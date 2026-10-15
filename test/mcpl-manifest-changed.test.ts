@@ -100,6 +100,13 @@ function makeHarness() {
 
 const settle = () => new Promise((r) => setImmediate(r));
 
+test('a manifest change from a server with no configuration (removed) fetches nothing', async () => {
+  const { fw, connection } = makeHarness();
+  (fw as unknown as { mcplServerConfigs: Map<string, unknown> }).mcplServerConfigs = new Map();
+  await fw.handleManifestChanged(connection, { revision: 'sha256:gone', domains: ['capabilities'] });
+  assert.deepEqual(connection.events.map((e) => e.kind), [], 'no fetch, grant or policy request');
+});
+
 test('reduction applies BEFORE the policy Request; receipt names it applied', async () => {
   const { fw, connection, traces } = makeHarness();
   // New manifest drops channels.publish (and the chat set with it, since

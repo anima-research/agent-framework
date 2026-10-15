@@ -2,9 +2,15 @@
   refuses new ones.** A quiesce, a resume, a
   `host/command`, a store surgery, a branch switch, an undo or redo's config
   materialization, a puppet tool call, an awareness sync, or an MCPL
-  connect, disconnect or restart admitted before `stop()` began now
-  finishes before the event gate, the modules, the MCPL connections and the
-  store go, unless a budget runs out first (see the operators' note below).
+  disconnect admitted before `stop()` began now finishes before the event
+  gate, the modules, the MCPL connections and the store go, unless a budget
+  runs out first (see the operators' note below). An MCPL connect still in
+  flight is ended instead, in either engine, rejecting with "was not
+  connected: the framework stopped while it was connecting": `stop()`
+  doesn't wait on a server for it, in its handshake (its launch reaped),
+  its setup or its tool listing, which asks every server. A restart in
+  flight ends too, its connect refused once `stop()` has begun, so the
+  server it was restarting is down.
   Before, such an operation kept running through the teardown. A resume
   waiting on its maintenance pass or previews could go on to leave quiesce
   while the host stopped, so the host booted unquiesced; a puppet call

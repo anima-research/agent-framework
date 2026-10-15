@@ -1,6 +1,6 @@
 import { ToolPresentation, presentationTools, isPresentationTool, renderCatalogue, type PresentationSnapshot } from "./tool-presentation.js";
 import { dirname, join } from 'node:path';
-import { EXPIRY_REASON, INLINE_WITHHELD_TEXT, REFERENCE_LIMITS, classifyBlock, isInlineContradiction, isReferenceExpired, referenceExpiry, referenceRegistry, referenceStubOrNull, referenceTypeLabel, sanitizeLabel } from './mcpl/references.js';
+import { EXPIRY_REASON, INLINE_WITHHELD_TEXT, REFERENCE_LIMITS, classifyBlock, isInlineContradiction, isReferenceExpired, referenceBlockForScript, referenceExpiry, referenceRegistry, referenceStubOrNull, referenceTypeLabel, sanitizeLabel } from './mcpl/references.js';
 import { ReferenceFetcher, DEFAULT_FETCH_MAX_BYTES, EAGER_FETCH_TIMEOUT_MS } from './mcpl/reference-fetcher.js';
 import { appendFileSync, existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { JsStore } from '@animalabs/chronicle';
@@ -404,6 +404,10 @@ import { EventGate, formatShadowWarning } from './gate/event-gate.js';
 import { UsageTracker, type PersistedUsageState } from './usage/usage-tracker.js';
 import type { SessionUsageSnapshot, UsageUpdatedEvent } from './usage/types.js';
 import type { McplServerConnection } from './mcpl/server-connection.js';
+import { McplProtocolVersionError, McplUnreapedLaunchError } from './mcpl/server-connection.js';
+import { ModernMcpConnection } from './mcpl/modern-connection.js';
+import { asText, credentialRedactor, redactUrl, redactServerText, resolveServerBinding, serverConfigProblems, serverCredentialPatterns, serverTextRedactor } from './mcpl/protocol-family.js';
+import { MALFORMED_CONTENT_NOTICE, normalizeStandardToolResult } from './mcpl/tool-result-normalize.js';
 import { isWebSocketTransport } from './mcpl/transport.js';
 import type {
   McplServerConfig,
@@ -488,6 +492,15 @@ interface DeferredWrite {
   forAgent?: string;
 }
 const bySeq = (a: { seq: number }, b: { seq: number }): number => a.seq - b.seq;
+
+/** A server configuration refused before anything was spawned or dialed:
+ *  only a corrected configuration helps, so nothing retries it. */
+class McpConfigurationRefusal extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'McpConfigurationRefusal';
+  }
+}
 
 /** Stamp a deferred write's durable id into the metadata it is stored with
  *  (boot recovery dedups replays by it). Idempotent for an already-stamped
@@ -1245,6 +1258,28 @@ interface EphemeralRun {
 }
 
 /**
+ * What a script gets for a tool result that can't be converted to JSON,
+ * such as a cyclic object or a BigInt that an in-process module returned.
+ * It names the tool, and says the call itself completed, so a script that
+ * reports it doesn't invite a blind retry. The host's log gets the same
+ * line, since the tool that returned it needs fixing whether or not the
+ * script reports it.
+ */
+function unconvertibleScriptResult(toolName: string, err: unknown, ownError?: string): string {
+  let reason: string;
+  try {
+    reason = err instanceof Error ? err.message : String(err);
+  } catch {
+    reason = 'a value with no text form'; // String() throws on an object with no prototype
+  }
+  const own = ownError ? `, with this error: ${ownError}` : '.';
+  const text = `tool '${toolName}' returned a result that can't be converted to JSON, so the script can't receive it ` +
+    `(${reason}). The call itself completed${own}`;
+  console.error(`[code_execution] ${text}`);
+  return text;
+}
+
+/**
  * Longest failure text the inference-failure pipeline writes to one sink: the
  * reason in the exhaustion stderr line, a field of a logs/failures.log record,
  * an ops alert's message, the inference log's `error`, and a trace event's
@@ -1520,10 +1555,12 @@ const THROWN_TEXT_LIMIT = 500;
  * The text is bounded, since a provider or handler error can carry a whole
  * request body.
  */
-function thrownText(error: unknown): string {
+function thrownText(error: unknown, recorded: (text: unknown) => string = asText): string {
   let text: string;
   try {
-    text = String(error instanceof Error ? error.message : error);
+    // Redacted before it's cut, so no part of a credential across the cut
+    // is kept.
+    text = recorded(String(error instanceof Error ? error.message : error));
   } catch {
     text = '(a value that could not be read)';
   }
@@ -1535,15 +1572,15 @@ function thrownText(error: unknown): string {
  * handler failed" and what it threw (nothing, for `undefined`). Telling an
  * Error apart is itself guarded, since instanceof throws on a revoked Proxy.
  */
-function handlerFailureText(error: unknown): string {
+function handlerFailureText(error: unknown, recorded?: (text: unknown) => string): string {
   let isError = false;
   try {
     isError = error instanceof Error;
   } catch {
     // Not an Error that can be read; thrownText says so.
   }
-  if (isError) return thrownText(error);
-  return error === undefined ? 'the handler failed' : `the handler failed: ${thrownText(error)}`;
+  if (isError) return thrownText(error, recorded);
+  return error === undefined ? 'the handler failed' : `the handler failed: ${thrownText(error, recorded)}`;
 }
 
 /** A server's responder, and whether the request it belongs to has been answered yet. */
@@ -1551,6 +1588,11 @@ type AnswerOnce = {
   responder: { respond?: (result: unknown) => void; respondError?: (code: number, message: string, data?: unknown) => void } | undefined;
   answered: () => boolean;
 };
+
+/** A restart's hold on the id and tool prefix it moves its server to;
+ *  `restarting` names the server it restarts. Compared by identity.
+ *  `endedBy` says what ended it before its connect: a disconnect of that id. */
+type McpRestartClaim = { readonly restarting: string; endedBy?: string };
 
 /**
  * Wrap a server request's responder so the request is answered at most once,
@@ -1994,6 +2036,11 @@ export class AgentFramework {
   private mcplToolServers: Map<string, string> = new Map();
   /** Servers whose tools/list answered in the latest refresh. */
   private mcplListedServers: Set<string> = new Set();
+  /** refreshMcplTools' starts, and the start whose result was published
+   *  last: a refresh that a later-started one has overtaken publishes
+   *  nothing, since that one listed every server after it. */
+  private mcplToolsRefreshStarted = 0;
+  private mcplToolsRefreshPublished = 0;
   /** Zero-match tool-pattern diagnostics (checkToolPatterns): set at the end
    *  of create(), when the tool universe is first complete. */
   private toolPatternChecksArmed = false;
@@ -2004,6 +2051,27 @@ export class AgentFramework {
   private toolPatternKnownPrefixes: Map<string, string> = new Map();
   /** Maps serverId → McplServerConfig for prefix lookup. */
   private mcplServerConfigs: Map<string, import('./mcpl/types.js').McplServerConfig> = new Map();
+  /** Modern-MCP (2026-07-28) servers, by id; read through modernServers().
+   *  They are kept apart from the MCPL registry on purpose: they have no
+   *  grant, planes or server→host traffic, so the MCPL machinery (quiesce's
+   *  plane pauses, awareness gates, policy) never sees them. They take part
+   *  only through the tool paths, and their list changes reach agents
+   *  through ordinary admission. */
+  private modernMcpConnections: Map<string, ModernMcpConnection> | undefined;
+  /** Connects and disconnects in flight, by server id (holdMcpServerId);
+   *  created on first use, like modernMcpConnections. */
+  private mcpServerOps: Map<string, { kind: 'connect' | 'disconnect'; settled: Promise<void> }> | undefined;
+  /** Each legacy connect in flight's own abort (connectHeldMcplServer):
+   *  stop() and a disconnect of its id end it at once, its launch reaped,
+   *  rather than waiting out its handshake. Created on first use, as the
+   *  restart claims are (legacyConnectAborts()). */
+  private legacyConnectAbortMap: Map<string, AbortController> | undefined;
+  /** The ids and tool prefixes restarts hold, each with the claim of the
+   *  restart holding it, from the restart's checks through its connect
+   *  (restartMcplServer): no other connect or restart takes them while the
+   *  old server is torn down. Created on first use (restartClaims), like
+   *  mcpServerOps. */
+  private mcpRestartClaims: { ids: Map<string, McpRestartClaim>; prefixes: Map<string, McpRestartClaim> } | undefined;
   /** Host capabilities advertised during the MCP handshake — stored so servers
    *  can be connected at runtime (connectMcplServer) after initialization. */
   private mcplHostCapabilities: McplHostCapabilities | null = null;
@@ -2657,6 +2725,53 @@ export class AgentFramework {
     return !!this.stopPromise || !!this.queue?.isClosed;
   }
 
+  /** stop()'s first step for each connect still in flight, in either engine:
+   *  end it, so it fails at once and its operation ends, its launch reaped,
+   *  rather than holding stop()'s wait until its handshake's deadline. A
+   *  modern connect's connection is registered before it starts and is
+   *  closed; a legacy one's handshake, and the access provider a WebSocket
+   *  dial waits for, are aborted (legacyConnectAborts). A modern close's
+   *  outcome is the teardown's to report (closeModernMcpConnections). */
+  private endConnectsInFlight(): void {
+    for (const [id, op] of this.mcpServerOps ?? []) {
+      if (op.kind !== 'connect') continue;
+      this.modernServers().get(id)?.close().catch(() => { /* reported by the teardown's close */ });
+      const abort = this.legacyConnectAborts().get(id);
+      if (abort) {
+        abort.abort();
+      } else if (this.mcplServerRegistry?.getServer(id)) {
+        // Past its handshake, setting up: the registered connection's close,
+        // as a disconnect's, fails what the setup waits for.
+        this.mcplServerRegistry.removeServer(id).catch(() => { /* reported by the teardown's close */ });
+      }
+    }
+    // A connect waiting on other servers, listing every server's tools, stops
+    // waiting (untilStopBegins).
+    for (const wake of [...(this.stopWaiters ?? [])]) wake();
+  }
+
+  /** Wakers for the waits a connect makes that a stop() ends: see
+   *  untilStopBegins. Made on first use. */
+  private stopWaiters: Set<() => void> | undefined;
+
+  /** `work`, or undefined once stop() has begun, whichever comes first: a
+   *  connect's last step (its tool listing, which asks every server) needn't
+   *  hold stop()'s wait for operator operations on a server that doesn't
+   *  answer. The work goes on; the teardown's close ends what it waits for. */
+  private async untilStopBegins<T>(work: Promise<T>): Promise<T | undefined> {
+    work.catch(() => { /* its caller has stopped waiting, or reads it below */ });
+    if (this.stopHasBegun()) return undefined;
+    const waiters = (this.stopWaiters ??= new Set());
+    let wake!: () => void;
+    const stopped = new Promise<undefined>((resolve) => { wake = () => resolve(undefined); });
+    waiters.add(wake);
+    try {
+      return await Promise.race([work, stopped]);
+    } finally {
+      waiters.delete(wake);
+    }
+  }
+
   private refuseOperatorAfterStop(verb: string): void {
     if (this.stopHasBegun()) throw new Error(verb + ' refused: the framework is stopping');
   }
@@ -2684,6 +2799,13 @@ export class AgentFramework {
   }
 
   private async stopOwned(teardownTimeoutMs: number | undefined): Promise<void> {
+    // No MCP server is admitted from here on (stopHasBegun): none is launched
+    // or dialed while the rest are being closed, so none outlives the
+    // framework. A connect still in flight is ended now, in either engine,
+    // so it fails at once and its operator operation ends, rather than
+    // holding the wait for operator operations below until its handshake's
+    // deadline.
+    this.endConnectsInFlight();
     this.pushCoalescer?.suspend();
     this.flushCoalescingSnapshot();
     this.running = false;
@@ -2793,11 +2915,12 @@ export class AgentFramework {
     // the mount turn it holds, bounded only by teardownTimeoutMs.
     this.guardSpillsClosedFor = stoppingGeneration;
 
-    // Stop modules and MCPL servers in parallel
+    // Stop modules and both engines' MCP servers in parallel
     const shutdownPromises: Promise<void>[] = [this.moduleRegistry.stopAll(teardownTimeoutMs)];
     if (this.mcplServerRegistry) {
       shutdownPromises.push(this.mcplServerRegistry.closeAll(teardownTimeoutMs));
     }
+    shutdownPromises.push(this.closeModernMcpConnections(teardownTimeoutMs));
     // Timed-out or failed teardown retains its context and may still write.
     // Sync available state best-effort, but leave its store open for a retry.
     const shutdownErrors: unknown[] = operatorOperationsTimedOut === undefined ? [] : [operatorOperationsTimedOut];
@@ -3704,10 +3827,12 @@ export class AgentFramework {
     serverId: string,
     answer: AnswerOnce,
     outcome: { kind: 'refused' } | { kind: 'failed'; error: unknown },
+    /** The connection's redactor: a handler's error can quote what the server sent. */
+    recorded: (text: unknown) => string,
   ): void {
     // Optional chaining: prototype-built harnesses leave the queue unset.
     const stopping = outcome.kind === 'refused' || !!this.queue?.isClosed;
-    const what = outcome.kind === 'refused' ? '' : handlerFailureText(outcome.error);
+    const what = outcome.kind === 'refused' ? '' : handlerFailureText(outcome.error, recorded);
     const reason = outcome.kind === 'refused'
       ? 'the host is stopping'
       : stopping
@@ -3817,6 +3942,17 @@ export class AgentFramework {
    * Add a module at runtime.
    */
   async addModule(module: Module): Promise<void> {
+    // A server's tool prefix and a module's name share one namespace, as
+    // create() checks at startup: a module isn't added under a prefix a
+    // server holds, or one a restart is moving its server to.
+    const server = this.mcplPrefixMap.get(module.name);
+    if (server !== undefined) {
+      throw new Error(`Module "${module.name}" collides with MCPL server "${server}"'s toolPrefix "${module.name}"`);
+    }
+    const claimedBy = this.restartClaims().prefixes.get(module.name);
+    if (claimedBy) {
+      throw new Error(`Module "${module.name}" collides with the toolPrefix "${module.name}" the restart of "${claimedBy.restarting}" holds`);
+    }
     this.resetCompletedStop();
     await this.moduleRegistry.addModule(module);
     this.emitTrace({ type: 'module:added', moduleName: module.name });
@@ -3951,13 +4087,19 @@ export class AgentFramework {
     return this.referenceFetcherInstance;
   }
 
-  /** Register every RFC-005 reference in a tool-result content array against
-   *  its server, then eagerly fetch the ones inside the autofetch envelope
-   *  (below the eager ceiling, connection origin — never worse than the
-   *  server having inlined the bytes). Failures are non-fatal: the stub then
-   *  says fetch_reference instead of a path. */
-  private async autoFetchReferences(content: unknown[] | undefined, serverId: string, eager: boolean): Promise<void> {
-    if (!content) return;
+  /** Register every RFC-005 reference in an MCPL peer's tool-result content
+   *  against its server, then eagerly fetch the ones inside the autofetch
+   *  envelope (below the eager ceiling, connection origin — never worse than
+   *  the server having inlined the bytes). Failures are non-fatal: the stub
+   *  then says fetch_reference instead of a path.
+   *
+   *  For a script that will read the blocks, every reference is then fetched
+   *  ("eagerly lazy"): a script receiving a result is the strongest
+   *  available signal that the bytes are wanted (scripts process, they do
+   *  not browse), so the stub it receives carries a workspace path it can
+   *  open directly. A uri the result calls expired is fetched for neither. */
+  private async autoFetchReferences(content: unknown, serverId: string, forScript: boolean): Promise<void> {
+    if (!Array.isArray(content)) return;
     // Register every block first, then judge each uri once, by its latest
     // record. The registry keys records by uri and evicts the one registered
     // least recently, so a uri this result mentions keeps its record through
@@ -3974,18 +4116,22 @@ export class AgentFramework {
       const expiredHere = byUri.get(c.testimony.uri)?.expiredHere === true || isReferenceExpired(c.testimony);
       byUri.set(c.testimony.uri, { record, expiredHere });
     }
-    if (!eager) return;
     const fetcher = this.getReferenceFetcher();
-    const eligible = [...byUri.values()]
-      .filter(({ record, expiredHere }) => !expiredHere && fetcher.isEagerEligible(record))
-      .map(({ record }) => record);
+    const live = [...byUri.values()].filter(({ expiredHere }) => !expiredHere).map(({ record }) => record);
     // Parallel with a count cap: N small fetches cost one round-trip of
     // wall-clock, and anything past the cap stays lazy (stub says so).
     const MAX_EAGER_PER_RESULT = 8;
+    const eligible = live.filter((record) => fetcher.isEagerEligible(record));
     await Promise.all(eligible.slice(0, MAX_EAGER_PER_RESULT).map(async (record) => {
       const outcome = await fetcher.fetch(record, { timeoutMs: EAGER_FETCH_TIMEOUT_MS });
       if (!outcome.ok) console.error(`[rfc005] eager fetch of ${record.refId} failed: ${outcome.error}`);
     }));
+    if (!forScript) return;
+    // A record the eager pass saved returns at once.
+    for (const record of live) {
+      const outcome = await fetcher.fetch(record);
+      if (!outcome.ok) console.error(`[rfc005] script-demand fetch of ${record.refId} failed: ${outcome.error}`);
+    }
   }
 
   /** Core agent_settings keys — extension keys must not collide with these. */
@@ -9862,7 +10008,14 @@ export class AgentFramework {
    */
   private coalescingBinding(serverId: string): string {
     const config = this.mcplServerConfigs.get(serverId);
-    return createHash('sha256').update(JSON.stringify([serverId, config?.url ?? null, config?.command ?? null, config?.args ?? null])).digest('hex').slice(0, 16);
+    // A stdio server switched to the modern family is another peer, so its
+    // binding changes. The marker is added only for protocol: 'modern', so
+    // every binding stored for a legacy configuration stays the same. A
+    // network server's family follows its url's scheme, which is hashed.
+    const family = config?.protocol === 'modern' ? ['modern'] : [];
+    return createHash('sha256')
+      .update(JSON.stringify([serverId, config?.url ?? null, config?.command ?? null, config?.args ?? null, ...family]))
+      .digest('hex').slice(0, 16);
   }
 
   private initializePushCoalescer(): void {
@@ -13986,8 +14139,9 @@ export class AgentFramework {
     if (!this.mcplServerRegistry) {
       return { success: false, error: 'MCPL not initialized', isError: true };
     }
-    const server = this.mcplServerRegistry.getServer(config.id);
-    if (!server) {
+    const modern = this.modernServers().get(config.id) ?? null;
+    const server = modern ? null : this.mcplServerRegistry.getServer(config.id);
+    if (!modern && !server) {
       return { success: false, error: `MCPL server ${config.id} not found`, isError: true };
     }
     const prefix = config.toolPrefix ?? `mcpl--${config.id}`;
@@ -13999,16 +14153,14 @@ export class AgentFramework {
         isError: true,
       };
     }
+    const args = (call.input && typeof call.input === 'object') ? call.input as Record<string, unknown> : {};
     try {
-      const result = await server.sendToolsCall(toolName, call.input as Record<string, unknown>);
-      return {
-        success: true,
-        data: result.content,
-      };
+      const result = modern ? await modern.callTool(toolName, args) : await server!.sendToolsCall(toolName, args);
+      return AgentFramework.directToolResult(result);
     } catch (err) {
       return {
         success: false,
-        error: err instanceof Error ? err.message : String(err),
+        error: redactServerText(err instanceof Error ? err.message : err, config),
         isError: true,
       };
     }
@@ -14708,12 +14860,18 @@ export class AgentFramework {
 
   /**
    * Resolve one script-inner tool call to the string the script's tool
-   * function returns. Never rejects — errors become "Error: ..." strings,
+   * function returns. Never rejects: errors become "Error: ..." strings,
    * matching the managed PTC runtime ("Claude's code receives this error").
    *
-   * Results are serialized with the HISTORY serializer (images become
-   * placeholders): programmatic tool results are text-only by contract, and
-   * a script variable holding megabytes of base64 helps nobody.
+   * A result without structured content is serialized with the HISTORY
+   * serializer: images become placeholders, since a script variable holding
+   * megabytes of base64 helps nobody. A result with structured content is
+   * one JSON object holding both of the server's views
+   * (scriptStructuredResult), so its content blocks reach the script as the
+   * dispatch gave them, images and payloads included. A module's result that
+   * can't be stored or sent, such as a cyclic object or a BigInt, is already
+   * an error naming the tool when the dispatch returns it (storableToolResult),
+   * so a script reads that error's text.
    */
   private async handleScriptToolCall(
     agentName: string,
@@ -14733,29 +14891,81 @@ export class AgentFramework {
       // stream while the script still runs and wedge the tool round.
       script.endTurn = true;
     }
-    if (result.isError) {
+    // An MCP structured result reaches the script whole, as one JSON object,
+    // so code can use structuredContent directly and doesn't have to parse
+    // it back out of text.
+    const structured = Object.prototype.hasOwnProperty.call(result, 'structured');
+    if (result.isError && !structured) {
       return `Error: ${result.error ?? 'tool call failed'}`;
     }
-    if (result.data === undefined || result.data === null) return nonErrorResultText(result, 5_000_000);
-    // RFC-005 "eagerly lazy": a script receiving a result is the strongest
-    // available signal that the bytes are wanted (scripts process, they do
-    // not browse) — materialize every referenced payload now, so the stub
-    // the script receives carries a workspace path it can open directly.
-    if (Array.isArray(result.data)) {
-      const fetcher = this.getReferenceFetcher();
-      for (const block of result.data) {
-        const c = classifyBlock(block);
-        if (c.kind !== 'reference') continue;
-        const record = referenceRegistry.findByUri(c.testimony.uri)
-          ?? referenceRegistry.register(c.testimony);
-        const outcome = await fetcher.fetch(record);
-        if (!outcome.ok) console.error(`[rfc005] script-demand fetch of ${record.refId} failed: ${outcome.error}`);
-      }
+    if ((result.data === undefined || result.data === null) && !structured) {
+      return nonErrorResultText(result, AgentFramework.SCRIPT_RESULT_MAX_CHARS);
     }
+    // An MCPL peer's references were fetched for the script at dispatch
+    // (autoFetchReferences), so each one's stub carries the workspace path
+    // its payload was saved to.
     // Scripts get (nearly) full data — the script environment IS the spill:
     // filtering big results in code is the whole point. 5MB protocol safety
     // cap only; no context-cap truncation, no file spill.
-    return toolResultDataToHistoryString(result.data, 5_000_000);
+    if (structured) return this.scriptStructuredResult(result, toolName);
+    try {
+      return toolResultDataToHistoryString(result.data, AgentFramework.SCRIPT_RESULT_MAX_CHARS);
+    } catch (err) {
+      return `Error: ${unconvertibleScriptResult(toolName, err)}`;
+    }
+  }
+
+  /** The 5MB protocol safety cap on what a script receives. */
+  private static readonly SCRIPT_RESULT_MAX_CHARS = 5_000_000;
+
+  /**
+   * A structured MCP result as a script receives it: one JSON object holding
+   * both of the server's views, `{ content, structuredContent, isError }`,
+   * plus `error` (the text) on a tool error. `content` is the content array
+   * the dispatch gave this call (the direct reading): the server's blocks as
+   * sent, so payloads and images survive, except that an MCPL peer's blocks
+   * get the treatment RFC-005 gives them on every lane the model reads
+   * (referenceBlockForScript). `structuredContent` is the tool's own JSON, as
+   * sent. Past the size cap the result stays valid JSON: the whole object is
+   * saved to the workspace, and the script gets
+   * `{ isError, oversized: { chars, savedTo } }`. If it can't be saved, the
+   * script gets a failure to materialize the result, saying the tool may
+   * already have completed, never a success missing its result. A result
+   * that can't be converted to JSON (a cyclic object, a BigInt), which the
+   * dispatch's own check makes unlikely here, gets the same object empty,
+   * `{ content: [], structuredContent: null, isError: true, error }`, the
+   * error naming the tool.
+   */
+  private async scriptStructuredResult(result: ToolResult, toolName: string): Promise<string> {
+    const object = {
+      content: Array.isArray(result.data) ? result.data : [],
+      structuredContent: result.structured,
+      isError: result.isError === true,
+      ...(result.isError ? { error: result.error ?? '' } : {}),
+    };
+    let json: string;
+    try {
+      json = JSON.stringify(object);
+    } catch (err) {
+      const error = unconvertibleScriptResult(toolName, err, result.isError ? result.error : undefined);
+      return JSON.stringify({ content: [], structuredContent: null, isError: true, error });
+    }
+    if (json.length <= AgentFramework.SCRIPT_RESULT_MAX_CHARS) return json;
+    const workspace = this.getWorkspaceModule();
+    const mount = workspace ? this.firstWritableMountName(workspace) : null;
+    if (workspace && mount) {
+      const path = `${mount}/tool-results/${new Date().toISOString().slice(0, 10)}-script-${randomUUID()}.json`;
+      const written = await workspace.writeBinary(path, Buffer.from(json, 'utf8'), 'application/json').catch(() => null);
+      if (written?.success) {
+        return JSON.stringify({ isError: object.isError, oversized: { chars: json.length, savedTo: path } });
+      }
+    }
+    return JSON.stringify({
+      isError: true,
+      error: `the result (${json.length} chars) exceeds the ${AgentFramework.SCRIPT_RESULT_MAX_CHARS}-char script result cap ` +
+        `and could not be saved to the workspace, so it could not be delivered; the tool may already have completed`,
+      oversized: { chars: json.length, savedTo: null },
+    });
   }
 
   /**
@@ -16364,12 +16574,13 @@ export class AgentFramework {
         await this.connectMcplServerInternal(config, true);
       } catch (error) {
         if (error instanceof DiscordAwarenessAccountingError) {
-          await this.mcplServerRegistry.closeAll();
+          await this.closeMcpConnectionsAfterFailedStartup();
           throw error;
         }
         // Fail-open: log and continue with remaining servers
         const err = error instanceof Error ? error : new Error(String(error));
-        console.error(`Failed to connect MCPL server "${config.id}":`, err.message);
+        const message = redactServerText(err.message, config);
+        console.error(`Failed to connect MCPL server "${config.id}":`, message);
         // Reaching this catch means no stub was created, so nothing will
         // retry — except in the edge case where addServer succeeded (with a
         // reconnecting stub) and a later setup step threw; config.reconnect
@@ -16377,10 +16588,19 @@ export class AgentFramework {
         this.emitTrace({
           type: 'mcpl:server-connect-failed',
           serverId: config.id,
-          error: err.message,
+          error: message,
           attempt: 0,
-          willRetry: config.reconnect === true,
+          // A protocol-version verdict is never retried (no common revision;
+          // only configuration can fix it), and neither is a configuration
+          // refused before anything was launched.
+          willRetry: config.reconnect === true && !(error instanceof McplProtocolVersionError)
+            && !(error instanceof McpConfigurationRefusal),
         });
+        // So the server doesn't vanish quietly: alert at once, as the
+        // reconnect path does for the same verdict, since no attempt follows.
+        if (error instanceof McplProtocolVersionError) {
+          this.opsAlert('mcpl-down', config.id, `MCPL server unreachable at startup: ${message}`);
+        }
       }
     }
 
@@ -16393,12 +16613,104 @@ export class AgentFramework {
       await startupBarrier.promise;
       this.completeMcplDataPlaneGate(startupBarrier);
     } catch (error) {
-      await this.mcplServerRegistry.closeAll();
+      await this.closeMcpConnectionsAfterFailedStartup();
       throw error;
     }
 
     // Discover tools from all connected servers
     await this.refreshMcplTools();
+  }
+
+  /** The modern connections, created on first use, so a framework assembled
+   *  field by field (as unit tests do) needs no setup for them. */
+  private modernServers(): Map<string, ModernMcpConnection> {
+    return (this.modernMcpConnections ??= new Map());
+  }
+
+  /** The restarts' claims (mcpRestartClaims), created on first use, as the
+   *  modern connections are. */
+  private restartClaims(): { ids: Map<string, McpRestartClaim>; prefixes: Map<string, McpRestartClaim> } {
+    return (this.mcpRestartClaims ??= { ids: new Map(), prefixes: new Map() });
+  }
+
+  private legacyConnectAborts(): Map<string, AbortController> {
+    return (this.legacyConnectAbortMap ??= new Map());
+  }
+
+  /**
+   * Hold a server id for one connect or disconnect, until `release()`.
+   * Together with the live connections (the MCPL registry and the modern
+   * map) this is what holds an id: from a connect's admission until its
+   * teardown is done, one owner at a time. So a connect is refused while
+   * anything holds its id, and a teardown never removes what a later
+   * connection registered. A disconnect takes the hold over, and waits for
+   * the operation it displaced (`previous`); a connect that finds itself
+   * `displaced` ends rather than setting up a server being removed. Each
+   * release frees only its own hold.
+   */
+  private holdMcpServerId(id: string, kind: 'connect' | 'disconnect'): {
+    previous: Promise<void> | undefined;
+    displaced: () => boolean;
+    release: () => void;
+  } {
+    const ops = (this.mcpServerOps ??= new Map());
+    const previous = ops.get(id)?.settled;
+    let settle!: () => void;
+    const op = { kind, settled: new Promise<void>((resolve) => { settle = resolve; }) };
+    ops.set(id, op);
+    return {
+      previous,
+      displaced: () => ops.get(id) !== op,
+      release: () => {
+        if (ops.get(id) === op) ops.delete(id);
+        settle();
+      },
+    };
+  }
+
+  /**
+   * A connect whose failed launch couldn't be confirmed exited. Its
+   * connection stays registered, closed, and holds the id, so nothing
+   * launches beside a child that may still be running; a disconnect retries
+   * the reap, and completes once the exit is confirmed.
+   */
+  private static unreapedConnectFailure(id: string, failure: Error): Error {
+    return new Error(
+      `${failure.message}. MCP server "${id}" stays registered, closed, until its exit is confirmed: disconnect it to retry the reap`,
+      { cause: failure },
+    );
+  }
+
+  /** Close every modern-MCP connection, including any connect still in
+   *  flight, so none outlives a failed startup or stop(). One whose close
+   *  fails or is still pending stays registered, holding its id, as a failed
+   *  connect's does, and every failure is thrown, as the MCPL registry's
+   *  closeAll does. `timeoutMs` bounds the wait without cancelling cleanup. */
+  private async closeModernMcpConnections(timeoutMs = DEFAULT_SHUTDOWN_TIMEOUT_MS): Promise<void> {
+    await waitForShutdown([...this.modernServers()].map(([id, connection]) => ({
+      label: `mcp:${id}`,
+      promise: Promise.resolve().then(() => connection.close()).then(() => {
+        if (this.modernServers().get(id) === connection) this.modernServers().delete(id);
+      }),
+    })), timeoutMs);
+  }
+
+  /** After a failed startup: close both engines' connections, each whatever
+   *  the other's close did, and log what couldn't be closed. The caller then
+   *  rethrows the startup failure itself, so a cleanup failure never takes
+   *  its place. */
+  private async closeMcpConnectionsAfterFailedStartup(): Promise<void> {
+    const recorded = this.everyServerRedactor();
+    const outcomes = await Promise.allSettled([
+      this.mcplServerRegistry?.closeAll() ?? Promise.resolve(),
+      this.closeModernMcpConnections(),
+    ]);
+    for (const outcome of outcomes) {
+      if (outcome.status === 'rejected') {
+        console.error('[mcpl] after a failed startup, some MCP connections could not be closed:',
+          recorded(outcome.reason instanceof Error ? outcome.reason.message : outcome.reason));
+      }
+    }
   }
 
   /**
@@ -16800,24 +17112,98 @@ export class AgentFramework {
   private async connectMcplServerInternal(
     config: import('./mcpl/types.js').McplServerConfig,
     deferAwareness = false,
+    claim?: McpRestartClaim,
+  ): Promise<void> {
+    if (this.stopHasBegun()) {
+      throw new Error(`MCP server "${config.id}" was not connected: the framework is stopping or stopped`);
+    }
+    if (!this.mcplServerRegistry || !this.mcplHostCapabilities) {
+      throw new Error('MCPL subsystem is not initialized');
+    }
+
+    // Configuration mistakes fail here, before any routing is registered: a
+    // combination naming no usable transport (an http(s) url with transport
+    // 'websocket', transport 'http' with a ws url or with no url at all),
+    // protocol on a URL, a modern deadline of 0, MCPL policy on a modern
+    // server. Every valid legacy shape resolves exactly as before.
+    const family = AgentFramework.usableConfigFamily(config);
+    const taken = this.mcpServerIdTaken(config.id, claim);
+    if (taken) throw new Error(taken);
+    const hold = this.holdMcpServerId(config.id, 'connect');
+    try {
+      await this.connectHeldMcplServer(config, family, deferAwareness, hold.displaced);
+    } finally {
+      hold.release();
+    }
+  }
+
+  /** The part of a connect that runs holding its id. `displaced`: a
+   *  disconnect has taken the id over and is waiting for this connect. */
+  private async connectHeldMcplServer(
+    config: import('./mcpl/types.js').McplServerConfig,
+    family: 'legacy' | 'modern',
+    deferAwareness: boolean,
+    displaced: () => boolean,
   ): Promise<void> {
     if (!this.mcplServerRegistry || !this.mcplHostCapabilities) {
       throw new Error('MCPL subsystem is not initialized');
     }
 
-    // Every connect needs a readable awareness ledger: a runtime connect's
-    // awareness barrier reconciles it, and a stdio child taking the
+    // Every legacy connect needs a readable awareness ledger: a runtime
+    // connect's awareness barrier reconciles it, and a stdio child taking the
     // protective default derives that from it. Read it first, so an
     // unreadable ledger refuses the connect before anything is registered
     // under its id or spawned (a reconnecting server would otherwise be left
     // registered as a closed stub). With no outbox configured nothing is read.
-    this.getPlacedReactionBaseline();
+    // A modern connection has no awareness barrier and no reaction default.
+    if (family === 'legacy') this.getPlacedReactionBaseline();
 
     // Register prefix + config for tool dispatch routing (idempotent with
     // the pre-registration pass in initializeMcpl).
     const prefix = config.toolPrefix ?? `mcpl--${config.id}`;
     this.mcplPrefixMap.set(prefix, config.id);
     this.mcplServerConfigs.set(config.id, config);
+
+    if (family === 'modern') {
+      // Registered and wired before its first connect, so the connect in
+      // flight is already the framework's: stop() and disconnect close it,
+      // and a second connect for the same id is refused above.
+      const modern = ModernMcpConnection.create(config);
+      this.modernServers().set(config.id, modern);
+      this.wireModernEvents(modern, config);
+      let failure: Error | null = null;
+      try {
+        await modern.start();
+      } catch (error) {
+        failure = error instanceof Error ? error : new Error(String(error));
+      }
+      if (!failure && !modern.isClosed) {
+        this.emitTrace({ type: 'module:added', moduleName: `mcpl:${config.id}` });
+        return;
+      }
+      // It failed, or stop() or a disconnect closed it while connecting: it
+      // never serves. The connect error is the one to report.
+      const reason = failure ?? new Error(
+        `MCP server "${config.id}" was not connected: ` +
+          (this.stopHasBegun() ? 'the framework stopped while it was connecting' : 'it was disconnected while connecting'),
+      );
+      try {
+        await modern.close();
+      } catch (cleanup) {
+        // A cleanup failure is reported beside it, never in its place. The
+        // launch may still be running, so the connection stays registered
+        // and holds the id: nothing launches beside it, and a disconnect
+        // retries the reap.
+        const message = cleanup instanceof Error ? cleanup.message : String(cleanup);
+        this.emitTrace({ type: 'mcpl:server-error', serverId: config.id, error: redactServerText(message, config) });
+        if (this.modernServers().get(config.id) === modern) {
+          throw AgentFramework.unreapedConnectFailure(config.id, new Error(`${reason.message}; its cleanup also failed: ${message}`, { cause: reason }));
+        }
+        throw reason;
+      }
+      if (this.modernServers().get(config.id) === modern) this.modernServers().delete(config.id);
+      throw reason;
+    }
 
     // Record per-server channel subscription policy before the server
     // registers channels — handleRegister fires during the handshake.
@@ -16854,11 +17240,50 @@ export class AgentFramework {
         }),
       });
     }
-    const connection = await this.mcplServerRegistry.addServer(connectionConfig, this.mcplHostCapabilities);
+    let connection: McplServerConnection;
+    const abort = new AbortController();
+    this.legacyConnectAborts().set(config.id, abort);
+    try {
+      connection = await this.mcplServerRegistry.addServer(connectionConfig, this.mcplHostCapabilities, abort.signal);
+    } catch (error) {
+      // The registry keeps a failed launch that may still be running, as the
+      // closed connection that owns it.
+      if (error instanceof McplUnreapedLaunchError) throw AgentFramework.unreapedConnectFailure(config.id, error);
+      // Ended by stop() or by a disconnect of its id (its abort): said as a
+      // modern connect ended that way says it, with the handshake's own
+      // error as the cause.
+      if (abort.signal.aborted) {
+        throw new Error(
+          `MCP server "${config.id}" was not connected: ` +
+            (this.stopHasBegun() ? 'the framework stopped while it was connecting' : 'it was disconnected while connecting'),
+          { cause: error },
+        );
+      }
+      throw error;
+    } finally {
+      if (this.legacyConnectAborts().get(config.id) === abort) this.legacyConnectAborts().delete(config.id);
+    }
+    // stop() began while the handshake ran: its teardown has already
+    // collected the registry, so this connection would outlive it. Or a
+    // disconnect took the id over and is waiting for this connect. Either
+    // way, close it rather than set up a server that is being removed.
+    if (this.stopHasBegun() || displaced()) {
+      const why = this.stopHasBegun() ? 'the framework stopped while it was connecting' : 'it was disconnected while connecting';
+      // A cleanup that can't reap the child is reported with the refusal,
+      // not in place of it and not dropped. The registry keeps such a
+      // connection, so the id stays held.
+      let cleanup = '';
+      try {
+        await this.mcplServerRegistry.removeServer(config.id);
+      } catch (error) {
+        cleanup = `; its cleanup also failed: ${error instanceof Error ? error.message : String(error)}`;
+      }
+      throw new Error(`MCP server "${config.id}" was not connected: ${why}${cleanup}`);
+    }
 
     // Wire listeners before either startup staging or the runtime global gate
     // releases control traffic needed for registration and marker service.
-    this.wireMcplEvents(connection);
+    this.wireMcplEvents(connection, config);
 
     if (deferAwareness) {
       // Staged startup: both planes are closed, so the §5.3 policy
@@ -16915,13 +17340,17 @@ export class AgentFramework {
    * branch actually taken (anything but `close` is treated as `mcp-only`)
    * and a non-string `reason` is dropped.
    */
-  private static policyRefusalFields(receipt: { fallback?: unknown; reason?: unknown }): {
+  private static policyRefusalFields(
+    receipt: { fallback?: unknown; reason?: unknown },
+    recorded: (text: unknown) => string,
+  ): {
     fallback: 'close' | 'mcp-only';
     reason: string | null;
   } {
     return {
       fallback: receipt.fallback === 'close' ? 'close' : 'mcp-only',
-      reason: typeof receipt.reason === 'string' ? receipt.reason : null,
+      // The server's own words, recorded as every server text is.
+      reason: typeof receipt.reason === 'string' ? recorded(receipt.reason) : null,
     };
   }
 
@@ -16935,6 +17364,13 @@ export class AgentFramework {
     connection: McplServerConnection,
     announce: { revision?: string; domains?: string[] },
   ): Promise<void> {
+    // The server's configuration as it is now, before any await: a record
+    // made later keeps it, whatever becomes of the server meanwhile. A server
+    // with no configuration has been removed, and its manifest isn't
+    // refreshed.
+    const config = this.mcplServerConfigs.get(connection.id);
+    if (!config) return;
+    const recorded = serverTextRedactor(config);
     const st = this.manifestRefreshState.get(connection.id)
       ?? { inFlight: false, queued: false, lastCompletedAt: 0 };
     this.manifestRefreshState.set(connection.id, st);
@@ -16962,9 +17398,6 @@ export class AgentFramework {
 
     st.inFlight = true;
     try {
-      const config = this.mcplServerConfigs.get(connection.id);
-      if (!config) return;
-
       // §17.4 fetch. A server that cannot answer keeps its previous
       // manifest in force — an unparseable/failed fetch teaches nothing and
       // narrows nothing (§17.5 step 1).
@@ -16972,7 +17405,7 @@ export class AgentFramework {
       try {
         fetched = await connection.sendManifestRequest();
       } catch (err) {
-        console.error(`[mcpl] ${connection.id}: mcpl/manifest fetch failed — previous manifest stands (§17.5): ${err instanceof Error ? err.message : err}`);
+        console.error(`[mcpl] ${connection.id}: mcpl/manifest fetch failed — previous manifest stands (§17.5): ${recorded(err instanceof Error ? err.message : err)}`);
         return;
       }
       if (!fetched || typeof fetched !== 'object') {
@@ -17038,13 +17471,14 @@ export class AgentFramework {
       try {
         const receipt = await connection.sendFeatureSetsUpdateRequest(updateParams);
         if (receipt && receipt.accepted === false) {
-          const fallback = receipt.fallback ?? 'mcp-only';
+          const refusal = AgentFramework.policyRefusalFields(receipt, recorded);
+          const fallback = refusal.fallback;
           console.error(`[mcpl] ${connection.id} refused post-manifest policy — fallback: ${fallback}`);
           this.emitTrace({
             type: 'mcpl:policy-refused',
             serverId: connection.id,
             phase: 'manifest-change',
-            ...AgentFramework.policyRefusalFields(receipt),
+            ...refusal,
           });
           if (fallback === 'close') {
             await connection.close();
@@ -17124,6 +17558,10 @@ export class AgentFramework {
     connection: McplServerConnection,
   ): Promise<void> {
     if (!connection.capabilities) return;
+    // Taken before any await, so every record of what the server says below
+    // uses one derivation, whatever becomes of the server meanwhile (removed,
+    // or replaced by a restart).
+    const recorded = serverTextRedactor(config);
 
     // §5.4: compute the effective grant from the (config-masked)
     // advertisement. Not yet active — expansion activates only after the
@@ -17154,15 +17592,18 @@ export class AgentFramework {
     try {
       const receipt = await connection.sendFeatureSetsUpdateRequest(updateParams);
       if (receipt && receipt.accepted === false) {
-        const fallback = receipt.fallback ?? 'mcp-only';
+        // The fallback the host takes, which is the one logged; the server's
+        // reason is its own text.
+        const refusal = AgentFramework.policyRefusalFields(receipt, recorded);
+        const fallback = refusal.fallback;
         console.error(
-          `[mcpl] ${config.id} refused initial policy (${receipt.reason ?? 'no reason'}) — fallback: ${fallback}`,
+          `[mcpl] ${config.id} refused initial policy (${refusal.reason ?? 'no reason'}) — fallback: ${fallback}`,
         );
         this.emitTrace({
           type: 'mcpl:policy-refused',
           serverId: config.id,
           phase: 'initial',
-          ...AgentFramework.policyRefusalFields(receipt),
+          ...refusal,
         });
         if (fallback === 'close') {
           await connection.close();
@@ -17177,9 +17618,9 @@ export class AgentFramework {
       connection.establishGrant(grant);
       if (receipt?.accepted === true && receipt.mode === 'degraded') {
         for (const uf of receipt.unavailableFeatures ?? []) {
-          console.error(
-            `[mcpl] ${config.id} degraded: ${uf.featureSet} (${uf.effect}; missing ${uf.missingCapabilities.join(', ')})`,
-          );
+          console.error(recorded(
+            `[mcpl] ${config.id} degraded: ${uf.featureSet} (${uf.effect}; missing ${Array.isArray(uf.missingCapabilities) ? uf.missingCapabilities.join(', ') : 'unknown'})`,
+          ));
         }
       }
     } catch (err) {
@@ -17191,7 +17632,7 @@ export class AgentFramework {
       console.error(
         `[mcpl] ${config.id} did not answer the initial policy Request — ` +
           `MCPL privileged surface stays disabled (§6.7 unanswered expansion): ` +
-          (err instanceof Error ? err.message : String(err)),
+          recorded(err instanceof Error ? err.message : err),
       );
       return;
     }
@@ -17319,8 +17760,11 @@ export class AgentFramework {
     return this.trackOperatorOperation('mcpl:connect', () => this.runConnectMcplServer(config));
   }
 
+  /** connectMcplServer's work, for a restart's connect too: the id and tool
+   *  prefix its `claim` holds are free to it, and refused to everyone else. */
   private async runConnectMcplServer(
     config: import('./mcpl/types.js').McplServerConfig,
+    claim?: McpRestartClaim,
   ): Promise<void> {
     // Lazily bring up the MCPL subsystem — a framework that started with zero
     // configured servers can still deploy its first one at runtime.
@@ -17328,24 +17772,18 @@ export class AgentFramework {
       await this.initializeMcpl([], this.mcplInferenceRoutingConfig ?? undefined);
     }
 
-    // Same collision rules create() enforces at startup: the tool prefix must
-    // not shadow a module name or another server's prefix.
-    const prefix = config.toolPrefix ?? `mcpl--${config.id}`;
-    if (this.moduleRegistry.getAllModules().some(m => m.name === prefix)) {
-      throw new Error(
-        `MCPL server "${config.id}" toolPrefix "${prefix}" collides with module "${prefix}"`,
-      );
-    }
-    const prefixOwner = this.mcplPrefixMap.get(prefix);
-    if (prefixOwner && prefixOwner !== config.id) {
-      throw new Error(
-        `MCPL server "${config.id}" toolPrefix "${prefix}" collides with server "${prefixOwner}"`,
-      );
-    }
+    const collision = this.mcplPrefixCollision(config, undefined, claim);
+    if (collision) throw new Error(collision);
 
     const oldToolNames = new Set(this.mcplTools.map(t => t.name));
-    await this.connectMcplServerInternal(config);
-    await this.refreshMcplTools();
+    await this.connectMcplServerInternal(config, false, claim);
+    // A stop() that began during the connect's setup or its tool listing
+    // ends the connect: it doesn't wait on a server for a framework that is
+    // stopping, and the teardown closes what the connect set up.
+    const stopped = () => new Error(`MCP server "${config.id}" was not connected: the framework stopped while it was connecting`);
+    if (this.stopHasBegun()) throw stopped();
+    await this.untilStopBegins(this.refreshMcplTools());
+    if (this.stopHasBegun()) throw stopped();
     this.emitMcplToolDiff(oldToolNames, config.id);
   }
 
@@ -17355,9 +17793,21 @@ export class AgentFramework {
    * transport close, which preserves checkpoints for the reconnect), remove
    * its channels from the registry, drop routing entries, and refresh tools.
    * No-op-ish if the server is not connected (still clears routing state).
+   *
+   * It holds the id throughout (holdMcpServerId): a connect for it is
+   * refused meanwhile, and a connect already in flight is ended (closed, or
+   * displaced when its legacy handshake finishes) and settles before
+   * anything is removed. A close that can't confirm a child exited fails the
+   * disconnect before anything is removed: the server stays registered,
+   * closed, so nothing launches beside a child that may still be running,
+   * and disconnecting again retries the reap.
    */
   async disconnectMcplServer(id: string): Promise<void> {
     this.refuseOperatorAfterStop('disconnect MCPL server');
+    // A restart moving its server to this id is ended by this disconnect,
+    // even one that finishes before the restart's connect begins.
+    const claim = this.restartClaims().ids.get(id);
+    if (claim) claim.endedBy = `MCP server "${id}" was disconnected, which ends the restart of "${claim.restarting}"`;
     return this.trackOperatorOperation('mcpl:disconnect', () => this.runDisconnectMcplServer(id));
   }
 
@@ -17365,25 +17815,61 @@ export class AgentFramework {
     if (!this.mcplServerRegistry) {
       throw new Error('MCPL subsystem is not initialized');
     }
-    const config = this.mcplServerConfigs.get(id);
-    const oldToolNames = new Set(this.mcplTools.map(t => t.name));
+    const registry = this.mcplServerRegistry;
+    const hold = this.holdMcpServerId(id, 'disconnect');
+    try {
+      // Close what the id has now, so a connect in flight ends rather than
+      // being waited out: a modern connect is ended by its close, a legacy
+      // one still in its handshake (or a WebSocket dial waiting for its
+      // access provider) by its abort, its launch reaped, and a legacy one
+      // already registered (setting up after its handshake) fails its
+      // requests and finds itself displaced. The registry's removal is the
+      // legacy close: a failed one stays registered.
+      this.legacyConnectAborts().get(id)?.abort();
+      const modern = this.modernServers().get(id);
+      const closing = [modern?.close(), registry.removeServer(id)];
+      for (const pending of closing) pending?.catch(() => { /* its verdict is awaited below */ });
+      // What held the id before (a connect still running, an earlier
+      // disconnect) settles first, so what it registered is removed whole.
+      await hold.previous;
+      const oldToolNames = new Set(this.mcplTools.map(t => t.name));
 
-    await this.mcplServerRegistry.removeServer(id);
-    this.channelRegistry?.removeServer(id);
+      try {
+        for (const pending of closing) await pending;
+        // Whatever was registered since: a connect that was still
+        // handshaking, whose own removal couldn't reap, is re-checked here.
+        await registry.removeServer(id);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        throw new Error(
+          `${message}. MCP server "${id}" stays registered, closed, until its exit is confirmed: disconnect it again to retry the reap`,
+          { cause: error },
+        );
+      }
+      if (modern && this.modernServers().get(id) === modern) this.modernServers().delete(id);
+      this.channelRegistry?.removeServer(id);
 
-    // Permanent removal: also destroy feature-set and checkpoint state
-    // explicitly. The 'close' handler usually does this, but a connection that
-    // already transiently closed (reconnect pending) emits no second 'close'
-    // from close(), and the transient path deliberately preserves checkpoints.
-    this.featureSetManager?.removeServer(id);
-    this.checkpointManager?.removeServer(id);
+      // Permanent removal: also destroy feature-set and checkpoint state
+      // explicitly. The 'close' handler usually does this, but a connection that
+      // already transiently closed (reconnect pending) emits no second 'close'
+      // from close(), and the transient path deliberately preserves checkpoints.
+      this.featureSetManager?.removeServer(id);
+      this.checkpointManager?.removeServer(id);
 
-    const prefix = config?.toolPrefix ?? `mcpl--${id}`;
-    this.mcplPrefixMap.delete(prefix);
-    this.mcplServerConfigs.delete(id);
+      // Only this server's own claims, as the prefix map holds them rather
+      // than as its configuration reads now: a server connected since under
+      // a prefix it held keeps it, and a configuration changed after its
+      // connect leaves no claim behind.
+      for (const [prefix, owner] of this.mcplPrefixMap) {
+        if (owner === id) this.mcplPrefixMap.delete(prefix);
+      }
+      this.mcplServerConfigs.delete(id);
 
-    await this.refreshMcplTools();
-    this.emitMcplToolDiff(oldToolNames, id);
+      await this.refreshMcplTools();
+      this.emitMcplToolDiff(oldToolNames, id);
+    } finally {
+      hold.release();
+    }
   }
 
   /**
@@ -17391,6 +17877,27 @@ export class AgentFramework {
    * same (or an updated) config. This actually respawns a stdio child —
    * unlike `reconnect: true`, which only retries after transport-level
    * failures. Throws if the server has no stored config and none is given.
+   * What its connect would refuse is refused before the running server is
+   * torn down. Until the connect, a connect or a restart started meanwhile
+   * is refused the id and the tool prefix the restart moves the server to,
+   * and a module added meanwhile is refused that tool prefix. The id and
+   * prefix it moves the server from are free once its disconnect is done, as
+   * after any disconnect.
+   *
+   * A disconnect of the id the restart moves the server to (its own id, for
+   * a restart under the same id), or a `stop()`, that begins during the
+   * restart ends it, as a disconnect ends a connect in flight: the restart
+   * rejects, saying the server is down, and its holds are released. A
+   * restart whose connect fails leaves the server down, configured under the
+   * new configuration and its id, and holding its tool prefix, as any failed
+   * connect does: `listMcplServers()` lists it as not connected, and a
+   * restart or a disconnect under that id tries it again or removes it.
+   *
+   * Treat a submitted configuration and its nested values as immutable for
+   * as long as the server uses them. Apply changed settings with
+   * `restartMcplServer(id, newConfig)`; use `accessProvider` for a network
+   * server's rotating credentials (a stdio server's changed `env` goes
+   * through a restart with the new configuration).
    */
   async restartMcplServer(
     id: string,
@@ -17404,18 +17911,165 @@ export class AgentFramework {
     id: string,
     newConfig?: import('./mcpl/types.js').McplServerConfig,
   ): Promise<void> {
+    // What the connect would refuse is refused here, before the running
+    // server is torn down for it: the configuration's binding and settings,
+    // a new id another server holds, and a tool prefix another server or a
+    // module already holds. (A stop() already begun refused the restart at
+    // its entry, as it refuses every operator operation.) From these checks
+    // through its connect, the restart holds the id and the tool prefix it
+    // moves the server to (mcpRestartClaims), so no connect, restart or
+    // module added meanwhile takes them while the old server is torn down.
+    // A stop(), or a disconnect of the id it moves the server to, that
+    // begins after these checks isn't held off: it ends the restart, as it
+    // would end a connect.
     const config = newConfig ?? this.mcplServerConfigs.get(id);
     if (!config) {
       throw new Error(`MCPL server "${id}" is not configured`);
     }
-    // Every connect reads the awareness ledger: its awareness barrier
+    const family = AgentFramework.usableConfigFamily(config);
+    const inFlight = this.mcpServerOps?.get(id);
+    if (inFlight) {
+      // A connect or disconnect of the server being restarted, in flight,
+      // whatever id the restart moves it to: the restart's own disconnect
+      // would wait behind it, and its connect would then meet whatever that
+      // operation left, after the server was torn down.
+      throw new Error(`MCP server "${id}" was not restarted: it is being ${inFlight.kind === 'disconnect' ? 'disconnected' : 'connected'}; restart it once that has finished`);
+    }
+    const claimedBy = this.restartClaims().ids.get(id);
+    if (claimedBy) {
+      // Another restart is moving its server to this id, or restarting this
+      // server already.
+      throw new Error(claimedBy.restarting === id
+        ? `MCP server "${id}" was not restarted: it is being restarted; restart it once that has finished`
+        : `MCP server "${id}" was not restarted: the restart of "${claimedBy.restarting}" holds its id; restart it once that has finished`);
+    }
+    if (config.id !== id) {
+      const taken = this.mcpServerIdTaken(config.id, undefined, id);
+      if (taken) throw new Error(taken);
+    }
+    const collision = this.mcplPrefixCollision(config, id);
+    if (collision) throw new Error(collision);
+    // A legacy connect reads the awareness ledger: its awareness barrier
     // reconciles it, and a stdio child taking the protective default derives
     // that from it. Read it before disconnecting, so an unreadable ledger
     // refuses the restart and leaves the running child up, whatever the
     // server's baseline or transport. (No outbox configured: nothing to read.)
-    this.getPlacedReactionBaseline();
-    await this.runDisconnectMcplServer(id);
-    await this.runConnectMcplServer(config);
+    // A modern connection reads neither.
+    if (family === 'legacy') this.getPlacedReactionBaseline();
+
+    const claim: McpRestartClaim = { restarting: id };
+    const prefix = config.toolPrefix ?? `mcpl--${config.id}`;
+    this.restartClaims().ids.set(config.id, claim);
+    this.restartClaims().prefixes.set(prefix, claim);
+    try {
+      await this.runDisconnectMcplServer(id);
+      try {
+        await this.runConnectMcplServer(config, claim);
+      } catch (error) {
+        // The old server is gone, whatever ended the connect: a disconnect or
+        // a stop() that began during the restart, or the new server's own
+        // failure. The caller learns that first, then the connect's reason.
+        const reason = error instanceof Error ? error.message : String(error);
+        throw new Error(`MCP server "${id}" is down: it was disconnected for its restart, and the restart's connect failed: ${reason}`, { cause: error });
+      }
+    } finally {
+      if (this.restartClaims().ids.get(config.id) === claim) this.restartClaims().ids.delete(config.id);
+      if (this.restartClaims().prefixes.get(prefix) === claim) this.restartClaims().prefixes.delete(prefix);
+    }
+  }
+
+  /**
+   * A redactor for text that may come from any configured server, with every
+   * server's credentials replaced: those of the configurations present when
+   * it's made, then those present when it's used. An operation makes it
+   * before it waits, so a server removed meanwhile, and one connected
+   * meanwhile, both have their credentials replaced.
+   */
+  private everyServerRedactor(): (text: unknown) => string {
+    const snapshot = [...this.mcplServerConfigs.values()].flatMap(config => serverCredentialPatterns(config));
+    // The configurations present when the operation began, then those present
+    // now: a server removed meanwhile and one connected meanwhile are both
+    // covered. One pass over all their strings, so a secret that begins
+    // another server's longer one can't cut that one short.
+    return (text) => credentialRedactor([
+      ...snapshot,
+      ...[...this.mcplServerConfigs.values()].flatMap(config => serverCredentialPatterns(config)),
+    ])(text);
+  }
+
+  /** Why a connect for this id is refused, or null when the id is free. One
+   *  owner per id, across both engines (holdMcpServerId): a connect or
+   *  disconnect in flight holds it, and so does a registered connection,
+   *  including one kept because its launch couldn't be confirmed exited, and
+   *  a restart moving its server to the id (mcpRestartClaims), except to
+   *  that restart's own connect (`claim`). That connect is still refused
+   *  while a disconnect of the id is in flight: the restart's own disconnect
+   *  has finished by then, so that one began during the restart, and it ends
+   *  the restart. `restarting` words the refusal for a restart of that
+   *  server checking the id it would move to. */
+  private mcpServerIdTaken(id: string, claim?: McpRestartClaim, restarting?: string): string | null {
+    const refused = restarting === undefined ? '' : `MCP server "${restarting}" was not restarted: `;
+    const retry = restarting === undefined ? 'connect it' : `restart "${restarting}"`;
+    const claimedBy = this.restartClaims().ids.get(id);
+    if (claimedBy && claimedBy !== claim) {
+      return `${refused}MCP server "${id}" is held by the restart of "${claimedBy.restarting}"; ${retry} once that has finished`;
+    }
+    const op = this.mcpServerOps?.get(id);
+    if (op?.kind === 'disconnect') {
+      if (claim) return `MCP server "${id}" is being disconnected, which ends the restart of "${claim.restarting}"`;
+      return `${refused}MCP server "${id}" is still being disconnected; ${retry} once that has finished`;
+    }
+    // A disconnect of the id began during the restart, and has finished.
+    if (claim?.endedBy) return claim.endedBy;
+    const registered = this.modernServers().get(id) ?? this.mcplServerRegistry?.getServer(id);
+    if (op || registered) {
+      const idle = !op && registered && !registered.isConnected && !registered.willReconnect;
+      return `${refused}MCPL server "${id}" is already registered${idle ? ' (not connected and not reconnecting: disconnect it first)' : ''}`;
+    }
+    return null;
+  }
+
+  /** The collision rules create() enforces at startup, as a runtime connect
+   *  (or a restart, before its disconnect) meets them: the tool prefix must
+   *  not shadow a module name or another server's prefix, or be one a
+   *  restart is moving its server to (mcpRestartClaims). The server's own
+   *  prefix is free to keep, so is that of the server a restart is about to
+   *  disconnect (`leaving`), and so is the prefix a restart's own connect
+   *  holds (`claim`). */
+  private mcplPrefixCollision(
+    config: import('./mcpl/types.js').McplServerConfig,
+    leaving?: string,
+    claim?: McpRestartClaim,
+  ): string | null {
+    const prefix = config.toolPrefix ?? `mcpl--${config.id}`;
+    if (this.moduleRegistry.getAllModules().some(m => m.name === prefix)) {
+      return `MCPL server "${config.id}" toolPrefix "${prefix}" collides with module "${prefix}"`;
+    }
+    const claimedBy = this.restartClaims().prefixes.get(prefix);
+    if (claimedBy && claimedBy !== claim) {
+      return `MCPL server "${config.id}" toolPrefix "${prefix}" is held by the restart of "${claimedBy.restarting}"`;
+    }
+    const prefixOwner = this.mcplPrefixMap.get(prefix);
+    if (prefixOwner && prefixOwner !== config.id && prefixOwner !== leaving) {
+      return `MCPL server "${config.id}" toolPrefix "${prefix}" collides with server "${prefixOwner}"`;
+    }
+    return null;
+  }
+
+  /** The protocol family a configuration resolves to, or a refusal naming
+   *  every problem with it, before anything is spawned, dialed or torn down. */
+  private static usableConfigFamily(config: import('./mcpl/types.js').McplServerConfig): 'legacy' | 'modern' {
+    let family: 'legacy' | 'modern';
+    try {
+      family = resolveServerBinding(config).family;
+    } catch (error) {
+      throw new McpConfigurationRefusal(`MCP server "${config.id}" configuration: ${error instanceof Error ? error.message : String(error)}`);
+    }
+    const problems = serverConfigProblems(config);
+    if (problems.length > 0) {
+      throw new McpConfigurationRefusal(`MCP server "${config.id}" configuration: ${problems.join('; ')}`);
+    }
+    return family;
   }
 
   /**
@@ -17426,10 +18080,23 @@ export class AgentFramework {
     id: string;
     connected: boolean;
     retrying: boolean;
+    /** Which engine serves it: `legacy` (MCP 2024-11-05 + MCPL) or `modern`
+     *  (the SDK's client: MCP 2026-07-28, or over HTTP a 2025 revision), as
+     *  its configuration selects; null when the configuration names no
+     *  usable transport (see `refused`). */
+    family: 'legacy' | 'modern' | null;
+    /** The MCP revision its last handshake established; null until one has. */
+    protocolVersion: string | null;
+    /** How it is reached; null when the configuration names no usable transport. */
+    transport: 'stdio' | 'websocket' | 'http' | null;
+    /** Why connecting refuses this configuration, before anything is spawned
+     *  or dialed; null when it is usable. */
+    refused: string | null;
     toolPrefix: string;
     toolCount: number;
-    /** True only after the §5.3 policy receipt activated the grant. */
-    policyEstablished: boolean;
+    /** True only after the §5.3 policy receipt activated the grant. Null for
+     *  a modern server, which has no MCPL policy. */
+    policyEstablished: boolean | null;
     /** Sole normative authorization allowlist for the connection (§5.4). */
     effectiveGrant: string[];
     /** Advertised paths removed by host enabled/disabled capability config. */
@@ -17463,11 +18130,17 @@ export class AgentFramework {
       lastNegotiatedAt: number | null;
     };
     command?: string;
+    /** The url as {@link redactUrl} shows it, since a credential may ride in
+     *  it: no userinfo, each query parameter's value replaced, and any path
+     *  segment or query parameter name that looks like a credential
+     *  replaced. */
     url?: string;
   }> {
     const result: Array<{
       id: string; connected: boolean; retrying: boolean;
-      toolPrefix: string; toolCount: number; policyEstablished: boolean;
+      family: 'legacy' | 'modern' | null; protocolVersion: string | null;
+      transport: 'stdio' | 'websocket' | 'http' | null; refused: string | null;
+      toolPrefix: string; toolCount: number; policyEstablished: boolean | null;
       effectiveGrant: string[]; maskedCapabilities: string[];
       deniedCapabilities: string[]; allowHostCommands: boolean;
       toolObserveFilter: import('./mcpl/tool-lifecycle.js').ToolObserveRule[] | null;
@@ -17481,8 +18154,18 @@ export class AgentFramework {
     }> = [];
     for (const [id, config] of this.mcplServerConfigs) {
       const prefix = config.toolPrefix ?? `mcpl--${id}`;
-      const connection = this.mcplServerRegistry?.getServer(id) ?? null;
-      const connected = connection?.isConnected ?? false;
+      const modern = this.modernServers().get(id) ?? null;
+      const connection = modern ? null : this.mcplServerRegistry?.getServer(id) ?? null;
+      const connected = modern?.isConnected ?? connection?.isConnected ?? false;
+      // What connecting would decide, before anything is spawned or dialed: a
+      // configuration it refuses is listed as refused, not as a guessed binding.
+      let binding: { family: 'legacy' | 'modern'; transport: 'stdio' | 'websocket' | 'http' } | null;
+      try {
+        binding = resolveServerBinding(config);
+      } catch {
+        binding = null;
+      }
+      const problems = serverConfigProblems(config);
       // Attribute through the dispatch resolver: a bare prefix match would
       // also count a nested prefix's tools (`foo` vs `foo--bar`) as ours.
       const ownTools = (this.mcplTools ?? []).flatMap((t) => {
@@ -17492,10 +18175,14 @@ export class AgentFramework {
       result.push({
         id,
         connected,
-        retrying: !connected && (connection?.willReconnect ?? false),
+        retrying: !connected && (modern?.willReconnect ?? connection?.willReconnect ?? false),
+        family: binding?.family ?? null,
+        protocolVersion: modern?.protocolVersion ?? connection?.protocolVersion ?? null,
+        transport: binding?.transport ?? null,
+        refused: problems.length > 0 ? problems.join('; ') : null,
         toolPrefix: prefix,
         toolCount: ownTools.length,
-        policyEstablished: connection?.policyEstablished ?? false,
+        policyEstablished: binding?.family === 'modern' ? null : connection?.policyEstablished ?? false,
         effectiveGrant: connection?.grant.effectiveList() ?? [],
         maskedCapabilities: [...(connection?.droppedCapabilities ?? [])].sort(),
         deniedCapabilities: [...(connection?.grant.deniedPaths ?? [])].sort(),
@@ -17509,7 +18196,7 @@ export class AgentFramework {
           ? { ...connection.manifestState }
           : { lastValidatedRevision: null, lastFetchedAt: null, lastNegotiatedAt: null },
         command: config.command,
-        url: config.url,
+        url: config.url === undefined ? undefined : redactUrl(config.url),
       });
     }
     return result;
@@ -17519,11 +18206,12 @@ export class AgentFramework {
    * Wire event listeners on an MCPL server connection.
    * Push events and inference requests are deferred to Steps 6/7.
    */
-  private wireMcplEvents(connection: McplServerConnection): void {
+  private wireMcplEvents(connection: McplServerConnection, config: McplServerConfig): void {
+    const recorded = serverTextRedactor(config);
     // Forward subprocess stderr lines as trace events so consumers (conhost,
     // log sinks, TUI badges) can persist and surface them.
     connection.on('stderr', (params: { line: string }) => {
-      this.emitTrace({ type: 'mcpl:server-stderr', serverId: connection.id, line: params.line });
+      this.emitTrace({ type: 'mcpl:server-stderr', serverId: connection.id, line: recorded(params.line) });
     });
 
     // featureSets/changed is REMOVED in 0.5.0 — the connection answers it
@@ -17550,12 +18238,12 @@ export class AgentFramework {
         // Checked here, after the barrier and before anything records the
         // push as accepted: a stopped host refuses it.
         if (this.queue?.isClosed) {
-          this.refuseServerItem('push/event', connection.id, answer, { kind: 'refused' });
+          this.refuseServerItem('push/event', connection.id, answer, { kind: 'refused' }, recorded);
           return;
         }
         await this.pushHandler?.handlePushEvent(connection.id, params, answer.responder as never);
       } catch (error) {
-        this.refuseServerItem('push/event', connection.id, answer, { kind: 'failed', error });
+        this.refuseServerItem('push/event', connection.id, answer, { kind: 'failed', error }, recorded);
       }
     });
 
@@ -17580,7 +18268,7 @@ export class AgentFramework {
           // A stopping host starts no inference for a server: refused, like a
           // push, before the router runs.
           if (this.queue?.isClosed) {
-            this.refuseServerItem('inference/request', connection.id, answer, { kind: 'refused' });
+            this.refuseServerItem('inference/request', connection.id, answer, { kind: 'refused' }, recorded);
             return;
           }
           await this.inferenceRouter.handleInferenceRequest(connection.id, params, {
@@ -17589,7 +18277,7 @@ export class AgentFramework {
             requestId: responder.id,
           });
         } catch (error) {
-          this.refuseServerItem('inference/request', connection.id, answer, { kind: 'failed', error });
+          this.refuseServerItem('inference/request', connection.id, answer, { kind: 'failed', error }, recorded);
         }
       }
     });
@@ -17602,12 +18290,12 @@ export class AgentFramework {
       const answer = answerOnce(responder, 'channels/register', connection.id);
       try {
         if (this.queue?.isClosed) {
-          this.refuseServerItem('channels/register', connection.id, answer, { kind: 'refused' });
+          this.refuseServerItem('channels/register', connection.id, answer, { kind: 'refused' }, recorded);
           return;
         }
         await this.channelRegistry?.handleRegister(connection.id, params, answer.responder as never);
       } catch (error) {
-        this.refuseServerItem('channels/register', connection.id, answer, { kind: 'failed', error });
+        this.refuseServerItem('channels/register', connection.id, answer, { kind: 'failed', error }, recorded);
       }
     });
 
@@ -17622,12 +18310,12 @@ export class AgentFramework {
       const answer = answerOnce(responder, 'channels/changed', connection.id);
       try {
         if (this.queue?.isClosed) {
-          this.refuseServerItem('channels/changed', connection.id, answer, { kind: 'refused' });
+          this.refuseServerItem('channels/changed', connection.id, answer, { kind: 'refused' }, recorded);
           return;
         }
         await this.channelRegistry?.handleChanged(connection.id, params, answer.responder as never);
       } catch (error) {
-        this.refuseServerItem('channels/changed', connection.id, answer, { kind: 'failed', error });
+        this.refuseServerItem('channels/changed', connection.id, answer, { kind: 'failed', error }, recorded);
       }
     });
 
@@ -17638,7 +18326,7 @@ export class AgentFramework {
     // payload and no authority; everything below acts on FETCHED content.
     connection.on('manifest-changed', (params: { revision?: string; domains?: string[] }) => {
       void this.handleManifestChanged(connection, params).catch((err) => {
-        console.error(`[mcpl] ${connection.id} manifest refresh failed:`, err instanceof Error ? err.message : err);
+        console.error(`[mcpl] ${connection.id} manifest refresh failed:`, recorded(err instanceof Error ? err.message : err));
       });
     });
 
@@ -17661,7 +18349,7 @@ export class AgentFramework {
       const parsed = parseToolObserveParams(params);
       if (!parsed.ok) {
         if (responder?.respondError) responder.respondError(-32602, parsed.message, parsed.data);
-        else console.error(`[mcpl] ${connection.id}: tools/observe rejected — ${parsed.message}`);
+        else console.error(`[mcpl] ${connection.id}: tools/observe rejected — ${recorded(parsed.message)}`);
         return;
       }
       connection.toolObserveFilter = parsed.rules;
@@ -17693,12 +18381,12 @@ export class AgentFramework {
       try {
         if (this.discordAwarenessBarrier) await this.awaitDiscordAwarenessBarriers();
         if (this.queue?.isClosed) {
-          this.refuseServerItem('channels/incoming', connection.id, answer, { kind: 'refused' });
+          this.refuseServerItem('channels/incoming', connection.id, answer, { kind: 'refused' }, recorded);
           return;
         }
         await this.channelRegistry?.handleIncoming(connection.id, params, answer.responder as never);
       } catch (error) {
-        this.refuseServerItem('channels/incoming', connection.id, answer, { kind: 'failed', error });
+        this.refuseServerItem('channels/incoming', connection.id, answer, { kind: 'failed', error }, recorded);
       }
     });
 
@@ -17714,13 +18402,13 @@ export class AgentFramework {
         // A stopping host runs no host command: refused like the requests
         // above, before its handler runs, from the moment stop() has begun.
         if (this.stopHasBegun()) {
-          this.refuseServerItem('host/command', connection.id, answer, { kind: 'refused' });
+          this.refuseServerItem('host/command', connection.id, answer, { kind: 'refused' }, recorded);
           return;
         }
         const result = await this.handleHostCommand(connection.id, params ?? {});
         answer.responder!.respond(result);
       } catch (error) {
-        this.refuseServerItem('host/command', connection.id, answer, { kind: 'failed', error });
+        this.refuseServerItem('host/command', connection.id, answer, { kind: 'failed', error }, recorded);
       }
     });
 
@@ -17766,7 +18454,7 @@ export class AgentFramework {
         } catch (error) {
           console.error(
             `MCPL server "${connection.id}" re-registration after reconnect failed:`,
-            error instanceof Error ? error.message : error,
+            recorded(error instanceof Error ? error.message : error),
           );
         }
         this.releaseMcplDataPlaneGate(awarenessBarrier);
@@ -17799,32 +18487,40 @@ export class AgentFramework {
     // Surface connect/reconnect failures. Before these traces existed the
     // only receipt was a console.error on the host's own stderr — invisible
     // unless someone ssh'd in and read the process log.
-    connection.on('connect-failed', (params: { error: string; attempt: number }) => {
+    connection.on('connect-failed', (params: { error: string; attempt: number; permanent?: boolean }) => {
       this.emitTrace({
         type: 'mcpl:server-connect-failed',
         serverId: connection.id,
-        error: params.error,
+        error: recorded(params.error),
         attempt: params.attempt,
         willRetry: connection.willReconnect,
       });
+      // `permanent`: the failed launch couldn't be reaped, so no retry will
+      // start beside it. Alert now, as for a permanent reconnect failure.
+      if (params.permanent) {
+        this.opsAlert('mcpl-down', connection.id, `MCPL server unreachable (attempt ${params.attempt}): ${recorded(params.error)}`);
+      }
     });
-    connection.on('reconnect-failed', (params: { error: string; attempt: number }) => {
+    connection.on('reconnect-failed', (params: { error: string; attempt: number; permanent?: boolean }) => {
       this.emitTrace({
         type: 'mcpl:server-connect-failed',
         serverId: connection.id,
-        error: params.error,
+        error: recorded(params.error),
         attempt: params.attempt,
         willRetry: connection.willReconnect,
       });
-      // The reconnect loop never gives up (backoff caps at ~300s), so
-      // "the server is effectively down" is an attempt-count judgment:
-      // 5 failed attempts ≈ a few minutes of outage. Throttled per
-      // (serverId, kind), so a long outage re-posts every ~15 min.
-      if (params.attempt >= 5) {
+      // The reconnect loop gives up only on a protocol-version verdict or a
+      // launch that couldn't be reaped (`permanent`), which no later attempt
+      // changes — alert at once, since no fifth attempt will come. Otherwise
+      // backoff caps at ~300s, so "the server is effectively down" is an
+      // attempt-count judgment: 5 failed attempts ≈ a few minutes of outage.
+      // Throttled per (serverId, kind), so a long outage re-posts every
+      // ~15 min.
+      if (params.permanent || params.attempt >= 5) {
         this.opsAlert(
           'mcpl-down',
           connection.id,
-          `MCPL server unreachable (attempt ${params.attempt}): ${params.error}`,
+          `MCPL server unreachable (attempt ${params.attempt}): ${recorded(params.error)}`,
         );
       }
     });
@@ -17856,7 +18552,7 @@ export class AgentFramework {
       this.emitTrace({
         type: 'mcpl:server-error',
         serverId: connection.id,
-        error: err.message,
+        error: recorded(err.message),
       });
     });
 
@@ -17883,7 +18579,87 @@ export class AgentFramework {
         willReconnect: connection.willReconnect,
       });
       this.emitTrace({ type: 'module:removed', moduleName: `mcpl:${connection.id}` });
+      // Lost for good (no reconnect, and the registry has dropped it): its
+      // tools leave the agents' list, as a disconnect's do.
+      if (!connection.willReconnect && this.mcplServerRegistry?.getServer(connection.id) !== connection) {
+        this.handleToolsListChanged(connection.id);
+      }
     });
+  }
+
+  /**
+   * Wire a modern-MCP connection's events. There's less here than for MCPL
+   * on purpose: no push, inference, channels or policy exist on this family.
+   * A list change, including the relist after a reconnect, takes the legacy
+   * engine's refresh path (`handleToolsListChanged`), so any wake it causes
+   * goes through ordinary admission: it parks under quiesce or a hold like
+   * every other wake. It installs no awareness gate, since that gate orders
+   * MCPL data-plane traffic, which this family doesn't carry.
+   */
+  private wireModernEvents(connection: ModernMcpConnection, config: McplServerConfig): void {
+    const recorded = serverTextRedactor(config);
+    connection.on('stderr', (params: { line: string }) => {
+      this.emitTrace({ type: 'mcpl:server-stderr', serverId: connection.id, line: recorded(params.line) });
+    });
+    connection.on('tools-list-changed', () => {
+      this.handleToolsListChanged(connection.id);
+    });
+    connection.on('reconnect', (info?: { attempts?: number }) => {
+      this.emitTrace({ type: 'mcpl:server-reconnected', serverId: connection.id, attempts: info?.attempts ?? 0 });
+      this.emitTrace({ type: 'module:added', moduleName: `mcpl:${connection.id}` });
+      this.handleToolsListChanged(connection.id);
+    });
+    const failed = (params: { error: string; attempt: number; permanent?: boolean }) => {
+      this.emitTrace({
+        type: 'mcpl:server-connect-failed',
+        serverId: connection.id,
+        error: recorded(params.error),
+        attempt: params.attempt,
+        willRetry: connection.willReconnect,
+      });
+      // `permanent`: reconnecting halted on a launch that couldn't be reaped.
+      // No later attempt will come, so alert now.
+      if (params.permanent || params.attempt >= 5) {
+        this.opsAlert('mcpl-down', connection.id, `MCP server unreachable (attempt ${params.attempt}): ${recorded(params.error)}`);
+      }
+    };
+    connection.on('connect-failed', failed);
+    connection.on('reconnect-failed', failed);
+    connection.on('error', (err: Error) => {
+      this.emitTrace({ type: 'mcpl:server-error', serverId: connection.id, error: recorded(err.message) });
+    });
+    connection.on('close', () => {
+      // A closed provider's class hints are stale (RFC-008), as for MCPL.
+      this.dropMcplToolClasses(connection.id);
+      this.emitTrace({
+        type: 'mcpl:server-closed',
+        serverId: connection.id,
+        code: null,
+        signal: null,
+        willReconnect: connection.willReconnect,
+      });
+      this.emitTrace({ type: 'module:removed', moduleName: `mcpl:${connection.id}` });
+      // Without reconnect a server lost on its own is gone, as the MCPL
+      // registry drops one; its configuration stays listed as disconnected.
+      // One the host is closing stays until that teardown is done: whoever
+      // closes it removes it, so the id stays held meanwhile.
+      if (!connection.isClosed && !connection.willReconnect && this.modernServers().get(connection.id) === connection) {
+        this.modernServers().delete(connection.id);
+        // Gone for good: its tools leave the agents' list, as a disconnect's do.
+        this.handleToolsListChanged(connection.id);
+      }
+    });
+  }
+
+  /** An MCP tool call's trace: a result the server marked an error (or one
+   *  the reading couldn't complete) is tool:failed, as on the other tool
+   *  paths; anything else is tool:completed. */
+  private traceMcpToolOutcome(serverId: string, tool: string, callId: string, result: ToolResult, durationMs: number): void {
+    if (result.isError) {
+      this.emitTrace({ type: 'tool:failed', module: `mcpl:${serverId}`, tool, callId, error: result.error ?? 'tool returned an error' });
+    } else {
+      this.emitTrace({ type: 'tool:completed', module: `mcpl:${serverId}`, tool, callId, durationMs });
+    }
   }
 
   /**
@@ -17892,6 +18668,7 @@ export class AgentFramework {
    */
   private async refreshMcplTools(): Promise<void> {
     if (!this.mcplServerRegistry) return;
+    const generation = ++this.mcplToolsRefreshStarted;
 
     const tools: import('./types/index.js').ToolDefinition[] = [];
     const toolFeatureSets = new Map<string, string>();
@@ -17899,7 +18676,7 @@ export class AgentFramework {
     const toolServers = new Map<string, string>();
     const listedServers = new Set<string>();
 
-    for (const server of this.mcplServerRegistry.getAllServers()) {
+    for (const server of [...this.mcplServerRegistry.getAllServers()]) {
       const config = this.mcplServerConfigs.get(server.id);
       const prefix = config?.toolPrefix ?? `mcpl--${server.id}`;
       try {
@@ -17943,7 +18720,67 @@ export class AgentFramework {
       }
     }
 
-    this.mcplTools = tools;
+    // Modern servers: the same namespacing, tool policy and RFC-008 class
+    // hints. Feature sets are MCPL and don't apply. A server whose listing
+    // fails stays unlisted (unknown), never "listed nothing".
+    // The servers there now: one connected while this refresh runs is
+    // listed by its own connect's refresh.
+    for (const server of [...this.modernServers().values()]) {
+      if (!server.isConnected) continue;
+      const config = this.mcplServerConfigs.get(server.id);
+      const prefix = config?.toolPrefix ?? `mcpl--${server.id}`;
+      try {
+        const listed = await server.listTools();
+        listedServers.add(server.id);
+        for (const tool of listed) {
+          if (!isToolAllowed(tool.name, config)) continue;
+          const namespacedName = `${prefix}--${tool.name}`;
+          toolServers.set(namespacedName, server.id);
+          const declaredClasses = parseDeclaredClasses(tool._meta, namespacedName);
+          if (declaredClasses) toolClasses.set(namespacedName, declaredClasses);
+          tools.push({
+            name: namespacedName,
+            description: tool.description ?? '',
+            inputSchema: tool.inputSchema as import('./types/index.js').ToolDefinition['inputSchema'],
+          });
+        }
+      } catch (error) {
+        // A listing the teardown closed under a stop() isn't the server's
+        // error (untilStopBegins lets such a listing go on after stop()).
+        if (!this.stopHasBegun()) {
+          this.emitTrace({
+            type: 'mcpl:server-error',
+            serverId: server.id,
+            error: `tools/list failed: ${redactServerText(error instanceof Error ? error.message : String(error), config ?? {})}`,
+          });
+        }
+      }
+    }
+
+    // A refresh started after this one has published already: it listed
+    // every server after this one did, a server replaced by a restart under
+    // the same id included, so this one's listings are older.
+    if (generation < this.mcplToolsRefreshPublished) return;
+    // A server removed while this refresh awaited its lists (a disconnect,
+    // or a server lost for good) publishes nothing: whichever refresh
+    // finishes last must not bring back a removed server's tools.
+    // Asked of the same listing the refresh began from, now.
+    const live = new Set<string>([
+      ...(this.mcplServerRegistry?.getAllServers() ?? []).map((server) => server.id),
+      ...this.modernServers().keys(),
+    ]);
+    const gone = new Set([...new Set(toolServers.values())].filter((serverId) => !live.has(serverId)));
+    if (gone.size > 0) {
+      for (const [name, serverId] of [...toolServers]) {
+        if (!gone.has(serverId)) continue;
+        toolServers.delete(name);
+        toolFeatureSets.delete(name);
+        toolClasses.delete(name);
+      }
+      for (const serverId of gone) listedServers.delete(serverId);
+    }
+    this.mcplToolsRefreshPublished = generation;
+    this.mcplTools = gone.size > 0 ? tools.filter((tool) => toolServers.has(tool.name)) : tools;
     this.mcplToolFeatureSets = toolFeatureSets;
     this.mcplToolClasses = toolClasses;
     this.mcplToolServers = toolServers;
@@ -18046,13 +18883,14 @@ export class AgentFramework {
 
     this.mcplToolRefreshInFlight = true;
     const oldToolNames = new Set(this.mcplTools.map(t => t.name));
+    const recorded = this.everyServerRedactor();
 
     this.refreshMcplTools()
       .then(() => {
         this.emitMcplToolDiff(oldToolNames, serverId);
       })
       .catch((error) => {
-        console.error('MCPL tool refresh error:', error);
+        console.error('MCPL tool refresh error:', recorded(error instanceof Error ? (error.stack ?? error.message) : error));
       })
       .finally(() => {
         this.mcplToolRefreshInFlight = false;
@@ -18094,9 +18932,10 @@ export class AgentFramework {
    */
   private dispatchMcplToolCall(agentName: string, call: ToolCall, serverId: string, prefix: string): void {
     const toolName = call.name.slice(prefix.length + 2); // strip "{prefix}--"
-    const server = this.mcplServerRegistry!.getServer(serverId);
+    const modern = this.modernServers().get(serverId) ?? null;
+    const server = modern ? null : this.mcplServerRegistry!.getServer(serverId);
 
-    if (!server) {
+    if (!modern && !server) {
       // RFC-007: refused before executing — no lifecycle events.
       this.toolLifecycleEmitter?.refuse(agentName, call.id);
       this.pushEvent({
@@ -18135,6 +18974,65 @@ export class AgentFramework {
     // The turn that sends: a send's engaged channel is recorded on it, even
     // when the send's result, or the open that follows, comes after the turn.
     const sendingTurn = SEND_ENGAGEMENT_TOOLS.has(toolName) ? this.turnRouting.get(agentName) : undefined;
+
+    const dispatchRedactor = serverTextRedactor(config ?? {});
+    const failDispatch = (error: unknown) => {
+      const raw = error instanceof Error ? error : new Error(String(error));
+      // Server and transport text, as every record of it is, with the
+      // configuration the call was dispatched under.
+      const recorded = dispatchRedactor;
+      const err = { message: recorded(raw.message), stack: raw.stack === undefined ? undefined : recorded(raw.stack) };
+      this.emitTrace({ type: 'tool:failed', module: `mcpl:${serverId}`, tool: toolName, callId: call.id, error: err.message, stack: err.stack });
+      // RFC-007: transport error, closed connection or timeout — no result.
+      this.toolLifecycleEmitter?.markDispatchFailure(agentName, call.id);
+      this.pushEvent({
+        type: 'tool-result',
+        callId: call.id,
+        toolName: call.name,
+        agentName,
+        moduleName: `mcpl:${serverId}`,
+        result: { success: false, error: err.message, isError: true },
+      });
+    };
+
+    // A script's call that returns structured content gets the server's
+    // result itself (the direct reading): the script receives both views
+    // whole, so nothing the model reading lowers (stubs, image placeholders,
+    // generated JSON) stands in for what the server sent. An MCPL peer's
+    // content blocks are the exception: what a script prints comes back to
+    // the model, so each gets the treatment RFC-005 gives it on every lane
+    // the model reads. A standard peer's blocks reach the script as sent.
+    const forScript = this.scriptToolWaiters?.has(call.id) ?? false;
+    const reading = async (result: { content?: unknown; isError?: boolean; structuredContent?: unknown }, mcpl: boolean): Promise<ToolResult> => {
+      if (!forScript || !Object.prototype.hasOwnProperty.call(result, 'structuredContent')) {
+        return this.mcpToolResult(result, call.id, mcpl);
+      }
+      const direct = AgentFramework.directToolResult(result);
+      if (mcpl) return Array.isArray(direct.data) ? { ...direct, data: direct.data.map(referenceBlockForScript) } : direct;
+      // A standard peer's content that isn't a list of blocks is a malformed
+      // result on the model's reading (normalizeStandardToolResult), so the
+      // script reads it that way too, its structured content kept.
+      if (!result.isError && result.content !== undefined && !Array.isArray(result.content)) {
+        return { success: false, isError: true, error: MALFORMED_CONTENT_NOTICE, data: [], structured: result.structuredContent };
+      }
+      return direct;
+    };
+
+    if (modern) {
+      // Modern MCP: no state exchange, no channels, no RFC-005 references.
+      modern.callTool(toolName, args)
+        .then((result) => reading(result, false))
+        .then((result) => {
+          this.traceMcpToolOutcome(serverId, toolName, call.id, result, Date.now() - startTime);
+          this.pushEvent({ type: 'tool-result', callId: call.id, toolName: call.name, agentName, moduleName: `mcpl:${serverId}`, result });
+        })
+        .catch(failDispatch);
+      return;
+    }
+    const legacy = server!;
+    // An MCPL peer's results get the RFC-005 reading; an MCP-only peer's
+    // the standard one, the same as a modern server's.
+    const mcplPeer = legacy.capabilities !== null;
 
     // Build state params for stateful tools (Step 8).
     // A tools/list attribution selects that exact stateful set. Untagged tools
@@ -18183,17 +19081,25 @@ export class AgentFramework {
       }
     }
 
-    server.sendToolsCall(toolName, args, stateParams)
+    legacy.sendToolsCall(toolName, args, stateParams)
       .then(async (result) => {
-        // RFC-005: register references and eagerly fetch the small ones
-        // before serialization, so their stubs carry a saved path.
-        await this.autoFetchReferences(result.content, serverId, true)
-          .catch((e) => console.error('[rfc005] autofetch error:', (e as Error).message));
-        return result;
+        // RFC-005: register references and fetch the small ones, and every
+        // one a script will read, before serialization, so their stubs carry
+        // a saved path. Only an MCPL peer's blocks are references; an
+        // MCP-only peer's are standard. A script reads the blocks unless the
+        // result is an error without structured content, which reaches it as
+        // its error text alone.
+        if (mcplPeer) {
+          const scriptReads = forScript
+            && (!result.isError || Object.prototype.hasOwnProperty.call(result, 'structuredContent'));
+          await this.autoFetchReferences(result.content, serverId, scriptReads)
+            .catch((e) => console.error('[rfc005] autofetch error:', (e as Error).message));
+        }
+        return { result, toolResult: await reading(result, mcplPeer) };
       })
-      .then((result) => {
+      .then(({ result, toolResult }) => {
         const durationMs = Date.now() - startTime;
-        this.emitTrace({ type: 'tool:completed', module: `mcpl:${serverId}`, tool: toolName, callId: call.id, durationMs });
+        this.traceMcpToolOutcome(serverId, toolName, call.id, toolResult, durationMs);
 
         // Record checkpoint from stateful tool response (Step 8).
         // Explicit response attribution is authoritative. Otherwise use the
@@ -18255,52 +19161,106 @@ export class AgentFramework {
           }
         }
 
-        // Convert MCP tool result to framework ToolResult.
-        // When the result contains non-text blocks (e.g. images from an MCP
-        // tool like zulip-mcp's fetch_attachment), pass the full content array
-        // through so toMembraneToolResult can preserve image blocks natively.
-        // Text-only results still collapse to a joined string for backward
-        // compatibility with callers that expect data to be string-ish.
-        const textContent = result.content
-          ?.filter((c) => c.type === 'text' && c.text)
-          .map((c) => c.text!)
-          .join('\n');
-        const hasNonText = result.content?.some((c) => c.type !== 'text');
-        const data = result.isError
-          ? undefined
-          : hasNonText
-            ? result.content
-            : (textContent || undefined);
-
         this.pushEvent({
           type: 'tool-result',
           callId: call.id,
           toolName: call.name,
           agentName,
           moduleName: `mcpl:${serverId}`,
-          result: {
-            success: !result.isError,
-            data,
-            error: result.isError ? (textContent || 'Tool call failed') : undefined,
-            isError: result.isError ?? false,
-          },
+          result: toolResult,
         });
       })
-      .catch((error) => {
-        const err = error instanceof Error ? error : new Error(String(error));
-        this.emitTrace({ type: 'tool:failed', module: `mcpl:${serverId}`, tool: toolName, callId: call.id, error: err.message, stack: err.stack });
-        // RFC-007: transport error, closed connection or timeout — no result.
-        this.toolLifecycleEmitter?.markDispatchFailure(agentName, call.id);
+      .catch(failDispatch);
+  }
 
-        this.pushEvent({
-          type: 'tool-result',
-          callId: call.id,
-          toolName: call.name,
-          agentName,
-          moduleName: `mcpl:${serverId}`,
-          result: { success: false, error: err.message, isError: true },
-        });
-      });
+  /**
+   * The direct path's reading of an MCP tool result (executeToolCall,
+   * ModuleContext.callTool). `data` stays the raw content array, as module
+   * callers have always received it. Two things change: a tool error
+   * (`isError: true`) is now a failure, where every answer used to count as
+   * success, and `structured` is added by presence.
+   */
+  private static directToolResult(result: { content?: unknown; isError?: boolean; structuredContent?: unknown }): ToolResult {
+    const structured = Object.prototype.hasOwnProperty.call(result, 'structuredContent')
+      ? { structured: result.structuredContent }
+      : {};
+    if (result.isError) {
+      const text = (Array.isArray(result.content) ? result.content : [])
+        .filter((b): b is { type: 'text'; text: string } => !!b && (b as { type?: unknown }).type === 'text' && typeof (b as { text?: unknown }).text === 'string')
+        .map((b) => b.text)
+        .join('\n');
+      // The raw content rides along on a failure too: it is the server's
+      // own account of the error, for a program that wants more than text.
+      return { success: false, data: result.content, error: text || 'Tool call failed', isError: true, ...structured };
+    }
+    return { success: true, data: result.content, ...structured };
+  }
+
+  /**
+   * The framework's ToolResult for an MCP tool result on the model path
+   * (model dispatch, and scripts, which ride it). A standard peer, meaning an MCP-only legacy
+   * server or any modern server, gets the standard reading
+   * (tool-result-normalize.ts): typed content blocks, workspace-saved
+   * payloads, and `structured` kept by presence. An MCPL peer keeps the
+   * RFC-005 reading. Its content array passes through when it holds
+   * non-text blocks, so references and images render natively. It gets
+   * `structured` too, with the JSON view when its content is empty. The
+   * direct path (a module's callTool, a channel's tool call) doesn't come
+   * here: it returns the server's result itself (directToolResult), for
+   * either engine, as does a script's call whose result is structured, with
+   * an MCPL peer's blocks given RFC-005's treatment (referenceBlockForScript).
+   */
+  private async mcpToolResult(
+    result: { content?: unknown; isError?: boolean; structuredContent?: unknown },
+    callId: string,
+    mcplPeer: boolean,
+  ): Promise<ToolResult> {
+    const hasStructured = Object.prototype.hasOwnProperty.call(result, 'structuredContent');
+    if (!mcplPeer) {
+      // The date and call id make a saved payload's name readable; the UUID
+      // makes it unique. Sanitizing and truncating map distinct ids to one
+      // label (`call:a` and `call/a`), and a later write would replace the
+      // earlier result's file.
+      const label = `${new Date().toISOString().slice(0, 10)}-${callId}`.replace(/[^A-Za-z0-9._-]/g, '_').slice(0, 80) + `-${randomUUID()}`;
+      const workspace = this.getWorkspaceModule();
+      const mount = workspace ? this.firstWritableMountName(workspace) : null;
+      // A save that fails resolves null, never rejects: the payload is then a
+      // lost part of a completed call's result, not a dispatch failure. Why it
+      // failed goes to the host's log; the stub says only that it did.
+      const save = workspace && mount
+        ? async (fileName: string, bytes: Buffer, mimeType: string) => {
+            const path = `${mount}/tool-results/${fileName}`;
+            try {
+              const written = await workspace.writeBinary(path, bytes, mimeType);
+              if (written.success) return path;
+              console.error(`[mcp] saving tool payload ${path} (${JSON.stringify(mimeType)}) failed: ${written.error ?? 'the workspace refused the write'}`);
+            } catch (error) {
+              console.error(`[mcp] saving tool payload ${path} (${JSON.stringify(mimeType)}) failed:`, error);
+            }
+            return null;
+          }
+        : null;
+      return normalizeStandardToolResult(result, label, save);
+    }
+    const blocks = (Array.isArray(result.content) ? result.content : []) as Array<{ type?: string; text?: string }>;
+    // When the result contains non-text blocks (RFC-005 references, images),
+    // pass the full content array through so toMembraneToolResult can
+    // preserve them natively. Text-only results collapse to a joined string
+    // for callers that expect data to be string-ish.
+    let textContent = blocks
+      .filter((c) => c.type === 'text' && c.text)
+      .map((c) => c.text!)
+      .join('\n');
+    if (blocks.length === 0 && hasStructured) textContent = JSON.stringify(result.structuredContent) ?? 'null';
+    const hasNonText = blocks.some((c) => c.type !== 'text');
+    const structured = hasStructured ? { structured: result.structuredContent } : {};
+    return {
+      success: !result.isError,
+      data: result.isError ? undefined : hasNonText ? blocks : (textContent || undefined),
+      error: result.isError ? (textContent || 'Tool call failed') : undefined,
+      isError: result.isError ?? false,
+      ...structured,
+    };
   }
 
   /**

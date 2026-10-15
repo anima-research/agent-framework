@@ -865,7 +865,7 @@ test('inbound handlers wait out a generation installed while they wait', async (
   framework.handleHostCommand = async () => { handled.push('host-command'); return { ok: true }; };
   const connection = new EventEmitter() as any;
   connection.id = 'discord';
-  framework.wireMcplEvents(connection);
+  framework.wireMcplEvents(connection, { id: 'discord' });
   const responder = { id: 1, respond: () => {}, respondError: () => {} };
   for (const event of ['push-event', 'inference-request', 'channels-incoming', 'host-command']) {
     connection.emit(event, {}, responder);
@@ -897,7 +897,7 @@ test('an inbound handler waiting on a generation that fails refuses its request 
   framework.handleHostCommand = async () => { handled.push('host-command'); return { ok: true }; };
   const connection = new EventEmitter() as any;
   connection.id = 'discord';
-  framework.wireMcplEvents(connection);
+  framework.wireMcplEvents(connection, { id: 'discord' });
   const answers: Array<{ event: string; code?: number; result?: unknown }> = [];
   for (const event of ['push-event', 'inference-request', 'channels-incoming', 'host-command']) {
     connection.emit(event, {}, {
@@ -929,7 +929,7 @@ test('with no generation current, an inbound event is handled in the turn it arr
   framework.handleHostCommand = async () => { handled.push('host-command'); return { ok: true }; };
   const connection = new EventEmitter() as any;
   connection.id = 'discord';
-  framework.wireMcplEvents(connection);
+  framework.wireMcplEvents(connection, { id: 'discord' });
   const responder = { id: 1, respond: () => {}, respondError: () => {} };
   for (const event of ['push-event', 'inference-request', 'channels-incoming', 'host-command']) {
     connection.emit(event, {}, responder);

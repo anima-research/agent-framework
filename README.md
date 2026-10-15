@@ -270,6 +270,148 @@ A pattern that matches no tool is reported once, as a console line and an
 A pattern that could name a server's tools is not judged until that server
 has listed them, so late connects and reconnects don't cause early reports.
 
+#### Modern MCP servers
+
+The same `mcplServers` list also takes servers that speak modern MCP,
+reached through the official SDK client: revision `2026-07-28`, and over
+HTTP the 2025 revisions too. The configuration chooses the family, and a
+stdio server is never probed:
+
+| Configuration | Family | Transport |
+|---|---|---|
+| `url: 'ws://…'` / `'wss://…'` | MCPL (MCP `2024-11-05`) | WebSocket |
+| `url: 'http://…'` / `'https://…'` | modern MCP (`2026-07-28`, `2025-11-25`, `2025-06-18` or `2025-03-26`, negotiated) | Streamable HTTP (`token` / `accessProvider` as bearer) |
+| `command` | MCPL | stdio |
+| `command` + `protocol: 'modern'` | modern MCP (`2026-07-28`) | stdio |
+
+```typescript
+{
+  mcplServers: [
+    { id: 'docs', url: 'https://mcp.example.com/mcp', accessProvider: getToken },
+    { id: 'search', command: 'search-mcp', protocol: 'modern', reconnect: true },
+  ],
+}
+```
+
+A configuration with both `command` and `url` needs `transport` to say which
+one is used; without it, it is refused rather than silently ignoring one.
+
+A modern server's tools get the same prefix, `enabledTools`/`disabledTools`,
+class overrides and dispatch as an MCPL server's, and `listMcplServers()`
+shows its `family`, `protocolVersion` and `transport`. Its config differs in
+three ways:
+- It has no MCPL surface (grant, push, channels, inference requests, feature
+  sets), so setting MCPL-only fields on one is a configuration error.
+- `requestTimeoutMs` is one deadline per tool call and must be 1 to 2^31−1;
+  0 is refused, where MCPL reads it as no watchdog.
+- Over stdio it takes no credential: `token` or `accessProvider` on one is
+  refused.
+
+At the deadline, cancellation is requested for a leg still in flight;
+between the rounds of an `input_required` continuation nothing is in flight
+to cancel. Either way the outcome is reported as unknown (`no-response`),
+and the call is never retried. A call that ends for any other reason after
+the server asked for another round, before its final answer, is reported
+the same way, since the server may already have acted. An MCPL server that
+refuses `2024-11-05` with `-32022` fails with `McplProtocolVersionError`,
+and is not retried. The error names the revisions the server says it
+supports, or its error text when it lists none, and when the list includes
+`2026-07-28` it says to configure the server with `protocol: 'modern'` (stdio)
+or reach it over http(s).
+
+Over HTTP the revision is negotiated at each connect. The client asks
+`server/discover` first and connects at `2026-07-28` when the server offers
+it. A server that doesn't gets the 2025 `initialize` handshake, which asks
+for `2025-11-25` and accepts `2025-11-25`, `2025-06-18` or `2025-03-26` in
+the answer.
+`listMcplServers()` shows the revision it settles on as `protocolVersion`,
+and its `family` stays `modern`. On a 2025 revision:
+- List changes arrive on the session's standalone stream, which is kept
+  open while the session lives, whether or not the server issues a session
+  id. Its first open is tried again after a 408, 409, 429, a 5xx other than
+  501 and 505, or a network error, each reported as the connection's
+  `error`, and a relist follows once it opens, also when it opens on the
+  SDK's own retry after a credential refresh. Any other refusal goes to the
+  SDK, which opens no stream: it takes a 405 quietly, tries a 401 once more
+  after the credential's refresh, and reports the rest as an `error`. A
+  stream that drops is reopened: the first try waits the server's `retry`
+  hint when it sent one, and the base interval otherwise, and a try after a
+  failed one waits the longer of the hint and the doubling backoff. A
+  reopen that carries `Last-Event-ID` has what it missed replayed by the
+  server. One that can't, because the server's events had no ids, the
+  stream that dropped had carried none, or the server refused the id with
+  400, opens without it and relists the tools of a server that announces
+  list changes.
+- A request's stream that the server closes after a priming event is
+  resumed for as long as the request lives. Its cancellation at the
+  deadline stops the resume too. A stream cut again before it carried a
+  new event id is resumed with the last id its call's resumes carried,
+  which the SDK would leave out (modelcontextprotocol/typescript-sdk#2499).
+  A call whose stream ends unanswered with nothing to resume from fails
+  then, as `no-response`, not at its deadline.
+- The server ends the session by answering 404 to a request that carried
+  its id (except the stream's first open, whose 404 can also mean the
+  server has no GET route). A call whose POST met the 404 fails as
+  `error-response` with `data.httpStatus` 404, and isn't replayed. A call
+  whose stream the server's restart cut is `no-response`, since the server
+  may have run it. A session that had answered a request gets a new one at
+  once, whatever `reconnect` says: the connection emits `close` while its
+  `willReconnect` reads true, then `reconnect`, and the framework keeps the
+  server and its tools and relists. If the new session can't start,
+  `reconnect` decides, as for any lost connection, and a revision verdict
+  stops it for good, as on any reconnect. Without `reconnect`, that failure
+  emits a second `close`, while `willReconnect` reads false: the server is
+  gone. A session that ended before answering anything is a failed connect:
+  it emits `reconnect-failed` and `close`, and follows `reconnect` with a
+  growing backoff. So a load balancer without sticky sessions, or a rolling
+  upgrade that lands a connect on an old node and its requests on a new
+  one, shows up as a failing server rather than a silent loop.
+- A server that moves to `2026-07-28` in place is followed, since the
+  session's end brings a new connect, which negotiates afresh. Two more
+  answers end a 2025 session, with a session id or without: a 400 carrying
+  JSON-RPC `-32022` to any request, as the SDK's 2026 handler answers 2025
+  traffic it refuses (`legacy: 'reject'`), and a 405 to a GET for one of
+  the session's streams after the server had served it (the standalone
+  stream's reopen, or a request stream's resume), as that handler answers a
+  2025 session it serves statelessly (its default). A call refused with
+  `-32022` fails as `error-response` with the server's code and data, and
+  isn't replayed. A server that keeps serving a 2025 revision statelessly
+  to a connection that never had a standalone stream isn't followed, unless
+  its upgrade cut a call's stream, whose resume then meets the 405: that
+  connection stays on 2025 until its next connect.
+- Each session the server holds by its id is ended with a `DELETE` when the
+  connection lets it go, waiting at most 3 s: at `close()`, and so `stop()`
+  or a disconnect, a connect in flight included, and when a connect fails
+  after its `initialize` was answered. A session the server let go, with a
+  404, a `-32022` or such a 405, gets none.
+
+On `2026-07-28` too, a dropped stream's retries follow that timing: the
+server's `retry` hint first, and the connection's backoff after a failed
+try. They stop after two failed tries, the SDK's default, on every stream:
+a listen stream that can't be resumed is reopened, with a relist, and a
+call whose stream can't be resumed fails then, as `no-response`, rather
+than at its deadline.
+
+A server over HTTP that this client can't negotiate a revision with fails
+with `McplProtocolVersionError`, naming what each side speaks, and is not
+retried: the SDK's own refusal, after which it negotiates no further (a
+`-32022` whose list names a revision from `2026-07-28` on that this client
+doesn't speak, even if the list also names a 2025 revision it does, which
+the message then says); a discovery or `-32022` error that lists no
+revision in common, once the server has also refused the `initialize`
+tried after it (`rejected`); or an `initialize` answered with a revision
+the 2025 handshake doesn't accept, or with none (`mismatch`). `2026-07-28` is
+negotiated through `server/discover` alone, so it isn't accepted from
+`initialize`. An `initialize` that fails without an answer, such as a
+timeout, is no verdict, and is retried as any failed connect is. The
+error's `offered` lists the revisions this client offered. `2024-11-05`
+isn't one of them over HTTP: its HTTP binding was HTTP+SSE, another
+transport. Over stdio, a discovery answer that lists revisions without
+`2026-07-28` is a verdict too, even one the SDK can't read as a
+DiscoverResult.
+
+Server and transport text the framework records has the server's configured credentials replaced, in both engines. That covers connection traces, console lines, stderr traces, ops alerts, and a tool call's failure as its caller, the model and the `tool:failed` trace get it. The credentials are those the configuration holds: from the url, credential-like path segments and query names, credential-shaped or credential-named query values, and a `ws://` url's userinfo, in their encoded and decoded forms, replaced wherever they occur; every non-empty query parameter as its whole `name=value`, where no letter or digit adjoins it; the static `token`, raw and url-encoded; and a stdio server's `env` values whose names have a part ending in a credential word, such as `GITHUB_TOKEN`, `PGPASSWORD` or `SESSION_COOKIE`, raw and url-encoded. A stdio server's command-line arguments aren't derived. Standalone strings shorter than eight characters stay unchanged because they may be ordinary words; short query values are still removed with their parameter names. Treat a submitted configuration as immutable while the server uses it: apply changes with `restartMcplServer(id, newConfig)`. The token an `accessProvider` fetches, and secrets the configuration doesn't hold, remain outside this filtering. JSON-RPC tool answers, and the error a host's own connect raises, pass through as sent.
+
 #### Feature sets
 
 `enabledFeatureSets` and `disabledFeatureSets` select which of a server's
