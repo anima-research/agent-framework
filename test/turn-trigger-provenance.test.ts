@@ -12,8 +12,24 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { AgentFramework } from '../src/index.js';
 import { isNonChannelSurfaceEvent } from '../src/framework.js';
-import type { InferenceRequest } from '../src/index.js';
+import type { InferenceRequest, Module, ProcessEvent, ProcessState, EventResponse } from '../src/index.js';
 import { MockMembrane, createMockResponse } from './helpers/mock-membrane.js';
+
+
+class SurfaceModule implements Module {
+  readonly name = 'surface';
+  async start(): Promise<void> {}
+  async stop(): Promise<void> {}
+  getTools() { return []; }
+  async handleToolCall() { return { success: false, error: 'no tools' }; }
+  async onProcess(event: ProcessEvent, _state: ProcessState): Promise<EventResponse> {
+    if (event.type !== 'external-message') return {};
+    return {
+      addMessages: [{ participant: 'user', content: [{ type: 'text', text: String(event.content) }] }],
+      requestInference: true,
+    };
+  }
+}
 
 function internals(framework: AgentFramework) {
   return framework as unknown as {
@@ -41,6 +57,33 @@ describe('non-channel surface classification', () => {
       type: 'external-message', source: 'bridge', content: 'hello', metadata: { channelId: '' },
     }), true);
     assert.equal(isNonChannelSurfaceEvent({ type: 'mcpl:channel-incoming', channelId: 'room' } as never), false);
+  });
+});
+
+
+describe('surface provenance through the real scheduler', () => {
+  it('pushEvent carries metadata.channelId onto the turn trigger', async () => {
+    const tempDir = mkdtempSync(join(tmpdir(), 'surface-channel-test-'));
+    const membrane = new MockMembrane();
+    membrane.pushResponse(createMockResponse([]));
+    const framework = await AgentFramework.create({
+      storePath: join(tempDir, 'store'), membrane: membrane.asMembrane(),
+      agents: [{ name: 'scout', model: 'test-model', systemPrompt: 'scout' }],
+      modules: [new SurfaceModule()],
+    });
+    let handed: InferenceRequest | undefined;
+    const i = internals(framework);
+    const start = i.startAgentStream.bind(framework);
+    i.startAgentStream = async (agent, trigger) => { handed = trigger; return start(agent, trigger); };
+    framework.pushEvent({
+      type: 'external-message', source: 'bridge', content: 'channel input',
+      metadata: { channelId: 'discord:g:room' }, triggerInference: true,
+    });
+    await framework.runUntilIdle();
+    assert.equal(handed?.channelId, 'discord:g:room');
+    assert.equal(handed?.nonChannelOrigin, false);
+    await framework.stop();
+    rmSync(tempDir, { recursive: true, force: true });
   });
 });
 
