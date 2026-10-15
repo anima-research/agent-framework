@@ -1,4 +1,4 @@
-- `inference:speech` and `inference:speech_complete` traces carry the
+- `inference:published` and `inference:published_complete` traces carry the
   outgoing stream to in-process consumers: each chunk as it is sent, with
   its `channelId`, `inferenceId`, `index` and `text`, and each channel's
   `complete`. They are emitted whether or not the channel's server takes

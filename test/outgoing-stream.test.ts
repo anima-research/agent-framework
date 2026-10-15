@@ -1,6 +1,6 @@
 /**
  * The outgoing stream (MCPL Spec 14.3 `channels/outgoing/chunk` and
- * `complete`, mirrored as the `inference:speech` traces) carries what
+ * `complete`, mirrored as the `inference:published` traces) carries what
  * delivery published, sent once each publish is confirmed. Text that
  * delivery withholds never reaches it: a round that a silencing tool,
  * `skip_reply` or a private `think` keeps back, text under a hybrid hold, a
@@ -167,9 +167,9 @@ async function harness(scripts: NormalizedResponse[][], config: Partial<AgentCon
   const stub = registry(framework, options);
   const traces: Array<{ type: string; channelId: string; text: string; inferenceId: string; index?: number }> = [];
   framework.onTrace((event) => {
-    if (event.type === 'inference:speech' || event.type === 'inference:speech_complete') {
+    if (event.type === 'inference:published' || event.type === 'inference:published_complete') {
       const { type, channelId, text: body, inferenceId } = event;
-      traces.push({ type, channelId, text: body, inferenceId, ...(event.type === 'inference:speech' ? { index: event.index } : {}) });
+      traces.push({ type, channelId, text: body, inferenceId, ...(event.type === 'inference:published' ? { index: event.index } : {}) });
     }
   });
   /**
@@ -187,7 +187,7 @@ async function harness(scripts: NormalizedResponse[][], config: Partial<AgentCon
   return { framework, membrane, module, run, settled, traces, ...stub };
 }
 
-test('a delivered round streams its text once its publish is confirmed, and the speech traces mirror the stream', async () => {
+test('a delivered round streams its text once its publish is confirmed, and the published traces mirror the stream', async () => {
   const h = await harness([[round(text('first'), call('one', 'test--read')), final(text('second'))]]);
   try {
     await h.run();
@@ -200,9 +200,9 @@ test('a delivered round streams its text once its publish is confirmed, and the 
       { kind: 'complete', channelId: 'world:test', text: 'first\n\nsecond', inferenceId: id },
     ], 'each publish is streamed once it is confirmed, and a later one to the same channel opens with a paragraph break');
     assert.deepEqual(h.traces, [
-      { type: 'inference:speech', channelId: 'world:test', text: 'first', inferenceId: id, index: 0 },
-      { type: 'inference:speech', channelId: 'world:test', text: '\n\nsecond', inferenceId: id, index: 1 },
-      { type: 'inference:speech_complete', channelId: 'world:test', text: 'first\n\nsecond', inferenceId: id },
+      { type: 'inference:published', channelId: 'world:test', text: 'first', inferenceId: id, index: 0 },
+      { type: 'inference:published', channelId: 'world:test', text: '\n\nsecond', inferenceId: id, index: 1 },
+      { type: 'inference:published_complete', channelId: 'world:test', text: 'first\n\nsecond', inferenceId: id },
     ]);
   } finally { await h.framework.stop(); }
 });
@@ -404,7 +404,7 @@ for (const failure of ['unconfirmed', 'throw'] as const) {
       assert.deepEqual(h.publishes().map((p) => p.text), ['lost', 'kept'], 'both publishes were tried');
       assert.deepEqual(h.chunks().map((c) => c.text), ['kept'], 'only the confirmed one streams');
       assert.deepEqual(h.completes().map((c) => c.text), ['kept'], 'and the complete carries only it');
-      assert.equal(h.traces.some((t) => t.text.includes('lost')), false, 'nor do the speech traces');
+      assert.equal(h.traces.some((t) => t.text.includes('lost')), false, 'nor do the published traces');
     } finally { await h.framework.stop(); }
   });
 }
@@ -417,7 +417,7 @@ test('a stream stopped mid-turn still completes what it published', async () => 
   let published!: () => void;
   const firstOut = new Promise<void>((resolve) => { published = resolve; });
   h.module.during = async () => { await held; };
-  const unlog = h.framework.onTrace((event) => { if (event.type === 'inference:speech') published(); });
+  const unlog = h.framework.onTrace((event) => { if (event.type === 'inference:published') published(); });
   try {
     h.framework.pushEvent({ type: 'external-message', source: 'test', content: 'go', metadata: {} });
     void h.framework.runUntilIdle().catch(() => {});
@@ -474,8 +474,8 @@ for (const late of ['rejected', 'confirmed'] as const) {
       assert.deepEqual(h.log.filter((e) => e.kind !== 'publish').map((e) => `${e.kind}:${e.text}`),
         ['chunk:first', 'complete:first', 'mark:registry stopped', 'mark:teardown'],
         'the stream completes before the registry forgets its channels and the teardown, with what it sent, and nothing streams after its complete');
-      assert.deepEqual(h.traces.map((t) => `${t.type}:${t.text}`), ['inference:speech:first', 'inference:speech_complete:first'],
-        'and the speech traces say the same');
+      assert.deepEqual(h.traces.map((t) => `${t.type}:${t.text}`), ['inference:published:first', 'inference:published_complete:first'],
+        'and the published traces say the same');
     } finally {
       releaseTwo();
       await h.framework.stop();
@@ -586,15 +586,15 @@ test("with the real channel registry, a stop() with a publish still out sends th
   }
 });
 
-test("the speech traces are emitted when the channel's server takes no stream", async () => {
+test("the published traces are emitted when the channel's server takes no stream", async () => {
   const h = await harness([[round(text('first'), call('one', 'test--read')), final(text('second'))]], {}, { streaming: false });
   try {
     await h.run();
     assert.deepEqual(h.chunks(), [], 'the server is sent no chunk');
     assert.deepEqual(h.traces.map((t) => `${t.type}:${t.text}`), [
-      'inference:speech:first',
-      'inference:speech:\n\nsecond',
-      'inference:speech_complete:first\n\nsecond',
+      'inference:published:first',
+      'inference:published:\n\nsecond',
+      'inference:published_complete:first\n\nsecond',
     ], 'in-process consumers still hear what was published');
   } finally { await h.framework.stop(); }
 });
@@ -618,7 +618,7 @@ for (const c of unconfirmedCases) {
         assert.ok(h.publishes().some((p) => p.text === c.lost), 'the publish was tried');
         assert.equal(h.chunks().some((ch) => ch.text.includes(c.lost)), false, 'no chunk carries it');
         assert.equal(h.completes().some((co) => co.text.includes(c.lost)), false, 'nor does a complete');
-        assert.equal(h.traces.some((t) => t.text.includes(c.lost)), false, 'nor a speech trace');
+        assert.equal(h.traces.some((t) => t.text.includes(c.lost)), false, 'nor a published trace');
         if (c.kept) {
           assert.deepEqual(h.chunks().map((ch) => ch.text), [c.kept], 'the confirmed publish beside it still streams');
         }

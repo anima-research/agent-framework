@@ -174,7 +174,7 @@ export type TraceEvent =
        * tool's announcement among them, with no stream id, index or end, so
        * a relay that voices speech takes one of the two.
        */
-      type: 'inference:speech';
+      type: 'inference:published';
       agentName: string;
       /** Where the prose is published. */
       channelId: string;
@@ -189,10 +189,10 @@ export type TraceEvent =
        * A stream's end for one channel it published to (MCPL Spec 14.3
        * `channels/outgoing/complete`), sent on every exit path once the
        * stream has ended and its deliveries have run, or, when the host
-       * stops, at once: `text` is everything its `inference:speech` chunks
+       * stops, at once: `text` is everything its `inference:published` chunks
        * carried there, and none follows it.
        */
-      type: 'inference:speech_complete';
+      type: 'inference:published_complete';
       agentName: string;
       channelId: string;
       inferenceId: string;

@@ -11944,7 +11944,7 @@ export class AgentFramework {
 
     // MCPL Spec 14.3 outgoing streaming: the prose this stream's deliveries
     // publish, sent to the channel's server once each publish is confirmed
-    // (voice synthesis), and to in-process consumers as an `inference:speech`
+    // (voice synthesis), and to in-process consumers as an `inference:published`
     // trace. Delivery feeds it, never the text as the model writes it, so it
     // carries only what delivery published, where it published it. A
     // round's text reaches it once the round's routing is decided and its
@@ -11972,7 +11972,7 @@ export class AgentFramework {
       const index = outgoingIndex++;
       this.channelRegistry?.sendOutgoingChunk(channelId, agent.name, outgoingInferenceId, index, delta);
       this.emitTrace({
-        type: 'inference:speech',
+        type: 'inference:published',
         agentName: agent.name,
         channelId,
         inferenceId: outgoingInferenceId,
@@ -11995,7 +11995,7 @@ export class AgentFramework {
       for (const [channelId, text] of outgoingText) {
         this.channelRegistry?.sendOutgoingComplete(channelId, agent.name, outgoingInferenceId, text);
         this.emitTrace({
-          type: 'inference:speech_complete',
+          type: 'inference:published_complete',
           agentName: agent.name,
           channelId,
           inferenceId: outgoingInferenceId,
