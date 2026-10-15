@@ -630,6 +630,8 @@ export class EventGate {
   // land as a redundant empty wake right after the turn).
   private selfWakeTimers = new Map<string, ReturnType<typeof setTimeout>>();
   private selfWakeIntents = new Map<string, PersistedWakeIntent>();
+  private wakeIntentsRestored = false;
+  private overdueWakeIntentsAdmitted = false;
 
   // Privileged users who may wake the agent through sleep. Hot-reloaded from
   // privilegedUsersPath on change.
@@ -1973,6 +1975,8 @@ export class EventGate {
 
   /** Restore durable intent and future timers without changing the journal. */
   restoreWakeIntents(): void {
+    if (this.wakeIntentsRestored) return;
+    this.wakeIntentsRestored = true;
     const state = this.readWakeState();
     if (!state) return;
     const now = this.now();
@@ -1992,6 +1996,8 @@ export class EventGate {
 
   /** Admit restored overdue intents at the final safe startup/resume boundary. */
   admitOverdueWakeIntents(): void {
+    if (this.overdueWakeIntentsAdmitted) return;
+    this.overdueWakeIntentsAdmitted = true;
     const now = this.now();
     const due: Array<{ intent: PersistedWakeIntent; kind: 'sleep' | 'self-wake' }> = [];
     if (this.sleepUntil > 0 && this.sleepUntil <= now) {
@@ -2041,6 +2047,8 @@ export class EventGate {
   }
 
   private armRestoredSelfWake(intent: PersistedWakeIntent): void {
+    const previous = this.selfWakeTimers.get(intent.agentName!);
+    if (previous) clearTimeout(previous);
     const remaining = Math.max(0, intent.wakeAt - this.now());
     const delay = Math.min(remaining, 0x7fffffff);
     const timer = setTimeout(() => {
