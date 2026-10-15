@@ -6374,7 +6374,7 @@ export class AgentFramework {
    */
   private async reactToRefusal(agentName: string, category: string): Promise<void> {
     try {
-      if (this.turnRouting.get(agentName)?.nonChannelOrigin === true) return;
+      if (this.turnRouting?.get(agentName)?.nonChannelOrigin === true) return;
       const incoming = this.channelRegistry?.buildChannelContext()?.incoming;
       if (!incoming) return;
       // incoming.channelId is the MCPL composite id ("discord:<guild>:<channel>");
@@ -11980,7 +11980,7 @@ export class AgentFramework {
         : turnProseRouting === 'explicit'
           ? trigger?.channelId ?? null
           : resolveTurnLocus();
-    if (typingChannel) this.channelRegistry!.startTyping(typingChannel);
+    if (typingChannel) this.channelRegistry?.startTyping(typingChannel);
 
     // MCPL Spec 14.3 outgoing streaming: route text deltas to their
     // destination server AS THEY GENERATE (voice synthesis, live message

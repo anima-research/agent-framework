@@ -1015,7 +1015,7 @@ test("a fresh turn starts new routing state in every mode, and leaves the earlie
       assert.equal(now?.continuation, false, `${mode}: no continuation`);
       assert.deepEqual(now?.deliveries, [], `${mode}: no deliveries carried into the new turn`);
       assert.equal(now?.suppressed, 0, `${mode}: no suppression carried into the new turn`);
-      assert.equal(now?.triggerChannel, undefined, `${mode}: no trigger channel carried into the new turn`);
+      assert.equal(now?.triggerChannel, 'test:channel', `${mode}: the new turn uses its own triggering channel`);
       assert.notEqual(now?.locus, 'chan-earlier', `${mode}: no locus carried into the new turn`);
       assert.deepEqual([...(now?.engaged ?? [])], [], `${mode}: no engaged channels carried into the new turn`);
       assert.deepEqual(now?.arrivals, [], `${mode}: no arrival carried into the new turn`);
