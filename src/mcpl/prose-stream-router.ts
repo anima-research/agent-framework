@@ -21,13 +21,13 @@
  *
  * Three modes, mirroring proseRouting:
  *  - explicit: parse `>>` prefixes. A fresh turn's stream starts suppressed;
- *              one that resumes a turn starts at the turn's destination, and
- *              each round's end returns the stream to it (retarget).
- *  - hybrid:   parse `>>>` envelopes, with the frozen turn locus as the
+ *              a later stream of the turn starts at the turn's destination,
+ *              and each round's end returns the stream to it (retarget).
+ *  - hybrid:   parse `>>>` envelopes, with the turn's locus as the
  *              fallback. An envelope with no target, or `>>>skip_reply`,
  *              holds back what follows until a later `>>>` names a target.
  *  - locus:    NO prefix parsing (locus mode's `>>` lines are plain text);
- *              everything streams to the frozen turn locus.
+ *              everything streams to the turn's locus.
  */
 
 export interface RoutedDelta {
@@ -52,9 +52,9 @@ export class ProseStreamRouter {
     private opts: {
       /** explicit parses `>>`; hybrid parses `>>>` while retaining locus fallback. */
       mode: 'explicit' | 'hybrid' | 'locus';
-      /** Initial destination: the frozen turn locus (locus and hybrid mode); in
+      /** Initial destination: the turn's locus (locus and hybrid mode); in
        *  explicit mode, null on a fresh turn, or the turn's destination on a
-       *  stream that resumes one. */
+       *  later stream of the turn. */
       initialTarget: string | null;
       /** Resolve a `>>spec` to a channelId, or null (unresolved/ambiguous). */
       resolve: (spec: string) => string | null;

@@ -60,7 +60,8 @@ async function harness() {
   framework.mcplToolFeatureSets = new Map();
   framework.checkpointManager = null;
   framework.channelRegistry = registry;
-  framework.turnEngagedChannels = new Map();
+  // The sending turn's routing, whose engaged set a send tool records into.
+  framework.turnRouting = new Map([['sol', { engaged: new Set<string>() }]]);
   framework.emitTrace = () => {};
   const windowMessages: string[] = [];
   framework.addMessage = (_role: string, content: Array<{ text?: string }>) => {
@@ -79,7 +80,7 @@ async function harness() {
           clearTimeout(timeout);
           resolve({
             success: event.result.success,
-            engagedAtResult: [...(framework.turnEngagedChannels.get('sol') ?? [])],
+            engagedAtResult: [...(framework.turnRouting.get('sol')?.engaged ?? [])],
           });
         }
       };

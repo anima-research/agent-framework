@@ -41,11 +41,14 @@ export type TraceEvent =
       type: 'inference:started';
       agentName: string;
       /**
-       * The turn-frozen outbound locus (see turnLocusPins) — the channel this
-       * turn's plain prose will be routed to. Omitted for turns with no locus
-       * (heartbeats with no default channel). Observability only, like every
-       * trace field; lets external taps (e.g. a TTS relay) tag the whole
-       * activation with its channel without re-deriving routing.
+       * The turn's locus as this stream starts (locus and hybrid mode): where
+       * its unprefixed plain prose is published, unless a hybrid `>>>`
+       * destination takes it, or a re-pin or a `channel_open` moves the locus
+       * later in the turn. Omitted for a turn with no locus: explicit and
+       * disabled mode, a silent turn, and a heartbeat with no default
+       * channel. Observability only, like every trace field; lets external
+       * taps (e.g. a TTS relay) tag the whole activation with its channel
+       * without re-deriving routing.
        */
       channelId?: string;
       /** True for a control-plane wake that must not surface typing/prose. */
@@ -104,7 +107,9 @@ export type TraceEvent =
       blockType: 'text' | 'thinking' | 'tool_call' | 'tool_result';
       /** 0-indexed block position in the current assistant turn. */
       blockIndex: number;
-      /** Turn-frozen outbound locus for this turn (see inference:started). */
+      /** The channel this stream shows typing in: the turn's locus as the
+       *  stream started (see inference:started), or in explicit mode the
+       *  channel the start's wake came from. */
       channelId?: string;
     })
   | (TraceEventBase & {
@@ -119,7 +124,9 @@ export type TraceEvent =
       phase: 'block_start' | 'block_complete';
       blockType: 'text' | 'thinking' | 'tool_call' | 'tool_result';
       blockIndex: number;
-      /** Turn-frozen outbound locus for this turn (see inference:started). */
+      /** The channel this stream shows typing in: the turn's locus as the
+       *  stream started (see inference:started), or in explicit mode the
+       *  channel the start's wake came from. */
       channelId?: string;
     })
   | (TraceEventBase & {

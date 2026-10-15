@@ -14,6 +14,11 @@ jobs:
     name: Build & Test
     runs-on: ubuntu-latest
 
+    # issues: read lets the release-hold check list the open holds.
+    permissions:
+      contents: read
+      issues: read
+
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
@@ -23,6 +28,17 @@ jobs:
         uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
         with:
           node-version: 20
+
+      # The same check `npm version` runs first (see CONTRIBUTING.md): an
+      # open issue labelled release-hold stops the release. Both jobs that
+      # release need this one and check again themselves, so a held tag
+      # reaches neither npm nor the GitHub release notes. A dispatch on a
+      # branch releases nothing, so it isn't held.
+      - name: Release holds
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: node scripts/release-holds.mjs
+        env:
+          GH_TOKEN: ${{ github.token }}
 
       - name: Install dependencies
         run: npm install
@@ -46,9 +62,11 @@ jobs:
     # exchanges it for a publish credential. No long-lived NPM_TOKEN secret.
     # npm-side config: npmjs.com -> package -> Settings -> Trusted Publishers
     # -> GitHub Actions, matching the repo + this workflow path.
+    # issues: read lets prepublishOnly's release-hold check list the holds.
     permissions:
       contents: read
       id-token: write
+      issues: read
 
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
@@ -79,6 +97,10 @@ jobs:
 
       - name: Publish
         run: npm publish --access public --provenance
+        env:
+          # prepublishOnly checks the release holds again, as the build job
+          # did, with the same token.
+          GH_TOKEN: ${{ github.token }}
 
   github-release:
     name: GitHub release notes
@@ -89,13 +111,23 @@ jobs:
     # publish fails — the two jobs succeed or fail on their own.
     if: startsWith(github.ref, 'refs/tags/v')
 
+    # issues: read lets the release-hold check list the holds.
     permissions:
       contents: write
+      issues: read
 
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
           persist-credentials: false
+
+      # Checked again here, as prepublishOnly checks it again in the
+      # publish job: a hold filed after the build job's check stops these
+      # notes as it stops the npm publish.
+      - name: Release holds
+        run: node scripts/release-holds.mjs
+        env:
+          GH_TOKEN: ${{ github.token }}
 
       - name: Mirror changelog section into release notes
         env:

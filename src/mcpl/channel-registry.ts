@@ -533,17 +533,19 @@ interface ChannelRegistryOptions {
    */
   homeChannelResolver?: (agentName: string) => string | undefined;
   /**
-   * Resolve the channel that triggered an agent's CURRENT inference turn, by
-   * agent name. This is the fix for single-TRUNK agents (the only mode
+   * Resolve an agent's channel for its CURRENT inference turn, by agent name:
+   * the turn's locus once it has one, else the channel that triggered the
+   * turn. This is the fix for single-TRUNK agents (the only mode
    * connectome-host runs — it never exposes conversation forks). A trunk agent
    * has no fork home, so without this its plain-text speech falls back to the
    * process-global `defaultPublishChannel`, which tracks the most-recent inbound
    * across ALL channels and misroutes a reply to whichever channel last spoke
-   * under concurrency (item-3 redux). The framework tracks the triggering
-   * channel of the live turn per-agent and exposes it here; resolves to
-   * undefined for a heartbeat / no-trigger turn, which correctly keeps the
-   * global fallback. Consulted AFTER `homeChannelResolver` (a fork's home always
-   * wins), BEFORE `defaultPublishChannel`.
+   * under concurrency (item-3 redux). The framework keeps both on the live
+   * turn's routing state and exposes them here. For a heartbeat / no-trigger
+   * turn it resolves to undefined until the turn's locus is resolved, so that
+   * resolution takes the global fallback, which the turn then keeps.
+   * Consulted AFTER `homeChannelResolver` (a fork's home always wins), BEFORE
+   * `defaultPublishChannel`.
    */
   activeChannelResolver?: (agentName: string) => string | undefined;
 }
@@ -1474,8 +1476,9 @@ export class ChannelRegistry {
 
     // Resolve the outbound locus the SAME way routeSpeech does, so the agent is
     // told the channel its speech will actually land in: a conversation fork's
-    // home channel, else this turn's triggering channel (single trunk agent —
-    // item-3 redux), else the global default (heartbeats). Without this, a fork
+    // home channel, else this turn's channel (single trunk agent — item-3
+    // redux: its locus, else its triggering channel), else the global default
+    // (heartbeats). Without this, a fork
     // was advertised the global locus but published somewhere else; and a trunk
     // agent was told the wrong channel under concurrency.
     const home = agentName ? this.homeChannelResolver?.(agentName) : undefined;
