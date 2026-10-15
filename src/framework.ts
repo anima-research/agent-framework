@@ -10855,12 +10855,7 @@ export class AgentFramework {
       return;
     }
     console.error(`[prose] ${agent.name}: '!' continuation — requesting immediate next turn`);
-    this.pendingRequests.push({
-      agentName: agent.name,
-      reason: 'prose-continuation',
-      source: 'framework',
-      timestamp: Date.now(),
-    });
+    this.pendingRequests.push(this.derivedTurnRequest(agent.name, 'prose-continuation', routing));
   }
 
   /** The agent's routing state for its current turn, made when it has none. */
@@ -10871,6 +10866,23 @@ export class AgentFramework {
       this.turnRouting.set(agentName, routing);
     }
     return routing;
+  }
+
+
+  /** Build a fresh request caused by a logical turn, retaining private origin. */
+  private derivedTurnRequest(
+    agentName: string,
+    reason: string,
+    routing?: TurnRouting,
+  ): InferenceRequest {
+    const cause = routing ?? this.turnRouting.get(agentName) ?? this.openLogical.get(agentName);
+    return {
+      agentName,
+      reason,
+      source: 'framework',
+      timestamp: Date.now(),
+      ...(cause?.nonChannelOrigin ? { nonChannelOrigin: true } : {}),
+    };
   }
 
   /**
@@ -11148,12 +11160,7 @@ export class AgentFramework {
     if (!capped) {
       // Wake so the resend can happen immediately — an unsent DM reply must
       // not sit invisible until the next unrelated event.
-      this.pendingRequests.push({
-        agentName: name,
-        reason: 'prose-bounce',
-        source: 'framework',
-        timestamp: Date.now(),
-      });
+      this.pendingRequests.push(this.derivedTurnRequest(name, 'prose-bounce'));
     }
   }
 
@@ -12684,12 +12691,10 @@ export class AgentFramework {
                 const count = this.updateRewindMarker(agent, category);
                 onStep(count);
                 if (forced) forced.removed.push(rec);
-                this.pendingRequests.push({
-                  agentName: agent.name,
-                  reason: forced ? 'unstick-retry' : 'refusal-rewind-retry',
-                  source: 'framework',
-                  timestamp: Date.now(),
-                });
+                this.pendingRequests.push(this.derivedTurnRequest(
+                  agent.name,
+                  forced ? 'unstick-retry' : 'refusal-rewind-retry',
+                ));
                 handledByRewind = true;
               };
 
@@ -15885,12 +15890,7 @@ export class AgentFramework {
     );
 
     // Retry immediately on the repaired history (bounded by the cap above).
-    this.pendingRequests.push({
-      agentName: agent.name,
-      reason: 'inference-failure-rewind-retry',
-      source: 'framework',
-      timestamp: Date.now(),
-    });
+    this.pendingRequests.push(this.derivedTurnRequest(agent.name, 'inference-failure-rewind-retry'));
   }
 
   // ==========================================================================
