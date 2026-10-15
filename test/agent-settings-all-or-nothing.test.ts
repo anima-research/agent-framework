@@ -2,9 +2,10 @@
  * agent_settings checks every setting a call names before it applies any, as
  * far as a check can tell: the names, the core settings' own checks and each
  * extension's validate. What a check can't foresee (an extension without
- * validate, a strategy's own refusal, a store write that fails) can still
- * refuse after something applied, so what can refuse goes first, and every
- * refusal says exactly what the call changed: nothing, or which settings.
+ * validate, the budget preflight, a strategy's own refusal, a store write
+ * that fails) can still refuse after something applied, so what can refuse
+ * goes first, and every refusal says exactly what the call changed: nothing,
+ * or which settings.
  */
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
