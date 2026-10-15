@@ -11015,7 +11015,7 @@ export class AgentFramework {
       }
       const sticky = routing.pin;
       if (!allowLocus && !sticky) {
-        this.recordProseSuppression(routing, 1);
+        this.suppressPrivateTurnProse(routing, 1);
         continue;
       }
       const target = sticky ?? locus;
@@ -12286,7 +12286,7 @@ export class AgentFramework {
                       // Queued under this turn's routing, whenever it posts.
                       const routing = streamRouting;
                       for (const seg of roundSegments) {
-                        chainSpeech(() => this.deliverHybridProse(agent, seg, locus, true, routing), 'mid-turn hybrid prose delivery failed:');
+                        chainSpeech(() => this.deliverHybridProse(agent, seg, locus, !routing.nonChannelOrigin, routing), 'mid-turn hybrid prose delivery failed:');
                       }
                     }
                   } else if (turnProseRouting === 'explicit') {
@@ -12789,8 +12789,6 @@ export class AgentFramework {
                 if (turnProseRouting === 'disabled') {
                   console.error(`[routing] ${agent.name}: text-only prose NOT routed (proseRouting=disabled)`);
                   this.recordProseSuppression(streamRouting, 1);
-                } else if (streamRouting.nonChannelOrigin) {
-                  this.suppressPrivateTurnProse(streamRouting, 1);
                 } else if (turnSilenced && turnProseRouting !== 'explicit') {
                   // Only reachable on a guard recovery that carried the
                   // same-turn send suppression, or a suppressProse trigger
@@ -12802,7 +12800,7 @@ export class AgentFramework {
                   const locus = resolveTurnLocus();
                   console.error(`[prose] ${agent.name}: text-only turn -> hybrid prose gateway`);
                   try {
-                    await this.deliverHybridProse(agent, speechText, locus, true, finalRouting);
+                    await this.deliverHybridProse(agent, speechText, locus, !streamRouting.nonChannelOrigin, finalRouting);
                   } catch (err) {
                     console.error('text-only hybrid prose delivery failed:', err);
                   }
@@ -12813,6 +12811,8 @@ export class AgentFramework {
                   } catch (err) {
                     console.error('text-only prose delivery failed:', err);
                   }
+                } else if (streamRouting.nonChannelOrigin) {
+                  this.suppressPrivateTurnProse(streamRouting, 1);
                 } else {
                   // Route to the TURN-FROZEN locus, like every other speech
                   // path. This dispatch runs AFTER the agent is idle, so a live
@@ -12876,7 +12876,7 @@ export class AgentFramework {
                   const locus = resolveTurnLocus();
                   for (const seg of segments) {
                     try {
-                      await this.deliverHybridProse(agent, seg, locus, true, finalRouting);
+                      await this.deliverHybridProse(agent, seg, locus, !streamRouting.nonChannelOrigin, finalRouting);
                     } catch (err) {
                       console.error('trailing hybrid prose delivery failed:', err);
                     }
@@ -12938,7 +12938,7 @@ export class AgentFramework {
             // Locus and hybrid mode; explicit-mode envelopes acknowledge
             // themselves through the prose gateway.
             await turnSpeechChain;
-            if (!trigger?.suppressProse && turnProseRouting !== 'explicit') {
+            if (!trigger?.suppressProse) {
               this.appendProseDeliveryReceipt(agent, streamRouting);
             }
 
