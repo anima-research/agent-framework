@@ -298,6 +298,20 @@ describe('agent_settings checks a call\'s settings before it applies any, and sa
     });
   });
 
+  it('a saved setting the strategy doesn\'t apply is named when a refused reset cleared it', async () => {
+    await withFramework({ strategy: false }, (framework, call) => {
+      assert.equal(call({ action: 'update', tool_result_inline_max_chars: 5_000 }).success, true);
+      // Saved under a strategy with live settings; this one doesn't apply it.
+      (framework.getAgent('agent') as unknown as { runtimeSettingsOverrides: Record<string, unknown> })
+        .runtimeSettingsOverrides.tailTokens = 20_000;
+      (framework as unknown as { persistToolResultInlineCap: (...args: unknown[]) => void })
+        .persistToolResultInlineCap = () => { throw new Error('zz-disk full'); };
+      const refused = call({ action: 'reset', settings: ['tail_tokens', 'tool_result_inline_max_chars'] });
+      assert.equal(refused.error,
+        'zz-disk full. Changed before the refusal: tail_tokens, tool_result_inline_max_chars; nothing else in this call was.');
+    });
+  });
+
   it('the budget preflight\'s notes are logged only once the budget has applied', async () => {
     await withFramework({ strategy: false }, (framework, call) => {
       const warned: string[] = [];

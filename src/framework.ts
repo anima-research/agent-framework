@@ -19086,13 +19086,18 @@ export class AgentFramework {
   /** An agent's settings now, the core ones and the given extensions'. */
   private readAgentSettings(agentName: string, exts: AgentSettingsExtension[]): SettingsReading {
     const s = this.getAgentRuntimeSettings(agentName);
+    // What the agent keeps saved for each, too: a saved value the strategy
+    // doesn't apply can still be set or cleared, and is persisted.
+    const saved = this.agents.get(agentName)?.getRuntimeSettingsOverrides() ?? {};
     return {
       core: {
         // The budget it's set to, the one compiles plan at, and its transition
         // all change with a budget update.
-        context_budget_tokens: JSON.stringify([s.contextBudgetTokens, s.effectiveContextBudgetTokens, s.transition]),
-        tail_tokens: JSON.stringify(s.tailTokens ?? null),
-        transition_pace_tokens: JSON.stringify(s.transitionPaceTokens ?? null),
+        context_budget_tokens: JSON.stringify([
+          s.contextBudgetTokens, s.effectiveContextBudgetTokens, s.transition, saved.contextBudgetTokens ?? null,
+        ]),
+        tail_tokens: JSON.stringify([s.tailTokens ?? null, saved.tailTokens ?? null]),
+        transition_pace_tokens: JSON.stringify([s.transitionPaceTokens ?? null, saved.transitionPaceTokens ?? null]),
         same_round_think_text_policy: JSON.stringify([s.sameRoundThinkTextPolicy, s.sameRoundThinkTextPolicySource]),
       },
       exts: new Map(exts.map((ext) => [ext, readExtensionSettings(ext, agentName)])),
