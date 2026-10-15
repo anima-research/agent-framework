@@ -10879,7 +10879,7 @@ export class AgentFramework {
     reason: string,
     routing?: TurnRouting,
   ): InferenceRequest {
-    const cause = routing ?? this.turnRouting.get(agentName) ?? this.openLogical.get(agentName);
+    const cause = routing ?? this.turnRouting?.get(agentName) ?? this.openLogical?.get(agentName);
     return {
       agentName,
       reason,
