@@ -592,6 +592,46 @@ describe('a compile refused for budget holds its turn (#304)', () => {
     });
   });
 
+  it('stops the hold\'s drain kick when a surgery takes the store mid-tick, and the surgery waits for it', async () => {
+    await withBacklog({}, async (backlog) => {
+      // One maintenance pass at start, then none for an hour.
+      const t = await residentTurn({ maintenanceIntervalMs: 3_600_000 });
+      const fw = t.framework as unknown as {
+        maintenancePass: unknown;
+        overBudgetDrainAfter: Map<string, unknown[]>;
+        kickOverBudgetDrain: (name: string, agent: unknown, after?: () => void) => void;
+      };
+      const proto = ContextManager.prototype as unknown as Patchable;
+      try {
+        assert.ok(await pollUntil(() => fw.maintenancePass === null, 3_000), 'the start pass is done');
+        // From here a tick waits to be let go, as a compression call does.
+        let letGo!: () => void;
+        const gate = new Promise<void>((resolve) => { letGo = resolve; });
+        proto.tick = async function () { backlog.ticks++; await gate; };
+        const before = backlog.ticks;
+        t.send('Are you there?');
+        assert.ok(await pollUntil(() => t.of('inference:held').length === 1 && backlog.ticks === before + 1, 5_000),
+          'the hold\'s kick is in its first tick');
+        assert.equal(fw.overBudgetDrainAfter.get('prime')?.length, 1, 'with the hold\'s check waiting on it');
+        let switched = false;
+        const surgery = t.framework.switchBranch('main').then(() => { switched = true; });
+        await new Promise((r) => setTimeout(r, 200));
+        assert.equal(switched, false, 'the surgery waits for the tick in flight');
+        // A kick asked for while the surgery holds the store starts nothing
+        // and leaves no callback behind.
+        fw.kickOverBudgetDrain('prime', t.framework.getAgent('prime'), () => {});
+        assert.equal(fw.overBudgetDrainAfter.get('prime')?.length, 1);
+        letGo();
+        await surgery;
+        assert.equal(backlog.ticks, before + 1, 'the kick stopped once the surgery held the store: no tick after it');
+        assert.equal(fw.overBudgetDrainAfter.has('prime'), false, 'the kick ran its callback when it ended');
+        assert.ok(t.internal.budgetHolds.size === 1, 'the turn is still held');
+      } finally {
+        await t.close();
+      }
+    });
+  });
+
   it('falls back to a dry compile for a strategy with no preview, one at a time, and lands a fit', async () => {
     // Beth-2389's probe: dry compiles of 300 ms, a pass every 50 ms, each
     // asking. Compression finishes, and makes the context fit, while one runs.
