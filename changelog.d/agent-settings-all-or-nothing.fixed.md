@@ -12,9 +12,9 @@
   settings, then the extensions.
 - An `agent_settings` update or reset refusal ends by saying what the call
   changed: "Nothing in this call was changed.", or "Changed before the
-  refusal: …", naming each setting whose value differs from before the call,
-  or, if the settings can't be read back, that whether anything changed
-  couldn't be.
+  refusal: …", naming each setting whose applied or saved value differs from
+  before the call, or, if the settings can't be read back, that whether
+  anything changed couldn't be.
 - `agent_settings` refuses an update that names something that isn't a setting
   (`Unknown setting: tail_token`), or names `settings`, which only a reset
   reads, where it dropped the name unseen and answered as if the call had
