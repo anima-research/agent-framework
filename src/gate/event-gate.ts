@@ -1948,34 +1948,46 @@ export class EventGate {
     }
   }
 
-  /**
-   * Reconcile durable wake intents once an embedding host can accept messages
-   * and inference requests. Hosts should call this before releasing inbound
-   * traffic; `autoRecover` is available for standalone embedders.
-   */
-  recoverWakeIntents(): void {
+  /** Restore durable intent and future timers without changing the journal. */
+  restoreWakeIntents(): void {
     const state = this.readWakeState();
     if (!state) return;
     const now = this.now();
     if (state.sleep) {
-      this.sleepUntil = state.sleep.wakeAt; this.sleepArmedAt = state.sleep.armedAt;
-      this.sleepNote = state.sleep.note; this.sleepAgent = state.sleep.agentName; this.sleepSuppressed = 0;
+      this.sleepUntil = state.sleep.wakeAt;
+      this.sleepArmedAt = state.sleep.armedAt;
+      this.sleepNote = state.sleep.note;
+      this.sleepAgent = state.sleep.agentName;
+      this.sleepSuppressed = 0;
       if (state.sleep.wakeAt > now) this.armSleepTimer();
     }
     for (const intent of state.selfWakes) {
       this.selfWakeIntents.set(intent.agentName!, intent);
       if (intent.wakeAt > now) this.armRestoredSelfWake(intent);
     }
+  }
+
+  /** Admit restored overdue intents at the final safe startup/resume boundary. */
+  admitOverdueWakeIntents(): void {
+    const now = this.now();
     const due: Array<{ intent: PersistedWakeIntent; kind: 'sleep' | 'self-wake' }> = [];
-    if (state.sleep && state.sleep.wakeAt <= now) due.push({ intent: state.sleep, kind: 'sleep' });
-    for (const intent of state.selfWakes) if (intent.wakeAt <= now) due.push({ intent, kind: 'self-wake' });
+    if (this.sleepUntil > 0 && this.sleepUntil <= now) {
+      due.push({ intent: {
+        ...(this.sleepAgent ? { agentName: this.sleepAgent } : {}),
+        armedAt: this.sleepArmedAt,
+        wakeAt: this.sleepUntil,
+        source: 'sleep',
+        ...(this.sleepNote ? { note: this.sleepNote } : {}),
+      }, kind: 'sleep' });
+    }
+    for (const intent of this.selfWakeIntents.values()) {
+      if (intent.wakeAt <= now) due.push({ intent, kind: 'self-wake' });
+    }
     const woken = new Set<string>();
     for (const item of due) {
       if (item.kind === 'sleep') {
         this.sleepUntil = 0; this.sleepArmedAt = 0; this.sleepAgent = undefined; this.sleepNote = undefined;
       } else this.selfWakeIntents.delete(item.intent.agentName!);
-      // Journal admission precedes side effects. Failure restores the intent
-      // in memory and leaves its durable copy for the next startup.
       if (!this.tryPersistWakeState('admitting overdue wake recovery')) {
         if (item.kind === 'sleep') {
           this.sleepUntil = item.intent.wakeAt; this.sleepArmedAt = item.intent.armedAt;
@@ -1997,6 +2009,12 @@ export class EventGate {
         }
       }
     }
+  }
+
+  /** Backward-compatible one-shot recovery for standalone embedders. */
+  recoverWakeIntents(): void {
+    this.restoreWakeIntents();
+    this.admitOverdueWakeIntents();
   }
 
   private armRestoredSelfWake(intent: PersistedWakeIntent): void {
