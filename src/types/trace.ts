@@ -123,15 +123,16 @@ export type TraceEvent =
       type: 'inference:hold_ended';
       agentName: string;
       /**
-       * 'fit': a dry-run compile fits, and the held requests are queued for
-       * one fresh compile. 'check_failed': the dry run failed for a reason
-       * other than the budget, and the requests are queued for the turn's
-       * own compile to meet it. 'deadline': the 30 minutes passed.
-       * 'nothing_pending': compression has nothing left to do and the context
-       * still doesn't fit. After those two the requests are queued too, and
-       * the turn fails as a refused compile did before the hold. 'stopped':
-       * the framework stopped or the agent left, and the requests went with
-       * it.
+       * 'fit': context-manager's preview of the turn's next compile says it
+       * fits (a dry compile does, for a strategy with no preview), and the
+       * held requests are queued for one fresh compile. 'check_failed': that
+       * check failed for a reason other than the budget, and the requests are
+       * queued for the turn's own compile to meet it. 'deadline': the 30
+       * minutes passed. 'nothing_pending': compression has nothing pending
+       * and the context still doesn't fit. After those two the requests are
+       * queued too, and the turn fails as a refused compile did before the
+       * hold. 'stopped': the framework stopped or the agent left, and the
+       * requests went with it.
        */
       outcome: 'fit' | 'check_failed' | 'deadline' | 'nothing_pending' | 'stopped';
       /** Since the hold started (`inference:held`'s `since`). */
