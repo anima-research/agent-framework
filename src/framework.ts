@@ -563,7 +563,8 @@ interface TurnRouting {
    * system markers can't move it (2026-07-21 Cairn lounge misroute). Since
    * 2026-07-31 a re-pin moves it (repinTurnLocus): an addressed message, or a
    * follow-up in a channel the turn engaged. The agent's own channel_open
-   * moves it too. Unset in explicit and disabled mode, and for a turn with
+   * moves it too unless the turn opened from a private non-channel surface.
+   * Unset in explicit and disabled mode, and for a turn with
    * nowhere to speak.
    */
   locus?: string;
