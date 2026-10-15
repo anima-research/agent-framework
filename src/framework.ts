@@ -6373,6 +6373,7 @@ export class AgentFramework {
    */
   private async reactToRefusal(agentName: string, category: string): Promise<void> {
     try {
+      if (this.turnRouting.get(agentName)?.nonChannelOrigin === true) return;
       const incoming = this.channelRegistry?.buildChannelContext()?.incoming;
       if (!incoming) return;
       // incoming.channelId is the MCPL composite id ("discord:<guild>:<channel>");
@@ -18076,6 +18077,19 @@ export class AgentFramework {
           return;
         }
       }
+    }
+
+    if (call.name === 'channel_publish'
+      && this.routingOf(agentName).nonChannelOrigin
+      && !(call.input as { channelId?: unknown } | undefined)?.channelId) {
+      const error = 'This private turn has no inferred channel; channel_publish requires an explicit channelId.';
+      this.toolLifecycleEmitter?.refuse(agentName, call.id);
+      this.emitTrace({ type: 'tool:failed', module: 'channels', tool: call.name, callId: call.id, error });
+      this.pushEvent({
+        type: 'tool-result', callId: call.id, toolName: call.name, agentName, moduleName: 'channels',
+        result: { success: false, error, isError: true },
+      });
+      return;
     }
 
     this.emitTrace({ type: 'tool:started', module: 'channels', tool: call.name, callId: call.id, input: call.input });
