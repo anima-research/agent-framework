@@ -1,7 +1,6 @@
-- **Residents operated from WebUI/TUI/CLI/headless/API while also present in
-  channels:** a turn triggered from a non-channel surface no longer infers a
-  channel locus (home, active, or process-global last-inbound). Plain prose on
-  such a turn stays with the surface that triggered it; reaching a channel
-  requires an explicit send tool. Channel-triggered and heartbeat turns are
-  unchanged. Closes the case where a private WebUI reply was published to the
-  Discord channel that last spoke.
+- **Fresh turns opened from WebUI/TUI/CLI/headless/API:** private-surface input
+  freezes no inferred channel locus, so plain prose stays on its originating
+  surface unless the agent uses an explicit send. Starts that continue that
+  logical turn retain the same private routing state. Private input that arrives
+  inside an already-open channel turn is not covered here; sticky content-origin
+  privacy is tracked separately and should align with the speech-route work.
