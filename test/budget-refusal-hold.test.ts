@@ -5,9 +5,11 @@
  * call. Before the hold, the error policy retried it into the same refusal
  * within seconds and the turn ended; compression then freed the space, but
  * nothing ran the turn again, so the resident stayed silent until its next
- * wake. Now the turn waits while compression runs, and runs once a dry-run
- * compile fits: later wakes join it, and a deadline, or compression with
- * nothing left to do, ends it as a refused compile ended before.
+ * wake. Now the turn waits while compression runs, and runs once
+ * context-manager's preview says the context fits: later wakes join it, and a
+ * deadline, or compression with nothing pending, ends it as a refused compile
+ * ended before. The last describe runs the release check against the real
+ * autobiographical strategy.
  */
 
 import { describe, it } from 'node:test';
@@ -15,8 +17,8 @@ import assert from 'node:assert/strict';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { ContextManager } from '@animalabs/context-manager';
-import type { EventResponse, Module, ProcessEvent, ToolDefinition, ToolResult, TraceEvent } from '../src/index.js';
+import { AutobiographicalStrategy, ContextManager, PassthroughStrategy } from '@animalabs/context-manager';
+import type { EventResponse, InferencePolicy, Module, ProcessEvent, ToolDefinition, ToolResult, TraceEvent } from '../src/index.js';
 import { AgentFramework } from '../src/index.js';
 import type { NormalizedRequest, YieldingStream } from '@animalabs/membrane';
 import { createMockResponse, MockMembrane, MockYieldingStream } from './helpers/mock-membrane.js';
@@ -55,54 +57,90 @@ function stored(framework: AgentFramework): Array<{ text: string; metadata: Reco
 const storedText = (framework: AgentFramework): string => stored(framework).map((m) => m.text).join('\n');
 
 /**
- * The context manager's compression backlog: every compile is refused until
- * `fitAt` ticks have run (or `fit` is set), and pending work is reported
- * until then, or until `readyAt` ticks, whichever is sooner, as a strategy
- * reports a backlog. The maintenance loop and the drain kick tick it. A
- * compile decides at its start, as the context manager selects at its start;
- * a dry run then waits for `dryRunGate` and `dryRunMs` when they are set,
- * and throws `dryRunError` once when one is set.
+ * The context manager's compression backlog: the context fits once `fitAt`
+ * ticks have run (or `fit` is set), and pending work is reported until then,
+ * or until `readyAt` ticks, whichever is sooner, as a strategy reports a
+ * backlog (`alwaysPending` keeps it reported). The maintenance loop and the
+ * drain kick tick it. The strategy's progress snapshot moves with each tick,
+ * unless `stalled`, and when the context comes to fit, as a real one's does
+ * when the compression that makes it fit lands.
+ * - The release check's verdict is the context manager's preview, whose
+ *   contract is to say whether the context fits: here it says `fits`, and
+ *   throws `previewError` once when one is set.
+ * - `previewless` is a strategy with no preview: the check falls back to a
+ *   dry compile, which refuses as the committing one would (as a
+ *   hierarchical strategy's does), decided at its start as a select decides,
+ *   after `dryRunGate` and `dryRunMs` when they are set.
+ * - A committing compile is refused while the context doesn't fit, and
+ *   `refuseCompiles` more times whatever it does, as one is when content
+ *   reaches it after the check; `slowCompile` makes the nth wait first.
+ * The last describe runs the real strategy instead.
  */
 interface Backlog {
   ticks: number; fitAt: number; readyAt: number; fit: boolean;
-  dryRuns: number; compiles: number;
-  dryRunGate?: Promise<void>; dryRunError?: Error; dryRunMs?: number;
+  alwaysPending: boolean; stalled: boolean; previewless: boolean; refuseCompiles: number;
+  previews: number; dryRuns: number; dryRunsRunning: number; mostDryRunsRunning: number; compiles: number;
+  previewError?: Error; dryRunGate?: Promise<void>; dryRunMs?: number; slowCompile?: { nth: number; ms: number };
 }
 const fits = (b: Backlog): boolean => b.fit || b.ticks >= b.fitAt;
-const pending = (b: Backlog): boolean => !fits(b) && b.ticks < b.readyAt;
+const pending = (b: Backlog): boolean => b.alwaysPending || (!fits(b) && b.ticks < b.readyAt);
+const overBudget = (actual = 100_201) => Object.assign(
+  new Error('Compile plan would exceed hard budget: head=41200 tail=8100 middle=62000 budget=48568'),
+  { name: 'OverBudgetError', budget: 48_568, actual },
+);
 
-type Patchable = Record<'compile' | 'tick' | 'isReady', (...args: unknown[]) => unknown>;
+type Patchable = Record<'compile' | 'tick' | 'isReady' | 'previewContext', (...args: unknown[]) => unknown>;
 
 async function withBacklog<T>(backlog: Partial<Backlog>, run: (b: Backlog) => Promise<T>): Promise<T> {
-  const b: Backlog = { ticks: 0, fitAt: Infinity, readyAt: Infinity, fit: false, dryRuns: 0, compiles: 0, ...backlog };
+  const b: Backlog = {
+    ticks: 0, fitAt: Infinity, readyAt: Infinity, fit: false,
+    alwaysPending: false, stalled: false, previewless: false, refuseCompiles: 0,
+    previews: 0, dryRuns: 0, dryRunsRunning: 0, mostDryRunsRunning: 0, compiles: 0,
+    ...backlog,
+  };
   const proto = ContextManager.prototype as unknown as Patchable;
-  const original = { compile: proto.compile, tick: proto.tick, isReady: proto.isReady };
+  const original = { compile: proto.compile, tick: proto.tick, isReady: proto.isReady, previewContext: proto.previewContext };
+  const passthrough = PassthroughStrategy.prototype as unknown as { getProgressSnapshot?: () => unknown };
   proto.compile = async function (this: unknown, ...args: unknown[]) {
-    const dryRun = (args[2] as { dryRun?: boolean } | undefined)?.dryRun === true;
-    if (dryRun) b.dryRuns++;
-    else b.compiles++;
-    const fitsNow = fits(b);
-    if (dryRun && b.dryRunGate) await b.dryRunGate;
-    if (dryRun && b.dryRunMs) await new Promise((r) => setTimeout(r, b.dryRunMs));
-    if (dryRun && b.dryRunError) {
-      const error = b.dryRunError;
-      b.dryRunError = undefined;
-      throw error;
+    if ((args[2] as { dryRun?: boolean } | undefined)?.dryRun === true) {
+      b.dryRuns++;
+      b.mostDryRunsRunning = Math.max(b.mostDryRunsRunning, ++b.dryRunsRunning);
+      try {
+        const fitsNow = fits(b);
+        if (b.dryRunGate) await b.dryRunGate;
+        if (b.dryRunMs) await new Promise((r) => setTimeout(r, b.dryRunMs));
+        if (!fitsNow) throw overBudget();
+      } finally {
+        b.dryRunsRunning--;
+      }
+      return original.compile.apply(this, args);
     }
-    if (!fitsNow) {
-      throw Object.assign(
-        new Error('Compile plan would exceed hard budget: head=41200 tail=8100 middle=62000 budget=48568'),
-        { name: 'OverBudgetError', budget: 48_568, actual: 100_201 },
-      );
+    b.compiles++;
+    if (b.slowCompile?.nth === b.compiles) await new Promise((r) => setTimeout(r, b.slowCompile!.ms));
+    if (!fits(b)) throw overBudget();
+    if (b.refuseCompiles > 0) {
+      b.refuseCompiles--;
+      throw overBudget(49_000);
     }
     return original.compile.apply(this, args);
   };
+  proto.previewContext = function () {
+    b.previews++;
+    if (b.previewError) {
+      const error = b.previewError;
+      b.previewError = undefined;
+      throw error;
+    }
+    return b.previewless ? null : { fits: fits(b) };
+  };
   proto.tick = async function () { b.ticks++; };
   proto.isReady = function () { return !pending(b); };
+  passthrough.getProgressSnapshot = function () { return { chunksCompressed: b.stalled ? 0 : b.ticks, fits: fits(b) }; };
   try {
     return await run(b);
   } finally {
     Object.assign(proto, original);
+    delete passthrough.getProgressSnapshot;
   }
 }
 
@@ -158,9 +196,6 @@ interface Internal {
   budgetHoldMs: number;
   budgetHoldRecheckMs: number;
   budgetHolds: Map<string, unknown>;
-  budgetHoldCarry: Map<string, unknown>;
-  budgetHoldSpent: Map<string, unknown>;
-  budgetHoldNotes: Map<string, unknown>;
   activeTurnTokens: Map<string, number>;
   pendingRequests: Array<{ agentName: string }>;
   providerGateBlocked: (agentName: string) => boolean;
@@ -168,14 +203,16 @@ interface Internal {
 }
 type HeldRequest = { agentName: string; reason: string; coalescingBatch?: boolean; coalescingBatchSubjects?: string[]; coalescingSubject?: string };
 const holdOf = (t: { internal: Internal }) =>
-  (t.internal.budgetHolds as unknown as Map<string, { heldRequests: HeldRequest[] }>).get('prime');
+  (t.internal.budgetHolds as unknown as Map<string, { state: string; heldRequests: HeldRequest[] }>).get('prime');
 
 const heldRequests = (framework: AgentFramework): number | undefined => {
   const agents = (framework.healthSnapshot() as { agents: Array<{ name: string; budgetHold: { heldRequests: number } | null }> }).agents;
   return agents.find((a) => a.name === 'prime')?.budgetHold?.heldRequests;
 };
 
-async function residentTurn(options: { maintenanceIntervalMs: number; holdMs?: number; recheckMs?: number; responses?: number }) {
+async function residentTurn(options: {
+  maintenanceIntervalMs: number; holdMs?: number; recheckMs?: number; responses?: number; inferencePolicy?: InferencePolicy;
+}) {
   const tempDir = mkdtempSync(join(tmpdir(), 'budget-hold-'));
   const membrane = new SequentialStreamMembrane();
   membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Answered once it fit' }]));
@@ -189,6 +226,7 @@ async function residentTurn(options: { maintenanceIntervalMs: number; holdMs?: n
     modules: [new InboxModule()],
     syncIntervalMs: 0,
     maintenanceIntervalMs: options.maintenanceIntervalMs,
+    ...(options.inferencePolicy ? { inferencePolicy: options.inferencePolicy } : {}),
     // The default policy's three retries, without its 1, 2 and 4 second waits.
     errorPolicy: { maxRetries: 3, onInferenceError: (_error, _agent, attempt) => (attempt < 3 ? { retry: true, delayMs: 0 } : { retry: false }) },
   });
@@ -440,20 +478,20 @@ describe('a compile refused for budget holds its turn (#304)', () => {
     });
   });
 
-  it('runs again when a dry run fails for another reason, and the turn\'s own compile meets it', async () => {
+  it('runs the turn when the check fails for another reason, and the turn\'s own compile meets it', async () => {
     await withBacklog({}, async (backlog) => {
       const t = await residentTurn({ maintenanceIntervalMs: 50 });
       try {
         t.send('Are you there?');
         assert.ok(await pollUntil(() => t.of('inference:held').length === 1, 5_000));
-        // The context now fits, but the check's dry run fails for another
+        // The context now fits, but the check's preview fails for another
         // reason: the hold doesn't call that a fit, and lets the turn's
         // compile find out.
-        backlog.dryRunError = new Error('store read failed');
+        backlog.previewError = new Error('store read failed');
         backlog.fit = true;
         assert.ok(await pollUntil(() => storedText(t.framework).includes('Answered once it fit'), 5_000));
         assert.deepEqual(t.of('inference:hold_ended').map((e) => e.outcome), ['check_failed']);
-        assert.equal(backlog.dryRunError, undefined, 'the dry run met the error');
+        assert.equal(backlog.previewError, undefined, 'the preview met the error');
         assert.ok(JSON.stringify(t.membrane.calls[0]).includes('[budget-hold]'), 'the turn that ran says why it waited');
       } finally {
         await t.close();
@@ -476,6 +514,21 @@ describe('a compile refused for budget holds its turn (#304)', () => {
     });
   });
 
+  it('kicks the drain at once when the hold starts', async () => {
+    // No maintenance timer, and an interval longer than the test: only the
+    // hold's first kick can compress.
+    await withBacklog({ fitAt: 8 }, async () => {
+      const t = await residentTurn({ maintenanceIntervalMs: 0, recheckMs: 60_000 });
+      try {
+        t.send('Are you there?');
+        assert.ok(await pollUntil(() => storedText(t.framework).includes('Answered once it fit'), 3_000));
+        assert.deepEqual(t.of('inference:hold_ended').map((e) => e.outcome), ['fit']);
+      } finally {
+        await t.close();
+      }
+    });
+  });
+
   it('with the maintenance timer off, a backlog that never moves costs a kick an interval, not a loop', async () => {
     await withBacklog({}, async (backlog) => {
       const t = await residentTurn({ maintenanceIntervalMs: 0, recheckMs: 100 });
@@ -485,7 +538,7 @@ describe('a compile refused for budget holds its turn (#304)', () => {
         await new Promise((r) => setTimeout(r, 550));
         // The first kick at once, then one an interval: about 6 in 550 ms.
         assert.ok(backlog.ticks <= 8 * 8, `${backlog.ticks} ticks in 550 ms`);
-        assert.ok(backlog.dryRuns <= 8, `${backlog.dryRuns} dry runs in 550 ms`);
+        assert.ok(backlog.previews <= 8, `${backlog.previews} checks in 550 ms`);
         assert.ok(backlog.ticks >= 16, 'it does kick again');
       } finally {
         await t.close();
@@ -539,45 +592,50 @@ describe('a compile refused for budget holds its turn (#304)', () => {
     });
   });
 
-  it('sets aside a dry run that was running when a surgery asked to look again', async () => {
-    await withBacklog({}, async (backlog) => {
-      const t = await residentTurn({ maintenanceIntervalMs: 3_600_000 });
+  it('falls back to a dry compile for a strategy with no preview, one at a time, and lands a fit', async () => {
+    // Beth-2389's probe: dry compiles of 300 ms, a pass every 50 ms, each
+    // asking. Compression finishes, and makes the context fit, while one runs.
+    await withBacklog({ previewless: true, dryRunMs: 300, fitAt: 40, readyAt: 40 }, async (backlog) => {
+      const t = await residentTurn({ maintenanceIntervalMs: 50, holdMs: 6_000 });
       try {
         t.send('Are you there?');
         assert.ok(await pollUntil(() => t.of('inference:held').length === 1, 5_000));
-        assert.ok(await pollUntil(() => backlog.ticks >= 16 && !t.internal.activeTurnTokens.has('prime'), 3_000));
-        // A dry run starts, decides it doesn't fit, and is held there.
-        let release!: () => void;
-        backlog.dryRunGate = new Promise<void>((resolve) => { release = resolve; });
-        const dryRuns = backlog.dryRuns;
-        (t.framework as unknown as { checkBudgetHolds: () => void }).checkBudgetHolds();
-        assert.ok(await pollUntil(() => backlog.dryRuns === dryRuns + 1, 2_000));
-        // The context now fits, and a surgery asks to look again.
-        backlog.fit = true;
-        await t.framework.switchBranch('main');
-        backlog.dryRunGate = undefined;
-        release();
-        assert.ok(await pollUntil(() => storedText(t.framework).includes('Answered once it fit'), 3_000),
-          'the stale verdict was set aside, and a fresh dry run released the turn');
-        assert.ok(backlog.dryRuns >= dryRuns + 2);
+        assert.ok(await pollUntil(() => storedText(t.framework).includes('Answered once it fit'), 5_000),
+          'the turn runs soon after the fit, not at the deadline');
+        assert.deepEqual(t.of('inference:hold_ended').map((e) => e.outcome), ['fit'],
+          'a refusal decided before compression finished is not taken for nothing pending');
+        assert.ok(backlog.dryRuns >= 1 && backlog.previews >= 1, 'the preview had nothing to say, and a dry compile decided');
+        assert.equal(backlog.mostDryRunsRunning, 1, 'one dry compile at a time');
       } finally {
         await t.close();
       }
     });
   });
 
-  it('lands a fit while checks are asked for faster than a dry run takes', async () => {
-    // Beth-2389's probe: dry runs of 300 ms, a pass every 50 ms, each asking.
-    await withBacklog({ dryRunMs: 300 }, async (backlog) => {
-      const t = await residentTurn({ maintenanceIntervalMs: 50, holdMs: 6_000 });
+  it('on the fallback path, looks again at the next pass after a surgery a dry compile straddled', async () => {
+    // Compression makes no progress, so only a surgery changes what the
+    // check compares.
+    await withBacklog({ previewless: true, stalled: true }, async (backlog) => {
+      const t = await residentTurn({ maintenanceIntervalMs: 50 });
       try {
         t.send('Are you there?');
-        assert.ok(await pollUntil(() => t.of('inference:held').length === 1, 5_000));
-        await new Promise((r) => setTimeout(r, 400));
+        assert.ok(await pollUntil(() => t.of('inference:held').length === 1 && backlog.dryRuns >= 1 && backlog.dryRunsRunning === 0, 5_000));
+        // A surgery brings a check, whose dry compile decides it doesn't fit
+        // and is held there.
+        let release!: () => void;
+        backlog.dryRunGate = new Promise<void>((resolve) => { release = resolve; });
+        const dryRuns = backlog.dryRuns;
+        await t.framework.switchBranch('main');
+        assert.ok(await pollUntil(() => backlog.dryRuns === dryRuns + 1, 2_000));
+        // The context now fits, and a second surgery asks while that dry
+        // compile runs.
         backlog.fit = true;
+        await t.framework.switchBranch('main');
+        backlog.dryRunGate = undefined;
+        release();
         assert.ok(await pollUntil(() => storedText(t.framework).includes('Answered once it fit'), 3_000),
-          'the turn runs within 3 s of the fit, not at the deadline');
-        assert.deepEqual(t.of('inference:hold_ended').map((e) => e.outcome), ['fit']);
+          'the stale refusal stood only until the next pass, which the second surgery had given something new to look at');
+        assert.equal(backlog.mostDryRunsRunning, 1);
       } finally {
         await t.close();
       }
@@ -592,7 +650,7 @@ describe('a compile refused for budget holds its turn (#304)', () => {
       try {
         t.send('Are you there?');
         assert.ok(await pollUntil(() => t.of('inference:held').length === 1, 5_000));
-        assert.ok(await pollUntil(() => backlog.dryRuns >= 1, 2_000));
+        assert.ok(await pollUntil(() => backlog.previews >= 1, 2_000));
         backlog.fit = true;
         assert.ok(await pollUntil(() => storedText(t.framework).includes('Answered once it fit'), 3_000));
         assert.deepEqual(t.of('inference:hold_ended').map((e) => e.outcome), ['deadline']);
@@ -605,16 +663,21 @@ describe('a compile refused for budget holds its turn (#304)', () => {
   });
 
   it('looks again after an undo', async () => {
-    await withBacklog({}, async (backlog) => {
-      const t = await residentTurn({ maintenanceIntervalMs: 3_600_000 });
+    await withBacklog({ fit: true }, async (backlog) => {
+      // One maintenance pass at start, then none for an hour: only the undo
+      // can bring the release check.
+      const t = await residentTurn({ maintenanceIntervalMs: 3_600_000, responses: 2 });
       try {
+        t.send('A turn that fits');
+        assert.ok(await pollUntil(() => storedText(t.framework).includes('Answered once it fit'), 5_000));
+        backlog.fit = false;
         t.send('Are you there?');
-        assert.ok(await pollUntil(() => t.of('inference:held').length === 1, 5_000));
-        assert.ok(await pollUntil(() => backlog.ticks >= 16 && !t.internal.activeTurnTokens.has('prime'), 3_000));
+        assert.ok(await pollUntil(() => t.of('inference:held').length === 1 && backlog.previews >= 1, 5_000));
+        assert.ok(await pollUntil(() => !t.internal.activeTurnTokens.has('prime'), 3_000));
         backlog.fit = true;
         const undone = t.framework.undoLastTurn('prime');
-        assert.equal(undone.undone, true, 'the refused start left a checkpoint to undo');
-        assert.ok(await pollUntil(() => storedText(t.framework).includes('Answered once it fit'), 3_000),
+        assert.equal(undone.undone, true, 'the earlier turn left a checkpoint to undo');
+        assert.ok(await pollUntil(() => storedText(t.framework).includes('Answered turn 2'), 3_000),
           'the undo brought the release check forward');
       } finally {
         await t.close();
@@ -622,24 +685,32 @@ describe('a compile refused for budget holds its turn (#304)', () => {
     });
   });
 
-  it('holds a released turn again with its first refusal\'s start and deadline when its own compile still refuses', async () => {
-    // The dry run fits at once, but the turn's compile refuses twice more, as
-    // it can when content reaches it after the dry run (the turn start's
-    // flush of deferred messages, a coalesced batch's assembly).
-    const proto = ContextManager.prototype as unknown as Patchable;
-    const original = { compile: proto.compile, tick: proto.tick, isReady: proto.isReady };
-    let refusals = 0;
-    proto.compile = async function (this: unknown, ...args: unknown[]) {
-      const dryRun = (args[2] as { dryRun?: boolean } | undefined)?.dryRun === true;
-      if (!dryRun && refusals < 3) {
-        refusals++;
-        throw Object.assign(new Error('Compile plan would exceed hard budget: budget=48568'), { name: 'OverBudgetError', budget: 48_568, actual: 49_000 });
+  it('makes one held turn one undo step, which keeps the inputs that joined it', async () => {
+    await withBacklog({}, async (backlog) => {
+      const t = await residentTurn({ maintenanceIntervalMs: 50 });
+      try {
+        t.send('First message');
+        assert.ok(await pollUntil(() => t.of('inference:held').length === 1, 5_000));
+        t.send('Second message, while held');
+        assert.ok(await pollUntil(() => heldRequests(t.framework) === 2, 5_000));
+        backlog.fit = true;
+        assert.ok(await pollUntil(() => storedText(t.framework).includes('Answered once it fit'), 5_000));
+        assert.equal(t.framework.getUndoRedoState('prime').undoDepth, 1, 'the refused start left no undo step of its own');
+        assert.equal(t.framework.undoLastTurn('prime').undone, true);
+        const text = storedText(t.framework);
+        assert.ok(!text.includes('Answered once it fit'), 'the undo takes the reply');
+        assert.ok(text.includes('First message') && text.includes('Second message, while held'), 'and keeps both inputs');
+      } finally {
+        await t.close();
       }
-      return original.compile.apply(this, args);
-    };
-    proto.tick = async function () {};
-    proto.isReady = function () { return false; };
-    try {
+    });
+  });
+
+  it('holds a released turn again with its first refusal\'s start and deadline when its own compile still refuses', async () => {
+    // The check says it fits at once, but the turn's compile refuses three
+    // times, as it can when content reaches it after the check (the turn
+    // start's flush of deferred messages, a coalesced batch's assembly).
+    await withBacklog({ fit: true, alwaysPending: true, refuseCompiles: 3 }, async () => {
       const t = await residentTurn({ maintenanceIntervalMs: 50 });
       try {
         t.send('Are you there?');
@@ -652,38 +723,93 @@ describe('a compile refused for budget holds its turn (#304)', () => {
       } finally {
         await t.close();
       }
-    } finally {
-      Object.assign(proto, original);
-    }
+    });
+  });
+
+  it('does not release a turn its compile refused again until compression moves or a surgery runs', async () => {
+    // The check says it fits, the turn's compile is refused every time, and
+    // compression makes no progress.
+    await withBacklog({ fit: true, alwaysPending: true, refuseCompiles: Infinity, stalled: true }, async (backlog) => {
+      const t = await residentTurn({ maintenanceIntervalMs: 50 });
+      try {
+        t.send('Are you there?');
+        assert.ok(await pollUntil(() => t.of('inference:held').length === 2, 5_000), 'released once, refused, and held again');
+        const compiles = backlog.compiles;
+        await new Promise((r) => setTimeout(r, 600));
+        assert.equal(t.of('inference:held').length, 2, 'no release on the same evidence, pass after pass');
+        assert.equal(backlog.compiles, compiles, 'and no compile refused for it');
+        await t.framework.switchBranch('main');
+        assert.ok(await pollUntil(() => t.of('inference:held').length === 3, 3_000),
+          'a surgery is new evidence: the hold looks, releases, and holds again');
+      } finally {
+        await t.close();
+      }
+    });
+  });
+
+  it('looks again only once something that could make the context fit has changed', async () => {
+    await withBacklog({ stalled: true }, async (backlog) => {
+      const t = await residentTurn({ maintenanceIntervalMs: 50 });
+      try {
+        t.send('Are you there?');
+        assert.ok(await pollUntil(() => t.of('inference:held').length === 1 && backlog.previews >= 1, 5_000));
+        let previews = backlog.previews;
+        await new Promise((r) => setTimeout(r, 500));
+        assert.equal(backlog.previews, previews, 'ten passes, and no check while nothing changed');
+        // A budget for the agent changes what its next compile plans at. (The
+        // change previews once itself, as its preflight.)
+        t.framework.updateAgentRuntimeSettings('prime', { contextBudgetTokens: 200_000 });
+        previews = backlog.previews;
+        assert.ok(await pollUntil(() => backlog.previews > previews, 2_000), 'it looks once the budget changes');
+        previews = backlog.previews;
+        await new Promise((r) => setTimeout(r, 300));
+        assert.equal(backlog.previews, previews);
+        backlog.stalled = false;
+        assert.ok(await pollUntil(() => backlog.previews > previews, 2_000), 'and once compression moves');
+      } finally {
+        await t.close();
+      }
+    });
   });
 
   it('fails a released turn refused after its hold\'s deadline, rather than holding it afresh', async () => {
-    const proto = ContextManager.prototype as unknown as Patchable;
-    const original = { compile: proto.compile, tick: proto.tick, isReady: proto.isReady };
-    // The dry run fits, but the released turn's compile starts only after
-    // the deadline (a slow queue), and refuses.
-    let real = 0;
-    proto.compile = async function (this: unknown, ...args: unknown[]) {
-      const dryRun = (args[2] as { dryRun?: boolean } | undefined)?.dryRun === true;
-      if (dryRun) return original.compile.apply(this, args);
-      if (++real === 2) await new Promise((r) => setTimeout(r, 500));
-      throw Object.assign(new Error('Compile plan would exceed hard budget: budget=48568'), { name: 'OverBudgetError', budget: 48_568, actual: 49_000 });
-    };
-    proto.tick = async function () {};
-    proto.isReady = function () { return false; };
-    try {
+    // The check says it fits, but the released turn's compile starts only
+    // after the deadline (a slow queue), and refuses.
+    await withBacklog({ fit: true, alwaysPending: true, refuseCompiles: Infinity, slowCompile: { nth: 2, ms: 500 } }, async () => {
       const t = await residentTurn({ maintenanceIntervalMs: 50, holdMs: 300 });
       try {
         t.send('Are you there?');
+        assert.ok(await pollUntil(() => t.of('inference:hold_ended').length === 1, 3_000));
+        assert.equal(heldRequests(t.framework), undefined, 'a released turn is not waiting, so the status shows no hold');
         assert.ok(await pollUntil(() => t.of('inference:exhausted').length === 1, 5_000));
         assert.equal(t.of('inference:held').length, 1, 'no second hold past the first one\'s deadline');
         assert.match(String(t.of('inference:exhausted')[0]!.error), /the hold's 1 s bound passed and it still didn't fit/);
       } finally {
         await t.close();
       }
-    } finally {
-      Object.assign(proto, original);
-    }
+    });
+  });
+
+  it('ends a released turn the inference policy declines: nothing of its hold reaches a later turn', async () => {
+    await withBacklog({}, async (backlog) => {
+      let decline = false;
+      const t = await residentTurn({ maintenanceIntervalMs: 50, inferencePolicy: { shouldInfer: () => !decline } });
+      try {
+        t.send('Are you there?');
+        assert.ok(await pollUntil(() => t.of('inference:held').length === 1, 5_000));
+        decline = true;
+        backlog.fit = true;
+        assert.ok(await pollUntil(() => t.of('inference:hold_ended').length === 1 && t.internal.budgetHolds.size === 0, 3_000),
+          'released, declined, and its record gone');
+        assert.equal(t.membrane.calls.length, 0);
+        decline = false;
+        t.send('A later turn');
+        assert.ok(await pollUntil(() => t.membrane.calls.length === 1, 3_000));
+        assert.ok(!JSON.stringify(t.membrane.calls[0]).includes('[budget-hold]'), 'the later turn carries no note of the declined one\'s wait');
+      } finally {
+        await t.close();
+      }
+    });
   });
 
   it('leaves an ephemeral run to fail as before: its caller is waiting', async () => {
@@ -725,8 +851,8 @@ describe('a compile refused for budget holds its turn (#304)', () => {
     });
   });
 
-  it('holds a batch-only start\'s request as an ordinary cause: its batches were already stored', async () => {
-    await withBacklog({}, async () => {
+  it('holds a batch-only start\'s request as an ordinary cause, which no cancellation withdraws', async () => {
+    await withBacklog({}, async (backlog) => {
       const t = await residentTurn({ maintenanceIntervalMs: 3_600_000 });
       try {
         // A batch-only wake reaches its compile, which is refused.
@@ -739,7 +865,13 @@ describe('a compile refused for budget holds its turn (#304)', () => {
         assert.equal(held.length, 1);
         assert.equal(held[0]!.coalescingBatch, undefined, 'no longer batch-only, so the released start keeps its turn');
         assert.equal(held[0]!.coalescingBatchSubjects, undefined);
-        assert.equal(held[0]!.coalescingSubject, 'zz-subject', 'its subject stays, for a cancellation');
+        // Its content was stored before its compile: a cancellation of its
+        // subject takes neither the turn nor its only cause.
+        (t.framework as unknown as { cancelCoalescedWakes: (subject: string) => void }).cancelCoalescedWakes('zz-subject');
+        assert.equal(holdOf(t)!.heldRequests.length, 1, 'the turn keeps its own cause');
+        backlog.fit = true;
+        await t.framework.switchBranch('main');
+        assert.ok(await pollUntil(() => storedText(t.framework).includes('Answered once it fit'), 3_000));
       } finally {
         await t.close();
       }
@@ -789,7 +921,7 @@ describe('a compile refused for budget holds its turn (#304)', () => {
     });
   });
 
-  it('clears what a hold kept when the released start fails outside its compile', async () => {
+  it('drops the hold\'s record when the released start fails outside its compile', async () => {
     await withBacklog({}, async (backlog) => {
       const t = await residentTurn({ maintenanceIntervalMs: 3_600_000 });
       const fw = t.framework as unknown as { recordTurnCheckpoint: (name: string) => void };
@@ -806,11 +938,8 @@ describe('a compile refused for budget holds its turn (#304)', () => {
         };
         backlog.fit = true;
         await t.framework.switchBranch('main');
-        assert.ok(await pollUntil(() => failed > 0 && t.internal.budgetHolds.size === 0, 3_000));
-        await new Promise((r) => setTimeout(r, 100));
-        for (const map of [t.internal.budgetHoldCarry, t.internal.budgetHoldSpent, t.internal.budgetHoldNotes]) {
-          assert.equal(map.size, 0, 'nothing of the failed turn\'s hold is left for the next');
-        }
+        assert.ok(await pollUntil(() => failed > 0 && t.internal.budgetHolds.size === 0, 3_000),
+          'nothing of the failed turn\'s hold is left for the next');
       } finally {
         await t.close();
       }
@@ -888,9 +1017,7 @@ describe('a compile refused for budget holds its turn (#304)', () => {
         assert.deepEqual(t.of('inference:hold_ended').map((e) => e.outcome), ['stopped']);
         assert.deepEqual(t.internal.pendingRequests.filter((r) => r.agentName === 'prime'), [], 'the held request went with the stop');
         assert.equal(t.membrane.calls.length, 0);
-        for (const map of [t.internal.budgetHolds, t.internal.budgetHoldCarry, t.internal.budgetHoldSpent, t.internal.budgetHoldNotes]) {
-          assert.equal(map.size, 0);
-        }
+        assert.equal(t.internal.budgetHolds.size, 0);
       } finally {
         if (!closed) await t.close();
       }
@@ -900,11 +1027,9 @@ describe('a compile refused for budget holds its turn (#304)', () => {
       try {
         t.send('Are you there?');
         assert.ok(await pollUntil(() => t.of('inference:held').length === 1, 5_000));
-        t.internal.budgetHoldSpent.set('prime', { outcome: 'deadline', waitedMs: 1 });
         t.internal.disposeConversationAgent('prime');
         assert.deepEqual(t.of('inference:hold_ended').map((e) => e.outcome), ['stopped']);
-        assert.equal(t.internal.budgetHolds.size, 0);
-        assert.equal(t.internal.budgetHoldSpent.size, 0, 'a later agent of the name starts with none of it');
+        assert.equal(t.internal.budgetHolds.size, 0, 'a later agent of the name starts with none of it');
         // Past the hold's deadline: nothing is queued for an agent that's gone.
         await new Promise((r) => setTimeout(r, 450));
         assert.deepEqual(t.internal.pendingRequests.filter((r) => r.agentName === 'prime'), []);
@@ -913,5 +1038,113 @@ describe('a compile refused for budget holds its turn (#304)', () => {
         await t.close();
       }
     });
+  });
+});
+
+describe('the release check takes context-manager\'s verdict on the real strategy (#304)', () => {
+  /**
+   * A resident whose autobiographical strategy holds sixteen messages of
+   * mixed sizes, none compressed: compression is pending, and stays so, since
+   * nothing here can compress (the tick is stubbed: there is no compression
+   * model). The verdict's path, the preview and both compiles, is the
+   * strategy's own, unpatched.
+   */
+  async function realResident(adaptiveResolution: boolean) {
+    const proto = ContextManager.prototype as unknown as { tick: () => Promise<void> };
+    const tick = proto.tick;
+    proto.tick = async () => {};
+    const tempDir = mkdtempSync(join(tmpdir(), 'budget-hold-real-'));
+    const membrane = new SequentialStreamMembrane();
+    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Answered once it fit' }]));
+    const framework = await AgentFramework.create({
+      storePath: join(tempDir, 'store'),
+      membrane: membrane.asMembrane(),
+      agents: [{
+        name: 'prime', model: 'test-model', systemPrompt: 'You are prime.', contextBudgetTokens: 400_000, maxTokens: 1_000,
+        strategy: new AutobiographicalStrategy({ adaptiveResolution, targetChunkTokens: 300, recentWindowTokens: 400 }),
+      }],
+      modules: [],
+      syncIntervalMs: 0,
+      maintenanceIntervalMs: 50,
+      errorPolicy: { maxRetries: 3, onInferenceError: (_error: Error, _agent: string, attempt: number) => (attempt < 3 ? { retry: true, delayMs: 0 } : { retry: false }) },
+    });
+    const traces: TraceEvent[] = [];
+    framework.onTrace((e) => traces.push(e));
+    const cm = framework.getAgent('prime')!.getContextManager();
+    for (let i = 0; i < 16; i++) {
+      cm.addMessage(i % 2 === 0 ? 'User' : 'prime', [{ type: 'text', text: `m${i} ` + 'lorem ipsum dolor sit amet '.repeat(i % 3 === 0 ? 500 : 60) }]);
+    }
+    const budget = (maxTokens: number) => ({ maxTokens, reserveForResponse: 1_000 });
+    return {
+      framework,
+      membrane,
+      of: (type: string) => traces.filter((e) => e.type === type) as unknown as Array<Record<string, unknown>>,
+      preview: (maxTokens: number) => (cm as unknown as {
+        previewContext: (b: { maxTokens: number; reserveForResponse: number }) => { fits: boolean; finalTokens: number };
+      }).previewContext(budget(maxTokens)),
+      dryCompileResolves: (maxTokens: number) => cm.compile(budget(maxTokens), undefined, { dryRun: true } as never).then(() => true, () => false),
+      setBudget: (tokens: number) => framework.updateAgentRuntimeSettings('prime', { contextBudgetTokens: tokens, immediate: true }, { allowInfeasible: true }),
+      wake: () => (framework as unknown as { pendingRequests: unknown[] }).pendingRequests.push({
+        agentName: 'prime', reason: 'external-message', source: 'test', timestamp: Date.now(),
+      }),
+      close: async () => {
+        await framework.stop();
+        proto.tick = tick;
+        rmSync(tempDir, { recursive: true, force: true });
+      },
+    };
+  }
+
+  it('keeps holding at a budget where a dry compile resolves but the plan does not fit', async () => {
+    const t = await realResident(true);
+    try {
+      // Just over the budget, the adaptive strategy's dry compile resolves:
+      // it doesn't throw an over-budget plan at its plan check. The preview
+      // says the plan doesn't fit, and the turn's committing compile refuses.
+      assert.equal(t.preview(400_000).fits, true);
+      const plan = t.preview(400_000).finalTokens;
+      let band: number | undefined;
+      for (let b = plan; b < plan * 1.05 && band === undefined; b += Math.max(1, Math.round(plan / 1_000))) {
+        if (await t.dryCompileResolves(b) && !t.preview(b).fits) band = b;
+      }
+      assert.ok(band !== undefined, 'there is a budget where the dry compile resolves and the plan does not fit');
+      t.setBudget(band);
+      t.framework.start();
+      t.wake();
+      assert.ok(await pollUntil(() => t.of('inference:held').length === 1, 5_000), 'the turn\'s compile is refused there');
+      await new Promise((r) => setTimeout(r, 1_000));
+      assert.equal(t.of('inference:held').length, 1, 'held once, never released into the same refusal');
+      assert.deepEqual(t.of('inference:hold_ended'), []);
+      assert.equal(t.membrane.calls.length, 0);
+      t.setBudget(400_000);
+      assert.ok(await pollUntil(() => storedText(t.framework).includes('Answered once it fit'), 5_000), 'a budget it fits releases it');
+      assert.deepEqual(t.of('inference:hold_ended').map((e) => e.outcome), ['fit']);
+    } finally {
+      await t.close();
+    }
+  });
+
+  it('falls back to a dry compile where the preview needs adaptive resolution', async () => {
+    const t = await realResident(false);
+    try {
+      // The hierarchical strategy refuses an over-budget context in its
+      // preview and in a dry compile alike. A context that fits has no fold
+      // plan to preview, and the dry compile decides.
+      let fitsFrom = 10_000;
+      while (!(await t.dryCompileResolves(fitsFrom)) && fitsFrom < 400_000) fitsFrom += 1_000;
+      assert.ok(fitsFrom < 400_000);
+      assert.throws(() => t.preview(fitsFrom), /requires adaptiveResolution/);
+      t.setBudget(Math.round(fitsFrom * 0.8));
+      t.framework.start();
+      t.wake();
+      assert.ok(await pollUntil(() => t.of('inference:held').length === 1, 5_000));
+      await new Promise((r) => setTimeout(r, 500));
+      assert.deepEqual(t.of('inference:hold_ended'), [], 'it stays held while the context does not fit');
+      t.setBudget(fitsFrom + 2_000);
+      assert.ok(await pollUntil(() => storedText(t.framework).includes('Answered once it fit'), 5_000));
+      assert.deepEqual(t.of('inference:hold_ended').map((e) => e.outcome), ['fit'], 'the dry compile said it fits');
+    } finally {
+      await t.close();
+    }
   });
 });
