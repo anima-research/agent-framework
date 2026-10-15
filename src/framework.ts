@@ -646,14 +646,15 @@ function isTurnContinuation(reason: string): boolean {
 /** Positive classification for operator/local surfaces: future source names
  * stay private without extending a fragile allow-list. MCPL events are never
  * classified here, and any explicit channel id makes the event channel-bound. */
+function surfaceChannelId(event: ProcessEvent): string | undefined {
+  if (event.type !== 'external-message' && event.type !== 'api:message') return undefined;
+  const value = (event.metadata as Record<string, unknown> | undefined)?.channelId;
+  return typeof value === 'string' && value.trim().length > 0 ? value : undefined;
+}
+
 export function isNonChannelSurfaceEvent(event: ProcessEvent): boolean {
-  const type = event.type;
-  const channelId = event.type === 'external-message'
-    ? event.metadata?.channelId
-    : (event as unknown as { channelId?: unknown }).channelId;
-  return !type.startsWith('mcpl:')
-    && (type === 'external-message' || type === 'api:message')
-    && channelId === undefined;
+  return (event.type === 'external-message' || event.type === 'api:message')
+    && surfaceChannelId(event) === undefined;
 }
 const CONVERSATION_ROUTER_STATE_ID = 'framework/conversation-router';
 const INFERENCE_LOG_ID = 'framework/inference-log';
@@ -8958,7 +8959,7 @@ export class AgentFramework {
           ...extractGateFields(event),
           eventType: event.type,
           serverId: source,
-          channelId: '',
+          channelId: surfaceChannelId(event) ?? '',
         });
         if (!decision.trigger) return;
       }
@@ -8979,6 +8980,7 @@ export class AgentFramework {
             reason: event.type,
             source,
             timestamp: Date.now(),
+            ...(surfaceChannelId(event) ? { channelId: surfaceChannelId(event) } : {}),
             nonChannelOrigin: isNonChannelSurfaceEvent(event),
           });
         }
