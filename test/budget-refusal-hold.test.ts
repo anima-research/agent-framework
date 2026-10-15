@@ -685,6 +685,31 @@ describe('a compile refused for budget holds its turn (#304)', () => {
     });
   });
 
+  it('looks again after a redo', async () => {
+    await withBacklog({ fit: true }, async (backlog) => {
+      // No passes after the first: only the undo and the redo bring checks.
+      const t = await residentTurn({ maintenanceIntervalMs: 3_600_000, responses: 2 });
+      try {
+        t.send('A turn that fits');
+        assert.ok(await pollUntil(() => storedText(t.framework).includes('Answered once it fit'), 5_000));
+        backlog.fit = false;
+        t.send('Are you there?');
+        assert.ok(await pollUntil(() => t.of('inference:held').length === 1 && backlog.previews >= 1, 5_000));
+        assert.ok(await pollUntil(() => !t.internal.activeTurnTokens.has('prime'), 3_000));
+        // An undo while the turn is held, whose own check finds no fit yet ...
+        assert.equal(t.framework.undoLastTurn('prime').undone, true);
+        assert.ok(await pollUntil(() => backlog.previews >= 2, 2_000));
+        // ... and a redo once it would fit.
+        backlog.fit = true;
+        assert.equal(t.framework.redo('prime').redone, true);
+        assert.ok(await pollUntil(() => storedText(t.framework).includes('Answered turn 2'), 3_000),
+          'the redo brought the release check forward');
+      } finally {
+        await t.close();
+      }
+    });
+  });
+
   it('makes one held turn one undo step, which keeps the inputs that joined it', async () => {
     await withBacklog({}, async (backlog) => {
       const t = await residentTurn({ maintenanceIntervalMs: 50 });
