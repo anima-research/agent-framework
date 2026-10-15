@@ -157,13 +157,15 @@ function registry(framework: AgentFramework, options: { streaming?: boolean } = 
   };
 }
 
-async function harness(scripts: NormalizedResponse[][], config: Partial<AgentConfig> = {}, options: { streaming?: boolean } = {}) {
+async function harness(scripts: NormalizedResponse[][], config: Partial<AgentConfig> = {}, options: { streaming?: boolean; gate?: boolean } = {}) {
   const dir = mkdtempSync(join(tmpdir(), 'af-outgoing-stream-')); dirs.push(dir);
   const membrane = new ScriptMembrane(scripts);
   const module = new ToolModule();
   const framework = await AgentFramework.create({
     storePath: join(dir, 'store'), membrane: membrane.asMembrane(),
     agents: [{ name: 'assistant', model: 'test', systemPrompt: 'system', ...config }], modules: [module], syncIntervalMs: 0,
+    // An EventGate gives the agent the sleep tool.
+    ...(options.gate ? { gate: { configPath: join(dir, 'gate.json') } } : {}),
   });
   const stub = registry(framework, options);
   const traces: Array<{ type: string; channelId: string; text: string; inferenceId: string; index?: number }> = [];
@@ -277,6 +279,23 @@ test('explicit: a {{unsent}} resend streams the retained text it publishes', asy
     assert.deepEqual(h.publishes(), [{ channelId: 'discord:dm:99', text: original }]);
     assert.deepEqual(h.chunks().map((c) => ({ channelId: c.channelId, text: c.text })), [{ channelId: 'discord:dm:99', text: original }],
       'the stream carries the substituted text, not the token');
+  } finally { await h.framework.stop(); }
+});
+
+test('hybrid: a publish that fails streams nothing, and the {{unsent}} resend of its retained text streams once', async () => {
+  const reply = 'the reply I meant for alpha';
+  // The >>> post fails, so delivery retains its text and wakes a second turn, which resends it.
+  const h = await harness([[final(text(`>>>#alpha ${reply}`))], [final(text('>>>#alpha {{unsent}}'))]], { proseRouting: 'hybrid' });
+  h.fails.set(reply, 'undelivered');
+  // The failure applies to the first post alone, so the resend succeeds.
+  const failureOf = h.fails.get.bind(h.fails);
+  h.fails.get = (body: string) => { const failure = failureOf(body); h.fails.delete(body); return failure; };
+  try {
+    await h.run();
+    assert.deepEqual(h.publishes(), [{ channelId: 'chan-alpha', text: reply }, { channelId: 'chan-alpha', text: reply }],
+      'the post failed, and the resend posted the retained text');
+    assert.deepEqual(h.chunks().map((c) => ({ channelId: c.channelId, text: c.text })), [{ channelId: 'chan-alpha', text: reply }],
+      'only the resend streams, once, so a voice server speaks the reply once');
   } finally { await h.framework.stop(); }
 });
 
@@ -598,6 +617,20 @@ test('disabled: nothing streams, from a mid-turn round, trailing text or a text-
       assert.deepEqual(h.log, [], 'nothing is published, streamed or completed');
       assert.deepEqual(h.traces, [], 'and no published trace is emitted');
     } finally { await h.framework.stop(); }
+  }
+});
+
+test("the sleep tool's announcement publishes through routeSpeech, as prose does, but isn't part of the stream", async () => {
+  const h = await harness([[round(text('going quiet now'), call('s1', 'sleep', { seconds: 600 }))]], {}, { gate: true });
+  try {
+    await h.run();
+    assert.ok(h.publishes().some((p) => p.channelId === 'world:test' && p.text.startsWith('\u{1F4A4}')), 'the sleep tool announced at the locus');
+    assert.deepEqual(h.chunks().map((c) => c.text), ['going quiet now'], "the round's prose streams, and the announcement doesn't");
+  } finally {
+    // EventGate.dispose leaves a pending sleep's timer running, which would
+    // keep this file alive for the whole sleep, so the test ends the sleep.
+    (h.framework as unknown as { eventGate: { clearSleep(): boolean } }).eventGate.clearSleep();
+    await h.framework.stop();
   }
 });
 

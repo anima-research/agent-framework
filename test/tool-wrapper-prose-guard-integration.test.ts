@@ -261,7 +261,7 @@ describe('tool wrapper prose guard integration', () => {
     membrane.pushResponse(createMockResponse([{
       type: 'text', text: '<mcpl--heartbeat--heartbeat_status>\n</mcpl--heartbeat--heartbeat_status>',
     }] as ContentBlock[]));
-    const module = new HeartbeatModule(); const routed: string[] = [];
+    const module = new HeartbeatModule(); const routed: string[] = []; const outgoing: string[] = [];
     const framework = await AgentFramework.create({
       storePath: join(dir, 'store'), membrane: membrane.asMembrane(),
       agents: [{ name: 'assistant', model: 'test', systemPrompt: 'sys', toolWrapperProseGuard: true }],
@@ -269,6 +269,7 @@ describe('tool wrapper prose guard integration', () => {
     });
     (framework as unknown as { channelRegistry: unknown }).channelRegistry = new Proxy({
       resolveLocus: () => 'world:test', routeSpeech: async (_a: string, text: string) => { routed.push(text); return { delivered: true, channelId: 'world:test' }; },
+      sendOutgoingChunk: (_channel: string, _agent: string, _id: string, _index: number, delta: string) => { outgoing.push(delta); },
       getDefaultPublishChannel: () => null, isChannelOpen: () => true, getDescriptor: () => undefined, getChannelTools: () => [],
     }, { get: (target, prop: string) => (prop in target ? (target as Record<string, unknown>)[prop] : () => undefined) });
     framework.pushEvent({ type: 'external-message', source: 'test', content: 'go', metadata: {} } as unknown as ProcessEvent);
@@ -277,6 +278,8 @@ describe('tool wrapper prose guard integration', () => {
     await framework.stop();
     assert.equal(module.calls, 1, 'genuine structured tool executes exactly once');
     assert.deepEqual(routed, ['<mcpl--heartbeat--heartbeat_status>\n</mcpl--heartbeat--heartbeat_status>']);
+    assert.deepEqual(outgoing, ['<mcpl--heartbeat--heartbeat_status>\n</mcpl--heartbeat--heartbeat_status>'],
+      'posted as ordinary prose, it streams as delivery publishes it');
     assert.ok(all.some((m) => m.content.some((b) => b.type === 'text' && b.text.includes('<mcpl--heartbeat--heartbeat_status>'))));
     assert.ok(!all.some((m) => m.metadata?.kind === 'tool-wrapper-prose-contained'));
   });

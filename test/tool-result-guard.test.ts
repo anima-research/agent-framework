@@ -361,7 +361,7 @@ test('native Membrane observes the first refusal even when guard is enabled by a
   } finally { await framework.stop(); }
 });
 
-test('explicit mode: a guard retry streams on to the sticky destination delivery uses', async () => {
+test('explicit mode: a guard retry streams on to the sticky destination delivery uses, and each stream completes under its own id', async () => {
   const h = await harness([
     [createMockResponse([
       { type: 'text', text: '>>#alpha first' },
@@ -371,6 +371,7 @@ test('explicit mode: a guard retry streams on to the sticky destination delivery
   ], { toolResultGuard: true, proseRouting: 'explicit', refusalHandling: { retries: 3 } });
   const routed: Array<{ text: string; channelId: string }> = [];
   const streamed: Array<{ channelId: string; delta: string }> = [];
+  const completed: Array<{ channelId: string; text: string; inferenceId: string }> = [];
   (h.framework as unknown as { channelRegistry: unknown }).channelRegistry = new Proxy({
     resolveProseTarget: (spec: string) => spec === '#alpha' ? { channelId: 'chan-alpha' } : { error: `no channel ${spec}` },
     routeSpeech: async (_agent: string, speech: string, channelId: string) => {
@@ -378,6 +379,9 @@ test('explicit mode: a guard retry streams on to the sticky destination delivery
     },
     sendOutgoingChunk: (channelId: string, _agent: string, _id: string, _index: number, delta: string) => {
       streamed.push({ channelId, delta });
+    },
+    sendOutgoingComplete: (channelId: string, _agent: string, inferenceId: string, text: string) => {
+      completed.push({ channelId, text, inferenceId });
     },
     getDefaultPublishChannel: () => null, isChannelOpen: () => true,
     getDescriptor: () => undefined, getChannelTools: () => [],
@@ -392,6 +396,11 @@ test('explicit mode: a guard retry streams on to the sticky destination delivery
     const toAlpha = streamed.filter((d) => d.channelId === 'chan-alpha').map((d) => d.delta).join('');
     assert.match(toAlpha, /continued/, 'the resumed stream follows delivery there');
     assert.doesNotMatch(streamed.map((d) => d.delta).join(''), /discard-this-partial-output/);
+    assert.deepEqual(completed.map((c) => ({ channelId: c.channelId, text: c.text })), [
+      { channelId: 'chan-alpha', text: 'first' },
+      { channelId: 'chan-alpha', text: 'continued' },
+    ], 'the stream that handed its turn to the retry completes what it streamed, and so does the retry');
+    assert.notEqual(completed[0].inferenceId, completed[1].inferenceId, 'the retry streams under its own inference id');
   } finally { await h.framework.stop(); }
 });
 
