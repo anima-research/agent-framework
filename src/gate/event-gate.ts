@@ -1755,7 +1755,7 @@ export class EventGate {
   // =========================================================================
 
   /** Begin (or extend) a sleep window of `seconds`. Returns the wake time. */
-  setSleep(seconds: number, note?: string, agentName?: string): { until: number } {
+  setSleep(seconds: number, note?: string, agentName?: string): { until: number; durable: boolean } {
     const ms = Math.max(0, Math.floor(seconds * 1000));
     const armedAt = this.now();
     this.sleepUntil = armedAt + ms;
@@ -1767,7 +1767,7 @@ export class EventGate {
     // process-local wake. Persist before returning success whenever storage is
     // available; failure is loud but the live timer remains authoritative.
     this.armSleepTimer();
-    this.tryPersistWakeState('arming sleep');
+    const durable = this.tryPersistWakeState('arming sleep');
     this.reloadPrivilegedIfChanged();
     this.emitTrace({
       type: 'gate:decision',
@@ -1777,7 +1777,7 @@ export class EventGate {
       behavior: 'skip',
       timestamp: this.now(),
     });
-    return { until: this.sleepUntil };
+    return { until: this.sleepUntil, durable };
   }
 
   // =========================================================================
@@ -1791,7 +1791,7 @@ export class EventGate {
    * Cancelled by the agent's next turn start (see onInferenceStarted):
    * the semantics are "if nothing else wakes me by then, wake me".
    */
-  armSelfWake(agentName: string, seconds: number, source = 'skip_reply'): { inMs: number } {
+  armSelfWake(agentName: string, seconds: number, source = 'skip_reply'): { inMs: number; durable: boolean } {
     const ms = Math.max(1_000, Math.min(3_600_000, Math.floor(seconds * 1000)));
     const prev = this.selfWakeTimers.get(agentName);
     if (prev) clearTimeout(prev);
@@ -1802,7 +1802,7 @@ export class EventGate {
       source,
     };
     this.selfWakeIntents.set(agentName, intent);
-    this.tryPersistWakeState('arming self-wake');
+    const durable = this.tryPersistWakeState('arming self-wake');
     const timer = setTimeout(() => {
       this.selfWakeTimers.delete(agentName);
       this.selfWakeIntents.delete(agentName);
@@ -1843,7 +1843,7 @@ export class EventGate {
       behavior: 'skip',
       timestamp: this.now(),
     });
-    return { inMs: ms };
+    return { inMs: ms, durable };
   }
 
   /** End sleep immediately. Returns true if the agent was asleep. */

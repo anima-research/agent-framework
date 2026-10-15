@@ -20640,7 +20640,8 @@ export class AgentFramework {
         }
         const wake = readSkipReplyWake(enrichedCall.input);
         if (wake.kind === 'wake' && this.eventGate) {
-          const { inMs } = this.eventGate.armSelfWake(agentName, wake.seconds, 'skip_reply');
+          const { inMs, durable } = this.eventGate.armSelfWake(agentName, wake.seconds, 'skip_reply');
+          enrichedCall.input = { ...((enrichedCall.input ?? {}) as Record<string, unknown>), _wake_durable: durable };
           console.error(`[self-wake] agent=${agentName} armed in ${Math.round(inMs / 1000)}s (skip_reply)`);
         }
       }
@@ -26142,7 +26143,7 @@ export class AgentFramework {
       return;
     }
 
-    const { until } = gate.setSleep(seconds, input.message, agentName);
+    const { until, durable } = gate.setSleep(seconds, input.message, agentName);
     const announce = input.announce !== false; // default true
     const human =
       seconds >= 3600 ? `${(seconds / 3600).toFixed(1)}h`
@@ -26186,6 +26187,8 @@ export class AgentFramework {
         until,
         untilLocal: formatZonedDateTime(until, this.timeZone),
         timeZone: this.timeZone,
+        durable,
+        ...(!durable ? { note: 'Wake is armed in this process, but its journal write failed; it may not survive a restart.' } : {}),
       },
       endTurn: true,
     });
