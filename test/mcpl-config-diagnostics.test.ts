@@ -333,6 +333,78 @@ test('FeatureSetManager: each §6.4 disablement is traced beside its console lin
   assert.equal(quiet.lines.length, 3, 'the console line stays');
 });
 
+test("a refused initial policy's reason is recorded without the server's configured credentials", async () => {
+  const fw = Object.create(AgentFramework.prototype) as any;
+  fw.traceListeners = [];
+  fw.featureSetManager = new FeatureSetManager();
+  fw.checkpointManager = null;
+  const traces: Traced[] = [];
+  fw.onTrace((e: Traced) => traces.push(e));
+  const secret = 'srvSecret0123456789';
+  const connection = {
+    id: 'srv',
+    capabilities: { version: '0.5', pushEvents: true } as unknown as McplCapabilities,
+    mcpToolsAdvertised: false,
+    establishGrant: () => {},
+    sendFeatureSetsUpdateRequest: async () => ({ accepted: false, fallback: 'mcp-only', reason: `policy for ${secret} too narrow` }),
+    close: async () => {},
+  };
+  const capture = captureConsoleError();
+  try {
+    await fw.registerMcplServerFeatures({ id: 'srv', url: `wss://h/mcp/${secret}` } as McplServerConfig, connection);
+  } finally {
+    capture.stop();
+  }
+  const refused = traces.filter((t) => t.type === 'mcpl:policy-refused');
+  assert.equal(refused.length, 1);
+  assert.equal((refused[0] as { reason?: string }).reason, 'policy for redacted too narrow');
+  assert.ok(capture.lines.some((l) => l.includes('srv refused initial policy (policy for redacted too narrow)')), capture.lines.join('\n'));
+  assert.ok(!capture.lines.join('\n').includes(secret));
+});
+
+test("the initial policy's other records keep the credentials out too", async () => {
+  const secret = 'srvSecret0123456789';
+  const run = async (answer: () => Promise<unknown>) => {
+    const fw = Object.create(AgentFramework.prototype) as any;
+    fw.traceListeners = [];
+    fw.featureSetManager = new FeatureSetManager();
+    fw.checkpointManager = null;
+    const traces: Traced[] = [];
+    fw.onTrace((e: Traced) => traces.push(e));
+    const config = { id: 'srv', url: `wss://h/mcp/${secret}` } as McplServerConfig;
+    const connection = {
+      id: 'srv',
+      capabilities: { version: '0.5', pushEvents: true } as unknown as McplCapabilities,
+      mcpToolsAdvertised: false,
+      establishGrant: () => {},
+      sendFeatureSetsUpdateRequest: async () => answer(),
+      close: async () => {},
+    };
+    const capture = captureConsoleError();
+    try { await fw.registerMcplServerFeatures(config, connection); } finally { capture.stop(); }
+    const text = capture.lines.join('\n') + JSON.stringify(traces);
+    assert.ok(!text.includes(secret), text);
+    return { lines: capture.lines, traces };
+  };
+  // An unanswered request whose error quotes the url.
+  const unanswered = await run(async () => { throw new Error(`timed out talking to wss://h/mcp/${secret}`); });
+  assert.ok(unanswered.lines.some((l) => l.includes('did not answer the initial policy Request') && l.includes('timed out talking to wss://h/mcp/redacted')), unanswered.lines.join('\n'));
+  // A refusal whose fallback isn't one the host knows: it logs what it does.
+  const odd = await run(async () => ({ accepted: false, fallback: `close-${secret}`, reason: 'no' }));
+  assert.ok(odd.lines.some((l) => l.includes('refused initial policy (no) — fallback: mcp-only')), odd.lines.join('\n'));
+  // A degraded acceptance whose effect quotes the url, and an entry with no
+  // capability list, which is logged rather than read as an unanswered request.
+  const degraded = await run(async () => ({ accepted: true, mode: 'degraded', unavailableFeatures: [
+    { featureSet: 'fs', effect: `see ${secret}`, missingCapabilities: ['x'] },
+    { featureSet: 'odd', effect: 'none' },
+  ] }));
+  assert.ok(degraded.lines.some((l) => l.includes('srv degraded: fs (see redacted; missing x)')), degraded.lines.join('\n'));
+  assert.ok(degraded.lines.some((l) => l.includes('srv degraded: odd (none; missing unknown)')), degraded.lines.join('\n'));
+  assert.ok(!degraded.lines.some((l) => l.includes('did not answer')), degraded.lines.join('\n'));
+  // A refusal's reason, recorded with the derivation the operation began with.
+  await run(async () => ({ accepted: false, fallback: 'mcp-only', reason: `bad ${secret}` }));
+});
+
 test('registerMcplServerFeatures: a refused initial policy is traced, and fallback close closes', async () => {
   for (const fallback of ['close', 'mcp-only'] as const) {
     const fw = Object.create(AgentFramework.prototype) as any;

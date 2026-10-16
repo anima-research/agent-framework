@@ -110,7 +110,7 @@ test('a connect whose child a signal ends during initialize is refused, and its 
   assert.ok(logged.some((line) => line.includes('initial connect failed, will retry')), logged.join('\n'));
 });
 
-test('a transport kept for close() during a reconnect logs the errors it reports, rather than throwing them', { timeout: 10_000 }, async (t) => {
+test('a transport a reconnect gets after close() has begun logs the errors it reports while it closes, rather than throwing them', { timeout: 10_000 }, async (t) => {
   const handshake = deferred();
   const closing = deferred();
   const transport = new HeldTransport(closing.promise);
@@ -131,16 +131,16 @@ test('a transport kept for close() during a reconnect logs the errors it reports
   internals.config = { id: 'kept', command: 'unused', reconnect: true };
   internals.hostCapabilities = { version: '0.5' };
   const reconnecting = internals.attemptReconnect();
-  // close() disables reconnect, waits for the handshake in flight, and then
-  // closes the transport it handed back.
+  // close() ends the reconnect in flight: once its handshake returns, the
+  // attempt closes the transport it got, and close() waits for that.
   const closed = connection.close();
   handshake.resolve();
-  await reconnecting;
-  await waitFor(() => transport.calls > 0, 'close() to reach the kept transport');
+  await waitFor(() => transport.calls > 0, 'the ended reconnect to close the transport it got');
 
   const logged = captureConsoleError(t);
   assert.doesNotThrow(() => transport.emit('error', new Error('a malformed frame while close() waits')));
   closing.resolve();
+  await reconnecting;
   await closed;
   assert.doesNotThrow(() => transport.emit('error', new Error('another, after close() has finished')));
   assert.equal(connection.isConnected, false);

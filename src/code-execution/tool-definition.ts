@@ -32,8 +32,15 @@ export function buildCodeExecutionToolDefinition(opts?: {
       "non-identifier character replaced by '_' " +
       "(e.g. tool 'mcpl--discord--fetch_history' is the function mcpl__discord__fetch_history, " +
       "and tool 'mcpl--dog-events--status' is mcpl__dog_events__status). " +
-      'Each function takes a single dict of arguments and returns a string — the same text ' +
-      'the tool would have returned to you directly; parse structured results with json.loads. ' +
+      'Each function takes a single dict of arguments and returns a string: the text the tool ' +
+      'would have returned to you directly, or "Error: ..." if the call failed. For a result ' +
+      'with structured content, the string is a JSON object to parse with json.loads: ' +
+      '{"content": [...], "structuredContent": ..., "isError": false}, with "error" added when ' +
+      `"isError" is true. "content" holds the server's content blocks. A reference to a payload ` +
+      'appears there as {"type": ..., "refId": ..., "savedTo": ...}, where "savedTo" is the ' +
+      `workspace path the payload was saved to (null if it wasn't) and "refId" is fetch_reference's ` +
+      'ref_id. A structured result over 5 MB is saved to the workspace instead, and the string is ' +
+      '{"isError": ..., "oversized": {"chars": ..., "savedTo": ...}}. ' +
       "An exact-name lookup dict is also available: tools['mcpl--discord--fetch_history']({...}). " +
       'Use top-level await; run independent calls in parallel with asyncio.gather. ' +
       'Only what you print() (plus stderr and the exit code) comes back to you — intermediate ' +

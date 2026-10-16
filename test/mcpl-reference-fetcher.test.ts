@@ -274,10 +274,11 @@ async function eagerFetch(content: unknown[]): Promise<void> {
   const fetcher = makeFetcher({ srv: { url: ORIGIN } });
   const framework = Object.create(AgentFramework.prototype) as {
     getReferenceFetcher(): ReferenceFetcher;
-    autoFetchReferences(content: unknown[], serverId: string, eager: boolean): Promise<void>;
+    autoFetchReferences(content: unknown[], serverId: string, forScript: boolean): Promise<void>;
   };
   framework.getReferenceFetcher = () => fetcher;
-  await framework.autoFetchReferences(content, 'srv', true);
+  // The eager pass alone, as for the model's call: a script's demand would fetch the rest.
+  await framework.autoFetchReferences(content, 'srv', false);
 }
 
 test('the eager default skips expired references, so the live ones after them get its slots', async (t) => {

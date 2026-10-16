@@ -135,7 +135,7 @@ async function makeHarness() {
   };
   fw.discordAwarenessBarrier = null;
   fw.discordAwarenessBarrierGeneration = 0;
-  fw.wireMcplEvents(connection);
+  fw.wireMcplEvents(connection, config);
   await fw.registerMcplServerFeatures(config, connection);
 
   // The push handler responds synchronously when no awareness barrier is

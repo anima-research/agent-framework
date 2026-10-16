@@ -211,15 +211,22 @@ export interface McplChannelCapabilities {
 /**
  * Configuration for connecting to a single MCPL server.
  * Provided in FrameworkConfig.mcplServers[].
+ *
+ * Treat a submitted configuration and its nested values as immutable for as
+ * long as the server uses them. Apply changed settings with
+ * `restartMcplServer(id, newConfig)`; use `accessProvider` for a network
+ * server's rotating credentials (a stdio server's changed `env` goes through
+ * a restart with the new configuration).
  */
 export interface McplServerConfig {
   /** Unique server identifier */
   id: string;
 
   /**
-   * Command to spawn the server process (stdio transport). Mutually exclusive
-   * with `url`. Required for the stdio transport; omit it (and set `url`) for
-   * the WebSocket transport.
+   * Command to spawn the server process (stdio transport). Required for the
+   * stdio transport; omit it (and set `url`) for a network server, over
+   * WebSocket or HTTP. A configuration with both needs `transport` to say
+   * which one is used, and is refused without it.
    */
   command?: string;
 
@@ -243,22 +250,41 @@ export interface McplServerConfig {
   inheritEnv?: boolean;
 
   /**
-   * WebSocket URL for the network transport (`ws://` or `wss://`). Mutually
-   * exclusive with `command`. When set (or `transport: 'websocket'`), the host
-   * dials this endpoint instead of spawning a process — newline-delimited
-   * JSON-RPC MCPL runs over the socket identically to stdio.
+   * URL for a network server, used instead of `command`. A configuration
+   * with both needs `transport` to say which one is used, and is refused
+   * without it. Its scheme decides the protocol family:
+   * - `ws://` or `wss://` is a legacy MCPL server over MCPL's WebSocket
+   *   binding. The host dials it and runs the same newline-delimited JSON-RPC
+   *   as over stdio.
+   * - `http://` or `https://` is a modern MCP (2026-07-28) server over
+   *   Streamable HTTP.
    */
   url?: string;
 
   /**
-   * Transport selector. Defaults to `'websocket'` when a bare `url` is given
-   * (no `command`), `'stdio'` otherwise. Set explicitly to disambiguate.
+   * Transport selector. When it is absent, a `command` means stdio and a
+   * `url` means the transport its scheme names; with both, it is required.
+   * When it is set, it decides which of the two is used and must agree with
+   * it: `'stdio'` needs a `command`, `'websocket'` a ws(s):// url and
+   * `'http'` an http(s):// url.
    */
-  transport?: 'stdio' | 'websocket';
+  transport?: 'stdio' | 'websocket' | 'http';
 
   /**
-   * Bearer token for WebSocket auth. Appended to `url` as a `token` query
-   * parameter (`?token=…`) on connect. Ignored by the stdio transport.
+   * Protocol family for a stdio (`command`) server. Defaults to `'legacy'`,
+   * which is MCP 2024-11-05 + MCPL and today's behavior. `'modern'` speaks
+   * MCP 2026-07-28 through the SDK-backed modern engine. A network server's
+   * family comes from its url's scheme, so setting this on one is a
+   * configuration error. There is no probing between families.
+   */
+  protocol?: 'legacy' | 'modern';
+
+  /**
+   * Bearer token for a network server. Where it travels depends on the
+   * transport: on a ws(s):// url it is appended as a `token` query parameter
+   * (`?token=…`) on connect; to an http(s):// server it is sent as an
+   * `Authorization: Bearer` header and never put in the url. A legacy stdio
+   * server ignores it, and a modern stdio server refuses it.
    */
   token?: string;
 
@@ -374,7 +400,14 @@ export interface McplServerConfig {
    * accepts a request and never responds would otherwise freeze the awaiting
    * agent turn forever; with the timeout the pending request rejects with a
    * descriptive error, which the framework surfaces as a normal isError
-   * tool_result. Set 0 to disable. Default: 60000 (60 seconds).
+   * tool_result. Set 0 to disable. Default: 60000 (60 seconds). A value above
+   * 2^31−1 is refused: Node runs a longer timer after about 1 ms, so every
+   * request would time out at once.
+   *
+   * For a modern server it is one deadline per tool call, across every leg
+   * of the call, and must be an integer from 1 to 2^31−1. It can't be
+   * disabled: the SDK reads 0 as "time out now". At the deadline
+   * cancellation is requested and the outcome is unknown.
    */
   requestTimeoutMs?: number;
 
@@ -1315,6 +1348,8 @@ export interface McpToolDefinition {
   name: string;
   description?: string;
   inputSchema: Record<string, unknown>;
+  /** Server metadata for the tool (e.g. RFC-008 `mcpl/class` hints). */
+  _meta?: Record<string, unknown>;
 }
 
 /**
