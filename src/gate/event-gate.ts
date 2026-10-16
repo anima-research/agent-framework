@@ -736,7 +736,10 @@ export class EventGate {
       opts.scriptTimeoutMs ?? 50,
       this.now,
     );
-    if (opts.autoRecover === true) this.recoverWakeIntents();
+    if (opts.autoRecover === true) {
+      this.restoreWakeIntents();
+      this.admitOverdueWakeIntents();
+    }
   }
 
   // =========================================================================
@@ -1972,11 +1975,9 @@ export class EventGate {
       this.sleepNote = state.sleep.note;
       this.sleepAgent = state.sleep.agentName;
       this.sleepSuppressed = 0;
-      if (state.sleep.wakeAt > now) this.armSleepTimer();
     }
     for (const intent of state.selfWakes) {
       this.selfWakeIntents.set(intent.agentName!, intent);
-      if (intent.wakeAt > now) this.armRestoredSelfWake(intent);
     }
   }
 

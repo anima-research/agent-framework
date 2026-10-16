@@ -165,6 +165,20 @@ describe('durable wake intent recovery', () => {
     return { gate, inferenceRequests, messages };
   }
 
+  function restoredHarness(now: () => number) {
+    const inferenceRequests: Array<{ agentName: string; reason: string; source: string }> = [];
+    const messages: string[] = [];
+    const gate = new EventGate({
+      configPath: join(TMP_DIR, 'gate.json'), now,
+      emitTrace: () => {},
+      addMessage: (_p, c) => { messages.push(c.map((b) => b.text).join('\n')); return ''; },
+      requestInference: (agentName, reason, source) => inferenceRequests.push({ agentName, reason, source }),
+      getAgentNames: () => ['agent'],
+    });
+    gate.restoreWakeIntents();
+    return { gate, inferenceRequests, messages };
+  }
+
   it('persists sleep before setSleep reports success and re-arms it after restart', () => {
     let now = 1_000;
     const a = harness(() => now);
@@ -345,6 +359,9 @@ describe('durable wake intent recovery', () => {
     const h = harness(() => 100);
     assert.strictEqual(h.gate.getSleepState(), null);
     assert.strictEqual((h.gate as unknown as { selfWakeIntents: Map<string, unknown> }).selfWakeIntents.size, 0);
+    h.gate.admitOverdueWakeIntents();
+    assert.deepStrictEqual(h.inferenceRequests, [], 'invalid entries emit no recovery request');
+    assert.deepStrictEqual(h.messages, [], 'invalid entries emit no recovery marker');
     h.gate.dispose();
   });
 
@@ -362,6 +379,49 @@ describe('durable wake intent recovery', () => {
     assert.strictEqual(timers.size, 1);
     gate.dispose();
     assert.strictEqual(timers.size, 0);
+  });
+
+  it('restore loads future intent without arming until admission, and repeated restore reads once', () => {
+    writeFileSync(join(TMP_DIR, 'gate.wake-intents.json'), JSON.stringify({
+      version: 1,
+      selfWakes: [{ agentName: 'agent', armedAt: 1, wakeAt: 60_000, source: 'skip_reply' }],
+    }));
+    const h = restoredHarness(() => 1_000);
+    const internals = h.gate as unknown as { selfWakeTimers: Map<string, unknown> };
+    assert.strictEqual(internals.selfWakeTimers.size, 0, 'restore itself arms no timers');
+    h.gate.admitOverdueWakeIntents();
+    assert.strictEqual(internals.selfWakeTimers.size, 1, 'admission arms the future timer once');
+    h.gate.restoreWakeIntents();
+    h.gate.admitOverdueWakeIntents();
+    assert.strictEqual(internals.selfWakeTimers.size, 1, 'repeated recovery leaks no timer');
+    h.gate.dispose();
+  });
+
+  it('a future wake that falls due while quiesced survives restart and admits once on resume', async () => {
+    const now = Date.now();
+    const journal = join(TMP_DIR, 'gate.wake-intents.json');
+    writeFileSync(journal, JSON.stringify({
+      version: 1,
+      selfWakes: [{ agentName: 'agent', armedAt: now, wakeAt: now + 100, source: 'skip_reply' }],
+    }));
+    const first = restoredHarness(Date.now);
+    first.gate.setQuiesced(true);
+    first.gate.admitOverdueWakeIntents();
+    await sleep(180);
+    const parked = JSON.parse(readFileSync(journal, 'utf8'));
+    assert.strictEqual(parked.selfWakes.length, 1, 'quiesced deadline remains durable');
+    assert.strictEqual(first.inferenceRequests.length, 0);
+    first.gate.dispose();
+
+    const second = restoredHarness(Date.now);
+    second.gate.setQuiesced(true);
+    assert.strictEqual(second.inferenceRequests.length, 0, 'second quiesced boot does not admit');
+    second.gate.setQuiesced(false);
+    second.gate.admitOverdueWakeIntents();
+    assert.strictEqual(second.inferenceRequests.length, 1);
+    second.gate.admitOverdueWakeIntents();
+    assert.strictEqual(second.inferenceRequests.length, 1, 'repeated resume does not duplicate admission');
+    second.gate.dispose();
   });
 
   it('constructor with no journal performs no wake-journal write', () => {
