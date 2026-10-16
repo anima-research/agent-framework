@@ -1092,11 +1092,12 @@ const PROVIDER_ACCELERATION_JITTER_MS = 5_000;
  *  to make its context fit (#304). In the incident that asked for the hold,
  *  compression finished about 7 minutes after the first refusal, so 30
  *  minutes leaves a large backlog room. Short of the bound, a hold ends
- *  without a fit only when compression has nothing pending (checkBudgetHold)
- *  or at a stop. So this bounds a compression that keeps working and never
- *  makes the context fit, and one that is pending but can't move, such as a
- *  merge behind a compression hold, a compression model that keeps failing
- *  and being retried, or the speculative cap (R1-3 of #361's review). The
+ *  without a fit when compression has nothing pending, when a check fails
+ *  for another reason (the turn's own compile then meets that failure), or
+ *  when its agent stops or leaves. So this bounds a compression that keeps
+ *  working and never makes the context fit, and one that is pending but
+ *  can't move, such as a merge behind a compression hold, a compression model
+ *  that keeps failing and being retried, or the speculative cap. The
  *  operator hears of either from the context-refusal alert at each hold's
  *  start, whose webhook post goes at most once per 15 minutes for an agent.
  *  A fixed bound, with no option and no stall rule: the alert tells the
@@ -1147,7 +1148,7 @@ interface BudgetHold {
    *  opens the event gate again (beginAgentTurn). */
   gateClosed: boolean;
   /** Once spent: how it ended. */
-  ended?: { outcome: 'deadline' | 'nothing_pending'; waitedMs: number };
+  ended?: { outcome: 'deadline' | 'nothing_pending' };
 }
 /** Longest delay one setTimeout can represent (2^31-1 ms, about 24.8 days);
  *  a longer timer fires almost at once, so longer waits re-arm in steps. */
@@ -1717,6 +1718,9 @@ export class AgentFramework {
   /** Surgeries, undos and redos so far: one can make a held turn's context
    *  fit whatever compression has done (budgetHoldSignature). */
   private storeSurgeries = 0;
+  /** Messages added, edited or removed in each held agent's store, counted
+   *  from the hold's first look (budgetHoldSignature). */
+  private readonly storeChanges = new WeakMap<ContextManager, { count: number }>();
   private providerAccelerationDefaultCooldownMs = PROVIDER_ACCELERATION_DEFAULT_COOLDOWN_MS;
   private providerAccelerationJitterMs = PROVIDER_ACCELERATION_JITTER_MS;
   private providerHoldHook: ProviderHoldHook | undefined;
@@ -3270,13 +3274,17 @@ export class AgentFramework {
     const own: InferenceRequest = trigger
       ? { ...trigger, coalescingSubject: undefined, coalescingBatch: undefined, coalescingBatchSubjects: undefined }
       : { agentName: agent.name, reason: 'budget-hold-release', source: 'framework', timestamp: Date.now() };
+    // One held turn is one undo step: the refused start's checkpoint goes, and
+    // the released start records the turn's, after the inputs that joined it.
+    // A start can reach its compile while a hold waits (one parked for the
+    // primary provider's admission resumes without the scheduler's look at
+    // the hold), and joins it, its checkpoint going too.
     if (existing?.state === 'holding') {
       if (!existing.heldRequests.some((r) => this.sameInferenceRequest(r, own))) existing.heldRequests.push(own);
+      if (checkpoint !== undefined) this.dropTurnCheckpoint(agent.name, checkpoint);
       return true;
     }
     if (!this.compressionPending(agent)) return false;
-    // One held turn is one undo step: the refused start's checkpoint goes, and
-    // the released start records the turn's, after the inputs that joined it.
     if (checkpoint !== undefined) this.dropTurnCheckpoint(agent.name, checkpoint);
     const now = Date.now();
     const figures = error as Error & { budget?: unknown; actual?: unknown };
@@ -3390,6 +3398,11 @@ export class AgentFramework {
       }
       if (this.budgetHolds.get(agentName) !== hold || hold.state !== 'holding') return;
       if (this.agents.get(agentName) !== agent || this.surgeryHold) return;
+      // The dry compile planned the context as it stood when it began. A
+      // refusal decides nothing if something in the signature moved while it
+      // ran (compression, the store, a surgery whose own look this check
+      // turned away): the next look takes a fresh verdict.
+      if (verdict === 'refused' && this.budgetHoldSignature(agent) !== signature) return;
     }
     if (verdict === 'refused' && pending) {
       hold.lookedAt = signature;
@@ -3428,8 +3441,12 @@ export class AgentFramework {
     }
   }
 
-  /** The verdict of a strategy with no preview: a dry compile, whose plan
-   *  check such a strategy doesn't skip (a hierarchical one's doesn't). */
+  /** The verdict of a strategy with no preview, or of the hierarchical
+   *  strategy where its preview needs adaptive resolution: a dry compile. The
+   *  hierarchical strategy's refuses where its committing compile does. If a
+   *  strategy's dry compile resolves a plan the turn's compile refuses, the
+   *  released turn is refused and held again on the same evidence (lookedAt),
+   *  until something in the signature changes. */
   private async budgetHoldDryRun(agent: Agent): Promise<'fit' | 'refused' | 'check_failed'> {
     try {
       await agent.compileWithInjections(undefined, undefined, { dryRun: true });
@@ -3448,24 +3465,37 @@ export class AgentFramework {
   }
 
   /**
-   * What can make a held turn's context fit: compression's progress (for a
-   * strategy that reports none, whether it still has compression pending),
-   * the agent's message count (a message removed by any path), the agent's
-   * runtime settings (its budget, and the tail and pace that shape the plan),
-   * and surgeries on the store. A verdict isn't taken again until one of them
-   * changes. An edit that shrinks a message changes none of them, and is seen
-   * at the next compression step or surgery. Undefined, so that the check
-   * runs, when one of them can't be read, as while the strategy waits to
-   * reinitialize for a new branch.
+   * What can make a held turn's context fit: compression's progress, the
+   * agent's store (a message added, edited or removed, by any path), the
+   * agent's runtime settings (its budget, and the tail and pace that shape
+   * the plan), and surgeries on the store. A verdict isn't taken again until
+   * one of them changes. For a strategy that reports no progress, or none it
+   * can read (as while it waits to reinitialize for a new branch), whether it
+   * still has compression pending stands in for its progress. Undefined, so
+   * that the check runs, when anything else can't be read.
    */
   private budgetHoldSignature(agent: Agent): string | undefined {
     try {
       const cm = agent.getContextManager();
       const progress = this.contextProgress(cm) ?? { pending: this.compressionPending(agent) };
-      return JSON.stringify([progress, cm.getMessageCount(), agent.getRuntimeSettings(), this.storeSurgeries]);
+      return JSON.stringify([progress, this.storeChangeCount(cm), agent.getRuntimeSettings(), this.storeSurgeries]);
     } catch {
       return undefined;
     }
+  }
+
+  /** How many times the store has changed since the first look at it: a
+   *  count that only rises, so no change hides another, as a removal would
+   *  hide behind an arrival in the store's length. */
+  private storeChangeCount(cm: ContextManager): number {
+    let changes = this.storeChanges.get(cm);
+    if (!changes) {
+      const counted = { count: 0 };
+      cm.onMessage(() => { counted.count++; });
+      this.storeChanges.set(cm, counted);
+      changes = counted;
+    }
+    return changes.count;
   }
 
   /**
@@ -3516,7 +3546,7 @@ export class AgentFramework {
       hold.state = 'released';
     } else {
       hold.state = 'spent';
-      hold.ended = { outcome, waitedMs };
+      hold.ended = { outcome };
     }
     // The refusal closed the turn at the event gate. A held continuation (a
     // budget restart, a guard retry) skips the gate's start when it resumes,
@@ -3570,10 +3600,10 @@ export class AgentFramework {
     hold.recheck = undefined;
   }
 
-  /** A refusal of a turn whose hold is spent, its reason saying how long the
-   *  turn waited and why it ended. A released turn refused after its hold's
-   *  deadline passed is such a turn too. The error's name is kept, so it
-   *  still classifies as the refusal it is. */
+  /** A refusal of a turn whose hold is spent, its reason saying when the turn
+   *  was first held and why its hold ended. A released turn refused after its
+   *  hold's deadline passed is such a turn too. The error's name is kept, so
+   *  it still classifies as the refusal it is. */
   private afterBudgetHold(agentName: string, error: Error): Error {
     const { errorType } = this.classifyInferenceError(error);
     if (errorType !== 'over_budget' && errorType !== 'context_refusal') return error;
@@ -3586,14 +3616,14 @@ export class AgentFramework {
         : agent && !this.compressionPending(agent) ? 'nothing_pending' : undefined;
       if (outcome) {
         hold.state = 'spent';
-        hold.ended = { outcome, waitedMs: Date.now() - hold.startedAt };
+        hold.ended = { outcome };
       }
     }
     if (hold?.state !== 'spent' || !hold.ended) return error;
     const why = hold.ended.outcome === 'deadline'
       ? `the hold's ${describeWait(this.budgetHoldMs)} bound passed`
       : 'compression had nothing left to do';
-    const held = new Error(`${error.message} (the turn was first held ${describeWait(hold.ended.waitedMs)} ago; ${why} and it still didn't fit)`);
+    const held = new Error(`${error.message} (the turn was first held ${describeWait(Date.now() - hold.startedAt)} ago; ${why} and it still didn't fit)`);
     held.name = error.name;
     if (error.stack !== undefined) held.stack = error.stack;
     return held;
