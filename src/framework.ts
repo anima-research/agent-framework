@@ -4631,8 +4631,6 @@ export class AgentFramework {
       );
     }
 
-    this.eventGate?.admitOverdueWakeIntents();
-    const releasedRequests = this.pendingRequests.length;
     // In-memory first: addMessage must stop deferring so the flush below can
     // land. The DURABLE flag is cleared only after the flush completes — a
     // crash in between then boots quiesced with the un-acked remainder
@@ -4650,6 +4648,7 @@ export class AgentFramework {
       // flushDeferredWrites); nothing here may reach the plane reopen below.
       await this.flushDeferredWrites('resume');
       this.persistHostMode(null);
+      this.eventGate?.admitOverdueWakeIntents();
     } finally {
       // Reopen MCPL data planes through the existing barrier funnel — NOT a
       // bespoke ready() loop. The funnel inherits completeMcplDataPlaneGate's
@@ -4673,6 +4672,7 @@ export class AgentFramework {
         }
       }
 
+      const releasedRequests = this.pendingRequests.length;
       this.emitTrace({
         type: 'host:resume',
         ...(opts?.force && failing.length > 0 ? { forced: true } : {}),
