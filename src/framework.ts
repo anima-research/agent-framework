@@ -1137,12 +1137,10 @@ interface BudgetHold {
   recheck?: ReturnType<typeof setInterval>;
   /** A release check's dry compile is running (checkBudgetHold). */
   checking: boolean;
-  /** The signature (budgetHoldSignature) at the check that last refused, or
-   *  at a refusal of the turn this hold released: the hold looks again only
-   *  once it changes. */
-  refusedAt?: string;
-  /** Once its wait ends: the note the turn's compile carries, saying why it waited. */
-  note?: string;
+  /** The signature (budgetHoldSignature) at the hold's last verdict: a check
+   *  that refused, or one that released a turn its compile then refused. The
+   *  hold looks again only once the signature changes. */
+  lookedAt?: string;
   /** Once its wait ends: its requests include a continuation, whose start
    *  opens the event gate again (beginAgentTurn). */
   gateClosed: boolean;
@@ -2797,9 +2795,10 @@ export class AgentFramework {
 
     // A stopped host must never hang behind its own cooldown.
     this.cancelProviderAdmission();
-    // Nor behind a turn held for budget: its requests go with the stop, as a
-    // provider hold's do, and nothing a hold left for its agent's name
-    // outlives the stop.
+    // Nor behind a turn held for budget: a hold still waiting goes with its
+    // requests, as a provider hold's do, and every hold's record goes. Requests
+    // a hold has already released are queued wakes, which a stop leaves
+    // queued as it leaves any.
     for (const name of [...(this.budgetHolds?.keys() ?? [])]) this.dropBudgetHold(name);
     // An open logical turn doesn't survive a stop: a start after a restart
     // on this instance opens a new one rather than continuing the old turn's
@@ -3289,15 +3288,12 @@ export class AgentFramework {
     hold.reason = boundFailureText(String(error.message), FAILURE_SUMMARY_MAX_CHARS);
     hold.budget = typeof figures.budget === 'number' ? figures.budget : undefined;
     hold.actual = typeof figures.actual === 'number' ? figures.actual : undefined;
-    hold.note = undefined;
     hold.gateClosed = false;
-    // The check released this turn and its compile was refused, so the two
-    // disagreed: content reached the compile after the check, or the compile
-    // planned what the preview can't see (a kv-unified prefix). The hold
-    // doesn't release it again on the same evidence, but once compression
-    // moves, the budget or settings change, or a surgery runs
-    // (budgetHoldSignature).
-    hold.refusedAt = existing ? this.budgetHoldSignature(agent) : undefined;
+    // A released turn refused again keeps lookedAt, the signature its release
+    // was decided on: the check and the compile disagreed (content reached the
+    // compile after the check, or the compile planned what the preview can't
+    // see, such as a kv-unified prefix), so the hold doesn't release it again
+    // on the same evidence, only once something in the signature changes.
     hold.timer = setTimeout(() => this.releaseBudgetHold(agent.name, 'deadline'), Math.min(Math.max(0, hold.until - now), MAX_TIMER_DELAY_MS));
     hold.timer.unref?.();
     // With the maintenance timer off, nothing else compresses or looks again:
@@ -3368,16 +3364,15 @@ export class AgentFramework {
    * another reason, the hold ends too, and the turn's own compile meets that
    * failure ('check_failed'). If it refuses and compression had nothing
    * pending, the hold ends without a fit. Otherwise it goes on, and doesn't
-   * look again until compression moves, the budget or settings change, or a
-   * surgery runs (BudgetHold.refusedAt). None runs while a surgery holds the
-   * store; the surgery's release asks.
+   * look again until something in its signature changes (BudgetHold.lookedAt).
+   * None runs while a surgery holds the store; the surgery's release asks.
    */
   private async checkBudgetHold(agentName: string): Promise<void> {
     const hold = this.budgetHolds?.get(agentName);
     const agent = this.agents.get(agentName);
     if (hold?.state !== 'holding' || !agent || this.surgeryHold) return;
     const signature = this.budgetHoldSignature(agent);
-    if (signature !== undefined && signature === hold.refusedAt) return;
+    if (signature !== undefined && signature === hold.lookedAt) return;
     // Read before the verdict: a compression that ends while a dry compile
     // runs would otherwise make that compile's refusal look final.
     const pending = this.compressionPending(agent);
@@ -3394,9 +3389,16 @@ export class AgentFramework {
       if (this.budgetHolds.get(agentName) !== hold || hold.state !== 'holding') return;
       if (this.agents.get(agentName) !== agent || this.surgeryHold) return;
     }
-    if (verdict !== 'refused') this.releaseBudgetHold(agentName, verdict);
-    else if (!pending) this.releaseBudgetHold(agentName, 'nothing_pending');
-    else hold.refusedAt = signature;
+    if (verdict === 'refused' && pending) {
+      hold.lookedAt = signature;
+    } else if (verdict === 'refused') {
+      this.releaseBudgetHold(agentName, 'nothing_pending');
+    } else {
+      // The evidence this release rests on, so that a refusal of the released
+      // turn holds it until the evidence changes (holdForBudgetRefusal).
+      hold.lookedAt = signature;
+      this.releaseBudgetHold(agentName, verdict);
+    }
   }
 
   /**
@@ -3434,17 +3436,22 @@ export class AgentFramework {
     }
   }
 
-  /** What can make a held turn's context fit: compression's progress, the
-   *  agent's runtime settings (its budget, and the tail and pace that shape
-   *  the plan), and a surgery on the store. A check that refused isn't
-   *  repeated until one of them changes. Undefined when the strategy reports
-   *  no progress, so that every check runs. */
+  /**
+   * What can make a held turn's context fit: compression's progress (for a
+   * strategy that reports none, whether it still has compression pending),
+   * the agent's message count (a message removed by any path), the agent's
+   * runtime settings (its budget, and the tail and pace that shape the plan),
+   * and surgeries on the store. A verdict isn't taken again until one of them
+   * changes. An edit that shrinks a message changes none of them, and is seen
+   * at the next compression step or surgery. Undefined, so that the check
+   * runs, when one of them can't be read, as while the strategy waits to
+   * reinitialize for a new branch.
+   */
   private budgetHoldSignature(agent: Agent): string | undefined {
     try {
-      const progress = this.contextProgress(agent.getContextManager());
-      return progress === undefined
-        ? undefined
-        : JSON.stringify([progress, agent.getRuntimeSettings(), this.storeSurgeries]);
+      const cm = agent.getContextManager();
+      const progress = this.contextProgress(cm) ?? { pending: this.compressionPending(agent) };
+      return JSON.stringify([progress, cm.getMessageCount(), agent.getRuntimeSettings(), this.storeSurgeries]);
     } catch {
       return undefined;
     }
@@ -3462,7 +3469,7 @@ export class AgentFramework {
       void this.checkBudgetHold(agent.name);
       return;
     }
-    this.kickOverBudgetDrain(agent.name, agent, () => void this.checkBudgetHold(agent.name));
+    this.kickOverBudgetDrain(agent.name, agent, () => void this.checkBudgetHold(agent.name), 'hold');
   }
 
   /**
@@ -3470,7 +3477,7 @@ export class AgentFramework {
    * fresh compile, and the record stays until that turn's stream exists or
    * the turn ends (settleBudgetHold).
    * - The turn's next compile carries a note saying why it waited
-   *   (BudgetHold.note). It is an injection of that compile alone, which the
+   *   (budgetHoldNote). It is an injection of that compile alone, which the
    *   context manager adds after selecting within the budget: it can't be
    *   what refuses the compile, it is in the request only when the compile
    *   fit, it is never stored, and it moves no routing.
@@ -3478,7 +3485,7 @@ export class AgentFramework {
    *   refusal of its compile holds again, with the same start and deadline.
    * - After the deadline, or with nothing pending, the hold is spent: the
    *   turn's refusals take the error policy's path, as before #304, and say
-   *   how long the turn was held (afterBudgetHold).
+   *   when the turn was first held (afterBudgetHold).
    */
   private releaseBudgetHold(agentName: string, outcome: Exclude<BudgetHoldOutcome, 'stopped'>): void {
     const hold = this.budgetHolds?.get(agentName);
@@ -3500,11 +3507,6 @@ export class AgentFramework {
       hold.state = 'spent';
       hold.ended = { outcome, waitedMs };
     }
-    const size = hold.budget !== undefined && hold.actual !== undefined
-      ? ` (${hold.actual.toLocaleString('en-US')} tokens against ${hold.budget.toLocaleString('en-US')})`
-      : '';
-    hold.note = `[budget-hold] Your context didn't fit its budget${size}, so this turn ` +
-      `waited ${describeWait(waitedMs)} while compression caught up. It fits now.`;
     // The refusal closed the turn at the event gate. A held continuation (a
     // budget restart, a guard retry) skips the gate's start when it resumes,
     // since its predecessor would have kept the gate open: this one didn't,
@@ -3514,8 +3516,18 @@ export class AgentFramework {
     hold.heldRequests = [];
   }
 
-  /** A stop, or the agent's leaving: its held turn goes, with its requests,
-   *  as a provider hold's do, and nothing of it outlives the agent. */
+  /** The note a held turn's compile carries once its wait has ended, saying
+   *  why it waited, with the wait counted to now (beginAgentTurn). */
+  private budgetHoldNote(hold: BudgetHold): string {
+    const size = hold.budget !== undefined && hold.actual !== undefined
+      ? ` (${hold.actual.toLocaleString('en-US')} tokens against ${hold.budget.toLocaleString('en-US')})`
+      : '';
+    return `[budget-hold] Your context didn't fit its budget${size}, so this turn waited ` +
+      `${describeWait(Date.now() - hold.startedAt)}. It fits now.`;
+  }
+
+  /** A stop, or the agent's leaving: the agent's hold record goes, and a hold
+   *  still waiting takes its requests with it, as a provider hold's do. */
   private dropBudgetHold(agentName: string): void {
     const hold = this.budgetHolds?.get(agentName);
     if (!hold) return;
@@ -3555,15 +3567,22 @@ export class AgentFramework {
     const { errorType } = this.classifyInferenceError(error);
     if (errorType !== 'over_budget' && errorType !== 'context_refusal') return error;
     const hold = this.budgetHolds?.get(agentName);
-    if (hold?.state === 'released' && hold.until <= Date.now()) {
-      hold.state = 'spent';
-      hold.ended = { outcome: 'deadline', waitedMs: Date.now() - hold.startedAt };
+    if (hold?.state === 'released') {
+      // A released turn refused once its bound has passed, or with nothing
+      // pending that could change the refusal, has spent its hold.
+      const agent = this.agents.get(agentName);
+      const outcome = hold.until <= Date.now() ? 'deadline'
+        : agent && !this.compressionPending(agent) ? 'nothing_pending' : undefined;
+      if (outcome) {
+        hold.state = 'spent';
+        hold.ended = { outcome, waitedMs: Date.now() - hold.startedAt };
+      }
     }
     if (hold?.state !== 'spent' || !hold.ended) return error;
     const why = hold.ended.outcome === 'deadline'
       ? `the hold's ${describeWait(this.budgetHoldMs)} bound passed`
       : 'compression had nothing left to do';
-    const held = new Error(`${error.message} (the turn was held ${describeWait(hold.ended.waitedMs)} while compression ran; ${why} and it still didn't fit)`);
+    const held = new Error(`${error.message} (the turn was first held ${describeWait(hold.ended.waitedMs)} ago; ${why} and it still didn't fit)`);
     held.name = error.name;
     if (error.stack !== undefined) held.stack = error.stack;
     return held;
@@ -3576,7 +3595,7 @@ export class AgentFramework {
    * Bounded ticks, best-effort, never throws, one kick per agent at a time;
    * `after` runs once the kick ends, the one already running if there is one.
    */
-  private kickOverBudgetDrain(agentName: string, agent: Agent, after?: () => void): void {
+  private kickOverBudgetDrain(agentName: string, agent: Agent, after?: () => void, by: 'breaker' | 'hold' = 'breaker'): void {
     if (this.surgeryHold) return;
     if (after) {
       const waiting = this.overBudgetDrainAfter.get(agentName);
@@ -3593,15 +3612,19 @@ export class AgentFramework {
           await cm.tick();
           ticks++;
         }
+        // A hold's kicks, every interval with the maintenance timer off, are
+        // its own work, not failures.
+        const tag = by === 'hold' ? '[budget-hold]' : '[inference-failed]';
+        const label = by === 'hold' ? 'budget hold' : 'OverBudget breaker';
         console.error(
-          `[inference-failed] drain kicked for ${agentName} (OverBudget breaker, ${ticks} ticks` +
+          `${tag} drain kicked for ${agentName} (${label}, ${ticks} ticks` +
             `${ticks < 8 ? ', stopped while a surgery holds the store' : ''})`,
         );
       } catch (err) {
         if (err instanceof MaintenanceWithdrawnError) {
-          console.error(`[inference-failed] drain kicked for ${agentName} (OverBudget breaker, ${ticks} ticks, stopped: ${err.message})`);
+          console.error(`${by === 'hold' ? '[budget-hold]' : '[inference-failed]'} drain kicked for ${agentName} (${by === 'hold' ? 'budget hold' : 'OverBudget breaker'}, ${ticks} ticks, stopped: ${err.message})`);
         } else {
-          console.error(`[inference-failed] drain kick failed for ${agentName} after ${ticks} ticks: ${describeFailureWithFrames(err)}`);
+          console.error(`${by === 'hold' ? '[budget-hold]' : '[inference-failed]'} drain kick failed for ${agentName} after ${ticks} ticks: ${describeFailureWithFrames(err)}`);
         }
       } finally {
         this.overBudgetDrainInFlight.delete(agentName);
@@ -12438,7 +12461,7 @@ export class AgentFramework {
       // budget, so the note can't be what refuses this compile, and it is in
       // the request only when the compile fit. It is never stored.
       const heldTurn = this.budgetHolds?.get(agent.name);
-      const holdNote = heldTurn && heldTurn.state !== 'holding' ? heldTurn.note : undefined;
+      const holdNote = heldTurn && heldTurn.state !== 'holding' ? this.budgetHoldNote(heldTurn) : undefined;
       if (holdNote !== undefined) {
         const noteInjection: ContextInjection = {
           namespace: 'framework:budget-hold',
