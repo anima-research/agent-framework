@@ -290,7 +290,7 @@ describe('Conversation routing', () => {
     const onTrunk = compiles.filter((c) => c.cm === trunk);
     assert.ok(onTrunk.length >= 1, 'the seed compiled the template');
     assert.ok(onTrunk.every((c) => c.dry), "the template's compiles during the spawn are dry runs");
-    assert.equal(compiles.find((c) => c.cm === fork)?.dry, true, "the new namespace's emptiness check is a dry run");
+    assert.equal(compiles.filter((c) => c.cm === fork).length, 0, "the new namespace's emptiness check reads its stored messages, compiling nothing");
 
     const types = seeded.flatMap((m) => m.content.map((b) => b.type));
     assert.ok(!types.includes('thinking') && !types.includes('redacted_thinking'), `no thinking in the seed: ${types}`);

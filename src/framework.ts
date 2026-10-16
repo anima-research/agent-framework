@@ -9894,8 +9894,9 @@ export class AgentFramework {
    * history anyway (counter state lost, crash between spawn and persist),
    * seeding again would stack another template copy on top of it.
    *
-   * Both compiles are dry runs: neither is sent, and the template's runs
-   * while the template may be mid-stream, where a committing compile
+   * The fork's emptiness is its stored message count, so the fork itself
+   * is never compiled here. The template's compile is a dry run: it isn't
+   * sent, and it runs while the template may be mid-stream, where a committing compile
    * would commit fold resolutions and queue the compression its fold plan
    * calls for (and, once context-manager's thinking binding ships, fence
    * its stream's replies). In context-manager 0.14 a dry run leaves
