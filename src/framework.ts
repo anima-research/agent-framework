@@ -10441,11 +10441,16 @@ export class AgentFramework {
       // requests[0] in that mixed batch bypassed the turn lock because a
       // restart existed, then treated the continuation as a fresh turn.
       const trigger = budgetRestart ?? requests[0];
-      if (!budgetRestart && (trigger.nonChannelOrigin || trigger.channelId)) {
-        // Private-surface and channel wakes never share a fresh turn. Preserve
-        // queue order: the first request's kind runs now; opposite-kind siblings
-        // remain queued for a distinct turn.
-        const opposite = trigger.nonChannelOrigin
+      // A restart keeps its own kind. For a fresh batch led by a neutral wake,
+      // the first request that actually declares private/channel routing owns
+      // the turn kind; neutral causes may share that turn, the opposite kind may not.
+      const kindRequest = budgetRestart ?? requests.find(
+        (request) => request.nonChannelOrigin === true || !!request.channelId,
+      );
+      const turnIsPrivate = kindRequest?.nonChannelOrigin === true;
+      const turnIsChannel = !turnIsPrivate && !!kindRequest?.channelId;
+      if (turnIsPrivate || turnIsChannel) {
+        const opposite = turnIsPrivate
           ? (request: InferenceRequest) => !!request.channelId
           : (request: InferenceRequest) => request.nonChannelOrigin === true;
         const siblings = requests.filter((request) => request !== trigger && opposite(request));
@@ -10514,8 +10519,9 @@ export class AgentFramework {
         suppressProse: silentOnly ? trigger?.suppressProse : undefined,
         ephemeralSystemPrompt: silentOnly ? trigger?.ephemeralSystemPrompt : undefined,
         silentHeartbeat: silentOnly ? trigger?.silentHeartbeat : undefined,
-        channelId: trigger.nonChannelOrigin ? undefined : channelReq?.channelId,
-        addressed: trigger.nonChannelOrigin ? false : addressedReq !== undefined,
+        channelId: turnIsPrivate ? undefined : channelReq?.channelId,
+        addressed: turnIsPrivate ? false : addressedReq !== undefined,
+        nonChannelOrigin: turnIsPrivate || undefined,
         // A context-budget restart continues the same logical turn: it keeps
         // the channel for routing but names no author — the restart is its
         // own cause, and borrowing another request's author would be false

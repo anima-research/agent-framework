@@ -81,7 +81,7 @@ describe('surface provenance through the real scheduler', () => {
     });
     await framework.runUntilIdle();
     assert.equal(handed?.channelId, 'discord:g:room');
-    assert.equal(handed?.nonChannelOrigin, false);
+    assert.notEqual(handed?.nonChannelOrigin, true);
     await framework.stop();
     rmSync(tempDir, { recursive: true, force: true });
   });
