@@ -34,6 +34,36 @@ test('an alias, a definition or a kept key leaves the tool reachable', () => {
   assert.deepEqual(read('name = "test--send_message"'), { names: ['send_message'], reachable: ['send_message'] });
 });
 
+test("a direct call outside a definition leaves nothing reachable, beside a definition that doesn't use the tool", () => {
+  assert.deepEqual(read('def fmt(x):\n    return x\nawait say({"text": fmt("hi")})'), { names: ['say'], reachable: [] });
+  assert.deepEqual(read('await say(sorted(xs, key=lambda x: x))'), { names: ['say'], reachable: [] }, 'a lambda after the call');
+});
+
+test('a name inside a definition is reachable, a called key included, whatever lines the definition spans', () => {
+  assert.deepEqual(read('def go():\n    return tools["say"]({})'), { names: ['say'], reachable: ['say'] });
+  // A header over several lines, and a body line continued inside brackets at
+  // no indentation, as Python allows; the call after the definition is direct.
+  assert.deepEqual(read('async def post(\n    text,\n):\n    x = [\n1,\n]\n    await say({"text": text})\nawait skip_reply({})'),
+    { names: ['say', 'skip_reply'], reachable: ['say'] });
+  assert.deepEqual(read('class Poster:\n    async def go(self):\n        await send_message({})\n\nawait think({})'),
+    { names: ['send_message', 'think'], reachable: ['send_message'] });
+  // A line a string literal carries over continues its statement, whatever its
+  // indentation (Ramona-2416); so does a blank line written with \r\n.
+  assert.deepEqual(read('if True:\n    def f():\n        q = """\n"""; await say({})'), { names: ['say'], reachable: ['say'] }, 'a line opened inside a triple-quoted string');
+  assert.deepEqual(read('def f():\n    q = "a\\\n"; await say({})'), { names: ['say'], reachable: ['say'] }, 'a line opened inside a backslash-continued string');
+  assert.deepEqual(read('def f():\r\n    x = 1\r\n\r\n    await say({})\r\n'), { names: ['say'], reachable: ['say'] }, 'a blank \\r\\n line');
+});
+
+test("a class's own body runs as the class statement does, so a direct call there leaves nothing reachable", () => {
+  assert.deepEqual(read('class A:\n    say({})'), { names: ['say'], reachable: [] });
+  assert.deepEqual(read('class A:\n    post = say'), { names: ['say'], reachable: ['say'] }, 'an alias kept on the class');
+});
+
+test("a name at a line's end, before a line that opens with a bracket, is a reference, not a call", () => {
+  assert.deepEqual(read('alias = say\n(print("x"))'), { names: ['say'], reachable: ['say'] });
+  assert.deepEqual(read('post = tools["say"]\n(print("x"))'), { names: ['say'], reachable: ['say'] }, 'a key, likewise');
+});
+
 test('a comment names nothing, and its words are not code', () => {
   assert.deepEqual(read('await test__slow({})  # then skip_reply, or say so'), { names: [], reachable: [] });
   assert.deepEqual(read('say("hi")  # first class result'), { names: ['say'], reachable: [] });
@@ -59,6 +89,10 @@ test('an escaped quote stays inside its string', () => {
   assert.deepEqual(read('msg = "she said \\"skip_reply\\" # done"'), { names: ['skip_reply'], reachable: [] });
 });
 
+test('a name right after an escape in a string counts, as the string run as code would call it', () => {
+  assert.deepEqual(read('exec("x = 1\\nsay({})")'), { names: ['say'], reachable: [] });
+});
+
 test("an f-string's call inside its braces counts for its own round but leaves nothing reachable", () => {
   assert.deepEqual(read('print(f"result: {say({\'text\': \'hi\'})}")'), { names: ['say'], reachable: [] });
 });
@@ -68,17 +102,22 @@ test('a # inside a string starts no comment', () => {
     { names: ['say', 'send_message'], reachable: ['send_message'] });
 });
 
-test("a string in single quotes ends at its line's end, so a stray quote can't take the rest of the script", () => {
+test("a string in one quote mark, not three, ends at its line's end, so a stray quote can't take the rest of the script", () => {
   assert.deepEqual(read('x = "unclosed\npost = test__send_message'), { names: ['send_message'], reachable: ['send_message'] });
+  assert.deepEqual(read("x = 'unclosed\npost = test__send_message"), { names: ['send_message'], reachable: ['send_message'] });
 });
 
-test("what goes unseen: a name the code doesn't spell out, an enumeration, code from a file, a call awaited later, code kept in a string", () => {
+test("what goes unseen: a name the code doesn't spell out, an enumeration, code from a file, a call that outlives its script, an alias made inside a string or an f-string's field, code kept in a string", () => {
   assert.deepEqual(read('name = "skip" + "_reply"\nawait tools[name]({})'), { names: [], reachable: [] }, 'built at runtime');
   assert.deepEqual(read('await tools["s\\x61y"]({})'), { names: [], reachable: [] }, 'written with escapes');
   assert.deepEqual(read('fns = list(tools.values())'), { names: [], reachable: [] }, 'an enumeration');
   assert.deepEqual(read('exec(open("helper.py").read())'), { names: [], reachable: [] }, 'code from a file');
   assert.deepEqual(read('pending = say({"text": "hi"})'), { names: ['say'], reachable: [] }, 'a call made here...');
   assert.deepEqual(read('await pending'), { names: [], reachable: [] }, '...and awaited later');
+  assert.deepEqual(read('asyncio.create_task(say({"text": "hi"}))'), { names: ['say'], reachable: [] }, 'a call scheduled as a task');
+  assert.deepEqual(read('gen = (say({"text": m}) for m in msgs)'), { names: ['say'], reachable: [] }, 'a call left in a generator expression');
+  assert.deepEqual(read('exec("post = say")'), { names: ['say'], reachable: [] }, 'an alias made inside a string the script runs');
+  assert.deepEqual(read('print(f"{(post := say)}")'), { names: ['say'], reachable: [] }, "an alias made inside an f-string's field");
   assert.deepEqual(read('later = "say({\'text\': \'hi\'})"'), { names: ['say'], reachable: [] }, 'code kept in a string...');
   assert.deepEqual(read('await eval(later)'), { names: [], reachable: [] }, '...and run later');
 });

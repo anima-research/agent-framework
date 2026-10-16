@@ -832,18 +832,20 @@ describe("a round that runs code_execution is routed once its scripts return (re
     } finally { await h.done(); }
   });
 
-  it('locus: a think inside the script holds its round back under the private same-round policy', async () => {
-    const h = await scriptRound('locus', [
+  for (const mode of ['locus', 'hybrid', 'explicit'] as const) it(`${mode}: a think inside the script holds its round back under the private same-round policy`, async () => {
+    const prefix = mode === 'explicit' ? '>>#alpha ' : '';
+    const target = mode === 'explicit' ? 'chan-alpha' : 'world:test';
+    const h = await scriptRound(mode, [
       createMockResponse([
-        { type: 'text', text: 'working it through' },
+        { type: 'text', text: `${prefix}working it through` },
         scriptCall({ code: 'await think({"content": "notes"})' }),
       ] as ContentBlock[], 'tool_use'),
-      createMockResponse([{ type: 'text', text: 'the answer' }] as ContentBlock[]),
+      createMockResponse([{ type: 'text', text: `${prefix}the answer` }] as ContentBlock[]),
     ], { sameRoundThinkTextPolicy: 'private' });
     try {
       await h.run();
       assert.ok(h.log.includes('tool:think'), 'the script called think');
-      assert.deepStrictEqual(h.log.filter((e) => e.startsWith('publish:')), ['publish:the answer@world:test'],
+      assert.deepStrictEqual(h.log.filter((e) => e.startsWith('publish:')), [`publish:the answer@${target}`],
         'the round beside the think stays private, as with a direct think, and the next round is delivered');
     } finally { await h.done(); }
   });
@@ -1141,6 +1143,74 @@ describe("a round that runs code_execution is routed once its scripts return (re
       assert.deepStrictEqual(h.log.filter((e) => e.startsWith('publish:')), ['publish:keeping a handle@world:test'],
         "the send through the alias silences its round and the turn's later prose, as a direct send does");
     } finally { await h.done(); }
+  });
+
+  /** The agent's interpreter mark: the names it holds, or undefined when there is none. */
+  const markOf = (framework: AgentFramework) => {
+    const mark = (framework as unknown as { scriptRoutingInterpreters: Map<string, { names: Set<string> }> })
+      .scriptRoutingInterpreters.get('assistant');
+    return mark && [...mark.names].sort();
+  };
+
+  it("a script that calls a routing tool directly, beside a definition that doesn't use it, leaves no mark", async () => {
+    const h = await scriptRound('locus', [
+      createMockResponse([
+        { type: 'text', text: 'formatting notes' },
+        scriptCall({ code: 'def fmt(x):\n    return x.upper()\nawait think({"content": fmt("notes")})' }, 'ce1'),
+      ] as ContentBlock[], 'tool_use'),
+      createMockResponse([{ type: 'text', text: 'done' }] as ContentBlock[]),
+    ]);
+    try {
+      await h.run();
+      assert.ok(h.log.includes('tool:think'), 'the script thought');
+      assert.equal(markOf(h.framework), undefined, 'fmt can still be called, but it reaches no routing tool');
+    } finally { await h.done(); }
+  });
+
+  it('a later mark in the same interpreter adds its names to the earlier ones', async () => {
+    const h = await scriptRound('locus', [
+      createMockResponse([
+        { type: 'text', text: 'defining a helper' },
+        scriptCall({ code: 'async def post():\n    await test__send_message({})' }, 'ce1'),
+      ] as ContentBlock[], 'tool_use'),
+      createMockResponse([
+        { type: 'text', text: 'keeping a handle' },
+        scriptCall({ code: 't = think' }, 'ce2'),
+      ] as ContentBlock[], 'tool_use'),
+      createMockResponse([{ type: 'text', text: 'done' }] as ContentBlock[]),
+    ]);
+    try {
+      await h.run();
+      assert.deepStrictEqual(markOf(h.framework), ['send_message', 'think'], 'the helper the first script left is still there');
+    } finally { await h.done(); }
+  });
+
+  it('a script the busy runner refuses leaves no mark, though its code would have', async () => {
+    const h = await scriptRound('locus', [
+      createMockResponse([
+        { type: 'text', text: 'two scripts at once' },
+        scriptCall({ code: 'await test__slow({})' }, 'ce1'),
+        scriptCall({ code: 'post = test__send_message' }, 'ce2'),
+      ] as ContentBlock[], 'tool_use'),
+      createMockResponse([{ type: 'text', text: 'done' }] as ContentBlock[]),
+    ]);
+    // Let the first script go once the second's refusal has come back.
+    const results: string[] = [];
+    h.framework.onTrace((event) => {
+      if ((event.type === 'tool:completed' || event.type === 'tool:failed') && event.tool === 'code_execution') {
+        results.push(event.callId);
+        if (event.callId === 'ce2') h.module.releaseSlow();
+      }
+    });
+    const bound = setTimeout(() => h.module.releaseSlow(), 15000);
+    try {
+      await h.run();
+      assert.deepStrictEqual(results, ['ce2', 'ce1'], "the second script was refused while the first ran");
+      assert.equal(markOf(h.framework), undefined, 'the refused alias never ran, so it marks nothing');
+    } finally {
+      clearTimeout(bound);
+      await h.done();
+    }
   });
 
   it("a mark left in an earlier interpreter doesn't hold a round once a newer interpreter runs", async () => {
