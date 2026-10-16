@@ -3604,6 +3604,10 @@ export class AgentFramework {
     }
     if (this.overBudgetDrainInFlight.has(agentName)) return;
     this.overBudgetDrainInFlight.add(agentName);
+    // A hold's kicks, every interval with the maintenance timer off, are its
+    // own work, not failures.
+    const tag = by === 'hold' ? '[budget-hold]' : '[inference-failed]';
+    const label = by === 'hold' ? 'budget hold' : 'OverBudget breaker';
     const drain = (async () => {
       let ticks = 0;
       try {
@@ -3612,19 +3616,15 @@ export class AgentFramework {
           await cm.tick();
           ticks++;
         }
-        // A hold's kicks, every interval with the maintenance timer off, are
-        // its own work, not failures.
-        const tag = by === 'hold' ? '[budget-hold]' : '[inference-failed]';
-        const label = by === 'hold' ? 'budget hold' : 'OverBudget breaker';
         console.error(
           `${tag} drain kicked for ${agentName} (${label}, ${ticks} ticks` +
             `${ticks < 8 ? ', stopped while a surgery holds the store' : ''})`,
         );
       } catch (err) {
         if (err instanceof MaintenanceWithdrawnError) {
-          console.error(`${by === 'hold' ? '[budget-hold]' : '[inference-failed]'} drain kicked for ${agentName} (${by === 'hold' ? 'budget hold' : 'OverBudget breaker'}, ${ticks} ticks, stopped: ${err.message})`);
+          console.error(`${tag} drain kicked for ${agentName} (${label}, ${ticks} ticks, stopped: ${err.message})`);
         } else {
-          console.error(`${by === 'hold' ? '[budget-hold]' : '[inference-failed]'} drain kick failed for ${agentName} after ${ticks} ticks: ${describeFailureWithFrames(err)}`);
+          console.error(`${tag} drain kick failed for ${agentName} after ${ticks} ticks: ${describeFailureWithFrames(err)}`);
         }
       } finally {
         this.overBudgetDrainInFlight.delete(agentName);
