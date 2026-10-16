@@ -35,43 +35,45 @@
   silences the turn's later prose, while the private `think` hold and an
   explicit round's `skip_reply` don't apply (#307).
 - A round whose script can change its routing waits for the script, and its
-  prose goes out when the script finishes. A script can when its code names
-  a tool whose call changes the round's routing in the turn's mode: in locus
-  and hybrid mode `skip_reply`, a silencing send, `say` or `whisper`; in
-  explicit mode only `skip_reply`; and in either, `think` under the private
-  same-round policy. Disabled mode holds nothing. A name counts in code
-  wherever it stands as a whole identifier, as a function is called or a
-  `tools[...]` key is written: `say_hello` doesn't name `say`. A name in a
-  comment doesn't count, since Python never runs one, while a name anywhere
-  in a string does, since a string can be a key or code to run. A script can
-  also change its round's routing when the interpreter it runs in has run a
-  script that left such a tool reachable, by naming the tool inside a
-  definition (a function or lambda, a class's methods among them) or other
-  than in a direct call, or by keeping a string that is the tool's whole
-  name, as a key is. That holds until the interpreter is reclaimed or
-  restarted. A direct call outside a definition, a class's own body
-  included, or a string that only mentions a tool, as a printed sentence
-  does, leaves nothing reachable. Without code execution, a `code_execution`
-  call holds nothing. Any other round is routed at its tool-calls event, as
-  before, so narration beside a script isn't held for the script's runtime.
-  What goes unseen is routed as it was before scripts counted, such as a
-  tool name the code doesn't spell out (built at runtime, written with
-  escapes, or in non-ASCII spellings), code loaded from a file or module, an
-  enumeration of the tools, a definition or alias made inside a string the
-  script runs or an f-string's field, a call that outlives its script (one
-  it awaits only in a later script, schedules as a task, or leaves in a
-  generator expression), and code a later script runs from a string an
-  earlier one kept. The turn's locus and an explicit round's `>>` targets
-  are taken at the round's tool-calls event, when the model has finished
-  writing it, not when its scripts return; hybrid's `>>>` targets apply as
-  its delivery runs, as for any queued hybrid delivery. A background
-  script's call returns as soon as the script has started, and its later
-  calls aren't the round's. A script's result settles only the round that
-  dispatched it, even when a newer round reuses its call id. A round whose
-  turn ends or stops waiting on it, or that a newer round of the same agent
-  replaces, before its scripts return, as when the turn is stopped, is
-  withheld: a log line names it, and the turn's delivery receipt counts it
-  as suppressed.
+  prose goes out when the script finishes. A script can change it when its
+  code names a tool whose call changes the round's routing in the turn's
+  mode: in locus and hybrid mode `skip_reply`, a silencing send, `say` or
+  `whisper`; in explicit mode only `skip_reply`; and in either, `think`
+  under the private same-round policy. Disabled mode holds nothing. A name
+  counts in code wherever it stands as a whole word of ASCII letters, digits
+  and underscores, or after `__` as in `mcpl__world__say`, as a function is
+  called or a `tools[...]` key is written: `say_hello` doesn't name `say`. A
+  name in a comment doesn't count, since Python never runs one, while a name
+  anywhere in a string does, since a string can be a key or code to run. A
+  script can also change its round's routing when the interpreter it runs in
+  has run a script that left such a tool reachable, by naming the tool
+  inside a definition (a function or lambda, a class's methods among them)
+  or other than in a direct call, or by keeping a string that is the tool's
+  whole name, optionally namespaced, as a key kept for later is. That holds
+  until the interpreter is reclaimed or restarted. A direct call outside a
+  definition, a class's own body included, or a string that only mentions a
+  tool, as a printed sentence does, leaves nothing reachable. Without code
+  execution, a `code_execution` call holds nothing. Any other round is
+  routed at its tool-calls event, as before, so narration beside a script
+  isn't held for the script's runtime. What goes unseen is routed as it was
+  before scripts counted, such as a tool name the code doesn't spell out
+  (built at runtime, written with escapes, or in non-ASCII spellings), code
+  loaded from a file or module, an enumeration of the tools, a call written
+  in a string's text (code run with `exec` or `eval`, or an f-string's
+  field), inside a definition too, a definition or alias made inside such a
+  string, a call that outlives its script (one it awaits only in a later
+  script, schedules as a task, or leaves in a generator expression), and
+  code a later script runs from a string an earlier one kept. The turn's
+  locus and an explicit round's `>>` targets are taken at the round's
+  tool-calls event, when the model has finished writing it, not when its
+  scripts return; hybrid's `>>>` targets apply as its delivery runs, as for
+  any queued hybrid delivery. A background script's call returns as soon as
+  the script has started, and its later calls aren't the round's. A script's
+  result settles only the round that dispatched it, even when a newer round
+  reuses its call id. A round whose turn ends or stops waiting on it, or
+  that a newer round of the same agent replaces, before its scripts return,
+  as when the turn is stopped, is withheld: a log line names it, and the
+  turn's delivery receipt counts it as suppressed.
 - Every stream now sends `channels/outgoing/complete` for each channel it
   streamed to, on every exit path, as MCPL Spec 14.3 asks: once its
   deliveries have run, or, when the host stops, at once, with what it has

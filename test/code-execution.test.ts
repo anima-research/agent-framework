@@ -1192,21 +1192,30 @@ describe("a round that runs code_execution is routed once its scripts return (re
         scriptCall({ code: 'await test__slow({})' }, 'ce1'),
         scriptCall({ code: 'post = test__send_message' }, 'ce2'),
       ] as ContentBlock[], 'tool_use'),
+      // The control: the same script, run alone, marks.
+      createMockResponse([
+        { type: 'text', text: 'now alone' },
+        scriptCall({ code: 'post = test__send_message' }, 'ce3'),
+      ] as ContentBlock[], 'tool_use'),
       createMockResponse([{ type: 'text', text: 'done' }] as ContentBlock[]),
     ]);
-    // Let the first script go once the second's refusal has come back.
+    // Let the first script go once the second's refusal has come back, and
+    // read the mark once the first has finished, before the control runs.
     const results: string[] = [];
+    let markAfterRefusal: string[] | undefined = ['unread'];
     h.framework.onTrace((event) => {
       if ((event.type === 'tool:completed' || event.type === 'tool:failed') && event.tool === 'code_execution') {
         results.push(event.callId);
         if (event.callId === 'ce2') h.module.releaseSlow();
+        if (event.callId === 'ce1') markAfterRefusal = markOf(h.framework);
       }
     });
     const bound = setTimeout(() => h.module.releaseSlow(), 15000);
     try {
       await h.run();
-      assert.deepStrictEqual(results, ['ce2', 'ce1'], "the second script was refused while the first ran");
-      assert.equal(markOf(h.framework), undefined, 'the refused alias never ran, so it marks nothing');
+      assert.deepStrictEqual(results, ['ce2', 'ce1', 'ce3'], "the second script was refused while the first ran");
+      assert.equal(markAfterRefusal, undefined, 'the refused alias never ran, so it marked nothing');
+      assert.deepStrictEqual(markOf(h.framework), ['send_message'], 'the same script, run alone, marks');
     } finally {
       clearTimeout(bound);
       await h.done();

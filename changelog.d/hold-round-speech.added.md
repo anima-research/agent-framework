@@ -11,6 +11,7 @@
   `mcpl:speech-routed` also reports speech publishes, with no stream id,
   index or end: among them the `sleep` tool's announcement, and a
   subconscious's `speak_in_channel` as it is sent, before its outcome is
-  known. A relay that voices the agent's prose takes `inference:published`
-  alone, not both, and takes each message's id from it to edit what it
-  voiced.
+  known. A relay that voices the agent's prose takes the
+  `inference:published` stream, with its `inference:published_complete`, and
+  not `mcpl:speech-routed` as well, and takes each message's id from
+  `inference:published` to edit what it voiced.

@@ -18,27 +18,29 @@
  * direct call (an alias, a reference), names it inside a definition, whose
  * body runs later, when it's called (a def's header and indented block, a
  * class's methods among them, or a lambda), or keeps a string that is the
- * tool's whole name, as a key is, without calling it at once, as
- * `tools["world--say"](…)` does. A direct call anywhere else finishes inside
- * its own script, a class's own body included, since it runs as the class
- * statement does; and a string that only mentions a tool, as a printed
- * sentence does, leaves nothing reachable.
+ * tool's whole name, optionally namespaced, as a key kept for later is. A
+ * key called at once, as in `tools["world--say"](…)`, is a direct call. A
+ * direct call outside a definition leaves nothing reachable, a class's own
+ * body included, since it runs as the class statement does, and so does a
+ * string that only mentions a tool, as a printed sentence does.
  *
  * Some reaches go unseen, such as a tool name the code doesn't spell out
  * (built at runtime, written with escapes, or in non-ASCII spellings), code
- * loaded from a file or module, an enumeration of the tools, a definition or
- * alias made inside a string the script runs or inside an f-string's field,
- * a call that outlives its script (one it awaits only in a later script,
- * schedules as a task, or leaves in a generator expression), and code a
- * later script runs from a string an earlier one kept.
+ * loaded from a file or module, an enumeration of the tools, a call written
+ * in a string's text (code a script runs with exec or eval, or an f-string's
+ * field), inside a definition too, a definition or alias made inside such a
+ * string, a call that outlives its script (one it awaits only in a later
+ * script, schedules as a task, or leaves in a generator expression), and
+ * code a later script runs from a string an earlier one kept.
  *
  * @param tools plain tool names, of identifier characters
  */
 export function scriptToolNames(script: string, tools: readonly string[]): { names: Set<string>; reachable: Set<string> } {
+  if (tools.length === 0) return { names: new Set(), reachable: new Set() };
   const named = new RegExp(`(?:(?<![A-Za-z0-9_])|(?<=__))(${tools.join('|')})(?![A-Za-z0-9_])`, 'g');
-  const key = new RegExp(`^(?:.*(?:--|__))?(${tools.join('|')})$`);
+  const key = new RegExp(`^(?:[A-Za-z0-9_-]*(?:--|__))?(${tools.join('|')})$`);
   const { code, strings } = readScript(script);
-  const inDefinition = definitions(code, strings);
+  const inDefinition = definitions(script, code, strings);
   const names = new Set<string>();
   const reachable = new Set<string>();
   for (const match of code.matchAll(named)) {
@@ -68,20 +70,28 @@ const ESCAPE = /\\(?:x[0-9a-fA-F]{2}|u[0-9a-fA-F]{4}|U[0-9a-fA-F]{8}|N\{[^}]*\}|
 /**
  * Whether an offset of a script's code falls inside a definition, whose body
  * runs later, when it's called: a def's header and the indented block after
- * it, or a lambda from its keyword to the end of its line. A line inside
- * brackets, after a backslash, or inside a string literal that an earlier
- * line opened continues the line before it, whatever its indentation; and a
- * line of only whitespace, a carriage return included, doesn't end a block.
+ * it, or a lambda from its keyword to the end of its logical line. A line's
+ * indent is read from the script itself, so a line that opens with a string
+ * stands where it's written. A line inside brackets, after a backslash, or
+ * inside a string literal that an earlier line opened continues the line
+ * before it, whatever its indentation; and a line holding only whitespace (a
+ * carriage return included) or a comment doesn't end a block.
  */
-function definitions(code: string, strings: readonly { start: number; end: number }[]): (offset: number) => boolean {
+function definitions(
+  script: string,
+  code: string,
+  strings: readonly { start: number; end: number }[],
+): (offset: number) => boolean {
   const lines: { start: number; text: string; indent: number; blank: boolean; continued: boolean }[] = [];
   let depth = 0;
   let continued = false;
   let start = 0;
   for (const text of code.split('\n')) {
-    const indent = /^[ \t]*/.exec(text)![0].length;
+    const written = script.slice(start, start + text.length);
+    const indent = /^[ \t]*/.exec(written)![0].length;
+    const blank = /^\s*(?:#[^\n]*)?$/.test(written);
     const inString = strings.some((s) => s.start < start && start < s.end);
-    lines.push({ start, text, indent, blank: text.trim() === '', continued: continued || depth > 0 || inString });
+    lines.push({ start, text, indent, blank, continued: continued || depth > 0 || inString });
     for (const c of text) {
       if (c === '(' || c === '[' || c === '{') depth++;
       else if ((c === ')' || c === ']' || c === '}') && depth > 0) depth--;

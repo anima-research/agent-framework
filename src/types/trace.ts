@@ -184,8 +184,9 @@ export type TraceEvent =
        * id, index or end: routeSpeech's once delivered, the `sleep` tool's
        * announcement among them, and a subconscious's `speak_in_channel` as
        * it is sent, before its outcome is known. A relay that voices the
-       * agent's prose takes this trace alone, not both, and takes each
-       * message's id from its `messageId` to edit what it voiced.
+       * agent's prose takes this trace, with `inference:published_complete`,
+       * and not `mcpl:speech-routed` as well, and takes each message's id
+       * from its `messageId` to edit what it voiced.
        */
       type: 'inference:published';
       agentName: string;
