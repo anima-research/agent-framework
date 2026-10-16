@@ -3404,11 +3404,12 @@ export class AgentFramework {
   /**
    * Context-manager's verdict on a held turn's next compile, at the budget it
    * plans at (Agent.nextCompileBudget): its preview's, which reports an
-   * over-budget plan as not fitting. A dry compile can't give that verdict,
-   * since it doesn't throw an over-budget plan at the plan check
-   * (SelectOptions.dryRun in context-manager). Undefined for a strategy with
-   * no preview, and for one whose preview needs adaptive resolution: the
-   * dry compile decides there (budgetHoldDryRun).
+   * over-budget plan as not fitting and rethrows any other refusal, such as a
+   * context refusal (UncoveredDropError), a refusal here too. A dry compile
+   * can't give that verdict, since it doesn't throw an over-budget plan at
+   * the plan check (SelectOptions.dryRun in context-manager). Undefined for a
+   * strategy with no preview, and for one whose preview needs adaptive
+   * resolution: the dry compile decides there (budgetHoldDryRun).
    */
   private budgetHoldPreview(agent: Agent): 'fit' | 'refused' | 'check_failed' | undefined {
     const cm = agent.getContextManager() as unknown as {
@@ -3420,7 +3421,8 @@ export class AgentFramework {
       if (!preview) return undefined;
       return preview.fits === true ? 'fit' : 'refused';
     } catch (error) {
-      return error instanceof Error && error.message.includes('requires adaptiveResolution') ? undefined : 'check_failed';
+      if (error instanceof Error && error.message.includes('requires adaptiveResolution')) return undefined;
+      return this.budgetHoldThrownVerdict(error);
     }
   }
 
@@ -3431,9 +3433,16 @@ export class AgentFramework {
       await agent.compileWithInjections(undefined, undefined, { dryRun: true });
       return 'fit';
     } catch (error) {
-      const { errorType } = this.classifyInferenceError(error instanceof Error ? error : new Error(String(error)));
-      return errorType === 'over_budget' || errorType === 'context_refusal' ? 'refused' : 'check_failed';
+      return this.budgetHoldThrownVerdict(error);
     }
+  }
+
+  /** What a verdict's throw says, from the preview or a dry compile alike: a
+   *  refusal for budget or for coverage refuses, as the turn's own compile
+   *  would; anything else fails the check, and the turn's compile meets it. */
+  private budgetHoldThrownVerdict(error: unknown): 'refused' | 'check_failed' {
+    const { errorType } = this.classifyInferenceError(error instanceof Error ? error : new Error(String(error)));
+    return errorType === 'over_budget' || errorType === 'context_refusal' ? 'refused' : 'check_failed';
   }
 
   /**
