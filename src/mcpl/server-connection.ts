@@ -532,6 +532,15 @@ export class McplServerConnection extends EventEmitter {
     hostCapabilities: McplHostCapabilities,
   ): Promise<{ transport: McplTransport; capabilities: McplCapabilities | null; droppedCapabilities: ReadonlySet<string>; mcpToolsAdvertised: boolean }> {
     const transport = await openTransport(config);
+    // Once the handshake stops listening for 'error', this logs what the
+    // transport reports, until the handshake hands the transport on, or for
+    // good if the handshake fails. EventEmitter throws an 'error' that has no
+    // listener, and from an I/O callback nothing catches it. A malformed
+    // WebSocket frame that arrives with the initialize response, or while a
+    // failed handshake's close() runs, is such an error.
+    const logAfterSettled = (err: Error) => {
+      console.error(`[mcpl] ${config.id}: transport error after the handshake settled: ${err.message}`);
+    };
 
     try {
       const initId = 0; // use id=0 for the handshake
@@ -553,6 +562,7 @@ export class McplServerConnection extends EventEmitter {
           transport.off('line', onLine);
           transport.off('close', onClose);
           transport.off('error', onError);
+          transport.on('error', logAfterSettled);
           clearTimeout(timer);
         };
         const onLine = (line: string) => {
@@ -614,6 +624,10 @@ export class McplServerConnection extends EventEmitter {
         console.error(`MCPL server "${config.id}" capabilities masked by host config: ${dropped.map(logValue).join(', ')}`);
       }
 
+      // The caller wires the transport, or keeps it for close() with a
+      // listener of its own, in the continuation of this return, before any
+      // I/O callback can emit.
+      transport.off('error', logAfterSettled);
       return { transport, capabilities: scoped, droppedCapabilities: new Set(dropped), mcpToolsAdvertised };
     } catch (err) {
       // Never leak the child / socket if the handshake fails.
@@ -990,6 +1004,13 @@ export class McplServerConnection extends EventEmitter {
         // The prior transport was disconnected before this retry began. Keep
         // the fresh, unadmitted transport owned by close(), including on a
         // failed transport cleanup, instead of reviving a stopped connection.
+        // It isn't wired, and the handshake has removed its own listeners, so
+        // an error it reports from here on, such as a malformed frame from a
+        // WebSocket server while close() closes it, is logged here rather than
+        // thrown where nothing catches it.
+        transport.on('error', (err: Error) => {
+          console.error(`[mcpl] ${this.id}: a transport kept for close() reported an error: ${err.message}`);
+        });
         this.transport = transport;
         return;
       }

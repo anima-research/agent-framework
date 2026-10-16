@@ -3229,6 +3229,13 @@ test('a framework compile from before stop cannot drive after restart', async ()
     return result;
   };
   let starting: Promise<void> | undefined;
+  // The dropped turn's inference:* events, as a module's trace listener sees them.
+  const turnEvents: Array<{ type: string; reason?: string }> = [];
+  const unsubscribe = framework.onTrace((event) => {
+    if (event.type.startsWith('inference:') && (event as { agentName?: string }).agentName === 'assistant') {
+      turnEvents.push({ type: event.type, ...('reason' in event ? { reason: String(event.reason) } : {}) });
+    }
+  });
   try {
     const lines: string[] = [];
     const error = console.error;
@@ -3243,11 +3250,111 @@ test('a framework compile from before stop cannot drive after restart', async ()
     } finally { console.error = error; }
     assert.equal(driven, 0);
     assert.ok(lines.some((line) => /stopped and started again/.test(line) && /dropped before it sends anything/.test(line)), lines.join('\n'));
+    // The turn emitted inference:started before its compile, so it gets one
+    // terminal event: a listener's bracket (a typing loop) closes.
+    assert.deepEqual(turnEvents.map((event) => event.type), ['inference:started', 'inference:aborted']);
+    assert.match(turnEvents[1]?.reason ?? '', /stopped and started again.*dropped before it sends anything/);
+    unsubscribe();
     // A turn begun after the restart is admitted and drives its stream.
     await (framework as unknown as { startAgentStream(a: typeof agent): Promise<void> }).startAgentStream(agent);
     await until(() => driven === 1, 'the turn begun after the restart drives');
   } finally { compile.open(); await starting; await framework.stop(); store.close(); }
 });
+
+// A turn dropped before it sends anything, at either check: before its
+// compile (it waits in a module's gatherContext) or after it (it waits in its
+// compile). Each way it can lose its place: the framework stops, the agent is
+// removed, the agent object is replaced under its name, or the replacement's
+// own turn already holds the name's turn token.
+for (const phase of ['before', 'after'] as const) {
+  for (const how of ['stopping', 'removed', 'disposed', 'replaced', 'superseded'] as const) {
+    const title = { stopping: 'the framework stopping', removed: 'its agent removed',
+      disposed: 'its run disposed with its record', replaced: 'its agent replaced',
+      superseded: "a newer turn of its agent's name running" }[how];
+    test(`a turn dropped ${phase} its compile, with ${title}, ${how === 'superseded' ? "leaves the newer turn's bracket alone" : 'ends with inference:aborted'}`, async () => {
+      const dir = mkdtempSync(join(tmpdir(), `guard-drop-${phase}-compile-`)); dirs.push(dir);
+      const store = JsStore.openOrCreate({ path: join(dir, 'store') });
+      const membrane = new ScriptMembrane([[answer()]]);
+      const framework = await AgentFramework.create({ store, membrane: membrane.asMembrane(),
+        agents: [{ name: 'assistant', model: 'test', systemPrompt: 'system' }],
+        modules: [], syncIntervalMs: 0, maintenanceIntervalMs: 0 });
+      const agent = framework.getAgent('assistant')!;
+      const internal = framework as unknown as {
+        moduleRegistry: { gatherContext: (n: string) => Promise<unknown[]> };
+        agents: Map<string, unknown>;
+        activeTurnTokens: Map<string, number>;
+        lastInferenceAt: Map<string, { startedAt?: number; endedAt?: number }>;
+      };
+      const held = gate();
+      const entered = gate();
+      if (phase === 'before') {
+        internal.moduleRegistry.gatherContext = async () => { entered.open(); await held.opened; return []; };
+      } else {
+        const build = agent.buildActivationRequest.bind(agent);
+        agent.buildActivationRequest = async (...args) => { entered.open(); await held.opened; return build(...args); };
+      }
+      const turnEvents: Array<{ type: string; reason?: string; durationMs?: number }> = [];
+      framework.onTrace((event) => {
+        if (event.type.startsWith('inference:') && (event as { agentName?: string }).agentName === 'assistant') {
+          turnEvents.push({ type: event.type,
+            ...('reason' in event ? { reason: String(event.reason) } : {}),
+            ...('durationMs' in event ? { durationMs: Number(event.durationMs) } : {}) });
+        }
+      });
+      const lines: string[] = [];
+      const error = console.error;
+      console.error = (...args: unknown[]) => { lines.push(args.map(String).join(' ')); };
+      const heldMs = 25;
+      let starting: Promise<unknown> | undefined;
+      try {
+        starting = (framework as unknown as { startAgentStream(a: typeof agent): Promise<unknown> }).startAgentStream(agent);
+        await entered.opened;
+        if (how === 'stopping') await framework.stop();
+        else if (how === 'removed') internal.agents.delete('assistant');
+        else if (how === 'disposed') {
+          // As runEphemeralToCompletion's disposal does: the agent, its record and its token go.
+          internal.agents.delete('assistant');
+          internal.lastInferenceAt.delete('assistant');
+          internal.activeTurnTokens.delete('assistant');
+        } else {
+          internal.agents.set('assistant', Object.create(agent));
+          if (how === 'superseded') internal.activeTurnTokens.set('assistant', -1);
+        }
+        await new Promise((resolve) => setTimeout(resolve, heldMs));
+        held.open();
+        await starting;
+      } finally { console.error = error; held.open(); await starting; }
+      try {
+        const why = how === 'stopping' ? 'the framework was stopping' : 'the agent was replaced or removed';
+        const reason = `a turn ${phase === 'before' ? 'assembled' : 'compiled'} while ${why} is dropped before it sends anything`;
+        assert.ok(lines.some((line) => line.includes(reason)), lines.join('\n'));
+        const last = internal.lastInferenceAt.get('assistant');
+        if (how === 'superseded') {
+          // The terminal event and lastInference carry only the name, so they
+          // would end the newer turn: the dropped frame emits and records nothing.
+          assert.deepEqual(turnEvents.map((event) => event.type), ['inference:started']);
+          assert.equal(last?.endedAt, undefined);
+        } else {
+          assert.deepEqual(turnEvents.map((event) => event.type), ['inference:started', 'inference:aborted']);
+          assert.equal(turnEvents[1]?.reason, reason);
+          const durationMs = turnEvents[1]?.durationMs ?? NaN;
+          assert.ok(Number.isFinite(durationMs) && durationMs >= heldMs - 5 && durationMs < 60_000, `durationMs ${durationMs}`);
+          if (how === 'disposed') {
+            // The terminal event still closes a listener's bracket, but the
+            // disposed name gets no record back.
+            assert.equal(internal.lastInferenceAt.has('assistant'), false, JSON.stringify(last));
+          } else {
+            assert.ok(last?.endedAt !== undefined && last.endedAt >= (last.startedAt ?? Infinity), JSON.stringify(last));
+          }
+        }
+      } finally {
+        if (how === 'superseded') internal.activeTurnTokens.delete('assistant');
+        if (how !== 'stopping') internal.agents.set('assistant', agent);
+        await framework.stop(); store.close();
+      }
+    });
+  }
+}
 
 // Drain async storage/annotation continuations without advancing deadline time.
 async function flushAsync() {
