@@ -14994,7 +14994,7 @@ export class AgentFramework {
         const wants = inputObj.wake_in_seconds !== undefined && Number.isFinite(secs) && secs > 0;
         if (wants && this.eventGate) {
           const { inMs, durable } = this.eventGate.armSelfWake(agentName, secs, 'skip_reply');
-          inputObj._wake_durable = durable;
+          enrichedCall.input = { ...inputObj, _wake_durable: durable };
           console.error(`[self-wake] agent=${agentName} armed in ${Math.round(inMs / 1000)}s (skip_reply)`);
         } else if (inputObj.wake_in_seconds !== undefined && !this.eventGate) {
           delete inputObj.wake_in_seconds;
