@@ -93,6 +93,8 @@ interface PendingEvent {
    *  whose `channelId` is the adapter's raw id (a bare Discord snowflake for a
    *  DM) — unroutable. Absent when the host could not resolve one. */
   routeChannelId?: string;
+  /** Operator-surface routing class retained across debounce. */
+  routingClass?: 'private' | 'channel';
 }
 
 /**
@@ -120,6 +122,8 @@ export interface WakeProvenance {
    *  (2026-09-30: a DM reply published into a guild channel). Ambient-only
    *  batches still set nothing and keep the legacy fallback. */
   routeChannelId?: string;
+  /** Operator-surface routing class retained across debounce. */
+  routingClass?: 'private' | 'channel';
   /** Timestamp (ms) of the chosen event, so a consumer coalescing several
    *  requests can order by event recency, not by flush order. */
   at?: number;
@@ -216,17 +220,20 @@ export function wakeProvenance(events: PendingEvent[]): WakeProvenance | undefin
     if (e.addressed && (!newestAddressed || e.timestamp >= newestAddressed.timestamp)) newestAddressed = e;
   }
   const pick = newestAddressed ?? newest;
-  if (!pick) return undefined;
+  const privateSurface = events.some((event) => event.routingClass === 'private');
+  if (!pick && !privateSurface) return undefined;
   // push-event channel ids are the adapter's raw ids (a Discord snowflake):
   // not a composite channel id, so not reported as one
-  const channelId = pick.channelId && pick.eventType !== 'mcpl:push-event' ? pick.channelId : undefined;
-  const ns = pick.serverId || (pick.channelId ? pick.channelId.split(':')[0] : '') || 'channel';
+  const chosen = pick ?? events[events.length - 1]!;
+  const channelId = chosen.channelId && chosen.eventType !== 'mcpl:push-event' ? chosen.channelId : undefined;
+  const ns = chosen.serverId || (chosen.channelId ? chosen.channelId.split(':')[0] : '') || 'channel';
   return {
     ...(channelId ? { channelId } : {}),
-    ...(pick.authorId ? { counterparty: `${ns}:user:${pick.authorId}` } : {}),
-    ...(pick.addressed ? { addressed: true } : {}),
-    ...(pick.addressed && pick.routeChannelId ? { routeChannelId: pick.routeChannelId } : {}),
-    at: pick.timestamp,
+    ...(chosen.authorId ? { counterparty: `${ns}:user:${chosen.authorId}` } : {}),
+    ...(chosen.addressed ? { addressed: true } : {}),
+    ...(chosen.addressed && chosen.routeChannelId ? { routeChannelId: chosen.routeChannelId } : {}),
+    ...(privateSurface ? { routingClass: 'private' as const } : chosen.routingClass ? { routingClass: chosen.routingClass } : {}),
+    at: chosen.timestamp,
   };
 }
 
@@ -1498,6 +1505,7 @@ export class EventGate {
       serverId: info.serverId || undefined,
       addressed: Array.isArray(info.tags) && info.tags.includes('chat:addressed'),
       routeChannelId: this.routeChannelFor(info),
+      routingClass: info.routingClass,
     };
 
     const existing = this.debounceTimers.get(policy.name);

@@ -2347,6 +2347,10 @@ export class AgentFramework {
             ...(provenance?.channelId ? { wakeChannelId: provenance.channelId } : {}),
             ...(provenance?.counterparty ? { counterparty: provenance.counterparty } : {}),
             ...(provenance?.at ? { wakeAt: provenance.at } : {}),
+            ...(provenance?.routingClass === 'private' ? { nonChannelOrigin: true } : {}),
+            ...(provenance?.routingClass === 'channel' && provenance.channelId
+              ? { channelId: provenance.channelId }
+              : {}),
             // A batch that contains an ADDRESSED message (mention / reply /
             // DM) routes like the direct path does: the reply goes to that
             // message's channel. Without it the turn froze on the
@@ -8957,11 +8961,15 @@ export class AgentFramework {
 
       // Gate non-MCPL events (MCPL events are already gated in PushHandler/ChannelRegistry)
       if (this.eventGate && event.type !== 'mcpl:push-event' && event.type !== 'mcpl:channel-incoming') {
+        const surfaceChannel = surfaceChannelId(event);
         const decision = this.eventGate.evaluate({
           ...extractGateFields(event),
           eventType: event.type,
           serverId: source,
-          channelId: surfaceChannelId(event) ?? '',
+          channelId: surfaceChannel ?? '',
+          ...((event.type === 'external-message' || event.type === 'api:message')
+            ? { routingClass: surfaceChannel ? 'channel' as const : 'private' as const }
+            : {}),
         });
         if (!decision.trigger) return;
       }
