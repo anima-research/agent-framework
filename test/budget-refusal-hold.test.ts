@@ -1608,12 +1608,15 @@ describe('the release check takes context-manager\'s verdict on the real strateg
       t.wake();
       assert.ok(await pollUntil(() => t.of('inference:held').length === 1, 5_000));
       assert.equal(t.of('inference:held')[0]!.errorType, 'context_refusal');
-      // Four changes the hold looks again for, a message each.
+      // Four changes the hold looks again for, a message each, and a look for
+      // each: the preview rethrows the refusal at every one.
+      const looksBefore = t.previews();
       for (let i = 0; i < 4; i++) {
         t.addMessage(`later ${i}`);
         await new Promise((r) => setTimeout(r, 300));
       }
-      assert.equal(t.of('inference:held').length, 1, 'held once while the refusal stands');
+      assert.ok(t.previews() >= looksBefore + 4, `${t.previews() - looksBefore} looks while four messages arrived`);
+      assert.equal(t.of('inference:held').length, 1, 'held once while the refusal stands, through those looks');
       assert.deepEqual(t.of('inference:hold_ended'), []);
       assert.equal(t.of('ops:alert').filter((e) => e.kind === 'context-refusal').length, 1);
       assert.equal(t.membrane.calls.length, 0);
