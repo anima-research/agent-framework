@@ -7,18 +7,24 @@
   and finishes after it returns, and the store stays reserved until it's
   done: a turn asked for meanwhile starts after, and a
   `rollbackToMessage()`, `suppressMessages()` or `switchBranch()` made
-  meanwhile is refused as busy. A context-settings preview or a
-  runtime-settings change made meanwhile is refused by context-manager
-  until that agent's manager is current, as during a surgery's switch. An
-  undo or redo made meanwhile moves the
+  meanwhile is refused as busy. A runtime-settings change, reset or
+  cancelled transition made meanwhile, or during a surgery, is refused with
+  `OperatorActionError` (`agent-busy`) before any of it is applied. A context-settings preview made meanwhile is
+  refused by context-manager until that agent's manager is current, as
+  during a surgery's switch. An undo or redo made meanwhile moves the
   store again under the same reservation, and the managers are
   re-initialized for the branch the last one leaves. The re-initialization
   waits first for maintenance already running, a pass or an over-budget
   drain kick; the move itself is synchronous, so a maintenance tick running
-  at that moment still runs across it, as before. A conversation agent
-  created meanwhile waits for it, since its context is seeded from the
-  template's. An undo or redo that fails leaves the store where it was, with
-  the turn still there to undo or redo.
+  at that moment still runs across it, as before. Whatever that tick meets
+  then, its manager's refusal or a provider's failure, belongs to work for
+  the branch the store left, so it isn't reported as a maintenance failure.
+  Creating a conversation agent waits while a move or a surgery holds the
+  store, since its context is seeded from the template's, and a move made
+  while one is being created is refused as busy. An undo or redo that fails leaves the store where it was, with
+  the turn still there to undo or redo, unless its branch has been deleted:
+  a redo whose branch is gone drops that step, says so, and leaves the
+  steps beneath it to redo.
 - **A second `switchBranch()` made while one holds the store is refused**
   with `OperatorActionError` (`agent-busy`), as the other operator calls
   are.
