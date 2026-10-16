@@ -390,7 +390,7 @@ const CHANNEL_TOOL_DEFINITIONS: ToolDefinition[] = [
   },
   {
     name: 'channel_publish',
-    description: 'Publish a message to a channel. If channelId is omitted, publishes to the most recent incoming channel.',
+    description: 'Publish a message to a channel. If channelId is omitted, publishes to the most recent incoming channel (not in a turn from a private surface).',
     inputSchema: {
       type: 'object' as const,
       properties: {
@@ -3093,8 +3093,8 @@ export class ChannelRegistry {
     const channelId = locusChannelId;
     if (!channelId) {
       // The turn froze with no locus (no home, no triggering channel, no
-      // global inbound ever seen) — the agent was told its prose stays in
-      // the archive; honor that.
+      // global inbound ever seen) — the agent was told its prose stays on
+      // the surface where it was addressed; honor that.
       return fail(null, 'turn has no locus (no home/trigger channel; nothing to deliver into)');
     }
 

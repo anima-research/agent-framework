@@ -650,7 +650,7 @@ function isTurnContinuation(reason: string): boolean {
 function surfaceChannelId(event: ProcessEvent): string | undefined {
   if (event.type !== 'external-message' && event.type !== 'api:message') return undefined;
   const value = (event.metadata as Record<string, unknown> | undefined)?.channelId;
-  return typeof value === 'string' && value.trim().length > 0 ? value : undefined;
+  return typeof value === 'string' && value.trim().length > 0 ? value.trim() : undefined;
 }
 
 export function isNonChannelSurfaceEvent(event: ProcessEvent): boolean {
@@ -10657,8 +10657,8 @@ export class AgentFramework {
     let text: string;
     if (locus === null) {
       text =
-        '[routing] Your plain speech currently has no channel — it stays in ' +
-        'your archive. Use an explicit send tool to reach a channel.';
+        '[routing] Your plain speech currently goes to no channel: it stays on ' +
+        'the surface you were addressed from. Use an explicit send tool to reach a channel.';
     } else {
       const label = this.channelRegistry?.getDescriptor(locus)?.label;
       const shown =
@@ -12958,8 +12958,8 @@ export class AgentFramework {
             // trailing paths awaited the chain when there was final text; a
             // turn whose last response is empty awaits it here, so the
             // receipt and the continuation see its last rounds' deliveries.
-            // Locus and hybrid mode; explicit-mode envelopes acknowledge
-            // themselves through the prose gateway.
+            // Every mode reaches this call; modes with no recorded delivery
+            // or suppression produce no receipt.
             await turnSpeechChain;
             if (!trigger?.suppressProse) {
               this.appendProseDeliveryReceipt(agent, streamRouting);
