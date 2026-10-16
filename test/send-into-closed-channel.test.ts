@@ -13,6 +13,9 @@
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 
 import { AgentFramework } from '../src/framework.js';
 import { ChannelRegistry } from '../src/mcpl/channel-registry.js';
@@ -25,8 +28,8 @@ const origin = { kind: 'agent' as const, agentName: 'sol' };
 
 /** The note a send's answer carries when it lands in the closed #upkeep. */
 const UPKEEP_NOTE = `[closed channel] #upkeep (${channelId}) stays closed: speaking into a closed channel doesn't open it. ` +
-  'Messages there that address you, such as an @-mention, still reach you; to hear the rest of its traffic, ' +
-  `call channel_open with channelId "${channelId}" and serverId "discord". ` +
+  'Messages there that address you, such as an @-mention, still reach you; ' +
+  `channel_open with channelId "${channelId}" and serverId "discord" opens it. ` +
   'To stop this note, set closed_channel_note to false with agent_settings.';
 
 /** A real ChannelRegistry with one registered channel, and a framework with
@@ -39,11 +42,16 @@ async function harness() {
   let hold: Promise<void> | null = null;
   // The raw channel id the send's answer names.
   let sentTo = '444555';
+  // While set, the server refuses the send, as discord-mcpl does without Send Messages.
+  let refuseSends = false;
   const server = {
     id: 'discord',
     grant: new CapabilityGrant(new Set(ALL_CAPABILITY_PATHS), []),
     async sendToolsCall() {
       if (hold) await hold;
+      if (refuseSends) {
+        return { content: [{ type: 'text', text: `Missing Access in channel ${sentTo}` }], isError: true };
+      }
       // discord-mcpl's send tools answer with the posted message and the raw channel id.
       return { content: [{ type: 'text', text: JSON.stringify({ messageId: 'm9', channelId: sentTo }) }] };
     },
@@ -81,8 +89,6 @@ async function harness() {
     setStateJson: (_id: string, value: unknown) => { frameworkState = value; },
   };
   framework.agents = new Map([['sol', {}]]);
-  // Channels seen delivering a chat:dm message (a class field the constructor sets).
-  framework.directMessageChannels = new Set<string>();
   const windowMessages: string[] = [];
   framework.addMessage = (_role: string, content: Array<{ text?: string }>) => {
     windowMessages.push(content.map((b) => b.text ?? '').join(''));
@@ -92,16 +98,17 @@ async function harness() {
   /** Dispatch reply_message by the raw id; resolve with its result and the
    *  turn's engaged channels as they stood when the result was queued (the
    *  mid-turn re-pin reads them when that event is processed). */
-  async function reply(tool = 'reply_message'): Promise<{ success: boolean; engagedAtResult: string[]; data: string }> {
-    const out = await new Promise<{ success: boolean; engagedAtResult: string[]; data: string }>((resolve, reject) => {
+  async function reply(tool = 'reply_message'): Promise<{ success: boolean; engagedAtResult: string[]; data: string; error: string }> {
+    const out = await new Promise<{ success: boolean; engagedAtResult: string[]; data: string; error: string }>((resolve, reject) => {
       const timeout = setTimeout(() => reject(new Error('timed out waiting for the tool result')), 1000);
-      framework.pushEvent = (event: { type: string; callId?: string; result: { success: boolean; data?: unknown } }) => {
+      framework.pushEvent = (event: { type: string; callId?: string; result: { success: boolean; data?: unknown; error?: string } }) => {
         if (event.type === 'tool-result' && event.callId === 'call-reply') {
           clearTimeout(timeout);
           resolve({
             success: event.result.success,
             engagedAtResult: [...(framework.turnRouting.get('sol')?.engaged ?? [])],
             data: String(event.result.data ?? ''),
+            error: String(event.result.error ?? ''),
           });
         }
       };
@@ -122,6 +129,7 @@ async function harness() {
     setRefuseOpens: (v: boolean) => { refuseOpens = v; },
     setHold: (p: Promise<void> | null) => { hold = p; },
     setSentTo: (raw: string) => { sentTo = raw; },
+    setRefuseSends: (v: boolean) => { refuseSends = v; },
     state: () => frameworkState as { closedChannelNotes?: Record<string, boolean> } | null,
   };
 }
@@ -149,18 +157,71 @@ test("a send that stays in a closed channel says so, what still reaches the agen
   assert.ok((await reply()).data.endsWith(UPKEEP_NOTE));
 });
 
-test("a note that can't be worked out leaves the send's answer as the server gave it", async () => {
+test("a note that can't be worked out leaves the delivered words as they were, and the operator's log says why", async () => {
   const { registry, framework, reply } = await harness();
   assert.equal((await registry.handleChannelToolCall('channel_open', { channelId }, origin)).success, true);
   assert.equal((await registry.handleChannelToolCall('channel_close', { channelId }, origin)).success, true);
-  // The setting can't be read, as after the store has closed.
-  framework.store = { getStateJson: () => { throw new Error('store closed'); } };
-  const { success, data } = await reply();
-  assert.equal(success, true, 'the send was delivered, and says so');
-  assert.equal(data, JSON.stringify({ messageId: 'm9', channelId: '444555' }));
+  const answer = JSON.stringify({ messageId: 'm9', channelId: '444555' });
+  const logged: string[] = [];
+  const consoleError = console.error;
+  console.error = (...args: unknown[]) => {
+    const line = args.map(String).join(' ');
+    if (line.startsWith('[closed-channel-note]')) logged.push(line);
+  };
+  try {
+    // The setting can't be read, as after the store has closed.
+    const store = framework.store;
+    framework.store = { getStateJson: () => { throw new Error('store closed'); } };
+    let sent = await reply();
+    assert.equal(sent.success, true, 'the send was delivered, and says so');
+    assert.equal(sent.data, answer);
+    assert.deepEqual(logged.splice(0), ['[closed-channel-note] for sol failed: store closed']);
+    framework.store = store;
+
+    // The registry can't say whether the channel is a DM, and then a lookup
+    // throws something that isn't an Error at all.
+    const isDirectMessageChannel = registry.isDirectMessageChannel;
+    registry.isDirectMessageChannel = () => { throw new Error('lookup failed'); };
+    sent = await reply();
+    assert.equal(sent.success, true);
+    assert.equal(sent.data, answer);
+    assert.deepEqual(logged.splice(0), ['[closed-channel-note] for sol failed: lookup failed']);
+    registry.isDirectMessageChannel = () => { throw undefined; };
+    sent = await reply();
+    assert.equal(sent.success, true);
+    assert.equal(sent.data, answer);
+    assert.deepEqual(logged.splice(0), ['[closed-channel-note] for sol failed: undefined']);
+    registry.isDirectMessageChannel = isDirectMessageChannel;
+
+    // Routed speech's delivery line stands without the note.
+    const lines: string[] = [];
+    const agent = {
+      name: 'sol',
+      proseRouting: 'locus',
+      getContextManager: () => ({
+        addMessage: (_role: string, content: Array<{ text: string }>) => { lines.push(content[0]!.text); return 'm'; },
+      }),
+    };
+    framework.store = { getStateJson: () => { throw new Error('store closed'); } };
+    framework.appendProseDeliveryReceipt(agent, { deliveries: [channelId], suppressed: 0 });
+    assert.deepEqual(lines, [`[delivered] plain speech → #upkeep (${channelId})`]);
+    assert.deepEqual(logged.splice(0), ['[closed-channel-note] for sol failed: store closed']);
+  } finally {
+    console.error = consoleError;
+  }
 });
 
-test('a send into an open channel, or into a DM by any sign of one, carries no closed-channel note', async () => {
+test('a send the server refuses carries no closed-channel note', async () => {
+  const { registry, reply, setRefuseSends } = await harness();
+  assert.equal((await registry.handleChannelToolCall('channel_open', { channelId }, origin)).success, true);
+  assert.equal((await registry.handleChannelToolCall('channel_close', { channelId }, origin)).success, true);
+  setRefuseSends(true);
+  const refused = await reply();
+  assert.equal(refused.success, false);
+  assert.equal(refused.error, 'Missing Access in channel 444555', "the server's refusal, and nothing about the channel");
+});
+
+test('a send into an open channel, a DM the registry knows, or by send_dm carries no closed-channel note', async () => {
   {
     const { registry, reply } = await harness();
     assert.equal((await registry.handleChannelToolCall('channel_open', { channelId }, origin)).success, true);
@@ -170,12 +231,6 @@ test('a send into an open channel, or into a DM by any sign of one, carries no c
     // send_dm sends to a DM, whatever the registry knows of it.
     const { reply } = await harness();
     assert.ok(!(await reply('send_dm')).data.includes('[closed channel]'), 'send_dm');
-  }
-  {
-    // A channel that delivered a message tagged chat:dm.
-    const { framework, reply } = await harness();
-    framework.noteDirectMessageTags(channelId, ['chat:addressed', 'chat:dm']);
-    assert.ok(!(await reply()).data.includes('[closed channel]'), 'chat:dm seen');
   }
   {
     // One the registry knows as a DM by its metadata.
@@ -188,6 +243,19 @@ test('a send into an open channel, or into a DM by any sign of one, carries no c
     const { data, engagedAtResult } = await reply();
     assert.deepEqual(engagedAtResult, ['discord:dm:777']);
     assert.ok(!data.includes('[closed channel]'), 'registry DM');
+  }
+  {
+    // One the registry knows as a DM by its metadata alone: neither its id nor
+    // its label has a DM's shape.
+    const { registry, reply, setSentTo } = await harness();
+    await registry.handleChanged('discord', {
+      added: [{ id: 'discord:private-room-42', type: 'discord', label: 'Tess', direction: 'bidirectional',
+        address: { channelId: '42' }, metadata: { channelType: 'dm' } }],
+    } as never);
+    setSentTo('42');
+    const { data, engagedAtResult } = await reply();
+    assert.deepEqual(engagedAtResult, ['discord:private-room-42']);
+    assert.ok(!data.includes('[closed channel]'), 'registry DM by metadata');
   }
 });
 
@@ -212,6 +280,16 @@ test("routed speech that stays in a closed channel says so in the turn's deliver
   // The same words as a send's note, without its tag.
   const note = UPKEEP_NOTE.slice('[closed channel] '.length);
   assert.equal(receipt(channelId), `[delivered] plain speech → #upkeep (${channelId}) · ${note}`);
+  // Two closed channels in one turn: a note for each, and how to stop them once.
+  await registry.handleChanged('discord', {
+    added: [{ id: 'discord:g1:555666', type: 'discord', label: '#standup', direction: 'bidirectional',
+      address: { guildId: 'g1', channelId: '555666' } }],
+  } as never);
+  const stop = 'To stop this note, set closed_channel_note to false with agent_settings.';
+  const upkeepNote = note.slice(0, -(stop.length + 1));
+  const standupNote = upkeepNote.replaceAll('#upkeep', '#standup').replaceAll(channelId, 'discord:g1:555666');
+  assert.equal(receipt(channelId, 'discord:g1:555666'),
+    `[delivered] plain speech → #upkeep (${channelId}) · #standup (discord:g1:555666) · ${upkeepNote} ${standupNote} ${stop}`);
   // A DM says nothing more.
   assert.equal(receipt('discord:dm:777'), '[delivered] plain speech → #Tess (discord:dm:777)');
   // Nor does an open channel, or any channel once the agent has turned the note off.
@@ -294,4 +372,59 @@ test('a reply_message still in flight when the agent closes its channel marks no
   assert.equal(registry.isChannelOpen(channelId), false, 'the channel stays closed');
   registry.notePushDelivered('discord', channelId, 'm2', undefined, ['chat:mention']);
   assert.equal(registry.getDefaultPublishChannel(), null, 'the close, made while the reply was in flight, stands');
+});
+
+test("closed_channel_note is an agent_settings key, kept in the framework's state beside the others across a restart", async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'af-closed-channel-note-'));
+  const config = () => ({
+    storePath: join(dir, 'store'),
+    membrane: {} as never,
+    agents: [{ name: 'sol', model: 'test-model', systemPrompt: 'test' }],
+    modules: [],
+  });
+  /** One agent_settings call, as the agent makes it, and its result. */
+  const settings = (fw: AgentFramework, input: Record<string, unknown>) => {
+    const internals = fw as unknown as {
+      pushEvent(event: unknown): void;
+      dispatchAgentSettingsToolCall(agentName: string, call: unknown): void;
+    };
+    const pushEvent = internals.pushEvent;
+    let result: { success: boolean; data?: Record<string, unknown>; error?: string } | undefined;
+    internals.pushEvent = (event: { type: string; result: typeof result }) => { if (event.type === 'tool-result') result = event.result; };
+    try {
+      internals.dispatchAgentSettingsToolCall('sol', { id: 'call-settings', name: 'agent_settings', input });
+    } finally {
+      internals.pushEvent = pushEvent;
+    }
+    assert.ok(result, 'agent_settings answered');
+    return result;
+  };
+  let framework = await AgentFramework.create(config());
+  try {
+    const tool = framework.getAllTools().find((t) => t.name === 'agent_settings')!;
+    const property = (tool.inputSchema.properties as Record<string, { type: string; description: string }>).closed_channel_note;
+    assert.equal(property.type, 'boolean');
+    assert.match(property.description, /closed channel that isn't a DM/);
+    assert.equal(settings(framework, { action: 'get' }).data?.closed_channel_note, true, 'on by default');
+
+    // Another framework-owned setting, kept in the same state.
+    assert.equal(settings(framework, { action: 'update', tool_result_guard: true }).data?.tool_result_guard, true);
+    const off = settings(framework, { action: 'update', closed_channel_note: false });
+    assert.equal(off.data?.closed_channel_note, false);
+    assert.equal(off.data?.tool_result_guard, true, "turning the note off leaves the other setting's value");
+    assert.match(String(settings(framework, { action: 'update', closed_channel_note: 'no' }).error), /closed_channel_note must be a boolean/);
+
+    await framework.stop();
+    framework = await AgentFramework.create(config());
+    const after = settings(framework, { action: 'get' });
+    assert.equal(after.data?.closed_channel_note, false, 'still off after a restart');
+    assert.equal(after.data?.tool_result_guard, true, 'and the other setting with it');
+
+    const reset = settings(framework, { action: 'reset', settings: ['closed_channel_note'] });
+    assert.equal(reset.data?.closed_channel_note, true);
+    assert.equal(reset.data?.tool_result_guard, true, 'a reset of the note resets nothing else');
+  } finally {
+    await framework.stop();
+    rmSync(dir, { recursive: true, force: true });
+  }
 });

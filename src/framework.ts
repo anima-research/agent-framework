@@ -4033,8 +4033,8 @@ export class AgentFramework {
       properties: {
         closed_channel_note: {
           type: 'boolean',
-          description: 'Add a note when your words go to a closed channel, saying that it stays closed, what still ' +
-            'reaches you from it, and how to open it. On by default. Persists across turns and restarts until changed.',
+          description: "Add a note when your words go to a closed channel that isn't a DM, saying that it stays closed, " +
+            'what still reaches you from it, and how to open it. On by default. Persists across turns and restarts until changed.',
         },
       },
       keys: ['closed_channel_note'],
@@ -4047,31 +4047,29 @@ export class AgentFramework {
     };
   }
 
-  /** Channels that have delivered a message tagged chat:dm in this process:
-   *  every message of a DM reaches the agent, open or not, so the closed-channel
-   *  note is left off there. */
-  private readonly directMessageChannels = new Set<string>();
-
-  private noteDirectMessageTags(channelId: string, tags: string[] | undefined): void {
-    if (tags?.includes('chat:dm')) this.directMessageChannels.add(channelId);
-  }
-
   /** What an agent is told when their words go to a channel that stays closed,
-   *  or undefined where nothing needs saying: an open channel, or a DM, known by
-   *  a chat:dm message it delivered or by what the registry knows of it. */
+   *  or undefined where nothing needs saying: an open channel, or a channel the
+   *  registry knows as a DM (isDirectMessageChannel), every message of which
+   *  reaches the agent, open or not. A chat:dm tag describes one message, not
+   *  its channel: a whisper inside a shared channel carries one too. A DM the
+   *  registry doesn't know gets the note, which is true there as well. The
+   *  words hold on every connector: what a closed channel still delivers
+   *  beyond messages that address the agent is the connector's (slack-mcpl
+   *  delivers ambient traffic by its own subscription), so the note promises
+   *  only those, and what channel_open does. */
   private closedChannelNoteFor(channelId: string, serverId: string | null): string | undefined {
     const registry = this.channelRegistry;
     if (!registry || registry.isChannelOpen(channelId)) return undefined;
-    if (this.directMessageChannels.has(channelId) || registry.isDirectMessageChannel(channelId)) return undefined;
+    if (registry.isDirectMessageChannel(channelId)) return undefined;
     const label = registry.getDescriptor(channelId)?.label;
     const place = label && label !== channelId
       ? `${label.startsWith('#') ? label : `#${label}`} (${channelId})`
       : channelId;
     const open = serverId
-      ? `call channel_open with channelId "${channelId}" and serverId "${serverId}"`
-      : `call channel_open with channelId "${channelId}"`;
+      ? `channel_open with channelId "${channelId}" and serverId "${serverId}"`
+      : `channel_open with channelId "${channelId}"`;
     return `${place} stays closed: speaking into a closed channel doesn't open it. Messages there that address you, ` +
-      `such as an @-mention, still reach you; to hear the rest of its traffic, ${open}.`;
+      `such as an @-mention, still reach you; ${open} opens it.`;
   }
 
   /** How to stop the closed-channel note, said once wherever it appears. */
@@ -4088,7 +4086,7 @@ export class AgentFramework {
       // The setting is read only when there's a note to give.
       return notes.length > 0 && this.closedChannelNoteOn(agentName) ? notes : [];
     } catch (err) {
-      console.error(`[closed-channel-note] for ${agentName} failed: ${(err as Error).message}`);
+      console.error(`[closed-channel-note] for ${agentName} failed: ${err instanceof Error ? err.message : String(err)}`);
       return [];
     }
   }
@@ -9192,7 +9190,6 @@ export class AgentFramework {
 
     // Addressed-while-closed invitation — parity with the push-event path
     // (channels.publish surfaces like portal-mcpl deliver mentions here).
-    this.noteDirectMessageTags(event.channelId, event.tags);
     const incomingContent = [...event.content];
     {
       const invitation = this.buildClosedChannelInvitation({
@@ -10252,7 +10249,6 @@ export class AgentFramework {
 
     const content = [...event.content];
     if (triggerChannel) {
-      this.noteDirectMessageTags(triggerChannel.channelId, event.tags);
       const origin = (event.origin ?? {}) as Record<string, unknown>;
       const invitation = this.buildClosedChannelInvitation({
         serverId: event.serverId,
@@ -10759,6 +10755,30 @@ export class AgentFramework {
   }
 
   /**
+   * Explicit mode's counterpart at logical turn end. It has no `[delivered]`
+   * receipt, since the agent named every destination itself. Its `>>` speech
+   * opened a closed channel until speaking never opened one, so where that
+   * speech stayed in a closed channel that isn't a DM, the turn ends with the
+   * closed-channel note alone, in a send's words. No-op otherwise.
+   */
+  private appendExplicitClosedChannelNote(agent: Agent, routing: TurnRouting): void {
+    const delivered = new Set(routing.deliveries);
+    routing.deliveries = [];
+    const notes = this.closedChannelNotes(agent.name, delivered);
+    if (notes.length === 0) return;
+    try {
+      const mid = agent.getContextManager().addMessage(
+        'user',
+        [{ type: 'text', text: `[closed channel] ${notes.join(' ')} ${AgentFramework.CLOSED_CHANNEL_NOTE_OFF}` }],
+        { system: true, kind: 'delivery-receipt' } as MessageMetadata,
+      );
+      this.emitTrace({ type: 'message:added', messageId: mid, source: 'delivery-receipt' });
+    } catch (err) {
+      console.error('closed-channel note append failed:', err);
+    }
+  }
+
+  /**
    * Announce-on-change locus notice (turn-frozen routing). Appends a durable
    * `[routing]` window message when the turn's effective outbound locus
    * differs from the last one announced — the agent must never have to guess
@@ -11232,6 +11252,8 @@ export class AgentFramework {
 
     try {
       const result = await this.channelRegistry!.routeSpeech(name, body, targetChannel);
+      // For the turn's closed-channel note (appendExplicitClosedChannelNote).
+      this.recordProseDelivery(routing, result);
       if (result?.delivered) {
         this.proseBounceStreaks.delete(name);
         if (usedClipboard) this.proseClipboards.delete(name);
@@ -13063,10 +13085,13 @@ export class AgentFramework {
             // turn whose last response is empty awaits it here, so the
             // receipt and the continuation see its last rounds' deliveries.
             // Locus and hybrid mode; explicit-mode envelopes acknowledge
-            // themselves through the prose gateway.
+            // themselves through the prose gateway, and its turn ends with
+            // the closed-channel note alone, where one is due.
             await turnSpeechChain;
             if (!trigger?.suppressProse && turnProseRouting !== 'explicit') {
               this.appendProseDeliveryReceipt(agent, streamRouting);
+            } else if (!trigger?.suppressProse) {
+              this.appendExplicitClosedChannelNote(agent, streamRouting);
             }
 
             // A `!` continuation this turn asked for. This gives prose the
@@ -13237,6 +13262,13 @@ export class AgentFramework {
                 if (cancelKind === 'turn_ended' && !trigger?.suppressProse && turnProseRouting !== 'explicit') {
                   await turnSpeechChain;
                   this.appendProseDeliveryReceipt(agent, streamRouting);
+                } else if (cancelKind === 'turn_ended' && !trigger?.suppressProse) {
+                  // Explicit mode doesn't hold the turn for its deliveries, so
+                  // the note comes once they've run, unless a new stream has
+                  // started by then: nothing is added to a window mid-stream.
+                  void turnSpeechChain.then(() => {
+                    if (agent.streamId === myStreamId) this.appendExplicitClosedChannelNote(agent, streamRouting);
+                  });
                 }
                 // A `!` an earlier round asked for still starts its
                 // continuation when a tool ends the turn, once the turn's

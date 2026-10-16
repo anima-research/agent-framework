@@ -1418,6 +1418,126 @@ describe('explicit prose routing', () => {
     await framework.stop();
   });
 
+  /** A registry stub for the closed-channel note: #cafe is closed, laria's DM
+   *  is closed and the registry knows it as a DM, and #alpha is open. */
+  function closedNoteRegistry(framework: AgentFramework, held?: Promise<void>) {
+    const routed: Array<{ text: string; locus: string | null }> = [];
+    const known: Record<string, { channelId: string; label: string }> = {
+      '#alpha': { channelId: 'chan-alpha', label: '#alpha' },
+      '#cafe': { channelId: 'discord:g:cafe', label: '#cafe' },
+      '@laria': { channelId: 'discord:dm:99', label: 'DM: laria' },
+    };
+    const labels: Record<string, string> = { 'chan-alpha': '#alpha', 'discord:g:cafe': '#cafe', 'discord:dm:99': 'DM: laria' };
+    const registry: Record<string, unknown> = {
+      resolveProseTarget: (spec: string) => known[spec] ?? { error: `no channel matches "${spec}"` },
+      routeSpeech: async (_agent: string, text: string, locus?: string | null) => {
+        routed.push({ text, locus: locus ?? null });
+        if (held) await held;
+        return { delivered: true, channelId: locus ?? '' };
+      },
+      resolveLocus: () => 'chan-alpha',
+      getDefaultPublishChannel: () => null,
+      isChannelOpen: (id: string) => id === 'chan-alpha',
+      isDirectMessageChannel: (id: string) => id === 'discord:dm:99',
+      getDescriptor: (id: string) => (labels[id] ? { label: labels[id] } : undefined),
+      getChannelServerId: () => 'discord',
+      getChannelTools: () => [],
+    };
+    (framework as unknown as { channelRegistry: unknown }).channelRegistry = new Proxy(registry, {
+      get: (target, prop: string) => (prop in target ? target[prop] : () => undefined),
+    });
+    return routed;
+  }
+
+  const CAFE_NOTE = "[closed channel] #cafe (discord:g:cafe) stays closed: speaking into a closed channel doesn't open it. " +
+    'Messages there that address you, such as an @-mention, still reach you; ' +
+    'channel_open with channelId "discord:g:cafe" and serverId "discord" opens it. ' +
+    'To stop this note, set closed_channel_note to false with agent_settings.';
+
+  function windowTexts(framework: AgentFramework): string[] {
+    return framework.getAgent('assistant')!.getContextManager().getAllMessages()
+      .flatMap((m) => m.content.flatMap((b) => (b.type === 'text' ? [b.text] : [])));
+  }
+
+  it("speech that stays in a closed channel ends the turn with the closed-channel note alone, and a DM's or an open channel's gets none", async () => {
+    membrane.pushResponse(createMockResponse([
+      { type: 'text', text: '>>#cafe hello there\n>>@laria and you\n>>#alpha and everyone' },
+    ] as ContentBlock[]));
+    const framework = await createFramework();
+    const routed = closedNoteRegistry(framework);
+
+    trigger(framework);
+    await framework.runUntilIdle();
+
+    assert.deepEqual(routed.map((r) => r.locus), ['discord:g:cafe', 'discord:dm:99', 'chan-alpha']);
+    const texts = windowTexts(framework);
+    assert.deepEqual(texts.filter((t) => t.startsWith('[closed channel]')), [CAFE_NOTE]);
+    assert.ok(!texts.some((t) => t.startsWith('[delivered]')), 'explicit mode still has no delivery line');
+    await framework.stop();
+  });
+
+  it('a turn a tool ends gets the note once its speech has been delivered', async () => {
+    membrane.pushResponse(createMockResponse([
+      { type: 'text', text: '>>#cafe heading out now' },
+      { type: 'tool_use', id: 'e1', name: 'robot--move', input: { dir: 'out' } },
+    ] as ContentBlock[], 'tool_use'));
+    const framework = await createFramework();
+    const routed = closedNoteRegistry(framework);
+    // The move ends the turn, as skip_reply does, without keeping its round's prose private.
+    module.handleToolCall = async (call: ToolCall): Promise<ToolResult> => {
+      module.calls.push(call);
+      return { success: true, endTurn: true, data: { ok: true } };
+    };
+
+    trigger(framework);
+    await framework.runUntilIdle();
+    for (const end = Date.now() + 5000; !windowTexts(framework).includes(CAFE_NOTE) && Date.now() < end;) {
+      await new Promise<void>((resolve) => setTimeout(resolve, 5));
+    }
+
+    assert.equal(module.calls.length, 1, 'the move ended the turn');
+    assert.deepEqual(routed.map((r) => r.locus), ['discord:g:cafe']);
+    assert.deepEqual(windowTexts(framework).filter((t) => t.startsWith('[closed channel]')), [CAFE_NOTE]);
+    await framework.stop();
+  });
+
+  it("a tool-ended turn's note isn't added once the next turn's stream has started", async () => {
+    membrane.pushResponse(createMockResponse([
+      { type: 'text', text: '>>#cafe heading out now' },
+      { type: 'tool_use', id: 'e1', name: 'robot--move', input: { dir: 'out' } },
+    ] as ContentBlock[], 'tool_use'));
+    let release!: () => void;
+    const framework = await createFramework();
+    const routed = closedNoteRegistry(framework, new Promise<void>((resolve) => { release = resolve; }));
+    module.handleToolCall = async (call: ToolCall): Promise<ToolResult> => {
+      module.calls.push(call);
+      return { success: true, endTurn: true, data: { ok: true } };
+    };
+    let turns = 0;
+    framework.onTrace((e) => { if ((e as { type: string }).type === 'inference:started') turns++; });
+    // The next turn answers with nothing to deliver.
+    feedTurn(framework, 2, [{ type: 'text', text: '>>skip_reply' }] as ContentBlock[]);
+
+    trigger(framework);
+    await framework.runUntilIdle();
+    assert.equal(module.calls.length, 1, 'the move ended the first turn while its speech was still being delivered');
+    trigger(framework);
+    // The next turn's end waits behind the held post, so it can't go idle yet.
+    const idle = framework.runUntilIdle();
+    for (const end = Date.now() + 5000; turns < 2 && Date.now() < end;) {
+      await new Promise<void>((resolve) => setTimeout(resolve, 5));
+    }
+    assert.equal(turns, 2, 'the next turn has started');
+    release();
+    await idle;
+    await new Promise<void>((resolve) => setTimeout(resolve, 20));
+
+    assert.deepEqual(routed.map((r) => r.locus), ['discord:g:cafe']);
+    assert.deepEqual(windowTexts(framework).filter((t) => t.startsWith('[closed channel]')), [],
+      'nothing is added to the window after another stream has started');
+    await framework.stop();
+  });
+
   it('multi-envelope prose: each >> line routes independently (Tilde scenario)', async () => {
     membrane.pushResponse(createMockResponse([
       { type: 'text', text: '>>#alpha part one for the channel\n>>@laria part two, just for you\nwith a second line\n>> quoted arrow stays in body' },

@@ -54,7 +54,11 @@ agent (then notices append without waking, breaking any loop).
 
 Send tools (`send_message` etc.) and channel lifecycle work the same in
 explicit mode as in the other modes. Speaking never opens a channel, so a
-`>>` send into a closed channel publishes there and leaves it closed.
+`>>` send into a closed channel publishes there and leaves it closed. Explicit
+mode has no `[delivered]` receipt, so where a turn's `>>` speech stayed in a
+closed channel that isn't a DM, the turn ends with a `[closed channel]` line
+that says so, as a send tool's answer does, unless the agent has turned that
+note off (`agent_settings`' `closed_channel_note`).
 
 ## Teaching the grammar (teach-by-bounce)
 

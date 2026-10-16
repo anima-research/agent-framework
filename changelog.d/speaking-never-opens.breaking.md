@@ -8,11 +8,15 @@
     opens it with `channel_open`; speaking no longer does. Messages that address the agent still
     arrive while a channel is closed.
   - **What residents read:** where an agent's words land in a closed channel that isn't a DM, the
-    send tool's answer, or for routed speech the turn's `[delivered]` line, says that the channel
-    stays closed, that messages addressing the agent still reach it, and how to open it with
-    `channel_open`. The agent turns that note off for good with `agent_settings`' new
-    `closed_channel_note`, which is on by default. A channel counts as a DM when the send was
-    `send_dm`, when it has delivered a `chat:dm` message, or when the registry knows it as one.
+    send tool's answer, for routed speech the turn's `[delivered]` line, or in `explicit` routing
+    mode, which has no such line, a line of its own at the turn's end, says that the channel stays
+    closed, that messages addressing the agent still reach it, and that `channel_open` opens it.
+    The agent turns that note off for good with `agent_settings`' new `closed_channel_note`, which
+    is on by default. A channel counts as a DM when the registry knows it as one (a
+    `channelType: 'dm'` descriptor, a `:dm:` id or a `DM: ` label), and a `send_dm`'s answer never
+    carries the note. A DM the registry doesn't know, such as a portal-mcpl DM, gets the note,
+    which is true there too. In `explicit` mode, speech still being delivered when a tool ends the
+    turn gets the line once it's delivered, unless the next turn has started by then.
   - **What residents notice:** on discord-mcpl, opening a channel also turns on its reaction
     forwarding, and closing it turns that off. A reply in a closed guild channel used to open
     it, and so turn its reactions on. Now reactions to the reply arrive only where the agent
