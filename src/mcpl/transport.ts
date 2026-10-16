@@ -188,16 +188,35 @@ export class StdioTransport extends McplTransport {
     });
 
     this.child.on('error', (err) => this.emit('error', err));
+    // A write racing the child's exit fails with EPIPE on stdin. That is the
+    // exit's echo, which 'close' already reports, never a reason to crash: an
+    // unhandled stream 'error' would end the host.
+    this.child.stdin?.on('error', (err) => {
+      if (this.listenerCount('error') > 0) this.emit('error', err);
+    });
+    // A read error on the child's stdout or stderr is reported the same way,
+    // never thrown with nothing listening. The stdout listener is on the
+    // stream itself, since close() closes readline, which takes its own
+    // listener off the stream. While readline is open, its listener, which
+    // came first, re-emits the error on the interface, where an empty
+    // listener absorbs that copy; the stream listener's report is the only one.
+    const reportReadError = (err: Error) => {
+      if (this.listenerCount('error') > 0) this.emit('error', err);
+    };
+    this.child.stdout?.on('error', reportReadError);
+    this.rl.on('error', () => { /* readline's copy of a stdout error, reported above */ });
+    this.child.stderr?.on('error', reportReadError);
     this.child.on('exit', (code, signal) =>
       this.markClosed({ code, signal, reason: 'child process exited' }),
     );
   }
 
   /**
-   * Spawn `config.command` and return a ready stdio transport. Rejects if the
-   * command is missing (a config bug) or the process fails to spawn.
+   * Spawn `config.command` and resolve with a ready stdio transport once the
+   * child has spawned. Rejects if the command is missing (a config bug) or the
+   * process fails to spawn.
    */
-  static spawn(config: McplServerConfig): StdioTransport {
+  static async spawn(config: McplServerConfig): Promise<StdioTransport> {
     if (!config.command) {
       throw new Error(
         `MCPL server "${config.id}": stdio transport requires "command" (none provided)`,
@@ -206,6 +225,22 @@ export class StdioTransport extends McplTransport {
     const child = spawn(config.command, config.args ?? [], {
       stdio: ['pipe', 'pipe', 'pipe'],
       env: buildChildEnv(config),
+    });
+    // Node reports a failed spawn (a command that doesn't exist, say) as an
+    // 'error' on a tick after spawn() returns, and no 'exit' follows. It is
+    // settled here, where it is listened for. A caller that listens only once
+    // this resolves, as the handshake does, would be too late when reached
+    // from a timer callback, as a reconnect is: Node runs that tick before the
+    // caller's promise continuation, and throws an 'error' nothing listens for.
+    await new Promise<void>((resolve, reject) => {
+      const failed = (err: Error) => {
+        reject(new Error(`MCPL server "${config.id}" could not be started: ${err.message}`, { cause: err }));
+      };
+      child.once('error', failed);
+      child.once('spawn', () => {
+        child.off('error', failed);
+        resolve();
+      });
     });
     const rl = createInterface({ input: child.stdout! });
     return new StdioTransport(child, rl);
@@ -223,7 +258,12 @@ export class StdioTransport extends McplTransport {
       this.child.kill();
     }
     await new Promise<void>((resolve) => {
-      if (!this.child || this.child.exitCode !== null || this.child.killed) {
+      // Once Node has seen a child exit, it has its exitCode set, or its
+      // signalCode when a signal ended it, and its 'exit' event has fired. A
+      // signal that didn't come through kill() (an OOM kill, a crash) leaves
+      // `killed` false. A child that has exited but isn't reaped yet still
+      // takes the kill() above, which sets `killed`.
+      if (!this.child || this.child.exitCode !== null || this.child.signalCode !== null || this.child.killed) {
         resolve();
       } else {
         this.child.once('exit', () => resolve());

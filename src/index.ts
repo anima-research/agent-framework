@@ -17,7 +17,7 @@ export * from './modules/index.js';
 
 // API
 export { ApiServer } from './api/server.js';
-export { McpServer } from './api/mcp-server.js';
+export { McpServer } from './api/mcp-server-core.js';
 export type {
   ApiServerConfig,
   ApiMessage,

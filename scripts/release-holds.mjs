@@ -1,6 +1,7 @@
 // Runs as npm's `preversion` lifecycle hook (see package.json), before
 // `npm version` bumps anything; as `prepublishOnly`, before `npm publish`;
-// and in both of the publish workflow's releasing jobs for the pushed tag.
+// and in the publish workflow for a pushed tag: in its build job, and in
+// each of its two releasing jobs.
 // Stops the release while the repository has an open issue labelled
 // `release-hold`: someone found that releasing `main` as it stands would harm
 // whoever runs it, and the issue says what has to happen first.
@@ -8,7 +9,7 @@
 // The repository is the GitHub repository package.json names, as a URL or in
 // npm's shorthand, so a fork or a copy asks the package's home;
 // GITHUB_REPOSITORY (as in GitHub Actions) is used only when package.json
-// names none. A token in GH_TOKEN or GITHUB_TOKEN is sent when present; the
+// names none (no repository field, or a blank one). A token in GH_TOKEN or GITHUB_TOKEN is sent when present; the
 // issues of a public repository read without one. If the holds can't be read,
 // the release stops too, since an open hold can't be ruled out.
 import { readFileSync, writeSync } from "node:fs";
@@ -25,14 +26,16 @@ function fail(message) {
 }
 
 /** owner/repo from package.json's repository field: a github.com URL, or
- *  npm's shorthand (github:owner/repo, or owner/repo alone). */
+ *  npm's shorthand (github:owner/repo, or owner/repo alone). A URL can go on
+ *  past the repository (a path, such as a monorepo's /tree/main/pkg, a query
+ *  or a fragment), and the shorthand can name a ref after `#`. */
 function githubRepository(field) {
   const value = typeof field === "string" ? field : field?.url;
   if (typeof value !== "string" || value.trim() === "") return {};
-  const url = /github\.com[/:]([^/]+\/[^/]+?)(?:\.git)?\/?$/.exec(value);
-  if (url) return { repo: url[1] };
-  const shorthand = /^(?:github:)?([\w.-]+\/[\w.-]+?)(?:\.git)?$/.exec(value);
-  if (shorthand) return { repo: shorthand[1] };
+  const url = /github\.com[/:]([^/#?\s]+)\/([^/#?\s]+?)(?:\.git)?(?:[/#?].*)?$/.exec(value);
+  if (url) return { repo: `${url[1]}/${url[2]}` };
+  const shorthand = /^(?:github:)?([\w.-]+)\/([\w.-]+?)(?:\.git)?(?:#.*)?$/.exec(value);
+  if (shorthand) return { repo: `${shorthand[1]}/${shorthand[2]}` };
   return { unreadable: value };
 }
 
@@ -60,6 +63,16 @@ const { repo, namedBy } = repository();
 const api = (process.env.GITHUB_API_URL ?? "https://api.github.com").replace(/\/+$/, "");
 const token = process.env.GH_TOKEN || process.env.GITHUB_TOKEN;
 const where = `https://github.com/${repo}/issues?q=is%3Aissue+is%3Aopen+label%3A${LABEL}`;
+// How to go on after a stop, for where it ran: npm version's hook, wherever
+// it runs, comes before any tag; in the workflow, the tag is there to re-run.
+const lifecycle = process.env.npm_lifecycle_event;
+const rerun = lifecycle === "preversion"
+  ? "run npm version again"
+  : process.env.GITHUB_ACTIONS === "true"
+    ? "re-run this workflow for the tag"
+    : lifecycle === "prepublishOnly"
+      ? "run npm publish again"
+      : "run this again";
 
 /** What a maintainer can do about an answer other than the list. */
 function refusal(status) {
@@ -76,7 +89,10 @@ function refusal(status) {
       ? `no repository ${repo} is visible to the token in GH_TOKEN or GITHUB_TOKEN; check ${namedBy} and the token's access`
       : `no repository ${repo} is visible without a token; check ${namedBy}, or set GH_TOKEN if the repository is private`;
   }
-  if (status >= 500) return "GitHub had an error; run this again once it answers normally";
+  if (status === 410) {
+    return `issues are turned off for ${repo}, so no hold can be filed or read there; turn them on, or point ${namedBy} at the repository that tracks them`;
+  }
+  if (status >= 500) return `GitHub had an error; ${rerun} once it answers normally`;
   return "this check doesn't know that answer; see what GitHub shows";
 }
 
@@ -98,7 +114,7 @@ async function page(number) {
     const why = error.name === "TimeoutError"
       ? "no answer within 30 s"
       : error.cause?.code ?? error.cause?.message ?? error.message;
-    fail(`release-holds: couldn't reach GitHub to read the release holds (${why}). Check ${where}, and run this again once GitHub can be reached.`);
+    fail(`release-holds: couldn't reach GitHub to read the release holds (${why}). Check ${where}, and ${rerun} once GitHub can be reached.`);
   }
   if (!response.ok) {
     fail(`release-holds: GitHub answered ${`${response.status} ${response.statusText}`.trim()} when asked for the release holds: ${refusal(response.status)}. ${where}`);
@@ -107,39 +123,34 @@ async function page(number) {
   try {
     items = await response.json();
   } catch (error) {
-    fail(`release-holds: couldn't read GitHub's answer (${error.name === "TimeoutError" ? "no answer within 30 s" : error.message}). Check ${where}, and run this again.`);
+    fail(`release-holds: couldn't read GitHub's answer (${error.name === "TimeoutError" ? "no answer within 30 s" : error.message}). Check ${where}, and ${rerun}.`);
   }
   if (!Array.isArray(items)) {
-    fail(`release-holds: GitHub's answer wasn't a list of issues. Check ${where}, and run this again.`);
+    fail(`release-holds: GitHub's answer wasn't a list of issues. Check ${where}, and ${rerun}.`);
   }
   return items;
 }
 
 // The issues endpoint lists pull requests too. A hold is an issue: a pull
 // request isn't on main until it merges.
+// Only a page after the last it reads that holds something is past the
+// limit: a full last page leads to one more read, which may be empty.
 const holds = [];
 for (let number = 1; ; number++) {
-  if (number > MAX_PAGES) {
+  const items = await page(number);
+  if (number > MAX_PAGES && items.length > 0) {
     fail(`release-holds: more than ${MAX_PAGES * PAGE} open items are labelled ${LABEL} in ${repo}, more than this check reads. ${where}`);
   }
-  const items = await page(number);
   holds.push(...items.filter((item) => !item.pull_request));
   if (items.length < PAGE) break;
 }
 
 if (holds.length > 0) {
-  const again = process.env.GITHUB_ACTIONS === "true"
-    ? "then re-run this workflow for the tag"
-    : process.env.npm_lifecycle_event === "preversion"
-      ? "then run npm version again"
-      : process.env.npm_lifecycle_event === "prepublishOnly"
-        ? "then run npm publish again"
-        : "then run this again";
   fail(
     [
-      `Release held: ${holds.length === 1 ? "an open issue is" : `${holds.length} open issues are`} labelled ${LABEL} in ${repo}.`,
+      `Release held: ${holds.length === 1 ? "an open issue is" : `${holds.length} open issues are`} labelled ${LABEL} in ${repo} (named by ${namedBy}).`,
       ...holds.map((hold) => `  #${hold.number} ${hold.title}`),
-      `Resolve each one, or close it if it no longer applies, ${again}. ${where}`,
+      `Resolve each one, or close it if it no longer applies, then ${rerun}. ${where}`,
     ].join("\n"),
   );
 }

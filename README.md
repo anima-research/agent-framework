@@ -344,7 +344,7 @@ await server.start();
 
 **Commands:** `message.send`, `message.list`, `inference.request`, `inference.abort`, `branch.*`, `agent.*`, `module.*`, `store.*`, `inference.tail/inspect/search`, `events.*`, `host.quiesce/resume/status/maintenanceTick`, `host.providerWaits/releaseProviderWait`
 
-Also available as an MCP server via the `agent-framework-mcp` binary.
+Also available as an MCP server via the `agent-framework-mcp` binary (`npx -p @animalabs/agent-framework agent-framework-mcp` without installing it). It is a client of this API's WebSocket server, at `AGENT_FRAMEWORK_WS_URL` (default `ws://localhost:8765/ws`), and offers a subset of these commands as tools; its `tools/list` names them.
 
 ### Host quiesce / maintenance mode
 

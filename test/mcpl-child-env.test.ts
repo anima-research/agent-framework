@@ -89,7 +89,7 @@ test('a real spawned stdio child sees only allowlist + declared env', async () =
   process.env.REQUESTS_CA_BUNDLE = '/host/internal-ca.pem';
   process.env.HTTPS_PROXY = 'http://proxy.example:8443';
   try {
-    const transport = StdioTransport.spawn({
+    const transport = await StdioTransport.spawn({
       id: 'env-probe',
       command: process.execPath,
       args: ['-e', 'console.log(JSON.stringify(process.env))'],
