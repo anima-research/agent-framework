@@ -10,17 +10,17 @@
   as before.
   - **When it runs:** as one fresh compile, once context-manager's preview of
     that compile says it fits. A dry compile can't say so, since it can
-    resolve a plan the turn's compile refuses. A refusal the preview
-    rethrows, such as a context refusal, counts as a refusal. A strategy with
-    no preview, or the hierarchical strategy, gets the dry compile. The hold
-    looks after every maintenance pass, every drain kick it starts, and every
-    surgery, undo and redo. It looks again only once something that could
-    make the context fit has changed: compression's progress (for a strategy
-    that reports none, whether it still has compression pending), the agent's
-    message count, its runtime settings, or the store, by a surgery. An edit
-    that shrinks a message is seen at the next compression step or surgery. A
-    turn released and refused again is held again with its first deadline,
-    and isn't released again until one of those changes.
+    resolve a plan the turn's compile refuses. A refusal the preview rethrows,
+    such as a context refusal, counts as a refusal. A strategy with no preview
+    gets the dry compile. The hierarchical strategy's preview reports a
+    context that doesn't fit, and for one that does, the dry compile decides.
+    The hold looks after every maintenance pass, every drain kick it starts,
+    and every surgery, undo and redo. It looks again only once something that
+    could make the context fit has changed: compression's progress (for a
+    strategy that reports none, whether it still has compression pending), a
+    message added, edited or removed, its runtime settings, or a surgery on
+    the store. A turn released and refused again is held again with its first
+    deadline, and isn't released again until one of those changes.
   - **When it ends without running:** 30 minutes after the refusal that
     started it, or at once when compression has nothing pending, and the turn
     then fails as a refused compile did, its reason saying when it was first
