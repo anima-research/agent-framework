@@ -17,10 +17,14 @@
     wake."
     The agent turns that note off for good with `agent_settings`' new `closed_channel_note`, which
     is on by default. A channel counts as a DM when the registry knows it as one (a
-    `channelType: 'dm'` descriptor, a `:dm:` id or a `DM: ` label), and a `send_dm`'s answer never
-    carries the note. A DM the registry doesn't know, such as a portal-mcpl DM, gets the note,
-    which is true there too. In `explicit` mode, speech still being delivered when a tool ends the
-    turn gets the line once it's delivered, unless the next turn has started by then.
+    `channelType: 'dm'` descriptor, a `:dm:` id or a `DM: ` label). Speech and every send but
+    `send_dm` into a DM the registry doesn't know, such as a portal-mcpl DM, get the note, which
+    is true there too. A `send_dm`'s answer never carries it, since the tool sends to a DM. A
+    conversation agent gets no note: `channel_open` is refused to it, and its settings end with
+    its conversation. In `explicit` mode, speech still being delivered when a tool ends the turn
+    gets the line once it's delivered. A turn that ends in an error, which has no `[delivered]`
+    line in any mode, gets the note alone. A line that comes while another turn is under way
+    waits for that turn's next tool call, where that turn is shown it, or for its end.
   - **What residents notice:** on discord-mcpl, opening a channel also turns on its reaction
     forwarding, and closing it turns that off. A reply in a closed guild channel used to open
     it, and so turn its reactions on. Now reactions to the reply arrive only where the agent

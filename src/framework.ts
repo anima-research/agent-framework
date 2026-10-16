@@ -4078,11 +4078,15 @@ export class AgentFramework {
   private static readonly CLOSED_CHANNEL_NOTE_OFF = 'To stop this note, set closed_channel_note to false with agent_settings.';
 
   /** The closed-channel notes for an agent's words that landed in these
-   *  channels, or none when they've turned the note off. The note is advice:
-   *  if working it out fails, the words were still delivered, so that's
-   *  logged and nothing is added. */
+   *  channels, or none when they've turned the note off. A conversation agent
+   *  gets none: channel_open is refused to it and its settings end with its
+   *  conversation, so neither what the note offers nor turning it off is its
+   *  own, and the resident that owns the channel gets the note for its own
+   *  words. The note is advice: if working it out fails, the words were still
+   *  delivered, so that's logged and nothing is added. */
   private closedChannelNotes(agentName: string, channelIds: Iterable<string>, serverId?: string): string[] {
     try {
+      if (this.conversationAgentHomes.has(agentName)) return [];
       const notes = [...channelIds].flatMap((id) =>
         this.closedChannelNoteFor(id, serverId ?? this.channelRegistry?.getChannelServerId(id) ?? null) ?? []);
       // The setting is read only when there's a note to give.
@@ -5919,6 +5923,15 @@ export class AgentFramework {
     // The identity check keeps a settle that carries an earlier turn's
     // object from closing a newer turn; keep it when editing call sites.
     if (closes && this.openLogical.get(agentName) === closes) this.openLogical.delete(agentName);
+    // A turn that ends in an error has no `[delivered]` receipt in any mode,
+    // but its words that landed in a closed channel stayed there, where they
+    // used to open it however the turn ended. So once its speech has run,
+    // the note comes alone, once per channel, as at the other endings.
+    const settling = outcome.stopReason === 'exhausted' && closes ? this.agents.get(agentName) : undefined;
+    if (settling && closes) {
+      void (this.proseSpeechChains.get(agentName) ?? Promise.resolve())
+        .then(() => this.appendClosedChannelNoteAlone(settling, closes));
+    }
     const run = this.ephemeralRuns.get(agentName);
     if (!run) return;
     run.lastActivity = Date.now();
@@ -10757,24 +10770,29 @@ export class AgentFramework {
   }
 
   /**
-   * Explicit mode's counterpart at logical turn end. It has no `[delivered]`
-   * receipt, since the agent named every destination itself. Its `>>` speech
-   * opened a closed channel until speaking never opened one, so where that
-   * speech stayed in a closed channel that isn't a DM, the turn ends with the
-   * closed-channel note alone, in a send's words. No-op otherwise.
+   * The closed-channel note alone, in a send's words, for the words a logical
+   * turn left in closed channels where no `[delivered]` receipt carries it:
+   * explicit mode's turn end, which has no receipt since the agent named every
+   * destination itself, and a turn that ends in an error, which has none in
+   * any mode. That speech opened a closed channel until speaking never opened
+   * one, so the note goes wherever it stayed in a closed channel that isn't a
+   * DM, once per channel. It goes through addMessage, as the policy's open
+   * notice does: held while the agent has a turn alive and written at that
+   * turn's next boundary, so it reaches the agent once and never mid-turn.
+   * No-op otherwise.
    */
-  private appendExplicitClosedChannelNote(agent: Agent, routing: TurnRouting): void {
+  private appendClosedChannelNoteAlone(agent: Agent, routing: TurnRouting): void {
     const delivered = new Set(routing.deliveries);
     routing.deliveries = [];
     const notes = this.closedChannelNotes(agent.name, delivered);
     if (notes.length === 0) return;
     try {
-      const mid = agent.getContextManager().addMessage(
+      this.addMessage(
         'user',
         [{ type: 'text', text: `[closed channel] ${notes.join(' ')} ${AgentFramework.CLOSED_CHANNEL_NOTE_OFF}` }],
         { system: true, kind: 'delivery-receipt' } as MessageMetadata,
+        { forAgent: agent.name },
       );
-      this.emitTrace({ type: 'message:added', messageId: mid, source: 'delivery-receipt' });
     } catch (err) {
       console.error('closed-channel note append failed:', err);
     }
@@ -11254,7 +11272,7 @@ export class AgentFramework {
 
     try {
       const result = await this.channelRegistry!.routeSpeech(name, body, targetChannel);
-      // For the turn's closed-channel note (appendExplicitClosedChannelNote).
+      // For the turn's closed-channel note (appendClosedChannelNoteAlone).
       this.recordProseDelivery(routing, result);
       if (result?.delivered) {
         this.proseBounceStreaks.delete(name);
@@ -13093,7 +13111,7 @@ export class AgentFramework {
             if (!trigger?.suppressProse && turnProseRouting !== 'explicit') {
               this.appendProseDeliveryReceipt(agent, streamRouting);
             } else if (!trigger?.suppressProse) {
-              this.appendExplicitClosedChannelNote(agent, streamRouting);
+              this.appendClosedChannelNoteAlone(agent, streamRouting);
             }
 
             // A `!` continuation this turn asked for. This gives prose the
@@ -13266,11 +13284,8 @@ export class AgentFramework {
                   this.appendProseDeliveryReceipt(agent, streamRouting);
                 } else if (cancelKind === 'turn_ended' && !trigger?.suppressProse) {
                   // Explicit mode doesn't hold the turn for its deliveries, so
-                  // the note comes once they've run, unless a new stream has
-                  // started by then: nothing is added to a window mid-stream.
-                  void turnSpeechChain.then(() => {
-                    if (agent.streamId === myStreamId) this.appendExplicitClosedChannelNote(agent, streamRouting);
-                  });
+                  // the note comes once they've run.
+                  void turnSpeechChain.then(() => this.appendClosedChannelNoteAlone(agent, streamRouting));
                 }
                 // A `!` an earlier round asked for still starts its
                 // continuation when a tool ends the turn, once the turn's
@@ -18548,7 +18563,7 @@ export class AgentFramework {
       } else if (agent?.proseRouting === 'explicit') {
         // Explicit mode: announce to the turn's sticky prose target if the
         // model has set one; otherwise stay quiet — never guess a channel.
-        destination = this.turnRouting.get(agentName)?.pin;
+        destination = this.turnRouting.get(agentName)?.pin || undefined;
         if (!destination) {
           console.error(`[sleep] ${agentName}: no prose target this turn — sleep announcement not posted (explicit mode never guesses)`);
         }
@@ -18557,10 +18572,12 @@ export class AgentFramework {
       }
     }
     // Speaking never opens a channel, so in a closed one that isn't a DM the
-    // announcement says that only messages addressed to the agent reach it,
+    // announcement says the agent will still see messages addressed to it,
     // and the result carries the closed-channel note, as a send's answer does.
     // Both are decided from the channel as the announcement goes out: neither
-    // depends on the post landing, which stays fire-and-forget.
+    // depends on the post landing, which stays fire-and-forget. Those words
+    // are true in an open channel too, so they're the ones used when the
+    // channel's state can't be read.
     let closedChannelNote: string | undefined;
     let staysClosed = false;
     if (destination && this.channelRegistry?.getDescriptor(destination)) {
@@ -18568,6 +18585,7 @@ export class AgentFramework {
       try {
         staysClosed = this.closedChannelNoteFor(destination, null) !== undefined;
       } catch (err) {
+        staysClosed = true;
         console.error(`[sleep] ${agentName}: whether ${destination} stays closed couldn't be read: ${err instanceof Error ? err.message : String(err)}`);
       }
     }

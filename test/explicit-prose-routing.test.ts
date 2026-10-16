@@ -1420,7 +1420,7 @@ describe('explicit prose routing', () => {
 
   /** A registry stub for the closed-channel note: #cafe is closed, laria's DM
    *  is closed and the registry knows it as a DM, and #alpha is open. */
-  function closedNoteRegistry(framework: AgentFramework, held?: Promise<void>) {
+  function closedNoteRegistry(framework: AgentFramework, held?: Promise<void> | ((locus: string | null) => Promise<void> | undefined)) {
     const routed: Array<{ text: string; locus: string | null }> = [];
     const known: Record<string, { channelId: string; label: string }> = {
       '#alpha': { channelId: 'chan-alpha', label: '#alpha' },
@@ -1432,7 +1432,8 @@ describe('explicit prose routing', () => {
       resolveProseTarget: (spec: string) => known[spec] ?? { error: `no channel matches "${spec}"` },
       routeSpeech: async (_agent: string, text: string, locus?: string | null) => {
         routed.push({ text, locus: locus ?? null });
-        if (held) await held;
+        const wait = typeof held === 'function' ? held(locus ?? null) : held;
+        if (wait) await wait;
         return { delivered: true, channelId: locus ?? '' };
       },
       resolveLocus: () => 'chan-alpha',
@@ -1501,7 +1502,7 @@ describe('explicit prose routing', () => {
     await framework.stop();
   });
 
-  it("a tool-ended turn's note isn't added once the next turn's stream has started", async () => {
+  it("a tool-ended turn's note waits while the next turn runs, and is written once it ends", async () => {
     membrane.pushResponse(createMockResponse([
       { type: 'text', text: '>>#cafe heading out now' },
       { type: 'tool_use', id: 'e1', name: 'robot--move', input: { dir: 'out' } },
@@ -1518,23 +1519,156 @@ describe('explicit prose routing', () => {
     // The next turn answers with nothing to deliver.
     feedTurn(framework, 2, [{ type: 'text', text: '>>skip_reply' }] as ContentBlock[]);
 
+    // A failure lets the held post go and stops the framework, so the file still ends.
+    try {
+      trigger(framework);
+      await framework.runUntilIdle();
+      assert.equal(module.calls.length, 1, 'the move ended the first turn while its speech was still being delivered');
+      trigger(framework);
+      // The next turn's end waits behind the held post, so it can't go idle yet.
+      const idle = framework.runUntilIdle();
+      for (const end = Date.now() + 5000; turns < 2 && Date.now() < end;) {
+        await new Promise<void>((resolve) => setTimeout(resolve, 5));
+      }
+      assert.equal(turns, 2, 'the next turn has started');
+      release();
+      await idle;
+      await new Promise<void>((resolve) => setTimeout(resolve, 20));
+
+      assert.deepEqual(routed.map((r) => r.locus), ['discord:g:cafe']);
+      const texts = windowTexts(framework);
+      assert.deepEqual(texts.filter((t) => t.startsWith('[closed channel]')), [CAFE_NOTE], 'the note is given once');
+      assert.ok(texts.indexOf(CAFE_NOTE) > texts.lastIndexOf('>>skip_reply'),
+        "it comes after the next turn's own words: that turn never saw it");
+    } finally {
+      release();
+      await framework.stop();
+    }
+  });
+
+  it("a note due while the next turn's tool call runs waits for that call, and that turn is shown it", async () => {
+    membrane.pushResponse(createMockResponse([
+      { type: 'text', text: '>>#cafe heading out now' },
+      { type: 'tool_use', id: 'e1', name: 'robot--move', input: { dir: 'out' } },
+    ] as ContentBlock[], 'tool_use'));
+    let releaseCafe!: () => void;
+    const cafe = new Promise<void>((resolve) => { releaseCafe = resolve; });
+    let releaseMove!: () => void;
+    const secondMove = new Promise<void>((resolve) => { releaseMove = resolve; });
+    const framework = await createFramework();
+    closedNoteRegistry(framework, (locus) => (locus === 'discord:g:cafe' ? cafe : undefined));
+    // The first move ends its turn, as skip_reply does; the next turn's move waits until released.
+    module.handleToolCall = async (call: ToolCall): Promise<ToolResult> => {
+      module.calls.push(call);
+      if (module.calls.length === 1) return { success: true, endTurn: true, data: { ok: true } };
+      await secondMove;
+      return { success: true, data: { ok: true } };
+    };
+    let turns = 0;
+    framework.onTrace((e) => {
+      if ((e as { type: string }).type !== 'inference:started' || ++turns !== 2) return;
+      // The next turn moves back, then has nothing more to say.
+      membrane.pushResponse(createMockResponse([
+        { type: 'tool_use', id: 'e2', name: 'robot--move', input: { dir: 'back' } },
+      ] as ContentBlock[], 'tool_use'));
+      membrane.pushResponse(createMockResponse([{ type: 'text', text: '>>skip_reply' }] as ContentBlock[]));
+    });
+    const deferred = () => (framework as unknown as { deferredMessages: Array<{ content: Array<{ text?: string }> }> })
+      .deferredMessages.filter((m) => m.content.some((b) => b.text === CAFE_NOTE));
+
+    // A failure lets the held post and move go and stops the framework, so the file still ends.
+    try {
+      trigger(framework);
+      await framework.runUntilIdle();
+      assert.equal(module.calls.length, 1, 'the move ended the first turn while its speech was still being delivered');
+      trigger(framework);
+      const idle = framework.runUntilIdle();
+      for (const end = Date.now() + 5000; module.calls.length < 2 && Date.now() < end;) {
+        await new Promise<void>((resolve) => setTimeout(resolve, 5));
+      }
+      assert.equal(module.calls.length, 2, "the next turn's move is running");
+      releaseCafe();
+      for (const end = Date.now() + 5000; deferred().length === 0 && Date.now() < end;) {
+        await new Promise<void>((resolve) => setTimeout(resolve, 5));
+      }
+      assert.equal(deferred().length, 1, 'the note is due, and held');
+      assert.ok(!windowTexts(framework).includes(CAFE_NOTE), "it isn't written while that turn's move runs");
+      releaseMove();
+      await idle;
+
+      assert.deepEqual(windowTexts(framework).filter((t) => t.startsWith('[closed channel]')), [CAFE_NOTE], 'the note is given once');
+      const shown = membrane.lastStream!.receivedToolResultOptions
+        .flatMap((options) => options?.injectedMessages ?? [])
+        .some((message) => (message.content as Array<{ text?: string }>).some((block) => block.text === CAFE_NOTE));
+      assert.ok(shown, "the next turn is shown it with its move's result");
+    } finally {
+      releaseCafe();
+      releaseMove();
+      await framework.stop();
+    }
+  });
+
+  it('a turn that fails after its speech stayed in a closed channel still gets the note', async () => {
+    // Its speech is delivered at the tool call, and the round after the tool
+    // fails for good instead of completing: a 400, which the framework doesn't retry.
+    membrane.pushResponse(createMockResponse([
+      { type: 'text', text: '>>#cafe heading out now' },
+      { type: 'tool_use', id: 'f1', name: 'robot--move', input: { dir: 'out' } },
+    ] as ContentBlock[], 'tool_use'));
+    membrane.pushResponse(createMockResponse([] as ContentBlock[]));
+    const framework = await createFramework();
+    const routed = closedNoteRegistry(framework);
+    const makeStream = membrane.streamYielding.bind(membrane);
+    let streams = 0;
+    membrane.streamYielding = (request, options) => {
+      const stream = makeStream(request, options);
+      streams++;
+      const iterate = stream[Symbol.asyncIterator].bind(stream);
+      stream[Symbol.asyncIterator] = async function* () {
+        for await (const event of { [Symbol.asyncIterator]: iterate }) {
+          if (event.type === 'complete') {
+            yield {
+              type: 'error' as const,
+              error: new MembraneError({
+                type: 'invalid_request', retryable: false, httpStatus: 400,
+                message: 'synthetic invalid request', rawError: { status: 400 }, rawRequest: request,
+              }),
+            };
+            return;
+          }
+          yield event;
+        }
+      };
+      return stream;
+    };
+
     trigger(framework);
     await framework.runUntilIdle();
-    assert.equal(module.calls.length, 1, 'the move ended the first turn while its speech was still being delivered');
-    trigger(framework);
-    // The next turn's end waits behind the held post, so it can't go idle yet.
-    const idle = framework.runUntilIdle();
-    for (const end = Date.now() + 5000; turns < 2 && Date.now() < end;) {
+    for (const end = Date.now() + 5000; !windowTexts(framework).includes(CAFE_NOTE) && Date.now() < end;) {
       await new Promise<void>((resolve) => setTimeout(resolve, 5));
     }
-    assert.equal(turns, 2, 'the next turn has started');
-    release();
-    await idle;
-    await new Promise<void>((resolve) => setTimeout(resolve, 20));
+
+    assert.equal(streams, 1, 'the failure was not retried');
+    assert.deepEqual(routed.map((r) => r.locus), ['discord:g:cafe']);
+    assert.deepEqual(windowTexts(framework).filter((t) => t.startsWith('[closed channel]')), [CAFE_NOTE]);
+    await framework.stop();
+  });
+
+  it("in hybrid mode, speech that stays in a closed channel ends the turn's delivery line with the note", async () => {
+    membrane.pushResponse(createMockResponse([
+      { type: 'text', text: '>>>#cafe hello there' },
+    ] as ContentBlock[]));
+    const framework = await createFramework('hybrid');
+    const routed = closedNoteRegistry(framework);
+
+    trigger(framework);
+    await framework.runUntilIdle();
 
     assert.deepEqual(routed.map((r) => r.locus), ['discord:g:cafe']);
-    assert.deepEqual(windowTexts(framework).filter((t) => t.startsWith('[closed channel]')), [],
-      'nothing is added to the window after another stream has started');
+    const delivered = windowTexts(framework).filter((t) => t.startsWith('[delivered]'));
+    assert.equal(delivered.length, 1, delivered.join('\n'));
+    assert.ok(delivered[0]!.endsWith(` · ${CAFE_NOTE.slice('[closed channel] '.length)}`), delivered[0]);
+    assert.ok(!windowTexts(framework).some((t) => t.startsWith('[closed channel]')), 'the delivery line carries it');
     await framework.stop();
   });
 

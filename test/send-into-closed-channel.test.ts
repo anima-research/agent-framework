@@ -95,6 +95,8 @@ async function harness() {
     setStateJson: (_id: string, value: unknown) => { frameworkState = value; },
   };
   framework.agents = new Map([['sol', {}]]);
+  // Conversation agents by their home channel; sol isn't one.
+  framework.conversationAgentHomes = new Map();
   const windowMessages: string[] = [];
   framework.addMessage = (_role: string, content: Array<{ text?: string }>) => {
     windowMessages.push(content.map((b) => b.text ?? '').join(''));
@@ -234,7 +236,8 @@ test('a send into an open channel, a DM the registry knows, or by send_dm carrie
     assert.ok(!(await reply()).data.includes('[closed channel]'), 'open');
   }
   {
-    // send_dm sends to a DM, whatever the registry knows of it.
+    // send_dm sends to a DM by what the tool is, so its answer carries no
+    // note even into #upkeep, a channel the registry doesn't know as a DM.
     const { reply } = await harness();
     assert.ok(!(await reply('send_dm')).data.includes('[closed channel]'), 'send_dm');
   }
@@ -445,7 +448,17 @@ test("a sleep announced into a closed channel says only what addresses the agent
   framework.activeTurnTriggers = new Map();
   framework.timeZone = 'UTC';
   const routing = framework.turnRouting.get('sol');
-  /** One sleep call, as the agent makes it; its result once the posts it started have run. */
+  // Where each announcement was routed, and its post, which the sleep doesn't wait for.
+  const routedTo: Array<string | null> = [];
+  const posts: Promise<unknown>[] = [];
+  const route = registry.routeSpeech.bind(registry);
+  registry.routeSpeech = ((...args: Parameters<typeof route>) => {
+    routedTo.push(args[2] as string | null);
+    const post = route(...args);
+    posts.push(post);
+    return post;
+  }) as typeof route;
+  /** One sleep call, as the agent makes it; its result once the post it started has run. */
   const sleep = async (input: Record<string, unknown>) => {
     const result = await new Promise<{ success: boolean; data: Record<string, unknown>; endTurn?: boolean }>((resolve) => {
       framework.pushEvent = (event: { type: string; callId?: string; result: never }) => {
@@ -453,7 +466,7 @@ test("a sleep announced into a closed channel says only what addresses the agent
       };
       framework.dispatchSleepToolCall('sol', { id: 'call-sleep', name: 'sleep', input });
     });
-    await new Promise((resolve) => setImmediate(resolve));
+    await Promise.allSettled(posts.splice(0));
     return result;
   };
   const quiet = "💤 Going quiet for 10m. I'll still see messages, but won't respond until I wake.";
@@ -495,7 +508,50 @@ test("a sleep announced into a closed channel says only what addresses the agent
   routing.locus = 'discord:g1:999999';
   slept = await sleep({ seconds: 600 });
   assert.equal(slept.data.closedChannelNote, undefined);
+  assert.deepEqual(routedTo.splice(0).slice(-1), ['discord:g1:999999']);
+  assert.deepEqual(published.splice(0), [], 'nothing reached a channel');
+  // No locus at all: routed as before, with nothing to post to, and no note.
+  routing.locus = null;
+  slept = await sleep({ seconds: 600 });
+  assert.equal(slept.data.closedChannelNote, undefined);
+  assert.deepEqual(routedTo.splice(0), [null]);
+  assert.deepEqual(published.splice(0), []);
   routing.locus = channelId;
+
+  // When whether the channel stays closed can't be read, the words are ones
+  // true either way, and there's no note.
+  const isDm = registry.isDirectMessageChannel.bind(registry);
+  registry.isDirectMessageChannel = () => { throw new Error('the registry is unreadable'); };
+  slept = await sleep({ seconds: 600 });
+  registry.isDirectMessageChannel = isDm;
+  assert.equal(slept.data.closedChannelNote, undefined);
+  assert.deepEqual(published.splice(0), [{ channelId, text: addressed }]);
+
+  // A conversation agent can't open the channel, so it gets no note; the words
+  // for people follow the channel.
+  framework.conversationAgentHomes.set('sol', channelId);
+  slept = await sleep({ seconds: 600 });
+  framework.conversationAgentHomes.delete('sol');
+  assert.equal(slept.data.closedChannelNote, undefined);
+  assert.deepEqual(published.splice(0), [{ channelId, text: addressed }]);
+
+  // Hybrid routing announces to the locus as locus mode does.
+  framework.agents.set('sol', { proseRouting: 'hybrid' });
+  slept = await sleep({ seconds: 600 });
+  assert.equal(slept.data.closedChannelNote, UPKEEP_NOTE);
+  assert.deepEqual(published.splice(0), [{ channelId, text: addressed }]);
+  routedTo.splice(0);
+
+  // Prose routing off, or a silent turn: nothing is posted, and no note.
+  framework.agents.set('sol', { proseRouting: 'disabled' });
+  slept = await sleep({ seconds: 600 });
+  assert.equal(slept.data.closedChannelNote, undefined);
+  framework.agents.set('sol', {});
+  framework.activeTurnTriggers.set('sol', { suppressProse: true });
+  slept = await sleep({ seconds: 600 });
+  assert.equal(slept.data.closedChannelNote, undefined);
+  framework.activeTurnTriggers.delete('sol');
+  assert.deepEqual(routedTo.splice(0), [], 'nothing was routed');
 
   // No announcement, no note: one turned off, and explicit mode with no target this turn.
   slept = await sleep({ seconds: 600, announce: false });
@@ -503,10 +559,38 @@ test("a sleep announced into a closed channel says only what addresses the agent
   framework.agents.set('sol', { proseRouting: 'explicit' });
   slept = await sleep({ seconds: 600 });
   assert.equal(slept.data.closedChannelNote, undefined);
+  // An empty target is none.
+  routing.pin = '';
+  slept = await sleep({ seconds: 600 });
+  assert.equal(slept.data.closedChannelNote, undefined);
+  assert.deepEqual(routedTo.splice(0), [], 'nothing was routed');
   assert.deepEqual(published, [], 'nothing was posted');
   // Explicit mode announces to the turn's target, with the note.
   routing.pin = channelId;
   slept = await sleep({ seconds: 600 });
   assert.equal(slept.data.closedChannelNote, UPKEEP_NOTE);
   assert.deepEqual(published.splice(0), [{ channelId, text: addressed }]);
+});
+
+test('a conversation agent gets no note on its send: channel_open is refused to it', async () => {
+  const { framework, reply, windowMessages } = await harness();
+  framework.conversationAgentHomes.set('sol', channelId);
+  const { success, data } = await reply();
+  assert.equal(success, true);
+  assert.ok(!data.includes('[closed channel]'), data);
+  assert.deepEqual(windowMessages.filter((m) => m.startsWith('[closed channel]')), []);
+});
+
+test("channel_publish never opened a channel, so its answer carries no note", async () => {
+  const { framework, published, windowMessages } = await harness();
+  const result = await new Promise<{ success: boolean; data?: unknown }>((resolve) => {
+    framework.pushEvent = (event: { type: string; callId?: string; result: { success: boolean; data?: unknown } }) => {
+      if (event.type === 'tool-result' && event.callId === 'call-publish') resolve(event.result);
+    };
+    framework.dispatchChannelToolCall('sol', { id: 'call-publish', name: 'channel_publish', input: { channelId, content: 'a word to #upkeep' } });
+  });
+  assert.equal(result.success, true);
+  assert.deepEqual(published, [{ channelId, text: 'a word to #upkeep' }]);
+  assert.ok(!JSON.stringify(result.data ?? '').includes('[closed channel]'));
+  assert.deepEqual(windowMessages.filter((m) => m.startsWith('[closed channel]')), []);
 });
