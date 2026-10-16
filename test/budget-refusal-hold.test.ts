@@ -291,6 +291,9 @@ describe('a compile refused for budget holds its turn (#304)', () => {
         assert.equal(held[0]!.budget, 48_568);
         assert.equal(held[0]!.actual, 100_201);
         assert.equal((held[0]!.until as number) - (held[0]!.since as number), 30 * 60_000, 'a fixed 30-minute bound');
+        const alerts = t.of('ops:alert').filter((e) => e.kind === 'context-refusal');
+        assert.equal(alerts.length, 1, 'the context-refusal alert went out when the hold started');
+        assert.match(String(alerts[0]!.message), /the turn is held until \S+ while compression catches up/);
         assert.deepEqual(t.of('inference:hold_ended').map((e) => e.outcome), ['fit']);
         assert.deepEqual(t.of('inference:exhausted'), [], 'the turn never failed');
       } finally {
