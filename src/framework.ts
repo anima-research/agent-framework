@@ -6359,8 +6359,6 @@ export class AgentFramework {
       );
     }
 
-    this.eventGate?.admitOverdueWakeIntents();
-    const releasedRequests = this.pendingRequests.length;
     // In-memory first: addMessage must stop deferring so the flush below can
     // land. The DURABLE flag is cleared only after the flush completes — a
     // crash in between then boots quiesced with the un-acked remainder
@@ -6384,7 +6382,11 @@ export class AgentFramework {
       this.runReleasesAfterResume();
       await this.flushDeferredWrites('resume');
       this.persistHostMode(null);
+<<<<<<< HEAD
       this.hostModeRecordMayBeQuiesced = false;
+=======
+      this.eventGate?.admitOverdueWakeIntents();
+>>>>>>> 58380959 (fix(gate): retain quiesced wakes until admission (R2-1 R2-2 R2-6))
     } finally {
       this.resumeInFlight = false;
       // Reopen MCPL data planes (quiesced is already false). In `finally`
@@ -6392,6 +6394,7 @@ export class AgentFramework {
       // plane still paused.
       this.readyMcplPlanes();
 
+      const releasedRequests = this.pendingRequests.length;
       this.emitTrace({
         type: 'host:resume',
         ...(opts?.force && failing.length > 0 ? { forced: true } : {}),

@@ -631,7 +631,6 @@ export class EventGate {
   private selfWakeTimers = new Map<string, ReturnType<typeof setTimeout>>();
   private selfWakeIntents = new Map<string, PersistedWakeIntent>();
   private wakeIntentsRestored = false;
-  private overdueWakeIntentsAdmitted = false;
 
   // Privileged users who may wake the agent through sleep. Hot-reloaded from
   // privilegedUsersPath on change.
@@ -1795,16 +1794,18 @@ export class EventGate {
     const ms = Math.max(1_000, Math.min(3_600_000, Math.floor(seconds * 1000)));
     const prev = this.selfWakeTimers.get(agentName);
     if (prev) clearTimeout(prev);
+    const armedAt = this.now();
     const intent: PersistedWakeIntent = {
       agentName,
-      armedAt: this.now(),
-      wakeAt: this.now() + ms,
+      armedAt,
+      wakeAt: armedAt + ms,
       source,
     };
     this.selfWakeIntents.set(agentName, intent);
     const durable = this.tryPersistWakeState('arming self-wake');
     const timer = setTimeout(() => {
       this.selfWakeTimers.delete(agentName);
+      if (this.quiesced) return; // retain durable intent for resume/restart admission
       this.selfWakeIntents.delete(agentName);
       this.tryPersistWakeState('firing self-wake');
       this.emitTrace({
@@ -2002,9 +2003,11 @@ export class EventGate {
 
   /** Admit restored overdue intents at the final safe startup/resume boundary. */
   admitOverdueWakeIntents(): void {
-    if (this.overdueWakeIntentsAdmitted) return;
-    this.overdueWakeIntentsAdmitted = true;
     const now = this.now();
+    if (this.sleepUntil > now && !this.sleepTimer) this.armSleepTimer();
+    for (const intent of this.selfWakeIntents.values()) {
+      if (intent.wakeAt > now && !this.selfWakeTimers.has(intent.agentName!)) this.armRestoredSelfWake(intent);
+    }
     const due: Array<{ intent: PersistedWakeIntent; kind: 'sleep' | 'self-wake' }> = [];
     if (this.sleepUntil > 0 && this.sleepUntil <= now) {
       due.push({ intent: {
@@ -2066,6 +2069,8 @@ export class EventGate {
 
   private fireRestoredSelfWake(intent: PersistedWakeIntent): void {
     this.selfWakeTimers.delete(intent.agentName!);
+    if (this.quiesced) return; // retain durable intent for resume/restart admission
+    if (this.selfWakeIntents.get(intent.agentName!) !== intent) return;
     this.selfWakeIntents.delete(intent.agentName!);
     this.tryPersistWakeState('firing restored self-wake');
     const nowIso = new Date(this.now()).toISOString().slice(0, 19) + 'Z';
