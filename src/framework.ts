@@ -1189,6 +1189,9 @@ interface ManagerReinitFailure {
   /** A conversation agent the move emptied that couldn't be seeded again:
    *  disposed, and `error` says why. */
   seedingFailed?: true;
+  /** For a disposal in an undo's or redo's re-initialization: the move whose
+   *  branch its pass judged, which a move joining later doesn't change. */
+  after?: string;
 }
 
 /**
@@ -7782,7 +7785,8 @@ export class AgentFramework {
       throw new OperatorActionError(
         'failed',
         `Cannot redo: the branch this redo returns to, ${branchName}, no longer exists, so that step is dropped` +
-          (dropped > 1 ? `, with the ${dropped - 1} beneath it whose branches are gone too. ` : '. ') +
+          (dropped > 2 ? `, with the ${dropped - 1} beneath it whose branches are gone too. `
+            : dropped === 2 ? ', with the one beneath it, whose branch is gone too. ' : '. ') +
           (redoStack.length > 0
             ? `The step now on top can be redone (${redoStack.length} remaining).`
             : 'No redo steps remain.'),
@@ -8013,20 +8017,26 @@ export class AgentFramework {
    *
    * `moved` says whether a move has joined the pass since it began (an
    * undo's or redo's, under the same reservation). Then the store may no
-   * longer be on the branch a fork was judged on, and a refusal may be the
-   * move's: nothing is written and nothing disposed, since the next pass
-   * judges every fork again on the branch the store is on then.
+   * longer be on the branch a fork was judged on, and a refusal, the
+   * template's included, may be the move's: nothing is written and nothing
+   * disposed, whatever the cause, since the next pass judges every fork
+   * again on the branch the store is on then.
    */
   private async reseedEmptiedForks(failures: ManagerReinitFailure[], except: string | undefined, moved: () => boolean): Promise<void> {
     const router = this.conversationRouter;
     if (!router || this.conversationAgentHomes.size === 0) return;
     const failed = new Set(failures.map((f) => f.agentName));
     const template = this.agents.get(router.templateAgent);
+    // The template's own failure is named here, not by pointing at its alert:
+    // a failure is reported from the last pass only, and a later pass may
+    // find the template re-initialized.
+    const templateFailure = template ? failures.find((f) => f.agentName === template.name) : undefined;
     const templateDown = !template
-      ? `the conversation template agent "${router.templateAgent}" is not registered, so it couldn't be seeded again`
-      : failed.has(template.name)
-        ? `the template ${template.name}'s own context manager failed to re-initialize (its alert names why), so it couldn't be seeded again. ` +
-          `switchBranch() to the current branch, or a restart, re-initializes the template; the channel's next qualifying message then spawns a fork seeded from it`
+      ? `the conversation template agent "${router.templateAgent}" is not registered, so it couldn't be seeded again. ` +
+        `Registering an agent under that name, or configuring the conversation router with a registered template, lets the channel's next qualifying message spawn a fork seeded from it`
+      : templateFailure
+        ? `the template ${template.name}'s own context manager failed to re-initialize (${templateFailure.error}), so it couldn't be seeded again. ` +
+          `If the template still refuses its work, switchBranch() to the current branch, or a restart, re-initializes it; the channel's next qualifying message then spawns a fork seeded from it`
         : null;
     for (const agentName of [...this.conversationAgentHomes.keys()]) {
       if (agentName === except || failed.has(agentName)) continue;
@@ -8045,12 +8055,12 @@ export class AgentFramework {
           }
           continue;
         } catch (error) {
-          if (moved()) continue;
           cause = `seeding it again from the template failed: ${failureDescription(error)}`;
         }
       } else {
         cause = templateDown;
       }
+      if (moved()) continue;
       const channelId = this.conversationAgentHomes.get(agentName);
       if (channelId !== undefined && this.conversationRouter?.getBinding(channelId)?.agentName === agentName) {
         this.conversationRouter.unbind(channelId);
@@ -8063,9 +8073,10 @@ export class AgentFramework {
   /** Say which agents a move left with a manager that refuses its work:
    *  on the console, in failures.log and in an ops alert, one per agent. */
   private reportReinitFailures(after: string, failures: ManagerReinitFailure[]): void {
-    for (const { agentName, error, seedingFailed } of failures) {
-      this.reportReinitFailure(agentName, after, seedingFailed
-        ? `The ${after} moved the store's branch to one where this conversation agent had no messages of its own, ` +
+    for (const { agentName, error, seedingFailed, after: judgedAfter } of failures) {
+      const move = judgedAfter ?? after;
+      this.reportReinitFailure(agentName, move, seedingFailed
+        ? `The ${move} moved the store's branch to one where this conversation agent had no messages of its own, ` +
           `and ${error}. It was disposed and its channel unbound. Its messages stay on the branches that hold them, ` +
           "but no agent reads them again: the channel's next qualifying message spawns a new fork, under a new name, " +
           "so a redo to a branch that holds them doesn't bring this one back."
@@ -8092,8 +8103,10 @@ export class AgentFramework {
   private beginSyncMove(verb: 'undo' | 'redo', agentName: string): { landed(): void; abandon(): void } {
     const running = this.syncMoveReinit;
     if (running) {
-      // Under the running reservation, as reserveStoreForSurgery would check:
-      // every agent sharing the store is idle.
+      // Under the running reservation: every agent sharing the store is idle.
+      // reserveStoreForSurgery's other checks, no turn token and no spawn in
+      // flight, held when it took the reservation and can't change under it,
+      // since the hold refuses turn admission and a spawn waits for the hold.
       const busy = [...this.agents].filter(([, a]) => a.state.status !== 'idle').map(([name, a]) => `${name} is ${a.state.status}`);
       if (busy.length > 0) {
         throw new OperatorActionError(
@@ -8137,8 +8150,12 @@ export class AgentFramework {
         const disposed: ManagerReinitFailure[] = [];
         do {
           state.again = false;
+          // The move this pass judges forks for: a move that joins sets
+          // `again` and changes `after`, and from then on this pass disposes
+          // nothing.
+          const judged = state.after;
           failures = await this.reinitializeManagers(undefined, () => state.again);
-          disposed.push(...failures.filter((f) => f.seedingFailed));
+          disposed.push(...failures.filter((f) => f.seedingFailed).map((f) => ({ ...f, after: judged })));
         } while (state.again);
         failures = [...failures.filter((f) => !f.seedingFailed), ...disposed];
         // No move joins once the last pass is done: an undo or redo made from
