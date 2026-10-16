@@ -62,6 +62,34 @@ describe('non-channel surface classification', () => {
 
 
 describe('surface provenance through the real scheduler', () => {
+  it('[push, tui] chooses the first declared private kind and routes no prose', async () => {
+    const tempDir = mkdtempSync(join(tmpdir(), 'surface-mixed-test-'));
+    const membrane = new MockMembrane();
+    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'OPERATOR-ONLY' }]));
+    const framework = await AgentFramework.create({
+      storePath: join(tempDir, 'store'), membrane: membrane.asMembrane(),
+      agents: [{ name: 'scout', model: 'test-model', systemPrompt: 'scout' }],
+      modules: [new SurfaceModule()],
+    });
+    const i = internals(framework);
+    const routed: Array<{ text: string; locus: string | null }> = [];
+    i.pendingRequests.push({ agentName: 'scout', reason: 'mcpl:push-event', source: 'feeds', timestamp: Date.now() });
+    (framework as unknown as { channelRegistry: unknown }).channelRegistry = new Proxy({
+      getChannelTools: () => [], resolveLocus: () => 'discord:g:lounge',
+      routeSpeech: async (_agent: string, text: string, locus: string | null) => {
+        routed.push({ text, locus }); return { delivered: true, channelId: locus };
+      }, getDescriptor: () => undefined, getDefaultPublishChannel: () => 'discord:g:lounge',
+    }, { get: (target, prop: string) => prop in target ? target[prop as keyof typeof target] : () => undefined });
+    framework.pushEvent({ type: 'external-message', source: 'tui', content: 'private question', metadata: {}, triggerInference: true });
+    await framework.runUntilIdle();
+    assert.deepEqual(routed, []);
+    const routing = (framework as unknown as { turnRouting: Map<string, { nonChannelOrigin?: boolean; locus?: string }> }).turnRouting.get('scout');
+    assert.equal(routing?.nonChannelOrigin, true);
+    assert.equal(routing?.locus, undefined);
+    await framework.stop();
+    rmSync(tempDir, { recursive: true, force: true });
+  });
+
   it('pushEvent carries metadata.channelId onto the turn trigger', async () => {
     const tempDir = mkdtempSync(join(tmpdir(), 'surface-channel-test-'));
     const membrane = new MockMembrane();
