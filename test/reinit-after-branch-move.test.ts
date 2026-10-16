@@ -1033,9 +1033,11 @@ describe('conversation forks and an undo', () => {
     });
   });
 
-  /** Takes the template's next compiles in order: 'throw' fails one, 'hold'
-   *  waits at a gate until `release`, which says whether it then fails. */
-  const holdTemplateCompile = (framework: AgentFramework, calls: Array<'throw' | 'hold'>) => {
+  /** Takes the template's next compiles in order: 'throw' fails one; 'hold'
+   *  waits at a gate until `release`, which says whether it then fails, and
+   *  compiles after it; 'answer' compiles first and then waits at the gate
+   *  with its answer. */
+  const holdTemplateCompile = (framework: AgentFramework, calls: Array<'throw' | 'hold' | 'answer'>) => {
     const cmA = framework.getAgent('a')!.getContextManager();
     const compile = cmA.compile.bind(cmA);
     let entered!: () => void;
@@ -1046,6 +1048,12 @@ describe('conversation forks and an undo', () => {
     (cmA as unknown as { compile: typeof compile }).compile = async (...args: Parameters<typeof compile>) => {
       const call = calls.shift();
       if (call === 'throw') throw new Error('injected template compile failure');
+      if (call === 'answer') {
+        const answer = await compile(...args);
+        entered();
+        await gate;
+        return answer;
+      }
       if (call === 'hold') {
         entered();
         await gate;
@@ -1060,21 +1068,29 @@ describe('conversation forks and an undo', () => {
     };
   };
 
-  for (const outcome of ['answers', 'throws'] as const) {
-    it(`a redo that joins while a fork is being seeded again writes nothing to the branch it lands on, and disposes nothing (the template's compile ${outcome})`, { timeout: 30_000 }, async () => {
+  // The redo lands while the pass waits on the template's compile: after the
+  // compile answered on the branch the pass judged, before a compile that
+  // then runs on the branch the redo landed on, and before one that fails.
+  const joinedSeeds = [
+    { compile: 'answered before the move', call: 'answer', throws: false },
+    { compile: 'runs after the move', call: 'hold', throws: false },
+    { compile: 'throws after the move', call: 'hold', throws: true },
+  ] as const;
+  for (const joined of joinedSeeds) {
+    it(`a redo that joins while a fork is being seeded again writes nothing to the branch it lands on, and disposes nothing (the template's compile ${joined.compile})`, { timeout: 30_000 }, async () => {
       await withForks('reinit-fork-joined-', async (framework, internals) => {
         await forksAroundACheckpoint(framework, internals);
         const alerts: string[] = [];
         framework.onTrace((event) => {
           if (event.type === 'ops:alert') alerts.push((event as unknown as { agentName: string }).agentName);
         });
-        const held = holdTemplateCompile(framework, ['hold']);
+        const held = holdTemplateCompile(framework, [joined.call]);
         try {
           assert.equal(framework.undoLastTurn('a').undone, true);
           const running = internals.syncMoveReinit!;
           await held.reached; // the pass is seeding a-late-g1, inside the template's compile
           assert.equal(framework.redo('a').redone, true, 'the redo joins the running re-initialization');
-          held.release({ throws: outcome === 'throws' });
+          held.release({ throws: joined.throws });
           await running.done;
         } finally {
           held.restore();
