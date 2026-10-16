@@ -4678,10 +4678,9 @@ export class AgentFramework {
         ...(opts?.force && failing.length > 0 ? { forced: true } : {}),
         releasedRequests,
       });
-      // NOTE: parked wakes and gate buffers are in-memory only — a restart
-      // mid-quiesce boots quiesced but with these queues empty (sources like
-      // heartbeats re-deliver on their own cadence; one-shot wakes are lost).
-      // Deferred context WRITES are persisted while quiesced and survive.
+      // NOTE: ordinary parked wakes and gate buffers are in-memory only. Durable
+      // sleep/self-wake intents restore from their journal and are admitted here;
+      // recurring sources re-deliver on cadence. Deferred writes also survive.
       console.error(this.queue?.isClosed
         ? `[host-mode] resumed — ${releasedRequests} parked wake(s) won't run because the framework is stopping`
         : `[host-mode] resumed — ${releasedRequests} parked wake(s) released`);
@@ -18335,8 +18334,8 @@ export class AgentFramework {
     };
 
     if (call.name === 'wake') {
-      const was = gate.clearSleep();
-      finish({ success: true, data: { woke: was } });
+      const { woke, durable } = gate.clearSleep();
+      finish({ success: true, data: { woke, durable } });
       return;
     }
 

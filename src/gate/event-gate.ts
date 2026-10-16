@@ -546,6 +546,8 @@ interface PersistedWakeIntent {
   suppressed?: number;
 }
 
+/** Durable wake journal. At-most-once recovery holds while journal writes succeed;
+ * a failed deletion can replay an intent after restart. */
 interface PersistedWakeState {
   version: 1;
   sleep?: PersistedWakeIntent;
@@ -1825,7 +1827,7 @@ export class EventGate {
   }
 
   /** End sleep immediately. Returns true if the agent was asleep. */
-  clearSleep(): boolean {
+  clearSleep(): { woke: boolean; durable: boolean } {
     const hadIntent = this.sleepUntil > 0;
     const wasAsleep = this.sleepUntil > this.now();
     this.sleepUntil = 0;
@@ -1833,8 +1835,8 @@ export class EventGate {
     this.sleepNote = undefined;
     this.sleepAgent = undefined;
     if (this.sleepTimer) { clearTimeout(this.sleepTimer); this.sleepTimer = null; }
-    if (hadIntent) this.tryPersistWakeState('clearing sleep');
-    return wasAsleep;
+    const durable = !hadIntent || this.tryPersistWakeState('clearing sleep');
+    return { woke: wasAsleep, durable };
   }
 
   /**
@@ -2016,7 +2018,7 @@ export class EventGate {
         const note = item.intent.note ? ` Note: ${item.intent.note}` : '';
         this.addMessageFn('user', [{ type: 'text', text:
           `[wake-recovery] your ${item.kind === 'self-wake' ? item.intent.source : item.kind} wake ` +
-          `scheduled for ${new Date(item.intent.wakeAt).toISOString()} became overdue while the host was offline by ${overdueMs}ms.${note}` }],
+          `scheduled for ${new Date(item.intent.wakeAt).toISOString()} became overdue while the host was offline or quiesced by ${overdueMs}ms.${note}` }],
           { source: 'gate:wake-recovery', kind: item.kind }, target);
         if (!woken.has(target)) {
           this.requestInferenceFn(target, `wake intent recovery${item.intent.note ? `: ${item.intent.note}` : ''}`, 'wake-recovery');
