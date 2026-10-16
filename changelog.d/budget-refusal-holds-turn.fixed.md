@@ -42,6 +42,7 @@
     the held turn ends, up to 30 minutes later, rather than as exhausted
     within seconds. New traces `inference:held` and `inference:hold_ended`,
     and `healthSnapshot()` gives each agent's `budgetHold` (or null). The
-    `context-refusal` ops alert is raised when the hold starts, at most once
-    per 15 minutes for an agent, and says the turn is held until its
-    deadline. A hold's drain kicks log as `[budget-hold]`.
+    `context-refusal` ops alert goes out when the hold starts (its
+    `ops:alert` trace each time, its webhook post at most once per 15 minutes
+    for an agent), and says the turn is held until its deadline. A hold's
+    drain kicks log as `[budget-hold]`.

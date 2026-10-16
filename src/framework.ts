@@ -1096,9 +1096,9 @@ const PROVIDER_ACCELERATION_JITTER_MS = 5_000;
  *  working and never makes the context fit, and one that is pending but
  *  can't move: a merge behind a compression hold, a compression model that
  *  keeps failing and being retried, the speculative cap. The operator hears
- *  of either from the context-refusal alert at each hold's start, at most
- *  once per 15 minutes. A fixed bound rather than an option: no host has
- *  needed another. */
+ *  of either from the context-refusal alert at each hold's start, whose
+ *  webhook post goes at most once per 15 minutes for an agent. A fixed bound
+ *  rather than an option: no host has needed another. */
 const BUDGET_HOLD_MS = 30 * 60_000;
 /** How a budget hold ended: its context fits now; its check failed for
  *  another reason, which the turn's own compile then meets; its deadline
