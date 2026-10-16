@@ -158,7 +158,12 @@ async function withBacklog<T>(backlog: Partial<Backlog>, run: (b: Backlog) => Pr
       b.previewError = undefined;
       throw error;
     }
-    return b.previewless ? null : { fits: fits(b) };
+    if (b.previewless) return null;
+    // As context-manager's preview does: an over-budget plan answers
+    // fits: false, and any other refusal, a context refusal among them, is
+    // rethrown.
+    if (!fits(b) && refusalName !== 'OverBudgetError') throw overBudget();
+    return { fits: fits(b) };
   };
   proto.tick = async function () { b.ticks++; };
   proto.isReady = function () { return !pending(b); };
@@ -1023,7 +1028,9 @@ describe('a compile refused for budget holds its turn (#304)', () => {
   });
 
   it('holds a context refusal as it holds an over-budget one', async () => {
-    await withBacklog({ fitAt: 12, refusalName: 'UncoveredDropError' }, async () => {
+    // 40 ticks, past the pass at start and the hold's first kick: the release
+    // check looks while the context still doesn't fit.
+    await withBacklog({ fitAt: 40, refusalName: 'UncoveredDropError' }, async () => {
       const t = await residentTurn({ maintenanceIntervalMs: 50 });
       try {
         t.send('Are you there?');
@@ -1447,7 +1454,7 @@ describe('the release check takes context-manager\'s verdict on the real strateg
    * model). The verdict's path, the preview and both compiles, is the
    * strategy's own, unpatched.
    */
-  async function realResident(adaptiveResolution: boolean) {
+  async function realResident(adaptiveResolution: boolean, withStrategy?: (strategy: AutobiographicalStrategy) => void) {
     const proto = ContextManager.prototype as unknown as {
       tick: () => Promise<void>; previewContext: (...args: unknown[]) => unknown; compile: (...args: unknown[]) => unknown;
     };
@@ -1470,12 +1477,14 @@ describe('the release check takes context-manager\'s verdict on the real strateg
     const tempDir = mkdtempSync(join(tmpdir(), 'budget-hold-real-'));
     const membrane = new SequentialStreamMembrane();
     membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Answered once it fit' }]));
+    const strategy = new AutobiographicalStrategy({ adaptiveResolution, targetChunkTokens: 300, recentWindowTokens: 400 });
+    withStrategy?.(strategy);
     const framework = await AgentFramework.create({
       storePath: join(tempDir, 'store'),
       membrane: membrane.asMembrane(),
       agents: [{
         name: 'prime', model: 'test-model', systemPrompt: 'You are prime.', contextBudgetTokens: 400_000, maxTokens: 1_000,
-        strategy: new AutobiographicalStrategy({ adaptiveResolution, targetChunkTokens: 300, recentWindowTokens: 400 }),
+        strategy,
       }],
       modules: [],
       syncIntervalMs: 0,
@@ -1496,6 +1505,7 @@ describe('the release check takes context-manager\'s verdict on the real strateg
       preview: (maxTokens: number) => (cm as unknown as {
         previewContext: (b: { maxTokens: number; reserveForResponse: number }) => { fits: boolean; finalTokens: number; budgetTokens: number };
       }).previewContext(budget(maxTokens)),
+      addMessage: (text: string) => cm.addMessage('User', [{ type: 'text', text }]),
       dryCompileResolves: (maxTokens: number) => cm.compile(budget(maxTokens), undefined, { dryRun: true } as never).then(() => true, () => false),
       setBudget: (tokens: number) => framework.updateAgentRuntimeSettings('prime', { contextBudgetTokens: tokens, immediate: true }, { allowInfeasible: true }),
       wake: () => (framework as unknown as { pendingRequests: unknown[] }).pendingRequests.push({
@@ -1555,6 +1565,47 @@ describe('the release check takes context-manager\'s verdict on the real strateg
       assert.ok(await pollUntil(() => storedText(t.framework).includes('Answered once it fit'), 5_000), 'that budget releases it');
       assert.deepEqual(t.of('inference:hold_ended').map((e) => e.outcome), ['fit']);
       assert.ok(JSON.stringify(t.membrane.calls[0]).includes('[budget-hold]'), 'and its compile carries the note');
+    } finally {
+      await t.close();
+    }
+  });
+
+  it('holds a context refusal once on the preview path, and runs the turn once the refusal clears', async () => {
+    // Beth-2389's probe, kept as a test. A coverage defect in the strategy's
+    // emission, one emitted entry left out while `drop` is set, makes its
+    // coverage check refuse every select with UncoveredDropError: the
+    // committing compile's and the preview's alike. Context-manager's preview
+    // rethrows that refusal rather than answering fits: false.
+    let drop = true;
+    const t = await realResident(true, (strategy) => {
+      const s = strategy as unknown as { mergeAdjacentBodyGroupRaw: (...args: unknown[]) => unknown[] };
+      const merge = s.mergeAdjacentBodyGroupRaw.bind(strategy);
+      s.mergeAdjacentBodyGroupRaw = (...args: unknown[]) => {
+        const out = merge(...args);
+        if (drop && out.length > 2) out.splice(1, 1);
+        return out;
+      };
+    });
+    try {
+      assert.throws(() => t.preview(400_000), (e: unknown) => (e as { name?: string }).name === 'UncoveredDropError',
+        'the preview rethrows the context refusal');
+      t.framework.start();
+      t.wake();
+      assert.ok(await pollUntil(() => t.of('inference:held').length === 1, 5_000));
+      assert.equal(t.of('inference:held')[0]!.errorType, 'context_refusal');
+      // Four changes the hold looks again for, a message each.
+      for (let i = 0; i < 4; i++) {
+        t.addMessage(`later ${i}`);
+        await new Promise((r) => setTimeout(r, 300));
+      }
+      assert.equal(t.of('inference:held').length, 1, 'held once while the refusal stands');
+      assert.deepEqual(t.of('inference:hold_ended'), []);
+      assert.equal(t.of('ops:alert').filter((e) => e.kind === 'context-refusal').length, 1);
+      assert.equal(t.membrane.calls.length, 0);
+      drop = false;
+      t.addMessage('after the defect');
+      assert.ok(await pollUntil(() => storedText(t.framework).includes('Answered once it fit'), 5_000), 'the turn runs once the refusal clears');
+      assert.deepEqual(t.of('inference:hold_ended').map((e) => e.outcome), ['fit']);
     } finally {
       await t.close();
     }
