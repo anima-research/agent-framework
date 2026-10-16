@@ -8825,6 +8825,8 @@ export class AgentFramework {
               ephemeralSystemPrompt: this.activeTurnTriggers.get(agent.name)?.ephemeralSystemPrompt,
               silentHeartbeat: this.activeTurnTriggers.get(agent.name)?.silentHeartbeat,
               nonChannelOrigin: this.activeTurnTriggers.get(agent.name)?.nonChannelOrigin,
+              channelId: this.activeTurnTriggers.get(agent.name)?.channelId,
+              addressed: this.activeTurnTriggers.get(agent.name)?.addressed,
             });
           } else if (currentState.stream) {
             // What this round appends is in the next call's prompt. If that
