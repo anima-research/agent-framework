@@ -18,9 +18,9 @@
     and every surgery, undo and redo. It looks again only once something that
     could make the context fit has changed: compression's progress (for a
     strategy that reports none, whether it still has compression pending), a
-    message added, edited or removed, its runtime settings, or a surgery on
-    the store. A turn released and refused again is held again with its first
-    deadline, and isn't released again until one of those changes.
+    message added, edited or removed, the agent's runtime settings, or a
+    surgery on the store. A turn released and refused again is held again with
+    its first deadline, and isn't released again until one of those changes.
   - **When it ends without running:** 30 minutes after the refusal that
     started it, or at once when compression has nothing pending, and the turn
     then fails as a refused compile did, its reason saying when it was first
