@@ -653,7 +653,15 @@ describe('a compile refused for budget holds its turn (#304)', () => {
         assert.ok(hold, 'the status names the hold');
         assert.equal(hold!.errorType, 'over_budget');
         assert.equal(hold!.heldRequests, 1);
+        // The hold's first kick looks once when it ends. Only after that look
+        // does the context fit, so the look that releases the turn is the
+        // surgery's.
+        assert.ok(await pollUntil(() => backlog.previews >= 1, 3_000), 'the hold has looked once, after its first kick');
+        await new Promise((r) => setTimeout(r, 100));
+        const previews = backlog.previews;
         backlog.fit = true;
+        await new Promise((r) => setTimeout(r, 100));
+        assert.equal(backlog.previews, previews, 'nothing looks again before the surgery');
         await t.framework.switchBranch('main');
         assert.ok(await pollUntil(() => storedText(t.framework).includes('Answered once it fit'), 3_000),
           'the surgery brought the release check forward');
