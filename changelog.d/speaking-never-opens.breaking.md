@@ -11,6 +11,10 @@
     send tool's answer, for routed speech the turn's `[delivered]` line, or in `explicit` routing
     mode, which has no such line, a line of its own at the turn's end, says that the channel stays
     closed, that messages addressing the agent still reach it, and that `channel_open` opens it.
+    So does the `sleep` tool's result (`closedChannelNote`) when its announcement goes to such a
+    channel, decided from the channel as the announcement goes out, and that announcement's
+    default words there become "I'll still see messages addressed to me, but won't respond until I
+    wake."
     The agent turns that note off for good with `agent_settings`' new `closed_channel_note`, which
     is on by default. A channel counts as a DM when the registry knows it as one (a
     `channelType: 'dm'` descriptor, a `:dm:` id or a `DM: ` label), and a `send_dm`'s answer never

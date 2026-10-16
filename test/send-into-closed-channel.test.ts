@@ -44,6 +44,7 @@ async function harness() {
   let sentTo = '444555';
   // While set, the server refuses the send, as discord-mcpl does without Send Messages.
   let refuseSends = false;
+  const published: Array<{ channelId: string; text: string }> = [];
   const server = {
     id: 'discord',
     grant: new CapabilityGrant(new Set(ALL_CAPABILITY_PATHS), []),
@@ -62,6 +63,11 @@ async function harness() {
     },
     async sendChannelsClose() {
       return {};
+    },
+    // What routed speech, such as a sleep announcement, posts.
+    async sendChannelsPublish(params: { channelId: string; content: Array<{ text: string }> }) {
+      published.push({ channelId: params.channelId, text: params.content[0]!.text });
+      return { delivered: true };
     },
   };
   const serverRegistry = {
@@ -125,7 +131,7 @@ async function harness() {
   }
 
   return {
-    registry, framework, opens, windowMessages, reply,
+    registry, framework, opens, windowMessages, reply, published,
     setRefuseOpens: (v: boolean) => { refuseOpens = v; },
     setHold: (p: Promise<void> | null) => { hold = p; },
     setSentTo: (raw: string) => { sentTo = raw; },
@@ -427,4 +433,80 @@ test("closed_channel_note is an agent_settings key, kept in the framework's stat
     await framework.stop();
     rmSync(dir, { recursive: true, force: true });
   }
+});
+
+test("a sleep announced into a closed channel says only what addresses the agent reaches it, and the result carries the note", async () => {
+  const { registry, framework, published } = await harness();
+  await registry.handleChanged('discord', {
+    added: [{ id: 'discord:dm:777', type: 'discord', label: 'Tess', direction: 'bidirectional',
+      address: { channelId: '777' }, metadata: { channelType: 'dm' } }],
+  } as never);
+  framework.eventGate = { setSleep: (seconds: number) => ({ until: Date.parse('2026-10-16T04:00:00Z') + seconds * 1000 }) };
+  framework.activeTurnTriggers = new Map();
+  framework.timeZone = 'UTC';
+  const routing = framework.turnRouting.get('sol');
+  /** One sleep call, as the agent makes it; its result once the posts it started have run. */
+  const sleep = async (input: Record<string, unknown>) => {
+    const result = await new Promise<{ success: boolean; data: Record<string, unknown>; endTurn?: boolean }>((resolve) => {
+      framework.pushEvent = (event: { type: string; callId?: string; result: never }) => {
+        if (event.type === 'tool-result' && event.callId === 'call-sleep') resolve(event.result);
+      };
+      framework.dispatchSleepToolCall('sol', { id: 'call-sleep', name: 'sleep', input });
+    });
+    await new Promise((resolve) => setImmediate(resolve));
+    return result;
+  };
+  const quiet = "💤 Going quiet for 10m. I'll still see messages, but won't respond until I wake.";
+  const addressed = "💤 Going quiet for 10m. I'll still see messages addressed to me, but won't respond until I wake.";
+
+  // The turn's locus is the closed #upkeep.
+  routing.locus = channelId;
+  let slept = await sleep({ seconds: 600 });
+  assert.equal(slept.success, true);
+  assert.equal(slept.endTurn, true);
+  assert.equal(slept.data.closedChannelNote, UPKEEP_NOTE);
+  assert.deepEqual(published.splice(0), [{ channelId, text: addressed }]);
+
+  // The agent's own words are posted as they are, and the note still comes.
+  slept = await sleep({ seconds: 600, message: 'back soon' });
+  assert.equal(slept.data.closedChannelNote, UPKEEP_NOTE);
+  assert.deepEqual(published.splice(0), [{ channelId, text: 'back soon' }]);
+
+  // With the note turned off, the announcement still says what reaches the agent.
+  framework.closedChannelNoteSettingsExtension().update('sol', { closed_channel_note: false });
+  slept = await sleep({ seconds: 600 });
+  assert.equal(slept.data.closedChannelNote, undefined);
+  assert.deepEqual(published.splice(0), [{ channelId, text: addressed }]);
+  framework.closedChannelNoteSettingsExtension().reset('sol');
+
+  // A DM, and an open channel: every message still reaches the agent, and no note.
+  routing.locus = 'discord:dm:777';
+  slept = await sleep({ seconds: 600 });
+  assert.equal(slept.data.closedChannelNote, undefined);
+  assert.deepEqual(published.splice(0), [{ channelId: 'discord:dm:777', text: quiet }]);
+  assert.equal((await registry.handleChannelToolCall('channel_open', { channelId }, origin)).success, true);
+  routing.locus = channelId;
+  slept = await sleep({ seconds: 600 });
+  assert.equal(slept.data.closedChannelNote, undefined);
+  assert.deepEqual(published.splice(0), [{ channelId, text: quiet }]);
+  assert.equal((await registry.handleChannelToolCall('channel_close', { channelId }, origin)).success, true);
+
+  // A locus the registry doesn't know: the post fails, as before, and there's no note.
+  routing.locus = 'discord:g1:999999';
+  slept = await sleep({ seconds: 600 });
+  assert.equal(slept.data.closedChannelNote, undefined);
+  routing.locus = channelId;
+
+  // No announcement, no note: one turned off, and explicit mode with no target this turn.
+  slept = await sleep({ seconds: 600, announce: false });
+  assert.equal(slept.data.closedChannelNote, undefined);
+  framework.agents.set('sol', { proseRouting: 'explicit' });
+  slept = await sleep({ seconds: 600 });
+  assert.equal(slept.data.closedChannelNote, undefined);
+  assert.deepEqual(published, [], 'nothing was posted');
+  // Explicit mode announces to the turn's target, with the note.
+  routing.pin = channelId;
+  slept = await sleep({ seconds: 600 });
+  assert.equal(slept.data.closedChannelNote, UPKEEP_NOTE);
+  assert.deepEqual(published.splice(0), [{ channelId, text: addressed }]);
 });

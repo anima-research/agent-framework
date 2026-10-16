@@ -18538,8 +18538,9 @@ export class AgentFramework {
     // Announce in the TURN's frozen locus (best-effort; never blocks the
     // result). The sleep tool runs mid-turn, so the pin is live — same
     // authority as every other speech path, no live re-resolution.
+    // `destination` stays undefined where nothing is posted.
+    let destination: string | null | undefined;
     if (announce && this.channelRegistry) {
-      const text = input.message ?? `💤 Going quiet for ${human}. I'll still see messages, but won't respond until I wake.`;
       const agent = this.agents.get(agentName);
       const silentTurn = this.activeTurnTriggers.get(agentName)?.suppressProse === true;
       if (silentTurn || agent?.proseRouting === 'disabled') {
@@ -18547,20 +18548,35 @@ export class AgentFramework {
       } else if (agent?.proseRouting === 'explicit') {
         // Explicit mode: announce to the turn's sticky prose target if the
         // model has set one; otherwise stay quiet — never guess a channel.
-        const target = this.turnRouting.get(agentName)?.pin;
-        if (target) {
-          this.channelRegistry.routeSpeech(agentName, text, target).catch((err) => {
-            console.error('[sleep] announce failed:', err instanceof Error ? err.message : err);
-          });
-        } else {
+        destination = this.turnRouting.get(agentName)?.pin;
+        if (!destination) {
           console.error(`[sleep] ${agentName}: no prose target this turn — sleep announcement not posted (explicit mode never guesses)`);
         }
       } else {
-        const locus = this.turnRouting.get(agentName)?.locus ?? null;
-        this.channelRegistry.routeSpeech(agentName, text, locus).catch((err) => {
-          console.error('[sleep] announce failed:', err instanceof Error ? err.message : err);
-        });
+        destination = this.turnRouting.get(agentName)?.locus ?? null;
       }
+    }
+    // Speaking never opens a channel, so in a closed one that isn't a DM the
+    // announcement says that only messages addressed to the agent reach it,
+    // and the result carries the closed-channel note, as a send's answer does.
+    // Both are decided from the channel as the announcement goes out: neither
+    // depends on the post landing, which stays fire-and-forget.
+    let closedChannelNote: string | undefined;
+    let staysClosed = false;
+    if (destination && this.channelRegistry?.getDescriptor(destination)) {
+      [closedChannelNote] = this.closedChannelNotes(agentName, [destination]);
+      try {
+        staysClosed = this.closedChannelNoteFor(destination, null) !== undefined;
+      } catch (err) {
+        console.error(`[sleep] ${agentName}: whether ${destination} stays closed couldn't be read: ${err instanceof Error ? err.message : String(err)}`);
+      }
+    }
+    if (destination !== undefined) {
+      const text = input.message ??
+        `💤 Going quiet for ${human}. I'll still see messages${staysClosed ? ' addressed to me' : ''}, but won't respond until I wake.`;
+      this.channelRegistry!.routeSpeech(agentName, text, destination).catch((err) => {
+        console.error('[sleep] announce failed:', err instanceof Error ? err.message : err);
+      });
     }
 
     console.error(`[sleep] agent=${agentName} seconds=${seconds} announce=${announce} until=${new Date(until).toISOString()}`);
@@ -18572,6 +18588,9 @@ export class AgentFramework {
         until,
         untilLocal: formatZonedDateTime(until, this.timeZone),
         timeZone: this.timeZone,
+        ...(closedChannelNote
+          ? { closedChannelNote: `[closed channel] ${closedChannelNote} ${AgentFramework.CLOSED_CHANNEL_NOTE_OFF}` }
+          : {}),
       },
       endTurn: true,
     });
