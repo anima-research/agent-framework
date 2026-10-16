@@ -1090,15 +1090,17 @@ const PROVIDER_ACCELERATION_MAX_COOLDOWN_MS = 10 * 60_000;
 const PROVIDER_ACCELERATION_JITTER_MS = 5_000;
 /** How long a turn whose compile was refused for budget waits for compression
  *  to make its context fit (#304). In the incident that asked for the hold,
- *  compression took 7 minutes from the first refusal to a fit, so 30 minutes
- *  leaves a large backlog room. A hold ends sooner only when compression has
- *  nothing pending (checkBudgetHold). So this bounds a compression that keeps
- *  working and never makes the context fit, and one that is pending but
- *  can't move: a merge behind a compression hold, a compression model that
- *  keeps failing and being retried, the speculative cap. The operator hears
- *  of either from the context-refusal alert at each hold's start, whose
- *  webhook post goes at most once per 15 minutes for an agent. A fixed bound
- *  rather than an option: no host has needed another. */
+ *  compression finished about 7 minutes after the first refusal, so 30
+ *  minutes leaves a large backlog room. Short of the bound, a hold ends
+ *  without a fit only when compression has nothing pending (checkBudgetHold)
+ *  or at a stop. So this bounds a compression that keeps working and never
+ *  makes the context fit, and one that is pending but can't move, such as a
+ *  merge behind a compression hold, a compression model that keeps failing
+ *  and being retried, or the speculative cap (R1-3 of #361's review). The
+ *  operator hears of either from the context-refusal alert at each hold's
+ *  start, whose webhook post goes at most once per 15 minutes for an agent.
+ *  A fixed bound, with no option and no stall rule: the alert tells the
+ *  operator, and the bound ends the wait. */
 const BUDGET_HOLD_MS = 30 * 60_000;
 /** How a budget hold ended: its context fits now; its check failed for
  *  another reason, which the turn's own compile then meets; its deadline
