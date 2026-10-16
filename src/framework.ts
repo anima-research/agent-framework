@@ -665,7 +665,7 @@ function freshTurnRouting(): TurnRouting {
  * open, or a server without `channels.publish`), when it throws or times
  * out, or when the server reports it undelivered (`delivered: false`).
  */
-type SpeechPublished = (channelId: string, text: string) => void;
+type SpeechPublished = (channelId: string, text: string, messageId: string | undefined) => void;
 
 /** How a round's prose is delivered: kept private, and under which turn's routing. */
 interface ProseRound {
@@ -11319,7 +11319,7 @@ export class AgentFramework {
           if (outcome?.delivered) {
             this.proseBounceStreaks.delete(agent.name);
             if (usedClipboard) this.proseClipboards.delete(agent.name);
-            onPublished?.(outcome.channelId, body);
+            onPublished?.(outcome.channelId, body, outcome.messageId);
           } else {
             delete routing.pin;
             routing.hybridHold = true;
@@ -11351,7 +11351,7 @@ export class AgentFramework {
       try {
         const outcome = await this.channelRegistry!.routeSpeech(agent.name, envelope, target);
         this.recordProseDelivery(routing, outcome);
-        if (outcome?.delivered) onPublished?.(outcome.channelId, envelope);
+        if (outcome?.delivered) onPublished?.(outcome.channelId, envelope, outcome.messageId);
       } catch (err) {
         console.error('hybrid locus delivery failed:', err);
       }
@@ -11431,7 +11431,7 @@ export class AgentFramework {
       if (result?.delivered) {
         this.proseBounceStreaks.delete(name);
         if (usedClipboard) this.proseClipboards.delete(name);
-        round.onPublished?.(result.channelId, body);
+        round.onPublished?.(result.channelId, body, result.messageId);
       }
     } catch (err) {
       console.error(`[prose] ${name}: delivery to ${targetChannel} failed:`, err);
@@ -12307,7 +12307,7 @@ export class AgentFramework {
     const outgoingText = new Map<string, string>();
     // Set once the stream's `complete` has gone: no chunk follows it.
     let outgoingCompleted = false;
-    const streamSpeech: SpeechPublished = (channelId, text) => {
+    const streamSpeech: SpeechPublished = (channelId, text, messageId) => {
       if (outgoingCompleted) return;
       // A later publish to the same channel is another message: a paragraph
       // break keeps the two apart for a consumer that joins the chunks, so a
@@ -12324,6 +12324,7 @@ export class AgentFramework {
         inferenceId: outgoingInferenceId,
         index,
         text: delta,
+        ...(messageId !== undefined ? { messageId } : {}),
       });
     };
     // Spec 14.3: the stream's end for each channel it streamed to, with
@@ -12354,7 +12355,7 @@ export class AgentFramework {
       chainSpeech(async () => {
         const outcome = await this.channelRegistry!.routeSpeech(agent.name, text, locus);
         this.recordProseDelivery(streamRouting, outcome);
-        if (outcome?.delivered) streamSpeech(outcome.channelId, text);
+        if (outcome?.delivered) streamSpeech(outcome.channelId, text, outcome.messageId);
       }, 'mid-turn speech routing failed:');
     };
 
@@ -13209,7 +13210,7 @@ export class AgentFramework {
                   try {
                     const outcome = await this.channelRegistry.routeSpeech(agent.name, speechText, locus);
                     this.recordProseDelivery(streamRouting, outcome);
-                    if (outcome?.delivered) streamSpeech(outcome.channelId, speechText);
+                    if (outcome?.delivered) streamSpeech(outcome.channelId, speechText, outcome.messageId);
                   } catch (err) {
                     console.error('speech routing failed:', err);
                   }
@@ -13301,7 +13302,7 @@ export class AgentFramework {
                   try {
                     const outcome = await this.channelRegistry.routeSpeech(agent.name, seg, locus);
                     this.recordProseDelivery(streamRouting, outcome);
-                    if (outcome?.delivered) streamSpeech(outcome.channelId, seg);
+                    if (outcome?.delivered) streamSpeech(outcome.channelId, seg, outcome.messageId);
                   } catch (err) {
                     console.error('speech routing failed:', err);
                   }

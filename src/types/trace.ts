@@ -184,7 +184,8 @@ export type TraceEvent =
        * id, index or end: routeSpeech's once delivered, the `sleep` tool's
        * announcement among them, and a subconscious's `speak_in_channel` as
        * it is sent, before its outcome is known. A relay that voices speech
-       * takes one of the two, not both.
+       * takes one of the two, not both, and a relay that edits what it voiced
+       * takes the message's id from this trace's `messageId`.
        */
       type: 'inference:published';
       agentName: string;
@@ -195,6 +196,10 @@ export type TraceEvent =
       /** Increases by one per chunk of the stream, across its channels. */
       index: number;
       text: string;
+      /** The id the channel's server returned for this chunk's publish
+       *  (`ChannelsPublishResult.messageId`); absent when it returned none.
+       *  Each chunk is one publish, so each carries its own. */
+      messageId?: string;
     })
   | (TraceEventBase & {
       /**

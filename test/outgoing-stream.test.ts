@@ -105,6 +105,8 @@ function registry(framework: AgentFramework, options: { streaming?: boolean } = 
   const holds = new Map<string, Promise<void>>();
   /** A publish of one of these texts fails: the server reports it undelivered (`delivered: false`), or it throws. */
   const fails = new Map<string, 'undelivered' | 'throw'>();
+  /** A publish of one of these texts is answered with this message id, as a server that returns one. */
+  const messageIds = new Map<string, string>();
   const known: Record<string, string> = { '#alpha': 'chan-alpha', '#cafe': 'chan-cafe', '@laria': 'discord:dm:99' };
   let stopped = false;
   const target: Record<string, unknown> = {
@@ -116,7 +118,8 @@ function registry(framework: AgentFramework, options: { streaming?: boolean } = 
       await holds.get(body);
       const failure = fails.get(body);
       if (failure === 'throw') throw new Error('synthetic publish failure');
-      return { delivered: failure === undefined, channelId };
+      const messageId = messageIds.get(body);
+      return { delivered: failure === undefined, channelId, ...(messageId !== undefined ? { messageId } : {}) };
     },
     sendOutgoingChunk: (channelId: string, _agent: string, inferenceId: string, index: number, delta: string) => {
       if (stopped) return;
@@ -151,6 +154,7 @@ function registry(framework: AgentFramework, options: { streaming?: boolean } = 
     log,
     holds,
     fails,
+    messageIds,
     chunks: () => log.filter((e): e is Extract<Logged, { kind: 'chunk' }> => e.kind === 'chunk'),
     publishes: () => log.filter((e) => e.kind === 'publish').map((e) => ({ channelId: e.channelId, text: e.text })),
     completes: () => log.filter((e): e is Extract<Logged, { kind: 'complete' }> => e.kind === 'complete'),
@@ -168,11 +172,16 @@ async function harness(scripts: NormalizedResponse[][], config: Partial<AgentCon
     ...(options.gate ? { gate: { configPath: join(dir, 'gate.json') } } : {}),
   });
   const stub = registry(framework, options);
-  const traces: Array<{ type: string; channelId: string; text: string; inferenceId: string; index?: number }> = [];
+  const traces: Array<{ type: string; channelId: string; text: string; inferenceId: string; index?: number; messageId?: string }> = [];
   framework.onTrace((event) => {
     if (event.type === 'inference:published' || event.type === 'inference:published_complete') {
       const { type, channelId, text: body, inferenceId } = event;
-      traces.push({ type, channelId, text: body, inferenceId, ...(event.type === 'inference:published' ? { index: event.index } : {}) });
+      traces.push({
+        type, channelId, text: body, inferenceId,
+        ...(event.type === 'inference:published' ? { index: event.index } : {}),
+        // Kept whenever the key is there, so a trace that carries it as undefined shows.
+        ...('messageId' in event ? { messageId: event.messageId } : {}),
+      });
     }
   });
   /**
@@ -656,6 +665,32 @@ const failedPublishCases: Array<{ name: string; mode: 'locus' | 'hybrid' | 'expl
   { name: 'explicit mid-turn', mode: 'explicit', script: () => [round(text('>>#alpha lost'), call('one', 'test--read')), final(text('>>#cafe kept'))], lost: 'lost', kept: 'kept' },
   { name: 'explicit text-only', mode: 'explicit', script: () => [final(text('>>#alpha lost'))], lost: 'lost' },
 ];
+// The id a server returns for a publish rides on that publish's trace, on every delivery path.
+for (const c of failedPublishCases) {
+  test(`${c.name}: each published trace carries the message id its server returned for that publish`, async () => {
+    const h = await harness([c.script()], { proseRouting: c.mode });
+    const ids = new Map<string, string>([[c.lost, 'msg-1'], ...(c.kept ? [[c.kept, 'msg-2'] as [string, string]] : [])]);
+    for (const [body, id] of ids) h.messageIds.set(body, id);
+    try {
+      await h.run();
+      const published = h.traces.filter((t) => t.type === 'inference:published');
+      const bodyOf = (t: { text: string }) => t.text.replace(/^\n\n/, '');
+      assert.deepEqual(published.map(bodyOf).sort(), [...ids.keys()].sort(), 'each publish streamed once');
+      for (const t of published) assert.equal(t.messageId, ids.get(bodyOf(t)), `"${bodyOf(t)}" carries its own publish's id`);
+    } finally { await h.framework.stop(); }
+  });
+}
+
+test('a published trace carries no message id when the server returned none', async () => {
+  const h = await harness([[round(text('first'), call('one', 'test--read')), final(text('second'))]]);
+  try {
+    await h.run();
+    const published = h.traces.filter((t) => t.type === 'inference:published');
+    assert.equal(published.length, 2, 'both publishes streamed');
+    assert.ok(published.every((t) => !('messageId' in t)), 'no id came back, so the traces carry none');
+  } finally { await h.framework.stop(); }
+});
+
 for (const c of failedPublishCases) {
   for (const failure of ['undelivered', 'throw'] as const) {
     test(`${c.name}: a publish that ${failure === 'throw' ? 'throws' : 'the server reports undelivered'} streams nothing`, async () => {
