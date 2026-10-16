@@ -1149,6 +1149,53 @@ describe('conversation forks and an undo', () => {
     });
   });
 
+  it('a missing template: an empty fork is disposed, naming it, and a fork with history is left alone', { timeout: 30_000 }, async () => {
+    await withForks('reinit-fork-notemplate-', async (framework, internals) => {
+      const sequenceBefore = await forksAroundACheckpoint(framework, internals);
+      const alerts: Array<{ kind: string; agentName: string; message: string }> = [];
+      framework.onTrace((event) => {
+        if (event.type === 'ops:alert') alerts.push(event as unknown as { kind: string; agentName: string; message: string });
+      });
+      (framework as unknown as { agents: Map<string, unknown> }).agents.delete('a');
+      framework.getStore().createBranchAt('earlier', 'main', sequenceBefore);
+      await framework.switchBranch('earlier');
+      const reinit = alerts.filter((alert) => alert.kind === 'context-reinit-failed');
+      assert.deepEqual(reinit.map((alert) => alert.agentName), ['a-late-g1'], JSON.stringify(alerts));
+      assert.match(reinit[0]!.message, /the conversation template agent "a" is not registered, so it couldn't be seeded again\. It was disposed/);
+      assert.ok(!framework.getAgent('a-late-g1'), 'the empty fork is disposed');
+      assert.ok(framework.getAgent('a-early-g1'), 'the fork with history stays');
+    });
+  });
+
+  it('a conversation agent created over a namespace that already holds history is not seeded again, even when that history compiles to nothing', { timeout: 30_000 }, async () => {
+    await withForks('reinit-fork-recreate-', async (framework, internals) => {
+      const cmA = framework.getAgent('a')!.getContextManager();
+      cmA.addMessage('user', [{ type: 'text', text: 'hello a' }]);
+      await internals.createConversationAgent('a-chan-g1', 'world:chan');
+      const stored = framework.getAgent('a-chan-g1')!.getContextManager().getMessageCount();
+      assert.ok(stored > 0, 'seeded once');
+      // The name comes round again over the same namespace, as when the
+      // router's counter wasn't stored (agent-framework's F50 case).
+      const forget = framework as unknown as { disposeConversationAgent(name: string): void; usedEphemeralAgentNames: Set<string> };
+      forget.disposeConversationAgent('a-chan-g1');
+      forget.usedEphemeralAgentNames.delete('a-chan-g1');
+      // Every compile but the template's reads as empty, as a history that is
+      // hidden or past its window does.
+      const proto = Object.getPrototypeOf(cmA) as { compile: (...args: unknown[]) => Promise<{ messages: unknown[] }> };
+      const compile = proto.compile;
+      proto.compile = async function (this: unknown, ...args: unknown[]) {
+        const result = await compile.apply(this, args);
+        return this === cmA ? result : { ...result, messages: [] };
+      };
+      try {
+        await internals.createConversationAgent('a-chan-g1', 'world:chan');
+      } finally {
+        proto.compile = compile;
+      }
+      assert.equal(framework.getAgent('a-chan-g1')!.getContextManager().getMessageCount(), stored, 'no second copy of the template');
+    });
+  });
+
   for (const shape of ['history compiles to nothing', 'compile throws'] as const) {
     it(`a fork with stored history on the landed branch is neither seeded again nor disposed when its ${shape}`, { timeout: 30_000 }, async () => {
       await withForks('reinit-fork-hashistory-', async (framework, internals) => {
