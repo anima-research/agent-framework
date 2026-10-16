@@ -6382,11 +6382,8 @@ export class AgentFramework {
       this.runReleasesAfterResume();
       await this.flushDeferredWrites('resume');
       this.persistHostMode(null);
-<<<<<<< HEAD
-      this.hostModeRecordMayBeQuiesced = false;
-=======
+      // See abortRouting: the gate may not exist in partial harnesses.
       this.eventGate?.admitOverdueWakeIntents();
->>>>>>> 58380959 (fix(gate): retain quiesced wakes until admission (R2-1 R2-2 R2-6))
     } finally {
       this.resumeInFlight = false;
       // Reopen MCPL data planes (quiesced is already false). In `finally`
