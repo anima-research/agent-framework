@@ -1164,9 +1164,12 @@ describe('a compile refused for budget holds its turn (#304)', () => {
     try {
       await withBacklog({}, async (backlog) => {
         const first = await residentTurn({ maintenanceIntervalMs: 50, storePath: join(dir, 'store') });
-        first.send('Are you there?');
-        assert.ok(await pollUntil(() => first.of('inference:held').length === 1, 5_000));
-        await first.close();
+        try {
+          first.send('Are you there?');
+          assert.ok(await pollUntil(() => first.of('inference:held').length === 1, 5_000));
+        } finally {
+          await first.close();
+        }
         assert.deepEqual(first.of('inference:hold_ended').map((e) => e.outcome), ['stopped']);
         // The same store, opened by a new framework, as a process restart does.
         backlog.fit = true;
@@ -1198,10 +1201,13 @@ describe('a compile refused for budget holds its turn (#304)', () => {
       let blocked = true;
       t.internal.providerGateBlocked = (name: string) => (name === 'prime' && blocked) || open(name);
       const fw = t.framework as unknown as { reserveStoreForSurgery: (verb: string, agentName: string) => () => void };
+      // Released in finally too: stop() waits for a surgery's release, so a
+      // failed assertion would otherwise hang the file rather than fail.
+      let release = () => {};
       try {
         t.send('Are you there?');
         assert.ok(await pollUntil(() => t.of('inference:held').length === 1, 5_000));
-        const release = fw.reserveStoreForSurgery('test surgery', 'prime');
+        release = fw.reserveStoreForSurgery('test surgery', 'prime');
         const previews = backlog.previews;
         backlog.fit = true;
         await new Promise((r) => setTimeout(r, 400));
@@ -1212,6 +1218,7 @@ describe('a compile refused for budget holds its turn (#304)', () => {
         blocked = false;
         assert.ok(await pollUntil(() => storedText(t.framework).includes('Answered once it fit'), 3_000));
       } finally {
+        release();
         await t.close();
       }
     });
