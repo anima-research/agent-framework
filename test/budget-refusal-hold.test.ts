@@ -296,10 +296,14 @@ async function residentTurn(options: {
 
 describe('a compile refused for budget holds its turn (#304)', () => {
   it('runs the refused turn once compression makes the context fit, with no new wake', async () => {
-    await withBacklog({ fitAt: 12 }, async (backlog) => {
+    // 40 ticks: the pass at start and the hold's first kick give 16, so the
+    // maintenance loop must tick the held agent for the context to fit.
+    await withBacklog({ fitAt: 40 }, async (backlog) => {
       const t = await residentTurn({ maintenanceIntervalMs: 50 });
       try {
         t.send('Are you there?');
+        assert.ok(await pollUntil(() => t.of('inference:held').length === 1, 5_000));
+        assert.equal(t.internal.providerGateBlocked('prime'), false, 'the hold leaves the provider gate open, so compression runs');
         assert.ok(await pollUntil(() => fits(backlog), 10_000), 'compression should catch up');
         const answered = await pollUntil(() => storedText(t.framework).includes('Answered once it fit'), 5_000);
         assert.ok(answered, 'the refused turn should run once the context fits, with no new message to wake it');
@@ -1053,6 +1057,43 @@ describe('a compile refused for budget holds its turn (#304)', () => {
     });
   });
 
+  it('says a wait of minutes in minutes, in the note and in the failure', async () => {
+    type Times = { state: string; startedAt: number; until: number };
+    const times = (t: { internal: Internal }) => (t.internal.budgetHolds as unknown as Map<string, Times>).get('prime')!;
+    // The note: a turn held seven minutes, by its record, then released.
+    await withBacklog({}, async (backlog) => {
+      const t = await residentTurn({ maintenanceIntervalMs: 50 });
+      try {
+        t.send('Are you there?');
+        assert.ok(await pollUntil(() => t.of('inference:held').length === 1, 5_000));
+        times(t).startedAt = Date.now() - 7 * 60_000;
+        backlog.fit = true;
+        assert.ok(await pollUntil(() => t.membrane.calls.length === 1, 5_000));
+        assert.ok(JSON.stringify(t.membrane.calls[0]).includes(
+          "[budget-hold] Your context didn't fit its budget (100,201 tokens against 48,568), so this turn waited 7 min. It fits now."));
+      } finally {
+        await t.close();
+      }
+    });
+    // The failure: the default 30-minute bound, a turn first held 30 minutes
+    // ago by its record, and its released compile refused past the bound.
+    await withBacklog({ fit: true, alwaysPending: true, refuseCompiles: Infinity, slowCompile: { nth: 2, ms: 300 } }, async (backlog) => {
+      const t = await residentTurn({ maintenanceIntervalMs: 50 });
+      try {
+        t.send('Are you there?');
+        assert.ok(await pollUntil(() => times(t)?.state === 'released' && backlog.compiles === 2, 5_000), 'released, and its compile has begun');
+        times(t).startedAt = Date.now() - 30 * 60_000;
+        times(t).until = Date.now() - 1;
+        assert.ok(await pollUntil(() => t.of('inference:exhausted').length === 1, 5_000));
+        assert.ok(String(t.of('inference:exhausted')[0]!.error).endsWith(
+          "(the turn was first held 30 min ago; the hold's 30 min bound passed and it still didn't fit)"),
+          String(t.of('inference:exhausted')[0]!.error));
+      } finally {
+        await t.close();
+      }
+    });
+  });
+
   it('ends a released turn the inference policy declines: nothing of its hold reaches a later turn', async () => {
     await withBacklog({}, async (backlog) => {
       let decline = false;
@@ -1453,7 +1494,7 @@ describe('the release check takes context-manager\'s verdict on the real strateg
       membrane,
       of: (type: string) => traces.filter((e) => e.type === type) as unknown as Array<Record<string, unknown>>,
       preview: (maxTokens: number) => (cm as unknown as {
-        previewContext: (b: { maxTokens: number; reserveForResponse: number }) => { fits: boolean; finalTokens: number };
+        previewContext: (b: { maxTokens: number; reserveForResponse: number }) => { fits: boolean; finalTokens: number; budgetTokens: number };
       }).previewContext(budget(maxTokens)),
       dryCompileResolves: (maxTokens: number) => cm.compile(budget(maxTokens), undefined, { dryRun: true } as never).then(() => true, () => false),
       setBudget: (tokens: number) => framework.updateAgentRuntimeSettings('prime', { contextBudgetTokens: tokens, immediate: true }, { allowInfeasible: true }),
@@ -1497,9 +1538,23 @@ describe('the release check takes context-manager\'s verdict on the real strateg
       assert.equal(t.of('inference:held').length, 1, 'held once, never released into the same refusal');
       assert.deepEqual(t.of('inference:hold_ended'), []);
       assert.equal(t.membrane.calls.length, 0);
-      t.setBudget(400_000);
-      assert.ok(await pollUntil(() => storedText(t.framework).includes('Answered once it fit'), 5_000), 'a budget it fits releases it');
+      // The smallest budget the plan fits, by the preview. Its room to spare
+      // is less than the note's size, so the released compile, which carries
+      // the note, fits only because the note is merged after the selection.
+      let lo = band;
+      let hi = 400_000;
+      while (hi - lo > 1) {
+        const mid = Math.floor((lo + hi) / 2);
+        if (t.preview(mid).fits) hi = mid; else lo = mid;
+      }
+      const atHi = t.preview(hi);
+      const spare = atHi.budgetTokens - atHi.finalTokens;
+      assert.ok(spare >= 0 && spare < 10,
+        `${spare} tokens to spare at ${hi} (a plan of ${atHi.finalTokens} against ${atHi.budgetTokens}), well under the note's size`);
+      t.setBudget(hi);
+      assert.ok(await pollUntil(() => storedText(t.framework).includes('Answered once it fit'), 5_000), 'that budget releases it');
       assert.deepEqual(t.of('inference:hold_ended').map((e) => e.outcome), ['fit']);
+      assert.ok(JSON.stringify(t.membrane.calls[0]).includes('[budget-hold]'), 'and its compile carries the note');
     } finally {
       await t.close();
     }
