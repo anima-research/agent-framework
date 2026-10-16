@@ -33,7 +33,7 @@ function makeGate(configPath: string, opts?: {
 }) {
   const traces: TraceEntry[] = [];
   const messages: Array<{ participant: string; content: unknown; metadata?: unknown }> = [];
-  const inferenceRequests: Array<{ agentName: string; reason: string; source: string; channelId?: string; counterparty?: string; addressed?: boolean; at?: number; routeChannelId?: string }> = [];
+  const inferenceRequests: Array<{ agentName: string; reason: string; source: string; channelId?: string; counterparty?: string; addressed?: boolean; at?: number; routeChannelId?: string; routingClass?: 'private' | 'channel' }> = [];
 
   const gate = new EventGate({
     configPath,
@@ -345,6 +345,34 @@ describe('debounce', () => {
     const d = gate.evaluate(event());
     assert.strictEqual(d.trigger, false);
     assert.deepStrictEqual(d.behavior, { debounce: 100 });
+  });
+
+  it('retains private surface routing class across debounce', async () => {
+    const path = writeConfig('debounce-private-surface.json', {
+      policies: [{ name: 'surface', match: { scope: ['external-message'] }, behavior: { debounce: 100 } }],
+      default: 'skip',
+    });
+    const { gate, inferenceRequests } = makeGate(path);
+    gate.evaluate({ content: 'private', eventType: 'external-message', serverId: 'tui', channelId: '', routingClass: 'private' });
+    await new Promise((resolve) => setTimeout(resolve, 150));
+    assert.equal(inferenceRequests.length, 1);
+    assert.equal(inferenceRequests[0]?.routingClass, 'private');
+    assert.equal(inferenceRequests[0]?.channelId, undefined);
+    gate.dispose();
+  });
+
+  it('retains channel-bound surface routing class and channel across debounce', async () => {
+    const path = writeConfig('debounce-channel-surface.json', {
+      policies: [{ name: 'surface', match: { scope: ['external-message'] }, behavior: { debounce: 100 } }],
+      default: 'skip',
+    });
+    const { gate, inferenceRequests } = makeGate(path);
+    gate.evaluate({ content: 'channel', eventType: 'external-message', serverId: 'bridge', channelId: 'discord:g:room', routingClass: 'channel' });
+    await new Promise((resolve) => setTimeout(resolve, 150));
+    assert.equal(inferenceRequests.length, 1);
+    assert.equal(inferenceRequests[0]?.routingClass, 'channel');
+    assert.equal(inferenceRequests[0]?.channelId, 'discord:g:room');
+    gate.dispose();
   });
 
   it('batches events and fires after delay', async () => {

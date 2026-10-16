@@ -2364,7 +2364,9 @@ export class AgentFramework {
             // route applies to a fork only when it IS that home, and never to
             // another agent when a fork owns that channel. Otherwise a fork
             // bound elsewhere would show typing where it isn't replying.
-            ...(provenance?.routeChannelId && framework.mayTakeGateRoute(agentName, provenance.routeChannelId)
+            ...(provenance?.routingClass !== 'private'
+              && provenance?.routeChannelId
+              && framework.mayTakeGateRoute(agentName, provenance.routeChannelId)
               ? { channelId: provenance.routeChannelId, addressed: true }
               : {}),
           });
