@@ -9,8 +9,8 @@
   keeps running. An ephemeral run, and a refusal with nothing pending, fail
   as before.
   - **When it runs:** as one fresh compile, once context-manager's preview of
-    that compile says it fits. A dry compile can't say so, since it doesn't
-    throw an over-budget plan at its plan check. A refusal the preview
+    that compile says it fits. A dry compile can't say so, since it can
+    resolve a plan the turn's compile refuses. A refusal the preview
     rethrows, such as a context refusal, counts as a refusal. A strategy with
     no preview, or the hierarchical strategy, gets the dry compile. The hold
     looks after every maintenance pass, every drain kick it starts, and every

@@ -3408,8 +3408,8 @@ export class AgentFramework {
    * plans at (Agent.nextCompileBudget): its preview's, which reports an
    * over-budget plan as not fitting and rethrows any other refusal, such as a
    * context refusal (UncoveredDropError), a refusal here too. A dry compile
-   * can't give that verdict, since it doesn't throw an over-budget plan at
-   * the plan check (SelectOptions.dryRun in context-manager). Undefined for a
+   * can't give that verdict, since it can resolve a plan the turn's compile
+   * refuses (SelectOptions.dryRun in context-manager). Undefined for a
    * strategy with no preview, and for one whose preview needs adaptive
    * resolution: the dry compile decides there (budgetHoldDryRun).
    */

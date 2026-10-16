@@ -1542,9 +1542,9 @@ describe('the release check takes context-manager\'s verdict on the real strateg
   it('keeps holding at a budget where a dry compile resolves but the plan does not fit', async () => {
     const t = await realResident(true);
     try {
-      // Just over the budget, the adaptive strategy's dry compile resolves:
-      // it doesn't throw an over-budget plan at its plan check. The preview
-      // says the plan doesn't fit, and the turn's committing compile refuses.
+      // Just over the budget, the adaptive strategy's dry compile can resolve
+      // a plan the turn's compile refuses, and the preview says it doesn't
+      // fit. The loop finds such a budget.
       assert.equal(t.preview(400_000).fits, true);
       const plan = t.preview(400_000).finalTokens;
       let band: number | undefined;
