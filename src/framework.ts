@@ -4052,11 +4052,13 @@ export class AgentFramework {
    *  registry knows as a DM (isDirectMessageChannel), every message of which
    *  reaches the agent, open or not. A chat:dm tag describes one message, not
    *  its channel: a whisper inside a shared channel carries one too. A DM the
-   *  registry doesn't know gets the note, which is true there as well. The
-   *  words hold on every connector: what a closed channel still delivers
-   *  beyond messages that address the agent is the connector's (slack-mcpl
-   *  delivers ambient traffic by its own subscription), so the note promises
-   *  only those, and what channel_open does. */
+   *  registry doesn't know gets the note, which is true there as well. What a
+   *  closed channel still delivers beyond messages that address the agent is
+   *  the connector's (slack-mcpl delivers ambient traffic by its own
+   *  subscription), so the note promises only those, and what channel_open
+   *  does. One connector state the host can't see makes the second sentence
+   *  false: a channel muted with discord-mcpl's mute_channel delivers nothing,
+   *  messages that address the agent included. The agent that muted it knows. */
   private closedChannelNoteFor(channelId: string, serverId: string | null): string | undefined {
     const registry = this.channelRegistry;
     if (!registry || registry.isChannelOpen(channelId)) return undefined;
