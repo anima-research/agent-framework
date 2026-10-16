@@ -724,8 +724,37 @@ describe('stop() with an operator operation in flight', () => {
       const broadcasts: Array<[string, unknown]> = [];
       api.broadcast = (event, data) => { broadcasts.push([event, data]); };
       // As after a rollback made outside the API server.
-      (api as unknown as { currentBranch: string }).currentBranch = 'stale';
+      (api as unknown as { lastKnownBranch: string }).lastKnownBranch = 'stale';
       await api.cmdBranchSwitch({ name: 'side' });
+      assert.deepEqual(broadcasts, [['branch:switched', { from: 'main', to: 'side' }]]);
+    } finally { await framework.stop(); }
+  });
+
+  it('a switch from the API server that waits for running maintenance names the branch it moved to, and the current branch is the store\'s throughout', async () => {
+    const framework = await create();
+    try {
+      const api = new ApiServer(framework) as unknown as {
+        cmdBranchCreate(params: { name: string }): Promise<unknown>;
+        cmdBranchSwitch(params: { name: string }): Promise<unknown>;
+        cmdBranchCurrent(): Promise<{ name: string }>;
+        broadcast(event: string, data: unknown): void;
+      };
+      await api.cmdBranchCreate({ name: 'side' });
+      const broadcasts: Array<[string, unknown]> = [];
+      api.broadcast = (event, data) => { broadcasts.push([event, data]); };
+      // A maintenance pass still running: the switch moves the store once it ends.
+      let finish!: () => void;
+      internals(framework).maintenancePass = new Promise<void>((resolve) => { finish = resolve; });
+      const switching = api.cmdBranchSwitch({ name: 'side' });
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      assert.equal(framework.getStore().currentBranch().name, 'main', 'the switch waits for the pass');
+      assert.equal((await api.cmdBranchCurrent()).name, 'main');
+      assert.deepEqual(broadcasts, []);
+      finish();
+      internals(framework).maintenancePass = null;
+      await switching;
+      assert.equal(framework.getStore().currentBranch().name, 'side');
+      assert.equal((await api.cmdBranchCurrent()).name, 'side');
       assert.deepEqual(broadcasts, [['branch:switched', { from: 'main', to: 'side' }]]);
     } finally { await framework.stop(); }
   });
@@ -849,7 +878,7 @@ describe('stop() with an operator operation in flight', () => {
     const broadcasts: unknown[] = [];
     (api as unknown as { broadcast(event: string, data: unknown): void }).broadcast = (event, data) => { broadcasts.push([event, data]); };
     // A stale cache, as after a rollback made outside the API server.
-    (api as unknown as { currentBranch: string }).currentBranch = 'stale';
+    (api as unknown as { lastKnownBranch: string }).lastKnownBranch = 'stale';
     // A turn holds its token from dequeue, before its stream registers.
     const tokens = internals(framework).activeTurnTokens;
     tokens.set('agent', -1);

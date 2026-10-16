@@ -2,7 +2,7 @@
 export * from './types/index.js';
 
 // Core classes
-export { AgentFramework, BudgetPreflightError, ResumeBlockedError } from './framework.js';
+export { AgentFramework, BudgetPreflightError, ProviderWaitNotSleptError, ResumeBlockedError } from './framework.js';
 export type { RuntimeSettingsPreview, HostModeStatus } from './framework.js';
 export { Agent } from './agent.js';
 export type { StartStreamResult } from './agent.js';
@@ -17,7 +17,7 @@ export * from './modules/index.js';
 
 // API
 export { ApiServer } from './api/server.js';
-export { McpServer } from './api/mcp-server.js';
+export { McpServer } from './api/mcp-server-core.js';
 export type {
   ApiServerConfig,
   ApiMessage,

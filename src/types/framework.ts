@@ -302,6 +302,10 @@ export interface ContextMaintenanceAgentRun {
   pendingAfter?: string;
   progressBefore?: Record<string, unknown>;
   progressAfter?: Record<string, unknown>;
+  /**
+   * The agent's failure in this pass: a tick that threw, or its readiness
+   * that couldn't be read, before the ticks or after them.
+   */
   error?: string;
 }
 
@@ -323,6 +327,12 @@ export interface ContextMaintenanceSnapshot {
     agentName: string;
     ready: boolean;
     pending?: string;
+    /**
+     * Why the agent's readiness can't be read: the context manager refuses
+     * while its strategy's initialization is pending or has failed, and a
+     * strategy can refuse on its own. `ready` is false then.
+     */
+    error?: string;
     progress?: Record<string, unknown>;
   }>;
 }
