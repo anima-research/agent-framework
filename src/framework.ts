@@ -11003,7 +11003,7 @@ export class AgentFramework {
         if ('error' in resolved) {
           delete routing.pin;
           routing.hybridHold = true;
-          this.bounceProse(agent, parsed.body, resolved.error, resolved.candidates, '>>>');
+          this.bounceProse(agent, parsed.body, resolved.error, resolved.candidates, '>>>', routing);
           continue;
         }
         let body = parsed.body;
@@ -11024,19 +11024,19 @@ export class AgentFramework {
           } else {
             delete routing.pin;
             routing.hybridHold = true;
-            this.bounceProse(agent, parsed.body, `delivery to ${resolved.channelId} was not confirmed`, undefined, '>>>');
+            this.bounceProse(agent, parsed.body, `delivery to ${resolved.channelId} was not confirmed`, undefined, '>>>', routing);
           }
         } catch (err) {
           delete routing.pin;
           routing.hybridHold = true;
-          this.bounceProse(agent, parsed.body, `delivery to ${resolved.channelId} failed: ${err instanceof Error ? err.message : String(err)}`, undefined, '>>>');
+          this.bounceProse(agent, parsed.body, `delivery to ${resolved.channelId} failed: ${err instanceof Error ? err.message : String(err)}`, undefined, '>>>', routing);
         }
         continue;
       }
       if (attempted) {
         delete routing.pin;
         routing.hybridHold = true;
-        this.bounceProse(agent, normalized, 'malformed >>> routing envelope: destination is missing', undefined, '>>>');
+        this.bounceProse(agent, normalized, 'malformed >>> routing envelope: destination is missing', undefined, '>>>', routing);
         continue;
       }
       if (routing.hybridHold) {
@@ -11100,7 +11100,7 @@ export class AgentFramework {
       const res = envelope.resolved;
       if (!res) throw new Error(`[prose] ${name}: a >> envelope reached delivery without the target admitted with it`);
       if ('error' in res) {
-        this.bounceProse(agent, parsed.body, res.error, res.candidates);
+        this.bounceProse(agent, parsed.body, res.error, res.candidates, '>>', routing);
         return;
       }
       targetChannel = res.channelId;
@@ -11110,7 +11110,7 @@ export class AgentFramework {
     } else {
       const sticky = routing.pin;
       if (!sticky) {
-        this.bounceProse(agent, rawText, 'no destination prefix and no destination set yet this turn');
+        this.bounceProse(agent, rawText, 'no destination prefix and no destination set yet this turn', undefined, '>>', routing);
         return;
       }
       targetChannel = sticky;
@@ -11140,7 +11140,7 @@ export class AgentFramework {
   /** Cap on consecutive bounce-triggered wakes (notices still append after). */
   private static readonly PROSE_BOUNCE_WAKE_CAP = 2;
 
-  private bounceProse(agent: Agent, text: string, reason: string, candidates?: string[], prefix: '>>' | '>>>' = '>>'): void {
+  private bounceProse(agent: Agent, text: string, reason: string, candidates?: string[], prefix: '>>' | '>>>' = '>>', routing?: TurnRouting): void {
     const name = agent.name;
     this.proseClipboards.set(name, text);
     const streak = (this.proseBounceStreaks.get(name) ?? 0) + 1;
@@ -11178,7 +11178,7 @@ export class AgentFramework {
     if (!capped) {
       // Wake so the resend can happen immediately — an unsent DM reply must
       // not sit invisible until the next unrelated event.
-      this.pendingRequests.push(this.derivedTurnRequest(name, 'prose-bounce'));
+      this.pendingRequests.push(this.derivedTurnRequest(name, 'prose-bounce', routing));
     }
   }
 
