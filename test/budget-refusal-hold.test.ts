@@ -244,6 +244,7 @@ async function heldRestart(texts: string[], options: {
   fits?: boolean;
   /** Runs while the first round's tool runs, with the turn alive. */
   duringTool?: (internal: Internal) => void;
+  inferencePolicy?: InferencePolicy;
 } = {}) {
   const proto = ContextManager.prototype as unknown as Patchable;
   const original = { compile: proto.compile, tick: proto.tick, isReady: proto.isReady };
@@ -269,6 +270,7 @@ async function heldRestart(texts: string[], options: {
     syncIntervalMs: 0,
     maintenanceIntervalMs: 50,
     errorPolicy: { maxRetries: 3, onInferenceError: (_error: Error, _agent: string, attempt: number) => (attempt < 3 ? { retry: true, delayMs: 0 } : { retry: false }) },
+    ...(options.inferencePolicy ? { inferencePolicy: options.inferencePolicy } : {}),
   });
   const internal = framework as unknown as Internal;
   const traces: TraceEvent[] = [];
@@ -1771,17 +1773,21 @@ describe('a compile refused for budget holds its turn (#304)', () => {
       assert.equal(t.membrane.calls.length, 1);
       t.fit();
       assert.ok(await pollUntil(() => t.of('inference:hold_ended').length === 1, 3_000), 'the context fits, and the hold ends');
+      assert.equal(t.framework.getHostModeStatus().heldTurns, 0, 'no turn is held once the hold ends');
       // The released continuation reaches the scheduler, which either starts
       // it or parks it as it parks a wake.
       await pollUntil(() => t.membrane.calls.length > 1 || t.framework.getHostModeStatus().gatedRequests === 1, 3_000);
       assert.equal(t.membrane.calls.length, 1, 'no provider call after quiesce reported the host drained');
       assert.equal(t.framework.getHostModeStatus().gatedRequests, 1, 'the continuation is parked, as a wake is');
       assert.equal(heldAtQuiesce, 1, 'the status quiesce returned showed the held turn');
-      // A parked request isn't work for runUntilIdle while the host is quiesced.
+      // A parked request isn't work for runUntilIdle while the host is
+      // quiesced: it returns at once, well inside this bound.
+      let bound: ReturnType<typeof setTimeout> | undefined;
       const idle = await Promise.race([
         t.framework.runUntilIdle().then(() => true),
-        new Promise<boolean>((r) => setTimeout(() => r(false), 2_000)),
+        new Promise<boolean>((r) => { bound = setTimeout(() => r(false), 10_000); }),
       ]);
+      clearTimeout(bound);
       assert.equal(idle, true, 'runUntilIdle returns while the continuation waits for resume');
       await t.framework.resume();
       assert.ok(await pollUntil(() => storedText(t.framework).includes('Answered after the restart'), 5_000), 'the continuation runs at resume');
@@ -1852,7 +1858,9 @@ describe('a compile refused for budget holds its turn (#304)', () => {
         } as unknown as ProcessEvent);
         await framework.runUntilIdle();
         assert.equal(traces.filter((e) => e.type === 'inference:held').length, 0, 'no run loop would run a released turn');
-        assert.equal(traces.filter((e) => e.type === 'inference:exhausted').length, 1, 'the turn fails before runUntilIdle returns');
+        const exhausted = traces.filter((e) => e.type === 'inference:exhausted') as unknown as Array<{ errorType?: string }>;
+        assert.equal(exhausted.length, 1, 'the turn fails before runUntilIdle returns');
+        assert.equal(exhausted[0]!.errorType, 'over_budget', 'from the refusal, by the error policy\'s path');
       } finally {
         await framework.stop();
         rmSync(tempDir, { recursive: true, force: true });
@@ -1892,6 +1900,7 @@ describe('a compile refused for budget holds its turn (#304)', () => {
         assert.ok(await pollUntil(() => t.of('inference:held').length === 1, 5_000));
         assert.deepEqual(checkpoints.getTurnCheckpoints('prime').map((c) => c.turnIndex), full.map((c) => c.turnIndex),
           'the twenty checkpoints from before the turn, the oldest included');
+        assert.equal(checkpoints.turnCounters.get('prime'), 20, 'and the turn index the held start took');
       } finally {
         await t.close();
       }
@@ -1915,6 +1924,89 @@ describe('a compile refused for budget holds its turn (#304)', () => {
         await t.close();
       }
     });
+  });
+
+  it('keeps a released continuation that waits on provider admission from starting while the host is quiesced', async () => {
+    const t = await heldRestart(['Answered after the restart']);
+    const internals = t.framework as unknown as {
+      withAuxiliaryAdmission<T>(agentName: string, run: () => Promise<T>): Promise<T>;
+      providerGates: Map<string, { primaryDepth: number }>;
+      activeTurnTriggers: Map<string, { releasedByBudgetHold?: boolean } | undefined>;
+    };
+    // What the turn the release starts carries, sampled as it starts.
+    const started: Array<boolean | undefined> = [];
+    t.framework.onTrace((e) => {
+      if (e.type === 'inference:started' && t.of('inference:hold_ended').length === 1) {
+        started.push(internals.activeTurnTriggers.get('prime')?.releasedByBudgetHold);
+      }
+    });
+    let releaseAux = () => {};
+    try {
+      assert.ok(await pollUntil(() => t.of('inference:held').length === 1, 10_000), 'the restart is held');
+      // An auxiliary call holds provider admission, so the released restart
+      // passes the scheduler and waits behind it, with no turn token.
+      const auxDone = internals.withAuxiliaryAdmission('prime', () => new Promise<void>((resolve) => { releaseAux = resolve; }));
+      t.fit();
+      assert.ok(await pollUntil(() => t.of('inference:hold_ended').length === 1
+        && (internals.providerGates.get('prime')?.primaryDepth ?? 0) === 1
+        && !t.internal.activeTurnTokens.has('prime'), 5_000), 'released, and waiting on admission');
+      const status = await t.framework.quiesce({ reason: 'test', timeoutMs: 1_000 });
+      assert.equal(status.parkedAdmissions, 1);
+      releaseAux();
+      await auxDone;
+      await pollUntil(() => t.membrane.calls.length > 1 || t.framework.getHostModeStatus().gatedRequests === 1, 3_000);
+      assert.equal(t.membrane.calls.length, 1, 'no turn starts while the host is quiesced');
+      assert.equal(t.framework.getHostModeStatus().gatedRequests, 1, 'the continuation is parked, as a wake is');
+      await t.framework.resume();
+      assert.ok(await pollUntil(() => storedText(t.framework).includes('Answered after the restart'), 5_000), 'it runs at resume');
+      assert.deepEqual(started, [undefined], 'the turn it starts carries no mark, so nothing it retries is parked');
+    } finally {
+      releaseAux();
+      await t.close();
+    }
+  });
+
+  it('starts a released guard retry as its turn\'s trigger wherever it was queued, and a batch\'s wake ahead of it gets a fresh turn', async () => {
+    await withBacklog({ fit: true }, async () => {
+      const t = await residentTurn({ maintenanceIntervalMs: 3_600_000, responses: 2 });
+      const internals = t.framework as unknown as { activeTurnTriggers: Map<string, { reason?: string } | undefined> };
+      const triggers: Array<string | undefined> = [];
+      t.framework.onTrace((e) => { if (e.type === 'inference:started') triggers.push(internals.activeTurnTriggers.get('prime')?.reason); });
+      try {
+        // As a hold releases a held guard retry while a batch's wake is
+        // already queued ahead of it.
+        t.internal.pendingRequests.push(
+          {
+            agentName: 'prime', reason: 'mcpl:push-event', source: 'test', timestamp: Date.now(),
+            coalescingSubject: 'zz-subject', coalescingBatch: true, coalescingBatchSubjects: ['zz-subject'],
+          } as unknown as { agentName: string },
+          { agentName: 'prime', reason: 'tool_result_guard_retry', source: 'framework', timestamp: Date.now(), releasedByBudgetHold: true } as unknown as { agentName: string },
+        );
+        assert.ok(await pollUntil(() => t.membrane.calls.length === 2, 5_000), 'two turns');
+        assert.deepEqual(triggers, ['tool_result_guard_retry', 'mcpl:push-event'], 'the guard retry resumes its turn, then the batch\'s wake gets its own');
+      } finally {
+        await t.close();
+      }
+    });
+  });
+
+  it('keeps a deferred batch\'s wake beside a restart the inference policy declines queued for a turn of its own', async () => {
+    // The policy declines any turn a budget restart would start.
+    const policy: InferencePolicy = { shouldInfer: (_agentName, requests) => !requests.some((r) => r.reason === 'context_budget_restart') };
+    const t = await heldRestart(['Answered the batch'], {
+      fits: true,
+      inferencePolicy: policy,
+      duringTool: (internal) => internal.pendingRequests.push({
+        agentName: 'prime', reason: 'mcpl:push-event', source: 'test', timestamp: Date.now(),
+        coalescingSubject: 'zz-subject', coalescingBatch: true, coalescingBatchSubjects: ['zz-subject'],
+      } as unknown as { agentName: string }),
+    });
+    try {
+      assert.ok(await pollUntil(() => storedText(t.framework).includes('Answered the batch'), 10_000), 'the batch\'s wake gets a turn of its own');
+      assert.equal(t.membrane.calls.length, 2, 'the first round, then the batch\'s turn; the declined restart made no call');
+    } finally {
+      await t.close();
+    }
   });
 });
 
