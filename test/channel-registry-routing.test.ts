@@ -136,6 +136,37 @@ test('routeSpeech surfaces a failure when the server reports delivered:false', a
   assert.ok(traces.some(t => t.type === 'mcpl:speech-route-failed'));
 });
 
+test('routeSpeech counts a publish reply that leaves delivered out as delivered', async () => {
+  const { registry, failures } = makeRegistry({});
+  seedRegistered(registry, 'discord', 'ch-x');
+  registry.handleIncoming('discord', incoming('ch-x', 'hi'));
+
+  const res = await registry.routeSpeech('cairn', 'a reply', registry.resolveLocus('cairn'));
+
+  assert.deepEqual(res, { delivered: true, channelId: 'ch-x' }, 'the outcome says delivered, so the stream follows it');
+  assert.equal(failures.length, 0, 'and no route failure is reported');
+});
+
+test('routeSpeech reports each delivered publish as mcpl:speech-routed, with nothing that ties it to a stream or ends one', async () => {
+  const { registry, traces } = makeRegistry({ delivered: true });
+  seedRegistered(registry, 'discord', 'ch-x');
+  registry.handleIncoming('discord', incoming('ch-x', 'hi'));
+
+  const before = traces.length;
+  await registry.routeSpeech('cairn', 'first reply', registry.resolveLocus('cairn'));
+  await registry.routeSpeech('cairn', 'second reply', registry.resolveLocus('cairn'));
+
+  const routed = traces.slice(before);
+  assert.deepEqual(routed.map((t) => ({ type: t.type, channelId: t.channelId, text: t.text, delivered: t.delivered })), [
+    { type: 'mcpl:speech-routed', channelId: 'ch-x', text: 'first reply', delivered: true },
+    { type: 'mcpl:speech-routed', channelId: 'ch-x', text: 'second reply', delivered: true },
+  ], 'one trace per publish, with its whole text, and none that ends an utterance');
+  for (const t of routed) {
+    assert.deepEqual(['inferenceId', 'streamId', 'index'].filter((key) => key in t), [],
+      'no stream id or index, unlike inference:published');
+  }
+});
+
 test('routeSpeech routes a conversation fork to its HOME channel, not the global last-inbound (item 3)', async () => {
   // Two channels are live. chanA registered first; then a message arrives on
   // chanB, flipping the process-global defaultPublishChannel to chanB. A fork

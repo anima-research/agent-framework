@@ -103,6 +103,9 @@ interface PendingExec {
   deadlineMs: number | null;
 }
 
+/** Interpreters started in this process, by every runner: each one's number. */
+let interpretersStarted = 0;
+
 export class PyRunner {
   private readonly pythonPath: string;
   private readonly toolCallTimeoutMs: number;
@@ -120,6 +123,8 @@ export class PyRunner {
   private pending: PendingExec | null = null;
   private idleTimer: ReturnType<typeof setTimeout> | null = null;
   private execCounter = 0;
+  /** The number of this runner's latest interpreter (interpretersStarted). */
+  private interpreterNumber = 0;
   private disposed = false;
   /** An exec has passed the busy check but is still awaiting the interpreter. */
   private starting = false;
@@ -136,6 +141,16 @@ export class PyRunner {
 
   get busy(): boolean {
     return this.pending !== null || this.starting;
+  }
+
+  /**
+   * The live interpreter, whose state (variables, imports, functions) the
+   * scripts run in it share: a number no other interpreter in this process
+   * has had, from any runner, or null while none is running, before the
+   * first script or once it was reclaimed, killed or has exited.
+   */
+  get interpreter(): number | null {
+    return this.child && this.child.exitCode === null && !this.child.killed ? this.interpreterNumber : null;
   }
 
   /**
@@ -294,6 +309,7 @@ export class PyRunner {
       env: { ...process.env, PYTHONUNBUFFERED: '1' },
     });
     this.child = child;
+    this.interpreterNumber = ++interpretersStarted;
 
     child.stderr.setEncoding('utf8');
     child.stderr.on('data', (chunk: string) => {
