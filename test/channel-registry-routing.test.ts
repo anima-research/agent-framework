@@ -791,7 +791,7 @@ test("an open still on its way when the agent closes the channel leaves it close
 test('a decline decided while an open is on its way, or after one whose reply was lost, closes the channel at the server too', async () => {
   const events: Array<{ kind?: string; channelId?: string }> = [];
   const { registry, holdOpens, autoOpened, closeCalls, serverOpen, setLoseOpenReplies, setFailCloses, setGrant } = loggedRegistry(events);
-  await registry.handleRegister('discord', { channels: channelsOf('spoken', 'lost', 'refusing', 'plain', 'ungranted') } as never);
+  await registry.handleRegister('discord', { channels: channelsOf('spoken', 'tuned', 'lost', 'refusing', 'plain', 'ungranted') } as never);
   const agent = { kind: 'agent' as const, agentName: 'sol' };
   const closesBefore = closeCalls.length; // the first registration's reconcile closes each channel
 
@@ -807,6 +807,19 @@ test('a decline decided while an open is on its way, or after one whose reply wa
   assert.equal(registry.isChannelOpen('spoken'), false);
   assert.equal(registry.closedByAgent('discord', 'spoken'), 'declined');
   assert.deepEqual(autoOpened, [], 'and nothing reports the channel as opened');
+
+  // The same after the agent tuned 'tuned' out while speech's open was on its way: a tune-out
+  // holds the transport open too.
+  const heldTuned = holdOpens();
+  const speakingTuned = registry.routeSpeech('sol', 'answering', 'tuned');
+  await heldTuned.reached;
+  registry.enterTuneOut('discord', 'tuned', { epochId: 'e3', cadenceSeconds: 600, backlogCap: 20, maxWakes: 3, startedAtSequence: 0 }, 'agent-tool');
+  const declinedTuned = await registry.handleChannelToolCall('channel_decline', { channelId: 'tuned', messageId: 'm6' }, agent);
+  assert.equal(declinedTuned.success, true, declinedTuned.error);
+  heldTuned.release();
+  assert.deepEqual(await speakingTuned, { delivered: true, channelId: 'tuned' });
+  assert.equal(serverOpen.has('tuned'), false, 'the server applied the open, then the close');
+  assert.equal(registry.isChannelOpen('tuned'), false);
 
   // The agent's open of 'lost' reached the server, and its reply was lost.
   setLoseOpenReplies(true);
@@ -840,7 +853,7 @@ test('a decline decided while an open is on its way, or after one whose reply wa
   assert.equal(registry.getDesiredState('discord', 'ungranted'), 'open');
   const declinedUngranted = await registry.handleChannelToolCall('channel_decline', { channelId: 'ungranted', messageId: 'm5' }, agent);
   assert.equal(declinedUngranted.success, true, declinedUngranted.error);
-  assert.deepEqual(closeCalls.slice(closesBefore).map((c) => c.channelId), ['spoken', 'lost', 'refusing']);
+  assert.deepEqual(closeCalls.slice(closesBefore).map((c) => c.channelId), ['spoken', 'tuned', 'lost', 'refusing']);
 });
 
 test('a channel decided open whose open failed is closed at the transport, so the agent can decline it, and speech then leaves it closed', async () => {

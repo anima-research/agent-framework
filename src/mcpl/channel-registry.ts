@@ -2969,12 +2969,14 @@ export class ChannelRegistry {
       };
     }
 
-    // A channel decided open but not open here has an open on its way, or one
-    // that failed, maybe after the server applied it and its reply was lost.
-    // So the decline closes it at the server too, as channel_close does: the
-    // server applies the close after that open, and the open's reply leaves
-    // the flag as the decision says.
-    const closeAtServer = this.getDesiredState(entry.serverId, input.channelId) === 'open';
+    // A channel whose decision holds the transport open (open, or tuned out),
+    // but that isn't open here, has an open on its way, or one that failed,
+    // maybe after the server applied it and its reply was lost. So the
+    // decline closes it at the server too, as channel_close does: the server
+    // applies the close after that open, and the open's reply leaves the flag
+    // as the decision says.
+    const held = this.getDesiredState(entry.serverId, input.channelId);
+    const closeAtServer = held === 'open' || held === 'tuned-out';
 
     // The lifecycle decision is authoritative even if the optional public
     // acknowledgment cannot be rendered by the surface, or the close fails.

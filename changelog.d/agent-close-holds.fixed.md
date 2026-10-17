@@ -27,11 +27,12 @@
   announces "[channels] Now open" after the close. The close goes to the server after the open,
   so the channel ends closed, and the live state now follows the decision.
 - `channel_decline` of a channel decided open that isn't open at the transport, whose open failed
-  or is still on its way, now records the decline and closes the channel at the server, as
-  `channel_close` does, so the server ends closed whatever that open did. Before, it was refused
-  as "already open". discord-mcpl, slack-mcpl and zulip_mcp answer a close of a channel they never
-  opened without an error; a close that fails leaves the decline recorded, with `closeError` in
-  its answer.
+  or is still on its way, now records the decline, where it was refused as "already open". A
+  decline of such a channel, or of a tuned-out one that isn't open at the transport, also closes
+  the channel at the server, as `channel_close` does, so the server ends closed whatever an open
+  on its way, or one whose reply was lost, did. discord-mcpl, slack-mcpl and zulip_mcp answer a
+  close of a channel they never opened without an error; a close that fails leaves the decline
+  recorded, with `closeError` in its answer.
 - `channel_close`'s description and the "[channels] Now open" notice's last sentence now say that
   a channel the agent closes stays closed until it opens it with `channel_open`, and that neither
   speaking there nor policy reopens it.
