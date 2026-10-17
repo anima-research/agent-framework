@@ -1195,6 +1195,10 @@ interface ManagerReinitFailure {
   /** For a disposal whose cause also stops the channel's next spawn, a
    *  template that's missing or refuses its work: what lets it spawn again. */
   remedy?: string;
+  /** For a disposal that failed partway, as when the store refused to drop
+   *  the agent's turn checkpoints: that failure. The agent was unregistered
+   *  and its channel unbound before the step that failed. */
+  cleanupFailed?: string;
 }
 
 /**
@@ -8014,7 +8018,11 @@ export class AgentFramework {
    * That's so when its seeding throws, and when the template is missing or
    * its own re-initialization failed, since seeding reads the template's
    * compile. Its channel unbinds, so the channel's next qualifying message
-   * spawns a fresh fork, and the disposal is reported with the move's.
+   * spawns a fresh fork, and the disposal is reported with the move's. A
+   * disposal that fails partway, as when the store refuses to drop the
+   * fork's turn checkpoints, is reported in the same record, and the pass
+   * goes on to the next fork: disposeConversationAgent unregisters the fork
+   * before its first step that can throw.
    *
    * `moved` says whether a move has joined the pass since it began (an
    * undo's or redo's, under the same reservation). Then the store may no
@@ -8070,23 +8078,31 @@ export class AgentFramework {
         remedy = templateDown.remedy;
       }
       if (moved()) continue;
-      const channelId = this.conversationAgentHomes.get(agentName);
-      if (channelId !== undefined && this.conversationRouter?.getBinding(channelId)?.agentName === agentName) {
-        this.conversationRouter.unbind(channelId);
+      const failure: ManagerReinitFailure = { agentName, error: cause, seedingFailed: true, ...(remedy ? { remedy } : {}) };
+      try {
+        const channelId = this.conversationAgentHomes.get(agentName);
+        if (channelId !== undefined && this.conversationRouter?.getBinding(channelId)?.agentName === agentName) {
+          this.conversationRouter.unbind(channelId);
+        }
+        this.disposeConversationAgent(agentName);
+      } catch (error) {
+        failure.cleanupFailed = failureDescription(error);
       }
-      this.disposeConversationAgent(agentName);
-      failures.push({ agentName, error: cause, seedingFailed: true, ...(remedy ? { remedy } : {}) });
+      failures.push(failure);
     }
   }
 
   /** Say which agents a move left with a manager that refuses its work:
    *  on the console, in failures.log and in an ops alert, one per agent. */
   private reportReinitFailures(after: string, failures: ManagerReinitFailure[]): void {
-    for (const { agentName, error, seedingFailed, after: judgedAfter, remedy } of failures) {
+    for (const { agentName, error, seedingFailed, after: judgedAfter, remedy, cleanupFailed } of failures) {
       const move = judgedAfter ?? after;
       this.reportReinitFailure(agentName, move, seedingFailed
         ? `The ${move} moved the store's branch to one where this conversation agent had no messages of its own, ` +
-          `and it couldn't be seeded again, because ${error}. It was disposed and its channel unbound. ` +
+          `and it couldn't be seeded again, because ${error}. ` +
+          (cleanupFailed
+            ? `It was unregistered and its channel unbound, but cleaning up after it then failed: ${cleanupFailed}. `
+            : 'It was disposed and its channel unbound. ') +
           "Its messages stay on the branches that hold them, but no agent reads them again, " +
           "so a redo to a branch that holds them doesn't bring this one back. " +
           (remedy

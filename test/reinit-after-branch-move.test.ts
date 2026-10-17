@@ -1001,6 +1001,46 @@ describe('conversation forks and an undo', () => {
     });
   });
 
+  it("a fork whose disposal fails partway after its seeding fails is reported with both, and the pass seeds the next fork", { timeout: 30_000 }, async () => {
+    await withForks('reinit-fork-disposefail-', async (framework, internals) => {
+      await forksAroundACheckpoint(framework, internals);
+      const router = framework.getConversationRouter()!;
+      // A second fork spawned after the checkpoint, after a-late-g1 in the pass.
+      await internals.createConversationAgent('a-later-g1', 'world:later');
+      router.bind('world:later', 'a-later-g1', 1);
+      framework.getAgent('a-later-g1')!.getContextManager().addMessage('user', [{ type: 'text', text: 'later own' }]);
+      const alerts: Array<{ kind: string; agentName: string; message: string }> = [];
+      framework.onTrace((event) => {
+        if (event.type === 'ops:alert') alerts.push(event as unknown as { kind: string; agentName: string; message: string });
+      });
+      // a-late-g1's seeding fails, and then the store refuses to drop its turn
+      // checkpoints when it's disposed.
+      const cmLate = framework.getAgent('a-late-g1')!.getContextManager();
+      (cmLate as unknown as { addMessage: () => never }).addMessage = () => { throw new Error('injected seed failure'); };
+      const store = framework.getStore();
+      const treeGet = store.treeGet.bind(store);
+      (store as unknown as { treeGet: typeof treeGet }).treeGet = (treeId, key) => {
+        if (treeId === 'framework/turn-checkpoints/tree' && key === 'a-late-g1') throw new Error('injected checkpoint store failure');
+        return treeGet(treeId, key);
+      };
+      try {
+        assert.equal(framework.undoLastTurn('a').undone, true);
+        await internals.syncMoveReinit!.done;
+      } finally {
+        (store as unknown as { treeGet: typeof treeGet }).treeGet = treeGet;
+      }
+      const reinit = alerts.filter((alert) => alert.kind === 'context-reinit-failed');
+      assert.deepEqual(reinit.map((alert) => alert.agentName), ['a-late-g1'], JSON.stringify(alerts));
+      assert.match(reinit[0]!.message, /couldn't be seeded again, because its seeding from the template failed: .*injected seed failure\. It was unregistered and its channel unbound, but cleaning up after it then failed: .*injected checkpoint store failure\./);
+      assert.equal(internals.surgeryHold, null, 'the store is released');
+      assert.ok(!framework.getAgent('a-late-g1'), 'the fork is unregistered');
+      assert.equal(router.getBinding('world:late'), undefined, 'its channel is unbound');
+      const later = await textsOf(framework, 'a-later-g1');
+      assert.equal(count(later, 'hello a'), 1, `the next fork is seeded again from the template: ${JSON.stringify(later)}`);
+      assert.equal(count(later, 'later own'), 0, JSON.stringify(later));
+    });
+  });
+
   it('a move is refused while a fork is being created, and goes through once it is', { timeout: 30_000 }, async () => {
     await withForks('reinit-fork-inflight-', async (framework, internals) => {
       const cmA = framework.getAgent('a')!.getContextManager();
