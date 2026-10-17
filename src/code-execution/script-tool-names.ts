@@ -38,7 +38,9 @@
 export function scriptToolNames(script: string, tools: readonly string[]): { names: Set<string>; reachable: Set<string> } {
   if (tools.length === 0) return { names: new Set(), reachable: new Set() };
   const named = new RegExp(`(?:(?<![A-Za-z0-9_])|(?<=__))(${tools.join('|')})(?![A-Za-z0-9_])`, 'g');
-  const key = new RegExp(`^(?:[A-Za-z0-9_-]*(?:--|__))?(${tools.join('|')})$`);
+  // A kept key's prefix is any text without whitespace, as a tool prefix can
+  // hold `.` or `:`; a sentence that ends in a tool's name has spaces.
+  const key = new RegExp(`^(?:\\S*(?:--|__))?(${tools.join('|')})$`);
   const { code, strings } = readScript(script);
   const inDefinition = definitions(script, code, strings);
   const names = new Set<string>();

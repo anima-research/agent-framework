@@ -616,13 +616,23 @@ test("with the real channel registry, a stop() with a publish still out sends th
 });
 
 test('disabled: nothing streams, from a mid-turn round, trailing text or a text-only turn', async () => {
-  for (const script of [
-    [round(text('mid-turn'), call('one', 'test--read')), final(text('trailing'))],
-    [final(text('text only'))],
-  ]) {
-    const h = await harness([script], { proseRouting: 'disabled' });
+  for (const [script, branches] of [
+    [[round(text('mid-turn'), call('one', 'test--read')), final(text('trailing'))], ['mid-turn prose', 'tool-call trailing prose']],
+    [[final(text('text only'))], ['text-only prose']],
+  ] as const) {
+    const h = await harness([[...script]], { proseRouting: 'disabled' });
+    const called: string[] = [];
+    h.module.during = async (call) => { called.push(call.name); };
+    // Each branch the turn reaches says it routed nothing; the test checks it reached them.
+    const logged: string[] = [];
+    const error = console.error;
     try {
-      await h.run();
+      console.error = (...args: unknown[]) => { logged.push(args.map(String).join(' ')); };
+      try { await h.run(); } finally { console.error = error; }
+      for (const branch of branches) {
+        assert.ok(logged.includes(`[routing] assistant: ${branch} NOT routed (proseRouting=disabled)`), `the ${branch} branch ran`);
+      }
+      assert.deepEqual(called, script.length > 1 ? ['read'] : [], "the tool round's call was made");
       assert.deepEqual(h.log, [], 'nothing is published, streamed or completed');
       assert.deepEqual(h.traces, [], 'and no published trace is emitted');
     } finally { await h.framework.stop(); }

@@ -45,6 +45,9 @@ test('a key is a whole tool name, optionally namespaced, not a sentence that end
   assert.deepEqual(read('print("to speak, call world--say")'), { names: ['say'], reachable: [] });
   assert.deepEqual(read('print("use mcpl__world__say")'), { names: ['say'], reachable: [] });
   assert.deepEqual(read('k = "mcpl__world__say"'), { names: ['say'], reachable: ['say'] });
+  // A prefix can hold punctuation besides `-` and `_`.
+  assert.deepEqual(read('post = tools["mcpl--zulip.work--say"]'), { names: ['say'], reachable: ['say'] }, 'a `.` in the prefix');
+  assert.deepEqual(read('post = tools["discord:v1--say"]'), { names: ['say'], reachable: ['say'] }, 'a `:` in the prefix');
 });
 
 test("a direct call outside a definition leaves nothing reachable, beside a definition that doesn't use the tool", () => {
