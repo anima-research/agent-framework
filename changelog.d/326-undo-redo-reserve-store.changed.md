@@ -23,8 +23,9 @@
   store, since its context is seeded from the template's, and a move made
   while one is being created is refused as busy. An undo or redo that fails leaves the store where it was, with
   the turn still there to undo or redo, unless its branch has been deleted:
-  a redo whose branch is gone drops that step, and any beneath it whose
-  branches are gone too, and says so.
+  a redo whose branch is gone drops that step, and each step right beneath
+  it whose branch is gone too, down to the first whose branch is still
+  there, and says so.
 - **A second `switchBranch()` made while one holds the store is refused**
   with `OperatorActionError` (`agent-busy`), as the other operator calls
   are.

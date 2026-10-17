@@ -1192,6 +1192,9 @@ interface ManagerReinitFailure {
   /** For a disposal in an undo's or redo's re-initialization: the move whose
    *  branch its pass judged, which a move joining later doesn't change. */
   after?: string;
+  /** For a disposal whose cause also stops the channel's next spawn, a
+   *  template that's missing or refuses its work: what lets it spawn again. */
+  remedy?: string;
 }
 
 /**
@@ -8031,12 +8034,18 @@ export class AgentFramework {
     // a failure is reported from the last pass only, and a later pass may
     // find the template re-initialized.
     const templateFailure = template ? failures.find((f) => f.agentName === template.name) : undefined;
-    const templateDown = !template
-      ? `the conversation template agent "${router.templateAgent}" is not registered, so it couldn't be seeded again. ` +
-        `Registering an agent under that name, or configuring the conversation router with a registered template, lets the channel's next qualifying message spawn a fork seeded from it`
+    // A spawn seeds from the template too, so while the template is missing
+    // or refuses its work, the channel's next spawn fails as well.
+    const templateDown: { reason: string; remedy: string } | null = !template
+      ? {
+          reason: `no agent is registered as the conversation template "${router.templateAgent}"`,
+          remedy: 'an agent is registered under that name, or the conversation router is configured with a registered template',
+        }
       : templateFailure
-        ? `the template ${template.name}'s own context manager failed to re-initialize (${templateFailure.error}), so it couldn't be seeded again. ` +
-          `If the template still refuses its work, switchBranch() to the current branch, or a restart, re-initializes it; the channel's next qualifying message then spawns a fork seeded from it`
+        ? {
+            reason: `the template ${template.name}'s own context manager failed to re-initialize (${templateFailure.error})`,
+            remedy: 'the template is re-initialized, which a switchBranch() to the current branch or a restart does',
+          }
         : null;
     for (const agentName of [...this.conversationAgentHomes.keys()]) {
       if (agentName === except || failed.has(agentName)) continue;
@@ -8045,6 +8054,7 @@ export class AgentFramework {
       const contextManager = agent.getContextManager();
       if (contextManager.getMessageCount() > 0) continue;
       let cause: string;
+      let remedy: string | undefined;
       if (templateDown === null) {
         try {
           const added = await this.seedConversationAgentIfEmpty(agentName, contextManager, template!, moved);
@@ -8055,10 +8065,11 @@ export class AgentFramework {
           }
           continue;
         } catch (error) {
-          cause = `seeding it again from the template failed: ${failureDescription(error)}`;
+          cause = `its seeding from the template failed: ${failureDescription(error)}`;
         }
       } else {
-        cause = templateDown;
+        cause = templateDown.reason;
+        remedy = templateDown.remedy;
       }
       if (moved()) continue;
       const channelId = this.conversationAgentHomes.get(agentName);
@@ -8066,20 +8077,23 @@ export class AgentFramework {
         this.conversationRouter.unbind(channelId);
       }
       this.disposeConversationAgent(agentName);
-      failures.push({ agentName, error: cause, seedingFailed: true });
+      failures.push({ agentName, error: cause, seedingFailed: true, ...(remedy ? { remedy } : {}) });
     }
   }
 
   /** Say which agents a move left with a manager that refuses its work:
    *  on the console, in failures.log and in an ops alert, one per agent. */
   private reportReinitFailures(after: string, failures: ManagerReinitFailure[]): void {
-    for (const { agentName, error, seedingFailed, after: judgedAfter } of failures) {
+    for (const { agentName, error, seedingFailed, after: judgedAfter, remedy } of failures) {
       const move = judgedAfter ?? after;
       this.reportReinitFailure(agentName, move, seedingFailed
         ? `The ${move} moved the store's branch to one where this conversation agent had no messages of its own, ` +
-          `and ${error}. It was disposed and its channel unbound. Its messages stay on the branches that hold them, ` +
-          "but no agent reads them again: the channel's next qualifying message spawns a new fork, under a new name, " +
-          "so a redo to a branch that holds them doesn't bring this one back."
+          `and it couldn't be seeded again, because ${error}. It was disposed and its channel unbound. ` +
+          "Its messages stay on the branches that hold them, but no agent reads them again, " +
+          "so a redo to a branch that holds them doesn't bring this one back. " +
+          (remedy
+            ? `Once ${remedy}, the channel's next qualifying message spawns a new fork seeded from the template, under a new name.`
+            : "The channel's next qualifying message spawns a new fork, under a new name.")
         : `The ${after} moved the store's branch, and re-initializing this agent's context manager for it failed: ${error}. ` +
           REINIT_REMEDY);
     }

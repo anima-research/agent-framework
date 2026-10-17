@@ -980,8 +980,8 @@ describe('conversation forks and an undo', () => {
       }
       const reinit = alerts.filter((alert) => alert.kind === 'context-reinit-failed');
       assert.deepEqual(reinit.map((alert) => alert.agentName), ['a-late-g1'], JSON.stringify(alerts));
-      assert.match(reinit[0]!.message, /had no messages of its own, and seeding it again from the template failed: .*injected template compile failure\. It was disposed and its channel unbound/);
-      assert.match(reinit[0]!.message, /no agent reads them again: the channel's next qualifying message spawns a new fork, under a new name, so a redo to a branch that holds them doesn't bring this one back/);
+      assert.match(reinit[0]!.message, /had no messages of its own, and it couldn't be seeded again, because its seeding from the template failed: .*injected template compile failure\. It was disposed and its channel unbound/);
+      assert.match(reinit[0]!.message, /no agent reads them again, so a redo to a branch that holds them doesn't bring this one back\. The channel's next qualifying message spawns a new fork, under a new name\.$/);
       assert.doesNotMatch(reinit[0]!.message, /refuses its work/);
       assert.equal(internals.surgeryHold, null, 'the store is released');
       assert.ok(!framework.getAgent('a-late-g1'), 'the fork is disposed rather than left to answer with no history');
@@ -1150,7 +1150,7 @@ describe('conversation forks and an undo', () => {
       }
       const reinit = alerts.filter((alert) => alert.kind === 'context-reinit-failed');
       assert.deepEqual(reinit.map((alert) => alert.agentName), ['a-late-g1'], JSON.stringify(alerts));
-      assert.match(reinit[0]!.message, /seeding it again from the template failed: .*injected template compile failure/);
+      assert.match(reinit[0]!.message, /because its seeding from the template failed: .*injected template compile failure/);
       // Reported under the move whose branch its pass judged, not the redo that joined later.
       assert.match(reinit[0]!.message, /^The undo moved the store's branch/);
       assert.equal(reinit[0]!.data?.after, 'undo');
@@ -1179,7 +1179,9 @@ describe('conversation forks and an undo', () => {
       const byAgent = new Map(alerts.filter((alert) => alert.kind === 'context-reinit-failed').map((alert) => [alert.agentName, alert.message]));
       assert.deepEqual([...byAgent.keys()].sort(), ['a', 'a-late-g1'], JSON.stringify(alerts));
       assert.match(byAgent.get('a')!, /injected template init failure/);
-      assert.match(byAgent.get('a-late-g1')!, /the template a's own context manager failed to re-initialize \([^)]*injected template init failure[^)]*\), so it couldn't be seeded again\. If the template still refuses its work, switchBranch\(\) to the current branch/);
+      assert.match(byAgent.get('a-late-g1')!, /couldn't be seeded again, because the template a's own context manager failed to re-initialize \([^)]*injected template init failure[^)]*\)\. It was disposed/);
+      // A spawn seeds from the template too, so the channel spawns again only once it's re-initialized.
+      assert.match(byAgent.get('a-late-g1')!, /Once the template is re-initialized, which a switchBranch\(\) to the current branch or a restart does, the channel's next qualifying message spawns a new fork seeded from the template, under a new name\.$/);
       assert.match(byAgent.get('a-late-g1')!, /no agent reads them again/);
       assert.ok(!framework.getAgent('a-late-g1'), 'the empty fork is disposed');
       assert.equal(framework.getConversationRouter()!.getBinding('world:late'), undefined);
@@ -1264,7 +1266,8 @@ describe('conversation forks and an undo', () => {
       await framework.switchBranch('earlier');
       const reinit = alerts.filter((alert) => alert.kind === 'context-reinit-failed');
       assert.deepEqual(reinit.map((alert) => alert.agentName), ['a-late-g1'], JSON.stringify(alerts));
-      assert.match(reinit[0]!.message, /the conversation template agent "a" is not registered, so it couldn't be seeded again\. Registering an agent under that name, or configuring the conversation router with a registered template, lets the channel's next qualifying message spawn a fork seeded from it\. It was disposed/);
+      assert.match(reinit[0]!.message, /couldn't be seeded again, because no agent is registered as the conversation template "a"\. It was disposed/);
+      assert.match(reinit[0]!.message, /Once an agent is registered under that name, or the conversation router is configured with a registered template, the channel's next qualifying message spawns a new fork seeded from the template, under a new name\.$/);
       assert.ok(!framework.getAgent('a-late-g1'), 'the empty fork is disposed');
       assert.ok(framework.getAgent('a-early-g1'), 'the fork with history stays');
     });
