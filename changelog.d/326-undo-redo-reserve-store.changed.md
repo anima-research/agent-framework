@@ -29,3 +29,9 @@
 - **A second `switchBranch()` made while one holds the store is refused**
   with `OperatorActionError` (`agent-busy`), as the other operator calls
   are.
+- **While the store is held, by a surgery, a branch switch, an undo or a
+  redo, a coalesced update or retraction no longer removes the stored,
+  unread message it updates or withdraws.** The update, or the retraction's
+  notice, is added once the store is released, and a retraction with no
+  notice leaves the message in place, so an agent can read a message
+  withdrawn while the store was held.

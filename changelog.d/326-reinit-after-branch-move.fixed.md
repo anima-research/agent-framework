@@ -22,8 +22,9 @@
   re-initializes nothing. Each move re-initializes every agent on the store,
   one at a time with the event loop running between them, so the store stays
   reserved for longer as agents and their stored history grow, while the
-  host goes on handling events; most of each agent's own re-initialization
-  still runs without a break.
+  host goes on handling events between agents. Each agent's own
+  re-initialization can still hold the host for its whole length, which
+  grows with that agent's stored history.
 - **A conversation agent with no stored message of its own on the branch
   the store moves to is seeded again from the template,** as one spawned
   after the point a move returns to has none there. A conversation agent

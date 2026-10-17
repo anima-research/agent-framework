@@ -7967,15 +7967,13 @@ export class AgentFramework {
    * Called under the move's store reservation, so no turn starts while a
    * manager re-initializes, and the messages the reservation defers for its
    * agents are written after. The managers re-initialize one at a time, with
-   * a turn of the event loop before each: most of a manager's
-   * re-initialization runs synchronously, for a time that grows with its
-   * history, so side by side they would hold the event loop for most of the
-   * pass. A strategy's own initialize can also wait, as an autobiographical
-   * strategy does for its compression-state lock to deliver pending
-   * quarantine alerts, and the event loop can turn then too. Never rejects: it
-   * answers the agents whose re-initialization failed. Each of those
-   * managers refuses its work, as context-manager leaves a failed
-   * initialization, until another one succeeds.
+   * a turn of the event loop before each: a manager's re-initialization can
+   * hold the event loop throughout, for a time that grows with its history,
+   * as an autobiographical strategy's does, so side by side they would hold
+   * it for the whole pass. Never rejects: it answers the agents whose
+   * re-initialization failed. Each of those managers refuses its work, as
+   * context-manager leaves a failed initialization, until another one
+   * succeeds.
    */
   private async reinitializeManagers(except?: string, moved: () => boolean = () => false): Promise<ManagerReinitFailure[]> {
     const failures: ManagerReinitFailure[] = [];
@@ -10702,8 +10700,10 @@ export class AgentFramework {
     // While a move holds the store, nothing touches a manager's stored
     // messages, which may be on the branch the move leaves or under a
     // manager not yet re-initialized. Told the removal didn't happen, the
-    // coalescer appends the replacement as it does whenever one fails, and
-    // the replacement lands at the release with every deferred write.
+    // coalescer does what it does whenever one fails: a replacement, or a
+    // retraction's notice, is appended and lands at the release with every
+    // deferred write, beside the unread message, and a retraction with no
+    // notice leaves that message where it is.
     if (this.surgeryHold) return false;
     const agent = this.agents.get(p.agent);
     if (!agent) return false;
