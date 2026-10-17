@@ -303,6 +303,11 @@ export interface InferenceResult {
 export interface InferenceOptions {
   /** Abort signal for cancellation */
   signal?: AbortSignal;
+  /** Each provider call's progress deadline (membrane's `progressTimeoutMs`):
+   *  DEFAULT_INFERENCE_PROGRESS_TIMEOUT_MS when absent, NaN, zero or negative.
+   *  On expiry the result is aborted, with `abortReason: 'timeout'`: the direct
+   *  API doesn't retry, so what to do next is the caller's. */
+  progressTimeoutMs?: number;
 }
 
 /**

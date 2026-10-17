@@ -4,7 +4,7 @@ export * from './types/index.js';
 // Core classes
 export { AgentFramework, BudgetPreflightError, ProviderWaitNotSleptError, ResumeBlockedError } from './framework.js';
 export type { RuntimeSettingsPreview, HostModeStatus } from './framework.js';
-export { Agent } from './agent.js';
+export { Agent, DEFAULT_INFERENCE_PROGRESS_TIMEOUT_MS } from './agent.js';
 export type { StartStreamResult } from './agent.js';
 export { ProcessQueueImpl } from './queue.js';
 export { ModuleRegistry } from './module-registry.js';

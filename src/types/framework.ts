@@ -172,6 +172,28 @@ export interface FrameworkConfig {
   errorPolicy?: ErrorPolicy;
 
   /**
+   * How long one provider call may go without a parsed provider event before
+   * it is abandoned as stalled (membrane's `progressTimeoutMs`), in ms. It
+   * bounds each agent turn the framework streams and each MCPL server's
+   * inference request. Default 30 minutes (DEFAULT_INFERENCE_PROGRESS_TIMEOUT_MS).
+   *
+   * Keepalives aren't progress, so a provider that holds a stream open with
+   * them while generating nothing ends here instead of hanging the agent. A
+   * stretch with no parsed event counts as no progress whatever the model is
+   * doing, such as thinking a provider doesn't stream, so keep it above the
+   * longest such stretch you expect. A call that streams no events is bounded
+   * as a whole: an MCPL server's non-streaming request, and any call through
+   * an adapter that doesn't stream, such as membrane's Images adapter.
+   *
+   * An agent turn's expiry fails the request as a retryable `timeout`: the
+   * error policy retries it, each attempt with a fresh deadline, and a stall
+   * that persists exhausts the turn with its reason. With the default policy
+   * that is four attempts, so about two hours at the default bound. Infinity
+   * never expires; zero, a negative number or NaN gets the default.
+   */
+  inferenceProgressTimeoutMs?: number;
+
+  /**
    * Host verdict on a failed inference: "this cannot succeed until later".
    * Consulted before the error policy and before the built-in
    * organization-acceleration classification, for a persistent agent's

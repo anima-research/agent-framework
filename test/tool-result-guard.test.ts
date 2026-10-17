@@ -7,8 +7,8 @@ import { PassthroughStrategy, type StoredMessage, type StrategyContext } from '@
 import type { ContentBlock, Membrane, NormalizedRequest, NormalizedResponse, YieldingStreamOptions } from '@animalabs/membrane';
 import { Membrane as RealMembrane, NativeFormatter, type ProviderAdapter, type ProviderRequest,
   type ProviderResponse, type StreamCallbacks } from '@animalabs/membrane';
-import { AgentFramework, type AgentConfig, type AgentSettingsExtension, type Module, type ModuleContext,
-  type ToolCall, type ToolResult, type ProcessEvent, type ProcessState } from '../src/index.js';
+import { AgentFramework, DEFAULT_INFERENCE_PROGRESS_TIMEOUT_MS, type AgentConfig, type AgentSettingsExtension,
+  type Module, type ModuleContext, type ToolCall, type ToolResult, type ProcessEvent, type ProcessState } from '../src/index.js';
 import { TOOL_RESULT_GUARD_AUDIT_STATE, TOOL_RESULT_GUARD_NOTICE, keptWhenWithheld, withheldResultNotice } from '../src/tool-result-guard.js';
 import { MockYieldingStream, createMockResponse } from './helpers/mock-membrane.js';
 import { WorkspaceModule } from '../src/modules/workspace/index.js';
@@ -1077,8 +1077,12 @@ test('backward-compatible direct Agent inference also guards tool results', asyn
   const h = await harness([], { toolResultGuard: true });
   const responses = [calls('one'), refused(), answer()];
   const requests: NormalizedRequest[] = [];
-  (h.membrane as unknown as { stream: (request: NormalizedRequest) => Promise<NormalizedResponse> }).stream = async (request) => {
+  const deadlines: Array<number | undefined> = [];
+  (h.membrane as unknown as {
+    stream: (request: NormalizedRequest, options?: { progressTimeoutMs?: number }) => Promise<NormalizedResponse>;
+  }).stream = async (request, options) => {
     requests.push(structuredClone(request));
+    deadlines.push(options?.progressTimeoutMs);
     const response = responses.shift();
     assert.ok(response);
     return response;
@@ -1092,6 +1096,9 @@ test('backward-compatible direct Agent inference also guards tool results', asyn
     const final = await agent.runInference(h.framework.getAllTools());
     assert.deepEqual(final.speechContent, [{ type: 'text', text: 'continued' }]);
     assert.equal(requests.length, 3);
+    // Each provider call carries the progress deadline, the refusal retry's too.
+    assert.deepEqual(deadlines, [DEFAULT_INFERENCE_PROGRESS_TIMEOUT_MS, DEFAULT_INFERENCE_PROGRESS_TIMEOUT_MS,
+      DEFAULT_INFERENCE_PROGRESS_TIMEOUT_MS]);
     assert.equal(final.usage?.inputTokens, 20, 'abandoned refused attempt usage is included');
     assert.match(JSON.stringify(requests[1]), /direct-original/);
     assert.doesNotMatch(JSON.stringify(requests[2]), /direct-original|discard-this/);
