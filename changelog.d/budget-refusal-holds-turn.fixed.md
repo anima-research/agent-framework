@@ -21,12 +21,12 @@
     message added, edited or removed, the agent's runtime settings, or a
     surgery on the store. A turn released and refused again is held again with
     its first deadline, and isn't released again until one of those changes.
-  - **When it ends without running:** 30 minutes after the refusal that
-    started it, or at once when compression has nothing pending, and the turn
-    then fails as a refused compile did, its reason saying when it was first
-    held. The 30 minutes also bound a compression that is pending but doesn't
-    move. The hold lives in memory: a restart drops it, and the agent's next
-    wake compiles afresh.
+  - **When it ends without a fit:** 30 minutes after the refusal that
+    started it, or at once when compression has nothing pending. The turn
+    then runs if its context fits by then, and otherwise fails as a refused
+    compile did, its reason saying when it was first held. The 30 minutes
+    also bound a compression that is pending but doesn't move. The hold lives
+    in memory: a restart drops it, and the agent's next wake compiles afresh.
   - **What the agent sees:** the held turn's compile carries a note saying
     why it waited, for that compile alone: "[budget-hold] Your context didn't
     fit its budget (100,201 tokens against 48,568), so this turn waited
@@ -36,7 +36,7 @@
     runs on what the undo left (#381 is that for every pending wake).
   - **What hosts see:** the refused attempt emits `inference:failed`, and the
     turn's next start emits `inference:started` again. The turn's terminal
-    event comes when the held turn ends, up to 30 minutes after the refusal,
+    event comes when the held turn ends, after a hold of up to 30 minutes,
     rather than as an exhaustion within seconds. New traces `inference:held`
     and `inference:hold_ended`, and `healthSnapshot()` gives each agent's
     `budgetHold` (or null). The `context-refusal` ops alert goes out when the
