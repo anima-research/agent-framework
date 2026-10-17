@@ -21,11 +21,11 @@
   next tick too.
   Creating a conversation agent waits while a move or a surgery holds the
   store, since its context is seeded from the template's, and a move made
-  while one is being created is refused as busy. An undo or redo that fails leaves the store where it was, with
-  the turn still there to undo or redo, unless its branch has been deleted:
-  a redo whose branch is gone drops that step, and each step right beneath
-  it whose branch is gone too, down to the first whose branch is still
-  there, and says so.
+  while one is being created is refused as busy. An undo or redo that fails
+  leaves the store where it was, with the turn still there to undo or redo
+  (before, a failed undo lost its turn, and a failed redo its step), unless
+  it's a redo whose branch has been deleted, which drops that step and says
+  so, naming the branch and how many redo steps remain.
 - **A second `switchBranch()` made while one holds the store is refused**
   with `OperatorActionError` (`agent-busy`), as the other operator calls
   are.

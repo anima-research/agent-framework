@@ -649,7 +649,7 @@ describe('after a branch move, every agent on the store compiles without a resta
     await works('b');
   });
 
-  it('a redo whose branch was deleted drops that entry and says so, and the redo beneath it still works', async () => {
+  it("a redo whose branch was deleted drops that step and says so, with the switch's error as its cause, and the redo beneath it still works", async () => {
     // Two turns of a's, each checkpointed at its start as a turn is, then
     // undone one after the other.
     const store = framework.getStore();
@@ -665,58 +665,46 @@ describe('after a branch move, every agent on the store compiles without a resta
     const afterFirstUndo = store.currentBranch().name;
     framework.undoLastTurn('a');
     await reinitDone();
+    const afterSecondUndo = store.currentBranch().name;
     assert.equal(framework.getUndoRedoState('a').redoDepth, 2);
     // The top entry returns to the branch the first undo left; delete it.
     store.deleteBranch(afterFirstUndo);
 
-    let message = '';
-    assert.throws(() => framework.redo('a'), (e: unknown) => {
-      message = e instanceof Error ? e.message : String(e);
-      return e instanceof OperatorActionError && e.code === 'failed';
-    });
-    assert.match(message, new RegExp(`${afterFirstUndo}, no longer exists, so that step is dropped\\. The step now on top can be redone \\(1 remaining\\)\\.$`));
-    assert.equal(framework.getUndoRedoState('a').redoDepth, 1, 'the dead entry is gone');
+    // The error the switch itself throws for the deleted branch.
+    const mover = store as unknown as { switchBranch: (name: string) => void };
+    const switchBranch = mover.switchBranch.bind(store);
+    let switchError: unknown;
+    mover.switchBranch = (name: string) => {
+      try {
+        return switchBranch(name);
+      } catch (error) {
+        switchError = error;
+        throw error;
+      }
+    };
+    let thrown: unknown;
+    try {
+      assert.throws(() => framework.redo('a'), (e: unknown) => {
+        thrown = e;
+        return e instanceof OperatorActionError && e.code === 'failed';
+      });
+    } finally {
+      mover.switchBranch = switchBranch;
+    }
+    assert.ok(switchError, 'the switch refused the deleted branch');
+    assert.equal((thrown as Error).cause, switchError, "the switch's own error is the cause");
+    assert.match((thrown as Error).message,
+      new RegExp(`${afterFirstUndo}, no longer exists, so that step is dropped\\. 1 redo step remains\\.$`));
+    assert.equal(store.currentBranch().name, afterSecondUndo, 'the store stays where it was');
+    assert.equal(framework.getUndoRedoState('a').redoDepth, 1, 'the dead step is gone');
     assert.equal(internals().surgeryHold, null);
 
     const redone = framework.redo('a');
-    assert.equal(redone.redone, true, 'the entry beneath it redoes');
+    assert.equal(redone.redone, true, 'the step beneath it redoes');
     await reinitDone();
     assert.equal(store.currentBranch().name, 'main');
     await works('a');
     await works('b');
-  });
-
-  it('a redo drops every step on top whose branch is gone, says how many, and says when none remain', async () => {
-    // Start on a branch of the test's own, so the bottom step's branch can go too.
-    const store = framework.getStore();
-    store.createBranchAt('work', 'main', store.currentSequence());
-    await framework.switchBranch('work');
-    const before1 = store.currentSequence();
-    const turn1 = { agentName: 'a', turnIndex: 1, sequenceBefore: before1, branchName: 'work', timestamp: Date.now() };
-    internals().saveTurnCheckpoints('a', [turn1]);
-    cmOf('a').addMessage('user', text('turn one'));
-    const before2 = store.currentSequence();
-    internals().saveTurnCheckpoints('a', [turn1, { agentName: 'a', turnIndex: 2, sequenceBefore: before2, branchName: 'work', timestamp: Date.now() }]);
-    cmOf('a').addMessage('user', text('turn two'));
-    framework.undoLastTurn('a');
-    await reinitDone();
-    const afterFirstUndo = store.currentBranch().name;
-    framework.undoLastTurn('a');
-    await reinitDone();
-    assert.equal(framework.getUndoRedoState('a').redoDepth, 2);
-    // The top step returns to the branch the first undo left, the one beneath to `work`.
-    store.deleteBranch(afterFirstUndo);
-    store.deleteBranch('work');
-
-    let message = '';
-    assert.throws(() => framework.redo('a'), (e: unknown) => {
-      message = e instanceof Error ? e.message : String(e);
-      return e instanceof OperatorActionError && e.code === 'failed';
-    });
-    assert.match(message, new RegExp(`${afterFirstUndo}, no longer exists, so that step is dropped, with the one beneath it, whose branch is gone too\\. No redo steps remain\\.$`));
-    assert.equal(framework.getUndoRedoState('a').redoDepth, 0);
-    assert.equal(internals().surgeryHold, null);
-    await works('a');
   });
 
   it("a redo whose switch fails while the branch listing fails too keeps its step, and answers the switch's error", async () => {

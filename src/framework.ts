@@ -7760,39 +7760,26 @@ export class AgentFramework {
     try {
       this.store.switchBranch(branchName);
     } catch (error) {
-      // The store didn't move. While the branch exists, the turn is still
-      // there to redo. A branch deleted since the undo can't come back, so
-      // its entry goes: kept, it would refuse every redo and hide the ones
-      // beneath it.
-      move.abandon();
-      let names: Set<string>;
+      // The store didn't move. While the branch exists, or when whether it
+      // does can't be read, the turn is still there to redo, and the caller
+      // hears the switch's own error. A branch deleted since the undo can't
+      // come back, so its step goes, and the error says so: without that,
+      // a caller couldn't tell a dropped step from a kept one, and a retry
+      // would redo the step beneath it.
+      let gone = false;
       try {
-        names = new Set(this.store.listBranches().map((b) => b.name));
+        gone = !this.store.listBranches().some((b) => b.name === branchName);
       } catch {
-        // Whether the branch is still there isn't known, so the step stays,
-        // and the caller hears the switch's own error.
-        redoStack.push(entry);
-        throw error;
+        // Not known, so the step stays.
       }
-      if (names.has(branchName)) {
-        redoStack.push(entry);
-        throw error;
-      }
-      // Steps beneath whose branches are gone too go with it, so the step
-      // left on top is one a redo can take.
-      let dropped = 1;
-      while (redoStack.length > 0 && !names.has(redoStack[redoStack.length - 1]!.branchName)) {
-        redoStack.pop();
-        dropped++;
-      }
+      if (!gone) redoStack.push(entry);
+      move.abandon();
+      if (!gone) throw error;
+      const left = redoStack.length;
       throw new OperatorActionError(
         'failed',
-        `Cannot redo: the branch this redo returns to, ${branchName}, no longer exists, so that step is dropped` +
-          (dropped > 2 ? `, with the ${dropped - 1} beneath it whose branches are gone too. `
-            : dropped === 2 ? ', with the one beneath it, whose branch is gone too. ' : '. ') +
-          (redoStack.length > 0
-            ? `The step now on top can be redone (${redoStack.length} remaining).`
-            : 'No redo steps remain.'),
+        `Cannot redo: the branch this redo returns to, ${branchName}, no longer exists, so that step is dropped. ` +
+          (left === 0 ? 'No redo steps remain.' : left === 1 ? '1 redo step remains.' : `${left} redo steps remain.`),
         { cause: error },
       );
     }
