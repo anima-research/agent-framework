@@ -1451,11 +1451,19 @@ describe("a round that runs code_execution is routed once its scripts return (re
     try {
       const created = await h.framework.createEphemeralAgent({ name: 'eph-script', model: 'test-model', systemPrompt: 'Act.', allowedTools: 'all' });
       created.contextManager.addMessage('user', [{ type: 'text', text: 'go' }]);
-      // The idle watchdog disposes the ephemeral while its script waits in the slow call.
-      const run = h.framework.runEphemeralToCompletion(created.agent, created.contextManager, { startupTimeoutMs: 15000, idleTimeoutMs: 300, idlePollMs: 20 });
+      // The idle watchdog disposes the ephemeral while its script waits in the
+      // slow call. Its threshold is too long for python3's start to trip it, so
+      // the run is made to look idle only once the script is in the slow call,
+      // and the next poll disposes it.
+      const run = h.framework.runEphemeralToCompletion(created.agent, created.contextManager, { startupTimeoutMs: 15000, idleTimeoutMs: 60_000, idlePollMs: 20 });
+      const stalled = assert.rejects(run, /stalled/);
       h.framework.start();
-      await assert.rejects(run, /stalled/);
-      assert.ok(h.log.includes('tool:slow'), 'the script was running when the ephemeral was disposed');
+      const deadline = Date.now() + 15000;
+      while (Date.now() < deadline && !h.log.includes('tool:slow')) await new Promise((r) => setTimeout(r, 10));
+      assert.ok(h.log.includes('tool:slow'), 'the script reached the slow call');
+      const runs = (h.framework as unknown as { ephemeralRuns: Map<string, { lastActivity: number }> }).ephemeralRuns;
+      runs.get(created.agent.name)!.lastActivity = 0;
+      await stalled;
       // The script now returns, and its result arrives with the framework still running.
       let resulted!: () => void;
       const result = new Promise<void>((resolve) => { resulted = resolve; });
