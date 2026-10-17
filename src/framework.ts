@@ -571,8 +571,10 @@ interface TurnRouting {
    * system markers can't move it (2026-07-21 Cairn lounge misroute). Since
    * 2026-07-31 a re-pin moves it (repinTurnLocus): an addressed message, or a
    * follow-up in a channel the turn engaged. The agent's own channel_open
-   * moves it too. Unset in explicit and disabled mode, and for a turn with
-   * nowhere to speak.
+   * moves it too. None of these sets or moves it to a channel that refuses
+   * speech (ChannelRegistry.refusesSpeech), as of when it's set: a channel
+   * marked later keeps a locus it already holds until the turn ends. Unset
+   * in explicit and disabled mode, and for a turn with nowhere to speak.
    */
   locus?: string;
   /**
@@ -10918,13 +10920,16 @@ export class AgentFramework {
    * re-pin rule (2026-07-31, n=6 and n=7): a conversational message (not a
    * reaction or a system marker) that addressed the agent, or that follows
    * up in a channel the turn sent into (TurnRouting.engaged). Undefined for
-   * any other message. A tool boundary weighs the messages it injects by it,
-   * and noteArrival the ones no boundary of the turn weighs.
+   * any other message, and for one from a channel that refuses speech
+   * (ChannelRegistry.refusesSpeech), which names no conversation. A tool
+   * boundary weighs the messages it injects by it, and noteArrival the ones
+   * no boundary of the turn weighs.
    */
   private repinChannel(metadata: MessageMetadata | undefined, routing: TurnRouting): string | undefined {
     if (!isConversationalInjection(metadata)) return undefined;
     const m = metadata as Record<string, unknown> | undefined;
     if (typeof m?.channelId !== 'string') return undefined;
+    if (this.channelRegistry?.refusesSpeech(m.channelId)) return undefined;
     if (isAddressedMessage(m.tags as string[] | undefined, m)) return m.channelId;
     return routing.engaged.has(m.channelId) ? m.channelId : undefined;
   }
@@ -11815,7 +11820,8 @@ export class AgentFramework {
       // a previous turn's channel.
       routing.triggerChannel = trigger?.channelId;
       // FREEZE the turn's outbound locus now (turn-frozen routing): the home
-      // channel for forks, else the trigger channel, else the global default.
+      // channel for forks, else the trigger channel, else the global default,
+      // skipping a channel that refuses speech (ChannelRegistry.refusesSpeech).
       // Mid-turn injections must not redirect the agent's plain prose
       // (ambient chatter and reactions hijacked it before, 2026-07-21), and
       // the eager snapshot protects heartbeat turns from a moving
@@ -18394,7 +18400,11 @@ export class AgentFramework {
           const opened =
             (result.data as { channelId?: string } | undefined)?.channelId
             ?? (call.input as { channelId?: string } | undefined)?.channelId;
-          if (opened) {
+          // A channel that refuses speech (ChannelRegistry.refusesSpeech)
+          // names no conversation: opening it is for listening, so it moves
+          // neither the turn's trigger channel nor its locus, and nothing is
+          // announced.
+          if (opened && !this.channelRegistry?.refusesSpeech(opened)) {
             callingTurn.triggerChannel = opened;
             const openerAgent = this.agents.get(agentName);
             // The move is one this result tells the agent, so it needs the

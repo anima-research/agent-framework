@@ -1538,6 +1538,7 @@ describe('present while acting', () => {
       framework.agents = new Map([['assistant', { proseRouting: 'locus' }]]);
       framework.channelRegistry = {
         handleChannelToolCall: () => new Promise((resolve) => { resolveOpen = resolve; }),
+        refusesSpeech: () => false,
       };
       framework.turnRouting = new Map([['assistant', calling]]);
       framework.openLogical = new Map([['assistant', calling]]);
@@ -1577,6 +1578,7 @@ describe('present while acting', () => {
       framework.agents = new Map([['assistant', { proseRouting: 'locus' }]]);
       framework.channelRegistry = {
         handleChannelToolCall: async () => ({ success: true, data: { channelId: 'discord:guild:observatory' } }),
+        refusesSpeech: () => false,
       };
       framework.turnRouting = new Map([['assistant', calling]]);
       if (!silent) framework.openLogical = new Map([['assistant', calling]]);
@@ -1596,6 +1598,33 @@ describe('present while acting', () => {
       assert.equal(results[0]!.result.data?.routing !== undefined, !silent, 'the result tells the agent only of a move it made');
     });
   }
+
+  it('a channel_open of a channel marked speech none moves neither the trigger channel, the locus nor the announce baseline, and says nothing', async () => {
+    const calling: { engaged: Set<string>; triggerChannel?: string; locus?: string } = { engaged: new Set(), locus: 'chan-before' };
+    const framework = bareFramework();
+    framework.agents = new Map([['assistant', { proseRouting: 'locus' }]]);
+    framework.channelRegistry = {
+      handleChannelToolCall: async () => ({ success: true, data: { channelId: 'terminal:build' } }),
+      refusesSpeech: (channelId: string) => channelId === 'terminal:build',
+    };
+    framework.turnRouting = new Map([['assistant', calling]]);
+    framework.openLogical = new Map([['assistant', calling]]);
+    (framework.activeTurnTriggers as Map<string, unknown>).set('assistant', {});
+    const results: Array<{ result: { success?: boolean; data?: { routing?: string } } }> = [];
+    framework.pushEvent = (event: { type: string }) => {
+      if (event.type === 'tool-result') results.push(event as unknown as { result: { success?: boolean; data?: { routing?: string } } });
+    };
+
+    framework.dispatchChannelToolCall('assistant', {
+      id: 'open-1', name: 'channel_open', input: { channelId: 'terminal:build' },
+    });
+    await until(() => results.length > 0, 'the tool result');
+
+    assert.equal(results[0]!.result.success, true, 'the open itself succeeded');
+    assert.deepEqual(calling, { engaged: new Set(), locus: 'chan-before' }, 'neither the trigger channel nor the locus moved');
+    assert.equal((framework.lastAnnouncedLocus as Map<string, string>).get('assistant'), undefined, 'the announce baseline stayed as it was');
+    assert.equal(results[0]!.result.data?.routing, undefined, 'and the result tells the agent of no move');
+  });
 
   it('a prose turn ends with a [delivered] receipt naming where the prose landed', async () => {
     // Explicit sends receipt themselves via tool_result; auto-routed prose
@@ -1755,6 +1784,123 @@ describe('present while acting', () => {
     await framework.runUntilIdle();
 
     assert.deepEqual(routed.map((r) => r.text), ['walking over', 'there']);
+
+    await framework.stop();
+  });
+
+  it('an addressed mid-turn message from a speech-none channel does not re-pin the locus', async () => {
+    // A channel marked speech: 'none' (a terminal session) names no
+    // conversation, so even a message from it that addresses the agent
+    // leaves the agent's prose where the turn's conversation is.
+    membrane.pushResponse(createMockResponse([
+      { type: 'text', text: 'Starting the build.' },
+      { type: 'tool_use', id: 'c1', name: 'robot--move', input: { dir: 'north' } },
+    ] as ContentBlock[], 'tool_use'));
+    membrane.pushResponse(createMockResponse([
+      { type: 'text', text: 'The build is still running.' },
+    ] as ContentBlock[]));
+
+    const framework = await createFramework();
+    const routed = stubChannelRegistry(framework);
+    (framework as unknown as { channelRegistry: { refusesSpeech?: unknown } }).channelRegistry.refusesSpeech =
+      (channelId: string) => channelId === 'terminal:build';
+    module.toolDelayMs = 25;
+    module.interjection = 'build: needs input';
+    module.interjectionMetadata = { channelId: 'terminal:build', tags: ['chat:addressed'] };
+
+    const notices: string[] = [];
+    framework.onTrace((event) => {
+      const e = event as { type: string; source?: string };
+      if (e.type === 'message:added' && e.source === 'routing-notice') notices.push(e.source!);
+    });
+
+    trigger(framework);
+    await framework.runUntilIdle();
+
+    assert.deepEqual(routed, [
+      { text: 'Starting the build.', locus: 'chan-live-1' },
+      { text: 'The build is still running.', locus: 'chan-live-1' },
+    ], 'trailing prose stays at the frozen locus');
+    assert.equal(notices.length, 1, 'only the boot baseline is announced: no re-pin notice');
+    const wired = membrane.lastStream!.receivedToolResultOptions
+      .flatMap((o) => o?.injectedMessages ?? [])
+      .map((m) => JSON.stringify(m.content));
+    assert.ok(wired.some((t) => t.includes('build: needs input')), 'the message itself still reached the agent');
+
+    await framework.stop();
+  });
+
+  it('a follow-up from a speech-none channel the turn sent into does not re-pin the locus either', async () => {
+    // The engaged-channel leg of the re-pin: the agent sent into the
+    // terminal this turn, and the session's next output follows up there.
+    // A marked channel names no conversation, so the prose stays put.
+    membrane.pushResponse(createMockResponse([
+      { type: 'tool_use', id: 'c1', name: 'robot--move', input: { dir: 'north' } },
+    ] as ContentBlock[], 'tool_use'));
+    membrane.pushResponse(createMockResponse([
+      { type: 'text', text: 'The build is still running.' },
+    ] as ContentBlock[]));
+
+    const framework = await createFramework();
+    const routed = stubChannelRegistry(framework);
+    (framework as unknown as { channelRegistry: { refusesSpeech?: unknown } }).channelRegistry.refusesSpeech =
+      (channelId: string) => channelId === 'terminal:build';
+    module.toolDelayMs = 25;
+    module.interjection = 'build: 60%';
+    module.interjectionMetadata = { channelId: 'terminal:build', tags: ['terminal:output'] };
+    // As in the engaged-channel test above: seed the turn's engaged set with
+    // the terminal, as a send into it this turn would.
+    const origHandle = module.handleToolCall.bind(module);
+    module.handleToolCall = async (call) => {
+      (framework as unknown as {
+        turnRouting: Map<string, { engaged: Set<string> }>;
+      }).turnRouting.get('assistant')!.engaged.add('terminal:build');
+      return origHandle(call);
+    };
+
+    trigger(framework);
+    await framework.runUntilIdle();
+
+    assert.deepEqual(routed, [
+      { text: 'The build is still running.', locus: 'chan-live-1' },
+    ], 'trailing prose stays at the frozen locus');
+
+    await framework.stop();
+  });
+
+  it('channel_open of a speech-none channel opens it without moving or announcing the locus', async () => {
+    // Opening a terminal session's channel is for listening to it. The
+    // agent's prose stays where the turn's conversation is, and the tool
+    // result carries no routing note.
+    membrane.pushResponse(createMockResponse([
+      { type: 'tool_use', id: 'c1', name: 'channel_open', input: { channelId: 'terminal:build' } },
+    ] as ContentBlock[], 'tool_use'));
+    membrane.pushResponse(createMockResponse([
+      { type: 'text', text: 'Watching the build now.' },
+    ] as ContentBlock[]));
+
+    const framework = await createFramework();
+    const routed = stubChannelRegistry(framework);
+    const registry = (framework as unknown as { channelRegistry: Record<string, unknown> }).channelRegistry;
+    let opens = 0;
+    (registry as { handleChannelToolCall?: unknown }).handleChannelToolCall = async () => {
+      opens++;
+      return { success: true, data: { channelId: 'terminal:build', opened: true } };
+    };
+    (registry as { refusesSpeech?: unknown }).refusesSpeech = (channelId: string) => channelId === 'terminal:build';
+
+    trigger(framework);
+    await framework.runUntilIdle();
+
+    assert.equal(opens, 1, 'the open itself went to the registry');
+    assert.deepEqual(routed, [
+      { text: 'Watching the build now.', locus: 'chan-live-1' },
+    ], 'prose after the open stays at the frozen locus');
+    const results = membrane.lastStream!.receivedToolResults.flat() as Array<{ content?: unknown }>;
+    assert.ok(
+      !JSON.stringify(results).includes('plain speech now lands in this channel'),
+      'no routing note in the channel_open tool result',
+    );
 
     await framework.stop();
   });
