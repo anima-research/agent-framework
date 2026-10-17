@@ -17,8 +17,7 @@ import type {
   ToolResult,
 } from '../src/index.js';
 import { AgentFramework } from '../src/index.js';
-import { JsStore } from '@animalabs/chronicle';
-import { createMockResponse, MockMembrane, MockYieldingStream } from './helpers/mock-membrane.js';
+import { createMockResponse, HeldStream, MockMembrane, MockYieldingStream } from './helpers/mock-membrane.js';
 
 class EphemeralToolModule implements Module {
   readonly name = 'test';
@@ -142,8 +141,8 @@ async function runStartedEphemeral(
   return promise;
 }
 
-// For a run that stop() is to end: its turn has started inference, so if the
-// refusal didn't end it, only the idle watchdog would, after fifteen minutes.
+// For a run that stop() is to end: its turn has started inference, so if
+// stop() didn't end it, only the idle watchdog would, after fifteen minutes.
 // A short one turns that into a "stalled" rejection, which the refusal's
 // pattern doesn't match.
 const STOPPED_RUN_WATCHDOGS = { idleTimeoutMs: 20_000, idlePollMs: 50 };
@@ -154,7 +153,7 @@ async function stopAndRemove(framework: AgentFramework, tempDir: string): Promis
 }
 
 describe('runEphemeralToCompletion settle signal', () => {
-  it('a run whose turn stop() refuses ends at once, and a run asked for once stop() has begun is refused', { timeout: 60_000 }, async () => {
+  it('a run whose turn stop() refuses ends during stop(), and a run asked for once stop() has begun is refused', { timeout: 60_000 }, async () => {
     const { tempDir, storePath } = tempStorePath('ephemeral-stopping-');
     const membrane = new MockMembrane();
     membrane.pushResponse(createMockResponse([{ type: 'text', text: 'too late' }]));
@@ -195,7 +194,7 @@ describe('runEphemeralToCompletion settle signal', () => {
     }
   });
 
-  it('a run whose turn stop() refuses before its compile ends at once', { timeout: 60_000 }, async () => {
+  it('a run whose turn stop() refuses before its compile ends during stop()', { timeout: 60_000 }, async () => {
     // The turn waits on its modules' context when stop() begins, so it is
     // refused before it compiles, not after.
     const { tempDir, storePath } = tempStorePath('ephemeral-stopping-precompile-');
@@ -236,9 +235,10 @@ describe('runEphemeralToCompletion settle signal', () => {
     }
   });
 
-  it('a run waiting to retry when stop() begins gives up before its turn starts again, and ends at once', { timeout: 60_000 }, async () => {
+  it('a run waiting to retry when stop() begins gives up before its turn starts again, and ends during stop()', { timeout: 60_000 }, async () => {
     // stop() ends the retry's wait, which cancels the retry before its turn
-    // starts again; the run ends then, not when its idle watchdog fires.
+    // starts again; the run ends during stop(), not when its idle watchdog
+    // fires.
     const { tempDir, storePath } = tempStorePath('ephemeral-retry-stopping-');
     let waiting!: () => void;
     const inDelay = new Promise<void>((resolve) => { waiting = resolve; });
@@ -282,7 +282,7 @@ describe('runEphemeralToCompletion settle signal', () => {
     }
   });
 
-  it('a run whose stream failed and waits to retry ends at once when stop() begins', { timeout: 60_000 }, async () => {
+  it('a run whose stream failed and waits to retry ends during stop()', { timeout: 60_000 }, async () => {
     // The stream's own retry: stop() ends its wait and cancels it there.
     const { tempDir, storePath } = tempStorePath('ephemeral-stream-retry-stopping-');
     let waiting!: () => void;
@@ -323,14 +323,12 @@ describe('runEphemeralToCompletion settle signal', () => {
     }
   });
 
-  it('a turn asked for once stop() has begun does not start, and its run ends at once', { timeout: 60_000 }, async () => {
-    // As a wake the loop dequeued before stop() ended it would be: refused
-    // before the turn starts. The run, whose request never reached the loop,
-    // ends then, not when its startup watchdog fires.
-    const tempDir = mkdtempSync(join(tmpdir(), 'ephemeral-late-turn-'));
-    // A store the framework doesn't own stays open after stop(), as the run's
-    // own cleanup needs it to.
-    const store = JsStore.openOrCreate({ path: join(tempDir, 'store') });
+  it("a run whose wake the event loop hasn't taken up when stop() begins ends during stop(), not at its startup watchdog", { timeout: 60_000 }, async () => {
+    // The run is asked for and stop() begins in the same tick. Nothing is
+    // queued for the loop, so it isn't handling an event, the one place it
+    // still takes a wake up after stop() has stopped it: the run's wake stays
+    // untaken, and no turn of the run's starts or is refused (#335).
+    const { tempDir, storePath } = tempStorePath('ephemeral-untaken-wake-');
     let gathered = 0;
     const contextModule: Module = new EphemeralToolModule();
     contextModule.gatherContext = async () => {
@@ -338,7 +336,7 @@ describe('runEphemeralToCompletion settle signal', () => {
       return [];
     };
     const framework = await AgentFramework.create({
-      store,
+      storePath,
       membrane: new MockMembrane().asMembrane(),
       agents: [],
       modules: [contextModule],
@@ -346,15 +344,173 @@ describe('runEphemeralToCompletion settle signal', () => {
     });
     try {
       const { agent, contextManager } = await createEphemeral(framework);
-      // Asked for, but the event loop never started, so its turn waits.
-      const run = framework.runEphemeralToCompletion(agent, contextManager, STOPPED_RUN_WATCHDOGS);
-      await framework.stop();
-      await (framework as unknown as { startAgentStream(a: typeof agent): Promise<void> }).startAgentStream(agent);
+      framework.start();
+      // A startup watchdog the test outlasts: if stop() didn't end the run,
+      // the watchdog would fire after stop() had closed the store, and the
+      // run's cleanup, writing to that store, would throw "Store has been
+      // closed" in place of the watchdog's refusal, which the pattern doesn't
+      // match.
+      const run = framework.runEphemeralToCompletion(agent, contextManager, { startupTimeoutMs: 5_000 });
+      const stopped = framework.stop();
       await assert.rejects(run, /refused: the framework is stopping/);
-      assert.equal(gathered, 0, 'the turn did not start');
+      await stopped;
+      const pending = (framework as unknown as { pendingRequests: Array<{ agentName: string }> }).pendingRequests;
+      assert.ok(pending.some((request) => request.agentName === agent.name), 'the loop never took the wake up');
+      assert.equal(gathered, 0, 'no turn of the run started');
     } finally {
-      store.close();
       rmSync(tempDir, { recursive: true, force: true });
+    }
+  });
+
+  /** A resident whose stream stop() has to wait for, until the test releases it. */
+  async function frameworkHeldByAResident(storePath: string, released: Promise<void>, options: {
+    workerStream?: () => YieldingStream;
+    errorPolicy?: ErrorPolicy;
+  } = {}) {
+    let streaming!: () => void;
+    const residentStreaming = new Promise<void>((resolve) => { streaming = resolve; });
+    let slow!: () => void;
+    const inSlowEvent = new Promise<void>((resolve) => { slow = resolve; });
+    const membrane = new MockMembrane();
+    membrane.streamYielding = (request) => {
+      membrane.calls.push(request);
+      if (JSON.stringify(request.system ?? '').includes('Do the task.')) {
+        return options.workerStream?.() ?? new MockYieldingStream([createMockResponse([{ type: 'text', text: 'worker ran' }])]);
+      }
+      streaming();
+      return new HeldStream(released, [createMockResponse([{ type: 'text', text: 'resident done' }])]);
+    };
+    const events: Module = {
+      name: 'events',
+      async start() {},
+      async stop() {},
+      getTools: () => [],
+      async handleToolCall() { return { success: true }; },
+      async onProcess(event) {
+        if (event.type !== 'external-message') return {};
+        const text = String((event as { content?: unknown }).content);
+        if (text === 'slow') {
+          slow();
+          await new Promise((resolve) => setTimeout(resolve, 100));
+          return {};
+        }
+        return { addMessages: [{ participant: 'User', content: [{ type: 'text', text }] }], requestInference: true };
+      },
+    };
+    const framework = await AgentFramework.create({
+      storePath,
+      membrane: membrane.asMembrane(),
+      agents: [{ name: 'assistant', model: 'test-model', systemPrompt: 'test' }],
+      modules: [events],
+      syncIntervalMs: 0,
+      ...(options.errorPolicy ? { errorPolicy: options.errorPolicy } : {}),
+    });
+    const push = (content: string) =>
+      framework.pushEvent({ type: 'external-message', source: 'test', content, metadata: {} } as unknown as ProcessEvent);
+    return { framework, membrane, residentStreaming, inSlowEvent, push };
+  }
+
+  it("a run whose turn stop() refuses ends with the refusal when its startup watchdog fires before stop()'s sweep", { timeout: 60_000 }, async () => {
+    // stop() waits on a resident's stream until the test releases it, so its
+    // sweep comes after that. Meanwhile the loop, finishing a slow event,
+    // takes the run's wake up and refuses its turn, and the run's startup
+    // watchdog fires first. Once stop() has begun, it says why the run ended,
+    // the framework is stopping, and what it saw, but blames no stalled loop.
+    const { tempDir, storePath } = tempStorePath('ephemeral-held-stop-startup-');
+    let release!: () => void;
+    const released = new Promise<void>((resolve) => { release = resolve; });
+    const { framework, membrane, residentStreaming, inSlowEvent, push } = await frameworkHeldByAResident(storePath, released);
+    try {
+      const { agent, contextManager } = await createEphemeral(framework);
+      framework.start();
+      push('go');
+      await residentStreaming;
+      push('slow');
+      await inSlowEvent;
+      // Well past the slow event's 100 ms, so the loop has taken the wake up
+      // and refused the turn before the watchdog fires.
+      const run = framework.runEphemeralToCompletion(agent, contextManager, { startupTimeoutMs: 1_000 });
+      const stopped = framework.stop();
+      // The held stream is released only after this, so the sweep can't have
+      // ended the run.
+      await assert.rejects(run, /refused: the framework is stopping \(inference not started within 1000ms\)/);
+      const pending = (framework as unknown as { pendingRequests: Array<{ agentName: string }> }).pendingRequests;
+      assert.ok(!pending.some((request) => request.agentName === agent.name), "the loop took the run's wake up");
+      release();
+      await stopped;
+      assert.equal(membrane.calls.length, 1, "the run's turn sent nothing");
+    } finally {
+      release();
+      rmSync(tempDir, { recursive: true, force: true });
+    }
+  });
+
+  it("a run whose retry stop() cancels ends with the refusal when its idle watchdog fires before stop()'s sweep", { timeout: 60_000 }, async () => {
+    // The run's stream can't start, and stop() cancels its retry while it
+    // waits on a resident's stream. The run's inference had started, so its
+    // idle watchdog is the one that fires first.
+    const { tempDir, storePath } = tempStorePath('ephemeral-held-stop-idle-');
+    let release!: () => void;
+    const released = new Promise<void>((resolve) => { release = resolve; });
+    let waiting!: () => void;
+    const inDelay = new Promise<void>((resolve) => { waiting = resolve; });
+    const { framework, membrane, residentStreaming, push } = await frameworkHeldByAResident(storePath, released, {
+      workerStream: () => { throw new Error('the stream could not start'); },
+      errorPolicy: {
+        maxRetries: 1,
+        onInferenceError: (_error: Error, _agent: string, attempt: number): ErrorAction => {
+          waiting();
+          // Long enough that only stop() ends the wait.
+          return attempt < 1 ? { retry: true, delayMs: 60_000 } : { retry: false };
+        },
+      },
+    });
+    try {
+      const { agent, contextManager } = await createEphemeral(framework);
+      framework.start();
+      push('go');
+      await residentStreaming;
+      const run = framework.runEphemeralToCompletion(agent, contextManager, { idleTimeoutMs: 300, idlePollMs: 50 });
+      await inDelay;
+      const stopped = framework.stop();
+      // As above: the held stream is released only after this.
+      await assert.rejects(run, /refused: the framework is stopping \(no stream-driver activity for \d+s after inference started\)/);
+      release();
+      await stopped;
+      assert.equal(membrane.calls.length, 2, 'the resident streamed once, and the run tried once and was not retried');
+    } finally {
+      release();
+      rmSync(tempDir, { recursive: true, force: true });
+    }
+  });
+
+  it('an idle watchdog that fires with no stop() under way keeps its stall diagnosis', { timeout: 60_000 }, async () => {
+    // The run's stream starts and then yields nothing. Only once stop() has
+    // begun does the idle watchdog give the refusal instead.
+    const { tempDir, storePath } = tempStorePath('ephemeral-idle-no-stop-');
+    let release!: () => void;
+    const released = new Promise<void>((resolve) => { release = resolve; });
+    const membrane = new MockMembrane();
+    membrane.streamYielding = (request) => {
+      membrane.calls.push(request);
+      return new HeldStream(released, [createMockResponse([{ type: 'text', text: 'too late' }])]);
+    };
+    const framework = await AgentFramework.create({
+      storePath,
+      membrane: membrane.asMembrane(),
+      agents: [],
+      modules: [new EphemeralToolModule()],
+      syncIntervalMs: 0,
+    });
+    try {
+      const { agent, contextManager } = await createEphemeral(framework);
+      framework.start();
+      const run = framework.runEphemeralToCompletion(agent, contextManager, { idleTimeoutMs: 300, idlePollMs: 50 });
+      await assert.rejects(run, /stalled: no stream-driver activity for \d+s after inference started .*Stream likely dropped/);
+      assert.equal(membrane.calls.length, 1, 'the run streamed once');
+    } finally {
+      release();
+      await stopAndRemove(framework, tempDir);
     }
   });
 

@@ -52,19 +52,16 @@
   so that reordered their shared transcript.
 - `stop()` now stores what is still deferred for each registered agent
   before the store closes, in the order it arrived; before, a memory-only
-  queue lost it. Once `stop()` begins, a new ephemeral run is refused, and
-  an ephemeral run whose turn is refused because `stop()` has closed
-  admission, or whose retry `stop()` cancels, ends at once rather than
-  waiting for a watchdog. Since no turn starts or registers a stream once
-  `stop()` begins (unless `start()` is called before it finishes), no reply
-  can then follow a stored entry in a stream, so `stop()` stores each one
-  even while a frame it doesn't wait for still holds its target's turn, such
-  as a turn started outside the event loop, or a puppet call still running
-  after `stop()`'s wait for operator operations timed out; that call's pair
-  then lands after them. A quiesced host keeps what is deferred in its
-  persisted queue for boot recovery. An entry for a target no longer
-  registered (a disposed fork) is dropped from a memory-only queue at exit,
-  as before.
+  queue lost it. Once `stop()` begins, a new ephemeral run is refused. Since
+  no turn starts or registers a stream once `stop()` begins (unless
+  `start()` is called before it finishes), no reply can then follow a stored
+  entry in a stream, so `stop()` stores each one even while a frame it
+  doesn't wait for still holds its target's turn, such as a turn started
+  outside the event loop, or a puppet call still running after `stop()`'s
+  wait for operator operations timed out; that call's pair then lands after
+  them. A quiesced host keeps what is deferred in its persisted queue for
+  boot recovery. An entry for a target no longer registered (a disposed
+  fork) is dropped from a memory-only queue at exit, as before.
 - What is deferred for a conversation fork whose closure turn ends, or for
   an ephemeral run that ends, is now stored in that agent's store before the
   fork is disposed or the run deregistered. Before, the turn-end flush ran

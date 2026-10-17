@@ -171,6 +171,22 @@ export class MockYieldingStream implements YieldingStream {
   }
 }
 
+/**
+ * A stream that yields nothing until `released` settles, cancel included: a
+ * stream whose teardown stop() has to wait for.
+ */
+export class HeldStream extends MockYieldingStream {
+  constructor(private readonly released: Promise<void>, responses: NormalizedResponse[]) {
+    super(responses);
+  }
+
+  override async *[Symbol.asyncIterator](): AsyncGenerator<StreamEvent> {
+    await this.released;
+    const inner = super[Symbol.asyncIterator]();
+    for (let next = await inner.next(); !next.done; next = await inner.next()) yield next.value;
+  }
+}
+
 export class MockMembrane {
   responses: NormalizedResponse[] = [];
   calls: NormalizedRequest[] = [];

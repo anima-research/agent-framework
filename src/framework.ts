@@ -717,6 +717,22 @@ interface ProseRound {
   routing: TurnRouting;
 }
 
+/** What an ephemeral run ends with once stop() has begun, whatever ends it:
+ *  stop()'s sweep or one of the run's watchdogs. A watchdog adds what it saw
+ *  but names no cause. While stop() waits, a run whose turn it refused looks
+ *  the same as one whose stream, or whose event loop, never settles, and
+ *  only the latter two are faults: what the watchdog saw may or may not be
+ *  why stop() is slow. */
+function ephemeralRunStopped(name: string, observed?: string): Error {
+  return new Error(`Ephemeral agent "${name}" refused: the framework is stopping${observed ? ` (${observed})` : ''}`);
+}
+
+/** The reason on the inference:aborted that ends a turn whose retry stop()
+ *  cancelled, whichever frame was waiting to retry: beginAgentTurn's, when
+ *  the stream couldn't start, or driveStream's, when it failed once started.
+ *  Its inference:failed came first, and this says no retry follows it. */
+const RETRY_CANCELLED_BY_STOP = 'a retry waiting while the framework was stopping is dropped before it sends anything';
+
 function isTurnContinuation(reason: string): boolean {
   return reason === 'context_budget_restart' || reason === 'tool_results_ready'
     || reason === 'tool_result_guard_retry';
@@ -2983,6 +2999,18 @@ export class AgentFramework {
     if (this.loopPromise) {
       await this.loopPromise;
     }
+
+    // Nothing drives an ephemeral run once the loop has ended: no turn starts
+    // after stop() begins, every stream it found was cancelled and has
+    // settled, and a tool result that arrives now is dropped, since the queue
+    // is closed. So a run still registered could only wait for a watchdog,
+    // such as one whose wake was never taken up, whose turn was refused,
+    // whose retry was cancelled, or whose continuation is still queued. End
+    // each one now, while the store is open for its cleanup. (A start()
+    // during a stop() is #315's. One made before the loop ended keeps a loop
+    // running, so this stop waits for it; one made just after, before this
+    // point, has its runs ended here too.)
+    for (const [name, run] of this.ephemeralRuns) run.settle.reject(ephemeralRunStopped(name));
 
     // Admission closed when stop() began. What admitted operations start now,
     // such as a surgery's config materialization, joins the set, so wait until
@@ -6286,15 +6314,6 @@ export class AgentFramework {
     }
   }
 
-  /** A turn refused because stop() has begun: an ephemeral run waiting on it
-   *  ends now, rather than when its startup watchdog fires. */
-  private endEphemeralRunRefused(agent: Agent): void {
-    const run = this.ephemeralRuns.get(agent.name);
-    if (run && this.agents.get(agent.name) === agent) {
-      run.settle.reject(new Error(`Ephemeral agent "${agent.name}" refused: the framework is stopping`));
-    }
-  }
-
   private createDeferred<T>(): Deferred<T> {
     let resolve!: (value: T) => void;
     let reject!: (reason?: unknown) => void;
@@ -6419,7 +6438,7 @@ export class AgentFramework {
       );
     }
     // Once stop() has begun no turn starts (startAgentStream), so a run
-    // admitted now could only wait out its startup watchdog.
+    // admitted now could never run.
     if (this.providerAdmissionClosed) {
       throw new Error(`framework is stopping: refusing new ephemeral run for ${agent.name}`);
     }
@@ -6467,11 +6486,15 @@ export class AgentFramework {
     const startupTimeout = new Promise<never>((_, reject) => {
       startupWatchdog = setTimeout(() => {
         if (!run.inferenceStarted) {
-          reject(new Error(
-            `Ephemeral agent "${agent.name}" failed to start inference within ` +
-            `${STARTUP_TIMEOUT_MS}ms — zombie detected. The event loop may have ` +
-            `stalled or the inference request was dropped.`
-          ));
+          // A stop() slower than this watchdog leaves a run waiting for its
+          // sweep past it, and the run ends because the framework is stopping.
+          reject(this.providerAdmissionClosed
+            ? ephemeralRunStopped(agent.name, `inference not started within ${STARTUP_TIMEOUT_MS}ms`)
+            : new Error(
+              `Ephemeral agent "${agent.name}" failed to start inference within ` +
+              `${STARTUP_TIMEOUT_MS}ms — zombie detected. The event loop may have ` +
+              `stalled or the inference request was dropped.`
+            ));
         }
       }, STARTUP_TIMEOUT_MS);
     });
@@ -6481,12 +6504,14 @@ export class AgentFramework {
         if (!run.inferenceStarted) return;
         const idle = Date.now() - run.lastActivity;
         if (idle > COMPLETION_IDLE_TIMEOUT_MS) {
-          reject(new Error(
-            `Ephemeral agent "${agent.name}" stalled: no stream-driver activity for ` +
-            `${Math.round(idle / 1000)}s after inference started (threshold ` +
-            `${Math.round(COMPLETION_IDLE_TIMEOUT_MS / 1000)}s). Stream likely ` +
-            `dropped or terminal event was lost.`
-          ));
+          reject(this.providerAdmissionClosed
+            ? ephemeralRunStopped(agent.name, `no stream-driver activity for ${Math.round(idle / 1000)}s after inference started`)
+            : new Error(
+              `Ephemeral agent "${agent.name}" stalled: no stream-driver activity for ` +
+              `${Math.round(idle / 1000)}s after inference started (threshold ` +
+              `${Math.round(COMPLETION_IDLE_TIMEOUT_MS / 1000)}s). Stream likely ` +
+              `dropped or terminal event was lost.`
+            ));
         }
       }, IDLE_POLL_MS);
     });
@@ -11952,12 +11977,9 @@ export class AgentFramework {
     const ownsProviderGate =
       !this.ephemeralRuns.has(agent.name) && !this.conversationAgentHomes.has(agent.name);
     // A stopping framework starts no turn, whoever owns provider admission
-    // (conversation agents and ephemeral runs do not take the gate). An
-    // ephemeral run waiting on the turn ends now, as at every refusal of
-    // stop()'s.
+    // (conversation agents and ephemeral runs do not take the gate).
     if (this.providerAdmissionClosed) {
       if (ownsProviderGate && providerGateAlreadyHeld) this.releasePrimaryProviderGate(agent.name);
-      this.endEphemeralRunRefused(agent);
       return;
     }
     if (ownsProviderGate && !providerGateAlreadyHeld) {
@@ -12334,9 +12356,16 @@ export class AgentFramework {
       ...(trigger?.suppressProse ? { silent: true } : {}),
     });
     // A budget restart continues the same logical inference window. The
-    // predecessor keeps EventGate liveness until its successor terminates.
+    // predecessor keeps EventGate liveness until its successor terminates,
+    // and the successor takes it again if it ended in between: at a stop()
+    // (a restart left queued, which a start() then takes up), or at a
+    // provider hold that kept the successor from starting (a stated wait at
+    // its last admission check, or a cooldown after its own call failed),
+    // whose end queues it again.
     if (!resumesTurn) {
       this.eventGate?.onInferenceStarted(agent.name);
+    } else {
+      this.eventGate?.onInferenceResumed(agent.name);
     }
     this.lastInferenceAt.set(agent.name, { ...this.lastInferenceAt.get(agent.name), startedAt: turnStartedAt });
 
@@ -12420,7 +12449,6 @@ export class AgentFramework {
         this.channelRegistry?.stopTyping();
         this.eventGate?.onInferenceEnded(agent.name);
         this.abortDroppedTurn(agent.name, turnToken, reason, turnStartedAt);
-        if (this.providerAdmissionClosed) this.endEphemeralRunRefused(agent);
         return false;
       }
 
@@ -12471,7 +12499,6 @@ export class AgentFramework {
         this.channelRegistry?.stopTyping();
         this.eventGate?.onInferenceEnded(agent.name);
         this.abortDroppedTurn(agent.name, turnToken, reason, turnStartedAt);
-        if (stopping) this.endEphemeralRunRefused(agent);
         return false;
       }
       // A conversation agent takes no provider gate, so its own compression
@@ -12547,14 +12574,15 @@ export class AgentFramework {
         await this.waitForRetry(action.delayMs);
         if (this.providerAdmissionClosed) {
           // stop() ended the wait: that cancels the retry, it does not hasten
-          // it. Nothing is written (the store is closing); this frame still
-          // owns its token, since no retry frame replaced it. An ephemeral
-          // run waiting on the turn ends now, as at every refusal of stop()'s.
+          // it. The turn ends as one dropped before it sends anything does:
+          // a terminal event saying why, after the inference:failed above,
+          // and its record's end. Nothing is written (the store is closing);
+          // this frame still owns its token, since no retry frame replaced it.
+          this.abortDroppedTurn(agent.name, turnToken, RETRY_CANCELLED_BY_STOP, turnStartedAt);
           if (this.activeTurnTokens.get(agent.name) === turnToken) {
             this.activeTurnTokens.delete(agent.name);
             this.activeTurnTriggers.delete(agent.name);
           }
-          this.endEphemeralRunRefused(agent);
           return false;
         }
         // The retry re-enters startAgentStream, which replaces this frame's
@@ -13816,9 +13844,22 @@ export class AgentFramework {
               await this.waitForRetry(action.delayMs);
               // stop() ending the wait cancels the retry (this frame's finally
               // clears the token); it is never permission to retry at once.
-              // An ephemeral run waiting on the turn ends now.
               if (!this.providerAdmissionClosed) await this.startAgentStream(agent, trigger, attempt + 1);
-              else this.endEphemeralRunRefused(agent);
+              else {
+                // The turn ends here, and its inference:failed doesn't say so,
+                // since a retry usually follows one: an inference:aborted
+                // says why none does, as beginAgentTurn's cancelled retry
+                // gives. The finally ends its gate entry and its record. As
+                // in abortDroppedTurn, nothing when another turn of this name
+                // holds the token, whose bracket the event would end.
+                const owner = this.activeTurnTokens.get(agent.name);
+                if (owner === undefined || owner === myTurnToken) {
+                  this.emitTrace({
+                    type: 'inference:aborted', agentName: agent.name,
+                    durationMs: Date.now() - startTime, reason: RETRY_CANCELLED_BY_STOP,
+                  });
+                }
+              }
             } else {
               this.settleAgent(agent.name, {
                 stopReason: 'exhausted',
