@@ -11,8 +11,8 @@
  * inference tokens, not whether the agent should know about the event.
  */
 
-import { existsSync, readFileSync, statSync, writeFileSync, mkdirSync } from 'node:fs';
-import { dirname, join } from 'node:path';
+import { chmodSync, chownSync, existsSync, lstatSync, readdirSync, readFileSync, unlinkSync, writeFileSync, mkdirSync } from 'node:fs';
+import { basename, dirname, join } from 'node:path';
 import { GateScript } from './gate-script.js';
 
 import type { ToolDefinition } from '../types/events.js';
@@ -27,6 +27,7 @@ import type {
   GateStatus,
   ShadowWarning,
   GateProbeRow,
+  UnreadableConfigKept,
 } from './types.js';
 
 // Re-export types consumers need
@@ -48,6 +49,21 @@ const RELOAD_THROTTLE_MS = 1000;
 const MIN_DEBOUNCE_MS = 100;
 /** Maximum debounce value (ms). */
 const MAX_DEBOUNCE_MS = 300_000;
+
+/** Whether a check made at `last` is still fresh at `now`, less than the
+ *  reload throttle ago. A clock stepped backwards since makes it stale, so
+ *  the next check runs rather than wait for the clock to catch up. */
+function checkedRecently(now: number, last: number): boolean {
+  const elapsed = now - last;
+  return elapsed >= 0 && elapsed < RELOAD_THROTTLE_MS;
+}
+
+/** A read that failed because nothing is at the path. Any other failure
+ *  (EACCES on a directory, ELOOP, ENOTDIR) is a file that's there but can't
+ *  be read. */
+function isMissing(err: unknown): boolean {
+  return (err as NodeJS.ErrnoException | null)?.code === 'ENOENT';
+}
 
 // ---------------------------------------------------------------------------
 // Default config
@@ -533,6 +549,30 @@ export function formatShadowWarning(w: ShadowWarning): string {
     + `(first match wins — every event "${w.later}" would match is consumed by "${w.earlier}" first)`;
 }
 
+/** What a wake-rule tool tells the agent when its change kept a copy of an unreadable gate.json. */
+export function formatUnreadableKept(kept: UnreadableConfigKept): string {
+  return `gate.json couldn't be read (${kept.reason}), so a copy of it was kept at ${kept.keptPath}, and gate.json `
+    + 'now holds the rules that were in force, with this change. What the copy holds is not in force; whoever '
+    + 'runs this host can restore rules from it.';
+}
+
+/** The privileged-users file's error when some entries of its list aren't user ids. */
+function skippedPrivilegedIds(skipped: unknown[], loaded: number): string {
+  const one = skipped.length === 1;
+  const shown = skipped.slice(0, 5).map((x) => {
+    if (typeof x === 'number' && Number.isInteger(x)) {
+      return `${x} (a number this large can't be read exactly: write the id as a string, in quotes)`;
+    }
+    const json = JSON.stringify(x) ?? String(x);
+    return json.length > 40 ? `${json.slice(0, 39)}…` : json;
+  });
+  const more = skipped.length > shown.length ? `, and ${skipped.length - shown.length} more` : '';
+  const rest = loaded === 0 ? 'no id loaded, so no one is privileged' : `${loaded} ${loaded === 1 ? 'id' : 'ids'} did load`;
+  return `${skipped.length} ${one ? 'entry' : 'entries'} in the privileged-users file ${one ? "isn't a user id" : "aren't user ids"}, `
+    + `so ${one ? 'it was' : 'they were'} skipped: ${shown.join(', ')}${more}. A user id is a non-empty string, or a safe integer `
+    + `(a whole number within 2^53 - 1 of zero); ${rest}.`;
+}
+
 // ---------------------------------------------------------------------------
 // EventGate
 // ---------------------------------------------------------------------------
@@ -543,11 +583,22 @@ export class EventGate {
   /** Optional agent-authored programmable gate (gate.js). */
   private gateScript: GateScript;
   private compiledPolicies: CompiledPolicy[] = [];
-  private configMtime: number = 0;
+  /** The text of gate.json whose rules are in force, from a load or a write.
+   *  A reload parses the file again only when its text differs; a file that
+   *  holds it again after failing to load (a chmod that makes it readable,
+   *  an edit undone) needs nothing applied, only its error cleared. */
+  private configText: string | undefined;
   private lastReloadCheck: number = 0;
   private configSource: 'file' | 'initial' | 'default' = 'default';
   private lastReloadTimestamp: number | null = null;
-  private configErrors: string[] = [];
+  /** The current problem with each file the gate reads, one each, replaced
+   *  whenever that file is read again (gate_status `errors`). */
+  private configError: string | null = null;
+  private privilegedError: string | null = null;
+  /** Why the startup couldn't seed or reconcile gate.json, kept apart from
+   *  gate.json's own error so the load that follows can't clear it, until
+   *  gate.json loads new text or is written. */
+  private startupError: string | null = null;
 
   // Debounce state
   private debounceTimers = new Map<string, DebounceState>();
@@ -604,7 +655,9 @@ export class EventGate {
   // privilegedUsersPath on change.
   private privilegedUsersPath: string | undefined;
   private privilegedUserIds = new Set<string>();
-  private privilegedMtime = 0;
+  /** The privileged-users file's text as last read, whether or not it loaded;
+   *  undefined when it was missing or its last read failed. */
+  private privilegedText: string | undefined;
   private lastPrivilegedCheck = 0;
 
   // Dependency-injected callbacks
@@ -692,12 +745,20 @@ export class EventGate {
         }
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
-        this.configErrors.push(`Failed to seed/reconcile gate.json: ${msg}`);
+        // Its own slot: the load below would clear gate.json's error.
+        this.startupError = `Failed to seed/reconcile gate.json: ${msg}`;
       }
     }
 
     // Load config
-    this.config = this.loadConfig() ?? opts.initialConfig ?? { ...DEFAULT_CONFIG };
+    const read = this.readConfigFile();
+    if (read.state === 'loaded') {
+      this.config = read.config;
+      this.configText = read.text;
+      this.configSource = 'file';
+    } else {
+      this.config = opts.initialConfig ?? { ...DEFAULT_CONFIG };
+    }
     this.compiledPolicies = this.compilePolicies(this.config);
     this.refreshShadowWarnings('startup');
 
@@ -715,27 +776,181 @@ export class EventGate {
   // =========================================================================
 
   private loadConfig(): GateConfig | null {
-    if (!existsSync(this.configPath)) {
-      return null;
+    const read = this.readConfigFile();
+    return read.state === 'loaded' ? read.config : null; // Caller keeps previous config
+  }
+
+  /**
+   * gate.json as it is on disk: absent, loaded, or there but unreadable (it
+   * can't be read, isn't JSON, or holds something validateConfig refuses),
+   * with its bytes when it could be read, since text decoded from a file that
+   * isn't UTF-8 isn't what it held. Reading applies nothing: whoever
+   * applies a loaded config records its text as `configText`. With
+   * `unlessUnchanged`, a file whose text is `configText` comes back
+   * `unchanged`, unparsed, since the rules in force came from it.
+   */
+  private readConfigFile(opts?: { unlessUnchanged?: boolean }):
+    | { state: 'absent' }
+    | { state: 'unchanged' }
+    | { state: 'loaded'; config: GateConfig; text: string }
+    | { state: 'unreadable'; error: string; bytes?: Buffer } {
+    let bytes: Buffer;
+    try {
+      bytes = readFileSync(this.configPath);
+    } catch (err) {
+      if (!isMissing(err)) return this.configUnreadable(err);
+      // No file is no problem with it: the rules in force stay.
+      this.configError = null;
+      return { state: 'absent' };
+    }
+    const raw = bytes.toString('utf-8');
+    if (opts?.unlessUnchanged && raw === this.configText) {
+      // The file holds the text in force, which loaded, so it has no problem.
+      this.configError = null;
+      return { state: 'unchanged' };
     }
     try {
-      const raw = readFileSync(this.configPath, 'utf-8');
-      const stat = statSync(this.configPath);
-      this.configMtime = stat.mtimeMs;
       const config = validateConfig(JSON.parse(raw));
-      this.configSource = 'file';
-      this.configErrors = [];
-      return config;
+      this.configError = null;
+      return { state: 'loaded', config, text: raw };
     } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      this.configErrors = [msg];
+      return { ...this.configUnreadable(err), bytes };
+    }
+  }
+
+  /**
+   * gate.json's current error, replacing the last one, and traced and logged
+   * when it's new, so an edit that doesn't load is in the log once.
+   */
+  private configUnreadable(err: unknown): { state: 'unreadable'; error: string } {
+    const msg = err instanceof Error ? err.message : String(err);
+    if (msg !== this.configError) {
+      console.error(`[gate] ${this.configPath} couldn't be read (${msg}), so what it holds isn't in force`);
       this.emitTrace({
         type: 'gate:config-error',
         error: msg,
         configPath: this.configPath,
         timestamp: Date.now(),
       });
-      return null; // Caller keeps previous config
+    }
+    this.configError = msg;
+    return { state: 'unreadable', error: msg };
+  }
+
+  /**
+   * The rules a policy change starts from: gate.json as it is on disk, or the
+   * rules in force when it's absent or unreadable. An unreadable file comes
+   * back with its error, and with its bytes when it could be read, for
+   * keepUnreadableConfig before anything is written over it.
+   */
+  private configForChange(): { config: GateConfig; unreadable?: { error: string; bytes?: Buffer } } {
+    const read = this.readConfigFile();
+    if (read.state === 'loaded') return { config: read.config };
+    if (read.state === 'unreadable') return { config: this.config, unreadable: { error: read.error, bytes: read.bytes } };
+    return { config: this.config };
+  }
+
+  /**
+   * Keep a copy of an unreadable gate.json, byte for byte as the change read it, at
+   * `gate.json.unreadable-<UTC time>` beside it, before the rules in force are
+   * written over it in place, so what it held (often an operator's
+   * unfinished edit) isn't lost. A copy, not a rename, so gate.json itself
+   * stays where it is: a symlink keeps its target, the file its mode and
+   * owner, and a single-file bind mount works. Returns where the copy is.
+   * Throws, so the caller writes nothing, when the file couldn't be read at
+   * all (there's nothing to copy, and a file the process can't read is often
+   * one its operator closed off on purpose) or when the copy can't be made.
+   */
+  private keepUnreadableConfig(unreadable: { error: string; bytes?: Buffer }): string {
+    const reason = unreadable.error;
+    if (unreadable.bytes === undefined) {
+      throw new Error(`gate.json couldn't be read (${reason}), so it can't be kept, and nothing was written over it.`);
+    }
+    // No colons: Windows doesn't allow them in a file name.
+    const stamp = new Date(this.now()).toISOString().replace(/\.\d+Z$/, 'Z').replace(/[-:]/g, '');
+    const base = `${this.configPath}.unreadable-${stamp}`;
+    // The copy is no more readable than gate.json: it's created owner-only,
+    // then given gate.json's group, and only then its permission bits. A copy
+    // that can't take the group (this process isn't in it), or whose
+    // gate.json can't be stat'd, stays owner-only. So does the copy of a
+    // gate.json that's a symbolic link: what keeps others out of the file it
+    // points to can be a directory on the way there, and the copy, beside the
+    // link, isn't behind it.
+    let gateFile: { gid: number; mode: number } | undefined;
+    try {
+      const file = lstatSync(this.configPath);
+      if (!file.isSymbolicLink()) gateFile = file;
+    } catch { /* owner-only */ }
+    for (let n = 1; ; n++) {
+      const kept = n === 1 ? base : `${base}-${n}`;
+      try {
+        // An exclusive create, so a copy never replaces an earlier one.
+        writeFileSync(kept, unreadable.bytes, { flag: 'wx', mode: 0o600 });
+      } catch (err) {
+        const e = err as NodeJS.ErrnoException;
+        if (e.code === 'EEXIST') continue;
+        // A copy cut short is this call's own file: remove it, so nothing is left.
+        if (e.syscall !== 'open') {
+          try { unlinkSync(kept); } catch { /* it's named below */ }
+        }
+        throw new Error(
+          `gate.json couldn't be read (${reason}), and keeping a copy of it at ${kept} failed (${e.message ?? String(err)}), `
+          + 'so nothing was written.',
+        );
+      }
+      if (gateFile) {
+        try {
+          // The copy's own owner, this process, rather than -1 for "unchanged",
+          // which Bun 1.3.14 refuses with EPERM.
+          chownSync(kept, process.geteuid?.() ?? -1, gateFile.gid);
+          chmodSync(kept, gateFile.mode & 0o777);
+        } catch { /* it stays owner-only */ }
+      }
+      console.error(`[gate] ${this.configPath} couldn't be read (${reason}); kept a copy at ${kept} before writing the rules in force`);
+      this.emitTrace({
+        type: 'gate:config-kept',
+        configPath: this.configPath,
+        keptPath: kept,
+        error: reason,
+        timestamp: Date.now(),
+      });
+      return kept;
+    }
+  }
+
+  /**
+   * The copies keepUnreadableConfig made that are still beside gate.json,
+   * oldest first, each with what to do with it, for gate_status: the moment a
+   * copy is made reaches only the log, the trace and the change's caller, and
+   * the copy exists to be found later.
+   */
+  private keptCopies(): string[] {
+    const dir = dirname(this.configPath);
+    const prefix = `${basename(this.configPath)}.unreadable-`;
+    let names: string[];
+    try {
+      names = readdirSync(dir).filter((name) => name.startsWith(prefix));
+    } catch {
+      return [];
+    }
+    return names
+      .sort((a, b) => a.localeCompare(b, 'en', { numeric: true }))
+      .map((name) => `${join(dir, name)}: a copy of gate.json, kept when it couldn't be read. Nothing in it is in force. `
+        + "To use it, fix it and copy it over gate.json. Once it isn't needed, remove it.");
+  }
+
+  /**
+   * writeConfig, after keepUnreadableConfig may have kept a copy of gate.json:
+   * then a write that fails names the copy, since what the file held may now
+   * be only there.
+   */
+  private writeConfigAfterKeep(config: GateConfig, kept: UnreadableConfigKept | undefined): void {
+    try {
+      this.writeConfig(config);
+    } catch (err) {
+      if (!kept) throw err;
+      const msg = err instanceof Error ? err.message : String(err);
+      throw new Error(`${msg} A copy of what gate.json held when it couldn't be read is kept at ${kept.keptPath}.`, { cause: err });
     }
   }
 
@@ -766,16 +981,14 @@ export class EventGate {
 
   private reloadIfChanged(): void {
     const now = Date.now();
-    if (now - this.lastReloadCheck < RELOAD_THROTTLE_MS) return;
+    if (checkedRecently(now, this.lastReloadCheck)) return;
     this.lastReloadCheck = now;
 
     try {
-      if (!existsSync(this.configPath)) return;
-      const stat = statSync(this.configPath);
-      if (stat.mtimeMs === this.configMtime) return;
-
-      const newConfig = this.loadConfig();
-      if (!newConfig) return; // Parse error — keep previous config
+      // Missing, unchanged or unreadable: the rules in force stay.
+      const read = this.readConfigFile({ unlessUnchanged: true });
+      if (read.state !== 'loaded') return;
+      const newConfig = read.config;
 
       // Capture old policies' behavior fingerprints before any state
       // mutation — needed to detect kept policies whose parameters changed.
@@ -812,6 +1025,12 @@ export class EventGate {
 
       this.config = newConfig;
       this.compiledPolicies = this.compilePolicies(newConfig);
+      // Recorded only now that its rules are in force, so a reload that
+      // throws before here is tried again at the next check.
+      this.configText = read.text;
+      this.configSource = 'file';
+      // New text in gate.json now decides the rules, not the startup's.
+      this.startupError = null;
       this.lastReloadTimestamp = now;
       this.refreshShadowWarnings('reload');
 
@@ -825,7 +1044,7 @@ export class EventGate {
         timestamp: now,
       });
     } catch {
-      // Ignore stat errors
+      // The rules in force stay, and the next check tries again.
     }
   }
 
@@ -841,10 +1060,13 @@ export class EventGate {
    * surfaces it as a tool error. On success the policy is persisted to gate.json
    * (so it survives restart and is visible to `workspace--edit _config/gate.json`)
    * and the in-memory config is swapped in immediately, so the rule takes effect
-   * without waiting for the throttled mtime reload.
+   * without waiting for the throttled reload.
    *
    * The freshest on-disk config is re-read first, so a concurrent operator edit
-   * isn't clobbered. A policy with the same `name` is replaced IN PLACE when no
+   * isn't clobbered. When gate.json is there but won't load, the change starts
+   * from the rules in force, after a copy of the file is kept beside it
+   * (keepUnreadableConfig) and reported to `onUnreadableKept` once the change
+   * is written. A policy with the same `name` is replaced IN PLACE when no
    * `position` is given (order preserved); WITH a `position` it is moved there
    * — so re-issuing a rule is also how you reposition it. New policies append
    * by default; `'prepend'` puts one at the very front (ahead of EVERYTHING,
@@ -852,13 +1074,20 @@ export class EventGate {
    * anchored forms `{before: name}` / `{after: name}` insert relative to an
    * existing rule, which is almost always the safer way to order a sampler
    * or debounce against a specific catch-all.
+   *
+   * Throws, writing nothing, for an invalid policy, a placement it can't make,
+   * or a gate.json that can't be read or kept; and throws when the write
+   * fails, naming any copy kept.
    */
   addPolicy(
     rawPolicy: unknown,
-    options?: { position?: 'append' | 'prepend' | { before: string } | { after: string } },
+    options?: {
+      position?: 'append' | 'prepend' | { before: string } | { after: string };
+      onUnreadableKept?: (kept: UnreadableConfigKept) => void;
+    },
   ): GatePolicy {
     const policy = validatePolicy(rawPolicy);
-    const current = this.loadConfig() ?? this.config;
+    const { config: current, unreadable } = this.configForChange();
     const policies = [...current.policies];
     const idx = policies.findIndex((p) => p.name === policy.name);
     const position = options?.position;
@@ -884,7 +1113,11 @@ export class EventGate {
       }
     }
 
-    this.writeConfig({ ...current, policies });
+    const kept = unreadable !== undefined
+      ? { keptPath: this.keepUnreadableConfig(unreadable), reason: unreadable.error }
+      : undefined;
+    this.writeConfigAfterKeep({ ...current, policies }, kept);
+    if (kept) options?.onUnreadableKept?.(kept);
     this.emitTrace({
       type: 'gate:policy-added',
       configPath: this.configPath,
@@ -899,19 +1132,28 @@ export class EventGate {
    * Remove a policy by name from gate.json and clear its live state. Any pending
    * debounce batch is delivered first (matching reloadIfChanged's removal path,
    * so buffered events aren't silently dropped). Returns false if no policy of
-   * that name exists (nothing written). Freshest on-disk config is re-read first
-   * (see addPolicy).
+   * that name exists (nothing written). Freshest on-disk config is re-read first,
+   * and a copy of a gate.json that won't load is kept before it's written over
+   * (see addPolicy). Throws when gate.json can't be read or kept, or when the
+   * write fails (naming any copy kept); the rule then stays in force, with its
+   * state.
    */
-  removePolicy(name: string): boolean {
-    const current = this.loadConfig() ?? this.config;
+  removePolicy(name: string, options?: { onUnreadableKept?: (kept: UnreadableConfigKept) => void }): boolean {
+    const { config: current, unreadable } = this.configForChange();
     if (!current.policies.some((p) => p.name === name)) {
       return false;
     }
-    // Deliver any pending debounce batch, then drop timers/buckets/counters.
+    const kept = unreadable !== undefined
+      ? { keptPath: this.keepUnreadableConfig(unreadable), reason: unreadable.error }
+      : undefined;
+    const policies = current.policies.filter((p) => p.name !== name);
+    this.writeConfigAfterKeep({ ...current, policies }, kept);
+    // Only once the write has succeeded, so a failed keep or write leaves the
+    // rule in force with its state: deliver any pending debounce batch, then
+    // drop timers, buckets and counters.
     this.clearPolicyState(name, { deliverPendingDebounce: true });
     this.stats.delete(name);
-    const policies = current.policies.filter((p) => p.name !== name);
-    this.writeConfig({ ...current, policies });
+    if (kept) options?.onUnreadableKept?.(kept);
     this.emitTrace({
       type: 'gate:policy-removed',
       configPath: this.configPath,
@@ -932,24 +1174,22 @@ export class EventGate {
 
   /**
    * Persist a config to gate.json and apply it in memory together: write the
-   * file, swap in the compiled policies, and sync `configMtime` to the new file
-   * so `reloadIfChanged` doesn't redundantly re-parse identical content. Throws
+   * file, swap in the compiled policies, and keep the text written as
+   * `configText`, so `reloadIfChanged` doesn't parse it again. Throws
    * if the write fails (disk/permission) — callers surface it as a tool error.
    */
   private writeConfig(config: GateConfig): void {
     mkdirSync(dirname(this.configPath), { recursive: true });
-    writeFileSync(this.configPath, JSON.stringify(config, null, 2) + '\n');
+    const text = JSON.stringify(config, null, 2) + '\n';
+    writeFileSync(this.configPath, text);
+    this.configText = text;
     this.config = config;
     this.compiledPolicies = this.compilePolicies(config);
     this.refreshShadowWarnings('policy-mutation');
     this.configSource = 'file';
-    this.configErrors = [];
+    this.configError = null;
+    this.startupError = null;
     this.lastReloadTimestamp = Date.now();
-    try {
-      this.configMtime = statSync(this.configPath).mtimeMs;
-    } catch {
-      // A failed stat only risks one redundant reload; keep the old mtime.
-    }
   }
 
   // =========================================================================
@@ -1040,11 +1280,10 @@ export class EventGate {
     // and a privileged user's ping. The event always enters context regardless
     // (the gate only governs inference triggering).
     if (this.sleepUntil > this.now()) {
-      this.reloadPrivilegedIfChanged();
       const isHeartbeat =
         info.metadata?.source === 'heartbeat' || info.serverId === 'heartbeat';
       const authorId = this.extractAuthorId(info.metadata);
-      const privileged = authorId !== null && this.privilegedUserIds.has(authorId);
+      const privileged = this.isPrivilegedUser(authorId);
       if (!isHeartbeat && !privileged) {
         this.sleepSuppressed++;
         this.totalEvaluations++;
@@ -1835,7 +2074,6 @@ export class EventGate {
     return null;
   }
 
-  /** Load the privileged-users file (bare array or { userIds: [...] }). */
   /**
    * Whether an author id is on the privileged-users list (hot-reloaded).
    * Shared by sleep bypass and tune-out wake classification (#77: wakes are
@@ -1843,45 +2081,74 @@ export class EventGate {
    */
   isPrivilegedUser(authorId: string | null | undefined): boolean {
     if (!authorId) return false;
-    this.loadPrivileged();
+    this.reloadPrivilegedIfChanged();
     return this.privilegedUserIds.has(authorId);
   }
 
-  private loadPrivileged(): void {
+  /**
+   * Read the privileged-users file: a list of user ids, or `{"userIds": [...]}`,
+   * each a non-empty string or a safe integer (a whole number within 2^53 - 1 of zero). An absent file
+   * means no one is privileged. A file that can't be read, isn't JSON, or
+   * holds no list leaves the list that last loaded in this process in effect
+   * (none, at startup), with its error in gate_status until the file is read
+   * again. In a list, an entry that isn't a user id is skipped, and named in
+   * the file's error, and the rest load. With `unlessUnchanged`, a file whose
+   * text is the text last read isn't parsed again.
+   */
+  private loadPrivileged(opts?: { unlessUnchanged?: boolean }): void {
     if (!this.privilegedUsersPath) return;
+    const failed = (why: string): string => `Failed to load privileged-users file: ${why}`;
+    let raw: string;
     try {
-      if (!existsSync(this.privilegedUsersPath)) {
-        this.privilegedUserIds = new Set();
-        this.privilegedMtime = 0;
-        return;
-      }
-      this.privilegedMtime = statSync(this.privilegedUsersPath).mtimeMs;
-      const raw = JSON.parse(readFileSync(this.privilegedUsersPath, 'utf8'));
-      const ids = Array.isArray(raw) ? raw : Array.isArray(raw?.userIds) ? raw.userIds : [];
-      this.privilegedUserIds = new Set(ids.map((x: unknown) => String(x)));
+      raw = readFileSync(this.privilegedUsersPath, 'utf8');
     } catch (err) {
-      this.configErrors.push(
-        `Failed to load privileged-users file: ${err instanceof Error ? err.message : String(err)}`,
-      );
+      // Read again next time: a file can become readable with its text
+      // unchanged, as a chmod makes it.
+      this.privilegedText = undefined;
+      if (isMissing(err)) {
+        this.privilegedUserIds = new Set();
+        this.privilegedError = null;
+      } else {
+        this.privilegedError = failed(err instanceof Error ? err.message : String(err));
+      }
+      return;
     }
+    if (opts?.unlessUnchanged && raw === this.privilegedText) return;
+    this.privilegedText = raw;
+    let ids: unknown;
+    try {
+      const parsed: unknown = JSON.parse(raw);
+      ids = Array.isArray(parsed) ? parsed : (parsed as { userIds?: unknown } | null)?.userIds;
+    } catch (err) {
+      this.privilegedError = failed(err instanceof Error ? err.message : String(err));
+      return;
+    }
+    // A file that parses but holds no list hasn't loaded either: it used to
+    // mean no one is privileged, without a word.
+    if (!Array.isArray(ids)) {
+      this.privilegedError = failed('expected a list of user ids, or {"userIds": [...]}');
+      return;
+    }
+    const loaded = new Set<string>();
+    const skipped: unknown[] = [];
+    for (const id of ids) {
+      if (typeof id === 'string' && id !== '') loaded.add(id);
+      // JSON.parse has already rounded an integer past 2^53, and the rounded
+      // value can be another user's id, so it's skipped rather than loaded.
+      else if (typeof id === 'number' && Number.isSafeInteger(id)) loaded.add(String(id));
+      else skipped.push(id);
+    }
+    this.privilegedUserIds = loaded;
+    this.privilegedError = skipped.length > 0 ? skippedPrivilegedIds(skipped, loaded.size) : null;
   }
 
-  /** Throttled mtime-based reload of the privileged-users file. */
+  /** At most once a second, the privileged-users file read again, and loaded when its text has changed. */
   private reloadPrivilegedIfChanged(): void {
     if (!this.privilegedUsersPath) return;
     const now = this.now();
-    if (now - this.lastPrivilegedCheck < RELOAD_THROTTLE_MS) return;
+    if (checkedRecently(now, this.lastPrivilegedCheck)) return;
     this.lastPrivilegedCheck = now;
-    try {
-      if (!existsSync(this.privilegedUsersPath)) {
-        if (this.privilegedUserIds.size > 0) this.privilegedUserIds = new Set();
-        return;
-      }
-      const mtime = statSync(this.privilegedUsersPath).mtimeMs;
-      if (mtime !== this.privilegedMtime) this.loadPrivileged();
-    } catch {
-      /* leave the last-known set in place on a transient stat/read error */
-    }
+    this.loadPrivileged({ unlessUnchanged: true });
   }
 
   getToolDefinition(): ToolDefinition {
@@ -1895,6 +2162,10 @@ export class EventGate {
   }
 
   async handleToolCall(): Promise<{ success: boolean; data?: GateStatus; error?: string }> {
+    // What's in force now: each file read again if a check is due, as the
+    // next event would.
+    this.reloadIfChanged();
+    this.reloadPrivilegedIfChanged();
     const status = this.getStatus();
     return { success: true, data: status };
   }
@@ -1953,8 +2224,9 @@ export class EventGate {
       default: this.config.default ?? 'always',
       script: this.gateScript.status(),
       policies,
-      errors: [...this.configErrors],
+      errors: [this.configError, this.startupError, this.privilegedError].filter((e): e is string => e !== null),
       shadowWarnings: this.shadowWarningsCache.map(formatShadowWarning),
+      keptCopies: this.keptCopies(),
       totalEvaluations: this.totalEvaluations,
       defaultDecisions: {
         triggered: this.defaultTriggered,

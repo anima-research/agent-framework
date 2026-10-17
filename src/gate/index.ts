@@ -9,4 +9,5 @@ export type {
   GateEventInfo,
   GateStatus,
   GatePolicyStats,
+  UnreadableConfigKept,
 } from './types.js';

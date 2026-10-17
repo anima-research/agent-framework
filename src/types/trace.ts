@@ -327,6 +327,14 @@ export type TraceEvent =
       configPath: string;
     })
   | (TraceEventBase & {
+      /** gate.json couldn't be loaded, and a copy of it was kept at `keptPath`
+       *  before a wake-rule change wrote the rules in force over it. */
+      type: 'gate:config-kept';
+      error: string;
+      configPath: string;
+      keptPath: string;
+    })
+  | (TraceEventBase & {
       type: 'gate:debounce-delivered';
       policyName: string;
       eventCount: number;

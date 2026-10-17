@@ -400,7 +400,7 @@ function validateUtilityArgs(
 }
 import { CheckpointManager } from './mcpl/checkpoint-manager.js';
 import { isToolAllowed } from './mcpl/tool-policy.js';
-import { EventGate, formatShadowWarning } from './gate/event-gate.js';
+import { EventGate, formatShadowWarning, formatUnreadableKept } from './gate/event-gate.js';
 import { UsageTracker, type PersistedUsageState } from './usage/usage-tracker.js';
 import type { SessionUsageSnapshot, UsageUpdatedEvent } from './usage/types.js';
 import { stderrTailOf, withStderr, type McplConnectionCloseInfo, type McplServerConnection } from './mcpl/server-connection.js';
@@ -5544,15 +5544,22 @@ export class AgentFramework {
 
   /**
    * Add or replace (upsert) a gate policy at runtime. Validated and persisted
-   * to gate.json; hot-applied in memory. Throws if no gate is configured or the
-   * policy is invalid. Placement: `'prepend'` puts a rule ahead of EVERYTHING
-   * (including addressed-message wake rules — see EventGate.lintShadows);
-   * `{before: name}` / `{after: name}` anchor it against a specific rule,
-   * which is usually what a sampler or debounce actually wants.
+   * to gate.json; hot-applied in memory. Placement: `'prepend'` puts a rule
+   * ahead of EVERYTHING (including addressed-message wake rules — see
+   * EventGate.lintShadows); `{before: name}` / `{after: name}` anchor it
+   * against a specific rule, which is usually what a sampler or debounce
+   * actually wants. When gate.json is there but won't load, a copy of it is
+   * kept beside it before the change is written, and `onUnreadableKept` says
+   * where. Throws if no gate is configured, the policy is invalid, the
+   * placement can't be made, or gate.json can't be read, kept or written
+   * (EventGate.addPolicy).
    */
   addGatePolicy(
     rawPolicy: unknown,
-    options?: { position?: 'append' | 'prepend' | { before: string } | { after: string } },
+    options?: {
+      position?: 'append' | 'prepend' | { before: string } | { after: string };
+      onUnreadableKept?: (kept: import('./gate/types.js').UnreadableConfigKept) => void;
+    },
   ): import('./gate/types.js').GatePolicy {
     if (!this.eventGate) {
       throw new Error('No EventGate configured (FrameworkConfig.gate is unset).');
@@ -5562,13 +5569,18 @@ export class AgentFramework {
 
   /**
    * Remove a gate policy by name at runtime. Returns false if it didn't exist.
-   * Throws if no gate is configured.
+   * A copy of a gate.json that won't load is kept first, as for addGatePolicy.
+   * Throws if no gate is configured, or gate.json can't be read, kept or
+   * written (EventGate.removePolicy); the rule then stays in force.
    */
-  removeGatePolicy(name: string): boolean {
+  removeGatePolicy(
+    name: string,
+    options?: { onUnreadableKept?: (kept: import('./gate/types.js').UnreadableConfigKept) => void },
+  ): boolean {
     if (!this.eventGate) {
       throw new Error('No EventGate configured (FrameworkConfig.gate is unset).');
     }
-    return this.eventGate.removePolicy(name);
+    return this.eventGate.removePolicy(name, options);
   }
 
   /** Current gate policy names (freshest on-disk view). Empty when no gate. */
@@ -18557,10 +18569,13 @@ export class AgentFramework {
           finish({ success: false, error: 'wake_remove_rule: `name` (string) is required', isError: true });
           return;
         }
-        const removed = this.removeGatePolicy(input.name);
+        const report: { keptUnreadable?: string } = {};
+        const removed = this.removeGatePolicy(input.name, {
+          onUnreadableKept: (k) => { report.keptUnreadable = formatUnreadableKept(k); },
+        });
         finish({
           success: true,
-          data: { removed, name: input.name, policies: this.getGatePolicyNames() },
+          data: { removed, name: input.name, ...report, policies: this.getGatePolicyNames() },
         });
         return;
       }
@@ -18641,7 +18656,11 @@ export class AgentFramework {
       const before = new Map(
         this.eventGate!.probeTable().map((r) => [r.probe, r]),
       );
-      const policy = this.addGatePolicy(rawPolicy, position ? { position } : undefined);
+      const report: { keptUnreadable?: string } = {};
+      const policy = this.addGatePolicy(rawPolicy, {
+        ...(position ? { position } : {}),
+        onUnreadableKept: (k) => { report.keptUnreadable = formatUnreadableKept(k); },
+      });
       const after = this.eventGate!.probeTable();
       const probes = after.map((r) => {
         const prev = before.get(r.probe);
@@ -18660,6 +18679,7 @@ export class AgentFramework {
         success: true,
         data: {
           added: policy.name,
+          ...report,
           policies: this.getGatePolicyNames(),
           ...(shadowWarnings.length > 0 ? { shadowWarnings } : {}),
           probes,
