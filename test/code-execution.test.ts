@@ -10,8 +10,8 @@
 
 import { describe, it } from 'node:test';
 import assert from 'node:assert';
-import { execFileSync } from 'node:child_process';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { ChildProcess, execFileSync } from 'node:child_process';
+import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type {
@@ -31,6 +31,34 @@ import { PYTC_STOP_ROWS_DRIVER } from './helpers/pytc-stop-rows.js';
 const ECHO_TOOLS: { pyName: string; toolName: string }[] = [
   { pyName: 'test__echo', toolName: 'test--echo' },
 ];
+
+/** Wait for a condition, failing after 10 s rather than hanging the run. */
+const until = async (cond: () => boolean, what: string) => {
+  const deadline = Date.now() + 10_000;
+  while (!cond()) {
+    if (Date.now() > deadline) throw new Error(`timed out waiting for ${what}`);
+    await new Promise((r) => setTimeout(r, 20));
+  }
+};
+
+/** Wait for a promise, failing after 10 s rather than hanging the run. */
+const within = <T>(promise: Promise<T>, what: string): Promise<T> => {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const late = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => reject(new Error(`timed out waiting for ${what}`)), 10_000);
+  });
+  return Promise.race([promise, late]).finally(() => clearTimeout(timer));
+};
+
+/** Whether a process is still there to signal. */
+const alive = (pid: number): boolean => {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+};
 
 describe('buildInjectedTools', () => {
   it('sanitizes -- to __ and keeps valid identifiers', () => {
@@ -229,20 +257,37 @@ describe('PyRunner (real python3)', () => {
   });
 
   it('abort() settles a running script and reclaims the interpreter', async () => {
-    const runner = new PyRunner({ onToolCall: async () => '' });
+    let called!: () => void;
+    const running = new Promise<void>((resolve) => {
+      called = resolve;
+    });
+    const runner = new PyRunner({
+      onToolCall: async () => {
+        called();
+        return 'echo';
+      },
+    });
     try {
-      const pending = runner.exec('import asyncio\nawait asyncio.sleep(60)', []);
-      // Let the exec actually start before aborting.
-      await new Promise((r) => setTimeout(r, 500));
+      const pending = runner.exec('marker = 1\nawait test__echo({})\nimport asyncio\nawait asyncio.sleep(60)', ECHO_TOOLS);
+      // The script's tool call says it's running. An exec that settles first,
+      // or a call that never comes, fails the test rather than leaving it waiting.
+      await within(
+        Promise.race([
+          running,
+          pending.then((r) => assert.fail(`the exec settled before its script called its tool: ${r.stderr}`)),
+        ]),
+        'the script to call its tool',
+      );
       assert.strictEqual(runner.busy, true);
       runner.abort('test abort');
       const result = await pending;
       assert.strictEqual(result.aborted, true);
       assert.match(result.stderr, /aborted by host: test abort/);
-      // Runner remains usable after reclaim (fresh interpreter, state gone).
-      const after = await runner.exec('print("alive")', []);
+      // Runner remains usable after reclaim, in a fresh interpreter: the
+      // aborted script's state is gone.
+      const after = await runner.exec('try:\n    marker\n    print("kept")\nexcept NameError:\n    print("fresh")', []);
       assert.strictEqual(after.returnCode, 0, after.stderr);
-      assert.match(after.stdout, /alive/);
+      assert.strictEqual(after.stdout, 'fresh\n');
     } finally {
       runner.dispose();
     }
@@ -264,8 +309,8 @@ describe('PyRunner (real python3)', () => {
   });
 
   it('rejects a second exec issued before the first has started (same tick)', async () => {
-    // exec() awaits the interpreter before it records the running script, so
-    // a check made only after that await let two execs in at once.
+    // exec() awaits the interpreter, so a claim made only after that await
+    // would let two execs in at once.
     const runner = new PyRunner({ onToolCall: async () => '' });
     try {
       for (const warm of [false, true]) {
@@ -301,17 +346,233 @@ describe('PyRunner (real python3)', () => {
   });
 });
 
+// While the interpreter starts, the exec has claimed the runner but its
+// script hasn't been sent. An abort or a dispose then settles the exec, and
+// the script never runs.
+describe('PyRunner: an abort or dispose while the interpreter starts (real python3)', () => {
+  /** An executable standing in for python3: a shell script with the given body. */
+  const standIn = (body: string): { path: string; dir: string; done: () => void } => {
+    const dir = mkdtempSync(join(tmpdir(), 'af-pytc-standin-'));
+    const path = join(dir, 'python3');
+    writeFileSync(path, `#!/bin/sh\n${body}\n`);
+    chmodSync(path, 0o755);
+    return { path, dir, done: () => rmSync(dir, { recursive: true, force: true }) };
+  };
+  // The stand-ins are shell scripts.
+  const posix = { skip: process.platform === 'win32' ? 'the stand-ins need /bin/sh' : false };
+  // A write's failure comes back through the event loop: two turns of it.
+  const turns = () => new Promise<void>((r) => setImmediate(() => setImmediate(r)));
+
+  it('an abort settles the exec at once, and its script never runs', async () => {
+    const calls: string[] = [];
+    const runner = new PyRunner({
+      onToolCall: async (name) => {
+        calls.push(name);
+        return 'echo';
+      },
+    });
+    try {
+      const started = Date.now();
+      const pending = runner.exec('await test__echo({})\nimport asyncio\nawait asyncio.sleep(2)', ECHO_TOOLS);
+      assert.strictEqual(runner.busy, true);
+      runner.abort('turn abandoned');
+      assert.strictEqual(runner.busy, false, 'the next turn can run a script');
+      const result = await pending;
+      assert.strictEqual(result.aborted, true);
+      assert.match(result.stderr, /aborted by host: turn abandoned/);
+      // Waiting on the killed interpreter's readiness would take its 15 s start timeout.
+      const took = Date.now() - started;
+      assert.ok(took < 10_000, `settled after ${took} ms`);
+      const after = await runner.exec('print("alive")', []);
+      assert.strictEqual(after.returnCode, 0, after.stderr);
+      assert.strictEqual(after.stdout, 'alive\n');
+      assert.deepStrictEqual(calls, [], 'the aborted script never ran');
+    } finally {
+      runner.dispose();
+    }
+  });
+
+  it('an abort while the interpreter is still starting settles the exec and kills the interpreter', posix, async () => {
+    // The flaky abort test's case, an abort that lands while the interpreter
+    // starts. The stand-in writes its pid and never says it's ready, so the
+    // abort lands while it starts, however late it comes.
+    const never = standIn('echo $$ > "$(dirname "$0")/pid"\nexec sleep 30');
+    const runner = new PyRunner({ pythonPath: never.path, onToolCall: async () => '' });
+    try {
+      const pending = runner.exec('print("ran")', []);
+      const pidFile = join(never.dir, 'pid');
+      await until(() => existsSync(pidFile) && readFileSync(pidFile, 'utf8').endsWith('\n'), 'the interpreter to start');
+      const pid = Number(readFileSync(pidFile, 'utf8'));
+      assert.strictEqual(runner.busy, true);
+      runner.abort('test abort');
+      const result = await pending;
+      assert.strictEqual(result.aborted, true);
+      assert.strictEqual(result.stderr, 'script aborted by host: test abort');
+      assert.strictEqual(result.stdout, '');
+      // Left running, the stand-in would sleep on for 30 s.
+      await until(() => !alive(pid), 'the starting interpreter to be killed');
+    } finally {
+      runner.dispose();
+      never.done();
+    }
+  });
+
+  it('a second exec, issued on the tick an abort settles the first, runs whole in a fresh interpreter', async () => {
+    const runner = new PyRunner({ onToolCall: async () => '' });
+    try {
+      const first = runner.exec('import asyncio\nawait asyncio.sleep(2)', []);
+      runner.abort('turn abandoned');
+      const second = runner.exec('print("second")', []);
+      const [a, b] = await Promise.all([first, second]);
+      assert.strictEqual(a.aborted, true);
+      assert.match(a.stderr, /aborted by host: turn abandoned/);
+      assert.strictEqual(b.returnCode, 0, b.stderr);
+      assert.strictEqual(b.stdout, 'second\n');
+    } finally {
+      runner.dispose();
+    }
+  });
+
+  it('an abort on a warm interpreter, on the tick exec is called, settles it before its script is sent', async () => {
+    const runner = new PyRunner({ onToolCall: async () => '' });
+    try {
+      await runner.exec('print("warm")', []);
+      const first = runner.exec('import asyncio\nawait asyncio.sleep(2)', [], undefined, { deadlineMs: 300 });
+      runner.abort('turn abandoned');
+      const stopped = await first;
+      assert.strictEqual(stopped.aborted, true);
+      assert.match(stopped.stderr, /aborted by host: turn abandoned/);
+      // Had the aborted exec gone on to arm its deadline, that would interrupt
+      // this next script at 300 ms.
+      const next = await runner.exec('import asyncio\nawait asyncio.sleep(1)\nprint("whole")', []);
+      assert.strictEqual(next.returnCode, 0, next.stderr);
+      assert.strictEqual(next.stdout, 'whole\n');
+    } finally {
+      runner.dispose();
+    }
+  });
+
+  const stops: [string, (runner: PyRunner) => void, RegExp][] = [
+    ['a dispose', (runner) => runner.dispose(), /^code_execution runner disposed$/],
+    [
+      'an abort then a dispose (a background cancel)',
+      (runner) => {
+        runner.abort('cancelled by agent');
+        runner.dispose();
+      },
+      /^script aborted by host: cancelled by agent$/,
+    ],
+  ];
+  for (const [how, stop, says] of stops) {
+    it(`${how} settles the exec at once`, async () => {
+      const runner = new PyRunner({ onToolCall: async () => '' });
+      const started = Date.now();
+      const pending = runner.exec('import asyncio\nawait asyncio.sleep(2)', []);
+      stop(runner);
+      const result = await pending;
+      assert.strictEqual(result.aborted, true);
+      assert.match(result.stderr, says);
+      // Waiting on the killed interpreter's readiness would take its 15 s start timeout.
+      const took = Date.now() - started;
+      assert.ok(took < 10_000, `settled after ${took} ms`);
+    });
+  }
+
+  it('an abort while an interpreter that has stopped reading its input starts throws nothing', posix, async () => {
+    // The stand-in closes its input, says so, and never gets ready, so the
+    // abort's write meets a pipe nobody reads.
+    const closed = standIn('exec 0<&-\ntouch "$(dirname "$0")/closed"\nexec sleep 30');
+    const runner = new PyRunner({ pythonPath: closed.path, onToolCall: async () => '' });
+    try {
+      const pending = runner.exec('print(1)', []);
+      await until(() => existsSync(join(closed.dir, 'closed')), 'the stand-in to close its input');
+      runner.abort('turn abandoned');
+      const result = await pending;
+      assert.strictEqual(result.stderr, 'script aborted by host: turn abandoned');
+      // An unheard write error would fail this test as an uncaught exception.
+      await turns();
+    } finally {
+      runner.dispose();
+      closed.done();
+    }
+  });
+
+  it("an exec whose interpreter has stopped reading its input but runs on is settled at the failed write", posix, async () => {
+    // As after a script closes file descriptor 0: the interpreter is alive,
+    // and the exec's own writes, the init and the exec, meet a pipe nobody
+    // reads. Left running, the exec would wait out its 10-minute time limit.
+    const closes = standIn(`exec 0<&-\necho '{"op":"ready"}'\nexec sleep 30`);
+    const runner = new PyRunner({ pythonPath: closes.path, onToolCall: async () => '' });
+    try {
+      const result = await within(runner.exec('print(1)', []), 'the exec to settle');
+      assert.strictEqual(result.aborted, true);
+      assert.match(result.stderr, /^python runtime stopped reading its input, so it was killed/);
+      assert.strictEqual(runner.busy, false);
+      await turns();
+    } finally {
+      runner.dispose();
+      closes.done();
+    }
+  });
+
+  it("an abort or a dispose on the tick exec is called, with an interpreter that can't be spawned, kills no child without a pid", async () => {
+    // A failed spawn's child has no pid, and its exitCode stays null until
+    // Node's 'error' for it, a tick later. A kill() in that tick signals
+    // whatever pid Node's handle held: in a fresh Node 20 process that was 0,
+    // the caller's own process group. So the stub records such a kill
+    // instead, and passes on only a child's with a pid.
+    const kill = ChildProcess.prototype.kill;
+    const pidless: (NodeJS.Signals | number | undefined)[] = [];
+    ChildProcess.prototype.kill = function (this: ChildProcess, signal?: NodeJS.Signals | number) {
+      if (this.pid === undefined) {
+        pidless.push(signal);
+        return false;
+      }
+      return kill.call(this, signal);
+    };
+    try {
+      for (const stop of ['abort', 'dispose'] as const) {
+        const runner = new PyRunner({ pythonPath: '/definitely/not/a/python', onToolCall: async () => '' });
+        try {
+          const pending = runner.exec('print(1)', []);
+          if (stop === 'abort') runner.abort('stopped on the spawn tick');
+          else runner.dispose();
+          const result = await within(pending, `the exec stopped by ${stop}`);
+          assert.strictEqual(result.aborted, true, stop);
+          assert.strictEqual(
+            result.stderr,
+            stop === 'abort' ? 'script aborted by host: stopped on the spawn tick' : 'code_execution runner disposed',
+          );
+          assert.deepStrictEqual(pidless, [], `${stop}: a kill reached a child with no pid`);
+        } finally {
+          runner.dispose();
+        }
+      }
+    } finally {
+      ChildProcess.prototype.kill = kill;
+    }
+  });
+
+  it('an interpreter that exits before it is ready still reads as a failed start', posix, async () => {
+    const exits = standIn('exit 3');
+    const runner = new PyRunner({ pythonPath: exits.path, onToolCall: async () => '' });
+    try {
+      const result = await runner.exec('print(1)', []);
+      assert.strictEqual(result.aborted, true);
+      assert.strictEqual(
+        result.stderr,
+        `Failed to start python runtime (${exits.path}): python runtime exited before becoming ready`,
+      );
+    } finally {
+      runner.dispose();
+      exits.done();
+    }
+  });
+});
+
 // Inner-call ids restart in every interpreter: a result that outlives its
 // interpreter must not resolve a call of the one that replaced it.
 describe('code_execution inner-call results after the interpreter is replaced (real python3)', () => {
-  const until = async (cond: () => boolean, what: string) => {
-    const deadline = Date.now() + 10_000;
-    while (!cond()) {
-      if (Date.now() > deadline) throw new Error(`timed out waiting for ${what}`);
-      await new Promise((r) => setTimeout(r, 20));
-    }
-  };
-
   const stops: Record<string, { code: string; stop?: (runner: PyRunner) => void }> = {
     aborted: { code: 'print(await test__echo({}))', stop: (runner) => runner.abort('turn abandoned') },
     crashed: {
@@ -1365,6 +1626,22 @@ describe('code_execution time limit vs blocking code (real python3)', { skip: pr
       const after = await runner.exec('print(x)', []);
       assert.strictEqual(after.returnCode, 1);
       assert.match(after.stderr, /NameError: name 'x' is not defined/);
+    } finally {
+      runner.dispose();
+    }
+  });
+
+  it('the time-limit note starts on a line of its own after an interpreter exit, whose text ends without one', async () => {
+    const runner = new PyRunner({ onToolCall: async () => '' });
+    try {
+      // The interrupt at the limit ends the interpreter, so the exit handler settles the exec.
+      const code = 'import os, signal, time\nsignal.signal(signal.SIGINT, lambda *_: os._exit(3))\ntime.sleep(30)';
+      const result = await runner.exec(code, [], undefined, { deadlineMs: 1000 });
+      assert.strictEqual(result.returnCode, 1);
+      assert.strictEqual(
+        result.stderr,
+        'python runtime exited unexpectedly (code=3, signal=none)\nscript stopped: it reached its 1s time limit\n',
+      );
     } finally {
       runner.dispose();
     }
