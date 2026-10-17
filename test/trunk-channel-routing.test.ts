@@ -39,7 +39,7 @@ import type { ContextInjection } from '@animalabs/context-manager';
 /** Reach the private per-turn routing state (its triggering channel) + the pure channel-deriver. */
 function internals(framework: AgentFramework) {
   return framework as unknown as {
-    turnRouting: Map<string, { triggerChannel?: string }>;
+    turnRouting: Map<string, { triggerChannel?: string; locus?: string; nonChannelOrigin?: boolean }>;
     pendingRequests: Array<{ agentName: string; reason: string; source: string; timestamp: number; channelId?: string }>;
     derivePushEventChannel(
       origin: Record<string, unknown> | undefined,
@@ -479,6 +479,76 @@ describe('Trunk channel routing (item-3 redux)', () => {
     );
     await framework.stop();
   });
+  it('a WebUI turn after Discord traffic freezes null and keeps prose private', async () => {
+    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'private WebUI reply' }]));
+    const framework = await makeFramework();
+    const i = internals(framework) as ReturnType<typeof internals> & {
+      turnRouting: Map<string, { locus?: string; nonChannelOrigin: boolean }>;
+      channelRegistry: Record<string, unknown>;
+    };
+    let resolveCalls = 0;
+    let routeCalls = 0;
+    i.channelRegistry = new Proxy({
+      resolveLocus: () => { resolveCalls++; return 'discord:guild:last-room'; },
+      routeSpeech: async () => { routeCalls++; return null; },
+      getDescriptor: () => undefined,
+      sendOutgoingChunk: () => {}, sendOutgoingComplete: () => {}, sendOutgoingLifecycle: () => {},
+      startTyping: () => {}, stopTyping: () => {}, stopAll: () => {}, getChannelTools: () => [],
+    }, { get: (target, prop: string) => prop in target ? target[prop as keyof typeof target] : () => undefined }) as never;
+    const scout = framework.getAgent('scout')!;
+    await (framework as unknown as { startAgentStream(agent: unknown, trigger?: unknown): Promise<void> })
+      .startAgentStream(scout, { agentName: 'scout', reason: 'external-message', source: 'tui', timestamp: Date.now(), nonChannelOrigin: true });
+    await framework.runUntilIdle();
+    assert.equal(resolveCalls, 0);
+    assert.equal(routeCalls, 0);
+    assert.equal(i.turnRouting.get('scout')?.locus, undefined);
+    assert.equal(i.turnRouting.get('scout')?.nonChannelOrigin, true);
+    const texts = scout.getContextManager().getAllMessages().flatMap((m) => m.content)
+      .filter((b): b is { type: 'text'; text: string } => b.type === 'text').map((b) => b.text);
+    assert.ok(texts.some((t) => t.includes('[delivered] nothing') && t.includes('kept private')));
+    await framework.stop();
+  });
+
+  it('a WebUI turn overrides even a resident home channel', async () => {
+    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'private resident reply' }]));
+    const framework = await makeFramework();
+    const i = internals(framework) as ReturnType<typeof internals> & {
+      turnRouting: Map<string, { locus?: string; nonChannelOrigin: boolean }>;
+      channelRegistry: Record<string, unknown>;
+    };
+    let resolveCalls = 0;
+    i.channelRegistry = new Proxy({ resolveLocus: () => { resolveCalls++; return 'discord:guild:resident-home'; }, routeSpeech: async () => null, getDescriptor: () => undefined, startTyping: () => {}, stopTyping: () => {}, stopAll: () => {}, getChannelTools: () => [] }, { get: (t,p:string) => p in t ? t[p as keyof typeof t] : () => undefined }) as never;
+    const scout = framework.getAgent('scout')!;
+    await (framework as unknown as { startAgentStream(agent: unknown, trigger?: unknown): Promise<void> }).startAgentStream(scout, { agentName:'scout', reason:'external-message', source:'tui', timestamp:Date.now(), nonChannelOrigin:true });
+    await framework.runUntilIdle();
+    assert.equal(resolveCalls, 0);
+    assert.equal(i.turnRouting.get('scout')?.locus, undefined);
+    await framework.stop();
+  });
+
+  it('a channel-triggered turn still freezes its channel', async () => {
+    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'channel reply' }]));
+    const framework = await makeFramework();
+    const i = internals(framework) as ReturnType<typeof internals> & { turnRouting: Map<string,{locus?:string}>; channelRegistry: Record<string,unknown> };
+    i.channelRegistry = new Proxy({ resolveLocus: () => 'discord:guild:chanA', routeSpeech: async () => null, getDescriptor: () => undefined, startTyping: () => {}, stopTyping: () => {}, stopAll: () => {}, getChannelTools: () => [] }, { get:(t,p:string)=>p in t?t[p as keyof typeof t]:()=>undefined }) as never;
+    const scout=framework.getAgent('scout')!;
+    await (framework as unknown as {startAgentStream(a:unknown,t?:unknown):Promise<void>}).startAgentStream(scout,{agentName:'scout',reason:'mcpl:channel-incoming',source:'discord',timestamp:Date.now(),channelId:'discord:guild:chanA'});
+    await framework.runUntilIdle();
+    assert.equal(i.turnRouting.get('scout')?.locus,'discord:guild:chanA');
+    await framework.stop();
+  });
+
+  it('a heartbeat turn still uses the global fallback', async () => {
+    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'heartbeat reply' }]));
+    const framework=await makeFramework();
+    const i=internals(framework) as ReturnType<typeof internals> & {turnRouting:Map<string,{locus?:string}>;channelRegistry:Record<string,unknown>};
+    i.channelRegistry=new Proxy({resolveLocus:()=> 'discord:guild:last-room',routeSpeech:async()=>null,getDescriptor:()=>undefined,startTyping:()=>{},stopTyping:()=>{},stopAll:()=>{},getChannelTools:()=>[]},{get:(t,p:string)=>p in t?t[p as keyof typeof t]:()=>undefined}) as never;
+    const scout=framework.getAgent('scout')!;
+    await (framework as unknown as {startAgentStream(a:unknown,t?:unknown):Promise<void>}).startAgentStream(scout,{agentName:'scout',reason:'heartbeat',source:'timer',timestamp:Date.now()});
+    await framework.runUntilIdle();
+    assert.equal(i.turnRouting.get('scout')?.locus,'discord:guild:last-room');
+    await framework.stop();
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -554,7 +624,7 @@ describe('Residents read one message slot', () => {
 
   type Internals = {
     addMessage(participant: string, content: ContentBlock[], metadata?: Record<string, unknown>, opts?: { forAgent?: string }): string;
-    turnRouting: Map<string, { triggerChannel?: string }>;
+    turnRouting: Map<string, { triggerChannel?: string; locus?: string; nonChannelOrigin?: boolean }>;
     activeTurnTokens: Map<string, number>;
     deferredMessages: unknown[];
     channelRegistry: unknown;
@@ -777,4 +847,7 @@ describe('Residents read one message slot', () => {
       [{ agent: 'shade', text: 'Here I am.', locus: 'discord:dm:antra' }]);
     await framework.stop();
   });
+
+
+
 });

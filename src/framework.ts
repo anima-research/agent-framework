@@ -571,7 +571,8 @@ interface TurnRouting {
    * system markers can't move it (2026-07-21 Cairn lounge misroute). Since
    * 2026-07-31 a re-pin moves it (repinTurnLocus): an addressed message, or a
    * follow-up in a channel the turn engaged. The agent's own channel_open
-   * moves it too. Unset in explicit and disabled mode, and for a turn with
+   * moves it too unless the turn opened from a private non-channel surface.
+   * Unset in explicit and disabled mode, and for a turn with
    * nowhere to speak.
    */
   locus?: string;
@@ -601,6 +602,8 @@ interface TurnRouting {
   deliveries: string[];
   /** Plain-prose segments the turn suppressed, reported by its receipt. */
   suppressed: number;
+  nonChannelOrigin: boolean;
+  privateSuppressed: number;
   /**
    * The messages that would re-pin the locus (repinChannel) that no tool
    * boundary of the turn weighed, in the order they were stored
@@ -633,7 +636,7 @@ interface Arrival {
 function freshTurnRouting(): TurnRouting {
   return {
     engaged: new Set(), destination: null, hybridHold: false,
-    continuation: false, deliveries: [], suppressed: 0, arrivals: [],
+    continuation: false, deliveries: [], suppressed: 0, nonChannelOrigin: false, privateSuppressed: 0, arrivals: [],
   };
 }
 
@@ -647,6 +650,20 @@ interface ProseRound {
 function isTurnContinuation(reason: string): boolean {
   return reason === 'context_budget_restart' || reason === 'tool_results_ready'
     || reason === 'tool_result_guard_retry';
+}
+
+/** Positive classification for operator/local surfaces: future source names
+ * stay private without extending a fragile allow-list. MCPL events are never
+ * classified here, and any explicit channel id makes the event channel-bound. */
+function surfaceChannelId(event: ProcessEvent): string | undefined {
+  if (event.type !== 'external-message' && event.type !== 'api:message') return undefined;
+  const value = (event.metadata as Record<string, unknown> | undefined)?.channelId;
+  return typeof value === 'string' && value.trim().length > 0 ? value.trim() : undefined;
+}
+
+export function isNonChannelSurfaceEvent(event: ProcessEvent): boolean {
+  return (event.type === 'external-message' || event.type === 'api:message')
+    && surfaceChannelId(event) === undefined;
 }
 const CONVERSATION_ROUTER_STATE_ID = 'framework/conversation-router';
 const INFERENCE_LOG_ID = 'framework/inference-log';
@@ -2355,6 +2372,10 @@ export class AgentFramework {
             ...(provenance?.channelId ? { wakeChannelId: provenance.channelId } : {}),
             ...(provenance?.counterparty ? { counterparty: provenance.counterparty } : {}),
             ...(provenance?.at ? { wakeAt: provenance.at } : {}),
+            ...(provenance?.routingClass === 'private' ? { nonChannelOrigin: true } : {}),
+            ...(provenance?.routingClass === 'channel' && provenance.channelId
+              ? { channelId: provenance.channelId }
+              : {}),
             // A batch that contains an ADDRESSED message (mention / reply /
             // DM) routes like the direct path does: the reply goes to that
             // message's channel. Without it the turn froze on the
@@ -2368,7 +2389,9 @@ export class AgentFramework {
             // route applies to a fork only when it IS that home, and never to
             // another agent when a fork owns that channel. Otherwise a fork
             // bound elsewhere would show typing where it isn't replying.
-            ...(provenance?.routeChannelId && framework.mayTakeGateRoute(agentName, provenance.routeChannelId)
+            ...(provenance?.routingClass !== 'private'
+              && provenance?.routeChannelId
+              && framework.mayTakeGateRoute(agentName, provenance.routeChannelId)
               ? { channelId: provenance.routeChannelId, addressed: true }
               : {}),
           });
@@ -6616,6 +6639,7 @@ export class AgentFramework {
    */
   private async reactToRefusal(agentName: string, category: string): Promise<void> {
     try {
+      if (this.turnRouting?.get(agentName)?.nonChannelOrigin === true) return;
       const incoming = this.channelRegistry?.buildChannelContext()?.incoming;
       if (!incoming) return;
       // incoming.channelId is the MCPL composite id ("discord:<guild>:<channel>");
@@ -9080,7 +9104,7 @@ export class AgentFramework {
             const routing = this.routingOf(agent.name);
             let newLocus: string | undefined;
             for (const inj of midTurnInjections) newLocus = this.repinChannel(inj.metadata, routing) ?? newLocus;
-            if (newLocus) {
+            if (newLocus && !routing.nonChannelOrigin) {
               // What this boundary just stored is newer than any arrival the
               // turn holds, so the arrivals can't move the locus back.
               routing.arrivals = [];
@@ -9152,6 +9176,9 @@ export class AgentFramework {
               suppressProse: this.activeTurnTriggers.get(agent.name)?.suppressProse,
               ephemeralSystemPrompt: this.activeTurnTriggers.get(agent.name)?.ephemeralSystemPrompt,
               silentHeartbeat: this.activeTurnTriggers.get(agent.name)?.silentHeartbeat,
+              nonChannelOrigin: this.activeTurnTriggers.get(agent.name)?.nonChannelOrigin,
+              channelId: this.activeTurnTriggers.get(agent.name)?.channelId,
+              addressed: this.activeTurnTriggers.get(agent.name)?.addressed,
             });
           } else if (currentState.stream) {
             // What this round appends is in the next call's prompt. If that
@@ -9290,11 +9317,15 @@ export class AgentFramework {
 
       // Gate non-MCPL events (MCPL events are already gated in PushHandler/ChannelRegistry)
       if (this.eventGate && event.type !== 'mcpl:push-event' && event.type !== 'mcpl:channel-incoming') {
+        const surfaceChannel = surfaceChannelId(event);
         const decision = this.eventGate.evaluate({
           ...extractGateFields(event),
           eventType: event.type,
           serverId: source,
-          channelId: '',
+          channelId: surfaceChannel ?? '',
+          ...((event.type === 'external-message' || event.type === 'api:message')
+            ? { routingClass: surfaceChannel ? 'channel' as const : 'private' as const }
+            : {}),
         });
         if (!decision.trigger) return;
       }
@@ -9315,6 +9346,8 @@ export class AgentFramework {
             reason: event.type,
             source,
             timestamp: Date.now(),
+            ...(surfaceChannelId(event) ? { channelId: surfaceChannelId(event) } : {}),
+            nonChannelOrigin: isNonChannelSurfaceEvent(event),
           });
         }
       }
@@ -10772,6 +10805,22 @@ export class AgentFramework {
       // requests[0] in that mixed batch bypassed the turn lock because a
       // restart existed, then treated the continuation as a fresh turn.
       const trigger = budgetRestart ?? requests[0];
+      // A restart keeps its own kind. For a fresh batch led by a neutral wake,
+      // the first request that actually declares private/channel routing owns
+      // the turn kind; neutral causes may share that turn, the opposite kind may not.
+      const kindRequest = budgetRestart ?? requests.find(
+        (request) => request.nonChannelOrigin === true || !!request.channelId,
+      );
+      const turnIsPrivate = kindRequest?.nonChannelOrigin === true;
+      const turnIsChannel = !turnIsPrivate && !!kindRequest?.channelId;
+      if (turnIsPrivate || turnIsChannel) {
+        const opposite = turnIsPrivate
+          ? (request: InferenceRequest) => !!request.channelId
+          : (request: InferenceRequest) => request.nonChannelOrigin === true;
+        const siblings = requests.filter((request) => request !== trigger && opposite(request));
+        if (siblings.length > 0) this.pendingRequests.push(...siblings);
+        requests = requests.filter((request) => request === trigger || !opposite(request));
+      }
       // Route this turn's auto-published speech to the channel that triggered
       // it (item-3 redux). A batched wake may carry several triggering channels
       // (messages arrived in >1 channel while the agent was busy/idle):
@@ -10834,8 +10883,9 @@ export class AgentFramework {
         suppressProse: silentOnly ? trigger?.suppressProse : undefined,
         ephemeralSystemPrompt: silentOnly ? trigger?.ephemeralSystemPrompt : undefined,
         silentHeartbeat: silentOnly ? trigger?.silentHeartbeat : undefined,
-        channelId: channelReq?.channelId,
-        addressed: addressedReq !== undefined,
+        channelId: turnIsPrivate ? undefined : channelReq?.channelId,
+        addressed: turnIsPrivate ? false : addressedReq !== undefined,
+        nonChannelOrigin: turnIsPrivate || undefined,
         // A context-budget restart continues the same logical turn: it keeps
         // the channel for routing but names no author — the restart is its
         // own cause, and borrowing another request's author would be false
@@ -10868,6 +10918,12 @@ export class AgentFramework {
   private recordProseSuppression(routing: TurnRouting, count: number): void {
     if (count <= 0) return;
     routing.suppressed += count;
+  }
+
+  private suppressPrivateTurnProse(routing: TurnRouting, count: number): void {
+    if (count <= 0) return;
+    console.error('[routing] prose NOT auto-published (private non-channel turn)');
+    routing.suppressed += count; routing.privateSuppressed += count;
   }
 
   /** Record a successful plain-prose delivery for this turn's receipt. */
@@ -10910,12 +10966,13 @@ export class AgentFramework {
           : id,
       );
     }
-    const suppressedNote =
-      suppressed > 0
-        ? agent.proseRouting === 'disabled'
-          ? `${suppressed} plain-speech segment(s) suppressed (proseRouting=disabled — publish only with an explicit send tool)`
-          : `${suppressed} plain-speech segment(s) suppressed (explicit send in the same round — resend with a send tool if it was meant to be heard)`
-        : '';
+    const notes: string[] = [];
+    const privateSuppressed = routing.privateSuppressed ?? 0;
+    if (privateSuppressed > 0) notes.push(`${privateSuppressed} plain-speech segment(s) kept private (non-channel turn — publish only with an explicit send tool)`);
+    const otherSuppressed = Math.max(0, suppressed - privateSuppressed);
+    if (otherSuppressed > 0) notes.push(agent.proseRouting === 'disabled' ? `${otherSuppressed} plain-speech segment(s) suppressed (proseRouting=disabled — publish only with an explicit send tool)` : `${otherSuppressed} plain-speech segment(s) suppressed (explicit send in the same round — resend with a send tool if it was meant to be heard)`);
+    routing.privateSuppressed = 0;
+    const suppressedNote = notes.join(' · ');
     const text =
       shown.length > 0
         ? `[delivered] plain speech → ${shown.join(' · ')}${suppressedNote ? ` · ${suppressedNote}` : ''}`
@@ -10956,8 +11013,8 @@ export class AgentFramework {
     let text: string;
     if (locus === null) {
       text =
-        '[routing] Your plain speech currently has no channel — it stays in ' +
-        'your archive. Use an explicit send tool to reach a channel.';
+        '[routing] Your plain speech currently goes to no channel: it stays on ' +
+        'the surface you were addressed from. Use an explicit send tool to reach a channel.';
     } else {
       const label = this.channelRegistry?.getDescriptor(locus)?.label;
       const shown =
@@ -11014,6 +11071,7 @@ export class AgentFramework {
     const open = this.openLogical.get(agentName);
     if (!open) return;
     if ((metadata as { tuneOut?: unknown } | undefined)?.tuneOut) return;
+    if (open.nonChannelOrigin) return;
     const channelId = this.repinChannel(metadata, open);
     if (channelId) open.arrivals.push({ messageId, channelId });
   }
@@ -11171,12 +11229,7 @@ export class AgentFramework {
       return;
     }
     console.error(`[prose] ${agent.name}: '!' continuation — requesting immediate next turn`);
-    this.pendingRequests.push({
-      agentName: agent.name,
-      reason: 'prose-continuation',
-      source: 'framework',
-      timestamp: Date.now(),
-    });
+    this.pendingRequests.push(this.derivedTurnRequest(agent.name, 'prose-continuation', routing));
   }
 
   /** The agent's routing state for its current turn, made when it has none. */
@@ -11187,6 +11240,23 @@ export class AgentFramework {
       this.turnRouting.set(agentName, routing);
     }
     return routing;
+  }
+
+
+  /** Build a fresh request caused by a logical turn, retaining private origin. */
+  private derivedTurnRequest(
+    agentName: string,
+    reason: string,
+    routing?: TurnRouting,
+  ): InferenceRequest {
+    const cause = routing ?? this.turnRouting?.get(agentName) ?? this.openLogical?.get(agentName);
+    return {
+      agentName,
+      reason,
+      source: 'framework',
+      timestamp: Date.now(),
+      ...(cause?.nonChannelOrigin ? { nonChannelOrigin: true } : {}),
+    };
   }
 
   /**
@@ -11289,7 +11359,7 @@ export class AgentFramework {
         if ('error' in resolved) {
           delete routing.pin;
           routing.hybridHold = true;
-          this.bounceProse(agent, parsed.body, resolved.error, resolved.candidates, '>>>');
+          this.bounceProse(agent, parsed.body, resolved.error, resolved.candidates, '>>>', routing);
           continue;
         }
         let body = parsed.body;
@@ -11310,19 +11380,19 @@ export class AgentFramework {
           } else {
             delete routing.pin;
             routing.hybridHold = true;
-            this.bounceProse(agent, parsed.body, `delivery to ${resolved.channelId} was not confirmed`, undefined, '>>>');
+            this.bounceProse(agent, parsed.body, `delivery to ${resolved.channelId} was not confirmed`, undefined, '>>>', routing);
           }
         } catch (err) {
           delete routing.pin;
           routing.hybridHold = true;
-          this.bounceProse(agent, parsed.body, `delivery to ${resolved.channelId} failed: ${err instanceof Error ? err.message : String(err)}`, undefined, '>>>');
+          this.bounceProse(agent, parsed.body, `delivery to ${resolved.channelId} failed: ${err instanceof Error ? err.message : String(err)}`, undefined, '>>>', routing);
         }
         continue;
       }
       if (attempted) {
         delete routing.pin;
         routing.hybridHold = true;
-        this.bounceProse(agent, normalized, 'malformed >>> routing envelope: destination is missing', undefined, '>>>');
+        this.bounceProse(agent, normalized, 'malformed >>> routing envelope: destination is missing', undefined, '>>>', routing);
         continue;
       }
       if (routing.hybridHold) {
@@ -11331,7 +11401,7 @@ export class AgentFramework {
       }
       const sticky = routing.pin;
       if (!allowLocus && !sticky) {
-        this.recordProseSuppression(routing, 1);
+        this.suppressPrivateTurnProse(routing, 1);
         continue;
       }
       const target = sticky ?? locus;
@@ -11386,7 +11456,7 @@ export class AgentFramework {
       const res = envelope.resolved;
       if (!res) throw new Error(`[prose] ${name}: a >> envelope reached delivery without the target admitted with it`);
       if ('error' in res) {
-        this.bounceProse(agent, parsed.body, res.error, res.candidates);
+        this.bounceProse(agent, parsed.body, res.error, res.candidates, '>>', routing);
         return;
       }
       targetChannel = res.channelId;
@@ -11396,7 +11466,7 @@ export class AgentFramework {
     } else {
       const sticky = routing.pin;
       if (!sticky) {
-        this.bounceProse(agent, rawText, 'no destination prefix and no destination set yet this turn');
+        this.bounceProse(agent, rawText, 'no destination prefix and no destination set yet this turn', undefined, '>>', routing);
         return;
       }
       targetChannel = sticky;
@@ -11426,7 +11496,7 @@ export class AgentFramework {
   /** Cap on consecutive bounce-triggered wakes (notices still append after). */
   private static readonly PROSE_BOUNCE_WAKE_CAP = 2;
 
-  private bounceProse(agent: Agent, text: string, reason: string, candidates?: string[], prefix: '>>' | '>>>' = '>>'): void {
+  private bounceProse(agent: Agent, text: string, reason: string, candidates?: string[], prefix: '>>' | '>>>' = '>>', routing?: TurnRouting): void {
     const name = agent.name;
     this.proseClipboards.set(name, text);
     const streak = (this.proseBounceStreaks.get(name) ?? 0) + 1;
@@ -11464,12 +11534,7 @@ export class AgentFramework {
     if (!capped) {
       // Wake so the resend can happen immediately — an unsent DM reply must
       // not sit invisible until the next unrelated event.
-      this.pendingRequests.push({
-        agentName: name,
-        reason: 'prose-bounce',
-        source: 'framework',
-        timestamp: Date.now(),
-      });
+      this.pendingRequests.push(this.derivedTurnRequest(name, 'prose-bounce', routing));
     }
   }
 
@@ -11883,6 +11948,7 @@ export class AgentFramework {
     }
 
     if (opensTurn) {
+      routing.nonChannelOrigin = trigger?.nonChannelOrigin === true;
       // The turn's trigger channel (item-3 redux): the channel of a
       // channel/DM-triggered turn, and none for a heartbeat / no-trigger
       // turn, which falls back to the global default rather than inheriting
@@ -11901,7 +11967,7 @@ export class AgentFramework {
       // (announce-on-change only — no per-turn chatter, append-only for KV
       // stability).
       if (turnProseRouting !== 'explicit' && turnProseRouting !== 'disabled') {
-        const locus = this.channelRegistry?.resolveLocus(agent.name) ?? null;
+        const locus = routing.nonChannelOrigin ? null : this.channelRegistry?.resolveLocus(agent.name) ?? null;
         if (locus !== null) routing.locus = locus;
         if (attempt === 0) this.announceLocusIfChanged(agent.name, locus);
       }
@@ -11984,7 +12050,7 @@ export class AgentFramework {
       // MCPL beforeInference hooks (fail-open)
       if (this.hookOrchestrator) {
         try {
-          const hookParams = this.buildBeforeInferenceParams(agent, trigger);
+          const hookParams = this.buildBeforeInferenceParams(agent, trigger, true);
           const hookInjections = this.scopeInjectionsForAgent(
             agent.name,
             await this.hookOrchestrator.beforeInference(hookParams),
@@ -12313,7 +12379,7 @@ export class AgentFramework {
         : turnProseRouting === 'explicit'
           ? trigger?.channelId ?? null
           : resolveTurnLocus();
-    if (typingChannel) this.channelRegistry!.startTyping(typingChannel);
+    if (typingChannel) this.channelRegistry?.startTyping(typingChannel);
 
     // MCPL Spec 14.3 outgoing streaming: route text deltas to their
     // destination server AS THEY GENERATE (voice synthesis, live message
@@ -12630,7 +12696,7 @@ export class AgentFramework {
                       // Queued under this turn's routing, whenever it posts.
                       const routing = streamRouting;
                       for (const seg of roundSegments) {
-                        chainSpeech(() => this.deliverHybridProse(agent, seg, locus, true, routing), 'mid-turn hybrid prose delivery failed:');
+                        chainSpeech(() => this.deliverHybridProse(agent, seg, locus, !routing.nonChannelOrigin, routing), 'mid-turn hybrid prose delivery failed:');
                       }
                     }
                   } else if (turnProseRouting === 'explicit') {
@@ -12666,6 +12732,8 @@ export class AgentFramework {
                     // private round's, a >>skip_reply envelope's or a target
                     // that didn't resolve leave the destination as it was.
                     proseStream?.retarget(streamRouting.destination);
+                  } else if (streamRouting.nonChannelOrigin) {
+                    this.suppressPrivateTurnProse(streamRouting, roundSegments.length);
                   } else if (turnSilenced) {
                     console.error(
                       `[routing] ${agent.name}: mid-turn round [${roundToolNames.join(', ')}] -> prose NOT routed (turn silenced)`,
@@ -13026,12 +13094,10 @@ export class AgentFramework {
                 const count = this.updateRewindMarker(agent, category);
                 onStep(count);
                 if (forced) forced.removed.push(rec);
-                this.pendingRequests.push({
-                  agentName: agent.name,
-                  reason: forced ? 'unstick-retry' : 'refusal-rewind-retry',
-                  source: 'framework',
-                  timestamp: Date.now(),
-                });
+                this.pendingRequests.push(this.derivedTurnRequest(
+                  agent.name,
+                  forced ? 'unstick-retry' : 'refusal-rewind-retry',
+                ));
                 handledByRewind = true;
               };
 
@@ -13142,7 +13208,7 @@ export class AgentFramework {
                   const locus = resolveTurnLocus();
                   console.error(`[prose] ${agent.name}: text-only turn -> hybrid prose gateway`);
                   try {
-                    await this.deliverHybridProse(agent, speechText, locus, true, finalRouting);
+                    await this.deliverHybridProse(agent, speechText, locus, !streamRouting.nonChannelOrigin, finalRouting);
                   } catch (err) {
                     console.error('text-only hybrid prose delivery failed:', err);
                   }
@@ -13153,6 +13219,8 @@ export class AgentFramework {
                   } catch (err) {
                     console.error('text-only prose delivery failed:', err);
                   }
+                } else if (streamRouting.nonChannelOrigin) {
+                  this.suppressPrivateTurnProse(streamRouting, 1);
                 } else {
                   // Route to the TURN-FROZEN locus, like every other speech
                   // path. This dispatch runs AFTER the agent is idle, so a live
@@ -13216,7 +13284,7 @@ export class AgentFramework {
                   const locus = resolveTurnLocus();
                   for (const seg of segments) {
                     try {
-                      await this.deliverHybridProse(agent, seg, locus, true, finalRouting);
+                      await this.deliverHybridProse(agent, seg, locus, !streamRouting.nonChannelOrigin, finalRouting);
                     } catch (err) {
                       console.error('trailing hybrid prose delivery failed:', err);
                     }
@@ -13235,6 +13303,8 @@ export class AgentFramework {
                     }
                   }
                 }
+              } else if (streamRouting.nonChannelOrigin) {
+                this.suppressPrivateTurnProse(streamRouting, segments.length);
               } else if (silenced || segments.length === 0) {
                 console.error(
                   `[routing] ${agent.name}: tool-call turn [${toolNames.join(', ') || 'none'}] -> trailing prose NOT routed ` +
@@ -13273,10 +13343,10 @@ export class AgentFramework {
             // trailing paths awaited the chain when there was final text; a
             // turn whose last response is empty awaits it here, so the
             // receipt and the continuation see its last rounds' deliveries.
-            // Locus and hybrid mode; explicit-mode envelopes acknowledge
-            // themselves through the prose gateway.
+            // Every mode reaches this call; modes with no recorded delivery
+            // or suppression produce no receipt.
             await turnSpeechChain;
-            if (!trigger?.suppressProse && turnProseRouting !== 'explicit') {
+            if (!trigger?.suppressProse) {
               this.appendProseDeliveryReceipt(agent, streamRouting);
             }
 
@@ -16247,12 +16317,7 @@ export class AgentFramework {
     );
 
     // Retry immediately on the repaired history (bounded by the cap above).
-    this.pendingRequests.push({
-      agentName: agent.name,
-      reason: 'inference-failure-rewind-retry',
-      source: 'framework',
-      timestamp: Date.now(),
-    });
+    this.pendingRequests.push(this.derivedTurnRequest(agent.name, 'inference-failure-rewind-retry'));
   }
 
   // ==========================================================================
@@ -18448,6 +18513,19 @@ export class AgentFramework {
       }
     }
 
+    if (call.name === 'channel_publish'
+      && this.routingOf(agentName).nonChannelOrigin
+      && !(call.input as { channelId?: unknown } | undefined)?.channelId) {
+      const error = 'This private turn has no inferred channel; channel_publish requires an explicit channelId.';
+      this.toolLifecycleEmitter?.refuse(agentName, call.id);
+      this.emitTrace({ type: 'tool:failed', module: 'channels', tool: call.name, callId: call.id, error });
+      this.pushEvent({
+        type: 'tool-result', callId: call.id, toolName: call.name, agentName, moduleName: 'channels',
+        result: { success: false, error, isError: true },
+      });
+      return;
+    }
+
     this.emitTrace({ type: 'tool:started', module: 'channels', tool: call.name, callId: call.id, input: call.input });
     const startTime = Date.now();
     // The turn that called: a channel_open's result records its trigger
@@ -18484,27 +18562,30 @@ export class AgentFramework {
           if (opened) {
             callingTurn.triggerChannel = opened;
             const openerAgent = this.agents.get(agentName);
-            // The move is one this result tells the agent, so it needs the
-            // turn that called still open. A result that lands after the turn
-            // settled is dropped, so the agent never reads it, whether or not
-            // a later start has replaced the turn's routing state yet: the
-            // turn's locus stays where the agent was last told, for a resume
-            // that opens the turn again, and so does the announce baseline,
-            // which is the agent's across turns.
+            // Only the turn that called may move its own locus. A private
+            // non-channel turn may open for incoming traffic, but its prose
+            // stays private; explicit publish remains available.
+            const privateTurn = callingTurn.nonChannelOrigin;
             if (openerAgent
               && (openerAgent.proseRouting === 'locus' || openerAgent.proseRouting === 'hybrid')
               && this.openLogical.get(agentName) === callingTurn) {
-              callingTurn.locus = opened;
-              this.lastAnnouncedLocus.set(agentName, opened);
+              if (!privateTurn) {
+                callingTurn.locus = opened;
+                this.lastAnnouncedLocus.set(agentName, opened);
+              }
               result = {
                 ...result,
                 data: {
                   ...(result.data as Record<string, unknown> | undefined),
-                  routing: 'Your plain speech now lands in this channel. Other channels need an explicit send tool.',
+                  routing: privateTurn
+                    ? 'Channel opened for incoming traffic. This turn’s plain speech stays private; use an explicit send tool to publish there.'
+                    : 'Your plain speech now lands in this channel. Other channels need an explicit send tool.',
                 },
               };
               console.error(
-                `[routing] ${agentName}: channel_open -> pin moved to ${opened} (announced in tool result)`,
+                privateTurn
+                  ? `[routing] ${agentName}: channel_open -> private turn pin unchanged (announced in tool result)`
+                  : `[routing] ${agentName}: channel_open -> pin moved to ${opened} (announced in tool result)`,
               );
             }
           }
@@ -19679,7 +19760,7 @@ export class AgentFramework {
       });
   }
 
-  private buildBeforeInferenceParams(agent: Agent, trigger?: InferenceRequest): BeforeInferenceParams {
+  private buildBeforeInferenceParams(agent: Agent, trigger?: InferenceRequest, inTurn = false): BeforeInferenceParams {
     const inferenceId = `${agent.name}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
     return {
       inferenceId,
@@ -19698,7 +19779,10 @@ export class AgentFramework {
       // are omitted rather than fabricated — the hardcoded 200000 was false
       // for residents configured at 300k/600k.
       model: { id: agent.model },
-      channels: this.channelRegistry?.buildChannelContext(agent.name),
+      channels: this.channelRegistry?.buildChannelContext(agent.name, inTurn ? {
+        frozenLocus: this.turnRouting.get(agent.name)?.locus ?? null,
+        privateTurn: this.turnRouting.get(agent.name)?.nonChannelOrigin === true,
+      } : undefined),
     };
   }
 }

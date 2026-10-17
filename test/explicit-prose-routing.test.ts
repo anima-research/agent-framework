@@ -356,12 +356,12 @@ describe('explicit prose routing', () => {
 
   type RoutingState = {
     pin?: string; destination: string | null; hybridHold: boolean;
-    continuation: boolean; deliveries: string[]; suppressed: number;
+    continuation: boolean; deliveries: string[]; suppressed: number; privateSuppressed: number;
     triggerChannel?: string; locus?: string; engaged: Set<string>; arrivals: Array<{ messageId: string; channelId: string }>;
   };
   /** A turn's routing state, as the framework makes a fresh one. */
   const routingState = (fields: Partial<RoutingState> = {}): RoutingState => ({
-    destination: null, hybridHold: false, continuation: false, deliveries: [], suppressed: 0,
+    destination: null, hybridHold: false, continuation: false, deliveries: [], suppressed: 0, privateSuppressed: 0,
     engaged: new Set(), arrivals: [], ...fields,
   });
 
@@ -1115,11 +1115,11 @@ describe('explicit prose routing', () => {
       const receipts = context(framework).texts.filter((text) => text.startsWith('[delivered]'));
       assert.equal(receipts.length, 2, 'each supplied turn gets its own receipt');
       const delivered = receipts.find((text) => text.includes('chan-alpha'));
-      const suppressed = receipts.find((text) => text.includes('suppressed'));
+      const suppressed = receipts.find((text) => text.includes('kept private'));
       assert.ok(delivered, "the earlier turn's delivery is acknowledged");
-      assert.doesNotMatch(delivered, /suppressed/, "the earlier receipt excludes the newer suppression");
-      assert.ok(suppressed, "the newer turn's suppression is acknowledged");
-      assert.match(suppressed, /1 plain-speech segment.*suppressed/);
+      assert.doesNotMatch(delivered, /kept private/, "the earlier receipt excludes the newer private retention");
+      assert.ok(suppressed, "the newer turn's private retention is acknowledged");
+      assert.match(suppressed, /1 plain-speech segment.*kept private/);
       assert.doesNotMatch(suppressed, /chan-alpha/, "the newer receipt excludes the earlier delivery");
     });
   });
@@ -1460,7 +1460,9 @@ describe('explicit prose routing', () => {
     const routed = stubRegistry(framework);
     trigger(framework);
     await framework.runUntilIdle();
-    assert.deepEqual(routed, [{ text: 'Ordinary field speech.', locus: 'world:commons' }]);
+    assert.deepEqual(routed, [], 'channel-less hybrid prose cannot use an inferred locus');
+    const receipts = context(framework).texts.filter((text) => text.startsWith('[delivered]'));
+    assert.ok(receipts.some((text) => text.includes('kept private')));
     await framework.stop();
   });
 

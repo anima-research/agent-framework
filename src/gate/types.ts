@@ -223,6 +223,8 @@ export interface GateEventInfo {
   serverId: string;
   channelId: string;
   metadata?: Record<string, unknown>;
+  /** Routing class for operator-surface events held by the gate. */
+  routingClass?: 'private' | 'channel';
   /** Workspace mount name (for workspace:* events). */
   mount?: string;
   /** Mount-prefixed paths touched (for workspace:* events). */

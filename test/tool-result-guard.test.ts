@@ -100,7 +100,7 @@ async function harness(scripts: NormalizedResponse[][], config: Partial<AgentCon
     agents: [{ name: 'assistant', model: 'test', systemPrompt: 'system', ...config }], modules: [module], syncIntervalMs: 0 };
   const framework = await AgentFramework.create(base);
   const run = async () => {
-    framework.pushEvent({ type: 'external-message', source: 'test', content: 'read', metadata: {} });
+    framework.pushEvent({ type: 'external-message', source: 'test', content: 'read', metadata: { channelId: 'test:channel' } } as never);
     await framework.runUntilIdle();
   };
   return { framework, membrane, module, base, run };
@@ -344,7 +344,7 @@ test('native Membrane observes the first refusal even when guard is enabled by a
     if (event.type === 'inference:tokens') tokenTraces.push(String((event as { content?: unknown }).content));
   });
   try {
-    framework.pushEvent({ type: 'external-message', source: 'test', content: 'read', metadata: {} });
+    framework.pushEvent({ type: 'external-message', source: 'test', content: 'read', metadata: { channelId: 'test:channel' } } as never);
     await framework.runUntilIdle();
     assert.equal(requests.length, 3);
     assert.match(JSON.stringify(requests[1]), /payload-one/);
@@ -1015,7 +1015,7 @@ test("a fresh turn starts new routing state in every mode, and leaves the earlie
       assert.equal(now?.continuation, false, `${mode}: no continuation`);
       assert.deepEqual(now?.deliveries, [], `${mode}: no deliveries carried into the new turn`);
       assert.equal(now?.suppressed, 0, `${mode}: no suppression carried into the new turn`);
-      assert.equal(now?.triggerChannel, undefined, `${mode}: no trigger channel carried into the new turn`);
+      assert.equal(now?.triggerChannel, 'test:channel', `${mode}: the new turn uses its own triggering channel`);
       assert.notEqual(now?.locus, 'chan-earlier', `${mode}: no locus carried into the new turn`);
       assert.deepEqual([...(now?.engaged ?? [])], [], `${mode}: no engaged channels carried into the new turn`);
       assert.deepEqual(now?.arrivals, [], `${mode}: no arrival carried into the new turn`);

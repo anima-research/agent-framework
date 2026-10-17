@@ -390,7 +390,7 @@ const CHANNEL_TOOL_DEFINITIONS: ToolDefinition[] = [
   },
   {
     name: 'channel_publish',
-    description: 'Publish a message to a channel. If channelId is omitted, publishes to the most recent incoming channel.',
+    description: 'Publish a message to a channel. If channelId is omitted, publishes to the most recent incoming channel (not in a turn from a private surface).',
     inputSchema: {
       type: 'object' as const,
       properties: {
@@ -1450,19 +1450,19 @@ export class ChannelRegistry {
    *
    * Returns undefined if no channels are active.
    */
-  buildChannelContext(agentName?: string): ChannelContext | undefined {
+  buildChannelContext(
+    agentName?: string,
+    turn?: { frozenLocus: string | null; privateTurn?: boolean },
+  ): ChannelContext | undefined {
     const openChannels = this.getOpenChannels();
 
-    // Resolve the outbound locus the SAME way routeSpeech does, so the agent is
-    // told the channel its speech will actually land in: a conversation fork's
-    // home channel, else this turn's channel (single trunk agent — item-3
-    // redux: its locus, else its triggering channel), else the global default
-    // (heartbeats). Without this, a fork
-    // was advertised the global locus but published somewhere else; and a trunk
-    // agent was told the wrong channel under concurrency.
+    // During a real turn, report the same frozen locus routeSpeech consumes.
+    // A private non-channel turn freezes null and has no truthful incoming
+    // channel either. Outside a turn (including preview), retain live resolution:
+    // a fork's home, else the trunk's active channel, else the global default.
     const home = agentName ? this.homeChannelResolver?.(agentName) : undefined;
     const active = agentName ? this.activeChannelResolver?.(agentName) : undefined;
-    const outgoing = home ?? active ?? this.defaultPublishChannel;
+    const outgoing = turn ? turn.frozenLocus : home ?? active ?? this.defaultPublishChannel;
 
     if (openChannels.length === 0 && !outgoing) {
       return undefined;
@@ -1473,7 +1473,7 @@ export class ChannelRegistry {
     // Incoming: the most-recent inbound message (what the agent is replying to).
     // Left process-global — per-channel inbound tracking (the right messageId for
     // a fork's own channel) is a separate concern from the outbound routing fix.
-    if (this.defaultPublishChannel && this.defaultPublishMessageId) {
+    if (!turn?.privateTurn && this.defaultPublishChannel && this.defaultPublishMessageId) {
       context.incoming = {
         channelId: this.defaultPublishChannel,
         messageId: this.defaultPublishMessageId,
@@ -3093,8 +3093,8 @@ export class ChannelRegistry {
     const channelId = locusChannelId;
     if (!channelId) {
       // The turn froze with no locus (no home, no triggering channel, no
-      // global inbound ever seen) — the agent was told its prose stays in
-      // the archive; honor that.
+      // global inbound ever seen) — the agent was told its prose stays on
+      // the surface where it was addressed; honor that.
       return fail(null, 'turn has no locus (no home/trigger channel; nothing to deliver into)');
     }
 
