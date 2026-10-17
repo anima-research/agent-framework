@@ -50,7 +50,7 @@ import {
   splitPreservingImageSlots,
 } from '../src/tool-image-ledger.js';
 import { toolResultDataToHistoryString, truncateForHistory } from '../src/tool-result-history.js';
-import { classifyBlock, referenceRegistry, type ReferenceTestimony } from '../src/mcpl/references.js';
+import { UNBOUND_REASON, classifyBlock, referenceRegistry, type ReferenceTestimony } from '../src/mcpl/references.js';
 import { createMockResponse, MockMembrane } from './helpers/mock-membrane.js';
 
 const PNG = Buffer.from(
@@ -414,7 +414,8 @@ describe('save_recent_image provenance (issue #104)', () => {
     // say the same, or the index slides.
     const c = classifyBlock({ type: 'image', uri: 'https://example.invalid/sri-label.png', mimeType: '\u202EImage/PNG\u061C' });
     assert.strictEqual(c.kind, 'reference');
-    const record = referenceRegistry.register((c as { testimony: ReferenceTestimony }).testimony);
+    // Bound to its server, as a tool result's references are, so its stub is the one seeded below.
+    const record = referenceRegistry.register((c as { testimony: ReferenceTestimony }).testimony, 'vst');
     const h = await startTurn({
       prefix: 'sri-reference-label-',
       responses: [[saveCall('call_save', { path: 'files/label.png', index: 0 })], done],
@@ -441,10 +442,11 @@ describe('save_recent_image provenance (issue #104)', () => {
   });
 
   it('an expired reference refuses with its reason; one with a saved copy still points at fetch_reference', async () => {
+    // Bound to their server, as a tool result's references are, so the expiry is what the fetcher would refuse.
     const register = (name: string) => {
       const c = classifyBlock({ type: 'image', uri: `https://example.invalid/${name}`, mimeType: 'image/png', expiresAt: '2001-01-01T00:00:00Z' });
       assert.strictEqual(c.kind, 'reference');
-      return referenceRegistry.register((c as { testimony: ReferenceTestimony }).testimony);
+      return referenceRegistry.register((c as { testimony: ReferenceTestimony }).testimony, 'vst');
     };
     const kept = register('sri-expired-kept.png');
     kept.fetchedPath = 'files/refs/kept.png'; // saved before its expiry passed: fetch_reference serves it
@@ -477,6 +479,52 @@ describe('save_recent_image provenance (issue #104)', () => {
       assert.strictEqual(keptRefusal.isError, true);
       assert.match(keptRefusal.content, new RegExp(`index 1 is a reference \\(${kept.refId}, image/png, from`));
       assert.match(keptRefusal.content, /Fetch it with fetch_reference and save the materialized file instead\./);
+    } finally {
+      await h.framework.stop();
+      rmSync(h.tempDir, { recursive: true, force: true });
+    }
+  });
+
+  it('an unbound reference refuses with the reason its stub gives, where a bound one still points at fetch_reference', async () => {
+    // The first registered with no server, as an in-process module's reference or a
+    // channel message's is; the second against its server, as a tool result's is.
+    const register = (name: string, serverId?: string) => {
+      const c = classifyBlock({ type: 'image', uri: `https://example.invalid/${name}`, mimeType: 'image/png' });
+      assert.strictEqual(c.kind, 'reference');
+      return referenceRegistry.register((c as { testimony: ReferenceTestimony }).testimony, serverId);
+    };
+    const unbound = register('sri-unbound.png');
+    const bound = register('sri-bound.png', 'vst');
+    const h = await startTurn({
+      prefix: 'sri-reference-unbound-',
+      responses: [
+        [saveCall('call_save0', { path: 'files/unbound.png', index: 0 })],
+        [saveCall('call_save1', { path: 'files/bound.png', index: 1 })],
+        done,
+      ],
+      seedHistory: (framework) => {
+        framework.getAgent('prime')!.getContextManager().addMessage('user', [{
+          type: 'tool_result',
+          toolUseId: 'call_render',
+          toolName: 'mcpl--vst--render',
+          // Index 0 is the newest slot, the last line.
+          content: `[${bound.refId}] bound.png — image/png — from tool result — fetch with fetch_reference\n`
+            + `[${unbound.refId}] unbound.png — image/png — from tool result — ${UNBOUND_REASON}`,
+          isError: false,
+        }] as ContentBlock[]);
+      },
+    });
+    try {
+      const refused = await waitForToolResult(h.framework, 'call_save0');
+      assert.strictEqual(refused.isError, true);
+      assert.match(refused.content, new RegExp(`index 0 is a reference \\(${unbound.refId}, image/png, from`));
+      assert.ok(refused.content.includes(`It can't be fetched either — ${UNBOUND_REASON}.`), refused.content);
+      assert.ok(!refused.content.includes('fetch_reference'), refused.content);
+      const boundRefusal = await waitForToolResult(h.framework, 'call_save1');
+      assert.strictEqual(boundRefusal.isError, true);
+      assert.match(boundRefusal.content, new RegExp(`index 1 is a reference \\(${bound.refId}, image/png, from`));
+      assert.match(boundRefusal.content, /Fetch it with fetch_reference and save the materialized file instead\./);
+      assert.strictEqual(await fileBytes(h, 'files/unbound.png'), null);
     } finally {
       await h.framework.stop();
       rmSync(h.tempDir, { recursive: true, force: true });

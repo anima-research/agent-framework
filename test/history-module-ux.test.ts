@@ -291,8 +291,8 @@ describe('HistoryModule UX: extract aroundId', () => {
 
   it('errors cleanly: unknown id, anchor outside an explicit channel, mixing with from/to or author', async () => {
     const { mod } = stub(conv);
-    assert.match((await call(mod, 'extract', { aroundId: 'nope' })).error!, /No message/);
-    assert.match((await call(mod, 'extract', { aroundId: 'c11', channelId: 'other' })).error!, /not in channel/);
+    assert.match((await call(mod, 'extract', { aroundId: 'nope' })).error!, /no message in your history has the id "nope"/);
+    assert.match((await call(mod, 'extract', { aroundId: 'c11', channelId: 'other' })).error!, /isn't in channel "other" \(it's in "diary"\)/);
     assert.equal((await call(mod, 'extract', { aroundId: 'c11', from: '2026-09-20T00:00:00Z' })).success, false);
     assert.equal((await call(mod, 'extract', { aroundId: 'c11', author: 'antra' })).success, false);
     assert.equal((await call(mod, 'extract', { before: 3 })).success, false);

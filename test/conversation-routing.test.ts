@@ -10,7 +10,7 @@ import { tmpdir } from 'node:os';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { AgentFramework } from '../src/index.js';
-import type { ProcessEvent, ConversationRouterConfig, TraceEvent } from '../src/index.js';
+import type { ProcessEvent, ConversationRouterConfig, TraceEvent, Module, ModuleContext, ToolCall, ToolResult } from '../src/index.js';
 import { Membrane, OpenAIResponsesAPIAdapter, OpenAIResponsesFormatter } from '@animalabs/membrane';
 import type { ContentBlock } from '@animalabs/membrane';
 import { MockMembrane, createMockResponse } from './helpers/mock-membrane.js';
@@ -625,6 +625,108 @@ describe('Conversation routing', () => {
     framework.pushEvent(incomingEvent({ channelId: 'slack:D3', text: 'back again', channelType: 'im' }));
     await framework.runUntilIdle();
     assert.ok(framework.getAgent('conversation-slack-D3-g2'), 'rebind spawns generation 2');
+
+    await framework.stop();
+  });
+
+  it('a write deferred for a fork during its closure turn is stored in the fork before it is disposed', async () => {
+    const IDLE_TTL_MS = 60_000;
+    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'hello!' }]));
+    const framework = await makeFramework({ idleTtlMs: IDLE_TTL_MS });
+    framework.pushEvent(incomingEvent({ channelId: 'slack:D4', text: 'hi', channelType: 'im' }));
+    await framework.runUntilIdle();
+    const g1 = framework.getAgent('conversation-slack-D4-g1')!;
+    assert.ok(g1, 'g1 fork should exist after spawn');
+
+    forceExpiry(framework, 'slack:D4', IDLE_TTL_MS);
+    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Final report posted.' }]));
+    // While the closure turn is alive, a write addressed to the fork is
+    // deferred to that turn's end.
+    const internals = framework as unknown as {
+      addMessage(participant: string, content: ContentBlock[], metadata?: undefined, opts?: { forAgent?: string }): string;
+    };
+    const streamYielding = membrane.streamYielding.bind(membrane);
+    let deferred: string | undefined;
+    membrane.streamYielding = (request, options) => {
+      deferred = internals.addMessage('alice', [{ type: 'text', text: 'one more thing' }], undefined,
+        { forAgent: 'conversation-slack-D4-g1' });
+      return streamYielding(request, options);
+    };
+    framework.pushEvent({ type: 'external-message', source: 'test', content: 'tick', metadata: {} } as unknown as ProcessEvent);
+    await framework.runUntilIdle();
+
+    assert.equal(deferred, '', 'deferred: the closure turn was alive');
+    assert.equal(framework.getAgent('conversation-slack-D4-g1'), null, 'disposed once its closure turn finished');
+    const stored = g1.getContextManager().getAllMessages().map((m) => JSON.stringify(m.content));
+    assert.ok(stored[stored.length - 2]!.includes('Final report posted.'), stored.join('\n'));
+    assert.ok(stored[stored.length - 1]!.includes('one more thing'), 'stored after the closure reply, before the fork was disposed');
+
+    await framework.stop();
+  });
+
+  it('a closure turn that restarts is disposed by the frame that ends it, after storing what was held for it', async () => {
+    const IDLE_TTL_MS = 60_000;
+    // One tool, for the closure turn's tool round.
+    const tools: Module = {
+      name: 'test',
+      async start(_ctx: ModuleContext) {},
+      async stop() {},
+      getTools: () => [{ name: 'echo', description: 'Echo input', inputSchema: { type: 'object', properties: {} } }],
+      async handleToolCall(_call: ToolCall): Promise<ToolResult> { return { success: true, data: 'echoed' }; },
+      async onProcess() { return {}; },
+    } as unknown as Module;
+    const framework = await AgentFramework.create({
+      storePath: join(tempDir, 'test.chronicle'),
+      membrane: membrane.asMembrane(),
+      // The mock's tool round reports 10 input tokens, over this budget,
+      // which the fork inherits from its template: the closure turn's tool
+      // round restarts its stream.
+      agents: [{ name: 'trunk', model: 'test-model', systemPrompt: 'You are the trunk.', maxStreamTokens: 5 }],
+      modules: [tools],
+      conversations: { templateAgent: 'trunk', idleTtlMs: IDLE_TTL_MS },
+    });
+    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'hello!' }]));
+    framework.pushEvent(incomingEvent({ channelId: 'slack:D6', text: 'hi', channelType: 'im' }));
+    await framework.runUntilIdle();
+    const g1 = framework.getAgent('conversation-slack-D6-g1')!;
+    assert.ok(g1, 'g1 fork should exist after spawn');
+
+    forceExpiry(framework, 'slack:D6', IDLE_TTL_MS);
+    membrane.pushResponse(createMockResponse([
+      { type: 'text', text: 'Checking.' },
+      { type: 'tool_use', id: 'e1', name: 'test--echo', input: {} },
+    ] as ContentBlock[], 'tool_use'));
+    const internals = framework as unknown as {
+      addMessage(participant: string, content: ContentBlock[], metadata?: undefined, opts?: { forAgent?: string }): string;
+    };
+    const streamYielding = membrane.streamYielding.bind(membrane);
+    let streams = 0;
+    let deferred: string | undefined;
+    membrane.streamYielding = (request, options) => {
+      const first = streams++ === 0;
+      if (first) {
+        // While the closure turn is alive, a write addressed to the fork is
+        // deferred to that turn's end.
+        deferred = internals.addMessage('alice', [{ type: 'text', text: 'one more thing' }], undefined,
+          { forAgent: 'conversation-slack-D6-g1' });
+      }
+      const stream = streamYielding(request, options);
+      // A mock stream takes every response queued when it starts, so the
+      // restart's stream gets its reply only once the first has started.
+      if (first) membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Final report posted.' }]));
+      return stream;
+    };
+    framework.pushEvent({ type: 'external-message', source: 'test', content: 'tick', metadata: {} } as unknown as ProcessEvent);
+    await framework.runUntilIdle();
+
+    assert.equal(deferred, '', 'deferred: the closure turn was alive');
+    assert.equal(streams, 2, 'the closure turn restarted once');
+    assert.equal(framework.getAgent('conversation-slack-D6-g1'), null, 'disposed once its closure turn finished');
+    const stored = g1.getContextManager().getAllMessages().map((m) => JSON.stringify(m.content));
+    // The restart's turn start stores what was held for the turn, before its
+    // compile, so the restarted stream carries it and its reply follows.
+    assert.ok(stored[stored.length - 2]!.includes('one more thing'), stored.join('\n'));
+    assert.ok(stored[stored.length - 1]!.includes('Final report posted.'), 'the restarted closure turn finished in the fork');
 
     await framework.stop();
   });

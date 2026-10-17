@@ -520,6 +520,44 @@ export class Agent {
   }
 
   /**
+   * The budget compiles plan at, the path a patch's budget takes from it, and
+   * whether a descent is in flight, from the agent's own state alone: what a
+   * runtime-settings preview can still say while the context manager refuses
+   * its queries.
+   * @internal For the framework's runtime-settings preview; not a host API.
+   */
+  runtimeBudgetPath(patch?: AgentRuntimeSettingsPatch): {
+    liveBudgetTokens: number;
+    path: 'immediate' | 'paced' | 'none';
+    transition: 'stable' | 'converging';
+  } {
+    const live = this.contextBudgetTokens ?? DEFAULT_CONTEXT_BUDGET_TOKENS;
+    const budget = patch?.contextBudgetTokens;
+    return {
+      liveBudgetTokens: live,
+      path: budget === undefined ? 'none' : budget >= live || patch?.immediate ? 'immediate' : 'paced',
+      transition: this.contextBudgetTargetTokens === undefined ? 'stable' : 'converging',
+    };
+  }
+
+  /**
+   * Whether the context manager answers its queries, as its readiness says.
+   * It refuses them while its strategy's initialization is pending or has
+   * failed, until a switchBranch or setStrategy succeeds, and a strategy can
+   * refuse its readiness on its own, as the autobiographical one does for a
+   * branch it hasn't reloaded.
+   * @internal For the framework's runtime-settings preview; not a host API.
+   */
+  contextManagerAnswers(): boolean {
+    try {
+      this.contextManager.isReady();
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  /**
    * Read-only mirror of `updateRuntimeSettings`' budget semantics: derive what
    * the next compile would actually plan at if `patch` were applied, WITHOUT
    * mutating anything. This is the settings→config mapping a feasibility
@@ -561,9 +599,8 @@ export class Agent {
       this.validateRuntimeSettingsPatch(patch);
     }
     const hot = this.getHotContextSettings();
-    const live = this.contextBudgetTokens ?? DEFAULT_CONTEXT_BUDGET_TOKENS;
+    const { liveBudgetTokens: live, path } = this.runtimeBudgetPath(patch);
     const budget = patch?.contextBudgetTokens;
-    const path = budget === undefined ? 'none' : budget >= live || patch?.immediate ? 'immediate' : 'paced';
 
     const overrides: Record<string, unknown> = {};
     if (patch?.tailTokens !== undefined) {
@@ -780,6 +817,18 @@ export class Agent {
   }
 
   private validateRuntimeSettingsPatch(patch: AgentRuntimeSettingsPatch): void {
+    this.checkRuntimeSettingsPatch(patch);
+    if ((patch.tailTokens !== undefined || patch.transitionPaceTokens !== undefined) &&
+        !this.getHotContextSettings()) {
+      throw new Error('The active context strategy does not support live tail/transition settings');
+    }
+  }
+
+  /**
+   * The checks of a runtime-settings patch that need nothing from the context manager.
+   * @internal For the framework's runtime-settings preview; not a host API.
+   */
+  checkRuntimeSettingsPatch(patch: AgentRuntimeSettingsPatch): void {
     if (Object.keys(patch).length === 0) throw new Error('At least one setting is required');
     if (patch.contextBudgetTokens !== undefined) {
       if (!Number.isSafeInteger(patch.contextBudgetTokens) || patch.contextBudgetTokens <= this.maxTokens) {
@@ -799,10 +848,6 @@ export class Agent {
         patch.sameRoundThinkTextPolicy !== 'private') {
       throw new Error("sameRoundThinkTextPolicy must be 'public' or 'private'");
     }
-    if ((patch.tailTokens !== undefined || patch.transitionPaceTokens !== undefined) &&
-        !this.getHotContextSettings()) {
-      throw new Error('The active context strategy does not support live tail/transition settings');
-    }
   }
 
   /** Settle a converging budget once the window is prepared; true if it settled. */
@@ -817,20 +862,42 @@ export class Agent {
 
   /**
    * RFC-006 consumed watermark: the newest stored message at the last compile
-   * of a model request, per branch. Everything above it has never been in a
+   * of a model request, or at the last tool boundary that injected messages
+   * into a live one, per branch. Everything above it has never been in a
    * request and may still be replaced or withdrawn in place by its sender.
    */
   private consumedWatermark: { branch: string; sequence: number } | null = null;
+  /** Counts marks: a compile writes its watermark back only if no mark was
+   *  made while it ran (a tool boundary's, or another compile's). */
+  private watermarkMarks = 0;
 
   getConsumedWatermark(): { branch: string; sequence: number } | null {
     return this.consumedWatermark;
   }
 
-  /** Mark everything currently stored as consumed (boot, branch switch). */
+  /** Mark everything currently stored as consumed (the agent's creation, at
+   *  boot or later, and a tool boundary that injected messages into the live
+   *  stream). */
   markContextConsumed(): void {
     // Tolerates partial context-manager doubles (tests build Agents over
     // stubs): without a watermark nothing is ever treated as unread.
     this.consumedWatermark = this.pendingWatermark();
+    this.watermarkMarks++;
+  }
+
+  /**
+   * A finished compile's watermark, taken before it awaited. Within a branch
+   * the watermark only advances: if a mark was made while the compile ran,
+   * the compile's (older) one is applied only where it is later on that
+   * mark's branch, so a boundary's mark is never rolled back by a compile
+   * that started before it (a preview during a live turn).
+   */
+  private applyCompileWatermark(watermark: { branch: string; sequence: number }, marksBefore: number): void {
+    const current = this.consumedWatermark;
+    if (this.watermarkMarks !== marksBefore && current
+      && (current.branch !== watermark.branch || current.sequence >= watermark.sequence)) return;
+    this.consumedWatermark = watermark;
+    this.watermarkMarks++;
   }
 
   /** The watermark a successful compile will establish (taken before, applied after). */
@@ -862,9 +929,10 @@ export class Agent {
     // RFC-006 §3.3: consumption is determined at assembly — a compile that
     // fails assembled nothing, so the watermark moves only on success.
     const watermark = this.pendingWatermark();
+    const marksBefore = this.watermarkMarks;
     const compile = () => this.contextManager.compile(this.compileBudget(budget));
     const result = budget ? await compile() : await this.compileAtLiveBudget(compile);
-    if (watermark) this.consumedWatermark = watermark;
+    if (watermark) this.applyCompileWatermark(watermark, marksBefore);
     return result;
   }
 
@@ -903,9 +971,10 @@ export class Agent {
     // compression hold whose deadline has passed, which `compile` does for
     // any compile before it selects.
     const watermark = opts?.dryRun ? null : this.pendingWatermark();
+    const marksBefore = this.watermarkMarks;
     const compile = () => this.contextManager.compile(this.compileBudget(budget), injections, opts as never);
     const result = budget || opts?.dryRun ? await compile() : await this.compileAtLiveBudget(compile);
-    if (watermark) this.consumedWatermark = watermark;
+    if (watermark) this.applyCompileWatermark(watermark, marksBefore);
     return result;
   }
 
@@ -1069,7 +1138,12 @@ export class Agent {
 
     // If all tools done, transition to ready
     if (this._state.pending.size === 0) {
-      this._state = { status: 'ready', toolResults: this._state.completed, stream: this._state.stream };
+      this._state = {
+        status: 'ready',
+        toolResults: this._state.completed,
+        stream: this._state.stream,
+        supportsInjectedMessages: this._state.supportsInjectedMessages,
+      };
     }
   }
 
@@ -1363,9 +1437,10 @@ export class Agent {
 
   /**
    * Transition to waiting_for_tools when stream yields tool calls.
-   * Called by framework's driveStream.
+   * Called by framework's driveStream, with what the stream declared about
+   * carrying injected messages with this round's results (see AgentState).
    */
-  enterWaitingForTools(calls: ToolCall[], stream: YieldingStream): void {
+  enterWaitingForTools(calls: ToolCall[], stream: YieldingStream, supportsInjectedMessages?: boolean): void {
     const pending = new Map<ToolCallId, PendingToolCall>();
     for (const call of calls) {
       pending.set(call.id, {
@@ -1375,7 +1450,7 @@ export class Agent {
         startedAt: Date.now(),
       });
     }
-    this._state = { status: 'waiting_for_tools', pending, completed: [], stream };
+    this._state = { status: 'waiting_for_tools', pending, completed: [], stream, supportsInjectedMessages };
   }
 
   /**
@@ -1419,14 +1494,12 @@ export class Agent {
   }
 
   /**
-   * Cancel any active stream and reset to idle.
+   * Cancel the stream this agent's state holds (streaming, waiting on its
+   * tools, or ready at a tool boundary with every result in), and reset to
+   * idle.
    */
   cancelStream(): void {
-    if (this._state.status === 'streaming') {
-      this._state.stream.cancel();
-    } else if (this._state.status === 'waiting_for_tools' && this._state.stream) {
-      this._state.stream.cancel();
-    }
+    if ('stream' in this._state) this._state.stream?.cancel();
     this._state = { status: 'idle' };
   }
 
@@ -1487,8 +1560,7 @@ export class Agent {
       return { aborted: true, durationMs };
     }
 
-    if (this._state.status === 'streaming' ||
-        (this._state.status === 'waiting_for_tools' && this._state.stream)) {
+    if ('stream' in this._state && this._state.stream) {
       const durationMs = Date.now() - this._inferenceStartedAt;
       this.cancelStream();
       return { aborted: true, durationMs };

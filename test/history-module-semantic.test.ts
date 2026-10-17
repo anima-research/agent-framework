@@ -170,7 +170,7 @@ describe('HistoryModule semantic_search', () => {
     assert.equal(r.more, true);
     const res = await mod.handleToolCall({ id: 'c3', name: 'semantic_search', input: { query: 'anything' } });
     assert.equal(res.success, false);
-    assert.match(String(res.error), /embed-service|boom/);
+    assert.match(String(res.error), /^Nothing was searched: the semantic index service answered the search request with an error \(HTTP 500: boom\)\. /);
     await mod.stop();
   });
 

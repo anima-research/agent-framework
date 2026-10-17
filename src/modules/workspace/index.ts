@@ -39,7 +39,7 @@ import { MountWatcher, type FsChange } from './watcher.js';
 import { hashContent, DEFAULT_MAX_FILE_SIZE } from './sync.js';
 import { DiskAgreement, sameRootIdentity } from './disk-agreement.js';
 import { BranchIntents } from './branch-intent.js';
-import { coveredByIgnore, filesystemTrustsCtime, locateRoot } from './observe.js';
+import { coveredByIgnore, filesystemTrustsCtime, locateRoot, readPrefix } from './observe.js';
 import { TOOL_BATCH_HOOK_TIMEOUT_MS } from '../../module-registry.js';
 import {
   type MountRuntime,
@@ -156,13 +156,23 @@ export class WorkspaceReadError extends Error {
 
 /** Successful `readFileFromDisk()` result. */
 export interface WorkspaceDiskReadResult {
-  /** File bytes — the whole file, or its first `maxBytes` when `truncated`. */
+  /**
+   * File bytes: the whole file, or its first `maxBytes` when `truncated`.
+   * Without `maxBytes` the file is read with `readFile`, with no limit. In
+   * Node, that reads up to the size its own fstat finds, or to the file's end
+   * if that size is 0.
+   */
   bytes: Buffer;
-  /** Full on-disk size in bytes, regardless of truncation. */
+  /**
+   * The file's size, agreeing with `bytes` and `truncated`: `bytes.length`,
+   * unless `truncated`. Then it's the file's size by an fstat after the read,
+   * or `maxBytes + 1` if that's less, since the read found at least that many
+   * bytes.
+   */
   size: number;
-  /** True when `maxBytes` was set and the file was larger; `bytes` is a prefix. */
+  /** True when `maxBytes` was set and the read found the file going on past it; `bytes` is a prefix. */
   truncated: boolean;
-  /** mtime of the file actually read (for change-detection caches). */
+  /** mtime of the file actually read, from its fstat at the open (for change-detection caches). */
   mtimeMs: number;
   /** Canonical (realpath) location of the file read — inside the canonical mount root by construction. */
   realPath: string;
@@ -171,7 +181,12 @@ export interface WorkspaceDiskReadResult {
 }
 
 export interface ReadFileFromDiskOptions {
-  /** Read at most this many bytes (a bounded prefix read — the rest of the file is never loaded). */
+  /**
+   * Keep at most this many bytes (a bounded prefix read): the read loads them
+   * and one byte past them, which isn't kept and tells whether the file goes
+   * on, and never the rest of the file. It bounds the read itself, so it
+   * holds for a file that grows while it's read.
+   */
   maxBytes?: number;
 }
 
@@ -179,6 +194,11 @@ function errnoOf(err: unknown): string | undefined {
   return typeof err === 'object' && err !== null && 'code' in err && typeof (err as { code?: unknown }).code === 'string'
     ? (err as { code: string }).code
     : undefined;
+}
+
+/** read_image's refusal of a file over the mount's size limit, wherever it's found to be. */
+function imageTooLarge(maxSize: number, mountPrefixedPath: string): WorkspaceImageReadError {
+  return new WorkspaceImageReadError('too_large', `Image file exceeds max size (${maxSize} bytes): ${mountPrefixedPath}`);
 }
 
 const PNG_SIGNATURE = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
@@ -791,6 +811,7 @@ export class WorkspaceModule implements Module {
       intents: this.intents.get(mount.config.name)!,
       readOnly: mount.config.mode === 'read-only',
       walkCap: mount.config.walkCap ?? WALK_CAP,
+      catchUpScan: (mount.config.watch ?? 'always') === 'always',
     };
   }
 
@@ -994,9 +1015,12 @@ export class WorkspaceModule implements Module {
         this.watchers.set(name, watcher);
 
         // Chokidar is started with ignoreInitial:true, so changes made while
-        // the session was down would be invisible. One full pass catches up
-        // under the three-way rule: only real differences produce tree
-        // changes and events.
+        // the session was down would be invisible. A catch-up pass takes them
+        // in under the three-way rule: only real differences produce tree
+        // changes and events. It takes its turn with the mount's bare syncs,
+        // so on a mount over its walkCap it covers the walkCap entries after
+        // where the last turn stopped, and a change elsewhere waits for the
+        // rotation to reach it, or for a sync of its path.
         void this.initialScan(name);
       }
 
@@ -1046,9 +1070,16 @@ export class WorkspaceModule implements Module {
     // the pins and watermarks as the last work left them.
     this.stopped = true;
 
-    // Persist state
-    if (this.ctx) {
-      const activeBranchId = this.store ? this.store.currentBranch().id : undefined;
+    // Persist state, once initStore() has run and the state start() was
+    // handed has been applied (savedState is cleared then). Before that this
+    // session has made no pass or write, so it has nothing to save, and the
+    // stored state stays as it was: saving would put empty or default mounts
+    // over the saved pins. A create() that fails after starting this module
+    // stops it before the host can call initStore() (#389), and an
+    // initStore() that throws after taking the store leaves the state
+    // unapplied.
+    if (this.ctx && this.store && this.savedState === null) {
+      const activeBranchId = this.store.currentBranch().id;
       const state: WorkspaceModuleState = { mounts: {}, activeBranchId };
       for (const [name, mount] of this.mounts) {
         state.mounts[name] = {
@@ -1224,8 +1255,10 @@ export class WorkspaceModule implements Module {
         name: 'sync',
         description: 'Bring disk changes into the workspace. Without a path, every mount (or the given one) is '
           + 'rechecked and nothing pending in the workspace is discarded. A sync takes up to the mount\'s walk '
-          + 'cap of entries, files, links and the like (5000 unless configured); past it, what this one didn\'t reach is listed under '
-          + '`incomplete`, and the next sync of the same mount or directory resumes where it stopped. With a '
+          + 'cap of entries, files, links and the like (5000 unless configured). Past it, what this one didn\'t reach is listed under '
+          + '`incomplete`, and the walk takes turns: the next sync of the same mount or directory picks up where '
+          + 'the last turn stopped, so repeated syncs cover it all. On a mount watched continuously, its own catch-up '
+          + 'scan, at start and when its watcher reattaches, takes turns with its whole-mount syncs. With a '
           + 'path (file or directory), '
           + 'the workspace takes disk\'s state there explicitly: it restores a workspace-deleted file, resolves '
           + 'conflicts toward disk, replaces a workspace draft, and removes a workspace file disk does not have. '
@@ -1621,12 +1654,7 @@ export class WorkspaceModule implements Module {
     if (bytes.byteLength === 0) {
       throw new WorkspaceImageReadError('empty', `Image file is empty: ${mountPrefixedPath}`);
     }
-    if (bytes.byteLength > maxSize) {
-      throw new WorkspaceImageReadError(
-        'too_large',
-        `Image file exceeds max size (${maxSize} bytes): ${mountPrefixedPath}`,
-      );
-    }
+    if (bytes.byteLength > maxSize) throw imageTooLarge(maxSize, mountPrefixedPath);
     return {
       bytes,
       mimeType: detectImageMimeType(bytes, mountPrefixedPath),
@@ -1803,7 +1831,10 @@ export class WorkspaceModule implements Module {
    * - With symlinks allowed, the canonical target must stay beneath the
    *   canonical mount root; a sibling-prefix root (`/mount-other`) does not count.
    * - `maxBytes` performs a bounded prefix read: at most `maxBytes` bytes are
-   *   ever loaded, and `truncated` reports that the file was larger.
+   *   kept, and one byte past them is read to tell whether the file goes on
+   *   (`truncated`). The reads decide where the file ends, not the size fstat
+   *   gave at the open, so the bound holds for a file that grows while it's
+   *   read.
    *
    * Throws {@link WorkspaceReadError} with a `code` distinguishing unknown
    * mount, lexical traversal, unavailable mount, missing file, directory,
@@ -1831,23 +1862,17 @@ export class WorkspaceModule implements Module {
 
     const { handle, fileStat, realFilePath } = await this.openContainedFile(mount, relativePath, mountPrefixedPath);
     try {
-      const size = fileStat.size;
       const cap = options.maxBytes;
       let bytes: Buffer;
       let truncated = false;
-      if (cap !== undefined && size > cap) {
-        truncated = true;
-        bytes = Buffer.alloc(cap);
-        let offset = 0;
-        while (offset < cap) {
-          const { bytesRead } = await handle.read(bytes, offset, cap - offset, offset);
-          if (bytesRead === 0) break;
-          offset += bytesRead;
-        }
-        if (offset < cap) bytes = bytes.subarray(0, offset);
-      } else {
+      if (cap === undefined) {
         bytes = await handle.readFile();
+      } else {
+        ({ bytes, more: truncated } = await readPrefix(handle, cap, fileStat.size));
       }
+      // What the read found, not what the fstat before it said, so `size`,
+      // `bytes` and `truncated` agree even for a file that changed in between.
+      const size = truncated ? Math.max((await handle.stat()).size, bytes.length + 1) : bytes.length;
       return { bytes, size, truncated, mtimeMs: fileStat.mtimeMs, realPath: realFilePath, mount: mount.config.name };
     } catch (err) {
       if (err instanceof WorkspaceReadError) throw err;
@@ -1898,12 +1923,7 @@ export class WorkspaceModule implements Module {
         if (fileStat.size === 0) {
           throw new WorkspaceImageReadError('empty', `Image file is empty: ${mountPrefixedPath}`);
         }
-        if (fileStat.size > maxSize) {
-          throw new WorkspaceImageReadError(
-            'too_large',
-            `Image file exceeds max size (${maxSize} bytes): ${mountPrefixedPath}`,
-          );
-        }
+        if (fileStat.size > maxSize) throw imageTooLarge(maxSize, mountPrefixedPath);
       });
     } catch (err) {
       if (err instanceof WorkspaceImageReadError) throw err;
@@ -1913,9 +1933,12 @@ export class WorkspaceModule implements Module {
       }
       throw new WorkspaceImageReadError('not_found', `Unable to read image file: ${mountPrefixedPath}`);
     }
-    const { handle } = opened;
+    const { handle, fileStat } = opened;
     try {
-      const bytes = await handle.readFile();
+      // No more than maxSize is loaded: a file grown past it since the fstat
+      // above is refused here, as one already over it was there.
+      const { bytes, more } = await readPrefix(handle, maxSize, fileStat.size);
+      if (more) throw imageTooLarge(maxSize, mountPrefixedPath);
       return this.validateImageBytes(bytes, mountPrefixedPath, maxSize);
     } catch (err) {
       if (err instanceof WorkspaceImageReadError) throw err;
@@ -3004,10 +3027,14 @@ export class WorkspaceModule implements Module {
    * After an agent's completed tool batch, before anything continues its turn:
    * scan every `watch: 'on-agent-action'` mount, so what the batch's tools did
    * on disk (a shell command's files, a deletion) is in the workspace when the
-   * agent next looks. A scan that outlasts the deadline stops holding the
-   * round: the miss is recorded on the mount's status and pushed as a
-   * `workspace:agent-action-scan-incomplete` event, and the scan continues,
-   * deciding on the branch selected when it applies.
+   * agent next looks. On a mount over its walkCap, that holds for the first
+   * walkCap entries in the walk's order, which every batch's scan takes; files
+   * past them come in through syncs and the listings that reach them, while a
+   * read takes in only a file the workspace doesn't hold yet. A scan that
+   * outlasts the deadline stops holding the round: the miss is recorded on
+   * the mount's status and pushed as a `workspace:agent-action-scan-incomplete`
+   * event, and the scan continues, deciding on the branch selected when it
+   * applies.
    */
   async onToolBatchComplete(_agentName?: string): Promise<void> {
     // Every agent's workspace is the store's current branch, so the agent
@@ -3073,7 +3100,11 @@ export class WorkspaceModule implements Module {
     const scan: AgentActionScan = { late: false, settled: Promise.resolve() };
     const pass = this.withMount(mount, () => {
       if (mount.agentActionScanWaiting === scan) mount.agentActionScanWaiting = undefined;
-      return this.passUnlocked(mount, { kind: 'dir', dir: '', recursive: true }, { resume: true });
+      // From the mount's start, as a listing walks, keeping no place: on a
+      // mount over its walkCap, every batch's scan takes the first walkCap
+      // entries in the walk's order, and the place that syncs and catch-up
+      // scans resume from stays theirs.
+      return this.passUnlocked(mount, { kind: 'dir', dir: '', recursive: true });
     });
     scan.settled = pass.then(
       (result) => {
@@ -3168,7 +3199,9 @@ function stateView(report: PathReport): Record<string, unknown> {
 // ==========================================================================
 
 /**
- * Convert a glob pattern to a RegExp.
+ * Convert a glob pattern to a RegExp. Throws, naming the pattern, for a brace
+ * group it can't read: a "{" that never closes, a group inside another, or a
+ * group with no ",".
  */
 function globToRegex(pattern: string): RegExp {
   // Split pattern into segments, handling {a,b,c} alternation
@@ -3176,13 +3209,33 @@ function globToRegex(pattern: string): RegExp {
   let i = 0;
   while (i < pattern.length) {
     if (pattern[i] === '{') {
-      const closeIdx = pattern.indexOf('}', i);
-      if (closeIdx > i) {
-        const alternatives = pattern.slice(i + 1, closeIdx).split(',');
-        regex += '(?:' + alternatives.map(a => globPartToRegex(a)).join('|') + ')';
-        i = closeIdx + 1;
-        continue;
+      // A brace form this can't read is refused. A `{` that never closes, read
+      // as a literal, would almost always answer with no matches, and with it
+      // refused, each pass of this loop moves past at least one character. A
+      // group closes at the `}` that brings the braces open since its `{` back
+      // to none, so a `{` that never closes is named as that, even with a
+      // closed group after it. A group inside another would be split at the
+      // inner `}`, so `{a,{b,c}}` would match `a}` but not `a`, and a group
+      // with no `,` would lose its braces, so `{name}` would match `name` and
+      // never a file named `{name}`, and `{1..3}` would match only `1..3`.
+      let depth = 0;
+      let closeIdx = -1;
+      for (let j = i; j < pattern.length && closeIdx < 0; j++) {
+        if (pattern[j] === '{') depth++;
+        else if (pattern[j] === '}' && --depth === 0) closeIdx = j;
       }
+      if (closeIdx < 0) throw new Error(braceRefusal(pattern, 'has a "{" with no closing "}"'));
+      const group = pattern.slice(i + 1, closeIdx);
+      if (group.includes('{')) {
+        throw new Error(braceRefusal(pattern, 'has a "{" group inside another; put all its alternatives in one group'));
+      }
+      if (!group.includes(',')) {
+        throw new Error(braceRefusal(pattern, 'has a "{" group with no ","; a group needs two or more alternatives, separated by ","'));
+      }
+      const alternatives = group.split(',');
+      regex += '(?:' + alternatives.map(a => globPartToRegex(a)).join('|') + ')';
+      i = closeIdx + 1;
+      continue;
     }
     // Accumulate non-brace characters, convert as a chunk
     let chunk = '';
@@ -3195,6 +3248,11 @@ function globToRegex(pattern: string): RegExp {
     }
   }
   return new RegExp(`^${regex}$`);
+}
+
+/** A glob's refusal of a brace form it can't read, with the way to match a literal "{". */
+function braceRefusal(pattern: string, problem: string): string {
+  return `glob pattern ${JSON.stringify(pattern)} ${problem}. To match a "{" in a name, put "?" in its place.`;
 }
 
 function globPartToRegex(part: string): string {

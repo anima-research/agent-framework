@@ -1707,7 +1707,13 @@ test('storage recovery: shutdown retries edits queued by its terminating stream'
     edit(id, content);
   };
   let stopping: Promise<void> | undefined;
-  h.membrane.onSubmit = () => { stopping = h.framework.stop(); };
+  // stop() begins once the turn's stream has completed, on its
+  // inference:completed: the guard has accepted the batch, and its edit has
+  // failed once and is queued. (Begun while the round's results were
+  // submitted, at `ready`, stop() would now cancel the turn there.)
+  h.framework.onTrace((event) => {
+    if (event.type === 'inference:completed' && !stopping) stopping = h.framework.stop();
+  });
   try {
     await h.run();
     assert.ok(stopping);
@@ -2269,8 +2275,14 @@ test('#277: writeBinary for a branch writes there, and is refused once the works
 // what is so.
 // ---------------------------------------------------------------------------
 
-test('#281: a write still under way at the deadline is named as unfinished, and nothing waits on it longer', async () => {
+test('#281: a write still under way at the deadline is named as unfinished, and nothing waits on it longer', async (t) => {
   const h = await workspaceHarness([[calls('one', 'two'), refused()], [answer()]]);
+  // The batch's deadline is a Date.now() time taken when the batch is
+  // queued, and its first write starts only after the steps between, which
+  // a loaded host can stretch past a short deadline. With the clock held
+  // still, the deadline can't be spent before the write starts. The spill's
+  // own timer is a real one, and fires while the stalled write is under way.
+  t.mock.timers.enable({ apis: ['Date'], now: Date.now() });
   (h.framework as unknown as { withheldSpillDeadlineMs: number }).withheldSpillDeadlineMs = 50;
   const stalled = gate();
   let writes = 0;
@@ -2522,12 +2534,15 @@ test("#281: a disposed run's failed acceptance edit is retried by maintenance, a
   } finally { await h.framework.stop(); }
 });
 
-test('#281: batches behind one stalled write cost one deadline: no write starts until it settles', async () => {
+test('#281: batches behind one stalled write cost one deadline: no write starts until it settles', async (t) => {
   const h = await workspaceHarness([
     [calls('one'), refused()], [answer()],
     [calls('two'), refused()], [answer()],
     [calls('three'), refused()], [answer()],
   ]);
+  // As in the test above: with the clock held still, no batch's deadline can
+  // be spent before its write starts, whatever the host's load.
+  t.mock.timers.enable({ apis: ['Date'], now: Date.now() });
   (h.framework as unknown as { withheldSpillDeadlineMs: number }).withheldSpillDeadlineMs = 50;
   const framework = h.framework as unknown as {
     writeToolResultFile: (...args: unknown[]) => Promise<unknown>;
@@ -2552,6 +2567,10 @@ test('#281: batches behind one stalled write cost one deadline: no write starts 
     assert.equal(toolResults(h.framework)[1].content, AUDIT_STUB);
     stalled.open();
     await until(() => framework.stalledSpills.size === 0, 'the stalled write settles');
+    // The third batch's write is a real one, with nothing stalling it, and
+    // the spill's timer is real too: a deadline far beyond what a write here
+    // takes keeps a slow write on a loaded host from being named unfinished.
+    (h.framework as unknown as { withheldSpillDeadlineMs: number }).withheldSpillDeadlineMs = 60_000;
     await bounded(h.run(), 'the third batch');
     assert.equal(writes, 2, 'once it has settled, the next original is written');
     assert.ok(typeof annotated()[2].results[0].path === 'string' && annotated()[2].results[0].unfinished === undefined);
@@ -2615,13 +2634,18 @@ test('#281: stop during a compile that waits for an annotation lets no provider 
   } finally { write.open(); if (!stopped) await h.framework.stop(); }
 });
 
-test('#281: writes that stalled together each hold the workspace as unanswered until it settles', async () => {
+test('#281: writes that stalled together each hold the workspace as unanswered until it settles', async (t) => {
   const h = await workspaceHarness([]);
   const framework = h.framework as unknown as {
     withheldSpillDeadlineMs: number;
     writeToolResultFile: (label: string) => Promise<unknown>;
     spillWithheld: (label: string, text: string, branch: string) => Promise<unknown>;
   };
+  // spillWithheld reads the clock for its deadline and again before the write
+  // starts, with the write's place found between; a pause of the process
+  // there on a loaded host would spend 30 ms. With the clock held still it
+  // can't, and the spill's own timer is a real one.
+  t.mock.timers.enable({ apis: ['Date'], now: Date.now() });
   framework.withheldSpillDeadlineMs = 30;
   const gates = new Map<string, ReturnType<typeof gate>>([['a', gate()], ['b', gate()]]);
   const started: string[] = [];

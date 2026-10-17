@@ -29,11 +29,14 @@
   `skip_reply` keeps the round's envelopes in the context. In locus and
   hybrid mode an inner `skip_reply` suppresses the round's prose, and an
   inner silencing send suppresses it and the turn's later prose. An inner
-  `think` under the private same-round policy holds the round back in every
-  mode. On the fallback without `roundContent`, as in XML tool mode, an
-  inner call counts only as a direct one does there: a silencing call
-  silences the turn's later prose, while the private `think` hold and an
-  explicit round's `skip_reply` don't apply (#307).
+  `think` under the private same-round policy holds the round back in
+  every mode. An inner `skip_reply` refused for its `wake_in_seconds`, on
+  a host without an EventGate, counts as a refused direct one: it keeps
+  only its own round private, and the turn goes on. On the fallback
+  without `roundContent`, as in XML tool mode, an inner call counts only
+  as a direct one does there: a silencing call silences the turn's later
+  prose, while the private `think` hold and an explicit round's
+  `skip_reply` don't apply (#307).
 - A round whose script can change its routing waits for the script, and its
   prose goes out when the script finishes. A script can change it when its
   code names a tool whose call changes the round's routing in the turn's

@@ -1,6 +1,7 @@
 import { JsStore } from '@animalabs/chronicle';
 import { ContextManager, continuesBody, type BodyShard } from '@animalabs/context-manager';
 import { removeStoredInterval } from '../stored-removal.js';
+import { firstFreeBranchName } from '../branch-names.js';
 import {
   DEFAULT_DISCORD_AWARENESS_EMOJI,
   DiscordAwarenessOutbox,
@@ -22,6 +23,7 @@ export interface OfflineRecoveryBranchOptions {
   suppressMessageIds?: string[];
   /** Inclusive context-order ranges between Discord message endpoints. */
   suppressRanges?: Array<{ fromMessageId: string; toMessageId: string }>;
+  /** Defaults to `recovery/{agentName}/{ms}`, or with `-2`, `-3`, … appended when the store already holds that name. */
   branchName?: string;
   /** Defaults to the primary-agent namespace `agents/{agentName}`. */
   namespace?: string;
@@ -161,8 +163,9 @@ export async function createOfflineRecoveryBranch(
     refs = dedupeDiscordRefs([...refs, ...suppression.refs]);
 
     const sourceBranch = store.currentBranch().name;
+    const held = new Set(store.listBranches().map((branch) => branch.name));
     const targetBranch = options.branchName
-      ?? `recovery/${options.agentName}/${Date.now()}`;
+      ?? firstFreeBranchName(`recovery/${options.agentName}/${Date.now()}`, (name) => held.has(name));
     if (targetBranch === sourceBranch) {
       throw new Error('Recovery branch name must differ from the active source branch');
     }
@@ -240,9 +243,7 @@ interface SuppressionInterval {
 
 interface MessageLocation {
   first: number;
-  last: number;
   firstId: StoredWindowMessage['id'];
-  lastId: StoredWindowMessage['id'];
   /** Usually one run; multiple runs tolerate duplicate external metadata. */
   runs: SuppressionInterval[];
 }
@@ -405,9 +406,7 @@ function buildSuppressionPlan(
         };
         locations.set(externalId, {
           first: index,
-          last: index,
           firstId: messages[i].id,
-          lastId: messages[i].id,
           runs: [run],
         });
       } else {
@@ -423,8 +422,6 @@ function buildSuppressionPlan(
             toId: messages[i].id,
           });
         }
-        location.last = index;
-        location.lastId = messages[i].id;
       }
     }
   }
@@ -447,12 +444,19 @@ function buildSuppressionPlan(
     const to = locations.get(range.toMessageId)!;
     const earlier = from.first <= to.first ? from : to;
     const later = from.first <= to.first ? to : from;
+    // What's between the two messages, after the earlier one began and
+    // before the later one began: from the earlier one's first stored copy
+    // through the later one's first. Each end is every copy of it besides,
+    // as a single suppression is, so a copy stored outside that span (a
+    // write cut short and retried later) is taken on its own, and nothing
+    // else stored after the later one began is taken.
     intervals.push({
       start: earlier.first,
-      end: later.last,
+      end: later.first,
       fromId: earlier.firstId,
-      toId: later.lastId,
+      toId: later.firstId,
     });
+    for (const end of [from, to]) intervals.push(...end.runs.map((run) => ({ ...run })));
   }
 
   intervals.sort((a, b) => a.start - b.start || a.end - b.end);

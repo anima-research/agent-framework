@@ -211,3 +211,39 @@ test('announcements coalesce: rapid-fire N announces cause one immediate fetch',
   const fetches = connection.events.filter((e) => e.kind === 'fetch').length;
   assert.equal(fetches, 1, `rapid announcements must coalesce (§17.8), got ${fetches} fetches`);
 });
+
+test('an announcement without params is handled like any other: one receipt naming no domains, then the tools-list refresh', async () => {
+  // A notification may carry no params. The announcement's fields are hints
+  // the server sends; the change itself is read from the fetched manifest.
+  const { fw, connection, traces } = makeHarness();
+  let refreshed = 0;
+  fw.handleToolsListChanged = () => { refreshed++; };
+  connection.nextManifest = () => ({
+    version: '0.5',
+    pushEvents: true,
+    channels: { incoming: true },
+    featureSets: { chat: { description: 'chat', uses: ['pushEvents', 'channels.incoming', 'channels.publish'] } },
+  }) as unknown as McplCapabilities;
+
+  await fw.handleManifestChanged(connection, undefined);
+
+  assert.ok(!connection.grant.has('channels.publish'), 'the fetched manifest was applied');
+  const receipts = traces.filter((t) => t.type === 'mcpl:manifest-change-receipt');
+  assert.equal(receipts.length, 1, 'exactly one receipt');
+  assert.deepEqual(receipts[0].announcedDomains, []);
+  assert.equal(refreshed, 1, 'the tools list was refreshed');
+});
+
+test("an announcement's domains are reported only as strings: anything else names none", async () => {
+  const { fw, traces } = makeHarness();
+  const domainsOf = async (announce: unknown) => {
+    fw.manifestRefreshState = new Map(); // each announcement its own refresh, past the floor
+    const before = traces.length;
+    await fw.handleManifestChanged(fw.mcplServerRegistry.getServer('srv'), announce);
+    return traces.slice(before).filter((t) => t.type === 'mcpl:manifest-change-receipt').map((t) => t.announcedDomains);
+  };
+  assert.deepEqual(await domainsOf({ domains: 'capabilities' }), [[]]);
+  assert.deepEqual(await domainsOf({ domains: ['capabilities', 7, null, 'featureSets'] }), [['capabilities', 'featureSets']]);
+  assert.deepEqual(await domainsOf('capabilities'), [[]]);
+  assert.deepEqual(await domainsOf(null), [[]], 'params: null, as a server may send them');
+});

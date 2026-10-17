@@ -49,7 +49,9 @@ import type { ToolDefinition, ToolCall, ToolResult, ProcessEvent } from '../../t
 import type { EventResponse, ProcessState } from '../../types/module.js';
 import type { SearchWorkerMessage, SearchWorkerMatch } from './search-regex-worker.js';
 import type { ChannelRegistry } from '../../mcpl/channel-registry.js';
-import { SemanticIndexClient, SemanticIndexer, messageIndexText, type SemanticIndexConfig, type SyncReport, type PendingChanges } from './semantic.js';
+import { EmbedServiceError, SemanticIndexClient, SemanticIndexer, messageIndexText, type SearchResponse, type SemanticIndexConfig, type SyncReport, type PendingChanges } from './semantic.js';
+import { unknownToolMessage } from '../unknown-tool.js';
+import { safeSlice } from '../../safe-slice.js';
 
 // ============================================================================
 // Tool input shapes
@@ -177,10 +179,15 @@ const AROUND_MAX = 100;
  *  see a handful; past this the call fails loudly rather than guessing. */
 const AROUND_TIE_CAP = 5000;
 
-function tieCapError(anchorId: string, n: number): Error {
+function tieCapError(anchorId: string, ms: number, channelId: string | undefined): Error {
+  const at = new Date(ms).toISOString();
+  // The channel is the agent's to send back, so it's quoted whole: a cut one
+  // couldn't be sent. It's one the store holds, with all those messages in it.
+  const inChannel = channelId !== undefined ? ` and "channelId" set to ${JSON.stringify(channelId)}` : '';
   return new Error(
-    `Message ${anchorId} shares its timestamp with ${n} messages (more than ${AROUND_TIE_CAP}), too many to order ` +
-      'around it. Use extract with from/to set to that instant instead.',
+    `Nothing was read: more than ${AROUND_TIE_CAP} messages share the timestamp of message ${shown(anchorId)}, ${at}, too ` +
+      `many for aroundId to put in order. To read them, call history--extract with "from" and "to" both set to ${at}` +
+      `${inChannel}; it pages through them with "offset" and "limit".`,
   );
 }
 
@@ -336,16 +343,20 @@ export class HistoryModule implements Module {
    * you're trying to deliver a message, nonsense advice from a read-only
    * history tool. This module always uses its own read-only-appropriate
    * wording instead, regardless of which branch of the live resolver
-   * produced the miss.
+   * produced the miss. Its refusals open with "Nothing was read", which
+   * holds because every tool that resolves a channel here only reads (see
+   * the note above the helpers).
    */
   private resolveChannel(input: string | undefined): string | undefined {
     if (!input || !this.channelRegistry) return input;
     const resolved = this.channelRegistry.resolveProseTargetDurable(input);
     if (!('error' in resolved)) return resolved.channelId;
     if (input.startsWith('#') || input.startsWith('@') || DM_MENTION_RE.test(input)) {
-      const suggestions = resolved.candidates?.length ? ` Did you mean: ${resolved.candidates.join(', ')}?` : '';
+      const suggestions = resolved.candidates?.length ? ` Did you mean ${quotedList(resolved.candidates, 'or')}?` : '';
       throw new Error(
-        `No channel history found for "${input}" — it may never have been seen by this resident, or predates this feature.${suggestions}`,
+        `Nothing was read: no channel history matches ${shown(input)}. This host may never have seen a channel by that ` +
+          `name, or saw it before it kept channel names.${suggestions} Each message history--search returns carries ` +
+          'its "channelId", so searching for something said in that channel shows its id; pass that id as "channelId".',
       );
     }
     return input;
@@ -390,9 +401,15 @@ export class HistoryModule implements Module {
         ? cm.queryMessagesByTimeAndChannel({ fromMs: ms, toMs: ms, channelId, limit: 0 }).matchedCount
         : cm.queryMessagesByTime({ fromMs: ms, toMs: ms, limit: AROUND_TIE_CAP + 1 }).messages.length;
     if (n > AROUND_TIE_CAP) {
+      // The count is by channel alone, so an author filter can't bring it down.
+      const at = new Date(ms).toISOString();
       throw new Error(
-        `More than ${AROUND_TIE_CAP} messages share the instant ${new Date(ms).toISOString()}; a continuation can't step ` +
-          'through them. Narrow the search with channelId/author instead.',
+        `Nothing was searched: more than ${AROUND_TIE_CAP} messages share the instant ${at}, too many for a ` +
+          `continuation to step past. To read them, call history--extract with "from" and "to" both set to ${at}` +
+          (channelId !== undefined
+            ? ' and the same "channelId"; it pages through them with "offset" and "limit".'
+            : '; it pages through them with "offset" and "limit". Searching one channel, with "channelId", may also ' +
+              'bring them under the limit.'),
       );
     }
     return n;
@@ -450,13 +467,19 @@ export class HistoryModule implements Module {
     q: { fromMs?: number; toMs?: number; channelId?: string },
   ): { windowOffset: number; shift: number } {
     if (windowOffset === 0) {
-      if (afterId != null) throw new Error('"afterId" only applies together with a windowOffset > 0.');
+      if (afterId != null) {
+        throw new Error(
+          'Nothing was read: "afterId" goes with a "windowOffset" above 0, both copied from a truncated response\'s ' +
+            '"resume". For a first page, leave afterId out; to continue, copy the fields of that "resume" into the call.',
+        );
+      }
       return { windowOffset, shift: 0 };
     }
     if (afterId == null) {
       throw new Error(
-        '"windowOffset" needs the "afterId" from the same `resume` object — without it a message added or removed ' +
-          'since the previous call would be silently skipped. Pass the whole `resume` object back.',
+        'Nothing was read: "windowOffset" needs the "afterId" from the same "resume", or a message added or removed ' +
+          'since the previous call would be skipped unseen. Copy the fields of the previous response\'s "resume" into ' +
+          'the call.',
       );
     }
     const cm = this.cm as ContextManager;
@@ -467,9 +490,9 @@ export class HistoryModule implements Module {
     const i = around.findIndex((m) => String(m.id) === afterId);
     if (i === -1) {
       throw new Error(
-        `The window changed since the previous call: message ${afterId}, where that scan stopped, is no longer ` +
-          `within ${RELOCATE_RADIUS} positions of windowOffset ${windowOffset} (it may have been deleted). ` +
-          'Restart the scan without windowOffset/afterId, or narrow it with from/to.',
+        `Nothing was read: the window changed since the previous call. Message ${shown(afterId)}, where that scan stopped, ` +
+          `is no longer within ${RELOCATE_RADIUS} positions of windowOffset ${windowOffset}; it may have been deleted. ` +
+          'Restart the scan without "windowOffset" and "afterId", over the same range or one narrowed with "from" and "to".',
       );
     }
     const relocated = lo + i + 1;
@@ -717,7 +740,7 @@ export class HistoryModule implements Module {
             excludeAuthor: EXCLUDE_AUTHOR_SCHEMA,
             order: { type: 'string', enum: ['oldest', 'newest'], description: 'Scan and return oldest-first (default) or newest-first.' },
             limit: { type: 'number', description: `Max matches to return (default ${SEARCH_DEFAULT_LIMIT}, hard cap ${SEARCH_MAX_LIMIT}). Must be a non-negative integer.` },
-            maxScan: { type: 'number', description: `Max candidate messages to scan (default ${SEARCH_DEFAULT_MAX_SCAN}, hard cap ${SEARCH_MAX_MAX_SCAN}). Must be a non-negative integer.` },
+            maxScan: { type: 'number', description: `Max candidate messages to scan (default ${SEARCH_DEFAULT_MAX_SCAN}, hard cap ${SEARCH_MAX_MAX_SCAN}). Must be a whole number, 1 or more.` },
             skipSequences: {
               type: 'array',
               items: { type: 'number' },
@@ -793,7 +816,10 @@ export class HistoryModule implements Module {
         'Purely a read: nothing is written to your history. Hits are checked against your current branch ' +
         'before they come back: a message you undid or a summary from a branch you left is dropped and ' +
         'counted in index.droppedOffBranch; a message edited down to nothing searchable is dropped and ' +
-        'counted in index.droppedStale. Message snippets always show the current text of the message.',
+        'counted in index.droppedStale. When that leaves fewer than `limit` hits and the index may hold more, it ' +
+        'searches again, deeper, down to its first 200 hits; if a search after the first fails, the hits found so ' +
+        'far come back, with why in index.searchAgainError. Message snippets ' +
+        'always show the current text of the message.',
       inputSchema: {
         type: 'object' as const,
         properties: {
@@ -814,7 +840,13 @@ export class HistoryModule implements Module {
   async handleToolCall(call: ToolCall): Promise<ToolResult> {
     try {
       if (!this.cm) {
-        throw new Error('HistoryModule not bound — host must call bind(contextManager) before tool dispatch.');
+        // The host's mistake, named for whoever runs it; the agent reads what
+        // it can do about it, which is nothing.
+        console.error('[history] a tool was called before the host bound the module: call bind(contextManager) before tool dispatch');
+        throw new Error(
+          "The history tools aren't available: this host hasn't finished setting up the history module, so nothing " +
+            "was read. Calling them again won't change that; ask whoever runs this host.",
+        );
       }
       switch (call.name) {
         case 'stats':
@@ -828,7 +860,7 @@ export class HistoryModule implements Module {
         case 'semantic_search':
           return await this.handleSemanticSearch((call.input ?? {}) as SemanticSearchInput);
         default:
-          return { success: false, isError: true, error: `Unknown tool: ${call.name}` };
+          return { success: false, isError: true, error: unknownToolMessage(this.name, call.name, this.getTools()) };
       }
     } catch (error) {
       // Catches our own validation errors (bad ISO date, invalid regex,
@@ -897,20 +929,33 @@ export class HistoryModule implements Module {
 
   private handleExtract(input: ExtractInput): ToolResult {
     if (input.aroundId !== undefined) return this.handleExtractAround(input);
-    if (input.before !== undefined || input.after !== undefined || input.allChannels !== undefined) {
-      throw new Error('"before"/"after"/"allChannels" only apply together with "aroundId".');
+    const aroundOnly = (['before', 'after', 'allChannels'] as const).filter((k) => input[k] !== undefined);
+    if (aroundOnly.length > 0) {
+      const one = aroundOnly.length === 1;
+      throw new Error(
+        `Nothing was read: ${quotedList(aroundOnly, 'and')} ${one ? 'goes' : 'go'} with "aroundId", which reads the ` +
+          `conversation around one message. Pass aroundId too, or leave ${one ? 'it' : 'them'} out to read a range ` +
+          'with "from", "to" and "channelId".',
+      );
     }
     const channelId = this.resolveChannel(input.channelId);
     const fromMs = parseIsoDate(input.from, 'from');
     const toMs = parseIsoDate(input.to, 'to');
-    const limit = clampCount(input.limit, EXTRACT_DEFAULT_LIMIT, EXTRACT_MAX_LIMIT, 'limit');
-    const offset = clampCount(input.offset, 0, NATIVE_OFFSET_MAX, 'offset');
+    const limit = clampCount(input.limit, EXTRACT_DEFAULT_LIMIT, EXTRACT_MAX_LIMIT, 'limit', 'read');
+    const offset = clampCount(input.offset, 0, NATIVE_OFFSET_MAX, 'offset', 'read');
     const format = input.format ?? 'text';
     const authorFilter = buildAuthorFilter(input.author, input.excludeAuthor);
 
     const cm = this.cm as ContextManager;
-    if (!authorFilter && (input.windowOffset !== undefined || input.afterId !== undefined || input.seqMark !== undefined)) {
-      throw new Error('"windowOffset"/"afterId" only apply together with author/excludeAuthor (they resume a filtered scan). Use offset.');
+    const resumeOnly = (['windowOffset', 'afterId', 'seqMark'] as const).filter((k) => input[k] !== undefined);
+    if (!authorFilter && resumeOnly.length > 0) {
+      const one = resumeOnly.length === 1;
+      throw new Error(
+        `Nothing was read: ${quotedList(resumeOnly, 'and')} ${one ? 'resumes' : 'resume'} an author-filtered ` +
+          `extract, so ${one ? 'it goes' : 'they go'} with the "author" or "excludeAuthor" of the call that returned ` +
+          `${one ? 'it' : 'them'}: repeat that call with the fields of its "resume". To page through a range without an ` +
+          'author filter, use "offset".',
+      );
     }
 
     if (authorFilter) {
@@ -924,9 +969,11 @@ export class HistoryModule implements Module {
       // channel-scoped window pages in append order, and Discord catch-up
       // appends old-timestamped messages late, so "continue from the last
       // timestamp seen" would skip them.
-      const maxScan = clampCount(input.maxScan, EXTRACT_FILTER_DEFAULT_MAX_SCAN, EXTRACT_FILTER_MAX_MAX_SCAN, 'maxScan');
-      if (maxScan === 0) throw new Error('"maxScan" must be at least 1 for an author-filtered extract.');
-      const requestedOffset = clampCount(input.windowOffset, 0, NATIVE_OFFSET_MAX, 'windowOffset');
+      // An author-filtered extract has to examine at least 1 message.
+      const maxScan = clampCount(
+        input.maxScan, EXTRACT_FILTER_DEFAULT_MAX_SCAN, EXTRACT_FILTER_MAX_MAX_SCAN, 'maxScan', 'read', 1,
+      );
+      const requestedOffset = clampCount(input.windowOffset, 0, NATIVE_OFFSET_MAX, 'windowOffset', 'read');
       // A position is only meaningful against the window it was taken in:
       // a removal before it (every discord:delete, host hide, /undo) shifts
       // later positions left, and a message inserted before it (a
@@ -951,7 +998,8 @@ export class HistoryModule implements Module {
       if (channelId === undefined && windowOffset > 0) {
         if (typeof input.seqMark !== 'number') {
           throw new Error(
-            '"windowOffset" without channelId needs the "seqMark" from the same `resume` object. Pass the whole `resume` object back.',
+            'Nothing was read: "windowOffset" without "channelId" needs the "seqMark" from the same "resume". Copy the ' +
+              'fields of the previous response\'s "resume" into the call.',
           );
         }
         const cursor = cm.queryMessagesByTimeAndChannel({ fromMs, toMs, limit: 1, offset: windowOffset - 1 }).messages[0];
@@ -1128,25 +1176,27 @@ export class HistoryModule implements Module {
    * via edgeWindow, which is exact by timestamp).
    */
   private handleExtractAround(input: ExtractInput): ToolResult {
-    if (
-      input.from !== undefined ||
-      input.to !== undefined ||
-      input.offset !== undefined ||
-      input.windowOffset !== undefined ||
-      input.limit !== undefined
-    ) {
+    const windowFields = (['from', 'to', 'offset', 'windowOffset', 'limit'] as const).filter((k) => input[k] !== undefined);
+    if (windowFields.length > 0) {
       throw new Error(
-        '"aroundId" cannot be combined with from/to/offset/windowOffset/limit — it picks its own window; size it with before/after.',
+        `Nothing was read: "aroundId" picks its own window, so it doesn't take ${quotedList(windowFields, 'or')}. Size ` +
+          'the window with "before" and "after", or leave out "aroundId" to read a range.',
       );
     }
     if (input.author !== undefined || input.excludeAuthor !== undefined) {
-      throw new Error('"aroundId" returns the whole conversation around a message; author filters do not apply. Use search/extract with author instead.');
+      throw new Error(
+        'Nothing was read: "aroundId" reads the whole conversation around one message, so author filters don\'t ' +
+          'apply to it. To find someone\'s messages, use history--search or history--extract with "author".',
+      );
     }
     if (input.allChannels && input.channelId !== undefined) {
-      throw new Error('Pass either "channelId" or "allChannels", not both.');
+      throw new Error(
+        'Nothing was read: "channelId" and "allChannels" can\'t go together. Leave out "channelId" to read around the ' +
+          'message in every channel, or leave out both to read around it in its own channel.',
+      );
     }
-    const before = clampCount(input.before, AROUND_DEFAULT, AROUND_MAX, 'before');
-    const after = clampCount(input.after, AROUND_DEFAULT, AROUND_MAX, 'after');
+    const before = clampCount(input.before, AROUND_DEFAULT, AROUND_MAX, 'before', 'read');
+    const after = clampCount(input.after, AROUND_DEFAULT, AROUND_MAX, 'after', 'read');
     const format = input.format ?? 'text';
     const cm = this.cm as ContextManager;
 
@@ -1155,12 +1205,20 @@ export class HistoryModule implements Module {
     const rawId = String(input.aroundId);
     if (/^sum:/.test(rawId)) {
       throw new Error(
-        `${rawId} is a compression summary, not a message — use overview for summaries, or aroundId with a msg: hit.`,
+        `Nothing was read: ${shown(rawId)} is a compression summary, not a message. history--overview reads ` +
+          'summaries; "aroundId" takes a message, such as ' +
+          (this.semanticCfg
+            ? 'the "messageId" of a history--semantic_search hit.'
+            : 'the "id" of a history--search or history--extract result.'),
       );
     }
     const anchor = cm.getMessage(rawId.replace(/^msg:/, ''));
     if (!anchor) {
-      throw new Error(`No message with id ${JSON.stringify(input.aroundId)} in this history.`);
+      throw new Error(
+        `Nothing was read: no message in your history has the id ${shown(input.aroundId)}. Pass the "id" ` +
+          'of a history--search or history--extract result' +
+          (this.semanticCfg ? ', or the "messageId" of a history--semantic_search hit.' : '.'),
+      );
     }
     const anchorId = String(anchor.id);
     const anchorChannel = getChannelId(anchor);
@@ -1175,11 +1233,11 @@ export class HistoryModule implements Module {
     let ties: StoredMessage[];
     if (channelId !== undefined) {
       const n = cm.queryMessagesByTimeAndChannel({ fromMs: t, toMs: t, channelId, limit: 0 }).matchedCount;
-      if (n > AROUND_TIE_CAP) throw tieCapError(anchorId, n);
+      if (n > AROUND_TIE_CAP) throw tieCapError(anchorId, t, channelId);
       ties = cm.queryMessagesByTimeAndChannel({ fromMs: t, toMs: t, channelId, limit: n }).messages;
     } else {
       ties = cm.queryMessagesByTime({ fromMs: t, toMs: t, limit: AROUND_TIE_CAP + 1 }).messages;
-      if (ties.length > AROUND_TIE_CAP) throw tieCapError(anchorId, ties.length);
+      if (ties.length > AROUND_TIE_CAP) throw tieCapError(anchorId, t, undefined);
     }
     ties = [...ties].sort((x, y) => x.sequence - y.sequence);
     const idx = ties.findIndex((m) => String(m.id) === anchorId);
@@ -1187,9 +1245,9 @@ export class HistoryModule implements Module {
       // The anchor is in the store and every message of its millisecond in
       // `channelId` was fetched, so only an explicit channelId excludes it.
       throw new Error(
-        `Message ${anchorId} is not in channel ${JSON.stringify(input.channelId)}` +
-          (anchorChannel ? ` (it is in ${anchorChannel}).` : '.') +
-          ' Omit channelId to use the anchor\'s own channel.',
+        `Nothing was read: message ${shown(anchorId)} isn't in channel ${shown(input.channelId)}` +
+          (anchorChannel ? ` (it's in ${shown(anchorChannel)}).` : '.') +
+          ' Leave out "channelId" to read around it in its own channel.',
       );
     }
     const tiesBefore = ties.slice(Math.max(0, idx - before), idx);
@@ -1219,22 +1277,35 @@ export class HistoryModule implements Module {
   // ==========================================================================
 
   private async handleSearch(input: SearchInput): Promise<ToolResult> {
-    if (!input.query) {
-      throw new Error('search requires a non-empty "query".');
+    // A finite number is searched as its text, as a regular expression made
+    // from it reads it; any other value that isn't text is refused.
+    const given: unknown = input.query;
+    const query = typeof given === 'number' && Number.isFinite(given) ? String(given) : given;
+    if (typeof query !== 'string' || query === '') {
+      throw new Error(
+        'Nothing was searched: "query" must be the text to look for; ' +
+          `${given === undefined ? 'this call gave none' : `it's ${shown(given)}`}.`,
+      );
     }
     const channelId = this.resolveChannel(input.channelId);
     const fromMs = parseIsoDate(input.from, 'from');
     const toMs = parseIsoDate(input.to, 'to');
-    const limit = clampCount(input.limit, SEARCH_DEFAULT_LIMIT, SEARCH_MAX_LIMIT, 'limit');
-    const maxScan = clampCount(input.maxScan, SEARCH_DEFAULT_MAX_SCAN, SEARCH_MAX_MAX_SCAN, 'maxScan');
+    const limit = clampCount(input.limit, SEARCH_DEFAULT_LIMIT, SEARCH_MAX_LIMIT, 'limit', 'searched');
+    // A search has to scan at least 1 message.
+    const maxScan = clampCount(input.maxScan, SEARCH_DEFAULT_MAX_SCAN, SEARCH_MAX_MAX_SCAN, 'maxScan', 'searched', 1);
     const caseSensitive = input.caseSensitive ?? false;
     const flags = caseSensitive ? '' : 'i';
     const order = input.order ?? 'oldest';
     if (order !== 'oldest' && order !== 'newest') {
-      throw new Error(`"order" must be "oldest" or "newest", got ${JSON.stringify(input.order)}.`);
+      throw new Error(
+        `Nothing was searched: "order" must be "oldest" or "newest", or left out for "oldest"; it's ${shown(input.order)}.`,
+      );
     }
     if (input.wholeWord && input.regex) {
-      throw new Error('"wholeWord" applies to substring search only; in regex mode write \\b around the pattern instead.');
+      throw new Error(
+        'Nothing was searched: "wholeWord" applies to a search for text, not a regular expression. In a regular ' +
+          'expression, write \\b around the pattern instead, or set "regex" to false.',
+      );
     }
     const authorFilter = buildAuthorFilter(input.author, input.excludeAuthor);
 
@@ -1245,12 +1316,18 @@ export class HistoryModule implements Module {
     // than here.
     if (input.regex) {
       try {
-        new RegExp(input.query, flags);
+        new RegExp(query, flags);
       } catch (error) {
-        throw new Error(`Invalid regex "${input.query}": ${error instanceof Error ? error.message : String(error)}`);
+        // V8's message restates the pattern; the reason alone follows it.
+        const reason = (error instanceof Error ? error.message : String(error))
+          .replace(/^Invalid regular expression: \/.*\/[a-z]*: /s, '');
+        throw new Error(
+          `Nothing was searched: "query" ${shown(query)} isn't a valid regular expression (${reason}). ` +
+            'Fix the pattern, or set "regex" to false to search for the text as written.',
+        );
       }
     }
-    const needle = caseSensitive ? input.query : input.query.toLowerCase();
+    const needle = caseSensitive ? query : query.toLowerCase();
 
     const cm = this.cm as ContextManager;
     // The candidate window is the oldest (order:"oldest") or newest
@@ -1259,7 +1336,7 @@ export class HistoryModule implements Module {
     // detected up front rather than
     // silently scanning maxScan candidates and returning as if that were the
     // whole window. See the tool description's `truncated` contract.
-    if (maxScan === 0) throw new Error('"maxScan" must be at least 1 — a zero-message scan can never make progress.');
+    //
     // Continuation: `skipSequences` names what the previous call already
     // scanned at exactly the resume bound's millisecond (the bound is
     // inclusive). Identified by sequence range rather than a count, so a
@@ -1269,7 +1346,11 @@ export class HistoryModule implements Module {
     const skipRange = parseSkipSequences(input.skipSequences);
     const edgeMs = order === 'oldest' ? fromMs : toMs;
     if (skipRange && edgeMs === undefined) {
-      throw new Error(`"skipSequences" only applies together with "${order === 'oldest' ? 'from' : 'to'}" — pass the whole \`resume\` object back.`);
+      throw new Error(
+        `Nothing was searched: "skipSequences" goes with the "${order === 'oldest' ? 'from' : 'to'}" from the same ` +
+          '"resume". Copy the fields of the previous response\'s "resume" into the call, or leave "skipSequences" ' +
+          'out for a new search.',
+      );
     }
     const isSkipped = (m: StoredMessage) =>
       !!skipRange && m.timestamp.getTime() === edgeMs && m.sequence >= skipRange[0] && m.sequence <= skipRange[1];
@@ -1350,7 +1431,7 @@ export class HistoryModule implements Module {
       // through a worker thread instead, which can be forcibly terminated
       // on a deadline. See search-regex-worker.ts's header for the full
       // rationale.
-      const { matches, scanned } = await this.searchWithRegexWorker(candidates, input.query, flags, limit);
+      const { matches, scanned } = await this.searchWithRegexWorker(candidates, query, flags, limit);
       return { success: true, data: { scanned, ...poolInfo, truncated, ...resumeInfo(scanned), matches } };
     }
 
@@ -1416,22 +1497,32 @@ export class HistoryModule implements Module {
           const timer = setTimeout(() => {
             reject(
               new Error(
-                `search timed out after ${SEARCH_REGEX_TIMEOUT_MS}ms while matching regex "${pattern}" against ` +
-                  `up to ${texts.length} candidate(s) — the pattern may be catastrophically slow (exponential ` +
-                  'backtracking) against this data; try a simpler pattern, a literal substring search ' +
-                  '(regex:false), or a smaller maxScan.',
+                `The search stopped, and returned nothing: matching the regular expression ${shown(pattern)} ` +
+                  `against up to ${texts.length} ${texts.length === 1 ? 'message' : 'messages'} took longer than ` +
+                  `${SEARCH_REGEX_TIMEOUT_MS} ms, as a ` +
+                  'pattern that backtracks heavily can. Try a simpler pattern, set "regex" to false to search for the ' +
+                  'text as written, or lower "maxScan".',
               ),
             );
           }, SEARCH_REGEX_TIMEOUT_MS);
           timer.unref?.();
           worker.once('message', (msg: SearchWorkerMessage) => {
             clearTimeout(timer);
-            if (msg.type === 'error') reject(new Error(msg.error));
-            else resolve({ matches: msg.matches, scanned: msg.scanned });
+            if (msg.type === 'error') {
+              reject(new Error(
+                `The search stopped, and returned nothing: matching the regular expression ${shown(pattern)} ` +
+                  `failed (${msg.error}). Try a simpler pattern, or set "regex" to false to search for the text as written.`,
+              ));
+            } else {
+              resolve({ matches: msg.matches, scanned: msg.scanned });
+            }
           });
           worker.once('error', (err) => {
             clearTimeout(timer);
-            reject(err);
+            reject(new Error(
+              `The search stopped, and returned nothing: the worker matching the regular expression ${shown(pattern)} ` +
+                `failed (${err.message}). Set "regex" to false to search for the text as written.`,
+            ));
           });
         },
       );
@@ -1463,30 +1554,54 @@ export class HistoryModule implements Module {
 
   private async handleSemanticSearch(input: SemanticSearchInput): Promise<ToolResult> {
     if (!this.semanticCfg || !this.semanticClient) {
-      throw new Error('semantic_search is not configured for this resident (no embed-service in the recipe).');
+      throw new Error(
+        "Nothing was searched: this host has no semantic index set up, so history--semantic_search isn't available " +
+          "here, and calling it again won't change that. history--search finds messages by their words.",
+      );
     }
-    if (typeof input.query !== 'string' || !input.query.trim()) throw new Error('query must be a non-empty string');
-    const limit = clampCount(input.limit, SEMANTIC_DEFAULT_LIMIT, SEMANTIC_MAX_LIMIT, 'limit');
-    if (limit < 1) throw new Error('limit must be at least 1');
+    if (typeof input.query !== 'string' || !input.query.trim()) {
+      throw new Error(
+        'Nothing was searched: "query" must be a sentence describing what you\'re looking for; ' +
+          `${input.query === undefined ? 'this call gave none' : `it's ${shown(input.query)}`}.`,
+      );
+    }
+    // A search has to return at least 1 hit.
+    const limit = clampCount(input.limit, SEMANTIC_DEFAULT_LIMIT, SEMANTIC_MAX_LIMIT, 'limit', 'searched', 1);
     const fromMs = parseIsoDate(input.from, 'from');
     const toMs = parseIsoDate(input.to, 'to');
-    if (fromMs !== undefined && toMs !== undefined && fromMs > toMs) throw new Error('`from` must not be after `to`');
+    assertOrderedRange(fromMs, toMs, input.from, input.to);
     const channelId = this.resolveChannel(input.channelId);
     // Summaries carry no channel, so a channel filter on a summaries-only
     // search can only ever match nothing. Say so instead of returning [].
     const wantsSummariesOnly = input.level !== undefined || input.kinds === 'summaries';
     if (channelId && wantsSummariesOnly) {
-      throw new Error('channelId cannot be combined with kinds="summaries" or level: summaries are not per-channel. Drop channelId, or search kinds="messages".');
+      const picks = [
+        ...(input.kinds === 'summaries' ? ['"kinds": "summaries"'] : []),
+        ...(input.level !== undefined ? ['"level"'] : []),
+      ];
+      const fields = [...(input.kinds === 'summaries' ? ['kinds'] : []), ...(input.level !== undefined ? ['level'] : [])];
+      throw new Error(
+        `Nothing was searched: summaries aren't kept by channel, so "channelId" can't go with ${picks.join(' or ')}. ` +
+          `Leave out "channelId" to search summaries, or leave out ${quotedList(fields, 'and')} to search that ` +
+          'channel\'s messages.',
+      );
     }
     if (input.level !== undefined && input.kinds === 'messages') {
-      throw new Error('level applies to summaries only and cannot be combined with kinds="messages".');
+      throw new Error(
+        'Nothing was searched: "level" picks summaries, and "kinds" is "messages", so the two can\'t go together. ' +
+          'Leave out "kinds" to search summaries of that level, or leave out "level" to search messages.',
+      );
     }
     let kinds: string[] | undefined;
     if (wantsSummariesOnly) kinds = ['summary'];
     else if (input.kinds === 'messages' || channelId) kinds = ['message'];
-    if (input.level !== undefined && (!Number.isInteger(input.level) || input.level < 0)) throw new Error('level must be a non-negative integer');
+    if (input.level !== undefined && (!Number.isInteger(input.level) || input.level < 0)) {
+      throw new Error(`Nothing was searched: "level" must be a whole number, 0 or more, such as 1; it's ${shown(input.level)}.`);
+    }
     if (input.minScore !== undefined && (typeof input.minScore !== 'number' || input.minScore < -1 || input.minScore > 1)) {
-      throw new Error('minScore must be a number in -1..1');
+      throw new Error(
+        `Nothing was searched: "minScore" must be a number from -1 to 1, or left out; it's ${shown(input.minScore)}.`,
+      );
     }
 
     // Bounded catch-up so the newest messages are searchable; never block on a backlog.
@@ -1501,6 +1616,48 @@ export class HistoryModule implements Module {
       ts_to: toMs === undefined ? undefined : toMs / 1000,
       channel: channelId, kinds, level: input.level, min_score: input.minScore, snippet: SEMANTIC_SNIPPET_CHARS,
     });
+    // The client says what went wrong with the service; what that means for
+    // this call, and what the agent can do, is said here. The service's own
+    // source isn't in this repository, so a 404's advice holds whether it
+    // means this store's index doesn't exist yet or a route the service lacks.
+    const failure = (e: unknown): { reason: string; advice: string; mayPass: boolean } => {
+      const status = e instanceof EmbedServiceError ? e.status : null;
+      const reason = e instanceof Error ? e.message : String(e);
+      const later = {
+        reason, mayPass: true,
+        advice: 'You can try again later; if it keeps happening, ask whoever runs this host',
+      };
+      if (status === 404) {
+        return {
+          reason, mayPass: true,
+          advice: "If this store's index doesn't exist yet, the first messages indexed create it, and a later call " +
+            'can work; if it keeps happening, ask whoever runs this host',
+        };
+      }
+      if (status === 408 || status === 429 || (status !== null && status >= 500)) return later;
+      // An answer without what a search reads: a page shown while the service
+      // restarts clears, and an address that points at something else doesn't.
+      if (status !== null && status >= 200 && status < 300) {
+        return {
+          reason, mayPass: true,
+          advice: 'If the service was restarting, a later call can work; if its address points at something else, ' +
+            "none will until whoever runs this host fixes the semantic index's settings",
+        };
+      }
+      if (status !== null) {
+        return {
+          reason, mayPass: false,
+          advice: "Calling it again the same way won't change that; if it keeps happening, ask whoever runs this host",
+        };
+      }
+      // No answer: the service down or slow, or the connection dropped, which
+      // clears, or its address or certificate wrong, which doesn't.
+      return {
+        reason, mayPass: true,
+        advice: 'If the service is down or slow, or the connection dropped, a later call can work; if its address ' +
+          "or certificate is wrong, none will until whoever runs this host fixes the semantic index's settings",
+      };
+    };
     // The remote index is append-only and knows nothing about branches: a
     // message removed from the agent's reach by /undo, /checkout, /restore or
     // /newtopic keeps its id (a new message gets a fresh one) and stays
@@ -1534,11 +1691,21 @@ export class HistoryModule implements Module {
       return 'ok';
     };
     let k = limit;
-    let res = await runSearch(k);
+    let res: SearchResponse;
+    try {
+      res = await runSearch(k);
+    } catch (e) {
+      const { reason, advice } = failure(e);
+      throw new Error(`Nothing was searched: ${reason}. ${advice}. history--search finds messages by their words meanwhile.`);
+    }
     let droppedOffBranch = 0;
     let droppedStale = 0;
+    // Why searching again for more hits failed, when it did. The search
+    // before it answered, so its hits on this branch are returned.
+    let searchAgainError: string | null = null;
     let onBranch: typeof res.hits = [];
-    for (;;) {
+    // The last answer's hits on this branch, checked as they are now.
+    const check = (): void => {
       droppedOffBranch = 0; droppedStale = 0;
       onBranch = res.hits.filter((h) => {
         const v = keep(h);
@@ -1546,25 +1713,58 @@ export class HistoryModule implements Module {
         else if (v === 'stale') droppedStale++;
         return v === 'ok';
       });
+    };
+    for (;;) {
+      check();
       if (onBranch.length >= limit || res.hits.length < k || k >= SEMANTIC_MAX_FETCH) break;
       k = Math.min(SEMANTIC_MAX_FETCH, k * 4);
-      res = await runSearch(k);
+      try {
+        res = await runSearch(k);
+      } catch (e) {
+        const { reason, mayPass } = failure(e);
+        searchAgainError = `searching again for more hits failed: ${reason}. ` +
+          (mayPass ? 'Calling again may bring more.' : "Calling again the same way won't change that.");
+        // A message may have been edited, deleted or taken off this branch
+        // while that search waited, so the hits are checked again.
+        check();
+        break;
+      }
     }
     onBranch = onBranch.slice(0, limit);
-    const hits = onBranch.map((h) => ({
-      id: h.id,
-      /** Raw message id for a `msg:` hit (null for summaries) — pass it to extract({ aroundId }). */
-      messageId: h.id.startsWith('msg:') ? h.id.slice(4) : null,
-      kind: h.kind,
-      level: h.level,
-      score: h.score,
-      timestamp: h.ts === null ? null : new Date(h.ts * 1000).toISOString(),
-      channelId: h.channel,
-      participant: (h.meta as { participant?: unknown }).participant ?? null,
-      author: (h.meta as { author?: unknown }).author ?? null,
-      snippet: currentText.has(h.id) ? snippetOf(currentText.get(h.id)!) : (h.text ?? ''),
-      chars: currentText.has(h.id) ? currentText.get(h.id)!.length : h.chars,
-    }));
+    // A ts that makes no date reads as no timestamp, as a null one does, and a
+    // meta that isn't an object as no participant or author. The hit is still
+    // returned, but the index holds data written wrong, so the host is told.
+    // The index writes ts as a number of seconds, and text holding one reads
+    // as main read it; nothing else makes a date, and reading it can't throw.
+    const unread: string[] = [];
+    const hits = onBranch.map((h) => {
+      const ts: unknown = h.ts;
+      const seconds = typeof ts === 'number' ? ts : typeof ts === 'string' && ts.trim() !== '' ? Number(ts) : NaN;
+      const at = new Date(seconds * 1000);
+      const timestamp = Number.isNaN(at.getTime()) ? null : at.toISOString();
+      const meta = typeof h.meta === 'object' && h.meta !== null && !Array.isArray(h.meta)
+        ? h.meta as { participant?: unknown; author?: unknown }
+        : null;
+      const missing = [...(h.ts !== null && timestamp === null ? ['ts'] : []), ...(meta === null ? ['meta'] : [])];
+      if (missing.length > 0) unread.push(`${shown(h.id)} (${missing.join(' and ')})`);
+      return {
+        id: h.id,
+        /** Raw message id for a `msg:` hit (null for summaries) — pass it to extract({ aroundId }). */
+        messageId: h.id.startsWith('msg:') ? h.id.slice(4) : null,
+        kind: h.kind,
+        level: h.level,
+        score: h.score,
+        timestamp,
+        channelId: h.channel,
+        participant: meta?.participant ?? null,
+        author: meta?.author ?? null,
+        snippet: currentText.has(h.id) ? snippetOf(currentText.get(h.id)!) : (h.text ?? ''),
+        chars: currentText.has(h.id) ? currentText.get(h.id)!.length : h.chars,
+      };
+    });
+    if (unread.length > 0) {
+      this.indexer?.warn(`a search returned hits whose ts or meta couldn't be read, without them: ${unread.join(', ')}`);
+    }
     return {
       success: true,
       data: {
@@ -1578,6 +1778,8 @@ export class HistoryModule implements Module {
           droppedOffBranch,
           /** Hits for messages whose current text has nothing indexable (edited blank; the index delete is pending). */
           droppedStale,
+          /** When too few hits were on this branch and searching again for more failed: why, and whether calling again can help. */
+          searchAgainError,
         },
         timingMs: res.timing_ms,
       },
@@ -1589,7 +1791,7 @@ export class HistoryModule implements Module {
     const fromMs = parseIsoDate(input.from, 'from');
     const toMs = parseIsoDate(input.to, 'to');
     assertOrderedRange(fromMs, toMs, input.from, input.to);
-    const limit = clampCount(input.limit, OVERVIEW_DEFAULT_LIMIT, OVERVIEW_MAX_LIMIT, 'limit');
+    const limit = clampCount(input.limit, OVERVIEW_DEFAULT_LIMIT, OVERVIEW_MAX_LIMIT, 'limit', 'read');
     const cm = this.cm as ContextManager;
 
     let entries: TimeRangeSummaryEntry[];
@@ -1959,6 +2161,12 @@ export class HistoryModule implements Module {
 // Helpers
 // ============================================================================
 
+// The checks here (and resolveChannel) are shared by several tools. Their
+// refusals open with "Nothing was read", or for clampCount with the outcome
+// its caller names, and "Nothing was read" holds because every history tool
+// only reads. A tool that changes something should give its refusals an
+// opener of its own rather than reach these.
+
 /** Parse an ISO 8601 date string to Unix ms. Throws a clear error (not a
  *  crash) on an unparseable string; returns undefined for an omitted field
  *  (open-ended bound). */
@@ -1966,7 +2174,10 @@ function parseIsoDate(value: string | undefined, field: string): number | undefi
   if (value === undefined) return undefined;
   const ms = Date.parse(value);
   if (Number.isNaN(ms)) {
-    throw new Error(`Invalid ISO 8601 date for "${field}": ${JSON.stringify(value)}`);
+    throw new Error(
+      `Nothing was read: "${field}" is ${shown(value)}, which isn't an ISO 8601 date. Write it like 2026-03-01 or ` +
+        '2026-03-01T09:00:00Z.',
+    );
   }
   return ms;
 }
@@ -1980,7 +2191,10 @@ function parseIsoDate(value: string | undefined, field: string): number | undefi
  */
 function assertOrderedRange(fromMs: number | undefined, toMs: number | undefined, fromRaw: string | undefined, toRaw: string | undefined): void {
   if (fromMs !== undefined && toMs !== undefined && fromMs > toMs) {
-    throw new Error(`"from" (${fromRaw}) must not be after "to" (${toRaw}).`);
+    throw new Error(
+      `Nothing was read: "from" (${shown(fromRaw)}) is after "to" (${shown(toRaw)}), so the range holds nothing. Swap them, ` +
+        'or correct the one that\'s wrong.',
+    );
   }
 }
 
@@ -1992,22 +2206,52 @@ function assertOrderedRange(fromMs: number | undefined, toMs: number | undefined
  * "hard cap" and reach a native chronicle call expecting an unsigned
  * pagination argument (observed: `extract({limit:-1})` returning every
  * message in the store instead of being capped). Rejects (rather than
- * silently clamping) anything that isn't a finite non-negative integer, so
- * a caller mistake is surfaced as a clean tool error instead of silently
- * doing something other than what was asked.
+ * silently clamping) anything that isn't a whole number of at least `min`,
+ * so a caller mistake is surfaced as a clean tool error instead of silently
+ * doing something other than what was asked. The refusal opens with what
+ * didn't happen for the calling tool (`outcome`), and gives the range and
+ * the default.
  */
-function clampCount(value: number | undefined, def: number, max: number, field: string): number {
+function clampCount(
+  value: number | undefined, def: number, max: number, field: string, outcome: 'read' | 'searched', min = 0,
+): number {
   if (value === undefined) return def;
-  if (typeof value !== 'number' || !Number.isFinite(value)) {
-    throw new Error(`"${field}" must be a finite number, got ${JSON.stringify(value)}.`);
-  }
-  if (!Number.isInteger(value)) {
-    throw new Error(`"${field}" must be an integer, got ${value}.`);
-  }
-  if (value < 0) {
-    throw new Error(`"${field}" must be >= 0, got ${value}.`);
+  if (typeof value !== 'number' || !Number.isInteger(value) || value < min) {
+    throw new Error(
+      `Nothing was ${outcome}: "${field}" is ${shown(value)}, which isn't a whole number from ${min} to ${max}. `
+        + `Pass one, or leave it out for ${def}.`,
+    );
   }
   return Math.min(value, max);
+}
+
+/**
+ * A value a message names, the call's or the store's, as the message quotes
+ * it: its JSON, or what String() gives where JSON can't give the value itself,
+ * cut to 80 UTF-16 units, or one fewer where the 80th would split a surrogate
+ * pair: the message stays in the agent's context, and half a pair isn't
+ * well-formed text. Inside a list or an object, JSON writes Infinity and NaN
+ * as null, and so does the quote. A value the message gives the agent to send
+ * is quoted whole instead, since a cut one couldn't be sent.
+ */
+function shown(value: unknown): string {
+  let text: string | undefined;
+  // A value JSON can't give, such as a cycle, or Infinity or NaN as the whole
+  // value, which JSON.stringify gives as null, is shown as String() shows it.
+  if (typeof value !== 'number' || Number.isFinite(value)) {
+    try { text = JSON.stringify(value); } catch { /* String() below */ }
+  }
+  text ??= String(value);
+  return text.length <= 80 ? text : `${safeSlice(text, 0, 80)}…`;
+}
+
+/**
+ * Names in prose, each quoted whole: "a"; "a" and "b"; "a", "b" and "c" (or
+ * "or"). They're the tools' own field names, or names the agent can send.
+ */
+function quotedList(names: readonly string[], joiner: 'and' | 'or'): string {
+  const quoted = names.map((name) => JSON.stringify(name));
+  return quoted.length <= 1 ? quoted.join('') : `${quoted.slice(0, -1).join(', ')} ${joiner} ${quoted[quoted.length - 1]}`;
 }
 
 /** channelId lives at metadata.external.channelId — same path context-manager's
@@ -2270,7 +2514,11 @@ function parseSkipSequences(v: unknown): [number, number] | null {
     !v.every((x) => typeof x === 'number' && Number.isInteger(x) && x >= 0) ||
     v[0] > v[1]
   ) {
-    throw new Error('"skipSequences" must be [lo, hi], two non-negative integers with lo <= hi — copy it from `resume`.');
+    throw new Error(
+      'Nothing was searched: "skipSequences" must be two whole numbers, 0 or more, the first no larger than the ' +
+        `second, as a search's "resume" gives it; it's ${shown(v)}. Copy it from "resume" with its "from" or "to", ` +
+        'or leave it out for a new search.',
+    );
   }
   return [v[0], v[1]];
 }
@@ -2295,11 +2543,20 @@ function normalizeAuthorSpec(spec: string): string {
 function toAuthorSet(spec: AuthorSpec | undefined, field: string): Set<string> | null {
   if (spec === undefined) return null;
   const list = Array.isArray(spec) ? spec : [spec];
-  if (list.some((s) => typeof s !== 'string')) {
-    throw new Error(`"${field}" must be a string or an array of strings.`);
+  const odd = list.findIndex((s) => typeof s !== 'string');
+  if (odd !== -1) {
+    throw new Error(
+      `Nothing was read: "${field}" must list names or ids as text, such as ["alice", "1234"], and ` +
+        `${shown(list[odd])} isn't text.`,
+    );
   }
   const set = new Set(list.map(normalizeAuthorSpec).filter((s) => s.length > 0));
-  if (set.size === 0) throw new Error(`"${field}" must name at least one author.`);
+  if (set.size === 0) {
+    throw new Error(
+      `Nothing was read: "${field}" names no one: ${list.length > 0 ? 'its entries are blank' : 'the list is empty'}. ` +
+        `List at least one name or id, such as ["alice"], or leave "${field}" out.`,
+    );
+  }
   return set;
 }
 

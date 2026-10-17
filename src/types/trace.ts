@@ -533,6 +533,12 @@ export type TraceEvent =
       type: 'mcpl:server-connect-failed';
       serverId: string;
       error: string;
+      /** The last of the server's stderr, when its handshake failed by its
+       *  transport closing, a transport error or its timeout and it had
+       *  written any: the server's own text, which `error` never carries. A
+       *  transport that failed its handshake was never wired, so its lines
+       *  never reached `mcpl:server-stderr`. */
+      stderrTail?: string;
       /** Ordinal of the failed attempt: 0 is the initial connect, N is the Nth background retry. */
       attempt: number;
       /** True when a background reconnect loop will keep retrying. */
@@ -560,6 +566,11 @@ export type TraceEvent =
       code: number | null;
       /** Signal that terminated the child, if any. */
       signal: string | null;
+      /** Why the transport closed, in its own words, such as `child process
+       *  exited, and its pipe failed with write EPIPE` or `closed by host`;
+       *  null when it gave none, or when its reason is a WebSocket server's
+       *  own close text, which stays off the trace. */
+      reason: string | null;
       /** True when a background reconnect loop will revive the connection. */
       willReconnect: boolean;
     })

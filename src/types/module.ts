@@ -53,7 +53,12 @@ export interface Module {
 
   /**
    * Stop the module.
-   * Called when the framework stops or when the module is removed.
+   * Called when the framework stops or when the module is removed. Also called
+   * when a create() that started the module fails (#389): create() stops the
+   * framework before it rejects, so before the host has it and before anything
+   * a host wires up after create() returns, such as a WorkspaceModule's
+   * initStore(). A stop() that saves state can therefore run before that
+   * wiring, and shouldn't then save over state it was handed and hasn't used.
    */
   stop(): Promise<void>;
 

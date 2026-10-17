@@ -21,6 +21,7 @@ import type { StoredMessage } from '@animalabs/context-manager';
 import type { ChannelRegistry, TuneOutParams } from '../mcpl/channel-registry.js';
 import type { McplServerRegistry } from '../mcpl/server-registry.js';
 import { CapabilityGrant } from '../mcpl/capability-grant.js';
+import { armAfter, armAt } from '../deadline-timer.js';
 
 /** Defaults for tune_out tool params. */
 export const TUNE_OUT_DEFAULTS = {
@@ -64,7 +65,9 @@ export interface TuneOutFrameworkHooks {
 
 export class TuneOutCoordinator {
   private cadenceTimers = new Map<string, ReturnType<typeof setTimeout>>();
-  /** Duration-expiry timers (params.expiresAtMs); cleared on any cancel. */
+  /** Each duration's pending expiry step (params.expiresAtMs). stop clears
+   *  it, cancel does while the registry still holds the tune-out, and the
+   *  channel's next enter does in any case. */
   private expiryTimers = new Map<string, ReturnType<typeof setTimeout>>();
   /** Channels with a wake invocation pending inside the coalescing window. */
   private pendingWakes = new Map<string, { count: number; timer: ReturnType<typeof setTimeout> }>();
@@ -108,11 +111,10 @@ export class TuneOutCoordinator {
     const key = this.key(serverId, channelId);
     const existing = this.expiryTimers.get(key);
     if (existing) clearTimeout(existing);
-    const remaining = Math.max(0, params.expiresAtMs - Date.now());
-    this.expiryTimers.set(key, setTimeout(() => {
+    armAt(params.expiresAtMs, (timer) => { this.expiryTimers.set(key, timer); }, () => {
       this.expiryTimers.delete(key);
       this.cancel(serverId, channelId, 'duration', 'duration elapsed');
-    }, remaining));
+    });
   }
 
   private listActive(): Array<{ serverId: string; channelId: string; params: TuneOutParams }> {
@@ -145,16 +147,57 @@ export class TuneOutCoordinator {
     if (this.channelRegistry.getTuneOutState(serverId, channelId)) {
       return { ok: false, error: `channel ${channelId} is already tuned out (cancel first to change params)` };
     }
+    // A tool's input reaches here as the model wrote it, and the store can't
+    // keep a NaN or an Infinity: its append would throw after the registry
+    // had marked the channel tuned out. So each option is read as a number
+    // before anything changes, a numeric string included, as the sleep tool
+    // reads its seconds; null counts as left out. A value that gives no
+    // finite number is refused.
+    const leftOut = {
+      durationSeconds: 'to stay tuned out until you cancel',
+      cadenceSeconds: `for the default, ${TUNE_OUT_DEFAULTS.cadenceSeconds}`,
+      backlogCap: `for the default, ${TUNE_OUT_DEFAULTS.backlogCap}`,
+      maxWakes: `for the default, ${TUNE_OUT_DEFAULTS.maxWakes}`,
+    } as const;
+    const given: Partial<Record<keyof typeof leftOut, number>> = {};
+    for (const name of Object.keys(leftOut) as Array<keyof typeof leftOut>) {
+      const value: unknown = opts[name];
+      if (value == null) continue;
+      const n = Number(value);
+      if (!Number.isFinite(n)) {
+        const got = typeof value === 'number'
+          ? String(value)
+          : `${typeof value === 'string' ? 'the string' : 'the value'} ${JSON.stringify(value)}`;
+        return {
+          ok: false,
+          error: `Nothing was tuned out: ${name} must be a finite number${name.endsWith('Seconds') ? ' of seconds' : ''}, `
+            + `and it was ${got}. Leave it out ${leftOut[name]}.`,
+        };
+      }
+      given[name] = n;
+    }
+    const expiresAtMs = given.durationSeconds === undefined
+      ? undefined
+      : Date.now() + Math.max(60, given.durationSeconds) * 1000;
+    if (expiresAtMs !== undefined && !Number.isFinite(expiresAtMs)) {
+      return {
+        ok: false,
+        error: `Nothing was tuned out: durationSeconds ${given.durationSeconds} is longer than an end time can be kept. `
+          + `Leave it out ${leftOut.durationSeconds}.`,
+      };
+    }
     const params: TuneOutParams = {
       epochId: randomUUID(),
-      cadenceSeconds: Math.max(30, opts.cadenceSeconds ?? TUNE_OUT_DEFAULTS.cadenceSeconds),
-      backlogCap: Math.max(0, opts.backlogCap ?? TUNE_OUT_DEFAULTS.backlogCap),
-      maxWakes: Math.max(1, opts.maxWakes ?? TUNE_OUT_DEFAULTS.maxWakes),
+      cadenceSeconds: Math.max(30, given.cadenceSeconds ?? TUNE_OUT_DEFAULTS.cadenceSeconds),
+      backlogCap: Math.max(0, given.backlogCap ?? TUNE_OUT_DEFAULTS.backlogCap),
+      maxWakes: Math.max(1, given.maxWakes ?? TUNE_OUT_DEFAULTS.maxWakes),
       startedAtSequence: this.hooks.currentSequence(),
-      ...(opts.durationSeconds !== undefined
-        ? { expiresAtMs: Date.now() + Math.max(60, opts.durationSeconds) * 1000 }
-        : {}),
+      ...(expiresAtMs !== undefined ? { expiresAtMs } : {}),
     };
+    // A tune-out can end in the registry without cancel (a send into the
+    // channel or a close sets its state there), leaving its timers armed:
+    // clear them, so none of them acts on this one.
+    this.clearTimers(serverId, channelId);
     this.channelRegistry.enterTuneOut(serverId, channelId, params, source);
     this.armExpiry(serverId, channelId, params);
 
@@ -190,17 +233,7 @@ export class TuneOutCoordinator {
     if (!ended) {
       return { ok: false, error: `channel ${channelId} is not tuned out` };
     }
-    this.stopCadence(serverId, channelId);
-    const expiry = this.expiryTimers.get(this.key(serverId, channelId));
-    if (expiry) {
-      clearTimeout(expiry);
-      this.expiryTimers.delete(this.key(serverId, channelId));
-    }
-    const pending = this.pendingWakes.get(this.key(serverId, channelId));
-    if (pending) {
-      clearTimeout(pending.timer);
-      this.pendingWakes.delete(this.key(serverId, channelId));
-    }
+    this.clearTimers(serverId, channelId);
     this.divertedSinceInvocation.delete(this.key(serverId, channelId));
 
     // Backlog: every message stamped with this epoch, oldest first.
@@ -342,6 +375,7 @@ export class TuneOutCoordinator {
   private startCadence(serverId: string, channelId: string, cadenceSeconds: number): void {
     this.stopCadence(serverId, channelId);
     const key = this.key(serverId, channelId);
+    const hold = (timer: ReturnType<typeof setTimeout>): void => { this.cadenceTimers.set(key, timer); };
     const tick = () => {
       const state = this.channelRegistry.getTuneOutState(serverId, channelId);
       if (!state) return; // cancelled meanwhile
@@ -350,9 +384,22 @@ export class TuneOutCoordinator {
       if (diverted > 0) {
         this.invokeSubconscious(serverId, channelId, 'cadence', diverted);
       }
-      this.cadenceTimers.set(key, setTimeout(tick, cadenceSeconds * 1000));
+      armAfter(cadenceSeconds * 1000, hold, tick);
     };
-    this.cadenceTimers.set(key, setTimeout(tick, cadenceSeconds * 1000));
+    armAfter(cadenceSeconds * 1000, hold, tick);
+  }
+
+  /** Clear a channel's tune-out timers: its cadence, its end time and a wake
+   *  still coalescing. */
+  private clearTimers(serverId: string, channelId: string): void {
+    const key = this.key(serverId, channelId);
+    this.stopCadence(serverId, channelId);
+    const expiry = this.expiryTimers.get(key);
+    if (expiry) clearTimeout(expiry);
+    this.expiryTimers.delete(key);
+    const pending = this.pendingWakes.get(key);
+    if (pending) clearTimeout(pending.timer);
+    this.pendingWakes.delete(key);
   }
 
   private stopCadence(serverId: string, channelId: string): void {

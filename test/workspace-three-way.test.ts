@@ -13,7 +13,7 @@ import { describe, test, type TestContext } from 'node:test';
 import { TOOL_BATCH_HOOK_TIMEOUT_MS } from '../src/module-registry.js';
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { chmodSync, constants as fsConstants, existsSync, linkSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, renameSync, rmSync, statSync, symlinkSync, truncateSync, unlinkSync, utimesSync, writeFileSync } from 'node:fs';
+import { appendFileSync, chmodSync, constants as fsConstants, existsSync, linkSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, statSync, symlinkSync, truncateSync, unlinkSync, utimesSync, writeFileSync } from 'node:fs';
 import { open, statfs } from 'node:fs/promises';
 import { createHash } from 'node:crypto';
 import { createRequire, syncBuiltinESMExports } from 'node:module';
@@ -23,12 +23,13 @@ import { JsStore } from '@animalabs/chronicle';
 import { WorkspaceModule } from '../src/modules/workspace/index.js';
 import { DISK_AGREEMENT_RECORD_TYPE, DiskAgreement } from '../src/modules/workspace/disk-agreement.js';
 import { RecordJournal } from '../src/record-journal.js';
-import { confirmAbsent, fingerprintVouches, filesystemTrustsCtime, fsTypeTrustsCtime, observePath, readPath, type MountView } from '../src/modules/workspace/observe.js';
+import { confirmAbsent, fingerprintVouches, filesystemTrustsCtime, fsTypeTrustsCtime, observePath, provenAbsent, readPath, walkScope, type MountView } from '../src/modules/workspace/observe.js';
 import { EffectFailed, syncDirectories, unlinkContained, writeContained } from '../src/modules/workspace/effects.js';
 import { pushPaths, settleAdoptionBeforeMutation } from '../src/modules/workspace/reconcile.js';
 import type { MountConfig, WorkspaceConfig } from '../src/modules/workspace/types.js';
 import type { ModuleContext } from '../src/types/module.js';
 import type { ProcessEvent } from '../src/types/events.js';
+import { changedAfterFstat, withFileHandle } from './helpers/file-handle.js';
 
 const FAULT_FIXTURE = join(import.meta.dirname, 'fixtures/workspace-fault.mjs');
 const TREE = 'workspace/work/tree';
@@ -190,22 +191,30 @@ const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 /** The hash evidence and disk facts carry for this text. */
 const sha = (text: string) => createHash('sha256').update(text).digest('hex');
 
-/** Run `fn` with FileHandle.readFile switching branches as `onRead` says. */
+/**
+ * Run `fn` with each file a pass reads switching branches as `onRead` says,
+ * once per file, just before its read starts: at a FileHandle readFile, or at
+ * a handle's first FileHandle read at position 0 (a file that grew past the
+ * size limit is read from its start again, on the same handle, to hash it).
+ * Any other such read in the window counts too, such as a write's
+ * verification or a listing's head read.
+ */
 async function withReadHook<T>(onRead: (calls: number) => void, fn: () => Promise<T>): Promise<T> {
-  const probe = await open(join(tmpdir(), `read-hook-${process.pid}`), 'w');
-  const proto = Object.getPrototypeOf(probe) as { readFile: (...args: unknown[]) => Promise<Buffer> };
-  await probe.close();
-  const readFile = proto.readFile;
   let calls = 0;
-  proto.readFile = async function (this: unknown, ...args: unknown[]) {
-    onRead(++calls);
-    return readFile.apply(this, args);
-  };
-  try {
-    return await fn();
-  } finally {
-    proto.readFile = readFile;
-  }
+  const started = new WeakSet<object>();
+  return withFileHandle({
+    readFile: (readFile) => async function (this: unknown, ...args: unknown[]) {
+      onRead(++calls);
+      return readFile.apply(this, args);
+    },
+    read: (read) => async function (this: object, ...args: unknown[]) {
+      if (args[3] === 0 && !started.has(this)) {
+        started.add(this);
+        onRead(++calls);
+      }
+      return read.apply(this, args);
+    },
+  }, fn);
 }
 
 /** Run `fn` with node:fs/promises' `name` replaced by `make(original)`, as the code under test sees it. */
@@ -1900,6 +1909,40 @@ describe('trust and identity at the point of use', () => {
     }
   });
 
+  // A fractional limit, too, which allows the whole bytes in it.
+  for (const limit of [1024, 1024.5]) {
+    test(`a file within the size limit (${limit}) at its fstat that grows past it before the read is hashed as oversize, not loaded whole`, async (t) => {
+      const env = new Env(t);
+      const rootReal = realpathSync(env.dir);
+      env.writeDisk('grow.txt', 'a'.repeat(100));
+      const path = env.disk('grow.txt');
+      const read = await changedAfterFstat(path, () => appendFileSync(path, 'b'.repeat(4000)),
+        () => readPath(viewOf(env.dir), rootReal, 'grow.txt', limit));
+      assert.equal(read.kind, 'read');
+      if (read.kind !== 'read') return;
+      assert.equal(read.bytes, null, 'over the limit as read, so not kept, and so not ingested');
+      assert.equal(read.size, 4100, 'hashed to its end');
+      assert.equal(read.hash, createHash('sha256').update('a'.repeat(100) + 'b'.repeat(4000)).digest('hex'));
+      assert.equal(read.head.toString(), 'a'.repeat(100) + 'b'.repeat(4000), 'its head, as for any oversize file');
+    });
+  }
+
+  test('a file that grows within the size limit after its fstat is read whole, as the read found it', async (t) => {
+    const env = new Env(t);
+    const rootReal = realpathSync(env.dir);
+    env.writeDisk('grow.txt', 'a'.repeat(10));
+    const path = env.disk('grow.txt');
+    const grown = 'a'.repeat(10) + 'b'.repeat(200 * 1024);
+    const read = await changedAfterFstat(path, () => appendFileSync(path, 'b'.repeat(200 * 1024)),
+      () => readPath(viewOf(env.dir), rootReal, 'grow.txt', 1024 * 1024));
+    assert.equal(read.kind, 'read');
+    if (read.kind !== 'read') return;
+    assert.equal(read.bytes?.toString(), grown, 'read on, in larger buffers, past the 10 bytes its fstat gave');
+    assert.equal(read.size, grown.length);
+    assert.equal(read.fp.size, grown.length, 'the fingerprint gives the size of the bytes hashed');
+    assert.equal(read.hash, createHash('sha256').update(grown).digest('hex'));
+  });
+
   /** A root identified as it is now, and a way to replace it: renamed away, with an empty `sub` in its place. */
   const replaceable = (env: Env) => {
     mkdirSync(env.disk('sub'), { recursive: true });
@@ -2127,6 +2170,20 @@ describe('a mount larger than its walk cap (agent-framework #272)', () => {
     assert.notEqual(env.store.treeGet(TREE, 'big/d.txt'), null);
   });
 
+  test('a listing, and an agent-action scan, prove a deletion in a directory larger than the cap too', async (t) => {
+    for (const via of ['ls', 'agent-action'] as const) {
+      const env = new Env(t);
+      const m = await env.open({ walkCap: 2, ...(via === 'agent-action' ? { watch: 'on-agent-action' } : {}) });
+      for (const f of ['big/a.txt', 'big/b.txt', 'big/c.txt', 'big/d.txt', 'big/e.txt']) await seedSynced(env, m, f, f);
+      env.rmDisk('big/e.txt');
+      // Each takes a.txt and b.txt; big's listing, read whole, lacks e.txt.
+      if (via === 'ls') await call(m, 'ls', { path: 'work/big' });
+      else await m.onToolBatchComplete('agent');
+      assert.equal(env.store.treeGet(TREE, 'big/e.txt'), null, via);
+      assert.notEqual(env.store.treeGet(TREE, 'big/d.txt'), null, via);
+    }
+  });
+
   test('a listing starts at its scope every time, and leaves no place behind', async (t) => {
     const env = new Env(t);
     for (const f of ['a.txt', 'b.txt', 'c.txt']) env.writeDisk(f, f);
@@ -2141,8 +2198,11 @@ describe('a mount larger than its walk cap (agent-framework #272)', () => {
     const env = new Env(t);
     for (const f of ['d/a.txt', 'd/b.txt', 'd/c.txt', 'top.txt']) env.writeDisk(f, f);
     const m = await env.open({ walkCap: 2 });
-    await call(m, 'sync', { path: 'work/d' });
+    const first = await call(m, 'sync', { path: 'work/d' });
     assert.deepEqual(syncedNames(env), ['d/a.txt', 'd/b.txt']);
+    assert.ok(first.incomplete.some((r: { path: string; reason: string }) =>
+      r.path === 'd' && r.reason === 'the walk cap (2) was reached: the next sync of this directory resumes after work/d/b.txt'),
+      JSON.stringify(first.incomplete));
     await call(m, 'sync', { path: 'work/d' });
     assert.deepEqual(syncedNames(env), ['d/a.txt', 'd/b.txt', 'd/c.txt']);
     assert.equal((m as any).agreementOrThrow().walkResumesAfter('work', ''), undefined, 'the mount root keeps its own place');
@@ -2234,21 +2294,68 @@ describe('a mount larger than its walk cap (agent-framework #272)', () => {
     const synced = await call(m, 'sync', {});
     const resumes = synced.incomplete.filter((r: { reason: string }) => /resumes after/.test(r.reason));
     assert.deepEqual(resumes.map((r: { mount: string; path: string; reason: string }) => [r.mount, r.path, r.reason]),
-      [['work', '', 'the walk cap (1) was reached: the next sync or scan of this scope resumes after work/a.txt']]);
+      [['work', '', 'the walk cap (1) was reached: the next sync of the mount resumes after work/a.txt']]);
     // z/q.txt sits beneath z/, which wasn't listed: its reason is z/'s, not
     // that of the root, which holds an untaken b.txt.
     const skipped = synced.skipped?.find((x: { path: string }) => x.path === 'z/q.txt');
     assert.match(skipped?.reason ?? '', /not visited: the walk cap \(1\) was reached/, JSON.stringify(synced.skipped));
   });
 
-  test('agent-action scans resume where the last stopped', async (t) => {
+  test("the sync tool's description says how the walk takes turns", async (t) => {
+    const env = new Env(t);
+    const m = await env.open({});
+    const sync = m.getTools().find((tool: { name: string }) => tool.name === 'sync');
+    assert.ok(sync);
+    assert.match(sync.description, /the next sync of the same mount or directory picks up where the last turn stopped/);
+    assert.match(sync.description, /its own catch-up scan, at start and when its watcher reattaches, takes turns with its whole-mount syncs/);
+  });
+
+  test("a watched mount's capped sync names its catch-up scan as the other turn", async (t) => {
+    const env = new Env(t);
+    for (const f of ['a.txt', 'b.txt']) env.writeDisk(f, f);
+    const m = await env.open({ walkCap: 1 });
+    // Read as a watched mount from here; opened unwatched, so no watcher runs.
+    (m as any).mounts.get('work').config.watch = 'always';
+    const synced = await call(m, 'sync', {});
+    assert.ok(synced.incomplete.some((r: { path: string; reason: string }) => r.path === ''
+      && r.reason === 'the walk cap (1) was reached: the next sync of the mount, or its catch-up scan if that comes first, resumes after work/a.txt'),
+      JSON.stringify(synced.incomplete));
+  });
+
+  test("an agent-action scan takes the mount's start after every batch, and leaves the syncs' place alone", async (t) => {
     const env = new Env(t);
     for (const f of ['a.txt', 'b.txt', 'c.txt', 'd.txt']) env.writeDisk(f, f);
     const m = await env.open({ watch: 'on-agent-action', walkCap: 2 });
+    const agreement = (m as any).agreementOrThrow();
+    const stored = (p: string) => {
+      const e = env.store.treeGet(TREE, p);
+      return e ? env.store.getBlob(e.blobHash)?.toString('utf8') : null;
+    };
+    const capReports = () => env.events.filter((e) => e.type === 'workspace:agent-action-scan-incomplete').length;
+    // What a shell tool did to the first file in the walk's order is in the
+    // workspace after every batch, and each capped scan says where the cap
+    // stopped it.
+    for (const edit of ['edit one', 'edit number two', 'the third edit, longest']) {
+      env.writeDisk('a.txt', edit);
+      const reported = capReports();
+      await m.onToolBatchComplete('agent');
+      assert.equal(stored('a.txt'), edit);
+      assert.equal(capReports(), reported + 1, 'the batch\'s scan reported its cap');
+    }
+    assert.deepEqual(syncedNames(env), ['a.txt', 'b.txt'], 'the same two files every time');
+    assert.equal(agreement.walkResumesAfter('work', ''), undefined, 'and no place');
+    // A bare sync keeps its place, and a batch's scan between two syncs
+    // doesn't move it.
+    await call(m, 'sync', {});
+    assert.equal(agreement.walkResumesAfter('work', ''), 'b.txt');
     await m.onToolBatchComplete('agent');
-    assert.deepEqual(syncedNames(env), ['a.txt', 'b.txt']);
-    await m.onToolBatchComplete('agent');
+    assert.equal(agreement.walkResumesAfter('work', ''), 'b.txt');
+    await call(m, 'sync', {});
     assert.deepEqual(syncedNames(env), ['a.txt', 'b.txt', 'c.txt', 'd.txt']);
+    // A file a shell tool deleted among them is gone after the batch.
+    env.rmDisk('b.txt');
+    await m.onToolBatchComplete('agent');
+    assert.equal(stored('b.txt'), null);
   });
 
   test("a watched mount's catch-up scan resumes where the last stopped", async (t) => {
@@ -2675,16 +2782,156 @@ describe('a mount larger than its walk cap (agent-framework #272)', () => {
     assert.equal((m as any).agreementOrThrow().walkResumesAfter('work', ''), 'b.txt');
   });
 
-  test('a place is recorded after the root it was gathered under, even by a pass that records no evidence', async (t) => {
+  test('a pass that records only a place binds no root, so a replaced root is read as it is', async (t) => {
     const env = new Env(t);
-    // Files too large to take in: the pass records no evidence for them.
-    for (const f of ['a.txt', 'b.txt']) env.writeDisk(f, 'more than one byte');
+    // A file too large to take in: the passes record no evidence for it.
+    env.writeDisk('a.txt', 'more than one byte');
     const m = await env.open({ walkCap: 1, maxFileSize: 1 });
-    await call(m, 'sync', {});
     const agreement = (m as any).agreementOrThrow();
-    assert.equal(agreement.walkResumesAfter('work', ''), 'a.txt');
-    const st = statSync(env.dir, { bigint: true });
-    assert.deepEqual(agreement.rootIdentity('work'), { dev: String(st.dev), ino: String(st.ino) });
+    await call(m, 'sync', {});
+    assert.equal(agreement.walkResumesAfter('work', ''), undefined, 'the walk covered the mount');
+    assert.equal(agreement.rootIdentity('work'), undefined, 'and bound no root');
+    env.writeDisk('b.txt', 'more than one byte');
+    await call(m, 'sync', {});
+    assert.equal(agreement.walkResumesAfter('work', ''), 'a.txt', 'a capped walk keeps its place');
+    assert.equal(agreement.rootIdentity('work'), undefined, 'and binds no root either');
+    // Another directory takes the root's place. With no evidence to guard,
+    // the mount reads it as it is, and the walk takes its turn after the
+    // place there.
+    renameSync(env.dir, `${env.dir}-away`);
+    mkdirSync(env.dir);
+    for (const f of ['a.txt', 'b.txt', 'c.txt']) env.writeDisk(f, 'more than one byte');
+    const synced = await call(m, 'sync', {});
+    assert.ok(!synced.incomplete.some((r: { reason: string }) => /disk last agreed with/.test(r.reason)), JSON.stringify(synced.incomplete));
+    assert.equal(agreement.walkResumesAfter('work', ''), 'b.txt');
+  });
+
+  test("a whole mount's catch-up scan takes turns with its bare syncs", async (t) => {
+    const env = new Env(t);
+    for (const f of ['a.txt', 'b.txt', 'c.txt', 'd.txt', 'e.txt', 'f.txt']) env.writeDisk(f, f);
+    const m = await env.open({ walkCap: 2 });
+    await call(m, 'sync', {});
+    await (m as any).initialScan('work');
+    assert.deepEqual(syncedNames(env), ['a.txt', 'b.txt', 'c.txt', 'd.txt'], 'the scan took the next two');
+    await call(m, 'sync', {});
+    assert.deepEqual(syncedNames(env), ['a.txt', 'b.txt', 'c.txt', 'd.txt', 'e.txt', 'f.txt'], 'and the sync the two after those');
+  });
+
+  test('a pass that moves only its place makes no store sync', async (t) => {
+    const env = new Env(t);
+    for (const f of ['a.txt', 'b.txt', 'c.txt', 'd.txt']) env.writeDisk(f, f);
+    const m = await env.open({ walkCap: 2 });
+    // Without ctime trust no fingerprint vouches, so no pass re-records one
+    // once the files are older than the racy window, however slowly this
+    // runs: what's left to record is the place alone.
+    (m as any).ctimeTrust.set(realpathSync(env.dir), null);
+    await call(m, 'sync', {});
+    await call(m, 'sync', {});
+    assert.deepEqual(syncedNames(env), ['a.txt', 'b.txt', 'c.txt', 'd.txt']);
+    const agreement = (m as any).agreementOrThrow();
+    const sync = env.store.sync.bind(env.store);
+    let syncs = 0;
+    env.store.sync = () => {
+      syncs++;
+      return sync();
+    };
+    // Nothing on disk changes from here, so each pass records only where it
+    // stopped: a place that's lost costs coverage, never a decision.
+    const places: Array<string | undefined> = [];
+    for (let i = 0; i < 4; i++) {
+      await call(m, 'sync', {});
+      places.push(agreement.walkResumesAfter('work', ''));
+    }
+    assert.deepEqual(places, ['b.txt', 'd.txt', 'b.txt', 'd.txt'], 'the place moved on every pass');
+    assert.equal(syncs, 0, 'with no store sync');
+  });
+
+  test('a model of the walk: on random trees that change between passes, each pass takes the cyclic window after its place', async (t) => {
+    const env = new Env(t);
+    const rootReal = realpathSync(env.dir);
+    const view = { root: env.dir, followSymlinks: false, maxFileSize: 1 << 20, ignore: [] } as unknown as MountView;
+    // A seeded generator, so a failure replays.
+    let seed = 272;
+    const rand = (n: number): number => {
+      seed = (Math.imul(seed, 1103515245) + 12345) >>> 0;
+      return (seed >>> 8) % n;
+    };
+    // U+FF21 sorts before U+1F600 by UTF-8 byte and after it by UTF-16 code
+    // unit, the walk's order; U+E000 sorts before both by UTF-8 byte and
+    // between them by UTF-16 code unit.
+    const names = ['a', 'b', 'm', 'z', '\uFF21', '\u{1F600}', '\uE000'];
+    const pick = <T>(xs: T[]): T => xs[rand(xs.length)]!;
+    const randomPath = (): string => {
+      const parts: string[] = [];
+      for (let depth = rand(3); depth > 0; depth--) parts.push(pick(names));
+      return [...parts, `${pick(names)}.${rand(4) === 0 ? 'lnk' : 'txt'}`].join('/');
+    };
+    const add = (path: string): void => {
+      const full = env.disk(path);
+      mkdirSync(dirname(full), { recursive: true });
+      if (lstatSync(full, { throwIfNoEntry: false })) return;
+      if (path.endsWith('.lnk')) symlinkSync('nowhere', full); // dangling: an entry that isn't a file
+      else writeFileSync(full, path);
+    };
+    /** Every entry that isn't a directory, as readdir shows it now. */
+    const entries = (dir = ''): string[] => {
+      const out: string[] = [];
+      for (const d of readdirSync(env.disk(dir), { withFileTypes: true })) {
+        const path = dir ? `${dir}/${d.name}` : d.name;
+        if (d.isDirectory()) out.push(...entries(path));
+        else out.push(path);
+      }
+      return out;
+    };
+    // The walk's order, worked out independently: in each directory, its
+    // entries that aren't directories by name, then its subdirectories by
+    // name, each with everything beneath it.
+    const order = (a: string, b: string): number => {
+      const pa = a.split('/');
+      const pb = b.split('/');
+      for (let i = 0; ; i++) {
+        const leafA = i === pa.length - 1;
+        const leafB = i === pb.length - 1;
+        if (leafA !== leafB) return leafA ? -1 : 1;
+        if (pa[i] !== pb[i]) return pa[i]! < pb[i]! ? -1 : 1;
+        if (leafA) return 0;
+      }
+    };
+
+    for (let tree = 0; tree < 25; tree++) {
+      rmSync(env.dir, { recursive: true, force: true });
+      mkdirSync(env.dir);
+      for (let i = 4 + rand(16); i > 0; i--) add(randomPath());
+      const cap = 1 + rand(8);
+      let place: string | undefined;
+      for (let pass = 0; pass < 12; pass++) {
+        // Changes between passes: entries added, removed, the place itself
+        // removed, and whole directories removed.
+        for (let change = rand(4); change > 0; change--) {
+          const now = entries();
+          const kind = rand(4);
+          if (kind === 0 || now.length === 0) add(randomPath());
+          else if (kind === 1) rmSync(env.disk(pick(now)));
+          else if (kind === 2 && place !== undefined && now.includes(place)) rmSync(env.disk(place));
+          else {
+            const dirs = now.filter((p) => p.includes('/')).map((p) => p.slice(0, p.lastIndexOf('/')));
+            if (dirs.length > 0) rmSync(env.disk(pick(dirs)), { recursive: true, force: true });
+          }
+        }
+        const all = entries().sort(order);
+        const after = place === undefined ? [] : all.filter((p) => order(p, place!) > 0);
+        const upto = place === undefined ? all : all.filter((p) => order(p, place!) <= 0);
+        const window = [...after, ...upto].slice(0, cap);
+        const walk = await walkScope(view, rootReal, '', true, cap, place === undefined ? {} : { resumeAfter: place });
+        const taken = [...walk.files, ...walk.othersTaken];
+        const where = `tree ${tree}, pass ${pass}, cap ${cap}, after ${place}`;
+        assert.deepEqual(taken.sort(order), [...window].sort(order), `${where}: took the cyclic window`);
+        for (const p of all) assert.equal(provenAbsent(walk, p), false, `${where}: ${p} is on disk`);
+        if (walk.stoppedAfter !== undefined) assert.equal(walk.stoppedAfter, window.at(-1), `${where}: the place is the last entry taken`);
+        else assert.ok(all.length <= cap, `${where}: no place only once the walk took everything`);
+        place = walk.stoppedAfter;
+      }
+    }
   });
 
   test('places go through a checkpoint, and a scope a walk covered stays cleared', (t) => {

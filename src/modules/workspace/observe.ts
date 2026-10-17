@@ -571,9 +571,41 @@ async function openContained(
 }
 
 /**
+ * Read an open file from its start, at most `limit` bytes, and whether it
+ * goes on past them. Where the file ends is what the reads find: `sizeHint`,
+ * the size its fstat gave, only sizes the first buffer. Once a buffer is
+ * full, one byte read past it tells whether the file goes on. At the limit,
+ * that byte says it does, and isn't kept. Short of it, the file has grown
+ * since its fstat: the byte is kept, and the read goes on in a larger buffer,
+ * up to the limit. A file that has shrunk ends where the reads find its end.
+ * A fractional `limit` allows the whole bytes in it.
+ */
+export async function readPrefix(handle: FileHandle, limit: number, sizeHint: number): Promise<{ bytes: Buffer; more: boolean }> {
+  const cap = Math.floor(limit);
+  const next = Buffer.alloc(1);
+  let bytes = Buffer.alloc(Math.min(cap, sizeHint));
+  let length = 0;
+  for (;;) {
+    while (length < bytes.length) {
+      const { bytesRead } = await handle.read(bytes, length, bytes.length - length, length);
+      if (bytesRead === 0) return { bytes: bytes.subarray(0, length), more: false };
+      length += bytesRead;
+    }
+    if ((await handle.read(next, 0, 1, length)).bytesRead === 0) return { bytes, more: false };
+    if (length === cap) return { bytes, more: true };
+    // Longer than its fstat said: read on, up to the limit.
+    const grown = Buffer.alloc(Math.min(cap, Math.max(2 * length, length + 64 * 1024)));
+    bytes.copy(grown, 0, 0, length);
+    grown[length++] = next[0];
+    bytes = grown;
+  }
+}
+
+/**
  * Read and hash a mount-relative file through one located descriptor. The
- * whole file is returned when it is at most `limit` bytes; larger files are
- * hashed in chunks and only their head is kept.
+ * whole file is returned when it is at most `limit` bytes, both at its fstat
+ * and as read; any other file, including one that grew past `limit` since its
+ * fstat, is hashed in chunks and only its head is kept.
  */
 export async function readPath(
   view: MountView,
@@ -588,8 +620,13 @@ export async function readPath(
     const hashedAt = Date.now();
     const size = Number(info.size);
     const fp: Fingerprint = { ...statFingerprint(info), hashedAt };
-    if (size <= limit) {
-      const bytes = await handle.readFile();
+    // A file within the limit at its fstat is read no further than the limit,
+    // so one that has grown past it since is hashed below, from its start,
+    // never loaded whole. One over the limit at its fstat is hashed below
+    // without that read.
+    const within = size <= limit ? await readPrefix(handle, limit, size) : null;
+    if (within && !within.more) {
+      const { bytes } = within;
       return {
         kind: 'read',
         size: bytes.byteLength,
@@ -1059,7 +1096,11 @@ export async function walkScope(
     }
   }
   // The cap stopped the walk only if it left something: a walk whose last
-  // file used up the cap covered its scope.
+  // file used up the cap covered its scope. A directory the walk didn't list
+  // counts as left, even one that holds nothing it would take (empty, or
+  // only ignored names): telling them apart would take another read. Such a
+  // walk keeps its place and reports the directory as not visited, and the
+  // next one lists it on its way to the wrap.
   if (left === 0 && lastTaken !== undefined && (holdingUntaken.size > 0 || unlisted > 0)) walk.stoppedAfter = lastTaken;
   return walk;
 }

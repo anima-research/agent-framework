@@ -796,6 +796,30 @@ describe("a round that runs code_execution is routed once its scripts return (re
           "the round's prose is kept, as a direct skip_reply keeps it");
       } finally { await h.done(); }
     });
+
+    // With no EventGate, a skip_reply asking for a timed wake is refused, and
+    // the turn goes on. Refused inside the script, it counts as a direct one:
+    // its own round stays private, and the next round's prose is published.
+    it(`${mode}: a skip_reply refused inside the script keeps only its own round private`, async () => {
+      const kept = mode === 'explicit' ? '>>#alpha checking quietly' : 'checking quietly';
+      const said = mode === 'explicit' ? '>>#alpha no timer here, so now' : 'no timer here, so now';
+      const to = mode === 'explicit' ? 'chan-alpha' : 'world:test';
+      const h = await scriptRound(mode, [
+        createMockResponse([
+          { type: 'text', text: kept },
+          scriptCall({ code: 'await skip_reply({"wake_in_seconds": 60})' }),
+        ] as ContentBlock[], 'tool_use'),
+        createMockResponse([{ type: 'text', text: said }] as ContentBlock[]),
+      ]);
+      try {
+        await h.run();
+        assert.ok(!h.log.includes('tool:skip_reply'), 'the host refused the call before the registry saw it');
+        const published = h.log.filter((e) => e.startsWith('publish:'));
+        assert.deepStrictEqual(published, [`publish:no timer here, so now@${to}`],
+          "the refused call's round is kept, and the next round's prose is published");
+        assert.ok(!h.log.some((e) => e.startsWith('chunk:checking quietly')), "nor does the kept round's prose stream");
+      } finally { await h.done(); }
+    });
   }
 
   for (const mode of ['locus', 'hybrid'] as const) it(`${mode}: a send inside the script silences its round and the turn's later prose`, async () => {

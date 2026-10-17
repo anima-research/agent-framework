@@ -1,6 +1,6 @@
 {
   "name": "@animalabs/agent-framework",
-  "version": "0.22.1",
+  "version": "0.22.2",
   "description": "Multi-agent framework with pluggable modules, persistent state, and concurrent tool execution",
   "repository": {
     "type": "git",
@@ -17,7 +17,7 @@
     }
   },
   "files": [
-    "dist",
+    "dist/src",
     "src"
   ],
   "bin": {
@@ -58,7 +58,6 @@
     "@babel/parser": "^7.29.9",
     "@types/node": "^22.0.0",
     "@types/ws": "^8.5.13",
-    "discord.js": "^14.25.1",
     "tsx": "^4.21.0",
     "typescript": "^7.0.2"
   },
