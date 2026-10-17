@@ -53,16 +53,16 @@ agent (then notices append without waking, breaking any loop).
 - The entire "which event may move the agent's voice" question.
 
 Send tools (`send_message` etc.) and channel lifecycle work the same in
-explicit mode as in the other modes. Speaking never opens a channel, so a
-`>>` send into a closed channel publishes there and leaves it closed. Explicit
-mode has no `[delivered]` receipt, so where a turn's `>>` speech stayed in a
-closed channel that isn't a DM, the turn ends with a `[closed channel]` line
-that says so, as a send tool's answer does, unless the agent has turned that
-note off (`agent_settings`' `closed_channel_note`). Speech still being
-delivered when the turn ends gets the line once it has been delivered. A turn
-that ends in an error gets it too. If another turn is under way by then, the
-line waits for that turn's next tool call, where that turn is shown it, or for
-its end.
+explicit mode as in the other modes. A `>>` send into a closed channel opens
+it, with the usual `[channels]` notice, unless the agent closed or declined
+that channel itself: then it publishes there and leaves it closed. Explicit mode has no `[delivered]`
+receipt, so where a turn's `>>` speech stayed in a channel the agent closed or
+declined, the turn ends with a `[closed channel]` line that says so, as a send
+tool's answer does, unless the agent has turned that note off
+(`agent_settings`' `closed_channel_note`). Speech still being delivered when
+the turn ends gets the line once it has been delivered. If another turn is
+under way by then, the line waits for that turn's next tool call, where that
+turn is shown it, or for its end.
 
 ## Teaching the grammar (teach-by-bounce)
 

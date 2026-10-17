@@ -110,9 +110,6 @@ interface ChannelLifecycleEvent {
   epochId?: string;
   wakeCount?: number;
   source?: string;
-  /** kind 'desired-state': the agent answered the channel while it was
-   *  closed (noteAnswered). The next desired-state record drops it. */
-  answered?: true;
   messageId?: string;
   acknowledgment?: string;
 }
@@ -507,18 +504,19 @@ interface ChannelRegistryOptions {
     textLen: number;
   }) => void;
   /**
-   * Called when the subscription policy opened channels WITHOUT the agent
-   * asking (admitting newly discovered channels). The host wires this to drop
-   * a durable notice into the agent's window — the agent must always learn
-   * that new traffic will start flowing, and that `channel_close` opts out
-   * (their decision outranks policy). Fires ONCE per channel ever: the
-   * desired-state decision is durable, so reboots do not re-announce. Must
-   * not trigger inference. Speaking never opens a channel, so no send or
-   * delivery is reported here.
+   * Called when channels were opened WITHOUT the agent asking (subscription
+   * policy admitting a newly discovered channel, or delivery into a closed
+   * locus). The host wires this to drop a durable notice into the agent's
+   * window — the agent must always learn that new traffic will start
+   * flowing, and that `channel_close` opts out (their decision outranks
+   * policy). Fires ONCE per channel ever: the desired-state decision is
+   * durable, so reboots do not re-announce. Must not trigger inference.
    */
   onChannelAutoOpened?: (info: {
+    /** Agent whose action caused the open (delivery); absent for policy opens. */
+    conversationId?: string;
     serverId: string;
-    source: 'subscription-policy';
+    source: 'subscription-policy' | 'opened-by-delivery';
     channels: Array<{ channelId: string; label?: string }>;
   }) => void;
   /**
@@ -564,18 +562,15 @@ export type ChannelToolOrigin =
   | { kind: 'module'; moduleName?: string }
   | { kind: 'agent'; agentName: string };
 
-/** Push tags that mark something other than a new message: a reaction, its
- *  removal, an edit or a deletion. discord-mcpl sends these as pushes from an
- *  open channel too, so on their own they never moved the most recent inbound
- *  channel (notePushDelivered). */
-const NOT_A_NEW_MESSAGE: ReadonlySet<string> = new Set([
-  'chat:reaction', 'chat:reaction-remove', 'chat:edited', 'chat:deleted',
-]);
-
 /** The machine decision sources a module-origin channel_close may record.
  *  Closed on purpose: honest provenance means a small, auditable vocabulary,
  *  not arbitrary self-description. */
 export const MACHINE_CLOSE_SOURCES = new Set(['subscription-gc', 'housekeeping']);
+
+/** The agent's own decisions to keep a channel closed: its channel_close and
+ *  its decline of an invitation. Speech opens a closed channel only where
+ *  nobody decided, or a machine did (openForSpeech); it never undoes these. */
+export const AGENT_CLOSE_SOURCES: ReadonlySet<string> = new Set(['agent-tool', 'invitation-declined']);
 
 export class ChannelRegistry {
   private serverRegistry: McplServerRegistry;
@@ -596,8 +591,9 @@ export class ChannelRegistry {
     textLen: number;
   }) => void;
   private onChannelAutoOpened?: (info: {
+    conversationId?: string;
     serverId: string;
-    source: 'subscription-policy';
+    source: 'subscription-policy' | 'opened-by-delivery';
     channels: Array<{ channelId: string; label?: string }>;
   }) => void;
   private homeChannelResolver?: (agentName: string) => string | undefined;
@@ -686,16 +682,7 @@ export class ChannelRegistry {
     /** Durable wake count for the active tune-out epoch (replayed from
      *  'tune-out-wake' lifecycle records; see recordTuneOutWake). */
     wakeCount?: number;
-    /** The agent answered the channel while it was closed (noteAnswered),
-     *  and nothing has decided about it since. */
-    answered?: true;
   }>();
-  /** Decisions about channels' desired state so far, and each channel's
-   *  latest, so an answer still in flight when a decision about its channel
-   *  is made marks nothing (noteAnswered's `decidedSince`). Every call that
-   *  decides counts, one that keeps the record as it was included. */
-  private decisionCount = 0;
-  private lastDecisionAt = new Map<string, number>();
 
   /** One-time migration inputs from the retired recipe auto-open policy. */
   private legacyPolicies = new Map<string, 'auto' | 'manual' | string[]>();
@@ -1369,12 +1356,6 @@ export class ChannelRegistry {
     return this.findChannelEntry(channelId)?.open === true;
   }
 
-  /** Whether a channel is a DM by what the registry knows of it: its
-   *  metadata, or the id and label shapes DMs take (isDmChannelId). */
-  isDirectMessageChannel(channelId: string): boolean {
-    return this.isDmChannelId(channelId);
-  }
-
   getDesiredState(serverId: string, channelId: string): DesiredChannelState | undefined {
     return this.desiredStates.get(this.lifecycleKey(serverId, channelId))?.state;
   }
@@ -1604,7 +1585,6 @@ export class ChannelRegistry {
             source: typeof event.source === "string" ? event.source : "unknown",
             tuneOut: event.desired === 'tuned-out' ? event.tuneOut : undefined,
             wakeCount: 0,
-            ...(event.answered === true ? { answered: true as const } : {}),
           },
         );
       } else if (
@@ -1972,19 +1952,22 @@ export class ChannelRegistry {
     source: string,
   ): void {
     const key = this.lifecycleKey(serverId, channelId);
-    this.lastDecisionAt.set(key, ++this.decisionCount);
     const current = this.desiredStates.get(key);
-    let recorded = source;
+    // A machine's close isn't a decision: of a channel with no record (one
+    // registered lazily, or on a server whose grant lacks channels.lifecycle),
+    // it records the default that channel already had, so policy and
+    // bootstrap can still lift it (#417).
+    let recorded = !current && desired === 'closed' && MACHINE_CLOSE_SOURCES.has(source) ? 'default-closed' : source;
     if (current?.state === desired) {
       // The same state keeps the decision on record, except that the agent's
-      // own close or decline replaces a pure default, so it sticks: policy
-      // and bootstrap lift only 'default-closed'. A machine source never
-      // replaces one, so what nobody decided stays liftable. Either way the
-      // write ends an answer (noteAnswered), as a close ended main's open.
-      recorded = current.source === 'default-closed' && !MACHINE_CLOSE_SOURCES.has(source)
-        ? source
-        : current.source;
-      if (recorded === current.source && !current.answered) return;
+      // own close or decline replaces a pure default or a machine's close, so
+      // it sticks: policy and bootstrap lift only 'default-closed', and speech
+      // opens only what the agent didn't close itself (openForSpeech). A
+      // machine source never replaces one, so what nobody decided stays
+      // liftable.
+      const replaceable = current.source === 'default-closed' || MACHINE_CLOSE_SOURCES.has(current.source);
+      recorded = replaceable && AGENT_CLOSE_SOURCES.has(source) ? source : current.source;
+      if (recorded === current.source) return;
     }
     this.desiredStates.set(key, { state: desired, source: recorded });
     this.appendLifecycleEvent({
@@ -1995,77 +1978,6 @@ export class ChannelRegistry {
       source: recorded,
       timestamp: new Date().toISOString(),
     });
-  }
-
-  /** How many decisions about channels' desired state the registry has
-   *  taken: read before a publish or a send, and passed to noteAnswered after. */
-  decisionSequence(): number {
-    return this.decisionCount;
-  }
-
-  /**
-   * The agent's speech, or a send tool's call, delivered into this channel
-   * while it was closed. Speaking never opens a channel, but where the
-   * agent's next turn with no trigger speaks follows the channels it answered,
-   * as it did when answering opened them: a push from an answered channel
-   * moves the most recent inbound channel (notePushDelivered), as an open
-   * channel's channels/incoming does. Kept on the desired-state record, so it
-   * survives a restart, until the next decision about the channel: an open,
-   * a close, a decline or a tune-out. A decision made while the answer was
-   * in flight, after `decidedSince` (decisionSequence() taken before it was
-   * sent), stands too: the answer marks nothing, as when the agent closes a
-   * channel in the same round it answers there. It runs after a delivered
-   * publish, so a store that fails to record it is logged, not thrown: the
-   * publish stands, and the mark holds until this process ends.
-   */
-  noteAnswered(channelId: string, serverId: string, decidedSince: number): void {
-    const entry = this.channels.get(`${serverId}:${channelId}`);
-    if (!entry || entry.open) return;
-    const key = this.lifecycleKey(serverId, channelId);
-    if ((this.lastDecisionAt.get(key) ?? 0) > decidedSince) return;
-    const current = this.desiredStates.get(key);
-    if (current?.answered || current?.state === 'tuned-out') return;
-    const state = current?.state ?? 'closed';
-    const source = current?.source ?? 'default-closed';
-    this.desiredStates.set(key, { ...current, state, source, answered: true });
-    try {
-      this.appendLifecycleEvent({
-        kind: 'desired-state',
-        serverId,
-        channelId,
-        desired: state,
-        source,
-        answered: true,
-        timestamp: new Date().toISOString(),
-      });
-    } catch (error) {
-      console.error(`[channel] answered mark for ${logValue(channelId)} not recorded: ${logDetail((error as Error).message)}`);
-    }
-  }
-
-  /**
-   * A push was accepted from this channel. One from a channel the agent
-   * answered while it was closed (noteAnswered), and that is closed still, is
-   * where the last message came in, as an accepted channels/incoming message
-   * is (markAccepted), so a turn with no trigger speaks there. Once the
-   * channel's transport is open, its messages arrive as channels/incoming and
-   * move it there. A push from any other channel moves nothing, as before,
-   * and neither does a reaction, an edit or a deletion: those arrive as pushes
-   * from an open channel too, and never moved it.
-   */
-  notePushDelivered(
-    serverId: string,
-    channelId: string,
-    messageId?: string,
-    threadId?: string,
-    tags?: readonly string[],
-  ): void {
-    if (!this.desiredStates.get(this.lifecycleKey(serverId, channelId))?.answered) return;
-    if (this.channels.get(`${serverId}:${channelId}`)?.open) return;
-    if (tags?.some((t) => NOT_A_NEW_MESSAGE.has(t))) return;
-    this.defaultPublishChannel = channelId;
-    this.defaultPublishMessageId = messageId ?? null;
-    this.defaultPublishThreadId = threadId;
   }
 
   // ==========================================================================
@@ -2085,7 +1997,6 @@ export class ChannelRegistry {
     source: string,
   ): void {
     const key = this.lifecycleKey(serverId, channelId);
-    this.lastDecisionAt.set(key, ++this.decisionCount);
     this.desiredStates.set(key, {
       state: 'tuned-out',
       source,
@@ -2119,7 +2030,6 @@ export class ChannelRegistry {
     const current = this.desiredStates.get(key);
     if (current?.state !== 'tuned-out' || !current.tuneOut) return null;
     const ended = { params: current.tuneOut, wakeCount: current.wakeCount ?? 0 };
-    this.lastDecisionAt.set(key, ++this.decisionCount);
     this.desiredStates.set(key, { state: nextState, source });
     this.appendLifecycleEvent({
       kind: 'desired-state',
@@ -2500,13 +2410,14 @@ export class ChannelRegistry {
   }
 
   /**
-   * The open executor behind the agent's channel_open tool: record durable
-   * desired-open intent, tell the server to subscribe, mark the live entry
-   * open. Speaking never opens a channel, so no send or delivery comes here:
-   * an agent's speech into a closed channel publishes, and the channel's
-   * open state and recorded decision stay as they were. Desired state is
-   * recorded BEFORE the server round-trip: intent sticks even if the
-   * subscribe fails, and reconciliation retries later.
+   * The single open executor: record durable desired-open intent, tell the
+   * server to subscribe, mark the live entry open. Every path that opens a
+   * channel — the agent's channel_open tool, and speech or an explicit send
+   * into a closed channel nobody decided to keep closed (openForSpeech) —
+   * funnels here, so lifecycle events, desired state, and live state can
+   * never diverge by path.
+   * Desired state is recorded BEFORE the server round-trip: intent sticks
+   * even if the subscribe fails, and reconciliation retries later.
    */
   private async openChannelNow(
     entry: ChannelEntry,
@@ -2719,11 +2630,8 @@ export class ChannelRegistry {
    * MCPL id, or the raw server-internal id (`address.channelId`), since send
    * tools receive whatever the agent typed. Matches on `serverId` when it is
    * given, across every server otherwise, and is undefined when nothing
-   * matches or more than one channel does. A lookup only: speaking never
-   * opens a channel, so a send into a closed channel leaves it closed, and
-   * its recorded decision as it was. Typing indicators don't depend on a
-   * channel being open; opening subscribes to its ongoing traffic (on
-   * discord-mcpl, its reactions too).
+   * matches or more than one channel does. A lookup only; openForSpeech
+   * decides whether the send opens it.
    */
   resolveSendTarget(channelId: string, serverId?: string): string | undefined {
     let matches = [...this.channels.values()].filter(
@@ -2737,6 +2645,64 @@ export class ChannelRegistry {
       );
     }
     return matches.length === 1 ? matches[0]!.descriptor.id : undefined;
+  }
+
+  /**
+   * How the agent kept this channel closed itself, if it did: 'closed' for
+   * its channel_close, 'declined' for its channel_decline. Its speech there
+   * leaves such a channel closed (openForSpeech).
+   */
+  closedByAgent(serverId: string, channelId: string): 'closed' | 'declined' | undefined {
+    const current = this.desiredStates.get(this.lifecycleKey(serverId, channelId));
+    if (current?.state !== 'closed') return undefined;
+    if (current.source === 'agent-tool') return 'closed';
+    if (current.source === 'invitation-declined') return 'declined';
+    return undefined;
+  }
+
+  /** Whether this server's grant lets channels open and close at all
+   *  (channels.lifecycle, §14.1): without it, channel_open fails. */
+  canOpenChannels(serverId: string): boolean {
+    const server = this.serverRegistry.getServer(serverId);
+    return !!server && CapabilityGrant.of(server).has('channels.lifecycle');
+  }
+
+  /**
+   * Open a channel because the agent's words were delivered into it (routed
+   * speech, or an explicit send tool), so typing indicators, reaction
+   * machinery and inbound forwarding come alive with the reply. Only a
+   * channel nobody decided to keep closed opens: one with no decision on
+   * record, a pure default, or a machine's close (subscription-gc,
+   * housekeeping). The agent's own close or decline stands, and so does a
+   * tune-out; a channel decided open whose transport is down is
+   * reconciliation's to reopen, so its decision keeps its source. A failed
+   * open is traced and reported, and never stops the words: they're
+   * delivered either way.
+   */
+  async openForSpeech(
+    serverId: string,
+    channelId: string,
+    source: 'opened-by-delivery' | 'opened-by-reply',
+  ): Promise<'opened' | 'not-opened' | 'open-failed' | 'unknown-channel'> {
+    const entry = this.channels.get(`${serverId}:${channelId}`);
+    if (!entry) return 'unknown-channel';
+    if (entry.open) return 'not-opened';
+    const current = this.desiredStates.get(this.lifecycleKey(serverId, channelId));
+    if (current?.state === 'open' || current?.state === 'tuned-out') return 'not-opened';
+    if (current?.state === 'closed' && AGENT_CLOSE_SOURCES.has(current.source)) return 'not-opened';
+    try {
+      await this.openChannelNow(entry, source);
+      this.emitTraceFn({ type: 'mcpl:channel-opened-by-send', serverId, channelId });
+      return 'opened';
+    } catch (err) {
+      this.emitTraceFn({
+        type: 'mcpl:channel-open-failed',
+        serverId,
+        channelId,
+        error: (err as Error).message,
+      });
+      return 'open-failed';
+    }
   }
 
   private async handleToolOpen(input: {
@@ -2856,9 +2822,10 @@ export class ChannelRegistry {
 
     const alreadyDesiredClosed = this.getDesiredState(entry.serverId, input.channelId) === 'closed';
     if (!entry.open && alreadyDesiredClosed) {
-      // Nothing to send, but a close of a channel nobody decided about is
-      // still a decision: recording it keeps policy and bootstrap, which lift
-      // only a pure default, from opening the channel later.
+      // Nothing to send, but the agent's close of a channel nobody decided
+      // about, or a machine closed, is still its decision: recording it keeps
+      // policy and bootstrap, which lift only a pure default, and the agent's
+      // own speech there (openForSpeech) from opening the channel later.
       this.setDesiredState(entry.serverId, input.channelId, 'closed', closeSource);
       return {
         success: true,
@@ -3195,12 +3162,36 @@ export class ChannelRegistry {
       return fail(channelId, `no registered channel for locus "${channelId}"`);
     }
 
-    // Speaking never opens a channel: speech into a closed but registered
-    // locus (such as a DM that woke the agent) publishes, and the channel's
-    // open state and recorded decision stay as they were. Publishing doesn't
-    // need an open channel, and neither does typing; opening subscribes to
-    // the channel's ongoing traffic (on discord-mcpl, its reactions too),
-    // which is channel_open's.
+    // Speech routed into a closed but registered locus (the canonical case:
+    // a DM that woke the agent; DMs register closed) opens the channel
+    // first, so typing indicators, reaction machinery and inbound forwarding
+    // come alive with the reply, unless the agent closed or declined it
+    // itself (openForSpeech). A failed open doesn't stop the words: a server
+    // whose grant lacks channels.lifecycle can't open a channel at all, and
+    // a dead transport fails the publish below, which the agent is told.
+    if (!entry.open) {
+      const opened = await this.openForSpeech(entry.serverId, channelId, 'opened-by-delivery');
+      if (opened === 'opened') {
+        console.error(
+          `[routeSpeech] ${conversationId}: locus ${logValue(channelId)} was closed — opened by delivery (speech implies engagement)`,
+        );
+        try {
+          this.onChannelAutoOpened?.({
+            conversationId,
+            serverId: entry.serverId,
+            source: 'opened-by-delivery',
+            channels: [{ channelId, label: entry.descriptor.label }],
+          });
+        } catch (err) {
+          console.error('onChannelAutoOpened (delivery) failed:', err);
+        }
+      } else if (opened === 'open-failed') {
+        console.error(
+          `[routeSpeech] ${conversationId}: locus ${logValue(channelId)} is closed and its open failed; publishing anyway`,
+        );
+      }
+    }
+
     const server = this.serverRegistry.getServer(entry.serverId);
     if (!server) {
       return fail(channelId, `server "${entry.serverId}" not found`);
@@ -3217,8 +3208,14 @@ export class ChannelRegistry {
       channelId,
       content: [{ type: 'text', text }],
     };
-    const decidedSince = this.decisionCount;
-    const result = await server.sendChannelsPublish(publishParams);
+    let result: unknown;
+    try {
+      result = await server.sendChannelsPublish(publishParams);
+    } catch (err) {
+      // A thrown publish is a failed route, which the agent is told, as a
+      // refused one is.
+      return fail(channelId, `publish failed: ${(err as Error).message}`);
+    }
     const delivered = (result as { delivered?: boolean } | undefined)?.delivered ?? true;
     // Surface the posted message's id (ChannelsPublishResult.messageId) so
     // trace consumers can act on the just-posted message — e.g. a TTS-relay
@@ -3232,9 +3229,6 @@ export class ChannelRegistry {
     if (delivered === false) {
       return fail(channelId, `server "${entry.serverId}" reported delivered:false for "${channelId}"`);
     }
-    // Answering a closed channel leaves it closed, and where a turn with no
-    // trigger speaks still follows the agent there (noteAnswered).
-    if (!entry.open) this.noteAnswered(channelId, entry.serverId, decidedSince);
 
     console.error(`[routeSpeech] ${conversationId}: routed ${text.length} chars -> ${logValue(channelId)} (server=${entry.serverId}, delivered=${delivered})`);
     this.emitTraceFn({

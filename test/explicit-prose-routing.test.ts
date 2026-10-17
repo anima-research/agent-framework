@@ -1418,8 +1418,8 @@ describe('explicit prose routing', () => {
     await framework.stop();
   });
 
-  /** A registry stub for the closed-channel note: #cafe is closed, laria's DM
-   *  is closed and the registry knows it as a DM, and #alpha is open. */
+  /** A registry stub for the closed-channel note: the agent closed #cafe,
+   *  laria's DM is closed and nobody decided about it, and #alpha is open. */
   function closedNoteRegistry(framework: AgentFramework, held?: Promise<void> | ((locus: string | null) => Promise<void> | undefined)) {
     const routed: Array<{ text: string; locus: string | null }> = [];
     const known: Record<string, { channelId: string; label: string }> = {
@@ -1439,7 +1439,8 @@ describe('explicit prose routing', () => {
       resolveLocus: () => 'chan-alpha',
       getDefaultPublishChannel: () => null,
       isChannelOpen: (id: string) => id === 'chan-alpha',
-      isDirectMessageChannel: (id: string) => id === 'discord:dm:99',
+      closedByAgent: (_server: string, id: string) => (id === 'discord:g:cafe' ? 'closed' : undefined),
+      canOpenChannels: () => true,
       getDescriptor: (id: string) => (labels[id] ? { label: labels[id] } : undefined),
       getChannelServerId: () => 'discord',
       getChannelTools: () => [],
@@ -1450,7 +1451,7 @@ describe('explicit prose routing', () => {
     return routed;
   }
 
-  const CAFE_NOTE = "[closed channel] #cafe (discord:g:cafe) stays closed: speaking into a closed channel doesn't open it. " +
+  const CAFE_NOTE = "[closed channel] #cafe (discord:g:cafe) stays closed: you closed it, and your words there don't open it. " +
     'Messages there that address you, such as an @-mention, still reach you; ' +
     'channel_open with channelId "discord:g:cafe" and serverId "discord" opens it. ' +
     'To stop this note, set closed_channel_note to false with agent_settings.';
@@ -1460,7 +1461,7 @@ describe('explicit prose routing', () => {
       .flatMap((m) => m.content.flatMap((b) => (b.type === 'text' ? [b.text] : [])));
   }
 
-  it("speech that stays in a closed channel ends the turn with the closed-channel note alone, and a DM's or an open channel's gets none", async () => {
+  it("speech into a channel the agent closed ends the turn with the closed-channel note alone, and anywhere else gets none", async () => {
     membrane.pushResponse(createMockResponse([
       { type: 'text', text: '>>#cafe hello there\n>>@laria and you\n>>#alpha and everyone' },
     ] as ContentBlock[]));
@@ -1608,53 +1609,7 @@ describe('explicit prose routing', () => {
     }
   });
 
-  it('a turn that fails after its speech stayed in a closed channel still gets the note', async () => {
-    // Its speech is delivered at the tool call, and the round after the tool
-    // fails for good instead of completing: a 400, which the framework doesn't retry.
-    membrane.pushResponse(createMockResponse([
-      { type: 'text', text: '>>#cafe heading out now' },
-      { type: 'tool_use', id: 'f1', name: 'robot--move', input: { dir: 'out' } },
-    ] as ContentBlock[], 'tool_use'));
-    membrane.pushResponse(createMockResponse([] as ContentBlock[]));
-    const framework = await createFramework();
-    const routed = closedNoteRegistry(framework);
-    const makeStream = membrane.streamYielding.bind(membrane);
-    let streams = 0;
-    membrane.streamYielding = (request, options) => {
-      const stream = makeStream(request, options);
-      streams++;
-      const iterate = stream[Symbol.asyncIterator].bind(stream);
-      stream[Symbol.asyncIterator] = async function* () {
-        for await (const event of { [Symbol.asyncIterator]: iterate }) {
-          if (event.type === 'complete') {
-            yield {
-              type: 'error' as const,
-              error: new MembraneError({
-                type: 'invalid_request', retryable: false, httpStatus: 400,
-                message: 'synthetic invalid request', rawError: { status: 400 }, rawRequest: request,
-              }),
-            };
-            return;
-          }
-          yield event;
-        }
-      };
-      return stream;
-    };
-
-    trigger(framework);
-    await framework.runUntilIdle();
-    for (const end = Date.now() + 5000; !windowTexts(framework).includes(CAFE_NOTE) && Date.now() < end;) {
-      await new Promise<void>((resolve) => setTimeout(resolve, 5));
-    }
-
-    assert.equal(streams, 1, 'the failure was not retried');
-    assert.deepEqual(routed.map((r) => r.locus), ['discord:g:cafe']);
-    assert.deepEqual(windowTexts(framework).filter((t) => t.startsWith('[closed channel]')), [CAFE_NOTE]);
-    await framework.stop();
-  });
-
-  it("in hybrid mode, speech that stays in a closed channel ends the turn's delivery line with the note", async () => {
+  it("in hybrid mode, speech into a channel the agent closed ends the turn's delivery line with the note", async () => {
     membrane.pushResponse(createMockResponse([
       { type: 'text', text: '>>>#cafe hello there' },
     ] as ContentBlock[]));

@@ -244,22 +244,16 @@ test('speech routed into a closed channel names the channel as one field on each
     sendChannelsPublish: async () => ({ delivered: true }),
     sendChannelsOpen: async () => ({}),
   };
-  // A store that can't record the channel's answered mark, so its line prints too.
-  const store = {
-    registerState: () => {},
-    getStateJson: () => null,
-    appendToStateJson: () => { throw new Error('disk full\nreason=forged'); },
-  };
   const registry = new ChannelRegistry(
-    { getServer: () => server } as unknown as McplServerRegistry, {} as FeatureSetManager, () => {}, () => {}, { store: store as never },
+    { getServer: () => server } as unknown as McplServerRegistry, {} as FeatureSetManager, () => {}, () => {}, {},
   );
   (registry as unknown as { channels: Map<string, unknown> }).channels.set(`editor:${FORGED_CHANNEL}`, {
     serverId: 'editor', descriptor: { id: FORGED_CHANNEL, type: 'discord', label: 'chat' }, open: false,
   });
   const routed = await registry.routeSpeech('agent', 'hello', FORGED_CHANNEL);
-  assert.equal(routed?.delivered, true, 'the publish stands when the mark is not recorded');
-  assert.deepEqual(lines.filter((l) => l.startsWith('[routeSpeech]') || l.startsWith('[channel]')), [
-    `[channel] answered mark for ${field(FORGED_CHANNEL)} not recorded: ${logDetail('disk full\nreason=forged')}`,
+  assert.equal(routed?.delivered, true);
+  assert.deepEqual(lines.filter((l) => l.startsWith('[routeSpeech]')), [
+    `[routeSpeech] agent: locus ${field(FORGED_CHANNEL)} was closed — opened by delivery (speech implies engagement)`,
     `[routeSpeech] agent: routed 5 chars -> ${field(FORGED_CHANNEL)} (server=editor, delivered=true)`,
   ]);
 });

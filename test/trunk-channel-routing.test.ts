@@ -47,7 +47,6 @@ function internals(framework: AgentFramework) {
     channelRegistry: unknown;
     handleMcplPushEvent(event: unknown): void;
     handleMcplChannelIncoming(event: unknown): Promise<unknown>;
-    closedChannelNotes(agentName: string, channelIds: Iterable<string>): string[];
   };
 }
 
@@ -301,7 +300,7 @@ describe('Trunk channel routing (item-3 redux)', () => {
     const t2 = textOf(fw2);
     assert.doesNotMatch(t2, /prefixed with ">>/);
     assert.match(t2, /no single-word target reaches this channel unambiguously/);
-    assert.match(t2, /check whether discord exposes a send tool that can address it\. Note: follow-ups to your reply will NOT reach you/,
+    assert.match(t2, /check whether discord exposes a send tool that can address it\.\n/,
       'replying needs no join, and the hint promises no tool');
     assert.match(t2, /channel_open with channelId "discord:dm:1555"/, 'joining stays available');
     await fw2.stop();
@@ -321,9 +320,9 @@ describe('Trunk channel routing (item-3 redux)', () => {
   });
 
   it('a direct message carries no invitation: all of a DM reaches the agent, open or closed', async () => {
-    // Speaking never opens a channel, so a DM the agent has answered stays closed. An invitation
-    // on each DM would repeat a block whose premise is false there: there is no other traffic
-    // to miss, and nothing to join.
+    // A DM registers closed, and stays closed until the agent answers it, or for good once the
+    // agent closes it. An invitation on its messages would repeat a block whose premise is false
+    // there: there is no other traffic to miss, and nothing to join.
     const framework = await makeFramework();
     const i = internals(framework);
     i.channelRegistry = {
@@ -390,53 +389,6 @@ describe('Trunk channel routing (item-3 redux)', () => {
     await incomingOn('discord:dm:1555', 'antra: and one in private', ['chat:dm', 'chat:addressed', 'chat:private']);
     assert.match(lastText(), /one in private/);
     assert.doesNotMatch(lastText(), /Channel invitation/);
-    await framework.stop();
-  });
-
-  it("a whisper's chat:dm tag doesn't make its channel a DM: words left in that closed channel still get the note", async () => {
-    // A chat:dm tag describes one message. eidoverse-worlds tags a whisper inside
-    // its shared world channel that way, on either delivery path.
-    const framework = await makeFramework();
-    const i = internals(framework);
-    const world = 'eido:world:plaza';
-    i.channelRegistry = {
-      ensureChannelRegistered: () => {},
-      isChannelOpen: () => false,
-      isDirectMessageChannel: () => false,
-      getDesiredState: () => undefined,
-      getDescriptor: () => ({ label: '#plaza', capabilities: { history: { maxMessages: 80 } } }),
-      getChannelServerId: () => 'eido',
-      proseTargetFor: () => '#plaza',
-      stopAll: () => {},
-    };
-    const whisper = ['chat:dm', 'chat:private', 'chat:addressed'];
-    i.handleMcplPushEvent({
-      type: 'mcpl:push-event',
-      serverId: 'eido',
-      featureSet: 'eido.chat',
-      eventId: 'eido_w1',
-      content: [{ type: 'text', text: 'mira (whispering): over here' }],
-      origin: { source: 'eido', messageId: 'w1', mcplChannelId: world, authorName: 'mira' },
-      tags: whisper,
-      timestamp: new Date().toISOString(),
-      inferenceId: 'iw1',
-      triggerInference: false,
-    });
-    await i.handleMcplChannelIncoming({
-      type: 'mcpl:channel-incoming',
-      serverId: 'eido',
-      channelId: world,
-      messageId: 'w2',
-      author: { id: 'U9', name: 'mira' },
-      content: [{ type: 'text', text: 'mira (whispering): and again' }],
-      timestamp: new Date().toISOString(),
-      metadata: {},
-      tags: whisper,
-      triggerInference: false,
-    });
-    const notes = i.closedChannelNotes('scout', [world]);
-    assert.equal(notes.length, 1, 'the note is still given there');
-    assert.match(notes[0]!, /^#plaza \(eido:world:plaza\) stays closed/);
     await framework.stop();
   });
 

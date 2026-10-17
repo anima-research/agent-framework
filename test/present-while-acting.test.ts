@@ -1500,12 +1500,11 @@ describe('present while acting', () => {
     framework.mcplServerConfigs = new Map([['chat', { id: 'chat', toolPrefix: 'chat' }]]);
     framework.mcplToolFeatureSets = new Map();
     framework.checkpointManager = null;
-    // Speaking opens nothing: a send resolves its target and marks it answered.
+    // The send resolves its target, and opens it if it's closed and the agent
+    // didn't close it: here it's open, so its answer carries no note either.
     framework.channelRegistry = {
-      decisionSequence: () => 0,
       resolveSendTarget: (target: string) => target,
-      noteAnswered: () => {},
-      // An open channel, so the send's answer carries no closed-channel note.
+      openForSpeech: async () => 'not-opened',
       isChannelOpen: () => true,
     };
     framework.turnRouting = new Map([['assistant', sending]]);
