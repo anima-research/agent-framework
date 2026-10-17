@@ -37,6 +37,22 @@ function autobiographical(): AutobiographicalStrategy {
   });
 }
 
+/** A promise the test settles, which records whether anything has waited on
+ *  it through `then` (Promise.allSettled does), so a test can check that a
+ *  wait was reached instead of sleeping and hoping it was. */
+const watchedPromise = () => {
+  let settle!: () => void;
+  const promise = new Promise<void>((resolve) => { settle = resolve; });
+  let waitedOn = false;
+  const then = promise.then.bind(promise) as (onFulfilled?: unknown, onRejected?: unknown) => Promise<unknown>;
+  Object.defineProperty(promise, 'then', {
+    value: (onFulfilled?: unknown, onRejected?: unknown) => { waitedOn = true; return then(onFulfilled, onRejected); },
+  });
+  return { promise, settle, waited: () => waitedOn };
+};
+/** Let every queued microtask run (setImmediate's callback runs after them). */
+const settled = () => new Promise<void>((resolve) => { setImmediate(resolve); });
+
 type Internals = {
   surgeryHold: { verb: string } | null;
   activeTurnTokens: Map<string, number>;
@@ -78,22 +94,6 @@ describe('after a branch move, every agent on the store compiles without a resta
   const reinitAlerts = () => traces.filter(
     (t): t is Extract<TraceEvent, { type: 'ops:alert' }> => t.type === 'ops:alert' && t.kind === 'context-reinit-failed',
   );
-  /** A promise the test settles, which records whether anything has waited on
-   *  it through `then` (Promise.allSettled does), so a test can check that a
-   *  wait was reached instead of sleeping and hoping it was. */
-  const watchedPromise = () => {
-    let settle!: () => void;
-    const promise = new Promise<void>((resolve) => { settle = resolve; });
-    let waitedOn = false;
-    const then = promise.then.bind(promise) as (onFulfilled?: unknown, onRejected?: unknown) => Promise<unknown>;
-    Object.defineProperty(promise, 'then', {
-      value: (onFulfilled?: unknown, onRejected?: unknown) => { waitedOn = true; return then(onFulfilled, onRejected); },
-    });
-    return { promise, settle, waited: () => waitedOn };
-  };
-  /** Let every queued microtask run (setImmediate's callback runs after them). */
-  const settled = () => new Promise<void>((resolve) => { setImmediate(resolve); });
-
   beforeEach(async () => {
     tempDir = mkdtempSync(join(tmpdir(), 'reinit-after-move-'));
     membrane = new MockMembrane();
@@ -503,6 +503,26 @@ describe('after a branch move, every agent on the store compiles without a resta
       settle();
       fw.maintenancePass = null;
     }
+    await works('a');
+    await works('b');
+  });
+
+  it("an undo's managers re-initialize one at a time, with a turn of the event loop between them", async () => {
+    checkpointTurn();
+    const calls: string[] = [];
+    for (const name of ['a', 'b']) {
+      const cm = cmOf(name) as unknown as { setStrategy: (s: unknown) => Promise<void> };
+      const setStrategy = cm.setStrategy.bind(cm);
+      cm.setStrategy = (strategy: unknown) => { calls.push(name); return setStrategy(strategy); };
+    }
+    framework.undoLastTurn('a');
+    assert.deepEqual(calls, [], 'no manager re-initializes inside undoLastTurn()');
+    // An immediate queued now runs on the event loop's next turn: before the
+    // last manager re-initializes, since each waits for a turn of its own.
+    const before = await new Promise<number>((resolve) => { setImmediate(() => resolve(calls.length)); });
+    assert.ok(before < 2, `the event loop ran while the managers re-initialized (${before} of 2 had when it did)`);
+    await reinitDone();
+    assert.deepEqual(calls.sort(), ['a', 'b']);
     await works('a');
     await works('b');
   });
@@ -1226,24 +1246,18 @@ describe('conversation forks and an undo', () => {
         await gate;
         throw new Error('injected refusal after the store moved');
       };
-      // a-late-g1's own re-initialization in that pass finishes before the
-      // second undo, so the pass judges it, rather than skipping it as failed.
-      const cmLate = framework.getAgent('a-late-g1')!.getContextManager() as unknown as { setStrategy: (s: unknown) => Promise<void> };
-      const setLateStrategy = cmLate.setStrategy.bind(cmLate);
-      let lateDone!: () => void;
-      const lateReinitialized = new Promise<void>((resolve) => { lateDone = resolve; });
-      cmLate.setStrategy = (s: unknown) => setLateStrategy(s).finally(lateDone);
+      // The managers re-initialize one at a time, the template first, so
+      // a-late-g1's comes after the second undo has joined, and the pass
+      // judges it, rather than skipping it as failed.
       try {
         assert.equal(framework.undoLastTurn('a').undone, true, 'the first undo keeps a-late-g1 its history');
         const running = internals.syncMoveReinit!;
         await reached; // the first pass is re-initializing the template
-        await lateReinitialized;
         assert.equal(framework.undoLastTurn('a').undone, true, 'the second undo joins, to before a-late-g1 was spawned');
         release();
         await running.done;
       } finally {
         strategy.initialize = initialize;
-        cmLate.setStrategy = setLateStrategy;
       }
       assert.deepEqual(alerts.filter((alert) => alert.kind === 'context-reinit-failed'), [], 'nothing reported: the refusal came in a pass a move joined');
       assert.ok(framework.getAgent('a-late-g1'), 'not disposed');
@@ -1332,6 +1346,135 @@ describe('conversation forks and an undo', () => {
       });
     });
   }
+
+  type Placement = { agent: string; messageId?: string; deferredId?: string };
+  type HoldInternals = ForkInternals & {
+    maintenancePass: Promise<void> | null;
+    handleMcplChannelIncoming(event: unknown): Promise<Placement | undefined>;
+    resolvePlacement(placement: Placement): void;
+    lastConversationSweep: number;
+    sweepExpiredConversations(): void;
+  };
+  const channelMessage = (channelId: string, text: string, extra: Record<string, unknown> = {}) => ({
+    type: 'mcpl:channel-incoming',
+    serverId: 'world',
+    channelId,
+    messageId: `m-${text.toLowerCase().replace(/\W+/g, '-')}`,
+    author: { id: 'U1', name: 'alice' },
+    content: [{ type: 'text', text }],
+    timestamp: new Date().toISOString(),
+    metadata: { mentioned: true },
+    triggerInference: false,
+    ...extra,
+  });
+  const storedTexts = (cm: ContextManager): string[] => cm.getAllMessages().flatMap((m) => m.content)
+    .filter((b): b is { type: 'text'; text: string } => (b as { type: string }).type === 'text')
+    .map((b) => b.text);
+  /** Hold a maintenance pass across `move()`, run `during()` while the move
+   *  waits for it, then let it go and wait for the move to finish. */
+  const duringMaintenanceWait = async (internals: HoldInternals, move: () => Promise<unknown>, during: () => Promise<void>): Promise<void> => {
+    const { promise: pass, settle, waited } = watchedPromise();
+    internals.maintenancePass = pass;
+    let moved: Promise<unknown> | undefined;
+    try {
+      moved = move();
+      await settled();
+      assert.ok(waited(), 'the move waits on the running maintenance pass');
+      await during();
+    } finally {
+      settle();
+      internals.maintenancePass = null;
+    }
+    await moved;
+    await internals.syncMoveReinit?.done;
+  };
+
+  it("while an undo waits for running maintenance, a fork's channel message and a correction for it are deferred, and land after it's seeded again", { timeout: 30_000 }, async () => {
+    await withForks('reinit-fork-hold-writes-', async (framework, forkInternals) => {
+      await forksAroundACheckpoint(framework, forkInternals);
+      const internals = forkInternals as unknown as HoldInternals;
+      const placements: Array<Placement | undefined> = [];
+      await duringMaintenanceWait(internals, async () => assert.equal(framework.undoLastTurn('a').undone, true), async () => {
+        placements.push(await internals.handleMcplChannelIncoming(channelMessage('world:late', 'MESSAGE DURING THE UNDO')));
+        placements.push(await internals.handleMcplChannelIncoming(channelMessage('world:late', 'CORRECTION DURING THE UNDO', { deliverTo: 'a-late-g1' })));
+        for (const placement of placements) {
+          assert.ok(placement?.deferredId && !placement.messageId, `deferred, not stored: ${JSON.stringify(placement)}`);
+        }
+        assert.deepEqual(storedTexts(framework.getAgent('a-late-g1')!.getContextManager()), [], 'nothing written into the emptied fork during the wait');
+      });
+      assert.deepEqual(await textsOf(framework, 'a-late-g1'), ['hello a', 'MESSAGE DURING THE UNDO', 'CORRECTION DURING THE UNDO'],
+        'seeded from the template on the landed branch, then the two writes');
+      for (const placement of placements) {
+        internals.resolvePlacement(placement!);
+        assert.ok(placement!.messageId && !placement!.deferredId, `the placement resolves to the stored message: ${JSON.stringify(placement)}`);
+      }
+    });
+  });
+
+  it("while an undo waits for running maintenance, a fork's idle-TTL closure prompt is deferred, and lands after it's seeded again", { timeout: 30_000 }, async () => {
+    await withForks('reinit-fork-hold-closure-', async (framework, forkInternals) => {
+      await forksAroundACheckpoint(framework, forkInternals);
+      const internals = forkInternals as unknown as HoldInternals;
+      const late = framework.getAgent('a-late-g1')!.getContextManager();
+      const prompt = framework.getConversationRouter()!.closurePrompt;
+      await duringMaintenanceWait(internals, async () => assert.equal(framework.undoLastTurn('a').undone, true), async () => {
+        framework.getConversationRouter()!.getBinding('world:late')!.lastActivity = 0;
+        internals.lastConversationSweep = 0;
+        internals.sweepExpiredConversations();
+        assert.deepEqual(storedTexts(late), [], 'the closure prompt is not written into the emptied fork during the wait');
+      });
+      const texts = storedTexts(late);
+      assert.deepEqual(texts.slice(0, 2), ['hello a', prompt], `seeded first, then the closure prompt: ${JSON.stringify(texts)}`);
+    });
+  });
+
+  it("while a rollback waits for running maintenance, a fork's channel message is deferred, and lands on the branch the rollback moves to", { timeout: 30_000 }, async () => {
+    await withForks('reinit-fork-hold-rollback-', async (framework, forkInternals) => {
+      await forksAroundACheckpoint(framework, forkInternals);
+      const internals = forkInternals as unknown as HoldInternals;
+      const point = framework.getAgent('a')!.getContextManager().getAllMessages()
+        .find((m) => m.content.some((b) => (b as { text?: string }).text === 'hello a'))!;
+      const source = framework.getStore().currentBranch().name;
+      let placement: Placement | undefined;
+      await duringMaintenanceWait(internals, () => framework.rollbackToMessage('a', { messageId: point.id }), async () => {
+        placement = await internals.handleMcplChannelIncoming(channelMessage('world:early', 'MESSAGE DURING THE ROLLBACK'));
+        assert.ok(placement?.deferredId && !placement.messageId, `deferred, not stored: ${JSON.stringify(placement)}`);
+      });
+      assert.notEqual(framework.getStore().currentBranch().name, source, 'the rollback moved the store');
+      const early = await textsOf(framework, 'a-early-g1');
+      assert.equal(count(early, 'MESSAGE DURING THE ROLLBACK'), 1, `on the branch the rollback moved to: ${JSON.stringify(early)}`);
+    });
+  });
+
+  it("a re-seed whose template compile spans a move it didn't make writes nothing, and the fork is disposed and reported", { timeout: 30_000 }, async () => {
+    await withForks('reinit-fork-foreign-move-', async (framework, forkInternals, logged) => {
+      await forksAroundACheckpoint(framework, forkInternals);
+      const store = framework.getStore();
+      const cmA = framework.getAgent('a')!.getContextManager();
+      const late = framework.getAgent('a-late-g1')!.getContextManager();
+      const compile = cmA.compile.bind(cmA);
+      // The template's own manager moves the store between the seed's compile
+      // and its write, as a host moving through an agent's context manager can.
+      (cmA as unknown as { compile: typeof compile }).compile = async (...args: Parameters<typeof compile>) => {
+        const compiled = await compile(...args);
+        (cmA as unknown as { compile: typeof compile }).compile = compile;
+        store.createBranchAt('elsewhere', store.currentBranch().name, store.currentSequence());
+        await cmA.switchBranch('elsewhere');
+        return compiled;
+      };
+      try {
+        assert.equal(framework.undoLastTurn('a').undone, true);
+        await forkInternals.syncMoveReinit!.done;
+      } finally {
+        (cmA as unknown as { compile: typeof compile }).compile = compile;
+      }
+      assert.equal(store.currentBranch().name, 'elsewhere');
+      assert.deepEqual(storedTexts(late), [], 'nothing seeded from the compile of the branch the store left');
+      assert.ok(!framework.getAgent('a-late-g1'), 'the fork is disposed');
+      assert.ok(logged.some((line) => /agent=a-late-g1 .*couldn't be seeded again, because its seeding from the template failed: Error: the store moved to another branch while it was being seeded\./.test(line)),
+        logged.join('\n'));
+    });
+  });
 });
 
 /** A strategy whose next tick, once armed, closes its agent's provider gate and parks a maintenance call there. */

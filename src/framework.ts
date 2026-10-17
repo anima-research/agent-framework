@@ -7948,8 +7948,11 @@ export class AgentFramework {
           if (this.activeTurnTokens.has(name)) continue;
           for (const msg of this.drainDeferredFor(name)) {
             try {
+              // Stored with its deferred write's id, as the other flushes
+              // store theirs, so a placement deferred during the move
+              // resolves to the stored message.
               this.addMessage(msg.participant, msg.content, msg.metadata,
-                msg.forAgent ? { forAgent: msg.forAgent } : undefined);
+                { deferredWriteId: msg.id, ...(msg.forAgent ? { forAgent: msg.forAgent } : {}) });
             } catch (error) {
               console.error(`[operator] post-surgery deferred flush failed for ${name}: ${error instanceof Error ? error.message : String(error)}`);
             }
@@ -7973,22 +7976,26 @@ export class AgentFramework {
    *
    * Called under the move's store reservation, so no turn starts while a
    * manager re-initializes, and the messages the reservation defers for its
-   * agents are written after. The managers re-initialize side by side. Never
-   * rejects: it answers the agents whose re-initialization failed. Each of
-   * those managers refuses its work, as context-manager leaves a failed
+   * agents are written after. The managers re-initialize one at a time, with
+   * a turn of the event loop before each: a manager's re-initialization runs
+   * synchronously, for a time that grows with its history, so side by side
+   * they would hold the event loop for the whole pass. Never rejects: it
+   * answers the agents whose re-initialization failed. Each of those
+   * managers refuses its work, as context-manager leaves a failed
    * initialization, until another one succeeds.
    */
   private async reinitializeManagers(except?: string, moved: () => boolean = () => false): Promise<ManagerReinitFailure[]> {
     const failures: ManagerReinitFailure[] = [];
-    await Promise.all([...this.agents].map(async ([agentName, agent]) => {
-      if (agentName === except) return;
+    for (const [agentName, agent] of [...this.agents]) {
+      if (agentName === except) continue;
+      await new Promise<void>((resolve) => setImmediate(resolve));
       try {
         const cm = agent.getContextManager();
         await cm.setStrategy(cm.getStrategy());
       } catch (error) {
         failures.push({ agentName, error: failureDescription(error) });
       }
-    }));
+    }
     await this.reseedEmptiedForks(failures, except, moved);
     return failures;
   }
@@ -9646,13 +9653,13 @@ export class AgentFramework {
       if (!target) return undefined;
       if (this.conversationRouter && this.conversationAgentHomes.has(target.name)) {
         metadata.triggered = event.triggerInference ?? false;
-        const id = target.getContextManager().addMessage('user', event.content, metadata);
+        const placement = this.writeToFork(target, event.content, metadata);
         // A correction may target an older engagement. Refresh only the
         // binding whose agent actually received the message.
         if (this.conversationRouter.getBinding(event.channelId)?.agentName === target.name) {
           this.conversationRouter.touch(event.channelId);
         }
-        this.emitTrace({ type: 'message:added', messageId: id, source: 'mcpl:channel-incoming' });
+        this.emitTrace({ type: 'message:added', messageId: placement.messageId ?? '', source: 'mcpl:channel-incoming' });
         if (event.triggerInference) {
           this.pendingRequests.push({
             agentName: target.name, reason: 'mcpl:channel-incoming', source: event.serverId, timestamp: Date.now(),
@@ -9662,7 +9669,7 @@ export class AgentFramework {
             ...(event.coalescingSubject ? { coalescingSubject: event.coalescingSubject } : {}),
           });
         }
-        return { agent: target.name, messageId: id };
+        return placement;
       }
       if (this.conversationRouter) return undefined; // the trunk never holds channel traffic
       event = { ...event, targetAgents: [target.name] };
@@ -9830,9 +9837,9 @@ export class AgentFramework {
     const trigger = decision.trigger && event.triggerInference !== false;
     messageMetadata.triggered = trigger;
 
-    const id = agent.getContextManager().addMessage('user', event.content, messageMetadata);
+    const placement = this.writeToFork(agent, event.content, messageMetadata);
     router.touch(event.channelId);
-    this.emitTrace({ type: 'message:added', messageId: id, source: 'mcpl:channel-incoming' });
+    this.emitTrace({ type: 'message:added', messageId: placement.messageId ?? '', source: 'mcpl:channel-incoming' });
 
     if (trigger) {
       this.pendingRequests.push({
@@ -9848,7 +9855,26 @@ export class AgentFramework {
         ...(event.coalescingSubject ? { coalescingSubject: event.coalescingSubject } : {}),
       });
     }
-    return { agent: agent.name, messageId: id };
+    return placement;
+  }
+
+  /**
+   * Write a message into a conversation fork's own context, or, while a move
+   * holds the store, defer it, as the hold defers every write for the agents
+   * it reserves. Written then, it would land before the move's
+   * re-initialization and re-seed: in a namespace the move emptied, where the
+   * re-seed would then find a message and seed nothing, in a manager still
+   * re-initializing, which refuses it, or on the branch a rollback is about to
+   * leave. Deferred, it lands at the hold's release, after them. The answer
+   * says where it went: the stored message, or the deferred write.
+   */
+  private writeToFork(agent: Agent, content: ContentBlock[], metadata: Record<string, unknown>): CoalescingPlacement {
+    if (this.surgeryHold) {
+      const placement: CoalescingPlacement = { agent: '' };
+      this.addMessage('user', content, metadata as MessageMetadata, { forAgent: agent.name, placement });
+      return placement;
+    }
+    return { agent: agent.name, messageId: agent.getContextManager().addMessage('user', content, metadata) };
   }
 
   /**
@@ -9972,14 +9998,22 @@ export class AgentFramework {
     // Empty is no stored message on this branch: a namespace whose history
     // compiles to nothing (hidden, pruned, or past its window) still has it.
     if (contextManager.getMessageCount() > 0) return 0;
+    const branch = this.store.currentBranch().id;
     // The copy is the fork's own, and the template's annotation edits only
     // the template's message: seed only once each of the template's
     // annotations has finished.
     const { messages: compiled } = await template.toolResultGuard.afterAnnotations(
       () => template.getContextManager().compile(undefined, undefined, { dryRun: true }));
     // The store may have moved during those awaits: then this branch is no
-    // longer the one judged empty, so write nothing (the caller judges again).
+    // longer the one judged empty, and the compile may be another branch's,
+    // so write nothing. A move the caller made under its reservation is the
+    // caller's to judge again. Any other mover, such as a switch through an
+    // agent's own context manager, fails the seeding, so the fork isn't left
+    // to run with no seed.
     if (moved()) return null;
+    if (this.store.currentBranch().id !== branch) {
+      throw new Error('the store moved to another branch while it was being seeded');
+    }
     const withoutReasoning = withoutThinking(compiled);
     const seed = stripUnpairedToolBlocks(withoutReasoning);
     logSeedOmissions(name, template.name, compiled, withoutReasoning, seed);
@@ -10094,8 +10128,8 @@ export class AgentFramework {
         this.conversationAgentHomes.delete(binding.agentName);
         continue;
       }
-      agent.getContextManager().addMessage(
-        'user',
+      this.writeToFork(
+        agent,
         [{ type: 'text', text: this.conversationRouter.closurePrompt }],
         { channelId: binding.channelId, conversationClosure: true },
       );

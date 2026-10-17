@@ -20,19 +20,26 @@
   and says which branch the store is on. A rollback or suppression refused
   before the store moved, such as one whose branch name is already taken,
   re-initializes nothing. Each move re-initializes every agent on the store,
-  so its cost grows with the number of agents and with each one's stored
-  history; it hasn't been measured on a large store.
+  one at a time with the event loop running between them, so the store stays
+  reserved for longer as agents and their stored history grow, while the
+  host goes on handling events; each agent's own re-initialization still
+  runs without a break.
 - **A conversation agent spawned after the point a move returns to is
   seeded again from the template.** On the branch the store moved to it
   holds no stored message of its own, and a conversation agent was seeded
   only when it was created, so re-initialized it would have answered with
   no history. It's now seeded as at its creation, from the template's
   context as it stands on that branch, and keeps its name and its channel.
+  What reaches it while the move holds the store, from its channel, a
+  correction for it or its idle closure, is written after that, as every
+  agent's writes are; before, it was written at once, where the re-seed found
+  it and seeded nothing, or on the branch a rollback was about to leave.
   A move back to a branch that holds its own history, such as a redo after
   an undo, finds that history and seeds nothing. One spawned before that
   point keeps its history, even where that history compiles to nothing.
-  One that can't be seeded, because its seeding fails or the template is
-  missing or failed to re-initialize, is disposed rather than left to
+  One that can't be seeded, because its seeding fails, the store moves to
+  another branch while it's seeded by a switch the framework didn't make, or
+  the template is missing or failed to re-initialize, is disposed rather than left to
   answer with no history: `context-reinit-failed` says so and why. Its
   channel's next qualifying message spawns a fresh one, unless its seeding
   fails again, and while the template is missing or refuses its work a
