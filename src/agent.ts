@@ -1263,6 +1263,15 @@ export class Agent {
     this.failOpenKvSubmissions();
 
     this._streamId++;
+    // A pending cancel belongs to the stream that was live when cancelStream()
+    // ran. The stream driver collects it on that stream's terminal event, or
+    // at the loop's end when the iterator closed without one, while the
+    // stream still owns the agent. This clear is for the records no driver
+    // collects: a dropped turn's, whose stream no driver iterates; one whose
+    // stream's terminal came after another stream took the agent; or a
+    // cancel after the stream's complete event. A fresh stream must not
+    // inherit one and read its own later error as a deliberate stop.
+    this._pendingCancel = undefined;
     this._inferenceStartedAt = Date.now();
     this.lastStreamInputTokens = 0;
     // Reset the cache-inclusive counters too: a new stream must not inherit
@@ -1418,16 +1427,42 @@ export class Agent {
     this._state = { status: 'streaming', stream };
   }
 
+  /** The most recent cancelStream() of a live stream, until the stream
+   *  driver collects it on that stream's terminal event. Its presence is
+   *  the signal (a reasonless Stop is still a deliberate stop); its reason
+   *  is the caller's own word. Membrane reports every cancel() as reason
+   *  'user' — the call, not the actor — and a stream implementation may
+   *  report the cancel as `error` with no reason at all, so this record is
+   *  the only provenance a host-side cancel has. */
+  private _pendingCancel: { reason?: string } | undefined;
+
   /**
-   * Cancel any active stream and reset to idle.
+   * Cancel any active stream and reset to idle. `reason` is provenance for
+   * the framework's inference:aborted trace and marker metadata (e.g.
+   * 'zombie_reclaim', 'subagent_cancel'); it never reaches the provider.
    */
-  cancelStream(): void {
+  cancelStream(reason?: string): void {
+    const hadStream = this._state.status === 'streaming' ||
+      (this._state.status === 'waiting_for_tools' && !!this._state.stream);
+    if (hadStream) this._pendingCancel = { reason };
     if (this._state.status === 'streaming') {
       this._state.stream.cancel();
     } else if (this._state.status === 'waiting_for_tools' && this._state.stream) {
       this._state.stream.cancel();
     }
     this._state = { status: 'idle' };
+  }
+
+  /** Collect (and clear) the cancel that ended the current stream, if this
+   *  side issued one. The stream driver calls it once, while the stream
+   *  still owns the agent, at the stream's terminal event (`aborted`
+   *  normally, `error` for implementations that report cancel() that way)
+   *  or at the loop's end when the stream closed without one. A record no
+   *  driver collects is cleared when the agent's next stream starts. */
+  takeCancel(): { reason?: string } | undefined {
+    const c = this._pendingCancel;
+    this._pendingCancel = undefined;
+    return c;
   }
 
   /**
@@ -1490,7 +1525,7 @@ export class Agent {
     if (this._state.status === 'streaming' ||
         (this._state.status === 'waiting_for_tools' && this._state.stream)) {
       const durationMs = Date.now() - this._inferenceStartedAt;
-      this.cancelStream();
+      this.cancelStream(reason);
       return { aborted: true, durationMs };
     }
 

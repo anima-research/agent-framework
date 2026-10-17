@@ -66,11 +66,13 @@ export type TraceEvent =
       /** How long this start of the turn ran; after a context-budget restart, from the restart. */
       durationMs: number;
       /**
-       * Why the turn ended unfinished: the reason an operator gave
-       * `abortInference`, `'quiesce_abandoned'` for a turn an operator quiesce
-       * abandoned, or, for a turn dropped before it sent anything (its agent
-       * replaced or removed, or the framework stopping or restarted), a
-       * sentence saying which.
+       * Why the turn ended unfinished: the reason its canceller gave
+       * `abortInference` or `Agent.cancelStream` (`'user'` when it gave
+       * none), `'shutdown'` for a turn `stop()` cancelled,
+       * `'quiesce_abandoned'` for a turn an operator quiesce abandoned, or,
+       * for a turn dropped before it sent anything (its agent replaced or
+       * removed, or the framework stopping or restarted), a sentence saying
+       * which.
        */
       reason?: string;
     })

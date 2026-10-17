@@ -2035,6 +2035,120 @@ test('#277: stop waits for an annotation started by an ephemeral run it has alre
   } finally { write.open(); if (!stopped) await h.framework.stop(); }
 });
 
+test("stop() over a running ephemeral run settles the run's pending batch before the run is disposed", async () => {
+  // stop() ends the run's stream through the framework's own terminal, and
+  // that terminal's settle rejects the run's caller, whose finally disposes
+  // the agent. driveStream's finally abandons a pending batch only while the
+  // agent is still registered, so the terminal abandons the batch itself.
+  const h = await harness([[calls('one')]]);
+  let spills = 0;
+  slowSpill(h.framework, async () => { spills++; });
+  h.membrane.onSubmit = () => { queueMicrotask(() => { void h.framework.stop(); }); };
+  let outcome = 'pending';
+  try {
+    const created = await h.framework.createEphemeralAgent({
+      name: 'ephemeral', model: 'test', systemPrompt: 'system', toolResultGuard: true,
+    });
+    created.contextManager.addMessage('user', [{ type: 'text', text: 'read' }]);
+    const completion = h.framework.runEphemeralToCompletion(created.agent, created.contextManager)
+      .then(() => { outcome = 'resolved'; }, (e) => { outcome = `rejected: ${(e as Error).message}`; });
+    h.framework.start();
+    await bounded(completion, 'the run settling');
+  } finally { await h.framework.stop(); }
+  assert.match(outcome, /^rejected: Framework shutting down/, 'the run ends through the shutdown terminal');
+  assert.equal(spills, 1, "the aborted batch's original is written out for its stub");
+  const restarted = await AgentFramework.create(h.base);
+  try {
+    const audit = restarted.getStore().getStateJson(TOOL_RESULT_GUARD_AUDIT_STATE) as Array<Record<string, unknown>>;
+    const settled = audit.filter((r) => r.agentName === 'ephemeral' && r.type === 'withheld').map((r) => r.reason);
+    assert.deepEqual(settled, ['aborted'], 'the batch is settled once, as aborted');
+  } finally { await restarted.stop(); }
+});
+
+/** Make a scripted stream report its cancel as an `error` event, or by just
+ *  closing; a MockYieldingStream reports it as `aborted` by itself. */
+function reportCancelAs(stream: MockYieldingStream, shape: 'aborted' | 'error' | 'closes') {
+  if (shape === 'aborted') return;
+  const s = stream as unknown as { cancel: () => void; _done: boolean; events: unknown[]; pendingResolve: null | (() => void) };
+  s.cancel = function (this: typeof s) {
+    this._done = true;
+    if (shape === 'error') this.events.push({ type: 'error', error: new Error('stream cancelled') });
+    const resolve = this.pendingResolve;
+    this.pendingResolve = null;
+    resolve?.();
+  };
+}
+
+/** Make each stream the membrane hands out wait `ms` after its terminal event
+ *  before it ends, as a stream that cleans up after reporting may. The wait
+ *  is on the pull after the terminal, which a consumer that reads on with
+ *  `next()` makes; one that leaves its loop by `return()` closes the stream
+ *  at once, without it. */
+function waitAfterTerminal(membrane: ScriptMembrane, ms: number) {
+  const make = membrane.streamYielding.bind(membrane);
+  membrane.streamYielding = (request, options) => {
+    const stream = make(request, options);
+    const events = stream[Symbol.asyncIterator].bind(stream);
+    (stream as unknown as { [Symbol.asyncIterator]: () => AsyncIterator<{ type: string }> })[Symbol.asyncIterator] =
+      async function* () {
+        for await (const event of { [Symbol.asyncIterator]: events } as AsyncIterable<{ type: string }>) {
+          yield event;
+          if (event.type === 'complete' || event.type === 'error' || event.type === 'aborted') {
+            await new Promise((r) => setTimeout(r, ms));
+            return;
+          }
+        }
+      };
+    return stream;
+  };
+}
+
+// A caller's cancel ends the run through settleDeliberateCancel, which
+// abandons the batch itself before the settle, as the framework's own stops
+// do: its stream cases leave the switch with `break`, and if the stream waits
+// before it ends, after its terminal event, the run's caller can deregister
+// the agent before driveStream's finally runs. Pinned for each way the stream
+// reports the cancel, and for a stream that waits after reporting it.
+for (const how of ['abortInference', 'cancelStream'] as const) {
+  for (const [shape, waits] of [
+    ['aborted', false], ['error', false], ['closes', false], ['aborted', true], ['error', true],
+  ] as const) {
+    const reported = shape === 'closes' ? 'just closes' : `reports the cancel as ${shape === 'error' ? 'an error' : '`aborted`'}`;
+    test(`${how}() over a running ephemeral run settles its pending batch, with a stream that ${reported}${waits ? ' and waits before it ends' : ''}`, async () => {
+      const h = await harness([[calls('one')]]);
+      if (waits) waitAfterTerminal(h.membrane, 50);
+      let spills = 0;
+      slowSpill(h.framework, async () => { spills++; });
+      h.membrane.onSubmit = () => {
+        queueMicrotask(() => {
+          reportCancelAs(h.membrane.streams.at(-1)!, shape);
+          if (how === 'abortInference') h.framework.abortInference('ephemeral', 'caller');
+          else h.framework.getAgent('ephemeral')!.cancelStream('caller');
+        });
+      };
+      let outcome = 'pending';
+      try {
+        const created = await h.framework.createEphemeralAgent({
+          name: 'ephemeral', model: 'test', systemPrompt: 'system', toolResultGuard: true,
+        });
+        created.contextManager.addMessage('user', [{ type: 'text', text: 'read' }]);
+        const completion = h.framework.runEphemeralToCompletion(created.agent, created.contextManager)
+          .then(() => { outcome = 'resolved'; }, (e) => { outcome = `rejected: ${(e as Error).message}`; });
+        h.framework.start();
+        await bounded(completion, 'the run settling');
+      } finally { await h.framework.stop(); }
+      assert.match(outcome, /^rejected: Stream cancelled/, "the run ends through the caller's cancel");
+      assert.equal(spills, 1, "the aborted batch's original is written out for its stub");
+      const restarted = await AgentFramework.create(h.base);
+      try {
+        const audit = restarted.getStore().getStateJson(TOOL_RESULT_GUARD_AUDIT_STATE) as Array<Record<string, unknown>>;
+        const settled = audit.filter((r) => r.agentName === 'ephemeral' && r.type === 'withheld').map((r) => r.reason);
+        assert.deepEqual(settled, ['aborted'], 'the batch is settled once, as aborted');
+      } finally { await restarted.stop(); }
+    });
+  }
+}
+
 // ---------------------------------------------------------------------------
 // #281's review: each withheld result's file is its own, a branch change stops
 // the annotation's writes, and the direct API's refusal retry fits the budget.
@@ -3258,6 +3372,55 @@ test('a framework compile from before stop cannot drive after restart', async ()
     // A turn begun after the restart is admitted and drives its stream.
     await (framework as unknown as { startAgentStream(a: typeof agent): Promise<void> }).startAgentStream(agent);
     await until(() => driven === 1, 'the turn begun after the restart drives');
+  } finally { compile.open(); await starting; await framework.stop(); store.close(); }
+});
+
+test("a dropped turn's cancel record is not read by the next turn's stream: its own error stays a failure", async () => {
+  // The dropped turn calls agent.cancelStream() on a stream no driver iterates,
+  // so the cancel record it leaves is never collected. The next stream's start
+  // clears it; were it left, that stream's genuine error would read it and end
+  // as a deliberate stop instead of a failure.
+  const dir = mkdtempSync(join(tmpdir(), 'guard-dropped-record-')); dirs.push(dir);
+  const store = JsStore.openOrCreate({ path: join(dir, 'store') });
+  // The dropped turn's answer, then the next turn's (made to error), then a retry's.
+  const membrane = new ScriptMembrane([[answer()], [answer()], [answer()]]);
+  const framework = await AgentFramework.create({ store, membrane: membrane.asMembrane(),
+    agents: [{ name: 'assistant', model: 'test', systemPrompt: 'system' }],
+    modules: [], syncIntervalMs: 0, maintenanceIntervalMs: 0 });
+  const agent = framework.getAgent('assistant')!;
+  const compile = gate();
+  const entered = gate();
+  const build = agent.buildActivationRequest.bind(agent);
+  agent.buildActivationRequest = async (...args) => { entered.open(); await compile.opened; return build(...args); };
+  const stream = membrane.streamYielding.bind(membrane);
+  membrane.streamYielding = (...args) => {
+    const result = stream(...args);
+    // The first stream iterated is the next turn's: it fails on its own.
+    if (membrane.streams.length === 2) {
+      (result as unknown as { events: unknown[] }).events.unshift({ type: 'error', error: new Error('provider failed') });
+    }
+    return result;
+  };
+  let starting: Promise<void> | undefined;
+  try {
+    const error = console.error;
+    console.error = () => {};
+    try {
+      starting = (framework as unknown as { startAgentStream(a: typeof agent): Promise<void> }).startAgentStream(agent);
+      await entered.opened;
+      await framework.stop();
+      framework.start();
+      compile.open();
+      await starting;
+    } finally { console.error = error; }
+    const events: string[] = [];
+    framework.onTrace((event) => {
+      if (event.type.startsWith('inference:') && (event as { agentName?: string }).agentName === 'assistant') events.push(event.type);
+    });
+    await (framework as unknown as { startAgentStream(a: typeof agent): Promise<void> }).startAgentStream(agent);
+    await until(() => events.includes('inference:failed') || events.includes('inference:aborted'), "the next turn's stream ends");
+    assert.ok(events.includes('inference:failed'), `its error takes the failure path: ${JSON.stringify(events)}`);
+    assert.ok(!events.includes('inference:aborted'), `not a deliberate stop: ${JSON.stringify(events)}`);
   } finally { compile.open(); await starting; await framework.stop(); store.close(); }
 });
 

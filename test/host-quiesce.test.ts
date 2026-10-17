@@ -654,10 +654,93 @@ test('a cancel that surfaces as a stream ERROR still settles as an operator abor
     assert.ok(traces.some((t) => t.type === 'inference:aborted'
       && (t as { reason?: string }).reason === 'quiesce_abandoned'));
     assert.ok(!traces.some((t) => t.type === 'inference:exhausted'));
+    // The cancel provenance is read BEFORE the failure accounting: the same
+    // stream must not be reported failed and then aborted.
+    assert.ok(!traces.some((t) => t.type === 'inference:failed'),
+      'an abandoned turn is not first recorded as a provider failure');
     const lifecycle = traces
       .filter((t) => String(t.type).includes('lifecycle'))
       .map((t) => (t as { phase?: string }).phase);
     if (lifecycle.length > 0) assert.ok(!lifecycle.includes('completed'), 'an abandoned turn is not "completed"');
+  });
+});
+
+/** The `error` of each inference-log row the framework writes, in order. */
+function watchInferenceLog(framework: AgentFramework): string[] {
+  const logged: string[] = [];
+  const logs = framework as unknown as { logInference(entry: { error?: string }): void };
+  const logInference = logs.logInference.bind(framework);
+  logs.logInference = (entry) => { logged.push(entry.error ?? '(no error)'); logInference(entry); };
+  return logged;
+}
+
+test('an abandoned turn writes one inference-log row, attributed to the abandon', async () => {
+  // Every other terminal of a stream writes an inference-log row, the
+  // abandon's `error` twin included, so the log can attribute it later.
+  const membrane = new HangingMembrane();
+  await withFramework(membrane, async (framework) => {
+    const logged = watchInferenceLog(framework);
+    framework.start();
+    framework.nudgeAgent('agent', 'operator');
+    await waitFor('turn to start', () => membrane.calls.length === 1);
+    const status = await framework.quiesce({ timeoutMs: 1_000, abandon: true });
+    assert.equal(status.drained, true);
+    await waitFor('agent back to idle', () => framework.getAgent('agent')!.state.status === 'idle');
+    assert.deepEqual(logged, ['Stream aborted: quiesce_abandoned']);
+  });
+});
+
+test("an abandon stops the agent's running code_execution script with the turn", async () => {
+  const membrane = new HangingMembrane();
+  await withFramework(membrane, async (framework) => {
+    framework.start();
+    framework.nudgeAgent('agent', 'operator');
+    await waitFor('turn to start', () => membrane.calls.length === 1);
+    const scriptAborts: string[] = [];
+    (framework as unknown as { codeExecutionRunners: Map<string, unknown> }).codeExecutionRunners.set('agent', {
+      busy: true,
+      abort: (reason: string) => { scriptAborts.push(reason); },
+      dispose: () => {},
+    });
+    const status = await framework.quiesce({ timeoutMs: 1_000, abandon: true });
+    assert.equal(status.drained, true);
+    await waitFor('agent back to idle', () => framework.getAgent('agent')!.state.status === 'idle');
+    assert.deepEqual(scriptAborts, ['turn abandoned by quiesce']);
+  });
+});
+
+test('an abandon whose stream just closes still settles the turn as an operator abort', async () => {
+  // A stream implementation may answer cancel() by just closing its
+  // iterator, with no `aborted` or `error` event. The abandon still ends the
+  // turn as its twins do: the agent back to idle, one inference:aborted with
+  // the abandon's reason, one log row, and no failure accounting.
+  class ClosingHangStream extends HangingStream {
+    override async *[Symbol.asyncIterator](): AsyncIterator<StreamEvent> {
+      await this.waitForCancel();
+    }
+  }
+  class ClosingMembrane extends MockMembrane {
+    override streamYielding(request: NormalizedRequest): YieldingStream {
+      this.calls.push(request);
+      return new ClosingHangStream();
+    }
+  }
+  const membrane = new ClosingMembrane();
+  await withFramework(membrane, async (framework) => {
+    const traces: TraceEvent[] = [];
+    framework.onTrace((event) => traces.push(event));
+    const logged = watchInferenceLog(framework);
+    framework.start();
+    framework.nudgeAgent('agent', 'operator');
+    await waitFor('turn to start', () => membrane.calls.length === 1);
+    const status = await framework.quiesce({ timeoutMs: 1_000, abandon: true });
+    assert.equal(status.drained, true);
+    await waitFor('agent back to idle', () => framework.getAgent('agent')!.state.status === 'idle');
+    const aborted = traces.filter((t) => t.type === 'inference:aborted').map((t) => (t as { reason?: string }).reason);
+    assert.deepEqual(aborted, ['quiesce_abandoned']);
+    assert.ok(!traces.some((t) => t.type === 'inference:exhausted' || t.type === 'inference:failed'),
+      'an operator cancel must not feed the failure accounting');
+    assert.deepEqual(logged, ['Stream aborted: quiesce_abandoned']);
   });
 });
 

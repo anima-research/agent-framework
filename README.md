@@ -333,6 +333,8 @@ framework.abortInference('assistant', 'user requested stop');
 
 The non-streaming path uses `AbortSignal` forwarded to `membrane.stream()`, which returns an `AbortedResponse` with partial content. The streaming path cancels the `YieldingStream` directly.
 
+A turn whose stream is cancelled this way, or by `agent.cancelStream()`, ends as a stop, whether the stream reports the cancel as `aborted`, as an `error`, or by just closing: one `inference:aborted` carrying the caller's reason (`user` when none was given), a `[turn-interrupted]` note in the agent's context, and never `inference:exhausted`, which is for failed inferences. A stream that membrane aborts on its own, at a deadline or on an error (reason `timeout` or `error`), is a failed inference. `stop()` and an operator's quiesce abandon end a turn as a stop too, with their own reasons, `shutdown` and `quiesce_abandoned`, and write no note. A stopped stream still writes its inference-log row, with `success: false`.
+
 ## API Server
 
 WebSocket server for external clients (UIs, scripts, other agents).

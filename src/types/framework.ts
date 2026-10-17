@@ -411,7 +411,7 @@ export interface InferenceLogEntry {
   requestId: string;
   /** Whether inference succeeded */
   success: boolean;
-  /** Error message if failed */
+  /** Why it didn't succeed: the failure's message, or what stopped it */
   error?: string;
   /** Request data or blob ID if large */
   request: unknown | { blobId: string };
