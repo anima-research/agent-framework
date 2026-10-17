@@ -320,6 +320,23 @@ test("a send's note reads the channel on the server the words went to, not one o
   assert.ok(data.endsWith(UPKEEP_NOTE), data);
 });
 
+test("an invitation, and the notice a send's open gives, read the channel on the server the message or the send came from, not one on another server with the same id", async () => {
+  const { registry, framework, windowMessages, reply } = await harness({ sharedIdFirst: true });
+  // discord2's channel with this id is open, and it's the one a lookup by bare id finds.
+  assert.equal((await registry.handleChannelToolCall('channel_open', { channelId, serverId: 'discord2' }, origin)).success, true);
+  // A mention arrives from discord's #upkeep, which is closed.
+  const invitation = framework.buildClosedChannelInvitation({
+    serverId: 'discord', channelId, messageId: 'm1', authorName: 'Ann', tags: ['chat:addressed'],
+  });
+  assert.ok(invitation, "discord's channel is closed, so the mention comes with an invitation");
+  const invited = String(invitation.block.text);
+  assert.ok(invited.includes('upkeep') && !invited.includes('elsewhere'), invited);
+  // A send into discord's #upkeep, which nobody decided about, opens it, and the notice names it.
+  assert.equal((await reply()).success, true);
+  assert.equal(registry.isChannelOpen(channelId, 'discord'), true);
+  assert.ok(windowMessages.at(-1)?.startsWith(`[channels] Now open: #upkeep (${channelId})`), windowMessages.at(-1));
+});
+
 test('a send into an open channel, or into a channel a module closed, carries no closed-channel note', async () => {
   {
     const { registry, reply } = await harness();

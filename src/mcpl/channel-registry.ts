@@ -2463,9 +2463,9 @@ export class ChannelRegistry {
       address: entry.descriptor.address,
       ...(history ? { history } : {}),
     });
-    // A close decided while the open was on its way (the agent's channel_close
-    // racing an open a send started) went to the server after it, so the
-    // channel ends closed: the live flag follows the decision. A tune-out
+    // A close decided while the open was on its way (channel_close, or a
+    // decline, racing an open a send started) went to the server after it, so
+    // the channel ends closed: the live flag follows the decision. A tune-out
     // keeps the transport open, as reconciliation's opens hold it.
     const now = this.getDesiredState(entry.serverId, entry.descriptor.id);
     if (now === 'open' || now === 'tuned-out') entry.open = true;
@@ -2958,9 +2958,9 @@ export class ChannelRegistry {
     if (!entry) {
       return { success: false, error: resolved.error, isError: true };
     }
-    // Refused only for a channel open at the transport: a channel decided
-    // open whose open failed is closed, and the invitation that comes from it
-    // offers the decline (option 3) as the way to reply without joining.
+    // Refused only for a channel open at the transport: the invitation that
+    // comes from a channel decided open whose open failed offers the decline
+    // (option 3) as the way to reply without joining.
     if (entry.open) {
       return {
         success: false,
@@ -2969,9 +2969,31 @@ export class ChannelRegistry {
       };
     }
 
+    // A channel decided open but not open here has an open on its way, or one
+    // that failed, maybe after the server applied it and its reply was lost.
+    // So the decline closes it at the server too, as channel_close does: the
+    // server applies the close after that open, and the open's reply leaves
+    // the flag as the decision says.
+    const closeAtServer = this.getDesiredState(entry.serverId, input.channelId) === 'open';
+
     // The lifecycle decision is authoritative even if the optional public
-    // acknowledgment cannot be rendered by the surface.
+    // acknowledgment cannot be rendered by the surface, or the close fails.
     this.setDesiredState(entry.serverId, input.channelId, 'closed', 'invitation-declined');
+
+    let closeError: string | undefined;
+    if (closeAtServer) {
+      const server = this.serverRegistry.getServer(entry.serverId);
+      // Without the server or its lifecycle grant, no open could have been
+      // sent (openChannelNow and reconciliation both need them), so there is
+      // nothing to close.
+      if (server && CapabilityGrant.of(server).has('channels.lifecycle')) {
+        try {
+          await server.sendChannelsClose({ channelId: input.channelId });
+        } catch (error) {
+          closeError = (error as Error).message;
+        }
+      }
+    }
 
     let acknowledged = false;
     let representation: string | undefined;
@@ -3018,6 +3040,7 @@ export class ChannelRegistry {
         acknowledged,
         ...(representation ? { representation } : {}),
         ...(acknowledgmentError ? { acknowledgmentError } : {}),
+        ...(closeError ? { closeError } : {}),
       },
     };
   }

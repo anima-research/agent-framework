@@ -634,17 +634,29 @@ test("a module's close, made with no machine source, is the module's: speech lea
  *  channels/open answers can be held. */
 function loggedRegistry(events: unknown[]) {
   const openCalls: Array<{ channelId?: string }> = [];
+  const closeCalls: Array<{ channelId?: string }> = [];
+  /** What the server has open: it applies opens and closes in the order they arrive. */
+  const serverOpen = new Set<string>();
   let openHold: Promise<void> | null = null;
   let openReached: () => void = () => {};
+  let loseOpenReplies = false;
+  let failCloses = false;
   const server = {
     grant: new CapabilityGrant(new Set(ALL_CAPABILITY_PATHS), []),
     sendChannelsOpen: async (params: { channelId?: string }) => {
       openCalls.push(params);
+      if (params.channelId) serverOpen.add(params.channelId);
       openReached();
       if (openHold) await openHold;
+      if (loseOpenReplies) throw new Error('the reply to channels/open was lost');
       return {};
     },
-    sendChannelsClose: async () => ({}),
+    sendChannelsClose: async (params: { channelId?: string }) => {
+      closeCalls.push(params);
+      if (failCloses) throw new Error('close refused by server');
+      if (params.channelId) serverOpen.delete(params.channelId);
+      return {};
+    },
     sendChannelsPublish: async () => ({ delivered: true }),
   };
   const store = {
@@ -659,7 +671,11 @@ function loggedRegistry(events: unknown[]) {
     { store: store as never, onChannelAutoOpened: (info) => { autoOpened.push(info); } },
   );
   return {
-    registry, openCalls, autoOpened,
+    registry, openCalls, closeCalls, serverOpen, autoOpened,
+    /** The server applies each channels/open, and its reply is lost. */
+    setLoseOpenReplies: (v: boolean) => { loseOpenReplies = v; },
+    setFailCloses: (v: boolean) => { failCloses = v; },
+    setGrant: (grant: CapabilityGrant) => { server.grant = grant; },
     /** Hold every channels/open answer until the returned release; resolves `reached` at the first one. */
     holdOpens: () => {
       let release!: () => void;
@@ -717,8 +733,8 @@ test("the latest deliberate close records itself over any closed record: the ret
 });
 
 test("an open still on its way when the agent closes the channel leaves it closed, whether speech or a reconcile sent it; a tune-out decided meanwhile leaves it open", async () => {
-  const { registry, holdOpens, autoOpened } = loggedRegistry([]);
-  await registry.handleRegister('discord', { channels: channelsOf('spoken', 'reconciled', 'tuned') } as never);
+  const { registry, holdOpens, autoOpened, setLoseOpenReplies } = loggedRegistry([]);
+  await registry.handleRegister('discord', { channels: channelsOf('spoken', 'reconciled', 'tuned', 'retuned') } as never);
   const agent = { kind: 'agent' as const, agentName: 'sol' };
 
   // Speech opens 'spoken', nobody decided about it; the agent closes it while the open is on its way.
@@ -755,6 +771,76 @@ test("an open still on its way when the agent closes the channel leaves it close
   assert.equal(registry.getDesiredState('discord', 'tuned'), 'tuned-out');
   assert.equal(registry.isChannelOpen('tuned'), true, 'the transport the tune-out keeps open');
   assert.deepEqual(autoOpened, [], 'and no notice says it opened: the agent tuned it out');
+
+  // The same through a reconcile: 'retuned' is decided open, but its open's reply was lost, so the
+  // flag says closed; a reconcile reopens it, and the agent tunes it out while that open is on its way.
+  setLoseOpenReplies(true);
+  assert.equal((await registry.handleChannelToolCall('channel_open', { channelId: 'retuned' }, agent)).success, false);
+  setLoseOpenReplies(false);
+  assert.equal(registry.isChannelOpen('retuned'), false);
+  held = holdOpens();
+  const reconcilingTuned = registry.handleRegister('discord', { channels: channelsOf('retuned') } as never);
+  await held.reached;
+  registry.enterTuneOut('discord', 'retuned', { epochId: 'e2', cadenceSeconds: 600, backlogCap: 20, maxWakes: 3, startedAtSequence: 0 }, 'agent-tool');
+  held.release();
+  await reconcilingTuned;
+  assert.equal(registry.getDesiredState('discord', 'retuned'), 'tuned-out');
+  assert.equal(registry.isChannelOpen('retuned'), true, "the reconcile's open lands under a tune-out, which keeps the transport open");
+});
+
+test('a decline decided while an open is on its way, or after one whose reply was lost, closes the channel at the server too', async () => {
+  const events: Array<{ kind?: string; channelId?: string }> = [];
+  const { registry, holdOpens, autoOpened, closeCalls, serverOpen, setLoseOpenReplies, setFailCloses, setGrant } = loggedRegistry(events);
+  await registry.handleRegister('discord', { channels: channelsOf('spoken', 'lost', 'refusing', 'plain', 'ungranted') } as never);
+  const agent = { kind: 'agent' as const, agentName: 'sol' };
+  const closesBefore = closeCalls.length; // the first registration's reconcile closes each channel
+
+  // Speech opens 'spoken', which nobody decided about; the agent declines it while the open is on its way.
+  const held = holdOpens();
+  const speaking = registry.routeSpeech('sol', 'answering', 'spoken');
+  await held.reached;
+  const declined = await registry.handleChannelToolCall('channel_decline', { channelId: 'spoken', messageId: 'm1' }, agent);
+  assert.equal(declined.success, true, declined.error);
+  held.release();
+  assert.deepEqual(await speaking, { delivered: true, channelId: 'spoken' });
+  assert.equal(serverOpen.has('spoken'), false, 'the server applied the open, then the close');
+  assert.equal(registry.isChannelOpen('spoken'), false);
+  assert.equal(registry.closedByAgent('discord', 'spoken'), 'declined');
+  assert.deepEqual(autoOpened, [], 'and nothing reports the channel as opened');
+
+  // The agent's open of 'lost' reached the server, and its reply was lost.
+  setLoseOpenReplies(true);
+  assert.equal((await registry.handleChannelToolCall('channel_open', { channelId: 'lost' }, agent)).success, false);
+  setLoseOpenReplies(false);
+  assert.equal(serverOpen.has('lost'), true);
+  assert.equal(registry.isChannelOpen('lost'), false);
+  const declinedLost = await registry.handleChannelToolCall('channel_decline', { channelId: 'lost', messageId: 'm2' }, agent);
+  assert.equal(declinedLost.success, true, declinedLost.error);
+  assert.equal(serverOpen.has('lost'), false, 'the decline closed it at the server');
+  assert.equal((declinedLost.data as { closeError?: string }).closeError, undefined);
+
+  // A close the server refuses leaves the decline recorded, and the decline's answer says so.
+  setLoseOpenReplies(true);
+  await registry.handleChannelToolCall('channel_open', { channelId: 'refusing' }, agent);
+  setLoseOpenReplies(false);
+  setFailCloses(true);
+  const declinedRefusing = await registry.handleChannelToolCall('channel_decline', { channelId: 'refusing', messageId: 'm3' }, agent);
+  setFailCloses(false);
+  assert.equal(declinedRefusing.success, true, declinedRefusing.error);
+  assert.match(String((declinedRefusing.data as { closeError?: string }).closeError), /close refused by server/);
+  assert.equal(registry.closedByAgent('discord', 'refusing'), 'declined');
+  assert.ok(events.some((e) => e.kind === 'invitation-declined' && e.channelId === 'refusing'));
+
+  // A decline of a channel nobody decided to open sends nothing to the server.
+  const declinedPlain = await registry.handleChannelToolCall('channel_decline', { channelId: 'plain', messageId: 'm4' }, agent);
+  assert.equal(declinedPlain.success, true, declinedPlain.error);
+  // Nor does one on a server whose grant lacks channels.lifecycle, where no open was ever sent.
+  setGrant(new CapabilityGrant(new Set(ALL_CAPABILITY_PATHS.filter((p) => p !== 'channels.lifecycle')), []));
+  assert.equal((await registry.handleChannelToolCall('channel_open', { channelId: 'ungranted' }, agent)).success, false);
+  assert.equal(registry.getDesiredState('discord', 'ungranted'), 'open');
+  const declinedUngranted = await registry.handleChannelToolCall('channel_decline', { channelId: 'ungranted', messageId: 'm5' }, agent);
+  assert.equal(declinedUngranted.success, true, declinedUngranted.error);
+  assert.deepEqual(closeCalls.slice(closesBefore).map((c) => c.channelId), ['spoken', 'lost', 'refusing']);
 });
 
 test('a channel decided open whose open failed is closed at the transport, so the agent can decline it, and speech then leaves it closed', async () => {

@@ -4184,17 +4184,17 @@ export class AgentFramework {
    *  leaves a channel a module closed, and a tuned-out one, as they are
    *  (speechOpens), but there the module's own tool, or tune_out, is the way
    *  back, and a tuned-out send gets its own line (tunedOutSendNote). Every
-   *  other closed channel opens on speech, as it always did (openForSpeech),
-   *  so the agent meets the change here, where speaking used to reopen what it
-   *  had closed. The channel is read on the server the words went to. What
-   *  a closed channel still delivers beyond messages that address the agent
-   *  is the connector's (slack-mcpl delivers ambient traffic by its own
-   *  subscription), so the note promises only those, and
-   *  what channel_open does where the server's grant lets it open channels
-   *  (channels.lifecycle). One connector state the host can't see makes the
-   *  second sentence false: a channel muted with discord-mcpl's mute_channel
-   *  delivers nothing, messages that address the agent included. The agent
-   *  that muted it knows. */
+   *  other closed channel opens on speech where its server can open channels,
+   *  as it always did (openForSpeech), so the agent meets the change here,
+   *  where speaking used to reopen what it had closed. The channel is read on
+   *  the server the words went to. What a closed channel still delivers
+   *  beyond messages that address the agent is the connector's (slack-mcpl
+   *  delivers ambient traffic by its own subscription), so the note promises
+   *  only those, and what channel_open does where the server's grant lets it
+   *  open channels (channels.lifecycle). One connector state the host can't
+   *  see makes the second sentence false: a channel muted with discord-mcpl's
+   *  mute_channel delivers nothing, messages that address the agent included.
+   *  The agent that muted it knows. */
   private closedChannelNoteFor(channelId: string, serverId: string | null): string | undefined {
     const registry = this.channelRegistry;
     if (!registry || !serverId || registry.isChannelOpen(channelId, serverId)) return undefined;
@@ -9940,8 +9940,10 @@ export class AgentFramework {
     if (!this.channelRegistry) return null;
     if (!opts.tags?.includes('chat:addressed')) return null;
     if (opts.tags.includes('chat:dm')) return null;
-    if (this.channelRegistry.isChannelOpen(opts.channelId)) return null;
-    const descriptor = this.channelRegistry.getDescriptor(opts.channelId);
+    // Read on the server the message came from, as everything below is: two
+    // servers can carry a channel with the same id.
+    if (this.channelRegistry.isChannelOpen(opts.channelId, opts.serverId)) return null;
+    const descriptor = this.channelRegistry.getDescriptor(opts.channelId, opts.serverId);
     const maxBackscroll = descriptor?.capabilities?.history?.maxMessages ?? 0;
     const label = opts.channelLabel ?? descriptor?.label;
     const channelLabel = label ? `#${label}` : `"${opts.channelId}"`;
@@ -18457,7 +18459,7 @@ export class AgentFramework {
                   );
                   this.recordChannelAutoOpenNotice(
                     agentName,
-                    [{ channelId: engagedChannel, label: registry.getDescriptor(engagedChannel)?.label }],
+                    [{ channelId: engagedChannel, label: registry.getDescriptor(engagedChannel, serverId)?.label }],
                     'opened-by-reply',
                   );
                 } else if (status === 'open-failed') {
@@ -18894,14 +18896,17 @@ export class AgentFramework {
         destination = this.turnRouting.get(agentName)?.locus ?? null;
       }
     }
-    // The announcement opens a closed channel as any speech does, unless the
-    // agent or a module decided to keep it closed (openForSpeech): there it
-    // stays closed, so the announcement says the agent will still see
-    // messages addressed to it. That's decided from the channel as the
-    // announcement goes out, on the server its post goes to (routeSpeech's
-    // first entry with that id), since it doesn't depend on the post landing,
-    // which stays fire-and-forget. Those words are true in an open channel
-    // too, so they're the ones used when the channel's state can't be read.
+    // The announcement opens a closed channel as any speech does where its
+    // server can open channels, unless the agent or a module decided to keep
+    // it closed (openForSpeech): there it stays closed, so the announcement
+    // says the agent will still see messages addressed to it. On a server
+    // that can't open channels nothing opens, and what reaches the agent
+    // there is the server's own, so there too only that decision qualifies
+    // the words. That's decided from the channel as the announcement goes
+    // out, on the server its post goes to (routeSpeech's first entry with
+    // that id), since it doesn't depend on the post landing, which stays
+    // fire-and-forget. Those words are true in an open channel too, so
+    // they're the ones used when the channel's state can't be read.
     let staysClosed = false;
     if (destination && this.channelRegistry) {
       try {
