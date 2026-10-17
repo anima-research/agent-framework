@@ -75,6 +75,7 @@ import { Agent } from './agent.js';
 import { ModuleRegistry, checkedToolResult, isStateExistsError, storableToolResult, thrownResult } from './module-registry.js';
 import { McplServerRegistry } from './mcpl/server-registry.js';
 import { logValue } from './mcpl/log-value.js';
+import { hasNonConversationalTag } from './mcpl/tags.js';
 import { FeatureSetManager } from './mcpl/feature-set-manager.js';
 import { computeGrant, CapabilityGrant, expandAdvertisementShorthand } from './mcpl/capability-grant.js';
 import { maskNegotiatedCapabilities } from './mcpl/capability-mask.js';
@@ -194,14 +195,17 @@ const isSilencingTool = (name: string): boolean => {
  * True when an injected message is real conversational input — something the
  * agent might actually be replying to — rather than ambient machinery.
  * System markers (`system: true` — send-failed notices, routing notices) and
- * reactions (`chat:reaction` tag, MCPL RFC-001) don't count: they must not
- * clear explicit-send suppression, and they never influence routing.
+ * non-conversational marker tags (reactions added/removed, edits, deletions
+ * — MCPL RFC-001) don't count: they are about a message the agent has
+ * already seen, so they neither clear explicit-send suppression nor re-pin a
+ * turn's locus at a tool boundary. A marker that wakes the agent can still
+ * set that turn's speech channel (agent-framework#189).
  */
 const isConversationalInjection = (metadata?: MessageMetadata): boolean => {
   if (!metadata) return true;
   const m = metadata as Record<string, unknown>;
   if (m.system === true) return false;
-  if (Array.isArray(m.tags) && m.tags.includes('chat:reaction')) return false;
+  if (hasNonConversationalTag(m.tags)) return false;
   return true;
 };
 
@@ -1687,10 +1691,12 @@ export class AgentFramework {
   private processLoggingBroadcast: boolean;
   private activeStreams: Map<string, Promise<void>> = new Map();
 
-  /** A tool boundary injected fresh CONVERSATIONAL input (a real message —
-   *  not a reaction or a system marker) into the live stream. Tells
-   *  driveStream to clear sticky explicit-send suppression before handling
-   *  the next model round. Never affects routing: the turn locus is frozen. */
+  /** A tool boundary injected fresh CONVERSATIONAL input (a real message,
+   *  not a system marker or a reaction, reaction removal, edit or deletion
+   *  marker) into the live stream. Tells driveStream to clear sticky
+   *  explicit-send suppression before handling the next model round. The
+   *  signal itself never moves routing: the boundary re-pins the turn's
+   *  locus by its own rule (repinChannel). */
   private midTurnInputSignals: Set<string> = new Set();
   /** Last outbound locus announced to each agent as a durable `[routing]`
    *  window message. Announce-on-change only: steady state emits nothing
@@ -6610,7 +6616,8 @@ export class AgentFramework {
 
   /**
    * Mark an inference refusal visibly: react on the message that holds the
-   * conversational locus (the most recent incoming channel message) with a
+   * conversational locus (the most recent incoming channel message that
+   * isn't a reaction, reaction removal, edit or deletion marker) with a
    * category-specific emoji. Best-effort — failures are logged, never thrown,
    * and non-Discord loci are silently skipped.
    */
@@ -8987,8 +8994,9 @@ export class AgentFramework {
           // affected — the turn locus is frozen at turn start, so ambient
           // chatter, reactions, and system markers injected mid-turn can no
           // longer hijack where the agent's prose lands. Non-conversational
-          // injections (reactions, `system: true` markers) don't even clear
-          // the send suppression: nothing new was said to the agent.
+          // injections (`system: true` markers, and reaction, reaction
+          // removal, edit and deletion markers) don't even clear the send
+          // suppression: nothing new was said to the agent.
           if (midTurnInjections.some((inj) => isConversationalInjection(inj.metadata))) {
             this.midTurnInputSignals.add(agent.name);
           }
@@ -9040,11 +9048,12 @@ export class AgentFramework {
           // hospital scene into antra's DM). Re-pin the turn locus to the
           // LAST addressed conversational injection, at segment granularity:
           // prose routed in earlier rounds already went to the old pin,
-          // which was correct when it was delivered. Ambient chatter,
-          // reactions, and system markers still cannot move the pin — the
-          // 2026-07-21 Cairn hijack protection is unchanged; this extends
-          // the ratified addressed-outranks-ambient principle from turn
-          // start to boundaries. Locus mode only (explicit mode has no pin).
+          // which was correct when it was delivered. Ambient chatter, system
+          // markers, and reaction, reaction removal, edit and deletion
+          // markers still cannot move the pin — the 2026-07-21 Cairn hijack
+          // protection is unchanged; this extends the ratified
+          // addressed-outranks-ambient principle from turn start to
+          // boundaries. Locus mode only (explicit mode has no pin).
           // Skipped on endTurn/overBudget: no further prose this stream, and
           // a stale "for this turn" notice would be pure noise.
           //
@@ -9073,7 +9082,8 @@ export class AgentFramework {
             //    fleet's participants include agent-residents whose speech
             //    is as conversational as anyone's — the Discord bot flag
             //    tracks nothing that matters here (antra, 2026-07-31).
-            //    Reactions and system markers are already excluded by
+            //    System markers and reaction, reaction removal, edit and
+            //    deletion markers are already excluded by
             //    isConversationalInjection, and the engaged-this-turn scope
             //    keeps unrelated channels from moving the pin.
             // The last injection that qualifies wins (repinChannel).
@@ -10990,10 +11000,11 @@ export class AgentFramework {
   /**
    * The channel a message moves its turn's locus to, by the addressed
    * re-pin rule (2026-07-31, n=6 and n=7): a conversational message (not a
-   * reaction or a system marker) that addressed the agent, or that follows
-   * up in a channel the turn sent into (TurnRouting.engaged). Undefined for
-   * any other message. A tool boundary weighs the messages it injects by it,
-   * and noteArrival the ones no boundary of the turn weighs.
+   * system marker, nor a reaction, reaction removal, edit or deletion
+   * marker) that addressed the agent, or that follows up in a channel the
+   * turn sent into (TurnRouting.engaged). Undefined for any other message. A
+   * tool boundary weighs the messages it injects by it, and noteArrival the
+   * ones no boundary of the turn weighs.
    */
   private repinChannel(metadata: MessageMetadata | undefined, routing: TurnRouting): string | undefined {
     if (!isConversationalInjection(metadata)) return undefined;

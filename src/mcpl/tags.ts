@@ -19,6 +19,27 @@ const CORE_IMPLIES: Readonly<Record<string, readonly string[]>> = {
 };
 
 /**
+ * RFC-001 core tags that mark a message as being ABOUT the conversation
+ * rather than part of it: reactions (added or removed), edits and deletions
+ * of messages the agent has already seen. These are markers, not turns —
+ * they must not clear explicit-send suppression, count as a new
+ * conversational round, or retarget the default publish channel. Tags are
+ * still never authority (§16.6): this set only ever WITHHOLDS default
+ * conversational treatment, it never grants anything.
+ */
+export const NON_CONVERSATIONAL_TAGS: ReadonlySet<string> = new Set([
+  'chat:reaction',
+  'chat:reaction-remove',
+  'chat:edited',
+  'chat:deleted',
+]);
+
+/** True when a (possibly untyped) tag list carries a non-conversational marker tag. */
+export function hasNonConversationalTag(tags: unknown): boolean {
+  return Array.isArray(tags) && tags.some((t) => typeof t === 'string' && NON_CONVERSATIONAL_TAGS.has(t));
+}
+
+/**
  * Expand a raw tag list over the normative core closure, then resolve the
  * §16.2 mutual exclusion: `chat:addressed` and `chat:ambient` cannot both
  * stand after expansion, and addressed wins — a message that is both

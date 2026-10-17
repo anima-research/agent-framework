@@ -36,7 +36,7 @@ import type {
 import type { McplServerRegistry } from './server-registry.js';
 import type { FeatureSetManager } from './feature-set-manager.js';
 import type { ToolDefinition, ToolResult, ProcessEvent } from '../types/index.js';
-import { expandCoreTags } from './tags.js';
+import { expandCoreTags, hasNonConversationalTag } from './tags.js';
 import { coalesceRejectionReason, EmptyContentError, validateCoalescedContent } from './push-coalescer.js';
 import { isVisiblyEmptyContent } from './visible-content.js';
 import { logDetail, logValue } from './log-value.js';
@@ -390,11 +390,11 @@ const CHANNEL_TOOL_DEFINITIONS: ToolDefinition[] = [
   },
   {
     name: 'channel_publish',
-    description: 'Publish a message to a channel. If channelId is omitted, publishes to the most recent incoming channel.',
+    description: "Publish a message to a channel. If channelId is omitted, publishes to the channel of the most recent incoming message that isn't a reaction, reaction removal, edit or deletion.",
     inputSchema: {
       type: 'object' as const,
       properties: {
-        channelId: { type: 'string', description: 'ID of the channel to publish to (defaults to the most recent incoming channel)' },
+        channelId: { type: 'string', description: "ID of the channel to publish to (defaults to the channel of the most recent incoming message that isn't a reaction, reaction removal, edit or deletion)" },
         content: { type: 'string', description: 'Text content to publish' },
         text: { type: 'string', description: 'Alias for content' },
       },
@@ -521,9 +521,10 @@ interface ChannelRegistryOptions {
    * forks are spawned bound to a single channel (the framework tracks this in
    * `conversationAgentHomes` / `ConversationRouter.channelForAgent`); their
    * plain-text speech must route THERE. The process-global `defaultPublishChannel`
-   * tracks only the most-recent inbound across ALL channels, so with one fork per
-   * channel running concurrently it misroutes a fork's reply to whichever channel
-   * last spoke (item 3). Returns undefined for the trunk/primary agent, which has
+   * tracks only the most recent inbound message across ALL channels (reaction,
+   * reaction-removal, edit and deletion markers aside), so with one fork per
+   * channel running concurrently it misroutes a fork's reply to whichever
+   * channel last spoke (item 3). Returns undefined for the trunk/primary agent, which has
    * no home and correctly falls back to the global locus (heartbeats, etc.).
    */
   homeChannelResolver?: (agentName: string) => string | undefined;
@@ -533,11 +534,12 @@ interface ChannelRegistryOptions {
    * turn. This is the fix for single-TRUNK agents (the only mode
    * connectome-host runs — it never exposes conversation forks). A trunk agent
    * has no fork home, so without this its plain-text speech falls back to the
-   * process-global `defaultPublishChannel`, which tracks the most-recent inbound
-   * across ALL channels and misroutes a reply to whichever channel last spoke
-   * under concurrency (item-3 redux). The framework keeps both on the live
-   * turn's routing state and exposes them here. For a heartbeat / no-trigger
-   * turn it resolves to undefined until the turn's locus is resolved, so that
+   * process-global `defaultPublishChannel`, which tracks the most recent inbound
+   * message across ALL channels (markers aside) and misroutes a reply to
+   * whichever channel last spoke under concurrency (item-3 redux). The
+   * framework keeps both on the live turn's routing state and exposes them
+   * here. For a heartbeat / no-trigger turn it resolves to undefined until the
+   * turn's locus is resolved, so that
    * resolution takes the global fallback, which the turn then keeps.
    * Consulted AFTER `homeChannelResolver` (a fork's home always wins), BEFORE
    * `defaultPublishChannel`.
@@ -649,10 +651,12 @@ export class ChannelRegistry {
    */
   private dmClassified = new Map<string, true>();
 
-  /** Most recent incoming channel ID — used for speech routing / default publish. */
+  /** The channel of the most recent incoming message that isn't a reaction,
+   *  reaction removal, edit or deletion marker: used for speech routing and
+   *  the default publish. */
   private defaultPublishChannel: string | null = null;
 
-  /** Most recent incoming message metadata, used for buildChannelContext. */
+  /** The same message's id and thread, used for buildChannelContext. */
   private defaultPublishMessageId: string | null = null;
   private defaultPublishThreadId: string | undefined = undefined;
 
@@ -1044,9 +1048,15 @@ export class ChannelRegistry {
       // A coalesced item is "accepted" only once the coalescer admits it, so
       // for those this runs after the hook (below).
       const markAccepted = () => {
-        this.defaultPublishChannel = message.channelId;
-        this.defaultPublishMessageId = message.messageId;
-        this.defaultPublishThreadId = message.threadId;
+        // Non-conversational markers (a reaction added or removed, an edit, a
+        // deletion) are ABOUT a message, not one the agent replies to: they
+        // must not retarget the default publish locus or become
+        // `context.incoming`'s reply anchor.
+        if (!hasNonConversationalTag(message.tags)) {
+          this.defaultPublishChannel = message.channelId;
+          this.defaultPublishMessageId = message.messageId;
+          this.defaultPublishThreadId = message.threadId;
+        }
         // A server sending channels/incoming is authoritative evidence that
         // the transport is actually open. This repairs transient status only;
         // durable desired state still changes exclusively through lifecycle
@@ -1318,7 +1328,9 @@ export class ChannelRegistry {
   // ==========================================================================
 
   /**
-   * Get the default publish channel ID (most recent incoming channel).
+   * Get the default publish channel ID: the channel of the most recent
+   * incoming message that isn't a reaction, reaction removal, edit or
+   * deletion marker.
    */
   getDefaultPublishChannel(): string | null {
     return this.defaultPublishChannel;
@@ -1470,7 +1482,9 @@ export class ChannelRegistry {
 
     const context: ChannelContext = {};
 
-    // Incoming: the most-recent inbound message (what the agent is replying to).
+    // Incoming: the most recent inbound message that isn't a reaction,
+    // reaction removal, edit or deletion marker (what the agent is replying
+    // to).
     // Left process-global — per-channel inbound tracking (the right messageId for
     // a fork's own channel) is a separate concern from the outbound routing fix.
     if (this.defaultPublishChannel && this.defaultPublishMessageId) {
@@ -3192,7 +3206,9 @@ export class ChannelRegistry {
       };
     }
 
-    // Resolve channelId: default to most recent incoming channel
+    // Resolve channelId: default to the channel of the most recent incoming
+    // message that isn't a reaction, reaction removal, edit or deletion
+    // marker
     const channelId = input.channelId ?? this.defaultPublishChannel;
     if (!channelId) {
       return {
