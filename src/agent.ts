@@ -529,6 +529,44 @@ export class Agent {
   }
 
   /**
+   * The budget compiles plan at, the path a patch's budget takes from it, and
+   * whether a descent is in flight, from the agent's own state alone: what a
+   * runtime-settings preview can still say while the context manager refuses
+   * its queries.
+   * @internal For the framework's runtime-settings preview; not a host API.
+   */
+  runtimeBudgetPath(patch?: AgentRuntimeSettingsPatch): {
+    liveBudgetTokens: number;
+    path: 'immediate' | 'paced' | 'none';
+    transition: 'stable' | 'converging';
+  } {
+    const live = this.contextBudgetTokens ?? DEFAULT_CONTEXT_BUDGET_TOKENS;
+    const budget = patch?.contextBudgetTokens;
+    return {
+      liveBudgetTokens: live,
+      path: budget === undefined ? 'none' : budget >= live || patch?.immediate ? 'immediate' : 'paced',
+      transition: this.contextBudgetTargetTokens === undefined ? 'stable' : 'converging',
+    };
+  }
+
+  /**
+   * Whether the context manager answers its queries, as its readiness says.
+   * It refuses them while its strategy's initialization is pending or has
+   * failed, until a switchBranch or setStrategy succeeds, and a strategy can
+   * refuse its readiness on its own, as the autobiographical one does for a
+   * branch it hasn't reloaded.
+   * @internal For the framework's runtime-settings preview; not a host API.
+   */
+  contextManagerAnswers(): boolean {
+    try {
+      this.contextManager.isReady();
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  /**
    * Read-only mirror of `updateRuntimeSettings`' budget semantics: derive what
    * the next compile would actually plan at if `patch` were applied, WITHOUT
    * mutating anything. This is the settings→config mapping a feasibility
@@ -570,9 +608,8 @@ export class Agent {
       this.validateRuntimeSettingsPatch(patch);
     }
     const hot = this.getHotContextSettings();
-    const live = this.contextBudgetTokens ?? DEFAULT_CONTEXT_BUDGET_TOKENS;
+    const { liveBudgetTokens: live, path } = this.runtimeBudgetPath(patch);
     const budget = patch?.contextBudgetTokens;
-    const path = budget === undefined ? 'none' : budget >= live || patch?.immediate ? 'immediate' : 'paced';
 
     const overrides: Record<string, unknown> = {};
     if (patch?.tailTokens !== undefined) {
@@ -789,6 +826,18 @@ export class Agent {
   }
 
   private validateRuntimeSettingsPatch(patch: AgentRuntimeSettingsPatch): void {
+    this.checkRuntimeSettingsPatch(patch);
+    if ((patch.tailTokens !== undefined || patch.transitionPaceTokens !== undefined) &&
+        !this.getHotContextSettings()) {
+      throw new Error('The active context strategy does not support live tail/transition settings');
+    }
+  }
+
+  /**
+   * The checks of a runtime-settings patch that need nothing from the context manager.
+   * @internal For the framework's runtime-settings preview; not a host API.
+   */
+  checkRuntimeSettingsPatch(patch: AgentRuntimeSettingsPatch): void {
     if (Object.keys(patch).length === 0) throw new Error('At least one setting is required');
     if (patch.contextBudgetTokens !== undefined) {
       if (!Number.isSafeInteger(patch.contextBudgetTokens) || patch.contextBudgetTokens <= this.maxTokens) {
@@ -807,10 +856,6 @@ export class Agent {
         patch.sameRoundThinkTextPolicy !== 'public' &&
         patch.sameRoundThinkTextPolicy !== 'private') {
       throw new Error("sameRoundThinkTextPolicy must be 'public' or 'private'");
-    }
-    if ((patch.tailTokens !== undefined || patch.transitionPaceTokens !== undefined) &&
-        !this.getHotContextSettings()) {
-      throw new Error('The active context strategy does not support live tail/transition settings');
     }
   }
 

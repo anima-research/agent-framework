@@ -329,6 +329,42 @@ test('resume proceeds without a verdict for an agent whose context manager refus
     await assert.rejects(cm.setStrategy(failing), /strategy initialization failed for the test/);
     assert.throws(() => cm.getHotContextSettings(), /requires successful strategy initialization/);
 
+    // The preview answers rather than throws: no verdict, with what the
+    // agent's own state still says.
+    // The agent runs at the default budget of 100,000 tokens, so 50,000 is a paced descent.
+    const preview = framework.previewAgentRuntimeSettings('agent', { contextBudgetTokens: 50_000 });
+    assert.equal(preview.available, false);
+    assert.match(String(preview.reason), /requires successful strategy initialization/);
+    assert.equal(preview.path, 'paced');
+    assert.equal(preview.liveBudgetTokens, 100_000);
+    assert.equal(preview.transition, 'stable');
+    assert.equal(preview.effective, undefined);
+    // A patch whose values the agent refuses still throws.
+    assert.throws(() => framework.previewAgentRuntimeSettings('agent', { contextBudgetTokens: 5 }), /contextBudgetTokens must be/);
+    assert.throws(() => framework.previewAgentRuntimeSettings('agent', { tailTokens: -1 }), /tailTokens must be/);
+    // Whether the strategy takes a live tail or pace is the manager's to say,
+    // so while it refuses, a patch that sets one gets no verdict either.
+    for (const patch of [{ tailTokens: 2_000 }, { transitionPaceTokens: 1_000 }]) {
+      const unanswered = framework.previewAgentRuntimeSettings('agent', patch);
+      assert.equal(unanswered.available, false, JSON.stringify(patch));
+      assert.match(String(unanswered.reason), /requires successful strategy initialization/);
+      assert.equal(unanswered.liveBudgetTokens, 100_000);
+    }
+
+    // An update of the budget is refused, by the manager, and the preflight
+    // doesn't say it's applying one.
+    const preflight = t.mock.method(console, 'warn', () => {});
+    try {
+      assert.throws(
+        () => framework.updateAgentRuntimeSettings('agent', { contextBudgetTokens: 50_000 }),
+        /requires successful strategy initialization/,
+      );
+      assert.ok(!preflight.mock.calls.some((call) => String(call.arguments[0]).includes('applying without preflight')));
+    } finally {
+      preflight.mock.restore();
+    }
+    assert.equal(framework.getAgent('agent')!.runtimeBudgetPath().liveBudgetTokens, 100_000, 'the budget is as it was');
+
     const warn = t.mock.method(console, 'warn', () => {});
     let status: Awaited<ReturnType<typeof framework.resume>>;
     try {
@@ -339,10 +375,35 @@ test('resume proceeds without a verdict for an agent whose context manager refus
     assert.equal(status.quiesced, false);
     assert.ok(warn.mock.calls.some((call) => {
       const line = String(call.arguments[0]);
-      return line.includes("agent's settings can't be read")
+      return line.includes('feasibility preview unavailable for agent')
         && line.includes('requires successful strategy initialization')
-        && line.includes('proceeding without a verdict for it');
-    }), 'resume warns, naming the agent and the error');
+        && line.includes('proceeding without a verdict');
+    }), 'resume warns, naming the agent and the reason');
+  });
+});
+
+test('a preview stopped by a stale branch generation says branch_generation_changed, as the reason documents', async () => {
+  const membrane = new MockMembrane();
+  await withFramework(membrane, async (framework) => {
+    await framework.quiesce();
+    // As the autobiographical strategy refuses a branch it hasn't reloaded:
+    // its readiness and its settings both say so.
+    const stale = 'TestStrategy.getHotContextSettings requires reinitialization for the current branch generation';
+    const strategy = {
+      name: 'stale-generation-test',
+      async initialize() {},
+      checkReadiness: () => { throw new Error(stale); },
+      getHotContextSettings: () => { throw new Error(stale); },
+      updateHotContextSettings: () => { throw new Error(stale); },
+      async tick() {},
+      select: () => [],
+    } as unknown as ContextStrategy;
+    const cm = framework.getAgent('agent')!.getContextManager();
+    await cm.setStrategy(strategy);
+    const preview = framework.previewAgentRuntimeSettings('agent', { contextBudgetTokens: 50_000 });
+    assert.equal(preview.available, false);
+    assert.equal(preview.reason, 'branch_generation_changed');
+    assert.equal(preview.liveBudgetTokens, 100_000);
   });
 });
 

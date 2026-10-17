@@ -7,16 +7,21 @@
  *   - a transport McplServerConnection keeps for close() while a reconnect's
  *     handshake finishes, and one a failed handshake is closing, each of
  *     which reports an error while nothing else listens for it;
- *   - a write to a child that has closed its stdin.
+ *   - an error on a child's stdin or stdout, which ends the child, and one on
+ *     its stderr, which doesn't; a handshake whose child exits at once; a
+ *     connected server that closes its stdin, and one that only stops
+ *     reading; and the framework's trace of a close's reason.
  */
 import { test, type TestContext } from 'node:test';
 import assert from 'node:assert/strict';
+import { EventEmitter } from 'node:events';
 import type { ChildProcess } from 'node:child_process';
 import type { AddressInfo, Socket } from 'node:net';
 import { WebSocketServer } from 'ws';
 
 import { McplTransport, StdioTransport, type TransportCloseInfo } from '../src/mcpl/transport.js';
 import { McplServerConnection } from '../src/mcpl/server-connection.js';
+import { AgentFramework } from '../src/framework.js';
 
 function deferred() {
   let resolve!: () => void;
@@ -50,7 +55,7 @@ async function waitFor(condition: () => boolean, what: string): Promise<void> {
   }
 }
 
-test('close() resolves for a child that a signal not sent through kill() has already ended', async () => {
+test('close() resolves for a child that a signal not sent through kill() has already ended', { timeout: 10_000 }, async () => {
   const transport = await StdioTransport.spawn({
     id: 'signalled',
     command: process.execPath,
@@ -59,7 +64,8 @@ test('close() resolves for a child that a signal not sent through kill() has alr
   const child = (transport as unknown as { child: ChildProcess }).child;
   const closed = new Promise<TransportCloseInfo>((resolve) => { transport.once('close', resolve); });
   process.kill(child.pid!, 'SIGKILL');
-  const info = await closed;
+  const info = await within(closed, null);
+  assert.ok(info, "the child's close arrived within 5 s");
   assert.equal(info.signal, 'SIGKILL');
   assert.equal(child.exitCode, null);
   assert.equal(child.killed, false, "the signal didn't come through ChildProcess.kill()");
@@ -178,12 +184,12 @@ test("a failed handshake's transport logs an error it reports while it closes, r
   );
 });
 
-/** Settles with the promise's value, or with `fallback` after 5 s, so a test that
- *  waits for something that never comes still reaches its cleanup. */
-async function within<T, F>(promise: Promise<T>, fallback: F): Promise<T | F> {
+/** Settles with the promise's value, or with `fallback` after `ms` (5 s), so a
+ *  test that waits for something that never comes still reaches its cleanup. */
+async function within<T, F>(promise: Promise<T>, fallback: F, ms = 5000): Promise<T | F> {
   let timer: NodeJS.Timeout | undefined;
   try {
-    return await Promise.race([promise, new Promise<F>((resolve) => { timer = setTimeout(() => resolve(fallback), 5000); })]);
+    return await Promise.race([promise, new Promise<F>((resolve) => { timer = setTimeout(() => resolve(fallback), ms); })]);
   } finally {
     clearTimeout(timer);
   }
@@ -204,61 +210,206 @@ async function spawnDeafChild(t: TestContext, id: string): Promise<StdioTranspor
   return transport;
 }
 
-test("a failed write to a child's stdin reaches the transport's 'error' listener", { timeout: 10_000 }, async (t) => {
-  const transport = await spawnDeafChild(t, 'deaf-heard');
-  const reported = new Promise<NodeJS.ErrnoException>((resolve) => { transport.once('error', resolve); });
+test("a failed write to a child's stdin ends the child, and the transport's close names the failure", { timeout: 10_000 }, async (t) => {
+  const transport = await spawnDeafChild(t, 'deaf-write');
+  const errors: string[] = [];
+  transport.on('error', (error: Error) => { errors.push(error.message); });
+  const closed = new Promise<TransportCloseInfo>((resolve) => { transport.once('close', resolve); });
+  // The child has closed its stdin and is still running: the write's
+  // EPIPE leaves the transport unable to reach it.
   transport.writeLine('{}');
-  const error = await within(reported, null);
-  assert.ok(error, "the write's failure reached the transport's 'error' listener within 5 s");
-  assert.equal(error.code, 'EPIPE');
+  const info = await within(closed, null);
+  assert.ok(info, 'the transport closed within 5 s');
+  assert.equal(info.signal, 'SIGTERM', 'the transport ended the child');
+  assert.equal(info.reason, 'child process exited, and its pipe failed with write EPIPE');
+  assert.deepEqual(errors, [], "the close is the report: no 'error' is emitted");
 });
 
-test("a failed write to a child's stdin with nothing listening is not thrown", { timeout: 10_000 }, async (t) => {
-  const transport = await spawnDeafChild(t, 'deaf-unheard');
+test("a read error on a child's stdout ends the child the same way, and nothing is thrown", { timeout: 10_000 }, async (t) => {
+  const transport = await spawnDeafChild(t, 'pipes-stdout');
   const child = (transport as unknown as { child: ChildProcess }).child;
-  const failed = new Promise<void>((resolve) => { child.stdin!.once('close', () => resolve()); });
-  transport.writeLine('{}');
-  // The EPIPE destroys stdin; an 'error' nothing caught would have failed
-  // this test as an uncaught exception by the time its 'close' arrives.
-  assert.equal(await within(failed.then(() => 'closed'), 'still open after 5 s'), 'closed');
-  assert.equal(transport.listenerCount('error'), 0);
-});
-
-test("a read error on a child's stdout or stderr reaches the transport's 'error' listener once", { timeout: 10_000 }, async (t) => {
-  const transport = await spawnDeafChild(t, 'pipes-heard');
-  const child = (transport as unknown as { child: ChildProcess }).child;
-  for (const [name, stream] of [['stdout', child.stdout!], ['stderr', child.stderr!]] as const) {
-    const heard: string[] = [];
-    const onError = (error: Error) => { heard.push(error.message); };
-    transport.on('error', onError);
-    stream.destroy(new Error(`injected ${name} read failure`));
-    // A destroyed stream emits its 'error' on the next tick.
-    await new Promise((resolve) => setImmediate(resolve));
-    transport.off('error', onError);
-    assert.deepEqual(heard, [`injected ${name} read failure`]);
-  }
-});
-
-test("a read error on a child's stdout or stderr with nothing listening is not thrown", { timeout: 10_000 }, async (t) => {
-  const transport = await spawnDeafChild(t, 'pipes-unheard');
-  const child = (transport as unknown as { child: ChildProcess }).child;
+  const closed = new Promise<TransportCloseInfo>((resolve) => { transport.once('close', resolve); });
+  // Nothing listens for 'error' on the transport: an error thrown from the
+  // stream would fail this test as an uncaught exception.
   child.stdout!.destroy(new Error('injected stdout read failure'));
-  child.stderr!.destroy(new Error('injected stderr read failure'));
-  // Both errors are emitted on the next tick; one nothing caught would have
-  // failed this test as an uncaught exception by then.
-  await new Promise((resolve) => setImmediate(resolve));
-  assert.equal(transport.listenerCount('error'), 0);
+  const info = await within(closed, null);
+  assert.ok(info, 'the transport closed within 5 s');
+  assert.equal(info.signal, 'SIGTERM');
+  assert.equal(info.reason, 'child process exited, and its pipe failed with injected stdout read failure');
 });
 
-test("a read error on a child's stdout that arrives while close() runs reaches the listener, not thrown", { timeout: 10_000 }, async (t) => {
-  const transport = await spawnDeafChild(t, 'pipes-closing');
+test("a read error on a child's stderr reaches the transport's 'error' listener once, ends nothing, and with no listener isn't thrown", { timeout: 10_000 }, async (t) => {
+  const transport = await spawnDeafChild(t, 'pipes-stderr');
   const child = (transport as unknown as { child: ChildProcess }).child;
   const heard: string[] = [];
-  transport.on('error', (error: Error) => { heard.push(error.message); });
+  const onError = (error: Error) => { heard.push(error.message); };
+  transport.on('error', onError);
+  child.stderr!.destroy(new Error('injected stderr read failure'));
+  // A destroyed stream emits its 'error' on the next tick.
+  await new Promise((resolve) => setImmediate(resolve));
+  transport.off('error', onError);
+  assert.deepEqual(heard, ['injected stderr read failure']);
+  assert.equal(child.exitCode, null, 'stderr carries diagnostics only: the child is still running');
+  assert.equal(child.killed, false);
+
+  // With nothing listening, the same error is neither thrown (that would fail
+  // this test as an uncaught exception) nor the end of the child.
+  const unheard = await spawnDeafChild(t, 'pipes-stderr-unheard');
+  const unheardChild = (unheard as unknown as { child: ChildProcess }).child;
+  assert.equal(unheard.listenerCount('error'), 0);
+  unheardChild.stderr!.destroy(new Error('injected stderr read failure'));
+  await new Promise((resolve) => setImmediate(resolve));
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(unheardChild.exitCode, null);
+  assert.equal(unheardChild.killed, false);
+});
+
+test("a read error on a child's stdout that arrives while close() runs is not thrown", { timeout: 10_000 }, async (t) => {
+  const transport = await spawnDeafChild(t, 'pipes-closing');
+  const child = (transport as unknown as { child: ChildProcess }).child;
   // destroy() emits the error on the next tick, after close() has closed
   // readline, which takes readline's own listener off the stream.
   child.stdout!.destroy(new Error('injected stdout read failure'));
+  const closed = new Promise<TransportCloseInfo>((resolve) => { transport.once('close', resolve); });
   await transport.close();
   await new Promise((resolve) => setImmediate(resolve));
-  assert.deepEqual(heard, ['injected stdout read failure']);
+  assert.equal((await closed).reason, 'closed by host', "the host's close came first, and the error changes nothing");
+});
+
+test('a handshake whose child exits at once is refused by its close, never by a pipe error that raced the exit', { timeout: 30_000 }, async () => {
+  // `false` exits before its stdin is read, so the initialize write can fail
+  // with EPIPE before or after the exit: the maintainer's review measured 4
+  // of 10 runs with the EPIPE first. Either way the refusal is the close's.
+  let withPipeError = 0;
+  for (let run = 0; run < 10; run++) {
+    const refusal = await McplServerConnection.connect({ id: 'exits-at-once', command: 'false' }, { version: '0.5' })
+      .then(() => 'connected', (error: Error) => error.message);
+    assert.match(refusal, /^MCPL server "exits-at-once" transport closed before handshake completed \(child process exited(, and its pipe failed with write EPIPE)?\)$/);
+    if (refusal.includes('its pipe failed')) withPipeError++;
+  }
+  // Not asserted: whether a run raced is the platform's. Logged for the reader.
+  console.log(`# ${withPipeError} of 10 refusals named a pipe error that raced the exit`);
+});
+
+test('a server that closes its stdin is ended: a request fails with the disconnect, and the connection reconnects', { timeout: 60_000 }, async (t) => {
+  // Answers initialize, then, once the initialized notification is in, closes
+  // its stdin and says so on stderr, staying alive. (A server that only stops
+  // reading, leaving its stdin open, raises no error: the parent's writes are
+  // buffered, and its requests end at their timeout.)
+  const deafAfterInitialize = [
+    "const rl = require('readline').createInterface({ input: process.stdin });",
+    "rl.on('line', (line) => {",
+    '  const message = JSON.parse(line);',
+    "  if (message.method === 'initialize') {",
+    "    process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: message.id, result: { protocolVersion: '2024-11-05', capabilities: { experimental: { mcpl: { version: '0.5' } } }, serverInfo: { name: 'deaf-after-initialize', version: '0.0.0' } } }) + '\\n');",
+    "  } else if (message.method === 'notifications/initialized') {",
+    // Node keeps a stdio descriptor open when its stream is destroyed, so the
+    // read end is closed by hand once the stream is done with it. The line on
+    // stderr comes after, so a write that follows it fails.
+    "    process.stdin.once('close', () => { try { require('fs').closeSync(0); } catch {} console.error('closed stdin'); });",
+    '    rl.close(); process.stdin.destroy();',
+    '  }',
+    '});',
+    'setInterval(() => {}, 1 << 30);',
+  ].join('\n');
+  const connection = await McplServerConnection.connectWithReconnect(
+    {
+      id: 'deaf-after-initialize',
+      command: process.execPath,
+      args: ['-e', deafAfterInitialize],
+      reconnect: true,
+      reconnectIntervalMs: 10,
+      reconnectMaxIntervalMs: 10,
+    },
+    { version: '0.5' },
+  );
+  t.after(() => connection.close());
+  assert.equal(connection.isConnected, true);
+  const deaf = new Promise<void>((resolve) => {
+    connection.on('stderr', ({ line }: { line: string }) => { if (line === 'closed stdin') resolve(); });
+  });
+  const closed = new Promise<{ reason?: string }>((resolve) => {
+    connection.once('close', (_code: unknown, _signal: unknown, info: { reason?: string }) => resolve(info));
+  });
+  const reconnected = new Promise<void>((resolve) => { connection.once('reconnect', () => resolve()); });
+  connection.ready();
+  assert.equal(await within(deaf.then(() => 'deaf'), 'no word from the server within 15 s', 15_000), 'deaf');
+
+  // Its timeout is 30 s, so an answer within 15 s comes from the transport's close.
+  const answer = connection.sendManifestRequest(30_000).then(() => 'answered', (error: Error) => error.message);
+  assert.match(
+    await within(answer, 'still waiting after 15 s', 15_000),
+    /^MCPL server "deaf-after-initialize" disconnected unexpectedly \(code=n\/a, signal=SIGTERM, reason=child process exited, and its pipe failed with write EPIPE\) while awaiting mcpl\/manifest/,
+  );
+  assert.equal((await within(closed, null, 15_000))?.reason, 'child process exited, and its pipe failed with write EPIPE');
+  assert.equal(await within(reconnected.then(() => 'reconnected'), 'no reconnect within 15 s', 15_000), 'reconnected');
+});
+
+test("the framework's mcpl:server-closed trace carries the transport's reason, and leaves a WebSocket server's own close text off", () => {
+  const framework = Object.create(AgentFramework.prototype) as {
+    traceListeners: unknown[];
+    onTrace(listener: (event: Record<string, unknown>) => void): void;
+    wireMcplEvents(connection: unknown): void;
+  };
+  framework.traceListeners = [];
+  const closes: Array<Record<string, unknown>> = [];
+  framework.onTrace((event) => { if (event.type === 'mcpl:server-closed') closes.push(event); });
+  const connection = Object.assign(new EventEmitter(), { id: 'srv', willReconnect: true });
+  framework.wireMcplEvents(connection);
+  connection.emit('close', null, 'SIGTERM', {
+    transport: 'stdio', code: null, signal: 'SIGTERM', byHost: false,
+    reason: 'child process exited, and its pipe failed with write EPIPE',
+  });
+  connection.emit('close', 4001, null, {
+    transport: 'websocket', code: 4001, signal: null, byHost: false, reason: 'token expired', reasonFromPeer: true,
+  });
+  connection.emit('close', null, null);
+  assert.deepEqual(closes.map(({ code, signal, reason }) => ({ code, signal, reason })), [
+    { code: null, signal: 'SIGTERM', reason: 'child process exited, and its pipe failed with write EPIPE' },
+    { code: 4001, signal: null, reason: null },
+    { code: null, signal: null, reason: null },
+  ]);
+});
+
+test("a server that stops reading its stdin without closing it stays connected, and a request ends at its own timeout", { timeout: 20_000 }, async (t) => {
+  // Answers initialize, then, once the initialized notification is in, stops
+  // reading and says so on stderr, keeping its stdin open and staying alive.
+  const stopsReading = [
+    "const rl = require('readline').createInterface({ input: process.stdin });",
+    "rl.on('line', (line) => {",
+    '  const message = JSON.parse(line);',
+    "  if (message.method === 'initialize') {",
+    "    process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: message.id, result: { protocolVersion: '2024-11-05', capabilities: { experimental: { mcpl: { version: '0.5' } } }, serverInfo: { name: 'stops-reading', version: '0.0.0' } } }) + '\\n');",
+    "  } else if (message.method === 'notifications/initialized') {",
+    "    rl.pause(); process.stdin.pause(); console.error('stopped reading');",
+    '  }',
+    '});',
+    'setInterval(() => {}, 1 << 30);',
+  ].join('\n');
+  const connection = await McplServerConnection.connectWithReconnect(
+    {
+      id: 'stops-reading',
+      command: process.execPath,
+      args: ['-e', stopsReading],
+      reconnect: true,
+      reconnectIntervalMs: 10,
+      reconnectMaxIntervalMs: 10,
+    },
+    { version: '0.5' },
+  );
+  t.after(() => connection.close());
+  assert.equal(connection.isConnected, true);
+  const deaf = new Promise<void>((resolve) => {
+    connection.on('stderr', ({ line }: { line: string }) => { if (line === 'stopped reading') resolve(); });
+  });
+  let closed = false;
+  connection.once('close', () => { closed = true; });
+  connection.ready();
+  assert.equal(await within(deaf.then(() => 'deaf'), 'no word from the server within 5 s'), 'deaf');
+
+  // Nothing fails the write, so only the request's own 500 ms timeout ends it.
+  const answer = connection.sendManifestRequest(500).then(() => 'answered', (error: Error) => error.message);
+  assert.match(await within(answer, 'still waiting after 5 s'), /^MCPL server "stops-reading" did not respond to mcpl\/manifest \(id=\d+\) within 500ms/);
+  assert.equal(closed, false, 'nothing closed the connection');
+  assert.equal(connection.isConnected, true, 'the connection is still up');
 });

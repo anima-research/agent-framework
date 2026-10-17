@@ -374,7 +374,11 @@ export interface McplServerConfig {
    * accepts a request and never responds would otherwise freeze the awaiting
    * agent turn forever; with the timeout the pending request rejects with a
    * descriptive error, which the framework surfaces as a normal isError
-   * tool_result. Set 0 to disable. Default: 60000 (60 seconds).
+   * tool_result. Request timeouts are the only bound for a stdio server that
+   * stops reading its stdin without closing it: the host's writes are
+   * buffered, no error is raised, and the connection stays up. This is the
+   * timeout of every request that names none; the handshake's initialize has
+   * its own. Set 0 to disable. Default: 60000 (60 seconds).
    */
   requestTimeoutMs?: number;
 
