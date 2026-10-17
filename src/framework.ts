@@ -3473,7 +3473,8 @@ export class AgentFramework {
       // refusal decides nothing if something in the signature moved while it
       // ran (compression's progress or whether it has work, the store, a
       // surgery whose own look this check turned away): the next look takes a
-      // fresh verdict. So `pending` is still current below.
+      // fresh verdict. So `pending` is still current below, as far as the
+      // signature can be read.
       if (verdict === 'refused' && this.budgetHoldSignature(agent) !== signature) return;
     }
     // A refusal is final only if compression has nothing pending.
@@ -9132,9 +9133,9 @@ export class AgentFramework {
   }
 
   /** Drop the agent's newest turn checkpoint, if it is the one this start
-   *  recorded, and put back what recording it took, the checkpoints it
-   *  evicted and the redo it invalidated, so that undo and redo are as they
-   *  were before the start (holdForBudgetRefusal). */
+   *  recorded, and put back what recording it took: the checkpoints it
+   *  evicted, the redo it invalidated and its turn index, so that undo and
+   *  redo are as they were before the start (holdForBudgetRefusal). */
   private dropTurnCheckpoint(agentName: string, recorded: RecordedTurnCheckpoint): void {
     const checkpoints = this.getTurnCheckpoints(agentName);
     if (checkpoints.at(-1)?.turnIndex !== recorded.turnIndex) return;
@@ -9142,6 +9143,7 @@ export class AgentFramework {
     checkpoints.unshift(...recorded.evicted);
     this.saveTurnCheckpoints(agentName, checkpoints);
     if (recorded.redo) this.redoStacks.set(agentName, recorded.redo);
+    this.turnCounters.set(agentName, recorded.turnIndex);
   }
 
   /**
@@ -11274,23 +11276,6 @@ export class AgentFramework {
       const providerWait = this.providerWaits?.active(agentName, agent.model);
       if (providerWait && !this.ephemeralRuns.has(agentName) && this.holdForProviderWait(agent, providerWait, requests)) continue;
 
-      // Skip if agent is busy (inferring, streaming, or waiting for tools) —
-      // or if a turn is alive at all (activeTurnTokens): the state machine
-      // goes idle at endTurn's reset while driveStream teardown is still
-      // pending, and a successor turn dequeued in that gap compiles while the
-      // predecessor's deferred flush can still write (2026-07-31 Mythos).
-      // Turn-alive spans dequeue → settled teardown; wakes wait it out.
-      //
-      // EXCEPT a context-budget restart: it CONTINUES the turn whose token is
-      // held — queueing it behind its own turn's teardown is a deadlock when
-      // that teardown lags (the cancelled stream's `aborted` event is
-      // asynchronous and, historically, not even guaranteed — see the
-      // overBudget branch). The restart's startAgentStream overwrites the
-      // token; the predecessor frame's late finally no-ops via token-match.
-      // This mirrors how the restart has always overwritten activeStreams
-      // rather than waiting for the old stream's teardown.
-      const budgetRestart = requests.find((r) => r.reason === 'context_budget_restart');
-
       // Host quiesce (issue #122): park wakes instead of starting turns —
       // the requeue mirrors the busy path below, so requests survive and
       // fire at resume. A context-budget restart passes through: it
@@ -11327,6 +11312,46 @@ export class AgentFramework {
         // the batch to the continuation(s) alone before the trigger selection.
         requests.length = 0;
         requests.push(...passThrough);
+      }
+
+      // Skip if agent is busy (inferring, streaming, or waiting for tools) —
+      // or if a turn is alive at all (activeTurnTokens): the state machine
+      // goes idle at endTurn's reset while driveStream teardown is still
+      // pending, and a successor turn dequeued in that gap compiles while the
+      // predecessor's deferred flush can still write (2026-07-31 Mythos).
+      // Turn-alive spans dequeue → settled teardown; wakes wait it out.
+      //
+      // EXCEPT a context-budget restart: it CONTINUES the turn whose token is
+      // held — queueing it behind its own turn's teardown is a deadlock when
+      // that teardown lags (the cancelled stream's `aborted` event is
+      // asynchronous and, historically, not even guaranteed — see the
+      // overBudget branch). The restart's startAgentStream overwrites the
+      // token; the predecessor frame's late finally no-ops via token-match.
+      // This mirrors how the restart has always overwritten activeStreams
+      // rather than waiting for the old stream's teardown. Taken from the
+      // requests quiesce let through, so a restart it parked defines nothing.
+      const budgetRestart = requests.find((r) => r.reason === 'context_budget_restart');
+      // The request that grants the turn-alive exception must also define the
+      // downstream turn semantics. An ordinary wake can already be pending
+      // when the tool boundary appends a context-budget restart; selecting
+      // requests[0] in that mixed batch bypassed the turn lock because a
+      // restart existed, then treated the continuation as a fresh turn. So
+      // does any request that resumes a logical turn, such as a guard retry a
+      // budget hold released, wherever it was queued.
+      const trigger = budgetRestart ?? requests.find((r) => resumesLogicalTurn(r.reason)) ?? requests[0];
+      // A turn that resumes a logical turn skips batch assembly
+      // (beginAgentTurn), so a deferred batch's wake can't be one of its
+      // causes: its batch would never render. It stays queued for a fresh
+      // turn of its own, as it would behind any running turn, and its own
+      // policy decision. This covers a wake that waited behind a turn which
+      // then restarted, and one that joined a held continuation and was
+      // released beside it (#304).
+      if (resumesLogicalTurn(trigger?.reason)) {
+        const batches = requests.filter((r) => r !== trigger && r.coalescingBatch === true);
+        if (batches.length > 0) {
+          this.pendingRequests.push(...batches);
+          requests = requests.filter((r) => !batches.includes(r));
+        }
       }
 
       const turnAlive = !budgetRestart && this.activeTurnTokens.has(agentName);
@@ -11413,25 +11438,7 @@ export class AgentFramework {
       }
 
       // Start streaming inference (non-blocking — driveStream runs in background)
-      // The request that grants the turn-alive exception must also define the
-      // downstream turn semantics. An ordinary wake can already be pending
-      // when the tool boundary appends a context-budget restart; selecting
-      // requests[0] in that mixed batch bypassed the turn lock because a
-      // restart existed, then treated the continuation as a fresh turn.
-      const trigger = budgetRestart ?? requests[0];
-      // A turn that resumes a logical turn skips batch assembly
-      // (beginAgentTurn), so a deferred batch's wake can't be one of its
-      // causes: its batch would never render. It stays queued for a fresh
-      // turn of its own, as it would behind any running turn. A wake that
-      // joined a held continuation is released beside it (#304), and one that
-      // waited behind a turn that then restarted is dequeued with the restart.
-      if (resumesLogicalTurn(trigger?.reason)) {
-        const batches = requests.filter((r) => r !== trigger && r.coalescingBatch === true);
-        if (batches.length > 0) {
-          this.pendingRequests.push(...batches);
-          requests = requests.filter((r) => !batches.includes(r));
-        }
-      }
+      // from the trigger chosen above.
       // Route this turn's auto-published speech to the channel that triggered
       // it (item-3 redux). A batched wake may carry several triggering channels
       // (messages arrived in >1 channel while the agent was busy/idle):
@@ -12227,8 +12234,9 @@ export class AgentFramework {
           // park; starting here would bypass it and run a turn against a
           // context the operator believes frozen. Give admission back and
           // requeue — the scheduler re-parks it (coalesced) until resume.
-          // Continuations of a held turn pass, as they do at the gate.
-          if (this.quiesced && !isTurnContinuation(trigger?.reason ?? '')) {
+          // A continuation of a turn whose token is held passes, as at the
+          // gate; one a budget hold released parks, as at the gate.
+          if (this.quiesced && !(trigger && passesQuiesce(trigger))) {
             this.releasePrimaryProviderGate(agent.name);
             this.pendingRequests.push(trigger ?? {
               agentName: agent.name, reason: 'provider-admission:requeue', source: 'scheduler', timestamp: Date.now(),
@@ -12293,6 +12301,11 @@ export class AgentFramework {
     // clears our own token. Token-matched, so when a retry frame has replaced
     // the token, or the terminal-failure branch already deleted it, this
     // no-ops instead of clobbering a successor's marker.
+    // The turn starts here and holds its token, so a budget hold's mark on
+    // the request that started it ends here: nothing the turn retries or
+    // queues from its trigger is parked by quiesce as the release was
+    // (passesQuiesce).
+    if (trigger?.releasedByBudgetHold) trigger = { ...trigger, releasedByBudgetHold: undefined };
     const turnToken = this.nextTurnToken++;
     this.activeTurnTokens.set(agent.name, turnToken);
     this.activeTurnTriggers.set(agent.name, trigger);

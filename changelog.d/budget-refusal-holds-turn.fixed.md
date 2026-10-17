@@ -47,12 +47,16 @@
     once per 15 minutes for an agent), and says the turn is held until its
     deadline. A hold's drain kicks log as `[budget-hold]`. While the host is
     quiesced, a turn a hold releases waits for resume as a parked wake does,
-    a continuation included, so no turn starts after `quiesce()` reported the
-    host drained. `getHostModeStatus()` counts it among `gatedRequests`, and
-    its new `heldTurns` counts the turns still held.
+    a continuation included, whether it's still queued or already waiting
+    on provider admission, so no such turn starts while the host is
+    quiesced. `getHostModeStatus()` counts it among `gatedRequests`, and its
+    new `heldTurns` counts the turns still held.
 - A deferred batch's wake that waited behind a turn which then restarted for
   its context budget was consumed by the restarted turn, which continues the
   same logical turn and skips batch assembly, so the batch never rendered
-  until some later turn. It now stays queued and wakes a fresh turn of its
-  own once the restarted turn ends. A wake that joins a held continuation
-  (above) is kept out of it the same way.
+  until some later turn, or was dropped with it when the inference policy
+  declined the restart. It now stays queued, with its own policy decision,
+  and wakes a fresh turn of its own once the restarted turn ends. A wake
+  that joins a held continuation (above) is kept out of it the same way,
+  and a continuation a hold releases is its turn's trigger wherever it was
+  queued.
