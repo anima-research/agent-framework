@@ -648,6 +648,15 @@ function isTurnContinuation(reason: string): boolean {
   return reason === 'context_budget_restart' || reason === 'tool_results_ready'
     || reason === 'tool_result_guard_retry';
 }
+
+/** Whether host quiesce lets a queued request through rather than parking
+ *  it: a continuation of a turn whose token is held, which quiesce's drain
+ *  must let finish. A continuation a budget hold released continues a turn
+ *  that gave its token back when it was held, so it parks, as a wake does,
+ *  and runs at resume (#304). */
+function passesQuiesce(request: InferenceRequest): boolean {
+  return isTurnContinuation(request.reason) && request.releasedByBudgetHold !== true;
+}
 const CONVERSATION_ROUTER_STATE_ID = 'framework/conversation-router';
 const INFERENCE_LOG_ID = 'framework/inference-log';
 const PROCESS_LOG_ID = 'framework/process-log';
@@ -666,6 +675,16 @@ interface TurnCheckpoint {
   sequenceBefore: number;
   branchName: string;
   timestamp: number;
+}
+
+/** A turn checkpoint as its start recorded it: its turn index, the oldest
+ *  checkpoints the record evicted at the depth limit, and the redo entries
+ *  the start's new work invalidated, all of which dropping it puts back
+ *  (dropTurnCheckpoint). */
+interface RecordedTurnCheckpoint {
+  turnIndex: number;
+  evicted: TurnCheckpoint[];
+  redo?: RedoEntry[];
 }
 
 type DiscordAwarenessDrainOutcome =
@@ -892,9 +911,14 @@ export interface HostModeStatus {
   parkedAdmissions: number;
   /** Inference requests parked by the quiesce wake gate (while quiesced), or
    * simply queued (while serving — non-zero right after a resume until the
-   * scheduler's next pass consumes them). Continuations of a held turn
-   * (budget restart, tool results) are never counted. */
+   * scheduler's next pass consumes them). Continuations of a turn whose token
+   * is held (budget restart, tool results) are never counted; one a budget
+   * hold released is, since it parks until resume (#304). */
   gatedRequests: number;
+  /** Turns held for budget (#304), each waiting for compression to make its
+   * context fit. One a hold releases while the host is quiesced parks with
+   * the gated requests and runs at resume. */
+  heldTurns: number;
   /** Background code-execution scripts still running. Quiesce does NOT stop
    * them — they hold no turn token, so drain doesn't wait for them. Reported
    * so the operator sees what is still acting during the window. */
@@ -3286,10 +3310,12 @@ export class AgentFramework {
    *
    * Only a turn that comes through the scheduler holds: a resident's or a
    * conversation agent's. An ephemeral run's caller is waiting on it, so its
-   * refusal keeps the error policy's path. So does a refusal while the
-   * context manager has nothing pending, since compression can't change it;
-   * one of a turn whose hold is spent; and one once stop() has closed
-   * provider admission.
+   * refusal keeps the error policy's path. So does a refusal in a framework
+   * that isn't running: one start() hasn't started, where only runUntilIdle()
+   * runs turns and nothing would run the released one, and one stop() has
+   * begun to stop. So does one while the context manager has nothing
+   * pending, since compression can't change it, and one of a turn whose hold
+   * is spent.
    *
    * The agent's one record of its held turn (BudgetHold) lasts from the first
    * refusal until that turn's stream exists or the turn ends. A refusal of
@@ -3302,12 +3328,12 @@ export class AgentFramework {
     agent: Agent,
     error: Error,
     trigger: InferenceRequest | undefined,
-    /** The turn checkpoint the refused start recorded, by turn index. */
-    checkpoint: number | undefined,
+    /** The turn checkpoint the refused start recorded. */
+    checkpoint: RecordedTurnCheckpoint | undefined,
   ): boolean {
     const { errorType } = this.classifyInferenceError(error);
     if (errorType !== 'over_budget' && errorType !== 'context_refusal') return false;
-    if (!this.budgetHolds || this.providerAdmissionClosed) return false;
+    if (!this.budgetHolds || !this.running) return false;
     if (this.ephemeralRuns.has(agent.name) || this.agents.get(agent.name) !== agent) return false;
     const existing = this.budgetHolds.get(agent.name);
     if (existing?.state === 'spent') return false;
@@ -3320,11 +3346,12 @@ export class AgentFramework {
     const own: InferenceRequest = trigger
       ? { ...trigger, coalescingSubject: undefined, coalescingBatch: undefined, coalescingBatchSubjects: undefined }
       : { agentName: agent.name, reason: 'budget-hold-release', source: 'framework', timestamp: Date.now() };
-    // One held turn is one undo step: the refused start's checkpoint goes, and
-    // the released start records the turn's, after the inputs that joined it.
-    // A start can reach its compile while a hold waits (one parked for the
-    // primary provider's admission resumes without the scheduler's look at
-    // the hold), and joins it, its checkpoint going too.
+    // One held turn is one undo step: the refused start's checkpoint goes,
+    // with what recording it took back (the checkpoints it evicted, the redo
+    // it invalidated), and the released start records the turn's, after the
+    // inputs that joined it. A start can reach its compile while a hold waits
+    // (one parked for the primary provider's admission resumes without the
+    // scheduler's look at the hold), and joins it, its checkpoint going too.
     if (existing?.state === 'holding') {
       if (!existing.heldRequests.some((r) => this.sameInferenceRequest(r, own))) existing.heldRequests.push(own);
       if (checkpoint !== undefined) this.dropTurnCheckpoint(agent.name, checkpoint);
@@ -3427,7 +3454,8 @@ export class AgentFramework {
     const hold = this.budgetHolds?.get(agentName);
     const agent = this.agents.get(agentName);
     if (hold?.state !== 'holding' || !agent || this.surgeryHold) return;
-    const signature = this.budgetHoldSignature(agent);
+    const pending = this.compressionPending(agent);
+    const signature = this.budgetHoldSignature(agent, pending);
     if (signature !== undefined && signature === hold.lookedAt) return;
     let verdict = this.budgetHoldPreview(agent);
     if (verdict === undefined) {
@@ -3443,15 +3471,12 @@ export class AgentFramework {
       if (this.agents.get(agentName) !== agent || this.surgeryHold) return;
       // The dry compile planned the context as it stood when it began. A
       // refusal decides nothing if something in the signature moved while it
-      // ran (compression, the store, a surgery whose own look this check
-      // turned away): the next look takes a fresh verdict.
+      // ran (compression's progress or whether it has work, the store, a
+      // surgery whose own look this check turned away): the next look takes a
+      // fresh verdict. So `pending` is still current below.
       if (verdict === 'refused' && this.budgetHoldSignature(agent) !== signature) return;
     }
-    // Whether compression has work is read as the verdict is applied, not
-    // before the dry compile: a strategy's readiness can change without its
-    // progress snapshot showing it, and a refusal is final only if nothing is
-    // pending now.
-    const pending = this.compressionPending(agent);
+    // A refusal is final only if compression has nothing pending.
     if (verdict === 'refused' && pending) {
       hold.lookedAt = signature;
     } else if (verdict === 'refused') {
@@ -3513,20 +3538,26 @@ export class AgentFramework {
   }
 
   /**
-   * What can make a held turn's context fit: compression's progress, the
-   * agent's store (a message added, edited or removed, by any path), the
-   * agent's runtime settings (its budget, and the tail and pace that shape
-   * the plan), and surgeries on the store. A verdict isn't taken again until
-   * one of them changes. For a strategy that reports no progress, or none it
-   * can read (as while it waits to reinitialize for a new branch), whether it
-   * still has compression pending stands in for its progress. Undefined, so
-   * that the check runs, when anything else can't be read.
+   * What can make a held turn's context fit: compression's progress and
+   * whether it still has compression pending, the agent's store (a message
+   * added, edited or removed, by any path), the agent's runtime settings (its
+   * budget, and the tail and pace that shape the plan), and surgeries on the
+   * store. A verdict isn't taken again until one of them changes. Pending sits
+   * beside the strategy's progress snapshot, which needn't cover what its
+   * readiness reads, and alone for a strategy that reports no progress, or
+   * none it can read (as while it waits to reinitialize for a new branch).
+   * Undefined, so that the check runs, when anything else can't be read.
    */
-  private budgetHoldSignature(agent: Agent): string | undefined {
+  private budgetHoldSignature(agent: Agent, pending = this.compressionPending(agent)): string | undefined {
     try {
       const cm = agent.getContextManager();
-      const progress = this.contextProgress(cm) ?? { pending: this.compressionPending(agent) };
-      return JSON.stringify([progress, this.storeChangeCount(cm), agent.getRuntimeSettings(), this.storeSurgeries]);
+      return JSON.stringify([
+        this.contextProgress(cm) ?? null,
+        pending,
+        this.storeChangeCount(cm),
+        agent.getRuntimeSettings(),
+        this.storeSurgeries,
+      ]);
     } catch {
       return undefined;
     }
@@ -3601,7 +3632,9 @@ export class AgentFramework {
     // since its predecessor would have kept the gate open: this one didn't,
     // so its start opens it again (beginAgentTurn).
     hold.gateClosed = hold.heldRequests.some((r) => resumesLogicalTurn(r.reason));
-    this.pendingRequests.push(...hold.heldRequests);
+    // Marked, so that host quiesce parks them until resume, continuations
+    // included: the turn gave its token back when it was held (passesQuiesce).
+    this.pendingRequests.push(...hold.heldRequests.map((r) => ({ ...r, releasedByBudgetHold: true })));
     hold.heldRequests = [];
   }
 
@@ -5148,7 +5181,8 @@ export class AgentFramework {
       drained: this.activeTurnTokens.size === 0 && parkedAdmissions === 0,
       activeTurns: this.activeTurnTokens.size,
       parkedAdmissions,
-      gatedRequests: this.pendingRequests.filter((r) => !isTurnContinuation(r.reason)).length,
+      gatedRequests: this.pendingRequests.filter((r) => !passesQuiesce(r)).length,
+      heldTurns: [...(this.budgetHolds?.values() ?? [])].filter((hold) => hold.state === 'holding').length,
       backgroundScripts: [...this.backgroundScripts.values()]
         .filter((record) => record.status === 'running').length,
       deferredWrites: this.deferredMessages.length,
@@ -9073,7 +9107,7 @@ export class AgentFramework {
   // Turn checkpoint internals
   // ==========================================================================
 
-  private recordTurnCheckpoint(agentName: string): number {
+  private recordTurnCheckpoint(agentName: string): RecordedTurnCheckpoint {
     const turnIndex = this.turnCounters.get(agentName) ?? 0;
     this.turnCounters.set(agentName, turnIndex + 1);
 
@@ -9089,21 +9123,25 @@ export class AgentFramework {
     checkpoints.push(checkpoint);
 
     // Trim to max depth
-    if (checkpoints.length > MAX_TURN_CHECKPOINTS) {
-      checkpoints.splice(0, checkpoints.length - MAX_TURN_CHECKPOINTS);
-    }
+    const evicted = checkpoints.length > MAX_TURN_CHECKPOINTS
+      ? checkpoints.splice(0, checkpoints.length - MAX_TURN_CHECKPOINTS)
+      : [];
 
     this.saveTurnCheckpoints(agentName, checkpoints);
-    return turnIndex;
+    return { turnIndex, evicted };
   }
 
-  /** Drop the agent's newest turn checkpoint, if it is the one recorded for
-   *  this turn index (holdForBudgetRefusal). */
-  private dropTurnCheckpoint(agentName: string, turnIndex: number): void {
+  /** Drop the agent's newest turn checkpoint, if it is the one this start
+   *  recorded, and put back what recording it took, the checkpoints it
+   *  evicted and the redo it invalidated, so that undo and redo are as they
+   *  were before the start (holdForBudgetRefusal). */
+  private dropTurnCheckpoint(agentName: string, recorded: RecordedTurnCheckpoint): void {
     const checkpoints = this.getTurnCheckpoints(agentName);
-    if (checkpoints.at(-1)?.turnIndex !== turnIndex) return;
+    if (checkpoints.at(-1)?.turnIndex !== recorded.turnIndex) return;
     checkpoints.pop();
+    checkpoints.unshift(...recorded.evicted);
     this.saveTurnCheckpoints(agentName, checkpoints);
+    if (recorded.redo) this.redoStacks.set(agentName, recorded.redo);
   }
 
   /**
@@ -9203,10 +9241,11 @@ export class AgentFramework {
       // Direct inference requests (e.g. runEphemeralToCompletion) bypass the
       // event queue — without this the loop can exit before they're drained.
       // While quiesced, gate-parked requests are NOT progress and must not
-      // block idle (only a budget restart can still run); identity-equivalent
-      // to `.length > 0` when not quiesced.
+      // block idle (only a continuation of a turn whose token is held can
+      // still run, passesQuiesce); identity-equivalent to `.length > 0` when
+      // not quiesced.
       this.pendingRequests.some(
-        (r) => !this.quiesced || isTurnContinuation(r.reason),
+        (r) => !this.quiesced || passesQuiesce(r),
       ) ||
       this.activeStreams.size > 0 ||
       Array.from(this.agents.values()).some((a) => a.state.status !== 'idle')
@@ -11261,10 +11300,11 @@ export class AgentFramework {
       // kept): heartbeat/gate wakes arrive once per tick and nothing else
       // bounds a multi-day maintenance window's accumulation.
       if (this.quiesced) {
-        // Continuations of a held turn (budget restart, non-streaming tool
-        // results) pass; everything else parks.
-        const passThrough = requests.filter((r) => isTurnContinuation(r.reason));
-        const parked = requests.filter((r) => !isTurnContinuation(r.reason));
+        // Continuations of a turn whose token is held (budget restart,
+        // non-streaming tool results) pass; everything else parks, a
+        // continuation a budget hold released included (passesQuiesce).
+        const passThrough = requests.filter((r) => passesQuiesce(r));
+        const parked = requests.filter((r) => !passesQuiesce(r));
         // Coalesce per (reason, addressed): every channel wake shares one
         // reason, so keying on reason alone would let an ambient message
         // parked later evict a DM/mention parked earlier — and the
@@ -11379,6 +11419,19 @@ export class AgentFramework {
       // requests[0] in that mixed batch bypassed the turn lock because a
       // restart existed, then treated the continuation as a fresh turn.
       const trigger = budgetRestart ?? requests[0];
+      // A turn that resumes a logical turn skips batch assembly
+      // (beginAgentTurn), so a deferred batch's wake can't be one of its
+      // causes: its batch would never render. It stays queued for a fresh
+      // turn of its own, as it would behind any running turn. A wake that
+      // joined a held continuation is released beside it (#304), and one that
+      // waited behind a turn that then restarted is dequeued with the restart.
+      if (resumesLogicalTurn(trigger?.reason)) {
+        const batches = requests.filter((r) => r !== trigger && r.coalescingBatch === true);
+        if (batches.length > 0) {
+          this.pendingRequests.push(...batches);
+          requests = requests.filter((r) => !batches.includes(r));
+        }
+      }
       // Route this turn's auto-published speech to the channel that triggered
       // it (item-3 redux). A batched wake may carry several triggering channels
       // (messages arrived in >1 channel while the agent was busy/idle):
@@ -12423,9 +12476,9 @@ export class AgentFramework {
     }
 
     // Record turn checkpoint before inference (only on first attempt, not retries)
-    let checkpoint: number | undefined;
+    let checkpoint: RecordedTurnCheckpoint | undefined;
     if (attempt === 0 && trigger?.reason !== 'tool_result_guard_retry') {
-      checkpoint = this.recordTurnCheckpoint(agent.name);
+      checkpoint = { ...this.recordTurnCheckpoint(agent.name), redo: this.redoStacks.get(agent.name) };
       this.redoStacks.delete(agent.name); // new work invalidates redo
     }
 

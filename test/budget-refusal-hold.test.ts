@@ -203,12 +203,15 @@ class InboxModule implements Module {
  *  through a fresh compile (physicalWindowTokens, #92). */
 class BlobToolModule implements Module {
   readonly name = 'canned';
+  /** Runs while the tool runs, with the turn alive. */
+  constructor(private readonly duringCall?: () => void) {}
   async start(): Promise<void> {}
   async stop(): Promise<void> {}
   getTools(): ToolDefinition[] {
     return [{ name: 'fetch', description: 'blob', inputSchema: { type: 'object', properties: {} } }];
   }
   async handleToolCall(): Promise<ToolResult> {
+    this.duringCall?.();
     return { success: true, data: { blob: 'x'.repeat(30_000) } };
   }
   async onProcess(event: ProcessEvent): Promise<EventResponse> {
@@ -226,6 +229,73 @@ function nearCapToolResponse() {
   ], 'tool_use');
   (r as { usage: unknown }).usage = { inputTokens: 5_000, outputTokens: 5, cacheReadTokens: 195_000 };
   return r;
+}
+
+/**
+ * A turn whose continuation is held: its first compile fits, its tool round's
+ * usage near a 200k window restarts it through a fresh compile
+ * (nearCapToolResponse), and that compile is refused for budget, as is every
+ * dry compile the release check falls back to (the strategy has no preview),
+ * until `fit()`. Compression is pending until then. Each response text is
+ * answered by one provider call after the first round's.
+ */
+async function heldRestart(texts: string[], options: {
+  /** The restart's compile fits from the start, so nothing is held. */
+  fits?: boolean;
+  /** Runs while the first round's tool runs, with the turn alive. */
+  duringTool?: (internal: Internal) => void;
+} = {}) {
+  const proto = ContextManager.prototype as unknown as Patchable;
+  const original = { compile: proto.compile, tick: proto.tick, isReady: proto.isReady };
+  let fit = options.fits === true;
+  let committing = 0;
+  proto.compile = async function (this: unknown, ...args: unknown[]) {
+    const dryRun = (args[2] as { dryRun?: boolean } | undefined)?.dryRun === true;
+    const refused = dryRun ? !fit : ++committing >= 2 && !fit;
+    if (refused) throw overBudget(49_000);
+    return original.compile.apply(this, args);
+  };
+  proto.tick = async function () {};
+  proto.isReady = function () { return fit; };
+  const tempDir = mkdtempSync(join(tmpdir(), 'budget-hold-restart-'));
+  const membrane = new SequentialStreamMembrane();
+  membrane.pushResponse(nearCapToolResponse());
+  for (const text of texts) membrane.pushResponse(createMockResponse([{ type: 'text', text }]));
+  const framework = await AgentFramework.create({
+    storePath: join(tempDir, 'store'),
+    membrane: membrane.asMembrane(),
+    agents: [{ name: 'prime', model: 'test-model', systemPrompt: 'You are prime.', allowedTools: 'all', maxTokens: 4_000, physicalWindowTokens: 200_000 }],
+    modules: [new BlobToolModule(() => options.duringTool?.(internal))],
+    syncIntervalMs: 0,
+    maintenanceIntervalMs: 50,
+    errorPolicy: { maxRetries: 3, onInferenceError: (_error: Error, _agent: string, attempt: number) => (attempt < 3 ? { retry: true, delayMs: 0 } : { retry: false }) },
+  });
+  const internal = framework as unknown as Internal;
+  const traces: TraceEvent[] = [];
+  framework.onTrace((e) => traces.push(e));
+  let looks = 0;
+  const hold = framework as unknown as { checkBudgetHold?: (agentName: string) => Promise<void> };
+  const checkBudgetHold = hold.checkBudgetHold?.bind(framework);
+  if (checkBudgetHold) hold.checkBudgetHold = (agentName: string) => { looks++; return checkBudgetHold(agentName); };
+  framework.start();
+  framework.getAgent('prime')!.getContextManager().addMessage('user', [{ type: 'text', text: 'fetch it' }]);
+  internal.pendingRequests.push({ agentName: 'prime', reason: 'external-message', source: 'test', timestamp: Date.now() } as unknown as { agentName: string });
+  return {
+    framework,
+    internal,
+    membrane,
+    of: (type: string) => traces.filter((e) => e.type === type) as unknown as Array<Record<string, unknown>>,
+    looks: () => looks,
+    fit: () => { fit = true; },
+    close: async () => {
+      try {
+        await framework.stop();
+      } finally {
+        Object.assign(proto, original);
+        rmSync(tempDir, { recursive: true, force: true });
+      }
+    },
+  };
 }
 
 /** The framework's internals these tests read or shorten. */
@@ -893,8 +963,8 @@ describe('a compile refused for budget holds its turn (#304)', () => {
   });
 
   it('on the fallback path, holds on when compression comes back during a dry compile that its progress does not show', async () => {
-    // Progress frozen: only whether compression is pending changes, and the
-    // signature doesn't see it.
+    // Progress frozen: only whether compression is pending changes, which
+    // the signature sees beside the frozen progress.
     await withBacklog({ previewless: true, stalled: true, alwaysPending: true, readyAt: 0 }, async (backlog) => {
       const t = await residentTurn({ maintenanceIntervalMs: 50 });
       try {
@@ -1685,6 +1755,162 @@ describe('a compile refused for budget holds its turn (#304)', () => {
         await new Promise((r) => setTimeout(r, 450));
         assert.deepEqual(t.internal.pendingRequests.filter((r) => r.agentName === 'prime'), []);
         assert.deepEqual(t.of('inference:hold_ended').map((e) => e.outcome), ['stopped']);
+      } finally {
+        await t.close();
+      }
+    });
+  });
+  it('keeps a held continuation from running while the host is quiesced: it runs at resume', async () => {
+    const t = await heldRestart(['Answered after the restart']);
+    try {
+      assert.ok(await pollUntil(() => t.of('inference:held').length === 1, 10_000), 'the restart is held');
+      const status = await t.framework.quiesce({ reason: 'test', timeoutMs: 1_000 });
+      assert.equal(status.drained, true, 'the held turn holds no turn token');
+      // Asserted below, once the provider calls are.
+      const heldAtQuiesce = status.heldTurns;
+      assert.equal(t.membrane.calls.length, 1);
+      t.fit();
+      assert.ok(await pollUntil(() => t.of('inference:hold_ended').length === 1, 3_000), 'the context fits, and the hold ends');
+      // The released continuation reaches the scheduler, which either starts
+      // it or parks it as it parks a wake.
+      await pollUntil(() => t.membrane.calls.length > 1 || t.framework.getHostModeStatus().gatedRequests === 1, 3_000);
+      assert.equal(t.membrane.calls.length, 1, 'no provider call after quiesce reported the host drained');
+      assert.equal(t.framework.getHostModeStatus().gatedRequests, 1, 'the continuation is parked, as a wake is');
+      assert.equal(heldAtQuiesce, 1, 'the status quiesce returned showed the held turn');
+      // A parked request isn't work for runUntilIdle while the host is quiesced.
+      const idle = await Promise.race([
+        t.framework.runUntilIdle().then(() => true),
+        new Promise<boolean>((r) => setTimeout(() => r(false), 2_000)),
+      ]);
+      assert.equal(idle, true, 'runUntilIdle returns while the continuation waits for resume');
+      await t.framework.resume();
+      assert.ok(await pollUntil(() => storedText(t.framework).includes('Answered after the restart'), 5_000), 'the continuation runs at resume');
+      assert.equal(t.membrane.calls.length, 2);
+    } finally {
+      await t.close();
+    }
+  });
+
+  it('gives a deferred batch\'s wake that joins a held continuation a fresh turn of its own', async () => {
+    const t = await heldRestart(['Answered after the restart', 'Answered the batch']);
+    try {
+      assert.ok(await pollUntil(() => t.of('inference:held').length === 1, 10_000), 'the restart is held');
+      t.internal.pendingRequests.push({
+        agentName: 'prime', reason: 'mcpl:push-event', source: 'test', timestamp: Date.now(),
+        coalescingSubject: 'zz-subject', coalescingBatch: true, coalescingBatchSubjects: ['zz-subject'],
+      } as unknown as { agentName: string });
+      assert.ok(await pollUntil(() => holdOf(t)?.heldRequests.length === 2, 3_000), 'the batch\'s wake joins the hold');
+      t.fit();
+      assert.ok(await pollUntil(() => storedText(t.framework).includes('Answered after the restart'), 5_000), 'the continuation runs');
+      // The continuation skips batch assembly, so the batch's wake can't be
+      // one of its causes: it starts a turn of its own once that one ends.
+      assert.ok(await pollUntil(() => storedText(t.framework).includes('Answered the batch'), 5_000), 'the batch\'s wake gets a fresh turn');
+      assert.equal(t.membrane.calls.length, 3);
+    } finally {
+      await t.close();
+    }
+  });
+
+  it('gives a deferred batch\'s wake that waited behind a turn which then restarted a fresh turn of its own', async () => {
+    // Nothing is held: the restart's compile fits. The batch's wake arrives
+    // while the turn's tool runs, so it waits, queued, until the restart is
+    // queued beside it.
+    const t = await heldRestart(['Answered after the restart', 'Answered the batch'], {
+      fits: true,
+      duringTool: (internal) => internal.pendingRequests.push({
+        agentName: 'prime', reason: 'mcpl:push-event', source: 'test', timestamp: Date.now(),
+        coalescingSubject: 'zz-subject', coalescingBatch: true, coalescingBatchSubjects: ['zz-subject'],
+      } as unknown as { agentName: string }),
+    });
+    try {
+      assert.ok(await pollUntil(() => storedText(t.framework).includes('Answered after the restart'), 10_000), 'the restart runs');
+      assert.ok(await pollUntil(() => storedText(t.framework).includes('Answered the batch'), 5_000), 'the batch\'s wake gets a fresh turn');
+      assert.equal(t.membrane.calls.length, 3);
+      assert.equal(t.of('inference:held').length, 0);
+    } finally {
+      await t.close();
+    }
+  });
+
+  it('holds nothing in a framework that was never started: the refusal takes the error policy\'s path, as before', async () => {
+    await withBacklog({}, async () => {
+      const tempDir = mkdtempSync(join(tmpdir(), 'budget-hold-unstarted-'));
+      const framework = await AgentFramework.create({
+        storePath: join(tempDir, 'store'),
+        membrane: new SequentialStreamMembrane().asMembrane(),
+        agents: [{ name: 'prime', model: 'test-model', systemPrompt: 'You are prime.' }],
+        modules: [new InboxModule()],
+        syncIntervalMs: 0,
+        maintenanceIntervalMs: 50,
+        errorPolicy: { maxRetries: 3, onInferenceError: (_error: Error, _agent: string, attempt: number) => (attempt < 3 ? { retry: true, delayMs: 0 } : { retry: false }) },
+      });
+      const traces: TraceEvent[] = [];
+      framework.onTrace((e) => traces.push(e));
+      try {
+        framework.pushEvent({
+          type: 'external-message', source: 'test', content: [{ type: 'text', text: 'Are you there?' }], metadata: {}, triggerInference: true,
+        } as unknown as ProcessEvent);
+        await framework.runUntilIdle();
+        assert.equal(traces.filter((e) => e.type === 'inference:held').length, 0, 'no run loop would run a released turn');
+        assert.equal(traces.filter((e) => e.type === 'inference:exhausted').length, 1, 'the turn fails before runUntilIdle returns');
+      } finally {
+        await framework.stop();
+        rmSync(tempDir, { recursive: true, force: true });
+      }
+    });
+  });
+
+  it('looks again when compression stops being pending though the strategy\'s progress snapshot stands still', async () => {
+    // A progress snapshot that doesn't move while readiness does.
+    await withBacklog({ progress: 1, readyAt: 30 }, async (backlog) => {
+      const t = await residentTurn({ maintenanceIntervalMs: 50 });
+      try {
+        t.send('Are you there?');
+        assert.ok(await pollUntil(() => t.of('inference:held').length === 1, 5_000));
+        assert.ok(await pollUntil(() => backlog.ticks >= 30, 5_000), 'compression stops being pending');
+        assert.ok(await pollUntil(() => t.of('inference:hold_ended').length === 1, 3_000), 'the hold ends without waiting for its deadline');
+        assert.equal(t.of('inference:hold_ended')[0]!.outcome, 'nothing_pending');
+      } finally {
+        await t.close();
+      }
+    });
+  });
+
+  it('keeps the undo history whole at its limit: a held start gives back the checkpoint its record evicted', async () => {
+    await withBacklog({}, async () => {
+      const t = await residentTurn({ maintenanceIntervalMs: 3_600_000 });
+      const checkpoints = t.framework as unknown as {
+        getTurnCheckpoints: (agentName: string) => Array<{ turnIndex: number }>;
+        saveTurnCheckpoints: (agentName: string, checkpoints: unknown[]) => void;
+        turnCounters: Map<string, number>;
+      };
+      try {
+        const full = Array.from({ length: 20 }, (_, i) => ({ agentName: 'prime', turnIndex: i, sequenceBefore: 0, branchName: 'main', timestamp: i }));
+        checkpoints.saveTurnCheckpoints('prime', full);
+        checkpoints.turnCounters.set('prime', 20);
+        t.send('Are you there?');
+        assert.ok(await pollUntil(() => t.of('inference:held').length === 1, 5_000));
+        assert.deepEqual(checkpoints.getTurnCheckpoints('prime').map((c) => c.turnIndex), full.map((c) => c.turnIndex),
+          'the twenty checkpoints from before the turn, the oldest included');
+      } finally {
+        await t.close();
+      }
+    });
+  });
+
+  it('keeps the redo history: a held start gives back the redo its new work invalidated', async () => {
+    await withBacklog({ fit: true }, async (backlog) => {
+      const t = await residentTurn({ maintenanceIntervalMs: 3_600_000 });
+      try {
+        t.send('A turn that fits');
+        assert.ok(await pollUntil(() => storedText(t.framework).includes('Answered once it fit'), 5_000));
+        assert.equal(t.framework.undoLastTurn('prime').undone, true);
+        const before = t.framework.getUndoRedoState('prime');
+        assert.equal(before.redoDepth, 1, 'the undone turn can be redone');
+        backlog.fit = false;
+        t.send('Are you there?');
+        assert.ok(await pollUntil(() => t.of('inference:held').length === 1, 5_000));
+        assert.deepEqual(t.framework.getUndoRedoState('prime'), before, 'the held start left undo and redo as they were');
       } finally {
         await t.close();
       }
