@@ -90,7 +90,7 @@ describe('validation: new behaviors', () => {
   // Validation errors during initialConfig seeding land in getStatus().errors
   // rather than throwing — this matches the existing pattern where a bad
   // gate.json edit doesn't crash the running gate, just reports the issue.
-  it('reports rate_limit with non-positive tokens', () => {
+  it('leaves out a rate_limit with non-positive tokens, which wakes on nothing, and says so', () => {
     const { gate } = makeFakeClockGate({
       policies: [{
         name: 'p',
@@ -99,26 +99,47 @@ describe('validation: new behaviors', () => {
       }],
     });
     const errors = gate.getStatus().errors;
+    assert.deepStrictEqual(gate.getStatus().policies, []);
     assert.ok(
-      errors.some(e => /tokens must be a positive number/.test(e)),
+      errors.some(e => /Policy "p" is left out: behavior\.rate_limit\.tokens is 0, where a positive number is needed\./.test(e)),
       `expected validation error, got: ${JSON.stringify(errors)}`,
     );
   });
 
-  it('reports rate_limit with non-positive refillIntervalMs', () => {
-    const { gate } = makeFakeClockGate({
-      policies: [{
-        name: 'p',
-        match: {},
-        behavior: { rate_limit: { tokens: 5, refillIntervalMs: -1 } },
-      }],
-    });
-    assert.ok(
-      gate.getStatus().errors.some(e => /refillIntervalMs must be a positive number/.test(e)),
-    );
+  it('reads a rate_limit with a refillIntervalMs at or under 0 as tokens that never refill, as a negative one ran, and says so', () => {
+    for (const refillIntervalMs of [-1, 0]) {
+      const h = makeFakeClockGate({
+        default: 'skip',
+        policies: [{
+          name: 'p',
+          match: {},
+          behavior: { rate_limit: { tokens: 2, refillIntervalMs } },
+        }],
+      });
+      assert.deepStrictEqual(h.gate.getStatus().policies[0]!.behavior, { rate_limit: { tokens: 2, refillIntervalMs } });
+      assert.ok(
+        h.gate.getStatus().errors.some(e => e.includes(
+          `Policy "p": behavior.rate_limit.refillIntervalMs is ${refillIntervalMs}, where a positive number of milliseconds is needed, `
+          + 'so its tokens never refill, '
+          + 'and once they\'re spent it wakes the agent on nothing it matches.',
+        )),
+        JSON.stringify(h.gate.getStatus().errors),
+      );
+      // Its first two events wake the agent, and none after, however long it waits.
+      // The probe, which wake_add_rule's table reads, says the same at each step.
+      const woke: boolean[] = [];
+      const probed: boolean[] = [];
+      for (let i = 0; i < 5; i++) {
+        probed.push(h.gate.probe(event()).trigger);
+        woke.push(h.gate.evaluate(event()).trigger);
+        h.advance(60_000);
+      }
+      assert.deepStrictEqual(woke, [true, true, false, false, false], `refillIntervalMs ${refillIntervalMs}`);
+      assert.deepStrictEqual(probed, woke, `refillIntervalMs ${refillIntervalMs}: the probe`);
+    }
   });
 
-  it('reports passive_sample with non-integer every', () => {
+  it('reads passive_sample with non-integer every as its next whole number, as it ran, and says so', () => {
     const { gate } = makeFakeClockGate({
       policies: [{
         name: 'p',
@@ -126,8 +147,9 @@ describe('validation: new behaviors', () => {
         behavior: { passive_sample: { every: 1.5 } as { every: number } },
       }],
     });
+    assert.deepStrictEqual(gate.getStatus().policies[0]!.behavior, { passive_sample: { every: 2 } });
     assert.ok(
-      gate.getStatus().errors.some(e => /every must be a positive integer/.test(e)),
+      gate.getStatus().errors.some(e => /passive_sample\.every is 1\.5, not a whole number, so it's read as 2\./.test(e)),
     );
   });
 

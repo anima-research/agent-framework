@@ -414,7 +414,7 @@ function validateUtilityArgs(
 }
 import { CheckpointManager } from './mcpl/checkpoint-manager.js';
 import { isToolAllowed } from './mcpl/tool-policy.js';
-import { EventGate, formatShadowWarning } from './gate/event-gate.js';
+import { EventGate, checkToolInput, formatShadowWarning, formatUnreadableKept, shownValue } from './gate/event-gate.js';
 import { UsageTracker, type PersistedUsageState } from './usage/usage-tracker.js';
 import type { SessionUsageSnapshot, UsageUpdatedEvent } from './usage/types.js';
 import { stderrTailOf, withStderr, type McplConnectionCloseInfo, type McplServerConnection } from './mcpl/server-connection.js';
@@ -5863,15 +5863,29 @@ export class AgentFramework {
 
   /**
    * Add or replace (upsert) a gate policy at runtime. Validated and persisted
-   * to gate.json; hot-applied in memory. Throws if no gate is configured or the
-   * policy is invalid. Placement: `'prepend'` puts a rule ahead of EVERYTHING
-   * (including addressed-message wake rules — see EventGate.lintShadows);
-   * `{before: name}` / `{after: name}` anchor it against a specific rule,
-   * which is usually what a sampler or debounce actually wants.
+   * to gate.json; hot-applied in memory. Placement: `'prepend'` puts a rule
+   * ahead of EVERYTHING (including addressed-message wake rules — see
+   * EventGate.lintShadows); `{before: name}` / `{after: name}` anchor it
+   * against a specific rule, which is usually what a sampler or debounce
+   * actually wants. Every rule the change doesn't touch is written back as it
+   * was written. Over a gate.json the gate doesn't use, the change is written
+   * only if gate.json then loads, as when it replaces or removes the rule that
+   * keeps it out. When gate.json can't be read or isn't JSON, a copy of its
+   * bytes is kept beside it, and `onUnreadableKept` says where; the change is
+   * then written over it as an edit of the last text that loaded. Fields the gate
+   * reads nowhere, and that aren't a slip of one it does, are left out, and
+   * named to `onIgnoredFields`. Throws if no gate is configured, the policy is
+   * invalid, the placement can't be made, gate.json has no rule list a change
+   * could edit, it isn't used and the change doesn't mend it, or it can't be
+   * read, kept or written (EventGate.addPolicy).
    */
   addGatePolicy(
     rawPolicy: unknown,
-    options?: { position?: 'append' | 'prepend' | { before: string } | { after: string } },
+    options?: {
+      position?: 'append' | 'prepend' | { before: string } | { after: string };
+      onUnreadableKept?: (kept: import('./gate/types.js').UnreadableConfigKept) => void;
+      onIgnoredFields?: (notes: string[]) => void;
+    },
   ): import('./gate/types.js').GatePolicy {
     if (!this.eventGate) {
       throw new Error('No EventGate configured (FrameworkConfig.gate is unset).');
@@ -5881,13 +5895,20 @@ export class AgentFramework {
 
   /**
    * Remove a gate policy by name at runtime. Returns false if it didn't exist.
-   * Throws if no gate is configured.
+   * A copy of a gate.json that can't be read or isn't JSON is kept first, as
+   * for addGatePolicy. Throws if no gate is configured, gate.json has no rule
+   * list a change could edit, it isn't used and the removal doesn't mend it,
+   * or it can't be read, kept or written (EventGate.removePolicy); the rule
+   * then stays in force.
    */
-  removeGatePolicy(name: string): boolean {
+  removeGatePolicy(
+    name: string,
+    options?: { onUnreadableKept?: (kept: import('./gate/types.js').UnreadableConfigKept) => void },
+  ): boolean {
     if (!this.eventGate) {
       throw new Error('No EventGate configured (FrameworkConfig.gate is unset).');
     }
-    return this.eventGate.removePolicy(name);
+    return this.eventGate.removePolicy(name, options);
   }
 
   /** Current gate policy names (freshest on-disk view). Empty when no gate. */
@@ -6669,7 +6690,7 @@ export class AgentFramework {
         '• Watch a FILE/workspace path: match on `mount` + `pathGlob`, e.g. ' +
         '`{ name: "watch-notes", match: { scope: ["workspace:modified"], mount: "project", pathGlob: "notes/*.md" }, behavior: "always" }`.\n' +
         '• Watch a CHANNEL: match on `source` + `channel` (and/or `tagsAny: ["chat:ambient"]`), ' +
-        'e.g. `{ name: "watch-cairn", match: { source: "discord", channel: "discord:*:12345", tagsAny: ["chat:ambient"] }, behavior: { debounce: 60000 } }` ' +
+        'e.g. `{ name: "watch-cairn", match: { source: "discord", channel: "discord:*:12345", tagsAny: ["chat:ambient"] }, debounceMs: 60000 }` ' +
         '(the channel must be subscribed for ambient events to arrive — see channel mode).',
       inputSchema: {
         type: 'object',
@@ -19213,7 +19234,14 @@ export class AgentFramework {
    */
   private dispatchWakeRuleToolCall(agentName: string, call: ToolCall): void {
     this.emitTrace({ type: 'tool:started', module: 'gate', tool: call.name, callId: call.id, input: call.input });
-    const finish = (result: ToolResult) => {
+    // What wake_add_rule's input held that does nothing, checkToolInput's notes and
+    // then the gate's on a rule it saved: a refusal names it too, so the call that
+    // follows doesn't count on it.
+    const ignored: string[] = [];
+    const finish = (given: ToolResult) => {
+      // Where notes follow an error that doesn't end in a stop, it gets one, so each reads as a sentence of its own.
+      const said = given.error && !/[.!?]$/.test(given.error) ? `${given.error}.` : given.error;
+      const result = given.isError && ignored.length > 0 ? { ...given, error: [said, ...ignored].join(' ') } : given;
       this.emitTrace({
         type: result.isError ? 'tool:failed' : 'tool:completed',
         module: 'gate', tool: call.name, callId: call.id, durationMs: 0,
@@ -19229,18 +19257,28 @@ export class AgentFramework {
           finish({ success: false, error: 'wake_remove_rule: `name` (string) is required', isError: true });
           return;
         }
-        const removed = this.removeGatePolicy(input.name);
+        const report: { keptUnreadable?: string } = {};
+        const removed = this.removeGatePolicy(input.name, {
+          onUnreadableKept: (k) => { report.keptUnreadable = formatUnreadableKept(k); },
+        });
         finish({
           success: true,
-          data: { removed, name: input.name, policies: this.getGatePolicyNames() },
+          data: { removed, name: input.name, ...report, policies: this.getGatePolicyNames() },
         });
         return;
       }
 
       // wake_add_rule — assemble the canonical behavior from the typed fields
       // (exactly one), then let the gate's own validator do the authoritative
-      // range/shape checks.
-      const input = (call.input ?? {}) as {
+      // range/shape checks. Its parameters are read as a rule's fields are: a
+      // null or "" one is left out, a slip of one is refused, and so is a field
+      // of `match`, `rateLimit` or `passiveSample` given on its own, which the
+      // rule would otherwise be saved without; any other name is named in the
+      // result's ignoredFields, and in a refusal's text.
+      const parameters = AgentFramework.WAKE_RULE_TOOLS[0]!.inputSchema.properties as Record<string, unknown>;
+      const input = checkToolInput(
+        'wake_add_rule', (call.input ?? {}) as Record<string, unknown>, parameters, ignored, { match: 'the rule matches every event' },
+      ) as {
         name?: unknown; match?: unknown; resets?: unknown; position?: unknown;
         insertBefore?: unknown; insertAfter?: unknown; passthrough?: unknown;
         behavior?: unknown; debounceMs?: unknown; rateLimit?: unknown; passiveSample?: unknown;
@@ -19267,6 +19305,23 @@ export class AgentFramework {
         });
         return;
       }
+      // `behavior` is "always", "defer" or "skip" in this tool's schema. An
+      // object works too, as gate.json writes it, but in XML tool mode one
+      // arrives as text. Anything else used to be saved as "always", so it's
+      // refused here, in this tool's terms: the gate's own refusal would point
+      // at the object form, which XML mode can't send.
+      const named = input.behavior;
+      if (named !== undefined && named !== 'always' && named !== 'defer' && named !== 'skip'
+        && (named === null || typeof named !== 'object' || Array.isArray(named))) {
+        finish({
+          success: false,
+          error: `wake_add_rule: behavior must be "always", "defer" or "skip", and it's ${shownValue(named)}, `
+            + 'so nothing was saved. For a debounce, a rate limit or sampling, give debounceMs, rateLimit or '
+            + 'passiveSample instead of behavior.',
+          isError: true,
+        });
+        return;
+      }
       const behavior: unknown =
         input.debounceMs !== undefined ? { debounce: input.debounceMs }
         : input.rateLimit !== undefined ? { rate_limit: input.rateLimit }
@@ -19288,6 +19343,30 @@ export class AgentFramework {
           isError: true,
         });
         return;
+      }
+      // A placement of the wrong type used to be ignored, so the rule was
+      // appended rather than put where it was asked for.
+      if (input.position !== undefined && input.position !== 'append' && input.position !== 'prepend') {
+        finish({
+          success: false,
+          error: `wake_add_rule: position must be "append" or "prepend", and it's ${shownValue(input.position)}, `
+            + 'so nothing was saved. To place the rule next to another, give insertBefore or insertAfter with '
+            + 'that rule\'s name.',
+          isError: true,
+        });
+        return;
+      }
+      for (const field of ['insertBefore', 'insertAfter'] as const) {
+        const anchor = input[field];
+        if (anchor !== undefined && (typeof anchor !== 'string' || anchor.length === 0)) {
+          finish({
+            success: false,
+            error: `wake_add_rule: ${field} must be the name of a rule, and it's ${shownValue(anchor)}, so nothing `
+              + `was saved. The rules are: [${this.getGatePolicyNames().join(', ')}].`,
+            isError: true,
+          });
+          return;
+        }
       }
       let position: 'append' | 'prepend' | { before: string } | { after: string } | undefined;
       if (typeof input.insertBefore === 'string' && input.insertBefore) {
@@ -19313,7 +19392,13 @@ export class AgentFramework {
       const before = new Map(
         this.eventGate!.probeTable().map((r) => [r.probe, r]),
       );
-      const policy = this.addGatePolicy(rawPolicy, position ? { position } : undefined);
+      const report: { keptUnreadable?: string; ignoredFields?: string[] } = {};
+      const policy = this.addGatePolicy(rawPolicy, {
+        ...(position ? { position } : {}),
+        onUnreadableKept: (k) => { report.keptUnreadable = formatUnreadableKept(k); },
+        onIgnoredFields: (notes) => { ignored.push(...notes); },
+      });
+      if (ignored.length > 0) report.ignoredFields = ignored;
       const after = this.eventGate!.probeTable();
       const probes = after.map((r) => {
         const prev = before.get(r.probe);
@@ -19332,6 +19417,7 @@ export class AgentFramework {
         success: true,
         data: {
           added: policy.name,
+          ...report,
           policies: this.getGatePolicyNames(),
           ...(shadowWarnings.length > 0 ? { shadowWarnings } : {}),
           probes,

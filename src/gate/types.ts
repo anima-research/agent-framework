@@ -253,6 +253,18 @@ export interface GatePolicyStats {
   };
 }
 
+/**
+ * What a policy change (addPolicy, removePolicy) reports when gate.json was
+ * there but wouldn't load: a copy of it was kept before the change was
+ * written over it, from the rules in force.
+ */
+export interface UnreadableConfigKept {
+  /** Where the copy is: `gate.json.unreadable-<UTC time>`, beside gate.json. */
+  keptPath: string;
+  /** Why gate.json couldn't be loaded. */
+  reason: string;
+}
+
 /** Full gate status returned by gate:status tool. */
 export interface GateStatus {
   configPath: string;
@@ -269,6 +281,13 @@ export interface GateStatus {
    * same hazards wake_add_rule warns about at install time.
    */
   shadowWarnings: string[];
+  /**
+   * The copies wake-rule changes kept of a gate.json that couldn't be read or
+   * isn't JSON (gate.json.unreadable-<UTC time>, beside it), oldest first,
+   * each with what to do with it, until it's removed. Nothing in a copy is in
+   * force.
+   */
+  keptCopies: string[];
   /** Total events the gate has evaluated since startup. */
   totalEvaluations: number;
   /**

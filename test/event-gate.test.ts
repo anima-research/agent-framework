@@ -645,7 +645,11 @@ describe('debounce', () => {
 // ---------------------------------------------------------------------------
 
 describe('debounce bounds', () => {
-  it('rejects debounce < 100ms', () => {
+  // A gate.json debounce outside the range is read at its nearest bound, with
+  // a note, where the whole file used to be refused; addPolicy still refuses
+  // one (event-gate-strict-rules).
+  it('reads a debounce < 100ms as 100ms', (t) => {
+    t.mock.method(console, 'error', () => {});
     const path = tmpPath('low-debounce.json');
     mkdirSync(TMP_DIR, { recursive: true });
     writeFileSync(path, JSON.stringify({
@@ -653,12 +657,14 @@ describe('debounce bounds', () => {
       default: 'always',
     }));
     const { gate, traces } = makeGate(path);
-    // Should fall back to default config, emit error trace
-    assert.strictEqual(gate.evaluate(event()).trigger, true);
-    assert.ok(traces.some(t => t.type === 'gate:config-error'));
+    t.after(() => gate.dispose());
+    assert.strictEqual(gate.evaluate(event()).trigger, false, 'the event waits in the debounce batch');
+    assert.deepStrictEqual(gate.getStatus().policies[0]!.behavior, { debounce: 100 });
+    assert.ok(!traces.some(t => t.type === 'gate:config-error'));
   });
 
-  it('rejects debounce > 300000ms', () => {
+  it('reads a debounce > 300000ms as 300000ms', (t) => {
+    t.mock.method(console, 'error', () => {});
     const path = tmpPath('high-debounce.json');
     mkdirSync(TMP_DIR, { recursive: true });
     writeFileSync(path, JSON.stringify({
@@ -666,8 +672,10 @@ describe('debounce bounds', () => {
       default: 'always',
     }));
     const { gate, traces } = makeGate(path);
-    assert.strictEqual(gate.evaluate(event()).trigger, true);
-    assert.ok(traces.some(t => t.type === 'gate:config-error'));
+    t.after(() => gate.dispose());
+    assert.strictEqual(gate.evaluate(event()).trigger, false, 'the event waits in the debounce batch');
+    assert.deepStrictEqual(gate.getStatus().policies[0]!.behavior, { debounce: 300000 });
+    assert.ok(!traces.some(t => t.type === 'gate:config-error'));
   });
 });
 
