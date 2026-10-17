@@ -3372,7 +3372,7 @@ export class AgentFramework {
    * the agent's next compile (budgetHoldPreview, else budgetHoldDryRun). If
    * it fits, the hold ends and its turn runs. If the verdict failed for
    * another reason, the hold ends too, and the turn's own compile meets that
-   * failure ('check_failed'). If it refuses and compression had nothing
+   * failure ('check_failed'). If it refuses and compression has nothing
    * pending, the hold ends without a fit. Otherwise it goes on, and doesn't
    * look again until something in its signature changes (BudgetHold.lookedAt).
    * None runs while a surgery holds the store; the surgery's release asks.
@@ -3383,9 +3383,6 @@ export class AgentFramework {
     if (hold?.state !== 'holding' || !agent || this.surgeryHold) return;
     const signature = this.budgetHoldSignature(agent);
     if (signature !== undefined && signature === hold.lookedAt) return;
-    // Read before the verdict: a compression that ends while a dry compile
-    // runs would otherwise make that compile's refusal look final.
-    const pending = this.compressionPending(agent);
     let verdict = this.budgetHoldPreview(agent);
     if (verdict === undefined) {
       // Only the dry compile awaits, so only it can overlap another check.
@@ -3404,6 +3401,11 @@ export class AgentFramework {
       // turned away): the next look takes a fresh verdict.
       if (verdict === 'refused' && this.budgetHoldSignature(agent) !== signature) return;
     }
+    // Whether compression has work is read as the verdict is applied, not
+    // before the dry compile: a strategy's readiness can change without its
+    // progress snapshot showing it, and a refusal is final only if nothing is
+    // pending now.
+    const pending = this.compressionPending(agent);
     if (verdict === 'refused' && pending) {
       hold.lookedAt = signature;
     } else if (verdict === 'refused') {
