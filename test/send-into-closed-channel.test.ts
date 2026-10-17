@@ -157,6 +157,8 @@ test("a send into a channel the agent closed says so, what still reaches the age
   assert.equal(first.success, true);
   assert.ok(first.data.endsWith(`\n${UPKEEP_NOTE}`), first.data);
   assert.ok(first.data.startsWith('{"messageId":"m9"'), "the server's own answer comes first");
+  // Every send tool, send_dm included: one rule for every way of speaking.
+  assert.ok((await reply('send_dm')).data.endsWith(`\n${UPKEEP_NOTE}`), 'send_dm');
 
   // Turned off through agent_settings, for good: kept in the framework's state.
   const settings = framework.closedChannelNoteSettingsExtension();
@@ -265,18 +267,11 @@ test('a send the server refuses carries no closed-channel note', async () => {
   assert.equal(refused.error, 'Missing Access in channel 444555', "the server's refusal, and nothing about the channel");
 });
 
-test('a send into an open channel, by send_dm, or into a channel a module closed, carries no closed-channel note', async () => {
+test('a send into an open channel, or into a channel a module closed, carries no closed-channel note', async () => {
   {
     const { registry, reply } = await harness();
     assert.equal((await registry.handleChannelToolCall('channel_open', { channelId }, origin)).success, true);
     assert.ok(!(await reply()).data.includes('[closed channel]'), 'open');
-  }
-  {
-    // send_dm sends to a DM by what the tool is, so its answer carries no
-    // note even into #upkeep, which the agent closed.
-    const { registry, reply } = await harness();
-    assert.equal((await registry.handleChannelToolCall('channel_close', { channelId }, origin)).success, true);
-    assert.ok(!(await reply('send_dm')).data.includes('[closed channel]'), 'send_dm');
   }
   {
     // A module closed it, as connectome-host's mentions mode does through ctx.callTool:

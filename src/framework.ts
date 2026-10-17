@@ -18430,7 +18430,7 @@ export class AgentFramework {
             sendingTurn?.engaged.add(engagedChannel);
             // Where the agent's words stayed in a channel it closed or
             // declined itself, or tuned out, the send's answer says so.
-            const [closedNote] = toolName === 'send_dm' ? [] : this.closedChannelNotes(agentName, [engagedChannel], serverId);
+            const [closedNote] = this.closedChannelNotes(agentName, [engagedChannel], serverId);
             const tunedOutNote = this.tunedOutSendNote(agentName, engagedChannel, serverId);
             const note = closedNote ? `[closed channel] ${closedNote}` : tunedOutNote ? `[tuned out] ${tunedOutNote}` : undefined;
             if (note) {

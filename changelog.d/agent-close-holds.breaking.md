@@ -17,14 +17,13 @@
     gets the line once it's delivered, and a line that comes while another turn is under way
     waits for that turn's next tool call, where that turn is shown it, or for its end. The agent
     turns the note off for good with `agent_settings`' new `closed_channel_note`, which is on by
-    default. A `send_dm`'s answer never carries it, since the tool sends to a DM, and a
-    conversation agent gets none: `channel_open` is refused to it, and its settings end with its
-    conversation. In such a channel, the `sleep` tool's default announcement says "I'll still see
-    messages addressed to me, but won't respond until I wake." A send tool's call into a channel
-    the agent tuned out, which ended the tune-out before, now leaves it in place, and its answer
-    says so: "… stays tuned out: your words there don't end the tune-out, so its traffic still
-    goes to your subconscious until the tune-out ends. tune_out with channelId … and mode "cancel"
-    resumes normal attention there." The same setting turns that line off.
+    default. A conversation agent gets none: `channel_open` is refused to it, and its settings end
+    with its conversation. In such a channel, the `sleep` tool's default announcement says "I'll
+    still see messages addressed to me, but won't respond until I wake." A send tool's call into a
+    channel the agent tuned out, which ended the tune-out before, now leaves it in place, and its
+    answer says so: "… stays tuned out: your words there don't end the tune-out, so its traffic
+    still goes to your subconscious until the tune-out ends. tune_out with channelId … and mode
+    "cancel" resumes normal attention there." The same setting turns that line off.
   - **What the invitation says:** the closed-channel invitation's first option now says what
     replying does there. In a channel the agent closed or declined itself, it reads as before:
     "Reply without joining …", with the note that follow-ups that don't address the agent won't
