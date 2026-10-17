@@ -123,6 +123,26 @@ export async function eventually(predicate: () => boolean, what = 'condition'): 
   while (!predicate()) { assert(performance.now() < deadline, `${what} did not settle`); await new Promise((r) => setTimeout(r, 10)); }
 }
 
+/** How long settles() lets a wait run: far above what any of these waits
+ *  takes on a heavily loaded host, so load can't fire it, while a hang still
+ *  fails within a minute. */
+export const HANG_GUARD_MS = 60_000;
+
+/**
+ * Awaits `work`, failing with `what` if it hasn't settled within
+ * HANG_GUARD_MS. A hang guard, not a timing check: CI runs without a test
+ * timeout, so a wait that never ends would hold the whole run, and this turns
+ * it into a failure that names what was awaited. When it fires, the work it
+ * waited on keeps running, and the test's close then runs under it.
+ */
+export async function settles<T>(work: Promise<T>, what: string): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const late = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => reject(new Error(`${what} did not settle within ${HANG_GUARD_MS / 1000} s`)), HANG_GUARD_MS);
+  });
+  try { return await Promise.race([work, late]); } finally { clearTimeout(timer); }
+}
+
 
 /** Simulate a crash: stop without the snapshot flush a clean stop performs. */
 export async function crash(f: Awaited<ReturnType<typeof fixture>>): Promise<void> {
