@@ -96,6 +96,7 @@ import { detectKnownToolWrapperProse } from './tool-wrapper-prose-guard.js';
 import { InferenceRouter } from './mcpl/inference-router.js';
 import { ChannelRegistry, type ChannelToolOrigin } from './mcpl/channel-registry.js';
 import { ConversationRouter, CONVERSATION_ROUTING_DEPRECATION_NOTICE } from './mcpl/conversation-router.js';
+import type { IncomingMessageFacts, RoutingDecision } from './mcpl/conversation-router.js';
 import { safeSlice } from './safe-slice.js';
 import { ProviderWaits, EVERY_MODEL, isReleaseModel, withoutControls, type ProviderWait } from './provider-waits.js';
 import type { WorkspaceModule } from './modules/workspace/index.js';
@@ -2056,6 +2057,9 @@ export class AgentFramework {
    * turn still lands in the right channel.
    */
   private conversationAgentHomes: Map<string, string> = new Map();
+  /** Forks being spawned, by channel id, each until its spawn settles (see
+   *  routeConversation). The promise never rejects. */
+  private readonly conversationSpawns = new Map<string, Promise<void>>();
   /** Last idle-TTL sweep timestamp. */
   private lastConversationSweep = 0;
 
@@ -9931,7 +9935,7 @@ export class AgentFramework {
     const router = this.conversationRouter!;
     const descriptor = this.channelRegistry?.getDescriptor(event.channelId);
 
-    const decision = router.route({
+    const decision = await this.routeConversation({
       channelId: event.channelId,
       mentioned: event.metadata?.mentioned === true,
       kind: ConversationRouter.classifyChannel(descriptor, event.metadata),
@@ -9949,9 +9953,7 @@ export class AgentFramework {
     let agent: Agent | undefined;
     if (decision.kind === 'spawn') {
       try {
-        agent = await this.createConversationAgent(decision.agentName, event.channelId);
-        router.bind(event.channelId, decision.agentName, decision.generation);
-        this.persistConversationRouterState();
+        agent = await decision.spawned;
         this.emitTrace({
           type: 'mcpl:conversation-spawned',
           channelId: event.channelId,
@@ -10116,6 +10118,58 @@ export class AgentFramework {
       this.usedEphemeralAgentNames.delete(name);
       throw error;
     }
+  }
+
+  /**
+   * The router's decision for a message or batch on `facts.channelId`, made
+   * once no spawn is in flight for that channel, with a spawn it decides on
+   * already started. A routing that finds its channel's fork being spawned
+   * waits for that spawn to settle and decides then, whatever it would have
+   * decided meanwhile: once the fork is bound, the decision is the fork, and
+   * if the spawn failed, it decides as a message arriving next would, which
+   * proposes the spawn again if the message qualifies. The check, the
+   * decision and the spawn's start are one synchronous step, so at most one
+   * spawn per channel is in flight. Without the wait, a second spawn of the
+   * fork's name failed ("already registered or reserved"), and a message
+   * that didn't qualify on its own was dropped as unrouted; either way its
+   * message was lost. Each path that delivers messages handles them one at
+   * a time, but the event queue and the coalescer run beside each other, and
+   * a spawn can wait, as on its template's annotations
+   * (createConversationAgent); the waiting routing holds its own path for as
+   * long, which none of the spawn's awaits needs.
+   */
+  private async routeConversation(facts: IncomingMessageFacts): Promise<
+    Exclude<RoutingDecision, { kind: 'spawn' }> | (Extract<RoutingDecision, { kind: 'spawn' }> & { spawned: Promise<Agent> })
+  > {
+    for (;;) {
+      const inFlight = this.conversationSpawns.get(facts.channelId);
+      if (inFlight) {
+        await inFlight;
+        continue;
+      }
+      const decision = this.conversationRouter!.route(facts);
+      if (decision.kind !== 'spawn') return decision;
+      return { ...decision, spawned: this.spawnConversationAgent(facts.channelId, decision) };
+    }
+  }
+
+  /**
+   * Create the fork a spawn decision names, bind its channel to it and
+   * persist the counters, registered in conversationSpawns under the channel
+   * until it settles. routeConversation registers a spawn only when none is
+   * in flight for the channel, and only this spawn's settlement removes it,
+   * so the entry it removes is its own. It's removed before anyone waiting
+   * on it resumes, so a waiter that decides again doesn't find it.
+   */
+  private spawnConversationAgent(channelId: string, decision: { agentName: string; generation: number }): Promise<Agent> {
+    const spawn = this.createConversationAgent(decision.agentName, channelId).then((agent) => {
+      this.conversationRouter!.bind(channelId, decision.agentName, decision.generation);
+      this.persistConversationRouterState();
+      return agent;
+    });
+    const done = (): void => { this.conversationSpawns.delete(channelId); };
+    this.conversationSpawns.set(channelId, spawn.then(done, done));
+    return spawn;
   }
 
   /** Persist the router's generation counters (see hydration in create()). */
@@ -10602,16 +10656,14 @@ export class AgentFramework {
       // No fork yet: the same bind decision an incoming message would get. A
       // batch that qualifies spawns its fork now so it has someone to wake.
       const metadata = (occ.event.lane === 'channel' ? occ.event.event.metadata : occ.event.event.origin) ?? {};
-      const decision = router.route({
+      const decision = await this.routeConversation({
         channelId: occ.scope.id,
         mentioned: metadata.mentioned === true,
         kind: ConversationRouter.classifyChannel(this.channelRegistry?.getDescriptor(occ.scope.id), metadata),
       });
       if (decision.kind !== 'spawn') return decision.kind === 'unbound' ? [] : (this.agents.has(decision.agentName) ? [decision.agentName] : []);
       try {
-        await this.createConversationAgent(decision.agentName, occ.scope.id);
-        router.bind(occ.scope.id, decision.agentName, decision.generation);
-        this.persistConversationRouterState();
+        await decision.spawned;
         return [decision.agentName];
       } catch (err) {
         console.error(`[coalescing] could not spawn a conversation agent for ${logValue(occ.scope.id)}:`, err);

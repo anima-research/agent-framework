@@ -270,12 +270,20 @@ test('a refusal reaction with no server for its locus names the locus as one fie
   assert.deepEqual(lines, [`[inference-refusal] reaction skipped: no MCPL server for locus ${field(locus)} (agent=agent)`]);
 });
 
+/** The framework's own spawn step, which both spawn paths decide through,
+ *  for a stub framework: it calls the stub's createConversationAgent. */
+function spawnStep() {
+  const proto = AgentFramework.prototype as unknown as Record<'routeConversation' | 'spawnConversationAgent', unknown>;
+  return { conversationSpawns: new Map(), routeConversation: proto.routeConversation, spawnConversationAgent: proto.spawnConversationAgent };
+}
+
 test('a conversation agent that fails to spawn names its channel as one field', async (t) => {
   const lines = captureConsoleError(t);
   const traces: Array<{ type: string }> = [];
   const fakeThis = {
     conversationRouter: { route: () => ({ kind: 'spawn', agentName: 'conversation-chat-g1', generation: 1, trigger: true }), templateAgent: 'agent' },
     channelRegistry: { getDescriptor: () => undefined },
+    ...spawnStep(),
     createConversationAgent: async () => { throw new Error('no room'); },
     emitTrace: (e: { type: string }) => { traces.push(e); },
   };
@@ -294,6 +302,7 @@ test('a coalesced batch whose conversation agent fails to spawn names its channe
       route: () => ({ kind: 'spawn', agentName: 'conversation-chat-g1', generation: 1, trigger: true }),
     },
     channelRegistry: { getDescriptor: () => undefined },
+    ...spawnStep(),
     createConversationAgent: async () => { throw new Error('no room'); },
   };
   const audience = (AgentFramework.prototype as unknown as { coalescedAudience: (occ: unknown) => Promise<string[]> }).coalescedAudience;
