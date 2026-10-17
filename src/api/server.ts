@@ -593,8 +593,10 @@ export class ApiServer {
     // and stop() waits for one already running. It moves the store once any
     // maintenance already running has finished, so the move can come after
     // this call returns. The event names this switch's own move, from the
-    // branch read here to the one it was asked for: another switch can move
-    // the store again before this one continues.
+    // branch read here to the one it was asked for: the framework refuses
+    // another move until this one's awaited steps end, but a host that
+    // switches through an agent's own context manager can still move the
+    // store before this one continues.
     let switched = false;
     try {
       await this.framework.switchBranch(params.name);

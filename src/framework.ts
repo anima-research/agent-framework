@@ -1266,6 +1266,42 @@ interface EphemeralRun {
   toolCallsCount: number;
 }
 
+/** The re-initialization of every context manager after an undo's or redo's
+ *  move (AgentFramework.syncMoveReinit). */
+interface SyncMoveReinit {
+  /** A later undo or redo moved the store again: the pass runs again. */
+  again: boolean;
+  /** The last move made under the reservation, for the failure report. */
+  after: 'undo' | 'redo';
+  /** Settles once the reservation is released; never rejects. */
+  done: Promise<void>;
+}
+
+/** What an operator does about a manager a move left refusing its work. */
+const REINIT_REMEDY =
+  'Until it is re-initialized it refuses its work, compiles and message writes included: ' +
+  'switchBranch() to the current branch, or a restart, re-initializes it.';
+
+/** An agent whose context manager failed to re-initialize after a move, or a
+ *  conversation agent the move emptied that couldn't be seeded again. */
+interface ManagerReinitFailure {
+  agentName: string;
+  error: string;
+  /** A conversation agent the move emptied that couldn't be seeded again:
+   *  disposed, and `error` says why. */
+  seedingFailed?: true;
+  /** For a disposal in an undo's or redo's re-initialization: the move whose
+   *  branch its pass judged, which a move joining later doesn't change. */
+  after?: string;
+  /** For a disposal whose cause also stops the channel's next spawn, a
+   *  template that's missing or refuses its work: what lets it spawn again. */
+  remedy?: string;
+  /** For a disposal that failed partway, as when the store refused to drop
+   *  the agent's turn checkpoints: that failure. The agent was unregistered
+   *  and its channel unbound before the step that failed. */
+  cleanupFailed?: string;
+}
+
 /**
  * Longest failure text the inference-failure pipeline writes to one sink: the
  * reason in the exhaustion stderr line, a field of a logs/failures.log record,
@@ -2050,7 +2086,19 @@ export class AgentFramework {
    * agent admitted mid-switch, a wake for an agent created later — at the
    * scheduler, ephemeral admission and puppet entry points.
    */
-  private surgeryHold: { verb: string; agentName: string; since: number } | null = null;
+  private surgeryHold: { verb: string; agentName: string; since: number; released?: Promise<void> } | null = null;
+  /** Conversation forks being created: from the moment a spawn finds the
+   *  store free until it is registered, each counts as busy for a move
+   *  (reserveStoreForSurgery), so no move lands under a spawn. */
+  private readonly conversationSpawnsInFlight = new Set<string>();
+  /**
+   * The re-initialization of every context manager that an undo or redo
+   * starts once its move has landed (reinitializeAfterSyncMove). Those two
+   * return before it finishes, so it holds their store reservation until
+   * every manager is current. An undo or redo made meanwhile moves the store
+   * again under that reservation and sets `again`, and the pass runs again.
+   */
+  private syncMoveReinit: SyncMoveReinit | null = null;
   /** Serialize per-server drains so reconnect and an online undo cannot race. */
   private discordAwarenessDrains: Map<string, Promise<DiscordAwarenessDrainOutcome>> = new Map();
   /** Framework-global inference gate; older generations cannot release it. */
@@ -3616,6 +3664,16 @@ export class AgentFramework {
           if (error instanceof MaintenanceWithdrawnError) {
             withdrawn = true;
             console.error(`[context-maintenance] agent=${agent.name} stopped: ${error.message}`);
+          } else if (this.syncMoveReinit) {
+            // An undo or redo moved the store while this tick ran. The
+            // store's hold starts no tick, so a tick that fails in this window
+            // is one the move landed under. Its work was for the branch the
+            // store left, which the re-initialization discards, so what it
+            // met isn't reported: its manager's refusal is the move's, and a
+            // lasting failure, such as the provider's, meets the re-initialized
+            // manager's next pass too, which reports its own failures.
+            withdrawn = true;
+            console.error(`[context-maintenance] agent=${agent.name} stopped: ${this.syncMoveReinit.after === 'undo' ? 'an undo' : 'a redo'} moved the store under the tick: ${error instanceof Error ? error.message : failureDescription(error)}`);
           } else {
             this.reportMaintenanceFailure(
               agent.name,
@@ -3629,7 +3687,9 @@ export class AgentFramework {
           if ('error' in state) {
             // A run records an agent's first failure: a readiness refusal
             // after a tick that failed is read again by the next pass.
-            if (record.error === undefined && !withdrawn) this.reportMaintenanceFailure(agent.name, record, state.error);
+            // While an undo's or redo's re-initialization is due, this reads
+            // a manager the move left stale, as in the catch above.
+            if (record.error === undefined && !withdrawn && !this.syncMoveReinit) this.reportMaintenanceFailure(agent.name, record, state.error);
           } else {
             record.readyAfter = state.ready;
             if (state.pending) record.pendingAfter = state.pending;
@@ -4443,6 +4503,7 @@ export class AgentFramework {
   ): AgentRuntimeSettingsSnapshot {
     const agent = this.agents.get(agentName);
     if (!agent) throw new Error(`Unknown agent: ${agentName}`);
+    this.refuseRuntimeSettingsChangeUnderHold(agentName);
     // Feasibility preflight — only a budget-bearing patch can wedge, and only
     // on the immediate path (a paced descent leaves the compile budget alone
     // and converges only as far as the folded floor allows). Boot restore
@@ -4511,6 +4572,7 @@ export class AgentFramework {
   ): AgentRuntimeSettingsSnapshot {
     const agent = this.agents.get(agentName);
     if (!agent) throw new Error(`Unknown agent: ${agentName}`);
+    this.refuseRuntimeSettingsChangeUnderHold(agentName);
     const result = agent.resetRuntimeSettings(keys);
     if (opts?.persist !== false) {
       this.persistAgentRuntimeSettings(agentName, this.persistedRuntimeSettingsOf(agent));
@@ -4531,6 +4593,7 @@ export class AgentFramework {
   ): AgentRuntimeSettingsSnapshot {
     const agent = this.agents.get(agentName);
     if (!agent) throw new Error(`Unknown agent: ${agentName}`);
+    this.refuseRuntimeSettingsChangeUnderHold(agentName);
     const result = agent.cancelRuntimeSettingsTransition();
     this.persistAgentRuntimeSettings(agentName, this.persistedRuntimeSettingsOf(agent));
     this.recordOperatorAction({
@@ -4539,6 +4602,21 @@ export class AgentFramework {
       ...(opts?.requester ? { requester: opts.requester } : {}),
     });
     return result;
+  }
+
+  /**
+   * A surgery, a switch, or an undo's or redo's re-initialization holds the
+   * store, and a manager re-initializing refuses the settings read that
+   * follows a change. So an update, a reset or a cancelled transition is
+   * refused here, before anything is applied, rather than leave an override
+   * set behind a refusal.
+   */
+  private refuseRuntimeSettingsChangeUnderHold(agentName: string): void {
+    if (!this.surgeryHold) return;
+    throw new OperatorActionError(
+      'agent-busy',
+      `Cannot change ${agentName}'s runtime settings: the store is under live ${this.surgeryHold.verb} for ${this.surgeryHold.agentName}; nothing was changed. Try again once it finishes.`,
+    );
   }
 
   // -------------------------------------------------------------------------
@@ -7344,6 +7422,9 @@ export class AgentFramework {
     // The branch has moved: delivery of the marks it changes starts behind
     // the data-plane gate, and the command doesn't wait for Discord.
     this.startDiscordAwarenessDelivery('turn undo', agentName);
+    // The preview compiles, so it waits for the managers the undos left
+    // re-initializing.
+    await this.syncMoveReinit?.done;
 
     return { ok: true, undone, requested, lastVisible: await this.lastVisiblePreview(agentName) };
   }
@@ -7664,14 +7745,26 @@ export class AgentFramework {
    * reserves the store as a surgery does: every agent must be idle, or it is
    * refused (OperatorActionError 'agent-busy'), and no turn starts until the
    * switch is done.
+   *
+   * Every agent's context manager is re-initialized for the branch before
+   * the store is released (reinitializeManagers). One whose
+   * re-initialization fails raises an ops alert naming its agent
+   * (`context-reinit-failed`), and the switch still resolves. A switch to the
+   * branch the store is already on re-initializes them too, which is how a
+   * manager left refusing by a failed re-initialization is recovered without
+   * a restart.
    */
   async switchBranch(name: string): Promise<void> {
     this.refuseOperatorAfterStop('switch branch');
     const release = this.reserveStoreForSurgery('switch branch', 'every agent');
+    let reinitializing: Promise<ManagerReinitFailure[]> | undefined;
     try {
       // A maintenance tick already running finishes before the switch.
       if (this.maintenanceRunning()) await this.settleMaintenancePass();
       this.store.switchBranch(name);
+      // No manager made this move, so each one's strategy is loaded for the
+      // branch generation the store has left.
+      reinitializing = this.reinitializeManagers();
       // Reversible Discord awareness markers are part of the branch
       // projection. Their delivery starts behind the data-plane gate, which
       // goes up before the store is released, and the switch doesn't wait
@@ -7682,7 +7775,11 @@ export class AgentFramework {
         await (ws as { materializeMount: (m: string) => Promise<void> }).materializeMount('_config');
       }
     } finally {
-      release();
+      try {
+        if (reinitializing) this.reportReinitFailures('branch switch', await reinitializing);
+      } finally {
+        release();
+      }
     }
   }
 
@@ -7695,6 +7792,16 @@ export class AgentFramework {
    *
    * The undone branch is saved so `redo()` can restore it.
    * Returns the checkpoint that was undone, or null if nothing to undo.
+   *
+   * The branch moves under every agent sharing the store, so an undo
+   * reserves the store as a surgery does: every agent must be idle, or it is
+   * refused (OperatorActionError 'agent-busy'). It returns once the store has
+   * moved, and the store stays reserved until every agent's context manager
+   * is re-initialized for the new branch, so no turn starts before then. One
+   * whose re-initialization fails raises an ops alert naming its agent
+   * (`context-reinit-failed`). An undo or redo made before the managers are
+   * done moves the store again under the same reservation, and they are
+   * re-initialized for the branch the last one leaves.
    */
   undoLastTurn(agentName: string, requester?: OperatorRequester): {
     undone: boolean;
@@ -7719,10 +7826,12 @@ export class AgentFramework {
       throw new Error(`Unknown agent: ${agentName}`);
     }
     if (agent.state.status !== 'idle') {
-      throw new Error(`Cannot undo while agent is ${agent.state.status}`);
+      throw new OperatorActionError('agent-busy', `Cannot undo while agent is ${agent.state.status}`);
     }
     // A surgery or a branch switch holds the store while it awaits its steps.
-    if (this.surgeryHold) {
+    // An earlier undo or redo whose managers are still re-initializing holds
+    // it too, and this undo moves the store again under its reservation.
+    if (this.surgeryHold && !this.syncMoveReinit) {
       throw new OperatorActionError('agent-busy', `Cannot undo: the store is under live ${this.surgeryHold.verb} for ${this.surgeryHold.agentName}`);
     }
 
@@ -7732,13 +7841,24 @@ export class AgentFramework {
     }
 
     const checkpoint = checkpoints.pop()!;
-    this.saveTurnCheckpoints(agentName, checkpoints);
-
     const currentBranch = this.store.currentBranch();
     const undoBranchName = `undo/${agentName}/${checkpoint.turnIndex}-${Date.now()}`;
 
-    this.store.createBranchAt(undoBranchName, currentBranch.name, checkpoint.sequenceBefore);
-    this.store.switchBranch(undoBranchName);
+    const move = this.beginSyncMove('undo', agentName);
+    try {
+      this.saveTurnCheckpoints(agentName, checkpoints);
+      this.store.createBranchAt(undoBranchName, currentBranch.name, checkpoint.sequenceBefore);
+      this.store.switchBranch(undoBranchName);
+    } catch (error) {
+      // The store didn't move: the turn is still there to undo.
+      try {
+        this.saveTurnCheckpoints(agentName, [...checkpoints, checkpoint]);
+      } finally {
+        move.abandon();
+      }
+      throw error;
+    }
+    move.landed();
 
     this.materializeConfigMountAfterBranchSwitch();
 
@@ -7778,6 +7898,9 @@ export class AgentFramework {
    *
    * Switches back to the branch that was active before the last undo.
    * Returns false if there's nothing to redo.
+   *
+   * It reserves the store and re-initializes every agent's context manager
+   * as undoLastTurn() does.
    */
   redo(agentName: string, requester?: OperatorRequester): {
     redone: boolean;
@@ -7790,10 +7913,12 @@ export class AgentFramework {
       throw new Error(`Unknown agent: ${agentName}`);
     }
     if (agent.state.status !== 'idle') {
-      throw new Error(`Cannot redo while agent is ${agent.state.status}`);
+      throw new OperatorActionError('agent-busy', `Cannot redo while agent is ${agent.state.status}`);
     }
     // A surgery or a branch switch holds the store while it awaits its steps.
-    if (this.surgeryHold) {
+    // An earlier undo or redo whose managers are still re-initializing holds
+    // it too, and this redo moves the store again under its reservation.
+    if (this.surgeryHold && !this.syncMoveReinit) {
       throw new OperatorActionError('agent-busy', `Cannot redo: the store is under live ${this.surgeryHold.verb} for ${this.surgeryHold.agentName}`);
     }
 
@@ -7802,10 +7927,37 @@ export class AgentFramework {
       return { redone: false };
     }
 
-    const { branchName, checkpoint } = redoStack.pop()!;
     const currentBranch = this.store.currentBranch();
-
-    this.store.switchBranch(branchName);
+    const move = this.beginSyncMove('redo', agentName);
+    const entry = redoStack.pop()!;
+    const { branchName, checkpoint } = entry;
+    try {
+      this.store.switchBranch(branchName);
+    } catch (error) {
+      // The store didn't move. While the branch exists, or when whether it
+      // does can't be read, the turn is still there to redo, and the caller
+      // hears the switch's own error. A branch deleted since the undo can't
+      // come back, so its step goes, and the error says so: without that,
+      // a caller couldn't tell a dropped step from a kept one, and a retry
+      // would redo the step beneath it.
+      let gone = false;
+      try {
+        gone = !this.store.listBranches().some((b) => b.name === branchName);
+      } catch {
+        // Not known, so the step stays.
+      }
+      if (!gone) redoStack.push(entry);
+      move.abandon();
+      if (!gone) throw error;
+      const left = redoStack.length;
+      throw new OperatorActionError(
+        'failed',
+        `Cannot redo: the branch this redo returns to, ${branchName}, no longer exists, so that step is dropped. ` +
+          (left === 0 ? 'No redo steps remain.' : left === 1 ? '1 redo step remains.' : `${left} redo steps remain.`),
+        { cause: error },
+      );
+    }
+    move.landed();
 
     this.materializeConfigMountAfterBranchSwitch();
 
@@ -7913,6 +8065,7 @@ export class AgentFramework {
     for (const name of this.activeTurnTokens.keys()) {
       if (!this.agents.has(name)) busy.push(`${name} is turn-alive`);
     }
+    for (const name of this.conversationSpawnsInFlight) busy.push(`${name} is being created`);
     if (busy.length > 0) {
       throw new OperatorActionError(
         'agent-busy',
@@ -7927,7 +8080,8 @@ export class AgentFramework {
     }
     // The token snapshot only covers agents that exist now; the hold covers
     // arrivals during the awaited switch (see surgeryHold).
-    const hold = { verb, agentName, since: Date.now() };
+    let resolveHold!: () => void;
+    const hold = { verb, agentName, since: Date.now(), released: new Promise<void>((resolve) => { resolveHold = resolve; }) };
     this.surgeryHold = hold;
     // Maintenance calls parked at a provider gate wake, find the hold and are
     // withdrawn, so the wait for running maintenance can't wait on them.
@@ -7943,6 +8097,7 @@ export class AgentFramework {
       // The release runs to its end before stop() can go on.
       settle();
       if (this.surgeryHold === hold) this.surgeryHold = null;
+      resolveHold();
       for (const [name, token] of reserved) {
         if (this.activeTurnTokens.get(name) === token) this.activeTurnTokens.delete(name);
       }
@@ -7954,8 +8109,14 @@ export class AgentFramework {
           if (this.activeTurnTokens.has(name)) continue;
           for (const msg of this.drainDeferredFor(name)) {
             try {
-              this.addMessage(msg.participant, msg.content, msg.metadata,
-                msg.forAgent ? { forAgent: msg.forAgent } : undefined);
+              // Stored with its deferred write's id, as the other flushes
+              // store theirs, so a placement deferred during the move
+              // resolves to the stored message. Traced as it lands, as the
+              // turn-start flush traces each message it stores: the trace
+              // at its deferral had no id to give.
+              const id = this.addMessage(msg.participant, msg.content, msg.metadata,
+                { deferredWriteId: msg.id, ...(msg.forAgent ? { forAgent: msg.forAgent } : {}) });
+              if (id) this.emitTrace({ type: 'message:added', messageId: id, source: 'deferred-flush:surgery-release' });
             } catch (error) {
               console.error(`[operator] post-surgery deferred flush failed for ${name}: ${error instanceof Error ? error.message : String(error)}`);
             }
@@ -7963,6 +8124,251 @@ export class AgentFramework {
         }
       }
     };
+  }
+
+  /**
+   * Re-initialize the context manager of every registered agent but
+   * `except`, for the branch the store is on now, after the branch moved
+   * (#326). A manager loads its strategy for one branch generation, and
+   * context-manager re-initializes only the manager that makes a move
+   * (switchBranch, fork), so every other manager on the store keeps a
+   * strategy that refuses its compiles, its readiness and its maintenance.
+   * Setting a manager's own strategy again re-initializes it for the
+   * store's current generation. A switchBranch() to the same branch would
+   * advance the generation, and leave stale each manager re-initialized
+   * before it.
+   *
+   * Called under the move's store reservation, so no turn starts while a
+   * manager re-initializes, and the messages the reservation defers for its
+   * agents are written after. The managers re-initialize one at a time, with
+   * a turn of the event loop before each: a manager's re-initialization can
+   * hold the event loop throughout, for a time that grows with its history,
+   * as an autobiographical strategy's does, so side by side they would hold
+   * it for the whole pass. Never rejects: it answers the agents whose
+   * re-initialization failed. Each of those managers refuses its work, as
+   * context-manager leaves a failed initialization, until another one
+   * succeeds.
+   */
+  private async reinitializeManagers(except?: string, moved: () => boolean = () => false): Promise<ManagerReinitFailure[]> {
+    const failures: ManagerReinitFailure[] = [];
+    for (const [agentName, agent] of [...this.agents]) {
+      if (agentName === except) continue;
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      try {
+        const cm = agent.getContextManager();
+        await cm.setStrategy(cm.getStrategy());
+      } catch (error) {
+        failures.push({ agentName, error: failureDescription(error) });
+      }
+    }
+    await this.reseedEmptiedForks(failures, except, moved);
+    return failures;
+  }
+
+  /**
+   * A conversation fork with no stored message on the branch the store moved
+   * to was spawned after the move's target point. Its manager re-initializes
+   * cleanly, but a fork is seeded only when it's created, so it would run on
+   * with no seed and no history. So it's seeded again here, from the
+   * template's compile as it stands on this branch, by creation's own rule
+   * (seedConversationAgentIfEmpty). It keeps its name, its channel and its
+   * turn history, so a move back to a branch that holds its history, such as
+   * a redo after an undo, finds it non-empty and seeds nothing. Empty means
+   * no stored message, not an empty compile: a fork whose history compiles
+   * to nothing on this branch still has it, and is left alone.
+   *
+   * Left to others: a fork whose re-initialization failed, which the failure
+   * report names, and the agent a rollback or suppression names, which is as
+   * its own operation leaves it. A rollback keeps its tail message, so it
+   * can't empty that agent; a suppression can, and seeding it again would
+   * bring back template copies the operator just removed.
+   *
+   * A fork that can't be seeded is disposed, as a spawn whose seeding fails
+   * is never created: it would otherwise answer its channel with no history.
+   * That's so when its seeding throws, and when the template is missing or
+   * its own re-initialization failed, since seeding reads the template's
+   * compile. Its channel unbinds, so the channel's next qualifying message
+   * spawns a fresh fork, and the disposal is reported with the move's. A
+   * disposal that fails partway, as when the store refuses to drop the
+   * fork's turn checkpoints, is reported in the same record, and the pass
+   * goes on to the next fork: disposeConversationAgent unregisters the fork
+   * before its first step that can throw.
+   *
+   * `moved` says whether a move has joined the pass since it began (an
+   * undo's or redo's, under the same reservation). Then the store may no
+   * longer be on the branch a fork was judged on, and a refusal, the
+   * template's included, may be the move's: nothing is written and nothing
+   * disposed, whatever the cause, since the next pass judges every fork
+   * again on the branch the store is on then.
+   */
+  private async reseedEmptiedForks(failures: ManagerReinitFailure[], except: string | undefined, moved: () => boolean): Promise<void> {
+    const router = this.conversationRouter;
+    if (!router || this.conversationAgentHomes.size === 0) return;
+    const failed = new Set(failures.map((f) => f.agentName));
+    const template = this.agents.get(router.templateAgent);
+    // The template's own failure is named here, not by pointing at its alert:
+    // a failure is reported from the last pass only, and a later pass may
+    // find the template re-initialized.
+    const templateFailure = template ? failures.find((f) => f.agentName === template.name) : undefined;
+    // A spawn seeds from the template too, so while the template is missing
+    // or refuses its work, the channel's next spawn fails as well.
+    const templateDown: { reason: string; remedy: string } | null = !template
+      ? {
+          reason: `no agent is registered as the conversation template "${router.templateAgent}"`,
+          remedy: 'an agent is registered under that name, or the conversation router is configured with a registered template',
+        }
+      : templateFailure
+        ? {
+            reason: `the template ${template.name}'s own context manager failed to re-initialize (${templateFailure.error})`,
+            remedy: 'the template is re-initialized, which a switchBranch() to the current branch or a restart does',
+          }
+        : null;
+    for (const agentName of [...this.conversationAgentHomes.keys()]) {
+      if (agentName === except || failed.has(agentName)) continue;
+      const agent = this.agents.get(agentName);
+      if (!agent) continue;
+      const contextManager = agent.getContextManager();
+      if (contextManager.getMessageCount() > 0) continue;
+      let cause: string;
+      let remedy: string | undefined;
+      if (templateDown === null) {
+        try {
+          const added = await this.seedConversationAgentIfEmpty(agentName, contextManager, template!, moved);
+          if (added === null) continue;
+          if (added > 0) {
+            agent.markContextConsumed(); // RFC-006: nothing stored before now is replaceable
+            console.error(`[operator] conversation agent ${agentName} had no messages on the branch the store moved to: seeded again from ${template!.name} with ${added} message(s)`);
+          }
+          continue;
+        } catch (error) {
+          cause = `its seeding from the template failed: ${failureDescription(error)}`;
+        }
+      } else {
+        cause = templateDown.reason;
+        remedy = templateDown.remedy;
+      }
+      if (moved()) continue;
+      const failure: ManagerReinitFailure = { agentName, error: cause, seedingFailed: true, ...(remedy ? { remedy } : {}) };
+      try {
+        const channelId = this.conversationAgentHomes.get(agentName);
+        if (channelId !== undefined && this.conversationRouter?.getBinding(channelId)?.agentName === agentName) {
+          this.conversationRouter.unbind(channelId);
+        }
+        this.disposeConversationAgent(agentName);
+      } catch (error) {
+        failure.cleanupFailed = failureDescription(error);
+      }
+      failures.push(failure);
+    }
+  }
+
+  /** Say which agents a move left with a manager that refuses its work:
+   *  on the console, in failures.log and in an ops alert, one per agent. */
+  private reportReinitFailures(after: string, failures: ManagerReinitFailure[]): void {
+    for (const { agentName, error, seedingFailed, after: judgedAfter, remedy, cleanupFailed } of failures) {
+      const move = judgedAfter ?? after;
+      this.reportReinitFailure(agentName, move, seedingFailed
+        ? `The ${move} moved the store's branch to one where this conversation agent had no messages of its own, ` +
+          `and it couldn't be seeded again, because ${error}. ` +
+          (cleanupFailed
+            ? `It was unregistered and its channel unbound, but cleaning up after it then failed: ${cleanupFailed}. `
+            : 'It was disposed and its channel unbound. ') +
+          "Its messages stay on the branches that hold them, but no agent reads them again, " +
+          "so a redo to a branch that holds them doesn't bring this one back. " +
+          (remedy
+            ? `Once ${remedy}, the channel's next qualifying message spawns a new fork seeded from the template, under a new name.`
+            : "The channel's next qualifying message spawns a new fork, under a new name, unless its seeding fails again.")
+        : `The ${after} moved the store's branch, and re-initializing this agent's context manager for it failed: ${error}. ` +
+          REINIT_REMEDY);
+    }
+  }
+
+  private reportReinitFailure(agentName: string, after: string, message: string): void {
+    console.error(`[operator] agent=${agentName} ${boundFailureText(message)}`);
+    this.opsAlert('context-reinit-failed', agentName, message, { data: { after } });
+  }
+
+  /**
+   * Take the store for an undo's or redo's move. It's reserved as a surgery
+   * reserves it, unless an earlier undo's or redo's managers are still
+   * re-initializing under their reservation (syncMoveReinit): then this move
+   * is made under that one. `landed()`, once the store has moved, hands a
+   * reservation this call took to the re-initialization that releases it
+   * (reinitializeAfterSyncMove), or has the joined one run again. `abandon()`,
+   * when the move failed before the store moved, releases a reservation this
+   * call took.
+   */
+  private beginSyncMove(verb: 'undo' | 'redo', agentName: string): { landed(): void; abandon(): void } {
+    const running = this.syncMoveReinit;
+    if (running) {
+      // Under the running reservation: every agent sharing the store is idle.
+      // reserveStoreForSurgery's other checks, no turn token and no spawn in
+      // flight, held when it took the reservation and can't change under it,
+      // since the hold refuses turn admission and a spawn waits for the hold.
+      const busy = [...this.agents].filter(([, a]) => a.state.status !== 'idle').map(([name, a]) => `${name} is ${a.state.status}`);
+      if (busy.length > 0) {
+        throw new OperatorActionError(
+          'agent-busy',
+          `Cannot ${verb} while ${busy.join(', ')} — every agent sharing the store must be idle (quiesce the host first)`,
+        );
+      }
+      return {
+        landed: () => { running.again = true; running.after = verb; },
+        abandon: () => {},
+      };
+    }
+    const release = this.reserveStoreForSurgery(verb, agentName);
+    return {
+      landed: () => this.reinitializeAfterSyncMove(verb, release),
+      abandon: release,
+    };
+  }
+
+  /**
+   * Re-initialize every agent's manager after an undo's or redo's move, and
+   * release the move's store reservation once they are all current. Its
+   * first pass starts once a maintenance pass already running has finished,
+   * inside the undo or redo or after it returns, and it finishes after the
+   * call has returned. A move made under the same reservation meanwhile sets
+   * `again`, and the pass runs again for the branch the store is on then.
+   * A manager's failure is reported from the last pass only, since an
+   * earlier pass can fail because of the later move. A fork disposed in any
+   * pass is reported, since a disposal isn't undone by a later pass.
+   */
+  private reinitializeAfterSyncMove(after: 'undo' | 'redo', release: () => void): void {
+    const state: SyncMoveReinit = { again: false, after, done: Promise.resolve() };
+    this.syncMoveReinit = state;
+    state.done = (async () => {
+      try {
+        // A maintenance tick already running finishes before any manager is
+        // re-initialized under it. The move itself was synchronous, so a tick
+        // in flight then ran across it, as on main.
+        if (this.maintenanceRunning()) await this.settleMaintenancePass();
+        let failures: ManagerReinitFailure[];
+        const disposed: ManagerReinitFailure[] = [];
+        do {
+          state.again = false;
+          // The move this pass judges forks for: a move that joins sets
+          // `again` and changes `after`, and from then on this pass disposes
+          // nothing.
+          const judged = state.after;
+          failures = await this.reinitializeManagers(undefined, () => state.again);
+          disposed.push(...failures.filter((f) => f.seedingFailed).map((f) => ({ ...f, after: judged })));
+        } while (state.again);
+        failures = [...failures.filter((f) => !f.seedingFailed), ...disposed];
+        // No move joins once the last pass is done: an undo or redo made from
+        // a listener of the report below meets the hold alone and is refused.
+        if (this.syncMoveReinit === state) this.syncMoveReinit = null;
+        this.reportReinitFailures(state.after, failures);
+      } finally {
+        if (this.syncMoveReinit === state) this.syncMoveReinit = null;
+        release();
+      }
+    })().catch((error: unknown) => {
+      // Nothing awaits this: a release that throws is said here, where a
+      // surgery's caller would hear it from the surgery.
+      console.error(`[operator] releasing the store the ${state.after} reserved failed: ${boundFailureText(failureDescription(error))}`);
+    });
   }
 
   /**
@@ -7983,8 +8389,28 @@ export class AgentFramework {
       return `active branch restored to ${sourceBranch}`;
     } catch (restoreError) {
       const detail = restoreError instanceof Error ? restoreError.message : String(restoreError);
-      const status = `RESTORE TO ${sourceBranch} ALSO FAILED (${detail}); agent is still on ${failedBranch}`;
+      // switchBranch() selects the branch before it initializes the strategy,
+      // so a failed initialization leaves the store back on the source.
+      const now = this.store.currentBranch().name;
+      const selected = now === sourceBranch;
+      const status = selected
+        ? `RESTORE TO ${sourceBranch} selected it, but re-initializing the agent's context manager for it FAILED (${detail}); ` +
+          'the agent refuses its work until switchBranch() to the current branch, or a restart, re-initializes it'
+        : `RESTORE TO ${sourceBranch} ALSO FAILED (${detail}); the store is still on ${now}, ` +
+          'and the agent refuses its work until switchBranch(), or a restart, re-initializes it';
       console.error(`[operator] agent=${agentName} ${status}`);
+      // Its manager is left as the failed switch left it, as the others are
+      // after a failed re-initialization: alerted the same way, saying which
+      // branch the store is on.
+      try {
+        this.reportReinitFailure(agentName, `restore to ${sourceBranch}`, selected
+          ? `The restore to ${sourceBranch} put the store back on ${sourceBranch}, and re-initializing this agent's context manager for it failed: ${detail}. ${REINIT_REMEDY}`
+          : `The restore to ${sourceBranch} failed (${detail}), so the store is still on ${now}. ` +
+            'Until this agent\'s context manager is re-initialized it refuses its work, compiles and message writes included: ' +
+            'switchBranch() to the branch it should run on, or a restart, re-initializes it.');
+      } catch (reportError) {
+        console.error(`[operator] agent=${agentName} reporting the failed restore failed: ${boundFailureText(failureDescription(reportError))}`);
+      }
       return status;
     }
   }
@@ -8070,6 +8496,7 @@ export class AgentFramework {
       const release = this.reserveStoreForSurgery('roll back', agentName);
       let branchName: string;
       let markers: SurgeryMarkerReceipt;
+      let moved = false;
       try {
         // A maintenance tick already running finishes before the switch.
         if (this.maintenanceRunning()) await this.settleMaintenancePass();
@@ -8089,11 +8516,14 @@ export class AgentFramework {
         try {
           branchName = cm.branchAt(tailMessageId as MessageId, targetBranch);
           await cm.switchBranch(branchName);
+          moved = true;
         } catch (error) {
           // switchBranch moves the chronicle branch BEFORE awaiting strategy
           // initialization, so a rejection here can leave the store on the
           // new branch with an uninitialized strategy. Retire the batch and
-          // go back to the source; keep the branch for diagnosis.
+          // go back to the source; keep the branch for diagnosis. A refusal
+          // before the switch left the store on the source, so nothing moved.
+          moved = this.store.currentBranch().name !== sourceBranch;
           if (markerBatch) this.discordAwarenessOutbox!.discard(markerBatch.id);
           const restored = await this.restoreSourceBranch(cm, sourceBranch, targetBranch, agentName);
           throw new OperatorActionError(
@@ -8112,7 +8542,15 @@ export class AgentFramework {
         this.startDiscordAwarenessDelivery('rollback', agentName);
         this.materializeConfigMountAfterBranchSwitch();
       } finally {
-        release();
+        // The agent's own manager re-initialized with its switch, or with the
+        // switch back to the source. Every other agent's is loaded for a
+        // branch generation the store has left, after a failed rollback too:
+        // its switch back is a move of its own.
+        try {
+          if (moved) this.reportReinitFailures('rollback', await this.reinitializeManagers(agentName));
+        } finally {
+          release();
+        }
       }
 
       console.error(
@@ -8240,6 +8678,7 @@ export class AgentFramework {
       const release = this.reserveStoreForSurgery('suppress', agentName);
       let createdBranch: string;
       let markers: SurgeryMarkerReceipt;
+      let moved = false;
       try {
         // A maintenance tick already running finishes before the fork.
         if (this.maintenanceRunning()) await this.settleMaintenancePass();
@@ -8265,10 +8704,14 @@ export class AgentFramework {
 
         try {
           createdBranch = await cm.fork(targetBranch);
+          moved = true;
         } catch (error) {
           // fork() switches the chronicle branch before awaiting strategy
           // initialization; a rejection can leave the store on the new
-          // branch. Retire the batch and go back to the source.
+          // branch. Retire the batch and go back to the source. A fork
+          // refused before it switched (a name already taken) left the store
+          // on the source, so nothing moved and no other manager is stale.
+          moved = this.store.currentBranch().name !== sourceBranch;
           retireBatch();
           const restored = await this.restoreSourceBranch(cm, sourceBranch, targetBranch, agentName);
           throw new OperatorActionError(
@@ -8309,7 +8752,13 @@ export class AgentFramework {
         this.startDiscordAwarenessDelivery('suppress', agentName);
         this.materializeConfigMountAfterBranchSwitch();
       } finally {
-        release();
+        // As in rollbackToMessage: fork() re-initialized only this agent's
+        // manager.
+        try {
+          if (moved) this.reportReinitFailures('suppression', await this.reinitializeManagers(agentName));
+        } finally {
+          release();
+        }
       }
 
       console.error(
@@ -9382,13 +9831,13 @@ export class AgentFramework {
       if (!target) return undefined;
       if (this.conversationRouter && this.conversationAgentHomes.has(target.name)) {
         metadata.triggered = event.triggerInference ?? false;
-        const id = target.getContextManager().addMessage('user', event.content, metadata);
+        const placement = this.writeToFork(target, event.content, metadata);
         // A correction may target an older engagement. Refresh only the
         // binding whose agent actually received the message.
         if (this.conversationRouter.getBinding(event.channelId)?.agentName === target.name) {
           this.conversationRouter.touch(event.channelId);
         }
-        this.emitTrace({ type: 'message:added', messageId: id, source: 'mcpl:channel-incoming' });
+        this.emitTrace({ type: 'message:added', messageId: placement.messageId ?? '', source: 'mcpl:channel-incoming' });
         if (event.triggerInference) {
           this.pendingRequests.push({
             agentName: target.name, reason: 'mcpl:channel-incoming', source: event.serverId, timestamp: Date.now(),
@@ -9398,7 +9847,7 @@ export class AgentFramework {
             ...(event.coalescingSubject ? { coalescingSubject: event.coalescingSubject } : {}),
           });
         }
-        return { agent: target.name, messageId: id };
+        return placement;
       }
       if (this.conversationRouter) return undefined; // the trunk never holds channel traffic
       event = { ...event, targetAgents: [target.name] };
@@ -9566,9 +10015,9 @@ export class AgentFramework {
     const trigger = decision.trigger && event.triggerInference !== false;
     messageMetadata.triggered = trigger;
 
-    const id = agent.getContextManager().addMessage('user', event.content, messageMetadata);
+    const placement = this.writeToFork(agent, event.content, messageMetadata);
     router.touch(event.channelId);
-    this.emitTrace({ type: 'message:added', messageId: id, source: 'mcpl:channel-incoming' });
+    this.emitTrace({ type: 'message:added', messageId: placement.messageId ?? '', source: 'mcpl:channel-incoming' });
 
     if (trigger) {
       this.pendingRequests.push({
@@ -9584,7 +10033,26 @@ export class AgentFramework {
         ...(event.coalescingSubject ? { coalescingSubject: event.coalescingSubject } : {}),
       });
     }
-    return { agent: agent.name, messageId: id };
+    return placement;
+  }
+
+  /**
+   * Write a message into a conversation fork's own context, or, while a move
+   * holds the store, defer it, as the hold defers every write for the agents
+   * it reserves. Written then, it would land before the move's
+   * re-initialization and re-seed: in a namespace the move emptied, where the
+   * re-seed would then find a message and seed nothing, in a manager still
+   * re-initializing, which refuses it, or on the branch a rollback is about to
+   * leave. Deferred, it lands at the hold's release, after them. The answer
+   * says where it went: the stored message, or the deferred write.
+   */
+  private writeToFork(agent: Agent, content: ContentBlock[], metadata: Record<string, unknown>): CoalescingPlacement {
+    if (this.surgeryHold) {
+      const placement: CoalescingPlacement = { agent: '' };
+      this.addMessage('user', content, metadata as MessageMetadata, { forAgent: agent.name, placement });
+      return placement;
+    }
+    return { agent: agent.name, messageId: agent.getContextManager().addMessage('user', content, metadata) };
   }
 
   /**
@@ -9596,6 +10064,11 @@ export class AgentFramework {
    * primary.
    */
   private async createConversationAgent(name: string, channelId: string): Promise<Agent> {
+    // A surgery, a branch switch, or an undo's or redo's re-initialization
+    // holds the store, and a fork's manager opens for the branch the store
+    // is on, seeded from the template's compile: wait until none holds it.
+    // From then until it's registered, the spawn counts as busy for a move.
+    for (let hold = this.surgeryHold; hold?.released; hold = this.surgeryHold) await hold.released;
     const router = this.conversationRouter!;
     const templateConfig = this.agentConfigs.get(router.templateAgent);
     const template = this.agents.get(router.templateAgent);
@@ -9606,6 +10079,7 @@ export class AgentFramework {
       throw new Error(`Conversation agent name "${name}" is already registered or reserved`);
     }
     this.usedEphemeralAgentNames.add(name);
+    this.conversationSpawnsInFlight.add(name);
     try {
 
       const contextManager = await ContextManager.open({
@@ -9621,64 +10095,7 @@ export class AgentFramework {
         debugLogContext: !!process.env.DEBUG_CONTEXT,
       });
 
-      // Seed with the template's compiled context, renaming the template
-      // participant so the fork reads its inheritance as its own history.
-      // Guard: only seed a genuinely fresh namespace. Generation counters are
-      // persisted precisely so names aren't reused, but if this namespace has
-      // history anyway (counter state lost, crash between spawn and persist),
-      // seeding again would stack another template copy on top of it.
-      //
-      // Both compiles are dry runs: neither is sent, and the template's runs
-      // while the template may be mid-stream, where a committing compile
-      // would commit fold resolutions and queue the compression its fold plan
-      // calls for (and, once context-manager's thinking binding ships, fence
-      // its stream's replies). In context-manager 0.14 a dry run leaves
-      // nothing else behind but the release of an expired compression hold
-      // (see Agent.compileWithInjections), so the template's request in
-      // flight keeps its calibration estimate.
-      // The template's compile runs at context-manager's default budget (none
-      // is passed), and a dry run still refuses a budget it can't fit: it
-      // skips only the post-pick check, and an adaptive fold plan that
-      // doesn't fit then overruns at the middle's emission. So a template
-      // whose fold plan doesn't fit that budget fails the spawn with
-      // context-manager's refusal, which names the tokens and the limit, as
-      // a committing compile failed it. Only a windowed-passthrough template
-      // whose newest message alone exceeds it seeds that message, larger than
-      // the budget. The fork's own compiles meet its window by its strategy's
-      // rule: passthrough, the fork's default, keeps the newest messages that
-      // fit; an adaptive strategy folds to fit or throws over_budget for the
-      // drain breaker.
-      // The seed leaves out the template's thinking (withoutThinking): a
-      // signed block verifies only while everything before it is what it was
-      // minted under, and a fork's system, tools and scoped injections don't
-      // promise that, while its own namespace holds no stamps that could
-      // vouch for the copies. On models that don't bind thinking to its
-      // prefix a copy would have been kept, so there the fork loses the
-      // template's reasoning.
-      // Then context-manager's stripUnpairedToolBlocks drops each call whose
-      // result isn't in the seed and each result whose call isn't, keeping
-      // the rest of their messages (a message left with nothing becomes its
-      // "[tool call omitted]" placeholder). A fork spawned while the template
-      // is between a round's call and its results (the coalescer can spawn
-      // one outside the event loop) would otherwise give the fork's first
-      // request an unanswered call: the passthrough strategies have no
-      // pairing pass, and an adaptive template's compile has been through its
-      // own.
-      const { messages: existing } = await contextManager.compile(undefined, undefined, { dryRun: true });
-      if (existing.length === 0) {
-        // The copy is the fork's own, and the template's annotation edits only
-        // the template's message: seed only once each of the template's
-        // annotations has finished.
-        const { messages: compiled } = await template.toolResultGuard.afterAnnotations(
-          () => template.getContextManager().compile(undefined, undefined, { dryRun: true }));
-        const withoutReasoning = withoutThinking(compiled);
-        const seed = stripUnpairedToolBlocks(withoutReasoning);
-        logSeedOmissions(name, template.name, compiled, withoutReasoning, seed);
-        for (const msg of seed) {
-          const participant = msg.participant === template.name ? name : msg.participant;
-          contextManager.addMessage(participant, msg.content);
-        }
-      }
+      await this.seedConversationAgentIfEmpty(name, contextManager, template);
 
       const config: AgentConfig = { ...templateConfig, name, strategy: undefined };
       const agent = new Agent(config, contextManager, this.membrane);
@@ -9691,7 +10108,98 @@ export class AgentFramework {
     } catch (error) {
       this.usedEphemeralAgentNames.delete(name);
       throw error;
+    } finally {
+      this.conversationSpawnsInFlight.delete(name);
     }
+  }
+
+  /**
+   * Seed a conversation fork's namespace from the template, when the
+   * namespace holds no stored message on this branch: at the fork's
+   * creation, and after a move lands on a branch where it holds none
+   * (reseedEmptiedForks). Answers how many messages it added (0 for a
+   * namespace with history, or a template with none), or null when `moved`
+   * says the store moved during the template's compile, so nothing was
+   * written.
+   *
+   * Seed with the template's compiled context, renaming the template
+   * participant so the fork reads its inheritance as its own history.
+   * Guard: only seed a genuinely fresh namespace. Generation counters are
+   * persisted precisely so names aren't reused, but if this namespace has
+   * history anyway (counter state lost, crash between spawn and persist),
+   * seeding again would stack another template copy on top of it.
+   *
+   * The fork's emptiness is its stored message count, so the fork itself
+   * is never compiled here. The template's compile is a dry run: it isn't
+   * sent, and it runs while the template may be mid-stream, where a committing compile
+   * would commit fold resolutions and queue the compression its fold plan
+   * calls for (and, once context-manager's thinking binding ships, fence
+   * its stream's replies). In context-manager 0.14 a dry run leaves
+   * nothing else behind but the release of an expired compression hold
+   * (see Agent.compileWithInjections), so the template's request in
+   * flight keeps its calibration estimate.
+   * The template's compile runs at context-manager's default budget (none
+   * is passed), and a dry run still refuses a budget it can't fit: it
+   * skips only the post-pick check, and an adaptive fold plan that
+   * doesn't fit then overruns at the middle's emission. So a template
+   * whose fold plan doesn't fit that budget fails the spawn with
+   * context-manager's refusal, which names the tokens and the limit, as
+   * a committing compile failed it. Only a windowed-passthrough template
+   * whose newest message alone exceeds it seeds that message, larger than
+   * the budget. The fork's own compiles meet its window by its strategy's
+   * rule: passthrough, the fork's default, keeps the newest messages that
+   * fit; an adaptive strategy folds to fit or throws over_budget for the
+   * drain breaker.
+   * The seed leaves out the template's thinking (withoutThinking): a
+   * signed block verifies only while everything before it is what it was
+   * minted under, and a fork's system, tools and scoped injections don't
+   * promise that, while its own namespace holds no stamps that could
+   * vouch for the copies. On models that don't bind thinking to its
+   * prefix a copy would have been kept, so there the fork loses the
+   * template's reasoning.
+   * Then context-manager's stripUnpairedToolBlocks drops each call whose
+   * result isn't in the seed and each result whose call isn't, keeping
+   * the rest of their messages (a message left with nothing becomes its
+   * "[tool call omitted]" placeholder). A fork spawned while the template
+   * is between a round's call and its results (the coalescer can spawn
+   * one outside the event loop) would otherwise give the fork's first
+   * request an unanswered call: the passthrough strategies have no
+   * pairing pass, and an adaptive template's compile has been through its
+   * own.
+   */
+  private async seedConversationAgentIfEmpty(
+    name: string,
+    contextManager: ContextManager,
+    template: Agent,
+    moved: () => boolean = () => false,
+  ): Promise<number | null> {
+    // Empty is no stored message on this branch: a namespace whose history
+    // compiles to nothing (hidden, pruned, or past its window) still has it.
+    if (contextManager.getMessageCount() > 0) return 0;
+    const branch = this.store.currentBranch().id;
+    // The copy is the fork's own, and the template's annotation edits only
+    // the template's message: seed only once each of the template's
+    // annotations has finished.
+    const { messages: compiled } = await template.toolResultGuard.afterAnnotations(
+      () => template.getContextManager().compile(undefined, undefined, { dryRun: true }));
+    // The store may have moved during those awaits: then this branch is no
+    // longer the one judged empty, and the compile may be another branch's,
+    // so write nothing. A move the caller made under its reservation is the
+    // caller's to judge again. Any other mover, such as a switch through an
+    // agent's own context manager, fails the seeding, so the fork isn't left
+    // to run with no seed.
+    if (moved()) return null;
+    if (this.store.currentBranch().id !== branch) {
+      throw new Error(`the store moved to another branch, ${this.store.currentBranch().name}, while it was being seeded`);
+    }
+    const withoutReasoning = withoutThinking(compiled);
+    const seed = stripUnpairedToolBlocks(withoutReasoning);
+    logSeedOmissions(name, template.name, compiled, withoutReasoning, seed);
+    for (const msg of seed) {
+      const participant = msg.participant === template.name ? name : msg.participant;
+      contextManager.addMessage(participant, msg.content);
+    }
+    return seed.length;
   }
 
   /** Persist the router's generation counters (see hydration in create()). */
@@ -9798,8 +10306,8 @@ export class AgentFramework {
         this.conversationAgentHomes.delete(binding.agentName);
         continue;
       }
-      agent.getContextManager().addMessage(
-        'user',
+      this.writeToFork(
+        agent,
         [{ type: 'text', text: this.conversationRouter.closurePrompt }],
         { channelId: binding.channelId, conversationClosure: true },
       );
@@ -10376,6 +10884,14 @@ export class AgentFramework {
       return true;
     }
     if (!p.messageId) return false;
+    // While a move holds the store, nothing touches a manager's stored
+    // messages, which may be on the branch the move leaves or under a
+    // manager not yet re-initialized. Told the removal didn't happen, the
+    // coalescer does what it does whenever one fails: a replacement, or a
+    // retraction's notice, is appended and lands at the release with every
+    // deferred write, beside the unread message, and a retraction with no
+    // notice leaves that message where it is.
+    if (this.surgeryHold) return false;
     const agent = this.agents.get(p.agent);
     if (!agent) return false;
     try {
@@ -16143,6 +16659,9 @@ export class AgentFramework {
         } catch (err) {
           if (err instanceof MaintenanceWithdrawnError) {
             console.error(`[inference-failed] drain kicked for ${agentName} (OverBudget breaker, ${ticks} ticks, stopped: ${err.message})`);
+          } else if (this.syncMoveReinit) {
+            // A move landed under this tick, as under a maintenance pass's.
+            console.error(`[inference-failed] drain kicked for ${agentName} (OverBudget breaker, ${ticks} ticks, stopped: ${this.syncMoveReinit.after === 'undo' ? 'an undo' : 'a redo'} moved the store under the tick: ${err instanceof Error ? err.message : failureDescription(err)})`);
           } else {
             console.error(`[inference-failed] drain kick failed for ${agentName} after ${ticks} ticks: ${describeFailureWithFrames(err)}`);
           }
