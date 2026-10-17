@@ -7937,9 +7937,12 @@ export class AgentFramework {
             try {
               // Stored with its deferred write's id, as the other flushes
               // store theirs, so a placement deferred during the move
-              // resolves to the stored message.
-              this.addMessage(msg.participant, msg.content, msg.metadata,
+              // resolves to the stored message. Traced as it lands, as the
+              // turn-start flush traces each message it stores: the trace
+              // at its deferral had no id to give.
+              const id = this.addMessage(msg.participant, msg.content, msg.metadata,
                 { deferredWriteId: msg.id, ...(msg.forAgent ? { forAgent: msg.forAgent } : {}) });
+              if (id) this.emitTrace({ type: 'message:added', messageId: id, source: 'deferred-flush:surgery-release' });
             } catch (error) {
               console.error(`[operator] post-surgery deferred flush failed for ${name}: ${error instanceof Error ? error.message : String(error)}`);
             }
@@ -7964,9 +7967,12 @@ export class AgentFramework {
    * Called under the move's store reservation, so no turn starts while a
    * manager re-initializes, and the messages the reservation defers for its
    * agents are written after. The managers re-initialize one at a time, with
-   * a turn of the event loop before each: a manager's re-initialization runs
-   * synchronously, for a time that grows with its history, so side by side
-   * they would hold the event loop for the whole pass. Never rejects: it
+   * a turn of the event loop before each: most of a manager's
+   * re-initialization runs synchronously, for a time that grows with its
+   * history, so side by side they would hold the event loop for most of the
+   * pass. A strategy's own initialize can also wait, as an autobiographical
+   * strategy does for its compression-state lock to deliver pending
+   * quarantine alerts, and the event loop can turn then too. Never rejects: it
    * answers the agents whose re-initialization failed. Each of those
    * managers refuses its work, as context-manager leaves a failed
    * initialization, until another one succeeds.
@@ -9999,7 +10005,7 @@ export class AgentFramework {
     // to run with no seed.
     if (moved()) return null;
     if (this.store.currentBranch().id !== branch) {
-      throw new Error('the store moved to another branch while it was being seeded');
+      throw new Error(`the store moved to another branch, ${this.store.currentBranch().name}, while it was being seeded`);
     }
     const withoutReasoning = withoutThinking(compiled);
     const seed = stripUnpairedToolBlocks(withoutReasoning);
@@ -10693,6 +10699,12 @@ export class AgentFramework {
       return true;
     }
     if (!p.messageId) return false;
+    // While a move holds the store, nothing touches a manager's stored
+    // messages, which may be on the branch the move leaves or under a
+    // manager not yet re-initialized. Told the removal didn't happen, the
+    // coalescer appends the replacement as it does whenever one fails, and
+    // the replacement lands at the release with every deferred write.
+    if (this.surgeryHold) return false;
     const agent = this.agents.get(p.agent);
     if (!agent) return false;
     try {

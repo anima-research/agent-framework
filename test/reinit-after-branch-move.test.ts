@@ -1340,6 +1340,7 @@ describe('conversation forks and an undo', () => {
     maintenancePass: Promise<void> | null;
     handleMcplChannelIncoming(event: unknown): Promise<Placement | undefined>;
     resolvePlacement(placement: Placement): void;
+    removePlacement(placement: Placement): boolean;
     lastConversationSweep: number;
     sweepExpiredConversations(): void;
   };
@@ -1382,6 +1383,10 @@ describe('conversation forks and an undo', () => {
       await forksAroundACheckpoint(framework, forkInternals);
       const internals = forkInternals as unknown as HoldInternals;
       const placements: Array<Placement | undefined> = [];
+      const added: Array<{ messageId: string; source: string }> = [];
+      framework.onTrace((event) => {
+        if (event.type === 'message:added') added.push(event as unknown as { messageId: string; source: string });
+      });
       await duringMaintenanceWait(internals, async () => assert.equal(framework.undoLastTurn('a').undone, true), async () => {
         placements.push(await internals.handleMcplChannelIncoming(channelMessage('world:late', 'MESSAGE DURING THE UNDO')));
         placements.push(await internals.handleMcplChannelIncoming(channelMessage('world:late', 'CORRECTION DURING THE UNDO', { deliverTo: 'a-late-g1' })));
@@ -1396,6 +1401,31 @@ describe('conversation forks and an undo', () => {
         internals.resolvePlacement(placement!);
         assert.ok(placement!.messageId && !placement!.deferredId, `the placement resolves to the stored message: ${JSON.stringify(placement)}`);
       }
+      // Each write is traced at its deferral with no id yet, as addMessage
+      // answers for any write it defers, and again as it lands at the
+      // release, with the stored message's id.
+      assert.deepEqual(added.filter((t) => t.source === 'mcpl:channel-incoming').map((t) => t.messageId), ['', ''],
+        `traced at the deferral, with no id yet: ${JSON.stringify(added)}`);
+      assert.deepEqual(added.filter((t) => t.source === 'deferred-flush:surgery-release').map((t) => t.messageId),
+        placements.map((p) => p!.messageId), `traced as each lands, with its stored id: ${JSON.stringify(added)}`);
+    });
+  });
+
+  it("while an undo holds the store, a coalesced push's removal of a fork's stored message is declined, and the message stays", { timeout: 30_000 }, async () => {
+    await withForks('reinit-fork-hold-remove-', async (framework, forkInternals) => {
+      await forksAroundACheckpoint(framework, forkInternals);
+      const internals = forkInternals as unknown as HoldInternals;
+      const early = framework.getAgent('a-early-g1')!.getContextManager();
+      let target: { id: string; text: string } | undefined;
+      await duringMaintenanceWait(internals, async () => assert.equal(framework.undoLastTurn('a').undone, true), async () => {
+        const message = early.getAllMessages().at(-1)!;
+        target = { id: message.id, text: storedTexts(early).at(-1)! };
+        assert.equal(internals.removePlacement({ agent: 'a-early-g1', messageId: message.id }), false,
+          'the removal is declined while the store is held');
+        assert.ok(early.getAllMessages().some((m) => m.id === message.id), 'the message is still stored during the hold');
+      });
+      assert.ok(target, 'a stored message to remove');
+      assert.ok(early.getAllMessages().some((m) => m.id === target!.id), `the message is still stored after the release: ${target!.text}`);
     });
   });
 
@@ -1459,7 +1489,7 @@ describe('conversation forks and an undo', () => {
       assert.equal(store.currentBranch().name, 'elsewhere');
       assert.deepEqual(storedTexts(late), [], 'nothing seeded from the compile of the branch the store left');
       assert.ok(!framework.getAgent('a-late-g1'), 'the fork is disposed');
-      assert.ok(logged.some((line) => /agent=a-late-g1 .*couldn't be seeded again, because its seeding from the template failed: Error: the store moved to another branch while it was being seeded\./.test(line)),
+      assert.ok(logged.some((line) => /agent=a-late-g1 .*couldn't be seeded again, because its seeding from the template failed: Error: the store moved to another branch, [^,]+, while it was being seeded\./.test(line)),
         logged.join('\n'));
     });
   });

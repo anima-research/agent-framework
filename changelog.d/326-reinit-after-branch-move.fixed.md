@@ -22,13 +22,13 @@
   re-initializes nothing. Each move re-initializes every agent on the store,
   one at a time with the event loop running between them, so the store stays
   reserved for longer as agents and their stored history grow, while the
-  host goes on handling events; each agent's own re-initialization still
-  runs without a break.
-- **A conversation agent spawned after the point a move returns to is
-  seeded again from the template.** On the branch the store moved to it
-  holds no stored message of its own, and a conversation agent was seeded
-  only when it was created, so re-initialized it would have answered with
-  no history. It's now seeded as at its creation, from the template's
+  host goes on handling events; most of each agent's own re-initialization
+  still runs without a break.
+- **A conversation agent with no stored message of its own on the branch
+  the store moves to is seeded again from the template,** as one spawned
+  after the point a move returns to has none there. A conversation agent
+  was seeded only when it was created, so re-initialized it would have
+  answered with no history. It's now seeded as at its creation, from the template's
   context as it stands on that branch, and keeps its name and its channel.
   What reaches it while the move holds the store, from its channel, a
   correction for it or its idle closure, is written after that, as every
