@@ -15,7 +15,16 @@
  */
 
 import { INLINE_WITHHELD_TEXT, isInlineContradiction, referenceStubOrNull } from './mcpl/references.js';
-import { formatPreservedImageSlots, formatToolImagePlaceholder, splitPreservingImageSlots } from './tool-image-ledger.js';
+import { formatToolImagePlaceholder, toolResultCutAt } from './tool-image-ledger.js';
+
+/** Where one block of a content array sits in its history text, and what
+ *  kind of block it was: text, an inline image (its placeholder), an RFC-005
+ *  reference (its stub), or inline data withheld for a contradiction. */
+export interface HistoryBlockSpan {
+  kind: 'text' | 'image' | 'reference' | 'withheld';
+  start: number;
+  end: number;
+}
 
 export interface HistorySerializeOptions {
   /**
@@ -25,6 +34,13 @@ export interface HistorySerializeOptions {
    * handle in history; null leaves the legacy ref-less form.
    */
   imageRef?: (blockIndex: number, image: { data: string; mimeType: string }) => string | null;
+  /**
+   * Called once a content array has been serialized block by block, rather
+   * than given up on for the fallback, with where each block sits in the
+   * joined text, before any cut at `maxChars`. The framework reads from it
+   * what a result's live copy showed (#403).
+   */
+  onBlocks?: (spans: HistoryBlockSpan[]) => void;
 }
 
 /**
@@ -80,14 +96,16 @@ export function nonErrorResultText(
   return toolResultDataToHistoryString(data, maxChars, options);
 }
 
-/** Bounded copy of an arbitrary string with the standard truncation notice.
- *  Image slots past the cut are re-appended, never dropped (issue #104). */
+/** Bounded copy of an arbitrary string with the standard truncation notice,
+ *  cut at the cap as a tool result's stored copy is (toolResultCutAt), so it
+ *  never ends in part of a slot. Each of its callers' readers sees this
+ *  very text, never the images behind a placeholder, so nothing past the cut
+ *  is kept for save_recent_image's index (#403). The framework stores a tool
+ *  result with spillOrTruncate, which keeps the slots past its cut that the
+ *  result's live copy showed. */
 export function truncateForHistory(str: string, maxChars: number): string {
   if (str.length <= maxChars) return str;
-  const { head, tail } = splitPreservingImageSlots(str, maxChars);
-  return head
-    + '\n\n[truncated — original was ' + str.length + ' chars]'
-    + formatPreservedImageSlots(tail);
+  return str.slice(0, toolResultCutAt(str, maxChars)) + '\n\n[truncated — original was ' + str.length + ' chars]';
 }
 
 /**
@@ -97,35 +115,45 @@ export function truncateForHistory(str: string, maxChars: number): string {
  */
 function tryHistoryStringFromContentArray(data: unknown, options?: HistorySerializeOptions): string | null {
   if (!Array.isArray(data)) return null;
-  const parts: string[] = [];
+  const parts: Array<{ kind: HistoryBlockSpan['kind']; text: string }> = [];
   for (const [blockIndex, raw] of data.entries()) {
     if (!raw || typeof raw !== 'object') return null;
     const b = raw as { type?: unknown; text?: unknown; data?: unknown; mimeType?: unknown };
     if (b.type === 'text' && typeof b.text === 'string') {
-      parts.push(b.text);
+      parts.push({ kind: 'text', text: b.text });
     } else if (isInlineContradiction(b)) {
       // RFC-005 vector 2: checked before the data branch so inline data
       // claiming bulk disposition is withheld, not rendered.
-      parts.push(INLINE_WITHHELD_TEXT);
+      parts.push({ kind: 'withheld', text: INLINE_WITHHELD_TEXT });
     } else if (b.type === 'image' && typeof b.data === 'string' && typeof b.mimeType === 'string') {
       // Decoded byte estimate from base64 length (3/4 ratio, rounded).
       const approxBytes = Math.floor(b.data.length * 3 / 4);
       const ref = options?.imageRef?.(blockIndex, { data: b.data, mimeType: b.mimeType }) ?? null;
-      parts.push(formatToolImagePlaceholder(b.mimeType, formatSize(approxBytes), ref));
+      parts.push({ kind: 'image', text: formatToolImagePlaceholder(b.mimeType, formatSize(approxBytes), ref) });
     } else if (b.type === 'resource' || ((b.type === 'image' || b.type === 'audio') && typeof (b as { uri?: unknown }).uri === 'string')) {
       // RFC-005 reference block: a bounded stub, never the raw block JSON
       // (which used to inline the URI — and the whole array — into history).
-      // Image-typed stubs still occupy a slot in save_recent_image's
-      // inventory (a failing one — bytes live behind fetch_reference), so
-      // the index never slides past an image the resident saw.
+      // A stub that shows an image type occupies a slot in
+      // save_recent_image's inventory (a failing one — bytes live behind
+      // fetch_reference), so the index never slides past an image the
+      // resident saw.
       const stub = referenceStubOrNull(b, 'from tool result');
       if (stub === null) return null;
-      parts.push(stub);
+      parts.push({ kind: 'reference', text: stub });
     } else {
       return null;
     }
   }
-  return parts.join('\n');
+  if (options?.onBlocks) {
+    const spans: HistoryBlockSpan[] = [];
+    let start = 0;
+    for (const part of parts) {
+      spans.push({ kind: part.kind, start, end: start + part.text.length });
+      start += part.text.length + 1; // the newline that joins them
+    }
+    options.onBlocks(spans);
+  }
+  return parts.map((part) => part.text).join('\n');
 }
 
 function formatSize(bytes: number): string {

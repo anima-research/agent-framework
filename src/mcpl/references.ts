@@ -30,6 +30,10 @@ export const REFERENCE_LIMITS = { uri: 4096, mimeType: 255, name: 255, expiresAt
 export const DIGEST_PATTERN = /^sha256:[A-Za-z0-9_-]{43}$/;
 const MAX_SAFE = 9007199254740991; // 2^53 - 1
 const STUB_FIELD_CHARS = 120;
+/** A saved copy's path, as its stub shows it. */
+const SAVED_PATH_CHARS = 256;
+/** A reference id's random suffix (see ReferenceRegistry.register). */
+const REF_ID_SUFFIX_CHARS = 4;
 
 export type ReferenceDisposition = 'never' | 'ref';
 
@@ -261,7 +265,7 @@ export class ReferenceRegistry {
         return existing;
       }
     }
-    const refId = `ref_${(++this.counter).toString(36)}_${Math.random().toString(36).slice(2, 6)}`;
+    const refId = `ref_${(++this.counter).toString(36)}_${Math.random().toString(36).slice(2, 2 + REF_ID_SUFFIX_CHARS)}`;
     const record: ReferenceRecord = { refId, serverId, testimony, receivedAt: Date.now() };
     this.records.set(refId, record);
     this.byKey.set(testimony.uri, refId);
@@ -300,6 +304,22 @@ export function referenceTypeLabel(mimeType: string | undefined): string {
 }
 
 /**
+ * The longest line buildReferenceStub writes, in UTF-16 code units, from its
+ * own bounds: the longest id the registry mints, then the name, the type with
+ * the largest size it shows, and the origin, each at its bound, and the
+ * longest ending, a saved copy's path, with their separators. The other
+ * endings, the fetch hint and the reasons a fetch would be refused, are
+ * shorter. A line shaped like a stub but longer than this is quoted text the
+ * writer can't have written, and no image slot (tool-image-ledger.ts).
+ */
+export const REFERENCE_STUB_MAX_CHARS =
+  `[ref_${MAX_SAFE.toString(36)}_] `.length + REF_ID_SUFFIX_CHARS
+  + STUB_FIELD_CHARS
+  + ' — '.length + STUB_FIELD_CHARS + ', '.length + `${formatSizeBytes(MAX_SAFE)} claimed`.length
+  + ' — '.length + STUB_FIELD_CHARS
+  + ' — '.length + 'saved: '.length + SAVED_PATH_CHARS;
+
+/**
  * Build the model-visible stub for a reference. Output length is bounded by
  * host constants and independent of every server-supplied field length.
  * Under `disposition:"never"` the uri is omitted unconditionally; under
@@ -322,7 +342,7 @@ export function buildReferenceStub(t: ReferenceTestimony, provenance?: string, s
   if (record.fetchedPath) {
     // Already materialized by the host-mediated fetcher: hand the model the
     // workspace path (host-generated, §7.3) so existing tools just work.
-    parts.push(`saved: ${sanitizeLabel(record.fetchedPath, 256)}`);
+    parts.push(`saved: ${sanitizeLabel(record.fetchedPath, SAVED_PATH_CHARS)}`);
   } else {
     // A reference whose record shows the fetcher would refuse it says why,
     // rather than inviting a fetch_reference call.
