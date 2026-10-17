@@ -265,7 +265,7 @@ test('a send the server refuses carries no closed-channel note', async () => {
   assert.equal(refused.error, 'Missing Access in channel 444555', "the server's refusal, and nothing about the channel");
 });
 
-test('a send into an open channel, or by send_dm, carries no closed-channel note', async () => {
+test('a send into an open channel, by send_dm, or into a channel a module closed, carries no closed-channel note', async () => {
   {
     const { registry, reply } = await harness();
     assert.equal((await registry.handleChannelToolCall('channel_open', { channelId }, origin)).success, true);
@@ -277,6 +277,18 @@ test('a send into an open channel, or by send_dm, carries no closed-channel note
     const { registry, reply } = await harness();
     assert.equal((await registry.handleChannelToolCall('channel_close', { channelId }, origin)).success, true);
     assert.ok(!(await reply('send_dm')).data.includes('[closed channel]'), 'send_dm');
+  }
+  {
+    // A module closed it, as connectome-host's mentions mode does through ctx.callTool:
+    // the send leaves it closed, and the module's own tool is the way back.
+    const { registry, opens, reply } = await harness();
+    assert.equal((await registry.handleChannelToolCall('channel_close', { channelId }, { kind: 'module' })).success, true);
+    const opensBefore = opens.length;
+    const { success, data } = await reply();
+    assert.equal(success, true);
+    assert.ok(!data.includes('[closed channel]'), 'a module\'s close');
+    assert.equal(opens.length, opensBefore, 'the send opened nothing');
+    assert.equal(registry.isChannelOpen(channelId), false);
   }
 });
 

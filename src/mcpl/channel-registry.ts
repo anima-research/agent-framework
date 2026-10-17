@@ -568,9 +568,16 @@ export type ChannelToolOrigin =
 export const MACHINE_CLOSE_SOURCES = new Set(['subscription-gc', 'housekeeping']);
 
 /** The agent's own decisions to keep a channel closed: its channel_close and
- *  its decline of an invitation. Speech opens a closed channel only where
- *  nobody decided, or a machine did (openForSpeech); it never undoes these. */
+ *  its decline of an invitation. Speech never undoes these (speechOpens), and
+ *  where the agent's words stay in such a channel it's told so. */
 export const AGENT_CLOSE_SOURCES: ReadonlySet<string> = new Set(['agent-tool', 'invitation-declined']);
+
+/** A close a module made through its own tool call (ctx.callTool) without a
+ *  machine source, such as connectome-host's mentions mode: a decision the
+ *  module owns, with its own way back. Speech leaves it closed too, but the
+ *  agent isn't told how to open it, since channel_open alone would undo only
+ *  part of what the module did. */
+export const MODULE_CLOSE_SOURCE = 'module-tool';
 
 export class ChannelRegistry {
   private serverRegistry: McplServerRegistry;
@@ -1959,14 +1966,18 @@ export class ChannelRegistry {
     // bootstrap can still lift it (#417).
     let recorded = !current && desired === 'closed' && MACHINE_CLOSE_SOURCES.has(source) ? 'default-closed' : source;
     if (current?.state === desired) {
-      // The same state keeps the decision on record, except that the agent's
-      // own close or decline replaces a pure default or a machine's close, so
-      // it sticks: policy and bootstrap lift only 'default-closed', and speech
-      // opens only what the agent didn't close itself (openForSpeech). A
-      // machine source never replaces one, so what nobody decided stays
-      // liftable.
-      const replaceable = current.source === 'default-closed' || MACHINE_CLOSE_SOURCES.has(current.source);
-      recorded = replaceable && AGENT_CLOSE_SOURCES.has(source) ? source : current.source;
+      // The same state keeps the decision on record, except that a close
+      // someone decided replaces one nobody did, so it sticks: policy and
+      // bootstrap lift only 'default-closed', and speech opens only what
+      // nobody decided to keep closed (speechOpens). The agent's own close or
+      // decline replaces a pure default, a machine's close or a module's; a
+      // module's close replaces a pure default or a machine's. A machine
+      // source never replaces one, so what nobody decided stays liftable.
+      const undecided = current.source === 'default-closed' || MACHINE_CLOSE_SOURCES.has(current.source);
+      const replaces = AGENT_CLOSE_SOURCES.has(source)
+        ? undecided || current.source === MODULE_CLOSE_SOURCE
+        : source === MODULE_CLOSE_SOURCE && undecided;
+      recorded = replaces ? source : current.source;
       if (recorded === current.source) return;
     }
     this.desiredStates.set(key, { state: desired, source: recorded });
@@ -2671,8 +2682,9 @@ export class ChannelRegistry {
    * Whether the agent's words delivered into this channel open it
    * (openForSpeech). A closed channel opens as it always did, unless the
    * agent decided to keep it closed itself (channel_close, channel_decline):
-   * that decision stands against its own speech. A tune-out stands too,
-   * since it's the agent's decision as well. Where nobody decided (no
+   * that decision stands against its own speech. So does a module's close
+   * (MODULE_CLOSE_SOURCE), and a tune-out, the agent's decision as well.
+   * Where nobody decided (no
    * record, a pure default) or a machine closed the channel
    * (subscription-gc, housekeeping), the channel opens, and so does one
    * decided open whose open failed. Nothing opens on a server whose grant
@@ -2683,7 +2695,7 @@ export class ChannelRegistry {
     if (!entry || entry.open || !this.canOpenChannels(serverId)) return false;
     const current = this.desiredStates.get(this.lifecycleKey(serverId, channelId));
     if (current?.state === 'tuned-out') return false;
-    return !(current?.state === 'closed' && AGENT_CLOSE_SOURCES.has(current.source));
+    return !(current?.state === 'closed' && (AGENT_CLOSE_SOURCES.has(current.source) || current.source === MODULE_CLOSE_SOURCE));
   }
 
   /**
@@ -2792,7 +2804,8 @@ export class ChannelRegistry {
        *  Honored ONLY for module-origin dispatch — tool input is untrusted,
        *  so a model-origin call carrying this field is still recorded as
        *  'agent-tool' (the resident may close their own channel; they may
-       *  not attribute the act to housekeeping). */
+       *  not attribute the act to housekeeping). A module-origin call
+       *  without it is the module's own close, MODULE_CLOSE_SOURCE. */
       source?: string;
       /** A machine close aimed at an explicitly-opened channel is refused
        *  unless the caller certifies an explicit idle lease (a configured
@@ -2814,11 +2827,12 @@ export class ChannelRegistry {
 
     // Provenance comes from trusted dispatch, not from self-description:
     // only module-origin calls may record a machine source, and only from
-    // the closed vocabulary. Agent-origin (or origin-less — the safe
+    // the closed vocabulary; without one, a module's close is its own
+    // (MODULE_CLOSE_SOURCE). Agent-origin (or origin-less — the safe
     // default for any legacy caller) records 'agent-tool' and has its
     // machine fields ignored entirely.
     const isModuleOrigin = origin?.kind === 'module';
-    let closeSource = 'agent-tool';
+    let closeSource = isModuleOrigin ? MODULE_CLOSE_SOURCE : 'agent-tool';
     if (isModuleOrigin && input.source !== undefined) {
       if (!MACHINE_CLOSE_SOURCES.has(input.source)) {
         return {
@@ -2850,7 +2864,7 @@ export class ChannelRegistry {
     // close of a channel whose current desired state is an agent/operator
     // 'open' is refused — structurally, so the caller can stand down rather
     // than retry — unless it certifies an explicit idle lease.
-    if (isModuleOrigin && closeSource !== 'agent-tool' && !input.overrideExplicitOpen) {
+    if (isModuleOrigin && MACHINE_CLOSE_SOURCES.has(closeSource) && !input.overrideExplicitOpen) {
       const current = this.desiredStates.get(this.lifecycleKey(entry.serverId, input.channelId));
       // Tuned-out is stated intent too: a GC/housekeeping close would
       // silently end the epoch and orphan its backlog.

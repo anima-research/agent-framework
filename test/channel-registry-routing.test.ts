@@ -583,6 +583,45 @@ test("channel_close's description says the close stands against speech and polic
     /It stays closed until you open it with channel_open: neither speaking there nor subscription policy reopens it\.$/);
 });
 
+test("a module's close, made with no machine source, is the module's: speech leaves it closed, and it isn't the agent's", async () => {
+  const { registry, openCalls, publishCalls } = makeRegistry({ delivered: true });
+  await registry.handleChanged('discord', {
+    added: [
+      { id: 'mode-a', type: 'discord', label: '#a', direction: 'bidirectional' },
+      { id: 'mode-b', type: 'discord', label: '#b', direction: 'bidirectional' },
+    ],
+  } as never);
+  // A module's tool call (ctx.callTool), as connectome-host's channel modes make them.
+  const mode = { kind: 'module' as const };
+  const agent = { kind: 'agent' as const, agentName: 'sol' };
+  // mode-b was opened by the module's other mode, which records an open as the agent's.
+  assert.equal((await registry.handleChannelToolCall('channel_open', { channelId: 'mode-b' }, mode)).success, true);
+  for (const id of ['mode-a', 'mode-b']) {
+    const closed = await registry.handleChannelToolCall('channel_close', { channelId: id }, mode);
+    assert.equal(closed.success, true, `${id}: not refused as a machine's close of an explicit open`);
+    assert.equal(registry.getDesiredState('discord', id), 'closed');
+    assert.equal(registry.speechOpens('discord', id), false, `${id}: speech leaves it closed`);
+    assert.equal(registry.closedByAgent('discord', id), undefined, `${id}: not the agent's close`);
+  }
+  const opensBefore = openCalls.length;
+  assert.deepEqual(await registry.routeSpeech('sol', 'a reply', 'mode-a'), { delivered: true, channelId: 'mode-a' });
+  assert.equal(publishCalls.at(-1)?.channelId, 'mode-a');
+  assert.equal(openCalls.length, opensBefore, 'speech opened nothing');
+
+  // Policy doesn't lift it at the next registration.
+  registry.setSubscriptionPolicy('discord', 'auto');
+  await registry.handleChanged('discord', {
+    added: [{ id: 'mode-a', type: 'discord', label: '#a', direction: 'bidirectional' }],
+  } as never);
+  assert.equal(registry.getDesiredState('discord', 'mode-a'), 'closed');
+  // A machine's close doesn't replace it.
+  await registry.handleChannelToolCall('channel_close', { channelId: 'mode-b', source: 'subscription-gc' }, mode);
+  assert.equal(registry.speechOpens('discord', 'mode-b'), false, "still the module's");
+  // The agent's own close does, and from then on it's the agent's.
+  await registry.handleChannelToolCall('channel_close', { channelId: 'mode-a' }, agent);
+  assert.equal(registry.closedByAgent('discord', 'mode-a'), 'closed');
+});
+
 test('resolveSendTarget names the channel a send went to and guesses nothing', async () => {
   const { registry, openCalls } = makeRegistry({ delivered: true });
   const added = (id: string, raw: string) => ({

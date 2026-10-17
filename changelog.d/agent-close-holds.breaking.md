@@ -20,10 +20,11 @@
     default. A `send_dm`'s answer never carries it, since the tool sends to a DM, and a
     conversation agent gets none: `channel_open` is refused to it, and its settings end with its
     conversation. In such a channel, the `sleep` tool's default announcement says "I'll still see
-    messages addressed to me, but won't respond until I wake." In connectome-host's `mentions`
-    channel mode, which closes a channel with `channel_close`, the note comes with every reply to
-    a mention there until the resident turns it off; the mode's own tool, not `channel_open`, is
-    the way back to its other mode.
+    messages addressed to me, but won't respond until I wake." A send tool's call into a channel
+    the agent tuned out, which ended the tune-out before, now leaves it in place, and its answer
+    says so: "… stays tuned out: your words there don't end the tune-out, so its traffic still
+    goes to your subconscious until the tune-out ends. tune_out with channelId … and mode "cancel"
+    resumes normal attention there." The same setting turns that line off.
   - **What the invitation says:** the closed-channel invitation's first option now says what
     replying does there. In a channel the agent closed or declined itself, it reads as before:
     "Reply without joining …", with the note that follow-ups that don't address the agent won't
@@ -48,11 +49,20 @@
     `channels/incoming`, such as connectome-host's outage reply, doesn't see them there. Nor does
     a turn with no trigger, such as a heartbeat, come to speak there: where it speaks moves only
     with `channels/incoming` messages.
+- **Hosts with modules that close channels:** a module's `channel_close` through its own tool
+  call (`ctx.callTool`) without a machine source is now recorded with the source `module-tool`,
+  where it was `agent-tool`. Speech leaves such a channel closed, as it does one the agent closed,
+  but gives no note, since the module owns the way back. In connectome-host that's the `mentions`
+  channel mode: a reply to a mention in a channel in that mode stays a reply, and the invitation
+  there offers "Reply without joining". Policy doesn't lift such a close, a machine's close
+  doesn't replace it, and the agent's own close does. A module's close is never refused as a
+  machine's close of an explicit open; only one naming a machine source is.
 - **Direct `ChannelRegistry` consumers:** `openIfClosedForSend()` is removed.
   `resolveSendTarget(channelId, serverId?)` returns the descriptor id of the channel a send went
   to, from a composite or raw id, and opens nothing. `speechOpens(serverId, channelId)` says whether
   the agent's words there open the channel: a closed channel opens unless the agent closed or
-  declined it, it's tuned out, or its server's grant lacks `channels.lifecycle`.
+  declined it, a module closed it, it's tuned out, or its server's grant lacks
+  `channels.lifecycle`.
   `openForSpeech(serverId, channelId, source)` opens it where `speechOpens` says so, as the
   framework's send path and `routeSpeech` do. `closedByAgent(serverId, channelId)` and
   `canOpenChannels(serverId)` are new.
