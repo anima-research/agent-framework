@@ -2465,8 +2465,10 @@ export class ChannelRegistry {
     });
     // A close decided while the open was on its way (the agent's channel_close
     // racing an open a send started) went to the server after it, so the
-    // channel ends closed: the live flag follows the decision.
-    if (this.getDesiredState(entry.serverId, entry.descriptor.id) === 'open') entry.open = true;
+    // channel ends closed: the live flag follows the decision. A tune-out
+    // keeps the transport open, as reconciliation's opens hold it.
+    const now = this.getDesiredState(entry.serverId, entry.descriptor.id);
+    if (now === 'open' || now === 'tuned-out') entry.open = true;
     return result;
   }
 
@@ -2673,11 +2675,6 @@ export class ChannelRegistry {
     return matches.length === 1 ? matches[0]!.descriptor.id : undefined;
   }
 
-  /**
-   * How the agent kept this channel closed itself, if it did: 'closed' for
-   * its channel_close, 'declined' for its channel_decline. Its speech there
-   * leaves such a channel closed (openForSpeech).
-   */
   /** Whether this channel stays closed when the agent's words go there
    *  because the agent or a module decided to keep it closed: the agent's own
    *  close or decline, or a module's close, which speech never opens
@@ -2689,6 +2686,11 @@ export class ChannelRegistry {
     return current?.state === 'closed' && isCloseDecision(current.source);
   }
 
+  /**
+   * How the agent kept this channel closed itself, if it did: 'closed' for
+   * its channel_close, 'declined' for its channel_decline. Its speech there
+   * leaves such a channel closed (openForSpeech).
+   */
   closedByAgent(serverId: string, channelId: string): 'closed' | 'declined' | undefined {
     const current = this.desiredStates.get(this.lifecycleKey(serverId, channelId));
     if (current?.state !== 'closed') return undefined;

@@ -4186,9 +4186,10 @@ export class AgentFramework {
    *  back, and a tuned-out send gets its own line (tunedOutSendNote). Every
    *  other closed channel opens on speech, as it always did (openForSpeech),
    *  so the agent meets the change here, where speaking used to reopen what it
-   *  had closed. The channel is read on the server the words went to. What a closed channel still delivers beyond messages that
-   *  address the agent is the connector's (slack-mcpl delivers ambient
-   *  traffic by its own subscription), so the note promises only those, and
+   *  had closed. The channel is read on the server the words went to. What
+   *  a closed channel still delivers beyond messages that address the agent
+   *  is the connector's (slack-mcpl delivers ambient traffic by its own
+   *  subscription), so the note promises only those, and
    *  what channel_open does where the server's grant lets it open channels
    *  (channels.lifecycle). One connector state the host can't see makes the
    *  second sentence false: a channel muted with discord-mcpl's mute_channel

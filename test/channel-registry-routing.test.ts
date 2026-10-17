@@ -716,9 +716,9 @@ test("the latest deliberate close records itself over any closed record: the ret
     ['invitation-declined', 'invitation-declined', 'module-tool', 'agent-tool']);
 });
 
-test("an open still on its way when the agent closes the channel leaves it closed, whether speech or a reconcile sent it", async () => {
+test("an open still on its way when the agent closes the channel leaves it closed, whether speech or a reconcile sent it; a tune-out decided meanwhile leaves it open", async () => {
   const { registry, holdOpens, autoOpened } = loggedRegistry([]);
-  await registry.handleRegister('discord', { channels: channelsOf('spoken', 'reconciled') } as never);
+  await registry.handleRegister('discord', { channels: channelsOf('spoken', 'reconciled', 'tuned') } as never);
   const agent = { kind: 'agent' as const, agentName: 'sol' };
 
   // Speech opens 'spoken', nobody decided about it; the agent closes it while the open is on its way.
@@ -744,6 +744,17 @@ test("an open still on its way when the agent closes the channel leaves it close
   await reregistering;
   assert.equal(registry.isChannelOpen('reconciled'), false);
   assert.equal(registry.getDesiredState('discord', 'reconciled'), 'closed');
+
+  // A tune-out keeps the transport open, so one decided while speech's open is on its way leaves the channel open.
+  held = holdOpens();
+  const speakingThere = registry.routeSpeech('sol', 'answering', 'tuned');
+  await held.reached;
+  registry.enterTuneOut('discord', 'tuned', { epochId: 'e1', cadenceSeconds: 600, backlogCap: 20, maxWakes: 3, startedAtSequence: 0 }, 'agent-tool');
+  held.release();
+  assert.deepEqual(await speakingThere, { delivered: true, channelId: 'tuned' });
+  assert.equal(registry.getDesiredState('discord', 'tuned'), 'tuned-out');
+  assert.equal(registry.isChannelOpen('tuned'), true, 'the transport the tune-out keeps open');
+  assert.deepEqual(autoOpened, [], 'and no notice says it opened: the agent tuned it out');
 });
 
 test('a channel decided open whose open failed is closed at the transport, so the agent can decline it, and speech then leaves it closed', async () => {
