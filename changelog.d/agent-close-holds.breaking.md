@@ -33,11 +33,16 @@
     forwarding, and closing it turns that off. A reply in a guild channel the agent closed used to
     reopen it, and so turn its reactions on. Now reactions to that reply arrive only where the
     agent opens the channel or turns them on with `set_reaction_visibility`. DMs are unaffected:
-    discord-mcpl requests no DM reaction events.
+    discord-mcpl requests no DM reaction events. On zulip_mcp, an answer's topic comes from the
+    last message delivered as `channels/incoming`, and a closed stream's mentions are pushed
+    instead, so in a stream the agent closed, every answer goes to the topic of the stream's last
+    message from before the close, where a reply used to reopen the stream.
   - **What hosts notice:** on discord-mcpl, a channel the agent closed keeps delivering the
     messages that address the agent as push events, as any closed channel's are, where a reply
     used to reopen it and switch them to `channels/incoming`. Host code that acts on
-    `channels/incoming`, such as connectome-host's outage reply, doesn't see them there.
+    `channels/incoming`, such as connectome-host's outage reply, doesn't see them there. Nor does
+    a turn with no trigger, such as a heartbeat, come to speak there: where it speaks moves only
+    with `channels/incoming` messages.
 - **Direct `ChannelRegistry` consumers:** `openIfClosedForSend()` is removed.
   `resolveSendTarget(channelId, serverId?)` returns the descriptor id of the channel a send went
   to, from a composite or raw id, and opens nothing. `speechOpens(serverId, channelId)` says whether

@@ -10,9 +10,10 @@
 - A send tool's call into a tuned-out channel no longer ends the tune-out. It used to set the
   channel's decision to open, which ended the tune-out epoch, and announced "[channels] Now open".
 - The agent's `channel_close` or `channel_decline` of a channel nobody had decided about, which
-  is closed by default, or of one a machine closed, is now recorded as its decision. Before, the
-  channel kept its default or the machine's source, so subscription policy or a server's
-  `initiallyOpen` could open the first later. A machine close of a channel nobody decided about,
+  is closed by default, or of one a machine closed, is now recorded as its decision, so neither
+  subscription policy, a server's `initiallyOpen` nor the agent's own speech there opens it later.
+  Before, the channel kept its default, which policy and `initiallyOpen` lift, or the machine's
+  source. A machine close of a channel nobody decided about,
   such as connectome-host's `subscription-gc`, still records no decision: the channel keeps its
   default, so policy can still open it. That now holds for a channel with no record at all, one
   registered lazily or on a server whose grant lacks `channels.lifecycle`, where a machine close
