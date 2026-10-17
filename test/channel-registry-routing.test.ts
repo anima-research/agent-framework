@@ -602,7 +602,7 @@ test('resolveSendTarget names the channel a send went to and guesses nothing', a
 });
 
 test("openForSpeech opens a closed channel nobody decided to keep closed, and leaves every other one as it is", async () => {
-  const { registry, openCalls } = makeRegistry({ delivered: true });
+  const { registry, openCalls, traces } = makeRegistry({ delivered: true });
   const ids = ['undecided', 'agent-closed', 'decided-open', 'tuned-out', 'open-now'];
   await registry.handleChanged('discord', {
     added: ids.map((id) => ({ id, type: 'discord', label: `#${id}`, direction: 'bidirectional' })),
@@ -632,6 +632,8 @@ test("openForSpeech opens a closed channel nobody decided to keep closed, and le
   assert.equal(await registry.openForSpeech('discord', 'nowhere', 'opened-by-reply'), 'unknown-channel');
 
   assert.deepEqual(openCalls.slice(opensBefore).map((c) => c.channelId), ['undecided', 'decided-open']);
+  assert.deepEqual(traces.filter((t) => t.type === 'mcpl:channel-opened-by-send').map((t) => t.channelId),
+    ['undecided', 'decided-open'], 'each open by speech is traced');
   assert.equal(registry.getDesiredState('discord', 'undecided'), 'open');
   assert.equal(registry.getDesiredState('discord', 'decided-open'), 'open');
   assert.equal(registry.getDesiredState('discord', 'tuned-out'), 'tuned-out', 'the tune-out stands');
