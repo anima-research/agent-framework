@@ -14,7 +14,7 @@ import { EventEmitter } from 'node:events';
 import { openTransport, type McplTransport, type TransportCloseInfo } from './transport.js';
 import { maskNegotiatedCapabilities } from './capability-mask.js';
 import { CapabilityGrant, expandAdvertisementShorthand } from './capability-grant.js';
-import { CAPABILITY_DISABLED } from './errors.js';
+import { CAPABILITY_DISABLED, McplErrorResponse } from './errors.js';
 import { logDetail, logValue } from './log-value.js';
 
 import type {
@@ -121,6 +121,33 @@ interface RequestOptions {
   timeoutMs?: number;
   /** Surface a late response even when it carries no checkpoint state. */
   surfaceOrphanedResponse?: boolean;
+}
+
+/** Text a server chose, as the agent reads it: past 200 characters (code
+ *  points, so a pair is never split) it's cut, so one server's words can't
+ *  fill what the agent reads. */
+function cutServerText(text: string): string {
+  let count = 0;
+  let end = 0;
+  for (const character of text) {
+    if (count === 200) return `${text.slice(0, end)}…`;
+    end += character.length;
+    count++;
+  }
+  return text;
+}
+
+/** A value a server sent, as JSON, without String(): JSON.stringify can't
+ *  call a server's toString, and one too deep to write is named instead.
+ *  It's cut as the server's own words are. */
+function showServerValue(value: unknown): string {
+  let text: string;
+  try {
+    text = JSON.stringify(value) ?? 'nothing';
+  } catch {
+    return '(a value nested too deeply to show)';
+  }
+  return cutServerText(text);
 }
 
 /**
@@ -1340,8 +1367,37 @@ export class McplServerConnection extends EventEmitter {
     if (pending.timer) clearTimeout(pending.timer);
 
     if (response.error) {
+      // Built without String() or a template's conversion of what the
+      // server sent: an object whose toString and valueOf aren't callable
+      // would throw here, after the entry is gone, and the request would
+      // never settle.
+      // JSON-RPC's error is an object with a code and a message. A server
+      // that sends text there instead has still said why. Anything else it
+      // sends there is shown as it came. A falsy error is read as no error,
+      // as before.
+      const error: unknown = response.error;
+      const isObject = typeof error === 'object' && error !== null && !Array.isArray(error);
+      const { code, message } = isObject ? (error as { code?: unknown; message?: unknown }) : {};
+      const shownCode = typeof code === 'number' ? String(code) : code === undefined ? 'none' : showServerValue(code);
+      // What the agent reads as the server's words: its message, or the error
+      // itself when that's text, cut; or else what came instead. The
+      // operator's message keeps a text message whole, and the code, which
+      // the agent can't act on.
+      const text = isObject
+        ? (typeof message === 'string' && message !== '' ? message : undefined)
+        : (typeof error === 'string' ? error : undefined);
+      const serverMessage = text !== undefined
+        ? cutServerText(text)
+        : !isObject
+          ? `an error that came as ${showServerValue(error)}`
+          : message == null || message === ''
+            ? 'an error with no message'
+            : `an error whose message isn't text: ${showServerValue(message)}`;
       pending.reject(
-        new Error(`MCPL server "${this.id}" returned error for ${pending.method}: [${response.error.code}] ${response.error.message}`),
+        new McplErrorResponse(
+          `MCPL server "${this.id}" returned error for ${pending.method}: [${shownCode}] ${text ?? serverMessage}`,
+          serverMessage,
+        ),
       );
     } else {
       pending.resolve(response.result);

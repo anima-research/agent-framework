@@ -42,6 +42,7 @@ import { isVisiblyEmptyContent } from './visible-content.js';
 import { logDetail, logValue } from './log-value.js';
 import { RefusalLines } from './refusal-lines.js';
 import { CapabilityGrant } from './capability-grant.js';
+import { McplErrorResponse } from './errors.js';
 
 // ============================================================================
 // Typing indicator interval (Discord typing lasts ~10s, so 7s keeps it alive)
@@ -211,6 +212,40 @@ interface ChannelEntry {
   serverId: string;
   descriptor: ChannelDescriptor;
   open: boolean;
+}
+
+/**
+ * A channel its server declared inbound-only (SPEC §14.2 `direction`): its
+ * messages come in, and the host publishes nothing into it. No publish, from
+ * plain speech, `channel_publish` or `publishForAgent`, and no outgoing
+ * stream. Typing and acknowledgements, which carry no content, still go
+ * (SPEC §14.5: "Delivery occurs only via `channels/publish`"). A channel
+ * declared `outbound` or `bidirectional`, or with no direction, isn't one.
+ */
+function isInboundOnly(entry: ChannelEntry): boolean {
+  return entry.descriptor.direction === 'inbound';
+}
+
+/** What a failed request to a server says to the agent: a server's error
+ *  response in its own words, naming the server, and any other failure as its
+ *  message, or as text when it has none. */
+function failureText(err: unknown, serverId: string): string {
+  if (err instanceof McplErrorResponse) return `server "${serverId}" answered with an error: ${err.serverMessage}`;
+  try {
+    const message = (err as { message?: unknown } | null | undefined)?.message;
+    return typeof message === 'string' && message !== '' ? message : String(err);
+  } catch {
+    return 'a failure that could not be printed';
+  }
+}
+
+/** Why the host sends nothing into an inbound-only channel, as the resident
+ *  reads it in a send-failure marker or a tool error. */
+function inboundOnlyReason(entry: ChannelEntry): string {
+  return (
+    `inbound-only: server "${entry.serverId}" declared this channel's direction "inbound", ` +
+    'so the host publishes nothing into it; to speak there, use that server\'s own tools'
+  );
 }
 
 /** Minimal responder interface for sending JSON-RPC results back. */
@@ -489,16 +524,21 @@ interface ChannelRegistryOptions {
   /**
    * Called when a text-only turn's speech could NOT be delivered to its
    * conversational locus — no locus, an unregistered channel, a missing
-   * server, or the server reporting `delivered: false`. The host wires this
-   * to drop a `[discord-send-failed]` marker into chronicle so the failure is
-   * visible to the agent (and operator) rather than silently lost. Must not
-   * itself trigger inference (avoid wake loops).
+   * server, or the server reporting `delivered: false` — or the server
+   * answered its publish with an error, after which whether it was posted is
+   * unknown. The host wires this to drop a `[discord-send-failed]` marker into
+   * chronicle so the failure is visible to the agent (and operator) rather
+   * than silently lost. Must not itself trigger inference (avoid wake loops).
    */
   onRouteFailure?: (info: {
     conversationId: string;
     channelId: string | null;
     reason: string;
     textLen: number;
+    /** `failed`: nothing was posted. `unknown`: the server answered the
+     *  publish with an error, which can follow a partial post, so some or
+     *  all of it may have been. */
+    outcome: 'failed' | 'unknown';
   }) => void;
   /**
    * Called when channels were opened WITHOUT the agent asking (subscription
@@ -581,6 +621,7 @@ export class ChannelRegistry {
     channelId: string | null;
     reason: string;
     textLen: number;
+    outcome: 'failed' | 'unknown';
   }) => void;
   private onChannelAutoOpened?: (info: {
     conversationId?: string;
@@ -1454,8 +1495,9 @@ export class ChannelRegistry {
     const openChannels = this.getOpenChannels();
 
     // Resolve the outbound locus the SAME way routeSpeech does, so the agent is
-    // told the channel its speech will actually land in: a conversation fork's
-    // home channel, else this turn's channel (single trunk agent — item-3
+    // told the channel its speech will actually land in (none, when its server
+    // declared it inbound-only, since speech isn't posted there): a conversation
+    // fork's home channel, else this turn's channel (single trunk agent — item-3
     // redux: its locus, else its triggering channel), else the global default
     // (heartbeats). Without this, a fork
     // was advertised the global locus but published somewhere else; and a trunk
@@ -1481,8 +1523,10 @@ export class ChannelRegistry {
       };
     }
 
-    // Default outgoing: the resolved outbound locus (home channel for forks).
-    if (outgoing) {
+    // Default outgoing: the resolved outbound locus (home channel for forks),
+    // unless its server declared it inbound-only: routeSpeech publishes nothing
+    // there, so it isn't where the agent's speech goes.
+    if (outgoing && !this.inboundOnlyServer(outgoing)) {
       context.defaultOutgoing = {
         channelId: outgoing,
       };
@@ -2085,16 +2129,50 @@ export class ChannelRegistry {
 
   /**
    * Publish into a channel on behalf of a named non-resident agent (the
-   * subconscious's speak_in_channel). Same delivery path as the
-   * channel_publish tool; the agent name rides the speech-routed trace.
+   * subconscious's speak_in_channel). Same delivery path, and the same result,
+   * as the channel_publish tool. Its traces carry the agent's name and follow
+   * the outcome as routeSpeech's do: speech-routed after a publish the server
+   * accepted and didn't report undelivered, and speech-route-failed otherwise.
    */
   async publishForAgent(
     channelId: string,
     text: string,
     agentName: string,
   ): Promise<{ success: boolean; data?: unknown; error?: string; isError?: boolean }> {
-    this.emitTraceFn({ type: 'mcpl:speech-routed', conversationId: agentName, channelId, text });
-    return this.handleToolPublish({ channelId, content: text });
+    // The server the publish goes to, as handleToolPublish finds it before
+    // it awaits: the channel may be removed while the reply is pending.
+    const serverId = this.findChannelEntry(channelId)?.serverId ?? '';
+    const seen: { rejection?: 'error-response' | 'other' } = {};
+    const result = await this.handleToolPublish({ channelId, content: text }, seen);
+    const reply = result.data as { delivered?: boolean; messageId?: string } | undefined;
+    if (result.success && reply?.delivered !== false) {
+      this.emitTraceFn({
+        type: 'mcpl:speech-routed',
+        conversationId: agentName,
+        serverId,
+        channelId,
+        delivered: true,
+        textLen: text.length,
+        text,
+        ...(reply?.messageId !== undefined ? { messageId: reply.messageId } : {}),
+      });
+    } else {
+      // What the host knows of the text, as routeSpeech's trace says it: an
+      // error response may follow a partial post; a refusal before the
+      // publish, or delivered:false, posted nothing; after any other
+      // rejection (a timeout, a lost connection, or a connection already
+      // closed) it can't tell which, and the trace says neither.
+      const outcome = seen.rejection === 'error-response' ? 'unknown' : seen.rejection === undefined ? 'failed' : undefined;
+      this.emitTraceFn({
+        type: 'mcpl:speech-route-failed',
+        conversationId: agentName,
+        channelId,
+        reason: result.success ? 'the server reported delivered:false' : (result.error ?? 'the publish failed'),
+        textLen: text.length,
+        ...(outcome ? { outcome } : {}),
+      });
+    }
+    return result;
   }
 
   /**
@@ -2233,12 +2311,12 @@ export class ChannelRegistry {
       }
 
       try {
-        await server.sendChannelsOpen({
+        const answer = await server.sendChannelsOpen({
           channelId: channel.id,
           type: channel.type,
           address: channel.address,
         });
-        if (entry) entry.open = true;
+        this.applyOpenAnswer(serverId, channel.id, answer);
       } catch (err) {
         if (entry) entry.open = false;
         this.emitTraceFn({
@@ -2303,6 +2381,17 @@ export class ChannelRegistry {
   /** Server id owning a registered channel (by descriptor id), or null. */
   getChannelServerId(channelId: string): string | null {
     return this.findChannelEntry(channelId)?.serverId ?? null;
+  }
+
+  /**
+   * The server that declared this channel inbound-only (isInboundOnly), or
+   * undefined when it isn't one. The notices name that server. A caller that
+   * knows the channel's server passes it; otherwise the channel is found as
+   * routeSpeech finds it.
+   */
+  inboundOnlyServer(channelId: string, serverId?: string): string | undefined {
+    const entry = serverId ? this.channels.get(`${serverId}:${channelId}`) : this.findChannelEntry(channelId);
+    return entry && isInboundOnly(entry) ? entry.serverId : undefined;
   }
 
   /**
@@ -2387,10 +2476,12 @@ export class ChannelRegistry {
 
   /**
    * The single open executor: record durable desired-open intent, tell the
-   * server to subscribe, mark the live entry open. Every path that opens a
-   * channel — the agent's channel_open tool, delivery into a closed locus,
-   * an explicit send into a closed channel — funnels here, so lifecycle
-   * events, desired state, and live state can never diverge by path.
+   * server to subscribe, and hand its answer to applyOpenAnswer, which
+   * records the live entry open unless the host has asked to close it since.
+   * Every open the agent or its speech asks for — the channel_open tool,
+   * delivery into a closed locus, an explicit send into a closed channel —
+   * funnels here; reconcile's reopening sends its own and hands its answer
+   * to applyOpenAnswer too.
    * Desired state is recorded BEFORE the server round-trip: intent sticks
    * even if the subscribe fails, and reconciliation retries later.
    */
@@ -2415,8 +2506,43 @@ export class ChannelRegistry {
       address: entry.descriptor.address,
       ...(history ? { history } : {}),
     });
-    entry.open = true;
+    this.applyOpenAnswer(entry.serverId, entry.descriptor.id, result);
     return result;
+  }
+
+  /**
+   * What a successful `channels/open` tells the host, wherever the host
+   * opens a channel: the channel is open, and the answer carries the
+   * server's descriptor for it (§14.3), the first place a lazily registered
+   * channel's own declaration can arrive. Both go to the channel's current
+   * entry, which a register or `channels/changed` during the open may have
+   * replaced.
+   *
+   * The open is recorded only while the channel's desired state is still
+   * on reconcile's open side, open or tuned-out (a tune-out keeps the
+   * transport open): a close the host asked for while the open was in
+   * flight is the newer decision, and its answer can come first, so an open
+   * answered after it leaves the channel closed. This is the one place an
+   * answered open is recorded, for both ways the host opens. The
+   * declaration is applied either way.
+   *
+   * Only an inbound-only declaration is applied. The answer isn't always the
+   * server's latest word: a `channels/changed` that arrives in the same read
+   * as the answer is handled before the open's caller resumes, so the answer
+   * is applied over it. Applying only a refusal keeps that race fail-closed:
+   * a stale answer can keep a channel refused until the server's next
+   * update, but never lift a newer refusal. A server lifts its declaration
+   * by changing or registering the channel again.
+   */
+  private applyOpenAnswer(serverId: string, channelId: string, answer: unknown): void {
+    const current = this.channels.get(`${serverId}:${channelId}`);
+    if (!current) return;
+    const desired = this.getDesiredState(serverId, channelId);
+    if (desired === 'open' || desired === 'tuned-out') current.open = true;
+    const declared = (answer as { channel?: { id?: unknown; direction?: unknown } } | undefined)?.channel;
+    if (declared?.id === channelId && declared.direction === 'inbound') {
+      current.descriptor = { ...current.descriptor, direction: 'inbound' };
+    }
   }
 
   /**
@@ -2432,8 +2558,27 @@ export class ChannelRegistry {
    *
    * Ambiguity is an error carrying candidates — never a guess: this is the
    * mechanism that makes prose misdelivery structurally impossible.
+   *
+   * `forSpeech` is for a target the agent's speech will be posted to: a
+   * channel its server declared inbound-only (isInboundOnly) then resolves
+   * to an error that says so, since nothing is published there, and that
+   * names the channel as `refusedChannelId`, so a caller can tell a refused
+   * channel from a name that resolved to nothing. Without it, as for reading
+   * a channel's history, any registered channel resolves.
    */
   resolveProseTarget(
+    spec: string,
+    opts?: { forSpeech?: boolean },
+  ): { channelId: string; label?: string } | { error: string; candidates?: string[]; refusedChannelId?: string } {
+    const resolved = this.resolveTargetByName(spec);
+    if (!opts?.forSpeech || 'error' in resolved) return resolved;
+    const entry = this.findChannelEntry(resolved.channelId);
+    return entry && isInboundOnly(entry)
+      ? { error: `${resolved.channelId} is ${inboundOnlyReason(entry)}`, refusedChannelId: resolved.channelId }
+      : resolved;
+  }
+
+  private resolveTargetByName(
     spec: string,
   ): { channelId: string; label?: string } | { error: string; candidates?: string[] } {
     const entries = [...this.channels.values()];
@@ -2593,7 +2738,7 @@ export class ChannelRegistry {
     ];
     for (const c of candidates) {
       if (/\s/.test(c) || c === '#') continue;
-      const r = this.resolveProseTarget(c);
+      const r = this.resolveProseTarget(c, { forSpeech: true });
       if ('channelId' in r && r.channelId === d.id) return c;
     }
     return undefined;
@@ -2711,7 +2856,7 @@ export class ChannelRegistry {
     } catch (err) {
       return {
         success: false,
-        error: `Failed to open channel: ${(err as Error).message}`,
+        error: `Failed to open channel: ${failureText(err, entry.serverId)}`,
         isError: true,
       };
     }
@@ -2825,7 +2970,7 @@ export class ChannelRegistry {
     } catch (err) {
       return {
         success: false,
-        error: `Failed to close channel: ${(err as Error).message}`,
+        error: `Failed to close channel: ${failureText(err, entry.serverId)}`,
         isError: true,
       };
     }
@@ -2878,7 +3023,7 @@ export class ChannelRegistry {
               'The channel integration could not post the acknowledgment.';
           }
         } catch (error) {
-          acknowledgmentError = (error as Error).message;
+          acknowledgmentError = failureText(error, entry.serverId);
         }
       }
     }
@@ -2982,18 +3127,6 @@ export class ChannelRegistry {
   }
 
   /**
-   * Host-owned output routing (see forking-knowledge-miner LOCUS-ROUTING-DESIGN).
-   * Publish the agent's plain-text speech to the current conversational locus
-   * (the most recent incoming channel, tracked cross-surface here in the host).
-   * Called by the framework on a text-only turn — replaces the per-surface
-   * sticky auto-post that used to live in discord-mcpl. Returns null when there
-   * is no locus / the channel or its server can't be resolved (in which case
-   * the speech simply stays in chronicle + module surfaces).
-   */
-  /** Resolve the outbound locus (fork HOME → this-turn's TRIGGERING channel →
-   *  process-global default). Public so a multi-segment caller can snapshot it
-   *  ONCE and pin every segment to it via routeSpeech's `overrideChannelId`. */
-  /**
    * MCPL Spec 14.3 outgoing streaming: forward a moderated text delta to the
    * server owning the channel, AS THE MODEL GENERATES. Emitted only when that
    * server declared `channels.streaming` in its initialize capabilities —
@@ -3041,6 +3174,9 @@ export class ChannelRegistry {
     // never-guess rule that governs delivery.
     const matches = [...this.channels.values()].filter((e) => e.descriptor.id === channelId);
     if (matches.length !== 1) return null;
+    // A stream is a copy of speech the host would publish, and nothing is
+    // published into an inbound-only channel.
+    if (isInboundOnly(matches[0]!)) return null;
     const server = this.serverRegistry.getServer(matches[0]!.serverId);
     // §5.4: the GRANT gates streaming, not the raw advertisement. The old
     // `capabilities?.channels?.streaming` check was doubly wrong: undefined
@@ -3051,11 +3187,30 @@ export class ChannelRegistry {
     return server;
   }
 
+  /** Resolve the outbound locus (fork HOME → this-turn's TRIGGERING channel →
+   *  process-global default). Public so a multi-segment caller can snapshot it
+   *  ONCE and pin every segment to it via routeSpeech's `overrideChannelId`. */
   resolveLocus(conversationId: string): string | null {
     const home = this.homeChannelResolver?.(conversationId);
     return home ?? this.activeChannelResolver?.(conversationId) ?? this.defaultPublishChannel ?? null;
   }
 
+  /**
+   * Host-owned output routing (see forking-knowledge-miner LOCUS-ROUTING-DESIGN).
+   * Publish the agent's plain-text speech to the current conversational locus
+   * (the most recent incoming channel, tracked cross-surface here in the host).
+   * Called by the framework on a text-only turn — replaces the per-surface
+   * sticky auto-post that used to live in discord-mcpl. Returns null when there
+   * is no locus, the channel or its server can't be resolved, its server
+   * declared it inbound-only, the channel was removed while it opened, the
+   * open fails, or the server answers the publish with an error or reports it
+   * undelivered. Each of these goes through fail(): a trace, and the host's
+   * send-failure marker. Any other failed publish rejects to the caller, as
+   * before: one that times out or loses its connection before an answer,
+   * whose outcome is unknown, and one whose connection was already closed,
+   * which sent nothing. Plain speech logs it, and a hybrid `>>>` caller
+   * bounces it. The speech stays in chronicle + module surfaces.
+   */
   async routeSpeech(
     conversationId: string,
     text: string,
@@ -3070,17 +3225,19 @@ export class ChannelRegistry {
   ): Promise<{ delivered: boolean; channelId: string; messageId?: string } | null> {
     // Surface a routing failure: emit a trace AND notify the host (which drops
     // a `[discord-send-failed]` marker into chronicle) so the agent learns her
-    // reply never reached the human, instead of it vanishing silently.
-    const fail = (channelId: string | null, reason: string): null => {
-      console.error(`[routeSpeech] ${conversationId}: ${reason} — speech NOT routed (${text.length} chars stay in chronicle)`);
+    // reply didn't reach the human, or wasn't confirmed to, instead of it
+    // vanishing silently.
+    const fail = (channelId: string | null, reason: string, outcome: 'failed' | 'unknown' = 'failed'): null => {
+      console.error(`[routeSpeech] ${conversationId}: ${reason} — speech ${outcome === 'unknown' ? 'delivery NOT confirmed' : 'NOT routed'} (${text.length} chars stay in chronicle)`);
       this.emitTraceFn({
         type: 'mcpl:speech-route-failed',
         conversationId,
         channelId: channelId ?? '',
         reason,
         textLen: text.length,
+        outcome,
       });
-      this.onRouteFailure?.({ conversationId, channelId, reason, textLen: text.length });
+      this.onRouteFailure?.({ conversationId, channelId, reason, textLen: text.length, outcome });
       return null;
     };
 
@@ -3102,6 +3259,11 @@ export class ChannelRegistry {
     if (!entry) {
       return fail(channelId, `no registered channel for locus "${channelId}"`);
     }
+    // Before the open below: speech that can't be posted here mustn't open
+    // the channel either.
+    if (isInboundOnly(entry)) {
+      return fail(channelId, inboundOnlyReason(entry));
+    }
 
     // INVARIANT: it is not possible to send into a closed channel. Speech
     // routed into a closed-but-registered locus (the canonical case: a DM
@@ -3110,6 +3272,10 @@ export class ChannelRegistry {
     // alive with the reply. If the open fails, the speech does NOT go out:
     // a half-alive delivery is worse than a loud marker.
     if (!entry.open) {
+      // The trace and the notice below report the open, which has happened
+      // whatever the checks after it decide: speech they refuse leaves the
+      // channel open, and the notice is how the agent learns that and how to
+      // close it. The send-failure marker reports the speech.
       try {
         await this.openChannelNow(entry, 'opened-by-delivery');
         console.error(
@@ -3131,8 +3297,18 @@ export class ChannelRegistry {
           console.error('onChannelAutoOpened (delivery) failed:', err);
         }
       } catch (err) {
-        return fail(channelId, `locus channel is closed and open failed: ${(err as Error).message}`);
+        return fail(channelId, `the channel was closed, and opening it failed: ${failureText(err, entry.serverId)}`);
       }
+    }
+    // The open awaited the server, and a channels/changed update or a
+    // re-register may have declared the channel inbound-only meanwhile, or a
+    // removal taken it away: nothing is published to a channel that's gone.
+    const declared = this.channels.get(`${entry.serverId}:${entry.descriptor.id}`);
+    if (!declared) {
+      return fail(channelId, 'the channel was removed while it was opening');
+    }
+    if (isInboundOnly(declared)) {
+      return fail(channelId, inboundOnlyReason(declared));
     }
 
     const server = this.serverRegistry.getServer(entry.serverId);
@@ -3151,7 +3327,22 @@ export class ChannelRegistry {
       channelId,
       content: [{ type: 'text', text }],
     };
-    const result = await server.sendChannelsPublish(publishParams);
+    let result: unknown;
+    try {
+      result = await server.sendChannelsPublish(publishParams);
+    } catch (err) {
+      // An error response is the server's answer, in its own words, that the
+      // publish failed. It may follow a partial post (a multi-part send whose
+      // later part failed), so the marker says delivery wasn't confirmed,
+      // never that nothing was posted. Any other rejection goes to the caller
+      // as before: one after a timeout, or a connection lost before an
+      // answer, and one on a connection already closed, before anything is
+      // sent.
+      if (err instanceof McplErrorResponse) {
+        return fail(channelId, `server "${entry.serverId}" answered the publish with an error: ${err.serverMessage}`, 'unknown');
+      }
+      throw err;
+    }
     const delivered = (result as { delivered?: boolean } | undefined)?.delivered ?? true;
     // Surface the posted message's id (ChannelsPublishResult.messageId) so
     // trace consumers can act on the just-posted message — e.g. a TTS-relay
@@ -3181,7 +3372,12 @@ export class ChannelRegistry {
     return { delivered, channelId, ...(messageId !== undefined ? { messageId } : {}) };
   }
 
-  private async handleToolPublish(input: { channelId?: string; content?: string; text?: string }): Promise<ToolResult> {
+  /** `seen`, when given, says how the publish rejected, if it did: an error
+   *  response, or another rejection. */
+  private async handleToolPublish(
+    input: { channelId?: string; content?: string; text?: string },
+    seen?: { rejection?: 'error-response' | 'other' },
+  ): Promise<ToolResult> {
     // Resolve content: accept both `content` and `text` (backward compat)
     const messageText = input.content ?? input.text;
     if (!messageText) {
@@ -3207,6 +3403,13 @@ export class ChannelRegistry {
       return {
         success: false,
         error: `Channel not found: ${channelId}`,
+        isError: true,
+      };
+    }
+    if (isInboundOnly(entry)) {
+      return {
+        success: false,
+        error: `Channel ${channelId} is ${inboundOnlyReason(entry)}`,
         isError: true,
       };
     }
@@ -3240,9 +3443,15 @@ export class ChannelRegistry {
         data: result ?? { delivered: true },
       };
     } catch (err) {
+      if (seen) seen.rejection = err instanceof McplErrorResponse ? 'error-response' : 'other';
+      // An error response may follow a partial post (a multi-part send whose
+      // later part failed), so it isn't called a failure, as routeSpeech's
+      // marker doesn't call it one.
       return {
         success: false,
-        error: `Failed to publish to channel: ${(err as Error).message}`,
+        error: err instanceof McplErrorResponse
+          ? `Publish to ${channelId} wasn't confirmed: ${failureText(err, entry.serverId)}. It may or may not have been posted, so sending it again could post it twice.`
+          : `Failed to publish to channel: ${failureText(err, entry.serverId)}`,
         isError: true,
       };
     }

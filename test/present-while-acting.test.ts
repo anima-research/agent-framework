@@ -1538,6 +1538,7 @@ describe('present while acting', () => {
       framework.agents = new Map([['assistant', { proseRouting: 'locus' }]]);
       framework.channelRegistry = {
         handleChannelToolCall: () => new Promise((resolve) => { resolveOpen = resolve; }),
+        inboundOnlyServer: () => undefined,
       };
       framework.turnRouting = new Map([['assistant', calling]]);
       framework.openLogical = new Map([['assistant', calling]]);
@@ -1577,6 +1578,7 @@ describe('present while acting', () => {
       framework.agents = new Map([['assistant', { proseRouting: 'locus' }]]);
       framework.channelRegistry = {
         handleChannelToolCall: async () => ({ success: true, data: { channelId: 'discord:guild:observatory' } }),
+        inboundOnlyServer: () => undefined,
       };
       framework.turnRouting = new Map([['assistant', calling]]);
       if (!silent) framework.openLogical = new Map([['assistant', calling]]);
@@ -1791,6 +1793,117 @@ describe('present while acting', () => {
       JSON.stringify(results).includes('plain speech now lands in this channel'),
       'routing note present in the channel_open tool result',
     );
+
+    await framework.stop();
+  });
+
+  // -------------------------------------------------------------------------
+  // A channel its server declared inbound-only takes no plain speech (the
+  // registry refuses it), so every notice that says where plain speech goes
+  // says that instead. pocket-body's live transcript is one: another agent
+  // speaking in the room arrives there addressed.
+  // -------------------------------------------------------------------------
+
+  /** The stub registry answers that body:ears is inbound-only, declared by pocket-body. */
+  function declareEarsInboundOnly(framework: AgentFramework): Record<string, unknown> {
+    const registry = (framework as unknown as { channelRegistry: Record<string, unknown> }).channelRegistry;
+    registry.inboundOnlyServer = (channelId: string) => (channelId === 'body:ears' ? 'pocket-body' : undefined);
+    return registry;
+  }
+
+  function assertSaysRefused(text: string | undefined, what: string): void {
+    assert.ok(text, `${what} was written`);
+    assert.ok(
+      text!.includes(
+        'pocket-body declared this channel inbound-only, so plain speech there is refused and stays in your archive. ' +
+          "To speak there, use pocket-body's own tools.",
+      ),
+      `${what} says plain speech there is refused, where it stays, and what to use instead: ${text}`,
+    );
+    assert.ok(!text!.includes('lands'), `${what} doesn't say the speech lands there: ${text}`);
+  }
+
+  it('the routing notice for a locus its server declared inbound-only says plain speech there is refused', async () => {
+    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'one' }] as ContentBlock[]));
+
+    const framework = await createFramework();
+    stubChannelRegistry(framework);
+    declareEarsInboundOnly(framework);
+
+    trigger(framework);
+    await framework.runUntilIdle();
+
+    (framework as unknown as { announceLocusIfChanged(agentName: string, locus: string | null): void })
+      .announceLocusIfChanged('assistant', 'body:ears');
+
+    const cm = (framework as unknown as {
+      agents: Map<string, { getContextManager(): { getAllMessages(): Array<{ content: Array<{ type: string; text?: string }> }> } }>;
+    }).agents.get('assistant')!.getContextManager();
+    const notices = cm.getAllMessages()
+      .flatMap((m) => m.content)
+      .map((b) => b.text ?? '')
+      .filter((t) => t.startsWith('[routing]'));
+    const notice = notices.at(-1);
+    assert.ok(notice?.startsWith('[routing] The conversation is now in body:ears.'), String(notice));
+    assertSaysRefused(notice, 'the routing notice');
+
+    await framework.stop();
+  });
+
+  it('an addressed arrival on an inbound-only channel re-pins there, and its notice says plain speech there is refused', async () => {
+    membrane.pushResponse(createMockResponse([
+      { type: 'text', text: 'Station four, proceeding.' },
+      { type: 'tool_use', id: 'c1', name: 'robot--move', input: { dir: 'north' } },
+    ] as ContentBlock[], 'tool_use'));
+    membrane.pushResponse(createMockResponse([
+      { type: 'text', text: 'Answering the room.' },
+    ] as ContentBlock[]));
+
+    const framework = await createFramework();
+    const routed = stubChannelRegistry(framework);
+    declareEarsInboundOnly(framework);
+    module.toolDelayMs = 25;
+    module.interjection = 'Linn, can you hear me?';
+    module.interjectionMetadata = { channelId: 'body:ears', tags: ['chat:addressed'] };
+
+    trigger(framework);
+    await framework.runUntilIdle();
+
+    // The locus follows the conversation as before; the registry, not the
+    // pin, is what keeps the speech out of the channel.
+    assert.deepEqual(routed, [
+      { text: 'Station four, proceeding.', locus: 'chan-live-1' },
+      { text: 'Answering the room.', locus: 'body:ears' },
+    ]);
+    const wired = membrane.lastStream!.receivedToolResultOptions
+      .flatMap((o) => o?.injectedMessages ?? [])
+      .flatMap((m) => m.content as Array<{ type: string; text?: string }>)
+      .map((b) => b.text ?? '');
+    const notice = wired.find((t) => t.startsWith('[routing]'));
+    assert.ok(notice?.startsWith('[routing] The conversation moved to body:ears.'), String(notice));
+    assertSaysRefused(notice, 'the re-pin notice');
+
+    await framework.stop();
+  });
+
+  it('channel_open of an inbound-only channel says in its result that plain speech there is refused', async () => {
+    membrane.pushResponse(createMockResponse([
+      { type: 'tool_use', id: 'c1', name: 'channel_open', input: { channelId: 'body:ears' } },
+    ] as ContentBlock[], 'tool_use'));
+    membrane.pushResponse(createMockResponse([
+      { type: 'text', text: 'Listening.' },
+    ] as ContentBlock[]));
+
+    const framework = await createFramework();
+    stubChannelRegistry(framework);
+    const registry = declareEarsInboundOnly(framework);
+    registry.handleChannelToolCall = async () => ({ success: true, data: { channelId: 'body:ears', opened: true } });
+
+    trigger(framework);
+    await framework.runUntilIdle();
+
+    const results = JSON.stringify(membrane.lastStream!.receivedToolResults.flat());
+    assertSaysRefused(results, 'the channel_open result');
 
     await framework.stop();
   });

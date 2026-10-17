@@ -36,6 +36,27 @@ export const UNKNOWN_CHANNEL = -32023;
 /** Server could not open/connect the requested channel. */
 export const CHANNEL_OPEN_FAILED = -32024;
 
+/**
+ * A server's JSON-RPC error response to a request the host sent once
+ * connected: the server answered with an error rather than a result.
+ * `serverMessage` is what the agent reads: the server's own words (its
+ * error's message, or the error itself when it sent text there), cut at 200
+ * characters, or else a sentence saying what came instead. `message` adds
+ * which server answered which request, and the code, with a text message
+ * whole. A request that times out, whose connection closes before an
+ * answer, or that finds its connection already closed, rejects with a plain
+ * Error instead, as does a failed handshake.
+ */
+export class McplErrorResponse extends Error {
+  readonly serverMessage: string;
+
+  constructor(message: string, serverMessage: string) {
+    super(message);
+    this.name = 'McplErrorResponse';
+    this.serverMessage = serverMessage;
+  }
+}
+
 // ============================================================================
 // Error Factories
 // ============================================================================

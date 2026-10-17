@@ -9,6 +9,7 @@ import { test, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
 
 import { McplServerConnection } from '../src/mcpl/server-connection.js';
+import { McplErrorResponse } from '../src/mcpl/errors.js';
 import type { McplHostCapabilities, McplServerConfig } from '../src/mcpl/types.js';
 
 // Stdio server: answers initialize and tools/list, but swallows tools/call —
@@ -64,6 +65,9 @@ test('tools/call against a hung server rejects within the configured timeout', a
       assert.match(err.message, /did not respond to tools\/call/);
       assert.match(err.message, /250ms/);
       assert.match(err.message, /hung/);
+      // Not a server's answer: a caller that marks McplErrorResponse as
+      // undelivered (routeSpeech) mustn't mark a request whose outcome is unknown.
+      assert.equal(err instanceof McplErrorResponse, false);
       return true;
     },
   );
