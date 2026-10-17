@@ -628,20 +628,6 @@ export class Agent {
     }
   }
 
-  /**
-   * The check resetRuntimeSettings makes before it changes anything, run
-   * alone: returning to a configured budget below the live one needs a
-   * strategy that can lower the budget gradually.
-   */
-  checkRuntimeSettingsReset(keys?: Array<keyof AgentRuntimeSettingsPatch>): void {
-    if (keys !== undefined && !keys.includes('contextBudgetTokens')) return;
-    const configured = this.configuredContextBudgetTokens ?? DEFAULT_CONTEXT_BUDGET_TOKENS;
-    const live = this.contextBudgetTokens ?? DEFAULT_CONTEXT_BUDGET_TOKENS;
-    if (configured < live && !this.getHotContextSettings()) {
-      throw new Error('The active context strategy cannot prepare a smaller window live');
-    }
-  }
-
   updateRuntimeSettings(patch: AgentRuntimeSettingsPatch): AgentRuntimeSettingsSnapshot {
     this.checkRuntimeSettingsPatch(patch);
     let nextContextBudget = this.contextBudgetTokens;
@@ -704,7 +690,6 @@ export class Agent {
   }
 
   resetRuntimeSettings(keys?: Array<keyof AgentRuntimeSettingsPatch>): AgentRuntimeSettingsSnapshot {
-    this.checkRuntimeSettingsReset(keys);
     const reset = new Set(keys ?? ['contextBudgetTokens', 'tailTokens', 'transitionPaceTokens', 'sameRoundThinkTextPolicy']);
     let nextContextBudget = this.contextBudgetTokens;
     let nextContextTarget = this.contextBudgetTargetTokens;
@@ -720,8 +705,8 @@ export class Agent {
       const configured = this.configuredContextBudgetTokens ?? DEFAULT_CONTEXT_BUDGET_TOKENS;
       const live = this.contextBudgetTokens ?? DEFAULT_CONTEXT_BUDGET_TOKENS;
       if (configured < live) {
-        // checkRuntimeSettingsReset refused this without one.
-        const hot = this.getHotContextSettings()!;
+        const hot = this.getHotContextSettings();
+        if (!hot) throw new Error('The active context strategy cannot prepare a smaller window live');
         hotPatch.preparedWindowTokens = configured - this.maxTokens;
         if (hot.transitionPaceTokens === undefined) {
           hotPatch.transitionPaceTokens = DEFAULT_TRANSITION_PACE_TOKENS;
