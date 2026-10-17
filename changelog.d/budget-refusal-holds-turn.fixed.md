@@ -16,12 +16,12 @@
     gets the dry compile. The hierarchical strategy's preview reports a
     context that doesn't fit, and for one that does, the dry compile decides.
     The hold looks after every maintenance pass, every drain kick it starts,
-    and every surgery, undo and redo. It looks again only once something that
-    could make the context fit has changed: compression's progress or whether
-    it still has compression pending, a message added, edited or removed, the
-    agent's runtime settings, or a surgery on the store. A turn released and
-    refused again is held again with its first deadline, and isn't released
-    again until one of those changes.
+    and every surgery, undo and redo. It takes a fresh verdict only once
+    something that could make the context fit has changed: compression's
+    progress or whether it still has compression pending, a message added,
+    edited or removed, the agent's runtime settings, or a surgery on the
+    store. A turn released and refused again is held again with its first
+    deadline, and isn't released again until one of those changes.
   - **When it ends without a fit:** 30 minutes after the refusal that
     started it, or at once when compression has nothing pending. The turn
     then runs if its context fits by then, and otherwise fails as a refused
@@ -32,11 +32,12 @@
     why it waited, for that compile alone: "[budget-hold] Your context didn't
     fit its budget (100,201 tokens against 48,568), so this turn waited
     7 min. It fits now." It's never stored. One held turn is one undo step,
-    which keeps the messages that arrived while it waited, and the refused
-    start leaves undo and redo as they were, the oldest checkpoint at the
-    limit of 20 included. An undo while a turn is held rewinds past that
-    turn's messages, and the held turn then runs on what the undo left (#381
-    is that for every pending wake).
+    which keeps the messages that arrived while it waited. The refused start
+    gives back the checkpoint it recorded, with the oldest one it evicted at
+    the limit of 20, and the redo its new work invalidated stays invalidated,
+    as at any turn's first start. An undo while a turn is held rewinds past
+    that turn's messages, and the held turn then runs on what the undo left
+    (#381 is that for every pending wake).
   - **What hosts see:** the refused attempt emits `inference:failed`, and the
     turn's next start emits `inference:started` again. The turn's terminal
     event comes when the held turn ends, after a hold of up to 30 minutes,
@@ -50,7 +51,9 @@
     a continuation included, whether it's still queued or already waiting
     on provider admission, so no such turn starts while the host is
     quiesced. `getHostModeStatus()` counts it among `gatedRequests`, and its
-    new `heldTurns` counts the turns still held.
+    new `heldTurns` counts the turns still held, as quiesce's log line does.
+    A budget restart a hold releases waits, as a wake does, for a turn token
+    another holds, such as a puppeted tool call's.
 - A deferred batch's wake that waited behind a turn which then restarted for
   its context budget was consumed by the restarted turn, which continues the
   same logical turn and skips batch assembly, so the batch never rendered
@@ -58,5 +61,5 @@
   declined the restart. It now stays queued, with its own policy decision,
   and wakes a fresh turn of its own once the restarted turn ends. A wake
   that joins a held continuation (above) is kept out of it the same way,
-  and a continuation a hold releases is its turn's trigger wherever it was
-  queued.
+  and a guard retry a hold releases is its turn's trigger wherever it was
+  queued, as a budget restart already was.
