@@ -45,6 +45,8 @@ async function harness() {
   let sentTo = '444555';
   // While set, the server refuses the send, as discord-mcpl does without Send Messages.
   let refuseSends = false;
+  // While set, the server refuses channels/close.
+  let refuseCloses = false;
   const published: Array<{ channelId: string; text: string }> = [];
   const server = {
     id: 'discord',
@@ -63,6 +65,7 @@ async function harness() {
       return {};
     },
     async sendChannelsClose() {
+      if (refuseCloses) throw new Error('close refused by server');
       return {};
     },
     // What routed speech, such as a sleep announcement, posts.
@@ -139,6 +142,7 @@ async function harness() {
     setHold: (p: Promise<void> | null) => { hold = p; },
     setSentTo: (raw: string) => { sentTo = raw; },
     setRefuseSends: (v: boolean) => { refuseSends = v; },
+    setRefuseCloses: (v: boolean) => { refuseCloses = v; },
     setGrant: (grant: CapabilityGrant) => { server.grant = grant; },
     state: () => frameworkState as { closedChannelNotes?: Record<string, boolean> } | null,
   };
@@ -232,6 +236,23 @@ test("on a server whose grant lacks channels.lifecycle, the note doesn't offer c
   assert.ok(data.endsWith(`\n[closed channel] #upkeep (${channelId}) stays closed: you closed it, and your words there don't open it. ` +
     'Messages there that address you, such as an @-mention, still reach you. ' +
     'To stop this note, set closed_channel_note to false with agent_settings.'), data);
+});
+
+test("a channel the agent closed whose server refused the close is still open, so a send there carries no note", async () => {
+  const { registry, opens, reply, setRefuseCloses } = await harness();
+  assert.equal((await registry.handleChannelToolCall('channel_open', { channelId }, origin)).success, true);
+  setRefuseCloses(true);
+  const closed = await registry.handleChannelToolCall('channel_close', { channelId }, origin);
+  assert.equal(closed.success, false);
+  // The record says the agent closed it; its traffic still flows.
+  assert.equal(registry.closedByAgent('discord', channelId), 'closed');
+  assert.equal(registry.isChannelOpen(channelId), true);
+  const opensBefore = opens.length;
+
+  const { success, data } = await reply();
+  assert.equal(success, true);
+  assert.ok(!data.includes('[closed channel]'), data);
+  assert.equal(opens.length, opensBefore, 'an open channel is opened by nothing');
 });
 
 test('a send the server refuses carries no closed-channel note', async () => {

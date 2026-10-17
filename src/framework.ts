@@ -18854,10 +18854,9 @@ export class AgentFramework {
     // fire-and-forget. Those words are true in an open channel too, so
     // they're the ones used when the channel's state can't be read.
     let staysClosed = false;
-    if (destination && this.channelRegistry?.getDescriptor(destination)) {
+    if (destination && this.channelRegistry) {
       try {
-        staysClosed =
-          this.closedChannelNoteFor(destination, this.channelRegistry.getChannelServerId(destination) ?? null) !== undefined;
+        staysClosed = this.closedChannelNoteFor(destination, this.channelRegistry.getChannelServerId(destination)) !== undefined;
       } catch (err) {
         staysClosed = true;
         console.error(`[sleep] ${agentName}: whether ${destination} stays closed couldn't be read: ${err instanceof Error ? err.message : String(err)}`);
