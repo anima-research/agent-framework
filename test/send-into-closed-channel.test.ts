@@ -9,7 +9,9 @@
  * re-pin. Where the words land in a channel the agent closed or declined
  * itself, the send's answer, or the turn's delivery line for routed speech,
  * says the channel stays closed, what still reaches the agent from it, and
- * how to open it, until the agent turns that note off with agent_settings.
+ * how to open it, until the agent turns that note off with agent_settings. A
+ * code_execution script's send keeps the server's receipt, which the script
+ * parses, and the agent is told by a notice in its window instead.
  */
 
 import { test } from 'node:test';
@@ -121,19 +123,23 @@ async function harness(opts: { sharedIdFirst?: boolean } = {}) {
   // Conversation agents by their home channel; sol isn't one.
   framework.conversationAgentHomes = new Map();
   const windowMessages: string[] = [];
-  framework.addMessage = (_role: string, content: Array<{ text?: string }>) => {
+  /** Whose window each of those was addressed to: addMessage's forAgent, or
+   *  undefined for the primary agent's. */
+  const windowFor: Array<string | undefined> = [];
+  framework.addMessage = (_role: string, content: Array<{ text?: string }>, _metadata?: unknown, opts?: { forAgent?: string }) => {
     windowMessages.push(content.map((b) => b.text ?? '').join(''));
+    windowFor.push(opts?.forAgent);
     return 'msg';
   };
 
   /** Dispatch reply_message by the raw id; resolve with its result and the
    *  turn's engaged channels as they stood when the result was queued (the
    *  mid-turn re-pin reads them when that event is processed). */
-  async function reply(tool = 'reply_message'): Promise<{ success: boolean; engagedAtResult: string[]; data: string; error: string }> {
+  async function reply(tool = 'reply_message', callId = 'call-reply'): Promise<{ success: boolean; engagedAtResult: string[]; data: string; error: string }> {
     const out = await new Promise<{ success: boolean; engagedAtResult: string[]; data: string; error: string }>((resolve, reject) => {
       const timeout = setTimeout(() => reject(new Error('timed out waiting for the tool result')), 1000);
       framework.pushEvent = (event: { type: string; callId?: string; result: { success: boolean; data?: unknown; error?: string } }) => {
-        if (event.type === 'tool-result' && event.callId === 'call-reply') {
+        if (event.type === 'tool-result' && event.callId === callId) {
           clearTimeout(timeout);
           resolve({
             success: event.result.success,
@@ -145,7 +151,7 @@ async function harness(opts: { sharedIdFirst?: boolean } = {}) {
       };
       framework.dispatchMcplToolCall(
         'sol',
-        { id: 'call-reply', name: `discord--${tool}`, input: { channelId: sentTo, messageId: 'm1', content: 'answering, without moving in' } },
+        { id: callId, name: `discord--${tool}`, input: { channelId: sentTo, messageId: 'm1', content: 'answering, without moving in' } },
         'discord',
         'discord',
       );
@@ -157,7 +163,7 @@ async function harness(opts: { sharedIdFirst?: boolean } = {}) {
   }
 
   return {
-    registry, framework, opens, windowMessages, reply, published,
+    registry, framework, opens, windowMessages, windowFor, reply, published,
     setRefuseOpens: (v: boolean) => { refuseOpens = v; },
     setHold: (p: Promise<void> | null) => {
       hold = p;
@@ -492,6 +498,62 @@ test('a send into a tuned-out channel leaves the tune-out in place, and its answ
   // A conversation agent gets none.
   framework.conversationAgentHomes.set('sol', channelId);
   assert.ok(!(await reply()).data.includes('[tuned out]'));
+});
+
+test("a code_execution script's send into a channel the agent closed or tuned out keeps the server's receipt, and the agent is told in its window", async () => {
+  const { registry, framework, windowMessages, windowFor, reply } = await harness();
+  assert.equal((await registry.handleChannelToolCall('channel_open', { channelId }, origin)).success, true);
+  assert.equal((await registry.handleChannelToolCall('channel_close', { channelId }, origin)).success, true);
+  const receipt = { messageId: 'm9', channelId: '444555' };
+
+  // A script parses the receipt, so it's the server's own, as before.
+  const scripted = await reply('reply_message', 'pytc-1');
+  assert.equal(scripted.success, true);
+  assert.deepEqual(JSON.parse(scripted.data), receipt);
+  const closedBody = UPKEEP_NOTE.slice('[closed channel] '.length);
+  assert.deepEqual(windowMessages, [`[closed channel] Your script's reply_message: ${closedBody}`]);
+  assert.deepEqual(windowFor, ['sol'], "it's addressed to the agent whose script sent, not to the primary's window by default");
+  // The model's own send keeps the note in its answer, and adds nothing to the window.
+  assert.ok((await reply()).data.endsWith(`\n${UPKEEP_NOTE}`));
+  assert.equal(windowMessages.length, 1);
+
+  // A tune-out's line goes the same way.
+  assert.equal((await registry.handleChannelToolCall('channel_open', { channelId }, origin)).success, true);
+  registry.enterTuneOut('discord', channelId, {
+    epochId: 'e1', cadenceSeconds: 600, backlogCap: 50, maxWakes: 3, startedAtSequence: 0,
+  }, 'agent-tool');
+  windowMessages.length = 0;
+  windowFor.length = 0;
+  assert.deepEqual(JSON.parse((await reply('send_dm', 'pytc-2')).data), receipt);
+  assert.equal(windowMessages.length, 1);
+  assert.deepEqual(windowFor, ['sol']);
+  assert.ok(windowMessages[0]!.startsWith(`[tuned out] Your script's send_dm: #upkeep (${channelId}) stays tuned out: `), windowMessages[0]);
+  assert.ok(windowMessages[0]!.endsWith('To stop this note, set closed_channel_note to false with agent_settings.'));
+
+  // A window that can't take the notice leaves the receipt as it was, and the operator's log says why.
+  const addMessage = framework.addMessage;
+  framework.addMessage = () => { throw new Error('window unavailable'); };
+  const logged: string[] = [];
+  const consoleError = console.error;
+  console.error = (...args: unknown[]) => {
+    const line = args.map(String).join(' ');
+    if (line.startsWith('[closed-channel-note]')) logged.push(line);
+  };
+  try {
+    const sent = await reply('send_dm', 'pytc-3');
+    assert.equal(sent.success, true);
+    assert.deepEqual(JSON.parse(sent.data), receipt);
+    assert.deepEqual(logged, ["[closed-channel-note] for sol's script failed: window unavailable"]);
+  } finally {
+    console.error = consoleError;
+    framework.addMessage = addMessage;
+  }
+
+  // The setting turns the notice off too.
+  framework.closedChannelNoteSettingsExtension().update('sol', { closed_channel_note: false });
+  windowMessages.length = 0;
+  assert.deepEqual(JSON.parse((await reply('reply_message', 'pytc-4')).data), receipt);
+  assert.deepEqual(windowMessages, []);
 });
 
 test('a reply_message still in flight when the agent closes its channel leaves it closed', async () => {

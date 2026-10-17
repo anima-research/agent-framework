@@ -24,7 +24,10 @@
     channel the agent tuned out, which ended the tune-out before, now leaves it in place, and its
     answer says so: "… stays tuned out: your words there don't end the tune-out, so its traffic
     still goes to your subconscious until the tune-out ends. tune_out with channelId … and mode
-    "cancel" resumes normal attention there." The same setting turns that line off.
+    "cancel" resumes normal attention there." The same setting turns that line off. A send a
+    `code_execution` script makes keeps the server's receipt alone, as before, since the script
+    parses it, and the agent gets the note or the tune-out line in its window instead, as a notice
+    the way "[channels] Now open" comes.
   - **What the invitation says:** the closed-channel invitation's first option now says what
     replying does there. In a channel the agent closed or declined itself, or a module closed, it
     reads as before: "Reply without joining …", with the note that follow-ups that don't address

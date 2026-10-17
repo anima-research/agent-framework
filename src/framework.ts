@@ -4221,7 +4221,8 @@ export class AgentFramework {
    *  tune-out; now it stands, so the agent that sent there expecting answers
    *  learns they still go to its subconscious. Only the send tools ended a
    *  tune-out (routed speech never did while the transport was open), so only
-   *  their answers carry this, send_dm's included: a tune-out diverts a DM
+   *  their answers carry this, send_dm's included, or for a code_execution
+   *  script's send a notice in the agent's window: a tune-out diverts a DM
    *  too. The same setting turns it off, a conversation agent gets none, and
    *  a failure while working it out is logged and adds nothing, as for the
    *  closed-channel note. */
@@ -18437,15 +18438,31 @@ export class AgentFramework {
           if (engagedChannel) {
             sendingTurn?.engaged.add(engagedChannel);
             // Where the agent's words stayed in a channel it closed or
-            // declined itself, or tuned out, the send's answer says so.
+            // declined itself, or tuned out, the send's answer says so. A
+            // code_execution script's send (`pytc-…`) keeps the server's
+            // receipt alone, as before, since the script parses it, and the
+            // agent whose script sent is told in its own window instead, by
+            // the path "Now open" takes.
             const [closedNote] = this.closedChannelNotes(agentName, [engagedChannel], serverId);
             const tunedOutNote = this.tunedOutSendNote(agentName, engagedChannel, serverId);
-            const note = closedNote ? `[closed channel] ${closedNote}` : tunedOutNote ? `[tuned out] ${tunedOutNote}` : undefined;
-            if (note) {
-              result.content = [
-                ...(result.content ?? []),
-                { type: 'text', text: `${note} ${AgentFramework.CLOSED_CHANNEL_NOTE_OFF}` },
-              ];
+            const tag = closedNote ? '[closed channel]' : tunedOutNote ? '[tuned out]' : undefined;
+            const body = closedNote ?? tunedOutNote;
+            if (tag && body) {
+              if (call.id.startsWith('pytc-')) {
+                try {
+                  this.addMessage('user', [{
+                    type: 'text',
+                    text: `${tag} Your script's ${toolName}: ${body} ${AgentFramework.CLOSED_CHANNEL_NOTE_OFF}`,
+                  }], { system: true, kind: 'channel-notice' }, { forAgent: agentName });
+                } catch (err) {
+                  console.error(`[closed-channel-note] for ${agentName}'s script failed: ${err instanceof Error ? err.message : String(err)}`);
+                }
+              } else {
+                result.content = [
+                  ...(result.content ?? []),
+                  { type: 'text', text: `${tag} ${body} ${AgentFramework.CLOSED_CHANNEL_NOTE_OFF}` },
+                ];
+              }
             }
             // Fire-and-forget: the send already succeeded; the open must not
             // delay or fail the tool result.
