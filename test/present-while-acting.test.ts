@@ -1011,7 +1011,7 @@ describe('present while acting', () => {
       // fallback's re-inference. Messages arrive before that starts.
       const open: Routing = {
         locus: 'chan-turn', triggerChannel: 'chan-turn', engaged: new Set(['discord:guild:portables']),
-        destination: null, hybridHold: false, continuation: false, deliveries: [], suppressed: 0, arrivals: [],
+        destination: null, continuation: false, deliveries: [], suppressed: 0, drafts: [], keptPrivate: 0, arrivals: [],
       };
       internals.turnRouting.set('assistant', open);
       internals.openLogical.set('assistant', open);
@@ -1040,7 +1040,7 @@ describe('present while acting', () => {
     };
     const open: Routing = {
       locus: 'chan-turn', triggerChannel: 'chan-turn', engaged: new Set(),
-      destination: null, hybridHold: false, continuation: false, deliveries: [], suppressed: 0, arrivals: [],
+      destination: null, continuation: false, deliveries: [], suppressed: 0, drafts: [], keptPrivate: 0, arrivals: [],
     };
     internals.turnRouting.set('assistant', open);
     internals.openLogical.set('assistant', open);
@@ -1191,8 +1191,8 @@ describe('present while acting', () => {
       recordTurnCheckpoint(agentName: string): void;
     };
     const open: Routing = {
-      locus: 'chan-turn', engaged: new Set(), destination: null, hybridHold: false,
-      continuation: false, deliveries: [], suppressed: 0, arrivals: [],
+      locus: 'chan-turn', engaged: new Set(), destination: null,
+      continuation: false, deliveries: [], suppressed: 0, drafts: [], keptPrivate: 0, arrivals: [],
     };
     internals.openLogical.set('assistant', open);
     internals.recordTurnCheckpoint = () => { throw new Error('checkpoint failed'); };
@@ -1220,8 +1220,8 @@ describe('present while acting', () => {
     // live, and stop() ended every open turn. Its budget restart now runs,
     // and its stream fails and is retried.
     const turn: Routing = {
-      locus: 'chan-turn', triggerChannel: 'chan-turn', engaged: new Set(), destination: null, hybridHold: false,
-      continuation: false, deliveries: [], suppressed: 0, arrivals: [],
+      locus: 'chan-turn', triggerChannel: 'chan-turn', engaged: new Set(), destination: null,
+      continuation: false, deliveries: [], suppressed: 0, drafts: [], keptPrivate: 0, arrivals: [],
     };
     internals.turnRouting.set('assistant', turn);
     internals.pendingRequests.push({
@@ -1267,8 +1267,8 @@ describe('present while acting', () => {
     // Built by hand, as #312's silent-start test does: production runs no
     // silent turn while a prose turn is open.
     const open: Routing = {
-      locus: 'chan-turn', engaged: new Set(), destination: null, hybridHold: false,
-      continuation: false, deliveries: [], suppressed: 0, arrivals: [],
+      locus: 'chan-turn', engaged: new Set(), destination: null,
+      continuation: false, deliveries: [], suppressed: 0, drafts: [], keptPrivate: 0, arrivals: [],
     };
     internals.openLogical.set('assistant', open);
     internals.pendingRequests.push({
@@ -1688,8 +1688,13 @@ describe('present while acting', () => {
       .filter((b) => b.type === 'text')
       .map((b) => b.text ?? '')
       .filter((t) => t.startsWith('[delivered]'));
+    // The suppressed words are held as drafts, named in the receipt.
+    const drafts = (framework as unknown as { proseDrafts: { open(a: string): Array<{ id: string; text: string }> } })
+      .proseDrafts.open('assistant').reverse();
+    assert.deepEqual(drafts.map((d) => d.text), ['the reply that silencing will eat', 'trailing prose, also suppressed (sticky)']);
     assert.deepEqual(receipts, [
-      '[delivered] nothing — 2 plain-speech segment(s) suppressed (explicit send in the same round — resend with a send tool if it was meant to be heard)',
+      `[delivered] nothing — 2 plain-speech segment(s) held as drafts ${drafts.map((d) => d.id).join(', ')} ` +
+        '(not sent — drafts can resend them unchanged, or dismiss them)',
     ]);
 
     await framework.stop();
@@ -1729,8 +1734,12 @@ describe('present while acting', () => {
         .filter((b) => b.type === 'text')
         .map((b) => b.text ?? '')
         .filter((t) => t.startsWith('[delivered]'));
+      const drafts = (framework as unknown as { proseDrafts: { open(a: string): Array<{ id: string; text: string }> } })
+        .proseDrafts.open('assistant').reverse();
+      assert.deepEqual(drafts.map((d) => d.text), ['adjacent prose that must NOT auto-publish', 'trailing prose, also suppressed (sticky)']);
       assert.deepEqual(receipts, [
-        '[delivered] nothing — 2 plain-speech segment(s) suppressed (explicit send in the same round — resend with a send tool if it was meant to be heard)',
+        `[delivered] nothing — 2 plain-speech segment(s) held as drafts ${drafts.map((d) => d.id).join(', ')} ` +
+          '(not sent — drafts can resend them unchanged, or dismiss them)',
       ], `${verb}: suppression is visible in the receipt`);
 
       await framework.stop();

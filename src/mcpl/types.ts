@@ -378,7 +378,10 @@ export interface McplServerConfig {
    * stops reading its stdin without closing it: the host's writes are
    * buffered, no error is raised, and the connection stays up. This is the
    * timeout of every request that names none; the handshake's initialize has
-   * its own. Set 0 to disable. Default: 60000 (60 seconds).
+   * its own. Set 0 to disable, except for channels/publish and the
+   * channels/open a delivery may send first, which keep the 60 s default: a
+   * publish's outcome is reported to the resident and recorded for its
+   * draft, so it must end. Default: 60000 (60 seconds).
    */
   requestTimeoutMs?: number;
 

@@ -34,15 +34,42 @@ A prose segment's FIRST line may carry a routing prefix:
   "keep going" ability tool turns have — wanted for robotics-like loops where
   an end-of-turn pause is undesirable.
 - `{{unsent}}` anywhere in the body is replaced at delivery with the
-  retained undelivered text (see below), enabling verbatim resend without retyping.
+  latest bounced text, held as a draft (see below), enabling verbatim resend
+  without retyping.
 
 ## The bounce (unprefixed prose)
 
-Unprefixed prose with no sticky target is **never delivered**. It is retained
-per-agent (latest-wins) and a system notice is appended telling the
-agent how to resend: `>>#channel {{unsent}}`. The notice requests inference so
-the resend can happen immediately — capped at 2 consecutive bounce-wakes per
-agent (then notices append without waking, breaking any loop).
+Unprefixed prose with no sticky target is **never delivered**. It is held as a
+draft (src/prose-drafts.ts) — never published except by the agent's own
+resend — and a system notice naming the draft tells
+the agent how to resend: `>>#channel {{unsent}}`, or the `drafts` tool by id.
+The notice requests inference so the resend can happen immediately — capped at
+2 consecutive bounce-wakes per agent (then notices append without waking,
+breaking any loop).
+
+`{{unsent}}` means the latest bounce while that draft is open (latest-wins, as
+the clipboard it replaced was), and `>>skip_reply {{unsent}}` dismisses it.
+Earlier bounces stay in the agent's drafts, by id, until resent, dismissed or
+let go (an agent's 100 newest drafts are always kept, and an older one for 7
+days after anything last happened to it); drafts survive restarts and branch
+moves, and a delivery through `{{unsent}}` is recorded on the draft like any
+resend.
+
+When the latest bounce may already have been posted (an attempt's outcome is
+unknown), or is being sent or queued in a resend right now, what happens
+depends on the route:
+- **Delivery** (`>>#channel … {{unsent}} …`): nothing is sent. The agent is
+  told. While the bounce is being sent or queued, it is told to wait for that
+  result; once the bounce may already have been posted, it can resend it with
+  the `drafts` tool's `confirmDuplicate`, though that could post it twice.
+  The envelope's own words are held as a new bounce draft, with `{{unsent}}`
+  written out and the risk carried, so that draft too can be resent only
+  with `confirmDuplicate`. A bare `{{unsent}}` holds nothing new: its words
+  already are the bounce.
+- **Hold** (an envelope that bounces, or one an explicit send held back): the
+  bounce's words are copied into the new draft with `{{unsent}}` written out,
+  and the draft carries the same risk (`inheritedRisk`), so it reads
+  unconfirmed until a confirmed delivery.
 
 ## What explicit mode retires (for that agent)
 

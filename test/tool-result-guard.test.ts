@@ -118,6 +118,23 @@ function toolResults(framework: AgentFramework) {
     .flatMap((message) => message.content.filter((block) => block.type === 'tool_result'));
 }
 
+/**
+ * A registry stub's routeSpeech, also offered as the outcome-returning
+ * deliverSpeech that explicit and hybrid delivery post through.
+ */
+function withDeliverSpeech<T extends Record<string, unknown>>(stub: T): T {
+  const route = stub.routeSpeech as (agent: string, text: string, channelId: string) => Promise<{ delivered?: boolean; channelId?: string } | undefined>;
+  return Object.assign(stub, {
+    deliverSpeech: async (agent: string, text: string, channelId: string) => {
+      const result = await route(agent, text, channelId);
+      return result?.delivered
+        ? { status: 'delivered', destination: { serverId: 'stub', channelId: result.channelId ?? channelId }, at: Date.now() }
+        : { status: 'failed', destination: { serverId: 'stub', channelId }, reason: 'the stub reported delivered: false', at: Date.now() };
+    },
+    resolveDestination: ({ channelId }: { channelId: string }) => ({ destination: { serverId: 'stub', channelId } }),
+  });
+}
+
 test('default off retains existing refusal behavior and original tool output', async () => {
   const h = await harness([[calls('one'), refused()]]);
   try {
@@ -330,7 +347,7 @@ test('native Membrane observes the first refusal even when guard is enabled by a
   });
   const routed: string[] = [];
   const outgoing: string[] = [];
-  (framework as unknown as { channelRegistry: unknown }).channelRegistry = new Proxy({
+  (framework as unknown as { channelRegistry: unknown }).channelRegistry = new Proxy(withDeliverSpeech({
     resolveLocus: () => 'world:test',
     routeSpeech: async (_agent: string, speech: string) => {
       routed.push(speech); return { delivered: true, channelId: 'world:test' };
@@ -338,7 +355,7 @@ test('native Membrane observes the first refusal even when guard is enabled by a
     sendOutgoingChunk: (_channel: string, _agent: string, _id: string, _index: number, delta: string) => { outgoing.push(delta); },
     getDefaultPublishChannel: () => null, isChannelOpen: () => true,
     getDescriptor: () => undefined, getChannelTools: () => [],
-  }, { get: (target, key: string) => key in target ? (target as Record<string, unknown>)[key] : () => undefined });
+  }), { get: (target, key: string) => key in target ? (target as Record<string, unknown>)[key] : () => undefined });
   const tokenTraces: string[] = [];
   framework.onTrace((event) => {
     if (event.type === 'inference:tokens') tokenTraces.push(String((event as { content?: unknown }).content));
@@ -371,7 +388,7 @@ test('explicit mode: a guard retry streams on to the sticky destination delivery
   ], { toolResultGuard: true, proseRouting: 'explicit', refusalHandling: { retries: 3 } });
   const routed: Array<{ text: string; channelId: string }> = [];
   const streamed: Array<{ channelId: string; delta: string }> = [];
-  (h.framework as unknown as { channelRegistry: unknown }).channelRegistry = new Proxy({
+  (h.framework as unknown as { channelRegistry: unknown }).channelRegistry = new Proxy(withDeliverSpeech({
     resolveProseTarget: (spec: string) => spec === '#alpha' ? { channelId: 'chan-alpha' } : { error: `no channel ${spec}` },
     routeSpeech: async (_agent: string, speech: string, channelId: string) => {
       routed.push({ text: speech, channelId }); return { delivered: true, channelId };
@@ -381,7 +398,7 @@ test('explicit mode: a guard retry streams on to the sticky destination delivery
     },
     getDefaultPublishChannel: () => null, isChannelOpen: () => true,
     getDescriptor: () => undefined, getChannelTools: () => [],
-  }, { get: (target, key: string) => key in target ? (target as Record<string, unknown>)[key] : () => undefined });
+  }), { get: (target, key: string) => key in target ? (target as Record<string, unknown>)[key] : () => undefined });
   try {
     await h.run();
     assert.equal(h.membrane.requests.length, 2, 'the guard retried once');
@@ -446,7 +463,7 @@ test('explicit mode: a budget restart streams on to the destination the turn las
   h.framework.onTrace((event) => {
     if (event.type === 'inference:stream_restarted') restarts.push(String((event as { reason?: string }).reason));
   });
-  (h.framework as unknown as { channelRegistry: unknown }).channelRegistry = new Proxy({
+  (h.framework as unknown as { channelRegistry: unknown }).channelRegistry = new Proxy(withDeliverSpeech({
     resolveProseTarget: (spec: string) => spec === '#alpha' ? { channelId: 'chan-alpha' }
       : spec === '#cafe' ? { channelId: 'chan-cafe' } : { error: `no channel ${spec}` },
     routeSpeech: async (_agent: string, text: string, channelId: string) => {
@@ -460,7 +477,7 @@ test('explicit mode: a budget restart streams on to the destination the turn las
     },
     getDefaultPublishChannel: () => null, isChannelOpen: () => true,
     getDescriptor: () => undefined, getChannelTools: () => [],
-  }, { get: (target, key: string) => key in target ? (target as Record<string, unknown>)[key] : () => undefined });
+  }), { get: (target, key: string) => key in target ? (target as Record<string, unknown>)[key] : () => undefined });
   try {
     await h.run();
     assert.equal(h.membrane.requests.length, 2);
@@ -506,7 +523,7 @@ test("explicit mode: a private round's prefix doesn't move where a budget restar
   h.framework.onTrace((event) => {
     if (event.type === 'inference:stream_restarted') restarts.push(String((event as { reason?: string }).reason));
   });
-  (h.framework as unknown as { channelRegistry: unknown }).channelRegistry = new Proxy({
+  (h.framework as unknown as { channelRegistry: unknown }).channelRegistry = new Proxy(withDeliverSpeech({
     resolveProseTarget: (spec: string) => spec === '#alpha' ? { channelId: 'chan-alpha' }
       : spec === '#cafe' ? { channelId: 'chan-cafe' } : { error: `no channel ${spec}` },
     routeSpeech: async (_agent: string, text: string, channelId: string) => {
@@ -519,7 +536,7 @@ test("explicit mode: a private round's prefix doesn't move where a budget restar
     handleChannelToolCall: async () => ({ success: true, data: { noted: true } }),
     getDefaultPublishChannel: () => null, isChannelOpen: () => true, getDescriptor: () => undefined,
     getChannelTools: () => [{ name: 'think', description: 'Reason privately', inputSchema: { type: 'object', properties: { content: { type: 'string' } } } }],
-  }, { get: (target, key: string) => key in target ? (target as Record<string, unknown>)[key] : () => undefined });
+  }), { get: (target, key: string) => key in target ? (target as Record<string, unknown>)[key] : () => undefined });
   try {
     await h.run();
     assert.equal(h.membrane.requests.length, 2);
@@ -584,7 +601,7 @@ async function heldRestart(mode: 'explicit' | 'locus', texts: { first: string; s
     }
     return stream;
   };
-  (h.framework as unknown as { channelRegistry: unknown }).channelRegistry = new Proxy({
+  (h.framework as unknown as { channelRegistry: unknown }).channelRegistry = new Proxy(withDeliverSpeech({
     resolveProseTarget: (spec: string) => spec === '#alpha' ? { channelId: 'chan-alpha' }
       : spec === '#cafe' ? { channelId: directory.cafe } : { error: `no channel ${spec}` },
     routeSpeech: async (_agent: string, text: string, channelId: string | null) => {
@@ -597,7 +614,7 @@ async function heldRestart(mode: 'explicit' | 'locus', texts: { first: string; s
     },
     getDefaultPublishChannel: () => null, isChannelOpen: () => true,
     getDescriptor: () => undefined, getChannelTools: () => [],
-  }, { get: (target, key: string) => key in target ? (target as Record<string, unknown>)[key] : () => undefined });
+  }), { get: (target, key: string) => key in target ? (target as Record<string, unknown>)[key] : () => undefined });
   const restarts: string[] = [];
   h.framework.onTrace((event) => {
     if (event.type === 'inference:stream_restarted') restarts.push(String((event as { reason?: string }).reason));
@@ -657,7 +674,7 @@ test("locus mode: a resumed stream's deliveries queue behind the turn's earlier 
 function explicitRegistry(h: Awaited<ReturnType<typeof harness>>) {
   const routed: Array<{ text: string; channelId: string }> = [];
   const streamed: Array<{ channelId: string; delta: string }> = [];
-  (h.framework as unknown as { channelRegistry: unknown }).channelRegistry = new Proxy({
+  (h.framework as unknown as { channelRegistry: unknown }).channelRegistry = new Proxy(withDeliverSpeech({
     resolveProseTarget: (spec: string) => spec === '#alpha' ? { channelId: 'chan-alpha' }
       : spec === '#cafe' ? { channelId: 'chan-cafe' } : { error: `no channel ${spec}` },
     routeSpeech: async (_agent: string, text: string, channelId: string) => {
@@ -670,7 +687,7 @@ function explicitRegistry(h: Awaited<ReturnType<typeof harness>>) {
     handleChannelToolCall: async () => ({ success: true, data: { noted: true } }),
     getDefaultPublishChannel: () => null, isChannelOpen: () => true, getDescriptor: () => undefined,
     getChannelTools: () => [{ name: 'think', description: 'Reason privately', inputSchema: { type: 'object', properties: { content: { type: 'string' } } } }],
-  }, { get: (target, key: string) => key in target ? (target as Record<string, unknown>)[key] : () => undefined });
+  }), { get: (target, key: string) => key in target ? (target as Record<string, unknown>)[key] : () => undefined });
   return { routed, streamed };
 }
 
@@ -847,12 +864,12 @@ test("a fresh turn and its restart wait behind the earlier turn's speech chain",
     if (text.trim() === 'earlier') await held;
     return { delivered: true, channelId };
   };
-  (h.framework as unknown as { channelRegistry: unknown }).channelRegistry = new Proxy({
+  (h.framework as unknown as { channelRegistry: unknown }).channelRegistry = new Proxy(withDeliverSpeech({
     resolveProseTarget: (spec: string) => spec === '#alpha' ? { channelId: 'chan-alpha' } : { error: 'unknown channel' },
     routeSpeech,
     getDefaultPublishChannel: () => null, isChannelOpen: () => true,
     getDescriptor: () => undefined, getChannelTools: () => [],
-  }, { get: (target, key: string) => key in target ? (target as Record<string, unknown>)[key] : () => undefined });
+  }), { get: (target, key: string) => key in target ? (target as Record<string, unknown>)[key] : () => undefined });
   const prior = routeSpeech('assistant', 'earlier', 'chan-alpha').then(() => {});
   (h.framework as unknown as { proseSpeechChains: Map<string, Promise<void>> })
     .proseSpeechChains.set('assistant', prior);
@@ -902,7 +919,7 @@ test("explicit: a restarted turn whose last response is empty checks for its ' !
   let release!: () => void;
   const held = new Promise<void>((resolve) => { release = resolve; });
   const routed: string[] = [];
-  (h.framework as unknown as { channelRegistry: unknown }).channelRegistry = new Proxy({
+  (h.framework as unknown as { channelRegistry: unknown }).channelRegistry = new Proxy(withDeliverSpeech({
     resolveProseTarget: (spec: string) => spec === '#alpha' ? { channelId: 'chan-alpha' } : { error: `no channel ${spec}` },
     resolveLocus: () => 'chan-locus',
     routeSpeech: async (_agent: string, text: string, channelId: string) => {
@@ -912,7 +929,7 @@ test("explicit: a restarted turn whose last response is empty checks for its ' !
     },
     getDefaultPublishChannel: () => null, isChannelOpen: () => true,
     getDescriptor: () => undefined, getChannelTools: () => [],
-  }, { get: (target, key: string) => key in target ? (target as Record<string, unknown>)[key] : () => undefined });
+  }), { get: (target, key: string) => key in target ? (target as Record<string, unknown>)[key] : () => undefined });
   const internals = h.framework as unknown as {
     requestProseContinuation(agent: unknown, routing: { continuation: boolean }): void;
   };
@@ -958,7 +975,7 @@ test("hybrid: a restarted turn whose last response is empty writes its receipt a
   let release!: () => void;
   const held = new Promise<void>((resolve) => { release = resolve; });
   const routed: string[] = [];
-  (h.framework as unknown as { channelRegistry: unknown }).channelRegistry = new Proxy({
+  (h.framework as unknown as { channelRegistry: unknown }).channelRegistry = new Proxy(withDeliverSpeech({
     resolveProseTarget: (spec: string) => spec === '#alpha' ? { channelId: 'chan-alpha' } : { error: `no channel ${spec}` },
     resolveLocus: () => 'chan-locus',
     routeSpeech: async (_agent: string, text: string, channelId: string) => {
@@ -968,7 +985,7 @@ test("hybrid: a restarted turn whose last response is empty writes its receipt a
     },
     getDefaultPublishChannel: () => null, isChannelOpen: () => true,
     getDescriptor: () => undefined, getChannelTools: () => [],
-  }, { get: (target, key: string) => key in target ? (target as Record<string, unknown>)[key] : () => undefined });
+  }), { get: (target, key: string) => key in target ? (target as Record<string, unknown>)[key] : () => undefined });
   const receipts = () => h.framework.getAgent('assistant')!.getContextManager().getAllMessages()
     .flatMap((message) => message.content)
     .filter((block): block is ContentBlock & { type: 'text' } => block.type === 'text' && (block as { text: string }).text.startsWith('[delivered]'))
@@ -996,12 +1013,12 @@ test("hybrid: a restarted turn whose last response is empty writes its receipt a
 test("a fresh turn starts new routing state in every mode, and leaves the earlier turn's as it was", async () => {
   for (const mode of ['explicit', 'hybrid', 'locus'] as const) {
     const h = await harness([[answer()]], { proseRouting: mode });
-    type Routing = { pin?: string; destination: string | null; hybridHold: boolean;
-      continuation: boolean; deliveries: string[]; suppressed: number;
+    type Routing = { pin?: string; destination: string | null; hybridHold?: 'private' | 'failed';
+      continuation: boolean; deliveries: string[]; suppressed: number; drafts: unknown[]; keptPrivate: number;
       triggerChannel?: string; locus?: string; engaged: Set<string>; arrivals: Array<{ messageId: string; channelId: string }> };
     const internals = h.framework as unknown as { turnRouting: Map<string, Routing> };
-    const earlierFields = (): Routing => ({ pin: 'chan-earlier', destination: 'chan-earlier', hybridHold: true,
-      continuation: true, deliveries: ['chan-earlier'], suppressed: 2,
+    const earlierFields = (): Routing => ({ pin: 'chan-earlier', destination: 'chan-earlier', hybridHold: 'failed',
+      continuation: true, deliveries: ['chan-earlier'], suppressed: 2, drafts: [{ id: 'd-earlier' }], keptPrivate: 1,
       triggerChannel: 'chan-earlier', locus: 'chan-earlier', engaged: new Set(['chan-earlier']), arrivals: [{ messageId: 'earlier-message', channelId: 'chan-earlier' }] });
     const earlier = earlierFields();
     internals.turnRouting.set('assistant', earlier);
@@ -1011,10 +1028,12 @@ test("a fresh turn starts new routing state in every mode, and leaves the earlie
       assert.notEqual(now, earlier, `${mode}: the new turn has its own routing state`);
       assert.equal(now?.pin, undefined, `${mode}: no sticky destination`);
       assert.equal(now?.destination, null, `${mode}: no turn destination`);
-      assert.equal(now?.hybridHold, false, `${mode}: no hybrid hold`);
+      assert.equal(now?.hybridHold, undefined, `${mode}: no hybrid hold`);
       assert.equal(now?.continuation, false, `${mode}: no continuation`);
       assert.deepEqual(now?.deliveries, [], `${mode}: no deliveries carried into the new turn`);
       assert.equal(now?.suppressed, 0, `${mode}: no suppression carried into the new turn`);
+      assert.deepEqual(now?.drafts, [], `${mode}: no drafts carried into the new turn`);
+      assert.equal(now?.keptPrivate, 0, `${mode}: no private count carried into the new turn`);
       assert.equal(now?.triggerChannel, undefined, `${mode}: no trigger channel carried into the new turn`);
       assert.notEqual(now?.locus, 'chan-earlier', `${mode}: no locus carried into the new turn`);
       assert.deepEqual([...(now?.engaged ?? [])], [], `${mode}: no engaged channels carried into the new turn`);
@@ -1044,7 +1063,7 @@ for (const shape of ['text-only', 'trailing'] as const) {
     let cafe = 'chan-cafe';
     const routed: Array<{ text: string; channelId: string }> = [];
     const streamed: Array<{ channelId: string; delta: string }> = [];
-    (h.framework as unknown as { channelRegistry: unknown }).channelRegistry = new Proxy({
+    (h.framework as unknown as { channelRegistry: unknown }).channelRegistry = new Proxy(withDeliverSpeech({
       resolveProseTarget: (spec: string) => spec === '#alpha' ? { channelId: 'chan-alpha' }
         : spec === '#cafe' ? { channelId: cafe } : { error: `no channel ${spec}` },
       routeSpeech: async (_agent: string, text: string, channelId: string) => {
@@ -1056,7 +1075,7 @@ for (const shape of ['text-only', 'trailing'] as const) {
       },
       getDefaultPublishChannel: () => null, isChannelOpen: () => true,
       getDescriptor: () => undefined, getChannelTools: () => [],
-    }, { get: (target, key: string) => key in target ? (target as Record<string, unknown>)[key] : () => undefined });
+    }), { get: (target, key: string) => key in target ? (target as Record<string, unknown>)[key] : () => undefined });
     const modules = (h.framework as unknown as { moduleRegistry: { dispatchSpeech: (...args: unknown[]) => Promise<void> } }).moduleRegistry;
     const dispatch = modules.dispatchSpeech.bind(modules);
     modules.dispatchSpeech = async (...args: unknown[]) => {
@@ -1262,7 +1281,7 @@ test('usage of an abandoned guarded round is counted in session totals', async (
 
 function fakeRegistry(framework: AgentFramework) {
   const routed: string[] = [];
-  (framework as unknown as { channelRegistry: unknown }).channelRegistry = new Proxy({
+  (framework as unknown as { channelRegistry: unknown }).channelRegistry = new Proxy(withDeliverSpeech({
     resolveLocus: () => 'world:test',
     routeSpeech: async (_agent: string, speech: string) => {
       routed.push(speech); return { delivered: true, channelId: 'world:test' };
@@ -1270,7 +1289,7 @@ function fakeRegistry(framework: AgentFramework) {
     sendOutgoingChunk: () => {},
     getDefaultPublishChannel: () => null, isChannelOpen: () => true,
     getDescriptor: () => undefined, getChannelTools: () => [],
-  }, { get: (target, key: string) => key in target ? (target as Record<string, unknown>)[key] : () => undefined });
+  }), { get: (target, key: string) => key in target ? (target as Record<string, unknown>)[key] : () => undefined });
   return routed;
 }
 

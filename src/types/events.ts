@@ -247,6 +247,8 @@ export interface McplPushEvent {
   inferenceId: string;
   triggerInference?: boolean;
   targetAgents?: string[];
+  /** Host acceptance time (epoch ms), stamped where the push is admitted. */
+  acceptedAt?: number;
 }
 
 /**
@@ -265,4 +267,6 @@ export interface McplChannelIncomingEvent {
   metadata?: Record<string, unknown>;
   triggerInference?: boolean;
   targetAgents?: string[];
+  /** Host acceptance time (epoch ms), stamped where the message is admitted. */
+  acceptedAt?: number;
 }
