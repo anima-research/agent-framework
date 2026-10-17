@@ -3,7 +3,7 @@ import { isDeepStrictEqual } from 'node:util';
 import type { ContextManager, MessageId, MessageMetadata } from '@animalabs/context-manager';
 import type { ContentBlock, NormalizedMessage, ToolResult } from '@animalabs/membrane';
 import type { CompletedToolCall } from './types/index.js';
-import { isStateExistsError } from './module-registry.js';
+import { ensureStateRegistered } from './module-registry.js';
 import { toolResultDataToHistoryString } from './tool-result-history.js';
 import { safeSlice } from './safe-slice.js';
 
@@ -295,11 +295,7 @@ export class ToolResultGuard {
   private write(record: Record<string, unknown>): void {
     const store = this.cm.getStore();
     if (!this.registered) {
-      try {
-        store.registerState({ id: TOOL_RESULT_GUARD_AUDIT_STATE, strategy: 'append_log' });
-      } catch (error) {
-        if (!isStateExistsError(error)) throw error;
-      }
+      ensureStateRegistered(store, { id: TOOL_RESULT_GUARD_AUDIT_STATE, strategy: 'append_log' });
       this.registered = true;
     }
     store.appendToStateJson(TOOL_RESULT_GUARD_AUDIT_STATE, record);

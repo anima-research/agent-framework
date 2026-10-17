@@ -33,6 +33,16 @@ export const TUNE_OUT_DEFAULTS = {
  *  subconscious turn, and max-wakes counts invocations, not messages. */
 const WAKE_COALESCE_MS = 2_000;
 
+/** What a thrown value says, without throwing: an Error's message, or the
+ *  value as text, which String() can't give for an object with no prototype. */
+function thrownReason(error: unknown): string {
+  try {
+    return error instanceof Error ? error.message : String(error);
+  } catch {
+    return '(a value that could not be read)';
+  }
+}
+
 export interface TuneOutFrameworkHooks {
   /** Deliver a message into an agent's window (per-agent seam). */
   addMessage: (
@@ -432,6 +442,8 @@ export class TuneOutCoordinator {
    * subconscious's compiles (antra: deliver changes, never let them wash
    * away — it has no long-term memory, so they must not live in window
    * content). Bytes change only when a disposition changes: KV-friendly.
+   * A failed read of the stored map throws, so the compile stops rather than
+   * run without them.
    */
   getDispositionsInjection(): {
     namespace: string;
@@ -453,12 +465,17 @@ export class TuneOutCoordinator {
 
   private readDispositions(): Record<string, string> {
     if (this.dispositionsCache) return this.dispositionsCache;
+    let raw: unknown;
     try {
-      const raw = this.channelRegistry.readCoordinatorState(this.dispositionsStateId);
-      this.dispositionsCache = (raw && typeof raw === 'object') ? raw as Record<string, string> : {};
-    } catch {
-      this.dispositionsCache = {};
+      raw = this.channelRegistry.readCoordinatorState(this.dispositionsStateId);
+    } catch (error) {
+      // A failed read is not an empty map, and nothing is cached, so the next
+      // read asks the store again. Taken as empty, it would compile the
+      // subconscious without its dispositions until a restart, and the next
+      // noteDisposition would write that empty map over the stored one.
+      throw new Error(`the stored dispositions (${this.dispositionsStateId}) could not be read: ${thrownReason(error)}`, { cause: error });
     }
+    this.dispositionsCache = (raw && typeof raw === 'object') ? raw as Record<string, string> : {};
     return this.dispositionsCache;
   }
 
@@ -469,8 +486,14 @@ export class TuneOutCoordinator {
     } else {
       dispositions[key] = text;
     }
+    // Stored before it's cached: a write that fails leaves the cache and the
+    // store as they were, so the note is in effect nowhere.
+    try {
+      this.channelRegistry.writeCoordinatorState(this.dispositionsStateId, dispositions);
+    } catch (error) {
+      throw new Error(`the dispositions (${this.dispositionsStateId}) could not be stored: ${thrownReason(error)}`, { cause: error });
+    }
     this.dispositionsCache = dispositions;
-    this.channelRegistry.writeCoordinatorState(this.dispositionsStateId, dispositions);
   }
 
   // ==========================================================================
@@ -508,7 +531,20 @@ export class TuneOutCoordinator {
       case 'note_disposition': {
         const key = String(input.key ?? '').trim();
         if (!key) return { success: false, error: 'key required', isError: false };
-        this.noteDisposition(key, String(input.text ?? ''));
+        try {
+          this.noteDisposition(key, String(input.text ?? ''));
+        } catch (error) {
+          // For the subconscious first: what became of its note, and that a
+          // later call may land. The store's own reason follows, for an operator.
+          // The note may set, change or remove a disposition, so what stays in
+          // effect is whatever was there before, if anything.
+          return {
+            success: false,
+            isError: true,
+            error: `The change to the disposition ${JSON.stringify(key)} wasn't recorded, so the dispositions stay as they were. ` +
+              `Noting it again may work once the store can be read and written. The store's error: ${thrownReason(error)}`,
+          };
+        }
         return { success: true, data: { noted: key } };
       }
       case 'speak_in_channel': {

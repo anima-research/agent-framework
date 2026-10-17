@@ -72,7 +72,7 @@ import { ProcessQueueImpl } from './queue.js';
 import { DEFAULT_SHUTDOWN_TIMEOUT_MS, validateShutdownTimeout, shutdownErrorMessage, waitForShutdown, ShutdownTimeoutError } from './shutdown.js';
 import { REFUSAL_REACTIONS, REFUSAL_REACTION_FALLBACK, REFUSAL_REACTION_BASELINE } from './refusal-reactions.js';
 import { Agent } from './agent.js';
-import { ModuleRegistry, checkedToolResult, isStateExistsError, storableToolResult, thrownResult } from './module-registry.js';
+import { ModuleRegistry, checkedToolResult, ensureStateRegistered, storableToolResult, thrownResult } from './module-registry.js';
 import { McplServerRegistry } from './mcpl/server-registry.js';
 import { logValue } from './mcpl/log-value.js';
 import { FeatureSetManager } from './mcpl/feature-set-manager.js';
@@ -2128,41 +2128,41 @@ export class AgentFramework {
     }
 
     // Register framework states
-    try {
-      store.registerState({ id: FRAMEWORK_STATE_ID, strategy: 'snapshot' });
-    } catch {
-      // Already registered
-    }
-    try {
-      store.registerState({ id: DEFERRED_WRITES_ID, strategy: 'snapshot' });
-    } catch {
-      // Already registered
-    }
+    ensureStateRegistered(store, { id: FRAMEWORK_STATE_ID, strategy: 'snapshot' });
+    ensureStateRegistered(store, { id: DEFERRED_WRITES_ID, strategy: 'snapshot' });
     for (const id of [COALESCING_STATE_ID, COALESCING_RECENT_ID]) {
-      try {
-        store.registerState({ id, strategy: 'snapshot' });
-      } catch {
-        // Already registered
-      }
+      ensureStateRegistered(store, { id, strategy: 'snapshot' });
     }
-
-    try {
-      store.registerState({
-        id: INFERENCE_LOG_ID,
-        strategy: 'append_log',
-        deltaSnapshotEvery: 100,
-        fullSnapshotEvery: 20,
-      });
-    } catch {
-      // Already registered
-    }
+    ensureStateRegistered(store, {
+      id: INFERENCE_LOG_ID,
+      strategy: 'append_log',
+      deltaSnapshotEvery: 100,
+      fullSnapshotEvery: 20,
+    });
 
     // The legacy single-map checkpoint state (TURN_CHECKPOINTS_ID) is no longer
     // registered for new stores — it's read-only fallback data in old ones.
-    try {
-      store.registerState({ id: TURN_CHECKPOINTS_TREE_ID, strategy: 'tree' });
-    } catch (error) {
-      if (!isStateExistsError(error)) throw error;
+    ensureStateRegistered(store, { id: TURN_CHECKPOINTS_TREE_ID, strategy: 'tree' });
+
+    // The conversation router's generation counters (see the routing setup
+    // below) are read now, before anything starts, so a read that fails
+    // leaves nothing running: create() closes a store it opened and fails
+    // with the read error. No persisted state yet reads as null. A read that
+    // fails is not that: taken as no counters, it would do what the routing
+    // setup's comment warns of.
+    let routerGenerations: Record<string, number> | undefined;
+    if (config.conversations) {
+      ensureStateRegistered(store, { id: CONVERSATION_ROUTER_STATE_ID, strategy: 'snapshot' });
+      try {
+        routerGenerations = (store.getStateJson(CONVERSATION_ROUTER_STATE_ID) as
+          { generations?: Record<string, number> } | null)?.generations;
+      } catch (error) {
+        if (ownsStore) store.close();
+        throw new Error(
+          `the conversation router's generation counters (${CONVERSATION_ROUTER_STATE_ID}) could not be read: ${thrownText(error)}`,
+          { cause: error },
+        );
+      }
     }
 
     // Process logging config (default: disabled)
@@ -2171,16 +2171,12 @@ export class AgentFramework {
 
     // Register process log state only if persistence is enabled
     if (processLoggingPersist) {
-      try {
-        store.registerState({
-          id: PROCESS_LOG_ID,
-          strategy: 'append_log',
-          deltaSnapshotEvery: 100,
-          fullSnapshotEvery: 20,
-        });
-      } catch {
-        // Already registered
-      }
+      ensureStateRegistered(store, {
+        id: PROCESS_LOG_ID,
+        strategy: 'append_log',
+        deltaSnapshotEvery: 100,
+        fullSnapshotEvery: 20,
+      });
     }
 
     const discordAwarenessOutboxPath = config.discordAwarenessOutboxPath
@@ -2292,20 +2288,10 @@ export class AgentFramework {
 
       // Generation counters persist across restarts — reusing generation 1's
       // agent name after a restart would reopen (and re-seed) the previous
-      // engagement's Chronicle namespace.
-      try {
-        store.registerState({ id: CONVERSATION_ROUTER_STATE_ID, strategy: 'snapshot' });
-      } catch {
-        // Already registered
-      }
-      try {
-        const data = store.getStateJson(CONVERSATION_ROUTER_STATE_ID) as
-          { generations?: Record<string, number> } | null;
-        if (data?.generations) {
-          framework.conversationRouter.hydrateGenerations(data.generations);
-        }
-      } catch {
-        // No persisted state yet
+      // engagement's Chronicle namespace. They were read before anything
+      // started (above).
+      if (routerGenerations) {
+        framework.conversationRouter.hydrateGenerations(routerGenerations);
       }
     }
 
@@ -9451,9 +9437,9 @@ export class AgentFramework {
     let agent: Agent | undefined;
     if (decision.kind === 'spawn') {
       try {
+        this.storeConversationGeneration(event.channelId, decision.generation);
         agent = await this.createConversationAgent(decision.agentName, event.channelId);
         router.bind(event.channelId, decision.agentName, decision.generation);
-        this.persistConversationRouterState();
         this.emitTrace({
           type: 'mcpl:conversation-spawned',
           channelId: event.channelId,
@@ -9620,15 +9606,48 @@ export class AgentFramework {
     }
   }
 
-  /** Persist the router's generation counters (see hydration in create()). */
-  private persistConversationRouterState(): void {
+  /**
+   * Store the router's generation counters with a spawn's generation, before
+   * the spawn it names (see hydration in create()). A fork whose counter isn't
+   * stored would have its name reused at the next restart, reopening its
+   * namespace, so a failed read or write throws and the caller refuses the
+   * spawn. The stored counters, the router's own and this spawn's are
+   * merged, each at its highest, in one synchronous step: another channel's
+   * spawn still in flight has stored its counter but not bound it yet, so
+   * the router's map alone would write that counter back down, and the
+   * router's own counters keep the stored ones from going back down when
+   * they read lower, as on a branch with older counters. The merge is a Map,
+   * so a channel id such as "constructor" is a key like any other. The
+   * callers name the channel; the errors name the state and what failed.
+   */
+  private storeConversationGeneration(channelId: string, generation: number): void {
     if (!this.conversationRouter) return;
+    let stored: unknown;
     try {
-      this.store.setStateJson(CONVERSATION_ROUTER_STATE_ID, {
-        generations: this.conversationRouter.exportGenerations(),
-      });
+      stored = (this.store.getStateJson(CONVERSATION_ROUTER_STATE_ID) as { generations?: unknown } | null)?.generations;
     } catch (error) {
-      console.error('Failed to persist conversation router state:', error);
+      throw new Error(
+        `the conversation router's generation counters (${CONVERSATION_ROUTER_STATE_ID}) could not be read: ${thrownText(error)}`,
+        { cause: error },
+      );
+    }
+    const generations = new Map<string, number>();
+    for (const source of [
+      stored && typeof stored === 'object' ? Object.entries(stored) : [],
+      Object.entries(this.conversationRouter.exportGenerations()),
+      [[channelId, generation]] as Array<[string, unknown]>,
+    ]) {
+      for (const [id, n] of source) {
+        if (typeof n === 'number' && n > (generations.get(id) ?? 0)) generations.set(id, n);
+      }
+    }
+    try {
+      this.store.setStateJson(CONVERSATION_ROUTER_STATE_ID, { generations: Object.fromEntries(generations) });
+    } catch (error) {
+      throw new Error(
+        `the conversation router's generation counters (${CONVERSATION_ROUTER_STATE_ID}) could not be stored: ${thrownText(error)}`,
+        { cause: error },
+      );
     }
   }
 
@@ -10111,9 +10130,9 @@ export class AgentFramework {
       });
       if (decision.kind !== 'spawn') return decision.kind === 'unbound' ? [] : (this.agents.has(decision.agentName) ? [decision.agentName] : []);
       try {
+        this.storeConversationGeneration(occ.scope.id, decision.generation);
         await this.createConversationAgent(decision.agentName, occ.scope.id);
         router.bind(occ.scope.id, decision.agentName, decision.generation);
-        this.persistConversationRouterState();
         return [decision.agentName];
       } catch (err) {
         console.error(`[coalescing] could not spawn a conversation agent for ${logValue(occ.scope.id)}:`, err);

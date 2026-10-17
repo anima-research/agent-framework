@@ -276,6 +276,7 @@ test('a conversation agent that fails to spawn names its channel as one field', 
   const fakeThis = {
     conversationRouter: { route: () => ({ kind: 'spawn', agentName: 'conversation-chat-g1', generation: 1, trigger: true }), templateAgent: 'agent' },
     channelRegistry: { getDescriptor: () => undefined },
+    storeConversationGeneration: () => {},
     createConversationAgent: async () => { throw new Error('no room'); },
     emitTrace: (e: { type: string }) => { traces.push(e); },
   };
@@ -294,6 +295,7 @@ test('a coalesced batch whose conversation agent fails to spawn names its channe
       route: () => ({ kind: 'spawn', agentName: 'conversation-chat-g1', generation: 1, trigger: true }),
     },
     channelRegistry: { getDescriptor: () => undefined },
+    storeConversationGeneration: () => {},
     createConversationAgent: async () => { throw new Error('no room'); },
   };
   const audience = (AgentFramework.prototype as unknown as { coalescedAudience: (occ: unknown) => Promise<string[]> }).coalescedAudience;
