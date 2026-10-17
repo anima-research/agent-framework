@@ -804,6 +804,39 @@ describe('a compile refused for budget holds its turn (#304)', () => {
     });
   });
 
+  it('on the fallback path, holds on when compression comes back during a dry compile that its progress does not show', async () => {
+    // Progress frozen: only whether compression is pending changes, and the
+    // signature doesn't see it.
+    await withBacklog({ previewless: true, stalled: true, alwaysPending: true, readyAt: 0 }, async (backlog) => {
+      const t = await residentTurn({ maintenanceIntervalMs: 50 });
+      try {
+        t.send('Are you there?');
+        assert.ok(await pollUntil(() => t.of('inference:held').length === 1 && backlog.dryRuns >= 1 && backlog.dryRunsRunning === 0, 5_000));
+        // Compression goes idle, and a message brings a look whose dry
+        // compile begins with nothing pending. While it runs, compression has
+        // work again.
+        let release!: () => void;
+        backlog.dryRunGate = new Promise<void>((resolve) => { release = resolve; });
+        const dryRuns = backlog.dryRuns;
+        backlog.alwaysPending = false;
+        t.send('Still there?');
+        assert.ok(await pollUntil(() => backlog.dryRuns === dryRuns + 1, 2_000));
+        backlog.alwaysPending = true;
+        backlog.dryRunGate = undefined;
+        release();
+        await new Promise((r) => setTimeout(r, 300));
+        assert.deepEqual(t.of('inference:hold_ended'), [], 'the refusal met compression with work again, so the hold goes on');
+        assert.deepEqual(t.of('inference:exhausted'), []);
+        backlog.fit = true;
+        t.send('And now?');
+        assert.ok(await pollUntil(() => storedText(t.framework).includes('Answered once it fit'), 3_000));
+        assert.deepEqual(t.of('inference:hold_ended').map((e) => e.outcome), ['fit']);
+      } finally {
+        await t.close();
+      }
+    });
+  });
+
   it('tells a turn that fits after its hold\'s deadline why it waited', async () => {
     await withBacklog({}, async (backlog) => {
       // No passes after the first, so nothing looks between the hold's first
