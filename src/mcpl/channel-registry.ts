@@ -16,6 +16,7 @@
 import type { ContentBlock } from '@animalabs/membrane';
 import { INLINE_WITHHELD_TEXT, isInlineContradiction, referenceStubOrNull } from './references.js';
 import type { JsStore } from '@animalabs/chronicle';
+import { ensureStateRegistered } from '../module-registry.js';
 
 import type {
   ChannelDescriptor,
@@ -1549,13 +1550,7 @@ export class ChannelRegistry {
   private initializeLifecycleStore(): void {
     if (!this.store) return;
 
-    try {
-      this.store.registerState({ id: CHANNEL_LIFECYCLE_LOG_ID, strategy: 'append_log' });
-    } catch (error) {
-      if (!(error instanceof Error) || !error.message.includes('State already exists')) {
-        throw error;
-      }
-    }
+    ensureStateRegistered(this.store, { id: CHANNEL_LIFECYCLE_LOG_ID, strategy: 'append_log' });
 
     const raw = this.store.getStateJson(CHANNEL_LIFECYCLE_LOG_ID);
     if (!Array.isArray(raw)) return;
@@ -1616,13 +1611,7 @@ export class ChannelRegistry {
   private initializeLabelHistoryStore(): void {
     if (!this.store) return;
 
-    try {
-      this.store.registerState({ id: CHANNEL_LABEL_HISTORY_LOG_ID, strategy: 'append_log' });
-    } catch (error) {
-      if (!(error instanceof Error) || !error.message.includes('State already exists')) {
-        throw error;
-      }
-    }
+    ensureStateRegistered(this.store, { id: CHANNEL_LABEL_HISTORY_LOG_ID, strategy: 'append_log' });
 
     const raw = this.store.getStateJson(CHANNEL_LABEL_HISTORY_LOG_ID);
     if (!Array.isArray(raw)) return;
@@ -2069,17 +2058,13 @@ export class ChannelRegistry {
    */
   readCoordinatorState(stateId: string): unknown {
     if (!this.store) return null;
-    try {
-      this.store.registerState({ id: stateId, strategy: 'snapshot' });
-    } catch { /* already registered */ }
+    ensureStateRegistered(this.store, { id: stateId, strategy: 'snapshot' });
     return this.store.getStateJson(stateId);
   }
 
   writeCoordinatorState(stateId: string, value: unknown): void {
     if (!this.store) return;
-    try {
-      this.store.registerState({ id: stateId, strategy: 'snapshot' });
-    } catch { /* already registered */ }
+    ensureStateRegistered(this.store, { id: stateId, strategy: 'snapshot' });
     this.store.setStateJson(stateId, value);
   }
 

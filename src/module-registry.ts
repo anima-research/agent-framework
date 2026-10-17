@@ -1,4 +1,4 @@
-import type { JsStore } from '@animalabs/chronicle';
+import type { JsStateRegistration, JsStore } from '@animalabs/chronicle';
 import type { ContentBlock } from '@animalabs/membrane';
 import type {
   MessageId,
@@ -42,6 +42,25 @@ const MODULE_STATE_PREFIX = 'modules/';
  */
 export function isStateExistsError(err: unknown): boolean {
   return err instanceof Error && err.message.includes('State already exists');
+}
+
+/**
+ * Register a state, treating "already exists" as done: a store reopened after
+ * a restart already holds it. Every other failure is thrown here, where it
+ * happened, naming the state, with the store's own error as its cause. Each
+ * state the framework registers goes through this.
+ */
+export function ensureStateRegistered(
+  store: Pick<JsStore, 'registerState'>,
+  registration: JsStateRegistration,
+): void {
+  try {
+    store.registerState(registration);
+  } catch (error) {
+    if (isStateExistsError(error)) return;
+    const reason = error instanceof Error ? error.message : String(error);
+    throw new Error(`Registering state '${registration.id}' failed: ${reason}`, { cause: error });
+  }
 }
 
 /**
@@ -146,14 +165,7 @@ export class ModuleRegistry {
 
     // Register module state in store
     const stateId = this.getStateId(module.name);
-    try {
-      this.store.registerState({
-        id: stateId,
-        strategy: 'snapshot',
-      });
-    } catch {
-      // State already registered (from previous run)
-    }
+    ensureStateRegistered(this.store, { id: stateId, strategy: 'snapshot' });
 
     // Check if this is a restart (state exists)
     const existingState = this.store.getStateJson(stateId);
@@ -640,18 +652,12 @@ class ModuleContextImpl implements ModuleContext {
     name: string,
     opts?: { deltaSnapshotEvery?: number; fullSnapshotEvery?: number }
   ): void {
-    const id = this.logStateId(name);
-    try {
-      this.store.registerState({
-        id,
-        strategy: 'append_log',
-        deltaSnapshotEvery: opts?.deltaSnapshotEvery ?? 100,
-        fullSnapshotEvery: opts?.fullSnapshotEvery ?? 20,
-      });
-    } catch (err) {
-      if (!isStateExistsError(err)) throw err;
-      // Already registered (previous run) — idempotent path.
-    }
+    ensureStateRegistered(this.store, {
+      id: this.logStateId(name),
+      strategy: 'append_log',
+      deltaSnapshotEvery: opts?.deltaSnapshotEvery ?? 100,
+      fullSnapshotEvery: opts?.fullSnapshotEvery ?? 20,
+    });
     this.registeredLogStates.add(name);
   }
 

@@ -13,6 +13,7 @@
  */
 
 import type { JsStore } from '@animalabs/chronicle';
+import { ensureStateRegistered } from '../module-registry.js';
 
 import type { StateCheckpoint, JsonPatchOperation } from './types.js';
 
@@ -190,11 +191,7 @@ export class CheckpointManager {
     this.emitTraceFn = emitTraceFn;
 
     // Register the checkpoint metadata state slot
-    try {
-      store.registerState({ id: CHECKPOINTS_STATE_ID, strategy: 'snapshot' });
-    } catch {
-      // Already registered (e.g. framework restart)
-    }
+    ensureStateRegistered(store, { id: CHECKPOINTS_STATE_ID, strategy: 'snapshot' });
 
     // Load existing tree from Chronicle
     this.loadFromStore();
@@ -216,29 +213,24 @@ export class CheckpointManager {
     const key = this.key(serverId, featureSet);
     if (this.trees.has(key)) return; // Already registered (e.g. from loaded state)
 
+    // The host-managed state's slot is registered, and its stored value read,
+    // before the feature set is recorded: a registration that fails leaves
+    // nothing behind, so the next call (a reconnect's re-run) tries again.
+    let currentState: unknown = undefined;
+    if (opts.hostState) {
+      const stateId = this.stateId(serverId, featureSet);
+      ensureStateRegistered(this.store, { id: stateId, strategy: 'snapshot' });
+      const existing = this.store.getStateJson(stateId);
+      if (existing !== null && existing !== undefined) currentState = existing;
+    }
+
     this.trees.set(key, {
       hostState: opts.hostState,
       rollback: opts.rollback,
       currentCheckpoint: null,
-      currentState: undefined,
+      currentState,
       nodes: new Map(),
     });
-
-    // Register per-feature-set state slot for host-managed state
-    if (opts.hostState) {
-      const stateId = this.stateId(serverId, featureSet);
-      try {
-        this.store.registerState({ id: stateId, strategy: 'snapshot' });
-      } catch {
-        // Already registered
-      }
-      // Load existing state if any
-      const existing = this.store.getStateJson(stateId);
-      if (existing !== null && existing !== undefined) {
-        const tree = this.trees.get(key)!;
-        tree.currentState = existing;
-      }
-    }
 
     this.emitTraceFn({
       type: 'mcpl:state_registered',

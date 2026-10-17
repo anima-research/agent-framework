@@ -72,7 +72,7 @@ import { ProcessQueueImpl } from './queue.js';
 import { DEFAULT_SHUTDOWN_TIMEOUT_MS, validateShutdownTimeout, shutdownErrorMessage, waitForShutdown, ShutdownTimeoutError } from './shutdown.js';
 import { REFUSAL_REACTIONS, REFUSAL_REACTION_FALLBACK, REFUSAL_REACTION_BASELINE } from './refusal-reactions.js';
 import { Agent } from './agent.js';
-import { ModuleRegistry, checkedToolResult, isStateExistsError, storableToolResult, thrownResult } from './module-registry.js';
+import { ModuleRegistry, checkedToolResult, ensureStateRegistered, storableToolResult, thrownResult } from './module-registry.js';
 import { McplServerRegistry } from './mcpl/server-registry.js';
 import { logValue } from './mcpl/log-value.js';
 import { FeatureSetManager } from './mcpl/feature-set-manager.js';
@@ -2154,42 +2154,21 @@ export class AgentFramework {
     }
 
     // Register framework states
-    try {
-      store.registerState({ id: FRAMEWORK_STATE_ID, strategy: 'snapshot' });
-    } catch {
-      // Already registered
-    }
-    try {
-      store.registerState({ id: DEFERRED_WRITES_ID, strategy: 'snapshot' });
-    } catch {
-      // Already registered
-    }
+    ensureStateRegistered(store, { id: FRAMEWORK_STATE_ID, strategy: 'snapshot' });
+    ensureStateRegistered(store, { id: DEFERRED_WRITES_ID, strategy: 'snapshot' });
     for (const id of [COALESCING_STATE_ID, COALESCING_RECENT_ID]) {
-      try {
-        store.registerState({ id, strategy: 'snapshot' });
-      } catch {
-        // Already registered
-      }
+      ensureStateRegistered(store, { id, strategy: 'snapshot' });
     }
-
-    try {
-      store.registerState({
-        id: INFERENCE_LOG_ID,
-        strategy: 'append_log',
-        deltaSnapshotEvery: 100,
-        fullSnapshotEvery: 20,
-      });
-    } catch {
-      // Already registered
-    }
+    ensureStateRegistered(store, {
+      id: INFERENCE_LOG_ID,
+      strategy: 'append_log',
+      deltaSnapshotEvery: 100,
+      fullSnapshotEvery: 20,
+    });
 
     // The legacy single-map checkpoint state (TURN_CHECKPOINTS_ID) is no longer
     // registered for new stores — it's read-only fallback data in old ones.
-    try {
-      store.registerState({ id: TURN_CHECKPOINTS_TREE_ID, strategy: 'tree' });
-    } catch (error) {
-      if (!isStateExistsError(error)) throw error;
-    }
+    ensureStateRegistered(store, { id: TURN_CHECKPOINTS_TREE_ID, strategy: 'tree' });
 
     // Process logging config (default: disabled)
     const processLoggingPersist = config.processLogging?.persist ?? false;
@@ -2197,16 +2176,12 @@ export class AgentFramework {
 
     // Register process log state only if persistence is enabled
     if (processLoggingPersist) {
-      try {
-        store.registerState({
-          id: PROCESS_LOG_ID,
-          strategy: 'append_log',
-          deltaSnapshotEvery: 100,
-          fullSnapshotEvery: 20,
-        });
-      } catch {
-        // Already registered
-      }
+      ensureStateRegistered(store, {
+        id: PROCESS_LOG_ID,
+        strategy: 'append_log',
+        deltaSnapshotEvery: 100,
+        fullSnapshotEvery: 20,
+      });
     }
 
     const discordAwarenessOutboxPath = config.discordAwarenessOutboxPath
@@ -2319,11 +2294,7 @@ export class AgentFramework {
       // Generation counters persist across restarts — reusing generation 1's
       // agent name after a restart would reopen (and re-seed) the previous
       // engagement's Chronicle namespace.
-      try {
-        store.registerState({ id: CONVERSATION_ROUTER_STATE_ID, strategy: 'snapshot' });
-      } catch {
-        // Already registered
-      }
+      ensureStateRegistered(store, { id: CONVERSATION_ROUTER_STATE_ID, strategy: 'snapshot' });
       try {
         const data = store.getStateJson(CONVERSATION_ROUTER_STATE_ID) as
           { generations?: Record<string, number> } | null;
