@@ -20,7 +20,10 @@
     default. A `send_dm`'s answer never carries it, since the tool sends to a DM, and a
     conversation agent gets none: `channel_open` is refused to it, and its settings end with its
     conversation. In such a channel, the `sleep` tool's default announcement says "I'll still see
-    messages addressed to me, but won't respond until I wake."
+    messages addressed to me, but won't respond until I wake." In connectome-host's `mentions`
+    channel mode, which closes a channel with `channel_close`, the note comes with every reply to
+    a mention there until the resident turns it off; the mode's own tool, not `channel_open`, is
+    the way back to its other mode.
   - **What the invitation says:** the closed-channel invitation's first option now says what
     replying does there. In a channel the agent closed or declined itself, it reads as before:
     "Reply without joining …", with the note that follow-ups that don't address the agent won't
@@ -33,7 +36,9 @@
     forwarding, and closing it turns that off. A reply in a guild channel the agent closed used to
     reopen it, and so turn its reactions on. Now reactions to that reply arrive only where the
     agent opens the channel or turns them on with `set_reaction_visibility`. DMs are unaffected:
-    discord-mcpl requests no DM reaction events. On zulip_mcp, an answer's topic comes from the
+    discord-mcpl requests no DM reaction events. discord-mcpl's `channels/open` also lifts a mute
+    set with `mute_channel`, so a reply that opens a muted channel nobody decided about, or one a
+    machine closed, unmutes it, as before; a channel the agent closed keeps its mute. On zulip_mcp, an answer's topic comes from the
     last message delivered as `channels/incoming`, and a closed stream's mentions are pushed
     instead, so in a stream the agent closed, every answer goes to the topic of the stream's last
     message from before the close, where a reply used to reopen the stream.
