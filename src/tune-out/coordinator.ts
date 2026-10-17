@@ -485,7 +485,7 @@ export class TuneOutCoordinator {
       case 'deliver_summary': {
         const text = String(input.text ?? '').trim();
         const channelId = String(input.channelId ?? '');
-        if (!text) return { success: false, error: 'empty summary', isError: false };
+        if (!text) return { success: false, error: 'empty summary', isError: true };
         const subName = this.hooks.subconsciousName();
         if (!subName) return { success: false, error: 'subconscious not configured', isError: true };
         // Verbatim, under its own participant name, into the resident's window.
@@ -498,16 +498,16 @@ export class TuneOutCoordinator {
       case 'cancel_tuneout': {
         const channelId = String(input.channelId ?? '');
         const located = this.findByChannel(channelId);
-        if (!located) return { success: false, error: `channel ${channelId} is not tuned out`, isError: false };
+        if (!located) return { success: false, error: `channel ${channelId} is not tuned out`, isError: true };
         const note = typeof input.text === 'string' && input.text.trim() ? input.text.trim() : undefined;
         const result = this.cancel(located.serverId, channelId, 'subconscious', 'subconscious judgment', note);
         return result.ok
           ? { success: true, data: { cancelled: true } }
-          : { success: false, error: result.error, isError: false };
+          : { success: false, error: result.error, isError: true };
       }
       case 'note_disposition': {
         const key = String(input.key ?? '').trim();
-        if (!key) return { success: false, error: 'key required', isError: false };
+        if (!key) return { success: false, error: 'key required', isError: true };
         this.noteDisposition(key, String(input.text ?? ''));
         return { success: true, data: { noted: key } };
       }
@@ -515,13 +515,13 @@ export class TuneOutCoordinator {
         if (!this.hooks.allowChannelSpeech()) {
           return {
             success: false,
-            isError: false,
+            isError: true,
             error: 'channel speech is disabled for the subconscious (recipe: subconscious.allowChannelSpeech)',
           };
         }
         const channelId = String(input.channelId ?? '');
         const text = String(input.text ?? '').trim();
-        if (!text) return { success: false, error: 'empty message', isError: false };
+        if (!text) return { success: false, error: 'empty message', isError: true };
         return this.channelRegistry.publishForAgent(channelId, text, this.hooks.subconsciousName() ?? 'Subconscious');
       }
       default:

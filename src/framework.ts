@@ -18692,12 +18692,12 @@ export class AgentFramework {
       .find((e) => e.descriptor.id === channelId);
     let result: { success: boolean; data?: unknown; error?: string; isError?: boolean };
     if (!entry) {
-      result = { success: false, error: `unknown channel: ${channelId}`, isError: false };
+      result = { success: false, error: `unknown channel: ${channelId}`, isError: true };
     } else if (input.mode === 'cancel') {
       const r = coordinator.cancel(entry.serverId, channelId, 'agent-tool', 'agent request');
       result = r.ok
         ? { success: true, data: { cancelled: channelId } }
-        : { success: false, error: r.error, isError: false };
+        : { success: false, error: r.error, isError: true };
     } else {
       const r = coordinator.enter(entry.serverId, channelId, {
         cadenceSeconds: input.cadenceSeconds,
@@ -18715,7 +18715,7 @@ export class AgentFramework {
               maxWakes: r.params.maxWakes,
             },
           }
-        : { success: false, error: r.error, isError: false };
+        : { success: false, error: r.error, isError: true };
     }
     this.pushEvent({
       type: 'tool-result',

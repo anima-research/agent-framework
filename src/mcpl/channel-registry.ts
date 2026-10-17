@@ -2670,11 +2670,13 @@ export class ChannelRegistry {
     // A tuned-out channel is transport-open but attention-diverted; a plain
     // open would silently discard the epoch (and its pending backlog dump).
     // Cancelling is the tune-out coordinator's flow, reached via its own
-    // tool — refuse with the pointer rather than eat the state.
+    // tool — refuse with the pointer rather than eat the state. As an error
+    // result, the agent reads the pointer itself; `data` names the refusal
+    // for an in-process caller.
     if (this.getDesiredState(entry.serverId, input.channelId) === 'tuned-out') {
       return {
         success: false,
-        isError: false,
+        isError: true,
         error:
           `Channel ${input.channelId} is tuned out. Cancel the tune-out ` +
           `(tune_out with mode: 'cancel') to resume normal attention — ` +
