@@ -52,9 +52,18 @@ agent (then notices append without waking, breaking any loop).
   unprefixed prose bounces and prefixed prose is deliberate.
 - The entire "which event may move the agent's voice" question.
 
-Explicit send tools (`send_message` etc.) are unchanged. Channel lifecycle
-invariants (send-opens-channel, subscribed⇒open) are unchanged — a `>>` send
-into a closed channel opens it, with the usual `[channels]` notice.
+Send tools (`send_message` etc.) and channel lifecycle work the same in
+explicit mode as in the other modes. A `>>` send into a closed channel opens
+it, with the usual `[channels]` notice, unless the agent closed or declined
+that channel itself, a module closed it, the agent tuned it out, or its server
+can't open channels: then it publishes there and leaves the channel as it is.
+Explicit mode has no `[delivered]` receipt, so where a turn's `>>` speech
+stayed in a channel the agent closed or declined, the turn ends with a
+`[closed channel]` line that says so, as a send tool's answer does, unless the
+agent has turned that note off (`agent_settings`' `closed_channel_note`).
+Speech still being delivered when the turn ends gets the line once it has been
+delivered. If another turn is under way by then, the line waits for that turn's
+next tool call, where that turn is shown it, or for its end.
 
 ## Teaching the grammar (teach-by-bounce)
 

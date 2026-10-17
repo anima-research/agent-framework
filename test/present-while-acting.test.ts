@@ -1485,22 +1485,27 @@ describe('present while acting', () => {
     });
   }
 
-  it("a send's engaged channel is recorded on the turn that sent, however late its open resolves", async () => {
+  it("a send's engaged channel is recorded on the turn that sent, however late its result lands", async () => {
     const sending = { engaged: new Set<string>() };
     const next = { engaged: new Set<string>() };
-    let resolveOpen!: (outcome: { status: string; channelId: string }) => void;
+    let resolveSend!: (result: { content: Array<{ type: string; text: string }> }) => void;
     const framework = bareFramework();
     framework.mcplServerRegistry = {
       getServer: (id: string) => id === 'chat' ? {
         id: 'chat',
-        sendToolsCall: async () => ({ content: [{ type: 'text', text: 'sent' }] }),
+        // The send stays in flight until the test lets it land.
+        sendToolsCall: () => new Promise((resolve) => { resolveSend = resolve; }),
       } : null,
     };
     framework.mcplServerConfigs = new Map([['chat', { id: 'chat', toolPrefix: 'chat' }]]);
     framework.mcplToolFeatureSets = new Map();
     framework.checkpointManager = null;
+    // The send resolves its target, and opens it if it's closed and the agent
+    // didn't close it: here it's open, so its answer carries no note either.
     framework.channelRegistry = {
-      openIfClosedForSend: () => new Promise((resolve) => { resolveOpen = resolve; }),
+      resolveSendTarget: (target: string) => target,
+      openForSpeech: async () => 'not-opened',
+      isChannelOpen: () => true,
     };
     framework.turnRouting = new Map([['assistant', sending]]);
     const results: unknown[] = [];
@@ -1509,11 +1514,11 @@ describe('present while acting', () => {
     framework.dispatchMcplToolCall('assistant', {
       id: 'send-1', name: 'chat--send_message', input: { channelId: 'discord:guild:portables', text: 'hi' },
     }, 'chat', 'chat');
-    await until(() => results.length > 0 && resolveOpen !== undefined, 'the send to finish');
+    await until(() => resolveSend !== undefined, 'the send to go out');
     // The turn that sent has ended, and the next turn is the agent's live routing.
     (framework.turnRouting as Map<string, unknown>).set('assistant', next);
-    resolveOpen({ status: 'already-open', channelId: 'discord:guild:portables' });
-    await until(() => sending.engaged.size > 0, 'the open to resolve');
+    resolveSend({ content: [{ type: 'text', text: 'sent' }] });
+    await until(() => results.length > 0, 'the send to land');
 
     assert.deepEqual([...sending.engaged], ['discord:guild:portables']);
     assert.deepEqual([...next.engaged], [], "the next turn didn't send there");

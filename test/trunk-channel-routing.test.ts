@@ -46,6 +46,7 @@ function internals(framework: AgentFramework) {
     ): { channelId: string; label?: string } | undefined;
     channelRegistry: unknown;
     handleMcplPushEvent(event: unknown): void;
+    handleMcplChannelIncoming(event: unknown): Promise<unknown>;
   };
 }
 
@@ -157,6 +158,7 @@ describe('Trunk channel routing (item-3 redux)', () => {
     i.channelRegistry = {
       ensureChannelRegistered: () => {},
       isChannelOpen: () => false,
+      speechOpens: () => true,
       getDescriptor: () => ({ capabilities: { history: { maxMessages: 80 } } }),
       stopAll: () => {},
     };
@@ -194,12 +196,56 @@ describe('Trunk channel routing (item-3 redux)', () => {
     assert.match(text, /optionally set acknowledge/);
     assert.match(text, /Doing nothing is also fine\./);
     // 2026-08-05 accuracy pass: the delivery model must be stated correctly —
-    // direct addresses still arrive; un-@'d follow-ups to a reply do not.
+    // direct addresses still arrive.
     assert.match(text, /address you directly/);
-    assert.match(text, /follow-ups to your reply will NOT reach you/);
+    // Here nobody decided to keep the channel closed, so a reply joins it, and
+    // the invitation says so, with how to reply without joining.
+    assert.match(text, /\n1\. Reply — write your reply this turn prefixed with ">>#portables"; it will be delivered there, and replying joins the channel, as option 2 does\. To reply without joining, decline it first \(option 3\): a channel you've declined stays closed when you speak there\.\n/);
+    assert.doesNotMatch(text, /Reply without joining|follow-ups to your reply will NOT reach you/);
     // No surface-tracked tally on this event → no missed-count sentence.
     assert.doesNotMatch(text, /passed there without you/);
     await framework.stop();
+  });
+
+  it('in a channel the agent closed or declined itself, the invitation offers a reply without joining', async () => {
+    const textOf = (framework: Awaited<ReturnType<typeof makeFramework>>) =>
+      framework.getAgent('scout')!.getContextManager().queryMessages({}).messages.at(-1)?.content
+        .filter((block): block is { type: 'text'; text: string } => block.type === 'text')
+        .map((block) => block.text)
+        .join('\n') ?? '';
+    const mention = (id: string) => ({
+      type: 'mcpl:push-event' as const,
+      serverId: 'discord',
+      featureSet: 'discord.messaging',
+      eventId: `discord_msg_${id}`,
+      content: [{ type: 'text' as const, text: 'Antra: can you look at this?' }],
+      origin: { source: 'discord', messageId: id, mcplChannelId: 'discord:G1:C7', channelName: 'portables' },
+      tags: ['chat:mention', 'chat:addressed'],
+      timestamp: new Date().toISOString(),
+      inferenceId: `i-${id}`,
+      triggerInference: false,
+    });
+    for (const target of ['#portables', undefined]) {
+      const framework = await makeFramework();
+      const asked: string[] = [];
+      internals(framework).channelRegistry = {
+        ensureChannelRegistered: () => {},
+        isChannelOpen: () => false,
+        // A reply leaves this channel closed: the agent closed or declined it.
+        speechOpens: (serverId: string, channelId: string) => { asked.push(`${serverId}/${channelId}`); return false; },
+        getDescriptor: () => ({ capabilities: { history: { maxMessages: 80 } } }),
+        proseTargetFor: () => target,
+        stopAll: () => {},
+      };
+      internals(framework).handleMcplPushEvent(mention(`m-${target ?? 'none'}`));
+      const text = textOf(framework);
+      assert.deepEqual(asked, ['discord/discord:G1:C7'], 'asked about this channel on the server it came from');
+      assert.match(text, target
+        ? /\n1\. Reply without joining — write your reply this turn prefixed with ">>#portables"; it will be delivered there\. Note: follow-ups to your reply will NOT reach you unless they @-mention you or use the reply feature on your message\.\n/
+        : /\n1\. Reply without joining — no single-word target reaches this channel unambiguously, so a ">>" prefix can't name it; check whether discord exposes a send tool that can address it\. Note: follow-ups to your reply will NOT reach you unless they @-mention you or use the reply feature on your message\.\n/);
+      assert.doesNotMatch(text, /joins the channel|decline it first/);
+      await framework.stop();
+    }
   });
 
   it('surfaces the missed-ambient tally in the closed-channel invitation', async () => {
@@ -208,6 +254,7 @@ describe('Trunk channel routing (item-3 redux)', () => {
     i.channelRegistry = {
       ensureChannelRegistered: () => {},
       isChannelOpen: () => false,
+      speechOpens: () => true,
       getDescriptor: () => ({ capabilities: { history: { maxMessages: 80 } } }),
       stopAll: () => {},
     };
@@ -273,6 +320,7 @@ describe('Trunk channel routing (item-3 redux)', () => {
     i.channelRegistry = {
       ensureChannelRegistered: () => {},
       isChannelOpen: () => false,
+      speechOpens: () => true,
       getDescriptor: () => ({ label: 'DM: _reim0n', capabilities: { history: { maxMessages: 80 } } }),
       proseTargetFor: (id: string, serverId?: string) => { asked.push(`${serverId}/${id}`); return '@_reim0n'; },
       stopAll: () => {},
@@ -291,6 +339,7 @@ describe('Trunk channel routing (item-3 redux)', () => {
     i2.channelRegistry = {
       ensureChannelRegistered: () => {},
       isChannelOpen: () => false,
+      speechOpens: () => true,
       getDescriptor: () => ({ label: 'DM: _reim0n', capabilities: { history: { maxMessages: 80 } } }),
       proseTargetFor: () => undefined,
       stopAll: () => {},
@@ -298,7 +347,10 @@ describe('Trunk channel routing (item-3 redux)', () => {
     i2.handleMcplPushEvent(dmEvent('m4'));
     const t2 = textOf(fw2);
     assert.doesNotMatch(t2, /prefixed with ">>/);
-    assert.match(t2, /Reply without joining isn't available here/);
+    assert.match(t2, /no single-word target reaches this channel unambiguously/);
+    assert.match(t2, /\n1\. Reply — no single-word target reaches this channel unambiguously/);
+    assert.match(t2, /check whether discord exposes a send tool that can address it\. Replying there joins the channel, as option 2 does\. To reply without joining, decline it first \(option 3\): a channel you've declined stays closed when you speak there\.\n/,
+      'the hint promises no tool, and says what replying does');
     assert.match(t2, /channel_open with channelId "discord:dm:1555"/, 'joining stays available');
     await fw2.stop();
 
@@ -308,12 +360,88 @@ describe('Trunk channel routing (item-3 redux)', () => {
     i3.channelRegistry = {
       ensureChannelRegistered: () => {},
       isChannelOpen: () => false,
+      speechOpens: () => true,
       getDescriptor: () => undefined,
       stopAll: () => {},
     };
     i3.handleMcplPushEvent(dmEvent('m5'));
     assert.match(textOf(fw3), /prefixed with ">>discord:dm:1555"/);
     await fw3.stop();
+  });
+
+  it('a direct message carries no invitation: all of a DM reaches the agent, open or closed', async () => {
+    // A DM registers closed, and stays closed until the agent answers it, or for good once the
+    // agent closes it. An invitation on its messages would repeat a block whose premise is false
+    // there: there is no other traffic to miss, and nothing to join.
+    const framework = await makeFramework();
+    const i = internals(framework);
+    i.channelRegistry = {
+      ensureChannelRegistered: () => {},
+      isChannelOpen: () => false,
+      speechOpens: () => true,
+      getDescriptor: () => ({ label: 'DM: _reim0n', capabilities: { history: { maxMessages: 80 } } }),
+      proseTargetFor: () => '@_reim0n',
+      stopAll: () => {},
+    };
+    i.handleMcplPushEvent({
+      type: 'mcpl:push-event',
+      serverId: 'discord',
+      featureSet: 'discord.messaging',
+      eventId: 'discord_msg_m6',
+      content: [{ type: 'text', text: '_reim0n: you there?' }],
+      origin: { source: 'discord', messageId: 'm6', mcplChannelId: 'discord:dm:1555', isDM: true, authorName: '_reim0n' },
+      // As discord-mcpl tags a DM, after the host's core-tag closure.
+      tags: ['chat:dm', 'chat:addressed', 'chat:private'],
+      timestamp: new Date().toISOString(),
+      inferenceId: 'i6',
+      triggerInference: false,
+    });
+    const text = framework.getAgent('scout')!.getContextManager().queryMessages({}).messages.at(-1)?.content
+      .filter((block): block is { type: 'text'; text: string } => block.type === 'text')
+      .map((block) => block.text)
+      .join('\n') ?? '';
+    assert.match(text, /you there\?/);
+    assert.doesNotMatch(text, /Channel invitation/);
+    await framework.stop();
+  });
+
+  it('on channels/incoming too, a mention in a closed channel is invited and a DM is not', async () => {
+    const framework = await makeFramework();
+    const i = internals(framework);
+    i.channelRegistry = {
+      ensureChannelRegistered: () => {},
+      isChannelOpen: () => false,
+      speechOpens: () => true,
+      getDesiredState: () => undefined,
+      getDescriptor: () => ({ capabilities: { history: { maxMessages: 80 } } }),
+      proseTargetFor: () => '#portables',
+      stopAll: () => {},
+    };
+    const lastText = () =>
+      framework.getAgent('scout')!.getContextManager().queryMessages({}).messages.at(-1)?.content
+        .filter((block): block is { type: 'text'; text: string } => block.type === 'text')
+        .map((block) => block.text)
+        .join('\n') ?? '';
+    const incomingOn = (channelId: string, text: string, tags: string[]) => i.handleMcplChannelIncoming({
+      type: 'mcpl:channel-incoming',
+      serverId: 'discord',
+      channelId,
+      messageId: `m-${Math.random().toString(36).slice(2)}`,
+      author: { id: 'U1', name: 'antra' },
+      content: [{ type: 'text', text }],
+      timestamp: new Date().toISOString(),
+      metadata: {},
+      tags,
+      triggerInference: false,
+    });
+
+    await incomingOn('discord:G1:C7', 'antra: a question for you', ['chat:mention', 'chat:addressed']);
+    assert.match(lastText(), /Channel invitation/, 'this path builds the invitation');
+
+    await incomingOn('discord:dm:1555', 'antra: and one in private', ['chat:dm', 'chat:addressed', 'chat:private']);
+    assert.match(lastText(), /one in private/);
+    assert.doesNotMatch(lastText(), /Channel invitation/);
+    await framework.stop();
   });
 
   it('a channel-incoming trunk turn records its triggering channel', async () => {
