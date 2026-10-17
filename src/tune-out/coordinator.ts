@@ -34,6 +34,20 @@ export const TUNE_OUT_DEFAULTS = {
  *  subconscious turn, and max-wakes counts invocations, not messages. */
 const WAKE_COALESCE_MS = 2_000;
 
+/** How long after an end time whose cancel threw the cancel is tried again. */
+const EXPIRY_RETRY_MS = 60_000;
+
+/** What a caught value says: an Error's message, or the value as a string. */
+function describeThrown(err: unknown): string {
+  if (err instanceof Error) return err.message;
+  try {
+    return String(err);
+  } catch {
+    // A value with no string form, such as an object with no prototype.
+    return Object.prototype.toString.call(err);
+  }
+}
+
 export interface TuneOutFrameworkHooks {
   /** Deliver a message into an agent's window (per-agent seam). */
   addMessage: (
@@ -65,9 +79,11 @@ export interface TuneOutFrameworkHooks {
 
 export class TuneOutCoordinator {
   private cadenceTimers = new Map<string, ReturnType<typeof setTimeout>>();
-  /** Each duration's pending expiry step (params.expiresAtMs). stop clears
-   *  it, cancel does while the registry still holds the tune-out, and the
-   *  channel's next enter does in any case. */
+  /** Each duration's pending timer: a step toward its end time
+   *  (params.expiresAtMs), or the retry of an end-time cancel that threw.
+   *  stop clears it, cancel does when it finds the tune-out in the registry,
+   *  the end time does when its cancel finds the tune-out already ended,
+   *  and the channel's next accepted enter does in any case. */
   private expiryTimers = new Map<string, ReturnType<typeof setTimeout>>();
   /** Channels with a wake invocation pending inside the coalescing window. */
   private pendingWakes = new Map<string, { count: number; timer: ReturnType<typeof setTimeout> }>();
@@ -111,9 +127,35 @@ export class TuneOutCoordinator {
     const key = this.key(serverId, channelId);
     const existing = this.expiryTimers.get(key);
     if (existing) clearTimeout(existing);
-    armAt(params.expiresAtMs, (timer) => { this.expiryTimers.set(key, timer); }, () => {
-      this.expiryTimers.delete(key);
-      this.cancel(serverId, channelId, 'duration', 'duration elapsed');
+    const hold = (timer: ReturnType<typeof setTimeout>): void => { this.expiryTimers.set(key, timer); };
+    const end = (): void => {
+      try {
+        // The retry is armed before the cancel, as the cadence arms its next
+        // period before its turn, so a cancel that throws is tried again. A
+        // cancel that ends the tune-out clears it with the channel's other
+        // timers, and so does finding the tune-out already ended.
+        hold(setTimeout(end, EXPIRY_RETRY_MS));
+        if (!this.cancel(serverId, channelId, 'duration', 'duration elapsed').ok) {
+          this.clearTimers(serverId, channelId);
+        }
+      } catch (err) {
+        this.timerFailed('expiry', serverId, channelId, err);
+      }
+    };
+    armAt(params.expiresAtMs, hold, end);
+  }
+
+  /** A timer callback's work threw. Report it on stderr and as a trace rather
+   *  than throw it into the event loop, where an uncaught exception ends the
+   *  host process. */
+  private timerFailed(timer: 'cadence' | 'wake' | 'expiry', serverId: string, channelId: string, err: unknown): void {
+    console.error(`[tune-out] the ${timer} timer for ${channelId} on ${serverId} failed:`, err);
+    this.hooks.emitTrace({
+      type: 'tune-out:timer-failed',
+      timer,
+      serverId,
+      channelId,
+      error: describeThrown(err),
     });
   }
 
@@ -359,11 +401,12 @@ export class TuneOutCoordinator {
         intent: 'suppressed-tuned-out',
       });
     } catch (err) {
+      console.error(`[tune-out] acknowledging ${messageId} in ${channelId} on ${serverId} failed:`, err);
       this.hooks.emitTrace({
         type: 'tune-out:ack-failed',
         serverId,
         channelId,
-        error: (err as Error).message,
+        error: describeThrown(err),
       });
     }
   }
@@ -377,14 +420,20 @@ export class TuneOutCoordinator {
     const key = this.key(serverId, channelId);
     const hold = (timer: ReturnType<typeof setTimeout>): void => { this.cadenceTimers.set(key, timer); };
     const tick = () => {
-      const state = this.channelRegistry.getTuneOutState(serverId, channelId);
-      if (!state) return; // cancelled meanwhile
-      const diverted = this.divertedSinceInvocation.get(key) ?? 0;
-      // An empty period needs no turn at all — skip silently.
-      if (diverted > 0) {
-        this.invokeSubconscious(serverId, channelId, 'cadence', diverted);
+      try {
+        const state = this.channelRegistry.getTuneOutState(serverId, channelId);
+        if (!state) return; // cancelled meanwhile
+        // The next period is armed before this one's turn, so a turn that
+        // fails can't end the cadence.
+        armAfter(cadenceSeconds * 1000, hold, tick);
+        const diverted = this.divertedSinceInvocation.get(key) ?? 0;
+        // An empty period needs no turn at all — skip silently.
+        if (diverted > 0) {
+          this.invokeSubconscious(serverId, channelId, 'cadence', diverted);
+        }
+      } catch (err) {
+        this.timerFailed('cadence', serverId, channelId, err);
       }
-      armAfter(cadenceSeconds * 1000, hold, tick);
     };
     armAfter(cadenceSeconds * 1000, hold, tick);
   }
@@ -417,21 +466,25 @@ export class TuneOutCoordinator {
       return;
     }
     const timer = setTimeout(() => {
-      const entry = this.pendingWakes.get(key);
-      this.pendingWakes.delete(key);
-      // Count ONE durable wake per coalesced invocation.
-      const counted = this.channelRegistry.recordTuneOutWake(serverId, channelId);
-      if (!counted) return; // cancelled inside the window
-      if (counted.wakeCount > counted.params.maxWakes) {
-        this.cancel(
-          serverId,
-          channelId,
-          'tune-out-max-wakes',
-          `wake budget exhausted (${counted.params.maxWakes})`,
-        );
-        return;
+      try {
+        const entry = this.pendingWakes.get(key);
+        this.pendingWakes.delete(key);
+        // Count ONE durable wake per coalesced invocation.
+        const counted = this.channelRegistry.recordTuneOutWake(serverId, channelId);
+        if (!counted) return; // cancelled inside the window
+        if (counted.wakeCount > counted.params.maxWakes) {
+          this.cancel(
+            serverId,
+            channelId,
+            'tune-out-max-wakes',
+            `wake budget exhausted (${counted.params.maxWakes})`,
+          );
+          return;
+        }
+        this.invokeSubconscious(serverId, channelId, 'wake', entry?.count ?? 1);
+      } catch (err) {
+        this.timerFailed('wake', serverId, channelId, err);
       }
-      this.invokeSubconscious(serverId, channelId, 'wake', entry?.count ?? 1);
     }, WAKE_COALESCE_MS);
     this.pendingWakes.set(key, { count: 1, timer });
   }
@@ -450,7 +503,6 @@ export class TuneOutCoordinator {
     const subName = this.hooks.subconsciousName();
     if (!subName) return;
     const key = this.key(serverId, channelId);
-    this.divertedSinceInvocation.set(key, 0);
 
     const notice = trigger === 'wake'
       ? `[Tune-out wake: ${channelId} — ${count} addressed message${count === 1 ? '' : 's'}]`
@@ -462,6 +514,9 @@ export class TuneOutCoordinator {
       subName,
     );
     this.hooks.requestInference(subName, `tune-out ${trigger}: ${channelId}`, 'tune-out');
+    // Counted from here only once the turn has been asked for, so a turn that
+    // throws leaves its messages for the next period's turn.
+    this.divertedSinceInvocation.set(key, 0);
   }
 
   // ==========================================================================
