@@ -12879,9 +12879,10 @@ export class AgentFramework {
     const refusedWakeRounds = new Set<number>();
     let toolRounds = 0;
     // A refused skip_reply silences only its own round: the silence before it,
-    // saved as its round is dispatched, comes back at the next round or at
-    // 'complete'. It's this stream's: a budget restart starts from its
-    // trigger, and a tool-result-guard retry takes the turn's silence as
+    // saved as its round is routed (once its calls are dispatched, or, for a
+    // round that waits on scripts, once they return), comes back at the next
+    // round or at 'complete'. It's this stream's: a budget restart starts from
+    // its trigger, and a tool-result-guard retry takes the turn's silence as
     // 'complete' restored it, through guardRetryTurnSilenced.
     let silenceBeforeRefusal: boolean | undefined;
 
