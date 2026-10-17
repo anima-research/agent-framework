@@ -203,15 +203,16 @@ class InboxModule implements Module {
  *  through a fresh compile (physicalWindowTokens, #92). */
 class BlobToolModule implements Module {
   readonly name = 'canned';
-  /** Runs while the tool runs, with the turn alive. */
-  constructor(private readonly duringCall?: () => void) {}
+  /** Runs while the tool runs, with the turn alive; the tool waits for what
+   *  it returns. */
+  constructor(private readonly duringCall?: () => unknown) {}
   async start(): Promise<void> {}
   async stop(): Promise<void> {}
   getTools(): ToolDefinition[] {
     return [{ name: 'fetch', description: 'blob', inputSchema: { type: 'object', properties: {} } }];
   }
   async handleToolCall(): Promise<ToolResult> {
-    this.duringCall?.();
+    await this.duringCall?.();
     return { success: true, data: { blob: 'x'.repeat(30_000) } };
   }
   async onProcess(event: ProcessEvent): Promise<EventResponse> {
@@ -242,8 +243,9 @@ function nearCapToolResponse() {
 async function heldRestart(texts: string[], options: {
   /** The restart's compile fits from the start, so nothing is held. */
   fits?: boolean;
-  /** Runs while the first round's tool runs, with the turn alive. */
-  duringTool?: (internal: Internal) => void;
+  /** Runs while the tool runs, the first round's or a puppeted call's; the
+   *  tool waits for what it returns. */
+  duringTool?: (internal: Internal) => unknown;
   inferencePolicy?: InferencePolicy;
 } = {}) {
   const proto = ContextManager.prototype as unknown as Patchable;
@@ -1766,10 +1768,14 @@ describe('a compile refused for budget holds its turn (#304)', () => {
     const t = await heldRestart(['Answered after the restart']);
     try {
       assert.ok(await pollUntil(() => t.of('inference:held').length === 1, 10_000), 'the restart is held');
-      const status = await t.framework.quiesce({ reason: 'test', timeoutMs: 1_000 });
+      const { status, said } = await errorLines(async (lines) => ({
+        status: await t.framework.quiesce({ reason: 'test', timeoutMs: 1_000 }),
+        said: lines.filter((l) => l.startsWith('[host-mode] quiesced')),
+      }));
       assert.equal(status.drained, true, 'the held turn holds no turn token');
       // Asserted below, once the provider calls are.
       const heldAtQuiesce = status.heldTurns;
+      const saidAtQuiesce = said;
       assert.equal(t.membrane.calls.length, 1);
       t.fit();
       assert.ok(await pollUntil(() => t.of('inference:hold_ended').length === 1, 3_000), 'the context fits, and the hold ends');
@@ -1780,8 +1786,10 @@ describe('a compile refused for budget holds its turn (#304)', () => {
       assert.equal(t.membrane.calls.length, 1, 'no provider call after quiesce reported the host drained');
       assert.equal(t.framework.getHostModeStatus().gatedRequests, 1, 'the continuation is parked, as a wake is');
       assert.equal(heldAtQuiesce, 1, 'the status quiesce returned showed the held turn');
+      assert.deepEqual(saidAtQuiesce, ['[host-mode] quiesced — drained, 0 wake(s) parked, 1 turn(s) held for budget'], 'and so did its line');
       // A parked request isn't work for runUntilIdle while the host is
-      // quiesced: it returns at once, well inside this bound.
+      // quiesced, so it returns rather than waiting for resume; the bound
+      // only stops a regression from hanging the test.
       let bound: ReturnType<typeof setTimeout> | undefined;
       const idle = await Promise.race([
         t.framework.runUntilIdle().then(() => true),
@@ -1907,7 +1915,7 @@ describe('a compile refused for budget holds its turn (#304)', () => {
     });
   });
 
-  it('keeps the redo history: a held start gives back the redo its new work invalidated', async () => {
+  it('invalidates redo at a held start, as at any turn\'s first start, and leaves undo as it was', async () => {
     await withBacklog({ fit: true }, async (backlog) => {
       const t = await residentTurn({ maintenanceIntervalMs: 3_600_000 });
       try {
@@ -1919,7 +1927,10 @@ describe('a compile refused for budget holds its turn (#304)', () => {
         backlog.fit = false;
         t.send('Are you there?');
         assert.ok(await pollUntil(() => t.of('inference:held').length === 1, 5_000));
-        assert.deepEqual(t.framework.getUndoRedoState('prime'), before, 'the held start left undo and redo as they were');
+        // The held turn's input is stored, and a redo would move the store
+        // from under it.
+        assert.deepEqual(t.framework.getUndoRedoState('prime'), { ...before, canRedo: false, redoDepth: 0 },
+          'the held start invalidated redo and left undo as it was');
       } finally {
         await t.close();
       }
@@ -1962,6 +1973,41 @@ describe('a compile refused for budget holds its turn (#304)', () => {
       assert.deepEqual(started, [undefined], 'the turn it starts carries no mark, so nothing it retries is parked');
     } finally {
       releaseAux();
+      await t.close();
+    }
+  });
+
+  it('keeps a released budget restart from starting while a puppeted tool call holds the agent', async () => {
+    // Armed below: the puppeted call's tool waits for it.
+    let gate: Promise<void> | undefined;
+    let letGo = () => {};
+    const t = await heldRestart(['Answered after the restart'], { duringTool: () => gate });
+    const internals = t.framework as unknown as { processInferenceRequests: () => Promise<void> };
+    const pass = internals.processInferenceRequests.bind(t.framework);
+    let passes = 0;
+    internals.processInferenceRequests = () => { passes++; return pass(); };
+    let puppet: Promise<unknown> | undefined;
+    try {
+      assert.ok(await pollUntil(() => t.of('inference:held').length === 1, 10_000), 'the restart is held');
+      // The held agent is idle, so the puppeted call is admitted, and it
+      // holds the agent's turn token while its tool runs (#145).
+      gate = new Promise<void>((resolve) => { letGo = resolve; });
+      puppet = t.framework.puppetToolCall('prime', 'canned--fetch', {});
+      assert.ok(await pollUntil(() => t.internal.activeTurnTokens.has('prime'), 3_000), 'the puppeted call holds the agent');
+      t.fit();
+      assert.ok(await pollUntil(() => t.of('inference:hold_ended').length === 1, 3_000), 'the context fits, and the hold ends');
+      // The released restart continued a turn that gave its token back, so
+      // the scheduler keeps it queued behind the puppeted call, pass after pass.
+      const ended = passes;
+      assert.ok(await pollUntil(() => passes >= ended + 5 || t.membrane.calls.length > 1, 3_000));
+      assert.equal(t.membrane.calls.length, 1, 'no turn starts while the puppeted call holds the agent');
+      letGo();
+      await puppet;
+      assert.ok(await pollUntil(() => storedText(t.framework).includes('Answered after the restart'), 5_000), 'the restart runs once the call ends');
+      assert.equal(t.membrane.calls.length, 2);
+    } finally {
+      letGo();
+      await puppet?.catch(() => {});
       await t.close();
     }
   });
