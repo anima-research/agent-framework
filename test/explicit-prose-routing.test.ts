@@ -25,6 +25,7 @@ import type {
   InferenceRequest,
 } from '../src/index.js';
 import { AgentFramework } from '../src/index.js';
+import { ApiModule } from '../src/modules/api/index.js';
 import { MockMembrane, createMockResponse } from './helpers/mock-membrane.js';
 import { ProseStreamRouter } from '../src/mcpl/prose-stream-router.js';
 import { MembraneError } from '@animalabs/membrane';
@@ -1590,7 +1591,7 @@ describe('explicit prose routing', () => {
     const texts = framework.getAgent('assistant')!.getContextManager().getAllMessages()
       .flatMap(m => m.content).filter(b => b.type === 'text').map(b => (b as { text: string }).text);
     assert.ok(texts.includes(authored), 'authored prose remains in Chronicle');
-    assert.ok(texts.some(t => t.includes('[delivered] nothing') && t.includes('proseRouting=disabled')),
+    assert.ok(texts.some(t => t.includes('[delivered] shown on the attending surface; no automatic prose publish attempted') && t.includes('proseRouting=disabled')),
       'private suppression receipt explains the unsent prose');
 
     await framework.stop();
@@ -1615,7 +1616,7 @@ describe('explicit prose routing', () => {
     assert.equal(module.calls[0]!.name, 'say');
     const texts = framework.getAgent('assistant')!.getContextManager().getAllMessages()
       .flatMap(m => m.content).filter(b => b.type === 'text').map(b => (b as { text: string }).text);
-    assert.ok(texts.some(t => t.includes('[delivered] nothing') && t.includes('2 plain-speech segment(s) suppressed')),
+    assert.ok(texts.some(t => t.includes('[delivered] shown on the attending surface; no automatic prose publish attempted') && t.includes('2 plain-speech segment(s) suppressed')),
       'one receipt accounts for mid-turn and trailing prose');
 
     await framework.stop();
@@ -1912,5 +1913,40 @@ describe('explicit prose routing', () => {
       }
     });
   }
+
+  it('disabled context-budget continuation preserves its attending-surface receipt', async () => {
+    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'private continuation' }] as ContentBlock[]));
+    const framework = await createFramework('disabled');
+    stubRegistry(framework);
+    const agent = framework.getAgent('assistant')!;
+    await (framework as unknown as { startAgentStream(agent: unknown, trigger: unknown): Promise<void> })
+      .startAgentStream(agent, {
+        agentName: 'assistant', reason: 'context_budget_restart', source: 'framework', timestamp: Date.now(),
+        consoleAttendedOrigin: true,
+      });
+    await framework.runUntilIdle();
+    const texts = agent.getContextManager().getAllMessages().flatMap(m => m.content)
+      .filter(b => b.type === 'text').map(b => (b as { text: string }).text);
+    assert.ok(texts.some(t => t.includes('shown on the attending surface')
+      && t.includes('no automatic prose publish attempted')));
+    await framework.stop();
+  });
+
+  it('disabled api:inference-request is console-attended', async () => {
+    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'api reply' }] as ContentBlock[]));
+    const framework = await AgentFramework.create({
+      storePath: join(tempDir, 'api-test.chronicle'), membrane: membrane.asMembrane(),
+      agents: [{ name: 'assistant', model: 'test-model', systemPrompt: 'test', proseRouting: 'disabled' }],
+      modules: [new ApiModule()],
+    });
+    stubRegistry(framework);
+    framework.pushEvent({ type: 'api:inference-request', agentName: 'assistant' } as never);
+    await framework.runUntilIdle();
+    const texts = framework.getAgent('assistant')!.getContextManager().getAllMessages().flatMap(m => m.content)
+      .filter(b => b.type === 'text').map(b => (b as { text: string }).text);
+    assert.ok(texts.some(t => t.includes('shown on the attending surface')
+      && t.includes('no automatic prose publish attempted')));
+    await framework.stop();
+  });
 
 });

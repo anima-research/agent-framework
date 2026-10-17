@@ -144,6 +144,44 @@ describe('Turn trigger provenance', () => {
     await framework.stop();
   });
 
+  it('a fresh mixed batch keeps console attendance from any request', async () => {
+    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'mixed reply' }]));
+    const framework = await makeFramework();
+    const i = internals(framework);
+    const captured = spy(framework);
+    const t = Date.now();
+    i.pendingRequests.push(
+      { agentName: 'scout', reason: 'mcpl:channel-incoming', source: 'discord', timestamp: t,
+        channelId: 'discord:g:room', addressed: true },
+      { agentName: 'scout', reason: 'api:message', source: 'unknown', timestamp: t + 1,
+        consoleAttendedOrigin: true },
+    );
+    await i.processInferenceRequests();
+    await framework.runUntilIdle();
+    assert.equal(captured.handed?.consoleAttendedOrigin, true);
+    assert.equal(captured.handed?.channelId, 'discord:g:room');
+    await framework.stop();
+  });
+
+  it('a context-budget continuation preserves its original console-attended value', async () => {
+    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'continuing' }]));
+    const framework = await makeFramework();
+    const i = internals(framework);
+    const captured = spy(framework);
+    const t = Date.now();
+    i.pendingRequests.push(
+      { agentName: 'scout', reason: 'api:message', source: 'unknown', timestamp: t,
+        consoleAttendedOrigin: true },
+      { agentName: 'scout', reason: 'context_budget_restart', source: 'framework', timestamp: t + 1,
+        consoleAttendedOrigin: false },
+    );
+    await i.processInferenceRequests();
+    await framework.runUntilIdle();
+    assert.equal(captured.handed?.reason, 'context_budget_restart');
+    assert.equal(captured.handed?.consoleAttendedOrigin, false);
+    await framework.stop();
+  });
+
   it('a context-budget restart keeps the channel for routing but names no author', async () => {
     membrane.pushResponse(createMockResponse([{ type: 'text', text: 'continuing' }]));
     const framework = await makeFramework();
