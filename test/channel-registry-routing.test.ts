@@ -636,6 +636,12 @@ test("openForSpeech opens a closed channel nobody decided to keep closed, and le
   assert.equal(registry.getDesiredState('discord', 'decided-open'), 'open');
   assert.equal(registry.getDesiredState('discord', 'tuned-out'), 'tuned-out', 'the tune-out stands');
   assert.equal(registry.closedByAgent('discord', 'agent-closed'), 'closed');
+  // Opened again by speech, the agent's own open keeps its source, so a machine's close still can't override it.
+  const gc = await registry.handleChannelToolCall(
+    'channel_close', { channelId: 'decided-open', source: 'subscription-gc' }, { kind: 'module', moduleName: 'subscription-gc' });
+  assert.equal(gc.success, false);
+  assert.equal((gc.data as { refusal?: string } | undefined)?.refusal, 'explicit-open');
+  assert.equal(registry.isChannelOpen('decided-open'), true);
 });
 
 test('policy admissions are announced to the agent exactly once, as one batch', async () => {
