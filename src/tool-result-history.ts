@@ -11,7 +11,10 @@
  *
  * For MCP-shaped content arrays, this helper keeps text blocks verbatim and
  * replaces image blocks with a short `[image: mimeType, ~NKB]` placeholder.
- * For anything else it falls back to JSON.
+ * For anything else it falls back to JSON, written by RFC-005's rules at
+ * every depth (historyJson): a reference is shown as its stub wherever it
+ * sits in the data, so its uri never reaches history, and inline data that
+ * claims a uri or a disposition is withheld.
  */
 
 import { INLINE_WITHHELD_TEXT, isInlineContradiction, referenceStubOrNull } from './mcpl/references.js';
@@ -54,7 +57,7 @@ export function toolResultDataToHistoryString(
   const fromArray = tryHistoryStringFromContentArray(data, options);
   // JSON leaves out undefined, a function and a symbol: a result with no data
   // is stored as no text, as an empty content array is.
-  const str = fromArray ?? (JSON.stringify(data) as string | undefined) ?? '';
+  const str = fromArray ?? historyJson(data) ?? '';
   return maxChars ? truncateForHistory(str, maxChars) : str;
 }
 
@@ -93,7 +96,8 @@ export function truncateForHistory(str: string, maxChars: number): string {
 /**
  * If `data` is an MCP content array whose every block has a shape we
  * recognize, return a history-safe string (images → placeholders). Otherwise
- * return `null` to defer to the caller's fallback (JSON, usually).
+ * return `null` to defer to the fallback, historyJson, which shows a
+ * reference anywhere in the data as its stub.
  */
 function tryHistoryStringFromContentArray(data: unknown, options?: HistorySerializeOptions): string | null {
   if (!Array.isArray(data)) return null;
@@ -126,6 +130,75 @@ function tryHistoryStringFromContentArray(data: unknown, options?: HistorySerial
     }
   }
   return parts.join('\n');
+}
+
+/**
+ * Whether RFC-005 governs a value of a tool result's data, wherever it sits.
+ * A reference is a `resource` with a uri, at its top level or under
+ * `resource` (where MCP embeds a resource's uri), or an `image` or `audio`
+ * given by uri; inline data is an `image` or `audio` whose data is a string.
+ * A uri that is null, absent or empty counts as none, and data that isn't a
+ * string isn't inline data, so a record that only shares one of those type
+ * names is data. A uri of any other value, string or not, counts, so a
+ * credential fails closed.
+ */
+function governedByRfc005(b: Record<string, unknown>): boolean {
+  if (b.type === 'resource') return hasUri(b.uri) || (isPlainRecord(b.resource) && hasUri(b.resource.uri));
+  if (b.type === 'image' || b.type === 'audio') return typeof b.data === 'string' || hasUri(b.uri);
+  return false;
+}
+
+function hasUri(value: unknown): boolean {
+  return value !== undefined && value !== null && value !== '';
+}
+
+function isPlainRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+/**
+ * A value of a tool result's data as history shows it, by RFC-005's rules,
+ * wherever it sits in the data. A value RFC-005 governs (governedByRfc005) is
+ * shown as the reference lanes show it: a reference as its stub, an invalid
+ * one (such as a uri that isn't a string, or MCP's embedded resource, whose
+ * uri isn't at its top level) as an unrecognized-block line, and inline data
+ * that also claims a uri or a disposition as withheld, so no uri is ever
+ * shown. Inline data that claims neither is itself, as is any other value:
+ * a block of another type keeps its fields, a `resource_link`'s uri among
+ * them, since RFC-005 governs references.
+ */
+function shownInHistory(value: unknown): unknown {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return value;
+  const b = value as Record<string, unknown>;
+  if (!governedByRfc005(b)) return value;
+  if ((b.type === 'image' || b.type === 'audio') && typeof b.data === 'string') {
+    // JSON writes every field, so here inline data beside a uri of any value
+    // is withheld, not only beside a string one as in the lanes, which show
+    // no uri: an object can carry a credential. An empty uri carries none.
+    return hasUri(b.uri) || b.disposition !== undefined ? INLINE_WITHHELD_TEXT : value;
+  }
+  return referenceStubOrNull(b, 'from tool result') ?? value;
+}
+
+/**
+ * The text RFC-005 shows a value of a tool result's data as, when it shows it
+ * as text rather than as its fields: a reference's stub, an invalid one's
+ * unrecognized-block line, or inline data withheld. Null for any other value.
+ */
+export function rfc005TextOf(value: unknown): string | null {
+  const shown = shownInHistory(value);
+  return shown !== value && typeof shown === 'string' ? shown : null;
+}
+
+/**
+ * JSON of a tool result's data with each value in it shown as history shows
+ * it (shownInHistory), at any depth. Data that is itself shown as text, such
+ * as a bare reference, is that text.
+ */
+function historyJson(data: unknown): string | undefined {
+  const root = shownInHistory(data);
+  if (root !== data && typeof root === 'string') return root;
+  return JSON.stringify(data, (_key, value: unknown) => shownInHistory(value)) as string | undefined;
 }
 
 function formatSize(bytes: number): string {

@@ -93,13 +93,21 @@ export function classifyBlock(block: unknown): BlockClassification {
         return { kind: 'inline', contradiction: block.disposition !== undefined || hasUri };
       }
       if (hasUri) return parseReferenceFields(block);
-      return { kind: 'invalid', reason: `${block.type} block with neither data nor uri` };
+      return { kind: 'invalid', reason: `${block.type} block ${mediaWithoutStringReason(block)}` };
     }
     case 'resource':
       return parseReferenceFields(block);
     default:
       return { kind: 'invalid', reason: `unknown block type: ${block.type}` };
   }
+}
+
+/** What a media block with neither string data nor a string uri has instead:
+ *  nothing, or a field that isn't a string. */
+function mediaWithoutStringReason(block: Record<string, unknown>): string {
+  const notString = (['data', 'uri'] as const).filter((f) => block[f] !== undefined && block[f] !== null);
+  if (notString.length === 0) return 'with neither data nor uri';
+  return notString.length === 2 ? "whose data and uri aren't strings" : `whose ${notString[0]} isn't a string`;
 }
 
 function parseReferenceFields(block: Record<string, unknown>): BlockClassification {
@@ -140,7 +148,7 @@ export function isInlineContradiction(block: unknown): boolean {
 }
 
 export const INLINE_WITHHELD_TEXT =
-  '[inline content withheld: nonconformant bulk disposition on inline data]';
+  '[inline content withheld: inline data that also claims a uri or a bulk disposition]';
 
 /**
  * Why a reference counts as expired, or null when it doesn't: its expiresAt
