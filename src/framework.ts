@@ -4362,14 +4362,12 @@ export class AgentFramework {
     for (const tool of this.moduleRegistry.getAllTools()) {
       sources.set(tool.name, `Module: ${tool.name.split('--')[0]}`);
     }
-    // Use registered server prefixes, not a guess from a conventional mcpl-- name.
+    // An MCPL tool's source is the server a call of it reaches (resolveMcplTool),
+    // not the first configured prefix it begins with: prefixes can nest.
     for (const tool of tools) {
-      for (const config of this.mcplServerConfigs.values()) {
-        if (tool.name.startsWith((config.toolPrefix ?? `mcpl--${config.id}`) + '--')) {
-          sources.set(tool.name, `MCPL server: ${config.id}`); break;
-        }
-      }
-      if (!sources.has(tool.name)) sources.set(tool.name, 'Framework');
+      const mcpl = this.resolveMcplTool(tool.name);
+      if (mcpl) sources.set(tool.name, `MCPL server: ${mcpl[0]}`);
+      else if (!sources.has(tool.name)) sources.set(tool.name, 'Framework');
     }
     return presentation.resolve(tools, sources);
   }
@@ -14017,17 +14015,12 @@ export class AgentFramework {
       return this.runCodeExecution(call.callerAgentName ?? '__ephemeral__', call);
     }
 
-    // MCPL tools are dispatched via the MCPL subsystem
+    // MCPL tools go where the model's own call of the name goes, by the same
+    // resolver and with the prefix it matched: to the server whose listing
+    // offers the name, else the longest matching prefix.
     if (this.mcplServerRegistry) {
-      // Check if this is an MCPL-prefixed tool
-      const prefix = call.name.split('--').slice(0, -1).join('--');
-      const serverConfigs = this.mcplServerConfigs;
-      for (const [, config] of serverConfigs) {
-        const toolPrefix = config.toolPrefix ?? `mcpl--${config.id}`;
-        if (call.name.startsWith(toolPrefix + '--')) {
-          return this.executeMcplToolCall(call, config);
-        }
-      }
+      const mcpl = this.resolveMcplTool(call.name);
+      if (mcpl) return this.executeMcplToolCall(call, mcpl[0], mcpl[1]);
     }
 
     // Synthesized channel tools. This route was missing: when
@@ -14056,17 +14049,17 @@ export class AgentFramework {
     return this.moduleRegistry.handleToolCall(call);
   }
 
-  private async executeMcplToolCall(call: ToolCall, config: McplServerConfig): Promise<ToolResult> {
+  /** A programmatic call of an MCPL tool: `serverId` and `prefix` as resolveMcplTool matched them. */
+  private async executeMcplToolCall(call: ToolCall, serverId: string, prefix: string): Promise<ToolResult> {
     if (!this.mcplServerRegistry) {
       return { success: false, error: 'MCPL not initialized', isError: true };
     }
-    const server = this.mcplServerRegistry.getServer(config.id);
+    const server = this.mcplServerRegistry.getServer(serverId);
     if (!server) {
-      return { success: false, error: `MCPL server ${config.id} not found`, isError: true };
+      return { success: false, error: `MCPL server ${serverId} not found`, isError: true };
     }
-    const prefix = config.toolPrefix ?? `mcpl--${config.id}`;
     const toolName = call.name.slice(prefix.length + 2); // Strip prefix + '--'
-    if (!isToolAllowed(toolName, config)) {
+    if (!isToolAllowed(toolName, this.mcplServerConfigs.get(serverId))) {
       return {
         success: false,
         error: `Tool '${call.name}' is not permitted by this server's tool policy.`,
@@ -15161,9 +15154,10 @@ export class AgentFramework {
     // Tolerate partially-constructed frameworks (tests build them with
     // Object.create): nothing cached means nothing to forget.
     if (!this.mcplToolClasses?.size) return;
-    const prefix = this.mcplServerConfigs?.get(serverId)?.toolPrefix ?? `mcpl--${serverId}`;
-    for (const name of [...this.mcplToolClasses.keys()]) {
-      if (name.startsWith(`${prefix}--`)) this.mcplToolClasses.delete(name);
+    // The names the listing gives this server: its prefix alone would also
+    // take a nested prefix's (`foo` beside `foo--bar`).
+    for (const [name, owner] of this.mcplToolServers ?? []) {
+      if (owner === serverId) this.mcplToolClasses.delete(name);
     }
   }
 
@@ -15228,9 +15222,12 @@ export class AgentFramework {
   /**
    * Find the MCPL server for a tool: [serverId, prefix], or null.
    * Prefixes can nest (`foo` and `foo--bar`), so `foo--bar--x` can match
-   * both. The server whose tools/list produced the name decides; a name no
-   * live server listed (stale, or invented by the model) goes to the longest
-   * matching prefix. Never prefix-map insertion order.
+   * both. The tool listing decides: the server whose tools/list offered the
+   * name, after its tool policy, as of the last tool refresh (a server that
+   * closed since keeps its names until the next one). Where two servers list
+   * the same name, the listing holds the one listed last (#265). A name the
+   * listing doesn't hold (invented by the model, or no longer listed) goes to
+   * the longest matching prefix. Never prefix-map insertion order.
    */
   private resolveMcplTool(toolName: string): [string, string] | null {
     const listedBy = this.mcplToolServers?.get(toolName);
