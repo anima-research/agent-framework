@@ -11533,10 +11533,12 @@ export class AgentFramework {
   }
 
   /**
-   * Durable window notice for a channel the agent did not ask to open —
-   * subscription-policy admission, or an open forced by the agent's own
-   * delivery into a closed channel. The agent must always learn that new
-   * traffic will start flowing, and that `channel_close` opts out (their
+   * Durable window notice for a channel the agent did not ask to open: a
+   * subscription-policy admission, announced as the decision before its
+   * transport RPC (a failed open keeps the decision, and channel_list shows
+   * transport state), or an open that the agent's own delivery or reply
+   * caused (`opened-by-delivery`, `opened-by-reply`), once its transport is
+   * confirmed. Either way it names `channel_close` as the opt-out (their
    * decision outranks policy). System message: never triggers inference,
    * never conversational, never locus-eligible.
    */
@@ -11550,15 +11552,13 @@ export class AgentFramework {
       .map((c) => (c.label && c.label !== c.channelId ? `${c.label} (${c.channelId})` : c.channelId))
       .join(', ');
     const plural = channels.length > 1;
-    const causeText =
-      cause === 'subscription-policy'
-        ? 'your subscription policy just admitted ' + (plural ? 'them' : 'it')
-        : 'your own message into the closed channel engaged it';
-    const text =
-      `[channels] Now open: ${shown} — ${causeText}. Ongoing traffic from ` +
-      (plural ? 'these channels' : 'this channel') +
-      ` will reach you. If you don't want ${plural ? 'one of them' : 'it'}, use channel_close — ` +
-      'your choice sticks; neither policy nor a later send will silently reopen it.';
+    const text = (cause === 'subscription-policy'
+      ? `[channels] Selected for opening by subscription policy: ${shown}. ` +
+        'This records the admission decision; channel_list shows current transport state. ' +
+        'When open, ' + (plural ? 'their' : 'its') + ' ongoing traffic will reach you. '
+      : `[channels] Now open: ${shown}: your own message into the closed channel opened it. ` +
+        'Ongoing traffic from ' + (plural ? 'these channels' : 'this channel') + ' will reach you. ') +
+      `If you don't want ${plural ? 'one of them' : 'it'}, use channel_close; your choice outranks policy.`;
     try {
       // Through framework.addMessage for mid-turn safety (deferral +
       // hear-while-acting injection) — a delivery-forced open happens inside
@@ -18105,10 +18105,11 @@ export class AgentFramework {
   }
 
   /**
-   * Disconnect an MCPL server at runtime: close the connection, destroy its
-   * feature-set and checkpoint state (permanent removal — unlike a transient
-   * transport close, which preserves checkpoints for the reconnect), remove
-   * its channels from the registry, drop routing entries, and refresh tools.
+   * Disconnect an MCPL server at runtime: remove its channels from the
+   * registry (first, cancelling their queued lifecycle work), close the
+   * connection, destroy its feature-set and checkpoint state (permanent
+   * removal — unlike a transient transport close, which preserves checkpoints
+   * for the reconnect), drop routing entries, and refresh tools.
    * No-op-ish if the server is not connected (still clears routing state).
    */
   async disconnectMcplServer(id: string): Promise<void> {
@@ -18123,8 +18124,10 @@ export class AgentFramework {
     const config = this.mcplServerConfigs.get(id);
     const oldToolNames = new Set(this.mcplTools.map(t => t.name));
 
-    await this.mcplServerRegistry.removeServer(id);
+    // Channel entries go first: removing them cancels the server's queued
+    // lifecycle work, which must not run against the closing connection.
     this.channelRegistry?.removeServer(id);
+    await this.mcplServerRegistry.removeServer(id);
 
     // Permanent removal: also destroy feature-set and checkpoint state
     // explicitly. The 'close' handler usually does this, but a connection that
@@ -19000,9 +19003,11 @@ export class AgentFramework {
                 // Recorded here — not eagerly — because injection metadata
                 // carries the CANONICAL channel id (descriptor form), while
                 // send args often carry the raw provider id; this callback
-                // has the resolved form. The already-open path resolves on
+                // has the resolved form. A channel confirmed open resolves on
                 // the microtask queue, i.e. before the tool-result event
-                // that evaluates injections.
+                // that evaluates injections. One decided open whose transport
+                // is unconfirmed is opened again first, so its engagement is
+                // recorded when that open returns.
                 if (status !== 'unknown-channel' && status !== 'ambiguous') {
                   sendingTurn?.engaged.add(channelId ?? target);
                 }
@@ -19017,7 +19022,8 @@ export class AgentFramework {
                   );
                 } else if (status === 'open-failed') {
                   console.error(
-                    `[channel] ${agentName}: ${toolName} delivered to ${target} but the open-on-send failed — channel remains half-alive, will reconcile`,
+                    `[channel] ${agentName}: ${toolName} delivered to ${target} but the open-on-send failed; ` +
+                      'a later registration or delivery tries the open again',
                   );
                 }
               })
