@@ -12,7 +12,7 @@ import { McplServerConnection } from '../src/mcpl/server-connection.js';
 
 const missing = '/nonexistent/mcpl-server-that-is-not-here';
 
-test('spawn() rejects a command that cannot be spawned, naming the server and keeping the cause', async () => {
+test('spawn() rejects a command that cannot be spawned, naming the server and keeping the cause', { timeout: 10_000 }, async () => {
   await assert.rejects(StdioTransport.spawn({ id: 'missing', command: missing }), (err: Error) => {
     assert.equal(err.message, `MCPL server "missing" could not be started: spawn ${missing} ENOENT`);
     assert.equal((err.cause as NodeJS.ErrnoException | undefined)?.code, 'ENOENT');
@@ -20,7 +20,7 @@ test('spawn() rejects a command that cannot be spawned, naming the server and ke
   });
 });
 
-test('spawn() rejects a config without a command', async () => {
+test('spawn() rejects a config without a command', { timeout: 10_000 }, async () => {
   await assert.rejects(
     StdioTransport.spawn({ id: 'commandless' }),
     /^Error: MCPL server "commandless": stdio transport requires "command" \(none provided\)$/,

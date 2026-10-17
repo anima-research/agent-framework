@@ -135,15 +135,23 @@ never do.
   (subsections emitted in `### Breaking` / `### Added` / `### Changed` /
   `### Fixed` order), deletes the consumed fragments, keeps a fresh empty
   `Unreleased` above, and refuses to release when there is nothing to
-  release; npm then commits and tags. `git push --follow-tags` triggers
-  CI, which refuses a tag with no matching changelog section, publishes
-  `@animalabs/agent-framework` to npm, and creates the GitHub release with
-  that section as its notes. The two release jobs are independent: some
-  consumers run github-clone checkouts, so release notes must exist even
-  when npm publish fails. Both need the build job, so a failed build stops
-  both; past it, so do a tag with no changelog section, which neither can
-  release, and an open release hold (below), which each checks. Version
-  bumps are a maintainer release-time action, not part of feature PRs.
+  release; npm then commits and tags. `git push --follow-tags` triggers CI,
+  which refuses a tag with no matching changelog section, checks in a job
+  of its own that the packed release installs on its own
+  (`node scripts/pack-installs-alone.mjs` packs it, installs the tarball
+  alone into an empty directory with its dependencies from npm, nested so
+  the package reaches only its own, and checks the installed package, as
+  the script's header lists; to run it by hand, `npm run build` first, for
+  example before `git push --follow-tags`, or dispatch the workflow on a
+  branch, where it publishes nothing), publishes
+  `@animalabs/agent-framework` to npm once that check has passed, and
+  creates the GitHub release with that section as its notes. The two
+  release jobs are independent: some consumers run github-clone checkouts,
+  so release notes must exist even when npm publish fails. Both need the
+  build job, so a failed build stops both; past it, so do a tag with no
+  changelog section, which neither can release, and an open release hold
+  (below), which each checks. Version bumps are a maintainer release-time
+  action, not part of feature PRs.
 - **Breaking changes.** A dependent's caret range takes the later
   versions of its line (0.22.x before 1.0, 1.x from 1.0, and 0.0.z alone),
   so a breaking change released as a patch reaches each dependent whose
@@ -194,7 +202,11 @@ branches. The `pretest` hook copies `test/fixtures/*.mjs` into `dist/`.
 
 Push-time CI (`ci.yml`) builds, typechecks and tests every push and PR on
 ubuntu and macos. Lockfiles are deliberately gitignored in this repo, so CI
-installs with plain `npm install` and there is no lock to keep in sync.
+installs with `npm install` rather than `npm ci`, and there is no lock to
+keep in sync. It also runs the pack check the publish workflow runs before
+publishing (`node scripts/pack-installs-alone.mjs`, on ubuntu, with bun set
+up), so a file left out of the package, or an import only `devDependencies`
+supply, fails the PR.
 
 When working against local sibling checkouts rather than published versions,
 see the ecosystem workspace setup — `bun install` at the `rust-connectome`

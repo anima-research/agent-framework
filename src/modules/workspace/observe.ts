@@ -1059,7 +1059,11 @@ export async function walkScope(
     }
   }
   // The cap stopped the walk only if it left something: a walk whose last
-  // file used up the cap covered its scope.
+  // file used up the cap covered its scope. A directory the walk didn't list
+  // counts as left, even one that holds nothing it would take (empty, or
+  // only ignored names): telling them apart would take another read. Such a
+  // walk keeps its place and reports the directory as not visited, and the
+  // next one lists it on its way to the wrap.
   if (left === 0 && lastTaken !== undefined && (holdingUntaken.size > 0 || unlisted > 0)) walk.stoppedAfter = lastTaken;
   return walk;
 }

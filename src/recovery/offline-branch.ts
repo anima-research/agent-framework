@@ -240,9 +240,7 @@ interface SuppressionInterval {
 
 interface MessageLocation {
   first: number;
-  last: number;
   firstId: StoredWindowMessage['id'];
-  lastId: StoredWindowMessage['id'];
   /** Usually one run; multiple runs tolerate duplicate external metadata. */
   runs: SuppressionInterval[];
 }
@@ -405,9 +403,7 @@ function buildSuppressionPlan(
         };
         locations.set(externalId, {
           first: index,
-          last: index,
           firstId: messages[i].id,
-          lastId: messages[i].id,
           runs: [run],
         });
       } else {
@@ -423,8 +419,6 @@ function buildSuppressionPlan(
             toId: messages[i].id,
           });
         }
-        location.last = index;
-        location.lastId = messages[i].id;
       }
     }
   }
@@ -447,12 +441,19 @@ function buildSuppressionPlan(
     const to = locations.get(range.toMessageId)!;
     const earlier = from.first <= to.first ? from : to;
     const later = from.first <= to.first ? to : from;
+    // What's between the two messages, after the earlier one began and
+    // before the later one began: from the earlier one's first stored copy
+    // through the later one's first. Each end is every copy of it besides,
+    // as a single suppression is, so a copy stored outside that span (a
+    // write cut short and retried later) is taken on its own, and nothing
+    // else stored after the later one began is taken.
     intervals.push({
       start: earlier.first,
-      end: later.last,
+      end: later.first,
       fromId: earlier.firstId,
-      toId: later.lastId,
+      toId: later.firstId,
     });
+    for (const end of [from, to]) intervals.push(...end.runs.map((run) => ({ ...run })));
   }
 
   intervals.sort((a, b) => a.start - b.start || a.end - b.end);

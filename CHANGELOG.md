@@ -711,7 +711,10 @@ framework.
     below 1, which its `reset.discardedMultiplier` shows. With the host
     stopped, reset the first kind's multiplier once, and re-stamp the second
     kind's checked value, as the **Operators** entry of context-manager
-    0.14.0's changelog describes.
+    0.14.0's changelog describes. The reset is for a store that already
+    opened on 0.14.0 and ran a committing compile, which re-stamped its
+    multiplier: `^0.14.0` now installs 0.14.1, which keeps a still-unstamped
+    multiplier provisional and replaces or drops it on its own.
   - **What else hosts meet with context-manager 0.14.0** (added after the
     release): a preview, or any compile made with `dryRun`, leaves the context
     manager's estimate, its calibration and a pending kv-unified draft's marker

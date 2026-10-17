@@ -190,6 +190,98 @@ test('offline recovery suppresses inclusive ranges in context order', async () =
   }
 });
 
+test('a suppressed range takes every copy of both its messages, and leaves what was stored after the later one began', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'offline-recovery-range-copies-'));
+  const storePath = join(dir, 'agent.chronicle');
+  try {
+    const store = JsStore.openOrCreate({ path: storePath });
+    const cm = await ContextManager.open({ store, namespace: 'agents/cairn' });
+    const add = (text: string, messageId: string) => cm.addMessage('user', [{ type: 'text', text }], {
+      serverId: 'discord', channelId: 'discord:g1:c1', messageId,
+    });
+    add('keep', 'm-keep');
+    // B was stored twice, a write cut short and retried, with Z between:
+    // Z came after B began, so it isn't between A and B.
+    add('A', 'm-a');
+    add('B, cut short', 'm-b');
+    add('Z', 'm-z');
+    add('B, retried', 'm-b');
+    // C's retry was stored after D and E: it goes too, on its own.
+    add('C, cut short', 'm-c');
+    add('D', 'm-d');
+    add('E', 'm-e');
+    add('C, retried', 'm-c');
+    add('current anchor', 'm-current');
+    cm.close();
+    store.close();
+
+    const result = await createOfflineRecoveryBranch({
+      storePath,
+      agentName: 'cairn',
+      messageId: 'm-current',
+      suppressRanges: [
+        { fromMessageId: 'm-a', toMessageId: 'm-b' },
+        { fromMessageId: 'm-d', toMessageId: 'm-c' },
+      ],
+      branchName: 'recovery/cairn/range-copies',
+    });
+
+    assert.equal(result.messagesSuppressed, 6);
+    assert.deepEqual(result.refs.map((ref) => ref.messageId), ['m-a', 'm-b', 'm-c', 'm-d']);
+    const recoveredStore = JsStore.openOrCreate({ path: storePath });
+    const recoveredCm = await ContextManager.open({ store: recoveredStore, namespace: 'agents/cairn' });
+    assert.deepEqual(
+      recoveredCm.getAllMessages().map((message) => message.metadata?.messageId),
+      ['m-keep', 'm-z', 'm-e', 'm-current'],
+    );
+    recoveredCm.close();
+    recoveredStore.close();
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('a suppressed range whose two messages are stored in shards takes each whole', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'offline-recovery-range-shards-'));
+  const storePath = join(dir, 'agent.chronicle');
+  try {
+    const store = JsStore.openOrCreate({ path: storePath });
+    const cm = await ContextManager.open({ store, namespace: 'agents/cairn' });
+    const add = (text: string, messageId: string) => cm.addMessage('user', [{ type: 'text', text }], {
+      serverId: 'discord', channelId: 'discord:g1:c1', messageId,
+    });
+    add('keep', 'm-keep');
+    // Each shard of a long message carries its Discord message id.
+    appendShards(cm, 'body-a', ['m-a', 'm-a']);
+    add('between', 'm-between');
+    appendShards(cm, 'body-b', ['m-b', 'm-b', 'm-b']);
+    add('after', 'm-after');
+    add('current anchor', 'm-current');
+    cm.close();
+    store.close();
+
+    const result = await createOfflineRecoveryBranch({
+      storePath,
+      agentName: 'cairn',
+      messageId: 'm-current',
+      suppressRanges: [{ fromMessageId: 'm-b', toMessageId: 'm-a' }],
+      branchName: 'recovery/cairn/range-shards',
+    });
+
+    assert.equal(result.messagesSuppressed, 6, 'both bodies, every shard, and what lies between');
+    const recoveredStore = JsStore.openOrCreate({ path: storePath });
+    const recoveredCm = await ContextManager.open({ store: recoveredStore, namespace: 'agents/cairn' });
+    assert.deepEqual(
+      recoveredCm.getAllMessages().map((message) => message.metadata?.messageId),
+      ['m-keep', 'm-after', 'm-current'],
+    );
+    recoveredCm.close();
+    recoveredStore.close();
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test('offline recovery accepts an exact internal context ID anchor', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'offline-recovery-context-id-'));
   const storePath = join(dir, 'agent.chronicle');
