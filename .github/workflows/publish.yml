@@ -53,16 +53,20 @@ jobs:
         run: npm test
 
   # The tarball npm publish makes from this tree, installed alone into an
-  # empty directory with its dependencies from npm (nested, so the package
-  # reaches only its own), and loaded under Node and under bun: a file
-  # missing from `files`, a dependency only devDependencies supplied, or a
-  # bin npm's link can't run fails here, not for whoever installs the
-  # release. A job of its own, so the install scripts it runs never see
-  # the publish job's id-token; publish needs it, the GitHub release notes
-  # don't. It runs on a dispatch too, which publishes nothing.
+  # empty directory with its dependencies from npm (linked, so each package
+  # reaches only the dependencies it declares), and loaded under Node and
+  # under bun: a file missing from `files`, a dependency only
+  # devDependencies supplied, or a bin npm's link can't run fails here, not
+  # for whoever installs the release. A job of its own, so the install
+  # scripts it runs never see the publish job's id-token; publish needs it,
+  # the GitHub release notes don't. Dispatched on a branch, it runs too,
+  # and nothing is published. The job stops at 40 minutes, not at GitHub's
+  # 6 hours: above the check's own limits (10 minutes each for npm pack and
+  # npm install, a minute for each load), so the check names what hung.
   pack-check:
     name: Packed release installs on its own
     runs-on: ubuntu-latest
+    timeout-minutes: 40
     permissions:
       contents: read
 
