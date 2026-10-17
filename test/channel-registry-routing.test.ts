@@ -587,6 +587,21 @@ test("channel_close's description says the close stands against speech and polic
     /It stays closed until you open it with channel_open: neither speaking there nor subscription policy reopens it\.$/);
 });
 
+test("a module's close naming a source outside the machine vocabulary is refused on a channel that's already closed too", async () => {
+  const { registry } = makeRegistry({ delivered: true });
+  await registry.handleChanged('discord', {
+    added: [{ id: 'shut', type: 'discord', label: '#shut', direction: 'bidirectional' }],
+  } as never);
+  const agent = { kind: 'agent' as const, agentName: 'sol' };
+  assert.equal((await registry.handleChannelToolCall('channel_close', { channelId: 'shut' }, agent)).success, true);
+  // main answered "already closed" here, before looking at the source.
+  const refused = await registry.handleChannelToolCall(
+    'channel_close', { channelId: 'shut', source: 'gremlin-module' }, { kind: 'module', moduleName: 'gremlin' });
+  assert.equal(refused.success, false);
+  assert.match(refused.error ?? '', /Unknown machine close source/);
+  assert.equal(registry.closedByAgent('discord', 'shut'), 'closed', "the agent's close stays on record");
+});
+
 test("a module's close, made with no machine source, is the module's: speech leaves it closed, and it isn't the agent's", async () => {
   const { registry, openCalls, publishCalls } = makeRegistry({ delivered: true });
   await registry.handleChanged('discord', {
