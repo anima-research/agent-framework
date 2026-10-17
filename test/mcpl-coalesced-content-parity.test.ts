@@ -145,6 +145,8 @@ test('#266: a coalescer failure is traced as the host\'s (coalesce-failed), as t
   assert.deepEqual(channel.result.results[0], { messageId: 'fine', accepted: false, reason: 'coalescer_broke' }, 'the wire calls it a failure');
   const push = await f.send('push/event', f.params('p1', 'fine_push', { initial: true }));
   assert.equal(push.error?.code, -32603, 'the wire calls it a failure');
+  // The push handler answers a failure itself, with its own message, as in 0.22.x.
+  assert.equal(push.error?.message, 'coalescer_broke');
   assert.deepEqual(
     rejected.map(({ type, reason, detail }) => ({ type, reason, detail })),
     [

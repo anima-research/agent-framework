@@ -571,6 +571,47 @@ export type TraceEvent =
       hint: string;
     })
   | (TraceEventBase & {
+      /** An inbound RPC request/notification handler failed: it threw or
+       *  rejected, or it resolved after a reply write of its own failed or
+       *  after it tried to answer a second time. */
+      type: 'mcpl:request-handler-error';
+      serverId: string;
+      /** Connection event name, e.g. channels-register or push-event. */
+      event: string;
+      /** The request's id when it is a number, or a string id bounded as the
+       *  other texts here are: control, format and line-separator characters
+       *  replaced, and cut after 500 code points, with "…" marking the cut.
+       *  Absent for a notification, for a request whose id is neither, and
+       *  for a request form of mcpl/manifestChanged or
+       *  notifications/tools/list_changed, which is answered as it's admitted
+       *  and then handled as the notification is. */
+      requestId?: string | number;
+      /** Whether a reply write of the handler's returned: true once one
+       *  did. On a connection that had already closed, that write dropped
+       *  the reply, as the connection then drops every reply, so nothing
+       *  reached the server. A write that throws, as one that can't be
+       *  encoded does, sends nothing. When it's false and the responder
+       *  can send an error reply (it has respondError), the host sent -32603
+       *  "Internal error" itself, or -32000 while it stops, unless
+       *  `responseError` says that reply failed. A connection that has
+       *  already closed drops that reply, as it drops every reply, with no
+       *  `responseError`. */
+      responseAttempted: boolean;
+      /** The handler's own error when it threw or rejected; otherwise the
+       *  reply write that failed and that it swallowed, or that it tried to
+       *  answer a second time. */
+      error: string;
+      /** A reply write that failed, when the handler then failed with an
+       *  error of its own (which is `error`). */
+      responseFailure?: string;
+      /** What the handler tried to send after a reply was already attempted:
+       *  refused, never written. A result, or an error reply with its code
+       *  and (bounded) message. */
+      refusedResponse?: { kind: 'result' } | { kind: 'error'; code: number; message: string };
+      /** Failure while trying to send the internal-error response. */
+      responseError?: string;
+    })
+  | (TraceEventBase & {
       type: 'mcpl:orphaned-response';
       serverId: string;
       /** The JSON-RPC id of the late response whose pending request already timed out. */

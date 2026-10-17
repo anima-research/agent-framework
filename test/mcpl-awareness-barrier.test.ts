@@ -888,6 +888,10 @@ test('an inbound handler waiting on a generation that fails refuses its request 
   // its marks were not all attempted: nothing that waited behind it may run,
   // and each request is answered with the failure rather than left waiting.
   const framework = Object.create(AgentFramework.prototype) as any;
+  // Each refused request is reported as a handler failure, through
+  // emitTrace, which iterates the trace listeners a constructed framework
+  // always has (#318's registrations, which onTrace makes).
+  framework.traceListeners = [];
   const failing = deferred<any>();
   framework.discordAwarenessBarrier = { generation: 1, requiresBarrier: true, promise: failing.promise };
   const handled: string[] = [];
