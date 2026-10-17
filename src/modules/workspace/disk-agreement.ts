@@ -15,7 +15,9 @@
  * that isn't that directory any more (an unmounted drive whose mountpoint is
  * now empty, a replaced directory) is an unavailable mount, never a disk on
  * which every file was deleted; only an explicit acceptance takes it, and
- * that starts its evidence afresh.
+ * that starts its evidence afresh. A place, where a walk stopped (`walks`),
+ * binds no root: it only says where the next walk starts, in whatever
+ * directory the root is by then.
  *
  * Every transition is write-ahead (see reconcile.ts): an `intent` entry
  * (`pending`, with the prior value and the expected one) is durable before the
@@ -92,16 +94,30 @@ type JournalEntry =
   /** The root's identity; with `reset`, an accepted new root, whose evidence starts empty. */
   | { t: 'root'; mount: string; identity: RootIdentity; reset?: true }
   | { t: 'set'; mount: string; path: string; value: Physical }
-  | { t: 'forget'; mount: string; path: string };
+  | { t: 'forget'; mount: string; path: string }
+  /**
+   * Where a capped walk of `scope` stopped (the last entry it took), or null
+   * once a walk covered the scope. It carries no `path` field: agent-framework
+   * 0.22 replays an entry it doesn't know as a `forget` of `entry.path`, and
+   * so leaves the evidence alone when there is none.
+   */
+  | { t: 'walk'; mount: string; scope: string; after: string | null };
 
 interface MountEvidence {
   root: string;
   identity?: RootIdentity;
   paths: Map<string, Physical>;
+  /** By scope ('' for the mount root): where the next walk of it resumes. */
+  walks: Map<string, string>;
 }
 
 interface Snapshot {
-  mounts: Record<string, { root: string; identity?: RootIdentity; paths: Record<string, Physical> }>;
+  mounts: Record<string, {
+    root: string;
+    identity?: RootIdentity;
+    paths: Record<string, Physical>;
+    walks?: Record<string, string>;
+  }>;
 }
 
 export const DISK_AGREEMENT_RECORD_TYPE = 'workspace/disk-agreement';
@@ -123,9 +139,10 @@ export class DiskAgreement {
   private readonly mounts = new Map<string, MountEvidence>();
   private configured: Array<{ name: string; root: string }> = [];
   /**
-   * An append (or a rebuild) not yet made durable. Cleared only by a
-   * barrier that succeeds, so a failed barrier stays owed: a later pass with
-   * nothing new to record still settles it before deciding anything.
+   * An append of evidence (or a rebuild) not yet made durable. Cleared only
+   * by a barrier that succeeds, so a failed barrier stays owed: a later pass
+   * with nothing new to record still settles it before deciding anything. A
+   * place owes none (recordWalk).
    */
   private unsynced = false;
 
@@ -183,19 +200,19 @@ export class DiskAgreement {
         root: mount.root,
         ...(mount.identity ? { identity: mount.identity } : {}),
         paths: new Map(Object.entries(mount.paths)),
+        walks: new Map(Object.entries(mount.walks ?? {})),
       });
     }
     for (const { entry } of entries) {
       if (entry.t === 'mount') {
         const existing = replayed.get(entry.mount);
-        if (!existing || !sameRootPath(existing.root, entry.root)) replayed.set(entry.mount, { root: entry.root, paths: new Map() });
+        if (!existing || !sameRootPath(existing.root, entry.root)) {
+          replayed.set(entry.mount, { root: entry.root, paths: new Map(), walks: new Map() });
+        }
         continue;
       }
       const mount = replayed.get(entry.mount);
-      if (!mount) continue;
-      if (entry.t === 'root') applyRoot(mount, entry);
-      else if (entry.t === 'set') mount.paths.set(entry.path, entry.value);
-      else mount.paths.delete(entry.path);
+      if (mount) apply(mount, entry);
     }
     this.mounts.clear();
     for (const { name, root } of this.configured) {
@@ -203,7 +220,7 @@ export class DiskAgreement {
       if (found && sameRootPath(found.root, root)) {
         this.mounts.set(name, found);
       } else {
-        this.mounts.set(name, { root, paths: new Map() });
+        this.mounts.set(name, { root, paths: new Map(), walks: new Map() });
         this.journal.append({ t: 'mount', mount: name, root });
       }
     }
@@ -251,6 +268,29 @@ export class DiskAgreement {
   }
 
   /**
+   * Where the next walk of `scope` ('' for the mount root) resumes: the last
+   * entry a walk of it took before its cap stopped it, if one did.
+   */
+  walkResumesAfter(mount: string, scope: string): string | undefined {
+    this.ensureReconciled();
+    return this.mounts.get(mount)?.walks.get(scope);
+  }
+
+  /**
+   * Record where a walk of `scope` stopped (`after`), or that one covered it
+   * (null). Kept with the evidence so a restart resumes there too. A place
+   * that's lost costs coverage, never a decision: an append that didn't land
+   * loses one, and a checkpoint written by a version that doesn't keep them
+   * (0.22) loses them all, and each scope's walks start at its top again.
+   * So recording one owes no barrier: a pass that moves only its place makes
+   * no store sync, and the place becomes durable with the next one.
+   */
+  recordWalk(mount: string, scope: string, after: string | null): void {
+    if ((this.walkResumesAfter(mount, scope) ?? null) === after) return;
+    this.write({ t: 'walk', mount, scope, after }, {});
+  }
+
+  /**
    * Record an intent. `durable` makes it (and every append before it) stable
    * before the caller performs the effect; batches pass it on their last one.
    */
@@ -284,14 +324,13 @@ export class DiskAgreement {
 
   private write(entry: JournalEntry, opts: { durable?: boolean; afterCommittedState?: boolean }): void {
     this.ensureReconciled();
-    this.unsynced = true; // until proven durable: a failed append may still have landed
+    // Evidence is owed a barrier until proven durable: a failed append may
+    // still have landed. A place isn't (recordWalk).
+    if (entry.t !== 'walk') this.unsynced = true;
     this.journal.append(entry, opts);
     if (opts.durable) this.unsynced = false; // synced after this append, and so everything before it
     const mount = this.mounts.get((entry as { mount: string }).mount);
-    if (!mount) return;
-    if (entry.t === 'root') applyRoot(mount, entry);
-    else if (entry.t === 'set') mount.paths.set(entry.path, entry.value);
-    else if (entry.t === 'forget') mount.paths.delete(entry.path);
+    if (mount) apply(mount, entry);
   }
 
   /** Checkpoint when the tail has outgrown the live evidence. */
@@ -307,6 +346,7 @@ export class DiskAgreement {
         root: mount.root,
         ...(mount.identity ? { identity: mount.identity } : {}),
         paths: Object.fromEntries(mount.paths),
+        ...(mount.walks.size > 0 ? { walks: Object.fromEntries(mount.walks) } : {}),
       };
     }
     this.journal.checkpoint(snapshot);
@@ -319,7 +359,23 @@ export class DiskAgreement {
   }
 }
 
+/** Apply one entry to a mount's evidence; one of a kind this version doesn't know changes nothing. */
+function apply(mount: MountEvidence, entry: JournalEntry): void {
+  if (entry.t === 'root') applyRoot(mount, entry);
+  else if (entry.t === 'set') mount.paths.set(entry.path, entry.value);
+  else if (entry.t === 'forget') mount.paths.delete(entry.path);
+  else if (entry.t === 'walk') {
+    if (entry.after === null) mount.walks.delete(entry.scope);
+    else mount.walks.set(entry.scope, entry.after);
+  }
+}
+
 function applyRoot(mount: MountEvidence, entry: Extract<JournalEntry, { t: 'root' }>): void {
   mount.identity = entry.identity;
-  if (entry.reset) mount.paths.clear();
+  if (entry.reset) {
+    // Evidence about another directory says nothing about this one, and the
+    // accepted root's walks start at its top.
+    mount.paths.clear();
+    mount.walks.clear();
+  }
 }

@@ -321,10 +321,14 @@ export interface ModuleContext {
    *
    * Modules use this to react to agent lifecycle without polling — e.g. an
    * adapter that wants to show a "typing" indicator can bracket it between
-   * `inference:started` and the terminal events (`inference:turn_ended`,
-   * `inference:aborted`, `inference:failed`, `inference:exhausted`), all of
-   * which carry `agentName`. The terminal events fire once per turn, after any
-   * tool-call cycles, so a single start/stop bracket spans the whole turn.
+   * `inference:started` and the terminal events: `inference:completed` (the
+   * normal end), `inference:turn_ended` (a tool result ended the turn),
+   * `inference:aborted`, `inference:failed` and `inference:exhausted`, all of
+   * which carry `agentName`. A turn's tool-call cycles stay inside its
+   * stream, so one bracket spans them. A context-budget restart emits
+   * `inference:started` again with no terminal event for the stream it
+   * replaced, and a failing turn can emit `inference:failed` and then
+   * `inference:exhausted`, so a bracket should allow a repeated start or end.
    *
    * Returns an unsubscribe function. Call it in the module's `stop()` to avoid
    * leaking listeners across teardown/recreate (e.g. session switch).

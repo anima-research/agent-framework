@@ -12,7 +12,7 @@
   prepared budget change alone, as `previewActivation` already promised; a
   preview at the live window used to settle a converging budget change.
   `ActivationRequestOptions` gains `dryRun`.
-- With context-manager 0.14, a dry run leaves what a select leaves behind as
+- With context-manager 0.14.1, a dry run leaves what a select leaves behind as
   the last committing compile left it: no chunk record, no calibration, and
   none of the bookkeeping the next compile or an observer reads. The one thing
   it can still leave is the release of a compression hold whose deadline has

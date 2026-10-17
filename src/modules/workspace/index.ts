@@ -50,6 +50,7 @@ import {
   type PushResult,
   type Scope,
   type TreeOp,
+  WALK_CAP,
   pushPaths,
   reconcilePass,
   settleAdoptionBeforeMutation,
@@ -651,6 +652,16 @@ export class WorkspaceModule implements Module {
   private savedState: WorkspaceModuleState | null = null;
 
   constructor(config: WorkspaceConfig) {
+    for (const mount of config.mounts) {
+      const cap: unknown = mount.walkCap;
+      if (cap !== undefined && !(Number.isSafeInteger(cap) && (cap as number) > 0)) {
+        // Numbers as JavaScript writes them (JSON would say null for NaN), anything else as JSON.
+        const shown = typeof cap === 'number' ? String(cap) : typeof cap === 'bigint' ? `${cap}n` : JSON.stringify(cap) ?? String(cap);
+        throw new Error(
+          `[workspace] Mount "${mount.name}": walkCap must be a positive integer no larger than ${Number.MAX_SAFE_INTEGER}, not ${shown}`,
+        );
+      }
+    }
     // Detect overlapping mount paths: if mount A contains mount B,
     // auto-add an ignore rule on A for B's path to prevent syncing
     // the sub-mount's directory through the super-mount.
@@ -779,6 +790,8 @@ export class WorkspaceModule implements Module {
       treeStateId: mount.treeStateId,
       intents: this.intents.get(mount.config.name)!,
       readOnly: mount.config.mode === 'read-only',
+      walkCap: mount.config.walkCap ?? WALK_CAP,
+      catchUpScan: (mount.config.watch ?? 'always') === 'always',
     };
   }
 
@@ -982,9 +995,12 @@ export class WorkspaceModule implements Module {
         this.watchers.set(name, watcher);
 
         // Chokidar is started with ignoreInitial:true, so changes made while
-        // the session was down would be invisible. One full pass catches up
-        // under the three-way rule: only real differences produce tree
-        // changes and events.
+        // the session was down would be invisible. A catch-up pass takes them
+        // in under the three-way rule: only real differences produce tree
+        // changes and events. It takes its turn with the mount's bare syncs,
+        // so on a mount over its walkCap it covers the walkCap entries after
+        // where the last turn stopped, and a change elsewhere waits for the
+        // rotation to reach it, or for a sync of its path.
         void this.initialScan(name);
       }
 
@@ -1004,7 +1020,7 @@ export class WorkspaceModule implements Module {
     try {
       // A full pass under the three-way rule: deletions on disk are confirmed
       // where nothing newer is pending, and nothing unvisited is touched.
-      await this.withMount(mount, () => this.passUnlocked(mount, { kind: 'dir', dir: '', recursive: true }));
+      await this.withMount(mount, () => this.passUnlocked(mount, { kind: 'dir', dir: '', recursive: true }, { resume: true }));
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       this.ctx?.pushEvent({
@@ -1211,7 +1227,12 @@ export class WorkspaceModule implements Module {
       {
         name: 'sync',
         description: 'Bring disk changes into the workspace. Without a path, every mount (or the given one) is '
-          + 'rechecked in full and nothing pending in the workspace is discarded. With a path (file or directory), '
+          + 'rechecked and nothing pending in the workspace is discarded. A sync takes up to the mount\'s walk '
+          + 'cap of entries, files, links and the like (5000 unless configured). Past it, what this one didn\'t reach is listed under '
+          + '`incomplete`, and the walk takes turns: the next sync of the same mount or directory picks up where '
+          + 'the last turn stopped, so repeated syncs cover it all. On a mount watched continuously, its own catch-up '
+          + 'scan, at start and when its watcher reattaches, takes turns with its whole-mount syncs. With a '
+          + 'path (file or directory), '
           + 'the workspace takes disk\'s state there explicitly: it restores a workspace-deleted file, resolves '
           + 'conflicts toward disk, replaces a workspace draft, and removes a workspace file disk does not have. '
           + 'Each workspace change it gives up is listed under `discarded`, with the state it had and, as `op`, '
@@ -2851,7 +2872,8 @@ export class WorkspaceModule implements Module {
         if (input.acceptRoot && await this.acceptRootUnlocked(mount)) rootsAccepted.push(name);
         if (!relativePath) {
           // A full recheck: every file rehashed, nothing pending discarded.
-          return this.passUnlocked(mount, { kind: 'dir', dir: '', recursive: true }, { rehash: true });
+          // Past the mount's walkCap, it resumes where the last one stopped.
+          return this.passUnlocked(mount, { kind: 'dir', dir: '', recursive: true }, { rehash: true, resume: true });
         }
         // An explicit path: the workspace takes disk's state there.
         const prefix = relativePath + '/';
@@ -2864,7 +2886,7 @@ export class WorkspaceModule implements Module {
         // beneath it (a directory scope's walk; a path scope doesn't walk).
         const opts: PassOptions = { rehash: true, adopt: () => true, branchId: askedOn, named: true };
         if (!isDir) return this.passUnlocked(mount, { kind: 'paths', paths: [relativePath] }, opts);
-        const beneath = await this.passUnlocked(mount, { kind: 'dir', dir: relativePath, recursive: true }, opts);
+        const beneath = await this.passUnlocked(mount, { kind: 'dir', dir: relativePath, recursive: true }, { ...opts, resume: true });
         // Something at the path itself is no part of a directory scope: a file
         // disk has where the workspace holds a directory, or a workspace file
         // where disk has a directory. Its own pass takes disk's state there
@@ -2988,10 +3010,14 @@ export class WorkspaceModule implements Module {
    * After an agent's completed tool batch, before anything continues its turn:
    * scan every `watch: 'on-agent-action'` mount, so what the batch's tools did
    * on disk (a shell command's files, a deletion) is in the workspace when the
-   * agent next looks. A scan that outlasts the deadline stops holding the
-   * round: the miss is recorded on the mount's status and pushed as a
-   * `workspace:agent-action-scan-incomplete` event, and the scan continues,
-   * deciding on the branch selected when it applies.
+   * agent next looks. On a mount over its walkCap, that holds for the first
+   * walkCap entries in the walk's order, which every batch's scan takes; files
+   * past them come in through syncs and the listings that reach them, while a
+   * read takes in only a file the workspace doesn't hold yet. A scan that
+   * outlasts the deadline stops holding the round: the miss is recorded on
+   * the mount's status and pushed as a `workspace:agent-action-scan-incomplete`
+   * event, and the scan continues, deciding on the branch selected when it
+   * applies.
    */
   async onToolBatchComplete(_agentName?: string): Promise<void> {
     // Every agent's workspace is the store's current branch, so the agent
@@ -3057,6 +3083,10 @@ export class WorkspaceModule implements Module {
     const scan: AgentActionScan = { late: false, settled: Promise.resolve() };
     const pass = this.withMount(mount, () => {
       if (mount.agentActionScanWaiting === scan) mount.agentActionScanWaiting = undefined;
+      // From the mount's start, as a listing walks, keeping no place: on a
+      // mount over its walkCap, every batch's scan takes the first walkCap
+      // entries in the walk's order, and the place that syncs and catch-up
+      // scans resume from stays theirs.
       return this.passUnlocked(mount, { kind: 'dir', dir: '', recursive: true });
     });
     scan.settled = pass.then(

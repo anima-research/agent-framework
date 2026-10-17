@@ -152,6 +152,14 @@ export interface MountRuntime {
   treeStateId: string;
   intents: BranchIntents;
   readOnly: boolean;
+  /** The most entries one walk of the mount takes, files and the other entries that aren't directories (`MountConfig.walkCap`). */
+  walkCap: number;
+  /**
+   * Whether the mount runs a catch-up scan (`watch: 'always'`, at start and
+   * when its watcher reattaches), which takes turns with its whole-mount
+   * syncs.
+   */
+  catchUpScan: boolean;
 }
 
 export type Scope =
@@ -163,8 +171,16 @@ export interface PassOptions {
   rehash?: boolean;
   /** Paths whose disk state is adopted explicitly (a path sync). */
   adopt?: (path: string) => boolean;
-  /** Walk cap for directory scopes. */
+  /** Walk cap for directory scopes; the mount's `walkCap` when absent. */
   cap?: number;
+  /**
+   * A recursive directory pass of a sync or a catch-up scan: its walk resumes
+   * after the last entry the previous one of this scope took, and records
+   * where it stopped, so repeated passes cover a scope larger than the cap.
+   * A listing's pass, and an agent-action scan's, start at their scope's
+   * start and record no place.
+   */
+  resume?: boolean;
   /**
    * The scope was named by a path sync: ignore patterns that cover it don't
    * apply beneath it (see walkScope). A listing's scope keeps them.
@@ -618,10 +634,16 @@ async function gather(store: JsStore, agreement: DiskAgreement, mount: MountRunt
     for (const [p] of agreement.paths(mount.name, scope.dir)) if (inScope(p, scope)) candidates.add(p);
     for (const [p] of mount.intents.list(scope.dir)) if (inScope(p, scope)) candidates.add(p);
     if (rootUnavailable === null) {
-      walk = await walkScope(mount.view, mount.rootReal, scope.dir, scope.recursive, opts.cap ?? WALK_CAP, { named: opts.named });
+      const resumeAfter = opts.resume ? agreement.walkResumesAfter(mount.name, scope.dir) : undefined;
+      walk = await walkScope(mount.view, mount.rootReal, scope.dir, scope.recursive, opts.cap ?? mount.walkCap, {
+        named: opts.named,
+        ...(resumeAfter !== undefined ? { resumeAfter } : {}),
+      });
       for (const f of walk.files) if (inScope(f, scope)) candidates.add(f);
-      // Ignored names are listed only when something tracks them (above).
-      for (const [p, why] of walk.others) if (why !== 'ignored by the mount' && inScope(p, scope)) candidates.add(p);
+      // The other entries it took (a link, a socket…). Ignored names, and the
+      // entries the cap left, are listed only when something tracks them
+      // (above).
+      for (const p of walk.othersTaken) if (inScope(p, scope)) candidates.add(p);
       for (const d of walk.dirs) if (inScope(d, { kind: 'dir', dir: scope.dir, recursive: false })) gathered.dirs.push(d);
     }
   }
@@ -637,14 +659,21 @@ async function gather(store: JsStore, agreement: DiskAgreement, mount: MountRunt
       gathered.facts.set(path, { kind: 'absent' });
       continue;
     }
-    if (walk && !walk.files.has(path) && !walk.others.has(path)) {
-      // Beneath a region the walk didn't reach: unproven either way.
-      const region = walk.incomplete.find((r) => r.path === '' || path === r.path || path.startsWith(r.path + '/'));
-      gathered.facts.set(path, { kind: 'unobserved', reason: region ? region.reason : 'not reached by the walk' });
-      continue;
-    }
     if (walk?.others.get(path) === 'ignored by the mount') {
       gathered.facts.set(path, { kind: 'unobserved', reason: 'ignored by the mount' });
+      continue;
+    }
+    if (walk && !walk.files.has(path) && !walk.othersTaken.has(path)) {
+      // Not taken by the walk, or beneath a region it didn't reach: unproven
+      // either way. The nearest region holding it says why.
+      let region: Walk['incomplete'][number] | undefined;
+      for (const r of walk.incomplete) {
+        if (r.path !== '' && path !== r.path && !path.startsWith(r.path + '/')) continue;
+        // A link's own region is about what lies beneath it, not the link.
+        if (r.kind === 'symlink' && r.path === path) continue;
+        if (region === undefined || r.path.length > region.path.length) region = r;
+      }
+      gathered.facts.set(path, { kind: 'unobserved', reason: region ? region.reason : 'not reached by the walk' });
       continue;
     }
     const p = agreement.get(mount.name, path);
@@ -793,6 +822,18 @@ export async function reconcilePass(
     agreement.set(mount.name, x.path, next, { afterCommittedState: first });
     first = false;
   }
+  // Where the walk stopped, once what it observed is decided: the next pass
+  // of this scope resumes after it, or starts afresh once this one covered
+  // the scope. A walk that couldn't list its scope's own directory covered
+  // none of it, and leaves the place as it was. Unlike evidence, a place
+  // binds no root: it only says where the next walk starts, and that walk
+  // takes its turn after it in whatever directory is the root by then.
+  let resumeAfter: string | null | undefined;
+  if (opts.resume && walk && scope.kind === 'dir' && scope.recursive && walk.complete.has(scope.dir)) {
+    resumeAfter = walk.stoppedAfter ?? null;
+    agreement.recordWalk(mount.name, scope.dir, resumeAfter);
+  }
+
   // 5. Durable before returning. An agreement advance (D = S) has no pending
   // intent to recover from, so losing its append would leave an older P that
   // another branch would misread as a disk edit.
@@ -816,15 +857,31 @@ export async function reconcilePass(
   }
   if (walk) {
     const tracked = [...result.reports.values()].filter((r) => r.state === 'unverified').map((r) => r.path);
+    if (typeof resumeAfter === 'string' && scope.kind === 'dir') {
+      // A watched mount's catch-up scan takes turns with its whole-mount
+      // syncs; nothing else moves a place.
+      const next = scope.dir !== ''
+        ? 'the next sync of this directory'
+        : mount.catchUpScan
+          ? 'the next sync of the mount, or its catch-up scan if that comes first,'
+          : 'the next sync of the mount';
+      result.incomplete.push({
+        path: scope.dir,
+        reason: `the walk cap (${opts.cap ?? mount.walkCap}) was reached: ${next} resumes after ${mount.name}/${resumeAfter}`,
+      });
+    }
     for (const region of walk.incomplete) {
-      const hides = tracked.some((p) => p === region.path || p.startsWith(region.path + '/'));
+      // A link's own region hides only what lies beneath it: the link itself
+      // is reported by path, with its own reason.
+      const hides = tracked.some((p) => (region.kind !== 'symlink' && p === region.path) || p.startsWith(region.path + '/'));
       if (region.kind === 'error' || region.kind === 'cap' || hides) result.incomplete.push({ path: region.path, reason: region.reason });
       // An ignored name that hides nothing tracked is reported nowhere else:
       // counted, so a sync that says 0 also says what it didn't look at
-      // (agent-framework #276). A symlink region isn't counted: the link
-      // itself is a candidate the pass reports by path, taken through the
+      // (agent-framework #276). A symlink region isn't counted: a link the
+      // walk took is a candidate the pass reports by path, taken through the
       // link when it's a file on a mount that follows symlinks, and
-      // otherwise listed under `skipped`.
+      // otherwise listed under `skipped`; a tracked link the cap left is
+      // unverified for the cap.
       else if (region.kind === 'ignored') result.passedOver.set(region.reason, (result.passedOver.get(region.reason) ?? 0) + 1);
     }
   }

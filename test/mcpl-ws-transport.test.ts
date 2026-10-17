@@ -249,6 +249,7 @@ test("a server-side close with code 4001 surfaces on the connection 'close' even
       code: 4001,
       signal: null,
       reason: 'token expired',
+      reasonFromPeer: true,
       byHost: false,
     });
     // The reconnect dialed with the credential the close listener installed.

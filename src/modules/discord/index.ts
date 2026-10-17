@@ -67,9 +67,11 @@ const TYPING_REFRESH_MS = 8_000;
 // stuck on forever.
 const TYPING_MAX_MS = 5 * 60_000;
 
-// Trace event types that terminate an agent's turn — any of these stops the
-// typing keepalive. They fire once per turn, after all tool-call cycles.
+// Trace event types that end an agent's turn (onTrace's contract) — any of
+// these stops the typing keepalive. A turn's tool-call cycles stay inside its
+// stream, so they come after them. inference:completed is the normal end.
 const TURN_TERMINAL_TRACES = new Set([
+  'inference:completed',
   'inference:turn_ended',
   'inference:aborted',
   'inference:failed',

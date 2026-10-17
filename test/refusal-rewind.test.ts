@@ -21,6 +21,13 @@ function makeAgentHarness(messages: any[]) {
       const i = messages.findIndex((m) => m.id === id);
       if (i >= 0) messages.splice(i, 1);
     },
+    // A range by its two ends, inclusive, as context-manager's removeMessages.
+    removeMessages: (fromId: string, toId: string) => {
+      const from = messages.findIndex((m) => m.id === fromId);
+      const to = messages.findIndex((m) => m.id === toId);
+      if (from < 0 || to < from) throw new Error(`no range ${fromId}..${toId}`);
+      for (const m of messages.splice(from, to - from + 1)) removed.push(m.id);
+    },
     addMessage: (participant: string, content: any[], meta: any) => {
       const id = `marker-${added.length}`;
       added.push({ participant, content, meta });
