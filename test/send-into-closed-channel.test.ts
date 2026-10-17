@@ -387,21 +387,35 @@ test('a reply_message into a channel decided open whose open failed opens it aga
   assert.match(windowMessages.at(-1) ?? '', /^\[channels\] Now open: #upkeep \(discord:g1:444555\) — your own message into the closed channel engaged it\./);
 });
 
-test('a reply_message into a tuned-out channel leaves the tune-out in place', async () => {
-  const { registry, opens, windowMessages, reply } = await harness();
+test('a send into a tuned-out channel leaves the tune-out in place, and its answer says so', async () => {
+  const { registry, framework, opens, windowMessages, reply } = await harness();
   // Tuned out: the transport stays open, and the decision is the tune-out.
   assert.equal((await registry.handleChannelToolCall('channel_open', { channelId }, origin)).success, true);
   registry.enterTuneOut('discord', channelId, {
     epochId: 'e1', cadenceSeconds: 600, backlogCap: 50, maxWakes: 3, startedAtSequence: 0,
   }, 'agent-tool');
   const opensBefore = opens.length;
+  const tunedOutNote = `[tuned out] #upkeep (${channelId}) stays tuned out: your words there don't end the tune-out, ` +
+    'so its traffic still goes to your subconscious until the tune-out ends. ' +
+    `tune_out with channelId "${channelId}" and mode "cancel" resumes normal attention there. ` +
+    'To stop this note, set closed_channel_note to false with agent_settings.';
 
-  const { success } = await reply();
-
-  assert.equal(success, true);
+  for (const tool of ['reply_message', 'send_dm']) {
+    const { success, data } = await reply(tool);
+    assert.equal(success, true);
+    assert.ok(data.endsWith(`\n${tunedOutNote}`), `${tool}: ${data}`);
+  }
   assert.equal(registry.getDesiredState('discord', channelId), 'tuned-out', 'the tune-out stands');
   assert.equal(opens.length, opensBefore, 'the send sent no channels/open');
   assert.deepEqual(windowMessages, [], 'no notice says the channel opened');
+
+  // The setting turns it off too.
+  framework.closedChannelNoteSettingsExtension().update('sol', { closed_channel_note: false });
+  assert.ok(!(await reply()).data.includes('[tuned out]'));
+  framework.closedChannelNoteSettingsExtension().reset('sol');
+  // A conversation agent gets none.
+  framework.conversationAgentHomes.set('sol', channelId);
+  assert.ok(!(await reply()).data.includes('[tuned out]'));
 });
 
 test('a reply_message still in flight when the agent closes its channel leaves it closed', async () => {
@@ -451,7 +465,7 @@ test("closed_channel_note is an agent_settings key, kept in the framework's stat
     const tool = framework.getAllTools().find((t) => t.name === 'agent_settings')!;
     const property = (tool.inputSchema.properties as Record<string, { type: string; description: string }>).closed_channel_note;
     assert.equal(property.type, 'boolean');
-    assert.match(property.description, /a channel you closed or declined/);
+    assert.match(property.description, /a channel you closed or declined, or a send tool's words to one you tuned out/);
     assert.equal(settings(framework, { action: 'get' }).data?.closed_channel_note, true, 'on by default');
 
     // Another framework-owned setting, kept in the same state.

@@ -4163,8 +4163,9 @@ export class AgentFramework {
       properties: {
         closed_channel_note: {
           type: 'boolean',
-          description: 'Add a note when your words go to a channel you closed or declined, saying that it stays closed, ' +
-            'what still reaches you from it, and how to open it. On by default. Persists across turns and restarts until changed.',
+          description: 'Add a note when your words go to a channel you closed or declined, or a send tool\'s words to one ' +
+            'you tuned out, saying that it stays that way and how to change that. On by default. ' +
+            'Persists across turns and restarts until changed.',
         },
       },
       keys: ['closed_channel_note'],
@@ -4195,15 +4196,44 @@ export class AgentFramework {
     if (!registry || !serverId || registry.isChannelOpen(channelId)) return undefined;
     const how = registry.closedByAgent(serverId, channelId);
     if (!how) return undefined;
-    const label = registry.getDescriptor(channelId)?.label;
-    const place = label && label !== channelId
-      ? `${label.startsWith('#') ? label : `#${label}`} (${channelId})`
-      : channelId;
+    const place = this.channelNotePlace(channelId);
     const reach = 'Messages there that address you, such as an @-mention, still reach you';
     const open = registry.canOpenChannels(serverId)
       ? `; channel_open with channelId "${channelId}" and serverId "${serverId}" opens it.`
       : '.';
     return `${place} stays closed: you ${how} it, and your words there don't open it. ${reach}${open}`;
+  }
+
+  /** A channel as a note names it: its label and id, or its id alone. */
+  private channelNotePlace(channelId: string): string {
+    const label = this.channelRegistry?.getDescriptor(channelId)?.label;
+    return label && label !== channelId
+      ? `${label.startsWith('#') ? label : `#${label}`} (${channelId})`
+      : channelId;
+  }
+
+  /** What an agent is told when a send tool's words go to a channel it tuned
+   *  out, or undefined where nothing needs saying. On main a send ended the
+   *  tune-out; now it stands, so the agent that sent there expecting answers
+   *  learns they still go to its subconscious. Only the send tools ended a
+   *  tune-out (routed speech never did while the transport was open), so only
+   *  their answers carry this, send_dm's included: a tune-out diverts a DM
+   *  too. The same setting turns it off, a conversation agent gets none, and
+   *  a failure while working it out is logged and adds nothing, as for the
+   *  closed-channel note. */
+  private tunedOutSendNote(agentName: string, channelId: string, serverId: string): string | undefined {
+    try {
+      const registry = this.channelRegistry;
+      if (!registry || this.conversationAgentHomes.has(agentName)) return undefined;
+      if (registry.getDesiredState(serverId, channelId) !== 'tuned-out') return undefined;
+      if (!this.closedChannelNoteOn(agentName)) return undefined;
+      return `${this.channelNotePlace(channelId)} stays tuned out: your words there don't end the tune-out, so its ` +
+        'traffic still goes to your subconscious until the tune-out ends. ' +
+        `tune_out with channelId "${channelId}" and mode "cancel" resumes normal attention there.`;
+    } catch (err) {
+      console.error(`[closed-channel-note] for ${agentName} failed: ${err instanceof Error ? err.message : String(err)}`);
+      return undefined;
+    }
   }
 
   /** How to stop the closed-channel note, said once wherever it appears. */
@@ -18399,12 +18429,14 @@ export class AgentFramework {
           if (engagedChannel) {
             sendingTurn?.engaged.add(engagedChannel);
             // Where the agent's words stayed in a channel it closed or
-            // declined itself, the send's answer says so.
-            const [note] = toolName === 'send_dm' ? [] : this.closedChannelNotes(agentName, [engagedChannel], serverId);
+            // declined itself, or tuned out, the send's answer says so.
+            const [closedNote] = toolName === 'send_dm' ? [] : this.closedChannelNotes(agentName, [engagedChannel], serverId);
+            const tunedOutNote = this.tunedOutSendNote(agentName, engagedChannel, serverId);
+            const note = closedNote ? `[closed channel] ${closedNote}` : tunedOutNote ? `[tuned out] ${tunedOutNote}` : undefined;
             if (note) {
               result.content = [
                 ...(result.content ?? []),
-                { type: 'text', text: `[closed channel] ${note} ${AgentFramework.CLOSED_CHANNEL_NOTE_OFF}` },
+                { type: 'text', text: `${note} ${AgentFramework.CLOSED_CHANNEL_NOTE_OFF}` },
               ];
             }
             // Fire-and-forget: the send already succeeded; the open must not
