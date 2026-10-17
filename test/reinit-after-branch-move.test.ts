@@ -981,7 +981,7 @@ describe('conversation forks and an undo', () => {
       const reinit = alerts.filter((alert) => alert.kind === 'context-reinit-failed');
       assert.deepEqual(reinit.map((alert) => alert.agentName), ['a-late-g1'], JSON.stringify(alerts));
       assert.match(reinit[0]!.message, /had no messages of its own, and it couldn't be seeded again, because its seeding from the template failed: .*injected template compile failure\. It was disposed and its channel unbound/);
-      assert.match(reinit[0]!.message, /no agent reads them again, so a redo to a branch that holds them doesn't bring this one back\. The channel's next qualifying message spawns a new fork, under a new name\.$/);
+      assert.match(reinit[0]!.message, /no agent reads them again, so a redo to a branch that holds them doesn't bring this one back\. The channel's next qualifying message spawns a new fork, under a new name, unless its seeding fails again\.$/);
       assert.doesNotMatch(reinit[0]!.message, /refuses its work/);
       assert.equal(internals.surgeryHold, null, 'the store is released');
       assert.ok(!framework.getAgent('a-late-g1'), 'the fork is disposed rather than left to answer with no history');

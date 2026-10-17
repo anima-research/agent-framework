@@ -8093,7 +8093,7 @@ export class AgentFramework {
           "so a redo to a branch that holds them doesn't bring this one back. " +
           (remedy
             ? `Once ${remedy}, the channel's next qualifying message spawns a new fork seeded from the template, under a new name.`
-            : "The channel's next qualifying message spawns a new fork, under a new name.")
+            : "The channel's next qualifying message spawns a new fork, under a new name, unless its seeding fails again.")
         : `The ${after} moved the store's branch, and re-initializing this agent's context manager for it failed: ${error}. ` +
           REINIT_REMEDY);
     }

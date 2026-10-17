@@ -34,7 +34,8 @@
   One that can't be seeded, because its seeding fails or the template is
   missing or failed to re-initialize, is disposed rather than left to
   answer with no history: `context-reinit-failed` says so and why. Its
-  channel's next qualifying message spawns a fresh one, though while the
-  template is missing or refuses its work a spawn fails too, so the alert
-  says what puts the template right first. Its messages stay in the store,
-  but a redo doesn't bring the disposed one back.
+  channel's next qualifying message spawns a fresh one, unless its seeding
+  fails again, and while the template is missing or refuses its work a
+  spawn fails too, so the alert says what puts the template right first.
+  Its messages stay in the store, but a redo doesn't bring the disposed one
+  back.
