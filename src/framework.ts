@@ -14173,7 +14173,12 @@ export class AgentFramework {
     if (ownsOrigin) this.foregroundScriptOrigins.set(agentName, origin);
     let exec: import('./code-execution/py-runner.js').ExecResult;
     try {
-      exec = await runner.exec(input.code, injected, undefined, timeLimitMs !== undefined ? { deadlineMs: timeLimitMs } : undefined);
+      // A script stopped at its ceiling is offered background mode only when
+      // this agent could start a background script as this one starts: it
+      // runs them, and a slot is free under the cap.
+      const backgroundCeilingMs = this.runsBackgroundScripts(agentName)
+        && this.runningBackgroundScripts(agentName) < this.maxBackgroundScripts() ? limits.backgroundMaxMs : undefined;
+      exec = await runner.exec(input.code, injected, undefined, { deadlineMs: timeLimitMs, ceilingMs, backgroundCeilingMs });
     } finally {
       if (this.scriptDeferredEndTurn.get(agentName) === script) this.scriptDeferredEndTurn.delete(agentName);
       if (ownsOrigin && this.foregroundScriptOrigins.get(agentName) === origin) {
@@ -14199,6 +14204,21 @@ export class AgentFramework {
   // Background (daemon) scripts — model-authored watchers that outlive the turn
   // ---------------------------------------------------------------------------
 
+  /** Background scripts are the primary agent's, or any agent's when no primary agent is named. */
+  private runsBackgroundScripts(agentName: string): boolean {
+    return !this.primaryAgentName || agentName === this.primaryAgentName;
+  }
+
+  /** How many background scripts an agent may have running at once. */
+  private maxBackgroundScripts(): number {
+    return this.codeExecutionConfig?.maxBackgroundScripts ?? 3;
+  }
+
+  /** How many of this agent's background scripts are running now. */
+  private runningBackgroundScripts(agentName: string): number {
+    return [...this.backgroundScripts.values()].filter((s) => s.agentName === agentName && s.status === 'running').length;
+  }
+
   /**
    * Start a background script: dedicated interpreter, output journaled to a
    * workspace file, wake_agent() available in-script. The tool result
@@ -14217,7 +14237,7 @@ export class AgentFramework {
     // v1: primary-agent-only. A conversation fork's or ephemeral's daemon
     // would outlive its owner and its wake would land in the primary
     // conversation anyway — refuse loudly instead of surprising anyone.
-    if (this.primaryAgentName && agentName !== this.primaryAgentName) {
+    if (!this.runsBackgroundScripts(agentName)) {
       return {
         success: false,
         error: 'background scripts are available to the primary agent only',
@@ -14225,10 +14245,8 @@ export class AgentFramework {
       };
     }
     const cfg = this.codeExecutionConfig;
-    const maxScripts = cfg?.maxBackgroundScripts ?? 3;
-    const runningCount = [...this.backgroundScripts.values()]
-      .filter((s) => s.agentName === agentName && s.status === 'running').length;
-    if (runningCount >= maxScripts) {
+    const maxScripts = this.maxBackgroundScripts();
+    if (this.runningBackgroundScripts(agentName) >= maxScripts) {
       return {
         success: false,
         error: `background script limit reached (${maxScripts} running). ` +
@@ -14288,7 +14306,7 @@ export class AgentFramework {
         logPath: logAbsPath,
         lifetimeMs,
         onWake: (line, payload) => this.handleScriptWake(record, line, payload),
-      })
+      }, { ceilingMs: scriptTimeLimits(cfg ?? undefined).backgroundMaxMs })
       .then((exec) => this.settleBackgroundScript(record, exec))
       .catch((err) => {
         // exec never rejects by contract; this is the belt-and-suspenders.
