@@ -78,6 +78,9 @@ test('a name inside a definition is reachable, a called key included, whatever l
   assert.deepEqual(read('def f():\r\n    x = 1\r\n\r\n    # a note\r\n    await say({})\r\n'), { names: ['say'], reachable: ['say'] }, 'a blank \\r\\n line and a comment');
   // A backslash at a line's end continues it in code too.
   assert.deepEqual(read('def f():\n    x = 1 + \\\n2; await say({})'), { names: ['say'], reachable: ['say'] }, 'a line continued by a backslash in code');
+  // ...a header's too: `async \` with `def` on the next line is one `async def`.
+  assert.deepEqual(read('async \\\ndef quiet():\n    await skip_reply({})\nawait say({})'), { names: ['say', 'skip_reply'], reachable: ['skip_reply'] }, 'async joined to def by a backslash');
+  assert.deepEqual(read('async \\\n    \\\n  def quiet():\n    await skip_reply({})'), { names: ['skip_reply'], reachable: ['skip_reply'] }, 'a header over two backslash joins');
   assert.deepEqual(read('f = (lambda x:\n    say(x))'), { names: ['say'], reachable: ['say'] }, "a lambda's body on its continued line");
 });
 

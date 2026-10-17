@@ -104,7 +104,14 @@ function definitions(
   const startOf = (j: number) => (j < lines.length ? lines[j].start : code.length);
   const spans: [number, number][] = [];
   lines.forEach((line, i) => {
-    if (line.continued || !/^[ \t]*(?:async[ \t]+)?def\b/.test(line.text)) return;
+    if (line.continued) return;
+    // A header read as Python reads its logical line: `async \` and `def` on
+    // the next line are one `async def`.
+    let header = line.text;
+    for (let k = i + 1; k < lines.length && header.trimEnd().endsWith('\\'); k++) {
+      header = `${header.trimEnd().slice(0, -1)} ${lines[k].text}`;
+    }
+    if (!/^[ \t]*(?:async[ \t]+)?def\b/.test(header)) return;
     // The header's own continued lines, then the block indented under it.
     let j = i + 1;
     while (j < lines.length && (lines[j].blank || lines[j].continued || lines[j].indent > line.indent)) j++;
