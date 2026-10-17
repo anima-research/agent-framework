@@ -579,6 +579,11 @@ export const AGENT_CLOSE_SOURCES: ReadonlySet<string> = new Set(['agent-tool', '
  *  part of what the module did. */
 export const MODULE_CLOSE_SOURCE = 'module-tool';
 
+/** A close the agent or a module decided: speech never undoes it. */
+function isCloseDecision(source: string): boolean {
+  return AGENT_CLOSE_SOURCES.has(source) || source === MODULE_CLOSE_SOURCE;
+}
+
 export class ChannelRegistry {
   private serverRegistry: McplServerRegistry;
   private featureSetManager: FeatureSetManager;
@@ -1355,12 +1360,20 @@ export class ChannelRegistry {
     return !!entry && !(entry.descriptor.metadata as { lazyRegistered?: boolean } | undefined)?.lazyRegistered;
   }
 
-  getDescriptor(channelId: string): ChannelDescriptor | undefined {
-    return this.findChannelEntry(channelId)?.descriptor;
+  /** A channel's descriptor: on the server named, or else the first server
+   *  that has a channel with this id. */
+  getDescriptor(channelId: string, serverId?: string): ChannelDescriptor | undefined {
+    return this.entryFor(channelId, serverId)?.descriptor;
   }
 
-  isChannelOpen(channelId: string): boolean {
-    return this.findChannelEntry(channelId)?.open === true;
+  /** Whether a channel is open at the transport: on the server named, or else
+   *  the first server that has a channel with this id. */
+  isChannelOpen(channelId: string, serverId?: string): boolean {
+    return this.entryFor(channelId, serverId)?.open === true;
+  }
+
+  private entryFor(channelId: string, serverId?: string): ChannelEntry | undefined {
+    return serverId === undefined ? this.findChannelEntry(channelId) : this.channels.get(`${serverId}:${channelId}`);
   }
 
   getDesiredState(serverId: string, channelId: string): DesiredChannelState | undefined {
@@ -1964,21 +1977,17 @@ export class ChannelRegistry {
     // registered lazily, or on a server whose grant lacks channels.lifecycle),
     // it records the default that channel already had, so policy and
     // bootstrap can still lift it (#417).
-    let recorded = !current && desired === 'closed' && MACHINE_CLOSE_SOURCES.has(source) ? 'default-closed' : source;
+    const recorded = !current && desired === 'closed' && MACHINE_CLOSE_SOURCES.has(source) ? 'default-closed' : source;
     if (current?.state === desired) {
-      // The same state keeps the decision on record, except that a close
-      // someone decided replaces one nobody did, so it sticks: policy and
+      // The same state keeps the record, except that the latest deliberate
+      // close wins: the agent's own close or decline, or a module's close,
+      // records itself over whatever closed record is there (a pure default,
+      // the retired recipe's migration, a machine's close, a source a replay
+      // couldn't read, or another deliberate close), so it sticks: policy and
       // bootstrap lift only 'default-closed', and speech opens only what
-      // nobody decided to keep closed (speechOpens). The agent's own close or
-      // decline replaces a pure default, a machine's close or a module's; a
-      // module's close replaces a pure default or a machine's. A machine
-      // source never replaces one, so what nobody decided stays liftable.
-      const undecided = current.source === 'default-closed' || MACHINE_CLOSE_SOURCES.has(current.source);
-      const replaces = AGENT_CLOSE_SOURCES.has(source)
-        ? undecided || current.source === MODULE_CLOSE_SOURCE
-        : source === MODULE_CLOSE_SOURCE && undecided;
-      recorded = replaces ? source : current.source;
-      if (recorded === current.source) return;
+      // nobody decided to keep closed (speechOpens). A machine's close never
+      // replaces a record, so what nobody decided stays liftable.
+      if (desired !== 'closed' || !isCloseDecision(source) || current.source === source) return;
     }
     this.desiredStates.set(key, { state: desired, source: recorded });
     this.appendLifecycleEvent({
@@ -2273,7 +2282,10 @@ export class ChannelRegistry {
           type: channel.type,
           address: channel.address,
         });
-        if (entry) entry.open = true;
+        // As in openChannelNow: a close decided meanwhile went to the server
+        // after this open, so the flag follows the decision.
+        const now = this.getDesiredState(serverId, channel.id);
+        if (entry && (now === 'open' || now === 'tuned-out')) entry.open = true;
       } catch (err) {
         if (entry) entry.open = false;
         this.emitTraceFn({
@@ -2451,7 +2463,10 @@ export class ChannelRegistry {
       address: entry.descriptor.address,
       ...(history ? { history } : {}),
     });
-    entry.open = true;
+    // A close decided while the open was on its way (the agent's channel_close
+    // racing an open a send started) went to the server after it, so the
+    // channel ends closed: the live flag follows the decision.
+    if (this.getDesiredState(entry.serverId, entry.descriptor.id) === 'open') entry.open = true;
     return result;
   }
 
@@ -2663,6 +2678,17 @@ export class ChannelRegistry {
    * its channel_close, 'declined' for its channel_decline. Its speech there
    * leaves such a channel closed (openForSpeech).
    */
+  /** Whether this channel stays closed when the agent's words go there
+   *  because the agent or a module decided to keep it closed: the agent's own
+   *  close or decline, or a module's close, which speech never opens
+   *  (speechOpens). False for a channel open at the transport. */
+  closedByDecision(serverId: string, channelId: string): boolean {
+    const entry = this.channels.get(`${serverId}:${channelId}`);
+    if (!entry || entry.open) return false;
+    const current = this.desiredStates.get(this.lifecycleKey(serverId, channelId));
+    return current?.state === 'closed' && isCloseDecision(current.source);
+  }
+
   closedByAgent(serverId: string, channelId: string): 'closed' | 'declined' | undefined {
     const current = this.desiredStates.get(this.lifecycleKey(serverId, channelId));
     if (current?.state !== 'closed') return undefined;
@@ -2695,7 +2721,7 @@ export class ChannelRegistry {
     if (!entry || entry.open || !this.canOpenChannels(serverId)) return false;
     const current = this.desiredStates.get(this.lifecycleKey(serverId, channelId));
     if (current?.state === 'tuned-out') return false;
-    return !(current?.state === 'closed' && (AGENT_CLOSE_SOURCES.has(current.source) || current.source === MODULE_CLOSE_SOURCE));
+    return !(current?.state === 'closed' && isCloseDecision(current.source));
   }
 
   /**
@@ -2716,6 +2742,9 @@ export class ChannelRegistry {
     if (!this.speechOpens(serverId, channelId)) return 'not-opened';
     try {
       await this.openChannelNow(entry, source);
+      // A close the agent decided while the open was on its way stands, and
+      // nothing reports the channel as opened.
+      if (this.getDesiredState(serverId, channelId) !== 'open') return 'not-opened';
       this.emitTraceFn({ type: 'mcpl:channel-opened-by-send', serverId, channelId });
       return 'opened';
     } catch (err) {
@@ -2927,7 +2956,10 @@ export class ChannelRegistry {
     if (!entry) {
       return { success: false, error: resolved.error, isError: true };
     }
-    if (entry.open || this.getDesiredState(entry.serverId, input.channelId) === 'open') {
+    // Refused only for a channel open at the transport: a channel decided
+    // open whose open failed is closed, and the invitation that comes from it
+    // offers the decline (option 3) as the way to reply without joining.
+    if (entry.open) {
       return {
         success: false,
         error: `Channel is already open: ${input.channelId}. Use channel_close to leave it.`,

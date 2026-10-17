@@ -242,7 +242,7 @@ describe('Trunk channel routing (item-3 redux)', () => {
       assert.deepEqual(asked, ['discord/discord:G1:C7'], 'asked about this channel on the server it came from');
       assert.match(text, target
         ? /\n1\. Reply without joining — write your reply this turn prefixed with ">>#portables"; it will be delivered there\. Note: follow-ups to your reply will NOT reach you unless they @-mention you or use the reply feature on your message\.\n/
-        : /\n1\. Reply without joining — no single-word target reaches this channel unambiguously, so a ">>" prefix can't name it; check whether discord exposes a send tool that can address it\.\n/);
+        : /\n1\. Reply without joining — no single-word target reaches this channel unambiguously, so a ">>" prefix can't name it; check whether discord exposes a send tool that can address it\. Note: follow-ups to your reply will NOT reach you unless they @-mention you or use the reply feature on your message\.\n/);
       assert.doesNotMatch(text, /joins the channel|decline it first/);
       await framework.stop();
     }

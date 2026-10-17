@@ -432,15 +432,17 @@ test("speech opens a channel a machine closed, and the agent's own close of it t
     added: [
       { id: 'gc-a', type: 'discord', label: '#a', direction: 'bidirectional' },
       { id: 'gc-b', type: 'discord', label: '#b', direction: 'bidirectional' },
+      { id: 'hk-a', type: 'discord', label: '#h', direction: 'bidirectional' },
     ],
   } as never);
   const agent = { kind: 'agent' as const, agentName: 'sol' };
-  const gc = { kind: 'module' as const, moduleName: 'subscription-gc' };
-  for (const id of ['gc-a', 'gc-b']) {
+  // Both machine sources: subscription-gc's idle close and a housekeeping close.
+  for (const [id, source] of [['gc-a', 'subscription-gc'], ['gc-b', 'subscription-gc'], ['hk-a', 'housekeeping']] as const) {
     assert.equal((await registry.handleChannelToolCall('channel_open', { channelId: id }, agent)).success, true);
     assert.equal((await registry.handleChannelToolCall(
-      'channel_close', { channelId: id, source: 'subscription-gc', overrideExplicitOpen: true }, gc)).success, true);
+      'channel_close', { channelId: id, source, overrideExplicitOpen: true }, { kind: 'module', moduleName: source })).success, true);
     assert.equal(registry.closedByAgent('discord', id), undefined, 'a machine close is no decision of the agent');
+    assert.equal(registry.speechOpens('discord', id), true, `speech opens what ${source} closed`);
   }
   // The agent closes one of them itself: its close replaces the machine's.
   const closed = await registry.handleChannelToolCall('channel_close', { channelId: 'gc-b' }, agent);
@@ -450,10 +452,12 @@ test("speech opens a channel a machine closed, and the agent's own close of it t
 
   await registry.routeSpeech('sol', 'answering', 'gc-a');
   await registry.routeSpeech('sol', 'answering', 'gc-b');
+  await registry.routeSpeech('sol', 'answering', 'hk-a');
 
-  assert.deepEqual(openCalls.slice(opensBefore).map((c) => c.channelId), ['gc-a'], 'speech opens only the machine-closed one');
+  assert.deepEqual(openCalls.slice(opensBefore).map((c) => c.channelId), ['gc-a', 'hk-a'], 'speech opens only the machine-closed ones');
   assert.equal(lookup('gc-a')!.open, true);
   assert.equal(lookup('gc-b')!.open, false);
+  assert.equal(lookup('hk-a')!.open, true);
 });
 
 test('routeSpeech with an omitted locus fails loudly as a routing bug', async () => {
@@ -620,6 +624,148 @@ test("a module's close, made with no machine source, is the module's: speech lea
   // The agent's own close does, and from then on it's the agent's.
   await registry.handleChannelToolCall('channel_close', { channelId: 'mode-a' }, agent);
   assert.equal(registry.closedByAgent('discord', 'mode-a'), 'closed');
+  // The latest deliberate close wins: the mode set again makes it the module's.
+  await registry.handleChannelToolCall('channel_close', { channelId: 'mode-a' }, mode);
+  assert.equal(registry.closedByAgent('discord', 'mode-a'), undefined, "the module's again");
+  assert.equal(registry.speechOpens('discord', 'mode-a'), false);
+});
+
+/** A registry over a lifecycle log, as Chronicle keeps it, with a server whose
+ *  channels/open answers can be held. */
+function loggedRegistry(events: unknown[]) {
+  const openCalls: Array<{ channelId?: string }> = [];
+  let openHold: Promise<void> | null = null;
+  let openReached: () => void = () => {};
+  const server = {
+    grant: new CapabilityGrant(new Set(ALL_CAPABILITY_PATHS), []),
+    sendChannelsOpen: async (params: { channelId?: string }) => {
+      openCalls.push(params);
+      openReached();
+      if (openHold) await openHold;
+      return {};
+    },
+    sendChannelsClose: async () => ({}),
+    sendChannelsPublish: async () => ({ delivered: true }),
+  };
+  const store = {
+    registerState: () => {},
+    getStateJson: (id: string) => (id === 'mcpl/channel-lifecycle' ? events : null),
+    appendToStateJson: (id: string, event: unknown) => { if (id === 'mcpl/channel-lifecycle') events.push(event); },
+  };
+  // Each open speech reports, as the framework's "[channels] Now open" notice hears of it.
+  const autoOpened: Array<{ channels: Array<{ channelId: string }> }> = [];
+  const registry = new ChannelRegistry(
+    { getServer: () => server } as unknown as McplServerRegistry, {} as FeatureSetManager, () => {}, () => {},
+    { store: store as never, onChannelAutoOpened: (info) => { autoOpened.push(info); } },
+  );
+  return {
+    registry, openCalls, autoOpened,
+    /** Hold every channels/open answer until the returned release; resolves `reached` at the first one. */
+    holdOpens: () => {
+      let release!: () => void;
+      openHold = new Promise<void>((resolve) => { release = resolve; });
+      const reached = new Promise<void>((resolve) => { openReached = resolve; });
+      return { reached, release: () => { openHold = null; release(); } };
+    },
+  };
+}
+
+const channelsOf = (...ids: string[]) =>
+  ids.map((id) => ({ id, type: 'discord', label: `#${id}`, direction: 'bidirectional' as const }));
+
+test("the latest deliberate close records itself over any closed record: the retired recipe's migration, a source a replay couldn't read, the agent's own earlier close; a machine's close replaces none", async () => {
+  // A record replayed from the log with no source reads as 'unknown'.
+  const events: unknown[] = [{ kind: 'desired-state', serverId: 'discord', channelId: 'replayed', desired: 'closed', timestamp: '2026-10-01T00:00:00.000Z' }];
+  const { registry, openCalls } = loggedRegistry(events);
+  // The server's first registration consumes the retired recipe policy ('manual'):
+  // every channel it lists that has no record is recorded closed by that migration.
+  await registry.handleRegister('discord', { channels: channelsOf('migrated-a', 'migrated-b', 'migrated-c', 'replayed') } as never);
+  for (const id of ['migrated-a', 'migrated-b', 'migrated-c', 'replayed']) {
+    assert.equal(registry.getDesiredState('discord', id), 'closed', id);
+    assert.equal(registry.speechOpens('discord', id), true, `${id}: nobody decided it, so speech would open it`);
+  }
+  const agent = { kind: 'agent' as const, agentName: 'sol' };
+  assert.equal((await registry.handleChannelToolCall('channel_close', { channelId: 'migrated-a' }, agent)).success, true);
+  assert.equal((await registry.handleChannelToolCall('channel_decline', { channelId: 'migrated-b', messageId: 'm1' }, agent)).success, true);
+  assert.equal((await registry.handleChannelToolCall('channel_close', { channelId: 'migrated-c' }, { kind: 'module' })).success, true);
+  assert.equal((await registry.handleChannelToolCall('channel_close', { channelId: 'replayed' }, agent)).success, true);
+  assert.equal(registry.closedByAgent('discord', 'migrated-a'), 'closed');
+  assert.equal(registry.closedByAgent('discord', 'migrated-b'), 'declined');
+  assert.equal(registry.closedByAgent('discord', 'migrated-c'), undefined, "a module's close");
+  assert.equal(registry.closedByAgent('discord', 'replayed'), 'closed');
+  // A decline after the agent's own close is the latest decision, and the note says so.
+  assert.equal((await registry.handleChannelToolCall('channel_decline', { channelId: 'migrated-a', messageId: 'm2' }, agent)).success, true);
+  assert.equal(registry.closedByAgent('discord', 'migrated-a'), 'declined');
+  // A machine's close replaces none of them.
+  const gc = { kind: 'module' as const, moduleName: 'subscription-gc' };
+  for (const id of ['migrated-a', 'migrated-c']) {
+    assert.equal((await registry.handleChannelToolCall('channel_close', { channelId: id, source: 'subscription-gc' }, gc)).success, true);
+  }
+  assert.equal(registry.closedByAgent('discord', 'migrated-a'), 'declined');
+  assert.equal(registry.speechOpens('discord', 'migrated-c'), false, "still the module's");
+
+  const opensBefore = openCalls.length;
+  for (const id of ['migrated-a', 'migrated-b', 'migrated-c', 'replayed']) {
+    assert.deepEqual(await registry.routeSpeech('sol', 'answering', id), { delivered: true, channelId: id });
+  }
+  assert.equal(openCalls.length, opensBefore, 'speech opened none of them');
+  // Each decision went to the log.
+  const logged = (id: string) => (events as Array<{ kind?: string; channelId?: string; source?: string }>)
+    .filter((e) => e.kind === 'desired-state' && e.channelId === id).at(-1)?.source;
+  assert.deepEqual(['migrated-a', 'migrated-b', 'migrated-c', 'replayed'].map(logged),
+    ['invitation-declined', 'invitation-declined', 'module-tool', 'agent-tool']);
+});
+
+test("an open still on its way when the agent closes the channel leaves it closed, whether speech or a reconcile sent it", async () => {
+  const { registry, holdOpens, autoOpened } = loggedRegistry([]);
+  await registry.handleRegister('discord', { channels: channelsOf('spoken', 'reconciled') } as never);
+  const agent = { kind: 'agent' as const, agentName: 'sol' };
+
+  // Speech opens 'spoken', nobody decided about it; the agent closes it while the open is on its way.
+  let held = holdOpens();
+  const speaking = registry.routeSpeech('sol', 'answering', 'spoken');
+  await held.reached;
+  assert.equal(registry.getDesiredState('discord', 'spoken'), 'open', "the open's intent is recorded");
+  assert.equal((await registry.handleChannelToolCall('channel_close', { channelId: 'spoken' }, agent)).success, true);
+  held.release();
+  assert.deepEqual(await speaking, { delivered: true, channelId: 'spoken' });
+  assert.equal(registry.isChannelOpen('spoken'), false, 'the close, decided while the open was on its way, stands');
+  assert.equal(registry.getDesiredState('discord', 'spoken'), 'closed');
+  assert.deepEqual(autoOpened, [], 'and nothing reports the channel as opened');
+  assert.equal(await registry.openForSpeech('discord', 'spoken', 'opened-by-delivery'), 'not-opened');
+
+  // A reconcile reopens 'reconciled', which the agent decided open; the agent closes it meanwhile.
+  assert.equal((await registry.handleChannelToolCall('channel_open', { channelId: 'reconciled' }, agent)).success, true);
+  held = holdOpens();
+  const reregistering = registry.handleRegister('discord', { channels: channelsOf('reconciled') } as never);
+  await held.reached;
+  assert.equal((await registry.handleChannelToolCall('channel_close', { channelId: 'reconciled' }, agent)).success, true);
+  held.release();
+  await reregistering;
+  assert.equal(registry.isChannelOpen('reconciled'), false);
+  assert.equal(registry.getDesiredState('discord', 'reconciled'), 'closed');
+});
+
+test('a channel decided open whose open failed is closed at the transport, so the agent can decline it, and speech then leaves it closed', async () => {
+  const { registry, openCalls, setFailOpens } = makeRegistry({ delivered: true });
+  await registry.handleChanged('discord', { added: channelsOf('down') } as never);
+  const agent = { kind: 'agent' as const, agentName: 'sol' };
+  setFailOpens(true);
+  assert.equal((await registry.handleChannelToolCall('channel_open', { channelId: 'down' }, agent)).success, false);
+  assert.equal(registry.getDesiredState('discord', 'down'), 'open');
+  assert.equal(registry.isChannelOpen('down'), false);
+  const declined = await registry.handleChannelToolCall('channel_decline', { channelId: 'down', messageId: 'm1' }, agent);
+  assert.equal(declined.success, true, declined.error);
+  assert.equal(registry.closedByAgent('discord', 'down'), 'declined');
+  setFailOpens(false);
+  const opensBefore = openCalls.length;
+  assert.deepEqual(await registry.routeSpeech('sol', 'answering', 'down'), { delivered: true, channelId: 'down' });
+  assert.equal(openCalls.length, opensBefore, 'speech leaves it closed');
+  // A channel open at the transport is still refused.
+  assert.equal((await registry.handleChannelToolCall('channel_open', { channelId: 'down' }, agent)).success, true);
+  const refused = await registry.handleChannelToolCall('channel_decline', { channelId: 'down', messageId: 'm2' }, agent);
+  assert.equal(refused.success, false);
+  assert.match(refused.error ?? '', /already open/);
 });
 
 test('resolveSendTarget names the channel a send went to and guesses nothing', async () => {

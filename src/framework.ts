@@ -4180,10 +4180,13 @@ export class AgentFramework {
 
   /** What an agent is told when their words go to a channel that stays closed
    *  because it closed or declined the channel itself (ChannelRegistry
-   *  closedByAgent), or undefined where nothing needs saying: speech opens
-   *  every other closed channel, as it always did (openForSpeech), so the
-   *  agent meets the change only here, where speaking used to reopen what it
-   *  had closed. What a closed channel still delivers beyond messages that
+   *  closedByAgent), or undefined where nothing needs saying. Speech also
+   *  leaves a channel a module closed, and a tuned-out one, as they are
+   *  (speechOpens), but there the module's own tool, or tune_out, is the way
+   *  back, and a tuned-out send gets its own line (tunedOutSendNote). Every
+   *  other closed channel opens on speech, as it always did (openForSpeech),
+   *  so the agent meets the change here, where speaking used to reopen what it
+   *  had closed. The channel is read on the server the words went to. What a closed channel still delivers beyond messages that
    *  address the agent is the connector's (slack-mcpl delivers ambient
    *  traffic by its own subscription), so the note promises only those, and
    *  what channel_open does where the server's grant lets it open channels
@@ -4193,10 +4196,10 @@ export class AgentFramework {
    *  that muted it knows. */
   private closedChannelNoteFor(channelId: string, serverId: string | null): string | undefined {
     const registry = this.channelRegistry;
-    if (!registry || !serverId || registry.isChannelOpen(channelId)) return undefined;
+    if (!registry || !serverId || registry.isChannelOpen(channelId, serverId)) return undefined;
     const how = registry.closedByAgent(serverId, channelId);
     if (!how) return undefined;
-    const place = this.channelNotePlace(channelId);
+    const place = this.channelNotePlace(channelId, serverId);
     const reach = 'Messages there that address you, such as an @-mention, still reach you';
     const open = registry.canOpenChannels(serverId)
       ? `; channel_open with channelId "${channelId}" and serverId "${serverId}" opens it.`
@@ -4205,8 +4208,8 @@ export class AgentFramework {
   }
 
   /** A channel as a note names it: its label and id, or its id alone. */
-  private channelNotePlace(channelId: string): string {
-    const label = this.channelRegistry?.getDescriptor(channelId)?.label;
+  private channelNotePlace(channelId: string, serverId?: string): string {
+    const label = this.channelRegistry?.getDescriptor(channelId, serverId)?.label;
     return label && label !== channelId
       ? `${label.startsWith('#') ? label : `#${label}`} (${channelId})`
       : channelId;
@@ -4227,7 +4230,7 @@ export class AgentFramework {
       if (!registry || this.conversationAgentHomes.has(agentName)) return undefined;
       if (registry.getDesiredState(serverId, channelId) !== 'tuned-out') return undefined;
       if (!this.closedChannelNoteOn(agentName)) return undefined;
-      return `${this.channelNotePlace(channelId)} stays tuned out: your words there don't end the tune-out, so its ` +
+      return `${this.channelNotePlace(channelId, serverId)} stays tuned out: your words there don't end the tune-out, so its ` +
         'traffic still goes to your subconscious until the tune-out ends. ' +
         `tune_out with channelId "${channelId}" and mode "cancel" resumes normal attention there.`;
     } catch (err) {
@@ -9965,7 +9968,9 @@ export class AgentFramework {
           `Note: follow-ups to your reply will NOT reach you unless they @-mention you or use the reply feature on your message.\n`
       : `1. Reply${replyJoins ? '' : ' without joining'} — no single-word target reaches this channel unambiguously, ` +
         `so a ">>" prefix can't name it; check whether ${opts.serverId} exposes a send tool that can address it.` +
-        (replyJoins ? ` Replying there joins the channel, as option 2 does. ${withoutJoining}\n` : '\n');
+        (replyJoins
+          ? ` Replying there joins the channel, as option 2 does. ${withoutJoining}\n`
+          : ` Note: follow-ups to your reply will NOT reach you unless they @-mention you or use the reply feature on your message.\n`);
     const missedCount = opts.missedMessages ?? 0;
     const missedNote =
       missedCount > 0
@@ -18889,16 +18894,18 @@ export class AgentFramework {
       }
     }
     // The announcement opens a closed channel as any speech does, unless the
-    // agent closed or declined it itself (openForSpeech): there it stays
-    // closed, so the announcement says the agent will still see messages
-    // addressed to it. That's decided from the channel as the announcement
-    // goes out, since it doesn't depend on the post landing, which stays
-    // fire-and-forget. Those words are true in an open channel too, so
-    // they're the ones used when the channel's state can't be read.
+    // agent or a module decided to keep it closed (openForSpeech): there it
+    // stays closed, so the announcement says the agent will still see
+    // messages addressed to it. That's decided from the channel as the
+    // announcement goes out, on the server its post goes to (routeSpeech's
+    // first entry with that id), since it doesn't depend on the post landing,
+    // which stays fire-and-forget. Those words are true in an open channel
+    // too, so they're the ones used when the channel's state can't be read.
     let staysClosed = false;
     if (destination && this.channelRegistry) {
       try {
-        staysClosed = this.closedChannelNoteFor(destination, this.channelRegistry.getChannelServerId(destination)) !== undefined;
+        const serverId = this.channelRegistry.getChannelServerId(destination);
+        staysClosed = serverId !== null && this.channelRegistry.closedByDecision(serverId, destination);
       } catch (err) {
         staysClosed = true;
         console.error(`[sleep] ${agentName}: whether ${destination} stays closed couldn't be read: ${err instanceof Error ? err.message : String(err)}`);

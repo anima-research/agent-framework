@@ -18,16 +18,17 @@
     waits for that turn's next tool call, where that turn is shown it, or for its end. The agent
     turns the note off for good with `agent_settings`' new `closed_channel_note`, which is on by
     default. A conversation agent gets none: `channel_open` is refused to it, and its settings end
-    with its conversation. In such a channel, the `sleep` tool's default announcement says "I'll
-    still see messages addressed to me, but won't respond until I wake." A send tool's call into a
+    with its conversation. In such a channel, and in one a module closed, the `sleep` tool's
+    default announcement says "I'll still see messages addressed to me, but won't respond until I
+    wake." A send tool's call into a
     channel the agent tuned out, which ended the tune-out before, now leaves it in place, and its
     answer says so: "… stays tuned out: your words there don't end the tune-out, so its traffic
     still goes to your subconscious until the tune-out ends. tune_out with channelId … and mode
     "cancel" resumes normal attention there." The same setting turns that line off.
   - **What the invitation says:** the closed-channel invitation's first option now says what
-    replying does there. In a channel the agent closed or declined itself, it reads as before:
-    "Reply without joining …", with the note that follow-ups that don't address the agent won't
-    reach it. In any other closed channel, where a reply opens the channel, it reads "1. Reply —
+    replying does there. In a channel the agent closed or declined itself, or a module closed, it
+    reads as before: "Reply without joining …", with the note that follow-ups that don't address
+    the agent won't reach it. In any other closed channel, where a reply opens the channel, it reads "1. Reply —
     … it will be delivered there, and replying joins the channel, as option 2 does. To reply
     without joining, decline it first (option 3): a channel you've declined stays closed when you
     speak there." Before, it offered "Reply without joining" there too, though the reply opened
@@ -53,9 +54,15 @@
   where it was `agent-tool`. Speech leaves such a channel closed, as it does one the agent closed,
   but gives no note, since the module owns the way back. In connectome-host that's the `mentions`
   channel mode: a reply to a mention in a channel in that mode stays a reply, and the invitation
-  there offers "Reply without joining". Policy doesn't lift such a close, a machine's close
-  doesn't replace it, and the agent's own close does. A module's close is never refused as a
-  machine's close of an explicit open; only one naming a machine source is.
+  there offers "Reply without joining". Policy doesn't lift such a close, and a machine's close
+  doesn't replace it. Of the agent's close and a module's, the later one is the one on record. A
+  module's close is never refused as a machine's close of an explicit open; only one naming a
+  machine source is. A module's `channel_close` naming an unknown machine source is now refused on
+  a channel that's already closed too, where it returned "already closed".
+  - **Who needs to act:** a module's close made before this change was recorded as `agent-tool`,
+    which can't be told apart from the agent's own, so after the upgrade such a channel reads as
+    one the agent closed, and the agent's words there carry the note. Setting the channel's mode
+    again (connectome-host's `channel_mode` with `mentions`) records the close as the module's.
 - **Direct `ChannelRegistry` consumers:** `openIfClosedForSend()` is removed.
   `resolveSendTarget(channelId, serverId?)` returns the descriptor id of the channel a send went
   to, from a composite or raw id, and opens nothing. `speechOpens(serverId, channelId)` says whether
@@ -63,8 +70,10 @@
   declined it, a module closed it, it's tuned out, or its server's grant lacks
   `channels.lifecycle`.
   `openForSpeech(serverId, channelId, source)` opens it where `speechOpens` says so, as the
-  framework's send path and `routeSpeech` do. `closedByAgent(serverId, channelId)` and
-  `canOpenChannels(serverId)` are new.
+  framework's send path and `routeSpeech` do. `closedByAgent(serverId, channelId)`,
+  `closedByDecision(serverId, channelId)` and `canOpenChannels(serverId)` are new.
+  `isChannelOpen(channelId, serverId?)` and `getDescriptor(channelId, serverId?)` read the channel
+  on the server named, where one is given.
 - **Prompt cache:** `channel_close`'s description and `agent_settings`' input schema change, so
   the first request after the upgrade that carries those tools misses the cache from its tool
   block on.

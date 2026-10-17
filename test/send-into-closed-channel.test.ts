@@ -1,15 +1,15 @@
 /**
  * Speaking never undoes the agent's own decision to keep a channel closed: an
  * explicit send tool's successful call posts (the server sends it), and opens
- * a closed channel, as channel_open does, only where nobody decided to keep it
- * closed. A channel the agent closed or declined stays closed, a channel whose
- * open failed isn't opened again, and a tuned-out channel stays tuned out.
- * The call records the channel as engaged this turn, by its descriptor id,
- * for the mid-turn re-pin. Where the words land in a channel the agent closed
- * or declined itself, the send's answer, or the turn's delivery line for
- * routed speech, says the channel stays closed, what still reaches the agent
- * from it, and how to open it, until the agent turns that note off with
- * agent_settings.
+ * a closed channel, as channel_open does, unless the agent closed or declined
+ * it itself or a module closed it, which stay closed, as a tuned-out channel
+ * stays tuned out. A channel nobody decided about, one a machine closed, and
+ * one decided open whose open failed are opened, as on main. The call records
+ * the channel as engaged this turn, by its descriptor id, for the mid-turn
+ * re-pin. Where the words land in a channel the agent closed or declined
+ * itself, the send's answer, or the turn's delivery line for routed speech,
+ * says the channel stays closed, what still reaches the agent from it, and
+ * how to open it, until the agent turns that note off with agent_settings.
  */
 
 import { test } from 'node:test';
@@ -34,13 +34,17 @@ const UPKEEP_NOTE = `[closed channel] #upkeep (${channelId}) stays closed: you c
   'To stop this note, set closed_channel_note to false with agent_settings.';
 
 /** A real ChannelRegistry with one registered channel, and a framework with
- *  just what dispatchMcplToolCall reads. */
-async function harness() {
+ *  just what dispatchMcplToolCall reads. With sharedIdFirst, a second server,
+ *  discord2, registers a channel with the same id first, so a lookup by bare
+ *  id finds that one. */
+async function harness(opts: { sharedIdFirst?: boolean } = {}) {
   // Every channels/open attempt, including one the server refuses.
   const opens: Array<{ channelId?: string }> = [];
   let refuseOpens = false;
-  // While set, the send's result waits for it.
+  // While set, the send's result waits for it; reaching it resolves sendReached.
   let hold: Promise<void> | null = null;
+  let reached!: () => void;
+  let sendReached = new Promise<void>((resolve) => { reached = resolve; });
   // The raw channel id the send's answer names.
   let sentTo = '444555';
   // While set, the server refuses the send, as discord-mcpl does without Send Messages.
@@ -52,6 +56,7 @@ async function harness() {
     id: 'discord',
     grant: new CapabilityGrant(new Set(ALL_CAPABILITY_PATHS), []),
     async sendToolsCall() {
+      reached();
       if (hold) await hold;
       if (refuseSends) {
         return { content: [{ type: 'text', text: `Missing Access in channel ${sentTo}` }], isError: true };
@@ -75,9 +80,23 @@ async function harness() {
     },
   };
   const serverRegistry = {
-    getServer: (id: string) => (id === 'discord' ? server : undefined),
+    getServer: (id: string) => (id === 'discord' || id === 'discord2' ? server : undefined),
   } as unknown as McplServerRegistry;
   const registry = new ChannelRegistry(serverRegistry, {} as FeatureSetManager, () => {}, () => {});
+  if (opts.sharedIdFirst) {
+    await registry.handleChanged('discord2', {
+      added: [{ id: channelId, type: 'discord', label: '#elsewhere', direction: 'bidirectional',
+        address: { guildId: 'g2', channelId: '444555' } }],
+    } as never);
+  }
+  // Every open a send starts, which the send's answer doesn't wait for.
+  const speechOpens: Promise<unknown>[] = [];
+  const openForSpeech = registry.openForSpeech.bind(registry);
+  registry.openForSpeech = ((...args: Parameters<typeof openForSpeech>) => {
+    const opening = openForSpeech(...args);
+    speechOpens.push(opening);
+    return opening;
+  }) as typeof openForSpeech;
   await registry.handleChanged('discord', {
     added: [{ id: channelId, type: 'discord', label: '#upkeep', direction: 'bidirectional',
       address: { guildId: 'g1', channelId: '444555' } }],
@@ -131,15 +150,20 @@ async function harness() {
         'discord',
       );
     });
-    // Let anything the send started on its own settle before the caller looks.
-    await new Promise((resolve) => setImmediate(resolve));
+    // Let the open the send started on its own settle, and what follows it,
+    // before the caller looks.
+    await Promise.allSettled(speechOpens.splice(0));
     return out;
   }
 
   return {
     registry, framework, opens, windowMessages, reply, published,
     setRefuseOpens: (v: boolean) => { refuseOpens = v; },
-    setHold: (p: Promise<void> | null) => { hold = p; },
+    setHold: (p: Promise<void> | null) => {
+      hold = p;
+      sendReached = new Promise<void>((resolve) => { reached = resolve; });
+    },
+    sendReached: () => sendReached,
     setSentTo: (raw: string) => { sentTo = raw; },
     setRefuseSends: (v: boolean) => { refuseSends = v; },
     setRefuseCloses: (v: boolean) => { refuseCloses = v; },
@@ -267,6 +291,35 @@ test('a send the server refuses carries no closed-channel note', async () => {
   assert.equal(refused.error, 'Missing Access in channel 444555', "the server's refusal, and nothing about the channel");
 });
 
+test('a send the server refuses into a closed channel nobody decided about opens nothing and says nothing about it', async () => {
+  const { registry, opens, windowMessages, reply, setRefuseSends } = await harness();
+  assert.equal(registry.speechOpens('discord', channelId), true, 'a reply that went through would open it');
+  const before = registry.getDesiredState('discord', channelId);
+  setRefuseSends(true);
+  const opensBefore = opens.length;
+  const refused = await reply();
+  assert.equal(refused.success, false);
+  assert.equal(refused.error, 'Missing Access in channel 444555');
+  assert.equal(opens.length, opensBefore, 'nothing was posted, so nothing opens');
+  assert.equal(registry.isChannelOpen(channelId), false);
+  assert.equal(registry.getDesiredState('discord', channelId), before, 'and no intent to open is recorded');
+  assert.equal(registry.speechOpens('discord', channelId), true, 'a later reply would still open it');
+  assert.deepEqual(windowMessages, [], 'no notice either');
+});
+
+test("a send's note reads the channel on the server the words went to, not one on another server with the same id", async () => {
+  const { registry, reply } = await harness({ sharedIdFirst: true });
+  // discord2's channel with this id is open, and found first by bare id.
+  assert.equal((await registry.handleChannelToolCall('channel_open', { channelId, serverId: 'discord2' }, origin)).success, true);
+  assert.equal(registry.isChannelOpen(channelId), true, 'by bare id, the open one on discord2');
+  // On discord, where the reply goes, the agent closed it.
+  assert.equal((await registry.handleChannelToolCall('channel_close', { channelId, serverId: 'discord' }, origin)).success, true);
+  assert.equal(registry.isChannelOpen(channelId, 'discord'), false);
+  const { success, data } = await reply();
+  assert.equal(success, true);
+  assert.ok(data.endsWith(UPKEEP_NOTE), data);
+});
+
 test('a send into an open channel, or into a channel a module closed, carries no closed-channel note', async () => {
   {
     const { registry, reply } = await harness();
@@ -384,7 +437,6 @@ test('a reply_message into a channel decided open whose open failed opens it aga
   const opensBefore = opens.length;
 
   const { success, data } = await reply();
-  await new Promise<void>((resolve) => setImmediate(resolve));
 
   assert.equal(success, true);
   assert.ok(!data.includes('[closed channel]'), 'no note: the agent decided this channel open');
@@ -426,15 +478,17 @@ test('a send into a tuned-out channel leaves the tune-out in place, and its answ
 });
 
 test('a reply_message still in flight when the agent closes its channel leaves it closed', async () => {
-  const { registry, opens, reply, setHold } = await harness();
+  const { registry, opens, reply, setHold, sendReached } = await harness();
   assert.equal((await registry.handleChannelToolCall('channel_open', { channelId }, origin)).success, true);
   let release!: () => void;
   setHold(new Promise<void>((resolve) => { release = resolve; }));
+  const opensBefore = opens.length;
   const replying = reply();
-  // The same round closes the channel while the reply is in flight.
+  // The reply is at the server, waiting for its answer, when the same round
+  // closes the channel.
+  await sendReached();
   assert.equal((await registry.handleChannelToolCall('channel_close', { channelId }, origin)).success, true);
   release();
-  const opensBefore = opens.length;
   const { success, data } = await replying;
   assert.equal(success, true);
   assert.equal(registry.isChannelOpen(channelId), false, 'the close, made while the reply was in flight, stands');
@@ -497,8 +551,8 @@ test("closed_channel_note is an agent_settings key, kept in the framework's stat
   }
 });
 
-test("a sleep announced into a channel the agent closed says only what addresses it reaches it; anywhere else it opens as speech does", async () => {
-  const { registry, framework, published, opens } = await harness();
+test("a sleep announced into a channel the agent or a module closed says the agent will still see messages addressed to it; elsewhere the post opens the channel as speech does, and says it will still see messages", async () => {
+  const { registry, framework, published, opens, setRefuseCloses } = await harness();
   await registry.handleChanged('discord', {
     added: [{ id: 'discord:g1:777888', type: 'discord', label: '#lobby', direction: 'bidirectional',
       address: { guildId: 'g1', channelId: '777888' } }],
@@ -537,7 +591,7 @@ test("a sleep announced into a channel the agent closed says only what addresses
   let slept = await sleep({ seconds: 600 });
   assert.equal(slept.success, true);
   assert.equal(slept.endTurn, true);
-  assert.equal(slept.data.closedChannelNote, undefined, 'the sleep result carries no note');
+  assert.deepEqual(Object.keys(slept.data).sort(), ['sleepingFor', 'timeZone', 'until', 'untilLocal'], 'the sleep result carries no note');
   assert.deepEqual(published.splice(0), [{ channelId, text: addressed }]);
   assert.equal(registry.isChannelOpen(channelId), false, 'it stays closed');
 
@@ -552,11 +606,41 @@ test("a sleep announced into a channel the agent closed says only what addresses
   framework.closedChannelNoteSettingsExtension().reset('sol');
 
   // When who closed the channel can't be read, the words are ones true either way.
-  const closedByAgent = registry.closedByAgent.bind(registry);
-  registry.closedByAgent = () => { throw new Error('the registry is unreadable'); };
+  const closedByDecision = registry.closedByDecision.bind(registry);
+  registry.closedByDecision = () => { throw new Error('the registry is unreadable'); };
   slept = await sleep({ seconds: 600 });
-  registry.closedByAgent = closedByAgent;
+  registry.closedByDecision = closedByDecision;
   assert.deepEqual(published.splice(0), [{ channelId, text: addressed }]);
+
+  // A channel a module closed stays closed too, as connectome-host's mentions mode keeps it.
+  await registry.handleChanged('discord', {
+    added: [{ id: 'discord:g1:121212', type: 'discord', label: '#mentions-only', direction: 'bidirectional',
+      address: { guildId: 'g1', channelId: '121212' } }],
+  } as never);
+  assert.equal((await registry.handleChannelToolCall('channel_open', { channelId: 'discord:g1:121212' }, origin)).success, true);
+  assert.equal((await registry.handleChannelToolCall('channel_close', { channelId: 'discord:g1:121212' }, { kind: 'module' })).success, true);
+  routing.locus = 'discord:g1:121212';
+  const opensBeforeModule = opens.length;
+  slept = await sleep({ seconds: 600 });
+  assert.deepEqual(published.splice(0), [{ channelId: 'discord:g1:121212', text: addressed }]);
+  assert.equal(opens.length, opensBeforeModule, 'the post opened nothing');
+  assert.equal(registry.isChannelOpen('discord:g1:121212'), false);
+
+  // A channel the agent closed whose server refused the close is still open, so all of it still reaches the agent.
+  await registry.handleChanged('discord', {
+    added: [{ id: 'discord:g1:343434', type: 'discord', label: '#refused', direction: 'bidirectional',
+      address: { guildId: 'g1', channelId: '343434' } }],
+  } as never);
+  assert.equal((await registry.handleChannelToolCall('channel_open', { channelId: 'discord:g1:343434' }, origin)).success, true);
+  setRefuseCloses(true);
+  assert.equal((await registry.handleChannelToolCall('channel_close', { channelId: 'discord:g1:343434' }, origin)).success, false);
+  setRefuseCloses(false);
+  assert.equal(registry.closedByAgent('discord', 'discord:g1:343434'), 'closed', 'the close is on record');
+  assert.equal(registry.isChannelOpen('discord:g1:343434'), true, 'and the channel is still open');
+  routing.locus = 'discord:g1:343434';
+  slept = await sleep({ seconds: 600 });
+  assert.deepEqual(published.splice(0), [{ channelId: 'discord:g1:343434', text: quiet }]);
+  routing.locus = channelId;
 
   // A conversation agent's announcement reads the same: the words follow the channel.
   framework.conversationAgentHomes.set('sol', channelId);
