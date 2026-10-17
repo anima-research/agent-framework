@@ -336,9 +336,8 @@ const CHANNEL_TOOL_DEFINITIONS: ToolDefinition[] = [
   {
     name: 'channel_open',
     description:
-      'Open a channel to start receiving its ordinary ongoing traffic. The MCPL ' +
-      'integration performs its own subscribe/join/attach operation. Optionally request ' +
-      'history preceding the message that invited you into the channel.',
+      'Open a channel. What an open channel delivers to you depends on its MCPL server. ' +
+      'Optionally request history preceding the message that invited you into the channel.',
     inputSchema: {
       type: 'object' as const,
       properties: {
@@ -378,7 +377,9 @@ const CHANNEL_TOOL_DEFINITIONS: ToolDefinition[] = [
   },
   {
     name: 'channel_close',
-    description: 'Close a channel to stop receiving messages',
+    description:
+      'Close a channel. Messages that address you still reach you; what else stops reaching you ' +
+      'depends on its server.',
     inputSchema: {
       type: 'object' as const,
       properties: {
@@ -504,10 +505,11 @@ interface ChannelRegistryOptions {
    * Called when channels were opened WITHOUT the agent asking (subscription
    * policy admitting a newly discovered channel, or delivery into a closed
    * locus). The host wires this to drop a durable notice into the agent's
-   * window — the agent must always learn that new traffic will start
-   * flowing, and that `channel_close` opts out (their decision outranks
-   * policy). Fires ONCE per channel ever: the desired-state decision is
-   * durable, so reboots do not re-announce. Must not trigger inference.
+   * window — the agent must always learn that the channel opened, and that
+   * `channel_close` opts out (their decision outranks policy). What an open
+   * channel delivers is the server's to say (#406). Fires ONCE per channel
+   * ever: the desired-state decision is durable, so reboots do not
+   * re-announce. Must not trigger inference.
    */
   onChannelAutoOpened?: (info: {
     /** Agent whose action caused the open (delivery); absent for policy opens. */
@@ -2284,9 +2286,9 @@ export class ChannelRegistry {
       }
     }
 
-    // Announce policy admissions to the agent — nothing may start flowing
-    // traffic into their window without them being told, and told how to
-    // opt out (channel_close; their decision outranks policy).
+    // Announce policy admissions to the agent — no channel may open without
+    // them being told, and told how to opt out (channel_close; their
+    // decision outranks policy).
     if (policyOpened.length > 0) {
       try {
         this.onChannelAutoOpened?.({
@@ -2878,7 +2880,7 @@ export class ChannelRegistry {
     if (entry.open || this.getDesiredState(entry.serverId, input.channelId) === 'open') {
       return {
         success: false,
-        error: `Channel is already open: ${input.channelId}. Use channel_close to leave it.`,
+        error: `Channel is already open: ${input.channelId}. Use channel_close to close it.`,
         isError: true,
       };
     }
