@@ -148,7 +148,7 @@ async function harness() {
   };
 }
 
-test("a send that stays in a closed channel says so, what still reaches the agent, and how to open it, until they turn the note off", async () => {
+test("a send into a channel the agent closed says so, what still reaches the agent, and how to open it, until they turn the note off", async () => {
   const { registry, framework, reply, state } = await harness();
   assert.equal((await registry.handleChannelToolCall('channel_open', { channelId }, origin)).success, true);
   assert.equal((await registry.handleChannelToolCall('channel_close', { channelId }, origin)).success, true);

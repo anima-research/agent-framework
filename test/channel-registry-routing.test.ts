@@ -574,6 +574,13 @@ test("a machine's close of a channel with no record leaves it the default it was
   assert.deepEqual(openCalls.slice(opensBefore).map((c) => c.channelId), ['lazy-1']);
 });
 
+test("channel_close's description says the close stands against speech and policy", () => {
+  const { registry } = makeRegistry({ delivered: true });
+  const close = registry.getChannelTools().find((t) => t.name === 'channel_close')!;
+  assert.match(close.description,
+    /It stays closed until you open it with channel_open: neither speaking there nor subscription policy reopens it\.$/);
+});
+
 test('resolveSendTarget names the channel a send went to and guesses nothing', async () => {
   const { registry, openCalls } = makeRegistry({ delivered: true });
   const added = (id: string, raw: string) => ({

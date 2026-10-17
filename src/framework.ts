@@ -10952,8 +10952,8 @@ export class AgentFramework {
           ? `${suppressed} plain-speech segment(s) suppressed (proseRouting=disabled — publish only with an explicit send tool)`
           : `${suppressed} plain-speech segment(s) suppressed (explicit send in the same round — resend with a send tool if it was meant to be heard)`
         : '';
-    // Words that stayed in a closed channel that isn't a DM say so, unless
-    // the agent has turned the note off.
+    // Words that stayed in a channel the agent closed or declined say so,
+    // unless the agent has turned the note off.
     const closedNotes = this.closedChannelNotes(agent.name, seen);
     const closedNote = closedNotes.length > 0
       ? ` · ${closedNotes.join(' ')} ${AgentFramework.CLOSED_CHANNEL_NOTE_OFF}`
