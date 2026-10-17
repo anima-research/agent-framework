@@ -27,7 +27,10 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
         with:
-          node-version: 20
+          # The engines floor: a release publishes only after it builds and
+          # passes its tests on the oldest Node it promises to run on. The
+          # publish job below builds the published tarball again, on Node 24.
+          node-version: '22.12.0'
 
       # The same check `npm version` runs first (see CONTRIBUTING.md): an
       # open issue labelled release-hold stops the release. Both jobs that
@@ -40,8 +43,10 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
 
+      # --engine-strict, as in ci.yml: a dependency that doesn't admit the
+      # floor fails here, before anything is published.
       - name: Install dependencies
-        run: npm install
+        run: npm install --engine-strict
 
       - name: Type-check
         run: npx tsc --noEmit
