@@ -14787,6 +14787,8 @@ export class AgentFramework {
       toolCallTimeoutMs: cfg?.toolCallTimeoutMs,
       scriptTimeoutMs: cfg?.scriptTimeoutMs,
       idleReclaimMs: 0, // dedicated runner; lifetime is the exec deadline
+      env: cfg?.env,
+      inheritEnv: cfg?.inheritEnv,
       label: `${agentName}:${scriptId}`,
       onToolCall: (toolName, args) => this.handleScriptToolCall(agentName, toolName, args, origin),
     });
@@ -15218,6 +15220,8 @@ export class AgentFramework {
         toolCallTimeoutMs: cfg?.toolCallTimeoutMs,
         scriptTimeoutMs: cfg?.scriptTimeoutMs,
         idleReclaimMs: cfg?.idleReclaimMs,
+        env: cfg?.env,
+        inheritEnv: cfg?.inheritEnv,
         label: agentName,
         // The script that made the call is the one running when it arrives.
         onToolCall: (toolName, args) =>

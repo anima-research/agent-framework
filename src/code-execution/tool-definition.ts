@@ -9,6 +9,7 @@
  */
 
 import type { ToolDefinition } from '../types/index.js';
+import { kindOf } from '../mcpl/transport.js';
 import { formatLimit, MAX_TIMER_MS } from './py-runner.js';
 
 export const CODE_EXECUTION_TOOL_NAME = 'code_execution';
@@ -39,7 +40,9 @@ export function buildCodeExecutionToolDefinition(opts?: {
       'Only what you print() (plus stderr and the exit code) comes back to you — intermediate ' +
       'tool results stay in the script, so filter or aggregate large data there and print only ' +
       'what you need. Interpreter state (variables, imports) persists across code_execution ' +
-      `calls but is reclaimed after ~${idleMinutes} minutes idle. A tool call that receives no ` +
+      `calls but is reclaimed after ~${idleMinutes} minutes idle. Relative paths resolve in a ` +
+      'scratch directory of the interpreter\'s, which goes whenever it stops or is reclaimed, so a file meant to ' +
+      'outlast the interpreter needs an absolute path. A tool call that receives no ' +
       `response within ~${callTimeoutSeconds}s raises TimeoutError inside the script. ` +
       `A foreground script is stopped after ${formatLimit(limits.defaultMs)}; pass time_limit_ms to set this call's limit ` +
       `(at most ${formatLimit(limits.maxMs)}; a background script runs up to ${formatLimit(limits.backgroundMaxMs)}). ` +
@@ -113,8 +116,20 @@ export function scriptTimeLimits(opts?: {
   };
 }
 
-/** Refuse a configuration whose time limits contradict each other. */
-export function validateCodeExecutionConfig(cfg: { scriptTimeoutMs?: number; maxScriptTimeoutMs?: number }): void {
+/**
+ * Refuse a configuration whose time limits contradict each other, or whose
+ * interpreter environment would be misread. A recipe's `"inheritEnv": "true"`,
+ * or a `${VAR}` substituted as a string, arrives untyped, and the runner passes
+ * the host's environment only for `true`, so such a value would quietly keep
+ * the allowlist. Anything but true, false or null is refused, a quoted "false"
+ * included.
+ */
+export function validateCodeExecutionConfig(cfg: {
+  scriptTimeoutMs?: number;
+  maxScriptTimeoutMs?: number;
+  env?: unknown;
+  inheritEnv?: unknown;
+}): void {
   const defaultMs = cfg.scriptTimeoutMs ?? 600_000;
   if (cfg.maxScriptTimeoutMs !== undefined && !(cfg.maxScriptTimeoutMs >= defaultMs)) {
     throw new Error(
@@ -122,4 +137,43 @@ export function validateCodeExecutionConfig(cfg: { scriptTimeoutMs?: number; max
         'it is the most an agent may ask for, and the default is always allowed',
     );
   }
+  // None of the environment's refusals below shows the value it refuses,
+  // at most its kind: a substituted value can be a credential. null counts
+  // as not set, so a generated config that writes an unset setting as null
+  // keeps working.
+  if (cfg.inheritEnv !== undefined && cfg.inheritEnv !== null && typeof cfg.inheritEnv !== 'boolean') {
+    const wanted = typeof cfg.inheritEnv === 'string' ? 'true or false, unquoted,' : 'true or false,';
+    throw new Error(
+      `codeExecution.inheritEnv must be ${wanted} not ${kindOf(cfg.inheritEnv)}: ` +
+        "true hands the interpreter the host's whole environment, and false or leaving it out keeps the allowlist",
+    );
+  }
+  if (cfg.env !== undefined && cfg.env !== null) {
+    if (!isPlainObject(cfg.env)) {
+      throw new Error(`codeExecution.env must be an object of variable names and string values, not ${kindOf(cfg.env)}`);
+    }
+    for (const [name, value] of Object.entries(cfg.env)) {
+      // spawn writes each variable as name=value: a name that is empty or
+      // holds '=' doesn't reach the interpreter as written, and a NUL in a
+      // name or a value makes spawn throw at every start.
+      // Only what comes before an '=' or NUL is shown: what follows can be a
+      // value pasted into the name.
+      if (name === '' || name.includes('=') || name.includes('\0')) {
+        const shown = name === '' ? 'that is empty' : `starting ${JSON.stringify(name.split(/[=\0]/, 1)[0])} that holds '=' or NUL`;
+        throw new Error(`codeExecution.env has a variable name ${shown}, and a name can't be empty or hold '=' or NUL`);
+      }
+      if (typeof value !== 'string') {
+        throw new Error(`codeExecution.env.${name} must be a string, not ${kindOf(value)}: give its value as a string, or leave ${name} out`);
+      }
+      if (value.includes('\0')) {
+        throw new Error(`codeExecution.env.${name} holds a NUL character, which no environment variable can carry`);
+      }
+    }
+  }
+}
+
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  if (typeof value !== 'object' || value === null) return false;
+  const proto = Object.getPrototypeOf(value);
+  return proto === Object.prototype || proto === null;
 }

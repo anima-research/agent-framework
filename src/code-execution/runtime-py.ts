@@ -53,6 +53,7 @@ import inspect
 import io
 import json
 import os
+import re
 import signal
 import sys
 import threading
@@ -70,9 +71,16 @@ TAIL_CHARS = 4000
 
 _send_lock = threading.Lock()
 
+# A str can hold a lone surrogate, which UTF-8 can't encode: on POSIX,
+# os.fsdecode makes one of each byte in a filename that doesn't decode as
+# UTF-8, and json.loads makes one of a "\ud800" escape. PYTHONIOENCODING makes
+# the protocol channel strict UTF-8, so writing one would fail the whole
+# message, and a script's result would never arrive. Each goes as U+FFFD.
+_LONE_SURROGATE = re.compile(r"[\ud800-\udfff]")
+
 
 def send(obj):
-    line = json.dumps(obj, ensure_ascii=False, default=str)
+    line = _LONE_SURROGATE.sub("\ufffd", json.dumps(obj, ensure_ascii=False, default=str))
     with _send_lock:
         PROTO_OUT.write(line + "\n")
         PROTO_OUT.flush()
