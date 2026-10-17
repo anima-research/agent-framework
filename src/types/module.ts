@@ -327,7 +327,8 @@ export interface ModuleContext {
    * Modules use this to react to agent lifecycle without polling — e.g. an
    * adapter that wants to show a "typing" indicator can bracket it between
    * `inference:started` and the terminal events: `inference:completed` (the
-   * normal end), `inference:turn_ended` (a tool result ended the turn),
+   * model answered and the turn ended, with a final response or with a tool
+   * result that ended it, which `inference:turn_ended` then follows),
    * `inference:aborted`, `inference:failed` and `inference:exhausted`, all of
    * which carry `agentName`. A turn's tool-call cycles stay inside its
    * stream, so one bracket spans them. A context-budget restart emits

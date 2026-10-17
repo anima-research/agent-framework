@@ -1252,7 +1252,50 @@ test('usage of an abandoned guarded round is counted in session totals', async (
   try {
     await h.run();
     const totals = h.framework.getSessionUsage().totals as unknown as Record<string, number>;
-    assert.ok(totals.inputTokens >= 1_007, `refused round usage missing: ${JSON.stringify(totals)}`);
+    assert.equal(totals.inputTokens, 1_007, `the refused round is counted, once: ${JSON.stringify(totals)}`);
+  } finally { await h.framework.stop(); }
+});
+
+test('an abandoned guarded round whose response carries no usage still counts its rounds', async () => {
+  // Membrane's usage samples are cumulative across a stream's rounds: the
+  // withheld stream's two rounds emit 10, then 20 input tokens, and the
+  // retry's one round 10. No final response carries details.usage, so each
+  // stream counts its latest sample.
+  const sampled = (response: NormalizedResponse, inputTokens: number, outputTokens: number) =>
+    ({ ...response, usage: { inputTokens, outputTokens } }) as NormalizedResponse;
+  const h = await harness([[sampled(calls('one'), 10, 5), sampled(refused(), 20, 10)], [sampled(answer(), 10, 5)]], { toolResultGuard: true });
+  try {
+    await h.run();
+    const totals = h.framework.getSessionUsage().totals as unknown as Record<string, number>;
+    assert.equal(totals.inputTokens, 30, `each stream is counted once, from its latest sample: ${JSON.stringify(totals)}`);
+    // The log says what the totals count: the withheld stream, then the retry.
+    const logs = h.framework.queryInferenceLogs({ agentName: 'assistant' }).entries.map((e) => e.entry).reverse();
+    assert.deepEqual(logs.map((e) => [e.success, e.tokenUsage]),
+      [[false, { input: 20, output: 10 }], [true, { input: 10, output: 5 }]]);
+  } finally { await h.framework.stop(); }
+});
+
+test("an abandoned guarded round with no usage sample counts and notes its response's own usage", async () => {
+  const h = await harness([[calls('one'), refused()], [answer()]], { toolResultGuard: true });
+  // A stream that emits no usage events: only the refused response's own
+  // usage (10 input tokens, from the shared mock) says what it was billed.
+  const make = h.membrane.streamYielding.bind(h.membrane);
+  h.membrane.streamYielding = (request, options) => {
+    const stream = make(request, options);
+    const events = stream[Symbol.asyncIterator].bind(stream);
+    stream[Symbol.asyncIterator] = async function* () {
+      const it = events();
+      for (let r = await it.next(); !r.done; r = await it.next()) if (r.value.type !== 'usage') yield r.value;
+    };
+    return stream;
+  };
+  try {
+    await h.run();
+    const totals = h.framework.getSessionUsage().totals as unknown as Record<string, number>;
+    assert.equal(totals.inputTokens, 10, `the refused round is counted from its response: ${JSON.stringify(totals)}`);
+    const withheld = h.framework.queryInferenceLogs({ agentName: 'assistant' }).entries.map((e) => e.entry)
+      .find((e) => e.stopReason === 'refusal');
+    assert.deepEqual(withheld?.tokenUsage, { input: 10, output: 5 }, "the withheld stream's entry carries the response's usage");
   } finally { await h.framework.stop(); }
 });
 
