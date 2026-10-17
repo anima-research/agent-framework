@@ -205,7 +205,8 @@ export interface CoalescerHost<E> {
   /** Persist one receipt now, before the acceptance is acknowledged. Throws
    *  on failure, which fails the acceptance (the producer retries). */
   recordReceipt?(record: CoalescingReceiptRecord): void;
-  /** Make every write so far DURABLE (fsync, group-committed by the host).
+  /** Make every write so far DURABLE (an fsync; the coalescer requests each
+   *  commit under its lock, so no two acceptances share one).
    *  Awaited before an acceptance is acknowledged and before push/render is
    *  issued: a kill after either boundary must find the receipt, the
    *  accepted work, and the render-start on disk. Rejects on failure. */

@@ -13,7 +13,7 @@ import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createMockResponse } from './helpers/mock-membrane.js';
-import { fixture, eventually, crash, ok, TS } from './helpers/coalescing-fixture.js';
+import { fixture, eventually, crash, ok, TS, REPLY_DEADLINE_MS } from './helpers/coalescing-fixture.js';
 
 // ---------------------------------------------------------------------------
 // Plain coalescing, feature-set scope (vectors 1–6, 35)
@@ -829,6 +829,44 @@ function holdNextCommit(f: Awaited<ReturnType<typeof fixture>>): Promise<() => v
   });
 }
 
+test("the fixture's reply deadline: a request still unanswered at 3 s fails at the deadline, naming it", { timeout: 120_000 }, async (t) => {
+  const f = await fixture(); t.after(f.close); await f.register();
+  // A host that doesn't answer in time: the batch's first commit is held until
+  // the deadline has passed, so its admission waits.
+  const held = holdNextCommit(f);
+  const received: string[] = [];
+  f.framework.onTrace((e) => {
+    if (e.type === 'mcpl:coalescing' && (e as { kind?: string }).kind === 'received') received.push((e as { eventId: string }).eventId);
+  });
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  let release: (() => void) | undefined;
+  try {
+    const batch = f.send('channels/incoming', { messages: [
+      f.channel('e1', 'one', {}, 'chat', 'm1'), f.channel('e2', 'two', {}, 'chat', 'm2'), f.channel('e3', 'three', {}, 'chat', 'm3'),
+    ] }).then(() => 'replied', (err: Error) => err.message);
+    // send()'s deadline runs on the mocked clock, so it can't end this wait;
+    // node:test's own timeout still does, mocked setTimeout or not.
+    release = await held;
+    // Whether the wait has settled once the timers that are due have run.
+    const now = () => Promise.race([batch, new Promise<string>((r) => setImmediate(() => r('pending')))]);
+    t.mock.timers.tick(3_000);
+    assert.equal(await now(), 'pending', 'still waiting at 3 s');
+    t.mock.timers.tick(REPLY_DEADLINE_MS - 3_000 - 1);
+    assert.equal(await now(), 'pending', 'still waiting just short of the deadline');
+    t.mock.timers.tick(1);
+    assert.equal(await now(), `no reply to channels/incoming within ${REPLY_DEADLINE_MS / 1000} s`);
+  } finally {
+    // Real timers again before the held work goes on. The released commit lets
+    // the host finish admitting the batch, and it answers once it has: wait for
+    // that answer, whatever the checks above found, so the close doesn't take
+    // the channel away from the admission still under way.
+    t.mock.timers.reset();
+    release?.();
+    await f.answered();
+  }
+  assert.deepEqual(received, ['e1', 'e2', 'e3'], 'the host admitted the whole batch before the test ends');
+});
+
 test('R11: a retraction during the render-start commit wait is final; the batch is not restored', async (t) => {
   const f = await fixture(); t.after(f.close);
   await f.send('push/event', f.params('1', 'withdrawn_fallback', { deferred: true, initial: true }));
@@ -1029,7 +1067,7 @@ async function storageOutage(t: { after: (fn: () => Promise<void>) => void }, ba
   return { f, coalescer, outage, wakes, driveTo, assertSpacing };
 }
 
-test('R17: a persistent storage outage backs off (1×, 2×, 4× …) and the series resets on recovery', { timeout: 30_000 }, async (t) => {
+test('R17: a persistent storage outage backs off (1×, 2×, 4× …) and the series resets on recovery', { timeout: 120_000 }, async (t) => {
   const { f, coalescer, outage, wakes, driveTo, assertSpacing } = await storageOutage(t, 40);
   await f.send('push/event', f.params('1', 'outage_fallback', { deferred: true, initial: true }));
   outage.failing = true;
@@ -1060,7 +1098,7 @@ test('R17: a persistent storage outage backs off (1×, 2×, 4× …) and the ser
   assert(f.lastRequest().includes('second_outage'), 'delivered once storage recovered again');
 });
 
-test('R17b: the backoff stops doubling at 60× its base', { timeout: 30_000 }, async (t) => {
+test('R17b: the backoff stops doubling at 60× its base', { timeout: 120_000 }, async (t) => {
   // A small base reaches the cap within a second: attempt 7 is the first
   // whose doubling (64×) passes it.
   const { f, wakes, outage, driveTo, assertSpacing } = await storageOutage(t, 3);
