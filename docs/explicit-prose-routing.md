@@ -62,8 +62,8 @@ The grammar is never injected into context. The mode switch appends one short
 durable notice (persisted per agent, so reboots never re-notice); the first
 undelivered text produces a bounce notice carrying the exact resend syntax —
 the model learns by doing, and the knowledge accretes into its own history.
-The full reference is available on demand via the **`prose_help` tool**, whose
-result is model-requested content. The system prompt is never touched: those
+When the agent's `allowedTools` permits `prose_help`, the full reference is
+available on demand through that tool. Its result is model-requested content. The system prompt is never touched: those
 bytes belong to the recipe, and the deepest KV prefix must not vary with
 framework code.
 

@@ -289,7 +289,7 @@ const isAddressedMessage = (
 // envelopes can never disagree on what is a prefix.
 
 /** One-time primer appended when an agent's proseRouting mode changes. */
-function proseModePrimer(mode: 'explicit' | 'hybrid' | 'locus' | 'disabled'): string {
+function proseModePrimer(mode: 'explicit' | 'hybrid' | 'locus' | 'disabled', helpAvailable: boolean): string {
   if (mode === 'locus') {
     return '[prose-routing] Mode change: your plain text auto-routes to the ' +
       'conversational locus again. `>>` destination prefixes are no longer needed.';
@@ -306,14 +306,14 @@ function proseModePrimer(mode: 'explicit' | 'hybrid' | 'locus' | 'disabled'): st
   // message drew a deterministic reasoning_extraction refusal (ablation A/B).
   // The grammar is TAUGHT BY BOUNCE: the first undelivered text produces a
   // notice with the exact resend syntax, and the full reference is available
-  // on demand via the prose_help tool (a tool RESULT is model-requested
+  // on demand via prose_help when allowed by the agent's list (a tool RESULT is model-requested
   // content — the safest role there is). Nothing is injected into the system
   // prompt: those bytes belong to the recipe, and the deepest KV prefix must
   // not vary with framework code.
   return (
     '[prose-routing] Output mode changed: plain text is delivered only with a ' +
-    'destination prefix line, e.g. ">>#channel-name your text". ' +
-    'The prose_help tool shows the full syntax.'
+    'destination prefix line, e.g. ">>#channel-name your text".' +
+    (helpAvailable ? ' The prose_help tool shows the full syntax.' : '')
   );
 }
 
@@ -1762,6 +1762,8 @@ export class AgentFramework {
   private usedEphemeralAgentNames: Set<string> = new Set();
   /** One-shot generation tickets minted by createEphemeralAgent. */
   private ephemeralCandidates: WeakMap<Agent, ContextManager> = new WeakMap();
+  /** Warn only once per Agent instance after utilities are registered. */
+  private emptyUtilityPermissionWarnings: WeakSet<Agent> = new WeakSet();
   /** Physical ephemeral frames deliberately disposed by their run watchdog/caller.
    * The name is single-generation, so these frames still own their terminal
    * typing/outgoing close even after runEphemeralToCompletion deregisters them. */
@@ -2290,6 +2292,9 @@ export class AgentFramework {
     // Add modules
     for (const module of config.modules) {
       await framework.addModule(module);
+    }
+    for (const agent of framework.agents.values()) {
+      framework.warnEmptyUtilityPermissions(agent);
     }
     for (const [agentName, presentation] of framework.toolPresentations) {
       const workspace = framework.getWorkspaceModule();
@@ -3932,6 +3937,11 @@ export class AgentFramework {
     return this.moduleRegistry.getAllModules();
   }
 
+  /** Read the namespaced utility catalogue without adding first-class model tools. */
+  getAllUtilities(): import('./types/index.js').ToolDefinition[] {
+    return this.moduleRegistry.getAllUtilities();
+  }
+
   /**
    * Get all available tools from all modules and MCPL servers.
    */
@@ -4316,6 +4326,15 @@ export class AgentFramework {
     };
   }
 
+  private warnEmptyUtilityPermissions(agent: Agent): void {
+    if (agent.allowedTools === 'all' || !agent.allowedTools.includes('utils')
+        || this.emptyUtilityPermissionWarnings.has(agent)) return;
+    const utilities = this.moduleRegistry.getAllUtilities();
+    if (utilities.length === 0 || utilities.some(tool => agent.canUseTool(tool.name))) return;
+    console.warn(`[utils] Agent '${agent.name}': ${utilities.length} registered utilities, 0 permitted; none permitted by this agent's allowedTools. Add each required module--utility name to allowedTools.`);
+    this.emptyUtilityPermissionWarnings.add(agent);
+  }
+
   private getToolsForAgent(
     agentName: string,
     snapshot?: InferenceToolSnapshot,
@@ -4334,7 +4353,11 @@ export class AgentFramework {
           : t);
       return [...SUBCONSCIOUS_TOOLS, ...basics];
     }
-    return [...this.getAllTools(), ...(this.toolPresentations.has(agentName) ? presentationTools(this.toolPresentations.get(agentName)!.config.cataloguePath) : [])].map((tool) => {
+    const agent = this.agents.get(agentName);
+    if (agent) this.warnEmptyUtilityPermissions(agent);
+    const hasPermittedUtility = !agent || this.moduleRegistry.getAllUtilities().some(tool => agent.canUseTool(tool.name));
+    return [...this.getAllTools(), ...(this.toolPresentations.has(agentName) ? presentationTools(this.toolPresentations.get(agentName)!.config.cataloguePath) : [])]
+      .filter(tool => tool.name !== 'utils' || hasPermittedUtility).map((tool) => {
       if (tool.name === 'think') {
         return this.buildThinkTool(
           snapshot?.sameRoundThinkTextPolicy
@@ -5917,8 +5940,10 @@ export class AgentFramework {
   /**
    * Create an ephemeral agent that is NOT registered in the main event loop.
    *
-   * Used by SubagentModule (and similar) to create short-lived agents
-   * that are driven externally (not by the framework's event loop).
+   * Used by SubagentModule (and similar) to prepare short-lived agents.
+   * Call runEphemeralToCompletion(agent, contextManager) to register and run
+   * the returned agent. Framework-created identities have tool authority only
+   * while registered; public tool calls before a run or after retirement fail.
    * The returned agent has its own ContextManager on a namespaced state
    * within the framework's shared Chronicle store — messages go to
    * `{namespace}/messages`, context log to `{namespace}/context`.
@@ -11437,7 +11462,7 @@ export class AgentFramework {
       'The text is retained; nothing is lost. To deliver it unchanged, reply with a ' +
       `destination plus the token {{unsent}}, e.g. "${prefix}#channel {{unsent}}" or "${prefix}@person {{unsent}}". ` +
       `"${prefix}skip_reply {{unsent}}" keeps it in context only.` +
-      (prefix === '>>' ? ' The prose_help tool shows the full syntax.' : '');
+      (prefix === '>>' && this.canAgentUseTool(agent.name, 'prose_help') ? ' The prose_help tool shows the full syntax.' : '');
     try {
       // Through framework.addMessage, NOT the context manager directly: while
       // the turn is still streaming this defers the notice to the next tool
@@ -11509,7 +11534,7 @@ export class AgentFramework {
     try {
       const id = agent.getContextManager().addMessage(
         'user',
-        [{ type: 'text', text: proseModePrimer(mode) }],
+        [{ type: 'text', text: proseModePrimer(mode, this.canAgentUseTool(agent.name, 'prose_help')) }],
         { system: true, kind: 'prose-routing-primer' },
       );
       this.emitTrace({ type: 'message:added', messageId: id, source: 'prose-routing-primer' });
@@ -12606,7 +12631,9 @@ export class AgentFramework {
             // with verbatim roundContent are live-routed (see liveProseRouting
             // note above — the fallback preamble is cumulative in XML mode).
             if (this.channelRegistry) {
-              const roundToolNames = event.calls.map((c) => c.name);
+              const roundToolNames = event.calls
+                .filter((c) => this.canAgentUseTool(agent.name, c.name))
+                .map((c) => c.name);
               const hasSameRoundPrivateThink =
                 roundToolNames.includes('think') &&
                 requestSnapshot.sameRoundThinkTextPolicy === 'private';
@@ -13190,7 +13217,7 @@ export class AgentFramework {
               const toolNames = response.content
                 .filter((b) => b.type === 'tool_use')
                 .map((b) => (b as unknown as { name?: string }).name)
-                .filter((n): n is string => typeof n === 'string');
+                .filter((n): n is string => typeof n === 'string' && this.canAgentUseTool(agent.name, n));
               const silenced = liveProseRouting
                 ? turnSilenced
                 : turnSilenced || toolNames.some(isSilencingTool);
@@ -13819,8 +13846,12 @@ export class AgentFramework {
    * call entered through — a public method shared with model callers can
    * never confer module trust, whatever the input claims. Module origin
    * exists only through the private closure handed to ModuleRegistry
-   * (ctx.callTool → executeToolCallFrom with {kind:'module'}). Callers that
-   * don't identify themselves fail safe to agent semantics too.
+   * (ctx.callTool → executeToolCallFrom with {kind:'module'}), which is exempt
+   * from agent allowlists. Registered agents' allowedTools is enforced at
+   * dispatch, including namespaced utility names; utils only grants the
+   * list/describe/run slot. Genuinely unidentified public callers (including
+   * unknown legacy names) remain unrestricted. Framework-created identities
+   * are refused while unregistered, even if their configured list allows it.
    */
   async executeToolCall(call: ToolCall): Promise<ToolResult> {
     return this.executeToolCallFrom(call, {
@@ -14009,6 +14040,11 @@ export class AgentFramework {
   }
 
   private async executeToolCallFrom(call: ToolCall, origin: ChannelToolOrigin): Promise<ToolResult> {
+    if (origin.kind === 'agent') {
+      const refusal = this.agentToolPermissionFailure(origin.agentName, call);
+      if (refusal) return refusal;
+    }
+
     if (isPresentationTool(call.name)) return this.editToolPresentation(call.callerAgentName ?? '__ephemeral__', call);
     // Client-side programmatic tool calling for promise-based callers
     // (SubagentModule ephemerals). Keyed by callerAgentName so each ephemeral
@@ -14048,7 +14084,7 @@ export class AgentFramework {
     // ephemerals, ModuleContext.callTool) reach utilities the same way the
     // model does.
     if (call.name === 'utils') {
-      return this.handleUtilsToolCall(call.callerAgentName ?? '__ephemeral__', call, { inProcess: true });
+      return this.handleUtilsToolCall(call.callerAgentName ?? '__ephemeral__', call, { inProcess: true, trustedModule: origin.kind === 'module' });
     }
 
     // Module tools. The caller uses the result in process, so it gets the
@@ -15243,7 +15279,36 @@ export class AgentFramework {
     return best;
   }
 
+  /** Registered policy; framework-created identities have no dispatch authority
+   * while unregistered. Genuine legacy caller names retain their surface. */
+  private canAgentUseTool(agentName: string, toolName: string): boolean {
+    const agent = this.agents.get(agentName);
+    return agent ? agent.canUseTool(toolName) : !this.usedEphemeralAgentNames.has(agentName);
+  }
+
+  private agentToolPermissionFailure(agentName: string, call: ToolCall, reportRefusal = true): ToolResult | undefined {
+    if (this.canAgentUseTool(agentName, call.name)) return undefined;
+    const error = !this.agents.has(agentName) && this.usedEphemeralAgentNames.has(agentName)
+      ? `Caller '${agentName}' is not a running agent; framework-created agents have tool authority only while registered.`
+      : `Tool '${call.name}' is not permitted by this agent's allowedTools.`;
+    if (reportRefusal) {
+      this.toolLifecycleEmitter?.refuse(agentName, call.id);
+      this.emitTrace({
+        type: 'tool:failed', module: 'framework', tool: call.name, callId: call.id, error,
+      });
+    }
+    return { success: false, error, isError: true };
+  }
+
   private dispatchToolCall(agentName: string, call: ToolCall): void {
+    const refusal = this.agentToolPermissionFailure(agentName, call);
+    if (refusal) {
+      this.pushEvent({
+        type: 'tool-result', callId: call.id, toolName: call.name, agentName, moduleName: 'framework', result: refusal,
+      });
+      return;
+    }
+
     // Enrich call with caller identity so modules can resolve the calling agent
     const enrichedCall: ToolCall = { ...call, callerAgentName: agentName };
     if (isPresentationTool(call.name)) {
@@ -19364,28 +19429,46 @@ export class AgentFramework {
    *  (Module.getUtilities). Shared by the model-facing dispatcher and the
    *  programmatic path (executeToolCall), so code_execution scripts and
    *  ephemerals reach utilities too. */
-  private async handleUtilsToolCall(agentName: string, call: ToolCall, options: { inProcess?: boolean } = {}): Promise<ToolResult> {
+  private async handleUtilsToolCall(agentName: string, call: ToolCall, options: { inProcess?: boolean; trustedModule?: boolean } = {}): Promise<ToolResult> {
     const input = (call.input ?? {}) as { action?: unknown; name?: unknown; args?: unknown };
-    const utilities = this.moduleRegistry.getAllUtilities();
-    const available = (): string =>
-      utilities.length ? utilities.map((u) => u.name).join(', ') : '(none registered)';
+    const allUtilities = this.moduleRegistry.getAllUtilities();
+    const utilities = allUtilities.filter(def => options.trustedModule || this.canAgentUseTool(agentName, def.name));
+    const counts = `${allUtilities.length} registered utilities, ${utilities.length} permitted`;
+    const available = (): string => utilities.length
+      ? `Available: ${utilities.map((u) => u.name).join(', ')} (${counts})`
+      : allUtilities.length
+        ? `${counts}; none permitted by this agent's allowedTools. Add each required module--utility name to allowedTools.`
+        : `${counts} (none registered)`;
     switch (input.action) {
       case 'list':
+        if (allUtilities.length > 0 && utilities.length === 0) {
+          return { success: false, isError: true, error: available() };
+        }
         return {
           success: true,
           data: utilities.map((u) => ({ name: u.name, description: utilityOneLiner(u.description) })),
         };
       case 'describe': {
-        const def = utilities.find((u) => u.name === input.name);
+        const def = allUtilities.find((u) => u.name === input.name);
         if (!def) {
-          return { success: false, isError: true, error: `No utility "${String(input.name)}". Available: ${available()}` };
+          return { success: false, isError: true, error: `No utility "${String(input.name)}". ${available()}` };
+        }
+        if (!options.trustedModule) {
+          const refusal = this.agentToolPermissionFailure(agentName, { ...call, name: def.name }, false);
+          if (refusal) return refusal;
         }
         return { success: true, data: def };
       }
       case 'run': {
-        const def = utilities.find((u) => u.name === input.name);
+        const def = allUtilities.find((u) => u.name === input.name);
         if (!def) {
-          return { success: false, isError: true, error: `No utility "${String(input.name)}". Available: ${available()}` };
+          return { success: false, isError: true, error: `No utility "${String(input.name)}". ${available()}` };
+        }
+        if (!options.trustedModule) {
+          // The allowed outer utils call owns its lifecycle and terminal trace;
+          // refusing the utility does not create or refuse a separate call.
+          const refusal = this.agentToolPermissionFailure(agentName, { ...call, name: def.name }, false);
+          if (refusal) return refusal;
         }
         const args = input.args ?? {};
         const problem = validateUtilityArgs(args, def.inputSchema);

@@ -27,9 +27,15 @@ export interface AgentConfig {
   strategy?: ContextStrategy;
 
   /**
-   * Which tools this agent can use.
+   * Enforced at dispatch for registered agent callers; omitted means 'all'.
    * - 'all': all available tools
-   * - string[]: specific tool names (with module prefix)
+   * - string[]: exact tool names, including module--utility names for utilities.
+   * A named utility grant permits direct model, public and script calls.
+   * 'utils' additionally grants the list/describe/run slot; run still checks
+   * the utility name. The slot is hidden when no utility is permitted.
+   * Trusted module calls are exempt. Genuinely unidentified public callers,
+   * including unknown legacy names, remain unrestricted. Framework-created
+   * identities have tool authority only while registered.
    */
   allowedTools?: 'all' | string[];
 
