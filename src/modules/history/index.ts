@@ -215,9 +215,13 @@ const SEMANTIC_DEFAULT_LIMIT = 10;
 const SEMANTIC_MAX_LIMIT = 50;
 /** Largest k sent to the embed-service when over-fetching past dropped hits (its own cap is 200). */
 const SEMANTIC_MAX_FETCH = 200;
-/** Local snippet: the leading SEMANTIC_SNIPPET_CHARS of the current text. */
+/**
+ * Local snippet: the leading SEMANTIC_SNIPPET_CHARS of the current text, one
+ * fewer where the last would split a surrogate pair, since the snippet reaches
+ * the agent's context.
+ */
 function snippetOf(text: string): string {
-  return text.length <= SEMANTIC_SNIPPET_CHARS ? text : `${text.slice(0, SEMANTIC_SNIPPET_CHARS)}…`;
+  return text.length <= SEMANTIC_SNIPPET_CHARS ? text : `${safeSlice(text, 0, SEMANTIC_SNIPPET_CHARS)}…`;
 }
 const SEMANTIC_SNIPPET_CHARS = 400;
 
@@ -1682,7 +1686,7 @@ export class HistoryModule implements Module {
       if (msgId !== undefined) {
         const m = cm.getMessage(msgId);
         if (!m) return 'offBranch';
-        const text = messageIndexText(m, includePrivate).slice(0, this.semanticCfg!.maxChars ?? 32_000);
+        const text = safeSlice(messageIndexText(m, includePrivate), 0, this.semanticCfg!.maxChars ?? 32_000);
         if (!text) return 'stale';
         currentText.set(h.id, text);
         return 'ok';
@@ -2588,12 +2592,12 @@ function buildAuthorFilter(include: AuthorSpec | undefined, exclude: AuthorSpec 
 /** ~SNIPPET_CONTEXT_CHARS of surrounding context on each side of a match, or
  *  the first ~SNIPPET_FALLBACK_CHARS of content when no meaningful match
  *  position is given (kept simple on purpose — this is a readability aid,
- *  not a highlighting engine). */
+ *  not a highlighting engine). Neither end splits a surrogate pair. */
 function snippetAround(text: string, index: number, length: number): string {
-  if (index < 0) return text.slice(0, SNIPPET_FALLBACK_CHARS);
+  if (index < 0) return safeSlice(text, 0, SNIPPET_FALLBACK_CHARS);
   const start = Math.max(0, index - SNIPPET_CONTEXT_CHARS);
   const end = Math.min(text.length, index + length + SNIPPET_CONTEXT_CHARS);
   const prefix = start > 0 ? '…' : '';
   const suffix = end < text.length ? '…' : '';
-  return prefix + text.slice(start, end) + suffix;
+  return prefix + safeSlice(text, start, end) + suffix;
 }

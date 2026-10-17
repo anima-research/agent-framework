@@ -293,7 +293,7 @@ export function messageToItem(msg: StoredMessage, cfg: { includePrivateTools?: b
   const tsMs = msg.timestamp.getTime();
   return {
     id: `msg:${String(msg.id)}`,
-    text: text.slice(0, cfg.maxChars ?? 32_000),
+    text: safeSlice(text, 0, cfg.maxChars ?? 32_000),
     ts: tsMs / 1000,
     channel: channelOf(msg),
     kind: 'message',
@@ -320,7 +320,7 @@ export function summaryToItem(s: SummaryLike, cfg: { maxChars?: number }): Index
   if (!text) return null;
   return {
     id: `sum:${s.id}`,
-    text: text.slice(0, cfg.maxChars ?? 32_000),
+    text: safeSlice(text, 0, cfg.maxChars ?? 32_000),
     ts: s.startMs / 1000,
     kind: 'summary',
     level: s.level,

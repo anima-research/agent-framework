@@ -210,6 +210,25 @@ describe('HistoryModule UX: wholeWord', () => {
   });
 });
 
+describe('HistoryModule UX: snippets', () => {
+  it('keep up to 80 units each side of a match, one fewer where the 80th would split a surrogate pair', async () => {
+    // One code point, two UTF-16 units. With the "x" first, 80 units before the match start on the second half of
+    // a pair, and with the "z" after it, 80 units after the match end on the first half of one: each end moves in.
+    const grin = '\u{1F600}';
+    const before = `x${grin.repeat(100)}y`;
+    const { mod } = stub([
+      mk({ id: 's1', ms: min(1), text: `${before}needlez${grin.repeat(100)}` }),
+      // Here the message ends within 80 units of the match, so the snippet runs to its end and only its start moves.
+      mk({ id: 's2', ms: min(2), text: `${before}needlez` }),
+    ]);
+    const snippets = async (input: Record<string, unknown>) =>
+      data(await call(mod, 'search', input)).matches.map((m: any) => m.snippet);
+    const expected = [`…${grin.repeat(39)}yneedlez${grin.repeat(39)}…`, `…${grin.repeat(39)}yneedlez`];
+    assert.deepEqual(await snippets({ query: 'needle' }), expected);
+    assert.deepEqual(await snippets({ query: 'needle', regex: true }), expected);
+  });
+});
+
 describe('HistoryModule UX: order + scannedThrough', () => {
   it('order:newest scans the most recent maxScan and returns newest-first, with a to: resume point', async () => {
     const { mod } = stub(fixture);

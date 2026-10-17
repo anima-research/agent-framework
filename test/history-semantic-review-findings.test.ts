@@ -366,6 +366,45 @@ describe('semantic sync: Greptile #173 findings', () => {
     await m.stop();
   });
 
+  it("a hit's snippet keeps up to 400 units of its text, one fewer where the 400th would split a surrogate pair", async () => {
+    // One code point, two UTF-16 units, so after the "x" the 400th unit is the first half of the 200th of them.
+    const grin = '\u{1F600}';
+    const cm = new StubCm([msg('e', T0, `x${grin.repeat(250)}`)]);
+    const m = new HistoryModule({ semantic: { url: svc.url, namespace: 'n', syncIntervalMs: 0, maxSyncBeforeSearch: 0 } });
+    m.bind(cm as unknown as ContextManager);
+    await m.syncSemanticIndex();
+    const res = await m.handleToolCall({ id: 'c', name: 'semantic_search', input: { query: 'x' } });
+    const hit = (res.data as { hits: Array<{ id: string; snippet: string }> }).hits.find((h) => h.id === 'msg:e');
+    assert.ok(hit, 'the message is a hit');
+    assert.equal(hit.snippet, `x${grin.repeat(199)}…`);
+    await m.stop();
+  });
+
+  it("with maxChars at 400, a hit's snippet is its text cut there at a whole character", async () => {
+    // maxChars cuts the current text the snippet is built from. After the "x", the 400th unit is the first half of a pair.
+    const grin = '\u{1F600}';
+    const cm = new StubCm([msg('e', T0, `x${grin.repeat(250)}`)]);
+    const m = new HistoryModule({ semantic: { url: svc.url, namespace: 'n', syncIntervalMs: 0, maxSyncBeforeSearch: 0, maxChars: 400 } });
+    m.bind(cm as unknown as ContextManager);
+    await m.syncSemanticIndex();
+    const res = await m.handleToolCall({ id: 'c', name: 'semantic_search', input: { query: 'x' } });
+    const hit = (res.data as { hits: Array<{ id: string; snippet: string }> }).hits.find((h) => h.id === 'msg:e');
+    assert.ok(hit, 'the message is a hit');
+    assert.equal(hit.snippet, `x${grin.repeat(199)}`);
+    await m.stop();
+  });
+
+  it("the text indexed is cut at maxChars at a whole character, a message's and a summary's", async () => {
+    const grin = '\u{1F600}';
+    const summary = { id: 's1', level: 1, content: `x${grin.repeat(250)}`, tokens: 3, startMs: T0, endMs: T0 + 1, firstSequence: 0, lastSequence: 1, createdMs: T0 + 5 };
+    const m = new HistoryModule({ semantic: { url: svc.url, namespace: 'n', syncIntervalMs: 0, maxChars: 400 } });
+    m.bind(new StubCm([msg('e', T0, `x${grin.repeat(250)}`)], [summary]) as unknown as ContextManager);
+    await m.syncSemanticIndex();
+    assert.equal(svc.items.get('msg:e')?.text, `x${grin.repeat(199)}`);
+    assert.equal(svc.items.get('sum:s1')?.text, `x${grin.repeat(199)}`);
+    await m.stop();
+  });
+
   it('G3#2 queued edits for messages that left the branch do not spend the sync budget', async () => {
     const cm = new StubCm(Array.from({ length: 300 }, (_, i) => msg(`m${i}`, T0 + i * 3_600_000, `message ${i}`)));
     const m = mod(cm);
