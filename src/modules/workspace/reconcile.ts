@@ -341,6 +341,47 @@ function settleAdoption(p: Pending, s: { hash: string; size: number } | null): A
 }
 
 /**
+ * What's in the way, and the way out, when disk's shape keeps a push from a
+ * path: no push writes a file over a directory or unlinks one, or writes
+ * below a file or a symlink the walk won't take (`writeContained`,
+ * `unlinkContained`), forced or not. Null for any other reason, which is
+ * passed on as it is.
+ */
+function inTheWay(reason: string | undefined, deletion: boolean): string | null {
+  if (reason === 'a directory') {
+    return deletion
+      ? 'disk has a directory at this path, and no push unlinks one, forced or not — if it should go, move or remove it on disk'
+      : 'disk has a directory at this path, and no push writes a file over one, forced or not — ' +
+        'move or remove that directory on disk and materialize again, or write the file under another path';
+  }
+  // A deletion below a file finds nothing there to unlink, so only a write
+  // meets this one.
+  if (reason === 'a parent path is not a directory') {
+    return 'disk has a file or a symlink where this path needs a directory, and no push writes below one, forced or not — ' +
+      'move or remove it on disk and materialize again, or write the file under another path';
+  }
+  return null;
+}
+
+/**
+ * The forced way out the refusal of a disk copy that couldn't be verified
+ * names, if any. A forced push skips the verification, so it gets past the
+ * note only where its effect can go on. A file the module can't read (EACCES)
+ * is overwritten, or unlinked, where disk lets the workspace write it, or
+ * unlink it, which a read's EACCES doesn't show: force is named on that
+ * condition. What isn't a regular file is unlinked by a forced deletion. No
+ * other note names force: a forced push stops at some (a symlink the mount
+ * doesn't follow, a FIFO for a write, a parent it can't use); another writer
+ * still at the file ("the file changed while it was read") is answered by
+ * materializing again; and the rest aren't known to pass.
+ */
+function forcedWay(note: string | undefined, deletion: boolean, forced: string): string {
+  if (note === 'cannot open (EACCES)') return `, or, if disk lets the workspace ${deletion ? 'unlink' : 'write'} the file, ${forced}`;
+  if (deletion && note === 'not a regular file') return `, or ${forced}`;
+  return '';
+}
+
+/**
  * The synchronous precondition of every workspace mutation: evidence owed a
  * barrier is made durable first, and an adoption left pending on the
  * selected branch is settled by the tree before the mutation changes it, and
@@ -1020,6 +1061,10 @@ export async function pushPaths(
     const p = agreement.get(mount.name, path);
     const bi = mount.intents.get(path);
     const v = decide(d, s, p, bi, branchId, false);
+    // The ways out a refusal names, as materialize takes them: a deletion
+    // reaches disk only with applyDeletions.
+    const again = s ? 'materialize again' : 'materialize again with applyDeletions';
+    const forced = s ? 'materialize it with force to overwrite it' : 'materialize it with force and applyDeletions to delete it';
     // What the effect may find: what this observation saw, unless forced.
     const expect: Expect = opts.force || d.kind === 'unobserved' || d.kind === 'unhashed'
       ? { kind: 'any' }
@@ -1033,7 +1078,7 @@ export async function pushPaths(
         result.skipped.push({
           path,
           reason: 'stale copy: disk changed since it last agreed with the workspace, which did not — ' +
-            'sync this path to adopt the disk version, or pass force to overwrite it',
+            `sync this path to adopt the disk version, or ${forced}`,
         });
         continue;
       }
@@ -1065,7 +1110,22 @@ export async function pushPaths(
     }
     if (v.state === 'unverified') {
       if (!opts.force) {
-        result.skipped.push({ path, reason: `cannot verify disk copy (${v.note ?? 'not observed'}) — fix it and materialize again, or pass force to overwrite it` });
+        // An intent that can't be read is the one note fixing doesn't
+        // answer: nothing is decided over it until a sync of the path
+        // replaces it (decide()), and a sync replaces it only where it sees
+        // disk's copy, so a copy it can't see is named first. For the rest,
+        // fixing what the note names holds, and forcedWay says where force
+        // does too.
+        const sync = 'sync this path to adopt the disk version, which replaces the intent';
+        result.skipped.push({
+          path,
+          reason: bi?.unreadable !== undefined
+            ? d.kind === 'absent' || d.kind === 'file'
+              ? `${v.note} — ${sync}`
+              : `${v.note}, and disk's copy can't be verified (${d.kind === 'unobserved' ? d.reason : 'not hashed'}) — once it can be, ${sync}`
+            : inTheWay(v.note, !s) ??
+              `cannot verify disk copy (${v.note ?? 'not observed'}) — fix it and ${again}${forcedWay(v.note, !s, forced)}`,
+        });
         continue;
       }
     }
@@ -1086,13 +1146,13 @@ export async function pushPaths(
         path,
         reason: noEvidence
           ? `disk holds a different copy, and nothing records which is newer (conflict: ${kind}) — ` +
-            'sync this path to adopt the disk version, or materialize this path with force to overwrite it'
+            `sync this path to adopt the disk version, or materialize this path with force ${s ? 'to overwrite it' : 'and applyDeletions to delete it'}`
           : kind === 'interrupted'
             ? 'disk holds bytes that match neither what was being written there nor what disk last agreed with ' +
               '(conflict: interrupted), as a write that failed or was cut off partway leaves — check the file, then ' +
-              'pass force to write the workspace copy over it, or sync this path to adopt the disk copy as it is'
+              `${forced}, or sync this path to adopt the disk copy as it is`
             : `stale copy: disk changed since it last agreed with the workspace (conflict: ${kind}) — ` +
-              'sync this path to adopt the disk version, or pass force to overwrite it',
+              `sync this path to adopt the disk version, or ${forced}`,
       });
       continue;
     }
@@ -1167,7 +1227,8 @@ export async function pushPaths(
         // exactly what it was, whatever kind that was.
         agreement.restore(mount.name, step.path, step.before);
         recorded = true;
-        result.skipped.push({ path: step.path, reason: `not ${step.kind === 'write' ? 'written' : 'unlinked'}: ${failure.message}` });
+        const why = inTheWay(failure.message, step.kind === 'unlink') ?? failure.message;
+        result.skipped.push({ path: step.path, reason: `not ${step.kind === 'write' ? 'written' : 'unlinked'}: ${why}` });
       } else {
         // No completion: the intent stays pending, and the next observation
         // resolves it from whatever disk then holds.
