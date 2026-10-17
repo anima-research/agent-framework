@@ -91,7 +91,7 @@ export type { McplServerConfig } from './mcpl/index.js';
 // MCPL client connection (exposed so external tooling — server playtests,
 // health probes, protocol harnesses — can dial an MCPL server exactly the
 // way the framework host does, over stdio or WebSocket)
-export { McplServerConnection } from './mcpl/index.js';
+export { McplServerConnection, McplRequestError } from './mcpl/index.js';
 export type { McplHostCapabilities, McplConnectionCloseInfo } from './mcpl/index.js';
 
 // MCPL tool lifecycle (RFC-007) and tool classes (RFC-008): the types a host
@@ -127,18 +127,38 @@ export { PassthroughStrategy, AutobiographicalStrategy, KnowledgeStrategy } from
 export type { KnowledgeConfig, PhaseType } from '@animalabs/context-manager';
 export type { Membrane, NormalizedMessage, NormalizedRequest, ContentBlock } from '@animalabs/membrane';
 
-// Offline outage recovery and branch-independent Discord awareness markers
+// Offline outage recovery and the Discord awareness-mark journal
 export {
   DiscordAwarenessOutbox,
+  DiscordAwarenessRefusal,
   DEFAULT_DISCORD_AWARENESS_EMOJI,
   defaultDiscordAwarenessOutboxPath,
   extractDiscordAwarenessRefs,
+  isPermanentDiscordReactionFailure,
+  selectDiscordAwarenessRefs,
 } from './recovery/discord-awareness-outbox.js';
 export type {
+  DiscordAwarenessAction,
+  DiscordAwarenessAttempt,
   DiscordAwarenessBatch,
-  DiscordAwarenessEntry,
-  DiscordAwarenessOperation,
+  DiscordAwarenessBatchRecord,
+  DiscordAwarenessBatchView,
+  DiscordAwarenessLegacyEvidence,
+  DiscordAwarenessRetractView,
+  DiscordAwarenessView,
+  DiscordAwarenessCancelReceipt,
+  DiscordAwarenessDispatch,
+  DiscordAwarenessMarks,
+  DiscordAwarenessOp,
+  DiscordAwarenessOpStatus,
+  DiscordAwarenessOutcome,
+  DiscordAwarenessPrepareInput,
+  DiscordAwarenessImportedUnsent,
   DiscordAwarenessRef,
+  DiscordAwarenessRetractReceipt,
+  DiscordAwarenessRetirement,
+  DiscordAwarenessScope,
+  DiscordAwarenessSettlement,
   DiscordSuppressionInterval,
 } from './recovery/discord-awareness-outbox.js';
 // Live operator surgery (rollback / suppress) and its durable action log
@@ -147,7 +167,9 @@ export type {
   OperatorLogEntry,
   OperatorLogInput,
   OperatorRequester,
+  SurgeryMarkerFacts,
   SurgeryMarkerReceipt,
+  SurgeryMarksPreview,
 } from './operator-log.js';
 export { createOfflineRecoveryBranch } from './recovery/offline-branch.js';
 export type {

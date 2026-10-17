@@ -17,6 +17,7 @@ import { JsStore } from '@animalabs/chronicle';
 import { ContextManager } from '@animalabs/context-manager';
 import { AgentFramework, OperatorActionError } from '../src/index.js';
 import { createOfflineRecoveryBranch } from '../src/recovery/offline-branch.js';
+import { DiscordAwarenessOutbox } from '../src/recovery/discord-awareness-outbox.js';
 import { MockMembrane } from './helpers/mock-membrane.js';
 
 const T = 1_760_000_000_000;
@@ -119,13 +120,44 @@ describe('default operator branch names', () => {
     assert.equal(cm().currentBranch().name, `rollback/scout/${T}-2`);
   });
 
+  it('a default name a pending suppression claims takes the next free name, rather than being refused', async () => {
+    // What a suppression that failed and couldn't retire its batch leaves:
+    // its removals pending for its target, here the rollback's default name.
+    const outbox = (framework as unknown as { discordAwarenessOutbox: DiscordAwarenessOutbox }).discordAwarenessOutbox;
+    const [kept] = cm().getAllMessages();
+    outbox.prepare({
+      agentName: 'scout', sourceBranch: 'main', targetBranch: `rollback/scout/${T}`,
+      refs: [{ serverId: 'discord', channelId: 'discord:g1:c1', messageId: 'd1' }], scope: 'all',
+      activationPolicy: 'explicit', suppressionIntervals: [{ fromId: String(kept.id), toId: String(kept.id) }],
+    });
+    assert.equal(outbox.pendingSuppressionsFor(`rollback/scout/${T}`).length, 1);
+    pinNow();
+    const rolled = await framework.rollbackToMessage('scout', { messageId: ids[3] });
+    assert.equal(rolled.targetBranch, `rollback/scout/${T}-2`);
+    assert.equal(cm().currentBranch().name, `rollback/scout/${T}-2`);
+  });
+
+  it("while the journal can't be read, a default name is refused with the journal's own message", async () => {
+    pinNow();
+    mock.method(DiscordAwarenessOutbox.prototype, 'pendingSuppressionsFor', () => {
+      throw new Error('injected unreadable journal');
+    });
+    await assert.rejects(
+      framework.rollbackToMessage('scout', { messageId: ids[3] }),
+      (error: unknown) => error instanceof OperatorActionError && error.code === 'failed'
+        && error.message.startsWith(`Branch rollback/scout/${T} can't be made now: the Discord awareness journal can't be read (injected unreadable journal)`),
+    );
+    assert.deepEqual(branchNames(), ['main']);
+  });
+
   it("an explicit name stays the caller's: a taken one is refused, not renamed", async () => {
     await framework.rollbackToMessage('scout', { messageId: ids[3], branchName: 'chosen' });
     await framework.switchBranch('main');
     await assert.rejects(
       framework.rollbackToMessage('scout', { messageId: ids[1], branchName: 'chosen' }),
-      (error: unknown) => error instanceof OperatorActionError && error.code === 'failed'
-        && /Branch already exists: chosen/.test(error.message),
+      // Refused before anything is prepared, as a known collision is.
+      (error: unknown) => error instanceof OperatorActionError && error.code === 'invalid'
+        && /^Rollback branch chosen already exists$/.test(error.message),
     );
     assert.deepEqual(branchNames(), ['chosen', 'main']);
   });
@@ -155,6 +187,66 @@ describe('default offline recovery branch names', () => {
       const recovered = await createOfflineRecoveryBranch({ storePath, agentName: 'cairn', messageId: 'm2' });
       assert.equal(recovered.sourceBranch, 'main');
       assert.equal(recovered.targetBranch, `recovery/cairn/${T}-2`);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("an offline recovery's default name a pending suppression claims takes the next free name; a dry run doesn't open the journal", async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'offline-recovery-claimed-'));
+    const storePath = join(dir, 'agent.chronicle');
+    try {
+      const store = JsStore.openOrCreate({ path: storePath });
+      const seeded = await ContextManager.open({ store, namespace: 'agents/cairn' });
+      const seededIds: string[] = [];
+      for (let i = 1; i <= 3; i++) {
+        seededIds.push(String(seeded.addMessage('user', [{ type: 'text', text: `m${i}` }], {
+          serverId: 'discord', channelId: 'discord:g1:c1', messageId: `m${i}`,
+        })));
+      }
+      seeded.close();
+      // A suppression left with its removals pending for the recovery's
+      // default name.
+      new DiscordAwarenessOutbox(store).prepare({
+        agentName: 'cairn', sourceBranch: 'main', targetBranch: `recovery/cairn/${T}`,
+        refs: [{ serverId: 'discord', channelId: 'discord:g1:c1', messageId: 'm1' }], scope: 'all',
+        activationPolicy: 'explicit', suppressionIntervals: [{ fromId: seededIds[0]!, toId: seededIds[0]! }],
+      });
+      store.close();
+
+      pinNow();
+      const dry = await createOfflineRecoveryBranch({ storePath, agentName: 'cairn', messageId: 'm2', dryRun: true });
+      assert.equal(dry.targetBranch, `recovery/cairn/${T}`);
+      const recovered = await createOfflineRecoveryBranch({ storePath, agentName: 'cairn', messageId: 'm2' });
+      assert.equal(recovered.targetBranch, `recovery/cairn/${T}-2`);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("while the journal can't be read, an offline recovery's default name is refused with the journal's own message", async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'offline-recovery-unreadable-'));
+    const storePath = join(dir, 'agent.chronicle');
+    try {
+      const store = JsStore.openOrCreate({ path: storePath });
+      const seeded = await ContextManager.open({ store, namespace: 'agents/cairn' });
+      for (let i = 1; i <= 3; i++) {
+        seeded.addMessage('user', [{ type: 'text', text: `m${i}` }], {
+          serverId: 'discord', channelId: 'discord:g1:c1', messageId: `m${i}`,
+        });
+      }
+      seeded.close();
+      store.close();
+
+      pinNow();
+      mock.method(DiscordAwarenessOutbox.prototype, 'pendingSuppressionsFor', () => {
+        throw new Error('injected unreadable journal');
+      });
+      await assert.rejects(
+        createOfflineRecoveryBranch({ storePath, agentName: 'cairn', messageId: 'm2' }),
+        (error: unknown) => error instanceof Error
+          && error.message.startsWith(`Recovery branch recovery/cairn/${T} can't be made: the Discord awareness journal, or the pre-journal ledger it imports (--outbox), can't be read (injected unreadable journal)`),
+      );
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }

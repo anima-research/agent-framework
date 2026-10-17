@@ -1,9 +1,10 @@
 import { describe, it, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { JsStore } from '@animalabs/chronicle';
 import { AgentFramework } from '../src/framework.js';
 import { REFUSAL_REACTION_BASELINE } from '../src/refusal-reactions.js';
 import { DiscordAwarenessOutbox } from '../src/recovery/discord-awareness-outbox.js';
@@ -22,11 +23,13 @@ function baseline(framework: AgentFramework): readonly string[] {
   return (framework as unknown as { getPlacedReactionBaseline(): readonly string[] }).getPlacedReactionBaseline();
 }
 
-// A refusal for an awareness ledger that can't be read, whichever read met it
-// first: the connect's or restart's own read, or a connect's awareness
-// barrier. The assertions after each refusal say what it left behind.
+// A refusal for an awareness journal that can't be read, met by the read a
+// connect or restart makes to derive the protective default: the journal's
+// own refusal (as breakJournal leaves it) is the cause. The assertions after
+// each refusal say what it left behind.
 function accountingRefusal(error: unknown): boolean {
-  return error instanceof Error && error.name === 'DiscordAwarenessAccountingError';
+  return error instanceof Error && error.name === 'DiscordAwarenessAccountingError'
+    && /The Discord awareness journal can't be read in this process/.test(error.message);
 }
 
 async function childEnv(framework: AgentFramework) {
@@ -48,8 +51,6 @@ describe('placed-reaction baseline', () => {
   });
 
   afterEach(async () => {
-    // A corrupt-ledger test must not leave teardown trying to reconcile it.
-    rmSync(outboxPath, { force: true });
     await framework?.stop();
     framework = undefined;
     rmSync(dir, { recursive: true, force: true });
@@ -68,15 +69,46 @@ describe('placed-reaction baseline', () => {
     return framework;
   }
 
-  function retain(emoji: string) {
-    const outbox = new DiscordAwarenessOutbox(outboxPath);
-    return outbox.prepare({
+  /** The running framework's own journal instance (the journal's one writer). */
+  const journal = (fw: AgentFramework) =>
+    (fw as unknown as { discordAwarenessOutbox: DiscordAwarenessOutbox }).discordAwarenessOutbox;
+
+  /**
+   * Retain a batch with this marker in the store's journal: through the
+   * running framework's own journal, or, before one runs, in the store
+   * directly.
+   */
+  function retain(emoji: string, opts: { activate?: boolean } = {}) {
+    const input = {
       agentName: 'resident',
       sourceBranch: 'main',
       targetBranch: 'later-recovery',
       emoji,
+      scope: 'all' as const,
       refs: [{ serverId: 'discord', channelId: 'discord:guild:channel', messageId: emoji }],
-    })!;
+    };
+    const prepareIn = (outbox: DiscordAwarenessOutbox) => {
+      const batch = outbox.prepare(input)!;
+      if (opts.activate) outbox.activate(batch.id);
+      return batch;
+    };
+    if (framework) return prepareIn(journal(framework));
+    const store = JsStore.openOrCreate({ path: join(dir, 'test.chronicle') });
+    try {
+      return prepareIn(new DiscordAwarenessOutbox(store));
+    } finally {
+      store.close();
+    }
+  }
+
+  /**
+   * Leave the running framework's journal unreadable for the rest of this
+   * process, as an append that threw inside the store does (RecordJournal's
+   * needsReopen): every read of it throws from now on.
+   */
+  function breakJournal(fw: AgentFramework): void {
+    (journal(fw) as unknown as { journal: { unreadable: unknown } }).journal.unreadable =
+      new Error('an append threw inside the store');
   }
 
   it('includes default awareness and refusal markers once, with a fresh snapshot', async () => {
@@ -89,10 +121,8 @@ describe('placed-reaction baseline', () => {
 
   it('keeps the adapter default alongside configured and retained offline awareness markers', async () => {
     retain('🫥');
-    const completed = retain('👁️');
-    const outbox = new DiscordAwarenessOutbox(outboxPath);
-    outbox.activate(completed.id);
-    outbox.recordSuccess(completed.id, completed.refs[0]!, 'add');
+    // An active batch's marker stays covered: its marks can later be removed.
+    retain('👁️', { activate: true });
     const fw = await create('🔕');
     assert.deepEqual(new Set(baseline(fw)), new Set([...REFUSAL_REACTION_BASELINE, '💤', '🔕', '🫥', '👁️']));
     assert.equal(baseline(fw).length, new Set(baseline(fw)).size);
@@ -113,7 +143,7 @@ describe('placed-reaction baseline', () => {
     retain('<a:another:123456789012345679>');
     const fw = await create('123456789012345678');
     assert.deepEqual(baseline(fw), [...REFUSAL_REACTION_BASELINE, '💤', '123456789012345678', '123456789012345679']);
-    const stored = new DiscordAwarenessOutbox(outboxPath).batches();
+    const stored = journal(fw).batches();
     assert.equal(stored.find((batch) => batch.id === first.id)?.emoji, '<:old_name:123456789012345678>');
   });
 
@@ -278,17 +308,71 @@ describe('placed-reaction baseline', () => {
     assert.ok(env.baseline?.split(',').includes('🫥'), `the respawned child has the marker retained since: ${env.baseline}`);
   });
 
-  for (const own of [undefined, '🟪']) {
-    it(`a restart refuses on a corrupt ledger and leaves the child up (${own ? 'its own baseline' : 'the default'})`, async () => {
-      // Every connect reads the ledger at its awareness barrier, so a server
-      // with its own baseline can't come back either.
-      const fw = await create(undefined, [server(own ? { env: { [ENV_KEY]: own } } : {})]);
-      writeFileSync(outboxPath, '{broken');
-      await assert.rejects(() => fw.restartMcplServer('probe'), accountingRefusal);
-      // A restart that stopped the child leaves no server to ask.
-      assert.ok(await childEnv(fw).catch(() => undefined), 'the running child still answers');
+  it('a restart refuses on an unreadable journal when it derives the default, and leaves the child up', async () => {
+    const fw = await create(undefined, [server()]);
+    breakJournal(fw);
+    await assert.rejects(() => fw.restartMcplServer('probe'), accountingRefusal);
+    // A restart that stopped the child leaves no server to ask.
+    assert.ok(await childEnv(fw).catch(() => undefined), 'the running child still answers');
+  });
+
+  it('a server with its own baseline, or a WebSocket one, connects and restarts whatever the journal\'s state', async () => {
+    // Only a connect that derives the protective default reads the journal:
+    // awareness never gates MCPL.
+    const fw = await create(undefined, [server({ env: { [ENV_KEY]: '🟪' } })]);
+    breakJournal(fw);
+    assert.throws(() => baseline(fw), accountingRefusal, 'the journal is unreadable');
+    await fw.restartMcplServer('probe');
+    assert.equal((await childEnv(fw)).baseline, '🟪', 'restarted with its own baseline');
+    await fw.disconnectMcplServer('probe');
+    await fw.connectMcplServer(server({ reconnect: true, env: { [ENV_KEY]: '🟪' } }));
+    assert.equal((await childEnv(fw)).baseline, '🟪', 'connected with its own baseline');
+    // A WebSocket server owns its environment, so its connect reads nothing
+    // either: it gets as far as the transport.
+    await assert.rejects(
+      () => fw.connectMcplServer({ id: 'remote', url: 'ws://127.0.0.1:1' }),
+      /MCPL server "remote" WebSocket connect failed/,
+    );
+  });
+
+  it('a server that inherits its baseline from the host connects and restarts whatever the journal\'s state', async (t) => {
+    const previous = process.env[ENV_KEY];
+    process.env[ENV_KEY] = '🟦';
+    t.after(() => {
+      if (previous === undefined) delete process.env[ENV_KEY];
+      else process.env[ENV_KEY] = previous;
     });
-  }
+    const fw = await create(undefined, [server({ inheritEnv: true })]);
+    breakJournal(fw);
+    await fw.restartMcplServer('probe');
+    assert.equal((await childEnv(fw)).baseline, '🟦', 'restarted with the inherited baseline');
+    await fw.disconnectMcplServer('probe');
+    await fw.connectMcplServer(server({ inheritEnv: true }));
+    assert.equal((await childEnv(fw)).baseline, '🟦', 'connected with the inherited baseline');
+  });
+
+  it('a child that takes the default is not respawned while the journal is unreadable: each reconnect fails and is retried', async () => {
+    const fw = await create(undefined, [server({ reconnect: true, reconnectIntervalMs: 20, reconnectMaxIntervalMs: 20 })]);
+    const failures: string[] = [];
+    fw.onTrace((event) => {
+      if (event.type === 'mcpl:server-connect-failed') failures.push(String((event as { error?: unknown }).error));
+    });
+    breakJournal(fw);
+    const registry = (fw as unknown as {
+      mcplServerRegistry: {
+        getServer(id: string): { sendToolsCall(name: string, args: {}): Promise<unknown>; isConnected: boolean; willReconnect: boolean };
+      };
+    }).mcplServerRegistry;
+    await registry.getServer('probe').sendToolsCall('crash', {}).catch(() => {});
+    const deadline = Date.now() + 5_000;
+    while (failures.length < 2 && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 20));
+    assert.ok(failures.length >= 2, `each attempt fails and the next is scheduled: ${failures.join(' | ')}`);
+    for (const failure of failures) {
+      assert.match(failure, /Discord awareness accounting failed during .*The Discord awareness journal can't be read in this process/);
+    }
+    assert.equal(registry.getServer('probe').isConnected, false, 'no child was spawned without the default');
+    assert.equal(registry.getServer('probe').willReconnect, true, 'and it keeps retrying');
+  });
 
   it('passes a URL-only WebSocket config through unchanged', async () => {
     const fw = await create();
@@ -321,22 +405,25 @@ describe('placed-reaction baseline', () => {
     });
   }
 
-  it('fails explicitly on a corrupt retained ledger rather than deriving an incomplete default', async () => {
+  it('fails explicitly on an unreadable journal rather than deriving an incomplete default', async () => {
     const fw = await create(undefined, [server()]);
-    writeFileSync(outboxPath, '{broken');
-    assert.throws(() => baseline(fw), /Discord awareness.*ledger/i);
-    await fw.disconnectMcplServer('probe');
-    // Every connect reads the ledger before it registers anything: a
-    // reconnecting server, with or without its own baseline, would otherwise
-    // be left registered as a closed stub that blocks a retried connect.
+    breakJournal(fw);
+    assert.throws(() => baseline(fw), accountingRefusal);
     const internals = fw as unknown as {
       mcplServerRegistry: { getServer(id: string): unknown };
       mcplServerConfigs: Map<string, unknown>;
+      mcplPrefixMap: Map<string, string>;
     };
-    for (const config of [server(), server({ reconnect: true }), server({ reconnect: true, env: { [ENV_KEY]: '🟪' } })]) {
+    assert.equal(internals.mcplPrefixMap.get('mcpl--probe'), 'probe', 'a connected server has its tool routing');
+    await fw.disconnectMcplServer('probe');
+    // A connect that derives the default reads the journal before it
+    // registers anything: a reconnecting server would otherwise be left
+    // registered as a closed stub that blocks a retried connect.
+    for (const config of [server(), server({ reconnect: true })]) {
       await assert.rejects(() => fw.connectMcplServer(config), accountingRefusal);
       assert.equal(internals.mcplServerRegistry.getServer('probe'), null, 'no connection is left registered');
       assert.equal(internals.mcplServerConfigs.has('probe'), false, 'no config is left registered');
+      assert.equal(internals.mcplPrefixMap.has('mcpl--probe'), false, 'no tool routing is left registered');
     }
   });
 });

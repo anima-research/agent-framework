@@ -575,34 +575,6 @@ describe('stop() with work still in flight', () => {
       assert.deepEqual(rejections, []);
     });
 
-    for (const [event, method, params] of [
-      ['push-event', 'push/event', { featureSet: 'chat', eventId: 'e2', payload: { content: [{ type: 'text', text: 'waiting' }] } }],
-      ['channels-incoming', 'channels/incoming', { messages: [{ channelId: 'c', messageId: 'm2', content: [] }] }],
-      ['inference-request', 'inference/request', { messages: [] }],
-      ['host-command', 'host/command', { command: 'undo' }],
-    ] as const) {
-      it(`a ${method} held at the awareness barrier while the host stops is refused once the barrier lifts`, async () => {
-        const { framework, connection } = await wiredFramework();
-        let lift!: () => void;
-        (framework as unknown as { discordAwarenessBarrier: unknown }).discordAwarenessBarrier = {
-          promise: new Promise<void>((r) => { lift = r; }),
-        };
-        let handled = 0;
-        standIns(framework, async () => { handled++; return {}; });
-
-        const r = responder();
-        connection.emit(event, params, r);
-        await framework.stop();
-        lift();
-        await answered(r);
-
-        assert.equal(handled, 0);
-        assert.deepEqual(r.answers, [stopping]);
-        assert.ok(logged.some((line) => line.includes(`${method} from srv refused: the host is stopping`)), logged.join('\n'));
-        assert.deepEqual(rejections, []);
-      });
-    }
-
     it('a handler running when the host stops, and then failing, is answered -32000 with its own message', async () => {
       const { framework, connection } = await wiredFramework();
       let release!: () => void;

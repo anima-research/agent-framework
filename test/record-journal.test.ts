@@ -278,4 +278,22 @@ describe('RecordJournal', () => {
       assert.throws(() => new RecordJournal(store, { type: 't', checkpointType: 't' }), /distinct record types/);
     });
   });
+
+  it('a journal that keeps no checkpoints replays every entry, past any checkpoint an earlier writer left, and refuses one', () => {
+    withStore((store) => {
+      const earlier = new RecordJournal<Entry, { seen: string[] }>(store, { type: 'journal-test/entry' });
+      earlier.append({ n: 'a' });
+      earlier.checkpoint({ seen: [] });
+      earlier.append({ n: 'b' });
+      assert.deepStrictEqual(entriesOf(new RecordJournal<Entry, unknown>(store, { type: 'journal-test/entry' })), ['b']);
+
+      const journal = new RecordJournal<Entry>(store, { type: 'journal-test/entry', checkpoints: false });
+      assert.strictEqual(journal.keepsCheckpoints, false);
+      assert.deepStrictEqual(journal.load().snapshot, null);
+      assert.deepStrictEqual(entriesOf(journal as RecordJournal<Entry, unknown>), ['a', 'b']);
+      assert.throws(() => journal.checkpoint(undefined as never), /keeps no checkpoints/);
+      journal.append({ n: 'c' });
+      assert.deepStrictEqual(entriesOf(journal as RecordJournal<Entry, unknown>), ['a', 'b', 'c']);
+    });
+  });
 });

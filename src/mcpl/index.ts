@@ -106,7 +106,7 @@ export {
 } from './errors.js';
 
 // Server connection and registry
-export { McplServerConnection } from './server-connection.js';
+export { McplServerConnection, McplRequestError } from './server-connection.js';
 export type { McplConnectionCloseInfo } from './server-connection.js';
 export type { TransportCloseInfo } from './transport.js';
 export { McplServerRegistry, type McplCapabilityQuery } from './server-registry.js';
