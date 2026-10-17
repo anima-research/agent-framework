@@ -42,6 +42,7 @@ import type {
   FetchHistoryInput,
 } from './types.js';
 import { formatZonedDateTime, resolveTimeZone } from '../../timezone.js';
+import { logValue } from '../../mcpl/log-value.js';
 
 // Re-export event types for consumers who want to handle them
 export type { DiscordMessageEvent, DiscordEditEvent, DiscordDeleteEvent } from './types.js';
@@ -94,6 +95,12 @@ const TEXT_FILE_EXTENSIONS = [
 ];
 
 const CONVERSATION_TIMEOUT_MS = 30 * 60 * 1000; // 30 minutes
+
+/** What the agent reads for a text attachment whose contents couldn't be
+ *  fetched: by an error, or by an answer that wasn't OK. */
+function attachmentNotFetched(filename: string): ContentBlock {
+  return { type: 'text', text: `[Attachment: ${filename} (failed to fetch)]` };
+}
 
 /**
  * Discord module for the agent framework.
@@ -946,13 +953,15 @@ export class DiscordModule implements Module {
               type: 'text',
               text: `\n--- File: ${attachment.filename} ---\n${textContent}\n--- End of ${attachment.filename} ---\n`,
             });
+          } else {
+            // An answer whose body is never read holds its connection.
+            await response.body?.cancel().catch(() => {});
+            console.warn(`Discord: Attachment ${logValue(attachment.filename)} in message ${message.id} wasn't fetched: HTTP ${response.status}`);
+            blocks.push(attachmentNotFetched(attachment.filename));
           }
         } catch (error) {
-          // If fetch fails, just note the attachment
-          blocks.push({
-            type: 'text',
-            text: `[Attachment: ${attachment.filename} (failed to fetch)]`,
-          });
+          console.warn(`Discord: Attachment ${logValue(attachment.filename)} in message ${message.id} wasn't fetched:`, error);
+          blocks.push(attachmentNotFetched(attachment.filename));
         }
         continue;
       }

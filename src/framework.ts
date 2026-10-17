@@ -82,14 +82,15 @@ import { HookOrchestrator } from './mcpl/hook-orchestrator.js';
 import { ToolLifecycleEmitter, parseToolObserveParams, type ScriptCallOrigin } from './mcpl/tool-lifecycle.js';
 import { checkToolPattern, describeUnmatchedPattern, type PatternServer } from './mcpl/tool-pattern-check.js';
 import { BUILTIN_TOOL_CLASSES, normalizeClassTable, parseDeclaredClasses, resolveToolClass, type EffectiveToolClass, type ToolClass, type ToolClassSource } from './mcpl/tool-classes.js';
-import { PushHandler, convertBlock as convertPushBlock, type McplPushEvent } from './mcpl/push-handler.js';
+import { PushHandler, type McplPushEvent } from './mcpl/push-handler.js';
+import { convertBlock } from './mcpl/convert-block.js';
 import {
   PushCoalescer, CoalesceError, PUSH_COALESCING_SUPPORT, validateCoalesceMember, validateCoalescedContent,
   coalescingSubjectKey, type AssemblyResult, type CoalescedOccurrence, type CoalescingPlacement, type CoalescingSnapshot,
   type CoalescingReceiptRecord,
 } from './mcpl/push-coalescer.js';
 import type { ChannelIncomingMessage, ChannelIncomingMessageResult, McplContentBlock, PushEventResult } from './mcpl/types.js';
-import { isSilentHeartbeatMarker, isVisiblyEmptyContent } from './mcpl/visible-content.js';
+import { isSilentHeartbeatMarker, isVisiblyEmptyContent, NON_STRING_TEXT_PLACEHOLDER } from './mcpl/visible-content.js';
 import { parseProsePrefix, parseHybridProsePrefix } from './mcpl/prose-grammar.js';
 import { ProseStreamRouter } from './mcpl/prose-stream-router.js';
 import { detectKnownToolWrapperProse } from './tool-wrapper-prose-guard.js';
@@ -10373,7 +10374,7 @@ export class AgentFramework {
         messageId: identity.messageId ?? str(origin.messageId) ?? occ.eventId,
         threadId: identity.threadId ?? str(origin.threadId),
         author: identity.author ?? { id: str(origin.authorId) ?? '', name: str(origin.authorName) ?? str(origin.authorId) ?? 'Someone' },
-        content: materialized ? materialized.map(convertPushBlock) : push.content,
+        content: materialized ? materialized.map((block) => convertBlock(block, 'attachment on push event')) : push.content,
         timestamp: occ.timestamp,
         metadata: origin,
         tags: push.tags,
@@ -10392,7 +10393,7 @@ export class AgentFramework {
       ...occ.event.event,
       eventId: occ.eventId,
       timestamp: occ.timestamp,
-      ...(materialized ? { content: materialized.map(convertPushBlock) } : {}),
+      ...(materialized ? { content: materialized.map((block) => convertBlock(block, 'attachment on push event')) } : {}),
       coalescingSubject,
       // §5.2: the materialized occurrence is consumed by the request being
       // assembled; the wake that started it is not repeated.
@@ -15147,8 +15148,10 @@ export class AgentFramework {
         blocks.push({ type: 'text', text: INLINE_WITHHELD_TEXT });
         continue;
       }
-      if (b.type === 'text' && typeof b.text === 'string') {
-        let text = b.text;
+      if (b.type === 'text') {
+        // A text that isn't a string shows as the converters' placeholder,
+        // rather than sending the whole array to the JSON fallback.
+        let text = typeof b.text === 'string' ? b.text : NON_STRING_TEXT_PLACEHOLDER;
         if (maxChars && text.length > maxChars) {
           text = safeSlice(text, 0, maxChars)
             + '\n\n[truncated — original was ' + text.length + ' chars'
@@ -18549,9 +18552,13 @@ export class AgentFramework {
         // through so toMembraneToolResult can preserve image blocks natively.
         // Text-only results still collapse to a joined string for backward
         // compatibility with callers that expect data to be string-ish.
+        // A text block whose text isn't a string, which only a nonconformant
+        // server sends, shows as the converter's placeholder, where it used to
+        // vanish (null, 0, false) or read as String(text), "[object Object]".
         const textContent = result.content
-          ?.filter((c) => c.type === 'text' && c.text)
-          .map((c) => c.text!)
+          ?.filter((c) => c.type === 'text')
+          .map((c) => (typeof c.text === 'string' ? c.text : NON_STRING_TEXT_PLACEHOLDER))
+          .filter((text) => text !== '')
           .join('\n');
         const hasNonText = result.content?.some((c) => c.type !== 'text');
         const data = result.isError

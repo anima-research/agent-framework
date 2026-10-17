@@ -14,7 +14,7 @@
  */
 
 import type { ContentBlock } from '@animalabs/membrane';
-import { INLINE_WITHHELD_TEXT, isInlineContradiction, referenceStubOrNull } from './references.js';
+import { convertBlock } from './convert-block.js';
 import type { JsStore } from '@animalabs/chronicle';
 
 import type {
@@ -30,7 +30,6 @@ import type {
   ChannelsPublishParams,
   ChannelsOpenResult,
   ChannelHistoryRequest,
-  McplContentBlock,
 } from './types.js';
 
 import type { McplServerRegistry } from './server-registry.js';
@@ -38,7 +37,7 @@ import type { FeatureSetManager } from './feature-set-manager.js';
 import type { ToolDefinition, ToolResult, ProcessEvent } from '../types/index.js';
 import { expandCoreTags } from './tags.js';
 import { coalesceRejectionReason, EmptyContentError, validateCoalescedContent } from './push-coalescer.js';
-import { isVisiblyEmptyContent } from './visible-content.js';
+import { isVisiblyEmptyConversion } from './visible-content.js';
 import { logDetail, logValue } from './log-value.js';
 import { RefusalLines } from './refusal-lines.js';
 import { CapabilityGrant } from './capability-grant.js';
@@ -239,88 +238,6 @@ interface McplChannelIncomingEvent {
   tags?: string[];
   triggerInference?: boolean;
   targetAgents?: string[];
-}
-
-// ============================================================================
-// Content Conversion: McplContentBlock → membrane ContentBlock
-// ============================================================================
-
-/**
- * Convert a single MCPL wire-format content block to a membrane ContentBlock.
- */
-function convertBlock(block: McplContentBlock): ContentBlock {
-  switch (block.type) {
-    case 'text':
-      // Text that isn't a string is no text, as the request sanitizer and
-      // the visible-content check already read it.
-      return { type: 'text', text: typeof block.text === 'string' ? block.text : '' };
-
-    case 'image':
-      if (isInlineContradiction(block)) {
-        // RFC-005 vector 2: inline data claiming bulk disposition — fail
-        // closed, withhold the data (checked BEFORE the data branch).
-        return { type: 'text', text: INLINE_WITHHELD_TEXT };
-      }
-      if (isFilledString(block.uri) && block.disposition) {
-        // RFC-005 uri-form media with a disposition claim: stub, do not
-        // hand the URI to the provider or inline it.
-        return { type: 'text', text: referenceStubOrNull(block, 'attachment on channel message') ?? '[reference]' };
-      }
-      if (isFilledString(block.data) && isFilledString(block.mimeType)) {
-        return {
-          type: 'image',
-          source: { type: 'base64', data: block.data, mediaType: block.mimeType },
-        } as ContentBlock;
-      }
-      if (isFilledString(block.uri)) {
-        return {
-          type: 'image',
-          source: { type: 'url', url: block.uri },
-        } as ContentBlock;
-      }
-      return { type: 'text', text: isFilledString(block.data) ? '[Image: no media type]' : '[Image: no data]' };
-
-    case 'audio':
-      if (isInlineContradiction(block)) {
-        // RFC-005 vector 2: inline data claiming bulk disposition — fail
-        // closed, withhold the data (checked BEFORE the data branch).
-        return { type: 'text', text: INLINE_WITHHELD_TEXT };
-      }
-      if (isFilledString(block.uri) && block.disposition) {
-        // RFC-005 uri-form media with a disposition claim: stub, do not
-        // hand the URI to the provider or inline it.
-        return { type: 'text', text: referenceStubOrNull(block, 'attachment on channel message') ?? '[reference]' };
-      }
-      if (isFilledString(block.data) && isFilledString(block.mimeType)) {
-        return {
-          type: 'audio',
-          source: { type: 'base64', data: block.data, mediaType: block.mimeType },
-        } as ContentBlock;
-      }
-      return { type: 'text', text: isFilledString(block.data) ? '[Audio: no media type]' : '[Audio: no data]' };
-
-    case 'resource':
-      // RFC-005: reference blocks become bounded stubs — never raw URIs
-      // (a signed URL is a bearer credential that looks like a location).
-      return { type: 'text', text: referenceStubOrNull(block, 'attachment on channel message') ?? '[reference]' };
-
-    default: {
-      // Unknown wire block types previously fell off the exhaustive switch
-      // and propagated `undefined` into ContentBlock[]. Fail visibly. A type
-      // that isn't a string is no type, and is never converted to one: an
-      // object can throw when it is.
-      const type: unknown = (block as { type?: unknown }).type;
-      return { type: 'text', text: `[unrecognized content block: ${typeof type === 'string' ? type : 'untyped'}]` };
-    }
-  }
-}
-
-/** A string with something in it: the only data, mimeType or uri a block's
- *  source is built from, and the only uri that makes it a reference. Anything
- *  else a sender puts there leaves the block without it, so conversion never
- *  throws and never copies a non-string. */
-function isFilledString(value: unknown): value is string {
-  return typeof value === 'string' && value !== '';
 }
 
 // ============================================================================
@@ -1051,8 +968,8 @@ export class ChannelRegistry {
         }
       }
       if (message.tags) message.tags = expandCoreTags(message.tags);
-      const convertedContent: ContentBlock[] = message.content.map(convertBlock);
-      if (!emptyAllowed && isVisiblyEmptyContent(convertedContent)) {
+      const convertedContent: ContentBlock[] = message.content.map((block) => convertBlock(block, 'attachment on channel message'));
+      if (!emptyAllowed && isVisiblyEmptyConversion(message.content, convertedContent)) {
         rejectEmpty();
         continue;
       }
@@ -1080,7 +997,7 @@ export class ChannelRegistry {
       if (this.shouldTriggerInference) {
         // The text the agent's context gets, as the push lane's filter reads
         // it: the converted text blocks, a placeholder or reference stub
-        // among them, and a text block's non-string text as empty text.
+        // among them, NON_STRING_TEXT_PLACEHOLDER included.
         const textContent = convertedContent
           .filter((b): b is ContentBlock & { type: 'text' } => b.type === 'text')
           .map((b) => b.text)

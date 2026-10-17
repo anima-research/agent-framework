@@ -17,7 +17,7 @@ import { MockMembrane, MockYieldingStream, createMockResponse } from './mock-mem
 export const TS = '2026-09-30T00:00:00Z';
 export const ok = () => createMockResponse([{ type: 'text', text: 'ok' }]);
 
-export async function fixture(options: { server?: Record<string, unknown>; framework?: Partial<FrameworkConfig>; agents?: unknown[]; dir?: string; port?: number; featureSets?: Record<string, unknown>; mcpl?: Record<string, unknown> } = {}) {
+export async function fixture(options: { server?: Record<string, unknown>; framework?: Partial<FrameworkConfig>; agents?: unknown[]; dir?: string; port?: number; featureSets?: Record<string, unknown>; mcpl?: Record<string, unknown>; tools?: unknown[]; toolsCall?: (params: Record<string, unknown>) => unknown } = {}) {
   const wss = new WebSocketServer({ port: options.port ?? 0, host: '127.0.0.1' });
   await once(wss, 'listening');
   let online = true;
@@ -44,7 +44,8 @@ export async function fixture(options: { server?: Record<string, unknown>; frame
           ...options.mcpl,
         } } }, serverInfo: { name: 'editor', version: '1' } });
       } else if (m.method === 'featureSets/update') reply({ accepted: true });
-      else if (m.method === 'tools/list') reply({ tools: [] });
+      else if (m.method === 'tools/list') reply({ tools: options.tools ?? [] });
+      else if (m.method === 'tools/call' && options.toolsCall) reply(options.toolsCall(m.params));
       else if (m.method === 'channels/publish') { published.push(m.params); if (m.id !== undefined) reply({ delivered: true }); }
       else if (m.method === 'channels/close') reply({ closed: true });
       else if (m.method === 'channels/open') reply({ channel: { id: m.params.channelId, type: 'discord', label: m.params.channelId } });

@@ -15,6 +15,7 @@
  */
 
 import { INLINE_WITHHELD_TEXT, isInlineContradiction, referenceStubOrNull } from './mcpl/references.js';
+import { NON_STRING_TEXT_PLACEHOLDER } from './mcpl/visible-content.js';
 import { formatPreservedImageSlots, formatToolImagePlaceholder, splitPreservingImageSlots } from './tool-image-ledger.js';
 
 export interface HistorySerializeOptions {
@@ -101,8 +102,10 @@ function tryHistoryStringFromContentArray(data: unknown, options?: HistorySerial
   for (const [blockIndex, raw] of data.entries()) {
     if (!raw || typeof raw !== 'object') return null;
     const b = raw as { type?: unknown; text?: unknown; data?: unknown; mimeType?: unknown };
-    if (b.type === 'text' && typeof b.text === 'string') {
-      parts.push(b.text);
+    if (b.type === 'text') {
+      // A text that isn't a string shows as the converters' placeholder,
+      // rather than sending the whole array to the JSON fallback.
+      parts.push(typeof b.text === 'string' ? b.text : NON_STRING_TEXT_PLACEHOLDER);
     } else if (isInlineContradiction(b)) {
       // RFC-005 vector 2: checked before the data branch so inline data
       // claiming bulk disposition is withheld, not rendered.
