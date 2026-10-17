@@ -610,20 +610,23 @@ test("openForSpeech opens a closed channel nobody decided to keep closed, and le
   await registry.handleChannelToolCall('channel_open', { channelId: 'open-now' }, agent);
   await registry.handleChannelToolCall('channel_open', { channelId: 'tuned-out' }, agent);
   registry.enterTuneOut('discord', 'tuned-out', { epochId: 'e1', cadenceSeconds: 600, backlogCap: 20, maxWakes: 3, startedAtSequence: 0 }, 'agent-tool');
-  // Decided open, with its transport down.
   await registry.handleChannelToolCall('channel_open', { channelId: 'decided-open' }, agent);
-  (registry as unknown as { findChannelEntry(id: string): { open: boolean } }).findChannelEntry('decided-open').open = false;
+  // The tune-out's transport and the decided-open channel's are down.
+  const entry = (id: string) => (registry as unknown as { findChannelEntry(id: string): { open: boolean } }).findChannelEntry(id);
+  entry('tuned-out').open = false;
+  entry('decided-open').open = false;
   const opensBefore = openCalls.length;
 
   assert.equal(await registry.openForSpeech('discord', 'undecided', 'opened-by-reply'), 'opened');
+  assert.equal(await registry.openForSpeech('discord', 'decided-open', 'opened-by-reply'), 'opened', 'opened again, as on main');
   assert.equal(await registry.openForSpeech('discord', 'agent-closed', 'opened-by-reply'), 'not-opened');
-  assert.equal(await registry.openForSpeech('discord', 'decided-open', 'opened-by-reply'), 'not-opened');
   assert.equal(await registry.openForSpeech('discord', 'tuned-out', 'opened-by-reply'), 'not-opened');
   assert.equal(await registry.openForSpeech('discord', 'open-now', 'opened-by-reply'), 'not-opened');
   assert.equal(await registry.openForSpeech('discord', 'nowhere', 'opened-by-reply'), 'unknown-channel');
 
-  assert.deepEqual(openCalls.slice(opensBefore).map((c) => c.channelId), ['undecided']);
+  assert.deepEqual(openCalls.slice(opensBefore).map((c) => c.channelId), ['undecided', 'decided-open']);
   assert.equal(registry.getDesiredState('discord', 'undecided'), 'open');
+  assert.equal(registry.getDesiredState('discord', 'decided-open'), 'open');
   assert.equal(registry.getDesiredState('discord', 'tuned-out'), 'tuned-out', 'the tune-out stands');
   assert.equal(registry.closedByAgent('discord', 'agent-closed'), 'closed');
 });

@@ -34,7 +34,7 @@
   `resolveSendTarget(channelId, serverId?)` returns the descriptor id of the channel a send went
   to, from a composite or raw id, and opens nothing. `openForSpeech(serverId, channelId, source)`
   opens it as the framework's send path and `routeSpeech` do: a closed channel opens unless the
-  agent closed or declined it, it's tuned out, or it's decided open with its transport down.
+  agent closed or declined it, or it's tuned out.
   `closedByAgent(serverId, channelId)` and `canOpenChannels(serverId)` are new.
 - **Prompt cache:** `channel_close`'s description and `agent_settings`' input schema change, so
   the first request after the upgrade that carries those tools misses the cache from its tool

@@ -2670,12 +2670,14 @@ export class ChannelRegistry {
   /**
    * Open a channel because the agent's words were delivered into it (routed
    * speech, or an explicit send tool), so typing indicators, reaction
-   * machinery and inbound forwarding come alive with the reply. Only a
-   * channel nobody decided to keep closed opens: one with no decision on
-   * record, a pure default, or a machine's close (subscription-gc,
-   * housekeeping). The agent's own close or decline stands, and so does a
-   * tune-out; a channel decided open whose transport is down is
-   * reconciliation's to reopen, so its decision keeps its source. A failed
+   * machinery and inbound forwarding come alive with the reply. A closed
+   * channel opens as it always did, unless the agent decided to keep it
+   * closed itself (channel_close, channel_decline): that decision stands
+   * against its own speech. A tune-out stands too, since it's the agent's
+   * decision as well, and its transport stays open. Where nobody decided
+   * (no record, a pure default) or a machine closed the channel
+   * (subscription-gc, housekeeping), the channel opens, and so does one
+   * decided open whose open failed, keeping that decision's source. A failed
    * open is traced and reported, and never stops the words: they're
    * delivered either way.
    */
@@ -2688,7 +2690,7 @@ export class ChannelRegistry {
     if (!entry) return 'unknown-channel';
     if (entry.open) return 'not-opened';
     const current = this.desiredStates.get(this.lifecycleKey(serverId, channelId));
-    if (current?.state === 'open' || current?.state === 'tuned-out') return 'not-opened';
+    if (current?.state === 'tuned-out') return 'not-opened';
     if (current?.state === 'closed' && AGENT_CLOSE_SOURCES.has(current.source)) return 'not-opened';
     try {
       await this.openChannelNow(entry, source);

@@ -366,21 +366,25 @@ test('a reply_message into a channel the agent closed leaves it closed, and reco
     'recorded by the descriptor id the re-pin compares, before the tool result is queued');
 });
 
-test('a reply_message into a channel decided open whose open failed retries no open', async () => {
+test('a reply_message into a channel decided open whose open failed opens it again, as on main', async () => {
   const { registry, opens, windowMessages, reply, setRefuseOpens } = await harness();
   // The agent opened it, but the server refused: decided open, transport closed.
   setRefuseOpens(true);
   assert.equal((await registry.handleChannelToolCall('channel_open', { channelId }, origin)).success, false);
   assert.equal(registry.getDesiredState('discord', channelId), 'open');
   assert.equal(registry.isChannelOpen(channelId), false);
+  setRefuseOpens(false);
   const opensBefore = opens.length;
 
-  const { success } = await reply();
+  const { success, data } = await reply();
+  await new Promise<void>((resolve) => setImmediate(resolve));
 
   assert.equal(success, true);
-  assert.equal(opens.length, opensBefore, 'the send attempts no channels/open');
-  assert.equal(registry.isChannelOpen(channelId), false);
-  assert.deepEqual(windowMessages, []);
+  assert.ok(!data.includes('[closed channel]'), 'no note: the agent decided this channel open');
+  assert.equal(opens.length, opensBefore + 1, 'the send opened it again');
+  assert.equal(registry.isChannelOpen(channelId), true);
+  assert.equal(registry.getDesiredState('discord', channelId), 'open');
+  assert.match(windowMessages.at(-1) ?? '', /^\[channels\] Now open: #upkeep \(discord:g1:444555\) — your own message into the closed channel engaged it\./);
 });
 
 test('a reply_message into a tuned-out channel leaves the tune-out in place', async () => {
