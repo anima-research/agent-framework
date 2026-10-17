@@ -139,6 +139,7 @@ async function harness() {
     setHold: (p: Promise<void> | null) => { hold = p; },
     setSentTo: (raw: string) => { sentTo = raw; },
     setRefuseSends: (v: boolean) => { refuseSends = v; },
+    setGrant: (grant: CapabilityGrant) => { server.grant = grant; },
     state: () => frameworkState as { closedChannelNotes?: Record<string, boolean> } | null,
   };
 }
@@ -218,6 +219,19 @@ test("a note that can't be worked out leaves the delivered words as they were, a
   } finally {
     console.error = consoleError;
   }
+});
+
+test("on a server whose grant lacks channels.lifecycle, the note doesn't offer channel_open, which can't open anything there", async () => {
+  const { registry, reply, setGrant } = await harness();
+  setGrant(new CapabilityGrant(new Set(ALL_CAPABILITY_PATHS.filter((p) => p !== 'channels.lifecycle')), []));
+  // The close is the agent's decision on record, though the server can't be told.
+  await registry.handleChannelToolCall('channel_close', { channelId }, origin);
+  assert.equal(registry.closedByAgent('discord', channelId), 'closed');
+  const { success, data } = await reply();
+  assert.equal(success, true);
+  assert.ok(data.endsWith(`\n[closed channel] #upkeep (${channelId}) stays closed: you closed it, and your words there don't open it. ` +
+    'Messages there that address you, such as an @-mention, still reach you. ' +
+    'To stop this note, set closed_channel_note to false with agent_settings.'), data);
 });
 
 test('a send the server refuses carries no closed-channel note', async () => {
