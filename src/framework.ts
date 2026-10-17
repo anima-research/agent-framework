@@ -9921,11 +9921,21 @@ export class AgentFramework {
     const target = typeof namer.proseTargetFor === 'function'
       ? namer.proseTargetFor(opts.channelId, opts.serverId)
       : [label ? `#${label}` : undefined, opts.channelId].find((t): t is string => !!t && !/\s/.test(t));
+    // What replying does here is the registry's to say (speechOpens): a reply
+    // joins a channel nobody decided to keep closed, and leaves one the agent
+    // closed or declined itself closed. Each case is said as it is.
+    const replyJoins = this.channelRegistry.speechOpens(opts.serverId, opts.channelId);
+    const withoutJoining =
+      "To reply without joining, decline it first (option 3): a channel you've declined stays closed when you speak there.";
     const replyOption = target
-      ? `1. Reply without joining — write your reply this turn prefixed with ">>${target}"; it will be delivered there. ` +
-        `Note: follow-ups to your reply will NOT reach you unless they @-mention you or use the reply feature on your message.\n`
-      : `1. Reply without joining — no single-word target reaches this channel unambiguously, so a ">>" prefix can't name it; ` +
-        `check whether ${opts.serverId} exposes a send tool that can address it.\n`;
+      ? replyJoins
+        ? `1. Reply — write your reply this turn prefixed with ">>${target}"; it will be delivered there, and replying ` +
+          `joins the channel, as option 2 does. ${withoutJoining}\n`
+        : `1. Reply without joining — write your reply this turn prefixed with ">>${target}"; it will be delivered there. ` +
+          `Note: follow-ups to your reply will NOT reach you unless they @-mention you or use the reply feature on your message.\n`
+      : `1. Reply${replyJoins ? '' : ' without joining'} — no single-word target reaches this channel unambiguously, ` +
+        `so a ">>" prefix can't name it; check whether ${opts.serverId} exposes a send tool that can address it.` +
+        (replyJoins ? ` Replying there joins the channel, as option 2 does. ${withoutJoining}\n` : '\n');
     const missedCount = opts.missedMessages ?? 0;
     const missedNote =
       missedCount > 0

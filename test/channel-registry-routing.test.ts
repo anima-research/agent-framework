@@ -359,7 +359,7 @@ test('routeSpeech still delivers when the open on delivery fails', async () => {
   assert.equal(lookup('dm-alice')!.open, false);
 });
 
-test('routeSpeech publishes on a server whose grant lacks channels.lifecycle, where nothing can open', async () => {
+test('routeSpeech publishes on a server whose grant lacks channels.lifecycle, where nothing opens', async () => {
   const published: Array<string | undefined> = [];
   const server = {
     grant: new CapabilityGrant(new Set(ALL_CAPABILITY_PATHS.filter((p) => p !== 'channels.lifecycle')), []),
@@ -378,9 +378,11 @@ test('routeSpeech publishes on a server whose grant lacks channels.lifecycle, wh
 
   const res = await registry.routeSpeech('sol', 'hello from outside', 'lobby');
 
-  assert.deepEqual(res, { delivered: true, channelId: 'lobby' }, 'the open fails, and the words still go');
+  assert.deepEqual(res, { delivered: true, channelId: 'lobby' }, 'nothing opens, and the words still go');
   assert.deepEqual(published, ['lobby']);
   assert.equal(registry.canOpenChannels('portal'), false);
+  assert.equal(registry.speechOpens('portal', 'lobby'), false);
+  assert.equal(registry.getDesiredState('portal', 'lobby'), undefined, 'speech records no intent to open');
 });
 
 test('routeSpeech reports a publish that throws as a failed route (R1-4)', async () => {
@@ -616,6 +618,11 @@ test("openForSpeech opens a closed channel nobody decided to keep closed, and le
   entry('tuned-out').open = false;
   entry('decided-open').open = false;
   const opensBefore = openCalls.length;
+
+  assert.deepEqual(ids.map((id) => [id, registry.speechOpens('discord', id)]), [
+    ['undecided', true], ['agent-closed', false], ['decided-open', true], ['tuned-out', false], ['open-now', false],
+  ]);
+  assert.equal(registry.speechOpens('discord', 'nowhere'), false);
 
   assert.equal(await registry.openForSpeech('discord', 'undecided', 'opened-by-reply'), 'opened');
   assert.equal(await registry.openForSpeech('discord', 'decided-open', 'opened-by-reply'), 'opened', 'opened again, as on main');

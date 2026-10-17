@@ -1,7 +1,9 @@
 - A failed open no longer stops the agent's speech. Speech into a closed channel whose open fails,
-  on a server whose grant lacks `channels.lifecycle` or on a dead transport, is still published.
-  Before, the open that preceded publishing threw, and the speech failed with "locus channel is
-  closed and open failed". A send tool's call was already published before its open.
+  as on a dead transport, is still published. Before, the open that preceded publishing threw, and
+  the speech failed with "locus channel is closed and open failed". A send tool's call was already
+  published before its open. On a server whose grant lacks `channels.lifecycle`, where no channel
+  can open, speech now publishes without trying to open the channel, and records no intent to
+  open it. Before, it recorded that intent, and then failed.
 - A publish that throws, as on a dead transport, is now a failed route. The agent gets the
   `[discord-send-failed]` marker, and `mcpl:speech-route-failed` is traced. Before, the framework
   only logged it.

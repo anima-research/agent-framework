@@ -2668,18 +2668,31 @@ export class ChannelRegistry {
   }
 
   /**
+   * Whether the agent's words delivered into this channel open it
+   * (openForSpeech). A closed channel opens as it always did, unless the
+   * agent decided to keep it closed itself (channel_close, channel_decline):
+   * that decision stands against its own speech. A tune-out stands too,
+   * since it's the agent's decision as well. Where nobody decided (no
+   * record, a pure default) or a machine closed the channel
+   * (subscription-gc, housekeeping), the channel opens, and so does one
+   * decided open whose open failed. Nothing opens on a server whose grant
+   * lacks channels.lifecycle, so speech there records no intent to open.
+   */
+  speechOpens(serverId: string, channelId: string): boolean {
+    const entry = this.channels.get(`${serverId}:${channelId}`);
+    if (!entry || entry.open || !this.canOpenChannels(serverId)) return false;
+    const current = this.desiredStates.get(this.lifecycleKey(serverId, channelId));
+    if (current?.state === 'tuned-out') return false;
+    return !(current?.state === 'closed' && AGENT_CLOSE_SOURCES.has(current.source));
+  }
+
+  /**
    * Open a channel because the agent's words were delivered into it (routed
    * speech, or an explicit send tool), so typing indicators, reaction
-   * machinery and inbound forwarding come alive with the reply. A closed
-   * channel opens as it always did, unless the agent decided to keep it
-   * closed itself (channel_close, channel_decline): that decision stands
-   * against its own speech. A tune-out stands too, since it's the agent's
-   * decision as well, and its transport stays open. Where nobody decided
-   * (no record, a pure default) or a machine closed the channel
-   * (subscription-gc, housekeeping), the channel opens, and so does one
-   * decided open whose open failed, keeping that decision's source. A failed
-   * open is traced and reported, and never stops the words: they're
-   * delivered either way.
+   * machinery and inbound forwarding come alive with the reply, where
+   * speechOpens says speech opens it. A channel decided open keeps that
+   * decision's source. A failed open is traced and reported, and never stops
+   * the words: they're delivered either way.
    */
   async openForSpeech(
     serverId: string,
@@ -2688,10 +2701,7 @@ export class ChannelRegistry {
   ): Promise<'opened' | 'not-opened' | 'open-failed' | 'unknown-channel'> {
     const entry = this.channels.get(`${serverId}:${channelId}`);
     if (!entry) return 'unknown-channel';
-    if (entry.open) return 'not-opened';
-    const current = this.desiredStates.get(this.lifecycleKey(serverId, channelId));
-    if (current?.state === 'tuned-out') return 'not-opened';
-    if (current?.state === 'closed' && AGENT_CLOSE_SOURCES.has(current.source)) return 'not-opened';
+    if (!this.speechOpens(serverId, channelId)) return 'not-opened';
     try {
       await this.openChannelNow(entry, source);
       this.emitTraceFn({ type: 'mcpl:channel-opened-by-send', serverId, channelId });

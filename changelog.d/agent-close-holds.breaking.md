@@ -21,6 +21,14 @@
     conversation agent gets none: `channel_open` is refused to it, and its settings end with its
     conversation. In such a channel, the `sleep` tool's default announcement says "I'll still see
     messages addressed to me, but won't respond until I wake."
+  - **What the invitation says:** the closed-channel invitation's first option now says what
+    replying does there. In a channel the agent closed or declined itself, it reads as before:
+    "Reply without joining …", with the note that follow-ups that don't address the agent won't
+    reach it. In any other closed channel, where a reply opens the channel, it reads "1. Reply —
+    … it will be delivered there, and replying joins the channel, as option 2 does. To reply
+    without joining, decline it first (option 3): a channel you've declined stays closed when you
+    speak there." Before, it offered "Reply without joining" there too, though the reply opened
+    the channel.
   - **What residents notice:** on discord-mcpl, opening a channel also turns on its reaction
     forwarding, and closing it turns that off. A reply in a guild channel the agent closed used to
     reopen it, and so turn its reactions on. Now reactions to that reply arrive only where the
@@ -32,10 +40,12 @@
     `channels/incoming`, such as connectome-host's outage reply, doesn't see them there.
 - **Direct `ChannelRegistry` consumers:** `openIfClosedForSend()` is removed.
   `resolveSendTarget(channelId, serverId?)` returns the descriptor id of the channel a send went
-  to, from a composite or raw id, and opens nothing. `openForSpeech(serverId, channelId, source)`
-  opens it as the framework's send path and `routeSpeech` do: a closed channel opens unless the
-  agent closed or declined it, or it's tuned out.
-  `closedByAgent(serverId, channelId)` and `canOpenChannels(serverId)` are new.
+  to, from a composite or raw id, and opens nothing. `speechOpens(serverId, channelId)` says whether
+  the agent's words there open the channel: a closed channel opens unless the agent closed or
+  declined it, it's tuned out, or its server's grant lacks `channels.lifecycle`.
+  `openForSpeech(serverId, channelId, source)` opens it where `speechOpens` says so, as the
+  framework's send path and `routeSpeech` do. `closedByAgent(serverId, channelId)` and
+  `canOpenChannels(serverId)` are new.
 - **Prompt cache:** `channel_close`'s description and `agent_settings`' input schema change, so
   the first request after the upgrade that carries those tools misses the cache from its tool
   block on.
