@@ -67,6 +67,14 @@ const TYPING_REFRESH_MS = 8_000;
 // stuck on forever.
 const TYPING_MAX_MS = 5 * 60_000;
 
+// The most agents whose latest post the module keeps for their turn's
+// thoughts (lastPosts). Past it, the entry recorded longest ago goes, which
+// bounds the entries of agents that are gone, such as closed conversations'.
+// An entry is wanted only until its turn's speech arrives, so one goes while
+// still wanted only if this many other agents post in that time, and its
+// turn's thoughts then go into no message.
+const MAX_LAST_POSTS = 1_024;
+
 // Trace event types that end an agent's turn (onTrace's contract) — any of
 // these stops the typing keepalive. A turn's tool-call cycles stay inside its
 // stream, so they come after them. inference:completed is the normal end.
@@ -115,8 +123,19 @@ export class DiscordModule implements Module {
   // Track current reply context per agent
   private replyContexts: Map<string, ConversationContext> = new Map();
 
-  // Last message sent by a tool (for thought-editing)
-  private lastSentMessage: { channelId: string; messageId: string } | null = null;
+  // Where a tool turn's thoughts go (onAgentSpeech edits them in as a
+  // spoiler): each agent's latest message posted in a turn, with that turn's
+  // id (notePost). A `send` or `reply` records the message its client call
+  // returns, and so does the module's own speech. Thoughts go into it only
+  // when their speech ends the same turn, and taking them removes it. So
+  // neither another agent's message nor one from an earlier turn takes them,
+  // and an attempt in the turn that is refused or throws leaves the turn's own
+  // post in place. Turn ids increase, so an earlier turn's post that finishes
+  // after a later turn's leaves the later one in place. A DM records nothing,
+  // since its channel isn't known here, and neither does a post whose call or
+  // speech carries no turn. An entry goes when its thoughts are taken, when
+  // the agent's next post replaces it, or past MAX_LAST_POSTS agents.
+  private lastPosts: Map<string, { turnId: number; channelId: string; messageId: string }> = new Map();
 
   // Typing keepalive: agentName -> { interval, deadline }. Started on
   // inference:started, stopped on the turn's terminal trace event. Discord's
@@ -424,11 +443,11 @@ export class DiscordModule implements Module {
     try {
       switch (call.name) {
         case 'send':
-          return await this.handleSend(call.input as SendInput);
+          return await this.handleSend(call.input as SendInput, call);
         case 'dm':
           return await this.handleDM(call.input as SendDMInput);
         case 'reply':
-          return await this.handleReply(call.input as ReplyInput);
+          return await this.handleReply(call.input as ReplyInput, call);
         case 'react':
           return await this.handleReact(call.input as ReactInput);
         case 'edit':
@@ -570,13 +589,15 @@ export class DiscordModule implements Module {
     content: ContentBlock[],
     context: SpeechContext
   ): Promise<void> {
-    // If thoughts are present and we have a recently sent message, edit it
-    // to prepend the thoughts as spoiler text.
-    if (context.thoughts && context.thoughts.length > 0 && this.lastSentMessage) {
+    // If thoughts are present and this agent posted a message in the turn
+    // they end (lastPosts), edit it to prepend the thoughts as spoiler text.
+    const post = this.lastPosts.get(agentName);
+    if (context.thoughts && context.thoughts.length > 0 && post && post.turnId === context.turnId) {
+      this.lastPosts.delete(agentName);
       const thoughtText = this.extractText(context.thoughts);
       if (thoughtText) {
         try {
-          const { channelId, messageId } = this.lastSentMessage;
+          const { channelId, messageId } = post;
           // Fetch the current message content via the client isn't available,
           // but we know the tool just sent it — reconstruct by editing with
           // spoiler-wrapped thoughts prepended.
@@ -588,7 +609,6 @@ export class DiscordModule implements Module {
           console.warn('Discord: Failed to edit thoughts into message:', err);
         }
       }
-      this.lastSentMessage = null;
     }
 
     // Get reply context for this agent
@@ -617,8 +637,8 @@ export class DiscordModule implements Module {
       replyTo: replyCtx.replyToMessageId,
     });
 
-    // Track for thought-editing (in case of chained speech)
-    this.lastSentMessage = { channelId: targetChannel, messageId: result.messageId };
+    // Track for thought-editing (in case of chained speech in the same turn)
+    this.notePost(agentName, context.turnId, targetChannel, result.messageId);
 
     // Clear reply-to after sending (don't keep replying to same message)
     replyCtx.replyToMessageId = undefined;
@@ -1037,7 +1057,23 @@ export class DiscordModule implements Module {
   // Tool Handlers
   // ==========================================================================
 
-  private async handleSend(input: SendInput): Promise<ToolResult> {
+  /** Record a message the agent posted in a turn, for that turn's thoughts (lastPosts). */
+  private notePost(agentName: string | undefined, turnId: number | undefined, channelId: string, messageId: string): void {
+    if (agentName === undefined || turnId === undefined) return;
+    // A later turn's post stays: this one's turn has ended, and its thoughts
+    // have gone or will go nowhere.
+    const current = this.lastPosts.get(agentName);
+    if (current && current.turnId > turnId) return;
+    // Set it last, so the entry recorded longest ago is the first to go.
+    this.lastPosts.delete(agentName);
+    this.lastPosts.set(agentName, { turnId, channelId, messageId });
+    if (this.lastPosts.size > MAX_LAST_POSTS) {
+      const oldest = this.lastPosts.keys().next().value;
+      if (oldest !== undefined) this.lastPosts.delete(oldest);
+    }
+  }
+
+  private async handleSend(input: SendInput, call: ToolCall): Promise<ToolResult> {
     if (!this.checkRateLimit(input.channelId)) {
       return { success: false, error: 'Rate limited', isError: true };
     }
@@ -1048,7 +1084,7 @@ export class DiscordModule implements Module {
     });
 
     // Track for thought-editing
-    this.lastSentMessage = { channelId: input.channelId, messageId: result.messageId };
+    this.notePost(call.callerAgentName, call.callerTurnId, input.channelId, result.messageId);
 
     return { success: true, data: { messageId: result.messageId } };
   }
@@ -1058,7 +1094,7 @@ export class DiscordModule implements Module {
     return { success: true, data: { messageId: result.messageId } };
   }
 
-  private async handleReply(input: ReplyInput): Promise<ToolResult> {
+  private async handleReply(input: ReplyInput, call: ToolCall): Promise<ToolResult> {
     const replyCtx = this.replyContexts.get('default');
     if (!replyCtx) {
       return { success: false, error: 'No conversation context', isError: true };
@@ -1079,7 +1115,7 @@ export class DiscordModule implements Module {
     });
 
     // Track for thought-editing
-    this.lastSentMessage = { channelId: targetChannel, messageId: result.messageId };
+    this.notePost(call.callerAgentName, call.callerTurnId, targetChannel, result.messageId);
 
     // Clear reply-to after sending
     replyCtx.replyToMessageId = undefined;

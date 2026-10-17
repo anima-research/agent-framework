@@ -318,12 +318,13 @@ export class ModuleRegistry {
       };
     }
 
-    // Create a call with the un-prefixed name (preserving caller identity)
+    // Create a call with the un-prefixed name (preserving caller identity and turn)
     const moduleCall: ToolCall = {
       id: call.id,
       name: toolName,
       input: call.input,
       callerAgentName: call.callerAgentName,
+      ...(call.callerTurnId !== undefined ? { callerTurnId: call.callerTurnId } : {}),
     };
 
     try {
