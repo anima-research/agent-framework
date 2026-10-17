@@ -25,6 +25,7 @@ import type {
 } from './types/index.js';
 import type { Agent } from './agent.js';
 import { DEFAULT_SHUTDOWN_TIMEOUT_MS, validateShutdownTimeout, waitForShutdown } from './shutdown.js';
+import { toolArgsProblems } from './tool-args.js';
 
 /** How the registry queues a module's event: its push names the module. A
  * `ProcessQueue` serves too, ignoring the name. */
@@ -285,8 +286,8 @@ export class ModuleRegistry {
    * model. The result is checked and read once, in its JSON form
    * ({@link storableToolResult}).
    */
-  async storableToolCall(call: ToolCall): Promise<ToolResult> {
-    return storableToolResult(call, await this.handleToolCall(call));
+  async storableToolCall(call: ToolCall, options: { definition?: ToolDefinition } = {}): Promise<ToolResult> {
+    return storableToolResult(call, await this.handleToolCall(call, options));
   }
 
   /**
@@ -294,8 +295,14 @@ export class ModuleRegistry {
    * result, unchecked, as it returned it, for a caller that uses the result
    * in process (`ModuleContext.callTool`, `executeToolCall`, or a host
    * calling the registry). A module's throw is answered as an error result.
+   * A call whose input isn't an object, or lacks a key the tool's schema
+   * requires, is answered before the module runs, with an error result that
+   * opens "Nothing was done:" and names what to send (toolArgsProblems).
+   * A caller that has already resolved the tool's definition, as the `utils`
+   * tool has a utility's, passes it as `definition`, and it's checked against
+   * that one.
    */
-  async handleToolCall(call: ToolCall): Promise<ToolResult> {
+  async handleToolCall(call: ToolCall, options: { definition?: ToolDefinition } = {}): Promise<ToolResult> {
     // Parse module--tool name
     const sepIndex = call.name.indexOf('--');
     if (sepIndex === -1) {
@@ -327,6 +334,27 @@ export class ModuleRegistry {
     };
 
     try {
+      // The call against the tool's declared schema, before the module runs:
+      // a missing required argument is refused with what to send, where the
+      // handler would otherwise fail deep inside, or run without it. Values
+      // aren't checked here, since a handler may take more than its schema
+      // can say (toolArgsProblems). The module's own listing runs inside the
+      // try, so its throw is answered like any other. Utilities are listed
+      // only for a name the tools don't have, so a utility listing that
+      // throws or is slow reaches only calls to such names: a utility called
+      // by its own name, and a name the module answers without declaring it.
+      // A caller that passes `definition` lists nothing.
+      const definition = options.definition
+        ?? module.getTools().find((tool) => tool.name === toolName)
+        ?? module.getUtilities?.()?.find((tool) => tool.name === toolName);
+      const problems = toolArgsProblems(call.input, definition?.inputSchema);
+      if (problems.length > 0) {
+        return {
+          success: false,
+          error: `Nothing was done: ${call.name} ${problems.join('; ')}.`,
+          isError: true,
+        };
+      }
       return await module.handleToolCall(moduleCall);
     } catch (error) {
       return thrownResult(error);

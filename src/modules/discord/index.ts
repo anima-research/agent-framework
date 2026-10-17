@@ -440,7 +440,8 @@ export class DiscordModule implements Module {
         case 'set_reply_context':
           return await this.handleSetReplyContext(call.input as SetReplyContextInput);
         case 'activate':
-          return await this.handleActivate(call.input as { additive?: boolean });
+          // A call with no input at all activates with the defaults.
+          return await this.handleActivate((call.input ?? {}) as { additive?: boolean });
         case 'deactivate':
           return await this.handleDeactivate();
         case 'list_guilds':
