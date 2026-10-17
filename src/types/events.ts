@@ -186,7 +186,10 @@ export interface ModuleEvent {
 export interface ToolResult {
   /** Whether the tool succeeded */
   success: boolean;
-  /** Result data (if success) */
+  /**
+   * Result data (if success). The model reads a string as that text, an MCP
+   * content array as its blocks, and anything else as JSON.
+   */
   data?: unknown;
   /** Error message (if failure) */
   error?: string;

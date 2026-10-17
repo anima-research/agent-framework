@@ -15377,9 +15377,10 @@ export class AgentFramework {
       };
     }
     // MCPL tool results arrive as `data: McpToolResultContent[]` — preserve image
-    // blocks natively rather than JSON-stringifying them away. Anything else
-    // (objects, scalars) falls through to JSON. The error path was handled
-    // above, so isError is always false on these return paths.
+    // blocks natively rather than JSON-stringifying them away. A string goes
+    // as it is, as history stores it; anything else (objects, other scalars)
+    // falls through to JSON. The error path was handled above, so isError is
+    // always false on these return paths.
     const blocks = this.tryNativeToolResultContent(afResult.data, maxChars, precomputed?.filePath ?? null);
     if (blocks) {
       return { toolUseId: callId, content: blocks, isError: false };
@@ -15390,7 +15391,7 @@ export class AgentFramework {
     // JSON.stringify returns the VALUE undefined (not a string) for undefined
     // input — a module tool returning `{ success: true }` with no data would
     // otherwise make `content.length` below throw a TypeError mid-turn.
-    let content = JSON.stringify(afResult.data) ?? '';
+    let content = typeof afResult.data === 'string' ? afResult.data : JSON.stringify(afResult.data) ?? '';
     if (maxChars && content.length > maxChars) {
       content = safeSlice(content, 0, maxChars)
         + '\n\n[truncated — original was ' + content.length + ' chars]';

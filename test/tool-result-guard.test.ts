@@ -1820,14 +1820,14 @@ test('#281: a withheld result over the inline cap is written as stored, and its 
     const withheld = await h.workspace.readBinary(path);
     assert.ok('data' in withheld);
     const text = (withheld as { data: Buffer }).data.toString('utf8');
-    // The data is a string, stored as its JSON: 407 characters with the quotes.
-    assert.match(text, /^"long-x{94}\n\n\[truncated — showing 100 of 407 chars; full content: workspace file /,
+    // The data is a string, stored as it is: 405 characters.
+    assert.match(text, /^long-x{95}\n\n\[truncated — showing 100 of 405 chars; full content: workspace file /,
       'the withheld file holds the capped text, as stored');
     const whole = /full content: workspace file (work\/tool-results\/[^\s\]"]+\.txt)/.exec(text)?.[1];
     assert.ok(whole && whole !== path, `its note names the file with the whole output: ${text}`);
     const full = await h.workspace.readBinary(whole);
     assert.ok('data' in full);
-    assert.match((full as { data: Buffer }).data.toString('utf8'), /^"long-x{400}"$/);
+    assert.match((full as { data: Buffer }).data.toString('utf8'), /^long-x{400}$/);
     assert.doesNotMatch(stub, /full result/, 'the stub says "its result", which the file holds');
   } finally { await h.framework.stop(); }
 });

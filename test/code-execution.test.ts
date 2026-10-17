@@ -521,6 +521,135 @@ describe('framework code_execution integration (real python3)', () => {
     }
   });
 
+  it('a module tool that returns a string hands the script that string, not its JSON encoding', async () => {
+    // The tool contract: a script's tool function returns "the same text the
+    // tool would have returned to you directly". For a string result that
+    // is the string itself, newlines and quotes intact.
+    const listing = 'As of 10:00.\n[review] org/repo#1 "Fix it"';
+    class ListingModule extends ScriptToolModule {
+      override getTools(): ToolDefinition[] {
+        return [...super.getTools(), {
+          name: 'listing',
+          description: 'A line-per-item listing.',
+          inputSchema: { type: 'object', properties: {} },
+        }];
+      }
+      override async handleToolCall(call: ToolCall): Promise<ToolResult> {
+        if (call.name.endsWith('listing')) return { success: true, data: listing };
+        return super.handleToolCall(call);
+      }
+    }
+    const { tempDir, storePath } = tempStorePath('pytc-string-');
+    const membrane = new MockMembrane();
+    const code = [
+      'r = await test__listing({})',
+      'lines = r.split("\\n")',
+      'print("count:", len(lines))',
+      'print("second:", lines[1])',
+      'print("quoted:", r.startswith(\'"\'))',
+    ].join('\n');
+    membrane.pushResponse(createMockResponse([
+      { type: 'tool_use', id: 'call_ce_str', name: 'code_execution', input: { code } },
+    ], 'tool_use'));
+    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Done.' }]));
+
+    const framework = await createFrameworkWithCodeExecution(storePath, membrane, new ListingModule());
+    try {
+      const created = await framework.createEphemeralAgent({
+        name: 'worker', model: 'test-model', systemPrompt: 'Do the task.', allowedTools: 'all',
+      });
+      created.contextManager.addMessage('user', [{ type: 'text', text: 'Go.' }]);
+      const promise = framework.runEphemeralToCompletion(created.agent, created.contextManager);
+      framework.start();
+      await promise;
+
+      const wireResult = membrane.lastStream!.receivedToolResults[0][0] as { content: string };
+      const out = JSON.parse(wireResult.content) as { stdout: string; return_code: number };
+      assert.strictEqual(out.return_code, 0, wireResult.content);
+      assert.match(out.stdout, /count: 2\n/);
+      assert.match(out.stdout, /second: \[review\] org\/repo#1 "Fix it"\n/);
+      assert.match(out.stdout, /quoted: False/);
+    } finally {
+      await framework.stop();
+      rmSync(tempDir, { recursive: true, force: true });
+    }
+  });
+
+  it("an MCP tool's text-only result reaches the model and a script as that text, not its JSON encoding", async () => {
+    // The MCPL tool-result mapping hands a result whose blocks are all text
+    // on as their joined text, so an MCP tool's text answer is string data
+    // too: the model and a script get the text as the server sent it.
+    const listing = 'As of 10:00.\n[review] org/repo#1 "Fix it"';
+    // A stdio MCPL server whose one tool answers with a single text block
+    // holding the `text` it was given. It accepts the framework's initial
+    // featureSets/update, as the fixtures' servers do, so the connection
+    // doesn't wait out the policy request's timeout.
+    const server = `
+      let buf = '';
+      process.stdin.on('data', (c) => {
+        buf += c.toString('utf8');
+        let i;
+        while ((i = buf.indexOf('\\n')) >= 0) {
+          const line = buf.slice(0, i); buf = buf.slice(i + 1);
+          if (!line.trim()) continue;
+          let m; try { m = JSON.parse(line); } catch { continue; }
+          const reply = (result) => process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: m.id, result }) + '\\n');
+          if (m.method === 'initialize') reply({ capabilities: { experimental: { mcpl: { version: '0.4' } } } });
+          else if (m.method === 'tools/list') reply({ tools: [{ name: 'echo', description: 'e', inputSchema: { type: 'object' } }] });
+          else if (m.method === 'tools/call') reply({ content: [{ type: 'text', text: String(m.params.arguments.text) }] });
+          else if (m.method === 'featureSets/update') { if (m.id !== undefined) reply({ accepted: true }); }
+        }
+      });
+    `;
+    const { tempDir, storePath } = tempStorePath('pytc-mcp-string-');
+    const membrane = new MockMembrane();
+    const code = [
+      `r = await mcpl__echo__echo({"text": ${JSON.stringify(listing)}})`,
+      'lines = r.split("\\n")',
+      'print("count:", len(lines))',
+      'print("second:", lines[1])',
+      'print("quoted:", r.startswith(\'"\'))',
+    ].join('\n');
+    membrane.pushResponse(createMockResponse([
+      { type: 'tool_use', id: 'call_mcp_direct', name: 'mcpl--echo--echo', input: { text: listing } },
+      { type: 'tool_use', id: 'call_mcp_script', name: 'code_execution', input: { code } },
+    ], 'tool_use'));
+    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Done.' }]));
+
+    const framework = await AgentFramework.create({
+      storePath,
+      membrane: membrane.asMembrane(),
+      agents: [],
+      modules: [],
+      mcplServers: [{ id: 'echo', command: process.execPath, args: ['-e', server] }],
+      syncIntervalMs: 0,
+      codeExecution: { enabled: true },
+    });
+    try {
+      const created = await framework.createEphemeralAgent({
+        name: 'worker', model: 'test-model', systemPrompt: 'Do the task.', allowedTools: 'all',
+      });
+      created.contextManager.addMessage('user', [{ type: 'text', text: 'Go.' }]);
+      const promise = framework.runEphemeralToCompletion(created.agent, created.contextManager);
+      framework.start();
+      await promise;
+
+      const wire = membrane.lastStream!.receivedToolResults[0] as Array<{ toolUseId: string; content: unknown }>;
+      const direct = wire.find((r) => r.toolUseId === 'call_mcp_direct');
+      assert.strictEqual(direct?.content, listing, 'the model gets the text, not its JSON encoding');
+      const script = wire.find((r) => r.toolUseId === 'call_mcp_script') as { content: string } | undefined;
+      assert.ok(script, 'the script call has a result');
+      const out = JSON.parse(script.content) as { stdout: string; return_code: number };
+      assert.strictEqual(out.return_code, 0, script.content);
+      assert.match(out.stdout, /count: 2\n/);
+      assert.match(out.stdout, /second: \[review\] org\/repo#1 "Fix it"\n/);
+      assert.match(out.stdout, /quoted: False/);
+    } finally {
+      await framework.stop();
+      rmSync(tempDir, { recursive: true, force: true });
+    }
+  });
+
   it('two code_execution calls in one response: one runs, the other is refused, the turn completes', async () => {
     const { tempDir, storePath } = tempStorePath('pytc-two-');
     const membrane = new MockMembrane();

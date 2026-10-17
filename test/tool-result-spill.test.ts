@@ -426,6 +426,64 @@ describe('tool-result spill completion (issue #89)', () => {
     }
   });
 
+  it('spills a plain string result as its text: lines intact, greppable, not one JSON-quoted line', async () => {
+    // A module tool that answers with a line-per-item listing returns a
+    // string. It used to be JSON-quoted on the way to history, so its spill
+    // file held one escaped line that could only be paged by character.
+    const body = Array.from({ length: 3000 }, (_, i) => `[review] org/repo#${i} "title ${i}"\tsize ${'t'.repeat(10)}`).join('\n');
+    const h = await startSpillTurn({
+      prefix: 'spill-string-',
+      result: { success: true, data: body },
+      withWorkspace: true,
+    });
+    try {
+      const stored = await waitForStoredToolResult(h.framework);
+      assert.ok(stored, 'tool result should be stored');
+      assert.ok(stored.content.startsWith('[review] org/repo#0 "title 0"\t'), 'inline head is the text itself, unquoted');
+
+      const refMatch = stored.content.match(/workspace file (files\/tool-results\/\S+\.txt)/);
+      assert.ok(refMatch, 'reference should name the spill file');
+      const file = await h.workspace!.readBinary(refMatch[1]);
+      assert.ok('data' in file, 'spill file should be readable');
+      const saved = (file as { data: Buffer }).data.toString('utf8');
+      assert.strictEqual(saved, body, 'the spill file holds the string verbatim');
+      assert.strictEqual(saved.split('\n').length, 3000, 'one line per item');
+
+      // grep finds one item, on its own line.
+      const grep = await h.workspace!.handleToolCall({
+        id: 'grep', name: 'grep', input: { pattern: 'repo#2999 ', path: refMatch[1] },
+      });
+      assert.strictEqual(grep.success, true, grep.error);
+      const matches = (grep.data as { results: Array<{ matches: Array<{ line: number; text: string }> }> })
+        .results.flatMap((r) => r.matches);
+      assert.deepStrictEqual(matches.map((m) => [m.line, m.text]), [[3000, body.split('\n')[2999]]]);
+    } finally {
+      await h.framework.stop();
+      rmSync(h.tempDir, { recursive: true, force: true });
+    }
+  });
+
+  it('a plain string result reaches history and the live wire as its text, byte-identical', async () => {
+    const body = 'As of 10:00. 2 open.\n[review] org/repo#1 "Fix it"\n[merge] org/repo#2 done';
+    const h = await startSpillTurn({
+      prefix: 'string-wire-',
+      result: { success: true, data: body },
+      withWorkspace: false,
+    });
+    try {
+      const stored = await waitForStoredToolResult(h.framework);
+      assert.ok(stored, 'tool result should be stored');
+      assert.strictEqual(stored.content, body, 'history holds the string, not its JSON encoding');
+      const wire = h.membrane.lastStream?.receivedToolResults[0] as
+        Array<{ content: unknown }> | undefined;
+      assert.ok(wire && wire.length === 1, 'one wire tool result expected');
+      assert.strictEqual(wire[0].content, body, 'the wire carries the same text');
+    } finally {
+      await h.framework.stop();
+      rmSync(h.tempDir, { recursive: true, force: true });
+    }
+  });
+
   it('falls back to EXPLICIT plain truncation with no writable workspace', async () => {
     const h = await startSpillTurn({
       prefix: 'spill-nows-',
