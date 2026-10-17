@@ -276,10 +276,11 @@ async function residentTurn(options: {
   framework.onTrace((e) => traces.push(e));
   // Every look the hold is asked for (checkBudgetHold), whatever it decides:
   // a window that asserts no verdict asserts first that the hold was asked.
+  // Counted only where there is a hold, so the file runs against main too.
   let looks = 0;
-  const hold = framework as unknown as { checkBudgetHold: (agentName: string) => Promise<void> };
-  const checkBudgetHold = hold.checkBudgetHold.bind(framework);
-  hold.checkBudgetHold = (agentName: string) => { looks++; return checkBudgetHold(agentName); };
+  const hold = framework as unknown as { checkBudgetHold?: (agentName: string) => Promise<void> };
+  const checkBudgetHold = hold.checkBudgetHold?.bind(framework);
+  if (checkBudgetHold) hold.checkBudgetHold = (agentName: string) => { looks++; return checkBudgetHold(agentName); };
   const send = (text: string) => framework.pushEvent({
     type: 'external-message',
     source: 'test',
