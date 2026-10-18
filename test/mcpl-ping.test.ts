@@ -42,6 +42,19 @@ test('a ping on a connected transport is answered with an empty result; a ping n
   ]);
 });
 
+test('a ping with id null is answered with id null, and one with an invalid id gets -32600, at once while the planes are paused (#475)', (t) => {
+  const { connection, receive, written } = bareConnection();
+  t.mock.method(console, 'error', () => {});
+  // Before ready() both planes are closed, as at startup.
+  receive({ jsonrpc: '2.0', id: null, method: 'ping' });
+  receive({ jsonrpc: '2.0', id: { x: 1 }, method: 'ping' });
+  assert.deepEqual(written(), [
+    { jsonrpc: '2.0', id: null, result: {} },
+    { jsonrpc: '2.0', id: null, error: { code: -32600, message: 'Invalid Request: the id must be a string, a number or null, not an object' } },
+  ]);
+  assert.equal((connection as any).bufferedEvents.length, 0);
+});
+
 test('a ping is answered at once while the planes are paused, and nothing is held for it', () => {
   const { connection, receive, written } = bareConnection();
   // Before ready() both planes are closed, as at startup; a quiesce or the
@@ -61,6 +74,9 @@ test('a ping is answered at once while the planes are paused, and nothing is hel
 //   that isn't a ping, a request whose method isn't a string, a ping sent as
 //   a notification, a log notification, its initialize response, and a ping
 //   with the id "late", which the connected transport answers.
+// - null-ids: as initialize arrives, pings with id null and with an object
+//   id, and answers initialize, then pings with the id "late", once its pong
+//   for id null arrives.
 const HANDSHAKE_SERVER = String.raw`
 const mode = process.argv[1];
 let buf = '';
@@ -80,6 +96,8 @@ process.stdin.on('data', (c) => {
       init = m;
       if (mode === 'pings-first') {
         process.stdout.write(line({ jsonrpc: '2.0', id: 0, method: 'ping' }));
+      } else if (mode === 'null-ids') {
+        process.stdout.write(line({ jsonrpc: '2.0', id: null, method: 'ping' }) + line({ jsonrpc: '2.0', id: { x: 1 }, method: 'ping' }));
       } else {
         process.stdout.write(
           line({ jsonrpc: '2.0', id: 0, method: 'roots/list' }) +
@@ -96,7 +114,10 @@ process.stdin.on('data', (c) => {
         process.stdout.write(line(initResult(init.id)));
         report();
       }
-      if (mode === 'one-chunk' && m.id === 'late') report();
+      if (mode === 'null-ids' && m.id === null && pong) {
+        process.stdout.write(line(initResult(init.id)) + line({ jsonrpc: '2.0', id: 'late', method: 'ping' }));
+      }
+      if ((mode === 'one-chunk' || mode === 'null-ids') && m.id === 'late') report();
     }
   }
 });
@@ -105,7 +126,7 @@ setInterval(() => {}, 1 << 30);
 
 /** Connects to a HANDSHAKE_SERVER and returns the capabilities the host took
  *  from the handshake, and the server's stderr report. */
-async function handshakeWith(mode: 'pings-first' | 'one-chunk') {
+async function handshakeWith(mode: 'pings-first' | 'one-chunk' | 'null-ids') {
   const connection = await McplServerConnection.connect(
     { id: 'pinger', command: process.execPath, args: ['-e', HANDSHAKE_SERVER, mode], requestTimeoutMs: 5_000 },
     { version: '0.5' },
@@ -143,4 +164,12 @@ test('during the handshake nothing that carries a method is taken for the initia
   // included; the ping after the response, held while the connection
   // subscribed, was answered by the connected transport.
   assert.equal(report, 'responses:["\\"late\\":pong"]');
+});
+
+test('during the handshake a ping with id null is answered with id null, and one with an invalid id is ignored (#475)', async () => {
+  const { capabilities, report } = await handshakeWith('null-ids');
+  // The server answered initialize only once its pong for id null arrived.
+  assert.equal(capabilities?.pushEvents, true);
+  // The ping with an object id got nothing, and isn't echoed.
+  assert.equal(report, 'responses:["null:pong","\\"late\\":pong"]');
 });

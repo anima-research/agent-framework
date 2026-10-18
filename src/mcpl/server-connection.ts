@@ -16,6 +16,7 @@ import { maskNegotiatedCapabilities } from './capability-mask.js';
 import { CapabilityGrant, expandAdvertisementShorthand } from './capability-grant.js';
 import { CAPABILITY_DISABLED, boundedForLog, describeCause } from './errors.js';
 import { logDetail, logValue } from './log-value.js';
+import { jsonKind, readEnvelope } from '../jsonrpc-envelope.js';
 
 import type {
   McplServerConfig,
@@ -165,11 +166,19 @@ interface RequestOptions {
   surfaceOrphanedResponse?: boolean;
 }
 
-/** A request's method for a log line, whatever the server sent there. */
-function describeMethod(method: unknown): string {
-  return typeof method === 'string'
-    ? `method ${logValue(method)}`
-    : `a method of type ${method === null ? 'null' : typeof method}`;
+/** The log line for a response whose id is neither a string nor a number,
+ *  or that has none: the host's own request ids are numbers, so it can't be
+ *  matched to one. A server sends an error with id null, or under MCP with
+ *  no id, when it couldn't read a request (JSON-RPC 2.0 §5), so once
+ *  connected it may be the answer to a request of ours, which gets nothing
+ *  from it and ends as any unanswered request does, by its timeout where it
+ *  has one. (During the handshake such an error answers initialize.) Its
+ *  error member, if it has one, is printed as sent, through logValue, since
+ *  it's the server's text. */
+function unmatchedResponse(serverId: string, response: { id?: unknown; error?: unknown }): string {
+  const which = Object.hasOwn(response, 'id') ? `whose id is ${jsonKind(response.id)}` : 'with no id';
+  return `[mcpl] ${serverId}: ignored a response ${which}, which can't be matched to a request of ours` +
+    (response.error !== undefined ? `; its error: ${logValue(response.error)}` : '');
 }
 
 /**
@@ -735,15 +744,30 @@ export class McplServerConnection extends EventEmitter {
           // initialize response, whatever its id: a server's own ids can start
           // at 0, this handshake's. MCP lets a server ping before
           // initialization completes, and the ping gets its empty result, as
-          // on a connected transport. Anything else it sends now is ignored.
-          if ('method' in msg) {
-            const request = msg as unknown as JsonRpcRequest;
-            if (request.method === 'ping' && request.id != null) {
-              transport.writeLine(JSON.stringify({ jsonrpc: '2.0', id: request.id, result: {} }));
-            }
+          // on a connected transport, `"id": null` included
+          // (src/jsonrpc-envelope.ts). Anything else it sends now is ignored,
+          // an invalid request included. Of its responses, the one with
+          // initialize's id answers it, and so does a JSON-RPC 2.0 error with
+          // id null or with no id: a peer answers a request it couldn't read
+          // that way (JSON-RPC 2.0 §5; MCP 2025-11-25, Basic), initialize is
+          // the only request this host has out, and a peer never answers a
+          // response. Such an error means the server can't read this host's
+          // messages, so the handshake fails at once, in the server's words.
+          // `"jsonrpc": "2.0"` keeps a server's own JSON log line, which can
+          // carry an id and an error key, from failing it. Any other response
+          // whose id can't be matched is logged, as on a connected transport.
+          const envelope = readEnvelope(msg as unknown as Record<string, unknown>);
+          if (envelope.kind === 'request' && envelope.method === 'ping') {
+            transport.writeLine(JSON.stringify({ jsonrpc: '2.0', id: envelope.id, result: {} }));
             return;
           }
-          if (msg.id !== initId) return;
+          if (envelope.kind !== 'response') return;
+          const namesNoRequest = msg.id === null || !Object.hasOwn(msg, 'id');
+          const answersInitialize = msg.id === initId || (namesNoRequest && msg.jsonrpc === '2.0' && Boolean(msg.error));
+          if (!answersInitialize) {
+            if (typeof msg.id !== 'string' && typeof msg.id !== 'number') console.error(unmatchedResponse(config.id, msg));
+            return;
+          }
           cleanup();
           if (msg.error) {
             // describeCause rather than the template's own conversion: the
@@ -1460,7 +1484,7 @@ export class McplServerConnection extends EventEmitter {
    */
   private setupMessageRouting(transport: McplTransport): void {
     transport.on('line', (line: string) => {
-      let msg: JsonRpcRequest | JsonRpcResponse;
+      let msg: unknown;
       try {
         msg = JSON.parse(line);
       } catch {
@@ -1472,7 +1496,7 @@ export class McplServerConnection extends EventEmitter {
       // before property access, just as malformed JSON lines are ignored.
       if (msg === null || typeof msg !== 'object' || Array.isArray(msg)) return;
       try {
-        this.dispatchMessage(msg);
+        this.dispatchMessage(msg as Record<string, unknown>);
       } catch (error) {
         const request = msg as { method?: unknown; id?: unknown };
         this.reportInboundFailure(error, {
@@ -1484,15 +1508,31 @@ export class McplServerConnection extends EventEmitter {
   }
 
   /** Contain synchronous dispatch failures; async RPC handlers own their promises. */
-  private dispatchMessage(msg: JsonRpcRequest | JsonRpcResponse): void {
-    // Is this a response to one of our outbound requests?
-    if ('id' in msg && msg.id != null && !('method' in msg)) {
-      this.handleResponse(msg as JsonRpcResponse);
-      return;
+  private dispatchMessage(msg: Record<string, unknown>): void {
+    // The envelope is read once, here (src/jsonrpc-envelope.ts says how).
+    const envelope = readEnvelope(msg);
+    switch (envelope.kind) {
+      case 'response':
+        // Never answered, so a server that answers what it can't read, with
+        // id null, can't start an exchange of errors with us.
+        this.handleResponse(msg as unknown as JsonRpcResponse);
+        return;
+      case 'neither':
+        // Not JSON-RPC: ignored like the server's other unrelated output.
+        return;
+      case 'invalid': {
+        this.sendErrorResponse(envelope.id, envelope.error.code, envelope.error.message);
+        const forMethod = envelope.method !== undefined ? ` for method ${logValue(envelope.method)}` : '';
+        console.error(`[mcpl] ${this.id}: answered -32600 to an invalid request${forMethod}: ${envelope.problems}`);
+        return;
+      }
     }
 
-    // It is an inbound request or notification from the server
-    const request = msg as JsonRpcRequest;
+    // It is an inbound request or notification from the server, its method
+    // a string. A request's id is a string, a number or null, and `"id": null`
+    // is answered with id null; a notification has none.
+    const request = msg as unknown as JsonRpcRequest;
+    const requestId = envelope.kind === 'request' ? envelope.id : undefined;
 
     // MCP's ping, which either side may send: its receiver answers promptly
     // with an empty result. It's answered as it arrives, before admission and
@@ -1500,11 +1540,11 @@ export class McplServerConnection extends EventEmitter {
     // paused plane mustn't hold that answer. A ping sent as a notification
     // has nothing to answer. The handshake answers one too.
     if (request.method === 'ping') {
-      if (request.id != null) this.sendResponse(request.id, {});
+      if (requestId !== undefined) this.sendResponse(requestId, {});
       return;
     }
 
-    const eventName = typeof request.method === 'string' && Object.hasOwn(McplServerConnection.METHOD_TO_EVENT, request.method)
+    const eventName = Object.hasOwn(McplServerConnection.METHOD_TO_EVENT, request.method)
       ? McplServerConnection.METHOD_TO_EVENT[request.method] : undefined;
 
     // §7 is removed in 0.5.0: scope/elevate is no longer a method. Answer
@@ -1516,8 +1556,8 @@ export class McplServerConnection extends EventEmitter {
     // routed, control-plane classified, and mutating declarations — a
     // live ungated self-attestation path (PR #79 review blocker 4).
     if (request.method === McplMethod.FeatureSetsChanged) {
-      if (request.id != null) {
-        this.sendErrorResponse(request.id, -32601, 'featureSets/changed removed in MCPL 0.5.0 (superseded by mcpl/manifestChanged, SPEC §17)');
+      if (requestId !== undefined) {
+        this.sendErrorResponse(requestId, -32601, 'featureSets/changed removed in MCPL 0.5.0 (superseded by mcpl/manifestChanged, SPEC §17)');
       } else {
         console.error(`[mcpl] ${this.id}: discarded featureSets/changed — removed in 0.5.0 (§6.7/§17)`);
       }
@@ -1525,8 +1565,8 @@ export class McplServerConnection extends EventEmitter {
     }
 
     if (request.method === McplMethod.ScopeElevate) {
-      if (request.id != null) {
-        this.sendErrorResponse(request.id, -32601, 'scope/elevate removed in MCPL 0.5.0 (SPEC §7)');
+      if (requestId !== undefined) {
+        this.sendErrorResponse(requestId, -32601, 'scope/elevate removed in MCPL 0.5.0 (SPEC §7)');
       }
       return;
     }
@@ -1538,24 +1578,23 @@ export class McplServerConnection extends EventEmitter {
 
     if (!eventName) {
       // §6.6: a request that will never be answered MUST get an error, so a
-      // request (it has an id) whose method isn't a string, or isn't one this
-      // host handles, is answered -32601. A notification nobody handles is
-      // ignored, as JSON-RPC asks.
-      if (request.id != null) {
-        this.sendErrorResponse(request.id, -32601, 'Method not found');
-        console.error(`[mcpl] ${this.id}: answered -32601 to a request for ${describeMethod(request.method)}, which this host doesn't handle`);
+      // request whose method isn't one this host handles is answered -32601.
+      // A notification nobody handles is ignored, as JSON-RPC asks.
+      if (requestId !== undefined) {
+        this.sendErrorResponse(requestId, -32601, 'Method not found');
+        console.error(`[mcpl] ${this.id}: answered -32601 to a request for method ${logValue(request.method)}, which this host doesn't handle`);
       }
       return;
     }
 
     // Emit the typed event with params and (for requests) a respond callback
-    if (request.id != null) {
+    if (requestId !== undefined) {
       // Server expects a response — provide a respond helper
       this.dispatchInboundEvent(eventName, request.params, {
-        id: request.id,
-        respond: (result: unknown) => this.sendResponse(request.id!, result),
+        id: requestId,
+        respond: (result: unknown) => this.sendResponse(requestId, result),
         respondError: (code: number, message: string, data?: unknown) =>
-          this.sendErrorResponse(request.id!, code, message, data),
+          this.sendErrorResponse(requestId, code, message, data),
       });
     } else {
       // Notification — no response expected
@@ -1616,6 +1655,13 @@ export class McplServerConnection extends EventEmitter {
    * Handle a JSON-RPC response by resolving/rejecting the corresponding pending request.
    */
   private handleResponse(response: JsonRpcResponse): void {
+    // A response whose id is neither a string nor a number, or that has
+    // none, can't be matched to a request of ours. It isn't an orphan, which
+    // is a late answer to one, so it's logged and ignored.
+    if (typeof response.id !== 'string' && typeof response.id !== 'number') {
+      console.error(unmatchedResponse(this.id, response));
+      return;
+    }
     const pending = this.pendingRequests.get(response.id);
     if (!pending) {
       // Orphaned response — the request already timed out (or was settled) and
@@ -1693,7 +1739,7 @@ export class McplServerConnection extends EventEmitter {
   /**
    * Send a successful JSON-RPC response back to the server.
    */
-  private sendResponse(id: string | number, result: unknown): void {
+  private sendResponse(id: string | number | null, result: unknown): void {
     if (this.closed) return;
     const response: JsonRpcResponse = { jsonrpc: '2.0', id, result };
     this.transport?.writeLine(JSON.stringify(response));
@@ -1702,7 +1748,7 @@ export class McplServerConnection extends EventEmitter {
   /**
    * Send a JSON-RPC error response back to the server.
    */
-  private sendErrorResponse(id: string | number, code: number, message: string, data?: unknown): void {
+  private sendErrorResponse(id: string | number | null, code: number, message: string, data?: unknown): void {
     if (this.closed) return;
     const response: JsonRpcResponse = {
       jsonrpc: '2.0',

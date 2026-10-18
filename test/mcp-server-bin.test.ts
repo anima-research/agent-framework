@@ -108,10 +108,11 @@ test('importing the package, or running its server module under the command\'s n
   const entry = join(dir, 'entry.mjs');
   writeFileSync(entry, `const { McpServer } = await import(${rootUrl});\nif (typeof McpServer !== 'function') process.exit(2);\n`);
   // An application bundling the package carries the server's module, never
-  // the command: this copy, under the command's file name and beside the
-  // original so it resolves 'ws' as the module does, is that bundle run as
-  // the entry point. It used to start the server.
-  const bundleDir = join(dirname(CORE), `bundle-${process.pid}`);
+  // the command: this copy, under the command's file name and as deep in
+  // dist/src/ as the original, so it resolves 'ws' and its own relative
+  // imports as the module does, is that bundle run as the entry point. It
+  // used to start the server.
+  const bundleDir = join(dirname(dirname(CORE)), `bundle-${process.pid}`);
   mkdirSync(bundleDir);
   made.push(bundleDir);
   const bundle = join(bundleDir, 'mcp-server.js');

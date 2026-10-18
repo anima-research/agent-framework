@@ -641,7 +641,8 @@ const bySeq = (a: { seq: number }, b: { seq: number }): number => a.seq - b.seq;
 
 /** The reply helpers an MCPL connection hands an inbound request's handler. */
 type InboundResponder = {
-  id: string | number;
+  /** The request's id: null for a request that the server sent with id null. */
+  id: string | number | null;
   respond: (result: unknown) => void;
   respondError: (code: number, message: string, data?: unknown) => void;
 };
@@ -22576,7 +22577,7 @@ export class AgentFramework {
     // Handle server-initiated inference requests (Step 6)
     onRequest('inference-request', async (
       params: McplInferenceRequestParams,
-      responder?: { id: string | number; respond: (result: unknown) => void; respondError: (code: number, message: string) => void },
+      responder?: { id: string | number | null; respond: (result: unknown) => void; respondError: (code: number, message: string) => void },
     ) => {
       // RFC-006 §5.3 / SPEC §10.7: no inference from inside a render.
       if (this.pushCoalescer?.isRendering(connection.id)) {

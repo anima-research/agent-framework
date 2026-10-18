@@ -35,8 +35,10 @@ import type { HookOrchestrator } from './hook-orchestrator.js';
 interface Responder {
   respond(result: McplInferenceRequestResult): void;
   respondError(code: number, message: string, data?: unknown): void;
-  /** The JSON-RPC request ID, used for streaming chunk correlation. */
-  requestId?: string | number;
+  /** The JSON-RPC request ID, used for streaming chunk correlation: a
+   *  request sent with id null is answered whole, since its chunks couldn't
+   *  name it. */
+  requestId?: string | number | null;
 }
 
 // ============================================================================
