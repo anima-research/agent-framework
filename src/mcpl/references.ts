@@ -470,11 +470,14 @@ export function dialServer(
  * expiry. A pure function of the record and the servers' addresses: a
  * reference's stub asks it of the registry's (unfetchableReason), and the
  * fetcher's pre-dial check of its own framework's configs, whose credential
- * goes with the address it checks. In a process with one framework, or with
- * frameworks that agree on each id they share, the two sources hold the same
- * addresses, so a stub promises what the fetch does. Where two frameworks
- * configure one id differently, only a stub's words can be wrong, never where
- * a token goes. A fetch's own limits, its budget and ceiling, come after it.
+ * goes with the address it checks. In a process with one running framework,
+ * or with running frameworks that agree on each id they share, the two
+ * sources hold the same addresses, so a stub promises what the fetch does. A
+ * stopped framework's addresses are out of the registry, so its stubs say its
+ * servers are unknown while its configs still resolve them. Where two
+ * frameworks configure one id differently, only a stub's words can be wrong,
+ * never where a token goes. A fetch's own limits, its budget and ceiling,
+ * come after it.
  */
 export function dialCheck(
   record: ReferenceRecord,
