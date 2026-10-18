@@ -20,6 +20,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { JsStore } from '@animalabs/chronicle';
 import { AgentFramework } from '../src/index.js';
+import type { ScriptToolResult } from '../src/index.js';
 import type { Module, ModuleContext, ToolCall, ToolResult, ToolDefinition } from '../src/types/index.js';
 import {
   AUDIO_NO_DATA_TEXT,
@@ -472,7 +473,7 @@ describe("MCP's resource_link, a reference (RFC-005 §8.1)", () => {
     const fw = Object.create(AgentFramework.prototype) as {
       dispatchScriptToolCall: (...args: unknown[]) => Promise<ToolResult>;
       getReferenceFetcher(): unknown;
-      handleScriptToolCall(agentName: string, toolName: string, args: Record<string, unknown>): Promise<string>;
+      handleScriptToolCall(agentName: string, toolName: string, args: Record<string, unknown>): Promise<ScriptToolResult>;
     };
     const reference = {
       type: 'resource', uri: `https://zz-files.example/wanted.pdf?sig=${SECRET}`, name: 'wanted.pdf',
@@ -493,12 +494,14 @@ describe("MCP's resource_link, a reference (RFC-005 §8.1)", () => {
     });
     const error = console.error;
     console.error = () => {};
-    let text: string;
+    let result: ScriptToolResult;
     try {
-      text = await fw.handleScriptToolCall('zz-agent', 'zz_tool', {});
+      result = await fw.handleScriptToolCall('zz-agent', 'zz_tool', {});
     } finally {
       console.error = error;
     }
+    assert.equal(result.isError, false);
+    const { text } = result;
     assert.deepEqual(fetched, [reference.uri]);
     assert.deepEqual(claims, [['wanted.pdf', reference.digest, reference.expiresAt]]);
     // The script reads the text history stores for a protocol result's
