@@ -590,3 +590,157 @@ test('proseTargetFor: no token when none is safe (shared id across servers, whit
   assert.equal(registry.proseTargetFor('chan:8', 'discord-a'), '#only-a');
   assert.equal(registry.proseTargetFor('chan:8', 'discord-b'), undefined);
 });
+
+/** Mark a seeded channel as not a conversation, as terminal-sessions does. */
+function refuseSpeech(lookup: (id: string) => { descriptor: { metadata?: Record<string, unknown> } } | undefined, channelId: string): void {
+  lookup(channelId)!.descriptor.metadata = { ...lookup(channelId)!.descriptor.metadata, speech: 'none' };
+}
+
+test('a wake from a speech-none channel (a terminal session) routes bare prose to the default channel, and does not open the terminal', async () => {
+  // The trunk agent's turn was triggered by a terminal completion: the active
+  // channel is terminal:build. Its last human message came in chanA.
+  const active: Record<string, string> = { sol: 'terminal:build' };
+  const { registry, publishCalls, openCalls, lookup } = makeRegistry(
+    { delivered: true },
+    () => undefined,
+    (n) => active[n],
+  );
+  seedRegistered(registry, 'discord', 'chanA');
+  registry.handleIncoming('discord', incoming('chanA', 'kick off the build?'));
+  seedRegistered(registry, 'terminal', 'terminal:build');
+  refuseSpeech(lookup, 'terminal:build');
+  lookup('terminal:build')!.open = false;
+
+  const locus = registry.resolveLocus('sol');
+  assert.equal(locus, 'chanA', 'the terminal channel is skipped; the default (last inbound) channel is the locus');
+  assert.equal(registry.buildChannelContext('sol')?.defaultOutgoing?.channelId, 'chanA', 'the agent is told the same channel');
+
+  const res = await registry.routeSpeech('sol', 'The build passed.', locus);
+  assert.deepEqual(res, { delivered: true, channelId: 'chanA' });
+  assert.equal(publishCalls.at(-1)?.channelId, 'chanA');
+  assert.equal(openCalls.length, 0, 'the terminal channel was not opened by delivery');
+  assert.equal(lookup('terminal:build')!.open, false);
+  assert.equal(registry.getDesiredState('terminal', 'terminal:build'), undefined, 'no durable desire to keep it open');
+});
+
+test('a wake from a speech-none channel with nothing else to speak into leaves the turn without a locus, and the terminal closed', async () => {
+  const active: Record<string, string> = { sol: 'terminal:build' };
+  const { registry, failures, openCalls, lookup } = makeRegistry({ delivered: true }, () => undefined, (n) => active[n]);
+  seedRegistered(registry, 'terminal', 'terminal:build');
+  refuseSpeech(lookup, 'terminal:build');
+  lookup('terminal:build')!.open = false;
+
+  assert.equal(registry.resolveLocus('sol'), null);
+  assert.equal(registry.buildChannelContext('sol')?.defaultOutgoing, undefined);
+  const res = await registry.routeSpeech('sol', 'The build passed.', null);
+  assert.equal(res, null, 'prose stays in the archive, as for any turn without a locus');
+  assert.equal(failures.length, 1);
+  assert.match(failures[0]!.reason, /no locus/);
+  // The reason reaches the agent in its send-failure marker, so it names the
+  // case truly: the trigger channel exists, and refuses speech.
+  assert.match(failures[0]!.reason, /no home, trigger or default channel that takes plain speech/);
+  assert.equal(openCalls.length, 0);
+});
+
+test('a speech-none home channel is skipped too, and an explicit send to a speech-none channel still delivers', async () => {
+  const { registry, publishCalls, lookup } = makeRegistry(
+    { delivered: true },
+    (n) => (n === 'fork-1' ? 'terminal:build' : undefined),
+  );
+  seedRegistered(registry, 'discord', 'chanA');
+  registry.handleIncoming('discord', incoming('chanA', 'hello'));
+  seedRegistered(registry, 'terminal', 'terminal:build');
+  refuseSpeech(lookup, 'terminal:build');
+  lookup('terminal:build')!.open = false;
+
+  assert.equal(registry.resolveLocus('fork-1'), 'chanA', 'a home that refuses speech yields to the next candidate');
+  assert.equal(registry.buildChannelContext('fork-1')?.defaultOutgoing?.channelId, 'chanA', 'and the fork is told that channel');
+
+  // Addressed on purpose (an explicit target), the channel takes the text: the
+  // server records it as a note for observers. Whether delivery also opens a
+  // closed channel is routeSpeech's rule for every channel, not this mark's,
+  // so it isn't asserted here.
+  const res = await registry.routeSpeech('fork-1', 'leaving a note on the build', 'terminal:build');
+  assert.deepEqual(res, { delivered: true, channelId: 'terminal:build' });
+  assert.equal(publishCalls.at(-1)?.channelId, 'terminal:build');
+});
+
+/** A terminal session's descriptor, as terminal-sessions registers it: marked as not a conversation. */
+function terminalDescriptor(id: string, marked = true) {
+  return {
+    id, type: 'terminal', label: id, direction: 'bidirectional' as const, initiallyOpen: false,
+    metadata: { node: 'mbp', ...(marked ? { speech: 'none' } : {}) },
+  };
+}
+
+/** A channels/incoming message with its own message id, so the reply context can tell messages apart. */
+function incomingWithId(channelId: string, messageId: string, text: string) {
+  const msg = incoming(channelId, text);
+  msg.messages[0]!.messageId = messageId;
+  return msg;
+}
+
+test("a speech-none channel's own traffic never makes it the default publish channel: the fallback, the reply context and channel_publish without a channelId stay with the conversation", async () => {
+  // An open terminal session sends its digests as channels/incoming, as
+  // terminal-sessions does while a session channel is open. Before the mark
+  // was read here, that traffic made the terminal the default publish
+  // channel, so a wake from it had no fallback while the session was open.
+  const active: Record<string, string> = { sol: 'terminal:build' };
+  const { registry, publishCalls, lookup } = makeRegistry({ delivered: true }, () => undefined, (n) => active[n]);
+  seedRegistered(registry, 'discord', 'chanA');
+  registry.handleIncoming('discord', incomingWithId('chanA', 'm-chan', 'kick off the build?'));
+  // The session's descriptor arrives as a server registers it, mark included.
+  await registry.handleRegister('terminal', { channels: [terminalDescriptor('terminal:build')] });
+  registry.handleIncoming('terminal', incomingWithId('terminal:build', 'm-term', 'build: 40%, 12 MB written'));
+  assert.equal(lookup('terminal:build')!.open, true, 'its traffic was accepted, so the transport counts as open');
+
+  assert.equal(registry.getDefaultPublishChannel(), 'chanA', 'the default stays where the conversation was');
+  assert.equal(registry.resolveLocus('sol'), 'chanA', 'the wake falls back to the conversation with the session open too');
+  const context = registry.buildChannelContext('sol');
+  assert.equal(context?.defaultOutgoing?.channelId, 'chanA', 'the agent is told the same channel');
+  assert.deepEqual(context?.incoming, { channelId: 'chanA', messageId: 'm-chan', threadId: undefined },
+    "the reply context stays on the conversation's message, its id and thread with it");
+
+  const res = await registry.handleChannelToolCall('channel_publish', { text: 'status: the build is running' }, { kind: 'agent', agentName: 'sol' });
+  assert.equal(res.success, true, JSON.stringify(res));
+  assert.equal(publishCalls.at(-1)?.channelId, 'chanA', 'channel_publish with no channelId posts to the conversation, not the terminal');
+});
+
+test('a channel marked after its traffic made it the default is skipped as the default: no fallback locus, and channel_publish without a channelId refuses', async () => {
+  const { registry, publishCalls } = makeRegistry({ delivered: true }, () => undefined, () => undefined);
+  seedRegistered(registry, 'discord', 'chanA');
+  registry.handleIncoming('discord', incomingWithId('chanA', 'm-chan', 'hello'));
+  // Unmarked when its traffic arrives, so it becomes the default...
+  await registry.handleRegister('terminal', { channels: [terminalDescriptor('terminal:build', false)] });
+  registry.handleIncoming('terminal', incomingWithId('terminal:build', 'm-term', 'build: started'));
+  assert.equal(registry.getDefaultPublishChannel(), 'terminal:build');
+  // ...and marked by a later registration of the same channel.
+  await registry.handleRegister('terminal', { channels: [terminalDescriptor('terminal:build')] });
+
+  assert.equal(registry.getDefaultPublishChannel(), 'terminal:build', 'the stored default is the one its traffic set');
+  assert.equal(registry.resolveLocus('sol'), null, 'a heartbeat-like wake skips the marked default');
+  assert.equal(registry.buildChannelContext('sol')?.defaultOutgoing, undefined, 'and is told of no channel');
+  const before = publishCalls.length;
+  const res = await registry.handleChannelToolCall('channel_publish', { text: 'note' }, { kind: 'agent', agentName: 'sol' });
+  assert.equal(res.success, false, 'no default to publish to');
+  assert.match(String(res.error), /no default channel available/);
+  assert.equal(publishCalls.length, before, 'nothing was published');
+});
+
+test("where two servers register one channel id, a message on it is read as delivery reads the id: the marked channel registered first keeps it from becoming the default", async () => {
+  const { registry, publishCalls } = makeRegistry({ delivered: true }, () => undefined, () => undefined);
+  seedRegistered(registry, 'discord', 'chanA');
+  registry.handleIncoming('discord', incomingWithId('chanA', 'm-chan', 'hello'));
+  // terminal-sessions registers shared:1 first, marked; another server then
+  // registers the same id, unmarked, and sends traffic on it.
+  await registry.handleRegister('terminal', { channels: [terminalDescriptor('shared:1')] });
+  seedRegistered(registry, 'other', 'shared:1');
+  registry.handleIncoming('other', incomingWithId('shared:1', 'm-other', 'hi'));
+
+  // A publish to shared:1 would reach the first registrant, the marked one,
+  // so the message doesn't make shared:1 the default.
+  assert.equal(registry.getDefaultPublishChannel(), 'chanA');
+  const res = await registry.handleChannelToolCall('channel_publish', { text: 'hello again' }, { kind: 'agent', agentName: 'sol' });
+  assert.equal(res.success, true, JSON.stringify(res));
+  assert.equal(publishCalls.at(-1)?.channelId, 'chanA', "channel_publish with no channelId doesn't reach the marked channel");
+});

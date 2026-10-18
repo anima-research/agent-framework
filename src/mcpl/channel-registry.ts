@@ -390,11 +390,11 @@ const CHANNEL_TOOL_DEFINITIONS: ToolDefinition[] = [
   },
   {
     name: 'channel_publish',
-    description: 'Publish a message to a channel. If channelId is omitted, publishes to the most recent incoming channel.',
+    description: 'Publish a message to a channel. If channelId is omitted, publishes to the most recent incoming channel, skipping any marked as not a conversation, such as a terminal session.',
     inputSchema: {
       type: 'object' as const,
       properties: {
-        channelId: { type: 'string', description: 'ID of the channel to publish to (defaults to the most recent incoming channel)' },
+        channelId: { type: 'string', description: 'ID of the channel to publish to (defaults to the most recent incoming channel, skipping any marked as not a conversation)' },
         content: { type: 'string', description: 'Text content to publish' },
         text: { type: 'string', description: 'Alias for content' },
       },
@@ -521,7 +521,7 @@ interface ChannelRegistryOptions {
    * forks are spawned bound to a single channel (the framework tracks this in
    * `conversationAgentHomes` / `ConversationRouter.channelForAgent`); their
    * plain-text speech must route THERE. The process-global `defaultPublishChannel`
-   * tracks only the most-recent inbound across ALL channels, so with one fork per
+   * tracks only the most-recent inbound across every channel that takes speech, so with one fork per
    * channel running concurrently it misroutes a fork's reply to whichever channel
    * last spoke (item 3). Returns undefined for the trunk/primary agent, which has
    * no home and correctly falls back to the global locus (heartbeats, etc.).
@@ -534,7 +534,7 @@ interface ChannelRegistryOptions {
    * connectome-host runs — it never exposes conversation forks). A trunk agent
    * has no fork home, so without this its plain-text speech falls back to the
    * process-global `defaultPublishChannel`, which tracks the most-recent inbound
-   * across ALL channels and misroutes a reply to whichever channel last spoke
+   * across every channel that takes speech and misroutes a reply to whichever channel last spoke
    * under concurrency (item-3 redux). The framework keeps both on the live
    * turn's routing state and exposes them here. For a heartbeat / no-trigger
    * turn it resolves to undefined until the turn's locus is resolved, so that
@@ -651,10 +651,10 @@ export class ChannelRegistry {
    */
   private dmClassified = new Map<string, true>();
 
-  /** Most recent incoming channel ID — used for speech routing / default publish. */
+  /** Most recent incoming channel ID, from a channel that takes speech (refusesSpeech): the fallback locus, and channel_publish's channel when the call names none. */
   private defaultPublishChannel: string | null = null;
 
-  /** Most recent incoming message metadata, used for buildChannelContext. */
+  /** That incoming message's id and thread, used for buildChannelContext. */
   private defaultPublishMessageId: string | null = null;
   private defaultPublishThreadId: string | undefined = undefined;
 
@@ -1064,9 +1064,15 @@ export class ChannelRegistry {
       // A coalesced item is "accepted" only once the coalescer admits it, so
       // for those this runs after the hook (below).
       const markAccepted = () => {
-        this.defaultPublishChannel = message.channelId;
-        this.defaultPublishMessageId = message.messageId;
-        this.defaultPublishThreadId = message.threadId;
+        // A channel marked `speech: 'none'` names no conversation, so its
+        // traffic doesn't make it the default publish channel: the fallback
+        // for a wake that names none, and channel_publish's channel when the
+        // call names none. Asked by id, as delivery resolves the default.
+        if (!this.refusesSpeech(message.channelId)) {
+          this.defaultPublishChannel = message.channelId;
+          this.defaultPublishMessageId = message.messageId;
+          this.defaultPublishThreadId = message.threadId;
+        }
         // A server sending channels/incoming is authoritative evidence that
         // the transport is actually open. This repairs transient status only;
         // durable desired state still changes exclusively through lifecycle
@@ -1339,7 +1345,8 @@ export class ChannelRegistry {
   // ==========================================================================
 
   /**
-   * Get the default publish channel ID (most recent incoming channel).
+   * Get the default publish channel ID: the most recent incoming channel that
+   * took speech when its traffic was accepted.
    */
   getDefaultPublishChannel(): string | null {
     return this.defaultPublishChannel;
@@ -1483,7 +1490,7 @@ export class ChannelRegistry {
     // agent was told the wrong channel under concurrency.
     const home = agentName ? this.homeChannelResolver?.(agentName) : undefined;
     const active = agentName ? this.activeChannelResolver?.(agentName) : undefined;
-    const outgoing = home ?? active ?? this.defaultPublishChannel;
+    const outgoing = this.firstSpeakable(home, active, this.defaultPublishChannel);
 
     if (openChannels.length === 0 && !outgoing) {
       return undefined;
@@ -1491,7 +1498,8 @@ export class ChannelRegistry {
 
     const context: ChannelContext = {};
 
-    // Incoming: the most-recent inbound message (what the agent is replying to).
+    // Incoming: the most-recent inbound message from a channel that takes
+    // speech (what the agent is replying to).
     // Left process-global — per-channel inbound tracking (the right messageId for
     // a fork's own channel) is a separate concern from the outbound routing fix.
     if (this.defaultPublishChannel && this.defaultPublishMessageId) {
@@ -3019,7 +3027,9 @@ export class ChannelRegistry {
   /**
    * Host-owned output routing (see forking-knowledge-miner LOCUS-ROUTING-DESIGN).
    * Publish the agent's plain-text speech to the current conversational locus
-   * (the most recent incoming channel, tracked cross-surface here in the host).
+   * (the turn's locus, which resolveLocus resolves from a fork's home, the
+   * turn's trigger channel or the default publish channel, skipping a channel
+   * that refuses speech).
    * Called by the framework on a text-only turn — replaces the per-surface
    * sticky auto-post that used to live in discord-mcpl. Returns null when there
    * is no locus / the channel or its server can't be resolved (in which case
@@ -3087,8 +3097,46 @@ export class ChannelRegistry {
   }
 
   resolveLocus(conversationId: string): string | null {
-    const home = this.homeChannelResolver?.(conversationId);
-    return home ?? this.activeChannelResolver?.(conversationId) ?? this.defaultPublishChannel ?? null;
+    return this.firstSpeakable(
+      this.homeChannelResolver?.(conversationId),
+      this.activeChannelResolver?.(conversationId),
+      this.defaultPublishChannel,
+    );
+  }
+
+  /**
+   * The first candidate locus, in precedence order, that may carry an
+   * agent's ordinary prose, skipping a channel that refuses speech
+   * (refusesSpeech). A wake from such a channel is a notification, not an
+   * invitation to reply there, so bare prose routes past it to the next
+   * candidate, and the channel is not opened by delivery. An explicit send
+   * to it still goes (routeSpeech takes the pinned target as given); only
+   * the automatic destination skips it.
+   */
+  private firstSpeakable(...candidates: Array<string | null | undefined>): string | null {
+    for (const candidate of candidates) {
+      if (candidate && !this.refusesSpeech(candidate)) return candidate;
+    }
+    return null;
+  }
+
+  /**
+   * Whether a channel's descriptor carries `metadata.speech: 'none'`: the
+   * channel is not a conversation, but something its server reports on
+   * (terminal-sessions marks every session channel so). It is never where an
+   * agent's ordinary prose lands on its own: not the locus a wake from it
+   * resolves to (firstSpeakable), not where a message from it re-pins the
+   * turn or the agent's channel_open of it moves it (the framework asks this
+   * at both), and not channel_publish's channel when the call names none
+   * (its traffic doesn't set the default, and a default marked later is
+   * skipped). A send that names it still reaches it. The channel is looked up
+   * by id, as delivery looks it up, so the mark read is the one on the
+   * channel prose would reach. The mark is read from the descriptor its
+   * server registered: a channel the host knows only from a push that named
+   * it, before its server registers it, isn't marked.
+   */
+  refusesSpeech(channelId: string): boolean {
+    return this.findChannelEntry(channelId)?.descriptor.metadata?.speech === 'none';
   }
 
   async routeSpeech(
@@ -3128,9 +3176,9 @@ export class ChannelRegistry {
     const channelId = locusChannelId;
     if (!channelId) {
       // The turn froze with no locus (no home, no triggering channel, no
-      // global inbound ever seen) — the agent was told its prose stays in
-      // the archive; honor that.
-      return fail(null, 'turn has no locus (no home/trigger channel; nothing to deliver into)');
+      // global inbound ever seen, or each of them refuses speech) — the agent
+      // was told its prose stays in the archive; honor that.
+      return fail(null, 'turn has no locus (no home, trigger or default channel that takes plain speech; nothing to deliver into)');
     }
 
     const entry = this.findChannelEntry(channelId);
@@ -3227,8 +3275,10 @@ export class ChannelRegistry {
       };
     }
 
-    // Resolve channelId: default to most recent incoming channel
-    const channelId = input.channelId ?? this.defaultPublishChannel;
+    // Resolve channelId: default to the most recent incoming channel, which
+    // is no default once it refuses speech (a mark that arrived after its
+    // traffic made it the default).
+    const channelId = input.channelId ?? this.firstSpeakable(this.defaultPublishChannel);
     if (!channelId) {
       return {
         success: false,
