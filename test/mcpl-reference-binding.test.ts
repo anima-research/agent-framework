@@ -155,8 +155,9 @@ test("fetch_reference reaches a push event's reference through its server's own 
     firstWritableMountName: () => 'scratch',
     emitTrace: () => {},
   });
-  // Configured as the framework configures a server, its address recorded
-  // in the reference registry, where the stub and the fetcher read it.
+  // Configured as the framework configures a server: its config, which the
+  // fetcher reads, and its address in the reference registry, which the
+  // stub reads.
   for (const config of [
     { id: 'push-srv', url: wsOrigin },
     { id: 'stdio-srv', command: 'stdio-server' },

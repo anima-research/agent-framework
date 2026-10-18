@@ -2,7 +2,8 @@
  * What a script receives from a tool whose result carries structuredContent,
  * through the real dispatch. An MCPL peer's content blocks get the treatment
  * RFC-005 gives them on every lane the model reads, since what a script prints
- * comes back to the model: a reference arrives without its URI, as the host's
+ * comes back to the model: a reference arrives without its URI (a link
+ * carries one only where the model's line shows it), as the host's
  * reference id, what the server said about it in that block, and `savedTo`,
  * the workspace path the dispatch fetched its payload to for the script; a
  * block the classifier rejects arrives as the notice the model's lanes show,
@@ -169,7 +170,7 @@ test("an MCPL peer's structured result reaches a script with each block treated 
     const out = await script('mcpl--files--attach');
     assert.ok(!out.includes('example.invalid'), `no URI reaches the script: ${out.slice(0, 2000)}`);
     assert.deepEqual(fetched, [uris('treated').report, uris('treated').big],
-      'every reference was fetched for the script before it read the result, except the one that counts as expired');
+      'every reference was fetched for the script before it read the result, except the one that counts as expired and the link, which is never fetched for a script');
     const object = JSON.parse(out) as { content: Array<{ refId?: string }>; structuredContent: unknown; isError: boolean };
     const [report, , big] = object.content;
     const link = object.content[8];

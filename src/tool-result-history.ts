@@ -15,8 +15,10 @@
  * other block as a marker saying what it was and why it isn't shown. Anything
  * else falls back to JSON, written by RFC-005's rules at every depth
  * (historyJson): a reference is shown as its stub wherever it sits in the
- * data, so its uri never reaches history, and inline data that claims a uri
- * or a disposition is withheld.
+ * data, so its uri reaches history only as a link's line shows it where the
+ * host can't fetch the link and its uri can't carry a credential
+ * (shownLinkUri), and inline data that claims a uri or a disposition is
+ * withheld.
  */
 
 import {
@@ -27,6 +29,7 @@ import {
   INLINE_WITHHELD_TEXT,
   buildReferenceStub,
   classifyBlock,
+  referenceRegistry,
   referenceStubOrNull,
   referenceTypeLabel,
 } from './mcpl/references.js';
@@ -99,7 +102,34 @@ export function toolResultBlocks(data: unknown, dataIsContent?: boolean): ToolRe
   if (dataIsContent !== true && !data.every((element) => isPlainRecord(element) && MCP_BLOCK_TYPES.has(element.type as string))) {
     return null;
   }
+  // Every reference first, so what one says of a uri (a `disposition: never`,
+  // an expiry) holds for each block that names it, whatever their order.
+  for (const raw of data) registerReference(raw);
   return data.map(toolResultBlock);
+}
+
+/** Register a block that is a reference, before any block is shown. */
+function registerReference(raw: unknown): void {
+  const c = classifyBlock(raw);
+  if (c.kind === 'reference') referenceRegistry.register(c.testimony);
+}
+
+/** Register every reference a tool result's data holds, at any depth, as
+ *  historyJson shows them, before any is shown. A value RFC-005 governs is
+ *  shown whole, so what's inside it isn't visited. */
+function registerReferencesIn(value: unknown, seen: Set<object> = new Set()): void {
+  if (!value || typeof value !== 'object' || seen.has(value)) return;
+  seen.add(value);
+  if (Array.isArray(value)) {
+    for (const element of value) registerReferencesIn(element, seen);
+    return;
+  }
+  const b = value as Record<string, unknown>;
+  if (governedByRfc005(b)) {
+    registerReference(b);
+    return;
+  }
+  for (const field of Object.values(b)) registerReferencesIn(field, seen);
 }
 
 /** One element of a content array, as toolResultBlocks gives it. Only an
@@ -164,10 +194,12 @@ export interface HistorySerializeOptions {
   /**
    * Called once a content array has been serialized block by block, rather
    * than given up on for the fallback, with where each block sits in the
-   * joined text, before any cut at `maxChars`. The framework reads from it
-   * what a result's live copy showed (#403).
+   * joined text, before any cut at `maxChars`, and the blocks themselves as
+   * this text was made from them. The framework reads from it what a
+   * result's live copy shows (#403), and builds that copy from these very
+   * blocks, so the two copies come from one classification.
    */
-  onBlocks?: (spans: HistoryBlockSpan[]) => void;
+  onBlocks?: (spans: HistoryBlockSpan[], blocks: ToolResultBlock[]) => void;
 }
 
 /**
@@ -259,7 +291,7 @@ function tryHistoryStringFromContentArray(data: unknown, options?: HistorySerial
       spans.push({ kind: part.kind, start, end: start + part.text.length });
       start += part.text.length + 1; // the newline that joins them
     }
-    options.onBlocks(spans);
+    options.onBlocks(spans, blocks);
   }
   return parts.map((part) => part.text).join('\n');
 }
@@ -267,16 +299,19 @@ function tryHistoryStringFromContentArray(data: unknown, options?: HistorySerial
 /**
  * Whether RFC-005 governs a value of a tool result's data, wherever it sits.
  * A reference is a `resource` with a uri, at its top level or under
- * `resource` (where MCP embeds a resource's uri), an `image` or `audio`
- * given by uri, or MCP's `resource_link` (RFC-005 §8.1); inline data is an
- * `image` or `audio` whose data is a string. A uri that is null, absent or
- * empty counts as none, and data that isn't a string isn't inline data, so a
- * record that only shares one of those type names is data. A uri of any
- * other value, string or not, counts, so a credential fails closed.
+ * `resource` (where MCP embeds a resource's uri), or an `image` or `audio`
+ * given by uri; inline data is an `image` or `audio` whose data is a string.
+ * There a uri that is null, absent or empty counts as none, and data that
+ * isn't a string isn't inline data, so a record that only shares one of
+ * those type names is data. A uri of any other value, string or not, counts,
+ * so a credential fails closed. MCP's `resource_link` (RFC-005 §8.1) is
+ * governed whatever its uri: one without a usable uri is its marker.
  */
 function governedByRfc005(b: Record<string, unknown>): boolean {
   if (b.type === 'resource') return hasUri(b.uri) || (isPlainRecord(b.resource) && hasUri(b.resource.uri));
-  if (b.type === 'resource_link') return hasUri(b.uri);
+  // A link is governed whatever its uri, so one without a usable uri is its
+  // marker here, as on the content lanes, never its fields.
+  if (b.type === 'resource_link') return true;
   if (b.type === 'image' || b.type === 'audio') return typeof b.data === 'string' || hasUri(b.uri);
   return false;
 }
@@ -296,7 +331,8 @@ function isPlainRecord(value: unknown): value is Record<string, unknown> {
  * one (such as a uri that isn't a string, or MCP's embedded resource, whose
  * uri isn't at its top level) as the marker saying why it isn't shown, and
  * inline data that also claims a uri or a disposition as withheld, so no uri
- * is ever shown. Inline data that claims neither is itself, as is any other value:
+ * is shown but a link's where its line shows one (shownLinkUri). Inline data
+ * that claims neither is itself, as is any other value:
  * a block of another type keeps its fields, since RFC-005 governs
  * references.
  */
@@ -329,6 +365,7 @@ export function rfc005TextOf(value: unknown): string | null {
  * as a bare reference, is that text.
  */
 function historyJson(data: unknown): string | undefined {
+  registerReferencesIn(data);
   const root = shownInHistory(data);
   if (root !== data && typeof root === 'string') return root;
   return JSON.stringify(data, (_key, value: unknown) => shownInHistory(value)) as string | undefined;

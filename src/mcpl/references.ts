@@ -20,7 +20,8 @@
  *    retires).
  *
  * The ReferenceRegistry is the host-private reference record (§6.2): raw
- * URIs and testimony live here and never in model-visible content. Fetching
+ * URIs and testimony live here, and model-visible content shows a uri only
+ * as a tool result's link line shows one (shownLinkUri). Fetching
  * (§6/§7 origin binding, ceilings, redirects) is deliberately not here yet —
  * the registry is what makes a future host-mediated fetcher and the
  * code-execution materialization hook possible.
@@ -263,8 +264,10 @@ export function shownServerId(serverId: string): string {
  * - Backblaze B2's: `https://f000.backblazeb2.com/file/b/k?Authorization=…`
  * - OAuth's: `#access_token=…&token_type=bearer`, `#id_token=…`, `?refresh_token=…`, `?client_secret=…`,
  *   and OAuth 1.0a's `?oauth_token=…&oauth_signature=…`
- * - the generic: `?token=…`, `?auth=…`, `?key=…`, `?apikey=…`, `?api_key=…`, `?x-api-key=…`, `?private_token=…`,
- *   `?secret=…`, `?password=…`, `?signature=…`
+ * - the generic: `?token=…`, `?auth=…`, `?auth_token=…`, `?key=…`, `?apikey=…`, `?api_key=…`, `?api_token=…`,
+ *   `?x-api-key=…`, `?private_token=…`, `?secret=…`, `?password=…`, `?signature=…`
+ * - a session's id, a bearer credential too: `?session_id=…`, `?jsessionid=…` (in a path, as
+ *   `;jsessionid=…` usually rides, it isn't read)
  * A credential named otherwise, or carried in a path, such as a webhook's
  * `https://discord.com/api/webhooks/<id>/<token>`, isn't caught.
  */
@@ -277,7 +280,8 @@ const CREDENTIAL_PARAMETERS: ReadonlySet<string> = new Set([
   'authorization',
   'access_token', 'id_token', 'refresh_token', 'client_secret',
   'oauth_token', 'oauth_signature',
-  'token', 'auth', 'key', 'api_key', 'x-api-key', 'private_token', 'secret', 'password',
+  'token', 'auth', 'auth_token', 'key', 'api_key', 'api_token', 'x-api-key', 'private_token', 'secret', 'password',
+  'session_id', 'jsessionid',
 ].map(credentialName));
 
 /** A parameter's name as CREDENTIAL_PARAMETERS compares it: its letters and
@@ -321,8 +325,10 @@ export function uriMayCarryCredential(uri: string): boolean {
 }
 
 /** How the host reaches a server, as far as fetching its references goes:
- *  the url it dials the server at, or none, for a server it doesn't connect
- *  to over a network, such as a stdio server. A framework records each of its
+ *  the WebSocket url it dials an MCPL server at, or none: for a server it
+ *  spawns, such as a stdio one, or a modern MCP server over HTTP, whose
+ *  results carry no references (RFC-005 governs MCPL peers' alone), or one
+ *  whose url the transport won't dial. A framework records each of its
  *  servers' in the registry (ReferenceRegistry.setServerAddress), where a
  *  stub reads it; its fetcher reads the same from the framework's own
  *  configs, beside each server's credential. */
@@ -683,16 +689,6 @@ export interface StubOptions {
 }
 
 /**
- * Build the model-visible stub for a reference. Its length is bounded by
- * host constants and independent of every server-supplied field's length:
- * REFERENCE_STUB_MAX_CHARS. Under `disposition:"never"` the uri is omitted
- * unconditionally; under `ref`/absent it is omitted too — this host's default
- * policy is the opaque id everywhere (the safe default of §5), with retrieval
- * via the record. The one exception is a tool result's link the host can't
- * fetch (StubOptions.unfetchedLinkUri), which is no stub but a line of its
- * own, its uri bounded by REFERENCE_LIMITS.uri.
- */
-/**
  * The uri a tool result's link shows, or null where it shows none: a link
  * (fromLink) the host can't fetch, whose uri can't carry a credential, and
  * that no reference withholds with `disposition: never`, keeps its uri, the
@@ -714,6 +710,16 @@ export function shownLinkUri(t: ReferenceTestimony, record: ReferenceRecord, now
   return uriMayCarryCredential(uri) ? null : uri;
 }
 
+/**
+ * Build the model-visible stub for a reference. Its length is bounded by
+ * host constants and independent of every server-supplied field's length:
+ * REFERENCE_STUB_MAX_CHARS. Under `disposition:"never"` the uri is omitted
+ * unconditionally; under `ref`/absent it is omitted too — this host's default
+ * policy is the opaque id everywhere (the safe default of §5), with retrieval
+ * via the record. The one exception is a tool result's link the host can't
+ * fetch (StubOptions.unfetchedLinkUri), which is no stub but a line of its
+ * own, its uri bounded by REFERENCE_LIMITS.uri.
+ */
 export function buildReferenceStub(t: ReferenceTestimony, provenance?: string, serverId?: string, options?: StubOptions): string {
   const record = referenceRegistry.register(t, serverId);
   const parts: string[] = [];
@@ -792,12 +798,12 @@ export function referenceStubOrNull(block: unknown, provenance?: string, serverI
  * the host's reference id, what the server said about it in this block (its
  * labels stripped and bounded as in the stub), and `savedTo`, the workspace
  * path its payload was fetched to, or null when it wasn't (`fetch_reference`
- * takes the id as `ref_id`). An unsaved reference that counts as expired
- * also carries `expired`. Its uri is left out, except that a link (MCP's
+ * takes the id as `ref_id`). Its uri is left out, except that a link (MCP's
  * resource_link) carries `uri` where the model's line for it shows the uri
- * (shownLinkUri). Where the stub gives a reason the fetcher would refuse,
- * in place of advising fetch_reference, the object carries the same words as
- * `unfetchable` (unfetchableReason). The reference is registered bound to `serverId`, the
+ * (shownLinkUri). Where the model's line is a stub, an unsaved reference
+ * that counts as expired also carries `expired`, and where the stub gives a
+ * reason the fetcher would refuse, in place of advising fetch_reference, the
+ * object carries the same words as `unfetchable` (unfetchableReason). The reference is registered bound to `serverId`, the
  * server whose tool returned it, as the model's lanes bind a tool result's
  * references, so the fetch its id offers can be made. A block the classifier
  * rejects becomes the notice the model's lanes show, and inline data that
@@ -814,10 +820,11 @@ export function referenceBlockForScript(block: unknown, serverId: string): unkno
     case 'reference': {
       const t = c.testimony;
       const record = referenceRegistry.register(t, serverId);
-      // As the stub judges it: a saved copy is still served.
-      const expiry = record.fetchedPath ? null : referenceExpiry(record.testimony);
       const uri = shownLinkUri(t, record);
-      // The reason the stub gives, where it gives one, in the same words.
+      // What the stub says, where the model's line is a stub: a link line
+      // that shows its uri says neither. As the stub judges it, a saved copy
+      // is still served.
+      const expiry = record.fetchedPath || uri !== null ? null : referenceExpiry(record.testimony);
       const unfetchable = uri === null ? unfetchableReason(record) : null;
       return {
         type: (block as { type: string }).type,

@@ -44,7 +44,7 @@ import { CoalesceError, validateCoalescedContent } from '../src/mcpl/push-coales
 import { ReferenceFetcher } from '../src/mcpl/reference-fetcher.js';
 import { checkedToolResult } from '../src/module-registry.js';
 import { parseImagePlaceholders } from '../src/tool-image-ledger.js';
-import { nonErrorResultText, toolResultDataToHistoryString } from '../src/tool-result-history.js';
+import { nonErrorResultText, toolResultBlocks, toolResultDataToHistoryString } from '../src/tool-result-history.js';
 import { MockMembrane, createMockResponse } from './helpers/mock-membrane.js';
 import { fixture } from './helpers/coalescing-fixture.js';
 
@@ -902,3 +902,108 @@ async function answerModelCall(answer: ToolResult): Promise<{ wire: string; stor
     rmSync(dir, { recursive: true, force: true });
   }
 }
+
+describe('one answer for every block of a result', () => {
+  it("withholds a link's uri for a later reference to it with disposition never, whatever the blocks' order", () => {
+    const uri = 'https://zz-elsewhere.example/order-never.csv';
+    const link = { type: 'resource_link', uri, name: 'order.csv' };
+    const never = { type: 'resource', uri, name: 'order.csv', disposition: 'never' };
+    const shown = toolResultDataToHistoryString([TEXT, link, never]);
+    assert.ok(!shown.includes(uri), shown);
+    assert.match(shown.split('\n')[1]!, /^\[ref_[^\]]+\] order\.csv — from tool result — /);
+    // At any depth in data too.
+    const uri2 = 'https://zz-elsewhere.example/order-never-deep.csv';
+    const deep = toolResultDataToHistoryString({ first: [{ ...link, uri: uri2 }], then: { ref: { ...never, uri: uri2 } } });
+    assert.ok(!deep.includes(uri2), deep);
+  });
+
+  it('shows a link with no usable uri at any depth as its marker, never its fields', () => {
+    for (const uri of ['', 42, null]) {
+      const shown = JSON.parse(toolResultDataToHistoryString({ found: [{ type: 'resource_link', uri, name: 'x', description: 'zz-link-description' }] }));
+      assert.equal(typeof shown.found[0], 'string', String(uri));
+      assert.ok(!JSON.stringify(shown).includes('zz-link-description'), String(uri));
+    }
+  });
+
+  it("builds the live copy from the stored pass's own blocks, never classifying them again", () => {
+    const fw = framework() as unknown as {
+      toMembraneToolResult(callId: string, result: ToolResult, maxChars: number | undefined, precomputed: unknown): Live;
+    };
+    const result: ToolResult = { success: true, data: [IMAGE, PLAIN_LINK], dataIsContent: true };
+    // What the stored pass decided, whatever the registry says now.
+    const live = fw.toMembraneToolResult('zz', result, 1000, {
+      text: 'zz-stored', filePath: null,
+      live: [{ kind: 'image', data: PNG, mimeType: 'image/png' }, { kind: 'link', text: 'zz-as-the-stored-pass-wrote-it' }],
+    }).content as Array<{ type: string; text?: string }>;
+    assert.deepEqual(live.map((b) => b.text ?? b.type), ['image', 'zz-as-the-stored-pass-wrote-it']);
+    // And where it decided the stored text, that's the live copy.
+    assert.equal(fw.toMembraneToolResult('zz', result, 1000, { text: 'zz-stored', filePath: null, live: null }).content, 'zz-stored');
+  });
+
+  it('goes natively with links and markers exactly at the cap, and as the stored text one character past it', () => {
+    const cap = AUDIO_TEXT.length * 2;
+    const at = copies({ success: true, data: [IMAGE, AUDIO, AUDIO], dataIsContent: true }, cap).live;
+    assert.ok(Array.isArray(at), String(at));
+    const past = copies({ success: true, data: [IMAGE, AUDIO, AUDIO], dataIsContent: true }, cap - 1);
+    assert.equal(past.live, past.stored);
+  });
+
+  it("reads a result's own dataIsContent, whatever the options say", () => {
+    const data = [TEXT, { type: 'zz-other' }];
+    // The result says data, so the array is JSON, though the options say content.
+    assert.equal(nonErrorResultText({ data, dataIsContent: false }, undefined, { dataIsContent: true }), JSON.stringify(data));
+    // The result says content, so each block shows on its own.
+    assert.equal(nonErrorResultText({ data, dataIsContent: true }, undefined, { dataIsContent: false }), `zz-text\n${unknownBlockText({ type: 'zz-other' })}`);
+  });
+
+  it('hides a link uri with any one credential parameter, each on its own', () => {
+    for (const name of ['X-Amz-Signature', 'X-Amz-Credential', 'X-Amz-Security-Token', 'X-Goog-Signature', 'X-Goog-Credential',
+      'sig', 'signature', 'Key-Pair-Id', 'Policy', 'hm', 'Authorization', 'access_token', 'id_token', 'refresh_token',
+      'client_secret', 'oauth_token', 'oauth_signature', 'token', 'auth', 'auth_token', 'key', 'api_key', 'api_token',
+      'x-api-key', 'private_token', 'secret', 'password', 'session_id', 'jsessionid']) {
+      const uri = `https://zz-elsewhere.example/one-${name}.csv?v=1&${name}=zz`;
+      const line = toolResultDataToHistoryString([TEXT, { type: 'resource_link', uri, name: 'one.csv' }]).split('\n')[1]!;
+      assert.ok(!line.includes('zz-elsewhere.example'), `${name}: ${line}`);
+    }
+  });
+
+  it("bounds an audio marker's type and strips its controls", () => {
+    const type = `audio/\u202Ewav\u0007${'x'.repeat(300)}`;
+    const [marker] = toolResultBlocks([{ type: 'audio', data: BASE64, mimeType: type }], true)! as Array<{ text: string }>;
+    assert.ok(!marker!.text.includes('\u202E') && !marker!.text.includes('\u0007'), marker!.text);
+    assert.ok(marker!.text.length < 250, String(marker!.text.length));
+  });
+
+  it("gives a script's object no expiry for a link whose line shows its uri, as the line gives none", () => {
+    const uri = 'https://zz-elsewhere.example/expired-link.csv';
+    referenceRegistry.register(testimonyOf({ type: 'resource', uri, name: 'expired.csv', expiresAt: '2001-01-01T00:00:00Z' }));
+    const link = { type: 'resource_link', uri, name: 'expired.csv' };
+    const object = referenceBlockForScript(link, 'zz-files') as { uri?: string; expired?: string; unfetchable?: string };
+    assert.equal(object.uri, uri);
+    assert.equal(object.expired, undefined);
+    assert.equal(object.unfetchable, undefined);
+    assert.ok(toolResultDataToHistoryString([TEXT, link]).endsWith(`[resource link "expired.csv": ${uri}; not fetched]`));
+  });
+
+  it("asks the resolver once for each server a fetch's check reads, so its address and its credential are one answer", () => {
+    const record = referenceRegistry.register(testimonyOf({ type: 'resource', uri: 'https://zz-refs.example/once.bin', name: 'once.bin' }), 'zz-once');
+    let asked = 0;
+    const fetcher = new ReferenceFetcher(() => {
+      asked += 1;
+      // A resolver that would answer elsewhere the second time it's asked.
+      return asked === 1 ? { url: 'wss://zz-refs.example' } : { url: 'wss://zz-other.example' };
+    }, async () => null);
+    assert.equal(fetcher.refusal(record), null);
+    assert.equal(asked, 1);
+  });
+
+  it("makes an MCPL result with an element that isn't a block its marker, not a failure", async () => {
+    const fw = framework() as unknown as {
+      mcpToolResult(result: unknown, callId: string, mcplPeer: boolean, serverId: string, callName: string): Promise<ToolResult>;
+    };
+    const result = await fw.mcpToolResult({ content: [null, TEXT] }, 'zz-null', true, 'zz-server', 'zz-tool');
+    assert.equal(result.success, true);
+    assert.equal(result.dataIsContent, true);
+    assert.equal(nonErrorResultText(result), `${unknownBlockText(null)}\nzz-text`);
+  });
+});

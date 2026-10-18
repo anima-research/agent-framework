@@ -364,10 +364,10 @@ export function toolResultCutAt(text: string, cap: number): number {
  *
  * `shown` is what the live copy showed beside the stored text: null when the
  * live copy was the text itself, as for every result that carried no inline
- * image. Then what the cut keeps is exactly what the resident saw, and
- * nothing past it is kept (#403). A result that carried an inline image went
- * to the model as native blocks (tryNativeToolResultContent, framework.ts),
- * every image whatever the text's length, so its stored text is the only
+ * image, or whose links and markers passed the cap together (goesNative).
+ * Then what the cut keeps is exactly what the resident saw, and nothing past
+ * it is kept (#403). A result whose live copy went to the model as native
+ * blocks (framework.ts) sent every image whatever the text's length, so its stored text is the only
  * place save_recent_image's inventory finds them, and a slot dropped by the
  * cut would be an image the resident saw that the index slides past (#104).
  * The image slots past the cut that lie wholly within what the live copy

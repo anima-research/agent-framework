@@ -994,6 +994,8 @@ test("the fetcher's own clauses name a server by its id as a stub does, bounded 
   const reg = new ReferenceRegistry();
   const id = `zz-\u202E${'x'.repeat(300)}`;
   const shown = shownServerId(id);
+  // Bounded at 120 characters, its controls gone, cut with an ellipsis.
+  assert.equal(shown, `zz-${'x'.repeat(116)}…`);
   // An answer's status, which every clause after dialing names the server in.
   const answered = await makeFetcher({ [id]: { url: `ws://127.0.0.1:${port}` } }).fetch(makeRecord(reg, `${ORIGIN}/status/503`, {}, id));
   assert.equal(answered.error, `the "${shown}" server answered HTTP 503`);

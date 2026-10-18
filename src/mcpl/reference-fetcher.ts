@@ -33,7 +33,7 @@
 import { createHash } from 'node:crypto';
 import type { ReferenceRecord, Refusal, ServerAddress } from './references.js';
 import { boundedForLog, describeCause } from './errors.js';
-import { dialCheck, dialServer, FRESH_REFERENCE, noAddressReason, NOTHING_TO_DO, REFERENCE_LIMITS, sanitizeLabel, SERVER_BACK, shownServerId } from './references.js';
+import { dialCheck, dialServer, FRESH_REFERENCE, NOTHING_TO_DO, REFERENCE_LIMITS, sanitizeLabel, shownServerId } from './references.js';
 
 export { normalizedOrigin, type Refusal } from './references.js';
 
@@ -53,8 +53,8 @@ const EAGER_FETCH_TIMEOUT_MS = 10_000;
 // doesn't know where a reference came from (a tool result, a push, a channel
 // message), so none names a tool, and fetch_reference's max_bytes is named
 // only where a larger one can fetch it. The refusals before dialing that a
-// stub shares take theirs from references.ts (NOTHING_TO_DO, FRESH_REFERENCE,
-// SERVER_BACK).
+// stub shares come from references.ts (dialServer, dialCheck) with their
+// remedies (NOTHING_TO_DO, FRESH_REFERENCE, SERVER_BACK).
 const TRY_LATER = 'Trying again later may work.';
 /** A request that failed before an answer: a refused or reset connection
  *  can clear, and a cause that repeats on every try (a port fetch refuses, a
@@ -195,26 +195,31 @@ export class ReferenceFetcher {
     private readonly saveFile: (fileName: string, data: Buffer, mimeType: string) => Promise<string | null>,
   ) {}
 
-  /** How the host reaches a server, as the resolver answers: what dialCheck
-   *  and dialServer read for a fetch. */
-  private readonly addressOf = (serverId: string): ServerAddress | undefined => {
-    const resolution = this.resolveServer(serverId);
-    return resolution === undefined || resolution === 'no-address' ? resolution : { url: resolution.url };
-  };
-
-  /** A server's credential and limits, for a server dialServer chose. */
-  private bindingFor(serverId: string): { serverId: string; binding: ResolvedServerBinding } | { refusal: Refusal } {
-    const binding = this.resolveServer(serverId);
-    if (binding === undefined) return refused(`this host no longer has the "${shownServerId(serverId)}" server it came from`, SERVER_BACK);
-    if (binding === 'no-address') return refused(noAddressReason(shownServerId(serverId)), NOTHING_TO_DO);
-    return { serverId, binding };
+  /** The server a check (dialServer or dialCheck) chose, with its credential
+   *  and limits from the same resolver answer whose address the check read:
+   *  each server's resolution is read once here, so the origin the check
+   *  passes and the token the fetch sends come from one answer, whatever a
+   *  resolver answers the next time it's asked. */
+  private chosen(
+    check: (addressOf: (serverId: string) => ServerAddress | undefined) => { serverId: string } | { refusal: Refusal },
+  ): { serverId: string; binding: ResolvedServerBinding } | { refusal: Refusal } {
+    const resolutions = new Map<string, ServerResolution | undefined>();
+    const addressOf = (serverId: string): ServerAddress | undefined => {
+      if (!resolutions.has(serverId)) resolutions.set(serverId, this.resolveServer(serverId));
+      const resolution = resolutions.get(serverId);
+      return resolution === undefined || resolution === 'no-address' ? resolution : { url: resolution.url };
+    };
+    const server = check(addressOf);
+    if ('refusal' in server) return server;
+    // The check chose only a server whose address it read as a url, so that
+    // server's resolution is a binding.
+    return { serverId: server.serverId, binding: resolutions.get(server.serverId) as ResolvedServerBinding };
   }
 
   /** The server a fetch of a record dials (§6.2), with its credential and
    *  limits, or why none can be. */
   private serverFor(record: ReferenceRecord): { serverId: string; binding: ResolvedServerBinding } | { refusal: Refusal } {
-    const server = dialServer(record, this.addressOf);
-    return 'refusal' in server ? server : this.bindingFor(server.serverId);
+    return this.chosen((addressOf) => dialServer(record, addressOf));
   }
 
   /** Would the eager (autofetch) default fetch this record? Not one the fetch
@@ -244,9 +249,7 @@ export class ReferenceFetcher {
    *  refuse with, and no eager slot goes to a fetch that would be refused. */
   private beforeDial(record: ReferenceRecord, opts?: { maxBytes?: number }):
     { refusal: Refusal } | { serverId: string; binding: ResolvedServerBinding; ceiling: number; budget: number } {
-    const dial = dialCheck(record, this.addressOf);
-    if ('refusal' in dial) return dial;
-    const server = this.bindingFor(dial.serverId);
+    const server = this.chosen((addressOf) => dialCheck(record, addressOf));
     if ('refusal' in server) return server;
     const { serverId, binding } = server;
     const t = record.testimony;

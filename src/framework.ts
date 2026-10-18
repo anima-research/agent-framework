@@ -120,6 +120,7 @@ import {
   truncateForHistory,
   DEFAULT_TOOL_RESULT_INLINE_MAX_CHARS,
   type HistoryBlockSpan,
+  type ToolResultBlock,
 } from './tool-result-history.js';
 import {
   TOOL_IMAGE_REF_RE,
@@ -352,7 +353,7 @@ const SEND_ENGAGEMENT_TOOLS = new Set([
 function extractChannelIdFromToolResult(
   content: Array<{ type: string; text?: string }> | undefined,
 ): string | undefined {
-  const text = content?.find((c) => c.type === 'text' && c.text)?.text;
+  const text = content?.find((c) => c?.type === 'text' && c.text)?.text;
   if (!text) return undefined;
   try {
     const parsed = JSON.parse(text) as { channelId?: unknown };
@@ -362,6 +363,16 @@ function extractChannelIdFromToolResult(
   } catch {
     return undefined;
   }
+}
+
+/** A tool result's stored copy as the history path wrote it: its text,
+ *  spilled or cut at the cap, the spill file, and, where its live copy goes
+ *  as native blocks (goesNative), the blocks the text was made from, which
+ *  the live copy is built from (toMembraneToolResult). */
+interface StoredToolResult {
+  text: string;
+  filePath: string | null;
+  live: ToolResultBlock[] | null;
 }
 
 /**
@@ -389,8 +400,10 @@ function serverAddressOf(cfg: McplServerConfig): ServerAddress {
  * too, has no text.
  */
 function mcplResultText(content: McpToolResultContent[] | undefined): string {
+  // An element that isn't a block, null among them, has no text: it shows as
+  // its marker where the content is shown block by block.
   return (Array.isArray(content) ? content : [])
-    .filter((c) => c.type === 'text')
+    .filter((c) => c?.type === 'text')
     .map((c) => (typeof c.text === 'string' ? c.text : NON_STRING_TEXT_PLACEHOLDER))
     .filter((text) => text !== '')
     .join('\n');
@@ -5152,7 +5165,7 @@ export class AgentFramework {
    *    the eager ceiling, connection origin — never worse than the server
    *    having inlined the bytes). Failures are non-fatal: the stub then says
    *    fetch_reference instead of a path.
-   *  - `script`: as `model`, then fetch every reference ("eagerly lazy"): a
+   *  - `script`: as `model`, then fetch every reference but a link ("eagerly lazy"): a
    *    script receiving a result is the strongest available signal that the
    *    bytes are wanted (scripts process, they do not browse), so the stub it
    *    receives carries a workspace path it can open directly.
@@ -18606,13 +18619,13 @@ export class AgentFramework {
     maxChars: number | undefined,
   ): Promise<{
     blocks: ContentBlock[];
-    spilled: Map<string, { text: string; filePath: string | null }>;
+    spilled: Map<string, StoredToolResult>;
   }> {
-    const spilled = new Map<string, { text: string; filePath: string | null }>();
+    const spilled = new Map<string, StoredToolResult>();
     const dateLabel = new Date().toISOString().slice(0, 10);
     for (const tc of toolResults) {
-      const { text, shown } = this.storedToolResultText(agentName, tc, maxChars);
-      spilled.set(tc.id, await this.spillOrTruncate(text, maxChars, `${dateLabel}-${tc.id}`, shown));
+      const { text, shown, live } = this.storedToolResultText(agentName, tc, maxChars);
+      spilled.set(tc.id, { ...await this.spillOrTruncate(text, maxChars, `${dateLabel}-${tc.id}`, shown), live });
     }
     const blocks: ContentBlock[] = toolResults.map(tc => ({
       type: 'tool_result' as const,
@@ -18646,10 +18659,11 @@ export class AgentFramework {
     agentName: string,
     tc: CompletedToolCall,
     maxChars: number | undefined,
-  ): { text: string; shown: ShownRanges | null } {
-    if (tc.result.isError) return { text: tc.result.error ?? 'Unknown error', shown: null };
+  ): { text: string; shown: ShownRanges | null; live: ToolResultBlock[] | null } {
+    if (tc.result.isError) return { text: tc.result.error ?? 'Unknown error', shown: null, live: null };
     const ledger = this.toolImageLedgerFor(agentName);
     let blocks = null as HistoryBlockSpan[] | null;
+    let classified = null as ToolResultBlock[] | null;
     const text = nonErrorResultText(tc.result, undefined, {
       imageRef: (blockIndex, image) => ledger.retain({
         toolCallId: tc.id,
@@ -18658,15 +18672,16 @@ export class AgentFramework {
         data: image.data,
         mediaType: image.mimeType,
       }).ref,
-      onBlocks: (spans) => { blocks = spans; },
+      onBlocks: (spans, result) => { blocks = spans; classified = result; },
     });
-    if (!blocks || !goesNative(blocks.map(({ kind, start, end }) => ({ kind, length: end - start })), maxChars)) {
-      return { text, shown: null };
+    if (!blocks || !classified || !goesNative(blocks.map(({ kind, start, end }) => ({ kind, length: end - start })), maxChars)) {
+      return { text, shown: null, live: null };
     }
     return {
       text,
       shown: blocks.map(({ kind, start, end }): [number, number] =>
         [start, kind === 'text' && maxChars ? start + toolResultCutAt(text.slice(start, end), maxChars) : end]),
+      live: classified,
     };
   }
 
@@ -18929,8 +18944,8 @@ export class AgentFramework {
     // RFC-005 "eagerly lazy": a script receiving a result is the strongest
     // available signal that the bytes are wanted (scripts process, they do
     // not browse), so the stub the script receives carries a workspace path
-    // it can open directly. An MCPL peer's references were fetched for the
-    // script at dispatch (autoFetchReferences). Any other tool's content
+    // it can open directly. An MCPL peer's references, but its links, were
+    // fetched for the script at dispatch (autoFetchReferences). Any other tool's content
     // array, a module's, is materialized here. Only a reference registered
     // against its server can be fetched: a module's result can carry content
     // it got from a call of its own (ctx.callTool), whose references were
@@ -19099,9 +19114,11 @@ export class AgentFramework {
     callId: string,
     afResult: ToolResult,
     maxChars?: number,
-    /** Pre-spilled outcome from the history path — used for the non-image
-     *  path so the live wire copy byte-matches what the window stored. */
-    precomputed?: { text: string; filePath: string | null },
+    /** The history path's outcome: its stored text, spilled or cut, and the
+     *  blocks it was made from where the live copy goes natively. The live
+     *  copy is built from these, never classified again, so the two copies
+     *  agree on every block and on whether it goes natively (goesNative). */
+    precomputed?: StoredToolResult,
   ): MembraneToolResult {
     if (afResult.isError) {
       // Same spill policy as successes: reuse the history copy so a giant
@@ -19117,13 +19134,16 @@ export class AgentFramework {
     // blocks natively rather than JSON-stringifying them away. Anything else
     // goes as text. The error path was handled above, so isError is always
     // false on these return paths.
-    const blocks = this.tryNativeToolResultContent(
-      afResult.data, Boolean(afResult.dataIsContent), maxChars, precomputed?.filePath ?? null);
+    if (precomputed !== undefined) {
+      return {
+        toolUseId: callId,
+        content: precomputed.live ? this.nativeContent(precomputed.live, maxChars, precomputed.filePath) : precomputed.text,
+        isError: false,
+      };
+    }
+    const blocks = this.tryNativeToolResultContent(afResult.data, Boolean(afResult.dataIsContent), maxChars);
     if (blocks) {
       return { toolUseId: callId, content: blocks, isError: false };
-    }
-    if (precomputed !== undefined) {
-      return { toolUseId: callId, content: precomputed.text, isError: false };
     }
     // Without the history path's copy, the text is made as that copy is
     // (nonErrorResultText), so a reference's uri stays out of it at any depth
@@ -19147,14 +19167,23 @@ export class AgentFramework {
     data: unknown,
     dataIsContent: boolean,
     maxChars?: number,
-    /** Spill file written by the history path — referenced from truncation
-     *  notices so an image-adjacent giant text block stays recoverable. */
-    spillPath: string | null = null,
   ): ToolResultContentBlock[] | null {
     const blocks = toolResultBlocks(data, dataIsContent);
     if (!blocks || !goesNative(blocks.map((block) => ({ kind: block.kind, length: block.kind === 'image' ? 0 : block.text.length })), maxChars)) {
       return null;
     }
+    return this.nativeContent(blocks, maxChars, null);
+  }
+
+  /** A result's blocks as Membrane's native content: each image as itself,
+   *  each text block cut at the cap, every other block whole. */
+  private nativeContent(
+    blocks: ToolResultBlock[],
+    maxChars: number | undefined,
+    /** Spill file written by the history path — referenced from truncation
+     *  notices so an image-adjacent giant text block stays recoverable. */
+    spillPath: string | null,
+  ): ToolResultContentBlock[] {
     return blocks.map((block): ToolResultContentBlock => {
       if (block.kind === 'image') {
         return { type: 'image', source: { type: 'base64', data: block.data, mediaType: block.mimeType } };
@@ -24508,7 +24537,7 @@ export class AgentFramework {
     // for callers that expect data to be string-ish (mcplResultText).
     let textContent = mcplResultText(blocks);
     if (blocks.length === 0 && hasStructured) textContent = JSON.stringify(result.structuredContent) ?? 'null';
-    const hasNonText = blocks.some((c) => c.type !== 'text');
+    const hasNonText = blocks.some((c) => c?.type !== 'text');
     const structured = hasStructured ? { structured: result.structuredContent } : {};
     // Blocks passed through are marked as content (dataIsContent), so each
     // shows as itself, its stub or its marker, never as the array's JSON.

@@ -1686,6 +1686,9 @@ describe('ToolImageLedger', () => {
     // isn't named.
     const longServer = (kind: string) => `${kind}-${'s'.repeat(400)}`;
     const host = {};
+    // srv is dialed on the references' own origin, so its rows reach the
+    // expiry's reasons and the fetch the stub offers.
+    referenceRegistry.setServerAddress('srv', { url: 'wss://example.invalid' }, host);
     referenceRegistry.setServerAddress(longServer('stdio'), 'no-address', host);
     referenceRegistry.setServerAddress(longServer('elsewhere'), { url: 'wss://elsewhere.invalid' }, host);
     referenceRegistry.setServerAddress(longServer('dialed'), { url: 'wss://example.invalid' }, host);
@@ -1699,6 +1702,11 @@ describe('ToolImageLedger', () => {
       ['user name or password', { uri: 'https://user:pass@example.invalid/sri-longest-userinfo.png' }, longServer('dialed')],
     );
     const reasons: Record<string, string> = {
+      passed: '— the reference is expired',
+      unparseable: '— the reference is treated as expired, since its expiry time can\'t be read',
+      rejected: '— the reference is treated as expired, since its expiry time isn\'t in a form this host accepts',
+      bound: '— fetch with fetch_reference',
+      unbound: '— it\'s not tied to any server',
       'no address': '— this host doesn\'t connect to the "stdio-s',
       'unknown server': '— this host no longer has the "unknown-s',
       'server address': '— the "garbled-s',
@@ -1710,8 +1718,9 @@ describe('ToolImageLedger', () => {
       const stub = longestId(buildReferenceStub(testimony(name, extra), 'o'.repeat(400), serverId));
       assert.ok(stub.length < REFERENCE_STUB_MAX_CHARS, `${name}: ${stub.length}`);
       assert.strictEqual(parseImagePlaceholders(stub).length, 1, name);
-      if (reasons[name]) assert.ok(stub.includes(reasons[name]!), `${name}: ${stub}`);
+      assert.ok(stub.includes(reasons[name]!), `${name}: ${stub}`);
     }
+    referenceRegistry.forgetServerAddress('srv', host);
     // A placeholder: RFC 6838 bounds a type or subtype name at 127
     // characters, so normalizeMediaType keeps the longest essence and refuses
     // one character more, and the size and ref take a safe integer's digits.
