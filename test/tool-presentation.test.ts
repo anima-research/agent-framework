@@ -2,6 +2,7 @@ import fs from 'node:fs';
 import {syncBuiltinESMExports} from 'node:module';
 import {test} from 'node:test';
 import assert from 'node:assert/strict';
+import {spawnSync} from 'node:child_process';
 import {mkdtempSync,rmSync,writeFileSync,readFileSync,chmodSync,statSync,existsSync,mkdirSync} from 'node:fs';
 import {tmpdir} from 'node:os';
 import {join} from 'node:path';
@@ -497,5 +498,25 @@ test('a problem lists at most ten names, then how many more',()=>{
   const sources=new Map(twelve('big--t').map(name=>[name,'MCPL server: big']));
   const defaultsFile=p.resolve(tools,sources).diagnostics[0];
   assert.ok(defaultsFile.includes(`(it sets "visible" for ${listed(twelve('big--t'))}, and a defaults file may set only descriptions`),defaultsFile);
+ } finally {rmSync(dir,{recursive:true,force:true});}
+});
+
+test('a FIFO at the presentation file is refused at once, not waited on with the process held',{skip:process.platform==='win32'?'no FIFOs':false},()=>{
+ const dir=mkdtempSync(join(tmpdir(),'presentation-fifo-'));
+ try {
+  const path=join(dir,'tools.json');
+  assert.equal(spawnSync('mkfifo',[path]).status,0,'mkfifo');
+  // Read in a child process, bounded: the read is synchronous, so an open that
+  // waits for a writer holds the whole process it runs in.
+  const module=new URL('../src/tool-presentation.js',import.meta.url).href;
+  const script=`const {ToolPresentation}=await import(${JSON.stringify(module)});`
+   +`const s=new ToolPresentation({path:${JSON.stringify(path)},cataloguePath:'board/tools.md'}).resolve([{name:'example',description:'original',inputSchema:{type:'object'}}]);`
+   +'console.log(JSON.stringify({diagnostics:s.diagnostics,description:s.advertised[0].description}));';
+  const child=spawnSync(process.execPath,['--input-type=module','-e',script],{encoding:'utf8',timeout:10_000});
+  assert.equal(child.signal,null,`the read waited on the FIFO until the child was stopped (${child.signal})`);
+  assert.equal(child.status,0,child.stderr);
+  const out=JSON.parse(child.stdout);
+  assert.match(out.diagnostics[0],/^Your tool presentation file can't be used \(it isn't a regular file\)/);
+  assert.equal(out.description,'original','the default description stays');
  } finally {rmSync(dir,{recursive:true,force:true});}
 });

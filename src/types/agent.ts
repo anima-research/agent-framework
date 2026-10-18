@@ -212,7 +212,8 @@ export interface AgentConfig {
    *   that publication envelope through the same authorized resolver.
    *   See docs/hybrid-prose-routing.md.
    * - 'disabled': generated prose is never published. Only explicit tools may
-   *   send externally; prose remains in Chronicle with a private suppression receipt.
+   *   send externally; prose remains in Chronicle, and a turn that wrote plain
+   *   speech ends with a private `[delivered] plain speech → no channel` receipt.
    */
   proseRouting?: 'locus' | 'explicit' | 'hybrid' | 'disabled';
 

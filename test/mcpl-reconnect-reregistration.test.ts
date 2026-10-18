@@ -107,8 +107,6 @@ async function makeHarness() {
   fw.mcplTools = [];
   fw.mcplToolRefreshInFlight = false;
   fw.mcplToolRefreshPending = false;
-  // A disconnect reads the servers whose connect is in flight.
-  fw.mcplConnecting = new Set();
   fw.channelRegistry = null;
   fw.inferenceRouter = null;
   fw.eventGate = null;
@@ -137,7 +135,7 @@ async function makeHarness() {
   };
   fw.discordAwarenessBarrier = null;
   fw.discordAwarenessBarrierGeneration = 0;
-  fw.wireMcplEvents(connection);
+  fw.wireMcplEvents(connection, config);
   await fw.registerMcplServerFeatures(config, connection);
 
   // The push handler responds synchronously when no awareness barrier is

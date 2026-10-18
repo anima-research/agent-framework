@@ -23,6 +23,7 @@ import { StringDecoder } from 'node:string_decoder';
 import WebSocket from 'ws';
 
 import type { McplServerConfig } from './types.js';
+import { describeCredentialError, noteDialSent, redactUrl, resolveServerBinding, urlAsDialed } from './protocol-family.js';
 import { assertBooleanSetting } from '../config-checks.js';
 import { logDetail } from './log-value.js';
 
@@ -45,6 +46,9 @@ export interface TransportCloseInfo {
  *  - `'stderr'` `(line: string)`            diagnostic line (stdio child stderr; never WS)
  *  - `'error'`  `(err: Error)`              transport-level error
  *  - `'close'`  `(info: TransportCloseInfo)` transport closed (once)
+ *  - `'unreaped'` `(failure: Error)`        a stdio child whose pipe failed
+ *    outlived SIGKILL too: the transport stays open, owning the child, and
+ *    close() retries the reap (never WS)
  *
  * Inbound `'line'`/`'stderr'` events are buffered until the first matching
  * listener attaches (and re-buffered whenever there are none), so no message is
@@ -88,6 +92,17 @@ export abstract class McplTransport extends EventEmitter {
    */
   get stderrTail(): string {
     return '';
+  }
+
+  /**
+   * The error a stdio child's stdin or stdout failed with, once one has. The
+   * transport is ending the child then, and stays open until it exits, but
+   * writes nothing more to it: writeLine drops each line, and both engines
+   * refuse a request as not sent. Undefined while writes go out, and always
+   * for a transport that has no pipes.
+   */
+  get pipeFailure(): Error | undefined {
+    return undefined;
   }
 
   /**
@@ -245,6 +260,10 @@ export class StdioTransport extends McplTransport {
     return (this.stderrCut ? '…' : '') + this.stderrEnd;
   }
 
+  override get pipeFailure(): Error | undefined {
+    return this.pipeError;
+  }
+
   override stderrEnded(ms: number): Promise<void> {
     const stderr = this.child.stderr;
     if (!stderr || this.stderrDone) return Promise.resolve();
@@ -267,6 +286,8 @@ export class StdioTransport extends McplTransport {
   private constructor(
     private readonly child: ChildProcess,
     private readonly rl: ReadlineInterface,
+    /** The server this child serves, named in its stderr lines and in what
+     *  its reaping reports. */
     serverId: string,
   ) {
     super(serverId);
@@ -302,16 +323,26 @@ export class StdioTransport extends McplTransport {
     this.child.on('error', (err) => this.reportError(err));
     // The child's stdin and stdout carry the protocol, so after an error on
     // either, a write's EPIPE or a read error, this transport can't reach the
-    // child even if it's still running. The handler sends a running child
-    // SIGTERM, and the exit's close names the error, so the connection handles
-    // it as any other exit. The close is the report: no 'error' is emitted,
-    // nothing is thrown. Nothing here escalates to SIGKILL, so a child that
-    // ignores SIGTERM keeps running, unreported. A child that stops reading
-    // without closing its stdin raises no error: the writes are buffered, and
-    // only request timeouts bound it (McplServerConfig.requestTimeoutMs).
+    // child even if it's still running. The handler ends the child as close()
+    // does, SIGTERM and then SIGKILL, in the one attempt close() shares, and
+    // the exit's close names the error, so the connection handles it as any
+    // other exit. The close is the report: no 'error' is emitted, nothing is
+    // thrown, and nothing more is written meanwhile (pipeFailure). The first
+    // error starts that one attempt, and a later one, from either pipe, adds
+    // nothing to it. A child that outlives SIGKILL too stays this
+    // transport's: 'unreaped' says so, unless the host is closing it, whose
+    // close() reports the failure itself. A child that stops reading without
+    // closing its stdin raises no error: the writes are buffered, and only
+    // request timeouts bound it (McplServerConfig.requestTimeoutMs). Under
+    // Bun a child that closes its stdin isn't reported either: Bun emits no
+    // 'error' for the writes to it (checked on 1.3.10, 1.4.3 and 1.4.4's
+    // canary), so request timeouts are its only bound too.
     const endOnPipeError = (err: Error) => {
-      this.pipeError ??= err;
-      if (this.child.exitCode === null && this.child.signalCode === null) this.child.kill();
+      if (this.pipeError) return;
+      this.pipeError = err;
+      void this.terminate().catch((failure: unknown) => {
+        if (!this.closed) this.emit('unreaped', failure instanceof Error ? failure : new Error(String(failure)));
+      });
     };
     this.child.stdin?.on('error', endOnPipeError);
     // On the stream itself, since close() closes readline, which takes its own
@@ -368,30 +399,88 @@ export class StdioTransport extends McplTransport {
   }
 
   writeLine(json: string): void {
+    // Nothing more goes to a child whose stdin or stdout has failed: this
+    // transport is ending it.
+    if (this.pipeError) return;
     // stdin may be gone if the child died between the closed-check and here.
     this.child.stdin?.write(json + '\n');
   }
 
-  async close(): Promise<void> {
-    this.markClosed({ reason: 'closed by host' });
-    this.rl.close();
-    if (this.child && !this.child.killed) {
-      this.child.kill();
+  private closing: Promise<void> | null = null;
+
+  /**
+   * Close and reap: resolves once the child has actually exited, not merely
+   * been signalled (`child.killed` is true as soon as a signal is sent). A
+   * child that outlives SIGTERM by {@link STDIO_EXIT_GRACE_MS} gets SIGKILL.
+   * If it still hasn't exited after that bound again, close rejects: an
+   * explicit cleanup failure, rather than waiting forever or claiming an
+   * exit that wasn't seen. Calls share one attempt, and so does a pipe
+   * failure that is already ending the child; a later call succeeds if the
+   * child has exited since.
+   */
+  close(): Promise<void> {
+    if (!this.closing) {
+      this.closing = this.reap();
+      return this.closing;
     }
-    await new Promise<void>((resolve) => {
-      // Once Node has seen a child exit, it has its exitCode set, or its
-      // signalCode when a signal ended it, and its 'exit' event has fired. A
-      // signal that didn't come through kill() (an OOM kill, a crash) leaves
-      // `killed` false. A child that has exited but isn't reaped yet still
-      // takes the kill() above, which sets `killed`.
-      if (!this.child || this.child.exitCode !== null || this.child.signalCode !== null || this.child.killed) {
-        resolve();
-      } else {
-        this.child.once('exit', () => resolve());
-      }
+    // A later call re-checks a failed verdict: a child that has exited since
+    // is reaped now. No new signals are sent.
+    return this.closing.catch((error: unknown) => {
+      if (this.exited()) return;
+      throw error;
     });
   }
+
+  private async reap(): Promise<void> {
+    this.markClosed({ reason: 'closed by host' });
+    this.rl.close();
+    await this.terminate();
+  }
+
+  /** Whether the child has exited, or never started (a spawn error). */
+  private exited(): boolean {
+    return this.child.pid === undefined || this.child.exitCode !== null || this.child.signalCode !== null;
+  }
+
+  private terminating: Promise<void> | null = null;
+
+  /**
+   * End the child: SIGTERM, then SIGKILL once it has outlived SIGTERM by
+   * {@link STDIO_EXIT_GRACE_MS}. Resolves once it has exited; rejects if it
+   * still hasn't that long after SIGKILL. close() and a pipe failure share
+   * one attempt, so no second signal or timer goes out. A failed attempt is
+   * re-checked, not repeated: a child that has exited since resolves it.
+   */
+  private terminate(): Promise<void> {
+    this.terminating ??= this.escalate();
+    return this.terminating.catch((error: unknown) => {
+      if (this.exited()) return;
+      throw error;
+    });
+  }
+
+  private async escalate(): Promise<void> {
+    const child = this.child;
+    if (this.exited()) return;
+    const exited = new Promise<void>((resolve) => child.once('exit', () => resolve()));
+    const exitWithin = (ms: number) => new Promise<boolean>((resolve) => {
+      const timer = setTimeout(() => resolve(false), ms);
+      void exited.then(() => { clearTimeout(timer); resolve(true); });
+    });
+    child.kill('SIGTERM');
+    if (await exitWithin(STDIO_EXIT_GRACE_MS)) return;
+    const named = `stdio child ${child.pid} of MCP server "${this.serverId}"`;
+    console.error(`[mcpl] ${named} ignored SIGTERM for ${STDIO_EXIT_GRACE_MS}ms — sending SIGKILL`);
+    child.kill('SIGKILL');
+    if (await exitWithin(STDIO_EXIT_GRACE_MS)) return;
+    throw new Error(
+      `${named} did not exit within ${STDIO_EXIT_GRACE_MS}ms of SIGKILL; it could not be reaped`,
+    );
+  }
 }
+
+/** How long a stdio child gets to exit after SIGTERM, and again after SIGKILL. */
+const STDIO_EXIT_GRACE_MS = 2_000;
 
 // ---------------------------------------------------------------------------
 // WebSocket
@@ -399,6 +488,18 @@ export class StdioTransport extends McplTransport {
 
 /** Timeout for the WebSocket to reach OPEN before we give up (ms). */
 const WS_OPEN_TIMEOUT_MS = 15_000;
+
+/** `work`, or `signal`'s reason once it aborts, whichever comes first. The
+ *  listener comes off the signal when `work` settles, so a long-lived signal,
+ *  such as a reconnect loop's, doesn't gather one per dial. */
+function raceAbort<T>(work: Promise<T>, signal: AbortSignal): Promise<T> {
+  if (signal.aborted) return Promise.reject(signal.reason);
+  return new Promise<T>((resolve, reject) => {
+    const onAbort = () => reject(signal.reason);
+    signal.addEventListener('abort', onAbort, { once: true });
+    work.then(resolve, reject).finally(() => signal.removeEventListener('abort', onAbort));
+  });
+}
 
 export class WebSocketTransport extends McplTransport {
   readonly kind = 'websocket' as const;
@@ -426,28 +527,43 @@ export class WebSocketTransport extends McplTransport {
   /**
    * Dial `config.url` and resolve once the socket is OPEN. Appends `?token=`
    * when `config.token` is set. Rejects on connect error / timeout (and tears
-   * the socket down) so a failed dial never leaks an open handle.
+   * the socket down) so a failed dial never leaks an open handle. `signal`
+   * ends a dial whose connection is closed meanwhile, at once, rather than
+   * at the open timeout.
    */
-  static async open(config: McplServerConfig): Promise<WebSocketTransport> {
+  static async open(config: McplServerConfig, signal?: AbortSignal): Promise<WebSocketTransport> {
     // Resolve the per-dial credential first: the provider runs on every
     // connect AND reconnect, so rotation happens at the transport layer and
     // nothing above it ever holds a credential.
     let token: string | null = config.token ?? null;
+    const abandoned = (): Error =>
+      new Error(`MCPL server "${config.id}" WebSocket connect abandoned: the connection was closed (${redactUrl(config.url)})`);
     if (config.accessProvider) {
+      if (signal?.aborted) throw abandoned();
       try {
-        token = (await config.accessProvider()) ?? token;
+        // A dial whose connection is closed meanwhile stops waiting for the
+        // provider; whatever the provider does later is ignored.
+        const provided = Promise.resolve(config.accessProvider());
+        provided.catch(() => { /* a late failure after the dial was abandoned */ });
+        token = (signal ? await raceAbort(provided, signal) : await provided) ?? token;
       } catch (err) {
+        if (signal?.aborted) throw abandoned();
         // Fall back to the static token (if any) rather than failing the dial
         // outright — the server will refuse a stale credential loudly anyway.
+        // The provider's own text may quote the credential, so it isn't logged.
         console.error(
-          `[mcpl] server "${config.id}": access provider failed (${err instanceof Error ? err.message : err}) — dialing with configured fallback`,
+          `[mcpl] server "${config.id}": access provider failed (${describeCredentialError(err)}) — dialing with configured fallback`,
         );
       }
     }
     const url = buildWebSocketUrl(config, token);
+    // A provider's token is in this url, and the query may be re-encoded:
+    // the server's text is recorded with what the dial sent, the token in
+    // each form a token is replaced in.
+    noteDialSent(config, { url, token: token ?? undefined });
     // Error strings travel: traces, logs, tool results the model reads. They
     // get the endpoint, never the credential.
-    const redacted = buildWebSocketUrl({ ...config, token: undefined }, null);
+    const redacted = redactUrl(config.url);
     const ws = new WebSocket(url);
 
     // A failed dial can emit 'error' MORE THAN ONCE on the raw socket (seen
@@ -461,31 +577,36 @@ export class WebSocketTransport extends McplTransport {
 
     return new Promise<WebSocketTransport>((resolve, reject) => {
       let settled = false;
-      const timer = setTimeout(() => {
+      const abandon = (error: Error): void => {
         if (settled) return;
         settled = true;
+        clearTimeout(timer);
+        signal?.removeEventListener('abort', onAbort);
         ws.removeAllListeners();
         ws.on('error', swallowLateErrors);
         try { ws.terminate(); } catch { /* already gone */ }
-        reject(new Error(`MCPL server "${config.id}" WebSocket connect timed out after ${WS_OPEN_TIMEOUT_MS}ms (${redacted})`));
+        reject(error);
+      };
+      const timer = setTimeout(() => {
+        abandon(new Error(`MCPL server "${config.id}" WebSocket connect timed out after ${WS_OPEN_TIMEOUT_MS}ms (${redacted})`));
       }, WS_OPEN_TIMEOUT_MS);
+      const onAbort = (): void => {
+        abandon(new Error(`MCPL server "${config.id}" WebSocket connect abandoned: the connection was closed (${redacted})`));
+      };
+      if (signal?.aborted) onAbort();
+      else signal?.addEventListener('abort', onAbort, { once: true });
 
       ws.once('open', () => {
         if (settled) return;
         settled = true;
         clearTimeout(timer);
+        signal?.removeEventListener('abort', onAbort);
         ws.removeAllListeners('error'); // the instance re-attaches its own handlers
         resolve(new WebSocketTransport(ws, config.id));
       });
 
       ws.once('error', (err: Error) => {
-        if (settled) return;
-        settled = true;
-        clearTimeout(timer);
-        ws.removeAllListeners();
-        ws.on('error', swallowLateErrors);
-        try { ws.terminate(); } catch { /* already gone */ }
-        reject(new Error(`MCPL server "${config.id}" WebSocket connect failed: ${err.message} (${redacted})`));
+        abandon(new Error(`MCPL server "${config.id}" WebSocket connect failed: ${err.message} (${redacted})`));
       });
     });
   }
@@ -527,7 +648,8 @@ export function buildWebSocketUrl(config: McplServerConfig, tokenOverride?: stri
   try {
     parsed = new URL(config.url);
   } catch {
-    throw new Error(`MCPL server "${config.id}": invalid WebSocket url "${config.url}"`);
+    // Not echoed: a url that doesn't parse can't be redacted.
+    throw new Error(`MCPL server "${config.id}": invalid WebSocket url (it isn't shown, since it may carry a credential)`);
   }
   if (parsed.protocol !== 'ws:' && parsed.protocol !== 'wss:') {
     throw new Error(
@@ -538,22 +660,33 @@ export function buildWebSocketUrl(config: McplServerConfig, tokenOverride?: stri
     throw new Error(`MCPL server "${config.id}": websocket url must not have a fragment, got "${parsed.hash}"`);
   }
   const token = tokenOverride !== undefined ? tokenOverride : config.token;
-  if (token) {
-    parsed.searchParams.set('token', token);
-  }
-  return parsed.toString();
+  return urlAsDialed(parsed, token).toString();
 }
 
 // ---------------------------------------------------------------------------
 // Factory
 // ---------------------------------------------------------------------------
 
-/** True when the config selects the WebSocket transport (explicit `transport`,
- *  or a `url` with no `command`). */
+/** True when the config selects the WebSocket transport, as
+ *  {@link resolveServerBinding} decides it; false for any other transport and
+ *  for a configuration it refuses. */
 export function isWebSocketTransport(config: McplServerConfig): boolean {
-  if (config.transport === 'websocket') return true;
-  if (config.transport === 'stdio') return false;
-  return Boolean(config.url) && !config.command;
+  try {
+    return resolveServerBinding(config).transport === 'websocket';
+  } catch {
+    return false;
+  }
+}
+
+/** Whether a server's binding dials it, over WebSocket or HTTP. False for a
+ *  stdio launch, and for a configuration whose binding can't be resolved,
+ *  which the family check refuses. */
+function dialsNetwork(config: McplServerConfig): boolean {
+  try {
+    return resolveServerBinding(config).transport !== 'stdio';
+  } catch {
+    return false;
+  }
 }
 
 /** The settings of McplServerConfig whose type is boolean. */
@@ -577,25 +710,29 @@ const SERVER_CONFIG_BOOLEANS: Record<BooleanSetting, string> = {
  * only `true` as on, so the quotes would hide what the value does. null counts
  * as not set, so a generated config that writes an unset setting as null
  * keeps working. `inheritEnv` is checked only for a stdio server, since a
- * WebSocket server never reads it. The error names the server, the setting
- * and the value's kind, not the value, which could be a secret pasted into
- * the wrong field.
+ * network server, WebSocket or HTTP, never reads it. The error names the
+ * server, the setting and the value's kind, not the value, which could be a
+ * secret pasted into the wrong field.
  */
 export function assertServerConfigBooleans(config: McplServerConfig): void {
   for (const [setting, whatTrueDoes] of Object.entries(SERVER_CONFIG_BOOLEANS) as Array<[BooleanSetting, string]>) {
-    if (setting === 'inheritEnv' && isWebSocketTransport(config)) continue;
+    if (setting === 'inheritEnv' && dialsNetwork(config)) continue;
     assertBooleanSetting(`MCPL server "${config.id}" ${setting}`, config[setting], whatTrueDoes);
   }
 }
 
 /**
- * Open the transport selected by `config` (WebSocket when `transport` is
- * 'websocket' or a bare `url` is given; stdio otherwise). The returned transport
- * is connected at the byte level but has NOT performed the MCPL handshake.
+ * Open the legacy transport `config` selects, as {@link resolveServerBinding}
+ * decides it: stdio for a `command`, MCPL's WebSocket binding for a ws(s)://
+ * url. A configuration it refuses, or one for the modern family (an http(s)
+ * url, or `protocol: 'modern'`), throws before anything is spawned or dialed.
+ * The returned transport is connected at the byte level but has NOT
+ * performed the MCPL handshake.
  */
-export async function openTransport(config: McplServerConfig): Promise<McplTransport> {
-  if (isWebSocketTransport(config)) {
-    return WebSocketTransport.open(config);
+export async function openTransport(config: McplServerConfig, signal?: AbortSignal): Promise<McplTransport> {
+  const binding = resolveServerBinding(config);
+  if (binding.family !== 'legacy') {
+    throw new Error(`MCP server "${config.id}" is configured for modern MCP; the legacy transports can't open it`);
   }
-  return StdioTransport.spawn(config);
+  return binding.transport === 'websocket' ? WebSocketTransport.open(config, signal) : StdioTransport.spawn(config);
 }

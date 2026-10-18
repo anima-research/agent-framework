@@ -64,20 +64,37 @@ export interface MountView {
    */
   others: readonly string[];
   /**
-   * The same mounts, each by its directory and its name, for a refusal that
-   * names the mount a symlink leads into. Without it, that refusal names no
-   * mount.
+   * The same mounts, each by its directory, its name and, where it has one,
+   * its real root (NestedMount), for a refusal that names the mount a path
+   * leads into: through a symlink this mount doesn't follow (linkWords), or
+   * through one it follows, or a root configured through one (nestedAtReal).
+   * Without it, no path is refused for where its links lead, and a link's
+   * refusal names no mount.
    */
-  nested?: readonly { dir: string; name: string }[];
+  nested?: readonly NestedMount[];
 }
+
+/**
+ * A mount nested in another: its directory in one of its spellings,
+ * mount-relative and `/`-separated, its name, and its real root, which
+ * every spelling shares. The real root is the root as realpath resolves it
+ * (the nearest existing directory's, where the root isn't made yet) once
+ * the module's start has read it, and the root as configured until then.
+ * There's none where it's this mount's own or holds it: the mount is nested
+ * by its configured path alone, since through its real root it would claim
+ * this mount's every path.
+ */
+export type NestedMount = { dir: string; name: string; real?: string };
 
 export type StatFingerprint = Omit<Fingerprint, 'hashedAt'>;
 
 /**
- * Opened with every read or write of a workspace path, where the platform has
- * it: for a regular file it changes nothing, and a FIFO or other special file
- * swapped in at the path neither blocks the open nor passes the regular-file
- * check that follows.
+ * Opened with every open of a workspace path that may already be there, a
+ * read, a write in place or a directory's sync, where the platform has it:
+ * for a regular file or a directory it changes nothing, and a FIFO or other
+ * special file swapped in at the path neither blocks the open nor passes the
+ * check of its kind that follows. A create needs none: O_CREAT | O_EXCL fails
+ * at once on anything already at the path.
  */
 export const NONBLOCK = typeof fsConstants.O_NONBLOCK === 'number' ? fsConstants.O_NONBLOCK : 0;
 
@@ -290,6 +307,31 @@ export async function linkReason(view: Pick<MountView, 'root' | 'name' | 'nested
   return linkWords(view.name, found, 'link' in found ? await linkLeads(view.root, rootReal, found.link) : null, view.nested);
 }
 
+/**
+ * The nested mount whose root holds `real`, a canonical path, the innermost,
+ * with the path to use there; undefined when none does. A path the lexical
+ * checks pass (inOtherMount, the tools' holderOf) reaches another mount's
+ * directory this way through a symlink the mount follows, so each check that
+ * resolves a path canonically asks this too.
+ */
+export function nestedAtReal(real: string, nested: readonly NestedMount[] = []): { name: string; use: string } | undefined {
+  const holder = nested
+    .flatMap((n) => (n.real !== undefined && contained(n.real, real) ? [{ name: n.name, real: n.real }] : []))
+    .sort((a, b) => b.real.length - a.real.length)[0];
+  if (!holder) return undefined;
+  const rest = relative(holder.real, real).split(sep).join('/');
+  return { name: holder.name, use: rest ? `${holder.name}/${rest}` : holder.name };
+}
+
+/**
+ * Why a mount-relative path that resolves into a nested mount's directory is
+ * refused (nestedAtReal): what it leads into, and the path to use in its
+ * place. Spelled as the tools take paths, from the mount's name.
+ */
+export function leadsInto(name: string, rel: string, holder: { name: string; use: string }): string {
+  return `"${rel === '' ? name : `${name}/${rel}`}" leads into mount "${holder.name}", nested in mount "${name}": use "${holder.use}" in its place`;
+}
+
 // ===========================================================================
 // Disk's spelling of a path
 // ===========================================================================
@@ -462,7 +504,11 @@ export class CheckedDir {
    */
   async sync(): Promise<void> {
     if (process.platform === 'win32') return;
-    const handle = await open(this.real, 'r');
+    // NONBLOCK: a FIFO put at its path since it was checked opens at once,
+    // and is refused below as not this directory, instead of holding the
+    // open, and with it the mount's turn, until something opens it for
+    // writing.
+    const handle = await open(this.real, fsConstants.O_RDONLY | NONBLOCK);
     try {
       const info = await handle.stat({ bigint: true });
       if (!info.isDirectory() || info.dev !== this.dev || info.ino !== this.ino) throw new Error(CHANGED);
@@ -512,6 +558,11 @@ async function locateDir(view: MountView, rootReal: string, rel: string): Promis
     if (real !== rootReal) return { kind: 'unobserved', reason: ROOT_UNAVAILABLE };
   } else if (!contained(rootReal, real)) {
     return { kind: 'unobserved', reason: OUTSIDE_PARENT, outside: true };
+  } else {
+    // Through a link this mount follows, a directory can be a nested
+    // mount's, which the mount neither reads nor writes.
+    const holder = nestedAtReal(real, view.nested);
+    if (holder) return { kind: 'unobserved', reason: leadsInto(view.name, rel, holder) };
   }
   const checked = await checkedAt(view, rel, real);
   if (checked) {
@@ -572,6 +623,10 @@ async function createDir(view: MountView, rootReal: string, rel: string): Promis
   if (base === null) return { kind: 'unobserved', reason: ROOT_UNAVAILABLE };
   for (let i = depth; i < parts.length; i++) {
     const childRel = parts.slice(0, i + 1).join('/');
+    // Nothing is made in a nested mount's directory, its root included where
+    // it isn't made yet, by a path that reaches it through a link.
+    const holder = nestedAtReal(base.at(parts[i]!), view.nested);
+    if (holder) return { kind: 'unobserved', reason: leadsInto(view.name, childRel, holder) };
     try {
       await mkdir(base.at(parts[i]!));
     } catch (err) {
@@ -742,7 +797,9 @@ async function parentPlacement(view: MountView, rootReal: string, relativePath: 
     const parent = await realpath(dirname(join(view.root, relativePath)));
     const found = await linkRefusal(view, rootReal, relativePath, parent, 'parents');
     if (found !== null) return { reason: await linkReason(view, rootReal, found) };
-    return contained(rootReal, parent) ? 'inside' : { reason: OUTSIDE_PARENT };
+    if (!contained(rootReal, parent)) return { reason: OUTSIDE_PARENT };
+    const holder = nestedAtReal(parent, view.nested);
+    return holder ? { reason: leadsInto(view.name, parentOf(relativePath), holder) } : 'inside';
   } catch (err) {
     const code = errno(err);
     if (code === 'ENOENT' || code === 'ENOTDIR') return 'gone';
@@ -788,6 +845,8 @@ export async function observePath(view: MountView, rootReal: string, relativePat
       return { kind: 'unobserved', reason: `a symlink that cannot be resolved (${errno(err) ?? String(err)})` };
     }
     if (!contained(rootReal, real)) return { kind: 'unobserved', reason: 'a symlink that leaves the mount' };
+    const holder = nestedAtReal(real, view.nested);
+    if (holder) return { kind: 'unobserved', reason: leadsInto(view.name, relativePath, holder) };
     if (!target.isFile()) {
       return { kind: 'unobserved', reason: target.isDirectory() ? 'a symlink to a directory, not walked' : 'not a regular file' };
     }
@@ -851,6 +910,8 @@ async function openContained(
     if (!contained(rootReal, real)) {
       return { kind: 'unobserved', reason: view.followSymlinks ? 'a symlink that leaves the mount' : OUTSIDE_PARENT };
     }
+    const holder = nestedAtReal(real, view.nested);
+    if (holder) return { kind: 'unobserved', reason: leadsInto(view.name, relativePath, holder) };
     const named = await stat(real, { bigint: true }).catch(() => null);
     if (named === null || named.dev !== info.dev || named.ino !== info.ino) {
       return { kind: 'unobserved', reason: 'the file changed while it was read' };

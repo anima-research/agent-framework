@@ -38,7 +38,7 @@ async function timedOutRender(t: TestContext, params: PushRenderParams = RENDER)
   const framework = Object.create(AgentFramework.prototype) as any;
   framework.traceListeners = [];
   framework.onTrace((event: never) => traces.push(event));
-  framework.wireMcplEvents(connection);
+  framework.wireMcplEvents(connection, { id: 'srv' });
   const orphans: unknown[] = [];
   connection.on('orphaned-response', (info: unknown) => orphans.push(info));
   connection.ready();

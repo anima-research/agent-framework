@@ -62,11 +62,15 @@ test('any other value is refused, naming the server, the setting and the kind of
   }
 });
 
-test('inheritEnv is checked only for a stdio server, since a WebSocket server never reads it', () => {
+test('inheritEnv is checked only for a stdio server, since a network server never reads it', () => {
   // A url alone or transport: 'websocket' dials, as openTransport chooses.
   check({ ...WEBSOCKET, inheritEnv: 'false' });
   check({ id: 'remote', url: 'ws://127.0.0.1:1', command: 'unused', transport: 'websocket', inheritEnv: 'no' });
-  // A url beside a command, with no transport, spawns the command.
+  // So does an http(s) url, over the modern engine.
+  check({ id: 'web', url: 'https://127.0.0.1:1/mcp', inheritEnv: 'false' });
+  // A url beside a command, with no transport, names no transport to use, so
+  // its family check refuses it; its booleans are still checked as a stdio
+  // server's.
   assert.throws(() => check({ id: 'both', url: 'ws://127.0.0.1:1', command: 'discord-mcpl', inheritEnv: 'false' }),
     /MCPL server "both" inheritEnv must be true or false, unquoted, not a string: /);
   // The other two apply to both transports.

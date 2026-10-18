@@ -19,7 +19,7 @@ function harness(connection = Object.assign(new EventEmitter(), { id: 'srv' })) 
   // Main's trace listeners are registrations (#318), which onTrace makes.
   framework.traceListeners = [];
   framework.onTrace((event: unknown) => traces.push(event));
-  framework.wireMcplEvents(connection);
+  framework.wireMcplEvents(connection, { id: connection.id });
   return { framework, connection, traces };
 }
 
@@ -678,7 +678,16 @@ test('a manifest refresh deferred by the fetch floor reports a failure other tha
   t.mock.method(console, 'error', (...args: unknown[]) => { lines.push(args.map(String).join(' ')); });
   // The last refresh completed just now, so this announcement waits out the floor.
   framework.manifestRefreshState = new Map([['srv', { inFlight: false, queued: false, lastCompletedAt: 100_000 }]]);
-  framework.mcplServerConfigs = { get() { throw new Error('the deferred refresh failed before its fetch'); } };
+  // Each run reads the server's configuration before anything else: the
+  // announcement's own run finds it, and the deferred run fails there.
+  let lookups = 0;
+  framework.mcplServerConfigs = {
+    get() {
+      lookups++;
+      if (lookups > 1) throw new Error('the deferred refresh failed before its fetch');
+      return { id: 'srv' };
+    },
+  };
   connection.emit('manifest-changed', { revision: 'r2' });
   await settle();
   assert.deepEqual(failureTraces(traces), [], 'nothing has run yet');
@@ -698,11 +707,13 @@ test('a manifest refresh queued behind a fetch in flight reports a failure other
   const lines: string[] = [];
   t.mock.method(console, 'error', (...args: unknown[]) => { lines.push(args.map(String).join(' ')); });
   framework.manifestRefreshState = new Map();
+  // Each run reads the server's configuration before anything else: both
+  // announcements' own runs find it, and the queued re-run fails there.
   let lookups = 0;
   framework.mcplServerConfigs = {
     get() {
       lookups++;
-      if (lookups > 1) throw new Error('the queued refresh failed before its fetch');
+      if (lookups > 2) throw new Error('the queued refresh failed before its fetch');
       return { id: 'srv' };
     },
   };
@@ -721,7 +732,7 @@ test('a manifest refresh queued behind a fetch in flight reports a failure other
   assert.equal(failures.length, 1);
   assert.equal(failures[0].event, 'manifest-changed');
   assert.match(failures[0].error, /the queued refresh failed before its fetch/);
-  assert.equal(lookups, 2);
+  assert.equal(lookups, 3);
   assert.ok(lines.includes('[mcpl] srv manifest-changed handler failed: "the queued refresh failed before its fetch"'), lines.join('\n'));
 });
 

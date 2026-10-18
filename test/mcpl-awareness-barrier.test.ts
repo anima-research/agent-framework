@@ -858,6 +858,11 @@ async function failPolicyRegistrationWhileServing(dir: string, closeFails: boole
   try {
     const traces: Array<{ type: string; serverId?: string; error?: string }> = [];
     framework.onTrace((event) => traces.push(event as never));
+    // Which servers' tools the framework asks to relist.
+    const lists = framework as unknown as { handleToolsListChanged(id: string): void };
+    const relist = lists.handleToolsListChanged.bind(framework);
+    const refreshed: string[] = [];
+    lists.handleToolsListChanged = (id: string) => { refreshed.push(id); relist(id); };
     const features = FeatureSetManager.prototype as any;
     const initializeServer = features.initializeServer;
     features.initializeServer = function (this: unknown, serverId: string, ...rest: unknown[]) {
@@ -900,7 +905,7 @@ async function failPolicyRegistrationWhileServing(dir: string, closeFails: boole
       false,
       'no gate failed',
     );
-    return { framework, discord, registry: internals.mcplServerRegistry };
+    return { framework, discord, registry: internals.mcplServerRegistry, refreshed };
   } catch (error) {
     await framework.stop();
     throw error;
@@ -943,6 +948,7 @@ test('a runtime connect whose policy registration throws and whose close then fa
     assert.ok(refused, 'the connection whose close failed is still registered');
     assert.equal(refused.willReconnect, false, 'its close had disarmed it before the transport close failed');
     assert.equal(refused.dataPlaneReady, false, 'the gate\'s completion left the refused connection paused');
+    assert.ok(failed.refreshed.includes(failed.discord.id), 'a refresh of the tool list was asked for though its close failed');
     await failed.framework.syncDiscordAwarenessMarkers();
     assert.equal(refused.dataPlaneReady, false, 'a later gate\'s completion leaves it paused too');
     assert.ok(
@@ -1158,7 +1164,7 @@ test('inbound handlers wait out a generation installed while they wait', async (
   framework.handleHostCommand = async () => { handled.push('host-command'); return { ok: true }; };
   const connection = new EventEmitter() as any;
   connection.id = 'discord';
-  framework.wireMcplEvents(connection);
+  framework.wireMcplEvents(connection, { id: 'discord' });
   const responder = { id: 1, respond: () => {}, respondError: () => {} };
   for (const event of ['push-event', 'inference-request', 'channels-incoming', 'host-command']) {
     connection.emit(event, {}, responder);
@@ -1194,7 +1200,7 @@ test('an inbound handler waiting on a generation that fails refuses its request 
   framework.handleHostCommand = async () => { handled.push('host-command'); return { ok: true }; };
   const connection = new EventEmitter() as any;
   connection.id = 'discord';
-  framework.wireMcplEvents(connection);
+  framework.wireMcplEvents(connection, { id: 'discord' });
   const answers: Array<{ event: string; code?: number; result?: unknown }> = [];
   for (const event of ['push-event', 'inference-request', 'channels-incoming', 'host-command']) {
     connection.emit(event, {}, {
@@ -1226,7 +1232,7 @@ test('with no generation current, an inbound event is handled in the turn it arr
   framework.handleHostCommand = async () => { handled.push('host-command'); return { ok: true }; };
   const connection = new EventEmitter() as any;
   connection.id = 'discord';
-  framework.wireMcplEvents(connection);
+  framework.wireMcplEvents(connection, { id: 'discord' });
   const responder = { id: 1, respond: () => {}, respondError: () => {} };
   for (const event of ['push-event', 'inference-request', 'channels-incoming', 'host-command']) {
     connection.emit(event, {}, responder);

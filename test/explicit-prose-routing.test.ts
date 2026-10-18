@@ -2202,8 +2202,8 @@ describe('explicit prose routing', () => {
     const texts = framework.getAgent('assistant')!.getContextManager().getAllMessages()
       .flatMap(m => m.content).filter(b => b.type === 'text').map(b => (b as { text: string }).text);
     assert.ok(texts.includes(authored), 'authored prose remains in Chronicle');
-    assert.ok(texts.some(t => t.includes('[delivered] nothing') && t.includes('proseRouting=disabled')),
-      'private suppression receipt explains the unsent prose');
+    assert.ok(texts.includes('[delivered] plain speech → no channel — 1 plain-speech segment(s) kept in the transcript (proseRouting=disabled — post to a channel only with an explicit send tool)'),
+      'the private receipt says the prose went to no channel and stays in the transcript');
 
     await framework.stop();
   });
@@ -2227,7 +2227,7 @@ describe('explicit prose routing', () => {
     assert.equal(module.calls[0]!.name, 'say');
     const texts = framework.getAgent('assistant')!.getContextManager().getAllMessages()
       .flatMap(m => m.content).filter(b => b.type === 'text').map(b => (b as { text: string }).text);
-    assert.ok(texts.some(t => t.includes('[delivered] nothing') && t.includes('2 plain-speech segment(s) suppressed')),
+    assert.ok(texts.some(t => t.includes('[delivered] plain speech → no channel') && t.includes('2 plain-speech segment(s) kept in the transcript')),
       'one receipt accounts for mid-turn and trailing prose');
 
     await framework.stop();

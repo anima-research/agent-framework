@@ -27,7 +27,7 @@ process.stdin.on('data', (c) => {
     if (!line.trim()) continue;
     let m; try { m = JSON.parse(line); } catch { continue; }
     const out = (o) => process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: m.id, ...o }) + '\\n');
-    if (m.method === 'initialize') out({ result: { capabilities: {} } });
+    if (m.method === 'initialize') out({ result: { protocolVersion: '2024-11-05', capabilities: {} } });
     else if (m.method === 'tools/call' && m.params.name === 'fail') {
       out({ error: { code: -32001, message: 'POSTED: part 1 of 2', data: { posted: ['111'] } } });
     } else if (m.method === 'tools/call' && m.params.name === 'exit') {
@@ -79,8 +79,11 @@ test('a connection lost while awaiting is no-response', async () => {
 test('closing the connection while a request awaits its answer rejects it as no-response', async () => {
   connection = await McplServerConnection.connect(config({ requestTimeoutMs: 10_000 }), HOST_CAPS);
   const pending = connection.sendToolsCall('stuck', {});
+  // The request fails as the close begins, and the close resolves once the
+  // child has exited, so the rejection is observed before the close is awaited.
+  const rejected = rejectsWith(pending, 'no-response');
   await connection.close();
-  await rejectsWith(pending, 'no-response');
+  await rejected;
   connection = null;
 });
 

@@ -557,7 +557,7 @@ describe('held prose drafts, end to end', () => {
         createMockResponse([text('More of it.')]),
       ]);
       assert.deepEqual(h.drafts(), []);
-      assert.ok(h.texts().some((t) => t.startsWith('[delivered] nothing — 2 plain-speech segment(s) suppressed (proseRouting=disabled')));
+      assert.ok(h.texts().some((t) => t.startsWith('[delivered] plain speech → no channel — 2 plain-speech segment(s) kept in the transcript (proseRouting=disabled')));
     } finally {
       await h.close();
     }

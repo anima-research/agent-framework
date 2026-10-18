@@ -24,7 +24,8 @@
  * Node has no openat, so a create, mkdir or unlink still resolves its path by
  * name after the parent was checked: a parent replaced concurrently in that
  * window can redirect that one operation, leaving an empty file or directory
- * outside the mount or unlinking a same-named file there. Nor is there an
+ * outside the mount or in a nested mount's directory, or unlinking a
+ * same-named file there. Nor is there an
  * unlink bound to an inode: an unlink checks the entry's identity again just
  * before it, and a file replaced at its path after that check is the one
  * unlinked. Content writes stay bound to the descriptor verified before
@@ -53,7 +54,9 @@ import {
   errno,
   checkDir,
   checkRoot,
+  leadsInto,
   nameOf,
+  nestedAtReal,
   parentOf,
 } from './observe.js';
 
@@ -273,7 +276,7 @@ export async function writeContained(
   let stage = 'write the file';
   try {
     const created = touched;
-    await checkOpened(view, rootReal, root, parent, target, handle, expect, noFollow, touched);
+    await checkOpened(view, rootReal, rel, root, parent, target, handle, expect, noFollow, touched);
     touched = true;
     // The mode the bytes are written at, and the one the file ends with.
     let before: number | undefined;
@@ -369,14 +372,16 @@ export async function writeContained(
  * Before an effect on an opened file: a regular file, and — unless forced —
  * still holding what was decided on. The hash reads the whole file, so it
  * comes first, and the checks of where the file is follow it: canonically
- * inside the mount, the one this path names (and not a symlink, where the
- * mount follows none and the open couldn't refuse one), with no other names,
- * in the directory still at its path beneath the root still at its own; and
- * nothing wrote it while those ran.
+ * inside the mount and in no nested mount's directory (nestedAtReal), the
+ * one this path names (and not a symlink, where the mount follows none and
+ * the open couldn't refuse one), with no other names, in the directory still
+ * at its path beneath the root still at its own; and nothing wrote it while
+ * those ran.
  */
 async function checkOpened(
   view: MountView,
   rootReal: string,
+  rel: string,
   root: CheckedDir,
   parent: CheckedDir,
   target: string,
@@ -391,6 +396,8 @@ async function checkOpened(
   const real = await realpath(target).catch(() => null);
   if (real === null) throw new EffectFailed(CHANGED, touched);
   if (!contained(rootReal, real)) throw new EffectFailed(view.followSymlinks ? 'a symlink that leaves the mount' : OUTSIDE_PARENT, touched);
+  const holder = nestedAtReal(real, view.nested);
+  if (holder) throw new EffectFailed(leadsInto(view.name, rel, holder), touched);
   const named = await stat(real, { bigint: true }).catch(() => null);
   if (named === null || named.dev !== info.dev || named.ino !== info.ino) throw new EffectFailed(CHANGED, touched);
   if (!view.followSymlinks) {
@@ -459,7 +466,7 @@ export async function chmodContained(
   let touched = false;
   let stage = 'set the file\'s mode';
   try {
-    await checkOpened(view, rootReal, root, parent, target, handle, expect, noFollow, false);
+    await checkOpened(view, rootReal, rel, root, parent, target, handle, expect, noFollow, false);
     const current = Number((await handle.stat({ bigint: true })).mode & 0o777n);
     if (from !== undefined && current !== from) throw new EffectFailed(MODE_CHANGED, false);
     const narrowing = (current & ~mode & 0o777) !== 0;
@@ -525,6 +532,10 @@ export async function unlinkContained(view: MountView, rootReal: string, rel: st
     if (!view.followSymlinks) throw new EffectFailed(NOT_FOLLOWED, false);
     const real = await realpath(target).catch(() => null);
     if (real === null || !contained(rootReal, real)) throw new EffectFailed('a symlink that leaves the mount', false);
+    // One leading into a nested mount's directory is that mount's: the link
+    // and the file it leads to are left as they are.
+    const holder = nestedAtReal(real, view.nested);
+    if (holder) throw new EffectFailed(leadsInto(view.name, rel, holder), false);
     const through = await stat(real, { bigint: true }).catch(() => null);
     if (through === null) throw new EffectFailed(CHANGED, false);
     // A followed link stands for the file it leads to, so it's removed only

@@ -5,7 +5,7 @@
  */
 
 import type { McplServerConfig, McplHostCapabilities } from './types.js';
-import { McplServerConnection } from './server-connection.js';
+import { McplServerConnection, McplUnreapedLaunchError } from './server-connection.js';
 import { DEFAULT_SHUTDOWN_TIMEOUT_MS, validateShutdownTimeout, waitForShutdown } from '../shutdown.js';
 
 /**
@@ -26,32 +26,56 @@ export type McplCapabilityQuery =
  */
 export class McplServerRegistry {
   private servers = new Map<string, McplServerConnection>();
+  /** Ids whose addServer is still connecting. A second add for one is
+   *  refused, so a failed launch's closed connection can always be registered
+   *  as the owner of a child it couldn't reap. */
+  private adding = new Set<string>();
   private closing = new Map<McplServerConnection, Promise<void>>();
 
   /**
    * Connect to an MCPL server and register it.
    *
    * Throws if a server with the same id is already registered, or if
-   * the connection/handshake fails.
+   * the connection/handshake fails. A failed launch whose child couldn't be
+   * confirmed exited stays registered all the same, as the closed connection
+   * that owns it ({@link McplUnreapedLaunchError}), so the id stays held
+   * and removeServer can retry the reap.
    */
   async addServer(
     config: McplServerConfig,
     hostCapabilities: McplHostCapabilities,
+    signal?: AbortSignal,
   ): Promise<McplServerConnection> {
-    if (this.servers.has(config.id)) {
+    if (this.servers.has(config.id) || this.adding.has(config.id)) {
       throw new Error(`MCPL server "${config.id}" is already registered`);
     }
 
-    const connection = config.reconnect === true
-      ? await McplServerConnection.connectWithReconnect(config, hostCapabilities)
-      : await McplServerConnection.connect(config, hostCapabilities);
+    this.adding.add(config.id);
+    let connection: McplServerConnection;
+    try {
+      connection = config.reconnect === true
+        ? await McplServerConnection.connectWithReconnect(config, hostCapabilities, signal)
+        : await McplServerConnection.connect(config, hostCapabilities, signal);
+    } catch (error) {
+      if (error instanceof McplUnreapedLaunchError) this.register(config, error.connection);
+      throw error;
+    } finally {
+      this.adding.delete(config.id);
+    }
+    this.register(config, connection);
+    return connection;
+  }
+
+  private register(config: McplServerConfig, connection: McplServerConnection): void {
     this.servers.set(config.id, connection);
 
     // Auto-remove on close unless the connection will reconnect. That was
     // decided once, from `reconnect === true` at connect, and a close() the
     // host asks for disarms it first, so a server closed for good goes too.
+    // A connection that still owns a child it couldn't reap keeps its id, so
+    // nothing launches beside that child; removeServer retries the reap.
     connection.on('close', () => {
-      if (!connection.willReconnect) {
+      if (!connection.willReconnect && this.servers.get(config.id) === connection && !connection.holdsUnreapedChild) {
         this.servers.delete(config.id);
       }
     });
@@ -60,20 +84,22 @@ export class McplServerRegistry {
     connection.on('reconnect', () => {
       // Connection already in the map — capabilities may have changed
     });
-
-    return connection;
   }
 
   /**
    * Disconnect and remove a server by id.
    *
-   * No-op if the server is not registered.
+   * No-op if the server is not registered. If its close can't confirm the
+   * child exited, it stays registered and the failure is thrown: removing it
+   * again retries the reap.
    */
   async removeServer(id: string): Promise<void> {
     const connection = this.servers.get(id);
     if (!connection) {
       return;
     }
+    // The id stays held until the close settles, so nothing launches beside
+    // a child still being reaped; it's freed only once the exit is confirmed.
     await this.closeServer(id, connection);
   }
 
@@ -138,8 +164,11 @@ export class McplServerRegistry {
   }
 
   /**
-   * Close all server connections, retaining failed or pending attempts.
-   * An explicit timeout bounds the caller's wait without cancelling cleanup.
+   * Close every server connection. Each one whose close confirms its exit
+   * is removed. One whose close fails or is still pending stays registered,
+   * holding its id, and every failure is thrown; removeServer or a later
+   * closeAll retries it. An explicit timeout bounds the caller's wait
+   * without cancelling cleanup.
    */
   async closeAll(timeoutMs = DEFAULT_SHUTDOWN_TIMEOUT_MS): Promise<void> {
     validateShutdownTimeout(timeoutMs);

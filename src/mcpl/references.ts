@@ -692,6 +692,28 @@ export interface StubOptions {
  * fetch (StubOptions.unfetchedLinkUri), which is no stub but a line of its
  * own, its uri bounded by REFERENCE_LIMITS.uri.
  */
+/**
+ * The uri a tool result's link shows, or null where it shows none: a link
+ * (fromLink) the host can't fetch, whose uri can't carry a credential, and
+ * that no reference withholds with `disposition: never`, keeps its uri, the
+ * agent's only handle on it. A tool result's link line (buildReferenceStub,
+ * unfetchedLinkUri) and a script's object for the link
+ * (referenceBlockForScript) both ask this, so the model and a script, whose
+ * output comes back to the model, see a link's uri alike.
+ *
+ * The credential check reads the uri as it would be shown, with what
+ * sanitizeLabel strips gone, so a uri split by a control character is read
+ * as it would read: `ht\u0000tps://user:pass@…` parses as a path, and shows
+ * as userinfo. A reference's disposition:"never" for the uri keeps it out
+ * whatever the link says.
+ */
+export function shownLinkUri(t: ReferenceTestimony, record: ReferenceRecord, nowMs = Date.now()): string | null {
+  if (!t.fromLink || record.testimony.disposition === 'never') return null;
+  if (unfetchableReason(record, nowMs) === null) return null;
+  const uri = sanitizeLabel(t.uri, REFERENCE_LIMITS.uri);
+  return uriMayCarryCredential(uri) ? null : uri;
+}
+
 export function buildReferenceStub(t: ReferenceTestimony, provenance?: string, serverId?: string, options?: StubOptions): string {
   const record = referenceRegistry.register(t, serverId);
   const parts: string[] = [];
@@ -712,17 +734,11 @@ export function buildReferenceStub(t: ReferenceTestimony, provenance?: string, s
   } else {
     // A reference the fetcher would refuse says why, rather than inviting a
     // fetch_reference call.
-    const refusal = unfetchableReason(record);
-    if (refusal !== null && t.fromLink && options?.unfetchedLinkUri && record.testimony.disposition !== 'never') {
-      // The credential check reads the uri as it would be shown, with what
-      // sanitizeLabel strips gone, so a uri split by a control character is
-      // read as it would read: `ht\u0000tps://user:pass@…` parses as a path,
-      // and shows as userinfo. A reference's disposition:"never" for the uri
-      // keeps it out whatever the link says.
-      const uri = sanitizeLabel(t.uri, REFERENCE_LIMITS.uri);
-      if (!uriMayCarryCredential(uri)) return unfetchedLinkText(t, uri);
+    if (options?.unfetchedLinkUri) {
+      const uri = shownLinkUri(t, record);
+      if (uri !== null) return unfetchedLinkText(t, uri);
     }
-    parts.push(refusal ?? 'fetch with fetch_reference');
+    parts.push(unfetchableReason(record) ?? 'fetch with fetch_reference');
   }
   return `[${record.refId}] ${parts.join(' — ') || 'referenced content'}`;
 }
@@ -765,5 +781,57 @@ export function referenceStubOrNull(block: unknown, provenance?: string, serverI
       return c.contradiction ? INLINE_WITHHELD_TEXT : null;
     case 'reference': return buildReferenceStub(c.testimony, provenance, serverId, options);
     case 'invalid': return c.shown;
+  }
+}
+
+/**
+ * RFC-005 treatment for one MCPL wire block, for a script's structured
+ * result, which carries blocks rather than text. It makes the decision
+ * referenceStubOrNull makes for the model's lanes, since what a script prints
+ * comes back to the model. A reference becomes the stub's facts as data:
+ * the host's reference id, what the server said about it in this block (its
+ * labels stripped and bounded as in the stub), and `savedTo`, the workspace
+ * path its payload was fetched to, or null when it wasn't (`fetch_reference`
+ * takes the id as `ref_id`). An unsaved reference that counts as expired
+ * also carries `expired`. Its uri is left out, except that a link (MCP's
+ * resource_link) carries `uri` where the model's line for it shows the uri
+ * (shownLinkUri). Where the stub gives a reason the fetcher would refuse,
+ * in place of advising fetch_reference, the object carries the same words as
+ * `unfetchable` (unfetchableReason). The reference is registered bound to `serverId`, the
+ * server whose tool returned it, as the model's lanes bind a tool result's
+ * references, so the fetch its id offers can be made. A block the classifier
+ * rejects becomes the notice the model's lanes show, and inline data that
+ * also claims a bulk disposition the withheld notice, each as a text block.
+ * A text block, or inline data that claims nothing, is returned as sent.
+ */
+export function referenceBlockForScript(block: unknown, serverId: string): unknown {
+  const c = classifyBlock(block);
+  switch (c.kind) {
+    case 'text': return block;
+    case 'inline':
+      return c.contradiction ? { type: 'text', text: INLINE_WITHHELD_TEXT } : block;
+    case 'invalid': return { type: 'text', text: c.shown };
+    case 'reference': {
+      const t = c.testimony;
+      const record = referenceRegistry.register(t, serverId);
+      // As the stub judges it: a saved copy is still served.
+      const expiry = record.fetchedPath ? null : referenceExpiry(record.testimony);
+      const uri = shownLinkUri(t, record);
+      // The reason the stub gives, where it gives one, in the same words.
+      const unfetchable = uri === null ? unfetchableReason(record) : null;
+      return {
+        type: (block as { type: string }).type,
+        refId: record.refId,
+        ...(uri !== null ? { uri } : {}),
+        ...(t.name !== undefined ? { name: sanitizeLabel(t.name, STUB_FIELD_CHARS) } : {}),
+        ...(t.mimeType !== undefined ? { mimeType: sanitizeLabel(t.mimeType, STUB_FIELD_CHARS) } : {}),
+        ...(t.sizeBytes !== undefined ? { sizeBytes: t.sizeBytes } : {}),
+        ...(t.digest !== undefined ? { digest: t.digest } : {}),
+        ...(t.expiresAt !== undefined ? { expiresAt: sanitizeLabel(t.expiresAt, STUB_FIELD_CHARS) } : {}),
+        savedTo: record.fetchedPath ?? null,
+        ...(expiry ? { expired: EXPIRY_REASON[expiry] } : {}),
+        ...(unfetchable !== null ? { unfetchable } : {}),
+      };
+    }
   }
 }

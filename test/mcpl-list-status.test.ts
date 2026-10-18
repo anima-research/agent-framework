@@ -42,6 +42,11 @@ test('listMcplServers exposes the live grant layers and host-owned authority', (
     id: 'discord',
     connected: true,
     retrying: false,
+    family: 'legacy',
+    // The stub never handshook, so no revision is established.
+    protocolVersion: null,
+    transport: 'stdio',
+    refused: null,
     toolPrefix: 'mcpl--discord',
     toolCount: 1,
     policyEstablished: true,
@@ -87,4 +92,42 @@ test('listMcplServers distinguishes a disconnected retrying stub from connected'
     lastFetchedAt: null,
     lastNegotiatedAt: null,
   });
+});
+
+test('listMcplServers lists a refused configuration as refused, shows urls redacted, and gives a modern server no MCPL policy', () => {
+  const framework = Object.create(AgentFramework.prototype) as any;
+  framework.mcplServerConfigs = new Map<string, Record<string, unknown>>([
+    ['both', { id: 'both', command: 'node', url: 'wss://u:pw@x.example/mcpl?token=sekret' }],
+    ['slow', { id: 'slow', url: 'https://x.example/mcp', requestTimeoutMs: 0 }],
+    ['docs', { id: 'docs', url: 'https://mcp.example/mcp?api_key=sekret&region=eu' }],
+    ['chat', { id: 'chat', url: 'wss://user:pw@chat.example/mcpl' }],
+    ['zap', { id: 'zap', url: 'https://mcp.zapier.com/api/mcp/s/sekretZt4kQ9xW2vLm8/mcp' }],
+  ]);
+  framework.mcplServerRegistry = { getServer: () => null };
+  framework.mcplTools = [];
+  framework.mcplPrefixMap = new Map();
+  const listed = (framework as AgentFramework).listMcplServers();
+  const byId = new Map(listed.map((s) => [s.id, s]));
+
+  // No usable transport: no family or transport is guessed.
+  const both = byId.get('both')!;
+  assert.equal(both.family, null);
+  assert.equal(both.transport, null);
+  assert.match(both.refused!, /"command" and "url" are both set/);
+  assert.equal(both.url, 'wss://x.example/mcpl?token=redacted');
+  // A binding that resolves, refused for another reason.
+  const slow = byId.get('slow')!;
+  assert.equal(slow.family, 'modern');
+  assert.equal(slow.transport, 'http');
+  assert.match(slow.refused!, /requestTimeoutMs must be an integer from 1/);
+  // Usable: nothing refused. MCPL policy doesn't apply to a modern server.
+  const docs = byId.get('docs')!;
+  assert.deepEqual([docs.family, docs.transport, docs.refused, docs.policyEstablished], ['modern', 'http', null, null]);
+  assert.equal(docs.url, 'https://mcp.example/mcp?api_key=redacted&region=redacted');
+  const chat = byId.get('chat')!;
+  assert.deepEqual([chat.family, chat.transport, chat.refused, chat.policyEstablished], ['legacy', 'websocket', null, false]);
+  assert.equal(chat.url, 'wss://chat.example/mcpl');
+  // A per-user secret in the path goes too.
+  assert.equal(byId.get('zap')!.url, 'https://mcp.zapier.com/api/mcp/s/redacted/mcp');
+  assert.ok(!/sekret|pw@/.test(JSON.stringify(listed)), 'no credential in the status');
 });

@@ -223,7 +223,7 @@ export function capabilityPatternMatches(pattern: string, path: string): boolean
 /** §13.4: denied unless explicitly enabled by host config. RFC-007 adds both
  *  tool-lifecycle leaves: observing other servers' tool use (and, above all,
  *  their arguments) is an operator decision, never a default. */
-const DENY_BY_DEFAULT: readonly string[] = [
+export const DENY_BY_DEFAULT: readonly string[] = [
   'contextHooks.beforeInference.inject.system',
   'toolLifecycle.observe',
   'toolLifecycle.inputs',

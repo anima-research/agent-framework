@@ -996,7 +996,7 @@ describe('stop() with work still in flight', () => {
         modules: [],
       });
       const connection = Object.assign(new EventEmitter(), { id: 'srv' });
-      (framework as unknown as { wireMcplEvents(c: unknown): void }).wireMcplEvents(connection);
+      (framework as unknown as { wireMcplEvents(c: unknown, config: unknown): void }).wireMcplEvents(connection, { id: 'srv', url: 'wss://h/mcp?token=wireToken0123456789' });
       return { framework, connection };
     }
 
@@ -1214,6 +1214,32 @@ describe('stop() with work still in flight', () => {
         const line = logged.find((l) => l.includes('push-event handler failed')) ?? '';
         assert.ok(line.length < 600, `logged ${line.length} characters`);
         assert.ok(line.endsWith('…(5000)'), line.slice(-40));
+      } finally {
+        await framework.stop();
+      }
+    });
+
+    it("a handler's error quoting the server's configured credential is recorded and answered without it, also across the cut", async () => {
+      const { framework, connection } = await wiredFramework();
+      try {
+        // The credential starts just before the 500-character cut, so a cut
+        // made before redacting would keep its first characters.
+        // Once whole, and once with the credential across the 500-character
+        // cut, where a cut made before redacting keeps its first nine.
+        const errors = ['refused wireToken0123456789', `${'x'.repeat(490)} wireToken0123456789 and more`];
+        for (const [i, error] of errors.entries()) {
+          (framework as unknown as { pushHandler: unknown }).pushHandler = {
+            handlePushEvent: async () => { throw new Error(error); },
+          };
+          const push = responder();
+          connection.emit('push-event', { featureSet: 'chat', eventId: `e-cred-${i}`, payload: { content: [{ type: 'text', text: 'x' }] } }, push);
+          await answered(push);
+          const message = push.answers[0]!.error!.message;
+          await until(() => logged.filter((line) => line.includes('srv push-event handler failed')).length > i, 'the log line');
+          for (const text of [message, ...logged]) {
+            assert.ok(!text.includes('wireToken'), text.slice(-120));
+          }
+        }
       } finally {
         await framework.stop();
       }

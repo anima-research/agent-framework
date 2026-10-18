@@ -388,9 +388,8 @@ describe('a symlinked parent on a mount that does not follow symlinks', () => {
     assert.ok(String(res.error).includes(reason), String(res.error));
     assert.ok(!String(res.error).includes('followSymlinks'), String(res.error));
     assert.equal(existsSync(join(env.dir, 'nested', 'sub', 'new.txt')), false);
-    // read_image, where the workspace's own copy can't be read as an image,
-    // gives the refusal, not that copy's failure.
-    await m.handleToolCall({ id: 't', name: 'write', input: { path: 'work/l/img.png', content: 'not an image\n' } });
+    // read_image gives the refusal too: the file tools refuse a path that
+    // leads into a nested mount before looking for the workspace's copy.
     const image = await m.handleToolCall({ id: 'i', name: 'read_image', input: { path: 'work/l/img.png' } });
     assert.equal(image.success, false);
     assert.equal(image.error, `work/l/img.png: ${reason}`);

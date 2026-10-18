@@ -33,6 +33,7 @@ import {
   buildReferenceStub,
   classifyBlock,
   noAddressReason,
+  referenceBlockForScript,
   referenceRegistry,
   sanitizeLabel,
   unknownBlockText,
@@ -294,6 +295,33 @@ describe("MCP's resource_link, a reference (RFC-005 §8.1)", () => {
       const resource = { type: 'resource', uri, name: 'report.csv' };
       const stub = toolResultDataToHistoryString([TEXT, resource]);
       assert.ok(stub.endsWith(`report.csv — from tool result — ${why}`) && !stub.includes(uri), stub);
+    }
+  });
+
+  it("gives a script's object the uri a tool result's line shows for the same link, and none where the line shows none", () => {
+    // One decision for both lanes (shownLinkUri): a script's output comes
+    // back to the model, so it holds what the model's own line holds.
+    servingFiles();
+    const withheldUri = 'https://zz-elsewhere.example/withheld-for-script.csv';
+    referenceRegistry.register(testimonyOf({ type: 'resource', uri: withheldUri, name: 'withheld.csv', disposition: 'never' }));
+    for (const [what, link, shows] of [
+      ["off its server's origin, with no credential", { type: 'resource_link', uri: 'https://zz-elsewhere.example/script-plain.csv', name: 'a.csv' }, true],
+      ['with a scheme the fetcher refuses', { type: 'resource_link', uri: 'file:///zz/script-plain.csv', name: 'a.csv' }, true],
+      ['that may carry a credential', { type: 'resource_link', uri: `https://zz-elsewhere.example/script-signed.csv?sig=${SECRET}`, name: 'a.csv' }, false],
+      ['withheld by a reference with disposition never', { type: 'resource_link', uri: withheldUri, name: 'a.csv' }, false],
+      ['the host can fetch', { type: 'resource_link', uri: 'https://zz-files.example/script-fetchable.csv', name: 'a.csv' }, false],
+    ] as const) {
+      // Delivered by the zz-files server, as a script's MCPL call registers it.
+      const object = referenceBlockForScript(link, 'zz-files') as { uri?: string; refId: string; unfetchable?: string };
+      const line = toolResultDataToHistoryString([TEXT, link], undefined, { dataIsContent: true }).split('\n')[1]!;
+      assert.equal(line.startsWith('[resource link '), shows, `${what}: ${line}`);
+      assert.equal(object.uri, shows ? link.uri : undefined, what);
+      // Where the stub gives a reason in place of advising fetch_reference,
+      // the object carries the same words.
+      const ending = line.slice(line.lastIndexOf(' — ') + 3);
+      assert.equal(object.unfetchable, shows || ending === 'fetch with fetch_reference' ? undefined : ending, what);
+      if (!shows) assert.ok(!line.includes(link.uri) && !JSON.stringify(object).includes(link.uri), what);
+      assert.match(object.refId, /^ref_/, what);
     }
   });
 

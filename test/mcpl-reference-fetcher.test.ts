@@ -355,10 +355,11 @@ test('a copy saved earlier is still served once its expiry has passed or reads a
 async function eagerFetch(content: unknown[], fetcher: ReferenceFetcher = makeFetcher({ srv: { url: ORIGIN } })): Promise<void> {
   const framework = Object.create(AgentFramework.prototype) as {
     getReferenceFetcher(): ReferenceFetcher;
-    autoFetchReferences(content: unknown[], serverId: string, eager: boolean): Promise<void>;
+    autoFetchReferences(content: unknown[], serverId: string, forScript: boolean): Promise<void>;
   };
   framework.getReferenceFetcher = () => fetcher;
-  await framework.autoFetchReferences(content, 'srv', true);
+  // The eager pass alone, as for the model's call: a script's demand would fetch the rest.
+  await framework.autoFetchReferences(content, 'srv', false);
 }
 
 test('the eager default skips expired references, so the live ones after them get its slots', async (t) => {
