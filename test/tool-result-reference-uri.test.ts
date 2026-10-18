@@ -14,6 +14,7 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { AgentFramework } from '../src/index.js';
+import type { ScriptToolResult } from '../src/index.js';
 import type { Module, ModuleContext, ToolCall, ToolResult, ToolDefinition } from '../src/types/index.js';
 import { nonErrorResultText, toolResultDataToHistoryString } from '../src/tool-result-history.js';
 import { parseImagePlaceholders } from '../src/tool-image-ledger.js';
@@ -327,14 +328,14 @@ describe('a model\'s call answered with such data', () => {
 describe('a script given such data', () => {
   type ScriptFramework = {
     dispatchScriptToolCall: (...args: unknown[]) => Promise<ToolResult>;
-    handleScriptToolCall(agentName: string, toolName: string, args: Record<string, unknown>): Promise<string>;
+    handleScriptToolCall(agentName: string, toolName: string, args: Record<string, unknown>): Promise<ScriptToolResult>;
   };
 
   it('gets the text history stores, with each reference as its stub and the rest as JSON writes it', async () => {
     const fw = Object.create(AgentFramework.prototype) as ScriptFramework;
     const shot = { type: 'image', data: BASE64, mimeType: 'image/png' };
     fw.dispatchScriptToolCall = async () => ({ success: true, data: { file: RESOURCE, shot, page: 2 } });
-    const text = await fw.handleScriptToolCall('zz-agent', 'zz_tool', {});
+    const { text } = await fw.handleScriptToolCall('zz-agent', 'zz_tool', {});
     assert.ok(!text.includes(SIGNATURE), text);
     const result = parsed(text) as { file: string; shot: unknown; page: number };
     assert.match(result.file, STUB);
@@ -350,7 +351,7 @@ describe('a script given such data', () => {
     console.error = (...args: unknown[]) => { logged.push(args.map(String).join(' ')); };
     let text: string;
     try {
-      text = await fw.handleScriptToolCall('zz-agent', 'zz_tool', {});
+      ({ text } = await fw.handleScriptToolCall('zz-agent', 'zz_tool', {}));
     } finally {
       console.error = error;
     }

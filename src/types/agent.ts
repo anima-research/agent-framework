@@ -187,12 +187,6 @@ export interface AgentConfig {
     autoRewind?: boolean;
     /** Max consecutive rewinds before giving up a turn. Default 3. */
     maxRewinds?: number;
-    /**
-     * When the rewound turn is a *human* message (not a machine tool result),
-     * announce the withholding on the conversational surface (Discord) rather
-     * than dropping it silently. Default true.
-     */
-    announceHumanTurns?: boolean;
   };
 
   /** Opt-in tool-output admission and one guarded retry after a provider

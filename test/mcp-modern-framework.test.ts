@@ -16,7 +16,7 @@ import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { AgentFramework, WorkspaceModule } from '../src/index.js';
-import type { EventResponse, Module, ModuleContext, ProcessEvent, ProcessState, ToolDefinition, ToolResult } from '../src/index.js';
+import type { EventResponse, Module, ModuleContext, ProcessEvent, ProcessState, ScriptToolResult, ToolDefinition, ToolResult } from '../src/index.js';
 import { MockMembrane, createMockResponse } from './helpers/mock-membrane.js';
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -161,21 +161,35 @@ test('model path: the result reaches the model, structured-only as JSON', async 
   });
 });
 
+/** A script's result with its JSON string parsed, to compare whole. */
+const parsedText = (result: ScriptToolResult) => ({ ...result, text: JSON.parse(result.text) as unknown });
+
 test('scripts get structured results whole, as one JSON object', async () => {
   await withModern(async ({ framework }) => {
     framework.start();
     const handle = (framework as unknown as {
-      handleScriptToolCall: (agent: string, tool: string, args: Record<string, unknown>) => Promise<string>;
+      handleScriptToolCall: (agent: string, tool: string, args: Record<string, unknown>) => Promise<ScriptToolResult>;
     }).handleScriptToolCall.bind(framework);
-    const out = JSON.parse(await handle('agent', 'mcpl--modern--structured_and_text', {}));
-    assert.deepEqual(out, {
-      content: [{ type: 'text', text: 'Found 2 rows.' }],
-      structuredContent: { rows: [{ id: 1 }, { id: 2 }] },
+    // Beside the string: isError, which the script reads as .is_error, and
+    // structuredJson, which has it read .structured from the string.
+    assert.deepEqual(parsedText(await handle('agent', 'mcpl--modern--structured_and_text', {})), {
+      text: {
+        content: [{ type: 'text', text: 'Found 2 rows.' }],
+        structuredContent: { rows: [{ id: 1 }, { id: 2 }] },
+        isError: false,
+      },
       isError: false,
+      structuredJson: true,
+    });
+    // A structured tool error is flagged as one beside its string.
+    assert.deepEqual(parsedText(await handle('agent', 'mcpl--modern--sized', { pad: 1, isError: true })), {
+      text: sizedObject(1, true),
+      isError: true,
+      structuredJson: true,
     });
     // Image plus scores: both views reach the script whole, the image's
     // payload included (no placeholder stands in for it).
-    const scored = JSON.parse(await handle('agent', 'mcpl--modern--scored_image', {}));
+    const scored = JSON.parse((await handle('agent', 'mcpl--modern--scored_image', {})).text);
     assert.deepEqual(scored, {
       content: [{ type: 'image', data: 'iVBORw0KGgo=', mimeType: 'image/png' }],
       structuredContent: { score: 0.9, label: 'cat' },
@@ -184,7 +198,7 @@ test('scripts get structured results whole, as one JSON object', async () => {
     // A resource link, embedded resources and audio are ordinary MCP blocks
     // from a modern server, not RFC-005 references: the script reads them as
     // the server sent them.
-    const media = JSON.parse(await handle('agent', 'mcpl--modern--structured_media', {}));
+    const media = JSON.parse((await handle('agent', 'mcpl--modern--structured_media', {})).text);
     assert.deepEqual(media, {
       content: [
         { type: 'text', text: 'before' },
@@ -198,8 +212,9 @@ test('scripts get structured results whole, as one JSON object', async () => {
       isError: false,
     });
     // Without structured content the script contract is unchanged (pinned):
-    // the history rendering, which JSON-encodes a text result.
-    assert.equal(await handle('agent', 'mcpl--modern--echo', { text: 'x' }), JSON.stringify('echo:x'));
+    // the history rendering, which JSON-encodes a text result. No
+    // structuredJson, so the script's .structured is None.
+    assert.deepEqual(await handle('agent', 'mcpl--modern--echo', { text: 'x' }), { text: JSON.stringify('echo:x'), isError: false });
   });
 });
 
@@ -220,7 +235,7 @@ const sizedObject = (pad: number, isError = false) => ({
 /** The pad that makes the script's JSON exactly `chars` long. */
 const padFor = (chars: number, isError = false) => chars - JSON.stringify(sizedObject(0, isError)).length;
 const scriptHandle = (framework: AgentFramework) => (framework as unknown as {
-  handleScriptToolCall: (agent: string, tool: string, args: Record<string, unknown>) => Promise<string>;
+  handleScriptToolCall: (agent: string, tool: string, args: Record<string, unknown>) => Promise<ScriptToolResult>;
 }).handleScriptToolCall.bind(framework);
 
 async function withWorkspace(fn: (h: Harness & { workspace: WorkspaceModule }) => Promise<void>): Promise<void> {
@@ -255,16 +270,22 @@ test('script results: exactly at the cap arrive inline; one past it are saved wh
     const handle = scriptHandle(framework);
 
     const at = await handle('agent', 'mcpl--modern--sized', { pad: padFor(SCRIPT_CAP) });
-    assert.equal(at.length, SCRIPT_CAP);
-    assert.deepEqual(JSON.parse(at), sizedObject(padFor(SCRIPT_CAP)));
+    assert.equal(at.text.length, SCRIPT_CAP);
+    assert.deepEqual(parsedText(at), { text: sizedObject(padFor(SCRIPT_CAP)), isError: false, structuredJson: true });
 
-    const over = JSON.parse(await handle('agent', 'mcpl--modern--sized', { pad: padFor(SCRIPT_CAP + 1) }));
+    // Past the cap the string holds where the object went, and is still
+    // marked as a structured result's object: .structured reads none from it.
+    const overResult = await handle('agent', 'mcpl--modern--sized', { pad: padFor(SCRIPT_CAP + 1) });
+    assert.deepEqual({ isError: overResult.isError, structuredJson: overResult.structuredJson }, { isError: false, structuredJson: true });
+    const over = JSON.parse(overResult.text);
     assert.deepEqual(Object.keys(over).sort(), ['isError', 'oversized']);
     assert.equal(over.isError, false);
     assert.equal(over.oversized.chars, SCRIPT_CAP + 1);
     assert.deepEqual(await savedObject(workspace, over.oversized.savedTo), sizedObject(padFor(SCRIPT_CAP + 1)), 'the whole object, recoverable');
 
-    const failed = JSON.parse(await handle('agent', 'mcpl--modern--sized', { pad: padFor(SCRIPT_CAP + 1, true), isError: true }));
+    const failedResult = await handle('agent', 'mcpl--modern--sized', { pad: padFor(SCRIPT_CAP + 1, true), isError: true });
+    assert.equal(failedResult.isError, true, 'flagged beside the string too');
+    const failed = JSON.parse(failedResult.text);
     assert.equal(failed.isError, true, 'a tool error stays visible without reading the file');
     assert.equal(failed.oversized.chars, SCRIPT_CAP + 1);
     assert.notEqual(failed.oversized.savedTo, over.oversized.savedTo);
@@ -273,19 +294,23 @@ test('script results: exactly at the cap arrive inline; one past it are saved wh
 });
 
 test('script results past the cap: no workspace, or a failed write, is a failure to deliver, never a success', async () => {
-  const assertUndelivered = (out: { isError: boolean; error: string; oversized: unknown }) => {
+  const assertUndelivered = (result: ScriptToolResult) => {
+    // Not delivered: flagged as an error beside a string that says the tool
+    // may already have completed.
+    assert.deepEqual({ isError: result.isError, structuredJson: result.structuredJson }, { isError: true, structuredJson: true });
+    const out = JSON.parse(result.text) as { isError: boolean; error: string; oversized: unknown };
     assert.equal(out.isError, true);
     assert.match(out.error, /exceeds the 5000000-char script result cap and could not be saved to the workspace, so it could not be delivered; the tool may already have completed/);
     assert.deepEqual(out.oversized, { chars: SCRIPT_CAP + 1, savedTo: null });
   };
   await withModern(async ({ framework }) => {
     framework.start();
-    assertUndelivered(JSON.parse(await scriptHandle(framework)('agent', 'mcpl--modern--sized', { pad: padFor(SCRIPT_CAP + 1) })));
+    assertUndelivered(await scriptHandle(framework)('agent', 'mcpl--modern--sized', { pad: padFor(SCRIPT_CAP + 1) }));
   });
   await withWorkspace(async ({ framework, workspace }) => {
     framework.start();
     workspace.writeBinary = async () => ({ success: false, error: 'disk full', isError: true });
-    assertUndelivered(JSON.parse(await scriptHandle(framework)('agent', 'mcpl--modern--sized', { pad: padFor(SCRIPT_CAP + 1) })));
+    assertUndelivered(await scriptHandle(framework)('agent', 'mcpl--modern--sized', { pad: padFor(SCRIPT_CAP + 1) }));
   });
 });
 

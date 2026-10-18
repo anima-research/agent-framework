@@ -20,6 +20,7 @@ import type {
   ModuleContext,
   ProcessEvent,
   ProcessState,
+  ScriptToolResult,
   ToolCall,
   ToolDefinition,
   ToolResult,
@@ -131,6 +132,77 @@ describe('PyRunner (real python3)', () => {
       assert.strictEqual(result.returnCode, 0, result.stderr);
       assert.match(result.stdout, /echoed: alpha/);
       assert.deepStrictEqual(calls, [{ name: 'test--echo', args: { message: 'alpha' } }]);
+    } finally {
+      runner.dispose();
+    }
+  });
+
+  it('gives a script each result as its string, with .is_error and .structured beside it', async () => {
+    const structured = JSON.stringify({ content: [], structuredContent: { rows: [1, 2] }, isError: false });
+    const oversized = JSON.stringify({ isError: true, oversized: { chars: 9, savedTo: null } });
+    const results: Record<string, string | ScriptToolResult> = {
+      failed: { text: 'Error: boom', isError: true },
+      // Text that merely starts like an error, the case .is_error is for.
+      textlike: { text: 'Error: a line of the file, not a failure', isError: false },
+      structured: { text: structured, isError: false, structuredJson: true },
+      oversized: { text: oversized, isError: true, structuredJson: true },
+      // A handler that returns a plain string says nothing about it.
+      plain: 'a string, nothing said',
+      // Unmarked text holding a structuredContent key is still text.
+      jsonlike: { text: '{"structuredContent": {"a": 1}}', isError: false },
+    };
+    const runner = new PyRunner({
+      onToolCall: async (_name, args) => {
+        if (args.kind === 'rejects') throw new Error('handler broke');
+        // A JS handler can resolve with what its type rules out; the call is
+        // still answered, as before this change.
+        if (args.kind === 'nothing') return undefined as unknown as string;
+        return results[String(args.kind)]!;
+      },
+    });
+    try {
+      const result = await runner.exec(
+        [
+          'import copy, json, pickle',
+          'out = {}',
+          'for kind in ["failed", "textlike", "structured", "oversized", "plain", "rejects", "jsonlike", "nothing"]:',
+          '    r = await test__echo({"kind": kind})',
+          '    out[kind] = {"text": str(r), "is_error": r.is_error, "structured": r.structured,',
+          '                 "type": type(r).__name__, "is_str": isinstance(r, str)}',
+          'r = await test__echo({"kind": "structured"})',
+          'out["parsed"] = json.loads(r)["structuredContent"]',
+          'out["copies"] = [[c.is_error, c.structured, c == r] for c in (copy.copy(r), pickle.loads(pickle.dumps(r)))]',
+          'key = await test__echo({"kind": "plain"})',
+          'try:',
+          '    await test__echo({key: 1}, extra=2)',
+          'except TypeError as e:',
+          '    out["refusal"] = str(e)',
+          'print(json.dumps(out))',
+        ].join('\n'),
+        ECHO_TOOLS,
+      );
+      assert.strictEqual(result.returnCode, 0, result.stderr);
+      const out = JSON.parse(result.stdout) as Record<string, unknown>;
+      const seen = (text: string, isError: boolean | null, value: unknown) =>
+        ({ text, is_error: isError, structured: value, type: 'ToolResult', is_str: true });
+      assert.deepStrictEqual(out.failed, seen('Error: boom', true, null));
+      assert.deepStrictEqual(out.textlike, seen('Error: a line of the file, not a failure', false, null));
+      assert.deepStrictEqual(out.structured, seen(structured, false, { rows: [1, 2] }));
+      // Marked as a structured result's object, but holding no
+      // structuredContent: none to read.
+      assert.deepStrictEqual(out.oversized, seen(oversized, true, null));
+      assert.deepStrictEqual(out.plain, seen('a string, nothing said', null, null));
+      // A handler that rejects reaches the script as an error, flagged.
+      assert.deepStrictEqual(out.rejects, seen('Error: handler broke', true, null));
+      // The string is unchanged for code that parses it itself.
+      assert.deepStrictEqual(out.parsed, { rows: [1, 2] });
+      // copy and pickle keep both attributes.
+      assert.deepStrictEqual(out.copies, [[false, { rows: [1, 2] }, true], [false, { rows: [1, 2] }, true]]);
+      assert.deepStrictEqual(out.jsonlike, seen('{"structuredContent": {"a": 1}}', false, null));
+      assert.deepStrictEqual(out.nothing, seen('', null, null));
+      // A refusal shows a key that is a tool's result as its text, the key the
+      // agent has to write, as it shows any str key.
+      assert.match(String(out.refusal), /\{'a string, nothing said': <int>, 'extra': <int>\}/);
     } finally {
       runner.dispose();
     }
@@ -986,10 +1058,14 @@ describe('framework code_execution integration (real python3)', () => {
     const code = [
       'import json',
       'names = []',
+      'flags = []',
       'for m in ["alpha", "beta"]:',
-      '    r = json.loads(await test__echo({"message": m}))',
+      '    raw = await test__echo({"message": m})',
+      '    flags.append(raw.is_error)',
+      '    r = json.loads(raw)',
       '    names.append(r["echoed"]["message"].upper())',
       'print("summary:", "+".join(names))',
+      'print("is_error:", flags)',
     ].join('\n');
 
     membrane.pushResponse(createMockResponse([
@@ -1029,6 +1105,9 @@ describe('framework code_execution integration (real python3)', () => {
       const wireResult = stream.receivedToolResults[0][0] as { toolUseId: string; content: string };
       assert.strictEqual(wireResult.toolUseId, 'call_ce_1');
       assert.match(wireResult.content, /summary: ALPHA\+BETA/);
+      // Through the framework, each result says it isn't an error (a
+      // handler that passed on only the string would make it None).
+      assert.match(wireResult.content, /is_error: \[False, False\]/);
       assert.match(wireResult.content, /"return_code":\s*0/);
       // ...and NOT the intermediate tool results.
       assert.ok(
@@ -1280,7 +1359,8 @@ describe('framework background scripts + spill (real python3)', () => {
     const bgCode = [
       'import asyncio',
       'await asyncio.sleep(0.2)',
-      'await wake_agent({"found": "signal"})',
+      'r = await test__echo({"message": "bg"})',
+      'await wake_agent({"found": "signal", "is_error": r.is_error})',
     ].join('\\n');
 
     // Turn 1: spawn the background script, then finish the turn.
@@ -1315,8 +1395,11 @@ describe('framework background scripts + spill (real python3)', () => {
       assert.ok(wakeMessage, 'wake message should be injected');
       const text = (wakeMessage.content[0] as { text?: string }).text ?? '';
       assert.match(text, /\[background script bg-\d+\] Woke you/);
-      assert.match(text, /line 3 of your script/);
+      assert.match(text, /line 4 of your script/);
       assert.match(text, /"found": "signal"/);
+      // A background script's results carry the flag too (None if only the
+      // string were passed on).
+      assert.match(text, /"is_error": false/);
       assert.match(text, /workspace file files\/background-scripts\/bg-\d+\.log/);
       assert.match(text, /Script status: still running|Script status/);
     } finally {

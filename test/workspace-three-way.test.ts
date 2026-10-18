@@ -1424,7 +1424,8 @@ describe('the catch-up pass at start', () => {
    * re-attach the watcher reports, since a re-attached watcher's ready runs its own pass (here always long before its
    * own bound). A watcher can re-attach just after its first ready. On macOS, by libuv's src/unix/fsevents.c, an
    * FSEvents event for the watched directory itself, when it carries no modification flags, reaches fs.watch as a
-   * rename under the directory's own name, and the watcher's raw handler re-attaches on any rename named like its root.
+   * rename under the directory's own name, and there, holding no root, the watcher re-attaches at any rename named
+   * like its root.
    */
   const assertPassesOnceReady = (env: Env, passes: number, expected: number) => {
     const reattaches = env.events.filter((e) => e.type === 'workspace:watcher-reattached').length;
@@ -1452,17 +1453,19 @@ describe('the catch-up pass at start', () => {
   test('a re-attached watcher runs its pass at its own ready, so a change after that pass reaches the store', { skip: process.platform !== 'linux' }, async (t) => {
     const env = new Env(t);
     env.writeDisk('gate.json', 'v1');
-    // The root poll is past the test's deadline, so only the root's rename event re-attaches the watcher.
+    // The root poll is past the test's deadline, so only the re-attach below happens.
     const m = await env.open({ watch: 'always', watchDebounceMs: 50, watchRootPollMs: 60_000 });
     const mount = (m as any).mounts.get('work');
     await until(() => !!mount.watcherReadyAt && storedText(env, 'gate.json') === 'v1', 'the first pass took gate.json in');
-    // The root is moved away, its file changed, and moved back, so the watcher re-attaches to the same directory,
-    // which the module still agrees with. chokidar's directory reads each wait a second meanwhile, so the
-    // re-attached watcher's scan reaches gate.json long after a pass started at the re-attach would have run.
+    // The watcher re-attaches to the same directory, which the module still agrees with, as it does at a rename
+    // named like a root it can't hold open. gate.json changes once the old chokidar instance has begun to close, which
+    // takes its listeners first, so no watcher reports the change. chokidar's directory reads each wait a second
+    // meanwhile, so the re-attached watcher's scan reaches gate.json long after a pass started at the re-attach would
+    // have run.
     await withChokidarReaddir(() => new Promise((r) => setTimeout(r, 1000)), async (reads) => {
-      renameSync(env.dir, `${env.dir}.away`);
-      writeFileSync(join(`${env.dir}.away`, 'gate.json'), 'v2');
-      renameSync(`${env.dir}.away`, env.dir);
+      const reattaching: Promise<void> = (m as any).watchers.get('work').reattach();
+      env.writeDisk('gate.json', 'v2');
+      await reattaching;
       await until(() => reattached(env), 'the watcher re-attached');
       await until(() => storedText(env, 'gate.json') === 'v2', 'gate.json\'s v2 was taken in', 15_000);
       env.writeDisk('gate.json', 'v3');
@@ -1529,8 +1532,9 @@ describe('the catch-up pass at start', () => {
     const m = await env.open({ watch: 'always', watchDebounceMs: 50 }, {}, (m) => { counted = countPasses(m); });
     const mount = (m as any).mounts.get('work');
     await until(() => !!mount.watcherReadyAt && storedText(env, 'gate.json') === 'v1', 'the pass ran at ready');
-    // The rename macOS reports for an FSEvents event on the root itself, sent to the watcher's chokidar instance.
-    (m as any).watchers.get('work').watcher.emit('raw', 'rename', 'work', {});
+    // The watcher re-attaches, as it does on macOS, where it holds no root, at the rename an FSEvents event on the root
+    // itself arrives as.
+    await (m as any).watchers.get('work').reattach();
     await until(() => counted.passes >= 2, "the re-attached watcher's ready ran its pass");
     await elapse(200);
     assert.ok(reattached(env), 'the watcher re-attached');

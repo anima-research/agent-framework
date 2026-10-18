@@ -18,7 +18,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 import { AgentFramework, WorkspaceModule } from '../src/index.js';
-import type { ToolResult } from '../src/index.js';
+import type { ScriptToolResult, ToolResult } from '../src/index.js';
 import { EXPIRY_REASON, INLINE_WITHHELD_TEXT, referenceRegistry } from '../src/mcpl/references.js';
 import type { ReferenceRecord } from '../src/mcpl/references.js';
 import { MockMembrane } from './helpers/mock-membrane.js';
@@ -98,7 +98,7 @@ async function withPeers(fn: (h: Harness) => Promise<void>, opts: { eager?: bool
     mcplServerRegistry: unknown;
     mcplPrefixMap: Map<string, string>;
     getReferenceFetcher: () => unknown;
-    handleScriptToolCall: (agent: string, tool: string, args: Record<string, unknown>) => Promise<string>;
+    handleScriptToolCall: (agent: string, tool: string, args: Record<string, unknown>) => Promise<ScriptToolResult>;
     dispatchMcplToolCall: (agent: string, call: { id: string; name: string; input: unknown }, serverId: string, prefix: string) => void;
     pushEvent: (event: { type: string; callId?: string; result?: ToolResult }) => void;
   };
@@ -135,7 +135,9 @@ async function withPeers(fn: (h: Harness) => Promise<void>, opts: { eager?: bool
   try {
     await fn({
       answer: (result) => { answer = result; },
-      script: (tool) => internals.handleScriptToolCall.call(framework, 'agent', tool, {}),
+      // The string a script's call returns; its flags are pinned in
+      // mcp-modern-framework and code-execution.
+      script: async (tool) => (await internals.handleScriptToolCall.call(framework, 'agent', tool, {})).text,
       modelCall,
       fetched,
       workspace,

@@ -1112,7 +1112,15 @@ export interface ChannelsListResult {
  * Spec Section 14.3.
  */
 export interface ChannelsOpenParams {
-  /** Exact registered id. Preferred over type/address matching. */
+  /**
+   * The exact registered id to open. Without it, a server matches by `type`
+   * and `address`, as before. A server that doesn't know the id should
+   * refuse rather than open another channel: the host fails an open whose
+   * answer names a different channel id, by its `channel.id` or a history
+   * item's `channelId`, compared exactly, as the server's traffic is. When
+   * that other channel is registered and decided closed, the host closes it
+   * again.
+   */
   channelId?: string;
   type: string;
   address?: Record<string, unknown>;

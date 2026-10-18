@@ -17,7 +17,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 import { AgentFramework, ApiModule } from '../src/index.js';
-import type { Module, ModuleContext, ToolDefinition, ToolResult } from '../src/index.js';
+import type { Module, ModuleContext, ScriptToolResult, ToolDefinition, ToolResult } from '../src/index.js';
 import { TUNE_OUT_DEFAULTS } from '../src/tune-out/coordinator.js';
 import { MockMembrane, createMockResponse } from './helpers/mock-membrane.js';
 
@@ -189,17 +189,23 @@ test('a script, and a module calling in process, get the refusals as errors too'
   // A script's call is answered through the event loop, so it has to run.
   framework.start();
   const script = (tool: string, input: Record<string, unknown>) => (framework as unknown as {
-    handleScriptToolCall(agent: string, tool: string, args: Record<string, unknown>): Promise<string>;
+    handleScriptToolCall(agent: string, tool: string, args: Record<string, unknown>): Promise<ScriptToolResult>;
   }).handleScriptToolCall('scout', tool, input);
-  assert.equal(await script('tune_out', { channelId: 'disc:guild:none' }), 'Error: unknown channel: disc:guild:none');
-  assert.equal(await script('api--lookup', {}), `Error: ${API_UNKNOWN}`);
+  // Each refusal reaches the script as an error, flagged as one (.is_error).
+  assert.deepEqual(await script('tune_out', { channelId: 'disc:guild:none' }), { text: 'Error: unknown channel: disc:guild:none', isError: true });
+  assert.deepEqual(await script('api--lookup', {}), { text: `Error: ${API_UNKNOWN}`, isError: true });
   // A control: the same tool's success still reads as one.
   const { cadenceSeconds, backlogCap, maxWakes } = TUNE_OUT_DEFAULTS;
-  assert.equal(
+  assert.deepEqual(
     await script('tune_out', { channelId: CHANNEL }),
-    JSON.stringify({ tunedOut: CHANNEL, cadenceSeconds, backlogCap, maxWakes }),
+    { text: JSON.stringify({ tunedOut: CHANNEL, cadenceSeconds, backlogCap, maxWakes }), isError: false },
   );
-  assert.equal(await script('channel_open', { channelId: CHANNEL }), `Error: ${TUNED_OUT}`);
+  assert.deepEqual(await script('channel_open', { channelId: CHANNEL }), { text: `Error: ${TUNED_OUT}`, isError: true });
+  // A script can't start a script: refused before any dispatch, as an error.
+  assert.deepEqual(
+    await script('code_execution', { code: 'print(1)' }),
+    { text: 'Error: code_execution cannot be called from within a script', isError: true },
+  );
   // A module gets the result as the registry returns it: flagged, with the
   // refusal's data kept, so it can still read why.
   assert.deepEqual(await keeper.ctx!.callTool({ id: 'ctx-open', name: 'channel_open', input: { channelId: CHANNEL } }), {

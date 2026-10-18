@@ -55,11 +55,30 @@ export interface BackgroundExecOptions {
   lifetimeMs: number;
 }
 
-/** Resolves inner tool calls. Must never reject — map errors to strings. */
+/**
+ * An inner tool call's result as the script gets it. `text` is the string
+ * its await returns, and the runner sets `.is_error` on that string from
+ * `isError`. With `structuredJson`, `text` is the JSON object a structured
+ * result reaches a script as, in any of its forms, and `.structured` reads
+ * its `structuredContent`, None for a form that holds none, such as one past
+ * the size cap; without it, `.structured` is None.
+ */
+export interface ScriptToolResult {
+  text: string;
+  isError: boolean;
+  structuredJson?: boolean;
+}
+
+/**
+ * Resolves inner tool calls. Must never reject — map errors to results; a
+ * rejection reaches the script as an `Error: …` result. A plain string is
+ * the result's text with nothing said about it, so the script's
+ * `.is_error` and `.structured` are None.
+ */
 export type ScriptToolCallHandler = (
   toolName: string,
   args: Record<string, unknown>,
-) => Promise<string>;
+) => Promise<string | ScriptToolResult>;
 
 export interface PyRunnerOptions {
   pythonPath?: string;
@@ -530,9 +549,24 @@ export class PyRunner {
             ? (msg.args as Record<string, unknown>)
             : {};
         this.onToolCall(toolName, args)
-          .catch((err) => `Error: ${err instanceof Error ? err.message : String(err)}`)
+          .catch((err): ScriptToolResult => ({
+            text: `Error: ${err instanceof Error ? err.message : String(err)}`,
+            isError: true,
+          }))
           .then((result) => {
-            this.reply(child, { op: 'tool_result', id: callId, result }, `result of ${toolName} call ${callId}`);
+            // Only an object is a ScriptToolResult. Anything else a handler
+            // resolves with, a string or a value its type rules out, is sent
+            // as it is, so the call is still answered.
+            const reply = typeof result === 'object' && result !== null
+              ? {
+                op: 'tool_result',
+                id: callId,
+                result: result.text,
+                is_error: result.isError,
+                ...(result.structuredJson ? { structured_json: true } : {}),
+              }
+              : { op: 'tool_result', id: callId, result };
+            this.reply(child, reply, `result of ${toolName} call ${callId}`);
           });
         return;
       }

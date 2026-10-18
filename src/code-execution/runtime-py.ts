@@ -7,7 +7,8 @@
  *
  *   - scripts run with top-level `await` (PyCF_ALLOW_TOP_LEVEL_AWAIT)
  *   - host tools are injected as async functions taking a single dict and
- *     returning a string (the tool_result text)
+ *     returning the tool_result text as a str (ToolResult), which also
+ *     carries .is_error and .structured
  *   - a pending tool call that gets no response raises TimeoutError with the
  *     same message shape the managed runtime produces
  *   - interpreter globals persist across execs (container-reuse semantics)
@@ -29,7 +30,7 @@
  *   host -> py : {op:"init", tools:[{py_name,tool_name}], call_timeout_s,
  *                 background?, log_path?, tail_chars?}
  *                {op:"exec", id, code}
- *                {op:"tool_result", id, result}
+ *                {op:"tool_result", id, result, is_error?, structured_json?}
  *                {op:"wake_ack", id, error?}
  *                {op:"cancel", id, reason?}
  *   py -> host : {op:"ready"}
@@ -49,6 +50,7 @@
 export const PYTHON_RUNTIME_SOURCE: string = String.raw`
 import ast
 import asyncio
+import functools
 import inspect
 import io
 import json
@@ -258,6 +260,31 @@ def _deliver_cancel(st):
     st.task.cancel()
 
 
+class ToolResult(str):
+    """A tool's result: the string the tool gave, with two attributes.
+
+    is_error: True if the result is an error, False if not, None if the
+    host didn't say.
+    structured: the parsed structuredContent of a structured result's JSON
+    object, or None.
+    """
+
+    # Defaults, since pickle and copy rebuild a str subclass from its text
+    # alone and then restore the attributes.
+    def __new__(cls, text="", is_error=None, structured_json=False):
+        self = str.__new__(cls, text)
+        self.is_error = is_error
+        self._structured_json = structured_json
+        return self
+
+    # Read from the string itself, the one copy sent, on first use only.
+    @functools.cached_property
+    def structured(self):
+        if not self._structured_json:
+            return None
+        return json.loads(self).get("structuredContent")
+
+
 def _resolve(fut, value):
     # Defense in depth: the script may have been cancelled since the lookup.
     if fut is not None and not fut.done():
@@ -307,8 +334,9 @@ def _make_tool_fn(tool_name, py_name):
             meant.update(kwargs)
             # A key is what the agent has to write, so a str key is shown
             # whole up to 60 characters, as names are elsewhere; a longer one,
-            # or any other key, is shown as a value is.
-            shown = ", ".join((repr(k) if type(k) is str and len(k) <= 60 else _brief(k)) + ": " + _brief(v)
+            # or any other key, is shown as a value is. A tool's result counts
+            # as a str: ToolResult keeps str's repr, so no script code runs.
+            shown = ", ".join((repr(k) if (type(k) is str or type(k) is ToolResult) and len(k) <= 60 else _brief(k)) + ": " + _brief(v)
                               for k, v in meant.items())
             raise TypeError(
                 py_name + " wasn't called: a tool function takes one dict of "
@@ -347,7 +375,8 @@ def _make_tool_fn(tool_name, py_name):
     tool_fn.__qualname__ = py_name
     tool_fn.__doc__ = (
         "Host tool '" + tool_name + "'. Takes a single dict of arguments and "
-        "returns the tool result as a string."
+        "returns the tool result as a string, with .is_error and .structured "
+        "beside it."
     )
     return tool_fn
 
@@ -537,7 +566,10 @@ def _dispatch(msg):
         )
         st.task = _current_exec_task
     elif op == "tool_result":
-        _resolve(_pending_tool_futures.get(msg.get("id")), str(msg.get("result", "")))
+        _resolve(
+            _pending_tool_futures.get(msg.get("id")),
+            ToolResult(str(msg.get("result", "")), msg.get("is_error"), msg.get("structured_json") is True),
+        )
     elif op == "wake_ack":
         _resolve(_pending_wake_futures.get(msg.get("id")), msg.get("error") or None)
     elif op == "cancel":

@@ -623,7 +623,7 @@ describe('notices about an agent\'s own action', () => {
       state.recordChannelAutoOpenNotice(fork.name, [{ channelId: 'c-1', label: '#one' }], 'opened-by-reply');
       assert.equal(forkCm.mock.callCount(), 1);
       assert.equal(primary.mock.callCount(), 0);
-      assert.match(JSON.stringify(forkCm.mock.calls[0]!.arguments[1]), /Now open: #one \(c-1\) — your own message into the closed channel engaged it/);
+      assert.match(JSON.stringify(forkCm.mock.calls[0]!.arguments[1]), /Now open: #one \(c-1\): your own message into the closed channel opened it/);
 
       state.recordChannelAutoOpenNotice(undefined, [{ channelId: 'c-2' }], 'subscription-policy');
       assert.equal(primary.mock.callCount(), 1, 'no agent caused a policy open');

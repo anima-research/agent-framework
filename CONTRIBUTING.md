@@ -148,7 +148,9 @@ never do.
   which refuses a tag with no matching changelog section, checks in a job
   of its own that the packed release installs on its own, publishes
   `@animalabs/agent-framework` to npm once that check has passed, and
-  creates the GitHub release with that section as its notes. The check,
+  creates the GitHub release with that section as its notes, cut at an
+  entry's start, with a link to the whole section, when it's longer than
+  120,000 characters, under GitHub's limit of 125,000. The check,
   `node scripts/pack-installs-alone.mjs`, packs the release and installs
   the tarball alone into an empty directory with its dependencies from
   npm. The install is linked, so each package reaches only the

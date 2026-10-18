@@ -24,8 +24,6 @@ export interface ModuleProcessResponse {
 export interface ProcessLoggingConfig {
   /** Persist process logs to Chronicle (default: false) */
   persist?: boolean;
-  /** Broadcast process:completed trace events (default: false) */
-  broadcast?: boolean;
 }
 
 /**

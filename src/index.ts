@@ -74,6 +74,7 @@ export type {
   ExecResult,
   PyRunnerOptions,
   ScriptToolCallHandler,
+  ScriptToolResult,
 } from './code-execution/index.js';
 export type { SessionUsage, AgentUsage, SessionUsageSnapshot, UsageUpdatedEvent } from './usage/index.js';
 

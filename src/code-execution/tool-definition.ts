@@ -42,6 +42,9 @@ export function buildCodeExecutionToolDefinition(opts?: {
       `workspace path the payload was saved to (null if it wasn't) and "refId" is fetch_reference's ` +
       'ref_id. A structured result over 5 MB is saved to the workspace instead, and the string is ' +
       '{"isError": ..., "oversized": {"chars": ..., "savedTo": ...}}. ' +
+      'Each string also carries .is_error (True if the result is an error, else False; test it ' +
+      'rather than an "Error:" prefix) and .structured (the parsed "structuredContent" of the ' +
+      'JSON object above, or None). ' +
       "An exact-name lookup dict is also available: tools['mcpl--discord--fetch_history']({...}). " +
       'Use top-level await; run independent calls in parallel with asyncio.gather. ' +
       'Only what you print() (plus stderr and the exit code) comes back to you — intermediate ' +

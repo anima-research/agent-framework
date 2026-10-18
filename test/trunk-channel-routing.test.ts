@@ -424,7 +424,7 @@ describe('Trunk channel routing (item-3 redux)', () => {
     const one = lastText();
     assert.match(
       one,
-      /Now open: #general \(acme\) \(slack:C1\) — your own message into the closed channel engaged it\. What an open channel delivers to you depends on its server\. If you don't want it, use channel_close/,
+      /Now open: #general \(acme\) \(slack:C1\): your own message into the closed channel opened it\. What an open channel delivers to you depends on its server\. If you don't want it, use channel_close/,
     );
     assert.doesNotMatch(one, /will reach you/);
 
@@ -432,7 +432,7 @@ describe('Trunk channel routing (item-3 redux)', () => {
     const two = lastText();
     assert.match(
       two,
-      /Now open: slack:C1, slack:C2 — your subscription policy just admitted them\. What an open channel delivers to you depends on its server\. If you don't want one of them, use channel_close/,
+      /Selected for opening by subscription policy: slack:C1, slack:C2\. This records the admission decision; channel_list shows current transport state\. What an open channel delivers to you depends on its server\. If you don't want one of them, use channel_close/,
     );
     assert.doesNotMatch(two, /will reach you/);
     await framework.stop();

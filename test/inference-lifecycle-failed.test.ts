@@ -161,6 +161,67 @@ test('a stream that fails, whose retry stop() cancels, ends failed', { timeout: 
   }
 });
 
+test('a stream that fails, whose retry a caller\'s stop cancels during its wait, ends failed', { timeout: 60_000 }, async () => {
+  let waiting!: () => void;
+  const inDelay = new Promise<void>((resolve) => { waiting = resolve; });
+  const retryLater: ErrorPolicy = {
+    maxRetries: 1,
+    onInferenceError: (_error, _agent, attempt) => {
+      waiting();
+      return attempt < 1 ? { retry: true, delayMs: 60_000 } : { retry: false };
+    },
+  };
+  const { framework, membrane, traces, phases, teardown } = await frameworkOver([failure()], retryLater);
+  try {
+    framework.start();
+    framework.pushEvent({ type: 'external-message', source: 'test', content: 'hello', metadata: {} });
+    await inDelay;
+    assert.equal(framework.abortInference('resident', 'user'), true, 'abortInference reports the stop');
+    for (let i = 0; i < 500 && !(traces.some((t) => t.type === 'inference:aborted') && framework.getHostModeStatus().activeTurns === 0); i++) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    assert.equal(membrane.calls.length, 1, 'the retry was cancelled, not sent');
+    assert.ok(
+      traces.some((t) => t.type === 'inference:aborted' && t.reason === 'user'),
+      `the caller's stop ended the turn: ${JSON.stringify(traces.filter((t) => t.type.startsWith('inference:')))}`,
+    );
+    assert.deepEqual(phases(), [['started', 'failed']]);
+  } finally {
+    await teardown();
+  }
+});
+
+test('a stream that fails, whose retry an operator\'s abandon cancels during its wait, ends failed', { timeout: 60_000 }, async () => {
+  let waiting!: () => void;
+  const inDelay = new Promise<void>((resolve) => { waiting = resolve; });
+  const retryLater: ErrorPolicy = {
+    maxRetries: 1,
+    onInferenceError: (_error, _agent, attempt) => {
+      waiting();
+      return attempt < 1 ? { retry: true, delayMs: 60_000 } : { retry: false };
+    },
+  };
+  const { framework, membrane, traces, phases, teardown } = await frameworkOver([failure()], retryLater);
+  try {
+    framework.start();
+    framework.pushEvent({ type: 'external-message', source: 'test', content: 'hello', metadata: {} });
+    await inDelay;
+    await framework.quiesce({ timeoutMs: 50, abandon: true });
+    for (let i = 0; i < 500 && !(traces.some((t) => t.type === 'inference:aborted') && framework.getHostModeStatus().activeTurns === 0); i++) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    assert.equal(membrane.calls.length, 1, 'the retry was cancelled, not sent');
+    assert.ok(
+      traces.some((t) => t.type === 'inference:aborted' && t.reason === 'quiesce_abandoned'),
+      `the abandon ended the turn: ${JSON.stringify(traces.filter((t) => t.type.startsWith('inference:')))}`,
+    );
+    assert.deepEqual(phases(), [['started', 'failed']]);
+    await framework.resume();
+  } finally {
+    await teardown();
+  }
+});
+
 test('a stream whose 429 holds the turn for the provider\'s wait ends failed', async () => {
   const rateLimited = new MembraneError({
     type: 'rate_limit', retryable: true, httpStatus: 429, retryAfterMs: 60_000,

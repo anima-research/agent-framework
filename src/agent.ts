@@ -1613,19 +1613,40 @@ export class Agent {
    *  the only provenance a host-side cancel has. */
   private _pendingCancel: { reason?: string } | undefined;
 
+  /** The most recent cancelStream() made while this agent held no stream:
+   *  during a turn's hooks or compile, while it waits to retry, or while no
+   *  check of a turn is ahead at all. The framework collects it at the check
+   *  ahead of it, which ends the turn, and the next start drops one no check
+   *  collected, so a stop made while none was ahead, such as a host's
+   *  interrupt of every agent, ends nothing. */
+  private _stopWithoutStream: { reason?: string } | undefined;
+
   /**
    * Cancel the stream this agent's state holds (streaming, waiting on its
    * tools, or ready at a tool boundary with every result in), and reset to
-   * idle. `reason` is provenance for the framework's inference:aborted trace
-   * and marker metadata (e.g. 'zombie_reclaim', 'subagent_cancel'); it never
-   * reaches the provider.
+   * idle. With no stream, the stop is kept for the turn in progress, which
+   * the framework ends at its next check, before it sends anything more, if
+   * one is still ahead; otherwise the next start drops it. `reason` is
+   * provenance for the framework's inference:aborted trace and marker
+   * metadata (e.g. 'zombie_reclaim', 'subagent_cancel'); it never reaches
+   * the provider.
    */
   cancelStream(reason?: string): void {
     if ('stream' in this._state && this._state.stream) {
       this._pendingCancel = { reason };
       this._state.stream.cancel();
+    } else {
+      this._stopWithoutStream = { reason };
     }
     this._state = { status: 'idle' };
+  }
+
+  /** Collect (and clear) the cancelStream() made while this agent held no
+   *  stream, if one was made since the last collection. */
+  takeStopWithoutStream(): { reason?: string } | undefined {
+    const s = this._stopWithoutStream;
+    this._stopWithoutStream = undefined;
+    return s;
   }
 
   /** Collect (and clear) the cancel that ended the current stream, if this
