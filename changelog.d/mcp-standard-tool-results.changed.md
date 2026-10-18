@@ -43,10 +43,11 @@
   the script (`null` when it couldn't; `fetch_reference` takes the id as its
   `ref_id` argument). It arrives without its URI, except a link (MCP's
   `resource_link`) that carries `uri` where the model's line for it shows
-  the uri. An unsaved reference that counts as expired also carries
-  `expired`, the reason the model's stub gives, and isn't fetched. One the
-  fetcher would refuse carries `unfetchable`, the words the model's stub
-  gives in place of advising `fetch_reference`.
+  the uri. An unsaved reference that counts as expired isn't fetched.
+  Where the model's line for a reference is a stub, the object also
+  carries what the stub says in place of advising `fetch_reference`:
+  `expired`, the reason, for one that counts as expired, and
+  `unfetchable`, the stub's words, for one the fetcher would refuse.
   A block the classifier rejects arrives as the notice the model reads in
   its place, and inline data that also claims a bulk disposition as the
   withheld notice. #181, by @Meganeuridae, first
