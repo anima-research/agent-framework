@@ -189,8 +189,11 @@ export interface ModuleContext {
    * `modules/<module>/<name>`. Idempotent — safe to call on every start().
    * Items are appended with `appendToLog` (one O(item) record per append) and
    * point-edited with `editLogItem`; Chronicle's append_log snapshot cadence
-   * handles consolidation. `name` must not be 'state' (reserved for the main
-   * snapshot state) and must not contain '/'.
+   * handles consolidation. The cadence applies when the state is first
+   * registered: a store that already holds the state keeps the cadence it was
+   * registered with. `name` must not be 'state' (reserved for the main
+   * snapshot state) and must not contain '/'. A registration that fails
+   * throws, naming the state, and leaves the name unregistered.
    */
   registerLogState(
     name: string,

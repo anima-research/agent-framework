@@ -22,7 +22,7 @@ import type {
   ToolDefinition,
   ToolResult,
 } from '../src/index.js';
-import { AgentFramework } from '../src/index.js';
+import { AgentFramework, ShutdownTimeoutError } from '../src/index.js';
 import { OperatorActionError } from '../src/operator-log.js';
 import type { NormalizedRequest, NormalizedResponse } from '@animalabs/membrane';
 import { MembraneError } from '@animalabs/membrane';
@@ -2232,6 +2232,100 @@ describe('queued context maintenance timer', () => {
       if (!stopped) await framework.stop();
       rmSync(dir, { recursive: true, force: true });
     }
+  });
+
+  describe("stop(t) with a maintenance tick that outlasts its budget", () => {
+    /** stop(t)'s outcome: its rejection, 'resolved', or 'still pending' after
+     *  5 s, so a stop() that waits on the tick fails the test rather than
+     *  hanging it. */
+    async function stopWithin(framework: AgentFramework, budget?: number): Promise<unknown> {
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      try {
+        return await Promise.race([
+          framework.stop(budget).then(() => 'resolved', (error: unknown) => error),
+          new Promise<string>((resolve) => { timer = setTimeout(() => resolve('still pending'), 5_000); }),
+        ]);
+      } finally { clearTimeout(timer); }
+    }
+    const maintenancePending = (outcome: unknown): boolean => outcome instanceof ShutdownTimeoutError
+      && outcome.message === 'Shutdown timed out after 100 ms; pending: maintenance';
+
+    it("a drain kick's tick: stop(t) fails naming maintenance, keeps the store open, and a later stop(t) waits for the same tick again", { timeout: 20_000 }, async () => {
+      const dir = mkdtempSync(join(tmpdir(), 'af-maintenance-stop-budget-'));
+      const strategy = new GatedTickStrategy();
+      const framework = await AgentFramework.create({
+        storePath: join(dir, 'store'),
+        membrane,
+        agents: [{ name: 'agent', model: 'test-model', systemPrompt: 'test', strategy }],
+        modules: [],
+        syncIntervalMs: 0,
+        maintenanceIntervalMs: 0,
+      });
+      strategy.framework = framework;
+      const internals = framework as unknown as {
+        noteInferenceExhausted(agentName: string, reason: string, retryable?: boolean, errorType?: string): void;
+      };
+      const quiet = console.error;
+      console.error = () => {};
+      try {
+        framework.start();
+        internals.noteInferenceExhausted('agent', 'compile refused', false, 'over_budget');
+        await waitFor(() => strategy.ticks === 1);
+        const outcome = await stopWithin(framework, 100);
+        assert.ok(maintenancePending(outcome), String(outcome));
+        assert.equal(framework.getStore().isClosed(), false, 'the tick may still write');
+        const again = await stopWithin(framework, 100);
+        assert.ok(maintenancePending(again), `a later stop() waits for the tick still held: ${String(again)}`);
+        assert.equal(framework.getStore().isClosed(), false, 'the tick is still held');
+        strategy.release();
+        await framework.stop();
+        assert.equal(strategy.storeOpenAtFirstTickEnd, true, 'the tick ended before the store closed');
+        assert.equal(framework.getStore().isClosed(), true, 'a later stop() closes the store');
+      } finally {
+        console.error = quiet;
+        strategy.release();
+        await framework.stop().catch(() => {});
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
+
+    it("a regular pass's tick held across a start(): no second pass starts beside it, and a later stop(t) waits for it again", { timeout: 20_000 }, async () => {
+      // start() runs the first pass at once; the interval never fires here.
+      const dir = mkdtempSync(join(tmpdir(), 'af-maintenance-pass-stop-budget-'));
+      const strategy = new GatedTickStrategy();
+      const framework = await AgentFramework.create({
+        storePath: join(dir, 'store'),
+        membrane,
+        agents: [{ name: 'agent', model: 'test-model', systemPrompt: 'test', strategy }],
+        modules: [],
+        syncIntervalMs: 0,
+        maintenanceIntervalMs: 60_000,
+      });
+      strategy.framework = framework;
+      const quiet = console.error;
+      console.error = () => {};
+      try {
+        framework.start();
+        await waitFor(() => strategy.ticks === 1);
+        const outcome = await stopWithin(framework, 100);
+        assert.ok(maintenancePending(outcome), String(outcome));
+        framework.start();
+        await new Promise((resolve) => setTimeout(resolve, 200));
+        assert.equal(strategy.ticks, 1, 'no pass started beside the held one');
+        const again = await stopWithin(framework, 100);
+        assert.ok(maintenancePending(again), `a later stop() waits for the pass still held: ${String(again)}`);
+        assert.equal(framework.getStore().isClosed(), false, 'the tick is still held');
+        strategy.release();
+        await framework.stop();
+        assert.equal(strategy.storeOpenAtFirstTickEnd, true, 'the tick ended before the store closed');
+        assert.equal(framework.getStore().isClosed(), true, 'a later stop() closes the store');
+      } finally {
+        console.error = quiet;
+        strategy.release();
+        await framework.stop().catch(() => {});
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
   });
 
   it('no pass starts while a surgery holds the store', async () => {

@@ -35,6 +35,9 @@ export function createMockResponse(
     usage: { inputTokens: 10, outputTokens: 5 },
     details: {
       raw: {},
+      // membrane's responses always carry their stop details, and the MCPL
+      // inference router reads them.
+      stop: { reason: stopReason, wasTruncated: false },
     },
   } as unknown as NormalizedResponse;
 }

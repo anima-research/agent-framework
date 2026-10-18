@@ -18,6 +18,10 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { fixture, TS } from './helpers/coalescing-fixture.js';
 import { RefusalLines } from '../src/mcpl/refusal-lines.js';
+import { NON_STRING_TEXT_PLACEHOLDER } from '../src/mcpl/visible-content.js';
+import { HookOrchestrator } from '../src/mcpl/hook-orchestrator.js';
+import { CapabilityGrant } from '../src/mcpl/capability-grant.js';
+import { logDetail, logValue } from '../src/mcpl/log-value.js';
 
 /** Base64 for an image well over 1 MiB once serialized (a Retina screenshot). */
 const BIG_IMAGE = { type: 'image', data: 'A'.repeat(1_600_000), mimeType: 'image/png' };
@@ -244,8 +248,10 @@ test('a block whose type, text or source isn\'t a string converts on both lanes,
     // Data whose media type is unusable is named as such, not as no data.
     ...odd('array_mime').map((mimeType) => ({ content: [{ type: 'image', data: 'AAAA', mimeType }], shows: '[Image: no media type]' })),
     ...odd('array_mime').map((mimeType) => ({ content: [{ type: 'audio', data: 'AAAA', mimeType }], shows: '[Audio: no media type]' })),
+    // A text block whose text isn't a string shows as its placeholder, so the
+    // agent reads that a block was there; the text beside it shows as itself.
     ...odd('array_text').map((text, i) => ({
-      content: [{ type: 'text', text }, { type: 'text', text: `beside_text_without_text_${i}` }], shows: `beside_text_without_text_${i}`,
+      content: [{ type: 'text', text }, { type: 'text', text: `beside_text_without_text_${i}` }], shows: NON_STRING_TEXT_PLACEHOLDER,
     })),
     // Reference-shaped: a uri that isn't a non-empty string never makes a
     // reference, with a disposition or without.
@@ -280,6 +286,12 @@ test('a block whose type, text or source isn\'t a string converts on both lanes,
     const expected = malformed.filter((m) => m.shows === shows).length * 4;
     assert.equal(occurrences(context, JSON.stringify(shows)), expected, shows);
   }
+  // And each text that was a string, four times too.
+  for (const { content } of malformed) {
+    for (const block of content as Array<{ text?: unknown }>) {
+      if (typeof block.text === 'string') assert.equal(occurrences(context, JSON.stringify(block.text)), 4, block.text);
+    }
+  }
   for (const leaked of ['toString', 'array_', '424242']) assert(!context.includes(leaked), `nothing that was not a string reaches the context (${leaked})`);
 });
 
@@ -300,14 +312,263 @@ test('a text block whose text isn\'t a string is no text, so alone it is refused
   assert.equal(coalesced.error?.message, plain.error?.message);
 });
 
+test('beside blank text, or with no text key at all, such a block is still no text, so the message is refused as empty on both lanes, coalesced or not', async (t) => {
+  const f = await fixture(); t.after(f.close); await f.register();
+  const contents = [
+    [{ type: 'text', text: { toString: 1 } }, { type: 'text', text: '   ' }],
+    [{ type: 'text' }],
+  ];
+  for (const [i, content] of contents.entries()) {
+    const r = await f.send('channels/incoming', { messages: [
+      { ...f.channel(`e${i}`, '', { initial: true }, 'chat', `coalesced${i}`), content },
+      { channelId: 'chat', messageId: `plain${i}`, timestamp: TS, author: { id: 'u', name: 'User' }, content },
+    ] });
+    assert.deepEqual(r.result.results.map((x: { accepted: boolean; reason?: string }) => [x.accepted, x.reason]),
+      [[false, 'empty_content'], [false, 'empty_content']], JSON.stringify(content));
+    const coalesced = await f.send('push/event', { ...f.params(`p${i}`, '', { initial: true }), payload: { content } });
+    const { coalesce: _coalesce, ...uncoalesced } = f.params(`q${i}`, '');
+    const plain = await f.send('push/event', { ...uncoalesced, payload: { content } });
+    assert.equal(coalesced.error?.code, -32602, JSON.stringify(content));
+    assert.equal(plain.error?.code, -32602, JSON.stringify(content));
+  }
+});
+
+test('content whose blocks aren\'t objects, or whose block of another type carries a text field, is still admitted uncoalesced on both lanes, as its placeholder', async (t) => {
+  const f = await fixture(); t.after(f.close); await f.register();
+  f.alwaysRespond();
+  // Only a text block shown as the non-string text placeholder counts as
+  // nothing; any other placeholder still counts as something.
+  for (const [i, content, shows] of [[0, [424242], 'untyped'], [1, [{ type: 'video', text: 5 }], 'video']] as const) {
+    const r = await f.send('channels/incoming', { messages: [
+      { channelId: 'chat', messageId: `plain${i}`, timestamp: TS, author: { id: 'u', name: 'User' }, content },
+    ] });
+    assert.deepEqual(r.result.results.map((x: { accepted: boolean }) => x.accepted), [true]);
+    const { coalesce: _coalesce, ...uncoalesced } = f.params(`q${i}`, '');
+    const plain = await f.send('push/event', { ...uncoalesced, payload: { content } });
+    assert.equal(plain.error, undefined);
+    assert.equal(plain.result.accepted, true);
+    await f.framework.runUntilIdle();
+    assert.equal(occurrences(f.context(), JSON.stringify(`[unrecognized content block: ${shows}]`)), 2);
+  }
+});
+
+test('a context injection\'s text block whose text isn\'t a string shows as the same placeholder, in the system prompt too', async (t) => {
+  const server = {
+    id: 'editor',
+    grant: new CapabilityGrant(new Set(['contextHooks.beforeInference.inject.system']), []),
+    sendBeforeInference: async () => ({
+      featureSet: 'doc',
+      contextInjections: [{
+        namespace: 'notes', position: 'system',
+        content: [{ type: 'text', text: { toString: 1 } }, { type: 'text', text: 'injected_text' }],
+      }],
+    }),
+  };
+  const hooks = new HookOrchestrator({ getAllServers: () => [server] } as never, { validateInbound: () => {} } as never);
+  const injections = await hooks.beforeInference({} as never);
+  // The words themselves, which every other test takes from the constant.
+  const placeholder = "[Text not shown: the server's text block had no string text.]";
+  assert.equal(NON_STRING_TEXT_PLACEHOLDER, placeholder);
+  assert.deepEqual(injections.map((injection) => injection.content), [
+    [{ type: 'text', text: placeholder }, { type: 'text', text: 'injected_text' }],
+  ]);
+  // A system injection's text is joined into the system prompt as it
+  // arrives, so a block the converter passed through would read there as
+  // String(text); { toString: 1 } has no string form at all.
+  const f = await fixture(); t.after(f.close);
+  (f.framework as unknown as { hookOrchestrator: HookOrchestrator }).hookOrchestrator = hooks;
+  const request = await f.framework.previewActivation('agent', { injections: true });
+  const system = (request as { system?: unknown }).system;
+  assert.equal(typeof system, 'string');
+  assert.ok((system as string).endsWith(`test\n${placeholder}\ninjected_text`), system as string);
+});
+
+test('a malformed block in one server\'s injection shows as its placeholder, as it would pushed, and every server\'s injections still arrive', async () => {
+  const server = (id: string, content: unknown[]) => ({
+    id,
+    grant: new CapabilityGrant(new Set(['contextHooks.beforeInference.inject.system']), []),
+    sendBeforeInference: async () => ({
+      featureSet: 'doc',
+      contextInjections: [{ namespace: 'notes', position: 'system', content }],
+    }),
+  });
+  // A type with no string form threw while the injection was converted, and
+  // the framework's catch then dropped every server's injections for the
+  // turn. Data that isn't a string went to the provider as an image's base64,
+  // and an audio block's uri was written into its text.
+  const bad = server('bad', [
+    { type: { toString: 1 } },
+    { type: 'image', data: 123, mimeType: 'image/png' },
+    { type: 'audio', uri: 'https://example.com/a.mp3' },
+  ]);
+  const good = server('good', [{ type: 'text', text: 'good_text' }]);
+  const hooks = new HookOrchestrator({ getAllServers: () => [bad, good] } as never, { validateInbound: () => {} } as never);
+  const injections = await hooks.beforeInference({} as never);
+  assert.deepEqual(injections.map((injection) => injection.content), [
+    [
+      { type: 'text', text: '[unrecognized content block: untyped]' },
+      { type: 'text', text: '[Image: no data]' },
+      { type: 'text', text: '[Audio: no data]' },
+    ],
+    [{ type: 'text', text: 'good_text' }],
+  ]);
+});
+
+test('an injection the host can\'t read is left out, with a console line, and every other injection still arrives', async (t) => {
+  const lines: string[] = [];
+  t.mock.method(console, 'error', (...args: unknown[]) => { lines.push(args.map(String).join(' ')); });
+  const server = (id: string, contextInjections: unknown) => ({
+    id,
+    grant: new CapabilityGrant(new Set(['contextHooks.beforeInference.inject.system']), []),
+    sendBeforeInference: async () => ({ featureSet: 'doc', contextInjections }),
+  });
+  // Each of these used to throw out of the hook, and the framework's catch
+  // around the whole hook then dropped every server's injections for the
+  // turn: a null block, content that isn't an array, a null injection, a
+  // position with no string form, and an answer whose injections aren't a
+  // list. The position is refused as one outside the grant, and the rest
+  // as unreadable.
+  const bad = server('bad', [
+    { namespace: 'a', position: 'system', content: [null, { type: 'text', text: 'lost_beside_null' }] },
+    { namespace: 'b', position: 'system', content: 5 },
+    null,
+    { namespace: 'e', position: { toString: 1 }, content: [{ type: 'text', text: 'lost_with_its_position' }] },
+    { namespace: 'c', position: 'system', content: [{ type: 'text', text: 'kept_from_bad' }] },
+  ]);
+  const odd = server('odd', { length: 1 });
+  const good = server('good', [{ namespace: 'd', position: 'system', content: [{ type: 'text', text: 'kept_from_good' }] }]);
+  const hooks = new HookOrchestrator({ getAllServers: () => [bad, odd, good] } as never, { validateInbound: () => {} } as never);
+  const injections = await hooks.beforeInference({} as never);
+  assert.deepEqual(injections.map((injection) => injection.content), [
+    [{ type: 'text', text: 'kept_from_bad' }],
+    [{ type: 'text', text: 'kept_from_good' }],
+  ]);
+  const dropped = '[mcpl] bad: dropped beforeInference injection at position ';
+  assert.equal(lines.filter((line) => line.startsWith(dropped) && line.includes(' — it couldn\'t be read: ')).length, 3, lines.join('\n'));
+  assert.equal(lines.filter((line) => line.startsWith(dropped) && line.endsWith(' — not in the effective grant (§10.8)')).length, 1, lines.join('\n'));
+  assert.deepEqual(lines.filter((line) => line.startsWith('[mcpl] odd: ')), ['[mcpl] odd: dropped its beforeInference injections — contextInjections isn\'t an array']);
+});
+
+test('an injection whose namespace can\'t be read as text is left out, and any other namespace that isn\'t a string reaches the agent as before, named once per server', async (t) => {
+  const lines: string[] = [];
+  t.mock.method(console, 'error', (...args: unknown[]) => { lines.push(args.map(String).join(' ')); });
+  const server = (id: string, contextInjections: unknown[]) => ({
+    id,
+    grant: new CapabilityGrant(new Set(['contextHooks.beforeInference.inject.system', 'contextHooks.beforeInference.inject.afterUser']), []),
+    sendBeforeInference: async () => ({ featureSet: 'doc', contextInjections }),
+  });
+  // context-manager writes an afterUser or beforeUser injection's namespace
+  // into a participant's name, as its text, as it builds the request, and
+  // never reads a system injection's. One with no text form threw there,
+  // after the hook's catch, and failed the whole request; any other reached
+  // the agent, and still does.
+  const bad = server('bad', [
+    { namespace: { toString: 1 }, position: 'afterUser', content: [{ type: 'text', text: 'lost_no_text_form' }] },
+    { namespace: { toString: 1 }, position: 'system', content: [{ type: 'text', text: 'lost_system_no_text_form' }] },
+    { namespace: 5, position: 'afterUser', content: [{ type: 'text', text: 'kept_number' }] },
+    { position: 'system', content: [{ type: 'text', text: 'kept_missing' }] },
+  ]);
+  const good = server('good', [{ namespace: 'notes', position: 'afterUser', content: [{ type: 'text', text: 'kept_from_good' }] }]);
+  const hooks = new HookOrchestrator({ getAllServers: () => [bad, good] } as never, { validateInbound: () => {} } as never);
+  const f = await fixture(); t.after(f.close);
+  (f.framework as unknown as { hookOrchestrator: HookOrchestrator }).hookOrchestrator = hooks;
+  const unreadable = (position: string) => `[mcpl] bad: dropped beforeInference injection at position ${position} — it couldn't be read: ${logDetail("its namespace isn't a string and can't be read as text")}`;
+  for (const turn of [1, 2]) {
+    const request = await f.framework.previewActivation('agent', { injections: true }) as unknown as { system?: unknown; messages: Array<{ participant: string; content: unknown }> };
+    const whole = JSON.stringify(request);
+    assert.ok(whole.includes('kept_from_good'), whole);
+    assert.ok(!whole.includes('lost_no_text_form') && !whole.includes('lost_system_no_text_form'), whole);
+    assert.equal(request.messages.find((m) => JSON.stringify(m.content).includes('kept_number'))?.participant, 'system_context:5', whole);
+    assert.ok(JSON.stringify(request.system).includes('kept_missing'), whole);
+    assert.equal(lines.filter((line) => line === unreadable('afterUser')).length, turn, lines.join('\n'));
+    assert.equal(lines.filter((line) => line === unreadable('system')).length, turn, lines.join('\n'));
+  }
+  // A server's first namespace that isn't a string, and only that one, is
+  // named, with what it does: it keeps the injection to no channel, and it's
+  // read as its text where it names a participant.
+  assert.deepEqual(lines.filter((line) => line.includes('namespace isn\'t a string, which')), [
+    '[mcpl] bad: a beforeInference injection\'s namespace isn\'t a string, which §10.4 requires, so it keeps the injection to no channel and every agent gets it; where it names a participant, it\'s read as its text, 5; this line prints once per server while the host runs',
+  ]);
+});
+
+test('a position the grant refuses prints as one field of one line, whatever it holds', async (t) => {
+  const lines: string[] = [];
+  t.mock.method(console, 'error', (...args: unknown[]) => { lines.push(args.map(String).join(' ')); });
+  const forged = 'bogus" — x\n[mcpl] other: forged line';
+  const server = {
+    id: 'bad',
+    grant: new CapabilityGrant(new Set(['contextHooks.beforeInference.inject.system']), []),
+    sendBeforeInference: async () => ({ featureSet: 'doc', contextInjections: [{ namespace: 'n', position: forged, content: [{ type: 'text', text: 'x' }] }] }),
+  };
+  const hooks = new HookOrchestrator({ getAllServers: () => [server] } as never, { validateInbound: () => {} } as never);
+  assert.deepEqual(await hooks.beforeInference({} as never), []);
+  assert.deepEqual(lines, [`[mcpl] bad: dropped beforeInference injection at position ${logValue(forged)} — not in the effective grant (§10.8)`]);
+  assert.ok(!lines[0]!.includes('\n'), lines[0]);
+});
+
+test('a reference stub names the lane its block came on: a channel message, a pushed event or an injection', async (t) => {
+  const f = await fixture(); t.after(f.close); await f.register();
+  f.alwaysRespond();
+  const content = [{ type: 'resource', uri: 'https://host/files?path=x.wav', mimeType: 'audio/wav', sizeBytes: 1000, name: 'x.wav', disposition: 'never' }];
+  const r = await f.send('channels/incoming', { messages: [
+    { channelId: 'chat', messageId: 'plain', timestamp: TS, author: { id: 'u', name: 'User' }, content },
+  ] });
+  assert.deepEqual(r.result.results.map((x: { accepted: boolean }) => x.accepted), [true]);
+  const { coalesce: _coalesce, ...uncoalesced } = f.params('q1', '');
+  const plain = await f.send('push/event', { ...uncoalesced, payload: { content } });
+  assert.equal(plain.result.accepted, true);
+  await f.framework.runUntilIdle();
+  assert.equal(occurrences(f.context(), 'attachment on channel message'), 1);
+  assert.equal(occurrences(f.context(), 'attachment on push event'), 1);
+  const server = {
+    id: 'editor',
+    grant: new CapabilityGrant(new Set(['contextHooks.beforeInference.inject.system']), []),
+    sendBeforeInference: async () => ({ featureSet: 'doc', contextInjections: [{ namespace: 'notes', position: 'system', content }] }),
+  };
+  const hooks = new HookOrchestrator({ getAllServers: () => [server] } as never, { validateInbound: () => {} } as never);
+  const [injection] = await hooks.beforeInference({} as never);
+  assert.equal(occurrences(JSON.stringify(injection?.content), 'attachment on context injection'), 1);
+});
+
+test('a tool result\'s text block whose text isn\'t a string shows as the same placeholder, alone or beside text', { timeout: 10_000 }, async (t) => {
+  const results: Record<string, unknown> = {
+    beside: { content: [{ type: 'text', text: null }, { type: 'text', text: 'found_text' }] },
+    alone: { content: [{ type: 'text', text: { a: 1 } }] },
+    // An empty string is still dropped from the join, as before.
+    blank: { content: [{ type: 'text', text: '' }, { type: 'text', text: 'found_text' }] },
+    // An error's text is its message, so such a text is the error's words.
+    error: { isError: true, content: [{ type: 'text', text: { a: 1 } }] },
+  };
+  const f = await fixture({
+    tools: [{ name: 'lookup', description: 'Look something up.', inputSchema: { type: 'object' } }],
+    toolsCall: (params) => results[(params.arguments as { case: string }).case],
+  });
+  t.after(f.close);
+  const internals = f.framework as unknown as { pushEvent(event: unknown): void; dispatchToolCall(agent: string, call: unknown): void };
+  const call = (id: string) => new Promise<{ data?: unknown; error?: unknown }>((resolve) => {
+    const original = internals.pushEvent;
+    internals.pushEvent = (event: unknown) => {
+      const e = event as { type: string; callId?: string; result?: { data?: unknown } };
+      if (e.type === 'tool-result' && e.callId === id) { internals.pushEvent = original; resolve(e.result!); }
+      else original.call(internals, event);
+    };
+    internals.dispatchToolCall('agent', { id, name: 'mcpl--editor--lookup', input: { case: id } });
+  });
+  assert.equal((await call('beside')).data, `${NON_STRING_TEXT_PLACEHOLDER}\nfound_text`);
+  assert.equal((await call('alone')).data, NON_STRING_TEXT_PLACEHOLDER);
+  assert.equal((await call('blank')).data, 'found_text');
+  assert.equal((await call('error')).error, NON_STRING_TEXT_PLACEHOLDER);
+});
+
 test('an inference filter reads the text conversion stores, a placeholder included, on both lanes, coalesced or not', async (t) => {
   const seen: string[] = [];
   const f = await fixture({ server: { shouldTriggerInference: (text: string) => { seen.push(text); return false; } } });
   t.after(f.close); await f.register();
-  // A text block whose text isn't a string, which reads as no text; a block
-  // that converts to a placeholder; and visible text.
+  // A text block whose text isn't a string, and a block of a type the host
+  // doesn't handle, each of which converts to its placeholder; and visible
+  // text.
   const content = [{ type: 'text', text: { toString: 1 } }, { type: 'video', uri: 'https://example.invalid/v.mp4' }, { type: 'text', text: 'visible_text' }];
-  const shown = '\n[unrecognized content block: video]\nvisible_text';
+  const shown = `${NON_STRING_TEXT_PLACEHOLDER}\n[unrecognized content block: video]\nvisible_text`;
   const r = await f.send('channels/incoming', { messages: [
     { ...f.channel('e1', '', { initial: true }, 'chat', 'coalesced'), content },
     { channelId: 'chat', messageId: 'plain', timestamp: TS, author: { id: 'u', name: 'User' }, content },
@@ -322,7 +583,7 @@ test('an inference filter reads the text conversion stores, a placeholder includ
   assert.equal(coalesced.result?.accepted, true);
   assert.equal(plain.result?.accepted, true);
   // Each lane joins its converted text blocks with a line break, the
-  // non-string one as empty text and the video as its placeholder.
+  // non-string text and the video each as its placeholder.
   assert.deepEqual(seen, [shown, shown, 'sibling_text', shown, shown],
     'the filter gets the same text on both lanes, and is reached for every message');
 });

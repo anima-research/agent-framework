@@ -611,7 +611,7 @@ function seedHostManaged(storePath: string, server: string, featureSet: string, 
 /** The refusal of a host-managed state read before its server connects, or, with `registration`, when its feature set registers. */
 const hostStateUnreadable = (server: string, featureSet: string, when: 'before-connect' | 'registration' = 'before-connect'): RegExp => new RegExp(
   `^the host-managed state of feature set "${featureSet}" on MCPL server "${server}" \\(mcpl/state/${server}/${featureSet}\\) could not ` +
-  `be read: injected EIO reading mcpl/state/${server}/${featureSet}\\. ` +
+  `be registered or read: injected EIO reading mcpl/state/${server}/${featureSet}\\. ` +
   (when === 'before-connect'
     ? `Neither create\\(\\) with the server configured nor a connectMcplServer\\(\\) of it goes on without it, since the feature set's ` +
       `next checkpoint would store over it\\. It's unchanged, and they go on once it can be read\\.$`

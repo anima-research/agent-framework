@@ -13,6 +13,7 @@
  */
 
 import type { JsStore } from '@animalabs/chronicle';
+import { ensureStateRegistered } from '../module-registry.js';
 
 import type { StateCheckpoint, JsonPatchOperation } from './types.js';
 
@@ -218,11 +219,7 @@ export class CheckpointManager {
     this.emitTraceFn = emitTraceFn;
 
     // Register the checkpoint metadata state slot
-    try {
-      store.registerState({ id: CHECKPOINTS_STATE_ID, strategy: 'snapshot' });
-    } catch {
-      // Already registered (e.g. framework restart)
-    }
+    ensureStateRegistered(store, { id: CHECKPOINTS_STATE_ID, strategy: 'snapshot' });
 
     // Load existing tree from Chronicle
     this.loadFromStore();
@@ -253,8 +250,9 @@ export class CheckpointManager {
       currentState: undefined,
       nodes: new Map(),
     };
-    // Read before the tree is held, so a registration that fails here is
-    // made whole by the next one.
+    // The state's slot is registered, and its stored value read, before the
+    // tree is held, so a registration that fails here leaves nothing behind
+    // and is made whole by the next one (a reconnect's re-run).
     if (opts.hostState) this.loadHostState(serverId, featureSet, tree, 'registration');
     this.trees.set(key, tree);
 
@@ -559,11 +557,12 @@ export class CheckpointManager {
   }
 
   /** A host-managed feature set's stored state, read into its tree; nothing
-   *  stored leaves it unset. A read that fails throws, naming the state:
-   *  taken as nothing stored, the next patch would apply to nothing and
-   *  store over it. `when` says what the refusal stops: a restored tree's
-   *  read comes before its server connects, and a feature set with no tree
-   *  is read when it registers, once its server has connected. */
+   *  stored leaves it unset. A registration or read that fails throws,
+   *  naming the state: taken as nothing stored, the next patch would apply
+   *  to nothing and store over it. `when` says what the refusal stops: a
+   *  restored tree's read comes before its server connects, and a feature
+   *  set with no tree is read when it registers, once its server has
+   *  connected. */
   private loadHostState(
     serverId: string,
     featureSet: string,
@@ -571,18 +570,14 @@ export class CheckpointManager {
     when: 'before-connect' | 'registration',
   ): void {
     const stateId = this.stateId(serverId, featureSet);
-    try {
-      this.store.registerState({ id: stateId, strategy: 'snapshot' });
-    } catch {
-      // Already registered
-    }
     let existing: unknown;
     try {
+      ensureStateRegistered(this.store, { id: stateId, strategy: 'snapshot' });
       existing = this.store.getStateJson(stateId);
     } catch (error) {
       throw new Error(
         `the host-managed state of feature set "${featureSet}" on MCPL server "${serverId}" (${stateId}) could not ` +
-          `be read: ${thrownText(error)}. ` +
+          `be registered or read: ${thrownText(error)}. ` +
           (when === 'before-connect'
             ? `Neither create() with the server configured nor a connectMcplServer() of it goes on without it, since ` +
               `the feature set's next checkpoint would store over it. It's unchanged, and they go on once it can be read.`

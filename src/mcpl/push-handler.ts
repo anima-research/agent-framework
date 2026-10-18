@@ -8,10 +8,9 @@
  */
 
 import type { ContentBlock } from '@animalabs/membrane';
-import { INLINE_WITHHELD_TEXT, isInlineContradiction, referenceStubOrNull } from './references.js';
+import { convertBlock } from './convert-block.js';
 
 import type {
-  McplContentBlock,
   PushEventParams,
   PushEventResult,
 } from './types.js';
@@ -19,7 +18,7 @@ import type { FeatureSetManager } from './feature-set-manager.js';
 import { McplFeatureSetError } from './feature-set-manager.js';
 import { expandCoreTags } from './tags.js';
 import { coalesceRejectionReason, EmptyContentError, validateCoalescedContent } from './push-coalescer.js';
-import { isSilentHeartbeatMarker, isVisiblyEmptyContent } from './visible-content.js';
+import { isSilentHeartbeatMarker, isVisiblyEmptyConversion } from './visible-content.js';
 import { logDetail, logValue } from './log-value.js';
 import { RefusalLines } from './refusal-lines.js';
 
@@ -50,91 +49,6 @@ export interface McplPushEvent {
   coalescingSubject?: string;
   /** RFC-006 assembly: materialized for this agent's turn (store directly). */
   assemblingFor?: string;
-}
-
-// ============================================================================
-// Content conversion: McplContentBlock → membrane ContentBlock
-// ============================================================================
-
-/**
- * Convert a single MCPL wire-format content block to a membrane ContentBlock,
- * as the channel lane's convertBlock (channel-registry.ts) does, apart from
- * the provenance its reference stubs name. Hook context injections convert
- * through hook-orchestrator.ts's own.
- */
-export function convertBlock(block: McplContentBlock): ContentBlock {
-  switch (block.type) {
-    case 'text':
-      // Text that isn't a string is no text, as the request sanitizer and
-      // the visible-content check already read it.
-      return { type: 'text', text: typeof block.text === 'string' ? block.text : '' };
-
-    case 'image':
-      if (isInlineContradiction(block)) {
-        // RFC-005 vector 2: inline data claiming bulk disposition — fail
-        // closed, withhold the data (checked BEFORE the data branch).
-        return { type: 'text', text: INLINE_WITHHELD_TEXT };
-      }
-      if (isFilledString(block.uri) && block.disposition) {
-        // RFC-005 uri-form media with a disposition claim: stub, do not
-        // hand the URI to the provider or inline it.
-        return { type: 'text', text: referenceStubOrNull(block, 'attachment on push event') ?? '[reference]' };
-      }
-      if (isFilledString(block.data) && isFilledString(block.mimeType)) {
-        return {
-          type: 'image',
-          source: { type: 'base64', data: block.data, mediaType: block.mimeType },
-        } as ContentBlock;
-      }
-      if (isFilledString(block.uri)) {
-        return {
-          type: 'image',
-          source: { type: 'url', url: block.uri },
-        } as ContentBlock;
-      }
-      return { type: 'text', text: isFilledString(block.data) ? '[Image: no media type]' : '[Image: no data]' };
-
-    case 'audio':
-      if (isInlineContradiction(block)) {
-        // RFC-005 vector 2: inline data claiming bulk disposition — fail
-        // closed, withhold the data (checked BEFORE the data branch).
-        return { type: 'text', text: INLINE_WITHHELD_TEXT };
-      }
-      if (isFilledString(block.uri) && block.disposition) {
-        // RFC-005 uri-form media with a disposition claim: stub, do not
-        // hand the URI to the provider or inline it.
-        return { type: 'text', text: referenceStubOrNull(block, 'attachment on push event') ?? '[reference]' };
-      }
-      if (isFilledString(block.data) && isFilledString(block.mimeType)) {
-        return {
-          type: 'audio',
-          source: { type: 'base64', data: block.data, mediaType: block.mimeType },
-        } as ContentBlock;
-      }
-      return { type: 'text', text: isFilledString(block.data) ? '[Audio: no media type]' : '[Audio: no data]' };
-
-    case 'resource':
-      // RFC-005: reference blocks become bounded stubs — never raw URIs
-      // (a signed URL is a bearer credential that looks like a location).
-      return { type: 'text', text: referenceStubOrNull(block, 'attachment on push event') ?? '[reference]' };
-
-    default: {
-      // Unknown wire block types previously fell off the exhaustive switch
-      // and propagated `undefined` into ContentBlock[]. Fail visibly. A type
-      // that isn't a string is no type, and is never converted to one: an
-      // object can throw when it is.
-      const type: unknown = (block as { type?: unknown }).type;
-      return { type: 'text', text: `[unrecognized content block: ${typeof type === 'string' ? type : 'untyped'}]` };
-    }
-  }
-}
-
-/** A string with something in it: the only data, mimeType or uri a block's
- *  source is built from, and the only uri that makes it a reference. Anything
- *  else a sender puts there leaves the block without it, so conversion never
- *  throws and never copies a non-string. */
-function isFilledString(value: unknown): value is string {
-  return typeof value === 'string' && value !== '';
 }
 
 // ============================================================================
@@ -275,8 +189,8 @@ export class PushHandler {
 
     // 2. Convert content blocks, and refuse content with nothing visible in
     // it — before dedup, so a refused eventId is not burned for a retry.
-    const content: ContentBlock[] = params.payload.content.map(convertBlock);
-    if (!emptyAllowed && isVisiblyEmptyContent(content)) {
+    const content: ContentBlock[] = params.payload.content.map((block) => convertBlock(block, 'attachment on push event'));
+    if (!emptyAllowed && isVisiblyEmptyConversion(params.payload.content, content)) {
       const err = new EmptyContentError();
       this.traceEmptyRejection(serverId, params);
       if (responder?.respondError) responder.respondError(err.code, err.message, { field: err.field });

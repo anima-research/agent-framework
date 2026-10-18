@@ -8,7 +8,14 @@
  * Spec reference: Section 11 (Server-Initiated Inference).
  */
 
-import type { Membrane, ContentBlock, NormalizedRequest } from '@animalabs/membrane';
+import type {
+  Membrane,
+  ContentBlock,
+  NormalizedRequest,
+  NormalizedResponse,
+  StopReason,
+  ToolCall,
+} from '@animalabs/membrane';
 
 import type {
   McplInferenceRequestParams,
@@ -61,6 +68,87 @@ function wildcardMatch(pattern: string, name: string): boolean {
 }
 
 // ============================================================================
+// Results
+// ============================================================================
+
+/**
+ * The inference/request result for a completed inference, the same for both
+ * modes: the response's text, why it stopped, and its usage.
+ *
+ * A response MCPL can't report as a completion throws, and is answered with
+ * the error: one the provider ended with an error, one where the model wrote a
+ * tool call, since inference/request offers the model none, and one with a
+ * stop reason FinishReason has no value for (see finishReasonFor).
+ */
+function resultFrom(response: NormalizedResponse, model: string): McplInferenceRequestResult {
+  // A provider can end an inference with finish_reason 'error' and no error
+  // object. membrane 0.5.87's OpenAI-style adapters fail a stream on a frame
+  // that carries one, as OpenRouter's mid-stream error does, but pass the token
+  // alone through, and membrane, having no stop reason for it, normalizes it
+  // to end_turn and keeps it as providerReason.
+  if (response.details.stop.providerReason === 'error') {
+    throw new Error("The provider ended the inference with an error (finish_reason 'error')");
+  }
+  // membrane's yielding stream lists a native tool call in toolCalls only
+  // when the stop was tool_use, so a tool_use block cut off by another stop is
+  // only in the content. membrane's complete() lists every tool_use block in
+  // toolCalls, whatever the stop.
+  const toolUses = response.content.filter((b: ContentBlock): b is ContentBlock & { type: 'tool_use' } => b.type === 'tool_use');
+  if (response.toolCalls.length > 0 || toolUses.length > 0) {
+    throw toolCallError(response.toolCalls.length > 0 ? response.toolCalls : toolUses);
+  }
+  // In XML tool mode membrane reads tool calls out of the text. Markup it
+  // reads no call from still shows in how the output ended: with a tool-call
+  // block still open (a call cut off at max_tokens, or an opening tag written
+  // in prose), or at `</function_calls>`, the stop sequence XML tool mode adds
+  // so that it can run calls (inference/request asks for no stop sequence of
+  // its own). Either way the markup is in the text.
+  if (response.details.stop.unclosedToolBlock) {
+    throw new Error("The model's output ended with a tool-call block still open, and inference/request offers no tools");
+  }
+  if (response.details.stop.triggeredSequence === '</function_calls>') {
+    throw new Error('The model wrote tool-call markup, and inference/request offers no tools');
+  }
+  return {
+    content: response.content
+      .filter((b: ContentBlock): b is ContentBlock & { type: 'text' } => b.type === 'text')
+      .map((b) => b.text)
+      .join(''),
+    model,
+    finishReason: finishReasonFor(response.stopReason),
+    usage: {
+      inputTokens: response.usage.inputTokens,
+      outputTokens: response.usage.outputTokens,
+    },
+  };
+}
+
+/**
+ * MCPL's finishReason for membrane's stop reason. Spec §11.3 closes
+ * FinishReason at these three, so any other stop throws: `end_turn` for a
+ * refusal, or for a turn membrane's resumption guard ended (`no_progress`,
+ * `round_limit`), would tell the server the model had finished.
+ */
+function finishReasonFor(stopReason: StopReason): McplInferenceRequestResult['finishReason'] {
+  switch (stopReason) {
+    case 'end_turn':
+    case 'max_tokens':
+    case 'stop_sequence':
+      return stopReason;
+    default:
+      throw new Error(
+        `The inference ended with stop reason '${stopReason}', for which inference/request has no finishReason`,
+      );
+  }
+}
+
+/** The error for a model that called a tool, which inference/request doesn't offer. */
+function toolCallError(calls: Array<Pick<ToolCall, 'name'>>): Error {
+  const names = calls.map((call) => call.name).join(', ');
+  return new Error(`The model called a tool (${names}), and inference/request offers none`);
+}
+
+// ============================================================================
 // Constants
 // ============================================================================
 
@@ -101,9 +189,10 @@ export class InferenceRouter {
    * 1. Validate feature set
    * 2. Check loop prevention (reject if inside a hook)
    * 3. Resolve model from routing policy
-   * 4. Build membrane request and run inference
-   * 5. Optionally stream chunks
-   * 6. Return result via responder
+   * 4. Build membrane request
+   * 5. Run inference, streaming its visible text as chunks when asked
+   * 6. Answer with the result, or with the error for any ending that isn't
+   *    a completion
    */
   async handleInferenceRequest(
     serverId: string,
@@ -161,49 +250,42 @@ export class InferenceRouter {
       },
     };
 
+    // Streaming needs a way to send chunks and an id to tag them with;
+    // without either, the request is answered whole.
+    const chunkRequestId = params.stream && this.sendChunkFn ? responder.requestId : undefined;
+    const streamed = chunkRequestId != null;
+
     try {
-      // 5. Run inference
-      if (params.stream && this.sendChunkFn && responder.requestId != null) {
-        // Streaming mode
-        await this.handleStreaming(serverId, model, request, responder);
-      } else {
-        // Non-streaming mode
-        const response = await this.membrane.complete(request);
+      // 5. Run inference. Both modes end in membrane's response, and one
+      // builder makes the result from it.
+      const response = chunkRequestId != null
+        ? await this.streamResponse(serverId, request, chunkRequestId)
+        : await this.membrane.complete(request);
 
-        // Extract text content from response
-        const contentText = response.content
-          .filter((b: ContentBlock): b is ContentBlock & { type: 'text' } => b.type === 'text')
-          .map((b: ContentBlock & { type: 'text' }) => b.text)
-          .join('');
+      // 6. Answer
+      const result = resultFrom(response, model);
 
-        const result: McplInferenceRequestResult = {
-          content: contentText,
-          model,
-          finishReason: this.mapStopReason(response.stopReason),
-          usage: {
-            inputTokens: response.usage.inputTokens,
-            outputTokens: response.usage.outputTokens,
-          },
-        };
+      this.emitTraceFn({
+        type: 'mcpl:inference_complete',
+        serverId,
+        model,
+        inputTokens: result.usage.inputTokens,
+        outputTokens: result.usage.outputTokens,
+        streamed,
+      });
 
-        // Emit trace: inference complete
-        this.emitTraceFn({
-          type: 'mcpl:inference_complete',
-          serverId,
-          model,
-          inputTokens: result.usage.inputTokens,
-          outputTokens: result.usage.outputTokens,
-        });
-
-        responder.respond(result);
-      }
+      responder.respond(result);
     } catch (err) {
-      // Emit trace: inference failed
+      // Every ending that isn't a completion lands here, in either mode:
+      // membrane's error, a stream that stopped early, a tool call, or a
+      // stop FinishReason can't name. The answer is the JSON-RPC error, never
+      // a result carrying what arrived.
       this.emitTraceFn({
         type: 'mcpl:inference_fail',
         serverId,
         model,
         error: err instanceof Error ? err.message : String(err),
+        streamed,
       });
 
       responder.respondError(
@@ -263,73 +345,49 @@ export class InferenceRouter {
   // ==========================================================================
 
   /**
-   * Handle streaming inference by sending chunks back to the server.
+   * Run the inference as a stream, sending each visible text delta to the
+   * server as an inference/chunk, and return membrane's response once the
+   * stream completes.
    *
-   * Uses membrane.streamYielding when available; falls back to non-streaming
-   * membrane.complete otherwise.
+   * Every other ending throws, so the request is answered with the error
+   * rather than with the text that arrived: membrane's `error`, an `aborted`
+   * stream, a stream that ends with no terminal event, and `tool-calls`. A
+   * stream that has yielded tool calls waits for their results until it is
+   * cancelled, and inference/request offers the model no tools. Leaving the
+   * loop by return or throw calls the stream's return(), which cancels it,
+   * so nothing keeps running once the request is answered.
    */
-  private async handleStreaming(
+  private async streamResponse(
     serverId: string,
-    model: string,
     request: NormalizedRequest,
-    responder: Responder,
-  ): Promise<void> {
-    const requestId = responder.requestId!;
-
-    // Check if streamYielding is available on the membrane instance.
-    // We use streamYielding to iterate events and forward text deltas as chunks.
+    requestId: string | number,
+  ): Promise<NormalizedResponse> {
     const stream = this.membrane.streamYielding(request);
-    let chunkIndex = 0;
-    let fullContent = '';
+    let index = 0;
 
     for await (const event of stream) {
-      if (event.type === 'tokens' && 'content' in event) {
-        const delta = (event as { type: 'tokens'; content: string }).content;
-        fullContent += delta;
-        this.sendChunkFn!(serverId, {
-          requestId,
-          index: chunkIndex++,
-          delta,
-        });
+      switch (event.type) {
+        case 'tokens':
+          // Only text membrane marks visible is sent, which leaves out
+          // thinking and tool-call markup. The result's content is the
+          // response's text blocks, which membrane parses on its own, so in
+          // XML tool mode the chunks can miss text the content holds: prose
+          // naming a tag the stream parser opens a block for, or a thinking
+          // block cut off before its close tag.
+          if (event.meta.visible) {
+            this.sendChunkFn!(serverId, { requestId, index: index++, delta: event.content });
+          }
+          break;
+        case 'tool-calls':
+          throw toolCallError(event.calls);
+        case 'complete':
+          return event.response;
+        case 'error':
+          throw event.error;
+        case 'aborted':
+          throw new Error(`The inference stopped before it finished (${event.reason})`);
       }
     }
-
-    // After streaming completes, send the final result
-    const result: McplInferenceRequestResult = {
-      content: fullContent,
-      model,
-      finishReason: 'end_turn',
-      usage: { inputTokens: 0, outputTokens: 0 },
-    };
-
-    this.emitTraceFn({
-      type: 'mcpl:inference_complete',
-      serverId,
-      model,
-      streamed: true,
-    });
-
-    responder.respond(result);
-  }
-
-  // ==========================================================================
-  // Private: Helpers
-  // ==========================================================================
-
-  /**
-   * Map membrane's stopReason string to MCPL's finishReason enum.
-   */
-  private mapStopReason(
-    stopReason: string | undefined,
-  ): 'end_turn' | 'max_tokens' | 'stop_sequence' {
-    switch (stopReason) {
-      case 'max_tokens':
-        return 'max_tokens';
-      case 'stop_sequence':
-        return 'stop_sequence';
-      case 'end_turn':
-      default:
-        return 'end_turn';
-    }
+    throw new Error('The inference stream ended without a result');
   }
 }

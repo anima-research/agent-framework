@@ -75,7 +75,7 @@ import { ProcessQueueImpl } from './queue.js';
 import { DEFAULT_SHUTDOWN_TIMEOUT_MS, validateShutdownTimeout, shutdownErrorMessage, waitForShutdown, ShutdownTimeoutError } from './shutdown.js';
 import { REFUSAL_REACTIONS, REFUSAL_REACTION_FALLBACK, REFUSAL_REACTION_BASELINE } from './refusal-reactions.js';
 import { Agent } from './agent.js';
-import { ModuleRegistry, checkedToolResult, isStateExistsError, storableToolResult, thrownResult } from './module-registry.js';
+import { ModuleRegistry, checkedToolResult, ensureStateRegistered, storableToolResult, thrownResult } from './module-registry.js';
 import { McplServerRegistry } from './mcpl/server-registry.js';
 import { logValue } from './mcpl/log-value.js';
 import { FeatureSetManager } from './mcpl/feature-set-manager.js';
@@ -85,20 +85,22 @@ import { HookOrchestrator } from './mcpl/hook-orchestrator.js';
 import { ToolLifecycleEmitter, parseToolObserveParams, type ScriptCallOrigin } from './mcpl/tool-lifecycle.js';
 import { checkToolPattern, describeUnmatchedPattern, type PatternServer } from './mcpl/tool-pattern-check.js';
 import { BUILTIN_TOOL_CLASSES, normalizeClassTable, parseDeclaredClasses, resolveToolClass, type EffectiveToolClass, type ToolClass, type ToolClassSource } from './mcpl/tool-classes.js';
-import { PushHandler, convertBlock as convertPushBlock, type McplPushEvent } from './mcpl/push-handler.js';
+import { PushHandler, type McplPushEvent } from './mcpl/push-handler.js';
+import { convertBlock } from './mcpl/convert-block.js';
 import {
   PushCoalescer, CoalesceError, PUSH_COALESCING_SUPPORT, validateCoalesceMember, validateCoalescedContent,
   coalescingSubjectKey, type AssemblyResult, type CoalescedOccurrence, type CoalescingPlacement, type CoalescingSnapshot,
   type CoalescingReceiptRecord,
 } from './mcpl/push-coalescer.js';
 import type { ChannelIncomingMessage, ChannelIncomingMessageResult, McplContentBlock, PushEventResult } from './mcpl/types.js';
-import { isSilentHeartbeatMarker, isVisiblyEmptyContent } from './mcpl/visible-content.js';
+import { isSilentHeartbeatMarker, isVisiblyEmptyContent, NON_STRING_TEXT_PLACEHOLDER } from './mcpl/visible-content.js';
 import { parseProsePrefix, parseHybridProsePrefix } from './mcpl/prose-grammar.js';
 import { ProseStreamRouter } from './mcpl/prose-stream-router.js';
 import { detectKnownToolWrapperProse } from './tool-wrapper-prose-guard.js';
 import { InferenceRouter } from './mcpl/inference-router.js';
 import { ChannelRegistry, type ChannelToolOrigin } from './mcpl/channel-registry.js';
 import { ConversationRouter, CONVERSATION_ROUTING_DEPRECATION_NOTICE } from './mcpl/conversation-router.js';
+import type { IncomingMessageFacts, RoutingDecision } from './mcpl/conversation-router.js';
 import { safeSlice } from './safe-slice.js';
 import { ProviderWaits, EVERY_MODEL, isReleaseModel, withoutControls, type ProviderWait } from './provider-waits.js';
 import type { WorkspaceModule } from './modules/workspace/index.js';
@@ -459,6 +461,11 @@ import {
 const FRAMEWORK_STATE_ID = 'framework/state';
 /** Snapshot slot mirroring context writes deferred while quiesced (#122). */
 const DEFERRED_WRITES_ID = 'framework/deferred-writes';
+/** What a write of the deferred-write queue did: wrote the record (the
+ *  queue, or an empty one over a record that held one), had nothing to
+ *  write, or wrote nothing for a queue over the cap
+ *  (DEFERRED_WRITES_PERSIST_CAP_CHARS). */
+type DeferredWritesOutcome = 'written' | 'nothing' | 'over-cap';
 /** The event a coalesced occurrence delivers through — one per lane. */
 interface CoalescedChannelEvent {
   type: 'mcpl:channel-incoming';
@@ -488,9 +495,12 @@ type CoalescedDelivery =
 const COALESCING_STATE_ID = 'mcpl/coalescing';
 /** Receipts written since the last snapshot flush (bridges the throttle window). */
 const COALESCING_RECENT_ID = 'mcpl/coalescing-recent';
-/** Above this serialized size the deferred-write mirror is skipped (kept in
- *  memory only) rather than rewriting a multi-MB snapshot per deferral. */
-const DEFERRED_WRITES_PERSIST_CAP_BYTES = 4 * 1024 * 1024;
+/** When the deferred-write queue's JSON is longer than this, counted as the
+ *  string's length (UTF-16 code units, which the messages call characters),
+ *  its record isn't written at all and keeps what it last held, rather than
+ *  rewriting a multi-MB snapshot per deferral. quiesce() refuses a queue
+ *  over it, unless the call has `abandon` (writeDeferredWritesForQuiesce). */
+const DEFERRED_WRITES_PERSIST_CAP_CHARS = 4 * 1024 * 1024;
 
 /** Requests that CONTINUE a turn whose token is already held — a context-
  *  budget restart, or the non-streaming path's tool-results round. The
@@ -1031,6 +1041,21 @@ export class ResumeBlockedError extends Error {
 }
 
 /**
+ * Thrown by `quiesce()` without `abandon` when the queue of deferred context
+ * writes can't reach disk: it's over its cap, so its record can't hold it, or
+ * its write failed, and that error is the `cause`. So the queue as it
+ * stands isn't on disk. The host's mode is as it was, and the
+ * message names the ways out, among them quiescing with `abandon: true`,
+ * which goes on with the queue in memory.
+ */
+export class QuiesceBlockedError extends Error {
+  constructor(message: string, options?: { cause?: unknown }) {
+    super(message, options);
+    this.name = 'QuiesceBlockedError';
+  }
+}
+
+/**
  * How `runEphemeralToCompletion` rejects when a retryable provider failure
  * states a wait the run won't sleep: one longer than an ephemeral run sleeps
  * in its turn (600 s), an infinite one, or one that is `NaN`. The run ends at
@@ -1156,13 +1181,13 @@ const DEFAULT_MAINTENANCE_INTERVAL_MS = 5000;
 /** Bound one pass so a large backlog yields to inference and other agents. */
 const MAINTENANCE_TICKS_PER_PASS = 8;
 /** The teardownTimeoutMs a failed create() gives stop(): how long each of its
- *  cleanup waits, on operator operations and then on modules and MCPL servers
- *  together, may take. stop() leaves its deadline to its caller, who owns the
+ *  waits may take. stop() leaves its deadline to its caller, who owns the
  *  framework, but the caller of a failed create() never got one: unbounded, a
  *  module whose stop() never settles would turn a failed boot that exits into
- *  one that hangs. stop()'s other waits are on streams, the event loop,
- *  maintenance and guard annotations, which a framework create() never
- *  started has none of. */
+ *  one that hangs. A framework create() never started has no streams, event
+ *  loop, maintenance or guard annotations to wait on, so the waits that can
+ *  take it are on operator operations and then on modules and MCPL servers
+ *  together. */
 const FAILED_CREATE_TEARDOWN_TIMEOUT_MS = 30_000;
 
 /** Local per-residence provider admission (AF #114 bounded first slice). */
@@ -1762,6 +1787,13 @@ export class AgentFramework {
    * start. stop() waits until this set is empty before it tears down, unless
    * its wait budget runs out. */
   private readonly operatorOperations = new Set<{ label: string; promise: Promise<void> }>();
+  /** What a wait of stop()'s left running when its budget ran out, by its
+   * promise: a stream it cancelled or an event loop still in a call. A later
+   * stop() waits for each again, beside what it finds, whatever has happened
+   * since to the entry it was found under (a run's end removes its stream's,
+   * a start() replaces the loop), so a budget never lets the store close
+   * under work still running. Each leaves once it settles. */
+  private readonly leftRunning = new Map<Promise<unknown>, { label: string; kind: 'stream' | 'loop' }>();
   private membrane: Membrane;
   private queue: ProcessQueueImpl;
   private agents: Map<string, Agent> = new Map();
@@ -1987,9 +2019,20 @@ export class AgentFramework {
   /** Agents an abandon could not cancel (token held, no stream) — surfaced
    *  in HostModeStatus until the next quiesce/resume. */
   private lastUnabandonable: string[] = [];
-  /** True while the deferred-write queue has a persisted mirror (quiesced). */
+  /** True while the deferred-write queue is mirrored to its record, so each
+   *  change of it writes it: from a write of it that reached or may reach
+   *  the record, one that failed or met the cap unless quiesce() rejected
+   *  for it (deferredWritesFellBehind), or a boot that restored it, until a
+   *  write clears the record once the queue drains. */
   private deferredWritesPersisted = false;
-  private deferredWritesCapWarned = false;
+  /** True from a write of the queue that failed or met the cap, unless
+   *  quiesce() rejected for it, until one succeeds: a run of failures
+   *  (deferredWritesFellBehind). A quiesce({ abandon: true }) over the cap
+   *  goes on rather than rejecting, so its write begins a run too. */
+  private deferredWritesBehind = false;
+  /** True once the cap has been met in the current run, so its line is
+   *  logged once a run, whatever began the run. */
+  private deferredWritesCapLogged = false;
   /** Branch-independent recovery files (see FrameworkConfig.hostModePath /
    *  deferredWritesPath). Undefined → branch-local slot fallback. */
   private hostModePath: string | undefined;
@@ -2108,7 +2151,7 @@ export class AgentFramework {
    * ephemeral agents have isolated slots and are their own only readers.
    */
   private readonly sharedSlotAgents = new Set<Agent>();
-  /** Group commit: one fsync per event-loop turn, shared by every waiter. */
+  /** The coalescing commit in flight, if any (see commitCoalescingDurable). */
   private coalescingCommit: Promise<void> | null = null;
   private inferenceRouter: InferenceRouter | null = null;
   private channelRegistry: ChannelRegistry | null = null;
@@ -2123,6 +2166,9 @@ export class AgentFramework {
    * turn still lands in the right channel.
    */
   private conversationAgentHomes: Map<string, string> = new Map();
+  /** Forks being spawned, by channel id, each until its spawn settles (see
+   *  routeConversation). The promise never rejects. */
+  private readonly conversationSpawns = new Map<string, Promise<void>>();
   /** Last idle-TTL sweep timestamp. */
   private lastConversationSweep = 0;
 
@@ -2331,11 +2377,11 @@ export class AgentFramework {
    * released: the framework it had begun is stopped, with
    * FAILED_CREATE_TEARDOWN_TIMEOUT_MS as stop()'s teardownTimeoutMs, and a
    * store create() opened is closed even when that stop failed or timed out.
-   * stop() keeps an owned store open when its waits on operator operations,
-   * modules or MCPL servers fail or time out, so that it can be called again,
-   * but no one can call it on a framework that create() never returned. When
-   * the release doesn't finish cleanly, the rejection carries create()'s error
-   * and then the release's, and its message says what didn't finish.
+   * stop() keeps an owned store open when any of its waits fails or times
+   * out, so that it can be called again, but no one can call it on a
+   * framework that create() never returned. When the release doesn't finish
+   * cleanly, the rejection carries create()'s error and then the release's,
+   * and its message says what didn't finish.
    */
   private static async releaseFailedCreate(
     error: unknown,
@@ -2383,42 +2429,21 @@ export class AgentFramework {
     building: { framework?: AgentFramework },
   ): Promise<AgentFramework> {
     // Register framework states
-    try {
-      store.registerState({ id: FRAMEWORK_STATE_ID, strategy: 'snapshot' });
-    } catch {
-      // Already registered
-    }
-    try {
-      store.registerState({ id: DEFERRED_WRITES_ID, strategy: 'snapshot' });
-    } catch {
-      // Already registered
-    }
+    ensureStateRegistered(store, { id: FRAMEWORK_STATE_ID, strategy: 'snapshot' });
+    ensureStateRegistered(store, { id: DEFERRED_WRITES_ID, strategy: 'snapshot' });
     for (const id of [COALESCING_STATE_ID, COALESCING_RECENT_ID]) {
-      try {
-        store.registerState({ id, strategy: 'snapshot' });
-      } catch {
-        // Already registered
-      }
+      ensureStateRegistered(store, { id, strategy: 'snapshot' });
     }
-
-    try {
-      store.registerState({
-        id: INFERENCE_LOG_ID,
-        strategy: 'append_log',
-        deltaSnapshotEvery: 100,
-        fullSnapshotEvery: 20,
-      });
-    } catch {
-      // Already registered
-    }
+    ensureStateRegistered(store, {
+      id: INFERENCE_LOG_ID,
+      strategy: 'append_log',
+      deltaSnapshotEvery: 100,
+      fullSnapshotEvery: 20,
+    });
 
     // The legacy single-map checkpoint state (TURN_CHECKPOINTS_ID) is no longer
     // registered for new stores — it's read-only fallback data in old ones.
-    try {
-      store.registerState({ id: TURN_CHECKPOINTS_TREE_ID, strategy: 'tree' });
-    } catch (error) {
-      if (!isStateExistsError(error)) throw error;
-    }
+    ensureStateRegistered(store, { id: TURN_CHECKPOINTS_TREE_ID, strategy: 'tree' });
 
     // Process logging config (default: disabled)
     const processLoggingPersist = config.processLogging?.persist ?? false;
@@ -2426,16 +2451,12 @@ export class AgentFramework {
 
     // Register process log state only if persistence is enabled
     if (processLoggingPersist) {
-      try {
-        store.registerState({
-          id: PROCESS_LOG_ID,
-          strategy: 'append_log',
-          deltaSnapshotEvery: 100,
-          fullSnapshotEvery: 20,
-        });
-      } catch {
-        // Already registered
-      }
+      ensureStateRegistered(store, {
+        id: PROCESS_LOG_ID,
+        strategy: 'append_log',
+        deltaSnapshotEvery: 100,
+        fullSnapshotEvery: 20,
+      });
     }
 
     const discordAwarenessOutboxPath = config.discordAwarenessOutboxPath
@@ -2548,11 +2569,7 @@ export class AgentFramework {
       // Generation counters persist across restarts — reusing generation 1's
       // agent name after a restart would reopen (and re-seed) the previous
       // engagement's Chronicle namespace.
-      try {
-        store.registerState({ id: CONVERSATION_ROUTER_STATE_ID, strategy: 'snapshot' });
-      } catch {
-        // Already registered
-      }
+      ensureStateRegistered(store, { id: CONVERSATION_ROUTER_STATE_ID, strategy: 'snapshot' });
       try {
         const data = store.getStateJson(CONVERSATION_ROUTER_STATE_ID) as
           { generations?: Record<string, number> } | null;
@@ -2883,16 +2900,34 @@ export class AgentFramework {
   }
 
   /**
-   * Stop the event loop. After a failed or timed-out wait on operator, module
-   * or MCPL cleanup, storage stays open and stop() can be called again. A
-   * timed-out wait lets teardown go on while that work may still act on what
-   * is being torn down.
-   * @param teardownTimeoutMs Optional budget for each wait on cleanup: an
-   * operator's operations already running, then modules and MCPL together.
-   * Omit to wait until cleanup settles, as required by existing module/child
-   * contracts. This does not bound earlier stream, event-loop or maintenance
-   * quiescence (a maintenance pass or over-budget drain kick in flight), or
-   * cancel cleanup.
+   * Stop the event loop. After a failed or timed-out wait, storage stays open
+   * and stop() can be called again. A timed-out wait lets teardown go on while
+   * what it waited for may still act on what is being torn down.
+   * @param teardownTimeoutMs Optional budget for each of stop()'s waits, in
+   * turn: on the streams it cancels, on maintenance in flight (a pass or an
+   * over-budget drain kick), on the event loop, on an operator's operations
+   * already running, then on modules and MCPL together. With a budget, a
+   * stop() can take up to five of them, besides the withheld-spill deadline
+   * of a guard's write still under way. Omit to wait until each settles, as
+   * required by existing module/child contracts. A wait whose budget runs out
+   * fails the stop() with a ShutdownTimeoutError naming what it waited for;
+   * with more than one, or beside another failure, stop() fails with an
+   * AggregateError of them all. After it:
+   * - an agent still registered whose stream is still running keeps its
+   *   deferred writes queued, since the stream may still write. The stream's
+   *   own turn-end flush takes them when it settles, if the process lives on,
+   *   and a later stop() takes what that leaves; a memory-only queue loses
+   *   them if the process exits first.
+   * - every ephemeral run still registered is ended, as after any stop(), and
+   *   its end stores what is queued for it, as at any run's end, whatever its
+   *   stream is doing: once a run has left, its stream's late events are
+   *   dropped, though a write the stream already had under way can still
+   *   land in the run's namespace after them.
+   * - an event loop still in a call, such as a module's onProcess, finishes
+   *   that call and the rest of its iteration, and then exits. A start()
+   *   made meanwhile runs its own loop beside that last iteration.
+   * - a later stop() waits again, within its own budget, for any stream or
+   *   loop this one left running, so the store never closes under it.
    */
   stop(teardownTimeoutMs = DEFAULT_SHUTDOWN_TIMEOUT_MS): Promise<void> {
     try { validateShutdownTimeout(teardownTimeoutMs); }
@@ -3029,10 +3064,52 @@ export class AgentFramework {
       if ('stream' in agent.state && agent.state.stream) agent.cancelStream();
     }
 
-    // Wait for all stream iteration handles to settle
-    if (this.activeStreams.size > 0) {
-      await Promise.allSettled(this.activeStreams.values());
+    // From here to the event loop, each wait is on work this stop() has
+    // asked to end, and each takes teardownTimeoutMs, as the waits on cleanup
+    // below do. One that runs out is reported with them once teardown has
+    // gone on, and keeps the store open for another stop(): what it waited
+    // for may still be running, and stays in leftRunning until it settles,
+    // for a later stop() to wait for again. A rejection settles a wait here
+    // as a resolution does: these are waits on work stop() has asked to end,
+    // not cleanup that can fail.
+    const waitsTimedOut: unknown[] = [];
+    type Running = { label: string; promise: Promise<unknown> };
+    const waitFor = async (attempts: Running[], kind?: 'stream' | 'loop'): Promise<void> => {
+      if (attempts.length === 0) return;
+      try {
+        await waitForShutdown(attempts.map(({ label, promise }) => ({ label, promise: promise.then(() => {}, () => {}) })), teardownTimeoutMs);
+      } catch (error) {
+        waitsTimedOut.push(error);
+        // Each leaves leftRunning as it settles, those that already have at once.
+        if (kind) for (const { label, promise } of attempts) {
+          this.leftRunning.set(promise, { label, kind });
+          const leave = () => { this.leftRunning.delete(promise); };
+          void promise.then(leave, leave);
+        }
+      }
+    };
+    // What this stop() found of a kind, beside what an earlier one's budget
+    // left running, each promise once.
+    const withLeftovers = (kind: 'stream' | 'loop', found: Running[]): Running[] => {
+      const all = new Map<Promise<unknown>, string>(found.map(({ label, promise }) => [promise, label]));
+      for (const [promise, entry] of this.leftRunning) {
+        if (entry.kind === kind && !all.has(promise)) all.set(promise, entry.label);
+      }
+      return [...all].map(([promise, label]) => ({ label, promise }));
+    };
+
+    // Wait for all stream iteration handles to settle. An agent whose handle
+    // hasn't settled by the final flush keeps its entries queued there. Its
+    // activeStreams entry alone doesn't say that a stream is still running:
+    // a restart whose compile failed after taking the stream id leaves the
+    // old frame's entry, which that frame no longer owns.
+    const stillStreaming = new Set<string>();
+    for (const [name, stream] of this.activeStreams) {
+      stillStreaming.add(name);
+      const settled = () => { stillStreaming.delete(name); };
+      void stream.then(settled, settled);
     }
+    await waitFor(withLeftovers('stream', [...this.activeStreams].map(([name, promise]) => ({ label: `stream:${name}`, promise }))), 'stream');
 
     // Stop sync timer
     if (this.syncTimer) {
@@ -3045,23 +3122,29 @@ export class AgentFramework {
       this.maintenanceTimer = null;
     }
     // The pass and any over-budget drain kick: a compression in flight lands
-    // before the store closes.
-    await this.settleMaintenancePass();
+    // before the store closes. Its bookkeeping outlives a timeout, since no
+    // pass starts while one runs and a drain leaves its set only as it
+    // settles, so it needs no leftRunning entry.
+    await waitFor(this.maintenanceRunning() ? [{ label: 'maintenance', promise: this.settleMaintenancePass() }] : []);
 
-    if (this.loopPromise) {
-      await this.loopPromise;
-    }
+    await waitFor(withLeftovers('loop', this.loopPromise ? [{ label: 'event loop', promise: this.loopPromise }] : []), 'loop');
 
-    // Nothing drives an ephemeral run once the loop has ended: no turn starts
-    // after stop() begins, every stream it found was cancelled and has
-    // settled, and a tool result that arrives now is dropped, since the queue
-    // is closed. So a run still registered could only wait for a watchdog,
-    // such as one whose wake was never taken up, whose turn was refused,
-    // whose retry was cancelled, or whose continuation is still queued. End
-    // each one now, while the store is open for its cleanup. (A start()
+    // Once the waits above have settled, nothing drives an ephemeral run: no
+    // turn starts after stop() begins, every stream it found was cancelled
+    // and has settled, and a tool result that arrives now is dropped, since
+    // the queue is closed. So a run still registered could only wait for a
+    // watchdog, such as one whose wake was never taken up, whose turn was
+    // refused, whose retry was cancelled, or whose continuation is still
+    // queued. End each one now, while the store is open for its cleanup.
+    // After a wait whose budget ran out, a run's stream or the loop may still
+    // be running, and every run is ended all the same: the caller asked for a
+    // bounded stop(), and a run whose stream is still running would otherwise
+    // wait for its idle watchdog. Its end stores its queue, as at any run's
+    // end; that stream's late events are dropped once the run has left, and a
+    // later stop() waits for the stream itself (leftRunning). (A start()
     // during a stop() is #315's. One made before the loop ended keeps a loop
-    // running, so this stop waits for it; one made just after, before this
-    // point, has its runs ended here too.)
+    // running, so this stop waits for it, up to its budget; one made just
+    // after, before this point, has its runs ended here too.)
     for (const [name, run] of this.ephemeralRuns) run.settle.reject(ephemeralRunStopped(name));
 
     // Admission closed when stop() began. What admitted operations start now,
@@ -3104,7 +3187,10 @@ export class AgentFramework {
     }
     // Timed-out or failed teardown retains its context and may still write.
     // Sync available state best-effort, but leave its store open for a retry.
-    const shutdownErrors: unknown[] = operatorOperationsTimedOut === undefined ? [] : [operatorOperationsTimedOut];
+    const shutdownErrors: unknown[] = [
+      ...waitsTimedOut,
+      ...(operatorOperationsTimedOut === undefined ? [] : [operatorOperationsTimedOut]),
+    ];
     for (const result of await Promise.allSettled(shutdownPromises)) {
       if (result.status === 'rejected') shutdownErrors.push(result.reason);
     }
@@ -3129,9 +3215,10 @@ export class AgentFramework {
       }
     }
 
-    // No stream is left: from the start of stop() none registers and no
-    // agent turn starts (providerAdmissionClosed, checked for every agent),
-    // and every stream registered before was cancelled and awaited above.
+    // No stream is left, unless its wait above ran out: from the start of
+    // stop() none registers and no agent turn starts (providerAdmissionClosed,
+    // checked for every agent), and every stream registered before was
+    // cancelled and awaited above.
     // (A start() made before this stop finishes reopens admission, so a turn
     // it begins can be alive here and take one of these entries mid-stream;
     // #315 asks how start() after stop() should behave.)
@@ -3159,10 +3246,33 @@ export class AgentFramework {
     // disposed fork) is left: dropped with a memory-only queue at exit, and
     // logged and dropped from a persisted one by the boot or resume flush
     // that meets it.
+    //
+    // A registered agent's stream that outlasted its wait may still write,
+    // so that agent's entries stay queued, said once for it: no entry lands
+    // ahead of a stream that may still write. The stream counts as running
+    // while the handle this stop() waited on for it hasn't settled
+    // (stillStreaming). When it settles in a process that lives on, its own
+    // turn-end flush takes them, as at any turn's end, and a later stop()
+    // takes what that leaves. Until then a persisted queue keeps them for
+    // boot, and a memory-only one loses them at exit.
     if (this.deferredMessages.length > 0) {
-      const entries = [...this.agents.keys()].flatMap((name) => this.drainDeferredFor(name));
+      const registered = [...this.agents.keys()];
+      const entries = registered
+        .filter((name) => !stillStreaming.has(name))
+        .flatMap((name) => this.drainDeferredFor(name));
       this.readdDrained(entries, 'stop', { bypassDeferral: !this.quiesced });
       this.ackDeferredWrites();
+      for (const name of registered.filter((agent) => stillStreaming.has(agent))) {
+        const held = this.deferredMessages.filter((msg) => (msg.forAgent ?? this.primaryAgentName) === name).length;
+        if (held > 0) {
+          console.error(
+            `[deferral] stop: ${held} deferred write(s) for ${name} stay queued: its stream outlasted stop()'s wait and may still write; ` +
+            (this.deferredWritesPersisted || this.quiesced
+              ? 'the persisted queue keeps them for boot'
+              : 'this memory-only queue loses them if the process exits before that stream settles'),
+          );
+        }
+      }
     }
 
     // Final sync before closing
@@ -5082,9 +5192,15 @@ export class AgentFramework {
   static readonly QUIESCE_TIMEOUT_DEFAULT_MS = 120_000;
 
   /**
-   * Enter quiesce mode: persist the flag, suppress gate deliveries, pause all
-   * MCPL data planes, and wait for in-flight turns to settle (turn-alive is
-   * `activeTurnTokens`, which spans dequeue → settled teardown). Idempotent.
+   * Enter quiesce mode: write the deferred-write queue, persist the flag,
+   * suppress gate deliveries, pause all MCPL data planes, and wait for
+   * in-flight turns to settle (turn-alive is `activeTurnTokens`, which spans
+   * dequeue → settled teardown). Idempotent, but for the queue's write, which
+   * every call makes first: when the queue can't reach disk, because its
+   * write fails or it's over the cap, the call rejects with a
+   * QuiesceBlockedError and the host's mode as it was, unless it has
+   * `abandon`, which goes on with the queue in memory and an alert
+   * (writeDeferredWritesForQuiesce).
    *
    * On drain timeout the host STAYS quiesced (`drained: false` in the
    * result); with `abandon: true` the undrained streams are cancelled via a
@@ -5105,6 +5221,11 @@ export class AgentFramework {
     timeoutMs?: number;
     abandon?: boolean;
   }): Promise<HostModeStatus> {
+    // The deferred-write queue first, as a quiesced host keeps it, on a first
+    // call and a repeat alike: what it holds is on disk before the record says
+    // quiesced, including a write held only in memory, such as one deferred
+    // behind a turn still alive, unless an abandon goes on without it.
+    this.writeDeferredWritesForQuiesce(opts?.abandon === true);
     if (this.quiesced) {
       // Idempotent — EXCEPT abandon escalation: a first quiesce that timed
       // out undrained must be escalatable with a second quiesce({abandon})
@@ -5127,7 +5248,8 @@ export class AgentFramework {
     // host still serving, and a retry isn't taken by the check above for a
     // quiesce already done, so it writes the record. A write that fails
     // partway, such as a store write whose sync fails, may still reach the
-    // record, so a later resume() clears it.
+    // record, so a later resume() clears it. The queue written above stays
+    // mirrored then, as on a serving host after a resume, until it drains.
     const since = Date.now();
     this.hostModeRecordMayBeQuiesced = true;
     this.persistHostMode({
@@ -5402,7 +5524,9 @@ export class AgentFramework {
       // NOTE: parked wakes and gate buffers are in-memory only — a restart
       // mid-quiesce boots quiesced but with these queues empty (sources like
       // heartbeats re-deliver on their own cadence; one-shot wakes are lost).
-      // Deferred context WRITES are persisted while quiesced and survive.
+      // Deferred context WRITES are persisted while quiesced and survive,
+      // apart from any whose write failed or met the cap and that no later
+      // write carried (persistDeferredWrites).
       console.error(this.queue?.isClosed
         ? `[host-mode] resumed — ${releasedRequests} parked wake(s) won't run because the framework is stopping`
         : `[host-mode] resumed — ${releasedRequests} parked wake(s) released`);
@@ -5669,46 +5793,211 @@ export class AgentFramework {
    * end for a message held there and what is queued behind it, and, on a
    * stream that can't carry injected messages, for every message deferred
    * during the turn.
+   *
+   * A write that fails, or a queue over the cap, which writes nothing,
+   * leaves the record as it last held it, except that store only, a write
+   * whose sync failed is in the store, where a later sync can still put it
+   * on disk (writeDeferredWritesSlot). The queue stays in memory and
+   * mirrored, so its next change writes it again. Until a write succeeds, a
+   * restart restores what the record holds, or doesn't start if it can't
+   * read the record: it loses writes queued since, and brings back an entry
+   * withdrawn since (removePlacement, RFC-006's removal of an unread
+   * deferred write) that it still lists. The callers go on: a
+   * deferral's caller has already answered its source, so failing it would
+   * lose a write that can still land at resume. The first such write after
+   * one that succeeded raises an ops alert, and a line says when a write
+   * succeeds again (deferredWritesFellBehind). quiesce() writes the queue
+   * itself before it changes the host's mode, and refuses instead, unless
+   * the call has `abandon` (writeDeferredWritesForQuiesce).
    */
   private persistDeferredWrites(): void {
+    let outcome: DeferredWritesOutcome;
     try {
-      // The durable queue is everything not yet acked: writes still pending
-      // AND writes handed to a context manager whose sync has not happened.
-      // Always in original deferral order, whatever the pending/un-acked
-      // split: a re-deferred entry must not jump the queue.
-      const durable = [...this.unackedDeferredWrites, ...this.deferredMessages].sort(bySeq);
-      const scanFrom = Object.fromEntries(this.deferredScanFrom);
-      if ((this.quiesced || this.deferredWritesPersisted) && durable.length > 0) {
-        const payload = JSON.stringify(durable);
-        if (payload.length > DEFERRED_WRITES_PERSIST_CAP_BYTES) {
-          if (!this.deferredWritesCapWarned) {
-            this.deferredWritesCapWarned = true;
-            console.error(
-              `[host-mode] deferred context writes exceed ${DEFERRED_WRITES_PERSIST_CAP_BYTES} bytes ` +
-              `serialized (${durable.length} message(s)) — kept in memory only; ` +
-              `a crash before resume loses them`,
-            );
-          }
-          return;
-        }
-        if (this.deferredWritesPath) {
-          this.writeRecoveryFile(this.deferredWritesPath, { version: 2, pending: durable, scanFrom });
-        } else {
-          this.warnRecoveryFallbackOnce();
-          this.store.setStateJson(DEFERRED_WRITES_ID, { version: 2, pending: durable, scanFrom });
-        }
-        this.deferredWritesPersisted = true;
-      } else if (this.deferredWritesPersisted) {
-        if (this.deferredWritesPath) {
-          this.writeRecoveryFile(this.deferredWritesPath, { version: 1, pending: [] });
-        } else {
-          this.store.setStateJson(DEFERRED_WRITES_ID, []);
-        }
-        this.deferredWritesPersisted = false;
-      }
+      outcome = this.writeDeferredWrites(this.quiesced);
     } catch (err) {
       console.error('[host-mode] failed to persist deferred context writes:', err);
+      this.deferredWritesFellBehind({ error: err });
+      return;
     }
+    if (outcome === 'over-cap') {
+      this.deferredWritesFellBehind('over-cap');
+    } else if (outcome !== 'nothing') {
+      this.deferredWritesCaughtUp();
+    }
+  }
+
+  /**
+   * Write the queue to its record as it stands, when the host is quiesced
+   * (`quiesced`, which quiesce() passes before it sets the flag) or the
+   * queue is mirrored: the queue when it holds anything, and an empty one
+   * over a record that held one. What the write throws is thrown. A queue
+   * whose JSON is longer than the cap writes nothing.
+   */
+  private writeDeferredWrites(quiesced: boolean): DeferredWritesOutcome {
+    // The durable queue is everything not yet acked: writes still pending
+    // AND writes handed to a context manager whose sync has not happened.
+    // Always in original deferral order, whatever the pending/un-acked
+    // split: a re-deferred entry must not jump the queue.
+    const durable = this.durableDeferredWrites();
+    if ((quiesced || this.deferredWritesPersisted) && durable.length > 0) {
+      if (JSON.stringify(durable).length > DEFERRED_WRITES_PERSIST_CAP_CHARS) return 'over-cap';
+      const queue = { version: 2, pending: durable, scanFrom: Object.fromEntries(this.deferredScanFrom) };
+      if (this.deferredWritesPath) {
+        this.writeRecoveryFile(this.deferredWritesPath, queue);
+      } else {
+        this.warnRecoveryFallbackOnce();
+        // The slot may hold this queue from here on, even if the write
+        // throws: its sync can fail after the slot is set.
+        this.deferredWritesPersisted = true;
+        this.writeDeferredWritesSlot(queue);
+      }
+      this.deferredWritesPersisted = true;
+      return 'written';
+    }
+    if (!this.deferredWritesPersisted) return 'nothing';
+    if (this.deferredWritesPath) {
+      this.writeRecoveryFile(this.deferredWritesPath, { version: 1, pending: [] });
+    } else {
+      this.writeDeferredWritesSlot([]);
+    }
+    this.deferredWritesPersisted = false;
+    return 'written';
+  }
+
+  /** Store only, the slot is the record, and a write isn't on disk until the
+   *  store syncs, so a sync that fails is the write's failure, as in
+   *  persistHostMode. The slot is set by then, and a later sync can still
+   *  put it on disk, so writeDeferredWrites marks the queue mirrored before
+   *  it writes; a boot that restores such a queue skips each entry that
+   *  already landed. */
+  private writeDeferredWritesSlot(value: unknown): void {
+    this.store.setStateJson(DEFERRED_WRITES_ID, value);
+    this.store.sync();
+  }
+
+  /** The durable queue: every deferred write not yet acked, pending and
+   *  un-acked, in deferral order. */
+  private durableDeferredWrites(): DeferredWrite[] {
+    return [...this.unackedDeferredWrites, ...this.deferredMessages].sort(bySeq);
+  }
+
+  /** Where the queue is recorded, as an operator would look for it. */
+  private deferredWritesRecord(): string {
+    return this.deferredWritesPath ?? `the store's ${DEFERRED_WRITES_ID} slot`;
+  }
+
+  /**
+   * quiesce()'s write of the queue, before it changes the host's mode, as a
+   * quiesced host keeps it: a write held only in memory, such as one
+   * deferred behind a turn still alive, is on disk before quiesce() goes on,
+   * as its record is. When the queue can't reach disk, because its write
+   * fails or it's over the cap, which writes nothing, a call with `abandon`
+   * goes on with the queue in memory and the failure's or the cap's alert.
+   * Any other throws a QuiesceBlockedError naming the ways out, so quiesce()
+   * rejects with the host's mode as it was (store only, the slot set before
+   * a sync that failed leaves the queue mirrored: writeDeferredWritesSlot).
+   * Writes a flush landed stay in the queue until a store sync acks them, so
+   * it first retries an ack whose sync failed: once a sync succeeds they're
+   * on disk, and they leave the queue rather than count against the cap.
+   */
+  private writeDeferredWritesForQuiesce(abandon: boolean): void {
+    this.ackDeferredWrites();
+    // Abandon is the call for a turn that won't end. The queue stays in
+    // memory whichever way the call goes, and writes held for such a turn
+    // don't land until it does, so refusing it would leave only a restart,
+    // which loses them: it goes on, with the alert as everywhere else.
+    let outcome: DeferredWritesOutcome;
+    try {
+      outcome = this.writeDeferredWrites(true);
+    } catch (error) {
+      if (abandon) {
+        console.error(
+          '[host-mode] failed to persist deferred context writes; quiesce goes on with them in memory, so resume ' +
+          'before any restart:',
+          error,
+        );
+        this.deferredWritesFellBehind({ error }, true);
+        return;
+      }
+      throw new QuiesceBlockedError(
+        `quiesce refused: writing ${this.deferredWritesRecord()} failed: ${thrownText(error)}. So the queue as it ` +
+        `stands, ${this.durableDeferredWrites().length} deferred context write(s), isn't on disk. Once the record ` +
+        'can be written, quiesce again, or quiesce with abandon: true, which cancels the turns still streaming, to ' +
+        'go on with the queue in memory, and resume before any restart.',
+        { cause: error },
+      );
+    }
+    if (outcome === 'over-cap') {
+      if (abandon) {
+        this.deferredWritesFellBehind('over-cap', true);
+        return;
+      }
+      throw new QuiesceBlockedError(
+        `quiesce refused: the queue's ${this.durableDeferredWrites().length} deferred context write(s) come to ` +
+        `more than ${DEFERRED_WRITES_PERSIST_CAP_CHARS} characters of JSON, the cap, so ` +
+        `${this.deferredWritesRecord()} can't hold them, and a restart would lose them. ` +
+        (this.quiesced
+          ? 'Resume so they land, then quiesce again. A write held for a turn still alive stays queued through ' +
+            'a resume, so to end a turn that won\'t, quiesce with abandon: true before resuming. '
+          : 'Quiesce again once they have landed, or quiesce with abandon: true to end the turns they ' +
+            'wait for, then resume so they land, and quiesce again. ') +
+        'The abandon\'s answer lists a turn it can\'t end as unabandonable, and its writes land once it has ' +
+        'ended and the host is serving.',
+      );
+    }
+    if (outcome !== 'nothing') this.deferredWritesCaughtUp();
+  }
+
+  /**
+   * A write of the queue failed, or met the cap, and quiesce() didn't reject
+   * for it. The queue stays mirrored, so its next change writes it again.
+   * The first such write since one that succeeded raises an ops alert naming
+   * the record, and the rest of the run raises none. A failed write's own
+   * line is logged each time (persistDeferredWrites), and the cap's line the
+   * first time the cap is met in a run, whatever began it. On a host that is
+   * or is about to be quiesced, both say to resume before any restart, since
+   * a quiesced host lands its deferred writes only at a resume.
+   */
+  private deferredWritesFellBehind(cause: { error: unknown } | 'over-cap', quiesced = this.quiesced): void {
+    this.deferredWritesPersisted = true;
+    const startsRun = !this.deferredWritesBehind;
+    this.deferredWritesBehind = true;
+    const record = this.deferredWritesRecord();
+    const queued = this.durableDeferredWrites().length;
+    const resumeFirst = quiesced ? '. Resume before any restart' : '';
+    if (cause === 'over-cap') {
+      if (this.deferredWritesCapLogged) return;
+      this.deferredWritesCapLogged = true;
+      const message = `the queue's ${queued} deferred context write(s) come to more than ` +
+        `${DEFERRED_WRITES_PERSIST_CAP_CHARS} characters of JSON, the cap, so ${record} isn't written, ` +
+        `and a restart before the queue is under the cap and written restores what it last held${resumeFirst}`;
+      console.error(`[host-mode] ${message}`);
+      if (startsRun) {
+        this.opsAlert('deferred-writes', 'framework', message,
+          { data: { record, queued, capCharacters: DEFERRED_WRITES_PERSIST_CAP_CHARS } });
+      }
+      return;
+    }
+    if (!startsRun) return;
+    const { error } = cause;
+    const reason = error instanceof Error ? error.message : String(error);
+    const code = (error as NodeJS.ErrnoException | undefined)?.code;
+    this.opsAlert('deferred-writes', 'framework',
+      `writing ${record} failed: ${reason}. The queue's next change writes it again, and until a write of it ` +
+      `succeeds, the queue as it stands, ${queued} deferred context write(s), isn't on disk${resumeFirst}`,
+      { data: { record, queued, ...(code ? { code } : {}) } });
+  }
+
+  /** A write of the queue succeeded after a run of failures: say that the
+   *  record has caught up. */
+  private deferredWritesCaughtUp(): void {
+    if (!this.deferredWritesBehind) return;
+    this.deferredWritesBehind = false;
+    this.deferredWritesCapLogged = false;
+    console.error(
+      `[host-mode] ${this.deferredWritesRecord()} written again: it holds the queue's ` +
+      `${this.durableDeferredWrites().length} deferred context write(s)`,
+    );
   }
 
   /**
@@ -7823,12 +8112,20 @@ export class AgentFramework {
     if (params.command === 'quiesce') {
       // quiesce() clamps timeoutMs to [1s, 10m] itself — one clamp for every ingress.
       console.error(`[host-command] quiesce by=${requester} (server=${serverId})`);
-      const hostMode = await this.quiesce({
-        reason: params.reason ?? `host/command by ${requester}`,
-        ...(params.timeoutMs !== undefined ? { timeoutMs: params.timeoutMs } : {}),
-        ...(params.abandon ? { abandon: true } : {}),
-      });
-      return { ok: true, hostMode };
+      try {
+        const hostMode = await this.quiesce({
+          reason: params.reason ?? `host/command by ${requester}`,
+          ...(params.timeoutMs !== undefined ? { timeoutMs: params.timeoutMs } : {}),
+          ...(params.abandon ? { abandon: true } : {}),
+        });
+        return { ok: true, hostMode };
+      } catch (error) {
+        // A refusal, as resume()'s is below: the host's mode is as it was.
+        if (error instanceof QuiesceBlockedError) {
+          return { ok: false, error: error.message, hostMode: this.getHostModeStatus() };
+        }
+        throw error;
+      }
     }
     if (params.command === 'resume') {
       console.error(`[host-command] resume by=${requester} (server=${serverId})`);
@@ -9593,7 +9890,13 @@ export class AgentFramework {
   }
 
   private async runLoop(): Promise<void> {
-    while (this.running) {
+    // A loop ends with its lifecycle. A stop() whose budget ran out while
+    // this loop was in a call (a module's onProcess) returns before the call
+    // does, and a start() after it begins a lifecycle with a loop of its own;
+    // this one finishes its iteration and exits, rather than running beside
+    // that loop for good.
+    const lifecycle = this.lifecycleGeneration;
+    while (this.running && this.lifecycleGeneration === lifecycle) {
       try {
         await this.processNextEvent();
       } catch (error) {
@@ -10423,7 +10726,7 @@ export class AgentFramework {
     const router = this.conversationRouter!;
     const descriptor = this.channelRegistry?.getDescriptor(event.channelId);
 
-    const decision = router.route({
+    const decision = await this.routeConversation({
       channelId: event.channelId,
       mentioned: event.metadata?.mentioned === true,
       kind: ConversationRouter.classifyChannel(descriptor, event.metadata),
@@ -10441,9 +10744,7 @@ export class AgentFramework {
     let agent: Agent | undefined;
     if (decision.kind === 'spawn') {
       try {
-        agent = await this.createConversationAgent(decision.agentName, event.channelId);
-        router.bind(event.channelId, decision.agentName, decision.generation);
-        this.persistConversationRouterState();
+        agent = await decision.spawned;
         this.emitTrace({
           type: 'mcpl:conversation-spawned',
           channelId: event.channelId,
@@ -10610,6 +10911,58 @@ export class AgentFramework {
     }
   }
 
+  /**
+   * The router's decision for a message or batch on `facts.channelId`, made
+   * once no spawn is in flight for that channel, with a spawn it decides on
+   * already started. A routing that finds its channel's fork being spawned
+   * waits for that spawn to settle and decides then, whatever it would have
+   * decided meanwhile: once the fork is bound, the decision is the fork, and
+   * if the spawn failed, it decides as a message arriving next would, which
+   * proposes the spawn again if the message qualifies. The check, the
+   * decision and the spawn's start are one synchronous step, so at most one
+   * spawn per channel is in flight. Without the wait, a second spawn of the
+   * fork's name failed ("already registered or reserved"), and a message
+   * that didn't qualify on its own was dropped as unrouted; either way its
+   * message was lost. Each path that delivers messages handles them one at
+   * a time, but the event queue and the coalescer run beside each other, and
+   * a spawn can wait, as on its template's annotations
+   * (createConversationAgent); the waiting routing holds its own path for as
+   * long, which none of the spawn's awaits needs.
+   */
+  private async routeConversation(facts: IncomingMessageFacts): Promise<
+    Exclude<RoutingDecision, { kind: 'spawn' }> | (Extract<RoutingDecision, { kind: 'spawn' }> & { spawned: Promise<Agent> })
+  > {
+    for (;;) {
+      const inFlight = this.conversationSpawns.get(facts.channelId);
+      if (inFlight) {
+        await inFlight;
+        continue;
+      }
+      const decision = this.conversationRouter!.route(facts);
+      if (decision.kind !== 'spawn') return decision;
+      return { ...decision, spawned: this.spawnConversationAgent(facts.channelId, decision) };
+    }
+  }
+
+  /**
+   * Create the fork a spawn decision names, bind its channel to it and
+   * persist the counters, registered in conversationSpawns under the channel
+   * until it settles. routeConversation registers a spawn only when none is
+   * in flight for the channel, and only this spawn's settlement removes it,
+   * so the entry it removes is its own. It's removed before anyone waiting
+   * on it resumes, so a waiter that decides again doesn't find it.
+   */
+  private spawnConversationAgent(channelId: string, decision: { agentName: string; generation: number }): Promise<Agent> {
+    const spawn = this.createConversationAgent(decision.agentName, channelId).then((agent) => {
+      this.conversationRouter!.bind(channelId, decision.agentName, decision.generation);
+      this.persistConversationRouterState();
+      return agent;
+    });
+    const done = (): void => { this.conversationSpawns.delete(channelId); };
+    this.conversationSpawns.set(channelId, spawn.then(done, done));
+    return spawn;
+  }
+
   /** Persist the router's generation counters (see hydration in create()). */
   private persistConversationRouterState(): void {
     if (!this.conversationRouter) return;
@@ -10766,20 +11119,35 @@ export class AgentFramework {
    * replies to the agent) DO still arrive, and nothing warned that answering
    * via option 1 leaves the human's natural un-@'d follow-up invisible (Sol
    * answered four #architecture mentions over four days while the follow-ups
-   * to her own replies were silently dropped). The wording now states the
-   * actual delivery model, and option 1 carries the consequence inline. When
-   * the surface tracks a missed-ambient tally (discord-mcpl sends
+   * to her own replies were silently dropped). That pass stated discord-mcpl's
+   * delivery model here.
+   *
+   * #406: what reaches the agent from a channel, open or closed, is its
+   * server's delivery, which MCPL leaves to each server. discord-mcpl
+   * subscribes a channel on channels/open and unsubscribes it on
+   * channels/close. slack-mcpl keeps its own subscription, which decides
+   * whether a conversation's ordinary messages arrive, open or closed; open
+   * state only picks channels/incoming or push/event. So the invitation says
+   * only that messages addressing the agent reach it whether or not it opens
+   * the channel: it is shown only when one has arrived from a closed channel,
+   * and both servers deliver them either way. What else arrives is for the
+   * server to say on its push. Option 1 says what a reply does, which
+   * speechOpens decides: a reply opens a closed channel nobody decided to keep
+   * closed, and leaves one the agent closed or declined itself closed. Its old
+   * follow-up warning described discord-mcpl's delivery for a channel left
+   * closed, which is that server's to say on its push
+   * (anima-research/discord-mcpl#97). When the surface tracks a
+   * missed-ambient tally (discord-mcpl sends
    * `missedMessages`/`missedCharacters` in push origin), the invitation shows
    * the count — the cost of staying out, as a number, at decision time.
    *
    * No invitation on a direct message (`chat:dm`): every message of a DM is
    * addressed, so it reaches the agent open or closed, and there is nothing
-   * to miss or join. A DM registers closed, and stays closed until the agent
+   * to miss or open. A DM registers closed, and stays closed until the agent
    * answers it, or for good once the agent closes it, so without this a DM
    * would carry the block. The tag describes the message, not the channel:
    * a whisper tagged `chat:dm` inside a shared channel that is closed
-   * carries no invitation either, though its channel's other traffic stays
-   * out of reach.
+   * carries no invitation either.
    */
   private buildClosedChannelInvitation(opts: {
     serverId: string;
@@ -10803,7 +11171,13 @@ export class AgentFramework {
     const descriptor = this.channelRegistry.getDescriptor(opts.channelId, opts.serverId);
     const maxBackscroll = descriptor?.capabilities?.history?.maxMessages ?? 0;
     const label = opts.channelLabel ?? descriptor?.label;
-    const channelLabel = label ? `#${label}` : `"${opts.channelId}"`;
+    // A label that is only the channel's id (a lazily registered channel's)
+    // names nothing, as at the other places that name a channel. A registered
+    // label usually carries its own `#` (`#name (Guild)`), so a `#` is added
+    // only where the name lacks one, by proseTargetFor's rule.
+    const bareLabel = label && label !== opts.channelId ? label.replace(/^#/, '') : undefined;
+    const hashLabel = bareLabel ? `#${bareLabel}` : undefined;
+    const channelLabel = hashLabel ?? `"${opts.channelId}"`;
     const place = opts.guildName ? `${channelLabel} in "${opts.guildName}"` : channelLabel;
     // The label is for reading; the prefix must be ONE token that resolves back
     // here, on this server (a DM label "DM: alice" quoted verbatim parses as
@@ -10813,24 +11187,24 @@ export class AgentFramework {
     const namer = this.channelRegistry as { proseTargetFor?: (id: string, serverId?: string) => string | undefined };
     const target = typeof namer.proseTargetFor === 'function'
       ? namer.proseTargetFor(opts.channelId, opts.serverId)
-      : [label ? `#${label}` : undefined, opts.channelId].find((t): t is string => !!t && !/\s/.test(t));
+      : [hashLabel, opts.channelId].find((t): t is string => !!t && !/\s/.test(t));
     // What replying does here is the registry's to say (speechOpens): a reply
-    // joins a channel nobody decided to keep closed, and leaves one the agent
+    // opens a channel nobody decided to keep closed, and leaves one the agent
     // closed or declined itself closed. Each case is said as it is.
-    const replyJoins = this.channelRegistry.speechOpens(opts.serverId, opts.channelId);
-    const withoutJoining =
-      "To reply without joining, decline it first (option 3): a channel you've declined stays closed when you speak there.";
+    const replyOpens = this.channelRegistry.speechOpens(opts.serverId, opts.channelId);
+    const withoutOpening =
+      "To reply without opening it, decline it first (option 3): a channel you've declined stays closed when you speak there.";
     const replyOption = target
-      ? replyJoins
-        ? `1. Reply — write your reply this turn prefixed with ">>${target}"; it will be delivered there, and replying ` +
-          `joins the channel, as option 2 does. ${withoutJoining}\n`
-        : `1. Reply without joining — write your reply this turn prefixed with ">>${target}"; it will be delivered there. ` +
-          `Note: follow-ups to your reply will NOT reach you unless they @-mention you or use the reply feature on your message.\n`
-      : `1. Reply${replyJoins ? '' : ' without joining'} — no single-word target reaches this channel unambiguously, ` +
+      ? replyOpens
+        ? `1. Reply — write your reply this turn prefixed with ">>${target}"; it will be delivered there, which opens ` +
+          `the channel. ${withoutOpening}\n`
+        : `1. Reply — write your reply this turn prefixed with ">>${target}"; it will be delivered there, and the ` +
+          `channel stays closed.\n`
+      : `1. Reply — no single-word target reaches this channel unambiguously, ` +
         `so a ">>" prefix can't name it; check whether ${opts.serverId} exposes a send tool that can address it.` +
-        (replyJoins
-          ? ` Replying there joins the channel, as option 2 does. ${withoutJoining}\n`
-          : ` Note: follow-ups to your reply will NOT reach you unless they @-mention you or use the reply feature on your message.\n`);
+        (replyOpens
+          ? ` Replying there opens the channel. ${withoutOpening}\n`
+          : ` Replying there leaves the channel closed.\n`);
     const missedCount = opts.missedMessages ?? 0;
     const missedNote =
       missedCount > 0
@@ -10842,12 +11216,12 @@ export class AgentFramework {
       type: 'text',
       text:
         `\n[Channel invitation] ${opts.authorName} addressed you in ${place} — ` +
-        `a channel you haven't joined. Only messages that address you directly (an @-mention or ` +
-        `a reply to one of your messages) reach you from it; the rest of its traffic is invisible to you. ` +
+        `a channel you haven't opened. Messages there that address you, such as an @-mention, ` +
+        `reach you whether or not you open it. ` +
         missedNote +
         `Your options:\n` +
         replyOption +
-        `2. Join the channel — call channel_open with channelId "${opts.channelId}" and serverId "${opts.serverId}"` +
+        `2. Open the channel — call channel_open with channelId "${opts.channelId}" and serverId "${opts.serverId}"` +
         (maxBackscroll > 0
           ? `; to also read recent history, add backscroll (a number up to ${maxBackscroll}) and beforeMessageId "${opts.messageId}".\n`
           : `.\n`) +
@@ -11031,10 +11405,12 @@ export class AgentFramework {
 
   /**
    * Durability barrier for coalescing (RFC-006 §3.1/§3.2): everything
-   * written so far is fsynced before the caller proceeds. Group-committed —
-   * all acceptances that arrive in one event-loop turn share one
-   * `store.sync()` — so throughput is bounded by fsync rate per batch, not
-   * per message.
+   * written so far is fsynced before the caller proceeds. Commits asked for
+   * in the same event-loop turn would share one `store.sync()`, but the
+   * coalescer asks for every commit under its lock and holds the lock until
+   * the commit resolves, so no two share one. Each acceptance makes an fsync
+   * of its own, and so does each coalesced message a channels/incoming
+   * request newly admits, one at a time.
    */
   private commitCoalescingDurable(): Promise<void> {
     if (!this.coalescingCommit) {
@@ -11193,16 +11569,14 @@ export class AgentFramework {
       // No fork yet: the same bind decision an incoming message would get. A
       // batch that qualifies spawns its fork now so it has someone to wake.
       const metadata = (occ.event.lane === 'channel' ? occ.event.event.metadata : occ.event.event.origin) ?? {};
-      const decision = router.route({
+      const decision = await this.routeConversation({
         channelId: occ.scope.id,
         mentioned: metadata.mentioned === true,
         kind: ConversationRouter.classifyChannel(this.channelRegistry?.getDescriptor(occ.scope.id), metadata),
       });
       if (decision.kind !== 'spawn') return decision.kind === 'unbound' ? [] : (this.agents.has(decision.agentName) ? [decision.agentName] : []);
       try {
-        await this.createConversationAgent(decision.agentName, occ.scope.id);
-        router.bind(occ.scope.id, decision.agentName, decision.generation);
-        this.persistConversationRouterState();
+        await decision.spawned;
         return [decision.agentName];
       } catch (err) {
         console.error(`[coalescing] could not spawn a conversation agent for ${logValue(occ.scope.id)}:`, err);
@@ -11242,7 +11616,7 @@ export class AgentFramework {
         messageId: identity.messageId ?? str(origin.messageId) ?? occ.eventId,
         threadId: identity.threadId ?? str(origin.threadId),
         author: identity.author ?? { id: str(origin.authorId) ?? '', name: str(origin.authorName) ?? str(origin.authorId) ?? 'Someone' },
-        content: materialized ? materialized.map(convertPushBlock) : push.content,
+        content: materialized ? materialized.map((block) => convertBlock(block, 'attachment on push event')) : push.content,
         timestamp: occ.timestamp,
         metadata: origin,
         tags: push.tags,
@@ -11261,7 +11635,7 @@ export class AgentFramework {
       ...occ.event.event,
       eventId: occ.eventId,
       timestamp: occ.timestamp,
-      ...(materialized ? { content: materialized.map(convertPushBlock) } : {}),
+      ...(materialized ? { content: materialized.map((block) => convertBlock(block, 'attachment on push event')) } : {}),
       coalescingSubject,
       // §5.2: the materialized occurrence is consumed by the request being
       // assembled; the wake that started it is not repeated.
@@ -12160,10 +12534,11 @@ export class AgentFramework {
    * Durable window notice for a channel the agent did not ask to open —
    * subscription-policy admission, or an open by the agent's own delivery
    * into a closed channel nobody decided to keep closed. The agent must
-   * always learn that new traffic will start flowing, and that
-   * `channel_close` opts out: its close stands against policy and against
-   * its own speech there. System message: never triggers inference, never
-   * conversational, never locus-eligible.
+   * always learn that the channel opened, and that `channel_close` opts out:
+   * its close stands against policy and against its own speech there. What
+   * an open channel delivers is its server's to say (#406), so the notice
+   * doesn't promise its traffic. System message: never triggers inference,
+   * never conversational, never locus-eligible.
    */
   private recordChannelAutoOpenNotice(
     agentName: string | undefined,
@@ -12180,8 +12555,7 @@ export class AgentFramework {
         ? 'your subscription policy just admitted ' + (plural ? 'them' : 'it')
         : 'your own message into the closed channel engaged it';
     const text =
-      `[channels] Now open: ${shown} — ${causeText}. ` +
-      `Ongoing traffic from ${plural ? 'these channels' : 'this channel'} will reach you. ` +
+      `[channels] Now open: ${shown} — ${causeText}. What an open channel delivers to you depends on its server. ` +
       `If you don't want ${plural ? 'one of them' : 'it'}, use channel_close: a channel you close ` +
       'stays closed until you open it with channel_open, and neither speaking there nor policy reopens it.';
     try {
@@ -16161,8 +16535,10 @@ export class AgentFramework {
         blocks.push({ type: 'text', text: INLINE_WITHHELD_TEXT });
         continue;
       }
-      if (b.type === 'text' && typeof b.text === 'string') {
-        let text = b.text;
+      if (b.type === 'text') {
+        // A text that isn't a string shows as the converters' placeholder,
+        // rather than sending the whole array to the JSON fallback.
+        let text = typeof b.text === 'string' ? b.text : NON_STRING_TEXT_PLACEHOLDER;
         if (maxChars && text.length > maxChars) {
           text = safeSlice(text, 0, maxChars)
             + '\n\n[truncated — original was ' + text.length + ' chars'
@@ -19869,9 +20245,13 @@ export class AgentFramework {
         // through so toMembraneToolResult can preserve image blocks natively.
         // Text-only results still collapse to a joined string for backward
         // compatibility with callers that expect data to be string-ish.
+        // A text block whose text isn't a string, which only a nonconformant
+        // server sends, shows as the converter's placeholder, where it used to
+        // vanish (null, 0, false) or read as String(text), "[object Object]".
         const textContent = result.content
-          ?.filter((c) => c.type === 'text' && c.text)
-          .map((c) => c.text!)
+          ?.filter((c) => c.type === 'text')
+          .map((c) => (typeof c.text === 'string' ? c.text : NON_STRING_TEXT_PLACEHOLDER))
+          .filter((text) => text !== '')
           .join('\n');
         const hasNonText = result.content?.some((c) => c.type !== 'text');
         const data = result.isError

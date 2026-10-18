@@ -205,7 +205,8 @@ export interface CoalescerHost<E> {
   /** Persist one receipt now, before the acceptance is acknowledged. Throws
    *  on failure, which fails the acceptance (the producer retries). */
   recordReceipt?(record: CoalescingReceiptRecord): void;
-  /** Make every write so far DURABLE (fsync, group-committed by the host).
+  /** Make every write so far DURABLE (an fsync; the coalescer requests each
+   *  commit under its lock, so no two acceptances share one).
    *  Awaited before an acceptance is acknowledged and before push/render is
    *  issued: a kill after either boundary must find the receipt, the
    *  accepted work, and the render-start on disk. Rejects on failure. */
@@ -245,15 +246,21 @@ function mergeIdentity(prior: CoalescedOccurrence['identity'], next: CoalescedOc
  * Validate wire content before it is stored, rendered or converted.
  *
  * Its shape and its visible emptiness, nothing else. An incoming coalesced
- * occurrence reaches context through the converters an uncoalesced message
+ * occurrence reaches context through the converter an uncoalesced message
  * goes through: a plain occurrence the moment it is admitted (the coalescer
  * only remembers where it landed), a deferred one when its render settles or
  * falls back to it. Its content must be an array of objects. A block the
- * converters can't render (a video, an unknown type, an image with neither
+ * converter can't render (a video, an unknown type, an image with neither
  * uri nor data) becomes a placeholder, as it does uncoalesced, and so does a
- * malformed one, since the converters take any object without throwing: a
- * type, text, data, mimeType or uri that isn't a string counts as absent, a
- * text block's as no text. The uncoalesced lane doesn't check the array:
+ * malformed one, since the converter takes any object without throwing: a
+ * type, data, mimeType or uri that isn't a string counts as absent, and a
+ * text block whose text isn't a string shows as its own placeholder, which
+ * counts as no text where MCPL content is admitted: here, on the wire blocks,
+ * and at the uncoalesced boundaries, through isVisiblyEmptyConversion. The
+ * framework's backstops read converted content with isVisiblyEmptyContent,
+ * which would count the placeholder as text, but they see only content one of
+ * those checks has passed. The uncoalesced
+ * lane doesn't check the array:
  * there a member that isn't an object becomes the untyped placeholder, and a
  * null member or content that isn't an array throws in conversion
  * (agent-framework#297 brings that lane to this rule).
@@ -265,8 +272,8 @@ function mergeIdentity(prior: CoalescedOccurrence['identity'], next: CoalescedOc
  *
  * A render result, which the host delivers in the occurrence's place, gets
  * these checks, as RFC-006 §5.2 gives it every check a pushed payload gets,
- * and one more (`checkBlockShapes`): each block must be one the converters
- * show as itself or as a reference stub, not as a placeholder. A malformed
+ * and one more (`checkBlockShapes`): each block must be one the converter
+ * shows as itself or as a reference stub, not as a placeholder. A malformed
  * render falls back to the occurrence's own content; a pushed payload has
  * nothing to fall back to, and gets its placeholders.
  *
@@ -289,12 +296,12 @@ export function validateCoalescedContent(
 }
 
 /**
- * Whether the converters (`convertBlock` in push-handler.ts and
- * channel-registry.ts) show a block as itself, its text or its image or
+ * Whether the converter (`convertBlock` in convert-block.ts, which every lane
+ * uses) shows a block as itself, its text or its image or
  * audio source, or as a reference stub, and not as a placeholder: an
- * unrecognized block, a no-data or no-media-type one, or withheld inline
- * data. A text block whose text isn't a string, which they show as no text,
- * is refused too. This follows their branches in their order.
+ * unrecognized block, a no-data or no-media-type one, withheld inline data,
+ * or a text block whose text isn't a string. This follows its branches in
+ * their order.
  */
 function showsAsItself(b: Record<string, unknown>): boolean {
   if (b.type === 'text') return typeof b.text === 'string';

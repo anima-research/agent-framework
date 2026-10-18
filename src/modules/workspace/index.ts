@@ -41,7 +41,7 @@ import { hashContent, DEFAULT_MAX_FILE_SIZE } from './sync.js';
 import { DiskAgreement, sameRootIdentity } from './disk-agreement.js';
 import { BranchIntents } from './branch-intent.js';
 import { IGNORED, OTHER_MOUNT, filesystemTrustsCtime, inOtherMount, locateRoot, passedOverAt, readPrefix } from './observe.js';
-import { TOOL_BATCH_HOOK_TIMEOUT_MS } from '../../module-registry.js';
+import { TOOL_BATCH_HOOK_TIMEOUT_MS, ensureStateRegistered } from '../../module-registry.js';
 import {
   type MountRuntime,
   type PassOptions,
@@ -751,7 +751,11 @@ export class WorkspaceModule implements Module {
    * second. `ensureRunning()` gates on `ctx && mounts-populated`.
    */
   initStore(store: JsStore): void {
-    this.store = store;
+    // Every mount's states are registered before the module takes the store
+    // or any mount, so a registration that fails leaves the module as it was
+    // before the call, knowing no mount, and a later initStore starts clean.
+    const mounts = new Map<string, MountState>();
+    const intents = new Map<string, BranchIntents>();
 
     // Register tree states for each mount: the workspace tree, and the
     // branch-local intent that qualifies it.
@@ -759,19 +763,15 @@ export class WorkspaceModule implements Module {
       const treeStateId = `workspace/${mount.name}/tree`;
       const intentTreeStateId = `workspace/${mount.name}/intent`;
       for (const id of [treeStateId, intentTreeStateId]) {
-        try {
-          store.registerState({
-            id,
-            strategy: 'tree',
-            deltaSnapshotEvery: this.config.deltaSnapshotEvery ?? 50,
-            fullSnapshotEvery: this.config.fullSnapshotEvery ?? 10,
-          });
-        } catch {
-          // State already registered (restart scenario)
-        }
+        ensureStateRegistered(store, {
+          id,
+          strategy: 'tree',
+          deltaSnapshotEvery: this.config.deltaSnapshotEvery ?? 50,
+          fullSnapshotEvery: this.config.fullSnapshotEvery ?? 10,
+        });
       }
 
-      const mountState: MountState = {
+      mounts.set(mount.name, {
         config: mount,
         treeStateId,
         intentTreeStateId,
@@ -781,10 +781,13 @@ export class WorkspaceModule implements Module {
         lastMaterializedBranchId: null,
         watcherReadyAt: null,
         watcherError: null,
-      };
-      this.mounts.set(mount.name, mountState);
-      this.intents.set(mount.name, new BranchIntents(store, intentTreeStateId));
+      });
+      intents.set(mount.name, new BranchIntents(store, intentTreeStateId));
     }
+
+    this.store = store;
+    for (const [name, state] of mounts) this.mounts.set(name, state);
+    for (const [name, intent] of intents) this.intents.set(name, intent);
 
     // What disk last agreed with, per mount and path: global records, so a
     // branch switch never rewinds it.

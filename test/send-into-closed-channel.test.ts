@@ -380,7 +380,7 @@ test('a send into a closed channel nobody decided about opens it, as channel_ope
     assert.equal(registry.getDesiredState('discord', id), 'open');
     assert.equal(windowMessages.at(-1),
       `[channels] Now open: ${label} (${id}) — your own message into the closed channel engaged it. ` +
-      'Ongoing traffic from this channel will reach you. If you don\'t want it, use channel_close: a channel you close ' +
+      'What an open channel delivers to you depends on its server. If you don\'t want it, use channel_close: a channel you close ' +
       'stays closed until you open it with channel_open, and neither speaking there nor policy reopens it.');
   }
   assert.deepEqual(opens.map((o) => o.channelId), [channelId, 'discord:dm:777']);
