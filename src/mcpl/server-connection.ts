@@ -95,6 +95,20 @@ export function withStderr(error: unknown): string {
   return '. The last of its stderr:' + tail.split('\n').map((line) => `\n  stderr: ${logDetail(line)}`).join('');
 }
 
+/** A transport close's reason, as an error message gives it: the transport's
+ *  own words. A WebSocket peer's close reason is the server's text
+ *  (`reasonFromPeer`), so an error gives the words the transport uses for a
+ *  close without one, as `mcpl:server-closed` leaves that text out. A
+ *  WebSocket close's code, a number, says what the server meant (4001: a
+ *  refused credential), with or without a reason, so each error gives it too:
+ *  a pending request's error has `code=`, and the handshake's adds it for any
+ *  WebSocket close, since a close before the handshake completes reaches no
+ *  'close' event. A stdio child's exit reads as before. */
+function closeReasonText(info: TransportCloseInfo): string {
+  if (info.reasonFromPeer) return 'websocket closed';
+  return info.reason ?? 'unknown';
+}
+
 /** Default per-request timeout in milliseconds (see McplServerConfig.requestTimeoutMs).
  *  A live-but-wedged server (accepts requests, never answers, never closes its
  *  transport) would otherwise freeze the awaiting agent turn forever — no
@@ -301,6 +315,13 @@ export class McplServerConnection extends EventEmitter {
     return this.reconnectEnabled;
   }
 
+  /** Closed with no reconnect to come: after close(), whether or not its
+   *  transport close succeeded, or a drop with reconnect off. A connection
+   *  between retries keeps reconnectEnabled, so it isn't closed for good. */
+  private get closedForGood(): boolean {
+    return this.closed && !this.reconnectEnabled;
+  }
+
   /**
    * Private constructor. Use `McplServerConnection.connect()` instead.
    */
@@ -328,16 +349,29 @@ export class McplServerConnection extends EventEmitter {
    * Mark the connection as ready — flushes any events that arrived between
    * construction (when setupMessageRouting starts emitting) and now (when
    * the caller has attached listeners via wireMcplEvents).
+   *
+   * Does nothing once the connection is closed for good. Its policy was reset
+   * when it closed, so what it held that needs a grant would be refused, and a
+   * closed connection sends no response, so nothing it held could be answered.
+   * Only what needs no grant would pass, to listeners of a server that won't
+   * be served again. A connection between retries isn't closed for good: what
+   * it held, such as a reconnect stub's connect-failed, still reaches its
+   * listeners.
    */
   ready(): void {
+    if (this.closedForGood) return;
     this.controlPlaneReady = true;
     this.dataPlaneReady = true;
     const pending = this.bufferedEvents;
     this.bufferedEvents = [];
+    // The cap's drops are counted per pause: this flush ends one, so its line
+    // reports that pause's drops, and the next pause counts (and logs) its own.
+    const dropped = this.droppedBufferedEvents;
+    this.droppedBufferedEvents = 0;
     if (pending.length > 200) {
       console.error(
         `[mcpl] ${this.id}: flushing ${pending.length} buffered event(s) synchronously ` +
-        `(long pause backlog${this.droppedBufferedEvents > 0 ? `; ${this.droppedBufferedEvents} dropped at cap` : ''})`,
+        `(long pause backlog${dropped > 0 ? `; ${dropped} dropped at cap` : ''})`,
       );
     }
     this.flushDepth++;
@@ -357,9 +391,11 @@ export class McplServerConnection extends EventEmitter {
    * Release only server-establishment and lifecycle/control traffic. Responses
    * to host requests are never event-buffered, so tools/list and tools/call
    * responses remain live as well. Inference-bearing requests stay queued in
-   * their original relative order until {@link ready} is called.
+   * their original relative order until {@link ready} is called. Like
+   * {@link ready}, it does nothing once the connection is closed for good.
    */
   readyControlPlane(): void {
+    if (this.closedForGood) return;
     this.controlPlaneReady = true;
     const pending = this.bufferedEvents;
     this.bufferedEvents = [];
@@ -533,8 +569,9 @@ export class McplServerConnection extends EventEmitter {
     connection.allowHostCommands = config.allowHostCommands === true;
     connection.requestTimeoutMs = config.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS;
 
-    // Store config for reconnection
-    if (config.reconnect) {
+    // Store config for reconnection. Only `true` turns reconnect on, as at
+    // every other reader of it.
+    if (config.reconnect === true) {
       connection.config = config;
       connection.hostCapabilities = hostCapabilities;
       connection.reconnectEnabled = true;
@@ -625,7 +662,8 @@ export class McplServerConnection extends EventEmitter {
         };
         const onClose = (info: TransportCloseInfo) => {
           cleanup();
-          reject(failed(`MCPL server "${config.id}" transport closed before handshake completed (${info.reason ?? 'unknown'})`));
+          const code = transport.kind === 'websocket' && typeof info.code === 'number' ? `, code ${info.code}` : '';
+          reject(failed(`MCPL server "${config.id}" transport closed before handshake completed (${closeReasonText(info)}${code})`));
         };
         const onError = (err: Error) => {
           cleanup();
@@ -683,7 +721,7 @@ export class McplServerConnection extends EventEmitter {
     try {
       return await McplServerConnection.connect(config, hostCapabilities);
     } catch (error) {
-      if (!config.reconnect) {
+      if (config.reconnect !== true) {
         throw error;
       }
 
@@ -935,7 +973,8 @@ export class McplServerConnection extends EventEmitter {
     const attempt = Promise.resolve().then(async () => {
       // An already opened handshake owns a transport too. It hands that
       // transport back without admission once reconnect has been disabled.
-      // The registry bounds this wait; retry reuses this real close attempt.
+      // Only the registry's closeAll bounds its caller's wait for this; retry
+      // reuses this real close attempt.
       if (this.reconnectPromise) await this.reconnectPromise;
       if (this.transport) await this.transport.close();
       this.closeIncomplete = false;
@@ -1395,7 +1434,7 @@ export class McplServerConnection extends EventEmitter {
           if (pending.timer) clearTimeout(pending.timer);
           pending.reject(
             new Error(
-              `MCPL server "${this.id}" disconnected unexpectedly (code=${info.code ?? 'n/a'}, signal=${info.signal ?? 'n/a'}, reason=${info.reason ?? 'unknown'}) while awaiting ${pending.method} (id=${id})`,
+              `MCPL server "${this.id}" disconnected unexpectedly (code=${info.code ?? 'n/a'}, signal=${info.signal ?? 'n/a'}, reason=${closeReasonText(info)}) while awaiting ${pending.method} (id=${id})`,
             ),
           );
         }

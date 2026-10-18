@@ -61,6 +61,15 @@ the house default; plain descriptive titles are accepted.
 - The reviewer will typically **run your branch** (typecheck, test suite,
   sometimes exercising a module against a real store) and paste transcripts.
   Claims are checked, not trusted.
+- **Greptile** reviews only PRs labelled `greptile` (`.greptile/config.json`).
+  A scheduled workflow adds that label to each open, non-draft PR whose
+  additions plus deletions pass 400 lines, unless it carries `no-greptile`,
+  and the review starts when the label lands: within about half an hour of
+  the PR opening, passing 400 lines or being marked ready, and later when
+  GitHub's scheduler is busy. A smaller PR gets a Greptile review if a
+  maintainer adds the label. `no-greptile` skips the review. Removing
+  `greptile` from a PR past 400 lines doesn't skip it, since the next run
+  adds the label back.
 - Respond by pushing fix commits and replying per finding — "Addressed in
   `<sha>`" — rather than force-pushing a rewritten branch. A re-review then
   flips the verdict.
@@ -192,7 +201,7 @@ never do.
 ```bash
 npm install
 npm run build         # tsc; tests run from dist/, so build first
-npm test              # node --test dist/test/*.test.js
+npm test              # node --test --test-force-exit dist/test/*.test.js, with test/helpers/force-exit-blocking-stdout loaded first
 npx tsc --noEmit      # typecheck
 ```
 

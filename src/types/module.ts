@@ -53,7 +53,12 @@ export interface Module {
 
   /**
    * Stop the module.
-   * Called when the framework stops or when the module is removed.
+   * Called when the framework stops or when the module is removed. Also called
+   * when a create() that started the module fails (#389): create() stops the
+   * framework before it rejects, so before the host has it and before anything
+   * a host wires up after create() returns, such as a WorkspaceModule's
+   * initStore(). A stop() that saves state can therefore run before that
+   * wiring, and shouldn't then save over state it was handed and hasn't used.
    */
   stop(): Promise<void>;
 
@@ -322,7 +327,8 @@ export interface ModuleContext {
    * Modules use this to react to agent lifecycle without polling — e.g. an
    * adapter that wants to show a "typing" indicator can bracket it between
    * `inference:started` and the terminal events: `inference:completed` (the
-   * normal end), `inference:turn_ended` (a tool result ended the turn),
+   * model answered and the turn ended, with a final response or with a tool
+   * result that ended it, which `inference:turn_ended` then follows),
    * `inference:aborted`, `inference:failed` and `inference:exhausted`, all of
    * which carry `agentName`. A turn's tool-call cycles stay inside its
    * stream, so one bracket spans them. A context-budget restart emits

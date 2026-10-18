@@ -141,15 +141,17 @@ export const CHILD_ENV_ALLOWLIST = [
 
 /** Environment for a stdio child: allowlisted host vars (+ LC_*), then the
  *  server's declared `env` on top. Windows names merge case-insensitively;
- *  POSIX names remain case-sensitive. `inheritEnv: true` restores full inheritance. */
+ *  POSIX names remain case-sensitive. `inheritEnv: true` restores full inheritance,
+ *  and only `true` does: a direct caller can pass any value, unchecked. */
 export function buildChildEnv(
   config: Pick<McplServerConfig, 'env' | 'inheritEnv'>,
   hostEnv: NodeJS.ProcessEnv = process.env,
   platform: NodeJS.Platform = process.platform,
 ): NodeJS.ProcessEnv {
   const win = platform === 'win32';
-  const env: NodeJS.ProcessEnv = config.inheritEnv ? { ...hostEnv } : {};
-  if (!config.inheritEnv) {
+  const inherit = config.inheritEnv === true;
+  const env: NodeJS.ProcessEnv = inherit ? { ...hostEnv } : {};
+  if (!inherit) {
     for (const [key, value] of Object.entries(hostEnv)) {
       if (value === undefined) continue;
       // Windows commonly enumerates Path/SystemRoot rather than PATH/SYSTEMROOT.
@@ -479,6 +481,53 @@ export function isWebSocketTransport(config: McplServerConfig): boolean {
   if (config.transport === 'websocket') return true;
   if (config.transport === 'stdio') return false;
   return Boolean(config.url) && !config.command;
+}
+
+/** The settings of McplServerConfig whose type is boolean. */
+type BooleanSetting = {
+  [K in keyof McplServerConfig]-?: NonNullable<McplServerConfig[K]> extends boolean ? K : never;
+}[keyof McplServerConfig];
+
+/** What `true` does for each boolean setting, as its refusal says it. A
+ *  boolean setting added to McplServerConfig doesn't compile until it has
+ *  an entry here, so the check below covers it too. */
+const SERVER_CONFIG_BOOLEANS: Record<BooleanSetting, string> = {
+  inheritEnv: 'true passes the server the host\'s whole environment, and false or leaving it out passes only the allowlisted and LC_* host variables',
+  reconnect: 'true retries in the background when the server can\'t be reached or its connection drops, and false or leaving it out doesn\'t',
+  allowHostCommands: 'true lets the server run the host\'s admin commands, such as undo, hide, unstick and quiesce, and false or leaving it out refuses them',
+};
+
+/**
+ * Refuse a server config whose `inheritEnv`, `reconnect` or `allowHostCommands`
+ * holds anything but true or false. A config read from JSON can carry a quoted
+ * "false" where the type says boolean, and every reader of these settings takes
+ * only `true` as on, so the quotes would hide what the value does. null counts
+ * as not set, so a generated config that writes an unset setting as null
+ * keeps working. `inheritEnv` is checked only for a stdio server, since a
+ * WebSocket server never reads it. The error names the server, the setting
+ * and the value's kind, not the value, which could be a secret pasted into
+ * the wrong field.
+ */
+export function assertServerConfigBooleans(config: McplServerConfig): void {
+  for (const [setting, whatTrueDoes] of Object.entries(SERVER_CONFIG_BOOLEANS) as Array<[BooleanSetting, string]>) {
+    if (setting === 'inheritEnv' && isWebSocketTransport(config)) continue;
+    const value: unknown = config[setting];
+    if (value === undefined || value === null || typeof value === 'boolean') continue;
+    const wanted = typeof value === 'string' ? 'true or false, unquoted,' : 'true or false,';
+    throw new Error(`MCPL server "${config.id}" ${setting} must be ${wanted} not ${kindOf(value)}: ${whatTrueDoes}`);
+  }
+}
+
+/** The kind of a value that isn't undefined, null or a boolean, as a refusal
+ *  names it in place of the value. */
+function kindOf(value: unknown): string {
+  if (Array.isArray(value)) return 'an array';
+  if (typeof value !== 'object') return `a ${typeof value}`;
+  const prototype = Object.getPrototypeOf(value) as { constructor?: { name?: string } } | null;
+  if (prototype === null || prototype === Object.prototype) return 'an object';
+  const name = prototype.constructor?.name;
+  if (!name) return 'an object that isn\'t plain';
+  return `${/^[aeiou]/i.test(name) ? 'an' : 'a'} ${name}`;
 }
 
 /**

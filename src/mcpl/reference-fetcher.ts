@@ -29,7 +29,7 @@
  */
 import { createHash } from 'node:crypto';
 import type { ReferenceRecord } from './references.js';
-import { EXPIRY_REASON, isReferenceExpired, referenceExpiry, REFERENCE_LIMITS, sanitizeLabel } from './references.js';
+import { EXPIRY_REASON, isReferenceExpired, referenceExpiry, REFERENCE_LIMITS, sanitizeLabel, UNBOUND_REASON } from './references.js';
 
 /** Per-fetch hard ceiling on actual bytes (overridable per server / call). */
 export const DEFAULT_FETCH_MAX_BYTES = 256 * 1024 * 1024;
@@ -158,7 +158,7 @@ export class ReferenceFetcher {
 
   private async doFetch(record: ReferenceRecord, opts?: { maxBytes?: number; timeoutMs?: number }): Promise<FetchOutcome> {
     const t = record.testimony;
-    if (record.serverId === undefined) return { ok: false, error: 'reference has no server binding' };
+    if (record.serverId === undefined) return { ok: false, error: `reference ${UNBOUND_REASON}` };
     const binding = this.resolveServer(record.serverId);
     if (!binding) return { ok: false, error: `unknown server: ${record.serverId}` };
 

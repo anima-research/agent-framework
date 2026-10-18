@@ -312,3 +312,110 @@ test("reconnectAfterFailure() on a live transport reports byHost: true and still
     wss.close();
   }
 });
+
+/** A WebSocket server that closes each socket with `code` and the server's own
+ *  close reason `reason` when it receives `method`, and otherwise answers as
+ *  startMockMcplWsServer does. */
+function startClosingWsServer(method: string, code: number, reason: string) {
+  const wss = startMockMcplWsServer((ws) => {
+    ws.on('message', (data) => {
+      const msg = JSON.parse(String(data)) as { method?: string };
+      if (msg.method === method) ws.close(code, reason);
+    });
+  });
+  return wss;
+}
+
+// A close reason the server writes, made to forge a second host log line.
+const PEER_REASON = 'token expired\n[mcpl] editor: forged line';
+
+test("a server's close reason during the handshake stays out of the connect error, which gives the transport's words and the close code", async () => {
+  const wss = startClosingWsServer('initialize', 4001, PEER_REASON);
+  await waitListening(wss);
+  try {
+    await assert.rejects(
+      withDeadline(McplServerConnection.connect({ id: 'editor', url: wsUrl(wss) }, HOST_CAPS), 10_000, 'the connect to fail'),
+      (error: Error) => {
+        assert.equal(error.message, 'MCPL server "editor" transport closed before handshake completed (websocket closed, code 4001)');
+        return true;
+      },
+    );
+  } finally {
+    wss.close();
+  }
+});
+
+test('a server that closes during the handshake with a code and no reason gets the same connect error, the code included', async () => {
+  // A refused credential can come as 4001 alone: the code is what tells it
+  // from another close, whether or not the server sent words with it.
+  const wss = startClosingWsServer('initialize', 4001, '');
+  await waitListening(wss);
+  try {
+    await assert.rejects(
+      withDeadline(McplServerConnection.connect({ id: 'editor', url: wsUrl(wss) }, HOST_CAPS), 10_000, 'the connect to fail'),
+      (error: Error) => {
+        assert.equal(error.message, 'MCPL server "editor" transport closed before handshake completed (websocket closed, code 4001)');
+        return true;
+      },
+    );
+  } finally {
+    wss.close();
+  }
+});
+
+test("a server's close reason stays out of the error a pending request is rejected with", async () => {
+  const wss = startClosingWsServer('tools/call', 4001, PEER_REASON);
+  await waitListening(wss);
+  let conn: McplServerConnection | undefined;
+  try {
+    conn = await McplServerConnection.connect({ id: 'editor', url: wsUrl(wss) }, HOST_CAPS);
+    conn.ready();
+    await assert.rejects(
+      withDeadline(conn.sendToolsCall('echo', { text: 'hello' }), 10_000, 'the call to be rejected'),
+      (error: Error) => {
+        assert.match(error.message, /^MCPL server "editor" disconnected unexpectedly \(code=4001, signal=n\/a, reason=websocket closed\) while awaiting tools\/call \(id=\d+\)$/);
+        return true;
+      },
+    );
+  } finally {
+    await conn?.close();
+    wss.close();
+  }
+});
+
+test('the buffered-event cap counts the drops of each pause: a later pause reports its own, and logs its first drop', async () => {
+  // The second pause runs through a control-only flush and a second pause of
+  // the data plane before ready() ends it, and its count covers all of it.
+  const wss = startMockMcplWsServer();
+  await waitListening(wss);
+  const conn = await McplServerConnection.connect({ id: 'editor', url: wsUrl(wss) }, HOST_CAPS);
+  const lines: string[] = [];
+  const consoleError = console.error;
+  console.error = (...args: unknown[]) => { lines.push(args.map(String).join(' ')); };
+  try {
+    conn.ready();
+    // A responder-less data-plane event while the data plane is paused is
+    // buffered, and past the cap (1000) the oldest such event is dropped.
+    const pauseAndBuffer = (count: number) => {
+      conn.pauseDataPlane();
+      for (let i = 0; i < count; i++) conn.emit('test-data-event', { i });
+    };
+    pauseAndBuffer(1150);
+    conn.ready();
+    pauseAndBuffer(1050);
+    // Within one pause, neither a control-only flush (a quiesce's) nor
+    // pausing the paused data plane again starts the count over.
+    conn.readyControlPlane();
+    conn.pauseDataPlane();
+    for (let i = 0; i < 25; i++) conn.emit('test-data-event', { late: i });
+    conn.ready();
+  } finally {
+    console.error = consoleError;
+    await conn.close();
+    wss.close();
+  }
+  const flushes = lines.filter((line) => line.includes('buffered event(s) synchronously'));
+  assert.deepEqual(flushes.map((line) => /; (\d+) dropped at cap\)$/.exec(line)?.[1]), ['150', '75']);
+  const dropLogs = lines.filter((line) => line.includes('buffered-event cap'));
+  assert.deepEqual(dropLogs.map((line) => /dropped (\d+) responder-less/.exec(line)?.[1]), ['1', '101', '1']);
+});

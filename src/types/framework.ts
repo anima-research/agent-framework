@@ -413,18 +413,30 @@ export interface InferenceLogEntry {
   success: boolean;
   /** Error message if failed */
   error?: string;
-  /** Request data or blob ID if large */
+  /** Request data or blob ID if large. A stream the framework ended at a
+   *  tool boundary (stopReason 'turn_ended', 'context_budget' or
+   *  'physical_window') records a note in place of the body. */
   request: unknown | { blobId: string };
   /** Response data or blob ID if large (only if successful) */
   response?: unknown | { blobId: string };
   durationMs: number;
+  /** The stream's usage: its final response's, or, for a stream that ended
+   *  without one, the provider rounds it finished before it ended. Exactly
+   *  one entry of a stream carries it, the one its end wrote; a stream whose
+   *  end writes none (a quiesce-abandoned turn, a superseded stream, a
+   *  disposed agent's stream) gets a failure entry that carries it, when it
+   *  had finished a round. One that hadn't has nothing to carry and gets no
+   *  entry. */
   tokenUsage?: {
     input: number;
     output: number;
     cacheCreation?: number;
     cacheRead?: number;
   };
-  /** Stop reason from the model */
+  /** Stop reason from the model, or why the framework ended the stream at a
+   *  tool boundary: 'turn_ended' (a tool result with endTurn), or
+   *  'context_budget' / 'physical_window' (a context-budget or
+   *  physical-window restart). */
   stopReason?: string;
 }
 

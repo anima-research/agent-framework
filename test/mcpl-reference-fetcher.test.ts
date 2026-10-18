@@ -9,7 +9,7 @@ import assert from 'node:assert/strict';
 import { createServer } from 'node:http';
 import { createHash } from 'node:crypto';
 import { ReferenceFetcher, normalizedOrigin } from '../src/mcpl/reference-fetcher.js';
-import { ReferenceRegistry, classifyBlock, referenceExpiry, referenceRegistry } from '../src/mcpl/references.js';
+import { ReferenceRegistry, UNBOUND_REASON, classifyBlock, referenceExpiry, referenceRegistry } from '../src/mcpl/references.js';
 import { AgentFramework } from '../src/framework.js';
 
 const PAYLOAD = Buffer.from('RIFF-not-really-a-wav-'.repeat(100));
@@ -422,6 +422,43 @@ test('binding upgrade: unbound stub-time registration gains the dispatch serverI
   const bound = reg.register(t, 'srv');               // dispatch: knows the server
   assert.equal(unbound.refId, bound.refId, 'one record, not a fork');
   assert.equal(unbound.serverId, 'srv', 'binding upgraded in place');
+});
+
+test('fetch_reference answers an unbound reference with the reason its stub gives, and dials nothing', { timeout: 10_000 }, async () => {
+  // Registered with no server, as an in-process module's reference or a channel message's is.
+  const c = classifyBlock({ type: 'resource', uri: `${ORIGIN}/ok?unbound`, sizeBytes: PAYLOAD.length });
+  assert.equal(c.kind, 'reference');
+  const record = referenceRegistry.register((c as Extract<ReturnType<typeof classifyBlock>, { kind: 'reference' }>).testimony);
+  const fetcher = makeFetcher({ srv: { url: ORIGIN } });
+  assert.equal(fetcher.isEagerEligible(record), false, 'no eager slot either');
+  type Answer = { result: { success: boolean; error?: string; isError?: boolean } };
+  const framework = Object.create(AgentFramework.prototype) as {
+    getReferenceFetcher(): ReferenceFetcher;
+    emitTrace(event: unknown): void;
+    pushEvent(event: unknown): void;
+    dispatchFetchReferenceToolCall(agentName: string, call: { id: string; name: string; input: unknown }): void;
+  };
+  framework.getReferenceFetcher = () => fetcher;
+  framework.emitTrace = () => {};
+  const answered = new Promise<Answer>((resolve) => { framework.pushEvent = (event) => resolve(event as Answer); });
+  framework.dispatchFetchReferenceToolCall('prime', { id: 'call_fetch', name: 'fetch_reference', input: { ref_id: record.refId } });
+  const { result } = await answered;
+  assert.equal(result.success, false);
+  assert.equal(result.isError, true);
+  assert.equal(result.error, `reference ${UNBOUND_REASON}`);
+  assert.equal(hits.get('/ok?unbound') ?? 0, 0, 'nothing dialed');
+});
+
+test('a reference both unbound and expired is refused as unbound, the reason its stub gives', async () => {
+  const reg = new ReferenceRegistry();
+  const c = classifyBlock({ type: 'resource', uri: `${ORIGIN}/ok?unbound-expired`, expiresAt: '2001-01-01T00:00:00Z' });
+  assert.equal(c.kind, 'reference');
+  const t = (c as Extract<ReturnType<typeof classifyBlock>, { kind: 'reference' }>).testimony;
+  assert.equal(referenceExpiry(t), 'passed');
+  const out = await makeFetcher({ srv: { url: ORIGIN } }).fetch(reg.register(t));
+  assert.equal(out.ok, false);
+  assert.equal(out.error, `reference ${UNBOUND_REASON}`);
+  assert.equal(hits.get('/ok?unbound-expired') ?? 0, 0, 'nothing dialed');
 });
 
 test('testimony refreshes while unfetched, freezes after fetch', async () => {

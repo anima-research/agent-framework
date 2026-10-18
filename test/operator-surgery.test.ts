@@ -228,6 +228,105 @@ describe('live operator surgery', () => {
     }
   });
 
+  it('a write deferred behind the surgery lands with its durable id, as every flush from the queue does', async () => {
+    const c = cm() as unknown as { switchBranch: (name: string) => Promise<void> };
+    const originalSwitch = c.switchBranch;
+    let releaseSwitch!: () => void;
+    const gate = new Promise<void>((resolve) => { releaseSwitch = resolve; });
+    c.switchBranch = async (name: string) => { await gate; return originalSwitch.call(c, name); };
+    const internals = framework as unknown as {
+      surgeryHold: unknown;
+      deferredMessages: Array<{ id: string }>;
+      addMessage(participant: string, content: unknown[], metadata?: Record<string, unknown>): string;
+    };
+    try {
+      const rollback = framework.rollbackToMessage('scout', { messageId: ids[2] });
+      await new Promise((resolve) => setImmediate(resolve));
+      assert.ok(internals.surgeryHold, 'store hold is up while the switch is awaited');
+      assert.equal(internals.addMessage('user', [{ type: 'text', text: 'arrived mid-surgery' }]), '', 'deferred');
+      const queuedId = internals.deferredMessages.at(-1)!.id;
+      releaseSwitch();
+      await rollback;
+      const landed = cm().getAllMessages().find((m) => (m.content[0] as { text?: string }).text === 'arrived mid-surgery');
+      assert.ok(landed, 'flushed when the hold released');
+      // The id makes a queued pair's tool_result re-defer with its tool_use
+      // rather than land alone, and lets boot recovery skip a replay.
+      assert.equal((landed!.metadata as { deferredWriteId?: string } | undefined)?.deferredWriteId, queuedId);
+    } finally {
+      c.switchBranch = originalSwitch;
+    }
+  });
+
+  it("the post-surgery flush lands what waited behind the hold while another agent's tool cycle is pending, and acknowledges it", { timeout: 60_000 }, async () => {
+    const c = cm() as unknown as { switchBranch: (name: string) => Promise<void> };
+    const originalSwitch = c.switchBranch;
+    let releaseSwitch!: () => void;
+    const gate = new Promise<void>((resolve) => { releaseSwitch = resolve; });
+    let entered!: () => void;
+    const inSwitch = new Promise<void>((resolve) => { entered = resolve; });
+    c.switchBranch = async (name: string) => { entered(); await gate; return originalSwitch.call(c, name); };
+    const internals = framework as unknown as {
+      surgeryHold: unknown;
+      deferredWritesPersisted: boolean;
+      unackedDeferredWrites: unknown[];
+      pendingAssistantBlocks: Map<string, unknown[]>;
+      addMessage(participant: string, content: unknown[], metadata?: Record<string, unknown>): string;
+    };
+    internals.deferredWritesPersisted = true;
+    try {
+      const rollback = framework.rollbackToMessage('scout', { messageId: ids[2] });
+      await inSwitch;
+      assert.ok(internals.surgeryHold, 'store hold is up while the switch is awaited');
+      assert.equal(internals.addMessage('user', [{ type: 'text', text: 'waited for the hold' }]), '', 'deferred');
+      // Another agent's tool cycle says nothing about scout's window.
+      internals.pendingAssistantBlocks.set('builder', [{ type: 'tool_use', id: 'b1', name: 'x', input: {} }]);
+      releaseSwitch();
+      await rollback;
+      assert.ok(remainingTexts().includes('waited for the hold'), 'flushed when the hold released');
+      assert.equal(internals.unackedDeferredWrites.length, 0, 'and acknowledged, so the recovery queue no longer holds it');
+    } finally {
+      internals.pendingAssistantBlocks.delete('builder');
+      c.switchBranch = originalSwitch;
+    }
+  });
+
+  it("the post-surgery flush stores several agents' writes in the order they arrived", { timeout: 60_000 }, async () => {
+    // Residents share one message slot, so the order writes arrived in is the
+    // order every resident reads.
+    await framework.stop();
+    framework = await AgentFramework.create({
+      storePath,
+      membrane: membrane.asMembrane(),
+      agents: [
+        { name: 'scout', model: 'test-model', systemPrompt: 'You are scout.' },
+        { name: 'builder', model: 'test-model', systemPrompt: 'You are builder.' },
+      ],
+      modules: [],
+    });
+    const c = cm() as unknown as { switchBranch: (name: string) => Promise<void> };
+    const originalSwitch = c.switchBranch;
+    let releaseSwitch!: () => void;
+    const gate = new Promise<void>((resolve) => { releaseSwitch = resolve; });
+    let entered!: () => void;
+    const inSwitch = new Promise<void>((resolve) => { entered = resolve; });
+    c.switchBranch = async (name: string) => { entered(); await gate; return originalSwitch.call(c, name); };
+    const add = (framework as unknown as {
+      addMessage(participant: string, content: unknown[], metadata?: undefined, opts?: { forAgent?: string }): string;
+    }).addMessage.bind(framework);
+    try {
+      const rollback = framework.rollbackToMessage('scout', { messageId: ids[2] });
+      await inSwitch;
+      assert.equal(add('user', [{ type: 'text', text: 'one' }]), '', 'deferred');
+      assert.equal(add('user', [{ type: 'text', text: 'two' }], undefined, { forAgent: 'builder' }), '', 'deferred');
+      assert.equal(add('user', [{ type: 'text', text: 'three' }]), '', 'deferred');
+      releaseSwitch();
+      await rollback;
+      assert.deepEqual(remainingTexts().filter((t) => ['one', 'two', 'three'].includes(t)), ['one', 'two', 'three']);
+    } finally {
+      c.switchBranch = originalSwitch;
+    }
+  });
+
   // --- strategy-initialization failure -----------------------------------------
   // switchBranch()/fork() move the chronicle branch BEFORE awaiting strategy
   // initialization, so a rejection there leaves the store on the new branch.
@@ -429,6 +528,57 @@ describe('live operator surgery', () => {
     assert.deepEqual(entry.result?.removedIds, huge.slice(0, 50));
     assert.equal(entry.result?.removedIdsTruncated, true);
     for (const id of huge) assert.equal(cm().getMessage(id as never), null);
+
+    // The range form takes what was stored between its two messages, from the
+    // earlier one's first copy through the later one's first, in either
+    // order, and every copy of both: a range ending at a message stored twice
+    // takes its retry too.
+    const hideRange = (fromMessageId: string, toMessageId: string) => internals.handleHostCommand('discord', {
+      command: 'hide', agentName: 'scout', fromMessageId, toMessageId, requesterName: 'antra',
+    });
+    const plain = (text: string, discordId: string) => cm().addMessage('user', [{ type: 'text', text }], {
+      serverId: 'discord', channelId: 'discord:g1:c1', messageId: discordId,
+    });
+    appendBody('d-cut2', 'g-cut2', ['p0', 'p1']);
+    appendBody('d-cut2', 'g-cut2', ['r0', 'r1', 'r2']);
+    plain('after', 'd-after');
+    const forward = await hideRange('d4', 'd-cut2');
+    assert.equal(forward.ok, true, String(forward.error));
+    assert.equal(forward.hidden, 4, 'm4, m5, and both copies of the cut message');
+    assert.deepEqual(refsOf(forward), ['d4', 'd5', 'd-cut2']);
+    assert.deepEqual(remainingTexts(), ['m1', 'm2', 'm3', 'after']);
+
+    appendBody('d-cut3', 'g-cut3', ['q0']);
+    appendBody('d-cut3', 'g-cut3', ['s0', 's1']);
+    plain('last', 'd-last');
+    const backward = await hideRange('d-cut3', 'd2');
+    assert.equal(backward.ok, true, String(backward.error));
+    assert.equal(backward.hidden, 5, 'm2, m3, after, and both copies of the cut message');
+    assert.deepEqual(remainingTexts(), ['m1', 'last']);
+
+    // What was stored between a message's first copy and its retry came after
+    // that message began, so a range ending at it leaves that in.
+    plain('A', 'd-a');
+    appendBody('d-b', 'g-b', ['bp0']);
+    plain('Z', 'd-z');
+    appendBody('d-b', 'g-b', ['br0', 'br1']);
+    const between = await hideRange('d-a', 'd-b');
+    assert.equal(between.ok, true, String(between.error));
+    assert.equal(between.hidden, 3, 'A, and both copies of B');
+    assert.deepEqual(refsOf(between), ['d-a', 'd-b']);
+    assert.deepEqual(remainingTexts(), ['m1', 'last', 'Z']);
+
+    // A copy of the earlier message stored after the later one goes too, on
+    // its own: what was stored between them stays.
+    appendBody('d-c', 'g-c', ['cp0']);
+    plain('D', 'd-d');
+    plain('E', 'd-e');
+    appendBody('d-c', 'g-c', ['cr0', 'cr1']);
+    const mirror = await hideRange('d-d', 'd-c');
+    assert.equal(mirror.ok, true, String(mirror.error));
+    assert.equal(mirror.hidden, 3, 'both copies of C, and D');
+    assert.deepEqual(refsOf(mirror), ['d-c', 'd-d']);
+    assert.deepEqual(remainingTexts(), ['m1', 'last', 'Z', 'E']);
   });
 
   it('hide refuses while a surgery holds the store, and a missing Discord id matches nothing', async () => {

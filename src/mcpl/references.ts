@@ -172,6 +172,11 @@ export const EXPIRY_REASON = {
   rejected: `treated as expired: its expiresAt was rejected as a field, over ${REFERENCE_LIMITS.expiresAt} characters or not a string (fail closed)`,
 } as const;
 
+/** A reference registered with no server, as the stub, the fetcher's refusal
+ *  and save_recent_image's all say it: the fetcher dials only through the
+ *  server a reference was registered against. */
+export const UNBOUND_REASON = 'unbound: no server is recorded to fetch it from';
+
 /** Strip control characters (C0, DEL, C1) and every bidi control (marks,
  *  embeddings, overrides, isolates, and the Arabic letter mark), trim the
  *  whitespace (a BOM included) left at either end, and bound the length.
@@ -319,12 +324,27 @@ export function buildReferenceStub(t: ReferenceTestimony, provenance?: string, s
     // workspace path (host-generated, §7.3) so existing tools just work.
     parts.push(`saved: ${sanitizeLabel(record.fetchedPath, 256)}`);
   } else {
-    // An expired reference says so rather than inviting a fetch_reference
-    // call the fetcher can only refuse.
-    const expiry = referenceExpiry(record.testimony);
-    parts.push(expiry ? EXPIRY_REASON[expiry] : 'fetch with fetch_reference');
+    // A reference whose record shows the fetcher would refuse it says why,
+    // rather than inviting a fetch_reference call.
+    parts.push(unfetchableReason(record) ?? 'fetch with fetch_reference');
   }
   return `[${record.refId}] ${parts.join(' — ') || 'referenced content'}`;
+}
+
+/**
+ * Why the fetcher would refuse a reference, as far as its record shows: no
+ * server registered for it, which the fetcher checks first, or its expiry.
+ * Null for a saved copy, which the fetcher serves before any check, and when
+ * the record shows neither. The fetcher's other refusals rest on what a record
+ * doesn't hold, such as a server gone by the time of the fetch, a uri off the
+ * origin its server was dialed at, a claimed size over the ceiling a fetch is
+ * given, or a server's fetch budget spent, and it gives those in its own words.
+ */
+export function unfetchableReason(record: ReferenceRecord, nowMs = Date.now()): string | null {
+  if (record.fetchedPath) return null;
+  if (record.serverId === undefined) return UNBOUND_REASON;
+  const expiry = referenceExpiry(record.testimony, nowMs);
+  return expiry ? EXPIRY_REASON[expiry] : null;
 }
 
 /**

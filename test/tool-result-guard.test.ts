@@ -1252,7 +1252,50 @@ test('usage of an abandoned guarded round is counted in session totals', async (
   try {
     await h.run();
     const totals = h.framework.getSessionUsage().totals as unknown as Record<string, number>;
-    assert.ok(totals.inputTokens >= 1_007, `refused round usage missing: ${JSON.stringify(totals)}`);
+    assert.equal(totals.inputTokens, 1_007, `the refused round is counted, once: ${JSON.stringify(totals)}`);
+  } finally { await h.framework.stop(); }
+});
+
+test('an abandoned guarded round whose response carries no usage still counts its rounds', async () => {
+  // Membrane's usage samples are cumulative across a stream's rounds: the
+  // withheld stream's two rounds emit 10, then 20 input tokens, and the
+  // retry's one round 10. No final response carries details.usage, so each
+  // stream counts its latest sample.
+  const sampled = (response: NormalizedResponse, inputTokens: number, outputTokens: number) =>
+    ({ ...response, usage: { inputTokens, outputTokens } }) as NormalizedResponse;
+  const h = await harness([[sampled(calls('one'), 10, 5), sampled(refused(), 20, 10)], [sampled(answer(), 10, 5)]], { toolResultGuard: true });
+  try {
+    await h.run();
+    const totals = h.framework.getSessionUsage().totals as unknown as Record<string, number>;
+    assert.equal(totals.inputTokens, 30, `each stream is counted once, from its latest sample: ${JSON.stringify(totals)}`);
+    // The log says what the totals count: the withheld stream, then the retry.
+    const logs = h.framework.queryInferenceLogs({ agentName: 'assistant' }).entries.map((e) => e.entry).reverse();
+    assert.deepEqual(logs.map((e) => [e.success, e.tokenUsage]),
+      [[false, { input: 20, output: 10 }], [true, { input: 10, output: 5 }]]);
+  } finally { await h.framework.stop(); }
+});
+
+test("an abandoned guarded round with no usage sample counts and notes its response's own usage", async () => {
+  const h = await harness([[calls('one'), refused()], [answer()]], { toolResultGuard: true });
+  // A stream that emits no usage events: only the refused response's own
+  // usage (10 input tokens, from the shared mock) says what it was billed.
+  const make = h.membrane.streamYielding.bind(h.membrane);
+  h.membrane.streamYielding = (request, options) => {
+    const stream = make(request, options);
+    const events = stream[Symbol.asyncIterator].bind(stream);
+    stream[Symbol.asyncIterator] = async function* () {
+      const it = events();
+      for (let r = await it.next(); !r.done; r = await it.next()) if (r.value.type !== 'usage') yield r.value;
+    };
+    return stream;
+  };
+  try {
+    await h.run();
+    const totals = h.framework.getSessionUsage().totals as unknown as Record<string, number>;
+    assert.equal(totals.inputTokens, 10, `the refused round is counted from its response: ${JSON.stringify(totals)}`);
+    const withheld = h.framework.queryInferenceLogs({ agentName: 'assistant' }).entries.map((e) => e.entry)
+      .find((e) => e.stopReason === 'refusal');
+    assert.deepEqual(withheld?.tokenUsage, { input: 10, output: 5 }, "the withheld stream's entry carries the response's usage");
   } finally { await h.framework.stop(); }
 });
 
@@ -1684,7 +1727,13 @@ test('storage recovery: shutdown retries edits queued by its terminating stream'
     edit(id, content);
   };
   let stopping: Promise<void> | undefined;
-  h.membrane.onSubmit = () => { stopping = h.framework.stop(); };
+  // stop() begins once the turn's stream has completed, on its
+  // inference:completed: the guard has accepted the batch, and its edit has
+  // failed once and is queued. (Begun while the round's results were
+  // submitted, at `ready`, stop() would now cancel the turn there.)
+  h.framework.onTrace((event) => {
+    if (event.type === 'inference:completed' && !stopping) stopping = h.framework.stop();
+  });
   try {
     await h.run();
     assert.ok(stopping);
@@ -2246,8 +2295,14 @@ test('#277: writeBinary for a branch writes there, and is refused once the works
 // what is so.
 // ---------------------------------------------------------------------------
 
-test('#281: a write still under way at the deadline is named as unfinished, and nothing waits on it longer', async () => {
+test('#281: a write still under way at the deadline is named as unfinished, and nothing waits on it longer', async (t) => {
   const h = await workspaceHarness([[calls('one', 'two'), refused()], [answer()]]);
+  // The batch's deadline is a Date.now() time taken when the batch is
+  // queued, and its first write starts only after the steps between, which
+  // a loaded host can stretch past a short deadline. With the clock held
+  // still, the deadline can't be spent before the write starts. The spill's
+  // own timer is a real one, and fires while the stalled write is under way.
+  t.mock.timers.enable({ apis: ['Date'], now: Date.now() });
   (h.framework as unknown as { withheldSpillDeadlineMs: number }).withheldSpillDeadlineMs = 50;
   const stalled = gate();
   let writes = 0;
@@ -2499,12 +2554,15 @@ test("#281: a disposed run's failed acceptance edit is retried by maintenance, a
   } finally { await h.framework.stop(); }
 });
 
-test('#281: batches behind one stalled write cost one deadline: no write starts until it settles', async () => {
+test('#281: batches behind one stalled write cost one deadline: no write starts until it settles', async (t) => {
   const h = await workspaceHarness([
     [calls('one'), refused()], [answer()],
     [calls('two'), refused()], [answer()],
     [calls('three'), refused()], [answer()],
   ]);
+  // As in the test above: with the clock held still, no batch's deadline can
+  // be spent before its write starts, whatever the host's load.
+  t.mock.timers.enable({ apis: ['Date'], now: Date.now() });
   (h.framework as unknown as { withheldSpillDeadlineMs: number }).withheldSpillDeadlineMs = 50;
   const framework = h.framework as unknown as {
     writeToolResultFile: (...args: unknown[]) => Promise<unknown>;
@@ -2529,6 +2587,10 @@ test('#281: batches behind one stalled write cost one deadline: no write starts 
     assert.equal(toolResults(h.framework)[1].content, AUDIT_STUB);
     stalled.open();
     await until(() => framework.stalledSpills.size === 0, 'the stalled write settles');
+    // The third batch's write is a real one, with nothing stalling it, and
+    // the spill's timer is real too: a deadline far beyond what a write here
+    // takes keeps a slow write on a loaded host from being named unfinished.
+    (h.framework as unknown as { withheldSpillDeadlineMs: number }).withheldSpillDeadlineMs = 60_000;
     await bounded(h.run(), 'the third batch');
     assert.equal(writes, 2, 'once it has settled, the next original is written');
     assert.ok(typeof annotated()[2].results[0].path === 'string' && annotated()[2].results[0].unfinished === undefined);
@@ -2592,13 +2654,18 @@ test('#281: stop during a compile that waits for an annotation lets no provider 
   } finally { write.open(); if (!stopped) await h.framework.stop(); }
 });
 
-test('#281: writes that stalled together each hold the workspace as unanswered until it settles', async () => {
+test('#281: writes that stalled together each hold the workspace as unanswered until it settles', async (t) => {
   const h = await workspaceHarness([]);
   const framework = h.framework as unknown as {
     withheldSpillDeadlineMs: number;
     writeToolResultFile: (label: string) => Promise<unknown>;
     spillWithheld: (label: string, text: string, branch: string) => Promise<unknown>;
   };
+  // spillWithheld reads the clock for its deadline and again before the write
+  // starts, with the write's place found between; a pause of the process
+  // there on a loaded host would spend 30 ms. With the clock held still it
+  // can't, and the spill's own timer is a real one.
+  t.mock.timers.enable({ apis: ['Date'], now: Date.now() });
   framework.withheldSpillDeadlineMs = 30;
   const gates = new Map<string, ReturnType<typeof gate>>([['a', gate()], ['b', gate()]]);
   const started: string[] = [];
