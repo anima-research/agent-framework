@@ -112,6 +112,7 @@ import { ProviderWaits, EVERY_MODEL, isReleaseModel, withoutControls, type Provi
 import type { WorkspaceModule } from './modules/workspace/index.js';
 import type { ToolResultGuard, WithheldSpill } from './tool-result-guard.js';
 import {
+  goesNative,
   nonErrorResultText,
   toolResultBlocks,
   toolResultDataToHistoryString,
@@ -18401,11 +18402,12 @@ export class AgentFramework {
    * the image stays reachable by provenance after the bytes leave the wire.
    *
    * The live copy is the stored text itself unless the result is a content
-   * array carrying an inline image, which tryNativeToolResultContent sends
-   * as native blocks. It takes the blocks the serializer takes
-   * (toolResultBlocks), and shows each image, stub and marker whole and each
-   * text block up to where it cuts that block at the cap (`maxChars`,
-   * toolResultCutAt), so those are the ranges of the text it showed.
+   * array carrying an inline image whose links and markers fit the cap
+   * together (goesNative), which tryNativeToolResultContent sends as native
+   * blocks. It takes the blocks the serializer takes (toolResultBlocks), and
+   * shows each image, stub and marker whole and each text block up to where
+   * it cuts that block at the cap (`maxChars`, toolResultCutAt), so those are
+   * the ranges of the text it showed.
    */
   private storedToolResultText(
     agentName: string,
@@ -18425,7 +18427,9 @@ export class AgentFramework {
       }).ref,
       onBlocks: (spans) => { blocks = spans; },
     });
-    if (!blocks?.some((block) => block.kind === 'image')) return { text, shown: null };
+    if (!blocks || !goesNative(blocks.map(({ kind, start, end }) => ({ kind, length: end - start })), maxChars)) {
+      return { text, shown: null };
+    }
     return {
       text,
       shown: blocks.map(({ kind, start, end }): [number, number] =>
@@ -18827,9 +18831,10 @@ export class AgentFramework {
 
   /**
    * If `data` is a content array (toolResultBlocks) carrying at least one
-   * image, its blocks as Membrane's native ToolResultContentBlock[]: each
-   * image as itself, and every other block as the text the stored copy shows
-   * for it. Returns null otherwise, and the live copy is the stored text.
+   * image, and its links and markers fit the cap together (goesNative),
+   * its blocks as Membrane's native ToolResultContentBlock[]: each image as
+   * itself, and every other block as the text the stored copy shows for it.
+   * Returns null otherwise, and the live copy is the stored text.
    * `maxChars`, when provided, caps each accompanying text block so an image
    * inlined alongside an enormous text payload can't blow the context. A
    * block is cut as the stored copy is (toolResultCutAt), never inside a
@@ -18844,7 +18849,9 @@ export class AgentFramework {
     spillPath: string | null = null,
   ): ToolResultContentBlock[] | null {
     const blocks = toolResultBlocks(data, dataIsContent);
-    if (!blocks?.some((block) => block.kind === 'image')) return null;
+    if (!blocks || !goesNative(blocks.map((block) => ({ kind: block.kind, length: block.kind === 'image' ? 0 : block.text.length })), maxChars)) {
+      return null;
+    }
     return blocks.map((block): ToolResultContentBlock => {
       if (block.kind === 'image') {
         return { type: 'image', source: { type: 'base64', data: block.data, mediaType: block.mimeType } };

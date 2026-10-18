@@ -43,17 +43,41 @@ export interface HistoryBlockSpan {
 }
 
 /**
+ * Whether a tool result's live copy goes as native blocks, an image among
+ * them, rather than as its stored text. It does when the result holds an
+ * image and its links' blocks and markers come to no more than `maxChars`
+ * together. Past that, the live copy is the stored text, cut at the cap, so
+ * no number of links and markers carries a result past it. A reference's
+ * stub and a withheld line go whole beside an image whatever their length,
+ * and past its cut the stored copy keeps the newest 64 image slots the live
+ * copy showed (#403). Text blocks don't count either: the native copy cuts
+ * each at the cap on its own. Both copies decide by this, from each block's
+ * kind and the length of its text.
+ */
+export function goesNative(
+  blocks: ReadonlyArray<{ kind: ToolResultBlock['kind']; length: number }>,
+  maxChars: number | undefined,
+): boolean {
+  if (!blocks.some((block) => block.kind === 'image')) return false;
+  if (!maxChars) return true;
+  let bounded = 0;
+  for (const block of blocks) if (block.kind === 'link' || block.kind === 'marker') bounded += block.length;
+  return bounded <= maxChars;
+}
+
+/**
  * One block of a tool result's content array as both of its copies show it
  * (toolResultBlocks): a text block's text, an inline image, which the stored
  * copy shows as its placeholder and the live copy as itself, or the text that
- * stands in its place, the same in both. That text is a reference's stub,
- * inline data withheld for a contradiction, or a marker saying what kind of
- * block it was and why the lane can't show it.
+ * stands in its place, the same in both. That text is a reference's stub, a
+ * link's stub or line (MCP's resource_link, `link`), inline data withheld for
+ * a contradiction, or a marker saying what kind of block it was and why the
+ * lane can't show it.
  */
 export type ToolResultBlock =
   | { kind: 'text'; text: string }
   | { kind: 'image'; data: string; mimeType: string }
-  | { kind: 'reference' | 'withheld' | 'marker'; text: string };
+  | { kind: 'reference' | 'link' | 'withheld' | 'marker'; text: string };
 
 /** The block types MCP defines for a tool result's content. */
 const MCP_BLOCK_TYPES = new Set(['text', 'image', 'audio', 'resource', 'resource_link']);
@@ -93,8 +117,12 @@ function toolResultBlock(raw: unknown): ToolResultBlock {
       // inventory (a failing one: its bytes are behind fetch_reference), so
       // the index never slides past an image the resident saw. A link the
       // host can't fetch, shown by its uri, is no slot, as no link was before
-      // links were references, when the result's JSON showed it.
-      return { kind: 'reference', text: buildReferenceStub(c.testimony, 'from tool result', undefined, { unfetchedLinkUri: true }) };
+      // links were references, when the result's JSON showed it. A link's
+      // block, stub or line, is `link`, counted toward the cap (goesNative).
+      return {
+        kind: c.testimony.fromLink ? 'link' : 'reference',
+        text: buildReferenceStub(c.testimony, 'from tool result', undefined, { unfetchedLinkUri: true }),
+      };
     case 'invalid':
       return { kind: 'marker', text: c.shown };
     case 'inline': {

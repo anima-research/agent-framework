@@ -137,11 +137,57 @@ describe("a protocol result's content (dataIsContent)", () => {
 
   it('cuts a text block at the cap in the live copy, and shows each marker whole', () => {
     const long = { type: 'text', text: 'z'.repeat(500) };
-    const { live } = copies({ success: true, data: [IMAGE, long, AUDIO], dataIsContent: true }, 40);
+    const { live } = copies({ success: true, data: [IMAGE, long, AUDIO], dataIsContent: true }, 100);
     const [, text, marker] = live as Array<{ type: string; text: string }>;
-    assert.match(text.text, /^z{40}\n\n\[truncated — original was 500 chars\]$/);
-    assert.ok(AUDIO_TEXT.length > 40);
+    assert.match(text.text, /^z{100}\n\n\[truncated — original was 500 chars\]$/);
     assert.equal(marker.text, AUDIO_TEXT);
+  });
+
+  it('sends the stored text, cut at the cap, once its links pass the cap together', () => {
+    // Each link line carries its uri whole. Together past the cap, the live
+    // copy is the stored text cut at the cap, as main sent a result holding a
+    // link, so no number of them carries the result past it.
+    const links = Array.from({ length: 6 }, (_, i) =>
+      ({ type: 'resource_link', uri: `https://zz-files.example/${'p'.repeat(1000)}/${i}.csv`, name: `${i}.csv` }));
+    const { stored, live } = copies({ success: true, data: [IMAGE, TEXT, ...links], dataIsContent: true }, 2000);
+    assert.equal(live, stored);
+    assert.match(stored, /^\[image: image\/png, 9B\]\nzz-text\n\[resource link "0\.csv": /);
+    assert.match(stored, /\[truncated — original was \d+ chars\]$/);
+    assert.ok(stored.length < 2100, String(stored.length));
+    // Within the cap, they go beside the image as before.
+    const few = copies({ success: true, data: [IMAGE, TEXT, links[0]], dataIsContent: true }, 2000).live;
+    assert.ok(Array.isArray(few) && (few as Array<{ type: string }>)[0]!.type === 'image', JSON.stringify(few).slice(0, 200));
+  });
+
+  it('counts markers toward that budget too', () => {
+    const { stored, live } = copies({ success: true, data: [IMAGE, ...Array.from({ length: 30 }, () => AUDIO)], dataIsContent: true }, 1000);
+    assert.ok(AUDIO_TEXT.length * 30 > 1000);
+    assert.equal(live, stored);
+    assert.match(stored, /\[truncated — original was \d+ chars\]$/);
+    const few = copies({ success: true, data: [IMAGE, AUDIO, AUDIO], dataIsContent: true }, 1000).live as Array<{ type: string; text?: string }>;
+    assert.deepEqual(few.map((b) => b.text ?? b.type), ['image', AUDIO_TEXT, AUDIO_TEXT]);
+  });
+
+  it("sends references' stubs and withheld lines whole beside an image, whatever their length together, as before", () => {
+    const refs = Array.from({ length: 20 }, (_, i) => ({ type: 'resource', uri: `https://zz-files.example/r${i}.pdf`, name: `r${i}.pdf` }));
+    const withheld = { ...AUDIO, uri: 'https://zz-files.example/a.wav' };
+    for (const data of [[IMAGE, ...refs], [IMAGE, ...refs.slice(0, 5), ...Array.from({ length: 12 }, () => withheld)]]) {
+      const result: ToolResult = { success: true, data, dataIsContent: true };
+      // The stored text before its cut: each block a line of it.
+      const whole = nonErrorResultText(result);
+      assert.ok(whole.length > 1000, String(whole.length));
+      const blocks = copies(result, 1000).live as Array<{ type: string; text?: string }>;
+      assert.ok(Array.isArray(blocks), String(blocks).slice(0, 200));
+      assert.deepEqual(blocks.map((b) => b.text ?? b.type), whole.split('\n').map((line, i) => (i === 0 ? 'image' : line)));
+      assert.match(blocks[1]!.text!, /^\[ref_[^\]]+\] r0\.pdf — from tool result — /);
+      if (data.includes(withheld)) assert.equal(blocks.at(-1)!.text, INLINE_WITHHELD_TEXT);
+    }
+    // At a cap shorter than one stub, the live copy shows the stub whole too:
+    // it cuts only text blocks (#403).
+    const stub = nonErrorResultText({ data: [IMAGE, refs[0]], dataIsContent: true }).split('\n')[1]!;
+    assert.ok(stub.length > 40, stub);
+    const tiny = copies({ success: true, data: [IMAGE, refs[0]], dataIsContent: true }, 40).live as Array<{ type: string; text?: string }>;
+    assert.deepEqual(tiny.map((b) => b.text ?? b.type), ['image', stub]);
   });
 });
 
@@ -651,6 +697,30 @@ describe('dataIsContent travels with the result', () => {
     }
     assert.equal(checkedToolResult(call, new Answer()).result.dataIsContent, true);
     assert.equal(reads, 1);
+  });
+
+  it("through a model's round, an image past the stored copy's cut keeps no slot there when the live copy is the stored text", async () => {
+    // With the links before the image passing the cap, the model reads the
+    // stored text, cut before the image's placeholder: no slot of it is kept
+    // past the cut, since the model never saw it.
+    const links = Array.from({ length: 30 }, (_, i) =>
+      ({ type: 'resource_link', uri: `https://zz-files.example/${'p'.repeat(1000)}/${i}.csv`, name: `${i}.csv` }));
+    const { wire, stored } = await answerModelCall({ success: true, data: [TEXT, ...links, IMAGE], dataIsContent: true });
+    assert.equal(wire, stored);
+    const [text] = JSON.parse(stored) as string[];
+    assert.ok(!text!.includes('fell past the cut'), text!.slice(-400));
+    assert.ok(!/\[image: image\/png/.test(text!), text!.slice(-400));
+  });
+
+  it("through a model's round, sends the stored copy when its links pass the cap together", async () => {
+    const links = Array.from({ length: 30 }, (_, i) =>
+      ({ type: 'resource_link', uri: `https://zz-files.example/${'p'.repeat(1000)}/${i}.csv`, name: `${i}.csv` }));
+    const { wire, stored } = await answerModelCall({ success: true, data: [IMAGE, TEXT, ...links], dataIsContent: true });
+    assert.equal(wire, stored);
+    const [text] = JSON.parse(stored) as string[];
+    // The image's placeholder keeps its ledger ref, and the text is cut at the cap.
+    assert.match(text!, /^\[image: image\/png, 9B, ref img_[a-z0-9]+_\d+\]\nzz-text\n/);
+    assert.ok(text!.length < 24_000 + 500, String(text!.length));
   });
 
   it("through a model's round, from a module's result: both copies show its blocks", async () => {
