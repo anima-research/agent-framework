@@ -11,11 +11,24 @@
  *
  * For MCP-shaped content arrays, this helper keeps text blocks verbatim and
  * replaces image blocks with a short `[image: mimeType, ~NKB]` placeholder.
- * For anything else it falls back to JSON.
+ * For anything else it falls back to JSON, written by RFC-005's rules at
+ * every depth (historyJson): a reference is shown as its stub wherever it
+ * sits in the data, so its uri never reaches history, and inline data that
+ * claims a uri or a disposition is withheld.
  */
 
 import { INLINE_WITHHELD_TEXT, isInlineContradiction, referenceStubOrNull } from './mcpl/references.js';
-import { formatPreservedImageSlots, formatToolImagePlaceholder, splitPreservingImageSlots } from './tool-image-ledger.js';
+import { NON_STRING_TEXT_PLACEHOLDER } from './mcpl/visible-content.js';
+import { formatToolImagePlaceholder, toolResultCutAt } from './tool-image-ledger.js';
+
+/** Where one block of a content array sits in its history text, and what
+ *  kind of block it was: text, an inline image (its placeholder), an RFC-005
+ *  reference (its stub), or inline data withheld for a contradiction. */
+export interface HistoryBlockSpan {
+  kind: 'text' | 'image' | 'reference' | 'withheld';
+  start: number;
+  end: number;
+}
 
 export interface HistorySerializeOptions {
   /**
@@ -25,6 +38,13 @@ export interface HistorySerializeOptions {
    * handle in history; null leaves the legacy ref-less form.
    */
   imageRef?: (blockIndex: number, image: { data: string; mimeType: string }) => string | null;
+  /**
+   * Called once a content array has been serialized block by block, rather
+   * than given up on for the fallback, with where each block sits in the
+   * joined text, before any cut at `maxChars`. The framework reads from it
+   * what a result's live copy showed (#403).
+   */
+  onBlocks?: (spans: HistoryBlockSpan[]) => void;
 }
 
 /**
@@ -54,7 +74,7 @@ export function toolResultDataToHistoryString(
   const fromArray = tryHistoryStringFromContentArray(data, options);
   // JSON leaves out undefined, a function and a symbol: a result with no data
   // is stored as no text, as an empty content array is.
-  const str = fromArray ?? (JSON.stringify(data) as string | undefined) ?? '';
+  const str = fromArray ?? historyJson(data) ?? '';
   return maxChars ? truncateForHistory(str, maxChars) : str;
 }
 
@@ -80,52 +100,136 @@ export function nonErrorResultText(
   return toolResultDataToHistoryString(data, maxChars, options);
 }
 
-/** Bounded copy of an arbitrary string with the standard truncation notice.
- *  Image slots past the cut are re-appended, never dropped (issue #104). */
+/** Bounded copy of an arbitrary string with the standard truncation notice,
+ *  cut at the cap as a tool result's stored copy is (toolResultCutAt), so it
+ *  never ends in part of a slot. Each of its callers' readers sees this
+ *  very text, never the images behind a placeholder, so nothing past the cut
+ *  is kept for save_recent_image's index (#403). The framework stores a tool
+ *  result with spillOrTruncate, which keeps the slots past its cut that the
+ *  result's live copy showed. */
 export function truncateForHistory(str: string, maxChars: number): string {
   if (str.length <= maxChars) return str;
-  const { head, tail } = splitPreservingImageSlots(str, maxChars);
-  return head
-    + '\n\n[truncated — original was ' + str.length + ' chars]'
-    + formatPreservedImageSlots(tail);
+  return str.slice(0, toolResultCutAt(str, maxChars)) + '\n\n[truncated — original was ' + str.length + ' chars]';
 }
 
 /**
  * If `data` is an MCP content array whose every block has a shape we
  * recognize, return a history-safe string (images → placeholders). Otherwise
- * return `null` to defer to the caller's fallback (JSON, usually).
+ * return `null` to defer to the fallback, historyJson, which shows a
+ * reference anywhere in the data as its stub.
  */
 function tryHistoryStringFromContentArray(data: unknown, options?: HistorySerializeOptions): string | null {
   if (!Array.isArray(data)) return null;
-  const parts: string[] = [];
+  const parts: Array<{ kind: HistoryBlockSpan['kind']; text: string }> = [];
   for (const [blockIndex, raw] of data.entries()) {
     if (!raw || typeof raw !== 'object') return null;
     const b = raw as { type?: unknown; text?: unknown; data?: unknown; mimeType?: unknown };
-    if (b.type === 'text' && typeof b.text === 'string') {
-      parts.push(b.text);
+    if (b.type === 'text') {
+      // A text that isn't a string shows as the converters' placeholder,
+      // rather than sending the whole array to the JSON fallback.
+      parts.push({ kind: 'text', text: typeof b.text === 'string' ? b.text : NON_STRING_TEXT_PLACEHOLDER });
     } else if (isInlineContradiction(b)) {
       // RFC-005 vector 2: checked before the data branch so inline data
       // claiming bulk disposition is withheld, not rendered.
-      parts.push(INLINE_WITHHELD_TEXT);
+      parts.push({ kind: 'withheld', text: INLINE_WITHHELD_TEXT });
     } else if (b.type === 'image' && typeof b.data === 'string' && typeof b.mimeType === 'string') {
       // Decoded byte estimate from base64 length (3/4 ratio, rounded).
       const approxBytes = Math.floor(b.data.length * 3 / 4);
       const ref = options?.imageRef?.(blockIndex, { data: b.data, mimeType: b.mimeType }) ?? null;
-      parts.push(formatToolImagePlaceholder(b.mimeType, formatSize(approxBytes), ref));
+      parts.push({ kind: 'image', text: formatToolImagePlaceholder(b.mimeType, formatSize(approxBytes), ref) });
     } else if (b.type === 'resource' || ((b.type === 'image' || b.type === 'audio') && typeof (b as { uri?: unknown }).uri === 'string')) {
       // RFC-005 reference block: a bounded stub, never the raw block JSON
       // (which used to inline the URI — and the whole array — into history).
-      // Image-typed stubs still occupy a slot in save_recent_image's
-      // inventory (a failing one — bytes live behind fetch_reference), so
-      // the index never slides past an image the resident saw.
+      // A stub that shows an image type occupies a slot in
+      // save_recent_image's inventory (a failing one — bytes live behind
+      // fetch_reference), so the index never slides past an image the
+      // resident saw.
       const stub = referenceStubOrNull(b, 'from tool result');
       if (stub === null) return null;
-      parts.push(stub);
+      parts.push({ kind: 'reference', text: stub });
     } else {
       return null;
     }
   }
-  return parts.join('\n');
+  if (options?.onBlocks) {
+    const spans: HistoryBlockSpan[] = [];
+    let start = 0;
+    for (const part of parts) {
+      spans.push({ kind: part.kind, start, end: start + part.text.length });
+      start += part.text.length + 1; // the newline that joins them
+    }
+    options.onBlocks(spans);
+  }
+  return parts.map((part) => part.text).join('\n');
+}
+
+/**
+ * Whether RFC-005 governs a value of a tool result's data, wherever it sits.
+ * A reference is a `resource` with a uri, at its top level or under
+ * `resource` (where MCP embeds a resource's uri), or an `image` or `audio`
+ * given by uri; inline data is an `image` or `audio` whose data is a string.
+ * A uri that is null, absent or empty counts as none, and data that isn't a
+ * string isn't inline data, so a record that only shares one of those type
+ * names is data. A uri of any other value, string or not, counts, so a
+ * credential fails closed.
+ */
+function governedByRfc005(b: Record<string, unknown>): boolean {
+  if (b.type === 'resource') return hasUri(b.uri) || (isPlainRecord(b.resource) && hasUri(b.resource.uri));
+  if (b.type === 'image' || b.type === 'audio') return typeof b.data === 'string' || hasUri(b.uri);
+  return false;
+}
+
+function hasUri(value: unknown): boolean {
+  return value !== undefined && value !== null && value !== '';
+}
+
+function isPlainRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+/**
+ * A value of a tool result's data as history shows it, by RFC-005's rules,
+ * wherever it sits in the data. A value RFC-005 governs (governedByRfc005) is
+ * shown as the reference lanes show it: a reference as its stub, an invalid
+ * one (such as a uri that isn't a string, or MCP's embedded resource, whose
+ * uri isn't at its top level) as an unrecognized-block line, and inline data
+ * that also claims a uri or a disposition as withheld, so no uri is ever
+ * shown. Inline data that claims neither is itself, as is any other value:
+ * a block of another type keeps its fields, a `resource_link`'s uri among
+ * them, since RFC-005 governs references.
+ */
+function shownInHistory(value: unknown): unknown {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return value;
+  const b = value as Record<string, unknown>;
+  if (!governedByRfc005(b)) return value;
+  if ((b.type === 'image' || b.type === 'audio') && typeof b.data === 'string') {
+    // JSON writes every field, so here inline data beside a uri of any value
+    // is withheld, not only beside a string one as in the lanes, which show
+    // no uri: an object can carry a credential. An empty uri carries none.
+    return hasUri(b.uri) || b.disposition !== undefined ? INLINE_WITHHELD_TEXT : value;
+  }
+  return referenceStubOrNull(b, 'from tool result') ?? value;
+}
+
+/**
+ * The text RFC-005 shows a value of a tool result's data as, when it shows it
+ * as text rather than as its fields: a reference's stub, an invalid one's
+ * unrecognized-block line, or inline data withheld. Null for any other value.
+ */
+export function rfc005TextOf(value: unknown): string | null {
+  const shown = shownInHistory(value);
+  return shown !== value && typeof shown === 'string' ? shown : null;
+}
+
+/**
+ * JSON of a tool result's data with each value in it shown as history shows
+ * it (shownInHistory), at any depth. Data that is itself shown as text, such
+ * as a bare reference, is that text.
+ */
+function historyJson(data: unknown): string | undefined {
+  const root = shownInHistory(data);
+  if (root !== data && typeof root === 'string') return root;
+  return JSON.stringify(data, (_key, value: unknown) => shownInHistory(value)) as string | undefined;
 }
 
 function formatSize(bytes: number): string {

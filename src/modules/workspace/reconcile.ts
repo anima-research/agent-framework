@@ -54,20 +54,26 @@ import {
 } from './disk-agreement.js';
 import type { BranchIntent, BranchIntents, ConflictKind, ConflictRecord, DiskCounterpart } from './branch-intent.js';
 import {
+  IGNORED,
   type MountView,
+  OTHER_MOUNT,
   ROOT_REPLACED,
   type Walk,
   fingerprintVouches,
+  ignoreBeneath,
+  inOtherMount,
   locateRoot,
   looksBinary,
   observePath,
+  passedOverAt,
+  passedOverBetween,
   provenAbsent,
   readHead,
   readPath,
   sniffImageMime,
   walkScope,
 } from './observe.js';
-import { EffectFailed, type Expect, chainOf, syncDirectories, unlinkContained, writeContained } from './effects.js';
+import { EffectFailed, type Expect, chainOf, chmodContained, narrowedTo, syncDirectories, unlinkContained, writeContained } from './effects.js';
 
 export type EntryState =
   | 'synced'
@@ -106,8 +112,11 @@ export interface PathReport {
 export type TreeOp = 'created' | 'modified' | 'deleted';
 
 export interface PassResult {
-  /** Tree changes adopted from disk. */
-  ops: Array<{ path: string; op: TreeOp }>;
+  /**
+   * Tree changes adopted from disk. `modeOnly`: disk's mode was taken in on
+   * the same bytes, which makes no event.
+   */
+  ops: Array<{ path: string; op: TreeOp; modeOnly?: true }>;
   /** What a path sync gave up of the workspace's own; `op` is what it did to the
    *  workspace copy, absent when it changed none (a deletion or conflict given
    *  up for a disk copy the workspace can't hold). */
@@ -120,9 +129,11 @@ export interface PassResult {
   incomplete: Array<{ path: string; reason: string }>;
   /**
    * What the walk passed over by design and reported nowhere else, counted by
-   * reason: entries the mount's ignore list covers, when nothing beneath them
-   * is tracked (a tracked one is reported under `incomplete`). An ignored
-   * directory counts once, everything in it included. Only listings the walk
+   * reason: another mount's directory nested in this one, entries the mount's
+   * ignore list covers, and entries with an editor's swap or backup file
+   * name, when nothing beneath them is tracked (a tracked one is reported
+   * under `incomplete`). Such a directory counts
+   * once, everything in it included. Only listings the walk
    * kept count: a directory changed during the walk, or one past the file
    * cap, is reported under `incomplete` instead.
    */
@@ -160,6 +171,14 @@ export interface MountRuntime {
    * syncs.
    */
   catchUpScan: boolean;
+  /**
+   * Whether a file's mode is observed, taken in and applied: the module's,
+   * from the platform. Windows reports only 0o666 or 0o444, so there a store
+   * written on a POSIX host would lose its executable bits at the first look:
+   * modes go unobserved, as before they were recorded, and the store and the
+   * evidence keep their own for the next POSIX host.
+   */
+  modesObserved: boolean;
 }
 
 export type Scope =
@@ -182,8 +201,10 @@ export interface PassOptions {
    */
   resume?: boolean;
   /**
-   * The scope was named by a path sync: ignore patterns that cover it don't
-   * apply beneath it (see walkScope). A listing's scope keeps them.
+   * The scope was named, by a path sync or by a file tool's pass on the path
+   * it acts on: what the mount passes over by design that covers the scope,
+   * at it or above it, doesn't apply there (see walkScope). A listing's scope
+   * keeps it.
    */
   named?: boolean;
   /**
@@ -206,6 +227,12 @@ type DiskFact =
       hash: string;
       size: number;
       mtimeMs: number;
+      /**
+       * Permission bits (`st_mode & 0o777`); none where modes go unobserved,
+       * as on Windows, which keeps no POSIX modes (MountRuntime's
+       * `modesObserved`): nothing there is taken in or applied.
+       */
+      mode?: number;
       fp: Fingerprint | null;
       /** Text within limits, with its bytes: what disk→store sync may store. */
       ingestible: Buffer | null;
@@ -226,7 +253,63 @@ function diskCandidate(d: DiskFact): Candidate | null {
 
 function agreedFromDisk(d: DiskFact): Agreed {
   if (d.kind !== 'file') return { kind: 'absent' };
-  return { kind: 'content', hash: d.hash, size: d.size, ...(d.fp ? { fp: d.fp } : {}) };
+  return { kind: 'content', hash: d.hash, size: d.size, ...(d.mode !== undefined ? { mode: d.mode } : {}), ...(d.fp ? { fp: d.fp } : {}) };
+}
+
+/** The file-type bits git records with a regular file's mode. */
+const REGULAR_FILE = 0o100000;
+
+/** A tree entry's mode for permission bits: with the regular-file type bits, as git records one. */
+export function treeMode(perm: number): number {
+  return REGULAR_FILE | (perm & 0o777);
+}
+
+/**
+ * The mode a tree entry takes for disk's permission bits, or, where disk's
+ * aren't observed, the entry's own. With neither, the placeholder an entry
+ * without a recorded mode has (see entryMode).
+ */
+function treeModeOf(perm: number | undefined, s: StoreSide | null): { mode: number } {
+  if (perm !== undefined) return { mode: treeMode(perm) };
+  if (s?.mode !== undefined) return { mode: treeMode(s.mode) };
+  return { mode: 0o644 };
+}
+
+/**
+ * The permission bits a tree entry records, or undefined when it records
+ * none. An entry without the file-type bits was written before modes were
+ * recorded, which wrote 0o644 whatever disk had: a placeholder, not a mode.
+ */
+export function entryMode(mode: number): number | undefined {
+  return (mode & 0o170000) === REGULAR_FILE ? mode & 0o777 : undefined;
+}
+
+/** The store's side of a path: its entry's bytes, and its mode when recorded. */
+type StoreSide = { hash: string; size: number; mode?: number };
+
+/** The store's side of a tree entry. */
+export function storeSide(entry: { blobHash: string; size: number; mode: number } | null): StoreSide | null {
+  if (!entry) return null;
+  const mode = entryMode(entry.mode);
+  return { hash: entry.blobHash, size: entry.size, ...(mode !== undefined ? { mode } : {}) };
+}
+
+/**
+ * Where disk and the store hold the same bytes, what their modes ask for.
+ * A mode the store doesn't record agrees with any, and takes disk's
+ * (`fill`). The store's mode goes to disk (`push`) only where the evidence
+ * shows disk still has the mode they last agreed on; otherwise disk's mode
+ * is taken in as a change (`adopt`): disk changed it, or nothing says which
+ * side did, and an unknown never moves disk.
+ */
+function modeAction(disk: number, store: number | undefined, agreed: number | undefined): 'fill' | 'adopt' | 'push' | undefined {
+  if (store === undefined) return 'fill';
+  if (store === disk) return undefined;
+  return agreed !== undefined && agreed === disk ? 'push' : 'adopt';
+}
+
+function octal(mode: number): string {
+  return `0${mode.toString(8).padStart(3, '0')}`;
 }
 
 function inScope(path: string, scope: Scope): boolean {
@@ -253,7 +336,7 @@ async function learnDisk(
   const p = tracked.p;
   const trusted = (fp: { dev: string }) => mount.ctimeTrustedDev !== null && fp.dev === mount.ctimeTrustedDev;
   if (!opts.rehash && p?.kind === 'content' && fingerprintVouches(p.fp, seen.fp, trusted(seen.fp))) {
-    return { kind: 'file', hash: p.hash, size: seen.size, mtimeMs: seen.mtimeMs, fp: p.fp ?? null, ingestible: null };
+    return { kind: 'file', hash: p.hash, size: seen.size, mtimeMs: seen.mtimeMs, ...(mount.modesObserved ? { mode: seen.mode } : {}), fp: p.fp ?? null, ingestible: null };
   }
   const nothingTracked = p === undefined && !tracked.hasStore && !tracked.hasIntent;
   if (nothingTracked && seen.size > mount.view.maxFileSize) {
@@ -271,6 +354,7 @@ async function learnDisk(
     hash: read.hash,
     size: read.size,
     mtimeMs: read.mtimeMs,
+    ...(mount.modesObserved ? { mode: read.mode } : {}),
     // A fingerprint is recorded only where it can later vouch for the bytes.
     fp: trusted(read.fp) ? read.fp : null,
     ingestible,
@@ -296,12 +380,40 @@ interface Verdict {
    * is decided from it, and nothing at all is recorded (see module doc).
    */
   unconfirmed?: true;
+  /**
+   * With `unconfirmed`: disk's mode is one of the stopped push's own
+   * (pushedMode), so the push that completes it gives the store's mode
+   * there, as it would where disk has the mode they last agreed on.
+   */
+  ownMode?: true;
+  /**
+   * A path sync's adoption over a push of ours that stopped partway: the
+   * mode the tree takes, which is the one the push meant the bytes on disk
+   * to have, not the one it left them at. The evidence keeps disk's actual
+   * mode, so a later push moves disk to the tree's.
+   */
+  diskMode?: number;
   /** A path sync's adoption gives up this workspace state (see decide). */
   discards?: EntryState;
+  /**
+   * Disk and the store hold the same bytes, and the store's mode is unknown
+   * or differs (see modeAction): `fill` and `adopt` record disk's mode on
+   * the store's entry, `adopt` as a change; `push` leaves it for a push.
+   */
+  mode?: 'fill' | 'adopt' | 'push';
   /**
    * The last confirmed evidence decide resolved for the path, which an
    * adoption's intent carries as its prior: a settled same-branch adoption's
    * outcome, where the recorded P is still that adoption's pending record.
+   * Or the evidence a push's narrowing left when it stopped before its
+   * bytes, which decide uses without recording it, so the intent stays: a
+   * push plans from it and goes on as the stopped push, its intent carrying
+   * that push's prior and modes (pushPaths), and a sync that adopts disk's
+   * copy carries it as its adoption's prior. An adoption that doesn't land
+   * returns to it, as every adoption returns to its prior: the store's
+   * change is owed again, and the next push completes it at the store's
+   * mode. The old bytes' own mode doesn't survive that, since the adoption's
+   * intent replaced the push's.
    */
   prior?: Agreed;
 }
@@ -332,12 +444,61 @@ function keepStoreSide(hasStore: boolean, bi: BranchIntent | null): EntryState {
  * mutation boundary): a later write of the same content can't pass for the
  * old adoption.
  */
-function settleAdoption(p: Pending, s: { hash: string; size: number } | null): Agreed | 'forget' {
+function settleAdoption(p: Pending, s: StoreSide | null): Agreed | 'forget' {
   const sc: Candidate = s ? { kind: 'content', hash: s.hash } : ABSENT;
   if (sameCandidate(sc, p.expect)) {
-    return p.expect.kind === 'absent' ? { kind: 'absent' } : { kind: 'content', hash: p.expect.hash, size: s!.size };
+    // Where modes are observed, the adoption took disk's mode with its bytes,
+    // so the entry's mode is the one they agreed on, but for an adoption that
+    // took the mode a stopped push of ours meant the old bytes to have: its
+    // entry holds that mode while disk holds the push's narrowed one, which a
+    // later sync then takes in. Where modes aren't observed, the entry's mode
+    // is the store's own, and the evidence records none.
+    return p.expect.kind === 'absent'
+      ? { kind: 'absent' }
+      : { kind: 'content', hash: p.expect.hash, size: s!.size, ...(s!.mode !== undefined ? { mode: s!.mode } : {}) };
   }
   return p.prior ?? 'forget';
+}
+
+/**
+ * What's in the way, and the way out, when disk's shape keeps a push from a
+ * path: no push writes a file over a directory or unlinks one, or writes
+ * below a file or a symlink the walk won't take (`writeContained`,
+ * `unlinkContained`), forced or not. Null for any other reason, which is
+ * passed on as it is.
+ */
+function inTheWay(reason: string | undefined, deletion: boolean): string | null {
+  if (reason === 'a directory') {
+    return deletion
+      ? 'disk has a directory at this path, and no push unlinks one, forced or not — if it should go, move or remove it on disk'
+      : 'disk has a directory at this path, and no push writes a file over one, forced or not — ' +
+        'move or remove that directory on disk and materialize again, or write the file under another path';
+  }
+  // A deletion below a file finds nothing there to unlink, so only a write
+  // meets this one.
+  if (reason === 'a parent path is not a directory') {
+    return 'disk has a file or a symlink where this path needs a directory, and no push writes below one, forced or not — ' +
+      'move or remove it on disk and materialize again, or write the file under another path';
+  }
+  return null;
+}
+
+/**
+ * The forced way out the refusal of a disk copy that couldn't be verified
+ * names, if any. A forced push skips the verification, so it gets past the
+ * note only where its effect can go on. A file the module can't read (EACCES)
+ * is overwritten, or unlinked, where disk lets the workspace write it, or
+ * unlink it, which a read's EACCES doesn't show: force is named on that
+ * condition. What isn't a regular file is unlinked by a forced deletion. No
+ * other note names force: a forced push stops at some (a symlink the mount
+ * doesn't follow, a FIFO for a write, a parent it can't use); another writer
+ * still at the file ("the file changed while it was read") is answered by
+ * materializing again; and the rest aren't known to pass.
+ */
+function forcedWay(note: string | undefined, deletion: boolean, forced: string): string {
+  if (note === 'cannot open (EACCES)') return `, or, if disk lets the workspace ${deletion ? 'unlink' : 'write'} the file, ${forced}`;
+  if (deletion && note === 'not a regular file') return `, or ${forced}`;
+  return '';
 }
 
 /**
@@ -361,10 +522,28 @@ export function settleAdoptionBeforeMutation(
   const p = agreement.get(mount.name, path);
   if (p?.kind !== 'pending' || p.effect !== 'adopt' || p.branchId !== store.currentBranch().id) return;
   const entry = store.treeGet(mount.treeStateId, path);
-  const settled = settleAdoption(p, entry ? { hash: entry.blobHash, size: entry.size } : null);
+  const settled = settleAdoption(p, entry ? { hash: entry.blobHash, size: entry.size, ...(entryMode(entry.mode) !== undefined ? { mode: entryMode(entry.mode) } : {}) } : null);
   if (settled === 'forget') agreement.forget(mount.name, path);
   else agreement.set(mount.name, path, settled, { afterCommittedState: true });
   agreement.barrier();
+}
+
+/**
+ * What a push of ours that stopped partway left on disk, read by its own
+ * modes (Pending's `modes`): the new bytes at `from & to` or `to` were meant
+ * to have `to`; the old bytes at `from & to`, narrower than `from`, still
+ * have `from` as theirs. New bytes at `from` are a push's only where
+ * `from & to` is `from`: a push that narrows does so before its bytes, so
+ * otherwise they were given `from` since. Undefined where disk shows
+ * anything else: no push of ours, or a mode set since it stopped.
+ */
+function pushedMode(p: Pending, dc: Candidate, d: DiskFact): number | undefined {
+  const m = p.modes;
+  if (p.effect !== 'disk' || m === undefined || d.kind !== 'file' || d.mode === undefined) return undefined;
+  const narrowed = m.from & m.to;
+  if (sameCandidate(dc, p.expect)) return d.mode === narrowed || d.mode === m.to ? m.to : undefined;
+  const prior = p.prior ? candidateOf(p.prior) : null;
+  return prior && sameCandidate(dc, prior) && narrowed !== m.from && d.mode === narrowed ? m.from : undefined;
 }
 
 /**
@@ -374,20 +553,34 @@ export function settleAdoptionBeforeMutation(
 function resolvePending(
   p: Pending,
   dc: Candidate,
-  s: { hash: string; size: number } | null,
+  s: StoreSide | null,
   d: DiskFact,
   branchId: string,
-): { p: Physical | undefined; record?: Agreed | Interrupted | 'forget'; uncaptured?: true; unconfirmed?: true } {
+): { p: Physical | undefined; record?: Agreed | Interrupted | 'forget'; uncaptured?: true; unconfirmed?: true; ownMode?: true } {
   const prior = p.prior;
   const priorCandidate = prior ? candidateOf(prior) : null;
   if (p.effect === 'disk') {
     if (sameCandidate(dc, p.expect)) {
       // Our own effect shows on disk, but nothing proves it durable: decided
       // on, never recorded. Only a push whose barriers succeed completes it.
+      // Where disk's mode is one of the push's own, the push that completes
+      // it gives the store's mode there.
       const shown = p.expect.kind === 'absent' ? ({ kind: 'absent' } as Agreed) : agreedFromDisk(d);
-      return { p: shown, unconfirmed: true };
+      return { p: shown, unconfirmed: true, ...(pushedMode(p, dc, d) !== undefined ? { ownMode: true as const } : {}) };
     }
-    if (priorCandidate && sameCandidate(dc, priorCandidate)) return { p: prior!, record: prior! };
+    if (priorCandidate && sameCandidate(dc, priorCandidate)) {
+      // The push narrowed the mode and stopped before its bytes: disk's mode
+      // is the push's, so the rule decides from it, and the next push writes
+      // the bytes at it and then widens to the store's. The old bytes are
+      // never given the store's mode. Nothing is recorded: the intent, with
+      // the modes that map disk's narrowed one back to the old bytes' own,
+      // stays, carried by a push that goes on with it (pushPaths), until a
+      // push completes it or a sync adopts disk's copy.
+      if (prior!.kind === 'content' && d.kind === 'file' && pushedMode(p, dc, d) !== undefined) {
+        return { p: { ...prior!, mode: d.mode } };
+      }
+      return { p: prior!, record: prior! };
+    }
     // A write whose prior was unknown left no file: it never created one (a
     // partial write leaves a file behind), so P is as unknown as before.
     if (!prior && dc.kind === 'absent' && p.expect.kind === 'content') return { p: undefined, record: 'forget' };
@@ -418,13 +611,17 @@ function resolvePending(
  * An explicit path sync: the store takes disk's state, whatever the evidence
  * — a pending push's included. That chooses disk; it doesn't certify the push.
  */
-function adoptDisk(d: Extract<DiskFact, { kind: 'absent' | 'file' }>, s: { hash: string; size: number } | null): Verdict {
+function adoptDisk(d: Extract<DiskFact, { kind: 'absent' | 'file' }>, s: StoreSide | null): Verdict {
   if (d.kind === 'absent') {
     return { state: 'synced', ...(s ? { adopt: 'remove' as const, op: 'deleted' as const } : {}), p: { kind: 'absent' }, intent: {} };
   }
   // Disk agreeing with the store is disk's state already, whatever the file
-  // is: a binary or oversize file the workspace holds stays held.
-  if (s && s.hash === d.hash) return { state: 'synced', p: agreedFromDisk(d), intent: {} };
+  // is: a binary or oversize file the workspace holds stays held. Its mode
+  // is disk's too.
+  if (s && s.hash === d.hash) {
+    const mode = d.mode === undefined ? undefined : s.mode === undefined ? 'fill' as const : s.mode !== d.mode ? 'adopt' as const : undefined;
+    return { state: 'synced', p: agreedFromDisk(d), intent: {}, ...(mode ? { mode } : {}), ...(mode === 'adopt' ? { op: 'modified' as const } : {}) };
+  }
   if (d.ingestible) return { state: 'synced', adopt: 'ingest', op: s ? 'modified' : 'created', p: agreedFromDisk(d), intent: {} };
   return { state: 'disk-only', ...(s ? { adopt: 'drop' as const, op: 'deleted' as const } : {}), p: 'forget', intent: {} };
 }
@@ -432,7 +629,7 @@ function adoptDisk(d: Extract<DiskFact, { kind: 'absent' | 'file' }>, s: { hash:
 /** The rule (see module doc). Pure. */
 function decide(
   d: DiskFact,
-  s: { hash: string; size: number } | null,
+  s: StoreSide | null,
   pIn: Physical | undefined,
   bi: BranchIntent | null,
   branchId: string,
@@ -461,12 +658,20 @@ function decide(
   if (adopt) {
     // What a path sync gives up is exactly what a sync without a path would
     // have kept of the workspace's own (a draft, a deletion, a conflict's
-    // workspace side), and the verdict says which.
-    const taken = adoptDisk(d, s);
+    // workspace side), and the verdict says which. Where a push of ours
+    // stopped partway, disk's mode is the push's: the store takes the one
+    // the push meant those bytes to have, and the evidence keeps disk's, so
+    // a later push moves disk there.
+    const meant = pIn?.kind === 'pending' ? pushedMode(pIn, dc, d) : undefined;
+    const taken = adoptDisk(meant === undefined ? d : { ...d, mode: meant } as typeof d, s);
+    if (meant !== undefined) {
+      if (taken.p !== undefined && taken.p !== 'forget' && taken.p.kind === 'content') taken.p = agreedFromDisk(d);
+      if (taken.adopt === 'ingest' || taken.mode !== undefined) taken.diskMode = meant;
+    }
     // A give-up is an adoption, or the intent it clears: a deletion or a
     // conflict given up for a disk copy the workspace can't hold changes no
     // tree entry, and is listed all the same.
-    if (taken.adopt || (bi && taken.intent !== undefined)) {
+    if (taken.adopt || taken.mode === 'adopt' || (bi && taken.intent !== undefined)) {
       const kept = decide(d, s, pIn, bi, branchId, false);
       if (WORKSPACE_KEPT.has(kept.state)) taken.discards = kept.state;
       if (taken.adopt && kept.prior) taken.prior = kept.prior;
@@ -478,6 +683,9 @@ function decide(
   // verdict below records newer evidence.
   let p = pIn;
   let resolution: Agreed | Interrupted | 'forget' | undefined;
+  // Evidence a resolution decides from without recording it: a stopped
+  // push's narrowing, whose intent stays (resolvePending).
+  let unrecorded: Agreed | undefined;
   let uncaptured = false;
   if (p?.kind === 'pending') {
     const resolved = resolvePending(p, dc, s, d, branchId);
@@ -486,13 +694,18 @@ function decide(
       // follows from that, and nothing is recorded — no completion, no
       // agreement, no branch-intent change — until a push confirms it.
       const state: EntryState = sameCandidate(dc, sc) ? 'synced' : bi?.conflict ? 'conflict' : keepStoreSide(s !== null, bi);
-      return { state, note: UNCONFIRMED_NOTE, unconfirmed: true };
+      return {
+        state, note: UNCONFIRMED_NOTE, unconfirmed: true,
+        ...(resolved.ownMode ? { ownMode: true as const } : {}),
+      };
     }
     p = resolved.p;
     resolution = resolved.record;
+    if (resolution === undefined && p !== undefined && (p.kind === 'content' || p.kind === 'absent')) unrecorded = p;
     uncaptured = resolved.uncaptured === true;
   }
-  const verdict = (v: Verdict): Verdict => (resolution && v.p === undefined ? { ...v, p: resolution } : v);
+  const verdict = (v: Verdict): Verdict => (resolution && v.p === undefined ? { ...v, p: resolution }
+    : unrecorded && v.p === undefined && v.prior === undefined ? { ...v, prior: unrecorded } : v);
 
   // Agreement settles everything, a recorded conflict included.
   if (sameCandidate(dc, sc)) {
@@ -508,11 +721,23 @@ function decide(
     const recorded = p?.kind === 'content' ? p : null;
     // Re-record only when P says something else, or a fresh fingerprint can
     // replace one that no longer vouches. A fresh one exists only where it's
-    // trusted, so both are judged as trusted here.
-    const stale = !recorded || recorded.hash !== agreed.hash || recorded.size !== agreed.size ||
+    // trusted, so both are judged as trusted here. Evidence a resolution left
+    // unrecorded, a stopped push's narrowing, is stale too: the agreement
+    // replaces that push's intent, and the mode rule gives the store's mode.
+    const stale = unrecorded !== undefined || !recorded || recorded.hash !== agreed.hash || recorded.size !== agreed.size || recorded.mode !== agreed.mode ||
       (agreed.fp !== undefined && fingerprintVouches(agreed.fp, agreed.fp, true) &&
         !fingerprintVouches(recorded.fp, agreed.fp, true));
-    return verdict({ state: 'synced', ...(stale ? { p: agreed } : {}), ...settles });
+    const mode = agreed.mode === undefined ? undefined : modeAction(agreed.mode, s!.mode, recorded?.mode);
+    if (mode === 'push') {
+      return verdict({
+        state: 'workspace-draft',
+        mode,
+        note: `the workspace's mode (${octal(s!.mode!)}) differs from disk's (${octal(agreed.mode!)}): materialize to apply it`,
+        ...(stale ? { p: agreed } : {}),
+        ...settles,
+      });
+    }
+    return verdict({ state: 'synced', ...(mode ? { mode } : {}), ...(mode === 'adopt' ? { op: 'modified' as const } : {}), ...(stale ? { p: agreed } : {}), ...settles });
   }
 
   // A recorded conflict stays until it is resolved explicitly or disk and store converge.
@@ -655,12 +880,41 @@ async function gather(store: JsStore, agreement: DiskAgreement, mount: MountRunt
       gathered.facts.set(path, { kind: 'unobserved', reason: rootUnavailable });
       continue;
     }
+    // What the mount passes over by design stays unobserved by a pass that
+    // names no path, however it reaches it, so no listing's absence proves a
+    // copy there gone. In another mount's directory, no pass of this mount
+    // observes anything, named or not.
+    // Beneath a directory a by-design rule covers, a pass that isn't named
+    // observes nothing. A path a rule covers by its own name is observed as a
+    // walk observes it: passed over where the walk lists it, and absent where
+    // the walk lists its directory without it; a pass that reaches it by its
+    // path alone, as a listing, glob or grep naming it does, passes over it.
+    // A pass that names its scope, as a sync naming a path and a file tool's
+    // pass on the path it acts on do, sets aside only what covers the scope,
+    // at it or above it, as its walk does (#276): a directory passed over by
+    // design beneath a named directory stays passed over, and so does what
+    // lies beneath it.
+    let byDesign: string | undefined;
+    if (inOtherMount(path, mount.view.others)) {
+      byDesign = OTHER_MOUNT;
+    } else if (!opts.named) {
+      const slash = path.lastIndexOf('/');
+      const above = slash < 0 ? undefined : passedOverAt(path.slice(0, slash), mount.view.ignore, mount.view.others);
+      const own = above === undefined && !walk ? passedOverAt(path, mount.view.ignore, mount.view.others) : undefined;
+      byDesign = above ?? own;
+    } else if (scope.kind === 'dir') {
+      byDesign = passedOverBetween(scope.dir, path, ignoreBeneath(scope.dir, mount.view.ignore), mount.view.others);
+    }
+    if (byDesign !== undefined) {
+      gathered.facts.set(path, { kind: 'unobserved', reason: byDesign });
+      continue;
+    }
     if (walk && provenAbsent(walk, path)) {
       gathered.facts.set(path, { kind: 'absent' });
       continue;
     }
-    if (walk?.others.get(path) === 'ignored by the mount') {
-      gathered.facts.set(path, { kind: 'unobserved', reason: 'ignored by the mount' });
+    if (walk?.others.get(path) === IGNORED) {
+      gathered.facts.set(path, { kind: 'unobserved', reason: IGNORED });
       continue;
     }
     if (walk && !walk.files.has(path) && !walk.othersTaken.has(path)) {
@@ -748,11 +1002,10 @@ export async function reconcilePass(
   // Decide and apply — synchronously, so nothing interleaves.
   const branchId = store.currentBranch().id;
   result.branchId = branchId;
-  type Planned = { path: string; verdict: Verdict; d: DiskFact; s: { hash: string; size: number } | null; p: Physical | undefined; bi: BranchIntent | null };
+  type Planned = { path: string; verdict: Verdict; d: DiskFact; s: StoreSide | null; p: Physical | undefined; bi: BranchIntent | null };
   const planned: Planned[] = [];
   for (const [path, d] of facts) {
-    const entry = store.treeGet(mount.treeStateId, path);
-    const s = entry ? { hash: entry.blobHash, size: entry.size } : null;
+    const s = storeSide(store.treeGet(mount.treeStateId, path));
     const p = agreement.get(mount.name, path);
     const bi = mount.intents.get(path);
     const verdict = decide(d, s, p, bi, branchId, opts.adopt?.(path) === true);
@@ -787,10 +1040,16 @@ export async function reconcilePass(
     const v = x.verdict;
     if (v.adopt === 'ingest' && x.d.kind === 'file' && x.d.ingestible) {
       const blobHash = store.storeBlob(x.d.ingestible, 'text/plain');
-      store.treeSet(mount.treeStateId, x.path, { blobHash, size: x.d.ingestible.byteLength, mode: 0o644 });
+      store.treeSet(mount.treeStateId, x.path, { blobHash, size: x.d.ingestible.byteLength, ...treeModeOf(v.diskMode ?? x.d.mode, x.s) });
       committed = true;
     } else if ((v.adopt === 'remove' || v.adopt === 'drop') && x.s) {
       store.treeRemove(mount.treeStateId, x.path);
+      committed = true;
+    } else if ((v.mode === 'fill' || v.mode === 'adopt') && x.d.kind === 'file' && x.s) {
+      // The same bytes, with disk's mode. A fill records a mode where the
+      // entry had none, which is no change: an undo or a branch whose entry
+      // still has none agrees with any mode, so neither reads it as one.
+      store.treeSet(mount.treeStateId, x.path, { blobHash: x.s.hash, size: x.s.size, ...treeModeOf(v.diskMode ?? x.d.mode, x.s) });
       committed = true;
     }
     if (v.conflict) {
@@ -802,8 +1061,9 @@ export async function reconcilePass(
       mount.intents.put(x.path, v.intent);
       committed = true;
     }
-    if (v.op && v.adopt) result.ops.push({ path: x.path, op: v.op });
-    if (v.discards) result.discarded.push({ path: x.path, was: v.discards, ...(v.op && v.adopt ? { op: v.op } : {}) });
+    const changed = v.adopt !== undefined || v.mode === 'adopt';
+    if (v.op && changed) result.ops.push({ path: x.path, op: v.op, ...(v.adopt === undefined ? { modeOnly: true as const } : {}) });
+    if (v.discards) result.discarded.push({ path: x.path, was: v.discards, ...(v.op && changed ? { op: v.op } : {}) });
   }
 
   // 4. Completions and agreements, after the commits they assert are synced —
@@ -874,8 +1134,16 @@ export async function reconcilePass(
       // A link's own region hides only what lies beneath it: the link itself
       // is reported by path, with its own reason.
       const hides = tracked.some((p) => (region.kind !== 'symlink' && p === region.path) || p.startsWith(region.path + '/'));
-      if (region.kind === 'error' || region.kind === 'cap' || hides) result.incomplete.push({ path: region.path, reason: region.reason });
-      // An ignored name that hides nothing tracked is reported nowhere else:
+      // A scope passed over whole is the answer to the pass that asked for
+      // it, so it's always named. Another mount's directory met beneath the
+      // scope is passed over by design even where this mount's tree holds
+      // copies there: no tool of this mount syncs, pushes or clears them
+      // (listings show them, naming their holder), so naming the directory
+      // as unreached would never clear.
+      const wholeScope = scope.kind === 'dir' && scope.dir !== '' && region.path === scope.dir;
+      const unreached = hides && region.reason !== OTHER_MOUNT;
+      if (region.kind === 'error' || region.kind === 'cap' || unreached || wholeScope) result.incomplete.push({ path: region.path, reason: region.reason });
+      // A name passed over by design that hides nothing tracked is reported nowhere else:
       // counted, so a sync that says 0 also says what it didn't look at
       // (agent-framework #276). A symlink region isn't counted: a link the
       // walk took is a candidate the pass reports by path, taken through the
@@ -924,6 +1192,11 @@ export interface PushResult {
   deleted: string[];
   /** Refused paths, each with its reason. */
   skipped: Array<{ path: string; reason: string }>;
+  /**
+   * Written paths whose mode stayed as disk had it, each with why: their
+   * bytes reached disk, and the workspace's mode didn't.
+   */
+  modesKept: Array<{ path: string; reason: string }>;
   /** Workspace deletions left on disk because applyDeletions wasn't given. */
   pendingDeletions: string[];
   /** The branch and sequence the push planned on: what disk now reflects.
@@ -933,6 +1206,9 @@ export interface PushResult {
   branchId?: string;
   sequence?: number;
 }
+
+/** Why a push skips a path in another mount's directory nested in its own. */
+export const NOT_PUSHED_IN_OTHER_MOUNT = "it lies in another mount's directory, which no push of this mount writes";
 
 /**
  * Make disk hold the store's version of each path, under the same rule:
@@ -962,7 +1238,7 @@ export async function pushPaths(
 ): Promise<PushResult> {
   agreement.ensureReconciled();
   if (agreement.needsBarrier) agreement.barrier(); // as a pass does: nothing decided from unsynced evidence
-  const result: PushResult = { written: [], unchanged: [], deleted: [], skipped: [], pendingDeletions: [] };
+  const result: PushResult = { written: [], unchanged: [], deleted: [], skipped: [], modesKept: [], pendingDeletions: [] };
   if (mount.readOnly) return result;
   // A root that isn't available takes no writes, forced or not: restoring the
   // store's files into an empty mountpoint would fill the disk the drive was
@@ -971,6 +1247,18 @@ export async function pushPaths(
   if ('reason' in root) {
     for (const path of paths) result.skipped.push({ path, reason: root.reason });
     return result;
+  }
+  // Another mount's directory nested in this one is that mount's: no push
+  // of this mount writes or deletes a path in it, forced or not. (On a mount
+  // that follows links, a link of this mount's that leads there is read as
+  // this mount's own path; on one that doesn't, the link is refused.)
+  if (mount.view.others.length > 0) {
+    const own: string[] = [];
+    for (const path of paths) {
+      if (inOtherMount(path, mount.view.others)) result.skipped.push({ path, reason: NOT_PUSHED_IN_OTHER_MOUNT });
+      else own.push(path);
+    }
+    paths = own;
   }
 
   type Plan = {
@@ -984,7 +1272,39 @@ export async function pushPaths(
     prior: Agreed | null;
     /** What the effect may find at the path. */
     expect: Expect;
-  } & ({ kind: 'write'; blob: Buffer; hash: string } | { kind: 'unlink' });
+  } & (
+    | {
+        kind: 'write';
+        blob: Buffer;
+        hash: string;
+        /** Permission bits the write gives the file, if any. */
+        apply?: number;
+        /** The mode disk had when it was checked, which `apply` replaces only if disk still has it. */
+        from?: number;
+        /** The store's mode, and the evidence's before the push. */
+        storeMode?: number;
+        priorMode?: number;
+        /** The mode disk had when it was checked, forced or not: where the push's modes start. */
+        seenMode?: number;
+        /** `apply` is forced over a mode disk changed since it last agreed, or one nothing records. */
+        overDisk?: true;
+        /**
+         * For a push that re-plans over our own narrowing push stopped before
+         * its bytes, the modes its intent carries: from the old bytes' own
+         * mode, the stopped push's `from`, to the store's mode now, or where
+         * the store records none, the mode the stopped push narrowed to.
+         */
+        ownModes?: { from: number; to: number };
+      }
+    | { kind: 'unlink' }
+    /**
+     * The store's mode, applied to bytes disk and the store share; `from`,
+     * when given, the mode disk must still have. `overDisk`: a forced chmod
+     * over a mode disk changed since it last agreed, or one nothing records
+     * which side changed, rather than a push of the store's own change.
+     */
+    | { kind: 'chmod'; mode: number; hash: string; size: number; from?: number; overDisk?: true }
+  );
   const plans: Plan[] = [];
 
   // Observe disk.
@@ -1015,11 +1335,20 @@ export async function pushPaths(
   result.sequence = store.currentSequence();
   let recorded = false;
   for (const [path, d] of facts) {
-    const entry = store.treeGet(mount.treeStateId, path);
-    const s = entry ? { hash: entry.blobHash, size: entry.size } : null;
+    const s = storeSide(store.treeGet(mount.treeStateId, path));
     const p = agreement.get(mount.name, path);
     const bi = mount.intents.get(path);
     const v = decide(d, s, p, bi, branchId, false);
+    // The ways out a refusal names, as materialize takes them: a deletion
+    // reaches disk only with applyDeletions.
+    const again = s ? 'materialize again' : 'materialize again with applyDeletions';
+    // Where disk has deleted a file the workspace holds, a sync takes the
+    // deletion, which removes the workspace's copy, and a forced push writes
+    // the workspace's copy back: there is no disk copy to adopt or overwrite.
+    const gone = s !== null && d.kind === 'absent';
+    const forced = !s ? 'materialize it with force and applyDeletions to delete it'
+      : gone ? "materialize it with force to write the workspace's copy back" : 'materialize it with force to overwrite it';
+    const takeDisk = gone ? "sync this path to take disk's deletion, which removes the workspace's copy" : 'sync this path to adopt the disk version';
     // What the effect may find: what this observation saw, unless forced.
     const expect: Expect = opts.force || d.kind === 'unobserved' || d.kind === 'unhashed'
       ? { kind: 'any' }
@@ -1033,14 +1362,47 @@ export async function pushPaths(
         result.skipped.push({
           path,
           reason: 'stale copy: disk changed since it last agreed with the workspace, which did not — ' +
-            'sync this path to adopt the disk version, or pass force to overwrite it',
+            `${takeDisk}, or ${forced}`,
         });
         continue;
       }
       const priorP = p && (p.kind === 'absent' || p.kind === 'content') ? p : null;
       const blob = store.getBlob(s.hash);
-      if (blob) plans.push({ path, kind: 'write', blob, hash: s.hash, prior: priorP, before: agreement.get(mount.name, path), expect });
-      else result.skipped.push({ path, reason: 'the workspace copy is missing from the store' });
+      const forcedMode = mount.modesObserved && s.mode !== undefined && s.mode !== (d.kind === 'file' ? d.mode : undefined) ? s.mode : undefined;
+      const agreedMode = priorP?.kind === 'content' ? priorP.mode : undefined;
+      if (blob) {
+        plans.push({
+          path, kind: 'write', blob, hash: s.hash, prior: priorP, before: agreement.get(mount.name, path), expect,
+          ...(forcedMode !== undefined ? { apply: forcedMode } : {}),
+          ...(forcedMode !== undefined && d.kind === 'file' && agreedMode !== d.mode ? { overDisk: true as const } : {}),
+          ...(s.mode !== undefined ? { storeMode: s.mode } : {}),
+          // Refused over disk's mode, the completion records what an unforced
+          // write would: the mode disk last agreed with.
+          ...(agreedMode !== undefined ? { priorMode: agreedMode } : {}),
+          ...(d.kind === 'file' && d.mode !== undefined ? { seenMode: d.mode } : {}),
+        });
+      } else result.skipped.push({ path, reason: 'the workspace copy is missing from the store' });
+      continue;
+    }
+    if (v.mode === 'adopt' && s && d.kind === 'file') {
+      // Disk's mode changed since it last agreed, on the bytes the store
+      // holds, and the store's didn't. A sync takes it in. Recording disk's
+      // mode here would read as the store's change, which the next push
+      // would revert; forced, disk takes the store's mode, as forced bytes do.
+      if (!opts.force) {
+        // modeAction adopts where disk changed the mode since they agreed, and
+        // where nothing records a mode they agreed on.
+        const agreedMode = p?.kind === 'content' ? p.mode : undefined;
+        result.skipped.push({
+          path,
+          reason: (agreedMode === undefined
+            ? `disk's mode (${octal(d.mode!)}) differs from the workspace's (${octal(s.mode!)}), and nothing records which side changed it`
+            : `disk's mode (${octal(d.mode!)}) changed since it last agreed with the workspace's (${octal(s.mode!)})`) +
+            ' — sync this path to take disk\'s mode in, or materialize this path with force to apply the workspace\'s',
+        });
+        continue;
+      }
+      plans.push({ path, kind: 'chmod', mode: s.mode!, hash: s.hash, size: s.size, prior: null, before: p, expect, overDisk: true });
       continue;
     }
     // Whatever the verdict learned about disk (an agreement, a resolved
@@ -1053,8 +1415,22 @@ export async function pushPaths(
     // The prior a new intent carries is the last confirmed evidence: for a
     // path whose earlier push is unconfirmed, that push's own prior, never
     // the bytes it wrote.
-    const known = v.unconfirmed ? (p as Pending).prior ?? undefined : v.p === 'forget' ? undefined : v.p !== undefined ? v.p : p;
+    const known = v.unconfirmed ? (p as Pending).prior ?? undefined : v.p === 'forget' ? undefined : v.p !== undefined ? v.p : v.prior ?? p;
     const prior = known && (known.kind === 'absent' || known.kind === 'content') ? known : null;
+    // A push that re-plans over our own narrowing push, stopped before its
+    // bytes, plans from disk's narrowed mode (the verdict's prior, which
+    // resolvePending leaves unrecorded), as above, and goes on as that push:
+    // its intent carries the stopped push's prior, the old bytes at their own
+    // mode, never the mode it narrowed them to, and modes from that mode, so a
+    // stop of this push too reads disk's narrowed mode as the push's own.
+    // Past the adoptions handled above, a verdict carries a prior with P still
+    // pending only from that narrowing, whose push recorded its modes.
+    const stopped = v.prior !== undefined && p?.kind === 'pending' ? p : undefined;
+    if (v.mode === 'push' && s && d.kind === 'file') {
+      // Forced, disk takes the store's mode whatever it holds now, as it takes its bytes.
+      plans.push({ path, kind: 'chmod', mode: s.mode!, ...(opts.force ? {} : { from: d.mode }), hash: s.hash, size: s.size, prior, before: agreement.get(mount.name, path), expect });
+      continue;
+    }
     if (v.state === 'synced' && !v.unconfirmed) {
       if (v.intent !== undefined) {
         mount.intents.put(path, v.intent);
@@ -1065,7 +1441,25 @@ export async function pushPaths(
     }
     if (v.state === 'unverified') {
       if (!opts.force) {
-        result.skipped.push({ path, reason: `cannot verify disk copy (${v.note ?? 'not observed'}) — fix it and materialize again, or pass force to overwrite it` });
+        // An intent that can't be read is the one note fixing doesn't
+        // answer: nothing is decided over it until a sync of the path
+        // replaces it (decide()), and a sync replaces it only where it sees
+        // disk's copy, so a copy it can't see is named first. For the rest,
+        // fixing what the note names holds, and forcedWay says where force
+        // does too. Where disk has deleted the file, that sync takes the
+        // deletion.
+        const sync = gone
+          ? "sync this path to take disk's deletion, which removes the workspace's copy and replaces the intent"
+          : 'sync this path to adopt the disk version, which replaces the intent';
+        result.skipped.push({
+          path,
+          reason: bi?.unreadable !== undefined
+            ? d.kind === 'absent' || d.kind === 'file'
+              ? `${v.note} — ${sync}`
+              : `${v.note}, and disk's copy can't be verified (${d.kind === 'unobserved' ? d.reason : 'not hashed'}) — once it can be, ${sync}`
+            : inTheWay(v.note, !s) ??
+              `cannot verify disk copy (${v.note ?? 'not observed'}) — fix it and ${again}${forcedWay(v.note, !s, forced)}`,
+        });
         continue;
       }
     }
@@ -1084,15 +1478,20 @@ export async function pushPaths(
       }
       result.skipped.push({
         path,
-        reason: noEvidence
+        // Whatever was recorded, a disk with no copy now is answered for what
+        // it holds; a path with no evidence still needs its push named.
+        reason: gone
+          ? `disk has no copy of this file (conflict: ${kind}) — ${takeDisk}, or ` +
+            `materialize ${noEvidence ? 'this path' : 'it'} with force to write the workspace's copy back`
+          : noEvidence
           ? `disk holds a different copy, and nothing records which is newer (conflict: ${kind}) — ` +
-            'sync this path to adopt the disk version, or materialize this path with force to overwrite it'
+            `sync this path to adopt the disk version, or materialize this path with force ${s ? 'to overwrite it' : 'and applyDeletions to delete it'}`
           : kind === 'interrupted'
             ? 'disk holds bytes that match neither what was being written there nor what disk last agreed with ' +
               '(conflict: interrupted), as a write that failed or was cut off partway leaves — check the file, then ' +
-              'pass force to write the workspace copy over it, or sync this path to adopt the disk copy as it is'
+              `${forced}, or sync this path to adopt the disk copy as it is`
             : `stale copy: disk changed since it last agreed with the workspace (conflict: ${kind}) — ` +
-              'sync this path to adopt the disk version, or pass force to overwrite it',
+              `sync this path to adopt the disk version, or ${forced}`,
       });
       continue;
     }
@@ -1133,28 +1532,115 @@ export async function pushPaths(
       result.skipped.push({ path, reason: 'the workspace copy is missing from the store' });
       continue;
     }
-    plans.push({ path, kind: 'write', blob, hash: s.hash, prior, before: agreement.get(mount.name, path), expect });
+    // The store's mode goes to disk with its bytes where the file is new,
+    // the push is forced, or disk still has the mode they last agreed on. A
+    // push that completes our own unconfirmed one, whose bytes landed, is a
+    // push like any other: it gives the store's mode where disk shows one of
+    // the stopped push's own (pushedMode) or the one they last agreed on, and
+    // keeps any other, set since it stopped (Ada-1017, room-203 #131062,
+    // #131518). A mode disk changed since stays, and so does the evidence
+    // that it did, up to the moment of the write.
+    const dm = d.kind === 'file' ? d.mode : undefined;
+    const priorMode = prior?.kind === 'content' ? prior.mode : undefined;
+    const own = v.unconfirmed === true && v.ownMode === true;
+    const apply = mount.modesObserved && s.mode !== undefined && s.mode !== dm &&
+      (dm === undefined || opts.force === true || own || priorMode === dm) ? s.mode : undefined;
+    plans.push({
+      path, kind: 'write', blob, hash: s.hash, prior: stopped ? stopped.prior : prior, before: agreement.get(mount.name, path), expect,
+      // With no mode in the store's entry, its `to` is the mode the push
+      // leaves, the one the stopped push narrowed to: it claims none it lacks.
+      ...(stopped ? { ownModes: { from: stopped.modes!.from, to: s.mode ?? (stopped.modes!.from & stopped.modes!.to) } } : {}),
+      ...(apply !== undefined ? { apply } : {}),
+      ...(apply !== undefined && dm !== undefined && opts.force !== true ? { from: dm } : {}),
+      // Forced over a mode disk changed: without force, the bytes would keep it.
+      ...(apply !== undefined && dm !== undefined && priorMode !== dm && !own ? { overDisk: true as const } : {}),
+      ...(s.mode !== undefined ? { storeMode: s.mode } : {}),
+      ...(priorMode !== undefined ? { priorMode } : {}),
+      ...(dm !== undefined ? { seenMode: dm } : {}),
+    });
   }
 
   // 1. Durable intents before any disk effect, the root they write under first.
+  // A chmod announces none: it leaves the bytes as they are. Stopped before
+  // its completion, it leaves disk at the store's mode or still at the one
+  // the evidence agreed, and the next observation decides from that: synced
+  // and recorded, or pushed again. Nothing is lost either way. A forced
+  // chmod has no guard: stopped before it, disk keeps whatever mode it found,
+  // which the next observation reads as disk's, and forced again, it applies
+  // the store's.
   if (plans.length > 0) agreement.recordRootIdentity(mount.name, root.identity);
-  plans.forEach((step, i) => {
+  const announced = plans.filter((step) => step.kind !== 'chmod');
+  announced.forEach((step, i) => {
     agreement.intend(mount.name, step.path, {
       effect: 'disk',
       prior: step.prior,
       expect: step.kind === 'write' ? { kind: 'content', hash: step.hash } : ABSENT,
       branchId,
-    }, { durable: i === plans.length - 1 });
+      // A write whose plan gives a mode (`apply`) records the modes it may
+      // leave, so a stop is read by them: the mode it saw, or for a file it
+      // creates the one it creates it at, and the one it gives. A file a
+      // forced push creates at its entry's mode with no mode planned records
+      // none. One that goes on as our own stopped narrowing records that
+      // push's, from the old bytes' own mode, whether or not it gives a mode
+      // itself.
+      ...(step.kind === 'write' && step.ownModes !== undefined ? { modes: step.ownModes }
+        : step.kind === 'write' && step.apply !== undefined
+          ? { modes: { from: step.seenMode ?? step.apply, to: step.apply } } : {}),
+    }, { durable: i === announced.length - 1 });
   });
 
   // 2. Effects, each bound at its point of use.
-  const effected: Array<{ step: Plan; dirs: string[] }> = [];
+  const effected: Array<{ step: Plan; dirs: string[]; mode?: number; widenRefused?: boolean; modeKept?: boolean }> = [];
   for (const step of plans) {
     opts.beforeEffect?.(step.path);
     try {
       if (step.kind === 'write') {
-        await writeContained(mount.view, mount.rootReal, step.path, step.blob, step.expect);
-        effected.push({ step, dirs: chainOf(step.path) });
+        const { perm, widenRefused, modeKept } = await writeContained(
+          mount.view, mount.rootReal, step.path, step.blob, step.expect, step.apply, step.from, step.overDisk === true,
+          // Where modes go unobserved, nothing is applied, a created file's included.
+          mount.modesObserved ? step.storeMode : undefined,
+        );
+        effected.push({ step, dirs: chainOf(step.path), mode: perm, widenRefused, modeKept });
+      } else if (step.kind === 'chmod') {
+        // An inode change, made durable by the file's own fsync.
+        const { refused, narrowing } = await chmodContained(mount.view, mount.rootReal, step.path, step.mode, step.expect, step.from);
+        // A chmod announces no intent, so a refused one leaves the evidence
+        // as planning read it, unless it says otherwise below.
+        if (refused && narrowing && !step.overDisk) {
+          // A narrowing of the store's own change that the kernel refused
+          // stays owed, as a write's does: taking disk's wider mode in would
+          // let a later write put new bytes out at it.
+          result.skipped.push({
+            path: step.path,
+            reason: `not given the workspace's mode (${octal(step.mode)}): the kernel refused to narrow it, as it does for a file another user owns, ` +
+              'so it stays owed: a retry is refused the same way until the file\'s owner or an administrator narrows it',
+          });
+          continue;
+        }
+        if (refused && step.overDisk) {
+          // Forced over a mode disk changed, or one nothing records: the
+          // path is as it was before the push, so a sync takes disk's mode
+          // in, as it would have without force.
+          result.skipped.push({
+            path: step.path,
+            reason: `not given the workspace's mode (${octal(step.mode)}): the kernel refused the chmod, so disk keeps its mode, and a sync takes it in`,
+          });
+          continue;
+        }
+        if (refused) {
+          // A widening of the store's own change that the kernel refused:
+          // disk keeps its mode, and the evidence records none, so a sync
+          // takes disk's in by the rule for an unknown rather than owing a
+          // mode this process can never give.
+          agreement.set(mount.name, step.path, { kind: 'content', hash: step.hash, size: step.size });
+          recorded = true;
+          result.skipped.push({
+            path: step.path,
+            reason: `not given the workspace's mode (${octal(step.mode)}): the kernel refused the chmod, and a sync takes disk's mode in`,
+          });
+          continue;
+        }
+        effected.push({ step, dirs: [] });
       } else {
         // Its directory is synced whether this unlink removed the entry or
         // found it gone: either way the completion claims a durable absence.
@@ -1167,7 +1653,8 @@ export async function pushPaths(
         // exactly what it was, whatever kind that was.
         agreement.restore(mount.name, step.path, step.before);
         recorded = true;
-        result.skipped.push({ path: step.path, reason: `not ${step.kind === 'write' ? 'written' : 'unlinked'}: ${failure.message}` });
+        const why = inTheWay(failure.message, step.kind === 'unlink') ?? failure.message;
+        result.skipped.push({ path: step.path, reason: `not ${step.kind === 'unlink' ? 'unlinked' : step.kind === 'chmod' ? 'given the workspace\'s mode' : 'written'}: ${why}` });
       } else {
         // No completion: the intent stays pending, and the next observation
         // resolves it from whatever disk then holds.
@@ -1184,7 +1671,8 @@ export async function pushPaths(
   // 4. Completions. P is physical and global. Branch intent belongs to the
   // branch this push planned on: it is settled only while that branch is
   // still selected, and otherwise by convergence when the branch returns.
-  for (const { step, dirs } of effected) {
+  for (const { step, dirs, mode: written, widenRefused, modeKept } of effected) {
+    const mode = mount.modesObserved ? written : undefined;
     const failed = dirs.find((dir) => unsynced.has(dir));
     if (failed !== undefined) {
       result.skipped.push({
@@ -1194,11 +1682,61 @@ export async function pushPaths(
       });
       continue;
     }
-    const value: Agreed = step.kind === 'write' ? { kind: 'content', hash: step.hash, size: step.blob.byteLength } : { kind: 'absent' };
+    // The mode the evidence records: the one the push gave the file, if the
+    // file has it; disk's own, where the store records none or the same; and
+    // otherwise the one disk last agreed with, so a mode disk changed since
+    // reads as disk's. (Where modes go unobserved, the evidence's writer
+    // records none.)
+    // A widening of the workspace's own change that the kernel refused
+    // records none: a sync takes disk's mode in, rather than owing one this
+    // process can never give. Forced over a mode disk changed, or one nothing
+    // records (overDisk), any refused chmod ends where an unforced write
+    // would: the evidence records the mode disk last agreed with, if any, and
+    // a sync takes disk's mode in.
+    const agreedMode = step.kind === 'chmod'
+      ? step.mode
+      : step.kind === 'write'
+        ? widenRefused && !step.overDisk
+          ? undefined
+          : step.apply !== undefined && step.apply === mode
+            ? mode
+            : step.storeMode === undefined || step.storeMode === mode ? mode : step.priorMode
+        : undefined;
+    const value: Agreed = step.kind === 'unlink'
+      ? { kind: 'absent' }
+      : { kind: 'content', hash: step.hash, size: step.kind === 'write' ? step.blob.byteLength : step.size, ...(agreedMode !== undefined ? { mode: agreedMode } : {}) };
     agreement.set(mount.name, step.path, value);
     recorded = true;
+    // Bytes written where the kernel refused the mode, or where disk's mode
+    // changed since it last agreed, keep disk's mode, and the push says so
+    // beside what it wrote: the bytes reached disk, so it's no refusal.
+    if (step.kind === 'write' && widenRefused && mode !== undefined) {
+      result.modesKept.push({
+        path: step.path,
+        reason: `written, its mode left at ${octal(mode)}: the kernel refused the chmod, ` +
+          `so the workspace's (${octal(step.apply ?? step.storeMode ?? mode)}) isn't given, and a sync takes disk's mode in`,
+      });
+    } else if (step.kind === 'write' && modeKept && mode !== undefined) {
+      // Forced over a mode disk changed, and refused: the bytes are written
+      // at it, the evidence records it as an unforced write's would.
+      result.modesKept.push({
+        path: step.path,
+        reason: `written, its mode left at ${octal(mode)}: the kernel refused to narrow it ` +
+          `${narrowedTo(mode & (step.apply ?? mode), step.apply ?? mode)}, so disk keeps its mode, and a sync takes it in`,
+      });
+    } else if (step.kind === 'write' && mode !== undefined && step.storeMode !== undefined && mode !== step.storeMode) {
+      result.modesKept.push({
+        path: step.path,
+        reason: (step.priorMode === undefined
+          ? `written, keeping disk's mode (${octal(mode)}), which differs from the workspace's (${octal(step.storeMode)}), and nothing records which side changed it`
+          : `written, keeping disk's mode (${octal(mode)}), which changed since it last agreed with the workspace's (${octal(step.storeMode)})`) +
+          ' — sync this path to take disk\'s mode in, or materialize this path with force to apply the workspace\'s',
+      });
+    }
     const planned = store.currentBranch().id === branchId;
-    if (step.kind === 'write') {
+    if (step.kind === 'chmod') {
+      result.written.push(step.path);
+    } else if (step.kind === 'write') {
       if (planned) mount.intents.update(step.path, (cur) => { const next = { ...cur }; delete next.conflict; delete next.origin; return next; });
       result.written.push(step.path);
     } else {

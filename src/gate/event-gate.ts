@@ -1573,8 +1573,10 @@ export class EventGate {
       }
       for (const [channelId, { count, oldest, label }] of byChannel) {
         // Prefer the human-readable name; keep the id parenthesized so the
-        // agent can still address tools that want the composite id.
-        const channel = label ? `#${label} (${channelId})` : channelId;
+        // agent can still address tools that want the composite id. A name
+        // may carry its own `#`, so one is added only where the name lacks
+        // it, as at the other places that add a `#`.
+        const channel = label ? `${label.startsWith('#') ? label : `#${label}`} (${channelId})` : channelId;
         const age = Math.round((Date.now() - oldest) / 1000);
         lines.push(
           `- ${count} message${count > 1 ? 's' : ''} in ${channel} ` +
@@ -1618,6 +1620,17 @@ export class EventGate {
       clearTimeout(selfWake);
       this.selfWakeTimers.delete(agentName);
     }
+  }
+
+  /** A turn that continues another (a budget restart, a tool-result-guard
+   *  retry) holds the entry its predecessor kept for it, and takes it again
+   *  where that entry ended in between: at a stop(), whose dispose() clears
+   *  every entry, or at a provider hold that kept the turn from starting,
+   *  whose end queues it again. Unlike onInferenceStarted it leaves a
+   *  pending self-wake alone: the logical turn that armed it is the one
+   *  still running. */
+  onInferenceResumed(agentName: string): void {
+    this.inferring.add(agentName);
   }
 
   onInferenceEnded(agentName: string): void {
@@ -1983,5 +1996,16 @@ export class EventGate {
     this.rateLimitDenied.clear();
     this.passiveSampleFires.clear();
     this.inferenceBuffer = [];
+    // stop() disposes the gate once its streams and event loop have ended (a
+    // turn still compiling then is dropped at its next check, before it sends
+    // anything), and a start() goes on with this gate. An agent left here by
+    // a turn whose exit didn't end it (a retry stop() cancelled, a successor
+    // stop() refused) would make every debounced batch buffer until that
+    // agent's next turn ended. A turn that continues after the start() takes
+    // its entry again (onInferenceResumed). A turn that a start() during the
+    // stop() began before this ran loses its entry too, and runs on without
+    // it, so debounced batches are delivered while it runs: nothing refuses
+    // a start() during a stop() yet.
+    this.inferring.clear();
   }
 }

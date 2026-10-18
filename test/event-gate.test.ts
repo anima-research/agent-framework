@@ -379,6 +379,36 @@ describe('debounce', () => {
     assert.strictEqual(inferenceRequests[0].agentName, 'agent');
   });
 
+  it('a batched wake names a channel whose channelName already starts with # with one #', () => {
+    // #406: a channel's name may carry its own `#`; the line adds one only
+    // where the name lacks it, as the other places that add a `#` do.
+    const path = writeConfig('debounce-hash-name.json', {
+      policies: [
+        { name: 'chat', match: { scope: ['mcpl:channel-incoming'] }, behavior: { debounce: 100 } },
+      ],
+      default: 'skip',
+    });
+    const { gate, messages } = makeGate(path);
+    gate.evaluate(event({ eventType: 'mcpl:channel-incoming', serverId: 'zulip', channelId: 'zulip:design', content: 'a',
+      metadata: { channelName: '#design' } }));
+    gate.evaluate(event({ eventType: 'mcpl:channel-incoming', serverId: 'discord', channelId: 'discord:g:portables', content: 'b',
+      metadata: { channelName: 'portables' } }));
+    // Fire the batch now rather than after a delay, so the verdict doesn't
+    // depend on how loaded the machine is.
+    const batch = gate as unknown as {
+      debounceTimers: Map<string, { timer: ReturnType<typeof setTimeout> }>;
+      fireDebounce(policyName: string): void;
+    };
+    clearTimeout(batch.debounceTimers.get('chat')!.timer);
+    batch.fireDebounce('chat');
+
+    assert.strictEqual(messages.length, 1);
+    const text = (messages[0].content as Array<{ text: string }>)[0].text;
+    assert.match(text, /1 message in #design \(zulip:design\)/);
+    assert.match(text, /1 message in #portables \(discord:g:portables\)/);
+    assert.doesNotMatch(text, /##/);
+  });
+
   it('a batched wake carries the newest channel event\'s channel AND author together (provenance)', async () => {
     const path = writeConfig('debounce-provenance.json', {
       policies: [

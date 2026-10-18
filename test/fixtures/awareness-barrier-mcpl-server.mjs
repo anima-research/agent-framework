@@ -161,7 +161,7 @@ function sendDataRequest(id, phase) {
 function beginServerTraffic() {
   if (initialized) return;
   initialized = true;
-  log('initialized');
+  log('initialized', { pid: process.pid });
   request(200, 'channels/register', { channels: [channel('startup')] });
   // The reconnect generation carries an inference-bearing event in the same
   // registration window. Initial-start tests use generation 1 as well.

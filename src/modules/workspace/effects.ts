@@ -79,6 +79,30 @@ export class EffectFailed extends Error {
 }
 
 const CHANGED = 'disk changed since it was checked';
+const MODE_CHANGED = 'disk\'s mode changed since it was checked; a sync takes it in';
+/**
+ * A write's narrowing the kernel refused (another user's file, an ACL): the
+ * write goes no further, and the next push meets the same refusal. Names the
+ * mode the file has, the one the chmod aimed at, and the workspace's, once
+ * where the two are the same.
+ */
+const notNarrowed = (from: number, target: number, workspace: number): string =>
+  `the kernel refused to narrow its mode ${narrowingOf(from, target, workspace)}, as it does for a file another user owns, ` +
+  'and new bytes aren\'t written wider than their mode: a retry is refused the same way until the file\'s owner or an administrator narrows it';
+/** "from 0640 to 0600, within the workspace's 0604", or "from 0644 to the workspace's 0600". */
+const narrowingOf = (from: number, target: number, workspace: number): string => `from ${octalMode(from)} ${narrowedTo(target, workspace)}`;
+/** "to 0600, within the workspace's 0604", or "to the workspace's 0600" where the two are the same. */
+export const narrowedTo = (target: number, workspace: number): string =>
+  target === workspace
+    ? `to the workspace's ${octalMode(workspace)}`
+    : `to ${octalMode(target)}, within the workspace's ${octalMode(workspace)}`;
+const octalMode = (mode: number): string => '0' + (mode & 0o777).toString(8).padStart(3, '0');
+
+/** Whether the kernel refused a chmod as not this process's to make (another user's file, an ACL). */
+function chmodRefused(err: unknown): boolean {
+  const code = errno(err);
+  return code === 'EPERM' || code === 'EACCES';
+}
 const MOVED = 'the directory changed since it was checked';
 const HARD_LINKED = 'a file with other hard links, which writing it in place would change too — force does not override '
   + 'this; to write this path alone, give it a copy of its own first (copy it to a new name, then move that over it) '
@@ -162,9 +186,45 @@ async function hashAt(target: string, id: { dev: bigint; ino: bigint }, flags: n
 /**
  * Write `bytes` at a mount-relative path, creating missing parent
  * directories, and make the file durable (its directories are synced by the
- * caller, after all of a push's effects: syncDirectories).
+ * caller, after all of a push's effects: syncDirectories). With `mode`, the
+ * file takes those permission bits; without it, a file written in place
+ * keeps its own, and one the write creates takes `createMode`, the store's,
+ * or 0o644 under the umask without one. A new file is created at that mode
+ * and given it exactly before its bytes, whether or not a chmod was owed
+ * when the write was planned; a file written in place loses the bits
+ * `mode` removes before its bytes and gains the ones it adds after them, so
+ * no bytes ever sit at a mode wider than both their old and new ones. With
+ * `from`, the mode is given only to a file in place that still has the
+ * permission bits `from`: one whose permission bits changed since it was
+ * checked keeps them, as a changed byte would be kept, and the widening
+ * after the bytes is made only over the mode the write left them at, so a
+ * mode set while they went in is kept too, up to the check just before that
+ * chmod. Without it, as a forced push writes, the mode is given whatever the
+ * file has, before the bytes and again after them where a mode set while
+ * they went in differs, a file the forced push creates included; a file an
+ * unforced push creates keeps a mode set while its bytes go in. Setuid and
+ * setgid are another matter, whatever `from` says: a file that has either
+ * when the write checks it loses both before the bytes, and keeps its
+ * permission bits and its sticky bit; the chmod after the bytes keeps the
+ * special bits the file has then (withSpecialBits).
+ *
+ * Where the kernel refuses a chmod (EPERM or EACCES: another user's file,
+ * an ACL), the write acts on the refusal. A refused drop of setuid and
+ * setgid carries on under the kernel's own rule for a write, which leaves
+ * setuid for a writer with CAP_FSETID and setgid where the group can't
+ * execute. A refused narrowing refuses the write before its bytes, unless
+ * the mode is forced over one disk changed or one nothing records
+ * (`overDisk`): then the bytes go in at the mode the file has, as an
+ * unforced write's would, and `modeKept` says so. A refused widening, after
+ * the bytes or to a created file's exact mode, leaves the file at the mode
+ * it has, and `widenRefused` says so.
+ * Returns the permission bits the file has after the write, and whether a
+ * chmod was refused and the file kept its mode.
  */
-export async function writeContained(view: MountView, rootReal: string, rel: string, bytes: Buffer, expect: Expect): Promise<void> {
+export async function writeContained(
+  view: MountView, rootReal: string, rel: string, bytes: Buffer, expect: Expect, mode?: number, from?: number, overDisk?: boolean,
+  createMode?: number,
+): Promise<{ perm: number; widenRefused: boolean; modeKept: boolean }> {
   const checked = await parentFor(view, rootReal, rel, true);
   if (checked.kind !== 'checked') throw new EffectFailed('a parent path is not a directory', false);
   const parent = checked.dir;
@@ -180,8 +240,10 @@ export async function writeContained(view: MountView, rootReal: string, rel: str
   const create = async (): Promise<FileHandle> => {
     try {
       // Exclusive: never follows a symlink, never takes over a file that
-      // appeared since planning saw none.
-      const handle = await open(target, fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_EXCL, 0o644);
+      // appeared since planning saw none. At the mode it's given, which the
+      // umask can only narrow, so the file is never wider than that mode,
+      // even stopped before the chmod that makes the mode exact.
+      const handle = await open(target, fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_EXCL, mode ?? createMode ?? 0o644);
       touched = true;
       return handle;
     } catch (err) {
@@ -210,37 +272,207 @@ export async function writeContained(view: MountView, rootReal: string, rel: str
 
   let stage = 'write the file';
   try {
-    // Before any byte: a regular file, and — unless forced — still holding
-    // what was decided on. The hash reads the whole file, so it comes first,
-    // and the checks of where the file is follow it.
-    const info = await handle.stat({ bigint: true });
-    if (!info.isFile()) throw new EffectFailed('not a regular file', touched);
-    if (expect.kind === 'content' && (await hashAt(target, info, noFollow)) !== expect.hash) throw new EffectFailed(CHANGED, touched);
-    // Then: canonically inside the mount, the one this path names (and not a
-    // symlink, where the mount follows none and the open couldn't refuse
-    // one), with no other names, in the directory still at its path beneath
-    // the root still at its own.
-    const real = await realpath(target).catch(() => null);
-    if (real === null) throw new EffectFailed(CHANGED, touched);
-    if (!contained(rootReal, real)) throw new EffectFailed(view.followSymlinks ? 'a symlink that leaves the mount' : OUTSIDE_PARENT, touched);
-    const named = await stat(real, { bigint: true }).catch(() => null);
-    if (named === null || named.dev !== info.dev || named.ino !== info.ino) throw new EffectFailed(CHANGED, touched);
-    if (!view.followSymlinks) {
-      const entry = await lstat(target, { bigint: true }).catch(() => null);
-      if (entry?.isSymbolicLink()) throw new EffectFailed(NOT_FOLLOWED, touched);
-      if (entry === null || !entry.isFile() || entry.dev !== info.dev || entry.ino !== info.ino) throw new EffectFailed(CHANGED, touched);
-    }
-    if (info.nlink > 1n) throw new EffectFailed(HARD_LINKED, touched);
-    const gone = await moved(root, parent);
-    if (gone !== null) throw new EffectFailed(gone, touched);
-    // Nothing wrote it while those ran.
-    if (!unchanged(info, await handle.stat({ bigint: true }).catch(() => null))) throw new EffectFailed(CHANGED, touched);
-
+    const created = touched;
+    await checkOpened(view, rootReal, root, parent, target, handle, expect, noFollow, touched);
     touched = true;
+    // The mode the bytes are written at, and the one the file ends with.
+    let before: number | undefined;
+    let after: number | undefined;
+    let left: number | undefined;
+    const seen = (await handle.stat({ bigint: true })).mode;
+    const current = Number(seen & 0o777n);
+    // A file the write creates gets the store's mode exactly, whether or not
+    // a chmod was owed when the write was planned: a forced write can find
+    // the file removed since.
+    const exact = mode ?? (created ? createMode : undefined);
+    if (exact !== undefined) {
+      if (created) {
+        before = exact;
+        // Forced (the effect expects any copy), it gives a file it creates its
+        // mode after the bytes too, as it gives one in place; an unforced
+        // creation keeps a mode set while its bytes go in, as every unforced
+        // write does.
+        if (expect.kind === 'any') after = exact;
+      } else if (from === undefined || current === from) {
+        before = current & exact;
+        after = exact;
+      }
+      if (before === current) before = undefined;
+      left = before ?? current;
+      // A forced write gives its mode after the bytes too, wherever the file's
+      // differs then (below); an unforced one owes nothing more here.
+      if (after === left && from !== undefined) after = undefined;
+    }
+    // A file that has setuid or setgid when the write checks it loses both
+    // before the bytes, whether or not the write narrows the mode, and keeps
+    // the permission bits it has then: no new bytes go in under a privileged
+    // bit. Where the kernel refuses that chmod (another user's file, an ACL),
+    // the write carries on under the kernel's own rule for a write, which
+    // clears setuid, and setgid where the group can execute, for a writer
+    // without CAP_FSETID. A narrowing it refuses stops the write first: new
+    // bytes aren't written wider than their mode. Forced over a mode disk
+    // changed or one nothing records (overDisk), the bytes go in at the mode
+    // the file has instead, as they would have without force.
+    const drop = before === undefined && !created && (seen & SETUID_SETGID) !== 0n;
+    // A widening the kernel refuses leaves the bytes at the mode the file
+    // has: the write stands, and its caller says why the mode wasn't given.
+    // A created file's chmod to its exact mode widens the one the umask left.
+    let widenRefused = false;
+    let modeKept = false;
+    if (before !== undefined || drop) {
+      stage = 'set the file\'s mode';
+      try {
+        await handle.chmod(await withSpecialBits(handle, before ?? current, STICKY));
+      } catch (err) {
+        if (!chmodRefused(err)) throw err;
+        if (created) widenRefused = true;
+        else if (!drop && overDisk) {
+          // Forced over a mode disk changed: the bytes go in at the mode
+          // the file has, as they would have without force.
+          modeKept = true;
+          after = undefined;
+        } else if (!drop) throw new EffectFailed(notNarrowed(current, before!, mode!), false);
+      }
+    }
+    stage = 'write the file';
     await handle.truncate(0);
     await handle.writeFile(bytes);
+    // A mode set while the bytes went in is kept, unless the write is forced:
+    // one set in the instant between this check and the chmod isn't, since
+    // there's no compare-and-chmod to make the two one step.
+    if (after !== undefined) {
+      const now = Number((await handle.stat({ bigint: true })).mode & 0o777n);
+      // Forced, wherever the file's mode isn't the one it gives; unforced,
+      // only over the mode the write left the bytes at.
+      if (from === undefined ? now !== after : now === left) {
+        stage = 'set the file\'s mode';
+        try {
+          await handle.chmod(await withSpecialBits(handle, after));
+        } catch (err) {
+          if (!chmodRefused(err)) throw err;
+          widenRefused = true;
+        }
+      }
+    }
     stage = 'make the write durable (file fsync)';
     await handle.sync();
+    return { perm: Number((await handle.stat({ bigint: true })).mode & 0o777n), widenRefused, modeKept };
+  } catch (err) {
+    if (err instanceof EffectFailed) throw err;
+    throw new EffectFailed(`could not ${stage}: ${message(err)}`, touched);
+  } finally {
+    await handle.close();
+  }
+}
+
+/**
+ * Before an effect on an opened file: a regular file, and — unless forced —
+ * still holding what was decided on. The hash reads the whole file, so it
+ * comes first, and the checks of where the file is follow it: canonically
+ * inside the mount, the one this path names (and not a symlink, where the
+ * mount follows none and the open couldn't refuse one), with no other names,
+ * in the directory still at its path beneath the root still at its own; and
+ * nothing wrote it while those ran.
+ */
+async function checkOpened(
+  view: MountView,
+  rootReal: string,
+  root: CheckedDir,
+  parent: CheckedDir,
+  target: string,
+  handle: FileHandle,
+  expect: Expect,
+  noFollow: number,
+  touched: boolean,
+): Promise<void> {
+  const info = await handle.stat({ bigint: true });
+  if (!info.isFile()) throw new EffectFailed('not a regular file', touched);
+  if (expect.kind === 'content' && (await hashAt(target, info, noFollow)) !== expect.hash) throw new EffectFailed(CHANGED, touched);
+  const real = await realpath(target).catch(() => null);
+  if (real === null) throw new EffectFailed(CHANGED, touched);
+  if (!contained(rootReal, real)) throw new EffectFailed(view.followSymlinks ? 'a symlink that leaves the mount' : OUTSIDE_PARENT, touched);
+  const named = await stat(real, { bigint: true }).catch(() => null);
+  if (named === null || named.dev !== info.dev || named.ino !== info.ino) throw new EffectFailed(CHANGED, touched);
+  if (!view.followSymlinks) {
+    const entry = await lstat(target, { bigint: true }).catch(() => null);
+    if (entry?.isSymbolicLink()) throw new EffectFailed(NOT_FOLLOWED, touched);
+    if (entry === null || !entry.isFile() || entry.dev !== info.dev || entry.ino !== info.ino) throw new EffectFailed(CHANGED, touched);
+  }
+  if (info.nlink > 1n) throw new EffectFailed(HARD_LINKED, touched);
+  const gone = await moved(root, parent);
+  if (gone !== null) throw new EffectFailed(gone, touched);
+  if (!unchanged(info, await handle.stat({ bigint: true }).catch(() => null))) throw new EffectFailed(CHANGED, touched);
+}
+
+/** The sticky bit, the one special bit the chmod before a write's bytes keeps. */
+const STICKY = 0o1000n;
+/** The setuid and setgid bits, which the chmod before a write's bytes drops. */
+const SETUID_SETGID = 0o6000n;
+
+/**
+ * `perm` with those of the opened file's setuid, setgid and sticky bits that
+ * `keep` names, as the file has them now. The store never records them, so
+ * a chmod adds none. The chmod before a write's bytes, made whenever the
+ * write narrows the mode or the file has setuid or setgid when the write
+ * checks it, keeps only the sticky bit, stricter than the kernel's rule for a
+ * write, so where it's made no new bytes go in under a setuid or setgid bit
+ * the write saw; where the kernel refuses it, the kernel's rule applies
+ * (writeContained). A widening chmod after the bytes, and a chmod of the
+ * mode alone, keep all three as the file has them then.
+ */
+async function withSpecialBits(handle: FileHandle, perm: number, keep: bigint = 0o7000n): Promise<number> {
+  return Number((await handle.stat({ bigint: true })).mode & keep) | perm;
+}
+
+/**
+ * Give a mount-relative file the permission bits `mode`, through a located
+ * descriptor, after the checks a write in place makes, and make the change
+ * durable. The bytes are left as they are. With `from`, a file whose
+ * permission bits are no longer those, the ones it had when it was checked,
+ * is refused: its mode changed since, and is kept, as a changed byte would
+ * be. A chmod the kernel refuses (EPERM or EACCES: another user's file, an
+ * ACL) changes nothing, and the result says so (`refused`), with whether it
+ * would have removed bits the file has (`narrowing`), for the caller to
+ * record and report.
+ */
+export async function chmodContained(
+  view: MountView, rootReal: string, rel: string, mode: number, expect: Expect, from?: number,
+): Promise<{ refused: boolean; narrowing: boolean }> {
+  const checked = await parentFor(view, rootReal, rel, false);
+  if (checked.kind !== 'checked') throw new EffectFailed('the file was removed since it was checked', false);
+  const parent = checked.dir;
+  const root = checked.root;
+  const target = parent.at(nameOf(rel));
+  const noFollow = noFollowFlag(view);
+  if (!view.followSymlinks && !noFollow) {
+    if ((await lstat(target).catch(() => null))?.isSymbolicLink()) throw new EffectFailed(NOT_FOLLOWED, false);
+  }
+  let handle: FileHandle;
+  try {
+    handle = await open(target, fsConstants.O_RDONLY | NONBLOCK | noFollow);
+  } catch (err) {
+    const code = errno(err);
+    if (code === 'ENOENT') throw new EffectFailed('the file was removed since it was checked', false);
+    if (code === 'ELOOP' && !view.followSymlinks) throw new EffectFailed(NOT_FOLLOWED, false);
+    throw new EffectFailed(`cannot open the file (${code ?? message(err)})`, false);
+  }
+  let touched = false;
+  let stage = 'set the file\'s mode';
+  try {
+    await checkOpened(view, rootReal, root, parent, target, handle, expect, noFollow, false);
+    const current = Number((await handle.stat({ bigint: true })).mode & 0o777n);
+    if (from !== undefined && current !== from) throw new EffectFailed(MODE_CHANGED, false);
+    const narrowing = (current & ~mode & 0o777) !== 0;
+    touched = true;
+    try {
+      await handle.chmod(await withSpecialBits(handle, mode));
+    } catch (err) {
+      if (chmodRefused(err)) return { refused: true, narrowing };
+      throw err;
+    }
+    stage = 'make the mode durable (file fsync)';
+    await handle.sync();
+    return { refused: false, narrowing };
   } catch (err) {
     if (err instanceof EffectFailed) throw err;
     throw new EffectFailed(`could not ${stage}: ${message(err)}`, touched);

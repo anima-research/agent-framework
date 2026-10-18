@@ -40,3 +40,32 @@ export function splitProseSegments(content: readonly ContentBlock[]): string[] {
 
   return segments;
 }
+
+/**
+ * A turn's content without the prose of some of its tool rounds, the turn's
+ * rounds counted from 0 in order. A round's prose is its text
+ * before its calls, and a round starts at the first block after the previous
+ * round's `tool_result` blocks. So a round with no prose still counts, two
+ * calls of one round (their `tool_use` blocks come before any result) stay
+ * one round, and a round is found by its place, whatever its text holds.
+ * Other rounds' text, every non-text block and the text after the last round
+ * stay.
+ */
+export function withoutRoundsProse(
+  content: readonly ContentBlock[],
+  rounds: ReadonlySet<number>,
+): ContentBlock[] {
+  let round = 0;
+  let afterResults = false;
+  return content.filter((block) => {
+    if (block.type === 'tool_result') {
+      afterResults = true;
+      return true;
+    }
+    if (afterResults) {
+      round++;
+      afterResults = false;
+    }
+    return !(block.type === 'text' && rounds.has(round));
+  });
+}

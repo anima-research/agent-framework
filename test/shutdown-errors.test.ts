@@ -464,6 +464,20 @@ test('MCPL registry retains failed and pending servers and bounds concurrent att
   assert.equal(registry.getAllServers().length, 0);
 });
 
+test('MCPL registry closeServer leaves an entry that a newer connection holds under the same id', async () => {
+  const registry = new McplServerRegistry();
+  const servers = (registry as unknown as { servers: Map<string, McplServerConnection> }).servers;
+  let replacedCloses = 0;
+  const replaced = { close: async () => { replacedCloses++; } } as unknown as McplServerConnection;
+  const current = { close: async () => { throw new Error('the newer connection was closed'); } } as unknown as McplServerConnection;
+  // As when a restart has replaced the connection that a policy fallback or
+  // a failed connect is closing for good.
+  servers.set('restarted', current);
+  await registry.closeServer('restarted', replaced);
+  assert.equal(replacedCloses, 1, 'the connection asked about is closed');
+  assert.equal(registry.getServer('restarted'), current, 'the newer connection keeps its entry');
+});
+
 
 test('public MCPL recovery serializes overlapping reconnects and close waits for late cleanup', async t => {
   t.mock.timers.enable({ apis: ['setTimeout'] });

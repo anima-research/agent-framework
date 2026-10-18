@@ -48,9 +48,15 @@ export interface Fingerprint {
   hashedAt: number;
 }
 
+/**
+ * `mode`: the permission bits disk held (`st_mode & 0o777`). Evidence from
+ * before modes were recorded, or recorded after the kernel refused a
+ * widening of the workspace's own change, has none: a sync takes disk's mode
+ * in.
+ */
 export type Agreed =
   | { kind: 'absent' }
-  | { kind: 'content'; hash: string; size: number; fp?: Fingerprint };
+  | { kind: 'content'; hash: string; size: number; fp?: Fingerprint; mode?: number };
 
 export type Candidate = { kind: 'absent' } | { kind: 'content'; hash: string };
 
@@ -63,6 +69,21 @@ export interface Pending {
   expect: Candidate;
   /** Branch the intent was recorded on (an adoption's meaning is branch-relative). */
   branchId: string;
+  /**
+   * For a write whose plan gives the file a mode: the mode it saw (`from`)
+   * and the one it gives (`to`); a write that creates the file records `to`
+   * for both. A push that goes on as our own narrowing push, stopped before
+   * its bytes, records that push's `from`, the old bytes' own mode, and the
+   * store's mode now, or where the store records none, the mode the stopped
+   * push narrowed to, whether or not it gives a mode itself. It narrows to
+   * `from & to` before the bytes and widens to `to` after them, so a stop
+   * leaves disk at one of those three, with the old bytes or the new, and
+   * those are the push's own. A file that has setuid or setgid
+   * when the write checks it loses them before the bytes too, a chmod that
+   * keeps the permission bits it has then, so a stop after that chmod alone
+   * leaves disk at the mode the write saw, less those bits.
+   */
+  modes?: { from: number; to: number };
 }
 
 export interface Interrupted {
@@ -133,6 +154,21 @@ export function sameCandidate(a: Candidate, b: Candidate): boolean {
   return a.kind === b.kind && (a.kind === 'absent' || a.hash === (b as { hash: string }).hash);
 }
 
+/** A record with no mode claimed: a content record's, and a pending intent's own modes and its prior's. */
+function withoutModes(value: Physical): Physical {
+  if (value.kind === 'content' && value.mode !== undefined) {
+    const { mode: _mode, ...rest } = value;
+    return rest;
+  }
+  if (value.kind === 'pending') {
+    const { modes: _modes, ...intent } = value;
+    if (intent.prior?.kind !== 'content' || intent.prior.mode === undefined) return intent;
+    const { mode: _mode, ...prior } = intent.prior;
+    return { ...intent, prior };
+  }
+  return value;
+}
+
 export class DiskAgreement {
   private readonly store: JsStore;
   private readonly journal: RecordJournal<JournalEntry, Snapshot>;
@@ -145,10 +181,13 @@ export class DiskAgreement {
    * place owes none (recordWalk).
    */
   private unsynced = false;
+  /** Whether this host observes file modes (not on Windows): where it doesn't, no record it writes claims one. */
+  private readonly modesObserved: () => boolean;
 
-  constructor(store: JsStore) {
+  constructor(store: JsStore, opts: { modesObserved?: () => boolean } = {}) {
     this.store = store;
     this.journal = new RecordJournal<JournalEntry, Snapshot>(store, { type: DISK_AGREEMENT_RECORD_TYPE });
+    this.modesObserved = opts.modesObserved ?? (() => true);
   }
 
   /**
@@ -315,7 +354,8 @@ export class DiskAgreement {
   /**
    * Put back exactly the evidence a path had before an intent whose effect
    * never touched it — whatever kind it was (agreed, pending, interrupted, or
-   * unknown) — so the intent leaves no trace in what P says.
+   * unknown) — so the intent leaves no trace in what P says; where modes go
+   * unobserved, less any mode it carried, as every record written there.
    */
   restore(mount: string, path: string, value: Physical | undefined): void {
     if (value === undefined) this.forget(mount, path);
@@ -324,6 +364,14 @@ export class DiskAgreement {
 
   private write(entry: JournalEntry, opts: { durable?: boolean; afterCommittedState?: boolean }): void {
     this.ensureReconciled();
+    // A host that doesn't observe modes has none that's true to record: a
+    // record it writes carries no mode, and a host that observes them reads
+    // the path's mode as unknown, as for evidence from before modes were
+    // recorded. This holds whatever built the record: disk, the store's
+    // entry, or an earlier record a POSIX host wrote, put back by a restore.
+    // (A checkpoint re-serializes the evidence as it stands, other hosts'
+    // records included, as replaying the journal would.)
+    if (entry.t === 'set' && !this.modesObserved()) entry = { ...entry, value: withoutModes(entry.value) };
     // Evidence is owed a barrier until proven durable: a failed append may
     // still have landed. A place isn't (recordWalk).
     if (entry.t !== 'walk') this.unsynced = true;

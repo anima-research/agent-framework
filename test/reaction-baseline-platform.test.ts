@@ -137,3 +137,14 @@ test('POSIX reaction baseline keeps differently cased env names distinct', async
   assert.ok(composed[KEY]!.split(',').includes('💤'));
   assert.ok(composed[KEY]!.split(',').includes('🔕'));
 });
+
+test('an inheritEnv that is not true never reads the host baseline: the protective default stands', async () => {
+  // create() and connectMcplServer refuse such a value; this is the read a
+  // config reaching connectMcplServerInternal unchecked would meet.
+  for (const inheritEnv of ['false', 'true', 1]) {
+    const composed = await connectionEnv('linux', {}, inheritEnv as unknown as boolean, { [KEY]: '🟦' });
+    assert.equal(composed[KEY], DEFAULT, JSON.stringify(inheritEnv));
+  }
+  const inherited = await connectionEnv('linux', {}, true, { [KEY]: '🟦' });
+  assert.equal(inherited[KEY], '🟦', 'true still inherits it');
+});

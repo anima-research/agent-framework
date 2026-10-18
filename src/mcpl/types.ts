@@ -238,7 +238,10 @@ export interface McplServerConfig {
   /**
    * Escape hatch: pass the host's entire environment (including secrets) to
    * the stdio child, as older versions did. Only for servers that genuinely
-   * need it. Default false.
+   * need it. Default false. Only `true` turns it on, and null counts as not
+   * set. For a stdio server, `create()`, `connectMcplServer` and
+   * `restartMcplServer` refuse any other value, such as a quoted "false". A
+   * WebSocket server never reads it.
    */
   inheritEnv?: boolean;
 
@@ -278,7 +281,9 @@ export interface McplServerConfig {
    * unstick). DEFAULT FALSE: no §6.2 capability path exists for it, and the
    * grant cannot confer it — only this config, decided by the operator, can
    * (PR #79 review blocker 9). The one legitimate fleet user is
-   * discord-mcpl's slash-command relay.
+   * discord-mcpl's slash-command relay. Only `true` turns it on, and null
+   * counts as not set. `create()`, `connectMcplServer` and
+   * `restartMcplServer` refuse any other value, such as a quoted "true".
    */
   allowHostCommands?: boolean;
 
@@ -351,6 +356,9 @@ export interface McplServerConfig {
    * When true, connect() resolves immediately (with null capabilities) if the
    * server is unavailable, and retries in the background.
    * Adapted from Anarchid/agent-framework@mcpl-module-proto.
+   * Only `true` turns it on, and null counts as not set. `create()`,
+   * `connectMcplServer` and `restartMcplServer` refuse any other value, such
+   * as a quoted "false".
    */
   reconnect?: boolean;
 

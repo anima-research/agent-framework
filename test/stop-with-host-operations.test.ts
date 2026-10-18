@@ -944,6 +944,9 @@ describe('stop() with an operator operation in flight', () => {
       fw.emitMcplToolDiff = () => {};
       fw.mcplServerRegistry = {
         getAllServers: () => [],
+        // A connect asks whether the server is connected already, as the
+        // registry answers for an unknown server.
+        getServer: () => null,
         removeServer: async () => {
           entered = true;
           await held;

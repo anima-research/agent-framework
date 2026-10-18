@@ -16,11 +16,12 @@
 
 import test, { type TestContext } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { appendFileSync, mkdirSync, mkdtempSync, rmSync, statSync, symlinkSync, truncateSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { JsStore } from '@animalabs/chronicle';
 import { WorkspaceModule, WorkspaceReadError } from '../src/modules/workspace/index.js';
+import { changedAfterFstat, countingLoads, withFileHandle } from './helpers/file-handle.js';
 
 function setup(t: TestContext, options?: { followSymlinks?: boolean }) {
   const root = mkdtempSync(join(tmpdir(), 'af-read-from-disk-'));
@@ -176,7 +177,75 @@ test('maxBytes performs a bounded prefix read and reports truncation', async (t)
   assert.equal(whole.truncated, false);
   assert.equal(whole.bytes.length, 10_000);
 
+  const exact = await workspace.readFileFromDisk('work/big.txt', { maxBytes: 10_000 });
+  assert.equal(exact.truncated, false, 'a file of exactly maxBytes goes on no further');
+  assert.equal(exact.bytes.length, 10_000);
+
+  const none = await workspace.readFileFromDisk('work/big.txt', { maxBytes: 0 });
+  assert.deepEqual([none.bytes.length, none.truncated, none.size], [0, true, 10_000]);
+  writeFileSync(join(mountDir, 'empty.txt'), '');
+  const empty = await workspace.readFileFromDisk('work/empty.txt', { maxBytes: 0 });
+  assert.deepEqual([empty.bytes.length, empty.truncated, empty.size], [0, false, 0]);
+
   await assert.rejects(workspace.readFileFromDisk('work/big.txt', { maxBytes: -1 }), RangeError);
+});
+
+test('maxBytes bounds the read itself: a file that grows past it after the open is still read no further', async (t) => {
+  const { mountDir, workspace } = setup(t);
+  const path = join(mountDir, 'log.txt');
+  for (const start of ['a'.repeat(10), '']) {
+    writeFileSync(path, start); // a file empty at the open, too: its fstat gives no size to read up to
+    const { result: read, loaded } = await countingLoads(() => changedAfterFstat(path, () => appendFileSync(path, 'b'.repeat(5000)),
+      () => workspace.readFileFromDisk('work/log.txt', { maxBytes: 100 })));
+    assert.equal(read.bytes.toString(), (start + 'b'.repeat(5000)).slice(0, 100), 'its first maxBytes');
+    assert.equal(read.truncated, true, 'the read found the file going on past maxBytes');
+    assert.equal(read.size, start.length + 5000, 'its size once read, not the size the open\'s fstat gave');
+    assert.ok(loaded <= 101, `loaded ${loaded} bytes: no more than maxBytes, and the one byte that shows the file goes on`);
+  }
+});
+
+test('a truncated read reports a size past maxBytes even when the file shrinks under it once read', async (t) => {
+  const { mountDir, workspace } = setup(t);
+  const path = join(mountDir, 'log.txt');
+  writeFileSync(path, 'a'.repeat(200));
+  const ino = String(statSync(path, { bigint: true }).ino);
+  let stats = 0;
+  const read = await withFileHandle({
+    stat: (stat) => async function (this: unknown, ...args: unknown[]) {
+      const result = await stat.apply(this, args);
+      if (String(result.ino) !== ino || ++stats === 1) return result; // the open's fstat
+      truncateSync(path, 10); // the file shrinks before the fstat after the read
+      return stat.apply(this, args);
+    },
+  }, () => workspace.readFileFromDisk('work/log.txt', { maxBytes: 100 }));
+  assert.equal(stats, 2, 'the fstat after the read was made');
+  assert.equal(read.bytes.toString(), 'a'.repeat(100));
+  assert.equal(read.truncated, true, 'the read found the file going on past maxBytes');
+  assert.equal(read.size, 101, 'the bytes the read found, where the fstat after it says 10');
+});
+
+test('a file that shrinks under maxBytes after the open is read to its end, and not reported truncated', async (t) => {
+  const { mountDir, workspace } = setup(t);
+  const path = join(mountDir, 'log.txt');
+  writeFileSync(path, 'a'.repeat(5000));
+  const read = await changedAfterFstat(path, () => truncateSync(path, 50),
+    () => workspace.readFileFromDisk('work/log.txt', { maxBytes: 100 }));
+  assert.equal(read.bytes.toString(), 'a'.repeat(50));
+  assert.equal(read.truncated, false, 'the read reached the file\'s end');
+  assert.equal(read.size, 50);
+});
+
+test('size is what the read found: a file that grows after the open, within maxBytes or with none, reports the bytes it gave', async (t) => {
+  const { mountDir, workspace } = setup(t);
+  const path = join(mountDir, 'log.txt');
+  for (const options of [{}, { maxBytes: 100 }]) {
+    writeFileSync(path, 'a'.repeat(10));
+    const read = await changedAfterFstat(path, () => appendFileSync(path, 'b'.repeat(20)),
+      () => workspace.readFileFromDisk('work/log.txt', options));
+    assert.equal(read.bytes.toString(), 'a'.repeat(10) + 'b'.repeat(20), JSON.stringify(options));
+    assert.equal(read.truncated, false);
+    assert.equal(read.size, 30, `size agrees with the bytes (${JSON.stringify(options)})`);
+  }
 });
 
 test('read_image keeps its historical error wording after sharing the containment core', async (t) => {

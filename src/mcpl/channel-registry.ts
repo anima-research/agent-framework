@@ -14,8 +14,9 @@
  */
 
 import type { ContentBlock } from '@animalabs/membrane';
-import { INLINE_WITHHELD_TEXT, isInlineContradiction, referenceStubOrNull } from './references.js';
+import { convertBlock } from './convert-block.js';
 import type { JsStore } from '@animalabs/chronicle';
+import { ensureStateRegistered } from '../module-registry.js';
 
 import type {
   ChannelDescriptor,
@@ -30,7 +31,6 @@ import type {
   ChannelsPublishParams,
   ChannelsOpenResult,
   ChannelHistoryRequest,
-  McplContentBlock,
 } from './types.js';
 
 import type { McplServerRegistry } from './server-registry.js';
@@ -38,7 +38,7 @@ import type { FeatureSetManager } from './feature-set-manager.js';
 import type { ToolDefinition, ToolResult, ProcessEvent } from '../types/index.js';
 import { expandCoreTags } from './tags.js';
 import { coalesceRejectionReason, EmptyContentError, validateCoalescedContent } from './push-coalescer.js';
-import { isVisiblyEmptyContent } from './visible-content.js';
+import { isVisiblyEmptyConversion } from './visible-content.js';
 import { logDetail, logValue } from './log-value.js';
 import { RefusalLines } from './refusal-lines.js';
 import { CapabilityGrant } from './capability-grant.js';
@@ -242,88 +242,6 @@ interface McplChannelIncomingEvent {
 }
 
 // ============================================================================
-// Content Conversion: McplContentBlock → membrane ContentBlock
-// ============================================================================
-
-/**
- * Convert a single MCPL wire-format content block to a membrane ContentBlock.
- */
-function convertBlock(block: McplContentBlock): ContentBlock {
-  switch (block.type) {
-    case 'text':
-      // Text that isn't a string is no text, as the request sanitizer and
-      // the visible-content check already read it.
-      return { type: 'text', text: typeof block.text === 'string' ? block.text : '' };
-
-    case 'image':
-      if (isInlineContradiction(block)) {
-        // RFC-005 vector 2: inline data claiming bulk disposition — fail
-        // closed, withhold the data (checked BEFORE the data branch).
-        return { type: 'text', text: INLINE_WITHHELD_TEXT };
-      }
-      if (isFilledString(block.uri) && block.disposition) {
-        // RFC-005 uri-form media with a disposition claim: stub, do not
-        // hand the URI to the provider or inline it.
-        return { type: 'text', text: referenceStubOrNull(block, 'attachment on channel message') ?? '[reference]' };
-      }
-      if (isFilledString(block.data) && isFilledString(block.mimeType)) {
-        return {
-          type: 'image',
-          source: { type: 'base64', data: block.data, mediaType: block.mimeType },
-        } as ContentBlock;
-      }
-      if (isFilledString(block.uri)) {
-        return {
-          type: 'image',
-          source: { type: 'url', url: block.uri },
-        } as ContentBlock;
-      }
-      return { type: 'text', text: isFilledString(block.data) ? '[Image: no media type]' : '[Image: no data]' };
-
-    case 'audio':
-      if (isInlineContradiction(block)) {
-        // RFC-005 vector 2: inline data claiming bulk disposition — fail
-        // closed, withhold the data (checked BEFORE the data branch).
-        return { type: 'text', text: INLINE_WITHHELD_TEXT };
-      }
-      if (isFilledString(block.uri) && block.disposition) {
-        // RFC-005 uri-form media with a disposition claim: stub, do not
-        // hand the URI to the provider or inline it.
-        return { type: 'text', text: referenceStubOrNull(block, 'attachment on channel message') ?? '[reference]' };
-      }
-      if (isFilledString(block.data) && isFilledString(block.mimeType)) {
-        return {
-          type: 'audio',
-          source: { type: 'base64', data: block.data, mediaType: block.mimeType },
-        } as ContentBlock;
-      }
-      return { type: 'text', text: isFilledString(block.data) ? '[Audio: no media type]' : '[Audio: no data]' };
-
-    case 'resource':
-      // RFC-005: reference blocks become bounded stubs — never raw URIs
-      // (a signed URL is a bearer credential that looks like a location).
-      return { type: 'text', text: referenceStubOrNull(block, 'attachment on channel message') ?? '[reference]' };
-
-    default: {
-      // Unknown wire block types previously fell off the exhaustive switch
-      // and propagated `undefined` into ContentBlock[]. Fail visibly. A type
-      // that isn't a string is no type, and is never converted to one: an
-      // object can throw when it is.
-      const type: unknown = (block as { type?: unknown }).type;
-      return { type: 'text', text: `[unrecognized content block: ${typeof type === 'string' ? type : 'untyped'}]` };
-    }
-  }
-}
-
-/** A string with something in it: the only data, mimeType or uri a block's
- *  source is built from, and the only uri that makes it a reference. Anything
- *  else a sender puts there leaves the block without it, so conversion never
- *  throws and never copies a non-string. */
-function isFilledString(value: unknown): value is string {
-  return typeof value === 'string' && value !== '';
-}
-
-// ============================================================================
 // Channel Tool Definitions
 // ============================================================================
 
@@ -336,9 +254,8 @@ const CHANNEL_TOOL_DEFINITIONS: ToolDefinition[] = [
   {
     name: 'channel_open',
     description:
-      'Open a channel to start receiving its ordinary ongoing traffic. The MCPL ' +
-      'integration performs its own subscribe/join/attach operation. Optionally request ' +
-      'history preceding the message that invited you into the channel.',
+      'Open a channel. What an open channel delivers to you depends on its MCPL server. ' +
+      'Optionally request history preceding the message that invited you into the channel.',
     inputSchema: {
       type: 'object' as const,
       properties: {
@@ -378,7 +295,9 @@ const CHANNEL_TOOL_DEFINITIONS: ToolDefinition[] = [
   },
   {
     name: 'channel_close',
-    description: 'Close a channel to stop receiving messages',
+    description:
+      'Close a channel. Messages that address you still reach you; what else stops reaching you ' +
+      'depends on its server.',
     inputSchema: {
       type: 'object' as const,
       properties: {
@@ -504,10 +423,11 @@ interface ChannelRegistryOptions {
    * Called when channels were opened WITHOUT the agent asking (subscription
    * policy admitting a newly discovered channel, or delivery into a closed
    * locus). The host wires this to drop a durable notice into the agent's
-   * window — the agent must always learn that new traffic will start
-   * flowing, and that `channel_close` opts out (their decision outranks
-   * policy). Fires ONCE per channel ever: the desired-state decision is
-   * durable, so reboots do not re-announce. Must not trigger inference.
+   * window — the agent must always learn that the channel opened, and that
+   * `channel_close` opts out (their decision outranks policy). What an open
+   * channel delivers is the server's to say (#406). Fires ONCE per channel
+   * ever: the desired-state decision is durable, so reboots do not
+   * re-announce. Must not trigger inference.
    */
   onChannelAutoOpened?: (info: {
     /** Agent whose action caused the open (delivery); absent for policy opens. */
@@ -543,6 +463,8 @@ interface ChannelRegistryOptions {
    * `defaultPublishChannel`.
    */
   activeChannelResolver?: (agentName: string) => string | undefined;
+  /** Whether this framework has EventGate and can honor skip_reply self-wakes. */
+  eventGatePresent?: boolean;
 }
 
 // ============================================================================
@@ -680,6 +602,7 @@ export class ChannelRegistry {
   private legacyPolicies = new Map<string, 'auto' | 'manual' | string[]>();
   private migratedLegacyPolicies = new Set<string>();
   private handleCoalescedIncoming?: ChannelRegistryOptions['handleCoalescedIncoming'];
+  private channelTools: ToolDefinition[];
 
   constructor(
     serverRegistry: McplServerRegistry,
@@ -696,6 +619,23 @@ export class ChannelRegistry {
     },
   ) {
     this.handleCoalescedIncoming = options?.handleCoalescedIncoming;
+    this.channelTools = CHANNEL_TOOL_DEFINITIONS.map((tool) => {
+      if (tool.name !== 'skip_reply' || options?.eventGatePresent === true) return tool;
+      const schema = tool.inputSchema as {
+        type: 'object';
+        properties: NonNullable<ToolDefinition['inputSchema']['properties']>;
+        required?: string[];
+      };
+      const { wake_in_seconds: _wake, ...properties } = schema.properties;
+      return {
+        ...tool,
+        description: tool.description.replace(
+          ' To end this turn but come back on your own shortly, set wake_in_seconds.',
+          '',
+        ),
+        inputSchema: { ...schema, properties },
+      };
+    });
     this.serverRegistry = serverRegistry;
     this.featureSetManager = featureSetManager;
     this.pushEventFn = pushEventFn;
@@ -1031,8 +971,8 @@ export class ChannelRegistry {
         }
       }
       if (message.tags) message.tags = expandCoreTags(message.tags);
-      const convertedContent: ContentBlock[] = message.content.map(convertBlock);
-      if (!emptyAllowed && isVisiblyEmptyContent(convertedContent)) {
+      const convertedContent: ContentBlock[] = message.content.map((block) => convertBlock(block, 'attachment on channel message'));
+      if (!emptyAllowed && isVisiblyEmptyConversion(message.content, convertedContent)) {
         rejectEmpty();
         continue;
       }
@@ -1060,7 +1000,7 @@ export class ChannelRegistry {
       if (this.shouldTriggerInference) {
         // The text the agent's context gets, as the push lane's filter reads
         // it: the converted text blocks, a placeholder or reference stub
-        // among them, and a text block's non-string text as empty text.
+        // among them, NON_STRING_TEXT_PLACEHOLDER included.
         const textContent = convertedContent
           .filter((b): b is ContentBlock & { type: 'text' } => b.type === 'text')
           .map((b) => b.text)
@@ -1171,20 +1111,34 @@ export class ChannelRegistry {
         (existing.descriptor.metadata as { lazyRegistered?: boolean } | undefined)?.lazyRegistered &&
         label && existing.descriptor.label === channelId
       ) {
-        existing.descriptor.label = label;
-        if (extraMetadata) {
-          existing.descriptor.metadata = { ...existing.descriptor.metadata, ...extraMetadata };
-        }
+        const metadata = extraMetadata
+          ? { ...existing.descriptor.metadata, ...extraMetadata }
+          : existing.descriptor.metadata;
         // The channel now has a real label, not just the bare id — durable.
-        this.appendLabelSighting(
-          existing.descriptor.id,
-          existing.descriptor.label,
-          extractDmMeta(existing.descriptor.metadata),
-        );
+        // Recorded before the live descriptor takes it, since this branch's
+        // guard reads the descriptor: an append that throws leaves the
+        // placeholder, so the next push tries again.
+        this.appendLabelSighting(existing.descriptor.id, label, extractDmMeta(metadata));
+        existing.descriptor.label = label;
+        existing.descriptor.metadata = metadata;
       }
       return;
     }
 
+    // Only persist a REAL label durably. Falling back to the bare
+    // channelId as a placeholder (no server-supplied label at all — e.g. a
+    // Discord DM push missing both channelName and an author name,
+    // framework.ts's derivePushEventChannel) must never overwrite a real
+    // label already on file from a previous boot: after a restart the live
+    // `channels` map starts empty, so THIS is the very branch a
+    // label-less post-restart event takes — recording the placeholder here
+    // would clobber the good label initializeLabelHistoryStore() just
+    // replayed, defeating the entire point of the durable log. The live
+    // descriptor below still carries the placeholder for in-process
+    // routing; only the durable write is skipped when there's no real
+    // label to record. A real label is recorded before the entry exists:
+    // an append that throws registers nothing, so the next push tries again.
+    if (label) this.appendLabelSighting(channelId, label, extractDmMeta(extraMetadata));
     const key = `${serverId}:${channelId}`;
     this.channels.set(key, {
       serverId,
@@ -1197,19 +1151,6 @@ export class ChannelRegistry {
       },
       open: false,
     });
-    // Only persist a REAL label durably. Falling back to the bare
-    // channelId as a placeholder (no server-supplied label at all — e.g. a
-    // Discord DM push missing both channelName and an author name,
-    // framework.ts's derivePushEventChannel) must never overwrite a real
-    // label already on file from a previous boot: after a restart the live
-    // `channels` map starts empty, so THIS is the very branch a
-    // label-less post-restart event takes — recording the placeholder here
-    // would clobber the good label initializeLabelHistoryStore() just
-    // replayed, defeating the entire point of the durable log. The live
-    // descriptor above still carries the placeholder for in-process
-    // routing; only the durable write is skipped when there's no real
-    // label to record.
-    if (label) this.appendLabelSighting(channelId, label, extractDmMeta(extraMetadata));
     this.emitTraceFn({
       type: 'mcpl:channel-lazy-registered',
       serverId,
@@ -1373,7 +1314,7 @@ export class ChannelRegistry {
    * Get synthesized tool definitions for channel operations.
    */
   getChannelTools(): ToolDefinition[] {
-    return CHANNEL_TOOL_DEFINITIONS;
+    return this.channelTools;
   }
 
   /**
@@ -1549,13 +1490,7 @@ export class ChannelRegistry {
   private initializeLifecycleStore(): void {
     if (!this.store) return;
 
-    try {
-      this.store.registerState({ id: CHANNEL_LIFECYCLE_LOG_ID, strategy: 'append_log' });
-    } catch (error) {
-      if (!(error instanceof Error) || !error.message.includes('State already exists')) {
-        throw error;
-      }
-    }
+    ensureStateRegistered(this.store, { id: CHANNEL_LIFECYCLE_LOG_ID, strategy: 'append_log' });
 
     const raw = this.store.getStateJson(CHANNEL_LIFECYCLE_LOG_ID);
     if (!Array.isArray(raw)) return;
@@ -1598,6 +1533,15 @@ export class ChannelRegistry {
     }
   }
 
+  /**
+   * Each writer appends its record here before it changes memory for it, so
+   * an append that throws, as on a full disk, fails the operation with that
+   * change unmade, and memory and the log still agree. A retry then records
+   * the change rather than finding it in memory already, where
+   * setDesiredState's same-state return would record nothing, and a restart
+   * replays what memory held. appendLabelSighting keeps the same order for
+   * the label history.
+   */
   private appendLifecycleEvent(event: ChannelLifecycleEvent): void {
     this.store?.appendToStateJson(CHANNEL_LIFECYCLE_LOG_ID, event);
   }
@@ -1616,13 +1560,7 @@ export class ChannelRegistry {
   private initializeLabelHistoryStore(): void {
     if (!this.store) return;
 
-    try {
-      this.store.registerState({ id: CHANNEL_LABEL_HISTORY_LOG_ID, strategy: 'append_log' });
-    } catch (error) {
-      if (!(error instanceof Error) || !error.message.includes('State already exists')) {
-        throw error;
-      }
-    }
+    ensureStateRegistered(this.store, { id: CHANNEL_LABEL_HISTORY_LOG_ID, strategy: 'append_log' });
 
     const raw = this.store.getStateJson(CHANNEL_LABEL_HISTORY_LOG_ID);
     if (!Array.isArray(raw)) return;
@@ -1703,6 +1641,16 @@ export class ChannelRegistry {
     const recipientNameUnchanged = recipientName === undefined || recipientName === this.dmRecipientNames.get(channelId);
     const isDmUnchanged = isDm === undefined || this.dmClassified.get(channelId) === true;
     if (labelUnchanged && recipientIdUnchanged && recipientNameUnchanged && isDmUnchanged) return;
+    // The log first, as for lifecycle events: an append that throws leaves
+    // the history in memory as it was, so the next sighting records it.
+    this.store?.appendToStateJson(CHANNEL_LABEL_HISTORY_LOG_ID, {
+      channelId,
+      label,
+      ts: Date.now(),
+      ...(recipientId ? { recipientId } : {}),
+      ...(recipientName ? { recipientName } : {}),
+      ...(isDm ? { isDm } : {}),
+    } satisfies ChannelLabelSightingEvent);
     this.labelHistory.set(channelId, label);
     let seen = this.allLabelsSeen.get(channelId);
     if (!seen) {
@@ -1713,14 +1661,6 @@ export class ChannelRegistry {
     if (recipientId) this.dmRecipientIds.set(channelId, recipientId);
     if (recipientName) this.dmRecipientNames.set(channelId, recipientName);
     if (isDm) this.dmClassified.set(channelId, true);
-    this.store?.appendToStateJson(CHANNEL_LABEL_HISTORY_LOG_ID, {
-      channelId,
-      label,
-      ts: Date.now(),
-      ...(recipientId ? { recipientId } : {}),
-      ...(recipientName ? { recipientName } : {}),
-      ...(isDm ? { isDm } : {}),
-    } satisfies ChannelLabelSightingEvent);
   }
 
   /**
@@ -1945,7 +1885,6 @@ export class ChannelRegistry {
   ): void {
     const key = this.lifecycleKey(serverId, channelId);
     if (this.desiredStates.get(key)?.state === desired) return;
-    this.desiredStates.set(key, { state: desired, source });
     this.appendLifecycleEvent({
       kind: 'desired-state',
       serverId,
@@ -1954,6 +1893,7 @@ export class ChannelRegistry {
       source,
       timestamp: new Date().toISOString(),
     });
+    this.desiredStates.set(key, { state: desired, source });
   }
 
   // ==========================================================================
@@ -1973,12 +1913,6 @@ export class ChannelRegistry {
     source: string,
   ): void {
     const key = this.lifecycleKey(serverId, channelId);
-    this.desiredStates.set(key, {
-      state: 'tuned-out',
-      source,
-      tuneOut: params,
-      wakeCount: 0,
-    });
     this.appendLifecycleEvent({
       kind: 'desired-state',
       serverId,
@@ -1987,6 +1921,12 @@ export class ChannelRegistry {
       tuneOut: params,
       source,
       timestamp: new Date().toISOString(),
+    });
+    this.desiredStates.set(key, {
+      state: 'tuned-out',
+      source,
+      tuneOut: params,
+      wakeCount: 0,
     });
   }
 
@@ -2006,7 +1946,6 @@ export class ChannelRegistry {
     const current = this.desiredStates.get(key);
     if (current?.state !== 'tuned-out' || !current.tuneOut) return null;
     const ended = { params: current.tuneOut, wakeCount: current.wakeCount ?? 0 };
-    this.desiredStates.set(key, { state: nextState, source });
     this.appendLifecycleEvent({
       kind: 'desired-state',
       serverId,
@@ -2015,6 +1954,7 @@ export class ChannelRegistry {
       source,
       timestamp: new Date().toISOString(),
     });
+    this.desiredStates.set(key, { state: nextState, source });
     return ended;
   }
 
@@ -2032,16 +1972,17 @@ export class ChannelRegistry {
     const key = this.lifecycleKey(serverId, channelId);
     const current = this.desiredStates.get(key);
     if (current?.state !== 'tuned-out' || !current.tuneOut) return null;
-    current.wakeCount = (current.wakeCount ?? 0) + 1;
+    const wakeCount = (current.wakeCount ?? 0) + 1;
     this.appendLifecycleEvent({
       kind: 'tune-out-wake',
       serverId,
       channelId,
       epochId: current.tuneOut.epochId,
-      wakeCount: current.wakeCount,
+      wakeCount,
       timestamp: new Date().toISOString(),
     });
-    return { params: current.tuneOut, wakeCount: current.wakeCount };
+    current.wakeCount = wakeCount;
+    return { params: current.tuneOut, wakeCount };
   }
 
   /** Active tune-out params + wake count for a channel, or null. */
@@ -2069,17 +2010,13 @@ export class ChannelRegistry {
    */
   readCoordinatorState(stateId: string): unknown {
     if (!this.store) return null;
-    try {
-      this.store.registerState({ id: stateId, strategy: 'snapshot' });
-    } catch { /* already registered */ }
+    ensureStateRegistered(this.store, { id: stateId, strategy: 'snapshot' });
     return this.store.getStateJson(stateId);
   }
 
   writeCoordinatorState(stateId: string, value: unknown): void {
     if (!this.store) return;
-    try {
-      this.store.registerState({ id: stateId, strategy: 'snapshot' });
-    } catch { /* already registered */ }
+    ensureStateRegistered(this.store, { id: stateId, strategy: 'snapshot' });
     this.store.setStateJson(stateId, value);
   }
 
@@ -2116,13 +2053,13 @@ export class ChannelRegistry {
       this.setDesiredState(serverId, channel.id, desired, 'legacy-recipe-migration');
     }
 
-    this.migratedLegacyPolicies.add(serverId);
     this.appendLifecycleEvent({
       kind: 'legacy-policy-migrated',
       serverId,
       source: Array.isArray(policy) ? 'allow-list' : policy,
       timestamp: new Date().toISOString(),
     });
+    this.migratedLegacyPolicies.add(serverId);
   }
 
   /**
@@ -2251,9 +2188,9 @@ export class ChannelRegistry {
       }
     }
 
-    // Announce policy admissions to the agent — nothing may start flowing
-    // traffic into their window without them being told, and told how to
-    // opt out (channel_close; their decision outranks policy).
+    // Announce policy admissions to the agent — no channel may open without
+    // them being told, and told how to opt out (channel_close; their
+    // decision outranks policy).
     if (policyOpened.length > 0) {
       try {
         this.onChannelAutoOpened?.({
@@ -2670,11 +2607,13 @@ export class ChannelRegistry {
     // A tuned-out channel is transport-open but attention-diverted; a plain
     // open would silently discard the epoch (and its pending backlog dump).
     // Cancelling is the tune-out coordinator's flow, reached via its own
-    // tool — refuse with the pointer rather than eat the state.
+    // tool — refuse with the pointer rather than eat the state. As an error
+    // result, the agent reads the pointer itself; `data` names the refusal
+    // for an in-process caller.
     if (this.getDesiredState(entry.serverId, input.channelId) === 'tuned-out') {
       return {
         success: false,
-        isError: false,
+        isError: true,
         error:
           `Channel ${input.channelId} is tuned out. Cancel the tune-out ` +
           `(tune_out with mode: 'cancel') to resume normal attention — ` +
@@ -2845,7 +2784,7 @@ export class ChannelRegistry {
     if (entry.open || this.getDesiredState(entry.serverId, input.channelId) === 'open') {
       return {
         success: false,
-        error: `Channel is already open: ${input.channelId}. Use channel_close to leave it.`,
+        error: `Channel is already open: ${input.channelId}. Use channel_close to close it.`,
         isError: true,
       };
     }
@@ -2955,8 +2894,8 @@ export class ChannelRegistry {
    */
   private handleToolSkipReply(input: { reason?: string; wake_in_seconds?: number }): ToolResult {
     // The self-wake itself is armed by the framework (which owns the
-    // EventGate) BEFORE this dispatch; when the gate is absent the framework
-    // strips the field so this confirmation stays truthful.
+    // EventGate) BEFORE this dispatch. Without a gate, a positive timer request
+    // is refused before this successful end-turn handler is reached.
     const wakeSecs = Number(input.wake_in_seconds);
     const selfWake = Number.isFinite(wakeSecs) && wakeSecs > 0
       ? Math.max(1, Math.min(3600, Math.floor(wakeSecs)))

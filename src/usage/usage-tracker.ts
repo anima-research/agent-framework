@@ -12,10 +12,14 @@ function accumulateUsage(
   tokens: { inputTokens: number; outputTokens: number; cacheCreationTokens: number; cacheReadTokens: number },
   estimatedCost?: { total: number; currency: string }
 ): void {
-  target.inputTokens += tokens.inputTokens;
-  target.outputTokens += tokens.outputTokens;
-  target.cacheCreationTokens += tokens.cacheCreationTokens;
-  target.cacheReadTokens += tokens.cacheReadTokens;
+  // A provider's usage can lack a count (membrane 0.5.87's Bedrock stream
+  // takes a message_delta's output count as reported); adding it would make
+  // the total NaN, which is stored as null.
+  const count = (n: number): number => (Number.isFinite(n) ? n : 0);
+  target.inputTokens += count(tokens.inputTokens);
+  target.outputTokens += count(tokens.outputTokens);
+  target.cacheCreationTokens += count(tokens.cacheCreationTokens);
+  target.cacheReadTokens += count(tokens.cacheReadTokens);
   if (estimatedCost) {
     if (!target.estimatedCost) {
       target.estimatedCost = { total: 0, currency: estimatedCost.currency };
@@ -31,10 +35,16 @@ function accumulateUsage(
 function parseUsage(raw: unknown): SessionUsage | null {
   if (!raw || typeof raw !== 'object') return null;
   const o = raw as Record<string, unknown>;
-  if (typeof o.inputTokens !== 'number' || typeof o.outputTokens !== 'number') return null;
+  // A count stored as null is a NaN total, as JSON stores one: an earlier
+  // release could write it when a provider's usage lacked a count. The sum
+  // before it was lost when it became NaN, so it reads as 0.
+  const count = (v: unknown): number | undefined => (v === null ? 0 : typeof v === 'number' ? v : undefined);
+  const inputTokens = count(o.inputTokens);
+  const outputTokens = count(o.outputTokens);
+  if (inputTokens === undefined || outputTokens === undefined) return null;
   return {
-    inputTokens: o.inputTokens,
-    outputTokens: o.outputTokens as number,
+    inputTokens,
+    outputTokens,
     cacheCreationTokens: typeof o.cacheCreationTokens === 'number' ? o.cacheCreationTokens : 0,
     cacheReadTokens: typeof o.cacheReadTokens === 'number' ? o.cacheReadTokens : 0,
     estimatedCost: o.estimatedCost && typeof o.estimatedCost === 'object'
@@ -47,6 +57,18 @@ export interface PersistedUsageState {
   totals: SessionUsage;
   byAgent: Array<{ agentName: string; usage: SessionUsage; inferenceCount: number }>;
   inferenceCount: number;
+}
+
+/** What keeps a stored usage record from restoring, or undefined when it
+ *  restores: it must be an object whose totals are token counts and whose
+ *  byAgent, if it has one, is a list. Its per-agent entries are checked one
+ *  by one as they restore, and one that isn't an agent's usage is skipped. */
+export function persistedUsageProblem(value: unknown): 'not a record' | 'totals' | 'byAgent' | undefined {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return 'not a record';
+  const { totals, byAgent } = value as { totals?: unknown; byAgent?: unknown };
+  if (parseUsage(totals) === null) return 'totals';
+  if (byAgent !== undefined && !Array.isArray(byAgent)) return 'byAgent';
+  return undefined;
 }
 
 export class UsageTracker {
@@ -71,7 +93,9 @@ export class UsageTracker {
     this.totals = totals;
     this.inferenceCount = typeof state.inferenceCount === 'number' ? state.inferenceCount : 0;
     if (Array.isArray(state.byAgent)) {
-      for (const entry of state.byAgent) {
+      for (const item of state.byAgent as unknown[]) {
+        if (!item || typeof item !== 'object') continue;
+        const entry = item as { agentName?: unknown; usage?: unknown; inferenceCount?: unknown };
         const usage = parseUsage(entry.usage);
         if (usage && typeof entry.agentName === 'string') {
           this.byAgent.set(entry.agentName, {

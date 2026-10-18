@@ -8,6 +8,7 @@
 import { watch, type FSWatcher } from 'chokidar';
 import { mkdirSync, statSync } from 'node:fs';
 import { basename, sep } from 'node:path';
+import { passedOverAt } from './observe.js';
 import { type MountConfig } from './types.js';
 
 export type FsOp = 'created' | 'modified' | 'deleted';
@@ -48,7 +49,8 @@ interface RootIdentity {
 export class MountWatcher {
   private watcher: FSWatcher | null = null;
   // Most recent op seen per path within the current debounce window.
-  // create -> modify collapses to 'created' (single batch); delete always wins.
+  // create -> modify collapses to 'created' (single batch); a trailing delete
+  // wins, and delete -> create reads as 'modified' (see mergeOp).
   private pendingChanges = new Map<string, FsOp>();
   private debounceTimer: ReturnType<typeof setTimeout> | null = null;
   private rootPollTimer: ReturnType<typeof setInterval> | null = null;
@@ -67,6 +69,8 @@ export class MountWatcher {
     config: MountConfig,
     onChange: (changes: FsChange[]) => void,
     lifecycle: WatcherLifecycle = {},
+    /** Other mounts' directories nested in this one, mount-relative: passed over as a walk passes over them. */
+    private readonly others: readonly string[] = [],
   ) {
     this.config = config;
     this.debounceMs = config.watchDebounceMs ?? 300;
@@ -101,10 +105,28 @@ export class MountWatcher {
       }
     }
 
-    const ignored = this.config.ignore ?? [];
+    const ignore = this.config.ignore ?? [];
 
     this.watcher = watch(this.config.path, {
-      ignored: ignored.length > 0 ? ignored : undefined,
+      // What a walk passes over by design, by the path relative to the mount:
+      // another mount's directory, the mount's ignore list and editors' swap
+      // and backup files. chokidar 4
+      // compares a string given here with the whole absolute path, so the
+      // list itself would match nothing.
+      ignored: (path: string) => {
+        const relative = this.toRelative(path);
+        return relative !== null && passedOverAt(relative, ignore, this.others) !== undefined;
+      },
+      // Its filter for editors' files tested the whole path, so a directory
+      // with a dot in its name hid every `*.swp` beneath it, and the walk
+      // didn't agree. An editor's save by rename then arrives as an unlink at
+      // once, and an add once `awaitWriteFinish` finds the new copy settled.
+      // A pass reads disk, not the ops, after the debounce's quiet spell
+      // following the last event: a copy on disk by then is taken in as a
+      // change, one still being written is read as it stands and taken in
+      // again when its add comes, and a re-add after a longer spell is a
+      // deletion and then a creation.
+      atomic: false,
       persistent: true,
       ignoreInitial: true,
       followSymlinks: this.config.followSymlinks ?? false,

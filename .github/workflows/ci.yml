@@ -13,6 +13,11 @@ jobs:
   build-and-test:
     name: Build & Test (${{ matrix.os }}, node ${{ matrix.node }})
     runs-on: ${{ matrix.os }}
+    # Without a limit, a step that hangs leaves the check pending until
+    # GitHub's six-hour limit. Passing runs take under seven minutes. A
+    # test file stuck under Node 20, or a test stuck under Node 24, fails
+    # sooner and by name, through npm test's --test-timeout.
+    timeout-minutes: 20
     strategy:
       fail-fast: false
       # Both platforms: a package-lock.json regenerated over an existing
@@ -54,9 +59,11 @@ jobs:
       # npm test runs with --test-force-exit, which hides async work a test
       # leaves running, such as a late arrival after stop() ("Queue is
       # closed"). These files run unforced so that class fails here, not in a
-      # later PR's qualification.
+      # later PR's qualification. They get npm test's --test-timeout too:
+      # under Node 20 it fails a file whose leftover work keeps it alive, by
+      # name, and under Node 24 the job's limit ends such a file.
       - name: Test unforced (work in flight at stop)
-        run: node --test dist/test/stop-with-work-in-flight.test.js dist/test/stop-with-host-operations.test.js dist/test/conversation-routing.test.js
+        run: node --test --test-timeout=600000 dist/test/stop-with-work-in-flight.test.js dist/test/stop-with-host-operations.test.js dist/test/conversation-routing.test.js
 
   # The release as npm would pack it, installed on its own and loaded, as
   # the publish workflow checks before it publishes (see
@@ -70,6 +77,9 @@ jobs:
   pack-check:
     name: Packed release installs on its own
     runs-on: ubuntu-latest
+    # A limit for the same reason as build-and-test's. Passing runs take
+    # under a minute.
+    timeout-minutes: 10
 
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0

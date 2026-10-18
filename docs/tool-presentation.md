@@ -18,7 +18,7 @@ Changes affect the next newly compiled request. They do not rewrite an in-flight
 
 Framework unit/integration tests exercise persistent edits, reset, malformed input, direct file edits, isolation, preview matching, both dispatch routes, catalogue reads and recovery protection. Provider transport and permission enforcement remain in their existing owners.
 
-The catalogue begins with exact names and visibility grouped by registered module or MCPL server, followed by full definitions. Index entries give offset/limit values for reading a definition. Those line references apply to the displayed revision; reread the index after changes. Sources come from the registries, including configured MCPL prefixes. Groups are rebuilt each read rather than maintained as a fixed taxonomy. Visible/hidden is not an imposed primary/secondary ranking.
+The catalogue begins with exact names and visibility grouped by registered module or MCPL server, followed by full definitions. Index entries give offset/limit values for reading a definition. Those line references apply to the displayed revision; reread the index after changes. Sources come from the registries: an MCPL tool's is the server a call of it reaches, the one whose tool listing offers the name, else the longest configured prefix it begins with. Groups are rebuilt each read rather than maintained as a fixed taxonomy. Visible/hidden is not an imposed primary/secondary ranking.
 
 ## Component description defaults
 

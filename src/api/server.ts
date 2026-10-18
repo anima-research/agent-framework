@@ -11,7 +11,7 @@ import { createServer, IncomingMessage, ServerResponse } from 'node:http';
 import { timingSafeEqual } from 'node:crypto';
 import type { ContentBlock } from '@animalabs/membrane';
 import type { AgentFramework } from '../framework.js';
-import { ResumeBlockedError } from '../framework.js';
+import { QuiesceBlockedError, ResumeBlockedError } from '../framework.js';
 import { isReleaseModel } from '../provider-waits.js';
 import type { TraceEvent, ProcessEvent } from '../types/index.js';
 import type {
@@ -1073,6 +1073,9 @@ export class ApiServer {
               verdicts: error.verdicts,
               hostMode: this.framework.getHostModeStatus(),
             });
+          } else if (error instanceof QuiesceBlockedError) {
+            // A refusal, as resume()'s is: the host's mode is as it was.
+            respond(409, { error: error.message, hostMode: this.framework.getHostModeStatus() });
           } else {
             respond(500, { error: error instanceof Error ? error.message : String(error) });
           }

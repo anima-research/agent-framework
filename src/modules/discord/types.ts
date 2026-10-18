@@ -264,6 +264,13 @@ export interface HistoryMessage {
   /** Message content */
   content: string;
 
+  /** Attachments, as the live path's DiscordMessageData carries them. A
+   *  client that doesn't map them leaves this out: the history sync then
+   *  stores a message it missed without them, and rebuilds no row, since it
+   *  can't tell what the row should hold, though it still changes a row's
+   *  text as a live edit does. */
+  attachments?: DiscordAttachment[];
+
   /** Timestamp */
   timestamp: Date;
 
@@ -403,7 +410,13 @@ export interface DiscordClientInterface {
   /** Get the bot's user ID (available after connect) */
   getBotUserId(): string | null;
 
-  /** Send a message to a channel */
+  /**
+   * Send a message to a channel, and start the thread `createThread` asks
+   * for when the channel can hold threads; in one that can't, such as a DM,
+   * no thread is started and nothing says so. When this resolves, the
+   * message was sent. `threadFailure`, when there is one, is why the thread
+   * it tried to start wasn't.
+   */
   sendMessage(
     channelId: string,
     content: string,
@@ -411,7 +424,7 @@ export interface DiscordClientInterface {
       replyTo?: string;
       createThread?: { name: string };
     }
-  ): Promise<{ messageId: string }>;
+  ): Promise<{ messageId: string; threadFailure?: string }>;
 
   /** Send a DM to a user */
   sendDM(userId: string, content: string): Promise<{ messageId: string }>;

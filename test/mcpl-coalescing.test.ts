@@ -13,7 +13,7 @@ import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createMockResponse } from './helpers/mock-membrane.js';
-import { fixture, eventually, crash, ok, TS } from './helpers/coalescing-fixture.js';
+import { fixture, eventually, settles, crash, ok, TS, REPLY_DEADLINE_MS } from './helpers/coalescing-fixture.js';
 
 // ---------------------------------------------------------------------------
 // Plain coalescing, feature-set scope (vectors 1–6, 35)
@@ -340,9 +340,14 @@ test('vector 24: revoked authority before assembly drops the batch without a ren
   const f = await fixture(); t.after(f.close);
   await f.send('push/event', f.params('1', 'previously_permitted', { deferred: true }));
   await f.framework.stop(); await f.create(false);
-  await f.framework.runUntilIdle();
+  let withdrawn = 0;
+  f.framework.onTrace((e) => { if (e.type === 'mcpl:coalescing' && (e as { kind?: string }).kind === 'turn-withdrawn') withdrawn++; });
+  // A second model call would wait for a response the fixture never queues.
+  await settles(f.framework.runUntilIdle(), 'the drain after the restart');
   assert.equal(f.renders.length, 0);
   assert(!f.context().includes('previously_permitted'));
+  assert.equal(f.membrane.calls.length, 0, 'and the revoked batch, the only cause, started no inference');
+  assert.equal(withdrawn, 1, 'its turn started and was withdrawn');
 });
 
 test('vector 27i: a deferred notice displaces an unread plain occurrence', async (t) => {
@@ -402,15 +407,33 @@ test('vectors 7/47: restart keeps accepted content, receipts, and appends after 
 });
 
 test('#196 finding 2 / vector 34c: a busy channel never hits a subject cap', async (t) => {
-  const f = await fixture({ framework: { gate: { config: { policies: [{ name: 'attention', match: { tagsAny: ['chat:mention'] }, behavior: 'always' }], default: 'skip' } } } as never }); t.after(f.close); await f.register();
+  // start() arms the periodic store sync, and this fixture never calls it;
+  // syncIntervalMs: 0 keeps that sync off if one ever does.
+  const f = await fixture({ framework: { gate: { config: { policies: [{ name: 'attention', match: { tagsAny: ['chat:mention'] }, behavior: 'always' }], default: 'skip' } }, syncIntervalMs: 0 } as never }); t.after(f.close); await f.register();
   const msg = (i: number | string, tags: string[]) => ({ channelId: 'chat', messageId: 'm' + i, eventId: 'e' + i, timestamp: TS, author: { id: 'u', name: 'User' }, tags,
     content: [{ type: 'text', text: 'text_' + i }], coalesce: { key: 'message:m' + i, initial: true } });
+  // #196's review measured 85 ms a message on this path, because its journal
+  // synced the store for each of three operations per message. An acceptance
+  // now awaits one durable commit (RFC-006), so messages sent one at a time
+  // make one store sync each. The count takes every store sync during the
+  // sends; nothing else in this fixture syncs the store meanwhile. It must be
+  // at least one, or the count no longer sees the commits, and at most one a
+  // message, so commits shared between acceptances would still pass. The
+  // total time depends on the disk and the host's load, so it's reported, not
+  // asserted; each send keeps the fixture's reply deadline, its guard against
+  // a hang.
+  const store = (f.framework as unknown as { store: { sync: (...a: unknown[]) => unknown } }).store;
+  const sync = store.sync.bind(store);
+  let syncs = 0;
+  store.sync = (...a: unknown[]) => { syncs++; return sync(...a); };
+  const sends = 300;
   const t0 = Date.now();
-  for (let i = 0; i < 300; i++) {
+  for (let i = 0; i < sends; i++) {
     const r = await f.send('channels/incoming', { messages: [msg(i, [])] });
     assert.equal(r.result.results[0].accepted, true);
   }
   const elapsed = Date.now() - t0;
+  const synced = syncs;
   await f.framework.runUntilIdle();
   assert.equal(f.membrane.calls.length, 0);
   const mention = await f.send('channels/incoming', { messages: [msg('mention', ['chat:mention'])] });
@@ -418,10 +441,9 @@ test('#196 finding 2 / vector 34c: a busy channel never hits a subject cap', asy
   await f.framework.runUntilIdle();
   assert.equal(f.membrane.calls.length, 1);
   assert(f.lastRequest().includes('text_mention') && f.lastRequest().includes('text_0'));
-  // Each acceptance awaits a group-committed fsync (RFC-006 durability); serial
-  // sends cannot batch, so this is ~300 fsyncs. Bounded, and reported.
-  console.log(`# 300 serial coalesced channel messages: ${elapsed}ms (${(elapsed / 300).toFixed(1)} ms/msg incl. fsync)`);
-  assert(elapsed < 30_000, `300 coalesced messages took ${elapsed}ms`);
+  console.log(`# ${sends} serial coalesced channel messages: ${elapsed}ms (${(elapsed / sends).toFixed(1)} ms/msg incl. fsync), ${synced} store syncs`);
+  assert(synced > 0, `${sends} coalesced messages made no store sync: the acceptances didn't commit, or the count can't see their commits`);
+  assert(synced <= sends, `${sends} coalesced messages made ${synced} store syncs, more than one a message`);
 });
 
 test('#196 finding 4: a context-budget restart does not assemble a pending batch', async (t) => {
@@ -829,6 +851,44 @@ function holdNextCommit(f: Awaited<ReturnType<typeof fixture>>): Promise<() => v
   });
 }
 
+test("the fixture's reply deadline: a request still unanswered at 3 s fails at the deadline, naming it", { timeout: 120_000 }, async (t) => {
+  const f = await fixture(); t.after(f.close); await f.register();
+  // A host that doesn't answer in time: the batch's first commit is held until
+  // the deadline has passed, so its admission waits.
+  const held = holdNextCommit(f);
+  const received: string[] = [];
+  f.framework.onTrace((e) => {
+    if (e.type === 'mcpl:coalescing' && (e as { kind?: string }).kind === 'received') received.push((e as { eventId: string }).eventId);
+  });
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  let release: (() => void) | undefined;
+  try {
+    const batch = f.send('channels/incoming', { messages: [
+      f.channel('e1', 'one', {}, 'chat', 'm1'), f.channel('e2', 'two', {}, 'chat', 'm2'), f.channel('e3', 'three', {}, 'chat', 'm3'),
+    ] }).then(() => 'replied', (err: Error) => err.message);
+    // send()'s deadline runs on the mocked clock, so it can't end this wait;
+    // node:test's own timeout still does, mocked setTimeout or not.
+    release = await held;
+    // Whether the wait has settled once the timers that are due have run.
+    const now = () => Promise.race([batch, new Promise<string>((r) => setImmediate(() => r('pending')))]);
+    t.mock.timers.tick(3_000);
+    assert.equal(await now(), 'pending', 'still waiting at 3 s');
+    t.mock.timers.tick(REPLY_DEADLINE_MS - 3_000 - 1);
+    assert.equal(await now(), 'pending', 'still waiting just short of the deadline');
+    t.mock.timers.tick(1);
+    assert.equal(await now(), `no reply to channels/incoming within ${REPLY_DEADLINE_MS / 1000} s`);
+  } finally {
+    // Real timers again before the held work goes on. The released commit lets
+    // the host finish admitting the batch, and it answers once it has: wait for
+    // that answer, whatever the checks above found, so the close doesn't take
+    // the channel away from the admission still under way.
+    t.mock.timers.reset();
+    release?.();
+    await f.answered();
+  }
+  assert.deepEqual(received, ['e1', 'e2', 'e3'], 'the host admitted the whole batch before the test ends');
+});
+
 test('R11: a retraction during the render-start commit wait is final; the batch is not restored', async (t) => {
   const f = await fixture(); t.after(f.close);
   await f.send('push/event', f.params('1', 'withdrawn_fallback', { deferred: true, initial: true }));
@@ -855,6 +915,8 @@ test('R11: a retraction during the render-start commit wait is final; the batch 
 test('R12: endpoint reassignment during the render-start commit wait never sends the batch to the new peer', async (t) => {
   const f = await fixture(); t.after(f.close);
   await f.send('push/event', f.params('1', 'old_fallback', { deferred: true, data: { secret: 'private_notice_data' } }));
+  let withdrawn = 0;
+  f.framework.onTrace((e) => { if (e.type === 'mcpl:coalescing' && (e as { kind?: string }).kind === 'turn-withdrawn') withdrawn++; });
   const held = holdNextCommit(f);
   const run = f.framework.runUntilIdle();
   const release = await held;
@@ -862,10 +924,13 @@ test('R12: endpoint reassignment during the render-start commit wait never sends
   await f.framework.restartMcplServer('editor', { ...config, url: `${config.url}/reassigned` } as never);
   await eventually(() => f.hostCaps.length === 2, 'reconnect to the new endpoint');
   release();
-  await run;
+  // A second model call would wait for a response the fixture never queues.
+  await settles(run, 'the drain after the reassignment');
   assert.equal(f.renders.length, 0, 'no push/render to the new peer');
   assert(!JSON.stringify(f.renders).includes('private_notice_data'));
   assert(!f.context().includes('old_fallback'));
+  assert.equal(f.membrane.calls.length, 0, 'and the revoked batch, the only cause, started no inference');
+  assert.equal(withdrawn, 1, 'its turn started and was withdrawn');
 });
 
 // ---------------------------------------------------------------------------
@@ -891,6 +956,51 @@ test('R13: a retraction during the audience lookup is final; the stale batch is 
   assert(!f.context().includes('withdrawn_fallback') && !f.context().includes('document_diff'), 'nothing of the withdrawn batch was published');
   await f.turn();
   assert(!f.context().includes('document_diff'));
+});
+
+test('a turn whose batch\'s audience no longer names its agent at the assembly starts no inference', async (t) => {
+  const f = await fixture(); t.after(f.close);
+  await f.send('push/event', f.params('1', 'moved_fallback', { deferred: true, initial: true }));
+  // The admission's wake has looked the audience up; the next lookup is the
+  // assembly's, and it names another agent instead, as when a conversation
+  // fork's channel is bound to a new fork in between.
+  const internals = f.framework as unknown as { coalescedAudience: (occ: unknown) => Promise<string[]>; pushCoalescer: { pendingBatches(): number } };
+  const orig = internals.coalescedAudience.bind(internals);
+  internals.coalescedAudience = async () => { internals.coalescedAudience = orig; return ['conversation-chat-g2']; };
+  let withdrawn = 0;
+  f.framework.onTrace((e) => { if (e.type === 'mcpl:coalescing' && (e as { kind?: string }).kind === 'turn-withdrawn') withdrawn++; });
+  // A second model call would wait for a response the fixture never queues.
+  await settles(f.framework.runUntilIdle(), 'the drain after the wake');
+  assert.equal(f.renders.length, 0);
+  assert(!f.context().includes('moved_fallback'));
+  assert.equal(f.membrane.calls.length, 0, 'the batch, the only cause, started no inference');
+  assert.equal(withdrawn, 1, 'its turn started and was withdrawn');
+  assert.equal(internals.pushCoalescer.pendingBatches(), 1, 'the batch stays pending');
+});
+
+test('an assembly for an agent outside the audience of a batch another assembly is rendering declines it', async (t) => {
+  const f = await fixture({ agents: [{ name: 'agent', model: 'test', systemPrompt: 'test' }, { name: 'other', model: 'test', systemPrompt: 'test' }] }); t.after(f.close);
+  let release!: (value: unknown) => void;
+  let began!: () => void;
+  const started = new Promise<void>((resolve) => { began = resolve; });
+  f.renderer(() => { began(); return new Promise((resolve) => { release = resolve; }); });
+  await f.send('push/event', f.params('1', 'shared_fallback', { deferred: true, initial: true }));
+  const internals = f.framework as unknown as { coalescedAudience: (occ: unknown) => Promise<string[]>; pushCoalescer: { assemble(agent: string): Promise<{ settled: Set<string>; materialized: Set<string> }> } };
+  // From here on the audience is 'other' alone, as when a conversation fork's
+  // channel has moved to a new fork. 'other' freezes the batch and its render
+  // is held; 'agent' then assembles while it's in flight.
+  internals.coalescedAudience = async () => ['other'];
+  const rendering = internals.pushCoalescer.assemble('other');
+  await settles(started, "the render for 'other'");
+  // Joining the held render instead would wait for a release that comes
+  // only after this call.
+  const declined = await settles(internals.pushCoalescer.assemble('agent'), "the assembly for 'agent'");
+  assert.equal(declined.settled.size, 1, 'the subject is settled for the agent outside the audience');
+  assert.equal(declined.materialized.size, 0, 'and gave it nothing');
+  release({ content: [{ type: 'text', text: 'shared_render' }] });
+  const rendered = await settles(rendering, "the assembly for 'other'");
+  assert.equal(rendered.settled.size, 1);
+  assert.equal(rendered.materialized.size, 1, 'the assembly in the audience delivered the render');
 });
 
 test('R14: two consecutive crash windows with an acceptance in between keep both recovered batches', async (t) => {
@@ -932,7 +1042,7 @@ test('R15: a retraction arriving between the render result and its publication w
 // Review round 8 (#197): liveness after a failed render-start commit
 // ---------------------------------------------------------------------------
 
-test('R16: a batch whose render-start commit failed is re-woken once storage recovers', async (t) => {
+test('R16: a batch whose render-start commit failed is re-woken once storage recovers', { timeout: 120_000 }, async (t) => {
   const f = await fixture(); t.after(f.close);
   const coalescer = (f.framework as unknown as { pushCoalescer: { options: { recoveryBackoffMs?: number }; pendingBatches(): number } }).pushCoalescer;
   coalescer.options.recoveryBackoffMs = 50;
@@ -941,15 +1051,36 @@ test('R16: a batch whose render-start commit failed is re-woken once storage rec
   const orig = store.sync.bind(store);
   let failing = 0;
   store.sync = () => { if (failing > 0) { failing--; throw new Error('EIO simulated'); } orig(); };
+  const traced: Array<{ kind: string; source?: string }> = [];
+  f.framework.onTrace((e) => {
+    if (e.type === 'mcpl:coalescing') traced.push({ kind: (e as { kind: string }).kind, source: (e as { source?: string }).source });
+  });
+  // Every turn that reaches the model is answered, so a model call nothing
+  // should have caused is counted rather than left waiting for a response.
+  f.alwaysRespond();
   await f.send('push/event', f.params('1', 'asleep_fallback', { deferred: true, initial: true }));
   failing = 1; // the render-start commit fails; storage then recovers
-  await f.framework.runUntilIdle();
+  // The recovery wake can fire inside the first drain or after it, so drive
+  // until the batch renders rather than for a fixed number of drains.
+  await settles(f.framework.runUntilIdle(), 'the first drain');
+  for (let pass = 0; !traced.some((e) => e.kind === 'rendered'); pass++) {
+    assert(pass < 5, 'the batch rendered within five recovery wakes');
+    await eventually(() => internals.pendingRequests.length > 0, 'recovery wake');
+    await settles(f.framework.runUntilIdle(), `the drain after recovery wake ${pass + 1}`);
+    // A macrotask turn, so timers (this test's timeout among them) can fire
+    // even when both waits above return at once.
+    await new Promise((resolve) => setImmediate(resolve));
+  }
+  assert.equal(f.membrane.calls.length, 1, 'one model call, the recovery turn\'s: the wake whose render-start commit failed, the only cause, started none');
+  assert(f.lastRequest().includes('asleep_fallback'), 'the recovery turn delivered the batch');
+  const kinds = traced.map((e) => e.kind);
+  const order = (...steps: string[]) => kinds.filter((k) => steps.includes(k));
+  assert.deepEqual(order('persist-failed', 'turn-withdrawn', 'rendered'), ['persist-failed', 'turn-withdrawn', 'rendered'], 'the failed freeze withdrew its turn');
+  assert.deepEqual(order('persist-failed', 'recovery-wake', 'rendered'), ['persist-failed', 'recovery-wake', 'rendered'], 're-woken by the recovery timer, without unrelated traffic');
+  // The failed commit can't prove that no render started, so the batch takes
+  // its fallback and the server is never asked to render it.
+  assert.equal(traced.find((e) => e.kind === 'rendered')?.source, 'fallback');
   assert.equal(f.renders.length, 0);
-  assert.equal(coalescer.pendingBatches(), 1, 'the batch is kept');
-  assert(!f.lastRequest().includes('asleep_fallback'));
-  await eventually(() => internals.pendingRequests.length > 0, 'recovery wake');
-  await f.turn();
-  assert(f.lastRequest().includes('asleep_fallback'), 'delivered without unrelated traffic');
   assert.equal(coalescer.pendingBatches(), 0);
 });
 
@@ -975,7 +1106,7 @@ test('R16b: a producer retry re-wakes a batch left asleep by a failed freeze', a
 });
 
 // The timeout bounds a drain that never returns, such as a backoff regressed
-// to a tight loop; npm test sets no timeout of its own.
+// to a tight loop, far sooner than npm test's ten-minute --test-timeout.
 /**
  * R17's harness: a coalescing fixture whose store fails while `failing` is
  * set, its recovery backoff at `baseMs`, and every traced recovery wake with
@@ -1029,7 +1160,7 @@ async function storageOutage(t: { after: (fn: () => Promise<void>) => void }, ba
   return { f, coalescer, outage, wakes, driveTo, assertSpacing };
 }
 
-test('R17: a persistent storage outage backs off (1×, 2×, 4× …) and the series resets on recovery', { timeout: 30_000 }, async (t) => {
+test('R17: a persistent storage outage backs off (1×, 2×, 4× …) and the series resets on recovery', { timeout: 120_000 }, async (t) => {
   const { f, coalescer, outage, wakes, driveTo, assertSpacing } = await storageOutage(t, 40);
   await f.send('push/event', f.params('1', 'outage_fallback', { deferred: true, initial: true }));
   outage.failing = true;
@@ -1060,7 +1191,7 @@ test('R17: a persistent storage outage backs off (1×, 2×, 4× …) and the ser
   assert(f.lastRequest().includes('second_outage'), 'delivered once storage recovered again');
 });
 
-test('R17b: the backoff stops doubling at 60× its base', { timeout: 30_000 }, async (t) => {
+test('R17b: the backoff stops doubling at 60× its base', { timeout: 120_000 }, async (t) => {
   // A small base reaches the cap within a second: attempt 7 is the first
   // whose doubling (64×) passes it.
   const { f, wakes, outage, driveTo, assertSpacing } = await storageOutage(t, 3);

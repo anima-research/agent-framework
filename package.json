@@ -1,6 +1,6 @@
 {
   "name": "@animalabs/agent-framework",
-  "version": "0.22.1",
+  "version": "0.22.2",
   "description": "Multi-agent framework with pluggable modules, persistent state, and concurrent tool execution",
   "repository": {
     "type": "git",
@@ -17,7 +17,7 @@
     }
   },
   "files": [
-    "dist",
+    "dist/src",
     "src"
   ],
   "bin": {
@@ -31,7 +31,7 @@
     "clean": "rm -rf dist",
     "typecheck": "tsc --noEmit",
     "pretest": "mkdir -p dist/test/fixtures && cp test/fixtures/*.mjs dist/test/fixtures/",
-    "test": "node --test --test-force-exit dist/test/*.test.js",
+    "test": "node --import ./dist/test/helpers/force-exit-blocking-stdout.js --test --test-force-exit --test-timeout=600000 dist/test/*.test.js",
     "preversion": "node scripts/release-bump.mjs && node scripts/release-holds.mjs",
     "version": "node scripts/release-changelog.mjs && git add CHANGELOG.md changelog.d",
     "prepublishOnly": "node scripts/release-holds.mjs && npm run build"
@@ -58,7 +58,6 @@
     "@babel/parser": "^7.29.9",
     "@types/node": "^22.0.0",
     "@types/ws": "^8.5.13",
-    "discord.js": "^14.25.1",
     "tsx": "^4.21.0",
     "typescript": "^7.0.2"
   },

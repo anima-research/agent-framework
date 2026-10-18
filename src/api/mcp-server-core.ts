@@ -536,7 +536,7 @@ export class McpServer {
             },
             errorsOnly: {
               type: 'boolean',
-              description: 'Only show failed inferences',
+              description: "Only show inferences that didn't succeed: failed or stopped",
             },
             limit: {
               type: 'number',

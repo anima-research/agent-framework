@@ -40,7 +40,7 @@ export class ApiModule implements Module {
 
   async handleToolCall(_call: ToolCall): Promise<ToolResult> {
     // API module has no tools
-    return { success: false, error: 'Unknown tool' };
+    return { success: false, error: 'Unknown tool', isError: true };
   }
 
   async onProcess(event: ProcessEvent, _state: ProcessState): Promise<EventResponse> {
