@@ -63,7 +63,7 @@ const LINK = {
 };
 const STUB = /\[ref_[^\]]+\] report\.csv — text\/csv, ~1KB claimed — from tool result — /;
 /** LINK's stub where the host can't fetch it, as where no server delivered it: its uri may carry a credential (sig). */
-const LINK_STUB = new RegExp(`${STUB.source}not tied to any server, so there's nowhere to fetch it from$`);
+const LINK_STUB = new RegExp(`${STUB.source}it's not tied to any server, so there's nowhere to fetch it from$`);
 /** A link whose uri can't carry a credential. */
 const PLAIN_URI = 'https://zz-files.example/report.csv';
 const PLAIN_LINK = { ...LINK, uri: PLAIN_URI };
@@ -286,7 +286,7 @@ describe("MCP's resource_link, a reference (RFC-005 §8.1)", () => {
       ...['#token', '#policy', '#access_token=', '?token', '?token=&page=2'].map((tail) =>
         [`https://zz-elsewhere.example/docs/auth${tail}`, "third-party origin: it isn't on its server's own address, so this host doesn't fetch it"]),
       // A relative one is read as a relative reference is.
-      ['zz-reports/report.csv?page=2', 'reference uri does not parse'],
+      ['zz-reports/report.csv?page=2', "its address doesn't parse as a URL"],
     ]) {
       const link = { type: 'resource_link', uri, name: 'report.csv' };
       referenceRegistry.register(testimonyOf(link), 'zz-files');
@@ -341,7 +341,7 @@ describe("MCP's resource_link, a reference (RFC-005 §8.1)", () => {
     for (const uri of carriers) {
       const link = { type: 'resource_link', uri, name: 'report.csv' };
       const shown = toolResultDataToHistoryString([TEXT, link]);
-      assert.match(shown, /^zz-text\n\[ref_[^\]]+\] report\.csv — from tool result — not tied to any server, so there's nowhere to fetch it from$/, uri);
+      assert.match(shown, /^zz-text\n\[ref_[^\]]+\] report\.csv — from tool result — it's not tied to any server, so there's nowhere to fetch it from$/, uri);
       assert.ok(!shown.includes(uri), shown);
     }
     const { stored, live } = copies({ success: true, data: [TEXT, LINK], dataIsContent: true });
@@ -367,7 +367,7 @@ describe("MCP's resource_link, a reference (RFC-005 §8.1)", () => {
     const uri = 'https://zz-elsewhere.example/withheld.csv';
     referenceRegistry.register(testimonyOf({ type: 'resource', uri, name: 'withheld.csv', disposition: 'never' }));
     const shown = toolResultDataToHistoryString([TEXT, { type: 'resource_link', uri, name: 'report.csv' }]);
-    assert.match(shown, /^zz-text\n\[ref_[^\]]+\] report\.csv — from tool result — not tied to any server/);
+    assert.match(shown, /^zz-text\n\[ref_[^\]]+\] report\.csv — from tool result — it's not tied to any server/);
     assert.ok(!shown.includes(uri), shown);
   });
 
@@ -409,7 +409,7 @@ describe("MCP's resource_link, a reference (RFC-005 §8.1)", () => {
     const kept = referenceRegistry.findByUri(uri)!.testimony;
     assert.deepEqual([kept.digest, kept.expiresAt, kept.name, kept.fromLink], [digest, '2020-01-01T00:00:00Z', 'claimed.bin', undefined]);
     // A link's stub reads its record, so it says what the reference's expiry makes of it.
-    assert.match((convertBlock({ type: 'resource_link', uri, name: 'linked.bin' } as never, 'p', 'zz-files') as { text: string }).text, /^\[ref_[^\]]+\] linked\.bin — p — expired$/);
+    assert.match((convertBlock({ type: 'resource_link', uri, name: 'linked.bin' } as never, 'p', 'zz-files') as { text: string }).text, /^\[ref_[^\]]+\] linked\.bin — p — the reference is expired$/);
     const later = 'https://zz-files.example/linked-first.bin';
     referenceRegistry.register(testimonyOf({ type: 'resource_link', uri: later, name: 'first' }), 'zz-files');
     referenceRegistry.register(testimonyOf({ type: 'resource', uri: later, digest, name: 'second' }), 'zz-files');
@@ -504,11 +504,11 @@ describe('what a stub says of a fetch, which the fetch then does', () => {
   let made: Array<[string, ReturnType<typeof record>, string | null]> | undefined;
   const cases = () => made ??= (serving(), [
     ['dialed on its origin', record('dialed.bin', ['zz-dialed']), null],
-    ['from no server', record('unbound.bin', []), "not tied to any server, so there's nowhere to fetch it from"],
-    ['from an unknown server', record('gone.bin', ['zz-gone']), 'unknown server: zz-gone'],
-    ['from a server with no address', record('stdio.bin', ['zz-stdio']), "no address: this host doesn't connect to server zz-stdio over a network, so there's nowhere to fetch it from"],
+    ['from no server', record('unbound.bin', []), "it's not tied to any server, so there's nowhere to fetch it from"],
+    ['from an unknown server', record('gone.bin', ['zz-gone']), 'this host no longer has the "zz-gone" server it came from'],
+    ['from a server with no address', record('stdio.bin', ['zz-stdio']), noAddressReason('zz-stdio')],
     ['from a server with no address, and one dialed on its origin', record('both.bin', ['zz-stdio', 'zz-dialed']), null],
-    ['dialed on its origin, but expired', record('expired.bin', ['zz-dialed'], { expiresAt: '2020-01-01T00:00:00Z' }), 'expired'],
+    ['dialed on its origin, but expired', record('expired.bin', ['zz-dialed'], { expiresAt: '2020-01-01T00:00:00Z' }), 'the reference is expired'],
   ]);
 
   it("ends a resource's stub with why a fetch would be refused, or the fetch it offers", () => {
@@ -522,8 +522,8 @@ describe('what a stub says of a fetch, which the fetch then does', () => {
     const fetcher = servedFetcher();
     for (const [what, r, why] of cases()) {
       const refusal = fetcher.refusal(r);
-      assert.equal(refusal === null, why === null, `${what}: ${refusal?.reason}`);
-      if (refusal && why) assert.equal(refusal.reason, why, what);
+      assert.equal(refusal === null, why === null, `${what}: ${refusal?.error}`);
+      if (refusal && why) assert.equal(refusal.error, why, what);
     }
   });
 
@@ -544,7 +544,7 @@ describe('what a stub says of a fetch, which the fetch then does', () => {
     const fetcher = fw.getReferenceFetcher();
     assert.equal(fetcher.refusal(wired), null);
     assert.ok(buildReferenceStub(wired.testimony, 'zz').endsWith('— zz — fetch with fetch_reference'));
-    assert.equal(fetcher.refusal(spawned)?.reason, noAddressReason('zz-spawned'));
+    assert.equal(fetcher.refusal(spawned)?.error, noAddressReason('zz-spawned'));
     assert.ok(buildReferenceStub(spawned.testimony, 'zz').endsWith(`— zz — ${noAddressReason('zz-spawned')}`));
   });
 
@@ -568,10 +568,11 @@ describe('what a stub says of a fetch, which the fetch then does', () => {
     const onEarlier = referenceRegistry.register(testimonyOf({ type: 'resource', uri: 'https://zz-earlier.example/shared.bin', name: 'shared.bin' }), 'zz-shared');
     // Each fetcher checks a uri against its own config's address, whose token
     // it carries: the earlier framework's never dials the later one's origin.
-    assert.match(earlier.getReferenceFetcher().refusal(onLater)!.reason, /^third-party origin \(https:\/\/zz-later\.example != dialed https:\/\/zz-earlier\.example\)/);
+    assert.equal(earlier.getReferenceFetcher().refusal(onLater)!.error,
+      'it points to https://zz-later.example, not to the "zz-shared" server\'s own address (wss://zz-earlier.example), and this host fetches only from the server itself');
     assert.equal(earlier.getReferenceFetcher().refusal(onEarlier), null);
     assert.equal(later.getReferenceFetcher().refusal(onLater), null);
-    assert.match(later.getReferenceFetcher().refusal(onEarlier)!.reason, /^third-party origin/);
+    assert.match(later.getReferenceFetcher().refusal(onEarlier)!.error, /^it points to https:\/\/zz-earlier\.example, not to the "zz-shared" server's own address \(wss:\/\/zz-later\.example\)/);
     // The later framework's removal takes back only its own entry, and the
     // earlier one's is in force again.
     referenceRegistry.forgetServerAddress('zz-shared', later);
@@ -628,36 +629,27 @@ describe('what a stub says of a fetch, which the fetch then does', () => {
     const weird = `zz-\u202E${'x'.repeat(300)}`;
     const r = record('weird.bin', [weird]);
     const stub = buildReferenceStub(r.testimony, 'zz');
-    assert.ok(stub.includes('unknown server: zz-xxx') && !stub.includes('\u202E') && stub.length < 400, stub);
+    assert.ok(stub.includes('this host no longer has the "zz-xxx') && !stub.includes('\u202E') && stub.length < 400, stub);
     referenceRegistry.setServerAddress('zz-other', { url: 'wss://zz-other.example' }, TEST_HOST);
     const offOrigin = record('elsewhere.bin', ['zz-other']);
     assert.ok(buildReferenceStub(offOrigin.testimony, 'zz').endsWith("— zz — third-party origin: it isn't on its server's own address, so this host doesn't fetch it"));
     const fetcher = new ReferenceFetcher(() => ({ url: 'wss://zz-other.example' }), async () => null);
-    assert.match(fetcher.refusal(offOrigin)!.reason, /^third-party origin \(https:\/\/zz-refs\.example != dialed https:\/\/zz-other\.example\); not fetched by this host$/);
+    assert.equal(fetcher.refusal(offOrigin)!.error,
+      'it points to https://zz-refs.example, not to the "zz-other" server\'s own address (wss://zz-other.example), and this host fetches only from the server itself');
     // A scheme the fetcher doesn't fetch: the stub doesn't name it, and the
     // fetch's refusal names it bounded as a label is.
     const scheme = `zz${'s'.repeat(300)}`;
     const t = testimonyOf({ type: 'resource', uri: `${scheme}://zz-refs.example/long.bin`, name: 'long.bin' });
     const long = referenceRegistry.register(t, 'zz-dialed');
     assert.ok(buildReferenceStub(t, 'zz').endsWith('— zz — scheme not allowed: this host fetches only http and https uris'));
-    assert.equal(new ReferenceFetcher(() => ({ url: 'wss://zz-refs.example' }), async () => null).refusal(long)?.reason,
-      `scheme not allowed: ${sanitizeLabel(`${scheme}:`, 120)}`);
+    assert.equal(new ReferenceFetcher(() => ({ url: 'wss://zz-refs.example' }), async () => null).refusal(long)?.error,
+      `its address uses ${sanitizeLabel(`${scheme}:`, 120)}, and this host fetches only http: and https: addresses`);
   });
 
-  it('refuses an http uri on a securely dialed server as plaintext, and a server url that does not parse as such', () => {
-    const plain = referenceRegistry.register(testimonyOf({ type: 'resource', uri: 'http://zz-refs.example/plain.bin', name: 'plain.bin' }), 'zz-secure');
-    referenceRegistry.setServerAddress('zz-secure', { url: 'wss://zz-refs.example' }, TEST_HOST);
-    assert.ok(buildReferenceStub(plain.testimony, 'zz').endsWith('— zz — plaintext reference from a secure origin'));
-    assert.equal(new ReferenceFetcher(() => ({ url: 'wss://zz-refs.example' }), async () => null).refusal(plain)?.reason, 'plaintext reference from a secure origin');
-    // On the secure server's port named outright, it's the same place.
-    const port = referenceRegistry.register(testimonyOf({ type: 'resource', uri: 'http://zz-refs.example:443/port.bin', name: 'port.bin' }), 'zz-secure');
-    assert.ok(buildReferenceStub(port.testimony, 'zz').endsWith('— zz — plaintext reference from a secure origin'));
-    // Another host over plaintext is a third party's, as before.
-    const elsewhere = referenceRegistry.register(testimonyOf({ type: 'resource', uri: 'http://zz-elsewhere.example/plain.bin', name: 'plain.bin' }), 'zz-secure');
-    assert.match(buildReferenceStub(elsewhere.testimony, 'zz'), /— zz — third-party origin: /);
+  it('refuses a reference through a server whose url does not parse, saying so', () => {
     referenceRegistry.setServerAddress('zz-garbled', { url: 'zz not a url' }, TEST_HOST);
     const garbled = referenceRegistry.register(testimonyOf({ type: 'resource', uri: 'https://zz-refs.example/garbled.bin', name: 'garbled.bin' }), 'zz-garbled');
-    assert.ok(buildReferenceStub(garbled.testimony, 'zz').endsWith('— zz — server url does not parse'));
+    assert.ok(buildReferenceStub(garbled.testimony, 'zz').endsWith('— zz — the "zz-garbled" server\'s address doesn\'t parse as a URL, so there\'s nowhere to fetch it from'));
   });
 });
 
@@ -798,7 +790,7 @@ describe('dataIsContent travels with the result', () => {
     // can't be fetched.
     await f.framework.disconnectMcplServer('editor');
     assert.equal(referenceRegistry.serverAddress('editor'), undefined);
-    assert.match(nonErrorResultText(model), new RegExp(`\\n${STUB.source}unknown server: editor\\n`));
+    assert.match(nonErrorResultText(model), new RegExp(`\\n${STUB.source}this host no longer has the "editor" server it came from\\n`));
   });
 });
 

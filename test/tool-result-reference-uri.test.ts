@@ -139,7 +139,7 @@ describe('data the serializer doesn\'t read as content blocks', () => {
     assert.ok(!text.includes(SIGNATURE), text);
     const [record, signedShown, plain, stub, plainShown] = parsed(text) as [unknown, string, string, string, string];
     assert.deepEqual([record, plain], [{ id: 1, type: 'zz-record' }, 'zz']);
-    assert.match(signedShown, /^\[ref_[^\]]+\] zz\.pdf — application\/pdf — from tool result — not tied to any server/);
+    assert.match(signedShown, /^\[ref_[^\]]+\] zz\.pdf — application\/pdf — from tool result — it's not tied to any server/);
     assert.match(stub, STUB);
     assert.equal(plainShown, `[resource link "zz.pdf": ${plainUri}, application/pdf; not fetched]`);
   });
@@ -356,6 +356,6 @@ describe('a script given such data', () => {
     }
     assert.ok(!text.includes(SIGNATURE), text);
     assert.match(text, /^zz-text\n\[ref_[^\]]+\] zz\.pdf — application\/pdf — from tool result/);
-    assert.ok(logged.some((line) => /\[rfc005\] script-demand fetch of ref_\S+ failed: reference not tied to any server, so there's nowhere to fetch it from/.test(line)), logged.join('\n'));
+    assert.ok(logged.some((line) => /\[rfc005\] script-demand fetch of ref_\S+ failed: it's not tied to any server, so there's nowhere to fetch it from$/.test(line)), logged.join('\n'));
   });
 });

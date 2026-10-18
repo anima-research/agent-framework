@@ -123,8 +123,8 @@ test('the stub leaves out a type, or a provenance, that sanitizes to nothing', (
 
 test("an expired reference's stub says why, where a live one's advises fetch_reference", () => {
   // Each bound to its server, as a tool result's references are, so the expiry is what's left to say.
-  const cases = [['2001-01-01T00:00:00Z', /[\]—] expired$/], ['not-a-date', /[\]—] treated as expired, since its expiry time can't be read$/],
-    ['x'.repeat(REFERENCE_LIMITS.expiresAt + 1), /[\]—] treated as expired, since its expiry time isn't in a form this host accepts$/]] as const;
+  const cases = [['2001-01-01T00:00:00Z', /[\]—] the reference is expired$/], ['not-a-date', /[\]—] the reference is treated as expired, since its expiry time can't be read$/],
+    ['x'.repeat(REFERENCE_LIMITS.expiresAt + 1), /[\]—] the reference is treated as expired, since its expiry time isn't in a form this host accepts$/]] as const;
   for (const [i, [expiresAt, why]] of cases.entries()) {
     const { testimony } = reference('resource', { uri: `https://example.test/stub-expired-${i}`, expiresAt });
     const stub = buildReferenceStub(testimony, undefined, 'srv');
@@ -146,11 +146,11 @@ test("an unbound reference's stub says it can't be fetched and why, where a boun
   // Registered with no server, as an in-process module's reference or a channel message's is.
   const { testimony } = reference('resource', { uri: 'https://example.test/stub-unbound' });
   const unbound = buildReferenceStub(testimony, 'from a module');
-  assert.ok(unbound.endsWith(`] from a module — ${UNBOUND_REASON}`), unbound);
+  assert.ok(unbound.endsWith(`] from a module — it's ${UNBOUND_REASON}`), unbound);
   assert.ok(!unbound.includes('fetch_reference'), unbound);
   // Expired as well: the fetcher refuses it as unbound first, so the stub says that.
   const { testimony: both } = reference('resource', { uri: 'https://example.test/stub-unbound-expired', expiresAt: '2001-01-01T00:00:00Z' });
-  assert.ok(buildReferenceStub(both).endsWith(`] ${UNBOUND_REASON}`));
+  assert.ok(buildReferenceStub(both).endsWith(`] it's ${UNBOUND_REASON}`));
   // A later registration that knows its server binds the record, and the next stub advises fetch_reference.
   assert.ok(buildReferenceStub(testimony, 'from a server', 'srv').endsWith('] from a server — fetch with fetch_reference'));
 });

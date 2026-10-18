@@ -1,8 +1,8 @@
 - Where `fetch_reference` refused a reference from an MCPL server the host
   doesn't connect to over a network, such as a stdio server, as
-  `unknown server: <id>`, it now says `no address: this host doesn't
-  connect to server <id> over a network, so there's nowhere to fetch it
-  from`. A server the host spawns from a command has no address either,
+  `unknown server: <id>`, it now says `this host doesn't connect to the
+  "<id>" server over a network, so there's nowhere to fetch it from`. A
+  server the host spawns from a command has no address either,
   even when its config also holds a `url`, on whose origin its references
   used to be fetched; nor has a WebSocket server whose `url` the transport
   won't dial: one that isn't a `ws://` or `wss://` url, or that has a

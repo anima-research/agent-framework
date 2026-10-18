@@ -291,6 +291,118 @@ export async function linkReason(view: Pick<MountView, 'root' | 'name' | 'nested
 }
 
 // ===========================================================================
+// Disk's spelling of a path
+// ===========================================================================
+
+const sameFile = (a: BigIntStats, b: BigIntStats): boolean => a.dev === b.dev && a.ino === b.ino;
+
+/** A letter's other case: its upper case if it's in lower case, else its lower case. */
+const otherCase = (c: string): string => (c === c.toLowerCase() ? c.toUpperCase() : c.toLowerCase());
+
+/**
+ * The name with each letter's case flipped, where its other case is one
+ * letter whose own other case is the letter again, so the flip changes only
+ * pairs that any folding disk folds together. `ß`, whose upper case is `SS`,
+ * and dotless `ı`, whose upper case `I` lowers to `i`, stay as they are.
+ */
+const flippedCase = (name: string): string =>
+  [...name].map((c) => {
+    const other = otherCase(c);
+    return [...other].length === 1 && otherCase(other) === c ? other : c;
+  }).join('');
+
+/** Names compared as NFC in lower case. */
+const folded = (name: string): string => name.normalize('NFC').toLowerCase();
+
+/**
+ * Names compared more loosely, through upper case and back, which also folds
+ * `ß` with `ss`, `ſ` with `s` and `ς` with `σ`, as a disk that folds fully
+ * does. It also folds dotless `ı` with `i`, which a disk may keep apart;
+ * the same-file check keeps that from naming another file.
+ */
+const foldedLoosely = (name: string): string => name.normalize('NFC').toLowerCase().toUpperCase().toLowerCase();
+
+/**
+ * The name `dir` lists for `segment`: `segment` itself, unless disk folds it
+ * there and lists it otherwise. `dir` is listed only where a variant of
+ * `segment`, its case flipped or its other Unicode normalization form, finds
+ * the same file (device and inode) as `given`, the segment's own entry, as on
+ * a disk that folds names. The last segment isn't looked up as given unless
+ * the listing must settle it, so for it any variant found leads to the
+ * listing: on a disk that tells spellings apart, that's only where `dir`
+ * holds a variant as a name of its own. The name as given wins if it's
+ * listed; otherwise the segment takes the listed name that folds to it and is
+ * the same file, so the name returned reaches the file the segment does, or
+ * is the segment as given. Names are compared as NFC in lower case first, and
+ * only where none of those is the file, more loosely (foldedLoosely). A
+ * directory that can't be listed, or a name that can't be looked up, leaves
+ * the segment as given.
+ */
+async function listedName(dir: string, segment: string, given: BigIntStats | null): Promise<string> {
+  const variants = new Set([flippedCase(segment), segment.normalize('NFC'), segment.normalize('NFD')]);
+  variants.delete(segment);
+  let folds = false;
+  for (const variant of variants) {
+    const other = await lstat(join(dir, variant), { bigint: true }).catch(() => null);
+    if (other !== null && (given === null || sameFile(other, given))) { folds = true; break; }
+  }
+  if (!folds) return segment;
+  const listed = await readdir(dir).catch(() => null);
+  if (listed === null || listed.includes(segment)) return segment;
+  const target = given ?? await lstat(join(dir, segment), { bigint: true }).catch(() => null);
+  if (target === null) return segment;
+  for (const fold of [folded, foldedLoosely]) {
+    for (const name of listed) {
+      if (fold(name) !== fold(segment)) continue;
+      const info = await lstat(join(dir, name), { bigint: true }).catch(() => null);
+      if (info !== null && sameFile(info, target)) return name;
+    }
+  }
+  return segment;
+}
+
+/**
+ * `relativePath` as disk spells it. On a disk that folds names, as macOS's
+ * does by default (case and Unicode normalization), `SRC/a.ts` reaches
+ * `src/a.ts`, and whatever names what it finds from the spelling it was
+ * given takes the file in a second time, under a name disk doesn't list. So
+ * each segment, from the mount's root down, takes the name its directory
+ * lists for it (listedName). The walk goes on beneath a segment only if it's
+ * a directory, a symlink not included, so nothing past a link is read. It
+ * passes over an empty or `.` segment, which names the directory reached,
+ * and goes back up at `..`, to the directory it came from. At the mount's
+ * root a `..` stops it, keeping the rest as given: a path can climb above
+ * the root and come back in, as `../proj/x` does for a root named `proj`, and
+ * walking that would list the directory above the root. An absolute path
+ * keeps its spelling too: it names a place from the filesystem's root, not
+ * the mount's, so walking it from the mount's root would respell it against
+ * other directories, and the path returned could lead outside the mount.
+ */
+export async function diskSpelling(root: string, relativePath: string): Promise<string> {
+  if (relativePath === '' || isAbsolute(relativePath)) return relativePath;
+  const segments = relativePath.split('/');
+  // The directories walked into, the mount's root first.
+  const dirs = [root];
+  for (let i = 0; i < segments.length; i++) {
+    const segment = segments[i]!;
+    if (segment === '' || segment === '.') continue;
+    if (segment === '..') {
+      if (dirs.length === 1) break;
+      dirs.pop();
+      continue;
+    }
+    const dir = dirs[dirs.length - 1]!;
+    const last = i === segments.length - 1;
+    const given = last ? null : await lstat(join(dir, segment), { bigint: true }).catch(() => null);
+    if (!last && given === null) break;
+    segments[i] = await listedName(dir, segment, given);
+    if (given === null || !given.isDirectory()) break;
+    dirs.push(join(dir, segments[i]!));
+  }
+  return segments.join('/');
+}
+
+// ===========================================================================
 // Checked directories
 // ===========================================================================
 

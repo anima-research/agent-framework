@@ -8,8 +8,10 @@
  *    not fetch third-party origins at all (deferred with declared reference
  *    origins); the connection credential is applied as an Authorization
  *    header by this code alone and never surfaces to model, script, or URI.
- *  - **scheme allowlist (§7.1, vector 11):** https; http only when the dialed
- *    origin itself is plaintext (a ws:// server references its own origin).
+ *  - **scheme allowlist (§7.1, vector 11):** the uri's own scheme is http: or
+ *    https:, and since origins compare with their schemes, http only from a
+ *    server dialed in plaintext (ws://), https only from one dialed over TLS
+ *    (wss://).
  *  - **no redirect traversal (§7.2, vector 12):** any 3xx refuses.
  *  - **actual-byte ceiling (§7.3 list, vector 10):** streamed with abort the
  *    moment real octets exceed the ceiling, regardless of claimed sizeBytes.
@@ -30,11 +32,13 @@
  */
 import { createHash } from 'node:crypto';
 import type { ReferenceRecord, Refusal, ServerAddress } from './references.js';
-import { dialCheck, dialServer, noAddressReason, REFERENCE_LIMITS, sanitizeLabel, shownServerId } from './references.js';
+import { boundedForLog, describeCause } from './errors.js';
+import { dialCheck, dialServer, FRESH_REFERENCE, noAddressReason, NOTHING_TO_DO, REFERENCE_LIMITS, sanitizeLabel, SERVER_BACK, shownServerId } from './references.js';
 
 export { normalizedOrigin, type Refusal } from './references.js';
 
-/** Per-fetch hard ceiling on actual bytes (overridable per server / call). */
+/** Per-fetch hard ceiling on actual bytes. A call can lower it for itself
+ *  (fetch_reference's max_bytes, which it clamps to this); nothing raises it. */
 export const DEFAULT_FETCH_MAX_BYTES = 256 * 1024 * 1024;
 /** Eager (autofetch) threshold: at most what could have shipped inline. */
 export const DEFAULT_EAGER_FETCH_MAX_BYTES = 256 * 1024;
@@ -43,12 +47,30 @@ export const DEFAULT_EAGER_FETCH_MAX_BYTES = 256 * 1024;
  *  kept. */
 export const DEFAULT_MAX_TOTAL_BYTES = 1024 * 1024 * 1024;
 const FETCH_TIMEOUT_MS = 60_000;
-/** What a refusal by the per-server budget adds. The total lives as long as
- *  this fetcher, one per framework, so only someone running the host renews
- *  it, by starting a new one, or raises the budget (the server's config's
- *  autofetch.maxTotalBytes, which each fetch reads afresh). */
-const BUDGET_LASTS = "the budget doesn't renew on its own, so calling again won't change that unless whoever runs this host raises or renews it";
 const EAGER_FETCH_TIMEOUT_MS = 10_000;
+
+// What calling again can do, as each failure's remedy says it. The fetcher
+// doesn't know where a reference came from (a tool result, a push, a channel
+// message), so none names a tool, and fetch_reference's max_bytes is named
+// only where a larger one can fetch it. The refusals before dialing that a
+// stub shares take theirs from references.ts (NOTHING_TO_DO, FRESH_REFERENCE,
+// SERVER_BACK).
+const TRY_LATER = 'Trying again later may work.';
+/** A request that failed before an answer: a refused or reset connection
+ *  can clear, and a cause that repeats on every try (a port fetch refuses, a
+ *  name that doesn't resolve, a certificate this host doesn't trust) is
+ *  whoever runs the host's to change, so the remedy names both. */
+const REQUEST_FAILED = "Trying again later may work; if it fails the same way, whoever runs this host can check its connection to the server.";
+const CREDENTIALS = "Calling again won't change that; whoever runs this host can check its credentials for the server.";
+const FRESH_OR_CREDENTIALS = "Once a fresh reference to it arrives, fetching may work; if that's refused too, whoever runs this host can check its credentials for the server.";
+/** The total lives as long as this fetcher, one per framework, so only
+ *  someone running the host renews it, by starting a new one, or raises the
+ *  budget (the server's config's autofetch.maxTotalBytes, which each fetch
+ *  reads afresh). */
+const BUDGET = "The budget doesn't renew on its own, so calling again won't change that unless whoever runs this host raises or renews it.";
+/** The host's own ceiling: fetch_reference clamps max_bytes to it, and no
+ *  config sets another. */
+const HOST_CEILING = "No max_bytes or setting lifts that limit, so calling again won't change it.";
 
 export interface ResolvedServerBinding {
   /** The url the host dials the server at. The framework's resolver gives only
@@ -66,19 +88,63 @@ export interface ResolvedServerBinding {
  *  know resolves to undefined. */
 export type ServerResolution = ResolvedServerBinding | 'no-address';
 
-/** fetch_reference's words for a refusal. */
-function refusalText(refusal: Refusal): string {
-  return refusal.ofReference ? `reference ${refusal.reason}` : refusal.reason;
+/** A fetch's result: the saved copy, or why it failed, which every failure
+ *  says with both a clause and a remedy. The fields the other side lacks are
+ *  declared undefined, so a caller can read them before checking ok. */
+export type FetchOutcome =
+  | {
+    ok: true;
+    /** Mount-prefixed workspace path of the saved payload. */
+    path: string;
+    bytes?: number;
+    mimeType?: string;
+    digestVerified?: boolean;
+    error?: undefined;
+    remedy?: undefined;
+  }
+  | ({ ok: false; path?: undefined; bytes?: undefined; mimeType?: undefined; digestVerified?: undefined } & Pick<Refusal, 'error' | 'remedy'>);
+
+const refused = (error: string, remedy: string): { refusal: Refusal } => ({ refusal: { error, remedy } });
+const fail = (error: string, remedy: string): FetchOutcome => ({ ok: false, error, remedy });
+
+/** What calling again can do about a server's HTTP status. A later try can
+ *  work after a timeout, a conflict or lock the server's state can clear, a
+ *  request it calls too early, a rate limit or a server's passing trouble,
+ *  though not after 501 or 505, which say the server doesn't support the
+ *  request. A 401 is about this host's credentials for the server, which a
+ *  fresh reference doesn't change, and a 403 can be either those or this
+ *  reference. The rest of 4xx is about this reference, which a fresh one may
+ *  not share. */
+function statusRemedy(status: number): string {
+  if (status === 501 || status === 505) return NOTHING_TO_DO;
+  if (status === 408 || status === 409 || status === 423 || status === 425 || status === 429 || status >= 500) return TRY_LATER;
+  if (status === 401) return CREDENTIALS;
+  if (status === 403) return FRESH_OR_CREDENTIALS;
+  return FRESH_REFERENCE;
 }
 
-export interface FetchOutcome {
-  ok: boolean;
-  /** Mount-prefixed workspace path of the saved payload (on success). */
-  path?: string;
-  bytes?: number;
-  mimeType?: string;
-  digestVerified?: boolean;
-  error?: string;
+/** What a download stopped at a call's own ceiling, below the host's, can do.
+ *  Its whole size is unknown, only that it's past what arrived, and a fetch
+ *  again reads it from the start, within the host's ceiling and what the
+ *  server's budget has left after this one's bytes. The read loop stops a
+ *  download past the host's ceiling before it asks, so what arrived is within
+ *  it, and only the budget can be what binds. */
+function largerMaxBytes(received: number, left: number, server: string): string {
+  const most = Math.min(DEFAULT_FETCH_MAX_BYTES, left);
+  if (received <= most) return `It's at least ${received} bytes; a larger max_bytes, up to ${most}, may fetch it.`;
+  return `It's at least ${received} bytes, more than the ${left} bytes left of this host's fetch budget for ${server}. ${BUDGET}`;
+}
+
+/** What a thrown fetch says went wrong. fetch's own "fetch failed" says only
+ *  that, so its cause's words come first. A cause from trying each of a
+ *  host's addresses (an AggregateError) has no words of its own, so its
+ *  attempts' stand in. */
+function whyFetchFailed(e: unknown): string {
+  const source = (e as { cause?: unknown } | null | undefined)?.cause ?? e;
+  const own = describeCause(source);
+  if (own !== '') return own;
+  const attempts = (source as { errors?: unknown } | null | undefined)?.errors;
+  return Array.isArray(attempts) && attempts.length > 0 ? attempts.map(describeCause).join('; ') : describeCause(e);
 }
 
 /** Magic-byte sniff for the formats this pipeline actually moves. The
@@ -139,8 +205,8 @@ export class ReferenceFetcher {
   /** A server's credential and limits, for a server dialServer chose. */
   private bindingFor(serverId: string): { serverId: string; binding: ResolvedServerBinding } | { refusal: Refusal } {
     const binding = this.resolveServer(serverId);
-    if (binding === undefined) return { refusal: { reason: `unknown server: ${shownServerId(serverId)}`, ofReference: false } };
-    if (binding === 'no-address') return { refusal: { reason: noAddressReason(shownServerId(serverId)), ofReference: false } };
+    if (binding === undefined) return refused(`this host no longer has the "${shownServerId(serverId)}" server it came from`, SERVER_BACK);
+    if (binding === 'no-address') return refused(noAddressReason(shownServerId(serverId)), NOTHING_TO_DO);
     return { serverId, binding };
   }
 
@@ -167,13 +233,15 @@ export class ReferenceFetcher {
   }
 
   /** Every check the fetch makes before it dials, in its order: the server
-   *  (none, unknown, no address, off the uri's origin) and the expiry, which
-   *  dialCheck makes as a reference's stub does; then the server's spent
-   *  budget, a claimed size over the ceiling. For a record with no saved
-   *  copy and no fetch under way, the fetch, `refusal()` and the eager
-   *  check all ask this, so what save_recent_image says is the reason the
-   *  fetch would refuse with, and no eager slot goes to a fetch that would
-   *  be refused. */
+   *  (none, unknown, no address, an address of its own or the reference's
+   *  that doesn't parse, a reference address carrying a user name or
+   *  password, a scheme other than http: or https:, off the uri's origin)
+   *  and the expiry, which dialCheck makes as a reference's stub does; then
+   *  a claimed size over the host's own ceiling, the server's spent budget,
+   *  a claimed size over a call's ceiling. For a record with no saved copy
+   *  and no fetch under way, the fetch, `refusal()` and the eager check all
+   *  ask this, so what save_recent_image says is the reason the fetch would
+   *  refuse with, and no eager slot goes to a fetch that would be refused. */
   private beforeDial(record: ReferenceRecord, opts?: { maxBytes?: number }):
     { refusal: Refusal } | { serverId: string; binding: ResolvedServerBinding; ceiling: number; budget: number } {
     const dial = dialCheck(record, this.addressOf);
@@ -184,13 +252,18 @@ export class ReferenceFetcher {
     const t = record.testimony;
 
     const ceiling = opts?.maxBytes ?? DEFAULT_FETCH_MAX_BYTES;
-    // The budget is checked before the ceiling, here and while reading: a
-    // larger max_bytes lifts the ceiling, and nothing the caller does lifts
+    // A claim past the host's own ceiling is refused first: nothing lifts
+    // it, not even a budget whoever runs the host raises.
+    if (t.sizeBytes !== undefined && t.sizeBytes > DEFAULT_FETCH_MAX_BYTES) {
+      return refused(`it claims ${t.sizeBytes} bytes, over the ${DEFAULT_FETCH_MAX_BYTES} bytes this host fetches at most`, HOST_CEILING);
+    }
+    // The budget is checked before a call's ceiling, here and while reading:
+    // a larger max_bytes lifts that ceiling, and nothing the caller does lifts
     // the budget, so a fetch past both is told about the budget.
     const budget = binding.autofetch?.maxTotalBytes ?? DEFAULT_MAX_TOTAL_BYTES;
     const used = this.totals.get(serverId) ?? 0;
     if (used >= budget) {
-      return { refusal: { reason: `per-server fetch budget exhausted (${used}/${budget} bytes); ${BUDGET_LASTS}`, ofReference: false } };
+      return refused(`this host's fetch budget for the "${shownServerId(serverId)}" server is used up (${used} of ${budget} bytes)`, BUDGET);
     }
     // Vector 4: a claim already over the ceiling refuses without dialing. One
     // that's also over what's left of the budget is told about the budget,
@@ -198,14 +271,15 @@ export class ReferenceFetcher {
     // ceiling still dials, and the budget stops it at its first chunk past.
     if (t.sizeBytes !== undefined && t.sizeBytes > ceiling) {
       if (t.sizeBytes > budget - used) {
-        return {
-          refusal: {
-            reason: `claimed ${t.sizeBytes} bytes exceeds what's left of the per-server fetch budget (${used}/${budget} bytes); ${BUDGET_LASTS}`,
-            ofReference: false,
-          },
-        };
+        return refused(
+          `it claims ${t.sizeBytes} bytes, more than the ${budget - used} bytes left of this host's fetch budget for the "${shownServerId(serverId)}" server`,
+          BUDGET,
+        );
       }
-      return { refusal: { reason: `claimed ${t.sizeBytes} bytes exceeds fetch ceiling ${ceiling}`, ofReference: false } };
+      // Within what's left of the budget and the host's ceiling, so a
+      // ceiling of the call's own is what a larger max_bytes lifts.
+      return refused(`it claims ${t.sizeBytes} bytes, over the ${ceiling} bytes this call allows`,
+        `Pass max_bytes of at least ${t.sizeBytes} to fetch it.`);
     }
     return { serverId, binding, ceiling, budget };
   }
@@ -238,20 +312,22 @@ export class ReferenceFetcher {
   private async doFetch(record: ReferenceRecord, opts?: { maxBytes?: number; timeoutMs?: number }): Promise<FetchOutcome> {
     const t = record.testimony;
     const check = this.beforeDial(record, opts);
-    if ('refusal' in check) return { ok: false, error: refusalText(check.refusal) };
+    if ('refusal' in check) return fail(check.refusal.error, check.refusal.remedy);
     const { serverId, binding, ceiling, budget } = check;
+    const server = `the "${shownServerId(serverId)}" server`;
 
+    const timeoutMs = opts?.timeoutMs ?? FETCH_TIMEOUT_MS;
     const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), opts?.timeoutMs ?? FETCH_TIMEOUT_MS);
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
     try {
       const headers: Record<string, string> = {};
       if (binding.token) headers.authorization = `Bearer ${binding.token}`;
       const resp = await fetch(t.uri, { headers, redirect: 'manual', signal: controller.signal });
       if (resp.status >= 300 && resp.status < 400) {
-        return { ok: false, error: `redirect refused (HTTP ${resp.status}) — no redirect traversal` };
+        return fail(`${server} answered HTTP ${resp.status}, a redirect, and this host doesn't follow redirects`, NOTHING_TO_DO);
       }
-      if (!resp.ok) return { ok: false, error: `HTTP ${resp.status}` };
-      if (!resp.body) return { ok: false, error: 'no response body' };
+      if (!resp.ok) return fail(`${server} answered HTTP ${resp.status}`, statusRemedy(resp.status));
+      if (!resp.body) return fail(`${server} answered without any content`, FRESH_REFERENCE);
 
       const hash = createHash('sha256');
       const chunks: Buffer[] = [];
@@ -265,13 +341,24 @@ export class ReferenceFetcher {
         // this server read the same total, so none spends what another took.
         const total = (this.totals.get(serverId) ?? 0) + value.byteLength;
         this.totals.set(serverId, total);
+        // The limit nothing lifts first, as before dialing: the host's
+        // ceiling, then the budget, then a call's own ceiling.
+        if (received > DEFAULT_FETCH_MAX_BYTES) {
+          controller.abort();
+          return fail(`the download had reached ${received} bytes, past the ${DEFAULT_FETCH_MAX_BYTES} bytes this host fetches at most, ` +
+            'so it was stopped and nothing was kept', HOST_CEILING);
+        }
         if (total > budget) {
           controller.abort();
-          return { ok: false, error: `aborted: per-server fetch budget exhausted (${total}/${budget} bytes); ${BUDGET_LASTS}` };
+          // The server's running total, as the next fetch's refusal gives it:
+          // other fetches through the server may have spent part of it.
+          return fail(`this host's fetch budget for ${server} ran out during the download (${total} of ${budget} bytes), ` +
+            'so it was stopped and nothing was kept', BUDGET);
         }
         if (received > ceiling) {
           controller.abort();
-          return { ok: false, error: `aborted: actual bytes exceeded ceiling at ${received}` };
+          return fail(`the download had reached ${received} bytes, past the ${ceiling} bytes this call allows, ` +
+            'so it was stopped and nothing was kept', largerMaxBytes(received, budget - total, server));
         }
         const buf = Buffer.from(value);
         hash.update(buf);
@@ -284,7 +371,11 @@ export class ReferenceFetcher {
         const got = 'sha256:' + hash.digest('base64url');
         if (got !== t.digest) {
           // Vector 5: never presented as the described content.
-          return { ok: false, error: `digest mismatch (claimed ${t.digest.slice(0, 20)}…, got ${got.slice(0, 20)}…)` };
+          return fail(
+            `the bytes that arrived don't match the reference's digest (${t.digest.slice(0, 20)}…, against ${got.slice(0, 20)}…), ` +
+              "so they weren't kept",
+            "Trying again may work; if it fails the same way, fetching may work once a fresh reference to it arrives.",
+          );
         }
         digestVerified = true;
       }
@@ -299,8 +390,21 @@ export class ReferenceFetcher {
       const observedMime = sniffMime(data) ?? headerMime ?? claimedMime ?? 'application/octet-stream';
       const ext = EXT_BY_MIME.get(observedMime) ?? EXT_BY_MIME.get(headerMime ?? '') ?? EXT_BY_MIME.get(claimedMime ?? '') ?? 'bin';
       // §7.3: host-generated storage name; the server's `name` is display-only.
-      const path = await this.saveFile(`${record.refId}.${ext}`, data, observedMime);
-      if (path === null) return { ok: false, error: 'no writable workspace mount to store the payload' };
+      // A null from the save hook covers no workspace, no writable mount and
+      // a failed write, and the hook logs which. A throw is the save's failure
+      // too, not the fetch's, so it's logged here.
+      const fileName = `${record.refId}.${ext}`;
+      let path: string | null;
+      try {
+        path = await this.saveFile(fileName, data, observedMime);
+      } catch (e) {
+        console.error(`[refs] couldn't store ${fileName}: ${boundedForLog(describeCause(e))}`);
+        path = null;
+      }
+      if (path === null) {
+        return fail("it was fetched, but this host couldn't store it in its workspace, so nothing was kept",
+          'Calling again is likely to fail the same way; whoever runs this host can see why in its log.');
+      }
 
       record.fetchedPath = path;
       record.verifiedBytes = data.length;
@@ -308,8 +412,13 @@ export class ReferenceFetcher {
       record.digestVerified = digestVerified;
       return { ok: true, path, bytes: data.length, mimeType: observedMime, digestVerified };
     } catch (e) {
-      const msg = (e as Error).name === 'AbortError' ? 'fetch timed out or aborted' : (e as Error).message;
-      return { ok: false, error: msg };
+      // The timer is the only abort that throws: the budget and the ceiling
+      // abort the download and return at once.
+      if ((e as Error)?.name === 'AbortError') {
+        const seconds = timeoutMs / 1000;
+        return fail(`it took longer than ${seconds} second${seconds === 1 ? '' : 's'}`, TRY_LATER);
+      }
+      return fail(`the request to ${server} failed: ${boundedForLog(whyFetchFailed(e))}`, REQUEST_FAILED);
     } finally {
       clearTimeout(timer);
     }

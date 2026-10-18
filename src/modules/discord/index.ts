@@ -340,8 +340,9 @@ function oncePerBody(rows: readonly StoredMessage[]): string[] {
 /** A live create on its way to the store (DiscordModule.creating). */
 interface LiveCreate {
   /** converting: the live path fetches its attachments; queued: its event
-   *  waits in the queue; writing: onProcess answered it, and the store may
-   *  not show the message's row yet. */
+   *  waits in the queue; writing: onProcess answered it, and each Discord
+   *  event after it looks for the message's row, and ends the entry once it
+   *  shows. */
   phase: 'converting' | 'queued' | 'writing';
   /** A delete for the message came before its create was handled, so no row
    *  comes, and the entry waits for that delete to be handled. */
@@ -393,17 +394,18 @@ export class DiscordModule implements Module {
 
   // The Discord messages whose live create is on its way to the store: from
   // the moment the live path takes one up, through its conversion and the
-  // event queue, until the store shows the row onProcess answered with. The
-  // framework holds a module's writes while the agent's turn is alive or the
-  // host is quiesced, and queryMessages shows a row only once it lands, so
-  // each Discord event looks for the rows still on their way. A history sync
-  // stores none of these messages, so no message is stored twice. A delete
-  // before the create is handled drops it: nothing is stored and nobody is
-  // woken. Any message's entry ends when its delete is handled, since a sync
-  // running then skips the message (noteLive) and a later one doesn't fetch
-  // it. An edit while it converts is folded into it. A create whose row never
-  // lands keeps its entry, and the sync off its message, until the module
-  // stops.
+  // event queue, until a query shows the row onProcess answered with, stored
+  // or held. The framework holds a module's writes while the agent's turn is
+  // alive or the host is quiesced, and queryMessages shows a held write's
+  // row, marked held, so the next Discord event finds it either way and ends
+  // its entry. A history sync stores none of these messages, so no message is
+  // stored twice. A delete before the create is handled drops it: nothing is
+  // stored and nobody is woken. Any message's entry ends when its delete is
+  // handled, since a sync running then skips the message (noteLive) and a
+  // later one doesn't fetch it. An edit while it converts is folded into it.
+  // A create whose answer the framework fails to write or hold shows no row,
+  // and keeps its entry, and the sync off its message, until its delete is
+  // handled or the module stops.
   private readonly creating = new Map<string, LiveCreate>();
 
   // Typing keepalive: agentName -> { interval, deadline }. Started on
@@ -761,7 +763,8 @@ export class DiscordModule implements Module {
     // A stopped module answers nothing (stop()).
     if (!this.ctx) return {};
 
-    // Each Discord event ends the entries whose row the store shows now.
+    // Each Discord event ends the entries whose row a query shows now, stored
+    // or held.
     if (event.type.startsWith('discord:')) {
       for (const [id, live] of this.creating) if (live.phase === 'writing' && this.storedRow(id)) this.creating.delete(id);
     }
@@ -822,10 +825,10 @@ export class DiscordModule implements Module {
       const contentBlocks = msg.contentBlocks ?? textFirst(ownText(msg.content));
       this.noteLive(msg.discordMessageId);
 
-      // A message a history sync stored first keeps that row: the create adds
-      // none, and still sets the reply context and asks for inference, since
-      // the message arrived live. Either way the entry waits until a Discord
-      // event finds the message's row.
+      // A message a history sync wrote first, stored or held, keeps that row:
+      // the create adds none, and still sets the reply context and asks for
+      // inference, since the message arrived live. Either way the entry waits
+      // until a Discord event finds the message's row.
       const stored = this.storedRow(msg.discordMessageId);
       if (live) live.phase = 'writing';
 
@@ -853,18 +856,18 @@ export class DiscordModule implements Module {
     // Handle Discord message edit
     if (event.type === 'discord:edit') {
       const edit = event as DiscordEditEvent;
-      // The stored row, not only its id: an edit changes the message's own
+      // The message's row, not only its id: an edit changes the message's own
       // text and keeps what the host added beside it, but for the blocks of
       // attachments the edit took away, when the client passed the edit's
       // attachments and the row is text-first.
       // An edit that comes while the live path converts the message's create
       // is folded into that create (handleDiscordMessageEdit). Any other edit
-      // to a message nobody has stored is dropped: a history sync running
-      // now stores the text it fetched, and the next sync's text rule changes
-      // it. A row stored in shards can't be edited one shard at a time, so it
-      // keeps its text, and the host's log says so. Only an edit that writes
-      // marks the message live, so an update that changes nothing leaves a
-      // running sync free to rewrite the row.
+      // to a message with no row, stored or held, is dropped: a history sync
+      // running now stores the text it fetched, and the next sync's text rule
+      // changes it. A row stored in shards can't be edited one shard at a
+      // time, so it keeps its text, and the host's log says so. Only an edit
+      // that writes marks the message live, so an update that changes nothing
+      // leaves a running sync free to rewrite the row.
       const stored = this.storedRow(edit.discordMessageId);
       if (!stored) return {};
       if (stored.bodyGroupId) {
@@ -1064,7 +1067,8 @@ export class DiscordModule implements Module {
 
   /**
    * Sync history for a specific channel - compare with Context Manager and update.
-   * Uses queryMessages() to enumerate stored messages for proper edit/delete detection.
+   * Uses queryMessages() to enumerate the channel's rows, a held write's among
+   * them, for proper edit/delete detection.
    *
    * The live path can store, edit or remove a row whenever the sync awaits.
    * So the sync fetches history and runs the live conversion it needs first,
@@ -1220,7 +1224,8 @@ export class DiscordModule implements Module {
    *  edit replaces a row's own text and keeps what the host added beside it.
    *  Each id's rows are in store order. A message stored twice holds two,
    *  of which a sync acts on the first, as the live path does (storedRow),
-   *  and a delete takes both. */
+   *  and a delete takes both. A write the framework holds is a row too
+   *  (storedRows). */
   private storedByDiscordId(ctx: ModuleContext, channelId: string): Map<string, StoredMessage[]> {
     const rows = new Map<string, StoredMessage[]>();
     for (const msg of ctx.queryMessages({ source: 'discord', metadata: { channelId } }).messages) {
@@ -1234,14 +1239,17 @@ export class DiscordModule implements Module {
   }
 
   /** The stored rows of a Discord message, by its id in the row's metadata,
-   *  in store order. The module context's findMessageByExternalId holds only
-   *  rows the module stored through its context, not those a process response
-   *  added, so it misses what the live path stored. */
+   *  in store order. A write the framework holds comes after them as a held
+   *  row, which an edit or removal reaches as it does a stored one. The
+   *  module context's findMessageByExternalId holds only rows the module
+   *  stored through its context, not those a process response added, so it
+   *  misses what the live path stored. */
   private storedRows(discordMessageId: string): StoredMessage[] {
     return this.ctx?.queryMessages({ source: 'discord', externalIds: [discordMessageId] }).messages ?? [];
   }
 
-  /** The row an edit or a create acts on: a message's first stored row. */
+  /** The row an edit or a create acts on: a message's first row, a stored
+   *  one before a held one (storedRows). */
   private storedRow(discordMessageId: string): StoredMessage | undefined {
     return this.storedRows(discordMessageId)[0];
   }

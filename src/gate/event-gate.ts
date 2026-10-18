@@ -2003,10 +2003,9 @@ export class EventGate {
     // a turn whose exit didn't end it (a retry stop() cancelled, a successor
     // stop() refused) would make every debounced batch buffer until that
     // agent's next turn ended. A turn that continues after the start() takes
-    // its entry again (onInferenceResumed). A turn that a start() during the
-    // stop() began before this ran loses its entry too, and runs on without
-    // it, so debounced batches are delivered while it runs: nothing refuses
-    // a start() during a stop() yet.
+    // its entry again (onInferenceResumed). A start() made during the stop()
+    // is refused, so no turn of a new lifecycle can have begun before this
+    // runs.
     this.inferring.clear();
   }
 }

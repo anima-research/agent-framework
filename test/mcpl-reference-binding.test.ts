@@ -177,31 +177,35 @@ test("fetch_reference reaches a push event's reference through its server's own 
   const fetched = await fetchReference(own!.refId);
   assert.equal(fetched.success, true, fetched.error);
   assert.equal(dialed, 1);
+  // fetch_reference's sentence: the fetcher's clause, then what calling again can do.
+  const refusedWith = (refId: string, clause: string, remedy = "Calling again won't change that.") =>
+    `fetch_reference couldn't fetch "${refId}": ${clause}. ${remedy}`;
   const refused = await fetchReference(elsewhere!.refId);
   assert.equal(refused.success, false);
-  assert.match(refused.error ?? '', /third-party origin/);
+  assert.match(refused.error ?? '', /^fetch_reference couldn't fetch "ref_\S+": it points to \S+, not to the "\S+" server's own address /);
   const noAddress = await fetchReference(stdio!.refId);
   assert.equal(noAddress.success, false);
-  assert.equal(noAddress.error, noAddressReason('stdio-srv'));
+  assert.equal(noAddress.error, refusedWith(stdio!.refId, noAddressReason('stdio-srv')));
   const notDialed = await fetchReference(spawned!.refId);
   assert.equal(notDialed.success, false);
-  assert.equal(notDialed.error, noAddressReason('spawned-srv'));
+  assert.equal(notDialed.error, refusedWith(spawned!.refId, noAddressReason('spawned-srv')));
   const unknown = await fetchReference(gone!.refId);
   assert.equal(unknown.success, false);
-  assert.equal(unknown.error, 'unknown server: gone-srv');
+  assert.equal(unknown.error, refusedWith(gone!.refId, 'this host no longer has the "gone-srv" server it came from',
+    "Calling again won't change that unless whoever runs this host adds that server back."));
   assert.equal(dialed, 1, 'nothing dialed for the other four');
   const throughWebSocket = await fetchReference(wsCommand!.refId);
   assert.equal(throughWebSocket.success, true, throughWebSocket.error);
   assert.equal(dialed, 2);
   const spawnedByTransport = await fetchReference(stdioUrl!.refId);
   assert.equal(spawnedByTransport.success, false);
-  assert.equal(spawnedByTransport.error, noAddressReason('stdio-url-srv'));
+  assert.equal(spawnedByTransport.error, refusedWith(stdioUrl!.refId, noAddressReason('stdio-url-srv')));
   const undialable = await fetchReference(wsHttp!.refId);
   assert.equal(undialable.success, false);
-  assert.equal(undialable.error, noAddressReason('ws-http-srv'));
+  assert.equal(undialable.error, refusedWith(wsHttp!.refId, noAddressReason('ws-http-srv')));
   const fragment = await fetchReference(wsFragment!.refId);
   assert.equal(fragment.success, false);
-  assert.equal(fragment.error, noAddressReason('ws-fragment-srv'));
+  assert.equal(fragment.error, refusedWith(wsFragment!.refId, noAddressReason('ws-fragment-srv')));
   assert.equal(dialed, 2, 'nothing dialed for the last three');
 });
 

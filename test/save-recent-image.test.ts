@@ -582,7 +582,7 @@ describe('save_recent_image provenance (issue #104)', () => {
       const refused = await waitForToolResult(h.framework, 'call_save0');
       assert.strictEqual(refused.isError, true);
       assert.match(refused.content, new RegExp(`index 0 is a reference \\(${expired.refId}, image/png, from`));
-      assert.match(refused.content, /It can't be fetched either — expired\./);
+      assert.match(refused.content, /It can't be fetched either — the reference is expired\. Once a fresh reference to it arrives, fetching may work; until then, fetching it again won't\./);
       assert.ok(!refused.content.includes('fetch_reference'), refused.content);
       const keptRefusal = await waitForToolResult(h.framework, 'call_save1');
       assert.strictEqual(keptRefusal.isError, true);
@@ -628,7 +628,9 @@ describe('save_recent_image provenance (issue #104)', () => {
       const refused = await waitForToolResult(h.framework, 'call_save0');
       assert.strictEqual(refused.isError, true);
       assert.match(refused.content, new RegExp(`index 0 is a reference \\(${unbound.refId}, image/png, from`));
-      assert.ok(refused.content.includes(`It can't be fetched either — ${UNBOUND_REASON}.`), refused.content);
+      assert.ok(refused.content.includes(
+        `It can't be fetched either — it's ${UNBOUND_REASON}. Once a fresh reference to it arrives, fetching may work; until then, fetching it again won't.`,
+      ), refused.content);
       assert.ok(!refused.content.includes('fetch_reference'), refused.content);
       const boundRefusal = await waitForToolResult(h.framework, 'call_save1');
       assert.strictEqual(boundRefusal.isError, true);
@@ -682,13 +684,18 @@ describe('save_recent_image provenance (issue #104)', () => {
       },
     });
     try {
-      const budgetLasts = "the budget doesn't renew on its own, so calling again won't change that unless whoever runs this host raises or renews it";
+      // The fetcher's clause, then what calling again can do, as fetch_reference would say them.
+      const nothing = "Calling again won't change that.";
       const expected = [
-        ['call_save0', noAddress.refId, `It can't be fetched either — ${noAddressReason('stdio')}.`],
-        ['call_save1', offOrigin.refId, "It can't be fetched either — third-party origin (https://cdn.example.invalid != dialed https://example.invalid); not fetched by this host."],
-        ['call_save2', gone.refId, "It can't be fetched either — unknown server: gone."],
-        ['call_save3', big.refId, "It can't be fetched either — claimed 536870912 bytes exceeds fetch ceiling 268435456."],
-        ['call_save4', spent.refId, `It can't be fetched either — per-server fetch budget exhausted (0/0 bytes); ${budgetLasts}.`],
+        ['call_save0', noAddress.refId, `It can't be fetched either — ${noAddressReason('stdio')}. ${nothing}`],
+        ['call_save1', offOrigin.refId, "It can't be fetched either — it points to https://cdn.example.invalid, not to the \"vst\" server's own address "
+          + `(wss://example.invalid), and this host fetches only from the server itself. ${nothing}`],
+        ['call_save2', gone.refId, "It can't be fetched either — this host no longer has the \"gone\" server it came from. "
+          + "Calling again won't change that unless whoever runs this host adds that server back."],
+        ['call_save3', big.refId, "It can't be fetched either — it claims 536870912 bytes, over the 268435456 bytes this host fetches at most. "
+          + "No max_bytes or setting lifts that limit, so calling again won't change it."],
+        ['call_save4', spent.refId, "It can't be fetched either — this host's fetch budget for the \"spent\" server is used up (0 of 0 bytes). "
+          + "The budget doesn't renew on its own, so calling again won't change that unless whoever runs this host raises or renews it."],
       ] as const;
       for (const [call, refId, reason] of expected) {
         const refused = await waitForToolResult(h.framework, call);
@@ -1682,17 +1689,22 @@ describe('ToolImageLedger', () => {
     referenceRegistry.setServerAddress(longServer('stdio'), 'no-address', host);
     referenceRegistry.setServerAddress(longServer('elsewhere'), { url: 'wss://elsewhere.invalid' }, host);
     referenceRegistry.setServerAddress(longServer('dialed'), { url: 'wss://example.invalid' }, host);
+    referenceRegistry.setServerAddress(longServer('garbled'), { url: 'not a url' }, host);
     endings.push(
       ['no address', {}, longServer('stdio')],
       ['unknown server', {}, longServer('unknown')],
+      ['server address', {}, longServer('garbled')],
       ['third-party origin', {}, longServer('elsewhere')],
       ['scheme', { uri: `${'x'.repeat(400)}://example.invalid/sri-longest-scheme.png` }, longServer('dialed')],
+      ['user name or password', { uri: 'https://user:pass@example.invalid/sri-longest-userinfo.png' }, longServer('dialed')],
     );
     const reasons: Record<string, string> = {
-      'no address': '— no address: this host',
-      'unknown server': '— unknown server: unknown-s',
+      'no address': '— this host doesn\'t connect to the "stdio-s',
+      'unknown server': '— this host no longer has the "unknown-s',
+      'server address': '— the "garbled-s',
       'third-party origin': '— third-party origin:',
       scheme: '— scheme not allowed: this host fetches only',
+      'user name or password': '— its address carries a user name or password',
     };
     for (const [name, extra, serverId] of endings) {
       const stub = longestId(buildReferenceStub(testimony(name, extra), 'o'.repeat(400), serverId));

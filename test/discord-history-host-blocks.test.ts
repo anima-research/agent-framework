@@ -66,10 +66,12 @@ function row(id: string, content: Block[], textFirst: boolean, timestamp = 1_000
 
 /** `storeAdds`: the context's addMessage stores a row, as the store does,
  *  for tests where a later lookup must find what a sync added. `hold` and
- *  `land` play the framework's hold on a module's writes while the agent's
- *  turn is alive: between them, an add, a sync's or a live answer's, waits
- *  unseen by queryMessages, and `land` stores what waited, in order. Edits
- *  and removals act at once, on stored rows, as the framework's do. */
+ *  `land` play rows that don't show yet: between them, an add, a sync's or a
+ *  live answer's, waits unseen by queryMessages, and `land` stores what
+ *  waited, in order. The framework shows a write it holds as a held row,
+ *  which discord-held-writes.test.ts runs the module over, so these play
+ *  the rows of answers it hasn't written or held. Edits and removals act at
+ *  once, on stored rows, as the framework's do. */
 function setup(rows: Row[], client: Partial<DiscordClientInterface> = {}, { storeAdds = false } = {}) {
   const module = new DiscordModule({ sendTyping: async () => {}, ...client } as unknown as DiscordClientInterface, { token: 't', autoTyping: false });
   const harness = module as unknown as Harness;
@@ -661,11 +663,11 @@ test('a history sync stores nothing for a message whose live create is still con
   assert.deepEqual(rows.map((r) => [r.id, r.content]), [['stored-n2', [text('with a file'), fileBlock]]]);
 });
 
-test('a history sync stores nothing for a message whose row the framework holds, through later Discord events, and the record lets it go once the row is stored', async () => {
+test('a history sync stores nothing for a message whose row doesn\'t show yet, through later Discord events, and the record lets it go once the row shows', async () => {
   const rows: Row[] = [];
   let fetched: HistoryMessage[] = [];
   const { harness, events, apply, hold, land } = setup(rows, { fetchHistory: async () => fetched }, { storeAdds: true });
-  // The agent's turn is alive: the framework holds each answer's row.
+  // Each answer's row doesn't show yet.
   hold();
   await harness.handleDiscordMessage(live('n3', 'late'));
   await harness.handleDiscordMessage(live('n4', 'later'));
@@ -679,7 +681,7 @@ test('a history sync stores nothing for a message whose row the framework holds,
   assert.equal(harness.creating.size, 0);
 });
 
-test('a create a delete dropped keeps a history sync from storing its message until that delete is handled, though another Discord event comes first and the framework holds writes', async (t) => {
+test('a create a delete dropped keeps a history sync from storing its message until that delete is handled, though another Discord event comes first and its row doesn\'t show yet', async (t) => {
   const rows: Row[] = [];
   const release = heldFetch(t);
   const { harness, events, apply, hold, land } = setup(rows, { fetchHistory: async () => [history('x6', 'withdrawn', 1_000, [])] }, { storeAdds: true });

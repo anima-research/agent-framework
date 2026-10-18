@@ -233,11 +233,12 @@ export const EXPIRY_REASON = {
 export const UNBOUND_REASON = "not tied to any server, so there's nowhere to fetch it from";
 
 /** The refusal for a server the host has no address to dial, one it doesn't
- *  connect to over a network, such as a stdio server: the fetcher dials only
- *  through a server's address. A reference's stub, fetch_reference and
- *  save_recent_image all give it (dialCheck). */
+ *  connect to over a network, such as a stdio server, as a clause that
+ *  completes "couldn't fetch <ref>: " and says so of the server: the fetcher
+ *  dials only through a server's address. A reference's stub, fetch_reference
+ *  and save_recent_image all give it (dialCheck). */
 export function noAddressReason(serverId: string): string {
-  return `no address: this host doesn't connect to server ${serverId} over a network, so there's nowhere to fetch it from`;
+  return `this host doesn't connect to the "${serverId}" server over a network, so there's nowhere to fetch it from`;
 }
 
 /** A server's id as the agent reads it in a stub or a refusal: as a label
@@ -327,16 +328,32 @@ export function uriMayCarryCredential(uri: string): boolean {
  *  configs, beside each server's credential. */
 export type ServerAddress = { url: string } | 'no-address';
 
-/** Why a fetch of a reference would be refused before it dials. `ofReference`
- *  marks one of the reference's own phrases (unbound, expired), which
- *  fetch_reference words as "reference <reason>"; it gives the others as
- *  they are. `inStub`, where it's set, is how the reference's stub words it,
- *  without the parts of the uri the stub never shows. */
+/** Why a fetch of a reference failed, or would be refused before it dials. */
 export interface Refusal {
-  reason: string;
-  ofReference: boolean;
+  /** What happened, as a clause that completes "couldn't fetch <ref>: ",
+   *  whatever it's about: fetch_reference's sentence, save_recent_image's,
+   *  and the eager and script-demand fetches' log lines read it. */
+  error: string;
+  /** What calling again can do, as a sentence. fetch_reference and
+   *  save_recent_image show it; the eager and script-demand fetches log the
+   *  error alone, and a reference's stub never shows it. */
+  remedy: string;
+  /** How the reference's stub words it, where the clause names parts of the
+   *  uri the stub never shows. A stub shows this or the clause. */
   inStub?: string;
 }
+
+// What calling again can do, for the refusals a reference's stub shares with
+// a fetch; the fetcher has these and its own. None names a tool: a fetch
+// doesn't know where its reference came from.
+export const NOTHING_TO_DO = "Calling again won't change that.";
+/** The registry keys a record by its uri, so a fresh reference to the same
+ *  uri arrives as this very id and refreshes its record. */
+export const FRESH_REFERENCE = "Once a fresh reference to it arrives, fetching may work; until then, fetching it again won't.";
+/** A server's address is read from the host's configs as they are at each
+ *  fetch. */
+export const SERVER_BACK = "Calling again won't change that unless whoever runs this host adds that server back.";
+const SERVER_ADDRESS = "Calling again won't change that unless whoever runs this host corrects the server's address.";
 
 /** ws→http / wss→https with default ports elided, for origin comparison. */
 export function normalizedOrigin(url: string): string | null {
@@ -351,42 +368,57 @@ export function normalizedOrigin(url: string): string | null {
   }
 }
 
-/** Whether two urls that parse name one host and port as written: the same
- *  port, or neither giving one (`http://h` and `wss://h`, the same site over
- *  plaintext), or one giving the other's default (`http://h:443` and
- *  `wss://h`). */
-function samePlace(a: string, b: string): boolean {
-  const x = new URL(a);
-  const y = new URL(b);
-  const port = (u: URL) => u.port || (u.protocol === 'https:' || u.protocol === 'wss:' ? '443' : '80');
-  return x.hostname.toLowerCase() === y.hostname.toLowerCase() && (x.port === y.port || port(x) === port(y));
+/** A server's address as it's configured, its scheme and host, for a
+ *  clause: never its userinfo, path or query. URL's own origin is 'null' for
+ *  a scheme that isn't special, which normalizedOrigin accepts. The caller
+ *  has already parsed it. */
+function configuredOrigin(url: string): string {
+  const u = new URL(url);
+  return `${u.protocol}//${u.host}`;
 }
 
 /** The §6.1/§7.1 policy check of a uri against the url a server is dialed
  *  at: null where a fetch through that server may fetch it. */
-function originRefusal(uri: string, serverUrl: string): Refusal | null {
+function originRefusal(uri: string, serverUrl: string, serverId: string): Refusal | null {
   const refOrigin = normalizedOrigin(uri);
+  if (!refOrigin) return { error: "its address doesn't parse as a URL", remedy: NOTHING_TO_DO };
+  // A server's address that doesn't parse leaves nothing to dial. The
+  // framework's resolver gives only an address its transport dials, so this
+  // guards other resolvers.
   const dialedOrigin = normalizedOrigin(serverUrl);
-  if (!refOrigin) return { reason: 'reference uri does not parse', ofReference: false };
-  if (!dialedOrigin) return { reason: 'server url does not parse', ofReference: false };
-  const scheme = refOrigin.split('//')[0];
+  if (!dialedOrigin) {
+    return {
+      error: `the "${shownServerId(serverId)}" server's address doesn't parse as a URL, so there's nowhere to fetch it from`,
+      remedy: SERVER_ADDRESS,
+    };
+  }
+  const refUrl = new URL(uri);
+  // A user name or password in the uri is a credential embedded in it,
+  // which RFC-005 §6.1 forbids a server to mint and lets a host refuse
+  // (vector 6). This host neither sends nor repeats it: fetch refuses such
+  // a url with a message that holds it whole.
+  if (refUrl.username !== '' || refUrl.password !== '') {
+    return { error: "its address carries a user name or password, which this host doesn't send", remedy: NOTHING_TO_DO };
+  }
+  // The uri's own scheme, not its origin's: an origin reads ws: as http:
+  // and wss: as https:, and fetch refuses a ws: or wss: uri ('unknown
+  // scheme') before connecting, which would read as a failed request a
+  // later try can mend.
+  const scheme = refUrl.protocol;
   if (scheme !== 'https:' && scheme !== 'http:') {
     return {
-      reason: `scheme not allowed: ${sanitizeLabel(scheme, STUB_FIELD_CHARS)}`,
-      ofReference: false,
+      error: `its address uses ${sanitizeLabel(scheme, STUB_FIELD_CHARS)}, and this host fetches only http: and https: addresses`,
+      remedy: NOTHING_TO_DO,
       inStub: 'scheme not allowed: this host fetches only http and https uris',
     };
   }
-  // An http uri on the host of a server dialed over a secure connection, on
-  // the same port or each on its scheme's default, before the origins are
-  // compared, which would call it a third party's.
-  if (scheme === 'http:' && dialedOrigin.startsWith('https:') && samePlace(uri, serverUrl)) {
-    return { reason: 'plaintext reference from a secure origin', ofReference: false };
-  }
+  // Origins compare with their schemes, so this also refuses an http:
+  // reference from a server dialed over TLS (wss://).
   if (refOrigin !== dialedOrigin) {
     return {
-      reason: `third-party origin (${refOrigin} != dialed ${dialedOrigin}); not fetched by this host`,
-      ofReference: false,
+      error: `it points to ${refOrigin}, not to the "${shownServerId(serverId)}" server's own address (${configuredOrigin(serverUrl)}), ` +
+        'and this host fetches only from the server itself',
+      remedy: NOTHING_TO_DO,
       inStub: "third-party origin: it isn't on its server's own address, so this host doesn't fetch it",
     };
   }
@@ -398,7 +430,7 @@ function originRefusal(uri: string, serverUrl: string): Refusal | null {
  * they delivered it, the first whose address is on the uri's origin (§6.2).
  * When none is, the first server's refusal (unknown to this host, with no
  * address, or the origin check's), and for a record no server delivered,
- * that it's unbound.
+ * that it's unbound, which a later delivery of the uri by a server mends.
  */
 export function dialServer(
   record: ReferenceRecord,
@@ -408,13 +440,12 @@ export function dialServer(
   let dialed: string | undefined;
   for (const serverId of record.serverIds) {
     const address = addressOf(serverId);
-    const shownId = shownServerId(serverId);
     if (address === undefined) {
-      refusal ??= { reason: `unknown server: ${shownId}`, ofReference: false };
+      refusal ??= { error: `this host no longer has the "${shownServerId(serverId)}" server it came from`, remedy: SERVER_BACK };
     } else if (address === 'no-address') {
-      refusal ??= { reason: noAddressReason(shownId), ofReference: false };
+      refusal ??= { error: noAddressReason(shownServerId(serverId)), remedy: NOTHING_TO_DO };
     } else {
-      const offOrigin = originRefusal(record.testimony.uri, address.url);
+      const offOrigin = originRefusal(record.testimony.uri, address.url, serverId);
       if (offOrigin === null) {
         dialed = serverId;
         break;
@@ -422,7 +453,9 @@ export function dialServer(
       refusal ??= offOrigin;
     }
   }
-  return dialed === undefined ? { refusal: refusal ?? { reason: UNBOUND_REASON, ofReference: true } } : { serverId: dialed };
+  return dialed === undefined
+    ? { refusal: refusal ?? { error: `it's ${UNBOUND_REASON}`, remedy: FRESH_REFERENCE } }
+    : { serverId: dialed };
 }
 
 /**
@@ -445,7 +478,7 @@ export function dialCheck(
   const server = dialServer(record, addressOf);
   if ('refusal' in server) return server;
   const expiry = referenceExpiry(record.testimony, nowMs);
-  return expiry ? { refusal: { reason: EXPIRY_REASON[expiry], ofReference: true } } : server;
+  return expiry ? { refusal: { error: `the reference is ${EXPIRY_REASON[expiry]}`, remedy: FRESH_REFERENCE } } : server;
 }
 
 /** Strip control characters (C0, DEL, C1), every bidi control (marks,
@@ -716,7 +749,7 @@ function unfetchedLinkText(t: ReferenceTestimony, uri: string): string {
 export function unfetchableReason(record: ReferenceRecord, nowMs = Date.now()): string | null {
   if (record.fetchedPath) return null;
   const dial = dialCheck(record, (serverId) => referenceRegistry.serverAddress(serverId), nowMs);
-  return 'refusal' in dial ? dial.refusal.inStub ?? dial.refusal.reason : null;
+  return 'refusal' in dial ? dial.refusal.inStub ?? dial.refusal.error : null;
 }
 
 /**

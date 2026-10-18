@@ -781,7 +781,8 @@ describe('runEphemeralToCompletion settle signal', () => {
       const { agent, contextManager } = await createEphemeral(framework, 'worker');
       const result = await runStartedEphemeral(framework, agent, contextManager);
       assert.strictEqual(result.speech, 'Done.');
-      assert.deepStrictEqual(returned, [''], 'deferred: the run was waiting on its tool');
+      assert.strictEqual(returned.length, 1);
+      assert.match(returned[0]!, /^held:./, "deferred: the run was waiting on its tool, so the module's context answers the held write's handle");
       assert.strictEqual(framework.getAgent(agent.name), null, 'deregistered');
       const stored = contextManager.getAllMessages().map((m) =>
         `${m.participant}: ${m.content.map((b) => (b.type === 'text' ? (b as { text: string }).text : `<${b.type}>`)).join(' ')}`);

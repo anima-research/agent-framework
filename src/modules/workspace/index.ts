@@ -40,7 +40,7 @@ import { MountWatcher, type FsChange } from './watcher.js';
 import { hashContent, DEFAULT_MAX_FILE_SIZE } from './sync.js';
 import { DiskAgreement, sameRootIdentity } from './disk-agreement.js';
 import { BranchIntents } from './branch-intent.js';
-import { IGNORED, NONBLOCK, OTHER_MOUNT, checkDir, filesystemTrustsCtime, inOtherMount, linkLeads, linkOnTheWay, linkRefusal, linkWords, locateRoot, nestedHolder, passedOverAt, readPrefix, type LinkFound } from './observe.js';
+import { IGNORED, NONBLOCK, OTHER_MOUNT, checkDir, diskSpelling, filesystemTrustsCtime, inOtherMount, linkLeads, linkOnTheWay, linkRefusal, linkWords, locateRoot, nestedHolder, passedOverAt, readPrefix, type LinkFound } from './observe.js';
 import { TOOL_BATCH_HOOK_TIMEOUT_MS, ensureStateRegistered } from '../../module-registry.js';
 import {
   type MountRuntime,
@@ -715,6 +715,8 @@ export class WorkspaceModule implements Module {
   private store: JsStore | null = null;
   /** Set once stop has drained and saved, cleared by start (running()). */
   private stopped = false;
+  /** Stops begun, so a start that read disk meanwhile can tell that one came. */
+  private stopsBegun = 0;
   private config: WorkspaceConfig;
   private mounts = new Map<string, MountState>();
   private watchers = new Map<string, MountWatcher>();
@@ -730,10 +732,12 @@ export class WorkspaceModule implements Module {
   /** Per canonical root: the device of its filesystem when that maintains ctime, else null. */
   private ctimeTrust = new Map<string, string | null>();
   /**
-   * Each mount's directories that are other mounts nested inside it:
-   * mount-relative, `/`-separated, with each mount's name and resolved root.
+   * Each mount's directories that are other mounts nested inside it, with
+   * each mount's name, in each spelling that names the directory: as
+   * configured, and as disk spells it where that differs (spellNestedDirs).
+   * Each spelling is mount-relative and `/`-separated, with its resolved root.
    */
-  private otherMounts = new Map<string, Array<{ dir: string; name: string; root: string }>>();
+  private otherMounts = new Map<string, Array<{ name: string; spellings: Array<{ dir: string; root: string }> }>>();
   /**
    * Whether a file's mode is observed, taken in and applied (MountRuntime's
    * `modesObserved`): not on Windows, which reports no POSIX modes. A test
@@ -777,7 +781,7 @@ export class WorkspaceModule implements Module {
           // directory, read against `/`-separated paths, whatever the
           // platform's.
           const relPath = rel.split(sep).join('/');
-          this.otherMounts.set(outer.name, [...(this.otherMounts.get(outer.name) ?? []), { dir: relPath, name: inner.name, root: innerPath }]);
+          this.otherMounts.set(outer.name, [...(this.otherMounts.get(outer.name) ?? []), { name: inner.name, spellings: [{ dir: relPath, root: innerPath }] }]);
           console.warn(
             `[workspace] Mount "${outer.name}" contains mount "${inner.name}" ` +
             `at ${relPath}/ — passing over it as another mount's directory`,
@@ -903,7 +907,7 @@ export class WorkspaceModule implements Module {
   }
 
   /**
-   * Where a search's walk starts: `base`, its path as given, then each
+   * Where a search's walk starts: `base`, its path as disk spells it, then each
    * segment of `beneath` while disk lists it, in the directory reached so
    * far, as a directory with exactly that spelling. The walk names what it
    * finds from its start's spelling, and a case-insensitive disk would let
@@ -958,6 +962,14 @@ export class WorkspaceModule implements Module {
   }
 
   async start(ctx: ModuleContext): Promise<void> {
+    // Each nested mount's directory as disk spells it, read before this start
+    // sets anything, so a restart takes no call and walks or watches nothing
+    // before the spellings are known. A stop begun meanwhile stands, and this
+    // start then sets nothing.
+    const stops = this.stopsBegun;
+    await this.spellNestedDirs();
+    if (this.stopsBegun !== stops) return;
+
     this.ctx = ctx;
     this.stopped = false;
 
@@ -1209,6 +1221,7 @@ export class WorkspaceModule implements Module {
   }
 
   async stop(): Promise<void> {
+    this.stopsBegun++;
     // No new watcher-driven passes, then let every pass and write finish
     // before the store goes away — including any queued behind the ones in
     // flight (a tool call, a scan continuing past its deadline): drained
@@ -1219,11 +1232,13 @@ export class WorkspaceModule implements Module {
     for (const watcher of stopping) {
       await watcher.stop();
     }
+    // A call under way can await disk (parsePath) before it takes its turn,
+    // so the calls are waited for as well as the turns.
     for (;;) {
       const tails = [...this.mountTurns.values()];
-      await Promise.all(tails);
+      await Promise.allSettled([...this.callsUnderWay, ...tails]);
       const now = [...this.mountTurns.values()];
-      if (now.length === tails.length && now.every((tail, i) => tail === tails[i])) break;
+      if (this.callsUnderWay.size === 0 && now.length === tails.length && now.every((tail, i) => tail === tails[i])) break;
     }
     // Nothing is queued now, and nothing more is taken: what follows saves
     // the pins and watermarks as the last work left them.
@@ -1501,6 +1516,25 @@ export class WorkspaceModule implements Module {
 
   async handleToolCall(call: ToolCall): Promise<ToolResult> {
     if (!this.running()) return { success: false, isError: true, error: NOT_RUNNING };
+    return this.underWay(this.runToolCall(call));
+  }
+
+  /**
+   * Tool calls, and the public reads and writes that take a mount's turn,
+   * under way. Each can await disk (parsePath) before it takes its turn, so
+   * stop waits for these as well as for the turns.
+   */
+  private callsUnderWay = new Set<Promise<unknown>>();
+
+  /** `work`, recorded as under way until it settles (callsUnderWay). */
+  private underWay<T>(work: Promise<T>): Promise<T> {
+    this.callsUnderWay.add(work);
+    const done = (): void => { this.callsUnderWay.delete(work); };
+    work.then(done, done);
+    return work;
+  }
+
+  private async runToolCall(call: ToolCall): Promise<ToolResult> {
     try {
       // Every handler reads its input as its schema describes it; a call
       // that sends something else is refused here, before anything is read.
@@ -1624,7 +1658,10 @@ export class WorkspaceModule implements Module {
    */
   resolveAbsolutePath(mountPrefixedPath: string): string | null {
     try {
-      const { mount, relativePath } = this.parseFilePath(mountPrefixedPath);
+      // Synchronous, so the path as given: it reaches the same file, and
+      // the nested-mount check matches it as configured or as disk spells
+      // the nested mount's directory (spellNestedDirs).
+      const { mount, relativePath } = this.refuseNested({ ...this.parsePathAsGiven(mountPrefixedPath), path: mountPrefixedPath });
       return resolve(mount.config.path, relativePath);
     } catch {
       return null;
@@ -1659,10 +1696,19 @@ export class WorkspaceModule implements Module {
     options: { branch?: string } = {},
   ): Promise<ToolResult> {
     if (!this.running()) return { success: false, isError: true, error: NOT_RUNNING };
+    return this.underWay(this.writeBinaryUnderWay(mountPrefixedPath, data, mimeType, options));
+  }
+
+  private async writeBinaryUnderWay(
+    mountPrefixedPath: string,
+    data: Buffer,
+    mimeType: string,
+    options: { branch?: string },
+  ): Promise<ToolResult> {
     let mount: MountState;
     let relativePath: string;
     try {
-      ({ mount, relativePath } = this.parseFilePath(mountPrefixedPath));
+      ({ mount, relativePath, path: mountPrefixedPath } = await this.parseFilePath(mountPrefixedPath));
     } catch (error) {
       return {
         success: false,
@@ -1723,10 +1769,16 @@ export class WorkspaceModule implements Module {
     mountPrefixedPath: string,
   ): Promise<{ data: Buffer } | { error: string }> {
     if (!this.running()) return { error: NOT_RUNNING };
+    return this.underWay(this.readBinaryUnderWay(mountPrefixedPath));
+  }
+
+  private async readBinaryUnderWay(
+    mountPrefixedPath: string,
+  ): Promise<{ data: Buffer } | { error: string }> {
     let mount: MountState;
     let relativePath: string;
     try {
-      ({ mount, relativePath } = this.parseFilePath(mountPrefixedPath));
+      ({ mount, relativePath, path: mountPrefixedPath } = await this.parseFilePath(mountPrefixedPath));
     } catch (error) {
       return { error: error instanceof Error ? error.message : String(error) };
     }
@@ -1766,7 +1818,7 @@ export class WorkspaceModule implements Module {
     let mount: MountState;
     let relativePath: string;
     try {
-      ({ mount, relativePath } = this.parseFilePath(mountPrefixedPath));
+      ({ mount, relativePath, path: mountPrefixedPath } = await this.parseFilePath(mountPrefixedPath));
     } catch (error) {
       return { error: error instanceof Error ? error.message : String(error) };
     }
@@ -1798,14 +1850,35 @@ export class WorkspaceModule implements Module {
     }
   }
 
-  /** The directories of the mounts nested inside a mount, mount-relative. */
+  /** The directories of the mounts nested inside a mount, mount-relative, in each spelling. */
   private othersOf(mountName: string): string[] {
-    return (this.otherMounts.get(mountName) ?? []).map((o) => o.dir);
+    return (this.otherMounts.get(mountName) ?? []).flatMap((o) => o.spellings.map((s) => s.dir));
   }
 
-  /** The mounts nested in `mountName`, by directory and name (MountView's `nested`). */
+  /**
+   * Adds to each nested mount's directory the spelling disk lists it by,
+   * where that differs from the configuration's. On a disk that folds names,
+   * the outer mount's walks name the directory as disk does, and so does a
+   * path parsePath has respelled, while a path given as configured
+   * still names it as configured (resolveAbsolutePath). A directory not on
+   * disk keeps its configured spelling alone. Run at each start.
+   */
+  private async spellNestedDirs(): Promise<void> {
+    for (const [outerName, nested] of this.otherMounts) {
+      const outer = this.config.mounts.find((m) => m.name === outerName);
+      if (!outer) continue;
+      const outerRoot = resolve(outer.path);
+      for (const entry of nested) {
+        const configured = entry.spellings[0]!;
+        const dir = await diskSpelling(outerRoot, configured.dir);
+        entry.spellings = dir === configured.dir ? [configured] : [configured, { dir, root: join(outerRoot, ...dir.split('/')) }];
+      }
+    }
+  }
+
+  /** The mounts nested in `mountName`, by directory and name (MountView's `nested`), in each spelling known. */
   private nestedOf(mountName: string): { dir: string; name: string }[] {
-    return (this.otherMounts.get(mountName) ?? []).map(({ dir, name }) => ({ dir, name }));
+    return (this.otherMounts.get(mountName) ?? []).flatMap((o) => o.spellings.map((s) => ({ dir: s.dir, name: o.name })));
   }
 
   /**
@@ -1820,7 +1893,7 @@ export class WorkspaceModule implements Module {
     if (!mount) return undefined;
     const resolved = resolve(mount.config.path, relativePath);
     const holder = (this.otherMounts.get(mountName) ?? [])
-      .filter((o) => isContainedPath(o.root, resolved))
+      .flatMap((o) => o.spellings.filter((s) => isContainedPath(s.root, resolved)).map((s) => ({ name: o.name, root: s.root })))
       .sort((a, b) => b.root.length - a.root.length)[0];
     if (!holder) return undefined;
     const rest = relative(holder.root, resolved).split(sep).join('/');
@@ -1847,17 +1920,40 @@ export class WorkspaceModule implements Module {
    * observe it and its pushes don't write it, so its file operations refuse
    * it, naming the innermost mount that holds it and the path to use there.
    */
-  private parseFilePath(path: string): { mount: MountState; relativePath: string } {
-    const parsed = this.parsePath(path);
+  private async parseFilePath(path: string): Promise<{ mount: MountState; relativePath: string; path: string }> {
+    return this.refuseNested(await this.parsePath(path));
+  }
+
+  /** A parsed path, refused if it lies in a nested mount's directory (parseFilePath). */
+  private refuseNested<P extends { mount: MountState; relativePath: string; path: string }>(parsed: P): P {
     const holder = this.holderOf(parsed.mount.config.name, parsed.relativePath);
-    if (holder) throw new NestedMountError(path, parsed.mount.config.name, holder.name, holder.use);
+    if (holder) throw new NestedMountError(parsed.path, parsed.mount.config.name, holder.name, holder.use);
     return parsed;
   }
 
   /**
-   * Parse a mount-prefixed path into (mountName, relativePath).
+   * Parse a mount-prefixed path into its mount and mount-relative path, as
+   * disk spells it (diskSpelling), with `path` the mount-prefixed path so
+   * spelled. On a disk that folds names, a path spelled otherwise reaches
+   * disk's file, so every tool takes it by disk's name: one name per file,
+   * and the names its answers give are disk's. A handler that must read
+   * something at the moment it's asked, as handleSync reads the branch a path
+   * sync adopts on, reads it before calling this, since this awaits disk.
    */
-  private parsePath(path: string): { mount: MountState; relativePath: string } {
+  private async parsePath(path: string): Promise<{ mount: MountState; relativePath: string; path: string }> {
+    const given = this.parsePathAsGiven(path);
+    const relativePath = await diskSpelling(resolve(given.mount.config.path), given.relativePath);
+    return {
+      mount: given.mount,
+      relativePath,
+      path: relativePath === given.relativePath ? path : `${given.mount.config.name}/${relativePath}`,
+    };
+  }
+
+  /**
+   * Parse a mount-prefixed path into (mountName, relativePath), as spelled.
+   */
+  private parsePathAsGiven(path: string): { mount: MountState; relativePath: string } {
     // A file's name on disk is UTF-8, which can't hold a lone surrogate: the
     // store would keep one name and disk another.
     if (LONE_SURROGATE.test(path)) {
@@ -2140,7 +2236,7 @@ export class WorkspaceModule implements Module {
     let mount: MountState;
     let relativePath: string;
     try {
-      ({ mount, relativePath } = this.parseFilePath(mountPrefixedPath));
+      ({ mount, relativePath, path: mountPrefixedPath } = await this.parseFilePath(mountPrefixedPath));
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       const code: WorkspaceReadErrorCode = err instanceof NestedMountError ? 'other_mount'
@@ -2446,7 +2542,8 @@ export class WorkspaceModule implements Module {
     }
     let content = generatedContent;
     if (content === undefined) {
-      const { mount, relativePath } = this.parseFilePath(input.path);
+      const { mount, relativePath, path } = await this.parseFilePath(input.path);
+      input = { ...input, path };
       const store = this.getStore();
       const found = await this.withMount(mount, async (): Promise<{ text: string } | { error: string }> => {
         const report = await this.ensureSynced(mount, relativePath);
@@ -2534,7 +2631,9 @@ export class WorkspaceModule implements Module {
     let mount: MountState;
     let relativePath: string;
     try {
-      ({ mount, relativePath } = this.parseFilePath(input.path));
+      let path: string;
+      ({ mount, relativePath, path } = await this.parseFilePath(input.path));
+      input = { ...input, path };
     } catch (err) {
       return {
         success: false,
@@ -2606,7 +2705,8 @@ export class WorkspaceModule implements Module {
     if (LONE_SURROGATE.test(input.content)) {
       return { success: false, isError: true, error: 'The write did nothing: "content" holds a lone UTF-16 surrogate, which UTF-8 can\'t store.' };
     }
-    const { mount, relativePath } = this.parseFilePath(input.path);
+    const { mount, relativePath, path } = await this.parseFilePath(input.path);
+    input = { ...input, path };
     if (mount.config.mode === 'read-only') {
       return { success: false, error: `Mount "${mount.config.name}" is read-only`, isError: true };
     }
@@ -2651,7 +2751,8 @@ export class WorkspaceModule implements Module {
         return { success: false, isError: true, error: `The edit did nothing: "${field}" holds a lone UTF-16 surrogate, which UTF-8 can't store.` };
       }
     }
-    const { mount, relativePath } = this.parseFilePath(input.path);
+    const { mount, relativePath, path } = await this.parseFilePath(input.path);
+    input = { ...input, path };
     if (mount.config.mode === 'read-only') {
       return { success: false, error: `Mount "${mount.config.name}" is read-only`, isError: true };
     }
@@ -2795,7 +2896,8 @@ export class WorkspaceModule implements Module {
   }
 
   private async handleDelete(input: DeleteInput): Promise<ToolResult> {
-    const { mount, relativePath } = this.parseFilePath(input.path);
+    const { mount, relativePath, path } = await this.parseFilePath(input.path);
+    input = { ...input, path };
     if (mount.config.mode === 'read-only') {
       return { success: false, error: `Mount "${mount.config.name}" is read-only`, isError: true };
     }
@@ -2842,7 +2944,8 @@ export class WorkspaceModule implements Module {
       return { success: true, data: { mounts } };
     }
 
-    const { mount, relativePath } = this.parsePath(input.path);
+    const { mount, relativePath, path } = await this.parsePath(input.path);
+    input = { ...input, path };
     const recursive = input.recursive === true;
 
     // Every listing checks the paths it shows against disk first, under the
@@ -2895,7 +2998,7 @@ export class WorkspaceModule implements Module {
 
     // Search across mounts
     const mountsToSearch = input.path
-      ? [this.parsePath(input.path)]
+      ? [await this.parsePath(input.path)]
       : [...this.mounts.values()].map(m => ({ mount: m, relativePath: '' }));
 
     // Every match lies beneath the pattern's literal directory, so the walk
@@ -2947,7 +3050,7 @@ export class WorkspaceModule implements Module {
     const contextAfter = input.contextAfter ?? 0;
 
     const mountsToSearch = input.path
-      ? [this.parsePath(input.path)]
+      ? [await this.parsePath(input.path)]
       : [...this.mounts.values()].map(m => ({ mount: m, relativePath: '' }));
 
     type GrepMatch = { line: number; text: string; context?: string[] };
@@ -3212,7 +3315,7 @@ export class WorkspaceModule implements Module {
     const modesKept: Array<{ mount: string; path: string; reason: string }> = [];
 
     let explicit: { mount: MountState; relativePath: string } | null = null;
-    if (input.path) explicit = this.parsePath(input.path);
+    if (input.path) explicit = await this.parsePath(input.path);
 
     let mountsToMaterialize: Array<{ name: string; mount: MountState }>;
     if (explicit) {
@@ -3398,7 +3501,7 @@ export class WorkspaceModule implements Module {
     // A path names its own mount; otherwise the given mount, or every mount.
     let targets: Array<{ name: string; mount: MountState; relativePath: string }>;
     if (input.path) {
-      const { mount, relativePath } = this.parsePath(input.path);
+      const { mount, relativePath } = await this.parsePath(input.path);
       targets = [{ name: mount.config.name, mount, relativePath }];
     } else if (input.mount) {
       const m = this.mounts.get(input.mount);
