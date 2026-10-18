@@ -7,7 +7,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert';
 import { tmpdir } from 'node:os';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { existsSync, mkdtempSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 
 import { WebSocketServer } from 'ws';
@@ -126,6 +126,87 @@ test('connectMcplServer rejects a duplicate id and a colliding prefix', async ()
     await assert.rejects(
       framework.connectMcplServer(serverConfig('second', { toolPrefix: 'mcpl--first' })),
       /collides with server "first"/,
+    );
+  });
+});
+
+test('create() refuses a boolean setting that holds anything but true or false, before it spawns any server', async () => {
+  const tempDir = mkdtempSync(join(tmpdir(), 'mcpl-lifecycle-'));
+  const marker = join(tempDir, 'spawned');
+  // A valid server listed first writes a marker when it starts, so a refusal
+  // that came after anything was spawned leaves the marker. Both servers
+  // exit as soon as they start, so a spawn that shouldn't have happened
+  // leaves no child holding the test open.
+  const early = { id: 'early', command: process.execPath, args: ['-e', `require('node:fs').writeFileSync(${JSON.stringify(marker)}, '')`] };
+  const refused = (extra: Record<string, unknown>) => ({ id: 'quoted', command: process.execPath, args: ['-e', ''], ...extra });
+  const cases: Array<[string, Record<string, unknown>, string]> = [
+    ['inheritEnv', { inheritEnv: 'false' }, 'true or false, unquoted, not a string'],
+    ['reconnect', { reconnect: 'true' }, 'true or false, unquoted, not a string'],
+    ['allowHostCommands', { allowHostCommands: 1 }, 'true or false, not a number'],
+  ];
+  try {
+    for (const [setting, extra, wanted] of cases) {
+      const created = AgentFramework.create({
+        storePath: join(tempDir, `test-${setting}.chronicle`),
+        membrane: new MockMembrane().asMembrane(),
+        agents: [{ name: 'assistant', model: 'test-model', systemPrompt: 'test' }],
+        modules: [],
+        mcplServers: [early, refused(extra)] as never,
+      });
+      // A framework created anyway is stopped, so the failure is this
+      // assertion rather than a file held open by its server.
+      await assert.rejects(
+        created.then(async (framework) => { await framework.stop(); return framework; }),
+        new RegExp(`MCPL server "quoted" ${setting} must be ${wanted}: `),
+      );
+      assert.equal(existsSync(marker), false, `no server was spawned before ${setting} was refused`);
+    }
+  } finally {
+    rmSync(tempDir, { recursive: true, force: true });
+  }
+});
+
+test('connectMcplServer refuses a boolean setting that holds anything but true or false, and registers nothing', async () => {
+  await withFramework(true, async (framework) => {
+    for (const [setting, value] of [['inheritEnv', 'false'], ['reconnect', 'false'], ['allowHostCommands', 'true']]) {
+      await assert.rejects(
+        framework.connectMcplServer(serverConfig('second', { [setting]: value }) as never),
+        new RegExp(`MCPL server "second" ${setting} must be true or false, unquoted, not a string: `),
+      );
+    }
+    assert.deepEqual(framework.listMcplServers().map(s => s.id), ['first']);
+  });
+});
+
+test('restartMcplServer refuses such a setting before it disconnects the running server, which stays up', async () => {
+  await withFramework(true, async (framework) => {
+    for (const [setting, value] of [['inheritEnv', 'true'], ['reconnect', 'true'], ['allowHostCommands', 'false']]) {
+      await assert.rejects(
+        framework.restartMcplServer('first', serverConfig('first', { [setting]: value }) as never),
+        new RegExp(`MCPL server "first" ${setting} must be true or false, unquoted, not a string: `),
+      );
+      const servers = framework.listMcplServers();
+      assert.equal(servers.length, 1);
+      assert.equal(servers[0].connected, true, `the running server stays connected after ${setting} was refused`);
+    }
+  });
+});
+
+test('restartMcplServer given no config checks the stored one, before it disconnects the running server', async () => {
+  await withFramework(false, async (framework) => {
+    const config: Record<string, unknown> = serverConfig('stored');
+    await framework.connectMcplServer(config as never);
+    // The framework keeps the caller's own config object, so a host that
+    // changes it in place changes what a restart with no new config uses.
+    config.reconnect = 'true';
+    await assert.rejects(
+      framework.restartMcplServer('stored'),
+      /MCPL server "stored" reconnect must be true or false, unquoted, not a string: /,
+    );
+    assert.deepEqual(
+      framework.listMcplServers().map((s) => [s.id, s.connected]),
+      [['stored', true]],
+      'the running server stays connected',
     );
   });
 });

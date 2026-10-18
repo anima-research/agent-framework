@@ -81,6 +81,14 @@ test('inheritEnv: true passes the whole host env, declared env on top', () => {
   assert.equal(env.EXTRA, '1');
 });
 
+test('only inheritEnv: true passes the whole host env; a quoted "false" or any other value keeps the allowlist', () => {
+  const allowlistOnly = buildChildEnv({}, HOST_ENV);
+  for (const inheritEnv of ['false', 'true', 'no', 1, 0, {}, [], null]) {
+    assert.deepEqual(buildChildEnv({ inheritEnv: inheritEnv as unknown as boolean }, HOST_ENV), allowlistOnly,
+      JSON.stringify(inheritEnv));
+  }
+});
+
 test('a real spawned stdio child sees only allowlist + declared env', async () => {
   const secretKey = 'MCPL_ENV_TEST_HOST_SECRET';
   const previousCaBundle = process.env.REQUESTS_CA_BUNDLE;

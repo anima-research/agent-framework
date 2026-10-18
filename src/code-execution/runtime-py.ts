@@ -259,15 +259,61 @@ def _resolve(fut, value):
             pass
 
 
+def _brief(value):
+    # A value as a refusal shows it: by its type, such as <str>, which fails
+    # loudly if copied rather than sending something else. The agent has its
+    # values in the call it just wrote. No value's own code runs here: its
+    # __repr__ isn't called, and its type is named through type's own
+    # descriptor, so a metaclass's __name__ doesn't run either.
+    return "<" + type.__dict__["__name__"].__get__(type(value)) + ">"
+
+
 def _make_tool_fn(tool_name, py_name):
-    async def tool_fn(args=None):
+    async def tool_fn(*positional, **kwargs):
         global _next_tool_call_id
+        if len(positional) > 1:
+            raise TypeError(
+                py_name + " wasn't called: a tool function takes one dict of "
+                "arguments, such as await " + py_name + "({...}), and this call "
+                "gave it " + str(len(positional)) + " positional arguments"
+            )
+        # args= on its own is the dict, as it has always been. Beside other
+        # keywords it's one of them, since a tool such as utils has a field
+        # of that name, so the suggested dict keeps it.
+        if positional:
+            args = positional[0]
+        elif list(kwargs) == ["args"]:
+            args = kwargs.pop("args")
+        else:
+            args = None
+        if kwargs:
+            if args is not None and not isinstance(args, dict):
+                raise TypeError(
+                    py_name + " wasn't called: a tool function takes one dict of "
+                    "arguments, not keyword arguments, and this call also gave it "
+                    + _brief(args) + ", so put every argument in one dict: await "
+                    + py_name + "({...})"
+                )
+            # The likely intent is plain: the same arguments in one dict.
+            meant = dict(args) if isinstance(args, dict) else {}
+            meant.update(kwargs)
+            # A key is what the agent has to write, so a str key is shown
+            # whole up to 60 characters, as names are elsewhere; a longer one,
+            # or any other key, is shown as a value is.
+            shown = ", ".join((repr(k) if type(k) is str and len(k) <= 60 else _brief(k)) + ": " + _brief(v)
+                              for k, v in meant.items())
+            raise TypeError(
+                py_name + " wasn't called: a tool function takes one dict of "
+                "arguments, not keyword arguments, so write await "
+                + py_name + "({" + shown + "})"
+            )
         if args is None:
             args = {}
         if not isinstance(args, dict):
             raise TypeError(
-                "tool functions take a single dict of arguments, e.g. await "
-                + py_name + "({...})"
+                py_name + " wasn't called: a tool function takes one dict of "
+                "arguments, such as await " + py_name + "({...}), and this call "
+                "gave it " + _brief(args)
             )
         _next_tool_call_id += 1
         call_id = "t" + str(_next_tool_call_id)

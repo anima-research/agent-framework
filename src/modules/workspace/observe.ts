@@ -41,7 +41,7 @@ import { constants as fsConstants } from 'node:fs';
 import type { BigIntStats } from 'node:fs';
 import { lstat, mkdir, open, readdir, realpath, stat, statfs } from 'node:fs/promises';
 import type { FileHandle } from 'node:fs/promises';
-import { dirname, join, sep } from 'node:path';
+import { dirname, join, posix, sep } from 'node:path';
 import { sameRootIdentity, type Fingerprint, type RootIdentity } from './disk-agreement.js';
 
 export interface MountView {
@@ -56,6 +56,11 @@ export interface MountView {
   /** Text above this size is not ingested. */
   maxFileSize: number;
   ignore: string[];
+  /**
+   * Other mounts' directories nested inside this one, mount-relative. Every
+   * pass passes over them, named or not, as another mount's directory.
+   */
+  others: readonly string[];
 }
 
 export type StatFingerprint = Omit<Fingerprint, 'hashedAt'>;
@@ -70,13 +75,16 @@ export const NONBLOCK = typeof fsConstants.O_NONBLOCK === 'number' ? fsConstants
 
 export type Observation =
   | { kind: 'absent' }
-  | { kind: 'file'; size: number; mtimeMs: number; fp: StatFingerprint }
+  /** `mode`: the file's permission bits (`st_mode & 0o777`). */
+  | { kind: 'file'; size: number; mtimeMs: number; mode: number; fp: StatFingerprint }
   | { kind: 'unobserved'; reason: string };
 
 export interface ReadResult {
   kind: 'read';
   size: number;
   mtimeMs: number;
+  /** The permission bits of the inode the bytes were read from. */
+  mode: number;
   fp: Fingerprint;
   hash: string;
   /** The whole file, when it is at most the requested limit. */
@@ -503,7 +511,7 @@ export async function observePath(view: MountView, rootReal: string, relativePat
   } else if (!info.isFile()) {
     return { kind: 'unobserved', reason: 'not a regular file' };
   }
-  return { kind: 'file', size: Number(info.size), mtimeMs: Number(info.mtimeMs), fp: statFingerprint(info) };
+  return { kind: 'file', size: Number(info.size), mtimeMs: Number(info.mtimeMs), mode: Number(info.mode & 0o777n), fp: statFingerprint(info) };
 }
 
 /**
@@ -571,9 +579,41 @@ async function openContained(
 }
 
 /**
+ * Read an open file from its start, at most `limit` bytes, and whether it
+ * goes on past them. Where the file ends is what the reads find: `sizeHint`,
+ * the size its fstat gave, only sizes the first buffer. Once a buffer is
+ * full, one byte read past it tells whether the file goes on. At the limit,
+ * that byte says it does, and isn't kept. Short of it, the file has grown
+ * since its fstat: the byte is kept, and the read goes on in a larger buffer,
+ * up to the limit. A file that has shrunk ends where the reads find its end.
+ * A fractional `limit` allows the whole bytes in it.
+ */
+export async function readPrefix(handle: FileHandle, limit: number, sizeHint: number): Promise<{ bytes: Buffer; more: boolean }> {
+  const cap = Math.floor(limit);
+  const next = Buffer.alloc(1);
+  let bytes = Buffer.alloc(Math.min(cap, sizeHint));
+  let length = 0;
+  for (;;) {
+    while (length < bytes.length) {
+      const { bytesRead } = await handle.read(bytes, length, bytes.length - length, length);
+      if (bytesRead === 0) return { bytes: bytes.subarray(0, length), more: false };
+      length += bytesRead;
+    }
+    if ((await handle.read(next, 0, 1, length)).bytesRead === 0) return { bytes, more: false };
+    if (length === cap) return { bytes, more: true };
+    // Longer than its fstat said: read on, up to the limit.
+    const grown = Buffer.alloc(Math.min(cap, Math.max(2 * length, length + 64 * 1024)));
+    bytes.copy(grown, 0, 0, length);
+    grown[length++] = next[0];
+    bytes = grown;
+  }
+}
+
+/**
  * Read and hash a mount-relative file through one located descriptor. The
- * whole file is returned when it is at most `limit` bytes; larger files are
- * hashed in chunks and only their head is kept.
+ * whole file is returned when it is at most `limit` bytes, both at its fstat
+ * and as read; any other file, including one that grew past `limit` since its
+ * fstat, is hashed in chunks and only its head is kept.
  */
 export async function readPath(
   view: MountView,
@@ -588,12 +628,18 @@ export async function readPath(
     const hashedAt = Date.now();
     const size = Number(info.size);
     const fp: Fingerprint = { ...statFingerprint(info), hashedAt };
-    if (size <= limit) {
-      const bytes = await handle.readFile();
+    // A file within the limit at its fstat is read no further than the limit,
+    // so one that has grown past it since is hashed below, from its start,
+    // never loaded whole. One over the limit at its fstat is hashed below
+    // without that read.
+    const within = size <= limit ? await readPrefix(handle, limit, size) : null;
+    if (within && !within.more) {
+      const { bytes } = within;
       return {
         kind: 'read',
         size: bytes.byteLength,
         mtimeMs: Number(info.mtimeMs),
+        mode: Number(info.mode & 0o777n),
         fp: { ...fp, size: bytes.byteLength },
         hash: createHash('sha256').update(bytes).digest('hex'),
         bytes,
@@ -615,6 +661,7 @@ export async function readPath(
       kind: 'read',
       size: offset,
       mtimeMs: Number(info.mtimeMs),
+      mode: Number(info.mode & 0o777n),
       fp: { ...fp, size: offset },
       hash: hash.digest('hex'),
       bytes: null,
@@ -681,14 +728,18 @@ export interface Walk {
    */
   seen: Set<string>;
   /**
-   * The names in `others` that aren't ignored and that the walk took, as it
+   * The names in `others` that it doesn't pass over by design and that the walk took, as it
    * takes files, against its cap: the pass observes these by path. The rest
    * are present, and not observed by this pass.
    */
   othersTaken: Set<string>;
   /** Directories seen. */
   dirs: Set<string>;
-  /** Names seen that are neither (symlinks, sockets…), or ignored: present, unproven. */
+  /**
+   * Names seen that are neither (symlinks, sockets…), or that the walk passes
+   * over by design (another mount's directory, the ignore list, an editor's
+   * file name): present, unproven.
+   */
   others: Map<string, string>;
   /**
    * Directories whose listing the walk read whole, and that were still the
@@ -701,9 +752,10 @@ export interface Walk {
   /**
    * Where the walk didn't reach, and why. `error` and `cap` regions may hide
    * files the listing would show. An `ignored` region is passed over by
-   * design: one that hides a tracked entry is reported as incomplete, and
-   * one that hides nothing is counted as passed over. A `symlink` region is
-   * never walked; the pass reports the link itself by path.
+   * design: one that hides a tracked entry, or is the pass's whole scope, is
+   * reported as incomplete, and any other is counted as passed over. A
+   * `symlink` region is never walked; the pass reports the link itself by
+   * path.
    */
   incomplete: Array<{ path: string; reason: string; kind: 'error' | 'cap' | 'ignored' | 'symlink' }>;
   /**
@@ -774,6 +826,101 @@ export function coveredByIgnore(relativePath: string, patterns: string[]): boole
   return false;
 }
 
+/**
+ * The ignore patterns a walk that names `scope` reads beneath it: a pattern
+ * covering the scope itself, or a directory above it, doesn't apply beneath
+ * it (#276); one covering only something inside it does.
+ */
+export function ignoreBeneath(scope: string, patterns: string[]): string[] {
+  return patterns.filter((pattern) => !coveredByIgnore(scope, [pattern]));
+}
+
+/**
+ * Names editors give the files they keep beside the one being edited: vim's
+ * swap files (`.name.swp`, and `.name.swx` while it checks it can make one),
+ * backups ending in `~`, and Sublime Text's save-in-progress files, ending
+ * in `.subl…tmp`. A walk passes over an entry with such a name as it passes
+ * over what the ignore list covers, a directory with what lies beneath it,
+ * and the watcher ignores it; a sync that names one takes it in. They are
+ * the families chokidar's `atomic` option hid from the watcher, but that
+ * tested them against the whole path, unanchored, so it also hid
+ * `report.v2.swp`, and under a directory with a dot in its name, a plain
+ * `notes.swp`. Here each is matched against an entry's name, to its end,
+ * and vim's from its start.
+ */
+const EDITOR_FILE = /^\..+\.sw[px]$|~$|\.subl.*\.tmp$/;
+
+/** The walk's reason for an entry the mount's ignore list covers. */
+export const IGNORED = 'ignored by the mount';
+/** The walk's reason for an entry `EDITOR_FILE` names. */
+const EDITOR_FILE_REASON = "an editor's swap or backup file";
+
+/** Whether a reason the walk gave an entry is one it passes over by design. */
+export function passedOverByDesign(why: string | undefined): boolean {
+  return why === IGNORED || why === EDITOR_FILE_REASON || why === OTHER_MOUNT;
+}
+
+/** Why a pass passes over a directory that another mount nested in this one holds, and what lies beneath it. */
+export const OTHER_MOUNT = "another mount's directory";
+
+/**
+ * Whether a mount-relative path is another mount's directory, or lies
+ * beneath one, read as a join reads it: `.` and `..` segments within the
+ * path and repeated or trailing separators resolved, links not followed. A
+ * stored key such as `a//b/x`, which chronicle accepts, is read as `a/b/x`.
+ * A leading `..` that climbs above the mount's root is left as written.
+ * Every nested-mount check (a pass's, a walk's, a push's, grep's) asks this.
+ */
+export function inOtherMount(relativePath: string, others: readonly string[]): boolean {
+  const lexical = posix.normalize(relativePath).replace(/\/+$/, '');
+  return others.some((dir) => lexical === dir || lexical.startsWith(dir + '/'));
+}
+
+/**
+ * Why a walk passes over an entry by design, by its mount-relative path and
+ * its name: another mount's directory, the ignore list, or an editor's file
+ * name. Undefined when none covers it.
+ */
+function passedOverBecause(relativePath: string, name: string, patterns: string[], others: readonly string[]): string | undefined {
+  if (inOtherMount(relativePath, others)) return OTHER_MOUNT;
+  if (isIgnored(relativePath, name, patterns)) return IGNORED;
+  if (EDITOR_FILE.test(name)) return EDITOR_FILE_REASON;
+  return undefined;
+}
+
+/**
+ * Why a sync without a path, and the watcher, pass over a mount-relative
+ * path: the path itself or a directory above it is passed over by design, as
+ * the walk reads each entry by its path and name. A path in another mount's
+ * directory is that mount's, whatever else covers a directory above it.
+ * Undefined when nothing covers it.
+ */
+export function passedOverAt(relativePath: string, patterns: string[], others: readonly string[]): string | undefined {
+  if (inOtherMount(relativePath, others)) return OTHER_MOUNT;
+  const segments = relativePath.split('/').filter(Boolean);
+  for (let i = 0; i < segments.length; i++) {
+    const why = passedOverBecause(segments.slice(0, i + 1).join('/'), segments[i]!, patterns, others);
+    if (why !== undefined) return why;
+  }
+  return undefined;
+}
+
+/**
+ * Why a walk of `scope` passes over a directory between it and a path beneath
+ * it: the first directory strictly beneath the scope and above the path that
+ * the mount passes over by design, by its path and name, with the patterns
+ * the walk reads there. Undefined when none is.
+ */
+export function passedOverBetween(scope: string, relativePath: string, patterns: string[], others: readonly string[]): string | undefined {
+  const segments = relativePath.split('/').filter(Boolean);
+  const from = scope === '' ? 0 : scope.split('/').filter(Boolean).length;
+  for (let i = from; i < segments.length - 1; i++) {
+    const why = passedOverBecause(segments.slice(0, i + 1).join('/'), segments[i]!, patterns, others);
+    if (why !== undefined) return why;
+  }
+  return undefined;
+}
+
 /** Simple ignore patterns, as the watcher and the old walk read them. */
 export function isIgnored(relativePath: string, name: string, patterns: string[]): boolean {
   for (const pattern of patterns) {
@@ -835,6 +982,29 @@ export async function walkScope(
     files: new Set(), seen: new Set(), othersTaken: new Set(), dirs: new Set(), others: new Map(), complete: new Set(), missing: new Set(),
     incomplete: [],
   };
+  // A walk that isn't named passes over a scope the mount passes over by
+  // design, at it or a directory above it, as its parent's listing would pass
+  // over its entry: a name rule (a bare-name ignore entry, an editor's name)
+  // doesn't match what lies beneath, as a path rule (`cache/**`) does. So a
+  // listing, glob or grep there never starts tracking what the mount leaves
+  // out, and a stored copy beneath it is unobserved, as beneath any region
+  // passed over by design. Its region says how to take what's there in: a
+  // sync that names it, whose scope is walked (#276), below.
+  // Another mount's directory is passed over by every walk, named or not,
+  // and no sync of this mount takes it in, so its region gives no advice.
+  if (scope !== '' && inOtherMount(scope, view.others)) {
+    walk.others.set(scope, OTHER_MOUNT);
+    walk.incomplete.push({ path: scope, reason: OTHER_MOUNT, kind: 'ignored' });
+    return walk;
+  }
+  if (!opts.named && scope !== '') {
+    const why = passedOverAt(scope, view.ignore, view.others);
+    if (why !== undefined) {
+      walk.others.set(scope, why);
+      walk.incomplete.push({ path: scope, reason: `${why}: a sync that names this path takes in what's there, editors' files aside`, kind: 'ignored' });
+      return walk;
+    }
+  }
   const top = await checkDir(view, rootReal, scope);
   if (top.kind === 'absent') {
     walk.missing.add(scope);
@@ -847,9 +1017,11 @@ export async function walkScope(
   // A scope a path sync names is walked even where the ignore list covers
   // it: a pattern covering the scope itself, or a directory above it, doesn't
   // apply beneath it. So a named directory's contents are synced, as a named
-  // file is (agent-framework #276). A listing keeps the ignore: its pass
-  // would otherwise start tracking what it lists.
-  const ignore = opts.named ? view.ignore.filter((pattern) => !coveredByIgnore(scope, [pattern])) : view.ignore;
+  // file is (agent-framework #276), apart from what a pattern covering only
+  // something inside it covers, and editors' files, which are passed over
+  // there as anywhere. A listing keeps the ignore: its pass would otherwise
+  // start tracking what it lists.
+  const ignore = opts.named ? ignoreBeneath(scope, view.ignore) : view.ignore;
   // A position outside the scope, or for a walk that doesn't descend, is no
   // position in this walk's order.
   const after = recursive && opts.resumeAfter !== undefined && (scope === '' || opts.resumeAfter.startsWith(scope + '/'))
@@ -950,9 +1122,10 @@ export async function walkScope(
     const regions: Walk['incomplete'] = [];
     for (const entry of entries) {
       const childRel = rel ? `${rel}/${entry.name}` : entry.name;
-      if (isIgnored(childRel, entry.name, ignore)) {
-        others.push([childRel, 'ignored by the mount']);
-        regions.push({ path: childRel, reason: 'ignored by the mount', kind: 'ignored' });
+      const passedOver = passedOverBecause(childRel, entry.name, ignore, view.others);
+      if (passedOver !== undefined) {
+        others.push([childRel, passedOver]);
+        regions.push({ path: childRel, reason: passedOver, kind: 'ignored' });
         continue;
       }
       if (entry.isDirectory()) {
@@ -1046,7 +1219,7 @@ export async function walkScope(
   const capped = `the walk cap (${cap}) was reached`;
   const holdingUntaken = new Set<string>();
   for (const f of walk.seen) holdingUntaken.add(parentOf(f));
-  for (const [p, why] of walk.others) if (why !== 'ignored by the mount' && !walk.othersTaken.has(p)) holdingUntaken.add(parentOf(p));
+  for (const [p, why] of walk.others) if (!passedOverByDesign(why) && !walk.othersTaken.has(p)) holdingUntaken.add(parentOf(p));
   for (const d of holdingUntaken) {
     walk.incomplete.push({ path: d, reason: `${capped} before everything here was taken`, kind: 'cap' });
   }
@@ -1061,7 +1234,8 @@ export async function walkScope(
   // The cap stopped the walk only if it left something: a walk whose last
   // file used up the cap covered its scope. A directory the walk didn't list
   // counts as left, even one that holds nothing it would take (empty, or
-  // only ignored names): telling them apart would take another read. Such a
+  // only names it passes over by design): telling them apart would take
+  // another read. Such a
   // walk keeps its place and reports the directory as not visited, and the
   // next one lists it on its way to the wrap.
   if (left === 0 && lastTaken !== undefined && (holdingUntaken.size > 0 || unlisted > 0)) walk.stoppedAfter = lastTaken;

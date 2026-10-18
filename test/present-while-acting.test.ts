@@ -931,13 +931,19 @@ describe('present while acting', () => {
       deferredMessages: unknown[];
     };
     let deferredInStart = -1;
+    // Another agent's tool cycle is pending when the start fails: the flush
+    // at its end waits only on this agent's own cycle.
+    const cycles = (framework as unknown as { pendingAssistantBlocks: Map<string, ContentBlock[]> }).pendingAssistantBlocks;
     module.startHook = async () => {
       store.addMessage('Antra', [{ type: 'text', text: 'quick question for you' }] as ContentBlock[], addressed('discord:dm:antra'));
       deferredInStart = store.deferredMessages.length;
+      cycles.set('builder', [{ type: 'tool_use', id: 'b1', name: 'x', input: {} }] as ContentBlock[]);
     };
     await release(framework);
+    cycles.delete('builder');
     assert.equal(deferredInStart, 1, 'the DM was deferred while the start held the turn');
     assert.equal(calls, 2, 'the second start failed before its stream');
+    assert.equal(store.deferredMessages.length, 0, "the failed start's flush stored the DM while another agent's tools were pending");
     // During the second hold, someone else addresses the agent.
     await say(framework, 'over here', addressed('discord:dm:q'));
     await release(framework);
@@ -946,6 +952,80 @@ describe('present while acting', () => {
     assert.deepEqual(routed, [
       { text: 'Back now.', locus: 'discord:dm:q' },
     ], 'the newer message wins: the deferred one landed when its start failed');
+
+    await framework.stop();
+  });
+
+  it("a failed start's flush stops at a message it can't store: it and what follows stay queued, in order", async () => {
+    membrane.pushResponse(createMockResponse([
+      { type: 'tool_use', id: 'c1', name: 'robot--move', input: { dir: 'north' } },
+    ] as ContentBlock[], 'tool_use'));
+    membrane.pushResponse(createMockResponse([] as ContentBlock[]));
+
+    const framework = await createFramework();
+    stubChannelRegistry(framework);
+    module.toolDelayMs = 25;
+    let hostHolds = 0;
+    (framework as unknown as { providerHoldHook: (error: Error) => { holdMs: number; reason: string } | undefined })
+      .providerHoldHook = (error) => error.message === 'stream setup failed' && hostHolds++ === 0
+        ? { holdMs: 60_000, reason: 'host hold' } : undefined;
+    // As above: stream one is held at its end, the start after the first
+    // release fails before its stream exists and is held, the third answers.
+    const makeStream = membrane.streamYielding.bind(membrane);
+    let calls = 0;
+    membrane.streamYielding = (request, options) => {
+      const n = ++calls;
+      if (n === 2) throw new Error('stream setup failed');
+      const stream = makeStream(request, options);
+      const iterate = stream[Symbol.asyncIterator].bind(stream);
+      stream[Symbol.asyncIterator] = async function* () {
+        for await (const event of { [Symbol.asyncIterator]: iterate }) {
+          if (event.type === 'complete' && n === 1) {
+            yield { type: 'error' as const, error: accelerationLimit(request) };
+            return;
+          }
+          yield event;
+        }
+      };
+      return stream;
+    };
+    feedStart(framework, 2, [{ type: 'text', text: 'Back now.' }] as ContentBlock[]);
+
+    trigger(framework);
+    await framework.runUntilIdle();
+    // During the second start, before its stream exists, two messages arrive
+    // and are deferred, and the store refuses the first of them.
+    const store = framework as unknown as {
+      addMessage(participant: string, content: ContentBlock[], metadata: Record<string, unknown>): string;
+      deferredMessages: Array<{ content: ContentBlock[] }>;
+    };
+    const cm = framework.getAgent('assistant')!.getContextManager() as unknown as {
+      addMessage(participant: string, content: ContentBlock[], metadata?: unknown): string;
+    };
+    const add = cm.addMessage.bind(cm);
+    let refuse = true;
+    cm.addMessage = (participant, content, metadata) => {
+      if (refuse && (content[0] as { text?: string })?.text === 'first') throw new Error('store refused');
+      return add(participant, content, metadata);
+    };
+    module.startHook = async () => {
+      store.addMessage('Antra', [{ type: 'text', text: 'first' }] as ContentBlock[], ambient('discord:dm:antra'));
+      store.addMessage('Antra', [{ type: 'text', text: 'second' }] as ContentBlock[], ambient('discord:dm:antra'));
+    };
+    const texts = () => framework.getAgent('assistant')!.getContextManager().getAllMessages()
+      .flatMap((m) => m.content.filter((b) => b.type === 'text').map((b) => (b as { text: string }).text))
+      .filter((t) => t === 'first' || t === 'second');
+    await release(framework);
+    assert.equal(calls, 2, 'the second start failed before its stream');
+    assert.deepEqual(store.deferredMessages.map((m) => (m.content[0] as { text: string }).text), ['first', 'second'],
+      'the message the flush could not store, and the one behind it, stay queued in order');
+    assert.deepEqual(texts(), [], 'nothing behind the refused message was stored');
+
+    // Once the store takes it, the next start stores both, in order.
+    refuse = false;
+    await release(framework);
+    assert.equal(calls, 3, 'the third start compiled');
+    assert.deepEqual(texts(), ['first', 'second']);
 
     await framework.stop();
   });
@@ -1281,63 +1361,6 @@ describe('present while acting', () => {
     assert.deepEqual(routed, [], 'and its restart stayed silent');
     assert.equal(module.interjection, null, 'the DM arrived during its tool round');
     assert.deepEqual(open.arrivals, [], "the silent turn's injections are no arrival of the prose turn");
-
-    await framework.stop();
-  });
-
-  it("a failed start's flush stores each deferred message on its own, so one failure loses no other", async () => {
-    membrane.pushResponse(createMockResponse([
-      { type: 'tool_use', id: 'c1', name: 'robot--move', input: { dir: 'north' } },
-    ] as ContentBlock[], 'tool_use'));
-    membrane.pushResponse(createMockResponse([] as ContentBlock[]));
-    const framework = await createFramework();
-    stubChannelRegistry(framework);
-    module.toolDelayMs = 25;
-    let hostHolds = 0;
-    (framework as unknown as { providerHoldHook: (error: Error) => { holdMs: number; reason: string } | undefined })
-      .providerHoldHook = (error) => error.message === 'stream setup failed' && hostHolds++ === 0
-        ? { holdMs: 60_000, reason: 'host hold' } : undefined;
-    const makeStream = membrane.streamYielding.bind(membrane);
-    let calls = 0;
-    membrane.streamYielding = (request, options) => {
-      const n = ++calls;
-      if (n === 2) throw new Error('stream setup failed');
-      const stream = makeStream(request, options);
-      const iterate = stream[Symbol.asyncIterator].bind(stream);
-      stream[Symbol.asyncIterator] = async function* () {
-        for await (const event of { [Symbol.asyncIterator]: iterate }) {
-          if (event.type === 'complete' && n === 1) {
-            yield { type: 'error' as const, error: accelerationLimit(request) };
-            return;
-          }
-          yield event;
-        }
-      };
-      return stream;
-    };
-    const store = framework as unknown as {
-      addMessage(participant: string, content: ContentBlock[], metadata: Record<string, unknown>, opts?: { deferredWriteId?: string }): string;
-    };
-    const add = store.addMessage.bind(framework);
-    // The store refuses the first message when the failed start's flush lands it.
-    store.addMessage = (participant, content, metadata, opts) => {
-      if (opts?.deferredWriteId && (content[0] as { text?: string }).text === 'poison') throw new Error('store refused');
-      return add(participant, content, metadata, opts);
-    };
-
-    trigger(framework);
-    await framework.runUntilIdle();
-    module.startHook = async () => {
-      store.addMessage('Antra', [{ type: 'text', text: 'poison' }] as ContentBlock[], {});
-      store.addMessage('Antra', [{ type: 'text', text: 'second' }] as ContentBlock[], {});
-    };
-    await release(framework);
-
-    assert.equal(calls, 2, 'the second start failed before its stream');
-    const texts = framework.getAgent('assistant')!.getContextManager().getAllMessages()
-      .flatMap((m) => m.content.filter((b) => b.type === 'text').map((b) => (b as { text: string }).text));
-    assert.ok(texts.includes('second'), 'the message behind the refused one was stored');
-    assert.ok(!texts.includes('poison'));
 
     await framework.stop();
   });

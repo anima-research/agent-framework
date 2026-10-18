@@ -12,6 +12,438 @@ Releases up to and including 0.7.3 predate this file; for their contents see
 
 ## Unreleased
 
+## 0.22.2 — 2026-10-17
+
+**Operators upgrading from 0.22.1:** on a workspace mount over 5000 files, the
+first syncs and catch-up scans after upgrading catch up on what 0.22.1's
+walks, which stopped at 5000 files, never reached, up to the mount's walk cap
+(`walkCap`, 5000 entries unless configured) in each pass. Each pass pushes one
+event for each kind of change it finds, listing every path, and where the
+mount's `wakeOnChange` admits that kind, each event is one message to the
+agent. Going back to 0.22.1 is safe for a store 0.22.2 wrote, with one
+exception: 0.22.1 refuses to create the framework when an agent's persisted
+runtime setting can't be applied, such as a budget no longer above the
+recipe's `maxTokens`, or a budget below the recipe's on a strategy that can't
+prepare a smaller window. 0.22.2 starts with such a setting and logs
+`[agent-settings]` that it stays set but unapplied; reset it with
+`resetAgentRuntimeSettings()` before going back. Under 0.22.1, a coalesced
+message whose content passes 1 MiB with its inline images is refused again,
+and walks stop at 5000 files again. 0.22.1 leaves the walk's place alone, so
+coming forward resumes there, unless 0.22.1 wrote a checkpoint meanwhile,
+which starts each scope's walk at its top. Keep context-manager 0.14.1, which
+0.22.1's `^0.14.0` admits. Not tested: going back under connectome-host rather
+than a bare framework, and a tail or pace kept unapplied.
+
+### Added
+
+- The `mcpl:server-closed` trace carries `reason`, why the transport closed,
+  in its own words, such as `child process exited, and its pipe failed with
+  write EPIPE` or `closed by host`. It is null when the transport gave none,
+  and when the reason is a WebSocket server's own close text, which stays off
+  the trace: `TransportCloseInfo` and the connection's close info mark that
+  text with `reasonFromPeer`.
+
+- `ProviderWaitNotSleptError`: when a retryable provider failure states a
+  wait an ephemeral run won't sleep (longer than the 600 s it sleeps in its
+  turn, infinite, or `NaN`), `runEphemeralToCompletion` now rejects with this
+  error, carrying the wait as stated as `retryAfterMs`. Its message is
+  unchanged. Its `name` is `ProviderWaitNotSleptError`, so a logged rejection
+  reads that where it read `Error`. A host that decides whether to run a task
+  again can test `instanceof` or the `name` instead of reading the message.
+  Every other ending still rejects with a plain `Error`.
+
+- `AgentFramework.switchBranch(name)` switches the store to an existing
+  branch, starts the delivery of the Discord awareness marks the move
+  changes, re-materializes the config mount, and then resolves. It doesn't
+  wait for Discord, as the surgeries don't. If the mount fails, it rejects
+  with the branch already moved. The branch moves under every agent
+  sharing the store, so, as for `rollbackToMessage()`, every agent must be
+  idle: during a live turn it refuses with `OperatorActionError`
+  (`agent-busy`), and no turn starts until it's done. Once `stop()` has
+  begun it refuses, and `stop()` waits for one already running.
+  - The API server's branch switch used to run these steps itself, on the
+    store, and now calls `switchBranch()`. So it refuses during a live turn
+    instead of moving the branch beneath it. Its current branch follows the
+    store from the moment it moves, and clients hear of a move even when a
+    later step fails, but not of a refused switch. A branch create with
+    `switchTo` creates the branch first, so during a live turn it creates
+    it and answers the switch's refusal.
+
+### Changed
+
+- A context-maintenance pass no longer fails as a whole when one agent's readiness can't be read. context-manager 0.14, which agent-framework has required since 0.21.1, refuses its readiness queries while a strategy's initialization is pending (inside `switchBranch`, `fork`, `setStrategy` or `ContextManager.open`) or has failed, and a strategy can refuse on its own, as the autobiographical one does for a branch it hasn't reloaded. That agent's run now records the error, the agent gets its own `context-maintenance-failed` alert (`scope: 'agent'`), and the other agents run. Before, such a throw ended the pass for every agent, with one alert for the whole pass (`scope: 'pass'`). Anything else that throws while one agent's maintenance is prepared is that agent's failure in the same way. A failure that lasts, met by every pass, is logged, alerted and recorded in the maintenance history when it's first met, then again when its text changes, every 15 minutes while it lasts (the alert webhook's cooldown for it, counted from the webhook's last post of it), or after that agent's maintenance has gone without a failure. A pass that met only failures already reported, and took no tick, isn't added to the history unless an operator's `maintain` (`maintenanceTick()`) asked for it, so a lasting failure no longer pushes out the runs that did work. `getContextMaintenanceSnapshot()` reports such an agent as `ready: false` with an `error`, and a strategy that can't give a progress snapshot reads as having none.
+- While an operator surgery (`rollbackToMessage` or `suppressMessages`) or `switchBranch` holds the store, no maintenance pass starts and no over-budget drain kick is started, a running pass or drain kick starts no new tick, and the operator call waits for them to finish before it switches or forks the branch, so no maintenance work overlaps the move. `stop()` waits for them the same way, a drain kick included, before it closes the store, so the tick in flight ends before the store closes, and once `stop()` has begun, no drain kick starts and none starts a new tick. Maintenance makes no provider call meanwhile, a conversation agent's included: one made under the hold, or once `stop()` has begun, is withdrawn without being sent, and so is a resident's call waiting at its provider gate when the hold is taken or `stop()` begins. That's no maintenance failure, and for a call outside context-manager 0.14's compression fallback ladder, a merge's or a chunk's canonical call with its retries after a `tool_use` stop, context-manager counts no attempt. One inside the ladder, after a chunk's canonical call was refused or cut short, is recorded there as a provider error, and once every rung has failed, the chunk's request family is quarantined, with its alert. Before, a resident's call made once `stop()` had begun was refused as a failure, so a restart that caught a maintenance tick before one of its calls logged a maintenance failure and raised a `context-maintenance-failed` alert; now the agent's maintenance logs that it stopped. An over-budget compile's `context-refusal` alert says whether the drain breaker kicked: `kicking`, `already draining`, or `not kicked` with the reason, where it said `kicking` whenever the agent was found, and `unavailable (no agent handle)` for one it can't find, as before. A kick joins what `stop()`, an operator surgery and `switchBranch` wait for before the alert is raised, so a listener on the alert that begins any of them waits for the kick, which then starts no tick. A merge keeps its place in the queue. When a chunk's compression is withdrawn outside the ladder, context-manager logs its "Failed to compress chunk (hierarchical)" line with the withdrawal, and the chunk is queued again at that manager's next rebuild, such as its next message or sent compile. The operator call never waits on a provider cooldown, or on the retry turn a cooldown queues, which the hold keeps from starting. `switchBranch` can therefore move the store after the call returns, and the API server's `branch.switch` announces the move it made once it has, while `branch.current`, the branch list, `/health` and `/status` read the store's branch whenever they report one. `maintenanceTick()` answers `ran: false` meanwhile, and `resume()` refuses with `OperatorActionError` (`agent-busy`), as the other operator calls do, including when the surgery took the store while `resume()` waited. Resume once the surgery has finished.
+
+- **Built with TypeScript 7**, the native compiler, up from 5.9. Measured
+  with 7.0.2 against 5.9.3 on the same source, the emitted JavaScript is
+  byte-identical. What the package ships beside it changes:
+  - seven declaration files under `dist/src/` (`mcpl/push-coalescer`,
+    `mcpl/references`, `mcpl/tool-classes`, `mcpl/transport`, `mcpl/types`,
+    `modules/workspace/types` and `tune-out/tools`) write string literal
+    types with single quotes, as the source does; the types are the same;
+  - source maps: of the `.js.map` files that change, all but four move only
+    columns; in two a generated line maps to other source lines, and in two
+    a generated line gains or loses its mapping, so a stack trace can land
+    on a different column, and rarely on a different line or none. Of the
+    56 `.d.ts.map` files that change, 49 map some declarations to other
+    source lines and 7 gain or lose a line's mapping, which can move where
+    go-to-definition lands;
+  - `dist/tsconfig.tsbuildinfo`, the compiler's build record, changes.
+
+  `test/stop-with-work-in-flight.test.ts`, whose build ships in `dist/test`,
+  now parses `src` with `@babel/parser`, a new devDependency: the main entry
+  of TypeScript 7's package has no compiler API, and its `./unstable/*`
+  entries reach the native compiler over IPC.
+
+  As with the same source built with 5.9.3, a consumer on TypeScript 7 with
+  `skipLibCheck` off whose `types` leaves out `node` can get Node-name errors
+  from this package's declarations and its dependencies', unless its program
+  already reaches Node's types. Install `@types/node` and list `node` in
+  `types`, as this package's own `tsconfig.json` now does.
+
+### Fixed
+
+- A coalesced MCPL message with inline images is admitted like any other message (#266). Coalesced `channels/incoming` and `push/event` items, and render results, were checked against a 1 MiB budget on their serialized content, inline base64 images included, which uncoalesced messages never had. Any message with a sizeable screenshot was refused as `coalesce_invalid`, never stored and never woke the agent, and discord-mcpl tags every message create with `coalesce`. An incoming coalesced item's content must be an array of objects with something visible in it (a retraction may be empty, and on the push lane so may a silent heartbeat), and within that it is admitted as an uncoalesced message is: a block the converters can't render, such as a video or an unknown type, becomes the same placeholder whether or not the message was coalesced. The converters of both lanes now take any object without throwing: a block's type, text, data, mimeType or uri that isn't a string is treated as absent, so a malformed block becomes a placeholder too (a text block, no text) instead of throwing in conversion, where the sender got no answer and a `channels/incoming` batch stopped before its later messages. An image or audio block that has data but no usable media type reads `[Image: no media type]` or `[Audio: no media type]` rather than claiming no data, and an image or audio block with a disposition is a reference only when its uri is a non-empty string. A `shouldTriggerInference` filter, and so the EventGate's content filter, reads on both lanes the text the agent's context gets, the converted text blocks joined with line breaks: on the channel lane, which read the message's own text blocks before, a block that converts to text (an unknown type's placeholder, an image with no data, a reference stub) is now part of what a filter matches, as it already was on the push lane, and text that isn't a string reads as empty. A render result, which the host delivers in the occurrence's place, gets every check a pushed payload gets (RFC-006 §5.2) except visible emptiness, since an empty render means nothing happened, and one more: each block must be one the converters show as itself (its text, or its image or audio source) or as a reference stub. A render with a block that would show as a placeholder falls back to the occurrence's own content, which a pushed payload doesn't have. The 4 KiB bound on `coalesce.data`, which the coalescer holds outside context, is unchanged.
+  Every coalesce rejection is now visible on the host as well as on the wire: as a `mcpl:channel-incoming-rejected` or `mcpl:push-event-rejected` trace with the error's message in `detail` and the failing `field` when the error names one, and as a line, unless it is a push refused for its channel within a minute of that channel's last line (below). A coalesce rejection's `[channel-incoming-rejected]` line names the server, channel, message id and failing field, and its `[push-event-rejected]` line names the server, feature set, event id and failing field; each ends with the error's message. When a channel's refusals were held back, the next line printed for it adds how many. The reason follows the answer the sender got: `coalesce-invalid` when the item was the sender's to fix (malformed, or a push to a channel it isn't permitted or hasn't registered), `coalesce-failed` when the host itself failed (coalescing unavailable, the host stopping or unable to make an acceptance durable, or an internal error). A `channels/incoming` message for an unregistered channel now gets a line too (`reason=unknown-channel`), coalesced or not. So that a server that never registered a busy channel doesn't print a line for every message in it, a channel's first refusal prints, and after that a refusal prints only once a minute has passed since the channel's last line, naming how many were held back since; a channel-scoped push refused because its channel isn't declared (-32023) or may not be used (-32017) prints the same way on its own lane, per channel, and its line and its trace name the channel. Every refusal is still answered and traced. The unknown-channel trace carries the message id, and its reason is now `unknown-channel`, the line's token (it was `unknown channel — not registered (§14.5)`). A render result the host refuses gets a `[push-render-failed]` line naming the server, subject, event id and failing field, and the occurrence's own content is delivered instead. A missing push `eventId` prints as `""` on every `[push-event-rejected]` line, and the push rejection trace carries `''`. The wire answers are unchanged.
+  The host log lines listed here now print the values a server chose (channel, message and event ids, feature set and field names, a tool's name and declared classes, an advertised capability's key, a discarded method's name) in a form a server can't use to add a line that reads as another host record, a word that reads as another field of the same line, or a `key=` that a search for that field finds before the real one. That covers every `[channel-incoming-rejected]` and `[push-event-rejected]` line, the existing empty-content, duplicate and feature-set rejections included; the `[channel-incoming-dropped]` and `[push-event-dropped]` backstops; the `[routeSpeech]` delivery and closed-locus lines; the `[inference-refusal]` line for a locus with no server; both conversation spawn-failure lines, the routed message's and the coalesced batch's; the `[heartbeat]` silent-wake line; the feature-set disabled line, the tool-class lines, the masked-capability line and the discarded-method line. A plain token (visible characters with no space, quote, backslash or `=`) prints as before. Anything else prints as a JSON string with every `=`, every space and every invisible character escaped (a line break, a terminal escape, a bidi control, a default-ignorable character such as a Hangul filler or a variation selector), so `JSON.parse` of it gives back exactly what was sent. A value longer than 256 UTF-16 units is cut instead: it prints, quoted, as its first 256 (255 when the 256th is a high surrogate) followed by `…(N)` with N its full length. A value that isn't a string prints as its JSON text, a non-finite number as `NaN` or `Infinity`. The feature-set rejection's reason, which names the feature set, is a field like any other: `reason="Unknown\u0020feature\u0020set:\u0020…"`. The `[inference-refusal]` line's locus, and a plain unknown tool class, now print without literal quotes. The host's own message at the end of a line is quoted and cut the same way but keeps its plain spaces and `=`.
+
+- A workspace mount with more files than one walk takes is now covered by repeated syncs (#272). Each mount sets its cap with `walkCap`, a positive integer no larger than `Number.MAX_SAFE_INTEGER` that defaults to 5000; any other value is refused when the module is created, naming the mount. A bare `sync` or a `sync` of a directory that reaches the cap lists what it didn't reach under `incomplete`, and the next one of the same scope resumes after the last entry it took, then wraps to the start. A watched mount's catch-up scan (at start and when its watcher reattaches) takes its turn in the same rotation as the mount's bare syncs. The place is kept with the mount's disk evidence, so a restart resumes there too, unless the machine went down before the store made the latest place durable, which only starts the next walk at an earlier place. Before, every walk stopped at the same 5000 files, so no walk ever reached the files past them. An agent-action scan (`watch: 'on-agent-action'`) still takes up to the cap from the mount's start after every tool batch, and a listing (`ls`, `glob`, `grep`) still takes up to the cap from its scope's start. Both now take entries in the walk's name order, so on a mount over the cap they can reach different files than 0.22's first 5000, which followed the order the platform lists a directory in.
+  - A walk takes each directory's entries that aren't directories by name, then its subdirectories by name, so each walk can resume where the last stopped, whatever order the platform lists a directory in. A link, or another entry that isn't a directory, counts against the cap as a file does, since the pass reads each one it takes, through the link on a mount that follows them.
+  - Each directory's listing is read whole, so a file deleted on disk is seen wherever the walk lists, past the cap included. Before, a directory holding more files than the cap never proved a deletion.
+  - Because a watched mount's catch-up scan takes its turn in the rotation, on a mount over the cap a change made while the process was down reaches the workspace when the rotation comes to it, or when a sync of its path takes it. Before, the catch-up scan at start took a change among the first 5000 files every time, and never one past them.
+  - The `sync` tool's description now says that a sync takes up to the mount's walk cap, and that the next sync of the same mount or directory picks up where the last turn stopped, with a watched mount's catch-up scan taking turns with its whole-mount syncs. So the first request after the upgrade that carries the workspace's tools misses the prompt cache from its tool block on.
+  - On a mount over 5000 entries, the first syncs and catch-up scans after the upgrade catch up on what 0.22's walks never reached: files past the old cap, never scanned, and edits and deletions of tracked files there. Each such pass pushes one event for each kind of change it finds (`workspace:created`, `workspace:modified` or `workspace:deleted`), each listing every path, and a mount whose `wakeOnChange` admits that kind turns each into one message to the agent. Any pass that lists a directory larger than the cap, a listing or an agent-action scan included, also proves deletions there that 0.22 never proved.
+  - Going back to 0.22: its walks stop at the same 5000 files as before. It leaves the place alone, so coming forward again resumes there, unless 0.22 wrote a checkpoint meanwhile, which drops every place and starts each scope at its top.
+
+- Removing a single message that belongs to a body, a one-shard body's included, no longer fails: context-manager's `removeMessage` refuses any message in a body, so agent-framework now removes one as a range in offline recovery's suppressions, and in a Discord suppression resumed after a crash. The host `hide` command now hides a message stored as a body (a long one, in shards) whole, with every stored copy of it (a write cut short leaves a partial copy before its retry). Its range form takes what was stored between its two messages, from the earlier one's first copy through the later one's first, and every copy of both, each whole, so a copy stored outside that span is taken on its own, and nothing else stored after the later message began is taken. Offline recovery's suppressed ranges (`suppressRanges`) take the same: before, a range ran through the later message's last copy, taking what was stored between that message's copies, and left out a copy of the earlier message stored after it. Either form's operator-log entry lists at most 50 of the ids it removed, with `removedIdsTruncated` when there were more. It's refused as busy while a surgery holds the store, and a message with no Discord id never matches one. A module's removal of a message it added, and the coalescer's, take its whole body too, and an automatic rewind whose newest message is a shard of a body takes the whole body.
+
+- A lower context budget the agent was running at comes back at once after a restart, when a compile recorded it as reached and the boot's preflight says it still fits (context-manager #162). Before, every restore of a lower budget paced a new descent from the recipe's budget, on a strategy that can prepare a smaller window, so until the first compile settled it the agent reported `converging` and planned at the recipe's budget.
+  - **The marker.** The persisted runtime settings carry `contextBudgetReachedTokens` beside `contextBudgetTokens`. It is the record's own budget, written when a compile fits at it (a paced descent's settle included), and withdrawn when the context manager refuses that budget as over budget, even if the budget changed while that compile ran, unless a compile at that budget that started later has already ended with a fit or a refusal: of two compiles at one budget, the one that started later planned at the newer store, so an earlier-started one that ends after it is ignored. The context manager selects against the budget before it adds injections, so a compile with injections plans like one without, and the marker says the stored context fits the budget, not that a request with its injections, system prompt and tools does. A fit counts only if the live budget didn't change while the compile ran, and a settle only for a compile that began under that descent; each arm of a descent is a new one, to the same target included. What a compile showed stands only until the live budget changes: after a persisted change, immediate or paced, back to an earlier budget included, the record carries none until a compile fits at the new budget. A `persist: false` change leaves the record as it was, marker included. A compile must record a fit before an unmarked record can take the proof-based immediate path.
+  - **At boot**, each persisted setting is restored on its own: the think-text policy, then the tail and the pace, and the budget last. A budget below the recipe's whose record carries the marker is applied at once if the preflight says it fits now, and otherwise paced from the recipe's budget, as before. The preflight plans the stored context as the context manager will, with the restored tail and pace, so it sees a new `maxTokens` or strategy configuration a restart brings, and a context that grew while the agent ran at another budget; the system prompt, tools and injections are outside the context manager's budget. A budget at or above the recipe's is applied at once with or without the marker, as an increase always is.
+  - **If a compile at a budget below the recipe's that the boot applied at once is refused** before any compile at it has fit and before the budget is next written (an update that carries a budget, whatever its value, or a reset of it), the refusal withdraws the marker, and the agent makes the paced decrease a boot without the marker makes, from the recipe's budget: the budget alone, with the default pace when the strategy has none. Then it compiles again. If the budget can't be restored paced, the agent compiles at the recipe's budget with the budget kept set. This fallback runs once: a compile refused after it, including one already in flight at the boot's budget or the fallback's own compile at the recipe's, reports its own refusal, as does one the start order ignores. A tail, pace or think-text policy change leaves it in place.
+  - **A persisted setting never stops the agent booting,** except an invalid think-text policy, which still fails closed. A tail, pace or budget that can't be applied now (a tail or pace on a strategy without live settings, a budget no longer above `maxTokens`, a lower one restored paced on a strategy that can't prepare a smaller window) is kept set but unapplied, so a later persisting write keeps it in the record, and the agent runs at the recipe's for it. A `private` think-text policy beside such a setting still governs. When a marked budget isn't applied at once or a setting can't be applied, one log line says why, what couldn't be applied, and the budget that's set beside the one compiles plan at.
+  - **Smaller:** a patch can't set the field; a malformed persisted number (the marker, a budget, a tail or a pace) is ignored with a log line naming its kind; a record holding nothing else restores nothing. If reading the record fails at boot, the agent logs it and boots at the recipe's; a store that can't be read at all still fails agent creation at an earlier read of the same state, as before. A record that can't be read or written when a compile tells it is logged, and told again at the next compile at that budget.
+- Outside a descent, `previewAgentRuntimeSettings` and the budget preflight plan a patch at the reach its next compile plans at: the pace for a paced decrease, and the configured reach otherwise, so an immediate change, and a pace with no descent, preview at the configured reach. A preview taken during a descent plans under that descent's prepared window, and at its live pace when the strategy carries one, which a preview can't change.
+- The runtime settings snapshot (`getAgentRuntimeSettings`, `agent_settings` `get`) reports `effectiveContextBudgetTokens`, the budget compiles plan at now, beside `contextBudgetTokens`, the budget that's set. They differ while a lower budget converges, when compiles still plan at the budget the descent started from, and while a budget the agent couldn't apply is kept, when they plan at the budget it runs at. Code that builds an `AgentRuntimeSettingsSnapshot` itself, such as a test double, adds the field.
+
+- `previewAgentRuntimeSettings()` no longer throws when an agent's context manager (0.14, required since 0.21.1) refuses its queries, as after its strategy failed to initialize: it answers `{available: false, reason}`, with the agent's live budget and the patch's path, as it does for any preview it can't compute. So `resume()` no longer throws for such an agent either. It warns, naming the agent and the reason, and proceeds without a feasibility verdict for that agent: the verdict guards against an agent that would run over budget, and an agent whose manager refuses its compiles can't run. That manager refuses the agent's turns and writes until a `switchBranch` or `setStrategy` succeeds, and maintenance reports it.
+- Offline recovery (`createOfflineRecoveryBranch`) reads a sharded message's body as context-manager 0.14.0 does: a message continues the body before it only when it carries the same group id at a higher shard index. A document posted twice stores two copies under one group id, so an anchor at the end of one copy, or a suppression of one copy alone, is no longer refused. A selection inside one copy is still refused. An anchor at the end of a write that was cut short keeps that partial body and leaves out its retry, which context-manager 0.14.0 reads as a body of its own.
+
+- Requires context-manager 0.14.1 (was `^0.14.0`). In 0.14.0, under the
+  autobiographical strategy, a dry compile that was the first compile after a
+  message's removal left later compiles reading message positions from before
+  the removal, so every later compile could throw `UncoveredDropError` until
+  something rebuilt the order (anima-research/context-manager#180). Previews
+  now compile dry, and hiding or suppressing messages answers with one right
+  after it removes them, so with 0.14.0 a hide or a suppression could leave the
+  agent unable to compile its next turn.
+- context-manager 0.14.1 also reads a calibration record written by 0.13.0 or
+  earlier, which has no pricing stamp, as provisional rather than learned
+  (anima-research/context-manager#179). It may be discarded at load; one above
+  1 that puts a compile over budget drops to 1; and the first provider sample
+  replaces it. So an agent whose autobiographical strategy uses adaptive
+  resolution, upgrading from such a store, can compile a different window when
+  the record is read, and again when the first provider sample sets the
+  multiplier, rather than over about ten samples. A store that has already run
+  a committing compile on 0.14.0 keeps its re-stamped multiplier;
+  context-manager 0.14.0's notes give the one-time reset it may still need.
+
+- A start that continues a logical turn now keeps what the turn has decided
+  about where its speech is published. Those starts are a framework retry
+  after a stream error, the re-inference that consumes unstreamed tool
+  results, and the compile a provider-capacity hold defers a turn to (#314).
+  Before, each began with fresh routing:
+  - in hybrid mode, the hold after `>>>skip_reply` was dropped, so the new
+    stream's unprefixed prose was published to the turn's locus;
+  - the sticky destination was dropped in both modes, so unprefixed prose
+    went to the locus in hybrid mode, and in explicit mode bounced with a
+    notice and a wake, while the new stream streamed nothing;
+  - the turn's locus was resolved again: a retry lost a mid-turn addressed
+    re-pin, a re-inference took the locus of whichever wake started it, and
+    a held turn's later compile let a newer ambient message move it.
+
+  A hybrid stream's live outgoing deltas still start at the turn's locus,
+  as before.
+- A message that no tool boundary weighed now moves the turn's locus at the
+  turn's next start, by the rule a mid-turn message follows: a
+  conversational message that addressed the agent, or that follows up in a
+  channel the turn sent into, with the same
+  `[routing] The conversation moved to …` notice. That covers a message that
+  arrives during a capacity hold or before a re-inference, and one drained
+  at a budget restart's over-budget boundary, which before never moved the
+  locus. Ambient traffic in a channel the turn hasn't sent into, reactions
+  and system markers don't move it. Neither does a message the agent won't
+  see: one that tune-out diverts, or one removed before that start, such as
+  an unread coalesced message its server retracted. The newest qualifying
+  message that remains decides. Residents read one message slot, and a
+  tool boundary weighs only the messages drained for its own agent, so each
+  resident's open turn also takes, by the same rule, a message stored for
+  another resident whenever it lands, including one that resident's
+  boundary drained. A message tagged as addressed addresses the account the
+  residents share, so it can move any resident's turn.
+- A silent turn's tool boundary no longer re-pins its locus or adds a
+  `[routing]` notice to its stream.
+- For a trunk agent, the channel context passed to `beforeInference` hooks
+  (`channels.defaultOutgoing`) names the turn's locus once the turn has one.
+  After a re-pin, a later start of the turn reports the locus it moved to,
+  where its unprefixed speech is published unless a hybrid `>>>` destination
+  takes it, not the channel that triggered the turn. A conversation fork
+  still reports its home channel.
+- A start that fails before its stream exists now lands the messages
+  deferred during it, as a stream's end does. Before, they waited for the
+  agent's next start and landed after any message stored in between. A
+  start that throws outside its stream's failure handling ends its logical
+  turn, so the agent's next start opens its own, and an ephemeral run
+  (`runEphemeralToCompletion`) whose start throws that way fails at once
+  with the start's error. Before, the run waited for its watchdog: 30 s by
+  default before its inference started, or 15 minutes once it had.
+- A send's engaged channel is recorded on the turn that called the tool,
+  even when the open that follows the send comes after that turn has ended.
+  A `channel_open` moves the locus of the turn that called it while that
+  turn is open. Its result tells the agent of the move, so one that comes
+  after the turn ended moves nothing: the result is dropped unread.
+
+- The Discord module's typing keepalive now stops when a turn completes normally, at `inference:completed`. It stopped only at `inference:turn_ended`, `inference:aborted`, `inference:failed` and `inference:exhausted`, so with `autoTyping` on, its default, the indicator went on refreshing after an ordinary reply until the agent's next `inference:started` or its five-minute cap. `onTrace`'s documentation now names `inference:completed` as a turn's normal end, beside the other four.
+
+- `agent-framework-mcp`, the MCP server's bin, now runs as an installed
+  command on Linux and macOS. Its file had no `#!` line, so the shell ran it
+  as a shell script, and it started only when `argv[1]` ended in
+  `mcp-server.js`, which the path of npm's link doesn't. The command is now
+  a file of its own that always starts the server, run through the link or
+  by its own path, as `mcp-wrapper.sh` runs it. `McpServer` moved to a
+  module of its own, which the package root still exports, so importing or
+  bundling the package never starts a server. Before, an entry script, or
+  a bundle, named `mcp-server.js` did. The server is a client of the
+  framework's WebSocket API (`AGENT_FRAMEWORK_WS_URL`, default
+  `ws://localhost:8765/ws`), which must be running: without it, it prints
+  "Failed to start MCP server" and exits 1.
+
+- A connect or reconnect whose stdio server fails its handshake, by exiting,
+  by a transport error or by not answering in time, such as a server that
+  exits at startup for want of a token, now keeps the last of the server's
+  stderr: at most 2,048 UTF-16 code units, after a `…` when earlier output
+  was dropped. The error named only how the handshake failed, and what the
+  server wrote about why was dropped (#339). The stderr stays out of the
+  error's message, which travels wherever errors go, tool results included,
+  since a server's stderr can hold a credential. The error carries it as
+  `stderrTail`, the connection's `'connect-failed'` and `'reconnect-failed'`
+  events carry it beside `error`, the host's log line about the failure
+  prints it a line at a time, and the `mcpl:server-connect-failed` trace
+  carries it as `stderrTail`. The `mcpl-down` ops alert, which posts to the
+  operator's webhook, leaves it out. An `initialize` error answer, where the
+  server gives its own reason, is unchanged.
+- A stdio server's last stderr line, when it has no newline, is now emitted
+  as a `'stderr'` line once the stream ends. It was kept until more output
+  completed it, so it never arrived (#339).
+- A stdio server's stderr is decoded as one stream, so a character whose
+  bytes arrive in two reads is no longer replaced with U+FFFD in its line.
+
+- `StdioTransport.close()` resolves for a child that a signal other than its
+  own `kill()` has already ended, such as an OOM kill or a crash. It waited
+  for an `exit` event that had already fired. So a connect or reconnect whose
+  child died that way during `initialize` never settled, `close()` on its
+  connection never settled, and `stop()` never returned, or, given a teardown
+  timeout, failed when it ran out (#331).
+- An error an MCPL transport reports while nothing else listens for it is
+  now logged instead of thrown as an uncaught exception. That covers a
+  transport that `McplServerConnection` keeps for `close()` while a
+  reconnect's handshake finishes (#332), a transport whose handshake has
+  settled until the connection takes it, and one that a failed handshake is
+  closing. A malformed frame from a WebSocket server is such an error.
+
+- An error on a stdio MCPL child's stdin or stdout, such as a write's EPIPE
+  from a child that closed its stdin but kept running, is now handled as the
+  end of that child. Such an error was thrown as an uncaught exception, and
+  where a host caught it, a child that kept running left the connection
+  connected, with each request waiting out its timeout. Those pipes carry the
+  protocol, so the transport sends the child SIGTERM if it's still running,
+  and when the child exits, the transport's close names the error (`child
+  process exited, and its pipe failed with write EPIPE`), unless the host had
+  closed the transport first. The connection handles that close as any other
+  exit: it rejects its pending requests, and reconnects if `reconnect` is set.
+  A child that ignores SIGTERM keeps running, and its requests still wait out
+  their timeouts. A read error on the child's stderr, which was thrown as an
+  uncaught exception too, now reaches the transport's `'error'` listener if
+  it has one and is otherwise dropped: once the connection is wired it ends
+  nothing, and during a handshake it fails the handshake.
+
+- A stdio MCPL server whose command can't be spawned, such as a command that
+  doesn't exist, now fails its connect or reconnect attempt with
+  `MCPL server "<id>" could not be started: ` and the runtime's spawn error,
+  such as Node's `spawn <command> ENOENT`, which is also its `cause`. Node
+  reports a failed spawn after `spawn()` has returned, and a reconnect
+  attempt, which runs from a timer, got that report before anything listened
+  for it. So it was thrown as an uncaught exception, which ends a host that
+  has no `uncaughtException` handler (#336).
+
+- The physical-window projection (#92) projects from the stream's latest
+  provider call that reported a prompt. Membrane's usage event is the stream's
+  running total across the tool loop, and the projection added it as the
+  prior call's prompt and output, so from the boundary after a stream's
+  second call on, an agent with `physicalWindowTokens` set could restart its
+  stream even when the next request would have fit. Its physical-window
+  restart now comes only when that call's prompt and output, what the stream
+  has grown by since that call, the round about to be appended and the
+  response reserve together cross the window (`maxStreamTokens` still
+  restarts on its own), and the `inference:stream_restarted` trace's
+  `inputTokens` for a `physical_window` restart is that projection. The
+  growth is the blocks appended since that call and the output of each later
+  call that reported no prompt. A call's output of 0 counts as `maxTokens`,
+  the bound on it, since a call that ends at a tool boundary always wrote a
+  `tool_use`. The projection runs once a call on the stream has reported a
+  prompt. `Agent.lastStreamRealInputTokens` holds that call's prompt, which
+  is what the provider billed, and `lastStreamOutputTokens` its output;
+  `Agent.lastStreamUnreportedTokens` holds the growth since.
+  `lastStreamInputTokens` stays the stream's accumulated fresh input, which
+  is what `maxStreamTokens` checks.
+
+- **`stop()` waits for an operator's operation that is already running, and
+  refuses new ones.** A quiesce, a resume, a
+  `host/command`, a store surgery, a branch switch, an undo or redo's config
+  materialization, a puppet tool call, an awareness sync, or an MCPL
+  connect, disconnect or restart admitted before `stop()` began now
+  finishes before the event gate, the modules, the MCPL connections and the
+  store go, unless a budget runs out first (see the operators' note below).
+  Before, such an operation kept running through the teardown. A resume
+  waiting on its maintenance pass or previews could go on to leave quiesce
+  while the host stopped, so the host booted unquiesced; a puppet call
+  could find the store closed partway; a surgery could still be running at
+  the final sync; a `host/command` could answer after its connection
+  closed; an API server branch switch requested during `stop()` moved the
+  branch, mounted its config after the store had closed and answered
+  success; and a connect could leave a connection that nothing closed.
+  - Once `stop()` has begun, `quiesce()`, `resume()`, `rollbackToMessage()`,
+    `suppressMessages()`, `switchBranch()`, `undoLastTurn()`, `redo()`,
+    `maintenanceTick()`, `puppetToolCall()`, `syncDiscordAwarenessMarkers()`,
+    `connectMcplServer()`, `disconnectMcplServer()` and `restartMcplServer()`
+    refuse with "<verb> refused: the framework is stopping" before they
+    read or change
+    anything, as a `host/command` already did. That includes a call made
+    from a trace emitted inside `stop()`'s own start, before its queue has
+    closed, and the MCPL listener now refuses a `host/command` from that
+    moment too.
+  - The awareness delivery that a surgery, a branch switch, a `host/command`
+    undo, or the API server's undo or redo starts
+    (`startDiscordAwarenessDelivery()`) runs like a server's drain: `stop()`
+    doesn't wait for it, and once `stop()` has begun none is started, since
+    the teardown would cut it off. The durable outbox keeps the marks, and
+    the next start delivers them.
+  - `stop()` also waits for what those operations start while it waits: the
+    config materialization that undo, redo and the two surgeries start
+    without waiting for it themselves. The framework now logs a failed
+    materialization.
+  - A quiesce stops waiting for its drain, or for an abandon's grace, once
+    `stop()` begins. `stop()` cancels the streams and waits for the event
+    loop and the operations above, puppet calls included. It doesn't wait
+    for any other turn that holds its token with no stream to cancel, so a
+    quiesce cut short can report `drained: false`. The host stays quiesced,
+    so it boots quiesced. A drain cut short logs that it stopped waiting,
+    emits no `host:quiesce` trace, and leaves an abandon it hadn't begun to
+    `stop()`, which cancels the streams. An abandon whose grace is cut short
+    reports its abandon as usual.
+  - A resume refuses at its start once `stop()` has begun, whether or not
+    the host is quiesced, and checks again after its maintenance and preview
+    waits, before it leaves quiesce, so a quiesced host stays quiesced. A
+    resume past that point finishes, its durable clear included, and its log
+    says that the parked wakes it released won't run.
+  - A host's trace listener can call `stop()` from inside an operation, such
+    as on its completion trace, and `stop()` still waits for that operation.
+    A multi-turn `host/command` undo stopped that way still undoes every
+    turn it was asked for.
+  - `undoLastTurn()` and `redo()` refuse with `OperatorActionError`
+    (`agent-busy`) while a surgery or a branch switch holds the store,
+    instead of moving the branch beneath it.
+  - A `stop()` called from a trace emitted inside `stop()`'s own start, as
+    the push coalescer's suspension emits for a render in flight, gets the
+    attempt already running. Before, it started a second teardown beside
+    the first, which then failed at its final sync, and every later
+    `stop()` rejected with "Store has been closed" for a framework that had
+    stopped.
+  - While the host stops, an MCPL awareness barrier that fails no longer
+    recycles the connections, which `stop()` is closing. The framework
+    releases it as it releases a completed one, so nothing waits on a
+    rejected barrier, and unless the host is quiesced, what it held back
+    reaches the listeners' stopping refusal.
+  - **For operators:** `stop()` waits as long as an operation's own work
+    runs. An awareness drain finishes its deliveries, each within its own
+    deadline, and a puppet call waits for its tool, so a tool on an MCPL
+    server that never answers holds `stop()` until the request times out
+    (60 s by default, never with `requestTimeoutMs: 0`).
+    `stop(teardownTimeoutMs)` gives this wait its own budget, shared by all
+    its rounds, and then gives the modules' and MCPL's teardown the budget
+    again, so a budgeted `stop()` can take up to twice the budget, beside
+    the stream and event-loop waits that no budget bounds. An operation
+    that outlasts the budget fails `stop()` with a `ShutdownTimeoutError`
+    that names it, on its own or inside an `AggregateError` when other
+    cleanup failed too. `stop()` still tears down the rest, while that
+    operation may still run, and keeps the store open, so `stop()` can be
+    called again.
+
+- A turn the framework drops before it sends anything, because its agent was replaced or removed, or the framework was stopping or had been stopped and started again while the turn was assembled or compiled, now ends with `inference:aborted`, whose `reason` says which, and records `lastInference.endedAt`. The turn had emitted `inference:started` and then no terminal event, so a module that brackets a turn between them, such as a typing indicator, kept that turn open, and the health snapshot showed it still running. When a newer turn of the agent's name already holds its turn token, the dropped turn emits and records nothing, since both carry only the name and would end that newer turn. The web UI in `ui/` now also returns an agent to idle on `inference:turn_ended`, `inference:aborted` and `inference:exhausted`, where it had looked only at `inference:completed` and `inference:failed`.
+
+- Compiles that are never sent are now dry runs (context-manager's
+  `SelectOptions.dryRun`): `previewActivation`, which undo, rollback and
+  hiding messages also run for their "last visible" line; the API's
+  `message.list` and agent context commands; and a conversation fork's seed
+  (the template's compile and the new namespace's emptiness check). A
+  committing compile persists fold resolutions and queues the compression its
+  fold plan calls for. Once context-manager's thinking binding
+  (anima-research/context-manager#160, not yet released) ships, it will also
+  commit stamps and join the branch's compiles awaiting acceptance, where one
+  never sent can cost a live stream's later replies their thinking. A dry run
+  does none of that, and it leaves the agent's consumed watermark and a
+  prepared budget change alone, as `previewActivation` already promised; a
+  preview at the live window used to settle a converging budget change.
+  `ActivationRequestOptions` gains `dryRun`.
+- With context-manager 0.14.1, a dry run leaves what a select leaves behind as
+  the last committing compile left it: no chunk record, no calibration, and
+  none of the bookkeeping the next compile or an observer reads. The one thing
+  it can still leave is the release of a compression hold whose deadline has
+  passed, as any compile does.
+- Under the autobiographical strategy, a dry run still refuses a budget the
+  context can't fit, as a committing compile does: context-manager skips only
+  its post-pick check, and an adaptive fold plan that doesn't fit then
+  overruns at the middle's emission, with a refusal that names the tokens and
+  the limit. So at such a budget a preview, `message.list` and the API's agent
+  context command still fail, and a fork whose template's fold plan doesn't
+  fit the default budget its seed is compiled at still fails to spawn.
+  Windowed passthrough, though, skips its refusal of a newest message larger
+  than the budget on a dry run: where they failed on such a message, a
+  preview, `message.list` and the agent context command now return it alone,
+  larger than the budget, and a fork is seeded with it. Passthrough, the
+  default strategy, keeps the newest messages that fit, as before.
+- A conversation fork's seed no longer copies the template's `thinking` and
+  `redacted_thinking` blocks, and leaves out a message with no content left.
+  A fork inherits the template's conversation, not its reasoning. A signed
+  block was minted under the template's prefix, which the fork's system
+  prompt, tools and scoped injections don't promise to match, so on an
+  account that enforces thinking binding the fork's first request could be
+  refused (inferred from probes of other requests, not observed on a fork).
+  Unsigned reasoning, from text-only providers or XML mode, goes by the same
+  rule. On models that don't bind thinking to its prefix (by probes, Fable 5
+  and Sonnet 5), a copy would have been kept, so there the fork loses the
+  template's reasoning. That a provider accepts the stripped seed rests on
+  probes of two shapes, each sent without its thinking: an assistant text
+  turn followed by a new user turn, on Sonnet 5.5, Fable 5.1, Fable 5 and
+  Sonnet 5; and a tool round, a `tool_use` with no thinking before it and
+  its result, continued by the model, on those four, Opus 5.5 and Haiku 5.5.
+  Other thinking models weren't probed.
+- On the OpenAI Responses path, the seed's items that were paired with a
+  reasoning item it left out (the message's text, a function call) lose
+  their provider-native raw item and render from their fields, so the fork
+  replays no item id whose reasoning is gone. Opaque items, such as a
+  compaction or a hosted tool's call, keep theirs.
+- A fork's seed keeps no tool call whose result isn't in it, and no result
+  whose call isn't (context-manager's `stripUnpairedToolBlocks`): the rest of
+  their messages stays, and a message left with nothing becomes
+  `[tool call omitted]`. A fork spawned while the template was between a
+  tool round's call and its results (the coalescer can spawn one outside the
+  event loop) gave the fork's first request an unanswered call under the
+  passthrough strategies.
+- A fork's spawn logs one line when its seed left something out:
+  `[conversation] <fork>: seeded from <template> without N thinking
+  block(s), N unanswered tool call(s) and N orphaned tool result(s)`.
+
 ## 0.22.1 — 2026-10-14
 
 **Operators upgrading from 0.22.0:** a provider's stated `retry-after` now

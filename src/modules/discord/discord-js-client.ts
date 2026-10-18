@@ -29,6 +29,17 @@ export interface DiscordJsClientConfig {
   channelIds?: string[];
 }
 
+/** An attachment as both a live message and history carry it. */
+function toAttachment(a: Attachment): DiscordAttachment {
+  return {
+    id: a.id,
+    filename: a.name ?? 'unknown',
+    url: a.url,
+    contentType: a.contentType ?? undefined,
+    size: a.size,
+  };
+}
+
 export class DiscordJsClient implements DiscordClientInterface {
   private client: Client;
   private token: string;
@@ -68,7 +79,11 @@ export class DiscordJsClient implements DiscordClientInterface {
     });
 
     this.client.on('messageUpdate', (_oldMessage, newMessage) => {
-      if (!newMessage.content || !this.editHandler) return;
+      // content is null for a partial message, one discord.js hadn't cached
+      // and whose update carried no text, so there's no text to compare; a
+      // cached message keeps the text it had. An edit that leaves no text,
+      // beside an attachment, is '' and is still an edit.
+      if (typeof newMessage.content !== 'string' || !this.editHandler) return;
       this.editHandler(newMessage.id, newMessage.content);
     });
 
@@ -114,13 +129,7 @@ export class DiscordJsClient implements DiscordClientInterface {
   }
 
   private convertMessage(message: Message): DiscordMessageData {
-    const attachments: DiscordAttachment[] = message.attachments.map((a: Attachment) => ({
-      id: a.id,
-      filename: a.name ?? 'unknown',
-      url: a.url,
-      contentType: a.contentType ?? undefined,
-      size: a.size,
-    }));
+    const attachments = message.attachments.map(toAttachment);
 
     // Extract mentioned user IDs
     const mentionedUserIds = message.mentions.users.map((u: User) => u.id);
@@ -160,7 +169,7 @@ export class DiscordJsClient implements DiscordClientInterface {
     channelId: string,
     content: string,
     options?: { replyTo?: string; createThread?: { name: string } }
-  ): Promise<{ messageId: string }> {
+  ): Promise<{ messageId: string; threadFailure?: string }> {
     const channel = await this.client.channels.fetch(channelId);
     if (!channel || !('send' in channel)) {
       throw new Error(`Channel ${channelId} not found or not a text channel`);
@@ -173,7 +182,13 @@ export class DiscordJsClient implements DiscordClientInterface {
     });
 
     if (options?.createThread && 'threads' in textChannel) {
-      await message.startThread({ name: options.createThread.name });
+      try {
+        await message.startThread({ name: options.createThread.name });
+      } catch (error) {
+        // The message is out, so the caller counts it as sent before it
+        // reports why its thread wasn't started.
+        return { messageId: message.id, threadFailure: error instanceof Error ? error.message : String(error) };
+      }
     }
 
     return { messageId: message.id };
@@ -341,6 +356,7 @@ export class DiscordJsClient implements DiscordClientInterface {
       authorName: m.author.username,
       isBot: m.author.bot,
       content: m.content,
+      attachments: m.attachments.map(toAttachment),
       timestamp: m.createdAt,
       replyTo: m.reference
         ? {

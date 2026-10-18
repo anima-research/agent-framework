@@ -16,6 +16,7 @@ import { EventEmitter } from 'node:events';
 
 import { AgentFramework } from '../src/framework.js';
 import { FeatureSetManager } from '../src/mcpl/feature-set-manager.js';
+import { McplServerRegistry } from '../src/mcpl/server-registry.js';
 import { CapabilityGrant, computeGrant, expandAdvertisementShorthand } from '../src/mcpl/capability-grant.js';
 import type { McplCapabilities, McplServerConfig } from '../src/mcpl/types.js';
 
@@ -87,7 +88,9 @@ function makeHarness() {
 
   const connection = new ManifestFake();
   connection.capabilities = expandAdvertisementShorthand(INITIAL);
-  fw.mcplServerRegistry = { getAllServers: () => [connection], getServer: (id: string) => (id === 'srv' ? connection : null) };
+  const registry = new McplServerRegistry();
+  (registry as any).servers.set('srv', connection);
+  fw.mcplServerRegistry = registry;
 
   // Model post-§5.3 state: initial policy done, full grant active.
   const grant = computeGrant(connection.capabilities, config, { mcpToolsAdvertised: false });
@@ -95,7 +98,7 @@ function makeHarness() {
   connection.establishGrant(grant);
   connection.events = []; // discard setup noise
 
-  return { fw, connection, traces };
+  return { fw, connection, traces, registry };
 }
 
 const settle = () => new Promise((r) => setImmediate(r));
@@ -176,14 +179,17 @@ test('refusal with fallback mcp-only: empty grant, empty-derived feature state',
   assert.equal(connection.closed, false);
 });
 
-test('refusal with fallback close: the transport is closed', async () => {
-  const { fw, connection } = makeHarness();
+test('refusal with fallback close: the transport is closed and the server unregistered', async () => {
+  const { fw, connection, registry } = makeHarness();
   connection.answerPolicy = 'refuse-close';
   connection.nextManifest = () => INITIAL;
 
   await fw.handleManifestChanged(connection, { revision: 'sha256:r2', domains: ['capabilities'] });
 
   assert.equal(connection.closed, true, 'fallback close must be honored (§6.7)');
+  // The fake's close() emits no 'close', as a server's doesn't once it's down
+  // between retries, so only a close through the registry unregisters it.
+  assert.equal(registry.getServer('srv'), null);
 });
 
 test('failed fetch: previous manifest and grant stand untouched', async () => {
@@ -210,4 +216,40 @@ test('announcements coalesce: rapid-fire N announces cause one immediate fetch',
 
   const fetches = connection.events.filter((e) => e.kind === 'fetch').length;
   assert.equal(fetches, 1, `rapid announcements must coalesce (§17.8), got ${fetches} fetches`);
+});
+
+test('an announcement without params is handled like any other: one receipt naming no domains, then the tools-list refresh', async () => {
+  // A notification may carry no params. The announcement's fields are hints
+  // the server sends; the change itself is read from the fetched manifest.
+  const { fw, connection, traces } = makeHarness();
+  let refreshed = 0;
+  fw.handleToolsListChanged = () => { refreshed++; };
+  connection.nextManifest = () => ({
+    version: '0.5',
+    pushEvents: true,
+    channels: { incoming: true },
+    featureSets: { chat: { description: 'chat', uses: ['pushEvents', 'channels.incoming', 'channels.publish'] } },
+  }) as unknown as McplCapabilities;
+
+  await fw.handleManifestChanged(connection, undefined);
+
+  assert.ok(!connection.grant.has('channels.publish'), 'the fetched manifest was applied');
+  const receipts = traces.filter((t) => t.type === 'mcpl:manifest-change-receipt');
+  assert.equal(receipts.length, 1, 'exactly one receipt');
+  assert.deepEqual(receipts[0].announcedDomains, []);
+  assert.equal(refreshed, 1, 'the tools list was refreshed');
+});
+
+test("an announcement's domains are reported only as strings: anything else names none", async () => {
+  const { fw, traces } = makeHarness();
+  const domainsOf = async (announce: unknown) => {
+    fw.manifestRefreshState = new Map(); // each announcement its own refresh, past the floor
+    const before = traces.length;
+    await fw.handleManifestChanged(fw.mcplServerRegistry.getServer('srv'), announce);
+    return traces.slice(before).filter((t) => t.type === 'mcpl:manifest-change-receipt').map((t) => t.announcedDomains);
+  };
+  assert.deepEqual(await domainsOf({ domains: 'capabilities' }), [[]]);
+  assert.deepEqual(await domainsOf({ domains: ['capabilities', 7, null, 'featureSets'] }), [['capabilities', 'featureSets']]);
+  assert.deepEqual(await domainsOf('capabilities'), [[]]);
+  assert.deepEqual(await domainsOf(null), [[]], 'params: null, as a server may send them');
 });

@@ -14,7 +14,7 @@
  */
 
 import type { ContentBlock } from '@animalabs/membrane';
-import { INLINE_WITHHELD_TEXT, isInlineContradiction, referenceStubOrNull } from './references.js';
+import { convertBlock } from './convert-block.js';
 import type { ContextInjection } from '@animalabs/context-manager';
 
 import type {
@@ -28,6 +28,7 @@ import type { McplServerRegistry } from './server-registry.js';
 import type { McplServerConnection } from './server-connection.js';
 import type { FeatureSetManager } from './feature-set-manager.js';
 import { CapabilityGrant } from './capability-grant.js';
+import { logDetail, logValue } from './log-value.js';
 
 /** Timeout for beforeInference per server (fail-open). */
 const BEFORE_INFERENCE_TIMEOUT_MS = 5_000;
@@ -58,79 +59,13 @@ function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise
 // ============================================================================
 
 /**
- * Convert a single MCPL wire-format content block to a membrane ContentBlock.
- */
-function convertBlock(block: McplContentBlock): ContentBlock {
-  switch (block.type) {
-    case 'text':
-      return { type: 'text', text: block.text };
-
-    case 'image':
-      if (isInlineContradiction(block)) {
-        // RFC-005 vector 2: inline data claiming bulk disposition — fail
-        // closed, withhold the data (checked BEFORE the data branch).
-        return { type: 'text', text: INLINE_WITHHELD_TEXT };
-      }
-      if (block.uri && block.disposition) {
-        // RFC-005 uri-form media with a disposition claim: stub, do not
-        // hand the URI to the provider or inline it.
-        return { type: 'text', text: referenceStubOrNull(block, 'attachment on context injection') ?? '[reference]' };
-      }
-      if (block.data && block.mimeType) {
-        return {
-          type: 'image',
-          source: { type: 'base64', data: block.data, mediaType: block.mimeType },
-        };
-      }
-      if (block.uri) {
-        return {
-          type: 'image',
-          source: { type: 'url', url: block.uri },
-        };
-      }
-      // Malformed image block — degrade to text
-      return { type: 'text', text: '[Image: missing data]' };
-
-    case 'audio':
-      if (isInlineContradiction(block)) {
-        // RFC-005 vector 2: inline data claiming bulk disposition — fail
-        // closed, withhold the data (checked BEFORE the data branch).
-        return { type: 'text', text: INLINE_WITHHELD_TEXT };
-      }
-      if (block.uri && block.disposition) {
-        // RFC-005 uri-form media with a disposition claim: stub, do not
-        // hand the URI to the provider or inline it.
-        return { type: 'text', text: referenceStubOrNull(block, 'attachment on context injection') ?? '[reference]' };
-      }
-      if (block.data && block.mimeType) {
-        return {
-          type: 'audio',
-          source: { type: 'base64', data: block.data, mediaType: block.mimeType },
-        };
-      }
-      // Audio without inline data — degrade to text
-      return { type: 'text', text: `[Audio: ${block.uri ?? 'missing data'}]` };
-
-    case 'resource':
-      // RFC-005: reference blocks become bounded stubs — never raw URIs
-      // (a signed URL is a bearer credential that looks like a location).
-      return { type: 'text', text: referenceStubOrNull(block, 'attachment on context injection') ?? '[reference]' };
-
-    default:
-      // Unknown wire block types previously fell off the exhaustive switch
-      // and propagated `undefined` into ContentBlock[]. Fail visibly.
-      return { type: 'text', text: `[unrecognized content block: ${(block as { type?: string }).type ?? 'untyped'}]` };
-  }
-}
-
-/**
  * Convert MCPL injection content (string shorthand or block array) to membrane ContentBlock[].
  */
 function convertContent(content: string | McplContentBlock[]): ContentBlock[] {
   if (typeof content === 'string') {
     return [{ type: 'text', text: content }];
   }
-  return content.map(convertBlock);
+  return content.map((block) => convertBlock(block, 'attachment on context injection'));
 }
 
 /**
@@ -153,6 +88,10 @@ export class HookOrchestrator {
   private registry: McplServerRegistry;
   private featureSetManager: FeatureSetManager;
   private _isInHook = false;
+  /** Servers already told that an injection's namespace wasn't a string. */
+  private readonly namespaceWarned = new Set<string>();
+  /** Server and namespace pairs already told that a system injection held a block that isn't text. */
+  private readonly notShownWarned = new Set<string>();
 
   constructor(registry: McplServerRegistry, featureSetManager: FeatureSetManager) {
     this.registry = registry;
@@ -261,26 +200,92 @@ export class HookOrchestrator {
         continue;
       }
 
+      // One server's malformed answer, or one malformed injection in it, is
+      // that server's to fix: it's left out with a line naming the server,
+      // and every other injection still arrives. Unguarded, a throw here
+      // leaves fanOutBeforeInference, and the framework's catch around the
+      // whole hook drops every server's injections for the turn.
+      const answered: unknown = result.contextInjections;
+      if (answered !== undefined && answered !== null && !Array.isArray(answered)) {
+        console.error(`[mcpl] ${server.id}: dropped its beforeInference injections — contextInjections isn't an array`);
+        continue;
+      }
       // §5.4/§10.8: authorize EACH injection by its typed position against
       // the grant CURRENT NOW, at response receipt — not when the request
       // was sent. A revocation that landed while the hook was in flight is
       // enforced here without extra machinery.
-      if (result.contextInjections && result.contextInjections.length > 0) {
-        for (const mcplInj of result.contextInjections) {
+      for (const mcplInj of (answered ?? []) as McplContextInjection[]) {
+        try {
           const leaf = INJECT_LEAVES.find((l) => l.position === mcplInj.position);
           if (!leaf || !CapabilityGrant.of(server).has(leaf.path)) {
             console.error(
               `[mcpl] ${server.id}: dropped beforeInference injection at position ` +
-                `"${mcplInj.position}" — not in the effective grant (§10.8)`,
+                `${logValue(mcplInj.position)} — not in the effective grant (§10.8)`,
             );
             continue;
           }
-          injections.push(convertMcplInjection(mcplInj));
+          if (typeof mcplInj.namespace !== 'string') this.readNamespace(server.id, mcplInj.namespace);
+          const injection = convertMcplInjection(mcplInj);
+          if (injection.position === 'system') this.noteBlocksNotShown(server.id, mcplInj.namespace, injection.content);
+          injections.push(injection);
+        } catch (error) {
+          // Such as a null block, content that isn't an array, a null
+          // injection, or a namespace that can't be read as text.
+          const position = (mcplInj as { position?: unknown } | null | undefined)?.position;
+          console.error(
+            `[mcpl] ${server.id}: dropped beforeInference injection at position ${logValue(position)} ` +
+              `— it couldn't be read: ${logDetail(error instanceof Error ? error.message : error)}`,
+          );
         }
       }
     }
 
     return injections;
+  }
+
+  /**
+   * Checks a namespace that isn't a string, which §10.4 doesn't allow. One
+   * that can be read as text is kept as it is, and its server's operator is
+   * told once: context-manager reads it as its text when it writes a
+   * beforeUser or afterUser injection's namespace into a participant's name,
+   * as it always has. One with no text form would throw there, after the
+   * catch around each injection, and fail the turn, so it throws here, and
+   * its injection alone is left out, whatever its position.
+   */
+  private readNamespace(serverId: string, namespace: unknown): void {
+    let text: string;
+    try {
+      text = String(namespace);
+    } catch {
+      throw new Error("its namespace isn't a string and can't be read as text");
+    }
+    if (this.namespaceWarned.has(serverId)) return;
+    this.namespaceWarned.add(serverId);
+    console.error(
+      `[mcpl] ${serverId}: a beforeInference injection's namespace isn't a string, which §10.4 requires, so it keeps the ` +
+        `injection to no channel and every agent gets it; where it names a participant, it's read as its text, ${logValue(text)}; ` +
+        'this line prints once per server while the host runs',
+    );
+  }
+
+  /**
+   * The system prompt is text, so an agent given a `system` injection reads
+   * a line in place of each of its blocks that isn't text (the agent's
+   * buildSystemPrompt). The server meant those blocks for the model, so its
+   * operator is told, once per server and namespace, as the server's
+   * injections are gathered, whichever agents are given them. The namespace
+   * is read as its text, which readNamespace has checked it has.
+   */
+  private noteBlocksNotShown(serverId: string, namespace: unknown, content: ContentBlock[]): void {
+    if (!content.some((block) => block.type !== 'text')) return;
+    const key = `${serverId}\u0000${String(namespace)}`;
+    if (this.notShownWarned.has(key)) return;
+    this.notShownWarned.add(key);
+    console.error(
+      `[mcpl] ${serverId}: a system injection in namespace ${logValue(namespace)} holds a block that isn't text, ` +
+        "which the system prompt can't carry, so an agent given the injection reads a line in place of each such block; " +
+        'this line prints once per server and namespace while the host runs',
+    );
   }
 
 }

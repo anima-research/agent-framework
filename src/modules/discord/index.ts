@@ -8,6 +8,7 @@
  */
 
 import type { ContentBlock } from '@animalabs/membrane';
+import type { StoredMessage } from '@animalabs/context-manager';
 import type {
   Module,
   ModuleContext,
@@ -24,11 +25,13 @@ import type {
   DiscordModuleConfig,
   DiscordModuleState,
   ConversationContext,
+  DiscordAttachment,
   DiscordClientInterface,
   DiscordMessageData,
   DiscordMessageEvent,
   DiscordEditEvent,
   DiscordDeleteEvent,
+  HistoryMessage,
   SendInput,
   SendDMInput,
   ReplyInput,
@@ -42,6 +45,7 @@ import type {
   FetchHistoryInput,
 } from './types.js';
 import { formatZonedDateTime, resolveTimeZone } from '../../timezone.js';
+import { logValue } from '../../mcpl/log-value.js';
 
 // Re-export event types for consumers who want to handle them
 export type { DiscordMessageEvent, DiscordEditEvent, DiscordDeleteEvent } from './types.js';
@@ -95,6 +99,128 @@ const TEXT_FILE_EXTENSIONS = [
 
 const CONVERSATION_TIMEOUT_MS = 30 * 60 * 1000; // 30 minutes
 
+/** What the agent reads for a text attachment whose contents couldn't be
+ *  fetched: by an error, or by an answer that wasn't OK. */
+function attachmentNotFetched(filename: string): { type: 'text'; text: string } {
+  return { type: 'text', text: `[Attachment: ${filename} (failed to fetch)]` };
+}
+
+/** What a stored message reads when it has no text of its own and nothing the
+ *  host added, so the agent still sees that a message was there. */
+const EMPTY_MESSAGE = '[Empty message]';
+
+/**
+ * Metadata on a stored Discord message whose first block is its own text,
+ * '' when it has none, and every block after it the host's: images, inlined
+ * file text, attachment notes and EMPTY_MESSAGE. An edit replaces content and
+ * can't touch metadata, so the mark holds for the row's life, and it tells an
+ * edit or a sync which block is Discord's to replace. For the same reason a
+ * row stored before the mark never gets it, even once a history sync
+ * rebuilds it in this layout. The request builder drops an empty text block,
+ * as it does wherever one occurs.
+ */
+const TEXT_FIRST = 'discordTextFirst';
+
+/** A message's own text as a stored row holds it: '' when it's blank. */
+function ownText(content: string): string {
+  return content.trim() ? content : '';
+}
+
+const isEmptyMarker = (block: ContentBlock): boolean => block.type === 'text' && block.text === EMPTY_MESSAGE;
+const isBlankText = (block: ContentBlock): boolean => block.type === 'text' && !block.text.trim();
+
+/**
+ * A text-first row's content: the message's own text, '' when it has none,
+ * then `after`, what the host added; EMPTY_MESSAGE when there's neither.
+ */
+function textFirst(text: string, after: ContentBlock[] = []): ContentBlock[] {
+  return [{ type: 'text', text }, ...(text || after.length > 0 ? after : [{ type: 'text' as const, text: EMPTY_MESSAGE }])];
+}
+
+/** A text-first row's content with `text` as the message's own text, in
+ *  place of its first block, keeping what the host added after it. */
+function withOwnText(content: ContentBlock[], text: string): ContentBlock[] {
+  return textFirst(ownText(text), content.slice(1).filter((block) => !isEmptyMarker(block)));
+}
+
+/**
+ * The content a stored Discord message should hold once Discord's text for it
+ * is `discordText`, or null when it holds that already.
+ *
+ * A text-first row keeps every block the host added and replaces only its own
+ * text; EMPTY_MESSAGE goes once there is text, and comes back when nothing is
+ * left. A row stored before that layout held its own text first when it had
+ * any, but a message without text began with what the host added, which may
+ * be text, a file's contents or a note, so its first block can't be told
+ * apart. Such a row is left alone unless Discord's text is there and differs
+ * from its first block, and then that text takes the first block's place
+ * when it's text, and goes before it when it isn't, and EMPTY_MESSAGE goes.
+ * So a message without text, stored beginning with a file's contents or a
+ * note, loses that block. The history sync, which has the message's
+ * attachments, rebuilds such a row instead (needsRebuild).
+ */
+function contentForText(stored: StoredMessage, discordText: string): ContentBlock[] | null {
+  const text = ownText(discordText);
+  const [first, ...rest] = stored.content;
+  if (stored.metadata?.[TEXT_FIRST] === true) {
+    if (first?.type === 'text' && first.text === text) return null;
+    return withOwnText(stored.content, text);
+  }
+  if (!text || (first?.type === 'text' && first.text === discordText)) return null;
+  return [{ type: 'text', text: discordText }, ...(first?.type === 'text' ? rest : stored.content).filter((block) => !isEmptyMarker(block))];
+}
+
+/**
+ * Whether a stored row lacks or holds more than the live conversion gives
+ * Discord's `message` now, its own text aside, so the history sync stores it
+ * through that conversion again. The conversion gives each attachment one
+ * block: an image, a file's text, or a note when it isn't fetched or isn't
+ * read. So a text-first row holds one block per attachment after its text,
+ * EMPTY_MESSAGE aside, which the text's rule keeps. A row stored before that
+ * layout held its text, when it had any, then those blocks, or EMPTY_MESSAGE
+ * alone; one that doesn't was blanked or stripped by an earlier edit or sync,
+ * or its message gained or lost text, or lost an attachment. Its first block,
+ * when it is the message's own text, counts as that text, even when the text
+ * reads as EMPTY_MESSAGE. For a message without text of its own, a first
+ * block that's text may be what the host added or a caption the message has
+ * since lost, which no count tells apart, so that row is stored again; it
+ * then begins with its own '' text. One whose text alone changed is left to
+ * the text's rule, which keeps the blocks after it. History without
+ * attachments can't be compared, so it rebuilds nothing.
+ */
+function needsRebuild(stored: StoredMessage, message: HistoryMessage): boolean {
+  if (message.attachments === undefined) return false;
+  const attachments = message.attachments.length;
+  const held = (blocks: ContentBlock[]) => blocks.filter((block) => !isBlankText(block) && !isEmptyMarker(block)).length;
+  if (stored.metadata?.[TEXT_FIRST] === true) return held(stored.content.slice(1)) !== attachments;
+  const own = ownText(message.content);
+  const [first, ...rest] = stored.content;
+  if (!own && first?.type === 'text' && !isBlankText(first) && !isEmptyMarker(first)) return true;
+  const expected = (own ? 1 : 0) + attachments;
+  const counted = own && first?.type === 'text' && first.text === own ? 1 + held(rest) : held(stored.content);
+  return counted !== expected || (expected === 0 && !stored.content.some(isEmptyMarker));
+}
+
+/**
+ * Whether a row holds non-blank text besides its message's own text now,
+ * which may be what a file gave. A marked row whose message's text changed
+ * counts its old text here too, which can delay its rebuild until a fetch
+ * succeeds but never loses text.
+ */
+function holdsOtherText(stored: StoredMessage, message: HistoryMessage): boolean {
+  const own = ownText(message.content);
+  const [first, ...rest] = stored.content;
+  const others = own && first?.type === 'text' && first.text === own ? rest : stored.content;
+  return others.some((block) => block.type === 'text' && !isBlankText(block) && !isEmptyMarker(block));
+}
+
+/** Whether a message's conversion holds, after the message's own text, the
+ *  note for an attachment of its whose text wasn't fetched. */
+function holdsNotFetched(content: ContentBlock[], message: HistoryMessage): boolean {
+  const notes = new Set((message.attachments ?? []).map((attachment) => attachmentNotFetched(attachment.filename).text));
+  return content.slice(1).some((block) => block.type === 'text' && notes.has(block.text));
+}
+
 /**
  * Discord module for the agent framework.
  */
@@ -117,6 +243,12 @@ export class DiscordModule implements Module {
 
   // Last message sent by a tool (for thought-editing)
   private lastSentMessage: { channelId: string; messageId: string } | null = null;
+
+  // One set per running history sync: the Discord messages the live path
+  // stored, edited or was told were deleted since that sync began. What the
+  // live path saw is newer than what the sync fetched, so the sync leaves
+  // those messages alone.
+  private readonly liveDuringSync = new Set<Set<string>>();
 
   // Typing keepalive: agentName -> { interval, deadline }. Started on
   // inference:started, stopped on the turn's terminal trace event. Discord's
@@ -406,7 +538,7 @@ export class DiscordModule implements Module {
       },
       {
         name: 'fetch_history',
-        description: 'Fetch recent message history from a channel',
+        description: 'Fetch recent message history from a channel. A message with attachments lists each one\'s filename, type and size; their contents aren\'t included.',
         inputSchema: {
           type: 'object',
           properties: {
@@ -509,8 +641,10 @@ export class DiscordModule implements Module {
         });
       }
 
-      // Build content blocks from message and attachments
-      const contentBlocks = msg.contentBlocks ?? [{ type: 'text' as const, text: msg.content }];
+      // Built from the message and its attachments, or from its text alone
+      // when an event carries no blocks; text first, as TEXT_FIRST marks.
+      const contentBlocks = msg.contentBlocks ?? textFirst(ownText(msg.content));
+      this.noteLive(msg.discordMessageId);
 
       // Return declarative response - framework applies all writes atomically
       return {
@@ -522,6 +656,7 @@ export class DiscordModule implements Module {
               external: { source: 'discord', id: msg.discordMessageId },
               channelId: msg.channelId,
               timestamp: msg.timestamp,
+              [TEXT_FIRST]: true,
             },
           },
         ],
@@ -533,29 +668,41 @@ export class DiscordModule implements Module {
     // Handle Discord message edit
     if (event.type === 'discord:edit') {
       const edit = event as DiscordEditEvent;
-      const internalId = state.findMessageByExternalId('discord', edit.discordMessageId);
-      if (!internalId) {
+      // The stored row, not only its id: an edit changes the message's own
+      // text and keeps what the host added beside it.
+      // An edit to a message nobody has stored yet is dropped: whatever
+      // stores the message, its live add or a history sync running now,
+      // stores the text it got, and the next sync's text rule changes it.
+      // A row stored in shards can't be edited one shard at a time, so it
+      // keeps its text, and the host's log says so. Only an edit that writes
+      // marks the message live, so an update that changes nothing leaves a
+      // running sync free to rewrite the row.
+      const stored = this.storedRow(edit.discordMessageId);
+      if (!stored) return {};
+      if (stored.bodyGroupId) {
+        console.warn(`Discord: An update to message ${edit.discordMessageId} wasn't applied: it's stored in shards, which can't be edited, so if its text changed, the agent still has the earlier text`);
         return {};
       }
-      return {
-        editMessages: [
-          {
-            messageId: internalId,
-            content: [{ type: 'text', text: edit.newContent }],
-          },
-        ],
-      };
+      const content = contentForText(stored, edit.newContent);
+      if (!content) return {};
+      this.noteLive(edit.discordMessageId);
+      return { editMessages: [{ messageId: stored.id, content }] };
     }
 
     // Handle Discord message delete
     if (event.type === 'discord:delete') {
       const del = event as DiscordDeleteEvent;
-      const internalId = state.findMessageByExternalId('discord', del.discordMessageId);
-      if (!internalId) {
+      // A row stored in shards is removed whole: the framework takes out the
+      // body a shard belongs to. The message is the live path's even when no
+      // row is found, so a running sync doesn't store what its fetch may
+      // still hold.
+      this.noteLive(del.discordMessageId);
+      const stored = this.storedRow(del.discordMessageId);
+      if (!stored) {
         return {};
       }
       return {
-        removeMessages: [internalId],
+        removeMessages: [stored.id],
       };
     }
 
@@ -724,131 +871,176 @@ export class DiscordModule implements Module {
   /**
    * Sync history for a specific channel - compare with Context Manager and update.
    * Uses queryMessages() to enumerate stored messages for proper edit/delete detection.
+   *
+   * The live path can store, edit or remove a row whenever the sync awaits.
+   * So the sync fetches history and runs the live conversion it needs first,
+   * then reads the store again and writes with no await between that read
+   * and its writes. It leaves alone any message the live path stored,
+   * changed or was told was deleted while it ran (liveDuringSync), an update
+   * that changed nothing aside. A live edit to a message nobody had stored
+   * yet is dropped, so a message the sync stores holds the text it fetched
+   * until the next sync's text rule changes it. The framework writes an
+   * event's response only once every module has processed the event, so an
+   * event processed before the sync began can still be written after the
+   * sync's own writes, which this doesn't cover.
    */
   private async syncChannelHistory(channelId: string): Promise<{
     newMessages: number;
     editedMessages: number;
     deletedMessages: number;
   }> {
-    if (!this.ctx) {
-      return { newMessages: 0, editedMessages: 0, deletedMessages: 0 };
+    const unchanged = { newMessages: 0, editedMessages: 0, deletedMessages: 0 };
+    const ctx = this.ctx;
+    if (!ctx) {
+      return unchanged;
     }
+    const live = new Set<string>();
+    this.liveDuringSync.add(live);
+    try {
+      const scrollback = this.config.historyScrollback ?? 50;
+      // The rows stored as the sync begins. One that is gone by the time it
+      // writes was removed meanwhile, and isn't the sync's to bring back.
+      const before = this.storedByDiscordId(ctx, channelId);
 
-    const scrollback = this.config.historyScrollback ?? 50;
-    
-    // Fetch recent history from Discord
-    const discordMessages = await this.client.fetchHistory(channelId, { limit: scrollback });
-    
-    // Build a map of Discord message ID -> content for comparison
-    const discordMessageMap = new Map<string, { content: string; authorName: string; timestamp: Date }>();
-    for (const msg of discordMessages) {
-      discordMessageMap.set(msg.id, {
-        content: msg.content,
-        authorName: msg.authorName,
-        timestamp: msg.timestamp,
-      });
-    }
+      // Fetch recent history from Discord. If the module stopped or restarted
+      // meanwhile, this sync's context is gone and it writes nothing.
+      const discordMessages = await this.client.fetchHistory(channelId, { limit: scrollback });
+      if (this.ctx !== ctx) return unchanged;
 
-    // Query Context Manager for all Discord messages from this channel
-    const { messages: storedMessages } = this.ctx.queryMessages({
-      source: 'discord',
-      metadata: { channelId },
-    });
+      // Discord's ids, for delete detection inside the fetched window.
+      const discordIds = new Set(discordMessages.map((msg) => msg.id));
 
-    // Build a map of stored message external IDs -> internal data
-    const storedMessageMap = new Map<string, { internalId: string; content: string; sourceTimestamp?: number }>();
-    for (const msg of storedMessages) {
-      const external = msg.metadata?.external as { id?: string } | undefined;
-      if (external?.id) {
-        // Extract text content for comparison
-        const textContent = msg.content
-          .filter((block): block is { type: 'text'; text: string } => block.type === 'text')
-          .map((block) => block.text)
-          .join('\n');
-        storedMessageMap.set(external.id, {
-          internalId: msg.id,
-          content: textContent,
-          sourceTimestamp: typeof msg.metadata?.timestamp === 'number'
-            ? msg.metadata.timestamp
-            : undefined,
-        });
+      // Discord history is newest-first, while addMessage appends to the stored
+      // conversation. Process oldest-first so missed messages retain chronology.
+      const chronologicalMessages = [...discordMessages].reverse();
+
+      // The live conversion, which fetches attachments, for a message the
+      // store lacks and for a row that doesn't hold what the conversion gives
+      // the message now (needsRebuild). A row stored in shards can't be
+      // edited one shard at a time, so it's left as it is.
+      const converted = new Map<string, ContentBlock[]>();
+      for (const discordMsg of chronologicalMessages) {
+        const stored = before.get(discordMsg.id);
+        if (stored && (stored.bodyGroupId || !needsRebuild(stored, discordMsg))) continue;
+        const content = await this.convertMessageToContent(discordMsg);
+        if (this.ctx !== ctx) return unchanged;
+        // A failed fetch never costs a row the text it holds: when a file
+        // wasn't fetched, a row holding other text, which may be that file's,
+        // keeps what it holds, and the next sync tries again.
+        if (stored && holdsNotFetched(content, discordMsg) && holdsOtherText(stored, discordMsg)) continue;
+        converted.set(discordMsg.id, content);
       }
-    }
 
-    let newMessages = 0;
-    let editedMessages = 0;
-    let deletedMessages = 0;
+      // From here on nothing awaits, so the rows read now are the rows written.
+      const storedMessageMap = this.storedByDiscordId(ctx, channelId);
+      let newMessages = 0;
+      let editedMessages = 0;
+      let deletedMessages = 0;
+      for (const discordMsg of chronologicalMessages) {
+        if (live.has(discordMsg.id)) continue;
+        const stored = storedMessageMap.get(discordMsg.id);
 
-    // Discord history is newest-first, while addMessage appends to the stored
-    // conversation. Process oldest-first so missed messages retain chronology.
-    const chronologicalMessages = [...discordMessages].reverse();
-    for (const discordMsg of chronologicalMessages) {
-      const stored = storedMessageMap.get(discordMsg.id);
-      
-      if (!stored) {
-        // New message we haven't seen
-        // For bot's own messages (from previous sessions), use the agent name
-        // This ensures continuity of conversation history
-        const isBotMessage = discordMsg.authorId === this.state.botUserId;
-        const agentName = this.ctx.getAgents()[0]?.name;
-        const participantName = isBotMessage 
-          ? (agentName ?? discordMsg.authorName)
-          : discordMsg.authorName;
-        
-        this.ctx.addMessage(
-          participantName,
-          [{ type: 'text', text: discordMsg.content }],
-          {
-            external: { source: 'discord', id: discordMsg.id },
-            channelId,
-            timestamp: discordMsg.timestamp.getTime(),
-            isOwnMessage: isBotMessage, // Mark as our own for reference
+        if (!stored) {
+          // A message we haven't stored. One that was stored when the sync
+          // began, and isn't now, was removed meanwhile: not the sync's to
+          // bring back.
+          const content = converted.get(discordMsg.id);
+          if (!content || before.has(discordMsg.id)) continue;
+          // For bot's own messages (from previous sessions), use the agent name
+          // This ensures continuity of conversation history
+          const isBotMessage = discordMsg.authorId === this.state.botUserId;
+          const agentName = ctx.getAgents()[0]?.name;
+          const participantName = isBotMessage
+            ? (agentName ?? discordMsg.authorName)
+            : discordMsg.authorName;
+          ctx.addMessage(
+            participantName,
+            content,
+            {
+              external: { source: 'discord', id: discordMsg.id },
+              channelId,
+              timestamp: discordMsg.timestamp.getTime(),
+              isOwnMessage: isBotMessage, // Mark as our own for reference
+              [TEXT_FIRST]: true,
+            }
+          );
+          newMessages++;
+        } else if (!stored.bodyGroupId) {
+          // We have this message - check whether it changed (offline edit detection)
+          const content = needsRebuild(stored, discordMsg)
+            ? converted.get(discordMsg.id)
+            : contentForText(stored, discordMsg.content);
+          if (content) {
+            ctx.editMessage(stored.id, content);
+            editedMessages++;
           }
-        );
-        newMessages++;
-      } else {
-        // We have this message - check if content changed (offline edit detection)
-        if (stored.content !== discordMsg.content) {
-          this.ctx.editMessage(stored.internalId, [
-            { type: 'text', text: discordMsg.content },
-          ]);
-          editedMessages++;
         }
       }
-    }
 
-    // Check for deletes only inside the history we actually fetched. A short
-    // response covers complete available history; a full page has an older
-    // boundary whose tied millisecond must be preserved.
-    const fetchedCompleteHistory = discordMessages.length < scrollback;
-    const oldestFetchedTimestamp = discordMessages.length > 0
-      ? Math.min(...discordMessages.map((msg) => msg.timestamp.getTime()))
-      : undefined;
-    for (const [externalId, stored] of storedMessageMap) {
-      const isInsideFetchedWindow = fetchedCompleteHistory || (
-        stored.sourceTimestamp !== undefined &&
-        oldestFetchedTimestamp !== undefined &&
-        // Discord timestamps are millisecond-precise, so an older message just
-        // beyond the page can tie the oldest fetched timestamp. Preserve ties
-        // rather than guessing that an unseen boundary message was deleted.
-        stored.sourceTimestamp > oldestFetchedTimestamp
-      );
-      if (isInsideFetchedWindow && !discordMessageMap.has(externalId)) {
-        // Message exists in our store but not in Discord - it was deleted
-        // Note: This only catches deletes within the scrollback window
-        this.ctx.removeMessage(stored.internalId);
-        deletedMessages++;
+      // Check for deletes only inside the history we actually fetched. A short
+      // response covers complete available history; a full page has an older
+      // boundary whose tied millisecond must be preserved.
+      const fetchedCompleteHistory = discordMessages.length < scrollback;
+      const oldestFetchedTimestamp = discordMessages.length > 0
+        ? Math.min(...discordMessages.map((msg) => msg.timestamp.getTime()))
+        : undefined;
+      for (const [externalId, stored] of storedMessageMap) {
+        const sourceTimestamp = typeof stored.metadata?.timestamp === 'number'
+          ? stored.metadata.timestamp
+          : undefined;
+        const isInsideFetchedWindow = fetchedCompleteHistory || (
+          sourceTimestamp !== undefined &&
+          oldestFetchedTimestamp !== undefined &&
+          // Discord timestamps are millisecond-precise, so an older message just
+          // beyond the page can tie the oldest fetched timestamp. Preserve ties
+          // rather than guessing that an unseen boundary message was deleted.
+          sourceTimestamp > oldestFetchedTimestamp
+        );
+        if (isInsideFetchedWindow && !discordIds.has(externalId) && !live.has(externalId)) {
+          // Message exists in our store but not in Discord - it was deleted
+          // Note: This only catches deletes within the scrollback window.
+          // A message the live path wrote while the sync ran is newer than
+          // the fetch, so it stays. One shard's id takes out a body whole.
+          ctx.removeMessage(stored.id);
+          deletedMessages++;
+        }
       }
-    }
 
-    // Update last read
-    if (discordMessages.length > 0) {
-      // Messages are typically newest first
-      const newestId = discordMessages[0].id;
-      this.state.lastReadMessageId[channelId] = newestId;
-    }
+      // Update last read
+      if (discordMessages.length > 0) {
+        // Messages are typically newest first
+        const newestId = discordMessages[0].id;
+        this.state.lastReadMessageId[channelId] = newestId;
+      }
 
-    return { newMessages, editedMessages, deletedMessages };
+      return { newMessages, editedMessages, deletedMessages };
+    } finally {
+      this.liveDuringSync.delete(live);
+    }
+  }
+
+  /** A channel's stored Discord rows by their Discord message id, whole: an
+   *  edit replaces a row's own text and keeps what the host added beside it. */
+  private storedByDiscordId(ctx: ModuleContext, channelId: string): Map<string, StoredMessage> {
+    const rows = new Map<string, StoredMessage>();
+    for (const msg of ctx.queryMessages({ source: 'discord', metadata: { channelId } }).messages) {
+      const external = msg.metadata?.external as { id?: string } | undefined;
+      if (external?.id) rows.set(external.id, msg);
+    }
+    return rows;
+  }
+
+  /** The stored row of a Discord message, by its id in the row's metadata.
+   *  The module context's findMessageByExternalId holds only rows the module
+   *  stored through its context, not those a process response added, so it
+   *  misses what the live path stored. */
+  private storedRow(discordMessageId: string): StoredMessage | undefined {
+    return this.ctx?.queryMessages({ source: 'discord', externalIds: [discordMessageId] }).messages[0];
+  }
+
+  /** Marks a Discord message as the live path's for every history sync running now. */
+  private noteLive(discordMessageId: string): void {
+    for (const live of this.liveDuringSync) live.add(discordMessageId);
   }
 
   private async handleDiscordMessage(message: DiscordMessageData): Promise<void> {
@@ -907,19 +1099,18 @@ export class DiscordModule implements Module {
   }
 
   /**
-   * Convert Discord message to ContentBlock array.
-   * Includes text content and any supported attachments (images, text files).
+   * Convert a Discord message, live or from history, to ContentBlock array:
+   * its own text first, '' when it has none, then any supported attachments
+   * (images, text files) and notes for the rest, as TEXT_FIRST marks.
    */
-  private async convertMessageToContent(message: DiscordMessageData): Promise<ContentBlock[]> {
+  private async convertMessageToContent(
+    message: { id: string; content: string; attachments?: readonly DiscordAttachment[] },
+  ): Promise<ContentBlock[]> {
+    // What the host adds after the message's own text: one block per attachment.
     const blocks: ContentBlock[] = [];
 
-    // Add text content if present
-    if (message.content.trim()) {
-      blocks.push({ type: 'text', text: message.content });
-    }
-
     // Process attachments
-    for (const attachment of message.attachments) {
+    for (const attachment of message.attachments ?? []) {
       const contentType = attachment.contentType?.toLowerCase() ?? '';
       const filename = attachment.filename.toLowerCase();
 
@@ -946,13 +1137,15 @@ export class DiscordModule implements Module {
               type: 'text',
               text: `\n--- File: ${attachment.filename} ---\n${textContent}\n--- End of ${attachment.filename} ---\n`,
             });
+          } else {
+            // An answer whose body is never read holds its connection.
+            await response.body?.cancel().catch(() => {});
+            console.warn(`Discord: Attachment ${logValue(attachment.filename)} in message ${message.id} wasn't fetched: HTTP ${response.status}`);
+            blocks.push(attachmentNotFetched(attachment.filename));
           }
         } catch (error) {
-          // If fetch fails, just note the attachment
-          blocks.push({
-            type: 'text',
-            text: `[Attachment: ${attachment.filename} (failed to fetch)]`,
-          });
+          console.warn(`Discord: Attachment ${logValue(attachment.filename)} in message ${message.id} wasn't fetched:`, error);
+          blocks.push(attachmentNotFetched(attachment.filename));
         }
         continue;
       }
@@ -964,12 +1157,7 @@ export class DiscordModule implements Module {
       });
     }
 
-    // Ensure we have at least empty text if nothing else
-    if (blocks.length === 0) {
-      blocks.push({ type: 'text', text: '[Empty message]' });
-    }
-
-    return blocks;
+    return textFirst(ownText(message.content), blocks);
   }
 
   /**
@@ -1047,9 +1235,13 @@ export class DiscordModule implements Module {
       createThread: input.createThread,
     });
 
-    // Track for thought-editing
+    // Track for thought-editing: the message is out, whether or not its
+    // thread was started.
     this.lastSentMessage = { channelId: input.channelId, messageId: result.messageId };
 
+    if (result.threadFailure !== undefined) {
+      return { success: false, error: result.threadFailure, isError: true };
+    }
     return { success: true, data: { messageId: result.messageId } };
   }
 
@@ -1213,6 +1405,11 @@ export class DiscordModule implements Module {
           authorId: m.authorId,
           isBot: m.isBot,
           content: m.content,
+          // Not their URLs: a link Discord signs works for anyone holding it
+          // until it expires, and an agent could repeat it where others read.
+          ...(m.attachments?.length
+            ? { attachments: m.attachments.map(({ filename, contentType, size }) => ({ filename, contentType, size })) }
+            : {}),
           timestamp: formatZonedDateTime(m.timestamp, this.timeZone),
           replyTo: m.replyTo,
         })),

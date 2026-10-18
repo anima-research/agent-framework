@@ -1,4 +1,4 @@
-import type { JsStore } from '@animalabs/chronicle';
+import type { JsStateRegistration, JsStore } from '@animalabs/chronicle';
 import type { ContentBlock } from '@animalabs/membrane';
 import type {
   MessageId,
@@ -25,6 +25,7 @@ import type {
 } from './types/index.js';
 import type { Agent } from './agent.js';
 import { DEFAULT_SHUTDOWN_TIMEOUT_MS, validateShutdownTimeout, waitForShutdown } from './shutdown.js';
+import { logValue } from './mcpl/log-value.js';
 
 /** How the registry queues a module's event: its push names the module. A
  * `ProcessQueue` serves too, ignoring the name. */
@@ -42,6 +43,25 @@ const MODULE_STATE_PREFIX = 'modules/';
  */
 export function isStateExistsError(err: unknown): boolean {
   return err instanceof Error && err.message.includes('State already exists');
+}
+
+/**
+ * Register a state, treating "already exists" as done: a store reopened after
+ * a restart already holds it. Every other failure is thrown here, where it
+ * happened, naming the state, with the store's own error as its cause. Each
+ * state the framework registers goes through this.
+ */
+export function ensureStateRegistered(
+  store: Pick<JsStore, 'registerState'>,
+  registration: JsStateRegistration,
+): void {
+  try {
+    store.registerState(registration);
+  } catch (error) {
+    if (isStateExistsError(error)) return;
+    const reason = error instanceof Error ? error.message : String(error);
+    throw new Error(`Registering state '${registration.id}' failed: ${reason}`, { cause: error });
+  }
 }
 
 /**
@@ -81,6 +101,8 @@ export class ModuleRegistry {
 
   private modules: Map<string, Module> = new Map();
   private stopping = new Map<Module, Promise<void>>();
+  /** Module and namespace pairs already told that a system injection held a block that isn't text. */
+  private notShownWarned = new Set<string>();
   private moduleContexts: Map<string, ModuleContextImpl> = new Map();
   private speechHandlers: SpeechHandler[] = [];
   private store: JsStore;
@@ -146,14 +168,7 @@ export class ModuleRegistry {
 
     // Register module state in store
     const stateId = this.getStateId(module.name);
-    try {
-      this.store.registerState({
-        id: stateId,
-        strategy: 'snapshot',
-      });
-    } catch {
-      // State already registered (from previous run)
-    }
+    ensureStateRegistered(this.store, { id: stateId, strategy: 'snapshot' });
 
     // Check if this is a restart (state exists)
     const existingState = this.store.getStateJson(stateId);
@@ -425,7 +440,10 @@ export class ModuleRegistry {
       );
       let timer: ReturnType<typeof setTimeout> | undefined;
       const promise = Promise.race([
-        module.gatherContext(agentName).then(r => injections.push(...r)),
+        module.gatherContext(agentName).then(r => {
+          injections.push(...r);
+          this.noteBlocksNotShown(module.name, r);
+        }),
         new Promise<void>((_, rej) => {
           timer = setTimeout(
             () => rej(new Error(`gatherContext timed out after ${budgetMs}ms`)),
@@ -441,6 +459,28 @@ export class ModuleRegistry {
 
     await Promise.all(promises);
     return injections;
+  }
+
+  /**
+   * The system prompt is text, so an agent given a `system` injection reads
+   * a line in place of each of its blocks that isn't text (the agent's
+   * buildSystemPrompt), though `ContextInjection`'s content may be any
+   * block. The module meant those blocks for the model, so its operator is
+   * told, once per module and namespace, as the module's injections are
+   * gathered, whichever agents are given them.
+   */
+  private noteBlocksNotShown(moduleName: string, injections: ContextInjection[]): void {
+    for (const injection of injections) {
+      if (injection.position !== 'system' || !injection.content.some((block) => block.type !== 'text')) continue;
+      const key = `${moduleName}\u0000${injection.namespace}`;
+      if (this.notShownWarned.has(key)) continue;
+      this.notShownWarned.add(key);
+      console.error(
+        `[${moduleName}] gatherContext: a system injection in namespace ${logValue(injection.namespace)} holds a block that ` +
+          "isn't text, which the system prompt can't carry, so an agent given the injection reads a line in place of each such block; " +
+          'this line prints once per module and namespace while the host runs',
+      );
+    }
   }
 
   /**
@@ -640,18 +680,12 @@ class ModuleContextImpl implements ModuleContext {
     name: string,
     opts?: { deltaSnapshotEvery?: number; fullSnapshotEvery?: number }
   ): void {
-    const id = this.logStateId(name);
-    try {
-      this.store.registerState({
-        id,
-        strategy: 'append_log',
-        deltaSnapshotEvery: opts?.deltaSnapshotEvery ?? 100,
-        fullSnapshotEvery: opts?.fullSnapshotEvery ?? 20,
-      });
-    } catch (err) {
-      if (!isStateExistsError(err)) throw err;
-      // Already registered (previous run) — idempotent path.
-    }
+    ensureStateRegistered(this.store, {
+      id: this.logStateId(name),
+      strategy: 'append_log',
+      deltaSnapshotEvery: opts?.deltaSnapshotEvery ?? 100,
+      fullSnapshotEvery: opts?.fullSnapshotEvery ?? 20,
+    });
     this.registeredLogStates.add(name);
   }
 

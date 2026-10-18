@@ -3,8 +3,8 @@ import { isDeepStrictEqual } from 'node:util';
 import type { ContextManager, MessageId, MessageMetadata } from '@animalabs/context-manager';
 import type { ContentBlock, NormalizedMessage, ToolResult } from '@animalabs/membrane';
 import type { CompletedToolCall } from './types/index.js';
-import { isStateExistsError } from './module-registry.js';
-import { toolResultDataToHistoryString } from './tool-result-history.js';
+import { ensureStateRegistered } from './module-registry.js';
+import { rfc005TextOf, toolResultDataToHistoryString } from './tool-result-history.js';
 import { safeSlice } from './safe-slice.js';
 
 export const TOOL_RESULT_GUARD_NOTICE = 'Tool result withheld by the guard. The tool has already executed.';
@@ -101,7 +101,10 @@ export function keptWhenWithheld(result: CompletedToolCall['result'], maxChars: 
   const fields = data as Record<string, unknown>;
   const kept = Object.fromEntries(keys.filter((key) => Object.hasOwn(fields, key)).map((key) => [key, fields[key]]));
   if (Object.keys(kept).length === 0) return undefined;
-  const whole = toolResultDataToHistoryString(kept);
+  // Data that RFC-005 shows as text, such as a reference's stub, keeps that
+  // text: picked out of it, a kept uri would lose the type that makes it a
+  // reference, and be written out of the stub that hides it.
+  const whole = rfc005TextOf(fields) ?? toolResultDataToHistoryString(kept);
   if (!maxChars || whole.length <= maxChars) return whole;
   // Never half a surrogate pair: the stub goes to the provider as text, so
   // the cut can be one character short of the cap.
@@ -295,11 +298,7 @@ export class ToolResultGuard {
   private write(record: Record<string, unknown>): void {
     const store = this.cm.getStore();
     if (!this.registered) {
-      try {
-        store.registerState({ id: TOOL_RESULT_GUARD_AUDIT_STATE, strategy: 'append_log' });
-      } catch (error) {
-        if (!isStateExistsError(error)) throw error;
-      }
+      ensureStateRegistered(store, { id: TOOL_RESULT_GUARD_AUDIT_STATE, strategy: 'append_log' });
       this.registered = true;
     }
     store.appendToStateJson(TOOL_RESULT_GUARD_AUDIT_STATE, record);

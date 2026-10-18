@@ -871,20 +871,42 @@ export class Agent {
 
   /**
    * RFC-006 consumed watermark: the newest stored message at the last compile
-   * of a model request, per branch. Everything above it has never been in a
+   * of a model request, or at the last tool boundary that injected messages
+   * into a live one, per branch. Everything above it has never been in a
    * request and may still be replaced or withdrawn in place by its sender.
    */
   private consumedWatermark: { branch: string; sequence: number } | null = null;
+  /** Counts marks: a compile writes its watermark back only if no mark was
+   *  made while it ran (a tool boundary's, or another compile's). */
+  private watermarkMarks = 0;
 
   getConsumedWatermark(): { branch: string; sequence: number } | null {
     return this.consumedWatermark;
   }
 
-  /** Mark everything currently stored as consumed (boot, branch switch). */
+  /** Mark everything currently stored as consumed (the agent's creation, at
+   *  boot or later, and a tool boundary that injected messages into the live
+   *  stream). */
   markContextConsumed(): void {
     // Tolerates partial context-manager doubles (tests build Agents over
     // stubs): without a watermark nothing is ever treated as unread.
     this.consumedWatermark = this.pendingWatermark();
+    this.watermarkMarks++;
+  }
+
+  /**
+   * A finished compile's watermark, taken before it awaited. Within a branch
+   * the watermark only advances: if a mark was made while the compile ran,
+   * the compile's (older) one is applied only where it is later on that
+   * mark's branch, so a boundary's mark is never rolled back by a compile
+   * that started before it (a preview during a live turn).
+   */
+  private applyCompileWatermark(watermark: { branch: string; sequence: number }, marksBefore: number): void {
+    const current = this.consumedWatermark;
+    if (this.watermarkMarks !== marksBefore && current
+      && (current.branch !== watermark.branch || current.sequence >= watermark.sequence)) return;
+    this.consumedWatermark = watermark;
+    this.watermarkMarks++;
   }
 
   /** The watermark a successful compile will establish (taken before, applied after). */
@@ -916,9 +938,10 @@ export class Agent {
     // RFC-006 §3.3: consumption is determined at assembly — a compile that
     // fails assembled nothing, so the watermark moves only on success.
     const watermark = this.pendingWatermark();
+    const marksBefore = this.watermarkMarks;
     const compile = () => this.contextManager.compile(this.compileBudget(budget));
     const result = budget ? await compile() : await this.compileAtLiveBudget(compile);
-    if (watermark) this.consumedWatermark = watermark;
+    if (watermark) this.applyCompileWatermark(watermark, marksBefore);
     return result;
   }
 
@@ -957,9 +980,10 @@ export class Agent {
     // compression hold whose deadline has passed, which `compile` does for
     // any compile before it selects.
     const watermark = opts?.dryRun ? null : this.pendingWatermark();
+    const marksBefore = this.watermarkMarks;
     const compile = () => this.contextManager.compile(this.compileBudget(budget), injections, opts as never);
     const result = budget || opts?.dryRun ? await compile() : await this.compileAtLiveBudget(compile);
-    if (watermark) this.consumedWatermark = watermark;
+    if (watermark) this.applyCompileWatermark(watermark, marksBefore);
     return result;
   }
 
@@ -1123,7 +1147,12 @@ export class Agent {
 
     // If all tools done, transition to ready
     if (this._state.pending.size === 0) {
-      this._state = { status: 'ready', toolResults: this._state.completed, stream: this._state.stream };
+      this._state = {
+        status: 'ready',
+        toolResults: this._state.completed,
+        stream: this._state.stream,
+        supportsInjectedMessages: this._state.supportsInjectedMessages,
+      };
     }
   }
 
@@ -1317,6 +1346,15 @@ export class Agent {
     this.failOpenKvSubmissions();
 
     this._streamId++;
+    // A pending cancel belongs to the stream that was live when cancelStream()
+    // ran. The stream driver collects it on that stream's terminal event, or
+    // at the loop's end when the iterator closed without one, while the
+    // stream still owns the agent. This clear is for the records no driver
+    // collects: a dropped turn's, whose stream no driver iterates; one whose
+    // stream's terminal came after another stream took the agent; or a
+    // cancel after the stream's complete event. A fresh stream must not
+    // inherit one and read its own later error as a deliberate stop.
+    this._pendingCancel = undefined;
     this._inferenceStartedAt = Date.now();
     this.lastStreamInputTokens = 0;
     // Reset the cache-inclusive counters too: a new stream must not inherit
@@ -1417,9 +1455,10 @@ export class Agent {
 
   /**
    * Transition to waiting_for_tools when stream yields tool calls.
-   * Called by framework's driveStream.
+   * Called by framework's driveStream, with what the stream declared about
+   * carrying injected messages with this round's results (see AgentState).
    */
-  enterWaitingForTools(calls: ToolCall[], stream: YieldingStream): void {
+  enterWaitingForTools(calls: ToolCall[], stream: YieldingStream, supportsInjectedMessages?: boolean): void {
     const pending = new Map<ToolCallId, PendingToolCall>();
     for (const call of calls) {
       pending.set(call.id, {
@@ -1429,7 +1468,7 @@ export class Agent {
         startedAt: Date.now(),
       });
     }
-    this._state = { status: 'waiting_for_tools', pending, completed: [], stream };
+    this._state = { status: 'waiting_for_tools', pending, completed: [], stream, supportsInjectedMessages };
   }
 
   /**
@@ -1472,16 +1511,40 @@ export class Agent {
     this._state = { status: 'streaming', stream };
   }
 
+  /** The most recent cancelStream() of a live stream, until the stream
+   *  driver collects it on that stream's terminal event. Its presence is
+   *  the signal (a reasonless Stop is still a deliberate stop); its reason
+   *  is the caller's own word. Membrane reports every cancel() as reason
+   *  'user' — the call, not the actor — and a stream implementation may
+   *  report the cancel as `error` with no reason at all, so this record is
+   *  the only provenance a host-side cancel has. */
+  private _pendingCancel: { reason?: string } | undefined;
+
   /**
-   * Cancel any active stream and reset to idle.
+   * Cancel the stream this agent's state holds (streaming, waiting on its
+   * tools, or ready at a tool boundary with every result in), and reset to
+   * idle. `reason` is provenance for the framework's inference:aborted trace
+   * and marker metadata (e.g. 'zombie_reclaim', 'subagent_cancel'); it never
+   * reaches the provider.
    */
-  cancelStream(): void {
-    if (this._state.status === 'streaming') {
-      this._state.stream.cancel();
-    } else if (this._state.status === 'waiting_for_tools' && this._state.stream) {
+  cancelStream(reason?: string): void {
+    if ('stream' in this._state && this._state.stream) {
+      this._pendingCancel = { reason };
       this._state.stream.cancel();
     }
     this._state = { status: 'idle' };
+  }
+
+  /** Collect (and clear) the cancel that ended the current stream, if this
+   *  side issued one. The stream driver calls it once, while the stream
+   *  still owns the agent, at the stream's terminal event (`aborted`
+   *  normally, `error` for implementations that report cancel() that way)
+   *  or at the loop's end when the stream closed without one. A record no
+   *  driver collects is cleared when the agent's next stream starts. */
+  takeCancel(): { reason?: string } | undefined {
+    const c = this._pendingCancel;
+    this._pendingCancel = undefined;
+    return c;
   }
 
   /**
@@ -1516,20 +1579,20 @@ export class Agent {
   }
 
   /**
-   * Build the effective system prompt, appending any system-position injections.
+   * Build the effective system prompt, appending any system-position
+   * injections, their blocks joined by line breaks. The system prompt is
+   * text, so a block of another type, such as an image a server or module
+   * injected there, can't go in it: a line in its place says so. The hook
+   * orchestrator tells a server's operator once per server and namespace,
+   * and the module registry tells a module's once per module and namespace.
    */
   private buildSystemPrompt(systemInjections: ContentBlock[]): string {
     if (systemInjections.length === 0) {
       return this.systemPrompt;
     }
 
-    const injectedText = systemInjections
-      .filter((block): block is ContentBlock & { type: 'text' } => block.type === 'text')
-      .map((block) => block.text);
-
-    if (injectedText.length === 0) {
-      return this.systemPrompt;
-    }
+    const injectedText = systemInjections.map((block) =>
+      block.type === 'text' ? block.text : `[${block.type} block not shown: the system prompt carries text only.]`);
 
     return this.systemPrompt + '\n' + injectedText.join('\n');
   }
@@ -1541,10 +1604,9 @@ export class Agent {
       return { aborted: true, durationMs };
     }
 
-    if (this._state.status === 'streaming' ||
-        (this._state.status === 'waiting_for_tools' && this._state.stream)) {
+    if ('stream' in this._state && this._state.stream) {
       const durationMs = Date.now() - this._inferenceStartedAt;
-      this.cancelStream();
+      this.cancelStream(reason);
       return { aborted: true, durationMs };
     }
 

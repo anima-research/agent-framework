@@ -30,6 +30,10 @@ export const REFERENCE_LIMITS = { uri: 4096, mimeType: 255, name: 255, expiresAt
 export const DIGEST_PATTERN = /^sha256:[A-Za-z0-9_-]{43}$/;
 const MAX_SAFE = 9007199254740991; // 2^53 - 1
 const STUB_FIELD_CHARS = 120;
+/** A saved copy's path, as its stub shows it. */
+const SAVED_PATH_CHARS = 256;
+/** A reference id's random suffix (see ReferenceRegistry.register). */
+const REF_ID_SUFFIX_CHARS = 4;
 
 export type ReferenceDisposition = 'never' | 'ref';
 
@@ -93,13 +97,21 @@ export function classifyBlock(block: unknown): BlockClassification {
         return { kind: 'inline', contradiction: block.disposition !== undefined || hasUri };
       }
       if (hasUri) return parseReferenceFields(block);
-      return { kind: 'invalid', reason: `${block.type} block with neither data nor uri` };
+      return { kind: 'invalid', reason: `${block.type} block ${mediaWithoutStringReason(block)}` };
     }
     case 'resource':
       return parseReferenceFields(block);
     default:
       return { kind: 'invalid', reason: `unknown block type: ${block.type}` };
   }
+}
+
+/** What a media block with neither string data nor a string uri has instead:
+ *  nothing, or a field that isn't a string. */
+function mediaWithoutStringReason(block: Record<string, unknown>): string {
+  const notString = (['data', 'uri'] as const).filter((f) => block[f] !== undefined && block[f] !== null);
+  if (notString.length === 0) return 'with neither data nor uri';
+  return notString.length === 2 ? "whose data and uri aren't strings" : `whose ${notString[0]} isn't a string`;
 }
 
 function parseReferenceFields(block: Record<string, unknown>): BlockClassification {
@@ -140,7 +152,7 @@ export function isInlineContradiction(block: unknown): boolean {
 }
 
 export const INLINE_WITHHELD_TEXT =
-  '[inline content withheld: nonconformant bulk disposition on inline data]';
+  '[inline content withheld: inline data that also claims a uri or a bulk disposition]';
 
 /**
  * Why a reference counts as expired, or null when it doesn't: its expiresAt
@@ -171,6 +183,11 @@ export const EXPIRY_REASON = {
   unparseable: 'treated as expired: its expiresAt does not parse (fail closed)',
   rejected: `treated as expired: its expiresAt was rejected as a field, over ${REFERENCE_LIMITS.expiresAt} characters or not a string (fail closed)`,
 } as const;
+
+/** A reference registered with no server, as the stub, the fetcher's refusal
+ *  and save_recent_image's all say it: the fetcher dials only through the
+ *  server a reference was registered against. */
+export const UNBOUND_REASON = 'unbound: no server is recorded to fetch it from';
 
 /** Strip control characters (C0, DEL, C1) and every bidi control (marks,
  *  embeddings, overrides, isolates, and the Arabic letter mark), trim the
@@ -256,7 +273,7 @@ export class ReferenceRegistry {
         return existing;
       }
     }
-    const refId = `ref_${(++this.counter).toString(36)}_${Math.random().toString(36).slice(2, 6)}`;
+    const refId = `ref_${(++this.counter).toString(36)}_${Math.random().toString(36).slice(2, 2 + REF_ID_SUFFIX_CHARS)}`;
     const record: ReferenceRecord = { refId, serverId, testimony, receivedAt: Date.now() };
     this.records.set(refId, record);
     this.byKey.set(testimony.uri, refId);
@@ -295,6 +312,22 @@ export function referenceTypeLabel(mimeType: string | undefined): string {
 }
 
 /**
+ * The longest line buildReferenceStub writes, in UTF-16 code units, from its
+ * own bounds: the longest id the registry mints, then the name, the type with
+ * the largest size it shows, and the origin, each at its bound, and the
+ * longest ending, a saved copy's path, with their separators. The other
+ * endings, the fetch hint and the reasons a fetch would be refused, are
+ * shorter. A line shaped like a stub but longer than this is quoted text the
+ * writer can't have written, and no image slot (tool-image-ledger.ts).
+ */
+export const REFERENCE_STUB_MAX_CHARS =
+  `[ref_${MAX_SAFE.toString(36)}_] `.length + REF_ID_SUFFIX_CHARS
+  + STUB_FIELD_CHARS
+  + ' — '.length + STUB_FIELD_CHARS + ', '.length + `${formatSizeBytes(MAX_SAFE)} claimed`.length
+  + ' — '.length + STUB_FIELD_CHARS
+  + ' — '.length + 'saved: '.length + SAVED_PATH_CHARS;
+
+/**
  * Build the model-visible stub for a reference. Output length is bounded by
  * host constants and independent of every server-supplied field length.
  * Under `disposition:"never"` the uri is omitted unconditionally; under
@@ -317,14 +350,29 @@ export function buildReferenceStub(t: ReferenceTestimony, provenance?: string, s
   if (record.fetchedPath) {
     // Already materialized by the host-mediated fetcher: hand the model the
     // workspace path (host-generated, §7.3) so existing tools just work.
-    parts.push(`saved: ${sanitizeLabel(record.fetchedPath, 256)}`);
+    parts.push(`saved: ${sanitizeLabel(record.fetchedPath, SAVED_PATH_CHARS)}`);
   } else {
-    // An expired reference says so rather than inviting a fetch_reference
-    // call the fetcher can only refuse.
-    const expiry = referenceExpiry(record.testimony);
-    parts.push(expiry ? EXPIRY_REASON[expiry] : 'fetch with fetch_reference');
+    // A reference whose record shows the fetcher would refuse it says why,
+    // rather than inviting a fetch_reference call.
+    parts.push(unfetchableReason(record) ?? 'fetch with fetch_reference');
   }
   return `[${record.refId}] ${parts.join(' — ') || 'referenced content'}`;
+}
+
+/**
+ * Why the fetcher would refuse a reference, as far as its record shows: no
+ * server registered for it, which the fetcher checks first, or its expiry.
+ * Null for a saved copy, which the fetcher serves before any check, and when
+ * the record shows neither. The fetcher's other refusals rest on what a record
+ * doesn't hold, such as a server gone by the time of the fetch, a uri off the
+ * origin its server was dialed at, a claimed size over the ceiling a fetch is
+ * given, or a server's fetch budget spent, and it gives those in its own words.
+ */
+export function unfetchableReason(record: ReferenceRecord, nowMs = Date.now()): string | null {
+  if (record.fetchedPath) return null;
+  if (record.serverId === undefined) return UNBOUND_REASON;
+  const expiry = referenceExpiry(record.testimony, nowMs);
+  return expiry ? EXPIRY_REASON[expiry] : null;
 }
 
 /**

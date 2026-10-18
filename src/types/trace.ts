@@ -55,6 +55,12 @@ export type TraceEvent =
       silent?: boolean;
     })
   | (TraceEventBase & {
+      /**
+       * The model answered and the turn ended: with the stream's final
+       * response, or with a tool result carrying `endTurn`, which
+       * `inference:turn_ended` then follows. `tokenUsage` is the stream's
+       * usage, cumulative across its rounds.
+       */
       type: 'inference:completed';
       agentName: string;
       durationMs: number;
@@ -66,11 +72,13 @@ export type TraceEvent =
       /** How long this start of the turn ran; after a context-budget restart, from the restart. */
       durationMs: number;
       /**
-       * Why the turn ended unfinished: the reason an operator gave
-       * `abortInference`, `'quiesce_abandoned'` for a turn an operator quiesce
-       * abandoned, or, for a turn dropped before it sent anything (its agent
-       * replaced or removed, or the framework stopping or restarted), a
-       * sentence saying which.
+       * Why the turn ended unfinished: the reason its canceller gave
+       * `abortInference` or `Agent.cancelStream` (`'user'` when it gave
+       * none), `'shutdown'` for a turn `stop()` cancelled,
+       * `'quiesce_abandoned'` for a turn an operator quiesce abandoned, or,
+       * for a turn dropped before it sent anything (its agent replaced or
+       * removed, or the framework stopping or restarted), a sentence saying
+       * which.
        */
       reason?: string;
     })
@@ -615,6 +623,47 @@ export type TraceEvent =
       /** The pattern rewritten under the server's actual tool prefix. */
       suggestion?: string;
       hint: string;
+    })
+  | (TraceEventBase & {
+      /** An inbound RPC request/notification handler failed: it threw or
+       *  rejected, or it resolved after a reply write of its own failed or
+       *  after it tried to answer a second time. */
+      type: 'mcpl:request-handler-error';
+      serverId: string;
+      /** Connection event name, e.g. channels-register or push-event. */
+      event: string;
+      /** The request's id when it is a number, or a string id bounded as the
+       *  other texts here are: control, format and line-separator characters
+       *  replaced, and cut after 500 code points, with "…" marking the cut.
+       *  Absent for a notification, for a request whose id is neither, and
+       *  for a request form of mcpl/manifestChanged or
+       *  notifications/tools/list_changed, which is answered as it's admitted
+       *  and then handled as the notification is. */
+      requestId?: string | number;
+      /** Whether a reply write of the handler's returned: true once one
+       *  did. On a connection that had already closed, that write dropped
+       *  the reply, as the connection then drops every reply, so nothing
+       *  reached the server. A write that throws, as one that can't be
+       *  encoded does, sends nothing. When it's false and the responder
+       *  can send an error reply (it has respondError), the host sent -32603
+       *  "Internal error" itself, or -32000 while it stops, unless
+       *  `responseError` says that reply failed. A connection that has
+       *  already closed drops that reply, as it drops every reply, with no
+       *  `responseError`. */
+      responseAttempted: boolean;
+      /** The handler's own error when it threw or rejected; otherwise the
+       *  reply write that failed and that it swallowed, or that it tried to
+       *  answer a second time. */
+      error: string;
+      /** A reply write that failed, when the handler then failed with an
+       *  error of its own (which is `error`). */
+      responseFailure?: string;
+      /** What the handler tried to send after a reply was already attempted:
+       *  refused, never written. A result, or an error reply with its code
+       *  and (bounded) message. */
+      refusedResponse?: { kind: 'result' } | { kind: 'error'; code: number; message: string };
+      /** Failure while trying to send the internal-error response. */
+      responseError?: string;
     })
   | (TraceEventBase & {
       type: 'mcpl:orphaned-response';

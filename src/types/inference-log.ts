@@ -17,7 +17,7 @@ export interface InferenceLogQuery {
   offset?: number;
   /** Search pattern for content (regex) */
   pattern?: string;
-  /** Only show failures */
+  /** Only show inferences that didn't succeed: failed or stopped */
   errorsOnly?: boolean;
 }
 

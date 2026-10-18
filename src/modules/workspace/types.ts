@@ -38,6 +38,11 @@ export interface MountConfig {
    * - Exact name match: ".git", "node_modules"
    * - Directory glob: "node_modules/**" (anything under node_modules)
    * - Extension glob: "*.pyc" (any file ending in .pyc)
+   * A sync without a path and the watcher pass over what the list covers,
+   * and over entries with an editor's swap or backup file name whatever it
+   * says, a directory with what lies beneath it: `.name.swp` and `.name.swx`
+   * (the whole name), and names ending in `~` or in `.subl…tmp`, matched by
+   * `^\..+\.sw[px]$`, `~$` and `\.subl.*\.tmp$`.
    */
   ignore?: string[];
   /** Whether to follow symlinks (default: false) */
@@ -74,6 +79,8 @@ export interface MountConfig {
    *
    * Self-writes through the module's own tools are already suppressed by the
    * watcher, so a mount shared between agents only wakes on external writes.
+   * A change of a file's mode alone is recorded, and makes no event: it
+   * brings nothing new to read.
    * The EventGate still has final say — use gate policies for path-glob
    * filtering or to disable wake temporarily via hot-reload.
    */

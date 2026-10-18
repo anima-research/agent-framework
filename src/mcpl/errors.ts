@@ -40,6 +40,34 @@ export const CHANNEL_OPEN_FAILED = -32024;
 // Error Factories
 // ============================================================================
 
+/** The text of any value: anything thrown or rejected, or a value a server
+ *  sent, such as an error answer's code. Never throws, whatever it is: a
+ *  null-prototype object, or a message getter or toString that throws. */
+export function describeCause(cause: unknown): string {
+  try {
+    return cause instanceof Error ? String(cause.message) : String(cause);
+  } catch {
+    try {
+      return Object.prototype.toString.call(cause);
+    } catch {
+      return 'an error that could not be printed';
+    }
+  }
+}
+
+/** Text a server or a handler chose, made fit for an error's message or a
+ *  trace field: control and format characters replaced (C0 and C1 controls,
+ *  bidi and other \p{Cf} characters, and the line and paragraph separators
+ *  some log readers break lines on), and cut after `max` code points, with
+ *  "…" marking the cut. Those are read as data, by a trace's or an error
+ *  listener's reader, so the text is bounded rather than escaped. A log line
+ *  prints text a server or a handler chose through log-value instead
+ *  (logValue for a field, logDetail for the free text that ends the line). */
+export function boundedForLog(text: string, max = 200): string {
+  const points = [...text.replace(/[\p{Cc}\p{Cf}\u2028\u2029]/gu, '?')];
+  return points.length > max ? `${points.slice(0, max).join('')}…` : points.join('');
+}
+
 /**
  * Create a "feature set not enabled" error.
  * Returned when a server sends a message tagged with a feature set

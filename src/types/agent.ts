@@ -307,13 +307,18 @@ export interface InferenceOptions {
 
 /**
  * Internal state of an agent.
+ *
+ * `supportsInjectedMessages` is what the stream declared with the round's
+ * tool calls (membrane's `ToolContext.supportsInjectedMessages`): whether it
+ * can carry messages injected with that round's results. It's absent when
+ * the stream doesn't say, as on membrane 0.5.87 and earlier.
  */
 export type AgentState =
   | { status: 'idle' }
   | { status: 'inferring'; promise: Promise<InferenceResult>; abortController: AbortController }
   | { status: 'streaming'; stream: YieldingStream }
-  | { status: 'waiting_for_tools'; pending: Map<ToolCallId, PendingToolCall>; completed: CompletedToolCall[]; stream?: YieldingStream }
-  | { status: 'ready'; toolResults: CompletedToolCall[]; stream?: YieldingStream };
+  | { status: 'waiting_for_tools'; pending: Map<ToolCallId, PendingToolCall>; completed: CompletedToolCall[]; stream?: YieldingStream; supportsInjectedMessages?: boolean }
+  | { status: 'ready'; toolResults: CompletedToolCall[]; stream?: YieldingStream; supportsInjectedMessages?: boolean };
 
 /**
  * A tool call that's in progress.
