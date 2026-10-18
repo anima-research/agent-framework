@@ -123,6 +123,7 @@ import {
   scriptViewClaims,
   shownToScript,
   shownToScriptFromServer,
+  toolResultBlocks,
   toolResultDataToHistoryString,
   truncateForHistory,
   DEFAULT_TOOL_RESULT_INLINE_MAX_CHARS,
@@ -443,12 +444,11 @@ function estimateAppendedRoundTokens(
   let images = 0;
   for (const tc of toolResults) {
     chars += spilled.get(tc.id)?.text.length ?? 0;
-    if (Array.isArray(tc.result.data)) {
-      for (const raw of tc.result.data) {
-        const b = raw as { type?: unknown };
-        if (b && typeof b === 'object' && b.type === 'image') images += 1;
-      }
-    }
+    // The images toolResultBlocks finds, an embedded resource's among them,
+    // which the live copy sends natively unless the result's links and
+    // markers pass the cap (goesNative). Counting them then overestimates, as
+    // this projection means to.
+    images += toolResultBlocks(tc.result.data, Boolean(tc.result.dataIsContent))?.filter((b) => b.kind === 'image').length ?? 0;
   }
   let injectedTokens = 0;
   for (const inj of injections) {

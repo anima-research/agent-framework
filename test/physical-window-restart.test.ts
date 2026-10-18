@@ -55,6 +55,30 @@ class QueuedStreamsMembrane extends MockMembrane {
   }
 }
 
+/** A tool whose one result is an image, as an MCP image block or as an
+ *  embedded resource's image blob. */
+class ImageToolModule implements Module {
+  readonly name = 'canned';
+  constructor(private readonly block: unknown) {}
+  async start(): Promise<void> {}
+  async stop(): Promise<void> {}
+  getTools(): ToolDefinition[] {
+    return [{ name: 'fetch', description: 'image', inputSchema: { type: 'object', properties: {} } }];
+  }
+  async handleToolCall(): Promise<ToolResult> {
+    return { success: true, data: [this.block], dataIsContent: true };
+  }
+  async onProcess(event: ProcessEvent): Promise<EventResponse> {
+    if (event.type === 'external-message') {
+      return {
+        addMessages: [{ participant: 'User', content: (event as { content: unknown }).content as never }],
+        requestInference: true,
+      };
+    }
+    return {};
+  }
+}
+
 class BlobToolModule implements Module {
   readonly name = 'canned';
   async start(): Promise<void> {}
@@ -426,6 +450,34 @@ describe('physical-window mid-turn restart (issue #92)', () => {
   // it. The restart trace's inputTokens is the projection, so the tests below
   // pin it whole.
   const APPENDED = 6_049;
+
+  it("counts an embedded resource's image as the image it's sent as", async () => {
+    // A 170k prompt with 2k output and the 32k reserve crosses the window
+    // whatever the round adds, so each turn restarts once and its projection
+    // shows what the image round added: the same for an MCP image block and
+    // for an embedded resource's image blob, each sent as a native image.
+    const png = Buffer.from('89504e470d0a1a0a', 'hex').toString('base64');
+    const projected = async (block: unknown) => {
+      const t = await windowTurn([
+        [
+          round('call_1', { inputTokens: 20_000, cacheReadTokens: 150_000, outputTokens: 2_000 }),
+          round(null, { inputTokens: 21_000, cacheReadTokens: 300_000, outputTokens: 2_500 }),
+        ],
+        afterRestart,
+      ], new ImageToolModule(block));
+      try {
+        assert.ok(t.done, 'the turn should finish');
+        assert.strictEqual(t.restarts.length, 1);
+        return t.restarts[0]!.inputTokens!;
+      } finally {
+        await t.close();
+      }
+    };
+    const inline = await projected({ type: 'image', data: png, mimeType: 'image/png' });
+    const embedded = await projected({ type: 'resource', resource: { uri: 'file:///zz/shot.png', mimeType: 'image/png', blob: png } });
+    assert.ok(inline >= 170_000 + 2_000 + 32_000 + 1_600, String(inline));
+    assert.strictEqual(embedded, inline);
+  });
 
   it('counts a cache-write prompt term toward a restart', async () => {
     // 10k fresh + 30k cache write + 120k cache read = a 160k prompt; with 2k
