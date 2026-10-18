@@ -289,10 +289,12 @@ function credentialName(name: string): string {
  * Whether a uri may carry a credential: userinfo, or a query or fragment
  * parameter named on CREDENTIAL_PARAMETERS with a value, a fragment read as
  * `name=value&…` as a query is. A name with no value carries nothing, as an
- * anchor (`#token`) or `?token=` doesn't. A `?` or `;` inside either
- * separates parameters too, as in a route kept in a fragment
- * (`#/reset?token=…`). A uri that doesn't parse, even as a relative
- * reference, may, since its parts can't be read.
+ * anchor (`#token`) or `?token=` doesn't. A `?` or `;` inside either may
+ * separate parameters too, as in a route kept in a fragment
+ * (`#/reset?token=…`), so the parameters are read both with and without
+ * them as separators, and one with a value in either reading counts. A uri
+ * that doesn't parse, even as a relative reference, may, since its parts
+ * can't be read.
  */
 export function uriMayCarryCredential(uri: string): boolean {
   let u: URL;
@@ -308,9 +310,12 @@ export function uriMayCarryCredential(uri: string): boolean {
     }
   }
   if (u.username !== '' || u.password !== '') return true;
-  const named = (params: string) =>
-    [...new URLSearchParams(params.replace(/[?;]/g, '&')).entries()]
-      .some(([name, value]) => value !== '' && CREDENTIAL_PARAMETERS.has(credentialName(name)));
+  // Read both ways: with '&' alone separating parameters, as a server
+  // reading the query as WHATWG does sees them, and with '?' and ';' too, so
+  // a value that opens with one (`token=;…`) still counts in the first.
+  const named = (params: string) => [params, params.replace(/[?;]/g, '&')].some((read) =>
+    [...new URLSearchParams(read).entries()]
+      .some(([name, value]) => value !== '' && CREDENTIAL_PARAMETERS.has(credentialName(name))));
   return named(u.search) || named(u.hash.slice(1));
 }
 
@@ -346,9 +351,10 @@ export function normalizedOrigin(url: string): string | null {
   }
 }
 
-/** Whether two urls that parse name one host, on the same port, explicit or
- *  each its scheme's default: `http://h` and `wss://h`, or `http://h:443` and
- *  `wss://h`. */
+/** Whether two urls that parse name one host and port as written: the same
+ *  port, or neither giving one (`http://h` and `wss://h`, the same site over
+ *  plaintext), or one giving the other's default (`http://h:443` and
+ *  `wss://h`). */
 function samePlace(a: string, b: string): boolean {
   const x = new URL(a);
   const y = new URL(b);
@@ -577,9 +583,11 @@ export class ReferenceRegistry {
   }
 
   /** Take back a framework's entry for a server, as it does for a server it
-   *  removes. Another framework's entry for the id, if any, is in force
-   *  again; with none, the id's references are refused as an unknown
-   *  server's, as that framework's fetch refuses them. */
+   *  removes, and for each of its servers when it stops. Another framework's
+   *  entry for the id, if any, is in force again; with none, a stub reads the
+   *  id's references as an unknown server's. After a removal, that framework's
+   *  fetch refuses them too. A stopped framework keeps its configs, so its
+   *  fetcher, called before it starts again, can still dial them. */
   forgetServerAddress(serverId: string, owner: object): void {
     const entries = (this.addresses.get(serverId) ?? []).filter((e) => e.owner !== owner);
     if (entries.length > 0) this.addresses.set(serverId, entries);

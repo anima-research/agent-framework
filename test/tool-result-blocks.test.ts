@@ -272,6 +272,9 @@ describe("MCP's resource_link, a reference (RFC-005 §8.1)", () => {
       'https://zz-elsewhere.example/#/reset?token=zz',
       'https://zz-elsewhere.example/cb?v=1;sig=zz',
       'https://zz-elsewhere.example/cb?v=1&amp;token=zz',
+      // a value that opens with a character read as a separator
+      'https://zz-elsewhere.example/cb?token=;zz',
+      'https://zz-elsewhere.example/cb#access_token=?zz',
       // names compared by their letters and digits alone, without case, and OAuth 1.0a's
       ...['accessToken', 'access-token', 'Api-Key', 'x-api-key', 'private-token', 'oauth_token', 'oauth_signature', 'token[]', 'api.key']
         .map((name) => `https://zz-elsewhere.example/cb?${name}=zz`),
