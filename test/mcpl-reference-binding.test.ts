@@ -150,19 +150,22 @@ test("fetch_reference reaches a push event's reference through its server's own 
     dispatchFetchReferenceToolCall(agentName: string, call: { id: string; name: string; input: unknown }): void;
   };
   Object.assign(framework, {
-    mcplServerConfigs: new Map([
-      ['push-srv', { id: 'push-srv', url: wsOrigin }],
-      ['stdio-srv', { id: 'stdio-srv', command: 'stdio-server' }],
-      ['spawned-srv', { id: 'spawned-srv', command: 'stdio-server', url: wsOrigin }],
-      ['ws-command-srv', { id: 'ws-command-srv', transport: 'websocket', command: 'stdio-server', url: wsOrigin }],
-      ['stdio-url-srv', { id: 'stdio-url-srv', transport: 'stdio', url: wsOrigin }],
-      ['ws-http-srv', { id: 'ws-http-srv', transport: 'websocket', url: origin }],
-      ['ws-fragment-srv', { id: 'ws-fragment-srv', url: `${wsOrigin}/mcpl#frag` }],
-    ]),
+    mcplServerConfigs: new Map(),
     getWorkspaceModule: () => ({ writeBinary: async () => ({ success: true }) }),
     firstWritableMountName: () => 'scratch',
     emitTrace: () => {},
   });
+  // Configured as the framework configures a server, its address recorded
+  // in the reference registry, where the stub and the fetcher read it.
+  for (const config of [
+    { id: 'push-srv', url: wsOrigin },
+    { id: 'stdio-srv', command: 'stdio-server' },
+    { id: 'spawned-srv', command: 'stdio-server', url: wsOrigin },
+    { id: 'ws-command-srv', transport: 'websocket', command: 'stdio-server', url: wsOrigin },
+    { id: 'stdio-url-srv', transport: 'stdio', url: wsOrigin },
+    { id: 'ws-http-srv', transport: 'websocket', url: origin },
+    { id: 'ws-fragment-srv', url: `${wsOrigin}/mcpl#frag` },
+  ]) (framework as unknown as { setMcplServerConfig(config: unknown): void }).setMcplServerConfig(config);
   // Bounded, so a dispatch that never answers fails the test rather than hanging it.
   const fetchReference = (refId: string): Promise<Answer['result']> => {
     let timer: NodeJS.Timeout | undefined;
@@ -245,6 +248,11 @@ async function puppetCall(answer: unknown, fetcher: unknown): Promise<{ result: 
     },
     getReferenceFetcher: () => fetcher,
   });
+  // eido is dialed on its references' origin, so a stub of one can offer
+  // the fetch: the reference registry records its address, as the
+  // framework does for a server it configures.
+  (framework as unknown as { setMcplServerConfig(config: unknown): void })
+    .setMcplServerConfig({ id: 'eido', url: 'wss://editor.example.invalid' });
   const quiet = console.log;
   console.log = () => {};
   const { result } = await framework.puppetToolCall('princess', 'mcpl--eido--look', {})

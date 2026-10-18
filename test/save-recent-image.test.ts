@@ -72,8 +72,8 @@ import { createMockResponse, MockMembrane } from './helpers/mock-membrane.js';
  *  connecting to them: a ws:// or wss:// url for one the host connects to over
  *  a network, a command alone for a stdio server. */
 function configureServers(framework: AgentFramework, configs: Array<{ id: string; url?: string; command?: string; autofetch?: { maxTotalBytes?: number } }>): void {
-  const known = (framework as unknown as { mcplServerConfigs: Map<string, unknown> }).mcplServerConfigs;
-  for (const config of configs) known.set(config.id, config);
+  const configure = (framework as unknown as { setMcplServerConfig(config: unknown): void }).setMcplServerConfig.bind(framework);
+  for (const config of configs) configure(config);
 }
 
 const PNG = Buffer.from(
@@ -1674,10 +1674,31 @@ describe('ToolImageLedger', () => {
       ['bound', {}, 'srv'],
       ['unbound', {}, undefined],
     ];
+    // And the reasons a fetch would be refused before it dials, each at its
+    // longest: a server's id is bounded as a label is, and a refused scheme
+    // isn't named.
+    const longServer = (kind: string) => `${kind}-${'s'.repeat(400)}`;
+    const host = {};
+    referenceRegistry.setServerAddress(longServer('stdio'), 'no-address', host);
+    referenceRegistry.setServerAddress(longServer('elsewhere'), { url: 'wss://elsewhere.invalid' }, host);
+    referenceRegistry.setServerAddress(longServer('dialed'), { url: 'wss://example.invalid' }, host);
+    endings.push(
+      ['no address', {}, longServer('stdio')],
+      ['unknown server', {}, longServer('unknown')],
+      ['third-party origin', {}, longServer('elsewhere')],
+      ['scheme', { uri: `${'x'.repeat(400)}://example.invalid/sri-longest-scheme.png` }, longServer('dialed')],
+    );
+    const reasons: Record<string, string> = {
+      'no address': '— no address: this host',
+      'unknown server': '— unknown server: unknown-s',
+      'third-party origin': '— third-party origin:',
+      scheme: '— scheme not allowed: this host fetches only',
+    };
     for (const [name, extra, serverId] of endings) {
       const stub = longestId(buildReferenceStub(testimony(name, extra), 'o'.repeat(400), serverId));
       assert.ok(stub.length < REFERENCE_STUB_MAX_CHARS, `${name}: ${stub.length}`);
       assert.strictEqual(parseImagePlaceholders(stub).length, 1, name);
+      if (reasons[name]) assert.ok(stub.includes(reasons[name]!), `${name}: ${stub}`);
     }
     // A placeholder: RFC 6838 bounds a type or subtype name at 127
     // characters, so normalizeMediaType keeps the longest essence and refuses

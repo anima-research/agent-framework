@@ -1,6 +1,6 @@
 import { ToolPresentation, presentationTools, isPresentationTool, renderCatalogue, type PresentationSnapshot } from "./tool-presentation.js";
 import { dirname, join } from 'node:path';
-import { INLINE_WITHHELD_TEXT, REFERENCE_LIMITS, classifyBlock, isInlineContradiction, isReferenceExpired, referenceRegistry, referenceStubOrNull, sanitizeLabel } from './mcpl/references.js';
+import { REFERENCE_LIMITS, classifyBlock, isReferenceExpired, referenceRegistry, sanitizeLabel, type ServerAddress } from './mcpl/references.js';
 import { ReferenceFetcher, DEFAULT_FETCH_MAX_BYTES, EAGER_FETCH_TIMEOUT_MS } from './mcpl/reference-fetcher.js';
 import {
   appendFileSync, closeSync, existsSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, unlinkSync,
@@ -113,6 +113,7 @@ import type { WorkspaceModule } from './modules/workspace/index.js';
 import type { ToolResultGuard, WithheldSpill } from './tool-result-guard.js';
 import {
   nonErrorResultText,
+  toolResultBlocks,
   toolResultDataToHistoryString,
   truncateForHistory,
   DEFAULT_TOOL_RESULT_INLINE_MAX_CHARS,
@@ -358,6 +359,23 @@ function extractChannelIdFromToolResult(
   } catch {
     return undefined;
   }
+}
+
+/**
+ * How the host reaches an MCPL server, for fetching its references: the url
+ * it dials the server at, as the transport decides. None for a server the
+ * host spawns, as a stdio server, nor for a WebSocket server whose url the
+ * transport won't dial, which buildWebSocketUrl refuses: one that isn't a
+ * ws:// or wss:// url, or has a fragment.
+ */
+function serverAddressOf(cfg: McplServerConfig): ServerAddress {
+  if (!isWebSocketTransport(cfg) || !cfg.url) return 'no-address';
+  try {
+    buildWebSocketUrl(cfg, null);
+  } catch {
+    return 'no-address';
+  }
+  return { url: cfg.url };
 }
 
 /**
@@ -3100,6 +3118,11 @@ export class AgentFramework {
     // and withheld spills, closed for the generation a stop ended, are open
     // for this one.
     this.lifecycleGeneration++;
+    // Its servers' addresses, which an earlier stop() took out of the
+    // reference registry, for its stubs.
+    for (const config of this.mcplServerConfigs.values()) {
+      referenceRegistry.setServerAddress(config.id, serverAddressOf(config), this);
+    }
     this.loopPromise = this.runLoop();
 
     // Start periodic sync timer (if enabled)
@@ -3458,6 +3481,10 @@ export class AgentFramework {
     if (this.mcplServerRegistry) {
       shutdownPromises.push(this.mcplServerRegistry.closeAll(teardownTimeoutMs));
     }
+    // A stopped framework's servers' addresses leave the reference registry,
+    // so no other framework's stub reads them and the registry doesn't keep
+    // this one reachable. start() records them again.
+    step(() => { for (const id of this.mcplServerConfigs.keys()) referenceRegistry.forgetServerAddress(id, this); });
     // Timed-out or failed teardown retains its context and may still write.
     // Sync available state best-effort, but leave its store open for a retry.
     for (const result of await Promise.allSettled(shutdownPromises)) {
@@ -4907,18 +4934,8 @@ export class AgentFramework {
         (serverId) => {
           const cfg = this.mcplServerConfigs.get(serverId);
           if (!cfg) return undefined;
-          // A server's address is the url the host dials it at, as the
-          // transport decides: none for a server the host spawns, as a stdio
-          // server, nor for a WebSocket server whose url the transport won't
-          // dial, which buildWebSocketUrl refuses: one that isn't a ws:// or
-          // wss:// url, or has a fragment.
-          if (!isWebSocketTransport(cfg) || !cfg.url) return 'no-address';
-          try {
-            buildWebSocketUrl(cfg, null);
-          } catch {
-            return 'no-address';
-          }
-          return { url: cfg.url, token: cfg.token, autofetch: cfg.autofetch };
+          const address = serverAddressOf(cfg);
+          return address === 'no-address' ? address : { url: address.url, token: cfg.token, autofetch: cfg.autofetch };
         },
         async (fileName, data, mimeType) => {
           const workspace = this.getWorkspaceModule();
@@ -4941,6 +4958,14 @@ export class AgentFramework {
     return this.referenceFetcherInstance;
   }
 
+  /** Configure an MCPL server: its config, for tool routing and the fetcher,
+   *  which reads a server's address and credential from it, and its address
+   *  in the reference registry, where a reference's stub reads it. */
+  private setMcplServerConfig(config: McplServerConfig): void {
+    this.mcplServerConfigs.set(config.id, config);
+    referenceRegistry.setServerAddress(config.id, serverAddressOf(config), this);
+  }
+
   /** Register every RFC-005 reference in a tool-result content array against
    *  its server, then eagerly fetch the ones inside the autofetch envelope
    *  (below the eager ceiling, connection origin — never worse than the
@@ -4956,18 +4981,27 @@ export class AgentFramework {
     // record here, hence the key by uri. A uri that any of this result's
     // blocks calls expired takes no slot, whichever block registered last. A
     // later result's fresh expiry still supersedes, through register().
-    const byUri = new Map<string, { record: import('./mcpl/references.js').ReferenceRecord; expiredHere: boolean }>();
+    // A link (MCP's resource_link) is registered, so the agent can fetch it,
+    // but never fetched here: a tool's links are what it offers to follow,
+    // and fetching them would spend the server's fetch budget on bytes
+    // nobody asked for. A uri a link names is fetched only when a block of
+    // the result that isn't a link names it too.
+    const byUri = new Map<string, {
+      record: import('./mcpl/references.js').ReferenceRecord; expiredHere: boolean; linkOnly: boolean;
+    }>();
     for (const block of content) {
       const c = classifyBlock(block);
       if (c.kind !== 'reference') continue;
       const record = referenceRegistry.register(c.testimony, serverId);
-      const expiredHere = byUri.get(c.testimony.uri)?.expiredHere === true || isReferenceExpired(c.testimony);
-      byUri.set(c.testimony.uri, { record, expiredHere });
+      const prior = byUri.get(c.testimony.uri);
+      const expiredHere = prior?.expiredHere === true || isReferenceExpired(c.testimony);
+      const linkOnly = (prior?.linkOnly ?? true) && c.testimony.fromLink === true;
+      byUri.set(c.testimony.uri, { record, expiredHere, linkOnly });
     }
     if (!eager) return;
     const fetcher = this.getReferenceFetcher();
     const eligible = [...byUri.values()]
-      .filter(({ record, expiredHere }) => !expiredHere && fetcher.isEagerEligible(record))
+      .filter(({ record, expiredHere, linkOnly }) => !expiredHere && !linkOnly && fetcher.isEagerEligible(record))
       .map(({ record }) => record);
     // Parallel with a count cap: N small fetches cost one round-trip of
     // wall-clock, and anything past the cap stays lazy (stub says so).
@@ -17848,6 +17882,7 @@ export class AgentFramework {
       return {
         success: true,
         data: result.content,
+        dataIsContent: true,
       };
     } catch (err) {
       return {
@@ -18367,9 +18402,9 @@ export class AgentFramework {
    *
    * The live copy is the stored text itself unless the result is a content
    * array carrying an inline image, which tryNativeToolResultContent sends
-   * as native blocks. It takes the same arrays the serializer takes block by
-   * block, and shows each image and each reference block's stub whole and
-   * each text block up to where it cuts that block at the cap (`maxChars`,
+   * as native blocks. It takes the blocks the serializer takes
+   * (toolResultBlocks), and shows each image, stub and marker whole and each
+   * text block up to where it cuts that block at the cap (`maxChars`,
    * toolResultCutAt), so those are the ranges of the text it showed.
    */
   private storedToolResultText(
@@ -18644,21 +18679,27 @@ export class AgentFramework {
     if (result.data === undefined || result.data === null) return nonErrorResultText(result, 5_000_000);
     // RFC-005 "eagerly lazy": a script receiving a result is the strongest
     // available signal that the bytes are wanted (scripts process, they do
-    // not browse) — materialize the references of a content array now, so
-    // the stub the script receives carries a workspace path it can open
+    // not browse) — materialize the references at the top level of an array
+    // now, whether or not the array is shown as content, so the stub the
+    // script receives carries a workspace path it can open
     // directly. Only a reference registered against its server can be
     // fetched: an MCPL server's result content is, on arrival, including
     // content a module got from a call of its own (ctx.callTool) and returns.
     // A reference a module makes itself has no server, so its fetch is
     // refused (and logged here) and the script gets its stub, as it does for
-    // a reference nested in other data, which isn't fetched.
+    // a reference nested in other data, which isn't fetched. A link (MCP's
+    // resource_link) isn't fetched either: a tool's links are what it offers
+    // to follow, and the script can fetch the ones it wants with
+    // fetch_reference.
     if (Array.isArray(result.data)) {
       const fetcher = this.getReferenceFetcher();
       for (const block of result.data) {
         const c = classifyBlock(block);
-        if (c.kind !== 'reference') continue;
-        const record = referenceRegistry.findByUri(c.testimony.uri)
-          ?? referenceRegistry.register(c.testimony);
+        if (c.kind !== 'reference' || c.testimony.fromLink) continue;
+        // Registered, not only found, so a re-issued reference's claims
+        // replace a link's, or a stale reference's, before the fetch reads
+        // them, as on any other path, while the record isn't fetched yet.
+        const record = referenceRegistry.register(c.testimony);
         const outcome = await fetcher.fetch(record);
         if (!outcome.ok) console.error(`[rfc005] script-demand fetch of ${record.refId} failed: ${outcome.error}`);
       }
@@ -18668,7 +18709,7 @@ export class AgentFramework {
     // reference is its stub at any depth and inline data claiming a uri or a
     // disposition is withheld (RFC-005). 5MB protocol safety cap only; no
     // context-cap truncation, no file spill.
-    return toolResultDataToHistoryString(result.data, 5_000_000);
+    return toolResultDataToHistoryString(result.data, 5_000_000, { dataIsContent: Boolean(result.dataIsContent) });
   }
 
   /**
@@ -18769,7 +18810,8 @@ export class AgentFramework {
     // blocks natively rather than JSON-stringifying them away. Anything else
     // goes as text. The error path was handled above, so isError is always
     // false on these return paths.
-    const blocks = this.tryNativeToolResultContent(afResult.data, maxChars, precomputed?.filePath ?? null);
+    const blocks = this.tryNativeToolResultContent(
+      afResult.data, Boolean(afResult.dataIsContent), maxChars, precomputed?.filePath ?? null);
     if (blocks) {
       return { toolUseId: callId, content: blocks, isError: false };
     }
@@ -18784,9 +18826,10 @@ export class AgentFramework {
   }
 
   /**
-   * If `data` is an MCP tool-result content array carrying at least one image,
-   * convert to Membrane's native ToolResultContentBlock[]. Returns null when
-   * the array is text-only (let JSON path handle it; saves a code path).
+   * If `data` is a content array (toolResultBlocks) carrying at least one
+   * image, its blocks as Membrane's native ToolResultContentBlock[]: each
+   * image as itself, and every other block as the text the stored copy shows
+   * for it. Returns null otherwise, and the live copy is the stored text.
    * `maxChars`, when provided, caps each accompanying text block so an image
    * inlined alongside an enormous text payload can't blow the context. A
    * block is cut as the stored copy is (toolResultCutAt), never inside a
@@ -18794,51 +18837,27 @@ export class AgentFramework {
    */
   private tryNativeToolResultContent(
     data: unknown,
+    dataIsContent: boolean,
     maxChars?: number,
     /** Spill file written by the history path — referenced from truncation
      *  notices so an image-adjacent giant text block stays recoverable. */
     spillPath: string | null = null,
   ): ToolResultContentBlock[] | null {
-    if (!Array.isArray(data)) return null;
-    let hasImage = false;
-    const blocks: ToolResultContentBlock[] = [];
-    for (const raw of data) {
-      if (!raw || typeof raw !== 'object') return null;
-      const b = raw as { type?: unknown; text?: unknown; data?: unknown; mimeType?: unknown };
-      if (isInlineContradiction(b)) {
-        // RFC-005 vector 2: withhold inline data claiming bulk disposition.
-        blocks.push({ type: 'text', text: INLINE_WITHHELD_TEXT });
-        continue;
+    const blocks = toolResultBlocks(data, dataIsContent);
+    if (!blocks?.some((block) => block.kind === 'image')) return null;
+    return blocks.map((block): ToolResultContentBlock => {
+      if (block.kind === 'image') {
+        return { type: 'image', source: { type: 'base64', data: block.data, mediaType: block.mimeType } };
       }
-      if (b.type === 'text') {
-        // A text that isn't a string shows as the converters' placeholder,
-        // rather than sending the whole array to the JSON fallback.
-        let text = typeof b.text === 'string' ? b.text : NON_STRING_TEXT_PLACEHOLDER;
-        if (maxChars && text.length > maxChars) {
-          text = text.slice(0, toolResultCutAt(text, maxChars))
-            + '\n\n[truncated — original was ' + text.length + ' chars'
-            + (spillPath ? `; full serialized result: workspace file ${spillPath}` : '')
-            + ']';
-        }
-        blocks.push({ type: 'text', text });
-      } else if (b.type === 'image' && typeof b.data === 'string' && typeof b.mimeType === 'string') {
-        hasImage = true;
-        blocks.push({
-          type: 'image',
-          source: { type: 'base64', data: b.data, mediaType: b.mimeType },
-        });
-      } else if (b.type === 'resource' || ((b.type === 'image' || b.type === 'audio') && typeof (b as { uri?: unknown }).uri === 'string')) {
-        // RFC-005 reference block → bounded stub. Previously this bailed the
-        // whole array to JSON, which both inlined the reference verbatim and
-        // demoted any adjacent image block to stringified base64.
-        const stub = referenceStubOrNull(b, 'from tool result');
-        if (stub === null) return null;
-        blocks.push({ type: 'text', text: stub });
-      } else {
-        return null; // unknown shape: the stored copy's text, which shows any reference in it as its stub
+      let text = block.text;
+      if (block.kind === 'text' && maxChars && text.length > maxChars) {
+        text = text.slice(0, toolResultCutAt(text, maxChars))
+          + '\n\n[truncated — original was ' + text.length + ' chars'
+          + (spillPath ? `; full serialized result: workspace file ${spillPath}` : '')
+          + ']';
       }
-    }
-    return hasImage ? blocks : null;
+      return { type: 'text', text };
+    });
   }
 
   private toolImageLedgerFor(agentName: string): ToolImageLedger {
@@ -20719,7 +20738,7 @@ export class AgentFramework {
     for (const config of serverConfigs) {
       const prefix = config.toolPrefix ?? `mcpl--${config.id}`;
       this.mcplPrefixMap.set(prefix, config.id);
-      this.mcplServerConfigs.set(config.id, config);
+      this.setMcplServerConfig(config);
     }
 
     // Find shouldTriggerInference callback:
@@ -21417,7 +21436,7 @@ export class AgentFramework {
       if (owner === config.id && other !== prefix) this.mcplPrefixMap.delete(other);
     }
     this.mcplPrefixMap.set(prefix, config.id);
-    this.mcplServerConfigs.set(config.id, config);
+    this.setMcplServerConfig(config);
 
     // Record per-server channel subscription policy before the server
     // registers channels — handleRegister fires during the handshake.
@@ -22086,6 +22105,7 @@ export class AgentFramework {
     const prefix = config?.toolPrefix ?? `mcpl--${id}`;
     if (this.mcplPrefixMap.get(prefix) === id) this.mcplPrefixMap.delete(prefix);
     this.mcplServerConfigs.delete(id);
+    referenceRegistry.forgetServerAddress(id, this);
 
     await this.refreshMcplTools();
     this.emitMcplToolDiff(oldToolNames, id);
@@ -23147,19 +23167,16 @@ export class AgentFramework {
         // is a failure (mcplToolFailure, which an in-process caller's error
         // takes too). When a success contains non-text blocks (e.g. images
         // from an MCP tool like zulip-mcp's fetch_attachment), pass the full
-        // content array through so toMembraneToolResult can preserve image
-        // blocks natively. Text-only results still collapse to a joined
-        // string for backward compatibility with callers that expect data to
-        // be string-ish.
+        // content array through, marked as content (dataIsContent), so
+        // toMembraneToolResult can preserve image blocks natively and show
+        // every other block as its stub or marker. Text-only results still
+        // collapse to a joined string for backward compatibility with
+        // callers that expect data to be string-ish.
         const converted: ToolResult = result.isError
           ? mcplToolFailure(result.content, serverId, call.name)
-          : {
-              success: true,
-              data: result.content?.some((c) => c.type !== 'text')
-                ? result.content
-                : (mcplResultText(result.content) || undefined),
-              isError: false,
-            };
+          : result.content?.some((c) => c.type !== 'text')
+            ? { success: true, data: result.content, dataIsContent: true, isError: false }
+            : { success: true, data: mcplResultText(result.content) || undefined, isError: false };
         this.emitTrace({
           type: converted.isError ? 'tool:failed' : 'tool:completed',
           module: `mcpl:${serverId}`, tool: toolName, callId: call.id, durationMs,

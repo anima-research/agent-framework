@@ -5,6 +5,11 @@ import {
   referenceRegistry, referenceStubOrNull, UNBOUND_REASON, unfetchableReason,
 } from '../src/mcpl/references.js';
 
+// The server these tests bind references to, dialed on their origin, so a
+// bound reference's stub can offer the fetch; the framework records each
+// server it configures the same way.
+referenceRegistry.setServerAddress('srv', { url: 'wss://example.test' }, {});
+
 const fields = ['name', 'mimeType', 'expiresAt'] as const;
 const types = ['resource', 'image', 'audio'] as const;
 function reference(type: string, extra: Record<string, unknown> = {}) {

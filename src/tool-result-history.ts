@@ -9,28 +9,123 @@
  * `maxChars` slice and re-introduces, one turn deferred, exactly the silent
  * hallucination this feature exists to kill.
  *
- * For MCP-shaped content arrays, this helper keeps text blocks verbatim and
- * replaces image blocks with a short `[image: mimeType, ~NKB]` placeholder.
- * For anything else it falls back to JSON, written by RFC-005's rules at
- * every depth (historyJson): a reference is shown as its stub wherever it
- * sits in the data, so its uri never reaches history, and inline data that
- * claims a uri or a disposition is withheld.
+ * A content array (toolResultBlocks) is shown block by block, each block as
+ * both copies show it: text verbatim, an image as a short
+ * `[image: mimeType, ~NKB]` placeholder, a reference as its stub, and any
+ * other block as a marker saying what it was and why it isn't shown. Anything
+ * else falls back to JSON, written by RFC-005's rules at every depth
+ * (historyJson): a reference is shown as its stub wherever it sits in the
+ * data, so its uri never reaches history, and inline data that claims a uri
+ * or a disposition is withheld.
  */
 
-import { INLINE_WITHHELD_TEXT, isInlineContradiction, referenceStubOrNull } from './mcpl/references.js';
-import { NON_STRING_TEXT_PLACEHOLDER } from './mcpl/visible-content.js';
+import {
+  AUDIO_NO_DATA_TEXT,
+  AUDIO_NO_MEDIA_TYPE_TEXT,
+  IMAGE_NO_DATA_TEXT,
+  IMAGE_NO_MEDIA_TYPE_TEXT,
+  INLINE_WITHHELD_TEXT,
+  buildReferenceStub,
+  classifyBlock,
+  referenceStubOrNull,
+  referenceTypeLabel,
+} from './mcpl/references.js';
 import { formatToolImagePlaceholder, toolResultCutAt } from './tool-image-ledger.js';
 
 /** Where one block of a content array sits in its history text, and what
  *  kind of block it was: text, an inline image (its placeholder), an RFC-005
- *  reference (its stub), or inline data withheld for a contradiction. */
+ *  reference (its stub), inline data withheld for a contradiction, or a
+ *  marker in place of a block the lane can't show. */
 export interface HistoryBlockSpan {
-  kind: 'text' | 'image' | 'reference' | 'withheld';
+  kind: ToolResultBlock['kind'];
   start: number;
   end: number;
 }
 
+/**
+ * One block of a tool result's content array as both of its copies show it
+ * (toolResultBlocks): a text block's text, an inline image, which the stored
+ * copy shows as its placeholder and the live copy as itself, or the text that
+ * stands in its place, the same in both. That text is a reference's stub,
+ * inline data withheld for a contradiction, or a marker saying what kind of
+ * block it was and why the lane can't show it.
+ */
+export type ToolResultBlock =
+  | { kind: 'text'; text: string }
+  | { kind: 'image'; data: string; mimeType: string }
+  | { kind: 'reference' | 'withheld' | 'marker'; text: string };
+
+/** The block types MCP defines for a tool result's content. */
+const MCP_BLOCK_TYPES = new Set(['text', 'image', 'audio', 'resource', 'resource_link']);
+
+/**
+ * Each element of `data` as both copies of a tool result show it, or null
+ * when `data` isn't a content array, so the result is data, written as JSON.
+ * An array is content when the result says so (`dataIsContent`, which the
+ * framework sets on an MCPL tool's result: every element of a protocol
+ * result's content is a block, of a type the host shows or not). Otherwise
+ * it's content only when every element is a block of one of MCP's own types,
+ * so a list of records of other types stays data. A module's array of
+ * records that all carry MCP's type names, such as `[{ type: 'image', url }]`,
+ * is read as content, and shows a marker for each record that isn't a block
+ * the lane can show.
+ */
+export function toolResultBlocks(data: unknown, dataIsContent?: boolean): ToolResultBlock[] | null {
+  if (!Array.isArray(data)) return null;
+  if (dataIsContent !== true && !data.every((element) => isPlainRecord(element) && MCP_BLOCK_TYPES.has(element.type as string))) {
+    return null;
+  }
+  return data.map(toolResultBlock);
+}
+
+/** One element of a content array, as toolResultBlocks gives it. Only an
+ *  image with data and a media type is shown as itself, as the push lane's
+ *  converter shows one, and only text and images can be: this host's tool
+ *  results carry nothing else, so inline audio is a marker here. */
+function toolResultBlock(raw: unknown): ToolResultBlock {
+  const c = classifyBlock(raw);
+  switch (c.kind) {
+    case 'text':
+      return { kind: 'text', text: (raw as { text: string }).text };
+    case 'reference':
+      // A bounded stub, never the block's JSON, which would show its uri. A
+      // stub that shows an image type occupies a slot in save_recent_image's
+      // inventory (a failing one: its bytes are behind fetch_reference), so
+      // the index never slides past an image the resident saw. A link the
+      // host can't fetch, shown by its uri, is no slot, as no link was before
+      // links were references, when the result's JSON showed it.
+      return { kind: 'reference', text: buildReferenceStub(c.testimony, 'from tool result', undefined, { unfetchedLinkUri: true }) };
+    case 'invalid':
+      return { kind: 'marker', text: c.shown };
+    case 'inline': {
+      if (c.contradiction) return { kind: 'withheld', text: INLINE_WITHHELD_TEXT };
+      const b = raw as { type: 'image' | 'audio'; data: string; mimeType?: unknown };
+      const image = b.type === 'image';
+      if (b.data === '') return { kind: 'marker', text: image ? IMAGE_NO_DATA_TEXT : AUDIO_NO_DATA_TEXT };
+      if (typeof b.mimeType !== 'string' || b.mimeType === '') {
+        return { kind: 'marker', text: image ? IMAGE_NO_MEDIA_TYPE_TEXT : AUDIO_NO_MEDIA_TYPE_TEXT };
+      }
+      if (image) return { kind: 'image', data: b.data, mimeType: b.mimeType };
+      return { kind: 'marker', text: toolResultAudioText(b.mimeType, b.data) };
+    }
+  }
+}
+
+/** What a tool result's inline audio shows as: its type and size, and that
+ *  this host's tool results carry only text and images. */
+function toolResultAudioText(mimeType: string, data: string): string {
+  const what = [referenceTypeLabel(mimeType), formatSize(Math.floor(data.length * 3 / 4))].filter(Boolean).join(', ');
+  return `[Audio not shown: this host's tool results carry only text and images (${what}).]`;
+}
+
 export interface HistorySerializeOptions {
+  /**
+   * Whether the result's data is a protocol result's content
+   * (ToolResult.dataIsContent), so an array is shown block by block whatever
+   * its blocks' types (toolResultBlocks). nonErrorResultText takes it from
+   * the result instead, whatever this says.
+   */
+  dataIsContent?: boolean;
   /**
    * Called for every image block the serializer replaces with a placeholder
    * (issue #104). Returns the retention ref to embed in the placeholder —
@@ -86,9 +181,11 @@ export function toolResultDataToHistoryString(
  *
  * Each field is read once: the direct Agent API passes its caller's own
  * result here, unchecked, and a getter needn't answer the same way twice.
+ * Whether an array is content is the result's own `dataIsContent`, read for
+ * its truth as a result's flags are, whatever `options` says.
  */
 export function nonErrorResultText(
-  result: { data?: unknown; error?: string },
+  result: { data?: unknown; error?: string; dataIsContent?: boolean },
   maxChars?: number,
   options?: HistorySerializeOptions,
 ): string {
@@ -97,7 +194,7 @@ export function nonErrorResultText(
     const error = result.error;
     if (typeof error === 'string' && error) return maxChars ? truncateForHistory(error, maxChars) : error;
   }
-  return toolResultDataToHistoryString(data, maxChars, options);
+  return toolResultDataToHistoryString(data, maxChars, { ...options, dataIsContent: Boolean(result.dataIsContent) });
 }
 
 /** Bounded copy of an arbitrary string with the standard truncation notice,
@@ -113,44 +210,20 @@ export function truncateForHistory(str: string, maxChars: number): string {
 }
 
 /**
- * If `data` is an MCP content array whose every block has a shape we
- * recognize, return a history-safe string (images → placeholders). Otherwise
- * return `null` to defer to the fallback, historyJson, which shows a
- * reference anywhere in the data as its stub.
+ * A content array's history text (toolResultBlocks): each block's text, an
+ * image as its placeholder, joined by newlines. Null when `data` isn't a
+ * content array, for the fallback, historyJson.
  */
 function tryHistoryStringFromContentArray(data: unknown, options?: HistorySerializeOptions): string | null {
-  if (!Array.isArray(data)) return null;
-  const parts: Array<{ kind: HistoryBlockSpan['kind']; text: string }> = [];
-  for (const [blockIndex, raw] of data.entries()) {
-    if (!raw || typeof raw !== 'object') return null;
-    const b = raw as { type?: unknown; text?: unknown; data?: unknown; mimeType?: unknown };
-    if (b.type === 'text') {
-      // A text that isn't a string shows as the converters' placeholder,
-      // rather than sending the whole array to the JSON fallback.
-      parts.push({ kind: 'text', text: typeof b.text === 'string' ? b.text : NON_STRING_TEXT_PLACEHOLDER });
-    } else if (isInlineContradiction(b)) {
-      // RFC-005 vector 2: checked before the data branch so inline data
-      // claiming bulk disposition is withheld, not rendered.
-      parts.push({ kind: 'withheld', text: INLINE_WITHHELD_TEXT });
-    } else if (b.type === 'image' && typeof b.data === 'string' && typeof b.mimeType === 'string') {
-      // Decoded byte estimate from base64 length (3/4 ratio, rounded).
-      const approxBytes = Math.floor(b.data.length * 3 / 4);
-      const ref = options?.imageRef?.(blockIndex, { data: b.data, mimeType: b.mimeType }) ?? null;
-      parts.push({ kind: 'image', text: formatToolImagePlaceholder(b.mimeType, formatSize(approxBytes), ref) });
-    } else if (b.type === 'resource' || ((b.type === 'image' || b.type === 'audio') && typeof (b as { uri?: unknown }).uri === 'string')) {
-      // RFC-005 reference block: a bounded stub, never the raw block JSON
-      // (which used to inline the URI — and the whole array — into history).
-      // A stub that shows an image type occupies a slot in
-      // save_recent_image's inventory (a failing one — bytes live behind
-      // fetch_reference), so the index never slides past an image the
-      // resident saw.
-      const stub = referenceStubOrNull(b, 'from tool result');
-      if (stub === null) return null;
-      parts.push({ kind: 'reference', text: stub });
-    } else {
-      return null;
-    }
-  }
+  const blocks = toolResultBlocks(data, options?.dataIsContent);
+  if (blocks === null) return null;
+  const parts = blocks.map((block, blockIndex): { kind: HistoryBlockSpan['kind']; text: string } => {
+    if (block.kind !== 'image') return block;
+    // Decoded byte estimate from base64 length (3/4 ratio, rounded).
+    const approxBytes = Math.floor(block.data.length * 3 / 4);
+    const ref = options?.imageRef?.(blockIndex, { data: block.data, mimeType: block.mimeType }) ?? null;
+    return { kind: 'image', text: formatToolImagePlaceholder(block.mimeType, formatSize(approxBytes), ref) };
+  });
   if (options?.onBlocks) {
     const spans: HistoryBlockSpan[] = [];
     let start = 0;
@@ -166,15 +239,16 @@ function tryHistoryStringFromContentArray(data: unknown, options?: HistorySerial
 /**
  * Whether RFC-005 governs a value of a tool result's data, wherever it sits.
  * A reference is a `resource` with a uri, at its top level or under
- * `resource` (where MCP embeds a resource's uri), or an `image` or `audio`
- * given by uri; inline data is an `image` or `audio` whose data is a string.
- * A uri that is null, absent or empty counts as none, and data that isn't a
- * string isn't inline data, so a record that only shares one of those type
- * names is data. A uri of any other value, string or not, counts, so a
- * credential fails closed.
+ * `resource` (where MCP embeds a resource's uri), an `image` or `audio`
+ * given by uri, or MCP's `resource_link` (RFC-005 §8.1); inline data is an
+ * `image` or `audio` whose data is a string. A uri that is null, absent or
+ * empty counts as none, and data that isn't a string isn't inline data, so a
+ * record that only shares one of those type names is data. A uri of any
+ * other value, string or not, counts, so a credential fails closed.
  */
 function governedByRfc005(b: Record<string, unknown>): boolean {
   if (b.type === 'resource') return hasUri(b.uri) || (isPlainRecord(b.resource) && hasUri(b.resource.uri));
+  if (b.type === 'resource_link') return hasUri(b.uri);
   if (b.type === 'image' || b.type === 'audio') return typeof b.data === 'string' || hasUri(b.uri);
   return false;
 }
@@ -192,11 +266,11 @@ function isPlainRecord(value: unknown): value is Record<string, unknown> {
  * wherever it sits in the data. A value RFC-005 governs (governedByRfc005) is
  * shown as the reference lanes show it: a reference as its stub, an invalid
  * one (such as a uri that isn't a string, or MCP's embedded resource, whose
- * uri isn't at its top level) as an unrecognized-block line, and inline data
- * that also claims a uri or a disposition as withheld, so no uri is ever
- * shown. Inline data that claims neither is itself, as is any other value:
- * a block of another type keeps its fields, a `resource_link`'s uri among
- * them, since RFC-005 governs references.
+ * uri isn't at its top level) as the marker saying why it isn't shown, and
+ * inline data that also claims a uri or a disposition as withheld, so no uri
+ * is ever shown. Inline data that claims neither is itself, as is any other value:
+ * a block of another type keeps its fields, since RFC-005 governs
+ * references.
  */
 function shownInHistory(value: unknown): unknown {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return value;
@@ -208,13 +282,13 @@ function shownInHistory(value: unknown): unknown {
     // no uri: an object can carry a credential. An empty uri carries none.
     return hasUri(b.uri) || b.disposition !== undefined ? INLINE_WITHHELD_TEXT : value;
   }
-  return referenceStubOrNull(b, 'from tool result') ?? value;
+  return referenceStubOrNull(b, 'from tool result', undefined, { unfetchedLinkUri: true }) ?? value;
 }
 
 /**
  * The text RFC-005 shows a value of a tool result's data as, when it shows it
  * as text rather than as its fields: a reference's stub, an invalid one's
- * unrecognized-block line, or inline data withheld. Null for any other value.
+ * marker, or inline data withheld. Null for any other value.
  */
 export function rfc005TextOf(value: unknown): string | null {
   const shown = shownInHistory(value);

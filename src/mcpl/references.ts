@@ -49,6 +49,10 @@ export interface ReferenceTestimony {
   disposition?: ReferenceDisposition;
   rejectedFields: string[];
   truncatedFields: string[];
+  /** Set when the testimony is an MCP resource_link's, which claims no
+   *  digest, expiry or disposition. A link is registered but never fetched
+   *  on the side, and its testimony never replaces a record's (register). */
+  fromLink?: true;
 }
 
 export type BlockClassification =
@@ -92,27 +96,33 @@ export function classifyBlock(block: unknown): BlockClassification {
         : { kind: 'invalid', shown: NON_STRING_TEXT_PLACEHOLDER };
     case 'image':
     case 'audio': {
-      const hasData = typeof block.data === 'string';
-      const hasUri = typeof block.uri === 'string';
-      if (hasData) {
-        // Inline form claiming bulk disposition (or smuggling a uri beside
+      // An empty uri is no link, as the push lane's converter reads it.
+      const hasLink = typeof block.uri === 'string' && block.uri !== '';
+      if (typeof block.data === 'string') {
+        // Inline form claiming bulk disposition (or smuggling a link beside
         // the data) is the vector-2 contradiction: fail closed, withhold.
-        // A uri of '' counts here too, though it's no link: until the
-        // tool-result lane gives every inline shape a marker of its own,
-        // showing that data would put some of it into history as raw JSON.
-        // Once that lane does, an empty link beside data reads as no link.
-        return { kind: 'inline', contradiction: block.disposition !== undefined || hasUri };
+        return { kind: 'inline', contradiction: block.disposition !== undefined || hasLink };
       }
-      // With no data, an empty uri is no link, as the push lane's converter
-      // reads it.
-      if (hasUri && block.uri !== '') return parseReferenceFields(block);
+      if (hasLink) return parseReferenceFields(block);
       return { kind: 'invalid', shown: block.type === 'image' ? IMAGE_NO_DATA_TEXT : AUDIO_NO_DATA_TEXT };
     }
     case 'resource':
       return parseReferenceFields(block);
+    case 'resource_link':
+      // MCP's link to a resource is a reference too. RFC-005 §8.1 maps it
+      // onto the reference record field for field, its `size` as `sizeBytes`,
+      // with no disposition: the host's default policy, as for any reference
+      // that claims none. Its title, description and annotations aren't
+      // testimony.
+      return linkTestimony(parseReferenceFields({ uri: block.uri, name: block.name, mimeType: block.mimeType, sizeBytes: block.size }));
     default:
       return { kind: 'invalid', shown: unknownBlockText(block) };
   }
+}
+
+/** A link's classification, its testimony marked as a link's (fromLink). */
+function linkTestimony(c: BlockClassification): BlockClassification {
+  return c.kind === 'reference' ? { kind: 'reference', testimony: { ...c.testimony, fromLink: true } } : c;
 }
 
 function parseReferenceFields(block: Record<string, unknown>): BlockClassification {
@@ -222,21 +232,225 @@ export const EXPIRY_REASON = {
  *  only through a server that delivered the reference. */
 export const UNBOUND_REASON = "not tied to any server, so there's nowhere to fetch it from";
 
-/** The fetcher's refusal for a server it has no address to dial, one the
- *  host doesn't connect to over a network, such as a stdio server; the
- *  fetcher dials only through a server's address. save_recent_image gives it
- *  too. A stub can't know it, since only the framework holds its servers'
- *  configs. */
+/** The refusal for a server the host has no address to dial, one it doesn't
+ *  connect to over a network, such as a stdio server: the fetcher dials only
+ *  through a server's address. A reference's stub, fetch_reference and
+ *  save_recent_image all give it (dialCheck). */
 export function noAddressReason(serverId: string): string {
   return `no address: this host doesn't connect to server ${serverId} over a network, so there's nowhere to fetch it from`;
 }
 
-/** Strip control characters (C0, DEL, C1) and every bidi control (marks,
- *  embeddings, overrides, isolates, and the Arabic letter mark), trim the
- *  whitespace (a BOM included) left at either end, and bound the length.
- *  Labels are labels — storage naming is host-generated elsewhere (§7.3). */
+/** A server's id as the agent reads it in a stub or a refusal: as a label
+ *  is, bounded and with its controls removed. */
+export function shownServerId(serverId: string): string {
+  return sanitizeLabel(serverId, STUB_FIELD_CHARS);
+}
+
+/**
+ * Query and fragment parameters that carry a credential, by name, compared
+ * by their letters and digits alone, without letter case, so `access_token`,
+ * `accessToken`, `access-token` and `access_token[]` are one name. RFC-005 §5: "Signed URLs and query capabilities are
+ * bearer credentials that look like locations", so a uri is shown only where
+ * the host's policy classifies it as non-capability-bearing, which here is
+ * one with no userinfo and none of these parameters (uriMayCarryCredential).
+ * For example:
+ * - AWS's signed URLs: `https://b.s3.amazonaws.com/k?X-Amz-Algorithm=…&X-Amz-Credential=…&X-Amz-Security-Token=…&X-Amz-Signature=…`
+ * - Google Cloud Storage's: `https://storage.googleapis.com/b/k?X-Goog-Algorithm=…&X-Goog-Credential=…&X-Goog-Signature=…`
+ * - Azure's shared access signatures: `https://a.blob.core.windows.net/c/b?sv=…&se=…&sp=r&sig=…`
+ * - CloudFront's: `https://d1.cloudfront.net/k?Expires=…&Signature=…&Key-Pair-Id=…`, or `?Policy=…&Signature=…&Key-Pair-Id=…`
+ * - Discord's CDN: `https://cdn.discordapp.com/attachments/1/2/f.png?ex=…&is=…&hm=…`
+ * - Backblaze B2's: `https://f000.backblazeb2.com/file/b/k?Authorization=…`
+ * - OAuth's: `#access_token=…&token_type=bearer`, `#id_token=…`, `?refresh_token=…`, `?client_secret=…`,
+ *   and OAuth 1.0a's `?oauth_token=…&oauth_signature=…`
+ * - the generic: `?token=…`, `?auth=…`, `?key=…`, `?apikey=…`, `?api_key=…`, `?x-api-key=…`, `?private_token=…`,
+ *   `?secret=…`, `?password=…`, `?signature=…`
+ * A credential named otherwise, or carried in a path, such as a webhook's
+ * `https://discord.com/api/webhooks/<id>/<token>`, isn't caught.
+ */
+const CREDENTIAL_PARAMETERS: ReadonlySet<string> = new Set([
+  'x-amz-signature', 'x-amz-credential', 'x-amz-security-token',
+  'x-goog-signature', 'x-goog-credential',
+  'sig',
+  'signature', 'key-pair-id', 'policy',
+  'hm',
+  'authorization',
+  'access_token', 'id_token', 'refresh_token', 'client_secret',
+  'oauth_token', 'oauth_signature',
+  'token', 'auth', 'key', 'api_key', 'x-api-key', 'private_token', 'secret', 'password',
+].map(credentialName));
+
+/** A parameter's name as CREDENTIAL_PARAMETERS compares it: its letters and
+ *  digits alone, in lower case. */
+function credentialName(name: string): string {
+  return name.toLowerCase().replace(/[^a-z0-9]/g, '');
+}
+
+/**
+ * Whether a uri may carry a credential: userinfo, or a query or fragment
+ * parameter named on CREDENTIAL_PARAMETERS with a value, a fragment read as
+ * `name=value&…` as a query is. A name with no value carries nothing, as an
+ * anchor (`#token`) or `?token=` doesn't. A `?` or `;` inside either
+ * separates parameters too, as in a route kept in a fragment
+ * (`#/reset?token=…`). A uri that doesn't parse, even as a relative
+ * reference, may, since its parts can't be read.
+ */
+export function uriMayCarryCredential(uri: string): boolean {
+  let u: URL;
+  try {
+    // Absolute first: against an http base, `http:user:pass@host` would read
+    // as a relative path and hide its userinfo.
+    u = new URL(uri);
+  } catch {
+    try {
+      u = new URL(uri, 'http://relative.invalid/');
+    } catch {
+      return true;
+    }
+  }
+  if (u.username !== '' || u.password !== '') return true;
+  const named = (params: string) =>
+    [...new URLSearchParams(params.replace(/[?;]/g, '&')).entries()]
+      .some(([name, value]) => value !== '' && CREDENTIAL_PARAMETERS.has(credentialName(name)));
+  return named(u.search) || named(u.hash.slice(1));
+}
+
+/** How the host reaches a server, as far as fetching its references goes:
+ *  the url it dials the server at, or none, for a server it doesn't connect
+ *  to over a network, such as a stdio server. A framework records each of its
+ *  servers' in the registry (ReferenceRegistry.setServerAddress), where a
+ *  stub reads it; its fetcher reads the same from the framework's own
+ *  configs, beside each server's credential. */
+export type ServerAddress = { url: string } | 'no-address';
+
+/** Why a fetch of a reference would be refused before it dials. `ofReference`
+ *  marks one of the reference's own phrases (unbound, expired), which
+ *  fetch_reference words as "reference <reason>"; it gives the others as
+ *  they are. `inStub`, where it's set, is how the reference's stub words it,
+ *  without the parts of the uri the stub never shows. */
+export interface Refusal {
+  reason: string;
+  ofReference: boolean;
+  inStub?: string;
+}
+
+/** ws→http / wss→https with default ports elided, for origin comparison. */
+export function normalizedOrigin(url: string): string | null {
+  try {
+    const u = new URL(url);
+    const scheme = u.protocol === 'ws:' ? 'http:' : u.protocol === 'wss:' ? 'https:' : u.protocol;
+    const defaultPort = scheme === 'https:' ? '443' : '80';
+    const port = u.port === '' || u.port === defaultPort ? '' : `:${u.port}`;
+    return `${scheme}//${u.hostname.toLowerCase()}${port}`;
+  } catch {
+    return null;
+  }
+}
+
+/** Whether two urls that parse name one host, on the same port, explicit or
+ *  each its scheme's default: `http://h` and `wss://h`, or `http://h:443` and
+ *  `wss://h`. */
+function samePlace(a: string, b: string): boolean {
+  const x = new URL(a);
+  const y = new URL(b);
+  const port = (u: URL) => u.port || (u.protocol === 'https:' || u.protocol === 'wss:' ? '443' : '80');
+  return x.hostname.toLowerCase() === y.hostname.toLowerCase() && (x.port === y.port || port(x) === port(y));
+}
+
+/** The §6.1/§7.1 policy check of a uri against the url a server is dialed
+ *  at: null where a fetch through that server may fetch it. */
+function originRefusal(uri: string, serverUrl: string): Refusal | null {
+  const refOrigin = normalizedOrigin(uri);
+  const dialedOrigin = normalizedOrigin(serverUrl);
+  if (!refOrigin) return { reason: 'reference uri does not parse', ofReference: false };
+  if (!dialedOrigin) return { reason: 'server url does not parse', ofReference: false };
+  const scheme = refOrigin.split('//')[0];
+  if (scheme !== 'https:' && scheme !== 'http:') {
+    return {
+      reason: `scheme not allowed: ${sanitizeLabel(scheme, STUB_FIELD_CHARS)}`,
+      ofReference: false,
+      inStub: 'scheme not allowed: this host fetches only http and https uris',
+    };
+  }
+  // An http uri on the host of a server dialed over a secure connection, on
+  // the same port or each on its scheme's default, before the origins are
+  // compared, which would call it a third party's.
+  if (scheme === 'http:' && dialedOrigin.startsWith('https:') && samePlace(uri, serverUrl)) {
+    return { reason: 'plaintext reference from a secure origin', ofReference: false };
+  }
+  if (refOrigin !== dialedOrigin) {
+    return {
+      reason: `third-party origin (${refOrigin} != dialed ${dialedOrigin}); not fetched by this host`,
+      ofReference: false,
+      inStub: "third-party origin: it isn't on its server's own address, so this host doesn't fetch it",
+    };
+  }
+  return null;
+}
+
+/**
+ * The server a fetch of a reference would dial: its servers, in the order
+ * they delivered it, the first whose address is on the uri's origin (§6.2).
+ * When none is, the first server's refusal (unknown to this host, with no
+ * address, or the origin check's), and for a record no server delivered,
+ * that it's unbound.
+ */
+export function dialServer(
+  record: ReferenceRecord,
+  addressOf: (serverId: string) => ServerAddress | undefined,
+): { serverId: string } | { refusal: Refusal } {
+  let refusal: Refusal | undefined;
+  let dialed: string | undefined;
+  for (const serverId of record.serverIds) {
+    const address = addressOf(serverId);
+    const shownId = shownServerId(serverId);
+    if (address === undefined) {
+      refusal ??= { reason: `unknown server: ${shownId}`, ofReference: false };
+    } else if (address === 'no-address') {
+      refusal ??= { reason: noAddressReason(shownId), ofReference: false };
+    } else {
+      const offOrigin = originRefusal(record.testimony.uri, address.url);
+      if (offOrigin === null) {
+        dialed = serverId;
+        break;
+      }
+      refusal ??= offOrigin;
+    }
+  }
+  return dialed === undefined ? { refusal: refusal ?? { reason: UNBOUND_REASON, ofReference: true } } : { serverId: dialed };
+}
+
+/**
+ * Where a fetch of a reference would dial, or why it would be refused before
+ * dialing, whatever the fetch: dialServer's server, then the reference's
+ * expiry. A pure function of the record and the servers' addresses: a
+ * reference's stub asks it of the registry's (unfetchableReason), and the
+ * fetcher's pre-dial check of its own framework's configs, whose credential
+ * goes with the address it checks. In a process with one framework, or with
+ * frameworks that agree on each id they share, the two sources hold the same
+ * addresses, so a stub promises what the fetch does. Where two frameworks
+ * configure one id differently, only a stub's words can be wrong, never where
+ * a token goes. A fetch's own limits, its budget and ceiling, come after it.
+ */
+export function dialCheck(
+  record: ReferenceRecord,
+  addressOf: (serverId: string) => ServerAddress | undefined,
+  nowMs = Date.now(),
+): { serverId: string } | { refusal: Refusal } {
+  const server = dialServer(record, addressOf);
+  if ('refusal' in server) return server;
+  const expiry = referenceExpiry(record.testimony, nowMs);
+  return expiry ? { refusal: { reason: EXPIRY_REASON[expiry], ofReference: true } } : server;
+}
+
+/** Strip control characters (C0, DEL, C1), every bidi control (marks,
+ *  embeddings, overrides, isolates, and the Arabic letter mark) and the line
+ *  and paragraph separators (U+2028, U+2029), which a regex reads as line
+ *  ends, so a label can't start a line of its own, such as one the image
+ *  ledger would read as a slot. Then trim the whitespace (a BOM included)
+ *  left at either end, and bound the length. Labels are labels — storage
+ *  naming is host-generated elsewhere (§7.3). */
 export function sanitizeLabel(s: string, maxChars: number): string {
-  const cleaned = s.replace(/[\p{Cc}\p{Bidi_Control}]/gu, '').trim();
+  const cleaned = s.replace(/[\p{Cc}\p{Bidi_Control}\u2028\u2029]/gu, '').trim();
   if (cleaned.length <= maxChars) return cleaned;
   let cut = cleaned.slice(0, Math.max(0, maxChars - 1));
   // never split a surrogate pair at the truncation boundary
@@ -318,8 +532,9 @@ export class ReferenceRegistry {
         // Refresh testimony while unfetched: a re-issued reference with a new
         // digest/expiry supersedes the stale claims. Once fetched, the record
         // describes verified bytes on disk and keeps the testimony they were
-        // verified against.
-        if (!existing.fetchedPath) existing.testimony = testimony;
+        // verified against. A link claims no digest, expiry or disposition,
+        // so its testimony never replaces a record's claims.
+        if (!existing.fetchedPath && !testimony.fromLink) existing.testimony = testimony;
         // Newest again, so a uri just mentioned is the last to be evicted.
         this.records.delete(existingId);
         this.records.set(existingId, existing);
@@ -345,6 +560,36 @@ export class ReferenceRegistry {
     return this.records.get(refId);
   }
 
+  /** How the host reaches each server, by id, as each framework in the process
+   *  configured it, which a reference's stub reads (unfetchableReason). A
+   *  fetch reads its own framework's configs instead, so a server's token only
+   *  ever goes to the origin its own config names. Keyed by id as a record's
+   *  servers are: where two frameworks configure one id, the latest entry is
+   *  in force, and a stub's words can be wrong for the other one's fetch. */
+  private addresses = new Map<string, Array<{ owner: object; address: ServerAddress }>>();
+
+  /** Record how the host reaches a server, as a framework (`owner`) does for
+   *  each server it configures. Its entry for the id is then in force. */
+  setServerAddress(serverId: string, address: ServerAddress, owner: object): void {
+    const entries = (this.addresses.get(serverId) ?? []).filter((e) => e.owner !== owner);
+    entries.push({ owner, address });
+    this.addresses.set(serverId, entries);
+  }
+
+  /** Take back a framework's entry for a server, as it does for a server it
+   *  removes. Another framework's entry for the id, if any, is in force
+   *  again; with none, the id's references are refused as an unknown
+   *  server's, as that framework's fetch refuses them. */
+  forgetServerAddress(serverId: string, owner: object): void {
+    const entries = (this.addresses.get(serverId) ?? []).filter((e) => e.owner !== owner);
+    if (entries.length > 0) this.addresses.set(serverId, entries);
+    else this.addresses.delete(serverId);
+  }
+
+  serverAddress(serverId: string): ServerAddress | undefined {
+    return this.addresses.get(serverId)?.at(-1)?.address;
+  }
+
   /** Find the record for a uri. */
   findByUri(uri: string): ReferenceRecord | undefined {
     const id = this.byKey.get(uri);
@@ -365,13 +610,15 @@ export function referenceTypeLabel(mimeType: string | undefined): string {
 }
 
 /**
- * The longest line buildReferenceStub writes, in UTF-16 code units, from its
+ * The longest stub buildReferenceStub writes, in UTF-16 code units, from its
  * own bounds: the longest id the registry mints, then the name, the type with
  * the largest size it shows, and the origin, each at its bound, and the
  * longest ending, a saved copy's path, with their separators. The other
  * endings, the fetch hint and the reasons a fetch would be refused, are
  * shorter. A line shaped like a stub but longer than this is quoted text the
- * writer can't have written, and no image slot (tool-image-ledger.ts).
+ * writer can't have written, and no image slot (tool-image-ledger.ts). A
+ * tool result's link line (StubOptions.unfetchedLinkUri) isn't shaped like a
+ * stub, so it's no slot whatever its length.
  */
 export const REFERENCE_STUB_MAX_CHARS =
   `[ref_${MAX_SAFE.toString(36)}_] `.length + REF_ID_SUFFIX_CHARS
@@ -380,14 +627,31 @@ export const REFERENCE_STUB_MAX_CHARS =
   + ' — '.length + STUB_FIELD_CHARS
   + ' — '.length + 'saved: '.length + SAVED_PATH_CHARS;
 
+/** How a lane shows a reference beyond its stub. */
+export interface StubOptions {
+  /**
+   * Show a link (MCP's resource_link) the host can't fetch as its name, uri
+   * and type, unless its uri may carry a credential (uriMayCarryCredential).
+   * For a tool result's links, whose JSON showed every link's uri before
+   * this host read links as references: there the uri is the agent's only
+   * handle on a link the host can't fetch, and showing it is §5's MAY for a
+   * reference the host's policy classifies as non-capability-bearing. No
+   * other lane showed a link's uri, so none shows one now.
+   */
+  unfetchedLinkUri?: boolean;
+}
+
 /**
- * Build the model-visible stub for a reference. Output length is bounded by
- * host constants and independent of every server-supplied field length.
- * Under `disposition:"never"` the uri is omitted unconditionally; under
- * `ref`/absent it is omitted too — this host's default policy is the opaque
- * id everywhere (the safe default of §5), with retrieval via the record.
+ * Build the model-visible stub for a reference. Its length is bounded by
+ * host constants and independent of every server-supplied field's length:
+ * REFERENCE_STUB_MAX_CHARS. Under `disposition:"never"` the uri is omitted
+ * unconditionally; under `ref`/absent it is omitted too — this host's default
+ * policy is the opaque id everywhere (the safe default of §5), with retrieval
+ * via the record. The one exception is a tool result's link the host can't
+ * fetch (StubOptions.unfetchedLinkUri), which is no stub but a line of its
+ * own, its uri bounded by REFERENCE_LIMITS.uri.
  */
-export function buildReferenceStub(t: ReferenceTestimony, provenance?: string, serverId?: string): string {
+export function buildReferenceStub(t: ReferenceTestimony, provenance?: string, serverId?: string, options?: StubOptions): string {
   const record = referenceRegistry.register(t, serverId);
   const parts: string[] = [];
   // A label is shown only when something is left of it once sanitized.
@@ -405,29 +669,46 @@ export function buildReferenceStub(t: ReferenceTestimony, provenance?: string, s
     // workspace path (host-generated, §7.3) so existing tools just work.
     parts.push(`saved: ${sanitizeLabel(record.fetchedPath, SAVED_PATH_CHARS)}`);
   } else {
-    // A reference whose record shows the fetcher would refuse it says why,
-    // rather than inviting a fetch_reference call.
-    parts.push(unfetchableReason(record) ?? 'fetch with fetch_reference');
+    // A reference the fetcher would refuse says why, rather than inviting a
+    // fetch_reference call.
+    const refusal = unfetchableReason(record);
+    if (refusal !== null && t.fromLink && options?.unfetchedLinkUri && record.testimony.disposition !== 'never') {
+      // The credential check reads the uri as it would be shown, with what
+      // sanitizeLabel strips gone, so a uri split by a control character is
+      // read as it would read: `ht\u0000tps://user:pass@…` parses as a path,
+      // and shows as userinfo. A reference's disposition:"never" for the uri
+      // keeps it out whatever the link says.
+      const uri = sanitizeLabel(t.uri, REFERENCE_LIMITS.uri);
+      if (!uriMayCarryCredential(uri)) return unfetchedLinkText(t, uri);
+    }
+    parts.push(refusal ?? 'fetch with fetch_reference');
   }
   return `[${record.refId}] ${parts.join(' — ') || 'referenced content'}`;
 }
 
 /**
- * Why the fetcher would refuse a reference, as far as its record alone shows,
- * for its stub: no server registered for it, which the fetcher checks first,
- * or its expiry. Null for a saved copy, which the fetcher serves before any
- * check, and when the record shows neither. The fetcher's other refusals rest
- * on what a record doesn't hold: whether any of its servers is known to the
- * host, has an address and is on the uri's origin, the dialed server's fetch
- * budget spent, or a claimed size over the ceiling a fetch is given. The
- * fetcher gives those in its own words, and save_recent_image, in the
- * framework where it can ask the fetcher, says them too.
+ * What a tool result's link the host can't fetch shows, where its uri can't
+ * carry a credential: its name, its uri and its type, as a standard MCP
+ * server's link shows (StubOptions.unfetchedLinkUri).
+ */
+function unfetchedLinkText(t: ReferenceTestimony, uri: string): string {
+  const name = t.name ? sanitizeLabel(t.name, STUB_FIELD_CHARS) : '';
+  const mimeType = referenceTypeLabel(t.mimeType);
+  return `[resource link${name ? ` "${name}"` : ''}: ${uri}${mimeType ? `, ${mimeType}` : ''}; not fetched]`;
+}
+
+/**
+ * Why the fetcher would refuse a reference before it dials, whatever the
+ * fetch, in its stub's words: the registry's dialCheck, from its record and
+ * its servers' addresses. Null for a saved copy, which the fetcher serves
+ * before any check, and where a fetch would dial. A fetch's own limits, the
+ * server's spent budget or a claimed size over the ceiling it's given, the
+ * fetcher gives in its own words, and save_recent_image says them too.
  */
 export function unfetchableReason(record: ReferenceRecord, nowMs = Date.now()): string | null {
   if (record.fetchedPath) return null;
-  if (record.serverIds.length === 0) return UNBOUND_REASON;
-  const expiry = referenceExpiry(record.testimony, nowMs);
-  return expiry ? EXPIRY_REASON[expiry] : null;
+  const dial = dialCheck(record, (serverId) => referenceRegistry.serverAddress(serverId), nowMs);
+  return 'refusal' in dial ? dial.refusal.inStub ?? dial.refusal.reason : null;
 }
 
 /**
@@ -435,13 +716,13 @@ export function unfetchableReason(record: ReferenceRecord, nowMs = Date.now()): 
  * lanes. Returns a replacement string, or null when the block should keep
  * its existing (inline/text) handling.
  */
-export function referenceStubOrNull(block: unknown, provenance?: string, serverId?: string): string | null {
+export function referenceStubOrNull(block: unknown, provenance?: string, serverId?: string, options?: StubOptions): string | null {
   const c = classifyBlock(block);
   switch (c.kind) {
     case 'text': return null;
     case 'inline':
       return c.contradiction ? INLINE_WITHHELD_TEXT : null;
-    case 'reference': return buildReferenceStub(c.testimony, provenance, serverId);
+    case 'reference': return buildReferenceStub(c.testimony, provenance, serverId, options);
     case 'invalid': return c.shown;
   }
 }

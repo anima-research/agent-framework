@@ -59,13 +59,15 @@ test("a reference block that can't be read says which part is missing, and what 
     assert.equal(referenceStubOrNull(block), text);
     assert.deepEqual(convertBlock(block as never, 'test', 'words'), { type: 'text', text });
   }
-  // Beside inline data, any string uri, an empty one too, stays withheld as
-  // on main: the tool-result lane can't show every inline shape yet, and
-  // showing this audio would put its data into history as raw JSON.
+  // Beside inline data, an empty link is no link either, now that the
+  // tool-result lane gives every inline shape its marker: this audio shows as
+  // a tool result's audio does, and its data stays out of history.
   const audio = { type: 'audio', data: 'aGVsbG8=', mimeType: 'audio/wav', uri: '' };
-  assert.deepEqual(classifyBlock(audio), { kind: 'inline', contradiction: true });
+  assert.deepEqual(classifyBlock(audio), { kind: 'inline', contradiction: false });
   const stored = toolResultDataToHistoryString([{ type: 'text', text: 't' }, audio]);
-  assert.ok(stored.includes(INLINE_WITHHELD_TEXT) && !stored.includes('aGVsbG8='), stored);
+  assert.equal(stored, "t\n[Audio not shown: this host's tool results carry only text and images (audio/wav, 6B).]");
+  // A link that isn't empty still withholds it.
+  assert.deepEqual(classifyBlock({ ...audio, uri: 'https://zz.example/a.wav' }), { kind: 'inline', contradiction: true });
 });
 
 // ---------------------------------------------------------------------------

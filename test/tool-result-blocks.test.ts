@@ -1,0 +1,811 @@
+/**
+ * A tool result's content array reaches the agent block by block, on both of
+ * its copies, the stored text history keeps and the live copy the model reads
+ * when the result is answered: each block as itself, as a reference's stub,
+ * or as a marker saying what kind of block it was and why it isn't shown,
+ * never as the array's JSON, which would carry inline data's base64 and a
+ * link's uri. A protocol result's content is content whatever its blocks'
+ * types (ToolResult.dataIsContent, which an MCPL tool's result carries). Any
+ * other array is content only when every element is a block of one of MCP's
+ * types, so a list of records of other types stays data, written as JSON.
+ *
+ * Run: node --import tsx --test test/tool-result-blocks.test.ts
+ */
+import { describe, it, test } from 'node:test';
+import assert from 'node:assert/strict';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { createServer } from 'node:http';
+import type { AddressInfo } from 'node:net';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { JsStore } from '@animalabs/chronicle';
+import { AgentFramework } from '../src/index.js';
+import type { Module, ModuleContext, ToolCall, ToolResult, ToolDefinition } from '../src/types/index.js';
+import {
+  AUDIO_NO_DATA_TEXT,
+  AUDIO_NO_MEDIA_TYPE_TEXT,
+  IMAGE_NO_DATA_TEXT,
+  IMAGE_NO_MEDIA_TYPE_TEXT,
+  INLINE_WITHHELD_TEXT,
+  REFERENCE_LIMITS,
+  REFERENCE_LINK_TOO_LONG_TEXT,
+  REFERENCE_NO_LINK_TEXT,
+  buildReferenceStub,
+  classifyBlock,
+  noAddressReason,
+  referenceRegistry,
+  sanitizeLabel,
+  unknownBlockText,
+  type BlockClassification,
+} from '../src/mcpl/references.js';
+import { convertBlock } from '../src/mcpl/convert-block.js';
+import { CoalesceError, validateCoalescedContent } from '../src/mcpl/push-coalescer.js';
+import { ReferenceFetcher } from '../src/mcpl/reference-fetcher.js';
+import { checkedToolResult } from '../src/module-registry.js';
+import { parseImagePlaceholders } from '../src/tool-image-ledger.js';
+import { nonErrorResultText, toolResultDataToHistoryString } from '../src/tool-result-history.js';
+import { MockMembrane, createMockResponse } from './helpers/mock-membrane.js';
+import { fixture } from './helpers/coalescing-fixture.js';
+
+const SECRET = 'zz-secret-signature';
+/** 3,000 bytes of audio or image data, base64. */
+const BASE64 = Buffer.alloc(3000, 7).toString('base64');
+const PNG = Buffer.from('89504e470d0a1a0a', 'hex').toString('base64');
+const TEXT = { type: 'text', text: 'zz-text' };
+const IMAGE = { type: 'image', data: PNG, mimeType: 'image/png' };
+const AUDIO = { type: 'audio', data: BASE64, mimeType: 'audio/wav' };
+const AUDIO_TEXT = "[Audio not shown: this host's tool results carry only text and images (audio/wav, ~3KB).]";
+const VIDEO = { type: 'video', uri: `https://zz-files.example/clip.mp4?sig=${SECRET}` };
+const LINK_URI = `https://zz-files.example/report.csv?sig=${SECRET}`;
+const LINK = {
+  type: 'resource_link', uri: LINK_URI, name: 'report.csv', mimeType: 'text/csv', size: 1234,
+  title: 'zz-title', description: 'zz-description', annotations: { audience: ['user'] },
+};
+const STUB = /\[ref_[^\]]+\] report\.csv — text\/csv, ~1KB claimed — from tool result — /;
+/** LINK's stub where the host can't fetch it, as where no server delivered it: its uri may carry a credential (sig). */
+const LINK_STUB = new RegExp(`${STUB.source}not tied to any server, so there's nowhere to fetch it from$`);
+/** A link whose uri can't carry a credential. */
+const PLAIN_URI = 'https://zz-files.example/report.csv';
+const PLAIN_LINK = { ...LINK, uri: PLAIN_URI };
+/** What PLAIN_LINK shows in a tool result where the host can't fetch it, as where no server delivered it. */
+const PLAIN_LINK_TEXT = `[resource link "report.csv": ${PLAIN_URI}, text/csv; not fetched]`;
+/** Record a server dialed on the links' origin, as the framework records a server it configures. Each
+ *  test that needs it asks, so the file loads against a registry that keeps no addresses. */
+const servingFiles = () => referenceRegistry.setServerAddress('zz-files', { url: 'wss://zz-files.example' }, TEST_HOST);
+/** The framework these tests record servers' addresses for, as one does. */
+const TEST_HOST = {};
+
+/** Each block the lane can't show as itself, and the marker that stands in its place. */
+const MARKED: Array<[string, unknown, string]> = [
+  ['inline audio', AUDIO, AUDIO_TEXT],
+  ['audio data with no media type', { type: 'audio', data: BASE64 }, AUDIO_NO_MEDIA_TYPE_TEXT],
+  ['image data with no media type', { type: 'image', data: BASE64 }, IMAGE_NO_MEDIA_TYPE_TEXT],
+  ['image data with an empty media type', { type: 'image', data: BASE64, mimeType: '' }, IMAGE_NO_MEDIA_TYPE_TEXT],
+  ['an image whose data is empty', { type: 'image', data: '', mimeType: 'image/png' }, IMAGE_NO_DATA_TEXT],
+  ['audio whose data is empty', { type: 'audio', data: '', mimeType: 'audio/wav' }, AUDIO_NO_DATA_TEXT],
+  ['an image with neither data nor a link', { type: 'image' }, IMAGE_NO_DATA_TEXT],
+  ['a block of a type the host can\'t show', VIDEO, unknownBlockText(VIDEO)],
+  ['an element that isn\'t a block', 42, unknownBlockText(42)],
+  ['null', null, unknownBlockText(null)],
+];
+
+type Live = { content: unknown; isError: boolean };
+const framework = () => Object.create(AgentFramework.prototype) as {
+  toMembraneToolResult(callId: string, result: ToolResult, maxChars?: number): Live;
+};
+/** Both copies of a result: the stored text, and the content the model is sent. */
+function copies(result: ToolResult, maxChars?: number): { stored: string; live: unknown } {
+  return { stored: nonErrorResultText(result, maxChars), live: framework().toMembraneToolResult('zz-call', result, maxChars).content };
+}
+
+describe("a protocol result's content (dataIsContent)", () => {
+  it('shows each block the lane can\'t show as its marker on both copies, never as JSON', () => {
+    assert.equal(AUDIO_TEXT, `[Audio not shown: this host's tool results carry only text and images (audio/wav, ~3KB).]`);
+    for (const [what, block, marker] of MARKED) {
+      const { stored, live } = copies({ success: true, data: [TEXT, block], dataIsContent: true });
+      assert.equal(stored, `zz-text\n${marker}`, what);
+      // With no image, the live copy is the stored text.
+      assert.equal(live, stored, what);
+    }
+    const all = copies({ success: true, data: [TEXT, ...MARKED.map(([, block]) => block)], dataIsContent: true }).stored;
+    assert.ok(!all.includes(BASE64.slice(0, 64)) && !all.includes(SECRET), all);
+  });
+
+  it('keeps an image native in the live copy beside them, and its placeholder in the stored text', () => {
+    for (const [what, block, marker] of MARKED) {
+      const { stored, live } = copies({ success: true, data: [IMAGE, TEXT, block], dataIsContent: true });
+      assert.equal(stored, `[image: image/png, 9B]\nzz-text\n${marker}`, what);
+      assert.deepEqual(live, [
+        { type: 'image', source: { type: 'base64', data: PNG, mediaType: 'image/png' } },
+        { type: 'text', text: 'zz-text' },
+        { type: 'text', text: marker },
+      ], what);
+    }
+  });
+
+  it('shows a reference as its stub, and inline data claiming a link as withheld, as before', () => {
+    const { stored, live } = copies({
+      success: true,
+      data: [IMAGE, { type: 'resource', uri: `https://zz-files.example/a.pdf?sig=${SECRET}`, name: 'a.pdf' }, { ...AUDIO, uri: 'https://zz-files.example/a.wav' }],
+      dataIsContent: true,
+    });
+    assert.match(stored, /^\[image: image\/png, 9B\]\n\[ref_[^\]]+\] a\.pdf — from tool result — [^\n]+\n/);
+    assert.ok(stored.endsWith(`\n${INLINE_WITHHELD_TEXT}`), stored);
+    assert.ok(!stored.includes(SECRET), stored);
+    assert.deepEqual((live as Array<{ type: string; text?: string }>).map((b) => b.text ?? b.type), stored.split('\n').map((line, i) => (i === 0 ? 'image' : line)));
+  });
+
+  it('cuts a text block at the cap in the live copy, and shows each marker whole', () => {
+    const long = { type: 'text', text: 'z'.repeat(500) };
+    const { live } = copies({ success: true, data: [IMAGE, long, AUDIO], dataIsContent: true }, 40);
+    const [, text, marker] = live as Array<{ type: string; text: string }>;
+    assert.match(text.text, /^z{40}\n\n\[truncated — original was 500 chars\]$/);
+    assert.ok(AUDIO_TEXT.length > 40);
+    assert.equal(marker.text, AUDIO_TEXT);
+  });
+});
+
+describe('an array without dataIsContent', () => {
+  it('is content when every element is a block of one of MCP\'s types, each block the lane can\'t show as its marker', () => {
+    assert.equal(toolResultDataToHistoryString([TEXT, AUDIO]), `zz-text\n${AUDIO_TEXT}`);
+    assert.equal(toolResultDataToHistoryString([TEXT, PLAIN_LINK]), `zz-text\n${PLAIN_LINK_TEXT}`);
+    assert.equal(toolResultDataToHistoryString([]), '');
+    // A list of records that all carry MCP's type names is read as content
+    // too: this one, with its url, shows a marker where JSON showed it.
+    assert.equal(toolResultDataToHistoryString([{ type: 'image', url: 'https://zz-images.example/a.png' }]), IMAGE_NO_DATA_TEXT);
+  });
+
+  it('is data, written as JSON, when any element is of another type or isn\'t a record', () => {
+    for (const data of [
+      [TEXT, VIDEO],
+      [TEXT, { type: 'user', id: 1 }],
+      [{ name: 'a' }, { name: 'b' }],
+      ['a', 'b'],
+      [TEXT, 42],
+      [TEXT, null],
+      [TEXT, { type: 42 }],
+    ]) {
+      assert.equal(toolResultDataToHistoryString(data), JSON.stringify(data));
+    }
+    // So is data that isn't an array, whatever it holds.
+    assert.equal(toolResultDataToHistoryString({ content: [TEXT] }), JSON.stringify({ content: [TEXT] }));
+  });
+
+  it('is content whatever its elements when the result says it is, and only then', () => {
+    assert.equal(toolResultDataToHistoryString([TEXT, VIDEO], undefined, { dataIsContent: true }), `zz-text\n${unknownBlockText(VIDEO)}`);
+    assert.equal(nonErrorResultText({ data: [TEXT, VIDEO], dataIsContent: true }), `zz-text\n${unknownBlockText(VIDEO)}`);
+    assert.equal(nonErrorResultText({ data: [TEXT, VIDEO], dataIsContent: false }), JSON.stringify([TEXT, VIDEO]));
+    // Data that isn't an array is data, whatever the result says.
+    assert.equal(nonErrorResultText({ data: { a: 1 }, dataIsContent: true }), '{"a":1}');
+    // The flag is read for its truth, as a result's other flags are, on both copies.
+    const loose = { success: true, data: [IMAGE, TEXT, VIDEO], dataIsContent: 1 as never };
+    const { stored, live } = copies(loose);
+    assert.equal(stored, `[image: image/png, 9B]\nzz-text\n${unknownBlockText(VIDEO)}`);
+    assert.equal((live as unknown[]).length, 3);
+  });
+});
+
+/** A block's reference testimony, as classifyBlock reads it. */
+function testimonyOf(block: unknown) {
+  const c = classifyBlock(block);
+  assert.equal(c.kind, 'reference');
+  return (c as Extract<BlockClassification, { kind: 'reference' }>).testimony;
+}
+
+describe("MCP's resource_link, a reference (RFC-005 §8.1)", () => {
+  it('maps onto the reference record field for field, its size as sizeBytes, with no disposition', () => {
+    const t = testimonyOf({ ...LINK, disposition: 'never', digest: `sha256:${'A'.repeat(43)}`, expiresAt: '2020-01-01T00:00:00Z' });
+    assert.deepEqual([t.uri, t.name, t.mimeType, t.sizeBytes], [LINK_URI, 'report.csv', 'text/csv', 1234]);
+    assert.deepEqual([t.disposition, t.digest, t.expiresAt], [undefined, undefined, undefined]);
+    assert.deepEqual(t.rejectedFields, []);
+    // A size that isn't a byte count is dropped as a field, as a sizeBytes is.
+    const bad = testimonyOf({ ...LINK, size: -1 });
+    assert.equal(bad.sizeBytes, undefined);
+    assert.deepEqual(bad.rejectedFields, ['sizeBytes']);
+    assert.deepEqual(classifyBlock({ type: 'resource_link', name: 'zz' }), { kind: 'invalid', shown: REFERENCE_NO_LINK_TEXT });
+    assert.deepEqual(classifyBlock({ type: 'resource_link', uri: 'u'.repeat(REFERENCE_LIMITS.uri + 1) }), { kind: 'invalid', shown: REFERENCE_LINK_TOO_LONG_TEXT });
+  });
+
+  it('shows as a stub where the host can fetch it, never its uri, in a content array and at any depth in data', () => {
+    const uri = `https://zz-files.example/fetchable.csv?sig=${SECRET}`;
+    const fetchable = { ...LINK, uri };
+    servingFiles();
+    referenceRegistry.register(testimonyOf(fetchable), 'zz-files');
+    const { stored, live } = copies({ success: true, data: [TEXT, fetchable], dataIsContent: true });
+    assert.match(stored, new RegExp(`^zz-text\\n${STUB.source}fetch with fetch_reference$`));
+    assert.equal(live, stored);
+    const nested = toolResultDataToHistoryString({ found: [fetchable], page: 2 });
+    assert.ok(!nested.includes(SECRET), nested);
+    assert.match((JSON.parse(nested) as { found: string[] }).found[0]!, STUB);
+  });
+
+  it("in a tool result, shows its name, uri and type where the host can't fetch it and the uri can't carry a credential", () => {
+    // PLAIN_LINK has no server, as a module's link hasn't.
+    const { stored, live } = copies({ success: true, data: [TEXT, PLAIN_LINK], dataIsContent: true });
+    assert.equal(stored, `zz-text\n${PLAIN_LINK_TEXT}`);
+    assert.equal(live, stored);
+    assert.deepEqual(JSON.parse(toolResultDataToHistoryString({ found: [PLAIN_LINK], page: 2 })), { found: [PLAIN_LINK_TEXT], page: 2 });
+    assert.equal(toolResultDataToHistoryString(PLAIN_LINK), PLAIN_LINK_TEXT);
+    // So too where a server delivered it, with a scheme the fetcher doesn't
+    // fetch or off its server's origin. A resource there gets the stub that
+    // says why, with no uri, as a resource always has.
+    servingFiles();
+    for (const [uri, why] of [
+      ['file:///zz/report.csv', 'scheme not allowed: this host fetches only http and https uris'],
+      ['zz-server://reports/report.csv', 'scheme not allowed: this host fetches only http and https uris'],
+      ['https://zz-elsewhere.example/watch?v=zz', "third-party origin: it isn't on its server's own address, so this host doesn't fetch it"],
+      ['https://zz-elsewhere.example/d/zz/edit?usp=sharing#heading=h.zz', "third-party origin: it isn't on its server's own address, so this host doesn't fetch it"],
+      ['https://zz-elsewhere.example/cb?token_type=bearer&key_id=zz', "third-party origin: it isn't on its server's own address, so this host doesn't fetch it"],
+      // A credential's name with no value, such as an anchor, carries nothing.
+      ...['#token', '#policy', '#access_token=', '?token', '?token=&page=2'].map((tail) =>
+        [`https://zz-elsewhere.example/docs/auth${tail}`, "third-party origin: it isn't on its server's own address, so this host doesn't fetch it"]),
+      // A relative one is read as a relative reference is.
+      ['zz-reports/report.csv?page=2', 'reference uri does not parse'],
+    ]) {
+      const link = { type: 'resource_link', uri, name: 'report.csv' };
+      referenceRegistry.register(testimonyOf(link), 'zz-files');
+      assert.equal(toolResultDataToHistoryString([TEXT, link]), `zz-text\n[resource link "report.csv": ${uri}; not fetched]`);
+      const resource = { type: 'resource', uri, name: 'report.csv' };
+      const stub = toolResultDataToHistoryString([TEXT, resource]);
+      assert.ok(stub.endsWith(`report.csv — from tool result — ${why}`) && !stub.includes(uri), stub);
+    }
+  });
+
+  it("in a tool result, shows the stub that says why where the host can't fetch it and the uri may carry a credential", () => {
+    const carriers = [
+      // userinfo, whatever the scheme
+      'postgres://zz-user:zz-pass@zz-db.example/zz',
+      'https://zz-user@zz-elsewhere.example/report.csv',
+      // AWS's and Google's signed URLs, names compared without letter case
+      'https://zz-bucket.s3.amazonaws.com/report.csv?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=zz&X-Amz-Signature=zz',
+      'https://zz-bucket.s3.amazonaws.com/report.csv?x-amz-security-token=zz',
+      'https://storage.googleapis.com/zz-bucket/report.csv?X-Goog-Credential=zz&X-Goog-Signature=zz',
+      // Azure's shared access signature, CloudFront's, Discord's CDN, B2's
+      'https://zz.blob.core.windows.net/c/report.csv?sv=2024-01-01&se=2030-01-01&sp=r&sig=zz',
+      'https://zz.cloudfront.net/report.csv?Expires=1&Signature=zz&Key-Pair-Id=zz',
+      'https://zz.cloudfront.net/report.csv?Policy=zz',
+      'https://cdn.discordapp.com/attachments/1/2/report.csv?ex=1&is=2&hm=zz',
+      'https://f000.backblazeb2.com/file/zz/report.csv?Authorization=zz',
+      // OAuth's, in a fragment or a query, and the generic names
+      'https://zz-elsewhere.example/cb#access_token=zz&token_type=bearer',
+      'https://zz-elsewhere.example/cb#id_token=zz',
+      'https://zz-elsewhere.example/#/reset?token=zz',
+      'https://zz-elsewhere.example/cb?v=1;sig=zz',
+      'https://zz-elsewhere.example/cb?v=1&amp;token=zz',
+      // names compared by their letters and digits alone, without case, and OAuth 1.0a's
+      ...['accessToken', 'access-token', 'Api-Key', 'x-api-key', 'private-token', 'oauth_token', 'oauth_signature', 'token[]', 'api.key']
+        .map((name) => `https://zz-elsewhere.example/cb?${name}=zz`),
+      // userinfo after a scheme with no slashes, read as an absolute uri
+      'http:zz-user:zz-pass@zz-elsewhere.example/report.csv',
+      // a credential's name, or a scheme before userinfo, split by a
+      // character the line doesn't show: the check reads the uri as shown
+      'https://zz-elsewhere.example/cb?to\u0000ken=zz',
+      'ht\u0000tps://zz-user:zz-pass@zz-elsewhere.example/report.csv',
+      'https://zz-elsewhere.example/cb?refresh_token=zz',
+      'https://zz-elsewhere.example/cb?client_secret=zz',
+      ...['token', 'auth', 'key', 'apikey', 'api_key', 'secret', 'password', 'signature'].map((name) => `zz-server://reports/report.csv?${name}=zz`),
+      // a relative one, read as a relative reference is, and one that doesn't
+      // parse even so, whose parts can't be read
+      'zz-reports/report.csv?token=zz',
+      'https://zz elsewhere.example/report.csv',
+    ];
+    for (const uri of carriers) {
+      const link = { type: 'resource_link', uri, name: 'report.csv' };
+      const shown = toolResultDataToHistoryString([TEXT, link]);
+      assert.match(shown, /^zz-text\n\[ref_[^\]]+\] report\.csv — from tool result — not tied to any server, so there's nowhere to fetch it from$/, uri);
+      assert.ok(!shown.includes(uri), shown);
+    }
+    const { stored, live } = copies({ success: true, data: [TEXT, LINK], dataIsContent: true });
+    assert.match(stored, new RegExp(`^zz-text\\n${LINK_STUB.source}`));
+    assert.equal(live, stored);
+    assert.ok(!stored.includes(SECRET), stored);
+    // So too where a server delivered it and the origin or the scheme refuses
+    // the fetch: the stub says why.
+    servingFiles();
+    for (const [uri, why] of [
+      [`https://zz-elsewhere.example/report.csv?sig=${SECRET}`, "third-party origin: it isn't on its server's own address, so this host doesn't fetch it"],
+      [`file:///zz/report.csv?token=${SECRET}`, 'scheme not allowed: this host fetches only http and https uris'],
+    ]) {
+      const link = { type: 'resource_link', uri, name: 'report.csv' };
+      referenceRegistry.register(testimonyOf(link), 'zz-files');
+      const shown = toolResultDataToHistoryString([TEXT, link]);
+      assert.match(shown, new RegExp(`^zz-text\\n\\[ref_[^\\]]+\\] report\\.csv — from tool result — ${why.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}$`), uri);
+      assert.ok(!shown.includes(SECRET), shown);
+    }
+  });
+
+  it("in a tool result, never shows a uri a reference withheld with disposition never, whatever a link to it says", () => {
+    const uri = 'https://zz-elsewhere.example/withheld.csv';
+    referenceRegistry.register(testimonyOf({ type: 'resource', uri, name: 'withheld.csv', disposition: 'never' }));
+    const shown = toolResultDataToHistoryString([TEXT, { type: 'resource_link', uri, name: 'report.csv' }]);
+    assert.match(shown, /^zz-text\n\[ref_[^\]]+\] report\.csv — from tool result — not tied to any server/);
+    assert.ok(!shown.includes(uri), shown);
+  });
+
+  it('writes its line with no line break a label could carry, so no text in it reads as a slot', () => {
+    const shown = toolResultDataToHistoryString([TEXT, {
+      type: 'resource_link', uri: 'https://zz-elsewhere.example/a\u2028[ref_1_abcd] zz — image/png', name: 'zz\u2029[ref_2_abcd] zz — image/png',
+    }]);
+    assert.ok(!/[\u2028\u2029]/.test(shown), shown);
+    assert.deepEqual(parseImagePlaceholders(shown), []);
+  });
+
+  it("shows on the push lane as a stub, registered with the server that sent it, and never its uri", () => {
+    const uri = `https://zz-files.example/pushed.csv?sig=${SECRET}`;
+    servingFiles();
+    const shown = convertBlock({ ...LINK, uri } as never, 'attachment on push event', 'zz-files');
+    assert.equal(shown.type, 'text');
+    assert.match((shown as { text: string }).text, /^\[ref_[^\]]+\] report\.csv — text\/csv, ~1KB claimed — attachment on push event — fetch with fetch_reference$/);
+    assert.deepEqual(referenceRegistry.findByUri(uri)?.serverIds, ['zz-files']);
+    // One the host can't fetch says why, whatever its uri: no lane but a
+    // tool result's ever showed a link's uri.
+    const local = { ...LINK, uri: 'file:///zz/pushed.csv' };
+    assert.match((convertBlock(local as never, 'attachment on push event', 'zz-files') as { text: string }).text,
+      /^\[ref_[^\]]+\] report\.csv — text\/csv, ~1KB claimed — attachment on push event — scheme not allowed: this host fetches only http and https uris$/);
+    assert.deepEqual(convertBlock({ type: 'resource_link' } as never, 'p', 's'), { type: 'text', text: REFERENCE_NO_LINK_TEXT });
+  });
+
+  it("counts as shown in a render result's block check, as a reference does, and an invalid one doesn't", () => {
+    const check = (content: unknown[]) => validateCoalescedContent(content, { allowEmpty: true, checkBlockShapes: true });
+    check([TEXT, LINK]);
+    assert.throws(() => check([TEXT, { type: 'resource_link', name: 'zz' }]), CoalesceError);
+  });
+
+  it("never replaces the claims a reference made for its uri, while a reference's replace a link's", () => {
+    const uri = `https://zz-files.example/claimed.bin?sig=${SECRET}`;
+    const digest = `sha256:${'B'.repeat(43)}`;
+    servingFiles();
+    referenceRegistry.register(testimonyOf({ type: 'resource', uri, digest, expiresAt: '2020-01-01T00:00:00Z', name: 'claimed.bin' }), 'zz-files');
+    referenceRegistry.register(testimonyOf({ type: 'resource_link', uri, name: 'linked.bin' }), 'zz-files');
+    const kept = referenceRegistry.findByUri(uri)!.testimony;
+    assert.deepEqual([kept.digest, kept.expiresAt, kept.name, kept.fromLink], [digest, '2020-01-01T00:00:00Z', 'claimed.bin', undefined]);
+    // A link's stub reads its record, so it says what the reference's expiry makes of it.
+    assert.match((convertBlock({ type: 'resource_link', uri, name: 'linked.bin' } as never, 'p', 'zz-files') as { text: string }).text, /^\[ref_[^\]]+\] linked\.bin — p — expired$/);
+    const later = 'https://zz-files.example/linked-first.bin';
+    referenceRegistry.register(testimonyOf({ type: 'resource_link', uri: later, name: 'first' }), 'zz-files');
+    referenceRegistry.register(testimonyOf({ type: 'resource', uri: later, digest, name: 'second' }), 'zz-files');
+    const replaced = referenceRegistry.findByUri(later)!.testimony;
+    assert.deepEqual([replaced.digest, replaced.name, replaced.fromLink], [digest, 'second', undefined]);
+  });
+
+  it('is registered with its server and never fetched eagerly, unless another block names its uri', async () => {
+    const fw = Object.create(AgentFramework.prototype) as {
+      autoFetchReferences(content: unknown[], serverId: string, eager: boolean): Promise<void>;
+      getReferenceFetcher(): unknown;
+    };
+    const fetched: string[] = [];
+    fw.getReferenceFetcher = () => ({
+      isEagerEligible: () => true,
+      fetch: async (record: { testimony: { uri: string } }) => { fetched.push(record.testimony.uri); return { ok: true }; },
+    });
+    const u = (name: string) => `https://zz-files.example/eager/${name}`;
+    await fw.autoFetchReferences([
+      { type: 'resource_link', uri: u('linked') },
+      { type: 'resource_link', uri: u('linked-then-referenced') },
+      { type: 'resource', uri: u('linked-then-referenced') },
+      { type: 'resource', uri: u('referenced-then-linked') },
+      { type: 'resource_link', uri: u('referenced-then-linked') },
+      { type: 'resource', uri: u('referenced') },
+    ], 'zz-eager-server', true);
+    assert.deepEqual(fetched.sort(), [u('linked-then-referenced'), u('referenced'), u('referenced-then-linked')].sort());
+    assert.deepEqual(referenceRegistry.findByUri(u('linked'))?.serverIds, ['zz-eager-server']);
+  });
+
+  it("isn't fetched for a script on demand, where a reference is", async () => {
+    const fw = Object.create(AgentFramework.prototype) as {
+      dispatchScriptToolCall: (...args: unknown[]) => Promise<ToolResult>;
+      getReferenceFetcher(): unknown;
+      handleScriptToolCall(agentName: string, toolName: string, args: Record<string, unknown>): Promise<string>;
+    };
+    const reference = {
+      type: 'resource', uri: `https://zz-files.example/wanted.pdf?sig=${SECRET}`, name: 'wanted.pdf',
+      digest: `sha256:${'C'.repeat(43)}`, expiresAt: '2099-01-01T00:00:00Z',
+    };
+    // A link to the same uri came first, so its record holds the link's
+    // claims until the reference's replace them.
+    referenceRegistry.register(testimonyOf({ type: 'resource_link', uri: reference.uri, name: 'linked.pdf' }), 'zz-files');
+    fw.dispatchScriptToolCall = async () => ({ success: true, data: [TEXT, LINK, reference, VIDEO], dataIsContent: true });
+    const fetched: string[] = [];
+    const claims: unknown[] = [];
+    fw.getReferenceFetcher = () => ({
+      fetch: async (record: { testimony: { uri: string; name?: string; digest?: string; expiresAt?: string } }) => {
+        fetched.push(record.testimony.uri);
+        claims.push([record.testimony.name, record.testimony.digest, record.testimony.expiresAt]);
+        return { ok: false, error: 'zz-refused' };
+      },
+    });
+    const error = console.error;
+    console.error = () => {};
+    let text: string;
+    try {
+      text = await fw.handleScriptToolCall('zz-agent', 'zz_tool', {});
+    } finally {
+      console.error = error;
+    }
+    assert.deepEqual(fetched, [reference.uri]);
+    assert.deepEqual(claims, [['wanted.pdf', reference.digest, reference.expiresAt]]);
+    // The script reads the text history stores for a protocol result's
+    // content: the link, which no server delivered, as the stub that says so.
+    assert.match(text, new RegExp(`^zz-text\\n${LINK_STUB.source.slice(0, -1)}\\n\\[ref_[^\\]]+\\] wanted\\.pdf — from tool result[^\\n]+\\n`));
+    assert.ok(text.endsWith(`\n${unknownBlockText(VIDEO)}`), text);
+    assert.ok(!text.includes(SECRET), text);
+  });
+});
+
+describe('what a stub says of a fetch, which the fetch then does', () => {
+  // Servers as a framework records them: one dialed on the references'
+  // origin, one with no address, as a stdio server; zz-gone is unknown.
+  const serving = () => {
+    referenceRegistry.setServerAddress('zz-dialed', { url: 'wss://zz-refs.example' }, TEST_HOST);
+    referenceRegistry.setServerAddress('zz-stdio', 'no-address', TEST_HOST);
+  };
+  /** The fetcher of a framework configured as `serving` records it. */
+  const servedFetcher = () => new ReferenceFetcher(
+    (serverId) => (serverId === 'zz-dialed' ? { url: 'wss://zz-refs.example' } : serverId === 'zz-stdio' ? 'no-address' : undefined),
+    async () => null,
+  );
+  const record = (name: string, serverIds: string[], extra: Record<string, unknown> = {}) => {
+    const t = testimonyOf({ type: 'resource', uri: `https://zz-refs.example/${name}?sig=${SECRET}`, name, ...extra });
+    let r = referenceRegistry.register(t);
+    for (const id of serverIds) r = referenceRegistry.register(t, id);
+    return r;
+  };
+  // Made when a test first asks, so the file loads against a registry that
+  // keeps no addresses.
+  let made: Array<[string, ReturnType<typeof record>, string | null]> | undefined;
+  const cases = () => made ??= (serving(), [
+    ['dialed on its origin', record('dialed.bin', ['zz-dialed']), null],
+    ['from no server', record('unbound.bin', []), "not tied to any server, so there's nowhere to fetch it from"],
+    ['from an unknown server', record('gone.bin', ['zz-gone']), 'unknown server: zz-gone'],
+    ['from a server with no address', record('stdio.bin', ['zz-stdio']), "no address: this host doesn't connect to server zz-stdio over a network, so there's nowhere to fetch it from"],
+    ['from a server with no address, and one dialed on its origin', record('both.bin', ['zz-stdio', 'zz-dialed']), null],
+    ['dialed on its origin, but expired', record('expired.bin', ['zz-dialed'], { expiresAt: '2020-01-01T00:00:00Z' }), 'expired'],
+  ]);
+
+  it("ends a resource's stub with why a fetch would be refused, or the fetch it offers", () => {
+    for (const [what, r, why] of cases()) {
+      const stub = buildReferenceStub(r.testimony, 'zz');
+      assert.ok(stub.endsWith(`— zz — ${why ?? 'fetch with fetch_reference'}`) && !stub.includes(SECRET), `${what}: ${stub}`);
+    }
+  });
+
+  it("agrees with the fetcher's own check, which reads its framework's configs", () => {
+    const fetcher = servedFetcher();
+    for (const [what, r, why] of cases()) {
+      const refusal = fetcher.refusal(r);
+      assert.equal(refusal === null, why === null, `${what}: ${refusal?.reason}`);
+      if (refusal && why) assert.equal(refusal.reason, why, what);
+    }
+  });
+
+  it("is the framework's fetcher's check too, and the framework records each server's address for the stub", () => {
+    const fw = Object.create(AgentFramework.prototype) as {
+      mcplServerConfigs: Map<string, unknown>;
+      setMcplServerConfig(config: unknown): void;
+      getReferenceFetcher(): ReferenceFetcher;
+    };
+    fw.mcplServerConfigs = new Map();
+    fw.setMcplServerConfig({ id: 'zz-wired', url: 'wss://zz-refs.example' });
+    assert.deepEqual(referenceRegistry.serverAddress('zz-wired'), { url: 'wss://zz-refs.example' });
+    // A server the host spawns has no address, whatever url its config holds.
+    fw.setMcplServerConfig({ id: 'zz-spawned', command: 'zz-server', url: 'wss://zz-refs.example' });
+    assert.equal(referenceRegistry.serverAddress('zz-spawned'), 'no-address');
+    const wired = record('wired.bin', ['zz-wired']);
+    const spawned = record('spawned.bin', ['zz-spawned']);
+    const fetcher = fw.getReferenceFetcher();
+    assert.equal(fetcher.refusal(wired), null);
+    assert.ok(buildReferenceStub(wired.testimony, 'zz').endsWith('— zz — fetch with fetch_reference'));
+    assert.equal(fetcher.refusal(spawned)?.reason, noAddressReason('zz-spawned'));
+    assert.ok(buildReferenceStub(spawned.testimony, 'zz').endsWith(`— zz — ${noAddressReason('zz-spawned')}`));
+  });
+
+  it("never sends a framework's token to another framework's origin for one id, and a removal takes back only its own address", () => {
+    const framework = () => {
+      const fw = Object.create(AgentFramework.prototype) as {
+        mcplServerConfigs: Map<string, unknown>;
+        setMcplServerConfig(config: unknown): void;
+        getReferenceFetcher(): ReferenceFetcher;
+      };
+      fw.mcplServerConfigs = new Map();
+      return fw;
+    };
+    const earlier = framework();
+    const later = framework();
+    earlier.setMcplServerConfig({ id: 'zz-shared', url: 'wss://zz-earlier.example', token: 'zz-earlier-token' });
+    later.setMcplServerConfig({ id: 'zz-shared', url: 'wss://zz-later.example', token: 'zz-later-token' });
+    // The later framework's entry is in force for the stub.
+    assert.deepEqual(referenceRegistry.serverAddress('zz-shared'), { url: 'wss://zz-later.example' });
+    const onLater = referenceRegistry.register(testimonyOf({ type: 'resource', uri: 'https://zz-later.example/shared.bin', name: 'shared.bin' }), 'zz-shared');
+    const onEarlier = referenceRegistry.register(testimonyOf({ type: 'resource', uri: 'https://zz-earlier.example/shared.bin', name: 'shared.bin' }), 'zz-shared');
+    // Each fetcher checks a uri against its own config's address, whose token
+    // it carries: the earlier framework's never dials the later one's origin.
+    assert.match(earlier.getReferenceFetcher().refusal(onLater)!.reason, /^third-party origin \(https:\/\/zz-later\.example != dialed https:\/\/zz-earlier\.example\)/);
+    assert.equal(earlier.getReferenceFetcher().refusal(onEarlier), null);
+    assert.equal(later.getReferenceFetcher().refusal(onLater), null);
+    assert.match(later.getReferenceFetcher().refusal(onEarlier)!.reason, /^third-party origin/);
+    // The later framework's removal takes back only its own entry, and the
+    // earlier one's is in force again.
+    referenceRegistry.forgetServerAddress('zz-shared', later);
+    assert.deepEqual(referenceRegistry.serverAddress('zz-shared'), { url: 'wss://zz-earlier.example' });
+    assert.ok(buildReferenceStub(onEarlier.testimony, 'zz').endsWith('— zz — fetch with fetch_reference'));
+    referenceRegistry.forgetServerAddress('zz-shared', earlier);
+    assert.equal(referenceRegistry.serverAddress('zz-shared'), undefined);
+  });
+
+  it("carries each framework's own token to its own server's origin, and to no other, when it fetches", async (t) => {
+    const heard: Array<[string, string | undefined]> = [];
+    const serve = async (name: string) => {
+      const server = createServer((req, res) => {
+        heard.push([name, req.headers.authorization]);
+        res.writeHead(200, { 'content-type': 'application/octet-stream' });
+        res.end(Buffer.from('zz-bytes'));
+      });
+      await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+      t.after(() => new Promise<void>((resolve) => server.close(() => resolve())));
+      return `127.0.0.1:${(server.address() as AddressInfo).port}`;
+    };
+    const [hostA, hostB] = [await serve('a'), await serve('b')];
+    const framework = (url: string, token: string) => {
+      const fw = Object.create(AgentFramework.prototype) as {
+        setMcplServerConfig(config: unknown): void;
+        getReferenceFetcher(): ReferenceFetcher;
+      };
+      Object.assign(fw, {
+        mcplServerConfigs: new Map(),
+        getWorkspaceModule: () => ({ writeBinary: async () => ({ success: true }) }),
+        firstWritableMountName: () => 'scratch',
+        emitTrace: () => {},
+      });
+      fw.setMcplServerConfig({ id: 'zz-shared-fetch', url, token });
+      return fw;
+    };
+    const a = framework(`ws://${hostA}`, 'zz-token-a');
+    const b = framework(`ws://${hostB}`, 'zz-token-b');
+    const onA = referenceRegistry.register(testimonyOf({ type: 'resource', uri: `http://${hostA}/a.bin`, name: 'a.bin' }), 'zz-shared-fetch');
+    const onB = referenceRegistry.register(testimonyOf({ type: 'resource', uri: `http://${hostB}/b.bin`, name: 'b.bin' }), 'zz-shared-fetch');
+    // Each framework refuses the other's origin without dialing it, and
+    // dials its own with its own token.
+    assert.equal((await b.getReferenceFetcher().fetch(onA)).ok, false);
+    assert.equal((await a.getReferenceFetcher().fetch(onB)).ok, false);
+    assert.equal((await a.getReferenceFetcher().fetch(onA)).ok, true);
+    assert.equal((await b.getReferenceFetcher().fetch(onB)).ok, true);
+    assert.deepEqual(heard, [['a', 'Bearer zz-token-a'], ['b', 'Bearer zz-token-b']]);
+    referenceRegistry.forgetServerAddress('zz-shared-fetch', a);
+    referenceRegistry.forgetServerAddress('zz-shared-fetch', b);
+  });
+
+  it("words a server's id as a label in a stub, and a third-party origin and a refused scheme without the uri's parts", () => {
+    serving();
+    const weird = `zz-\u202E${'x'.repeat(300)}`;
+    const r = record('weird.bin', [weird]);
+    const stub = buildReferenceStub(r.testimony, 'zz');
+    assert.ok(stub.includes('unknown server: zz-xxx') && !stub.includes('\u202E') && stub.length < 400, stub);
+    referenceRegistry.setServerAddress('zz-other', { url: 'wss://zz-other.example' }, TEST_HOST);
+    const offOrigin = record('elsewhere.bin', ['zz-other']);
+    assert.ok(buildReferenceStub(offOrigin.testimony, 'zz').endsWith("— zz — third-party origin: it isn't on its server's own address, so this host doesn't fetch it"));
+    const fetcher = new ReferenceFetcher(() => ({ url: 'wss://zz-other.example' }), async () => null);
+    assert.match(fetcher.refusal(offOrigin)!.reason, /^third-party origin \(https:\/\/zz-refs\.example != dialed https:\/\/zz-other\.example\); not fetched by this host$/);
+    // A scheme the fetcher doesn't fetch: the stub doesn't name it, and the
+    // fetch's refusal names it bounded as a label is.
+    const scheme = `zz${'s'.repeat(300)}`;
+    const t = testimonyOf({ type: 'resource', uri: `${scheme}://zz-refs.example/long.bin`, name: 'long.bin' });
+    const long = referenceRegistry.register(t, 'zz-dialed');
+    assert.ok(buildReferenceStub(t, 'zz').endsWith('— zz — scheme not allowed: this host fetches only http and https uris'));
+    assert.equal(new ReferenceFetcher(() => ({ url: 'wss://zz-refs.example' }), async () => null).refusal(long)?.reason,
+      `scheme not allowed: ${sanitizeLabel(`${scheme}:`, 120)}`);
+  });
+
+  it('refuses an http uri on a securely dialed server as plaintext, and a server url that does not parse as such', () => {
+    const plain = referenceRegistry.register(testimonyOf({ type: 'resource', uri: 'http://zz-refs.example/plain.bin', name: 'plain.bin' }), 'zz-secure');
+    referenceRegistry.setServerAddress('zz-secure', { url: 'wss://zz-refs.example' }, TEST_HOST);
+    assert.ok(buildReferenceStub(plain.testimony, 'zz').endsWith('— zz — plaintext reference from a secure origin'));
+    assert.equal(new ReferenceFetcher(() => ({ url: 'wss://zz-refs.example' }), async () => null).refusal(plain)?.reason, 'plaintext reference from a secure origin');
+    // On the secure server's port named outright, it's the same place.
+    const port = referenceRegistry.register(testimonyOf({ type: 'resource', uri: 'http://zz-refs.example:443/port.bin', name: 'port.bin' }), 'zz-secure');
+    assert.ok(buildReferenceStub(port.testimony, 'zz').endsWith('— zz — plaintext reference from a secure origin'));
+    // Another host over plaintext is a third party's, as before.
+    const elsewhere = referenceRegistry.register(testimonyOf({ type: 'resource', uri: 'http://zz-elsewhere.example/plain.bin', name: 'plain.bin' }), 'zz-secure');
+    assert.match(buildReferenceStub(elsewhere.testimony, 'zz'), /— zz — third-party origin: /);
+    referenceRegistry.setServerAddress('zz-garbled', { url: 'zz not a url' }, TEST_HOST);
+    const garbled = referenceRegistry.register(testimonyOf({ type: 'resource', uri: 'https://zz-refs.example/garbled.bin', name: 'garbled.bin' }), 'zz-garbled');
+    assert.ok(buildReferenceStub(garbled.testimony, 'zz').endsWith('— zz — server url does not parse'));
+  });
+});
+
+describe('an empty link beside inline data is no link', () => {
+  const image = { ...IMAGE, uri: '' };
+  const audio = { ...AUDIO, uri: '' };
+
+  it('so the data is shown as any inline data is, on the push lane and the tool-result lane', () => {
+    assert.deepEqual(classifyBlock(image), { kind: 'inline', contradiction: false });
+    assert.deepEqual(classifyBlock(audio), { kind: 'inline', contradiction: false });
+    assert.deepEqual(convertBlock(image as never, 'p', 's'), { type: 'image', source: { type: 'base64', data: PNG, mediaType: 'image/png' } });
+    assert.deepEqual(convertBlock(audio as never, 'p', 's'), { type: 'audio', source: { type: 'base64', data: BASE64, mediaType: 'audio/wav' } });
+    const { stored, live } = copies({ success: true, data: [image, audio], dataIsContent: true });
+    assert.equal(stored, `[image: image/png, 9B]\n${AUDIO_TEXT}`);
+    assert.deepEqual(live, [{ type: 'image', source: { type: 'base64', data: PNG, mediaType: 'image/png' } }, { type: 'text', text: AUDIO_TEXT }]);
+  });
+
+  it('while a link that isn\'t empty still withholds it, on both lanes', () => {
+    const linked = { ...AUDIO, uri: 'https://zz-files.example/a.wav' };
+    assert.deepEqual(classifyBlock(linked), { kind: 'inline', contradiction: true });
+    assert.deepEqual(convertBlock(linked as never, 'p', 's'), { type: 'text', text: INLINE_WITHHELD_TEXT });
+    assert.equal(nonErrorResultText({ data: [TEXT, linked], dataIsContent: true }), `zz-text\n${INLINE_WITHHELD_TEXT}`);
+  });
+});
+
+describe('dataIsContent travels with the result', () => {
+  it('is kept as its truth when a module\'s result is checked, read once', () => {
+    const call = { id: 'zz', name: 'zz_tool', input: {} };
+    assert.equal(checkedToolResult(call, { success: true, data: [TEXT], dataIsContent: 1 }).result.dataIsContent, true);
+    assert.equal(checkedToolResult(call, { success: true, data: [TEXT], dataIsContent: 0 }).result.dataIsContent, false);
+    assert.equal('dataIsContent' in checkedToolResult(call, { success: true, data: [TEXT] }).result, false);
+    let reads = 0;
+    class Answer {
+      success = true;
+      data = [TEXT, VIDEO];
+      get dataIsContent() { reads += 1; return true; }
+    }
+    assert.equal(checkedToolResult(call, new Answer()).result.dataIsContent, true);
+    assert.equal(reads, 1);
+  });
+
+  it("through a model's round, from a module's result: both copies show its blocks", async () => {
+    for (const dataIsContent of [true, undefined]) {
+      const { wire, stored } = await answerModelCall({ success: true, data: [IMAGE, TEXT, AUDIO, VIDEO], ...(dataIsContent ? { dataIsContent } : {}) });
+      if (dataIsContent) {
+        // The image's placeholder carries the ref the ledger retained it under.
+        assert.equal(stored.replace(/ref img_[A-Za-z0-9]+_\d+/, 'ref IMG'), JSON.stringify([`[image: image/png, 9B, ref IMG]\nzz-text\n${AUDIO_TEXT}\n${unknownBlockText(VIDEO)}`]));
+        assert.equal(wire, JSON.stringify([[
+          { type: 'image', source: { type: 'base64', data: PNG, mediaType: 'image/png' } },
+          { type: 'text', text: 'zz-text' },
+          { type: 'text', text: AUDIO_TEXT },
+          { type: 'text', text: unknownBlockText(VIDEO) },
+        ]]));
+      } else {
+        // Without it, the block of a type MCP doesn't define makes the array data.
+        assert.equal(stored, JSON.stringify([JSON.stringify([IMAGE, TEXT, AUDIO, VIDEO])]));
+        assert.equal(wire, stored);
+      }
+    }
+  });
+
+  test("an MCPL tool's result carries it, to the model's call, an in-process caller and the puppet's stored pair", { timeout: 30_000 }, async (t) => {
+    // The fixture's server is dialed at ws://127.0.0.1:<port>, so a link on
+    // that origin can be fetched, and one elsewhere can't.
+    let BLOCKS: unknown[] = [];
+    const f = await fixture({
+      tools: [{ name: 'lookup', description: 'Look something up.', inputSchema: { type: 'object' } }],
+      toolsCall: (params) => ((params.arguments as { case: string }).case === 'text'
+        ? { content: [TEXT, { type: 'text', text: 'zz-more' }] }
+        : { content: BLOCKS }),
+    });
+    t.after(f.close);
+    const elsewhere = `https://zz-files.example/mcpl.csv?sig=${SECRET}`;
+    const plain = 'https://zz-files.example/mcpl.csv';
+    const own = `http://127.0.0.1:${f.port}/mcpl.csv?sig=${SECRET}`;
+    BLOCKS = [TEXT, VIDEO, AUDIO, { ...LINK, uri: own }, { ...LINK, uri: elsewhere, name: 'elsewhere.csv' }, { ...LINK, uri: plain, name: 'plain.csv' }];
+    assert.deepEqual(referenceRegistry.serverAddress('editor'), { url: `ws://127.0.0.1:${f.port}` });
+    const internals = f.framework as unknown as { pushEvent(event: unknown): void; dispatchToolCall(agent: string, call: unknown): void };
+    const viaModel = (id: string, c: string) => new Promise<ToolResult>((resolve) => {
+      const original = internals.pushEvent;
+      internals.pushEvent = (event: unknown) => {
+        const e = event as { type: string; callId?: string; result?: ToolResult };
+        if (e.type === 'tool-result' && e.callId === id) { internals.pushEvent = original; resolve(e.result!); }
+        else original.call(internals, event);
+      };
+      internals.dispatchToolCall('agent', { id, name: 'mcpl--editor--lookup', input: { case: c } });
+    });
+    // The puppet stores the pair from a checked copy of the in-process
+    // result. It runs first, while the agent is idle.
+    const { toolUseId } = await f.framework.puppetToolCall('agent', 'mcpl--editor--lookup', { case: 'blocks' });
+    const stored = f.framework.getAgent('agent')!.getContextManager().getAllMessages()
+      .flatMap((m) => m.content as unknown as Array<Record<string, unknown>>)
+      .find((b) => b.type === 'tool_result' && b.toolUseId === toolUseId);
+    const model = await viaModel('zz-model', 'blocks');
+    assert.equal(model.dataIsContent, true);
+    assert.deepEqual(model.data, BLOCKS);
+    const expected = nonErrorResultText(model);
+    // The server's own link fetches. Another origin's, which may carry a
+    // credential, says why it can't be fetched, and the plain one shows its uri.
+    assert.match(expected, new RegExp(
+      `^zz-text\\n\\[Content not shown: this host can't display "video" content\\.\\]\\n\\[Audio not shown: [^\\n]+\\n${STUB.source}fetch with fetch_reference\\n`
+      + `\\[ref_[^\\]]+\\] elsewhere\\.csv — text/csv, ~1KB claimed — from tool result — third-party origin: it isn't on its server's own address, so this host doesn't fetch it\\n`
+      + `\\[resource link "plain\\.csv": https://zz-files\\.example/mcpl\\.csv, text/csv; not fetched\\]$`));
+    assert.ok(!expected.includes(SECRET), expected);
+    assert.deepEqual(referenceRegistry.findByUri(own)?.serverIds, ['editor']);
+    // The puppet's stored pair holds what a model's call stores.
+    assert.equal(stored?.content, expected);
+    // A text-only result is still its joined text, and carries nothing more.
+    const text = await viaModel('zz-text', 'text');
+    assert.deepEqual([text.data, text.dataIsContent], ['zz-text\nzz-more', undefined]);
+    const inProcess = await f.framework.executeToolCall({ id: 'zz-x', name: 'mcpl--editor--lookup', input: { case: 'blocks' } });
+    assert.deepEqual([inProcess.data, inProcess.dataIsContent], [BLOCKS, true]);
+    // A server the framework removes is forgotten, and a link of its then
+    // can't be fetched.
+    await f.framework.disconnectMcplServer('editor');
+    assert.equal(referenceRegistry.serverAddress('editor'), undefined);
+    assert.match(nonErrorResultText(model), new RegExp(`\\n${STUB.source}unknown server: editor\\n`));
+  });
+});
+
+test("a framework's stop takes its servers' addresses out of the registry, and its start records them again", async () => {
+  // On a store of its own, so it can start again after it stops.
+  const dir = mkdtempSync(join(tmpdir(), 'tool-result-blocks-lifecycle-'));
+  const store = JsStore.openOrCreate({ path: join(dir, 'store') });
+  const framework = await AgentFramework.create({
+    store,
+    membrane: new MockMembrane().asMembrane(),
+    agents: [{ name: 'agent', model: 'test-model', systemPrompt: 'test', allowedTools: 'all' }],
+    modules: [],
+    syncIntervalMs: 0,
+    maintenanceIntervalMs: 0,
+  });
+  try {
+    (framework as unknown as { setMcplServerConfig(config: unknown): void })
+      .setMcplServerConfig({ id: 'zz-lifecycle', url: 'wss://zz-lifecycle.example' });
+    framework.start();
+    assert.deepEqual(referenceRegistry.serverAddress('zz-lifecycle'), { url: 'wss://zz-lifecycle.example' });
+    await framework.stop();
+    assert.equal(referenceRegistry.serverAddress('zz-lifecycle'), undefined);
+    framework.start();
+    assert.deepEqual(referenceRegistry.serverAddress('zz-lifecycle'), { url: 'wss://zz-lifecycle.example' });
+  } finally {
+    await framework.stop();
+    store.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+/** A module whose one tool answers with the result it was given. */
+class AnswerModule implements Module {
+  readonly name = 'content';
+  constructor(private readonly answer: ToolResult) {}
+  async start(_ctx: ModuleContext): Promise<void> {}
+  async stop(): Promise<void> {}
+  getTools(): ToolDefinition[] {
+    return [{ name: 'get', description: 'Answer with content.', inputSchema: { type: 'object', properties: {} } }];
+  }
+  async handleToolCall(_call: ToolCall): Promise<ToolResult> {
+    return this.answer;
+  }
+  async onProcess(): Promise<Record<string, never>> {
+    return {};
+  }
+}
+
+/** The content of the tool result the model received for one call, and of what the agent's history stored. */
+async function answerModelCall(answer: ToolResult): Promise<{ wire: string; stored: string }> {
+  const dir = mkdtempSync(join(tmpdir(), 'tool-result-blocks-'));
+  const membrane = new MockMembrane();
+  const framework = await AgentFramework.create({
+    storePath: join(dir, 'store'),
+    membrane: membrane.asMembrane(),
+    agents: [{ name: 'agent', model: 'test-model', systemPrompt: 'test', allowedTools: 'all' }],
+    modules: [new AnswerModule(answer)],
+    syncIntervalMs: 0,
+    maintenanceIntervalMs: 0,
+  });
+  try {
+    membrane.pushResponse(createMockResponse([{ type: 'tool_use', id: 'zz-call', name: 'content--get', input: {} }], 'tool_use'));
+    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'zz-done' }]));
+    framework.start();
+    (framework as unknown as { pendingRequests: unknown[] }).pendingRequests.push({
+      agentName: 'agent', reason: 'external-message', source: 'test', timestamp: Date.now(),
+    });
+    const stream = () => membrane.lastStream as unknown as { receivedToolResults: unknown[][] } | undefined;
+    const deadline = Date.now() + 5_000;
+    while ((stream()?.receivedToolResults.length ?? 0) < 1 && Date.now() < deadline) await new Promise((r) => setTimeout(r, 25));
+    const received = stream()?.receivedToolResults[0];
+    assert.ok(received, 'the model was answered');
+    const stored = framework.getAgent('agent')!.getContextManager().getAllMessages()
+      .flatMap((message) => message.content)
+      .filter((block) => (block as { type?: string }).type === 'tool_result');
+    assert.equal(stored.length, 1, 'the history holds the tool result');
+    const contentOf = (results: unknown[]) => JSON.stringify(results.map((r) => (r as { content?: unknown }).content));
+    return { wire: contentOf(received), stored: contentOf(stored) };
+  } finally {
+    await framework.stop();
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
