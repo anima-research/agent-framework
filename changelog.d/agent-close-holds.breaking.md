@@ -29,13 +29,16 @@
     parses it, and the agent gets the note or the tune-out line in its window instead, as a notice
     the way "[channels] Now open" comes.
   - **What the invitation says:** the closed-channel invitation's first option now says what
-    replying does there. In a channel the agent closed or declined itself, or a module closed, it
-    reads as before: "Reply without joining …", with the note that follow-ups that don't address
-    the agent won't reach it. In any other closed channel, where a reply opens the channel, it reads "1. Reply —
-    … it will be delivered there, and replying joins the channel, as option 2 does. To reply
-    without joining, decline it first (option 3): a channel you've declined stays closed when you
-    speak there." Before, it offered "Reply without joining" there too, though the reply opened
-    the channel.
+    replying does there. In a channel the agent closed or declined itself, or a module closed, a
+    reply no longer opens the channel, and the option says so: "1. Reply — … it will be delivered
+    there, and the channel stays closed." Before, it said "… which opens the channel" there too.
+    It says the same on a server whose grant lacks `channels.lifecycle`, where 0.22.3 said a reply
+    opens the channel though nothing there could. In any other closed channel, where a reply still
+    opens the channel, it adds how to reply without opening it: "To reply without opening it,
+    decline it first (option 3): a channel you've declined stays closed when you speak there."
+    What else reaches the agent from a channel left closed is its server's to say (#406): on
+    discord-mcpl, the channel's later messages that don't address the agent don't arrive as
+    they're posted, and anima-research/discord-mcpl#97 has discord-mcpl say so on its push.
   - **What residents notice:** on discord-mcpl, opening a channel also turns on its reaction
     forwarding, and closing it turns that off. A reply in a guild channel the agent closed used to
     reopen it, and so turn its reactions on. Now reactions to that reply arrive only where the
@@ -57,7 +60,7 @@
   where it was `agent-tool`. Speech leaves such a channel closed, as it does one the agent closed,
   but gives no note, since the module owns the way back. In connectome-host that's the `mentions`
   channel mode: a reply to a mention in a channel in that mode stays a reply, and the invitation
-  there offers "Reply without joining". Policy doesn't lift such a close, and a machine's close
+  there says the channel stays closed. Policy doesn't lift such a close, and a machine's close
   doesn't replace it. Of the agent's close and a module's, the later one is the one on record. A
   module's close is never refused as a machine's close of an explicit open; only one naming a
   machine source is. A module's `channel_close` naming an unknown machine source is now refused on

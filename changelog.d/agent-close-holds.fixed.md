@@ -38,5 +38,5 @@
   speaking there nor policy reopens it.
 - The closed-channel invitation is no longer added to a direct message (`chat:dm`), all of which
   reaches the agent whether the DM is open or not. Where no single-word target reaches a channel,
-  it no longer says that replying needs a join: it suggests checking whether the server has a
+  it no longer says to open the channel to reply: it suggests checking whether the server has a
   send tool that can address the channel.
