@@ -46,7 +46,7 @@ import { CoalesceError, validateCoalescedContent } from '../src/mcpl/push-coales
 import { ReferenceFetcher } from '../src/mcpl/reference-fetcher.js';
 import { checkedToolResult } from '../src/module-registry.js';
 import { parseImagePlaceholders } from '../src/tool-image-ledger.js';
-import { nonErrorResultText, toolResultBlocks, toolResultDataToHistoryString } from '../src/tool-result-history.js';
+import { nonErrorResultText, toolResultDataToHistoryString } from '../src/tool-result-history.js';
 import { MockMembrane, createMockResponse } from './helpers/mock-membrane.js';
 import { fixture } from './helpers/coalescing-fixture.js';
 
@@ -980,9 +980,11 @@ describe('one answer for every block of a result', () => {
 
   it("bounds an audio marker's type and strips its controls", () => {
     const type = `audio/\u202Ewav\u0007${'x'.repeat(300)}`;
-    const [marker] = toolResultBlocks([{ type: 'audio', data: BASE64, mimeType: type }], true)! as Array<{ text: string }>;
-    assert.ok(!marker!.text.includes('\u202E') && !marker!.text.includes('\u0007'), marker!.text);
-    assert.ok(marker!.text.length < 250, String(marker!.text.length));
+    // The array's one block, so the text is its marker alone.
+    const marker = toolResultDataToHistoryString([{ type: 'audio', data: BASE64, mimeType: type }], undefined, { dataIsContent: true });
+    assert.match(marker, /^\[Audio not shown: /);
+    assert.ok(!marker.includes('\u202E') && !marker.includes('\u0007'), marker);
+    assert.ok(marker.length < 250, String(marker.length));
   });
 
   it("gives a script's object for a link whose line shows its uri what its refId meets, which the line, having no id, doesn't say", () => {
