@@ -725,6 +725,9 @@ export function shownLinkUri(t: ReferenceTestimony, record: ReferenceRecord, now
  */
 export function buildReferenceStub(t: ReferenceTestimony, provenance?: string, serverId?: string, options?: StubOptions): string {
   const record = referenceRegistry.register(t, serverId);
+  // One clock reading for the whole stub, so whether it shows a link's uri
+  // and the reason it gives can't disagree across an expiry.
+  const nowMs = Date.now();
   const parts: string[] = [];
   // A label is shown only when something is left of it once sanitized.
   const name = t.name ? sanitizeLabel(t.name, STUB_FIELD_CHARS) : '';
@@ -744,10 +747,10 @@ export function buildReferenceStub(t: ReferenceTestimony, provenance?: string, s
     // A reference the fetcher would refuse says why, rather than inviting a
     // fetch_reference call.
     if (options?.unfetchedLinkUri) {
-      const uri = shownLinkUri(t, record);
+      const uri = shownLinkUri(t, record, nowMs);
       if (uri !== null) return unfetchedLinkText(t, uri);
     }
-    parts.push(unfetchableReason(record) ?? 'fetch with fetch_reference');
+    parts.push(unfetchableReason(record, nowMs) ?? 'fetch with fetch_reference');
   }
   return `[${record.refId}] ${parts.join(' — ') || 'referenced content'}`;
 }
@@ -803,10 +806,12 @@ export function referenceStubOrNull(block: unknown, provenance?: string, serverI
  * path its payload was fetched to, or null when it wasn't (`fetch_reference`
  * takes the id as `ref_id`). Its uri is left out, except that a link (MCP's
  * resource_link) carries `uri` where the model's line for it shows the uri
- * (shownLinkUri). Where the model's line is a stub, an unsaved reference
- * that counts as expired also carries `expired`, and where the stub gives a
- * reason the fetcher would refuse, in place of advising fetch_reference, the
- * object carries the same words as `unfetchable` (unfetchableReason). The reference is registered bound to `serverId`, the
+ * (shownLinkUri). An unsaved reference that counts as expired also carries
+ * `expired`, and one the fetcher would refuse carries `unfetchable`, the
+ * words a stub gives in place of advising fetch_reference
+ * (unfetchableReason). Both say what a fetch_reference with the object's
+ * `refId` meets, so a link whose line shows its uri, which the host can't
+ * fetch, carries them too: its line has no id to fetch with. The reference is registered bound to `serverId`, the
  * server whose tool returned it, as the model's lanes bind a tool result's
  * references, so the fetch its id offers can be made. A block the classifier
  * rejects becomes the notice the model's lanes show, and inline data that
@@ -823,12 +828,16 @@ export function referenceBlockForScript(block: unknown, serverId: string): unkno
     case 'reference': {
       const t = c.testimony;
       const record = referenceRegistry.register(t, serverId);
-      const uri = shownLinkUri(t, record);
-      // What the stub says, where the model's line is a stub: a link line
-      // that shows its uri says neither. As the stub judges it, a saved copy
-      // is still served.
-      const expiry = record.fetchedPath || uri !== null ? null : referenceExpiry(record.testimony);
-      const unfetchable = uri === null ? unfetchableReason(record) : null;
+      // One clock reading for the whole object, so its words can't disagree
+      // with each other across an expiry.
+      const nowMs = Date.now();
+      const uri = shownLinkUri(t, record, nowMs);
+      // What a fetch_reference with this object's refId meets, in the words
+      // a stub gives, whether or not the model's line for it is a stub: the
+      // line has no id to fetch with, and the object does. As the stub
+      // judges it, a saved copy is still served.
+      const expiry = record.fetchedPath ? null : referenceExpiry(record.testimony, nowMs);
+      const unfetchable = unfetchableReason(record, nowMs);
       return {
         type: (block as { type: string }).type,
         refId: record.refId,

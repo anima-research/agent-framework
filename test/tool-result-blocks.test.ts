@@ -25,6 +25,7 @@ import type { Module, ModuleContext, ToolCall, ToolResult, ToolDefinition } from
 import {
   AUDIO_NO_DATA_TEXT,
   AUDIO_NO_MEDIA_TYPE_TEXT,
+  EXPIRY_REASON,
   IMAGE_NO_DATA_TEXT,
   IMAGE_NO_MEDIA_TYPE_TEXT,
   INLINE_WITHHELD_TEXT,
@@ -305,22 +306,29 @@ describe("MCP's resource_link, a reference (RFC-005 §8.1)", () => {
     servingFiles();
     const withheldUri = 'https://zz-elsewhere.example/withheld-for-script.csv';
     referenceRegistry.register(testimonyOf({ type: 'resource', uri: withheldUri, name: 'withheld.csv', disposition: 'never' }));
-    for (const [what, link, shows] of [
-      ["off its server's origin, with no credential", { type: 'resource_link', uri: 'https://zz-elsewhere.example/script-plain.csv', name: 'a.csv' }, true],
-      ['with a scheme the fetcher refuses', { type: 'resource_link', uri: 'file:///zz/script-plain.csv', name: 'a.csv' }, true],
-      ['that may carry a credential', { type: 'resource_link', uri: `https://zz-elsewhere.example/script-signed.csv?sig=${SECRET}`, name: 'a.csv' }, false],
-      ['withheld by a reference with disposition never', { type: 'resource_link', uri: withheldUri, name: 'a.csv' }, false],
-      ['the host can fetch', { type: 'resource_link', uri: 'https://zz-files.example/script-fetchable.csv', name: 'a.csv' }, false],
+    const thirdParty = "third-party origin: it isn't on its server's own address, so this host doesn't fetch it";
+    for (const [what, link, shows, refused] of [
+      ["off its server's origin, with no credential", { type: 'resource_link', uri: 'https://zz-elsewhere.example/script-plain.csv', name: 'a.csv' }, true, thirdParty],
+      ['with a scheme the fetcher refuses', { type: 'resource_link', uri: 'file:///zz/script-plain.csv', name: 'a.csv' }, true, 'scheme not allowed: this host fetches only http and https uris'],
+      ['that may carry a credential', { type: 'resource_link', uri: `https://zz-elsewhere.example/script-signed.csv?sig=${SECRET}`, name: 'a.csv' }, false, thirdParty],
+      ['withheld by a reference with disposition never', { type: 'resource_link', uri: withheldUri, name: 'a.csv' }, false, thirdParty],
+      ['the host can fetch', { type: 'resource_link', uri: 'https://zz-files.example/script-fetchable.csv', name: 'a.csv' }, false, undefined],
     ] as const) {
       // Delivered by the zz-files server, as a script's MCPL call registers it.
       const object = referenceBlockForScript(link, 'zz-files') as { uri?: string; refId: string; unfetchable?: string };
       const line = toolResultDataToHistoryString([TEXT, link], undefined, { dataIsContent: true }).split('\n')[1]!;
       assert.equal(line.startsWith('[resource link '), shows, `${what}: ${line}`);
       assert.equal(object.uri, shows ? link.uri : undefined, what);
-      // Where the stub gives a reason in place of advising fetch_reference,
-      // the object carries the same words.
-      const ending = line.slice(line.lastIndexOf(' — ') + 3);
-      assert.equal(object.unfetchable, shows || ending === 'fetch with fetch_reference' ? undefined : ending, what);
+      // The object says what a fetch_reference with its refId meets: where
+      // the line is a stub, the reason it gives in place of advising
+      // fetch_reference, in the same words, and where the line shows the
+      // uri, which it does only for a link the host can't fetch, the reason
+      // that fetch is refused, which the line, having no id, doesn't give.
+      if (!shows) {
+        const ending = line.slice(line.lastIndexOf(' — ') + 3);
+        assert.equal(ending, refused ?? 'fetch with fetch_reference', what);
+      }
+      assert.equal(object.unfetchable, refused, what);
       if (!shows) assert.ok(!line.includes(link.uri) && !JSON.stringify(object).includes(link.uri), what);
       assert.match(object.refId, /^ref_/, what);
     }
@@ -977,15 +985,49 @@ describe('one answer for every block of a result', () => {
     assert.ok(marker!.text.length < 250, String(marker!.text.length));
   });
 
-  it("gives a script's object no expiry for a link whose line shows its uri, as the line gives none", () => {
-    const uri = 'https://zz-elsewhere.example/expired-link.csv';
+  it("gives a script's object for a link whose line shows its uri what its refId meets, which the line, having no id, doesn't say", () => {
+    // On its server's own origin, so the expiry is the one refusal.
+    servingFiles();
+    const uri = 'https://zz-files.example/expired-link.csv';
     referenceRegistry.register(testimonyOf({ type: 'resource', uri, name: 'expired.csv', expiresAt: '2001-01-01T00:00:00Z' }));
     const link = { type: 'resource_link', uri, name: 'expired.csv' };
-    const object = referenceBlockForScript(link, 'zz-files') as { uri?: string; expired?: string; unfetchable?: string };
+    const object = referenceBlockForScript(link, 'zz-files') as { uri?: string; refId: string; expired?: string; unfetchable?: string };
     assert.equal(object.uri, uri);
-    assert.equal(object.expired, undefined);
-    assert.equal(object.unfetchable, undefined);
+    assert.match(object.refId, /^ref_/);
+    assert.equal(object.expired, EXPIRY_REASON.passed);
+    assert.equal(object.unfetchable, `the reference is ${EXPIRY_REASON.passed}`);
     assert.ok(toolResultDataToHistoryString([TEXT, link]).endsWith(`[resource link "expired.csv": ${uri}; not fetched]`));
+  });
+
+  it("reads the clock once for a script's object and once for a stub, so neither disagrees with itself across an expiry", () => {
+    servingFiles();
+    const expiresAt = '2030-01-01T00:00:00Z';
+    const at = Date.parse(expiresAt);
+    for (const [what, block] of [
+      ['a reference', { type: 'resource', uri: 'https://zz-files.example/clock.csv', name: 'clock.csv', expiresAt }],
+      ['a link to a reference', { type: 'resource_link', uri: 'https://zz-files.example/clock-link.csv', name: 'clock.csv' }],
+    ] as const) {
+      // Its record holds the expiry, as a reference delivered for the link's
+      // uri leaves it, before the clock moves.
+      referenceRegistry.register(testimonyOf({ ...block, type: 'resource', expiresAt }), 'zz-files');
+      const now = Date.now;
+      // A clock that reads just before the expiry the first time it's read,
+      // and past it every time after.
+      let reads = 0;
+      Date.now = () => (reads++ === 0 ? at - 1000 : at + 1000);
+      let object: { uri?: string; expired?: string; unfetchable?: string };
+      let stub: string;
+      try {
+        object = referenceBlockForScript(block, 'zz-files') as typeof object;
+        reads = 0;
+        stub = buildReferenceStub(testimonyOf(block), 'from tool result', undefined, { unfetchedLinkUri: true });
+      } finally {
+        Date.now = now;
+      }
+      // Each says, as of its one reading, that a fetch would dial.
+      assert.deepEqual([object.uri, object.expired, object.unfetchable], [undefined, undefined, undefined], what);
+      assert.ok(stub.endsWith('— fetch with fetch_reference'), `${what}: ${stub}`);
+    }
   });
 
   it("asks the resolver once for each server a fetch's check reads, so its address and its credential are one answer", () => {
