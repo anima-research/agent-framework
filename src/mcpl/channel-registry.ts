@@ -1725,7 +1725,11 @@ export class ChannelRegistry {
   /**
    * Build channel context for inclusion in beforeInference params.
    *
-   * Returns undefined if no channels are active.
+   * Returns undefined when it would hold nothing: no channel open, no
+   * outgoing locus and no incoming message, as for a private turn with no
+   * channel open. A turn with no locus, as in explicit and disabled modes,
+   * still gets the message it replies to (incoming), whether or not a
+   * channel is open.
    */
   buildChannelContext(
     agentName?: string,

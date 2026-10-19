@@ -851,7 +851,9 @@ interface TurnRouting {
    * The channel whose message triggered the turn (item-3 redux), which the
    * locus is resolved from when the turn opens, and which the channel
    * registry reports as the turn's default outgoing channel. A turn that
-   * channel_opens a channel moves it there. Kept across the turn's streams:
+   * channel_opens a channel moves it there, unless the turn is a private
+   * non-channel surface's, whose opens move nothing. Kept across the turn's
+   * streams:
    * a budget restart's trigger carries no channel, and dropping it there
    * sent Sol's DM reply to a stale guild channel (2026-07-22).
    */
@@ -4221,8 +4223,8 @@ export class AgentFramework {
    *  with any of them can be withdrawn or dropped on its own, and must not
    *  stand for one without. (coalescingBatch is set only beside one of the
    *  first two.) A gate window's private part and its other part are two
-   *  wakes from one flush, with the same reason, source and time, and may
-   *  differ only in their routing class. */
+   *  wakes from one flush, with the same reason, source and time; unless the
+   *  other part names a channel, only their routing class tells them apart. */
   private sameInferenceRequest(a: InferenceRequest, b: InferenceRequest): boolean {
     const batchSubjects = (r: InferenceRequest) => (r.coalescingBatchSubjects ?? []).join('\n');
     return a.agentName === b.agentName && a.reason === b.reason && a.source === b.source &&
@@ -16360,10 +16362,15 @@ export class AgentFramework {
     //  - A silent start routes no prose. It gets an object of its own, with
     //    no locus, so it neither takes nor disturbs an open turn's. Its
     //    object is the agent's live routing while it runs, and the open
-    //    turn's next start makes the turn's object live again. (No silent
-    //    start runs while a prose turn is open in production: a capacity
-    //    hold holds silent wakes with the turn's, and a re-inference's wake
-    //    is queued before its stream ends, so it batches with them.)
+    //    turn's next start makes the turn's object live again. A silent
+    //    start runs while a prose turn is open when the scheduler holds that
+    //    turn's other-kind wakes and only silent ticks are left
+    //    (processInferenceRequests); otherwise a capacity hold holds silent
+    //    wakes with the turn's, and a re-inference's wake is queued before its
+    //    stream ends, so it batches with them. Nothing that continues the
+    //    open turn reads the silent start's object: a continuation takes the
+    //    open turn (openLogical), and a resume runs only while its own turn's
+    //    token is held, so no silent start runs between.
     //  - Any other start continues the agent's open logical turn, if one is
     //    open (openLogical): a framework retry, the start that consumes tool
     //    results the non-streaming fallback left (whichever wake the
@@ -26136,7 +26143,7 @@ export class AgentFramework {
     // The turn that called: a channel_open's result records its trigger
     // channel there, however late it arrives, and moves its locus while the
     // turn is still open, even once another start's routing is the agent's
-    // live one. A silent turn's open moves no locus: no silent start or
+    // live one; a private non-channel turn's records and moves neither. A silent turn's open moves no locus: no silent start or
     // resume registers its routing state as the open turn (openLogical), and
     // a non-silent resume that does, a budget restart batched with an
     // ordinary wake, starts only once its over-budget boundary has every
