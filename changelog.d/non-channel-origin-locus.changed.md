@@ -17,15 +17,15 @@
 
   A private surface's wake and a wake that names a channel never start one turn
   together: not from one batch, one gate debounce window or one quiesce. In a
-  gate window, a channel-bound surface message names its channel, and so does an
-  addressed channel event whose channel the host resolved; ambient channel
-  events that share a window with a private message, with nothing in the window
-  that names a channel, share its private turn, and nothing answers them in
-  their channel. A start that continues a turn keeps that turn's kind, and takes
-  no private surface's wake into a turn that isn't private. Such wakes wait for
-  the open turn to end; an idle agent's open turn that holds such a wake with
-  nothing of its own kind to start for 30 seconds ends, and a
-  `[inference-stale]` line says so.
+  gate window, an addressed channel event names its channel when the host
+  resolved it, and a channel-bound surface message names its own unless an
+  addressed event shares its part; ambient channel events that share a window
+  with a private message, with nothing in their part that names a channel, share
+  its private turn, and nothing answers them in their channel. A start that
+  continues a turn keeps that turn's kind, and takes no private surface's wake
+  into a turn that isn't private. Such wakes wait for the open turn to end; an
+  idle agent's open turn that holds such a wake with nothing of its own kind to
+  start for 30 seconds ends, and a `[inference-stale]` line says so.
 
   Real-turn hooks get the turn's frozen locus as `defaultOutgoing`. Explicit,
   disabled and private turns have none. Explicit and disabled turns get

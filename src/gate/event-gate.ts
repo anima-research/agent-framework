@@ -1640,12 +1640,13 @@ export class EventGate {
     // own, from its own events, the part whose first event arrived first
     // going first. Where the other part has a channel to answer in (an
     // addressed event whose registered channel the host resolved, or a
-    // channel-bound surface message), the scheduler runs the two in separate
+    // channel-bound surface message with no addressed event beside it, since
+    // an addressed event outranks it), the scheduler runs the two in separate
     // turns. An ambient channel event names its channel only as where it
     // woke the agent, and an addressed one whose channel the host couldn't
-    // resolve names none, so such a part's wake shares the private turn, and
-    // nothing answers it in its channel: the window's content above stays
-    // one message, the operator's words included.
+    // resolve names none, so a part whose pick names no channel shares the
+    // private turn, and nothing answers it in its channel: the window's
+    // content above stays one message, the operator's words included.
     // A shared buffer holds each policy's events in the order its debounce
     // fired, so arrival is read from the events' own times, and within one
     // millisecond from their order in the window.

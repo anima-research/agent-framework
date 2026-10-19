@@ -13857,8 +13857,9 @@ export class AgentFramework {
       // whose start continues the turn, or that finds the turn ended, resets
       // it; a wake's own age, which counts its wait behind a busy agent, never
       // starts it. Time the agent spends busy after the clock starts counts,
-      // since only a silent start can run beside the held turn. A turn that
-      // has had nothing of its kind for OPEN_TURN_HOLD_MS has none coming: it
+      // since nothing that runs beside the held turn continues it: a silent
+      // start, or its budget restart with the wakes it takes. A turn that has
+      // had nothing of its kind for OPEN_TURN_HOLD_MS has none coming: it
       // ends, and the wakes it held start. A turn whose token stays held, or
       // one with no wake of the other kind waiting, isn't reached here.
       const held = requests.filter(opposite);
@@ -19396,7 +19397,10 @@ export class AgentFramework {
    * script runs (dispatchChannelToolCall): the script carries out that turn's
    * work, so a private turn's script publishes only where it names, after its
    * turn ends too, and a later turn doesn't change how its calls are judged.
-   * Its wake_agent() wakes stay neutral.
+   * Its wake_agent() wakes stay neutral. A callerTurnId that a caller of
+   * executeToolCall put on the call stays as it put it, on a foreground
+   * script's calls too (ToolCall.callerTurnId), and doesn't choose the turn
+   * that judges them.
    */
   private async runCodeExecution(agentName: string, call: ToolCall, startTurn: TurnRouting | null): Promise<ToolResult> {
     // RFC-007: what the script's own tool calls are attributed to. Read

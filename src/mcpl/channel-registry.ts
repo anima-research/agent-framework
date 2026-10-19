@@ -1760,8 +1760,8 @@ export class ChannelRegistry {
     const outgoing = turn ? turn.frozenLocus : home ?? active ?? fallback;
     // Incoming: the most recent inbound message that isn't a reaction,
     // reaction removal, edit or deletion marker, apart from an edit the
-    // coalescer delivers on acceptance as the agent's first view (what the
-    // agent is replying to).
+    // coalescer delivers on acceptance as the agent's first view: usually
+    // what the agent is replying to, unless another message arrived since.
     // Left process-global — per-channel inbound tracking (the right messageId for
     // a fork's own channel) is a separate concern from the outbound routing fix.
     const incoming = !turn?.privateTurn && fallback && this.defaultPublishMessageId
