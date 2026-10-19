@@ -1753,26 +1753,24 @@ export class ChannelRegistry {
     // message as the one it is replying to.
     const fallback = agentName !== undefined ? this.globalFallbackFor(agentName) : this.defaultPublishChannel;
     const outgoing = turn ? turn.frozenLocus : home ?? active ?? fallback;
-
-    if (openChannels.length === 0 && !outgoing) {
-      return undefined;
-    }
-
-    const context: ChannelContext = {};
-
     // Incoming: the most recent inbound message that isn't a reaction,
     // reaction removal, edit or deletion marker, apart from an edit the
     // coalescer delivers on acceptance as the agent's first view (what the
     // agent is replying to).
     // Left process-global — per-channel inbound tracking (the right messageId for
     // a fork's own channel) is a separate concern from the outbound routing fix.
-    if (!turn?.privateTurn && fallback && this.defaultPublishMessageId) {
-      context.incoming = {
-        channelId: fallback,
-        messageId: this.defaultPublishMessageId,
-        threadId: this.defaultPublishThreadId,
-      };
+    const incoming = !turn?.privateTurn && fallback && this.defaultPublishMessageId
+      ? { channelId: fallback, messageId: this.defaultPublishMessageId, threadId: this.defaultPublishThreadId }
+      : undefined;
+
+    // A real turn with no locus (explicit or disabled mode) still has the
+    // message it replies to.
+    if (openChannels.length === 0 && !outgoing && !incoming) {
+      return undefined;
     }
+
+    const context: ChannelContext = {};
+    if (incoming) context.incoming = incoming;
 
     // Default outgoing: the resolved outbound locus (home channel for forks),
     // unless its server declared it inbound-only: routeSpeech publishes nothing
