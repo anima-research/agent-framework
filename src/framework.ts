@@ -4229,14 +4229,15 @@ export class AgentFramework {
     if (this.ephemeralRuns.has(agent.name) || this.agents.get(agent.name) !== agent) return false;
     const existing = this.budgetHolds.get(agent.name);
     if (existing?.state === 'spent') return false;
-    // The refused start's own request is an ordinary cause now, whatever it
-    // was: its batches were assembled and their content stored before its
-    // compile (beginAgentTurn), so the turn is owed. Neither an empty later
-    // batch of its subject nor a cancellation of the subject withdraws it, as
-    // neither withdraws a turn already running. A start with no request of
-    // its own gets one.
+    // The refused start's own request is an ordinary cause: its batches were
+    // assembled and their content stored before its compile, and past the
+    // coalescing gate a start carries its trigger without a batch wake's marks
+    // (beginAgentTurn), so the turn is owed. Neither an empty later batch of
+    // its subject nor a cancellation of the subject withdraws it, as neither
+    // withdraws a turn already running. A start with no request of its own
+    // gets one.
     const own: InferenceRequest = trigger
-      ? { ...trigger, coalescingSubject: undefined, coalescingBatch: undefined, coalescingBatchSubjects: undefined }
+      ? { ...trigger }
       : { agentName: agent.name, reason: 'budget-hold-release', source: 'framework', timestamp: Date.now() };
     // One held turn is one undo step: the refused start's checkpoint goes,
     // with what recording it took back (the checkpoints it evicted, its turn
