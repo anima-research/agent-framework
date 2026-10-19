@@ -104,6 +104,8 @@ interface Backlog {
   /** The refusal's error name: OverBudgetError unless set. */
   refusalName?: string;
   previewError?: Error; dryRunGate?: Promise<void>; dryRunMs?: number; slowCompile?: { nth: number; ms: number };
+  /** The nth compile waits until this settles. */
+  compileGate?: { nth: number; until: Promise<void> };
 }
 const fits = (b: Backlog): boolean => b.fit || b.ticks >= b.fitAt;
 const pending = (b: Backlog): boolean => b.alwaysPending || (!fits(b) && b.ticks < b.readyAt);
@@ -144,6 +146,7 @@ async function withBacklog<T>(backlog: Partial<Backlog>, run: (b: Backlog) => Pr
     }
     b.compiles++;
     if (b.slowCompile?.nth === b.compiles) await new Promise((r) => setTimeout(r, b.slowCompile!.ms));
+    if (b.compileGate?.nth === b.compiles) await b.compileGate.until;
     if (!fits(b)) throw overBudget();
     if (b.refuseCompiles > 0) {
       b.refuseCompiles--;
@@ -1432,6 +1435,56 @@ describe('a compile refused for budget holds its turn (#304)', () => {
         assert.ok(await pollUntil(() => t.membrane.calls.length === 1, 3_000));
         assert.ok(!JSON.stringify(t.membrane.calls[0]).includes('[budget-hold]'), 'the later turn carries no note of the declined one\'s wait');
       } finally {
+        await t.close();
+      }
+    });
+  });
+
+  it('ends a released turn that a stop reaches before it sends anything: nothing of its hold reaches a later turn', async () => {
+    let open!: () => void;
+    const until = new Promise<void>((resolve) => { open = resolve; });
+    await withBacklog({ compileGate: { nth: 2, until } }, async (backlog) => {
+      // The released compile makes a stream (the mock counts it among its
+      // calls) that the stop keeps from being read; the later turn's is the
+      // second.
+      const t = await residentTurn({ maintenanceIntervalMs: 50, responses: 2 });
+      try {
+        t.send('Are you there?');
+        assert.ok(await pollUntil(() => t.of('inference:held').length === 1, 5_000));
+        backlog.fit = true;
+        assert.ok(await pollUntil(() => backlog.compiles === 2, 3_000), 'the hold released the turn into its compile');
+        assert.equal(t.framework.abortInference('prime'), true, 'a stop made while the released turn compiles is reported taken');
+        open();
+        assert.ok(await pollUntil(() => t.of('inference:aborted').length === 1, 3_000), 'the stop ended the turn at the check after its compile');
+        assert.equal(t.of('inference:completed').length, 0, 'the stopped turn completed nothing');
+        assert.equal(t.internal.budgetHolds.size, 0, 'the hold\'s record went with the turn');
+        t.send('A later turn');
+        assert.ok(await pollUntil(() => t.of('inference:completed').length === 1, 3_000), 'the later turn ran');
+        const later = t.membrane.calls[t.membrane.calls.length - 1];
+        assert.ok(!JSON.stringify(later).includes('[budget-hold]'), 'the later turn carries no note of the stopped one\'s wait');
+      } finally {
+        open();
+        await t.close();
+      }
+    });
+  });
+
+  it('ends a turn whose compile a stop reached, rather than holding it, when that compile is refused for budget', async () => {
+    let open!: () => void;
+    const until = new Promise<void>((resolve) => { open = resolve; });
+    await withBacklog({ compileGate: { nth: 1, until } }, async (backlog) => {
+      const t = await residentTurn({ maintenanceIntervalMs: 50 });
+      try {
+        t.send('Are you there?');
+        assert.ok(await pollUntil(() => backlog.compiles === 1, 5_000), 'the turn is in its compile');
+        assert.equal(t.framework.abortInference('prime'), true, 'a stop made while the turn compiles is reported taken');
+        open();
+        assert.ok(await pollUntil(() => t.of('inference:aborted').length === 1, 3_000), 'the stop ended the turn at its failure');
+        assert.equal(t.of('inference:held').length, 0, 'the refused turn was not held');
+        assert.equal(t.internal.budgetHolds.size, 0);
+        assert.equal(t.membrane.calls.length, 0, 'nothing was sent');
+      } finally {
+        open();
         await t.close();
       }
     });
