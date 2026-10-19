@@ -211,6 +211,9 @@ jobs:
           if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
             gh release edit "$GITHUB_REF_NAME" --notes-file notes.md
           else
+            # A 0.22 release is never the repository's newest, so it's
+            # created with --latest=false, which leaves GitHub's Latest on
+            # the newest line whatever GitHub would choose by default.
             gh release create "$GITHUB_REF_NAME" --title "$GITHUB_REF_NAME" \
-              --notes-file notes.md --verify-tag
+              --notes-file notes.md --verify-tag --latest=false
           fi
