@@ -42,9 +42,8 @@
   another branch while it's seeded by a switch the framework didn't make, or
   the template is missing or failed to re-initialize, is disposed rather than left to
   answer with no history: `context-reinit-failed` says so and why. If
-  disposing it fails partway, as when the store refuses to drop its turn
-  checkpoints, the alert says that too, and the move's other conversation
-  agents are still seeded. Its channel's next qualifying message spawns a
+  disposing it fails partway, the alert says that too, and the move's other
+  conversation agents are still seeded. Its channel's next qualifying message spawns a
   fresh one, unless its seeding
   fails again, and while the template is missing or refuses its work a
   spawn fails too, so the alert says what puts the template right first.
