@@ -6,7 +6,10 @@
   the provider for whatever compression it still had queued, though no turn
   would compile that context again. That compression is now withdrawn
   unsent, while a call already out runs to its answer, and what was stored
-  stays in the store. An ephemeral agent's compression is also withdrawn
-  under a surgery's hold and once `stop()` has begun, as a resident's and a
-  conversation agent's already were: before, it went on calling the
-  provider while `stop()` tore down.
+  stays in the store. On such a manager, `resetHeadWindow()` with no
+  transition text, which would ask the provider for one, now rejects with a
+  `MaintenanceWithdrawnError`, which extends context-manager's
+  `CompressionWithdrawn`; with text it works as before. An ephemeral agent's
+  compression is also withdrawn under a surgery's hold and once `stop()` has
+  begun, as a resident's and a conversation agent's already were: before, it
+  went on calling the provider while `stop()` tore down.
