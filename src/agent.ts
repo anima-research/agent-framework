@@ -3,6 +3,7 @@ import { isAbortedResponse } from '@animalabs/membrane';
 import { createHash } from 'node:crypto';
 import type { CacheWireReceipt, KvUnifiedRequestHooks } from './kv-unified-wire.js';
 import { ToolResultGuard } from './tool-result-guard.js';
+import { withoutTokenEstimates } from './thinking-token-stamp.js';
 import { assertBooleanSetting, holdsSettings } from './config-checks.js';
 import {
   indexSilentTickRows,
@@ -1088,8 +1089,11 @@ export class Agent {
     // notice.
     let unguardedResults: ReturnType<Agent['buildToolResultMessages']> | undefined;
     const assemble = async (): Promise<NormalizedRequest> => {
-      const { messages, systemInjections } = await this.toolResultGuard.afterAnnotations(
+      const compiled = await this.toolResultGuard.afterAnnotations(
         () => this.compileWithInjections(budget, injections));
+      const { systemInjections } = compiled;
+      // The framework's own pricing stamp never goes out (thinking-token-stamp.ts).
+      const messages = withoutTokenEstimates(compiled.messages);
       // Read once, after the first compile, since results may have become
       // ready while it ran; the refusal retry, assembled while the agent is
       // inferring, sends the same ones.
@@ -1285,6 +1289,8 @@ export class Agent {
         ),
       }))
       .filter((m) => m.content.length > 0);
+    // The framework's own pricing stamp never goes out (thinking-token-stamp.ts).
+    messages = withoutTokenEstimates(messages);
 
     // Silent heartbeat ticks store no prompt row. Render a request-only
     // separator before each tick's first surviving row so the wire formatter
