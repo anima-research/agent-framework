@@ -639,4 +639,109 @@ describe('surface batches at their edges, through the real scheduler', () => {
       await rig.close();
     }
   });
+
+  it("a private turn's refusal reacts in no channel", async () => {
+    const rig = await surfaceRig();
+    try {
+      const reactions: unknown[] = [];
+      const internalsOf = rig.framework as unknown as {
+        channelRegistry: Record<string, unknown>;
+        mcplServerRegistry: unknown;
+        routingOf(name: string): Record<string, unknown>;
+        reactToRefusal(agentName: string, category: string): Promise<void>;
+      };
+      Object.assign(internalsOf.channelRegistry, {
+        buildChannelContext: () => ({ incoming: { channelId: 'discord:g:room', messageId: 'm1' } }),
+        getChannelServerId: () => 'discord',
+      });
+      // No MCPL server is configured here: the stub stands in for the one
+      // that owns the channel, and is taken away before the framework stops.
+      const servers = internalsOf.mcplServerRegistry;
+      internalsOf.mcplServerRegistry = { getServer: () => ({ sendToolsCall: async (...args: unknown[]) => { reactions.push(args); } }) };
+      try {
+        await internalsOf.reactToRefusal('scout', 'refusal');
+        assert.equal(reactions.length, 1, 'control: a turn that is not private reacts');
+        internalsOf.routingOf('scout').nonChannelOrigin = true;
+        await internalsOf.reactToRefusal('scout', 'refusal');
+        assert.equal(reactions.length, 1, 'a private turn adds no reaction');
+      } finally {
+        internalsOf.mcplServerRegistry = servers;
+      }
+    } finally {
+      await rig.close();
+    }
+  });
+
+  it('a request a turn causes carries the turn\'s private origin, from the turn it names', async () => {
+    const rig = await surfaceRig();
+    try {
+      const internalsOf = rig.framework as unknown as {
+        routingOf(name: string): Record<string, unknown>;
+        derivedTurnRequest(agentName: string, reason: string, routing?: unknown): InferenceRequest;
+      };
+      const live = internalsOf.routingOf('scout');
+      assert.notEqual(internalsOf.derivedTurnRequest('scout', 'refusal-retry').nonChannelOrigin, true, 'control: the live turn is not private');
+      live.nonChannelOrigin = true;
+      for (const reason of ['refusal-retry', 'unstick-retry', 'inference-failure-rewind-retry', 'prose-continuation']) {
+        assert.equal(internalsOf.derivedTurnRequest('scout', reason).nonChannelOrigin, true, reason);
+      }
+      // A cause named explicitly wins over the live turn, as a bounce names the
+      // turn its envelope came from.
+      assert.notEqual(internalsOf.derivedTurnRequest('scout', 'prose-bounce', { nonChannelOrigin: false }).nonChannelOrigin, true);
+    } finally {
+      await rig.close();
+    }
+  });
+
+  it("a private turn's round speech stays on its surface and is counted as kept private", async () => {
+    const tools = {
+      name: 'robot',
+      async start() {}, async stop() {},
+      getTools: () => [{ name: 'move', description: 'Move', inputSchema: { type: 'object', properties: {} } }],
+      async handleToolCall() { return { success: true, data: 'moved' }; },
+      async onProcess() { return {}; },
+    } as unknown as Module;
+    const rig = await surfaceRig({ modules: [tools] });
+    try {
+      // One stream: a round that speaks and calls a tool, then a reply.
+      rig.membrane.pushResponse(createMockResponse([
+        { type: 'text', text: 'on my way' },
+        { type: 'tool_use', id: 'm1', name: 'robot--move', input: {} },
+      ] as never, 'tool_use'));
+      rig.membrane.pushResponse(createMockResponse([{ type: 'text', text: 'done' }]));
+      rig.framework.pushEvent(tuiMessage());
+      await rig.until(() => rig.starts.length >= 1, 'the private turn');
+      await rig.framework.runUntilIdle();
+      assert.deepEqual(rig.routed, [], 'nothing is routed');
+      const texts = (rig.framework.getAgent('scout')!.getContextManager().getAllMessages() as Array<{ content: Array<{ type: string; text?: string }> }>)
+        .flatMap((m) => m.content).filter((b) => b.type === 'text').map((b) => b.text ?? '');
+      assert.ok(texts.some((t) => t.startsWith('[delivered]') && t.includes('2 plain-speech segment(s) kept private (non-channel turn')), JSON.stringify(texts));
+    } finally {
+      await rig.close();
+    }
+  });
+
+  it("a private turn's text-only reply counts each segment it kept on its surface", async () => {
+    const rig = await surfaceRig();
+    try {
+      // Two runs of text, split by an all-refused XML round (a tool attempt
+      // answered in-band by its notice): two segments, though nothing was
+      // called.
+      rig.membrane.pushResponse(createMockResponse([
+        { type: 'text', text: 'first part' },
+        { type: 'tool_attempt', rawXml: '<invoke name="read">' },
+        { type: 'tool_notice', notices: [{ ordinal: 0, kind: 'refused', message: 'boundary' }] },
+        { type: 'text', text: 'second part' },
+      ] as never));
+      rig.framework.pushEvent(tuiMessage());
+      await rig.until(() => rig.starts.length >= 1, 'the private turn');
+      await rig.framework.runUntilIdle();
+      assert.deepEqual(rig.routed, [], 'nothing is routed');
+      const texts = (rig.framework.getAgent('scout')!.getContextManager().getAllMessages() as Array<{ content: Array<{ type: string; text?: string }> }>)
+        .flatMap((m) => m.content).filter((b) => b.type === 'text').map((b) => b.text ?? '');
+      assert.ok(texts.some((t) => t.startsWith('[delivered]') && t.includes('2 plain-speech segment(s) kept private (non-channel turn')), JSON.stringify(texts));
+    } finally {
+      await rig.close();
+    }
+  });
 });

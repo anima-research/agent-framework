@@ -2383,6 +2383,75 @@ describe('explicit prose routing', () => {
     });
   }
 
+  it('a deliberate envelope is delivered alike in a private turn and a channel one; only hybrid\'s unprefixed prose differs', async () => {
+    // The trigger kinds: this file's own channel-less trigger, a private
+    // surface's, and the same message with a channel.
+    const cases: Array<{ mode: 'explicit' | 'hybrid'; text: string; channel: unknown[]; private: unknown[] }> = [
+      { mode: 'explicit', text: '>>#cafe A message meant for the café.',
+        channel: [{ text: 'A message meant for the café.', locus: 'discord:g:cafe' }],
+        private: [{ text: 'A message meant for the café.', locus: 'discord:g:cafe' }] },
+      { mode: 'hybrid', text: '>>>#cafe\nA message meant for the café.',
+        channel: [{ text: 'A message meant for the café.', locus: 'discord:g:cafe' }],
+        private: [{ text: 'A message meant for the café.', locus: 'discord:g:cafe' }] },
+      { mode: 'hybrid', text: 'Ordinary field speech.',
+        channel: [{ text: 'Ordinary field speech.', locus: 'world:commons' }],
+        private: [] },
+    ];
+    let n = 0;
+    for (const c of cases) {
+      for (const kind of ['private', 'channel'] as const) {
+        const local = new MockMembrane();
+        local.pushResponse(createMockResponse([{ type: 'text', text: c.text }] as ContentBlock[]));
+        const framework = await AgentFramework.create({
+          storePath: join(tempDir, `kinds-${++n}.chronicle`), membrane: local.asMembrane(),
+          agents: [{ name: 'assistant', model: 'test-model', systemPrompt: 'You are a test agent.', proseRouting: c.mode }],
+          modules: [new ToolboxModule()],
+        });
+        const routed = stubRegistry(framework);
+        framework.pushEvent({
+          type: 'external-message', source: 'test', content: 'go',
+          metadata: kind === 'channel' ? { channelId: 'world:commons' } : {},
+        } as unknown as ProcessEvent);
+        await framework.runUntilIdle();
+        assert.deepEqual(routed, c[kind], `${c.mode}, ${kind} turn: ${JSON.stringify(c.text)}`);
+        await framework.stop();
+      }
+    }
+  });
+
+  it("a late bounce wakes a turn of its own turn's kind, not of the turn live when it lands", async () => {
+    await withHeldHybridCallback('>>>#nowhere Where does this go?', async ({ framework, earlier, next, pending, release }) => {
+      // The bouncing envelope is the earlier turn's, a private one; the live
+      // turn, when its delivery runs, is a channel's.
+      (earlier as RoutingState & { nonChannelOrigin?: boolean }).nonChannelOrigin = true;
+      (next as RoutingState & { nonChannelOrigin?: boolean }).nonChannelOrigin = false;
+      const queued = (framework as unknown as { pendingRequests: Array<{ reason: string; nonChannelOrigin?: boolean }> }).pendingRequests;
+      release();
+      await within(pending, 'the late envelope');
+      const bounce = queued.find((r) => r.reason === 'prose-bounce');
+      assert.ok(bounce, `the bounce wakes the agent: ${JSON.stringify(queued)}`);
+      assert.equal(bounce!.nonChannelOrigin, true, "the wake carries the bouncing turn's private origin");
+    });
+  });
+
+  it("a private turn's bounce wakes a private turn", async () => {
+    membrane.pushResponse(createMockResponse([{ type: 'text', text: '>>#nowhere Where does this go?' }] as ContentBlock[]));
+    const framework = await createFramework('explicit');
+    stubRegistry(framework);
+    const starts: Array<{ reason: string; nonChannelOrigin?: boolean }> = [];
+    const internals = framework as unknown as { startAgentStream(agent: unknown, trigger?: { reason: string; nonChannelOrigin?: boolean }): Promise<void> };
+    const start = internals.startAgentStream.bind(framework);
+    internals.startAgentStream = async (agent, trigger) => { if (trigger) starts.push(trigger); return start(agent, trigger); };
+    feedTurn(framework, 2, []);
+    trigger(framework);
+    await framework.runUntilIdle();
+    assert.deepEqual(starts.map((s) => [s.reason, s.nonChannelOrigin === true]), [
+      ['external-message', true],
+      ['prose-bounce', true],
+    ], 'the bounce wake carries the bouncing turn\'s private origin');
+    await framework.stop();
+  });
+
   it('hybrid leaves unprefixed prose on the frozen locus', async () => {
     membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Ordinary field speech.' }] as ContentBlock[]));
     const framework = await createFramework('hybrid');
