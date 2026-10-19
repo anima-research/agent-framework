@@ -144,6 +144,26 @@ test('a send that posts takes its own turn\'s thoughts', async () => {
   assert.deepEqual(s.edits, ['M1: ||why||\nfirst']);
 });
 
+test("a private surface's turn posts no speech and edits its thoughts into no message", async () => {
+  for (const privateTurn of [true, false]) {
+    const s = setup();
+    const client = (s.module as unknown as { client: { sendMessage(...args: unknown[]): Promise<unknown> } }).client;
+    const sent: unknown[] = [];
+    const sendMessage = client.sendMessage.bind(client);
+    // The turn sent a message deliberately.
+    await s.send('A', 1, 'first');
+    client.sendMessage = async (...args: unknown[]) => { sent.push(args); return sendMessage(...args); };
+    await s.module.onAgentSpeech('A', [{ type: 'text', text: 'the reply' }], { ...ends(1), ...(privateTurn ? { nonChannelOrigin: true } : {}) });
+    if (privateTurn) {
+      assert.deepEqual(s.edits, [], 'its thoughts stay on its surface');
+      assert.deepEqual(sent, [], 'and so does its speech');
+    } else {
+      assert.deepEqual(s.edits, ['M1: ||why||\nfirst'], "control: a channel's turn takes its thoughts");
+      assert.equal(sent.length, 1, 'and posts its speech');
+    }
+  }
+});
+
 test('a reply that posts takes its own turn\'s thoughts', async () => {
   const s = setup();
   assert.equal((await s.tool('A', 1, 'reply', { content: 'first' })).success, true);

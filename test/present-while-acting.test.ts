@@ -2122,7 +2122,7 @@ describe('present while acting', () => {
       ({ success: true, data: { channelId: 'discord:guild:observatory', opened: true } });
     const agent = framework.getAgent('assistant')!;
     const internals = framework as unknown as {
-      turnRouting: Map<string, { locus?: string; nonChannelOrigin: boolean }>;
+      turnRouting: Map<string, { locus?: string; triggerChannel?: string; nonChannelOrigin: boolean }>;
       pushEvent(event: unknown): void;
     };
     const pushed: unknown[] = [];
@@ -2135,6 +2135,7 @@ describe('present while acting', () => {
     await framework.runUntilIdle();
     assert.deepEqual(routed, []);
     assert.equal(internals.turnRouting.get('assistant')?.locus, undefined);
+    assert.equal(internals.turnRouting.get('assistant')?.triggerChannel, undefined, "the opened channel isn't the private turn's trigger channel");
     assert.equal(internals.turnRouting.get('assistant')?.nonChannelOrigin, true);
     assert.ok(JSON.stringify(pushed).includes('plain speech stays private'));
     await framework.stop();

@@ -83,3 +83,23 @@ for (const end of turnEnds) {
     }
   });
 }
+
+test("a private surface's turn shows no typing", async () => {
+  mock.timers.enable({ apis: ['setInterval'] });
+  try {
+    const { module, emit, typings } = await startModule();
+    try {
+      emit({ type: 'inference:started', agentName, nonChannelOrigin: true, timestamp: 0 });
+      mock.timers.tick(REFRESH_MS * 2);
+      assert.equal(typings(), 0, 'its activity stays on its surface');
+      emit({ type: 'inference:turn_ended', agentName, timestamp: 0 });
+      // Control: a channel's turn shows it.
+      emit({ type: 'inference:started', agentName, timestamp: 0 });
+      assert.equal(typings(), 1);
+    } finally {
+      await module.stop();
+    }
+  } finally {
+    mock.timers.reset();
+  }
+});

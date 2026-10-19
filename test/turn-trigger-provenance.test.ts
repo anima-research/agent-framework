@@ -336,7 +336,7 @@ const roomMessage = (addressed: boolean, content = 'room message') => ({
  *  records routed speech and resolves a turn's locus to its trigger channel,
  *  as the real registry's active-channel resolution does. */
 async function surfaceRig(opts: {
-  gate?: unknown; maxStreamTokens?: number; modules?: Module[];
+  gate?: unknown; maxStreamTokens?: number; modules?: Module[]; agent?: Record<string, unknown>;
 } = {}) {
   const tempDir = mkdtempSync(join(tmpdir(), 'surface-edges-test-'));
   const membrane = new MockMembrane();
@@ -354,6 +354,7 @@ async function surfaceRig(opts: {
     agents: [{
       name: 'scout', model: 'test-model', systemPrompt: 'scout',
       ...(opts.maxStreamTokens !== undefined ? { maxStreamTokens: opts.maxStreamTokens } : {}),
+      ...opts.agent,
     }],
     modules: [new SurfaceModule(), ...(opts.modules ?? [])],
     ...(opts.gate ? { gate: opts.gate } : {}),
@@ -984,6 +985,111 @@ describe("the scheduler's split, and a private turn's other paths", () => {
       rig.state.openLogical.delete('scout');
       const after = await internalsOf.executeToolCall({ id: 'p4', name: 'channel_publish', input: { content: 'hello' }, callerAgentName: 'scout' });
       assert.equal(after.success, true, JSON.stringify(after));
+    } finally {
+      await rig.close();
+    }
+  });
+
+  it("a private turn's speech reaches modules marked private", async () => {
+    const heard: Array<{ nonChannelOrigin?: boolean }> = [];
+    const listener = {
+      name: 'listener',
+      async start(ctx: { registerSpeechHandler(name: string, options?: unknown): void }) { ctx.registerSpeechHandler('*', { additive: true }); },
+      async stop() {},
+      getTools: () => [],
+      async handleToolCall() { return { success: false }; },
+      async onProcess() { return {}; },
+      async onAgentSpeech(_agent: string, _content: unknown, context: { nonChannelOrigin?: boolean }) { heard.push(context); },
+    } as unknown as Module;
+    const rig = await surfaceRig({ modules: [listener] });
+    try {
+      rig.framework.pushEvent(tuiMessage());
+      await rig.until(() => heard.length >= 1, 'the speech');
+      rig.framework.pushEvent(roomMessage(true));
+      await rig.until(() => heard.length >= 2, "the room's speech");
+      await rig.framework.runUntilIdle();
+      assert.equal(heard[0]!.nonChannelOrigin, true);
+      assert.notEqual(heard[1]!.nonChannelOrigin, true);
+    } finally {
+      await rig.close();
+    }
+  });
+
+  it("a private turn's inference:started is marked private for trace listeners", async () => {
+    const started: Array<{ nonChannelOrigin?: boolean }> = [];
+    const listener = {
+      name: 'tracer',
+      async start(ctx: { onTrace(listener: (event: { type: string; nonChannelOrigin?: boolean }) => void): () => void }) {
+        ctx.onTrace((event) => { if (event.type === 'inference:started') started.push(event); });
+      },
+      async stop() {},
+      getTools: () => [],
+      async handleToolCall() { return { success: false }; },
+      async onProcess() { return {}; },
+    } as unknown as Module;
+    const rig = await surfaceRig({ modules: [listener] });
+    try {
+      rig.framework.pushEvent(tuiMessage());
+      await rig.until(() => started.length >= 1, 'the private turn');
+      await rig.framework.runUntilIdle();
+      rig.framework.pushEvent(roomMessage(true));
+      await rig.until(() => started.length >= 2, "the room's turn");
+      await rig.framework.runUntilIdle();
+      assert.equal(started[0]!.nonChannelOrigin, true);
+      assert.equal(started[1]!.nonChannelOrigin, undefined);
+    } finally {
+      await rig.close();
+    }
+  });
+
+  it("a private turn's refusal rewind retries privately, and its record names no channel", async () => {
+    const rig = await surfaceRig({ agent: { refusalHandling: { autoRewind: true, maxRewinds: 1 } } });
+    try {
+      const records: Array<Record<string, unknown>> = [];
+      const internalsOf = rig.framework as unknown as { logFailure(record: Record<string, unknown>): void; channelRegistry: Record<string, unknown> };
+      internalsOf.logFailure = (record) => { records.push(record); };
+      internalsOf.channelRegistry.buildChannelContext = () => ({ incoming: { channelId: ROOM, messageId: 'm1' } });
+      rig.membrane.pushResponse(createMockResponse([], 'refusal'));
+      rig.framework.pushEvent(tuiMessage());
+      await rig.until(() => rig.starts.length >= 2, 'the turn and its rewind\'s retry');
+      await rig.framework.runUntilIdle();
+      assert.equal(rig.starts[1]!.reason, 'refusal-rewind-retry', JSON.stringify(rig.starts));
+      assert.ok(privateStart(rig.starts[1]!), 'the retry stays private');
+      const refusal = records.find((r) => r.kind === 'refusal');
+      assert.ok(refusal, JSON.stringify(records));
+      assert.equal(refusal!.locus, null, 'a private turn has no incoming channel to name');
+      assert.deepEqual(rig.routed, []);
+    } finally {
+      await rig.close();
+    }
+  });
+
+  it("a private turn's same-round private think keeps its words as the resident's own choice", async () => {
+    const robot = {
+      name: 'robot',
+      async start() {}, async stop() {},
+      getTools: () => [{ name: 'move', description: 'Move', inputSchema: { type: 'object', properties: {} } }],
+      async handleToolCall() { return { success: true, data: 'moved' }; },
+      async onProcess() { return {}; },
+    } as unknown as Module;
+    const rig = await surfaceRig({ modules: [robot], agent: { sameRoundThinkTextPolicy: 'private' } });
+    try {
+      // think is a channel tool the registry answers.
+      (rig.state.channelRegistry as Record<string, unknown>).handleChannelToolCall = async () => ({ success: true, data: {} });
+      rig.membrane.pushResponse(createMockResponse([
+        { type: 'text', text: 'thinking aloud' },
+        { type: 'tool_use', id: 't1', name: 'think', input: { thought: 'quietly' } },
+        { type: 'tool_use', id: 'm1', name: 'robot--move', input: {} },
+      ] as never, 'tool_use'));
+      rig.membrane.pushResponse(createMockResponse([{ type: 'text', text: 'done' }]));
+      rig.framework.pushEvent(tuiMessage());
+      await rig.until(() => rig.starts.length >= 1, 'the private turn');
+      await rig.framework.runUntilIdle();
+      const texts = (rig.framework.getAgent('scout')!.getContextManager().getAllMessages() as Array<{ content: Array<{ type: string; text?: string }> }>)
+        .flatMap((m) => m.content).filter((b) => b.type === 'text').map((b) => b.text ?? '');
+      const receipt = texts.find((t) => t.startsWith('[delivered]')) ?? '';
+      assert.match(receipt, /1 plain-speech segment\(s\) kept private \(skip_reply or a private think\)/, receipt);
+      assert.match(receipt, /1 plain-speech segment\(s\) kept private \(non-channel turn/, receipt);
     } finally {
       await rig.close();
     }

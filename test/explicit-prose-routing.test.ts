@@ -1323,6 +1323,41 @@ describe('explicit prose routing', () => {
     });
   });
 
+  it("the non-streaming fallback's re-inference keeps its private turn's privacy, though no turn is open any more", async () => {
+    const framework = await createFramework('hybrid');
+    stubRegistry(framework);
+    const agent = framework.getAgent('assistant')!;
+    const internals = framework as unknown as {
+      routingOf(name: string): { nonChannelOrigin?: boolean };
+      openLogical: Map<string, unknown>;
+      pendingRequests: InferenceRequest[];
+      handleProcessEvent(event: ProcessEvent): Promise<void>;
+    };
+    // A private turn ran the tools, and is no longer open, as after a stop()
+    // and start on this instance.
+    internals.routingOf('assistant').nonChannelOrigin = true;
+    internals.openLogical.delete('assistant');
+    const response = createMockResponse([
+      { type: 'tool_use', id: 'unstreamed-private', name: 'robot--move', input: { dir: 'north' } },
+    ] as ContentBlock[], 'tool_use');
+    (membrane as unknown as { stream: () => Promise<typeof response> }).stream = async () => response;
+    try {
+      agent.getContextManager().addMessage('user', [{ type: 'text', text: 'Take the direct inference path.' }]);
+      await agent.runInference(framework.getAllTools());
+      assert.equal(agent.state.status, 'waiting_for_tools');
+      agent.addAssistantResponse(response.content);
+      await internals.handleProcessEvent({
+        type: 'tool-result', source: 'robot', moduleName: 'robot', agentName: 'assistant', callId: 'unstreamed-private',
+        result: { success: true, data: { ok: true } },
+      } as ProcessEvent);
+      const ready = internals.pendingRequests.find((r) => r.reason === 'tool_results_ready');
+      assert.ok(ready, 'control: the fallback scheduled the re-inference');
+      assert.equal(ready!.nonChannelOrigin, true, "it opens a private turn for the private turn's results");
+    } finally {
+      await framework.stop();
+    }
+  });
+
   it("the non-streaming fallback leaves the scheduling turn's logical turn open for the re-inference", async () => {
     // Adapted from a reviewer's producer test: the agent's direct inference
     // API leaves tools pending with no yielding stream, and the tool result

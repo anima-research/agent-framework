@@ -11664,7 +11664,10 @@ export class AgentFramework {
           } else {
             // Non-streaming fallback: schedule re-inference, which continues
             // this stream's logical turn (openLogical), so it carries the
-            // turn's properties, as the budget restart does.
+            // turn's properties, as the budget restart does. Its privacy is
+            // the turn's own, so a re-inference that finds no open turn, as
+            // after a stop() and start, opens a private one for a private
+            // turn's results.
             this.pendingRequests.push({
               agentName: agent.name,
               reason: 'tool_results_ready',
@@ -11672,6 +11675,7 @@ export class AgentFramework {
               timestamp: Date.now(),
               suppressProse: this.activeTurnTriggers.get(agent.name)?.suppressProse,
               silentHeartbeat: this.activeTurnTriggers.get(agent.name)?.silentHeartbeat,
+              ...(this.turnRouting?.get(agent.name)?.nonChannelOrigin ? { nonChannelOrigin: true } : {}),
             });
           }
         }
@@ -13949,9 +13953,9 @@ export class AgentFramework {
    * from keptPrivate, which is the resident's own choice, where this is the
    * surface's rule.
    */
-  private suppressPrivateTurnProse(routing: TurnRouting, count: number): void {
+  private suppressPrivateTurnProse(agentName: string, routing: TurnRouting, count: number): void {
     if (count <= 0) return;
-    console.error('[routing] prose NOT auto-published (private non-channel turn)');
+    console.error(`[routing] ${agentName}: ${count} prose segment(s) NOT auto-published (private non-channel turn)`);
     routing.privateSuppressed += count;
   }
 
@@ -13994,7 +13998,7 @@ export class AgentFramework {
     // drafted (suppressPrivateTurnProse).
     if (agent.proseRouting !== 'hybrid') {
       if (routing.nonChannelOrigin) {
-        this.suppressPrivateTurnProse(routing, segments.length);
+        this.suppressPrivateTurnProse(agent.name, routing, segments.length);
         return;
       }
       this.holdProseDrafts(agent, segments, 'explicit-send', round);
@@ -14062,7 +14066,7 @@ export class AgentFramework {
       }
     }
     routing.keptPrivate += privateCount;
-    this.suppressPrivateTurnProse(routing, surfaceCount);
+    this.suppressPrivateTurnProse(agent.name, routing, surfaceCount);
     this.holdProseDrafts(agent, parts, 'explicit-send', round);
     // The turn's receipt names them by their state at turn end; each was
     // named when it bounced.
@@ -15470,7 +15474,7 @@ export class AgentFramework {
       }
       const sticky = routing.pin;
       if (!allowLocus && !sticky) {
-        this.suppressPrivateTurnProse(routing, 1);
+        this.suppressPrivateTurnProse(agent.name, routing, 1);
         continue;
       }
       const target = sticky ?? locus;
@@ -16368,6 +16372,7 @@ export class AgentFramework {
       // The turn's locus, kept across a start that continues the turn.
       channelId: turnLocus,
       ...(trigger?.suppressProse ? { silent: true } : {}),
+      ...(routing.nonChannelOrigin ? { nonChannelOrigin: true } : {}),
     });
     // A budget restart continues the same logical inference window. The
     // predecessor keeps EventGate liveness until its successor terminates,
@@ -17451,15 +17456,21 @@ export class AgentFramework {
                     chainSpeech(() => this.deliverAdmittedProse(agent, envelopes, { ...holdOpts, keepPrivate }), 'mid-turn prose delivery failed:');
                   }
                 }
-              } else if (streamRouting.nonChannelOrigin) {
-                this.suppressPrivateTurnProse(streamRouting, roundSegments.length);
               } else if (turnSilenced) {
                 console.error(
                   `[routing] ${agent.name}: mid-turn round [${toolNames.join(', ')}] -> prose NOT routed (turn silenced: ${silenceCause})`,
                 );
                 // Never a silent black hole (n=8: the flying-scene reply):
-                // held as drafts the resident can resend, and named.
+                // held as drafts the resident can resend, and named. A
+                // private turn's are counted as kept private instead, the
+                // resident's own choice (skip_reply, a private think) first.
                 this.holdSilencedProse(agent, roundRuns, silenceCause, hasSameRoundPrivateThink, holdOpts);
+              } else if (streamRouting.nonChannelOrigin) {
+                // The resident's own private think keeps the round's words
+                // (keptPrivate), as in a silenced round; otherwise the
+                // surface's rule does.
+                if (hasSameRoundPrivateThink) streamRouting.keptPrivate += roundSegments.length;
+                else this.suppressPrivateTurnProse(agent.name, streamRouting, roundSegments.length);
               } else if (hasSameRoundPrivateThink) {
                 console.error(
                   `[routing] ${agent.name}: mid-turn round [${toolNames.join(', ')}] -> prose NOT routed (same_round_think_text_policy=private)`,
@@ -17936,6 +17947,7 @@ export class AgentFramework {
                 },
                 thoughts: thoughts.length > 0 ? thoughts : undefined,
                 turnId: streamRouting.turnId,
+                ...(streamRouting.nonChannelOrigin ? { nonChannelOrigin: true } : {}),
               };
               await this.moduleRegistry.dispatchSpeech(
                 agent.name,
@@ -17996,7 +18008,7 @@ export class AgentFramework {
                     }
                   }
                 } else if (streamRouting.nonChannelOrigin) {
-                  this.suppressPrivateTurnProse(streamRouting, speechSegments.length);
+                  this.suppressPrivateTurnProse(agent.name, streamRouting, speechSegments.length);
                 } else {
                   // Route to the TURN-FROZEN locus, like every other speech
                   // path. This dispatch runs AFTER the agent is idle, so a live
@@ -18088,7 +18100,7 @@ export class AgentFramework {
                   }
                 }
               } else if (streamRouting.nonChannelOrigin) {
-                this.suppressPrivateTurnProse(streamRouting, segments.length);
+                this.suppressPrivateTurnProse(agent.name, streamRouting, segments.length);
               } else if (silenced || segments.length === 0) {
                 console.error(
                   `[routing] ${agent.name}: tool-call turn [${toolNames.join(', ') || 'none'}] -> trailing prose NOT routed ` +
@@ -21935,8 +21947,12 @@ export class AgentFramework {
       kind: 'refusal',
       category,
       streak,
-      // The refused agent's own view: a subagent's refusal names no channel.
-      locus: this.channelRegistry?.buildChannelContext(agentName)?.incoming?.channelId ?? null,
+      // The refused agent's own view: a subagent's refusal names no channel,
+      // and nor does a private non-channel turn's, which has no incoming
+      // channel (as reactToRefusal reads it).
+      locus: this.turnRouting?.get(agentName)?.nonChannelOrigin === true
+        ? null
+        : this.channelRegistry?.buildChannelContext(agentName)?.incoming?.channelId ?? null,
       tokens: tokens ?? null,
     });
     if (streak >= 2) {
@@ -25925,17 +25941,20 @@ export class AgentFramework {
         // distance zero, the safest role there is — instead of a separate
         // window notice. lastAnnouncedLocus tracks it so announce-on-change
         // stays coherent. Locus-mode agents only: explicit mode has no pin.
+        // A private non-channel turn is the exception: its open moves
+        // nothing (below).
         if (call.name === 'channel_open' && result?.success) {
           const opened =
             (result.data as { channelId?: string } | undefined)?.channelId
             ?? (call.input as { channelId?: string } | undefined)?.channelId;
           if (opened) {
-            callingTurn.triggerChannel = opened;
-            const openerAgent = this.agents.get(agentName);
             // Only the turn that called may move its own locus. A private
             // non-channel turn may open for incoming traffic, but its prose
-            // stays private; explicit publish remains available.
+            // stays private, and the channel isn't its trigger channel
+            // either; explicit publish remains available.
             const privateTurn = callingTurn.nonChannelOrigin;
+            if (!privateTurn) callingTurn.triggerChannel = opened;
+            const openerAgent = this.agents.get(agentName);
             if (openerAgent
               && (openerAgent.proseRouting === 'locus' || openerAgent.proseRouting === 'hybrid')
               && this.openLogical.get(agentName) === callingTurn) {
