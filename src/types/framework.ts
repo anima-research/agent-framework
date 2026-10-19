@@ -33,7 +33,9 @@ export interface ProcessLoggingConfig {
  * Client-side programmatic tool calling: a synthesized `code_execution` tool
  * that runs model-authored Python on the host, with every framework tool
  * injected as an async function. Mirrors the trained surface of Anthropic's
- * server-side PTC; inner tool results never enter the model context.
+ * server-side PTC; inner tool results never enter the model context, except
+ * the start of an answer that came after its call's code stopped waiting,
+ * which the result's line naming the calls quotes.
  *
  * Robustness boundary, not a security sandbox (same doctrine as gate.js —
  * the agent already has broader host access through its tools).

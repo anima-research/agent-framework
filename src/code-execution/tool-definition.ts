@@ -47,13 +47,14 @@ export function buildCodeExecutionToolDefinition(opts?: {
       'JSON object above, or None). ' +
       "An exact-name lookup dict is also available: tools['mcpl--discord--fetch_history']({...}). " +
       'Use top-level await; run independent calls in parallel with asyncio.gather. ' +
-      'Only what the script and the commands it runs print (stdout and stderr), and the exit code, come back ' +
-      'to you — intermediate tool results stay in the script, so filter or aggregate large data there and ' +
-      'print only what you need. Interpreter state (variables, imports) persists across code_execution ' +
-      `calls but is reclaimed after ~${idleMinutes} minutes idle. Relative paths resolve in a ` +
+      'Only how the script ended, what it and the commands it runs print (stdout and stderr), and a line naming ' +
+      'the tool calls that timed out or were cancelled in it, or were still running when it ended, come back to you; ' +
+      'other tool results stay in the script, so filter or aggregate large data there and print only what you need. ' +
+      'Interpreter state (variables, imports) persists ' +
+      `across code_execution calls but is reclaimed after ~${idleMinutes} minutes idle. Relative paths resolve in a ` +
       'scratch directory of the interpreter\'s, which goes whenever it stops or is reclaimed, so a file meant to ' +
       'outlast the interpreter needs an absolute path. A tool call that receives no ' +
-      `response within ~${callTimeoutSeconds}s raises TimeoutError inside the script. ` +
+      `response within ~${callTimeoutSeconds}s raises TimeoutError inside the script, though the call was sent and may still take effect. ` +
       `A foreground script is stopped after ${formatLimit(limits.defaultMs)}; pass time_limit_ms to set this call's limit ` +
       `(at most ${formatLimit(limits.maxMs)}; a background script runs up to ${formatLimit(limits.backgroundMaxMs)}). ` +
       'Stopping a script does not stop tools it already called. ' +

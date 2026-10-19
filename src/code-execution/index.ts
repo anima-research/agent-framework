@@ -5,13 +5,17 @@
  * (code_execution tool + tools exposed as async python functions), but runs
  * the interpreter on the host and dispatches inner tool calls in-process
  * through the framework's own tool routing — intermediate results never
- * enter the model's context; the full trace stays on-box.
+ * enter the model's context, except the start of an answer that came after
+ * its call's code stopped waiting, which the result's line quotes (callsLine);
+ * the full trace stays on-box.
  */
 
 export { PyRunner, buildInjectedTools } from './py-runner.js';
 export type {
   InjectedTool,
   ExecResult,
+  ScriptCalls,
+  UncertainCall,
   PyRunnerOptions,
   ScriptToolCallHandler,
   ScriptToolResult,

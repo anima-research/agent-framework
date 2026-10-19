@@ -1,0 +1,1 @@
+- A foreground `code_execution` result's opening lines now hold the runner's own words on how the script ended, such as why it stopped the script or why the script didn't run, after the exit code and the time-limit note, and the stderr the model reads goes without them, so they're said once.

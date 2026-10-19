@@ -132,7 +132,7 @@ import {
   type ShownRanges,
 } from './tool-image-ledger.js';
 import { randomUUID, createHash } from 'node:crypto';
-import { PyRunner, buildInjectedTools, formatLimit, type ScriptToolResult } from './code-execution/py-runner.js';
+import { PyRunner, buildInjectedTools, callsLine, formatLimit, scriptStderr, type ScriptToolResult } from './code-execution/py-runner.js';
 import { scriptToolNames } from './code-execution/script-tool-names.js';
 import { scriptEndText, scriptEndTextWithin, type ScriptEnd } from './code-execution/result-text.js';
 import {
@@ -1833,6 +1833,8 @@ interface BackgroundScriptRecord {
   status: 'running' | 'finished' | 'died' | 'cancelled';
   /** Set when cancel/dispose already settled this script (suppresses wakes). */
   cancelled: boolean;
+  /** Its exec, which a cancel waits for to say which tool calls it left running. */
+  ended?: Promise<import('./code-execution/py-runner.js').ExecResult>;
 }
 
 interface EphemeralRun {
@@ -19324,7 +19326,9 @@ export class AgentFramework {
    * itself). Inner tool calls are dispatched through dispatchToolCall — the
    * exact model path, including MCPL state/checkpoint handling, channel
    * routing, and traces — and resolved via scriptToolWaiters, so their
-   * results reach the running script and never the model context.
+   * results reach the running script and never the model context, except
+   * the start of an answer that came after its call's code stopped waiting,
+   * which the result's line naming the calls quotes (callsLine).
    */
   private async runCodeExecution(agentName: string, call: ToolCall): Promise<ToolResult> {
     // RFC-007: what the script's own tool calls are attributed to. Read
@@ -19363,15 +19367,23 @@ export class AgentFramework {
       if (!record || record.agentName !== agentName) {
         return { success: false, error: `no background script '${input.script_id}'`, isError: true };
       }
+      // The agent stopped the script, so its result says which tool calls
+      // the stop left running: they may still take effect.
+      let toolCalls: string | null = null;
       if (record.status === 'running') {
         record.cancelled = true;
         record.status = 'cancelled';
         record.runner.abort('cancelled by agent');
         record.runner.dispose();
+        // The abort settles the exec at once.
+        toolCalls = record.ended ? callsLine(await record.ended) : null;
       }
       return {
         success: true,
-        data: { script_id: record.id, status: record.status, log: record.logPath },
+        data: {
+          ...(toolCalls ? { tool_calls: toolCalls } : {}),
+          script_id: record.id, status: record.status, log: record.logPath,
+        },
       };
     }
     if (input.action !== undefined && input.action !== 'run') {
@@ -19453,15 +19465,25 @@ export class AgentFramework {
       const earlier = mark?.interpreter === interpreter ? mark.names : [];
       this.scriptRoutingInterpreters.set(agentName, { interpreter, names: new Set([...earlier, ...reachable]) });
     }
+    const toolCalls = callsLine(exec);
 
     // The model reads how the script ended as text, its ending first, within
     // the bound its caller reads whole: the one the call carries, as an
     // in-process caller may set it, or else the one the framework gives the
     // calls it dispatches (resultMaxCharsFor), the agent's inline cap. Hosts
-    // read the fields in `structured`.
+    // read the fields in `structured`. The runner's own words are in the
+    // heading, so the text's stderr goes without them (scriptStderr) and says
+    // them once; `structured` keeps stderr as hosts get it.
     const cap = call.resultMaxChars ?? this.resultMaxCharsFor(agentName, call.id);
     const text = await this.scriptEndResultText(
-      { stdout: exec.stdout, stderr: exec.stderr, returnCode: exec.returnCode, ...(capNote ? { timeLimitNote: capNote } : {}) },
+      {
+        stdout: exec.stdout,
+        stderr: scriptStderr(exec),
+        returnCode: exec.returnCode,
+        ...(capNote ? { timeLimitNote: capNote } : {}),
+        ...(exec.runnerNote !== undefined ? { runnerNote: exec.runnerNote } : {}),
+        ...(toolCalls ? { toolCalls } : {}),
+      },
       cap,
       call.id,
     );
@@ -19469,6 +19491,7 @@ export class AgentFramework {
       success: true,
       data: [{ type: 'text', text }],
       structured: {
+        ...(toolCalls ? { tool_calls: toolCalls } : {}),
         stdout: exec.stdout,
         stderr: exec.stderr,
         return_code: exec.returnCode,
@@ -19616,12 +19639,12 @@ export class AgentFramework {
       callId: scriptId, input: { lines: code.split('\n').length },
     });
 
-    void runner
-      .exec(code, injected, {
-        logPath: logAbsPath,
-        lifetimeMs,
-        onWake: (line, payload) => this.handleScriptWake(record, line, payload),
-      }, { ceilingMs: scriptTimeLimits(cfg ?? undefined).backgroundMaxMs })
+    record.ended = runner.exec(code, injected, {
+      logPath: logAbsPath,
+      lifetimeMs,
+      onWake: (line, payload) => this.handleScriptWake(record, line, payload),
+    }, { ceilingMs: scriptTimeLimits(cfg ?? undefined).backgroundMaxMs });
+    void record.ended
       .then((exec) => this.settleBackgroundScript(record, exec))
       .catch((err) => {
         // exec never rejects by contract; this is the belt-and-suspenders.
@@ -19739,9 +19762,11 @@ export class AgentFramework {
       const output = exec.tail ?? exec.stderr ?? '';
       const tail = safeSlice(output, Math.max(0, output.length - 2000), output.length);
       const elapsedMin = Math.round((Date.now() - record.startedAt) / 60_000);
+      const toolCalls = callsLine(exec);
       const envelope =
         `[background script ${record.id}] Your background script DIED ${elapsedMin}m after start ` +
         `(it did not call wake_agent and is no longer watching).\n` +
+        (toolCalls ? `${toolCalls}\n` : '') +
         `Last output:\n${tail || '(none)'}\n` +
         (record.logPath ? `Full journal: workspace file ${record.logPath}` : '');
       this.injectScriptWake(record, envelope);
@@ -20077,7 +20102,8 @@ export class AgentFramework {
         env: cfg?.env,
         inheritEnv: cfg?.inheritEnv,
         label: agentName,
-        // The script that made the call is the one running when it arrives.
+        // A call is filed with the script running when it arrives, which made
+        // it unless code an earlier script left running did.
         onToolCall: (toolName, args) =>
           this.handleScriptToolCall(
             agentName, toolName, args,
@@ -20112,7 +20138,7 @@ export class AgentFramework {
     toolName: string,
     args: Record<string, unknown>,
     origin?: ScriptCallOrigin,
-    /** The foreground script that made the call; none for a background script. */
+    /** The foreground script running when the call arrived; none for a background script. */
     script?: { endTurn: boolean; turnId?: number; calls: RoundCall[] },
   ): Promise<ScriptToolResult> {
     if (toolName === CODE_EXECUTION_TOOL_NAME) {

@@ -72,6 +72,8 @@ export {
 export type {
   InjectedTool,
   ExecResult,
+  ScriptCalls,
+  UncertainCall,
   PyRunnerOptions,
   ScriptToolCallHandler,
   ScriptToolResult,

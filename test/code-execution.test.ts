@@ -5,7 +5,9 @@
  * await, tool-function injection, timeout, and deadline behavior are all
  * exercised end-to-end. Framework tests drive a full agent turn through the
  * MockMembrane and assert the load-bearing invariant: inner tool results
- * reach the running script but never the model-facing tool_result.
+ * reach the running script but never the model-facing tool_result, except
+ * the start of an answer that came after its call's code stopped waiting,
+ * which the result's line quotes.
  */
 
 import { describe, it } from 'node:test';
@@ -15,19 +17,24 @@ import { chmodSync, closeSync, existsSync, mkdtempSync, openSync, readdirSync, r
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { PassThrough, type Writable } from 'node:stream';
+import { setFlagsFromString } from 'node:v8';
+import { runInNewContext } from 'node:vm';
 import type {
   EventResponse,
+  ExecResult,
   Module,
   ModuleContext,
   ProcessEvent,
   ProcessState,
+  ScriptCalls,
   ScriptToolResult,
   ToolCall,
   ToolDefinition,
   ToolResult,
+  UncertainCall,
 } from '../src/index.js';
 import { AgentFramework, PYTHON_RUNTIME_SOURCE, PyRunner, buildInjectedTools } from '../src/index.js';
-import { OutputStream } from '../src/code-execution/py-runner.js';
+import { callBrief, callsLine, OutputStream, scriptStderr } from '../src/code-execution/py-runner.js';
 import { createMockResponse, MockMembrane } from './helpers/mock-membrane.js';
 import type { ContentBlock } from '@animalabs/membrane';
 import { PYTC_STOP_ROWS_DRIVER } from './helpers/pytc-stop-rows.js';
@@ -76,8 +83,8 @@ const exitedUnder = (how: string, background = false, check?: string): string =>
     how === 'was ended by SIGKILL' ? 'by using too much memory' : how.startsWith('was ended by') ? 'with os.kill()' : 'with os._exit()'}`
   }; if not, ask whoever runs this host.`;
 
-/** The advice's first step after a crash's signal, with faulthandler's traceback above it, and without. */
-const NATIVE_CRASH = 'check the traceback above for the call that crashed in native code, such as an extension module the script uses';
+/** The advice's first step after a crash's signal, with faulthandler's traceback in the output, and without. */
+const NATIVE_CRASH = 'check the traceback that starts "Fatal Python error:" for the call that crashed in native code, such as an extension module the script uses';
 const NATIVE_CRASH_UNSEEN = 'check whether native code the script calls crashes, such as an extension module it uses';
 
 /**
@@ -90,7 +97,7 @@ const exitedAfterEnd = (how: string, taken?: string, background = false, check?:
   `script ended, but the Python interpreter ${how} before all of its output reached the host, so some of it may be missing`
   + `${background ? '' : ', and variables from earlier scripts are gone'}. If it happens again, `
   + (taken
-    ? `check whether the script closes, shuts down or replaces ${taken}, as the runtime's line above says`
+    ? `check whether the script closes, shuts down or replaces ${taken}, as the runtime's line starting "[pytc-runtime]" says`
     : check ?? `check whether the script itself ends the process, for example ${
       how === 'was ended by SIGKILL' ? 'by using too much memory' : how.startsWith('was ended by') ? 'with os.kill()' : 'with os._exit()'}`)
   + '; if not, ask whoever runs this host.';
@@ -99,8 +106,8 @@ const exitedAfterEnd = (how: string, taken?: string, background = false, check?:
 const runtimeLost = (taken: string): string =>
   "script stopped: the Python interpreter exited with code 70 while it ran, so the rest of the script didn't run, and variables "
   + 'from earlier scripts are gone. Tool calls it had already made keep their effects, so check them before you run it again in '
-  + `a new interpreter. If it stops the same way, check whether the script closes, shuts down or replaces ${taken}, as the runtime's line above `
-  + 'says; if not, ask whoever runs this host.';
+  + `a new interpreter. If it stops the same way, check whether the script closes, shuts down or replaces ${taken}, as the runtime's line starting `
+  + '"[pytc-runtime]" says; if not, ask whoever runs this host.';
 
 describe('buildInjectedTools', () => {
   it('sanitizes -- to __ and keeps valid identifiers', () => {
@@ -312,6 +319,7 @@ describe('PyRunner (real python3)', () => {
         // A JS handler can resolve with what its type rules out; the call is
         // still answered, as before this change.
         if (args.kind === 'nothing') return undefined as unknown as string;
+        if (args.kind === 'null') return null as unknown as string;
         return results[String(args.kind)]!;
       },
     });
@@ -320,7 +328,7 @@ describe('PyRunner (real python3)', () => {
         [
           'import copy, json, pickle',
           'out = {}',
-          'for kind in ["failed", "textlike", "structured", "oversized", "plain", "rejects", "jsonlike", "nothing"]:',
+          'for kind in ["failed", "textlike", "structured", "oversized", "plain", "rejects", "jsonlike", "nothing", "null"]:',
           '    r = await test__echo({"kind": kind})',
           '    out[kind] = {"text": str(r), "is_error": r.is_error, "structured": r.structured,',
           '                 "type": type(r).__name__, "is_str": isinstance(r, str)}',
@@ -355,6 +363,9 @@ describe('PyRunner (real python3)', () => {
       assert.deepStrictEqual(out.copies, [[false, { rows: [1, 2] }, true], [false, { rows: [1, 2] }, true]]);
       assert.deepStrictEqual(out.jsonlike, seen('{"structuredContent": {"a": 1}}', false, null));
       assert.deepStrictEqual(out.nothing, seen('', null, null));
+      // null isn't a result object either: the reply sends it as it is, which
+      // the runtime makes the text Python gives it.
+      assert.deepStrictEqual(out.null, seen('None', null, null));
       // A refusal shows a key that is a tool's result as its text, the key the
       // agent has to write, as it shows any str key.
       assert.match(String(out.refusal), /\{'a string, nothing said': <int>, 'extra': <int>\}/);
@@ -466,16 +477,620 @@ describe('PyRunner (real python3)', () => {
     }
   });
 
-  it('raises TimeoutError inside the script when a tool call gets no response', async () => {
+  it('raises TimeoutError inside the script when a tool call gets no response, saying the call may still take effect, and the result names the call', async () => {
     const runner = new PyRunner({
       toolCallTimeoutMs: 1000,
-      onToolCall: () => new Promise((resolve) => setTimeout(() => resolve('late'), 5000)),
+      // No answer comes, so the call is still running when the script ends.
+      onToolCall: () => new Promise<string>(() => {}),
     });
     try {
       const result = await runner.exec('await test__echo({})', ECHO_TOOLS);
       assert.strictEqual(result.returnCode, 1);
-      assert.match(result.stderr, /TimeoutError: Calling tool \['test--echo'\] timed out/);
+      assert.match(result.stderr, /TimeoutError: Calling tool \['test--echo'\] timed out \(no response after 1s\)\. The call was sent and may still take effect, so check for its effect before calling it again\.\n/);
+      assert.deepStrictEqual(result.calls, { made: 1, uncertain: [{ tool: 'test--echo', args: '{}', state: 'timed-out-running' }] });
     } finally {
+      runner.dispose();
+    }
+  });
+
+  it("a call the script stopped waiting for and that was answered before it ended is named with its answer's start, in the order the calls were made", async () => {
+    // The second call is what answers the first, so the first's answer
+    // reaches the host after the runtime's word that the script stopped
+    // waiting for it. The third is still running when the script ends.
+    let answerFirst!: (answer: string) => void;
+    let answerThird: ((answer: string) => void) | undefined;
+    // Its 120th character is the first half of a surrogate pair, which the cut leaves out.
+    const firstAnswer = `first answer, ${'y'.repeat(105)}${'\u{1F600}'.repeat(5)}`;
+    const runner = new PyRunner({
+      toolCallTimeoutMs: 1000,
+      onToolCall: (_name, args) => {
+        if (args.n === 1) return new Promise((resolve) => { answerFirst = resolve; });
+        if (args.n === 3) return new Promise((resolve) => { answerThird = resolve; });
+        answerFirst(firstAnswer);
+        return new Promise((resolve) => setImmediate(() => resolve('second answer')));
+      },
+    });
+    try {
+      const result = await within(runner.exec([
+        'import asyncio',
+        'try:',
+        '    await test__echo({"n": 1})',
+        'except TimeoutError:',
+        '    pass',
+        'print(await test__echo({"n": 2}))',
+        'asyncio.ensure_future(test__echo({"n": 3}))',
+        'await asyncio.sleep(0.2)',
+      ].join('\n'), ECHO_TOOLS), 'the script');
+      assert.strictEqual(result.returnCode, 0, result.stderr);
+      assert.strictEqual(result.stdout, 'second answer\n');
+      assert.deepStrictEqual(result.calls, {
+        made: 3,
+        uncertain: [
+          { tool: 'test--echo', args: '{"n":1}', state: 'answered-unseen', answer: `first answer, ${'y'.repeat(105)}\u2026` },
+          { tool: 'test--echo', args: '{"n":3}', state: 'running' },
+        ],
+      });
+    } finally {
+      answerThird?.('');
+      runner.dispose();
+    }
+  });
+
+  it('a call answered with an error after its code stopped waiting is named as one, and an answer is the start of the text a script gets', async () => {
+    // Each answer comes once the script has stopped waiting for its call: the
+    // last call is what answers the others. The failed one's JSON, as a
+    // structured result reaches a script, holds isError past the cut.
+    const failedText = JSON.stringify({ content: [{ type: 'text', text: `rate limited: ${'x'.repeat(150)}` }], structuredContent: null, isError: true });
+    const answers: Record<string, string | ScriptToolResult> = {
+      failed: { text: failedText, isError: true, structuredJson: true },
+      sent: { text: 'Message sent', isError: false },
+      plain: 'a plain string',
+    };
+    const held: Array<() => void> = [];
+    const runner = new PyRunner({
+      toolCallTimeoutMs: 1000,
+      onToolCall: (_name, args) => {
+        if (args.kind === 'release') {
+          for (const answer of held.splice(0)) answer();
+          return new Promise((resolve) => setImmediate(() => resolve('released')));
+        }
+        return new Promise((resolve, reject) => {
+          held.push(args.kind === 'rejects' ? () => reject(new Error('handler broke')) : () => resolve(answers[String(args.kind)]!));
+        });
+      },
+    });
+    try {
+      const result = await within(runner.exec([
+        'import asyncio',
+        'async def call(kind):',
+        '    try:',
+        '        await test__echo({"kind": kind})',
+        '    except TimeoutError:',
+        '        pass',
+        'await asyncio.gather(*(call(kind) for kind in ["failed", "sent", "plain", "rejects"]))',
+        'print(await test__echo({"kind": "release"}))',
+      ].join('\n'), ECHO_TOOLS), 'the script');
+      assert.strictEqual(result.returnCode, 0, result.stderr);
+      assert.strictEqual(result.stdout, 'released\n');
+      assert.deepStrictEqual(result.calls, {
+        made: 5,
+        uncertain: [
+          { tool: 'test--echo', args: '{"kind":"failed"}', state: 'answered-unseen', answer: `${failedText.slice(0, 120)}\u2026`, isError: true },
+          { tool: 'test--echo', args: '{"kind":"sent"}', state: 'answered-unseen', answer: 'Message sent' },
+          { tool: 'test--echo', args: '{"kind":"plain"}', state: 'answered-unseen', answer: 'a plain string' },
+          { tool: 'test--echo', args: '{"kind":"rejects"}', state: 'answered-unseen', answer: 'Error: handler broke', isError: true },
+        ],
+      });
+      const lines = callsLine(result)!.split('\n');
+      assert.strictEqual(lines[1], `- answered with an error after its code stopped waiting: test--echo {"kind":"failed"}, answer ${JSON.stringify(`${failedText.slice(0, 120)}\u2026`)}`);
+      assert.strictEqual(lines[2], '- answered after its code stopped waiting: test--echo {"kind":"sent"}, answer "Message sent"');
+    } finally {
+      for (const answer of held.splice(0)) answer();
+      runner.dispose();
+    }
+  });
+
+  it('a call the script stops waiting for with a shorter wait_for of its own is named with its answer, beside the retry', async () => {
+    // The retry is what answers the first call, so that answer comes after
+    // the runtime's word that the script cancelled it.
+    let answerFirst!: (answer: string) => void;
+    const runner = new PyRunner({
+      onToolCall: (_name, args) => {
+        if (args.n === 1) return new Promise((resolve) => { answerFirst = resolve; });
+        answerFirst('sent message 41');
+        return new Promise((resolve) => setImmediate(() => resolve('sent message 42')));
+      },
+    });
+    try {
+      const result = await within(runner.exec([
+        'import asyncio',
+        'try:',
+        '    await asyncio.wait_for(test__echo({"n": 1}), 0.3)',
+        'except asyncio.TimeoutError:',
+        '    pass',
+        'print(await test__echo({"n": 2}))',
+      ].join('\n'), ECHO_TOOLS), 'the script');
+      assert.strictEqual(result.returnCode, 0, result.stderr);
+      assert.strictEqual(result.stdout, 'sent message 42\n');
+      assert.deepStrictEqual(result.calls, {
+        made: 2,
+        uncertain: [{ tool: 'test--echo', args: '{"n":1}', state: 'answered-unseen', answer: 'sent message 41' }],
+      });
+    } finally {
+      runner.dispose();
+    }
+  });
+
+  it('a call the script cancels and that is still running when it ends is named as cancelled in the script', async () => {
+    const runner = new PyRunner({ onToolCall: () => new Promise<string>(() => {}) });
+    try {
+      const result = await within(runner.exec([
+        'import asyncio, __main__',
+        't = asyncio.ensure_future(test__echo({"n": 1}))',
+        'while not __main__._pending_tool_futures:',
+        '    await asyncio.sleep(0.01)',
+        't.cancel()',
+        'try:',
+        '    await t',
+        'except asyncio.CancelledError:',
+        '    pass',
+      ].join('\n'), ECHO_TOOLS), 'the script');
+      assert.strictEqual(result.returnCode, 0, result.stderr);
+      assert.deepStrictEqual(result.calls, {
+        made: 1,
+        uncertain: [{ tool: 'test--echo', args: '{"n":1}', state: 'cancelled-running' }],
+      });
+    } finally {
+      runner.dispose();
+    }
+  });
+
+  it("calls a host's stop cuts off, and those the runtime cancels at a script's end, read as still running, with no word that the script stopped waiting", async () => {
+    const runner = new PyRunner({ onToolCall: () => new Promise<string>(() => {}) });
+    const internals = runner as unknown as { handleLine(line: string, child: ChildProcess, interpreter: number): void };
+    const handle = internals.handleLine.bind(runner);
+    const ops: string[] = [];
+    internals.handleLine = (line, child, interpreter) => {
+      try { ops.push(String((JSON.parse(line) as { op?: unknown }).op)); } catch { /* not the protocol's */ }
+      handle(line, child, interpreter);
+    };
+    try {
+      // One call the script awaits, which the time limit's stop cuts off, and
+      // one a task it started has pending when the script ends. The awaited
+      // call runs at once, and the task's at the loop's next turn.
+      const result = await within(runner.exec([
+        'import asyncio',
+        'asyncio.ensure_future(test__echo({"n": "left"}))',
+        'await test__echo({"n": "awaited"})',
+      ].join('\n'), ECHO_TOOLS, undefined, { deadlineMs: 1000 }), 'the script');
+      assert.match(result.runnerNote ?? '', /^script stopped: it reached its 1s time limit\./);
+      assert.deepStrictEqual(result.calls, {
+        made: 2,
+        uncertain: [
+          { tool: 'test--echo', args: '{"n":"awaited"}', state: 'running' },
+          { tool: 'test--echo', args: '{"n":"left"}', state: 'running' },
+        ],
+      });
+      await new Promise((resolve) => setTimeout(resolve, 200));
+      assert.ok(!ops.includes('tool_unwaited'), ops.join(', '));
+    } finally {
+      runner.dispose();
+    }
+  });
+
+  it("a call answered while the script held its event loop past the call's timeout is named with that answer when the script got a TimeoutError", async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'pytc-held-'));
+    const holding = join(dir, 'holding');
+    const answered = join(dir, 'answered');
+    const runner = new PyRunner({
+      toolCallTimeoutMs: 1000,
+      // The answer goes once the script holds its loop, and its mark after it has gone.
+      onToolCall: async () => {
+        await until(() => existsSync(holding), 'the script to hold its loop');
+        setImmediate(() => writeFileSync(answered, ''));
+        return 'answered while the loop was held';
+      },
+    });
+    try {
+      const result = await within(runner.exec([
+        'import asyncio, os, sys, time',
+        't = asyncio.ensure_future(test__echo({"n": 1}))',
+        'await asyncio.sleep(0)',
+        `open(${JSON.stringify(holding)}, "w").close()`,
+        'start = time.monotonic()',
+        // Held until the answer has gone, and past the call's 1 s timeout.
+        `while not os.path.exists(${JSON.stringify(answered)}) or time.monotonic() - start < 1.5:`,
+        '    time.sleep(0.01)',
+        'try:',
+        '    await t',
+        '    print("saw the answer")',
+        'except TimeoutError:',
+        '    print("timed out")',
+        'print(sys.version_info >= (3, 12))',
+      ].join('\n'), ECHO_TOOLS), 'the script');
+      assert.strictEqual(result.returnCode, 0, result.stderr);
+      const timedOut = result.stdout.startsWith('timed out\n');
+      // From Python 3.12, the timeout fires before the answer queued behind it is read.
+      if (result.stdout.endsWith('True\n')) assert.ok(timedOut, result.stdout);
+      // Either way, the result says what the script saw.
+      assert.deepStrictEqual(result.calls, {
+        made: 1,
+        uncertain: timedOut
+          ? [{ tool: 'test--echo', args: '{"n":1}', state: 'answered-unseen', answer: 'answered while the loop was held' }]
+          : [],
+      });
+    } finally {
+      runner.dispose();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("a call from a task an earlier script left running is named in the result of the script running when it's made, and one made while none runs in the next script's", async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'pytc-left-'));
+    const between = join(dir, 'between-scripts');
+    const started = join(dir, 'second-started');
+    let sawBetween!: () => void;
+    const madeBetween = new Promise<void>((resolve) => { sawBetween = resolve; });
+    const runner = new PyRunner({
+      // Only the first call between the scripts is answered, so the others are
+      // still running when the second script ends.
+      onToolCall: (_name, args) => {
+        if (args.when === 'answered between scripts') return Promise.resolve('ok');
+        if (args.when === 'between scripts') sawBetween();
+        return new Promise<string>(() => {});
+      },
+    });
+    try {
+      // The first script leaves a task that calls a tool twice once the host
+      // has the first script's result, and again once the second has started.
+      const first = await within(runner.exec([
+        'import asyncio, os, __main__',
+        'async def later():',
+        '    global answered',
+        `    while not os.path.exists(${JSON.stringify(between)}):`,
+        '        await asyncio.sleep(0.01)',
+        '    await test__echo({"when": "answered between scripts"})',
+        '    answered = "t" + str(__main__._next_tool_call_id)',
+        '    asyncio.ensure_future(test__echo({"when": "between scripts"}))',
+        `    while not os.path.exists(${JSON.stringify(started)}):`,
+        '        await asyncio.sleep(0.01)',
+        '    asyncio.ensure_future(test__echo({"when": "during the second"}))',
+        'left = asyncio.ensure_future(later())',
+      ].join('\n'), ECHO_TOOLS), 'the first script');
+      assert.strictEqual(first.calls, undefined);
+      writeFileSync(between, '');
+      await within(madeBetween, 'the call made between scripts');
+      const second = await within(runner.exec([
+        'import asyncio, __main__',
+        // Word, once the second script has started, that the code waiting for
+        // the call answered between the scripts had stopped waiting, as a held
+        // loop brings it: that call's answer went unseen after all.
+        '__main__.send({"op": "tool_unwaited", "id": answered, "cause": "timeout"})',
+        `open(${JSON.stringify(started)}, "w").close()`,
+        // The runtime keeps each call's future just before it sends the call.
+        'while len(__main__._pending_tool_futures) < 2:',
+        '    await asyncio.sleep(0.01)',
+      ].join('\n'), ECHO_TOOLS), 'the second script');
+      assert.strictEqual(second.returnCode, 0, second.stderr);
+      assert.deepStrictEqual(second.calls, {
+        made: 1,
+        before: 2,
+        uncertain: [
+          { tool: 'test--echo', args: '{"when":"answered between scripts"}', state: 'answered-unseen', answer: 'ok' },
+          { tool: 'test--echo', args: '{"when":"between scripts"}', state: 'running' },
+          { tool: 'test--echo', args: '{"when":"during the second"}', state: 'running' },
+        ],
+      });
+    } finally {
+      runner.dispose();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("a call taken on from an interpreter that has gone is kept apart from the next interpreter's, whose call ids start again", async () => {
+    let answerLeftover!: (text: string) => void;
+    let sawLeftover!: () => void;
+    const leftoverMade = new Promise<void>((resolve) => { sawLeftover = resolve; });
+    const dir = mkdtempSync(join(tmpdir(), 'pytc-reclaim-'));
+    const between = join(dir, 'between-scripts');
+    const filed = join(dir, 'leftover-answer-filed');
+    const runner = new PyRunner({
+      // Off, so the test reclaims the interpreter itself once the leftover's
+      // call is in, as the idle timer does, rather than racing a timer.
+      idleReclaimMs: 0,
+      onToolCall: (_name, args) => {
+        if (args.who === 'leftover') {
+          sawLeftover();
+          return new Promise<string>((resolve) => { answerLeftover = resolve; });
+        }
+        // The leftover's answer comes once the second interpreter's own first
+        // call is in, and the second script ends only once the host has filed
+        // it, which the answer's microtasks do before setImmediate's turn.
+        answerLeftover('the leftover\'s answer');
+        setImmediate(() => writeFileSync(filed, ''));
+        return new Promise<string>(() => {});
+      },
+    });
+    const internals = runner as unknown as { child: ChildProcess | null; reclaim(reason: string): void };
+    try {
+      // The first script leaves a task whose call, its interpreter's first, is
+      // made once the host has the script's result.
+      await within(runner.exec([
+        'import asyncio, os',
+        'async def later():',
+        `    while not os.path.exists(${JSON.stringify(between)}):`,
+        '        await asyncio.sleep(0.01)',
+        '    await test__echo({"who": "leftover"})',
+        'left = asyncio.ensure_future(later())',
+      ].join('\n'), ECHO_TOOLS), 'the first script');
+      writeFileSync(between, '');
+      await within(leftoverMade, 'the leftover call');
+      internals.reclaim('idle');
+      assert.strictEqual(internals.child, null);
+      // In a new interpreter, whose first call has the same id as the leftover's.
+      const second = await within(runner.exec([
+        'import asyncio, os',
+        't = asyncio.ensure_future(test__echo({"who": "the second script"}))',
+        `while not os.path.exists(${JSON.stringify(filed)}):`,
+        '    await asyncio.sleep(0.01)',
+      ].join('\n'), ECHO_TOOLS), 'the second script');
+      assert.strictEqual(second.returnCode, 0, second.stderr);
+      // The leftover's answer came once its interpreter had gone, so its code never saw it.
+      assert.deepStrictEqual(second.calls, {
+        made: 1,
+        before: 1,
+        uncertain: [
+          { tool: 'test--echo', args: '{"who":"leftover"}', state: 'answered-unseen', answer: "the leftover's answer" },
+          { tool: 'test--echo', args: '{"who":"the second script"}', state: 'running' },
+        ],
+      });
+    } finally {
+      runner.dispose();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('an answer that comes once the interpreter that made the call has exited, before its script settles, is named as unseen', async () => {
+    let answer!: (text: string) => void;
+    let sawCall!: () => void;
+    const made = new Promise<void>((resolve) => { sawCall = resolve; });
+    const runner = new PyRunner({
+      onToolCall: () => {
+        sawCall();
+        return new Promise<string>((resolve) => { answer = resolve; });
+      },
+    });
+    const internals = runner as unknown as { child: ChildProcess | null };
+    let command = 0;
+    try {
+      // A command holding the output pipes keeps the host waiting for them
+      // after the interpreter exits, so its script settles only later.
+      const running = runner.exec([
+        'import asyncio, os, subprocess, __main__',
+        'print(subprocess.Popen(["sleep", "30"]).pid, flush=True)',
+        't = asyncio.ensure_future(test__echo({"x": 1}))',
+        'while not __main__._pending_tool_futures:',
+        '    await asyncio.sleep(0.01)',
+        'os._exit(3)',
+      ].join('\n'), ECHO_TOOLS);
+      await within(made, 'the call');
+      const child = internals.child!;
+      await within(new Promise<void>((resolve) => {
+        if (child.exitCode !== null) resolve();
+        else child.once('exit', () => resolve());
+      }), 'the exit');
+      answer('late answer');
+      const result = await within(running, 'the script to settle');
+      command = Number(result.stdout.trim());
+      assert.deepStrictEqual(result.calls, {
+        made: 1,
+        uncertain: [{ tool: 'test--echo', args: '{"x":1}', state: 'answered-unseen', answer: 'late answer' }],
+      });
+    } finally {
+      if (command && alive(command)) process.kill(command, 'SIGKILL');
+      runner.dispose();
+    }
+  });
+
+  it('a call made while no script runs, whose code stops waiting and whose answer then comes, is taken on by the next script', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'pytc-gap-'));
+    const between = join(dir, 'between-scripts');
+    let answer!: (text: string) => void;
+    let sawCall!: () => void;
+    const made = new Promise<void>((resolve) => { sawCall = resolve; });
+    const runner = new PyRunner({
+      onToolCall: () => {
+        sawCall();
+        return new Promise<string>((resolve) => { answer = resolve; });
+      },
+    });
+    try {
+      // The first script leaves a task that calls a tool once the host has the
+      // first script's result, then sends the runtime's own word that it
+      // stopped waiting (runtime-py.ts tool_fn), as its timeout would.
+      await within(runner.exec([
+        'import asyncio, os, __main__',
+        'async def later():',
+        `    while not os.path.exists(${JSON.stringify(between)}):`,
+        '        await asyncio.sleep(0.01)',
+        '    t = asyncio.ensure_future(test__echo({"when": "between scripts"}))',
+        '    while not __main__._pending_tool_futures:',
+        '        await asyncio.sleep(0.01)',
+        '    __main__.send({"op": "tool_unwaited", "id": "t" + str(__main__._next_tool_call_id), "cause": "timeout"})',
+        'left = asyncio.ensure_future(later())',
+      ].join('\n'), ECHO_TOOLS), 'the first script');
+      writeFileSync(between, '');
+      await within(made, 'the call made between scripts');
+      // Once the host has read that word, in its record of calls made while no
+      // script runs, the answer comes.
+      const internals = runner as unknown as { loose: { open: Map<string, { unwaited: string | null }> } };
+      await until(() => [...internals.loose.open.values()].some((call) => call.unwaited !== null), 'the word that its code stopped waiting');
+      answer('answered while no script ran');
+      await new Promise((resolve) => setImmediate(resolve));
+      const second = await within(runner.exec('pass', ECHO_TOOLS), 'the second script');
+      assert.deepStrictEqual(second.calls, {
+        made: 0,
+        before: 1,
+        uncertain: [{ tool: 'test--echo', args: '{"when":"between scripts"}', state: 'answered-unseen', answer: 'answered while no script ran' }],
+      });
+    } finally {
+      runner.dispose();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('a call from a thread the script started, through run_coroutine_threadsafe, is named in its result', async () => {
+    // The answer never comes, so the call is still running when the script ends.
+    const runner = new PyRunner({ onToolCall: () => new Promise<string>(() => {}) });
+    try {
+      const result = await within(runner.exec([
+        'import asyncio, threading, __main__',
+        'loop = asyncio.get_running_loop()',
+        'def in_thread():',
+        '    try:',
+        '        asyncio.run_coroutine_threadsafe(test__echo({"from": "a thread"}), loop).result()',
+        '    except BaseException:',
+        '        pass',
+        'threading.Thread(target=in_thread, daemon=True).start()',
+        // The runtime keeps the call's future just before it sends the call.
+        'while not __main__._pending_tool_futures:',
+        '    await asyncio.sleep(0.01)',
+      ].join('\n'), ECHO_TOOLS), 'the script');
+      assert.strictEqual(result.returnCode, 0, result.stderr);
+      assert.deepStrictEqual(result.calls, {
+        made: 1,
+        uncertain: [{ tool: 'test--echo', args: '{"from":"a thread"}', state: 'running' }],
+      });
+    } finally {
+      runner.dispose();
+    }
+  });
+
+  it("the host's record of a script's calls closes when it reads the script's end: a later answer leaves its call running, and a later call goes to the next script's", async () => {
+    const answers = new Map<string, (text: string) => void>();
+    const runner = new PyRunner({
+      onToolCall: (_name, args) => new Promise<string>((resolve) => { answers.set(String(args.when), resolve); }),
+    });
+    const internals = runner as unknown as {
+      settleIfComplete(child: ChildProcess): void;
+      handleLine(line: string, child: ChildProcess, interpreter: number): void;
+      interpreterNumber: number;
+      pending: { returnCode: number | null } | null;
+    };
+    const settle = internals.settleIfComplete.bind(runner);
+    let held = false;
+    // Once the host has read the script's end, before it settles: the call's
+    // answer comes, and another call arrives.
+    internals.settleIfComplete = (child) => {
+      if (held || internals.pending?.returnCode == null) {
+        settle(child);
+        return;
+      }
+      held = true;
+      answers.get('during')!('answered after the end');
+      internals.handleLine(JSON.stringify({ op: 'tool_call', id: 't9999', exec_id: null, name: 'test--echo', args: { when: 'after the end' } }), child, internals.interpreterNumber);
+      setTimeout(() => settle(child), 50);
+    };
+    try {
+      const first = await within(runner.exec([
+        'import asyncio, __main__',
+        't = asyncio.ensure_future(test__echo({"when": "during"}))',
+        'while not __main__._pending_tool_futures:',
+        '    await asyncio.sleep(0.01)',
+      ].join('\n'), ECHO_TOOLS), 'the first script');
+      assert.ok(held);
+      assert.deepStrictEqual(first.calls, { made: 1, uncertain: [{ tool: 'test--echo', args: '{"when":"during"}', state: 'running' }] });
+      const second = await within(runner.exec('pass', ECHO_TOOLS), 'the second script');
+      assert.deepStrictEqual(second.calls, {
+        made: 0,
+        before: 1,
+        uncertain: [{ tool: 'test--echo', args: '{"when":"after the end"}', state: 'running' }],
+      });
+    } finally {
+      runner.dispose();
+    }
+  });
+
+  it('an exec lists the first 1,000 calls answered after its script stopped waiting for them, and counts the rest by tool', async () => {
+    const held: Array<(answer: string) => void> = [];
+    const runner = new PyRunner({
+      onToolCall: (_name, args) => {
+        if (!args.go) return new Promise((resolve) => { held.push(resolve); });
+        // The script's word that it stopped waiting for each has come first, as it was sent first.
+        for (const answer of held.splice(0)) answer('late');
+        return Promise.resolve('go');
+      },
+    });
+    try {
+      // The script sends the runtime's own word itself (runtime-py.ts tool_fn)
+      // for 1,001 calls still waiting for their answers.
+      const result = await within(runner.exec([
+        'import asyncio, __main__',
+        'first = __main__._next_tool_call_id + 1',
+        'waiting = [asyncio.ensure_future(test__echo({"n": i})) for i in range(1001)]',
+        'await asyncio.sleep(0)',
+        'for i in range(first, first + 1001):',
+        '    __main__.send({"op": "tool_unwaited", "id": "t" + str(i), "cause": "timeout"})',
+        'await test__echo({"go": True})',
+        // And word for one answered while the script waited, once the list is full.
+        '__main__.send({"op": "tool_unwaited", "id": "t" + str(__main__._next_tool_call_id), "cause": "timeout"})',
+      ].join('\n'), ECHO_TOOLS), 'the script');
+      assert.strictEqual(result.returnCode, 0, result.stderr);
+      const calls = result.calls!;
+      assert.strictEqual(calls.made, 1002);
+      assert.strictEqual(calls.uncertain.length, 1000);
+      assert.deepStrictEqual(calls.uncertain[999], { tool: 'test--echo', args: '{"n":999}', state: 'answered-unseen', answer: 'late' });
+      assert.deepStrictEqual(calls.unlisted, { 'test--echo': 2 });
+      const lines = callsLine(result)!.split('\n');
+      assert.strictEqual(lines[0], 'tool calls: 1002 made while the script ran, 0 answered while it waited; the other 1002:');
+      assert.strictEqual(lines.at(-1), '- and 992 more: test--echo \u00d7992');
+    } finally {
+      runner.dispose();
+    }
+  });
+
+  it('an exec keeps the last 1,000 calls answered while its script waited, so word that the script stopped waiting for an older one finds it answered', async () => {
+    const runner = new PyRunner({ onToolCall: async () => 'ok' });
+    try {
+      // The script sends the runtime's own word itself (runtime-py.ts tool_fn),
+      // after 1,001 answers, which put the first out of what the exec keeps.
+      const result = await within(runner.exec([
+        'import asyncio, __main__',
+        'await test__echo({"n": 0})',
+        'first = "t" + str(__main__._next_tool_call_id)',
+        'await test__echo({"n": 1})',
+        'second = "t" + str(__main__._next_tool_call_id)',
+        'await asyncio.gather(*(test__echo({"n": i}) for i in range(2, 1001)))',
+        '__main__.send({"op": "tool_unwaited", "id": first, "cause": "timeout"})',
+        '__main__.send({"op": "tool_unwaited", "id": second, "cause": "timeout"})',
+        // A round trip after them, so both have reached the host before the end.
+        'await test__echo({"n": "last"})',
+      ].join('\n'), ECHO_TOOLS), 'the script');
+      assert.strictEqual(result.returnCode, 0, result.stderr);
+      assert.deepStrictEqual(result.calls, {
+        made: 1002,
+        uncertain: [{ tool: 'test--echo', args: '{"n":1}', state: 'answered-unseen', answer: 'ok' }],
+      });
+    } finally {
+      runner.dispose();
+    }
+  });
+
+  it('a call is named by its arguments as JSON, cut to 120 characters with each string cut first, never inside a surrogate pair', async () => {
+    let answer: ((answer: string) => void) | undefined;
+    const runner = new PyRunner({ onToolCall: () => new Promise((resolve) => { answer = resolve; }) });
+    try {
+      // '{"text":"' and 110 x's take 119 characters, so the cut at 120 falls inside the first pair.
+      const pending = runner.exec('await test__echo({"text": "x" * 110 + "\\U0001F600" * 5 + "z" * 1_000_000})', ECHO_TOOLS);
+      await until(() => answer !== undefined, 'the call');
+      runner.abort('the test is done with it');
+      const result = await pending;
+      assert.deepStrictEqual(result.calls, {
+        made: 1,
+        uncertain: [{ tool: 'test--echo', args: `{"text":"${'x'.repeat(110)}\u2026`, state: 'running' }],
+      });
+    } finally {
+      answer?.('');
       runner.dispose();
     }
   });
@@ -491,6 +1106,10 @@ describe('PyRunner (real python3)', () => {
       assert.strictEqual(result.returnCode, 1);
       assert.match(result.stderr, /cancelled by host/);
       assert.ok(Date.now() - started < 15_000, 'deadline cancel took too long');
+      // The runner's note on the limit ends the result, and it alone is the runner's.
+      assert.match(result.runnerNote ?? '', /^script stopped: it reached its 1s time limit\. [^\n]*$/);
+      assert.ok(result.stderr.endsWith(`\n${result.runnerNote}\n`), result.stderr);
+      assert.strictEqual(result.aborted, undefined);
     } finally {
       runner.dispose();
     }
@@ -523,6 +1142,8 @@ describe('PyRunner (real python3)', () => {
       const result = await pending;
       assert.strictEqual(result.aborted, true);
       assert.match(result.stderr, /aborted by host: test abort/);
+      assert.strictEqual(result.runnerNote, 'script aborted by host: test abort');
+      assert.deepStrictEqual(result.calls, { made: 1, uncertain: [] });
       // Runner remains usable after reclaim, in a fresh interpreter: the
       // aborted script's state is gone.
       const after = await runner.exec('try:\n    marker\n    print("kept")\nexcept NameError:\n    print("fresh")', []);
@@ -542,6 +1163,8 @@ describe('PyRunner (real python3)', () => {
       assert.strictEqual(second.returnCode, 1);
       assert.strictEqual(second.stderr, "script didn't run: another code_execution script of yours is already running, and they run one at a time. "
         + 'Run this one again once that one has finished, or combine the two into one script.');
+      assert.strictEqual(second.runnerNote, second.stderr);
+      assert.strictEqual(second.calls, undefined);
       runner.abort('cleanup');
       await first;
     } finally {
@@ -582,6 +1205,12 @@ describe('PyRunner (real python3)', () => {
       assert.strictEqual(result.returnCode, 1);
       assert.strictEqual(result.stderr, "script didn't run: this host can't start its Python interpreter, /definitely/not/a/python (ENOENT), "
         + "so code_execution can't run scripts here until whoever runs this host installs it or points this host at one. Calling it again before then fails the same way.");
+      assert.strictEqual(result.runnerNote, result.stderr);
+      // The runner disposed, a script given to it doesn't run either, and says why.
+      runner.dispose();
+      assert.deepStrictEqual(await runner.exec('print(1)', []), {
+        stdout: '', stderr: 'code_execution runner disposed', returnCode: 1, aborted: true, runnerNote: 'code_execution runner disposed',
+      });
     } finally {
       runner.dispose();
     }
@@ -4483,6 +5112,7 @@ describe('PyRunner background mode (real python3)', () => {
       assert.strictEqual(result.returnCode, 1, result.tail ?? '');
       const note = 'script stopped: it reached its 2s time limit. Tool calls it had already made keep their effects, so check them before running it again.\n';
       assert.strictEqual(result.tail, `watching\n\nKeyboardInterrupt: script cancelled by host\n${note}`);
+      assert.strictEqual(result.runnerNote, note.trimEnd());
       assert.strictEqual(readFileSync(logPath, 'utf8'), result.tail);
     } finally {
       runner.dispose();
@@ -4509,6 +5139,9 @@ describe('PyRunner background mode (real python3)', () => {
         const result = await within(runner.exec(code, [], { logPath: null, lifetimeMs: 30_000, onWake: async () => null }), what);
         assert.strictEqual(result.aborted, true, what);
         assert.match(result.tail ?? '', says, what);
+        // The runner's line on the exit ends the journal's tail, and is its own.
+        assert.strictEqual(result.runnerNote, result.stderr, what);
+        assert.ok(result.tail?.endsWith(`${result.runnerNote}\n`), what);
       } finally {
         runner.dispose();
       }
@@ -5310,6 +5943,8 @@ describe('code_execution per-call time limit (time_limit_ms)', () => {
     await withFramework({ scriptTimeoutMs: 300_000, maxScriptTimeoutMs: 1_800_000 }, async (framework) => {
       const tool = framework.getAllTools().find((t) => t.name === 'code_execution')!;
       assert.match(tool.description, /A foreground script is stopped after 5 min; pass time_limit_ms to set this call's limit \(at most 30 min; a background script runs up to 24 h\)/);
+      assert.match(tool.description, /raises TimeoutError inside the script, though the call was sent and may still take effect\. /);
+      assert.match(tool.description, /Only how the script ended, what it and the commands it runs print \(stdout and stderr\), and a line naming the tool calls that timed out or were cancelled in it, or were still running when it ended, come back to you; other tool results stay in the script, so filter or aggregate large data there and print only what you need\. Interpreter state /);
       const props = (tool.inputSchema as { properties: Record<string, { description: string }> }).properties;
       assert.match(props.time_limit_ms.description, /Default 300000, at most 1800000/);
     });
@@ -5720,8 +6355,255 @@ describe('code_execution time limit vs blocking code (real python3)', { skip: pr
           + 'if not, ask whoever runs this host.\n'
           + 'script stopped: it reached its 1s time limit. Tool calls it had already made keep their effects, so check them before running it again.\n',
       );
+      // Both lines are the runner's own.
+      assert.strictEqual(result.runnerNote, result.stderr.trimEnd());
     } finally {
       runner.dispose();
     }
+  });
+});
+
+describe("callsLine: what a script's result says of its tool calls", () => {
+  const ended = (calls: ScriptCalls, how: Partial<ExecResult> = {}): ExecResult => ({ stdout: '', stderr: '', returnCode: 0, calls, ...how });
+  const running = (i: number, tool = 'a--b'): UncertainCall => ({ tool, args: `{"i":${i}}`, state: 'running' });
+  const STILL_RUNNING = '- still running when the script ended, so it may still take effect:';
+
+  it('says nothing of a script that ended on its own with every call answered, or that made none', () => {
+    assert.strictEqual(callsLine(ended({ made: 3, uncertain: [] })), null);
+    assert.strictEqual(callsLine(ended({ made: 0, uncertain: [] }, { aborted: true, returnCode: 1 })), null);
+    assert.strictEqual(callsLine({ stdout: '', stderr: '', returnCode: 1, aborted: true }), null);
+  });
+
+  it('after an error or a stop, counts the calls even when the script saw every answer', () => {
+    assert.strictEqual(callsLine(ended({ made: 1, uncertain: [] }, { returnCode: 1 })), 'tool calls: 1 made while the script ran, answered while it waited.');
+    assert.strictEqual(callsLine(ended({ made: 5, uncertain: [] }, { aborted: true, returnCode: 1 })), 'tool calls: 5 made while the script ran, all answered while it waited.');
+    // A stop after the script had reported 0 still counts them.
+    assert.strictEqual(callsLine(ended({ made: 2, uncertain: [] }, { aborted: true, returnCode: 0 })), 'tool calls: 2 made while the script ran, all answered while it waited.');
+  });
+
+  it("names each call whose answer the script didn't see, by how it stood, after a clean finish too", () => {
+    assert.strictEqual(callsLine(ended({ made: 6, uncertain: [
+      { tool: 'x--send', args: '{"to":"a"}', state: 'running' },
+      { tool: 'x--write', args: '{"p":"b"}', state: 'timed-out-running' },
+      { tool: 'x--send', args: '{"to":"c"}', state: 'answered-unseen', answer: 'sent "c"\nok' },
+      { tool: 'x--send', args: '{"to":"d"}', state: 'answered-unseen', answer: '{"content":[{"type":"text","text":"rate…', isError: true },
+      { tool: 'x--write', args: '{"p":"e"}', state: 'cancelled-running' },
+    ] })), [
+      'tool calls: 6 made while the script ran, 1 answered while it waited; the other 5:',
+      `${STILL_RUNNING} x--send {"to":"a"}`,
+      '- timed out in the script and still running, so it may still take effect: x--write {"p":"b"}',
+      '- answered after its code stopped waiting: x--send {"to":"c"}, answer "sent \\"c\\"\\nok"',
+      '- answered with an error after its code stopped waiting: x--send {"to":"d"}, answer "{\\"content\\":[{\\"type\\":\\"text\\",\\"text\\":\\"rate…"',
+      '- cancelled in the script and still running, so it may still take effect: x--write {"p":"e"}',
+    ].join('\n'));
+    assert.strictEqual(callsLine(ended({ made: 1, uncertain: [running(0)] }, { returnCode: 1 })),
+      `tool calls: 1 made while the script ran, 0 answered while it waited; the other one:\n${STILL_RUNNING} a--b {"i":0}`);
+  });
+
+  it('counts apart the calls made before the script started that it took on', () => {
+    assert.strictEqual(callsLine(ended({ made: 1, before: 1, uncertain: [running(0), running(1)] })), [
+      'tool calls: 1 made while the script ran and 1 before it started, 0 answered while it waited; the other 2:',
+      `${STILL_RUNNING} a--b {"i":0}`,
+      `${STILL_RUNNING} a--b {"i":1}`,
+    ].join('\n'));
+    assert.strictEqual(callsLine(ended({ made: 2, before: 1, uncertain: [] }, { returnCode: 1 })),
+      'tool calls: 2 made while the script ran and 1 before it started, all answered while it waited.');
+    assert.strictEqual(callsLine(ended({ made: 0, before: 1, uncertain: [] }, { returnCode: 1 })),
+      'tool calls: 0 made while the script ran and 1 before it started, answered while it waited.');
+  });
+
+  it('names ten, and counts the rest by tool, those past what the record lists included', () => {
+    const uncertain = [...Array(10).keys()].map((i) => running(i)).concat([running(10, 'c--d'), running(11), running(12, 'c--d')]);
+    const lines = callsLine(ended({ made: 13, uncertain }, { aborted: true, returnCode: 1 }))!.split('\n');
+    assert.strictEqual(lines.length, 12);
+    assert.strictEqual(lines[10], `${STILL_RUNNING} a--b {"i":9}`);
+    assert.strictEqual(lines[11], '- and 3 more: c--d \u00d72, a--b \u00d71');
+    const past = callsLine(ended({ made: 20, uncertain: [running(0)], unlisted: { 'a--b': 2, 'e--f': 3 } }))!.split('\n');
+    assert.deepStrictEqual(past, [
+      'tool calls: 20 made while the script ran, 14 answered while it waited; the other 6:',
+      `${STILL_RUNNING} a--b {"i":0}`,
+      '- and 5 more: a--b \u00d72, e--f \u00d73',
+    ]);
+  });
+});
+
+describe("callBrief: what a call's record keeps of its arguments or its answer", () => {
+  it('keeps a copy of what it shows, so a kept brief holds no long text alive', () => {
+    setFlagsFromString('--expose-gc');
+    const gc = runInNewContext('gc') as () => void;
+    gc();
+    const before = process.memoryUsage().heapUsed;
+    // Briefs of answers as long as the framework gives a script: a slice of
+    // each would keep its whole answer, 100 MB for the twenty.
+    const kept = Array.from({ length: 20 }, (_, i) => callBrief(`${i}:`.padEnd(5_000_000, 'x')));
+    gc();
+    const grown = process.memoryUsage().heapUsed - before;
+    assert.ok(grown < 20_000_000, `twenty briefs of 5,000,000-character texts kept ${grown} bytes`);
+    assert.strictEqual(kept[0], `0:${'x'.repeat(118)}\u2026`);
+  });
+});
+
+describe("scriptStderr: a result's stderr without the runner's own words", () => {
+  const result = (stderr: string, runnerNote?: string): ExecResult =>
+    ({ stdout: '', stderr, returnCode: 1, ...(runnerNote === undefined ? {} : { aborted: true, runnerNote }) });
+
+  it('takes off the words that end it, with or without the line end after them', () => {
+    const why = 'script aborted by host: test abort';
+    const note = 'script stopped: it reached its 1s time limit. Tool calls it had already made keep their effects.';
+    // As the runner ends stderr: the reason after the script's own line, the time-limit note after both.
+    assert.strictEqual(scriptStderr(result(`Traceback\nValueError: x\n${why}`, why)), 'Traceback\nValueError: x\n');
+    assert.strictEqual(scriptStderr(result(`partial\n${why}\n${note}\n`, `${why}\n${note}`)), 'partial\n');
+    assert.strictEqual(scriptStderr(result(`Traceback\n${note}\n`, note)), 'Traceback\n');
+    // A script that didn't run wrote nothing.
+    assert.strictEqual(scriptStderr(result(why, why)), '');
+  });
+
+  it("is the whole stderr when the runner added no words, or the stderr doesn't end with them on a line of their own", () => {
+    assert.strictEqual(scriptStderr(result('Traceback\n')), 'Traceback\n');
+    assert.strictEqual(scriptStderr(result('the script wrote: done', 'done')), 'the script wrote: done');
+    assert.strictEqual(scriptStderr(result('something else\n', 'done')), 'something else\n');
+  });
+});
+
+/** A module whose one tool, hold--wait, answers only once the test releases it, or the module stops. */
+class HoldToolModule implements Module {
+  readonly name = 'hold';
+  readonly calls: ToolCall[] = [];
+  private readonly answers: Array<(result: ToolResult) => void> = [];
+
+  async start(_ctx: ModuleContext): Promise<void> {}
+  async stop(): Promise<void> {
+    this.release();
+  }
+
+  getTools(): ToolDefinition[] {
+    return [{ name: 'wait', description: 'Answers once released.', inputSchema: { type: 'object', properties: { what: { type: 'string' } } } }];
+  }
+
+  handleToolCall(call: ToolCall): Promise<ToolResult> {
+    this.calls.push(call);
+    return new Promise((resolve) => this.answers.push(resolve));
+  }
+
+  async onProcess(): Promise<EventResponse> {
+    return {};
+  }
+
+  release(): void {
+    for (const answer of this.answers.splice(0)) answer({ success: true, data: { released: true } });
+  }
+}
+
+describe("framework code_execution: the result names the calls a script didn't see answered (real python3)", () => {
+  const STILL_RUNNING = '- still running when the script ended, so it may still take effect:';
+
+  async function withHold(body: (framework: AgentFramework, hold: HoldToolModule) => Promise<void>): Promise<void> {
+    const { tempDir, storePath } = tempStorePath('pytc-calls-');
+    const membrane = new MockMembrane();
+    // The answer to a background script's wake.
+    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'noted' }]));
+    const hold = new HoldToolModule();
+    const framework = await AgentFramework.create({
+      storePath,
+      membrane: membrane.asMembrane(),
+      agents: [{ name: 'prime', model: 'test-model', systemPrompt: 'You are prime.', allowedTools: 'all' }],
+      modules: [new ScriptToolModule(), hold],
+      syncIntervalMs: 0,
+      codeExecution: { enabled: true, wakeMinIntervalMs: 0 },
+    });
+    try {
+      // A script's calls come back through the framework's event loop.
+      framework.start();
+      await body(framework, hold);
+    } finally {
+      hold.release();
+      await framework.stop();
+      rmSync(tempDir, { recursive: true, force: true });
+    }
+  }
+
+  const run = (framework: AgentFramework, input: Record<string, unknown>) =>
+    framework.executeToolCall({ id: `ce-${Math.random()}`, name: 'code_execution', input, callerAgentName: 'prime' });
+  const dataOf = (result: ToolResult) => result.data as Record<string, unknown>;
+  // A foreground script's result: the text the model reads, and the fields a host reads.
+  const textOf = (result: ToolResult) => (result.data as Array<{ type: string; text: string }>)[0]!.text;
+  const structuredOf = (result: ToolResult) => result.structured as Record<string, unknown>;
+
+  it("a script stopped at its time limit names the calls it left running after the runner's words, ahead of its output, and one that fails counts its calls", async () => {
+    await withHold(async (framework) => {
+      const result = await run(framework, {
+        code: 'import asyncio\nawait test__echo({"message": "a"})\nasyncio.ensure_future(hold__wait({"what": "x"}))\nawait asyncio.sleep(60)',
+        // Room for both calls before the limit, on a loaded host too.
+        time_limit_ms: 3000,
+      });
+      const line = `tool calls: 2 made while the script ran, 1 answered while it waited; the other one:\n${STILL_RUNNING} hold--wait {"what":"x"}`;
+      const stopped = structuredOf(result);
+      assert.strictEqual(Object.keys(stopped)[0], 'tool_calls', JSON.stringify(stopped));
+      assert.strictEqual(stopped.tool_calls, line);
+      // How it ended comes first: the exit code, the runner's words and the
+      // line, then stderr without the runner's words, which a host still reads
+      // at the end of the stderr it gets.
+      const text = textOf(result);
+      const note = /^exit code: \d+\n(script stopped: it reached its 3s time limit\. [^\n]*)\n/.exec(text)?.[1];
+      assert.ok(note !== undefined, text);
+      assert.ok(text.startsWith(`exit code: ${stopped.return_code}\n${note}\n${line}\n--- stderr ---\n`), text);
+      assert.strictEqual(text.split(note).length, 2, text);
+      assert.ok(String(stopped.stderr).endsWith(`\n${note}\n`), String(stopped.stderr));
+      const failedResult = await run(framework, { code: 'await test__echo({"message": "b"})\nraise ValueError("no")' });
+      const failed = structuredOf(failedResult);
+      assert.strictEqual(failed.tool_calls, 'tool calls: 1 made while the script ran, answered while it waited.');
+      // A script that fails on its own has no words of the runner's: the line
+      // follows the exit code, ahead of the traceback.
+      assert.ok(textOf(failedResult).startsWith(`exit code: 1\n${failed.tool_calls}\n--- stderr ---\nTraceback`), textOf(failedResult));
+    });
+  });
+
+  it('a script that finishes on its own says nothing of its calls, unless it left one running', async () => {
+    await withHold(async (framework) => {
+      const quietResult = await run(framework, { code: 'print(await test__echo({"message": "c"}))' });
+      const quiet = structuredOf(quietResult);
+      assert.strictEqual(quiet.return_code, 0, String(quiet.stderr));
+      assert.ok(!('tool_calls' in quiet), JSON.stringify(quiet));
+      assert.ok(!textOf(quietResult).includes('tool calls'), textOf(quietResult));
+      const leftResult = await run(framework, { code: 'import asyncio\nasyncio.ensure_future(hold__wait({"what": "y"}))\nawait asyncio.sleep(0.2)' });
+      const left = structuredOf(leftResult);
+      const line = `tool calls: 1 made while the script ran, 0 answered while it waited; the other one:\n${STILL_RUNNING} hold--wait {"what":"y"}`;
+      assert.strictEqual(left.return_code, 0, String(left.stderr));
+      assert.strictEqual(left.tool_calls, line);
+      assert.ok(textOf(leftResult).startsWith(`exit code: 0\n${line}\n`), textOf(leftResult));
+    });
+  });
+
+  it('a background script that dies names the calls it left running in the wake, before its last output', async () => {
+    await withHold(async (framework) => {
+      const started = await run(framework, {
+        code: 'import asyncio\nasyncio.ensure_future(hold__wait({"what": "z"}))\nawait asyncio.sleep(0.2)\nraise ValueError("watcher exploded")',
+        background: true,
+      });
+      assert.strictEqual(started.success, true, JSON.stringify(started));
+      let text = '';
+      await until(() => {
+        const messages = (framework.getAgent('prime')?.getContextManager().queryMessages({}).messages ?? []) as unknown as
+          Array<{ content: Array<{ text?: string }>; metadata?: { source?: string } }>;
+        text = messages.find((m) => m.metadata?.source === 'background-script')?.content[0]?.text ?? '';
+        return text !== '';
+      }, 'the wake');
+      assert.ok(text.includes(`(it did not call wake_agent and is no longer watching).\ntool calls: 1 made while the script ran, 0 answered while it waited; the other one:\n${STILL_RUNNING} hold--wait {"what":"z"}\nLast output:\n`), text);
+    });
+  });
+
+  it("a cancel's result names, first, the calls the cancelled script left running", async () => {
+    await withHold(async (framework, hold) => {
+      const started = await run(framework, {
+        code: 'import asyncio\nasyncio.ensure_future(hold__wait({"what": "w"}))\nawait asyncio.sleep(60)',
+        background: true,
+      });
+      const scriptId = (started.data as { script_id: string }).script_id;
+      await until(() => hold.calls.length === 1, 'the call');
+      const cancelled = dataOf(await run(framework, { action: 'cancel', script_id: scriptId }));
+      assert.strictEqual(Object.keys(cancelled)[0], 'tool_calls', JSON.stringify(cancelled));
+      assert.strictEqual(cancelled.tool_calls, `tool calls: 1 made while the script ran, 0 answered while it waited; the other one:\n${STILL_RUNNING} hold--wait {"what":"w"}`);
+      assert.strictEqual(cancelled.status, 'cancelled');
+    });
   });
 });

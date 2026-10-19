@@ -1,14 +1,14 @@
 /**
  * What the model reads when a foreground `code_execution` script ends.
  *
- * How the script ended comes first: its exit code, and the time-limit note
- * when the call's limit was capped. stderr comes next, ahead of stdout: its
- * end holds a traceback, and for a script the runner stopped, why it stopped,
- * which the runner writes on a line of its own after the script's own stderr.
+ * How the script ended comes first: its exit code, the time-limit note when
+ * the call's limit was capped, the runner's own words when it has any, such
+ * as why it stopped the script, and what the script's tool calls left
+ * uncertain. stderr comes next, ahead of stdout: its end holds a traceback.
  * Within a budget, each stream is cut to its head and its tail around a count
  * of what was cut, and stderr keeps a share of the room of its own, so in any
  * budget that holds a cut of each stream, however long stdout runs, it can't
- * push the exit code or stderr's end out of view.
+ * push how the script ended or stderr's end out of view.
  */
 
 export interface ScriptEnd {
@@ -17,6 +17,10 @@ export interface ScriptEnd {
   returnCode: number;
   /** Set when the call's time_limit_ms was capped at the deployment's maximum. */
   timeLimitNote?: string;
+  /** The runner's own words, when it has any (ExecResult.runnerNote); stderr goes without them (scriptStderr). */
+  runnerNote?: string;
+  /** What the script's tool calls left uncertain, when there's something to say (callsLine). */
+  toolCalls?: string;
 }
 
 /** The whole text, nothing cut. */
@@ -46,7 +50,10 @@ export function scriptEndTextWithin(end: ScriptEnd, budget: number): string | nu
 }
 
 function heading(end: ScriptEnd): string {
-  return `exit code: ${end.returnCode}\n` + (end.timeLimitNote ? `time limit: ${end.timeLimitNote}\n` : '');
+  return `exit code: ${end.returnCode}\n`
+    + (end.timeLimitNote ? `time limit: ${end.timeLimitNote}\n` : '')
+    + (end.runnerNote ? `${end.runnerNote}\n` : '')
+    + (end.toolCalls ? `${end.toolCalls}\n` : '');
 }
 
 /** A stream under its label, ending in a newline; nothing for an empty stream. */

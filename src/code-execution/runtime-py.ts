@@ -9,8 +9,9 @@
  *   - host tools are injected as async functions taking a single dict and
  *     returning the tool_result text as a str (ToolResult), which also
  *     carries .is_error and .structured
- *   - a pending tool call that gets no response raises TimeoutError with the
- *     same message shape the managed runtime produces
+ *   - a pending tool call that gets no response raises TimeoutError, opening
+ *     with the message the managed runtime produces and saying the call may
+ *     still take effect; the runtime tells the host (tool_unwaited)
  *   - interpreter globals persist across execs (container-reuse semantics)
  *
  * BACKGROUND MODE (model-authored daemons): when init carries
@@ -80,7 +81,18 @@
  *                              can't tell that from a script's own shutdown
  *                              of the socket under fd 3.
  *   py -> host : {op:"ready"}
- *                {op:"tool_call", id, exec_id, name, args}
+ *                {op:"tool_call", id, exec_id, name, args}   exec_id
+ *                              is the exec running when it was sent, or
+ *                              null between scripts; PyRunner files a
+ *                              call by when it reads it instead
+ *                {op:"tool_unwaited", id, cause}   the code that
+ *                              made that call stopped waiting for it, before
+ *                              it saw an answer: at call_timeout_s, with
+ *                              TimeoutError (cause "timeout"), or because
+ *                              the script cancelled it ("cancelled"), not
+ *                              when the host stopped the script or the
+ *                              runtime cancelled the call at its end; the
+ *                              call may still be running
  *                {op:"wake", id, exec_id, line, payload}
  *                {op:"exec_result", id, return_code}
  *
@@ -722,10 +734,25 @@ def _make_tool_fn(tool_name, py_name):
         try:
             return await asyncio.wait_for(fut, timeout=CALL_TIMEOUT_S)
         except asyncio.TimeoutError:
+            # The host keeps the call as one its code stopped waiting for,
+            # which the result names, with the answer if one comes in time.
+            send({"op": "tool_unwaited", "id": call_id, "cause": "timeout"})
             raise TimeoutError(
                 "Calling tool ['" + tool_name + "'] timed out (no response after "
-                + str(int(CALL_TIMEOUT_S)) + "s)."
+                + str(int(CALL_TIMEOUT_S)) + "s). The call was sent and may still "
+                "take effect, so check for its effect before calling it again."
             )
+        except asyncio.CancelledError:
+            # The script's own code stopped waiting, as with a shorter
+            # wait_for or a TaskGroup whose other task failed, and may call
+            # again: the host names the call as after a timeout. A call whose
+            # future the runtime cancelled at the script's end, which it took
+            # out of the pending calls then, and a stop the host asked for are
+            # the host's to know: their calls read as still running when the
+            # script ended.
+            if call_id in _pending_tool_futures and not (_stop is not None and _stop.state == _DELIVERED):
+                send({"op": "tool_unwaited", "id": call_id, "cause": "cancelled"})
+            raise
         finally:
             _pending_tool_futures.pop(call_id, None)
     tool_fn.__name__ = py_name

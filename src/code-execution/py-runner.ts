@@ -47,6 +47,57 @@ export interface ExecResult {
   /** Background execs: rolling tail of interleaved stdout+stderr (for the
    *  crash/finish envelope; the full journal is in the log file). */
   tail?: string;
+  /**
+   * The runner's own words that end the result, one to a line, which also end
+   * stderr (a background script's journal too). Set exactly when it adds them:
+   * - why it stopped the script: at an abort, a dispose, a kill at the time
+   *   limit, or the interpreter's exit under the script, with `aborted`;
+   * - the time-limit note, after a script it stopped at its limit reports
+   *   (`aborted` unset), or after the reason above;
+   * - why the script didn't run (another is running, or the runner was
+   *   disposed), with `aborted`;
+   * - why the interpreter didn't start, with `aborted`.
+   * Absent when the script ended on its own.
+   */
+  runnerNote?: string;
+  /** The tool calls made while the script ran, and any it took on from before it started, as the host saw them when the script ended: when it read the script's end, or stopped it. Absent when there were none. */
+  calls?: ScriptCalls;
+}
+
+/**
+ * The tool calls made while a script ran, as the host saw them when the script
+ * ended: by its own code, or by a task or a thread an earlier script left
+ * running, since a call named in no result would leave an effect that may
+ * still come unsaid.
+ */
+export interface ScriptCalls {
+  /** How many were made while it ran. */
+  made: number;
+  /** How many it took on from before it started: calls made while no script ran that were still waiting for their answer then, or answered after their code stopped waiting. Absent when none. */
+  before?: number;
+  /** Those whose answer wasn't seen while the script waited, in the order made, but for those `unlisted` counts; the rest were answered while it waited. */
+  uncertain: UncertainCall[];
+  /** Calls answered after the script stopped waiting for them, past the first CALLS_KEPT of those, which `uncertain` doesn't list: how many, by tool. */
+  unlisted?: Record<string, number>;
+}
+
+/** A tool call whose answer its script didn't see while it waited, so the agent can't tell its effect from the script. */
+export interface UncertainCall {
+  /** The tool's name, as the framework knows it. */
+  tool: string;
+  /** Its arguments as JSON, cut to CALL_BRIEF_CHARS. */
+  args: string;
+  /**
+   * - `running`: no answer had come when the script ended, so it may still take effect.
+   * - `timed-out-running`: the call's code stopped waiting at its tool-call timeout, and no answer had come when the script ended.
+   * - `cancelled-running`: the script cancelled the call's code, as with a shorter wait_for of its own, and no answer had come when the script ended.
+   * - `answered-unseen`: the answer came before the script ended, but after the call's code stopped waiting, at its tool-call timeout, when the script cancelled it, or with the interpreter that made the call gone.
+   */
+  state: 'running' | 'timed-out-running' | 'cancelled-running' | 'answered-unseen';
+  /** For `answered-unseen`: the answer's start, cut to CALL_BRIEF_CHARS. */
+  answer?: string;
+  /** For `answered-unseen`: set when the answer was an error (ScriptToolResult.isError), which a cut answer's start can leave out of view. */
+  isError?: true;
 }
 
 /** Per-exec options for background (daemon) scripts. */
@@ -181,6 +232,131 @@ export function formatLimit(ms: number): string {
 /** `line` after `text`, on a line of its own: a text that doesn't end with a newline gets one first. */
 function onItsOwnLine(text: string, line: string): string {
   return (text === '' || text.endsWith('\n') ? text : `${text}\n`) + line;
+}
+
+/**
+ * A result's stderr without the runner's own words (runnerNote), which end it
+ * on lines of their own, so a text that shows them elsewhere says them once:
+ * what the script and the commands it ran wrote, and the line end the runner
+ * added before its words. The whole stderr when it doesn't end with them.
+ */
+export function scriptStderr(result: ExecResult): string {
+  const { stderr, runnerNote } = result;
+  if (runnerNote === undefined) return stderr;
+  const start = stderr.endsWith(`${runnerNote}\n`) ? stderr.length - runnerNote.length - 1
+    : stderr.endsWith(runnerNote) ? stderr.length - runnerNote.length
+    : -1;
+  if (start < 0 || (start > 0 && stderr[start - 1] !== '\n')) return stderr;
+  return stderr.slice(0, start);
+}
+
+/** Why a script stopped, or didn't run, once its runner was disposed. */
+const DISPOSED = 'code_execution runner disposed';
+
+/** How much of a call's arguments, and of its answer, a result that names the call shows. */
+const CALL_BRIEF_CHARS = 120;
+/**
+ * How many calls of two kinds an exec keeps (CallRecords), so that a background
+ * script that runs for a day doesn't hold every call it made:
+ * - of those answered while the script waited, the most recent, in case word
+ *   comes that it had stopped waiting for one. Once 1,000 more are answered
+ *   before that word, the call counts as answered while the script waited.
+ * - of those answered after it stopped waiting, the first, which the result
+ *   lists. It counts the rest by tool.
+ * A call still waiting for its answer is held until the answer comes, which the
+ * framework gives within the tool-call timeout and 30 s more.
+ */
+const CALLS_KEPT = 1000;
+/** How many of the calls whose answer a script didn't see its result names; it counts the rest by tool. */
+const CALLS_NAMED = 10;
+
+/**
+ * `text` cut to CALL_BRIEF_CHARS with "…", never between a surrogate pair's
+ * halves. The characters it keeps are copied: on V8 a slice of a string keeps
+ * the whole string alive, so a kept brief of a long answer would hold the
+ * answer for as long as the record keeps the call.
+ */
+export function callBrief(text: string): string {
+  const cut = text.length > CALL_BRIEF_CHARS;
+  const end = !cut ? text.length
+    : /[\uD800-\uDBFF]/.test(text.charAt(CALL_BRIEF_CHARS - 1)) ? CALL_BRIEF_CHARS - 1 : CALL_BRIEF_CHARS;
+  const kept = text.slice(0, end).split('').join('');
+  return cut ? `${kept}…` : kept;
+}
+
+/**
+ * A call's arguments as JSON, cut as callBrief cuts. Each string and array is
+ * cut first, to no less than the brief can show, so a long text or list costs
+ * no more than a short one; an object with many keys, or a long key, is still
+ * made into JSON whole.
+ */
+function argsBrief(args: Record<string, unknown>): string {
+  return callBrief(JSON.stringify(args, (_key, value: unknown) =>
+    (typeof value === 'string' || Array.isArray(value)) && value.length > CALL_BRIEF_CHARS ? value.slice(0, CALL_BRIEF_CHARS) : value));
+}
+
+function newCallRecords(): CallRecords {
+  return { made: 0, before: 0, ended: false, open: new Map(), answered: new Map(), late: [], lateUnlisted: new Map() };
+}
+
+/** Keep a call answered after its script stopped waiting for it: listed, up to CALLS_KEPT of them, and past that counted by tool. */
+function keepLate(calls: CallRecords, call: KeptCall): void {
+  if (calls.late.length < CALLS_KEPT) calls.late.push(call);
+  else calls.lateUnlisted.set(call.tool, (calls.lateUnlisted.get(call.tool) ?? 0) + 1);
+}
+
+/** The calls made while an exec's script ran, and those it took on, as its result carries them: those whose answers weren't seen, in the order made. */
+function settledCalls(calls: CallRecords): ScriptCalls {
+  const uncertain: Array<UncertainCall & { n: number }> = [
+    ...[...calls.open.values()].map((c) => ({
+      n: c.n, tool: c.tool, args: c.args,
+      state: c.unwaited === 'timeout' ? 'timed-out-running' as const : c.unwaited === 'cancelled' ? 'cancelled-running' as const : 'running' as const,
+    })),
+    ...calls.late.map((c) => ({ ...c, state: 'answered-unseen' as const })),
+  ].sort((a, b) => a.n - b.n);
+  return {
+    made: calls.made,
+    ...(calls.before > 0 ? { before: calls.before } : {}),
+    uncertain: uncertain.map(({ n: _n, ...call }) => call),
+    ...(calls.lateUnlisted.size > 0 ? { unlisted: Object.fromEntries(calls.lateUnlisted) } : {}),
+  };
+}
+
+/**
+ * What a script's result says of its tool calls, so the agent can tell which
+ * effects took place: after an error, a stop or a crash, how many it made and
+ * which it didn't see answered; after it ended on its own, only those it
+ * didn't see answered, if any. Null when there's nothing to say.
+ */
+export function callsLine(result: ExecResult): string | null {
+  const calls = result.calls;
+  const before = calls?.before ?? 0;
+  const total = (calls?.made ?? 0) + before;
+  if (!calls || total === 0) return null;
+  const made = `${calls.made} made while the script ran${before > 0 ? ` and ${before} before it started` : ''}`;
+  const unseen = calls.uncertain;
+  const unlisted = Object.entries(calls.unlisted ?? {});
+  const others = unseen.length + unlisted.reduce((sum, [, n]) => sum + n, 0);
+  if (others === 0) {
+    if (result.aborted !== true && result.returnCode === 0) return null;
+    return `tool calls: ${made}, ${total === 1 ? '' : 'all '}answered while it waited.`;
+  }
+  const lines = [`tool calls: ${made}, ${total - others} answered while it waited; the other ${others === 1 ? 'one' : others}:`];
+  for (const call of unseen.slice(0, CALLS_NAMED)) {
+    const named = `${call.tool} ${call.args}`;
+    lines.push(
+      call.state === 'running' ? `- still running when the script ended, so it may still take effect: ${named}`
+        : call.state === 'timed-out-running' ? `- timed out in the script and still running, so it may still take effect: ${named}`
+        : call.state === 'cancelled-running' ? `- cancelled in the script and still running, so it may still take effect: ${named}`
+        : `- answered ${call.isError ? 'with an error ' : ''}after its code stopped waiting: ${named}, answer ${JSON.stringify(call.answer ?? '')}`,
+    );
+  }
+  const byTool = new Map<string, number>();
+  for (const call of unseen.slice(CALLS_NAMED)) byTool.set(call.tool, (byTool.get(call.tool) ?? 0) + 1);
+  for (const [tool, n] of unlisted) byTool.set(tool, (byTool.get(tool) ?? 0) + n);
+  const rest = others - Math.min(unseen.length, CALLS_NAMED);
+  if (rest > 0) lines.push(`- and ${rest} more: ${[...byTool].map(([tool, n]) => `${tool} ×${n}`).join(', ')}`);
+  return lines.join('\n');
 }
 
 /** Add a line of the runner's own to a background script's journal, on a line of its own. */
@@ -606,10 +782,10 @@ function interpreterExit(exitCode: number | null, signal: NodeJS.Signals | null,
   // such as a progress bar's, they follow on that line. SIGKILL is the out-of-memory killer's; any
   // other signal, the script can send itself.
   const check = taken
-    ? `check whether the script closes, shuts down or replaces ${taken}, as the runtime's line above says`
+    ? `check whether the script closes, shuts down or replaces ${taken}, as the runtime's line starting "[pytc-runtime]" says`
     : signal && CRASH_SIGNALS.has(signal)
       ? said.includes(CRASH_TRACEBACK)
-        ? 'check the traceback above for the call that crashed in native code, such as an extension module the script uses'
+        ? 'check the traceback that starts "Fatal Python error:" for the call that crashed in native code, such as an extension module the script uses'
         : 'check whether native code the script calls crashes, such as an extension module it uses'
       : `check whether the script itself ends the process, for example ${
         signal === 'SIGKILL' ? 'by using too much memory' : signal ? 'with os.kill()' : 'with os._exit()'}`;
@@ -659,6 +835,59 @@ interface PendingExec {
   returnCode: number | null;
   /** Set when the host settled the exec itself (stopPending), rather than its result and marks. */
   stopped?: true;
+  /** The script's tool calls so far. */
+  calls: CallRecords;
+}
+
+/**
+ * The tool calls made while a script runs, each by its interpreter and the
+ * runtime's call id, which is unique within an interpreter (PyRunner.callKey);
+ * those made while none runs wait in the runner's own record, which the next
+ * exec takes on (PyRunner.loose). The runtime alone knows whether a call's
+ * answer was seen: it says when the code that made a call stopped waiting for
+ * it, at its timeout or because the script cancelled it (tool_unwaited), which
+ * can arrive after the answer has gone, as when the script held its event loop
+ * past the call's timeout with the answer queued behind it.
+ */
+interface CallRecords {
+  /** How many were made while the script ran. */
+  made: number;
+  /** How many it took on from before it started (PyRunner.takeLoose). */
+  before: number;
+  /**
+   * Set once the host reads the script's end (exec_result): the record is
+   * then the calls as the host saw them when the script ended, so a later
+   * answer leaves its call as still running then, and a later call goes to
+   * the next exec's record.
+   */
+  ended: boolean;
+  /** Calls with no answer yet. */
+  open: Map<string, OpenCall>;
+  /** Calls answered with no word that the script stopped waiting: the last CALLS_KEPT of them. */
+  answered: Map<string, KeptCall>;
+  /** Calls answered after the script stopped waiting for them: the first CALLS_KEPT of them (keepLate). */
+  late: KeptCall[];
+  /** The rest of those, by tool. */
+  lateUnlisted: Map<string, number>;
+}
+
+interface KeptCall {
+  /** Its place among the runner's calls, for the order made. */
+  n: number;
+  tool: string;
+  /** Its arguments, as argsBrief gives them. */
+  args: string;
+  /** The start of its answer, as callBrief gives it. */
+  answer: string;
+  /** Set when the answer was an error (ScriptToolResult.isError). */
+  isError?: true;
+  /** Set on one answered while no script ran, which the next exec keeps only for word that its code had stopped waiting (takeLoose). */
+  uncounted?: true;
+}
+
+interface OpenCall extends Omit<KeptCall, 'answer'> {
+  /** Why its code stopped waiting for it, when the runtime says it did (tool_unwaited). */
+  unwaited: 'timeout' | 'cancelled' | null;
 }
 
 /** Interpreters started in this process, by every runner: each one's number. */
@@ -699,6 +928,10 @@ export class PyRunner {
   private err: OutputStream | null = null;
   private runtimeDir: string | null = null;
   private pending: PendingExec | null = null;
+  /** The calls made while no exec is pending, which the next exec takes on (takeLoose). */
+  private loose: CallRecords = newCallRecords();
+  /** How many calls the runner has kept: each one's place in the order made. */
+  private callCounter = 0;
   private idleTimer: ReturnType<typeof setTimeout> | null = null;
   private execCounter = 0;
   /** The number of this runner's latest interpreter (interpretersStarted). */
@@ -761,16 +994,12 @@ export class PyRunner {
     opts?: { deadlineMs?: number; ceilingMs?: number; backgroundCeilingMs?: number },
   ): Promise<ExecResult> {
     if (this.disposed) {
-      return { stdout: '', stderr: 'code_execution runner disposed', returnCode: 1, aborted: true };
+      return { stdout: '', stderr: DISPOSED, returnCode: 1, aborted: true, runnerNote: DISPOSED };
     }
     if (this.busy) {
-      return {
-        stdout: '',
-        stderr: "script didn't run: another code_execution script of yours is already running, and they run one at a time. "
-          + 'Run this one again once that one has finished, or combine the two into one script.',
-        returnCode: 1,
-        aborted: true,
-      };
+      const busy = "script didn't run: another code_execution script of yours is already running, and they run one at a time. "
+        + 'Run this one again once that one has finished, or combine the two into one script.';
+      return { stdout: '', stderr: busy, returnCode: 1, aborted: true, runnerNote: busy };
     }
     this.clearIdleTimer();
 
@@ -794,6 +1023,7 @@ export class PyRunner {
       sent: false,
       journal: null,
       returnCode: null,
+      calls: this.takeLoose(),
     };
     this.pending = pending;
     try {
@@ -802,12 +1032,8 @@ export class PyRunner {
       // Settled already when an abort or dispose reclaimed the interpreter
       // as it started; another exec may have claimed the runner since.
       if (!pending.settled) {
-        this.settlePending({
-          stdout: '',
-          stderr: startFailure(this.pythonPath, err),
-          returnCode: 1,
-          aborted: true,
-        });
+        const failed = startFailure(this.pythonPath, err);
+        this.settlePending({ stdout: '', stderr: failed, returnCode: 1, aborted: true, runnerNote: failed });
         this.reclaim('spawn-failed');
       }
       return settled;
@@ -884,8 +1110,37 @@ export class PyRunner {
   dispose(): void {
     if (this.disposed) return;
     this.disposed = true;
-    this.stopPending('code_execution runner disposed');
+    this.stopPending(DISPOSED);
     this.reclaim('dispose');
+  }
+
+  /** The record a call read now goes to: the pending exec's while its script runs, else the one the next exec takes on. */
+  private callRecords(): CallRecords {
+    const calls = this.pending?.calls;
+    return calls && !calls.ended ? calls : this.loose;
+  }
+
+  /** A call's key in the records: its interpreter's number (interpretersStarted) and the runtime's call id, so a call taken on from an interpreter that has gone doesn't meet the next one's. */
+  private callKey(interpreter: number, callId: string): string {
+    return `${interpreter}:${callId}`;
+  }
+
+  /**
+   * A new exec's record of its calls: the runner's record of those made while
+   * no script ran, so that a call from code an earlier script left running,
+   * still waiting for its answer when the next script starts or answered after
+   * its code stopped waiting, is named in that script's result. Those answered
+   * while their code waited are kept uncounted, since their effect came and was
+   * seen, unless word comes that their code had stopped waiting after all, as
+   * a held loop can bring once the next exec has started.
+   */
+  private takeLoose(): CallRecords {
+    const calls = this.loose;
+    this.loose = newCallRecords();
+    calls.before = calls.open.size + calls.late.length + [...calls.lateUnlisted.values()].reduce((sum, n) => sum + n, 0);
+    calls.made = 0;
+    for (const call of calls.answered.values()) call.uncounted = true;
+    return calls;
   }
 
   // -------------------------------------------------------------------------
@@ -923,6 +1178,7 @@ export class PyRunner {
     });
     this.child = child;
     this.interpreterNumber = ++interpretersStarted;
+    const interpreter = this.interpreterNumber;
     const protoIn = child.stdio[3] as Writable;
     const protoOut = child.stdio[4] as Readable;
     this.protoIn = protoIn;
@@ -1012,7 +1268,7 @@ export class PyRunner {
     });
 
     this.reader = createInterface({ input: protoOut });
-    this.reader.on('line', (line) => this.handleLine(line, child));
+    this.reader.on('line', (line) => this.handleLine(line, child, interpreter));
     // readline passes its input's error on to the interface, where with no
     // listener it would be thrown as an uncaught exception and end the host.
     // protoOut's own listener above logs it.
@@ -1061,8 +1317,9 @@ export class PyRunner {
   /** Fails the readiness of an interpreter that is still starting (see reclaim). */
   private readyFailer: ((err: Error) => void) | null = null;
 
-  private handleLine(line: string, child: ChildProcess): void {
-    let msg: { op?: string; id?: string; name?: string; args?: unknown; return_code?: number };
+  /** A line from an interpreter's runtime: `child`, whose number is `interpreter`. */
+  private handleLine(line: string, child: ChildProcess, interpreter: number): void {
+    let msg: { op?: string; id?: string; name?: string; args?: unknown; return_code?: number; cause?: unknown };
     try {
       msg = JSON.parse(line);
     } catch {
@@ -1083,6 +1340,16 @@ export class PyRunner {
           msg.args && typeof msg.args === 'object' && !Array.isArray(msg.args)
             ? (msg.args as Record<string, unknown>)
             : {};
+        // The exec pending when the call arrives keeps it (CallRecords),
+        // whatever code made it, a task or a thread an earlier script left
+        // running included: a call named in no result would leave an effect
+        // that may still come unsaid. One that arrives while none is pending,
+        // or once the pending one's script has ended, waits for the next
+        // (takeLoose).
+        const calls = this.callRecords();
+        const key = this.callKey(interpreter, callId);
+        calls.made++;
+        calls.open.set(key, { n: this.callCounter++, tool: toolName, args: argsBrief(args), unwaited: null });
         this.onToolCall(toolName, args)
           .catch((err): ScriptToolResult => ({
             text: `Error: ${err instanceof Error ? err.message : String(err)}`,
@@ -1092,6 +1359,26 @@ export class PyRunner {
             // Only an object is a ScriptToolResult. Anything else a handler
             // resolves with, a string or a value its type rules out, is sent
             // as it is, so the call is still answered.
+            const answer = typeof result === 'object' && result !== null ? result.text : result;
+            const call = calls.ended ? undefined : calls.open.get(key);
+            if (call) {
+              calls.open.delete(key);
+              // A value the handler's type rules out is kept as no text:
+              // callBrief takes a string, and a throw here would leave the
+              // call unanswered.
+              const kept: KeptCall = {
+                n: call.n, tool: call.tool, args: call.args, answer: callBrief(typeof answer === 'string' ? answer : ''),
+                ...(typeof result === 'object' && result !== null && result.isError === true ? { isError: true as const } : {}),
+              };
+              // Code whose interpreter has exited or been killed can't see the
+              // answer either, whether or not the runner has torn it down yet.
+              if (call.unwaited !== null || !alive(child)) {
+                keepLate(calls, kept);
+              } else {
+                calls.answered.set(key, kept);
+                if (calls.answered.size > CALLS_KEPT) calls.answered.delete(calls.answered.keys().next().value!);
+              }
+            }
             const reply = typeof result === 'object' && result !== null
               ? {
                 op: 'tool_result',
@@ -1103,6 +1390,29 @@ export class PyRunner {
               : { op: 'tool_result', id: callId, result };
             this.reply(child, reply, `result of ${toolName} call ${callId}`);
           });
+        return;
+      }
+
+      case 'tool_unwaited': {
+        // The script stopped waiting for the call, at its timeout or because
+        // it cancelled it (runtime-py.ts tool_fn), so the result names it,
+        // with the start of its answer if one comes: the script may call
+        // again, and that answer tells whether the first call did anything.
+        // The runtime drops an answer that arrives after this.
+        const calls = this.callRecords();
+        const key = this.callKey(interpreter, String(msg.id));
+        const open = calls.open.get(key);
+        if (open) open.unwaited = msg.cause === 'cancelled' ? 'cancelled' : 'timeout';
+        const answered = calls.answered.get(key);
+        if (answered) {
+          calls.answered.delete(key);
+          // One answered while no script ran is counted only now (takeLoose).
+          if (answered.uncounted) {
+            delete answered.uncounted;
+            calls.before++;
+          }
+          keepLate(calls, answered);
+        }
         return;
       }
 
@@ -1128,6 +1438,7 @@ export class PyRunner {
         const pending = this.pending;
         if (pending && msg.id === pending.id && pending.returnCode === null) {
           pending.returnCode = typeof msg.return_code === 'number' ? msg.return_code : 1;
+          pending.calls.ended = true;
           this.settleIfComplete(child);
         }
         return;
@@ -1182,10 +1493,10 @@ export class PyRunner {
       // own tools, when it has one that hasn't reached its cap or failed a
       // write, and in its tail, which the result carries.
       writeLine(journal, why);
-      this.settlePending({ stdout: '', stderr: why, returnCode, aborted: true, tail: journal.tail });
+      this.settlePending({ stdout: '', stderr: why, returnCode, aborted: true, tail: journal.tail, runnerNote: why });
       return tail;
     }
-    this.settlePending({ stdout, stderr: onItsOwnLine(stderr, why), returnCode, aborted: true });
+    this.settlePending({ stdout, stderr: onItsOwnLine(stderr, why), returnCode, aborted: true, runnerNote: why });
     return stderr;
   }
 
@@ -1201,7 +1512,11 @@ export class PyRunner {
         + `${limitRemedy(pending.deadlineMs, pending.ceilingMs, pending.background, pending.backgroundCeilingMs)}\n`;
       // On a line of its own: a script's output, and the runner's own texts, such as an
       // interpreter's exit, can end without a newline.
-      result = { ...result, stderr: onItsOwnLine(result.stderr, note) };
+      result = {
+        ...result,
+        stderr: onItsOwnLine(result.stderr, note),
+        runnerNote: result.runnerNote === undefined ? note.trimEnd() : `${result.runnerNote}\n${note.trimEnd()}`,
+      };
       // A background script's journal says so too: in its file, when it has one,
       // and in its tail, which is the result's.
       if (pending.journal) {
@@ -1209,6 +1524,7 @@ export class PyRunner {
         result = { ...result, tail: pending.journal.tail };
       }
     }
+    if (pending.calls.made + pending.calls.before > 0) result = { ...result, calls: settledCalls(pending.calls) };
     // Only now: what the stop wrote above is the journal's last.
     pending.journal?.close();
     if (pending.deadlineTimer) clearTimeout(pending.deadlineTimer);

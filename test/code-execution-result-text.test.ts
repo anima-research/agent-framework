@@ -56,6 +56,18 @@ describe('code_execution result text', () => {
     assert.strictEqual(scriptEndText({ stdout: '', stderr: '', returnCode: 0 }), 'exit code: 0\n');
   });
 
+  it("puts the runner's own words and what the tool calls left uncertain in the heading, after the exit code and the time-limit note", () => {
+    const toolCalls = 'tool calls: 2 made while the script ran, 1 answered while it waited; the other one:\n- still running when the script ended, so it may still take effect: a--b {"i":0}';
+    assert.strictEqual(
+      scriptEndText({
+        stdout: 'out\n', stderr: 'Traceback\n', returnCode: 1, timeLimitNote: 'capped',
+        runnerNote: 'script stopped: it reached its 1s time limit. Run it again.', toolCalls,
+      }),
+      `exit code: 1\ntime limit: capped\nscript stopped: it reached its 1s time limit. Run it again.\n${toolCalls}\n--- stderr ---\nTraceback\n--- stdout ---\nout\n`,
+    );
+    assert.strictEqual(scriptEndText({ stdout: '', stderr: '', returnCode: 0, toolCalls }), `exit code: 0\n${toolCalls}\n`);
+  });
+
   it('is whole when it fits the budget', () => {
     const end = { stdout: 'a\n'.repeat(100), stderr: 'b\n', returnCode: 0 };
     const whole = scriptEndText(end);
@@ -325,17 +337,21 @@ describe('code_execution result text, through the framework (real python3)', () 
     });
   });
 
-  it('a stopped script\'s reason stays in view ahead of a long stdout', async () => {
+  it('a stopped script\'s reason comes in the heading, ahead of a long stdout, and once', async () => {
     await withFramework({ workspace: false, codeExecution: { scriptTimeoutMs: 600_000 } }, async (framework) => {
       const code = 'import sys, asyncio\nsys.stdout.write("y" * 30000)\nsys.stdout.flush()\nawait asyncio.sleep(60)';
       const r = await run(framework, 'ce-stopped', { code, time_limit_ms: 1000 });
       const text = textOf(r);
       assert.ok(text.length <= 24_000, String(text.length));
-      const stderr = bodyOf(text, 'stderr');
-      assert.ok(stderr, text.slice(0, 300));
-      assert.match(stderr, /\nscript stopped: it reached its 1s time limit\. [^\n]*To give it longer, pass time_limit_ms up to 600000 \(10 min\)\.\n$/);
-      assert.ok(text.startsWith(`exit code: ${(r.structured as { return_code: number }).return_code}\n--- stderr ---\n`), text.slice(0, 120));
-      assert.ok(text.indexOf('script stopped') < text.indexOf('--- stdout ---\nyyy'));
+      const { return_code: returnCode, stderr } = r.structured as { return_code: number; stderr: string };
+      const reason = /^exit code: \d+\n(script stopped: it reached its 1s time limit\. [^\n]*To give it longer, pass time_limit_ms up to 600000 \(10 min\)\.)\n/.exec(text)?.[1];
+      assert.ok(reason, text.slice(0, 400));
+      assert.ok(text.startsWith(`exit code: ${returnCode}\n${reason}\n--- stderr ---\n`), text.slice(0, 400));
+      // Said once: the text's stderr goes without it, and a host still reads
+      // it at the end of the stderr it gets.
+      assert.strictEqual(text.split(reason).length, 2, text.slice(0, 400));
+      assert.ok(stderr.endsWith(`\n${reason}\n`), stderr.slice(-300));
+      assert.ok(text.indexOf('--- stderr ---') < text.indexOf('--- stdout ---\nyyy'));
       assert.match(text, /\n\[cut to fit; the whole output was \d+ chars, and with no writable workspace mount without an include, what was cut was not retained\]$/);
     });
   });
