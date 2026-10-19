@@ -26191,8 +26191,10 @@ export class AgentFramework {
                 data: {
                   ...(result.data as Record<string, unknown> | undefined),
                   routing: privateTurn
-                    ? `Channel opened for incoming traffic. This turn’s plain speech stays private; use an explicit send tool${
-                      openerAgent.proseRouting === 'hybrid' ? ' or a >>> envelope' : ''} to publish there.`
+                    ? inboundOnlyServer
+                      ? `Channel opened for incoming traffic. This turn’s plain speech stays private, and ${inboundOnlySpeechNote(inboundOnlyServer)}`
+                      : `Channel opened for incoming traffic. This turn’s plain speech stays private; use an explicit send tool${
+                        openerAgent.proseRouting === 'hybrid' ? ' or a >>> envelope' : ''} to publish there.`
                     : inboundOnlyServer
                       ? `${inboundOnlySpeechNote(inboundOnlyServer)} Other channels need an explicit send tool.`
                       : 'Your plain speech now lands in this channel. Other channels need an explicit send tool.',

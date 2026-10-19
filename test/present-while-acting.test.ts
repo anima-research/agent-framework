@@ -2144,12 +2144,13 @@ describe('present while acting', () => {
     await framework.stop();
   });
 
-  it('channel_open keeps a private turn private and leaves its frozen pin unchanged', async () => {
+  for (const mode of ['locus', 'hybrid'] as const) {
+  it(`${mode}: channel_open keeps a private turn private and leaves its frozen pin unchanged`, async () => {
     membrane.pushResponse(createMockResponse([
       { type: 'tool_use', id: 'c-private', name: 'channel_open', input: { channelId: 'discord:guild:observatory' } },
     ] as ContentBlock[], 'tool_use'));
     membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Still private after open.' }] as ContentBlock[]));
-    const framework = await createFramework();
+    const framework = await createFramework({ proseRouting: mode });
     const routed = stubChannelRegistry(framework);
     const registry = (framework as unknown as { channelRegistry: Record<string, unknown> }).channelRegistry;
     (registry as { handleChannelToolCall?: unknown }).handleChannelToolCall = async () =>
@@ -2171,7 +2172,31 @@ describe('present while acting', () => {
     assert.equal(internals.turnRouting.get('assistant')?.locus, undefined);
     assert.equal(internals.turnRouting.get('assistant')?.triggerChannel, undefined, "the opened channel isn't the private turn's trigger channel");
     assert.equal(internals.turnRouting.get('assistant')?.nonChannelOrigin, true);
-    assert.ok(JSON.stringify(pushed).includes('plain speech stays private'));
+    const said = JSON.stringify(pushed);
+    assert.ok(said.includes('plain speech stays private'), said);
+    assert.equal(said.includes('or a >>> envelope'), mode === 'hybrid', `hybrid names its envelopes, locus doesn't: ${said}`);
+    await framework.stop();
+  });
+  }
+
+  it("channel_open of an inbound-only channel in a private turn says plain speech there is refused, and offers no way to publish there", async () => {
+    membrane.pushResponse(createMockResponse([
+      { type: 'tool_use', id: 'c1', name: 'channel_open', input: { channelId: 'body:ears' } },
+    ] as ContentBlock[], 'tool_use'));
+    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Listening.' }] as ContentBlock[]));
+    const framework = await createFramework({ proseRouting: 'hybrid' });
+    stubChannelRegistry(framework);
+    const registry = declareEarsInboundOnly(framework);
+    registry.handleChannelToolCall = async () => ({ success: true, data: { channelId: 'body:ears', opened: true } });
+    await (framework as unknown as { startAgentStream(agent: unknown, trigger: unknown): Promise<void> })
+      .startAgentStream(framework.getAgent('assistant')!, {
+        agentName: 'assistant', reason: 'external-message', source: 'tui', timestamp: Date.now(), nonChannelOrigin: true,
+      });
+    await framework.runUntilIdle();
+    const results = JSON.stringify(membrane.lastStream!.receivedToolResults.flat());
+    assertSaysRefused(results, 'the channel_open result');
+    assert.ok(results.includes('plain speech stays private'), results);
+    assert.ok(!results.includes('>>> envelope'), `no envelope is offered for a channel that takes no speech: ${results}`);
     await framework.stop();
   });
 
