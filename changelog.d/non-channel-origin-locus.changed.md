@@ -35,6 +35,10 @@
   refusal reactions to the process-global last inbound channel, and record a
   refusal with no channel.
 
+  A script's calls are judged by the turn that started it, for as long as the
+  script runs. A background script's `channel_open` now records on that turn,
+  and moves its locus while it is open, rather than the agent's latest turn's.
+
   An `external-message` or `api:message` whose `metadata.channelId` names its
   channel, and whose `metadata.tags` carry `chat:addressed`, is addressed, as a
   channel message is: its turn answers in that channel ahead of ambient traffic.

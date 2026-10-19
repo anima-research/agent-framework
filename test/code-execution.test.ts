@@ -1300,6 +1300,9 @@ describe("a round that runs code_execution is routed once its scripts return (re
     async handleToolCall(call: ToolCall): Promise<ToolResult> {
       const name = call.name.includes('--') ? call.name.slice(call.name.lastIndexOf('--') + 2) : call.name;
       this.log.push(`tool:${name}`);
+      // A script passes what it saw to echo as a note, for a test to read.
+      const note = (call.input as { note?: unknown } | undefined)?.note;
+      if (name === 'echo' && typeof note === 'string') this.log.push(`note:${note}`);
       if (name === 'slow') {
         await this.slowReleased;
         this.log.push('slow:returned');
@@ -2155,38 +2158,66 @@ describe("a round that runs code_execution is routed once its scripts return (re
     }
   });
 
+  // A surface message names a channel, or names none and opens a private turn.
+  const surface = (channelId?: string) => ({
+    type: 'external-message', source: channelId ? 'bridge' : 'tui', content: 'go', metadata: channelId ? { channelId } : {},
+  }) as unknown as ProcessEvent;
+  // A private turn's refusal of a channel_publish that names no channel.
+  const REFUSED = 'channel_publish requires an explicit channelId';
+  // A background watcher: it waits on the slow tool, which a test releases,
+  // then publishes naming no channel, and passes the publish's answer to echo.
+  const WATCHER = [
+    'await test__slow({})',
+    'r = await channel_publish({"content": "from the watcher"})',
+    'await test__echo({"note": str(r)})',
+  ].join('\n');
+  type ScriptHarness = Awaited<ReturnType<typeof scriptRound>>;
+  type Routing = { nonChannelOrigin?: boolean; triggerChannel?: string };
+  const routingInternals = (h: ScriptHarness) => h.framework as unknown as {
+    turnRouting: Map<string, Routing>; openLogical: Map<string, unknown>;
+  };
+  /** Releases the slow tool and runs the framework until every background
+   *  script has settled: a script's calls come back as events, which the
+   *  test's own runs of the framework process. */
+  async function settleWatchers(h: ScriptHarness): Promise<void> {
+    const scripts = (h.framework as unknown as { backgroundScripts: Map<string, { status: string }> }).backgroundScripts;
+    assert.ok(scripts.size > 0, 'control: a watcher started');
+    h.module.releaseSlow();
+    for (const deadline = Date.now() + 15_000; [...scripts.values()].some((s) => s.status === 'running');) {
+      if (Date.now() > deadline) throw new Error(`the watcher never settled: ${JSON.stringify(h.log)}`);
+      await new Promise((r) => setTimeout(r, 25));
+      await h.framework.runUntilIdle();
+    }
+    assert.ok(h.log.includes('slow:returned'), 'control: the watcher was released');
+  }
+  /** What the watcher's publish answered, as it passed it to echo. */
+  const watcherNote = (h: ScriptHarness): string => {
+    const note = h.log.find((entry) => entry.startsWith('note:'));
+    assert.ok(note !== undefined, `control: the watcher ran to its end: ${JSON.stringify(h.log)}`);
+    return note!;
+  };
+
   for (const startedPrivate of [true, false]) {
     it(`a background script's channel_publish is judged by the turn that started it, not by a later ${startedPrivate ? 'channel' : 'private'} turn`, async () => {
-      // The watcher waits on the slow tool, which the test releases once the
-      // later turn has run, and then publishes naming no channel.
-      const watcher = 'await test__slow({})\nawait channel_publish({"content": "from the watcher"})';
       const h = await scriptRound('locus', [
-        createMockResponse([scriptCall({ code: watcher, background: true }, 'bg')] as ContentBlock[], 'tool_use'),
+        createMockResponse([scriptCall({ code: WATCHER, background: true }, 'bg')] as ContentBlock[], 'tool_use'),
         createMockResponse([{ type: 'text', text: 'watching' }] as ContentBlock[]),
       ], {}, { channelPublish: true });
-      const scripts = (h.framework as unknown as { backgroundScripts: Map<string, { status: string }> }).backgroundScripts;
-      // A surface message names a channel, or names none and opens a private turn.
-      const surface = (channelId?: string) => ({
-        type: 'external-message', source: channelId ? 'bridge' : 'tui', content: 'go', metadata: channelId ? { channelId } : {},
-      }) as unknown as ProcessEvent;
+      const internals = routingInternals(h);
       try {
         h.framework.pushEvent(surface(startedPrivate ? undefined : 'world:test'));
         await h.framework.runUntilIdle();
-        assert.equal(scripts.size, 1, 'control: the watcher started');
+        const startRouting = internals.turnRouting.get('assistant');
         // Queued only now: a mock stream takes every response queued when it starts.
         h.membrane.pushResponse(createMockResponse([{ type: 'text', text: 'the later turn' }] as ContentBlock[]));
         h.framework.pushEvent(surface(startedPrivate ? 'world:test' : undefined));
         await h.framework.runUntilIdle();
-        assert.ok(h.log.includes('publish:the later turn@world:test') === startedPrivate, `control: the later turn ran: ${JSON.stringify(h.log)}`);
-        h.module.releaseSlow();
-        // The script's calls come back as events, which the test's own runs
-        // of the framework process.
-        for (const deadline = Date.now() + 15_000; [...scripts.values()].some((s) => s.status === 'running');) {
-          if (Date.now() > deadline) throw new Error(`the watcher never settled: ${JSON.stringify(h.log)}`);
-          await new Promise((r) => setTimeout(r, 25));
-          await h.framework.runUntilIdle();
-        }
-        assert.ok(h.log.includes('slow:returned'), 'control: the watcher was released');
+        const later = internals.turnRouting.get('assistant');
+        assert.ok(later && later !== startRouting, 'control: the later turn ran');
+        assert.equal(later!.nonChannelOrigin === true, !startedPrivate, `control: the later turn is ${startedPrivate ? 'a channel' : 'a private'} one`);
+        assert.equal(h.log.includes('publish:the later turn@world:test'), startedPrivate, `control: ${JSON.stringify(h.log)}`);
+        await settleWatchers(h);
+        assert.equal(watcherNote(h).includes(REFUSED), startedPrivate, watcherNote(h));
         assert.equal(h.log.includes('tool:channel_publish'), !startedPrivate, JSON.stringify(h.log));
       } finally {
         await h.done();
@@ -2194,27 +2225,116 @@ describe("a round that runs code_execution is routed once its scripts return (re
     });
   }
 
-  it("a script that a call made as the agent starts outside any turn is judged by no turn, not by the private turn that ended", async () => {
-    const watcher = 'await test__slow({})\nawait channel_publish({"content": "from the watcher"})';
+  for (const startedPrivate of [true, false]) {
+    it(`a background script's channel_open records on the turn that started it, not on a later ${startedPrivate ? 'channel' : 'private'} turn`, async () => {
+      const watcher = 'await test__slow({})\nawait channel_open({"channelId": "world:other"})';
+      const h = await scriptRound('locus', [
+        createMockResponse([scriptCall({ code: watcher, background: true }, 'bg')] as ContentBlock[], 'tool_use'),
+        createMockResponse([{ type: 'text', text: 'watching' }] as ContentBlock[]),
+      ]);
+      const internals = routingInternals(h);
+      try {
+        h.framework.pushEvent(surface(startedPrivate ? undefined : 'world:test'));
+        await h.framework.runUntilIdle();
+        const startRouting = internals.turnRouting.get('assistant')!;
+        h.membrane.pushResponse(createMockResponse([{ type: 'text', text: 'the later turn' }] as ContentBlock[]));
+        h.framework.pushEvent(surface(startedPrivate ? 'world:test' : undefined));
+        await h.framework.runUntilIdle();
+        const later = internals.turnRouting.get('assistant')!;
+        assert.ok(later !== startRouting, 'control: the later turn ran');
+        const laterTrigger = later.triggerChannel;
+        await settleWatchers(h);
+        assert.ok(h.log.includes('tool:channel_open'), `control: the watcher opened the channel: ${JSON.stringify(h.log)}`);
+        assert.equal(later.triggerChannel, laterTrigger, "the later turn's trigger channel stays as it was");
+        assert.equal(startRouting.triggerChannel === 'world:other', !startedPrivate,
+          `the turn that started the script records it, unless that turn is private: ${startRouting.triggerChannel}`);
+      } finally {
+        await h.done();
+      }
+    });
+  }
+
+  for (const privateTurn of [true, false]) {
+    it(`a foreground script's channel_publish naming no channel is judged by its own ${privateTurn ? 'private' : 'channel'} turn`, async () => {
+      const code = 'r = await channel_publish({"content": "from the script"})\nawait test__echo({"note": str(r)})';
+      const h = await scriptRound('locus', [
+        createMockResponse([scriptCall({ code })] as ContentBlock[], 'tool_use'),
+        createMockResponse([{ type: 'text', text: 'done' }] as ContentBlock[]),
+      ], {}, { channelPublish: true });
+      try {
+        h.framework.pushEvent(surface(privateTurn ? undefined : 'world:test'));
+        await h.framework.runUntilIdle();
+        assert.equal(watcherNote(h).includes(REFUSED), privateTurn, watcherNote(h));
+        assert.equal(h.log.includes('tool:channel_publish'), !privateTurn, JSON.stringify(h.log));
+      } finally {
+        await h.done();
+      }
+    });
+  }
+
+  it("a script that a call made as the agent starts outside any turn is judged by no turn, whatever turn the caller put on the call", async () => {
     const h = await scriptRound('locus', [createMockResponse([{ type: 'text', text: 'private words' }] as ContentBlock[])], {}, { channelPublish: true });
-    const scripts = (h.framework as unknown as { backgroundScripts: Map<string, { status: string }> }).backgroundScripts;
-    const internals = h.framework as unknown as { turnRouting: Map<string, { nonChannelOrigin?: boolean }>; openLogical: Map<string, unknown> };
+    const internals = routingInternals(h);
     try {
-      h.framework.pushEvent({ type: 'external-message', source: 'tui', content: 'go', metadata: {} } as unknown as ProcessEvent);
+      h.framework.pushEvent(surface());
       await h.framework.runUntilIdle();
       assert.equal(internals.turnRouting.get('assistant')?.nonChannelOrigin, true, "control: the agent's latest turn was private");
+      assert.equal(internals.openLogical.has('assistant'), false, 'control: and it has ended');
+      // A caller may put a turn on the call (ToolCall.callerTurnId).
+      const started = await h.framework.executeToolCall({
+        id: 'host-bg', name: 'code_execution', input: { code: WATCHER, background: true }, callerAgentName: 'assistant', callerTurnId: 1,
+      } as never);
+      assert.equal(started.success, true, JSON.stringify(started));
+      await settleWatchers(h);
+      assert.ok(!watcherNote(h).includes(REFUSED), watcherNote(h));
+      assert.ok(h.log.includes('tool:channel_publish'), JSON.stringify(h.log));
+    } finally {
+      await h.done();
+    }
+  });
+
+  it("a script that a call made as the agent starts outside any turn records its channel_open on no turn", async () => {
+    const watcher = 'await test__slow({})\nawait channel_open({"channelId": "world:other"})';
+    const h = await scriptRound('locus', [createMockResponse([{ type: 'text', text: 'room words' }] as ContentBlock[])]);
+    const internals = routingInternals(h);
+    try {
+      h.framework.pushEvent(surface('world:test'));
+      await h.framework.runUntilIdle();
+      const latest = internals.turnRouting.get('assistant')!;
+      assert.equal(latest.triggerChannel, 'world:test', "control: the agent's latest turn was the room's");
       assert.equal(internals.openLogical.has('assistant'), false, 'control: and it has ended');
       const started = await h.framework.executeToolCall({
         id: 'host-bg', name: 'code_execution', input: { code: watcher, background: true }, callerAgentName: 'assistant',
       } as never);
       assert.equal(started.success, true, JSON.stringify(started));
-      h.module.releaseSlow();
-      for (const deadline = Date.now() + 15_000; [...scripts.values()].some((s) => s.status === 'running');) {
-        if (Date.now() > deadline) throw new Error(`the watcher never settled: ${JSON.stringify(h.log)}`);
-        await new Promise((r) => setTimeout(r, 25));
-        await h.framework.runUntilIdle();
-      }
-      assert.ok(h.log.includes('tool:channel_publish'), JSON.stringify(h.log));
+      await settleWatchers(h);
+      assert.ok(h.log.includes('tool:channel_open'), `control: the watcher opened the channel: ${JSON.stringify(h.log)}`);
+      assert.equal(latest.triggerChannel, 'world:test', "the latest turn's trigger channel stays its own");
+    } finally {
+      await h.done();
+    }
+  });
+
+  it("a script that a call made as the agent starts while a private turn is open keeps that turn's rule after it ends, whatever the live routing and the call's turn", async () => {
+    const h = await scriptRound('locus', [createMockResponse([{ type: 'text', text: 'private words' }] as ContentBlock[])], {}, { channelPublish: true });
+    const internals = routingInternals(h);
+    try {
+      h.framework.pushEvent(surface());
+      await h.framework.runUntilIdle();
+      const privateRouting = internals.turnRouting.get('assistant')!;
+      assert.equal(privateRouting.nonChannelOrigin, true, 'control: a private turn ran');
+      // The private turn is open, and a silent tick that ran beside it left
+      // its own routing as the agent's live one.
+      internals.openLogical.set('assistant', privateRouting);
+      internals.turnRouting.set('assistant', { ...privateRouting, nonChannelOrigin: false });
+      const started = await h.framework.executeToolCall({
+        id: 'host-bg', name: 'code_execution', input: { code: WATCHER, background: true }, callerAgentName: 'assistant', callerTurnId: 1,
+      } as never);
+      assert.equal(started.success, true, JSON.stringify(started));
+      internals.openLogical.delete('assistant');
+      await settleWatchers(h);
+      assert.ok(watcherNote(h).includes(REFUSED), watcherNote(h));
+      assert.ok(!h.log.includes('tool:channel_publish'), JSON.stringify(h.log));
     } finally {
       await h.done();
     }

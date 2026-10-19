@@ -2663,7 +2663,7 @@ export class AgentFramework {
    *  turn of the code_execution call running it, which its calls carry.
    *  `calls` records each tool the script calls, for its round's routing
    *  (ScriptRound). `startTurn` is the turn that started it, which judges
-   *  its calls' channel_publish (scriptStartTurn). */
+   *  its calls (runCodeExecution). */
   private scriptDeferredEndTurn: Map<string, { endTurn: boolean; turnId?: number; calls: RoundCall[]; startTurn: TurnRouting | null }> = new Map();
   /** Per agent, a round that called code_execution and waits for those calls'
    *  results before its prose is routed (ScriptRound). */
@@ -19176,7 +19176,10 @@ export class AgentFramework {
     // (SubagentModule ephemerals). Keyed by callerAgentName so each ephemeral
     // gets its own interpreter state.
     if (call.name === CODE_EXECUTION_TOOL_NAME && this.codeExecutionConfig) {
-      return this.runCodeExecution(call.callerAgentName ?? '__ephemeral__', call);
+      const caller = call.callerAgentName ?? '__ephemeral__';
+      // A call made as the agent outside its stream: the agent's open turn
+      // starts the script, whatever turn the caller put on the call.
+      return this.runCodeExecution(caller, call, this.openLogical?.get(caller) ?? null);
     }
 
     // MCPL tools go where the model's own call of the name goes, by the same
@@ -19293,7 +19296,9 @@ export class AgentFramework {
     // The round that waits on this call, registered just before dispatch.
     const waitingRound = this.scriptRounds.get(agentName);
     const round = waitingRound?.pending.has(call.id) ? waitingRound : undefined;
-    this.runCodeExecution(agentName, call)
+    // A model's call, dispatched from its own live stream: the agent's live
+    // turn is the call's turn, and starts the script.
+    this.runCodeExecution(agentName, call, this.turnRouting?.get(agentName) ?? null)
       .catch((error): ToolResult => {
         this.toolLifecycleEmitter?.markDispatchFailure(agentName, call.id);
         // runCodeExecution is designed not to reject; this is the last-resort
@@ -19381,14 +19386,22 @@ export class AgentFramework {
    * exact model path, including MCPL state/checkpoint handling, channel
    * routing, and traces — and resolved via scriptToolWaiters, so their
    * results reach the running script and never the model context.
+   *
+   * `startTurn` is the turn that starts the script, given by the entry point
+   * that runs it: a model's call, its own turn; a call made as the agent
+   * outside a stream, such as through executeToolCall, the agent's open turn
+   * then; null for none. It judges the script's calls for as long as the
+   * script runs (dispatchChannelToolCall): the script carries out that turn's
+   * work, so a private turn's script publishes only where it names, after its
+   * turn ends too, and a later turn doesn't change how its calls are judged.
+   * Its wake_agent() wakes stay neutral.
    */
-  private async runCodeExecution(agentName: string, call: ToolCall): Promise<ToolResult> {
+  private async runCodeExecution(agentName: string, call: ToolCall, startTurn: TurnRouting | null): Promise<ToolResult> {
     // RFC-007: what the script's own tool calls are attributed to. Read
     // before the first await: it is only known while this call is being
     // dispatched. Undefined off the model dispatch path (ephemeral callers),
     // whose code_execution call is not reported either.
     const origin = this.toolLifecycleEmitter?.scriptOrigin(agentName, call.id);
-    const startTurn = this.scriptStartTurn(agentName, call);
     const input = (call.input ?? {}) as {
       code?: unknown;
       background?: unknown;
@@ -19558,8 +19571,8 @@ export class AgentFramework {
     injected: import('./code-execution/py-runner.js').InjectedTool[],
     timeLimitMs?: number,
     origin?: ScriptCallOrigin,
-    /** The turn that started the script (scriptStartTurn), which judges its
-     *  calls' channel_publish for as long as it runs. */
+    /** The turn that started the script (runCodeExecution), which judges
+     *  its calls for as long as it runs. */
     startTurn: TurnRouting | null = null,
   ): ToolResult {
     // v1: primary-agent-only. A conversation fork's or ephemeral's daemon
@@ -20116,7 +20129,7 @@ export class AgentFramework {
     origin?: ScriptCallOrigin,
     /** The foreground script that made the call; none for a background script. */
     script?: { endTurn: boolean; turnId?: number; calls: RoundCall[]; startTurn: TurnRouting | null },
-    /** A background script's start turn (scriptStartTurn); a foreground
+    /** A background script's start turn (runCodeExecution); a foreground
      *  script's is on its record. */
     backgroundStartTurn: TurnRouting | null = null,
   ): Promise<ScriptToolResult> {
@@ -20259,7 +20272,7 @@ export class AgentFramework {
     args: Record<string, unknown>,
     origin?: ScriptCallOrigin,
     turnId?: number,
-    /** The turn that started the script (scriptStartTurn), null for none. */
+    /** The turn that started the script (runCodeExecution), null for none. */
     startTurn: TurnRouting | null = null,
   ): Promise<ToolResult> {
     return new Promise<ToolResult>((resolve) => {
@@ -26037,20 +26050,6 @@ export class AgentFramework {
   }
 
   /**
-   * The turn that starts a script, which judges its calls' channel_publish
-   * for as long as it runs (privatePublishRefusal): a model's code_execution
-   * call, the turn it was made in (callerTurnId), live while the call is
-   * dispatched; one made as the agent outside a stream, such as through
-   * executeToolCall, the agent's open turn then; null for none. The script
-   * carries out that turn's work, so a private turn's script publishes only
-   * where it names, after its turn ends too, and a later turn doesn't change
-   * how its calls are judged. Its wake_agent() wakes stay neutral.
-   */
-  private scriptStartTurn(agentName: string, call: ToolCall): TurnRouting | null {
-    return (call.callerTurnId !== undefined ? this.turnRouting?.get(agentName) : this.openLogical?.get(agentName)) ?? null;
-  }
-
-  /**
    * The refusal of a channel_publish that names no channel in a private
    * non-channel turn, or undefined. A turn from a private surface publishes
    * only where it names: an argument-less channel_publish infers no channel,
@@ -26058,7 +26057,7 @@ export class AgentFramework {
    * speaks. Judged on the call as it was made, and on the turn given: the
    * model's dispatch and its round's routing (roundCallOf) give the call's
    * own turn, the agent's live one (turnRouting, read without making one); a
-   * script's call gives the turn that started the script (scriptStartTurn),
+   * script's call gives the turn that started the script (runCodeExecution),
    * for as long as it runs; and a public call made as the agent
    * (executeToolCall) gives the agent's open turn, so one made outside any
    * turn isn't judged by a turn that has ended.
@@ -26140,15 +26139,18 @@ export class AgentFramework {
 
     this.emitTrace({ type: 'tool:started', module: 'channels', tool: call.name, callId: call.id, input: call.input });
     const startTime = Date.now();
-    // The turn that called: a channel_open's result records its trigger
-    // channel there, however late it arrives, and moves its locus while the
-    // turn is still open, even once another start's routing is the agent's
-    // live one; a private non-channel turn's records and moves neither. A silent turn's open moves no locus: no silent start or
-    // resume registers its routing state as the open turn (openLogical), and
-    // a non-silent resume that does, a budget restart batched with an
-    // ordinary wake, starts only once its over-budget boundary has every
-    // result of the round.
-    const callingTurn = this.routingOf(agentName);
+    // The turn that called: a model's call's own turn, the agent's live one
+    // when the call is dispatched; a script's call, the turn that started the
+    // script (startTurn), or none, as for its channel_publish. A channel_open's
+    // result records its trigger channel there, however late it arrives, and
+    // moves its locus while the turn is still open, even once another start's
+    // routing is the agent's live one; a private non-channel turn's records and
+    // moves neither, nor does a script's with no start turn. A silent turn's
+    // open moves no locus: no silent start or resume registers its routing
+    // state as the open turn (openLogical), and a non-silent resume that does,
+    // a budget restart batched with an ordinary wake, starts only once its
+    // over-budget boundary has every result of the round.
+    const callingTurn = startTurn !== undefined ? startTurn : this.routingOf(agentName);
 
     this.channelRegistry!.handleChannelToolCall(call.name, call.input, { kind: 'agent', agentName })
       .then((result) => {
@@ -26177,7 +26179,7 @@ export class AgentFramework {
           const opened =
             (result.data as { channelId?: string } | undefined)?.channelId
             ?? (call.input as { channelId?: string } | undefined)?.channelId;
-          if (opened) {
+          if (opened && callingTurn) {
             // Only the turn that called may move its own locus. A private
             // non-channel turn may open for incoming traffic, but its prose
             // stays private, and the channel isn't its trigger channel
