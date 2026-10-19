@@ -371,6 +371,10 @@ export interface InferenceRequest {
    *  all of them without materializing content, the turn has no cause left
    *  and does not run. */
   coalescingBatchSubjects?: string[];
+  /** Framework-owned: a request a budget hold released (#304). Its turn gave
+   *  back its token when it was held, so while the host is quiesced it parks
+   *  as a wake does, a continuation included, and runs at resume. */
+  releasedByBudgetHold?: boolean;
   agentName: string;
   reason: string;
   source: string;

@@ -24,6 +24,9 @@ import {
   DEFAULT_TOOL_RESULT_INLINE_MAX_CHARS,
 } from './tool-result-history.js';
 
+/** ContextManager.compile's own budget when it is given none. */
+const CONTEXT_MANAGER_DEFAULT_BUDGET: TokenBudget = { maxTokens: 100_000, reserveForResponse: 4_000 };
+
 export interface ActivationRequestOptions {
   /** The silent heartbeat tick this request answers, if any. */
   silentHeartbeat?: SilentHeartbeatTick;
@@ -384,9 +387,15 @@ export class Agent {
     const resolved = this.resolveBudget(budget);
     const reserve = this.toolResultGuard.pendingWireReserveTokens;
     if (reserve === 0) return resolved;
-    // Mirrors ContextManager.compile's own default when no budget is set.
-    const base = resolved ?? { maxTokens: 100_000, reserveForResponse: 4_000 };
+    const base = resolved ?? CONTEXT_MANAGER_DEFAULT_BUDGET;
     return { ...base, reserveForResponse: base.reserveForResponse + reserve };
+  }
+
+  /** The budget the agent's next compile plans at (compileBudget), for a
+   *  preview of that compile: context-manager's own default when the agent
+   *  sets none, as its compile then gets. */
+  nextCompileBudget(): TokenBudget {
+    return this.compileBudget(undefined) ?? CONTEXT_MANAGER_DEFAULT_BUDGET;
   }
 
   /** Structural compatibility keeps lightweight test/host ContextManager
