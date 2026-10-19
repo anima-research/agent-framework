@@ -11,7 +11,7 @@ import type { ModuleContext } from '../src/index.js';
 import { AgentFramework } from '../src/framework.js';
 import { McplProtocolVersionError, McplServerConnection } from '../src/mcpl/server-connection.js';
 import { ModernMcpConnection, malformedLineDiagnostic } from '../src/mcpl/modern-connection.js';
-import { noteDialSent } from '../src/mcpl/protocol-family.js';
+import { noteDialSent, redactServerText, serverTextRedactor } from '../src/mcpl/protocol-family.js';
 import { MockMembrane } from './helpers/mock-membrane.js';
 
 /** Discovery succeeds; the inventory request gets a normal echoed-path 404. */
@@ -173,6 +173,22 @@ test('legacy initial and reconnect console records redact known credentials', as
   } finally { await connection.close(); }
 });
 
+test("a legacy initial connect that fails while its configuration can't be read still returns the stub that retries, and logs its failure withheld", async (t) => {
+  const lines: string[] = [];
+  t.mock.method(console, 'error', (...args: unknown[]) => lines.push(args.map(String).join(' ')));
+  t.mock.method(McplServerConnection as any, 'handshake', async () => { throw new Error(`transport ${secret}`); });
+  const legacyConfig = { id: 'legacy', command: 'unused', reconnect: true, reconnectIntervalMs: 60_000, reconnectMaxIntervalMs: 60_000 };
+  Object.defineProperty(legacyConfig, 'env', { enumerable: true, get() { throw new Error('the ledger cannot be read'); } });
+  const connection = await McplServerConnection.connectWithReconnect(legacyConfig, { version: '0.5', pushEvents: true });
+  try {
+    assert.equal(connection.isConnected, false);
+    assert.ok(
+      lines.includes(`MCPL server "legacy" initial connect failed, will retry: [withheld: the server's configuration couldn't be read to redact this]`),
+      lines.join('\n'),
+    );
+  } finally { await connection.close(); }
+});
+
 test('a real discover-then-tools/list 404 is redacted in the framework error trace', async (t) => {
   t.mock.method(console, 'error', () => {});
   const dir = mkdtempSync(join(tmpdir(), 'mcp-list-text-'));
@@ -266,6 +282,75 @@ test("a tool call's failure, from either engine, reaches its caller and its trac
     assert.ok(text && !text.includes(secret) && !text.includes(config.token), String(text));
   }
   assert.match(String(events[0]?.result?.error), /HTTP 500 at \/api\/mcp\/s\/redacted\/mcp with redacted/);
+});
+
+/** A framework with one server, whose configuration a host passed with an
+ *  `env` getter that throws: the configuration its text is redacted with. */
+function frameworkWithUnreadableConfig() {
+  const unreadable = { id: 'remote' } as { id: string; env?: Record<string, string> };
+  Object.defineProperty(unreadable, 'env', { enumerable: true, get() { throw new Error('the host cannot read it'); } });
+  const framework = Object.create(AgentFramework.prototype) as any;
+  framework.mcplServerConfigs = new Map<string, object>([[unreadable.id, unreadable]]);
+  framework.emitTrace = () => {};
+  return framework;
+}
+
+test("an in-process tool call that fails under a host's configuration that can't be read returns the withheld words as its error", async () => {
+  // Where the redaction's throw rejected the caller's await.
+  const framework = frameworkWithUnreadableConfig();
+  const server = { id: 'remote', sendToolsCall: async () => { throw new Error('socket closed'); } };
+  framework.mcplServerRegistry = { getServer: (id: string) => (id === 'remote' ? server : null) };
+  framework.modernServers = () => new Map();
+  const result = await framework.executeMcplToolCall({ id: 'c1', name: 'mcpl--remote--echo', input: {} }, 'remote', 'mcpl--remote');
+  assert.deepEqual([result.success, result.error], [false, "[withheld: the server's configuration couldn't be read to redact this]"]);
+});
+
+test("a dispatched tool call that fails under a host's configuration that can't be read gets the withheld words as its result's error", async () => {
+  // Where the failure handler threw and posted no result.
+  const framework = frameworkWithUnreadableConfig();
+  const events: Array<{ type: string; result?: { error?: string } }> = [];
+  framework.pushEvent = (event: { type: string }) => events.push(event);
+  framework.toolLifecycleEmitter = null;
+  framework.modernServers = () => new Map([['remote', { callTool: async () => { throw new Error('HTTP 500'); } }]]);
+  framework.dispatchMcplToolCall('assistant', { id: 'c2', name: 'mcpl--remote--echo', input: {} }, 'remote', 'mcpl--remote');
+  const until = Date.now() + 5_000;
+  while (events.length === 0 && Date.now() < until) await new Promise((resolve) => setTimeout(resolve, 5));
+  assert.equal(events[0]?.result?.error, "[withheld: the server's configuration couldn't be read to redact this]");
+});
+
+test("a redaction whose server's configuration can't be read withholds the text, and reads the configuration again next time", () => {
+  // A stdio server's env is a getter that throws while the Discord awareness
+  // ledger can't be read: such a configuration says nothing of what to take
+  // out, and a redaction runs where a throw has nowhere to go.
+  let readable = false;
+  const unreadable = { id: 'unreadable' } as { id: string; env?: Record<string, string> };
+  Object.defineProperty(unreadable, 'env', {
+    enumerable: true,
+    get() {
+      if (!readable) throw new Error('the ledger cannot be read');
+      return { API_TOKEN: 'envSecret0123456789' };
+    },
+  });
+  const withheld = "[withheld: the server's configuration couldn't be read to redact this]";
+  assert.equal(redactServerText('failed with envSecret0123456789', unreadable), withheld);
+  // A url that can't be read withholds too, rather than reading as no url.
+  const unreadableUrl = { id: 'unreadable-url' } as { id: string; url?: string };
+  Object.defineProperty(unreadableUrl, 'url', { enumerable: true, get() { throw new Error('the url cannot be read'); } });
+  assert.equal(redactServerText(`closed ${secret}`, unreadableUrl), withheld);
+  // A connection's redactor reads it again at its next call.
+  const recorded = serverTextRedactor(unreadable);
+  assert.equal(recorded('failed with envSecret0123456789'), withheld);
+  readable = true;
+  assert.equal(recorded('failed with envSecret0123456789'), 'failed with redacted');
+  // Text that may come from any server is withheld while one of them can't be
+  // read, and redacted again once it can.
+  readable = false;
+  const framework = Object.create(AgentFramework.prototype) as any;
+  framework.mcplServerConfigs = new Map<string, object>([[config.id, config], ['unreadable', unreadable]]);
+  const everyServer = framework.everyServerRedactor();
+  assert.equal(everyServer(`closed ${secret}`), withheld);
+  readable = true;
+  assert.equal(everyServer(`closed ${secret} envSecret0123456789`), 'closed redacted redacted');
 });
 
 test("a malformed line's diagnostic is redacted before it is cut, so no part of a credential across the cut is kept", () => {

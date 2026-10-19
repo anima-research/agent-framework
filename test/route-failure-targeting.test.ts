@@ -83,6 +83,8 @@ class SenderModule implements Module {
 }
 
 const SEND_FAILED = '[discord-send-failed]';
+// What a turn with no locus is told instead.
+const UNDELIVERABLE = '[send-undeliverable]';
 const BOUNCED = 'was not delivered —';
 const count = (messages: Array<{ content: unknown }>, needle: string) =>
   messages.filter((m) => JSON.stringify(m.content).includes(needle)).length;
@@ -305,35 +307,48 @@ describe('notices about an agent\'s own action', () => {
       assert.ok(errors.some((e) => e.includes('[route-failure] released-conversation has ended, and its reply had no channel to reach')));
     });
 
-    it('tells no one, logged, when an ephemeral run\'s final reply had no channel to reach, before or after its release', async (t) => {
+    it('treats an ephemeral run\'s final reply with no channel of its own as its caller\'s result: no failure, logged or told', async (t) => {
       const errors: string[] = [];
       t.mock.method(console, 'error', (...args: unknown[]) => { errors.push(args.map(String).join(' ')); });
       const speech = 'Worker speech with no channel to go to.';
 
       const archived = await runEphemeral('locus', speech);
 
-      // The run settles before its final reply is routed, so its release and
-      // the reply's failure can come in either order: the notice lands in its
-      // window and is read at its release, or the failure finds it gone. Either
-      // way, a reply that had no channel to reach is passed on to no one.
+      // The run's prose is its caller's result (#551): with no channel of its
+      // own it is undelivered, not a failed delivery, before or after its
+      // release, so nothing is written, logged or passed on.
       assert.ok(archived.some((m) => m.participant === 'worker' && JSON.stringify(m.content).includes(speech)), 'the run\'s reply is archived');
+      assert.equal(count(archived, UNDELIVERABLE), 0, 'no no-locus notice in its own window');
       const { messages } = await framework.getAgent('primary')!.getContextManager().compile();
       assert.equal(count(messages, 'Your previous reply'), 0, 'the primary did not write that reply');
       assert.equal(count(messages, 'A reply by worker'), 0);
       assert.ok(!errors.some((e) => /not a registered agent/.test(e)));
-      assert.ok(errors.some((e) => e.includes('[route-failure] worker has ended, and its reply had no channel to reach')));
+      assert.ok(!errors.some((e) => e.includes('[route-failure] worker')), 'no route failure is logged');
+      assert.ok(!errors.some((e) => e.includes('[routeSpeech] worker')), 'no "NOT routed" line');
       assert.equal(internals(framework).deferredMessages.length, 0);
     });
 
-    it('passes an ephemeral run\'s failed delivery to a channel on to the primary, by name', async () => {
+    it('never sends an ephemeral run\'s reply to the default channel, so nothing fails there', async (t) => {
       (internals(framework).channelRegistry as unknown as { defaultPublishChannel: string | null }).defaultPublishChannel = 'missing-channel';
-      const speech = 'Worker speech for a channel that is not registered.';
+      const errors: string[] = [];
+      t.mock.method(console, 'error', (...args: unknown[]) => { errors.push(args.map(String).join(' ')); });
 
-      await runEphemeral('locus', speech);
+      await runEphemeral('locus', 'Worker speech that the default channel never gets.');
 
-      // Whether the delivery fails before the run's release (its window's
-      // notice is passed on at release) or after it (the failure finds it
-      // gone), the primary is told once, by name.
+      // The latest inbound channel is nobody's choice for a subagent (#551).
+      const { messages } = await framework.getAgent('primary')!.getContextManager().compile();
+      assert.equal(count(messages, SEND_FAILED), 0, 'the primary is told of no failure');
+      assert.ok(!errors.some((e) => e.includes('missing-channel')), 'no delivery to the default channel was attempted');
+      assert.equal(internals(framework).deferredMessages.length, 0);
+    });
+
+    it('passes an ended ephemeral run\'s failed delivery to a channel it was given on to the primary, by name', async () => {
+      await runEphemeral('locus', 'Worker speech.');
+      // After the run's release, its speech is routed to a channel given
+      // directly, as a channel the run opened or named would be; the channel
+      // isn't registered, so the delivery fails.
+      await internals(framework).channelRegistry.routeSpeech('worker', 'Worker speech for a channel that is not registered.', 'missing-channel');
+
       const { messages } = await framework.getAgent('primary')!.getContextManager().compile();
       const named = messages.filter((m) => JSON.stringify(m.content).includes(SEND_FAILED));
       assert.equal(named.length, 1);
@@ -341,8 +356,7 @@ describe('notices about an agent\'s own action', () => {
       assert.equal(internals(framework).deferredMessages.length, 0);
     });
 
-    it('still releases an ephemeral run when the primary cannot be told, logged', async (t) => {
-      (internals(framework).channelRegistry as unknown as { defaultPublishChannel: string | null }).defaultPublishChannel = 'missing-channel';
+    it('logs it when the primary cannot be told of an ended ephemeral run\'s failed delivery', async (t) => {
       const primaryCm = framework.getAgent('primary')!.getContextManager();
       const store = primaryCm.addMessage.bind(primaryCm);
       t.mock.method(primaryCm, 'addMessage', (...args: Parameters<typeof primaryCm.addMessage>) => {
@@ -352,9 +366,10 @@ describe('notices about an agent\'s own action', () => {
       const errors: string[] = [];
       t.mock.method(console, 'error', (...args: unknown[]) => { errors.push(args.map(String).join(' ')); });
 
-      await runEphemeral('locus', 'Worker speech for a channel that is not registered.');
-
+      await runEphemeral('locus', 'Worker speech.');
       assert.equal(framework.getAgent('worker'), null, 'the run is released');
+      await internals(framework).channelRegistry.routeSpeech('worker', 'Worker speech for a channel that is not registered.', 'missing-channel');
+
       assert.ok(errors.some((e) => e.includes('[route-failure] failed to tell the primary that worker\'s reply to missing-channel failed')));
     });
 
@@ -365,7 +380,6 @@ describe('notices about an agent\'s own action', () => {
       });
       try {
         await internals(bare).initializeMcpl([]);
-        (internals(bare).channelRegistry as unknown as { defaultPublishChannel: string | null }).defaultPublishChannel = 'missing-channel';
         const errors: string[] = [];
         t.mock.method(console, 'error', (...args: unknown[]) => { errors.push(args.map(String).join(' ')); });
         const created = await bare.createEphemeralAgent({
@@ -377,6 +391,9 @@ describe('notices about an agent\'s own action', () => {
         bare.start();
         await run;
         await bare.runUntilIdle();
+        // After the run's release, its speech is routed to a channel given
+        // directly, as a channel of its own would be, and the delivery fails.
+        await internals(bare).channelRegistry.routeSpeech('worker', 'Worker speech with nobody to tell.', 'missing-channel');
 
         const archive = await ContextManager.open({
           store: bare.getStore(), namespace: 'subagent/worker', isolate: true, strategy: new PassthroughStrategy(),

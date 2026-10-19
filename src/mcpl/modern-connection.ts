@@ -70,6 +70,8 @@ import { StdioTransport, type McplTransport } from './transport.js';
 import { McplProtocolVersionError, McplRequestError, McplUnreapedLaunchError } from './server-connection.js';
 import { LEGACY_MCP_PROTOCOL_VERSION, MAX_TIMER_MS, MODERN_MCP_PROTOCOL_VERSION, checkServerConfig, describeCredentialError, noteDialSent, redactServerText, serverTextRedactor } from './protocol-family.js';
 import type { McplServerConfig, McpToolDefinition } from './types.js';
+import { boundedForLog } from './errors.js';
+import { logDetail, logValue, logValueRedacted } from './log-value.js';
 
 const DEFAULT_REQUEST_TIMEOUT_MS = 60_000;
 /** Bound on establishing the connection (`server/discover`), like the legacy
@@ -113,12 +115,16 @@ interface WireRecord {
 
 /**
  * A send that Connectome's own transport refused before writing anything (its
- * stdio line is closed): nothing of that request reached the server.
+ * stdio line is closed): nothing of that request reached the server. `pipe`:
+ * the child's stdin or stdout had failed, so this host can no longer write to
+ * that server at all.
  */
 class NotWrittenError extends Error {
-  constructor(message: string) {
+  readonly pipe: boolean;
+  constructor(message: string, pipe = false) {
     super(message);
     this.name = 'NotWrittenError';
+    this.pipe = pipe;
   }
 }
 
@@ -315,7 +321,7 @@ class SpawnerStdioTransport implements Transport {
     // Once the child's stdin or stdout has failed, the line is ending it and
     // writes nothing more to it, so a message is refused here as not sent.
     const failed = this.line.pipeFailure;
-    if (failed) throw new NotWrittenError(`MCP server "${this.config.id}" stdio pipe failed with ${failed.message}`);
+    if (failed) throw new NotWrittenError(`MCP server "${this.config.id}" stdio pipe failed with ${failed.message}`, true);
     this.line.writeLine(JSON.stringify(message));
   }
 
@@ -858,7 +864,7 @@ export class ModernMcpConnection extends EventEmitter {
    */
   async callTool(name: string, args: Record<string, unknown>): Promise<ModernToolCallResult> {
     const timeoutMs = this.requestTimeoutMs;
-    const result = await this.request('tools/call', `tools/call "${name}"`, (client) =>
+    const result = await this.request('tools/call', `tools/call ${logValue(name)}`, (client) =>
       client.callTool(
         { name, arguments: args },
         { timeout: timeoutMs, maxTotalTimeout: timeoutMs, signal: AbortSignal.timeout(timeoutMs) },
@@ -872,18 +878,29 @@ export class ModernMcpConnection extends EventEmitter {
   }
 
   /** Run one logical request in a wire scope, and classify its failure by
-   *  what that scope saw. */
+   *  what that scope saw. `what` names the request in the host's log: its
+   *  method, and a tool call's tool as a log field. */
   private async request<T>(method: string, what: string, run: (client: Client) => Promise<T>, timeoutMs?: number): Promise<T> {
     const session = this.session;
     if (!session) {
-      // Connectome refuses before anything reaches the SDK: provably not sent.
-      throw new McplRequestError(`Cannot send ${what}: connection to "${this.id}" is not established`, 'not-sent');
+      // Connectome refuses before anything reaches the SDK: provably not
+      // sent. In the agent's words, as the legacy engine's request on a
+      // closed connection: after this host's own close, only that holds;
+      // otherwise the connection is closed, and whether this host is
+      // reconnecting says what works from there.
+      throw new McplRequestError(
+        this.closedByHost
+          ? `The request wasn't sent: this host closed its connection to the "${this.id}" server, so nothing ran. ` +
+            'If calling it again fails, ask whoever runs this host.'
+          : `The request wasn't sent: the connection to the "${this.id}" server is closed, so nothing ran. ${this.retryText()}`,
+        'not-sent',
+      );
     }
     const record: WireRecord = { method, handedOff: false, answer: 'none', continued: false };
     try {
       return await wireScope.run(record, () => run(session.client));
     } catch (error) {
-      throw this.requestFailure(what, record, error, timeoutMs);
+      throw this.requestFailure(what, record, error, timeoutMs, session.lost);
     } finally {
       session.wire.forget(record);
     }
@@ -982,6 +999,14 @@ export class ModernMcpConnection extends EventEmitter {
     }
   }
 
+  /** What works from here after a request that didn't run, by whether this
+   *  host is reconnecting to the server, in the legacy engine's words. */
+  private retryText(): string {
+    return this.willReconnect
+      ? 'This host is reconnecting to it; try again later.'
+      : "This host won't reconnect to it on its own. If you need it, ask whoever runs this host.";
+  }
+
   /**
    * Map a failure onto the request-outcome contract by what crossed the
    * transport boundary for this request, claiming no more than that shows.
@@ -992,7 +1017,7 @@ export class ModernMcpConnection extends EventEmitter {
    *   Connectome's stdio line refused before writing, an HTTP refusal before
    *   any request went out);
    * - the most recent leg answered with a JSON-RPC error: `error-response`
-   *   with that error's data, and its code in the message;
+   *   with that error's data;
    * - the most recent leg answered with a complete result: the server
    *   finished, but what it returned can't be used (output validation).
    *   That's a plain error, not a request outcome;
@@ -1011,69 +1036,147 @@ export class ModernMcpConnection extends EventEmitter {
    *   already have acted on the call;
    * - handed off and unanswered: `no-response`. At the deadline, cancellation
    *   was requested and the outcome is unknown.
-   * A `tools/list` failure says so: listing changes nothing on the server, so
-   * a retry is safe, where a tool call's retry may duplicate a side effect.
+   *
+   * The message is the agent's, in the legacy engine's words where it has
+   * words for the same outcome (#506), and in their shape where it hasn't:
+   * what happened, whether anything took effect, and what works from there.
+   * A request this host's close cut off, and one whose connection closed
+   * under it (`lost`), read as the legacy engine's do. The method, the tool,
+   * the JSON-RPC code, the HTTP status, the deadline in milliseconds and the
+   * SDK's or transport's words are the operator's, so they go to one log
+   * line, the server's text redacted. Where the effect is in doubt, a tool
+   * call's message says to check it before trying again, and a listing's that
+   * listing changes nothing on the server, so trying again is safe.
    */
-  private requestFailure(what: string, record: WireRecord, error: unknown, timeoutMs?: number): Error {
-    const prefix = `MCP server "${this.id}"`;
+  private requestFailure(what: string, record: WireRecord, error: unknown, timeoutMs?: number, lost = false): Error {
+    const server = `the "${this.id}" server`;
+    const Server = `The "${this.id}" server`;
     const message = redactServerText(error instanceof Error ? error.message : String(error), this.config);
-    const advice = record.method === 'tools/list'
-      ? 'Listing changes nothing on the server, so it is safe to retry.'
-      : 'Verify state before retrying; a blind retry of a side-effecting tool may duplicate it.';
+    const log = (line: string) => console.error(`MCP server "${this.id}" ${line}`);
+    const listing = record.method === 'tools/list';
+    // What a failure whose effect is in doubt says: for a tool call, that the
+    // effect is unknown and to check it; for a listing, that it's safe to ask
+    // again.
+    const unknown = (said: string) => listing
+      ? `${said}. Listing changes nothing on the server, so it's safe to try again.`
+      : `${said}, so whether the request took effect is unknown. Check its effect before trying again.`;
     if (!record.handedOff) {
-      return new McplRequestError(`${prefix} ${what} was not sent: ${message}`, 'not-sent');
+      log(`${what} not sent: ${logDetail(message)}`);
+      const pipe = error instanceof NotWrittenError && error.pipe;
+      return new McplRequestError(
+        pipe
+          ? `The request wasn't sent: this host can no longer write to ${server}, so nothing ran. ${this.retryText()}`
+          // Before the wire, the cause can pass (the stdio line closing as
+          // the connection is lost) or stay (a tool's outputSchema the SDK
+          // can't compile), so the message claims neither.
+          : `The request wasn't sent: this host couldn't send it to ${server}, so nothing ran. If calling it again fails, ask whoever runs this host.`,
+        'not-sent',
+      );
     }
     if (record.answer === 'error' && record.error) {
       const { code, message: wireMessage, data } = record.error;
-      return new McplRequestError(`${prefix} returned error for ${what}: [${code}] ${wireMessage}`, 'error-response', data);
+      // A JSON-RPC answer reaches the caller unredacted (redactServerText's
+      // scope). The log is a record of the server's text, so the message is
+      // redacted there, whatever JSON value it is, as every other line this
+      // connection writes is.
+      log(`answered ${what} with error ${logValue(code)}: ${logValueRedacted(wireMessage, (text) => redactServerText(text, this.config))}`);
+      // The server's own words, bounded as errors.ts says. Only a string is
+      // words: a message of any other JSON value reads as none.
+      const said = typeof wireMessage === 'string' ? boundedForLog(wireMessage.trim()) : '';
+      return new McplRequestError(
+        said ? `${Server} answered with an error: ${said}` : unknown(`${Server} answered with an error without saying what went wrong`),
+        'error-response',
+        data,
+      );
     }
     if (record.answer === 'complete') {
-      return new Error(`${prefix} answered ${what}, but the result can't be used: ${message}`);
+      log(`answered ${what} with a result this host can't use: ${logDetail(message)}`);
+      return new Error(unknown(`${Server} answered, but not in a form this host can read`));
     }
     const deadline = error instanceof SdkError && error.code === SdkErrorCode.RequestTimeout;
     const within = deadline && timeoutMs ? ` within ${timeoutMs}ms` : '';
     if (record.answer === 'input-required' || record.answer === 'unrecognized') {
       const reason = /[.!?]$/.test(message) ? message : `${message}.`;
-      const ending = record.answer === 'unrecognized'
-        ? `its answer was not a complete result: ${reason}`
+      log(record.answer === 'unrecognized'
+        ? `did not finish ${what}${within}: its answer was not a complete result: ${logDetail(reason)}`
         : deadline
-          ? 'it asked for another round (input_required), and the deadline passed before that round was sent, so nothing was in flight to cancel.'
-          : `it asked for another round (input_required), and the call ended before that round was sent: ${reason}`;
+          ? `did not finish ${what}${within}: it asked for another round (input_required), and the deadline passed before that round was sent`
+          : `did not finish ${what}: it asked for another round (input_required), and the call ended before that round was sent: ${logDetail(reason)}`);
       return new McplRequestError(
-        `${prefix} did not finish ${what}${within}: ${ending} ` +
-          `The outcome is unknown: the server may already have acted on the call. ${advice}`,
+        unknown(record.answer === 'unrecognized'
+          ? `${Server}'s answer wasn't a complete result`
+          : `${Server} didn't finish the request: it asked for more from this host, and ${deadline ? 'the time ran out' : 'the call ended'} before this host sent it`),
         'no-response',
       );
     }
     // An HTTP refusal of the credential: 401 or 403, however the SDK raised
     // it. It raises a plain 403 under another code than its step-up limit's,
     // and an insufficient_scope 403 as InsufficientScopeError when no OAuth
-    // provider is configured.
+    // provider is configured. A 403 can refuse a valid credential that lacks
+    // permission, so the message says the server refused this host access.
     const refusedWith = error instanceof SdkHttpError && (error.status === 401 || error.status === 403)
       ? error.status
       : error instanceof InsufficientScopeError ? 403 : null;
     if (refusedWith !== null) {
       if (record.continued) {
+        log(`refused a later round of ${what}: HTTP ${refusedWith} (${logDetail(message)})`);
         return new McplRequestError(
-          `${prefix} did not finish ${what}: it asked for another round (input_required), and the server refused a later one: ` +
-            `HTTP ${refusedWith} (${message}). The outcome is unknown: the server may already have acted on the call. ${advice}`,
+          listing
+            ? unknown(`${Server} refused this host access partway through the request, after asking for more`)
+            : `${Server} refused this host access partway through the request, after asking for more, so whether it took effect is unknown. ` +
+              'Check its effect before trying again; if calling it again fails, ask whoever runs this host.',
           'no-response',
         );
       }
+      log(`refused ${what}: HTTP ${refusedWith} (${logDetail(message)})`);
       // The response body (the SDK's `text`) is the server's text and can
       // echo the request's url, so it's left out of the data; the status stays.
       const { text: _body, ...data } = (error instanceof SdkHttpError && error.data && typeof error.data === 'object' ? error.data : {}) as Record<string, unknown>;
-      return new McplRequestError(`${prefix} refused ${what}: HTTP ${refusedWith} (${message})`, 'error-response', { ...data, httpStatus: refusedWith });
+      return new McplRequestError(
+        `${Server} refused this host access, so the request didn't run. If you need it, ask whoever runs this host.`,
+        'error-response',
+        { ...data, httpStatus: refusedWith },
+      );
     }
     if (deadline) {
-      const outcome = record.method === 'tools/list'
-        ? 'the list did not arrive in time.'
-        : 'the outcome is unknown: the tool may still complete server-side.';
+      log(`didn't answer ${what}${within}; cancellation requested`);
+      const seconds = timeoutMs ? timeoutMs / 1000 : null;
+      const late = seconds === null ? `${Server} didn't answer in time` : `${Server} didn't answer within ${seconds} second${seconds === 1 ? '' : 's'}`;
       return new McplRequestError(
-        `${prefix} did not answer ${what}${within}. Cancellation was requested; ${outcome} ${advice}`,
+        listing
+          ? `${late}, and this host asked it to cancel. Listing changes nothing on the server, so it's safe to try again.`
+          : `${late}, so whether the request took effect is unknown: this host asked it to cancel, and it may still complete on the server. ` +
+            'Check its effect before trying again, since repeating something that changes state may do it twice.',
         'no-response',
       );
     }
-    return new McplRequestError(`${prefix} ${what} failed: ${message}`, 'no-response');
+    // Anything else after the request went out. An HTTP status other than
+    // 401/403 is only in the SDK's error, not its message, so the log names it.
+    log(`${what} failed${error instanceof SdkHttpError ? ` with HTTP ${error.status}` : ''}: ${logDetail(message)}`);
+    if (this.closedByHost) {
+      // This host's close cut it off: the legacy engine's words.
+      return new McplRequestError(unknown(`${Server} didn't answer before this host closed its connection`), 'no-response');
+    }
+    if (lost) {
+      // The connection closed under it: the legacy engine's words, with
+      // whether this host is reconnecting.
+      return new McplRequestError(
+        listing
+          ? unknown(`The connection to ${server} closed before it answered`)
+          : `The connection to ${server} closed before it answered, so whether the request took effect is unknown. ` +
+            (this.willReconnect
+              ? 'Check its effect before trying again; this host is reconnecting to it.'
+              : "This host won't reconnect to it on its own. If you need it, ask whoever runs this host."),
+        'no-response',
+      );
+    }
+    // The connection may still stand, as after an HTTP error with no JSON-RPC
+    // answer, so the message says nothing of reconnecting.
+    return new McplRequestError(
+      listing
+        ? `The request to ${server} failed before an answer came back. Listing changes nothing on the server, so it's safe to try again.`
+        : `The request to ${server} failed before an answer came back, so whether it took effect is unknown. Check its effect before trying again.`,
+      'no-response',
+    );
   }
 }

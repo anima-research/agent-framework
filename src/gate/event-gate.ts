@@ -45,6 +45,15 @@ const MAX_TRACE_SNIPPET = 80;
 const MAX_INFERENCE_BUFFER = 100;
 /** Minimum interval between filesystem checks for config changes (ms). */
 const RELOAD_THROTTLE_MS = 1000;
+
+/**
+ * Parse a gate file's text as JSON. Some Windows editors save UTF-8 with a
+ * leading U+FEFF (BOM), which `readFileSync(…, 'utf-8')` keeps and
+ * `JSON.parse` rejects; drop exactly one before parsing (#395).
+ */
+function parseGateJson(text: string): unknown {
+  return JSON.parse(text.charCodeAt(0) === 0xfeff ? text.slice(1) : text);
+}
 /** Minimum debounce value (ms). */
 const MIN_DEBOUNCE_MS = 100;
 /** Maximum debounce value (ms). */
@@ -733,7 +742,7 @@ export class EventGate {
       const raw = readFileSync(this.configPath, 'utf-8');
       const stat = statSync(this.configPath);
       this.configMtime = stat.mtimeMs;
-      const config = validateConfig(JSON.parse(raw));
+      const config = validateConfig(parseGateJson(raw));
       this.configSource = 'file';
       this.configErrors = [];
       return config;
@@ -1892,7 +1901,7 @@ export class EventGate {
         return;
       }
       this.privilegedMtime = statSync(this.privilegedUsersPath).mtimeMs;
-      const raw = JSON.parse(readFileSync(this.privilegedUsersPath, 'utf8'));
+      const raw: any = parseGateJson(readFileSync(this.privilegedUsersPath, 'utf8'));
       const ids = Array.isArray(raw) ? raw : Array.isArray(raw?.userIds) ? raw.userIds : [];
       this.privilegedUserIds = new Set(ids.map((x: unknown) => String(x)));
     } catch (err) {

@@ -25,6 +25,7 @@ import { WorkspaceModule, WorkspaceReadError } from '../src/modules/workspace/in
 import { checkDir, readPath, type MountView } from '../src/modules/workspace/observe.js';
 import { EffectFailed, unlinkContained, writeContained } from '../src/modules/workspace/effects.js';
 import { MountWatcher, type FsChange } from '../src/modules/workspace/watcher.js';
+import { changesFlow, isProbe } from './helpers/watcher-flow.js';
 import type { MountConfig } from '../src/modules/workspace/types.js';
 import type { ModuleContext } from '../src/types/module.js';
 
@@ -741,15 +742,19 @@ describe('a watcher of a mount configured as a relative path', () => {
     const env = new Env(t);
     mkdirSync(env.at('m'));
     const path = `./${relative(process.cwd(), env.at('m'))}`;
-    const changes: FsChange[] = [];
+    const batches: FsChange[][] = [];
     let ready = false;
-    const watcher = new MountWatcher({ name: 'm', path, mode: 'read-write', watch: 'always', watchDebounceMs: 50 }, (batch) => changes.push(...batch), { onReady: () => { ready = true; } });
+    const watcher = new MountWatcher({ name: 'm', path, mode: 'read-write', watch: 'always', watchDebounceMs: 50 }, (batch) => batches.push(batch), { onReady: () => { ready = true; } });
     watcher.start();
     t.after(() => watcher.stop());
     for (let i = 0; i < 400 && !ready; i++) await new Promise((r) => setTimeout(r, 25));
     assert.equal(ready, true, 'the watcher is ready');
+    // On macOS a write right after onReady can come before the platform
+    // delivers events, and goes unreported, so the test waits until they flow.
+    await changesFlow(env.at('m'), batches, []);
     writeFileSync(env.at('m/x.txt'), 'x\n');
-    for (let i = 0; i < 400 && !changes.some((c) => c.path === 'x.txt'); i++) await new Promise((r) => setTimeout(r, 25));
-    assert.ok(changes.some((c) => c.path === 'x.txt'), `heard: ${JSON.stringify(changes)}`);
+    const heard = () => batches.flat().some((c) => c.path === 'x.txt');
+    for (let i = 0; i < 400 && !heard(); i++) await new Promise((r) => setTimeout(r, 25));
+    assert.ok(heard(), `heard: ${JSON.stringify(batches.flat().filter((c) => !isProbe(c.path)))}`);
   });
 });

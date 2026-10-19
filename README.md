@@ -237,8 +237,11 @@ queue. Switching back to the source branch queues removal of the bot's marker;
 returning to the recovery branch queues it again. Initial MCPL events remain
 buffered until the ledger has been reconciled. Startup, reconnect, runtime
 list-change, and online undo use one framework-global generation: every MCPL
-data plane waits while all control planes remain live for registration and
-marker service. Awareness marker calls also have a mandatory deadline that is
+data plane waits while the control planes remain live for registration and
+marker service. A connection whose policy exchange is in flight, after a
+connect or a reconnect, keeps both planes closed until the exchange settles,
+since its traffic is admitted against the grant the exchange establishes.
+Awareness marker calls also have a mandatory deadline that is
 independent of `requestTimeoutMs` (including when that value is `0`); configure
 it with `discordAwarenessDeadlineMs` (default 10000ms, clamped to 50..60000ms).
 Configure the online marker with `discordAwarenessEmoji`; the offline CLI

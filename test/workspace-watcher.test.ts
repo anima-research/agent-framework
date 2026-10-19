@@ -3,9 +3,10 @@ import assert from 'node:assert';
 import fs, { existsSync, mkdtempSync, mkdirSync, readdirSync, readlinkSync, realpathSync, renameSync, rmdirSync, statSync, symlinkSync, writeFileSync, unlinkSync, rmSync } from 'node:fs';
 import { syncBuiltinESMExports } from 'node:module';
 import { tmpdir } from 'node:os';
-import { basename, dirname, join } from 'node:path';
+import { dirname, join } from 'node:path';
 
 import { MountWatcher, type FsChange, type WatcherLifecycle } from '../src/modules/workspace/watcher.js';
+import { changesFlow, isProbe } from './helpers/watcher-flow.js';
 import type { MountConfig } from '../src/modules/workspace/types.js';
 
 // Much shorter than the watcher's defaults (a 300 ms debounce, a 2 s root
@@ -130,8 +131,9 @@ async function waitFor(predicate: () => boolean, message: string, timeoutMs = EV
 }
 
 /**
- * A polling watcher, once chokidar's first scan is done. A change made before
- * then can be part of the files chokidar starts from (ignoreInitial), and is
+ * A polling watcher, once chokidar's first scan is done and its poll reports
+ * changes (changesFlow). A change made before then can be part of the files
+ * chokidar starts from (ignoreInitial), or of the poll's first stat, and is
  * then never reported. If the watcher has reported an error and isn't ready
  * when the wait checks, the wait fails with that error, and a watcher that
  * doesn't get ready is stopped.
@@ -143,6 +145,7 @@ async function readyWithPolling(): Promise<{ watcher: MountWatcher; batches: FsC
   try {
     await waitFor(() => ready || failed !== undefined, 'expected the watcher to be ready');
     if (!ready) throw failed;
+    await changesFlow(tmp, collected.batches, []);
   } catch (error) {
     await collected.watcher.stop();
     throw error;
@@ -159,41 +162,6 @@ async function changeFor(batches: FsChange[][], path: string, op?: FsChange['op'
     () => batches.flat().some(c => c.path === path && (op === undefined || c.op === op)),
     `expected ${op ? `a ${op} entry` : 'a change'} for ${path}`,
   );
-}
-
-// The probe files changesFlow writes, which a test's results leave out by name.
-const PROBE_PREFIX = 'probe-';
-const isProbe = (path: string): boolean => basename(path).startsWith(PROBE_PREFIX);
-
-/**
- * Waits until the watcher reports a change in each of `dirs`, relative to the
- * mount's root `root` (the root itself when `dirs` names none), so what a test
- * writes there next is written while changes are delivered. `onReady` says
- * chokidar's first scan is done, not that the platform delivers events yet. By
- * our reading of libuv, on macOS `fs.watch` of a directory returns before
- * libuv's own thread has made the FSEventStream that reports it, a stream that
- * starts "since now" and is made again for every watched directory each time
- * one is added. So a file written in between isn't reported until a later
- * change in its directory, when chokidar reads the directory again, and a probe
- * reported in one directory can come from a stream made before another
- * directory's watch. Each attempt writes a new probe in each directory still
- * unreported and waits up to a second, since the next probe is that later
- * change. The probes stay in the batches, and a test's results leave them out
- * (isProbe).
- */
-async function changesFlow(root: string, batches: FsChange[][], dirs: readonly string[]): Promise<void> {
-  const where = dirs.length ? dirs : [''];
-  const start = Date.now();
-  const left = () => Date.now() - start < EVENT_MS;
-  const reportedIn = (dir: string) => batches.flat().some((c) => isProbe(c.path) && dirname(c.path) === (dir || '.'));
-  for (let n = 0; left(); n++) {
-    for (const dir of where) if (!reportedIn(dir)) writeFileSync(join(root, dir, `${PROBE_PREFIX}${n}.txt`), String(n));
-    for (const attempt = Date.now(); Date.now() - attempt < 1_000 && left(); await wait(25)) {
-      if (where.every(reportedIn)) return;
-    }
-  }
-  const seen = [...new Set(batches.flat().map((c) => c.path))];
-  assert.fail(`expected the watcher to report a probe in each of ${where.map((d) => d || '.').join(', ')}; it reported ${seen.join(', ') || 'nothing'}`);
 }
 
 /**
@@ -364,8 +332,10 @@ describe('MountWatcher lifecycle', () => {
     try {
       assert.ok(existsSync(nested), 'start() should have created the watched path');
       // A file written before chokidar's first scan is done can be part of
-      // what it starts from (ignoreInitial), and then is never reported.
+      // what it starts from (ignoreInitial), or of the poll's first stat, just
+      // after onReady, and then is never reported.
       await waitFor(() => ready, 'onReady should have fired');
+      await changesFlow(nested, batches, []);
       writeFileSync(join(nested, 'ticket.md'), 'hi');
       await changeFor(batches, 'ticket.md');
     } finally {
@@ -489,6 +459,7 @@ describe('MountWatcher lifecycle', () => {
 
     try {
       await waitFor(() => ready, 'expected initial watcher ready');
+      await changesFlow(tmp, batches, []);
 
       const file = join(tmp, 'normal.md');
       writeFileSync(file, 'v1');
@@ -772,6 +743,7 @@ describe('MountWatcher lifecycle', () => {
         await (watcher as unknown as { reattach(): Promise<void> }).reattach();
         assert.ok(errors.some((e) => e.message === 'close failed'), "the re-attach reported its close's failure");
         await waitFor(() => readyCount === 2, 'expected the watcher to attach again');
+        await changesFlow(tmp, batches, []);
         writeFileSync(join(tmp, 'after.md'), 'x');
         await changeFor(batches, 'after.md', 'created');
       } finally {

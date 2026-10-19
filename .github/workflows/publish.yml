@@ -193,21 +193,17 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
 
+      # The notes are the tag's CHANGELOG.md section. GitHub refuses a
+      # release body over 125,000 characters, as it refused v0.22.3's (run
+      # 39167578309, HTTP 422), so the script cuts a section longer than
+      # 120,000 characters at an entry's start and closes with a link to the
+      # whole section at the tag. It fails the step for a tag with no
+      # section.
       - name: Mirror changelog section into release notes
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          ver="${GITHUB_REF_NAME#v}"
-          # Section header is '## X.Y.Z — YYYY-MM-DD'; match the version
-          # field exactly (string compare, no regex escaping needed).
-          awk -v ver="$ver" '
-            /^## / { if (in_section) exit; if ($2 == ver) { in_section = 1; next } }
-            in_section { print }
-          ' CHANGELOG.md | sed '/./,$!d' > notes.md
-          if ! [ -s notes.md ]; then
-            echo "::error::No CHANGELOG.md section found for ${ver}."
-            exit 1
-          fi
+          node scripts/release-notes.mjs "$GITHUB_REF_NAME" notes.md
           if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
             gh release edit "$GITHUB_REF_NAME" --notes-file notes.md
           else

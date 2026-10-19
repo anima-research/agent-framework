@@ -869,10 +869,15 @@ async function failPolicyRegistrationWhileServing(dir: string, closeFails: boole
       if (serverId === discord.id) throw new Error('injected policy registration failure');
       return initializeServer.call(this, serverId, ...rest);
     };
+    // Whether its exchange's marker still held the failing connection's
+    // planes when its close began, which marks it closed for good.
+    const exchanges = (framework as unknown as { mcplPolicyExchanges: WeakMap<object, number> }).mcplPolicyExchanges;
+    const markedAtClose: boolean[] = [];
     const connections = McplServerConnection.prototype as any;
     const close = connections.close;
     let closeFailed = false;
     connections.close = function (this: any) {
+      if (this.id === discord.id) markedAtClose.push(exchanges.get(this) === this.transportEpoch);
       if (closeFails && this.id === discord.id && !closeFailed && this.transport) {
         closeFailed = true;
         const transport = this.transport;
@@ -892,6 +897,9 @@ async function failPolicyRegistrationWhileServing(dir: string, closeFails: boole
       connections.close = close;
     }
     assert.equal(closeFailed, closeFails, 'the close failed only when asked to');
+    // So no gate, such as a resume finishing meanwhile, could ready it
+    // between its exchange's end and its close.
+    assert.deepEqual(markedAtClose, [true], 'it was closed once, while its exchange still held its planes');
     const internals = framework as unknown as {
       discordAwarenessBarrier: unknown;
       mcplServerRegistry: { getServer(id: string): unknown };
@@ -1042,6 +1050,7 @@ test('a control flush that installs a newer generation cannot be released by the
   const oldDrain = deferred<any>();
   const newDrain = deferred<any>();
   const framework = Object.create(AgentFramework.prototype) as any;
+  framework.mcplPolicyExchanges = new WeakMap();
   framework.discordAwarenessBarrier = null;
   framework.discordAwarenessBarrierGeneration = 0;
   const drains = [oldDrain.promise, newDrain.promise];
@@ -1081,6 +1090,7 @@ test('a control flush that installs a newer generation cannot be released by the
 
 test('while the host stops, a failed gate lets out what a running connection held, and nothing of one closed for good', async () => {
   const framework = Object.create(AgentFramework.prototype) as any;
+  framework.mcplPolicyExchanges = new WeakMap();
   framework.discordAwarenessBarrier = null;
   framework.discordAwarenessBarrierGeneration = 0;
   framework.beginDiscordAwarenessBarrier = () => ({ requiresBarrier: true, promise: new Promise(() => {}) });
@@ -1120,6 +1130,7 @@ test('overlapping reconnect/list-change generations release only the newest barr
   const reconnectDrain = deferred<any>();
   const listChangeDrain = deferred<any>();
   const framework = Object.create(AgentFramework.prototype) as any;
+  framework.mcplPolicyExchanges = new WeakMap();
   framework.discordAwarenessBarrier = null;
   framework.discordAwarenessBarrierGeneration = 0;
   const drains = [reconnectDrain.promise, listChangeDrain.promise];

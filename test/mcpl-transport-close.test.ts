@@ -24,6 +24,7 @@ import { WebSocketServer } from 'ws';
 
 import { McplTransport, StdioTransport, type TransportCloseInfo } from '../src/mcpl/transport.js';
 import { McplRequestError, McplServerConnection } from '../src/mcpl/server-connection.js';
+import type { McplServerConfig } from '../src/mcpl/types.js';
 import { AgentFramework } from '../src/framework.js';
 
 function deferred() {
@@ -31,6 +32,10 @@ function deferred() {
   const promise = new Promise<void>((done) => { resolve = done; });
   return { promise, resolve };
 }
+
+/** What a record of a server's text says when the server's configuration
+ *  can't be read to redact it. */
+const WITHHELD = "[withheld: the server's configuration couldn't be read to redact this]";
 
 /** A transport whose close() waits on the test. */
 class HeldTransport extends McplTransport {
@@ -119,7 +124,7 @@ test('a connect whose child a signal ends during initialize is refused, and its 
   assert.ok(logged.some((line) => line.includes('initial connect failed, will retry')), logged.join('\n'));
 });
 
-test('a transport a reconnect gets after close() has begun logs the errors it reports while it closes, rather than throwing them', { timeout: 10_000 }, async (t) => {
+for (const unreadable of [false, true]) test(`a transport a reconnect gets after close() has begun logs the errors it reports while it closes${unreadable ? ", withheld when the server's configuration can't be read," : ','} rather than throwing them`, { timeout: 10_000 }, async (t) => {
   const handshake = deferred();
   const closing = deferred();
   const transport = new HeldTransport(closing.promise);
@@ -138,6 +143,7 @@ test('a transport a reconnect gets after close() has begun logs the errors it re
   internals.closed = true;
   internals.reconnectEnabled = true;
   internals.config = { id: 'kept', command: 'unused', reconnect: true };
+  if (unreadable) Object.defineProperty(internals.config, 'env', { enumerable: true, get() { throw new Error('this configuration cannot be read'); } });
   internals.hostCapabilities = { version: '0.5' };
   const reconnecting = internals.attemptReconnect();
   // close() ends the reconnect in flight: once its handshake returns, the
@@ -153,8 +159,13 @@ test('a transport a reconnect gets after close() has begun logs the errors it re
   await closed;
   assert.doesNotThrow(() => transport.emit('error', new Error('another, after close() has finished')));
   assert.equal(connection.isConnected, false);
-  assert.ok(logged.some((line) => line.includes('a malformed frame while close() waits')), logged.join('\n'));
-  assert.ok(logged.some((line) => line.includes('another, after close() has finished')), logged.join('\n'));
+  if (unreadable) {
+    const withheld = `[mcpl] kept: a transport closed before it served reported an error: ${WITHHELD}`;
+    assert.equal(logged.filter((line) => line === withheld).length, 2, logged.join('\n'));
+  } else {
+    assert.ok(logged.some((line) => line.includes('a malformed frame while close() waits')), logged.join('\n'));
+    assert.ok(logged.some((line) => line.includes('another, after close() has finished')), logged.join('\n'));
+  }
 });
 
 test("a failed handshake's transport logs an error it reports while it closes, rather than throwing it", { timeout: 10_000 }, async (t) => {
@@ -187,7 +198,7 @@ test("a failed handshake's transport logs an error it reports while it closes, r
   );
 });
 
-test("a failed handshake's transport error is logged without the server's credentials", { timeout: 10_000 }, async (t) => {
+for (const unreadable of [false, true]) test(`a failed handshake's transport error is logged ${unreadable ? "withheld when the server's configuration can't be read" : "without the server's credentials"}`, { timeout: 10_000 }, async (t) => {
   const logged = captureConsoleError(t);
   const server = new WebSocketServer({ port: 0, host: '127.0.0.1' });
   t.after(() => new Promise<void>((resolve) => { server.close(() => resolve()); }));
@@ -202,10 +213,13 @@ test("a failed handshake's transport error is logged without the server's creden
   });
   const { port } = server.address() as AddressInfo;
   // The frame's error text, "invalid opcode 3", quotes this token.
-  await assert.rejects(McplServerConnection.connect({ id: 'malformed', url: `ws://127.0.0.1:${port}`, token: 'invalid opcode' }, { version: '0.5' }));
+  const config: McplServerConfig = { id: 'malformed', url: `ws://127.0.0.1:${port}`, token: 'invalid opcode' };
+  if (unreadable) Object.defineProperty(config, 'env', { enumerable: true, get() { throw new Error('this configuration cannot be read'); } });
+  await assert.rejects(McplServerConnection.connect(config, { version: '0.5' }), /initialize error: refused by the test server/);
   await waitFor(() => logged.some((line) => line.includes('after the handshake settled')), 'the frame\'s error to be logged');
+  const text = unreadable ? WITHHELD : 'Invalid WebSocket frame: redacted 3';
   assert.ok(
-    logged.some((line) => line === '[mcpl] malformed: transport error after the handshake settled: Invalid WebSocket frame: redacted 3'),
+    logged.some((line) => line === `[mcpl] malformed: transport error after the handshake settled: ${text}`),
     logged.join('\n'),
   );
 });

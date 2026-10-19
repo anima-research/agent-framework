@@ -159,16 +159,19 @@ test('a failed error response is traced without an escaping rejection', async ()
   assert.match(failures[0].responseError, /error response transport failed/);
 });
 
-test('inference responders retain request IDs and successful handling stays synchronous', async () => {
+test('inference responders retain request IDs and their transport\'s chunk sender, and successful handling stays synchronous', async () => {
   const { framework, connection, traces } = harness();
   framework.inferenceRouter = {
     handleInferenceRequest(_server: string, _params: unknown, reply: any) {
       assert.equal(reply.requestId, 17);
+      reply.sendChunk({ requestId: 17, index: 0, delta: 'a' });
       reply.respond({ accepted: true });
     },
   };
-  const reply = responder();
+  const chunks: unknown[] = [];
+  const reply = { ...responder(), sendChunk: (chunk: unknown) => { chunks.push(chunk); } };
   connection.emit('inference-request', {}, reply);
+  assert.deepEqual(chunks, [{ requestId: 17, index: 0, delta: 'a' }], 'chunks go out through the request\'s own sender');
   assert.deepEqual(reply.results, [{ accepted: true }]);
   await settle();
   assert.equal(reply.errors.length, 0);
@@ -677,7 +680,7 @@ test('a manifest refresh deferred by the fetch floor reports a failure other tha
   const lines: string[] = [];
   t.mock.method(console, 'error', (...args: unknown[]) => { lines.push(args.map(String).join(' ')); });
   // The last refresh completed just now, so this announcement waits out the floor.
-  framework.manifestRefreshState = new Map([['srv', { inFlight: false, queued: false, lastCompletedAt: 100_000 }]]);
+  framework.manifestRefreshState = new Map([[connection, { inFlight: false, queued: false, lastCompletedAt: 100_000 }]]);
   // Each run reads the server's configuration before anything else: the
   // announcement's own run finds it, and the deferred run fails there.
   let lookups = 0;
@@ -756,7 +759,7 @@ test('a server\'s error answer that no template can convert settles the host\'s 
     '[mcpl] srv: mcpl/manifest fetch failed — previous manifest stands (§17.5): The "srv" server answered with an error without saying what went wrong, so whether the request took effect is unknown. Check its effect before trying again.',
   ]);
   assert.deepEqual(traces.filter((e) => e.type === 'mcpl:server-error' || e.type === 'mcpl:request-handler-error'), []);
-  assert.equal(framework.manifestRefreshState.get('srv').inFlight, false);
+  assert.equal(framework.manifestRefreshState.get(connection).inFlight, false);
 });
 
 test('a server\'s error message in the error a host request rejects with is bounded: control, format and line characters replaced, and cut after 200 code points; its code goes to the log line instead, as logValue prints it', async (t) => {

@@ -632,7 +632,7 @@ export type TraceEvent =
   | (TraceEventBase & {
       type: 'mcpl:orphaned-response';
       serverId: string;
-      /** The JSON-RPC id of the late response whose pending request already timed out. */
+      /** The JSON-RPC id of the late response, whose request had already timed out or been ended by its transport's close. */
       responseId: string | number;
       /** Original request method when retained for mandatory-deadline visibility. */
       method?: string;

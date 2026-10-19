@@ -370,11 +370,11 @@ const CHANNEL_TOOL_DEFINITIONS: ToolDefinition[] = [
   },
   {
     name: 'channel_publish',
-    description: 'Publish a message to a channel. If channelId is omitted, publishes to the most recent incoming channel.',
+    description: 'Publish a message to a channel. If channelId is omitted, publishes to the channel this conversation is bound to, if any, else to the most recent incoming channel. A subagent has neither, and must name one.',
     inputSchema: {
       type: 'object' as const,
       properties: {
-        channelId: { type: 'string', description: 'ID of the channel to publish to (defaults to the most recent incoming channel)' },
+        channelId: { type: 'string', description: 'ID of the channel to publish to (defaults to the conversation\'s bound channel, else the most recent incoming channel; required of a subagent)' },
         content: { type: 'string', description: 'Text content to publish' },
         text: { type: 'string', description: 'Alias for content' },
       },
@@ -617,8 +617,10 @@ interface ChannelRegistryOptions {
   /**
    * Called when a text-only turn's speech could NOT be delivered to its
    * conversational locus — no locus, an unregistered channel, a missing
-   * server, or the server reporting `delivered: false`. The host wires this
-   * to drop a `[discord-send-failed]` marker into chronicle so the failure is
+   * server, or the server reporting `delivered: false`. Not called for an
+   * ephemeral run's speech with no locus, which is its caller's result
+   * (`takesGlobalFallback`). The host wires this to drop a
+   * `[discord-send-failed]` marker into chronicle so the failure is
    * visible to the agent (and operator) rather than silently lost. Must not
    * itself trigger inference (avoid wake loops).
    */
@@ -678,6 +680,18 @@ interface ChannelRegistryOptions {
    * `defaultPublishChannel`.
    */
   activeChannelResolver?: (agentName: string) => string | undefined;
+  /**
+   * Whether a conversation takes the process-global fallback, the channel of
+   * the most recent delivered inbound message: as where its plain speech lands
+   * when it has no home and no channel of its own this turn, as its channel
+   * context's `incoming` and default outgoing channel, and as
+   * `channel_publish`'s target when it names none. False for an ephemeral run
+   * (a subagent): its prose is its caller's result, so a channel that only the
+   * latest inbound message picked is never its destination, and its plain
+   * speech with no channel of its own is undelivered rather than a failed
+   * delivery. Absent, every conversation takes it.
+   */
+  takesGlobalFallback?: (conversationId: string) => boolean;
   /** Whether this framework has EventGate and can honor skip_reply self-wakes. */
   eventGatePresent?: boolean;
 }
@@ -725,6 +739,7 @@ export class ChannelRegistry {
   }) => void;
   private homeChannelResolver?: (agentName: string) => string | undefined;
   private activeChannelResolver?: (agentName: string) => string | undefined;
+  private takesGlobalFallback?: (conversationId: string) => boolean;
   private store?: JsStore;
 
   /** Registered channels, keyed by `{serverId}:{channelId}`. */
@@ -904,6 +919,7 @@ export class ChannelRegistry {
     this.onChannelAutoOpened = options?.onChannelAutoOpened;
     this.homeChannelResolver = options?.homeChannelResolver;
     this.activeChannelResolver = options?.activeChannelResolver;
+    this.takesGlobalFallback = options?.takesGlobalFallback;
     this.store = options?.store;
     this.initializeLifecycleStore();
     this.initializeLabelHistoryStore();
@@ -1681,7 +1697,7 @@ export class ChannelRegistry {
         });
 
       case 'channel_publish':
-        return this.handleToolPublish(input as { channelId: string; content: string });
+        return this.handleToolPublish(input as { channelId: string; content: string }, origin);
 
       case 'think':
         return this.handleToolThink(input as { content?: string });
@@ -1716,9 +1732,15 @@ export class ChannelRegistry {
     // (heartbeats). Without this, a fork
     // was advertised the global locus but published somewhere else; and a trunk
     // agent was told the wrong channel under concurrency.
-    const home = agentName ? this.homeChannelResolver?.(agentName) : undefined;
-    const active = agentName ? this.activeChannelResolver?.(agentName) : undefined;
-    const outgoing = home ?? active ?? this.focusChannelResolver?.() ?? this.fallbackLocus();
+    // Each lookup is keyed on whether a name was given, not its truthiness:
+    // '' is a name an ephemeral run can have, and resolveLocus reads it too.
+    const home = agentName !== undefined ? this.homeChannelResolver?.(agentName) : undefined;
+    const active = agentName !== undefined ? this.activeChannelResolver?.(agentName) : undefined;
+    // An ephemeral run takes no global fallback (takesGlobalFallback): not the
+    // all-except hold's channel, not the latest inbound message's channel as
+    // its outgoing one, nor that message as the one it is replying to.
+    const fallback = agentName !== undefined ? this.globalFallbackFor(agentName) : this.sharedFallback();
+    const outgoing = home ?? active ?? fallback;
 
     if (openChannels.length === 0 && !outgoing) {
       return undefined;
@@ -1729,9 +1751,9 @@ export class ChannelRegistry {
     // Incoming: the most-recent inbound message (what the agent is replying to).
     // Left process-global — per-channel inbound tracking (the right messageId for
     // a fork's own channel) is a separate concern from the outbound routing fix.
-    if (this.defaultPublishChannel && this.defaultPublishMessageId) {
+    if (fallback && this.defaultPublishMessageId) {
       context.incoming = {
-        channelId: this.defaultPublishChannel,
+        channelId: fallback,
         messageId: this.defaultPublishMessageId,
         threadId: this.defaultPublishThreadId,
       };
@@ -3567,15 +3589,30 @@ export class ChannelRegistry {
 
   resolveLocus(conversationId: string): string | null {
     const home = this.homeChannelResolver?.(conversationId);
-    return home ?? this.activeChannelResolver?.(conversationId) ?? this.focusChannelResolver?.() ?? this.fallbackLocus();
+    return home ?? this.activeChannelResolver?.(conversationId) ?? this.globalFallbackFor(conversationId);
   }
 
   /**
-   * The locus a turn gets when neither a home channel nor its own delivery
-   * names one: the latest delivered inbound channel under the legacy rule,
-   * otherwise none — the prose stays private (architecture channel §3
-   * carve-out, 2026-10-06).
+   * The process-global fallback for this conversation, or null when it takes
+   * none (takesGlobalFallback): an ephemeral run's prose is its caller's
+   * result, so neither the all-except hold's channel nor the latest inbound
+   * message's is ever its destination.
    */
+  private globalFallbackFor(conversationId: string): string | null {
+    return this.takesGlobalFallback?.(conversationId) === false ? null : this.sharedFallback();
+  }
+
+  /**
+   * What every conversation that takes the global fallback falls back to when
+   * neither a home channel nor its own delivery names one: the all-except
+   * hold's channel while one is open, else the latest delivered inbound
+   * channel under the legacy locus rule, else none — the prose stays private
+   * (architecture channel §3 carve-out, 2026-10-06).
+   */
+  private sharedFallback(): string | null {
+    return this.focusChannelResolver?.() ?? this.fallbackLocus();
+  }
+
   private fallbackLocus(): string | null {
     return this.latestInboundLocus ? this.defaultPublishChannel : null;
   }
@@ -3781,7 +3818,9 @@ export class ChannelRegistry {
    * Plain speech for one turn segment: publish `text` to the turn's frozen
    * locus and report the PublishOutcome. A failure (or an uncertain outcome)
    * is surfaced as a trace and through onRouteFailure, so the agent learns
-   * its words did not (or may not have) reached anyone.
+   * its words did not (or may not have) reached anyone. An ephemeral run's
+   * speech with no locus is the exception: it is its caller's result, so it
+   * returns as not delivered and surfaces nothing.
    */
   async deliverSpeech(
     conversationId: string,
@@ -3792,7 +3831,9 @@ export class ChannelRegistry {
      *  dispatch resolving live can read the NEXT turn's trigger state or a
      *  stale global default and land the reply in the wrong channel (item-3,
      *  PR #32, and the 2026-07-22 Sol DM misroute). Explicit `null` means
-     *  "this turn is pinned to no locus": fail loudly rather than guess. */
+     *  "this turn is pinned to no locus": fail loudly rather than guess,
+     *  except for an ephemeral run, whose speech is then its caller's
+     *  result. */
     locusChannelId: string | null,
     /** `heldOnFailure`: the caller holds a `failed` delivery's words as a
      *  draft with its own notice, so no failure marker is written for it.
@@ -3827,6 +3868,12 @@ export class ChannelRegistry {
       return fail(null, reason, { status: 'failed', reason, at: Date.now() });
     }
     if (!locusChannelId) {
+      // An ephemeral run with no channel of its own: its plain speech is its
+      // caller's result (takesGlobalFallback). It returns as not delivered,
+      // with its own reason, and writes no line, trace or notice.
+      if (this.takesGlobalFallback?.(conversationId) === false) {
+        return { status: 'failed', reason: "an ephemeral run's plain speech with no channel of its own is its caller's result", at: Date.now() };
+      }
       // The turn froze with no locus (no home, no triggering channel, no
       // global inbound ever seen) — the agent was told its prose stays in
       // the archive; honor that.
@@ -3872,7 +3919,10 @@ export class ChannelRegistry {
     };
   }
 
-  private async handleToolPublish(input: { channelId?: string; content?: string; text?: string }): Promise<ToolResult> {
+  private async handleToolPublish(
+    input: { channelId?: string; content?: string; text?: string },
+    origin?: ChannelToolOrigin,
+  ): Promise<ToolResult> {
     // Resolve content: accept both `content` and `text` (backward compat)
     const messageText = input.content ?? input.text;
     if (!messageText) {
@@ -3883,13 +3933,19 @@ export class ChannelRegistry {
       };
     }
 
-    // Resolve channelId. The latest delivered inbound channel is a default
-    // only under the legacy locus rule; otherwise a publish names its channel.
-    const channelId = input.channelId ?? this.fallbackLocus();
+    // Resolve channelId: default to what the caller falls back to — the
+    // all-except hold's channel, else the latest delivered inbound channel
+    // under the legacy locus rule — which an ephemeral run never takes
+    // (takesGlobalFallback), so it names one.
+    const caller = origin?.kind === 'agent' ? origin.agentName : undefined;
+    const channelId = input.channelId ?? (caller !== undefined ? this.globalFallbackFor(caller) : this.sharedFallback());
     if (!channelId) {
       return {
         success: false,
-        error: 'No channelId specified and no default channel available',
+        error: caller !== undefined && this.takesGlobalFallback?.(caller) === false
+          ? 'Nothing was published: name the channel with channelId. A subagent has no default channel, since its plain '
+            + 'speech is returned to whoever called it, so channel_publish sends only to a channel it names.'
+          : 'No channelId specified and no default channel available',
         isError: true,
       };
     }

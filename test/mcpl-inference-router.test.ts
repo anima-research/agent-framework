@@ -115,7 +115,7 @@ interface Answer {
 /** Ask the router for one inference, played by `script` on a real Membrane. */
 async function ask(
   script: Script,
-  opts: { stream: boolean; mode: Mode; policy?: InferenceRoutingPolicy },
+  opts: { stream: boolean; mode: Mode; policy?: InferenceRoutingPolicy; noChunkSender?: boolean },
 ): Promise<Answer> {
   const membrane = new Membrane(new ScriptedAdapter(script), {
     formatter: opts.mode === 'xml' ? new AnthropicXmlFormatter({ toolMode: 'xml' }) : new NativeFormatter(),
@@ -126,7 +126,7 @@ async function ask(
     answer.stream = streamYielding(request);
     return answer.stream;
   };
-  return askWith(membrane, opts.stream, answer, opts.policy);
+  return askWith(membrane, opts.stream, answer, opts.policy, opts.noChunkSender);
 }
 
 /** Ask a router built on `membrane`, routing by `policy` (none: `default`), for one inference. */
@@ -135,6 +135,7 @@ async function askWith(
   stream: boolean,
   answer: Answer = { chunks: [], sent: [], traces: [] },
   policy?: InferenceRoutingPolicy,
+  noChunkSender = false,
 ): Promise<Answer> {
   const router = new InferenceRouter(
     membrane,
@@ -142,12 +143,6 @@ async function askWith(
     { validateInbound: () => {} } as unknown as FeatureSetManager,
     policy ?? null,
     (event) => { answer.traces.push(event); },
-    (_serverId, params) => {
-      answer.chunks.push(params);
-      const last = answer.sent.length - 1;
-      if (answer.sent[last]?.startsWith('chunk:')) answer.sent[last] += params.delta;
-      else answer.sent.push(`chunk:${params.delta}`);
-    },
   );
 
   await router.handleInferenceRequest('scripted-server', {
@@ -164,6 +159,14 @@ async function askWith(
       answer.error = { code, message };
       answer.sent.push(`error:${message}`);
     },
+    ...(noChunkSender ? {} : {
+      sendChunk: (params: InferenceChunkParams) => {
+        answer.chunks.push(params);
+        const last = answer.sent.length - 1;
+        if (answer.sent[last]?.startsWith('chunk:')) answer.sent[last] += params.delta;
+        else answer.sent.push(`chunk:${params.delta}`);
+      },
+    }),
   });
 
   // Every answer is traced: an error by mcpl:inference_fail with its message,
@@ -239,6 +242,13 @@ const TAG_IN_PROSE: Script = {
 
 for (const mode of ['native', 'xml'] as const) {
   describe(`MCPL inference router, ${mode} mode: a streamed request`, () => {
+    it('answers a streamed request whole when its responder carries no chunk sender', async () => {
+      const answer = await ask({ chunks: ['Hello ', 'world'], stopReason: 'end_turn' }, { stream: true, mode, noChunkSender: true });
+      assert.strictEqual(answer.error, undefined);
+      assert.deepStrictEqual(answer.sent, ['result:Hello world']);
+      assert.deepStrictEqual(answer.chunks, []);
+    });
+
     it('answers a completed stream with its text, after chunks that join up to it (control)', async () => {
       const answer = await ask({ chunks: ['Hello ', 'world'], stopReason: 'end_turn' }, { stream: true, mode });
 

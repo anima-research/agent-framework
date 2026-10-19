@@ -289,6 +289,58 @@ describe('placed-reaction baseline', () => {
     assert.ok(env.baseline?.split(',').includes('🫥'), `the respawned child has the marker retained since: ${env.baseline}`);
   });
 
+  it("a reconnect while the ledger can't be read fails as a reconnect, and the child comes back once it can", async (t) => {
+    const logged: string[] = [];
+    t.mock.method(console, 'error', (...args: unknown[]) => { logged.push(args.map(String).join(' ')); });
+    const fw = await create(undefined, [server({ reconnect: true, reconnectIntervalMs: 20, reconnectMaxIntervalMs: 20 })]);
+    const connection = (fw as unknown as {
+      mcplServerRegistry: { getServer(id: string): {
+        isConnected: boolean;
+        sendToolsCall(name: string, args: {}): Promise<unknown>;
+        on(event: 'reconnect-failed', listener: (params: { error: string }) => void): void;
+      } };
+    }).mcplServerRegistry.getServer('probe');
+    const failures: string[] = [];
+    connection.on('reconnect-failed', ({ error }) => { failures.push(error); });
+    writeFileSync(outboxPath, '{broken');
+    // Each spawn reads the ledger for the child's default, so a reconnect
+    // fails there, and its failure is recorded with the same configuration.
+    await connection.sendToolsCall('crash', {}).catch(() => {});
+    const waitFor = async (condition: () => boolean, what: string): Promise<void> => {
+      const deadline = Date.now() + 5_000;
+      while (!condition()) {
+        assert.ok(Date.now() < deadline, `timed out waiting for ${what}`);
+        await new Promise((resolve) => setTimeout(resolve, 20));
+      }
+    };
+    await waitFor(() => logged.some((line) => line.startsWith('MCPL server "probe" reconnect failed: ')), 'a failed reconnect to be logged');
+    assert.ok(
+      logged.includes(`MCPL server "probe" reconnect failed: [withheld: the server's configuration couldn't be read to redact this]`),
+      logged.join('\n'),
+    );
+    // The failure is reported, with its cause, for the framework to record.
+    assert.match(failures[0] ?? '', /reaction-baseline ledger read/);
+    // The attempts go on, so the child comes back once the ledger reads.
+    rmSync(outboxPath, { force: true });
+    await waitFor(() => connection.isConnected, 'the child to come back');
+    assert.ok((await childEnv(fw)).baseline, 'the respawned child answers, with a default');
+  });
+
+  it("startup goes on past a server whose configuration a host passed can't be read, and logs its failed connect withheld", async (t) => {
+    const logged: string[] = [];
+    t.mock.method(console, 'error', (...args: unknown[]) => { logged.push(args.map(String).join(' ')); });
+    // The connect reads env for the child's default, and fails; startup's
+    // catch for it records the failure with the same configuration.
+    const unreadable = server();
+    Object.defineProperty(unreadable, 'env', { enumerable: true, get() { throw new Error('the host cannot read it'); } });
+    const fw = await create(undefined, [unreadable]);
+    assert.ok(
+      logged.includes(`Failed to connect MCPL server "probe": [withheld: the server's configuration couldn't be read to redact this]`),
+      logged.join('\n'),
+    );
+    assert.equal(fw.listMcplServers().some((s) => s.connected), false);
+  });
+
   for (const own of [undefined, '🟪']) {
     it(`a restart refuses on a corrupt ledger and leaves the child up (${own ? 'its own baseline' : 'the default'})`, async () => {
       // Every connect reads the ledger at its awareness barrier, so a server

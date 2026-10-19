@@ -160,14 +160,21 @@ test('a hold releases only its own claim: a disconnect queued behind another sti
   });
 });
 
-test('a modern connect is refused while a legacy connect for the same id is still handshaking', async () => {
+test('a modern connect is refused while a legacy connect for the same id is still handshaking, before it reads anything', async () => {
   await withFramework(async ({ framework, dir }) => {
     const legacyLog = join(dir, 'legacy.log');
     const modernLog = join(dir, 'raw.jsonl');
     const pending = framework.connectMcplServer(legacy('same', 'slow', legacyLog, { SLOW_INIT_MS: '800' }));
     await until(() => launches(legacyLog).length === 1, 'the legacy launch, handshaking');
-    await assert.rejects(framework.connectMcplServer(modern('same', '', modernLog)), /MCPL server "same" has a connect in flight; try again once it settles/);
+    // A connect reads the server's restored trees before it adds the server
+    // (the first one has, by now); one refused for its id reads none.
+    const read: string[] = [];
+    const checkpoints = (framework as unknown as { checkpointManager: { loadHostStates(id: string): void } | null }).checkpointManager!;
+    const load = checkpoints.loadHostStates.bind(checkpoints);
+    checkpoints.loadHostStates = (id: string) => { read.push(id); load(id); };
+    await assert.rejects(framework.connectMcplServer(modern('same', '', modernLog)), /^Error: MCPL server "same" has a connect in flight; try again once it settles$/);
     assert.equal(launches(modernLog).length, 0, 'the modern server was never launched');
+    assert.deepEqual(read, [], 'the refused connect read no trees');
     await pending;
     const served = status(framework, 'same')!;
     assert.equal(served.family, 'legacy');
@@ -191,6 +198,34 @@ test('a disconnect during a legacy handshake ends that connect at once, and remo
     assert.deepEqual(toolsOf(framework, 'same'), []);
     assert.equal(alive(launches(log)[0]!), false, 'its child was reaped');
     assert.equal(launches(log).length, 1, 'and nothing else launched');
+  });
+});
+
+test("legacy: a disconnect during a handshake whose child can't be reaped rejects, and the server stays registered until a retried disconnect confirms the exit", async () => {
+  await withFramework(async ({ framework, dir }) => {
+    const log = join(dir, 'legacy.log');
+    const reaping = unreapable();
+    // The handshake never finishes on its own, so only the disconnect ends
+    // the connect. Its cleanup can't reap the child, so the connect leaves
+    // the closed connection that owns it registered, after the disconnect's
+    // first removal found nothing there: the disconnect checks again once
+    // the connect has settled.
+    const pending = framework.connectMcplServer(legacy('l', 'slow', log, { SLOW_INIT_MS: '3600000' }));
+    const connectFailure = pending.then(() => null, (error: unknown) => error);
+    await until(() => launches(log).length === 1, 'the legacy launch, handshaking');
+    await assert.rejects(
+      framework.disconnectMcplServer('l'),
+      /could not be reaped\. MCP server "l" stays registered, closed, until its exit is confirmed: disconnect it again to retry the reap$/,
+    );
+    assert.match(String(await connectFailure), /MCP server "l" was not connected: it was disconnected while connecting; its cleanup also failed: .*could not be reaped/);
+    assert.equal(status(framework, 'l')?.connected, false, 'still listed, closed');
+    await assert.rejects(framework.connectMcplServer(legacy('l', 'ok', log)), /"l" is already registered \(not connected and not reconnecting: disconnect it first\)/);
+    assert.equal(launches(log).length, 1, 'no launch beside the unreaped child');
+
+    await killAndWait(reaping.stuck[0]!);
+    reaping.active = false;
+    await framework.disconnectMcplServer('l');
+    assert.equal(status(framework, 'l'), undefined, 'the retried disconnect completed');
   });
 });
 

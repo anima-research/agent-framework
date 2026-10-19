@@ -410,7 +410,8 @@ export interface InferenceRequest {
    * replies in the channel it is answering — not the process-global most-recent-
    * inbound locus, which a concurrent message elsewhere can hijack (item-3
    * redux). Undefined for non-channel wakes (heartbeat, timers, module events),
-   * which correctly fall back to the global default channel.
+   * which correctly fall back to the global default channel, except an
+   * ephemeral run's (a subagent's), which takes no global fallback.
    */
   channelId?: string;
   /**

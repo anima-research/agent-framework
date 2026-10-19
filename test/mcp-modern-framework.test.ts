@@ -518,7 +518,7 @@ test('quiesce: a lost modern child reconnects and relists without starting a tur
   });
 });
 
-test('the framework owns a modern connect in flight: stop() ends it, and a second connect is refused', async () => {
+test("the framework owns a modern connect in flight: a second connect is refused in #506's words, a tool call reads the connecting text, and stop() ends it", async () => {
   const RAW = join(here, 'fixtures', 'modern-raw-server.mjs');
   const dir = mkdtempSync(join(tmpdir(), 'modern-framework-'));
   const framework = await AgentFramework.create({
@@ -532,7 +532,12 @@ test('the framework owns a modern connect in flight: stop() ends it, and a secon
     const config = { id: 'hang', command: process.execPath, args: [RAW, 'hang-discover', log], protocol: 'modern' as const };
     const pending = framework.connectMcplServer(config);
     await waitFor('the launch waiting on discover', () => lines(log).some((l) => l.includes('server/discover')));
-    await assert.rejects(framework.connectMcplServer(config), /already registered/);
+    await assert.rejects(framework.connectMcplServer(config), /^Error: MCPL server "hang" has a connect in flight; try again once it settles$/);
+    // Its connection is registered before it starts, and not one to call yet.
+    const during = await framework.executeToolCall({ id: 'during', name: 'mcpl--hang--echo', input: {} });
+    assert.equal(during.success, false);
+    assert.equal(during.error, 'This host is connecting to the "hang" server that provides mcpl--hang--echo, so the call didn\'t run. Try again in a moment.');
+    assert.equal(lines(log).filter((l) => l.includes('tools/call')).length, 0, 'nothing reached the server');
     const pid = (JSON.parse(lines(log)[0]!) as { pid: number }).pid;
     // stop() ends the connect in flight rather than waiting for its handshake.
     const stopping = Date.now();

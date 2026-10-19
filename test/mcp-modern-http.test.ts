@@ -123,7 +123,7 @@ test('HTTP: a deadline aborts the request stream, and the server sees the cancel
   await assert.rejects(connection.callTool('slow', { ms: 1500 }), (err: unknown) => {
     assert.ok(err instanceof McplRequestError);
     assert.equal(err.outcome, 'no-response');
-    assert.match(err.message, /Cancellation was requested/);
+    assert.match(err.message, /this host asked it to cancel/);
     return true;
   });
   const deadline = Date.now() + 3000;
@@ -153,7 +153,9 @@ test('HTTP: an auth wall on a call is an error-response with the status in data'
   });
 });
 
-test('HTTP: an auth wall on a later round of a call is a no-response, since the first round may have acted', async () => {
+test('HTTP: an auth wall on a later round of a call is a no-response, since the first round may have acted', async (t) => {
+  const consoleLines: string[] = [];
+  t.mock.method(console, 'error', (...args: unknown[]) => consoleLines.push(args.map(String).join(' ')));
   // The SDK server can't be made to ask for another round, so `cont`, which
   // it doesn't list, is answered here: a state-only input_required for the
   // first round, then 401 for every later one.
@@ -179,14 +181,16 @@ test('HTTP: an auth wall on a later round of a call is a no-response, since the 
     // Not the error-response a refused first round gets: the server took
     // the first round, and may have acted on it.
     assert.equal(err.outcome, 'no-response');
-    assert.match(err.message, /asked for another round \(input_required\), and the server refused a later one: HTTP 401/);
+    assert.equal(err.message, 'The "remote" server refused this host access partway through the request, after asking for more, ' +
+      'so whether it took effect is unknown. Check its effect before trying again; if calling it again fails, ask whoever runs this host.');
     return true;
   });
+  assert.ok(consoleLines.some((line) => /^MCP server "remote" refused a later round of tools\/call cont: HTTP 401 \(/.test(line)), consoleLines.join('\n'));
   assert.equal(states[0], undefined, 'the first round carried no state');
   assert.ok(states.length >= 2 && states.slice(1).every((s) => s === 'state-1'), `each later round carried it: ${JSON.stringify(states)}`);
 });
 
-test('HTTP: an echoed path in a tool transport failure is redacted, but a JSON-RPC error is the server answer', async (t) => {
+test("HTTP: an echoed path in a tool transport failure is redacted in the log and kept from the agent's text, but a JSON-RPC error is the server answer", async (t) => {
   const consoleLines: string[] = [];
   t.mock.method(console, 'error', (...args: unknown[]) => consoleLines.push(args.map(String).join(' ')));
   const secret = 'pathSecret0123456789';
@@ -212,12 +216,16 @@ test('HTTP: an echoed path in a tool transport failure is redacted, but a JSON-R
   rpc = false;
   await assert.rejects(connection.callTool('echo', {}), (error: unknown) => {
     assert.ok(error instanceof McplRequestError);
-    assert.match(error.message, /Cannot POST \/api\/mcp\/s\/redacted\/mcp/);
-    assert.ok(!error.message.includes(secret));
+    // The transport's words are the operator's: the log has them, redacted.
+    assert.equal(error.message, 'The request to the "remote" server failed before an answer came back, so whether it took effect is unknown. ' +
+      'Check its effect before trying again.');
     assert.equal(error.outcome, 'no-response');
     return true;
   });
-  assert.ok(consoleLines.some(line => line.includes('Cannot POST /api/mcp/s/redacted/mcp')));
+  // The status is only in the SDK's error, so the log names it.
+  assert.ok(consoleLines.some(line => /^MCP server "remote" tools\/call echo failed with HTTP 500: .*Cannot POST \/api\/mcp\/s\/redacted\/mcp/.test(line)), consoleLines.join('\n'));
+  // The answer's log line is a record of the server's text, so it's redacted.
+  assert.ok(consoleLines.includes('MCP server "remote" answered tools/call echo with error -32603: redacted'), consoleLines.join('\n'));
   assert.ok(!consoleLines.join('\n').includes(secret));
   const dir = mkdtempSync(join(tmpdir(), 'mcp-tool-transport-'));
   const framework = await AgentFramework.create({
@@ -229,7 +237,7 @@ test('HTTP: an echoed path in a tool transport failure is redacted, but a JSON-R
   try {
     const result = await framework.executeToolCall({ id: 'echo-failed', name: 'mcpl--remote--echo', input: {} });
     assert.equal(result.success, false);
-    assert.match(result.error!, /Cannot POST \/api\/mcp\/s\/redacted\/mcp/);
+    assert.match(result.error!, /^The request to the "remote" server failed before an answer came back/);
     assert.ok(!JSON.stringify(result).includes(secret), 'the model-facing tool result contains no path credential');
   } finally {
     await framework.stop();

@@ -41,7 +41,7 @@ import { constants as fsConstants } from 'node:fs';
 import type { BigIntStats } from 'node:fs';
 import { lstat, mkdir, open, readdir, readlink, realpath, stat, statfs } from 'node:fs/promises';
 import type { FileHandle } from 'node:fs/promises';
-import { dirname, isAbsolute, join, posix, relative, resolve, sep } from 'node:path';
+import { basename, dirname, isAbsolute, join, posix, relative, resolve, sep } from 'node:path';
 import { sameRootIdentity, type Fingerprint, type RootIdentity } from './disk-agreement.js';
 
 export interface MountView {
@@ -362,45 +362,185 @@ const folded = (name: string): string => name.normalize('NFC').toLowerCase();
  * does. It also folds dotless `ı` with `i`, which a disk may keep apart;
  * the same-file check keeps that from naming another file.
  */
-const foldedLoosely = (name: string): string => name.normalize('NFC').toLowerCase().toUpperCase().toLowerCase();
+export const foldedLoosely = (name: string): string => name.normalize('NFC').toLowerCase().toUpperCase().toLowerCase();
+
+/** What the workspace holds of a mount, as the spelling step reads it (diskSpelling). */
+export interface WorkspaceEntries {
+  /**
+   * Whether the workspace holds an entry at exactly this path, or records an
+   * intent there, such as a deletion disk hasn't been given yet.
+   */
+  has(path: string): boolean;
+  /** The paths of the entries under `prefix`, a directory's path and `/`, or `''` for every entry. */
+  under(prefix: string): string[];
+  /**
+   * The nested mount whose directory holds this path, by the nested-mount
+   * checks' own reading of it, or undefined where the path is the mount's
+   * own.
+   */
+  holder(path: string): string | undefined;
+  /** Whether the mount's root folds case (foldsCase). */
+  rootFoldsCase: boolean;
+}
+
+/**
+ * Whether `dir` folds case, told without writing: by looking up flipped a
+ * name it lists whose flipped spelling it doesn't list too (a name with no
+ * letter to flip is its own flipped spelling, and two hard links that differ
+ * only in case are one file on any disk). Where no name it lists tells, or
+ * it can't be listed, the directory holding it is asked instead, where both
+ * are on one device, each as a link to it leads: its own name looked up
+ * flipped there, or, for a name with no letter to flip, that directory's own
+ * folding. A directory on a device of its own is taken to tell case apart. A
+ * directory not there yet folds as the one it would be made in. Where
+ * nothing tells, it's taken to tell case apart.
+ */
+export async function foldsCase(dir: string): Promise<boolean> {
+  const holder = dirname(dir);
+  let listed: Set<string>;
+  try {
+    listed = new Set(await readdir(dir));
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT' && holder !== dir) return foldsCase(holder);
+    listed = new Set();
+  }
+  const look = (path: string) => lstat(path, { bigint: true }).catch(() => null);
+  const name = [...listed].find((n) => !listed.has(flippedCase(n)));
+  if (name !== undefined) {
+    const [named, flipped] = await Promise.all([look(join(dir, name)), look(join(dir, flippedCase(name)))]);
+    return named != null && flipped != null && sameFile(named, flipped);
+  }
+  if (holder === dir) return false;
+  // The directory and its holder are looked up through links, so a root
+  // that is one, or is reached through one, is compared by the device it
+  // lies on. Whether the holder folds is told by its own entries, the root's
+  // name and the flipped name, each looked up without following a link
+  // there: a link at the flipped name to the root is another file, and a
+  // root that is a link is found as itself.
+  const see = (path: string) => stat(path, { bigint: true }).catch(() => null);
+  const own = basename(dir);
+  const [self, held, entry, flipped] = await Promise.all([see(dir), see(holder), look(dir), look(join(holder, flippedCase(own)))]);
+  if (self == null || held == null || self.dev !== held.dev) return false;
+  if (flippedCase(own) === own) return foldsCase(holder);
+  return entry != null && flipped != null && sameFile(entry, flipped);
+}
+
+/**
+ * A name in simple case folding, letter by letter: each letter as the lower
+ * case of its upper case, so `Σ` and a word's last `ς` are both `σ`, `ſ` is
+ * `s` and `µ` is `μ`. A letter whose upper case is more than one letter
+ * takes its own lower case instead, as the Greek `ᾈ` takes `ᾀ` and `ß` stays
+ * `ß`. A letter whose lower case is more than one letter too, as `İ`'s is,
+ * stays as it is, and so does dotless `ı`, whose upper case `I` lowers to
+ * `i`, which case folding keeps apart from it. Unicode normalization is left
+ * alone, and so are letters only a fuller folding joins, such as `ß` with
+ * `ss`: no listing shows two such names to be one file, and a disk that
+ * folds case needn't join them.
+ */
+export const lowered = (name: string): string =>
+  [...name].map((c) => {
+    if (c === '\u0131') return c;
+    const upper = c.toUpperCase();
+    const lower = [...upper].length === 1 ? upper.toLowerCase() : c.toLowerCase();
+    return [...lower].length === 1 ? lower : c;
+  }).join('');
+
+/**
+ * The name `segment` takes among the workspace's entries directly under the
+ * directory `prefix` (its path and `/`, or `''` for the mount's root): the
+ * segment itself where an entry is there under it, else the first name, in
+ * the order given, equal to it in simple case folding (lowered), else null.
+ * A name is compared again only where another name came between its entries,
+ * as `N.txt` comes between `N` and `N/x` in path order, so the step doesn't
+ * fold a name once for every entry beneath it.
+ */
+function entryName(paths: readonly string[], prefix: string, segment: string): string | null {
+  const want = lowered(segment);
+  let found: string | null = null;
+  let previous: string | null = null;
+  for (const path of paths) {
+    if (!path.startsWith(prefix)) continue;
+    const rest = path.slice(prefix.length);
+    const slash = rest.indexOf('/');
+    const name = slash === -1 ? rest : rest.slice(0, slash);
+    if (name === previous) continue;
+    previous = name;
+    if (name === segment) return segment;
+    if (found === null && lowered(name) === want) found = name;
+  }
+  return found;
+}
 
 /**
  * The name `dir` lists for `segment`: `segment` itself, unless disk folds it
  * there and lists it otherwise. `dir` is listed only where a variant of
  * `segment`, its case flipped or its other Unicode normalization form, finds
- * the same file (device and inode) as `given`, the segment's own entry, as on
- * a disk that folds names. The last segment isn't looked up as given unless
- * the listing must settle it, so for it any variant found leads to the
- * listing: on a disk that tells spellings apart, that's only where `dir`
- * holds a variant as a name of its own. The name as given wins if it's
- * listed; otherwise the segment takes the listed name that folds to it and is
- * the same file, so the name returned reaches the file the segment does, or
- * is the segment as given. Names are compared as NFC in lower case first, and
- * only where none of those is the file, more loosely (foldedLoosely). A
- * directory that can't be listed, or a name that can't be looked up, leaves
- * the segment as given.
+ * the same file (device and inode) as `given`, the segment's own entry, as
+ * on a disk that folds names. The last segment isn't looked up as given, so
+ * for it any variant found leads to the listing: on a disk that tells
+ * spellings apart, that's only where `dir` holds a variant as a name of its
+ * own. The name as given wins if it's listed; otherwise the segment takes
+ * the listed name that folds to it and is the same file, so the name
+ * returned reaches the file the segment does, or is the segment as given.
+ * Names are compared as NFC in lower case first, and only where none of
+ * those is the file, more loosely (foldedLoosely). A directory that can't be
+ * listed, or a name that can't be looked up, leaves the segment as given. A
+ * segment with no variant at all, no letter to flip and one normalization
+ * form, is looked up as given and keeps its spelling; for a last segment
+ * with a letter that case maps, such as `ς`, the listing then says whether
+ * disk lists it as given. `found` says whether the lookups found disk's
+ * file: for a directory, its own lookup; for a last segment, whether a
+ * variant was found, which on a disk that tells spellings apart may be
+ * another file, or for one with no variant, whether disk has it as given, by
+ * the listing where it was read. `caseFolds` says what looking the segment
+ * up with its case flipped showed of `dir`: that it folds case, that it
+ * tells case apart, or nothing (null), for a segment with no letter to flip.
+ * For a segment not looked up as given (`given` null), `caseFolds` is set
+ * from whatever file the flipped spelling finds, which tells nothing of
+ * `dir`; diskSpelling reads it only for directories, which are looked up as
+ * given.
  */
-async function listedName(dir: string, segment: string, given: BigIntStats | null): Promise<string> {
-  const variants = new Set([flippedCase(segment), segment.normalize('NFC'), segment.normalize('NFD')]);
+async function listedName(dir: string, segment: string, given: BigIntStats | null): Promise<{ name: string; found: boolean; caseFolds: boolean | null }> {
+  const flipped = flippedCase(segment);
+  const variants = new Set([flipped, segment.normalize('NFC'), segment.normalize('NFD')]);
   variants.delete(segment);
+  // A segment with no variant to try, such as `2024` or `ς`, is looked up
+  // as given, the only way to learn that disk has it. A last segment with a
+  // letter that case maps, as `ς` does, can reach a file disk lists in
+  // another spelling, such as `σ`, on a disk that folds more than case
+  // pairs, so there the listing settles whether disk lists it as given.
+  if (variants.size === 0) {
+    const own = given ?? await lstat(join(dir, segment), { bigint: true }).catch(() => null);
+    if (given !== null || own === null || (segment.toLowerCase() === segment && segment.toUpperCase() === segment)) {
+      return { name: segment, found: own !== null, caseFolds: null };
+    }
+    const listed = await readdir(dir).catch(() => null);
+    return { name: segment, found: listed?.includes(segment) ?? true, caseFolds: null };
+  }
   let folds = false;
+  let caseFolds: boolean | null = flipped === segment ? null : false;
   for (const variant of variants) {
     const other = await lstat(join(dir, variant), { bigint: true }).catch(() => null);
-    if (other !== null && (given === null || sameFile(other, given))) { folds = true; break; }
+    if (other !== null && (given === null || sameFile(other, given))) {
+      folds = true;
+      if (variant === flipped) caseFolds = true;
+      break;
+    }
   }
-  if (!folds) return segment;
+  const as = (name: string) => ({ name, found: folds, caseFolds });
+  if (!folds) return as(segment);
   const listed = await readdir(dir).catch(() => null);
-  if (listed === null || listed.includes(segment)) return segment;
+  if (listed === null || listed.includes(segment)) return as(segment);
   const target = given ?? await lstat(join(dir, segment), { bigint: true }).catch(() => null);
-  if (target === null) return segment;
+  if (target === null) return as(segment);
   for (const fold of [folded, foldedLoosely]) {
     for (const name of listed) {
       if (fold(name) !== fold(segment)) continue;
       const info = await lstat(join(dir, name), { bigint: true }).catch(() => null);
-      if (info !== null && sameFile(info, target)) return name;
+      if (info !== null && sameFile(info, target)) return as(name);
     }
   }
-  return segment;
+  return as(segment);
 }
 
 /**
@@ -419,29 +559,99 @@ async function listedName(dir: string, segment: string, given: BigIntStats | nul
  * keeps its spelling too: it names a place from the filesystem's root, not
  * the mount's, so walking it from the mount's root would respell it against
  * other directories, and the path returned could lead outside the mount.
+ *
+ * Given the workspace's `entries`, an entry not yet on disk spells its path
+ * as its file will. A path the workspace holds an entry at exactly keeps its
+ * spelling whole, and so does a last segment where the workspace holds an
+ * entry at exactly that path once its directories have taken disk's
+ * spelling, so an entry that disk lists in another spelling, or in a
+ * directory disk lists in another, stays reachable by its own path. `has`
+ * counts a path the workspace records an intent at, such as a deletion disk
+ * hasn't been given yet, so that's reached by its own path too. And where
+ * the directory reached folds case, each segment disk has nothing for takes
+ * the name of an entry it equals in simple case folding (entryName), as the
+ * disk will once that entry is written: a second draft spelled in another
+ * case is the first one. None of this applies where disk's spelling puts the
+ * path in a nested mount's directory, by the nested-mount checks' own
+ * reading (`holder`): there the path keeps disk's spelling, so they refuse
+ * at least what they refuse without the entries. The root's folding is read
+ * at start (`rootFoldsCase`), and a directory beneath it is taken to fold as
+ * the directory holding it did when its name was looked up with its case
+ * flipped, or, for a name with no letter to flip, as the nearest directory
+ * above that told, so the step reads nothing more of disk for this.
  */
-export async function diskSpelling(root: string, relativePath: string): Promise<string> {
+export async function diskSpelling(root: string, relativePath: string, entries?: WorkspaceEntries): Promise<string> {
   if (relativePath === '' || isAbsolute(relativePath)) return relativePath;
+  // A path that names an entry exactly keeps its spelling, read before the
+  // walk awaits disk, so the entries' walk needn't run for it.
+  const exact = entries?.has(relativePath) ?? false;
+  // The path as disk spells it, and as the workspace's entries spell it.
   const segments = relativePath.split('/');
-  // The directories walked into, the mount's root first.
+  const spelled = [...segments];
+  // The directories walked into, the mount's root first; their names below
+  // the root, as returned; and whether each folds case: the root's as read at
+  // start, and beneath it, whether looking its name up with its case flipped
+  // found it in the directory holding it (null for a name with no letter to
+  // flip).
   const dirs = [root];
+  const names: string[] = [];
+  const folding: (boolean | null)[] = [entries?.rootFoldsCase ?? null];
+  // From segment `from` on, disk has nothing: each segment takes an entry's
+  // name, where the directory reached folds case, passing over an empty or
+  // `.` segment, and the rest keeps its spelling from the first segment no
+  // entry has a name for, a `..` included.
+  const fromEntries = (from: number): void => {
+    // The nearest directory, from the one reached up, that told.
+    let folds: boolean | null = null;
+    for (let k = folding.length - 1; folds === null && k >= 0; k--) folds = folding[k]!;
+    if (!entries || exact || !folds) return;
+    let prefix = names.length === 0 ? '' : `${names.join('/')}/`;
+    const paths = entries.under(prefix);
+    for (let j = from; j < spelled.length; j++) {
+      const segment = spelled[j]!;
+      if (segment === '' || segment === '.') continue;
+      const name = entryName(paths, prefix, segment);
+      if (name === null) return;
+      spelled[j] = name;
+      prefix = `${prefix}${name}/`;
+    }
+  };
   for (let i = 0; i < segments.length; i++) {
     const segment = segments[i]!;
     if (segment === '' || segment === '.') continue;
     if (segment === '..') {
       if (dirs.length === 1) break;
       dirs.pop();
+      names.pop();
+      folding.pop();
       continue;
     }
     const dir = dirs[dirs.length - 1]!;
-    const last = i === segments.length - 1;
-    const given = last ? null : await lstat(join(dir, segment), { bigint: true }).catch(() => null);
-    if (!last && given === null) break;
-    segments[i] = await listedName(dir, segment, given);
-    if (given === null || !given.isDirectory()) break;
-    dirs.push(join(dir, segments[i]!));
+    if (i === segments.length - 1) {
+      const { name, found } = await listedName(dir, segment, null);
+      segments[i] = name;
+      if (!exact && !entries?.has([...names, segment].join('/'))) {
+        spelled[i] = name;
+        if (!found) fromEntries(i);
+      }
+      break;
+    }
+    const given = await lstat(join(dir, segment), { bigint: true }).catch(() => null);
+    if (given === null) {
+      fromEntries(i);
+      break;
+    }
+    const { name, caseFolds } = await listedName(dir, segment, given);
+    segments[i] = name;
+    spelled[i] = name;
+    if (!given.isDirectory()) break;
+    dirs.push(join(dir, name));
+    names.push(name);
+    folding.push(caseFolds);
   }
-  return segments.join('/');
+  const asDisk = segments.join('/');
+  if (!entries || entries.holder(asDisk) !== undefined) return asDisk;
+  return exact ? relativePath : spelled.join('/');
 }
 
 // ===========================================================================
