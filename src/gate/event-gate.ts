@@ -1890,6 +1890,10 @@ export class EventGate {
       this.armSleepTimer();
       return;
     }
+    // A deadline reached during runtime quiescence releases only its timer
+    // handle. Keep the durable intent in memory and the journal so resume (or
+    // another restart) admits it exactly once at the serving boundary.
+    if (this.quiesced) return;
     const note = this.sleepNote;
     const agent = this.sleepAgent;
     this.sleepUntil = 0;
@@ -2028,7 +2032,12 @@ export class EventGate {
     for (const item of due) {
       if (item.kind === 'sleep') {
         this.sleepUntil = 0; this.sleepArmedAt = 0; this.sleepAgent = undefined; this.sleepNote = undefined;
-      } else this.selfWakeIntents.delete(item.intent.agentName!);
+      } else {
+        const timer = this.selfWakeTimers.get(item.intent.agentName!);
+        if (timer) clearTimeout(timer);
+        this.selfWakeTimers.delete(item.intent.agentName!);
+        this.selfWakeIntents.delete(item.intent.agentName!);
+      }
       if (!this.tryPersistWakeState('admitting overdue wake recovery')) {
         if (item.kind === 'sleep') {
           this.sleepUntil = item.intent.wakeAt; this.sleepArmedAt = item.intent.armedAt;

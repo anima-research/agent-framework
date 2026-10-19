@@ -364,8 +364,10 @@ describe('durable wake intent recovery', () => {
   it('skips out-of-range and backwards journal timestamps', () => {
     writeFileSync(join(TMP_DIR, 'gate.wake-intents.json'), JSON.stringify({
       version: 1,
-      sleep: { agentName: 'agent', armedAt: 0, wakeAt: -1e20, source: 'sleep' },
-      selfWakes: [{ agentName: 'agent', armedAt: 10, wakeAt: 9, source: 'skip_reply' }],
+      selfWakes: [
+        { agentName: 'out-of-range', armedAt: -2e20, wakeAt: -1e20, source: 'skip_reply' },
+        { agentName: 'backwards', armedAt: 10, wakeAt: 9, source: 'skip_reply' },
+      ],
     }));
     const h = harness(() => 100);
     assert.strictEqual(h.gate.getSleepState(), null);
@@ -433,6 +435,54 @@ describe('durable wake intent recovery', () => {
     second.gate.admitOverdueWakeIntents();
     assert.strictEqual(second.inferenceRequests.length, 1, 'repeated resume does not duplicate admission');
     second.gate.dispose();
+  });
+
+  it('a sleep deadline reached while quiesced survives restart and resume admits exactly one recovery request', async () => {
+    const now = Date.now();
+    const journal = join(TMP_DIR, 'gate.wake-intents.json');
+    writeFileSync(journal, JSON.stringify({
+      version: 1,
+      sleep: { agentName: 'agent', armedAt: now, wakeAt: now + 75, source: 'sleep' },
+      selfWakes: [],
+    }));
+    const first = restoredHarness(Date.now);
+    first.gate.setQuiesced(true);
+    first.gate.admitOverdueWakeIntents();
+    await sleep(130);
+    assert.ok(JSON.parse(readFileSync(journal, 'utf8')).sleep, 'quiesced sleep expiry stays journaled');
+    assert.strictEqual(first.inferenceRequests.length, 0);
+    first.gate.dispose();
+
+    const second = restoredHarness(Date.now);
+    second.gate.setQuiesced(true);
+    assert.strictEqual(second.inferenceRequests.length, 0, 'restart while quiesced still does not admit');
+    second.gate.setQuiesced(false);
+    second.gate.admitOverdueWakeIntents();
+    assert.strictEqual(second.inferenceRequests.length, 1, 'resume admits the overdue sleep once');
+    second.gate.admitOverdueWakeIntents();
+    assert.strictEqual(second.inferenceRequests.length, 1, 'later admission cannot duplicate it');
+    second.gate.dispose();
+  });
+
+  it('admitting a due restored self-wake clears its live timer before it can fire again', async () => {
+    const now = Date.now();
+    const journal = join(TMP_DIR, 'gate.wake-intents.json');
+    writeFileSync(journal, JSON.stringify({
+      version: 1,
+      selfWakes: [{ agentName: 'agent', armedAt: now - 100, wakeAt: now - 1, source: 'skip_reply' }],
+    }));
+    const h = restoredHarness(Date.now);
+    const internals = h.gate as unknown as {
+      selfWakeTimers: Map<string, ReturnType<typeof setTimeout>>;
+    };
+    let staleFires = 0;
+    internals.selfWakeTimers.set('agent', setTimeout(() => { staleFires++; }, 25));
+    h.gate.admitOverdueWakeIntents();
+    assert.strictEqual(internals.selfWakeTimers.has('agent'), false, 'admission removes the timer handle');
+    await sleep(60);
+    assert.strictEqual(staleFires, 0, 'the cleared callback never fires');
+    assert.strictEqual(h.inferenceRequests.length, 1, 'the due intent is admitted once');
+    h.gate.dispose();
   });
 
   it('constructor with no journal performs no wake-journal write', () => {
@@ -568,14 +618,31 @@ describe('wake durability receipts', () => {
     const storePath = join(dir, 'store');
     const hostModePath = join(dir, 'host-mode.json');
     writeFileSync(hostModePath, JSON.stringify({ version: 1, quiesced: true, since: now }));
-    const framework = await AgentFramework.create({
-      storePath, hostModePath, membrane: new MockMembrane().asMembrane(),
-      agents: [{ name: 'agent', model: 'test', systemPrompt: 'test' }], modules: [],
-      gate: { configPath },
-    });
+    const errors: string[] = [];
+    const priorError = console.error;
+    console.error = (...args: unknown[]) => { errors.push(args.map(String).join(' ')); };
+    let framework: AgentFramework;
+    try {
+      framework = await AgentFramework.create({
+        storePath, hostModePath, membrane: new MockMembrane().asMembrane(),
+        agents: [{ name: 'agent', model: 'test', systemPrompt: 'test' }], modules: [],
+        gate: { configPath },
+      });
+    } finally {
+      console.error = priorError;
+    }
+    assert.ok(errors.some((line) => line.includes('Durable sleep/self-wake intents restore from their journal')));
+    assert.ok(errors.every((line) => !line.includes('Wakes parked before the restart')));
     const state = JSON.parse(readFileSync(journalPath, 'utf8'));
     assert.ok(state.sleep, 'quiesced create leaves overdue wake durable');
     assert.equal((framework as unknown as { pendingRequests: unknown[] }).pendingRequests.length, 0);
+    const gate = (framework as unknown as { eventGate: EventGate }).eventGate;
+    const admitted: string[] = [];
+    (gate as unknown as { requestInferenceFn(a: string): void }).requestInferenceFn = (a: string) => { admitted.push(a); };
+    await framework.resume();
+    assert.deepStrictEqual(admitted, ['agent'], 'resume admits the overdue wake');
+    gate.admitOverdueWakeIntents();
+    assert.deepStrictEqual(admitted, ['agent'], 'later admission does not duplicate it');
     await framework.stop();
   });
 });

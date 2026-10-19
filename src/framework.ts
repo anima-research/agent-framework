@@ -3235,8 +3235,9 @@ export class AgentFramework {
           `since ${hostMode.since ? new Date(hostMode.since).toISOString() : 'unknown'}).\n` +
           `[host-mode] No wakes will start turns and MCPL data planes stay paused\n` +
           `[host-mode] until resume() — via host/command, the API server, or the\n` +
-          `[host-mode] framework API. Wakes parked before the restart were in-memory\n` +
-          `[host-mode] and are gone; recurring sources re-deliver on their own cadence.\n` +
+          `[host-mode] framework API. Durable sleep/self-wake intents restore from their journal\n` +
+          `[host-mode] and are admitted at resume. Ordinary parked wakes and gate buffers\n` +
+          `[host-mode] were in memory and are gone; recurring sources re-deliver on cadence.\n` +
           `[host-mode] ${restoredWrites} deferred context write(s) restored from the store;\n` +
           `[host-mode] they land at resume().\n` +
           `[host-mode] ============================================================`,
@@ -3645,6 +3646,10 @@ export class AgentFramework {
     // The generation this stop ends; withheld spills close for it alone, so a
     // start() after this stop has settled reopens them for its own.
     const stoppingGeneration = this.lifecycleGeneration;
+    // Stop wake timers before closing the queue. A deadline in the old gap
+    // could otherwise consume its durable intent and enqueue into a queue
+    // this stop immediately closes, losing the wake across restart.
+    step(() => this.eventGate?.dispose());
     step(() => this.queue.close());
     step(() => this.tuneOutCoordinator?.stop());
 
@@ -3817,8 +3822,6 @@ export class AgentFramework {
     // Stop typing indicators, and forget the registry's channels
     step(() => this.channelRegistry?.stopAll());
 
-    // Dispose EventGate (clear debounce timers)
-    step(() => this.eventGate?.dispose());
     step(() => this.livenessWatchdog?.stop());
     AgentFramework.diagnosed.delete(this);
 
