@@ -1288,8 +1288,9 @@ function logSeedOmissions(
  * because stop() has closed provider admission, or because the framework is
  * done with the agent (an ephemeral run that has left or been released by
  * cleanup(), a conversation fork disposed or not made): each is the
- * framework's own doing, and no failure. It sent nothing: it was refused at
- * the provider gate, or woken there from its wait. It extends context-manager's
+ * framework's own doing, and no failure. It sent nothing: it was refused
+ * before the call was made, at the provider gate or by the manager's own
+ * membrane, or woken at the gate from its wait. It extends context-manager's
  * CompressionWithdrawn, whose constructor sets the brand context-manager reads
  * a withdrawal by, so the call is no outcome of the compression: every rung
  * of the fallback ladder and the merge path rethrow it unchanged, recording
@@ -2349,6 +2350,9 @@ export class AgentFramework {
    *  by the object, not the run's record (ephemeralRuns), which its cleanup
    *  drops before a cancelled stream may count its last usage. */
   private ephemeralAgents: WeakSet<Agent> = new WeakSet();
+  /** Candidates withdrawn by their cleanup(): they can never run, since
+   *  cleanup() is the caller's word that it is done with them. */
+  private releasedEphemeralCandidates: WeakSet<Agent> = new WeakSet();
   /** Each ephemeral agent's or conversation fork's release, kept per Agent
    *  rather than per name: set once an ephemeral run has left or cleanup() has
    *  released it, or as a conversation fork is disposed or fails to be made.
@@ -4148,7 +4152,7 @@ export class AgentFramework {
     return this.membraneAdmitting(async (run, model) => {
       this.withdrawMaintenanceUnderSurgery();
       this.withdrawMaintenanceWhenStopping(agentName);
-      if (release.released) throw new MaintenanceWithdrawnError(`conversation agent ${agentName} has been disposed`);
+      if (release.released) throw new MaintenanceWithdrawnError(`conversation agent ${agentName} has been released`);
       this.refuseHeldProviderModel(agentName, model);
       try { return await run(); }
       catch (error) {
@@ -4164,9 +4168,14 @@ export class AgentFramework {
    * holds the store or once stop() has closed provider admission. An
    * ephemeral run records no stated wait, its name being single-use, so none
    * binds them. They are withdrawn too once the manager's run has left or
-   * cleanup() has released it (`release`): nothing compiles its context for
-   * another turn then, so a drain still working through its queue would pay
-   * for summaries no one reads. What the run stored stays in its namespace.
+   * cleanup() has released it (`release`). cleanup() is the caller's word
+   * that it is done with the agent: a run it has abandoned, to a timeout or
+   * a cancel, may still be going, and goes on with its compression
+   * withdrawn. A drain still working through its queue would pay for
+   * summaries no one reads. A call already out when the release lands runs
+   * to its answer, its retries inside membrane included, since the release
+   * is checked as each call starts. What the run stored stays in its
+   * namespace.
    */
   private ephemeralAuxiliaryMembraneFor(agentName: string, release: { released: boolean }): Membrane {
     return this.membraneAdmitting(async (run) => {
@@ -7946,10 +7955,12 @@ export class AgentFramework {
    *
    * Data persists after cleanup for investigation and cross-revert.
    * Call cleanup() when done to release the ContextManager. Once its run has
-   * ended, or cleanup() has released it, the ContextManager makes no further
+   * ended, or cleanup() has released it, the ContextManager starts no further
    * provider call: compression its strategy still has queued is withdrawn
-   * unsent, as it is for every agent under a surgery's hold or once stop()
-   * has begun.
+   * unsent, as a resident's and a conversation agent's is under a surgery's
+   * hold or once stop() has begun. A call already out then runs to its
+   * answer, its retries inside membrane included. cleanup() also retires an
+   * agent that hasn't run, so runEphemeralToCompletion refuses it.
    */
   async createEphemeralAgent(config: AgentConfig): Promise<{
     agent: Agent;
@@ -7990,8 +8001,11 @@ export class AgentFramework {
       const cleanup = () => {
         // Don't close the store — it's shared. Data persists in the store
         // under the namespace for investigation. The manager's compression is
-        // withdrawn from here on (ephemeralAuxiliaryMembraneFor).
+        // withdrawn from here on (ephemeralAuxiliaryMembraneFor). A candidate
+        // that never ran is withdrawn for good, so it can't run later on a
+        // manager whose compression is withdrawn (runEphemeralToCompletion).
         release.released = true;
+        this.releasedEphemeralCandidates.add(agent);
       };
 
       return { agent, contextManager, cleanup };
@@ -8112,6 +8126,12 @@ export class AgentFramework {
     contextManager: ContextManager,
     watchdogs?: { startupTimeoutMs?: number; idleTimeoutMs?: number; idlePollMs?: number },
   ): Promise<{ speech: string; toolCallsCount: number }> {
+    // cleanup() said the caller was done with it, and its manager's
+    // compression is withdrawn for good: no retry would cure that, so this
+    // comes before the refusals that a later retry can pass.
+    if (this.releasedEphemeralCandidates.has(agent)) {
+      throw new Error(`Ephemeral agent "${agent.name}" was released by cleanup() and can't run; create a new one`);
+    }
     // Refused at admission while quiesced rather than requeued: the caller
     // awaits the settle promise under an idle-stall watchdog, so a gate-parked
     // ephemeral would ride out its timeout and reject with a misleading

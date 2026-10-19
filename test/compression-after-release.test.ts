@@ -1,17 +1,19 @@
 /**
- * A context manager the framework is done with makes no further provider call
- * (anima-research/agent-framework#550): an ephemeral agent's compression is
- * withdrawn unsent once its run has left or cleanup() has released it, and a
- * conversation fork's once it has been disposed or its creation has failed
+ * A context manager the framework is done with starts no further provider
+ * call (anima-research/agent-framework#550): an ephemeral agent's compression
+ * is withdrawn unsent once its run has left or cleanup() has released it, and
+ * a conversation fork's once it has been disposed or its creation has failed
  * partway. A call already out runs to its answer. An ephemeral agent's is
- * withdrawn too, as every agent's is, under a surgery's hold and once stop()
- * has begun. The withdrawal is context-manager's CompressionWithdrawn, so the
- * strategy's drain stops quietly and logs nothing.
+ * withdrawn too, as a resident's and a conversation agent's are, under a
+ * surgery's hold and once stop() has begun. The withdrawal is
+ * context-manager's CompressionWithdrawn, so the strategy's drain stops
+ * quietly, with nothing on the console.
  *
- * Each test gives the manager an autobiographical strategy that drains in the
- * background (autoTickOnNewMessage), as connectome-host builds a subagent's,
- * and a backlog of small chunks, so its drain still has compression queued at
- * the moment under test.
+ * Each test of a drain gives the manager an autobiographical strategy that
+ * drains in the background (autoTickOnNewMessage), as connectome-host builds
+ * a subagent's, and a backlog of small chunks, so its drain still has
+ * compression queued at the moment under test. The last test checks
+ * resetHeadWindow(), which asks for a transition summary the same way.
  */
 import { describe, it } from 'node:test';
 import assert from 'node:assert';
@@ -19,6 +21,7 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { NormalizedRequest, NormalizedResponse } from '@animalabs/membrane';
+import { CompressionWithdrawn } from '@animalabs/context-manager';
 import type { EventResponse, Module, ModuleContext, ProcessEvent, ProcessState, ToolDefinition, ToolResult } from '../src/index.js';
 import { AgentFramework, AutobiographicalStrategy } from '../src/index.js';
 import { createMockResponse, MockMembrane } from './helpers/mock-membrane.js';
@@ -38,9 +41,6 @@ class CompressionMembrane extends MockMembrane {
       this.inFlight--;
     }
     return createMockResponse([{ type: 'text', text: `Summary ${this.compressions.length}: the exchange went on.` }]);
-  }
-  since(at: number): number {
-    return this.compressions.filter((started) => started > at).length;
   }
 }
 
@@ -128,9 +128,9 @@ describe('a context manager the framework is done with makes no compression call
       const run = framework.runEphemeralToCompletion(agent, contextManager);
       framework.start();
       await run;
-      const ended = Date.now();
+      const sent = membrane.compressions.length;
       await sleep(1_000);
-      assert.equal(membrane.since(ended), 0, 'no compression call reached the provider after the run ended');
+      assert.equal(membrane.compressions.length, sent, 'no compression call reached the provider after the run ended');
       assert.deepEqual(errors.lines, [], 'the withdrawal stopped the drain without a log line');
     } finally {
       errors.restore();
@@ -149,14 +149,16 @@ describe('a context manager the framework is done with makes no compression call
       addBacklog(released.contextManager, 30);
       await until(() => membrane.compressions.length >= 1);
       released.cleanup();
-      const at = Date.now();
+      const sent = membrane.compressions.length;
       await sleep(800);
-      assert.equal(membrane.since(at), 0, "no compression call reached the provider after the manager's release");
+      assert.equal(membrane.compressions.length, sent, "no compression call reached the provider after the manager's release");
+      // The agent can't run once cleanup() has released it.
+      await assert.rejects(framework.runEphemeralToCompletion(released.agent, released.contextManager),
+        /was released by cleanup\(\) and can't run/);
       // A manager created after another's release compresses as before.
       const other = await createDraining(framework, 'other');
-      const before = Date.now();
       addBacklog(other.contextManager, 6);
-      await until(() => membrane.since(before) >= 1);
+      await until(() => membrane.compressions.length > sent);
       other.cleanup();
       await quiesce(membrane);
       assert.deepEqual(errors.lines, [], 'the withdrawal stopped the drain without a log line');
@@ -179,10 +181,10 @@ describe('a context manager the framework is done with makes no compression call
       const { contextManager, cleanup } = await createDraining(framework);
       addBacklog(contextManager, 40);
       await until(() => membrane.compressions.length >= 1);
-      const stopping = Date.now();
+      const sent = membrane.compressions.length;
       await framework.stop();
       await sleep(300);
-      assert.equal(membrane.since(stopping), 0, 'no compression call reached the provider once stop() had begun');
+      assert.equal(membrane.compressions.length, sent, 'no compression call reached the provider once stop() had begun');
       assert.deepEqual(errors.lines.filter((line) => /withdrawn|Failed to compress/i.test(line)), [],
         'the withdrawal stopped the drain without a log line');
       cleanup();
@@ -211,9 +213,9 @@ describe('a context manager the framework is done with makes no compression call
       addBacklog(framework.getAgent('trunk-chan-g1')!.getContextManager(), 30);
       await until(() => membrane.compressions.length >= 1);
       internals.disposeConversationAgent('trunk-chan-g1');
-      const at = Date.now();
+      const sent = membrane.compressions.length;
       await sleep(800);
-      assert.equal(membrane.since(at), 0, 'no compression call reached the provider after the fork was disposed');
+      assert.equal(membrane.compressions.length, sent, 'no compression call reached the provider after the fork was disposed');
       assert.deepEqual(errors.lines, [], 'the withdrawal stopped the drain without a log line');
     } finally {
       errors.restore();
@@ -232,11 +234,14 @@ describe('a context manager the framework is done with makes no compression call
       modules: [new Quiet()], syncIntervalMs: 0, maintenanceIntervalMs: 0,
       conversations: { templateAgent: 'trunk', bind: { channel: 'mention' }, strategyFactory: () => drainingStrategy() },
     });
-    const internals = framework as unknown as { createConversationAgent(name: string, channelId: string): Promise<unknown> };
+    const internals = framework as unknown as {
+      createConversationAgent(name: string, channelId: string): Promise<unknown>;
+      disposeConversationAgent(name: string): void;
+    };
     const errors = captureDrainErrors();
     try {
-      // The template's history is the fork's seed. Its last message, made
-      // malformed here, is refused by the fork's addMessage, so the seed
+      // The template's history is the fork's seed. A malformed message
+      // appended to it here is refused by the fork's addMessage, so the seed
       // stops after the 30 before it, which queue compression.
       const template = framework.getAgent('trunk')!.getContextManager();
       addBacklog(template, 30);
@@ -248,6 +253,15 @@ describe('a context manager the framework is done with makes no compression call
       await assert.rejects(internals.createConversationAgent('trunk-chan-g1', 'world:chan'), /refused/);
       await sleep(800);
       assert.equal(membrane.compressions.length, 0, "no compression call reached the provider for the fork that wasn't made");
+      // The failure frees the name, and a fork made again under it is a new
+      // Agent with its own manager, whose compression goes out as before. Its
+      // namespace already holds the failed fork's seed, so it isn't seeded
+      // again: new messages start its drain.
+      template.compile = compile;
+      await internals.createConversationAgent('trunk-chan-g1', 'world:chan');
+      addBacklog(framework.getAgent('trunk-chan-g1')!.getContextManager(), 6, 30);
+      await until(() => membrane.compressions.length >= 1);
+      internals.disposeConversationAgent('trunk-chan-g1');
       assert.deepEqual(errors.lines, [], 'the withdrawal stopped the drain without a log line');
     } finally {
       errors.restore();
@@ -281,6 +295,50 @@ describe('a context manager the framework is done with makes no compression call
     } finally {
       errors.restore();
       await quiesce(membrane);
+      await framework.stop();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('resetHeadWindow() once released: withdrawn with no text, and no call with text', { timeout: 60_000 }, async () => {
+    // A host's /newtopic asks the provider for a transition summary through
+    // the same manager membrane, so the release reaches it too.
+    const membrane = new CompressionMembrane(0);
+    const dir = mkdtempSync(join(tmpdir(), 'af-withdrawn-reset-'));
+    const strategy = () => new AutobiographicalStrategy({ compressionModel: 'test-compression-model' });
+    const framework = await AgentFramework.create({
+      storePath: join(dir, 'store.chronicle'), membrane: membrane.asMembrane(),
+      agents: [{ name: 'trunk', model: 'test-model', systemPrompt: 'test' }],
+      modules: [new Quiet()], syncIntervalMs: 0, maintenanceIntervalMs: 0,
+      conversations: { templateAgent: 'trunk', bind: { channel: 'mention' }, strategyFactory: strategy },
+    });
+    const internals = framework as unknown as {
+      createConversationAgent(name: string, channelId: string): Promise<unknown>;
+      disposeConversationAgent(name: string): void;
+    };
+    try {
+      const ephemeral = await framework.createEphemeralAgent({
+        name: 'worker', model: 'test-model', systemPrompt: 'Do the task.', allowedTools: 'all', strategy: strategy(),
+      });
+      await internals.createConversationAgent('trunk-chan-g1', 'world:chan');
+      const managers = [
+        { name: 'worker', manager: ephemeral.contextManager, release: () => ephemeral.cleanup() },
+        { name: 'trunk-chan-g1', manager: framework.getAgent('trunk-chan-g1')!.getContextManager(),
+          release: () => internals.disposeConversationAgent('trunk-chan-g1') },
+      ];
+      for (const { name, manager, release } of managers) {
+        manager.addMessage('user', [{ type: 'text', text: 'hello there' }]);
+        manager.addMessage(name, [{ type: 'text', text: 'hi' }]);
+        const before = membrane.compressions.length;
+        await manager.resetHeadWindow();
+        assert.equal(membrane.compressions.length, before + 1, `${name}: before the release, a reset with no text asks the provider`);
+        release();
+        await assert.rejects(manager.resetHeadWindow(), (error: unknown) =>
+          error instanceof CompressionWithdrawn && /has been released/.test((error as Error).message));
+        await manager.resetHeadWindow('We moved on.');
+        assert.equal(membrane.compressions.length, before + 1, `${name}: after the release, no reset reached the provider`);
+      }
+    } finally {
       await framework.stop();
       rmSync(dir, { recursive: true, force: true });
     }
