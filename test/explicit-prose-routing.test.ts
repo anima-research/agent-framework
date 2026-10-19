@@ -1483,8 +1483,11 @@ describe('explicit prose routing', () => {
       try {
         // The scheduling turn asked for a continuation and left its tool
         // results pending; the scheduler then starts the agent with another
-        // wake, which consumes them.
+        // wake, which consumes them. This file's wake names no channel, so
+        // it is a private surface's, and the turn it continues is too: a
+        // private wake joins no turn that isn't private.
         const scheduling: RoutingState = routingState({ continuation: true });
+        (scheduling as RoutingState & { nonChannelOrigin?: boolean }).nonChannelOrigin = true;
         internals.openLogical.set('assistant', scheduling);
         internals.turnRouting.set('assistant', routingState());
         trigger(framework);

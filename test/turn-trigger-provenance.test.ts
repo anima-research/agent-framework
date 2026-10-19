@@ -558,12 +558,15 @@ describe('surface batches at their edges, through the real scheduler', () => {
       await rig.i.processInferenceRequests();
       assert.equal(rig.starts.length, 0, `nothing continues the private turn with the room's wake: ${JSON.stringify(rig.starts)}`);
       assert.ok(rig.i.pendingRequests.some((r) => r.channelId === ROOM), 'the wake is still queued');
-      // The private turn ends.
-      rig.state.openLogical.delete('scout');
-      await rig.until(() => rig.starts.length >= 1, "the room's own turn");
+      // The private turn's continuation arrives, runs, and its stream's end
+      // ends the turn.
+      rig.i.pendingRequests.push({ agentName: 'scout', reason: 'tool_results_ready', source: 'framework', timestamp: Date.now() });
+      await rig.until(() => rig.starts.length >= 2, "the continuation, then the room's own turn");
       await rig.framework.runUntilIdle();
-      assert.ok(roomStart(rig.starts[0]!), JSON.stringify(rig.starts[0]));
-      assert.equal(rig.starts[0]!.addressed, true);
+      assert.equal(rig.starts[0]!.reason, 'tool_results_ready', JSON.stringify(rig.starts));
+      assert.ok(privateStart(rig.starts[0]!), 'the continuation keeps the turn private');
+      assert.ok(roomStart(rig.starts[1]!), JSON.stringify(rig.starts[1]));
+      assert.equal(rig.starts[1]!.addressed, true);
       assert.deepEqual(rig.routed.map((r) => r.locus), [ROOM]);
     } finally {
       await rig.close();
@@ -742,6 +745,117 @@ describe('surface batches at their edges, through the real scheduler', () => {
       assert.ok(texts.some((t) => t.startsWith('[delivered]') && t.includes('2 plain-speech segment(s) kept private (non-channel turn')), JSON.stringify(texts));
     } finally {
       await rig.close();
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The scheduler's split, and a private turn's other paths, as the house's
+// internal review of the whole change found them.
+// ---------------------------------------------------------------------------
+
+type Routing = Record<string, unknown>;
+const routingOf = (framework: AgentFramework): Routing =>
+  (framework as unknown as { routingOf(name: string): Routing }).routingOf('scout');
+const tuiWake = (): InferenceRequest => ({ agentName: 'scout', reason: 'external-message', source: 'tui', timestamp: Date.now(), nonChannelOrigin: true });
+const roomWake = (): InferenceRequest => ({ agentName: 'scout', reason: 'external-message', source: 'bridge', timestamp: Date.now(), channelId: ROOM });
+const silentTick = (): InferenceRequest => ({
+  agentName: 'scout', reason: 'mcpl:push-event', source: 'heartbeat', timestamp: Date.now(), suppressProse: true,
+});
+
+describe("the scheduler's split, and a private turn's other paths", () => {
+  it('a silent tick at the head of a batch decides nothing: the open turn still holds the other kind', async () => {
+    for (const openPrivate of [false, true]) {
+      const rig = await surfaceRig();
+      try {
+        const routing = routingOf(rig.framework);
+        if (openPrivate) routing.nonChannelOrigin = true;
+        else routing.triggerChannel = ROOM;
+        rig.state.openLogical.set('scout', routing);
+        const other = openPrivate ? roomWake() : tuiWake();
+        rig.i.pendingRequests.push(silentTick(), other);
+        await rig.i.processInferenceRequests();
+        const label = `open ${openPrivate ? 'private' : 'channel'} turn`;
+        assert.ok(rig.i.pendingRequests.includes(other), `${label}: the other kind's wake waits: ${JSON.stringify(rig.starts)}`);
+        assert.ok(rig.starts.every((s) => s.suppressProse === true), `${label}: only the silent tick starts: ${JSON.stringify(rig.starts)}`);
+        assert.equal(rig.starts[0]?.nonChannelOrigin, undefined, `${label}: the tick takes its own kind, not the turn's`);
+        assert.equal(rig.state.openLogical.get('scout'), routing, `${label}: the open turn is left as it was`);
+      } finally {
+        await rig.close();
+      }
+    }
+  });
+
+  it('a turn that is neither private nor a channel\'s holds a private wake too, and takes a neutral one', async () => {
+    const rig = await surfaceRig();
+    try {
+      // An open turn with no channel of its own, as a heartbeat's.
+      const routing = routingOf(rig.framework);
+      rig.state.openLogical.set('scout', routing);
+      const wake = tuiWake();
+      rig.i.pendingRequests.push(wake);
+      await rig.i.processInferenceRequests();
+      assert.equal(rig.starts.length, 0, `the private wake starts nothing in it: ${JSON.stringify(rig.starts)}`);
+      assert.ok(rig.i.pendingRequests.includes(wake), 'it waits');
+      // A neutral wake continues the turn, and the private one still waits.
+      rig.i.pendingRequests.push({ agentName: 'scout', reason: 'timer', source: 'clock', timestamp: Date.now() });
+      await rig.i.processInferenceRequests();
+      assert.equal(rig.starts.length, 1, JSON.stringify(rig.starts));
+      assert.equal(rig.starts[0]!.reason, 'timer');
+      assert.notEqual(rig.starts[0]!.nonChannelOrigin, true);
+      assert.ok(rig.i.pendingRequests.includes(wake), 'the private wake still waits');
+    } finally {
+      await rig.close();
+    }
+  });
+
+  it("an idle open turn's hold resets when something of its kind comes, and past its bound the turn ends and its held wakes start", async () => {
+    const holdsOf = (rig: Awaited<ReturnType<typeof surfaceRig>>) =>
+      (rig.framework as unknown as { openTurnHolds: Map<string, { turn: unknown; since: number }> }).openTurnHolds;
+    const openChannelTurn = (rig: Awaited<ReturnType<typeof surfaceRig>>) => {
+      const routing = routingOf(rig.framework);
+      routing.triggerChannel = ROOM;
+      rig.state.openLogical.set('scout', routing);
+      return routing;
+    };
+    const first = await surfaceRig();
+    try {
+      const routing = openChannelTurn(first);
+      first.i.pendingRequests.push(tuiWake());
+      await first.i.processInferenceRequests();
+      assert.equal(first.starts.length, 0);
+      assert.equal(holdsOf(first).get('scout')?.turn, routing, "the hold's clock starts at the first pass that finds nothing of the turn's kind");
+      // Long past the bound, a pass that finds the turn's own kind resets it,
+      // and the turn goes on.
+      holdsOf(first).get('scout')!.since -= 31_000;
+      first.i.pendingRequests.push({ agentName: 'scout', reason: 'timer', source: 'clock', timestamp: Date.now() });
+      await first.i.processInferenceRequests();
+      assert.equal(first.starts.length, 1, 'the neutral wake continued the turn');
+      assert.equal(first.starts[0]!.reason, 'timer');
+      assert.equal(holdsOf(first).has('scout'), false, 'and reset the clock');
+    } finally {
+      await first.close();
+    }
+    const second = await surfaceRig();
+    try {
+      const routing = openChannelTurn(second);
+      second.i.pendingRequests.push(tuiWake());
+      await second.i.processInferenceRequests();
+      holdsOf(second).get('scout')!.since -= 31_000;
+      const lines: string[] = [];
+      const error = console.error;
+      console.error = (...args: unknown[]) => { lines.push(args.join(' ')); };
+      try {
+        await second.i.processInferenceRequests();
+      } finally {
+        console.error = error;
+      }
+      assert.notEqual(second.state.openLogical.get('scout'), routing, 'past the bound, the turn ends');
+      assert.ok(lines.some((line) => line.includes('[inference-stale] agent=scout') && line.includes('ending the turn')), JSON.stringify(lines));
+      await second.until(() => second.starts.some(privateStart), 'the held wake starts its own turn');
+      assert.deepEqual(second.routed, []);
+    } finally {
+      await second.close();
     }
   });
 });
