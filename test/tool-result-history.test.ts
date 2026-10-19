@@ -45,10 +45,18 @@ test('unknown block shape falls back to JSON', () => {
   assert.equal(toolResultDataToHistoryString(data), JSON.stringify(data));
 });
 
-test('mixed known + unknown block shape falls back to JSON (all-or-nothing)', () => {
+test('blocks of MCP types the lane cannot show are markers, block by block, never the JSON with their data', () => {
   const data = [
     { type: 'text', text: 'fine' },
     { type: 'audio', data: 'XX', mimeType: 'audio/mpeg' },
+  ];
+  assert.equal(toolResultDataToHistoryString(data), "fine\n[Audio not shown: this host's tool results carry only text and images (audio/mpeg, 1B).]");
+});
+
+test('a block of a type MCP does not define makes the array data, written as JSON (all-or-nothing)', () => {
+  const data = [
+    { type: 'text', text: 'fine' },
+    { type: 'mystery', payload: 42 },
   ];
   assert.equal(toolResultDataToHistoryString(data), JSON.stringify(data));
 });

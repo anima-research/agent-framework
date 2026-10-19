@@ -35,14 +35,21 @@
   content kept, where it was an empty success.
 - An MCPL peer's blocks in a script's `content` get the treatment every
   lane the model reads gives them, since what a script prints comes back to
-  the model. An RFC-005 reference arrives without its URI, as the host's
-  reference id (`refId`), what the server said about it in that block
-  (`name`, `mimeType`, `sizeBytes`, `digest`, `expiresAt`, with control and
-  bidi characters stripped from the text fields, as in the model's stub),
-  and `savedTo`, the workspace path the framework fetched its payload to for
+  the model. An RFC-005 reference arrives as the host's reference id
+  (`refId`), what the server said about it in that block (`name`,
+  `mimeType`, `sizeBytes`, `digest`, `expiresAt`, with control and bidi
+  characters stripped from the text fields, as in the model's stub), and
+  `savedTo`, the workspace path the framework fetched its payload to for
   the script (`null` when it couldn't; `fetch_reference` takes the id as its
-  `ref_id` argument). An unsaved reference that counts as expired also
-  carries `expired`, the reason the model's stub gives, and isn't fetched.
+  `ref_id` argument). It arrives without its URI, except a link (MCP's
+  `resource_link`) that carries `uri` where the model's line for it shows
+  the uri. An unsaved reference that counts as expired also carries
+  `expired`, the reason the model's stub gives, and isn't fetched. One the
+  fetcher would refuse carries `unfetchable`, the words a stub gives in
+  place of advising `fetch_reference`. Both give why a `fetch_reference`
+  with the object's `refId` would be refused, as the result's references
+  claim it, so a link whose line shows its uri, which the host can't
+  fetch, carries them too.
   A block the classifier rejects arrives as the notice the model reads in
   its place, and inline data that also claims a bulk disposition as the
   withheld notice. #181, by @Meganeuridae, first

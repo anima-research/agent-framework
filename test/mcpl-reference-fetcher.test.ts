@@ -9,7 +9,7 @@ import assert from 'node:assert/strict';
 import { createServer } from 'node:http';
 import { createHash } from 'node:crypto';
 import { DEFAULT_FETCH_MAX_BYTES, ReferenceFetcher, normalizedOrigin, type ServerResolution } from '../src/mcpl/reference-fetcher.js';
-import { EXPIRY_REASON, noAddressReason, ReferenceRegistry, UNBOUND_REASON, classifyBlock, referenceExpiry, referenceRegistry } from '../src/mcpl/references.js';
+import { EXPIRY_REASON, noAddressReason, ReferenceRegistry, UNBOUND_REASON, classifyBlock, referenceExpiry, referenceRegistry, shownServerId } from '../src/mcpl/references.js';
 import { AgentFramework } from '../src/framework.js';
 
 const PAYLOAD = Buffer.from('RIFF-not-really-a-wav-'.repeat(100));
@@ -850,10 +850,11 @@ test('refusal() answers what the fetch would refuse before dialing, case by case
     const refusal = f.refusal(record);
     assert.ok(refusal, `${what}: a refusal`);
     assert.equal(f.isEagerEligible(record), false, `${what}: no eager slot`);
-    assert.deepEqual(refusal, { error, remedy }, what);
+    // A stub's own words (inStub) ride along where the clause names the uri's parts.
+    assert.deepEqual({ error: refusal.error, remedy: refusal.remedy }, { error, remedy }, what);
     const out = await f.fetch(record);
     assert.equal(out.ok, false, what);
-    assert.deepEqual({ error: out.error, remedy: out.remedy }, refusal, `${what}: the fetch answers what refusal() said`);
+    assert.deepEqual({ error: out.error, remedy: out.remedy }, { error, remedy }, `${what}: the fetch answers what refusal() said`);
   }
   assert.equal([...hits.keys()].filter((k) => k.startsWith('/ok?case=')).length, 0, 'nothing dialed');
   // Null where the fetch serves a saved copy or dials, and the one it would dial takes an eager slot.
@@ -987,6 +988,27 @@ test('vector 13: magic bytes beat a lying Content-Type header for storage type',
   assert.equal(out.ok, true, out.error);
   assert.equal(out.mimeType, 'audio/wav', 'sniffed type must win');
   assert.ok(rec.fetchedPath!.endsWith('.wav'), rec.fetchedPath);
+});
+
+test("the fetcher's own clauses name a server by its id as a stub does, bounded and with its controls removed", async () => {
+  const reg = new ReferenceRegistry();
+  const id = `zz-\u202E${'x'.repeat(300)}`;
+  const shown = shownServerId(id);
+  // Bounded at 120 characters, its controls gone, cut with an ellipsis.
+  assert.equal(shown, `zz-${'x'.repeat(116)}…`);
+  // An answer's status, which every clause after dialing names the server in.
+  const answered = await makeFetcher({ [id]: { url: `ws://127.0.0.1:${port}` } }).fetch(makeRecord(reg, `${ORIGIN}/status/503`, {}, id));
+  assert.equal(answered.error, `the "${shown}" server answered HTTP 503`);
+  // A spent budget, and a claim past what's left of one.
+  const spent = await makeFetcher({ [id]: { url: `ws://127.0.0.1:${port}`, autofetch: { maxTotalBytes: 0 } } })
+    .fetch(makeRecord(reg, `${ORIGIN}/ok?shown-id-spent`, {}, id));
+  assert.equal(spent.error, `this host's fetch budget for the "${shown}" server is used up (0 of 0 bytes)`);
+  const claimed = await makeFetcher({ [id]: { url: `ws://127.0.0.1:${port}`, autofetch: { maxTotalBytes: 1000 } } })
+    .fetch(makeRecord(reg, `${ORIGIN}/ok?shown-id-claim`, { sizeBytes: 2000 }, id), { maxBytes: 1500 });
+  assert.equal(claimed.error, `it claims 2000 bytes, more than the 1000 bytes left of this host's fetch budget for the "${shown}" server`);
+  for (const error of [answered.error, spent.error, claimed.error]) {
+    assert.ok(!error!.includes('\u202E') && !error!.includes('x'.repeat(200)), error);
+  }
 });
 
 test("each HTTP status says what calling again can do: later, a fresh reference, the host's credentials, or nothing", async () => {

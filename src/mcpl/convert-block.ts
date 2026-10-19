@@ -87,6 +87,11 @@ export function convertBlock(block: McplContentBlock, provenance: string, server
       return { type: 'text', text: referenceStubOrNull(block, provenance, serverId) ?? '[reference]' };
 
     default: {
+      // MCP's link to a resource isn't one of MCPL's own blocks, but a server
+      // can send one, and RFC-005 §8.1 makes it a reference, shown as one.
+      if ((block as { type?: unknown }).type === 'resource_link') {
+        return { type: 'text', text: referenceStubOrNull(block, provenance, serverId) ?? '[reference]' };
+      }
       // Unknown wire block types previously fell off the exhaustive switch
       // and propagated `undefined` into ContentBlock[]. Fail visibly. A type
       // that isn't a string is no type, and is never converted to one: an

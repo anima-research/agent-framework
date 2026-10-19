@@ -2,7 +2,8 @@
  * What a script receives from a tool whose result carries structuredContent,
  * through the real dispatch. An MCPL peer's content blocks get the treatment
  * RFC-005 gives them on every lane the model reads, since what a script prints
- * comes back to the model: a reference arrives without its URI, as the host's
+ * comes back to the model: a reference arrives without its URI (a link
+ * carries one only where the model's line shows it), as the host's
  * reference id, what the server said about it in that block, and `savedTo`,
  * the workspace path the dispatch fetched its payload to for the script; a
  * block the classifier rejects arrives as the notice the model's lanes show,
@@ -18,7 +19,7 @@ import { join } from 'node:path';
 
 import { AgentFramework, WorkspaceModule } from '../src/index.js';
 import type { ScriptToolResult, ToolResult } from '../src/index.js';
-import { EXPIRY_REASON, INLINE_WITHHELD_TEXT } from '../src/mcpl/references.js';
+import { EXPIRY_REASON, INLINE_WITHHELD_TEXT, referenceRegistry } from '../src/mcpl/references.js';
 import type { ReferenceRecord } from '../src/mcpl/references.js';
 import { MockMembrane } from './helpers/mock-membrane.js';
 
@@ -50,10 +51,11 @@ const blocks = (test: string) => [
   // Inline data that claims nothing.
   { type: 'image', data: 'iVBORw0KGgo=', mimeType: 'image/png' },
   // Blocks the classifier rejects: a uri longer than its limit (4096 UTF-16
-  // units), an MCP embedded resource (its uri nested), and a type RFC-005
-  // doesn't define.
+  // units), and an MCP embedded resource (its uri nested).
   { type: 'resource', uri: `https://files.example.invalid/long?sig=${'s'.repeat(4096)}`, name: 'long' },
   { type: 'resource', resource: { uri: 'https://files.example.invalid/embedded?sig=embedded-token', mimeType: 'text/plain', text: 'embedded' } },
+  // A link (MCP's resource_link), a reference (RFC-005 §8.1) the host can
+  // fetch here, so its uri, which also carries a signature, stays out.
   { type: 'resource_link', uri: 'https://files.example.invalid/link?sig=link-token', name: 'link' },
   { type: 'text', text: 'two attachments' },
   // A reference that counts as expired: with a bidi override after it, its
@@ -103,6 +105,9 @@ async function withPeers(fn: (h: Harness) => Promise<void>, opts: { eager?: bool
   internals.mcplServerRegistry = { getServer: (id: string) => peers.get(id) ?? null, getAllServers: () => [], closeAll: async () => {} };
   internals.mcplPrefixMap.set('mcpl--files', 'files');
   internals.mcplPrefixMap.set('mcpl--plain', 'plain');
+  // As configuring `files` records its address, which a reference's stub,
+  // and a script's object for it, read for what a fetch would do.
+  referenceRegistry.setServerAddress('files', { url: 'wss://files.example.invalid' }, framework);
   // Stands in for the host-mediated fetcher: every reference is eager or
   // none is, as the test asks, the report is saved and anything else
   // refused, and a saved record returns at once.
@@ -139,12 +144,13 @@ async function withPeers(fn: (h: Harness) => Promise<void>, opts: { eager?: bool
     });
   } finally {
     await framework.stop();
+    referenceRegistry.forgetServerAddress('files', framework);
     rmSync(dir, { recursive: true, force: true });
   }
 }
 
 /** What a script reads for those blocks from an MCPL peer, given each reference's id. */
-const treated = (report: string, big: string, old: string) => [
+const treated = (report: string, big: string, old: string, link: string) => [
   { type: 'resource', refId: report, name: 'report.pdf', mimeType: 'application/pdf', sizeBytes: 1234, digest: DIGEST,
     expiresAt: '2026-12-31T00:00:00Z', savedTo: SAVED },
   { type: 'resource', refId: report, name: 'report-copy.pdf', savedTo: SAVED },
@@ -154,9 +160,10 @@ const treated = (report: string, big: string, old: string) => [
   { type: 'image', data: 'iVBORw0KGgo=', mimeType: 'image/png' },
   { type: 'text', text: '[Reference not shown: its link is longer than this host accepts.]' },
   { type: 'text', text: '[Reference not shown: it arrived without a link.]' },
-  { type: 'text', text: `[Content not shown: this host can't display "resource_link" content.]` },
+  { type: 'resource_link', refId: link, name: 'link', savedTo: null },
   { type: 'text', text: 'two attachments' },
-  { type: 'image', refId: old, mimeType: 'image/png', expiresAt: '2027-01-01T00:00:00Z', savedTo: null, expired: EXPIRY_REASON.unparseable },
+  { type: 'image', refId: old, mimeType: 'image/png', expiresAt: '2027-01-01T00:00:00Z', savedTo: null, expired: EXPIRY_REASON.unparseable,
+    unfetchable: `the reference is ${EXPIRY_REASON.unparseable}` },
 ];
 
 test("an MCPL peer's structured result reaches a script with each block treated as the model's lanes treat it", async () => {
@@ -165,15 +172,14 @@ test("an MCPL peer's structured result reaches a script with each block treated 
     const out = await script('mcpl--files--attach');
     assert.ok(!out.includes('example.invalid'), `no URI reaches the script: ${out.slice(0, 2000)}`);
     assert.deepEqual(fetched, [uris('treated').report, uris('treated').big],
-      'every reference was fetched for the script before it read the result, except the one that counts as expired');
+      'every reference was fetched for the script before it read the result, except the one that counts as expired and the link, which is never fetched for a script');
     const object = JSON.parse(out) as { content: Array<{ refId?: string }>; structuredContent: unknown; isError: boolean };
     const [report, , big] = object.content;
+    const link = object.content[8];
     const old = object.content[10];
-    assert.match(String(report!.refId), /^ref_/);
-    assert.match(String(big!.refId), /^ref_/);
-    assert.match(String(old!.refId), /^ref_/);
-    assert.equal(new Set([report!.refId, big!.refId, old!.refId]).size, 3);
-    assert.deepEqual(object, { content: treated(report!.refId!, big!.refId!, old!.refId!), structuredContent: { attachments: 2 }, isError: false });
+    for (const ref of [report, big, link, old]) assert.match(String(ref!.refId), /^ref_/);
+    assert.equal(new Set([report!.refId, big!.refId, link!.refId, old!.refId]).size, 4);
+    assert.deepEqual(object, { content: treated(report!.refId!, big!.refId!, old!.refId!, link!.refId!), structuredContent: { attachments: 2 }, isError: false });
   });
 });
 
@@ -235,7 +241,7 @@ test("an MCPL peer's structured result past the script cap is saved with its ref
     const saved = read.data.toString('utf8');
     assert.ok(!saved.includes('example.invalid'), 'no URI in the saved file');
     const object = JSON.parse(saved) as { content: Array<{ refId?: string }> };
-    assert.deepEqual(object.content, treated(object.content[0]!.refId!, object.content[2]!.refId!, object.content[10]!.refId!));
+    assert.deepEqual(object.content, treated(object.content[0]!.refId!, object.content[2]!.refId!, object.content[10]!.refId!, object.content[8]!.refId!));
   });
 });
 
@@ -271,11 +277,36 @@ test('an error with structured content is fetched for the script, and reaches it
     assert.ok(!out.includes('example.invalid'), out);
     const object = JSON.parse(out) as { content: Array<{ refId?: string }>; structuredContent: unknown; isError: boolean; error: string };
     assert.deepEqual(object, {
-      content: [treated(object.content[0]!.refId!, '', '')[0], { type: 'text', text: 'the attach failed' }],
+      content: [treated(object.content[0]!.refId!, '', '', '')[0], { type: 'text', text: 'the attach failed' }],
       structuredContent: { partial: true },
       isError: true,
       error: 'the attach failed',
     });
     assert.deepEqual(fetched, [uris('structured-error').report], 'the script reads the blocks, so its reference was fetched first');
+  });
+});
+
+test("an MCPL peer's link reads every reference in its result, so a never anywhere in it withholds the link's uri from a script", { timeout: 30_000 }, async () => {
+  await withPeers(async (h) => {
+    // Off the server's origin, so the host can't fetch it and its line would
+    // show its uri, but a reference in the same result says never, and a
+    // later one, registered last, doesn't.
+    const uri = 'https://elsewhere.example.invalid/never-in-result.csv';
+    h.answer({
+      content: [
+        { type: 'resource', uri, name: 'kept.csv', disposition: 'never' },
+        { type: 'resource', uri, name: 'kept.csv' },
+        { type: 'resource_link', uri, name: 'kept.csv' },
+      ],
+      structuredContent: {},
+    });
+    const out = await h.script('mcpl--files--attach');
+    assert.ok(!out.includes('elsewhere.example.invalid'), out);
+    // Each block reached the script, the link as a reference object.
+    const object = JSON.parse(out) as { content: Array<{ type: string; refId?: string; uri?: string }>; isError: boolean };
+    assert.equal(object.isError, false);
+    assert.deepEqual(object.content.map((b) => b.type), ['resource', 'resource', 'resource_link']);
+    assert.match(String(object.content[2]!.refId), /^ref_/);
+    assert.equal(object.content[2]!.uri, undefined);
   });
 });

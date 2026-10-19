@@ -901,7 +901,7 @@ class ProcessStateImpl implements ProcessState {
 }
 
 /** A result's flags, which consumers read for their truth: booleans here. */
-const RESULT_FLAGS = ['success', 'isError', 'endTurn'] as const;
+const RESULT_FLAGS = ['success', 'isError', 'endTurn', 'dataIsContent'] as const;
 
 /**
  * A module's tool result as the framework can store, send and trace it. A
@@ -971,7 +971,7 @@ export function checkedToolResult(call: ToolCall, result: unknown): { result: To
     endTurn = Boolean(fields.endTurn);
     read('error');
     ownText = errorText(fields.error);
-    for (const key of ['success', 'isError', 'data']) read(key);
+    for (const key of ['success', 'isError', 'data', 'dataIsContent']) read(key);
     for (const key of Object.keys(candidate)) {
       if (key !== 'toJSON' && !(key in fields)) fields[key] = candidate[key];
     }

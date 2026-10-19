@@ -323,7 +323,7 @@ export function validateCoalescedContent(
  */
 function showsAsItself(b: Record<string, unknown>): boolean {
   if (b.type === 'text') return typeof b.text === 'string';
-  if (b.type === 'resource') return classifyBlock(b).kind === 'reference';
+  if (b.type === 'resource' || b.type === 'resource_link') return classifyBlock(b).kind === 'reference';
   if (b.type !== 'image' && b.type !== 'audio') return false;
   if (isInlineContradiction(b)) return false;
   if (isFilledString(b.uri) && b.disposition) return classifyBlock(b).kind === 'reference';

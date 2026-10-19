@@ -31,9 +31,11 @@
  * that the bytes are wanted). Per-server budgets cap cumulative appetite.
  */
 import { createHash } from 'node:crypto';
-import type { ReferenceRecord } from './references.js';
+import type { ReferenceRecord, Refusal, ServerAddress } from './references.js';
 import { boundedForLog, describeCause } from './errors.js';
-import { EXPIRY_REASON, noAddressReason, referenceExpiry, REFERENCE_LIMITS, sanitizeLabel, UNBOUND_REASON } from './references.js';
+import { dialCheck, dialServer, FRESH_REFERENCE, NOTHING_TO_DO, REFERENCE_LIMITS, sanitizeLabel, shownServerId } from './references.js';
+
+export { normalizedOrigin, type Refusal } from './references.js';
 
 /** Per-fetch hard ceiling on actual bytes. A call can lower it for itself
  *  (fetch_reference's max_bytes, which it clamps to this); nothing raises it. */
@@ -50,11 +52,9 @@ const EAGER_FETCH_TIMEOUT_MS = 10_000;
 // What calling again can do, as each failure's remedy says it. The fetcher
 // doesn't know where a reference came from (a tool result, a push, a channel
 // message), so none names a tool, and fetch_reference's max_bytes is named
-// only where a larger one can fetch it.
-const NOTHING_TO_DO = "Calling again won't change that.";
-/** The registry keys a record by its uri, so a fresh reference to the same
- *  uri arrives as this very id and refreshes its record. */
-const FRESH_REFERENCE = "Once a fresh reference to it arrives, fetching may work; until then, fetching it again won't.";
+// only where a larger one can fetch it. The refusals before dialing that a
+// stub shares come from references.ts (dialServer, dialCheck) with their
+// remedies (NOTHING_TO_DO, FRESH_REFERENCE, SERVER_BACK).
 const TRY_LATER = 'Trying again later may work.';
 /** A request that failed before an answer: a refused or reset connection
  *  can clear, and a cause that repeats on every try (a port fetch refuses, a
@@ -71,8 +71,6 @@ const BUDGET = "The budget doesn't renew on its own, so calling again won't chan
 /** The host's own ceiling: fetch_reference clamps max_bytes to it, and no
  *  config sets another. */
 const HOST_CEILING = "No max_bytes or setting lifts that limit, so calling again won't change it.";
-/** The resolver reads the host's server configs as they are at each fetch. */
-const SERVER_BACK = "Calling again won't change that unless whoever runs this host adds that server back.";
 
 export interface ResolvedServerBinding {
   /** The url the host dials the server at. The framework's resolver gives only
@@ -90,18 +88,6 @@ export interface ResolvedServerBinding {
  *  know resolves to undefined. */
 export type ServerResolution = ResolvedServerBinding | 'no-address';
 
-/** Why a fetch failed, or would be refused before dialing. */
-export interface Refusal {
-  /** What happened, as a clause that completes "couldn't fetch <ref>: ",
-   *  whatever it's about: fetch_reference's sentence, save_recent_image's,
-   *  and the eager and script-demand fetches' log lines read it. */
-  error: string;
-  /** What calling again can do, as a sentence. fetch_reference and
-   *  save_recent_image show it; the eager and script-demand fetches log the
-   *  error alone. */
-  remedy: string;
-}
-
 /** A fetch's result: the saved copy, or why it failed, which every failure
  *  says with both a clause and a remedy. The fields the other side lacks are
  *  declared undefined, so a caller can read them before checking ok. */
@@ -116,7 +102,7 @@ export type FetchOutcome =
     error?: undefined;
     remedy?: undefined;
   }
-  | ({ ok: false; path?: undefined; bytes?: undefined; mimeType?: undefined; digestVerified?: undefined } & Refusal);
+  | ({ ok: false; path?: undefined; bytes?: undefined; mimeType?: undefined; digestVerified?: undefined } & Pick<Refusal, 'error' | 'remedy'>);
 
 const refused = (error: string, remedy: string): { refusal: Refusal } => ({ refusal: { error, remedy } });
 const fail = (error: string, remedy: string): FetchOutcome => ({ ok: false, error, remedy });
@@ -191,28 +177,6 @@ const EXT_BY_MIME = new Map<string, string>(Object.entries({
   'application/pdf': 'pdf', 'application/zip': 'zip',
 }));
 
-/** A server's address as it's configured, its scheme and host, for a
- *  clause: never its userinfo, path or query. URL's own origin is 'null' for
- *  a scheme that isn't special, which normalizedOrigin accepts. The caller
- *  has already parsed it. */
-function configuredOrigin(url: string): string {
-  const u = new URL(url);
-  return `${u.protocol}//${u.host}`;
-}
-
-/** ws→http / wss→https with default ports elided, for origin comparison. */
-export function normalizedOrigin(url: string): string | null {
-  try {
-    const u = new URL(url);
-    const scheme = u.protocol === 'ws:' ? 'http:' : u.protocol === 'wss:' ? 'https:' : u.protocol;
-    const defaultPort = scheme === 'https:' ? '443' : '80';
-    const port = u.port === '' || u.port === defaultPort ? '' : `:${u.port}`;
-    return `${scheme}//${u.hostname.toLowerCase()}${port}`;
-  } catch {
-    return null;
-  }
-}
-
 export class ReferenceFetcher {
   /** Bytes read through each server in this process, charged to the server a
    *  fetch dials through as each chunk is read, kept or not. Concurrent
@@ -222,11 +186,41 @@ export class ReferenceFetcher {
   private inFlight = new Map<string, Promise<FetchOutcome>>();
 
   constructor(
+    /** A server's address, credential and limits, by id, from the
+     *  framework's own config: the origin a fetch is checked against and the
+     *  token it carries come from one answer. */
     private readonly resolveServer: (serverId: string) => ServerResolution | undefined,
     /** Persist the payload; returns a mount-prefixed path or null when no
      *  writable workspace exists. File name is host-generated (§7.3). */
     private readonly saveFile: (fileName: string, data: Buffer, mimeType: string) => Promise<string | null>,
   ) {}
+
+  /** The server a check (dialServer or dialCheck) chose, with its credential
+   *  and limits from the same resolver answer whose address the check read:
+   *  each server's resolution is read once here, so the origin the check
+   *  passes and the token the fetch sends come from one answer, whatever a
+   *  resolver answers the next time it's asked. */
+  private chosen(
+    check: (addressOf: (serverId: string) => ServerAddress | undefined) => { serverId: string } | { refusal: Refusal },
+  ): { serverId: string; binding: ResolvedServerBinding } | { refusal: Refusal } {
+    const resolutions = new Map<string, ServerResolution | undefined>();
+    const addressOf = (serverId: string): ServerAddress | undefined => {
+      if (!resolutions.has(serverId)) resolutions.set(serverId, this.resolveServer(serverId));
+      const resolution = resolutions.get(serverId);
+      return resolution === undefined || resolution === 'no-address' ? resolution : { url: resolution.url };
+    };
+    const server = check(addressOf);
+    if ('refusal' in server) return server;
+    // The check chose only a server whose address it read as a url, so that
+    // server's resolution is a binding.
+    return { serverId: server.serverId, binding: resolutions.get(server.serverId) as ResolvedServerBinding };
+  }
+
+  /** The server a fetch of a record dials (§6.2), with its credential and
+   *  limits, or why none can be. */
+  private serverFor(record: ReferenceRecord): { serverId: string; binding: ResolvedServerBinding } | { refusal: Refusal } {
+    return this.chosen((addressOf) => dialServer(record, addressOf));
+  }
 
   /** Would the eager (autofetch) default fetch this record? Not one the fetch
    *  would refuse before dialing, asked as the eager fetch asks it, with the
@@ -243,49 +237,22 @@ export class ReferenceFetcher {
     return record.testimony.sizeBytes !== undefined && record.testimony.sizeBytes <= cap;
   }
 
-  /** The server to dial for a record (§6.2): the first, in the order they
-   *  delivered it, whose address is on the uri's origin. When none is, the
-   *  first server's refusal (unknown to this host, with no address to dial,
-   *  or the origin check's), and for a record no server delivered, that it's
-   *  unbound. */
-  private serverFor(record: ReferenceRecord): { serverId: string; binding: ResolvedServerBinding } | { refusal: Refusal } {
-    let refusal: { refusal: Refusal } | undefined;
-    for (const serverId of record.serverIds) {
-      const binding = this.resolveServer(serverId);
-      if (!binding) {
-        refusal ??= refused(`this host no longer has the "${serverId}" server it came from`, SERVER_BACK);
-        continue;
-      }
-      if (binding === 'no-address') {
-        refusal ??= refused(noAddressReason(serverId), NOTHING_TO_DO);
-        continue;
-      }
-      const offOrigin = this.originCheck(record, binding, serverId);
-      if (offOrigin === null) return { serverId, binding };
-      refusal ??= offOrigin;
-    }
-    // A later delivery of the same uri by a server binds this record.
-    return refusal ?? refused(`it's ${UNBOUND_REASON}`, FRESH_REFERENCE);
-  }
-
   /** Every check the fetch makes before it dials, in its order: the server
    *  (none, unknown, no address, an address of its own or the reference's
    *  that doesn't parse, a reference address carrying a user name or
-   *  password, a scheme other than http: or https:, off the uri's origin),
-   *  the expiry, a claimed size over the host's own ceiling, the server's
-   *  spent budget, a claimed size over a call's ceiling. For a record with no
-   *  saved copy and no fetch under way, the fetch, `refusal()` and the eager
-   *  check all ask this, so what save_recent_image says is the reason the
-   *  fetch would refuse with, and no eager slot goes to a fetch that would be
-   *  refused. */
+   *  password, a scheme other than http: or https:, off the uri's origin)
+   *  and the expiry, which dialCheck makes as a reference's stub does; then
+   *  a claimed size over the host's own ceiling, the server's spent budget,
+   *  a claimed size over a call's ceiling. For a record with no saved copy
+   *  and no fetch under way, the fetch, `refusal()` and the eager check all
+   *  ask this, so what save_recent_image says is the reason the fetch would
+   *  refuse with, and no eager slot goes to a fetch that would be refused. */
   private beforeDial(record: ReferenceRecord, opts?: { maxBytes?: number }):
     { refusal: Refusal } | { serverId: string; binding: ResolvedServerBinding; ceiling: number; budget: number } {
-    const server = this.serverFor(record);
+    const server = this.chosen((addressOf) => dialCheck(record, addressOf));
     if ('refusal' in server) return server;
     const { serverId, binding } = server;
     const t = record.testimony;
-    const expiry = referenceExpiry(t);
-    if (expiry) return refused(`the reference is ${EXPIRY_REASON[expiry]}`, FRESH_REFERENCE);
 
     const ceiling = opts?.maxBytes ?? DEFAULT_FETCH_MAX_BYTES;
     // A claim past the host's own ceiling is refused first: nothing lifts
@@ -299,7 +266,7 @@ export class ReferenceFetcher {
     const budget = binding.autofetch?.maxTotalBytes ?? DEFAULT_MAX_TOTAL_BYTES;
     const used = this.totals.get(serverId) ?? 0;
     if (used >= budget) {
-      return refused(`this host's fetch budget for the "${serverId}" server is used up (${used} of ${budget} bytes)`, BUDGET);
+      return refused(`this host's fetch budget for the "${shownServerId(serverId)}" server is used up (${used} of ${budget} bytes)`, BUDGET);
     }
     // Vector 4: a claim already over the ceiling refuses without dialing. One
     // that's also over what's left of the budget is told about the budget,
@@ -308,7 +275,7 @@ export class ReferenceFetcher {
     if (t.sizeBytes !== undefined && t.sizeBytes > ceiling) {
       if (t.sizeBytes > budget - used) {
         return refused(
-          `it claims ${t.sizeBytes} bytes, more than the ${budget - used} bytes left of this host's fetch budget for the "${serverId}" server`,
+          `it claims ${t.sizeBytes} bytes, more than the ${budget - used} bytes left of this host's fetch budget for the "${shownServerId(serverId)}" server`,
           BUDGET,
         );
       }
@@ -331,43 +298,6 @@ export class ReferenceFetcher {
     return 'refusal' in check ? check.refusal : null;
   }
 
-  /** §6.1/§7.1 policy check; returns a refusal or null. */
-  private originCheck(record: ReferenceRecord, binding: ResolvedServerBinding, serverId: string): { refusal: Refusal } | null {
-    const refOrigin = normalizedOrigin(record.testimony.uri);
-    if (!refOrigin) return refused("its address doesn't parse as a URL", NOTHING_TO_DO);
-    // A server's address that doesn't parse leaves nothing to dial. The
-    // framework's resolver gives only an address its transport dials, so this
-    // guards other resolvers.
-    const dialedOrigin = normalizedOrigin(binding.url);
-    if (!dialedOrigin) {
-      return refused(`the "${serverId}" server's address doesn't parse as a URL, so there's nowhere to fetch it from`,
-        "Calling again won't change that unless whoever runs this host corrects the server's address.");
-    }
-    const refUrl = new URL(record.testimony.uri);
-    // A user name or password in the uri is a credential embedded in it,
-    // which RFC-005 §6.1 forbids a server to mint and lets a host refuse
-    // (vector 6). This host neither sends nor repeats it: fetch refuses such
-    // a url with a message that holds it whole.
-    if (refUrl.username !== '' || refUrl.password !== '') {
-      return refused("its address carries a user name or password, which this host doesn't send", NOTHING_TO_DO);
-    }
-    // The uri's own scheme, not its origin's: an origin reads ws: as http:
-    // and wss: as https:, and fetch refuses a ws: or wss: uri ('unknown
-    // scheme') before connecting, which would read as a failed request a
-    // later try can mend.
-    const scheme = refUrl.protocol;
-    if (scheme !== 'https:' && scheme !== 'http:') {
-      return refused(`its address uses ${scheme}, and this host fetches only http: and https: addresses`, NOTHING_TO_DO);
-    }
-    // Origins compare with their schemes, so this also refuses an http:
-    // reference from a server dialed over TLS (wss://).
-    if (refOrigin !== dialedOrigin) {
-      return refused(`it points to ${refOrigin}, not to the "${serverId}" server's own address (${configuredOrigin(binding.url)}), ` +
-        'and this host fetches only from the server itself', NOTHING_TO_DO);
-    }
-    return null;
-  }
-
   /** Fetch a reference to workspace storage. Idempotent per record; concurrent
    *  callers share one in-flight fetch. */
   fetch(record: ReferenceRecord, opts?: { maxBytes?: number; timeoutMs?: number }): Promise<FetchOutcome> {
@@ -385,9 +315,9 @@ export class ReferenceFetcher {
   private async doFetch(record: ReferenceRecord, opts?: { maxBytes?: number; timeoutMs?: number }): Promise<FetchOutcome> {
     const t = record.testimony;
     const check = this.beforeDial(record, opts);
-    if ('refusal' in check) return { ok: false, ...check.refusal };
+    if ('refusal' in check) return fail(check.refusal.error, check.refusal.remedy);
     const { serverId, binding, ceiling, budget } = check;
-    const server = `the "${serverId}" server`;
+    const server = `the "${shownServerId(serverId)}" server`;
 
     const timeoutMs = opts?.timeoutMs ?? FETCH_TIMEOUT_MS;
     const controller = new AbortController();
