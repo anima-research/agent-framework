@@ -934,4 +934,23 @@ describe("the scheduler's split, and a private turn's other paths", () => {
       await rig.close();
     }
   });
+
+  it("a channel-bound surface message's channel isn't another agent's when a conversation fork owns it", async () => {
+    const gate = { config: { policies: [{ name: 'surface', match: { scope: ['external-message'] }, behavior: { debounce: 50 } }], default: 'skip' } };
+    for (const viaGate of [false, true]) {
+      const rig = await surfaceRig(viaGate ? { gate } : {});
+      try {
+        (rig.framework as unknown as { conversationAgentHomes: Map<string, string> }).conversationAgentHomes.set('scout-fork', ROOM);
+        rig.framework.pushEvent(roomMessage(true));
+        await rig.until(() => rig.starts.length >= 1, 'the trunk agent\'s turn');
+        await rig.framework.runUntilIdle();
+        const label = viaGate ? 'through the gate' : 'directly';
+        assert.equal(rig.starts[0]!.channelId, undefined, `${label}: ${JSON.stringify(rig.starts[0])}`);
+        assert.notEqual(rig.starts[0]!.addressed, true, label);
+        assert.ok(!rig.routed.some((r) => r.locus === ROOM), `${label}: nothing lands in the fork's channel`);
+      } finally {
+        await rig.close();
+      }
+    }
+  });
 });

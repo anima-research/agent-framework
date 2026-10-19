@@ -3135,7 +3135,10 @@ export class AgentFramework {
             ...(provenance?.counterparty ? { counterparty: provenance.counterparty } : {}),
             ...(provenance?.at ? { wakeAt: provenance.at } : {}),
             ...(provenance?.routingClass === 'private' ? { nonChannelOrigin: true } : {}),
+            // A channel-bound surface message names its channel as the
+            // turn's, under the fork rule below.
             ...(provenance?.routingClass === 'channel' && provenance.channelId
+              && framework.mayTakeGateRoute(agentName, provenance.channelId)
               ? { channelId: provenance.channelId }
               : {}),
             // A batch that contains an ADDRESSED message (mention / reply /
@@ -11814,18 +11817,22 @@ export class AgentFramework {
               (n) => !this.conversationAgentHomes.has(n) && n !== this.subconsciousAgentName)
           : response.requestInference;
 
+      // A channel-bound surface message's channel is the turn's, unless a
+      // conversation fork owns it (mayTakeGateRoute).
+      const boundChannel = surfaceChannelId(event);
       for (const agentName of targetAgents) {
         const agent = this.agents.get(agentName);
         if (agent && agent.canBeTriggeredBy(source)) {
+          const channelId = boundChannel && this.mayTakeGateRoute(agentName, boundChannel) ? boundChannel : undefined;
           this.pendingRequests.push({
             agentName,
             reason: event.type,
             source,
             timestamp: Date.now(),
-            ...(surfaceChannelId(event) ? { channelId: surfaceChannelId(event) } : {}),
+            ...(channelId ? { channelId } : {}),
             // A channel-bound surface message that addressed the agent outranks
             // ambient ones for the turn's channel, as a channel-incoming one does.
-            ...(surfaceChannelId(event) && isAddressedMessage(surfaceTags(event)) ? { addressed: true } : {}),
+            ...(channelId && isAddressedMessage(surfaceTags(event)) ? { addressed: true } : {}),
             nonChannelOrigin: isNonChannelSurfaceEvent(event),
           });
         }
@@ -13460,8 +13467,9 @@ export class AgentFramework {
   }
 
   /**
-   * Whether a batched gate wake's addressed route may become `agentName`'s
-   * speech locus. The gate broadcasts to every agent, conversation forks
+   * Whether a wake's channel may become `agentName`'s speech locus: a batched
+   * gate wake's addressed route, or a channel-bound surface message's own
+   * channel. The gate broadcasts to every agent, conversation forks
    * included. A fork speaks only in its home channel, and a channel bound to
    * a fork is that fork's conversation, so no other agent takes it.
    */
