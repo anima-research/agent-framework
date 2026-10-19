@@ -132,26 +132,22 @@ export interface FrameworkConfig {
      */
     collapseDerivationNoticesAfter?: number;
     /**
-     * Whether an agent is told when something is derived from it (the
-     * `[Agent lifecycle: … was derived from you …]` lines, and the count
-     * lines they collapse into). Default true. The `dendrite:agent-created`
-     * trace is emitted either way. A policy, not a rule: being told when
-     * the body changes is a property some minds want and others may not
-     * (architecture channel, 2026-10-19), so a host or a mind can turn it
-     * off here; a per-agent switch is the shape to grow toward.
+     * A host's say over every derivation and spawn, before the agent exists:
+     * the spec as it will be registered (name, kind, spawner, route,
+     * inheritance, metadata). Return nothing to allow, or `{ refuse }` with
+     * the reason, which the caller gets as the error. The framework attaches
+     * no meaning to the decision — consent, budget, hours, a mind's standing
+     * instruction, a use not yet imagined are all the host's (architecture
+     * channel, 2026-10-19: semantics live outside the platform).
      */
-    announceDerivations?: boolean;
+    beforeDerive?: (spec: import('../dendrite/types.js').AgentSpec) => void | { refuse: string };
     /**
-     * What the framework asks of `subconscious.consent` for reader forks
-     * (connectome-host#334). `'recorded'` (default): a record given is
-     * checked against the live fork section and carried on each fork; none
-     * is demanded. `'required'`: `create` also refuses forks without one.
-     * `'none'`: the field is ignored and `withdraw_consent` is not offered.
-     * A policy for the host and the minds it runs to set, not a rule the
-     * framework imposes: a consent gate and its wording assume one kind of
-     * mind, and the architecture should not (tel0s and Antra, 2026-10-19).
+     * What an agent is told when something is derived from it. Given the
+     * record, the agent it was derived from and the framework's default line,
+     * return the text to add, or null to add nothing. Absent, the default
+     * line is used. The `dendrite:agent-created` trace is emitted either way.
      */
-    consent?: 'required' | 'recorded' | 'none';
+    derivationNotice?: (record: import('../dendrite/types.js').AgentRecord, from: string, defaultText: string) => string | null;
   };
 
   /**

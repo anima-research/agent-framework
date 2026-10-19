@@ -781,30 +781,6 @@ export type TraceEvent =
       reason: 'host-stop';
     })
 
-  /** The resident withdrew the yes its reader forks ran under (withdraw_consent). */
-  | (TraceEventBase & {
-      type: 'tune-out:reader-consent-withdrawn';
-      agentName: string;
-      reason?: string;
-      /** `consent.at` of the yes withdrawn, when one was recorded. */
-      consentAt?: string;
-    })
-  /** A reader invocation was not derived: the resident has withdrawn its yes. */
-  | (TraceEventBase & {
-      type: 'tune-out:reader-withheld';
-      agentName: string;
-      serverId: string;
-      channelId: string;
-      epochId: string;
-      trigger: 'cadence' | 'wake' | 'cancel';
-      held: number;
-    })
-  /** A new yes was recorded after a withdrawal: reader forks derive again. */
-  | (TraceEventBase & {
-      type: 'tune-out:reader-consent-renewed';
-      agentName: string;
-      consentAt: string;
-    })
   /** A tune-out reader fork was derived for one invocation (subconscious.reader: 'forks'). */
   | (TraceEventBase & {
       type: 'tune-out:reader-fork';
@@ -831,8 +807,6 @@ export type TraceEvent =
       onParentEnd?: import('../dendrite/types.js').ParentEndPolicy;
       resultTo?: import('../dendrite/types.js').ResultRoute;
       inherit?: import('../dendrite/types.js').ContextInheritance;
-      /** A reader fork: the resident's yes to the fork section it runs under (ReaderConsent). */
-      consent?: import('../tune-out/tools.js').ReaderConsent;
     })
   | (TraceEventBase & {
       type: 'dendrite:agent-ended';

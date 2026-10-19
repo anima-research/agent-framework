@@ -176,12 +176,6 @@ export interface TuneOutFrameworkHooks {
    */
   holdWithoutReader?: () => boolean;
   /**
-   * `reader: 'forks'`: the resident has withdrawn the yes the forks run
-   * under (withdraw_consent). While true no reader fork is derived and a
-   * hold is a silent hold, as with no reader configured; `tune_out` says so.
-   */
-  readerWithdrawn?: () => boolean;
-  /**
    * Post a line into a channel under the resident's name. Used for the
    * all-except scope's entry and release announcements in the excepted
    * channel (Linn, 2026-10-12: the room should hear the door shut, not
@@ -228,14 +222,12 @@ export class TuneOutCoordinator {
 
   /** A reader exists: the persistent subconscious, or forks on demand. */
   private readerAvailable(): boolean {
-    return this.hooks.subconsciousName() != null || this.forkReader;
+    return this.hooks.subconsciousName() != null || typeof this.hooks.invokeReader === 'function';
   }
 
-  /** Reader forks are the configured reader, and the resident's yes stands. */
+  /** Reader forks are the configured reader. */
   private get forkReader(): boolean {
-    return this.hooks.subconsciousName() == null
-      && typeof this.hooks.invokeReader === 'function'
-      && this.hooks.readerWithdrawn?.() !== true;
+    return this.hooks.subconsciousName() == null && typeof this.hooks.invokeReader === 'function';
   }
 
   /** Restart cadence + expiry timers and re-anchor after a process restart. */
