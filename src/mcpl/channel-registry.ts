@@ -1736,9 +1736,10 @@ export class ChannelRegistry {
     // During a real turn, report the same frozen locus routeSpeech consumes.
     // A private non-channel turn freezes null and has no truthful incoming
     // channel either. Outside a turn (including preview), resolve the
-    // outbound locus the SAME way routeSpeech does, so the agent is told the
-    // channel its speech will actually land in (none, when its server
-    // declared it inbound-only, since speech isn't posted there): a
+    // outbound locus the SAME way routeSpeech does for a turn that isn't
+    // private, so the agent is told the channel such a turn's speech lands in
+    // (none, when its server declared it inbound-only, since speech isn't
+    // posted there): a
     // conversation fork's home channel, else this turn's channel (single
     // trunk agent — item-3 redux: its locus, else its triggering channel),
     // else the global default (heartbeats). Without this, a fork was
@@ -4018,9 +4019,10 @@ export class ChannelRegistry {
       if (this.takesGlobalFallback?.(conversationId) === false) {
         return { status: 'failed', reason: "an ephemeral run's plain speech with no channel of its own is its caller's result", at: Date.now() };
       }
-      // The turn froze with no locus (no home, no triggering channel, no
-      // global inbound ever seen) — the agent was told its prose stays on
-      // the surface where it was addressed; honor that.
+      // The turn froze with no locus (a private turn, or no home, no
+      // triggering channel, no global inbound ever seen) — the agent was told
+      // its prose stays on the surface it was addressed from, if any; honor
+      // that.
       const reason = 'turn has no locus (no home/trigger channel; nothing to deliver into)';
       return fail(null, reason, { status: 'failed', reason, at: Date.now() });
     }

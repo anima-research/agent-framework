@@ -14801,7 +14801,8 @@ export class AgentFramework {
       );
     }
     if (kept > 0) notes.push(`${kept} plain-speech segment(s) kept private (skip_reply or a private think)`);
-    if (privateKept > 0) notes.push(`${privateKept} plain-speech segment(s) kept private (non-channel turn — publish only with an explicit send tool)`);
+    if (privateKept > 0) notes.push(`${privateKept} plain-speech segment(s) kept private (non-channel turn — publish only with an explicit send tool${
+      agent.proseRouting === 'hybrid' ? ' or a >>> envelope' : ''})`);
     if (suppressed > 0) {
       notes.push(agent.proseRouting === 'disabled'
         ? `${suppressed} plain-speech segment(s) kept in the transcript (proseRouting=disabled — post to a channel only with an explicit send tool)`
@@ -14863,9 +14864,12 @@ export class AgentFramework {
 
     let text: string;
     if (locus === null) {
+      // A private turn's speech stays on the surface it came from; a turn
+      // that came from no surface has none, hence "if any".
       text =
         '[routing] Your plain speech currently goes to no channel: it stays on ' +
-        'the surface you were addressed from. Use an explicit send tool to reach a channel.';
+        'the surface you were addressed from, if any. Use an explicit send tool' +
+        `${agent.proseRouting === 'hybrid' ? ' or a >>> envelope' : ''} to reach a channel.`;
     } else {
       const label = this.channelRegistry?.getDescriptor(locus)?.label;
       const shown =
@@ -25968,7 +25972,8 @@ export class AgentFramework {
                 data: {
                   ...(result.data as Record<string, unknown> | undefined),
                   routing: privateTurn
-                    ? 'Channel opened for incoming traffic. This turn’s plain speech stays private; use an explicit send tool to publish there.'
+                    ? `Channel opened for incoming traffic. This turn’s plain speech stays private; use an explicit send tool${
+                      openerAgent.proseRouting === 'hybrid' ? ' or a >>> envelope' : ''} to publish there.`
                     : inboundOnlyServer
                       ? `${inboundOnlySpeechNote(inboundOnlyServer)} Other channels need an explicit send tool.`
                       : 'Your plain speech now lands in this channel. Other channels need an explicit send tool.',

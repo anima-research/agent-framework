@@ -423,6 +423,8 @@ export interface InferenceRequest {
    * request-only separator carrying the tick's instruction before the tick's
    * first surviving row (`SILENT_HEARTBEAT_SEPARATOR`). */
   silentHeartbeat?: SilentHeartbeatTick;
-  /** True when a private non-channel surface requested this inference. */
+  /** True when this inference is a private non-channel surface's: that
+   *  surface requested it, or a turn that one opened caused it (a derived
+   *  continuation, a bounce or a rewind carries the turn's privacy on). */
   nonChannelOrigin?: boolean;
 }
