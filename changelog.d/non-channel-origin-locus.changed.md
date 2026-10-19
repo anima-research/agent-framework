@@ -39,7 +39,3 @@
 
   When an agent's speech has no channel, its `[routing]` notice now says it
   stays on the surface the agent was addressed from, if any.
-
-  `channel_publish`'s description and its `channelId` parameter's description
-  changed, so the first request after the upgrade that carries the channel
-  tools misses the prompt cache from it.
