@@ -15,25 +15,26 @@
   no message, and shows no typing for it: a module with its own speech handler
   or typing indicator can use the fields to do the same.
 
-  A private surface's wake and a wake that names a channel never start one
-  turn together: not from one batch, one gate debounce window or one quiesce.
-  In a gate window, an addressed channel event or a channel-bound surface
-  message names its channel; ambient channel events that share a window with a
-  private message share its private turn, and nothing answers them in their
-  channel. A start that continues a turn keeps that turn's kind, and takes no
-  private surface's wake into a turn that isn't private. Such wakes wait for
+  A private surface's wake and a wake that names a channel never start one turn
+  together: not from one batch, one gate debounce window or one quiesce. In a
+  gate window, a channel-bound surface message names its channel, and so does an
+  addressed channel event whose channel the host resolved; ambient channel
+  events that share a window with a private message, with nothing in the window
+  that names a channel, share its private turn, and nothing answers them in
+  their channel. A start that continues a turn keeps that turn's kind, and takes
+  no private surface's wake into a turn that isn't private. Such wakes wait for
   the open turn to end; an idle agent's open turn that holds such a wake with
   nothing of its own kind to start for 30 seconds ends, and a
   `[inference-stale]` line says so.
 
   Real-turn hooks get the turn's frozen locus as `defaultOutgoing`. Explicit,
-  disabled and private turns have none. Private turns also omit `incoming`;
-  explicit and disabled turns get it even when no channel is open.
-  They require an explicit `channelId` for `channel_publish`, a conversation
-  fork's included, and so does a call `executeToolCall` makes as the agent
-  during one, and a script one starts, for as long as the script runs. They keep `channel_open` from moving the prose locus, skip
-  refusal reactions to the process-global last inbound channel, and record a
-  refusal with no channel.
+  disabled and private turns have none. Explicit and disabled turns get
+  `incoming` even when no channel is open; private turns omit it. Private turns
+  require an explicit `channelId` for `channel_publish`, a conversation fork's
+  included, and so does a call `executeToolCall` makes as the agent during one,
+  and a script one starts, for as long as the script runs. They keep
+  `channel_open` from moving the prose locus, skip refusal reactions to the
+  process-global last inbound channel, and record a refusal with no channel.
 
   A script's calls are judged by the turn that started it, for as long as the
   script runs. A background script's `channel_open` now records on that turn,

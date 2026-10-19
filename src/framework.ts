@@ -13854,8 +13854,8 @@ export class AgentFramework {
       // runs only for an idle agent (the busy branch above requeues first).
       // The hold's clock starts at the first such pass that holds a wake of
       // the other kind with nothing of the turn's kind to start, and a pass
-      // that finds something of its kind, or finds the turn ended, resets it;
-      // a wake's own age, which counts its wait behind a busy agent, never
+      // whose start continues the turn, or that finds the turn ended, resets
+      // it; a wake's own age, which counts its wait behind a busy agent, never
       // starts it. Time the agent spends busy after the clock starts counts,
       // since only a silent start can run beside the held turn. A turn that
       // has had nothing of its kind for OPEN_TURN_HOLD_MS has none coming: it
@@ -13885,9 +13885,11 @@ export class AgentFramework {
           );
         }
       } else if (hold && (hold.turn === continued || this.openLogical?.get(agentName) !== hold.turn)) {
-        // Something of the held turn's kind came, or the turn is no longer
+        // This pass's start continues the held turn, or the turn is no longer
         // open. A pass about another turn, such as a silent tick's budget
-        // restart, leaves its clock as it is.
+        // restart, leaves its clock as it is, a wake of the held turn's kind
+        // batched into that restart included, since the restart takes it into
+        // the tick's turn.
         this.openTurnHolds?.delete(agentName);
       }
       if (requests.length === 0) continue;

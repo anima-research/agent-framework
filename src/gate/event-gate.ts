@@ -113,9 +113,10 @@ interface PendingEvent {
  * "who woke the agent" from it). Ids only, never content or display names.
  */
 export interface WakeProvenance {
-  /** Composite channel id of the chosen event — telemetry only, never a
-   *  speech locus. Omitted for `mcpl:push-event` events, whose channel ids
-   *  are raw server ids (unroutable and a second spelling of the same
+  /** Composite channel id of the chosen event, telemetry only, except for a
+   *  channel-bound surface message's wake (`routingClass` 'channel'), whose
+   *  turn answers in it. Omitted for `mcpl:push-event` events, whose channel
+   *  ids are raw server ids (unroutable and a second spelling of the same
    *  channel); the framework derives the composite id on the direct path. */
   channelId?: string;
   /** Server-namespaced author id: `<serverId>:user:<id>` (falls back to the
@@ -1621,8 +1622,9 @@ export class EventGate {
     });
 
     // Provenance of the batched wake (who/where woke the agent): the newest
-    // ADDRESSED event first, else the newest event naming a channel or an
-    // author; channel + author + addressed from that ONE event. When that
+    // ADDRESSED event first, else the newest channel-bound surface message,
+    // else the newest event naming a channel or an author; channel + author +
+    // addressed from that ONE event (wakeProvenance). When that
     // event addressed the agent and its registered channel is known,
     // `routeChannelId` names the turn's speech locus too — the reply goes
     // back to whoever addressed the agent, not to whichever channel last saw
@@ -1637,11 +1639,13 @@ export class EventGate {
     // channel side would never be answered. So each part gets a wake of its
     // own, from its own events, the part whose first event arrived first
     // going first. Where the other part has a channel to answer in (an
-    // addressed event, or a channel-bound surface message), the scheduler
-    // runs the two in separate turns. An ambient channel event names its
-    // channel only as where it woke the agent, so its wake shares the
-    // private turn, and nothing answers it in its channel: the window's
-    // content above stays one message, the operator's words included.
+    // addressed event whose registered channel the host resolved, or a
+    // channel-bound surface message), the scheduler runs the two in separate
+    // turns. An ambient channel event names its channel only as where it
+    // woke the agent, and an addressed one whose channel the host couldn't
+    // resolve names none, so such a part's wake shares the private turn, and
+    // nothing answers it in its channel: the window's content above stays
+    // one message, the operator's words included.
     // A shared buffer holds each policy's events in the order its debounce
     // fired, so arrival is read from the events' own times, and within one
     // millisecond from their order in the window.

@@ -1728,8 +1728,8 @@ export class ChannelRegistry {
    * Returns undefined when it would hold nothing: no channel open, no
    * outgoing locus and no incoming message, as for a private turn with no
    * channel open. A turn with no locus, as in explicit and disabled modes,
-   * still gets the message it replies to (incoming), whether or not a
-   * channel is open.
+   * still gets `incoming`, the most recent inbound message (below), whether
+   * or not a channel is open.
    */
   buildChannelContext(
     agentName?: string,
@@ -1768,8 +1768,8 @@ export class ChannelRegistry {
       ? { channelId: fallback, messageId: this.defaultPublishMessageId, threadId: this.defaultPublishThreadId }
       : undefined;
 
-    // A real turn with no locus (explicit or disabled mode) still has the
-    // message it replies to.
+    // A real turn with no locus (explicit or disabled mode) still gets the
+    // most recent inbound message.
     if (openChannels.length === 0 && !outgoing && !incoming) {
       return undefined;
     }
