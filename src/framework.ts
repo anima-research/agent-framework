@@ -1,6 +1,6 @@
 import { ToolPresentation, presentationTools, isPresentationTool, renderCatalogue, type PresentationSnapshot } from "./tool-presentation.js";
 import { dirname, join } from 'node:path';
-import { EXPIRY_REASON, REFERENCE_LIMITS, claimedExpiry, classifyBlock, contentClaims, isReferenceExpired, referenceBlockForScript, referenceRegistry, sanitizeLabel, type ServerAddress } from './mcpl/references.js';
+import { EXPIRY_REASON, REFERENCE_LIMITS, claimedExpiry, classifyBlock, contentClaims, isReferenceExpired, referenceBlockForScript, referenceRegistry, sanitizeLabel, type ResultClaims, type ServerAddress } from './mcpl/references.js';
 import { ReferenceFetcher, DEFAULT_FETCH_MAX_BYTES, EAGER_FETCH_TIMEOUT_MS } from './mcpl/reference-fetcher.js';
 import {
   appendFileSync, closeSync, existsSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, unlinkSync,
@@ -19217,13 +19217,15 @@ export class AgentFramework {
     // which isn't fetched. A link (MCP's resource_link) isn't fetched either:
     // a tool's links are what it offers to follow, and the script can fetch
     // the ones it wants with fetch_reference.
+    // The result's claims, read as showing it reads them (resultClaimsOf),
+    // once: the fetches below and the text the script gets read the same.
+    let claims: ResultClaims | undefined;
     if (Array.isArray(result.data) && this.resolveMcplTool(toolName) === null) {
       const fetcher = this.getReferenceFetcher();
-      // The result's claims, read as showing it reads them (resultClaimsOf):
-      // a uri any of its references gives an expiry that counts isn't
-      // fetched, as autoFetchReferences passes over one that any block of an
-      // MCPL result marks expired.
-      const claims = resultClaimsOf(result.data, result.dataIsContent);
+      // A uri any of the result's references gives an expiry that counts
+      // isn't fetched, as autoFetchReferences passes over one that any block
+      // of an MCPL result marks expired.
+      claims = resultClaimsOf(result.data, result.dataIsContent);
       for (const block of result.data) {
         const c = classifyBlock(block);
         if (c.kind !== 'reference' || c.testimony.fromLink) continue;
@@ -19248,7 +19250,7 @@ export class AgentFramework {
     if (structured) return this.scriptStructuredResult(result, toolName);
     try {
       return {
-        text: toolResultDataToHistoryString(result.data, AgentFramework.SCRIPT_RESULT_MAX_CHARS, { dataIsContent: Boolean(result.dataIsContent) }),
+        text: toolResultDataToHistoryString(result.data, AgentFramework.SCRIPT_RESULT_MAX_CHARS, { dataIsContent: Boolean(result.dataIsContent), claims }),
         isError: false,
       };
     } catch (err) {

@@ -331,12 +331,12 @@ function isPlainRecord(value: unknown): value is Record<string, unknown> {
  * shown as the reference lanes show it: a reference as its stub, an invalid
  * one (such as a uri that isn't a string, or MCP's embedded resource, whose
  * uri isn't at its top level) as the marker saying why it isn't shown, and
- * inline data that also claims a uri or a disposition as withheld. So the
- * only reference's uri shown is a link's, in its line, where the host can't
- * fetch the link and its uri can't carry a credential (shownLinkUri). Inline
- * data that claims neither is itself, as is any other value: a block of
- * another type keeps its fields, a url among them, since RFC-005 governs
- * references.
+ * inline data that also claims a uri or a disposition as withheld. So of
+ * the uris RFC-005 governs, the only one shown is a link's, in its line,
+ * where the host can't fetch the link and its uri can't carry a credential
+ * (shownLinkUri). Inline data that claims neither is itself, as is any other
+ * value: a block of another type keeps its fields, a url among them, since
+ * RFC-005 governs references.
  */
 function shownInHistory(value: unknown, claims?: ResultClaims): unknown {
   return walkedInHistory(value, (b) => referenceStubOrNull(b, 'from tool result', undefined, { unfetchedLinkUri: true, claims }));
@@ -369,10 +369,10 @@ function walkedInHistory(value: unknown, asText: (b: Record<string, unknown>) =>
  * through toJSON, the fields of inline data and every depth it shows: so
  * every reference whose stub the result shows counts, and nothing it doesn't
  * show does. A value serialization can't write, such as a cycle, stops the
- * walk where it would stop the result. It's a walk of its own before the one
- * that shows the data, so a value's toJSON and getters run in both: one that
- * answers differently the second time can claim what the shown text
- * doesn't show.
+ * walk where it would stop the result's serialization. It's a walk of its
+ * own before the one that shows the data, so a value's toJSON and getters
+ * run in both: one that answers differently the second time can claim what
+ * the shown text doesn't show.
  */
 function claimsInHistory(data: unknown): ResultClaims {
   const testimonies: ReferenceTestimony[] = [];
@@ -396,7 +396,10 @@ function claimsInHistory(data: unknown): ResultClaims {
     }
   } catch {
     // Showing the result meets the same failure at the same place, for a
-    // value that answers the same each time it's read.
+    // value that answers the same each time it's read. A withheld result
+    // shows only the fields it keeps, but the guard serialized the whole
+    // result for its audit before that (ToolResultGuard.archive), so such a
+    // value stopped it there.
   }
   return resultClaims(testimonies);
 }

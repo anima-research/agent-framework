@@ -74,13 +74,13 @@ const PLAIN_URI = 'https://zz-files.example/report.csv';
 const PLAIN_LINK = { ...LINK, uri: PLAIN_URI };
 /** What PLAIN_LINK shows in a tool result where the host can't fetch it, as where no server delivered it. */
 const PLAIN_LINK_TEXT = `[resource link "report.csv": ${PLAIN_URI}, text/csv; not fetched]`;
-/** Record a server dialed on the links' origin, as the framework records a server it configures. Each
- *  test that needs it asks, so the file loads against a registry that keeps no addresses. */
 /** A content array's claims, by the module's own contentClaims, read off the
  *  module's namespace so the file still loads against main's src, which
  *  lacks it, for red-first. */
 const contentClaimsOf = (blocks: unknown[]) =>
   (referencesModule as unknown as { contentClaims(blocks: unknown[]): referencesModule.ResultClaims }).contentClaims(blocks);
+/** Record a server dialed on the links' origin, as the framework records a server it configures. Each
+ *  test that needs it asks, so the file loads against a registry that keeps no addresses. */
 const servingFiles = () => referenceRegistry.setServerAddress('zz-files', { url: 'wss://zz-files.example' }, TEST_HOST);
 /** The framework these tests record servers' addresses for, as one does. */
 const TEST_HOST = {};
@@ -979,15 +979,24 @@ describe('one answer for every block of a result', () => {
     assert.ok(deep.then.ref.endsWith('— the reference is expired'), deep.then.ref);
   });
 
-  it("words competing expiries in a result by one fixed order, whatever the order of its blocks", () => {
+  it("words competing expiries in a result by EXPIRY_REASON's order, whatever the order of its blocks", () => {
     servingFiles();
-    const uri = 'https://zz-files.example/competing.csv';
-    const passed = { type: 'resource', uri, name: 'competing.csv', expiresAt: '2001-01-01T00:00:00Z' };
-    const unreadable = { type: 'resource', uri, name: 'competing.csv', expiresAt: 'zz-not-a-time' };
-    referenceRegistry.register(testimonyOf(passed), 'zz-files');
-    for (const order of [[passed, unreadable], [unreadable, passed]]) {
-      const lines = toolResultDataToHistoryString(order).split('\n');
-      assert.ok(lines.every((line) => line.endsWith(`— the reference is ${EXPIRY_REASON.passed}`)), lines.join('\n'));
+    const permutations = <T,>(items: T[]): T[][] => items.length <= 1 ? [items]
+      : items.flatMap((item, i) => permutations([...items.slice(0, i), ...items.slice(i + 1)]).map((rest) => [item, ...rest]));
+    const cases: Array<[string, Array<keyof typeof EXPIRY_REASON>]> = [
+      ['competing-all.csv', ['passed', 'unparseable', 'rejected']],
+      ['competing-unread.csv', ['unparseable', 'rejected']],
+    ];
+    for (const [name, kinds] of cases) {
+      const uri = `https://zz-files.example/${name}`;
+      const expiresAt = { passed: '2001-01-01T00:00:00Z', unparseable: 'zz-not-a-time', rejected: 'x'.repeat(REFERENCE_LIMITS.expiresAt + 1) };
+      const blocks = kinds.map((kind) => ({ type: 'resource', uri, name, expiresAt: expiresAt[kind] }));
+      referenceRegistry.register(testimonyOf(blocks[0]), 'zz-files');
+      // The first of EXPIRY_REASON's cases the blocks give.
+      for (const order of permutations(blocks)) {
+        const lines = toolResultDataToHistoryString(order).split('\n');
+        assert.ok(lines.every((line) => line.endsWith(`— the reference is ${EXPIRY_REASON[kinds[0]!]}`)), lines.join('\n'));
+      }
     }
   });
 
@@ -1004,6 +1013,27 @@ describe('one answer for every block of a result', () => {
     // This result's fresh reference decides: the link is a stub that fetches.
     assert.match(before!, /^\[ref_[^\]]+\] earlier\.csv — from tool result — fetch with fetch_reference$/);
     assert.equal(after, before);
+  });
+
+  it("lets a later result's plain reference to a uri lift an earlier result's never, whatever the order of its link and reference", () => {
+    const orders: Array<[string, (link: unknown, plain: unknown) => unknown[]]> = [
+      ['link-first', (link, plain) => [link, plain]],
+      ['reference-first', (link, plain) => [plain, link]],
+    ];
+    for (const [order, blocks] of orders) {
+      const uri = `https://zz-elsewhere.example/lifted-${order}.csv`;
+      // An earlier result marks the uri never.
+      toolResultDataToHistoryString([{ type: 'resource', uri, name: 'lifted.csv', disposition: 'never' }]);
+      // The later result's reference is its server's latest word on the
+      // uri, so the link shows it, as if no never had been given.
+      const lines = toolResultDataToHistoryString(blocks(
+        { type: 'resource_link', uri, name: 'lifted.csv' }, { type: 'resource', uri, name: 'lifted.csv' })).split('\n');
+      assert.ok(lines.includes(`[resource link "lifted.csv": ${uri}; not fetched]`), `${order}: ${lines.join('\n')}`);
+    }
+    // A result naming the uri only in a link leaves the earlier never in force.
+    const uri = 'https://zz-elsewhere.example/lifted-link-only.csv';
+    toolResultDataToHistoryString([{ type: 'resource', uri, name: 'kept.csv', disposition: 'never' }]);
+    assert.match(toolResultDataToHistoryString([{ type: 'resource_link', uri, name: 'kept.csv' }]), /^\[ref_[^\]]+\] kept\.csv — from tool result — /);
   });
 
   it("finds a never inside inline data's other fields, which showing it descends into, before any block is shown", () => {
@@ -1083,60 +1113,70 @@ describe('one answer for every block of a result', () => {
     }
   });
 
-  it("isn't fetched for a script on demand where a reference at depth in the module's data gives its uri an expiry, as the text reads it", async () => {
+  /** A module's result for a script, its data `data`: what the demand fetch
+   *  tried, what it logged, and what the script got. */
+  const demandFetch = async (data: unknown[], dataIsContent?: boolean) => {
     const fw = Object.create(AgentFramework.prototype) as {
       dispatchScriptToolCall: (...args: unknown[]) => Promise<ToolResult>;
       getReferenceFetcher(): unknown;
       handleScriptToolCall(agentName: string, toolName: string, args: Record<string, unknown>): Promise<ScriptToolResult>;
     };
-    const uri = 'https://zz-files.example/demand-deep-expired.pdf';
-    // Data, not content: its second element isn't a block, so its text reads
-    // the result's claims at depth, where the expiry is.
-    const data = [
-      { type: 'resource', uri, name: 'deep.pdf', expiresAt: '2099-01-01T00:00:00Z' },
-      { nested: { type: 'resource', uri, name: 'deep.pdf', expiresAt: '2001-01-01T00:00:00Z' } },
-    ];
-    fw.dispatchScriptToolCall = async () => ({ success: true, data });
-    const fetched: string[] = [];
-    fw.getReferenceFetcher = () => ({ fetch: async (record: { testimony: { uri: string } }) => { fetched.push(record.testimony.uri); return { ok: false, error: 'zz-refused' }; } });
-    const error = console.error;
-    console.error = () => {};
-    let result: ScriptToolResult;
-    try {
-      result = await fw.handleScriptToolCall('zz-agent', 'zz_tool', {});
-    } finally {
-      console.error = error;
-    }
-    assert.equal(result.isError, false);
-    assert.deepEqual(fetched, []);
-    assert.ok(result.text.includes('— the reference is expired'), result.text);
-  });
-
-  it("isn't fetched for a script on demand where any reference in the module's array gives its uri an expiry that counts", async () => {
-    const fw = Object.create(AgentFramework.prototype) as {
-      dispatchScriptToolCall: (...args: unknown[]) => Promise<ToolResult>;
-      getReferenceFetcher(): unknown;
-      handleScriptToolCall(agentName: string, toolName: string, args: Record<string, unknown>): Promise<ScriptToolResult>;
-    };
-    const uri = 'https://zz-files.example/demand-expired.pdf';
-    const fresh = { type: 'resource', uri, name: 'demand.pdf', expiresAt: '2099-01-01T00:00:00Z' };
-    const expired = { type: 'resource', uri, name: 'demand.pdf', expiresAt: '2001-01-01T00:00:00Z' };
-    fw.dispatchScriptToolCall = async () => ({ success: true, data: [fresh, expired], dataIsContent: true });
+    fw.dispatchScriptToolCall = async () => ({ success: true, data, ...(dataIsContent ? { dataIsContent } : {}) });
     const fetched: string[] = [];
     fw.getReferenceFetcher = () => ({ fetch: async (record: { testimony: { uri: string } }) => { fetched.push(record.testimony.uri); return { ok: false, error: 'zz-refused' }; } });
     const logged: string[] = [];
     const error = console.error;
     console.error = (line: string) => { logged.push(line); };
-    let result: ScriptToolResult;
     try {
-      result = await fw.handleScriptToolCall('zz-agent', 'zz_tool', {});
+      const result = await fw.handleScriptToolCall('zz-agent', 'zz_tool', {});
+      return { fetched, logged, result };
     } finally {
       console.error = error;
     }
+  };
+  const NOT_MADE_EXPIRED = /script-demand fetch of ref_\S+ not made: by the result's claims, the reference is expired/;
+
+  it("isn't fetched for a script on demand where a reference at depth in the module's data gives its uri an expiry, reading the claims as the text does", async () => {
+    // Data, not content: its second element isn't a block, so its text reads
+    // the result's claims at depth.
+    const at = (uri: string, nestedExpiry: string) => [
+      { type: 'resource', uri, name: 'deep.pdf', expiresAt: '2099-01-01T00:00:00Z' },
+      { nested: { type: 'resource', uri, name: 'deep.pdf', expiresAt: nestedExpiry } },
+    ];
+    // Where the nested reference is fresh too, the top one is fetched.
+    const control = 'https://zz-files.example/demand-deep-fresh.pdf';
+    const fresh = await demandFetch(at(control, '2099-06-01T00:00:00Z'));
+    assert.equal(fresh.result.isError, false);
+    assert.deepEqual(fresh.fetched, [control]);
+    // Where it has expired, it isn't, for the expiry only a reading at depth sees.
+    const uri = 'https://zz-files.example/demand-deep-expired.pdf';
+    const expired = await demandFetch(at(uri, '2001-01-01T00:00:00Z'));
+    assert.equal(expired.result.isError, false);
+    assert.deepEqual(expired.fetched, []);
+    assert.ok(expired.logged.some((line) => NOT_MADE_EXPIRED.test(line)), expired.logged.join('\n'));
+  });
+
+  it("is fetched for a script on demand where only a content array's unshown block names its uri expired, as the text reads it", async () => {
+    // Content from an MCPL call a module forwards: its elements are blocks,
+    // and one the lane doesn't know is a marker, its fields unshown.
+    const uri = 'https://zz-files.example/demand-content-flag.pdf';
+    const { fetched, result } = await demandFetch([
+      { type: 'resource', uri, name: 'flag.pdf', expiresAt: '2099-01-01T00:00:00Z' },
+      { type: 'zz-unknown', inner: { type: 'resource', uri, name: 'flag.pdf', expiresAt: '2001-01-01T00:00:00Z' } },
+    ], true);
+    assert.equal(result.isError, false);
+    assert.deepEqual(fetched, [uri]);
+  });
+
+  it("isn't fetched for a script on demand where any reference in the module's array gives its uri an expiry that counts", async () => {
+    const uri = 'https://zz-files.example/demand-expired.pdf';
+    const fresh = { type: 'resource', uri, name: 'demand.pdf', expiresAt: '2099-01-01T00:00:00Z' };
+    const expired = { type: 'resource', uri, name: 'demand.pdf', expiresAt: '2001-01-01T00:00:00Z' };
+    const { fetched, logged, result } = await demandFetch([fresh, expired], true);
     assert.equal(result.isError, false);
     assert.deepEqual(fetched, []);
     // The fetch not made is logged, as a refused one is.
-    assert.ok(logged.some((line) => /script-demand fetch of ref_\S+ not made: by the result's claims, the reference is expired/.test(line)), logged.join('\n'));
+    assert.ok(logged.some((line) => NOT_MADE_EXPIRED.test(line)), logged.join('\n'));
   });
 
   it('shows a link with no usable uri at any depth as its marker, never its fields', () => {

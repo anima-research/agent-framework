@@ -472,7 +472,10 @@ export function dialServer(
  * fetcher's pre-dial check of its own framework's configs, whose credential
  * goes with the address it checks. In a process with one running framework,
  * or with running frameworks that agree on each id they share, the two
- * sources hold the same addresses, so a stub promises what the fetch does. A
+ * sources hold the same addresses, so a stub promises the server the fetch
+ * dials. A stub reads an expiry with its result's claims, and the fetch with
+ * the record's latest testimony, so where one result names a uri both
+ * expired and fresh, its stub says expired while a fetch can succeed. A
  * stopped framework's addresses are out of the registry, so its stubs read
  * another running framework's entry for the same id where there is one, and
  * otherwise say the server is unknown, while its configs still resolve it.
@@ -486,8 +489,9 @@ export function dialCheck(
   addressOf: (serverId: string) => ServerAddress | undefined,
   nowMs = Date.now(),
   /** For a stub or a script's object, the claims of the result it's shown
-   *  in, read with the record's own (claimedExpiry). A fetch reads the
-   *  record alone. */
+   *  in, which decide where its references name the record's uri, the
+   *  record's own testimony deciding otherwise (claimedExpiry). A fetch
+   *  reads the record alone. */
   claims?: ResultClaims,
 ): { serverId: string } | { refusal: Refusal } {
   const server = dialServer(record, addressOf);
@@ -695,8 +699,9 @@ export interface StubOptions {
    * other lane showed a link's uri, so none shows one now.
    */
   unfetchedLinkUri?: boolean;
-  /** The claims of the result this block is shown in (resultClaims), read
-   *  with the record's own for what the stub says. */
+  /** The claims of the result this block is shown in (resultClaims), which
+   *  decide what the stub says where its references name the record's uri,
+   *  the record's own testimony deciding otherwise. */
   claims?: ResultClaims;
 }
 
@@ -707,9 +712,14 @@ export interface StubOptions {
  * an expiry that counts is expired (claimedExpiry), whatever the order of the
  * blocks and whatever the registry evicted while it was read (Ada-1017's
  * call). A decision about a record reads its result's claims where the
- * result's references say anything of its uri, and otherwise the record's
- * own testimony, the latest the registry holds from an earlier result. A
- * link claims no disposition or expiry, so it adds nothing here.
+ * result's references name its uri, a plain one included, and otherwise the
+ * record's own testimony, from an earlier result. A reference naming the uri
+ * is that result's word on it, the latest, as the registry keeps it
+ * (register() replaces a record's testimony with it until the record is
+ * fetched), so an earlier result's `never` or expiry gives way to it
+ * (Ada-1017's call). A link claims no disposition or expiry, so it adds
+ * nothing here, and a result that names a uri only in links leaves its
+ * record's testimony in force.
  */
 export type ResultClaims = ReadonlyMap<string, UriClaims>;
 
@@ -758,14 +768,15 @@ export function contentClaims(blocks: readonly unknown[]): ResultClaims {
 }
 
 /** The claims a decision about a record reads: its result's for its uri,
- *  where the result's references say anything of it, and otherwise the
- *  record's own testimony. */
+ *  where the result's references name it, and otherwise the record's own
+ *  testimony. */
 function uriClaims(record: ReferenceRecord, claims?: ResultClaims): UriClaims | undefined {
   return claims?.get(record.testimony.uri) ?? resultClaims([record.testimony]).get(record.testimony.uri);
 }
 
 /** Whether a record's uri is withheld: marked `disposition: never` by its
- *  result's references, or by its own testimony where they say nothing. */
+ *  result's references, or by its own testimony where none of them names
+ *  it. */
 export function claimedNever(record: ReferenceRecord, claims?: ResultClaims): boolean {
   return uriClaims(record, claims)?.never === true;
 }
@@ -776,10 +787,12 @@ export function claimedNever(record: ReferenceRecord, claims?: ResultClaims): bo
 export function claimedExpiry(record: ReferenceRecord, claims: ResultClaims | undefined, nowMs: number): keyof typeof EXPIRY_REASON | null {
   const c = uriClaims(record, claims);
   if (!c) return null;
-  if (c.earliestMs !== null && c.earliestMs <= nowMs) return 'passed';
-  if (c.unparseable) return 'unparseable';
-  if (c.rejected) return 'rejected';
-  return null;
+  const given: Record<keyof typeof EXPIRY_REASON, boolean> = {
+    passed: c.earliestMs !== null && c.earliestMs <= nowMs,
+    unparseable: c.unparseable,
+    rejected: c.rejected,
+  };
+  return (Object.keys(EXPIRY_REASON) as Array<keyof typeof EXPIRY_REASON>).find((reason) => given[reason]) ?? null;
 }
 
 /**
@@ -794,8 +807,9 @@ export function claimedExpiry(record: ReferenceRecord, claims: ResultClaims | un
  * The credential check reads the uri as it would be shown, with what
  * sanitizeLabel strips gone, so a uri split by a control character is read
  * as it would read: `ht\u0000tps://user:pass@…` parses as a path, and shows
- * as userinfo. A reference's disposition:"never" for the uri, the record's
- * or any in the same result (claims), keeps it out whatever the link says.
+ * as userinfo. A `disposition: "never"` for the uri keeps it out whatever
+ * the link says: any reference's in the same result (claims), or, where no
+ * reference in the result names the uri, the record's.
  */
 export function shownLinkUri(t: ReferenceTestimony, record: ReferenceRecord, nowMs = Date.now(), claims?: ResultClaims): string | null {
   if (!t.fromLink || claimedNever(record, claims)) return null;
@@ -904,7 +918,8 @@ export function referenceStubOrNull(block: unknown, provenance?: string, serverI
  * `refId` would be refused, as the result's references claim it, so a link
  * whose line shows its uri, which the host can't fetch, carries them too: its
  * line has no id to fetch with. The fetch itself reads the record, which
- * keeps the latest testimony registered (Ada-1017's call). `claims` are
+ * keeps the latest testimony registered until it's fetched, and then the one
+ * its saved copy was verified against (Ada-1017's call). `claims` are
  * those of the content array the block came in (contentClaims), so its
  * other references count as they do for the model's line (ResultClaims).
  * The reference is registered bound to `serverId`, the server whose tool
@@ -932,7 +947,7 @@ export function referenceBlockForScript(block: unknown, serverId: string, claims
       // the words a stub gives, whether or not the model's line for it is a
       // stub: the line has no id to fetch with, and the object does. As the
       // stub judges it, a saved copy is still served, and the result's own
-      // claims count with the record's.
+      // claims decide where its references name the uri (uriClaims).
       const expiry = record.fetchedPath ? null : claimedExpiry(record, claims, nowMs);
       const unfetchable = unfetchableReason(record, nowMs, claims);
       return {
