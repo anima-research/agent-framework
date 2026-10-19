@@ -209,6 +209,10 @@ export {
   type SubconsciousConfig,
   type PersistentReaderConfig,
   type ForkReaderConfig,
+  type ReaderConsent,
+  type ReaderConsentSection,
+  readerConsentSection,
+  readerConsentDrift,
   type ReaderFramingContext,
 } from './tune-out/tools.js';
 export {

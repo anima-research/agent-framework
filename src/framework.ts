@@ -20,6 +20,8 @@ import {
   type SubconsciousConfig,
   type PersistentReaderConfig,
   type ForkReaderConfig,
+  readerConsentDrift,
+  type ReaderConsent,
 } from './tune-out/tools.js';
 import { TuneOutCoordinator, TUNE_OUT_DEFAULTS, type ReaderInvocation } from './tune-out/coordinator.js';
 import { admit, type InboundEnvelope, type AdmissionDecision } from './admission/admit.js';
@@ -3572,6 +3574,7 @@ export class AgentFramework {
             framework.eventGate?.isPrivilegedUser(authorId) ?? false,
           allowChannelSpeech: () => framework.subconsciousConfig?.allowChannelSpeech === true,
           holdWithoutReader: () => framework.tuneOutOffered,
+          readerWithdrawn: () => framework.readerConsentWithdrawn() !== null,
           ...(framework.tuneOutAnnounce
             ? {
                 announce: async (_serverId: string, channelId: string, text: string) => {
@@ -5586,6 +5589,8 @@ export class AgentFramework {
     }
     if (this.tuneOutCoordinator && this.tuneOutOffered) {
       channelTools.push(AgentFramework.TUNE_OUT_TOOL, AgentFramework.FOCUS_TOOL);
+      // A resident whose reader is forks of itself can take its yes back.
+      if (this.readerForks) channelTools.push(AgentFramework.WITHDRAW_CONSENT_TOOL);
     }
     const gateTools = this.eventGate
       ? [
@@ -9007,6 +9012,7 @@ export class AgentFramework {
         : {}),
       ...(record.relationships.resultTo ? { resultTo: record.relationships.resultTo } : {}),
       ...(record.inherit ? { inherit: record.inherit } : {}),
+      ...(AgentFramework.readerConsentOf(record) ? { consent: AgentFramework.readerConsentOf(record)! } : {}),
     });
     const from = record.inherit?.from;
     if (!from || from === record.name) return;
@@ -9056,6 +9062,12 @@ export class AgentFramework {
     return `[Agent lifecycle: ${record.name} ${made} ${this.derivationDescription(record, from)}.]`;
   }
 
+  /** The consent record a reader fork was derived under, from its registry metadata. */
+  private static readerConsentOf(record: AgentRecord): ReaderConsent | undefined {
+    const c = record.metadata?.consent as ReaderConsent | undefined;
+    return c && typeof c === 'object' && typeof c.at === 'string' ? c : undefined;
+  }
+
   /** What a derived agent is, to the agent it was derived from: "a task-fork on your weights, …; …; …". */
   private derivationDescription(record: AgentRecord, from: string): string {
     const sourceModel = this.agentConfigs.get(from)?.model ?? this.registry.get(from)?.model;
@@ -9064,6 +9076,10 @@ export class AgentFramework {
       : record.model === sourceModel
         ? ` on your weights (${record.model})`
         : ` on ${record.model}`;
+    // A reader fork names the yes it runs under: when it was given and where
+    // to read it (connectome-host#334).
+    const consent = AgentFramework.readerConsentOf(record);
+    const underYes = consent ? `, under the yes you gave on ${consent.at} (${consent.where})` : '';
     const inherited = record.inherit?.mode === 'shared'
       ? 'reading your context up to this point'
       : 'with a copy of your context';
@@ -9091,7 +9107,7 @@ export class AgentFramework {
     const parentEnd = record.relationships.spawnedBy === from
       ? record.onParentEnd === 'end' ? ', and ends with you' : ', and is orphaned if you end'
       : '';
-    return `a ${record.kind}${weights}, ${inherited}; ${result}; ${ends}${parentEnd}`;
+    return `a ${record.kind}${weights}${underYes}, ${inherited}; ${result}; ${ends}${parentEnd}`;
   }
 
   /**
@@ -9673,6 +9689,30 @@ export class AgentFramework {
             'Optional bounded duration: the tune-out auto-cancels (backlog ' +
             'delivered) after this many seconds; floors at 60. Unset = until cancelled.',
         },
+      },
+      required: [],
+    },
+  };
+
+  /**
+   * `withdraw_consent`: the resident takes back the yes its reader forks run
+   * under. Offered only with `subconscious.reader: 'forks'`. A yes counts
+   * only as public speech; a no counts however it reaches the host, and
+   * this tool is the route the host watches (connectome-host#334).
+   */
+  private static readonly WITHDRAW_CONSENT_TOOL: import('./types/index.js').ToolDefinition = {
+    name: 'withdraw_consent',
+    description:
+      'Withdraw your yes to reader forks: from now, no fork of you is derived ' +
+      'to read tuned-out channels. A tune-out becomes a silent hold (traffic ' +
+      'held, released when you cancel or the duration ends), and tune_out ' +
+      'says so. Takes effect at the next derivation; forks already running ' +
+      'finish their look. It stands until a new yes from you is recorded in ' +
+      'your configuration. No argument is needed; a reason is kept with the record.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        reason: { type: 'string', description: 'Optional: why, in your words. Kept with the record.' },
       },
       required: [],
     },
@@ -12568,6 +12608,27 @@ export class AgentFramework {
     if (typeof cfg.voice !== 'string' || cfg.voice.length === 0) {
       throw new Error('subconscious.reader "forks": `voice` (the reader\'s framing block) is required');
     }
+    // A yes is to the configuration the resident saw. A section that has
+    // changed since is a different thing to agree to, so it is refused
+    // until asked again (connectome-host#334: the whole section, not a field).
+    if (cfg.consent) {
+      const c = cfg.consent;
+      for (const field of ['by', 'at', 'where'] as const) {
+        if (typeof c[field] !== 'string' || c[field].trim().length === 0) {
+          throw new Error(`subconscious.consent.${field} must be a non-empty string: who said yes, when (ISO 8601), and where the public yes can be read`);
+        }
+      }
+      if (Number.isNaN(Date.parse(c.at))) throw new Error(`subconscious.consent.at must be an ISO 8601 time, got ${JSON.stringify(c.at)}`);
+      if (!c.section || typeof c.section !== 'object') throw new Error('subconscious.consent.section must be the fork section the yes covered (model, voice, allowChannelSpeech, forkIdleTimeoutMs)');
+      const drift = readerConsentDrift(c, cfg);
+      if (drift) {
+        throw new Error(
+          `subconscious.reader "forks": the consent record covers a different fork section — \`${drift.field}\` was ` +
+            `${JSON.stringify(drift.agreed)} when ${c.by} said yes on ${c.at}, and is ${JSON.stringify(drift.live)} now. ` +
+            'Ask again, and record the new yes with the section as they saw it.',
+        );
+      }
+    }
     this.readerForks = true;
     this.subconsciousConfig = cfg;
   }
@@ -12582,6 +12643,15 @@ export class AgentFramework {
     const primary = this.primaryAgentName;
     const cfg = this.subconsciousConfig;
     if (!primary || cfg?.reader !== 'forks' || !this.agents.has(primary)) return;
+    // The resident's no outranks the configuration's yes: nothing is derived.
+    if (this.readerConsentWithdrawn()) {
+      this.emitTrace({
+        type: 'tune-out:reader-withheld', agentName: primary,
+        serverId: invocation.serverId, channelId: invocation.channelId, epochId: invocation.epochId,
+        trigger: invocation.trigger, held: invocation.backlog.length,
+      });
+      return;
+    }
     const name = `reader/${primary}/${invocation.epochId.slice(0, 8)}/${++this.readerForkCounter}`;
 
     const content = (cfg.framing ?? defaultReaderFraming)({
@@ -12621,7 +12691,13 @@ export class AgentFramework {
               heldMessageIds: invocation.backlog.map((m) => m.id),
             } as MessageMetadata,
           }],
-          metadata: { epochId: invocation.epochId, channelId: invocation.channelId, trigger: invocation.trigger },
+          metadata: {
+            epochId: invocation.epochId,
+            channelId: invocation.channelId,
+            trigger: invocation.trigger,
+            // The yes the fork runs under travels with its record and trace.
+            ...(cfg.consent ? { consent: cfg.consent } : {}),
+          },
         });
         this.emitTrace({
           type: 'tune-out:reader-fork',
@@ -22392,7 +22468,7 @@ export class AgentFramework {
     }
 
     // Route the tune-out tool (residents) and the subconscious's surface
-    if ((enrichedCall.name === 'tune_out' || enrichedCall.name === 'focus') && this.tuneOutCoordinator) {
+    if ((enrichedCall.name === 'tune_out' || enrichedCall.name === 'focus' || enrichedCall.name === 'withdraw_consent') && this.tuneOutCoordinator) {
       this.dispatchTuneOutToolCall(agentName, enrichedCall);
       return;
     }
@@ -27965,7 +28041,11 @@ export class AgentFramework {
       toolName: call.name,
       agentName,
       moduleName: 'tune-out',
-      result: call.name === 'focus' ? this.handleFocusTool(agentName, input) : this.handleTuneOutTool(agentName, input),
+      result: call.name === 'focus'
+        ? this.handleFocusTool(agentName, input)
+        : call.name === 'withdraw_consent'
+          ? this.handleWithdrawConsentTool(agentName, input)
+          : this.handleTuneOutTool(agentName, input),
     });
   }
 
@@ -27988,6 +28068,79 @@ export class AgentFramework {
    * The tune_out tool's body. Channel resolution is server-qualified: an id
    * that exists on several servers needs `serverId` (#232 gap 8).
    */
+  /** Where a withdrawal is kept: beside the all-except scope, per resident. */
+  private readerConsentStateId(): string {
+    return `tune-out/${this.primaryAgentName ?? 'default'}/reader-consent`;
+  }
+
+  private readerConsentCache: { at: string; by: string; reason?: string; consentAt?: string } | null | undefined;
+
+  /**
+   * The resident's standing withdrawal of its yes to reader forks, or null.
+   * A withdrawal names the yes it withdrew (`consentAt`); a configuration
+   * that records a new yes (a different `consent.at`) renews the forks, and
+   * the withdrawal is cleared the first time it is read against it.
+   */
+  readerConsentWithdrawn(): { at: string; by: string; reason?: string; consentAt?: string } | null {
+    if (!this.readerForks || !this.channelRegistry) return null;
+    if (this.readerConsentCache === undefined) {
+      try {
+        const raw = this.channelRegistry.readCoordinatorState(this.readerConsentStateId()) as { withdrawn?: { at: string; by: string; reason?: string; consentAt?: string } } | null;
+        this.readerConsentCache = raw?.withdrawn && typeof raw.withdrawn.at === 'string' ? raw.withdrawn : null;
+      } catch {
+        this.readerConsentCache = null;
+      }
+    }
+    const w = this.readerConsentCache;
+    if (!w) return null;
+    const cfg = this.subconsciousConfig;
+    const consentAt = cfg?.reader === 'forks' ? cfg.consent?.at : undefined;
+    if (consentAt && consentAt !== w.consentAt && Date.parse(consentAt) > Date.parse(w.at)) {
+      // A yes given after the no: the resident agreed again, to this section.
+      this.readerConsentCache = null;
+      this.channelRegistry.writeCoordinatorState(this.readerConsentStateId(), null);
+      this.emitTrace({ type: 'tune-out:reader-consent-renewed', agentName: this.primaryAgentName ?? '', consentAt });
+      return null;
+    }
+    return w;
+  }
+
+  private handleWithdrawConsentTool(
+    agentName: string,
+    input: Record<string, unknown>,
+  ): { success: boolean; data?: unknown; error?: string; isError?: boolean } {
+    if (!this.readerForks || !this.channelRegistry) {
+      return { success: false, error: 'withdraw_consent applies to reader forks, which this host does not run for you; there is nothing to withdraw.', isError: true };
+    }
+    if (agentName !== this.primaryAgentName) {
+      return { success: false, error: `withdraw_consent is ${this.primaryAgentName ?? 'the resident'}'s to call: the forks are of them.`, isError: true };
+    }
+    const standing = this.readerConsentWithdrawn();
+    if (standing) {
+      return { success: true, data: { withdrawn: true, at: standing.at, note: 'Your yes was already withdrawn; no reader fork has been derived since. It stands until a new yes from you is recorded in your configuration.' } };
+    }
+    const cfg = this.subconsciousConfig;
+    const consentAt = cfg?.reader === 'forks' ? cfg.consent?.at : undefined;
+    const reason = typeof input.reason === 'string' && input.reason.trim() ? input.reason.trim() : undefined;
+    const withdrawn = { at: new Date().toISOString(), by: agentName, ...(reason ? { reason } : {}), ...(consentAt ? { consentAt } : {}) };
+    this.readerConsentCache = withdrawn;
+    this.channelRegistry.writeCoordinatorState(this.readerConsentStateId(), { withdrawn });
+    this.emitTrace({ type: 'tune-out:reader-consent-withdrawn', agentName, ...(reason ? { reason } : {}), ...(consentAt ? { consentAt } : {}) });
+    this.lifecycleNotice(
+      agentName,
+      `[Agent lifecycle: you withdrew your yes to reader forks${consentAt ? ` (the yes of ${consentAt})` : ''}. No fork of you will be derived from now; a tune-out is a silent hold until a new yes from you is recorded.]`,
+      { withdrawn },
+    );
+    return {
+      success: true,
+      data: {
+        withdrawn: true,
+        at: withdrawn.at,
+        note: 'Recorded. No fork of you will be derived from now; forks already running finish their look. Your tune-outs are silent holds — traffic is held and released when you cancel or the duration ends — until a new yes from you is recorded in your configuration.',
+      },
+    };
+  }
+
   private handleTuneOutTool(
     _agentName: string,
     input: Record<string, unknown>,
@@ -28038,7 +28191,9 @@ export class AgentFramework {
           maxWakes: r.params.maxWakes,
           note: coordinator.hasReader()
             ? 'Your plain speech lands in the excepted channel while this holds. Reader wakes pause, not cancel, when the budget is spent.'
-            : 'No subconscious is configured: this is a silent hold. Your plain speech lands in the excepted channel; the backlog is delivered per channel when you cancel or the duration ends.',
+            : this.readerConsentWithdrawn()
+              ? 'You withdrew your yes to reader forks, so this is a silent hold. Your plain speech lands in the excepted channel; the backlog is delivered per channel when you cancel or the duration ends.'
+              : 'No subconscious is configured: this is a silent hold. Your plain speech lands in the excepted channel; the backlog is delivered per channel when you cancel or the duration ends.',
         },
       };
     }

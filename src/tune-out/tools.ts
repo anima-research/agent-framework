@@ -128,9 +128,69 @@ export type SubconsciousConfig = PersistentReaderConfig | ForkReaderConfig;
 interface SubconsciousConfigBase {
   /** Master switch. */
   enabled: boolean;
-  /** Allow speak_in_channel. Default false until the voice block has
-   *  passed its canary round. */
+  /**
+   * Allow speak_in_channel. Default false until the voice block has passed
+   * its canary round. A reader's post goes out through the resident's own
+   * publish path, so the channel sees it under the resident's account, in
+   * the reader's own words; nothing in the request names the reader.
+   */
   allowChannelSpeech?: boolean;
+}
+
+/**
+ * The resident's yes to reader forks, recorded by the host (the consent
+ * flow is the host's; connectome-host#334). A fork-mode reader is
+ * fork-grade: the resident's whole prefix is read on the weights the
+ * configuration names, so the yes is to the configuration — the fork
+ * section as the resident saw it — and `create` refuses a section that
+ * differs from the one agreed. The record travels on every fork's registry
+ * entry and in `dendrite:agent-created`, and each derivation notice names it.
+ */
+export interface ReaderConsent {
+  /** Who said yes: the resident. */
+  by: string;
+  /** When, ISO 8601. */
+  at: string;
+  /** Where the public yes can be read: a message id, or a link. */
+  where: string;
+  /** The fork section the yes covered, as the resident saw it. */
+  section: ReaderConsentSection;
+}
+
+/** The fields of a fork section a yes covers: everything but the host's functions. */
+export interface ReaderConsentSection {
+  model: string;
+  voice: string;
+  allowChannelSpeech?: boolean;
+  forkIdleTimeoutMs?: number;
+}
+
+/** The fork section of a configuration, as a consent record states it. */
+export function readerConsentSection(cfg: Pick<ForkReaderConfig, 'model' | 'voice' | 'allowChannelSpeech' | 'forkIdleTimeoutMs'>): ReaderConsentSection {
+  return {
+    model: cfg.model,
+    voice: cfg.voice,
+    ...(cfg.allowChannelSpeech !== undefined ? { allowChannelSpeech: cfg.allowChannelSpeech } : {}),
+    ...(cfg.forkIdleTimeoutMs !== undefined ? { forkIdleTimeoutMs: cfg.forkIdleTimeoutMs } : {}),
+  };
+}
+
+/**
+ * The first field of the live fork section that differs from the one a
+ * consent record covered, or null when they agree. `allowChannelSpeech`
+ * absent and false are the same section (speech off); an idle timeout absent
+ * and the default are not compared as equal, since the record keeps what the
+ * resident saw.
+ */
+export function readerConsentDrift(consent: ReaderConsent, cfg: ForkReaderConfig): { field: keyof ReaderConsentSection; agreed: unknown; live: unknown } | null {
+  const live = readerConsentSection(cfg);
+  const agreed = consent.section;
+  for (const field of ['model', 'voice', 'allowChannelSpeech', 'forkIdleTimeoutMs'] as const) {
+    const a = field === 'allowChannelSpeech' ? agreed[field] === true : agreed[field];
+    const l = field === 'allowChannelSpeech' ? live[field] === true : live[field];
+    if (a !== l) return { field, agreed: agreed[field], live: live[field] };
+  }
+  return null;
 }
 
 export interface PersistentReaderConfig extends SubconsciousConfigBase {
@@ -178,6 +238,13 @@ export interface ForkReaderConfig extends SubconsciousConfigBase {
   strategyFactory?: () => import('@animalabs/context-manager').ContextStrategy;
   /** Idle timeout for one reader fork (default 10 minutes). */
   forkIdleTimeoutMs?: number;
+  /**
+   * The resident's yes to this section (see ReaderConsent). Recorded by the
+   * host; `create` refuses a record whose section differs from this one.
+   * Without a record the framework derives forks as configured — the host
+   * decides whether to require one (connectome-host does).
+   */
+  consent?: ReaderConsent;
   /**
    * How a reader fork is prompted: the content of the one message it
    * receives after the fork point. Default `defaultReaderFraming`. The
