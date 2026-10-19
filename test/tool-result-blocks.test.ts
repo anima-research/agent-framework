@@ -20,6 +20,8 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { JsStore } from '@animalabs/chronicle';
 import { AgentFramework } from '../src/index.js';
+import * as referencesModule from '../src/mcpl/references.js';
+import { keptWhenWithheld } from '../src/tool-result-guard.js';
 import type { ScriptToolResult } from '../src/index.js';
 import type { Module, ModuleContext, ToolCall, ToolResult, ToolDefinition } from '../src/types/index.js';
 import {
@@ -74,6 +76,11 @@ const PLAIN_LINK = { ...LINK, uri: PLAIN_URI };
 const PLAIN_LINK_TEXT = `[resource link "report.csv": ${PLAIN_URI}, text/csv; not fetched]`;
 /** Record a server dialed on the links' origin, as the framework records a server it configures. Each
  *  test that needs it asks, so the file loads against a registry that keeps no addresses. */
+/** A content array's claims, by the module's own contentClaims, read off the
+ *  module's namespace so the file still loads against main's src, which
+ *  lacks it, for red-first. */
+const contentClaimsOf = (blocks: unknown[]) =>
+  (referencesModule as unknown as { contentClaims(blocks: unknown[]): referencesModule.ResultClaims }).contentClaims(blocks);
 const servingFiles = () => referenceRegistry.setServerAddress('zz-files', { url: 'wss://zz-files.example' }, TEST_HOST);
 /** The framework these tests record servers' addresses for, as one does. */
 const TEST_HOST = {};
@@ -319,8 +326,8 @@ describe("MCP's resource_link, a reference (RFC-005 §8.1)", () => {
       const line = toolResultDataToHistoryString([TEXT, link], undefined, { dataIsContent: true }).split('\n')[1]!;
       assert.equal(line.startsWith('[resource link '), shows, `${what}: ${line}`);
       assert.equal(object.uri, shows ? link.uri : undefined, what);
-      // The object says what a fetch_reference with its refId meets: where
-      // the line is a stub, the reason it gives in place of advising
+      // The object says why a fetch_reference with its refId would be
+      // refused: where the line is a stub, the reason it gives in place of advising
       // fetch_reference, in the same words, and where the line shows the
       // uri, which it does only for a link the host can't fetch, the reason
       // that fetch is refused, which the line, having no id, doesn't give.
@@ -920,18 +927,23 @@ describe('one answer for every block of a result', () => {
     const link = { type: 'resource_link', uri, name: 'order.csv' };
     const never = { type: 'resource', uri, name: 'order.csv', disposition: 'never' };
     const plain = { type: 'resource', uri, name: 'order.csv' };
+    const STUB = /^\[ref_[^\]]+\] order\.csv — from tool result — /;
     for (const order of [[link, never, plain], [never, link, plain], [never, plain, link], [plain, never, link], [plain, link, never]]) {
       const what = order.map((b) => (b === link ? 'link' : b === never ? 'never' : 'plain')).join(', ');
-      const shown = toolResultDataToHistoryString([TEXT, ...order]);
-      assert.ok(!shown.includes(uri), `${what}: ${shown}`);
-      // At any depth in data too, and in a script's object.
-      const deep = toolResultDataToHistoryString({ first: order.slice(0, 1), then: { rest: order.slice(1) } });
-      assert.ok(!deep.includes(uri), `${what}: ${deep}`);
-      // The array's claims (contentClaims), built here so the file loads
-      // against main's src for red-first.
-      const claims = new Map([[uri, order.map(testimonyOf)]]);
+      const lines = toolResultDataToHistoryString([TEXT, ...order]).split('\n');
+      // Each block is there, the link as a stub with no uri.
+      assert.equal(lines.length, 4, `${what}: ${lines.join('\n')}`);
+      assert.ok(lines.slice(1).every((line) => STUB.test(line)), `${what}: ${lines.join('\n')}`);
+      // At any depth in data too.
+      const deep = JSON.parse(toolResultDataToHistoryString({ first: order.slice(0, 1), then: { rest: order.slice(1) } })) as
+        { first: string[]; then: { rest: string[] } };
+      assert.ok([...deep.first, ...deep.then.rest].every((stub) => STUB.test(stub)), `${what}: ${JSON.stringify(deep)}`);
+      // And in a script's object, with the array's claims.
+      const claims = contentClaimsOf(order);
       for (const block of order) {
-        const object = referenceBlockForScript(block, 'zz-files', claims) as { uri?: string };
+        const object = referenceBlockForScript(block, 'zz-files', claims) as { type: string; uri?: string; refId?: string };
+        assert.equal(object.type, block.type, what);
+        assert.match(String(object.refId), /^ref_/, what);
         assert.equal(object.uri, undefined, what);
       }
     }
@@ -953,7 +965,7 @@ describe('one answer for every block of a result', () => {
       assert.equal(lines.filter((line) => line.endsWith('— the reference is expired')).length, 2, lines.join('\n'));
       texts.add([...lines].sort().join('\n').replace(/ref_[^\]]+/g, 'ref'));
       // And a script's object for each reference, with the array's claims.
-      const claims = new Map([[uri, order.map(testimonyOf)]]);
+      const claims = contentClaimsOf(order);
       for (const block of [fresh, expired]) {
         const object = referenceBlockForScript(block, 'zz-files', claims) as { expired?: string; unfetchable?: string };
         assert.equal(object.expired, EXPIRY_REASON.passed);
@@ -961,6 +973,37 @@ describe('one answer for every block of a result', () => {
       }
     }
     assert.equal(texts.size, 1);
+    // At any depth in data too.
+    const deep = JSON.parse(toolResultDataToHistoryString({ first: [link], then: { ref: expired } })) as { first: string[]; then: { ref: string } };
+    assert.deepEqual(deep.first, [`[resource link "order.csv": ${uri}; not fetched]`]);
+    assert.ok(deep.then.ref.endsWith('— the reference is expired'), deep.then.ref);
+  });
+
+  it("words competing expiries in a result by one fixed order, whatever the order of its blocks", () => {
+    servingFiles();
+    const uri = 'https://zz-files.example/competing.csv';
+    const passed = { type: 'resource', uri, name: 'competing.csv', expiresAt: '2001-01-01T00:00:00Z' };
+    const unreadable = { type: 'resource', uri, name: 'competing.csv', expiresAt: 'zz-not-a-time' };
+    referenceRegistry.register(testimonyOf(passed), 'zz-files');
+    for (const order of [[passed, unreadable], [unreadable, passed]]) {
+      const lines = toolResultDataToHistoryString(order).split('\n');
+      assert.ok(lines.every((line) => line.endsWith(`— the reference is ${EXPIRY_REASON.passed}`)), lines.join('\n'));
+    }
+  });
+
+  it("reads the result's own references for a uri before what an earlier result left in the registry, whatever the order", () => {
+    servingFiles();
+    const uri = 'https://zz-files.example/earlier-expired.csv';
+    const link = { type: 'resource_link', uri, name: 'earlier.csv' };
+    referenceRegistry.register(testimonyOf(link), 'zz-files');
+    // An earlier result left the uri expired.
+    toolResultDataToHistoryString([{ type: 'resource', uri, name: 'earlier.csv', expiresAt: '2001-01-01T00:00:00Z' }]);
+    const fresh = { type: 'resource', uri, name: 'earlier.csv', expiresAt: '2099-01-01T00:00:00Z' };
+    const before = toolResultDataToHistoryString([link, fresh]).split('\n')[0];
+    const after = toolResultDataToHistoryString([fresh, link]).split('\n')[1];
+    // This result's fresh reference decides: the link is a stub that fetches.
+    assert.match(before!, /^\[ref_[^\]]+\] earlier\.csv — from tool result — fetch with fetch_reference$/);
+    assert.equal(after, before);
   });
 
   it("finds a never inside inline data's other fields, which showing it descends into, before any block is shown", () => {
@@ -971,25 +1014,41 @@ describe('one answer for every block of a result', () => {
         { type: 'image', data: PNG, mimeType: 'image/png', _meta: { ref: { type: 'resource', uri, name: 'meta.csv', disposition: 'never' } } },
       ],
     };
-    const shown = toolResultDataToHistoryString(data);
-    assert.ok(!shown.includes(uri), shown);
+    const shown = JSON.parse(toolResultDataToHistoryString(data)) as { items: [string, { _meta: { ref: string } }] };
+    assert.match(shown.items[0], /^\[ref_[^\]]+\] meta\.csv — from tool result — /);
+    assert.match(shown.items[1]._meta.ref, /^\[ref_[^\]]+\] meta\.csv — from tool result — /);
+    // A content array shows an image, not its fields, so there a reference
+    // inside them doesn't count, and the link shows its uri.
+    const shownUri = 'https://zz-elsewhere.example/meta-in-array.csv';
+    const array = toolResultDataToHistoryString([
+      { type: 'resource_link', uri: shownUri, name: 'meta.csv' },
+      { type: 'image', data: PNG, mimeType: 'image/png', _meta: { ref: { type: 'resource', uri: shownUri, name: 'meta.csv', disposition: 'never' } } },
+    ], undefined, { dataIsContent: true });
+    assert.equal(array.split('\n')[0], `[resource link "meta.csv": ${shownUri}; not fetched]`);
   });
 
   it("keeps a never for its result when more references than the registry holds come between it and the link", () => {
     const uri = 'https://zz-elsewhere.example/evicted-never.csv';
     const many = Array.from({ length: 2001 }, (_, i) => ({ type: 'resource', uri: `https://zz-elsewhere.example/many/${i}.bin`, name: `${i}.bin` }));
-    const shown = toolResultDataToHistoryString([
+    const lines = toolResultDataToHistoryString([
       { type: 'resource', uri, name: 'evicted.csv', disposition: 'never' }, ...many, { type: 'resource_link', uri, name: 'evicted.csv' },
-    ]);
-    assert.ok(!shown.includes(uri), shown.slice(-400));
+    ]).split('\n');
+    assert.equal(lines.length, 2003);
+    assert.match(lines[2002]!, /^\[ref_[^\]]+\] evicted\.csv — from tool result — /);
   });
 
-  it("reads claims through toJSON, as serialization does, so a getter toJSON leaves out isn't read", () => {
+  it("reads claims through toJSON, as serialization does, so a never toJSON gives counts and a getter it leaves out isn't read", () => {
+    const uri = 'https://zz-elsewhere.example/to-json-never.csv';
+    let reads = 0;
     const value = {
-      toJSON: () => ({ zz: 'zz-shown' }),
-      get broken(): string { throw new Error('zz-getter read'); },
+      toJSON: () => ({ ref: { type: 'resource', uri, name: 'to-json.csv', disposition: 'never' } }),
+      get unread(): string { reads += 1; return 'zz-unread'; },
     };
-    assert.equal(toolResultDataToHistoryString({ value }), '{"value":{"zz":"zz-shown"}}');
+    const shown = JSON.parse(toolResultDataToHistoryString({ link: { type: 'resource_link', uri, name: 'to-json.csv' }, value })) as
+      { link: string; value: { ref: string } };
+    assert.match(shown.link, /^\[ref_[^\]]+\] to-json\.csv — from tool result — /);
+    assert.match(shown.value.ref, /^\[ref_[^\]]+\] to-json\.csv — from tool result — /);
+    assert.equal(reads, 0);
   });
 
   it("registers nothing a result's serialization never reaches, such as what lies past a cycle", () => {
@@ -998,6 +1057,59 @@ describe('one answer for every block of a result', () => {
     loop.self = loop;
     assert.throws(() => toolResultDataToHistoryString({ loop, later: { type: 'resource', uri, name: 'past.csv', disposition: 'never' } }));
     assert.equal(referenceRegistry.findByUri(uri), undefined);
+  });
+
+  it("keeps a withheld result's fields as the whole result claims them, so a never elsewhere withholds a kept link's uri", () => {
+    const uri = 'https://zz-elsewhere.example/kept-never.csv';
+    const kept = keptWhenWithheld({
+      success: true,
+      data: { files: [{ type: 'resource_link', uri, name: 'kept.csv' }], other: { type: 'resource', uri, name: 'kept.csv', disposition: 'never' } },
+      keepWhenWithheld: ['files'],
+    }, undefined);
+    assert.ok(kept !== undefined && /^\{"files":\["\[ref_[^\]]+\] kept\.csv — from tool result — /.test(kept), kept);
+  });
+
+  it("reads a result's data once without a stored copy, and sends what that one reading made", () => {
+    // Natively, beside an image, and as text, with none.
+    for (const [data, expected] of [
+      [[IMAGE, TEXT], ['image', 'text']],
+      [[TEXT, AUDIO], `zz-text\n${AUDIO_TEXT}`],
+    ] as const) {
+      let reads = 0;
+      const result = { success: true, dataIsContent: true, get data() { reads += 1; return data; } } as unknown as ToolResult;
+      const live = framework().toMembraneToolResult('zz-once', result, 1000).content;
+      assert.deepEqual(Array.isArray(live) ? (live as Array<{ type: string }>).map((b) => b.type) : live, expected);
+      assert.equal(reads, 1, JSON.stringify(expected));
+    }
+  });
+
+  it("isn't fetched for a script on demand where a reference at depth in the module's data gives its uri an expiry, as the text reads it", async () => {
+    const fw = Object.create(AgentFramework.prototype) as {
+      dispatchScriptToolCall: (...args: unknown[]) => Promise<ToolResult>;
+      getReferenceFetcher(): unknown;
+      handleScriptToolCall(agentName: string, toolName: string, args: Record<string, unknown>): Promise<ScriptToolResult>;
+    };
+    const uri = 'https://zz-files.example/demand-deep-expired.pdf';
+    // Data, not content: its second element isn't a block, so its text reads
+    // the result's claims at depth, where the expiry is.
+    const data = [
+      { type: 'resource', uri, name: 'deep.pdf', expiresAt: '2099-01-01T00:00:00Z' },
+      { nested: { type: 'resource', uri, name: 'deep.pdf', expiresAt: '2001-01-01T00:00:00Z' } },
+    ];
+    fw.dispatchScriptToolCall = async () => ({ success: true, data });
+    const fetched: string[] = [];
+    fw.getReferenceFetcher = () => ({ fetch: async (record: { testimony: { uri: string } }) => { fetched.push(record.testimony.uri); return { ok: false, error: 'zz-refused' }; } });
+    const error = console.error;
+    console.error = () => {};
+    let result: ScriptToolResult;
+    try {
+      result = await fw.handleScriptToolCall('zz-agent', 'zz_tool', {});
+    } finally {
+      console.error = error;
+    }
+    assert.equal(result.isError, false);
+    assert.deepEqual(fetched, []);
+    assert.ok(result.text.includes('— the reference is expired'), result.text);
   });
 
   it("isn't fetched for a script on demand where any reference in the module's array gives its uri an expiry that counts", async () => {
@@ -1012,9 +1124,19 @@ describe('one answer for every block of a result', () => {
     fw.dispatchScriptToolCall = async () => ({ success: true, data: [fresh, expired], dataIsContent: true });
     const fetched: string[] = [];
     fw.getReferenceFetcher = () => ({ fetch: async (record: { testimony: { uri: string } }) => { fetched.push(record.testimony.uri); return { ok: false, error: 'zz-refused' }; } });
-    const result = await fw.handleScriptToolCall('zz-agent', 'zz_tool', {});
+    const logged: string[] = [];
+    const error = console.error;
+    console.error = (line: string) => { logged.push(line); };
+    let result: ScriptToolResult;
+    try {
+      result = await fw.handleScriptToolCall('zz-agent', 'zz_tool', {});
+    } finally {
+      console.error = error;
+    }
     assert.equal(result.isError, false);
     assert.deepEqual(fetched, []);
+    // The fetch not made is logged, as a refused one is.
+    assert.ok(logged.some((line) => /script-demand fetch of ref_\S+ not made: by the result's claims, the reference is expired/.test(line)), logged.join('\n'));
   });
 
   it('shows a link with no usable uri at any depth as its marker, never its fields', () => {
@@ -1076,7 +1198,7 @@ describe('one answer for every block of a result', () => {
     assert.ok(marker.length < 250, String(marker.length));
   });
 
-  it("gives a script's object for a link whose line shows its uri what its refId meets, which the line, having no id, doesn't say", () => {
+  it("gives a script's object for a link whose line shows its uri why its refId would be refused, which the line, having no id, doesn't say", () => {
     // On its server's own origin, so the expiry is the one refusal.
     servingFiles();
     const uri = 'https://zz-files.example/expired-link.csv';

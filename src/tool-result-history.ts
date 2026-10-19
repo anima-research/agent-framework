@@ -100,16 +100,31 @@ const MCP_BLOCK_TYPES = new Set(['text', 'image', 'audio', 'resource', 'resource
  * is read as content, and shows a marker for each record that isn't a block
  * the lane can show.
  */
-export function toolResultBlocks(data: unknown, dataIsContent?: boolean): ToolResultBlock[] | null {
-  if (!Array.isArray(data)) return null;
-  if (dataIsContent !== true && !data.every((element) => isPlainRecord(element) && MCP_BLOCK_TYPES.has(element.type as string))) {
-    return null;
-  }
+export function toolResultBlocks(data: unknown, dataIsContent?: boolean, claims?: ResultClaims): ToolResultBlock[] | null {
+  if (!isContentArray(data, dataIsContent)) return null;
   // The result's claims, read as one (ResultClaims): what any of its
   // references says of a uri (a `disposition: never`, an expiry) holds for
   // each block that names it, whatever their order.
-  const claims = contentClaims(data);
-  return data.map((raw) => toolResultBlock(raw, claims));
+  const read = claims ?? contentClaims(data);
+  return data.map((raw) => toolResultBlock(raw, read));
+}
+
+/** Whether a tool result's data is a content array, which toolResultBlocks
+ *  shows block by block. */
+function isContentArray(data: unknown, dataIsContent?: boolean): data is unknown[] {
+  return Array.isArray(data)
+    && (dataIsContent === true || data.every((element) => isPlainRecord(element) && MCP_BLOCK_TYPES.has(element.type as string)));
+}
+
+/**
+ * The claims of a tool result's data (ResultClaims), as showing it reads
+ * them: a content array's from its elements (contentClaims), and any other
+ * data's by the walk serialization takes (claimsInHistory). For a decision
+ * made about the result outside showing it, such as which of its references
+ * to fetch, or for showing part of it as the rest of it claims.
+ */
+export function resultClaimsOf(data: unknown, dataIsContent?: boolean): ResultClaims {
+  return isContentArray(data, dataIsContent) ? contentClaims(data) : claimsInHistory(data);
 }
 
 /** One element of a content array, as toolResultBlocks gives it. Only an
@@ -180,6 +195,12 @@ export interface HistorySerializeOptions {
    * blocks, so the two copies come from one classification.
    */
   onBlocks?: (spans: HistoryBlockSpan[], blocks: ToolResultBlock[]) => void;
+  /**
+   * The claims to read (ResultClaims) in place of the data's own, where the
+   * data shown is part of a larger result whose claims these are
+   * (resultClaimsOf), such as the fields a withheld result keeps.
+   */
+  claims?: ResultClaims;
 }
 
 /**
@@ -209,7 +230,7 @@ export function toolResultDataToHistoryString(
   const fromArray = tryHistoryStringFromContentArray(data, options);
   // JSON leaves out undefined, a function and a symbol: a result with no data
   // is stored as no text, as an empty content array is.
-  const str = fromArray ?? historyJson(data) ?? '';
+  const str = fromArray ?? historyJson(data, options?.claims) ?? '';
   return maxChars ? truncateForHistory(str, maxChars) : str;
 }
 
@@ -255,7 +276,7 @@ export function truncateForHistory(str: string, maxChars: number): string {
  * content array, for the fallback, historyJson.
  */
 function tryHistoryStringFromContentArray(data: unknown, options?: HistorySerializeOptions): string | null {
-  const blocks = toolResultBlocks(data, options?.dataIsContent);
+  const blocks = toolResultBlocks(data, options?.dataIsContent, options?.claims);
   if (blocks === null) return null;
   const parts = blocks.map((block, blockIndex): { kind: HistoryBlockSpan['kind']; text: string } => {
     if (block.kind !== 'image') return block;
@@ -311,10 +332,10 @@ function isPlainRecord(value: unknown): value is Record<string, unknown> {
  * one (such as a uri that isn't a string, or MCP's embedded resource, whose
  * uri isn't at its top level) as the marker saying why it isn't shown, and
  * inline data that also claims a uri or a disposition as withheld. So the
- * only uri shown is a link's, in its line, where the host can't fetch the
- * link and its uri can't carry a credential (shownLinkUri). Inline data that
- * claims neither is itself, as is any other value:
- * a block of another type keeps its fields, since RFC-005 governs
+ * only reference's uri shown is a link's, in its line, where the host can't
+ * fetch the link and its uri can't carry a credential (shownLinkUri). Inline
+ * data that claims neither is itself, as is any other value: a block of
+ * another type keeps its fields, a url among them, since RFC-005 governs
  * references.
  */
 function shownInHistory(value: unknown, claims?: ResultClaims): unknown {
@@ -325,8 +346,9 @@ function shownInHistory(value: unknown, claims?: ResultClaims): unknown {
  * The one walk of a tool result's data that showing it and reading its
  * claims both take: a value RFC-005 governs is text, from `asText`, except
  * inline data that claims no uri or disposition, which is itself, as is any
- * other value, so serialization descends into exactly the same values each
- * time. `asText` gives a governed value's text, or null where it's itself.
+ * other value, so serialization descends into the same values each time, so
+ * long as each value's toJSON and getters answer the same each time they're
+ * read. `asText` gives a governed value's text, or null where it's itself.
  */
 function walkedInHistory(value: unknown, asText: (b: Record<string, unknown>) => string | null): unknown {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return value;
@@ -347,7 +369,10 @@ function walkedInHistory(value: unknown, asText: (b: Record<string, unknown>) =>
  * through toJSON, the fields of inline data and every depth it shows: so
  * every reference whose stub the result shows counts, and nothing it doesn't
  * show does. A value serialization can't write, such as a cycle, stops the
- * walk where it would stop the result.
+ * walk where it would stop the result. It's a walk of its own before the one
+ * that shows the data, so a value's toJSON and getters run in both: one that
+ * answers differently the second time can claim what the shown text
+ * doesn't show.
  */
 function claimsInHistory(data: unknown): ResultClaims {
   const testimonies: ReferenceTestimony[] = [];
@@ -355,14 +380,23 @@ function claimsInHistory(data: unknown): ResultClaims {
     const c = classifyBlock(b);
     if (c.kind === 'reference') testimonies.push(c.testimony);
     // Text where referenceStubOrNull gives text, so the walk descends where
-    // showing descends.
-    return c.kind === 'text' || (c.kind === 'inline' && !c.contradiction) ? null : '';
+    // showing descends. Inline data never reaches here: walkedInHistory
+    // decides it first.
+    return c.kind === 'text' ? null : '';
   };
   try {
     const root = walkedInHistory(data, read);
-    if (root === data || typeof root !== 'string') JSON.stringify(data, (_key, value: unknown) => walkedInHistory(value, read));
+    // Its text is thrown away, so a string is written as 0, which keeps a
+    // long one from being copied for nothing; the walk descends as before.
+    if (root === data || typeof root !== 'string') {
+      JSON.stringify(data, (_key, value: unknown) => {
+        const walked = walkedInHistory(value, read);
+        return typeof walked === 'string' ? 0 : walked;
+      });
+    }
   } catch {
-    // Showing the result meets the same failure at the same place.
+    // Showing the result meets the same failure at the same place, for a
+    // value that answers the same each time it's read.
   }
   return resultClaims(testimonies);
 }
@@ -383,8 +417,8 @@ export function rfc005TextOf(value: unknown): string | null {
  * it (shownInHistory), at any depth. Data that is itself shown as text, such
  * as a bare reference, is that text.
  */
-function historyJson(data: unknown): string | undefined {
-  const claims = claimsInHistory(data);
+function historyJson(data: unknown, given?: ResultClaims): string | undefined {
+  const claims = given ?? claimsInHistory(data);
   const root = shownInHistory(data, claims);
   if (root !== data && typeof root === 'string') return root;
   return JSON.stringify(data, (_key, value: unknown) => shownInHistory(value, claims)) as string | undefined;

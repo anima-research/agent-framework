@@ -701,29 +701,53 @@ export interface StubOptions {
 }
 
 /**
- * What one tool result's references claim of each uri they name: uri → the
- * testimony each of those references gave it. A decision a block of that
- * result makes reads them all with its record's own, and the strictest claim
- * wins: a uri any of them marks `disposition: never` is withheld, and one
- * any of them gives an expiry that counts is expired (claimedExpiry), so a
- * result means the same whatever the order of its blocks, and whatever the
- * registry evicted while it was read (Ada-1017's call). Across results the
- * registry keeps the latest testimony (register).
+ * What one tool result's references claim of each uri they name, each uri's
+ * testimonies read as one (UriClaims): the strictest claim wins, so a uri any
+ * of them marks `disposition: never` is withheld, and one any of them gives
+ * an expiry that counts is expired (claimedExpiry), whatever the order of the
+ * blocks and whatever the registry evicted while it was read (Ada-1017's
+ * call). A decision about a record reads its result's claims where the
+ * result's references say anything of its uri, and otherwise the record's
+ * own testimony, the latest the registry holds from an earlier result. A
+ * link claims no disposition or expiry, so it adds nothing here.
  */
-export type ResultClaims = ReadonlyMap<string, readonly ReferenceTestimony[]>;
+export type ResultClaims = ReadonlyMap<string, UriClaims>;
 
-/** A result's claims (ResultClaims), from the testimonies of its references. */
+/** What a result's references say of one uri, read as one. */
+export interface UriClaims {
+  /** Whether any of them marks it `disposition: never`. */
+  never: boolean;
+  /** Whether any of them gives an expiry rejected as a field. */
+  rejected: boolean;
+  /** Whether any of them gives an expiry that doesn't parse. */
+  unparseable: boolean;
+  /** The earliest expiry any of them gives, in ms since the epoch, or null. */
+  earliestMs: number | null;
+}
+
+/** A result's claims (ResultClaims), from the testimonies of its references,
+ *  each read once, as referenceExpiry reads an expiry. */
 export function resultClaims(testimonies: Iterable<ReferenceTestimony>): ResultClaims {
-  const claims = new Map<string, ReferenceTestimony[]>();
+  const claims = new Map<string, UriClaims>();
   for (const t of testimonies) {
-    const list = claims.get(t.uri);
-    if (list) list.push(t);
-    else claims.set(t.uri, [t]);
+    if (t.fromLink) continue;
+    let c = claims.get(t.uri);
+    if (!c) claims.set(t.uri, c = { never: false, rejected: false, unparseable: false, earliestMs: null });
+    if (t.disposition === 'never') c.never = true;
+    if (t.rejectedFields.includes('expiresAt')) {
+      c.rejected = true;
+    } else if (t.expiresAt !== undefined) {
+      const ms = Date.parse(t.expiresAt);
+      if (Number.isNaN(ms)) c.unparseable = true;
+      else if (c.earliestMs === null || ms < c.earliestMs) c.earliestMs = ms;
+    }
   }
   return claims;
 }
 
-/** The claims of a content array's references, element by element. */
+/** The claims of a content array's references, read from its elements as
+ *  the array shows them: an element's own fields, such as an image's
+ *  `_meta`, aren't shown, so a reference inside them doesn't count. */
 export function contentClaims(blocks: readonly unknown[]): ResultClaims {
   const testimonies: ReferenceTestimony[] = [];
   for (const block of blocks) {
@@ -733,24 +757,29 @@ export function contentClaims(blocks: readonly unknown[]): ResultClaims {
   return resultClaims(testimonies);
 }
 
-/** Every testimony a decision about a record reads: the record's own, and
- *  each one the result's references gave its uri. */
-function claimsOf(record: ReferenceRecord, claims?: ResultClaims): ReferenceTestimony[] {
-  return [record.testimony, ...(claims?.get(record.testimony.uri) ?? [])];
+/** The claims a decision about a record reads: its result's for its uri,
+ *  where the result's references say anything of it, and otherwise the
+ *  record's own testimony. */
+function uriClaims(record: ReferenceRecord, claims?: ResultClaims): UriClaims | undefined {
+  return claims?.get(record.testimony.uri) ?? resultClaims([record.testimony]).get(record.testimony.uri);
 }
 
-/** Whether a record's uri is withheld: its own testimony, or any of the
- *  result's references, marks it `disposition: never`. */
+/** Whether a record's uri is withheld: marked `disposition: never` by its
+ *  result's references, or by its own testimony where they say nothing. */
 export function claimedNever(record: ReferenceRecord, claims?: ResultClaims): boolean {
-  return claimsOf(record, claims).some((t) => t.disposition === 'never');
+  return uriClaims(record, claims)?.never === true;
 }
 
 /** The expiry a record counts, as of `nowMs`: the first of EXPIRY_REASON's
- *  cases that its own testimony, or any of the result's references, gives,
- *  so the order of the blocks doesn't choose the words. Null when none does. */
+ *  cases its claims give (uriClaims), so the order of the blocks doesn't
+ *  choose the words. Null when none does. */
 export function claimedExpiry(record: ReferenceRecord, claims: ResultClaims | undefined, nowMs: number): keyof typeof EXPIRY_REASON | null {
-  const found = new Set(claimsOf(record, claims).map((t) => referenceExpiry(t, nowMs)));
-  return (Object.keys(EXPIRY_REASON) as Array<keyof typeof EXPIRY_REASON>).find((kind) => found.has(kind)) ?? null;
+  const c = uriClaims(record, claims);
+  if (!c) return null;
+  if (c.earliestMs !== null && c.earliestMs <= nowMs) return 'passed';
+  if (c.unparseable) return 'unparseable';
+  if (c.rejected) return 'rejected';
+  return null;
 }
 
 /**
@@ -871,9 +900,11 @@ export function referenceStubOrNull(block: unknown, provenance?: string, serverI
  * (shownLinkUri). An unsaved reference that counts as expired also carries
  * `expired`, and one the fetcher would refuse carries `unfetchable`, the
  * words a stub gives in place of advising fetch_reference
- * (unfetchableReason). Both say what a fetch_reference with the object's
- * `refId` meets, so a link whose line shows its uri, which the host can't
- * fetch, carries them too: its line has no id to fetch with. `claims` are
+ * (unfetchableReason). Both give why a fetch_reference with the object's
+ * `refId` would be refused, as the result's references claim it, so a link
+ * whose line shows its uri, which the host can't fetch, carries them too: its
+ * line has no id to fetch with. The fetch itself reads the record, which
+ * keeps the latest testimony registered (Ada-1017's call). `claims` are
  * those of the content array the block came in (contentClaims), so its
  * other references count as they do for the model's line (ResultClaims).
  * The reference is registered bound to `serverId`, the server whose tool
@@ -897,11 +928,11 @@ export function referenceBlockForScript(block: unknown, serverId: string, claims
       // with each other across an expiry.
       const nowMs = Date.now();
       const uri = shownLinkUri(t, record, nowMs, claims);
-      // What a fetch_reference with this object's refId meets, in the words
-      // a stub gives, whether or not the model's line for it is a stub: the
-      // line has no id to fetch with, and the object does. As the stub
-      // judges it, a saved copy is still served, and the result's own claims
-      // count with the record's.
+      // Why a fetch_reference with this object's refId would be refused, in
+      // the words a stub gives, whether or not the model's line for it is a
+      // stub: the line has no id to fetch with, and the object does. As the
+      // stub judges it, a saved copy is still served, and the result's own
+      // claims count with the record's.
       const expiry = record.fetchedPath ? null : claimedExpiry(record, claims, nowMs);
       const unfetchable = unfetchableReason(record, nowMs, claims);
       return {

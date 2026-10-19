@@ -1,6 +1,6 @@
 import { ToolPresentation, presentationTools, isPresentationTool, renderCatalogue, type PresentationSnapshot } from "./tool-presentation.js";
 import { dirname, join } from 'node:path';
-import { REFERENCE_LIMITS, claimedExpiry, classifyBlock, contentClaims, isReferenceExpired, referenceBlockForScript, referenceRegistry, sanitizeLabel, type ServerAddress } from './mcpl/references.js';
+import { EXPIRY_REASON, REFERENCE_LIMITS, claimedExpiry, classifyBlock, contentClaims, isReferenceExpired, referenceBlockForScript, referenceRegistry, sanitizeLabel, type ServerAddress } from './mcpl/references.js';
 import { ReferenceFetcher, DEFAULT_FETCH_MAX_BYTES, EAGER_FETCH_TIMEOUT_MS } from './mcpl/reference-fetcher.js';
 import {
   appendFileSync, closeSync, existsSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, unlinkSync,
@@ -115,6 +115,7 @@ import type { ToolResultGuard, WithheldSpill } from './tool-result-guard.js';
 import {
   goesNative,
   nonErrorResultText,
+  resultClaimsOf,
   toolResultDataToHistoryString,
   truncateForHistory,
   DEFAULT_TOOL_RESULT_INLINE_MAX_CHARS,
@@ -19218,10 +19219,11 @@ export class AgentFramework {
     // the ones it wants with fetch_reference.
     if (Array.isArray(result.data) && this.resolveMcplTool(toolName) === null) {
       const fetcher = this.getReferenceFetcher();
-      // The array's claims, read as one: a uri any of its references gives
-      // an expiry that counts isn't fetched, as autoFetchReferences passes
-      // over one that any block of an MCPL result marks expired.
-      const claims = contentClaims(result.data);
+      // The result's claims, read as showing it reads them (resultClaimsOf):
+      // a uri any of its references gives an expiry that counts isn't
+      // fetched, as autoFetchReferences passes over one that any block of an
+      // MCPL result marks expired.
+      const claims = resultClaimsOf(result.data, result.dataIsContent);
       for (const block of result.data) {
         const c = classifyBlock(block);
         if (c.kind !== 'reference' || c.testimony.fromLink) continue;
@@ -19229,7 +19231,11 @@ export class AgentFramework {
         // replace a link's, or a stale reference's, before the fetch reads
         // them, as on any other path, while the record isn't fetched yet.
         const record = referenceRegistry.register(c.testimony);
-        if (!record.fetchedPath && claimedExpiry(record, claims, Date.now()) !== null) continue;
+        const expired = record.fetchedPath ? null : claimedExpiry(record, claims, Date.now());
+        if (expired !== null) {
+          console.error(`[rfc005] script-demand fetch of ${record.refId} not made: by the result's claims, the reference is ${EXPIRY_REASON[expired]}`);
+          continue;
+        }
         const outcome = await fetcher.fetch(record);
         if (!outcome.ok) console.error(`[rfc005] script-demand fetch of ${record.refId} failed: ${outcome.error}`);
       }
@@ -19431,9 +19437,10 @@ export class AgentFramework {
   }
 
   /**
-   * A content array's blocks (toolResultBlocks), carrying at least one image
-   * whose links and markers fit the cap together (goesNative), as Membrane's
-   * native ToolResultContentBlock[]: each image as itself, each text block
+   * A content array's blocks (toolResultBlocks) as Membrane's native
+   * ToolResultContentBlock[], for a caller that found they go natively: at
+   * least one image, with links and markers that fit the cap together
+   * (goesNative), which this doesn't check. Each image as itself, each text block
    * cut at the cap, and every other block whole, as the text the stored copy
    * shows for it. `maxChars`, when provided, caps each text block so an image
    * inlined beside an enormous text payload can't blow the context. A block

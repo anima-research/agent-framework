@@ -4,7 +4,7 @@ import type { ContextManager, MessageId, MessageMetadata } from '@animalabs/cont
 import type { ContentBlock, NormalizedMessage, ToolResult } from '@animalabs/membrane';
 import type { CompletedToolCall } from './types/index.js';
 import { ensureStateRegistered } from './module-registry.js';
-import { rfc005TextOf, toolResultDataToHistoryString } from './tool-result-history.js';
+import { resultClaimsOf, rfc005TextOf, toolResultDataToHistoryString } from './tool-result-history.js';
 import { safeSlice } from './safe-slice.js';
 
 export const TOOL_RESULT_GUARD_NOTICE = 'Tool result withheld by the guard. The tool has already executed.';
@@ -104,7 +104,9 @@ export function keptWhenWithheld(result: CompletedToolCall['result'], maxChars: 
   // Data that RFC-005 shows as text, such as a reference's stub, keeps that
   // text: picked out of it, a kept uri would lose the type that makes it a
   // reference, and be written out of the stub that hides it.
-  const whole = rfc005TextOf(fields) ?? toolResultDataToHistoryString(kept);
+  // The kept fields are shown as the whole result claims (resultClaimsOf), so
+  // a never elsewhere in it still withholds a kept link's uri.
+  const whole = rfc005TextOf(fields) ?? toolResultDataToHistoryString(kept, undefined, { claims: resultClaimsOf(fields) });
   if (!maxChars || whole.length <= maxChars) return whole;
   // Never half a surrogate pair: the stub goes to the provider as text, so
   // the cut can be one character short of the cap.

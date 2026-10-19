@@ -302,5 +302,11 @@ test("an MCPL peer's link reads every reference in its result, so a never anywhe
     });
     const out = await h.script('mcpl--files--attach');
     assert.ok(!out.includes('elsewhere.example.invalid'), out);
+    // Each block reached the script, the link as a reference object.
+    const object = JSON.parse(out) as { content: Array<{ type: string; refId?: string; uri?: string }>; isError: boolean };
+    assert.equal(object.isError, false);
+    assert.deepEqual(object.content.map((b) => b.type), ['resource', 'resource', 'resource_link']);
+    assert.match(String(object.content[2]!.refId), /^ref_/);
+    assert.equal(object.content[2]!.uri, undefined);
   });
 });

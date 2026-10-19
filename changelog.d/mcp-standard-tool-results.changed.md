@@ -46,9 +46,10 @@
   the uri. An unsaved reference that counts as expired also carries
   `expired`, the reason the model's stub gives, and isn't fetched. One the
   fetcher would refuse carries `unfetchable`, the words a stub gives in
-  place of advising `fetch_reference`. Both say what a `fetch_reference`
-  with the object's `refId` meets, so a link whose line shows its uri,
-  which the host can't fetch, carries them too.
+  place of advising `fetch_reference`. Both give why a `fetch_reference`
+  with the object's `refId` would be refused, as the result's references
+  claim it, so a link whose line shows its uri, which the host can't
+  fetch, carries them too.
   A block the classifier rejects arrives as the notice the model reads in
   its place, and inline data that also claims a bulk disposition as the
   withheld notice. #181, by @Meganeuridae, first
