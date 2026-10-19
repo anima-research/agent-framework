@@ -587,6 +587,28 @@ describe('wake recovery startup ordering', () => {
   });
 });
 
+describe('stop ordering preserves wake intents', () => {
+  it('disposes the EventGate before closing the process queue', async () => {
+    const dir = join(TMP_DIR, 'stop-order');
+    const framework = await AgentFramework.create({
+      storePath: join(dir, 'store'), membrane: new MockMembrane().asMembrane(),
+      agents: [{ name: 'agent', model: 'test', systemPrompt: 'test' }], modules: [],
+      gate: { configPath: join(dir, 'gate.json') },
+    });
+    const internals = framework as unknown as {
+      eventGate: EventGate;
+      queue: { close(): void };
+    };
+    const order: string[] = [];
+    const dispose = internals.eventGate.dispose.bind(internals.eventGate);
+    const close = internals.queue.close.bind(internals.queue);
+    internals.eventGate.dispose = () => { order.push('gate'); dispose(); };
+    internals.queue.close = () => { order.push('queue'); close(); };
+    await framework.stop();
+    assert.deepStrictEqual(order.slice(0, 2), ['gate', 'queue']);
+  });
+});
+
 describe('wake durability receipts', () => {
   it('setSleep and armSelfWake report a failed journal write without dropping live timers', () => {
     const gate = makeGate().gate;
