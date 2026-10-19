@@ -953,4 +953,39 @@ describe("the scheduler's split, and a private turn's other paths", () => {
       }
     }
   });
+
+  it("a private turn's channel_publish that names a channel goes there, from the model and from a call made as the agent", async () => {
+    const rig = await surfaceRig();
+    try {
+      const calls: Array<{ name: string; input: unknown }> = [];
+      const internalsOf = rig.framework as unknown as {
+        channelRegistry: Record<string, unknown>;
+        dispatchChannelToolCall(agentName: string, call: { id: string; name: string; input: unknown }): void;
+        executeToolCall(call: { id: string; name: string; input: unknown; callerAgentName?: string }): Promise<{ success: boolean; error?: string }>;
+        roundCallOf(agentName: string, call: { name: string; input?: unknown }): { cause: string | null };
+      };
+      internalsOf.channelRegistry.handleChannelToolCall = async (name: string, input: unknown) => { calls.push({ name, input }); return { success: true, data: {} }; };
+      const routing = routingOf(rig.framework);
+      routing.nonChannelOrigin = true;
+      rig.state.openLogical.set('scout', routing);
+      internalsOf.dispatchChannelToolCall('scout', { id: 'p1', name: 'channel_publish', input: { channelId: ROOM, content: 'hello' } });
+      await new Promise((r) => setTimeout(r, 20));
+      assert.deepEqual(calls.map((c) => (c.input as { channelId?: string }).channelId), [ROOM], 'the model\'s named publish went through');
+      // A call made as the agent, during its private turn, keeps the rule.
+      const refused = await internalsOf.executeToolCall({ id: 'p2', name: 'channel_publish', input: { content: 'hello' }, callerAgentName: 'scout' });
+      assert.equal(refused.success, false);
+      assert.match(refused.error!, /channel_publish requires an explicit channelId/);
+      const named = await internalsOf.executeToolCall({ id: 'p3', name: 'channel_publish', input: { channelId: ROOM, content: 'hello' }, callerAgentName: 'scout' });
+      assert.equal(named.success, true);
+      // Its round counts a refused publish as no send, and a named one as one.
+      assert.equal(internalsOf.roundCallOf('scout', { name: 'channel_publish', input: { content: 'hello' } }).cause, null);
+      assert.equal(internalsOf.roundCallOf('scout', { name: 'channel_publish', input: { channelId: ROOM, content: 'hello' } }).cause, 'send');
+      // Outside any turn, a call made as the agent isn't judged by the turn that ended.
+      rig.state.openLogical.delete('scout');
+      const after = await internalsOf.executeToolCall({ id: 'p4', name: 'channel_publish', input: { content: 'hello' }, callerAgentName: 'scout' });
+      assert.equal(after.success, true, JSON.stringify(after));
+    } finally {
+      await rig.close();
+    }
+  });
 });

@@ -19077,6 +19077,12 @@ export class AgentFramework {
     // synthesized verbs (think, skip_reply) are deliberately not routed
     // here.
     if (call.name.startsWith('channel_') && this.channelRegistry) {
+      // A call made as the agent keeps a private turn's publish rule, as the
+      // model's own call does (dispatchChannelToolCall).
+      if (origin.kind === 'agent') {
+        const error = this.privatePublishRefusal(origin.agentName, call, this.openLogical?.get(origin.agentName));
+        if (error !== undefined) return { success: false, error, isError: true };
+      }
       return this.channelRegistry.handleChannelToolCall(call.name, call.input, origin);
     }
 
@@ -20594,10 +20600,12 @@ export class AgentFramework {
    * marked refused: it keeps its own round private and silences nothing
    * after it. A refusal withholds the call's effect, not the model's choice
    * to keep its words private. Any other call the list refuses posted
-   * nothing, so it gives no cause.
+   * nothing, so it gives no cause, and nor does a private turn's
+   * channel_publish that names no channel (privatePublishRefusal).
    */
   private roundCallOf(agentName: string, call: { name: string; input?: unknown }): RoundCall {
-    const permitted = this.canAgentUseTool(agentName, call.name);
+    const permitted = this.canAgentUseTool(agentName, call.name)
+      && this.privatePublishRefusal(agentName, call, this.turnRouting?.get(agentName)) === undefined;
     const refused = bareToolName(call.name) === 'skip_reply' && (!permitted || this.refusesSelfWake(call));
     return { name: call.name, cause: permitted || refused ? silenceCauseOf([call]) : null, refused };
   }
@@ -25800,6 +25808,30 @@ export class AgentFramework {
   }
 
   /**
+   * The refusal of a channel_publish that names no channel in a private
+   * non-channel turn, or undefined. A turn from a private surface publishes
+   * only where it names: an argument-less channel_publish infers no channel,
+   * a fork's home included, since the turn was private wherever the agent
+   * speaks. Judged on the call as it was made, and on the turn given: the
+   * model's dispatch and its round's routing (roundCallOf) give the call's
+   * own turn, the agent's latest (turnRouting, read without making one),
+   * and a public call made as the agent (executeToolCall) gives the agent's
+   * open turn, so one made outside any turn isn't judged by a turn that has
+   * ended.
+   */
+  private privatePublishRefusal(
+    agentName: string,
+    call: { name: string; input?: unknown },
+    turn: TurnRouting | undefined,
+  ): string | undefined {
+    if (call.name !== 'channel_publish' || turn?.nonChannelOrigin !== true) return undefined;
+    if ((call.input as { channelId?: unknown } | undefined)?.channelId) return undefined;
+    const home = this.conversationAgentHomes.get(agentName);
+    return 'This private turn has no inferred channel; channel_publish requires an explicit channelId.'
+      + (home ? ` To publish in this conversation's channel, name "${home}".` : '');
+  }
+
+  /**
    * Build BeforeInferenceParams from agent state and trigger context.
    */
   /**
@@ -25807,16 +25839,10 @@ export class AgentFramework {
    */
   private dispatchChannelToolCall(agentName: string, call: ToolCall): void {
     const home = this.conversationAgentHomes.get(agentName);
-    // A turn from a private surface publishes only where it names: an
-    // argument-less channel_publish infers no channel, a fork's home
-    // included, since the turn was private wherever the agent speaks.
-    // Judged on the call as the agent made it, before a fork's default
-    // below fills one in.
-    if (call.name === 'channel_publish'
-      && this.routingOf(agentName).nonChannelOrigin
-      && !(call.input as { channelId?: unknown } | undefined)?.channelId) {
-      const error = 'This private turn has no inferred channel; channel_publish requires an explicit channelId.'
-        + (home ? ` To publish in this conversation's channel, name "${home}".` : '');
+    // Judged on the call as the agent made it, before a fork's default below
+    // fills one in, and on the turn it was made in.
+    const error = this.privatePublishRefusal(agentName, call, this.turnRouting?.get(agentName));
+    if (error !== undefined) {
       this.toolLifecycleEmitter?.refuse(agentName, call.id);
       this.emitTrace({ type: 'tool:failed', module: 'channels', tool: call.name, callId: call.id, error });
       this.pushEvent({
