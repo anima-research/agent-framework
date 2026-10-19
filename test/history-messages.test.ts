@@ -860,7 +860,9 @@ test('a sync pass names each failure it met in lastError once: the stats answer 
   // A failed delete and a failed edit's upsert in one pass are each named, in the order met.
   const both = await routed(t, (kind, n) => {
     if (kind === 'search') return [200, { namespace: 'test/ns', hits: [hit], count_indexed: 1, timing_ms: { embed: 1, search: 1 } }];
-    if (kind === 'stats') return [404, { error: { message: 'no such index' } }];
+    // An index that's made, so the removal goes to /delete: a pass whose
+    // stats answer 404 has no index to remove from, and makes no call.
+    if (kind === 'stats') return [200, { namespace: 'test/ns', by_kind: {} }];
     if (kind === 'delete') return [500, { error: { message: 'delete failed' } }];
     // The edit's upsert comes first, before the walk's.
     return n === 0 ? [503, { error: { message: 'overloaded' } }] : [200, { inserted: 1, updated: 0, unchanged: 0, count: 1 }];

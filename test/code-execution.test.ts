@@ -20,6 +20,7 @@ import type {
   ModuleContext,
   ProcessEvent,
   ProcessState,
+  ScriptToolResult,
   ToolCall,
   ToolDefinition,
   ToolResult,
@@ -131,6 +132,77 @@ describe('PyRunner (real python3)', () => {
       assert.strictEqual(result.returnCode, 0, result.stderr);
       assert.match(result.stdout, /echoed: alpha/);
       assert.deepStrictEqual(calls, [{ name: 'test--echo', args: { message: 'alpha' } }]);
+    } finally {
+      runner.dispose();
+    }
+  });
+
+  it('gives a script each result as its string, with .is_error and .structured beside it', async () => {
+    const structured = JSON.stringify({ content: [], structuredContent: { rows: [1, 2] }, isError: false });
+    const oversized = JSON.stringify({ isError: true, oversized: { chars: 9, savedTo: null } });
+    const results: Record<string, string | ScriptToolResult> = {
+      failed: { text: 'Error: boom', isError: true },
+      // Text that merely starts like an error, the case .is_error is for.
+      textlike: { text: 'Error: a line of the file, not a failure', isError: false },
+      structured: { text: structured, isError: false, structuredJson: true },
+      oversized: { text: oversized, isError: true, structuredJson: true },
+      // A handler that returns a plain string says nothing about it.
+      plain: 'a string, nothing said',
+      // Unmarked text holding a structuredContent key is still text.
+      jsonlike: { text: '{"structuredContent": {"a": 1}}', isError: false },
+    };
+    const runner = new PyRunner({
+      onToolCall: async (_name, args) => {
+        if (args.kind === 'rejects') throw new Error('handler broke');
+        // A JS handler can resolve with what its type rules out; the call is
+        // still answered, as before this change.
+        if (args.kind === 'nothing') return undefined as unknown as string;
+        return results[String(args.kind)]!;
+      },
+    });
+    try {
+      const result = await runner.exec(
+        [
+          'import copy, json, pickle',
+          'out = {}',
+          'for kind in ["failed", "textlike", "structured", "oversized", "plain", "rejects", "jsonlike", "nothing"]:',
+          '    r = await test__echo({"kind": kind})',
+          '    out[kind] = {"text": str(r), "is_error": r.is_error, "structured": r.structured,',
+          '                 "type": type(r).__name__, "is_str": isinstance(r, str)}',
+          'r = await test__echo({"kind": "structured"})',
+          'out["parsed"] = json.loads(r)["structuredContent"]',
+          'out["copies"] = [[c.is_error, c.structured, c == r] for c in (copy.copy(r), pickle.loads(pickle.dumps(r)))]',
+          'key = await test__echo({"kind": "plain"})',
+          'try:',
+          '    await test__echo({key: 1}, extra=2)',
+          'except TypeError as e:',
+          '    out["refusal"] = str(e)',
+          'print(json.dumps(out))',
+        ].join('\n'),
+        ECHO_TOOLS,
+      );
+      assert.strictEqual(result.returnCode, 0, result.stderr);
+      const out = JSON.parse(result.stdout) as Record<string, unknown>;
+      const seen = (text: string, isError: boolean | null, value: unknown) =>
+        ({ text, is_error: isError, structured: value, type: 'ToolResult', is_str: true });
+      assert.deepStrictEqual(out.failed, seen('Error: boom', true, null));
+      assert.deepStrictEqual(out.textlike, seen('Error: a line of the file, not a failure', false, null));
+      assert.deepStrictEqual(out.structured, seen(structured, false, { rows: [1, 2] }));
+      // Marked as a structured result's object, but holding no
+      // structuredContent: none to read.
+      assert.deepStrictEqual(out.oversized, seen(oversized, true, null));
+      assert.deepStrictEqual(out.plain, seen('a string, nothing said', null, null));
+      // A handler that rejects reaches the script as an error, flagged.
+      assert.deepStrictEqual(out.rejects, seen('Error: handler broke', true, null));
+      // The string is unchanged for code that parses it itself.
+      assert.deepStrictEqual(out.parsed, { rows: [1, 2] });
+      // copy and pickle keep both attributes.
+      assert.deepStrictEqual(out.copies, [[false, { rows: [1, 2] }, true], [false, { rows: [1, 2] }, true]]);
+      assert.deepStrictEqual(out.jsonlike, seen('{"structuredContent": {"a": 1}}', false, null));
+      assert.deepStrictEqual(out.nothing, seen('', null, null));
+      // A refusal shows a key that is a tool's result as its text, the key the
+      // agent has to write, as it shows any str key.
+      assert.match(String(out.refusal), /\{'a string, nothing said': <int>, 'extra': <int>\}/);
     } finally {
       runner.dispose();
     }
@@ -858,7 +930,95 @@ async function createFrameworkWithCodeExecution(storePath: string, membrane: Moc
   });
 }
 
+/** A host variable no allowlist names, and a declared one, for the env tests below. */
+const HOST_ONLY = 'AF_CODE_EXEC_TEST_HOST_ONLY';
+const DECLARED = 'AF_CODE_EXEC_TEST_DECLARED';
+
 describe('framework code_execution integration (real python3)', () => {
+  it("a script gets codeExecution.env and not a host variable outside the allowlist", async () => {
+    const { tempDir, storePath } = tempStorePath('pytc-env-');
+    const membrane = new MockMembrane();
+    const code = `import os; print("declared:", os.environ.get("${DECLARED}"), "host:", repr(os.environ.get("${HOST_ONLY}")))`;
+    membrane.pushResponse(createMockResponse([
+      { type: 'tool_use', id: 'call_env_1', name: 'code_execution', input: { code } },
+    ], 'tool_use'));
+    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Done.' }]));
+    const framework = await AgentFramework.create({
+      storePath,
+      membrane: membrane.asMembrane(),
+      agents: [],
+      modules: [new ScriptToolModule()],
+      syncIntervalMs: 0,
+      codeExecution: { enabled: true, env: { [DECLARED]: 'from-config' } },
+    });
+    try {
+      process.env[HOST_ONLY] = 'host-value';
+      const created = await framework.createEphemeralAgent({
+        name: 'worker', model: 'test-model', systemPrompt: 'Do the task.', allowedTools: 'all',
+      });
+      created.contextManager.addMessage('user', [{ type: 'text', text: 'Go.' }]);
+      const promise = framework.runEphemeralToCompletion(created.agent, created.contextManager);
+      framework.start();
+      await promise;
+      const wireResult = membrane.lastStream!.receivedToolResults[0][0] as { content: string };
+      assert.match(wireResult.content, /declared: from-config host: None/, wireResult.content);
+    } finally {
+      await framework.stop();
+      delete process.env[HOST_ONLY];
+      rmSync(tempDir, { recursive: true, force: true });
+    }
+  });
+
+  it("with codeExecution.inheritEnv: true, a script gets the host's variables beside codeExecution.env", async () => {
+    const { tempDir, storePath } = tempStorePath('pytc-envinherit-');
+    const membrane = new MockMembrane();
+    const code = `import os; print("declared:", os.environ.get("${DECLARED}"), "host:", repr(os.environ.get("${HOST_ONLY}")))`;
+    membrane.pushResponse(createMockResponse([
+      { type: 'tool_use', id: 'call_env_2', name: 'code_execution', input: { code } },
+    ], 'tool_use'));
+    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Done.' }]));
+    const framework = await AgentFramework.create({
+      storePath,
+      membrane: membrane.asMembrane(),
+      agents: [],
+      modules: [new ScriptToolModule()],
+      syncIntervalMs: 0,
+      codeExecution: { enabled: true, env: { [DECLARED]: 'from-config' }, inheritEnv: true },
+    });
+    try {
+      process.env[HOST_ONLY] = 'host-value';
+      const created = await framework.createEphemeralAgent({
+        name: 'worker', model: 'test-model', systemPrompt: 'Do the task.', allowedTools: 'all',
+      });
+      created.contextManager.addMessage('user', [{ type: 'text', text: 'Go.' }]);
+      const promise = framework.runEphemeralToCompletion(created.agent, created.contextManager);
+      framework.start();
+      await promise;
+      const wireResult = membrane.lastStream!.receivedToolResults[0][0] as { content: string };
+      assert.match(wireResult.content, /declared: from-config host: 'host-value'/, wireResult.content);
+    } finally {
+      await framework.stop();
+      delete process.env[HOST_ONLY];
+      rmSync(tempDir, { recursive: true, force: true });
+    }
+  });
+
+  it('create() refuses a codeExecution.inheritEnv that is not a boolean', async () => {
+    const { tempDir, storePath } = tempStorePath('pytc-inherit-');
+    try {
+      await assert.rejects(AgentFramework.create({
+        storePath,
+        membrane: new MockMembrane().asMembrane(),
+        agents: [],
+        modules: [new ScriptToolModule()],
+        syncIntervalMs: 0,
+        codeExecution: { enabled: true, inheritEnv: 'false' as unknown as boolean },
+      }), /codeExecution\.inheritEnv must be true or false, unquoted, not a string: /);
+    } finally {
+      rmSync(tempDir, { recursive: true, force: true });
+    }
+  });
+
   it('synthesizes the tool only when enabled', async () => {
     const { tempDir, storePath } = tempStorePath('pytc-tools-');
     const membrane = new MockMembrane();
@@ -898,10 +1058,14 @@ describe('framework code_execution integration (real python3)', () => {
     const code = [
       'import json',
       'names = []',
+      'flags = []',
       'for m in ["alpha", "beta"]:',
-      '    r = json.loads(await test__echo({"message": m}))',
+      '    raw = await test__echo({"message": m})',
+      '    flags.append(raw.is_error)',
+      '    r = json.loads(raw)',
       '    names.append(r["echoed"]["message"].upper())',
       'print("summary:", "+".join(names))',
+      'print("is_error:", flags)',
     ].join('\n');
 
     membrane.pushResponse(createMockResponse([
@@ -941,6 +1105,9 @@ describe('framework code_execution integration (real python3)', () => {
       const wireResult = stream.receivedToolResults[0][0] as { toolUseId: string; content: string };
       assert.strictEqual(wireResult.toolUseId, 'call_ce_1');
       assert.match(wireResult.content, /summary: ALPHA\+BETA/);
+      // Through the framework, each result says it isn't an error (a
+      // handler that passed on only the string would make it None).
+      assert.match(wireResult.content, /is_error: \[False, False\]/);
       assert.match(wireResult.content, /"return_code":\s*0/);
       // ...and NOT the intermediate tool results.
       assert.ok(
@@ -1192,7 +1359,8 @@ describe('framework background scripts + spill (real python3)', () => {
     const bgCode = [
       'import asyncio',
       'await asyncio.sleep(0.2)',
-      'await wake_agent({"found": "signal"})',
+      'r = await test__echo({"message": "bg"})',
+      'await wake_agent({"found": "signal", "is_error": r.is_error})',
     ].join('\\n');
 
     // Turn 1: spawn the background script, then finish the turn.
@@ -1227,12 +1395,81 @@ describe('framework background scripts + spill (real python3)', () => {
       assert.ok(wakeMessage, 'wake message should be injected');
       const text = (wakeMessage.content[0] as { text?: string }).text ?? '';
       assert.match(text, /\[background script bg-\d+\] Woke you/);
-      assert.match(text, /line 3 of your script/);
+      assert.match(text, /line 4 of your script/);
       assert.match(text, /"found": "signal"/);
+      // A background script's results carry the flag too (None if only the
+      // string were passed on).
+      assert.match(text, /"is_error": false/);
       assert.match(text, /workspace file files\/background-scripts\/bg-\d+\.log/);
       assert.match(text, /Script status: still running|Script status/);
     } finally {
       await framework.stop();
+      rmSync(tempDir, { recursive: true, force: true });
+    }
+  });
+
+  it('a background script gets codeExecution.env and not a host variable outside the allowlist', async () => {
+    const { tempDir, storePath } = tempStorePath('pytc-bgenv-');
+    const membrane = new MockMembrane();
+    const bgCode = `import os\nawait wake_agent({"declared": os.environ.get("${DECLARED}"), "host": os.environ.get("${HOST_ONLY}")})`;
+    membrane.pushResponse(createMockResponse([
+      { type: 'tool_use', id: 'call_bgenv', name: 'code_execution', input: { code: bgCode, background: true } },
+    ], 'tool_use'));
+    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Armed.' }]));
+    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Woke.' }]));
+    const framework = await createBgFramework(storePath, membrane, { codeExecution: { env: { [DECLARED]: 'from-config' } } });
+    try {
+      process.env[HOST_ONLY] = 'host-value';
+      framework.start();
+      framework.pushEvent({
+        type: 'external-message', source: 'test', content: [{ type: 'text', text: 'arm it' }], metadata: {}, triggerInference: true,
+      } as unknown as ProcessEvent);
+      const deadline = Date.now() + 20_000;
+      let wakeText = '';
+      while (Date.now() < deadline && !wakeText) {
+        await new Promise((r) => setTimeout(r, 100));
+        const msgs = (framework.getAgent('prime')?.getContextManager().queryMessages({}).messages ?? []) as unknown as Array<{ content: ContentBlockLike[]; metadata?: { source?: string } }>;
+        const wake = msgs.find((m) => m.metadata?.source === 'background-script');
+        wakeText = (wake?.content[0] as { text?: string } | undefined)?.text ?? '';
+      }
+      assert.match(wakeText, /"declared": "from-config"/, wakeText);
+      assert.match(wakeText, /"host": null/, wakeText);
+    } finally {
+      await framework.stop();
+      delete process.env[HOST_ONLY];
+      rmSync(tempDir, { recursive: true, force: true });
+    }
+  });
+
+  it("with codeExecution.inheritEnv: true, a background script gets the host's variables beside codeExecution.env", async () => {
+    const { tempDir, storePath } = tempStorePath('pytc-bgenvinherit-');
+    const membrane = new MockMembrane();
+    const bgCode = `import os\nawait wake_agent({"declared": os.environ.get("${DECLARED}"), "host": os.environ.get("${HOST_ONLY}")})`;
+    membrane.pushResponse(createMockResponse([
+      { type: 'tool_use', id: 'call_bgenv_inherit', name: 'code_execution', input: { code: bgCode, background: true } },
+    ], 'tool_use'));
+    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Armed.' }]));
+    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Woke.' }]));
+    const framework = await createBgFramework(storePath, membrane, { codeExecution: { env: { [DECLARED]: 'from-config' }, inheritEnv: true } });
+    try {
+      process.env[HOST_ONLY] = 'host-value';
+      framework.start();
+      framework.pushEvent({
+        type: 'external-message', source: 'test', content: [{ type: 'text', text: 'arm it' }], metadata: {}, triggerInference: true,
+      } as unknown as ProcessEvent);
+      const deadline = Date.now() + 20_000;
+      let wakeText = '';
+      while (Date.now() < deadline && !wakeText) {
+        await new Promise((r) => setTimeout(r, 100));
+        const msgs = (framework.getAgent('prime')?.getContextManager().queryMessages({}).messages ?? []) as unknown as Array<{ content: ContentBlockLike[]; metadata?: { source?: string } }>;
+        const wake = msgs.find((m) => m.metadata?.source === 'background-script');
+        wakeText = (wake?.content[0] as { text?: string } | undefined)?.text ?? '';
+      }
+      assert.match(wakeText, /"declared": "from-config"/, wakeText);
+      assert.match(wakeText, /"host": "host-value"/, wakeText);
+    } finally {
+      await framework.stop();
+      delete process.env[HOST_ONLY];
       rmSync(tempDir, { recursive: true, force: true });
     }
   });
@@ -1336,6 +1573,51 @@ describe('framework background scripts + spill (real python3)', () => {
     } finally {
       await framework.stop();
       rmSync(tempDir, { recursive: true, force: true });
+    }
+  });
+
+  it('a dead script\'s last output is cut at 2000 units without halving a surrogate pair', async () => {
+    // 1500 emoji, then the traceback. Whichever parity the cut 2000 units
+    // from the end has, one of the two runs (with or without one more unit
+    // after the emoji) puts it on a pair's second half.
+    for (const after of ['', 'x']) {
+      const { tempDir, storePath } = tempStorePath('pytc-bgpair-');
+      const membrane = new MockMembrane();
+      membrane.pushResponse(createMockResponse([{ type: 'text', text: 'noted' }]));
+      const framework = await createBgFramework(storePath, membrane, {});
+      try {
+        framework.start();
+        const started = await framework.executeToolCall({
+          id: 'c1',
+          name: 'code_execution',
+          input: {
+            code: `import asyncio\nprint("\\U0001F600" * 1500 + "${after}", flush=True)\nawait asyncio.sleep(0.1)\nraise ValueError("done")`,
+            background: true,
+          },
+          callerAgentName: 'prime',
+        });
+        assert.strictEqual(started.success, true, JSON.stringify(started));
+
+        const deadline = Date.now() + 20_000;
+        let crashMessage: { content: ContentBlockLike[] } | null = null;
+        while (Date.now() < deadline && !crashMessage) {
+          await new Promise((r) => setTimeout(r, 100));
+          const cm = framework.getAgent('prime')?.getContextManager();
+          const msgs = (cm?.queryMessages({}).messages ?? []) as unknown as Array<{ content: ContentBlockLike[]; metadata?: { source?: string } }>;
+          crashMessage = msgs.find((m) => m.metadata?.source === 'background-script') ?? null;
+        }
+        assert.ok(crashMessage, 'crash wake should be injected');
+        const text = (crashMessage.content[0] as { text?: string }).text ?? '';
+        // A halved pair would be stored as U+FFFD, or kept as a lone surrogate.
+        const last = text.split('Last output:\n')[1] ?? '';
+        assert.ok(last.startsWith('\u{1F600}'),
+          `the last output starts on a whole emoji (after ${JSON.stringify(after)}): ${JSON.stringify(last.slice(0, 4))}`);
+        assert.ok(!text.includes('\ufffd') && !/[\ud800-\udbff](?![\udc00-\udfff])|(?<![\ud800-\udbff])[\udc00-\udfff]/.test(text),
+          `no half of a pair (after ${JSON.stringify(after)})`);
+      } finally {
+        await framework.stop();
+        rmSync(tempDir, { recursive: true, force: true });
+      }
     }
   });
 
@@ -1578,7 +1860,7 @@ describe('code_execution per-call time limit (time_limit_ms)', () => {
     ]);
   });
 
-  it('create() refuses a codeExecution that is not an object, which would read as off', async () => {
+  it('create() refuses a codeExecution that is not an object, null or false, since it would read as off', async () => {
     await assertRefused([
       [true, 'codeExecution must be an object, such as { enabled: true }, not a boolean'],
       ['true', 'codeExecution must be an object, such as { enabled: true }, not a string'],
@@ -1586,14 +1868,17 @@ describe('code_execution per-call time limit (time_limit_ms)', () => {
     ]);
   });
 
-  it('a null or left-out codeExecution.enabled counts as off, and a configuration that is off has nothing else checked', async () => {
-    // Contradictory limits are refused only once code execution is on.
+  it('a null or false codeExecution, or a null or left-out codeExecution.enabled, counts as off, and a configuration that is off has nothing else checked', async () => {
+    // Contradictory limits, and an env or inheritEnv that would be refused,
+    // are checked only once code execution is on.
     const contradictory = { scriptTimeoutMs: 600_000, maxScriptTimeoutMs: 60_000 };
     for (const codeExecution of [
       null,
+      false,
       { enabled: null, ...contradictory },
       { enabled: false, ...contradictory },
       { ...contradictory },
+      { enabled: false, inheritEnv: 'true', env: 7 },
     ]) {
       const { tempDir, storePath } = tempStorePath('pytc-enabled-off-');
       let framework: AgentFramework | undefined;

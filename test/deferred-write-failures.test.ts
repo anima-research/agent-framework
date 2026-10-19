@@ -286,7 +286,7 @@ test('a queue over the cap is refused by a quiesce() without abandon, with the h
       message: `quiesce refused: the queue's 1 deferred context write(s) come to more than 4194304 characters of JSON, ` +
         `the cap, so ${h.queuePath} can't hold them, and a restart would lose them. Quiesce again once they have landed, ` +
         'or quiesce with abandon: true to end the turns they wait for, then resume so they land, and quiesce again. ' +
-        "The abandon's answer lists a turn it can't end as unabandonable, and its writes land once it has ended and " +
+        "The abandon's answer lists a turn it hasn't ended within its grace as unabandonable, and its writes land once it has ended and " +
         'the host is serving.',
     });
     assert.equal(h.framework.getHostModeStatus().quiesced, false, 'the host is still serving');
@@ -302,7 +302,7 @@ test('a queue over the cap is refused by a quiesce() without abandon, with the h
       message: `quiesce refused: the queue's 2 deferred context write(s) come to more than 4194304 characters of JSON, ` +
         `the cap, so ${h.queuePath} can't hold them, and a restart would lose them. Resume so they land, then quiesce ` +
         'again. A write held for a turn still alive stays queued through a resume, so to end a turn that won\'t, ' +
-        "quiesce with abandon: true before resuming. The abandon's answer lists a turn it can't end as unabandonable, " +
+        "quiesce with abandon: true before resuming. The abandon's answer lists a turn it hasn't ended within its grace as unabandonable, " +
         'and its writes land once it has ended and the host is serving.',
     });
     assert.equal(h.framework.getHostModeStatus().quiesced, true, 'still quiesced');

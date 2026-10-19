@@ -1,10 +1,12 @@
 // Packs this package as `npm publish` packs it, installs the tarball alone
 // into an empty directory with its dependencies from the registry, and
 // checks, under the Node that runs this, what the installed package.json
-// offers. The install is nested (npm's --install-strategy nested), which is
-// stricter than npm's default: the package reaches only its own
-// dependencies, so a package it imports but only devDependencies lists
-// fails to load even when another dependency brings that package in.
+// offers. The install is linked (npm's --install-strategy linked), which is
+// stricter than npm's default: each package reaches only the dependencies
+// it declares, so a package it imports but only devDependencies lists fails
+// to load, even when another dependency depends on that package or asks
+// for it as a peer. It needs Node 20.10 or later, for its bin load hook and
+// a JSON target's import attribute.
 //   - every file its `main`, `types` (or `typings`), `exports` and `bin`
 //     name is in the package: each `exports` target under every condition
 //     (the `bun` and `types` targets too), at least one file for each export
@@ -34,40 +36,59 @@ import { tmpdir } from "node:os";
 import { join, relative } from "node:path";
 import { pathToFileURL } from "node:url";
 
-const LOAD_TIMEOUT_MS = 60_000;
+// The limits of npm pack and npm install, and of each load, which
+// PACK_INSTALLS_ALONE_INSTALL_TIMEOUT_MS and
+// PACK_INSTALLS_ALONE_LOAD_TIMEOUT_MS set in milliseconds. A child that
+// outlives its limit is killed, not asked to stop. What it started itself
+// isn't killed with it: in CI, the job's timeout-minutes ends that.
 const INSTALL_TIMEOUT_MS = 10 * 60_000;
+const LOAD_TIMEOUT_MS = 60_000;
 // What the load hook makes an ES module bin throw once its imports have
 // loaded, and what it throws in place of loading a bin that isn't one.
 const LINKED = "__pack_installs_alone_linked__";
 const NOT_MODULE = "__pack_installs_alone_not_module__";
-const HOOK = `export async function load(url, context, nextLoad) {
-  const result = await nextLoad(url, context);
-  if (url !== process.env.PACK_INSTALLS_ALONE_BIN) return result;
-  // A CommonJS bin's requires run with its code, so it isn't loaded at all.
-  if (result.format !== "module") throw new Error("${NOT_MODULE}");
-  // Only a bin whose first line starts with '#!' gets here.
-  const lines = String(result.source).split("\\n");
-  lines.splice(1, 0, 'throw "${LINKED}";');
-  return { ...result, source: lines.join("\\n") };
+const HOOK = `export function load(url, context, nextLoad) {
+  const patch = (result) => {
+    if (url !== process.env.PACK_INSTALLS_ALONE_BIN) return result;
+    // A CommonJS bin's requires run with its code, so it isn't loaded at all.
+    if (result.format !== "module") throw new Error("${NOT_MODULE}");
+    // Only a bin whose first line starts with '#!' gets here.
+    const lines = String(result.source).split("\\n");
+    lines.splice(1, 0, 'throw "${LINKED}";');
+    return { ...result, source: lines.join("\\n") };
+  };
+  // registerHooks' nextLoad answers at once, register's with a promise.
+  const result = nextLoad(url, context);
+  return typeof result?.then === "function" ? result.then(patch) : patch(result);
 }
+`;
+// Installs the hook: registerHooks where Node has it (from 22.15 and 23.5),
+// since Node 26 deprecates register, which Node 20.6 brought.
+const REGISTER = (hook) => `import * as m from "node:module";
+if (m.registerHooks) m.registerHooks({ load: (await import(${JSON.stringify(hook)})).load });
+else m.register(${JSON.stringify(hook)});
 `;
 
 class CheckError extends Error {}
 
 /** The target a set of conditions picks from an exports value, as Node
  *  resolves it: the first key, in order, that is active or `default`. A
- *  `null` it reaches blocks the subpath for those conditions, so it answers
- *  null, which stops the search as Node's does; undefined means no key
- *  matched. */
+ *  `null` it reaches, or an empty array, blocks the subpath for those
+ *  conditions, so it answers null, which stops the search as Node's does,
+ *  though inside an array Node goes on to the next item; undefined means no
+ *  key matched. */
 function pick(value, conditions) {
   if (value === null) return null;
   if (typeof value === "string") return value;
   if (Array.isArray(value)) {
+    if (value.length === 0) return null;
+    let blocked;
     for (const item of value) {
       const found = pick(item, conditions);
-      if (found !== undefined) return found;
+      if (typeof found === "string") return found;
+      if (found === null) blocked = null;
     }
-    return undefined;
+    return blocked;
   }
   if (value && typeof value === "object") {
     for (const [key, inner] of Object.entries(value)) {
@@ -132,13 +153,25 @@ function bunOnPath() {
 /** Runs a command with its output going to ours; a failure throws `message`. */
 function run(file, args, options, message) {
   try {
-    execFileSync(file, args, { stdio: ["ignore", "inherit", "inherit"], ...options });
+    execFileSync(file, args, { stdio: ["ignore", "inherit", "inherit"], killSignal: "SIGKILL", ...options });
   } catch (error) {
     throw new CheckError(error?.code === "ETIMEDOUT" ? `${message.split(" (")[0]}: it didn't finish within ${options.timeout / 1000} s.` : message);
   }
 }
 
+/** A limit in milliseconds from the environment, or `fallback` where it's unset or empty. */
+function millis(name, fallback) {
+  const value = process.env[name];
+  if (value === undefined || value === "") return fallback;
+  if (!/^[1-9][0-9]*$/.test(value)) {
+    throw new CheckError(`${name} is '${value}': give it a positive whole number of milliseconds.`);
+  }
+  return Number(value);
+}
+
 function main() {
+  const installTimeoutMs = millis("PACK_INSTALLS_ALONE_INSTALL_TIMEOUT_MS", INSTALL_TIMEOUT_MS);
+  const loadTimeoutMs = millis("PACK_INSTALLS_ALONE_LOAD_TIMEOUT_MS", LOAD_TIMEOUT_MS);
   const source = JSON.parse(readFileSync("package.json", "utf8"));
   const unbuilt = namedFiles(source).filter(([path]) => !existsSync(path));
   if (unbuilt.length > 0) {
@@ -157,10 +190,14 @@ function main() {
         encoding: "utf8",
         stdio: ["ignore", "pipe", "inherit"],
         maxBuffer: 64 * 1024 * 1024,
+        timeout: installTimeoutMs,
+        killSignal: "SIGKILL",
       });
     } catch (error) {
       if (error?.stdout) process.stderr.write(error.stdout);
-      throw new CheckError("npm pack failed (its output is above).");
+      throw new CheckError(
+        error?.code === "ETIMEDOUT" ? `npm pack didn't finish within ${installTimeoutMs / 1000} s.` : "npm pack failed (its output is above).",
+      );
     }
     // npm 11 prints an array of records, npm 12 an object keyed by name.
     let records;
@@ -182,8 +219,8 @@ function main() {
     writeFileSync(join(dir, "package.json"), JSON.stringify({ name: "pack-installs-alone", private: true }));
     run(
       "npm",
-      ["install", "--no-audit", "--no-fund", "--no-package-lock", "--install-strategy=nested", tarball],
-      { cwd: dir, timeout: INSTALL_TIMEOUT_MS },
+      ["install", "--no-audit", "--no-fund", "--no-package-lock", "--install-strategy=linked", tarball],
+      { cwd: dir, timeout: installTimeoutMs },
       `${packed.filename} didn't install on its own into an empty directory (npm's output is above). A dependency ` +
         "that isn't on the registry does that, or a registry or network error, which a re-run gets past.",
     );
@@ -197,7 +234,7 @@ function main() {
     const missing = named.filter(([path]) => !existsSync(join(installed, path)));
     // A consumer's TypeScript reads the declaration beside each module it
     // reaches, so a package with types carries the one the build wrote
-    // beside each module it packs. A named one was checked above.
+    // beside each `.js` it packs. A named one was checked above.
     if (typeof pkg.types === "string" || typeof pkg.typings === "string" || hasCondition(pkg.exports, "types")) {
       const checked = new Set([...files, ...named.map(([path]) => relative(".", path))]);
       for (const file of files) {
@@ -234,8 +271,12 @@ function main() {
     for (const [key, value] of roots) {
       if (key.includes("*")) continue;
       const specifier = key === "." ? pkg.name : `${pkg.name}${key.slice(1)}`;
-      const imported = pick(value, ["node", "import"]);
-      const required = pick(value, ["node", "require"]);
+      // Node also matches `node-addons`, unless it runs with --no-addons,
+      // which none of the loads here does, and `module-sync` where it can
+      // require ES modules.
+      const also = ["node-addons", ...(process.features?.require_module ? ["module-sync"] : [])];
+      const imported = pick(value, ["node", "import", ...also]);
+      const required = pick(value, ["node", "require", ...also]);
       if (typeof imported === "string") loads.push([specifier, imported.endsWith(".json") ? "import json" : "import"]);
       if (typeof required === "string" && required !== imported) loads.push([specifier, "require"]);
     }
@@ -247,7 +288,7 @@ function main() {
       run(
         process.execPath,
         how === "require" ? ["-e", code] : ["--input-type=module", "-e", code],
-        { cwd: dir, timeout: LOAD_TIMEOUT_MS },
+        { cwd: dir, timeout: loadTimeoutMs },
         `loading '${specifier}' (${how}) from the installed ${packed.filename} failed (above). A dependency only ` +
           "devDependencies supplied does that, as does a file it imports that the package leaves out, or a " +
           "dependency's new release (rerun this on main to tell).",
@@ -266,8 +307,8 @@ function main() {
       run(
         "bun",
         ["-e", `await import(${JSON.stringify(specifier)}); process.exit(0);`],
-        { cwd: dir, timeout: LOAD_TIMEOUT_MS },
-        `loading '${specifier}' under bun from the installed ${packed.filename} failed (above). ` +
+        { cwd: dir, timeout: loadTimeoutMs },
+        `loading '${specifier}' under bun (from the installed ${packed.filename}) failed, as its output above shows. ` +
           "A file it imports that the package leaves out does that, a dependency only devDependencies supplied, or " +
           "a dependency's new release (rerun this on main to tell).",
       );
@@ -295,11 +336,12 @@ function main() {
       const hook = join(work, "bin-hook.mjs");
       const register = join(work, "bin-register.mjs");
       writeFileSync(hook, HOOK);
-      writeFileSync(register, `import { register } from "node:module";\nregister(${JSON.stringify(pathToFileURL(hook).href)});\n`);
+      writeFileSync(register, REGISTER(pathToFileURL(hook).href));
       const loaded = spawnSync(process.execPath, ["--import", pathToFileURL(register).href, file], {
         cwd: dir,
         encoding: "utf8",
-        timeout: LOAD_TIMEOUT_MS,
+        timeout: loadTimeoutMs,
+        killSignal: "SIGKILL",
         env: { ...process.env, PACK_INSTALLS_ALONE_BIN: pathToFileURL(realpathSync(file)).href },
       });
       const stderr = `${loaded.stderr ?? ""}`;
@@ -315,7 +357,7 @@ function main() {
       process.stderr.write(stderr);
       throw new CheckError(
         loaded.error?.code === "ETIMEDOUT"
-          ? `loading bin '${bin}' (${path}) in ${packed.filename} didn't finish within ${LOAD_TIMEOUT_MS / 1000} s.`
+          ? `loading bin '${bin}' (${path}) in ${packed.filename} didn't finish within ${loadTimeoutMs / 1000} s.`
           : `bin '${bin}' (${path}) in ${packed.filename} doesn't load (above): a package it imports that only ` +
               "devDependencies supplies does that, as does a file the package leaves out, a syntax error, or a " +
               "dependency's new release (rerun this on main to tell).",

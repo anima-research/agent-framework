@@ -12,6 +12,7 @@ import { MockMembrane } from './helpers/mock-membrane.js';
 
 const ENV_KEY = 'DISCORD_SUPPRESSED_REACTIONS_BASELINE';
 const FIXTURE = fileURLToPath(new URL('./fixtures/reaction-baseline-mcpl-server.mjs', import.meta.url));
+const MODERN_FIXTURE = fileURLToPath(new URL('./fixtures/modern-mcp-server.mjs', import.meta.url));
 
 function server(overrides: Partial<McplServerConfig> = {}): McplServerConfig {
   return { id: 'probe', command: process.execPath, args: [FIXTURE], ...overrides };
@@ -140,13 +141,23 @@ describe('placed-reaction baseline', () => {
     assert.deepEqual(config.env, { BASELINE_TEST_EXTRA: 'preserved' }, 'caller config stays unchanged');
   });
 
-  for (const transport of [undefined, 'stdio'] as const) {
-    it('injects the baseline with command + URL and ' + (transport ?? 'implicit') + ' transport', async () => {
-      const fw = await create('🔕', [server({ url: 'ws://127.0.0.1:1', transport })]);
-      const env = await childEnv(fw);
-      assert.deepEqual(new Set(env.baseline?.split(',')), new Set([...REFUSAL_REACTION_BASELINE, '💤', '🔕']));
-    });
-  }
+  it('injects the baseline with command + URL and stdio transport', async () => {
+    const fw = await create('🔕', [server({ url: 'ws://127.0.0.1:1', transport: 'stdio' })]);
+    const env = await childEnv(fw);
+    assert.deepEqual(new Set(env.baseline?.split(',')), new Set([...REFUSAL_REACTION_BASELINE, '💤', '🔕']));
+  });
+
+  it('refuses command + URL with no transport before spawning anything', async () => {
+    // Which of the two the configuration means is ambiguous, so its binding
+    // is refused: nothing is launched, and no baseline is derived for it.
+    const fw = await create('🔕');
+    await assert.rejects(
+      () => fw.connectMcplServer(server({ url: 'ws://127.0.0.1:1' })),
+      /"command" and "url" are both set, and no "transport" says which one to use/,
+    );
+    const registry = (fw as unknown as { mcplServerRegistry: { getServer(id: string): unknown } | null }).mcplServerRegistry;
+    assert.equal(registry?.getServer('probe') ?? null, null, 'nothing is registered or spawned');
+  });
 
   it('derives the default on runtime connect, including newly retained ledger markers', async () => {
     const fw = await create('🔕');
@@ -278,6 +289,58 @@ describe('placed-reaction baseline', () => {
     assert.ok(env.baseline?.split(',').includes('🫥'), `the respawned child has the marker retained since: ${env.baseline}`);
   });
 
+  it("a reconnect while the ledger can't be read fails as a reconnect, and the child comes back once it can", async (t) => {
+    const logged: string[] = [];
+    t.mock.method(console, 'error', (...args: unknown[]) => { logged.push(args.map(String).join(' ')); });
+    const fw = await create(undefined, [server({ reconnect: true, reconnectIntervalMs: 20, reconnectMaxIntervalMs: 20 })]);
+    const connection = (fw as unknown as {
+      mcplServerRegistry: { getServer(id: string): {
+        isConnected: boolean;
+        sendToolsCall(name: string, args: {}): Promise<unknown>;
+        on(event: 'reconnect-failed', listener: (params: { error: string }) => void): void;
+      } };
+    }).mcplServerRegistry.getServer('probe');
+    const failures: string[] = [];
+    connection.on('reconnect-failed', ({ error }) => { failures.push(error); });
+    writeFileSync(outboxPath, '{broken');
+    // Each spawn reads the ledger for the child's default, so a reconnect
+    // fails there, and its failure is recorded with the same configuration.
+    await connection.sendToolsCall('crash', {}).catch(() => {});
+    const waitFor = async (condition: () => boolean, what: string): Promise<void> => {
+      const deadline = Date.now() + 5_000;
+      while (!condition()) {
+        assert.ok(Date.now() < deadline, `timed out waiting for ${what}`);
+        await new Promise((resolve) => setTimeout(resolve, 20));
+      }
+    };
+    await waitFor(() => logged.some((line) => line.startsWith('MCPL server "probe" reconnect failed: ')), 'a failed reconnect to be logged');
+    assert.ok(
+      logged.includes(`MCPL server "probe" reconnect failed: [withheld: the server's configuration couldn't be read to redact this]`),
+      logged.join('\n'),
+    );
+    // The failure is reported, with its cause, for the framework to record.
+    assert.match(failures[0] ?? '', /reaction-baseline ledger read/);
+    // The attempts go on, so the child comes back once the ledger reads.
+    rmSync(outboxPath, { force: true });
+    await waitFor(() => connection.isConnected, 'the child to come back');
+    assert.ok((await childEnv(fw)).baseline, 'the respawned child answers, with a default');
+  });
+
+  it("startup goes on past a server whose configuration a host passed can't be read, and logs its failed connect withheld", async (t) => {
+    const logged: string[] = [];
+    t.mock.method(console, 'error', (...args: unknown[]) => { logged.push(args.map(String).join(' ')); });
+    // The connect reads env for the child's default, and fails; startup's
+    // catch for it records the failure with the same configuration.
+    const unreadable = server();
+    Object.defineProperty(unreadable, 'env', { enumerable: true, get() { throw new Error('the host cannot read it'); } });
+    const fw = await create(undefined, [unreadable]);
+    assert.ok(
+      logged.includes(`Failed to connect MCPL server "probe": [withheld: the server's configuration couldn't be read to redact this]`),
+      logged.join('\n'),
+    );
+    assert.equal(fw.listMcplServers().some((s) => s.connected), false);
+  });
+
   for (const own of [undefined, '🟪']) {
     it(`a restart refuses on a corrupt ledger and leaves the child up (${own ? 'its own baseline' : 'the default'})`, async () => {
       // Every connect reads the ledger at its awareness barrier, so a server
@@ -289,6 +352,22 @@ describe('placed-reaction baseline', () => {
       assert.ok(await childEnv(fw).catch(() => undefined), 'the running child still answers');
     });
   }
+
+  it('a modern server connects and restarts on a corrupt ledger, which it never reads', async () => {
+    // A modern connection has no awareness barrier and no reaction default,
+    // so the ledger is no reason of its own to refuse it.
+    const fw = await create();
+    const modern = (id: string): McplServerConfig => ({
+      id, command: process.execPath, args: [MODERN_FIXTURE, join(dir, `${id}-starts.log`), join(dir, `${id}-events.log`)], protocol: 'modern',
+    });
+    await fw.connectMcplServer(modern('modern'));
+    writeFileSync(outboxPath, '{broken');
+    await fw.restartMcplServer('modern');
+    await fw.connectMcplServer(modern('second'));
+    assert.deepEqual(fw.listMcplServers().map((s) => [s.id, s.connected]).sort(), [['modern', true], ['second', true]]);
+    // A legacy connect still refuses on it.
+    await assert.rejects(() => fw.connectMcplServer(server()), accountingRefusal);
+  });
 
   it('passes a URL-only WebSocket config through unchanged', async () => {
     const fw = await create();

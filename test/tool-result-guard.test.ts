@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { PassthroughStrategy, type StoredMessage, type StrategyContext } from '@animalabs/context-manager';
 import type { ContentBlock, Membrane, NormalizedRequest, NormalizedResponse, YieldingStreamOptions } from '@animalabs/membrane';
-import { Membrane as RealMembrane, NativeFormatter, type ProviderAdapter, type ProviderRequest,
+import { MembraneError, Membrane as RealMembrane, NativeFormatter, type ProviderAdapter, type ProviderRequest,
   type ProviderResponse, type StreamCallbacks } from '@animalabs/membrane';
 import { AgentFramework, type AgentConfig, type AgentSettingsExtension, type Module, type ModuleContext,
   type ToolCall, type ToolResult, type ProcessEvent, type ProcessState } from '../src/index.js';
@@ -116,6 +116,23 @@ function extension(framework: AgentFramework): AgentSettingsExtension {
 function toolResults(framework: AgentFramework) {
   return framework.getAgent('assistant')!.getContextManager().getAllMessages()
     .flatMap((message) => message.content.filter((block) => block.type === 'tool_result'));
+}
+
+/**
+ * A registry stub's routeSpeech, also offered as the outcome-returning
+ * deliverSpeech that explicit and hybrid delivery post through.
+ */
+function withDeliverSpeech<T extends Record<string, unknown>>(stub: T): T {
+  const route = stub.routeSpeech as (agent: string, text: string, channelId: string) => Promise<{ delivered?: boolean; channelId?: string } | undefined>;
+  return Object.assign(stub, {
+    deliverSpeech: async (agent: string, text: string, channelId: string) => {
+      const result = await route(agent, text, channelId);
+      return result?.delivered
+        ? { status: 'delivered', destination: { serverId: 'stub', channelId: result.channelId ?? channelId }, at: Date.now() }
+        : { status: 'failed', destination: { serverId: 'stub', channelId }, reason: 'the stub reported delivered: false', at: Date.now() };
+    },
+    resolveDestination: ({ channelId }: { channelId: string }) => ({ destination: { serverId: 'stub', channelId } }),
+  });
 }
 
 test('default off retains existing refusal behavior and original tool output', async () => {
@@ -330,7 +347,7 @@ test('native Membrane observes the first refusal even when guard is enabled by a
   });
   const routed: string[] = [];
   const outgoing: string[] = [];
-  (framework as unknown as { channelRegistry: unknown }).channelRegistry = new Proxy({
+  (framework as unknown as { channelRegistry: unknown }).channelRegistry = new Proxy(withDeliverSpeech({
     resolveLocus: () => 'world:test',
     routeSpeech: async (_agent: string, speech: string) => {
       routed.push(speech); return { delivered: true, channelId: 'world:test' };
@@ -338,7 +355,7 @@ test('native Membrane observes the first refusal even when guard is enabled by a
     sendOutgoingChunk: (_channel: string, _agent: string, _id: string, _index: number, delta: string) => { outgoing.push(delta); },
     getDefaultPublishChannel: () => null, isChannelOpen: () => true,
     getDescriptor: () => undefined, getChannelTools: () => [],
-  }, { get: (target, key: string) => key in target ? (target as Record<string, unknown>)[key] : () => undefined });
+  }), { get: (target, key: string) => key in target ? (target as Record<string, unknown>)[key] : () => undefined });
   const tokenTraces: string[] = [];
   framework.onTrace((event) => {
     if (event.type === 'inference:tokens') tokenTraces.push(String((event as { content?: unknown }).content));
@@ -371,7 +388,7 @@ test('explicit mode: a guard retry streams on to the sticky destination delivery
   ], { toolResultGuard: true, proseRouting: 'explicit', refusalHandling: { retries: 3 } });
   const routed: Array<{ text: string; channelId: string }> = [];
   const streamed: Array<{ channelId: string; delta: string }> = [];
-  (h.framework as unknown as { channelRegistry: unknown }).channelRegistry = new Proxy({
+  (h.framework as unknown as { channelRegistry: unknown }).channelRegistry = new Proxy(withDeliverSpeech({
     resolveProseTarget: (spec: string) => spec === '#alpha' ? { channelId: 'chan-alpha' } : { error: `no channel ${spec}` },
     routeSpeech: async (_agent: string, speech: string, channelId: string) => {
       routed.push({ text: speech, channelId }); return { delivered: true, channelId };
@@ -381,7 +398,7 @@ test('explicit mode: a guard retry streams on to the sticky destination delivery
     },
     getDefaultPublishChannel: () => null, isChannelOpen: () => true,
     getDescriptor: () => undefined, getChannelTools: () => [],
-  }, { get: (target, key: string) => key in target ? (target as Record<string, unknown>)[key] : () => undefined });
+  }), { get: (target, key: string) => key in target ? (target as Record<string, unknown>)[key] : () => undefined });
   try {
     await h.run();
     assert.equal(h.membrane.requests.length, 2, 'the guard retried once');
@@ -446,7 +463,7 @@ test('explicit mode: a budget restart streams on to the destination the turn las
   h.framework.onTrace((event) => {
     if (event.type === 'inference:stream_restarted') restarts.push(String((event as { reason?: string }).reason));
   });
-  (h.framework as unknown as { channelRegistry: unknown }).channelRegistry = new Proxy({
+  (h.framework as unknown as { channelRegistry: unknown }).channelRegistry = new Proxy(withDeliverSpeech({
     resolveProseTarget: (spec: string) => spec === '#alpha' ? { channelId: 'chan-alpha' }
       : spec === '#cafe' ? { channelId: 'chan-cafe' } : { error: `no channel ${spec}` },
     routeSpeech: async (_agent: string, text: string, channelId: string) => {
@@ -460,7 +477,7 @@ test('explicit mode: a budget restart streams on to the destination the turn las
     },
     getDefaultPublishChannel: () => null, isChannelOpen: () => true,
     getDescriptor: () => undefined, getChannelTools: () => [],
-  }, { get: (target, key: string) => key in target ? (target as Record<string, unknown>)[key] : () => undefined });
+  }), { get: (target, key: string) => key in target ? (target as Record<string, unknown>)[key] : () => undefined });
   try {
     await h.run();
     assert.equal(h.membrane.requests.length, 2);
@@ -506,7 +523,7 @@ test("explicit mode: a private round's prefix doesn't move where a budget restar
   h.framework.onTrace((event) => {
     if (event.type === 'inference:stream_restarted') restarts.push(String((event as { reason?: string }).reason));
   });
-  (h.framework as unknown as { channelRegistry: unknown }).channelRegistry = new Proxy({
+  (h.framework as unknown as { channelRegistry: unknown }).channelRegistry = new Proxy(withDeliverSpeech({
     resolveProseTarget: (spec: string) => spec === '#alpha' ? { channelId: 'chan-alpha' }
       : spec === '#cafe' ? { channelId: 'chan-cafe' } : { error: `no channel ${spec}` },
     routeSpeech: async (_agent: string, text: string, channelId: string) => {
@@ -519,7 +536,7 @@ test("explicit mode: a private round's prefix doesn't move where a budget restar
     handleChannelToolCall: async () => ({ success: true, data: { noted: true } }),
     getDefaultPublishChannel: () => null, isChannelOpen: () => true, getDescriptor: () => undefined,
     getChannelTools: () => [{ name: 'think', description: 'Reason privately', inputSchema: { type: 'object', properties: { content: { type: 'string' } } } }],
-  }, { get: (target, key: string) => key in target ? (target as Record<string, unknown>)[key] : () => undefined });
+  }), { get: (target, key: string) => key in target ? (target as Record<string, unknown>)[key] : () => undefined });
   try {
     await h.run();
     assert.equal(h.membrane.requests.length, 2);
@@ -584,7 +601,7 @@ async function heldRestart(mode: 'explicit' | 'locus', texts: { first: string; s
     }
     return stream;
   };
-  (h.framework as unknown as { channelRegistry: unknown }).channelRegistry = new Proxy({
+  (h.framework as unknown as { channelRegistry: unknown }).channelRegistry = new Proxy(withDeliverSpeech({
     resolveProseTarget: (spec: string) => spec === '#alpha' ? { channelId: 'chan-alpha' }
       : spec === '#cafe' ? { channelId: directory.cafe } : { error: `no channel ${spec}` },
     routeSpeech: async (_agent: string, text: string, channelId: string | null) => {
@@ -597,7 +614,7 @@ async function heldRestart(mode: 'explicit' | 'locus', texts: { first: string; s
     },
     getDefaultPublishChannel: () => null, isChannelOpen: () => true,
     getDescriptor: () => undefined, getChannelTools: () => [],
-  }, { get: (target, key: string) => key in target ? (target as Record<string, unknown>)[key] : () => undefined });
+  }), { get: (target, key: string) => key in target ? (target as Record<string, unknown>)[key] : () => undefined });
   const restarts: string[] = [];
   h.framework.onTrace((event) => {
     if (event.type === 'inference:stream_restarted') restarts.push(String((event as { reason?: string }).reason));
@@ -657,7 +674,7 @@ test("locus mode: a resumed stream's deliveries queue behind the turn's earlier 
 function explicitRegistry(h: Awaited<ReturnType<typeof harness>>) {
   const routed: Array<{ text: string; channelId: string }> = [];
   const streamed: Array<{ channelId: string; delta: string }> = [];
-  (h.framework as unknown as { channelRegistry: unknown }).channelRegistry = new Proxy({
+  (h.framework as unknown as { channelRegistry: unknown }).channelRegistry = new Proxy(withDeliverSpeech({
     resolveProseTarget: (spec: string) => spec === '#alpha' ? { channelId: 'chan-alpha' }
       : spec === '#cafe' ? { channelId: 'chan-cafe' } : { error: `no channel ${spec}` },
     routeSpeech: async (_agent: string, text: string, channelId: string) => {
@@ -670,7 +687,7 @@ function explicitRegistry(h: Awaited<ReturnType<typeof harness>>) {
     handleChannelToolCall: async () => ({ success: true, data: { noted: true } }),
     getDefaultPublishChannel: () => null, isChannelOpen: () => true, getDescriptor: () => undefined,
     getChannelTools: () => [{ name: 'think', description: 'Reason privately', inputSchema: { type: 'object', properties: { content: { type: 'string' } } } }],
-  }, { get: (target, key: string) => key in target ? (target as Record<string, unknown>)[key] : () => undefined });
+  }), { get: (target, key: string) => key in target ? (target as Record<string, unknown>)[key] : () => undefined });
   return { routed, streamed };
 }
 
@@ -847,12 +864,12 @@ test("a fresh turn and its restart wait behind the earlier turn's speech chain",
     if (text.trim() === 'earlier') await held;
     return { delivered: true, channelId };
   };
-  (h.framework as unknown as { channelRegistry: unknown }).channelRegistry = new Proxy({
+  (h.framework as unknown as { channelRegistry: unknown }).channelRegistry = new Proxy(withDeliverSpeech({
     resolveProseTarget: (spec: string) => spec === '#alpha' ? { channelId: 'chan-alpha' } : { error: 'unknown channel' },
     routeSpeech,
     getDefaultPublishChannel: () => null, isChannelOpen: () => true,
     getDescriptor: () => undefined, getChannelTools: () => [],
-  }, { get: (target, key: string) => key in target ? (target as Record<string, unknown>)[key] : () => undefined });
+  }), { get: (target, key: string) => key in target ? (target as Record<string, unknown>)[key] : () => undefined });
   const prior = routeSpeech('assistant', 'earlier', 'chan-alpha').then(() => {});
   (h.framework as unknown as { proseSpeechChains: Map<string, Promise<void>> })
     .proseSpeechChains.set('assistant', prior);
@@ -902,7 +919,7 @@ test("explicit: a restarted turn whose last response is empty checks for its ' !
   let release!: () => void;
   const held = new Promise<void>((resolve) => { release = resolve; });
   const routed: string[] = [];
-  (h.framework as unknown as { channelRegistry: unknown }).channelRegistry = new Proxy({
+  (h.framework as unknown as { channelRegistry: unknown }).channelRegistry = new Proxy(withDeliverSpeech({
     resolveProseTarget: (spec: string) => spec === '#alpha' ? { channelId: 'chan-alpha' } : { error: `no channel ${spec}` },
     resolveLocus: () => 'chan-locus',
     routeSpeech: async (_agent: string, text: string, channelId: string) => {
@@ -912,7 +929,7 @@ test("explicit: a restarted turn whose last response is empty checks for its ' !
     },
     getDefaultPublishChannel: () => null, isChannelOpen: () => true,
     getDescriptor: () => undefined, getChannelTools: () => [],
-  }, { get: (target, key: string) => key in target ? (target as Record<string, unknown>)[key] : () => undefined });
+  }), { get: (target, key: string) => key in target ? (target as Record<string, unknown>)[key] : () => undefined });
   const internals = h.framework as unknown as {
     requestProseContinuation(agent: unknown, routing: { continuation: boolean }): void;
   };
@@ -958,7 +975,7 @@ test("hybrid: a restarted turn whose last response is empty writes its receipt a
   let release!: () => void;
   const held = new Promise<void>((resolve) => { release = resolve; });
   const routed: string[] = [];
-  (h.framework as unknown as { channelRegistry: unknown }).channelRegistry = new Proxy({
+  (h.framework as unknown as { channelRegistry: unknown }).channelRegistry = new Proxy(withDeliverSpeech({
     resolveProseTarget: (spec: string) => spec === '#alpha' ? { channelId: 'chan-alpha' } : { error: `no channel ${spec}` },
     resolveLocus: () => 'chan-locus',
     routeSpeech: async (_agent: string, text: string, channelId: string) => {
@@ -968,7 +985,7 @@ test("hybrid: a restarted turn whose last response is empty writes its receipt a
     },
     getDefaultPublishChannel: () => null, isChannelOpen: () => true,
     getDescriptor: () => undefined, getChannelTools: () => [],
-  }, { get: (target, key: string) => key in target ? (target as Record<string, unknown>)[key] : () => undefined });
+  }), { get: (target, key: string) => key in target ? (target as Record<string, unknown>)[key] : () => undefined });
   const receipts = () => h.framework.getAgent('assistant')!.getContextManager().getAllMessages()
     .flatMap((message) => message.content)
     .filter((block): block is ContentBlock & { type: 'text' } => block.type === 'text' && (block as { text: string }).text.startsWith('[delivered]'))
@@ -996,12 +1013,12 @@ test("hybrid: a restarted turn whose last response is empty writes its receipt a
 test("a fresh turn starts new routing state in every mode, and leaves the earlier turn's as it was", async () => {
   for (const mode of ['explicit', 'hybrid', 'locus'] as const) {
     const h = await harness([[answer()]], { proseRouting: mode });
-    type Routing = { pin?: string; destination: string | null; hybridHold: boolean;
-      continuation: boolean; deliveries: string[]; suppressed: number;
+    type Routing = { pin?: string; destination: string | null; hybridHold?: 'private' | 'failed';
+      continuation: boolean; deliveries: string[]; suppressed: number; drafts: unknown[]; keptPrivate: number;
       triggerChannel?: string; locus?: string; engaged: Set<string>; arrivals: Array<{ messageId: string; channelId: string }> };
     const internals = h.framework as unknown as { turnRouting: Map<string, Routing> };
-    const earlierFields = (): Routing => ({ pin: 'chan-earlier', destination: 'chan-earlier', hybridHold: true,
-      continuation: true, deliveries: ['chan-earlier'], suppressed: 2,
+    const earlierFields = (): Routing => ({ pin: 'chan-earlier', destination: 'chan-earlier', hybridHold: 'failed',
+      continuation: true, deliveries: ['chan-earlier'], suppressed: 2, drafts: [{ id: 'd-earlier' }], keptPrivate: 1,
       triggerChannel: 'chan-earlier', locus: 'chan-earlier', engaged: new Set(['chan-earlier']), arrivals: [{ messageId: 'earlier-message', channelId: 'chan-earlier' }] });
     const earlier = earlierFields();
     internals.turnRouting.set('assistant', earlier);
@@ -1011,10 +1028,12 @@ test("a fresh turn starts new routing state in every mode, and leaves the earlie
       assert.notEqual(now, earlier, `${mode}: the new turn has its own routing state`);
       assert.equal(now?.pin, undefined, `${mode}: no sticky destination`);
       assert.equal(now?.destination, null, `${mode}: no turn destination`);
-      assert.equal(now?.hybridHold, false, `${mode}: no hybrid hold`);
+      assert.equal(now?.hybridHold, undefined, `${mode}: no hybrid hold`);
       assert.equal(now?.continuation, false, `${mode}: no continuation`);
       assert.deepEqual(now?.deliveries, [], `${mode}: no deliveries carried into the new turn`);
       assert.equal(now?.suppressed, 0, `${mode}: no suppression carried into the new turn`);
+      assert.deepEqual(now?.drafts, [], `${mode}: no drafts carried into the new turn`);
+      assert.equal(now?.keptPrivate, 0, `${mode}: no private count carried into the new turn`);
       assert.equal(now?.triggerChannel, undefined, `${mode}: no trigger channel carried into the new turn`);
       assert.notEqual(now?.locus, 'chan-earlier', `${mode}: no locus carried into the new turn`);
       assert.deepEqual([...(now?.engaged ?? [])], [], `${mode}: no engaged channels carried into the new turn`);
@@ -1044,7 +1063,7 @@ for (const shape of ['text-only', 'trailing'] as const) {
     let cafe = 'chan-cafe';
     const routed: Array<{ text: string; channelId: string }> = [];
     const streamed: Array<{ channelId: string; delta: string }> = [];
-    (h.framework as unknown as { channelRegistry: unknown }).channelRegistry = new Proxy({
+    (h.framework as unknown as { channelRegistry: unknown }).channelRegistry = new Proxy(withDeliverSpeech({
       resolveProseTarget: (spec: string) => spec === '#alpha' ? { channelId: 'chan-alpha' }
         : spec === '#cafe' ? { channelId: cafe } : { error: `no channel ${spec}` },
       routeSpeech: async (_agent: string, text: string, channelId: string) => {
@@ -1056,7 +1075,7 @@ for (const shape of ['text-only', 'trailing'] as const) {
       },
       getDefaultPublishChannel: () => null, isChannelOpen: () => true,
       getDescriptor: () => undefined, getChannelTools: () => [],
-    }, { get: (target, key: string) => key in target ? (target as Record<string, unknown>)[key] : () => undefined });
+    }), { get: (target, key: string) => key in target ? (target as Record<string, unknown>)[key] : () => undefined });
     const modules = (h.framework as unknown as { moduleRegistry: { dispatchSpeech: (...args: unknown[]) => Promise<void> } }).moduleRegistry;
     const dispatch = modules.dispatchSpeech.bind(modules);
     modules.dispatchSpeech = async (...args: unknown[]) => {
@@ -1305,7 +1324,7 @@ test("an abandoned guarded round with no usage sample counts and notes its respo
 
 function fakeRegistry(framework: AgentFramework) {
   const routed: string[] = [];
-  (framework as unknown as { channelRegistry: unknown }).channelRegistry = new Proxy({
+  (framework as unknown as { channelRegistry: unknown }).channelRegistry = new Proxy(withDeliverSpeech({
     resolveLocus: () => 'world:test',
     routeSpeech: async (_agent: string, speech: string) => {
       routed.push(speech); return { delivered: true, channelId: 'world:test' };
@@ -1313,7 +1332,7 @@ function fakeRegistry(framework: AgentFramework) {
     sendOutgoingChunk: () => {},
     getDefaultPublishChannel: () => null, isChannelOpen: () => true,
     getDescriptor: () => undefined, getChannelTools: () => [],
-  }, { get: (target, key: string) => key in target ? (target as Record<string, unknown>)[key] : () => undefined });
+  }), { get: (target, key: string) => key in target ? (target as Record<string, unknown>)[key] : () => undefined });
   return routed;
 }
 
@@ -1791,6 +1810,15 @@ function gate() {
   const opened = new Promise<void>((resolve) => { open = resolve; });
   return { opened, open };
 }
+/** Hold a stream's compile: opens `entered` when a turn's stream start
+ *  assembles its request, then waits for `release`. The stream path assembles
+ *  through the agent's own assembler (buildActivationRequest is only its
+ *  preview), so the hold goes there. */
+function holdStreamCompile(agent: object, entered: { open(): void }, release: Promise<void>): void {
+  const assembler = agent as { assembleActivationRequest: (...args: unknown[]) => Promise<unknown> };
+  const assemble = assembler.assembleActivationRequest.bind(agent);
+  assembler.assembleActivationRequest = async (...args) => { entered.open(); await release; return assemble(...args); };
+}
 async function until(check: () => boolean, what: string) {
   for (let i = 0; i < 400 && !check(); i++) await new Promise((resolve) => setTimeout(resolve, 5));
   assert.ok(check(), `timed out waiting until ${what}`);
@@ -2200,6 +2228,184 @@ for (const how of ['abortInference', 'cancelStream'] as const) {
     });
   }
 }
+
+// What an ephemeral run's batch left in the guard's audit, read after a
+// restart: its records in order, and the reason its withheld record gives.
+async function ephemeralBatchAudit(base: Parameters<typeof AgentFramework.create>[0]): Promise<{ types: unknown[]; reason: unknown }> {
+  const restarted = await AgentFramework.create(base);
+  try {
+    const audit = restarted.getStore().getStateJson(TOOL_RESULT_GUARD_AUDIT_STATE) as Array<Record<string, unknown>>;
+    const mine = audit.filter((r) => r.agentName === 'ephemeral');
+    return { types: mine.map((r) => r.type), reason: mine.find((r) => r.type === 'withheld')?.reason };
+  } finally { await restarted.stop(); }
+}
+const SETTLED_AS_IT_LEFT = ['staged', 'linked', 'withheld', 'annotated', 'stub_updated'];
+
+// An ephemeral run that leaves with its batch still pending settles it as it
+// leaves, before it's deregistered: once it's gone, driveStream's finally,
+// which abandons only while the agent is registered, and every later turn are
+// gone with it. Pinned for a failure whose stream ends only after the run's
+// caller has deregistered the agent, in both shapes, and for a run the
+// completion watchdog ends while its stream says nothing.
+for (const how of ['an uncaused error', 'an abort whose reason is timeout', 'the completion watchdog'] as const) {
+  test(`an ephemeral run that ends by ${how} with its batch pending settles the batch as it leaves`, async () => {
+    const h = await harness([[calls('one')]]);
+    if (how !== 'the completion watchdog') waitAfterTerminal(h.membrane, () => h.framework.getAgent('ephemeral') === null);
+    let spills = 0;
+    slowSpill(h.framework, async () => { spills++; });
+    h.membrane.onSubmit = () => {
+      // Once the results go in, the stream starts no next round: it reports
+      // the failure, or for the watchdog says nothing more.
+      const stream = h.membrane.streams.at(-1)! as unknown as { events: unknown[]; processResponse: (index: number) => void };
+      stream.processResponse = () => {};
+      if (how === 'an uncaused error') {
+        stream.events.push({ type: 'error', error: new MembraneError({ type: 'auth', retryable: false, message: 'key revoked', rawError: { status: 401 } }) });
+      } else if (how === 'an abort whose reason is timeout') {
+        stream.events.push({ type: 'aborted', reason: 'timeout' });
+      }
+    };
+    let outcome = 'pending';
+    try {
+      const created = await h.framework.createEphemeralAgent({
+        name: 'ephemeral', model: 'test', systemPrompt: 'system', toolResultGuard: true,
+      });
+      created.contextManager.addMessage('user', [{ type: 'text', text: 'read' }]);
+      const completion = h.framework.runEphemeralToCompletion(created.agent, created.contextManager,
+        how === 'the completion watchdog' ? { idleTimeoutMs: 200, idlePollMs: 20 } : undefined)
+        .then(() => { outcome = 'resolved'; }, (e) => { outcome = `rejected: ${(e as Error).message}`; });
+      h.framework.start();
+      await bounded(completion, 'the run settling');
+      assert.equal(created.agent.toolResultGuard.hasPending, false, 'the run left no batch pending');
+    } finally { await h.framework.stop(); }
+    assert.match(outcome, how === 'the completion watchdog' ? /^rejected: Ephemeral agent "ephemeral" stalled/
+      : how === 'an uncaused error' ? /^rejected: key revoked/ : /^rejected: Stream aborted: timeout/, 'the run ends as expected');
+    assert.equal(spills, 1, "the batch's original is offered to the host's spill once");
+    const audit = await ephemeralBatchAudit(h.base);
+    assert.deepEqual(audit.types, SETTLED_AS_IT_LEFT, 'the batch is settled once, and its stub says where its original is');
+    assert.equal(audit.reason, how === 'the completion watchdog' ? 'run_stalled' : 'aborted', 'naming why');
+  });
+}
+
+// A budget restart, and an error retry, keep the batch for the stream that
+// follows. When that stream's start fails before any stream exists, the
+// failure settles the run, and the batch is settled as the run leaves.
+for (const shape of ['a budget restart', 'an error retry'] as const) {
+  test(`an ephemeral run whose new start after ${shape} fails settles the batch it kept as it leaves`, async () => {
+    const h = await harness([[calls('one')], [answer()]]);
+    let spills = 0;
+    slowSpill(h.framework, async () => { spills++; });
+    if (shape === 'an error retry') {
+      h.membrane.onSubmit = () => {
+        // Once the results go in, the stream fails in a way the error policy retries.
+        const stream = h.membrane.streams.at(-1)! as unknown as { events: unknown[]; processResponse: (index: number) => void };
+        stream.processResponse = () => {};
+        stream.events.push({ type: 'error', error: new MembraneError({ type: 'server', retryable: true, retryAfterMs: 1, message: 'overloaded', rawError: { status: 529 } }) });
+      };
+    }
+    const make = h.membrane.streamYielding.bind(h.membrane);
+    let starts = 0;
+    h.membrane.streamYielding = (request, options) => {
+      starts++;
+      if (starts === 2) throw new MembraneError({ type: 'auth', retryable: false, message: 'key revoked at the new start', rawError: { status: 401 } });
+      return make(request, options);
+    };
+    let outcome = 'pending';
+    try {
+      const created = await h.framework.createEphemeralAgent({
+        name: 'ephemeral', model: 'test', systemPrompt: 'system', toolResultGuard: true,
+        ...(shape === 'a budget restart' ? { maxStreamTokens: 5 } : {}),
+      });
+      created.contextManager.addMessage('user', [{ type: 'text', text: 'read' }]);
+      const completion = h.framework.runEphemeralToCompletion(created.agent, created.contextManager)
+        .then(() => { outcome = 'resolved'; }, (e) => { outcome = `rejected: ${(e as Error).message}`; });
+      h.framework.start();
+      await bounded(completion, 'the run settling');
+      assert.equal(starts, 2, 'the new start was tried');
+      assert.equal(created.agent.toolResultGuard.hasPending, false, 'the run left no batch pending');
+    } finally { await h.framework.stop(); }
+    assert.match(outcome, /^rejected: key revoked at the new start/, "the run ends with the new start's error");
+    assert.equal(spills, 1, "the batch's original is offered to the host's spill once");
+    const audit = await ephemeralBatchAudit(h.base);
+    assert.deepEqual(audit.types, SETTLED_AS_IT_LEFT, 'the batch is settled once, and its stub says where its original is');
+    assert.equal(audit.reason, 'aborted', 'naming why');
+  });
+}
+
+// stop() ends a run as a stop, with no stop terminal: by its sweep of the
+// runs still registered once its waits have settled or run out, here with
+// the run's stream still running past stop()'s budget, or by the completion
+// watchdog, firing while stop() waits for that stream. Either way the batch
+// reads `aborted`, as the run's error is a stop's.
+for (const how of ["stop()'s sweep", 'the completion watchdog during a stop()'] as const) {
+  test(`an ephemeral run ended by ${how} while its stream is still running settles its batch as it leaves`, async () => {
+    const h = await harness([[calls('one')]]);
+    let endStream: (() => void) | undefined;
+    h.membrane.onSubmit = () => {
+      // Once the results go in, the stream says nothing more, and stop()'s
+      // cancel doesn't end it: the test does, once it has looked.
+      const stream = h.membrane.streams.at(-1)! as unknown as { processResponse: (index: number) => void; cancel: () => void };
+      stream.processResponse = () => {};
+      endStream = stream.cancel.bind(stream);
+      stream.cancel = () => {};
+    };
+    let outcome = 'pending';
+    try {
+      const created = await h.framework.createEphemeralAgent({
+        name: 'ephemeral', model: 'test', systemPrompt: 'system', toolResultGuard: true,
+      });
+      created.contextManager.addMessage('user', [{ type: 'text', text: 'read' }]);
+      const completion = h.framework.runEphemeralToCompletion(created.agent, created.contextManager,
+        how === "stop()'s sweep" ? undefined : { idleTimeoutMs: 200, idlePollMs: 20 })
+        .then(() => { outcome = 'resolved'; }, (e) => { outcome = `rejected: ${(e as Error).message}`; });
+      h.framework.start();
+      for (let i = 0; i < 400 && !created.agent.toolResultGuard.hasPending; i++) await new Promise((r) => setTimeout(r, 5));
+      assert.ok(created.agent.toolResultGuard.hasPending, 'the results went in');
+      const stopped = await h.framework.stop(how === "stop()'s sweep" ? 100 : 1_000).then(() => 'resolved', (e: unknown) => e);
+      assert.ok(stopped instanceof Error && /^Shutdown timed out/.test(stopped.message), `stop() waited for the stream: ${String(stopped)}`);
+      await bounded(completion, 'the run settling');
+      assert.equal(h.framework.getAgent('ephemeral'), null, 'the run has left');
+      assert.equal(created.agent.toolResultGuard.hasPending, false, 'the run left no batch pending');
+    } finally {
+      endStream?.();
+      await h.framework.stop();
+    }
+    assert.match(outcome, how === "stop()'s sweep" ? /^rejected: Ephemeral agent "ephemeral" refused: the framework is stopping$/
+      : /^rejected: Ephemeral agent "ephemeral" refused: the framework is stopping \(no stream-driver activity/, 'the run ends as a stop');
+    const audit = await ephemeralBatchAudit(h.base);
+    assert.deepEqual(audit.types, SETTLED_AS_IT_LEFT, 'the batch is settled once, and its stub says where its original is');
+    assert.equal(audit.reason, 'aborted', 'naming why');
+  });
+}
+
+// The rest of the run's teardown, its stream's cancel and its deregistration,
+// doesn't depend on the batch's record: a leave-point abandon that throws is
+// said, and the run still ends with its own error and leaves the framework.
+test('an ephemeral run whose batch fails to record as it leaves still ends with its own error and is deregistered', async (t) => {
+  const lines: string[] = [];
+  t.mock.method(console, 'error', (...args: unknown[]) => { lines.push(args.map(String).join(' ')); });
+  const h = await harness([[calls('one')]]);
+  h.membrane.onSubmit = () => {
+    // Once the results go in, the stream says nothing more.
+    (h.membrane.streams.at(-1)! as unknown as { processResponse: (index: number) => void }).processResponse = () => {};
+  };
+  let outcome = 'pending';
+  try {
+    const created = await h.framework.createEphemeralAgent({
+      name: 'ephemeral', model: 'test', systemPrompt: 'system', toolResultGuard: true,
+    });
+    created.agent.toolResultGuard.abandon = () => { throw new Error('audit unavailable'); };
+    created.contextManager.addMessage('user', [{ type: 'text', text: 'read' }]);
+    const completion = h.framework.runEphemeralToCompletion(created.agent, created.contextManager,
+      { idleTimeoutMs: 200, idlePollMs: 20 })
+      .then(() => { outcome = 'resolved'; }, (e) => { outcome = `rejected: ${(e as Error).message}`; });
+    h.framework.start();
+    await bounded(completion, 'the run settling');
+    assert.equal(h.framework.getAgent('ephemeral'), null, 'the run is deregistered');
+  } finally { await h.framework.stop(); }
+  assert.match(outcome, /^rejected: Ephemeral agent "ephemeral" stalled/, 'the run ends with its own error');
+  assert.ok(lines.some((line) => line.includes('failed to record a batch the ephemeral run left')
+    && line.includes('audit unavailable')), 'the failed record is said');
+});
 
 // ---------------------------------------------------------------------------
 // #281's review: each withheld result's file is its own, a branch change stops
@@ -3402,8 +3608,7 @@ test('a framework compile from before stop cannot drive after restart', async ()
   const agent = framework.getAgent('assistant')!;
   const compile = gate();
   const entered = gate();
-  const build = agent.buildActivationRequest.bind(agent);
-  agent.buildActivationRequest = async (...args) => { entered.open(); await compile.opened; return build(...args); };
+  holdStreamCompile(agent, entered, compile.opened);
   let driven = 0;
   const stream = membrane.streamYielding.bind(membrane);
   membrane.streamYielding = (...args) => {
@@ -3460,8 +3665,11 @@ test("a dropped turn's cancel record is not read by the next turn's stream: its 
   const agent = framework.getAgent('assistant')!;
   const compile = gate();
   const entered = gate();
-  const build = agent.buildActivationRequest.bind(agent);
-  agent.buildActivationRequest = async (...args) => { entered.open(); await compile.opened; return build(...args); };
+  // The stream path compiles through the agent's own assembler
+  // (buildActivationRequest is only its wrapper for previews).
+  const hooked = agent as unknown as { assembleActivationRequest: (...args: unknown[]) => Promise<unknown> };
+  const assemble = hooked.assembleActivationRequest.bind(agent);
+  hooked.assembleActivationRequest = async (...args) => { entered.open(); await compile.opened; return assemble(...args); };
   const stream = membrane.streamYielding.bind(membrane);
   membrane.streamYielding = (...args) => {
     const result = stream(...args);
@@ -3523,8 +3731,7 @@ for (const phase of ['before', 'after'] as const) {
       if (phase === 'before') {
         internal.moduleRegistry.gatherContext = async () => { entered.open(); await held.opened; return []; };
       } else {
-        const build = agent.buildActivationRequest.bind(agent);
-        agent.buildActivationRequest = async (...args) => { entered.open(); await held.opened; return build(...args); };
+        holdStreamCompile(agent, entered, held.opened);
       }
       const turnEvents: Array<{ type: string; reason?: string; durationMs?: number }> = [];
       framework.onTrace((event) => {

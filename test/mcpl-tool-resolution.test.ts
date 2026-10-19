@@ -7,8 +7,9 @@
  * for a programmatic call, through the public executeToolCall or a module's
  * ctx.callTool, which also sends the server the tool name the model's call
  * sends; for an MCPL tool's source in the tool presentation; and for the
- * RFC-008 class declarations a server's close forgets. Where two servers list
- * the same full name, the listing holds the one listed last (#265).
+ * RFC-008 class declarations a server's close forgets. Prefixes that meet
+ * are refused at configuration since #265, so the stand-ins below build such
+ * a pair directly, to pin the resolver's own rule.
  */
 
 import { test } from 'node:test';
@@ -211,7 +212,8 @@ test("a call of a tool its server's policy denies is refused on every path, not 
   const h = await standIns([{ id: 'short', prefix: 'foo', lists: ['secret', 'echo'], disabledTools: ['secret'] }]);
   try {
     for (const path of PATHS) {
-      assert.equal(await h.call(path, 'foo--secret'), "refused: Tool 'foo--secret' is not permitted by this server's tool policy.", `by ${path}`);
+      assert.equal(await h.call(path, 'foo--secret'), `refused: foo--secret isn't allowed by this host's policy for the "short" server, ` +
+        "so the call didn't run, and calling it again won't change that. If you need it, ask whoever runs this host.", `by ${path}`);
     }
     assert.equal(await h.call('executeToolCall', 'foo--echo'), 'short:echo', 'an allowed tool is sent');
   } finally {
@@ -238,10 +240,11 @@ test('a name an MCPL prefix fits goes to MCPL on every path, even with no config
   try {
     // A prefix with neither a config nor a server: refused as MCPL, never handed to a module.
     h.internals.mcplPrefixMap.set('ghost', 'ghost');
-    for (const path of ['executeToolCall', 'ctx.callTool'] as const) {
-      assert.equal(await h.call(path, 'ghost--echo'), 'refused: MCPL server ghost not found', `by ${path}`);
+    // Every path says the same: the server isn't connected, and won't be on its own.
+    for (const path of ['executeToolCall', 'ctx.callTool', 'model'] as const) {
+      assert.equal(await h.call(path, 'ghost--echo'), `refused: The "ghost" server that provides ghost--echo isn't connected, ` +
+        "and this host won't reconnect to it on its own, so the call didn't run. If you need it, ask whoever runs this host.", `by ${path}`);
     }
-    assert.equal(await h.call('model', 'ghost--echo'), 'refused: MCPL server not found: ghost', 'by model');
     // A server with no config is still sent the call.
     h.internals.mcplServerConfigs.delete('short');
     for (const path of PATHS) assert.equal(await h.call(path, 'foo--echo'), 'short:echo', `by ${path}`);
@@ -385,13 +388,14 @@ async function live(servers: ReturnType<typeof fixture>[], names: string[]) {
 }
 
 test('with fixture servers configured at create(), one on the default prefix, every path reaches the server the model\'s call reaches', async () => {
-  // `plain` takes the default prefix, `mcpl--plain`; `inner`'s begins with it.
+  // `plain` takes the default prefix, `mcpl--plain`, and lists a name with
+  // `--` in it; `inner`'s prefix doesn't meet it (#265).
   const servers = [
     fixture('plain', ['echo', 'inner--qux']),
-    fixture('inner', ['echo'], 'mcpl--plain--inner'),
+    fixture('inner', ['echo'], 'inner'),
   ];
   const calls: Array<[string, string]> = [
-    ['mcpl--plain--inner--echo', 'inner:echo'],
+    ['inner--echo', 'inner:echo'],
     ['mcpl--plain--echo', 'plain:echo'],
     ['mcpl--plain--inner--qux', 'plain:inner--qux'],
   ];

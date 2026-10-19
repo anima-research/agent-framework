@@ -25,6 +25,7 @@ import type { FeatureSetManager } from '../src/mcpl/feature-set-manager.js';
 import { TuneOutCoordinator, type TuneOutFrameworkHooks } from '../src/tune-out/coordinator.js';
 import { MockMembrane, createMockResponse } from './helpers/mock-membrane.js';
 import { fixture } from './helpers/coalescing-fixture.js';
+import { forkAgentName } from '../src/mcpl/conversation-router.js';
 
 /** A real store whose getStateJson fails for one id, as an I/O error would,
  *  the first `times` times it is asked while `failing()` holds. */
@@ -331,7 +332,7 @@ describe("the conversation router's generation counters", () => {
     try {
       framework.pushEvent(directMessage('one'));
       await framework.runUntilIdle();
-      assert.equal(framework.getAgent('conversation-slack-D9-g1'), null, 'no fork without its counter stored');
+      assert.equal(framework.getAgent(forkAgentName('conversation', 'srv', 'slack:D9', 1)), null, 'no fork without its counter stored');
       assert.deepEqual(refusals, [
         "the conversation router's generation counters (framework/conversation-router) could not be stored: injected EIO writing framework/conversation-router",
       ]);
@@ -339,7 +340,7 @@ describe("the conversation router's generation counters", () => {
 
       framework.pushEvent(directMessage('two'));
       await framework.runUntilIdle();
-      assert.ok(framework.getAgent('conversation-slack-D9-g1'), 'the next qualifying message spawns it');
+      assert.ok(framework.getAgent(forkAgentName('conversation', 'srv', 'slack:D9', 1)), 'the next qualifying message spawns it');
       assert.deepEqual(store.getStateJson(ROUTER), { generations: { 'slack:D9': 1 } });
     } finally {
       await framework.stop();
@@ -367,7 +368,7 @@ describe("the conversation router's generation counters", () => {
       framework.pushEvent(directMessage('one', 'slack:D9', false));
       await framework.runUntilIdle();
       failing = false;
-      assert.equal(framework.getAgent('conversation-slack-D9-g1'), null, 'no fork without its counter stored');
+      assert.equal(framework.getAgent(forkAgentName('conversation', 'srv', 'slack:D9', 1)), null, 'no fork without its counter stored');
       assert.deepEqual(refusals, [
         "the conversation router's generation counters (framework/conversation-router) could not be read: injected EIO reading framework/conversation-router",
       ]);
@@ -394,7 +395,7 @@ describe("the conversation router's generation counters", () => {
       store.setStateJson(ROUTER, { generations: { 'slack:A': 1, 'slack:B': 5 } });
       framework.pushEvent(directMessage('one', 'slack:C', false));
       await framework.runUntilIdle();
-      assert.ok(framework.getAgent('conversation-slack-C-g1'));
+      assert.ok(framework.getAgent(forkAgentName('conversation', 'srv', 'slack:C', 1)));
       assert.deepEqual(store.getStateJson(ROUTER), { generations: { 'slack:A': 2, 'slack:B': 5, 'slack:C': 1 } });
       // A channel id that names an Object.prototype member is a key like any other.
       framework.pushEvent(directMessage('two', 'constructor', false));
@@ -422,7 +423,7 @@ describe("the conversation router's generation counters", () => {
       assert.ok(failedWrites.count > 0, "the batch reached its fork's spawn and tried to store the counter");
       const router = (f.framework as unknown as { conversationRouter: { getBinding(id: string): unknown } }).conversationRouter;
       assert.equal(router.getBinding('chat'), undefined, 'no fork was bound');
-      assert.equal(f.framework.getAgent('conversation-chat-g1'), null);
+      assert.equal(f.framework.getAgent(forkAgentName('conversation', 'editor', 'chat', 1)), null);
       assert.equal(store.getStateJson(ROUTER), null);
     } finally {
       await f.close();
@@ -483,8 +484,8 @@ describe("the conversation router's generation counters", () => {
       assert.deepEqual(store.getStateJson(ROUTER), { generations: { chat: 1, side: 1 } }, 'both stored while neither is bound');
       write.open();
       await Promise.all([queue, coalesced]);
-      assert.ok(f.framework.getAgent('conversation-chat-g1'));
-      assert.ok(f.framework.getAgent('conversation-side-g1'));
+      assert.ok(f.framework.getAgent(forkAgentName('conversation', 'editor', 'chat', 1)));
+      assert.ok(f.framework.getAgent(forkAgentName('conversation', 'editor', 'side', 1)));
       assert.deepEqual(store.getStateJson(ROUTER), { generations: { chat: 1, side: 1 } });
     } finally {
       write.open();

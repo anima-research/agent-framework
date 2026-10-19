@@ -186,5 +186,5 @@ test('RFC-005: dispatch pre-registration and stub share ONE record (reviewer pro
   const stubId = out.match(/\[(ref_[a-z0-9_]+)\]/)?.[1];
   assert.equal(stubId, dispatchRecord.refId, 'stub id must equal dispatch id');
   assert.ok(out.includes('saved: scratch/refs/'), 'eager-fetched path must surface in the stub');
-  assert.equal(referenceRegistry.get(stubId!)?.serverId, 'srv', 'visible id must be server-bound');
+  assert.deepEqual(referenceRegistry.get(stubId!)?.serverIds, ['srv'], 'visible id must be server-bound');
 });

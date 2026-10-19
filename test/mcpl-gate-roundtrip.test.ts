@@ -35,7 +35,9 @@ function makeGate(config: GateConfig) {
 function makeRegistry(shouldTriggerInference?: (c: string, m: Record<string, unknown>) => boolean) {
   const pushed: ProcessEvent[] = [];
   const registry = new ChannelRegistry(
-    {} as never,
+    // No server connection: the host directs no channel lifecycle here, so
+    // traffic is what marks a channel open.
+    { getServer: () => undefined } as never,
     {} as never,
     (ev) => pushed.push(ev),
     () => {},

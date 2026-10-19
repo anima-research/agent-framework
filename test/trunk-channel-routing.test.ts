@@ -160,6 +160,7 @@ describe('Trunk channel routing (item-3 redux)', () => {
     i.channelRegistry = {
       ensureChannelRegistered: () => {},
       isChannelOpen: () => false,
+      getChannelLabel: () => undefined,
       getDescriptor: () => ({ capabilities: { history: { maxMessages: 80 } } }),
       stopAll: () => {},
     };
@@ -217,6 +218,7 @@ describe('Trunk channel routing (item-3 redux)', () => {
     i.channelRegistry = {
       ensureChannelRegistered: () => {},
       isChannelOpen: () => false,
+      getChannelLabel: () => undefined,
       getDescriptor: () => ({ capabilities: { history: { maxMessages: 80 } } }),
       stopAll: () => {},
     };
@@ -282,6 +284,7 @@ describe('Trunk channel routing (item-3 redux)', () => {
     i.channelRegistry = {
       ensureChannelRegistered: () => {},
       isChannelOpen: () => false,
+      getChannelLabel: () => undefined,
       getDescriptor: () => ({ label: 'DM: _reim0n', capabilities: { history: { maxMessages: 80 } } }),
       proseTargetFor: (id: string, serverId?: string) => { asked.push(`${serverId}/${id}`); return '@_reim0n'; },
       stopAll: () => {},
@@ -300,6 +303,7 @@ describe('Trunk channel routing (item-3 redux)', () => {
     i2.channelRegistry = {
       ensureChannelRegistered: () => {},
       isChannelOpen: () => false,
+      getChannelLabel: () => undefined,
       getDescriptor: () => ({ label: 'DM: _reim0n', capabilities: { history: { maxMessages: 80 } } }),
       proseTargetFor: () => undefined,
       stopAll: () => {},
@@ -317,6 +321,7 @@ describe('Trunk channel routing (item-3 redux)', () => {
     i3.channelRegistry = {
       ensureChannelRegistered: () => {},
       isChannelOpen: () => false,
+      getChannelLabel: () => undefined,
       getDescriptor: () => undefined,
       stopAll: () => {},
     };
@@ -340,6 +345,7 @@ describe('Trunk channel routing (item-3 redux)', () => {
       ensureChannelRegistered: () => {},
       isChannelOpen: () => false,
       getDescriptor: (id: string) => ({ label: labels[id] }),
+      getChannelLabel: (_serverId: string, id: string) => labels[id],
       stopAll: () => {},
     };
     const textOf = () =>
@@ -418,7 +424,7 @@ describe('Trunk channel routing (item-3 redux)', () => {
     const one = lastText();
     assert.match(
       one,
-      /Now open: #general \(acme\) \(slack:C1\) — your own message into the closed channel engaged it\. What an open channel delivers to you depends on its server\. If you don't want it, use channel_close/,
+      /Now open: #general \(acme\) \(slack:C1\): your own message into the closed channel opened it\. What an open channel delivers to you depends on its server\. If you don't want it, use channel_close/,
     );
     assert.doesNotMatch(one, /will reach you/);
 
@@ -426,7 +432,7 @@ describe('Trunk channel routing (item-3 redux)', () => {
     const two = lastText();
     assert.match(
       two,
-      /Now open: slack:C1, slack:C2 — your subscription policy just admitted them\. What an open channel delivers to you depends on its server\. If you don't want one of them, use channel_close/,
+      /Selected for opening by subscription policy: slack:C1, slack:C2\. This records the admission decision; channel_list shows current transport state\. What an open channel delivers to you depends on its server\. If you don't want one of them, use channel_close/,
     );
     assert.doesNotMatch(two, /will reach you/);
     await framework.stop();

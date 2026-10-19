@@ -15,9 +15,10 @@
  */
 
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
+import { buildChildEnv } from '../mcpl/transport.js';
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, resolve } from 'node:path';
 import { createInterface, type Interface } from 'node:readline';
 import { boundedErrorMessage } from '../error-message.js';
 import { PYTHON_RUNTIME_SOURCE } from './runtime-py.js';
@@ -54,11 +55,30 @@ export interface BackgroundExecOptions {
   lifetimeMs: number;
 }
 
-/** Resolves inner tool calls. Must never reject — map errors to strings. */
+/**
+ * An inner tool call's result as the script gets it. `text` is the string
+ * its await returns, and the runner sets `.is_error` on that string from
+ * `isError`. With `structuredJson`, `text` is the JSON object a structured
+ * result reaches a script as, in any of its forms, and `.structured` reads
+ * its `structuredContent`, None for a form that holds none, such as one past
+ * the size cap; without it, `.structured` is None.
+ */
+export interface ScriptToolResult {
+  text: string;
+  isError: boolean;
+  structuredJson?: boolean;
+}
+
+/**
+ * Resolves inner tool calls. Must never reject — map errors to results; a
+ * rejection reaches the script as an `Error: …` result. A plain string is
+ * the result's text with nothing said about it, so the script's
+ * `.is_error` and `.structured` are None.
+ */
 export type ScriptToolCallHandler = (
   toolName: string,
   args: Record<string, unknown>,
-) => Promise<string>;
+) => Promise<string | ScriptToolResult>;
 
 export interface PyRunnerOptions {
   pythonPath?: string;
@@ -73,6 +93,19 @@ export interface PyRunnerOptions {
   onToolCall: ScriptToolCallHandler;
   /** Log prefix, typically the agent name. */
   label?: string;
+  /** Variables for the interpreter beyond what it inherits, such as
+   *  PYTHONPATH or a venv's. It inherits only what stdio MCPL children do
+   *  (CHILD_ENV_ALLOWLIST and LC_*, CA bundles and proxy variables among
+   *  them, and a proxy URL can carry credentials), then these, then
+   *  PYTHONUNBUFFERED and PYTHONIOENCODING, which the runner sets last.
+   *  Like the allowlist, this limits what the model's code inherits, not
+   *  what a process running as the same user can read. */
+  env?: Record<string, string>;
+  /** Pass the host's whole environment instead of the allowlist, as before
+   *  `env` existed. That hands every host variable, provider keys included,
+   *  to the model's code and to every subprocess a script starts; listing
+   *  what scripts need in `env` is the safer route. */
+  inheritEnv?: boolean;
 }
 
 const DEFAULT_TOOL_CALL_TIMEOUT_MS = 270_000;
@@ -164,6 +197,17 @@ interface PendingExec {
   sent: boolean;
 }
 
+/**
+ * The interpreter to spawn. A bare name is looked up on PATH. A path with a
+ * separator is resolved against the host's working directory, where it
+ * resolved before the interpreter got a working directory of its own: spawn
+ * would resolve it against the runtime directory instead.
+ */
+function spawnablePath(pythonPath: string): string {
+  const hasSeparator = pythonPath.includes('/') || (process.platform === 'win32' && pythonPath.includes('\\'));
+  return hasSeparator ? resolve(pythonPath) : pythonPath;
+}
+
 export class PyRunner {
   private readonly pythonPath: string;
   private readonly toolCallTimeoutMs: number;
@@ -172,6 +216,7 @@ export class PyRunner {
   private readonly idleReclaimMs: number;
   private readonly onToolCall: ScriptToolCallHandler;
   private readonly label: string;
+  private readonly envOptions: { env?: Record<string, string>; inheritEnv?: boolean };
 
   private onWake: ((line: number, payload: unknown) => Promise<string | null>) | null = null;
   private child: ChildProcessWithoutNullStreams | null = null;
@@ -191,6 +236,12 @@ export class PyRunner {
     this.idleReclaimMs = options.idleReclaimMs ?? DEFAULT_IDLE_RECLAIM_MS;
     this.onToolCall = options.onToolCall;
     this.label = options.label ?? 'pytc';
+    // The interpreter runs model-authored code: the same env discipline as an
+    // MCPL connector child (#175), for a child that deserves it more. Stored
+    // as options, not a snapshot — the env is rebuilt at every spawn so a
+    // respawn after idle reclaim sees current host values, as the old
+    // per-spawn `{ ...process.env }` did.
+    this.envOptions = { env: options.env, inheritEnv: options.inheritEnv };
   }
 
   get busy(): boolean {
@@ -368,13 +419,23 @@ export class PyRunner {
     }
     this.teardownChild();
 
-    this.runtimeDir = mkdtempSync(join(tmpdir(), 'af-pytc-'));
+    // Absolute, since the interpreter runs in it: from a relative TMPDIR,
+    // runtime.py's path would otherwise resolve against the directory itself.
+    this.runtimeDir = resolve(mkdtempSync(join(tmpdir(), 'af-pytc-')));
     const runtimePath = join(this.runtimeDir, 'runtime.py');
     writeFileSync(runtimePath, PYTHON_RUNTIME_SOURCE, 'utf8');
 
-    const child = spawn(this.pythonPath, [runtimePath], {
+    const child = spawn(spawnablePath(this.pythonPath), [runtimePath], {
       stdio: ['pipe', 'pipe', 'pipe'],
-      env: { ...process.env, PYTHONUNBUFFERED: '1' },
+      // The runtime directory, not the host's working directory: a script's
+      // relative paths land here, and go at teardown, rather than beside the
+      // host's .env and data. An absolute path still reaches the host's files.
+      cwd: this.runtimeDir,
+      // Set last, over a declared env: the protocol needs both. It writes
+      // non-ASCII JSON on piped stdio, which Python before 3.15 on Windows
+      // encodes in the ANSI code page unless told otherwise, and a host's
+      // own PYTHONUTF8 no longer reaches the interpreter.
+      env: { ...buildChildEnv(this.envOptions), PYTHONUNBUFFERED: '1', PYTHONIOENCODING: 'utf-8' },
     });
     this.child = child;
 
@@ -488,9 +549,24 @@ export class PyRunner {
             ? (msg.args as Record<string, unknown>)
             : {};
         this.onToolCall(toolName, args)
-          .catch((err) => `Error: ${err instanceof Error ? err.message : String(err)}`)
+          .catch((err): ScriptToolResult => ({
+            text: `Error: ${err instanceof Error ? err.message : String(err)}`,
+            isError: true,
+          }))
           .then((result) => {
-            this.reply(child, { op: 'tool_result', id: callId, result }, `result of ${toolName} call ${callId}`);
+            // Only an object is a ScriptToolResult. Anything else a handler
+            // resolves with, a string or a value its type rules out, is sent
+            // as it is, so the call is still answered.
+            const reply = typeof result === 'object' && result !== null
+              ? {
+                op: 'tool_result',
+                id: callId,
+                result: result.text,
+                is_error: result.isError,
+                ...(result.structuredJson ? { structured_json: true } : {}),
+              }
+              : { op: 'tool_result', id: callId, result };
+            this.reply(child, reply, `result of ${toolName} call ${callId}`);
           });
         return;
       }
@@ -619,8 +695,8 @@ export class PyRunner {
       this.reader.close();
       this.reader = null;
     }
-    if (this.child) {
-      const child = this.child;
+    const child = this.child;
+    if (child) {
       this.child = null;
       this.childReady = null;
       this.readyResolver = null;
@@ -640,13 +716,24 @@ export class PyRunner {
         child.kill('SIGKILL');
       }
     }
-    if (this.runtimeDir) {
-      try {
-        rmSync(this.runtimeDir, { recursive: true, force: true });
-      } catch {
-        // temp cleanup is best-effort
-      }
-      this.runtimeDir = null;
+    const dir = this.runtimeDir;
+    this.runtimeDir = null;
+    if (dir) {
+      const remove = (): void => {
+        try {
+          rmSync(dir, { recursive: true, force: true });
+        } catch {
+          // temp cleanup is best-effort
+        }
+      };
+      // The directory is the interpreter's working directory, which Windows
+      // won't remove while the process lives, so there it goes once the
+      // process has. Elsewhere it goes now, so a host that exits right after
+      // this doesn't leave it behind. A child that never started has no exit
+      // to wait for.
+      const running = child !== null && child.pid !== undefined && child.exitCode === null && child.signalCode === null;
+      if (running && process.platform === 'win32') child.once('exit', remove);
+      else remove();
     }
   }
 

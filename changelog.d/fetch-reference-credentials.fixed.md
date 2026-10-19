@@ -1,0 +1,1 @@
+- A reference whose address carries a user name or password is refused before anything is dialed, in words that don't repeat them. `fetch` refused such an address before connecting, with a message holding the whole address, password included, which `fetch_reference` gave the agent as its error, and the host's log carried it when the eager fetch tried it.

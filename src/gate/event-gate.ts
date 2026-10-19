@@ -14,6 +14,7 @@
 import { existsSync, readFileSync, statSync, writeFileSync, mkdirSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { GateScript } from './gate-script.js';
+import { safeSlice } from '../safe-slice.js';
 
 import type { ToolDefinition } from '../types/events.js';
 import type {
@@ -44,6 +45,15 @@ const MAX_TRACE_SNIPPET = 80;
 const MAX_INFERENCE_BUFFER = 100;
 /** Minimum interval between filesystem checks for config changes (ms). */
 const RELOAD_THROTTLE_MS = 1000;
+
+/**
+ * Parse a gate file's text as JSON. Some Windows editors save UTF-8 with a
+ * leading U+FEFF (BOM), which `readFileSync(…, 'utf-8')` keeps and
+ * `JSON.parse` rejects; drop exactly one before parsing (#395).
+ */
+function parseGateJson(text: string): unknown {
+  return JSON.parse(text.charCodeAt(0) === 0xfeff ? text.slice(1) : text);
+}
 /** Minimum debounce value (ms). */
 const MIN_DEBOUNCE_MS = 100;
 /** Maximum debounce value (ms). */
@@ -722,7 +732,7 @@ export class EventGate {
       const raw = readFileSync(this.configPath, 'utf-8');
       const stat = statSync(this.configPath);
       this.configMtime = stat.mtimeMs;
-      const config = validateConfig(JSON.parse(raw));
+      const config = validateConfig(parseGateJson(raw));
       this.configSource = 'file';
       this.configErrors = [];
       return config;
@@ -1484,7 +1494,7 @@ export class EventGate {
     const event: PendingEvent = {
       policyName: policy.name,
       content: info.content.length > MAX_CONTENT_SNIPPET
-        ? info.content.slice(0, MAX_CONTENT_SNIPPET) + '...'
+        ? safeSlice(info.content, 0, MAX_CONTENT_SNIPPET) + '...'
         : info.content,
       eventType: info.eventType,
       timestamp: Date.now(),
@@ -1869,7 +1879,7 @@ export class EventGate {
         return;
       }
       this.privilegedMtime = statSync(this.privilegedUsersPath).mtimeMs;
-      const raw = JSON.parse(readFileSync(this.privilegedUsersPath, 'utf8'));
+      const raw: any = parseGateJson(readFileSync(this.privilegedUsersPath, 'utf8'));
       const ids = Array.isArray(raw) ? raw : Array.isArray(raw?.userIds) ? raw.userIds : [];
       this.privilegedUserIds = new Set(ids.map((x: unknown) => String(x)));
     } catch (err) {
@@ -2002,10 +2012,9 @@ export class EventGate {
     // a turn whose exit didn't end it (a retry stop() cancelled, a successor
     // stop() refused) would make every debounced batch buffer until that
     // agent's next turn ended. A turn that continues after the start() takes
-    // its entry again (onInferenceResumed). A turn that a start() during the
-    // stop() began before this ran loses its entry too, and runs on without
-    // it, so debounced batches are delivered while it runs: nothing refuses
-    // a start() during a stop() yet.
+    // its entry again (onInferenceResumed). A start() made during the stop()
+    // is refused, so no turn of a new lifecycle can have begun before this
+    // runs.
     this.inferring.clear();
   }
 }

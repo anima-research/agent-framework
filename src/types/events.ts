@@ -193,6 +193,14 @@ export interface ToolResult {
   /** Whether this was an error (for LLM) */
   isError?: boolean;
   /**
+   * An MCP tool's `structuredContent`: its machine-readable result, beside
+   * `data`, which is the content view. Present exactly when the server sent
+   * one, so `false`, `0` and `null` are values here, not absence. Programs
+   * read it (scripts get it in their result object); the model sees content,
+   * and sees this rendered as JSON only when the content carries no text.
+   */
+  structured?: unknown;
+  /**
    * When true, the framework saves tool_use + tool_result messages to context,
    * cancels the active stream, and resets the agent to idle.
    * This is a "sleep until next event" primitive — the LLM expects the call to block.
@@ -225,6 +233,19 @@ export interface ToolCall {
   input: unknown;
   /** The agent that made this tool call. Set by the framework dispatch layer. */
   callerAgentName?: string;
+  /**
+   * The turn the call was made in, the same id as that turn's
+   * `SpeechContext.turnId`. Set by the framework dispatch layer, beside
+   * `callerAgentName`: a model's call carries the turn whose stream made it, a
+   * foreground script's inner call the turn of the code_execution call whose
+   * script is running when the call arrives, and a utility run its `utils`
+   * call's. A background script runs apart from any turn, so its calls carry
+   * none. Ids increase, so a later turn's is larger, and they're unique only
+   * within one run of the process. A call made with `executeToolCall` or a
+   * module's `callTool` skips that layer and carries whatever turn its caller
+   * put on the call, usually none.
+   */
+  callerTurnId?: number;
 }
 
 // ============================================================================
@@ -247,6 +268,8 @@ export interface McplPushEvent {
   inferenceId: string;
   triggerInference?: boolean;
   targetAgents?: string[];
+  /** Host acceptance time (epoch ms), stamped where the push is admitted. */
+  acceptedAt?: number;
 }
 
 /**
@@ -265,4 +288,6 @@ export interface McplChannelIncomingEvent {
   metadata?: Record<string, unknown>;
   triggerInference?: boolean;
   targetAgents?: string[];
+  /** Host acceptance time (epoch ms), stamped where the message is admitted. */
+  acceptedAt?: number;
 }

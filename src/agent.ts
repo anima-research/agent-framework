@@ -3,14 +3,21 @@ import { isAbortedResponse } from '@animalabs/membrane';
 import { createHash } from 'node:crypto';
 import type { CacheWireReceipt, KvUnifiedRequestHooks } from './kv-unified-wire.js';
 import { ToolResultGuard } from './tool-result-guard.js';
+import { assertBooleanSetting, holdsSettings } from './config-checks.js';
 import {
-  indexSilentTickRows,
-  separateSilentHeartbeatTicks,
+  CONTINUE_ROW,
+  continueTurn,
+  indexRequestOnlyRows,
+  renderRequestOnlyRows,
   silentHeartbeatSeparatorTurn,
+  tickKey,
+  toolLoopPrompt,
+  type RequestOnlyPrompt,
+  type RequestOnlyRowIndex,
   type SilentHeartbeatTick,
-  type SilentTickIndex,
   type StoredRowLike,
 } from './silent-heartbeat.js';
+import { randomUUID } from 'node:crypto';
 import {
   nonErrorResultText,
   truncateForHistory,
@@ -31,6 +38,13 @@ export interface ActivationRequestOptions {
 export interface StartStreamResult {
   stream: YieldingStream;
   request: NormalizedRequest;
+  /** The request-only `[Continue]` prompt this request's reply follows, if
+   *  any, read from the request: a new one when it ends on `[Continue]`;
+   *  else, when it ends on tool results, the prompt of the reply that called
+   *  those tools (`toolLoopPrompt`); else none. The framework stamps the
+   *  reply's rows with it (`metadata.promptedBy`), for later compiles to
+   *  render it before them. */
+  continuePrompt?: RequestOnlyPrompt;
   takeKvSubmission?: () => { submissionId: string; wireReceipt: CacheWireReceipt } | undefined;
   drainKvSubmissionIds?: () => string[];
 }
@@ -77,6 +91,53 @@ function stableHash(value: unknown): string {
 const DEFAULT_CONTEXT_BUDGET_TOKENS = 100_000;
 const DEFAULT_TRANSITION_PACE_TOKENS = 16_000;
 const DEFAULT_SAME_ROUND_THINK_TEXT_POLICY: SameRoundThinkTextPolicy = 'public';
+
+/**
+ * Refuse an agent config whose `promptCaching`, `toolResultGuard`,
+ * `toolWrapperProseGuard`, `thinking.enabled` or `refusalHandling.autoRewind`
+ * holds anything but true or false (assertBooleanSetting), or whose `thinking`
+ * or `refusalHandling` is anything but an object, null or false
+ * (holdsSettings). The constructor runs it first, so the rule holds wherever
+ * an Agent is built. `create()` also runs it for each of its agents before
+ * anything opens, and `createEphemeralAgent` before it reserves the name, so a
+ * refusal there leaves nothing behind. Membrane reads `thinking.enabled`, and
+ * the refusal is here because the setting is AgentConfig's.
+ */
+export function assertAgentSwitches(config: AgentConfig): void {
+  const agent = `Agent "${config.name}"`;
+  assertBooleanSetting(
+    `${agent} promptCaching`,
+    config.promptCaching,
+    'true or leaving it out marks requests for prompt caching, and false leaves the markers off, for transports that refuse them',
+  );
+  if (holdsSettings(`${agent} thinking`, config.thinking, '{ enabled: true }')) {
+    assertBooleanSetting(
+      `${agent} thinking.enabled`,
+      config.thinking.enabled,
+      'true asks the provider for extended thinking, and false or leaving it out doesn\'t',
+    );
+  }
+  if (holdsSettings(`${agent} refusalHandling`, config.refusalHandling, '{ autoRewind: true }')) {
+    assertBooleanSetting(
+      `${agent} refusalHandling.autoRewind`,
+      config.refusalHandling.autoRewind,
+      'true redacts the turn that tripped a refusal and runs again, up to maxRewinds times, ' +
+        'and false or leaving it out doesn\'t',
+    );
+  }
+  assertBooleanSetting(
+    `${agent} toolResultGuard`,
+    config.toolResultGuard,
+    'true turns on tool-output admission, with one guarded retry after a provider refusal, ' +
+      'and false or leaving it out doesn\'t',
+  );
+  assertBooleanSetting(
+    `${agent} toolWrapperProseGuard`,
+    config.toolWrapperProseGuard,
+    'true keeps a response whose whole prose is a tool-call-shaped wrapper from running or entering the agent\'s history, ' +
+      'and false or leaving it out doesn\'t',
+  );
+}
 
 /**
  * An agent wraps a context manager and manages inference state.
@@ -224,6 +285,7 @@ export class Agent {
     contextManager: ContextManager,
     membrane: Membrane
   ) {
+    assertAgentSwitches(config);
     this.name = config.name;
     this.model = config.model;
     this.systemPrompt = config.systemPrompt;
@@ -233,11 +295,11 @@ export class Agent {
     this.temperature = config.temperature;
     this.thinking = config.thinking;
     this.refusalHandling = config.refusalHandling;
-    this.toolResultGuard = new ToolResultGuard(config.name, contextManager, config.toolResultGuard);
+    this.toolResultGuard = new ToolResultGuard(config.name, contextManager, config.toolResultGuard === true);
     this.proseRouting = config.proseRouting ?? 'locus';
-    this.toolWrapperProseGuard = config.toolWrapperProseGuard ?? false;
+    this.toolWrapperProseGuard = config.toolWrapperProseGuard === true;
     this.cacheTtl = config.cacheTtl ?? '1h';
-    this.promptCaching = config.promptCaching ?? true;
+    this.promptCaching = config.promptCaching !== false;
     this.prefillUserMessage = config.prefillUserMessage;
     this.providerParams = config.providerParams;
     this.sameRoundThinkTextPolicy = config.sameRoundThinkTextPolicy;
@@ -1059,15 +1121,8 @@ export class Agent {
       return {
         messages: this.toolResultGuard.prepareRequest(messages, true),
         system: this.buildSystemPrompt(systemInjections),
-        config: {
-          model: this.model,
-          maxTokens: this.maxTokens,
-          ...(this.temperature !== undefined && { temperature: this.temperature }),
-          ...(this.thinking !== undefined && { thinking: this.thinking }),
-        },
         tools: tools.length > 0 ? tools : undefined,
-        ...(this.providerParams && { providerParams: this.providerParams }),
-        assistantParticipant: this.name,
+        ...this.requestSettings(),
       };
     };
     const request = await assemble();
@@ -1171,9 +1226,12 @@ export class Agent {
    * Build the membrane-normalized request that WOULD be emitted for this
    * agent's next activation, given the supplied tools and injections.
    *
-   * This is the single source of truth for request assembly, shared by the
-   * real activation path (`startStreamWithInjections`) and debug/preview
-   * tooling (`Framework.previewActivation`). It does not call the membrane.
+   * This is the single source of truth for a framework turn's request,
+   * shared by the real activation path (`startStreamWithInjections`) and
+   * debug/preview tooling (`Framework.previewActivation`). It does not call
+   * the membrane. The direct API (`runInferenceWithInjections`) assembles its
+   * own messages, system prompt and tools, and both take the agent's
+   * settings from `requestSettings()`.
    * A compile that is sent commits what the context manager commits for it
    * (fold resolutions, the compression its fold plan calls for, the consumed
    * watermark); a preview passes `options.dryRun`, so its compile commits
@@ -1185,13 +1243,13 @@ export class Agent {
    * may show a withheld stub before its place is added; the activation waits
    * for them around its call.
    */
-  async buildActivationRequest(
+  private async assembleActivationRequest(
     availableTools: ToolDefinition[],
     injections?: ContextInjection[],
     budget?: TokenBudget,
     compressionTools: ToolDefinition[] = availableTools,
     options: ActivationRequestOptions = {},
-  ): Promise<NormalizedRequest> {
+  ): Promise<{ request: NormalizedRequest; continuePrompt?: RequestOnlyPrompt }> {
     // Compression may revisit hidden tools in recorded history. Keep its full
     // definition set separate from the resident's advertised tools: the
     // autobiographical strategy must declare the same tools on its
@@ -1250,42 +1308,72 @@ export class Agent {
       }))
       .filter((m) => m.content.length > 0);
 
-    // Silent heartbeat ticks store no prompt row. Render a request-only
-    // separator before each tick's first surviving row so the wire formatter
-    // cannot merge the tick into the previous assistant message (see
-    // silent-heartbeat.ts for what can and cannot be matched). This agent's
-    // own first request for a tick ends on that same turn, so the prefix it
-    // caches is the one every later compile renders. "First" is per agent: a
-    // broadcast tick shares its eventId with every resident.
-    const ticks = this.indexSilentHeartbeatTicks();
-    messages = separateSilentHeartbeatTicks(messages, ticks.rows, this.name);
+    // Silent heartbeat ticks and replies to a [Continue] turn store no
+    // prompt row. Render each request-only turn before its response's first
+    // surviving row, so the wire formatter cannot merge the response into the
+    // previous assistant message and every later request keeps the prefix
+    // the response was minted under (see silent-heartbeat.ts for what can
+    // and cannot be matched). The request that minted the response ended on
+    // that same turn, so the prefix it caches is the one every later compile
+    // renders. "First" is per agent: a broadcast tick shares its eventId with
+    // every resident.
+    const index = this.indexRequestOnlyRows();
+    const rendered = renderRequestOnlyRows(messages, index, this.name);
+    messages = rendered.messages;
+    // A tick opens wherever its separator isn't already rendered: on its first
+    // request, and on a restart whose compile left none of the tick's rows,
+    // so the restart's reply follows the separator, where every later compile
+    // renders it.
     const openingTick = options.silentHeartbeat !== undefined
-      && !ticks.started.has(options.silentHeartbeat.eventId);
+      && !rendered.separatedTicks.has(tickKey(options.silentHeartbeat));
 
+    // The [Continue] prompt this request's reply follows, read from the
+    // request itself: a new one when it ends on [Continue]; else, when it
+    // ends on tool results, the prompt of the reply that called those tools,
+    // whose tool loop this reply continues; else none. A request that ends
+    // on anything else (a message that arrived during a cooldown, say) gets
+    // a reply that follows that message and carries no prompt.
+    let continuePrompt: RequestOnlyPrompt | undefined;
     if (openingTick) {
       messages = [...messages, silentHeartbeatSeparatorTurn()];
     } else if (messages.length > 0 && messages[messages.length - 1]!.participant === this.name) {
       // Safety: ensure messages don't end with an assistant message.
       // Some models reject trailing assistant messages ("prefill not supported"),
       // and after context compression a stale assistant turn can end up last.
-      messages = [...messages, {
-        participant: 'user',
-        content: [{ type: 'text', text: '[Continue]' }],
-      }];
+      messages = [...messages, continueTurn()];
+      continuePrompt = { turn: randomUUID(), text: CONTINUE_ROW };
+    } else {
+      continuePrompt = toolLoopPrompt(messages.at(-1), index);
     }
 
-    return {
+    const request: NormalizedRequest = {
       messages: this.toolResultGuard.prepareRequest(messages),
       system: this.buildSystemPrompt(systemInjections),
+      tools: availableTools.length > 0 ? availableTools : undefined,
+      ...this.requestSettings(),
+      ...(kvUnified ? { cacheMarkers: 'cm-owned' as const } : {}),
+    };
+    return { request, ...(continuePrompt ? { continuePrompt } : {}) };
+  }
+
+  /**
+   * The request fields that come from this agent's own settings: its model
+   * config, prompt caching and cache TTL, prefill message, provider
+   * parameters and participant name. Every request the agent sends takes
+   * them from here, a framework turn's (assembleActivationRequest) and the
+   * direct API's (runInferenceWithInjections), so a setting reaches both or
+   * neither.
+   */
+  private requestSettings(): Pick<NormalizedRequest,
+    'config' | 'promptCaching' | 'cacheTtl' | 'prefillUserMessage' | 'providerParams' | 'assistantParticipant'> {
+    return {
       config: {
         model: this.model,
         maxTokens: this.maxTokens,
         ...(this.temperature !== undefined && { temperature: this.temperature }),
         ...(this.thinking !== undefined && { thinking: this.thinking }),
       },
-      tools: availableTools.length > 0 ? availableTools : undefined,
       promptCaching: this.promptCaching,
-      ...(kvUnified ? { cacheMarkers: 'cm-owned' as const } : {}),
       cacheTtl: this.cacheTtl,
       ...(this.prefillUserMessage && { prefillUserMessage: this.prefillUserMessage }),
       ...(this.providerParams && { providerParams: this.providerParams }),
@@ -1293,22 +1381,35 @@ export class Agent {
     };
   }
 
-  /** Stored silent-tick rows, memoized on the store's cached message array
-   * (ContextManager returns the same array until the store changes). */
-  private silentTickIndex: { source: readonly unknown[]; index: SilentTickIndex } | null = null;
+  /** The request `assembleActivationRequest` builds (see there), for preview
+   * and debug tooling: what this agent's next activation would send. */
+  async buildActivationRequest(
+    availableTools: ToolDefinition[],
+    injections?: ContextInjection[],
+    budget?: TokenBudget,
+    compressionTools: ToolDefinition[] = availableTools,
+    options: ActivationRequestOptions = {},
+  ): Promise<NormalizedRequest> {
+    return (await this.assembleActivationRequest(availableTools, injections, budget, compressionTools, options)).request;
+  }
 
-  private indexSilentHeartbeatTicks(): SilentTickIndex {
-    const empty: SilentTickIndex = { rows: new Map(), started: new Set() };
+  /** Stored rows that follow a request-only turn, memoized on the store's
+   * cached message array (ContextManager returns the same array until the
+   * store changes). */
+  private requestOnlyIndex: { source: readonly unknown[]; index: RequestOnlyRowIndex } | null = null;
+
+  private indexRequestOnlyRows(): RequestOnlyRowIndex {
+    const empty: RequestOnlyRowIndex = { ticks: new Map(), prompts: new Map() };
     const cm = this.contextManager as Partial<ContextManager>;
     if (typeof cm.getAllMessages !== 'function') return empty;
     try {
       const stored = cm.getAllMessages() as unknown as readonly StoredRowLike[];
-      if (this.silentTickIndex?.source === stored) return this.silentTickIndex.index;
-      const index = indexSilentTickRows(stored, this.name);
-      this.silentTickIndex = { source: stored, index };
+      if (this.requestOnlyIndex?.source === stored) return this.requestOnlyIndex.index;
+      const index = indexRequestOnlyRows(stored, this.name);
+      this.requestOnlyIndex = { source: stored, index };
       return index;
     } catch (error) {
-      console.error(`[silent-heartbeat] ${this.name}: could not index tick rows; separators omitted:`, error);
+      console.error(`[request-only-rows] ${this.name}: could not index stored rows; request-only turns omitted:`, error);
       return empty;
     }
   }
@@ -1372,8 +1473,8 @@ export class Agent {
     // Compiled only once each withheld stub's annotation has finished,
     // including one that began during the compile, and after a stub edit that
     // failed has been retried (see afterAnnotations).
-    const request = await this.toolResultGuard.afterAnnotations(
-      () => this.buildActivationRequest(availableTools, injections, budget, compressionTools, options));
+    const { request, continuePrompt } = await this.toolResultGuard.afterAnnotations(
+      () => this.assembleActivationRequest(availableTools, injections, budget, compressionTools, options));
     request.messages = this.toolResultGuard.prepareRequest(request.messages, true);
 
     const receiptAware = (this.contextManager as unknown as { getStrategy?: () => unknown })
@@ -1422,6 +1523,7 @@ export class Agent {
     return {
       stream,
       request,
+      ...(continuePrompt ? { continuePrompt } : {}),
       ...(kvEnabled
         ? {
             takeKvSubmission: () => kvQueue.shift(),
@@ -1520,19 +1622,40 @@ export class Agent {
    *  the only provenance a host-side cancel has. */
   private _pendingCancel: { reason?: string } | undefined;
 
+  /** The most recent cancelStream() made while this agent held no stream:
+   *  during a turn's hooks or compile, while it waits to retry, or while no
+   *  check of a turn is ahead at all. The framework collects it at the check
+   *  ahead of it, which ends the turn, and the next start drops one no check
+   *  collected, so a stop made while none was ahead, such as a host's
+   *  interrupt of every agent, ends nothing. */
+  private _stopWithoutStream: { reason?: string } | undefined;
+
   /**
    * Cancel the stream this agent's state holds (streaming, waiting on its
    * tools, or ready at a tool boundary with every result in), and reset to
-   * idle. `reason` is provenance for the framework's inference:aborted trace
-   * and marker metadata (e.g. 'zombie_reclaim', 'subagent_cancel'); it never
-   * reaches the provider.
+   * idle. With no stream, the stop is kept for the turn in progress, which
+   * the framework ends at its next check, before it sends anything more, if
+   * one is still ahead; otherwise the next start drops it. `reason` is
+   * provenance for the framework's inference:aborted trace and marker
+   * metadata (e.g. 'zombie_reclaim', 'subagent_cancel'); it never reaches
+   * the provider.
    */
   cancelStream(reason?: string): void {
     if ('stream' in this._state && this._state.stream) {
       this._pendingCancel = { reason };
       this._state.stream.cancel();
+    } else {
+      this._stopWithoutStream = { reason };
     }
     this._state = { status: 'idle' };
+  }
+
+  /** Collect (and clear) the cancelStream() made while this agent held no
+   *  stream, if one was made since the last collection. */
+  takeStopWithoutStream(): { reason?: string } | undefined {
+    const s = this._stopWithoutStream;
+    this._stopWithoutStream = undefined;
+    return s;
   }
 
   /** Collect (and clear) the cancel that ended the current stream, if this

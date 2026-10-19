@@ -25,6 +25,7 @@ import { tmpdir } from 'node:os';
 import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { isDeepStrictEqual } from 'node:util';
 import type {
   Module,
   ModuleContext,
@@ -330,7 +331,7 @@ describe('mid-turn deliveries keep the window what the stream carried', () => {
       pendingAssistantBlocks: Map<string, ContentBlock[]>;
       activeTurnTokens: Map<string, number>;
       activeStreams: Map<string, unknown>;
-      deferredMessages: Array<{ id: string; seq: number; participant: string }>;
+      deferredMessages: Array<{ id: string; seq: number; participant: string; forAgent?: string }>;
       deferredWritesPersisted: boolean;
       drainDeferredFor: (name: string, stopAt?: unknown) => unknown[];
       readdDrained: (entries: unknown[], where: string) => unknown[];
@@ -379,6 +380,9 @@ describe('mid-turn deliveries keep the window what the stream carried', () => {
       assert.notEqual(internals.addMessage('Antra', text('targeted'), undefined, { forAgent: 'assistant' }), '', 'stored too');
       internals.pendingAssistantBlocks.set('assistant', otherCycle());
       assert.equal(internals.addMessage('Antra', text('in its own cycle')), '', "deferred: the primary's own cycle is pending");
+      // Its entry names no agent: one with no target is the primary's, as the
+      // recovery file and a boot whose primary was renamed take it.
+      assert.deepEqual(internals.deferredMessages.map((m) => m.forAgent), [undefined], 'a primary-bound entry names no agent');
     } finally {
       internals.pendingAssistantBlocks.delete('builder');
       internals.pendingAssistantBlocks.delete('assistant');
@@ -654,6 +658,75 @@ describe('mid-turn deliveries keep the window what the stream carried', () => {
         await framework.stop();
       }
     }
+  });
+
+  it('at a tool boundary, a sharded body stored whole is carried as the next compile renders it', async () => {
+    // A body the strategy shards on ingest is stored as several messages,
+    // which a compile joins. A body of one text block reads the same as
+    // given and joined; in the other cases the two differ, so the boundary
+    // has to carry the join for the stream to carry what later requests do.
+    const long = Array.from({ length: 60 }, (_, i) => `Sentence ${i} of a long message from Antra.`).join(' ');
+    const ofLong = (messages: Array<{ content: unknown }>) =>
+      messages.filter((m) => JSON.stringify(m.content).includes('Sentence 0 '));
+    const PNG = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==';
+    const image = { type: 'image', source: { type: 'base64', data: PNG, mediaType: 'image/png' } } as ContentBlock;
+    const cases: Array<{ name: string; content: ContentBlock[] }> = [
+      { name: 'one long text block', content: text(long) },
+      { name: 'a short text, then the long text', content: [...text('Intro. '), ...text(long)] },
+      { name: 'the long text, then an image', content: [...text(long), image] },
+      { name: 'a short text, an image, then the long text', content: [...text('Intro. '), image, ...text(long)] },
+    ];
+    const readBacks: number[] = [];
+    // Every case is run, and those whose injection differs from the next
+    // compile are named together.
+    const differ: string[] = [];
+    for (const [i, { name, content }] of cases.entries()) {
+      membrane = new MockMembrane();
+      membrane.pushResponse(createMockResponse([
+        { type: 'text', text: 'Moving.' },
+        { type: 'tool_use', id: 'c1', name: 'robot--move', input: {} },
+      ] as ContentBlock[], 'tool_use'));
+      membrane.pushResponse(createMockResponse(text('Done.')));
+      const framework = await createFramework({
+        storePath: join(tempDir, `whole-${i}.chronicle`),
+        membrane: membrane.asMembrane(),
+        agents: [{
+          name: 'assistant', model: 'test-model', systemPrompt: 'You are a robot pilot.',
+          strategy: new AutobiographicalStrategy({
+            adaptiveResolution: true, foldingStrategy: 'kv-stable', recentWindowTokens: 30_000, kvStableReachTokens: 8_000,
+            targetChunkTokens: 50,
+          }),
+        } as never],
+      });
+      const cm = framework.getAgent('assistant')!.getContextManager();
+      // The store is read back for a write only when it took more than one
+      // message: here the body, and not the short message after it.
+      const internals = framework as unknown as { storedCopiesOf: (...args: unknown[]) => unknown[] };
+      const storedCopiesOf = internals.storedCopiesOf.bind(framework);
+      let readBack = 0;
+      internals.storedCopiesOf = (...args) => { readBack++; return storedCopiesOf(...args); };
+      module.interjections = [{ participant: 'Antra', content }, { participant: 'Antra', content: text('look right') }];
+      try {
+        framework.pushEvent({ type: 'external-message', source: 'test', content: 'go' } as unknown as ProcessEvent);
+        await framework.runUntilIdle();
+        const landed = cm.getAllMessages().filter((m) => (m as { bodyGroupId?: string }).bodyGroupId);
+        assert.ok(landed.length > 1, `${name}: stored as ${landed.length} shards`);
+        readBacks.push(readBack);
+        const injected = ofLong(membrane.lastStream!.receivedToolResultOptions[0]?.injectedMessages ?? []);
+        // The next turn's request is compiled from the store.
+        membrane.pushResponse(createMockResponse(text('Okay.')));
+        framework.pushEvent({ type: 'external-message', source: 'test', content: 'go' } as unknown as ProcessEvent);
+        await framework.runUntilIdle();
+        const next = ofLong(membrane.calls.at(-1)!.messages);
+        assert.equal(injected.length, 1, `${name}: one message injected`);
+        assert.equal(next.length, 1, `${name}: one message in the next request`);
+        if (!isDeepStrictEqual(injected[0]!.content, next[0]!.content)) differ.push(name);
+      } finally {
+        await framework.stop();
+      }
+    }
+    assert.deepEqual(differ, [], 'the boundary carried what the next compile renders');
+    assert.deepEqual(readBacks, [1, 1, 1, 1], 'the store is read back for each body, and not for the short message after it');
   });
 
   it("a write that throws after it's stored, re-added from the queue, is weighed for its agent's open turn as a stored write is", async () => {

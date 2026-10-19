@@ -64,12 +64,32 @@ Chronicle's audit history.
   model: 'claude-opus-4-20250514',
   systemPrompt: '...',
   strategy: new AutobiographicalStrategy({ recentWindowTokens: 30000 }),
-  allowedTools: ['search', 'read', 'write'],   // or 'all'
+  allowedTools: ['search--query', 'utils', 'files--archive'], // or 'all'
   triggerSources: ['discord'],                   // or 'all'
   maxTokens: 8192,
   maxStreamTokens: 150_000,  // input token budget before stream restart
 }
 ```
+
+`allowedTools` is enforced at dispatch for registered agents. Omission or
+`'all'` permits all tools; an explicit list matches exact names, including
+`module--utility` names. Utilities aren't tools of their own: an agent's model
+and its scripts are offered them only through `utils`, whose `run` checks the
+utility's own name. An agent that should use a utility lists both `utils` and
+`module--utility`. The name alone passes the dispatch check for any call by
+that name, whether the host makes it with `executeToolCall` on the agent's
+behalf or the model or a script makes it without being offered it. The slot
+is hidden when the agent can use no registered utility. If utilities exist
+but none are permitted, `list` returns a failed `ToolResult` with the registered
+and permitted counts and migration advice, and a list containing `utils`
+logs one warning per Agent instance after registration.
+An empty registry still returns a successful empty list.
+
+Trusted module calls are exempt from agent allowlists. Genuinely unidentified
+public callers, including unknown legacy caller names, remain unrestricted.
+Framework-created ephemeral and conversation identities fail closed while
+unregistered. Hosts using `createEphemeralAgent` must register and run the
+returned agent through `runEphemeralToCompletion` for tool authority.
 
 **Inference modes:**
 - **Streaming** (default in framework): `startStreamWithInjections()` returns a `YieldingStream` that emits tokens, tool calls, and completion events. The framework drives the stream, dispatches tools, and resumes automatically.
@@ -217,8 +237,11 @@ queue. Switching back to the source branch queues removal of the bot's marker;
 returning to the recovery branch queues it again. Initial MCPL events remain
 buffered until the ledger has been reconciled. Startup, reconnect, runtime
 list-change, and online undo use one framework-global generation: every MCPL
-data plane waits while all control planes remain live for registration and
-marker service. Awareness marker calls also have a mandatory deadline that is
+data plane waits while the control planes remain live for registration and
+marker service. A connection whose policy exchange is in flight, after a
+connect or a reconnect, keeps both planes closed until the exchange settles,
+since its traffic is admitted against the grant the exchange establishes.
+Awareness marker calls also have a mandatory deadline that is
 independent of `requestTimeoutMs` (including when that value is `0`); configure
 it with `discordAwarenessDeadlineMs` (default 10000ms, clamped to 50..60000ms).
 Configure the online marker with `discordAwarenessEmoji`; the offline CLI
@@ -255,6 +278,17 @@ defaults to `mcpl--<serverId>`: server `search` with no `toolPrefix` offers
 `mcpl--search--query`, and with `toolPrefix: 'search'` it offers
 `search--query`.
 
+No two servers' prefixes may meet, since their servers could then give one
+tool name. Two prefixes meet when one is the other's followed by `-`, or
+begins with the other's followed by `--`: server `foo` listing `bar--echo` and
+server `foo--bar` listing `echo` would both give `foo--bar--echo`. `create()`
+refuses such a pair, and so do a runtime connect and a restart (before it
+disconnects anything), naming both servers and the rule. `foo` beside
+`foo-bar` or `foobar` is fine. A server that lists one tool more than once has
+its first listing offered to the model and the rest left out, and each tool
+refresh that finds it raises an `mcpl-tool-duplicate` ops alert naming the
+tools. Its webhook post goes out at most once per server in 15 minutes.
+
 These settings take RFC-007 §6.2 patterns (`*` matches any run of characters)
 over that full model-facing name, so they need the prefix:
 
@@ -269,6 +303,72 @@ A pattern that matches no tool is reported once, as a console line and an
 (`search--*` under the default prefix), the report suggests the prefixed form.
 A pattern that could name a server's tools is not judged until that server
 has listed them, so late connects and reconnects don't cause early reports.
+
+#### Modern MCP servers (2026-07-28)
+
+The same `mcplServers` list also takes servers that speak modern MCP
+(revision `2026-07-28`), reached through the official SDK client. The
+configuration chooses the family, and nothing is probed:
+
+| Configuration | Family | Transport |
+|---|---|---|
+| `url: 'ws://…'` / `'wss://…'` | MCPL (MCP `2024-11-05`) | WebSocket |
+| `url: 'http://…'` / `'https://…'` | modern MCP | Streamable HTTP (`token` / `accessProvider` as bearer) |
+| `command` | MCPL | stdio |
+| `command` + `protocol: 'modern'` | modern MCP | stdio |
+
+```typescript
+{
+  mcplServers: [
+    { id: 'docs', url: 'https://mcp.example.com/mcp', accessProvider: getToken },
+    { id: 'search', command: 'search-mcp', protocol: 'modern', reconnect: true },
+  ],
+}
+```
+
+A configuration with both `command` and `url` needs `transport` to say which
+one is used; without it, it is refused rather than silently ignoring one.
+
+A modern server's tools get the same prefix, `enabledTools`/`disabledTools`,
+class overrides and dispatch as an MCPL server's, and `listMcplServers()`
+shows its `family`, `protocolVersion` and `transport`. Its config differs in
+three ways:
+- It has no MCPL surface (grant, push, channels, inference requests, feature
+  sets). A setting that asks for that surface can't apply, so it is a
+  configuration error: `allowHostCommands: true`, an `enabledCapabilities`
+  pattern that matches a capability denied by default, `channelSubscription:
+  'auto'` or a non-empty list, a scope's non-empty `whitelist`, a
+  `toolLifecycle` `observe` or `inputs` block, and a
+  `toolLifecycle.maxInputBytes` or an `autofetch` bound above its default.
+  A setting
+  that only takes something away, or repeats a default, is already
+  satisfied, so it is accepted: `enabledFeatureSets` and the rest of
+  `enabledCapabilities`, which are allow-lists, `disabledFeatureSets`,
+  `disabledCapabilities`, a scope's `blacklist`, `channelSubscription:
+  'manual'`, a `toolLifecycle.maxInputBytes` or an `autofetch` bound at or
+  below its default, and `shouldTriggerInference`.
+  So a host that puts a deny-list on every server it deploys can deploy a
+  modern one.
+- `requestTimeoutMs` is one deadline per tool call and must be 1 to 2^31−1;
+  0 is refused, where MCPL reads it as no watchdog.
+- Over stdio it takes no credential: `token` or `accessProvider` on one is
+  refused.
+
+At the deadline, cancellation is requested for a leg still in flight;
+between the rounds of an `input_required` continuation nothing is in flight
+to cancel. Either way the outcome is reported as unknown (`no-response`),
+and the call is never retried. The protocol has no cancel for a paused call,
+so whatever the server holds for it, beyond the `requestState` it gave this
+client, stays until the server lets it go. A call that ends for any other
+reason after the server asked for another round, before its final answer, is
+reported the same way, since the server may already have acted. An MCPL
+server that refuses `2024-11-05` with `-32022` fails with
+`McplProtocolVersionError`, and is not retried. The error names the
+revisions the server says it supports ("none listed" for an empty list), or its error text when it sends no list,
+and when the list includes `2026-07-28` it says to configure the server with
+`protocol: 'modern'` (stdio) or reach it over http(s).
+
+Server and transport text the framework records has the server's configured credentials replaced, in both engines. That covers connection traces, console lines, stderr traces, ops alerts, and a tool call's failure as its caller, the model and the `tool:failed` trace get it. The credentials are those the configuration holds and those its dials sent: from the url as each dial sends it (a WebSocket dial sets the token in the query, which writes the whole query again, form-encoded, and an access provider's token can be in it), credential-like path segments and query names, credential-shaped or credential-named query values, and a WebSocket url's userinfo, in their encoded and decoded forms, replaced wherever they occur; every non-empty query parameter as its whole `name=value`, where no letter or digit adjoins it; the static `token`, and each token an access provider handed a dial, the newest sixteen, raw and url-encoded; and a stdio server's `env` values whose names have a part ending in a credential word, such as `GITHUB_TOKEN`, `PGPASSWORD` or `SESSION_COOKIE`, raw and url-encoded. A stdio server's command-line arguments aren't derived. Standalone strings shorter than eight characters stay unchanged because they may be ordinary words; short query values are still removed with their parameter names. Treat a submitted configuration as immutable while the server uses it: apply changes with `restartMcplServer(id, newConfig)`. Secrets neither the configuration holds nor a dial sent remain outside this filtering. JSON-RPC tool answers, and the error a host's own connect raises, pass through as sent.
 
 #### Feature sets
 
@@ -299,7 +399,10 @@ some version was read (or history is unknown). `initial: true` on a create lets
 the host know the subject's history is complete, so a create → edit → delete
 that nobody read leaves no trace. `deferred: true` (push only) holds a batch of
 notices outside context and asks the server for the content with `push/render`
-when a turn is assembled.
+when a turn is assembled. Each render describes what changed since the one
+before it, so neither a later render nor a notice replaces an earlier render
+the model hasn't read: the newer render lands after it, and a retraction or a
+later plain occurrence withdraws the unread renders, newest first.
 
 Plain content stays in context and is delivered on arrival through the ordinary
 channel/push path; the host only remembers where it landed. "Unread" means:
@@ -334,6 +437,8 @@ framework.abortInference('assistant', 'user requested stop');
 The non-streaming path uses `AbortSignal` forwarded to `membrane.stream()`, which returns an `AbortedResponse` with partial content. The streaming path cancels the `YieldingStream` directly.
 
 A turn whose stream is cancelled this way, or by `agent.cancelStream()`, ends as a stop, whether the stream reports the cancel as `aborted`, as an `error`, or by just closing: one `inference:aborted` carrying the caller's reason (`user` when none was given), a `[turn-interrupted]` note in the agent's context, and never `inference:exhausted`, which is for failed inferences. A stream that membrane aborts on its own, at a deadline or on an error (reason `timeout` or `error`), is a failed inference. `stop()` and an operator's quiesce abandon end a turn as a stop too, with their own reasons, `shutdown` and `quiesce_abandoned`, and write no note. A stopped stream still writes its inference-log row, with `success: false`.
+
+A caller's stop and an operator's quiesce abandon also reach a turn that has no live stream: one running its modules' `gatherContext`, its MCPL hooks or its compile, one waiting to retry a failed inference or compile (`abortInference()` and an operator's abandon end the wait, and a stop through `Agent.cancelStream()` waits for it to run out), and one whose tool-result guard is waiting to retry after a refusal, which holds only the round's finished stream. The turn ends at its next check, before it sends anything more, as a stop on a live stream ends it, and a turn whose compile fails after the stop ends at the failure, before a provider hold, the error policy's retry or `inference:exhausted`. A caller's stop leaves the note saying the turn was stopped before it sent anything or before it finished, and an operator's abandon leaves none. `abortInference()` returns `true` for such a turn. In the guard's wait, `stop()` ends the turn as a stop with reason `shutdown`, and an operator's abandon ends it as the abandon, even when a caller's stop came first; with both, it ends as `stop()`'s. `stop()` drops a turn in its hooks, its compile or a wait to retry before it sends anything, as before, and drops one whose compile fails while it runs, once a caller's stop has reached it, rather than ending it as that stop. While the failure of a turn's stream is reported (`inference:failed`), the agent no longer holds that stream, so `abortInference()` from a listener reports `false`. A failure to build a turn's request is reported while the turn's check is still ahead, so there `abortInference()` reports `true`, and the turn ends at that check. A stop made where no check of a turn is ahead stops nothing, and doesn't end the agent's next turn: while the agent is idle, while a turn finishes its last delivery, while a budget restart or a non-streaming turn's tool results wait to start the turn's next call, and while a provider-capacity hold or a provider's stated wait has parked a turn until the hold ends.
 
 ## API Server
 

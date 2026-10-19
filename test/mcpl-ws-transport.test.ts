@@ -1,9 +1,9 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { WebSocketServer, type WebSocket } from 'ws';
+import { WebSocketServer, WebSocket } from 'ws';
 import type { AddressInfo } from 'node:net';
 import { McplServerConnection, type McplConnectionCloseInfo } from '../src/mcpl/server-connection.js';
-import { buildWebSocketUrl, isWebSocketTransport } from '../src/mcpl/transport.js';
+import { buildWebSocketUrl, isWebSocketTransport, openTransport } from '../src/mcpl/transport.js';
 import type { McplHostCapabilities } from '../src/mcpl/types.js';
 
 const HOST_CAPS: McplHostCapabilities = { version: '0.4', pushEvents: true, featureSets: true };
@@ -28,7 +28,7 @@ function startMockMcplWsServer(onSocket?: (ws: WebSocket) => void) {
       const reply = (result: unknown) => ws.send(JSON.stringify({ jsonrpc: '2.0', id: msg.id, result }));
       switch (msg.method) {
         case 'initialize':
-          reply({ capabilities: { experimental: { mcpl: { version: '0.4', pushEvents: true } } } });
+          reply({ protocolVersion: '2024-11-05', capabilities: { experimental: { mcpl: { version: '0.4', pushEvents: true } } } });
           break;
         case 'notifications/initialized':
           break; // notification, no reply
@@ -82,15 +82,39 @@ test('buildWebSocketUrl validates protocol and appends the token as a query para
   );
   assert.throws(() => buildWebSocketUrl({ id: 's', url: 'http://example.com' }), /ws:\/\/ or wss:\/\//);
   assert.throws(() => buildWebSocketUrl({ id: 's', command: 'x' }), /requires "url"/);
+  // A url that doesn't parse can't be redacted, so the error doesn't echo it.
+  assert.throws(() => buildWebSocketUrl({ id: 's', url: 'not a url ?token=sekret' }),
+    (error: Error) => /invalid WebSocket url/.test(error.message) && !error.message.includes('sekret'));
+});
+
+test('buildWebSocketUrl refuses a url with a fragment, which the ws library refuses to dial', () => {
+  assert.throws(() => buildWebSocketUrl({ id: 's', url: 'wss://example.com/mcpl#x' }), /must not have a fragment, got "#x"/);
+  assert.throws(() => new WebSocket('wss://example.com/mcpl#x'), /fragment identifier/);
+  // An empty fragment is no fragment to either.
+  assert.equal(buildWebSocketUrl({ id: 's', url: 'wss://example.com/mcpl#' }), 'wss://example.com/mcpl#');
 });
 
 test('isWebSocketTransport selects the transport from config shape', () => {
   assert.equal(isWebSocketTransport({ id: 's', url: 'wss://x/y' }), true);
   assert.equal(isWebSocketTransport({ id: 's', url: 'wss://x/y', transport: 'websocket' }), true);
   assert.equal(isWebSocketTransport({ id: 's', command: 'node' }), false);
-  // Explicit transport wins over shape.
   assert.equal(isWebSocketTransport({ id: 's', command: 'node', transport: 'stdio' }), false);
-  assert.equal(isWebSocketTransport({ id: 's', url: 'wss://x', command: 'node' }), false); // url+command → stdio unless transport says otherwise
+  // The scheme decides, as resolveServerBinding does: an http(s) url is modern MCP, never a WebSocket.
+  assert.equal(isWebSocketTransport({ id: 's', url: 'https://x/mcp' }), false);
+  assert.equal(isWebSocketTransport({ id: 's', url: 'http://x/mcp', transport: 'http' }), false);
+  // With both a command and a url, the explicit transport decides.
+  assert.equal(isWebSocketTransport({ id: 's', url: 'wss://x', command: 'node', transport: 'websocket' }), true);
+  assert.equal(isWebSocketTransport({ id: 's', url: 'wss://x', command: 'node', transport: 'stdio' }), false);
+  // A configuration resolveServerBinding refuses selects nothing.
+  assert.equal(isWebSocketTransport({ id: 's', url: 'wss://x', command: 'node' }), false);
+  assert.equal(isWebSocketTransport({ id: 's', url: 'https://x/mcp', transport: 'websocket' }), false);
+});
+
+test('openTransport refuses a modern or refused configuration before dialing or spawning anything', async () => {
+  // x.invalid never resolves, so a dial would fail with a connect error, not these.
+  await assert.rejects(openTransport({ id: 'm', url: 'https://x.invalid/mcp' }), /configured for modern MCP; the legacy transports can't open it/);
+  await assert.rejects(openTransport({ id: 'm', command: 'srv', protocol: 'modern' }), /configured for modern MCP; the legacy transports can't open it/);
+  await assert.rejects(openTransport({ id: 'b', command: 'srv', url: 'wss://x.invalid/mcpl' }), /"command" and "url" are both set/);
 });
 
 test('connects over WebSocket, negotiates capabilities, lists tools, and round-trips a call', async () => {
@@ -127,6 +151,17 @@ test('a failed WebSocket dial rejects with a clear error (no reconnect)', async 
   );
 });
 
+test("a failed dial's error names the endpoint, never a credential the url or the token carries", async () => {
+  await assert.rejects(
+    McplServerConnection.connect({ id: 'dead', url: 'ws://u:pw@127.0.0.1:1/mcpl/s/sekret4kQ9xW2vLm8pRs/x?api_key=sekret&v=2', token: 'tok-sekret' }, HOST_CAPS),
+    (error: Error) => {
+      assert.match(error.message, /WebSocket connect (failed|timed out).*\(ws:\/\/127\.0\.0\.1:1\/mcpl\/s\/redacted\/x\?api_key=redacted&v=redacted\)/);
+      assert.ok(!/sekret|pw@/.test(error.message), error.message);
+      return true;
+    },
+  );
+});
+
 // A tiny stdio MCPL server: reads NDJSON on stdin, answers the same three
 // methods on stdout, and writes one line to stderr on boot (to prove stderr
 // still surfaces after the transport refactor). Kept inline so the test is
@@ -142,7 +177,7 @@ process.stdin.on('data', (c) => {
     if (!line.trim()) continue;
     let m; try { m = JSON.parse(line); } catch { continue; }
     const reply = (result) => process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: m.id, result }) + '\\n');
-    if (m.method === 'initialize') reply({ capabilities: { experimental: { mcpl: { version: '0.4', pushEvents: true } } } });
+    if (m.method === 'initialize') reply({ protocolVersion: '2024-11-05', capabilities: { experimental: { mcpl: { version: '0.4', pushEvents: true } } } });
     else if (m.method === 'tools/list') reply({ tools: [{ name: 'echo', description: 'e', inputSchema: { type: 'object' } }] });
     else if (m.method === 'tools/call') reply({ content: [{ type: 'text', text: String((m.params && m.params.arguments && m.params.arguments.text) || '') }] });
   }
@@ -363,7 +398,8 @@ test('a server that closes during the handshake with a code and no reason gets t
   }
 });
 
-test("a server's close reason stays out of the error a pending request is rejected with", async () => {
+test("a server's close reason stays out of the error a pending request is rejected with, and out of the log", async (t) => {
+  const errors = t.mock.method(console, 'error', () => {});
   const wss = startClosingWsServer('tools/call', 4001, PEER_REASON);
   await waitListening(wss);
   let conn: McplServerConnection | undefined;
@@ -373,10 +409,15 @@ test("a server's close reason stays out of the error a pending request is reject
     await assert.rejects(
       withDeadline(conn.sendToolsCall('echo', { text: 'hello' }), 10_000, 'the call to be rejected'),
       (error: Error) => {
-        assert.match(error.message, /^MCPL server "editor" disconnected unexpectedly \(code=4001, signal=n\/a, reason=websocket closed\) while awaiting tools\/call \(id=\d+\)$/);
+        assert.equal(error.message, 'The connection to the "editor" server closed before it answered, so whether the request took effect is unknown. ' +
+          "This host won't reconnect to it on its own. If you need it, ask whoever runs this host.");
         return true;
       },
     );
+    // The log has the close's code and the transport's words, never the peer's.
+    const lines = errors.mock.calls.map((call) => String(call.arguments[0]));
+    assert.ok(lines.some((line) => /^MCPL server "editor" disconnected \(code=4001, signal=n\/a, reason=websocket closed\) with 1 request\(s\) unanswered: tools\/call \(id=\d+\)$/.test(line)), lines.join('\n'));
+    assert.ok(!lines.some((line) => line.includes(PEER_REASON)), 'no log line carries the peer\'s close text');
   } finally {
     await conn?.close();
     wss.close();

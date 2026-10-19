@@ -54,7 +54,7 @@ interface Internals {
   maintenancePass: Promise<unknown> | null;
   mcplServerRegistry: unknown;
   beginDiscordAwarenessBarrier: () => { requiresBarrier: boolean; promise: Promise<unknown> };
-  wireMcplEvents(connection: unknown): void;
+  wireMcplEvents(connection: unknown, config: { id: string }): void;
   operatorOperations: Set<{ label: string; promise: Promise<void> }>;
   moduleRegistry: { getModule(name: string): unknown };
   saveTurnCheckpoints(name: string, checkpoints: unknown[]): void;
@@ -259,7 +259,7 @@ describe('stop() with an operator operation in flight', () => {
   it("stop() waits for a host/command, so its answer goes out before the connections close", async () => {
     const framework = await create();
     const connection = Object.assign(new EventEmitter(), { id: 'srv' });
-    internals(framework).wireMcplEvents(connection);
+    internals(framework).wireMcplEvents(connection, { id: 'srv' });
     const cm = framework.getAgent('agent')!.getContextManager();
     for (const n of [1, 2]) {
       cm.addMessage('user', [{ type: 'text', text: `m${n}` }], { serverId: 'srv', channelId: 'discord:g1:c1', messageId: `d${n}` });
@@ -358,7 +358,7 @@ describe('stop() with an operator operation in flight', () => {
     record('agent');
     framework.getAgent('agent')!.getContextManager().addMessage('user', [{ type: 'text', text: 'a turn' }]);
     const connection = Object.assign(new EventEmitter(), { id: 'srv' });
-    internals(framework).wireMcplEvents(connection);
+    internals(framework).wireMcplEvents(connection, { id: 'srv' });
     let barriers = 0;
     internals(framework).beginDiscordAwarenessBarrier = () => {
       barriers++;
@@ -814,7 +814,7 @@ describe('stop() with an operator operation in flight', () => {
           && error.code === 'agent-busy' && error.message === 'Cannot redo: the store is under live switch branch for every agent');
         // A host/command undo in turns mode answers the refusal with its code.
         const connection = Object.assign(new EventEmitter(), { id: 'srv' });
-        fw.wireMcplEvents(connection);
+        fw.wireMcplEvents(connection, { id: 'srv' });
         let answer: unknown;
         connection.emit('host-command', { command: 'undo', agentName: 'agent', turns: 1 }, {
           id: 11,
@@ -961,7 +961,15 @@ describe('stop() with an operator operation in flight', () => {
       await until(() => entered, 'MCPL operation');
       const stopping = framework.stop();
       await releaseWhenStopWaits(release);
-      await running;
+      // A disconnect finishes. A connect, or a restart's connect, that stop()
+      // overtook says so rather than reporting a connection the teardown is
+      // about to close.
+      if (action === 'disconnect') await running;
+      else {
+        await assert.rejects(running, action === 'connect'
+          ? /^Error: MCP server "srv" was not connected: the framework stopped while it was connecting$/
+          : /^Error: MCP server "srv" is down: it was disconnected for its restart, and the restart's connect failed: MCP server "srv" was not connected: the framework stopped while it was connecting$/);
+      }
       await stopping;
       assert.equal(connected, false);
       const settled = action === 'disconnect' ? 'connection removed' : 'connection opened';
@@ -1071,7 +1079,7 @@ describe('stop() with an operator operation in flight', () => {
       if (event.type === 'undo:completed') stopping = framework.stop();
     });
     const connection = Object.assign(new EventEmitter(), { id: 'srv' });
-    fw.wireMcplEvents(connection);
+    fw.wireMcplEvents(connection, { id: 'srv' });
     connection.emit('host-command', { command: 'undo', agentName: 'agent', turns: 1 }, {
       id: 9,
       respond: () => { order.push('undo answered'); },
@@ -1129,7 +1137,7 @@ describe('stop() with an operator operation in flight', () => {
       if (event.type === 'undo:completed' && !stopping) stopping = framework.stop();
     });
     const connection = Object.assign(new EventEmitter(), { id: 'srv' });
-    fw.wireMcplEvents(connection);
+    fw.wireMcplEvents(connection, { id: 'srv' });
     let answer: { ok?: boolean; undone?: number; requested?: number } | undefined;
     // Read as the answer goes out: stop() closes the store once the undo is done.
     let checkpoints: unknown[] | undefined;

@@ -264,8 +264,8 @@ test('mandatory awareness deadline survives requestTimeoutMs: 0 and durably rele
     const entry = outbox.batches()[0]!.refs[0]!;
     assert.equal(entry.deliveryStatus, 'pending');
     assert.equal(entry.attempts, 1);
-    assert.match(entry.lastError ?? '', /did not respond to tools\/call/);
-    assert.match(entry.lastError ?? '', /outcome is unknown/i);
+    assert.match(entry.lastError ?? '', /didn't answer within/);
+    assert.match(entry.lastError ?? '', /took effect is unknown/i);
     assert.equal(records(statusPath).filter((record) => record.event === 'reaction-call').length, 1);
     const push = records(statusPath).find((record) => record.event === 'push-response');
     assert.equal(push?.ledgerStatus, 'pending', 'failure was durable before inference release');
@@ -858,16 +858,26 @@ async function failPolicyRegistrationWhileServing(dir: string, closeFails: boole
   try {
     const traces: Array<{ type: string; serverId?: string; error?: string }> = [];
     framework.onTrace((event) => traces.push(event as never));
+    // Which servers' tools the framework asks to relist.
+    const lists = framework as unknown as { handleToolsListChanged(id: string): void };
+    const relist = lists.handleToolsListChanged.bind(framework);
+    const refreshed: string[] = [];
+    lists.handleToolsListChanged = (id: string) => { refreshed.push(id); relist(id); };
     const features = FeatureSetManager.prototype as any;
     const initializeServer = features.initializeServer;
     features.initializeServer = function (this: unknown, serverId: string, ...rest: unknown[]) {
       if (serverId === discord.id) throw new Error('injected policy registration failure');
       return initializeServer.call(this, serverId, ...rest);
     };
+    // Whether its exchange's marker still held the failing connection's
+    // planes when its close began, which marks it closed for good.
+    const exchanges = (framework as unknown as { mcplPolicyExchanges: WeakMap<object, number> }).mcplPolicyExchanges;
+    const markedAtClose: boolean[] = [];
     const connections = McplServerConnection.prototype as any;
     const close = connections.close;
     let closeFailed = false;
     connections.close = function (this: any) {
+      if (this.id === discord.id) markedAtClose.push(exchanges.get(this) === this.transportEpoch);
       if (closeFails && this.id === discord.id && !closeFailed && this.transport) {
         closeFailed = true;
         const transport = this.transport;
@@ -887,6 +897,9 @@ async function failPolicyRegistrationWhileServing(dir: string, closeFails: boole
       connections.close = close;
     }
     assert.equal(closeFailed, closeFails, 'the close failed only when asked to');
+    // So no gate, such as a resume finishing meanwhile, could ready it
+    // between its exchange's end and its close.
+    assert.deepEqual(markedAtClose, [true], 'it was closed once, while its exchange still held its planes');
     const internals = framework as unknown as {
       discordAwarenessBarrier: unknown;
       mcplServerRegistry: { getServer(id: string): unknown };
@@ -900,7 +913,7 @@ async function failPolicyRegistrationWhileServing(dir: string, closeFails: boole
       false,
       'no gate failed',
     );
-    return { framework, discord, registry: internals.mcplServerRegistry };
+    return { framework, discord, registry: internals.mcplServerRegistry, refreshed };
   } catch (error) {
     await framework.stop();
     throw error;
@@ -943,6 +956,7 @@ test('a runtime connect whose policy registration throws and whose close then fa
     assert.ok(refused, 'the connection whose close failed is still registered');
     assert.equal(refused.willReconnect, false, 'its close had disarmed it before the transport close failed');
     assert.equal(refused.dataPlaneReady, false, 'the gate\'s completion left the refused connection paused');
+    assert.ok(failed.refreshed.includes(failed.discord.id), 'a refresh of the tool list was asked for though its close failed');
     await failed.framework.syncDiscordAwarenessMarkers();
     assert.equal(refused.dataPlaneReady, false, 'a later gate\'s completion leaves it paused too');
     assert.ok(
@@ -1036,6 +1050,7 @@ test('a control flush that installs a newer generation cannot be released by the
   const oldDrain = deferred<any>();
   const newDrain = deferred<any>();
   const framework = Object.create(AgentFramework.prototype) as any;
+  framework.mcplPolicyExchanges = new WeakMap();
   framework.discordAwarenessBarrier = null;
   framework.discordAwarenessBarrierGeneration = 0;
   const drains = [oldDrain.promise, newDrain.promise];
@@ -1075,6 +1090,7 @@ test('a control flush that installs a newer generation cannot be released by the
 
 test('while the host stops, a failed gate lets out what a running connection held, and nothing of one closed for good', async () => {
   const framework = Object.create(AgentFramework.prototype) as any;
+  framework.mcplPolicyExchanges = new WeakMap();
   framework.discordAwarenessBarrier = null;
   framework.discordAwarenessBarrierGeneration = 0;
   framework.beginDiscordAwarenessBarrier = () => ({ requiresBarrier: true, promise: new Promise(() => {}) });
@@ -1114,6 +1130,7 @@ test('overlapping reconnect/list-change generations release only the newest barr
   const reconnectDrain = deferred<any>();
   const listChangeDrain = deferred<any>();
   const framework = Object.create(AgentFramework.prototype) as any;
+  framework.mcplPolicyExchanges = new WeakMap();
   framework.discordAwarenessBarrier = null;
   framework.discordAwarenessBarrierGeneration = 0;
   const drains = [reconnectDrain.promise, listChangeDrain.promise];
@@ -1158,7 +1175,7 @@ test('inbound handlers wait out a generation installed while they wait', async (
   framework.handleHostCommand = async () => { handled.push('host-command'); return { ok: true }; };
   const connection = new EventEmitter() as any;
   connection.id = 'discord';
-  framework.wireMcplEvents(connection);
+  framework.wireMcplEvents(connection, { id: 'discord' });
   const responder = { id: 1, respond: () => {}, respondError: () => {} };
   for (const event of ['push-event', 'inference-request', 'channels-incoming', 'host-command']) {
     connection.emit(event, {}, responder);
@@ -1194,7 +1211,7 @@ test('an inbound handler waiting on a generation that fails refuses its request 
   framework.handleHostCommand = async () => { handled.push('host-command'); return { ok: true }; };
   const connection = new EventEmitter() as any;
   connection.id = 'discord';
-  framework.wireMcplEvents(connection);
+  framework.wireMcplEvents(connection, { id: 'discord' });
   const answers: Array<{ event: string; code?: number; result?: unknown }> = [];
   for (const event of ['push-event', 'inference-request', 'channels-incoming', 'host-command']) {
     connection.emit(event, {}, {
@@ -1226,7 +1243,7 @@ test('with no generation current, an inbound event is handled in the turn it arr
   framework.handleHostCommand = async () => { handled.push('host-command'); return { ok: true }; };
   const connection = new EventEmitter() as any;
   connection.id = 'discord';
-  framework.wireMcplEvents(connection);
+  framework.wireMcplEvents(connection, { id: 'discord' });
   const responder = { id: 1, respond: () => {}, respondError: () => {} };
   for (const event of ['push-event', 'inference-request', 'channels-incoming', 'host-command']) {
     connection.emit(event, {}, responder);

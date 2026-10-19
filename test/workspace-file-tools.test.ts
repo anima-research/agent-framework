@@ -445,18 +445,20 @@ test('an edit that fails after its change is stored, having taken disk\'s change
   assert.equal(await stored('e.txt'), 'v2 LINE from another writer\n');
 });
 
-test('a deletion whose disk copy is not a regular file names the materialize that unlinks it', { skip: process.platform === 'win32' ? 'no FIFOs' : false }, async (t) => {
+test('a deletion whose disk copy is not a regular file says no push unlinks it, forced or not', { skip: process.platform === 'win32' ? 'no FIFOs' : false }, async (t) => {
   const { dir, call } = setup(t, { autoMaterialize: true });
   writeFileSync(join(dir, 'q.txt'), 'v1\n');
   assert.equal((await call('read', { path: 'work/q.txt' })).success, true);
   rmSync(join(dir, 'q.txt'));
   assert.equal(spawnSync('mkfifo', [join(dir, 'q.txt')]).status, 0, 'mkfifo');
+  const noPush = 'disk has a pipe, socket or device at this path, or a symlink to one, and no push unlinks it, forced or not — '
+    + 'ask whoever runs this host if it should go';
   assert.equal(errorOf(await call('delete', { path: 'work/q.txt' })), 'The deletion of "work/q.txt" is stored in the workspace, so don\'t send it again. '
-    + "Its push to disk didn't complete: cannot verify disk copy (not a regular file) — "
-    + 'fix it and materialize again with applyDeletions, or materialize it with force and applyDeletions to delete it.');
+    + `Its push to disk didn't complete: ${noPush}.`);
   const forced = await call('materialize', { path: 'work/q.txt', force: true, applyDeletions: true });
   assert.equal(forced.success, true, forced.error);
-  assert.equal(existsSync(join(dir, 'q.txt')), false, 'the forced materialize unlinked it');
+  assert.deepEqual((forced.data as { skipped?: unknown }).skipped, [{ mount: 'work', reason: `q.txt: not unlinked: ${noPush}` }]);
+  assert.equal(statSync(join(dir, 'q.txt')).isFIFO(), true, 'the FIFO stays');
 });
 
 // ---------------------------------------------------------------------------
@@ -473,14 +475,17 @@ test("an edit of a file disk made binary answers the disk-only text, not a delet
   assert.deepEqual([...readFileSync(join(dir, 'b.txt'))], [0, 1, 2, 0, 255, 0], 'disk keeps its bytes');
 });
 
-test('a deletion of a draft that met a disk file the workspace never saw names applyDeletions', async (t) => {
+test('a deletion of a draft that met a disk file the workspace never saw completes, leaves that file alone, and says so', async (t) => {
   const { dir, call, disk } = setup(t, { autoMaterialize: true });
   writeFileSync(join(dir, 'c.txt'), 'disk text\n');
   // The workspace never read c.txt, so its write is a draft that collides.
   assert.match(errorOf(await call('write', { path: 'work/c.txt', content: 'agent text\n' })), /conflict: store-origin-collision/);
-  assert.equal(errorOf(await call('delete', { path: 'work/c.txt' })), 'The deletion of "work/c.txt" is stored in the workspace, so don\'t send it again. '
-    + "Its push to disk didn't complete: disk holds a different copy, and nothing records which is newer (conflict: store-origin-collision) — "
-    + 'sync this path to adopt the disk version, or materialize this path with force and applyDeletions to delete it.');
+  // Deleting the draft gives up the workspace's side, and disk never agreed
+  // with it: nothing is pushed, disk's file is a sync's to observe, and the
+  // answer says nothing was unlinked.
+  const deleted = await call('delete', { path: 'work/c.txt' });
+  assert.equal(deleted.success, true, String(deleted.error));
+  assert.match(String((deleted.data as { note?: string }).note), /^nothing was unlinked: /);
   assert.equal(disk('c.txt')!.toString(), 'disk text\n');
 });
 

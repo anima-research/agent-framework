@@ -18,6 +18,7 @@ import type { FeatureSetManager } from './feature-set-manager.js';
 import { McplFeatureSetError } from './feature-set-manager.js';
 import { expandCoreTags } from './tags.js';
 import { coalesceRejectionReason, EmptyContentError, validateCoalescedContent } from './push-coalescer.js';
+import type { InboundSource } from './inbound-source.js';
 import { isSilentHeartbeatMarker, isVisiblyEmptyConversion } from './visible-content.js';
 import { logDetail, logValue } from './log-value.js';
 import { RefusalLines } from './refusal-lines.js';
@@ -49,6 +50,11 @@ export interface McplPushEvent {
   coalescingSubject?: string;
   /** RFC-006 assembly: materialized for this agent's turn (store directly). */
   assemblingFor?: string;
+  /** Host acceptance time (epoch ms), stamped where the push is admitted. */
+  acceptedAt?: number;
+  /** Framework-owned source envelope, frozen at a coalesced occurrence's
+   *  acceptance so its later delivery cannot restamp it (inbound-source.ts). */
+  inboundSource?: InboundSource;
 }
 
 // ============================================================================
@@ -113,6 +119,10 @@ export class PushHandler {
     emitTraceFn: (event: { type: string; [key: string]: unknown }) => void,
     shouldTriggerInference?: (content: string, metadata: Record<string, unknown>) => boolean,
     private readonly handleCoalesced?: (serverId: string, params: PushEventParams, event: McplPushEvent) => Promise<PushEventResult>,
+    /** An ordinary (uncoalesced) push was just admitted, before it is queued
+     *  or acknowledged: return its source envelope, frozen now
+     *  (mcpl/inbound-source.ts). Coalesced work is stamped by its own path. */
+    private readonly acceptInbound?: (event: McplPushEvent) => InboundSource | undefined,
   ) {
     this.featureSetManager = featureSetManager;
     this.pushEventFn = pushEventFn;
@@ -189,7 +199,7 @@ export class PushHandler {
 
     // 2. Convert content blocks, and refuse content with nothing visible in
     // it — before dedup, so a refused eventId is not burned for a retry.
-    const content: ContentBlock[] = params.payload.content.map((block) => convertBlock(block, 'attachment on push event'));
+    const content: ContentBlock[] = params.payload.content.map((block) => convertBlock(block, 'attachment on push event', serverId));
     if (!emptyAllowed && isVisiblyEmptyConversion(params.payload.content, content)) {
       const err = new EmptyContentError();
       this.traceEmptyRejection(serverId, params);
@@ -240,6 +250,7 @@ export class PushHandler {
       timestamp: params.timestamp,
       inferenceId,
       triggerInference,
+      acceptedAt: Date.now(),
     };
     if (coalesced) {
       // RFC-006: the coalescer decides whether this occurrence replaces an
@@ -258,6 +269,11 @@ export class PushHandler {
       }
       return;
     }
+    // The source envelope is frozen at admission, before queueing or the
+    // acknowledgement: nothing that changes while the push waits in the
+    // queue can rewrite where it came from.
+    const inboundSource = this.acceptInbound?.(pushEvent);
+    if (inboundSource) pushEvent.inboundSource = inboundSource;
     this.pushEventFn(pushEvent);
 
     // 7. Emit trace

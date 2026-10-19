@@ -4,8 +4,6 @@ import type {
   MessageId,
   MessageMetadata,
   MessageQuery,
-  MessageQueryResult,
-  StoredMessage,
   ContextInjection,
 } from '@animalabs/context-manager';
 import type {
@@ -22,10 +20,14 @@ import type {
   SpeechHandlerOptions,
   ProcessEvent,
   TraceEventListener,
+  ModuleMessage,
+  MessageQueryResult,
 } from './types/index.js';
+import { heldWriteId } from './held-writes.js';
 import type { Agent } from './agent.js';
 import { DEFAULT_SHUTDOWN_TIMEOUT_MS, validateShutdownTimeout, waitForShutdown } from './shutdown.js';
 import { logValue } from './mcpl/log-value.js';
+import { toolArgsProblems } from './tool-args.js';
 
 /** How the registry queues a module's event: its push names the module. A
  * `ProcessQueue` serves too, ignoring the name. */
@@ -111,7 +113,7 @@ export class ModuleRegistry {
   private addMessageFn: (participant: string, content: ContentBlock[], metadata?: MessageMetadata) => MessageId;
   private editMessageFn: (id: MessageId, content: ContentBlock[]) => void;
   private removeMessageFn: (id: MessageId) => void;
-  private getMessageFn: (id: MessageId) => StoredMessage | null;
+  private getMessageFn: (id: MessageId) => ModuleMessage | null;
   private queryMessagesFn: (filter: MessageQuery) => MessageQueryResult;
 
   private pushEventFn: (event: ProcessEvent, moduleName?: string) => void;
@@ -135,7 +137,7 @@ export class ModuleRegistry {
       addMessage: (participant: string, content: ContentBlock[], metadata?: MessageMetadata) => MessageId;
       editMessage: (id: MessageId, content: ContentBlock[]) => void;
       removeMessage: (id: MessageId) => void;
-      getMessage: (id: MessageId) => StoredMessage | null;
+      getMessage: (id: MessageId) => ModuleMessage | null;
       queryMessages: (filter: MessageQuery) => MessageQueryResult;
       /** Called with the pushing module's name. */
       pushEvent: (event: ProcessEvent, moduleName?: string) => void;
@@ -300,8 +302,8 @@ export class ModuleRegistry {
    * model. The result is checked and read once, in its JSON form
    * ({@link storableToolResult}).
    */
-  async storableToolCall(call: ToolCall): Promise<ToolResult> {
-    return storableToolResult(call, await this.handleToolCall(call));
+  async storableToolCall(call: ToolCall, options: { definition?: ToolDefinition } = {}): Promise<ToolResult> {
+    return storableToolResult(call, await this.handleToolCall(call, options));
   }
 
   /**
@@ -309,8 +311,14 @@ export class ModuleRegistry {
    * result, unchecked, as it returned it, for a caller that uses the result
    * in process (`ModuleContext.callTool`, `executeToolCall`, or a host
    * calling the registry). A module's throw is answered as an error result.
+   * A call whose input isn't an object, or lacks a key the tool's schema
+   * requires, is answered before the module runs, with an error result that
+   * opens "Nothing was done:" and names what to send (toolArgsProblems).
+   * A caller that has already resolved the tool's definition, as the `utils`
+   * tool has a utility's, passes it as `definition`, and it's checked against
+   * that one.
    */
-  async handleToolCall(call: ToolCall): Promise<ToolResult> {
+  async handleToolCall(call: ToolCall, options: { definition?: ToolDefinition } = {}): Promise<ToolResult> {
     // Parse module--tool name
     const sepIndex = call.name.indexOf('--');
     if (sepIndex === -1) {
@@ -333,15 +341,37 @@ export class ModuleRegistry {
       };
     }
 
-    // Create a call with the un-prefixed name (preserving caller identity)
+    // Create a call with the un-prefixed name (preserving caller identity and turn)
     const moduleCall: ToolCall = {
       id: call.id,
       name: toolName,
       input: call.input,
       callerAgentName: call.callerAgentName,
+      ...(call.callerTurnId !== undefined ? { callerTurnId: call.callerTurnId } : {}),
     };
 
     try {
+      // The call against the tool's declared schema, before the module runs:
+      // a missing required argument is refused with what to send, where the
+      // handler would otherwise fail deep inside, or run without it. Values
+      // aren't checked here, since a handler may take more than its schema
+      // can say (toolArgsProblems). The module's own listing runs inside the
+      // try, so its throw is answered like any other. Utilities are listed
+      // only for a name the tools don't have, so a utility listing that
+      // throws or is slow reaches only calls to such names: a utility called
+      // by its own name, and a name the module answers without declaring it.
+      // A caller that passes `definition` lists nothing.
+      const definition = options.definition
+        ?? module.getTools().find((tool) => tool.name === toolName)
+        ?? module.getUtilities?.()?.find((tool) => tool.name === toolName);
+      const problems = toolArgsProblems(call.input, definition?.inputSchema);
+      if (problems.length > 0) {
+        return {
+          success: false,
+          error: `Nothing was done: ${call.name} ${problems.join('; ')}.`,
+          isError: true,
+        };
+      }
       return await module.handleToolCall(moduleCall);
     } catch (error) {
       return thrownResult(error);
@@ -582,7 +612,7 @@ class ModuleContextImpl implements ModuleContext {
   private addMessageFn: (participant: string, content: ContentBlock[], metadata?: MessageMetadata) => MessageId;
   private editMessageFn: (id: MessageId, content: ContentBlock[]) => void;
   private removeMessageFn: (id: MessageId) => void;
-  private getMessageFn: (id: MessageId) => StoredMessage | null;
+  private getMessageFn: (id: MessageId) => ModuleMessage | null;
   private queryMessagesFn: (filter: MessageQuery) => MessageQueryResult;
   private pushEventFn: (event: ProcessEvent, moduleName?: string) => void;
   private onTraceFn: (listener: TraceEventListener) => () => void;
@@ -602,7 +632,7 @@ class ModuleContextImpl implements ModuleContext {
     addMessage: (participant: string, content: ContentBlock[], metadata?: MessageMetadata) => MessageId,
     editMessage: (id: MessageId, content: ContentBlock[]) => void,
     removeMessage: (id: MessageId) => void,
-    getMessage: (id: MessageId) => StoredMessage | null,
+    getMessage: (id: MessageId) => ModuleMessage | null,
     queryMessages: (filter: MessageQuery) => MessageQueryResult,
     pushEvent: (event: ProcessEvent, moduleName?: string) => void,
     onTrace: (listener: TraceEventListener) => () => void,
@@ -729,10 +759,13 @@ class ModuleContextImpl implements ModuleContext {
   ): MessageId {
     const id = this.addMessageFn(participant, content, metadata);
 
-    // Track external ID if provided
+    // Track external ID if provided. A write the framework holds keeps '',
+    // as it did before held writes had handles: the map is module state an
+    // earlier release reads back, and a handle is no id to it.
+    // findMessageByExternalId finds the held write by its external id.
     if (metadata?.external) {
       const key = `${metadata.external.source}:${metadata.external.id}`;
-      this.externalIdMap.set(key, id);
+      this.externalIdMap.set(key, heldWriteId(id) === undefined ? id : '');
       // Persist the mapping
       this.persistExternalIdMap();
     }
@@ -758,10 +791,33 @@ class ModuleContextImpl implements ModuleContext {
 
   findMessageByExternalId(source: string, externalId: string): MessageId | null {
     const key = `${source}:${externalId}`;
-    return this.externalIdMap.get(key) ?? null;
+    const entry = this.externalIdMap.get(key);
+    if (entry === undefined) return null;
+    // A stored id answers while the store holds its row, and once the row is
+    // gone the entry goes, as removeMessage drops it. The '' a held write
+    // keeps here (addMessage) names no row, so the message is looked up in
+    // the store by its external id, held rows included, and the first row
+    // found is taken, as context-manager's findByExternalId takes it: a held
+    // row answers by its handle and leaves the entry as it is, and a stored
+    // row's id becomes the entry. With nothing found, '' stays, as earlier
+    // releases kept it: in a module's start(), the writes the last process
+    // held don't show yet, since create() restores them after the modules
+    // start, and a write that shows later finds its entry.
+    if (entry !== '') {
+      if (this.getMessageFn(entry)) return entry;
+      this.externalIdMap.delete(key);
+      this.persistExternalIdMap();
+      return null;
+    }
+    const row = this.queryMessagesFn({ source, externalIds: [externalId] }).messages[0];
+    if (row?.held) return row.id;
+    if (!row) return null;
+    this.externalIdMap.set(key, row.id);
+    this.persistExternalIdMap();
+    return row.id;
   }
 
-  getMessage(id: MessageId): StoredMessage | null {
+  getMessage(id: MessageId): ModuleMessage | null {
     return this.getMessageFn(id);
   }
 

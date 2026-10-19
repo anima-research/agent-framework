@@ -409,6 +409,26 @@ describe('debounce', () => {
     assert.doesNotMatch(text, /##/);
   });
 
+  it('a quoted event\'s content is cut where no surrogate pair is halved', (t) => {
+    t.mock.timers.enable({ apis: ['setTimeout'] });
+    const path = writeConfig('debounce-pair.json', {
+      policies: [
+        { name: 'files', match: { scope: ['workspace:file-changed'] }, behavior: { debounce: 100 } },
+      ],
+      default: 'skip',
+    });
+    const { gate, messages } = makeGate(path);
+
+    // 199 units, then an emoji whose two units straddle the 200-unit cut.
+    gate.evaluate(event({ eventType: 'workspace:file-changed', content: `${'a'.repeat(199)}😀 and on` }));
+    t.mock.timers.tick(100);
+
+    assert.strictEqual(messages.length, 1);
+    const text = (messages[0].content as Array<{ text: string }>)[0].text;
+    assert.ok(text.includes(`: ${'a'.repeat(199)}...`), `the cut leaves the emoji out whole: ${JSON.stringify(text)}`);
+    assert.ok(!/[\ud800-\udbff](?![\udc00-\udfff])|(?<![\ud800-\udbff])[\udc00-\udfff]/.test(text), 'no half of a pair');
+  });
+
   it('a batched wake carries the newest channel event\'s channel AND author together (provenance)', async () => {
     const path = writeConfig('debounce-provenance.json', {
       policies: [

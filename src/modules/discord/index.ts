@@ -46,12 +46,15 @@ import type {
 } from './types.js';
 import { formatZonedDateTime, resolveTimeZone } from '../../timezone.js';
 import { logValue } from '../../mcpl/log-value.js';
+import { unknownToolMessage } from '../unknown-tool.js';
+import { DiscordRefusal } from './refusal.js';
 
 // Re-export event types for consumers who want to handle them
 export type { DiscordMessageEvent, DiscordEditEvent, DiscordDeleteEvent } from './types.js';
 
 export * from './types.js';
 export { DiscordJsClient, type DiscordJsClientConfig } from './discord-js-client.js';
+export { DiscordRefusal } from './refusal.js';
 
 const DEFAULT_CONFIG: Partial<DiscordModuleConfig> = {
   handleDMs: true,
@@ -70,6 +73,14 @@ const TYPING_REFRESH_MS = 8_000;
 // is somehow missed (crash, dropped stream), this guarantees typing can't get
 // stuck on forever.
 const TYPING_MAX_MS = 5 * 60_000;
+
+// The most agents whose latest post the module keeps for their turn's
+// thoughts (lastPosts). Past it, the entry recorded longest ago goes, which
+// bounds the entries of agents that are gone, such as closed conversations'.
+// An entry is wanted only until its turn's speech arrives, so one goes while
+// still wanted only if this many other agents post in that time, and its
+// turn's thoughts then go into no message.
+const MAX_LAST_POSTS = 1_024;
 
 // Trace event types that end an agent's turn (onTrace's contract) — any of
 // these stops the typing keepalive. A turn's tool-call cycles stay inside its
@@ -99,10 +110,57 @@ const TEXT_FILE_EXTENSIONS = [
 
 const CONVERSATION_TIMEOUT_MS = 30 * 60 * 1000; // 30 minutes
 
+/** A text attachment this many bytes or larger isn't read into the agent's context. */
+const TEXT_FILE_LIMIT_BYTES = 100_000;
+
+/** activate's and deactivate's answer before the module has started, or once it has stopped. */
+const NOT_RUNNING = "Speech handling wasn't changed: the Discord module hasn't started on this host, or has stopped. Calling it again won't change that until it runs; ask whoever runs this host if you need Discord.";
+
 /** What the agent reads for a text attachment whose contents couldn't be
  *  fetched: by an error, or by an answer that wasn't OK. */
 function attachmentNotFetched(filename: string): { type: 'text'; text: string } {
-  return { type: 'text', text: `[Attachment: ${filename} (failed to fetch)]` };
+  return {
+    type: 'text',
+    text: `[Attachment: ${filename} couldn't be fetched, so its text isn't in your context. If you need it, ask the sender in the channel to paste it.]`,
+  };
+}
+
+/**
+ * What the agent reads when a tool stops on an error that isn't a refusal
+ * (DiscordRefusal), such as a network failure: its outcome is unknown. A send
+ * repeated blindly can post twice, so those say how to check; the other tools
+ * are safe to repeat, since a second call changes nothing more.
+ */
+function unexpectedFailure(call: ToolCall, error: unknown): string {
+  const stopped = `discord--${call.name} stopped on an unexpected error: ${errorText(error)}.`;
+  const channelId = (call.input as { channelId?: unknown } | null | undefined)?.channelId;
+  switch (call.name) {
+    case 'send':
+      return `${stopped} Whether the message was sent is unknown: discord--fetch_history with channelId ${String(channelId)} shows it, so check before you send it again.`;
+    case 'dm':
+      return `${stopped} Whether the message was sent is unknown. If an earlier discord--dm to this user gave you its channelId, discord--fetch_history with it shows whether this one went; without it, sending it again may send it twice.`;
+    case 'edit':
+    case 'react':
+    case 'delete':
+    case 'create_thread':
+      return `${stopped} Whether it took effect is unknown. Calling it again is safe: if it did, the second call changes nothing more.`;
+    case 'list_guilds':
+    case 'list_channels':
+    case 'fetch_history':
+      return `${stopped} It changes nothing on Discord, so you can call it again.`;
+    default:
+      return `${stopped} Calling it again is safe.`;
+  }
+}
+
+/** An error's own words, for a sentence about it. */
+function errorText(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+/** A count of seconds, for the agent's eyes. */
+function seconds(n: number): string {
+  return `${n} second${n === 1 ? '' : 's'}`;
 }
 
 /** What a stored message reads when it has no text of its own and nothing the
@@ -221,6 +279,79 @@ function holdsNotFetched(content: ContentBlock[], message: HistoryMessage): bool
   return content.slice(1).some((block) => block.type === 'text' && notes.has(block.text));
 }
 
+/** A URL without its query or fragment: Discord's CDN signs an attachment's
+ *  URL afresh in each payload, so only its path names the attachment. */
+function urlPath(url: string): string {
+  return url.split(/[?#]/)[0] ?? url;
+}
+
+/**
+ * Whether a block the host added for an attachment stands for none of
+ * `attachments`, matched as the live conversion writes it: an image by its
+ * URL, a file's text by its header, and a note by the filename it opens
+ * with, as every note for an attachment does, whatever its words after it.
+ * A block that stands for no attachment, such as EMPTY_MESSAGE, never does.
+ */
+function forGoneAttachment(block: ContentBlock, attachments: readonly DiscordAttachment[]): boolean {
+  if (block.type === 'image') {
+    const source = (block as { source?: { type?: string; url?: unknown } }).source;
+    if (source?.type !== 'url' || typeof source.url !== 'string') return false;
+    const path = urlPath(source.url);
+    return !attachments.some((attachment) => urlPath(attachment.url) === path);
+  }
+  if (block.type !== 'text') return false;
+  const { text } = block;
+  const opening = text.startsWith('\n--- File: ') ? (filename: string) => `\n--- File: ${filename} ---\n`
+    : text.startsWith('[Attachment: ') ? (filename: string) => `[Attachment: ${filename} `
+    : null;
+  return opening !== null && !attachments.some((attachment) => text.startsWith(opening(attachment.filename)));
+}
+
+/**
+ * A text-first row's content without the blocks the host added for
+ * attachments its message no longer has, or `content` itself when none is
+ * gone. A block stays while an attachment it may stand for remains, so of two
+ * files of one name, removing one keeps both blocks, and a block that names
+ * no attachment stays. EMPTY_MESSAGE comes back once nothing is left.
+ */
+function withoutGoneAttachments(content: ContentBlock[], attachments: readonly DiscordAttachment[]): ContentBlock[] {
+  const [first, ...rest] = content;
+  if (first?.type !== 'text') return content;
+  const kept = rest.filter((block) => !forGoneAttachment(block, attachments));
+  if (kept.length === rest.length) return content;
+  return textFirst(first.text, kept);
+}
+
+/** The ids to remove for a message's rows: each row once, and a body stored
+ *  in shards once, since removing one shard takes out its whole body. */
+function oncePerBody(rows: readonly StoredMessage[]): string[] {
+  const bodies = new Set<string>();
+  const ids: string[] = [];
+  for (const row of rows) {
+    if (row.bodyGroupId) {
+      if (bodies.has(row.bodyGroupId)) continue;
+      bodies.add(row.bodyGroupId);
+    }
+    ids.push(row.id);
+  }
+  return ids;
+}
+
+/** A live create on its way to the store (DiscordModule.creating). */
+interface LiveCreate {
+  /** converting: the live path fetches its attachments; queued: its event
+   *  waits in the queue; writing: onProcess answered it, and each Discord
+   *  event after it looks for the message's row, and ends the entry once it
+   *  shows. */
+  phase: 'converting' | 'queued' | 'writing';
+  /** A delete for the message came before its create was handled, so no row
+   *  comes, and the entry waits for that delete to be handled. */
+  deleted: boolean;
+  /** The latest edit's text and attachments, from while it converted. */
+  text?: string;
+  attachments?: DiscordAttachment[];
+}
+
 /**
  * Discord module for the agent framework.
  */
@@ -241,14 +372,41 @@ export class DiscordModule implements Module {
   // Track current reply context per agent
   private replyContexts: Map<string, ConversationContext> = new Map();
 
-  // Last message sent by a tool (for thought-editing)
-  private lastSentMessage: { channelId: string; messageId: string } | null = null;
+  // Where a tool turn's thoughts go (onAgentSpeech edits them in as a
+  // spoiler): each agent's latest message posted in a turn, with that turn's
+  // id (notePost). A `send` or `reply` records the message its client call
+  // returns, and so does the module's own speech. Thoughts go into it only
+  // when their speech ends the same turn, and taking them removes it. So
+  // neither another agent's message nor one from an earlier turn takes them,
+  // and an attempt in the turn that is refused or throws leaves the turn's own
+  // post in place. Turn ids increase, so an earlier turn's post that finishes
+  // after a later turn's leaves the later one in place. A DM records nothing,
+  // since its channel isn't known here, and neither does a post whose call or
+  // speech carries no turn. An entry goes when its thoughts are taken, when
+  // the agent's next post replaces it, or past MAX_LAST_POSTS agents.
+  private lastPosts: Map<string, { turnId: number; channelId: string; messageId: string }> = new Map();
 
   // One set per running history sync: the Discord messages the live path
   // stored, edited or was told were deleted since that sync began. What the
   // live path saw is newer than what the sync fetched, so the sync leaves
   // those messages alone.
   private readonly liveDuringSync = new Set<Set<string>>();
+
+  // The Discord messages whose live create is on its way to the store: from
+  // the moment the live path takes one up, through its conversion and the
+  // event queue, until a query shows the row onProcess answered with, stored
+  // or held. The framework holds a module's writes while the agent's turn is
+  // alive or the host is quiesced, and queryMessages shows a held write's
+  // row, marked held, so the next Discord event finds it either way and ends
+  // its entry. A history sync stores none of these messages, so no message is
+  // stored twice. A delete before the create is handled drops it: nothing is
+  // stored and nobody is woken. Any message's entry ends when its delete is
+  // handled, since a sync running then skips the message (noteLive) and a
+  // later one doesn't fetch it. An edit while it converts is folded into it.
+  // A create whose answer the framework fails to write or hold shows no row,
+  // and keeps its entry, and the sync off its message, until its delete is
+  // handled or the module stops.
+  private readonly creating = new Map<string, LiveCreate>();
 
   // Typing keepalive: agentName -> { interval, deadline }. Started on
   // inference:started, stopped on the turn's terminal trace event. Discord's
@@ -297,7 +455,7 @@ export class DiscordModule implements Module {
 
     // Set up Discord event handlers
     this.client.onMessage((message) => this.handleDiscordMessage(message));
-    this.client.onMessageEdit((id, content) => this.handleDiscordMessageEdit(id, content));
+    this.client.onMessageEdit((id, content, attachments) => this.handleDiscordMessageEdit(id, content, attachments));
     this.client.onMessageDelete((id) => this.handleDiscordMessageDelete(id));
 
     // Set up ready handler for history sync on (re)connect
@@ -336,8 +494,14 @@ export class DiscordModule implements Module {
     }
     this.typingLoops.clear();
 
-    await this.client.disconnect();
+    // From here the module writes nothing, though the framework may dispatch
+    // to it until stop() resolves: the live path takes nothing up, a create
+    // still converting finds the context gone, and onProcess answers nothing.
+    // The record of creates on their way goes with the context.
     this.ctx = null;
+    this.creating.clear();
+
+    await this.client.disconnect();
   }
 
   /**
@@ -527,7 +691,7 @@ export class DiscordModule implements Module {
       },
       {
         name: 'list_channels',
-        description: 'List all channels in a Discord server',
+        description: 'List the channels in a Discord server, with their ids. Threads aren\'t listed.',
         inputSchema: {
           type: 'object',
           properties: {
@@ -556,11 +720,11 @@ export class DiscordModule implements Module {
     try {
       switch (call.name) {
         case 'send':
-          return await this.handleSend(call.input as SendInput);
+          return await this.handleSend(call.input as SendInput, call);
         case 'dm':
           return await this.handleDM(call.input as SendDMInput);
         case 'reply':
-          return await this.handleReply(call.input as ReplyInput);
+          return await this.handleReply(call.input as ReplyInput, call);
         case 'react':
           return await this.handleReact(call.input as ReactInput);
         case 'edit':
@@ -572,7 +736,8 @@ export class DiscordModule implements Module {
         case 'set_reply_context':
           return await this.handleSetReplyContext(call.input as SetReplyContextInput);
         case 'activate':
-          return await this.handleActivate(call.input as { additive?: boolean });
+          // A call with no input at all activates with the defaults.
+          return await this.handleActivate((call.input ?? {}) as { additive?: boolean });
         case 'deactivate':
           return await this.handleDeactivate();
         case 'list_guilds':
@@ -582,21 +747,36 @@ export class DiscordModule implements Module {
         case 'fetch_history':
           return await this.handleFetchHistory(call.input as FetchHistoryInput);
         default:
-          return { success: false, error: `Unknown tool: ${call.name}`, isError: true };
+          return { success: false, error: unknownToolMessage(this.name, call.name, this.getTools()), isError: true };
       }
     } catch (error) {
+      // A refusal says what was refused and what to do instead; anything else
+      // is unexpected, and its outcome is worded by the tool.
       return {
         success: false,
-        error: error instanceof Error ? error.message : String(error),
+        error: error instanceof DiscordRefusal ? error.message : unexpectedFailure(call, error),
         isError: true,
       };
     }
   }
 
   async onProcess(event: ProcessEvent, state: ProcessState): Promise<EventResponse> {
+    // A stopped module answers nothing (stop()).
+    if (!this.ctx) return {};
+
+    // Each Discord event ends the entries whose row a query shows now, stored
+    // or held.
+    if (event.type.startsWith('discord:')) {
+      for (const [id, live] of this.creating) if (live.phase === 'writing' && this.storedRow(id)) this.creating.delete(id);
+    }
+
     // Handle new Discord message
     if (event.type === 'discord:message') {
       const msg = event as DiscordMessageEvent;
+      const live = this.creating.get(msg.discordMessageId);
+      // Deleted while its create waited in the queue: nothing is stored, and
+      // nobody is woken by a message its author took back.
+      if (live?.deleted) return {};
       const currentState = state.getState<DiscordModuleState>() ?? {
         connectedGuilds: [],
         conversations: {},
@@ -646,20 +826,29 @@ export class DiscordModule implements Module {
       const contentBlocks = msg.contentBlocks ?? textFirst(ownText(msg.content));
       this.noteLive(msg.discordMessageId);
 
+      // A message a history sync wrote first, stored or held, keeps that row:
+      // the create adds none, and still sets the reply context and asks for
+      // inference, since the message arrived live. Either way the entry waits
+      // until a Discord event finds the message's row.
+      const stored = this.storedRow(msg.discordMessageId);
+      if (live) live.phase = 'writing';
+
       // Return declarative response - framework applies all writes atomically
       return {
-        addMessages: [
-          {
-            participant: msg.authorName,
-            content: contentBlocks,
-            metadata: {
-              external: { source: 'discord', id: msg.discordMessageId },
-              channelId: msg.channelId,
-              timestamp: msg.timestamp,
-              [TEXT_FIRST]: true,
+        ...(stored ? {} : {
+          addMessages: [
+            {
+              participant: msg.authorName,
+              content: contentBlocks,
+              metadata: {
+                external: { source: 'discord', id: msg.discordMessageId },
+                channelId: msg.channelId,
+                timestamp: msg.timestamp,
+                [TEXT_FIRST]: true,
+              },
             },
-          },
-        ],
+          ],
+        }),
         stateUpdate: newState,
         requestInference: msg.shouldTriggerInference ?? true,
       };
@@ -668,23 +857,29 @@ export class DiscordModule implements Module {
     // Handle Discord message edit
     if (event.type === 'discord:edit') {
       const edit = event as DiscordEditEvent;
-      // The stored row, not only its id: an edit changes the message's own
-      // text and keeps what the host added beside it.
-      // An edit to a message nobody has stored yet is dropped: whatever
-      // stores the message, its live add or a history sync running now,
-      // stores the text it got, and the next sync's text rule changes it.
-      // A row stored in shards can't be edited one shard at a time, so it
-      // keeps its text, and the host's log says so. Only an edit that writes
-      // marks the message live, so an update that changes nothing leaves a
-      // running sync free to rewrite the row.
+      // The message's row, not only its id: an edit changes the message's own
+      // text and keeps what the host added beside it, but for the blocks of
+      // attachments the edit took away, when the client passed the edit's
+      // attachments and the row is text-first.
+      // An edit that comes while the live path converts the message's create
+      // is folded into that create (handleDiscordMessageEdit). Any other edit
+      // to a message with no row, stored or held, is dropped: a history sync
+      // running now stores the text it fetched, and the next sync's text rule
+      // changes it. A row stored in shards can't be edited one shard at a
+      // time, so it keeps its text, and the host's log says so. Only an edit
+      // that writes marks the message live, so an update that changes nothing
+      // leaves a running sync free to rewrite the row.
       const stored = this.storedRow(edit.discordMessageId);
       if (!stored) return {};
       if (stored.bodyGroupId) {
         console.warn(`Discord: An update to message ${edit.discordMessageId} wasn't applied: it's stored in shards, which can't be edited, so if its text changed, the agent still has the earlier text`);
         return {};
       }
-      const content = contentForText(stored, edit.newContent);
-      if (!content) return {};
+      const texted = contentForText(stored, edit.newContent);
+      const content = edit.attachments && stored.metadata?.[TEXT_FIRST] === true
+        ? withoutGoneAttachments(texted ?? stored.content, edit.attachments)
+        : texted;
+      if (!content || content === stored.content) return {};
       this.noteLive(edit.discordMessageId);
       return { editMessages: [{ messageId: stored.id, content }] };
     }
@@ -692,17 +887,19 @@ export class DiscordModule implements Module {
     // Handle Discord message delete
     if (event.type === 'discord:delete') {
       const del = event as DiscordDeleteEvent;
-      // A row stored in shards is removed whole: the framework takes out the
-      // body a shard belongs to. The message is the live path's even when no
-      // row is found, so a running sync doesn't store what its fetch may
-      // still hold.
+      // Every row of the message goes, so one stored twice doesn't outlive
+      // its delete as a copy. A row stored in shards is removed whole: the
+      // framework takes out the body a shard belongs to. The message is the
+      // live path's even when no row is found, so a running sync doesn't
+      // store what its fetch may still hold, and that ends its entry.
       this.noteLive(del.discordMessageId);
-      const stored = this.storedRow(del.discordMessageId);
-      if (!stored) {
+      this.creating.delete(del.discordMessageId);
+      const rows = this.storedRows(del.discordMessageId);
+      if (rows.length === 0) {
         return {};
       }
       return {
-        removeMessages: [stored.id],
+        removeMessages: oncePerBody(rows),
       };
     }
 
@@ -717,13 +914,15 @@ export class DiscordModule implements Module {
     content: ContentBlock[],
     context: SpeechContext
   ): Promise<void> {
-    // If thoughts are present and we have a recently sent message, edit it
-    // to prepend the thoughts as spoiler text.
-    if (context.thoughts && context.thoughts.length > 0 && this.lastSentMessage) {
+    // If thoughts are present and this agent posted a message in the turn
+    // they end (lastPosts), edit it to prepend the thoughts as spoiler text.
+    const post = this.lastPosts.get(agentName);
+    if (context.thoughts && context.thoughts.length > 0 && post && post.turnId === context.turnId) {
+      this.lastPosts.delete(agentName);
       const thoughtText = this.extractText(context.thoughts);
       if (thoughtText) {
         try {
-          const { channelId, messageId } = this.lastSentMessage;
+          const { channelId, messageId } = post;
           // Fetch the current message content via the client isn't available,
           // but we know the tool just sent it — reconstruct by editing with
           // spoiler-wrapped thoughts prepended.
@@ -735,7 +934,6 @@ export class DiscordModule implements Module {
           console.warn('Discord: Failed to edit thoughts into message:', err);
         }
       }
-      this.lastSentMessage = null;
     }
 
     // Get reply context for this agent
@@ -753,7 +951,7 @@ export class DiscordModule implements Module {
     }
 
     // Check rate limit
-    if (!this.checkRateLimit(replyCtx.channelId)) {
+    if (this.rateLimitWait(replyCtx.channelId) > 0) {
       console.warn(`Discord: Rate limited for channel ${replyCtx.channelId}`);
       return;
     }
@@ -764,8 +962,8 @@ export class DiscordModule implements Module {
       replyTo: replyCtx.replyToMessageId,
     });
 
-    // Track for thought-editing (in case of chained speech)
-    this.lastSentMessage = { channelId: targetChannel, messageId: result.messageId };
+    // Track for thought-editing (in case of chained speech in the same turn)
+    this.notePost(agentName, context.turnId, targetChannel, result.messageId);
 
     // Clear reply-to after sending (don't keep replying to same message)
     replyCtx.replyToMessageId = undefined;
@@ -870,7 +1068,8 @@ export class DiscordModule implements Module {
 
   /**
    * Sync history for a specific channel - compare with Context Manager and update.
-   * Uses queryMessages() to enumerate stored messages for proper edit/delete detection.
+   * Uses queryMessages() to enumerate the channel's rows, a held write's among
+   * them, for proper edit/delete detection.
    *
    * The live path can store, edit or remove a row whenever the sync awaits.
    * So the sync fetches history and runs the live conversion it needs first,
@@ -920,7 +1119,7 @@ export class DiscordModule implements Module {
       // edited one shard at a time, so it's left as it is.
       const converted = new Map<string, ContentBlock[]>();
       for (const discordMsg of chronologicalMessages) {
-        const stored = before.get(discordMsg.id);
+        const stored = before.get(discordMsg.id)?.[0];
         if (stored && (stored.bodyGroupId || !needsRebuild(stored, discordMsg))) continue;
         const content = await this.convertMessageToContent(discordMsg);
         if (this.ctx !== ctx) return unchanged;
@@ -938,14 +1137,15 @@ export class DiscordModule implements Module {
       let deletedMessages = 0;
       for (const discordMsg of chronologicalMessages) {
         if (live.has(discordMsg.id)) continue;
-        const stored = storedMessageMap.get(discordMsg.id);
+        const stored = storedMessageMap.get(discordMsg.id)?.[0];
 
         if (!stored) {
           // A message we haven't stored. One that was stored when the sync
           // began, and isn't now, was removed meanwhile: not the sync's to
-          // bring back.
+          // bring back. One the live path is storing (creating) is the live
+          // path's, so it isn't stored twice.
           const content = converted.get(discordMsg.id);
-          if (!content || before.has(discordMsg.id)) continue;
+          if (!content || before.has(discordMsg.id) || this.creating.has(discordMsg.id)) continue;
           // For bot's own messages (from previous sessions), use the agent name
           // This ensures continuity of conversation history
           const isBotMessage = discordMsg.authorId === this.state.botUserId;
@@ -984,7 +1184,8 @@ export class DiscordModule implements Module {
       const oldestFetchedTimestamp = discordMessages.length > 0
         ? Math.min(...discordMessages.map((msg) => msg.timestamp.getTime()))
         : undefined;
-      for (const [externalId, stored] of storedMessageMap) {
+      for (const [externalId, rows] of storedMessageMap) {
+        const stored = rows[0]!;
         const sourceTimestamp = typeof stored.metadata?.timestamp === 'number'
           ? stored.metadata.timestamp
           : undefined;
@@ -1000,8 +1201,9 @@ export class DiscordModule implements Module {
           // Message exists in our store but not in Discord - it was deleted
           // Note: This only catches deletes within the scrollback window.
           // A message the live path wrote while the sync ran is newer than
-          // the fetch, so it stays. One shard's id takes out a body whole.
-          ctx.removeMessage(stored.id);
+          // the fetch, so it stays. Every row of the message goes, and one
+          // shard's id takes out a body whole.
+          for (const id of oncePerBody(rows)) ctx.removeMessage(id);
           deletedMessages++;
         }
       }
@@ -1020,22 +1222,37 @@ export class DiscordModule implements Module {
   }
 
   /** A channel's stored Discord rows by their Discord message id, whole: an
-   *  edit replaces a row's own text and keeps what the host added beside it. */
-  private storedByDiscordId(ctx: ModuleContext, channelId: string): Map<string, StoredMessage> {
-    const rows = new Map<string, StoredMessage>();
+   *  edit replaces a row's own text and keeps what the host added beside it.
+   *  Each id's rows are in store order. A message stored twice holds two,
+   *  of which a sync acts on the first, as the live path does (storedRow),
+   *  and a delete takes both. A write the framework holds is a row too
+   *  (storedRows). */
+  private storedByDiscordId(ctx: ModuleContext, channelId: string): Map<string, StoredMessage[]> {
+    const rows = new Map<string, StoredMessage[]>();
     for (const msg of ctx.queryMessages({ source: 'discord', metadata: { channelId } }).messages) {
       const external = msg.metadata?.external as { id?: string } | undefined;
-      if (external?.id) rows.set(external.id, msg);
+      if (!external?.id) continue;
+      const held = rows.get(external.id);
+      if (held) held.push(msg);
+      else rows.set(external.id, [msg]);
     }
     return rows;
   }
 
-  /** The stored row of a Discord message, by its id in the row's metadata.
-   *  The module context's findMessageByExternalId holds only rows the module
+  /** The stored rows of a Discord message, by its id in the row's metadata,
+   *  in store order. A write the framework holds comes after them as a held
+   *  row, which an edit or removal reaches as it does a stored one. The
+   *  module context's findMessageByExternalId holds only rows the module
    *  stored through its context, not those a process response added, so it
    *  misses what the live path stored. */
+  private storedRows(discordMessageId: string): StoredMessage[] {
+    return this.ctx?.queryMessages({ source: 'discord', externalIds: [discordMessageId] }).messages ?? [];
+  }
+
+  /** The row an edit or a create acts on: a message's first row, a stored
+   *  one before a held one (storedRows). */
   private storedRow(discordMessageId: string): StoredMessage | undefined {
-    return this.ctx?.queryMessages({ source: 'discord', externalIds: [discordMessageId] }).messages[0];
+    return this.storedRows(discordMessageId)[0];
   }
 
   /** Marks a Discord message as the live path's for every history sync running now. */
@@ -1044,7 +1261,8 @@ export class DiscordModule implements Module {
   }
 
   private async handleDiscordMessage(message: DiscordMessageData): Promise<void> {
-    if (!this.ctx) return;
+    const ctx = this.ctx;
+    if (!ctx) return;
 
     // ALWAYS ignore our own messages to prevent feedback loops
     if (this.state.botUserId && message.authorId === this.state.botUserId) {
@@ -1079,21 +1297,48 @@ export class DiscordModule implements Module {
     // Determine if this message should trigger inference
     const shouldTrigger = this.shouldTriggerInference(message, isDM);
 
+    // From here the message is the live path's to store (creating). A second
+    // delivery of a message whose create is already on its way is ignored.
+    if (this.creating.has(message.id)) return;
+    const live: LiveCreate = { phase: 'converting', deleted: false };
+    this.creating.set(message.id, live);
+    const drop = () => { if (this.creating.get(message.id) === live) this.creating.delete(message.id); };
+
     // Convert message content including attachments
-    const contentBlocks = await this.convertMessageToContent(message);
+    let contentBlocks: ContentBlock[];
+    try {
+      contentBlocks = await this.convertMessageToContent(message);
+    } catch (error) {
+      drop();
+      throw error;
+    }
+    // A module stopped or started again meanwhile writes nothing.
+    if (this.ctx !== ctx) {
+      drop();
+      return;
+    }
+    // A delete that came meanwhile drops the create: nothing is stored,
+    // nobody is woken. Its entry stays until that delete is handled, so no
+    // sync stores the message before then.
+    if (live.deleted) return;
+    // An edit that came meanwhile: its text, and the blocks of the
+    // attachments it left.
+    if (live.text !== undefined) contentBlocks = withOwnText(contentBlocks, live.text);
+    if (live.attachments) contentBlocks = withoutGoneAttachments(contentBlocks, live.attachments);
+    live.phase = 'queued';
 
     // Only queue the event - all state writes happen in onProcess()
-    this.ctx.pushEvent({
+    ctx.pushEvent({
       type: 'discord:message',
       discordMessageId: message.id,
       channelId: message.channelId,
       guildId: message.guildId,
       authorId: message.authorId,
       authorName: message.authorName,
-      content: message.content,
+      content: live.text ?? message.content,
       contentBlocks,
       timestamp: message.timestamp.getTime(),
-      attachments: message.attachments,
+      attachments: live.attachments ?? message.attachments,
       shouldTriggerInference: shouldTrigger,
     } as DiscordMessageEvent);
   }
@@ -1128,7 +1373,15 @@ export class DiscordModule implements Module {
 
       // Check for text files - fetch and include content
       const isTextFile = TEXT_FILE_EXTENSIONS.some(ext => filename.endsWith(ext));
-      if (isTextFile && attachment.size && attachment.size < 100_000) { // < 100KB
+      if (isTextFile && attachment.size >= TEXT_FILE_LIMIT_BYTES) {
+        blocks.push({
+          type: 'text',
+          text: `[Attachment: ${attachment.filename} (${attachment.size.toLocaleString('en-US')} bytes): this host reads text files under ${TEXT_FILE_LIMIT_BYTES.toLocaleString('en-US')} bytes into your context, so its text isn't here. If you need it, ask the sender to paste the part that matters.]`,
+        });
+        continue;
+      }
+      // A text file of size 0 gets the note below, as before.
+      if (isTextFile && attachment.size) {
         try {
           const response = await fetch(attachment.url);
           if (response.ok) {
@@ -1153,7 +1406,7 @@ export class DiscordModule implements Module {
       // For unsupported attachments, add a note
       blocks.push({
         type: 'text',
-        text: `[Attachment: ${attachment.filename} (${contentType || 'unknown type'})]`,
+        text: `[Attachment: ${attachment.filename} (${contentType || 'unknown type'}): this host didn't read its contents in, so they aren't in your context. If you need them, ask the sender for them in a form you can read, such as pasted text.]`,
       });
     }
 
@@ -1200,19 +1453,35 @@ export class DiscordModule implements Module {
     }
   }
 
-  private handleDiscordMessageEdit(messageId: string, newContent: string): void {
+  private handleDiscordMessageEdit(messageId: string, newContent: string, attachments?: DiscordAttachment[]): void {
     if (!this.ctx) return;
+
+    // An edit while the message's create converts is folded into that
+    // create, which would otherwise store the text it was sent with; one that
+    // comes after follows the create through the queue. Its event still goes,
+    // for a row a history sync stored first.
+    const live = this.creating.get(messageId);
+    if (live) {
+      live.text = newContent;
+      if (attachments) live.attachments = attachments;
+    }
 
     // Only queue the event - state writes happen in onProcess()
     this.ctx.pushEvent({
       type: 'discord:edit',
       discordMessageId: messageId,
       newContent,
+      ...(attachments ? { attachments } : {}),
     });
   }
 
   private handleDiscordMessageDelete(messageId: string): void {
     if (!this.ctx) return;
+
+    // A delete before the message's create is handled drops that create.
+    // Its event still goes, for a row a history sync stored first.
+    const live = this.creating.get(messageId);
+    if (live) live.deleted = true;
 
     // Only queue the event - state writes happen in onProcess()
     this.ctx.pushEvent({
@@ -1225,9 +1494,30 @@ export class DiscordModule implements Module {
   // Tool Handlers
   // ==========================================================================
 
-  private async handleSend(input: SendInput): Promise<ToolResult> {
-    if (!this.checkRateLimit(input.channelId)) {
-      return { success: false, error: 'Rate limited', isError: true };
+  /** Record a message the agent posted in a turn, for that turn's thoughts (lastPosts). */
+  private notePost(agentName: string | undefined, turnId: number | undefined, channelId: string, messageId: string): void {
+    if (agentName === undefined || turnId === undefined) return;
+    // A later turn's post stays: this one's turn has ended, and its thoughts
+    // have gone or will go nowhere.
+    const current = this.lastPosts.get(agentName);
+    if (current && current.turnId > turnId) return;
+    // Set it last, so the entry recorded longest ago is the first to go.
+    this.lastPosts.delete(agentName);
+    this.lastPosts.set(agentName, { turnId, channelId, messageId });
+    if (this.lastPosts.size > MAX_LAST_POSTS) {
+      const oldest = this.lastPosts.keys().next().value;
+      if (oldest !== undefined) this.lastPosts.delete(oldest);
+    }
+  }
+
+  private async handleSend(input: SendInput, call: ToolCall): Promise<ToolResult> {
+    const wait = this.rateLimitWait(input.channelId);
+    if (wait > 0) {
+      return {
+        success: false,
+        error: `Nothing was sent: channel ${input.channelId} has reached ${this.rateLimitRule()}. Send it again in ${seconds(wait)}; other channels have their own limit.`,
+        isError: true,
+      };
     }
 
     const result = await this.client.sendMessage(input.channelId, input.content, {
@@ -1237,27 +1527,41 @@ export class DiscordModule implements Module {
 
     // Track for thought-editing: the message is out, whether or not its
     // thread was started.
-    this.lastSentMessage = { channelId: input.channelId, messageId: result.messageId };
+    this.notePost(call.callerAgentName, call.callerTurnId, input.channelId, result.messageId);
 
     if (result.threadFailure !== undefined) {
       return { success: false, error: result.threadFailure, isError: true };
     }
-    return { success: true, data: { messageId: result.messageId } };
+    return { success: true, data: { messageId: result.messageId, ...(result.note !== undefined ? { note: result.note } : {}) } };
   }
 
   private async handleDM(input: SendDMInput): Promise<ToolResult> {
     const result = await this.client.sendDM(input.userId, input.content);
-    return { success: true, data: { messageId: result.messageId } };
+    // The direct message channel's id is what fetch_history reads it by, should a later dm need checking.
+    return { success: true, data: { messageId: result.messageId, ...(result.channelId !== undefined ? { channelId: result.channelId } : {}) } };
   }
 
-  private async handleReply(input: ReplyInput): Promise<ToolResult> {
+  private async handleReply(input: ReplyInput, call: ToolCall): Promise<ToolResult> {
     const replyCtx = this.replyContexts.get('default');
     if (!replyCtx) {
-      return { success: false, error: 'No conversation context', isError: true };
+      return {
+        success: false,
+        error: 'Nothing was sent: there\'s no conversation to reply in. Use discord--send with a channelId to post somewhere, or discord--set_reply_context with a channelId to choose where replies go, then reply again.',
+        isError: true,
+      };
     }
 
-    if (!this.checkRateLimit(replyCtx.channelId)) {
-      return { success: false, error: 'Rate limited', isError: true };
+    // The reply goes to the context's thread when it names one, an empty id
+    // as well, as it always has; the words name an empty id as what it is.
+    const thread = replyCtx.threadId;
+    const wait = this.rateLimitWait(replyCtx.channelId);
+    if (wait > 0) {
+      return {
+        success: false,
+        error: `Nothing was sent: this conversation's channel (${replyCtx.channelId}) has reached ${this.rateLimitRule()}`
+          + `${thread ? `, which counts its replies in thread ${thread} too` : ''}. Reply again in ${seconds(wait)}.`,
+        isError: true,
+      };
     }
 
     let content = input.content;
@@ -1265,13 +1569,31 @@ export class DiscordModule implements Module {
       content = `<@${replyCtx.userId}> ${content}`;
     }
 
-    const targetChannel = replyCtx.threadId ?? replyCtx.channelId;
-    const result = await this.client.sendMessage(targetChannel, content, {
-      replyTo: replyCtx.replyToMessageId,
-    });
+    // reply's call names no channel or message: its reply context does, as it
+    // stands now, before the send, which an incoming message can change.
+    const targetChannel = thread ?? replyCtx.channelId;
+    const pointsAt = thread === undefined ? `channel ${targetChannel}` : thread === '' ? 'an empty thread id' : `thread ${targetChannel}`;
+    const check = thread === ''
+      ? `, and its reply context names an empty thread id: discord--set_reply_context with a threadId, or without one to reply in channel ${replyCtx.channelId}, puts that right`
+      : `: discord--fetch_history with channelId ${targetChannel}, its reply context's ${thread !== undefined ? 'thread' : 'channel'}, shows it, so check before you reply again`;
+    const replyTo = replyCtx.replyToMessageId;
+    let result: { messageId: string };
+    try {
+      result = await this.client.sendMessage(targetChannel, content, { replyTo });
+    } catch (error) {
+      if (error instanceof DiscordRefusal) {
+        throw new DiscordRefusal(`${error.message} A reply goes where its reply context points: ${pointsAt}`
+          + `${replyTo ? `, answering message ${replyTo}` : ''}. discord--set_reply_context changes that.`, { cause: error });
+      }
+      return {
+        success: false,
+        error: `discord--reply stopped on an unexpected error: ${errorText(error)}. Whether the reply was sent is unknown${check}.`,
+        isError: true,
+      };
+    }
 
     // Track for thought-editing
-    this.lastSentMessage = { channelId: targetChannel, messageId: result.messageId };
+    this.notePost(call.callerAgentName, call.callerTurnId, targetChannel, result.messageId);
 
     // Clear reply-to after sending
     replyCtx.replyToMessageId = undefined;
@@ -1334,7 +1656,7 @@ export class DiscordModule implements Module {
 
   private async handleActivate(input: { additive?: boolean }): Promise<ToolResult> {
     if (!this.ctx) {
-      return { success: false, error: 'Module not started', isError: true };
+      return { success: false, error: NOT_RUNNING, isError: true };
     }
 
     this.ctx.registerSpeechHandler('*', { additive: input.additive });
@@ -1343,7 +1665,7 @@ export class DiscordModule implements Module {
 
   private async handleDeactivate(): Promise<ToolResult> {
     if (!this.ctx) {
-      return { success: false, error: 'Module not started', isError: true };
+      return { success: false, error: NOT_RUNNING, isError: true };
     }
 
     this.ctx.unregisterSpeechHandler();
@@ -1428,8 +1750,25 @@ export class DiscordModule implements Module {
       .join('\n');
   }
 
-  private checkRateLimit(channelId: string): boolean {
-    const limit = this.config.rateLimitPerMinute ?? 30;
+  private rateLimitPerMinute(): number {
+    return this.config.rateLimitPerMinute ?? 30;
+  }
+
+  /** The limit, as the rate-limit refusals word it. */
+  private rateLimitRule(): string {
+    const limit = this.rateLimitPerMinute();
+    return `this host's limit of ${limit} send${limit === 1 ? '' : 's'} a minute from the bot`;
+  }
+
+  /**
+   * Counts a send to `channelId` against its limit and returns 0, or, when
+   * the channel has had its sends for this window, returns the whole seconds
+   * until the window ends, at least 1. A window is the minute from the first
+   * send this lets through, and each send it lets through counts, whether or
+   * not Discord then takes it.
+   */
+  private rateLimitWait(channelId: string): number {
+    const limit = this.rateLimitPerMinute();
     const now = Date.now();
     const windowMs = 60 * 1000;
 
@@ -1441,11 +1780,11 @@ export class DiscordModule implements Module {
     }
 
     if (info.count >= limit) {
-      return false;
+      return Math.max(1, Math.ceil((info.windowStart + windowMs - now) / 1000));
     }
 
     info.count++;
-    return true;
+    return 0;
   }
 
   private cleanupOldConversations(): void {

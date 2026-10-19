@@ -601,7 +601,7 @@ describe('stop() with work still in flight', () => {
         assert.equal(internals.deferredMessages.length, 1, 'the note stays queued');
         assert.ok(!storedTexts().includes('a note for later'), 'nothing landed ahead of the stream');
         assert.ok(logged.includes(
-          "[deferral] stop: 1 deferred write(s) for assistant stay queued: its stream outlasted stop()'s wait and may still write; " +
+          "[deferral] stop: 1 deferred write(s) for assistant stay queued: its stream is still running and may still write; " +
           'this memory-only queue loses them if the process exits before that stream settles'), logged.join('\n'));
         release();
         await until(() => internals.deferredMessages.length === 0, "the stream's own end to take the note");
@@ -679,7 +679,9 @@ describe('stop() with work still in flight', () => {
           framework.pushEvent({ type: 'external-message', source: 'test', content: 'go', metadata: {} } as unknown as ProcessEvent);
           await until(() => internals.activeStreams.has('assistant'), 'the first stream');
           const handle = internals.activeStreams.get('assistant')!;
-          (framework.getAgent('assistant') as unknown as { buildActivationRequest: () => never }).buildActivationRequest = () => {
+          // The stream path compiles through the agent's own assembler
+          // (buildActivationRequest is only its wrapper for previews).
+          (framework.getAgent('assistant') as unknown as { assembleActivationRequest: () => never }).assembleActivationRequest = () => {
             throw new Error('the compile failed');
           };
           release();
@@ -873,6 +875,35 @@ describe('stop() with work still in flight', () => {
         await framework.stop();
       }
     });
+
+    it('a rejection over 500 characters is cut there, counting code points, without halving a surrogate pair', async () => {
+      const { framework, settle, pushed } = await withTuneOut();
+      try {
+        // 499 characters, then an emoji whose two UTF-16 units straddle unit
+        // 500. Counted in code points, the emoji is the 500th character.
+        const message = `${'x'.repeat(499)}😀 and more`;
+        settle().reject(new Error(message));
+        await until(() => pushed.length > 0, 'the failed result');
+        const result = (pushed[0] as unknown as { result: ToolResult }).result;
+        assert.equal(result.error, `${'x'.repeat(499)}😀… (509 characters)`, 'the cut keeps the emoji whole, and the count is of code points');
+      } finally {
+        await framework.stop();
+      }
+    });
+
+    it('a rejection of 500 characters or fewer comes back whole, though it is longer than 500 UTF-16 units', async () => {
+      const { framework, settle, pushed } = await withTuneOut();
+      try {
+        // 300 emoji: 600 UTF-16 units, 300 characters.
+        const message = '😀'.repeat(300);
+        settle().reject(new Error(message));
+        await until(() => pushed.length > 0, 'the failed result');
+        const result = (pushed[0] as unknown as { result: ToolResult }).result;
+        assert.equal(result.error, message, 'within 500 characters, nothing is cut and no note is added');
+      } finally {
+        await framework.stop();
+      }
+    });
   });
 
   it('every tool result the framework produces names its tool, and the call it answers', () => {
@@ -965,7 +996,7 @@ describe('stop() with work still in flight', () => {
         modules: [],
       });
       const connection = Object.assign(new EventEmitter(), { id: 'srv' });
-      (framework as unknown as { wireMcplEvents(c: unknown): void }).wireMcplEvents(connection);
+      (framework as unknown as { wireMcplEvents(c: unknown, config: unknown): void }).wireMcplEvents(connection, { id: 'srv', url: 'wss://h/mcp?token=wireToken0123456789' });
       return { framework, connection };
     }
 
@@ -1183,6 +1214,32 @@ describe('stop() with work still in flight', () => {
         const line = logged.find((l) => l.includes('push-event handler failed')) ?? '';
         assert.ok(line.length < 600, `logged ${line.length} characters`);
         assert.ok(line.endsWith('…(5000)'), line.slice(-40));
+      } finally {
+        await framework.stop();
+      }
+    });
+
+    it("a handler's error quoting the server's configured credential is recorded and answered without it, also across the cut", async () => {
+      const { framework, connection } = await wiredFramework();
+      try {
+        // The credential starts just before the 500-character cut, so a cut
+        // made before redacting would keep its first characters.
+        // Once whole, and once with the credential across the 500-character
+        // cut, where a cut made before redacting keeps its first nine.
+        const errors = ['refused wireToken0123456789', `${'x'.repeat(490)} wireToken0123456789 and more`];
+        for (const [i, error] of errors.entries()) {
+          (framework as unknown as { pushHandler: unknown }).pushHandler = {
+            handlePushEvent: async () => { throw new Error(error); },
+          };
+          const push = responder();
+          connection.emit('push-event', { featureSet: 'chat', eventId: `e-cred-${i}`, payload: { content: [{ type: 'text', text: 'x' }] } }, push);
+          await answered(push);
+          const message = push.answers[0]!.error!.message;
+          await until(() => logged.filter((line) => line.includes('srv push-event handler failed')).length > i, 'the log line');
+          for (const text of [message, ...logged]) {
+            assert.ok(!text.includes('wireToken'), text.slice(-120));
+          }
+        }
       } finally {
         await framework.stop();
       }

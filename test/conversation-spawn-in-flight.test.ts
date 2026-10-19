@@ -20,8 +20,11 @@ import assert from 'node:assert/strict';
 import type { TraceEvent } from '../src/index.js';
 import { createMockResponse } from './helpers/mock-membrane.js';
 import { fixture } from './helpers/coalescing-fixture.js';
+import { forkAgentName } from '../src/mcpl/conversation-router.js';
 
-const FORK = 'conversation-chat-g1';
+/** The fixture's channel `chat` is on its server `editor`. */
+const FORK = forkAgentName('conversation', 'editor', 'chat', 1);
+const NEXT_FORK = forkAgentName('conversation', 'editor', 'chat', 2);
 
 /** A gate a test opens itself, and a wait for a condition the code under
  *  test makes true (no fixed timers standing in for events). */
@@ -137,7 +140,7 @@ describe('messages on a channel whose fork is being spawned', () => {
       await Promise.all([queue, coalesced]);
       assert.deepEqual(t.failures, []);
       assert.deepEqual(t.spawned, [FORK], 'one spawn');
-      assert.equal(t.f.framework.getAgent('conversation-chat-g2'), null);
+      assert.equal(t.f.framework.getAgent(NEXT_FORK), null);
       assert.ok(t.holds('first-plain'), 'the fork holds the plain message');
       assert.ok(t.holds('second-coalesced'), 'and the coalesced one');
     } finally {
@@ -184,7 +187,7 @@ describe('messages on a channel whose fork is being spawned', () => {
       await t.f.framework.runUntilIdle();
       assert.deepEqual(t.failures, []);
       assert.ok(t.f.framework.getAgent(FORK), "the batch's audience spawned the fork");
-      assert.equal(t.f.framework.getAgent('conversation-chat-g2'), null);
+      assert.equal(t.f.framework.getAgent(NEXT_FORK), null);
       assert.ok(t.holds('plain-during-batch'), 'the fork holds the plain message');
     } finally {
       t.write.open();
@@ -205,7 +208,7 @@ describe('messages on a channel whose fork is being spawned', () => {
       await Promise.all([queue, pushed]);
       await t.f.framework.runUntilIdle();
       assert.deepEqual(t.spawned, [FORK], 'one spawn');
-      assert.equal(t.f.framework.getAgent('conversation-chat-g2'), null);
+      assert.equal(t.f.framework.getAgent(NEXT_FORK), null);
       assert.ok(t.holds('first-plain'), 'the fork holds the plain message');
       assert.ok(t.holds('document_diff'), "and the batch it was woken for, as rendered at the fork's turn");
     } finally {
