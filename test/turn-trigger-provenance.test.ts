@@ -462,4 +462,50 @@ describe('surface batches at their edges, through the real scheduler', () => {
       await rig.close();
     }
   });
+
+  it('a quiesce parks a private wake and a channel-bound one apart, and each gets its own turn at resume', async () => {
+    for (const privateFirst of [true, false]) {
+      const rig = await surfaceRig();
+      try {
+        await rig.framework.quiesce();
+        const events = [tuiMessage(), roomMessage(false)];
+        for (const event of privateFirst ? events : events.reverse()) rig.framework.pushEvent(event);
+        await rig.framework.runUntilIdle();
+        assert.equal(rig.starts.length, 0, 'control: nothing starts while quiesced');
+        await rig.framework.resume();
+        await rig.until(() => rig.starts.length >= 2, 'two turns after resume');
+        await rig.framework.runUntilIdle();
+        const label = privateFirst ? 'private first' : 'channel first';
+        assert.equal(rig.starts.length, 2, label);
+        assert.ok(rig.starts.some(privateStart) && rig.starts.some(roomStart), `${label}: ${JSON.stringify(rig.starts)}`);
+        assert.deepEqual(rig.routed.map((r) => r.locus), [ROOM], `${label}: only the room's turn spoke`);
+      } finally {
+        await rig.close();
+      }
+    }
+  });
+
+  it('a quiesce keeps a private wake apart from an unclassified one with the same reason, so the newer one evicts neither', async () => {
+    const rig = await surfaceRig();
+    try {
+      await rig.framework.quiesce();
+      const now = Date.now();
+      // As a debounce flush just before the quiesce leaves them: a private
+      // window's wake, then an unclassified one's.
+      rig.i.pendingRequests.push(
+        { agentName: 'scout', reason: 'gate:debounce', source: 'gate', timestamp: now, nonChannelOrigin: true },
+        { agentName: 'scout', reason: 'gate:debounce', source: 'gate', timestamp: now + 1 },
+      );
+      await rig.i.processInferenceRequests();
+      assert.equal(rig.starts.length, 0, 'control: nothing starts while quiesced');
+      await rig.framework.resume();
+      await rig.until(() => rig.starts.length >= 1, 'the turn after resume');
+      await rig.framework.runUntilIdle();
+      assert.equal(rig.starts.length, 1, JSON.stringify(rig.starts));
+      assert.ok(privateStart(rig.starts[0]!), `the private wake leads its turn: ${JSON.stringify(rig.starts[0])}`);
+      assert.deepEqual(rig.routed, [], 'nothing is routed');
+    } finally {
+      await rig.close();
+    }
+  });
 });

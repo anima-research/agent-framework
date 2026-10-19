@@ -13615,16 +13615,23 @@ export class AgentFramework {
         // results) pass; everything else parks.
         const passThrough = requests.filter((r) => isTurnContinuation(r.reason));
         const parked = requests.filter((r) => !isTurnContinuation(r.reason));
-        // Coalesce per (reason, addressed): every channel wake shares one
-        // reason, so keying on reason alone would let an ambient message
-        // parked later evict a DM/mention parked earlier — and the
+        // Coalesce per (reason, addressed, routing class): every channel wake
+        // shares one reason, so keying on reason alone would let an ambient
+        // message parked later evict a DM/mention parked earlier — and the
         // addressed-outranks-ambient trigger selection below would then
-        // route the resumed turn into the wrong channel.
+        // route the resumed turn into the wrong channel. Likewise a wake from
+        // a private surface, a channel-bound one and an unclassified one never
+        // stand for each other: keeping only the newer would drop a channel's
+        // wake, or answer a private one in a channel's turn or in an
+        // unclassified one's, which routes to the fallback. Kept apart, the
+        // split below runs a private wake and a channel-bound one in separate
+        // turns, and an unclassified one joins the turn it's batched with.
         const newestByKey = new Map<string, InferenceRequest>();
         for (const request of parked) {
           // A coalesced wake is withdrawable by its subject (RFC-006 §4.2); it
           // must not absorb an unrelated wake that would vanish with it.
-          const key = `${request.reason}|${request.addressed ? 'a' : 'n'}|${request.coalescingSubject ?? ''}`;
+          const routingClass = request.nonChannelOrigin ? 'p' : request.channelId ? 'c' : 'n';
+          const key = `${request.reason}|${request.addressed ? 'a' : 'n'}|${routingClass}|${request.coalescingSubject ?? ''}`;
           const prev = newestByKey.get(key);
           if (!prev || request.timestamp >= prev.timestamp) {
             newestByKey.set(key, request);
