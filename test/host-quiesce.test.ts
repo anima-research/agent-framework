@@ -1285,10 +1285,9 @@ test("resume stores several agents' writes in the order they arrived, and cuts e
     add('one', 'agent');
     add('two', 'scout');
     add('three', 'agent');
-    // Nothing checks a fresh write's blocks beyond reading each one's type,
-    // so a block that isn't an object can be queued; the log line names it
-    // by its JavaScript type.
-    internals.addMessage('user', [{ type: 'text', text: 'stuck' }, 'a bare string'], undefined, { forAgent: 'agent' });
+    // A write whose content the store would accept, which the store below
+    // refuses all the same; the log line names it by its blocks' types.
+    internals.addMessage('user', [{ type: 'text', text: 'stuck' }, { type: 'text', text: 'and more' }], undefined, { forAgent: 'agent' });
     add('for scout', 'scout');
     add('behind the stuck one', 'agent');
     add('also for scout', 'scout');
@@ -1303,7 +1302,7 @@ test("resume stores several agents' writes in the order they arrived, and cuts e
       return realAdd(participant, content, metadata, causedBy);
     }) as typeof agentCm.addMessage;
     const named = () => lines.filter((line) =>
-      line.includes(`deferred write ${stuckId} (user: text+string) for agent could not be stored`)
+      line.includes(`deferred write ${stuckId} (user: text) for agent could not be stored`)
       && line.includes('a thrown value that has no text')).length;
 
     let status = await framework.resume();
@@ -1353,9 +1352,10 @@ test('boot recovery drops a malformed recovered deferred write, naming it, and r
     // them in the recovery file: a null block, a string block and a number
     // block beside a text block, content that isn't blocks, a participant
     // that isn't text, which the line names by its type, and a target that
-    // is empty or isn't text. Once stored, a string or number block would
-    // make every compile for the agent throw, since the context manager's
-    // token estimate keys a WeakMap on each block.
+    // is empty or isn't text. A store before context-manager 0.16.0 kept a
+    // string or number block, and every compile for the agent then threw,
+    // since the context manager's token estimate keys a WeakMap on each
+    // block; from 0.16.0 the store refuses one.
     const file = join(storePath, 'recovery', 'deferred-writes.json');
     const doc = JSON.parse(readFileSync(file, 'utf8')) as { pending: Array<Record<string, unknown>> };
     assert.equal(doc.pending.length, 2);
@@ -1385,6 +1385,58 @@ test('boot recovery drops a malformed recovered deferred write, naming it, and r
       .map((m) => (m.content[0] as { text: string }).text);
     assert.deepEqual(texts, ['first', 'second']);
     await assert.doesNotReject(framework.getAgent('agent')!.compileContext(), 'and the agent compiles');
+  } finally {
+    console.error = error;
+    await framework.stop();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('a recovered deferred write context-manager refuses as malformed is dropped at the first flush, and the ack takes it out of the recovery file', { timeout: 60_000 }, async () => {
+  // A write addMessage refuses now could sit in a queue an earlier process
+  // persisted: a text block whose text isn't a string is an object block, so
+  // boot restores it, and the store refuses it at the flush that meets it.
+  const dir = mkdtempSync(join(tmpdir(), 'host-quiesce-refused-'));
+  const storePath = join(dir, 'store');
+  const config = () => ({
+    storePath,
+    membrane: new MockMembrane().asMembrane(),
+    agents: [{ name: 'agent', model: 'test-model', systemPrompt: 'test' }],
+    modules: [],
+  });
+  let framework = await AgentFramework.create(config());
+  const lines: string[] = [];
+  const error = console.error;
+  try {
+    await framework.quiesce({ reason: 'surgery' });
+    const before = framework.getAgent('agent')!.getContextManager().getAllMessages().length;
+    const add = (framework as unknown as { addMessage(p: string, c: unknown[]): unknown }).addMessage.bind(framework);
+    add('user', [{ type: 'text', text: 'first' }]);
+    add('user', [{ type: 'text', text: 'second' }]);
+    await framework.stop();
+
+    const file = join(storePath, 'recovery', 'deferred-writes.json');
+    const doc = JSON.parse(readFileSync(file, 'utf8')) as { pending: Array<Record<string, unknown>> };
+    assert.equal(doc.pending.length, 2);
+    // Between the two writes, so the second is queued behind it: the second
+    // moves up one seq, and the malformed entry takes its place.
+    const second = doc.pending[1]!;
+    const seq = second.seq as number;
+    second.seq = seq + 1;
+    doc.pending.splice(1, 0, { id: 'number-text', seq, participant: 'user', content: [{ type: 'text', text: 5 }] });
+    writeFileSync(file, JSON.stringify(doc));
+
+    framework = await AgentFramework.create(config());
+    assert.equal(framework.getHostModeStatus().deferredWrites, 3, 'boot restores it with the others');
+    console.error = (...args: unknown[]) => { lines.push(args.map(String).join(' ')); };
+    await framework.resume();
+    console.error = error;
+    assert.ok(lines.some((line) => line.includes("was refused as malformed, so it's dropped rather than queued again") && line.includes('content[0]')), lines.join('\n'));
+    const texts = framework.getAgent('agent')!.getContextManager().getAllMessages().slice(before)
+      .map((m) => (m.content[0] as { text: string }).text);
+    assert.deepEqual(texts, ['first', 'second'], 'what was queued behind it landed, in order');
+    assert.equal(framework.getHostModeStatus().deferredWrites, 0, 'nothing is queued again');
+    assert.ok(!readFileSync(file, 'utf8').includes('number-text'), 'and the recovery file no longer holds it');
   } finally {
     console.error = error;
     await framework.stop();

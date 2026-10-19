@@ -212,10 +212,11 @@ npx tsc --noEmit      # typecheck
 code you no longer have — always build before testing, and after switching
 branches. The `pretest` hook copies `test/fixtures/*.mjs` into `dist/`.
 
-`--test-timeout=600000` bounds each test file as a whole under Node 20,
-and each test under Node 24, at ten minutes; the slowest file,
-`mcpl-runtime-lifecycle`, takes about three. Each job in `ci.yml` also has
-a `timeout-minutes` limit, which ends a hang the test timeout doesn't reach.
+`--test-timeout=600000` bounds each test file as a whole under Node
+22.12, as it did under Node 20, and each test under Node 24, at ten
+minutes; the slowest file, `mcpl-runtime-lifecycle`, takes about three.
+Each job in `ci.yml` also has a `timeout-minutes` limit, which ends a hang
+the test timeout doesn't reach.
 
 Push-time CI (`ci.yml`) builds, typechecks and tests every push and PR on
 ubuntu and macos. Lockfiles are deliberately gitignored in this repo, so CI

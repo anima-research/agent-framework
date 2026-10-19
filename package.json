@@ -48,8 +48,8 @@
   "license": "MIT",
   "dependencies": {
     "@animalabs/chronicle": "^0.4.0",
-    "@animalabs/context-manager": "^0.14.1",
-    "@animalabs/membrane": "^0.5.87",
+    "@animalabs/context-manager": "^0.16.0",
+    "@animalabs/membrane": "^0.6.0",
     "@modelcontextprotocol/client": "^2.3.1",
     "chokidar": "^4.0.3",
     "discord.js": "^14.25.1",
@@ -64,6 +64,6 @@
     "typescript": "^7.0.2"
   },
   "engines": {
-    "node": ">=20.0.0"
+    "node": ">=22.12.0"
   }
 }

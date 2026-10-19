@@ -49,33 +49,6 @@ interface Interjection {
   content: ContentBlock[];
 }
 
-/** The installed context-manager's version. Its package's exports don't
- *  include package.json, so walk up from its entry point to it. */
-function contextManagerVersion(): string {
-  let dir = dirname(fileURLToPath(import.meta.resolve('@animalabs/context-manager')));
-  for (;;) {
-    const file = join(dir, 'package.json');
-    if (existsSync(file)) {
-      const pkg = JSON.parse(readFileSync(file, 'utf8')) as { name?: string; version?: string };
-      if (pkg.name === '@animalabs/context-manager' && pkg.version) return pkg.version;
-    }
-    const up = dirname(dir);
-    if (up === dir) throw new Error("can't find @animalabs/context-manager's package.json");
-    dir = up;
-  }
-}
-
-/** Set, with the reason, when shards can't land before a throw: from
- *  context-manager 0.15, a sharded write that fails partway removes what it
- *  wrote. The tests of carrying landed shards pin 0.14.x. */
-const NO_SHARDS_LAND_BEFORE_A_THROW = (() => {
-  const version = contextManagerVersion();
-  const [major, minor] = version.split('.').map(Number);
-  return major! > 0 || minor! >= 15
-    ? `context-manager ${version} removes what a sharded write that fails partway wrote, so no shards land before a throw`
-    : false;
-})();
-
 /** Tools that deliver messages while they run, the way a module or a channel
  *  would while the agent is busy: `move` continues the turn, `halt` ends it. */
 class InterjectingModule implements Module {
@@ -571,7 +544,7 @@ describe('mid-turn deliveries keep the window what the stream carried', () => {
         : null;
   }
 
-  it("at a tool boundary, a sharded body that throws after its first shard: what landed is carried and counts as written, and the rest isn't stored", { skip: NO_SHARDS_LAND_BEFORE_A_THROW }, async () => {
+  it('at a tool boundary, a sharded body whose write throws partway lands nothing: it waits for the turn end with what follows, and is stored whole then', async () => {
     membrane.pushResponse(createMockResponse([
       { type: 'text', text: 'Moving.' },
       { type: 'tool_use', id: 'c1', name: 'robot--move', input: {} },
@@ -579,8 +552,8 @@ describe('mid-turn deliveries keep the window what the stream carried', () => {
     membrane.pushResponse(createMockResponse(text('Done.')));
     const framework = await createFramework();
     shardOn(framework, 'part one');
-    // The strategy throws on the first shard's add, which stops the append
-    // loop before the second shard.
+    // The strategy throws on the first shard's add, and context-manager
+    // removes the shard it wrote before the write throws.
     throwOnceAfterStoring(framework, 'part one');
     module.interjections = [
       { participant: 'Antra', content: [...text('part one'), ...text('part two')] },
@@ -593,25 +566,28 @@ describe('mid-turn deliveries keep the window what the stream carried', () => {
       framework.pushEvent({ type: 'external-message', source: 'test', content: 'go' } as unknown as ProcessEvent);
       await framework.runUntilIdle();
     } finally { console.error = error; }
-    assert.deepEqual(injected(), ['Antra: part one', 'Antra: look right'], 'the request carries what the store holds');
+    assert.deepEqual(injected(), [], 'nothing of the body landed, so the boundary carried nothing');
     assert.deepEqual(windowOf(framework).slice(2), [
       'user: <tool_result>',
-      'Antra: part one',
-      'Antra: look right',
       'assistant: Done.',
-    ], 'the first shard alone, stored once');
-    assert.equal(internalsOf(framework).deferredMessages.length, 0, 'nothing went back into the queue');
-    assert.ok(errors.some((e) => e.includes("threw after 1 shard of its body was stored; what was stored counts as written and isn't stored again")
-      && e.includes('strategy failed')), errors.join('\n'));
+      'Antra: part one',
+      'Antra: part two',
+      'Antra: look right',
+    ], 'the body, stored whole at the turn end, then what was queued behind it');
+    assert.equal(internalsOf(framework).deferredMessages.length, 0, 'nothing is left in the queue');
+    assert.ok(errors.some((e) => e.includes('could not be stored; it stays queued') && e.includes('strategy failed')), errors.join('\n'));
     await framework.stop();
   });
 
-  it('at a tool boundary, the shards that landed before a throw are carried as the next compile renders them', { skip: NO_SHARDS_LAND_BEFORE_A_THROW }, async () => {
+  it('at a tool boundary, when removing the shards of a body whose write threw fails too, the shards that stayed are carried as the next compile renders them', async () => {
     // Probe by Ansel-2428: the autobiographical strategy shards a long
     // message on ingest and joins a body's consecutive shards when it
     // compiles, so the boundary must carry what landed in that shape. The
     // body with an image between two texts fails here if the join changes
     // where it puts a non-text block, so the copy of the join can't drift.
+    // A write that throws partway removes the shards it wrote, so shards
+    // stay only when that removal fails as well, which the store's removal
+    // is made to do here.
     const long = Array.from({ length: 60 }, (_, i) => `Sentence ${i} of a long message from Antra.`).join(' ');
     const ofLong = (messages: Array<{ content: unknown }>) =>
       messages.filter((m) => JSON.stringify(m.content).includes('Sentence 0 '));
@@ -641,11 +617,19 @@ describe('mid-turn deliveries keep the window what the stream carried', () => {
         } as never],
       });
       const cm = framework.getAgent('assistant')!.getContextManager();
+      const internals = cm as unknown as {
+        strategy: { onNewMessage?: (message: { bodyGroupId?: string }, ctx: unknown) => Promise<void> };
+        messageStore: { removeBodyGroup: (id: string) => void };
+      };
+      // The strategy throws on the throwAt-th shard's add, as the manager's
+      // own store listener calls it for each record written.
+      const onNewMessage = internals.strategy.onNewMessage;
       let shards = 0;
-      cm.onMessage((event) => {
-        if (event.type !== 'add' || !(event.message as { bodyGroupId?: string }).bodyGroupId) return;
-        if (++shards === throwAt) throw new Error('listener failed');
-      });
+      internals.strategy.onNewMessage = function (this: unknown, message, ctx) {
+        if (message.bodyGroupId && ++shards === throwAt) throw new Error('strategy failed');
+        return onNewMessage ? onNewMessage.call(this, message, ctx) : Promise.resolve();
+      };
+      internals.messageStore.removeBodyGroup = () => { throw new Error('removal failed'); };
       module.interjections = [{ participant: 'Antra', content }];
       const error = console.error;
       console.error = () => {};
@@ -653,7 +637,7 @@ describe('mid-turn deliveries keep the window what the stream carried', () => {
         framework.pushEvent({ type: 'external-message', source: 'test', content: 'go' } as unknown as ProcessEvent);
         await framework.runUntilIdle();
         const landed = cm.getAllMessages().filter((m) => (m as { bodyGroupId?: string }).bodyGroupId);
-        assert.equal(landed.length, throwAt, `${name}: ${throwAt} shards landed before the throw stopped the body`);
+        assert.equal(landed.length, throwAt, `${name}: ${throwAt} shards stayed, the removal having failed`);
         const injected = ofLong(membrane.lastStream!.receivedToolResultOptions[0]?.injectedMessages ?? []);
         // The next turn's request is compiled from the store.
         membrane.pushResponse(createMockResponse(text('Okay.')));
@@ -668,6 +652,37 @@ describe('mid-turn deliveries keep the window what the stream carried', () => {
         await framework.stop();
       }
     }
+  });
+
+  it('at a tool boundary, a queued write context-manager refuses as malformed is dropped, and what is queued behind it lands', async () => {
+    // addMessage refuses such content before it's queued, so an entry like
+    // this one reaches a drain only from a queue an earlier process
+    // persisted: it's placed in the queue as boot's restore would place it,
+    // ahead of the interjection by its seq.
+    module.duringTool = () => {
+      (module.framework as unknown as { deferredMessages: unknown[] }).deferredMessages.push({
+        id: 'persisted-before', seq: 0, participant: 'Antra', forAgent: 'assistant', heldAt: Date.now(),
+        // A text block whose text isn't a string, which the store refuses.
+        content: [{ type: 'text', text: 5 } as unknown as ContentBlock],
+      });
+    };
+    const errors: string[] = [];
+    const error = console.error;
+    console.error = (...args: unknown[]) => { errors.push(args.map(String).join(' ')); };
+    let framework: AgentFramework;
+    try {
+      framework = await runTurn('move', [{ participant: 'Antra', content: text('look right') }]);
+    } finally { console.error = error; }
+    assert.deepEqual(atBoundary(), ['Antra: look right', 'Antra: 5'], 'both were queued when the boundary drained');
+    assert.deepEqual(injected(), ['Antra: look right'], 'what was queued behind it is carried');
+    assert.deepEqual(windowOf(framework).slice(2), [
+      'user: <tool_result>',
+      'Antra: look right',
+      'assistant: Done.',
+    ], 'stored where the stream carried it, and the refused write nowhere');
+    assert.equal(internalsOf(framework).deferredMessages.length, 0, 'the refused write was not queued again');
+    assert.ok(errors.some((e) => e.includes("was refused as malformed, so it's dropped rather than queued again") && e.includes('content[0]')), errors.join('\n'));
+    await framework.stop();
   });
 
   it('at a tool boundary, a sharded body stored whole is carried as the next compile renders it', async () => {

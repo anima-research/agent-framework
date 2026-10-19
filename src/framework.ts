@@ -9,7 +9,7 @@ import {
 import { JsStore } from '@animalabs/chronicle';
 import type { Membrane, ContentBlock, NormalizedRequest, NormalizedResponse, YieldingStream, DetailedUsage, ToolResult as MembraneToolResult, ToolResultContentBlock } from '@animalabs/membrane';
 import { MembraneError } from '@animalabs/membrane';
-import { ContextManager, PassthroughStrategy, WindowedPassthroughStrategy, OverBudgetError, UncoveredDropError, stripUnpairedToolBlocks } from '@animalabs/context-manager';
+import { ContextManager, PassthroughStrategy, WindowedPassthroughStrategy, OverBudgetError, UncoveredDropError, stripUnpairedToolBlocks, MalformedContentError, malformedContentPlaces, CompressionWithdrawn } from '@animalabs/context-manager';
 import type { CacheWireReceipt } from './kv-unified-wire.js';
 import { SILENT_HEARTBEAT_SEPARATOR, type RequestOnlyPrompt, type RequestOnlyStamps } from './silent-heartbeat.js';
 import { SUBCONSCIOUS_TOOLS, SUBCONSCIOUS_TOOL_NAMES, type SubconsciousConfig } from './tune-out/tools.js';
@@ -332,6 +332,24 @@ const isConversationalInjection = (metadata?: MessageMetadata): boolean => {
   if (isMarkerTagged(m.tags, m.firstView === true)) return false;
   return true;
 };
+
+/**
+ * The first message a module's process response adds, or edit it makes,
+ * whose content context-manager won't store: `where` names it in the
+ * response, such as `addMessages[1]`, and `places` is malformedContentPlaces'
+ * answer for it. Null when the response holds none.
+ */
+function malformedResponseContent(response: EventResponse): { where: string; places: string[] } | null {
+  const writes = [
+    ...(response.addMessages ?? []).map((msg, i) => [`addMessages[${i}]`, msg.content] as const),
+    ...(response.editMessages ?? []).map((edit, i) => [`editMessages[${i}]`, edit.content] as const),
+  ];
+  for (const [where, content] of writes) {
+    const places = malformedContentPlaces(content);
+    if (places.length > 0) return { where, places };
+  }
+  return null;
+}
 
 /**
  * Rough token estimate for the blocks a continuation round is about to
@@ -1309,24 +1327,23 @@ function logSeedOmissions(
 }
 
 /**
- * A maintenance provider call withdrawn because a surgery holds the store, or
- * because stop() has closed provider admission: either is the framework's own
- * doing, and no failure. It sent nothing: it was refused at the provider
- * gate, or woken there from its wait. For a call outside context-manager
- * 0.14's compression fallback ladder, a merge's or a chunk's canonical call
- * with its retries after a tool_use stop, context-manager counts no attempt.
- * A merge keeps its queue entry, so the next tick after the hold, or after
- * the next start, does it again. A chunk's compression has already left the
- * queue: it logs "Failed to compress chunk (hierarchical)" with this error
- * and records the call, and the chunk, still uncompressed, is queued again at
- * that manager's next rebuild (its next initialization, message, sent compile
- * or released hold). A call inside the ladder, after a chunk's canonical call
- * was refused or cut short, is caught by the rung that made it and recorded
- * as a provider error, since 0.14 rethrows only its own
- * CompressionBranchDiscard there; once every rung has failed, the chunk's
- * request family is quarantined, with its alert, and the tick returns.
+ * A maintenance provider call withdrawn because a surgery holds the store,
+ * because stop() has closed provider admission, or because the framework is
+ * done with the agent (an ephemeral run that has left or been released by
+ * cleanup(), a conversation fork disposed or not made): each is the
+ * framework's own doing, and no failure. It sent nothing: it was refused
+ * before the call was made, at the provider gate or by the manager's own
+ * membrane, or woken at the gate from its wait. It extends context-manager's
+ * CompressionWithdrawn, whose constructor sets the brand context-manager reads
+ * a withdrawal by, so the call is no outcome of the compression: every rung
+ * of the fallback ladder and the merge path rethrow it unchanged, recording
+ * no outcome, attempt, streak or quarantine event. Its tick puts the chunk
+ * back at the head of the queue, unless a rebuild decided the queue afresh
+ * while the call was out, and a merge stays at the head of its own, for the
+ * next tick once calls are let through again (context-manager's
+ * CompressionWithdrawn doc has the rest).
  */
-class MaintenanceWithdrawnError extends Error {
+class MaintenanceWithdrawnError extends CompressionWithdrawn {
   constructor(reason: string) {
     super(`maintenance call withdrawn: ${reason}`);
     this.name = 'MaintenanceWithdrawnError';
@@ -2099,8 +2116,8 @@ function boundFailureFields(record: Record<string, unknown>): Record<string, unk
  *   adapter files every status it doesn't list (404, 405, 409, 410, 413,
  *   415, 422 …) as invalid_request, so it alone produces an invalid_request
  *   at 413 or 422, and no 0.5.86 adapter produces a context_length at 413.
- * - From membrane 0.5.87 (membrane #56 and #107), this package's floor, every
- *   adapter sends an HTTP failure through one status table
+ * - From membrane 0.5.87 (membrane #56 and #107), below this package's
+ *   floor, every adapter sends an HTTP failure through one status table
  *   (errorFromProviderStatus). On a 400 or 422, auth codes and reasons and
  *   the two account refusals it recognizes by their text (a balance too low,
  *   usage limits reached) are auth, and a context overflow, by its code or
@@ -2376,6 +2393,15 @@ export class AgentFramework {
    *  by the object, not the run's record (ephemeralRuns), which its cleanup
    *  drops before a cancelled stream may count its last usage. */
   private ephemeralAgents: WeakSet<Agent> = new WeakSet();
+  /** Candidates withdrawn by their cleanup(): they can never run, since
+   *  cleanup() is the caller's word that it is done with them. */
+  private releasedEphemeralCandidates: WeakSet<Agent> = new WeakSet();
+  /** Each ephemeral agent's or conversation fork's release, kept per Agent
+   *  rather than per name: set once an ephemeral run has left or cleanup() has
+   *  released it, or as a conversation fork is disposed or fails to be made.
+   *  From then on its context manager's compression is withdrawn
+   *  (ephemeralAuxiliaryMembraneFor, conversationAuxiliaryMembraneFor). */
+  private agentReleases: WeakMap<Agent, { released: boolean }> = new WeakMap();
   /** Warn only once per Agent instance after utilities are registered. */
   private emptyUtilityPermissionWarnings: WeakSet<Agent> = new WeakSet();
   /** Physical ephemeral frames deliberately disposed by their run watchdog/caller.
@@ -3948,9 +3974,10 @@ export class AgentFramework {
     //
     // A quiesced host defers each entry again instead, into the persisted
     // queue, for boot recovery. Past the deferral, a write that throws stays
-    // queued with what follows it for its target, and a memory-only queue
-    // still loses it at exit. An entry for a target no longer registered (a
-    // disposed fork) is left: dropped with a memory-only queue at exit, and
+    // queued with what follows it for its target, unless the store refused it
+    // as malformed, which drops it (writeDrainedInOrder), and a memory-only
+    // queue still loses it at exit. An entry for a target no longer registered
+    // (a disposed fork) is left: dropped with a memory-only queue at exit, and
     // from a persisted one, by the boot or resume flush that meets it, passed
     // to the primary if it's a failed reply, and otherwise dropped, logged.
     //
@@ -4155,23 +4182,50 @@ export class AgentFramework {
    * leave a gate behind. But its stated waits are recorded for (agent, model)
    * as a resident's are, so they bind its auxiliary calls too: a held model
    * is refused without a call, and an auxiliary call's own stated wait is
-   * recorded for it. (An ephemeral run records nothing, its name being
-   * single-use, so its context manager keeps the plain membrane.) Its
-   * compression is the background work a resident's is, whether a
-   * maintenance tick or a drain after a message starts it, so it is withdrawn
-   * as a resident's is: a call made while a surgery holds the store, or once
-   * stop() has closed provider admission, is withdrawn without being sent.
+   * recorded for it. (An ephemeral run's manager takes
+   * ephemeralAuxiliaryMembraneFor's instead.) Its compression is the
+   * background work a resident's is, whether a maintenance tick or a drain
+   * after a message starts it, so it is withdrawn as a resident's is: a call
+   * made while a surgery holds the store, or once stop() has closed provider
+   * admission, is withdrawn without being sent. So is one made once the fork
+   * has been disposed, or its creation has failed (`release`): its context
+   * stays in Chronicle, and no turn compiles it again.
    */
-  private conversationAuxiliaryMembraneFor(agentName: string): Membrane {
+  private conversationAuxiliaryMembraneFor(agentName: string, release: { released: boolean }): Membrane {
     return this.membraneAdmitting(async (run, model) => {
       this.withdrawMaintenanceUnderSurgery();
       this.withdrawMaintenanceWhenStopping(agentName);
+      if (release.released) throw new MaintenanceWithdrawnError(`conversation agent ${agentName} has been released`);
       this.refuseHeldProviderModel(agentName, model);
       try { return await run(); }
       catch (error) {
         if (model !== undefined && error instanceof Error) this.recordProviderWait(agentName, model, error);
         throw error;
       }
+    });
+  }
+  /**
+   * An ephemeral agent's auxiliary calls (its context manager's compression).
+   * Like a conversation agent's, they take no provider gate, and like any
+   * agent's compression they are withdrawn without being sent while a surgery
+   * holds the store or once stop() has closed provider admission. An
+   * ephemeral run records no stated wait, its name being single-use, so none
+   * binds them. They are withdrawn too once the manager's run has left or
+   * cleanup() has released it (`release`). cleanup() is the caller's word
+   * that it is done with the agent: a run it has abandoned, to a timeout or
+   * a cancel, may still be going, and goes on with its compression
+   * withdrawn. A drain still working through its queue would pay for
+   * summaries of a run that has ended, or that its caller has given up on.
+   * A call already out when the release lands runs to its answer, its
+   * retries inside membrane included, since the release is checked as each
+   * call starts. What the run stored stays in its namespace.
+   */
+  private ephemeralAuxiliaryMembraneFor(agentName: string, release: { released: boolean }): Membrane {
+    return this.membraneAdmitting(async (run) => {
+      this.withdrawMaintenanceUnderSurgery();
+      this.withdrawMaintenanceWhenStopping(agentName);
+      if (release.released) throw new MaintenanceWithdrawnError(`ephemeral agent ${agentName} has been released`);
+      return run();
     });
   }
   /** The framework's membrane, with each complete() call passed through
@@ -4503,9 +4557,8 @@ export class AgentFramework {
   /**
    * Refuse an auxiliary call to a model the provider asked this agent to wait
    * on, without calling it. The refusal is a retryable rate limit carrying
-   * the remaining wait, so a caller that paces (context-manager's compression
-   * lane, from its corrective round #138 on) waits it out instead of spending
-   * a call. It is marked
+   * the remaining wait, so a caller that paces waits it out instead of
+   * spending a call. It is marked
    * `providerAdmission: 'deferred'`: no call was made, so a caller can keep
    * the wait without counting a failed call (room-225 #47927).
    */
@@ -4556,17 +4609,16 @@ export class AgentFramework {
     for (const { wait, release } of released) {
       console.error(`[provider-wait] agent=${agentName} model=${wait.model} released by ${by} (${release})`);
     }
-    // The agent's context strategy may pace its own provider calls by the
-    // same stated wait (context-manager's compression lane, from its
-    // corrective round #138 on; 0.14.0 has no releaseCompressionPause, so this
-    // calls nothing there). The release is the operator's word on that wait
-    // too, so it is offered to the lane with its scope even when no wait
-    // binds here: the lane can hold a pause after
-    // this framework's own wait is gone (the records read again, the wait
-    // passed, or it was released in another process). The strategy's own
-    // backoff stays, and the receipt still lists only waits released here.
-    // Read inside the try: the release is already recorded, so a strategy
-    // that throws must not keep the hold below from being released.
+    // The agent's context strategy may pace its own provider calls by the same
+    // stated wait. context-manager 0.16.0, this package's floor, has no
+    // releaseCompressionPause, so this calls nothing in its strategies. The
+    // release is the operator's word on that wait too, so it is offered to the
+    // lane with its scope even when no wait binds here: the lane can hold a
+    // pause after this framework's own wait is gone (the records read again,
+    // the wait passed, or it was released in another process). The strategy's
+    // own backoff stays, and the receipt still lists only waits released here.
+    // Read inside the try: the release is already recorded, so a strategy that
+    // throws must not keep the hold below from being released.
     try {
       const strategy = this.agents.get(agentName)?.getContextManager().getStrategy() as
         { releaseCompressionPause?: (model?: string) => boolean } | undefined;
@@ -4720,6 +4772,11 @@ export class AgentFramework {
       } catch (error) {
         console.error(`[tool-result-guard] agent=${agent.name} storage retry failed during maintenance:`, error);
       }
+      // A manager the framework is done with takes no tick, since every call
+      // it would make is withdrawn. An ephemeral run that cleanup() released
+      // stays registered while it goes on, so its tool results are still
+      // stored (the flush above).
+      if (this.agentReleases.get(agent)?.released) return [];
       // Whatever throws while one agent's maintenance is prepared is that
       // agent's failure, reported for it alone, while the others run.
       const failedAgent = (error: unknown): Queued[] => {
@@ -6447,14 +6504,16 @@ export class AgentFramework {
    * acknowledged once: the chronicle is synced, then the persisted queue is
    * rewritten without the batch (ackDeferredWrites). Until then the batch
    * stays in the durable queue, so a crash mid-flush replays it at the next
-   * boot, which skips each entry that already landed, by its deferredWriteId
-   * — no loss, no duplicates. The batch is stored in queue order, whatever
-   * its targets (writeDrainedInOrder). A write the store rejects stays
-   * queued, logged, with what is queued behind it for its target, so the
-   * flush never stores that target's later entries ahead of it, and other
-   * targets' entries go on. (A write that isn't deferred can still land
-   * ahead of it, such as one for an idle agent once the host has resumed.)
-   * A boot that meets it again logs it and goes on.
+   * boot, which skips each entry that already landed, by its deferredWriteId —
+   * no loss, no duplicates. The batch is stored in queue order, whatever its
+   * targets (writeDrainedInOrder). A write the store rejects stays queued,
+   * logged, with what is queued behind it for its target, so the flush never
+   * stores that target's later entries ahead of it, and other targets' entries
+   * go on. One the store refuses as malformed, which it would at every flush,
+   * is logged and dropped instead, and what is behind it goes on. (A write
+   * that isn't deferred can still land ahead of it, such as one for an idle
+   * agent once the host has resumed.) A boot that meets it again logs it and
+   * goes on.
    *
    * Per-target: an agent whose turn is still alive keeps ITS messages
    * deferred for its own turn boundary; everyone else's flush now.
@@ -6982,19 +7041,21 @@ export class AgentFramework {
       }
     }
     // An entry the queue's readers can't handle has no place in it: one whose
-    // participant isn't text, whose content isn't an array, that holds a
-    // block that isn't an object, or whose `forAgent` is present but not a
-    // name, is dropped here with a line naming it, rather than held. Reading
-    // a null block's type throws, at the tool boundary and in the store. The
-    // store keeps a string or number block as given, but the context
-    // manager's token estimate keys a WeakMap on each block, which such a
-    // value can't be: once one is stored, every compile for that agent
-    // throws, and a restart doesn't clear it. What a block holds, such as a
-    // tool result's content, isn't checked here, as it isn't for a fresh
-    // write. The framework writes `forAgent` only as a non-empty name, so
-    // another value comes from damage or a hand edit, and the agent it
-    // meant can't be known: sent to the primary, as a falsy one would be, it
-    // could put another agent's message in the primary's window.
+    // participant isn't text, whose content isn't an array, that holds a block
+    // that isn't an object, or whose `forAgent` is present but not a name, is
+    // dropped here with a line naming it, rather than held. Reading a null
+    // block's type throws, at the tool boundary and in the store. From
+    // context-manager 0.16.0 the store refuses a string or number block and
+    // its reads leave one out; an older store kept it as given, and since the
+    // context manager's token estimate keys a WeakMap on each block, every
+    // compile for that agent then threw, and a restart didn't clear it. What a
+    // block holds, such as a tool result's content, isn't checked here: a
+    // recovered write whose content context-manager refuses is dropped at the
+    // flush that meets it (writeDrainedInOrder). The framework writes
+    // `forAgent` only as a non-empty name, so another value comes from damage
+    // or a hand edit, and the agent it meant can't be known: sent to the
+    // primary, as a falsy one would be, it could put another agent's message
+    // in the primary's window.
     const wellFormed = (m: unknown): m is Omit<DeferredWrite, 'id' | 'seq' | 'heldAt'> & { id?: unknown; seq?: unknown; heldAt?: unknown } => {
       if (!m || typeof m !== 'object') return false;
       const { participant, content, forAgent } = m as { participant?: unknown; content?: unknown; forAgent?: unknown };
@@ -7941,7 +8002,13 @@ export class AgentFramework {
    * `{namespace}/messages`, context log to `{namespace}/context`.
    *
    * Data persists after cleanup for investigation and cross-revert.
-   * Call cleanup() when done to release the ContextManager.
+   * Call cleanup() when done to release the ContextManager. Once its run has
+   * ended, or cleanup() has released it, the ContextManager starts no further
+   * provider call: compression its strategy still has queued is withdrawn
+   * unsent, as a resident's and a conversation agent's is under a surgery's
+   * hold or once stop() has begun. A call already out then runs to its
+   * answer, its retries inside membrane included. cleanup() also retires an
+   * agent that hasn't run, so runEphemeralToCompletion refuses it.
    */
   async createEphemeralAgent(config: AgentConfig): Promise<{
     agent: Agent;
@@ -7961,13 +8028,14 @@ export class AgentFramework {
     this.usedEphemeralAgentNames.set(config.name, 'run');
     try {
       const namespace = `subagent/${config.name}`;
+      const release = { released: false };
 
       const contextManager = await ContextManager.open({
         store: this.store,
         namespace,
         isolate: true,
         strategy: config.strategy ?? new PassthroughStrategy(),
-        membrane: this.membrane,
+        membrane: this.ephemeralAuxiliaryMembraneFor(config.name, release),
         debugLogContext: !!process.env.DEBUG_CONTEXT,
       });
 
@@ -7976,10 +8044,16 @@ export class AgentFramework {
       agent.markContextConsumed(); // RFC-006: nothing stored before now is replaceable
       this.ephemeralCandidates.set(agent, contextManager);
       this.ephemeralAgents.add(agent);
+      this.agentReleases.set(agent, release);
 
       const cleanup = () => {
-        // Don't close the store — it's shared. Just release the CM.
-        // Data persists in the store under the namespace for investigation.
+        // Don't close the store — it's shared. Data persists in the store
+        // under the namespace for investigation. The manager's compression is
+        // withdrawn from here on (ephemeralAuxiliaryMembraneFor). A candidate
+        // that never ran is withdrawn for good, so it can't run later on a
+        // manager whose compression is withdrawn (runEphemeralToCompletion).
+        release.released = true;
+        this.releasedEphemeralCandidates.add(agent);
       };
 
       return { agent, contextManager, cleanup };
@@ -8100,6 +8174,12 @@ export class AgentFramework {
     contextManager: ContextManager,
     watchdogs?: { startupTimeoutMs?: number; idleTimeoutMs?: number; idlePollMs?: number },
   ): Promise<{ speech: string; toolCallsCount: number }> {
+    // cleanup() said the caller was done with it, and its manager's
+    // compression is withdrawn for good: no retry would cure that, so this
+    // comes before the refusals that a later retry can pass.
+    if (this.releasedEphemeralCandidates.has(agent)) {
+      throw new Error(`Ephemeral agent "${agent.name}" was released by cleanup() and can't run; create a new one`);
+    }
     // Refused at admission while quiesced rather than requeued: the caller
     // awaits the settle promise under an idle-stall watchdog, so a gate-parked
     // ephemeral would ride out its timeout and reject with a misleading
@@ -8249,6 +8329,10 @@ export class AgentFramework {
       } catch (error) {
         console.error(`[ephemeral] agent=${agent.name} its stream's cancel failed at the run's end; the run leaves all the same:`, error);
       }
+      // The run has left: its manager's compression is withdrawn from here on,
+      // writes landing below included (ephemeralAuxiliaryMembraneFor).
+      const release = this.agentReleases.get(agent);
+      if (release) release.released = true;
       if (this.ephemeralRuns.get(agent.name) === run) this.ephemeralRuns.delete(agent.name);
       if (this.agents.get(agent.name) === agent) {
         // What is still queued for the run, such as a message held for its
@@ -11434,11 +11518,12 @@ export class AgentFramework {
             const deferred = this.drainDeferredFor(agent.name, (msg) => !isInjectableMidTurn(msg, agent.name));
             // Stored in queue order, cut at the first that can't be stored: it
             // and what follows wait for the turn's end, and only what was
-            // stored is injected (the round's results go on either way). A
-            // sharded body read back from its store is injected as later
-            // compiles render it, its shards joined, and a write that threw
-            // after storing, which counts as stored, as what landed of it
-            // (writeDrainedInOrder).
+            // stored is injected (the round's results go on either way). One
+            // the store refuses as malformed is dropped instead, and what
+            // follows goes on. A sharded body read back from its store is
+            // injected as later compiles render it, its shards joined, and a
+            // write that threw after storing, which counts as stored, as what
+            // landed of it (writeDrainedInOrder).
             const stored = this.writeDrainedInOrder(deferred, `tool boundary for ${agent.name}`, (msg) =>
               agent.getContextManager().addMessage(msg.participant, msg.content, withDeferredWriteId(msg.metadata, msg.id)));
             for (const [msg, { id, content }] of stored) {
@@ -11758,14 +11843,37 @@ export class AgentFramework {
       }
     }
 
+    // A response holding content context-manager won't store, in a message
+    // it adds or an edit it makes, is refused whole before any response is
+    // applied: none of it is applied, its module state update and inference
+    // request included, so no turn runs for content that was never stored,
+    // and it doesn't count as accepting a surface's input. A line and a
+    // trace name the module and where, and the other modules' responses
+    // apply. process:completed and the process log list the responses that
+    // applied, so a view built on them doesn't show a refused response's
+    // messages as the event's. A store error while a response applies, such
+    // as a shard the store refuses when a strategy's chunking makes one,
+    // propagates as any store error does.
+    const applying = responses.filter(({ moduleName, response }) => {
+      const refusal = malformedResponseContent(response);
+      if (refusal === null) return true;
+      const { where, places } = refusal;
+      console.error(
+        `[process-response-refused] module=${moduleName} event=${event.type} reason=malformed-content: ` +
+        logDetail(new MalformedContentError(`${where} refused`, places).message),
+      );
+      this.emitTrace({ type: 'process:response-refused', moduleName, eventType: event.type, where, places });
+      return false;
+    });
+
     // Apply responses. Console/API input is conversation from a non-channel
     // surface: one acceptance per event, whose envelope every message the
     // modules add for it carries.
     const surface = this.surfaceSourceFor(event);
-    if (surface && responses.some(({ response }) => (response.addMessages?.length ?? 0) > 0)) {
+    if (surface && applying.some(({ response }) => (response.addMessages?.length ?? 0) > 0)) {
       this.noteInboundAccepted(surface);
     }
-    for (const { moduleName, response } of responses) {
+    for (const { moduleName, response } of applying) {
       await this.applyProcessResponse(response, event, moduleName, surface);
     }
 
@@ -11777,11 +11885,11 @@ export class AgentFramework {
     const durationMs = Date.now() - startTime;
 
     // Always emit trace for observability (UI needs this)
-    this.emitTrace({ type: 'process:completed', processEvent: event, responses, durationMs });
+    this.emitTrace({ type: 'process:completed', processEvent: event, responses: applying, durationMs });
 
     // Log to Chronicle (if enabled)
     if (this.processLoggingPersist) {
-      this.logProcessEvent(event, responses);
+      this.logProcessEvent(event, applying);
     }
   }
 
@@ -11894,6 +12002,23 @@ export class AgentFramework {
     acceptedAt?: number;
     inboundSource?: InboundSource;
   }): Promise<CoalescingPlacement | undefined> {
+    // context-manager won't store content that doesn't match ContentBlock
+    // (malformedContentPlaces names where). Content from the wire can't be
+    // such content, since the MCPL boundary converts every block into one the
+    // store accepts, so this is the backstop for events that never crossed
+    // it, as the empty-content check below is. Refused here, such a message
+    // stores no row, spawns no fork and queues no wake, and the line names
+    // the server and channel it came from; past this point its write would
+    // throw. Absent content is the empty-content check's.
+    const malformed = event.content == null ? [] : malformedContentPlaces(event.content);
+    if (malformed.length > 0) {
+      console.error(`[channel-incoming-refused] server=${event.serverId} channel=${logValue(event.channelId)} messageId=${logValue(event.messageId)} reason=malformed-content: ${logDetail(malformed.join('; '))}`);
+      this.emitTrace({
+        type: 'mcpl:malformed-content-refused', lane: 'channel', serverId: event.serverId, places: malformed,
+        channelId: event.channelId, messageId: event.messageId, ...(event.eventId ? { eventId: event.eventId } : {}),
+      });
+      return undefined;
+    }
     // Same backstop as the push lane: no row, no wake, no fork spawned for a
     // message with nothing visible in it.
     if (isVisiblyEmptyContent(event.content)) {
@@ -12168,8 +12293,8 @@ export class AgentFramework {
       throw new Error(`Conversation agent name "${name}" is already registered or reserved`);
     }
     this.usedEphemeralAgentNames.set(name, 'conversation');
+    const release = { released: false };
     try {
-
       const contextManager = await ContextManager.open({
         store: this.store,
         namespace: `conversations/${name}`,
@@ -12179,7 +12304,7 @@ export class AgentFramework {
         // Provider cooldown ownership belongs to the persistent resident only;
         // generation-unique forks must not leak gates. A fork's own recorded
         // provider waits still bind its compression calls.
-        membrane: this.conversationAuxiliaryMembraneFor(name),
+        membrane: this.conversationAuxiliaryMembraneFor(name, release),
         debugLogContext: !!process.env.DEBUG_CONTEXT,
       });
 
@@ -12246,11 +12371,16 @@ export class AgentFramework {
       const agent = new Agent(config, contextManager, this.membrane);
       this.adoptToolResultGuard(agent);
       agent.markContextConsumed(); // RFC-006: nothing stored before now is replaceable
+      this.agentReleases.set(agent, release);
       this.agents.set(name, agent);
       this.agentConfigs.set(name, config);
       this.conversationAgentHomes.set(name, channelId);
       return agent;
     } catch (error) {
+      // A fork that fails partway, in its seed say, leaves a manager no agent
+      // owns, and the messages seeded before the failure may have started its
+      // drain: it is released as a disposed fork's is.
+      release.released = true;
       this.usedEphemeralAgentNames.delete(name);
       throw error;
     }
@@ -12368,6 +12498,10 @@ export class AgentFramework {
     this.closingConversationAgents.delete(agentName);
     const channelId = this.conversationAgentHomes.get(agentName);
     const agent = this.agents.get(agentName);
+    // Its compression is withdrawn from here on, the writes its window's
+    // release lands below included (conversationAuxiliaryMembraneFor).
+    const release = agent && this.agentReleases.get(agent);
+    if (release) release.released = true;
     this.agents.delete(agentName);
     if (agent) this.releaseWindowNowOrAfterResume(agent);
     this.turnRouting.delete(agentName);
@@ -13370,6 +13504,19 @@ export class AgentFramework {
    * Convert an MCPL push event to a context message.
    */
   private handleMcplPushEvent(event: McplPushEvent): CoalescingPlacement | undefined {
+    // Content context-manager won't store is refused first, as on the
+    // channel lane (handleMcplChannelIncoming): no row, no wake. Absent
+    // content is the empty-content backstop's.
+    const malformed = event.content == null ? [] : malformedContentPlaces(event.content);
+    if (malformed.length > 0) {
+      const channelId = this.derivePushEventChannel(event.origin)?.channelId;
+      console.error(`[push-event-refused] server=${event.serverId}${channelId ? ` channel=${logValue(channelId)}` : ''} eventId=${logValue(event.eventId ?? '')} reason=malformed-content: ${logDetail(malformed.join('; '))}`);
+      this.emitTrace({
+        type: 'mcpl:malformed-content-refused', lane: 'push', serverId: event.serverId, places: malformed,
+        eventId: event.eventId, ...(channelId ? { channelId } : {}),
+      });
+      return undefined;
+    }
     // Backstop for the MCPL boundary's empty-content rejection, covering
     // events that never crossed it (module-emitted, coalescer deliveries):
     // content with nothing visible stores no row and queues no wake — the
@@ -15940,6 +16087,7 @@ export class AgentFramework {
       // In queue order and cut at the first that can't be stored, as every
       // flush is (readdDrained), so a store failure neither lands the
       // messages behind it out of order nor replaces the start's own error.
+      // One refused as malformed is dropped, not cut at.
       // Gated on this agent's own tool cycle, as the turn-end flush is.
       if (!tokenHandedOff && !this.activeTurnTokens.has(agent.name)
         && this.deferredMessages.length > 0 && !this.pendingAssistantBlocks.has(agent.name)) {
@@ -16083,7 +16231,9 @@ export class AgentFramework {
       // One poison message, or a transient store-write failure, must not
       // abort the turn or drop the messages behind it in the queue: the
       // drain cuts there, and it and what follows stay queued, in order
-      // (writeDrainedInOrder).
+      // (writeDrainedInOrder). A message the store refuses as malformed,
+      // which it would at every flush, is dropped instead, and what follows
+      // goes on.
       this.flushForStart(agent, 'turn-start');
     }
 
@@ -18918,6 +19068,9 @@ export class AgentFramework {
       // still be stored — not under that turn: queue it as a unit for the
       // next flush (drainDeferredFor keeps order; the tool_result entry is
       // never split from its tool_use because both ride the same drain).
+      // One exception: a tool_use context-manager refuses as malformed is
+      // dropped at the drain, and the tool_result behind it is then stored
+      // alone (writeDrainedInOrder).
       // The finally below flushes it itself if that turn is already over.
       ownedToEnd = this.activeTurnTokens.get(agentName) === turnToken;
       if (ownedToEnd) {
@@ -20846,6 +20999,12 @@ export class AgentFramework {
       const { deferredWriteId: _theFrameworks, ...rest } = metadata as MessageMetadata & { deferredWriteId?: unknown };
       metadata = rest as MessageMetadata;
     }
+    // Content context-manager won't store is refused here, as the store's own
+    // write refuses it, whether this write is stored now or deferred: the
+    // writer learns at once, not from a line at a drain it never sees. Content
+    // the store mends, such as a tool_use whose input isn't an object, passes.
+    const malformed = malformedContentPlaces(content);
+    if (malformed.length > 0) throw new MalformedContentError('Message refused', malformed);
     const agent = this.deliveryAgent(opts?.forAgent);
     if (!agent) {
       if (opts?.forAgent) {
@@ -21031,12 +21190,29 @@ export class AgentFramework {
    *
    * So none of a target's entries lands ahead of an earlier one, and a queued
    * tool_use that can't be stored keeps the tool_result queued behind it from
-   * being stored alone. (A tool_use that is stored, followed by a tool_result
-   * that can't be, stays stored without it until the tool_result lands at a
-   * later flush. The only queued pair is puppetToolCall's defensive one,
-   * which no path reaches today.) An entry that keeps failing is logged by
-   * id at each flush, and holds its target's later queued writes rather than
-   * letting them land out of order.
+   * being stored alone, unless context-manager refused it as malformed
+   * (below). (A tool_use that is stored, followed by a tool_result that
+   * can't be, stays stored without it until the tool_result lands at a later
+   * flush, or for good when the store refuses the tool_result as malformed.
+   * The only queued pair is puppetToolCall's, queued only when its turn's
+   * token is no longer its own once the pair is built, which its comment
+   * calls defensive.) An entry that keeps failing is logged by id at each
+   * flush, and holds its target's later queued writes rather than letting
+   * them land out of order.
+   *
+   * An entry context-manager refuses as malformed (MalformedContentError) is
+   * the exception. The store refuses its content before storing any of it,
+   * and would refuse it at every flush, so requeued it would hold its
+   * target's later writes for good. It's logged and dropped instead, and its
+   * target isn't cut: left in the un-acked set, the next ack drops it from
+   * the durable queue. A tool_use dropped this way leaves a tool_result
+   * queued behind it to be stored alone. context-manager mends a tool_use
+   * whose input isn't an object, so it refuses one only when that input has
+   * no JSON form or the block itself is malformed. addMessage refuses such
+   * content before it's queued, so an entry meets this here from a queue an
+   * earlier process persisted, as puppetToolCall's pair, which it queues
+   * itself, or when the strategy's chunking splits well-formed content into a
+   * shard the store refuses, which the store's error names.
    *
    * From a fresh turn's start to the end of its coalescing assembly, before
    * its checkpoint, every write deferred for its agent lands in that
@@ -21057,32 +21233,34 @@ export class AgentFramework {
    * keeps failing holds what is deferred behind it and the assembly's writes
    * for its agent.
    *
-   * A write can throw after its message is stored: a store listener, the
-   * strategy's handling of the add, or a later shard of a sharded body can
-   * throw once a record is written. Before an entry that threw is put back,
-   * its target's store is read from where it stood before the write, for
-   * messages carrying the entry's `deferredWriteId`. What it finds counts as
-   * written, at most once: the entry isn't requeued and stored a second
-   * time, and what landed, as later compiles render it (asCompiled), is what
-   * it returns as the entry's content. For a sharded body, that can be its
-   * first shards alone, since the append loop stops at the throw; the rest
-   * of the body isn't stored. (Requeued, the
-   * landed shards would be stored twice, and only the rest could not be
-   * appended later without splitting the body.) Boot's scan for landed
-   * writes counts a landed shard the same way. When the store can't be read
+   * A write can throw after its message is stored: the strategy's handling
+   * of the add can throw once a record is written. Before an entry that
+   * threw is put back, its target's store is read from where it stood before
+   * the write, for messages carrying the entry's `deferredWriteId`. What it
+   * finds counts as written, at most once: the entry isn't requeued and
+   * stored a second time, and what landed, as later compiles render it
+   * (asCompiled), is what it returns as the entry's content. For a sharded
+   * body, that can be its first shards alone. Under context-manager 0.14 a
+   * sharded write that threw partway left the shards it had written. From
+   * 0.15 it removes them, and they stay only when that removal fails as
+   * well. (Requeued, the landed shards would be stored twice, and only the
+   * rest could not be appended later without splitting the body.) Boot's
+   * scan for landed writes counts a landed shard the same way, which also
+   * covers a body a 0.14 write left in a store. When the store can't be read
    * back (storedCopiesOf logs it), nothing is found, and the entry is put
    * back as one that couldn't be stored: if it had landed, a later flush
    * stores it again.
    *
    * Returns what was written (stored, or deferred again by addMessage, whose
-   * id is then empty), in queue order: for one target, a prefix of its
-   * entries. Each comes with its content: as given, unless the store took it
-   * as more than one message (a sharded body) and can be read back, when its
-   * copies are returned joined, as later compiles render them (asCompiled),
-   * or its write threw after storing it (above). `onLanded` hears an entry
-   * whose write threw after storing it, with the id it landed under, as soon
-   * as it's found: before the writes after it, so whatever it records keeps
-   * their order.
+   * id is then empty), in queue order: for one target, its entries up to the
+   * first that couldn't be stored, less any dropped as malformed. Each comes
+   * with its content: as given, unless the store took it as more than one
+   * message (a sharded body) and can be read back, when its copies are
+   * returned joined, as later compiles render them (asCompiled), or its write
+   * threw after storing it (above). `onLanded` hears an entry whose write
+   * threw after storing it, with the id it landed under, as soon as it's
+   * found: before the writes after it, so whatever it records keeps their
+   * order.
    */
   private writeDrainedInOrder(
     entries: DeferredWrite[],
@@ -21117,6 +21295,10 @@ export class AgentFramework {
           written.set(msg, { id: landed[0]!.id, content: asCompiled(landed) });
           this.logDeferredWriteError(msg, where, error, { count: landed.length, sharded: landed[0]!.bodyGroupId !== undefined });
           onLanded?.(msg, landed[0]!.id);
+          continue;
+        }
+        if (error instanceof MalformedContentError) {
+          this.logDeferredWriteError(msg, where, error, 'dropped');
           continue;
         }
         cut.add(target);
@@ -21154,15 +21336,16 @@ export class AgentFramework {
   }
 
   /** The line naming a drained write that threw: one that couldn't be stored,
-   *  which is already back in the queue, or, with `landed`, one stored before
-   *  the throw (for a sharded body, how many of its shards). Logging mustn't
+   *  which is already back in the queue, one refused as malformed, which is
+   *  dropped (`'dropped'`), or, with a count, one stored before the throw
+   *  (for a sharded body, how many of its shards). Logging mustn't
    *  fail the flush that met it, so a thrown value that has no text is named
    *  as such. */
   private logDeferredWriteError(
     msg: DeferredWrite,
     where: string,
     error: unknown,
-    landed?: { count: number; sharded: boolean },
+    outcome?: { count: number; sharded: boolean } | 'dropped',
   ): void {
     let reason: string;
     try {
@@ -21173,25 +21356,28 @@ export class AgentFramework {
     console.error(
       `[deferral] ${where}: deferred write ${describeDeferredWrite(msg)} for ` +
       `${msg.forAgent ?? this.primaryAgentName ?? 'the primary'} ` +
-      (landed
-        ? `threw after ${landed.sharded
-          ? `${landed.count} shard${landed.count === 1 ? '' : 's'} of its body ${landed.count === 1 ? 'was' : 'were'} stored`
-          : 'it was stored'}; what was stored counts as written and isn't stored again: `
-        : `could not be stored; it stays queued, holding what is queued behind it for that agent: `) +
+      (outcome === 'dropped'
+        ? `was refused as malformed, so it's dropped rather than queued again, and what is queued behind it for that agent goes on: `
+        : outcome
+          ? `threw after ${outcome.sharded
+            ? `${outcome.count} shard${outcome.count === 1 ? '' : 's'} of its body ${outcome.count === 1 ? 'was' : 'were'} stored`
+            : 'it was stored'}; what was stored counts as written and isn't stored again: `
+          : `could not be stored; it stays queued, holding what is queued behind it for that agent: `) +
       reason,
     );
   }
 
   /**
    * Write what is queued for `agent` into its window past its deferral, in
-   * queue order and cut at a write that fails (writeDrainedInOrder), between
-   * a fresh turn's start and its checkpoint, where what is stored is the
-   * turn's input: at the start, before each write the coalescing assembly
-   * makes for the agent, and once the assembly ends, the last two not while
-   * the host is quiesced, when what is queued waits for resume(). What is
-   * stored is weighed for the start now beginning and for every other
-   * resident's open turn. Returns whether anything is still queued for the
-   * agent.
+   * queue order and cut at a write that fails, though one the store refuses
+   * as malformed is dropped and what follows goes on (writeDrainedInOrder),
+   * between a fresh turn's start and its checkpoint, where what is stored is
+   * the turn's input: at the start, before each write the coalescing
+   * assembly makes for the agent, and once the assembly ends, the last two
+   * not while the host is quiesced, when what is queued waits for resume().
+   * What is stored is weighed for the start now beginning and for every
+   * other resident's open turn. Returns whether anything is still queued for
+   * the agent.
    */
   private flushForStart(agent: Agent, occasion: 'turn-start' | 'assembly'): boolean {
     const stored = this.writeDrainedInOrder(this.drainDeferredFor(agent.name), `${occasion} flush for ${agent.name}`, (msg) =>
@@ -21598,6 +21784,10 @@ export class AgentFramework {
     if (!agent) {
       throw new Error('No agents configured');
     }
+    // As the store's own edit does, and before a held write's content is
+    // replaced: a malformed edit leaves the write as it was.
+    const malformed = malformedContentPlaces(content);
+    if (malformed.length > 0) throw new MalformedContentError(`Edit of ${id} refused`, malformed);
     const writeId = heldWriteId(id);
     if (writeId !== undefined) {
       const held = this.heldWritesFor(agent).find((m) => m.id === writeId);

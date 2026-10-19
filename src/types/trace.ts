@@ -33,8 +33,22 @@ export type TraceEvent =
   | (TraceEventBase & {
       type: 'process:completed';
       processEvent: ProcessEvent;
+      /** The modules' responses that applied: one refused for malformed
+       *  content is left out, and named by process:response-refused. */
       responses: ModuleProcessResponse[];
       durationMs: number;
+    })
+  /** A module's process response held content context-manager won't store,
+   *  in a message it adds or an edit it makes, and was refused whole before
+   *  any response to the event applied. `where` names the first such message
+   *  or edit in the response, such as `addMessages[1]`, and `places` is
+   *  malformedContentPlaces' answer for it. */
+  | (TraceEventBase & {
+      type: 'process:response-refused';
+      moduleName: string;
+      eventType: string;
+      where: string;
+      places: string[];
     })
 
   // Inference lifecycle
@@ -366,6 +380,18 @@ export type TraceEvent =
       reason: string;
       field?: string;
       detail?: string;
+    })
+  /** MCPL content that context-manager won't store, because it doesn't
+   *  match ContentBlock, reached the store/wake site and was refused there:
+   *  no row, no wake. `places` is malformedContentPlaces' answer for it. */
+  | (TraceEventBase & {
+      type: 'mcpl:malformed-content-refused';
+      lane: 'push' | 'channel';
+      serverId: string;
+      places: string[];
+      eventId?: string;
+      channelId?: string;
+      messageId?: string;
     })
   /** MCPL content with nothing model-visible reached the store/wake site
    *  (module-emitted or coalescer-delivered) and was dropped: no row, no wake. */

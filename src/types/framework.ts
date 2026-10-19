@@ -461,13 +461,16 @@ export interface InferenceLogEntry {
 }
 
 /**
- * Entry in the process log - records a processed event with all module responses.
+ * Entry in the process log - records a processed event with the module
+ * responses that applied.
  */
 export interface ProcessLogEntry {
   timestamp: number;
   /** The process event that was handled */
   processEvent: ProcessEvent;
-  /** Responses from all modules, or blob ID if large */
+  /** The modules' responses that applied, or blob ID if large. A response
+   *  refused for content context-manager won't store is left out; its stderr
+   *  line and process:response-refused trace name it. */
   responses: ModuleProcessResponse[] | { blobId: string };
 }
 
@@ -477,7 +480,7 @@ export interface ProcessLogEntry {
 export interface ProcessLogQuery {
   /** Filter by process event type */
   eventType?: string;
-  /** Filter by module name (modules that responded) */
+  /** Filter by module name (modules whose responses applied) */
   moduleName?: string;
   /** Max number of logs to return */
   limit?: number;

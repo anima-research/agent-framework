@@ -15,7 +15,7 @@ jobs:
     runs-on: ${{ matrix.os }}
     # Without a limit, a step that hangs leaves the check pending until
     # GitHub's six-hour limit. Passing runs take under seven minutes. A
-    # test file stuck under Node 20, or a test stuck under Node 24, fails
+    # test file stuck under Node 22.12, or a test stuck under Node 24, fails
     # sooner and by name, through npm test's --test-timeout.
     timeout-minutes: 20
     strategy:
@@ -24,11 +24,17 @@ jobs:
       # node_modules tree records only that machine's native binaries, so a
       # lock made on macOS breaks Linux installs and vice versa. Each runner
       # catches the lock the other's platform produced. Tests run on ubuntu.
-      # Node: the engines floor and current LTS — stdio flushing semantics
-      # around process exit differ between versions and platforms.
+      # Node: the engines floor, pinned exactly; the newest Node the range
+      # admits; and, between them, every maintained major line (24), as
+      # membrane and context-manager test theirs. stdio flushing semantics
+      # around process exit differ between versions and platforms. macOS runs
+      # the two ends only.
       matrix:
         os: [ubuntu-latest, macos-latest]
-        node: [20, 24]
+        node: ['22.12.0', 24, latest]
+        exclude:
+          - os: macos-latest
+            node: 24
 
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
@@ -61,7 +67,7 @@ jobs:
       # leaves running, such as a late arrival after stop() ("Queue is
       # closed"). These files run unforced so that class fails here, not in a
       # later PR's qualification. They get npm test's --test-timeout too:
-      # under Node 20 it fails a file whose leftover work keeps it alive, by
+      # under Node 22.12 it fails a file whose leftover work keeps it alive, by
       # name, and under Node 24 the job's limit ends such a file.
       - name: Test unforced (work in flight at stop)
         run: node --test --test-timeout=600000 dist/test/stop-with-work-in-flight.test.js dist/test/stop-with-host-operations.test.js dist/test/conversation-routing.test.js
@@ -78,9 +84,17 @@ jobs:
   # hours: above the check's own limits (10 minutes each for npm pack and npm
   # install, a minute for each load), so the check names what hung.
   pack-check:
-    name: Packed release installs on its own
+    name: Packed release installs on its own (node ${{ matrix.node }})
     runs-on: ubuntu-latest
     timeout-minutes: 40
+    # The engines floor and current LTS: the check's load hook goes in through
+    # register below Node 22.15 and through registerHooks from there, so each
+    # branch a host takes runs before a merge, as publish.yml runs both before
+    # a release.
+    strategy:
+      fail-fast: false
+      matrix:
+        node: ['22.12.0', 24]
 
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
@@ -90,7 +104,7 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
         with:
-          node-version: 24
+          node-version: ${{ matrix.node }}
 
       # As publish installs, so a build that came to need a dependency's
       # install script fails here, before a tag, rather than in publish.
