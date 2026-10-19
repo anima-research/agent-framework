@@ -50,7 +50,7 @@
   "license": "MIT",
   "dependencies": {
     "@animalabs/chronicle": "^0.4.0",
-    "@animalabs/context-manager": "^0.17.0",
+    "@animalabs/context-manager": "^0.17.1",
     "@animalabs/membrane": "^0.6.0",
     "chokidar": "^4.0.3",
     "discord.js": "^14.25.1",
