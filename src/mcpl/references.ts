@@ -473,8 +473,10 @@ export function dialServer(
  * goes with the address it checks. In a process with one running framework,
  * or with running frameworks that agree on each id they share, the two
  * sources hold the same addresses, so a stub promises what the fetch does. A
- * stopped framework's addresses are out of the registry, so its stubs say its
- * servers are unknown while its configs still resolve them. Where two
+ * stopped framework's addresses are out of the registry, so its stubs read
+ * another running framework's entry for the same id where there is one, and
+ * otherwise say the server is unknown, while its configs still resolve it.
+ * Where two
  * frameworks configure one id differently, only a stub's words can be wrong,
  * never where a token goes. A fetch's own limits, its budget and ceiling,
  * come after it.
@@ -483,10 +485,14 @@ export function dialCheck(
   record: ReferenceRecord,
   addressOf: (serverId: string) => ServerAddress | undefined,
   nowMs = Date.now(),
+  /** For a stub or a script's object, the claims of the result it's shown
+   *  in, read with the record's own (claimedExpiry). A fetch reads the
+   *  record alone. */
+  claims?: ResultClaims,
 ): { serverId: string } | { refusal: Refusal } {
   const server = dialServer(record, addressOf);
   if ('refusal' in server) return server;
-  const expiry = referenceExpiry(record.testimony, nowMs);
+  const expiry = claimedExpiry(record, claims, nowMs);
   return expiry ? { refusal: { error: `the reference is ${EXPIRY_REASON[expiry]}`, remedy: FRESH_REFERENCE } } : server;
 }
 
@@ -551,7 +557,7 @@ const MAX_RECORDS = 2000;
 export class ReferenceRegistry {
   private records = new Map<string, ReferenceRecord>();
   /** uri → refId. The uri ALONE is the identity key: a tool result's stubs
-   *  (tool-result-history.ts's, and framework.ts's tryNativeToolResultContent)
+   *  (tool-result-history.ts's, which both copies of a tool result take)
    *  and a script's demand fetch register with no server context,
    *  while the registrations that know the server carry its id: a tool
    *  result's, before it's shown, whether the agent's dispatch or an
@@ -689,6 +695,62 @@ export interface StubOptions {
    * other lane showed a link's uri, so none shows one now.
    */
   unfetchedLinkUri?: boolean;
+  /** The claims of the result this block is shown in (resultClaims), read
+   *  with the record's own for what the stub says. */
+  claims?: ResultClaims;
+}
+
+/**
+ * What one tool result's references claim of each uri they name: uri → the
+ * testimony each of those references gave it. A decision a block of that
+ * result makes reads them all with its record's own, and the strictest claim
+ * wins: a uri any of them marks `disposition: never` is withheld, and one
+ * any of them gives an expiry that counts is expired (claimedExpiry), so a
+ * result means the same whatever the order of its blocks, and whatever the
+ * registry evicted while it was read (Ada-1017's call). Across results the
+ * registry keeps the latest testimony (register).
+ */
+export type ResultClaims = ReadonlyMap<string, readonly ReferenceTestimony[]>;
+
+/** A result's claims (ResultClaims), from the testimonies of its references. */
+export function resultClaims(testimonies: Iterable<ReferenceTestimony>): ResultClaims {
+  const claims = new Map<string, ReferenceTestimony[]>();
+  for (const t of testimonies) {
+    const list = claims.get(t.uri);
+    if (list) list.push(t);
+    else claims.set(t.uri, [t]);
+  }
+  return claims;
+}
+
+/** The claims of a content array's references, element by element. */
+export function contentClaims(blocks: readonly unknown[]): ResultClaims {
+  const testimonies: ReferenceTestimony[] = [];
+  for (const block of blocks) {
+    const c = classifyBlock(block);
+    if (c.kind === 'reference') testimonies.push(c.testimony);
+  }
+  return resultClaims(testimonies);
+}
+
+/** Every testimony a decision about a record reads: the record's own, and
+ *  each one the result's references gave its uri. */
+function claimsOf(record: ReferenceRecord, claims?: ResultClaims): ReferenceTestimony[] {
+  return [record.testimony, ...(claims?.get(record.testimony.uri) ?? [])];
+}
+
+/** Whether a record's uri is withheld: its own testimony, or any of the
+ *  result's references, marks it `disposition: never`. */
+export function claimedNever(record: ReferenceRecord, claims?: ResultClaims): boolean {
+  return claimsOf(record, claims).some((t) => t.disposition === 'never');
+}
+
+/** The expiry a record counts, as of `nowMs`: the first of EXPIRY_REASON's
+ *  cases that its own testimony, or any of the result's references, gives,
+ *  so the order of the blocks doesn't choose the words. Null when none does. */
+export function claimedExpiry(record: ReferenceRecord, claims: ResultClaims | undefined, nowMs: number): keyof typeof EXPIRY_REASON | null {
+  const found = new Set(claimsOf(record, claims).map((t) => referenceExpiry(t, nowMs)));
+  return (Object.keys(EXPIRY_REASON) as Array<keyof typeof EXPIRY_REASON>).find((kind) => found.has(kind)) ?? null;
 }
 
 /**
@@ -703,12 +765,12 @@ export interface StubOptions {
  * The credential check reads the uri as it would be shown, with what
  * sanitizeLabel strips gone, so a uri split by a control character is read
  * as it would read: `ht\u0000tps://user:pass@…` parses as a path, and shows
- * as userinfo. A reference's disposition:"never" for the uri keeps it out
- * whatever the link says.
+ * as userinfo. A reference's disposition:"never" for the uri, the record's
+ * or any in the same result (claims), keeps it out whatever the link says.
  */
-export function shownLinkUri(t: ReferenceTestimony, record: ReferenceRecord, nowMs = Date.now()): string | null {
-  if (!t.fromLink || record.testimony.disposition === 'never') return null;
-  if (unfetchableReason(record, nowMs) === null) return null;
+export function shownLinkUri(t: ReferenceTestimony, record: ReferenceRecord, nowMs = Date.now(), claims?: ResultClaims): string | null {
+  if (!t.fromLink || claimedNever(record, claims)) return null;
+  if (unfetchableReason(record, nowMs, claims) === null) return null;
   const uri = sanitizeLabel(t.uri, REFERENCE_LIMITS.uri);
   return uriMayCarryCredential(uri) ? null : uri;
 }
@@ -747,10 +809,10 @@ export function buildReferenceStub(t: ReferenceTestimony, provenance?: string, s
     // A reference the fetcher would refuse says why, rather than inviting a
     // fetch_reference call.
     if (options?.unfetchedLinkUri) {
-      const uri = shownLinkUri(t, record, nowMs);
+      const uri = shownLinkUri(t, record, nowMs, options.claims);
       if (uri !== null) return unfetchedLinkText(t, uri);
     }
-    parts.push(unfetchableReason(record, nowMs) ?? 'fetch with fetch_reference');
+    parts.push(unfetchableReason(record, nowMs, options?.claims) ?? 'fetch with fetch_reference');
   }
   return `[${record.refId}] ${parts.join(' — ') || 'referenced content'}`;
 }
@@ -774,9 +836,9 @@ function unfetchedLinkText(t: ReferenceTestimony, uri: string): string {
  * server's spent budget or a claimed size over the ceiling it's given, the
  * fetcher gives in its own words, and save_recent_image says them too.
  */
-export function unfetchableReason(record: ReferenceRecord, nowMs = Date.now()): string | null {
+export function unfetchableReason(record: ReferenceRecord, nowMs = Date.now(), claims?: ResultClaims): string | null {
   if (record.fetchedPath) return null;
-  const dial = dialCheck(record, (serverId) => referenceRegistry.serverAddress(serverId), nowMs);
+  const dial = dialCheck(record, (serverId) => referenceRegistry.serverAddress(serverId), nowMs, claims);
   return 'refusal' in dial ? dial.refusal.inStub ?? dial.refusal.error : null;
 }
 
@@ -811,14 +873,17 @@ export function referenceStubOrNull(block: unknown, provenance?: string, serverI
  * words a stub gives in place of advising fetch_reference
  * (unfetchableReason). Both say what a fetch_reference with the object's
  * `refId` meets, so a link whose line shows its uri, which the host can't
- * fetch, carries them too: its line has no id to fetch with. The reference is registered bound to `serverId`, the
- * server whose tool returned it, as the model's lanes bind a tool result's
- * references, so the fetch its id offers can be made. A block the classifier
+ * fetch, carries them too: its line has no id to fetch with. `claims` are
+ * those of the content array the block came in (contentClaims), so its
+ * other references count as they do for the model's line (ResultClaims).
+ * The reference is registered bound to `serverId`, the server whose tool
+ * returned it, as the model's lanes bind a tool result's references, so the
+ * fetch its id offers can be made. A block the classifier
  * rejects becomes the notice the model's lanes show, and inline data that
  * also claims a bulk disposition the withheld notice, each as a text block.
  * A text block, or inline data that claims nothing, is returned as sent.
  */
-export function referenceBlockForScript(block: unknown, serverId: string): unknown {
+export function referenceBlockForScript(block: unknown, serverId: string, claims?: ResultClaims): unknown {
   const c = classifyBlock(block);
   switch (c.kind) {
     case 'text': return block;
@@ -831,13 +896,14 @@ export function referenceBlockForScript(block: unknown, serverId: string): unkno
       // One clock reading for the whole object, so its words can't disagree
       // with each other across an expiry.
       const nowMs = Date.now();
-      const uri = shownLinkUri(t, record, nowMs);
+      const uri = shownLinkUri(t, record, nowMs, claims);
       // What a fetch_reference with this object's refId meets, in the words
       // a stub gives, whether or not the model's line for it is a stub: the
       // line has no id to fetch with, and the object does. As the stub
-      // judges it, a saved copy is still served.
-      const expiry = record.fetchedPath ? null : referenceExpiry(record.testimony, nowMs);
-      const unfetchable = unfetchableReason(record, nowMs);
+      // judges it, a saved copy is still served, and the result's own claims
+      // count with the record's.
+      const expiry = record.fetchedPath ? null : claimedExpiry(record, claims, nowMs);
+      const unfetchable = unfetchableReason(record, nowMs, claims);
       return {
         type: (block as { type: string }).type,
         refId: record.refId,

@@ -915,17 +915,106 @@ async function answerModelCall(answer: ToolResult): Promise<{ wire: string; stor
 }
 
 describe('one answer for every block of a result', () => {
-  it("withholds a link's uri for a later reference to it with disposition never, whatever the blocks' order", () => {
+  it("withholds a link's uri wherever a reference in the same result marks it never, whatever the blocks' order", () => {
     const uri = 'https://zz-elsewhere.example/order-never.csv';
     const link = { type: 'resource_link', uri, name: 'order.csv' };
     const never = { type: 'resource', uri, name: 'order.csv', disposition: 'never' };
-    const shown = toolResultDataToHistoryString([TEXT, link, never]);
+    const plain = { type: 'resource', uri, name: 'order.csv' };
+    for (const order of [[link, never, plain], [never, link, plain], [never, plain, link], [plain, never, link], [plain, link, never]]) {
+      const what = order.map((b) => (b === link ? 'link' : b === never ? 'never' : 'plain')).join(', ');
+      const shown = toolResultDataToHistoryString([TEXT, ...order]);
+      assert.ok(!shown.includes(uri), `${what}: ${shown}`);
+      // At any depth in data too, and in a script's object.
+      const deep = toolResultDataToHistoryString({ first: order.slice(0, 1), then: { rest: order.slice(1) } });
+      assert.ok(!deep.includes(uri), `${what}: ${deep}`);
+      // The array's claims (contentClaims), built here so the file loads
+      // against main's src for red-first.
+      const claims = new Map([[uri, order.map(testimonyOf)]]);
+      for (const block of order) {
+        const object = referenceBlockForScript(block, 'zz-files', claims) as { uri?: string };
+        assert.equal(object.uri, undefined, what);
+      }
+    }
+  });
+
+  it("reads an expiry any reference in the same result gives a uri for every block that names it, whatever their order", () => {
+    servingFiles();
+    const uri = 'https://zz-files.example/order-expired.csv';
+    const link = { type: 'resource_link', uri, name: 'order.csv' };
+    const expired = { type: 'resource', uri, name: 'order.csv', expiresAt: '2001-01-01T00:00:00Z' };
+    const fresh = { type: 'resource', uri, name: 'order.csv', expiresAt: '2099-01-01T00:00:00Z' };
+    referenceRegistry.register(testimonyOf(link), 'zz-files');
+    const texts = new Set<string>();
+    for (const order of [[fresh, link, expired], [expired, link, fresh], [link, fresh, expired]]) {
+      const lines = toolResultDataToHistoryString(order).split('\n');
+      // The link, which the expiry makes unfetchable, shows its line, and
+      // each reference's stub says the reference is expired.
+      assert.equal(lines.filter((line) => line === `[resource link "order.csv": ${uri}; not fetched]`).length, 1, lines.join('\n'));
+      assert.equal(lines.filter((line) => line.endsWith('— the reference is expired')).length, 2, lines.join('\n'));
+      texts.add([...lines].sort().join('\n').replace(/ref_[^\]]+/g, 'ref'));
+      // And a script's object for each reference, with the array's claims.
+      const claims = new Map([[uri, order.map(testimonyOf)]]);
+      for (const block of [fresh, expired]) {
+        const object = referenceBlockForScript(block, 'zz-files', claims) as { expired?: string; unfetchable?: string };
+        assert.equal(object.expired, EXPIRY_REASON.passed);
+        assert.equal(object.unfetchable, `the reference is ${EXPIRY_REASON.passed}`);
+      }
+    }
+    assert.equal(texts.size, 1);
+  });
+
+  it("finds a never inside inline data's other fields, which showing it descends into, before any block is shown", () => {
+    const uri = 'https://zz-elsewhere.example/meta-never.csv';
+    const data = {
+      items: [
+        { type: 'resource_link', uri, name: 'meta.csv' },
+        { type: 'image', data: PNG, mimeType: 'image/png', _meta: { ref: { type: 'resource', uri, name: 'meta.csv', disposition: 'never' } } },
+      ],
+    };
+    const shown = toolResultDataToHistoryString(data);
     assert.ok(!shown.includes(uri), shown);
-    assert.match(shown.split('\n')[1]!, /^\[ref_[^\]]+\] order\.csv — from tool result — /);
-    // At any depth in data too.
-    const uri2 = 'https://zz-elsewhere.example/order-never-deep.csv';
-    const deep = toolResultDataToHistoryString({ first: [{ ...link, uri: uri2 }], then: { ref: { ...never, uri: uri2 } } });
-    assert.ok(!deep.includes(uri2), deep);
+  });
+
+  it("keeps a never for its result when more references than the registry holds come between it and the link", () => {
+    const uri = 'https://zz-elsewhere.example/evicted-never.csv';
+    const many = Array.from({ length: 2001 }, (_, i) => ({ type: 'resource', uri: `https://zz-elsewhere.example/many/${i}.bin`, name: `${i}.bin` }));
+    const shown = toolResultDataToHistoryString([
+      { type: 'resource', uri, name: 'evicted.csv', disposition: 'never' }, ...many, { type: 'resource_link', uri, name: 'evicted.csv' },
+    ]);
+    assert.ok(!shown.includes(uri), shown.slice(-400));
+  });
+
+  it("reads claims through toJSON, as serialization does, so a getter toJSON leaves out isn't read", () => {
+    const value = {
+      toJSON: () => ({ zz: 'zz-shown' }),
+      get broken(): string { throw new Error('zz-getter read'); },
+    };
+    assert.equal(toolResultDataToHistoryString({ value }), '{"value":{"zz":"zz-shown"}}');
+  });
+
+  it("registers nothing a result's serialization never reaches, such as what lies past a cycle", () => {
+    const uri = 'https://zz-elsewhere.example/past-cycle.csv';
+    const loop: Record<string, unknown> = {};
+    loop.self = loop;
+    assert.throws(() => toolResultDataToHistoryString({ loop, later: { type: 'resource', uri, name: 'past.csv', disposition: 'never' } }));
+    assert.equal(referenceRegistry.findByUri(uri), undefined);
+  });
+
+  it("isn't fetched for a script on demand where any reference in the module's array gives its uri an expiry that counts", async () => {
+    const fw = Object.create(AgentFramework.prototype) as {
+      dispatchScriptToolCall: (...args: unknown[]) => Promise<ToolResult>;
+      getReferenceFetcher(): unknown;
+      handleScriptToolCall(agentName: string, toolName: string, args: Record<string, unknown>): Promise<ScriptToolResult>;
+    };
+    const uri = 'https://zz-files.example/demand-expired.pdf';
+    const fresh = { type: 'resource', uri, name: 'demand.pdf', expiresAt: '2099-01-01T00:00:00Z' };
+    const expired = { type: 'resource', uri, name: 'demand.pdf', expiresAt: '2001-01-01T00:00:00Z' };
+    fw.dispatchScriptToolCall = async () => ({ success: true, data: [fresh, expired], dataIsContent: true });
+    const fetched: string[] = [];
+    fw.getReferenceFetcher = () => ({ fetch: async (record: { testimony: { uri: string } }) => { fetched.push(record.testimony.uri); return { ok: false, error: 'zz-refused' }; } });
+    const result = await fw.handleScriptToolCall('zz-agent', 'zz_tool', {});
+    assert.equal(result.isError, false);
+    assert.deepEqual(fetched, []);
   });
 
   it('shows a link with no usable uri at any depth as its marker, never its fields', () => {
@@ -1042,6 +1131,112 @@ describe('one answer for every block of a result', () => {
     }, async () => null);
     assert.equal(fetcher.refusal(record), null);
     assert.equal(asked, 1);
+  });
+
+  it("pairs each check's origin with the same answer's token and eager limit, on a fetch and on the eager check that joins it", async (t) => {
+    const heard: Array<string | undefined> = [];
+    let arrived!: () => void;
+    const arrival = new Promise<void>((resolve) => { arrived = resolve; });
+    let release!: () => void;
+    const held = new Promise<void>((resolve) => { release = resolve; });
+    const server = createServer((req, res) => {
+      heard.push(req.headers.authorization);
+      arrived();
+      void held.then(() => {
+        res.writeHead(200, { 'content-type': 'application/octet-stream' });
+        res.end(Buffer.from('zz-bytes'));
+      });
+    });
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+    t.after(() => new Promise<void>((resolve) => server.close(() => resolve())));
+    const host = `127.0.0.1:${(server.address() as AddressInfo).port}`;
+    const record = referenceRegistry.register(
+      testimonyOf({ type: 'resource', uri: `http://${host}/answer.bin`, name: 'answer.bin', sizeBytes: 8 }), 'zz-answer');
+    // Every answer is on the server's own origin, each with its own token
+    // and eager limit, so a second read for one check would mix answers.
+    const answers = [
+      { url: `ws://${host}`, token: 'zz-first' },
+      { url: `ws://${host}`, token: 'zz-second', autofetch: { maxBytes: 1 } },
+      { url: `ws://${host}`, token: 'zz-third', autofetch: { maxBytes: 100 } },
+    ];
+    let asked = 0;
+    const fetcher = new ReferenceFetcher(() => answers[Math.min(asked++, answers.length - 1)], async () => 'scratch/answer.bin');
+    const fetching = fetcher.fetch(record);
+    await arrival;
+    assert.equal(asked, 1);
+    // The eager check of a record in flight joins it through dialServer,
+    // with one answer: the second's eager limit of 1 byte, which 8 bytes pass.
+    assert.equal(fetcher.isEagerEligible(record), false);
+    assert.equal(asked, 2);
+    release();
+    assert.equal((await fetching).ok, true);
+    assert.deepEqual(heard, ['Bearer zz-first']);
+  });
+
+  it("hands the live copy the stored pass's own blocks, so a change between the two leaves the live copy as stored", async () => {
+    servingFiles();
+    const link = { type: 'resource_link', uri: 'https://zz-files.example/handed.csv', name: 'handed.csv' };
+    // Delivered by the zz-files server, as an MCPL dispatch registers it.
+    referenceRegistry.register(testimonyOf(link), 'zz-files');
+    const result: ToolResult = { success: true, data: [IMAGE, link], dataIsContent: true };
+    const fw = Object.create(AgentFramework.prototype) as {
+      buildStoredToolResultContent(agent: string, calls: unknown[], maxChars: number | undefined): Promise<{ spilled: Map<string, unknown> }>;
+      toMembraneToolResult(callId: string, result: ToolResult, maxChars: number | undefined, precomputed: unknown): Live;
+    };
+    Object.assign(fw, { toolImageLedgers: new Map() });
+    const call = { id: 'zz-handed', name: 'zz_tool', input: {}, result };
+    const { spilled } = await fw.buildStoredToolResultContent('zz-agent', [call], 1000);
+    const stored = spilled.get('zz-handed') as { text: string; live: unknown[] | null };
+    const [, line] = stored.text.split('\n');
+    // Fetchable when stored: the link is a stub.
+    assert.match(line!, /^\[ref_[^\]]+\] handed\.csv — from tool result — fetch with fetch_reference$/);
+    // Then its server's address goes, so classified again it would be a line.
+    referenceRegistry.forgetServerAddress('zz-files', TEST_HOST);
+    try {
+      const live = fw.toMembraneToolResult('zz-handed', result, 1000, stored).content as Array<{ type: string; text?: string }>;
+      assert.deepEqual(live.map((b) => b.text ?? b.type), ['image', line]);
+    } finally {
+      servingFiles();
+    }
+  });
+
+  it("goes natively from the stored pass with links and markers exactly at the cap, and as its stored text one past it", async () => {
+    const fw = Object.create(AgentFramework.prototype) as {
+      buildStoredToolResultContent(agent: string, calls: unknown[], maxChars: number | undefined): Promise<{ spilled: Map<string, unknown> }>;
+      toMembraneToolResult(callId: string, result: ToolResult, maxChars: number | undefined, precomputed: unknown): Live;
+    };
+    Object.assign(fw, { toolImageLedgers: new Map(), writeToolResultFile: async () => null });
+    const result: ToolResult = { success: true, data: [IMAGE, AUDIO, AUDIO], dataIsContent: true };
+    const cap = AUDIO_TEXT.length * 2;
+    for (const [maxChars, native] of [[cap, true], [cap - 1, false]] as const) {
+      const call = { id: `zz-cap-${maxChars}`, name: 'zz_tool', input: {}, result };
+      const { spilled } = await fw.buildStoredToolResultContent('zz-agent', [call], maxChars);
+      const stored = spilled.get(call.id) as { text: string; live: unknown[] | null };
+      assert.equal(stored.live !== null, native, String(maxChars));
+      const live = fw.toMembraneToolResult(call.id, result, maxChars, stored).content;
+      if (native) assert.ok(Array.isArray(live), String(maxChars));
+      else assert.equal(live, stored.text, String(maxChars));
+    }
+  });
+
+  test("an MCPL send whose result has an element that isn't a block before its channel's id still succeeds", { timeout: 30_000 }, async (t) => {
+    const f = await fixture({
+      tools: [{ name: 'send_message', description: 'Send a message.', inputSchema: { type: 'object' } }],
+      toolsCall: () => ({ content: [null, { type: 'text', text: JSON.stringify({ channelId: 'zz-chan' }) }] }),
+    });
+    t.after(f.close);
+    const internals = f.framework as unknown as { pushEvent(event: unknown): void; dispatchToolCall(agent: string, call: unknown): void };
+    const result = await new Promise<ToolResult>((resolve) => {
+      const original = internals.pushEvent;
+      internals.pushEvent = (event: unknown) => {
+        const e = event as { type: string; callId?: string; result?: ToolResult };
+        if (e.type === 'tool-result' && e.callId === 'zz-send') { internals.pushEvent = original; resolve(e.result!); }
+        else original.call(internals, event);
+      };
+      internals.dispatchToolCall('agent', { id: 'zz-send', name: 'mcpl--editor--send_message', input: { channelId: 'zz-chan' } });
+    });
+    assert.equal(result.success, true, JSON.stringify(result));
+    assert.equal(nonErrorResultText(result), `${unknownBlockText(null)}\n{"channelId":"zz-chan"}`);
   });
 
   it("makes an MCPL result with an element that isn't a block its marker, not a failure", async () => {

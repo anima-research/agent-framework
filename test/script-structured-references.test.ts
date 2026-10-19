@@ -285,3 +285,22 @@ test('an error with structured content is fetched for the script, and reaches it
     assert.deepEqual(fetched, [uris('structured-error').report], 'the script reads the blocks, so its reference was fetched first');
   });
 });
+
+test("an MCPL peer's link reads every reference in its result, so a never anywhere in it withholds the link's uri from a script", { timeout: 30_000 }, async () => {
+  await withPeers(async (h) => {
+    // Off the server's origin, so the host can't fetch it and its line would
+    // show its uri, but a reference in the same result says never, and a
+    // later one, registered last, doesn't.
+    const uri = 'https://elsewhere.example.invalid/never-in-result.csv';
+    h.answer({
+      content: [
+        { type: 'resource', uri, name: 'kept.csv', disposition: 'never' },
+        { type: 'resource', uri, name: 'kept.csv' },
+        { type: 'resource_link', uri, name: 'kept.csv' },
+      ],
+      structuredContent: {},
+    });
+    const out = await h.script('mcpl--files--attach');
+    assert.ok(!out.includes('elsewhere.example.invalid'), out);
+  });
+});

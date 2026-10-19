@@ -1,6 +1,6 @@
 import { ToolPresentation, presentationTools, isPresentationTool, renderCatalogue, type PresentationSnapshot } from "./tool-presentation.js";
 import { dirname, join } from 'node:path';
-import { REFERENCE_LIMITS, classifyBlock, isReferenceExpired, referenceBlockForScript, referenceRegistry, sanitizeLabel, type ServerAddress } from './mcpl/references.js';
+import { REFERENCE_LIMITS, claimedExpiry, classifyBlock, contentClaims, isReferenceExpired, referenceBlockForScript, referenceRegistry, sanitizeLabel, type ServerAddress } from './mcpl/references.js';
 import { ReferenceFetcher, DEFAULT_FETCH_MAX_BYTES, EAGER_FETCH_TIMEOUT_MS } from './mcpl/reference-fetcher.js';
 import {
   appendFileSync, closeSync, existsSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, unlinkSync,
@@ -115,7 +115,6 @@ import type { ToolResultGuard, WithheldSpill } from './tool-result-guard.js';
 import {
   goesNative,
   nonErrorResultText,
-  toolResultBlocks,
   toolResultDataToHistoryString,
   truncateForHistory,
   DEFAULT_TOOL_RESULT_INLINE_MAX_CHARS,
@@ -18909,9 +18908,9 @@ export class AgentFramework {
    *
    * The live copy is the stored text itself unless the result is a content
    * array carrying an inline image whose links and markers fit the cap
-   * together (goesNative), which tryNativeToolResultContent sends as native
-   * blocks. It takes the blocks the serializer takes (toolResultBlocks), and
-   * shows each image, stub and marker whole and each text block up to where
+   * together (goesNative). Then `live` holds the blocks this text was made
+   * from, which toMembraneToolResult sends as native blocks (nativeContent),
+   * showing each image, stub and marker whole and each text block up to where
    * it cuts that block at the cap (`maxChars`, toolResultCutAt), so those are
    * the ranges of the text it showed.
    */
@@ -19219,6 +19218,10 @@ export class AgentFramework {
     // the ones it wants with fetch_reference.
     if (Array.isArray(result.data) && this.resolveMcplTool(toolName) === null) {
       const fetcher = this.getReferenceFetcher();
+      // The array's claims, read as one: a uri any of its references gives
+      // an expiry that counts isn't fetched, as autoFetchReferences passes
+      // over one that any block of an MCPL result marks expired.
+      const claims = contentClaims(result.data);
       for (const block of result.data) {
         const c = classifyBlock(block);
         if (c.kind !== 'reference' || c.testimony.fromLink) continue;
@@ -19226,6 +19229,7 @@ export class AgentFramework {
         // replace a link's, or a stale reference's, before the fetch reads
         // them, as on any other path, while the record isn't fetched yet.
         const record = referenceRegistry.register(c.testimony);
+        if (!record.fetchedPath && claimedExpiry(record, claims, Date.now()) !== null) continue;
         const outcome = await fetcher.fetch(record);
         if (!outcome.ok) console.error(`[rfc005] script-demand fetch of ${record.refId} failed: ${outcome.error}`);
       }
@@ -19410,42 +19414,32 @@ export class AgentFramework {
         isError: false,
       };
     }
-    const blocks = this.tryNativeToolResultContent(afResult.data, Boolean(afResult.dataIsContent), maxChars);
-    if (blocks) {
-      return { toolUseId: callId, content: blocks, isError: false };
+    // Without the history path's copy, one classification makes both the
+    // decision and the copy, as on that path: the text is made as that copy
+    // is (nonErrorResultText), so a reference shows at any depth as its stub,
+    // or a link as its line (RFC-005), a result with no data reads its error
+    // text, or no text, and never the value undefined; and where it's a
+    // content array whose links and markers fit the cap beside an image
+    // (goesNative), the very blocks that text was made from go natively.
+    let spans = null as HistoryBlockSpan[] | null;
+    let classified = null as ToolResultBlock[] | null;
+    const text = nonErrorResultText(afResult, maxChars, { onBlocks: (s, b) => { spans = s; classified = b; } });
+    if (spans && classified && goesNative((spans as HistoryBlockSpan[]).map(({ kind, start, end }) => ({ kind, length: end - start })), maxChars)) {
+      return { toolUseId: callId, content: this.nativeContent(classified, maxChars, null), isError: false };
     }
-    // Without the history path's copy, the text is made as that copy is
-    // (nonErrorResultText), so a reference's uri stays out of it at any depth
-    // (RFC-005), a result with no data reads its error text, or no text, and
-    // never the value undefined.
-    return { toolUseId: callId, content: nonErrorResultText(afResult, maxChars), isError: false };
+    return { toolUseId: callId, content: text, isError: false };
   }
 
   /**
-   * If `data` is a content array (toolResultBlocks) carrying at least one
-   * image, and its links and markers fit the cap together (goesNative),
-   * its blocks as Membrane's native ToolResultContentBlock[]: each image as
-   * itself, and every other block as the text the stored copy shows for it.
-   * Returns null otherwise, and the live copy is the stored text.
-   * `maxChars`, when provided, caps each accompanying text block so an image
-   * inlined alongside an enormous text payload can't blow the context. A
-   * block is cut as the stored copy is (toolResultCutAt), never inside a
-   * slot, so the stored copy can keep exactly the slots this showed (#403).
+   * A content array's blocks (toolResultBlocks), carrying at least one image
+   * whose links and markers fit the cap together (goesNative), as Membrane's
+   * native ToolResultContentBlock[]: each image as itself, each text block
+   * cut at the cap, and every other block whole, as the text the stored copy
+   * shows for it. `maxChars`, when provided, caps each text block so an image
+   * inlined beside an enormous text payload can't blow the context. A block
+   * is cut as the stored copy is (toolResultCutAt), never inside a slot, so
+   * the stored copy can keep exactly the slots this showed (#403).
    */
-  private tryNativeToolResultContent(
-    data: unknown,
-    dataIsContent: boolean,
-    maxChars?: number,
-  ): ToolResultContentBlock[] | null {
-    const blocks = toolResultBlocks(data, dataIsContent);
-    if (!blocks || !goesNative(blocks.map((block) => ({ kind: block.kind, length: block.kind === 'image' ? 0 : block.text.length })), maxChars)) {
-      return null;
-    }
-    return this.nativeContent(blocks, maxChars, null);
-  }
-
-  /** A result's blocks as Membrane's native content: each image as itself,
-   *  each text block cut at the cap, every other block whole. */
   private nativeContent(
     blocks: ToolResultBlock[],
     maxChars: number | undefined,
@@ -24565,7 +24559,12 @@ export class AgentFramework {
         return this.mcpToolResult(result, call.id, mcpl, serverId, call.name);
       }
       const direct = AgentFramework.directToolResult(result, serverId, call.name);
-      if (mcpl) return Array.isArray(direct.data) ? { ...direct, data: direct.data.map((block: unknown) => referenceBlockForScript(block, serverId)) } : direct;
+      if (mcpl) {
+        if (!Array.isArray(direct.data)) return direct;
+        // Each block reads the array's claims as one, as the model's line does.
+        const claims = contentClaims(direct.data);
+        return { ...direct, data: direct.data.map((block: unknown) => referenceBlockForScript(block, serverId, claims)) };
+      }
       // A standard peer's content that isn't a list of blocks is a malformed
       // result on the model's reading (normalizeStandardToolResult), so the
       // script reads it that way too, its structured content kept.
@@ -25235,8 +25234,8 @@ export class AgentFramework {
    * Handle the synthesized `read_image` tool: read image bytes from a
    * workspace mount and return them as a native MCP-shaped content array
    * (`[{type:'text'…},{type:'image', data, mimeType}]`). The live-turn
-   * converter (tryNativeToolResultContent → membrane tool_result image
-   * blocks) delivers the actual image to the model; history storage keeps
+   * converter (toMembraneToolResult's nativeContent → membrane tool_result
+   * image blocks) delivers the actual image to the model; history storage keeps
    * the standard compact `[image: …]` placeholder.
    */
   /** RFC-005 on-demand dereference: [ref id] → workspace file, via the

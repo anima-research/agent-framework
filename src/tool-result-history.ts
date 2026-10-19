@@ -29,9 +29,12 @@ import {
   INLINE_WITHHELD_TEXT,
   buildReferenceStub,
   classifyBlock,
-  referenceRegistry,
+  contentClaims,
   referenceStubOrNull,
   referenceTypeLabel,
+  resultClaims,
+  type ReferenceTestimony,
+  type ResultClaims,
 } from './mcpl/references.js';
 import { formatToolImagePlaceholder, toolResultCutAt } from './tool-image-ledger.js';
 
@@ -102,41 +105,18 @@ export function toolResultBlocks(data: unknown, dataIsContent?: boolean): ToolRe
   if (dataIsContent !== true && !data.every((element) => isPlainRecord(element) && MCP_BLOCK_TYPES.has(element.type as string))) {
     return null;
   }
-  // Every reference first, so what one says of a uri (a `disposition: never`,
-  // an expiry) holds for each block that names it, whatever their order.
-  for (const raw of data) registerReference(raw);
-  return data.map(toolResultBlock);
-}
-
-/** Register a block that is a reference, before any block is shown. */
-function registerReference(raw: unknown): void {
-  const c = classifyBlock(raw);
-  if (c.kind === 'reference') referenceRegistry.register(c.testimony);
-}
-
-/** Register every reference a tool result's data holds, at any depth, as
- *  historyJson shows them, before any is shown. A value RFC-005 governs is
- *  shown whole, so what's inside it isn't visited. */
-function registerReferencesIn(value: unknown, seen: Set<object> = new Set()): void {
-  if (!value || typeof value !== 'object' || seen.has(value)) return;
-  seen.add(value);
-  if (Array.isArray(value)) {
-    for (const element of value) registerReferencesIn(element, seen);
-    return;
-  }
-  const b = value as Record<string, unknown>;
-  if (governedByRfc005(b)) {
-    registerReference(b);
-    return;
-  }
-  for (const field of Object.values(b)) registerReferencesIn(field, seen);
+  // The result's claims, read as one (ResultClaims): what any of its
+  // references says of a uri (a `disposition: never`, an expiry) holds for
+  // each block that names it, whatever their order.
+  const claims = contentClaims(data);
+  return data.map((raw) => toolResultBlock(raw, claims));
 }
 
 /** One element of a content array, as toolResultBlocks gives it. Only an
  *  image with data and a media type is shown as itself, as the push lane's
  *  converter shows one, and only text and images can be: this host's tool
  *  results carry nothing else, so inline audio is a marker here. */
-function toolResultBlock(raw: unknown): ToolResultBlock {
+function toolResultBlock(raw: unknown, claims: ResultClaims): ToolResultBlock {
   const c = classifyBlock(raw);
   switch (c.kind) {
     case 'text':
@@ -151,7 +131,7 @@ function toolResultBlock(raw: unknown): ToolResultBlock {
       // block, stub or line, is `link`, counted toward the cap (goesNative).
       return {
         kind: c.testimony.fromLink ? 'link' : 'reference',
-        text: buildReferenceStub(c.testimony, 'from tool result', undefined, { unfetchedLinkUri: true }),
+        text: buildReferenceStub(c.testimony, 'from tool result', undefined, { unfetchedLinkUri: true, claims }),
       };
     case 'invalid':
       return { kind: 'marker', text: c.shown };
@@ -330,13 +310,25 @@ function isPlainRecord(value: unknown): value is Record<string, unknown> {
  * shown as the reference lanes show it: a reference as its stub, an invalid
  * one (such as a uri that isn't a string, or MCP's embedded resource, whose
  * uri isn't at its top level) as the marker saying why it isn't shown, and
- * inline data that also claims a uri or a disposition as withheld, so no uri
- * is shown but a link's where its line shows one (shownLinkUri). Inline data
- * that claims neither is itself, as is any other value:
+ * inline data that also claims a uri or a disposition as withheld. So the
+ * only uri shown is a link's, in its line, where the host can't fetch the
+ * link and its uri can't carry a credential (shownLinkUri). Inline data that
+ * claims neither is itself, as is any other value:
  * a block of another type keeps its fields, since RFC-005 governs
  * references.
  */
-function shownInHistory(value: unknown): unknown {
+function shownInHistory(value: unknown, claims?: ResultClaims): unknown {
+  return walkedInHistory(value, (b) => referenceStubOrNull(b, 'from tool result', undefined, { unfetchedLinkUri: true, claims }));
+}
+
+/**
+ * The one walk of a tool result's data that showing it and reading its
+ * claims both take: a value RFC-005 governs is text, from `asText`, except
+ * inline data that claims no uri or disposition, which is itself, as is any
+ * other value, so serialization descends into exactly the same values each
+ * time. `asText` gives a governed value's text, or null where it's itself.
+ */
+function walkedInHistory(value: unknown, asText: (b: Record<string, unknown>) => string | null): unknown {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return value;
   const b = value as Record<string, unknown>;
   if (!governedByRfc005(b)) return value;
@@ -346,7 +338,33 @@ function shownInHistory(value: unknown): unknown {
     // no uri: an object can carry a credential. An empty uri carries none.
     return hasUri(b.uri) || b.disposition !== undefined ? INLINE_WITHHELD_TEXT : value;
   }
-  return referenceStubOrNull(b, 'from tool result', undefined, { unfetchedLinkUri: true }) ?? value;
+  return asText(b) ?? value;
+}
+
+/**
+ * What a tool result's data claims of each uri its references name
+ * (ResultClaims), read by the walk serialization takes (walkedInHistory),
+ * through toJSON, the fields of inline data and every depth it shows: so
+ * every reference whose stub the result shows counts, and nothing it doesn't
+ * show does. A value serialization can't write, such as a cycle, stops the
+ * walk where it would stop the result.
+ */
+function claimsInHistory(data: unknown): ResultClaims {
+  const testimonies: ReferenceTestimony[] = [];
+  const read = (b: Record<string, unknown>): string | null => {
+    const c = classifyBlock(b);
+    if (c.kind === 'reference') testimonies.push(c.testimony);
+    // Text where referenceStubOrNull gives text, so the walk descends where
+    // showing descends.
+    return c.kind === 'text' || (c.kind === 'inline' && !c.contradiction) ? null : '';
+  };
+  try {
+    const root = walkedInHistory(data, read);
+    if (root === data || typeof root !== 'string') JSON.stringify(data, (_key, value: unknown) => walkedInHistory(value, read));
+  } catch {
+    // Showing the result meets the same failure at the same place.
+  }
+  return resultClaims(testimonies);
 }
 
 /**
@@ -355,6 +373,7 @@ function shownInHistory(value: unknown): unknown {
  * marker, or inline data withheld. Null for any other value.
  */
 export function rfc005TextOf(value: unknown): string | null {
+  // A single value claims only what it says itself, which its stub reads.
   const shown = shownInHistory(value);
   return shown !== value && typeof shown === 'string' ? shown : null;
 }
@@ -365,10 +384,10 @@ export function rfc005TextOf(value: unknown): string | null {
  * as a bare reference, is that text.
  */
 function historyJson(data: unknown): string | undefined {
-  registerReferencesIn(data);
-  const root = shownInHistory(data);
+  const claims = claimsInHistory(data);
+  const root = shownInHistory(data, claims);
   if (root !== data && typeof root === 'string') return root;
-  return JSON.stringify(data, (_key, value: unknown) => shownInHistory(value)) as string | undefined;
+  return JSON.stringify(data, (_key, value: unknown) => shownInHistory(value, claims)) as string | undefined;
 }
 
 function formatSize(bytes: number): string {

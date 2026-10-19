@@ -326,8 +326,8 @@ export interface StoredCut {
  * Where a tool result's text longer than `cap` is cut: by its stored copy
  * (cutStoredToolResult), by history's own truncation (truncateForHistory),
  * and by its live copy, for each text block beside an image
- * (tryNativeToolResultContent, framework.ts), so the stored copy and the live
- * copy cut alike. The text's length when it isn't longer than `cap`.
+ * (toMembraneToolResult's nativeContent, framework.ts), so the stored copy
+ * and the live copy cut alike. The text's length when it isn't longer than `cap`.
  *
  * The cut is made at the cap, or before it when the cap would split a
  * surrogate pair (safeSlice's rule), and that is where the moves back are
@@ -364,7 +364,8 @@ export function toolResultCutAt(text: string, cap: number): number {
  *
  * `shown` is what the live copy showed beside the stored text: null when the
  * live copy was the text itself, as for every result that carried no inline
- * image, or whose links and markers passed the cap together (goesNative).
+ * image, or whose links and markers came to more than the cap together, so
+ * goesNative said no.
  * Then what the cut keeps is exactly what the resident saw, and nothing past
  * it is kept (#403). A result whose live copy went to the model as native
  * blocks (framework.ts) sent every image whatever the text's length, so its stored text is the only
