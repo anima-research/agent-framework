@@ -5,6 +5,7 @@
  * into conversation messages and inference requests.
  */
 
+import { unknownToolMessage } from '../unknown-tool.js';
 import type {
   Module,
   ModuleContext,
@@ -38,9 +39,9 @@ export class ApiModule implements Module {
     // Nothing to clean up
   }
 
-  async handleToolCall(_call: ToolCall): Promise<ToolResult> {
+  async handleToolCall(call: ToolCall): Promise<ToolResult> {
     // API module has no tools
-    return { success: false, error: 'Unknown tool' };
+    return { success: false, error: unknownToolMessage(this.name, call.name, this.getTools()), isError: true };
   }
 
   async onProcess(event: ProcessEvent, _state: ProcessState): Promise<EventResponse> {

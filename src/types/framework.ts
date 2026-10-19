@@ -24,8 +24,6 @@ export interface ModuleProcessResponse {
 export interface ProcessLoggingConfig {
   /** Persist process logs to Chronicle (default: false) */
   persist?: boolean;
-  /** Broadcast process:completed trace events (default: false) */
-  broadcast?: boolean;
 }
 
 /**
@@ -41,7 +39,9 @@ export interface ProcessLoggingConfig {
  * the agent already has broader host access through its tools).
  */
 export interface CodeExecutionConfig {
-  /** Master switch — the tool is only synthesized when true. */
+  /** Master switch — only `true` synthesizes the tool. `create()` refuses a
+   *  value that isn't a boolean, a quoted "false" included; `null` or leaving
+   *  it out counts as off. */
   enabled: boolean;
   /** Python interpreter to spawn (default: 'python3' from PATH). */
   pythonPath?: string;
@@ -74,6 +74,23 @@ export interface CodeExecutionConfig {
   /** Max wake_agent() calls per background script (default 100); further
    *  calls raise RuntimeError inside the script. */
   maxWakesPerScript?: number;
+  /** Variables for the python interpreter beyond the operating allowlist it
+   *  inherits (see CHILD_ENV_ALLOWLIST), such as PYTHONPATH. A recipe can
+   *  `${VAR}`-substitute them from .env. Other host variables aren't
+   *  inherited, which limits what model-authored code inherits, not what a
+   *  process running as the same user can read. The runner sets
+   *  PYTHONUNBUFFERED and PYTHONIOENCODING last, over any value given here,
+   *  since its protocol needs both. The interpreter's working directory is
+   *  its own runtime directory, so a relative path given here, as in
+   *  PYTHONPATH, resolves there: give absolute paths. */
+  env?: Record<string, string>;
+  /** The interpreter inherits the host's whole environment instead of the
+   *  allowlist: every host variable, provider keys included, reaches
+   *  model-authored code and every subprocess a script starts. Listing what
+   *  scripts need in `env` is the safer route. With code execution enabled,
+   *  `create()` refuses any value but true, false or null, which counts as
+   *  not set. */
+  inheritEnv?: boolean;
 }
 
 /** See `FrameworkConfig.providerHold`. */
@@ -110,9 +127,10 @@ export interface FrameworkConfig {
   storePath?: string;
 
   /**
-   * Branch-independent Discord awareness-marker outbox. Defaults to
+   * Branch-independent Discord awareness ledger. Defaults to
    * `<storePath>/recovery/discord-awareness-outbox.json`. Set explicitly when
-   * providing an app-owned `store` without `storePath`; omit to disable.
+   * providing an app-owned `store` without `storePath`; with neither, the
+   * framework has no ledger and refuses a marks choice.
    */
   discordAwarenessOutboxPath?: string;
 
@@ -210,7 +228,9 @@ export interface FrameworkConfig {
 
   /**
    * Client-side programmatic tool calling (`code_execution` tool). Omitted or
-   * `enabled: false` → tool absent, no python is ever spawned.
+   * `enabled: false` → tool absent, no python is ever spawned. At runtime,
+   * untyped configs may also use `null` or `false` to omit this setting.
+   * Other values that aren't objects are refused at `create()`.
    */
   codeExecution?: CodeExecutionConfig;
 
@@ -302,6 +322,10 @@ export interface ContextMaintenanceAgentRun {
   pendingAfter?: string;
   progressBefore?: Record<string, unknown>;
   progressAfter?: Record<string, unknown>;
+  /**
+   * The agent's failure in this pass: a tick that threw, or its readiness
+   * that couldn't be read, before the ticks or after them.
+   */
   error?: string;
 }
 
@@ -323,6 +347,12 @@ export interface ContextMaintenanceSnapshot {
     agentName: string;
     ready: boolean;
     pending?: string;
+    /**
+     * Why the agent's readiness can't be read: the context manager refuses
+     * while its strategy's initialization is pending or has failed, and a
+     * strategy can refuse on its own. `ready` is false then.
+     */
+    error?: string;
     progress?: Record<string, unknown>;
   }>;
 }
@@ -401,20 +431,32 @@ export interface InferenceLogEntry {
   requestId: string;
   /** Whether inference succeeded */
   success: boolean;
-  /** Error message if failed */
+  /** Why it didn't succeed: the failure's message, or what stopped it */
   error?: string;
-  /** Request data or blob ID if large */
+  /** Request data or blob ID if large. A stream the framework ended at a
+   *  tool boundary (stopReason 'turn_ended', 'context_budget' or
+   *  'physical_window') records a note in place of the body. */
   request: unknown | { blobId: string };
   /** Response data or blob ID if large (only if successful) */
   response?: unknown | { blobId: string };
   durationMs: number;
+  /** The stream's usage: its final response's, or, for a stream that ended
+   *  without one, the provider rounds it finished before it ended. Exactly
+   *  one entry of a stream carries it, the one its end wrote, a stop's
+   *  included; a stream whose end writes none (a superseded stream, a
+   *  disposed agent's stream) gets a failure entry that carries it, when it
+   *  had finished a round. One that hadn't has nothing to carry and gets no
+   *  entry. */
   tokenUsage?: {
     input: number;
     output: number;
     cacheCreation?: number;
     cacheRead?: number;
   };
-  /** Stop reason from the model */
+  /** Stop reason from the model, or why the framework ended the stream at a
+   *  tool boundary: 'turn_ended' (a tool result with endTurn), or
+   *  'context_budget' / 'physical_window' (a context-budget or
+   *  physical-window restart). */
   stopReason?: string;
 }
 

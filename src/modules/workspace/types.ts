@@ -22,7 +22,9 @@ export interface MountConfig {
    * - 'on-agent-action': after each completed agent tool batch, the mount is
    *   scanned, and the agent's next inference waits for that scan up to
    *   `agentActionScanDeadlineMs`; a scan that takes longer finishes while
-   *   the round goes on
+   *   the round goes on. Each scan walks from the mount's start, so on a
+   *   mount over its `walkCap` it covers the first `walkCap` entries every
+   *   time, and files past them come in as `walkCap` describes
    * - 'never': no background reads; listings and lazy reads still observe
    *   the paths they show
    */
@@ -36,12 +38,53 @@ export interface MountConfig {
    * - Exact name match: ".git", "node_modules"
    * - Directory glob: "node_modules/**" (anything under node_modules)
    * - Extension glob: "*.pyc" (any file ending in .pyc)
+   * A sync without a path and the watcher pass over what the list covers,
+   * and over entries with an editor's swap or backup file name whatever it
+   * says, a directory with what lies beneath it: `.name.swp` and `.name.swx`
+   * (the whole name), and names ending in `~` or in `.subl…tmp`, matched by
+   * `^\..+\.sw[px]$`, `~$` and `\.subl.*\.tmp$`.
    */
   ignore?: string[];
-  /** Whether to follow symlinks (default: false) */
+  /**
+   * Whether to follow symlinks (default: false). Without it, no symlink on a
+   * path is followed: not one at the path itself, and not one among the
+   * directories on its way beneath the mount's root, wherever it leads. A path
+   * with a symlink among its directories is refused naming the link, and for
+   * a link inside the mount, its target. A mount root that is
+   * itself a symlink is still the root. With it, a symlink on a path is
+   * followed while what it reaches stays inside the mount. Either way, a
+   * listing or a sync's walk descends into no symlinked directory.
+   */
   followSymlinks?: boolean;
   /** Maximum file size in bytes (default: 5MB) */
   maxFileSize?: number;
+  /**
+   * The most entries one walk of this mount takes (default: 5000), a
+   * positive integer no larger than Number.MAX_SAFE_INTEGER: files, and
+   * links or other entries that aren't
+   * directories, each of which the pass observes. A sync that reaches it
+   * reports the rest as incomplete, and the next sync of the same scope
+   * resumes after the last entry it took, wrapping to the start, so repeated
+   * syncs cover a larger mount. A watched mount's catch-up scan (at start,
+   * and when its watcher reattaches) takes its turn in the same rotation as
+   * the mount's bare syncs, so on a mount over the cap, a change made while
+   * the process was down waits for the rotation to reach it. The place is
+   * kept with the mount's disk evidence, so a restart resumes there, unless
+   * the machine went down before the store made the latest place durable.
+   * An agent-action scan (`watch: 'on-agent-action'`) and a listing (`ls`,
+   * `glob`, `grep`) take up to it from their scope's start every time:
+   * `glob`'s is the directory its pattern's segments before the first
+   * wildcard name beneath its `path`, and `grep`'s the deeper of its `path`
+   * and its `glob` filter's directory, as far as disk lists each segment
+   * with that spelling as a directory, not a link. Each directory's listing
+   * is read whole, so a deletion is seen wherever the walk lists, whatever
+   * it took.
+   *
+   * It bounds what a walk observes, not the walk's own work: directories
+   * don't count against it, and each one the walk visits is read whole, so
+   * a tree of many directories that hold nothing is walked in full.
+   */
+  walkCap?: number;
   /**
    * If set, filesystem changes on this mount request inference.
    * - `true` — wake on any op (created | modified | deleted)
@@ -49,6 +92,8 @@ export interface MountConfig {
    *
    * Self-writes through the module's own tools are already suppressed by the
    * watcher, so a mount shared between agents only wakes on external writes.
+   * A change of a file's mode alone is recorded, and makes no event: it
+   * brings nothing new to read.
    * The EventGate still has final say — use gate policies for path-glob
    * filtering or to disable wake temporarily via hot-reload.
    */
@@ -111,7 +156,10 @@ export interface MountState {
   lastMaterializedSeq: number;
   /** Paths currently suppressed from watcher (recently materialized) */
   suppressedPaths: Set<string>;
-  /** Whether a full scan of the mount has completed this session */
+  /**
+   * Whether a pass over the whole mount has run this session. On a mount
+   * over its walkCap, that pass took the first walkCap entries.
+   */
   initialSyncDone: boolean;
   /** Branch ID that was active when this mount last materialized */
   lastMaterializedBranchId: string | null;
@@ -207,6 +255,20 @@ export interface EditInput {
   newString: string;
   /** Replace all occurrences (default: false) */
   replaceAll?: boolean;
+}
+
+export interface EditManyInput {
+  /** The edits, each matched in its file as the call reads it, all in one mount's files. */
+  edits: Array<{
+    /** File path (mount-prefixed) */
+    path: string;
+    /** Exact text to replace */
+    oldString: string;
+    /** Text to replace it with */
+    newString: string;
+    /** How many times oldString occurs in the file (default: 1); every one is replaced. */
+    occurrences?: number;
+  }>;
 }
 
 export interface DeleteInput {

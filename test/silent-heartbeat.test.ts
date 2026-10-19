@@ -55,7 +55,7 @@ async function make() {
 }
 
 describe('silent heartbeat', () => {
-  it('wakes once with ephemeral control context, stores no push message, and routes no prose', async () => {
+  it('wakes once with its instruction in a request-only turn, stores no push message, and routes no prose', async () => {
     const x = await make();
     try {
       x.membrane.pushResponse(createMockResponse([{ type: 'text', text: 'private self-check prose' }] as ContentBlock[]));
@@ -72,6 +72,10 @@ describe('silent heartbeat', () => {
       assert.match(wire, /silent heartbeat/);
       assert.match(wire, /Scheduled private self-check/);
       assert.doesNotMatch(wire, /private self-check prose/);
+      // The instruction is the request's last turn; the system prompt is the
+      // agent's own, as on every other turn.
+      assert.equal(x.membrane.calls[0]!.system, 'test');
+      assert.match(JSON.stringify(x.membrane.calls[0]!.messages.at(-1)), /Scheduled private self-check/);
     } finally { await x.framework.stop(); rmSync(x.dir, { recursive: true, force: true }); }
   });
 

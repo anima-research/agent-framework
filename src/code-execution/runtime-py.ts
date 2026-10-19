@@ -7,7 +7,8 @@
  *
  *   - scripts run with top-level `await` (PyCF_ALLOW_TOP_LEVEL_AWAIT)
  *   - host tools are injected as async functions taking a single dict and
- *     returning a string (the tool_result text)
+ *     returning the tool_result text as a str (ToolResult), which also
+ *     carries .is_error and .structured
  *   - a pending tool call that gets no response raises TimeoutError with the
  *     same message shape the managed runtime produces
  *   - interpreter globals persist across execs (container-reuse semantics)
@@ -29,7 +30,7 @@
  *   host -> py : {op:"init", tools:[{py_name,tool_name}], call_timeout_s,
  *                 background?, log_path?, tail_chars?}
  *                {op:"exec", id, code}
- *                {op:"tool_result", id, result}
+ *                {op:"tool_result", id, result, is_error?, structured_json?}
  *                {op:"wake_ack", id, error?}
  *                {op:"cancel", id, reason?}
  *   py -> host : {op:"ready"}
@@ -49,10 +50,12 @@
 export const PYTHON_RUNTIME_SOURCE: string = String.raw`
 import ast
 import asyncio
+import functools
 import inspect
 import io
 import json
 import os
+import re
 import signal
 import sys
 import threading
@@ -70,9 +73,16 @@ TAIL_CHARS = 4000
 
 _send_lock = threading.Lock()
 
+# A str can hold a lone surrogate, which UTF-8 can't encode: on POSIX,
+# os.fsdecode makes one of each byte in a filename that doesn't decode as
+# UTF-8, and json.loads makes one of a "\ud800" escape. PYTHONIOENCODING makes
+# the protocol channel strict UTF-8, so writing one would fail the whole
+# message, and a script's result would never arrive. Each goes as U+FFFD.
+_LONE_SURROGATE = re.compile(r"[\ud800-\udfff]")
+
 
 def send(obj):
-    line = json.dumps(obj, ensure_ascii=False, default=str)
+    line = _LONE_SURROGATE.sub("\ufffd", json.dumps(obj, ensure_ascii=False, default=str))
     with _send_lock:
         PROTO_OUT.write(line + "\n")
         PROTO_OUT.flush()
@@ -250,6 +260,31 @@ def _deliver_cancel(st):
     st.task.cancel()
 
 
+class ToolResult(str):
+    """A tool's result: the string the tool gave, with two attributes.
+
+    is_error: True if the result is an error, False if not, None if the
+    host didn't say.
+    structured: the parsed structuredContent of a structured result's JSON
+    object, or None.
+    """
+
+    # Defaults, since pickle and copy rebuild a str subclass from its text
+    # alone and then restore the attributes.
+    def __new__(cls, text="", is_error=None, structured_json=False):
+        self = str.__new__(cls, text)
+        self.is_error = is_error
+        self._structured_json = structured_json
+        return self
+
+    # Read from the string itself, the one copy sent, on first use only.
+    @functools.cached_property
+    def structured(self):
+        if not self._structured_json:
+            return None
+        return json.loads(self).get("structuredContent")
+
+
 def _resolve(fut, value):
     # Defense in depth: the script may have been cancelled since the lookup.
     if fut is not None and not fut.done():
@@ -259,15 +294,62 @@ def _resolve(fut, value):
             pass
 
 
+def _brief(value):
+    # A value as a refusal shows it: by its type, such as <str>, which fails
+    # loudly if copied rather than sending something else. The agent has its
+    # values in the call it just wrote. No value's own code runs here: its
+    # __repr__ isn't called, and its type is named through type's own
+    # descriptor, so a metaclass's __name__ doesn't run either.
+    return "<" + type.__dict__["__name__"].__get__(type(value)) + ">"
+
+
 def _make_tool_fn(tool_name, py_name):
-    async def tool_fn(args=None):
+    async def tool_fn(*positional, **kwargs):
         global _next_tool_call_id
+        if len(positional) > 1:
+            raise TypeError(
+                py_name + " wasn't called: a tool function takes one dict of "
+                "arguments, such as await " + py_name + "({...}), and this call "
+                "gave it " + str(len(positional)) + " positional arguments"
+            )
+        # args= on its own is the dict, as it has always been. Beside other
+        # keywords it's one of them, since a tool such as utils has a field
+        # of that name, so the suggested dict keeps it.
+        if positional:
+            args = positional[0]
+        elif list(kwargs) == ["args"]:
+            args = kwargs.pop("args")
+        else:
+            args = None
+        if kwargs:
+            if args is not None and not isinstance(args, dict):
+                raise TypeError(
+                    py_name + " wasn't called: a tool function takes one dict of "
+                    "arguments, not keyword arguments, and this call also gave it "
+                    + _brief(args) + ", so put every argument in one dict: await "
+                    + py_name + "({...})"
+                )
+            # The likely intent is plain: the same arguments in one dict.
+            meant = dict(args) if isinstance(args, dict) else {}
+            meant.update(kwargs)
+            # A key is what the agent has to write, so a str key is shown
+            # whole up to 60 characters, as names are elsewhere; a longer one,
+            # or any other key, is shown as a value is. A tool's result counts
+            # as a str: ToolResult keeps str's repr, so no script code runs.
+            shown = ", ".join((repr(k) if (type(k) is str or type(k) is ToolResult) and len(k) <= 60 else _brief(k)) + ": " + _brief(v)
+                              for k, v in meant.items())
+            raise TypeError(
+                py_name + " wasn't called: a tool function takes one dict of "
+                "arguments, not keyword arguments, so write await "
+                + py_name + "({" + shown + "})"
+            )
         if args is None:
             args = {}
         if not isinstance(args, dict):
             raise TypeError(
-                "tool functions take a single dict of arguments, e.g. await "
-                + py_name + "({...})"
+                py_name + " wasn't called: a tool function takes one dict of "
+                "arguments, such as await " + py_name + "({...}), and this call "
+                "gave it " + _brief(args)
             )
         _next_tool_call_id += 1
         call_id = "t" + str(_next_tool_call_id)
@@ -293,7 +375,8 @@ def _make_tool_fn(tool_name, py_name):
     tool_fn.__qualname__ = py_name
     tool_fn.__doc__ = (
         "Host tool '" + tool_name + "'. Takes a single dict of arguments and "
-        "returns the tool result as a string."
+        "returns the tool result as a string, with .is_error and .structured "
+        "beside it."
     )
     return tool_fn
 
@@ -483,7 +566,10 @@ def _dispatch(msg):
         )
         st.task = _current_exec_task
     elif op == "tool_result":
-        _resolve(_pending_tool_futures.get(msg.get("id")), str(msg.get("result", "")))
+        _resolve(
+            _pending_tool_futures.get(msg.get("id")),
+            ToolResult(str(msg.get("result", "")), msg.get("is_error"), msg.get("structured_json") is True),
+        )
     elif op == "wake_ack":
         _resolve(_pending_wake_futures.get(msg.get("id")), msg.get("error") or None)
     elif op == "cancel":

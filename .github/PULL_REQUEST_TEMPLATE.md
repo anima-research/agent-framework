@@ -21,8 +21,9 @@
 
 ---
 
-- [ ] Changelog fragment added — `changelog.d/<slug>.<breaking|added|changed|fixed>.md`
-      (see `changelog.d/README.md`) — or this change is internal-only /
+- [ ] Changelog fragment added or a pending one edited —
+      `changelog.d/<slug>.<breaking|added|changed|fixed>.md` (see
+      `changelog.d/README.md`) — or this change is internal-only /
       test-only / docs-only (apply the `no-changelog` label).
 
 <!-- AI-assisted contributions are welcome and normal here — see

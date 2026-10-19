@@ -154,4 +154,23 @@ describe('UsageTracker', () => {
     assert.ok(snap.totals.estimatedCost);
     assert.ok(Math.abs(snap.totals.estimatedCost.total - 0.03) < 1e-10);
   });
+
+  it("a usage without a count adds nothing for it, so the totals stay numbers and are stored as numbers", () => {
+    // membrane passes a Bedrock stream's output count through as reported, so one can be missing.
+    const { tracker } = createTracker();
+    tracker.onInferenceCompleted('agent', { inputTokens: 100, outputTokens: 50, cacheCreationTokens: 10, cacheReadTokens: 20 });
+    tracker.onInferenceCompleted('agent', {
+      inputTokens: 25,
+      outputTokens: undefined as unknown as number,
+      cacheCreationTokens: NaN,
+      cacheReadTokens: NaN,
+    });
+    const stored = JSON.parse(JSON.stringify(tracker.toJSON()));
+    assert.equal(stored.totals.inputTokens, 125);
+    assert.equal(stored.totals.outputTokens, 50);
+    assert.equal(stored.totals.cacheCreationTokens, 10);
+    assert.equal(stored.totals.cacheReadTokens, 20);
+    assert.equal(stored.byAgent[0].usage.inputTokens, 125);
+    assert.equal(stored.byAgent[0].usage.outputTokens, 50);
+  });
 });

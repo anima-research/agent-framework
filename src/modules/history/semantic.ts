@@ -26,6 +26,7 @@
 
 import type { ContextManager, StoredMessage } from '@animalabs/context-manager';
 import type { ContentBlock } from '@animalabs/membrane';
+import { safeSlice } from '../../safe-slice.js';
 
 export interface SemanticIndexConfig {
   /** Base URL of the embed-service, e.g. `http://100.90.161.34:8804`. */
@@ -104,6 +105,35 @@ export interface SearchResponse {
 
 const PRIVATE_PROSE_TOOLS = new Set(['think', 'journal', 'skip_reply', 'private_note']);
 
+/**
+ * The semantic index service's failure, said of the service alone: it didn't
+ * answer in time, couldn't be reached, cut its answer off, answered without
+ * what its request's caller reads, or answered with an HTTP error. `status` is
+ * the answer's HTTP status, and null where no whole answer came. Each caller
+ * says what that meant for its own work, a search or the background sync.
+ */
+export class EmbedServiceError extends Error {
+  constructor(message: string, readonly status: number | null) {
+    super(message);
+    this.name = 'EmbedServiceError';
+  }
+}
+
+/**
+ * What stopped a request reaching the service: fetch's cause, such as a
+ * refused connection. When several addresses were tried, as for a name like
+ * localhost with both an IPv6 and an IPv4 address, the cause is an
+ * AggregateError with no message of its own, and each address's error says it.
+ */
+function unreachedReason(e: unknown): string {
+  const cause = (e as { cause?: unknown } | null)?.cause;
+  if (cause instanceof AggregateError && !cause.message) {
+    const each = cause.errors.map((err) => (err instanceof Error ? err.message : String(err))).filter(Boolean);
+    if (each.length > 0) return each.join('; ');
+  }
+  return (cause instanceof Error && cause.message) || (e instanceof Error ? e.message : String(e));
+}
+
 export class SemanticIndexClient {
   private readonly base: string;
   private readonly ns: string;
@@ -114,21 +144,69 @@ export class SemanticIndexClient {
     this.timeoutMs = cfg.requestTimeoutMs ?? 30_000;
   }
 
-  private async call<T>(method: 'GET' | 'POST', path: string, body?: unknown): Promise<T> {
+  /**
+   * A request's answer, as JSON. `expect` is what the caller reads of it: an
+   * answer without that, such as a web page at a wrong address, fails as
+   * one, with its status, since the service did answer.
+   */
+  private async call<T>(
+    method: 'GET' | 'POST', path: string, body?: unknown, expect?: { what: string; is: (json: unknown) => boolean },
+  ): Promise<T> {
     const headers: Record<string, string> = { 'content-type': 'application/json' };
     if (this.cfg.token) headers.authorization = `Bearer ${this.cfg.token}`;
     const ctrl = new AbortController();
     const timer = setTimeout(() => ctrl.abort(), this.timeoutMs);
+    // The request's kind, for a message: search, upsert, delete or stats.
+    const request = path.slice(path.lastIndexOf('/') + 1);
+    // The timeout as the client used it: whole seconds, or else milliseconds.
+    const within = this.timeoutMs % 1000 === 0 ? `${this.timeoutMs / 1000} s` : `${this.timeoutMs} ms`;
     try {
-      const res = await fetch(`${this.base}${path}`, {
-        method, headers, body: body === undefined ? undefined : JSON.stringify(body), signal: ctrl.signal,
-      });
-      const text = await res.text();
+      let res: Response;
+      let text: string;
+      let answered = false;
+      try {
+        res = await fetch(`${this.base}${path}`, {
+          method, headers, body: body === undefined ? undefined : JSON.stringify(body), signal: ctrl.signal,
+        });
+        answered = true;
+        // An answer cut off after its status, or not finished within the
+        // timeout, counts as no answer. That's rare, and a stats or delete
+        // request that misses its 404 this way is made again on a later pass
+        // of the sync.
+        text = await res.text();
+      } catch (e) {
+        throw new EmbedServiceError(
+          answered
+            ? ctrl.signal.aborted
+              ? `the semantic index service's answer to the ${request} request didn't finish within ${within}`
+              : `the semantic index service's answer to the ${request} request was cut off (${unreachedReason(e)})`
+            : ctrl.signal.aborted
+              ? `the semantic index service didn't answer the ${request} request within ${within}`
+              : `the semantic index service couldn't be reached for the ${request} request (${unreachedReason(e)})`,
+          null,
+        );
+      }
       let json: unknown;
       try { json = JSON.parse(text); } catch { json = undefined; }
       if (!res.ok) {
-        const msg = (json as { error?: { message?: string } } | undefined)?.error?.message ?? text.slice(0, 200);
-        throw new Error(`embed-service ${method} ${path} → ${res.status}: ${msg}`);
+        // The service's message, or any other body, is quoted to at most its
+        // first 200 UTF-16 units, one fewer rather than end on half of a
+        // surrogate pair, and a quote that's cut ends in "…". A message that
+        // isn't text quotes the body instead.
+        const given = (json as { error?: { message?: unknown } } | undefined)?.error?.message;
+        const quoted = typeof given === 'string' ? given : text;
+        const cut = safeSlice(quoted, 0, 200);
+        const msg = cut.length < quoted.length ? `${cut}…` : cut;
+        throw new EmbedServiceError(
+          `the semantic index service answered the ${request} request with an error (HTTP ${res.status}${msg ? `: ${msg}` : ''})`,
+          res.status,
+        );
+      }
+      if (expect && !expect.is(json)) {
+        throw new EmbedServiceError(
+          `the semantic index service answered the ${request} request without ${expect.what} (HTTP ${res.status})`,
+          res.status,
+        );
       }
       return json as T;
     } finally {
@@ -139,15 +217,17 @@ export class SemanticIndexClient {
   /** Stats for this namespace; `null` when the namespace does not exist yet. */
   async stats(): Promise<IndexStats | null> {
     try {
-      return await this.call<IndexStats>('GET', `/v1/index/${this.ns}/stats`);
+      return await this.call<IndexStats>('GET', `/v1/index/${this.ns}/stats`, undefined, {
+        what: 'stats by kind', is: (json) => isObject((json as { by_kind?: unknown } | undefined)?.by_kind),
+      });
     } catch (e) {
-      if (e instanceof Error && /→ 404/.test(e.message)) return null;
+      if (e instanceof EmbedServiceError && e.status === 404) return null;
       throw e;
     }
   }
 
   async upsert(items: IndexItem[]): Promise<{ inserted: number; updated: number; unchanged: number; count: number }> {
-    return this.call('POST', `/v1/index/${this.ns}/upsert`, { items });
+    return this.call('POST', `/v1/index/${this.ns}/upsert`, { items }, { what: 'a JSON object', is: isObject });
   }
 
   async delete(ids: string[]): Promise<{ deleted: number }> {
@@ -155,8 +235,27 @@ export class SemanticIndexClient {
   }
 
   async search(req: SearchRequest): Promise<SearchResponse> {
-    return this.call<SearchResponse>('POST', `/v1/index/${this.ns}/search`, req);
+    return this.call('POST', `/v1/index/${this.ns}/search`, req, {
+      what: 'a list of hits, each with an id', is: (json) => {
+        const hits = (json as { hits?: unknown } | undefined)?.hits;
+        return Array.isArray(hits) && hits.every(isHit);
+      },
+    });
   }
+}
+
+/** A JSON object: not null, and not a list. */
+function isObject(json: unknown): boolean {
+  return typeof json === 'object' && json !== null && !Array.isArray(json);
+}
+
+/**
+ * A hit as semantic_search needs one: an object with a string id, which it
+ * reads of every hit. Its ts and meta are read only for the hits it returns,
+ * and as far as they can be read.
+ */
+function isHit(hit: unknown): boolean {
+  return isObject(hit) && typeof (hit as { id?: unknown }).id === 'string';
 }
 
 /** Text to embed for one message, or '' when there is nothing worth indexing. */
@@ -194,7 +293,7 @@ export function messageToItem(msg: StoredMessage, cfg: { includePrivateTools?: b
   const tsMs = msg.timestamp.getTime();
   return {
     id: `msg:${String(msg.id)}`,
-    text: text.slice(0, cfg.maxChars ?? 32_000),
+    text: safeSlice(text, 0, cfg.maxChars ?? 32_000),
     ts: tsMs / 1000,
     channel: channelOf(msg),
     kind: 'message',
@@ -221,7 +320,7 @@ export function summaryToItem(s: SummaryLike, cfg: { maxChars?: number }): Index
   if (!text) return null;
   return {
     id: `sum:${s.id}`,
-    text: text.slice(0, cfg.maxChars ?? 32_000),
+    text: safeSlice(text, 0, cfg.maxChars ?? 32_000),
     ts: s.startMs / 1000,
     kind: 'summary',
     level: s.level,
@@ -258,6 +357,11 @@ export class SemanticIndexer {
     private readonly log: (msg: string) => void = () => {},
   ) {}
 
+  /** A line for the host's log, naming this indexer's index first, since a host can keep several. */
+  warn(line: string): void {
+    this.log(`[history/semantic] index ${JSON.stringify(this.cfg.namespace)}: ${line}`);
+  }
+
   /**
    * Edits and removals since the last successful sync. The time-cursor walk
    * only revisits the overlap window, so an edit to an older message (its
@@ -271,7 +375,16 @@ export class SemanticIndexer {
   private readonly editedIds = new Set<string>();
   private readonly removedIds = new Set<string>();
   private detach: (() => void) | null = null;
-  /** Set once the service answers 404 to /delete (a build without the route): removals are dropped from then on. */
+  /**
+   * Set once the service answers 404 to /delete in a pass whose /stats
+   * answered with stats, which shows the index is made, so the 404 means a
+   * build without the route. From then on, removals are dropped as they come
+   * and no pass calls /delete, until the host restarts or binds the module
+   * again, which makes a new indexer. A pass whose /stats answers 404 has no
+   * index to remove from and makes no /delete call; a /delete 404 in a pass
+   * whose /stats answered with something that isn't stats is re-queued like
+   * any other failure, since that answer doesn't show the index is made.
+   */
   private deleteUnsupported = false;
   /** Called whenever the pending edit/remove sets change. */
   onPendingChange: ((p: PendingChanges) => void) | null = null;
@@ -290,7 +403,7 @@ export class SemanticIndexer {
     if (this.detach) return;
     const on = (this.cm as { onMessage?: ContextManager['onMessage'] }).onMessage;
     if (typeof on !== 'function') {
-      this.log('[history/semantic] context-manager has no onMessage: edits and removals will not reach the index');
+      this.warn("the context-manager has no onMessage, so edits and removals won't reach the index");
       return;
     }
     this.detach = on.call(this.cm, (e) => {
@@ -323,8 +436,27 @@ export class SemanticIndexer {
     const report: SyncReport = { pushed: 0, inserted: 0, updated: 0, unchanged: 0, more: false, messagesScanned: 0, summariesScanned: 0 };
     if (this.backingOff) { report.more = true; return report; }
     const batchSize = Math.min(256, Math.max(1, this.cfg.syncBatch ?? 128));
+    // Failures of the edits and removals phase, which don't end the pass, and a
+    // stats answer that isn't stats: lastError names each, ended or not.
+    const phaseErrors: string[] = [];
+    let notStats: EmbedServiceError | null = null;
     try {
-      const stats = await this.client.stats();
+      // A 2xx that isn't stats, such as a web page from a wrong route, gives no
+      // watermark: the pass walks from the start, as for a namespace that
+      // doesn't exist yet, and lastError names the answer. Every pass then
+      // starts over, and a history longer than a pass's budget is never
+      // walked to its end, so a pass whose budget runs out fails on that
+      // answer.
+      let stats: IndexStats | null = null;
+      try {
+        stats = await this.client.stats();
+      } catch (e) {
+        if (!(e instanceof EmbedServiceError && e.status !== null && e.status >= 200 && e.status < 300)) throw e;
+        notStats = e;
+      }
+      // /stats answered 404, which stats() reads as a namespace that doesn't
+      // exist: there's no index to remove from.
+      const noIndex = stats === null && notStats === null;
       const msgWm = stats?.by_kind.message?.max_cursor ?? null;
       const sumWm = stats?.by_kind.summary?.max_cursor ?? null;
       let budget = maxItems;
@@ -340,14 +472,14 @@ export class SemanticIndexer {
       // This phase fails on its own: a failure re-queues its ids, is logged
       // and reported via lastError, and the tick falls through to summaries
       // and the time walk, so one bad delete/upsert cannot freeze indexing.
-      let phaseError: string | null = null;
       if (this.removedIds.size > 0 || this.editedIds.size > 0) {
         const removed = [...this.removedIds];
         // Edits spend the budget like any other upsert, so a large queue left
         // by an outage cannot make a search's bounded catch-up unbounded; the
         // rest stay queued for the next pass.
-        // Only actionable edits (an upsert or a delete) spend it: one whose
-        // message left the branch is dropped for free.
+        // An edit whose message is on the branch spends it, one edited down to
+        // nothing indexable too, even in a pass that makes no /delete call; one
+        // whose message left the branch is dropped for free.
         this.removedIds.clear();
         const edited: string[] = [];
         const toDelete = removed.map((id) => `msg:${id}`);
@@ -367,22 +499,40 @@ export class SemanticIndexer {
           if (item) toUpsert.push(item); else { toDelete.push(`msg:${id}`); blanked.push(id); }
         }
         if (this.editedIds.size > 0) report.more = true;
-        if (toDelete.length > 0) {
+        // The removals and blanked edits are dropped with no /delete call in
+        // two cases. With no index (/stats answered 404), there's nothing to
+        // remove, and the index this pass makes takes only what the store
+        // holds and can index, which leaves them out. Once the service is known
+        // to lack the route (deleteUnsupported), the index keeps them, and
+        // search-time checks (on-branch, still indexable) keep them out of
+        // results.
+        if (toDelete.length > 0 && !noIndex && !this.deleteUnsupported) {
           try {
             await this.client.delete(toDelete);
           } catch (e) {
             const msg = e instanceof Error ? e.message : String(e);
-            if (/→ 404/.test(msg)) {
-              // A service build without /delete (or a namespace that does
-              // not exist). Drop the removals and blanked edits: search-time
-              // checks (on-branch, still indexable) keep them out of results.
+            // What the delete held, by kind, for the warning.
+            const what = [
+              removed.length > 0 ? `${removed.length} removal(s)` : null,
+              blanked.length > 0 ? `${blanked.length} edit(s) down to nothing indexable` : null,
+            ].filter((s): s is string => s !== null).join(' and ');
+            if (e instanceof EmbedServiceError && e.status === 404 && stats !== null) {
+              // This pass's /stats answered with stats, so the index is made
+              // and the 404 is the route's: a service build without /delete.
               this.deleteUnsupported = true;
-              this.log(`[history/semantic] /delete unsupported by the embed-service; dropping ${toDelete.length} removal(s): ${msg}`);
+              this.warn(
+                `/delete answered 404, so the service lacks that route; dropping ${what}. Later removals and edits `
+                  + `down to nothing indexable are dropped too, until the host restarts or binds the history module `
+                  + `again: ${msg}`,
+              );
             } else {
+              // Any other failure, and a 404 in a pass whose /stats answered
+              // with something that isn't stats, which doesn't show the index
+              // is made: re-queued, for a later pass.
               for (const id of removed) this.removedIds.add(id);
               for (const id of blanked) if (!this.removedIds.has(id)) this.editedIds.add(id);
-              phaseError = msg;
-              this.log(`[history/semantic] delete failed, ${removed.length} removal(s) re-queued: ${msg}`);
+              phaseErrors.push(msg);
+              this.warn(`delete failed, ${what} re-queued: ${msg}`);
             }
           }
         }
@@ -395,8 +545,8 @@ export class SemanticIndexer {
         } catch (e) {
           const msg = e instanceof Error ? e.message : String(e);
           for (const id of edited) if (!this.removedIds.has(id)) this.editedIds.add(id);
-          phaseError = msg;
-          this.log(`[history/semantic] edit re-upsert failed, ${edited.length} edit(s) re-queued: ${msg}`);
+          phaseErrors.push(msg);
+          this.warn(`edit re-upsert failed, ${edited.length} edit(s) re-queued: ${msg}`);
         }
         this.pendingChanged();
       }
@@ -458,16 +608,23 @@ export class SemanticIndexer {
         fromMs = lastMs;
       }
       await flush();
-      this.consecutiveFailures = 0; this.lastError = phaseError; this.lastSyncAt = Date.now();
+      if (notStats && report.more) throw notStats;
+      this.consecutiveFailures = 0; this.lastError = named(notStats?.message ?? null, ...phaseErrors); this.lastSyncAt = Date.now();
       return report;
     } catch (e) {
       this.consecutiveFailures++;
       const delay = Math.min(15 * 60_000, 5_000 * 2 ** Math.min(8, this.consecutiveFailures - 1));
       this.backoffUntil = Date.now() + delay;
-      this.lastError = e instanceof Error ? e.message : String(e);
-      this.log(`[history/semantic] sync failed (${this.consecutiveFailures}×, retry in ${Math.round(delay / 1000)}s): ${this.lastError}`);
+      const failure = e instanceof Error ? e.message : String(e);
+      this.lastError = named(failure, notStats?.message ?? null, ...phaseErrors);
+      this.warn(`sync failed (${this.consecutiveFailures}×, retry in ${Math.round(delay / 1000)}s): ${failure}`);
       report.more = true;
       return report;
     }
   }
+}
+
+/** Each failure a sync pass met, once, in the order given, for its lastError: null if none. */
+function named(...failures: (string | null)[]): string | null {
+  return [...new Set(failures.filter((f): f is string => f !== null))].join('; ') || null;
 }

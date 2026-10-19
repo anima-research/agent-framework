@@ -210,6 +210,25 @@ describe('HistoryModule UX: wholeWord', () => {
   });
 });
 
+describe('HistoryModule UX: snippets', () => {
+  it('keep up to 80 units each side of a match, one fewer where the 80th would split a surrogate pair', async () => {
+    // One code point, two UTF-16 units. With the "x" first, 80 units before the match start on the second half of
+    // a pair, and with the "z" after it, 80 units after the match end on the first half of one: each end moves in.
+    const grin = '\u{1F600}';
+    const before = `x${grin.repeat(100)}y`;
+    const { mod } = stub([
+      mk({ id: 's1', ms: min(1), text: `${before}needlez${grin.repeat(100)}` }),
+      // Here the message ends within 80 units of the match, so the snippet runs to its end and only its start moves.
+      mk({ id: 's2', ms: min(2), text: `${before}needlez` }),
+    ]);
+    const snippets = async (input: Record<string, unknown>) =>
+      data(await call(mod, 'search', input)).matches.map((m: any) => m.snippet);
+    const expected = [`…${grin.repeat(39)}yneedlez${grin.repeat(39)}…`, `…${grin.repeat(39)}yneedlez`];
+    assert.deepEqual(await snippets({ query: 'needle' }), expected);
+    assert.deepEqual(await snippets({ query: 'needle', regex: true }), expected);
+  });
+});
+
 describe('HistoryModule UX: order + scannedThrough', () => {
   it('order:newest scans the most recent maxScan and returns newest-first, with a to: resume point', async () => {
     const { mod } = stub(fixture);
@@ -291,8 +310,8 @@ describe('HistoryModule UX: extract aroundId', () => {
 
   it('errors cleanly: unknown id, anchor outside an explicit channel, mixing with from/to or author', async () => {
     const { mod } = stub(conv);
-    assert.match((await call(mod, 'extract', { aroundId: 'nope' })).error!, /No message/);
-    assert.match((await call(mod, 'extract', { aroundId: 'c11', channelId: 'other' })).error!, /not in channel/);
+    assert.match((await call(mod, 'extract', { aroundId: 'nope' })).error!, /no message in your history has the id "nope"/);
+    assert.match((await call(mod, 'extract', { aroundId: 'c11', channelId: 'other' })).error!, /isn't in channel "other" \(it's in "diary"\)/);
     assert.equal((await call(mod, 'extract', { aroundId: 'c11', from: '2026-09-20T00:00:00Z' })).success, false);
     assert.equal((await call(mod, 'extract', { aroundId: 'c11', author: 'antra' })).success, false);
     assert.equal((await call(mod, 'extract', { before: 3 })).success, false);
@@ -352,5 +371,87 @@ describe('HistoryModule UX: real-store ordering (catch-up backfill)', () => {
     const c = data(await call(mod, 'extract', { channelId: 'diary', limit: 3 }));
     assert.equal(c.matchedCount, 7);
     assert.equal(c.hasMore, true);
+  });
+});
+
+describe('HistoryModule UX: a case-insensitive match\'s snippet', () => {
+  // `İ` (U+0130) is the one character whose lower case is longer (two UTF-16
+  // units: `i` and a combining dot), so each one before a match moves the
+  // match's index in the lowered text one unit past its index in the text.
+  it('stays on its match when İ comes before it', async () => {
+    const text = `${'İ'.repeat(100)} the needle is here`;
+    const { mod } = stub([mk({ id: 'i1', ms: min(1), text })]);
+    const d = data(await call(mod, 'search', { query: 'needle' }));
+    assert.equal(d.matches.length, 1);
+    assert.equal(d.matches[0].snippet, `…${text.slice(105 - 80)}`);
+  });
+
+  it('stays on its match when the search is case-sensitive, which lowers nothing', async () => {
+    const text = `${'İ'.repeat(100)} the Needle is here`;
+    const { mod } = stub([mk({ id: 'i5', ms: min(1), text })]);
+    const d = data(await call(mod, 'search', { query: 'Needle', caseSensitive: true }));
+    assert.equal(d.matches.length, 1);
+    assert.equal(d.matches[0].snippet, `…${text.slice(105 - 80)}`);
+  });
+
+  it('stays on its match with wholeWord', async () => {
+    const text = `${'İ'.repeat(100)} the needle is here`;
+    const { mod } = stub([mk({ id: 'i2', ms: min(1), text })]);
+    const d = data(await call(mod, 'search', { query: 'needle', wholeWord: true }));
+    assert.equal(d.matches.length, 1);
+    assert.equal(d.matches[0].snippet, `…${text.slice(105 - 80)}`);
+  });
+
+  it('spans the match in the text when the query holds an İ', async () => {
+    const text = `${'x'.repeat(200)} İstanbul ${'y'.repeat(200)}`;
+    const { mod } = stub([mk({ id: 'i3', ms: min(1), text })]);
+    const d = data(await call(mod, 'search', { query: 'İstanbul' }));
+    assert.equal(d.matches.length, 1);
+    assert.equal(d.matches[0].snippet, `…${'x'.repeat(79)} İstanbul ${'y'.repeat(79)}…`);
+  });
+
+  // `İ` lowers to `i` and then U+0307, a combining dot, so a match can start
+  // or end inside its lower case. The snippet then takes in the whole `İ`.
+  it('takes in the whole İ when the match starts inside its lower case', async () => {
+    const text = `${'a'.repeat(100)}İ${'b'.repeat(100)}`;
+    const { mod } = stub([mk({ id: 'i4', ms: min(1), text })]);
+    const d = data(await call(mod, 'search', { query: '\u0307' }));
+    assert.equal(d.matches.length, 1);
+    assert.equal(d.matches[0].snippet, `…${'a'.repeat(80)}İ${'b'.repeat(80)}…`);
+  });
+
+  it('takes in the whole İ when the match starts before it and ends inside its lower case, after earlier İs', async () => {
+    const text = `${'İ'.repeat(5)}${'a'.repeat(100)}İ${'b'.repeat(100)}`;
+    const { mod } = stub([mk({ id: 'i6', ms: min(1), text })]);
+    const d = data(await call(mod, 'search', { query: 'ai' }));
+    assert.equal(d.matches.length, 1);
+    assert.equal(d.matches[0].snippet, `…${'a'.repeat(81)}İ${'b'.repeat(80)}…`);
+  });
+
+  it('takes in both İs when the match starts inside one and ends inside the next', async () => {
+    const text = `${'a'.repeat(100)}İİ${'b'.repeat(100)}`;
+    const { mod } = stub([mk({ id: 'i7', ms: min(1), text })]);
+    const d = data(await call(mod, 'search', { query: '\u0307i' }));
+    assert.equal(d.matches.length, 1);
+    assert.equal(d.matches[0].snippet, `…${'a'.repeat(80)}İİ${'b'.repeat(80)}…`);
+  });
+
+  it('stays on its match with characters outside the BMP before it', async () => {
+    // Each emoji is two UTF-16 units, and lowers to itself.
+    const text = `${'😀'.repeat(50)}${'x'.repeat(100)}İ the needle is here`;
+    const { mod } = stub([mk({ id: 'i8', ms: min(1), text })]);
+    const d = data(await call(mod, 'search', { query: 'needle' }));
+    assert.equal(d.matches.length, 1);
+    assert.equal(d.matches[0].snippet, `…${'x'.repeat(74)}İ the needle is here`);
+  });
+
+  it('passes over a message with an İ that holds no match', async () => {
+    const { mod } = stub([
+      mk({ id: 'i9', ms: min(1), text: 'İstanbul trip' }),
+      mk({ id: 'i10', ms: min(2), text: 'the needle is here' }),
+    ]);
+    const d = data(await call(mod, 'search', { query: 'needle' }));
+    assert.equal(d.matches.length, 1);
+    assert.equal(d.matches[0].snippet, 'the needle is here');
   });
 });

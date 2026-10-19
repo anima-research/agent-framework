@@ -64,12 +64,32 @@ Chronicle's audit history.
   model: 'claude-opus-4-20250514',
   systemPrompt: '...',
   strategy: new AutobiographicalStrategy({ recentWindowTokens: 30000 }),
-  allowedTools: ['search', 'read', 'write'],   // or 'all'
+  allowedTools: ['search--query', 'utils', 'files--archive'], // or 'all'
   triggerSources: ['discord'],                   // or 'all'
   maxTokens: 8192,
   maxStreamTokens: 150_000,  // input token budget before stream restart
 }
 ```
+
+`allowedTools` is enforced at dispatch for registered agents. Omission or
+`'all'` permits all tools; an explicit list matches exact names, including
+`module--utility` names. Utilities aren't tools of their own: an agent's model
+and its scripts are offered them only through `utils`, whose `run` checks the
+utility's own name. An agent that should use a utility lists both `utils` and
+`module--utility`. The name alone passes the dispatch check for any call by
+that name, whether the host makes it with `executeToolCall` on the agent's
+behalf or the model or a script makes it without being offered it. The slot
+is hidden when the agent can use no registered utility. If utilities exist
+but none are permitted, `list` returns a failed `ToolResult` with the registered
+and permitted counts and migration advice, and a list containing `utils`
+logs one warning per Agent instance after registration.
+An empty registry still returns a successful empty list.
+
+Trusted module calls are exempt from agent allowlists. Genuinely unidentified
+public callers, including unknown legacy caller names, remain unrestricted.
+Framework-created ephemeral and conversation identities fail closed while
+unregistered. Hosts using `createEphemeralAgent` must register and run the
+returned agent through `runEphemeralToCompletion` for tool authority.
 
 **Inference modes:**
 - **Streaming** (default in framework): `startStreamWithInjections()` returns a `YieldingStream` that emits tokens, tool calls, and completion events. The framework drives the stream, dispatches tools, and resumes automatically.
@@ -161,15 +181,24 @@ agent-framework-recover \
 
 The specified Discord message is the last message the agent will still see;
 everything after it is left on the old branch. The command scans in bounded
-windows, never compiles message content, activates
-the new Chronicle branch, and writes only Discord `{serverId, channelId,
-messageId}` metadata to
-`<store>/recovery/discord-awareness-outbox.json`. When the host and that
-agent's `discord-mcpl` bot reconnect, each addressable discarded message is
-marked with 💤. Delivery state is recorded per message: retryable failures
-remain queued, permanent deleted/inaccessible-message failures remain in the
-audit ledger without blocking later markers. Portal and other non-Discord
-records are ignored.
+windows, never compiles message content, and activates the new Chronicle
+branch. By default the recovery is local to the resident: nothing is posted to
+Discord. To let the people involved see that the agent no longer has their
+messages, choose awareness marks explicitly with `--marks addressed` (removed
+messages that mentioned or replied to the bot, and DMs) or `--marks all`
+(every removed Discord message). The output counts what will be marked and
+what stays unmarked, and `--dry-run` shows exactly which addresses each choice
+covers. Only `{serverId, channelId, messageId}` metadata is written, to the
+awareness ledger, `<store>/recovery/discord-awareness-outbox.json`, and the
+marks are delivered when the host and that agent's `discord-mcpl` bot next
+connect (see
+[Live surgery and Discord awareness marks](#live-surgery-and-discord-awareness-marks)).
+If the branch is made but the marks can't be recorded, the output's `markers`
+says so and the branch stands. The live controls described below list, cancel
+and retract marks; with the host stopped there are none, so a chosen batch is
+stopped by starting the host and cancelling it, and a few of its marks may go
+out first.
+Portal and other non-Discord records are ignored.
 
 When the safe point is an assistant/tool-side record rather than a Discord
 message, use its exact ContextManager message ID:
@@ -202,7 +231,7 @@ agent-framework-recover \
 `--suppress-range <first>..<last>` suppresses the inclusive context interval
 between two Discord messages, including intervening agent/tool entries. These
 removals exist only on the recovery branch; the source branch remains intact.
-Suppressed Discord messages are queued for the same 💤 awareness marker.
+Suppressed Discord messages follow the same `--marks` choice.
 Selections that split a sharded body group or a tool-use/tool-result exchange
 are rejected. The suppression plan is journaled before the branch switch; if
 the recovery process is interrupted between interval removals, framework
@@ -212,19 +241,7 @@ For old stores whose messages lack `metadata.serverId`, supply
 normal agent host must be stopped while this command has the Chronicle store
 open.
 
-The marker sidecar is a retained operation ledger, not a delete-on-success
-queue. Switching back to the source branch queues removal of the bot's marker;
-returning to the recovery branch queues it again. Initial MCPL events remain
-buffered until the ledger has been reconciled. Startup, reconnect, runtime
-list-change, and online undo use one framework-global generation: every MCPL
-data plane waits while all control planes remain live for registration and
-marker service. Awareness marker calls also have a mandatory deadline that is
-independent of `requestTimeoutMs` (including when that value is `0`); configure
-it with `discordAwarenessDeadlineMs` (default 10000ms, clamped to 50..60000ms).
-Configure the online marker with `discordAwarenessEmoji`; the offline CLI
-accepts `--emoji`.
-
-For stdio MCPL children, the framework defaults `DISCORD_SUPPRESSED_REACTIONS_BASELINE` to the reactions it places: its refusal markers, the Discord adapter's default awareness marker, the configured awareness marker, and every retained outbox emoji. This covers later removals and replays after a configuration change. Suppression is by emoji, so members' own reactions with those emoji stop reaching the agent too. The default is derived at each spawn of a child (its first connect, each automatic reconnect, a restart), so the next child spawned gets the markers retained since the last spawn. When the awareness ledger exists but can't be read, a runtime connect reads it first and refuses before anything is registered or spawned (a startup connect, whose routing is staged beforehand, before anything spawns), and a restart refuses before it stops the running child. An automatic reconnect of a child that takes the default fails and retries rather than spawn it without the default. A value with tokens in the server's env (case-insensitive on Windows), or one intentionally inherited with `inheritEnv: true`, takes precedence, and the framework logs that it replaces the default. A value with no tokens, as discord-mcpl's parser reads them, counts as unset, since the adapter would read it as suppression off. The parser splits on commas and keeps a token only when its normalizer leaves something of it, after stripping U+FE0F, trimming, and stripping one leading and one trailing colon: so a blank value, commas alone, `:`, `::` or a lone U+FE0F (say from `${A},${B}` or `:${NAME}:` with the variables empty) has no tokens. The adapter's filters file and legacy operator env still take precedence over this variable, and they are where an operator turns suppression off.
+For stdio MCPL children, the framework defaults `DISCORD_SUPPRESSED_REACTIONS_BASELINE` to the reactions it places: its refusal markers, the Discord adapter's default awareness marker, the configured awareness marker, and every retained outbox emoji. This covers later removals and replays after a configuration change. Suppression is by emoji, so members' own reactions with those emoji stop reaching the agent too. The default is derived at each spawn of a child (its first connect, each automatic reconnect, a restart), so the next child spawned gets the markers retained since the last spawn. The ledger is read once and held, and read from its file again only after a write to it failed. When it can't be read, a runtime connect of a child that takes the default refuses before anything is registered or spawned (a startup connect, whose routing is staged beforehand, before anything spawns), and a restart of one refuses before it stops the running child; a child with a baseline of its own, and a WebSocket server, connect and restart whatever the ledger's state. An automatic reconnect of a child that takes the default fails and retries rather than spawn it without the default. A value with tokens in the server's env (case-insensitive on Windows), or one intentionally inherited with `inheritEnv: true`, takes precedence, and the framework logs that it replaces the default. A value with no tokens, as discord-mcpl's parser reads them, counts as unset, since the adapter would read it as suppression off. The parser splits on commas and keeps a token only when its normalizer leaves something of it, after stripping U+FE0F, trimming, and stripping one leading and one trailing colon: so a blank value, commas alone, `:`, `::` or a lone U+FE0F (say from `${A},${B}` or `:${NAME}:` with the variables empty) has no tokens. The adapter's filters file and legacy operator env still take precedence over this variable, and they are where an operator turns suppression off.
 
 `framework.getPlacedReactionBaseline()` returns a fresh snapshot of that default for other embeddings, including separately managed WebSocket adapters. It returns suppression tokens, with a custom emoji as its bare ID, not marker payloads for adding, removing or replaying a reaction. An unreadable awareness ledger throws instead of producing a partial snapshot. Hosts that previously supplied a refusal-only default must stop supplying it to adopt this framework-derived default; an explicit operator choice should remain intact.
 
@@ -255,6 +272,17 @@ defaults to `mcpl--<serverId>`: server `search` with no `toolPrefix` offers
 `mcpl--search--query`, and with `toolPrefix: 'search'` it offers
 `search--query`.
 
+No two servers' prefixes may meet, since their servers could then give one
+tool name. Two prefixes meet when one is the other's followed by `-`, or
+begins with the other's followed by `--`: server `foo` listing `bar--echo` and
+server `foo--bar` listing `echo` would both give `foo--bar--echo`. `create()`
+refuses such a pair, and so do a runtime connect and a restart (before it
+disconnects anything), naming both servers and the rule. `foo` beside
+`foo-bar` or `foobar` is fine. A server that lists one tool more than once has
+its first listing offered to the model and the rest left out, and each tool
+refresh that finds it raises an `mcpl-tool-duplicate` ops alert naming the
+tools. Its webhook post goes out at most once per server in 15 minutes.
+
 These settings take RFC-007 §6.2 patterns (`*` matches any run of characters)
 over that full model-facing name, so they need the prefix:
 
@@ -269,6 +297,72 @@ A pattern that matches no tool is reported once, as a console line and an
 (`search--*` under the default prefix), the report suggests the prefixed form.
 A pattern that could name a server's tools is not judged until that server
 has listed them, so late connects and reconnects don't cause early reports.
+
+#### Modern MCP servers (2026-07-28)
+
+The same `mcplServers` list also takes servers that speak modern MCP
+(revision `2026-07-28`), reached through the official SDK client. The
+configuration chooses the family, and nothing is probed:
+
+| Configuration | Family | Transport |
+|---|---|---|
+| `url: 'ws://…'` / `'wss://…'` | MCPL (MCP `2024-11-05`) | WebSocket |
+| `url: 'http://…'` / `'https://…'` | modern MCP | Streamable HTTP (`token` / `accessProvider` as bearer) |
+| `command` | MCPL | stdio |
+| `command` + `protocol: 'modern'` | modern MCP | stdio |
+
+```typescript
+{
+  mcplServers: [
+    { id: 'docs', url: 'https://mcp.example.com/mcp', accessProvider: getToken },
+    { id: 'search', command: 'search-mcp', protocol: 'modern', reconnect: true },
+  ],
+}
+```
+
+A configuration with both `command` and `url` needs `transport` to say which
+one is used; without it, it is refused rather than silently ignoring one.
+
+A modern server's tools get the same prefix, `enabledTools`/`disabledTools`,
+class overrides and dispatch as an MCPL server's, and `listMcplServers()`
+shows its `family`, `protocolVersion` and `transport`. Its config differs in
+three ways:
+- It has no MCPL surface (grant, push, channels, inference requests, feature
+  sets). A setting that asks for that surface can't apply, so it is a
+  configuration error: `allowHostCommands: true`, an `enabledCapabilities`
+  pattern that matches a capability denied by default, `channelSubscription:
+  'auto'` or a non-empty list, a scope's non-empty `whitelist`, a
+  `toolLifecycle` `observe` or `inputs` block, and a
+  `toolLifecycle.maxInputBytes` or an `autofetch` bound above its default.
+  A setting
+  that only takes something away, or repeats a default, is already
+  satisfied, so it is accepted: `enabledFeatureSets` and the rest of
+  `enabledCapabilities`, which are allow-lists, `disabledFeatureSets`,
+  `disabledCapabilities`, a scope's `blacklist`, `channelSubscription:
+  'manual'`, a `toolLifecycle.maxInputBytes` or an `autofetch` bound at or
+  below its default, and `shouldTriggerInference`.
+  So a host that puts a deny-list on every server it deploys can deploy a
+  modern one.
+- `requestTimeoutMs` is one deadline per tool call and must be 1 to 2^31−1;
+  0 is refused, where MCPL reads it as no watchdog.
+- Over stdio it takes no credential: `token` or `accessProvider` on one is
+  refused.
+
+At the deadline, cancellation is requested for a leg still in flight;
+between the rounds of an `input_required` continuation nothing is in flight
+to cancel. Either way the outcome is reported as unknown (`no-response`),
+and the call is never retried. The protocol has no cancel for a paused call,
+so whatever the server holds for it, beyond the `requestState` it gave this
+client, stays until the server lets it go. A call that ends for any other
+reason after the server asked for another round, before its final answer, is
+reported the same way, since the server may already have acted. An MCPL
+server that refuses `2024-11-05` with `-32022` fails with
+`McplProtocolVersionError`, and is not retried. The error names the
+revisions the server says it supports ("none listed" for an empty list), or its error text when it sends no list,
+and when the list includes `2026-07-28` it says to configure the server with
+`protocol: 'modern'` (stdio) or reach it over http(s).
+
+Server and transport text the framework records has the server's configured credentials replaced, in both engines. That covers connection traces, console lines, stderr traces, ops alerts, and a tool call's failure as its caller, the model and the `tool:failed` trace get it. The credentials are those the configuration holds and those its dials sent: from the url as each dial sends it (a WebSocket dial sets the token in the query, which writes the whole query again, form-encoded, and an access provider's token can be in it), credential-like path segments and query names, credential-shaped or credential-named query values, and a WebSocket url's userinfo, in their encoded and decoded forms, replaced wherever they occur; every non-empty query parameter as its whole `name=value`, where no letter or digit adjoins it; the static `token`, and each token an access provider handed a dial, the newest sixteen, raw and url-encoded; and a stdio server's `env` values whose names have a part ending in a credential word, such as `GITHUB_TOKEN`, `PGPASSWORD` or `SESSION_COOKIE`, raw and url-encoded. A stdio server's command-line arguments aren't derived. Standalone strings shorter than eight characters stay unchanged because they may be ordinary words; short query values are still removed with their parameter names. Treat a submitted configuration as immutable while the server uses it: apply changes with `restartMcplServer(id, newConfig)`. Secrets neither the configuration holds nor a dial sent remain outside this filtering. JSON-RPC tool answers, and the error a host's own connect raises, pass through as sent.
 
 #### Feature sets
 
@@ -299,7 +393,10 @@ some version was read (or history is unknown). `initial: true` on a create lets
 the host know the subject's history is complete, so a create → edit → delete
 that nobody read leaves no trace. `deferred: true` (push only) holds a batch of
 notices outside context and asks the server for the content with `push/render`
-when a turn is assembled.
+when a turn is assembled. Each render describes what changed since the one
+before it, so neither a later render nor a notice replaces an earlier render
+the model hasn't read: the newer render lands after it, and a retraction or a
+later plain occurrence withdraws the unread renders, newest first.
 
 Plain content stays in context and is delivered on arrival through the ordinary
 channel/push path; the host only remembers where it landed. "Unread" means:
@@ -333,6 +430,10 @@ framework.abortInference('assistant', 'user requested stop');
 
 The non-streaming path uses `AbortSignal` forwarded to `membrane.stream()`, which returns an `AbortedResponse` with partial content. The streaming path cancels the `YieldingStream` directly.
 
+A turn whose stream is cancelled this way, or by `agent.cancelStream()`, ends as a stop, whether the stream reports the cancel as `aborted`, as an `error`, or by just closing: one `inference:aborted` carrying the caller's reason (`user` when none was given), a `[turn-interrupted]` note in the agent's context, and never `inference:exhausted`, which is for failed inferences. A stream that membrane aborts on its own, at a deadline or on an error (reason `timeout` or `error`), is a failed inference. `stop()` and an operator's quiesce abandon end a turn as a stop too, with their own reasons, `shutdown` and `quiesce_abandoned`, and write no note. A stopped stream still writes its inference-log row, with `success: false`.
+
+A caller's stop and an operator's quiesce abandon also reach a turn that has no live stream: one running its modules' `gatherContext`, its MCPL hooks or its compile, one waiting to retry a failed inference or compile (`abortInference()` and an operator's abandon end the wait, and a stop through `Agent.cancelStream()` waits for it to run out), and one whose tool-result guard is waiting to retry after a refusal, which holds only the round's finished stream. The turn ends at its next check, before it sends anything more, as a stop on a live stream ends it, and a turn whose compile fails after the stop ends at the failure, before a provider hold, the error policy's retry or `inference:exhausted`. A caller's stop leaves the note saying the turn was stopped before it sent anything or before it finished, and an operator's abandon leaves none. `abortInference()` returns `true` for such a turn. In the guard's wait, `stop()` ends the turn as a stop with reason `shutdown`, and an operator's abandon ends it as the abandon, even when a caller's stop came first; with both, it ends as `stop()`'s. `stop()` drops a turn in its hooks, its compile or a wait to retry before it sends anything, as before, and drops one whose compile fails while it runs, once a caller's stop has reached it, rather than ending it as that stop. While the failure of a turn's stream is reported (`inference:failed`), the agent no longer holds that stream, so `abortInference()` from a listener reports `false`. A failure to build a turn's request is reported while the turn's check is still ahead, so there `abortInference()` reports `true`, and the turn ends at that check. A stop made where no check of a turn is ahead stops nothing, and doesn't end the agent's next turn: while the agent is idle, while a turn finishes its last delivery, while a budget restart or a non-streaming turn's tool results wait to start the turn's next call, and while a provider-capacity hold or a provider's stated wait has parked a turn until the hold ends.
+
 ## API Server
 
 WebSocket server for external clients (UIs, scripts, other agents).
@@ -344,7 +445,7 @@ await server.start();
 
 **Commands:** `message.send`, `message.list`, `inference.request`, `inference.abort`, `branch.*`, `agent.*`, `module.*`, `store.*`, `inference.tail/inspect/search`, `events.*`, `host.quiesce/resume/status/maintenanceTick`, `host.providerWaits/releaseProviderWait`
 
-Also available as an MCP server via the `agent-framework-mcp` binary.
+Also available as an MCP server via the `agent-framework-mcp` binary (`npx -p @animalabs/agent-framework agent-framework-mcp` without installing it). It is a client of this API's WebSocket server, at `AGENT_FRAMEWORK_WS_URL` (default `ws://localhost:8765/ws`), and offers a subset of these commands as tools; its `tools/list` names them.
 
 ### Host quiesce / maintenance mode
 
@@ -355,7 +456,7 @@ persists across restarts; `resume` gates on a fresh per-agent feasibility
 preview of the current runtime settings (`force` overrides).
 
 ```typescript
-await framework.quiesce({ reason: 'refold', timeoutMs: 120_000, abandon: false });
+await framework.quiesce({ reason: 'refold', timeoutMs: 120_000, abandon: false });  // throws QuiesceBlockedError if the deferred writes can't reach disk
 await framework.maintenanceTick();   // drain quarantine / advance merges
 await framework.resume();            // throws ResumeBlockedError if the layout won't compile
 ```
@@ -369,6 +470,158 @@ stated wait with `release-provider-wait` (`agentName`, optional `model`), as
 `host.providerWaits` lists the waits that bind. The HTTP host verbs accept an
 optional shared secret (`ApiServerConfig.adminToken`, sent as `x-admin-token`)
 for deployments that front the port with a proxy.
+
+### Live surgery and Discord awareness marks
+
+`rollbackToMessage(agent, { messageId })` forks the agent's context at a
+message and switches to the fork; `suppressMessages(agent, { messageIds })`
+forks at the head and removes the chosen messages on the fork. The source
+branch stays intact either way. Removing Discord messages from an agent's
+context is local to that agent unless the operator also chooses to mark them:
+
+```typescript
+const preview = framework.previewSurgeryMarks('cairn', { rollbackTo: messageId });
+// preview.scopes.addressed / .all: count, per-channel counts and refs
+const result = await framework.rollbackToMessage('cairn', {
+  messageId,
+  marks: { scope: 'addressed', refs: preview.scopes.addressed.refs },
+});
+// result.markers: { status: 'none' | 'queued' | 'not-scheduled', ... }
+```
+
+- **`marks`** is `'none'` (the default), or `{ scope: 'addressed' | 'all', refs? }`.
+  `addressed` covers messages tagged `chat:addressed` (mentions, replies to
+  the bot, DMs). Passing a preview's `refs` binds the choice to exactly that
+  set: messages that arrive before the surgery applies are removed locally but
+  never marked. Any other value is refused (`invalid`), never guessed. The
+  choice is recorded in the operator log.
+- **The surgery returns once marks are scheduled**, never after Discord has
+  accepted them. `result.markers` says whether they were scheduled (`queued`
+  with a count and batch id), not chosen or not in scope (`none`), or not to
+  be delivered because recording the batch as active failed after the body
+  change (`not-scheduled`, whose `error` says why, and whether the batch was
+  retired or stays prepared for a start to retire). Every receipt also counts the removed messages left
+  unmarked. Marker bookkeeping never fails or undoes an applied rollback or
+  suppression; a batch that can't be recorded before the body change stops
+  the surgery before anything changes (`failed`).
+- **Delivery runs in the background** and never holds MCPL traffic or turns.
+  MCPL's own hold stays: a connection whose policy exchange is in flight,
+  after a connect or a reconnect, keeps both planes closed until the
+  exchange settles, since its traffic is admitted against the grant the
+  exchange establishes. A route that is not connected keeps its work queued
+  until it connects.
+  Each reaction call has a mandatory deadline independent of
+  `requestTimeoutMs` (including `0`): `discordAwarenessDeadlineMs` (default
+  10000ms, clamped to 50..60000ms). The emoji is `discordAwarenessEmoji`
+  (offline: `--emoji`). Nothing more is sent for a mark after three
+  unconfirmed attempts at it (Discord refused it, or no answer came and so
+  it may have landed, one left on the wire when the host stopped included;
+  an attempt refused before it left the host doesn't count), or after a
+  refusal no retry can change (the message, channel or emoji is gone, access
+  is missing, or the message takes no more reactions); a pass that gives up
+  on marks raises one `discord-awareness-delivery` ops alert, and so does a
+  start whose reconciliation gives up on any. A JSON-RPC error answer, which
+  may come after the server acted, counts as unanswered, unless it is such a
+  refusal. A mark whose request failed in a way a retry could change is sent
+  again by the next delivery pass: after a surgery, a retract, a start, a
+  connect or reconnect of its route, a tools-list change, or an operator's
+  sync, and a trigger that meets a pass already running has that pass try
+  it once more before it ends.
+- **Marks are one-shot.** Switching branches, a turn undo, a redo and
+  restarts never request a mark or a removal of their own: what goes out is what a surgery
+  (the marks chosen for it) or a retract recorded, and a start's delivery
+  sends what of that hasn't gone out. The ledger is a table with one entry
+  per reaction (route, channel, message and emoji): what the acts that still
+  stand want of it, whether Discord is owed a request for that, and what
+  Discord last answered. It is a JSON file outside Chronicle,
+  `<store>/recovery/discord-awareness-outbox.json` (or
+  `discordAwarenessOutboxPath`), so it survives rollbacks, branch deletion
+  and a killed process. Each request is written ahead before it leaves, and
+  the next one is chosen from the ledger as it is then, so a cancel takes
+  effect even while an earlier request is on the wire. A request written and
+  never answered is kept as one that may land, whatever Discord answers
+  later. Between opposite wishes for one reaction, the later act wins: a
+  surgery's marks carry the moment of its choice, even when activation comes
+  later, so a retract made in between prevails, and cancelling it revives
+  nothing. A write goes to a temporary file renamed over the ledger, synced
+  with its directory and that directory's parent, as the framework's own
+  recovery files are: one that fails leaves the ledger as it was, and a
+  directory that can't be synced after the rename raises the `recovery-sync`
+  ops alert while the write stands. A write that activates, completes or
+  retires a batch syncs the store first, so it never outlives the change it
+  certifies. A ledger that can't be read, or holds a version this build
+  doesn't read, stops a start. A running host holds the ledger in memory and
+  reads the file again only after a write failed; while it then can't be
+  read, nothing is sent, the delivery alert says so, and the controls
+  refuse.
+- **A start never activates a surgery's marks.** A batch an interrupted
+  surgery left prepared is retired at the next start, none of its marks
+  sent. One that had marks to apply raises a `discord-awareness-not-scheduled` ops alert that names the
+  surgery, its agent and its branches, and the redo that applies the marks:
+  run the surgery again from the source onto a new branch name, choosing
+  marks again, if the source still has every message the surgery removed (a
+  `hide` there, or the source's deletion, changes that). A batch doesn't say
+  which surgery made it, so the alert names an offline recovery beside a
+  rollback or a suppression. One with none to apply (none chosen, or its marks cancelled) is
+  only logged. An interrupted suppression's removals are still finished, at
+  the first start on its branch, and its batch is retired then. Until then
+  a start on any branch with that name would apply those removals there.
+- **Operator controls,** each that changes the ledger recorded in the
+  operator log (a list or a preview records nothing); once `stop()`
+  has begun, cancel and retract refuse, like every operator entry
+  point:
+  - `listDiscordAwareness()` lists batches and retract requests, each with
+    its reactions counted by state (`queued`, `sending`, `present`,
+    `absent`, `unknown`, `failed` or `untouched`) and how many may still land;
+  - `cancelDiscordAwareness(batch | retractRequest)` stops a batch's marks or
+    a retract's removals from being sent or sent again, and never removes or
+    undoes anything. Its receipt counts what it stopped before any request
+    went out (`cancelled`), what Discord last confirmed as the act wanted
+    (`confirmed`), and the act's reactions with a request on the wire or one
+    never answered, any of which may still land (`mayStillLand`);
+  - `retractDiscordAwareness(batch | 'all')` queues removal of this bot's
+    reaction, through each address's configured MCPL route, for every message
+    of the batch (or of every batch that isn't retired, whether prepared or
+    active, and every reaction the ledger holds), whatever was answered
+    before: removing an absent reaction does nothing. As the latest act on
+    those reactions, it replaces the adds owed there and any an earlier
+    choice would owe later (a prepared batch's activation); cancelling it
+    never revives them. Its receipt counts the reactions on which an add may
+    still land, on the wire or never answered (an unanswered removal can't
+    bring a mark back).
+
+  Both are async. A request the ledger won't carry out (an unknown batch or
+  retract request) is refused as `invalid`; a failure to read or write the
+  ledger is `failed`. A framework with neither `storePath` nor
+  `discordAwarenessOutboxPath` has no ledger: it refuses a marks choice as
+  `invalid`, and so do its controls.
+- **Over `host/command`** (servers granted `allowHostCommands`): an `undo` by
+  messages takes `marks: 'none' | 'addressed' | 'all'` (default `none`; any
+  other value is refused) and returns `markers`. It holds the store like
+  every surgery, so it is refused while any agent sharing the store is
+  mid-turn. `hide` and an `undo` by turns place no marks, and refuse a
+  `marks` choice other than `none`. The `marks` verb takes `action: 'list'
+  | 'cancel' | 'retract'` with a `target` (a batch id; for cancel also a
+  retract request id; for retract also `all`).
+
+The ledger is version 3. A version 2 ledger, agent-framework 0.22.x's at the
+same path, is rewritten as version 3 in place by its first write: at a start,
+or an offline recovery. Each of its batches keeps how many of its messages
+0.22.x's last attempt saw a mark added to (`legacyAdded` in the list), never
+as a claim about what is on Discord. The work 0.22.x had still to do is never
+sent, since nobody chose it: a batch it never activated is retired (a
+suppression whose body may be pending, once a start on its branch finishes
+the body), and pending adds and removals are dropped. A batch it activated
+stays active, its body taken as finished, as 0.22.x took it. The rewrite names
+each batch that had such work, with how many adds and removals, on stderr
+wherever it runs, and in a `discord-awareness-import-unsent` ops alert at the
+host's start that made it. A batch 0.22.x never activated placed no marks; a
+retract of a batch takes off the mark of its emoji from each of its messages,
+whichever batch placed it. 0.22.x reads only versions 1 and 2, and its start
+stops on a version 3 file: to go back to 0.22.x, move the file aside first,
+and 0.22.x then starts with no marks history. A version 1 ledger, which only
+an unreleased commit wrote, is refused until it is moved away, and its error
+says what that gives up.
 
 ## Observability
 
