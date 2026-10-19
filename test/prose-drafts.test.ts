@@ -340,17 +340,20 @@ async function harness(opts: {
       : [],
     /** One addressed message in #room starts a turn (or, with `request`, a
      *  direct inference request for just that resident); resolves when it settles. */
-    turn: async (responses: Array<ReturnType<typeof createMockResponse>>, agentName = 'scout', via: 'incoming' | 'request' | 'silent' = 'incoming') => {
+    turn: async (responses: Array<ReturnType<typeof createMockResponse>>, agentName = 'scout', via: 'incoming' | 'request' | 'silent' | 'private' = 'incoming') => {
       for (const r of responses) membrane.pushResponse(r);
       const before = membrane.calls.length;
       if (via === 'incoming') {
         h.command({ op: 'incoming', channelId: ROOM, messageId: `in-${++incoming}`, mode: 'addressed', text: `message ${incoming}` });
       } else {
         // 'silent': a control-plane wake whose plain prose stays private, as
-        // a silent heartbeat's does.
+        // a silent heartbeat's does. 'private': see below.
         (framework as unknown as { pendingRequests: unknown[] }).pendingRequests.push({
           agentName, reason: 'test', source: 'test', timestamp: Date.now(),
           ...(via === 'silent' ? { suppressProse: true } : {}),
+          // 'private': a turn opened from a private non-channel surface, as an
+          // operator's console message opens one.
+          ...(via === 'private' ? { nonChannelOrigin: true } : {}),
         });
       }
       await until(() => membrane.calls.length > before, 'turn start');
@@ -546,6 +549,27 @@ describe('held prose drafts, end to end', () => {
         'the refused round and the round after it stay private');
     } finally {
       await h.close();
+    }
+  });
+
+  it("a private non-channel turn's plain speech is never drafted, an explicit send's round included", async () => {
+    // A draft exists to be resent, and resending words written on a private
+    // surface is the step into a channel the turn's privacy keeps them from.
+    for (const proseRouting of ['locus', 'hybrid'] as const) {
+      const h = await harness({ agents: [{ name: 'scout', proseRouting }] });
+      try {
+        await h.turn([
+          createMockResponse([text('A reply on the private surface.'), explicitSend('s1')], 'tool_use'),
+          createMockResponse([text('And one after the send.')]),
+        ], 'scout', 'private');
+        assert.deepEqual(h.publishes().map((p) => p.text), ['an explicit note elsewhere'], `${proseRouting}: only the explicit send went out`);
+        assert.deepEqual(h.drafts().map((d) => d.text), [], `${proseRouting}: nothing is held as a draft`);
+        const receipt = h.texts().find((t) => t.startsWith('[delivered]')) ?? '';
+        assert.match(receipt, /2 plain-speech segment\(s\) kept private \(non-channel turn/, `${proseRouting}: ${receipt}`);
+        assert.doesNotMatch(receipt, /draft/, `${proseRouting}: ${receipt}`);
+      } finally {
+        await h.close();
+      }
     }
   });
 

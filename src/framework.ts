@@ -13894,7 +13894,14 @@ export class AgentFramework {
       routing.keptPrivate += segments.length;
       return;
     }
+    // A private non-channel turn's plain speech had no channel to go to,
+    // whatever the round sent, so it is counted as kept private and never
+    // drafted (suppressPrivateTurnProse).
     if (agent.proseRouting !== 'hybrid') {
+      if (routing.nonChannelOrigin) {
+        this.suppressPrivateTurnProse(routing, segments.length);
+        return;
+      }
       this.holdProseDrafts(agent, segments, 'explicit-send', round);
       return;
     }
@@ -13909,6 +13916,7 @@ export class AgentFramework {
     // re-bounce rule, unsentWords), not its routing syntax, and the
     // destination the resident wrote stays with it as a note.
     let privateCount = 0;
+    let surfaceCount = 0;
     const parts: Array<{ text: string; note?: string; inheritedRisk?: InheritedRisk }> = [];
     /** Latest bounces a bare `{{unsent}}` named: still the one draft of those words. */
     const kept: Draft[] = [];
@@ -13949,12 +13957,17 @@ export class AgentFramework {
           parts.push({ text: envelope });
         } else if (routing.hybridHold === 'private') {
           privateCount++;
+        } else if (routing.nonChannelOrigin && !routing.pin && routing.hybridHold === undefined) {
+          // Unprefixed speech of a private non-channel turn, with no target
+          // named, had no channel to go to: kept private, never drafted.
+          surfaceCount++;
         } else {
           parts.push({ text: envelope });
         }
       }
     }
     routing.keptPrivate += privateCount;
+    this.suppressPrivateTurnProse(routing, surfaceCount);
     this.holdProseDrafts(agent, parts, 'explicit-send', round);
     // The turn's receipt names them by their state at turn end; each was
     // named when it bounced.

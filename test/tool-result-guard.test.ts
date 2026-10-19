@@ -1413,6 +1413,26 @@ test('guard recovery keeps same-turn explicit-send suppression', async () => {
   } finally { await h.framework.stop(); }
 });
 
+test("guard recovery in a private turn keeps the silenced text private, and drafts none of it", async () => {
+  const h = await harness([[createMockResponse([
+    { type: 'tool_use', id: 'send', name: 'test--send_message', input: {} },
+    { type: 'tool_use', id: 'one', name: 'test--read', input: {} },
+  ], 'tool_use'), refused()], [createMockResponse([{ type: 'text', text: 'postscript' }])]], { toolResultGuard: true });
+  const routed = fakeRegistry(h.framework);
+  try {
+    // An operator's message, which names no channel, opens a private turn.
+    h.framework.pushEvent({ type: 'external-message', source: 'test', content: 'read', metadata: {} } as never);
+    await h.framework.runUntilIdle();
+    assert.equal(h.membrane.requests.length, 2);
+    assert.ok(!routed.some((text) => text.includes('postscript')), `postscript routed: ${JSON.stringify(routed)}`);
+    const texts = (h.framework.getAgent('assistant')!.getContextManager().getAllMessages() as Array<{ content: Array<{ type: string; text?: string }> }>)
+      .flatMap((m) => m.content).filter((b) => b.type === 'text').map((b) => b.text ?? '');
+    const receipt = texts.find((t) => t.startsWith('[delivered]')) ?? '';
+    assert.match(receipt, /1 plain-speech segment\(s\) kept private \(non-channel turn/, receipt);
+    assert.doesNotMatch(receipt, /draft/, receipt);
+  } finally { await h.framework.stop(); }
+});
+
 test('a failed audit append while settling an aborted batch does not block teardown', async () => {
   const h = await harness([[calls('one')], [answer()]], { toolResultGuard: true });
   const store = h.framework.getStore();
