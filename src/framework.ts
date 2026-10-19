@@ -4172,10 +4172,10 @@ export class AgentFramework {
    * that it is done with the agent: a run it has abandoned, to a timeout or
    * a cancel, may still be going, and goes on with its compression
    * withdrawn. A drain still working through its queue would pay for
-   * summaries no one reads. A call already out when the release lands runs
-   * to its answer, its retries inside membrane included, since the release
-   * is checked as each call starts. What the run stored stays in its
-   * namespace.
+   * summaries of a run that has ended, or that its caller has given up on.
+   * A call already out when the release lands runs to its answer, its
+   * retries inside membrane included, since the release is checked as each
+   * call starts. What the run stored stays in its namespace.
    */
   private ephemeralAuxiliaryMembraneFor(agentName: string, release: { released: boolean }): Membrane {
     return this.membraneAdmitting(async (run) => {
@@ -4729,6 +4729,11 @@ export class AgentFramework {
       } catch (error) {
         console.error(`[tool-result-guard] agent=${agent.name} storage retry failed during maintenance:`, error);
       }
+      // A manager the framework is done with takes no tick, since every call
+      // it would make is withdrawn. An ephemeral run that cleanup() released
+      // stays registered while it goes on, so its tool results are still
+      // stored (the flush above).
+      if (this.agentReleases.get(agent)?.released) return [];
       // Whatever throws while one agent's maintenance is prepared is that
       // agent's failure, reported for it alone, while the others run.
       const failedAgent = (error: unknown): Queued[] => {

@@ -64,6 +64,25 @@ class Quiet implements Module {
   async onProcess(_event: ProcessEvent, _state: ProcessState): Promise<EventResponse> { return {}; }
 }
 
+/** A tool, `held--wait`, whose call ends only when the test opens it, so a
+ *  run can be held in the middle of its work. */
+class Held implements Module {
+  readonly name = 'held';
+  calls = 0;
+  private opened!: () => void;
+  private readonly gate = new Promise<void>((resolve) => { this.opened = resolve; });
+  open(): void { this.opened(); }
+  async start(_ctx: ModuleContext): Promise<void> {}
+  async stop(): Promise<void> {}
+  getTools(): ToolDefinition[] { return [{ name: 'wait', description: 'Wait until let go.', inputSchema: { type: 'object', properties: {} } }]; }
+  async handleToolCall(): Promise<ToolResult> {
+    this.calls++;
+    await this.gate;
+    return { success: true, data: 'let go' };
+  }
+  async onProcess(_event: ProcessEvent, _state: ProcessState): Promise<EventResponse> { return {}; }
+}
+
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 async function until(check: () => boolean, ms = 5_000): Promise<void> {
   const end = Date.now() + ms;
@@ -84,11 +103,11 @@ function captureDrainErrors(): { lines: string[]; restore: () => void } {
   return { lines, restore: () => { console.error = original; } };
 }
 
-async function setup(prefix: string, membrane: CompressionMembrane, stopMs = 0) {
+async function setup(prefix: string, membrane: CompressionMembrane, stopMs = 0, more: { modules?: Module[]; maintenanceIntervalMs?: number } = {}) {
   const dir = mkdtempSync(join(tmpdir(), prefix));
   const framework = await AgentFramework.create({
     storePath: join(dir, 'store.chronicle'), membrane: membrane.asMembrane(), agents: [],
-    modules: [new Quiet(stopMs)], syncIntervalMs: 0, maintenanceIntervalMs: 0,
+    modules: [new Quiet(stopMs), ...(more.modules ?? [])], syncIntervalMs: 0, maintenanceIntervalMs: more.maintenanceIntervalMs ?? 0,
   });
   return { dir, framework };
 }
@@ -165,6 +184,64 @@ describe('a context manager the framework is done with makes no compression call
     } finally {
       errors.restore();
       await quiesce(membrane);
+      await framework.stop();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('once cleanup() has released it while its run is still going, which goes on to its end', { timeout: 60_000 }, async () => {
+    // As connectome-host does when a timeout or a cancel abandons a run:
+    // cleanup() comes while the run is held in a tool call. The maintenance
+    // pass runs throughout, and takes no tick for the released manager, so it
+    // logs no withdrawal either.
+    const membrane = new CompressionMembrane(100);
+    membrane.pushResponse(createMockResponse([{ type: 'tool_use', id: 'call_1', name: 'held--wait', input: {} }], 'tool_use'));
+    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Done.' }]));
+    const held = new Held();
+    const { dir, framework } = await setup('af-ephemeral-withdrawn-midrun-', membrane, 0, { modules: [held], maintenanceIntervalMs: 20 });
+    const errors = captureDrainErrors();
+    try {
+      const { agent, contextManager, cleanup } = await createDraining(framework);
+      addBacklog(contextManager, 30);
+      contextManager.addMessage('user', [{ type: 'text', text: 'Run once.' }]);
+      await until(() => membrane.compressions.length >= 1);
+      const run = framework.runEphemeralToCompletion(agent, contextManager);
+      framework.start();
+      await until(() => held.calls === 1);
+      cleanup();
+      const sent = membrane.compressions.length;
+      await sleep(800);
+      assert.equal(membrane.compressions.length, sent,
+        'no compression call reached the provider once cleanup() had released the manager, though its run was still going');
+      held.open();
+      const { speech } = await run;
+      assert.equal(speech, 'Done.', 'the run went on to its end');
+      assert.equal(membrane.compressions.length, sent, 'nor while the run went on to its end');
+      assert.deepEqual(errors.lines, [], 'the withdrawal stopped the drain without a log line');
+    } finally {
+      errors.restore();
+      held.open();
+      await quiesce(membrane);
+      await framework.stop();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("refuses a run after cleanup() in its own words, before a refusal that a retry could pass", { timeout: 60_000 }, async () => {
+    const membrane = new CompressionMembrane(100);
+    const { dir, framework } = await setup('af-ephemeral-released-first-', membrane);
+    try {
+      framework.start();
+      const { agent, contextManager, cleanup } = await createDraining(framework, 'retired');
+      cleanup();
+      await framework.quiesce({ reason: 'test window' });
+      await assert.rejects(framework.runEphemeralToCompletion(agent, contextManager),
+        /was released by cleanup\(\) and can't run/, 'while quiesced, the caller hears of the release, not of the quiescence');
+      await framework.resume();
+      await framework.stop();
+      await assert.rejects(framework.runEphemeralToCompletion(agent, contextManager),
+        /was released by cleanup\(\) and can't run/, 'once stopped, the caller hears of the release, not of the stop');
+    } finally {
       await framework.stop();
       rmSync(dir, { recursive: true, force: true });
     }
