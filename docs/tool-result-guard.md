@@ -64,10 +64,11 @@ wire cost (chars/4 plus a flat per-image cost) in `reserveForResponse`, so
 substituting them for the placeholders cannot push a restart's request past
 its budget.
 
-While a submitted batch is pending (or a recovery is running), streamed text
-and its `inference:tokens` trace events are held at one publication
+While a submitted batch is pending (or a recovery is running), the
+round's `inference:tokens` trace events are held at one publication
 boundary; they are released in order on a clean round and discarded on a
-guard refusal.
+guard refusal. The outgoing stream needs no hold: it carries only what
+delivery publishes, and a refused attempt publishes nothing.
 
 Normal successful rounds admit the preceding results to memory. This works
 for framework yielding streams (including ephemeral agents and context-budget
@@ -271,9 +272,9 @@ retroactive and does not rewrite results already accepted into memory.
 - **Token stats.** The context manager's token-stats cache is not
   write-through on edit, so a stats read taken while a batch was pending can
   keep pricing that message as the placeholder.
-- **Held stream text on abort.** Text held while a submitted batch is
-  pending is dropped (not previewed) if the stream aborts or errors before
-  the round settles.
+- **Held token traces on abort.** `inference:tokens` traces held while a
+  submitted batch is pending are dropped (not previewed) if the stream
+  aborts or errors before the round settles.
 - **Withheld originals in the workspace.** Every reader of the mount can read
   a withheld original's file, and nothing removes it; delete it as any
   workspace file.

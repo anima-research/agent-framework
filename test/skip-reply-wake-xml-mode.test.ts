@@ -2,7 +2,9 @@
  * skip_reply's refused wake in XML tool mode: without an EventGate, a round
  * that calls skip_reply with wake_in_seconds is refused and the turn goes on.
  * That round's prose stays private, and every other round's prose is
- * delivered as it would be without the refusal, in order.
+ * delivered as it would be without the refusal, in order. A skip_reply
+ * refused inside a round's code_execution script keeps its round private the
+ * same way.
  *
  * In XML tool mode, tool-calls events carry no roundContent, so no round is
  * routed live: the turn's prose is delivered at its end, from the turn-end
@@ -41,6 +43,9 @@ const echo = (id: string, text: string, ...more: string[]): Round => ({
   results: `<function_results>${[id, ...more].map(() => '<result><stdout>{"echoed":"x"}</stdout></result>').join('')}</function_results>`,
 });
 const refusedWake = (id: string, text: string, wake: unknown = 60): Round => ({ text, calls: [{ id, name: 'skip_reply', input: { reason: 'later', wake_in_seconds: wake } }], results: '<function_results><error>refused</error></function_results>' });
+/** A round whose one call is a foreground code_execution script. */
+const script = (id: string, text: string, code: string): Round => ({ text, calls: [{ id, name: 'code_execution', input: { code } }], results: '<function_results><result><stdout></stdout></result></function_results>' });
+const REFUSED_IN_SCRIPT = 'await skip_reply({"wake_in_seconds": 60})';
 
 class XmlStream implements YieldingStream {
   private events: StreamEvent[] = [];
@@ -118,8 +123,13 @@ class EchoModule implements Module {
   async onProcess(_event: ProcessEvent, _state: ProcessState): Promise<EventResponse> { return {}; }
 }
 
-/** One XML-mode turn, with no EventGate unless asked: what reached the channel, and whether each round's result was an error. */
-async function xmlTurn(rounds: Round[], finalText: string, thinking = false, gate = false) {
+/**
+ * One XML-mode turn, with no EventGate unless asked: what reached the channel,
+ * whether each round's result was an error, and which channel tools the
+ * registry handled. With scripts, code execution is on and skip_reply is a
+ * channel tool a script can call.
+ */
+async function xmlTurn(rounds: Round[], finalText: string, thinking = false, opts: { scripts?: boolean; gate?: boolean } = {}) {
   let stream: XmlStream | undefined;
   const membrane = {
     async complete(_r: NormalizedRequest): Promise<NormalizedResponse> { throw new Error('not used'); },
@@ -132,13 +142,21 @@ async function xmlTurn(rounds: Round[], finalText: string, thinking = false, gat
   const framework = await AgentFramework.create({
     storePath: join(dir, 'store'), membrane: membrane as unknown as import('@animalabs/membrane').Membrane,
     agents: [{ name: 'agent', model: 'test', systemPrompt: 'test' }], modules: [new EchoModule()],
-    ...(gate ? { gate: { configPath: join(dir, 'gate.json') } } : {}),
+    ...(opts.scripts ? { codeExecution: { enabled: true } } : {}),
+    ...(opts.gate ? { gate: { configPath: join(dir, 'gate.json') } } : {}),
   });
   const routed: string[] = [];
+  const registrySaw: string[] = [];
+  const channelTools = opts.scripts
+    ? [{ name: 'skip_reply', description: 'End your turn without sending anything.', inputSchema: { type: 'object' as const, properties: {} } }]
+    : [];
   (framework as unknown as { channelRegistry: unknown }).channelRegistry = new Proxy({
-    getChannelTools: () => [], resolveLocus: () => 'channel:test',
+    getChannelTools: () => channelTools, resolveLocus: () => 'channel:test',
     routeSpeech: async (_agent: string, text: string) => { routed.push(text); return { delivered: true, channelId: 'channel:test' }; },
-    handleChannelToolCall: async () => ({ success: true, endTurn: true, data: { skipped: true, note: 'Turn ended; nothing sent.' } }),
+    handleChannelToolCall: async (name: string) => {
+      registrySaw.push(name);
+      return { success: true, endTurn: true, data: { skipped: true, note: 'Turn ended; nothing sent.' } };
+    },
   }, { get: (target, prop: string) => prop in target ? target[prop as keyof typeof target] : () => undefined });
   try {
     const agent = framework.getAgent('agent')!;
@@ -146,7 +164,7 @@ async function xmlTurn(rounds: Round[], finalText: string, thinking = false, gat
       .startAgentStream(agent, { agentName: 'agent', reason: 'test', source: 'test', timestamp: Date.now() });
     await framework.runUntilIdle();
     const errors = (stream?.received ?? []).map((r) => (r[0] as { isError?: boolean } | undefined)?.isError === true);
-    return { routed, errors };
+    return { routed, errors, registrySaw };
   } finally {
     await framework.stop();
     rmSync(dir, { recursive: true, force: true });
@@ -210,7 +228,7 @@ describe('skip_reply refused in XML tool mode: its round stays private, and the 
   });
 
   it('with a gate, a wake_in_seconds that isn\'t a number of seconds is refused the same way', async () => {
-    const r = await xmlTurn([echo('e1', 'ONE'), refusedWake('w1', 'REFUSED_PRIVATE', 'soon')], '\nFINAL_REPLY', false, true);
+    const r = await xmlTurn([echo('e1', 'ONE'), refusedWake('w1', 'REFUSED_PRIVATE', 'soon')], '\nFINAL_REPLY', false, { gate: true });
     assert.deepEqual(r.errors, [false, true], 'the wake was refused and the turn went on');
     assert.deepEqual(r.routed, ['ONE', 'FINAL_REPLY']);
   });
@@ -219,5 +237,17 @@ describe('skip_reply refused in XML tool mode: its round stays private, and the 
     const r = await xmlTurn([echo('e1', 'ONE'), refusedWake('w1', ''), echo('e2', 'TWO')], '\nTHIRD');
     assert.deepEqual(r.errors, [false, true, false]);
     assert.deepEqual(r.routed, ['ONE', 'TWO', 'THIRD']);
+  });
+
+  it('a skip_reply refused inside a code_execution script keeps its round private too', async () => {
+    const r = await xmlTurn([script('ce1', 'SCRIPT_PRIVATE', REFUSED_IN_SCRIPT)], '\nFINAL_REPLY', false, { scripts: true });
+    assert.ok(!r.registrySaw.includes('skip_reply'), 'the host refused the call before the registry saw it');
+    assert.deepEqual(r.routed, ['FINAL_REPLY']);
+  });
+
+  it('after a script round whose skip_reply was refused, the next round is delivered', async () => {
+    const r = await xmlTurn([script('ce1', 'SCRIPT_PRIVATE', REFUSED_IN_SCRIPT), echo('e1', 'TWO')], '\nTHIRD', false, { scripts: true });
+    assert.ok(!r.registrySaw.includes('skip_reply'), 'the host refused the call before the registry saw it');
+    assert.deepEqual(r.routed, ['TWO', 'THIRD']);
   });
 });

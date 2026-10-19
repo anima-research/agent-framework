@@ -399,6 +399,10 @@ export interface InferenceRequest {
    *  all of them without materializing content, the turn has no cause left
    *  and does not run. */
   coalescingBatchSubjects?: string[];
+  /** Host-owned: this wake's sole cause is reading this deferred write, a
+   *  coalesced render placed in its agent's queue (wakeToRead). Once the
+   *  agent has read the write, or it was removed, the wake starts no turn. */
+  readsDeferredWrite?: string;
   agentName: string;
   reason: string;
   source: string;

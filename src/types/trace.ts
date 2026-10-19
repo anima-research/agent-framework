@@ -124,9 +124,15 @@ export type TraceEvent =
       blockType: 'text' | 'thinking' | 'tool_call' | 'tool_result';
       /** 0-indexed block position in the current assistant turn. */
       blockIndex: number;
-      /** The channel this stream shows typing in: the turn's locus as the
-       *  stream started (see inference:started), or in explicit mode the
-       *  channel the start's wake came from. */
+      /** The channel this stream shows typing in, the conversation the turn
+       *  is attending. Locus and hybrid mode: the turn's locus, which an
+       *  addressed re-pin or the agent's own `channel_open` can move between
+       *  rounds, so it can change within one stream; the indicator and these
+       *  traces follow it from the next round on, at the model's first
+       *  content in it or its retry after a refusal, and a tool result the
+       *  boundary reports carries the channel of the round it answers. In
+       *  hybrid mode a `>>>` envelope can send the text itself elsewhere.
+       *  Explicit mode: the channel the start's wake came from. */
       channelId?: string;
     })
   | (TraceEventBase & {
@@ -141,9 +147,15 @@ export type TraceEvent =
       phase: 'block_start' | 'block_complete';
       blockType: 'text' | 'thinking' | 'tool_call' | 'tool_result';
       blockIndex: number;
-      /** The channel this stream shows typing in: the turn's locus as the
-       *  stream started (see inference:started), or in explicit mode the
-       *  channel the start's wake came from. */
+      /** The channel this stream shows typing in, the conversation the turn
+       *  is attending. Locus and hybrid mode: the turn's locus, which an
+       *  addressed re-pin or the agent's own `channel_open` can move between
+       *  rounds, so it can change within one stream; the indicator and these
+       *  traces follow it from the next round on, at the model's first
+       *  content in it or its retry after a refusal, and a tool result the
+       *  boundary reports carries the channel of the round it answers. In
+       *  hybrid mode a `>>>` envelope can send the text itself elsewhere.
+       *  Explicit mode: the channel the start's wake came from. */
       channelId?: string;
     })
   | (TraceEventBase & {
@@ -172,6 +184,59 @@ export type TraceEvent =
   | (TraceEventBase & {
       type: 'inference:turn_ended';
       agentName: string;
+    })
+  | (TraceEventBase & {
+      /**
+       * Prose that delivery published, sent once the publish succeeds: the
+       * outgoing stream's chunk (MCPL Spec 14.3 `channels/outgoing/chunk`),
+       * emitted whether or not the channel's server takes the stream. It
+       * carries only what was published, so a consumer that speaks or shows
+       * it, such as a voice relay, never gets text that delivery withholds (a
+       * `skip_reply`, a silencing send, a private `think`, a hold, a bounce,
+       * a draft) or a publish the server didn't confirm (`delivered: true`):
+       * one refused before sending, one that threw, timed out or got an
+       * error answer, one the server reported undelivered
+       * (`delivered: false`), and one whose reply leaves `delivered` out.
+       * `inference:tokens` stays the model's text as it is written (held, as
+       * before, while a tool-result guard's batch is pending). A later
+       * publish to the same channel by the same stream opens with a paragraph
+       * break (`\n\n`), so a channel's chunks joined in `index` order are its
+       * text, its messages kept apart.
+       * `mcpl:speech-routed` also reports speech publishes, with no stream
+       * id, index or end, each once delivered: deliverSpeech's, the `sleep`
+       * tool's announcement among them, and a subconscious's
+       * `speak_in_channel`'s. A relay that voices the agent's prose takes
+       * this trace, with `inference:published_complete`, and not
+       * `mcpl:speech-routed` as well, and takes each message's id from its
+       * `messageId` to edit what it voiced.
+       */
+      type: 'inference:published';
+      agentName: string;
+      /** Where the prose is published. */
+      channelId: string;
+      /** The stream's id, shared with its `channels/outgoing/*` notifications. */
+      inferenceId: string;
+      /** Increases by one per chunk of the stream, across its channels. */
+      index: number;
+      text: string;
+      /** The id the channel's server returned for this chunk's publish
+       *  (`ChannelsPublishResult.messageId`); absent when it returned none.
+       *  Each chunk is one publish, so each carries its own. */
+      messageId?: string;
+    })
+  | (TraceEventBase & {
+      /**
+       * A stream's end for one channel it published to (MCPL Spec 14.3
+       * `channels/outgoing/complete`), sent on every exit path once the
+       * stream has ended and its deliveries have run, or, when the host
+       * stops, at once: `text` is everything its `inference:published` chunks
+       * carried there, and none follows it.
+       */
+      type: 'inference:published_complete';
+      agentName: string;
+      channelId: string;
+      inferenceId: string;
+      text: string;
     })
 
   // Tool lifecycle
@@ -442,13 +507,16 @@ export type TraceEvent =
     })
 
   // Host-owned speech routing (ChannelRegistry.routeSpeech). One trace per
-  // delivered prose segment. `text` is the segment verbatim — the same content
+  // delivered prose segment, and one per publish the subconscious's
+  // speak_in_channel delivers (ChannelRegistry.publishForAgent): that one's
+  // conversationId is the speaking agent's name, and it carries no
+  // messageId. `text` is the segment verbatim — the same content
   // already on the bus chunk-by-chunk via inference:tokens, and mcpl:* traces
   // are 'ops'-scoped on the webui wire — and `messageId` is the surface's id
-  // for the posted message (when the MCPL server reports one). Together they
-  // give external taps the (channelId, messageId, text) tuple needed to edit
-  // a just-posted message, e.g. a TTS interruption truncating a reply to the
-  // words actually voiced.
+  // for the posted message (on routeSpeech's traces, when the MCPL server
+  // reports one). Together they give external taps the (channelId,
+  // messageId, text) tuple needed to edit a just-posted message, e.g. a TTS
+  // interruption truncating a reply to the words actually voiced.
   | (TraceEventBase & {
       type: 'mcpl:speech-routed';
       /** Agent / conversation whose speech was routed. */
@@ -459,7 +527,8 @@ export type TraceEvent =
       textLen: number;
       /** The routed prose segment, verbatim. */
       text: string;
-      /** Surface message id (e.g. Discord message id), when reported. */
+      /** Surface message id (e.g. Discord message id), when reported, on
+       *  routeSpeech's traces. speak_in_channel's carry none. */
       messageId?: string;
     })
   | (TraceEventBase & {
@@ -473,6 +542,9 @@ export type TraceEvent =
       /** `failed`: nothing was posted; `unknown`: the request was dispatched
        *  and no valid receipt came back, so it may have been. */
       outcome?: 'failed' | 'unknown';
+      /** The connector error's structured data, bounded (connectorText),
+       *  when it sent some: it may say what a multi-part send posted. */
+      detail?: string;
     })
 
   // Admin puppet: an operator executed a tool AS an agent and stored the

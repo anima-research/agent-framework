@@ -607,6 +607,23 @@ describe('replies to a [Continue] turn', () => {
     } finally { await x.framework.stop(); rmSync(x.dir, { recursive: true, force: true }); }
   });
 
+  it("stamps the reply of a [Continue] turn that a wake to read a render started, whose trigger the turn copies without the wake's mark", async () => {
+    const x = await make({ deliver: false });
+    try {
+      await wake(x, ordinaryEvent('hello'), signed('sig-1', 'first reply'));
+      // A render still queued (for another resident) keeps its wake to read
+      // it, which starts a turn with nothing new for this agent: [Continue].
+      const internals = x.framework as any;
+      internals.deferredMessages.push({ id: 'render-x', seq: 1, participant: 'editor', forAgent: 'ghost', content: [{ type: 'text', text: 'elsewhere' }], heldAt: Date.now() });
+      x.membrane.pushResponse(createMockResponse(signed('sig-c', 'continued reply'), 'end_turn'));
+      internals.pendingRequests.push({ agentName: 'assistant', reason: 'mcpl:push-event', source: 'editor', timestamp: Date.now(), readsDeferredWrite: 'render-x' });
+      await x.framework.runUntilIdle();
+      internals.deferredMessages.splice(0);
+      assert.equal(textOf(x.membrane.calls[1]!.messages.at(-1)!), '[Continue]');
+      assert.equal(rowWith(x.framework, 'continued reply').metadata?.promptedBy?.text, '[Continue]', 'the reply carries the prompt it followed');
+    } finally { await x.framework.stop(); rmSync(x.dir, { recursive: true, force: true }); }
+  });
+
   it('a row that is both a tick row and a reply to [Continue] gets both turns, separator first', () => {
     const tick = { eventId: 'hb-x', serverId: 'heartbeat', agentName: 'assistant', separator: SILENT_HEARTBEAT_SEPARATOR };
     const prompt = { turn: 'p-1', text: '[Continue]' };

@@ -162,6 +162,7 @@ describe('Trunk channel routing (item-3 redux)', () => {
       isChannelOpen: () => false,
       getChannelLabel: () => undefined,
       getDescriptor: () => ({ capabilities: { history: { maxMessages: 80 } } }),
+      inboundOnlyServer: () => undefined,
       stopAll: () => {},
     };
 
@@ -220,6 +221,7 @@ describe('Trunk channel routing (item-3 redux)', () => {
       isChannelOpen: () => false,
       getChannelLabel: () => undefined,
       getDescriptor: () => ({ capabilities: { history: { maxMessages: 80 } } }),
+      inboundOnlyServer: () => undefined,
       stopAll: () => {},
     };
 
@@ -287,6 +289,7 @@ describe('Trunk channel routing (item-3 redux)', () => {
       getChannelLabel: () => undefined,
       getDescriptor: () => ({ label: 'DM: _reim0n', capabilities: { history: { maxMessages: 80 } } }),
       proseTargetFor: (id: string, serverId?: string) => { asked.push(`${serverId}/${id}`); return '@_reim0n'; },
+      inboundOnlyServer: () => undefined,
       stopAll: () => {},
     };
     i.handleMcplPushEvent(dmEvent('m3'));
@@ -306,6 +309,7 @@ describe('Trunk channel routing (item-3 redux)', () => {
       getChannelLabel: () => undefined,
       getDescriptor: () => ({ label: 'DM: _reim0n', capabilities: { history: { maxMessages: 80 } } }),
       proseTargetFor: () => undefined,
+      inboundOnlyServer: () => undefined,
       stopAll: () => {},
     };
     i2.handleMcplPushEvent(dmEvent('m4'));
@@ -323,11 +327,54 @@ describe('Trunk channel routing (item-3 redux)', () => {
       isChannelOpen: () => false,
       getChannelLabel: () => undefined,
       getDescriptor: () => undefined,
+      inboundOnlyServer: () => undefined,
       stopAll: () => {},
     };
     i3.handleMcplPushEvent(dmEvent('m5'));
     assert.match(textOf(fw3), /prefixed with ">>discord:dm:1555"/);
     await fw3.stop();
+  });
+
+  it('the invitation offers no reply into a channel its server declared inbound-only, and says why', async () => {
+    // pocket-body's live transcript: another agent speaking in the room arrives
+    // on it addressed, and the host publishes nothing into it, so a ">>" reply would
+    // only be refused.
+    const framework = await makeFramework();
+    const i = internals(framework);
+    i.channelRegistry = {
+      ensureChannelRegistered: () => {},
+      isChannelOpen: () => false,
+      getDescriptor: () => ({ label: 'Body · ears', direction: 'inbound' }),
+      getChannelLabel: () => 'Body · ears',
+      proseTargetFor: () => '#ears',
+      inboundOnlyServer: (id: string) => (id === 'body:ears' ? 'pocket-body' : undefined),
+      stopAll: () => {},
+    };
+    i.handleMcplPushEvent({
+      type: 'mcpl:push-event',
+      serverId: 'pocket-body',
+      featureSet: 'body',
+      eventId: 'ears_1',
+      content: [{ type: 'text', text: 'Fable: Linn, can you hear me?' }],
+      origin: { source: 'pocket-body', messageId: 'e1', mcplChannelId: 'body:ears', channelName: 'Body · ears' },
+      tags: ['chat:addressed'],
+      timestamp: new Date().toISOString(),
+      inferenceId: 'i-e1',
+      triggerInference: false,
+    });
+
+    const text = framework.getAgent('scout')!.getContextManager().queryMessages({}).messages.at(-1)?.content
+      .filter((block): block is { type: 'text'; text: string } => block.type === 'text')
+      .map((block) => block.text)
+      .join('\n') ?? '';
+    assert.match(text, /Channel invitation/);
+    assert.match(
+      text,
+      /1\. Replying there isn't available: pocket-body declared this channel inbound-only, so nothing you write is posted into it\. To speak there, use pocket-body's own tools\./,
+    );
+    assert.doesNotMatch(text, /prefixed with ">>/);
+    assert.match(text, /channel_open with channelId "body:ears"/, 'opening it, to hear the room, stays available');
+    await framework.stop();
   });
 
   it('the invitation adds a # only where the channel\'s name lacks one, and names an unlabelled channel by its id', async () => {
@@ -346,6 +393,7 @@ describe('Trunk channel routing (item-3 redux)', () => {
       isChannelOpen: () => false,
       getDescriptor: (id: string) => ({ label: labels[id] }),
       getChannelLabel: (_serverId: string, id: string) => labels[id],
+      inboundOnlyServer: () => undefined,
       stopAll: () => {},
     };
     const textOf = () =>

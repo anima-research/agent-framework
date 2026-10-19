@@ -189,16 +189,17 @@ test("a connect and a reconnect that fail their handshakes report the server's s
   connection.ready();
   const failure = 'MCPL server "needs-token" transport closed before handshake completed (child process exited)';
   // The log lines are records, so the server's credentials are redacted
-  // there; the event carries the tail as the server wrote it.
+  // there, and the event carries the failed connect's tail, redacted as the
+  // host gets it on the error.
   const stderr = '. The last of its stderr:\n  stderr: "fatal: DISCORD_TOKEN redacted was refused"';
   const first = await within(connectFailed, null);
   assert.ok(first, 'the first connect failed and was reported within 15 s');
-  assert.deepEqual(first, { error: failure, stderrTail: 'fatal: DISCORD_TOKEN tok-0123456789abcdef was refused', attempt: 0 });
+  assert.deepEqual(first, { error: failure, stderrTail: 'fatal: DISCORD_TOKEN redacted was refused', attempt: 0 });
   assert.ok(logged.includes(`MCPL server "needs-token" initial connect failed, will retry: ${failure}${stderr}`), logged.join('\n'));
   const event = await within(reconnectFailed, null);
   assert.ok(event, 'a reconnect attempt failed within 15 s');
   assert.equal(event.error, failure);
-  assert.equal(event.stderrTail, 'fatal: DISCORD_TOKEN tok-0123456789abcdef was refused');
+  assert.equal(event.stderrTail, 'fatal: DISCORD_TOKEN redacted was refused');
   assert.ok(logged.includes(`MCPL server "needs-token" reconnect failed: ${failure}${stderr}`), logged.join('\n'));
 });
 

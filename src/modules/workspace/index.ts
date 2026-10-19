@@ -5,12 +5,11 @@
  * auto-sync between real filesystem and Chronicle, and manual materialization.
  */
 
-import { isUtf8 } from 'node:buffer';
 import { constants as fsConstants } from 'node:fs';
 import type { Stats } from 'node:fs';
 import { open, readdir, readlink, stat, lstat, realpath } from 'node:fs/promises';
 import { basename, dirname, isAbsolute, join, parse, resolve, relative, sep } from 'node:path';
-import type { JsStore } from '@animalabs/chronicle';
+import type { JsStore, JsTreeEntry } from '@animalabs/chronicle';
 import type { Module, ModuleContext, ProcessState, EventResponse } from '../../types/module.js';
 import type { ProcessEvent, ToolDefinition, ToolCall, ToolResult } from '../../types/events.js';
 import type {
@@ -23,6 +22,7 @@ import type {
   ReadImageInput,
   WriteInput,
   EditInput,
+  EditManyInput,
   DeleteInput,
   LsInput,
   GlobInput,
@@ -39,9 +39,12 @@ import { WORKSPACE_FS_EVENT_TYPES, opToEventType } from './types.js';
 import { MountWatcher, type FsChange } from './watcher.js';
 import { hashContent, DEFAULT_MAX_FILE_SIZE } from './sync.js';
 import { DiskAgreement, sameRootIdentity } from './disk-agreement.js';
-import { BranchIntents } from './branch-intent.js';
+import { type BranchIntent, BranchIntents } from './branch-intent.js';
 import { IGNORED, NONBLOCK, OTHER_MOUNT, ROOT_REPLACED, ROOT_UNAVAILABLE, checkDir, checkRoot, diskSpelling, filesystemTrustsCtime, foldsCase, inOtherMount, leadsInto, linkLeads, linkOnTheWay, linkRefusal, linkWords, locateRoot, nestedAtReal, nestedHolder, passedOverAt, readPrefix, type CheckedDir, type LinkFound, type MountView, type NestedMount, type WorkspaceEntries } from './observe.js';
 import { TOOL_BATCH_HOOK_TIMEOUT_MS, ensureStateRegistered } from '../../module-registry.js';
+import { DEFAULT_TOOL_RESULT_INLINE_MAX_CHARS } from '../../tool-result-history.js';
+import { type EditSpec, type FilePlan, countBudget, decodeForEdit, hintBudget, planFile } from './edit-plan.js';
+import { type EditProblem, type EditTool, cutLine, editList, editReceipt, fitted, refusalText } from './edit-text.js';
 import {
   type MountRuntime,
   type PassOptions,
@@ -83,6 +86,7 @@ export type {
   ReadImageInput,
   WriteInput,
   EditInput,
+  EditManyInput,
   DeleteInput,
   LsInput,
   GlobInput,
@@ -1426,16 +1430,60 @@ export class WorkspaceModule implements Module {
       },
       {
         name: 'edit',
-        description: 'Edit a file by replacing a substring. The oldString must be unique unless replaceAll is true.',
+        description: 'Edit a file by replacing exact text. oldString must occur exactly once, or with replaceAll at least once, '
+          + "and every occurrence is replaced; occurrences that overlap count, but can't each be replaced. "
+          + 'A miss shows the closest region it finds, numbered, and a count that differs shows the lines that matched. '
+          + 'CRLF line ends are matched with LF text and kept, as is a BOM. As second chances, straight and curly quotes match as equal, '
+          + "and an oldString carrying the file's BOM at its start or a line's CR at its end, as a character page shows them, matches without them, "
+          + 'its newString read the same way. '
+          + "Only the replaced text changes, and the new text's line ends take those of the text it replaces. "
+          + 'A change disk made to the file is taken in first, and the answer says so. '
+          + 'The answer shows the changed region, numbered, a long line from shortly before the change on it, as its length allows. '
+          + 'For several edits at once, in one file or across files, applied all or none, use edit_many.',
         inputSchema: {
           type: 'object' as const,
           properties: {
             path: { type: 'string', description: 'File path (mount-prefixed)' },
-            oldString: { type: 'string', description: 'String to find' },
-            newString: { type: 'string', description: 'Replacement string' },
-            replaceAll: { type: 'boolean', description: 'Replace all occurrences (default: false)' },
+            oldString: { type: 'string', description: 'Exact text to replace, including whitespace and indentation' },
+            newString: { type: 'string', description: 'Replacement text' },
+            replaceAll: { type: 'boolean', description: 'Replace every occurrence (default: false)' },
           },
           required: ['path', 'oldString', 'newString'],
+        },
+      },
+      {
+        name: 'edit_many',
+        description: 'Apply several exact edits at once, in one file or across files of one mount, all or none: no edit is stored unless every edit applies. '
+          + "Each edit's oldString must occur in its file exactly `occurrences` times (1 when left out), and every one is replaced; "
+          + "occurrences that overlap count, but can't each be replaced. "
+          + "Each edit is matched in its file as this call reads it, never in another edit's result, so the list's order doesn't matter, "
+          + "and two edits' matches may touch but not overlap. Matching is edit's. "
+          + "A refusal names the problems it finds, each by its edit's number in the list (from 1). "
+          + 'All or none holds in the workspace: on a mount that writes to disk, disk can still refuse a file, '
+          + "and the answer then says every edit is stored and names each file disk refused, with its push's reason. "
+          + "The answer shows each edit's first changed region, numbered, a long line from shortly before each change on it, as its length allows.",
+        inputSchema: {
+          type: 'object' as const,
+          properties: {
+            edits: {
+              type: 'array',
+              description: "The edits, each matched in its file as this call reads it, never in another edit's result",
+              items: {
+                type: 'object',
+                properties: {
+                  path: { type: 'string', description: 'File path (mount-prefixed); every edit names a file of the same mount' },
+                  oldString: { type: 'string', description: 'Exact text to replace, as the file holds it before this call' },
+                  newString: { type: 'string', description: 'Replacement text' },
+                  occurrences: {
+                    type: 'integer',
+                    description: 'How many times oldString occurs in the file (default: 1); every one is replaced, and any other count is refused',
+                  },
+                },
+                required: ['path', 'oldString', 'newString'],
+              },
+            },
+          },
+          required: ['edits'],
         },
       },
       {
@@ -1645,16 +1693,18 @@ export class WorkspaceModule implements Module {
       const input = call.input as Record<string, unknown>;
       const generated = typeof input?.path === 'string' ? this.findGeneratedTextFile(input.path) : undefined;
       if (generated) {
-        if (call.callerAgentName !== generated.agentName) return {success:false,isError:true,error:'Generated file belongs to another agent'};
-        if (call.name !== 'read') return {success:false,isError:true,error:'Generated file is read-only; edit the presentation configuration instead'};
-        return await this.handleRead(input as unknown as ReadInput, generated.read());
+        if (call.name === 'read' && call.callerAgentName === generated.agentName) {
+          return await this.handleRead(input as unknown as ReadInput, generated.read());
+        }
+        return { success: false, isError: true, error: this.generatedFileRefusal(generated, call.callerAgentName) };
       }
 
       switch (call.name) {
         case 'read': return await this.handleRead(input as unknown as ReadInput);
         case 'read_image': return await this.handleReadImage(input as unknown as ReadImageInput);
         case 'write': return await this.handleWrite(input as unknown as WriteInput);
-        case 'edit': return await this.handleEdit(input as unknown as EditInput);
+        case 'edit': return await this.handleEdit(input as unknown as EditInput, call.resultMaxChars);
+        case 'edit_many': return await this.handleEditMany(input as unknown as EditManyInput, call.resultMaxChars, call.callerAgentName);
         case 'delete': return await this.handleDelete(input as unknown as DeleteInput);
         case 'ls': return await this.handleLs(input as unknown as LsInput);
         case 'glob': return await this.handleGlob(input as unknown as GlobInput);
@@ -1783,10 +1833,13 @@ export class WorkspaceModule implements Module {
    * (agent-framework #277).
    *
    * A write whose tree entry is set but that then fails returns success
-   * false with `data: { inChronicle: true }`: its copy on disk was refused, or
-   * something after the entry (recording its intent, the event, the push)
-   * threw. The workspace's tools read the file from the tree, so it is there
-   * for them, on the branch that was current when the entry was set.
+   * false with `data: { inChronicle: true }`: its copy on disk was refused,
+   * the store failed after recording the entry, which skips the push where
+   * the mount pushes, or something after the entry (recording its intent,
+   * the event, the push) threw. The workspace's tools read the file from the
+   * tree, so it is there for them, on the branch that was current when the
+   * entry was set. A set that threw and couldn't be read back throws, saying
+   * that whether the entry is set isn't known.
    */
   async writeBinary(
     mountPrefixedPath: string,
@@ -1844,7 +1897,12 @@ export class WorkspaceModule implements Module {
           : `Wrote to Chronicle but failed to materialize "${mountPrefixedPath}" to disk: ${answer.refused}.`;
       } catch (error) {
         if (!committed) throw error;
-        failure = `Stored "${mountPrefixedPath}" in Chronicle, but the rest of the write failed: ${error instanceof Error ? error.message : String(error)}.`;
+        // As write words it: a store that failed after recording the file
+        // skipped its push, so on a mount that pushes, disk lacks it.
+        failure = error instanceof StoredThenFailed
+          ? `Stored "${mountPrefixedPath}" in Chronicle, but the store failed after recording it: ${error.message}.`
+            + (error.pushes ? " Its push to disk didn't run, so disk lacks the change until a materialize of the path writes it." : '')
+          : `Stored "${mountPrefixedPath}" in Chronicle, but the rest of the write failed: ${error instanceof Error ? error.message : String(error)}.`;
       }
       if (failure !== null) {
         // The file is in the Chronicle tree, where the workspace's tools read
@@ -2692,9 +2750,11 @@ export class WorkspaceModule implements Module {
   /**
    * Commit a tool's write or delete to the workspace tree, with the branch
    * intent it implies: store origin for a path disk never agreed with; for a
-   * deletion, a tombstone, unless the evidence holds no agreed disk copy (P
+   * deletion, a tombstone, written before the entry is removed, unless the
+   * agreement's evidence for the path, P, holds no agreed disk copy (P
    * absent, or no P and store origin), when it clears the path's intent and
-   * pushes nothing. It pushes the change to disk when the mount opts in via
+   * pushes nothing. It pushes the change to
+   * disk when the mount opts in via
    * `autoMaterialize` — required for cross-agent pipelines, since another
    * agent's watcher on the same directory only sees real filesystem events.
    * The push follows materialize's rule: a disk copy that changed since it
@@ -2713,85 +2773,210 @@ export class WorkspaceModule implements Module {
   private async commitToolChange(
     mount: MountState,
     relativePath: string,
-    change: { kind: 'set'; blobHash: string; size: number; mode?: number } | { kind: 'remove'; previousHash: string },
+    change: ToolChange,
     onCommitted?: () => void,
   ): Promise<{ refused: string | null; modeKept: string | null; note: string | null }> {
+    const { refused, modeKept, notes } = await this.commitToolChanges(mount, [{ path: relativePath, change }], onCommitted && (() => onCommitted()));
+    return { refused: refused.get(relativePath) ?? null, modeKept: modeKept.get(relativePath) ?? null, note: notes.get(relativePath) ?? null };
+  }
+
+  /**
+   * commitToolChange for several paths of one mount at once, as edit_many
+   * commits its files: every path's precondition is enforced before any entry
+   * is set, then a deletion's tombstone is written, then every entry is set
+   * in one record of the store, which takes all of them or none, then each
+   * other path's intent, by the rule commitToolChange's doc gives, which the
+   * code below applies, with no await between, and one push takes the paths
+   * to disk, but for a deletion that clears its path's intent. `onCommitted`
+   * is told of each path once the entries are set, also when the store throws
+   * after setting them, whose error then goes on in place of the push
+   * (changesLanded).
+   * Answers, by path, the reason for each that reached the workspace but not
+   * disk (`refused`), and, apart from it, why one whose bytes reached disk
+   * left the file's mode as disk had it (`modeKept`), and that a deletion
+   * clearing a conflict that named a disk file unlinked nothing (`notes`), as
+   * commitToolChange answers them for one path.
+   */
+  private async commitToolChanges(
+    mount: MountState,
+    changes: Array<{ path: string; change: ToolChange }>,
+    onCommitted?: (path: string) => void,
+  ): Promise<{ refused: Map<string, string>; modeKept: Map<string, string>; notes: Map<string, string> }> {
     const store = this.getStore();
+    const agreement = this.agreementOrThrow();
     const intents = this.intents.get(mount.config.name)!;
     // The mutation's precondition, enforced here, synchronously with the
     // commit: whatever settleBeforeMutation's pass could or couldn't settle.
-    settleAdoptionBeforeMutation(store, this.agreementOrThrow(), { name: mount.config.name, treeStateId: mount.treeStateId }, relativePath);
-    const evidence = this.agreementOrThrow().get(mount.config.name, relativePath);
-    const known = evidence !== undefined;
-    if (change.kind === 'set') {
-      store.treeSet(mount.treeStateId, relativePath, { blobHash: change.blobHash, size: change.size, mode: change.mode ?? 0o644 });
-      // A later intent update or disk push can throw; the tree entry is
-      // already set, on the branch current now. If the active branch changes
-      // during the push, that branch's tree has the file and the new one may
-      // not.
-      onCommitted?.();
-      intents.update(relativePath, (cur) => {
-        const next = { ...cur };
-        delete next.tombstone;
-        // Disk has never agreed with this path: a missing disk copy is a draft
-        // not yet materialized, not a deletion.
-        if (!known) next.origin = 'store';
-        return next;
-      });
-    } else {
-      store.treeRemove(mount.treeStateId, relativePath);
-      onCommitted?.();
-      // A deletion whose evidence holds no agreed disk copy (disk last agreed
-      // it had nothing here, or has never agreed with this entry, which the
-      // workspace created) puts the store back at the agreement. Nothing on
-      // disk is the workspace's to unlink, so it pushes nothing, and it
-      // clears the path's whole intent: no tombstone, so it needs no proof of
-      // absence, which a path disk can't show, such as one beneath a symlink
-      // the mount doesn't follow, would never give; and no conflict, which
-      // has nothing left to be about once the workspace has given up its
-      // side. Whatever disk holds there is a sync's to observe, a file the
-      // workspace never saw included. Any other deletion keeps its
-      // tombstone, which guards it: a copy disk agreed with, a push of ours
-      // that may have landed (pending or interrupted), or an entry from
-      // before the evidence.
-      let agreed = true;
-      let note: string | null = null;
-      intents.update(relativePath, (cur) => {
-        agreed = !(evidence?.kind === 'absent' || (evidence === undefined && cur.origin === 'store'));
-        if (agreed) {
-          const next = { ...cur, tombstone: { hash: change.previousHash } };
-          delete next.origin;
-          return next;
-        }
-        // A conflict it clears may name a file disk held there, which the
-        // workspace never took in: the answer says that file wasn't unlinked,
-        // where the deletion alone would read as having removed it. The
-        // deletion doesn't look at disk, so a file nothing recorded gets no
-        // note.
-        if (cur.conflict?.disk) {
-          note = `nothing was unlinked: when last observed, disk held a file at ${mount.config.name}/${relativePath} ` +
-            `that the workspace never took in (conflict: ${cur.conflict.kind}), and a sync observes whatever disk holds there`;
-        }
-        return {};
-      });
-      if (!agreed) return { refused: null, modeKept: null, note };
+    // Every path's comes first, so nothing that can refuse follows a set.
+    for (const { path } of changes) {
+      settleAdoptionBeforeMutation(store, agreement, { name: mount.config.name, treeStateId: mount.treeStateId }, path);
     }
-    if (!this.pushesOnCommit(mount)) return { refused: null, modeKept: null, note: null };
+    const entry = (change: ToolChange & { kind: 'set' }) => ({ blobHash: change.blobHash, size: change.size, mode: change.mode ?? 0o644 });
+    // The changes the tree doesn't hold yet, which the read-back below checks,
+    // read before any intent is written, so no read comes between a
+    // tombstone's write and the put-back's guard.
+    const changing = changes.filter(({ path, change }) => !holds(store.treeGet(mount.treeStateId, path), change));
+    // Each path's intent, by the rule commitToolChange's doc gives. A
+    // deletion's tombstone is written before its entry is removed. Removed
+    // without it, the entry would read as a file this branch doesn't have,
+    // which no materialize deletes and no second delete can reach
+    // (anima-research/agent-framework#553). Every other intent is written
+    // after the tree change: what it gives up, the tombstone a write replaces
+    // or the origin and conflict a deletion clears, guards the path until the
+    // change lands.
+    const notes = new Map<string, string>();
+    const unpushed = new Set<string>();
+    const intentChanges = changes.map(({ path, change }): { path: string; first: boolean; next: (cur: BranchIntent) => BranchIntent } => {
+      const evidence = agreement.get(mount.config.name, path);
+      const cur = intents.get(path) ?? {};
+      if (change.kind === 'remove') {
+        // A deletion whose evidence holds no agreed disk copy (disk last
+        // agreed it had nothing here, or has never agreed with this entry,
+        // which the workspace created) puts the store back at the
+        // agreement. Nothing on disk is the workspace's to unlink, so it
+        // pushes nothing, and it clears the path's whole intent: no
+        // tombstone, so it needs no proof of absence, which a path disk
+        // can't show, such as one beneath a symlink the mount doesn't
+        // follow, would never give; and no conflict, which has nothing left
+        // to be about once the workspace has given up its side. Whatever
+        // disk holds there is a sync's to observe, a file the workspace
+        // never saw included. Any other deletion keeps its tombstone, which
+        // guards it: a copy disk agreed with, a push of ours that may have
+        // landed (pending or interrupted), or an entry from before the
+        // evidence.
+        if (!(evidence?.kind === 'absent' || (evidence === undefined && cur.origin === 'store'))) {
+          return {
+            path,
+            first: true,
+            next: (current) => {
+              const next = { ...current, tombstone: { hash: change.previousHash } };
+              delete next.origin;
+              return next;
+            },
+          };
+        }
+        unpushed.add(path);
+        // A conflict it clears may name a file disk held there, which the
+        // workspace never took in: the answer says that file wasn't
+        // unlinked, where the deletion alone would read as having removed
+        // it. The deletion doesn't look at disk, so a file nothing recorded
+        // gets no note.
+        if (cur.conflict?.disk) {
+          notes.set(path, `nothing was unlinked: when last observed, disk held a file at ${mount.config.name}/${path} `
+            + `that the workspace never took in (conflict: ${cur.conflict.kind}), and a sync observes whatever disk holds there`);
+        }
+        return { path, first: false, next: () => ({}) };
+      }
+      return {
+        path,
+        first: false,
+        next: (current) => {
+          const next = { ...current };
+          delete next.tombstone;
+          // Disk has never agreed with this path: a missing disk copy is a
+          // draft not yet materialized, not a deletion.
+          if (evidence === undefined) next.origin = 'store';
+          return next;
+        },
+      };
+    });
+    // A tombstone written for a change that then doesn't land is put back:
+    // the path's intent record as it was, a damaged one's bytes included, so
+    // a refused deletion changes nothing. The put-back is best effort, since
+    // the error that stopped the call is its answer. A tombstone it leaves
+    // beside the entry guards nothing: decide gives no verdict from one while
+    // the entry is there, status and materialize take it as no deletion, and
+    // the path's next agreement clears it.
+    const written: Array<{ path: string; record: JsTreeEntry | null }> = [];
+    const putBack = () => {
+      for (const { path, record } of written) {
+        try {
+          if (record) store.treeSet(intents.treeStateId, path, record);
+          else if (store.treeGet(intents.treeStateId, path)) store.treeRemove(intents.treeStateId, path);
+        } catch (error) {
+          // Left beside the entry, where it guards nothing (above).
+          console.warn(
+            `[workspace] Mount "${mount.config.name}": a change to ${path} failed, and putting its branch intent back threw too `
+            + `(${error instanceof Error ? error.message : String(error)}), so a tombstone may be left beside the entry. One there `
+            + `deletes nothing, and the path's next agreement with disk clears it`,
+          );
+        }
+      }
+    };
+    try {
+      for (const { path, first, next } of intentChanges) {
+        if (!first) continue;
+        written.push({ path, record: store.treeGet(intents.treeStateId, path) });
+        intents.update(path, next);
+      }
+    } catch (error) {
+      putBack();
+      throw error;
+    }
+    // A store can fail after its record lands: Chronicle 0.4 writes a state's
+    // auto-snapshot after appending its update, and that failure reaches the
+    // caller with the update recorded (anima-research/chronicle#39). So a set
+    // that threw is read back, and where every path it changes holds what its
+    // change leaves, the record is in: the paths' intents follow, as for any
+    // set, and then the error goes on in place of the push. A change the tree
+    // already holds can't show whether the record is in, so a call whose every
+    // change the tree holds already goes on as the store's own failure.
+    let landedThenThrew: { error: unknown } | null = null;
+    try {
+      if (changes.length === 1) {
+        const [{ path, change }] = changes as [{ path: string; change: ToolChange }];
+        if (change.kind === 'set') store.treeSet(mount.treeStateId, path, entry(change));
+        else store.treeRemove(mount.treeStateId, path);
+      } else {
+        // One record for every path, so a store that fails partway sets none.
+        store.treeBatch(mount.treeStateId, changes.map(({ path, change }) => (change.kind === 'set'
+          ? { op: 'set', path, entry: entry(change) }
+          : { op: 'remove', path })));
+      }
+    } catch (error) {
+      // A read-back that fails can't tell whether the change landed, so its
+      // error goes on and a tombstone stays: put back where the removal did
+      // land, it would leave #553's state, and beside an entry it guards
+      // nothing.
+      if (changing.length === 0 || !changesLanded(store, mount.treeStateId, changing, error)) {
+        putBack();
+        throw error;
+      }
+      landedThenThrew = { error };
+    }
+    // A later intent update or disk push can throw; the tree entries are
+    // already set, on the branch current now. If the active branch changes
+    // during the push, that branch's tree has the files and the new one may
+    // not.
+    for (const { path } of changes) onCommitted?.(path);
+    for (const { path, first, next } of intentChanges) if (!first) intents.update(path, next);
+    const pushing = changes.filter(({ path }) => !unpushed.has(path));
+    if (landedThenThrew) throw new StoredThenFailed(landedThenThrew.error, this.pushesOnCommit(mount) && pushing.length > 0, notes);
+    const refused = new Map<string, string>();
+    const modeKept = new Map<string, string>();
+    if (!this.pushesOnCommit(mount) || pushing.length === 0) return { refused, modeKept, notes };
 
-    const pushed = await this.pushUnlocked(mount, [relativePath], {
-      applyDeletions: change.kind === 'remove',
+    const pushed = await this.pushUnlocked(mount, pushing.map(({ path }) => path), {
+      applyDeletions: pushing.some(({ change }) => change.kind === 'remove'),
       branchId: store.currentBranch().id,
     });
-    const refused = pushed.skipped.find((s) => s.path === relativePath);
-    if (!refused) return { refused: null, modeKept: pushed.modesKept.find((k) => k.path === relativePath)?.reason ?? null, note: null };
-    this.ctx?.pushEvent({
-      type: 'workspace:materialize-failed',
-      mount: mount.config.name,
-      path: relativePath,
-      op: change.kind === 'set' ? 'write' : 'delete',
-      error: refused.reason,
-    } as ProcessEvent);
-    return { refused: refused.reason, modeKept: null, note: null };
+    for (const { path, change } of pushing) {
+      const skipped = pushed.skipped.find((s) => s.path === path);
+      if (!skipped) {
+        const kept = pushed.modesKept.find((k) => k.path === path)?.reason;
+        if (kept) modeKept.set(path, kept);
+        continue;
+      }
+      refused.set(path, skipped.reason);
+      this.ctx?.pushEvent({
+        type: 'workspace:materialize-failed',
+        mount: mount.config.name,
+        path,
+        op: change.kind === 'set' ? 'write' : 'delete',
+        error: skipped.reason,
+      } as ProcessEvent);
+    }
+    return { refused, modeKept, notes };
   }
 
   // ==========================================================================
@@ -3056,166 +3241,448 @@ export class WorkspaceModule implements Module {
       }));
     } catch (error) {
       if (!committed) throw error;
-      return storedButUnfinished('write', input.path, { threw: error instanceof Error ? error.message : String(error) });
+      return storedButUnfinished('write', input.path, error instanceof StoredThenFailed
+        ? { storeFailed: error.message, pushes: error.pushes }
+        : { threw: error instanceof Error ? error.message : String(error) });
     }
     if (refused !== null) return storedButUnfinished('write', input.path, { refused });
 
     return { success: true, data: { ...receipt, ...(modeKept ? { modeKept } : {}) } };
   }
 
-  private async handleEdit(input: EditInput): Promise<ToolResult> {
-    // Refused before anything is read: an empty oldString matches between
-    // every character, and UTF-8 can't store a lone surrogate.
-    if (input.oldString === '') {
-      return { success: false, isError: true, error: 'The edit did nothing: "oldString" is empty, and an empty string matches between every character. Give the text to replace.' };
+  private async handleEdit(input: EditInput, maxChars = DEFAULT_TOOL_RESULT_INLINE_MAX_CHARS): Promise<ToolResult> {
+    return this.applyEdits('edit', [{
+      path: input.path,
+      oldString: input.oldString,
+      newString: input.newString,
+      expected: input.replaceAll ? 'all' : 1,
+    }], maxChars);
+  }
+
+  private async handleEditMany(
+    input: EditManyInput,
+    maxChars = DEFAULT_TOOL_RESULT_INLINE_MAX_CHARS,
+    callerAgentName?: string,
+  ): Promise<ToolResult> {
+    if (input.edits.length === 0) {
+      return { success: false, isError: true, error: 'The edit_many call did nothing: "edits" is empty. Give at least one edit.' };
     }
-    for (const field of ['oldString', 'newString'] as const) {
-      if (LONE_SURROGATE.test(input[field])) {
-        return { success: false, isError: true, error: `The edit did nothing: "${field}" holds a lone UTF-16 surrogate, which UTF-8 can't store.` };
+    return this.applyEdits('edit_many', input.edits.map((edit) => ({
+      path: edit.path,
+      oldString: edit.oldString,
+      newString: edit.newString,
+      expected: edit.occurrences ?? 1,
+    })), maxChars, callerAgentName);
+  }
+
+  /**
+   * A call's edits, all or none, applied to the stored copies of their files:
+   * edit's one, or edit_many's in the files of one mount. Each edit is matched
+   * in its file's text as this call reads it, never in another edit's result
+   * (edit-plan.ts), and any problem refuses the call with none of its edits
+   * stored: edit names its first problem, and edit_many every problem found.
+   *
+   * Each edit's own input is checked first, and each path's mount. A problem
+   * there refuses edit at once, before any file's text is read, and edit_many
+   * when its edits name more than one mount, which no one pass settles.
+   * Otherwise edit_many goes on to settle and plan the rest, so its one
+   * refusal names the problems it finds; the settling is what a read or a
+   * listing of its files would take in from disk, and the refusal says what
+   * it took in. A failure before the commit sets the entries stores none of
+   * them, and edit_many's answer to it says so. A store that throws as it
+   * sets them is read back (commitToolChanges), so the answer says they're
+   * stored where its record landed, and that it can't tell where they
+   * couldn't be read back.
+   * Under the mount's turn, one pass settles every path with disk, by the
+   * rule a listing uses, so the edits apply to what disk now holds. That pass
+   * is the only step that awaits before the commit: every file is then read,
+   * every edit planned, and every entry set (commitToolChanges) with no turn
+   * of the event loop between, so no pass, branch change or other call moves
+   * the tree between a file's read and its set. Disk then takes what it can
+   * of the stored change.
+   *
+   * The answer is held to `maxChars`, the length the call's result may have
+   * (ToolCall.resultMaxChars), as edit-text.ts describes.
+   */
+  private async applyEdits(
+    tool: EditTool,
+    given: Array<{ path: string; oldString: string; newString: string; expected: number | 'all' }>,
+    maxChars: number,
+    callerAgentName?: string,
+  ): Promise<ToolResult> {
+    const refuse = (problems: EditProblem[], notes: string[] = []): ToolResult =>
+      ({ success: false, isError: true, error: refusalText(tool, problems, notes, maxChars) });
+
+    // Each edit's own input, before anything is read: an empty old text
+    // matches between every character, and UTF-8 can't store a lone surrogate.
+    const problems: EditProblem[] = [];
+    const specs = new Map<number, EditSpec>();
+    for (const [index, edit] of given.entries()) {
+      const spec: EditSpec = {
+        index,
+        oldText: edit.oldString.replaceAll('\r\n', '\n'),
+        newText: edit.newString.replaceAll('\r\n', '\n'),
+        expected: edit.expected,
+      };
+      const found = problems.length;
+      if (spec.oldText === '') {
+        problems.push({ kind: 'input', edit: index, text: '"oldString" is empty, and an empty string matches between every character. Give the text to replace.' });
+      } else if (spec.oldText === spec.newText) {
+        // An edit's new text takes the line ends of the text it replaces, so
+        // one whose only change is its line ends changes nothing.
+        problems.push({
+          kind: 'input',
+          edit: index,
+          text: edit.oldString !== edit.newString
+            ? "oldString and newString are the same once their CRLF line ends are read as LF, so there's nothing to change: an edit keeps the file's line ends, and write replaces the whole file, line ends included."
+            : "oldString and newString are the same, so there's nothing to change.",
+        });
       }
+      for (const field of ['oldString', 'newString'] as const) {
+        if (LONE_SURROGATE.test(edit[field])) {
+          problems.push({ kind: 'input', edit: index, text: `"${field}" holds a lone UTF-16 surrogate, which UTF-8 can't store.` });
+        }
+      }
+      if (problems.length === found) specs.set(index, spec);
     }
-    const { mount, relativePath, path } = await this.parseFilePath(input.path);
-    input = { ...input, path };
-    if (mount.config.mode === 'read-only') {
-      return { success: false, error: `Mount "${mount.config.name}" is read-only`, isError: true };
+    // edit names its first problem, so one in its input refuses it before
+    // its path is looked up on disk.
+    if (tool === 'edit' && problems.length) return refuse(problems);
+
+    // Each path in its mount, as disk spells it, before any file's text is
+    // read. Edits of one stored path are one file, planned once from one
+    // text, whatever path named it, and named as disk spells it.
+    const parsed = new Map<string, { mount: MountState; relativePath: string; path: string } | Extract<EditProblem, { kind: 'file' }>>();
+    const targets = new Map<string, EditTarget>();
+    const mounts = new Map<string, MountState>();
+    for (const [index, { path }] of given.entries()) {
+      if (!parsed.has(path)) parsed.set(path, await this.editablePath(tool, path, callerAgentName));
+      const where = parsed.get(path)!;
+      if ('kind' in where) {
+        where.edits.push(index);
+        continue;
+      }
+      mounts.set(where.mount.config.name, where.mount);
+      const key = `${where.mount.config.name}/${where.relativePath}`;
+      let target = targets.get(key);
+      if (!target) targets.set(key, (target = { relativePath: where.relativePath, path: where.path, edits: [], specs: [] }));
+      target.edits.push(index);
+      const spec = specs.get(index);
+      if (spec) target.specs.push(spec);
     }
+    for (const where of parsed.values()) if ('kind' in where) problems.push(where);
+    if (mounts.size > 1) {
+      problems.push({ kind: 'mounts', edits: [...targets.values()].flatMap((target) => target.edits), mounts: [...mounts.keys()] });
+    }
+    const [mount] = mounts.values();
+    if (tool === 'edit' && problems.length) return refuse(problems);
+    if (!mount || mounts.size > 1) return refuse(problems);
 
     const store = this.getStore();
+    // Whether the commit set the call's entries, all of them at once.
     let committed = false;
-    let appliedNote: string | null = null;
+    // What each file's settling took in, for a receipt.
+    const applied = new Map<EditTarget, string | null>();
+    // The conflict each file's settling found, on a mount that doesn't push:
+    // the success answer names it, and so does the answer to a store that
+    // failed after recording the edits, which stand as on a success.
+    const conflicts = new Map<EditTarget, string>();
     try {
       return await this.withMount(mount, async (): Promise<ToolResult> => {
-        // The edit applies to the path as disk holds it now: a change on disk
-        // to a file the workspace holds is taken in first, by the rule a
-        // listing uses. The pass settles a pending intent on the path too, as
-        // settleBeforeMutation's would, and the commit enforces the rest
-        // (commitToolChange). A write passes over its path only to settle a
-        // pending intent, since it replaces the whole file. As every file
-        // tool's pass does, it names the path it acts on, so a file the
-        // mount passes over by design is observed (see PassOptions.named).
-        const pass = await this.passUnlocked(mount, { kind: 'paths', paths: [relativePath] }, { named: true });
-        const report = pass.reports.get(relativePath);
-        // A mode taken in alone isn't a change to the text: it brings nothing
-        // new to read, as it makes no event (emitFsEvents), and the edit then
-        // writes at the mode disk has, so it leaves nothing to say.
-        const took = (op: TreeOp) => pass.ops.some((o) => o.path === relativePath && o.op === op && !o.modeOnly);
-        // Which copy the edit used, when it isn't the one the workspace last
-        // agreed on with disk: disk's newer text, or the workspace's copy
-        // because disk's couldn't be read or disk has none. A file the
-        // workspace didn't hold has no older copy, so taking it in needs no
-        // word.
-        const whichCopy = (verb: string): string | null => took('modified')
-          ? `Disk's copy had changed since the workspace last agreed with it, so it was taken in first, and the edit ${verb} that text.`
-          : report?.state === 'unverified'
-            ? `The path couldn't be checked against disk (${report.note ?? 'not observed'}), so the edit ${verb} the workspace's copy.`
-            : report?.state === 'disk-missing-provenance-unknown'
-              ? `Disk has no copy of this file, and nothing records whether it was deleted there, so the edit ${verb} the workspace's copy.`
-              : null;
-        // A conflict the pass found is named when the edit is refused for the
-        // text it found, on either kind of mount, and on a success where the
-        // mount doesn't push, since such a mount keeps the conflict until
-        // materialize or sync settles it. A pushing mount's success met none
-        // (below). A stored edit that couldn't finish leaves it to the push's
-        // reason, which names the conflict, or to ls, which its answer points to.
-        const conflict = report?.state === 'conflict' ? report.conflict?.kind ?? 'both-changed' : null;
-        // Where disk has no copy now, whatever the conflict's kind, a sync of
-        // the path takes disk's deletion and a forced materialize writes the
-        // workspace's copy back. Where it has one, a sync keeps it and gives
-        // up the workspace's, whether or not the workspace can hold disk's
-        // copy: one it can't hold stays on disk alone.
-        const conflictNote = (where: string): string | null => conflict === null ? null
-          : `The path is in conflict with disk (${conflict}): the edit ${where} the workspace's copy. ` + (report?.diskNow === 'absent'
-            ? "Sync the path to take disk's deletion, which removes the workspace's copy, or materialize it with force to write the workspace's copy back to disk."
-            : "Sync the path to keep disk's copy and give up the workspace's, or materialize it with force to write the workspace's over disk's.");
-        const suffix = [whichCopy('looked in'), conflictNote('looked in')].filter((n) => n !== null).map((n) => ` ${n}`).join('');
-        appliedNote = whichCopy('applied to');
-
-        const entry = store.treeGet(mount.treeStateId, relativePath);
-        if (!entry) {
-          // A pass also drops a copy disk made binary or too large, which
-          // the disk-only answer describes; any other drop is disk's deletion.
-          const error = took('deleted') && report?.state !== 'disk-only'
-            ? `File not found: ${input.path}. Disk's copy was deleted since the workspace last agreed with it, and that was taken in first.`
-            : this.notInWorkspace(input.path, report);
-          return { success: false, error, isError: true };
-        }
-
-        const blob = store.getBlob(entry.blobHash);
-        if (!blob) {
-          return { success: false, error: `Blob not found for: ${input.path}`, isError: true };
-        }
-        // Decoding would turn each invalid sequence into U+FFFD, and writing
-        // the text back would change bytes the edit never named.
-        if (!isUtf8(blob)) {
-          return {
-            success: false,
-            isError: true,
-            error: `The edit did nothing: ${input.path} isn't valid UTF-8, so editing it would change bytes outside the text it replaces. `
-              + `Read shows each invalid byte sequence as U+FFFD, and a write replaces the whole file as UTF-8, so writing back what read shows puts U+FFFD in their place.${suffix}`,
-          };
-        }
-
-        let content = blob.toString('utf-8');
-
-        // An edit that would replace nothing is refused, replaceAll or not;
-        // without replaceAll, the text must occur once, and the refusal says
-        // how often it does. With replaceAll, whether it occurs is enough.
-        const count = input.replaceAll
-          ? Number(content.includes(input.oldString))
-          : content.split(input.oldString).length - 1;
-        if (count === 0) {
-          return { success: false, error: `String not found in ${input.path}.${suffix}`, isError: true };
-        }
-        if (count > 1 && !input.replaceAll) {
-          return {
-            success: false,
-            error: `String found ${count} times in ${input.path}. Use replaceAll: true or provide more context.${suffix}`,
-            isError: true,
-          };
-        }
-
-        // A replacer function, so that the new text goes in as given: in a
-        // replacement string, $&, $$, $' and $` are patterns.
-        content = input.replaceAll
-          ? content.replaceAll(input.oldString, () => input.newString)
-          : content.replace(input.oldString, () => input.newString);
-
-        const newBuffer = Buffer.from(content, 'utf-8');
-        const newBlobHash = store.storeBlob(newBuffer, 'text/plain');
-        const { refused, modeKept } = await this.commitToolChange(mount, relativePath, {
-          kind: 'set',
-          blobHash: newBlobHash,
-          size: newBuffer.byteLength,
-          mode: entry.mode,
-        }, () => { committed = true; });
-        if (refused !== null) return storedButUnfinished('edit', input.path, { refused }, appliedNote);
-
-        // The edit makes the path the workspace's own change (commitToolChange),
-        // so a file disk lacked goes back with this edit's push, or with the
-        // next materialize where the mount doesn't push. A push that didn't
-        // complete answers above, with its reason. One that completed met no
-        // conflict, since this push, unforced, stops at one: the edit made the
-        // two copies agree, which settles it, or there was none. So only a
-        // mount that doesn't push still holds the conflict the pass found.
+        // As every file tool's pass does, it names the paths it acts on, so a
+        // file the mount passes over by design is observed (see PassOptions.named).
+        const pass = await this.passUnlocked(mount, { kind: 'paths', paths: [...targets.values()].map((target) => target.relativePath) }, { named: true });
+        // Nothing below awaits until the commit's push.
+        const maxSize = mount.config.maxFileSize ?? DEFAULT_MAX_FILE_SIZE;
+        const hints = hintBudget();
+        // As much as the largest file the call names holds, at least, so the
+        // budget is the same whatever order its files are planned in.
+        let largest = maxSize;
+        for (const target of targets.values()) largest = Math.max(largest, store.treeGet(mount.treeStateId, target.relativePath)?.size ?? 0);
+        const counts = countBudget(largest);
+        const notes: string[] = [];
         const pushes = this.pushesOnCommit(mount);
-        const backOnDisk = report?.state === 'disk-missing-provenance-unknown'
-          ? `${pushes ? 'Its push put the file back on disk' : 'A materialize of the path puts it back on disk'}; if it was deleted there on purpose, delete it here too.`
-          : null;
-        const notes = [appliedNote, backOnDisk, pushes ? null : conflictNote('is in')].filter((n): n is string => n !== null);
+        const plans: Array<{ target: EditTarget; plan: FilePlan; mode: number; backOnDisk: string | null; conflictNote: string | null }> = [];
+        for (const target of targets.values()) {
+          const report = pass.reports.get(target.relativePath);
+          // A mode taken in alone isn't a change to the text: it brings nothing
+          // new to read, as it makes no event (emitFsEvents), and the edits
+          // then write at the mode disk has, so it leaves nothing to say.
+          const took = (op: TreeOp) => pass.ops.some((o) => o.path === target.relativePath && o.op === op && !o.modeOnly);
+          // Which copy the edits used, when it isn't the one the workspace
+          // last agreed on with disk: disk's newer text, or the workspace's
+          // copy because disk's couldn't be read or disk has none. A file the
+          // workspace didn't hold has no older copy, so taking it in needs no
+          // word.
+          const subject = tool === 'edit' ? 'the edit' : editList(target.edits);
+          const whichCopy = (verb: string): string | null => took('modified')
+            ? `Disk's copy${tool === 'edit' ? '' : ` of ${target.path}`} had changed since the workspace last agreed with it, so it was taken in first, and ${subject} ${verb} that text.`
+            : report?.state === 'unverified'
+              ? `${tool === 'edit' ? 'The path' : target.path} couldn't be checked against disk (${report.note ?? 'not observed'}), so ${subject} ${verb} the workspace's copy.`
+              : report?.state === 'disk-missing-provenance-unknown'
+                ? `Disk has no copy of ${tool === 'edit' ? 'this file' : target.path}, and nothing records whether it was deleted there, so ${subject} ${verb} the workspace's copy.`
+                : null;
+          // A conflict the pass found is named when the edits are refused for
+          // the text they found, on either kind of mount, and on a success
+          // where the mount doesn't push, since such a mount keeps the conflict
+          // until materialize or sync settles it. A pushing mount's push that
+          // completed met none: unforced, it stops at a conflict, so the edits
+          // made the two copies agree, which settles it, or there was none.
+          // Edits stored that couldn't finish leave it to the push's reason,
+          // which names the conflict, or to ls, which that answer points to
+          // when the rest of the call failed; where the store failed after
+          // recording them, the answer names it as the success does.
+          // What a sync does follows what disk holds now, whatever kind the
+          // conflict was recorded as: where disk has no copy, it takes the
+          // deletion; where disk has one, it keeps disk's copy and gives up
+          // the workspace's, though a copy the workspace can't hold, binary
+          // or past maxFileSize, isn't taken in.
+          const conflict = report?.state === 'conflict' ? report.conflict?.kind ?? 'both-changed' : null;
+          const conflictNote = (where: string): string | null => conflict === null ? null
+            : `${tool === 'edit' ? 'The path' : target.path} is in conflict with disk (${conflict}): ${subject} ${where} the workspace's copy. `
+              + (report?.diskNow === 'absent'
+                ? "Sync the path to take disk's deletion, which removes the workspace's copy, or materialize it with force to write the workspace's copy back to disk."
+                : "Sync the path to keep disk's copy and give up the workspace's, or materialize it with force to write the workspace's over disk's.");
+          applied.set(target, whichCopy('applied to'));
+          // The edits make the path the workspace's own change, so a file disk
+          // lacked goes back with this call's push, or with the next
+          // materialize where the mount doesn't push. A push that didn't
+          // complete answers with its reason instead.
+          const backOnDisk = report?.state !== 'disk-missing-provenance-unknown' ? null
+            : tool === 'edit'
+              ? `${pushes ? 'Its push put the file back on disk' : 'A materialize of the path puts it back on disk'}; if it was deleted there on purpose, delete it here too.`
+              : `${pushes ? `This call's push put ${target.path} back on disk` : `A materialize of ${target.path} puts it back on disk`}; if it was deleted there on purpose, delete it here too.`;
+          const lookedIn = [whichCopy('looked in'), conflictNote('looked in')].filter((note): note is string => note !== null);
+
+          const entry = store.treeGet(mount.treeStateId, target.relativePath);
+          if (!entry) {
+            // A pass also drops a copy disk made binary or too large, which
+            // the disk-only answer describes; any other drop is disk's deletion.
+            const text = took('deleted') && report?.state !== 'disk-only'
+              ? `File not found: ${target.path}. Disk's copy was deleted since the workspace last agreed with it, and that was taken in first.`
+              : this.notInWorkspace(target.path, report);
+            problems.push({ kind: 'file', edits: target.edits, path: target.path, text, whole: true });
+            continue;
+          }
+          notes.push(...lookedIn);
+          const blob = store.getBlob(entry.blobHash);
+          if (!blob) {
+            problems.push({ kind: 'file', edits: target.edits, path: target.path, text: `Blob not found for: ${target.path}`, whole: true });
+            continue;
+          }
+          // Decoding would turn each invalid sequence into U+FFFD, and writing
+          // the text back would change bytes the edits never named.
+          const file = decodeForEdit(blob);
+          if (!file) {
+            problems.push({
+              kind: 'file',
+              edits: target.edits,
+              path: target.path,
+              text: `${target.path} isn't valid UTF-8, so editing it would change bytes outside the text it replaces. `
+                + 'Read shows each invalid byte sequence as U+FFFD, and a write replaces the whole file as UTF-8, so writing back what read shows puts U+FFFD in their place.',
+              whole: false,
+            });
+            continue;
+          }
+          if (!target.specs.length) continue;
+          const planned = planFile(file, blob, target.specs, hints, maxSize, counts);
+          if ('problems' in planned) {
+            // One at a time: a call of many edits can have more problems
+            // than a spread passes as arguments.
+            for (const problem of planned.problems) problems.push({ ...problem, path: target.path });
+            continue;
+          }
+          // The planner refuses a file its counts take past the limit before
+          // building it, from the least its bytes can be; one it built past
+          // the limit, as its CRs or multi-byte characters can take it, is
+          // refused here.
+          if ('tooLarge' in planned || planned.plan.bytes.length > maxSize) {
+            const size = 'tooLarge' in planned ? `at least ${planned.tooLarge.toLocaleString('en-US')}` : planned.plan.bytes.length.toLocaleString('en-US');
+            problems.push({
+              kind: 'file',
+              edits: target.edits,
+              path: target.path,
+              text: `${target.path} would be ${size} bytes with ${tool === 'edit' ? 'this edit' : editList(target.edits)}, `
+                + `past the ${maxSize.toLocaleString('en-US')}-byte limit this mount sets on a file, so the workspace couldn't keep it. `
+                + "An edit that leaves the file within the limit applies. The limit is the mount's maxFileSize setting, which only whoever runs the host can change.",
+              whole: false,
+            });
+            continue;
+          }
+          plans.push({
+            target,
+            plan: planned.plan,
+            mode: entry.mode,
+            backOnDisk,
+            conflictNote: pushes ? null : conflictNote(tool === 'edit' || target.edits.length === 1 ? 'is in' : 'are in'),
+          });
+          const conflicted = plans.at(-1)!.conflictNote;
+          if (conflicted !== null) conflicts.set(target, conflicted);
+        }
+        if (problems.length) return refuse(problems, notes);
+
+        const { refused, modeKept } = await this.commitToolChanges(mount, plans.map(({ target, plan, mode }) => ({
+          path: target.relativePath,
+          change: { kind: 'set' as const, blobHash: store.storeBlob(plan.bytes, 'text/plain'), size: plan.bytes.length, mode },
+        })), () => { committed = true; });
+        if (refused.size > 0) return this.editsStoredButUnfinished(tool, [...targets.values()], applied, conflicts, { refused, modeKept }, maxChars);
         return {
           success: true,
-          data: {
-            path: input.path,
-            size: newBuffer.byteLength,
-            ...(notes.length > 0 ? { note: notes.join(' ') } : {}),
-            ...(modeKept ? { modeKept } : {}),
-          },
+          data: editReceipt(tool, plans.map(({ target, plan, backOnDisk, conflictNote }) => ({
+            path: target.path,
+            plan,
+            notes: [applied.get(target) ?? null, backOnDisk, conflictNote].filter((note): note is string => note !== null),
+            modeKept: modeKept.get(target.relativePath) ?? null,
+          })), given.length, maxChars),
         };
       });
     } catch (error) {
-      if (!committed) throw error;
-      return storedButUnfinished('edit', input.path, { threw: error instanceof Error ? error.message : String(error) }, appliedNote);
+      const message = error instanceof Error ? error.message : String(error);
+      if (committed) {
+        return this.editsStoredButUnfinished(tool, [...targets.values()], applied, conflicts, error instanceof StoredThenFailed
+          ? { storeFailed: message, pushes: error.pushes }
+          : { threw: message }, maxChars);
+      }
+      // A set that threw and couldn't be read back may have stored the edits,
+      // and a second call could then apply them twice.
+      if (error instanceof CommitUnknownError) {
+        const [set, read] = [cutLine(error.setError), cutLine(error.readError)];
+        return {
+          success: false,
+          isError: true,
+          error: tool === 'edit_many'
+            ? `The edit_many call can't tell whether it stored its edits: the store failed as it set them (${set}), and reading them back failed too (${read}). `
+              + 'Read its files before sending it again: a second call can apply its edits twice.'
+            : `Whether the edit of "${[...targets.values()][0]!.path}" is stored isn't known: the store failed as it set it (${set}), and reading it back failed too (${read}). `
+              + 'Read the file before sending the edit again: a second edit can apply the change twice.',
+        };
+      }
+      // The commit sets every entry in one record or none, and a set that
+      // threw was read back, so nothing is stored; or every change was one
+      // the tree already held, which leaves the tree as it was either way.
+      if (tool === 'edit_many') return { success: false, isError: true, error: `The edit_many call stored none of its edits: ${cutLine(message)}` };
+      throw error;
     }
+  }
+
+  /**
+   * Where an edit's path is in its mount, or why the call can't edit it: a
+   * path no mount holds, one outside its mount or holding a lone surrogate
+   * (parsePath), one a nested mount holds or that leads into one through a
+   * link (parseFilePath), a path that names its mount's root, one not spelled
+   * plainly, a read-only mount, or for edit_many a generated file. edit's
+   * generated file is refused before it gets here, by the same rule
+   * (handleToolCall checks a call's `path`, which edit_many's input lacks).
+   */
+  private async editablePath(
+    tool: EditTool,
+    path: string,
+    callerAgentName: string | undefined,
+  ): Promise<{ mount: MountState; relativePath: string; path: string } | Extract<EditProblem, { kind: 'file' }>> {
+    const unusable = (text: string) => ({ kind: 'file' as const, edits: [], path, text, whole: true });
+    try {
+      // As disk spells it, as every file tool takes its path, and a path in a
+      // mount nested inside this one is that mount's, which every file tool
+      // refuses here (parseFilePath).
+      const where = await this.parseFilePath(path);
+      // The workspace keeps an entry for each spelling of a path, so a path
+      // with an empty, "." or ".." segment, a trailing separator, or on
+      // Windows a backslash, would be an entry apart from the file's own, and
+      // two spellings in one call two plans of one file. Its plain spelling is
+      // where it resolves in the mount, as the containment check resolves it.
+      // A path whose part in the mount starts with a separator is absolute:
+      // parsePath refuses it where it resolves outside the mount, and this
+      // check where it names a place inside, as not plain. One that resolves
+      // to the mount's root, its bare name included, names no file.
+      const root = resolve(where.mount.config.path);
+      const plain = relative(root, resolve(root, where.relativePath)).split(sep).join('/');
+      if (plain === '') return unusable(`${path} names the root of mount "${where.mount.config.name}", which isn't a file; ls ${where.mount.config.name} lists the files in it.`);
+      if (plain !== where.relativePath) {
+        const named = `${where.mount.config.name}/${plain}`;
+        return unusable(`${path} isn't the plain spelling of its path, and the workspace would keep it as an entry apart from ${named}, the same file on disk; name it ${named}.`);
+      }
+      if (where.mount.config.mode === 'read-only') return unusable(`Mount "${where.mount.config.name}" is read-only`);
+      const generated = tool === 'edit_many' ? this.findGeneratedTextFile(path) : undefined;
+      if (generated) return unusable(`${path}: ${this.generatedFileRefusal(generated, callerAgentName)}.`);
+      return where;
+    } catch (error) {
+      return unusable(error instanceof Error ? error.message : String(error));
+    }
+  }
+
+  /**
+   * Why a call can't change a generated file: another agent's is that agent's,
+   * and the agent's own is read-only, since it shows the agent's tool
+   * presentation, which set_tool_visibility and set_tool_description change.
+   */
+  private generatedFileRefusal(generated: { agentName: string }, callerAgentName: string | undefined): string {
+    return callerAgentName !== generated.agentName
+      ? 'Generated file belongs to another agent'
+      : 'Generated file is read-only; change the tool presentation it shows with set_tool_visibility or set_tool_description instead';
+  }
+
+  /**
+   * The answer to edits stored but not finished: the commit set every file's
+   * entry, and then disk refused some of their pushes, or the store failed
+   * after recording them, so their push didn't run, or the rest of the call
+   * failed. It stays an error, since part of the call failed, and leads with
+   * what is stored, which must not be sent again: a second call can apply
+   * those edits twice. edit's is the answer write and delete give, one path's;
+   * edit_many's lists the files disk refused, each with its push's reason,
+   * notes each file disk took with its mode left as disk had it, as the
+   * success answer's `modeKept` does, within `maxChars`, and never says to
+   * send the call again. Where the store failed after recording the edits,
+   * which stand as on a success, it names each conflict the success answer
+   * would (`conflicts`, found only where the mount doesn't push).
+   */
+  private editsStoredButUnfinished(
+    tool: EditTool,
+    targets: EditTarget[],
+    applied: Map<EditTarget, string | null>,
+    conflicts: Map<EditTarget, string>,
+    outcome: { refused: Map<string, string>; modeKept: Map<string, string> } | { threw: string } | { storeFailed: string; pushes: boolean },
+    maxChars: number,
+  ): ToolResult {
+    const conflictOf = (target: EditTarget) => ('storeFailed' in outcome ? conflicts.get(target) ?? null : null);
+    if (tool === 'edit') {
+      const [target] = targets;
+      const note = [applied.get(target!) ?? null, conflictOf(target!)].filter((text): text is string => text !== null).join(' ');
+      return storedButUnfinished('edit', target!.path, 'refused' in outcome ? { refused: outcome.refused.get(target!.relativePath)! } : outcome, note || null);
+    }
+    const stored = "Every edit of this call is stored in the workspace, so don't send the call again: a second call can apply its edits twice.";
+    // The head is never cut, so what stands for the whole call goes in it,
+    // and the parts are the files disk refused, each with its push's reason.
+    let head: string;
+    const parts: string[] = [];
+    if ('refused' in outcome) {
+      const files = targets.length;
+      const refused = outcome.refused.size;
+      head = `${stored}\n\n${files === 1
+        ? "Disk didn't take the call's one file. Its push didn't complete:"
+        : `Disk took ${files - refused} of the call's ${files} files. ${refused === 1
+          ? "This file's push didn't complete:"
+          : "These files' pushes didn't complete, each with its reason:"}`}`;
+      for (const target of targets) {
+        const reason = outcome.refused.get(target.relativePath);
+        if (reason !== undefined) parts.push(`${target.path}: ${reason}`);
+      }
+    } else if ('storeFailed' in outcome) {
+      head = `${stored}\n\nThe store failed after recording them: ${cutLine(outcome.storeFailed)}.`
+        + (outcome.pushes ? " Their push to disk didn't run, so disk lacks them until a materialize of their files writes them." : '');
+    } else {
+      head = `${stored}\n\nThe rest of the call failed: ${cutLine(outcome.threw)}. ls shows each path's state.`;
+    }
+    const kept = 'modeKept' in outcome
+      ? targets.flatMap((target) => {
+        const reason = outcome.modeKept.get(target.relativePath);
+        return reason === undefined ? [] : [`Disk took ${target.path}: ${reason}.`];
+      })
+      : [];
+    const notes = [
+      ...kept,
+      ...targets.flatMap((target) => [applied.get(target) ?? null, conflictOf(target)]).filter((note): note is string => !!note),
+    ];
+    return { success: false, isError: true, error: fitted(head, parts, notes, maxChars, 'stored') };
   }
 
   private async handleDelete(input: DeleteInput): Promise<ToolResult> {
@@ -3250,6 +3717,13 @@ export class WorkspaceModule implements Module {
       });
     } catch (error) {
       if (!committed) throw error;
+      if (error instanceof StoredThenFailed) {
+        // Its note, as the success answer's: a deletion that cleared a
+        // conflict naming a disk file unlinked nothing.
+        const note = error.notes.get(relativePath);
+        return storedButUnfinished('delete', input.path, { storeFailed: error.message, pushes: error.pushes },
+          note === undefined ? null : `${note.charAt(0).toUpperCase()}${note.slice(1)}.`);
+      }
       return storedButUnfinished('delete', input.path, { threw: error instanceof Error ? error.message : String(error) });
     }
   }
@@ -3544,8 +4018,10 @@ export class WorkspaceModule implements Module {
       const intents = this.intents.get(name)!.list().filter(([p]) => own(p));
       const conflictPaths = intents.filter(([, bi]) => bi.conflict).map(([p]) => p);
       // A workspace deletion is pending until a push confirms it on disk:
-      // left there without applyDeletions, or unlinked but unconfirmed.
-      const deletionPaths = intents.filter(([, bi]) => bi.tombstone).map(([p]) => p);
+      // left there without applyDeletions, or unlinked but unconfirmed. A
+      // tombstone beside an entry that's still there, left by a deletion or
+      // a write that stopped partway (commitToolChanges), is no deletion.
+      const deletionPaths = intents.filter(([p, bi]) => bi.tombstone && !store.treeGet(mount.treeStateId, p)).map(([p]) => p);
       // Pending is what disk owes by the evidence: every entry it doesn't
       // show on disk (a refused or failed push stays owed), conflicts and
       // deletions. An entry from before the evidence isn't counted until a
@@ -3600,7 +4076,11 @@ export class WorkspaceModule implements Module {
 
     const { owed, unchecked, agreed } = this.entriesByEvidence(mount);
     for (const path of [...owed, ...unchecked]) selected.add(path);
-    for (const [p, bi] of intents) if (bi.conflict || bi.tombstone) selected.add(p);
+    // A tombstone is a deletion only where its entry is gone: one beside an
+    // entry that's still there, left by a change that stopped partway
+    // (commitToolChanges), would select an agreed entry, and a forced push
+    // would write it over a newer disk copy.
+    for (const [p, bi] of intents) if (bi.conflict || (bi.tombstone && !store.treeGet(mount.treeStateId, p))) selected.add(p);
     return { paths: [...selected], inPlace: agreed > 0 };
   }
 
@@ -4187,6 +4667,79 @@ function stateView(report: PathReport): Record<string, unknown> {
 /** A lone UTF-16 surrogate, which UTF-8 can't store: in `u` mode, a pair is one code point. */
 const LONE_SURROGATE = /\p{Cs}/u;
 
+/** A change commitToolChanges makes to one path's tree entry. */
+type ToolChange = { kind: 'set'; blobHash: string; size: number; mode?: number } | { kind: 'remove'; previousHash: string };
+
+/** A file an edit or edit_many call edits: one stored path, and every edit naming it. */
+interface EditTarget {
+  /** Its path in its mount, as disk spells it: the store's key for it. */
+  relativePath: string;
+  /** Its mount-prefixed path as disk spells it, which its answer uses. */
+  path: string;
+  /** Every edit naming it, by index, and the specs of those fit to be matched. */
+  edits: number[];
+  specs: EditSpec[];
+}
+
+/**
+ * Whether a tree entry is what a change leaves: for a set, an entry with its
+ * blob, size and mode; for a removal, none.
+ */
+function holds(entry: ReturnType<JsStore['treeGet']>, change: ToolChange): boolean {
+  return change.kind === 'set'
+    ? entry !== null && entry.blobHash === change.blobHash && entry.size === change.size && entry.mode === (change.mode ?? 0o644)
+    : entry === null;
+}
+
+/**
+ * Whether a store's set that threw recorded the changes anyway: every path
+ * holds what its change leaves. The changes given are those the tree didn't
+ * hold before the set, and one record takes all of them or none, so their
+ * holding shows the record is in. Reading them back can fail too, and then
+ * whether they're stored isn't known (CommitUnknownError).
+ */
+function changesLanded(
+  store: JsStore,
+  treeStateId: string,
+  changes: Array<{ path: string; change: ToolChange }>,
+  setError: unknown,
+): boolean {
+  try {
+    return changes.every(({ path, change }) => holds(store.treeGet(treeStateId, path), change));
+  } catch (readError) {
+    throw new CommitUnknownError(setError, readError);
+  }
+}
+
+/**
+ * A store's set threw, and reading its entries back threw too, so whether the
+ * change is stored isn't known. Its message says so after both errors.
+ */
+class CommitUnknownError extends Error {
+  readonly setError: string;
+  readonly readError: string;
+  constructor(setError: unknown, readError: unknown) {
+    const text = (error: unknown) => (error instanceof Error ? error.message : String(error));
+    super(`${text(setError)}; reading its entries back failed too (${text(readError)}), so whether the change is stored isn't known`);
+    this.name = 'CommitUnknownError';
+    this.setError = text(setError);
+    this.readError = text(readError);
+  }
+}
+
+/**
+ * A store's set that threw after recording the change (changesLanded): the
+ * entries are set and their intents follow, and the store's error goes on in
+ * place of the push. `pushes` says whether the mount would have pushed the
+ * change to disk, and `notes` are commitToolChanges' own, by path.
+ */
+class StoredThenFailed extends Error {
+  constructor(storeError: unknown, readonly pushes: boolean, readonly notes: Map<string, string>) {
+    super(storeError instanceof Error ? storeError.message : String(storeError));
+    this.name = 'StoredThenFailed';
+  }
+}
+
 /**
  * The answer to a write, edit or delete that the workspace stored but
  * couldn't finish: its push to disk didn't complete, or what follows the tree
@@ -4195,12 +4748,13 @@ const LONE_SURROGATE = /\p{Cs}/u;
  * and sending it again could apply it twice. The push's reason says what disk
  * holds and the way out, as materialize takes it. The text carries all of it,
  * since an error's data reaches neither the model nor a code_execution
- * script. An edit's note on which copy it applied to comes last.
+ * script. A note comes last: an edit's on which copy it applied to, or a
+ * deletion's that it unlinked nothing.
  */
 function storedButUnfinished(
   tool: 'write' | 'edit' | 'delete',
   path: string,
-  outcome: { refused: string } | { threw: string },
+  outcome: { refused: string } | { threw: string } | { storeFailed: string; pushes: boolean },
   note: string | null = null,
 ): ToolResult {
   const change = tool === 'delete' ? 'deletion' : tool;
@@ -4208,7 +4762,12 @@ function storedButUnfinished(
     + (tool === 'edit' ? ': a second edit can apply the change twice.' : '.');
   const rest = 'refused' in outcome
     ? ` Its push to disk didn't complete: ${outcome.refused}.`
-    : ` The rest of the call failed: ${outcome.threw}. ls shows the path's state.`;
+    : 'storeFailed' in outcome
+      ? ` The store failed after recording it: ${outcome.storeFailed}.` + (!outcome.pushes ? ''
+        : tool === 'delete'
+          ? ' Its push to disk didn\'t run, so disk keeps the file until a materialize of the path with applyDeletions deletes it.'
+          : ' Its push to disk didn\'t run, so disk lacks the change until a materialize of the path writes it.')
+      : ` The rest of the call failed: ${outcome.threw}. ls shows the path's state.`;
   return { success: false, isError: true, error: stored + rest + (note !== null ? ` ${note}` : '') };
 }
 
@@ -4230,16 +4789,19 @@ function linesOf(content: string): string[] {
 const INPUT_MINIMUMS: Record<string, Record<string, number>> = {
   read: { offset: 1, limit: 1, offsetChars: 0, limitChars: 1 },
   grep: { contextBefore: 0, contextAfter: 0 },
+  edit_many: { occurrences: 1 },
 };
 
 /**
  * Why a tool call's input doesn't fit its tool's schema, or null when it does:
  * an object, each required field present, and each field its schema calls a
  * string, a boolean or an integer of that type, an integer at least its
- * minimum. The workspace's schemas use no other types. Without it, an edit
- * missing `newString` wrote the word "undefined", and an offset of 1.5
- * numbered lines 1.5, 2.5 and on. A field the schema doesn't describe is left
- * to its handler.
+ * minimum. A field it calls an array of objects is an array, and each of its
+ * items is checked the same way against the items' schema, with the same
+ * minimums (edit_many's edits). The workspace's schemas use no other types.
+ * Without it, an edit missing `newString` wrote the word "undefined", and an
+ * offset of 1.5 numbered lines 1.5, 2.5 and on. A field the schema doesn't
+ * describe is left to its handler.
  */
 function inputProblem(
   schema: { properties?: Record<string, unknown>; required?: string[] },
@@ -4254,17 +4816,28 @@ function inputProblem(
     if (fields[name] === undefined) return `"${name}" is required`;
   }
   for (const [name, value] of Object.entries(fields)) {
-    const type = (schema.properties?.[name] as { type?: string } | undefined)?.type;
+    const property = schema.properties?.[name] as { type?: string; items?: { type?: string } } | undefined;
+    const type = property?.type;
     if (value === undefined || type === undefined) continue;
     const minimum = minimums[name];
     const fits = type === 'string' ? typeof value === 'string'
       : type === 'boolean' ? typeof value === 'boolean'
       : type === 'integer'
         ? Number.isSafeInteger(value) && (minimum === undefined || (value as number) >= minimum)
+      : type === 'array' ? Array.isArray(value)
         : true;
+    if (fits && type === 'array' && property?.items?.type === 'object') {
+      for (const [i, item] of (value as unknown[]).entries()) {
+        const problem = item !== null && typeof item === 'object' && !Array.isArray(item)
+          ? inputProblem(property.items as Parameters<typeof inputProblem>[0], item, minimums)
+          : 'it must be an object of the fields its schema lists';
+        if (problem !== null) return `"${name}" item ${i + 1}: ${problem}`;
+      }
+    }
     if (!fits) {
       const wanted = type === 'string' ? 'a string'
         : type === 'boolean' ? 'true or false'
+        : type === 'array' ? 'an array'
         : minimum === undefined ? 'a whole number' : `a whole number of at least ${minimum}`;
       const got = value === null ? 'null'
         : typeof value === 'number' ? String(value)

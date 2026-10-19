@@ -257,6 +257,20 @@ export interface EditInput {
   replaceAll?: boolean;
 }
 
+export interface EditManyInput {
+  /** The edits, each matched in its file as the call reads it, all in one mount's files. */
+  edits: Array<{
+    /** File path (mount-prefixed) */
+    path: string;
+    /** Exact text to replace */
+    oldString: string;
+    /** Text to replace it with */
+    newString: string;
+    /** How many times oldString occurs in the file (default: 1); every one is replaced. */
+    occurrences?: number;
+  }>;
+}
+
 export interface DeleteInput {
   /** File path (mount-prefixed) */
   path: string;

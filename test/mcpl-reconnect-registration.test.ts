@@ -10,8 +10,8 @@
  * connect holds both planes until the grant is established; a reconnect must
  * hold them too, both for a connection that was already open (an ordinary
  * disconnect) and for a stub that had never opened (a first reconnect while
- * startup is still staging other servers), and whatever gate completes
- * meanwhile, since each gate's completion opens every connection's planes.
+ * startup is still staging other servers), and whatever opens every
+ * connection's planes meanwhile (startup's staged open, a resume).
  */
 import { describe, it, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
@@ -128,18 +128,17 @@ describe('MCPL reconnect and channel registration', () => {
       enabledFeatureSets: ['chat'],
       ...(id === 'retry' ? { reconnect: true, reconnectIntervalMs: 20 } : {}),
     });
-    // Record each gate completion that opens every connection's planes
-    // (startup's staged open among them), and whether the retry's exchange
-    // was in flight then.
+    // Record each open of every connection's planes (startup's staged open
+    // among them), and whether the retry's exchange was in flight then.
     const opensOfEvery: boolean[] = [];
-    const proto = AgentFramework.prototype as unknown as { completeMcplDataPlaneGate: (barrier: unknown) => boolean };
-    const completeMcplDataPlaneGate = proto.completeMcplDataPlaneGate;
-    proto.completeMcplDataPlaneGate = function (this: any, barrier: unknown) {
-      if (this.discordAwarenessBarrier === barrier) {
+    const proto = AgentFramework.prototype as unknown as { readyMcplPlanes: (connections?: unknown[]) => void };
+    const readyMcplPlanes = proto.readyMcplPlanes;
+    proto.readyMcplPlanes = function (this: any, connections?: unknown[]) {
+      if (connections === undefined) {
         const retryConnection = this.mcplServerRegistry?.getServer('retry');
         opensOfEvery.push(!!retryConnection && this.mcplPolicyExchanges.get(retryConnection) === retryConnection.transportEpoch);
       }
-      return completeMcplDataPlaneGate.call(this, barrier);
+      return readyMcplPlanes.call(this, connections);
     };
     const traces: Array<{ type: string; moduleName?: string }> = [];
     try {
@@ -155,11 +154,11 @@ describe('MCPL reconnect and channel registration', () => {
         ],
       });
     } finally {
-      proto.completeMcplDataPlaneGate = completeMcplDataPlaneGate;
+      proto.readyMcplPlanes = readyMcplPlanes;
     }
     const retry = () => serverEvents(eventsPath).filter((e) => e.role === 'retry');
     await waitFor('the retry\'s policy answer held', () => retry().some((e) => e.event === 'policy-held'));
-    assert.ok(opensOfEvery.includes(true), `a gate opened every connection's planes while the retry's exchange was in flight: ${JSON.stringify(opensOfEvery)}`);
+    assert.ok(opensOfEvery.includes(true), `startup opened every connection's planes while the retry's exchange was in flight: ${JSON.stringify(opensOfEvery)}`);
     assert.equal(
       retry().find((e) => e.event === 'register-answered'),
       undefined,
@@ -180,7 +179,7 @@ describe('MCPL reconnect and channel registration', () => {
     assert.equal(announced(), 1);
   });
 
-  it('the registry runs onRegister before it registers the connection, so no gate sees a connect before its exchange is marked', async () => {
+  it('the registry runs onRegister before it registers the connection, so no opener sees a connect before its exchange is marked', async () => {
     const registry = new McplServerRegistry();
     const registeredAtCall: boolean[] = [];
     try {
@@ -197,10 +196,10 @@ describe('MCPL reconnect and channel registration', () => {
     }
   });
 
-  it("a staged connect's exchange holds its planes though another server's reconnect completes its gate meanwhile", async () => {
+  it("a staged connect's exchange holds its planes though another server reconnects and opens meanwhile", async () => {
     // `retry` fails its first connect and reconnects while `stager`'s staged
-    // policy answer is held; the retry's gate completes then, opening every
-    // connection's planes but the one whose exchange is in flight.
+    // policy answer is held; the retry's reconnect settles and opens its own
+    // planes then, and none of the stager's, whose exchange is in flight.
     const eventsPath = join(dir, 'events.jsonl');
     const pending = join(dir, 'policy-pending');
     const release = join(dir, 'policy-release');
@@ -244,11 +243,10 @@ describe('MCPL reconnect and channel registration', () => {
   });
 });
 
-describe('MCPL policy exchanges hold their planes against every gate', () => {
+describe('MCPL policy exchanges hold their planes against every opener', () => {
   /**
    * A framework with one connection whose policy answers wait for the test.
-   * No awareness outbox is configured, so a gate holds nothing back and
-   * completes as it is released, opening every connection it doesn't pass by.
+   * No awareness ledger is configured, so nothing is delivered.
    */
   function harness() {
     const answers: Array<(receipt: { accepted: true }) => void> = [];
@@ -257,9 +255,6 @@ describe('MCPL policy exchanges hold their planes against every gate', () => {
     let relisted = 0;
     const config = { id: 'srv', command: 'unused', enabledFeatureSets: ['chat'] };
     let registered = false;
-    // The awareness accounting each next gate waits on, in order; a gate
-    // with none queued has nothing pending.
-    const accounting: Array<Promise<unknown>> = [];
     const connection = Object.assign(new EventEmitter(), {
       id: 'srv',
       transportEpoch: 0,
@@ -275,8 +270,6 @@ describe('MCPL policy exchanges hold their planes against every gate', () => {
     const fw = Object.create(AgentFramework.prototype) as any;
     fw.traceListeners = [];
     fw.mcplPolicyExchanges = new WeakMap();
-    fw.discordAwarenessBarrier = null;
-    fw.discordAwarenessBarrierGeneration = 0;
     fw.discordAwarenessOutbox = null;
     // A runtime connect of this stdio server derives the protective reaction
     // default; with no outbox here, it covers the configured marker alone.
@@ -297,12 +290,6 @@ describe('MCPL policy exchanges hold their planes against every gate', () => {
       },
     };
     fw.handleToolsListChanged = () => { relisted++; };
-    fw.beginDiscordAwarenessBarrier = () => {
-      const pending = accounting.shift();
-      return pending
-        ? { requiresBarrier: true, promise: pending }
-        : { requiresBarrier: false, promise: Promise.resolve({ status: 'delivered', delivered: 0, failed: 0 }) };
-    };
     const traces: string[] = [];
     fw.onTrace((event: { type: string }) => traces.push(event.type));
     return {
@@ -312,33 +299,13 @@ describe('MCPL policy exchanges hold their planes against every gate', () => {
       failures,
       counts,
       relisted: () => relisted,
-      /** The next gate waits on accounting this test settles. */
-      pendingAccounting: () => {
-        let settle!: () => void;
-        accounting.push(new Promise<unknown>((resolve) => { settle = () => resolve({ status: 'delivered', delivered: 0, failed: 0 }); }));
-        return settle;
-      },
-      /** The next gate's accounting fails with this error. */
-      failingAccounting: (error: Error) => {
-        const failed = Promise.reject(error);
-        failed.catch(() => {});
-        accounting.push(failed);
-      },
       announced: () => traces.filter((type) => type === 'mcpl:server-reconnected' || type === 'module:added'),
       settle: () => new Promise((resolve) => setImmediate(resolve)),
       /** A connection already serving, with the framework's listeners. */
       serve: () => { registered = true; fw.wireMcplEvents(connection, config); },
-      /** What startup's staged open, a resume or an awareness sync does: a
-       *  gate over every connection, released and completed. */
-      gate: async () => {
-        const barrier = fw.installMcplDataPlaneGate();
-        fw.releaseMcplDataPlaneGate(barrier);
-        await barrier.promise;
-        fw.completeMcplDataPlaneGate(barrier);
-      },
-      /** Another server's tools/list_changed, with nothing pending: its gate
-       *  completes as it is released, synchronously. */
-      listChange: () => fw.releaseMcplDataPlaneGate(fw.installMcplDataPlaneGate()),
+      /** What startup's staged open and a resume do: open every connection's
+       *  planes. */
+      openEvery: () => fw.readyMcplPlanes(),
       reconnect: () => { connection.transportEpoch++; connection.isConnected = true; connection.emit('reconnect', { attempts: 1 }); },
       /** The transport closes, as its close handler leaves the connection. */
       drop: () => { connection.transportEpoch++; connection.isConnected = false; },
@@ -348,29 +315,18 @@ describe('MCPL policy exchanges hold their planes against every gate', () => {
     };
   }
 
-  it("no other gate (startup's staged open, a resume) releases a reconnect's traffic before its exchange settles", async () => {
+  it("no opener (startup's staged open, a resume) releases a reconnect's traffic before its exchange settles", async () => {
     const h = harness();
     h.serve();
     h.reconnect();
-    await h.gate();
+    h.openEvery();
     assert.deepEqual(h.counts, { opened: 0, controlOnly: 0, granted: 0 }, 'held, both planes, while the policy exchange is in flight');
     h.answers[0]({ accepted: true });
     await h.settle();
-    assert.deepEqual(h.counts, { opened: 1, controlOnly: 0, granted: 1 }, 'opened once its exchange settled, though the gate that replaced its own had completed');
+    assert.deepEqual(h.counts, { opened: 1, controlOnly: 0, granted: 1 }, 'opened by its own handler once its exchange settled');
     assert.deepEqual(h.announced(), ['mcpl:server-reconnected', 'module:added']);
-    await h.gate();
+    h.openEvery();
     assert.equal(h.counts.opened, 2, 'and no longer passed by');
-  });
-
-  it("another server's list change during a reconnect's exchange doesn't open it either", async () => {
-    const h = harness();
-    h.serve();
-    h.reconnect();
-    h.listChange();
-    assert.deepEqual(h.counts, { opened: 0, controlOnly: 0, granted: 0 });
-    h.answers[0]({ accepted: true });
-    await h.settle();
-    assert.deepEqual(h.counts, { opened: 1, controlOnly: 0, granted: 1 });
   });
 
   it('a superseded exchange never opens the planes of the transport that replaced it', async () => {
@@ -384,61 +340,35 @@ describe('MCPL policy exchanges hold their planes against every gate', () => {
     // exchange's transport apart from it.
     assert.deepEqual(h.announced(), [], 'the older exchange announces nothing');
     assert.equal(h.relisted(), 0, 'nor relists the tools');
-    await h.gate();
+    h.openEvery();
     assert.deepEqual(h.counts, { opened: 0, controlOnly: 0, granted: 0 }, 'the older answer grants nothing, and the newer exchange is still in flight');
     h.answers[1]({ accepted: true });
     await h.settle();
     assert.deepEqual(h.counts, { opened: 1, controlOnly: 0, granted: 1 });
   });
 
-  it('a transport that drops during its exchange is not announced, and its late answer grants nothing', async () => {
+  it('a transport that drops during its exchange is readied between transports, not announced, and its late answer grants nothing', async () => {
     const h = harness();
     h.serve();
     h.reconnect();
     h.drop();
     h.answers[0]({ accepted: true }); // answered just as the transport went
     await h.settle();
-    // Its gate's completion still readies every connection, this one between
-    // transports too: what a boundary kept stays held for the next grant
-    // (mcpl-reconnect-events pins that), and its own reports go on.
+    // Its handler still readies it, between transports: what a boundary kept
+    // stays held for the next grant (mcpl-reconnect-events pins that), and
+    // its own reports go on.
     assert.equal(h.counts.granted, 0, "the dead transport's answer grants nothing");
+    assert.equal(h.counts.opened, 1, 'readied between transports, so its own reports go on');
     assert.deepEqual(h.announced(), [], 'and announces nothing');
     assert.equal(h.relisted(), 0, 'nor relists its tools');
     // The next transport's exchange grants, opens and announces.
-    const opened = h.counts.opened;
     h.reconnect();
     h.answers[1]({ accepted: true });
     await h.settle();
     assert.equal(h.counts.granted, 1);
-    assert.equal(h.counts.opened, opened + 1);
+    assert.equal(h.counts.opened, 2);
     assert.deepEqual(h.announced(), ['mcpl:server-reconnected', 'module:added']);
     assert.equal(h.relisted(), 1);
-  });
-
-  it('a transport that drops after its exchange, before its awareness drain ends, is not announced', async () => {
-    const h = harness();
-    h.serve();
-    const settleAccounting = h.pendingAccounting(); // the reconnect's own gate waits on a drain
-    h.reconnect();
-    h.answers[0]({ accepted: true });
-    await h.settle();
-    h.drop();
-    settleAccounting();
-    await h.settle();
-    assert.deepEqual(h.announced(), [], 'its close reported it gone; the next reconnect announces it');
-  });
-
-  it("is announced though a newer gate replaced its own before the drain ended, so a stub's first reconnect is announced", async () => {
-    const h = harness();
-    h.serve();
-    const settleAccounting = h.pendingAccounting(); // the reconnect's own gate waits on a drain
-    h.reconnect();
-    h.listChange(); // another server's list change replaces it
-    h.answers[0]({ accepted: true });
-    await h.settle();
-    settleAccounting();
-    await h.settle();
-    assert.deepEqual(h.announced(), ['mcpl:server-reconnected', 'module:added']);
   });
 
   it("says a policy Request its transport's close ended was ended by the close, not unanswered", async (t) => {
@@ -454,21 +384,6 @@ describe('MCPL policy exchanges hold their planes against every gate', () => {
     assert.equal(logged.some((line) => line.includes('did not answer the initial policy Request')), false);
   });
 
-  it("an exchange that settles while a newer gate holds data opens only its control plane, and that gate's completion its data", async () => {
-    const h = harness();
-    h.serve();
-    h.reconnect();
-    const settleAccounting = h.pendingAccounting();
-    const sync = h.gate(); // an awareness sync with work pending: its gate releases control planes and holds data
-    assert.deepEqual(h.counts, { opened: 0, controlOnly: 0, granted: 0 }, "the sync's release passes the exchange by");
-    h.answers[0]({ accepted: true });
-    await h.settle();
-    assert.deepEqual(h.counts, { opened: 0, controlOnly: 1, granted: 1 });
-    settleAccounting();
-    await sync;
-    assert.deepEqual(h.counts, { opened: 1, controlOnly: 1, granted: 1 });
-  });
-
   it('a reconnect on a quiesced host opens only the control plane, and a resume the data plane', async () => {
     const h = harness();
     h.serve();
@@ -478,41 +393,41 @@ describe('MCPL policy exchanges hold their planes against every gate', () => {
     await h.settle();
     assert.deepEqual(h.counts, { opened: 0, controlOnly: 1, granted: 1 }, 'data stays held for the maintenance window');
     h.fw.quiesced = false;
-    await h.gate(); // resume()
+    h.openEvery(); // resume()
     assert.equal(h.counts.opened, 1);
   });
 
-  it("a reconnect whose exchange a gate overtook on a quiesced host opens only its control plane", async () => {
+  it('a reconnect whose exchange an open of every connection overtook on a quiesced host opens only its control plane', async () => {
     const h = harness();
     h.serve();
     h.fw.quiesced = true;
     h.reconnect();
-    await h.gate();
+    h.openEvery();
     assert.deepEqual(h.counts, { opened: 0, controlOnly: 0, granted: 0 }, 'held, control plane too, while the exchange is in flight');
     h.answers[0]({ accepted: true });
     await h.settle();
     assert.deepEqual(h.counts, { opened: 0, controlOnly: 1, granted: 1 });
   });
 
-  it("a runtime connect's exchange holds its planes against a gate until it settles", async () => {
+  it("a runtime connect's exchange holds its planes against an open of every connection until it settles", async () => {
     const h = harness();
     const connecting = h.connect();
     await h.settle();
     assert.equal(h.answers.length, 1, 'its policy Request is in flight');
-    await h.gate(); // a resume during the connect
+    h.openEvery(); // a resume during the connect
     assert.deepEqual(h.counts, { opened: 0, controlOnly: 0, granted: 0 }, 'held while the exchange is in flight');
     h.answers[0]({ accepted: true });
     await connecting;
     assert.deepEqual(h.counts, { opened: 1, controlOnly: 0, granted: 1 }, 'opened by the connect once the grant exists');
   });
 
-  it("a gate that completes as the registry registers a runtime connect passes it by, since the connect marks it at registration", async () => {
+  it('an open of every connection as the registry registers a runtime connect passes it by, since the connect marks it at registration', async () => {
     const h = harness();
     const registry = h.fw.mcplServerRegistry;
     const add = registry.addServer;
     registry.addServer = async (...args: unknown[]) => {
       const connection = await add(...args);
-      h.listChange(); // completes before the connect's continuation runs
+      h.openEvery(); // runs before the connect's continuation does
       return connection;
     };
     const connecting = h.connect();
@@ -523,59 +438,23 @@ describe('MCPL policy exchanges hold their planes against every gate', () => {
     assert.deepEqual(h.counts, { opened: 1, controlOnly: 0, granted: 1 });
   });
 
-  it("a runtime connect's planes stay held against a gate that completes during its awareness accounting", async () => {
-    const h = harness();
-    const settleAccounting = h.pendingAccounting();
-    const connecting = h.connect();
-    await h.settle();
-    await h.gate(); // a resume while the connect's accounting runs
-    assert.deepEqual(h.counts, { opened: 0, controlOnly: 0, granted: 0 }, 'held before its exchange begins');
-    settleAccounting();
-    await h.settle();
-    h.answers[0]({ accepted: true });
-    await connecting;
-    assert.deepEqual(h.counts, { opened: 1, controlOnly: 0, granted: 1 });
-  });
-
-  it('a runtime connect whose awareness accounting fails is closed while still marked, and no later gate passes it by', async () => {
-    const h = harness();
-    // A stub, whose first connect failed: closing one already closed leaves
-    // its epoch, so its marker would still match had it not lifted.
-    h.connection.isConnected = false;
-    // A close that fails, which keeps the connection registered; and the host
-    // stopping meanwhile, so the failed gate is completed as a completed one
-    // is, not recycled.
-    h.fw.queue = { isClosed: false };
-    const markedAtClose: boolean[] = [];
-    h.fw.closeFailedRuntimeConnect = async (connection: { transportEpoch: number }) => {
-      markedAtClose.push(h.fw.mcplPolicyExchanges.get(connection) === connection.transportEpoch);
-      h.fw.queue.isClosed = true;
-    };
-    h.failingAccounting(new Error('ledger unreadable'));
-    await assert.rejects(h.connect(), /ledger unreadable/);
-    assert.deepEqual(markedAtClose, [true], 'closed before its marker lifted');
-    // Closed for good, a real connection readies only its own reports, such
-    // as a stub's connect-failed: the failed gate's completion reached it.
-    assert.equal(h.counts.opened, 1);
-  });
-
   it('a runtime connect that a disconnect displaced lifts its marker after its removal, even a removal that failed', async () => {
     const h = harness();
-    h.connection.isConnected = false; // a stub, as above
+    h.connection.isConnected = false; // a stub, whose first connect failed
     let openedDuringRemoval = -1;
     h.fw.mcplServerRegistry.removeServer = async () => {
-      await h.gate(); // a gate completing while the removal runs
+      h.openEvery(); // an open of every connection while the removal runs
       openedDuringRemoval = h.counts.opened;
       throw new Error('its child could not be reaped');
     };
     await assert.rejects(h.connectDisplaced(), /it was disconnected while connecting; its cleanup also failed/);
     assert.equal(openedDuringRemoval, 0, 'still marked while its removal ran');
     // Closed for good, a real connection readies only its own reports.
-    await h.gate();
-    assert.equal(h.counts.opened, 1, 'the next gate reaches it');
+    h.openEvery();
+    assert.equal(h.counts.opened, 1, 'the next open reaches it');
   });
 
-  it('a runtime connect whose transport drops during its exchange grants nothing and is not announced', async () => {
+  it('a runtime connect whose transport drops during its exchange grants nothing, is readied between transports, and is not announced', async () => {
     const h = harness();
     const connecting = h.connect();
     await h.settle();
@@ -583,32 +462,11 @@ describe('MCPL policy exchanges hold their planes against every gate', () => {
     h.answers[0]({ accepted: true });
     await connecting;
     assert.equal(h.counts.granted, 0);
+    assert.equal(h.counts.opened, 1, 'readied between transports, so its own reports go on');
     assert.deepEqual(h.announced(), [], 'its reconnect announces it');
   });
 
-  it("a runtime connect whose transport a reconnect replaced during its accounting runs no exchange of its own, and is announced once", async (t) => {
-    const logged: string[] = [];
-    t.mock.method(console, 'error', (...args: unknown[]) => { logged.push(args.map(String).join(' ')); });
-    const h = harness();
-    const settleAccounting = h.pendingAccounting();
-    const connecting = h.connect();
-    await h.settle();
-    h.reconnect(); // its transport dropped, and the next one is exchanging
-    h.answers[0]({ accepted: true });
-    await h.settle();
-    settleAccounting();
-    await h.settle();
-    await h.settle();
-    const exchanges = h.answers.length;
-    if (exchanges > 1) h.answers[1]({ accepted: true }); // so the connect still ends
-    await connecting;
-    await h.settle();
-    assert.equal(exchanges, 1, "one exchange, the reconnect's");
-    assert.deepEqual(h.announced(), ['mcpl:server-reconnected', 'module:added'], 'announced once, by the reconnect');
-    assert.ok(logged.some((line) => line.includes('its transport closed before its policy exchange')), logged.join('\n'));
-  });
-
-  it("a runtime connect whose transport closes during its gate's flush is not announced", async () => {
+  it("a runtime connect whose transport closes during its open's flush is not announced", async () => {
     const h = harness();
     const ready = h.connection.ready;
     h.connection.ready = () => { ready(); h.drop(); }; // a listener the flush ran closed the transport
@@ -620,7 +478,7 @@ describe('MCPL policy exchanges hold their planes against every gate', () => {
     assert.deepEqual(h.announced(), [], 'its close reported it gone; its reconnect announces it');
   });
 
-  it("a reconnect whose transport closes during its release's flush is neither relisted nor announced", async () => {
+  it("a reconnect whose transport closes during its open's flush is neither relisted nor announced", async () => {
     const h = harness();
     h.serve();
     const ready = h.connection.ready;
@@ -640,10 +498,10 @@ describe('MCPL policy exchanges hold their planes against every gate', () => {
     h.fw.registerMcplServerFeatures = async () => { throw new Error('the policy step failed'); };
     h.reconnect();
     await h.settle();
-    assert.deepEqual(h.counts, { opened: 1, controlOnly: 0, granted: 0 }, 'opened MCP-only by its own gate');
+    assert.deepEqual(h.counts, { opened: 1, controlOnly: 0, granted: 0 }, 'opened MCP-only by its own handler');
     assert.deepEqual(h.announced(), ['mcpl:server-reconnected', 'module:added'], 'announced once it settles, granted or not');
-    await h.gate();
-    assert.equal(h.counts.opened, 2, 'and no later gate passes it by');
+    h.openEvery();
+    assert.equal(h.counts.opened, 2, 'and no later open passes it by');
   });
 
   for (const [how, settle] of [
@@ -662,38 +520,12 @@ describe('MCPL policy exchanges hold their planes against every gate', () => {
     });
   }
 
-  it("a reconnect whose gate a newer one replaced, and whose transport drops before its exchange settles, is readied between transports", async () => {
-    const h = harness();
-    h.serve();
-    h.reconnect();
-    h.listChange(); // replaces its gate and completes, passing the connection by
-    h.drop();
-    h.answers[0]({ accepted: true });
-    await h.settle();
-    assert.equal(h.counts.granted, 0, "the dead transport's answer grants nothing");
-    assert.equal(h.counts.opened, 1, 'readied, as any gate readies a connection between transports, so its own reports go on');
-    assert.deepEqual(h.announced(), []);
-  });
-
-  it("a runtime connect whose gate a newer one replaced, and whose transport drops during its exchange, is readied between transports", async () => {
-    const h = harness();
-    const connecting = h.connect();
-    await h.settle();
-    h.listChange(); // replaces its gate and completes, passing the connection by
-    h.drop();
-    h.answers[0]({ accepted: true });
-    await connecting;
-    assert.equal(h.counts.granted, 0);
-    assert.equal(h.counts.opened, 1, 'readied between transports, so its own reports go on');
-    assert.deepEqual(h.announced(), []);
-  });
-
-  it("a gate that completes after the transport dropped, before its exchange settles, isn't held by that exchange's marker", async () => {
+  it("an open of every connection after the transport dropped, before its exchange settles, isn't held by that exchange's marker", async () => {
     const h = harness();
     h.serve();
     h.reconnect();
     h.drop(); // its exchange is still in flight, for a transport that is gone
-    await h.gate();
+    h.openEvery();
     assert.equal(h.counts.opened, 1, 'readied between transports, so its own reports go on');
     h.answers[0]({ accepted: true });
     await h.settle();

@@ -116,9 +116,9 @@ never do.
   silently stranding an entry.
 - **The fragment lands with the change** — same commit, or at least the same
   PR. This binds direct pushes to `main` just as much as PRs. On PRs, CI
-  enforces it softly: touching `src/` without adding a fragment (or editing
-  `CHANGELOG.md`) fails the `changelog` check unless the `no-changelog`
-  label is applied.
+  enforces it softly: touching `src/` fails the `changelog` check unless the
+  PR adds a fragment, edits a pending one or edits `CHANGELOG.md`, or carries
+  the `no-changelog` label.
 - **What needs an entry:** anything a module developer, host, or downstream
   consumer would notice — behavior, event/trace surfaces, tool namespacing,
   config schema, agent state machine, public exports, defaults. Internal

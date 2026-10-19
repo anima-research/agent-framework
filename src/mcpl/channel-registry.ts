@@ -37,7 +37,7 @@ import type {
 import type { McplServerRegistry } from './server-registry.js';
 import type { FeatureSetManager } from './feature-set-manager.js';
 import type { ToolDefinition, ToolResult, ProcessEvent } from '../types/index.js';
-import { expandCoreTags } from './tags.js';
+import { expandCoreTags, isMarkerTagged } from './tags.js';
 import { coalesceRejectionReason, EmptyContentError, validateCoalescedContent } from './push-coalescer.js';
 import { isVisiblyEmptyConversion } from './visible-content.js';
 import { logDetail, logValue } from './log-value.js';
@@ -252,6 +252,27 @@ interface ChannelEntry {
   open: boolean;
 }
 
+/**
+ * A channel its server declared inbound-only (SPEC §14.2 `direction`): its
+ * messages come in, and the host publishes nothing into it. No publish, from
+ * plain speech, `channel_publish` or `publishForAgent`, and no outgoing
+ * stream. Typing and acknowledgements, which carry no content, still go
+ * (SPEC §14.5: "Delivery occurs only via `channels/publish`"). A channel
+ * declared `outbound` or `bidirectional`, or with no direction, isn't one.
+ */
+function isInboundOnly(entry: ChannelEntry): boolean {
+  return entry.descriptor.direction === 'inbound';
+}
+
+/** Why the host sends nothing into an inbound-only channel, as the resident
+ *  reads it in a send-failure marker or a tool error. */
+function inboundOnlyReason(entry: ChannelEntry): string {
+  return (
+    `inbound-only: server "${entry.serverId}" declared this channel's direction "inbound", ` +
+    'so the host publishes nothing into it; to speak there, use that server\'s own tools'
+  );
+}
+
 function sameChannelTarget(a: ChannelDescriptor, b: ChannelDescriptor): boolean {
   return a.type === b.type && isDeepStrictEqual(a.address, b.address);
 }
@@ -370,11 +391,11 @@ const CHANNEL_TOOL_DEFINITIONS: ToolDefinition[] = [
   },
   {
     name: 'channel_publish',
-    description: 'Publish a message to a channel. If channelId is omitted, publishes to the channel this conversation is bound to, if any, else to the most recent incoming channel. A subagent has neither, and must name one.',
+    description: "Publish a message to a channel. If channelId is omitted, publishes to your conversation's channel if you are bound to one; otherwise to the channel of the most recent incoming message this host received on any channel, whether or not you've been shown it. Reactions, reaction removals, deletions and edits don't set it, though an edit of a message you hadn't been shown can count as that message. A message pushed to you rather than posted on a channel never sets it. A subagent has neither default, so it must name a channel.",
     inputSchema: {
       type: 'object' as const,
       properties: {
-        channelId: { type: 'string', description: 'ID of the channel to publish to (defaults to the conversation\'s bound channel, else the most recent incoming channel; required of a subagent)' },
+        channelId: { type: 'string', description: "ID of the channel to publish to (defaults to your conversation's channel if you are bound to one; otherwise the channel of the most recent incoming message this host received on any channel, whether or not you've been shown it, other than a reaction, reaction removal, deletion or edit, though an edit of a message you hadn't been shown can count; a message pushed to you rather than posted on a channel never sets it; required of a subagent)" },
         content: { type: 'string', description: 'Text content to publish' },
         text: { type: 'string', description: 'Alias for content' },
       },
@@ -450,7 +471,8 @@ const CHANNEL_TOOL_DEFINITIONS: ToolDefinition[] = [
 // ============================================================================
 
 /** Bound connector values for notices, logs and an outcome's reason. A
- *  PublishOutcome keeps the connector's structured data (`detail`) whole. */
+ *  PublishOutcome keeps the connector's structured data (`detail`) as the
+ *  connection gives it, its strings redacted (redactedData). */
 export function connectorText(value: unknown): string {
   let text: string;
   try {
@@ -494,7 +516,8 @@ export interface PublishOutcome {
   /** Why it failed, or why its outcome is unknown — for a connector error,
    *  its message, bounded (which may say what was already posted). */
   reason?: string;
-  /** The connector error's structured `data`, verbatim, when it sent one. */
+  /** The connector error's structured `data`, with the strings in it
+   *  redacted (redactedData), when it sent one. */
   detail?: unknown;
   /** When the outcome was established (epoch ms). */
   at: number;
@@ -577,13 +600,16 @@ interface ChannelRegistryOptions {
    * RFC-006: an admitted `channels/incoming` message carrying `coalesce`, with
    * the event the ordinary path would have queued. The handler decides
    * replace / append / withdraw and returns the per-message result. Throws a
-   * `CoalesceError` for a malformed or unauthorized occurrence.
+   * `CoalesceError` for a malformed or unauthorized occurrence. `firstView`
+   * says the coalescer delivered the message as the agent's first view of it,
+   * with the delivery's own `firstView` mark; it is the host's own, and isn't
+   * in the answer to the server.
    */
   handleCoalescedIncoming?: (
     serverId: string,
     message: ChannelIncomingMessage,
     event: McplChannelIncomingEvent,
-  ) => Promise<ChannelIncomingMessageResult>;
+  ) => Promise<ChannelIncomingMessageResult & { firstView?: true }>;
   /** Chronicle store used for durable desired channel lifecycle state. */
   store?: JsStore;
   /**
@@ -615,14 +641,19 @@ interface ChannelRegistryOptions {
    */
   focusChannelResolver?: () => string | null;
   /**
-   * Called when a text-only turn's speech could NOT be delivered to its
-   * conversational locus — no locus, an unregistered channel, a missing
-   * server, or the server reporting `delivered: false`. Not called for an
-   * ephemeral run's speech with no locus, which is its caller's result
-   * (`takesGlobalFallback`). The host wires this to drop a
-   * `[discord-send-failed]` marker into chronicle so the failure is
-   * visible to the agent (and operator) rather than silently lost. Must not
-   * itself trigger inference (avoid wake loops).
+   * Called when a text-only turn's speech was not delivered to its
+   * conversational locus (`failed`), or may not have been (`unknown`), for
+   * whatever reason deliverSpeech gives, such as no locus, a channel that
+   * isn't registered or refuses speech, a missing server or grant, a failed
+   * open, the server reporting `delivered: false`, or a publish answered
+   * with an error, a timeout or a lost connection, after which whether it
+   * was posted is unknown. It isn't called for an ephemeral run's speech
+   * whose turn has no locus (a null locus), which is its caller's result
+   * (`takesGlobalFallback`), nor for a `failed` delivery whose caller holds
+   * its words with a notice of its own (deliverSpeech's `heldOnFailure`).
+   * The host wires this to drop a `[discord-send-failed]` marker into
+   * chronicle so the failure is visible to the agent (and operator) rather
+   * than silently lost. Must not itself trigger inference (avoid wake loops).
    */
   onRouteFailure?: (info: {
     conversationId: string;
@@ -658,9 +689,11 @@ interface ChannelRegistryOptions {
    * forks are spawned bound to a single channel (the framework tracks this in
    * `conversationAgentHomes` / `ConversationRouter.channelForAgent`); their
    * plain-text speech must route THERE. The process-global `defaultPublishChannel`
-   * tracks only the most-recent inbound across ALL channels, so with one fork per
-   * channel running concurrently it misroutes a fork's reply to whichever channel
-   * last spoke (item 3). Returns undefined for the trunk/primary agent, which has
+   * tracks only the most recent inbound message across ALL channels (reaction,
+   * reaction-removal, edit and deletion markers aside, apart from an edit the
+   * coalescer delivers on acceptance as the agent's first view), so with one
+   * fork per channel running concurrently it misroutes a fork's reply to
+   * whichever channel last spoke (item 3). Returns undefined for the trunk/primary agent, which has
    * no home and correctly falls back to the global locus (heartbeats, etc.).
    */
   homeChannelResolver?: (agentName: string) => string | undefined;
@@ -670,11 +703,12 @@ interface ChannelRegistryOptions {
    * turn. This is the fix for single-TRUNK agents (the only mode
    * connectome-host runs — it never exposes conversation forks). A trunk agent
    * has no fork home, so without this its plain-text speech falls back to the
-   * process-global `defaultPublishChannel`, which tracks the most-recent inbound
-   * across ALL channels and misroutes a reply to whichever channel last spoke
-   * under concurrency (item-3 redux). The framework keeps both on the live
-   * turn's routing state and exposes them here. For a heartbeat / no-trigger
-   * turn it resolves to undefined until the turn's locus is resolved, so that
+   * process-global `defaultPublishChannel`, which tracks the most recent inbound
+   * message across ALL channels (markers aside) and misroutes a reply to
+   * whichever channel last spoke under concurrency (item-3 redux). The
+   * framework keeps both on the live turn's routing state and exposes them
+   * here. For a heartbeat / no-trigger turn it resolves to undefined until the
+   * turn's locus is resolved, so that
    * resolution takes the global fallback, which the turn then keeps.
    * Consulted AFTER `homeChannelResolver` (a fork's home always wins), BEFORE
    * `defaultPublishChannel`.
@@ -799,10 +833,13 @@ export class ChannelRegistry {
    */
   private dmClassified = new Map<string, true>();
 
-  /** Most recent incoming channel ID — used for speech routing / default publish. */
+  /** The channel of the most recent incoming message that isn't a reaction,
+   *  reaction removal, edit or deletion marker, apart from an edit the
+   *  coalescer delivers on acceptance as the agent's first view: used for
+   *  speech routing and the default publish. */
   private defaultPublishChannel: string | null = null;
 
-  /** Most recent incoming message metadata, used for buildChannelContext. */
+  /** The same message's id and thread, used for buildChannelContext. */
   private defaultPublishMessageId: string | null = null;
   private defaultPublishThreadId: string | undefined = undefined;
 
@@ -856,6 +893,15 @@ export class ChannelRegistry {
    *  closes its own channels, and sends no receipt the host could wait for. */
   private directsLifecycle(serverId: string): boolean {
     return CapabilityGrant.of(this.serverRegistry.getServer(serverId)).has('channels.lifecycle');
+  }
+
+  /** Whether a decided close holds words back from a channel: only where
+   *  the host directs the server's lifecycle. Without that grant the host
+   *  can't close the channel, and words go into a transport that is open,
+   *  as the open step's engagesDecidedClosed reads it too. */
+  private closeStands(entry: ChannelEntry): boolean {
+    return this.getDesiredState(entry.serverId, entry.descriptor.id) === 'closed' &&
+      this.directsLifecycle(entry.serverId);
   }
 
   /** A registration's entry: nothing about its transport is known until a
@@ -1269,7 +1315,10 @@ export class ChannelRegistry {
       // cause A). A coalesced item is "accepted" only once the coalescer
       // admits it, so for those this runs after the hook (below).
       const incomingEntry = this.channels.get(incomingKey)!;
-      const markAccepted = () => {
+      // `firstView` is the coalescer's mark that an edit was the agent's first
+      // view of its message; the registry no longer records the publish locus
+      // here (admission does, through noteDelivered, with the same marker rule).
+      const markAccepted = (_firstView = false) => {
         // Where the host directs this server's lifecycle, only a receipt for
         // the current target confirms it: traffic shows the transport open
         // only for a confirmed target, and only for a channel still decided
@@ -1281,7 +1330,8 @@ export class ChannelRegistry {
         // channel open, as it always has. The entry is the one the message
         // was accepted for: one a re-registration put in its place meanwhile
         // waits for its own evidence. Durable desired state still changes
-        // exclusively through lifecycle operations.
+        // exclusively through lifecycle operations. A marker is evidence like
+        // any other message.
         if (this.directsLifecycle(serverId)) {
           if (this.unconfirmedChannelTargets.has(incomingEntry)) return;
           const desired = this.getDesiredState(serverId, message.channelId);
@@ -1340,7 +1390,8 @@ export class ChannelRegistry {
         // the coalescer, which replaces, appends or withdraws. Malformed
         // `coalesce` is a per-message failure; siblings are unaffected.
         try {
-          const result = await this.handleCoalescedIncoming!(serverId, message, event);
+          const { firstView, ...result } = await this.handleCoalescedIncoming!(serverId, message, event);
+          if (result.accepted) markAccepted(firstView === true);
           results.push(result);
         } catch (error) {
           const err = error as Error & { code?: number; field?: string };
@@ -1565,18 +1616,27 @@ export class ChannelRegistry {
   /**
    * The most recent DELIVERED inbound message (channel, message, thread).
    * Recorded by the framework after admission, so a held message never
-   * becomes "the latest inbound" (issue #232 gap 2). Read as the
-   * `incoming` reference in the channel context and, under
+   * becomes "the latest inbound" (issue #232 gap 2), and never for a marker
+   * (a reaction, reaction removal, edit or deletion, apart from an edit the
+   * coalescer delivered as the agent's first view: isMarkerTagged). Read as
+   * the `incoming` reference in the channel context and, under
    * `speech.locus: 'latest-inbound'`, as the fallback speech locus.
    */
-  noteDelivered(channelId: string, messageId: string, threadId?: string): void {
+  noteDelivered(channelId: string, messageId: string, threadId?: string, tags?: unknown, firstView = false): void {
+    // A marker is ABOUT a message, not one the agent replies to: it leaves
+    // the anchor where it was (#157). An edit the coalescer delivered as the
+    // agent's first view of its message counts as that message.
+    if (isMarkerTagged(tags, firstView)) return;
     this.defaultPublishChannel = channelId;
     this.defaultPublishMessageId = messageId;
     this.defaultPublishThreadId = threadId;
   }
 
   /**
-   * Get the default publish channel ID (most recent delivered incoming channel).
+   * Get the default publish channel ID: the channel of the most recent
+   * delivered incoming message that isn't a reaction, reaction removal, edit
+   * or deletion marker, apart from an edit the coalescer delivers on
+   * acceptance as the agent's first view.
    */
   getDefaultPublishChannel(): string | null {
     return this.defaultPublishChannel;
@@ -1726,8 +1786,9 @@ export class ChannelRegistry {
     const openChannels = this.getOpenChannels();
 
     // Resolve the outbound locus the SAME way routeSpeech does, so the agent is
-    // told the channel its speech will actually land in: a conversation fork's
-    // home channel, else this turn's channel (single trunk agent — item-3
+    // told the channel its speech will actually land in (none, when its server
+    // declared it inbound-only, since speech isn't posted there): a conversation
+    // fork's home channel, else this turn's channel (single trunk agent — item-3
     // redux: its locus, else its triggering channel), else the global default
     // (heartbeats). Without this, a fork
     // was advertised the global locus but published somewhere else; and a trunk
@@ -1742,25 +1803,41 @@ export class ChannelRegistry {
     const fallback = agentName !== undefined ? this.globalFallbackFor(agentName) : this.sharedFallback();
     const outgoing = home ?? active ?? fallback;
 
-    if (openChannels.length === 0 && !outgoing) {
+    // The reply anchor (below) is reported even when nothing is open and no
+    // outgoing channel resolves: under `speech.locus: 'delivery'` a turn
+    // can have an anchor and no locus.
+    const anchorChannel = agentName !== undefined && this.takesGlobalFallback?.(agentName) === false
+      ? null
+      : this.defaultPublishChannel;
+    if (openChannels.length === 0 && !outgoing && !(anchorChannel && this.defaultPublishMessageId)) {
       return undefined;
     }
 
     const context: ChannelContext = {};
 
-    // Incoming: the most-recent inbound message (what the agent is replying to).
-    // Left process-global — per-channel inbound tracking (the right messageId for
-    // a fork's own channel) is a separate concern from the outbound routing fix.
-    if (fallback && this.defaultPublishMessageId) {
+    // Incoming: the most recent delivered inbound message that isn't a
+    // reaction, reaction removal, edit or deletion marker, apart from an edit
+    // the coalescer delivers on acceptance as the agent's first view (what
+    // the agent is replying to; noteDelivered). Left process-global —
+    // per-channel inbound tracking (the right messageId for a fork's own
+    // channel) is a separate concern from the outbound routing fix. The
+    // anchor is independent of the speech rule: under `speech.locus:
+    // 'delivery'` the latest inbound is no fallback for where prose lands,
+    // but it is still the message the agent is replying to. An ephemeral run
+    // takes no anchor either (takesGlobalFallback): that message was never
+    // addressed to it.
+    if (anchorChannel && this.defaultPublishMessageId) {
       context.incoming = {
-        channelId: fallback,
+        channelId: anchorChannel,
         messageId: this.defaultPublishMessageId,
         threadId: this.defaultPublishThreadId,
       };
     }
 
-    // Default outgoing: the resolved outbound locus (home channel for forks).
-    if (outgoing) {
+    // Default outgoing: the resolved outbound locus (home channel for forks),
+    // unless its server declared it inbound-only: routeSpeech publishes nothing
+    // there, so it isn't where the agent's speech goes.
+    if (outgoing && !this.inboundOnlyServer(outgoing)) {
       context.defaultOutgoing = {
         channelId: outgoing,
       };
@@ -2363,16 +2440,50 @@ export class ChannelRegistry {
 
   /**
    * Publish into a channel on behalf of a named non-resident agent (the
-   * subconscious's speak_in_channel). Same delivery path as the
-   * channel_publish tool; the agent name rides the speech-routed trace.
+   * subconscious's speak_in_channel). Same delivery path, and the same result,
+   * as the channel_publish tool. Its traces carry the agent's name and follow
+   * the publish's outcome as deliverSpeech's do: speech-routed after a
+   * confirmed delivery, and speech-route-failed otherwise, `unknown` when the
+   * words may have been posted and `failed` when nothing was, a refusal before
+   * the publish included. The routed trace carries no message id, as before:
+   * nothing here reads one, and a consumer that edits the newest traced
+   * message in a channel would have this post to edit when an interruption of
+   * the resident matches none.
    */
   async publishForAgent(
     channelId: string,
     text: string,
     agentName: string,
   ): Promise<{ success: boolean; data?: unknown; error?: string; isError?: boolean }> {
-    this.emitTraceFn({ type: 'mcpl:speech-routed', conversationId: agentName, channelId, text });
-    return this.handleToolPublish({ channelId, content: text });
+    // The server the publish goes to, as handleToolPublish finds it before
+    // it awaits: the channel may be removed while the reply is pending.
+    const serverId = this.findChannelEntry(channelId)?.serverId ?? '';
+    const seen: { outcome?: PublishOutcome } = {};
+    const result = await this.handleToolPublish({ channelId, content: text }, undefined, seen);
+    if (seen.outcome?.status === 'delivered') {
+      this.emitTraceFn({
+        type: 'mcpl:speech-routed',
+        conversationId: agentName,
+        serverId,
+        channelId,
+        delivered: true,
+        textLen: text.length,
+        text,
+      });
+    } else {
+      this.emitTraceFn({
+        type: 'mcpl:speech-route-failed',
+        conversationId: agentName,
+        channelId,
+        // The publish's own reason and the connector's detail, as
+        // deliverSpeech's trace gives them, or the refusal before any publish.
+        reason: seen.outcome?.reason ?? result.error ?? 'the publish failed',
+        textLen: text.length,
+        outcome: seen.outcome?.status === 'unknown' ? 'unknown' : 'failed',
+        ...(seen.outcome?.detail !== undefined ? { detail: connectorText(seen.outcome.detail) } : {}),
+      });
+    }
+    return result;
   }
 
   /**
@@ -2606,6 +2717,7 @@ export class ChannelRegistry {
             `; ${channelId} is not marked open, and nothing in the answer is used`,
           );
         }
+        if (open) this.applyOpenDeclaration(entry, result);
         entry.open = open;
         this.unconfirmedChannelTargets.delete(entry);
         const now = this.getDesiredState(serverId, channelId);
@@ -2649,8 +2761,9 @@ export class ChannelRegistry {
   /**
    * Join outstanding lifecycle work without recording new intent. Retargeting
    * may have invalidated open confirmation while the decision remains pending.
-   * A close that settles during the wait remains authoritative; waiting for
-   * it is not an instruction to open the channel again.
+   * A close that settles during the wait remains authoritative where the host
+   * directs the server's lifecycle (closeStands); waiting for it is not an
+   * instruction to open the channel again.
    */
   private async waitForOpenChannel(entry: ChannelEntry): Promise<ChannelEntry> {
     const lifecycleKey = this.lifecycleKey(entry.serverId, entry.descriptor.id);
@@ -2672,7 +2785,7 @@ export class ChannelRegistry {
     }
     const current = this.channels.get(`${entry.serverId}:${entry.descriptor.id}`);
     if (!current) throw new Error('Channel registration was removed while delivery waited');
-    if (!current.open || this.getDesiredState(current.serverId, current.descriptor.id) === 'closed') {
+    if (!current.open || this.closeStands(current)) {
       throw new Error('Channel is not confirmed open for delivery, or was selected for closure while delivery waited');
     }
     return current;
@@ -2791,6 +2904,17 @@ export class ChannelRegistry {
   }
 
   /**
+   * The server that declared this channel inbound-only (isInboundOnly), or
+   * undefined when it isn't one. The notices name that server. A caller that
+   * knows the channel's server passes it; otherwise the channel is found by
+   * its id alone (findChannelEntry).
+   */
+  inboundOnlyServer(channelId: string, serverId?: string): string | undefined {
+    const entry = serverId ? this.channels.get(`${serverId}:${channelId}`) : this.findChannelEntry(channelId);
+    return entry && isInboundOnly(entry) ? entry.serverId : undefined;
+  }
+
+  /**
    * Find a channel entry by channelId (searches across all servers).
    * Returns the first match.
    */
@@ -2873,8 +2997,9 @@ export class ChannelRegistry {
   /**
    * Record durable desired-open intent, then queue the channel's lifecycle
    * work (applyDesiredChannelState), which tells the server to subscribe and
-   * marks the live entry open on a receipt for its current target. Every
-   * open the agent or its speech asks for — the channel_open tool, delivery
+   * marks the live entry open on a receipt for its current target, applying
+   * an inbound-only declaration the answer carries (applyOpenDeclaration).
+   * Every open the agent or its speech asks for — the channel_open tool, delivery
    * into a closed locus, an explicit send into a closed channel — comes
    * here. Reconciliation queues that work directly, as the closes do
    * (channel_close, a decline, and the close of a substituted channel).
@@ -2907,6 +3032,31 @@ export class ChannelRegistry {
   }
 
   /**
+   * An open's answer carries the server's descriptor for the channel
+   * (§14.3), the first place a lazily registered channel's own declaration
+   * can arrive. runLifecycleOperation hands it here, wherever the host opens
+   * a channel, once the answer is known to be for the channel's current
+   * entry and target. An answer that names another channel never arrives
+   * here: it's a substitution, which fails the open. One whose channel names
+   * no id is this channel's, as runLifecycleOperation takes it, so its
+   * declaration applies too.
+   *
+   * Only an inbound-only declaration is applied. The answer isn't always the
+   * server's latest word: a `channels/changed` that arrives in the same read
+   * as the answer is handled before the open's operation resumes, so the
+   * answer is applied over it. Applying only a refusal keeps that race
+   * fail-closed: a stale answer can keep a channel refused until the
+   * server's next update, but never lift a newer refusal. A server lifts its
+   * declaration by changing or registering the channel again.
+   */
+  private applyOpenDeclaration(entry: ChannelEntry, answer: unknown): void {
+    const declared = (answer as { channel?: { direction?: unknown } } | undefined)?.channel;
+    if (declared?.direction === 'inbound') {
+      entry.descriptor = { ...entry.descriptor, direction: 'inbound' };
+    }
+  }
+
+  /**
    * Resolve a `>>` prose-routing target (explicit prose routing —
    * docs/explicit-prose-routing.md) to a registered channel.
    *
@@ -2919,8 +3069,27 @@ export class ChannelRegistry {
    *
    * Ambiguity is an error carrying candidates — never a guess: this is the
    * mechanism that makes prose misdelivery structurally impossible.
+   *
+   * `forSpeech` is for a target the agent's speech will be posted to: a
+   * channel its server declared inbound-only (isInboundOnly) then resolves
+   * to an error that says so, since nothing is published there, and that
+   * names the channel as `refusedChannelId`, so a caller can tell a refused
+   * channel from a name that resolved to nothing. Without it, as for reading
+   * a channel's history, any registered channel resolves.
    */
   resolveProseTarget(
+    spec: string,
+    opts?: { forSpeech?: boolean },
+  ): { channelId: string; label?: string } | { error: string; candidates?: string[]; refusedChannelId?: string } {
+    const resolved = this.resolveTargetByName(spec);
+    if (!opts?.forSpeech || 'error' in resolved) return resolved;
+    const entry = this.findChannelEntry(resolved.channelId);
+    return entry && isInboundOnly(entry)
+      ? { error: `${resolved.channelId} is ${inboundOnlyReason(entry)}`, refusedChannelId: resolved.channelId }
+      : resolved;
+  }
+
+  private resolveTargetByName(
     spec: string,
   ): { channelId: string; label?: string } | { error: string; candidates?: string[] } {
     const entries = [...this.channels.values()];
@@ -3080,7 +3249,7 @@ export class ChannelRegistry {
     ];
     for (const c of candidates) {
       if (/\s/.test(c) || c === '#') continue;
-      const r = this.resolveProseTarget(c);
+      const r = this.resolveProseTarget(c, { forSpeech: true });
       if ('channelId' in r && r.channelId === d.id) return c;
     }
     return undefined;
@@ -3518,24 +3687,13 @@ export class ChannelRegistry {
   }
 
   /**
-   * Host-owned output routing (see forking-knowledge-miner LOCUS-ROUTING-DESIGN).
-   * Publish the agent's plain-text speech to the current conversational locus
-   * (the most recent incoming channel, tracked cross-surface here in the host).
-   * Called by the framework on a text-only turn — replaces the per-surface
-   * sticky auto-post that used to live in discord-mcpl. Returns null when there
-   * is no locus / the channel or its server can't be resolved (in which case
-   * the speech simply stays in chronicle + module surfaces).
-   */
-  /** Resolve the outbound locus (fork HOME → this-turn's TRIGGERING channel →
-   *  process-global default). Public so a multi-segment caller can snapshot it
-   *  ONCE and pin every segment to it via routeSpeech's `overrideChannelId`. */
-  /**
-   * MCPL Spec 14.3 outgoing streaming: forward a moderated text delta to the
-   * server owning the channel, AS THE MODEL GENERATES. Emitted only when that
-   * server declared `channels.streaming` in its initialize capabilities —
-   * servers that never opted in (the whole existing fleet) receive nothing.
-   * Fire-and-forget and never throws: streaming is an observer surface; the
-   * authoritative delivery is the eventual channels/publish.
+   * MCPL Spec 14.3 outgoing streaming: forward a text delta to the server
+   * owning the channel. The framework sends each piece of prose once its
+   * publish succeeds, so a stream carries only what was published.
+   * Emitted only when that server's grant has `channels.streaming` —
+   * servers that never opted in receive nothing. Fire-and-forget and never
+   * throws: streaming is an observer surface; the authoritative delivery is
+   * channels/publish.
    */
   sendOutgoingChunk(
     channelId: string,
@@ -3577,6 +3735,9 @@ export class ChannelRegistry {
     // never-guess rule that governs delivery.
     const matches = [...this.channels.values()].filter((e) => e.descriptor.id === channelId);
     if (matches.length !== 1) return null;
+    // Nothing is published into an inbound-only channel, so nothing is
+    // streamed there either.
+    if (isInboundOnly(matches[0]!)) return null;
     const server = this.serverRegistry.getServer(matches[0]!.serverId);
     // §5.4: the GRANT gates streaming, not the raw advertisement. The old
     // `capabilities?.channels?.streaming` check was doubly wrong: undefined
@@ -3587,6 +3748,9 @@ export class ChannelRegistry {
     return server;
   }
 
+  /** Resolve the outbound locus (fork HOME → this-turn's TRIGGERING channel →
+   *  process-global default). Public so a multi-segment caller can snapshot it
+   *  ONCE and pin every segment to it via routeSpeech's `overrideChannelId`. */
   resolveLocus(conversationId: string): string | null {
     const home = this.homeChannelResolver?.(conversationId);
     return home ?? this.activeChannelResolver?.(conversationId) ?? this.globalFallbackFor(conversationId);
@@ -3683,7 +3847,32 @@ export class ChannelRegistry {
    * possible to send into a closed channel: a closed but registered
    * destination is opened first (`openSource` names why), once its server
    * and that server's channels.publish grant are known to take the send, so
-   * a refused send opens nothing; and a failed open sends nothing.
+   * a send refused before the open opens nothing; and a failed open sends
+   * nothing.
+   *
+   * A channel its server declared inbound-only (isInboundOnly) takes nothing
+   * the host would post, whichever path the words took, a drafts resend
+   * included: it's refused before anything opens. The channel's queued
+   * lifecycle work and the open await the server, and a channels/changed
+   * update, a re-register or the open's own answer (applyOpenDeclaration)
+   * may declare the channel inbound-only meanwhile, or a removal take it
+   * away. So the check just before the publish, after every await, reads
+   * the channel's registration as it is then, and refuses one that is gone
+   * or inbound-only, or whose server's grant no longer has channels.publish.
+   * A removal during a wait already fails it there (waitForOpenChannel); the
+   * check also catches one made after the last wait, as the opening's notice
+   * can. A registration nothing has confirmed open, such as one that
+   * replaced the one waited for or a retarget of it, or one whose close now
+   * stands (where the host directs the server's lifecycle), is treated as at
+   * the first wait: the words wait for its queued lifecycle work, and the
+   * check runs again on the registration that work leaves. Words refused
+   * after an open for a declaration leave the channel open, and the agent
+   * gets the failure for the words. An open by delivery (`openSource`
+   * 'opened-by-delivery', the default) that turned a closed channel open
+   * also gives the notice that it's open, which says how to close it.
+   * One that only reconfirmed the transport of a channel already decided
+   * open or tuned out changes no decision, and gives none. When the
+   * registration is gone, the failure says the channel was removed.
    *
    * Only the connector's `delivered: true` confirms a post. `failed` means
    * nothing was posted: the attempt stopped before the request was written,
@@ -3720,20 +3909,29 @@ export class ChannelRegistry {
 
     // A send that would be refused is refused before anything opens: a
     // closed channel opens only for words that can go out.
+    if (isInboundOnly(entry)) {
+      return { status: 'failed', destination, reason: inboundOnlyReason(entry), at: at() };
+    }
     const server = this.serverRegistry.getServer(entry.serverId);
     if (!server) {
       return { status: 'failed', destination, reason: `server "${entry.serverId}" not found`, at: at() };
     }
     // §14.1: channels/publish requires channels.publish in the grant. The
-    // host not sending is the enforcement.
-    if (!CapabilityGrant.of(server).has('channels.publish')) {
-      return {
-        status: 'failed',
-        destination,
-        reason: `channels.publish not in "${entry.serverId}"'s effective grant (§14.1)`,
-        at: at(),
-      };
-    }
+    // host not sending is the enforcement, here and at the last check.
+    const ungranted = (): PublishOutcome => ({
+      status: 'failed',
+      destination,
+      reason: `channels.publish not in "${entry.serverId}"'s effective grant (§14.1)`,
+      at: at(),
+    });
+    if (!CapabilityGrant.of(server).has('channels.publish')) return ungranted();
+
+    const prevented = (err: unknown): PublishOutcome => ({
+      status: 'failed',
+      destination,
+      reason: `lifecycle work prevented delivery: ${connectorText(err instanceof Error ? err.message : String(err))}`,
+      at: at(),
+    });
 
     // Lifecycle work already queued for the channel settles first: words go
     // out only into the channel it leaves, and fail visibly if it leaves
@@ -3742,12 +3940,7 @@ export class ChannelRegistry {
       try {
         entry = await this.waitForOpenChannel(entry);
       } catch (err) {
-        return {
-          status: 'failed',
-          destination,
-          reason: `lifecycle work prevented delivery: ${connectorText(err instanceof Error ? err.message : String(err))}`,
-          at: at(),
-        };
+        return prevented(err);
       }
     }
 
@@ -3801,6 +3994,40 @@ export class ChannelRegistry {
       }
     }
 
+    // Checked again here, after every await above, the lifecycle work's, the
+    // open's or any other: a registration that is gone, or inbound-only, at
+    // this moment takes nothing. The entry is read from the map rather than
+    // taken from the last wait: the opening's notice runs in between, and
+    // publish() resumes a microtask after the wait. A registration nothing
+    // has confirmed open, such as one that replaced the one waited for
+    // (registered with open: false) or a retarget of it (marked unconfirmed),
+    // or one whose close now stands (closeStands), is treated as at the
+    // first wait: the words wait for its queued lifecycle work, and
+    // waitForOpenChannel refuses what that work leaves unconfirmed or with
+    // its close standing. The loop opens nothing itself. The check then runs
+    // again on the registration that stands. waitForOpenChannel returns
+    // only a registration it found open and whose close doesn't stand, or
+    // throws, so the loop ends unless the channel keeps changing.
+    const key = `${entry.serverId}:${entry.descriptor.id}`;
+    let current = this.channels.get(key);
+    while (current && !isInboundOnly(current) && (!current.open || this.closeStands(current))) {
+      try {
+        entry = await this.waitForOpenChannel(current);
+      } catch (err) {
+        return prevented(err);
+      }
+      current = this.channels.get(key);
+    }
+    if (!current) {
+      return { status: 'failed', destination, reason: 'the channel was removed before the words were published', at: at() };
+    }
+    if (isInboundOnly(current)) {
+      return { status: 'failed', destination, reason: inboundOnlyReason(current), at: at() };
+    }
+    // A grant reduced during any of the waits holds at once (§6.7): the
+    // words already on their way take it too.
+    if (!CapabilityGrant.of(server).has('channels.publish')) return ungranted();
+
     let result: unknown;
     try {
       result = await server.sendChannelsPublish({
@@ -3818,9 +4045,13 @@ export class ChannelRegistry {
    * Plain speech for one turn segment: publish `text` to the turn's frozen
    * locus and report the PublishOutcome. A failure (or an uncertain outcome)
    * is surfaced as a trace and through onRouteFailure, so the agent learns
-   * its words did not (or may not have) reached anyone. An ephemeral run's
-   * speech with no locus is the exception: it is its caller's result, so it
-   * returns as not delivered and surfaces nothing.
+   * its words did not (or may not have) reached anyone. A `failed` one whose
+   * caller holds its words with a notice of its own (`heldOnFailure`) gets
+   * the trace but not onRouteFailure. An ephemeral run's speech with no locus
+   * (null) is its caller's result: it returns as not delivered and surfaces
+   * nothing. This is host-owned output routing (see forking-knowledge-miner
+   * LOCUS-ROUTING-DESIGN), which replaced the per-surface sticky auto-post
+   * that used to live in discord-mcpl.
    */
   async deliverSpeech(
     conversationId: string,
@@ -3922,6 +4153,9 @@ export class ChannelRegistry {
   private async handleToolPublish(
     input: { channelId?: string; content?: string; text?: string },
     origin?: ChannelToolOrigin,
+    /** Filled with the publish's outcome once a request is attempted, for
+     *  publishForAgent's trace. */
+    seen?: { outcome?: PublishOutcome },
   ): Promise<ToolResult> {
     // Resolve content: accept both `content` and `text` (backward compat)
     const messageText = input.content ?? input.text;
@@ -3935,7 +4169,8 @@ export class ChannelRegistry {
 
     // Resolve channelId: default to what the caller falls back to — the
     // all-except hold's channel, else the latest delivered inbound channel
-    // under the legacy locus rule — which an ephemeral run never takes
+    // under the legacy locus rule (a marker — reaction, edit, deletion — is
+    // never that channel) — which an ephemeral run never takes
     // (takesGlobalFallback), so it names one.
     const caller = origin?.kind === 'agent' ? origin.agentName : undefined;
     const channelId = input.channelId ?? (caller !== undefined ? this.globalFallbackFor(caller) : this.sharedFallback());
@@ -3955,6 +4190,13 @@ export class ChannelRegistry {
       return {
         success: false,
         error: `Channel not found: ${channelId}`,
+        isError: true,
+      };
+    }
+    if (isInboundOnly(entry)) {
+      return {
+        success: false,
+        error: `Channel ${channelId} is ${inboundOnlyReason(entry)}`,
         isError: true,
       };
     }
@@ -3996,6 +4238,7 @@ export class ChannelRegistry {
     } catch (err) {
       outcome = publishErrorOutcome(err, destination, Date.now());
     }
+    if (seen) seen.outcome = outcome;
     if (outcome.status === 'delivered') return { success: true, data: result };
     // The connector's data may say what a multi-part send already posted.
     const detail = outcome.status === 'unknown' && outcome.detail !== undefined ? ` Connector detail: ${connectorText(outcome.detail)}` : '';

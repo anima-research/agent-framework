@@ -153,18 +153,35 @@ export { PassthroughStrategy, AutobiographicalStrategy, KnowledgeStrategy } from
 export type { KnowledgeConfig, PhaseType } from '@animalabs/context-manager';
 export type { Membrane, NormalizedMessage, NormalizedRequest, ContentBlock } from '@animalabs/membrane';
 
-// Offline outage recovery and branch-independent Discord awareness markers
+// Offline outage recovery and the Discord awareness-mark ledger
 export {
   DiscordAwarenessOutbox,
+  DiscordAwarenessRefusal,
   DEFAULT_DISCORD_AWARENESS_EMOJI,
   defaultDiscordAwarenessOutboxPath,
   extractDiscordAwarenessRefs,
+  isPermanentDiscordReactionFailure,
+  selectDiscordAwarenessRefs,
 } from './recovery/discord-awareness-outbox.js';
 export type {
+  DiscordAwarenessAction,
   DiscordAwarenessBatch,
-  DiscordAwarenessEntry,
-  DiscordAwarenessOperation,
+  DiscordAwarenessBatchStatus,
+  DiscordAwarenessBatchView,
+  DiscordAwarenessRetractView,
+  DiscordAwarenessView,
+  DiscordAwarenessCancelReceipt,
+  DiscordAwarenessMarks,
+  DiscordAwarenessOutcome,
+  DiscordAwarenessPrepareInput,
+  DiscordAwarenessReactionState,
+  DiscordAwarenessImportedUnsent,
   DiscordAwarenessRef,
+  DiscordAwarenessRequest,
+  DiscordAwarenessRetractReceipt,
+  DiscordAwarenessRetirement,
+  DiscordAwarenessScope,
+  DiscordAwarenessSettlement,
   DiscordSuppressionInterval,
 } from './recovery/discord-awareness-outbox.js';
 // Live operator surgery (rollback / suppress) and its durable action log
@@ -173,7 +190,9 @@ export type {
   OperatorLogEntry,
   OperatorLogInput,
   OperatorRequester,
+  SurgeryMarkerFacts,
   SurgeryMarkerReceipt,
+  SurgeryMarksPreview,
 } from './operator-log.js';
 export { createOfflineRecoveryBranch } from './recovery/offline-branch.js';
 export type {

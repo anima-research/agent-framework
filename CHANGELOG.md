@@ -12,6 +12,940 @@ Releases up to and including 0.7.3 predate this file; for their contents see
 
 ## Unreleased
 
+## 0.23.1 — 2026-10-19
+
+### Fixed
+
+- An agent's request no longer carries the `tokenEstimate` the framework
+  stamps on the thinking blocks it stores. Membrane sent a
+  `redacted_thinking` block to Anthropic and Bedrock with every field it
+  had, and the Messages API refuses a block carrying a field it doesn't
+  define ("Extra inputs are not permitted"). So once the framework stored a
+  stamped `redacted_thinking`, every later request carrying that turn was
+  refused. A framework turn's request and the direct API's (`runInference`)
+  now drop the stamp from the compiled messages. The stored block keeps it,
+  and context-manager still prices the block by it.
+
+## 0.23.0 — 2026-10-19
+
+### Breaking
+
+- `onChannelAutoOpened` with `source: 'subscription-policy'` now reports a durable admission decision before transport reconciliation. Treat it as intent; await the registration call and inspect `getOpenChannels()` when confirmed live state is needed. `opened-by-delivery` reports a delivery that opened a channel not already decided open or tuned out, once its transport is confirmed; a delivery that only reconfirms the transport of a channel that was isn't reported. The built-in host notice now distinguishes selected-for-opening from currently open.
+
+- **Operators:** two MCPL servers whose `toolPrefix`es meet are refused, at
+  `create()`, at a runtime connect and at a restart (before it disconnects
+  anything), with an error naming both servers, both prefixes and the rule
+  (#265). Two prefixes meet when one is the other's followed by `-`, or
+  begins with the other's followed by `--`, as `foo` and `foo--bar` do. Their
+  servers could give one tool name: `foo` listing `bar--echo` and `foo--bar`
+  listing `echo` both gave `foo--bar--echo`. Such a name reached the model
+  twice, which membrane's native formatter and Anthropic's API refuse, so
+  every inference of an agent offered it failed, and in XML tool mode its
+  calls reached whichever server listed it last. A configuration with such a
+  pair needs one of the two prefixes changed, such as `foo-bar` for
+  `foo--bar`. `foo` beside `foo-bar` or `foobar` is fine.
+
+- **Hosts:** explicit `allowedTools` lists must name each permitted utility as `module--utility`, or use `"all"`. Utilities aren't tools of their own: an agent's model and its scripts are offered them only through `utils`, whose `run` checks the utility's own name. An agent that should use a utility lists both `utils` and `module--utility`. The name alone passes the dispatch check for any call by that name, whether the host makes it with `executeToolCall` on the agent's behalf or the model or a script makes it without being offered it. `utils` alone no longer exposes a usable slot. When utilities are registered but none are permitted, `list` returns a failed `ToolResult` with both counts and migration advice instead of listing every registered utility, as earlier releases do. The slot is hidden in that case, and explicit lists containing `utils` log one warning per Agent instance. Hosts that construct depth-limited lists can obtain the existing namespaced utility catalogue through `getAllUtilities()`. Callers using `"all"` retain the permission policy; an empty registry continues to omit the slot and return a successful empty list. Hosts that drive `createEphemeralAgent` results themselves must use `runEphemeralToCompletion` to register and run them; framework-created identities have tool authority only while registered, and calls before a run or after retirement fail with a registration error. Adopt this change with the first connectome-host release after 0.10.2, which contains https://github.com/anima-research/connectome-host/pull/191.
+
+- **Operators with `codeExecution` enabled:** the python interpreter that runs model-authored scripts no longer inherits the host's environment, and it starts in its own runtime directory instead of the host's working directory. It gets the allowlist stdio MCPL children get (#175), `CHILD_ENV_ALLOWLIST` in `src/mcpl/transport.ts`, among them `PATH`, `HOME`, the locale, temp directories, CA bundles and proxy variables, whose URLs can carry credentials. Then come `codeExecution.env`, and last `PYTHONUNBUFFERED=1` and `PYTHONIOENCODING=utf-8`, which the runner sets over any declared value.
+  - **What stops arriving:** every host variable outside the allowlist, such as `PYTHONPATH`, `VIRTUAL_ENV`, `PYTHONHOME`, `LD_LIBRARY_PATH`, `PYTHONUTF8` and `ALL_PROXY`, and any credential a script read from `os.environ`. To get one back, list it in `codeExecution.env`, which a recipe can `${VAR}`-substitute from `.env`. `codeExecution.inheritEnv: true` restores the whole environment, and with it hands every host variable, provider keys included, to model code and to every subprocess a script starts.
+  - **Relative paths** now resolve in the runtime directory, which teardown removes, best effort, whenever the interpreter stops or is reclaimed: a script's relative reads and writes; a relative path in `codeExecution.env`, such as a `PYTHONPATH` entry; a relative value of an allowlisted path variable, such as `TMPDIR` or `SSL_CERT_FILE`; and a relative `PATH` entry that a bare `pythonPath` is looked up on. A file a script reads from the host, or writes to keep, needs an absolute path, as does a path in `codeExecution.env` or in an allowlisted variable. To give scripts somewhere durable, pass its absolute path through `codeExecution.env`, such as `"AGENT_FILES": "/srv/agent/files"`, and name the variable in the agent's prompt.
+  - **Direct `PyRunner` users:** `PyRunnerOptions` gains `env` and `inheritEnv`, and a runner built without them gets the allowlist. Only `inheritEnv: true` passes the whole environment, and these options aren't checked as `create()` checks `codeExecution`'s.
+  - **A misread configuration is refused at create:** an `inheritEnv` that isn't `true` or `false`, such as a quoted `"true"`, which would quietly keep the allowlist; an `env` that isn't an object of strings; and a variable name that is empty or holds `=` or NUL, or a value that holds NUL. A `null` `inheritEnv` or `env` counts as left out.
+  - **Unchanged:** a `pythonPath` with a separator, which still resolves from the host's working directory, and which a venv's interpreter needs no `VIRTUAL_ENV` for, since it finds its prefix and site-packages itself. The allowlisted variables keep their values too, so an absolute path among them names what it did, and a relative one resolves as above. The allowlist limits what model code inherits, not what it can read: on Linux a process running as the same user can still read the environment the host and its MCPL servers started with, through `/proc/<pid>/environ`, and can open the host's files, `.env` included, by absolute path.
+
+- **Hosts that set `processLogging.broadcast` or an agent's `refusalHandling.announceHumanTurns`, or read either back:** both settings are removed. In no release has either changed what the framework does, beyond `isProcessLoggingEnabled()` reporting `broadcast` back: `process:completed` trace events are emitted whatever `broadcast` says, and 0.6.2, the first release with `announceHumanTurns`, already shipped without its one reader. `isProcessLoggingEnabled()` now returns `{ persist }`.
+  - **Migration:** delete either setting from your config, and drop any read of `isProcessLoggingEnabled().broadcast` or of `announceHumanTurns` on an agent's `refusalHandling`. In TypeScript, an object literal checked against the framework's types, such as a config passed straight to `create()`, no longer compiles while it names either setting, and neither does such a read. In plain JavaScript, `isProcessLoggingEnabled().broadcast` reads `undefined`.
+  - **Unchanged:** a config that still sets either starts as before, with the setting ignored.
+
+- **MCPL/MCP server authors:** the legacy engine now enforces the revision it
+  speaks. `McplServerConnection` offers MCP `2024-11-05` and now also requires
+  it back: an `initialize` result with any other `protocolVersion`, or with
+  none, fails as `McplProtocolVersionError` (`kind: 'mismatch'`), stating what
+  each side said. Every server family probed answers `2024-11-05`, but a
+  hand-written server that omits the field must add it. An `initialize`
+  answered with JSON-RPC `-32022` fails as `McplProtocolVersionError`
+  (`kind: 'rejected'`), keeping the server's `supported` list, code and data.
+  When that list names modern MCP, the message says to configure the server
+  with `protocol: 'modern'`. A protocol-version verdict is never retried: no
+  reconnect stub, and a reconnecting connection stops its backoff loop
+  (`reconnect-failed` carries `permanent: true` and raises the ops alert at
+  once). At startup the verdict raises the same `mcpl-down` ops alert, so a
+  server refused for its revision doesn't drop out with only a log line. The
+  established revision is on `connection.protocolVersion`.
+- `tools/list` now follows `nextCursor` across pages, so a paginating server's
+  whole inventory reaches the agent; before, every page after the first was
+  silently dropped. A repeated cursor, or more than 100 pages, is an error
+  rather than a partial inventory.
+- **Hosts and operators:** a server configuration with both `command` and
+  `url` and no `transport` is now refused before anything is spawned or
+  dialed. Before, it was launched as stdio and the url was silently
+  ignored. Migration: drop the field you don't use, or set `transport` to
+  say which one is used. Unchanged: a configuration with only one of them,
+  or with both and a `transport`, resolves as before (a host can still
+  layer a url and `transport: 'websocket'` over a file's command). A legacy
+  `requestTimeoutMs` above 2^31−1 is refused too: Node ran it as a timer of
+  about 1 ms, so every request timed out at once. Every value that worked,
+  `0` included, passes.
+- **Hosts:** `stop()` now rejects, after its whole teardown, when an MCP
+  server's child couldn't be confirmed exited, naming each such child and
+  its server. Before, closing a stdio server returned as soon as a signal
+  was sent, so `stop()` never failed for this. Code that chains work on
+  `stop()`, such as exiting a TUI or switching sessions, should catch that
+  rejection: the framework is stopped either way. As with any failed
+  teardown, an owned store stays open, and a later `stop()` retries the
+  reap, completing once the child has exited.
+
+- **Module authors:** a module tool's call is refused before its handler
+  runs when it lacks a key the tool's `inputSchema` lists in `required` (a
+  key given as `null` counts as lacking it, unless its declaration admits
+  `null`, by a type list naming it or `nullable: true`, or it has no `type`
+  at all), or when its input is there but isn't an object. **Who
+  needs to act:** a module whose handler runs without a key its schema
+  requires, since calls that leave the key out ran before and are now
+  refused. **Migration:** if the key is optional, drop it from `required`
+  and give its default in the property's description; if your handler
+  needs it, keep it required: calls without it are now refused before your
+  handler runs, telling the agent what to send. **Unchanged:** a module
+  tool's values (types, enums, nested shapes) are still the handler's to
+  check, while a run through the `utils` tool has its values' types and
+  enums checked, as it always had; an absent input (`undefined` or `null`)
+  still reaches a tool that requires nothing; a name the module answers
+  but doesn't declare goes on unchecked; MCPL servers' tools keep their
+  servers' own checks. Where a required key is missing and the schema
+  declares its keys only in `properties` and `required`, the refusal also
+  names keys the call gave that it doesn't declare, since a key sent under
+  another name is one way a required key goes missing; such keys are never
+  refused for themselves. connectome-host needs no change:
+  its tools of this kind keep those keys required, since each such call
+  did something its agent didn't ask for, such as starting a subagent
+  named "undefined", or one with no system prompt, which was accepted and
+  then failed once its run began.
+
+- **Hosts whose config gives two agents one name:** `create()` now refuses the config, naming the name and each agent's place in `agents`, before it opens the store. Until now the last agent of a name took the others' place in the framework's registry, though all of them used the name's one context log, and an earlier one could still decide two things: whether the name was the primary agent, which is the first configured agent's name, and the name's tool presentation, when only an earlier agent of the name set one. Keep one agent of each name. An agent you rename starts a new context log and its recipe's settings, since both are kept by name, and still reads the residents' shared messages. Names compare exactly, so `Dup` beside `dup` is still two agents, though the history tool's author filter matches their own turns without letter case and can't tell them apart there.
+
+- **Code that sets or reads `InferenceRequest.ephemeralSystemPrompt`:** the
+  field is removed. It carried a system-position prompt for one turn; the
+  silent heartbeat was its only producer, and its instruction now rides the
+  tick's request-only separator. There is no replacement: a system prompt
+  that changes for one turn costs that request its prompt cache from the
+  system on, and changes what every retained signed-thinking block is bound
+  to. Nothing in this package or in connectome-host sets or reads it.
+  Unchanged: `suppressProse` and `silentHeartbeat` on `InferenceRequest`.
+
+- **Operators:** on Linux, a workspace mount's watcher holds the mount's root
+  directory open while it watches it, so it can tell whether that directory
+  has been removed whatever has since been made at its path.
+  - **What stops working:** `umount` of the file system under a watched
+    root fails with "target is busy" while the host watches it. Stop the host
+    first, or use `umount -l`, which still detaches it.
+  - **What gets slower:** a root removed, or replaced by a rename over it, is
+    found at the watcher's next root poll (`watchRootPollMs`, 2 s by default)
+    rather than at once.
+  - **Unchanged:** where the watcher can't hold the root (macOS, Windows, or
+    on Linux a root it can't open as a directory), it holds nothing open, as
+    before. On WSL 2, Windows programs can still rename or remove a watched
+    folder on a Windows drive.
+
+- **Operators whose mounts hold symlinks inside them:** on a mount that doesn't set `followSymlinks: true`, the default, a file reached through a symlinked directory inside the mount is no longer read, written or synced through the link. A file a host reads from disk behind such a link, such as an agent's instructions file, is refused, with a refusal that names the link. To keep using it, use the path through the link's target, which the refusal names, or for a link into another mount's directory, that mount's path; or, for a link to a directory inside the mount, set `followSymlinks: true` on that mount; or move the file so that no directory on its path is a link. Unchanged: a link leading out of the mount, and a file that is itself a link, are refused as before.
+- **Hosts and module authors choosing advice by a disk read's code:** `readFileFromDisk` refuses a link among a path's directories with a new code, `parent_symlink`, which `WorkspaceReadErrorCode` gains, and one into a nested mount's directory with `other_mount`, the code that mount's own paths get. A link leading out of the mount keeps `escape`, and a file that is itself a link keeps `symlink`.
+
+### Added
+
+- Connecting to an MCP server warns once when a credential would cross the
+  network unencrypted, to an `http://` or `ws://` url whose host isn't this
+  machine: its `token` or `accessProvider`, or a secret the url carries
+  itself (a `ws://` url's userinfo, a query parameter whose name says
+  credential: `token`, `key`, `secret`, `password`, `auth` or `signature`,
+  or whose value is shaped like one under a plain name, a query parameter
+  name that may itself be one, or a path segment that looks like one, as
+  the redacted url judges it). A name that may itself be
+  a credential is counted in the warning, never quoted. An `http(s)://` url
+  with userinfo is refused instead, since the HTTP client can't send it and
+  its error would quote it. Loopback hosts are
+  exempt, and so are the unspecified addresses `0.0.0.0` and `[::]`, which
+  reach this host too. It warns rather than refuses, since a private network
+  or a TLS-terminating proxy can make that deliberate.
+  `serverConfigWarnings` is exported beside `serverConfigProblems`, so a host
+  can apply the same check in its own configuration validation.
+
+- Modern MCP servers (revision `2026-07-28`) can now be configured beside
+  MCPL ones, through the official SDK 2.x client. A server's URL decides its
+  family: `ws://`/`wss://` stays MCPL (MCP `2024-11-05`), and
+  `http://`/`https://` is modern MCP over Streamable HTTP. A stdio server
+  stays legacy unless its config sets `protocol: 'modern'`. A modern server's
+  tools use the same prefix, tool policy, RFC-008 class hints and dispatch
+  paths as any MCPL server's, and its tool prefix meets the same rules: it
+  can't be a module's name or another server's prefix, or meet another
+  server's, whichever family either server is. It has no MCPL surface: no grant, push,
+  channels, inference requests, quiesce plane or awareness gate. MCPL policy
+  that asks for that surface on one is a configuration error, such as
+  `allowHostCommands: true` or a scope's non-empty `whitelist`. Policy that
+  only takes something away or repeats a default, such as
+  `disabledCapabilities` or an allow-list like `enabledFeatureSets`, is
+  accepted as already satisfied, so a host that puts a deny-list on every
+  server it deploys can deploy a modern one. A modern `requestTimeoutMs`
+  outside 1..2^31−1 is a configuration error too, since 0 means "time out
+  now" to the SDK. Details:
+  - **stdio:** runs through the framework's own spawner (env allowlist,
+    `inheritEnv`, stderr lines including startup), launched once per connect.
+  - **HTTP credentials:** come from `token`/`accessProvider`, as a cached
+    bearer refreshed once on 401.
+  - **Deadline:** each call gets one `requestTimeoutMs` deadline across every
+    leg and the pauses between them. At the deadline cancellation is
+    requested for a leg in flight (between continuation rounds none is), the
+    outcome is reported as unknown, and nothing is replayed.
+  - **Failures:** reported as `McplRequestError`, with the outcome taken from
+    what actually crossed the transport: `not-sent`, `error-response` (HTTP
+    401/403 with `data.httpStatus`) or `no-response`. Only an error or a
+    `complete` result is a final answer: a call that ends after an
+    `input_required` answer, or after a result type this revision doesn't
+    define, is `no-response`. A complete result that can't be used is a
+    plain error. The message an agent reads is the one an MCPL server's
+    failure gives where the two share an outcome, and has its shape where
+    they don't: what happened, whether anything took effect, and what works
+    from there. The method, the tool, the JSON-RPC code and the HTTP status
+    go to the host's log. A tool call made while the server's connect is
+    still under way reads as one made while an MCPL server connects.
+  - **Lifetime:** reconnects use the legacy backoff settings. A tool-list
+    change subscription is kept open, reopened if refused or lost, and its
+    changes go through ordinary admission, so they park under quiesce like
+    any wake. `close()` and `stop()` end any connect in flight. A
+    `ModernMcpConnection` starts once: a second `start()` returns the first
+    call's promise. When a stdio launch's first attempt fails and its cleanup
+    can't confirm the child exited, `ModernMcpConnection.connect()` throws
+    `McplUnreapedLaunchError`, whose `connection` owns the launch; its
+    `close()` retries the reap.
+  - **Status:** `listMcplServers()` entries gain `family`, `protocolVersion`
+    and `transport`.
+- A server lost for good (it closed and won't reconnect), MCPL or modern,
+  now leaves the agents' tool list, as a disconnected one does. So does one
+  whose reconnecting halts for good (`reconnect-failed` with
+  `permanent: true`, which also raises the ops alert). An MCP tool
+  result marked as an error is traced as `tool:failed`, on both engines.
+
+- **A `code_execution` script can test a result for an error, and read its
+  structured content, without parsing.** Each tool function's string is
+  unchanged, and carries two attributes beside it: `.is_error`, `True` for an
+  error result (a failure the framework reports as `Error: …`, or a
+  structured result whose `isError` is true) and `False` otherwise, and
+  `.structured`, the parsed `structuredContent` of a structured result's
+  JSON object, or `None`. A result whose text merely starts with `Error:`
+  reads `False`. The string is now a `str` subclass, so code that uses it as
+  a string keeps working, `json.loads` and `isinstance(r, str)` included,
+  while an exact type check such as `type(r) is str` now reads `False`, and
+  a result a script pickles loads only in the script runtime.
+  `PyRunner`'s `onToolCall` may return a `ScriptToolResult` (exported) to
+  set both, or a plain string as before, for which both read `None`.
+  `code_execution`'s description changes, so the first request after the
+  upgrade that carries it misses the prompt cache from its tool block on.
+
+### Changed
+
+- `getActiveTurnTrigger` returns the trigger of a turn that a coalesced batch woke without the host-owned `coalescingSubject`, `coalescingBatch` and `coalescingBatchSubjects` while that turn is retried: an in-turn retry, a provider hold's release, a requeue behind an auxiliary call, or the tool-result guard's restart. Those fields identify a wake for withdrawal while it is unconsumed, and a retry belongs to a turn that has already passed its batch gate. A turn whose merged wakes don't all share one subject shows no `coalescingSubject` either. Its other fields, such as `reason`, `source`, `channelId` and `counterparty`, are as before.
+
+- `fetch_reference`'s failures now say what happened to the reference and what calling again can do: `fetch_reference couldn't fetch "<ref_id>": <what happened>. <what calling again can do>`, where they gave the fetcher's reason alone, such as `HTTP 404`, `fetch timed out or aborted`, `claimed <n> bytes exceeds fetch ceiling <m>` or `third-party origin (<origin> != dialed <origin>); not fetched by this host`. Where `save_recent_image` says a reference can't be fetched, it gives the same two.
+  - **What happened** names the server and what it answered (`the "<server>" server answered HTTP 503`), the limit a fetch met (`it claims <n> bytes, over the <m> bytes this call allows`, `the download had reached <n> bytes, past …`), what kept a fetch from dialing (`it points to <origin>, not to the "<server>" server's own address (<origin>), and this host fetches only from the server itself`), or that what arrived didn't match the reference's digest or couldn't be stored. The eager fetch's and a script's fetch's log lines read the same words.
+  - **What calling again can do**, such as trying again later (after a timeout, 408, 409, 423, 425, 429, or a 5xx other than 501 and 505, and after a failed request, with whoever runs the host to check its connection to the server if it fails the same way), waiting for a fresh reference to it (an expired or unbound reference, and the other 4xx), passing a larger `max_bytes` (naming the size it needs, and no more than the server's fetch budget has left), asking whoever runs the host (who can check its credentials for the server after a 401 or 403, raise or renew a spent budget, or add back a server it no longer has), or nothing, as for an address on another origin, a server this host doesn't connect to over a network, or a claim past the 256 MiB this host fetches at most, which no `max_bytes` or setting lifts. A claim past those 256 MiB is refused for them first, and a download past them is stopped for them first, whatever the server's budget has left.
+  - **The budget's texts** read `this host's fetch budget for the "<server>" server is used up (<used> of <budget> bytes)` and, partway, `this host's fetch budget for the "<server>" server ran out during the download (<total> of <budget> bytes), so it was stopped and nothing was kept`, where they read `per-server fetch budget exhausted (<total>/<budget> bytes)`, the one partway after `aborted: `.
+  - **A `ws:` or `wss:` reference** on its server's own origin is refused for its scheme before anything is dialed, where `fetch` refused it before connecting and the agent read `fetch failed`. A server whose address doesn't parse is refused, saying so, and that whoever runs the host can correct it.
+  - **The host's log** says why a fetched payload couldn't be stored: no workspace, no writable mount, or the write's error. A save that throws is that failure too, logged, where its message reached the agent as the fetch's own error.
+
+- What the model sees of an MCP tool result from a server that isn't an
+  MCPL peer (an MCP-only legacy server, or a modern server) now follows its
+  content types:
+  - text stays text;
+  - an inline image stays native when a provider can take it: png, jpeg,
+    gif or webp, within 5 MB decoded;
+  - audio, binary resources, other images, and media with inline data but
+    no type are saved to the workspace (`tool-results/`), each under a
+    unique name, with a bounded stub saying where. If a payload can't be
+    saved, the result is reported as incomplete (`isError`), noting the tool
+    may already have completed, never as a success with part of it missing,
+    and the host's log says why the save failed;
+  - a failed result is read as its text alone, so there an inline image is
+    saved and stubbed like any other payload;
+  - a `resource_link` is shown as a link, with its name and URI, and never
+    fetched;
+  - an embedded text resource shows its text;
+  - an unknown block is shown as JSON, bounded, saying how much was left
+    out. A malformed entry is named and left out, and content that isn't a
+    list of blocks makes the result a failure.
+
+  Before, any non-text block turned the whole result into raw JSON.
+  `structuredContent` is kept by presence on the new `ToolResult.structured`
+  (`false`, `0` and `null` are values). The model sees it as JSON when the
+  server's content has no text block of its own; a structured-only result
+  used to reach the model as an empty string. MCPL peers keep their RFC-005
+  reading and gain `structured`.
+- A script whose tool call returns `structuredContent` receives the
+  server's result itself, as one JSON object: `{ content, structuredContent,
+  isError, error? }`. From a server that isn't an MCPL peer, `content` is the
+  blocks as sent, so images and other payloads survive. `structuredContent`
+  is the tool's own JSON, as sent. Content that is present but isn't a
+  list of blocks, from such a server, is the malformed result the model
+  reads (`isError`, with the malformed notice as `error`), its structured
+  content kept, where it was an empty success.
+- An MCPL peer's blocks in a script's `content` get the treatment every
+  lane the model reads gives them, since what a script prints comes back to
+  the model. An RFC-005 reference arrives without its URI, as the host's
+  reference id (`refId`), what the server said about it in that block
+  (`name`, `mimeType`, `sizeBytes`, `digest`, `expiresAt`, with control and
+  bidi characters stripped from the text fields, as in the model's stub),
+  and `savedTo`, the workspace path the framework fetched its payload to for
+  the script (`null` when it couldn't; `fetch_reference` takes the id as its
+  `ref_id` argument). An unsaved reference that counts as expired also
+  carries `expired`, the reason the model's stub gives, and isn't fetched.
+  A block the classifier rejects arrives as the notice the model reads in
+  its place, and inline data that also claims a bulk disposition as the
+  withheld notice. #181, by @Meganeuridae, first
+  found scripts losing `structuredContent`, and it kept the saved paths of
+  RFC-005 payloads for them by falling back to the text rendering. Here the
+  paths are in the structured object, as `savedTo`.
+- If a script's structured result would exceed the 5 MB script cap, the
+  framework saves it to the workspace and the script gets
+  `{ isError, oversized: { chars, savedTo } }`. If it can't be saved, the
+  script gets a failure that says the tool may have completed. Results
+  without structured content keep the existing script contract.
+- A result that can't be converted to JSON, such as a cyclic object or a
+  `BigInt` from an in-process module, reaches the script as an error that
+  names the tool and says the call itself completed: for a structured
+  result, the object above with `content: []`, `structuredContent: null`,
+  `isError: true` and the `error`, and `Error: …` otherwise. Before, the
+  script got the runner's bare error, such as `Converting circular
+  structure…`.
+- The `code_execution` tool's description now says what a script's tool
+  function returns: the text, or for a structured result the JSON object
+  above, with references and the oversized form. These two changes, and an
+  end-to-end test with real Python adapted from #181's, come from
+  @Meganeuridae's review of this change against #181.
+- The direct tool path (`executeToolCall`, `ModuleContext.callTool`) adds
+  `structured` to an MCP tool's result, success or failure, when the server
+  sent `structuredContent`. A modern server's result reaches it as an MCPL
+  server's does: an error result is a failure with its text, and a success
+  is the server's content array as `data`.
+- Closing a stdio MCP/MCPL server now waits for the child to exit, sending
+  SIGKILL after 2 s. A child still alive 2 s after SIGKILL fails `close()`
+  with an explicit error. Before, close returned as soon as a signal was
+  sent. `stop()` still finishes shutting everything else down after such a
+  failure, and then rejects (see the breaking notes). Concurrent `close()`
+  calls share one teardown, and a
+  later call re-checks a child that couldn't be reaped. A launch whose exit
+  can't be confirmed is never orphaned, and nothing launches beside it:
+  - `McplServerConnection.connect()` and `connectWithReconnect()` throw the
+    new `McplUnreapedLaunchError`, whose `connection` owns the launch; its
+    `close()` retries the reap. A reconnect attempt halts the loop instead
+    (`reconnect-failed`, `permanent: true`). Reconnect attempts run one at
+    a time, and never start before the previous child has exited.
+  - `reconnectAfterFailure()` on a connection without reconnect ends it
+    with `close()`, so a child it can't reap stays owned.
+  - `close()` during a reconnect handshake ends that launch before it
+    resolves, a WebSocket dial still opening included. In the framework,
+    `stop()` and a disconnect of the id end a first connect still in its
+    handshake the same way, and a WebSocket dial still waiting for its
+    access provider: `connect()`, `connectWithReconnect()` and
+    `McplServerRegistry.addServer()` take an optional `AbortSignal`, and an
+    aborted `connectWithReconnect()` makes no retry stub.
+  - `McplServerRegistry` holds an id until its child is confirmed exited:
+    `removeServer` frees it only once the close succeeds, a second
+    `addServer` for an id still connecting is refused, and `closeAll()`
+    keeps each connection it couldn't reap, reporting every failure.
+  - In the framework, a disconnect or failed connect whose cleanup can't
+    reap the child keeps the server registered, closed and listed as
+    disconnected, and its error says so; its tools leave the agents' list.
+    A connect for that id is refused until a disconnect, retried once the
+    child is gone, confirms the exit and completes the removal. A failed
+    startup connect that leaves such a child raises the `mcpl-down` ops
+    alert.
+- One owner per server id, across both families: a connect is refused while
+  another connect for that id is in flight (a legacy handshake included) or
+  a disconnect is still tearing it down. A disconnect closes a registered
+  connection immediately, and a legacy connect still handshaking is cleaned
+  up when its handshake settles (a modern connect in flight, or such a
+  legacy one, fails with "was not connected"); then it removes what was
+  registered. A teardown never removes what a later connection registered.
+  `restartMcplServer` refuses, before it tears the running server down, what
+  its connect would refuse: whatever the configuration check refuses (such as
+  an unusable binding, userinfo on an http(s) url, or MCPL policy that asks
+  for what a modern server lacks), a new id another server holds, a tool
+  prefix another server or a module holds or that meets another server's, a
+  framework whose `stop()` has begun, and a connect or disconnect of the
+  server in flight. Before, a restart disconnected first,
+  so a refused connect left the server gone; now the server keeps running.
+  From those checks through its connect, the restart holds the id and the
+  tool prefix it moves the server to: a connect or a restart started
+  meanwhile is refused them, or a prefix that meets that one, and a module
+  added meanwhile is refused that prefix, each naming the restart, rather than taking them while the old
+  server is torn down. The id and prefix it moves the server from are free
+  once its disconnect is done. A disconnect of the id it moves the server
+  to (its own, for a restart under the same id), or a `stop()`, that begins
+  during the restart ends it, as a disconnect ends a connect in flight, and
+  the restart's error says the server is down. A restart whose connect
+  fails leaves the server down, configured under the new configuration and
+  its id, and holding its tool prefix, as any failed connect does: it's
+  listed as not connected, and a restart or a disconnect under that id
+  tries it again or removes it. `addModule` also refuses a name a
+  server's tool prefix holds, as `create()` does at startup. A disconnect
+  releases the tool-prefix claims its own server holds. Treat a submitted
+  configuration as immutable while the server uses it: change settings with
+  `restartMcplServer(id, newConfig)`, and rotate a network server's
+  credentials through `accessProvider` (a stdio server's changed `env` goes
+  through a restart with the new configuration).
+- A server configuration naming no usable transport is now an error before
+  anything is spawned or dialed. That covers a `transport` that doesn't
+  match the url's scheme, `transport: 'http'` without a url, and an
+  unrecognized scheme. `McplServerConnection.connect()` and
+  `connectWithReconnect()` apply the framework's whole check (so `protocol`
+  on a WebSocket url is refused too), and a configuration error is never
+  turned into a retry stub. `openTransport()` and `isWebSocketTransport()`
+  decide by the same rule, so an http(s) url is never dialed as a WebSocket.
+- A configuration error, a WebSocket dial failure and `listMcplServers()`
+  show a server's url redacted, since a credential may ride in it: no
+  userinfo, each query parameter's value replaced, and so is a path
+  segment that looks like a credential (16 or more characters with a
+  digit, as a token or uuid has, or 32 or more of anything), such as the
+  per-user secret some hosted servers put in the path. A url that doesn't
+  parse isn't shown. An `accessProvider` that throws is logged by
+  its error's class and its message's length, not its text, which may quote
+  the credential.
+- `listMcplServers()` lists a configuration that connecting would refuse
+  with `refused`, which says why and is the verdict to read. Its `family`
+  and `transport` are null only when the configuration names no usable
+  transport, where the listing guessed a legacy binding before. A usable
+  binding refused for something else, such as an https url with
+  `requestTimeoutMs: 0`, keeps them. Its `policyEstablished` is null for a
+  modern server, which has no MCPL policy.
+
+- The MCPL texts an agent reads for a failed request, a refused tool call and a block the host can't show now say what happened, whether anything took effect, and what works from there, or that nothing does. Method names, request ids, JSON-RPC codes, close details and field names leave them. The ones an operator needs go to the host's log.
+  - **A failed MCPL request:**
+    - A connection that closes with a call pending reads `The connection to the "<server>" server closed before it answered, so whether the request took effect is unknown.` It then says whether this host is reconnecting, where it read `MCPL server "<server>" disconnected unexpectedly (code=…, signal=…, reason=…) while awaiting <method> (id=N)`.
+    - The other texts change the same way: a close by this host, a request on a closed connection or one the transport couldn't write, a server's error answer (in the server's own words, or, with none, saying the outcome is unknown) and a timeout.
+    - The log gains a line for a close with requests pending, with the close's code, signal and reason, whether this host closed it, and the requests left unanswered; one for a server's error answer, with its method, id and code, and its message, whatever JSON value it is, with any credential the server's configuration holds replaced, where the caller's text keeps the message unredacted; one for a timeout, with its method and id; and one for a request the transport couldn't write, with its method, id and the transport's words.
+  - **The framework's MCPL tool calls:**
+    - A call to a server missing from the registry, or to a tool its policy denies, says it didn't run and whether anything can change that, in the same words for the model's call and a script's. One made while this host is connecting to the server, in a runtime connect or a restart's, says so and to try again in a moment.
+    - An error result with no text, or only whitespace, reads as one whose effect is unknown, where it read `Tool call failed`, or the blank text.
+    - A conversation's `channel_open` is told where to reply.
+  - **Blocks the host can't show** read as what they were and why: `[Image not shown: …]`, `[Audio not shown: …]`, `[Reference not shown: …]`, `[Content not shown: …]`, and the text marker `[Text not shown: a text part arrived without readable text.]`. They had read `[Image: no data]`, `[unrecognized content block: …]`, `[inline content withheld: …]` and `[Text not shown: the server's text block had no string text.]`. An image or audio block with an empty link and no data reads as the no-data marker on the tool-result lane too.
+  - **A reference's expiry and missing server** read `expired`, `treated as expired, since its expiry time can't be read`, `treated as expired, since its expiry time isn't in a form this host accepts` and `not tied to any server, so there's nowhere to fetch it from`. They had read `expired: its expiresAt has passed`, `… (fail closed)` and `unbound: no server is recorded to fetch it from`.
+
+- A silent heartbeat tick's instruction now rides the tick's request-only
+  separator instead of a system-position injection, so a tick's request
+  carries the agent's own system prompt, like every other turn. A system
+  prompt that changed for one turn cost the heartbeat's request its prompt
+  cache from the system on, and on a provider that binds signed thinking to
+  the prefix it was minted under (context-manager #155) it failed every
+  retained thinking block in that request, and the tick reply's own thinking
+  at the next ordinary turn. `SILENT_HEARTBEAT_SEPARATOR` is now that
+  instruction (199 characters where it was 16, roughly 50 tokens at each
+  tick whose rows survive in the window). Each tick's rows now record the
+  separator their request rendered (`SilentHeartbeatStamp.separator`), and
+  later compiles render that text, so ticks stored before upgrading keep
+  their `[heartbeat tick]` marker byte for byte: no stored reply's prefix
+  changes. (`InferenceRequest.ephemeralSystemPrompt` is removed; see the
+  breaking entry.)
+- A tick whose restart compiles none of the tick's rows (a strategy folded
+  them all) opens again: the restart's request ends on the separator, where
+  later compiles render it before the restart's reply. It used to end on
+  `[Continue]`, and later compiles put the separator before a reply whose
+  request never held it.
+- When a compile ends on the agent's own message and the request gets a
+  trailing `[Continue]` turn, the reply's rows (its assistant responses and
+  tool results) now record that prompt (`metadata.promptedBy`, a
+  `{ turn, text }` pair), and every later request renders `[Continue]`
+  again just before the first of its assistant rows that survives, the way a
+  silent tick's separator is rendered. A later reply follows the same prompt
+  when what it is sent ends on the tool results of a reply that did: a next
+  round of the stream, a budget restart, an error retry, or a new process
+  reading the stored rows. A reply sent anything else after those results,
+  such as a message that arrived at the tool boundary or during a provider
+  cooldown, follows that instead and records no prompt. Without the turn,
+  later requests merged the reply into the previous assistant message (one
+  message carrying signed thinking from two responses, a 400 when it is the
+  latest), and dropped a turn the reply's request held, which a provider
+  that binds thinking refuses. A reply with neither a tool call nor signed or
+  redacted thinking can't be found in a compiled window and merges as
+  before. `StartStreamResult.continuePrompt` carries the prompt a stream's
+  request ends on (new, optional); the agent sets it. The direct
+  `runInference` paths compile without these request-only turns, as they
+  did without the tick separator, so their replies render none.
+
+### Fixed
+
+- Failed backscroll requests preserve the registry's known-open state rather than claiming a close. Automatic delivery joins pending lifecycle work without reopening a channel closed during the wait. A delivery or reply is announced as opening a channel, with the current registration label, only when the channel wasn't already decided open or tuned out; reconfirming the transport of a channel that was isn't announced. Speech engages a channel decided closed as a reply does, even while a failed close has left its transport open, wherever the server's grant lets the host open it. When `channel_open` fails for a channel that isn't open and is still decided open, its error says the channel stays selected for opening, since that decision outlives the failed round-trip and a later delivery or reconnect tries again.
+
+- Channel lifecycle operations now run in order per channel and reconcile the latest desired state and registration after an in-flight operation completes. Successful reconciliation confirms the current target and desired state at its receipt boundary; a superseded tool request reports that its requested state no longer applies. Automatic delivery preserves active tune-out attention state while opening or awaiting transport. A registration batch reconciles its channels side by side, so one held RPC doesn't delay its siblings. Removing a server cancels its queued lifecycle operations, and the framework removes its channel entries before closing its connection, so nothing queued runs against a closing connection or a later re-registration.
+
+- A channel's transport state is known only from a receipt for its current registration, connection, type, and address. A channel a registration creates or replaces, a retarget, a substitution, or a failed open or close leaves it unconfirmed: failed corrective opens fail joined delivery, while a same-target backscroll failure keeps a channel that was open usable. Incoming traffic confirms nothing unconfirmed (after a retarget it may still come from the old subscription), and it marks a channel open only while that channel is decided open or tuned out, so a close receipt stands. Explicit close, and declining an invitation, close an unconfirmed target for real instead of reporting it already closed. A retarget of a channel decided open or tuned out opens the new target.
+
+- Lifecycle convergence makes at most five transport attempts per operation. Continued descriptor/intent supersession fails with a diagnostic, releases the queue, and gives joined speech or reply preparation a visible failure instead of hanging. Later stable operations can retry.
+
+- A `channels/open` answered for a different channel than the one requested, by the answer's `channel.id` or a history item's `channelId`, compared exactly as the server's traffic is, fails the open. The requested channel isn't marked open (its open state becomes unconfirmed), nothing in the answer is used, its history included, and the host logs `[channel-open-substituted]` and emits an `mcpl:channel-open-substituted` trace, whose `answeredFor` is the answered id as the log line prints it, escaped by `logValue`. When the channel the server opened instead is registered and its desired state is closed, the host closes it again, so its traffic doesn't reach the resident. A substituted answer on a receipt already made stale by retargeting is retried like any stale receipt. An answer that names no channel, by a null id or none, is accepted as before; one whose id isn't a string fails the open the same way, with nothing to close. Either rollout order is safe: on a server that still falls back, the resident sees a failed open for an id that server no longer knows (a deleted channel), rather than another channel's traffic. `ChannelsOpenParams.channelId` is documented as exact: a server that doesn't know the id should refuse.
+
+- A tool name an MCPL server lists more than once reaches the model once:
+  the server's first listing is offered and the rest are left out (#265).
+  The model's tool list carried the name twice, which membrane's native
+  formatter and Anthropic's API refuse. Each tool refresh that finds such a
+  listing raises an `mcpl-tool-duplicate` ops alert naming the tools; its
+  webhook post goes out at most once per server in 15 minutes.
+
+- A `gate.json` or privileged-users file saved as UTF-8 with a leading BOM
+  now loads. Before, `JSON.parse` rejected the invisible U+FEFF, and the gate
+  reported an error and didn't apply the file (#395).
+
+- An ephemeral run (a subagent) no longer posts its plain prose to whichever
+  channel last received a message (#551). That channel, the process-global
+  fallback, was the locus of any `locus` or `hybrid` run with no channel of its
+  own, so delegated work, possibly drawn from a DM, could land in an unrelated,
+  possibly public channel. No ephemeral run takes the global fallback now,
+  whatever its prose routing:
+  - a `locus` or `hybrid` run's plain prose with no channel of its own is
+    returned to its caller as before and published nowhere; a sleep
+    announcement it makes is published nowhere too. Neither counts as a failed
+    delivery, so neither writes a `[send-undeliverable]` notice, an
+    `mcpl:speech-route-failed` trace or a log line;
+  - `channel_publish` without a `channelId` is refused, with words saying to
+    name the channel;
+  - its channel context has no `incoming` message, and no default outgoing
+    channel unless it opened one itself;
+  - a refusal of its inference adds no reaction anywhere, and its
+    `failures.log` record names no `locus`.
+
+  A channel the run opens itself, and a destination it names in its prose
+  (`hybrid`'s `>>>`, `explicit`'s `>>`), still route as before. Residents and
+  conversation forks keep the fallback. `channel_publish`'s description now
+  says where an omitted `channelId` goes: the conversation's bound channel,
+  else the most recent incoming one, and nowhere for a subagent.
+
+- Enforce each registered agent's allowedTools before model, script and public agent-origin dispatch, including utility names inside utils run. Filter utility list/describe to the same executable names. Refused calls retain paired error results without inner lifecycle state. A refusal withholds a call's effect, never the model's choice about its own words: a refused send changes nothing about prose, so its round and what follows go out; a `skip_reply` that a round calls itself (not one a `code_execution` script makes) keeps that round's prose private and silences nothing after it, as a refused wake already did, when the agent's allowedTools doesn't name it, another module's namespaced `skip_reply` included, or when it's the registry's own `skip_reply` asking for a wake this host can't set; and a refused `think` is read as a permitted one is, so the private same-round policy keeps its round private wherever it applies, which is where rounds are routed live. Framework-created identities (ephemerals and conversation forks) have no tool authority while unregistered, including after disposal; genuine unregistered legacy callers and trusted module closures retain their behavior. Prose primers and bounce notices advertise prose_help only when permitted, and `think`'s and `journal`'s descriptions tell an agent to call `skip_reply` only when it may. `think`'s result and `prose_help`'s reference no longer point at the `skip_reply` tool.
+
+- A turn woken only by deferred coalescing batches is withdrawn before inference in more of the cases where it used to call the model with nothing new to read: its batch was retracted or replaced after the wake was taken (the replacement or the retraction's notice wakes agents as any push does, by its own `triggerInference`), its batch was being rendered for another agent's assembly (the turn waits for that render, which the other agent's request reads), or the render was placed in another agent's deferred queue because that agent's turn was running. In that last case that agent is now woken for the render, as the batch's own wake would have woken it; before, nothing woke it for the render. When several agents are woken for one batch, the first assembly consumes it, and the others' turns already taken from the queue are withdrawn, as their still-queued wakes already were. A turn woken by a batch that a provider hold kept after its call failed is now retried with its own trigger when the hold ends, even if a newer batch of its subject arrived meanwhile. Before, the newer batch withdrew it, and the agent's next turn came from the newer batch's wake or, with nothing left held, from a fresh compile that names no channel or author.
+- When one agent's queued wakes merge into one turn, the turn's trigger now carries a coalescing subject only when it is every merged wake's, so a withdrawal of that subject's wakes, such as a retraction's or a newer batch's, takes the merged wake only when that subject was its sole cause. Before, the merged trigger carried its first wake's subject, and such a withdrawal, landing while the merged wake was held or requeued before its turn started, also dropped the wake's other causes, such as an ordinary message.
+
+- On a host with no primary (`agents: []`), a write with no target goes to the
+  first registered agent, such as an ephemeral run. Deferred, it now names
+  that agent in its queue entry, so it is that agent's as a targeted write is:
+  the agent's own flushes store it, and so does its window's release when it
+  leaves. Before, the entry named no agent, so neither the run's flushes nor
+  the run's end took it: after the run it was still queued, unstored, and in
+  the recovery file when the queue was persisted.
+- Boot recovery numbers the restored deferred-write queue 1, 2, 3, … in the
+  order it restores it, and later deferrals are numbered on from there.
+  Before, it kept each entry's `seq` and numbered only the entries without a
+  valid one, after the largest, so the counter went on from the largest valid
+  `seq`: one at `Number.MAX_SAFE_INTEGER`, which boot accepts, gave every
+  later deferral the same `seq`, 2^53. A recovery file whose `seq`s are all
+  valid isn't rewritten at boot for the new numbers; the queue's next write
+  carries them.
+- At a tool boundary, a deferred message that the strategy stores as more than
+  one message (a sharded body) is now injected as later compiles render it,
+  its shards joined. Before, it was injected as given, so a body of more than
+  one text block, or with a non-text block after a text block, reached the
+  stream in a different shape from later requests.
+
+- Under `proseRouting: "disabled"`, the turn-end receipt now reads `[delivered] plain speech → no channel — N plain-speech segment(s) kept in the transcript (…)` instead of `[delivered] nothing — N plain-speech segment(s) suppressed (…)`, which read to a resident talking with its operator through a console or Web UI as if its replies had reached no one (#225).
+
+- A Discord message is no longer stored twice when its live create and the history sync both reach it. The sync stored a message it fetched while the live path was still converting the message's attachments, or while its create waited to be handled, and the create then added a second row. Now the live path keeps each create on record from the moment it takes the message up until the store shows its row, stored or held (a held write's row shows at once), and the sync stores none of those. A second delivery of a message whose create is still on its way is ignored. A create whose message a sync stored first adds no row, and still sets the reply context and asks for inference as before. Where a message was already stored twice, a live edit and the sync both change its first row, where the sync changed the last, and a delete, live or found by the sync, removes every row of the message.
+- A message deleted before its create was handled is no longer stored, and no longer wakes the agent. A delete that came while the live path converted the message's attachments was handled first, found no row, and the create then stored the message. One that came while the create waited in the queue was handled after it, so the agent could be woken by, and answer, a message its author had taken back. Now the create is dropped: no row, no reply context, no inference.
+- An edit that comes while the live path converts the message's attachments is no longer lost. It was handled before the create, found no row and was dropped, so the message kept the text it was sent with until the next history sync. Now it's folded into the create.
+- An edit that removes an attachment now removes its block from the stored message. The client passed an edit's text alone, so the image, file text or note of an attachment the edit took away stayed in the row until the next history sync, which runs when the client becomes ready. The client now passes the edit's attachments, for a message discord.js had cached, and a message stored with its text first drops the block of each attachment it no longer has: an image by its URL, a file's text by its header and a note by the filename it opens with, whatever its words after it. A block that may stand for an attachment still there stays, such as one of two files of one name. An edit that adds an attachment, which Discord's API allows, is still left to the history sync, as is a message stored before its text came first.
+- A stopping module writes nothing. A create still converting attachments when the module stopped reached the stopped module's context and failed with a TypeError, in a promise nothing awaits. Now nothing is written for it, nor for a message that arrives or an event the framework hands the module while it disconnects.
+- Host authors: `DiscordClientInterface.onMessageEdit`'s handler takes an optional third argument, the edited message's attachments as the edit left them. A custom client that passes two arguments keeps today's behaviour: a stored message keeps its attachment blocks on such an edit. `DiscordEditEvent` gains the matching optional `attachments`.
+
+- **The workspace's disk reads refuse a mount root that isn't the mount's
+  directory.** `readFileFromDisk`, `readBinaryFromDisk` and `read_image` read
+  whatever was at a mount's root path, so a root renamed away and replaced by
+  a link to another directory, or by another directory, was read as the
+  mount. Once the workspace has recorded the root's identity, with the first
+  evidence it gathers there, such a root is refused as `mount_unavailable`,
+  in the words a sync uses for it, until a sync with `acceptRoot` takes it.
+  A root that is gone, or is a file, is `mount_unavailable` too, with errno
+  ENOENT or ENOTDIR, where it was "File not found". A root that changes
+  during a read, until the file has been opened and checked, gets the same
+  code and errno as one changed before the read.
+- **`readBinaryFromDisk`'s `maxBytes` bounds the read itself.** A file that
+  grows past it after the read's size check is refused as "File too large",
+  having loaded at most `maxBytes` bytes and one more, where it was read
+  whole.
+- **Two opens no longer wait on a FIFO.** A directory's sync after a push
+  opened the directory blocking, so a FIFO put at its path held the sync
+  until something opened it for writing. The tool presentation file's read
+  did the same, synchronously, holding the whole process. Each now opens
+  without waiting, and refuses what isn't a directory or a regular file.
+
+- `WorkspaceModule.readFileFromDisk` and `read_image` no longer wait on a FIFO in a mount until something writes to it. They refuse a FIFO, socket or device without opening it, with "Not a regular file: <path>" (`readFileFromDisk` with the code `not_found`), where they waited for a writer on a FIFO and gave other words for a socket or device. One reached through a symlink the mount follows is opened without waiting and refused the same way.
+
+- A reference whose address carries a user name or password is refused before anything is dialed, in words that don't repeat them. `fetch` refused such an address before connecting, with a message holding the whole address, password included, which `fetch_reference` gave the agent as its error, and the host's log carried it when the eager fetch tried it.
+
+- Notices about an agent's own action now reach the window that agent reads, deferred against that agent's own turn, stream and tool cycle (#188). Exceptions: a failed reply its speaker will never read, and a channel an ended agent's send opened, are told to the primary by name; any other notice for an agent no longer registered goes nowhere, logged.
+  - The notices: a failed reply (`[discord-send-failed]`), bounced prose (beside its `{{unsent}}` clipboard), the notices about the agent's drafts (a draft held at once, an `{{unsent}}` that names nothing or a draft it can't send, a resend whose outcome couldn't be recorded, and `>>skip_reply {{unsent}}`'s), a background script's wake, and a channel opened by the agent's own send. A channel opened by subscription policy, with no agent behind it, is still announced to the primary.
+  - A conversation fork's or an ephemeral run's notices land in its own window instead of the primary's. In connectome-host this moves a subagent's notices from the primary, where the default path put them, to the subagent.
+  - A resident's notices are addressed to it too, in the slot the residents share, and wait on its own turn rather than the primary's. Whether it may land there while another resident's turn is alive is the question of #291.
+  - When a fork or an ephemeral run is released, each failed-reply notice it never read is passed to the primary, once, by name, in the words of the speaker's own notice: "A reply by `<name>` (N chars) could not be delivered to … (…). Nothing was posted. `<name>` has ended.", or, for a delivery that wasn't confirmed, "Delivery of a reply by `<name>` (N chars) to … was not confirmed (…). It may or may not have been posted, so sending it again could post it twice. `<name>` has ended.", with the connector's detail when there is one. Never read means still queued for it, or stored in its window above its consumed watermark: after its last compile, and after the last tool boundary whose stream declared it carries the messages injected there. After a branch switch, only what both branches share up to the point they part counts as read. The same goes for a delivery that fails after its speaker is released, and for such a notice restored at boot whose agent is gone; a notice still queued goes on as that same queue entry, so a crash before its ack passes it on once. That notice's metadata carries `speaker`, and the delivery's `outcome` and `detail` as the speaker's notice had them; every failed-reply notice's metadata now carries `textLen`. With no primary registered, no one is told, and it's logged. A host stopped while quiesced, before a fork's or run's window release, queues the primary's notice of each failed reply that window holds unread, for resume or boot.
+  - A channel opened by an agent's own send after that agent has ended (an ephemeral run's final reply is routed after the run settles) is announced to the primary, by name: "Now open: … — opened by `<name>`'s reply; `<name>` has ended.", with the `channel_close` line. Its metadata carries `speaker`. With no primary registered, no one is told, and it's logged.
+  - Writes still queued for a fork or an ephemeral run when it is released land in its own window, which Chronicle keeps, with one acknowledgement once a failed reply among them has gone on to the primary. A fork or run that ends while the host is quiesced is deregistered at once, and only its window's release waits for resume, which lands them then; no other flush takes them meanwhile. A write addressed to it meanwhile is treated as for any agent no longer registered.
+  - The fallback reaper no longer disposes a closing fork whose turn is still alive before its stream has registered.
+  - Any other notice or background-script wake made for an agent that is no longer registered is dropped, logged once, with no trace and no wake.
+
+- `USERNAME` joins the child-env allowlist, beside `USER` and `LOGNAME`, so a Windows child gets its user's name, as a POSIX one does. Python's `getpass.getuser()` tries `LOGNAME`, `USER` and `LNAME` before `USERNAME`, so without it, it raises on a Windows host that supplies the name only through `USERNAME`, in stdio MCPL children and the code-execution interpreter alike.
+- A code-execution script's output that UTF-8 can't encode, a lone surrogate such as Python makes of a filename byte that isn't UTF-8 or of a `\ud800` JSON escape, reaches the host as U+FFFD. Before, the interpreter could fail to send the script's result, which then waited out the script's deadline.
+
+- The Discord module's tools now tell the agent what Discord refused and what to do instead. An id Discord doesn't know (Unknown Channel, Unknown Guild, Unknown Message, Unknown User), a channel, server or user the bot can't reach (Missing Access), a missing permission, an unknown emoji, an edit of someone else's message and a direct message the user doesn't take each read as "Nothing was sent", "Nothing was edited" and so on, with the call that shows the right id or whom to ask; before, the agent read Discord's bare words, such as "Unknown Channel". Any other refusal from Discord keeps Discord's words after the same lead. A `delete` of a message that isn't there says it's deleted or the id is wrong, without saying nothing was deleted, since a retried request of the call may have deleted it. A refused `reply` names the channel and message its reply context points to, and says `set_reply_context` changes them. What discord.js refuses itself, before it sends a request, reads the same way: a thread asked for on a message whose channel can't hold threads, or on a message that already has one (named, with how to post in it), and a reaction that isn't an emoji, which says Discord wasn't asked. A thread Discord says the message already has, from a repeat call or a retried request it had carried out, reads as there, with how to post in it; after a send, the send's error says so. A channel that holds no messages, such as a category, a forum or a media channel, is named as what it is, and an unknown channel's id says threads aren't listed by `list_channels`. An error that isn't a refusal, such as a network failure, reads as an unexpected error: for `send` and `reply` it says the message may have gone out and which channel's history shows it (for `reply`, the channel it posted in as it was sent, or, when its reply context names an empty thread id, how to put that right), for `dm` that sending again may send it twice unless an earlier `dm` to that user gave its channel's id, which `dm` now returns, and for the tools that change something that calling again is safe. A lookup that stops on such an error, before a tool changes anything, says nothing was done: a send's of its channel, a `dm`'s of its user and their direct message channel, and the message an `edit`, `delete`, `react` or `create_thread` acts on. One of those four that names an empty message id is refused before any request, with `fetch_history` as the way to find the id; it used to stop on discord.js's error. `list_channels` loses two refusals that couldn't be reached, and its description now says threads aren't listed. That changes the tool definitions every request carries, so each agent's first request after upgrading misses the prompt cache.
+- A `send` with `createThread` whose message went out but whose thread wasn't started now says the message was sent, with its id and the `create_thread` call that starts the thread, so the agent doesn't send it again. A thread asked for in a channel that can't hold one, such as a DM, is still skipped with a successful result, whose data now carries a `note` saying no thread was started and why.
+- The Discord module's rate limit refusal says how many seconds are left in the channel's window and what the limit is, rather than "Rate limited". A reply into a thread says the limit is its conversation's channel's. `reply` without a conversation, and `activate` and `deactivate` before the module has started, say what happened and what the agent can do. The notice for a text attachment that couldn't be fetched, which read `[Attachment: <filename> (failed to fetch)]`, now says its text isn't in the agent's context and to ask the sender in the channel to paste it, and the note for an attachment the host doesn't read in says the same of its contents. A text file of 100,000 bytes or more now says it's too large to read in, where it read as any attachment the host doesn't read in. A message stored with the earlier words keeps them until the history sync stores it again.
+- An unknown tool name for the `discord`, `health` or `api` module says there's no such tool and lists that module's tools, read from its own `getTools()`. The health snapshot asked for before the host has bound the module tells the agent nothing was read and to ask whoever runs the host, and prints the host's missing `bind(framework, store)` step on a console line.
+- **Client authors:** `DiscordRefusal` is exported. A `DiscordClientInterface` implementation that throws one has its message passed to the agent as it is; anything else it throws is worded as an unexpected error. `DiscordJsClient`'s `sendMessage`, `sendDM`, `editMessage`, `deleteMessage`, `addReaction`, `createThread`, `listChannels` and `fetchHistory` now throw a `DiscordRefusal` in three cases where each threw something else: Discord's refusal, a `DiscordAPIError` (kept as the refusal's `cause`); discord.js's own refusal of a thread or an emoji; and a channel that holds no messages or that discord.js returned as null, for which they threw an `Error` of their own. `sendMessage`, `sendDM`, `editMessage`, `deleteMessage`, `addReaction` and `createThread` also throw one when a lookup before their change stops on an unexpected error, such as a network failure. `fetchMessage` and `sendTyping`, whose failures reach only a console line, keep their errors. `sendMessage`'s `threadFailure` is worded for the agent, and it resolves with a `note` when the channel can't hold the thread asked for. `sendDM` resolves with the direct message channel's `channelId` beside the message's id; a custom client may leave it out.
+
+- A stream that reports the framework's own cancel as an `error`, by just closing, or by
+  throwing, now ends an endTurn or a budget restart the way an `aborted` one does. After
+  an `error`, neither is traced as `inference:failed`, logged as a failed inference, or
+  handed to the error policy. After a throw, neither is traced as `inference:failed` or
+  `inference:exhausted`, or leaves an "[inference-failed]" note in the agent's context.
+  In every shape, the stream's §10.5 lifecycle terminal reads `aborted`, an endTurn writes
+  its delivery receipt and starts the continuation it was asked for, and a budget restart
+  keeps the event gate's window open for its new stream, which takes over the turn's
+  typing and streamed message. A stop, a quiesce abandon or a caller's stop over a stream
+  that throws ends as one, as it already did over the other shapes, and the throw is said
+  on the console. A stream that reports its cancel as an `error` and then throws ends
+  once. membrane's yielding stream reports a cancel as `aborted`, so this reaches other
+  stream implementations.
+- A budget restart whose new start fails before its stream exists, such as on a store
+  write, no longer leaves the agent's window open at the event gate, which kept every
+  gate event buffered, for every agent. This happened with membrane's `aborted` restarts.
+
+- **An inference whose stream fails now ends its `inference/lifecycle` with
+  `failed`, where it ended `completed`.** An MCPL server granted
+  `inferenceLifecycle` was told that such an inference completed. Three
+  endings change:
+  - an `error` event that ends the turn;
+  - an `error` event that is retried. The retry is an inference of its own,
+    with its own `started` and terminal, and a retry that `stop()` cancels
+    leaves the failed inference `failed`;
+  - an `aborted` event whose reason isn't `user`, such as `timeout`.
+
+  The endings a stop or the framework's own cancel accounts for still end
+  `aborted`, as before: an `aborted` event with reason `user`, an `error`
+  event after a caller's stop, and an `aborted` or `error` event after the
+  framework's cancel.
+
+- A runtime connect, or a restart of another server into an id whose connect is still in flight, in either engine, is now refused before it changes anything, with `MCPL server "<id>" has a connect in flight; try again once it settles`, until that connect lets go of the id, just before it lists its tools. Before, a second connect went ahead beside a legacy one, and whichever settled last replaced the other in the registry without closing it. A disconnect of the id now ends the connect in flight and removes whatever it registered. Before, the disconnect removed the server's config and tool prefix, and the connect then registered the server without them, where no call reached it and only another disconnect cleared it.
+
+- An MCPL server that reconnects now has its channel registration accepted.
+  A reconnect resets the server's grant, and its traffic used to reach
+  admission before the host's new §5.3 policy Request was answered: a
+  `channels/register` sent right after initialize, as chat bridges do, was
+  refused (-32002) and never replayed, so the route's incoming messages
+  stayed unknown channels until the server registered again. A reconnect now
+  holds control traffic as well as data until the new grant is established,
+  as initial connect already did, both for a connection that was open and
+  for one whose first connect had failed. It holds them whatever gate
+  completes meanwhile, though each gate's completion opens every
+  connection's planes: startup's staged open, a quiesce resume, an awareness
+  sync, or another server's list change or reconnect. A runtime connect
+  holds its planes the same way, through its awareness accounting too, and
+  runs its exchange only on the transport it registered: if a reconnect
+  replaced that transport meanwhile, the reconnect's exchange covers the new
+  one, and the server is announced once.
+- A policy answer that arrives after its transport closed grants nothing,
+  whether to the initial policy Request or to one after a manifest change,
+  and a manifest fetched from a transport that has closed isn't installed,
+  nor a refresh queued on it run on the next one. A queued refresh's receipt
+  reports the domains of the announcements it coalesced on its transport,
+  each once, and the refresh limiter is kept per connection, so a connection
+  that replaces a removed server under its id starts its own, where a timer
+  of the removed connection could drop its replacement's queued refresh. A
+  reconnect is still announced (`mcpl:server-reconnected`, `module:added`)
+  once its attempt has settled, granted or not, and now also when another
+  gate replaced its own before the awareness drain ended, where it used to
+  go unannounced. A connect or reconnect whose transport drops before it's
+  announced isn't announced: the close has reported the server gone
+  (`module:removed`), and the next reconnect, if one comes, announces it.
+  For a host that lists modules from the trace: a server whose first connect
+  failed is added (`module:added`) once, by the first reconnect that's still
+  connected once its attempt settles, granted or not, where it used to be
+  added also when startup or a runtime connect registered it, and one that
+  never connects isn't added. What a server sent about its own process that
+  is still held when its transport closes, such as a request, a
+  `tools/observe` filter or a channel registration, is dropped rather than
+  admitted under the next transport's grant: the next process announces its
+  own. So is such a message read from the transport after it closed, as can
+  happen when a process a stdio server started still holds its stdout, until
+  a reconnect attempt, if one comes, closes the transport's reader. A
+  response read then is matched against none of the connection's requests,
+  since the next transport numbers its own afresh, and, as any late answer,
+  is surfaced as an orphaned response if it carries state, which waits, as
+  the host's other reports do, for the control plane to open. A connection
+  closed for good as its transport closes, by the host's close of a live
+  connection or a drop with reconnect off, drops and logs the incoming
+  messages and pushes it still holds then, and every request or notification
+  it reads late, since no grant will come. Incoming channel messages and
+  pushes still held, or read from the transport after it closed, are kept
+  and admitted under the next grant, since a bridge that recorded them as
+  forwarded won't send them again, and they stay held while no transport
+  serves, even when a gate readies every connection meanwhile; the host's
+  own reports about the transport, such as a `connect-failed`, go on.
+  Requests kept this way don't count against the 10,000 held requests a
+  server may have waiting, since no server waits on their answers any more:
+  they have a bound of their own, the same 10,000, past which one is dropped
+  and logged, so a dead process's backlog doesn't refuse the next process's
+  requests. A channel registration the next process sends while they are
+  still held is admitted ahead of them, so a kept message isn't refused as
+  an unknown channel, unless it names a channel that an earlier removal, or
+  an earlier registration kept in place, names: then it's kept in place too,
+  so the writes to one channel stay in order. A removal stays where it was
+  held, with whatever else it adds or updates, so when both planes open
+  together, what the next process sent before one is admitted before it.
+  While the host is quiesced its control plane opens first, so a removal is
+  admitted then, ahead of the incoming messages still held, as live traffic
+  is during a quiesce, and a message held for a channel it removed is
+  refused when the data plane opens. A registration that arrives once the
+  kept messages are admitted is too late for them, and a kept message for a
+  channel the registry doesn't know is refused. An answer to a request from
+  a closed transport is never written to the next one, whether the request
+  was still held or its listener was still working when the transport
+  closed, and neither is a streamed inference's chunk. A bridge that sends a
+  kept incoming message again after reconnecting, because it hadn't recorded
+  it as forwarded, can have it admitted twice; discord-mcpl records a
+  message as forwarded before it forwards it.
+
+- A module now reads, edits and removes the messages it writes while the framework holds them. The framework holds a module's writes while their agent has a turn alive or the host is quiesced, and stores them at a later boundary. A module's context answered such a write's id as `''`, its queries didn't see the write, and its edits and removals threw "Message not found". So a Discord message deleted during a turn stayed in the agent's history, an edit made then was lost, and a history sync could store a second copy.
+  - **`ctx.addMessage`** answers a held write's id as a handle, `held:` and the write's id in the deferred-writes queue. `getMessage`, `editMessage` and `removeMessage`, and a process answer's `editMessages` and `removeMessages`, take it as they take a stored id. An edit changes the held write, and a removal drops it, so the agent never reads it. Once the write lands, the handle names its stored row. A handle whose write the framework dropped names nothing, as an unknown id does.
+  - **`ctx.queryMessages`** answers the rows of held writes after the stored rows, marked `held: true` (the new `ModuleMessage` type), and `totalCount` counts them. A held row's `sequence` and `timestamp` are provisional, and change when its write lands. The writes a process held and the next one restores show once `create()` has restored them, which is after every module's `start()`: a module's `start()` doesn't see them, as before. A module that reads every row sees held ones too: connectome-host's retrieval module keeps its window to stored rows (anima-research/connectome-host#326).
+  - **`ctx.findMessageByExternalId`** answers the first row under the external id where it answered `''` for a held write: the write's handle while it's held and its stored id once it lands, or an older row the module added under the same external id. The context still keeps `''` for a held write in its persisted map, which an earlier release reads back, and looks such an entry up in the store by the external id, held rows included. So an entry an earlier release left for a held write finds its message, and an entry it finds nothing for stays, as in a module's `start()` for a write the last process held. A stored id answers while its row is stored: once a process answer or a removal by handle has taken the row, the lookup answers `null` rather than that row's id.
+  - A write a module or a process answer adds loses a `deferredWriteId` its metadata carries, such as one copied from a stored row: the framework finds a held write's stored row by that key.
+  - The deferred-writes queue (`recovery/deferred-writes.json`, or `framework/deferred-writes` without one) records when each write was held (`heldAt`). An entry an earlier release wrote takes the time the queue is read back.
+
+- A module tool's call that lacks a required argument, or whose input is
+  there but isn't an object, is answered before the module runs with what to
+  send, such as `Nothing was done: discord--set_reply_context needs
+  "channelId" (a string), and this call gave none.`, every problem named at
+  once. Before, the call reached the handler, which could fail deep inside
+  with a `TypeError`, or run without it: `discord--set_reply_context` with no
+  `channelId` left the reply context with no channel and answered success.
+- The `utils` tool's check of a run's arguments reads the same way ("Nothing
+  was done: …"), names every problem at once, and is still followed by the
+  utility's schema. It now admits any type of a declared type list, where it
+  refused every value of such a parameter; no longer checks the type of a
+  parameter whose `type` names no JSON Schema type, such as `any`, or a list
+  naming one, which it refused whatever it was (its `enum` is still
+  checked); and takes a run of 16 or more digits sent as text for a number,
+  passing it to the utility as text.
+- The Discord module's `activate` reads a call with no input as no
+  arguments, where it threw a `TypeError`.
+
+- Where `fetch_reference` refused a reference from an MCPL server the host
+  doesn't connect to over a network, such as a stdio server, as
+  `unknown server: <id>`, it now says `this host doesn't connect to the
+  "<id>" server over a network, so there's nowhere to fetch it from`. A
+  server the host spawns from a command has no address either,
+  even when its config also holds a `url`, on whose origin its references
+  used to be fetched; nor has a WebSocket server whose `url` the transport
+  won't dial: one that isn't a `ws://` or `wss://` url, or that has a
+  fragment. A WebSocket server whose `url` has a fragment, which the `ws`
+  library refuses to dial, now fails to connect with the transport's own
+  error naming the fragment. `save_recent_image` now gives the reason a
+  `fetch_reference` call naming no `max_bytes` would be refused with before
+  dialing, and points at `fetch_reference` only where that fetch would go
+  ahead. The eager fetch of the references in the result of an MCPL tool
+  call the agent makes no longer spends one of its slots on a reference the
+  fetch would refuse before dialing, such as one from a server whose fetch
+  budget is spent, though it still joins a fetch of a reference already
+  under way.
+
+- `WorkspaceModule.readBinaryFromDisk` could read outside its mount through a symlink: it followed one at the path or among the directories on its way, wherever it led, whatever the mount's `followSymlinks` said. It now reaches a file as `readFileFromDisk` does, so it refuses a symlink the mount doesn't follow, and on any mount a file that resolves outside it, in `readFileFromDisk`'s words, before any size limit answers. Its own answers for a missing file, a file that isn't regular and a file over `maxBytes` are kept, with two changes: a path through a file, which gave the system's message with the absolute path, answers "File not found on disk", and a file this user can't read answers "Unable to read file" whatever its size.
+
+- Server and transport text the framework records has the server's configured credentials replaced, in both engines: connection traces, console lines, stderr traces, the last of a server's stderr that a failed handshake keeps (in its trace and console line), the ops alert (and so `logs/failures.log` and the webhook), an MCP tool call that fails without an answer, as its caller and the model get it and in the `tool:failed` trace's message and stack. The credentials are those the configuration holds and those its dials sent: from the url as each dial sends it (a WebSocket dial sets the token in the query, which writes the whole query again, form-encoded, and an access provider's token can be in it), credential-like path segments and query names, credential-shaped or credential-named query values (each as written and decoded), every non-empty parameter as its whole `name=value`, and a WebSocket url's username and password, its userinfo as one unit before its `@` (the username alone when there's no password), with no length floor, so a short password goes with its username and a short username alone goes too, and the Basic credential a WebSocket client sends for it; the static `token`, and each token an access provider handed a dial (the newest sixteen), raw, and as a url carries it, percent- or form-encoded with either case of hex; and a stdio server's `env` values whose names have a part ending in a credential word, singular or plural, with any digits after it (`GITHUB_TOKEN`, `API_KEYS`, `PGPASSWORD`, `DB_PASS`, `AUTHORIZATION`, `SESSION_COOKIE`, `TOKEN2`), raw, and percent-encoded with either case of hex. Each of these strings, from every source, the `name=value` pairs and userinfo units too, is also replaced as JSON encoders write it, with `JSON.stringify`'s escapes, and with its slashes escaped too, as some encoders write them. A stdio server's command-line arguments are not derived. A string replaced on its own has at least eight characters, since a shorter one can't be told from ordinary text, and is replaced wherever it occurs. Every non-empty query parameter is also replaced as its whole `name=value`, only where no letter or digit adjoins the pair (so `v=2` leaves `dev=2` alone; a JSON escape before it, such as `\n`, isn't one); a short value goes only that way. A connection's event records use a redactor built once for it, and built again once a dial has sent something new. An operation's records replace the credentials of the configurations present when it began and of those present when each record is made, so a server removed, or replaced by a restart, while the operation waits is still covered, and so is one connected meanwhile. Every place a credential matches is replaced, places that overlap included, and text that may come from any server is matched against every server's strings at once, so two servers' secrets that overlap are both replaced whole. Over HTTP, which only the modern engine speaks, a 401 or 403's response body is left out of the request error's data; where the HTTP client builds the error's message from the body, as it does for most statuses, the message is redacted like any record. Credentials neither the configuration holds nor a dial sent are outside this, and so are a stdio server's command-line arguments. JSON-RPC answers, and the error a host's own connect raises, pass as they are.
+
+- A record of a server's text no longer throws when the configuration it's
+  redacted with can't be read, as a legacy stdio MCPL server's can't while
+  the Discord awareness ledger can't be read. In place of the text it reads
+  `[withheld: the server's configuration couldn't be read to redact this]`.
+  Before, on a legacy MCPL connection:
+  - a reconnect attempt made while the ledger couldn't be read rejected with
+    nothing to catch it, which by Node's default ends the process. The
+    connection made no further attempt, and its `close()`, and with it the
+    framework's `stop()`, rejected with the ledger's error;
+  - an error its transport reported after the handshake settled, or while a
+    transport that never served was closing, was thrown inside an I/O
+    callback;
+  - an initial connect with `reconnect: true` whose ledger broke after the
+    framework's own read rejected with the ledger's error, which ended
+    startup, instead of returning the stub that retries.
+
+- Under a configuration a host passes with a getter that throws, a failed
+  MCP or MCPL tool call now answers with the withheld words as its error,
+  where a call the model or a `code_execution` script made got no result and
+  an in-process call rejected; and startup goes on past that server's failed
+  connect, where it ended.
+
+- A silent heartbeat tick is now told apart by its server and its event id
+  together, so two servers' ticks whose events share an id each get their
+  own separator, before their own first row.
+
+- `start()` and `addModule()` made while a `stop()` is still running are now refused: `start()` throws `start() refused: the framework is stopping`, and `addModule()` rejects with `addModule() refused: the framework is stopping` (#315). Before, `start()` began a second lifecycle under the stop. If the stop hadn't yet seen its event loop end, it waited on the new loop instead: with no budget, which is the default, nothing ended that wait, and with one, it failed with `pending: event loop` and left the new loop running. If the stop had got past that wait, it settled after tearing down modules and an owned store under the new loop, and every later `stop()` returned that settled promise, so nothing could end the loop. A module added after the stop had taken its list of modules to stop stayed started and registered past it. `start()` and `addModule()` after a `stop()` has settled behave as before.
+
+- **A stdio MCP server whose stdin or stdout fails is now ended even when
+  it ignores SIGTERM, in both engines.** Since 0.22.2 such a failure sends
+  the child SIGTERM, and its exit closes the connection. A child that
+  ignored SIGTERM kept running, the connection stayed connected, and each
+  request waited out its timeout. The transport now sends SIGKILL after 2 s,
+  as its `close()` does, in the one attempt `close()` shares, so the
+  connection closes, and reconnects if it would after any exit, its close
+  still naming the pipe's error.
+  - Nothing more is written to the child after the failure. A request made
+    then is refused as not sent (`not-sent`), where it was written to the
+    failed pipe and reported at its deadline as possibly executed. One
+    written before the failure is still reported as possibly executed.
+  - A connected server's child that outlives SIGKILL too is held as a
+    launch that couldn't be reaped, as a reconnect holds one: reconnecting
+    halts, the `mcpl-down` alert is raised, its tools leave the agents'
+    list, and its id stays held until a disconnect or `stop()` retries the
+    reap and confirms the exit.
+  - Under Bun, a child that closes its stdin isn't reported at all, since
+    Bun emits no `'error'` event for the writes to it, so request timeouts
+    still bound it, as they do a child that stops reading.
+
+- **`stop()` ends an MCPL connect still in flight, in either engine,
+  instead of waiting for it.** The connect rejects with "was not connected:
+  the framework stopped while it was connecting", and `stop()` doesn't wait
+  on a server for it, in its handshake (its launch reaped), its setup or its
+  tool listing, which asks every server. A restart in flight ends too, its
+  connect refused once `stop()` has begun, so the server it was restarting
+  is down. A disconnect admitted before `stop()` began still finishes
+  first.
+
+- `stop()` now runs every step of its teardown whatever an earlier step did.
+  Before, a step that threw, such as a host's stream whose `cancel()`
+  throws, ended `stop()` there: its modules and MCPL servers weren't
+  stopped, the liveness watchdog went on beating, the framework stayed in
+  the diagnostics registry, an ephemeral run still pending wasn't ended,
+  and every later `stop()` failed the same way. Now `stop()` fails with
+  that error once the rest has run, beside any other failure in an
+  `AggregateError`, and an owned store stays open for another `stop()`, as
+  after a failed module stop. A step in the last flush of deferred writes,
+  which comes once everything else has stopped, fails the `stop()` as a
+  failed final sync does, and the store is still synced and closed.
+  - A stream whose `cancel()` threw is left running, as one whose wait ran
+    out is: `stop()` doesn't wait for it, even with no budget, its agent's
+    deferred writes stay queued, and a later `stop()` waits for it before
+    it closes the store.
+  - An ephemeral run whose own stream's `cancel()` throws at the run's end
+    now leaves all the same, and settles as it ended, such as with
+    `stop()`'s refusal, rather than with the cancel's error, which is
+    logged. Before, the throw skipped the run's cleanup: the run and its
+    agent stayed registered, and the stream's later text still reached the
+    agent's context.
+- `stop()` now ends Discord awareness delivery. A drain running when
+  `stop()` begins sends nothing more, and the marks it hasn't sent stay
+  pending in the outbox, unrecorded, for the next start's barrier; a line in
+  the host log names the server and how many marks it held. `stop()`
+  waits, within `teardownTimeoutMs`, for each drain still running to record
+  the call that closing its MCPL server ended. Before, `stop()` neither
+  stopped nor waited for drains: once the servers had closed, a drain went
+  on through its pending marks, recording each as a failed attempt
+  ("Cannot send request: connection … is closed") though it sent none, and
+  with many marks those writes went on after `stop()` had returned. After a
+  `create()` whose awareness barrier failed on one server, another server's
+  drain went on writing the outbox after `create()` had rejected, while a
+  `create()` retried in the same process could already be using it.
+  - A wait on drains that runs out fails the `stop()` with a
+    `ShutdownTimeoutError` naming `awareness drain:<server>` and keeps an
+    owned store open; a later `stop()` waits for that drain again. With a
+    budget, a `stop()` can now take up to six budgets, where 0.22.3 took up
+    to five. A failed `create()` gives this wait 30 s too, a third cleanup
+    wait beside the two it had in 0.22.3.
+
+- **A stop reaches a turn that has no live stream.** A turn can be alive
+  with no stream to carry a stop: while it runs its modules'
+  `gatherContext`, its MCPL hooks or its compile, while it waits to retry a
+  failed inference or a failed compile, and while the tool-result guard
+  waits for its speech to go out before retrying a refused round, when it
+  holds only the round's finished stream. In the first two,
+  `Agent.cancelStream()` had nothing to cancel, the framework's
+  `abortInference()` returned `false`, and an operator's quiesce abandon
+  left the turn running. In the guard's wait, the round's finished stream
+  was cancelled and `abortInference()` returned `true`, but the retry was
+  sent anyway. The turn went on to send its request or its retry, and
+  answered, and an abandoned one did so while the host was quiesced. Now
+  it ends at its next check, before it sends anything more.
+  - **What a host sees:** one `inference:aborted` with the stop's reason,
+    instead of a turn that goes on. The agent's `[turn-interrupted]` note
+    says the turn was stopped before it sent anything, or before it
+    finished; an operator's abandon writes no note. The inference log gets
+    the stop's row, as for a stop on a live stream:
+    `Stream cancelled (<reason>)`, or `Stream aborted: quiesce_abandoned`
+    for an operator's abandon. The framework's `abortInference()` returns
+    `true` for such a turn. `abortInference()` and an operator's abandon end
+    a turn's wait to retry, however long, so the turn ends at once; a stop
+    through `Agent.cancelStream()` ends it when the wait runs out. An MCPL
+    server granted `inferenceLifecycle` sees a failed inference whose retry
+    such a stop cancels end `failed`, as when `stop()` cancels it. In the
+    tool-result guard's wait, `stop()` and an operator's abandon end the
+    turn as their own stop even when a caller's stop came first, and as
+    `stop()`'s when both reach it. `host:quiesce`'s `unabandonable` lists a
+    turn that the abandon hasn't ended when its grace runs out: one with no
+    stream and no check ahead, such as a puppet tool turn, or one that
+    hasn't reached its check yet, the tool-result guard's wait for its
+    speech included. A turn whose stream the abandon cancelled while it was
+    still streaming isn't listed, even one still running.
+  - **A failure's report:** a turn's stream that failed or threw no longer
+    holds the agent while its `inference:failed` is delivered, nor does a
+    compiled stream held for a provider's wait. A listener sees the agent
+    idle, and `abortInference()` from a listener reports `false`: no stream
+    or check is there to take the stop. A stop through
+    `Agent.cancelStream()` made then ends the turn at the check after its
+    wait to retry, if the error policy retries it, and otherwise ends
+    nothing. A failure to build a turn's request is reported while the
+    turn's check is still ahead: `abortInference()` from a listener reports
+    `true` there, and the turn ends at that check.
+  - **A stop followed by a failure:** when a turn's compile fails after a
+    stop reached it, the turn ends at the failure: its `inference:failed`,
+    then its `inference:aborted`. It isn't held by a provider hold, and the
+    error policy doesn't retry it. If by then the agent was replaced, or the
+    framework is stopping or was stopped and started again, the turn is
+    dropped before it sends anything, as at the check after the compile. A
+    failure that would have exhausted the turn emits no
+    `inference:exhausted`, the event from which the hard-down alert's
+    failure streak, the over-budget drain and the poison-history breaker
+    count failures, so none of them counts it.
+  - **A stop made where no check of a turn is ahead ends nothing:** the
+    agent's next turn runs, as after a host's interrupt of every agent.
+    That covers an idle agent, a turn finishing its last delivery, a budget
+    restart or a non-streaming turn's tool results waiting to start the
+    turn's next call, and a turn a provider-capacity hold or a provider's
+    stated wait has parked.
+- **A start whose framework was stopped and started again since it began is
+  dropped before it retries a failed compile.** Its `inference:aborted`
+  reads `a retry waiting while the framework was stopped and started again
+  is dropped before it sends anything`; before, the retry compiled and was
+  sent in the new lifecycle. A start whose hooks ran across a `stop()` and a
+  `start()` is dropped before its compile too, as `a turn assembled while
+  the framework was stopped and started again …`, where before the check
+  after its compile dropped it. Either way a stop kept for the turn goes
+  with it, as for a turn dropped while `stop()` runs.
+
+- On Linux, a workspace mount's watcher no longer re-attaches, rescanning
+  the whole mount and running its catch-up pass, when a file or directory
+  with the mount root's own name is made, saved over or removed anywhere in
+  the mount, as a program a build names after its directory is on every
+  build. libuv reports such a rename under the same name as the root's own
+  removal, and the watcher took every one for the root's. It now holds its
+  root open (see Breaking) and checks whether the root is still the directory
+  it holds. Where it can't hold the root, as on macOS and Windows or without
+  read permission, such a rename still re-attaches it, as before.
+- A workspace mount's watcher whose re-attach fails to close its old chokidar
+  instance now reports that and attaches again. It used to stop watching the
+  mount until the root's identity changed.
+
+- On a disk that folds case, as macOS's does by default, a path that disk has nothing for takes the spelling of a workspace entry it equals in simple case folding, letter by letter, so a draft that isn't on disk yet has one name too. A `write` of `work/src/NEW.txt` where the workspace holds the draft `src/New.txt` now writes that draft, as the disk will once it's materialized, and `read work/src/new.txt` finds it; a directory works the same way. Two drafts that differ only in case used to be two entries for one file: a materialize wrote one and skipped the other, a forced one wrote the second over the first, and two directory drafts became one disk directory whose files the next pass moved under its spelling. A path that names a workspace entry exactly, or does once its directories take disk's spelling, keeps the entry's spelling, so an entry that disk lists in another spelling, or in a directory disk lists in another, such as a draft beside a file made on disk in another case before the draft was materialized, is read, synced, materialized and deleted by its own path. So is a file deleted in the workspace while disk keeps its copy, and a path in conflict: a `read` of its own path answers that it was deleted, or is in conflict, rather than taking the file in again, and a `materialize` of that path with `applyDeletions`, or a `sync`, reaches it. A path that disk's spelling puts in a nested mount's directory keeps that spelling, so the nested-mount checks still refuse what they refused. A draft whose directory disk comes to list in another spelling before it's materialized is found only by its own path. Drafts that differ only in Unicode normalization form, or in letters only a fuller folding joins, such as `ß` and `ss`, stay two entries, and where the disk folds them, as macOS's folds normalization, a materialize still writes one and skips the other. Spelling a path disk has nothing for reads the workspace's entries under the deepest of its directories disk has, so on macOS a script that creates thousands of new files, or looks up thousands of paths that don't exist, under one large directory pays that once per path. On a disk that tells case apart, every answer is as before, except that where such a disk folds normalization forms, a path that names a workspace entry exactly, or a deletion or conflict the workspace records there, or does once its directories take disk's form, keeps its form, outside nested mounts' directories.
+
+- A mount nested in another is now that mount's directory wherever disk puts it, not only where the outer mount's paths name it as written. A root configured through a symlink, or beneath one, is nested where its real path lies; before, it wasn't nested at all, and the outer mount took in and read the inner mount's files. Each start of the module reads each root's real path again, awaited, so a root on a share that stops answering holds that start, not the process; before the first start, mounts are nested by their configured paths alone, as they were. On a mount that follows symlinks, a path that reaches a nested mount's directory through a link is now refused as one written into it: the file tools answer `"work/l/x.txt" leads into mount "inner", nested in mount "work", which neither reads nor writes it: use "inner/sub/x.txt".`, a sync or a materialize leaves it with `"work/l" leads into mount "inner", nested in mount "work": use "inner/sub" in its place`, and `readFileFromDisk` refuses it with the code `other_mount`. Before, the outer mount read, took in, wrote and unlinked the inner mount's files through such a link (#530). On a mount that doesn't follow symlinks, a path through a link into a nested mount's directory is now refused before anything is stored, with the refusal of the link the mount doesn't follow; a `write`, `edit` or `delete` through it used to store a change that no push could write. Where the path is itself a link to a file in a nested mount's directory, `readFileFromDisk` now refuses it with the code `other_mount` and words naming that mount, where it answered `symlink`.
+- A mount configured with a relative root written with `./`, such as `./m`, now hears its watcher; it heard no change on disk.
+
+- A workspace mount that doesn't follow symlinks (`followSymlinks` unset or false) now follows none among the directories on a path's way either. Before, a symlinked directory pointing inside the mount was followed, so the workspace acted on a file under another path than the one it named: a materialize deleted, created or overwrote the file behind the link, and a sync took that file's bytes in. Such a path is now refused wherever the link leads, naming the link: for a link inside the mount, with its target, and for a link to a directory there, that the mount's host can set `followSymlinks: true`; for one leading outside the mount, saying so. On such a mount, reads through an inside directory link stop, from `readFileFromDisk` and `read_image`, with a new code, `parent_symlink`, or `other_mount` for one into a nested mount's directory, and a listing of the directory a link stands at says so instead of walking it. A directory link leading out of the mount keeps the code `escape`, with the new words. A change a tool stores through such a link stays pending until disk can be observed there: the link goes, or, for a link to a directory inside the mount, the host follows links. A file the workspace created through the link clears when its entry is deleted. For a link inside the mount, the path through its target is the one to use. A mount root that is itself a symlink is still the root, and a mount that follows symlinks keeps following them while they stay inside it.
+- Deleting a workspace entry disk never agreed with, a draft the workspace created with no push of it in doubt, or one at a path where disk last agreed it had nothing, no longer leaves a deletion pending. It records nothing to apply and pushes nothing, so it needs no proof of absence, which a path beneath a symlink the mount doesn't follow could never give. A draft written over a disk file the workspace never saw is now deleted without touching that file, which a sync observes as it does any file disk holds; the deletion was refused, with a forced push that would have deleted the file offered after a sync. Where a conflict the deletion clears names such a file, `delete`'s answer carries a `note` saying nothing was unlinked.
+
+- On a disk that folds names, as macOS's does by default (case, and Unicode normalization), the workspace's tools take a path as disk spells it, unless it names a workspace entry exactly, or a deletion or conflict the workspace records at that path, or does once its directories take disk's spelling, which keeps that spelling where disk's spelling doesn't put it in a nested mount's directory. A `path` spelled otherwise, such as `work/SRC` for disk's `src/`, reaches disk's files, and `glob`, `grep` and `ls` used to name what they found from that spelling. So the workspace took each file in a second time under that name, announced it as created, and announced it deleted at the next pass over the mount; a `write` there was held under the name given while disk put it in `src/`. Now each segment of a `path` that reaches an entry under another spelling takes the entry's own name, from the mount's root down, and answers name files as disk lists them: `read work/SRC/a.ts` answers with `path: "work/src/a.ts"`. A segment disk doesn't have keeps the spelling given, unless a workspace entry spells it, and nothing past a symlink, or past a `..` that climbs above the mount's root, is respelled. `readBinary`, `readBinaryFromDisk`, `readFileFromDisk` and `writeBinary` take their paths the same way; `resolveAbsolutePath` takes its path as given, and the path it returns reaches the same file. A nested mount's directory on disk is now known in its configured spelling and in disk's: `read`, `read_image`, `write`, `edit` and `delete`, and the public readers and writer, refuse a path into it spelled in another case or normalization form as that mount's, and an outer mount no longer takes in the files of a nested mount whose directory was configured in another spelling than disk's. On a disk that tells spellings apart, every answer is as before.
+
 ## 0.22.3 — 2026-10-18
 
 ### Added

@@ -13,7 +13,14 @@ import { test, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
 
 import { McplServerConnection, McplRequestError } from '../src/mcpl/server-connection.js';
+import { McplRequestError as FromMcplIndex } from '../src/mcpl/index.js';
+import { McplRequestError as FromPackageRoot } from '../src/index.js';
 import type { McplHostCapabilities, McplServerConfig } from '../src/mcpl/types.js';
+
+test('McplRequestError is exported from the mcpl index and the package root', () => {
+  assert.equal(FromMcplIndex, McplRequestError);
+  assert.equal(FromPackageRoot, McplRequestError);
+});
 
 // Stdio server: answers initialize; tools/call 'fail' gets a JSON-RPC error
 // with data, 'stuck' gets nothing, 'exit' kills the process mid-request.
@@ -73,7 +80,9 @@ test('a request nobody answers is no-response', async () => {
 
 test('a connection lost while awaiting is no-response', async () => {
   connection = await McplServerConnection.connect(config({ requestTimeoutMs: 10_000 }), HOST_CAPS);
-  await rejectsWith(connection.sendToolsCall('exit', {}), 'no-response');
+  const err = await rejectsWith(connection.sendToolsCall('exit', {}), 'no-response');
+  // The loss itself rejects it, not the request's own deadline.
+  assert.match(err.message, /^The connection to the "outcome" server closed before it answered/);
 });
 
 test('closing the connection while a request awaits its answer rejects it as no-response', async () => {

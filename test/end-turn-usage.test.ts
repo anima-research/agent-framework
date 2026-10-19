@@ -7,6 +7,7 @@ import { MembraneError } from '@animalabs/membrane';
 import type { DetailedUsage, NormalizedRequest, NormalizedResponse, StreamEvent, YieldingStream } from '@animalabs/membrane';
 import { AgentFramework } from '../src/index.js';
 import { HealthModule } from '../src/modules/health/index.js';
+import { EPHEMERAL_USAGE_NAME } from '../src/usage/usage-tracker.js';
 import type { EventResponse, Module, ProcessEvent, ToolCall, TraceEvent } from '../src/index.js';
 import { createMockResponse, MockMembrane, MockYieldingStream } from './helpers/mock-membrane.js';
 import { bindAsConversationFork } from './helpers/dendrite.js';
@@ -152,8 +153,9 @@ describe('tool-ended turn usage accounting', () => {
         const snapshot = f.framework.getSessionUsage();
         assert.equal(snapshot.inferenceCount, 1);
         assert.deepEqual(snapshot.totals, expectedTotals(totalUsage));
+        // An ephemeral run counts in the one shared entry; the traces name it.
         assert.deepEqual(snapshot.byAgent, [{
-          agentName: 'worker', usage: expectedTotals(totalUsage), inferenceCount: 1,
+          agentName: EPHEMERAL_USAGE_NAME, usage: expectedTotals(totalUsage), inferenceCount: 1, ephemeral: true,
         }]);
       } finally {
         await f.framework.stop();
@@ -210,7 +212,7 @@ describe('tool-ended turn usage accounting', () => {
     }
   });
 
-  it('attributes successive streams separately and persists their totals through store reopen', async () => {
+  it('attributes successive streams separately in the traces and the log, and persists their totals through store reopen', async () => {
     const f = await fixture();
     let stopped = false;
     try {
@@ -220,10 +222,18 @@ describe('tool-ended turn usage accounting', () => {
       await run(f.framework, 'bob');
       const snapshot = f.framework.getSessionUsage();
       assert.equal(snapshot.inferenceCount, 2);
-      assert.deepEqual(snapshot.byAgent, [
-        { agentName: 'alice', usage: expectedTotals(firstUsage), inferenceCount: 1 },
-        { agentName: 'bob', usage: expectedTotals(totalUsage), inferenceCount: 1 },
-      ]);
+      // Both ephemeral runs count in the one shared entry; the traces and the
+      // inference log attribute each stream to its own agent.
+      const shared = snapshot.byAgent.map(({ usage: { estimatedCost, ...tokens }, ...entry }) => ({ ...entry, tokens, currency: estimatedCost?.currency }));
+      assert.deepEqual(shared, [{
+        agentName: EPHEMERAL_USAGE_NAME,
+        tokens: { inputTokens: 350, outputTokens: 75, cacheCreationTokens: 75, cacheReadTokens: 130 },
+        currency: 'USD',
+        inferenceCount: 2,
+        ephemeral: true,
+      }]);
+      // The two streams' costs, 0.03 and 0.08.
+      assert.ok(Math.abs(snapshot.byAgent[0].usage.estimatedCost!.total - 0.11) < 1e-10);
       assert.deepEqual(f.traces.filter((e) => e.type === 'usage:updated').map((e) => e.agentName), ['alice', 'bob']);
       const logs = f.framework.queryInferenceLogs();
       assert.equal(logs.total, 2);

@@ -191,9 +191,10 @@ export interface FrameworkConfig {
   storePath?: string;
 
   /**
-   * Branch-independent Discord awareness-marker outbox. Defaults to
+   * Branch-independent Discord awareness ledger. Defaults to
    * `<storePath>/recovery/discord-awareness-outbox.json`. Set explicitly when
-   * providing an app-owned `store` without `storePath`; omit to disable.
+   * providing an app-owned `store` without `storePath`; with neither, the
+   * framework has no ledger and refuses a marks choice.
    */
   discordAwarenessOutboxPath?: string;
 

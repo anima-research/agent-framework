@@ -559,6 +559,8 @@ describe('a link into a nested mount\'s directory, on a mount that follows symli
       const res = await call(m, name, input);
       assert.equal(res.error, leadsInto(String(input.path), 'outer', 'inner', `inner/${String(input.path).slice('outer/alias/'.length)}`), name);
     }
+    const many = await call(m, 'edit_many', { edits: [{ path: 'outer/alias/x.txt', oldString: 'old', newString: 'outer-edited' }] });
+    assert.equal(many.error, `The edit_many call stored none of its edits: 1 problem.\n\nedit 1: ${leadsInto('outer/alias/x.txt', 'outer', 'inner', 'inner/x.txt')}`);
     assert.equal(existsSync(env.at('outer/a/b/y.txt')), false);
     assert.equal(readFileSync(env.at('outer/a/b/x.txt'), 'utf8'), 'inner v2\n');
   });

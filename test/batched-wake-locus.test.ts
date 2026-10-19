@@ -12,6 +12,9 @@
  * registered channel. An ambient-only batch names no channel: under the
  * default `speech.locus: 'delivery'` the turn has no locus and its prose
  * stays private; under `'latest-inbound'` it keeps the legacy fallback.
+ *
+ * The tests hold the gate's batch until both events are in it (holdBatches),
+ * so they don't depend on the second reaching the gate inside the window.
  */
 import { describe, it, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
@@ -97,49 +100,89 @@ function batchedWakeRig(speech?: { locus: 'delivery' | 'latest-inbound' }) {
       .filter((e) => e.event === 'publish')
       .map((e) => e.channelId!);
 
+  /**
+   * Holds the gate's batches: when a batch's timer fires with fewer than two
+   * events in it, the batch stays pending, and the returned function counts
+   * those held fires. A test that pairs two sends calls this, sends its first
+   * event, waits until that event's batch has been held past its 400 ms
+   * window, and then sends the second, which joins the same batch. That batch
+   * fires on the timer the second event starts, with both events in it,
+   * however long the second took to arrive. Without the hold, whether the
+   * two share a batch depends on the second reaching the gate within 400 ms
+   * of the first, which a loaded runner can miss.
+   *
+   * The hold lasts for the rest of the test, since each test builds its own
+   * framework. It reaches three private members, each checked here, so a
+   * rename fails at this helper. A batch that fires without passing through
+   * the hold never counts a held fire, so its test times out waiting for one.
+   */
+  const holdBatches = (): (() => number) => {
+    const gate = (framework as unknown as {
+      eventGate: { debounceTimers: Map<string, { events: unknown[] }>; fireDebounce(policyName: string): void } | null;
+    }).eventGate;
+    assert.ok(gate, 'premise: the framework has a gate');
+    assert.ok(gate.debounceTimers instanceof Map, 'premise: the gate keeps its pending batches in debounceTimers');
+    assert.equal(typeof gate.fireDebounce, 'function', 'premise: the gate fires a batch through fireDebounce');
+    const fire = gate.fireDebounce.bind(gate);
+    let held = 0;
+    gate.fireDebounce = (policyName) => {
+      if ((gate.debounceTimers.get(policyName)?.events.length ?? 0) >= 2) fire(policyName);
+      else held++;
+    };
+    return () => held;
+  };
+
   return {
     membrane: () => membrane,
     framework: () => framework,
-    dm, incoming, sent, publishes,
+    dm, incoming, sent, publishes, holdBatches,
   };
 }
 
 describe('batched wake routing', () => {
   const rig = batchedWakeRig();
-  const { dm, incoming, sent, publishes } = rig;
+  const { dm, incoming, sent, publishes, holdBatches } = rig;
   const membrane = { pushResponse: (r: ReturnType<typeof createMockResponse>) => rig.membrane().pushResponse(r) };
 
-  it('a DM followed one beat later by ambient chatter elsewhere: the reply goes to the DM', async () => {
+  it('a DM followed one beat later by ambient chatter elsewhere, in one batch: the reply goes to the DM', async () => {
+    const held = holdBatches();
     membrane.pushResponse(createMockResponse([{ type: 'text', text: 'answering the DM' }]));
     dm('are you there?');
     await waitFor(() => sent('dm-sent') === 1, 'dm sent');
+    await waitFor(() => held() >= 1, "the DM's batch held past its window");
     incoming(GENERAL, 'ambient', 'unrelated chatter');
     await waitFor(() => publishes().length >= 1, 'reply published');
     assert.deepEqual(publishes(), [DM]);
   });
 
   it('ambient chatter followed by a DM in the same window: the reply goes to the DM', async () => {
+    const held = holdBatches();
     membrane.pushResponse(createMockResponse([{ type: 'text', text: 'answering the DM' }]));
     incoming(GENERAL, 'ambient', 'unrelated chatter');
     await waitFor(() => sent('incoming-sent') === 1, 'ambient sent');
+    await waitFor(() => held() >= 1, "the ambient message's batch held past its window");
     dm('quick question');
     await waitFor(() => publishes().length >= 1, 'reply published');
     assert.deepEqual(publishes(), [DM]);
   });
 
   it('a mention in one channel then ambient chatter in another: the reply goes to the mention', async () => {
+    const held = holdBatches();
     membrane.pushResponse(createMockResponse([{ type: 'text', text: 'answering the mention' }]));
     incoming(ROOM, 'addressed', '@scout hello');
     await waitFor(() => sent('incoming-sent') === 1, 'mention sent');
+    await waitFor(() => held() >= 1, "the mention's batch held past its window");
     incoming(GENERAL, 'ambient', 'unrelated chatter');
     await waitFor(() => publishes().length >= 1, 'reply published');
     assert.deepEqual(publishes(), [ROOM]);
   });
 
   it("an ambient-only batch names no channel: under the default rule the turn has no locus and its prose stays private", async () => {
+    const held = holdBatches();
     membrane.pushResponse(createMockResponse([{ type: 'text', text: 'joining in' }]));
     incoming(ROOM, 'ambient', 'first');
     await waitFor(() => sent('incoming-sent') === 1, 'first sent');
+    await waitFor(() => held() >= 1, "the first message's batch held past its window");
     incoming(GENERAL, 'ambient', 'second');
     await waitFor(() => rig.membrane().calls.length >= 1, 'the batch woke the agent');
     await rig.framework().runUntilIdle();
@@ -155,12 +198,14 @@ describe('batched wake routing', () => {
 
 describe("batched wake routing under speech.locus 'latest-inbound'", () => {
   const rig = batchedWakeRig({ locus: 'latest-inbound' });
-  const { incoming, sent, publishes } = rig;
+  const { incoming, sent, publishes, holdBatches } = rig;
 
   it('an ambient-only batch keeps the legacy fallback (most recent inbound)', async () => {
+    const held = holdBatches();
     rig.membrane().pushResponse(createMockResponse([{ type: 'text', text: 'joining in' }]));
     incoming(ROOM, 'ambient', 'first');
     await waitFor(() => sent('incoming-sent') === 1, 'first sent');
+    await waitFor(() => held() >= 1, "the first message's batch held past its window");
     incoming(GENERAL, 'ambient', 'second');
     await waitFor(() => publishes().length >= 1, 'reply published');
     assert.deepEqual(publishes(), [GENERAL]);

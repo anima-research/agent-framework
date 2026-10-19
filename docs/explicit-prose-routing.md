@@ -26,7 +26,9 @@ A prose segment's FIRST line may carry a routing prefix:
   unprefixed segments of the SAME turn, including those a later stream of it
   writes, such as a framework retry's, a budget restart's or the compile a
   provider-capacity hold defers the turn to. A round kept private (one that
-  calls `skip_reply`, or has a same-round private think) sets no target.
+  calls `skip_reply`, or has a same-round private think) sets no target. A
+  target its server declared inbound-only is refused and clears the turn's
+  target, so later unprefixed segments bounce until a new `>>` target.
   Cross-turn, nothing is implicit.
 - **Continuation modifier:** ` !` immediately after the target
   (`>>#ops !` / `>>skip_reply !`) requests an immediate re-wake after this turn
@@ -81,7 +83,7 @@ depends on the route:
 
 Explicit send tools (`send_message` etc.) are unchanged. Channel lifecycle
 invariants (send-opens-channel, subscribed⇒open) are unchanged — a `>>` send
-into a closed channel opens it, with the usual `[channels]` notice.
+into a channel decided closed opens it, with the usual `[channels]` notice.
 
 ## Teaching the grammar (teach-by-bounce)
 

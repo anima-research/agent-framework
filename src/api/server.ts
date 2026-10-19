@@ -587,14 +587,14 @@ export class ApiServer {
 
     const from = this.currentBranch;
 
-    // The framework switches the store, starts the delivery of its Discord
-    // awareness marks behind the data-plane gate, and re-materializes the
-    // config mount. It refuses during a live turn or once stop() has begun,
-    // and stop() waits for one already running. It moves the store once any
-    // maintenance already running has finished, so the move can come after
-    // this call returns. The event names this switch's own move, from the
-    // branch read here to the one it was asked for: another switch can move
-    // the store again before this one continues.
+    // The framework switches the store and re-materializes the config mount;
+    // a branch switch adds or removes no Discord awareness marks. It refuses
+    // during a live turn or once stop() has begun, and stop() waits for one
+    // already running. It moves the store once any maintenance already
+    // running has finished, so the move can come after this call returns.
+    // The event names this switch's own move, from the branch read here to
+    // the one it was asked for: another switch can move the store again
+    // before this one continues.
     let switched = false;
     try {
       await this.framework.switchBranch(params.name);
@@ -647,8 +647,6 @@ export class ApiServer {
     const result = this.framework.undoLastTurn(params.agentName);
 
     if (result.undone) {
-      // Marks follow behind the data-plane gate; the undo doesn't wait for Discord.
-      this.framework.startDiscordAwarenessDelivery('undo', params.agentName);
       this.broadcast('branch:switched', {
         from: result.fromBranch,
         to: result.toBranch,
@@ -667,8 +665,6 @@ export class ApiServer {
     const result = this.framework.redo(params.agentName);
 
     if (result.redone) {
-      // Marks follow behind the data-plane gate; the redo doesn't wait for Discord.
-      this.framework.startDiscordAwarenessDelivery('redo', params.agentName);
       this.broadcast('branch:switched', {
         from: result.fromBranch,
         to: result.toBranch,

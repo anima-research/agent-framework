@@ -1,7 +1,7 @@
 /**
  * Host quiesce/maintenance mode (issue #122) — deterministic state-machine
- * coverage. No child processes; the MCPL plane/barrier interplay is covered
- * by the awareness-barrier suite.
+ * coverage, plus an end-to-end MCPL leg with a child server and crash cases
+ * whose crash a child process stages (both below).
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
@@ -746,7 +746,8 @@ test('maintenanceTick runs no pass while a surgery holds the store, and says so'
 
 // ---------------------------------------------------------------------------
 // End-to-end MCPL leg: data plane held while quiesced, resume deliverable
-// over host/command (control plane), funnel reopens and flushes the backlog.
+// over host/command (control plane), and the resume reopens the data plane
+// and flushes the backlog.
 // ---------------------------------------------------------------------------
 
 const QUIESCE_STDIO_SERVER = `

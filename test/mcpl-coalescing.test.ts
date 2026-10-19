@@ -4,7 +4,7 @@
  *
  * Vector numbers refer to RFC-006 §14.
  */
-import { test } from 'node:test';
+import { test, type TestContext } from 'node:test';
 import assert from 'node:assert/strict';
 import { fork } from 'node:child_process';
 import { once } from 'node:events';
@@ -12,10 +12,11 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import type { ContentBlock, NormalizedRequest, StreamEvent, YieldingStream } from '@animalabs/membrane';
 import { MembraneError } from '@animalabs/membrane';
-import type { StreamEvent, YieldingStream } from '@animalabs/membrane';
 import { createMockResponse, MockYieldingStream } from './helpers/mock-membrane.js';
 import { fixture, eventually, settles, crash, ok, TS, REPLY_DEADLINE_MS } from './helpers/coalescing-fixture.js';
+import { PushCoalescer, type CoalescerHost, type CoalescedOccurrence, type CoalescingReceiptRecord } from '../src/mcpl/push-coalescer.js';
 
 // ---------------------------------------------------------------------------
 // Plain coalescing, feature-set scope (vectors 1–6, 35)
@@ -1010,7 +1011,7 @@ test('an assembly for an agent outside the audience of a batch another assembly 
 // another agent's queue (a turn with nothing to read never reaches the model)
 // ---------------------------------------------------------------------------
 
-type Wake = { agentName: string; reason?: string; source?: string; timestamp?: number; coalescingSubject?: string; coalescingBatch?: boolean; coalescingBatchSubjects?: string[] };
+type Wake = { agentName: string; reason?: string; source?: string; timestamp?: number; coalescingSubject?: string; coalescingBatch?: boolean; coalescingBatchSubjects?: string[]; readsDeferredWrite?: string };
 
 type TurnInternals = {
   startAgentStream: (...a: unknown[]) => Promise<unknown>;
@@ -1232,7 +1233,7 @@ test("a render placed in a live turn's deferred queue isn't read by the resident
   assert(f.lastRequest().includes('document_diff'), "the primary's turn read the render once its queue was flushed");
 });
 
-test("a render placed in a live turn's deferred queue leaves the wakes of a newer batch of its subject as they are", async (t) => {
+test("a render placed in a live turn's deferred queue takes a newer batch of its subject, and its wakes, to its agent", async (t) => {
   const f = await fixture({ agents: TWO_RESIDENTS }); t.after(f.close);
   f.alwaysRespond();
   let release!: (value: unknown) => void;
@@ -1248,7 +1249,8 @@ test("a render placed in a live turn's deferred queue leaves the wakes of a newe
   const internals = f.framework as unknown as TurnInternals;
   // As above, the primary's turn is alive and 'other''s assembly renders the
   // batch, here held. A notice during the render opens a newer batch of the
-  // subject, which wakes its audience.
+  // subject, which wakes its audience. Once the render lands in the
+  // primary's queue, the newer batch follows the primary, wakes included.
   internals.activeTurnTokens.set('agent', -1);
   try {
     const pass = internals.processInferenceRequests();
@@ -1258,8 +1260,8 @@ test("a render placed in a live turn's deferred queue leaves the wakes of a newe
     assert.deepEqual(woken, ['agent', 'other']);
     release({ content: [{ type: 'text', text: 'first_render' }] });
     await settles(pass, 'the scheduler pass');
-    assert.deepEqual(internals.pendingRequests.map((r) => r.agentName).sort(), [...woken, 'agent'].sort(),
-      "the newer batch's wakes are as they were, beside the primary's wake for the render");
+    assert.deepEqual(internals.pendingRequests.map((r) => r.agentName), ['agent', 'agent'],
+      "the newer batch's wake is the primary's now, beside the primary's wake for the render");
   } finally {
     endStandInTurn(internals);
   }
@@ -1301,7 +1303,33 @@ test("a render placed in a live turn's deferred queue wakes its agent though a n
   assert(f.lastRequest().includes('first_render'), "the primary's turn read the render");
 });
 
-test("a render placed in a live turn's deferred queue keeps its agent's wake when another agent's assembly freezes a newer batch of its subject that gives nothing", async (t) => {
+test("a notice after a render landed unread in a live turn's deferred queue leaves it there, and the turn reads it before the newer render (#548)", async (t) => {
+  const f = await fixture({ agents: TWO_RESIDENTS }); t.after(f.close);
+  f.alwaysRespond();
+  let renders = 0;
+  f.renderer(() => Promise.resolve({ content: [{ type: 'text', text: ++renders > 1 ? 'second_render' : 'first_render' }] }));
+  await f.send('push/event', f.params('1', 'first_fallback', { deferred: true, initial: true }));
+  const internals = f.framework as unknown as TurnInternals;
+  // The primary's turn is alive, so 'other''s assembly places the render in
+  // the primary's deferred queue, unread. A notice then arrives. The render
+  // is a delta the next one builds on (RFC-006 §5.2), so it stays, and the
+  // notice's batch follows the primary.
+  internals.activeTurnTokens.set('agent', -1);
+  try {
+    await settles(internals.processInferenceRequests(), 'the scheduler pass');
+    assert.equal(renders, 1, "'other''s assembly rendered the first batch");
+    await f.send('push/event', f.params('2', 'second_fallback', { deferred: true }));
+    assert.deepEqual(internals.pendingRequests.map((r) => r.agentName), ['agent', 'agent'], "the render's wake and the newer batch's, both the primary's");
+  } finally {
+    endStandInTurn(internals);
+  }
+  await settles(f.framework.runUntilIdle(), 'the drain');
+  assert.equal(f.membrane.calls.length, 1);
+  const request = f.lastRequest();
+  assert(request.includes('first_render') && request.indexOf('first_render') < request.indexOf('second_render'), 'one call read the first render, then the second');
+});
+
+test("a render placed in a live turn's deferred queue takes a newer batch of its subject to its agent, so another agent's assembly leaves that batch and the render's wake alone", async (t) => {
   const f = await fixture({ agents: TWO_RESIDENTS }); t.after(f.close);
   f.alwaysRespond();
   const withdrawn = withdrawals(f);
@@ -1318,9 +1346,11 @@ test("a render placed in a live turn's deferred queue keeps its agent's wake whe
   const internals = f.framework as unknown as TurnInternals;
   // As above: the primary's turn is alive, 'other''s assembly renders the
   // batch into the primary's queue, and a notice during the render opens a
-  // newer batch, which wakes both. In the next pass the primary is still
-  // busy, and 'other''s assembly freezes the newer batch, whose render is
-  // empty: the freeze withdraws the subject's wakes, and nothing is placed.
+  // newer batch, which wakes both. Once the render lands, the newer batch
+  // follows the primary, whose queue holds the render it builds on (RFC-006
+  // §5.2), wakes included. In the next pass the primary is still busy, and
+  // 'other' has no wake left for the batch: the batch waits, with its wake,
+  // for the primary.
   internals.activeTurnTokens.set('agent', -1);
   try {
     const pass = internals.processInferenceRequests();
@@ -1329,14 +1359,524 @@ test("a render placed in a live turn's deferred queue keeps its agent's wake whe
     release({ content: [{ type: 'text', text: 'first_render' }] });
     await settles(pass, 'the first pass');
     await settles(internals.processInferenceRequests(), 'the second pass');
-    assert.deepEqual(withdrawn, ['other', 'other']);
-    assert.deepEqual(internals.pendingRequests.map((r) => r.agentName), ['agent'], "the primary's wake for the render outlived the newer batch's freeze");
+    assert.deepEqual(withdrawn, ['other'], "only 'other''s turn that rendered the first batch, which gave it nothing");
+    assert.equal(renders, 1, "'other''s assembly didn't render the newer batch");
+    assert.deepEqual(internals.pendingRequests.map((r) => r.agentName), ['agent', 'agent'], "the primary's wakes for the render and for the newer batch both wait for its turn");
   } finally {
     endStandInTurn(internals);
   }
   await settles(f.framework.runUntilIdle(), "the primary's turn");
+  assert.equal(renders, 2, "the primary's assembly rendered the newer batch, which gave nothing");
   assert.equal(f.membrane.calls.length, 1);
   assert(f.lastRequest().includes('first_render'), "the primary's turn read the render");
+});
+
+test("a render whose write failed at its agent's turn start is read before the next render of its subject, in that turn's request", async (t) => {
+  const f = await fixture({ agents: TWO_RESIDENTS }); t.after(f.close);
+  f.alwaysRespond();
+  let renders = 0;
+  f.renderer(() => Promise.resolve({ content: [{ type: 'text', text: ++renders > 1 ? 'second_render' : 'first_render' }] }));
+  await f.send('push/event', f.params('1', 'first_fallback', { deferred: true, initial: true }));
+  const internals = f.framework as unknown as TurnInternals;
+  // As in the test above: 'other''s assembly places the render in the
+  // primary's deferred queue while the primary's turn is alive, and a notice
+  // opens a newer batch, which follows the primary. That turn ends without
+  // a flush, so the render is still queued when the primary's next turn
+  // starts, and that start's flush fails to store it, once.
+  internals.activeTurnTokens.set('agent', -1);
+  try {
+    await settles(internals.processInferenceRequests(), 'the scheduler pass');
+    assert.equal(renders, 1, "'other''s assembly rendered the first batch");
+    await f.send('push/event', f.params('2', 'second_fallback', { deferred: true }));
+  } finally {
+    internals.activeTurnTokens.delete('agent');
+  }
+  const cm = f.framework.getAgent('agent')!.getContextManager();
+  const add = cm.addMessage.bind(cm);
+  let failed = false;
+  (cm as unknown as { addMessage: typeof add }).addMessage = (...args) => {
+    if (!failed && JSON.stringify(args[1]).includes('first_render')) {
+      failed = true;
+      throw new Error('transient');
+    }
+    return add(...args);
+  };
+  const errors: string[] = [];
+  const error = console.error;
+  console.error = (...args: unknown[]) => { errors.push(args.map(String).join(' ')); };
+  try {
+    await settles(f.framework.runUntilIdle(), "the primary's turn");
+  } finally {
+    console.error = error;
+  }
+  assert.ok(errors.some((e) => e.includes('turn-start flush for agent') && e.includes('transient')), "the start's flush couldn't store the first render");
+  assert.equal(renders, 2);
+  assert.equal(f.membrane.calls.length, 1);
+  const request = f.lastRequest();
+  assert(request.includes('first_render') && request.indexOf('first_render') < request.indexOf('second_render'), 'one call read the first render, then the second');
+});
+
+test("a render an assembly joins reaches the joining agent's request when it lands in that agent's queue (vector 25)", async (t) => {
+  const f = await fixture({ agents: TWO_RESIDENTS }); t.after(f.close);
+  f.alwaysRespond();
+  let release!: (value: unknown) => void;
+  let began!: () => void;
+  const started = new Promise<void>((resolve) => { began = resolve; });
+  let joined!: () => void;
+  const notesStarted = new Promise<void>((resolve) => { joined = resolve; });
+  f.renderer((params) => {
+    if (JSON.stringify(params).includes('notes')) {
+      joined();
+      return Promise.resolve({ content: [{ type: 'text', text: 'notes_render' }] });
+    }
+    began();
+    return new Promise((resolve) => { release = resolve; });
+  });
+  await f.send('push/event', f.params('1', 'first_fallback', { deferred: true, initial: true }));
+  const internals = f.framework as unknown as TurnInternals;
+  // While the primary's turn is alive, 'other''s assembly freezes the
+  // document's batch and awaits its render.
+  internals.activeTurnTokens.set('agent', -1);
+  const first = internals.processInferenceRequests();
+  await settles(started, "the document's render for 'other'");
+  // A batch of another subject wakes the primary, whose assembly joins the
+  // document's render (it is in that batch's audience) and renders the notes'
+  // batch. Its iteration reaches the document first, so the notes' render
+  // starting means the join is made.
+  await f.send('push/event', f.params('2', 'notes_fallback', { deferred: true, initial: true, key: 'notes' }));
+  internals.activeTurnTokens.delete('agent');
+  const second = internals.processInferenceRequests();
+  await settles(notesStarted, "the notes' render for the primary");
+  // The document's render lands in the primary's window, written for
+  // 'other''s assembly, so the primary's live turn defers it into its queue.
+  const flushed: string[] = [];
+  f.framework.onTrace((e) => {
+    const event = e as { type: string; source?: string; messageId?: string };
+    if (event.type === 'message:added' && event.source === 'deferred-flush:assembly' && event.messageId) flushed.push(event.messageId);
+  });
+  release({ content: [{ type: 'text', text: 'first_render' }] });
+  await settles(Promise.all([first, second]), 'both passes');
+  await settles(f.framework.runUntilIdle(), 'the drain');
+  const primaryCalls = f.membrane.calls.filter((c) => JSON.stringify((c as { messages?: unknown }).messages).includes('notes_render'));
+  assert.equal(primaryCalls.length, 1, "one primary turn: the render's wake to read it was retired once its request read it");
+  assert(JSON.stringify((primaryCalls[0] as { messages?: unknown }).messages).includes('first_render'), "the primary's request read the render its assembly joined");
+  const store = f.framework.getAgent('agent')!.getContextManager().getAllMessages();
+  assert.ok(store.some((m) => flushed.includes(m.id) && JSON.stringify(m.content).includes('first_render')), "the render was deferred into the primary's queue and written by its assembly's flush");
+  // Stored before the turn's checkpoint, it is the turn's input: undoing the
+  // turn keeps it.
+  f.framework.undoLastTurn('agent');
+  assert(f.context().includes('first_render'), 'the undo of the turn that read it keeps it');
+});
+
+test("a render deferred behind a write the store keeps refusing stays tracked, and a retraction removes both", async (t) => {
+  const f = await fixture({ agents: TWO_RESIDENTS }); t.after(f.close);
+  f.alwaysRespond();
+  let renders = 0;
+  f.renderer(() => Promise.resolve({ content: [{ type: 'text', text: ++renders > 1 ? 'second_render' : 'first_render' }] }));
+  await f.send('push/event', f.params('1', 'first_fallback', { deferred: true, initial: true }));
+  const internals = f.framework as unknown as TurnInternals & { deferredMessages: Array<{ content: unknown }> };
+  // As above, the first render waits in the primary's queue when its next
+  // turn starts, and the newer batch follows the primary. Here the store
+  // refuses the first render every time.
+  internals.activeTurnTokens.set('agent', -1);
+  try {
+    await settles(internals.processInferenceRequests(), 'the scheduler pass');
+    await f.send('push/event', f.params('2', 'second_fallback', { deferred: true }));
+  } finally {
+    internals.activeTurnTokens.delete('agent');
+  }
+  const cm = f.framework.getAgent('agent')!.getContextManager();
+  const add = cm.addMessage.bind(cm);
+  (cm as unknown as { addMessage: typeof add }).addMessage = (...args) => {
+    if (JSON.stringify(args[1]).includes('first_render')) throw new Error('disk full');
+    return add(...args);
+  };
+  const error = console.error;
+  console.error = () => {};
+  try {
+    await settles(f.framework.runUntilIdle(), "the primary's turns");
+  } finally {
+    console.error = error;
+  }
+  assert.equal(renders, 2, "the primary's assembly rendered the newer batch");
+  const queued = () => internals.deferredMessages.map((m) => JSON.stringify(m.content));
+  assert.ok(queued().some((c) => c.includes('second_render')), 'the newer render waits behind the refused one');
+  assert.ok(f.membrane.calls.every((c) => !JSON.stringify((c as { messages?: unknown }).messages).includes('second_render')), 'no request read it without the render it builds on');
+  const r = await f.send('push/event', f.params('3', '', { retract: true }));
+  assert.equal(r.result.coalesce.outcome, 'retracted', 'both renders were unread, and both are withdrawn');
+  assert.ok(!queued().some((c) => c.includes('first_render') || c.includes('second_render')), 'neither is queued any more');
+});
+
+test("a wake to read a render that was retracted unread starts no turn", async (t) => {
+  const f = await fixture({ agents: TWO_RESIDENTS }); t.after(f.close);
+  f.alwaysRespond();
+  f.renderer(() => Promise.resolve({ content: [{ type: 'text', text: 'first_render' }] }));
+  await f.send('push/event', f.params('1', 'first_fallback', { deferred: true, initial: true }));
+  const internals = f.framework as unknown as TurnInternals;
+  // While the primary's turn is alive, 'other''s assembly places the render
+  // in the primary's queue, with a wake for the primary to read it. The
+  // server retracts it before the primary is free.
+  internals.activeTurnTokens.set('agent', -1);
+  try {
+    await settles(internals.processInferenceRequests(), 'the scheduler pass');
+    assert.ok(internals.pendingRequests.some((r) => r.agentName === 'agent'), "the primary's wake to read the render");
+    const r = await f.send('push/event', f.params('2', '', { retract: true }));
+    assert.equal(r.result.coalesce.outcome, 'retracted');
+  } finally {
+    endStandInTurn(internals);
+  }
+  await settles(f.framework.runUntilIdle(), 'the drain');
+  assert.equal(f.membrane.calls.length, 0, 'nothing is left to read, so no turn runs');
+});
+
+test("a wake to read a render neither carries its mark into a merge with other causes nor absorbs another wake while parked", async (t) => {
+  const f = await fixture(); t.after(f.close);
+  const internals = f.framework as unknown as TurnInternals & {
+    quiesced: boolean;
+    deferredMessages: Array<{ id: string; seq: number; participant: string; content: unknown[]; heldAt: number }>;
+  };
+  // The renders they read wait, unread, in the agent's queue.
+  internals.deferredMessages.push(
+    { id: 'render-1', seq: 1, participant: 'editor', content: [{ type: 'text', text: 'queued_render' }], heldAt: Date.now() },
+    { id: 'render-2', seq: 2, participant: 'editor', content: [{ type: 'text', text: 'other_render' }], heldAt: Date.now() });
+  const wake = (extra: Partial<Wake> = {}): Wake => ({ agentName: 'agent', reason: 'mcpl:push-event', source: 'editor', timestamp: Date.now(), ...extra });
+  // Parked while quiesced, wakes are kept newest by key; a wake to read the
+  // render keys apart from a plain push wake, so neither absorbs the other.
+  internals.quiesced = true;
+  try {
+    internals.pendingRequests.push(wake({ readsDeferredWrite: 'render-1' }), wake(), wake({ readsDeferredWrite: 'render-2' }));
+    await settles(internals.processInferenceRequests(), 'the parked pass');
+    assert.deepEqual(internals.pendingRequests.map((r) => r.readsDeferredWrite), ['render-1', undefined, 'render-2'], 'each wake stays parked, those reading different renders included');
+  } finally {
+    internals.quiesced = false;
+  }
+  // Merged into one turn, the trigger keeps the mark only when every wake
+  // has it. The wake to read the render comes first, so it is the trigger.
+  const triggers: Array<{ readsDeferredWrite?: string }> = [];
+  const start = internals.startAgentStream;
+  internals.startAgentStream = async (_agent: unknown, trigger: unknown) => { triggers.push(trigger as { readsDeferredWrite?: string }); return undefined; };
+  try {
+    await settles(internals.processInferenceRequests(), 'the merged pass');
+    internals.pendingRequests.push(wake({ readsDeferredWrite: 'render-1' }), wake({ readsDeferredWrite: 'render-2' }));
+    await settles(internals.processInferenceRequests(), 'the pass of two renders');
+    internals.pendingRequests.push(wake({ readsDeferredWrite: 'render-1' }));
+    await settles(internals.processInferenceRequests(), 'the lone pass');
+  } finally {
+    internals.startAgentStream = start;
+    internals.deferredMessages.splice(0);
+  }
+  assert.deepEqual(triggers.map((r) => r.readsDeferredWrite), [undefined, undefined, 'render-1'], 'merged with a plain wake, or one reading another render, it drops the mark; alone it keeps it');
+});
+
+test("a wake to read a render starts its turn until the render's row is at or below the agent's watermark on the current branch", async (t) => {
+  const f = await fixture({ server: { shouldTriggerInference: () => true } }); t.after(f.close);
+  const internals = f.framework as unknown as TurnInternals & {
+    deferredMessages: Array<{ id: string; seq: number; participant: string; content: unknown[]; heldAt: number }>;
+  };
+  const agent = f.framework.getAgent('agent')! as unknown as {
+    getContextManager(): { getAllMessages(): Array<{ sequence: number; metadata?: { deferredWriteId?: string } }>; currentBranch(): { name: string } };
+    getConsumedWatermark(): { branch: string; sequence: number } | null;
+    consumedWatermark: { branch: string; sequence: number } | null;
+  };
+  // A render placed in the agent's queue lands in its store, as a flush
+  // stores it, while its wake to read it waits.
+  const land = (id: string): { sequence: number } => {
+    internals.deferredMessages.push({ id, seq: 1, participant: 'editor', content: [{ type: 'text', text: `${id}_text` }], heldAt: Date.now() });
+    internals.readdDrained(internals.drainDeferredFor('agent'), `${id} lands`);
+    internals.ackDeferredWrites();
+    const row = agent.getContextManager().getAllMessages().find((m) => m.metadata?.deferredWriteId === id);
+    assert(row, `${id} landed on the current branch`);
+    return row;
+  };
+  // The pass starts whatever turns are left.
+  const pass = async (id: string): Promise<number> => {
+    internals.pendingRequests.push({ agentName: 'agent', reason: 'mcpl:push-event', source: 'editor', timestamp: Date.now(), readsDeferredWrite: id });
+    let started = 0;
+    const start = internals.startAgentStream;
+    internals.startAgentStream = async () => { started++; return undefined; };
+    try {
+      await settles(internals.processInferenceRequests(), `the pass after ${id}`);
+    } finally {
+      internals.startAgentStream = start;
+    }
+    return started;
+  };
+  // Above the watermark the agent's creation set: unread.
+  land('render_0');
+  assert.equal(await pass('render_0'), 1, 'above the watermark on its branch, the wake starts the turn');
+  // At the watermark itself: read, as a compile whose newest row it was.
+  const atMark = land('render_at');
+  agent.consumedWatermark = { branch: agent.getContextManager().currentBranch().name, sequence: atMark.sequence };
+  assert.equal(await pass('render_at'), 0, 'at the watermark on its branch, the wake starts no turn');
+  // Below it: read, by a compile that read what followed it too.
+  land('render_below');
+  const after = land('render_after');
+  agent.consumedWatermark = { branch: agent.getContextManager().currentBranch().name, sequence: after.sequence };
+  assert.equal(await pass('render_below'), 0, 'below the watermark on its branch, the wake starts no turn');
+  // Drained from the queue but not yet stored: still queued.
+  const pendingWrite = { id: 'render_drained', seq: 1, participant: 'editor', content: [{ type: 'text', text: 'render_drained_text' }], heldAt: Date.now() };
+  (internals as unknown as { unackedDeferredWrites: unknown[] }).unackedDeferredWrites.push(pendingWrite);
+  assert.equal(await pass('render_drained'), 1, 'drained and not yet stored, the wake starts the turn');
+  (internals as unknown as { unackedDeferredWrites: unknown[] }).unackedDeferredWrites.splice(0);
+  // Stored and read, but still un-acked while the chronicle's sync fails:
+  // judged by its row.
+  const unsynced = land('render_unsynced');
+  (internals as unknown as { unackedDeferredWrites: unknown[] }).unackedDeferredWrites.push({ ...pendingWrite, id: 'render_unsynced' });
+  agent.consumedWatermark = { branch: agent.getContextManager().currentBranch().name, sequence: unsynced.sequence };
+  assert.equal(await pass('render_unsynced'), 0, 'stored and read, though not yet synced, the wake starts no turn');
+  (internals as unknown as { unackedDeferredWrites: unknown[] }).unackedDeferredWrites.splice(0);
+  // With no watermark (a store that couldn't be read when it was taken): in doubt.
+  const noMark = land('render_null');
+  agent.consumedWatermark = null;
+  assert.equal(await pass('render_null'), 1, 'with no watermark, the wake starts the turn');
+  agent.consumedWatermark = { branch: agent.getContextManager().currentBranch().name, sequence: noMark.sequence };
+  await f.send('push/event', f.params('a', 'turn_one', { key: 'a', initial: true }));
+  await f.framework.runUntilIdle();
+  // An operator's undo switches the store to a new branch; the agent's
+  // watermark stays on the old one until its next committing compile. The
+  // render lands at or below that watermark's sequence, so only the branch
+  // tells it unread.
+  f.framework.undoLastTurn('agent');
+  const afterUndo = land('render_1');
+  const mark = agent.getConsumedWatermark();
+  assert(mark && mark.branch !== agent.getContextManager().currentBranch().name && afterUndo.sequence <= mark.sequence,
+    `the watermark ${JSON.stringify(mark)} is on another branch, at or past the render's row (${afterUndo.sequence})`);
+  assert.equal(await pass('render_1'), 1, 'with the watermark on another branch, the wake starts the turn');
+});
+
+test("a turn a wake to read a render started, held by a provider hold, is retried once the hold ends, though its compile read the render", async (t) => {
+  const f = await fixture(); t.after(f.close);
+  let calls = 0;
+  (f.membrane as unknown as { streamYielding: unknown }).streamYielding = (request: unknown) => {
+    f.membrane.calls.push(request as never);
+    if (++calls > 1) return new MockYieldingStream([ok()]);
+    return new FailingStream(new MembraneError({
+      type: 'rate_limit', retryable: true, httpStatus: 429,
+      message: "This request would exceed your organization's maximum usage increase rate for input tokens per minute",
+      rawError: { status: 429 }, rawRequest: request,
+    } as ConstructorParameters<typeof MembraneError>[0]));
+  };
+  const internals = f.framework as unknown as TurnInternals & {
+    deferredMessages: Array<{ id: string; seq: number; participant: string; content: unknown[]; heldAt: number }>;
+  };
+  // A render waits in the agent's queue with its wake to read it; the turn
+  // the wake starts stores it at its start and compiles it.
+  internals.deferredMessages.push({ id: 'render-1', seq: 1, participant: 'editor', content: [{ type: 'text', text: 'queued_render' }], heldAt: Date.now() });
+  internals.pendingRequests.push({ agentName: 'agent', reason: 'mcpl:push-event', source: 'editor', timestamp: Date.now(), readsDeferredWrite: 'render-1' });
+  await settles(f.framework.runUntilIdle(), 'the turn that meets the limit');
+  assert.equal(f.membrane.calls.length, 1);
+  assert(f.lastRequest().includes('queued_render'), 'its request read the render');
+  const hold = internals.providerAccelerationCooldowns.get('agent');
+  assert.equal(hold?.heldRequests.length, 1, "the turn's trigger is held");
+  assert.equal(hold!.heldRequests[0].readsDeferredWrite, undefined, 'as an ordinary wake, without the mark');
+  hold!.until = Date.now();
+  internals.releaseProviderAccelerationCooldown('agent');
+  await settles(f.framework.runUntilIdle(), 'the retry');
+  assert.equal(f.membrane.calls.length, 2, 'the held turn was retried');
+});
+
+test("a wake to read a render starts its turn when the store can't say whether the agent read it", async (t) => {
+  const f = await fixture(); t.after(f.close);
+  const internals = f.framework as unknown as TurnInternals;
+  const cm = f.framework.getAgent('agent')!.getContextManager() as unknown as { queryMessages: (...a: unknown[]) => unknown };
+  const query = cm.queryMessages;
+  cm.queryMessages = () => { throw new Error('a blob the store names is missing'); };
+  internals.pendingRequests.push({ agentName: 'agent', reason: 'mcpl:push-event', source: 'editor', timestamp: Date.now(), readsDeferredWrite: 'render-1' });
+  const triggers: unknown[] = [];
+  const start = internals.startAgentStream;
+  internals.startAgentStream = async (_agent: unknown, trigger: unknown) => { triggers.push(trigger); return undefined; };
+  const errors: string[] = [];
+  const error = console.error;
+  console.error = (...args: unknown[]) => { errors.push(args.map(String).join(' ')); };
+  try {
+    await settles(internals.processInferenceRequests(), 'the pass');
+  } finally {
+    console.error = error;
+    internals.startAgentStream = start;
+    cm.queryMessages = query;
+  }
+  assert.equal(triggers.length, 1, 'in doubt, the wake starts the turn');
+  assert(errors.some((e) => e.includes('render-1') && e.includes('a blob the store names is missing')), `the failed read is logged: ${JSON.stringify(errors)}`);
+});
+
+test("a wake to read a render that's gone is dropped from a pass whose other wakes still start the turn", async (t) => {
+  const f = await fixture(); t.after(f.close);
+  const internals = f.framework as unknown as TurnInternals;
+  internals.pendingRequests.push(
+    { agentName: 'agent', reason: 'mcpl:push-event', source: 'editor', timestamp: Date.now(), readsDeferredWrite: 'render-gone' },
+    { agentName: 'agent', reason: 'heartbeat', source: 'framework', timestamp: Date.now() });
+  const triggers: Wake[] = [];
+  const start = internals.startAgentStream;
+  internals.startAgentStream = async (_agent: unknown, trigger: unknown) => { triggers.push(trigger as Wake); return undefined; };
+  const errors: string[] = [];
+  const error = console.error;
+  console.error = (...args: unknown[]) => { errors.push(args.map(String).join(' ')); };
+  try {
+    await settles(internals.processInferenceRequests(), 'the pass');
+  } finally {
+    console.error = error;
+    internals.startAgentStream = start;
+  }
+  assert.deepEqual(triggers.map((r) => [r.reason, r.readsDeferredWrite]), [['heartbeat', undefined]], 'the turn starts for the heartbeat alone');
+  assert(errors.some((e) => e.includes('1 wake(s) to read a render') && e.includes('dropped')), `the drop is logged: ${JSON.stringify(errors)}`);
+});
+
+test("a provider recovery whose released wakes start no turn ends and reopens auxiliary admission: a gone render's wake under any policy, and a wake the policy drops", async (t) => {
+  const f = await fixture(); t.after(f.close);
+  const internals = f.framework as unknown as TurnInternals & {
+    inferencePolicy: { shouldInfer(...a: unknown[]): boolean };
+    providerAccelerationRecoveries: Map<string, unknown>;
+  };
+  const gate = internals.providerGate('agent') as unknown as { primaryPending: boolean; auxiliaryWaiters: Array<() => void> };
+  // A hold's release leaves a primary turn pending, which holds auxiliary
+  // calls back until it runs; the pass then finds nothing to start.
+  const releaseThenPass = async (shouldInfer: boolean, wake: Wake): Promise<boolean> => {
+    internals.inferencePolicy = { shouldInfer: () => shouldInfer };
+    gate.primaryPending = true;
+    internals.providerAccelerationRecoveries.set('agent', { startedAt: Date.now(), failures: 1, heldRequests: 1, reason: 'held', releasedAt: Date.now() });
+    let admitted = false;
+    gate.auxiliaryWaiters.push(() => { admitted = true; });
+    internals.pendingRequests.push(wake);
+    const error = console.error;
+    console.error = () => {};
+    try {
+      await settles(internals.processInferenceRequests(), 'the pass');
+      await settles(f.framework.runUntilIdle(), 'the drain');
+    } finally {
+      console.error = error;
+    }
+    assert.equal(gate.primaryPending, false, 'the pending primary turn is given up');
+    assert.equal(internals.providerAccelerationRecoveries.has('agent'), false, 'and the recovery ends');
+    return admitted;
+  };
+  // Under a policy that would start a turn for anything, even no cause.
+  assert.equal(await releaseThenPass(true, { agentName: 'agent', reason: 'mcpl:push-event', source: 'editor', timestamp: Date.now(), readsDeferredWrite: 'render-gone' }),
+    true, "a gone render's wake: the parked auxiliary call is admitted");
+  assert.equal(await releaseThenPass(false, { agentName: 'agent', reason: 'heartbeat', source: 'framework', timestamp: Date.now() }),
+    true, 'a wake the policy drops: the parked auxiliary call is admitted');
+  assert.equal(f.membrane.calls.length, 0, 'no turn runs');
+  // A gone render's wake dropped beside a wake that starts the turn leaves
+  // the recovery to that turn.
+  internals.inferencePolicy = { shouldInfer: () => true };
+  gate.primaryPending = true;
+  internals.providerAccelerationRecoveries.set('agent', { startedAt: Date.now(), failures: 1, heldRequests: 2, reason: 'held', releasedAt: Date.now() });
+  internals.pendingRequests.push(
+    { agentName: 'agent', reason: 'mcpl:push-event', source: 'editor', timestamp: Date.now(), readsDeferredWrite: 'render-gone' },
+    { agentName: 'agent', reason: 'heartbeat', source: 'framework', timestamp: Date.now() });
+  let started = 0;
+  const start = internals.startAgentStream;
+  internals.startAgentStream = async () => { started++; return undefined; };
+  const error = console.error;
+  console.error = () => {};
+  try {
+    await settles(internals.processInferenceRequests(), 'the pass with a turn to start');
+  } finally {
+    console.error = error;
+    internals.startAgentStream = start;
+  }
+  assert.equal(started, 1, "the heartbeat's turn starts");
+  assert.equal(internals.providerAccelerationRecoveries.has('agent'), true, 'and the recovery stays for that turn to end');
+});
+
+test("a provider hold keeps a wake to read a render, a batch wake, a batch-only merge and an ordinary wake apart, though they share a millisecond", async (t) => {
+  const f = await fixture(); t.after(f.close);
+  const internals = f.framework as unknown as TurnInternals;
+  const timer = setTimeout(() => {}, 60_000);
+  t.after(() => clearTimeout(timer));
+  internals.providerAccelerationCooldowns.set('agent', { startedAt: Date.now(), until: Date.now() + 60_000, timer, heldRequests: [], reason: 'held', failures: 1 });
+  const at = Date.now();
+  const wake = (extra: Partial<Wake> = {}): Wake => ({ agentName: 'agent', reason: 'mcpl:push-event', source: 'editor', timestamp: at, ...extra });
+  // A trigger merged from batches of two subjects carries no single
+  // subject: only its subjects tell it from an ordinary wake, or from a
+  // merge of other batches.
+  const merged = wake({ coalescingBatch: true, coalescingBatchSubjects: ['doc', 'notes'] });
+  internals.pendingRequests.push(merged, wake(), wake({ coalescingSubject: 'doc', coalescingBatch: true }), wake({ readsDeferredWrite: 'render-1' }), wake({ readsDeferredWrite: 'render-2' }),
+    wake({ coalescingBatch: true, coalescingBatchSubjects: ['doc', 'other'] }));
+  await settles(internals.processInferenceRequests(), 'the held pass');
+  const held = internals.providerAccelerationCooldowns.get('agent')?.heldRequests ?? [];
+  assert.deepEqual(held.map((r) => [r.coalescingSubject, r.coalescingBatchSubjects?.join(','), r.readsDeferredWrite]),
+    [[undefined, 'doc,notes', undefined], [undefined, undefined, undefined], ['doc', undefined, undefined], [undefined, undefined, 'render-1'], [undefined, undefined, 'render-2'], [undefined, 'doc,other', undefined]],
+    'each is held: none stands for another, which a withdrawal or a read could take with it');
+});
+
+test("an assembly that throws closes the window in which its writes bypass the turn's deferral", async (t) => {
+  const f = await fixture(); t.after(f.close);
+  f.alwaysRespond();
+  await f.send('push/event', f.params('1', 'first_fallback', { deferred: true, initial: true }));
+  const internals = f.framework as unknown as TurnInternals & {
+    assembling: Set<string>;
+    pushCoalescer: { assemble(agent: string, causes?: readonly string[]): Promise<unknown> };
+  };
+  const assemble = internals.pushCoalescer.assemble.bind(internals.pushCoalescer);
+  let during: boolean | undefined;
+  internals.pushCoalescer.assemble = async () => {
+    during = internals.assembling.has('agent');
+    throw new Error('a freeze failed');
+  };
+  const error = console.error;
+  console.error = () => {};
+  try {
+    await settles(f.framework.runUntilIdle(), "the agent's turn");
+  } finally {
+    console.error = error;
+    internals.pushCoalescer.assemble = assemble;
+  }
+  assert.equal(during, true, 'the window was open while the assembly ran');
+  assert.equal(internals.assembling.size, 0, 'and closed when it threw');
+});
+
+test("a write deferred for an agent while its assembly awaits a render lands in that turn's request, unless the host is quiesced by then", async (t) => {
+  for (const quiesce of [false, true]) {
+    const f = await fixture();
+    try {
+      f.alwaysRespond();
+      let release!: (value: unknown) => void;
+      let began!: () => void;
+      const started = new Promise<void>((resolve) => { began = resolve; });
+      f.renderer(() => {
+        began();
+        return new Promise((resolve) => { release = resolve; });
+      });
+      const internals = f.framework as unknown as TurnInternals & {
+        quiesced: boolean;
+        assembling: Set<string>;
+        deferredMessages: unknown[];
+        addMessage(participant: string, content: Array<{ type: 'text'; text: string }>): string;
+      };
+      // A plain push wakes the agent and a notice opens a batch while another
+      // turn of its holds it, so one turn starts for both: it has a cause
+      // besides the batch, and the batch's empty render doesn't withdraw it.
+      internals.activeTurnTokens.set('agent', -1);
+      try {
+        await f.send('push/event', { featureSet: 'doc', eventId: 'p1', timestamp: TS, payload: { content: [{ type: 'text', text: 'plain_before' }] } });
+        await f.send('push/event', f.params('1', 'first_fallback', { deferred: true, initial: true }));
+        await eventually(() => internals.pendingRequests.length > 0, 'the wakes');
+      } finally {
+        internals.activeTurnTokens.delete('agent');
+      }
+      const turn = f.framework.runUntilIdle();
+      await settles(started, 'the render');
+      // A module's write while the assembly awaits the render is deferred:
+      // the agent's turn is alive. The render then gives nothing, so no write
+      // of the assembly's comes after it.
+      assert.equal(internals.addMessage('Antra', [{ type: 'text', text: 'module_write' }]), '', 'deferred');
+      if (quiesce) internals.quiesced = true;
+      release({ content: [] });
+      await settles(turn, "the agent's turn");
+      const first = JSON.stringify((f.membrane.calls[0] as { messages?: unknown } | undefined)?.messages);
+      assert(first.includes('plain_before'), `quiesced ${quiesce}: the turn ran`);
+      assert.equal(internals.assembling.size, 0, `quiesced ${quiesce}: the window closed with the assembly`);
+      assert.equal(first.includes('module_write'), !quiesce, quiesce
+        ? 'a quiesced host keeps it queued for resume()'
+        : "the turn's request read the write that arrived while its assembly awaited the render");
+      if (quiesce) {
+        assert.ok(internals.deferredMessages.length > 0, 'still queued');
+        internals.quiesced = false;
+      }
+    } finally {
+      await f.close();
+    }
+  }
 });
 
 test("a render queued for one resident isn't another resident's to read once its flush has stored it", async (t) => {
@@ -1643,9 +2183,17 @@ test('R16b: a producer retry re-wakes a batch left asleep by a failed freeze', a
 /**
  * R17's harness: a coalescing fixture whose store fails while `failing` is
  * set, its recovery backoff at `baseMs`, and every traced recovery wake with
- * the monotonic time it was traced at.
+ * the timer that fired it: the delay it was armed with (`armedMs`), and when
+ * it was armed among the harness's steps (`armedAt`, beside the wake's own
+ * `tracedAt`). The spacing the coalescer controls is those two: each wake's
+ * timer armed after the wake before it, with the delay it's labelled with.
+ * When a timer fires is the host's: by `performance.now()` Node can fire one
+ * early, and on a CI runner one fired at least 1.3 ms early, so the wakes'
+ * measured spacing isn't checked. Every setTimeout is still a real one; the harness
+ * only counts each arming and notes, while a timer's callback runs, which
+ * arming it was.
  */
-async function storageOutage(t: { after: (fn: () => Promise<void>) => void }, baseMs: number) {
+async function storageOutage(t: TestContext, baseMs: number) {
   const f = await fixture();
   const coalescer = (f.framework as unknown as { pushCoalescer: { options: { recoveryBackoffMs?: number }; pendingBatches(): number; recovery: Map<string, { attempt: number; timer?: unknown }> } }).pushCoalescer;
   coalescer.options.recoveryBackoffMs = baseMs;
@@ -1657,10 +2205,25 @@ async function storageOutage(t: { after: (fn: () => Promise<void>) => void }, ba
   // One hook, in order: storage recovers before the fixture closes, so a
   // failed assertion doesn't add the close's own EIO to its report.
   t.after(async () => { outage.failing = false; await f.close(); });
-  const wakes: Array<{ attempt: number; delayMs: number; at: number }> = [];
+  // The arming of the timer whose callback is running, if one is: its delay,
+  // and its step, from one count of armings and wakes. A recovery wake is
+  // traced from inside its timer's callback (scheduleRecovery), so the trace
+  // can name the timer that fired it.
+  let step = 0;
+  let firing: { ms: number | undefined; at: number } | undefined;
+  const realSetTimeout = globalThis.setTimeout;
+  t.mock.method(globalThis, 'setTimeout', ((callback: (...args: unknown[]) => void, ms?: number, ...args: unknown[]) => {
+    const arming = { ms, at: ++step };
+    return realSetTimeout(function (this: unknown) {
+      const outer = firing;
+      firing = arming;
+      try { callback.apply(this, args); } finally { firing = outer; }
+    }, ms);
+  }) as typeof setTimeout);
+  const wakes: Array<{ attempt: number; delayMs: number; armedMs: number | undefined; armedAt: number | undefined; tracedAt: number }> = [];
   f.framework.onTrace((e) => {
     if (e.type === 'mcpl:coalescing' && (e as { kind?: string }).kind === 'recovery-wake') {
-      wakes.push({ ...(e as unknown as { attempt: number; delayMs: number }), at: performance.now() });
+      wakes.push({ ...(e as unknown as { attempt: number; delayMs: number }), armedMs: firing?.ms, armedAt: firing?.at, tracedAt: ++step });
     }
   });
   f.alwaysRespond();
@@ -1682,28 +2245,31 @@ async function storageOutage(t: { after: (fn: () => Promise<void>) => void }, ba
       assert(wakes.length > before, 'each re-wake is a traced recovery wake');
     }
   };
-  /** Each wake's timer was armed after the wake before it was traced, so their gap is at least its delay. */
-  const assertSpacing = (from = 0) => {
-    for (let i = from + 1; i < wakes.length; i++) {
-      // Less a millisecond: Node may fire a timer up to 1 ms early.
-      assert(wakes[i].at - wakes[i - 1].at >= wakes[i].delayMs - 1,
-        `wake ${i + 1} came ${(wakes[i].at - wakes[i - 1].at).toFixed(1)} ms after the one before, under its ${wakes[i].delayMs} ms delay`);
+  /** Each wake came from a timer armed with the delay its trace names, after
+   *  the wake before it was traced. A trace made outside every timer's
+   *  callback names no timer, and fails this: `firing` is put back as each
+   *  callback ends, so a later trace, such as one from a microtask, doesn't
+   *  take that timer's arming. */
+  const assertArmed = () => {
+    assert.deepEqual(wakes.map((w) => w.armedMs), wakes.map((w) => w.delayMs), 'each wake was fired by a timer armed with its delay');
+    for (let i = 1; i < wakes.length; i++) {
+      assert((wakes[i].armedAt ?? 0) > wakes[i - 1].tracedAt, `wake ${i + 1}'s timer was armed after wake ${i} was traced`);
     }
   };
-  return { f, coalescer, outage, wakes, driveTo, assertSpacing };
+  return { f, coalescer, outage, wakes, driveTo, assertArmed };
 }
 
 test('R17: a persistent storage outage backs off (1×, 2×, 4× …) and the series resets on recovery', { timeout: 120_000 }, async (t) => {
-  const { f, coalescer, outage, wakes, driveTo, assertSpacing } = await storageOutage(t, 40);
+  const { f, coalescer, outage, wakes, driveTo, assertArmed } = await storageOutage(t, 40);
   await f.send('push/event', f.params('1', 'outage_fallback', { deferred: true, initial: true }));
   outage.failing = true;
   await driveTo(3);
   // Every wake is one more consecutive failure, and its delay doubles from the
-  // base, however the attempts fell across drains. The timers are spaced at
-  // least that far apart, not only labelled so.
+  // base, however the attempts fell across drains. The timers are armed with
+  // that delay, not only labelled so.
   assert.deepEqual(wakes.map((w) => w.attempt), wakes.map((_, i) => i + 1), 'consecutive failures count up');
   assert.deepEqual(wakes.map((w) => w.delayMs), wakes.map((_, i) => Math.min(40 * 2 ** i, 40 * 60)), 'and the delay doubles');
-  assertSpacing();
+  assertArmed();
   assert.equal(coalescer.pendingBatches(), 1);
   assert(!f.context().includes('outage_fallback'));
   outage.failing = false; // storage recovers
@@ -1713,12 +2279,13 @@ test('R17: a persistent storage outage backs off (1×, 2×, 4× …) and the ser
   assert.equal(coalescer.recovery.size, 0, 'the failure series is forgotten on success');
 
   // A second outage starts a new series: its first wake is attempt 1 again,
-  // at the base delay.
+  // at the base delay, and armed so.
   const second = wakes.length;
   await f.send('push/event', f.params('2', 'second_outage', { deferred: true }));
   outage.failing = true;
   await driveTo(second + 1);
   assert.deepEqual(wakes.slice(second, second + 1).map(({ attempt, delayMs }) => ({ attempt, delayMs })), [{ attempt: 1, delayMs: 40 }]);
+  assertArmed();
   outage.failing = false;
   await f.framework.runUntilIdle();
   assert(f.lastRequest().includes('second_outage'), 'delivered once storage recovered again');
@@ -1727,12 +2294,12 @@ test('R17: a persistent storage outage backs off (1×, 2×, 4× …) and the ser
 test('R17b: the backoff stops doubling at 60× its base', { timeout: 120_000 }, async (t) => {
   // A small base reaches the cap within a second: attempt 7 is the first
   // whose doubling (64×) passes it.
-  const { f, wakes, outage, driveTo, assertSpacing } = await storageOutage(t, 3);
+  const { f, wakes, outage, driveTo, assertArmed } = await storageOutage(t, 3);
   await f.send('push/event', f.params('1', 'capped_fallback', { deferred: true, initial: true }));
   outage.failing = true;
   await driveTo(8);
   assert.deepEqual(wakes.slice(0, 8).map((w) => w.delayMs), [3, 6, 12, 24, 48, 96, 180, 180]);
-  assertSpacing();
+  assertArmed();
 });
 
 // ---------------------------------------------------------------------------
@@ -1756,4 +2323,1100 @@ for (const reader of ['other', 'agent'] as const) test(`R18 (${reader} read it):
   const del = await f.send('push/event', f.params('3', 'deletion_notice', { retract: true }));
   assert.equal(del.result.coalesce.outcome, 'noted');
   assert(f.context().includes('read_by_one') && f.context().includes('deletion_notice') && !f.context().includes('later_edit'));
+});
+
+// ---------------------------------------------------------------------------
+// #157's markers: an edit the agent sees first is the message it replaced
+// ---------------------------------------------------------------------------
+
+type Fixture = Awaited<ReturnType<typeof fixture>>;
+
+/**
+ * A turn, started by a mention in `chat`, with one round per `during` that
+ * sends explicitly (channel_publish), then a round that speaks. Each sending
+ * round streams only once its `during` has run: the first while the turn is
+ * live, each later one after the previous round's tool boundary. So what a
+ * `during` delivers reaches the agent at its round's tool boundary.
+ */
+async function sendThenSpeak(f: Fixture, ...during: Array<() => Promise<void>>) {
+  const gates = during.map(() => {
+    const gate = {} as { open: () => void; opened: Promise<void>; reached: () => void; atGate: Promise<void> };
+    gate.opened = new Promise<void>((resolve) => { gate.open = resolve; });
+    gate.atGate = new Promise<void>((resolve) => { gate.reached = resolve; });
+    return gate;
+  });
+  let first: MockYieldingStream | undefined;
+  (f.membrane as unknown as { streamYielding: unknown }).streamYielding = (request: unknown) => {
+    f.membrane.calls.push(request as never);
+    if (first) return new MockYieldingStream([ok()]);
+    const stream = new MockYieldingStream([
+      ...during.map((_, i) => createMockResponse([{ type: 'tool_use', id: `p${i}`, name: 'channel_publish', input: { content: `explicit_send_${i}` } }] as ContentBlock[], 'tool_use')),
+      createMockResponse([{ type: 'text', text: 'prose_reply' }] as ContentBlock[]),
+    ]);
+    first = stream;
+    let provided = 0;
+    const provide = stream.provideToolResults.bind(stream);
+    stream.provideToolResults = (results, options) => { provided++; provide(results, options); };
+    const inner = stream[Symbol.asyncIterator].bind(stream);
+    (stream as unknown as Record<symbol, unknown>)[Symbol.asyncIterator] = async function* () {
+      gates[0].reached();
+      await gates[0].opened;
+      const it = inner();
+      let streamed = 0;
+      while (true) {
+        const n = await it.next();
+        if (n.done) return;
+        // A later sending round's first event: hold it until its `during` ran.
+        if (provided > streamed && provided < gates.length) {
+          streamed = provided;
+          gates[streamed].reached();
+          await gates[streamed].opened;
+        }
+        yield n.value;
+      }
+    };
+    return stream;
+  };
+  await f.send('channels/incoming', { messages: [f.channel('c1', 'question', { initial: true }, 'chat', 'm1')] });
+  const run = f.framework.runUntilIdle();
+  for (const [i, deliver] of during.entries()) {
+    await gates[i].atGate;
+    await deliver();
+    gates[i].open();
+  }
+  await run;
+  const posted = f.published.map((p) => JSON.stringify(p.content));
+  return {
+    /** What each tool boundary injected, in order. */
+    injected: first!.receivedToolResultOptions.map((o) => JSON.stringify(o?.injectedMessages ?? [])),
+    sent: during.every((_, i) => posted.some((c) => c.includes(`explicit_send_${i}`))),
+    replied: posted.some((c) => c.includes('prose_reply')),
+  };
+}
+
+const unreadFollowUp = (f: Fixture, initial = true) =>
+  f.send('channels/incoming', { messages: [f.channel('c2', 'follow_up_wiht_typo', initial ? { initial: true } : {}, 'chat', 'm2')] });
+const pushTagged = async (f: Fixture, tags: string[], eventId = 'e2', text = 'follow_up_fixed') =>
+  (await f.send('push/event', { ...f.params(eventId, text, { channelId: 'chat', key: 'message:m2' }), tags })).result.coalesce.outcome as string;
+
+/** A follow-up the agent hasn't been shown, then its edit, in each lane; returns the edit's outcome. */
+const followUpThenEdit: Record<string, (f: Fixture) => Promise<string>> = {
+  'channel-scoped push': async (f) => {
+    await unreadFollowUp(f);
+    return pushTagged(f, ['chat:edited']);
+  },
+  'channel message': async (f) => {
+    await unreadFollowUp(f);
+    return (await f.send('channels/incoming', { messages: [{ ...f.channel('e2', 'follow_up_fixed', {}, 'chat', 'm2'), tags: ['chat:edited'] }] })).result.results[0].coalesce.outcome;
+  },
+  'feature-set push': async (f) => {
+    await f.send('push/event', { ...f.params('c2', 'follow_up_wiht_typo', { key: 'message:m2', initial: true }), tags: ['chat:mention'] });
+    return (await f.send('push/event', { ...f.params('e2', 'follow_up_fixed', { key: 'message:m2' }), tags: ['chat:edited'] })).result.coalesce.outcome;
+  },
+};
+
+for (const [lane, arrive] of Object.entries(followUpThenEdit)) test(`#157 (${lane}): an edit of a follow-up the agent hasn't been shown is its first view, so the reply after an explicit send routes`, async (t) => {
+  const f = await fixture(); t.after(f.close); await f.register();
+  let outcome: string | undefined;
+  const r = await sendThenSpeak(f, async () => { outcome = await arrive(f); });
+  assert.equal(outcome, 'replaced');
+  assert(r.injected[0].includes('follow_up_fixed') && !r.injected[0].includes('follow_up_wiht_typo'), 'the edit alone reached the boundary');
+  assert(r.sent, 'the explicit send posted');
+  assert(r.replied, 'the reply to the follow-up posted');
+});
+
+for (const tag of ['chat:reaction', 'chat:reaction-remove', 'chat:deleted']) test(`#157: a ${tag} occurrence that replaced an unread follow-up is still a notice about it, so the prose after an explicit send stays withheld`, async (t) => {
+  const f = await fixture(); t.after(f.close); await f.register();
+  let outcome: string | undefined;
+  const r = await sendThenSpeak(f, async () => { await unreadFollowUp(f); outcome = await pushTagged(f, [tag], 'e2', `${tag}_notice`); });
+  assert.equal(outcome, 'replaced');
+  assert(r.injected[0].includes(`${tag}_notice`), 'the notice reached the boundary');
+  assert(r.sent, 'the explicit send posted');
+  assert(!r.replied, 'the prose after the send stayed withheld');
+});
+
+test('#157: an edit of an edit, after the agent read the message, stays a marker, so the prose after an explicit send stays withheld', async (t) => {
+  const f = await fixture(); t.after(f.close); await f.register();
+  const outcomes: string[] = [];
+  const r = await sendThenSpeak(f, async () => {
+    for (const [eventId, text] of [['e1', 'question_edited_once'], ['e2', 'question_edited_twice']]) {
+      outcomes.push((await f.send('push/event', { ...f.params(eventId, text, { channelId: 'chat', key: 'message:m1' }), tags: ['chat:edited'] })).result.coalesce.outcome);
+    }
+  });
+  assert.deepEqual(outcomes, ['appended', 'replaced'], 'the agent had read the question, and the second edit replaced the unread first');
+  assert(r.injected[0].includes('question_edited_twice') && !r.injected[0].includes('question_edited_once'), 'the second edit alone reached the boundary');
+  assert(r.sent, 'the explicit send posted');
+  assert(!r.replied, 'the prose after the send stayed withheld');
+});
+
+test('#157: an edit of a follow-up the agent was shown at a tool boundary stays a marker, so the prose after the next explicit send stays withheld', async (t) => {
+  const f = await fixture(); t.after(f.close); await f.register();
+  const r = await sendThenSpeak(f, async () => { await unreadFollowUp(f); }, async () => { await pushTagged(f, ['chat:edited']); });
+  assert(r.injected[0].includes('follow_up_wiht_typo'), 'the first boundary showed the agent the follow-up');
+  assert(r.injected[1].includes('follow_up_fixed'), 'the second boundary showed it the edit');
+  assert(r.sent, 'both explicit sends posted');
+  assert(!r.replied, 'the prose after the second send stayed withheld');
+});
+
+test('#157: an edit of an edit of a follow-up the agent was shown at a tool boundary stays a marker, so the prose after the next explicit send stays withheld', async (t) => {
+  const f = await fixture(); t.after(f.close); await f.register();
+  const r = await sendThenSpeak(f, async () => { await unreadFollowUp(f); }, async () => {
+    await pushTagged(f, ['chat:edited'], 'e2', 'follow_up_fixed');
+    await pushTagged(f, ['chat:edited'], 'e3', 'follow_up_fixed_again');
+  });
+  assert(r.injected[0].includes('follow_up_wiht_typo'), 'the first boundary showed the agent the follow-up');
+  assert(r.injected[1].includes('follow_up_fixed_again') && !r.injected[1].includes('"firstView":true'), 'the second boundary showed it the last edit, unmarked');
+  assert(r.sent, 'both explicit sends posted');
+  assert(!r.replied, 'the prose after the second send stayed withheld');
+});
+
+test('#157: two edits of a follow-up the agent hasn\'t been shown leave the last its first view, so the reply after an explicit send routes', async (t) => {
+  const f = await fixture(); t.after(f.close); await f.register();
+  const outcomes: string[] = [];
+  const r = await sendThenSpeak(f, async () => {
+    await unreadFollowUp(f);
+    outcomes.push(await pushTagged(f, ['chat:edited'], 'e2', 'follow_up_fixed'));
+    outcomes.push(await pushTagged(f, ['chat:edited'], 'e3', 'follow_up_fixed_again'));
+  });
+  assert.deepEqual(outcomes, ['replaced', 'replaced']);
+  assert(r.injected[0].includes('follow_up_fixed_again') && r.injected[0].includes('"firstView":true'), 'the boundary showed the agent the last edit, marked');
+  assert(r.sent, 'the explicit send posted');
+  assert(r.replied, 'the reply to the follow-up posted');
+});
+
+test('#157: an edit of a follow-up whose producer never marked it initial stays a marker, so the prose after an explicit send stays withheld', async (t) => {
+  const f = await fixture(); t.after(f.close); await f.register();
+  let outcome: string | undefined;
+  const r = await sendThenSpeak(f, async () => { await unreadFollowUp(f, false); outcome = await pushTagged(f, ['chat:edited']); });
+  assert.equal(outcome, 'replaced', 'the edit replaced the unread follow-up, whose history the host can\'t know');
+  assert(r.injected[0].includes('follow_up_fixed'), 'the edit reached the boundary');
+  assert(r.sent, 'the explicit send posted');
+  assert(!r.replied, 'the prose after the send stayed withheld');
+});
+
+const serverMarked: Record<string, (f: Fixture) => Promise<string>> = {
+  'channel message': async (f) => (await f.send('channels/incoming', { messages: [{
+    ...f.channel('e9', 'edit_claiming_first_view', {}, 'chat', 'm9'), tags: ['chat:edited'], metadata: { firstView: true },
+  }] })).result.results[0].coalesce.outcome,
+  'channel-scoped push': async (f) => (await f.send('push/event', {
+    ...f.params('e9', 'edit_claiming_first_view', { channelId: 'chat', key: 'message:m9' }), tags: ['chat:edited'], origin: { firstView: true },
+  })).result.coalesce.outcome,
+  'feature-set push': async (f) => (await f.send('push/event', {
+    ...f.params('e9', 'edit_claiming_first_view', { key: 'message:m9' }), tags: ['chat:edited'], origin: { firstView: true },
+  })).result.coalesce.outcome,
+};
+
+for (const [lane, deliver] of Object.entries(serverMarked)) test(`#157 (${lane}): a server can't mark its own edit as the agent's first view`, async (t) => {
+  const f = await fixture(); t.after(f.close); await f.register();
+  let outcome: string | undefined;
+  const r = await sendThenSpeak(f, async () => { outcome = await deliver(f); });
+  assert.equal(outcome, 'appended');
+  assert(r.injected[0].includes('edit_claiming_first_view'), 'the edit reached the boundary');
+  assert(!r.injected[0].includes('"firstView":true'), "the server's own mark was dropped");
+  assert(r.sent, 'the explicit send posted');
+  assert(!r.replied, 'the prose after the send stayed withheld');
+});
+
+/** An organization acceleration 429, which holds the turn for a later compile. */
+const accelerationLimit = (request: NormalizedRequest): MembraneError => new MembraneError({
+  type: 'rate_limit', retryable: true, httpStatus: 429,
+  message: "This request would exceed your organization's maximum usage increase rate for input tokens per minute",
+  rawError: { status: 429 }, rawRequest: request,
+});
+
+/**
+ * A turn, started by a mention in `chat`, whose first stream sends into
+ * `chat` and then ends with an acceleration 429, so the turn waits for a
+ * later compile with none of its streams running. `midStream` runs while
+ * that first stream is still alive, and `during` while the turn waits.
+ * Returns the channel the turn's next start spoke into.
+ */
+async function heldTurnSpeaksInto(f: Fixture, during: () => Promise<void>, midStream?: () => Promise<void>): Promise<unknown> {
+  let streams = 0;
+  (f.membrane as unknown as { streamYielding: unknown }).streamYielding = (request: NormalizedRequest) => {
+    f.membrane.calls.push(request as never);
+    if (++streams > 1) return new MockYieldingStream([createMockResponse([{ type: 'text', text: 'prose_after_hold' }] as ContentBlock[])]);
+    const stream = new MockYieldingStream([
+      createMockResponse([{ type: 'tool_use', id: 'p0', name: 'channel_publish', input: { channelId: 'chat', content: 'explicit_send' } }] as ContentBlock[], 'tool_use'),
+      createMockResponse([] as ContentBlock[]),
+    ]);
+    const iterate = stream[Symbol.asyncIterator].bind(stream);
+    (stream as unknown as Record<symbol, unknown>)[Symbol.asyncIterator] = async function* () {
+      for await (const event of { [Symbol.asyncIterator]: iterate }) {
+        if ((event as { type?: string }).type === 'complete') { await midStream?.(); yield { type: 'error' as const, error: accelerationLimit(request) }; return; }
+        yield event;
+      }
+    };
+    return stream;
+  };
+  await f.send('channels/incoming', { messages: [f.channel('c1', 'question', { initial: true }, 'chat', 'm1')] });
+  await f.framework.runUntilIdle();
+  const internals = f.framework as unknown as {
+    providerAccelerationCooldowns: Map<string, { until: number }>;
+    releaseProviderAccelerationCooldown(agentName: string): void;
+  };
+  const hold = internals.providerAccelerationCooldowns.get('agent');
+  assert.ok(hold, 'the turn is held after its first stream');
+  await during();
+  hold.until = Date.now();
+  internals.releaseProviderAccelerationCooldown('agent');
+  await f.framework.runUntilIdle();
+  assert.equal(streams, 2, 'one deferred compile');
+  return f.published.find((p) => JSON.stringify(p.content).includes('prose_after_hold'))?.channelId;
+}
+
+test("#157: an edit that addresses the agent, of a follow-up stored while the turn waits out a capacity hold and not yet seen, moves the turn to the follow-up's channel", async (t) => {
+  const f = await fixture({ framework: { speech: { locus: 'latest-inbound' } } }); /* the re-pin is the legacy rule */ t.after(f.close); await f.register(); await f.register('other');
+  let outcome: string | undefined;
+  const channel = await heldTurnSpeaksInto(f, async () => {
+    await f.send('channels/incoming', { messages: [{ ...f.channel('q1', 'follow_up_wiht_typo', { initial: true }, 'other', 'mq'), tags: ['chat:ambient', 'chat:from-human'] }] });
+    outcome = (await f.send('push/event', {
+      ...f.params('e1', 'follow_up_fixed @agent', { channelId: 'other', key: 'message:mq' }), tags: ['chat:edited', 'chat:mention'],
+    })).result.coalesce.outcome;
+  });
+  assert.equal(outcome, 'replaced', 'the edit replaced the follow-up the agent had not seen');
+  assert.equal(channel, 'other');
+});
+
+test('#157: an edit of a follow-up stored at once, which a turn then read, is appended as a marker, so the prose after an explicit send stays withheld', async (t) => {
+  const f = await fixture(); t.after(f.close); await f.register();
+  // Stored at once, with no turn alive. The turn it wakes shows it to the agent in its compile.
+  await f.send('channels/incoming', { messages: [{ ...f.channel('c2', 'follow_up_wiht_typo', { initial: true }, 'chat', 'm2'), tags: ['chat:ambient', 'chat:from-human'] }] });
+  await f.framework.runUntilIdle();
+  assert.equal(f.membrane.calls.length, 1, 'one turn ran');
+  assert(JSON.stringify(f.membrane.calls[0]).includes('follow_up_wiht_typo'), "that turn's compile showed the agent the follow-up");
+  let outcome: string | undefined;
+  const r = await sendThenSpeak(f, async () => { outcome = await pushTagged(f, ['chat:edited']); });
+  assert.equal(outcome, 'appended', 'the edit came after the agent read the follow-up, so it replaced nothing');
+  assert(r.injected[0].includes('follow_up_fixed') && !r.injected[0].includes('"firstView":true'), 'the edit reached the boundary unmarked');
+  assert(r.sent, 'the explicit send posted');
+  assert(!r.replied, 'the prose after the send stayed withheld');
+});
+
+test('#157: an edit admitted while a compile is assembling a message stored at once stays a marker, so the prose after an explicit send stays withheld', async (t) => {
+  const f = await fixture(); t.after(f.close); await f.register();
+  // The question is stored at once and wakes the turn. The edit is admitted
+  // after the compile has assembled it and before the compile returns, so
+  // the question still counts as unread.
+  const cm = f.framework.getAgent('agent')!.getContextManager() as unknown as { compile: (...args: unknown[]) => Promise<unknown> };
+  const compile = cm.compile.bind(cm);
+  let shown = false;
+  let edited = false;
+  cm.compile = async (...args: unknown[]) => {
+    const result = await compile(...args);
+    if (!edited) {
+      edited = true;
+      shown = JSON.stringify(result).includes('question');
+      await f.send('push/event', { ...f.params('e1', 'question_edited', { channelId: 'chat', key: 'message:m1' }), tags: ['chat:edited'] });
+    }
+    return result;
+  };
+  const r = await sendThenSpeak(f, async () => {});
+  assert(shown, 'the compile assembled the question');
+  assert(r.injected[0].includes('question_edited') && !r.injected[0].includes('"firstView":true'), 'the edit reached the boundary unmarked');
+  assert(r.sent, 'the explicit send posted');
+  assert(!r.replied, 'the prose after the send stayed withheld');
+});
+
+/** A message in an agent's store whose text includes `text`. */
+const storedWith = (f: Fixture, text: string, agent = 'agent') =>
+  f.framework.getAgent(agent)!.getContextManager().getAllMessages().find((m) => JSON.stringify(m.content).includes(text));
+const isMarked = (message: { metadata?: unknown } | undefined) => (message?.metadata as { firstView?: unknown } | undefined)?.firstView === true;
+
+test("#157: a compile of an agent with a store of its own leaves another agent's message stored at once unseen, so its edit is still marked", async (t) => {
+  const f = await fixture({ server: { shouldTriggerInference: () => false } }); t.after(f.close); await f.register();
+  // Stored at once in the agent's store, waking no turn.
+  await f.send('push/event', f.params('d1', 'doc_unseen', { initial: true }));
+  await f.framework.runUntilIdle();
+  assert.equal(f.membrane.calls.length, 0, 'nothing has compiled yet');
+  // An ephemeral agent, whose store is its own, runs a turn.
+  const helper = await f.framework.createEphemeralAgent({ name: 'helper', model: 'test', systemPrompt: 'Do the task.' });
+  t.after(helper.cleanup);
+  helper.contextManager.addMessage('User', [{ type: 'text', text: 'helper_task' }]);
+  const run = f.framework.runEphemeralToCompletion(helper.agent, helper.contextManager);
+  await f.framework.runUntilIdle();
+  await run;
+  assert.equal(f.membrane.calls.length, 1, "the helper's compile ran");
+  assert(!JSON.stringify(f.membrane.calls[0]).includes('doc_unseen'), "the helper's request doesn't hold the agent's message");
+  const edit = await f.send('push/event', { ...f.params('d2', 'doc_edited'), tags: ['chat:edited'] });
+  assert.equal(edit.result.coalesce.outcome, 'replaced');
+  assert(isMarked(storedWith(f, 'doc_edited')), "the edit is the agent's first view");
+});
+
+test("#157: another resident's compile that assembles a message stored at once in the shared slot shows it, so an edit admitted during that compile isn't marked", async (t) => {
+  const f = await fixture({ agents: [{ name: 'agent', model: 'test', systemPrompt: 'test' }, { name: 'other', model: 'test', systemPrompt: 'test' }], server: { shouldTriggerInference: () => true } }); t.after(f.close);
+  // The edit is admitted after the other resident's compile has assembled
+  // the message and before that compile returns.
+  const cm = f.framework.getAgent('other')!.getContextManager() as unknown as { compile: (...args: unknown[]) => Promise<unknown> };
+  const compile = cm.compile.bind(cm);
+  let shown = false;
+  let edited = false;
+  cm.compile = async (...args: unknown[]) => {
+    const result = await compile(...args);
+    if (!edited) {
+      edited = true;
+      shown = JSON.stringify(result).includes('doc_unseen');
+      await f.send('push/event', { ...f.params('d2', 'doc_edited'), tags: ['chat:edited'] });
+    }
+    return result;
+  };
+  await f.send('push/event', f.params('d1', 'doc_unseen', { initial: true }));
+  const internals = f.framework as unknown as { pendingRequests: Array<{ agentName: string }> };
+  internals.pendingRequests = internals.pendingRequests.filter((r) => r.agentName === 'other');
+  f.alwaysRespond();
+  await f.framework.runUntilIdle();
+  assert(shown, "the other resident's compile assembled the message");
+  const stored = storedWith(f, 'doc_edited');
+  assert(stored, 'the edit is stored');
+  assert(!isMarked(stored), "the edit isn't marked as the agent's first view");
+});
+
+test("#157: an edit that addresses the agent, of a follow-up that arrived during the turn and was flushed when the turn was held, moves the turn to the follow-up's channel", async (t) => {
+  const f = await fixture({ framework: { speech: { locus: 'latest-inbound' } } }); /* the re-pin is the legacy rule */ t.after(f.close); await f.register(); await f.register('other');
+  let outcome: string | undefined;
+  const channel = await heldTurnSpeaksInto(f, async () => {
+    assert(storedWith(f, 'follow_up_wiht_typo'), 'the hold flushed the follow-up into the store');
+    outcome = (await f.send('push/event', {
+      ...f.params('e1', 'follow_up_fixed @agent', { channelId: 'other', key: 'message:mq' }), tags: ['chat:edited', 'chat:mention'],
+    })).result.coalesce.outcome;
+  }, async () => {
+    // The follow-up arrives while the first stream runs, so it waits in the deferred queue.
+    await f.send('channels/incoming', { messages: [{ ...f.channel('q1', 'follow_up_wiht_typo', { initial: true }, 'other', 'mq'), tags: ['chat:ambient', 'chat:from-human'] }] });
+    assert(!storedWith(f, 'follow_up_wiht_typo'), 'the follow-up was deferred, not stored at once');
+  });
+  assert.equal(outcome, 'replaced', 'the edit replaced the follow-up the agent had not seen');
+  assert.equal(channel, 'other');
+});
+
+test("#157: an edit of a follow-up that arrived during a turn and was flushed at the turn's end, before any compile showed it, is the agent's first view", async (t) => {
+  // The question wakes the turn. The follow-up and its edit wake nothing, so
+  // no compile shows the follow-up after the flush.
+  const f = await fixture({ server: { shouldTriggerInference: (content: string) => !content.includes('follow_up') } }); t.after(f.close); await f.register();
+  let streams = 0;
+  (f.membrane as unknown as { streamYielding: unknown }).streamYielding = (request: NormalizedRequest) => {
+    f.membrane.calls.push(request as never);
+    const stream = new MockYieldingStream([createMockResponse([{ type: 'text', text: 'answer' }] as ContentBlock[])]);
+    if (++streams > 1) return stream;
+    const iterate = stream[Symbol.asyncIterator].bind(stream);
+    (stream as unknown as Record<symbol, unknown>)[Symbol.asyncIterator] = async function* () {
+      for await (const event of { [Symbol.asyncIterator]: iterate }) {
+        // The follow-up arrives after the turn's last round, so no tool
+        // boundary drains it: it waits for the turn-end flush.
+        if ((event as { type?: string }).type === 'complete') {
+          await f.send('push/event', f.params('d1', 'follow_up_wiht_typo', { initial: true }));
+          assert(!storedWith(f, 'follow_up_wiht_typo'), 'the follow-up was deferred, not stored at once');
+        }
+        yield event;
+      }
+    };
+    return stream;
+  };
+  await f.send('channels/incoming', { messages: [f.channel('c1', 'question', { initial: true }, 'chat', 'm1')] });
+  await f.framework.runUntilIdle();
+  assert.equal(streams, 1, 'one turn ran');
+  assert(storedWith(f, 'follow_up_wiht_typo'), "the turn-end flush stored the follow-up");
+  assert(!f.membrane.calls.some((c) => JSON.stringify(c).includes('follow_up_wiht_typo')), 'no request held the follow-up');
+  const edit = await f.send('push/event', { ...f.params('d2', 'follow_up_fixed'), tags: ['chat:edited'] });
+  assert.equal(edit.result.coalesce.outcome, 'replaced');
+  assert(isMarked(storedWith(f, 'follow_up_fixed')), "the edit is the agent's first view");
+});
+
+test("#157: an edit admitted while the agent's compileContext is assembling a message stored at once stays a marker", async (t) => {
+  const f = await fixture({ server: { shouldTriggerInference: () => false } }); t.after(f.close); await f.register();
+  // Stored at once, waking no turn.
+  await f.send('push/event', f.params('d1', 'doc_unseen', { initial: true }));
+  await f.framework.runUntilIdle();
+  assert.equal(f.membrane.calls.length, 0, 'no turn ran');
+  const agent = f.framework.getAgent('agent')!;
+  const cm = agent.getContextManager() as unknown as { compile: (...args: unknown[]) => Promise<unknown> };
+  const compile = cm.compile.bind(cm);
+  let shown = false;
+  let outcome: string | undefined;
+  cm.compile = async (...args: unknown[]) => {
+    const result = await compile(...args);
+    shown = JSON.stringify(result).includes('doc_unseen');
+    outcome = (await f.send('push/event', { ...f.params('d2', 'doc_edited'), tags: ['chat:edited'] })).result.coalesce.outcome;
+    return result;
+  };
+  await agent.compileContext();
+  assert(shown, 'compileContext assembled the message');
+  assert.equal(outcome, 'replaced', 'the message still counted as unread while compileContext ran');
+  const stored = storedWith(f, 'doc_edited');
+  assert(stored, 'the edit is stored');
+  assert(!isMarked(stored), "the edit isn't the agent's first view");
+});
+
+for (const method of ['compileContext', 'compileWithInjections'] as const) test(`#157: a committing ${method} that throws gives its shown mark back, so an edit of a message stored at once is still the agent's first view`, async (t) => {
+  const f = await fixture({ server: { shouldTriggerInference: () => false } }); t.after(f.close); await f.register();
+  // Stored at once, waking no turn.
+  await f.send('push/event', f.params('d1', 'doc_unseen', { initial: true }));
+  await f.framework.runUntilIdle();
+  assert.equal(f.membrane.calls.length, 0, 'no turn ran');
+  const agent = f.framework.getAgent('agent')!;
+  const cm = agent.getContextManager() as unknown as { compile: (...args: unknown[]) => Promise<unknown> };
+  const compile = cm.compile;
+  cm.compile = async () => { throw new Error('compile_failed'); };
+  await assert.rejects(agent[method](), /compile_failed/);
+  cm.compile = compile;
+  const edit = await f.send('push/event', { ...f.params('d2', 'doc_edited'), tags: ['chat:edited'] });
+  assert.equal(edit.result.coalesce.outcome, 'replaced');
+  const stored = storedWith(f, 'doc_edited');
+  assert(stored, 'the edit is stored');
+  assert(isMarked(stored), "the edit is the agent's first view");
+});
+
+test("#157: a compile that throws after a tool boundary has moved the shown mark leaves the boundary's move, so an edit of a message stored at once is a marker", async (t) => {
+  const f = await fixture({ server: { shouldTriggerInference: () => false } }); t.after(f.close); await f.register();
+  await f.send('push/event', f.params('d1', 'doc_unseen', { initial: true }));
+  await f.framework.runUntilIdle();
+  assert.equal(f.membrane.calls.length, 0, 'no turn ran');
+  const agent = f.framework.getAgent('agent')!;
+  const cm = agent.getContextManager() as unknown as { compile: (...args: unknown[]) => Promise<unknown> };
+  const compile = cm.compile;
+  // A boundary of another turn injects while the compile runs, then the compile fails.
+  cm.compile = async () => { agent.markContextShown(); throw new Error('compile_failed'); };
+  await assert.rejects(agent.compileContext(), /compile_failed/);
+  cm.compile = compile;
+  const edit = await f.send('push/event', { ...f.params('d2', 'doc_edited'), tags: ['chat:edited'] });
+  assert.equal(edit.result.coalesce.outcome, 'replaced', 'the message is still unread');
+  const stored = storedWith(f, 'doc_edited');
+  assert(stored, 'the edit is stored');
+  assert(!isMarked(stored), "the edit isn't the agent's first view");
+});
+
+test('#157: a tool boundary that cannot read the store counts every message as shown, so an edit of a message stored at once is a marker', async (t) => {
+  const f = await fixture({ server: { shouldTriggerInference: () => false } }); t.after(f.close); await f.register();
+  await f.send('push/event', f.params('d1', 'doc_unseen', { initial: true }));
+  await f.framework.runUntilIdle();
+  assert.equal(f.membrane.calls.length, 0, 'no turn ran');
+  const agent = f.framework.getAgent('agent')!;
+  const cm = agent.getContextManager() as unknown as { currentBranch: () => unknown };
+  const currentBranch = cm.currentBranch;
+  cm.currentBranch = () => { throw new Error('store_unreadable'); };
+  agent.markContextShown();
+  cm.currentBranch = currentBranch;
+  const edit = await f.send('push/event', { ...f.params('d2', 'doc_edited'), tags: ['chat:edited'] });
+  assert.equal(edit.result.coalesce.outcome, 'replaced', 'the message is still unread');
+  const stored = storedWith(f, 'doc_edited');
+  assert(stored, 'the edit is stored');
+  assert(!isMarked(stored), "the edit isn't the agent's first view");
+});
+
+test("#157: a dry-run preview shows the agent nothing, so an edit of a message stored at once after one is still its first view", async (t) => {
+  const f = await fixture({ server: { shouldTriggerInference: () => false } }); t.after(f.close); await f.register();
+  await f.send('push/event', f.params('d1', 'doc_unseen', { initial: true }));
+  await f.framework.runUntilIdle();
+  assert.equal(f.membrane.calls.length, 0, 'no turn ran');
+  const preview = await f.framework.previewActivation('agent');
+  assert(JSON.stringify(preview).includes('doc_unseen'), 'the preview assembled the message');
+  const edit = await f.send('push/event', { ...f.params('d2', 'doc_edited'), tags: ['chat:edited'] });
+  assert.equal(edit.result.coalesce.outcome, 'replaced');
+  const stored = storedWith(f, 'doc_edited');
+  assert(stored, 'the edit is stored');
+  assert(isMarked(stored), "the edit is the agent's first view");
+});
+
+test("#157: the render of a deferred notice that births its subject is the agent's first view, so an edit tag on it doesn't make it a marker", async (t) => {
+  const f = await fixture(); t.after(f.close);
+  await f.send('push/event', { ...f.params('n1', 'fallback_text', { deferred: true, initial: true }), tags: ['chat:edited'] });
+  await f.framework.runUntilIdle();
+  assert.equal(f.renders.length, 1, 'the notice rendered at assembly');
+  const stored = storedWith(f, 'document_diff');
+  assert(stored, 'the render is stored');
+  assert(isMarked(stored), "the render is the agent's first view");
+});
+
+/** What a stand-in host has removed. As in the framework, a removed
+ *  placement is no longer unread, and nothing can still be unshown in it, so
+ *  a first-view decision has to be taken before the removal. */
+function removals() {
+  const removed = new Set<string>();
+  const key = (p: { deferredId?: string; messageId?: string }) => p.deferredId ?? p.messageId ?? '';
+  return {
+    gone: (p: { deferredId?: string; messageId?: string }) => removed.has(key(p)),
+    remove: (p: { deferredId?: string; messageId?: string }) => { removed.add(key(p)); return true; },
+  };
+}
+
+test("#157: a render that lands unread in another agent's deferred queue keeps its first view, so an edit that replaces it is marked", async () => {
+  const delivered: Array<{ eventId: string; firstView?: true }> = [];
+  const r = removals();
+  const host: CoalescerHost<null> = {
+    isUnread: (p) => !r.gone(p), isUnshown: (p) => !r.gone(p), remove: r.remove,
+    // Every delivery lands in the deferred queue of an agent whose turn is alive.
+    deliver: async (occ) => { delivered.push({ eventId: occ.eventId, ...(occ.firstView ? { firstView: true as const } : {}) }); return { agent: 'other', deferredId: `deferred-${delivered.length}` }; },
+    wakeForBatch: async () => {}, wakeToRead: async () => {}, cancelWake: () => {}, authorized: () => true,
+    audience: async () => ['agent', 'other'],
+    render: async () => ({ content: [{ type: 'text', text: 'document_diff' }] }),
+    audit: () => {}, save: () => {},
+  };
+  const coalescer = new PushCoalescer<null>(host);
+  const occurrence = (eventId: string, flags: Partial<CoalescedOccurrence<null>>): CoalescedOccurrence<null> => ({
+    serverId: 'editor', binding: 'binding', scope: { kind: 'featureSet', id: 'doc' }, key: 'document', eventId, timestamp: TS,
+    retract: false, deferred: false, initial: false, content: [{ type: 'text', text: eventId }], event: null, ...flags,
+  });
+  await coalescer.accept(occurrence('n1', { deferred: true, initial: true }));
+  await coalescer.assemble('agent');
+  const edit = await coalescer.accept(occurrence('e1', { tags: ['chat:edited'] }));
+  assert.equal(edit.coalesce?.outcome, 'replaced', 'the edit replaced the unread render');
+  assert.deepEqual(delivered, [{ eventId: 'n1', firstView: true }, { eventId: 'e1', firstView: true }], 'the render and the edit that replaced it are each marked');
+});
+
+test("#157: a notice's render that lands while an earlier render of its subject waits unread in a deferred queue is no first view", async () => {
+  const delivered: Array<{ eventId: string; firstView?: true }> = [];
+  let releaseFirst!: () => void;
+  const firstRender = new Promise<void>((resolve) => { releaseFirst = resolve; });
+  const r = removals();
+  const host: CoalescerHost<null> = {
+    isUnread: (p) => !r.gone(p), isUnshown: (p) => !r.gone(p), remove: r.remove,
+    // Every delivery lands in the deferred queue of an agent whose turn is alive.
+    deliver: async (occ) => { delivered.push({ eventId: occ.eventId, ...(occ.firstView ? { firstView: true as const } : {}) }); return { agent: 'other', deferredId: `deferred-${delivered.length}` }; },
+    wakeForBatch: async () => {}, wakeToRead: async () => {}, cancelWake: () => {}, authorized: () => true,
+    audience: async () => ['agent', 'other'],
+    render: async (occ) => { if (occ.eventId === 'n1') await firstRender; return { content: [{ type: 'text', text: `diff_${occ.eventId}` }] }; },
+    audit: () => {}, save: () => {},
+  };
+  const coalescer = new PushCoalescer<null>(host);
+  const occurrence = (eventId: string, flags: Partial<CoalescedOccurrence<null>>): CoalescedOccurrence<null> => ({
+    serverId: 'editor', binding: 'binding', scope: { kind: 'featureSet', id: 'doc' }, key: 'document', eventId, timestamp: TS,
+    retract: false, deferred: false, initial: false, content: [{ type: 'text', text: eventId }], event: null, ...flags,
+  });
+  await coalescer.accept(occurrence('n1', { deferred: true, initial: true }));
+  const first = coalescer.assemble('agent');
+  // A second notice arrives while the first batch renders, so it opens a new batch.
+  await coalescer.accept(occurrence('n2', { deferred: true }));
+  releaseFirst();
+  await first;
+  await coalescer.assemble('agent');
+  assert.deepEqual(delivered, [{ eventId: 'n1', firstView: true }, { eventId: 'n2' }], 'only the first render is the first view');
+});
+
+/** A coalescer whose every delivery lands in the deferred queue of 'other',
+ *  an agent whose turn is alive, unless `stored` names the event, whose
+ *  delivery is then stored and so materialized for the assembling turn, or
+ *  `unplaced` does, whose delivery is placed nowhere. The renders of `held`
+ *  wait for `release`, and those of `blank` come back blank. `state` answers
+ *  the host's read and shown questions for every placement it hasn't removed
+ *  (removals), and its `shownEvents` and `readEvents`, when given, for the
+ *  placements of the events they name.
+ *  (slimepriestess's probe for #168, with the held renders and the other
+ *  options added.) */
+function firstViewProbe(state: { shown: boolean; read: boolean; shownEvents?: Set<string>; readEvents?: Set<string> }, { held = ['n1'], stored = [] as string[], unplaced = [] as string[], blank = [] as string[] } = {}) {
+  const delivered: Array<{ eventId: string; firstView?: true }> = [];
+  // Each placement's event, for the per-event read and shown answers.
+  const eventOf = new Map<string, string>();
+  const named = (p: { deferredId?: string; messageId?: string }, events?: Set<string>) => events?.has(eventOf.get(p.deferredId ?? p.messageId ?? '') ?? '') === true;
+  const releases = new Map<string, () => void>();
+  const gates = new Map(held.map((id) => [id, new Promise<void>((resolve) => { releases.set(id, resolve); })]));
+  const started = new Map<string, () => void>();
+  const renderStarted = new Map(held.map((id) => [id, new Promise<void>((resolve) => { started.set(id, resolve); })]));
+  const r = removals();
+  const host: CoalescerHost<null> = {
+    isUnread: (p) => !r.gone(p) && !state.read && !named(p, state.readEvents),
+    isUnshown: (p) => !r.gone(p) && !state.shown && !state.read && !named(p, state.shownEvents) && !named(p, state.readEvents),
+    remove: r.remove,
+    deliver: async (occ) => {
+      delivered.push({ eventId: occ.eventId, ...(occ.firstView ? { firstView: true as const } : {}) });
+      if (unplaced.includes(occ.eventId)) return undefined;
+      const placement = stored.includes(occ.eventId)
+        ? { agent: 'agent', messageId: `stored-${delivered.length}` }
+        : { agent: 'other', deferredId: `deferred-${delivered.length}` };
+      eventOf.set(placement.messageId ?? placement.deferredId!, occ.eventId);
+      return placement;
+    },
+    wakeForBatch: async () => {}, wakeToRead: async () => {}, cancelWake: () => {}, authorized: () => true,
+    audience: async () => ['agent', 'other'],
+    render: async (occ) => {
+      started.get(occ.eventId)?.();
+      await gates.get(occ.eventId);
+      return { content: [{ type: 'text', text: blank.includes(occ.eventId) ? ' ' : `diff_${occ.eventId}` }] };
+    },
+    audit: () => {}, save: () => {},
+  };
+  const coalescer = new PushCoalescer<null>(host);
+  const occurrence = (eventId: string, flags: Partial<CoalescedOccurrence<null>>): CoalescedOccurrence<null> => ({
+    serverId: 'editor', binding: 'binding', scope: { kind: 'featureSet', id: 'doc' }, key: 'document', eventId, timestamp: TS,
+    retract: false, deferred: false, initial: false, content: [{ type: 'text', text: eventId }], event: null, ...flags,
+  });
+  return {
+    coalescer, host, delivered, occurrence,
+    release: (id: string) => releases.get(id)!(),
+    renderStarted: (id: string) => renderStarted.get(id)!,
+  };
+}
+
+/** n1's render lands in 'other''s deferred queue as a first view, after n2
+ *  opened a batch of the same subject during that render. */
+async function firstViewQueuedWithBatchPending(p: ReturnType<typeof firstViewProbe>): Promise<void> {
+  await p.coalescer.accept(p.occurrence('n1', { deferred: true, initial: true }));
+  const first = p.coalescer.assemble('agent');
+  await p.coalescer.accept(p.occurrence('n2', { deferred: true }));
+  p.release('n1');
+  await first;
+  assert.deepEqual(p.delivered, [{ eventId: 'n1', firstView: true }], "n1's render is the agent's first view");
+}
+
+for (const shown of [false, true]) test(`#157: a notice after a queued first-view render joins the pending batch and leaves the render in place, the batch's render joins its run unmarked, and a plain edit that displaces the run ${shown ? 'the agent was shown is no first view' : 'nothing has shown is the first view'}`, async () => {
+  const state = { shown: false, read: false };
+  const p = firstViewProbe(state);
+  await firstViewQueuedWithBatchPending(p);
+  // Shown at a boundary whose stream doesn't declare what it carries
+  // injected: still unread, but no longer unshown.
+  state.shown = shown;
+  const n3 = await p.coalescer.accept(p.occurrence('n3', { deferred: true, tags: ['chat:edited'] }));
+  assert.equal(n3.coalesce?.outcome, 'replaced', 'n3 joined the pending batch');
+  await p.coalescer.assemble('agent');
+  // A render is a delta the next one builds on (RFC-006 §5.2): n1 stays, and
+  // the batch's render joins its run. The run holds the first view, in n1.
+  assert.deepEqual(p.delivered, [{ eventId: 'n1', firstView: true }, { eventId: 'n3' }]);
+  const e1 = await p.coalescer.accept(p.occurrence('e1', { tags: ['chat:edited'] }));
+  assert.equal(e1.coalesce?.outcome, 'replaced', 'e1 displaced the run');
+  assert.deepEqual(p.delivered.at(-1), { eventId: 'e1', ...(shown ? {} : { firstView: true as const }) },
+    shown ? 'the agent was shown the run, so the edit is no first view' : 'nothing showed the run, so the edit takes its first view');
+});
+
+for (const shown of [false, true]) test(`#157: a render that settles while a first-view render is queued joins its run unmarked, and a retraction of the run ${shown ? 'the agent was shown leaves the next batch no first view' : 'nothing had shown leaves the next batch the first view'}`, async () => {
+  const state = { shown: false, read: false };
+  const p = firstViewProbe(state, { held: ['n1', 'n2'] });
+  await firstViewQueuedWithBatchPending(p);
+  // n2's batch renders, held, so no batch is pending when n3 arrives.
+  const second = p.coalescer.assemble('agent');
+  await settles(p.renderStarted('n2'), "n2's render");
+  state.shown = shown;
+  const n3 = await p.coalescer.accept(p.occurrence('n3', { deferred: true, tags: ['chat:edited'] }));
+  assert.equal(n3.coalesce?.outcome, 'first', 'n3 opened a batch beside the queued render, which stays');
+  p.release('n2');
+  await second;
+  assert.deepEqual(p.delivered, [{ eventId: 'n1', firstView: true }, { eventId: 'n2' }], "n2's render joined n1's run unmarked");
+  const r1 = await p.coalescer.accept(p.occurrence('r1', { retract: true, content: [] }));
+  assert.equal(r1.coalesce?.outcome, 'retracted');
+  // Later versions haven't been shown, whatever happened to the run.
+  state.shown = false;
+  await p.coalescer.accept(p.occurrence('n4', { deferred: true }));
+  await p.coalescer.assemble('agent');
+  assert.deepEqual(p.delivered.at(-1), { eventId: 'n4', ...(shown ? {} : { firstView: true as const }) });
+});
+
+test("#157: a batch opened during a render whose content the turn then read has a render that is no first view", async () => {
+  const state = { shown: false, read: false };
+  // n1's render is stored where the assembling turn's compile reads it, so
+  // that turn consumes it.
+  const p = firstViewProbe(state, { stored: ['n1'] });
+  await p.coalescer.accept(p.occurrence('n1', { deferred: true, initial: true }));
+  const first = p.coalescer.assemble('agent');
+  await p.coalescer.accept(p.occurrence('n2', { deferred: true }));
+  p.release('n1');
+  await first;
+  await p.coalescer.assemble('agent');
+  assert.deepEqual(p.delivered, [{ eventId: 'n1', firstView: true }, { eventId: 'n2' }], "n2's batch opened before the agent read n1, but its render comes after");
+});
+
+test('#157: a plain edit that takes the place of a pending first-view batch after the agent read an earlier render is no first view', async () => {
+  const state = { shown: false, read: false };
+  const p = firstViewProbe(state);
+  await firstViewQueuedWithBatchPending(p);
+  state.read = true;
+  const e1 = await p.coalescer.accept(p.occurrence('e1', { tags: ['chat:edited'] }));
+  assert.equal(e1.coalesce?.outcome, 'replaced');
+  assert.deepEqual(p.delivered.at(-1), { eventId: 'e1' });
+});
+
+/** n1's render lands in 'other''s deferred queue as the agent's first view,
+ *  and `shown` says whether the agent is then shown it. n2 opens a batch
+ *  beside it, which follows the run's agent and is no first view, since the
+ *  run holds it; that batch starts rendering for 'other'; n3 opens a new
+ *  batch during that render. Returns the held assembly, wrapped, since an
+ *  async function returning it would wait for it. */
+async function firstViewEndedDuringRender(p: ReturnType<typeof firstViewProbe>, state: { shown: boolean }, shown: boolean) {
+  await p.coalescer.accept(p.occurrence('n1', { deferred: true, initial: true }));
+  await p.coalescer.assemble('agent');
+  assert.deepEqual(p.delivered, [{ eventId: 'n1', firstView: true }], "n1's render is the agent's first view");
+  state.shown = shown;
+  const n2 = await p.coalescer.accept(p.occurrence('n2', { deferred: true }));
+  assert.equal(n2.coalesce?.outcome, 'first', 'n2 opened a batch beside the queued render, which stays');
+  const second = p.coalescer.assemble('other');
+  await settles(p.renderStarted('n2'), "n2's render");
+  const n3 = await p.coalescer.accept(p.occurrence('n3', { deferred: true }));
+  assert.equal(n3.coalesce?.outcome, 'first', 'n3 opened a new batch during the render');
+  return { second };
+}
+
+for (const shown of [false, true]) test(`#157: a plain edit that takes the place of a batch opened during a render beside a queued first-view render displaces that run too, and ${shown ? 'is no first view when the agent was shown it' : 'is the first view when nothing had shown it'}`, async () => {
+  const state = { shown: false, read: false };
+  const p = firstViewProbe(state, { held: ['n2'] });
+  const { second } = await firstViewEndedDuringRender(p, state, shown);
+  const e1 = await p.coalescer.accept(p.occurrence('e1', { tags: ['chat:edited'] }));
+  assert.equal(e1.coalesce?.outcome, 'replaced', "e1 took the pending batch's place");
+  p.release('n2');
+  await second;
+  assert.equal(p.delivered.at(-1)?.eventId, 'e1');
+  assert.equal(p.delivered.at(-1)?.firstView === true, !shown);
+});
+
+for (const shown of [false, true]) test(`#157: beside a queued first-view render, a batch whose render comes back blank and a later batch's render leave the run its first view, so a plain edit that displaces the run ${shown ? 'the agent was shown is no first view' : 'nothing had shown is the first view'}`, async () => {
+  const state = { shown: false, read: false };
+  const p = firstViewProbe(state, { held: ['n2'], blank: ['n2'] });
+  const { second } = await firstViewEndedDuringRender(p, state, shown);
+  p.release('n2');
+  await second;
+  assert.equal(p.delivered.length, 1, "n2's blank render delivered nothing");
+  await p.coalescer.assemble('agent');
+  assert.deepEqual(p.delivered.at(-1), { eventId: 'n3' }, "n3's render joined n1's run unmarked");
+  const e1 = await p.coalescer.accept(p.occurrence('e1', { tags: ['chat:edited'] }));
+  assert.equal(e1.coalesce?.outcome, 'replaced', 'e1 displaced the run');
+  assert.deepEqual(p.delivered.at(-1), { eventId: 'e1', ...(shown ? {} : { firstView: true as const }) });
+});
+
+/** n1's render lands in 'other''s deferred queue as the agent's first view;
+ *  `shown` says whether the agent is then shown it, and a retraction
+ *  withdraws it. */
+/** A run of n1, the agent's first view, and n3's render, which joined it
+ *  unmarked, both queued for 'other'. */
+async function firstViewRunOfTwo(p: ReturnType<typeof firstViewProbe>): Promise<void> {
+  await firstViewQueuedWithBatchPending(p);
+  await p.coalescer.accept(p.occurrence('n3', { deferred: true, tags: ['chat:edited'] }));
+  await p.coalescer.assemble('agent');
+  assert.deepEqual(p.delivered, [{ eventId: 'n1', firstView: true }, { eventId: 'n3' }], "n3's render joined n1's run unmarked");
+}
+
+/** Runs whose renders the agent may have seen differently: only a run none
+ *  of whose renders may have been shown, and none of whose renders has left
+ *  it read, hands its first view on. */
+const runMixes: Record<string, { shownEvents?: string[]; readEvents?: string[] }> = {
+  'its newest render shown and its oldest not': { shownEvents: ['n3'] },
+  'its oldest render shown and its newest not': { shownEvents: ['n1'] },
+  'its newest render read and its oldest not': { readEvents: ['n3'] },
+};
+const runEndings: Record<string, (p: ReturnType<typeof firstViewProbe>) => Promise<string>> = {
+  'a plain edit that displaces it is': async (p) => {
+    const e1 = await p.coalescer.accept(p.occurrence('e1', { tags: ['chat:edited'] }));
+    assert.equal(e1.coalesce?.outcome, 'replaced', 'e1 displaced what is left of the run');
+    return 'e1';
+  },
+  'a retraction of it leaves the next batch': async (p) => {
+    await p.coalescer.accept(p.occurrence('r1', { retract: true, content: [] }));
+    await p.coalescer.accept(p.occurrence('n4', { deferred: true }));
+    await p.coalescer.assemble('agent');
+    return 'n4';
+  },
+};
+for (const [mix, seen] of Object.entries(runMixes)) for (const [ending, end] of Object.entries(runEndings)) test(`#157: with a run of renders that has ${mix}, ${ending} no first view`, async () => {
+  const state = { shown: false, read: false, shownEvents: new Set<string>(), readEvents: new Set<string>() };
+  const p = firstViewProbe(state);
+  await firstViewRunOfTwo(p);
+  for (const id of seen.shownEvents ?? []) state.shownEvents.add(id);
+  for (const id of seen.readEvents ?? []) state.readEvents.add(id);
+  const next = await end(p);
+  assert.deepEqual(p.delivered.at(-1), { eventId: next }, 'something of the run may have been shown');
+});
+
+async function firstViewRetracted(p: ReturnType<typeof firstViewProbe>, state: { shown: boolean }, shown: boolean) {
+  await p.coalescer.accept(p.occurrence('n1', { deferred: true, initial: true }));
+  await p.coalescer.assemble('agent');
+  assert.deepEqual(p.delivered, [{ eventId: 'n1', firstView: true }], "n1's render is the agent's first view");
+  state.shown = shown;
+  const r1 = await p.coalescer.accept(p.occurrence('r1', { retract: true, content: [] }));
+  assert.equal(r1.coalesce?.outcome, 'retracted');
+  // Later versions haven't been shown, whatever happened to n1.
+  state.shown = false;
+}
+
+for (const shown of [false, true]) test(`#157: after a retraction withdraws a first-view render ${shown ? 'the agent was shown, the next batch is no first view' : 'nothing had shown, the next batch is the first view'}`, async () => {
+  const state = { shown: false, read: false };
+  const p = firstViewProbe(state, { held: [] });
+  await firstViewRetracted(p, state, shown);
+  await p.coalescer.accept(p.occurrence('n2', { deferred: true }));
+  await p.coalescer.assemble('agent');
+  assert.equal(p.delivered.at(-1)?.eventId, 'n2');
+  assert.equal(p.delivered.at(-1)?.firstView === true, !shown);
+});
+
+for (const shown of [false, true]) test(`#157: after a retraction withdraws a first-view render ${shown ? 'the agent was shown, a plain birth is no first view, nor its edit' : 'nothing had shown, a plain birth is the first view, and so is its edit'}`, async () => {
+  const state = { shown: false, read: false };
+  const p = firstViewProbe(state, { held: [] });
+  await firstViewRetracted(p, state, shown);
+  const p1 = await p.coalescer.accept(p.occurrence('p1', {}));
+  assert.equal(p1.coalesce?.outcome, 'first');
+  const e1 = await p.coalescer.accept(p.occurrence('e1', { tags: ['chat:edited'] }));
+  assert.equal(e1.coalesce?.outcome, 'replaced', 'e1 replaced the unread birth');
+  assert.equal(p.delivered.at(-1)?.eventId, 'e1');
+  assert.equal(p.delivered.at(-1)?.firstView === true, !shown);
+});
+
+for (const shown of [false, true]) test(`#157: a plain occurrence that displaces a first-view render ${shown ? 'the agent was shown and is placed nowhere leaves the next batch no first view' : 'nothing had shown and is placed nowhere leaves the next batch the first view'}`, async () => {
+  const state = { shown: false, read: false };
+  const p = firstViewProbe(state, { held: [], unplaced: ['p1'] });
+  await p.coalescer.accept(p.occurrence('n1', { deferred: true, initial: true }));
+  await p.coalescer.assemble('agent');
+  state.shown = shown;
+  const p1 = await p.coalescer.accept(p.occurrence('p1', { tags: ['chat:edited'] }));
+  assert.equal(p1.coalesce?.outcome, 'replaced');
+  assert.equal(p.delivered.at(-1)?.eventId, 'p1');
+  state.shown = false;
+  await p.coalescer.accept(p.occurrence('n2', { deferred: true }));
+  await p.coalescer.assemble('agent');
+  assert.equal(p.delivered.at(-1)?.eventId, 'n2');
+  assert.equal(p.delivered.at(-1)?.firstView === true, !shown);
+});
+
+test("#157: a snapshot keeps a subject's ended first view, so a restored coalescer's next batch is no first view", async () => {
+  const state = { shown: false, read: false };
+  const p = firstViewProbe(state, { held: [] });
+  await firstViewRetracted(p, state, true);
+  const snapshot = p.coalescer.snapshot();
+  assert.equal((snapshot.subjects[0] as { firstViewEnded?: unknown }).firstViewEnded, true, 'the snapshot carries the end');
+  const restored = new PushCoalescer<null>(p.host);
+  restored.restore(snapshot);
+  await restored.accept(p.occurrence('n2', { deferred: true }));
+  await restored.assemble('agent');
+  assert.deepEqual(p.delivered.at(-1), { eventId: 'n2' });
+});
+
+/** n1's render lands in 'other''s deferred queue as the agent's first view;
+ *  `shown` says whether the agent is then shown it, and a plain edit
+ *  displaces it. */
+async function firstViewDisplacedByPlain(p: ReturnType<typeof firstViewProbe>, state: { shown: boolean }, shown: boolean) {
+  await p.coalescer.accept(p.occurrence('n1', { deferred: true, initial: true }));
+  await p.coalescer.assemble('agent');
+  assert.deepEqual(p.delivered, [{ eventId: 'n1', firstView: true }], "n1's render is the agent's first view");
+  state.shown = shown;
+  const p1 = await p.coalescer.accept(p.occurrence('p1', { tags: ['chat:edited'] }));
+  assert.equal(p1.coalesce?.outcome, 'replaced', 'p1 displaced the queued render');
+  // Later versions haven't been shown, whatever happened to n1.
+  state.shown = false;
+}
+
+const firstViewEndings = { 'a retraction': firstViewRetracted, 'a plain occurrence that displaces it': firstViewDisplacedByPlain };
+
+for (const [ending, end] of Object.entries(firstViewEndings)) for (const shown of [false, true]) test(`#157: the crash-window receipt records keep a subject's ended first view after ${ending}, so a coalescer restored from them alone ${shown ? 'gives the next batch no first view' : 'still gives the next batch its first view when nothing had shown the agent the last'}`, async () => {
+  const state = { shown: false, read: false };
+  const p = firstViewProbe(state, { held: [] });
+  const records: CoalescingReceiptRecord[] = [];
+  p.host.recordReceipt = (record) => { records.push(structuredClone(record)); };
+  await end(p, state, shown);
+  // A crash before the throttled snapshot: only the records written at each acceptance survive.
+  const restored = new PushCoalescer<null>(p.host);
+  restored.restoreReceipts(records);
+  await restored.accept(p.occurrence('n2', { deferred: true }));
+  await restored.assemble('agent');
+  assert.deepEqual(p.delivered.at(-1), { eventId: 'n2', ...(shown ? {} : { firstView: true as const }) });
+});
+
+for (const shown of [false, true]) test(`#157: a snapshot taken before a subject's first view ended, with the records written after it, ${shown ? 'gives the next batch no first view' : 'still gives the next batch its first view when nothing had shown the agent the last'}`, async () => {
+  const state = { shown: false, read: false };
+  const p = firstViewProbe(state, { held: [] });
+  await p.coalescer.accept(p.occurrence('n1', { deferred: true, initial: true }));
+  // The last snapshot holds the subject with its batch pending; the records after it are the crash window's.
+  const snapshot = p.coalescer.snapshot();
+  const records: CoalescingReceiptRecord[] = [];
+  p.host.recordReceipt = (record) => { records.push(structuredClone(record)); };
+  await p.coalescer.assemble('agent');
+  assert.deepEqual(p.delivered, [{ eventId: 'n1', firstView: true }], "n1's render is the agent's first view");
+  state.shown = shown;
+  const r1 = await p.coalescer.accept(p.occurrence('r1', { retract: true, content: [] }));
+  assert.equal(r1.coalesce?.outcome, 'retracted');
+  state.shown = false;
+  assert.equal(records.length, 1, "the retraction's record is the only one after the snapshot");
+  const restored = new PushCoalescer<null>(p.host);
+  restored.restore(snapshot);
+  restored.restoreReceipts(records);
+  await restored.accept(p.occurrence('n2', { deferred: true }));
+  await restored.assemble('agent');
+  assert.deepEqual(p.delivered.at(-1), { eventId: 'n2', ...(shown ? {} : { firstView: true as const }) });
+});
+
+for (const shown of [false, true]) test(`#157: a snapshot that holds a first-view batch, restored with the records after it once their retry window has passed, ${shown ? "gives that batch's render no first view when a record ends the first view" : "leaves that batch's render the first view when nothing had shown the agent the last"}`, async () => {
+  const state = { shown: false, read: false };
+  const p = firstViewProbe(state, { held: [] });
+  await p.coalescer.accept(p.occurrence('n1', { deferred: true, initial: true }));
+  // The last snapshot holds n1's batch pending, as the agent's first view.
+  const snapshot = p.coalescer.snapshot();
+  const records: CoalescingReceiptRecord[] = [];
+  p.host.recordReceipt = (record) => { records.push(structuredClone(record)); };
+  await p.coalescer.assemble('agent');
+  assert.deepEqual(p.delivered, [{ eventId: 'n1', firstView: true }], "n1's render is the agent's first view");
+  state.shown = shown;
+  await p.coalescer.accept(p.occurrence('r1', { retract: true, content: [] }));
+  state.shown = false;
+  // The host comes back two hours after the crash. Past their retry window
+  // the records' batch facts aren't read, so the snapshot's batch is back,
+  // and the end a record carries holds for it too.
+  const later = Date.now() + 2 * 3_600_000;
+  const restored = new PushCoalescer<null>({ ...p.host, now: () => later });
+  restored.restore(snapshot);
+  restored.restoreReceipts(records);
+  await restored.assemble('agent');
+  assert.deepEqual(p.delivered.at(-1), { eventId: 'n1', ...(shown ? {} : { firstView: true as const }) });
+});
+
+for (const shown of [false, true]) test(`#157: crash-window records restored after their retry window has passed ${shown ? "still end the first view, so the edit of a later initial plain occurrence is no first view" : "leave the edit of a later initial plain occurrence the first view when nothing had shown the agent the last"}`, async () => {
+  const state = { shown: false, read: false };
+  const p = firstViewProbe(state, { held: [] });
+  const records: CoalescingReceiptRecord[] = [];
+  p.host.recordReceipt = (record) => { records.push(structuredClone(record)); };
+  await firstViewRetracted(p, state, shown);
+  // The host comes back two hours after the crash: every record is past the default one-hour retry window.
+  const later = Date.now() + 2 * 3_600_000;
+  const restored = new PushCoalescer<null>({ ...p.host, now: () => later });
+  restored.restoreReceipts(records);
+  await restored.accept(p.occurrence('p1', { initial: true }));
+  const e1 = await restored.accept(p.occurrence('e1', { tags: ['chat:edited'] }));
+  assert.equal(e1.coalesce?.outcome, 'replaced', 'e1 replaced the unread p1');
+  // A birth carries no mark of its own (it isn't an edit); its edit carries the first view it hands on.
+  assert.deepEqual(p.delivered.slice(-2), [
+    { eventId: 'p1' },
+    { eventId: 'e1', ...(shown ? {} : { firstView: true as const }) },
+  ]);
+});
+
+test("#157: a receipt keeps an admission's first view in memory only, so a restored receipt has none", async () => {
+  const state = { shown: false, read: false };
+  const p = firstViewProbe(state, { held: [] });
+  await p.coalescer.accept(p.occurrence('n1', { deferred: true, initial: true }));
+  await p.coalescer.assemble('agent');
+  await p.coalescer.accept(p.occurrence('e1', { tags: ['chat:edited'] }));
+  assert.deepEqual(p.delivered.at(-1), { eventId: 'e1', firstView: true });
+  assert.equal(p.coalescer.receiptFirstView('editor', 'binding', 'e1'), true, "the receipt records e1's first view");
+  assert.equal(p.coalescer.receiptFirstView('editor', 'binding', 'n1'), false, "n1's admission delivered nothing");
+  const snapshot = p.coalescer.snapshot();
+  for (const [, entry] of snapshot.receipts) assert.deepEqual(Object.keys(entry).sort(), ['at', 'result'], "a snapshot's receipt is its declared shape");
+  const restored = new PushCoalescer<null>(p.host);
+  restored.restore(snapshot);
+  assert.equal(restored.receiptFirstView('editor', 'binding', 'e1'), false, 'a restored receipt has no first view');
+});
+
+test('#157: a plain edit that arrives while a first-view batch renders takes its place as the first view', async () => {
+  const state = { shown: false, read: false };
+  const p = firstViewProbe(state);
+  await p.coalescer.accept(p.occurrence('n1', { deferred: true, initial: true }));
+  const first = p.coalescer.assemble('agent');
+  await settles(p.renderStarted('n1'), "n1's render");
+  const e1 = await p.coalescer.accept(p.occurrence('e1', { tags: ['chat:edited'] }));
+  assert.equal(e1.coalesce?.outcome, 'replaced', 'e1 cancelled the render and took its place');
+  p.release('n1');
+  await first;
+  assert.deepEqual(p.delivered, [{ eventId: 'e1', firstView: true }]);
+});
+
+for (const shown of [false, true]) test(`#157: a notice that displaces an unread first view ${shown ? 'that something may have shown the agent opens a batch whose render is no first view' : 'that nothing has shown the agent opens a batch whose render is the first view'}`, async () => {
+  const delivered: Array<{ eventId: string; firstView?: true }> = [];
+  const r = removals();
+  const host: CoalescerHost<null> = {
+    isUnread: (p) => !r.gone(p), isUnshown: (p) => !r.gone(p) && !shown, remove: r.remove,
+    deliver: async (occ) => { delivered.push({ eventId: occ.eventId, ...(occ.firstView ? { firstView: true as const } : {}) }); return { agent: 'agent', messageId: `stored-${delivered.length}` }; },
+    wakeForBatch: async () => {}, wakeToRead: async () => {}, cancelWake: () => {}, authorized: () => true,
+    audience: async () => ['agent'],
+    render: async () => ({ content: [{ type: 'text', text: 'document_diff' }] }),
+    audit: () => {}, save: () => {},
+  };
+  const coalescer = new PushCoalescer<null>(host);
+  const occurrence = (eventId: string, flags: Partial<CoalescedOccurrence<null>>): CoalescedOccurrence<null> => ({
+    serverId: 'editor', binding: 'binding', scope: { kind: 'featureSet', id: 'doc' }, key: 'document', eventId, timestamp: TS,
+    retract: false, deferred: false, initial: false, content: [{ type: 'text', text: eventId }], event: null, ...flags,
+  });
+  await coalescer.accept(occurrence('p1', { initial: true }));
+  const notice = await coalescer.accept(occurrence('n1', { deferred: true, tags: ['chat:edited'] }));
+  assert.equal(notice.coalesce?.outcome, 'replaced', 'the notice displaced the unread birth');
+  await coalescer.assemble('agent');
+  assert.deepEqual(delivered, [{ eventId: 'p1' }, { eventId: 'n1', ...(shown ? {} : { firstView: true as const }) }]);
+});
+
+test("#157: a plain edit that takes the place of a pending notice that birthed its subject is the agent's first view, and so is an edit of that edit", async (t) => {
+  const f = await fixture({ server: { shouldTriggerInference: () => false } }); t.after(f.close);
+  // The notice waits as a batch: no turn assembles it.
+  await f.send('push/event', f.params('n1', 'fallback_text', { deferred: true, initial: true }));
+  await f.framework.runUntilIdle();
+  assert.equal(f.renders.length, 0, 'nothing rendered the notice');
+  const first = await f.send('push/event', { ...f.params('e1', 'doc_edit_one'), tags: ['chat:edited'] });
+  assert.equal(first.result.coalesce.outcome, 'replaced', "the edit took the batch's place");
+  const one = storedWith(f, 'doc_edit_one');
+  assert(one, 'the edit is stored');
+  assert(isMarked(one), "the edit is the agent's first view");
+  const second = await f.send('push/event', { ...f.params('e2', 'doc_edit_two'), tags: ['chat:edited'] });
+  assert.equal(second.result.coalesce.outcome, 'replaced', 'the second edit replaced the first, unread');
+  const two = storedWith(f, 'doc_edit_two');
+  assert(two, 'the second edit is stored');
+  assert(isMarked(two), "the second edit is the agent's first view too");
+});
+
+test("#157: a notice that births its subject and is still pending at a restart is still the agent's first view after it", async (t) => {
+  const f = await fixture({ server: { shouldTriggerInference: () => false } }); t.after(f.close);
+  await f.send('push/event', f.params('n1', 'fallback_text', { deferred: true, initial: true }));
+  await f.framework.runUntilIdle();
+  assert.equal(f.renders.length, 0, 'nothing rendered the notice');
+  await f.framework.stop(); await f.create();
+  await f.framework.runUntilIdle();
+  assert.equal(f.renders.length, 0, 'nothing rendered the notice after the restart');
+  const edit = await f.send('push/event', { ...f.params('e1', 'doc_edit_one'), tags: ['chat:edited'] });
+  assert.equal(edit.result.coalesce.outcome, 'replaced', "the edit took the restored batch's place");
+  const stored = storedWith(f, 'doc_edit_one');
+  assert(stored, 'the edit is stored');
+  assert(isMarked(stored), "the edit is the agent's first view");
+});
+
+type IncomingAnchor = { buildChannelContext: (agent?: string) => { incoming?: { channelId: string; messageId: string } } | undefined };
+const incomingAnchor = (f: Fixture) => (f.framework as unknown as { channelRegistry: IncomingAnchor }).channelRegistry.buildChannelContext('agent')?.incoming;
+
+test("#157: a channel edit that is the agent's first view moves context.incoming to its message, as the message would", async (t) => {
+  const f = await fixture({ server: { shouldTriggerInference: () => false } }); t.after(f.close); await f.register(); await f.register('other');
+  await f.send('channels/incoming', { messages: [f.channel('a1', 'question_wiht_typo', { initial: true }, 'other', 'ma')] });
+  await f.send('channels/incoming', { messages: [f.channel('b1', 'unrelated', { initial: true }, 'chat', 'mb')] });
+  assert.equal(incomingAnchor(f)?.messageId, 'mb', 'the later message is the anchor');
+  const edit = await f.send('channels/incoming', { messages: [{ ...f.channel('a2', 'question_fixed', {}, 'other', 'ma'), tags: ['chat:edited'] }] });
+  assert.equal(edit.result.results[0].coalesce.outcome, 'replaced', 'the edit replaced the question the agent had not seen');
+  assert(!('firstView' in edit.result.results[0]), "the host's mark isn't in the answer to the server");
+  assert(isMarked(storedWith(f, 'question_fixed')), "the edit is the agent's first view");
+  assert.equal(incomingAnchor(f)?.channelId, 'other', "the anchor moved to the edit's channel");
+  assert.equal(incomingAnchor(f)?.messageId, 'ma', "and to the edit's message");
+});
+
+test("#157: a channel edit that is the agent's first view moves context.incoming to its message when its acceptance is retried after a failed commit", async (t) => {
+  const f = await fixture({ server: { shouldTriggerInference: () => false } }); t.after(f.close); await f.register(); await f.register('other');
+  await f.send('channels/incoming', { messages: [f.channel('a1', 'question_wiht_typo', { initial: true }, 'other', 'ma')] });
+  await f.send('channels/incoming', { messages: [f.channel('b1', 'unrelated', { initial: true }, 'chat', 'mb')] });
+  assert.equal(incomingAnchor(f)?.messageId, 'mb', 'the later message is the anchor');
+  // The edit's acceptance commit fails once, after its delivery (R10's seam),
+  // so the server retries, and the retry is answered from the receipt.
+  const internals = f.framework as unknown as { commitCoalescingDurable: () => Promise<void> };
+  const commit = internals.commitCoalescingDurable.bind(internals);
+  internals.commitCoalescingDurable = () => { internals.commitCoalescingDurable = commit; return Promise.reject(new Error('EIO simulated')); };
+  const message = { ...f.channel('a2', 'question_fixed', {}, 'other', 'ma'), tags: ['chat:edited'] };
+  const first = await f.send('channels/incoming', { messages: [message] });
+  assert.equal(first.result.results[0].accepted, false, 'the failed commit leaves the edit unacknowledged');
+  const delivered = storedWith(f, 'question_fixed');
+  assert(isMarked(delivered), "the edit was delivered as the agent's first view");
+  assert.equal(incomingAnchor(f)?.messageId, 'mb', 'an unacknowledged acceptance moves no anchor');
+  const retry = await f.send('channels/incoming', { messages: [message] });
+  // A second admission would replace the first attempt's delivery of a2
+  // itself, and say so.
+  assert.equal(retry.result.results[0].coalesce.outcome, 'replaced');
+  assert.equal(retry.result.results[0].coalesce.priorEventId, 'a1', "the retry is answered from the first attempt's receipt");
+  assert.equal(storedWith(f, 'question_fixed')?.id, delivered!.id, 'and delivers nothing again');
+  assert(!('firstView' in retry.result.results[0]), "the host's mark isn't in the answer to the server");
+  assert.equal(incomingAnchor(f)?.channelId, 'other', "the anchor moved to the edit's channel");
+  assert.equal(incomingAnchor(f)?.messageId, 'ma', "and to the edit's message");
+});
+
+test("#157: a channel edit after an earlier edit that was the agent's first view, of a message the agent has since read, leaves context.incoming where it was", async (t) => {
+  const f = await fixture({ server: { shouldTriggerInference: () => false } }); t.after(f.close); await f.register(); await f.register('other');
+  await f.send('channels/incoming', { messages: [f.channel('a1', 'question_wiht_typo', { initial: true }, 'other', 'ma')] });
+  await f.send('channels/incoming', { messages: [f.channel('b1', 'unrelated', { initial: true }, 'chat', 'mb')] });
+  await f.send('channels/incoming', { messages: [{ ...f.channel('a2', 'question_fixed', {}, 'other', 'ma'), tags: ['chat:edited'] }] });
+  assert.equal(incomingAnchor(f)?.messageId, 'ma', "the first-view edit moved the anchor to its message");
+  await f.send('channels/incoming', { messages: [f.channel('c1', 'later', { initial: true }, 'chat', 'mc')] });
+  await f.framework.getAgent('agent')!.compileContext();
+  // Each admission records only its own delivery's mark.
+  const edit = await f.send('channels/incoming', { messages: [{ ...f.channel('a3', 'question_fixed_again', {}, 'other', 'ma'), tags: ['chat:edited'] }] });
+  assert.equal(edit.result.results[0].coalesce.outcome, 'appended', 'the agent had read the edit');
+  assert.equal(incomingAnchor(f)?.messageId, 'mc', 'the marker left the anchor at the later message');
+});
+
+test('#157: a channel edit of a message the agent has read leaves context.incoming where it was', async (t) => {
+  const f = await fixture({ server: { shouldTriggerInference: () => false } }); t.after(f.close); await f.register(); await f.register('other');
+  await f.send('channels/incoming', { messages: [f.channel('a1', 'question_wiht_typo', { initial: true }, 'other', 'ma')] });
+  await f.framework.getAgent('agent')!.compileContext();
+  await f.send('channels/incoming', { messages: [f.channel('b1', 'unrelated', { initial: true }, 'chat', 'mb')] });
+  const edit = await f.send('channels/incoming', { messages: [{ ...f.channel('a2', 'question_fixed', {}, 'other', 'ma'), tags: ['chat:edited'] }] });
+  assert.equal(edit.result.results[0].coalesce.outcome, 'appended', 'the agent had read the question');
+  assert.equal(incomingAnchor(f)?.messageId, 'mb', 'the marker left the anchor at the later message');
 });

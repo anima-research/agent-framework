@@ -93,7 +93,7 @@ test('the budget counts what is held: requests held again by a control-plane flu
   const { connection, delivered, logged, requests, answers, held } = pausedConnection(t);
   requests(REQUESTS / 2);
   // The control plane opens and the data plane stays paused, as during a
-  // reconnect or an awareness drain: every push is held again.
+  // quiesce: every push is held again.
   connection.readyControlPlane();
   assert.equal(held(), REQUESTS / 2);
   requests(REQUESTS / 2);

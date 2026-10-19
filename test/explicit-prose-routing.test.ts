@@ -26,7 +26,6 @@ import type {
 } from '../src/index.js';
 import { AgentFramework } from '../src/index.js';
 import { MockMembrane, createMockResponse } from './helpers/mock-membrane.js';
-import { ProseStreamRouter } from '../src/mcpl/prose-stream-router.js';
 import { draftState, type ProseDraftStore } from '../src/prose-drafts.js';
 import { MembraneError } from '@animalabs/membrane';
 import type { ContentBlock, NormalizedRequest } from '@animalabs/membrane';
@@ -93,8 +92,14 @@ function stubRegistry(framework: AgentFramework, plan: Array<'delivered' | 'fals
       : { status: 'failed' as const, destination, reason: 'stub reported delivered:false', at: Date.now() };
   };
   const explicit: Record<string, unknown> = {
-    resolveProseTarget: (spec: string) =>
-      known[spec] ?? { error: 'no channel matches "' + spec + '"' },
+    // As the registry does, a channel its server declared inbound-only
+    // resolves for reading but not as a target for speech.
+    resolveProseTarget: (spec: string, opts?: { forSpeech?: boolean }) =>
+      spec === '#ears'
+        ? opts?.forSpeech
+          ? { error: 'body:ears is inbound-only: server "body" declared this channel\'s direction "inbound", so the host publishes nothing into it; to speak there, use that server\'s own tools', refusedChannelId: 'body:ears' }
+          : { channelId: 'body:ears', label: 'Body · ears' }
+        : known[spec] ?? { error: 'no channel matches "' + spec + '"' },
     deliverSpeech,
     routeSpeech: async (agent: string, text: string, locus?: string | null) => {
       const outcome = await deliverSpeech(agent, text, locus);
@@ -704,13 +709,13 @@ describe('explicit prose routing', () => {
 
 
   type RoutingState = {
-    pin?: string; destination: string | null; hybridHold?: 'private' | 'failed';
+    pin?: string; hybridHold?: 'private' | 'failed';
     continuation: boolean; deliveries: string[]; suppressed: number; drafts: Array<{ id: string; text: string }>; keptPrivate: number;
     triggerChannel?: string; locus?: string; engaged: Set<string>; arrivals: Array<{ messageId: string; channelId: string }>;
   };
   /** A turn's routing state, as the framework makes a fresh one. */
   const routingState = (fields: Partial<RoutingState> = {}): RoutingState => ({
-    destination: null, continuation: false, deliveries: [], suppressed: 0, drafts: [], keptPrivate: 0,
+    continuation: false, deliveries: [], suppressed: 0, drafts: [], keptPrivate: 0,
     engaged: new Set(), arrivals: [], ...fields,
   });
 
@@ -1631,6 +1636,48 @@ describe('explicit prose routing', () => {
     await framework.stop();
   });
 
+  it("explicit mode's typing and traces stay on its trigger channel across the turn's rounds", async () => {
+    // Explicit mode has no locus: its typing and traces show where the wake
+    // came from, and only a locus or hybrid turn's follow a moved locus.
+    membrane.pushResponse(createMockResponse([
+      { type: 'tool_use', id: 't1', name: 'robot--move', input: { dir: 'north' } },
+    ] as ContentBlock[], 'tool_use'));
+    membrane.pushResponse(createMockResponse([{ type: 'text', text: '>>#alpha done' }] as ContentBlock[]));
+
+    const framework = await createFramework();
+    const routed = stubRegistry(framework);
+    const registry = (framework as unknown as { channelRegistry: Record<string, unknown> }).channelRegistry;
+    const typing: string[] = [];
+    registry.startTyping = (channelId: string) => { typing.push(`start ${channelId}`); };
+    registry.stopTyping = (channelId?: string) => { typing.push(`stop ${channelId ?? '(all)'}`); };
+    const traced = new Set<string | undefined>();
+    framework.onTrace((event) => {
+      const e = event as { type: string; blockType?: string; channelId?: string };
+      if ((e.type === 'inference:tokens' || e.type === 'inference:content_block') && e.blockType === 'text') traced.add(e.channelId);
+    });
+    const internals = framework as unknown as {
+      pendingRequests: InferenceRequest[];
+      processInferenceRequests(): Promise<void>;
+    };
+    try {
+      internals.pendingRequests.push({
+        agentName: 'assistant', reason: 'mcpl:channel-incoming', source: 'discord', timestamp: Date.now(),
+        channelId: 'chan-alpha', addressed: true,
+      });
+      await internals.processInferenceRequests();
+      await framework.runUntilIdle();
+
+      assert.equal(module.calls.length, 1, 'control: round 1 ran its tool');
+      assert.deepEqual(routed, [{ text: 'done', locus: 'chan-alpha' }], 'control: round 2 ran and was delivered');
+      assert.ok(typing.includes('start chan-alpha'), `typing showed on the trigger channel: ${JSON.stringify(typing)}`);
+      assert.equal(typing.includes('stop chan-alpha'), false, `and stayed there until the turn ended: ${JSON.stringify(typing)}`);
+      assert.ok(typing.includes('stop (all)'), 'control: the turn\'s end stopped it');
+      assert.deepEqual([...traced], ['chan-alpha'], 'round 2 is traced in the trigger channel');
+    } finally {
+      await framework.stop();
+    }
+  });
+
   it('explicit mode streams nothing before a destination: unprefixed text never reaches the trigger channel', async () => {
     membrane.pushResponse(createMockResponse([
       { type: 'text', text: 'Unprefixed musing.\n>>#alpha streamed after the prefix' },
@@ -1663,7 +1710,7 @@ describe('explicit prose routing', () => {
     await framework.stop();
   });
 
-  it('the stream reads leading whitespace and a token\'s end as delivery does', async () => {
+  it("delivery reads leading whitespace and a token's end before a `>>` prefix", async () => {
     const framework = await createFramework();
     const routed = stubRegistry(framework);
     const gateway = framework as unknown as { deliverProse(agent: unknown, text: string): Promise<void> };
@@ -1673,61 +1720,23 @@ describe('explicit prose routing', () => {
       for (const text of cases) {
         routed.length = 0;
         await gateway.deliverProse(agent, text);
-        const router = new ProseStreamRouter({
-          mode: 'explicit', initialTarget: null, resolve: (spec) => (spec === '#alpha' ? 'chan-alpha' : null),
-        });
-        const streamed = [...router.feed(text), ...router.finish()];
-        assert.deepEqual(routed.map((r) => r.locus), ['chan-alpha'], `delivery sends ${JSON.stringify(text)} to #alpha`);
-        assert.ok(streamed.length > 0 && streamed.every((d) => d.channelId === 'chan-alpha'),
-          `the stream sends ${JSON.stringify(text)} there too`);
+        assert.deepEqual(routed.map((r) => ({ text: r.text.trim(), locus: r.locus })), [{ text: 'hello', locus: 'chan-alpha' }],
+          `delivery sends the body of ${JSON.stringify(text)} to #alpha`);
       }
     } finally {
       await framework.stop();
     }
   });
 
-  it("a round's destination, decided at its boundary, is the sticky destination its delivery leaves", async () => {
-    const framework = await createFramework();
-    stubRegistry(framework);
-    const internals = framework as unknown as {
-      deliverProse(agent: unknown, text: string): Promise<void>;
-      admitProse(text: string): unknown[];
-      roundDestination(current: string | null, envelopes: unknown[]): string | null;
-      turnRouting: Map<string, RoutingState>;
-    };
-    const agent = framework.getAgent('assistant')!;
-    const rounds: string[][] = [
-      ['>>#alpha first\n>>#alpha'],
-      ['  >>#alpha indented'],
-      ['>>#nowhere bounced'],
-      ['>>skip_reply kept\nand unprefixed'],
-      ['unprefixed', '>>#alpha second segment'],
-    ];
-    try {
-      for (const segments of rounds) {
-        for (const start of [null, 'chan-alpha']) {
-          internals.turnRouting.set('assistant', routingState({ pin: start ?? undefined }));
-          for (const segment of segments) await internals.deliverProse(agent, segment);
-          const admitted = segments.flatMap((segment) => internals.admitProse(segment));
-          assert.equal(internals.roundDestination(start, admitted), internals.turnRouting.get('assistant')?.pin ?? null,
-            `${JSON.stringify(segments)} from ${start}`);
-        }
-      }
-    } finally {
-      await framework.stop();
-    }
-  });
-
-  it('hybrid: a `>>>` envelope with no target streams nothing, as delivery bounces it', async () => {
+  it('hybrid: a `>>>` envelope with no target publishes nothing, so nothing streams, and holds the turn that queued it', async () => {
     const framework = await createFramework('hybrid');
     const routed = stubRegistry(framework);
     const gateway = framework as unknown as {
-      deliverHybridProse(agent: unknown, text: string, locus: string, allowLocus: boolean, round: { routing: RoutingState; notice: 'later' }): Promise<void>;
+      deliverHybridProse(agent: unknown, text: string, locus: string, allowLocus: boolean,
+        round: { routing: RoutingState; notice: 'later'; onPublished?: (channelId: string, text: string) => void }): Promise<void>;
       turnRouting: Map<string, RoutingState>;
     };
     const agent = framework.getAgent('assistant')!;
-    // The registry's resolver trims its argument, as the router's must here.
-    const resolve = (spec: string) => (spec.trim() === '#alpha' ? 'chan-alpha' : null);
     const cases = ['>>>\r\nsecret', '>>>\nsecret', '>>>\u00a0#alpha secret', '>>> \u00a0#alpha secret'];
     try {
       for (const text of cases) {
@@ -1735,50 +1744,50 @@ describe('explicit prose routing', () => {
         const queued: RoutingState = routingState();
         const live: RoutingState = routingState();
         gateway.turnRouting.set('assistant', live);
-        await gateway.deliverHybridProse(agent, text, 'chan-locus', true, { routing: queued, notice: 'later' });
+        const streamed: string[] = [];
+        await gateway.deliverHybridProse(agent, text, 'chan-locus', true,
+          { routing: queued, notice: 'later', onPublished: (_channel, body) => streamed.push(body) });
         assert.equal(queued.hybridHold, 'failed', 'the supplied turn receives the hold');
         assert.equal(live.hybridHold, undefined, 'the live turn stays unheld');
-        const router = new ProseStreamRouter({ mode: 'hybrid', initialTarget: 'chan-locus', resolve });
-        const streamed = [...router.feed(text), ...router.finish()];
         assert.equal(routed.length, 0, `delivery bounces ${JSON.stringify(text)}`);
-        assert.deepEqual(streamed, [], `and the stream sends none of ${JSON.stringify(text)}`);
+        assert.deepEqual(streamed, [], `and the stream hears none of ${JSON.stringify(text)}`);
       }
     } finally {
       await framework.stop();
     }
   });
 
-  it('hybrid: a segment that is only `>>>`, or `>>>` and a gap, holds back the next segment, as delivery does', async () => {
+  it('hybrid: a segment that is only `>>>`, or `>>>` and a gap, holds back the next segment, from delivery and the stream alike', async () => {
     const framework = await createFramework('hybrid');
     const routed = stubRegistry(framework);
     const gateway = framework as unknown as {
-      deliverHybridProse(agent: unknown, text: string, locus: string, allowLocus: boolean, round: { routing: RoutingState; notice: 'later' }): Promise<void>;
+      deliverHybridProse(agent: unknown, text: string, locus: string, allowLocus: boolean,
+        round: { routing: RoutingState; notice: 'later'; onPublished?: (channelId: string, text: string) => void }): Promise<void>;
       turnRouting: Map<string, RoutingState>;
     };
     const agent = framework.getAgent('assistant')!;
-    const resolve = (spec: string) => (spec.trim() === '#alpha' ? 'chan-alpha' : null);
     try {
       for (const prefix of ['>>>', '>>> ', '>>>\t']) {
         routed.length = 0;
         const queued: RoutingState = routingState();
         const live: RoutingState = routingState();
         gateway.turnRouting.set('assistant', live);
-        await gateway.deliverHybridProse(agent, '>>>#alpha first', 'chan-locus', true, { routing: queued, notice: 'later' });
-        await gateway.deliverHybridProse(agent, prefix, 'chan-locus', true, { routing: queued, notice: 'later' });
-        await gateway.deliverHybridProse(agent, 'secret', 'chan-locus', true, { routing: queued, notice: 'later' });
+        const streamed: Array<{ channelId: string; text: string }> = [];
+        const round = {
+          routing: queued,
+          notice: 'later' as const,
+          onPublished: (channelId: string, text: string) => { streamed.push({ channelId, text }); },
+        };
+        await gateway.deliverHybridProse(agent, '>>>#alpha first', 'chan-locus', true, round);
+        await gateway.deliverHybridProse(agent, prefix, 'chan-locus', true, round);
+        await gateway.deliverHybridProse(agent, 'secret', 'chan-locus', true, round);
         assert.deepEqual(queued.deliveries, ['chan-alpha'], 'the supplied turn records its delivery');
         assert.ok(queued.drafts.some((d) => d.text === 'secret'), 'the supplied turn holds the held-back segment as its draft');
         assert.deepEqual(live.deliveries, [], 'the live turn receives no delivery');
         assert.deepEqual(live.drafts, [], 'the live turn holds no draft');
-        const router = new ProseStreamRouter({ mode: 'hybrid', initialTarget: 'chan-locus', resolve });
-        const streamed = [
-          ...router.feed('>>>#alpha first'), ...router.endSegment(),
-          ...router.feed(prefix), ...router.endSegment(),
-          ...router.feed('secret'), ...router.finish(),
-        ];
         assert.deepEqual(routed.map((r) => r.text), ['first'], `delivery sends only first, after ${JSON.stringify(prefix)}`);
-        assert.equal(streamed.filter((d) => d.delta.includes('secret')).length, 0,
-          `and the stream holds secret back after ${JSON.stringify(prefix)}`);
+        assert.deepEqual(streamed, [{ channelId: 'chan-alpha', text: 'first' }],
+          `and the stream hears first, where it was published, and holds secret back after ${JSON.stringify(prefix)}`);
       }
     } finally {
       await framework.stop();
@@ -1804,6 +1813,25 @@ describe('explicit prose routing', () => {
       assert.deepEqual(queued.drafts.map((d) => d.text), ['held words', 'after it'], "and holds the round's words as its drafts");
       assert.equal(live.hybridHold, undefined, 'the live turn is untouched');
       assert.deepEqual(live.drafts, [], 'and holds no draft of that round');
+    } finally {
+      await framework.stop();
+    }
+  });
+
+  it('hybrid: a hold beside a send refuses a >>> target its server declared inbound-only, as delivery does, and drops the pin before it', async () => {
+    const framework = await createFramework('hybrid');
+    stubRegistry(framework);
+    const gateway = framework as unknown as {
+      holdSilencedProse(agent: unknown, segments: string[], cause: 'send', privateThink: boolean, round: { routing: RoutingState; notice: 'later' }): void;
+    };
+    const agent = framework.getAgent('assistant')!;
+    try {
+      // An earlier round of the turn pinned #alpha.
+      const routing: RoutingState = routingState({ pin: 'chan-alpha' });
+      gateway.holdSilencedProse(agent, ['>>>#ears for the room', 'after it'], 'send', false, { routing, notice: 'later' });
+      assert.equal(routing.pin, undefined, 'the inbound-only channel is never pinned, and the earlier pin is dropped');
+      assert.equal(routing.hybridHold, 'failed', 'the envelope fails as a refused target does at delivery');
+      assert.deepEqual(routing.drafts.map((d) => d.text), ['for the room', 'after it'], 'and the words are held as drafts');
     } finally {
       await framework.stop();
     }
@@ -1989,6 +2017,24 @@ describe('explicit prose routing', () => {
     await framework.stop();
   });
 
+  it('the hybrid and locus primers say plain text goes to the locus unless its server declared that channel inbound-only', async () => {
+    const framework = await createFramework('hybrid');
+    const agent = framework.getAgent('assistant')!;
+    const prime = (framework as unknown as { maybePrimeProseMode(agent: unknown): void }).maybePrimeProseMode.bind(framework);
+    prime(agent);
+    // The agent's mode is set from its config; a later config change is what
+    // brings the locus primer.
+    (agent as unknown as { proseRouting: string }).proseRouting = 'locus';
+    prime(agent);
+    const primers = agent.getContextManager().getAllMessages().flatMap(m => m.content)
+      .filter(b => b.type === 'text').map(b => (b as { text: string }).text)
+      .filter(t => t.startsWith('[prose-routing]'));
+    assert.equal(primers.length, 2, String(primers));
+    assert.match(primers[0]!, /^\[prose-routing\] Hybrid routing enabled: unprefixed text still lands in the current conversational locus, unless its server declared that channel inbound-only\. /);
+    assert.match(primers[1]!, /^\[prose-routing\] Mode change: your plain text auto-routes to the conversational locus again, unless its server declared that channel inbound-only\. /);
+    await framework.stop();
+  });
+
   it('prose_help tool returns the routing reference on demand', async () => {
     membrane.pushResponse(createMockResponse([
       { type: 'tool_use', id: 'c1', name: 'prose_help', input: {} },
@@ -2005,8 +2051,30 @@ describe('explicit prose routing', () => {
 
     const stream = membrane.lastStream!;
     assert.equal(stream.receivedToolResults.length, 1);
-    const result = JSON.stringify(stream.receivedToolResults[0]);
-    assert.ok(result.includes('destination'), 'help text served as tool result');
+    const strings: string[] = [];
+    JSON.stringify(stream.receivedToolResults[0], (_key, value) => {
+      if (typeof value === 'string') strings.push(value);
+      return value;
+    });
+    // The help is the agent's only full reference for a destination's rule,
+    // so each of its clauses is pinned, read across the text's line breaks.
+    // The result's content is the help as a JSON string, so it's decoded first.
+    const decoded = strings.map((s) => {
+      try {
+        const value: unknown = JSON.parse(s);
+        return typeof value === 'string' ? value : s;
+      } catch {
+        return s;
+      }
+    });
+    const help = decoded.join(' ').replace(/\s+/g, ' ');
+    for (const clause of [
+      'A destination applies to the rest of that turn, until another is named.',
+      'A name that matches no channel, or several, bounces and leaves it as it was.',
+      'A channel its server declared inbound-only is refused, and clears it.',
+    ]) {
+      assert.ok(help.includes(clause), `the help says: ${clause}`);
+    }
     assert.deepEqual(routed, [{ text: 'got it', locus: 'chan-alpha' }]);
 
     await framework.stop();
@@ -2047,6 +2115,268 @@ describe('explicit prose routing', () => {
     assert.ok(texts.includes('[delivered] plain speech → discord:g:cafe'), 'canonical destination receipt enters context');
     await framework.stop();
   });
+
+  for (const [mode, authored] of [
+    ['hybrid', '>>>#ears\nHello, room.'],
+    ['explicit', '>>#ears Hello, room.'],
+  ] as const) {
+    it(`${mode}: a target its server declared inbound-only bounces with that reason and publishes nothing`, async () => {
+      membrane.pushResponse(createMockResponse([{ type: 'text', text: authored }] as ContentBlock[]));
+      const framework = await createFramework(mode);
+      const routed = stubRegistry(framework);
+      feedTurn(framework, 2, [{ type: 'text', text: (mode === 'hybrid' ? '>>>' : '>>') + 'skip_reply {{unsent}}' }] as ContentBlock[]);
+      trigger(framework);
+      await framework.runUntilIdle();
+      assert.deepEqual(routed, [], 'nothing was published');
+      const texts = framework.getAgent('assistant')!.getContextManager().getAllMessages().flatMap(m => m.content)
+        .filter(b => b.type === 'text').map(b => (b as { text: string }).text);
+      const bounce = texts.find(t => t.startsWith('[prose-routing]') && t.includes('not delivered'));
+      assert.ok(bounce, 'the text bounced');
+      assert.ok(bounce!.includes('body:ears is inbound-only: server "body" declared'), `the bounce gives the declaration: ${bounce}`);
+      assert.ok(!bounce!.includes('was not confirmed'), `the bounce doesn't call it an unconfirmed delivery: ${bounce}`);
+      await framework.stop();
+    });
+  }
+
+  it("explicit: a target refused for speech clears the turn's destination, so later unprefixed text bounces rather than going to the earlier one", async () => {
+    // Anarchid's probe (agent-framework#350, R1-1): the turn names #alpha,
+    // then #ears, which its server declared inbound-only, then writes on
+    // without a prefix. That text was meant for the room, not #alpha.
+    membrane.pushResponse(createMockResponse([
+      { type: 'text', text: '>>#alpha first' },
+      { type: 'tool_use', id: 'c1', name: 'robot--move', input: { dir: 'north' } },
+    ] as ContentBlock[], 'tool_use'));
+    membrane.pushResponse(createMockResponse([
+      { type: 'text', text: '>>#ears for the room' },
+      { type: 'tool_use', id: 'c2', name: 'robot--move', input: { dir: 'south' } },
+    ] as ContentBlock[], 'tool_use'));
+    membrane.pushResponse(createMockResponse([
+      { type: 'text', text: 'and more for the room' },
+    ] as ContentBlock[]));
+    const framework = await createFramework('explicit');
+    const routed = stubRegistry(framework);
+    // The wakes the bounces ask for set the retained text aside.
+    feedTurn(framework, 2, [{ type: 'text', text: '>>skip_reply' }] as ContentBlock[]);
+    trigger(framework);
+    await framework.runUntilIdle();
+    assert.deepEqual(routed, [{ text: 'first', locus: 'chan-alpha' }], 'only the text before the refusal was published');
+    const bounces = framework.getAgent('assistant')!.getContextManager().getAllMessages().flatMap(m => m.content)
+      .filter(b => b.type === 'text').map(b => (b as { text: string }).text)
+      .filter(t => t.startsWith('[prose-routing]') && t.includes('not delivered'));
+    assert.ok(bounces.some(t => t.includes('body:ears is inbound-only')), `the refused target bounced with its reason: ${bounces.join(' | ')}`);
+    assert.ok(bounces.some(t => t.includes('this turn has no destination now')), `the later unprefixed text bounced: ${bounces.join(' | ')}`);
+    await framework.stop();
+  });
+
+  it("explicit: text routed to a channel its server declared inbound-only isn't streamed there, or sent at the stream's end", async () => {
+    // The round's delivery refuses #ears and bounces its text. The stream
+    // took it as it was written, and its end would send it should the server
+    // lift the declaration before the stream ends.
+    membrane.pushResponse(createMockResponse([
+      { type: 'text', text: '>>#ears for the room' },
+      { type: 'tool_use', id: 'c1', name: 'robot--move', input: { dir: 'north' } },
+    ] as ContentBlock[], 'tool_use'));
+    membrane.pushResponse(createMockResponse([
+      { type: 'text', text: '>>#alpha done' },
+    ] as ContentBlock[]));
+    const framework = await createFramework('explicit');
+    stubRegistry(framework);
+    const registry = (framework as unknown as { channelRegistry: Record<string, unknown> }).channelRegistry;
+    registry.inboundOnlyServer = (channelId: string) => (channelId === 'body:ears' ? 'body' : undefined);
+    const chunks: Array<{ channelId: string; delta: string }> = [];
+    const completes: Array<{ channelId: string; text: string }> = [];
+    registry.sendOutgoingChunk = (channelId: string, _agent: string, _inference: string, _index: number, delta: string) => {
+      chunks.push({ channelId, delta });
+    };
+    registry.sendOutgoingComplete = (channelId: string, _agent: string, _inference: string, text: string) => {
+      completes.push({ channelId, text });
+    };
+    feedTurn(framework, 2, [{ type: 'text', text: '>>skip_reply' }] as ContentBlock[]);
+    trigger(framework);
+    await framework.runUntilIdle();
+    assert.deepEqual(chunks.filter((c) => c.channelId === 'body:ears'), [], 'nothing is streamed to the inbound-only channel');
+    assert.deepEqual(completes, [{ channelId: 'chan-alpha', text: 'done' }], "the stream's end sends only what the stream routed and kept");
+    await framework.stop();
+  });
+
+  for (const refusal of ['inbound-only', 'inbound-only, unconfirmed', 'another failure', 'another failure, unconfirmed', 'delivered, then declared'] as const) {
+    const inboundOnly = refusal.startsWith('inbound-only');
+    it(`explicit: a delivery that ${refusal === 'delivered, then declared' ? 'is delivered while the channel turns inbound-only' : `fails (${refusal})`} ${inboundOnly ? "clears the turn's destination, as a refusal at admission does" : 'keeps the destination, as before'}`, async () => {
+      // #alpha resolves when the round is admitted. By its delivery, its
+      // server has declared it inbound-only (as a channels/changed, or the
+      // answer to opening it, can), or the publish fails some other way.
+      membrane.pushResponse(createMockResponse([
+        { type: 'text', text: '>>#alpha first' },
+        { type: 'tool_use', id: 'c1', name: 'robot--move', input: { dir: 'north' } },
+      ] as ContentBlock[], 'tool_use'));
+      membrane.pushResponse(createMockResponse([
+        { type: 'text', text: 'and more' },
+      ] as ContentBlock[]));
+      const framework = await createFramework('explicit');
+      const routed = stubRegistry(framework);
+      const registry = (framework as unknown as { channelRegistry: Record<string, unknown> }).channelRegistry;
+      const declared = new Set<string>();
+      registry.inboundOnlyServer = (channelId: string) => (declared.has(channelId) ? 'body' : undefined);
+      // The turn's routing, as its first delivery sees it.
+      let turn: { pin?: string } | undefined;
+      registry.deliverSpeech = async (_agent: string, text: string, locus?: string | null) => {
+        turn ??= (framework as unknown as { turnRouting: Map<string, { pin?: string }> }).turnRouting.get('assistant');
+        routed.push({ text, locus: locus ?? null });
+        if (inboundOnly || refusal === 'delivered, then declared') declared.add(locus ?? '');
+        const destination = { serverId: 'stub', channelId: locus ?? '' };
+        if (refusal === 'delivered, then declared') return { status: 'delivered', destination, at: Date.now() };
+        // A publish that may have been posted, as one that timed out may.
+        if (refusal.endsWith('unconfirmed')) return { status: 'unknown', destination, reason: 'channels/publish timed out (delivery uncertain)', at: Date.now() };
+        return { status: 'failed', destination, reason: inboundOnly ? 'inbound-only: server "body" declared it' : 'stub refused', at: Date.now() };
+      };
+      feedTurn(framework, 2, [{ type: 'text', text: '>>skip_reply' }] as ContentBlock[]);
+      trigger(framework);
+      await framework.runUntilIdle();
+      const bounces = context(framework).texts.filter((t) => t.startsWith('[prose-routing]') && t.includes('not delivered'));
+      if (inboundOnly) {
+        assert.deepEqual(routed, [{ text: 'first', locus: 'chan-alpha' }], 'the later text never went to the refused channel');
+        assert.ok(bounces.some((t) => t.includes('this turn has no destination now')), `the later text bounced: ${bounces.join(' | ')}`);
+        assert.equal(turn?.pin, undefined, 'the destination later text would follow ends');
+      } else {
+        assert.deepEqual(routed, [{ text: 'first', locus: 'chan-alpha' }, { text: 'and more', locus: 'chan-alpha' }]);
+        // Each failed delivery bounces its own words; none bounces for want of a destination.
+        assert.equal(bounces.filter((t) => t.includes('delivery to chan-alpha failed')).length, refusal === 'another failure' ? 2 : 0);
+        assert.equal(bounces.some((t) => t.includes('this turn has no destination now')), false);
+        assert.equal(turn?.pin, 'chan-alpha');
+      }
+      await framework.stop();
+    });
+  }
+
+  it('explicit: a refusal at delivery leaves the pin when another delivery has moved it off the refused channel', async () => {
+    // The pin ends only while it still names the refused channel. Here
+    // another delivery (as a replaced stream's queued one can) moves it to
+    // #cafe during #alpha's delivery, so it stays.
+    membrane.pushResponse(createMockResponse([
+      { type: 'text', text: '>>#alpha first' },
+      { type: 'tool_use', id: 'c1', name: 'robot--move', input: { dir: 'north' } },
+    ] as ContentBlock[], 'tool_use'));
+    membrane.pushResponse(createMockResponse([
+      { type: 'text', text: 'and more' },
+    ] as ContentBlock[]));
+    const framework = await createFramework('explicit');
+    const routed = stubRegistry(framework);
+    const registry = (framework as unknown as { channelRegistry: Record<string, unknown> }).channelRegistry;
+    const declared = new Set<string>();
+    registry.inboundOnlyServer = (channelId: string) => (declared.has(channelId) ? 'body' : undefined);
+    let turn: { pin?: string } | undefined;
+    let atFailure: { pin?: string } | undefined;
+    registry.deliverSpeech = async (_agent: string, text: string, locus?: string | null) => {
+      turn ??= (framework as unknown as { turnRouting: Map<string, { pin?: string }> }).turnRouting.get('assistant');
+      routed.push({ text, locus: locus ?? null });
+      const destination = { serverId: 'stub', channelId: locus ?? '' };
+      if (locus === 'chan-alpha') {
+        turn!.pin = 'discord:g:cafe';
+        atFailure = { pin: turn!.pin };
+        declared.add('chan-alpha');
+        return { status: 'failed', destination, reason: 'inbound-only: server "body" declared it', at: Date.now() };
+      }
+      return { status: 'delivered', destination, at: Date.now() };
+    };
+    feedTurn(framework, 2, [{ type: 'text', text: '>>skip_reply' }] as ContentBlock[]);
+    trigger(framework);
+    await framework.runUntilIdle();
+    assert.deepEqual(atFailure, { pin: 'discord:g:cafe' }, 'the state the clear met');
+    assert.equal(turn?.pin, 'discord:g:cafe', 'the moved pin stays');
+    assert.deepEqual(routed, [{ text: 'first', locus: 'chan-alpha' }, { text: 'and more', locus: 'discord:g:cafe' }]);
+    await framework.stop();
+  });
+
+  it("explicit: a delivery refused while a later round waits behind it leaves that round its own destination", async () => {
+    // Greta-2425's probe. Deliveries queue behind each other, and the turn
+    // goes on without waiting, so round 2's >>#cafe is admitted before round
+    // 1's delivery to #alpha fails. The clear ends only the pin #alpha set,
+    // and round 2's delivery then pins #cafe for the text after it.
+    membrane.pushResponse(createMockResponse([
+      { type: 'text', text: '>>#alpha first' },
+      { type: 'tool_use', id: 'c1', name: 'robot--move', input: { dir: 'north' } },
+    ] as ContentBlock[], 'tool_use'));
+    membrane.pushResponse(createMockResponse([
+      { type: 'text', text: '>>#cafe second' },
+      { type: 'tool_use', id: 'c2', name: 'robot--move', input: { dir: 'south' } },
+    ] as ContentBlock[], 'tool_use'));
+    membrane.pushResponse(createMockResponse([
+      { type: 'text', text: 'and more' },
+    ] as ContentBlock[]));
+    const framework = await createFramework('explicit');
+    const routed = stubRegistry(framework);
+    const registry = (framework as unknown as { channelRegistry: Record<string, unknown> }).channelRegistry;
+    const declared = new Set<string>();
+    registry.inboundOnlyServer = (channelId: string) => (declared.has(channelId) ? 'body' : undefined);
+    const turnOf = () => (framework as unknown as { turnRouting: Map<string, { pin?: string }> }).turnRouting.get('assistant');
+    let turn: { pin?: string } | undefined;
+    // MockMembrane gives a turn's rounds to its one stream, so a round's
+    // tool calls, not the membrane's calls, show how far the turn has got.
+    let toolRounds = 0;
+    framework.onTrace((e) => { if ((e as { type: string }).type === 'inference:tool_calls_yielded') toolRounds++; });
+    let roundsAtFailure = 0;
+    registry.deliverSpeech = async (_agent: string, text: string, locus?: string | null) => {
+      turn ??= turnOf();
+      routed.push({ text, locus: locus ?? null });
+      const destination = { serverId: 'stub', channelId: locus ?? '' };
+      if (locus === 'chan-alpha') {
+        // Hold #alpha's delivery until round 2 is admitted, as its tool calls
+        // show, then refuse it: its server has declared it inbound-only by
+        // now.
+        const deadline = Date.now() + 3000;
+        while (toolRounds < 2 && Date.now() < deadline) await new Promise((r) => setTimeout(r, 5));
+        roundsAtFailure = toolRounds;
+        declared.add('chan-alpha');
+        return { status: 'failed', destination, reason: 'inbound-only: server "body" declared it', at: Date.now() };
+      }
+      return { status: 'delivered', destination, at: Date.now() };
+    };
+    feedTurn(framework, 2, [{ type: 'text', text: '>>skip_reply' }] as ContentBlock[]);
+    trigger(framework);
+    await framework.runUntilIdle();
+    assert.ok(roundsAtFailure >= 2, `round 2 was admitted before #alpha refused (${roundsAtFailure} tool rounds)`);
+    assert.deepEqual(routed, [
+      { text: 'first', locus: 'chan-alpha' },
+      { text: 'second', locus: 'discord:g:cafe' },
+      { text: 'and more', locus: 'discord:g:cafe' },
+    ]);
+    assert.equal(turn?.pin, 'discord:g:cafe');
+    await framework.stop();
+  });
+
+  for (const [final, kept] of [['>>#ears ! for the room', false], ['>>#cafe ! for the room', true]] as const) {
+    it(`explicit: a turn's final text (${kept ? 'its target kept' : 'its target refused'}) reaches nothing of its ' !' continuation, which starts a turn of its own`, async () => {
+      // The turn's final text is delivered after the turn settles, so its
+      // pin doesn't carry into the continuation: that's a new turn, with no
+      // destination.
+      membrane.pushResponse(createMockResponse([
+        { type: 'text', text: '>>#alpha first' },
+        { type: 'tool_use', id: 'c1', name: 'robot--move', input: { dir: 'north' } },
+      ] as ContentBlock[], 'tool_use'));
+      membrane.pushResponse(createMockResponse([
+        { type: 'text', text: final },
+      ] as ContentBlock[]));
+      const framework = await createFramework('explicit');
+      const routed = stubRegistry(framework);
+      const stream = captureStream(framework);
+      feedTurn(framework, 2, [{ type: 'text', text: 'and more for the room' }] as ContentBlock[]);
+      feedTurn(framework, 3, [{ type: 'text', text: '>>skip_reply' }] as ContentBlock[]);
+      feedTurn(framework, 4, [{ type: 'text', text: '>>skip_reply' }] as ContentBlock[]);
+      trigger(framework);
+      await framework.runUntilIdle();
+      // The first turn makes two calls, its tool round and its final text.
+      assert.ok(membrane.calls.length >= 3, `the continuation ran (${membrane.calls.length} calls)`);
+      assert.deepEqual(routed, kept
+        ? [{ text: 'first', locus: 'chan-alpha' }, { text: 'for the room', locus: 'discord:g:cafe' }]
+        : [{ text: 'first', locus: 'chan-alpha' }]);
+      const continuation = stream.chunks.filter((c) => c.delta.includes('and more')).map((c) => c.channelId);
+      assert.deepEqual(continuation, [], 'the continuation streamed nothing anywhere');
+      assert.equal(stream.completes.some((c) => c.text.includes('and more')), false);
+      const bounces = context(framework).texts.filter((t) => t.startsWith('[prose-routing]') && t.includes('not delivered'));
+      assert.ok(bounces.some((t) => t.includes('this turn has no destination now')), `the continuation's text bounced: ${bounces.join(' | ')}`);
+      await framework.stop();
+    });
+  }
 
   it('hybrid leaves unprefixed prose on the frozen locus', async () => {
     membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Ordinary field speech.' }] as ContentBlock[]));
@@ -2236,8 +2566,8 @@ describe('explicit prose routing', () => {
   // ---- A start that continues a logical turn keeps the turn's routing ----
   // A framework retry after a stream error, the compile a provider-capacity
   // hold defers a turn to, and the re-inference that consumes unstreamed tool
-  // results each continue the turn: the sticky destination, explicit mode's
-  // turn destination and hybrid's hold carry into the new stream.
+  // results each continue the turn: the sticky destination and hybrid's hold
+  // carry into the new stream, which streams what its deliveries publish.
 
   /** An organization acceleration 429, which holds the turn for a later compile. */
   const accelerationLimit = (request: NormalizedRequest): MembraneError => new MembraneError({
@@ -2318,7 +2648,7 @@ describe('explicit prose routing', () => {
     for (const [label, mode, first, expected] of [
       ['hybrid >>>skip_reply keeps later unprefixed prose private', 'hybrid', '>>>skip_reply an aside', []],
       ['hybrid >>>#alpha is sticky', 'hybrid', '>>>#alpha first', [{ text: 'first', locus: 'chan-alpha' }, { text: 'carrying on', locus: 'chan-alpha' }]],
-      ['explicit >>#alpha is sticky, and the stream starts at the turn\'s destination', 'explicit', '>>#alpha first', [{ text: 'first', locus: 'chan-alpha' }, { text: 'carrying on', locus: 'chan-alpha' }]],
+      ['explicit >>#alpha is sticky, and the later stream streams where delivery publishes', 'explicit', '>>#alpha first', [{ text: 'first', locus: 'chan-alpha' }, { text: 'carrying on', locus: 'chan-alpha' }]],
     ] as const) {
       it(`across ${start}, ${label}`, async () => {
         const { framework, routed, bounces, laterChunks } = await continueTurn(how, mode, first);
@@ -2326,11 +2656,11 @@ describe('explicit prose routing', () => {
           // Publication as the registry stub saw it; bounce notices by their kind.
           assert.deepEqual(routed.map((r) => ({ text: r.text.trim(), locus: r.locus })), expected);
           assert.equal(bounces, 0, 'nothing bounced');
-          if (mode === 'explicit') {
-            // The later stream streams its unprefixed text where delivery sends it.
-            assert.deepEqual(laterChunks.map((c) => c.channelId), laterChunks.map(() => 'chan-alpha'));
-            assert.equal(laterChunks.map((c) => c.delta).join(''), 'carrying on');
-          }
+          // In every mode, the later stream streams what it published, where
+          // it published it: nothing under a hold, and its unprefixed text at
+          // the sticky destination.
+          assert.deepEqual(laterChunks.map((c) => ({ text: c.delta, locus: c.channelId })),
+            expected.filter((post) => post.text === 'carrying on'));
         } finally {
           await framework.stop();
         }
@@ -2341,7 +2671,7 @@ describe('explicit prose routing', () => {
   for (const [label, mode, left, expected] of [
     ['hybrid: the hold keeps later unprefixed prose private', 'hybrid', { hybridHold: 'private', locus: 'world:commons' }, []],
     ['hybrid: the sticky destination', 'hybrid', { pin: 'chan-alpha', locus: 'world:commons' }, [{ text: 'carrying on', locus: 'chan-alpha' }]],
-    ['explicit: the sticky destination, and the stream starts at the turn\'s destination', 'explicit', { pin: 'chan-alpha', destination: 'chan-alpha' }, [{ text: 'carrying on', locus: 'chan-alpha' }]],
+    ['explicit: the sticky destination, and the stream streams where delivery publishes', 'explicit', { pin: 'chan-alpha' }, [{ text: 'carrying on', locus: 'chan-alpha' }]],
   ] as const) {
     it(`a re-inference on unstreamed tool results keeps the turn's routing: ${label}`, async () => {
       membrane.pushResponse(createMockResponse([{ type: 'text', text: 'carrying on' }] as ContentBlock[]));
@@ -2364,10 +2694,9 @@ describe('explicit prose routing', () => {
         await within(framework.runUntilIdle(), 'the re-inference', 10000);
         assert.deepEqual(routed.map((r) => ({ text: r.text.trim(), locus: r.locus })), expected);
         assert.equal(context(framework).bounces, 0, 'nothing bounced');
-        if (mode === 'explicit') {
-          assert.deepEqual(chunks.map((c) => c.channelId), chunks.map(() => 'chan-alpha'));
-          assert.equal(chunks.map((c) => c.delta).join(''), 'carrying on');
-        }
+        // In every mode, the re-inference streams what it published, where it
+        // published it.
+        assert.deepEqual(chunks.map((c) => ({ text: c.delta, locus: c.channelId })), expected);
       } finally {
         await framework.stop();
       }
@@ -2391,7 +2720,7 @@ describe('explicit prose routing', () => {
       const cm = framework.getAgent('assistant')!.getContextManager();
       const getMessage = cm.getMessage.bind(cm);
       try {
-        const earlier = routingState({ pin: 'chan-alpha', destination: 'chan-alpha' });
+        const earlier = routingState({ pin: 'chan-alpha' });
         internals.turnRouting.set('assistant', earlier);
         internals.openLogical.set('assistant', earlier);
         // Someone addresses the agent from another channel while the turn waits.
@@ -2446,12 +2775,10 @@ describe('explicit prose routing', () => {
         if (text.trim() === 'zero') await held;
       });
       let starts = 0;
-      let retryChunks = 0;
       framework.onTrace((event) => {
         if (event.type !== 'inference:started') return;
         starts++;
         if (starts === 2) {
-          retryChunks = chunks.length;
           membrane.pushResponse(createMockResponse([{ type: 'text', text: 'carrying on' }]));
         }
         if (starts >= 3) membrane.pushResponse(createMockResponse([{ type: 'text', text: `${p}skip_reply` }]));
@@ -2488,7 +2815,6 @@ describe('explicit prose routing', () => {
         const routing = internals.turnRouting.get('assistant')!;
         if (mode === 'explicit') {
           assert.equal(routing.pin, 'discord:g:cafe', "round two's delivery hasn't run yet");
-          assert.equal(routing.destination, 'chan-alpha', 'though round two set the destination as it ended');
         } else {
           assert.equal(routing.hybridHold, undefined, "round two's delivery hasn't run yet");
         }
@@ -2501,11 +2827,16 @@ describe('explicit prose routing', () => {
             { text: 'first', locus: 'chan-alpha' },
             { text: 'carrying on', locus: 'chan-alpha' },
           ], "the replaced stream's posts go first, and the retry's text follows the destination they set");
-          assert.deepEqual(chunks.slice(retryChunks).map((c) => c.channelId), chunks.slice(retryChunks).map(() => 'chan-alpha'),
-            "the retry's stream starts at the destination round two set");
+          assert.deepEqual(chunks.map((c) => ({ text: c.delta.trim(), locus: c.channelId })), [
+            { text: 'zero', locus: 'discord:g:cafe' },
+            { text: 'first', locus: 'chan-alpha' },
+            { text: 'carrying on', locus: 'chan-alpha' },
+          ], "every chunk follows its publish: the replaced stream's late posts, then the retry's text at the destination they set");
         } else {
           assert.deepEqual(posts, [{ text: 'zero', locus: 'discord:g:cafe' }],
             "the retry's unprefixed text stays private under the hold the late delivery set");
+          assert.deepEqual(chunks.map((c) => ({ text: c.delta.trim(), locus: c.channelId })), [{ text: 'zero', locus: 'discord:g:cafe' }],
+            "only the late post streams: the retry's held text doesn't");
           const receipt = context(framework).texts.filter((t) => t.startsWith('[delivered]'));
           assert.equal(receipt.length, 1, `one receipt for the logical turn: ${receipt.join(' | ')}`);
           assert.match(receipt[0]!, /discord:g:cafe/, "it reports the replaced stream's late post");

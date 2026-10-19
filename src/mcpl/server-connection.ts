@@ -15,12 +15,15 @@ import { openTransport, STDERR_END_WAIT_MS, type McplTransport, type TransportCl
 import { maskNegotiatedCapabilities } from './capability-mask.js';
 import { CapabilityGrant, expandAdvertisementShorthand } from './capability-grant.js';
 import { CAPABILITY_DISABLED, boundedForLog, describeCause } from './errors.js';
-import { logDetail, logValue, logValueRedacted } from './log-value.js';
+import { logDetail, logValue, logValueRedacted, loggedCode } from './log-value.js';
 import {
   LEGACY_MCP_PROTOCOL_VERSION,
   MODERN_MCP_PROTOCOL_VERSION,
   checkServerConfig,
   redactServerText,
+  redactedData,
+  serverTextRedactor,
+  type ServerTextRedactor,
 } from './protocol-family.js';
 
 import type {
@@ -156,11 +159,13 @@ export class McplProtocolVersionError extends Error {
   constructor(
     message: string,
     readonly kind: 'rejected' | 'mismatch',
-    /** Revision the server answered with (`mismatch`; null when it gave none). */
+    /** Revision the server answered with (`mismatch`; null when it gave
+     *  none), redacted as the server's words are. */
     readonly returned: string | null,
     /** Revisions the server says it supports (`rejected`, when stated). */
     readonly supported: readonly string[] | null,
-    /** The JSON-RPC error's code and data, verbatim (`rejected`). */
+    /** The JSON-RPC error's code, and its data with each string in it
+     *  redacted (`rejected`). */
     readonly code?: number,
     readonly data?: unknown,
     /** The revision this client offered: the legacy engine's, unless a
@@ -172,8 +177,13 @@ export class McplProtocolVersionError extends Error {
   }
 }
 
-function protocolVersionRejection(id: string, error: { code: number; message: string; data?: unknown }): McplProtocolVersionError {
-  const data = error.data as { supported?: unknown } | undefined;
+function protocolVersionRejection(config: McplServerConfig, error: { code: number; message: string; data?: unknown }): McplProtocolVersionError {
+  const id = config.id;
+  // The server's words and data, redacted before they're bounded or kept:
+  // the error goes to the host. One build for all of them, so a
+  // configuration that can't be read is read once.
+  const redact = serverTextRedactor(config).now();
+  const data = redactedData(error.data, redact) as { supported?: unknown } | undefined;
   const supported = Array.isArray(data?.supported) && data.supported.every((v) => typeof v === 'string')
     ? (data.supported as string[])
     : null;
@@ -183,14 +193,15 @@ function protocolVersionRejection(id: string, error: { code: number; message: st
   return new McplProtocolVersionError(
     `MCPL server "${id}" does not support MCP ${MCP_PROTOCOL_VERSION}` +
       // The server's message can be any JSON value, so it's read without
-      // throwing (describeCause) and bounded, as the initialize error is.
-      (supported ? ` (it supports: ${supported.join(', ') || 'none listed'}).` : ` (${boundedForLog(describeCause(error.message))}).`) +
+      // throwing (describeCause), and redacted, then bounded, as the
+      // initialize error is.
+      (supported ? ` (it supports: ${boundedForLog(supported.join(', ')) || 'none listed'}).` : ` (${boundedForLog(redact(describeCause(error.message)))}).`) +
       modernHint,
     'rejected',
     null,
     supported,
     error.code,
-    error.data,
+    data,
   );
 }
 
@@ -218,16 +229,21 @@ class HandshakeCleanupError extends Error {
  * is confirmed, so the caller can still clean up, and should start nothing
  * else for this server until then. connect() and connectWithReconnect()
  * throw this, and the modern engine's ModernMcpConnection.connect() too.
- * `cause` is the connect's own failure.
+ * `cause` is the connect's own failure. `connection` isn't enumerable, so
+ * printing the error doesn't print the connection's configuration, its
+ * credentials included.
  */
 export class McplUnreapedLaunchError<Connection extends { close(): Promise<void> } = McplServerConnection> extends Error {
+  declare readonly connection: Connection;
+
   constructor(
-    readonly connection: Connection,
+    connection: Connection,
     failure: Error,
     /** The cleanup's own failure: the child it couldn't confirm exited. */
     readonly cleanup: Error,
   ) {
     super(`${failure.message}; its cleanup also failed: ${cleanup.message}`, { cause: failure });
+    Object.defineProperty(this, 'connection', { value: connection, enumerable: false });
     this.name = 'McplUnreapedLaunchError';
   }
 }
@@ -250,8 +266,9 @@ export class McplRequestError extends Error {
   constructor(
     message: string,
     readonly outcome: 'not-sent' | 'error-response' | 'no-response',
-    /** The JSON-RPC error's `data`, verbatim, when the server supplied one
-     *  (e.g. which parts of a multi-part send were posted). */
+    /** The JSON-RPC error's `data`, when the server supplied one (e.g. which
+     *  parts of a multi-part send were posted), with each string in it
+     *  redacted (redactedData): a host hands it on. */
     readonly data?: unknown,
   ) {
     super(message);
@@ -529,8 +546,8 @@ export class McplServerConnection extends EventEmitter {
 
   // Event buffering: control-plane traffic can be released independently from
   // inference-bearing data-plane traffic. This lets a server finish its own
-  // registration (and answer host tools/call requests) while startup/reconnect
-  // reconciliation keeps agent wakes behind a durable barrier.
+  // registration (and answer host tools/call requests) while its data plane
+  // stays held, as through a quiesce.
   private controlPlaneReady = false;
   private dataPlaneReady = false;
   private bufferedEvents: HeldItem[] = [];
@@ -568,6 +585,15 @@ export class McplServerConnection extends EventEmitter {
 
   // Reconnect state (adapted from Anarchid/agent-framework@mcpl-module-proto)
   private config: McplServerConfig | null = null;
+  /** The redactor of the server's text for `config`, made at its first error
+   *  answer, by when `config` is set, and kept: a framework-launched child's
+   *  `env` is a getter that reads the awareness ledger, so a redactor built
+   *  per answer would read it per answer (#540's review, R1-2). An answer
+   *  takes one build of it for its words, data and log line (`now()`), so
+   *  it reads the ledger at most once. It builds again only after a build
+   *  that failed, which withholds that answer's text, or once a dial notes
+   *  something new (serverTextRedactor). */
+  private redactor: ServerTextRedactor | null = null;
   private hostCapabilities: McplHostCapabilities | null = null;
   private reconnectEnabled = false;
   private reconnectIntervalMs = 5000;
@@ -666,8 +692,8 @@ export class McplServerConnection extends EventEmitter {
         `(long pause backlog${dropped > 0 ? `; ${dropped} dropped at cap` : ''})`,
       );
     }
-    // Re-enter the gate for every buffered item. A control handler (notably
-    // tools/list_changed) may install a newer data-plane barrier while this
+    // Re-enter the gate for every buffered item. A control handler (a
+    // host/command quiesce, say) may pause the data plane while this
     // snapshot is being flushed; later data items must observe that pause.
     this.flushHeld(pending);
   }
@@ -831,9 +857,8 @@ export class McplServerConnection extends EventEmitter {
 
   /**
    * Close the data plane synchronously while leaving an already-released
-   * control plane live. Used before list-change reconciliation so no new
-   * inference event can beat barrier installation. A reconnect closes both
-   * planes instead.
+   * control plane live. Used by quiesce, and by reconnectAfterFailure before
+   * its teardown. A reconnect closes both planes instead.
    */
   pauseDataPlane(): void {
     this.dataPlaneReady = false;
@@ -841,8 +866,8 @@ export class McplServerConnection extends EventEmitter {
 
   /**
    * Override emit to buffer server→host events until the corresponding plane
-   * is ready. Lifecycle events always pass through so reconnect can install a
-   * new data-plane gate before the fresh transport is exposed.
+   * is ready. Lifecycle events always pass through so the reconnect listener
+   * runs before the fresh transport's buffered traffic is released.
    */
   override emit(event: string | symbol, ...args: unknown[]): boolean {
     const name = typeof event === 'string' ? event : '';
@@ -1178,7 +1203,10 @@ export class McplServerConnection extends EventEmitter {
         // travels to traces and tool results, and a server's stderr is its
         // own text, which can hold a credential.
         const failed = (failure: string): Error & { stderrTail?: string } => {
-          const tail = transport.stderrTail.trimEnd();
+          // It goes to the host too, so it's redacted, from a window of the
+          // stream longer than the tail, so a credential the tail's cut
+          // would split is whole when it's matched (stderrTailRedacted).
+          const tail = transport.stderrTailRedacted(serverTextRedactor(config)).trimEnd();
           return Object.assign(new Error(failure), tail ? { stderrTail: tail } : {});
         };
         const cleanup = () => {
@@ -1222,21 +1250,25 @@ export class McplServerConnection extends EventEmitter {
             // listener after cleanup() has cleared the timeout: an uncaught
             // exception, which ends a host that doesn't catch them, and a
             // handshake left to wait forever. It's the server's text in an
-            // error's message, so it's bounded as errors.ts says.
+            // error the host gets, so it's redacted, then bounded as
+            // errors.ts says: a cut or a replaced character first would
+            // leave part of a credential the redactor can't match.
             reject(msg.error.code === UNSUPPORTED_PROTOCOL_VERSION_CODE
-              ? protocolVersionRejection(config.id, msg.error)
-              : new Error(`MCPL server "${config.id}" initialize error: ${boundedForLog(describeCause(msg.error.message))}`));
+              ? protocolVersionRejection(config, msg.error)
+              : new Error(`MCPL server "${config.id}" initialize error: ${boundedForLog(redactServerText(describeCause(msg.error.message), config))}`));
             return;
           }
           const result = msg.result as Record<string, unknown> | undefined;
           // The server's answer is the established revision. This engine
           // implements exactly one, so any other answer (or none) means the
           // two sides never agreed on what they're speaking.
-          const returned = typeof result?.protocolVersion === 'string' ? result.protocolVersion : null;
-          if (returned !== MCP_PROTOCOL_VERSION) {
+          const answered = typeof result?.protocolVersion === 'string' ? result.protocolVersion : null;
+          if (answered !== MCP_PROTOCOL_VERSION) {
+            // The server's words go to the host, so they're redacted.
+            const returned = answered === null ? null : redactServerText(answered, config);
             reject(new McplProtocolVersionError(
               `MCPL server "${config.id}" answered initialize with protocolVersion ` +
-                `${returned === null ? '(none)' : JSON.stringify(returned)}; this client's legacy engine speaks only ${MCP_PROTOCOL_VERSION}`,
+                `${returned === null ? '(none)' : boundedForLog(JSON.stringify(returned))}; this client's legacy engine speaks only ${MCP_PROTOCOL_VERSION}`,
               'mismatch',
               returned,
               null,
@@ -1251,7 +1283,7 @@ export class McplServerConnection extends EventEmitter {
           resolve({
             mcpl: (experimental?.mcpl as McplCapabilities) ?? null,
             mcpToolsAdvertised: caps?.tools !== undefined,
-            protocolVersion: returned,
+            protocolVersion: answered,
           });
         };
         const onClose = (info: TransportCloseInfo) => {
@@ -1585,10 +1617,11 @@ export class McplServerConnection extends EventEmitter {
         return { ...rest, tools };
       }
       if (typeof result.nextCursor !== 'string') {
-        throw malformed(`nextCursor must be a string, got ${JSON.stringify(result.nextCursor)}`);
+        // The cursor is the server's, so it's redacted, then bounded.
+        throw malformed(`nextCursor must be a string, got ${boundedForLog(redactServerText(JSON.stringify(result.nextCursor), this.config ?? {}))}`);
       }
       if (seen.has(result.nextCursor)) {
-        throw new Error(`MCPL server "${this.id}" repeated tools/list cursor ${JSON.stringify(result.nextCursor)}`);
+        throw new Error(`MCPL server "${this.id}" repeated tools/list cursor ${boundedForLog(redactServerText(JSON.stringify(result.nextCursor), this.config ?? {}))}`);
       }
       seen.add(result.nextCursor);
       cursor = result.nextCursor;
@@ -1895,9 +1928,8 @@ export class McplServerConnection extends EventEmitter {
     // boundary resets, so control traffic too (a server's channels/register
     // right after initialize) must wait for the new grant rather than be
     // refused against the empty one. The reconnect lifecycle event bypasses
-    // buffering; its framework listener installs the awareness barrier,
-    // re-establishes the grant (§5.3 policy responses are never buffered),
-    // and then opens the planes.
+    // buffering; its framework listener re-establishes the grant (§5.3
+    // policy responses are never buffered), and then opens the planes.
     this.controlPlaneReady = false;
     this.dataPlaneReady = false;
     this.resetPolicyForTransportBoundary();
@@ -1920,6 +1952,18 @@ export class McplServerConnection extends EventEmitter {
   // ==========================================================================
   // Private: message sending
   // ==========================================================================
+
+  /**
+   * A request refused before anything is kept for it, as `error`, with its
+   * operator's line logged after the refusal: a host logger that throws then
+   * loses that line, and can't turn the refusal into a throw from the call.
+   */
+  private static refused(error: McplRequestError, line: string): Promise<never> {
+    return new Promise((_, reject) => {
+      reject(error);
+      console.error(line);
+    });
+  }
 
   /**
    * Send a JSON-RPC request and return a promise that resolves with the result
@@ -1958,14 +2002,16 @@ export class McplServerConnection extends EventEmitter {
     // pipe's error are the operator's, so they go to the log.
     const pipeFailure = this.transport?.pipeFailure;
     if (pipeFailure) {
-      console.error(`MCPL server "${this.id}": ${method} not sent, since its stdio pipe failed: ${logDetail(pipeFailure.message)}`);
-      return Promise.reject(new McplRequestError(
-        `The request wasn't sent: this host can no longer write to the "${this.id}" server, so nothing ran. ` +
-          (this.willReconnect
-            ? 'This host is reconnecting to it; try again later.'
-            : "This host won't reconnect to it on its own. If you need it, ask whoever runs this host."),
-        'not-sent',
-      ));
+      return McplServerConnection.refused(
+        new McplRequestError(
+          `The request wasn't sent: this host can no longer write to the "${this.id}" server, so nothing ran. ` +
+            (this.willReconnect
+              ? 'This host is reconnecting to it; try again later.'
+              : "This host won't reconnect to it on its own. If you need it, ask whoever runs this host."),
+          'not-sent',
+        ),
+        `MCPL server "${this.id}": ${method} not sent, since its stdio pipe failed: ${logDetail(pipeFailure.message)}`,
+      );
     }
 
     const id = this.nextRequestId++;
@@ -1975,6 +2021,23 @@ export class McplServerConnection extends EventEmitter {
       id,
       params,
     };
+    // A request JSON can't write (a BigInt, a cycle) never leaves this host,
+    // and calling again fails the same way, so it's refused before anything
+    // is kept for it, in the modern engine's words (#556). The method, id and
+    // the serializer's words are the operator's.
+    let line: string;
+    try {
+      line = JSON.stringify(request);
+    } catch (err) {
+      return McplServerConnection.refused(
+        new McplRequestError(
+          `The request wasn't sent: this host couldn't send it to the "${this.id}" server, so nothing ran. ` +
+            'If calling it again fails, ask whoever runs this host.',
+          'not-sent',
+        ),
+        `MCPL server "${this.id}": ${method} (id=${id}) not sent, since it can't be written as JSON: ${logDetail(err instanceof Error ? err.message : err)}`,
+      );
+    }
 
     return new Promise((resolve, reject) => {
       const pending: PendingRequest = { resolve, reject, method };
@@ -2017,20 +2080,21 @@ export class McplServerConnection extends EventEmitter {
       }
       this.pendingRequests.set(id, pending);
       try {
-        this.transport!.writeLine(JSON.stringify(request));
+        this.transport!.writeLine(line);
       } catch (err) {
         // A synchronous write rejection sent no request. Remove its pending
         // state and watchdog before reporting that it is safe to retry. The
-        // method, id and the transport's words are the operator's.
+        // method, id and the transport's words are the operator's, logged
+        // after the refusal, as refused() logs.
         this.pendingRequests.delete(id);
         if (pending.timer) clearTimeout(pending.timer);
-        console.error(
-          `MCPL server "${this.id}": writing ${method} (id=${id}) failed: ${logDetail(err instanceof Error ? err.message : err)}`,
-        );
         reject(new McplRequestError(
           `The request wasn't sent: this host couldn't write it to the "${this.id}" server, so nothing ran. Try again later.`,
           'not-sent',
         ));
+        console.error(
+          `MCPL server "${this.id}": writing ${method} (id=${id}) failed: ${logDetail(err instanceof Error ? err.message : err)}`,
+        );
       }
     });
   }
@@ -2389,16 +2453,18 @@ export class McplServerConnection extends EventEmitter {
     if (pending.timer) clearTimeout(pending.timer);
 
     if (response.error) {
-      // The server's own words, after a word on whose they are, bounded as
-      // errors.ts says, since they're the server's text. Only a string is
-      // words: a message of any other JSON value reads as none. The method,
-      // id and JSON-RPC code are the operator's, so they go to the log, which
-      // prints any value a server can send without throwing (logValue). The
-      // caller's text keeps the server's words unredacted, as a JSON-RPC
-      // answer passes (redactServerText's scope); the log is a record of the
-      // server's text, so the message is redacted there, whatever JSON value
-      // it is, as every other line this connection writes is.
-      const said = typeof response.error.message === 'string' ? boundedForLog(response.error.message.trim()) : '';
+      // The server's own words, after a word on whose they are, redacted and
+      // then bounded as errors.ts says, since they're the server's text in
+      // an error the caller gets (redactServerText's scope), and its data's
+      // strings redacted too. It's trimmed after it's redacted, so a
+      // credential that ends in a space is whole when it's matched. Only a
+      // string is words: a message of any other JSON value reads as none.
+      // The method and id are the operator's, so they go to the log, and the
+      // code (loggedCode) and the message, whatever JSON values they are, go
+      // there redacted (logValueRedacted), as every other line this
+      // connection writes is.
+      const redact = (this.redactor ??= serverTextRedactor(this.config ?? {})).now();
+      const said = typeof response.error.message === 'string' ? boundedForLog(redact(response.error.message).trim()) : '';
       // The call is settled before its log line: its entry is gone and its
       // timer cleared, so nothing else would settle it, and a host's logger
       // can throw. The dispatch's containment reports such a throw. (A
@@ -2410,11 +2476,11 @@ export class McplServerConnection extends EventEmitter {
           : `The "${this.id}" server answered with an error without saying what went wrong, so whether the request took effect is unknown. ` +
             'Check its effect before trying again.',
         'error-response',
-        (response.error as { data?: unknown }).data,
+        redactedData((response.error as { data?: unknown }).data, redact),
       ));
       console.error(
-        `MCPL server "${this.id}" answered ${pending.method} (id=${response.id}) with error ${logValue(response.error.code)}: ` +
-        logValueRedacted(response.error.message, (text) => redactServerText(text, this.config ?? {})),
+        `MCPL server "${this.id}" answered ${pending.method} (id=${response.id}) with error ${loggedCode(response.error.code, redact)}: ` +
+        logValueRedacted(response.error.message, redact),
       );
     } else {
       pending.resolve(response.result);

@@ -126,8 +126,21 @@ export function redactUrl(url: string | undefined): string {
  * strings (serverCredentialPatterns), so strings of different servers that
  * overlap are both replaced whole. A credential neither the configuration
  * holds nor a dial of it sent, such as another origin's, is outside it, and
- * so are other encodings of the ones it holds. JSON-RPC answers, and the
- * error a host's own connect raises, pass as they are.
+ * so are other encodings of the ones it holds. A JSON-RPC answer's result
+ * passes as it is. No error a host's own call gets, whether thrown, rejected
+ * with or in an error answer's data, carries one of the strings above,
+ * whoever wrote the words: a server's words are redacted, then bounded,
+ * where an error is built from them, the strings in an error answer's data
+ * are redacted ({@link redactedData}), and an error a library raised is
+ * handed on as its name and its redacted words alone ({@link maskedError}),
+ * with a stdio launch failure's code. A failed handshake's stderr tail
+ * is redacted from a longer window of the stream, so a credential of up to
+ * 14,336 characters that reaches into it is replaced whole
+ * (McplTransport.stderrTailRedacted). A close's or a
+ * cleanup's failure carries the transports' own words, a child's pid, its
+ * server's id and the wait it was given, and passes as built. A
+ * connection's events are the framework's records' inputs, and the records
+ * redact them.
  *
  * A configuration that can't be read, such as one whose `env` is a getter
  * that throws, says nothing of which strings to replace, so the whole text
@@ -139,6 +152,22 @@ export function redactServerText(text: unknown, config: Pick<McplServerConfig, '
   return serverTextRedactor(config)(text);
 }
 
+/** A {@link serverTextRedactor}: a redaction of one configuration's
+ *  credentials, which reads the configuration until a build succeeds. */
+export interface ServerTextRedactor {
+  (text: unknown, from?: number): string;
+  /**
+   * This redaction for one piece of work, such as building one error from a
+   * server's words and data: its pattern built now if it isn't, so the
+   * configuration is read at most once for all the work's texts, and every
+   * text withheld if it can't be read.
+   */
+  now(): Redaction;
+}
+
+/** The redaction of a configuration that can't be read. */
+const withheld: Redaction = () => WITHHELD_TEXT;
+
 /**
  * {@link redactServerText} for one configuration, its strings found and its
  * pattern built once, and again once a dial has sent something new
@@ -146,28 +175,107 @@ export function redactServerText(text: unknown, config: Pick<McplServerConfig, '
  * line. A build that can't read the configuration withholds that call's
  * text, and the next call builds again.
  */
-export function serverTextRedactor(config: Pick<McplServerConfig, 'url' | 'token' | 'env'>): (text: unknown) => string {
+export function serverTextRedactor(config: Pick<McplServerConfig, 'url' | 'token' | 'env'>): ServerTextRedactor {
   let built = -1;
-  let redact!: (text: unknown) => string;
-  return (text) => {
+  let redact!: Redaction;
+  const now = (): Redaction => {
     const version = dialsSent.get(config)?.version ?? 0;
     if (version !== built) {
       let patterns: CredentialPattern[];
       try {
         patterns = serverCredentialPatterns(config);
       } catch {
-        return WITHHELD_TEXT;
+        return withheld;
       }
       redact = credentialRedactor(patterns);
       built = version;
     }
-    return redact(text);
+    return redact;
   };
+  return Object.assign((text: unknown, from?: number) => now()(text, from), { now });
 }
 
 /** What a redaction gives in place of text when the configuration it
  *  redacts with can't be read ({@link redactServerText}). */
 export const WITHHELD_TEXT = "[withheld: the server's configuration couldn't be read to redact this]";
+
+/** What {@link redactedData} gives in place of data nested deeper than it
+ *  walks. */
+export const TOO_DEEP_TEXT = '[withheld: nested too deep to redact]';
+
+/** How deep {@link redactedData} walks. A server's JSON can nest deeper than
+ *  a recursive walk's stack holds (10,000 levels overflow it), and the walk
+ *  runs where a throw would leave the request it answers unsettled. */
+const REDACTED_DATA_DEPTH = 64;
+
+/**
+ * The data a server's error answer carries beside its words, with every
+ * string in it, an object's keys included, redacted (`redact`, a server's
+ * {@link serverTextRedactor}, built once for the walk), so an error handed
+ * to a host carries no credential its configuration holds. Arrays and plain
+ * objects are walked, to a depth of 64; deeper data is
+ * {@link TOO_DEEP_TEXT}. A number goes as its redacted text if its digits,
+ * as JavaScript reads the number, hold a credential: a number with more
+ * significant digits than a double holds (about 15) has lost its last ones
+ * before anything sees it, so a credential sent as such a number isn't
+ * matched. A redacted key that comes out the same as another key is
+ * numbered, so every entry is kept under a name of its own, and a key the
+ * redaction leaves alone keeps its name. Any other value, null or a
+ * boolean, is kept as it is. With a configuration that can't be read, the
+ * data as a whole is {@link WITHHELD_TEXT}.
+ */
+export function redactedData(value: unknown, redactor: ServerTextRedactor | Redaction): unknown {
+  const redact = 'now' in redactor ? redactor.now() : redactor;
+  if (redact === withheld) return value === undefined ? undefined : WITHHELD_TEXT;
+  const walk = (item: unknown, depth: number): unknown => {
+    if (typeof item === 'string') return redact(item);
+    if (typeof item === 'number') {
+      const digits = String(item);
+      const redacted = redact(digits);
+      return redacted === digits ? item : redacted;
+    }
+    if (item === null || typeof item !== 'object') return item;
+    const walked = Array.isArray(item) || [Object.prototype, null].includes(Object.getPrototypeOf(item));
+    if (!walked) return item;
+    if (depth >= REDACTED_DATA_DEPTH) return TOO_DEEP_TEXT;
+    if (Array.isArray(item)) return item.map((entry) => walk(entry, depth + 1));
+    // A key the redaction leaves as it is keeps its name; a redacted one
+    // takes the first name no other key has, so no entry is lost or moved.
+    const entries = Object.entries(item);
+    const names = entries.map(([key]) => redact(key));
+    const taken = new Set(names.filter((name, n) => name === entries[n][0]));
+    // Each name's next number to try, so keys that redact alike don't search
+    // from 2 again: every number below it was taken, and stays taken.
+    const next = new Map<string, number>();
+    return Object.fromEntries(entries.map(([key, entry], n) => {
+      let name = names[n];
+      if (name !== key) {
+        const base = name;
+        let k = next.get(base) ?? 2;
+        while (taken.has(name)) name = `${base} (${k++})`;
+        next.set(base, k);
+        taken.add(name);
+      }
+      return [name, walk(entry, depth + 1)];
+    }));
+  };
+  return walk(value, 0);
+}
+
+/**
+ * An error a library raised, as the framework hands it to a host: its name,
+ * which is its class's, as it is, and its words redacted (`redact`, a
+ * server's {@link serverTextRedactor}), and nothing else. A library's error
+ * can carry the url it dialed elsewhere than in its message (Bun's fetch
+ * errors keep it in `path`, its path and query included), or keep the raw
+ * error it wraps as its `cause`, so none of that is carried over.
+ */
+export function maskedError(error: unknown, redact: (text: unknown) => string): Error {
+  const masked = new Error(redact(error instanceof Error ? error.message : error));
+  // Not enumerable, as an error's own name is not.
+  if (error instanceof Error) Object.defineProperty(masked, 'name', { value: error.name, writable: true, configurable: true });
+  return masked;
+}
 
 /**
  * What a configuration's dials sent that the configuration doesn't hold: the
@@ -368,19 +476,28 @@ export function serverCredentialPatterns(config: Pick<McplServerConfig, 'url' | 
 }
 
 /**
+ * A redaction: `text` with the credentials it holds replaced, and only what
+ * lies from its `from`th code unit on (0 when left out). A credential that
+ * begins before `from` and reaches past it is matched whole and replaced
+ * whole, so a part of the text can be given redacted as the whole text has
+ * it.
+ */
+export type Redaction = (text: unknown, from?: number) => string;
+
+/**
  * Every place one of the given patterns matches becomes `redacted`,
  * overlapping places included: the matches are found in the text as given,
  * a match may begin inside another, and each run of overlapping matches is
  * replaced as one. So two strings that overlap, one's end being the other's
  * start, are both replaced whole, and the replacement is never scanned.
  */
-export function credentialRedactor(patterns: readonly CredentialPattern[]): (text: unknown) => string {
-  if (patterns.length === 0) return asText;
+export function credentialRedactor(patterns: readonly CredentialPattern[]): Redaction {
+  if (patterns.length === 0) return (text, from = 0) => asText(text).slice(from);
   // Longest first, so at each place the longest string that matches there is
   // the match.
   const sources = [...patterns].sort((a, b) => b.value.length - a.value.length).map(({ source }) => source);
   const pattern = new RegExp([...new Set(sources)].join('|'), 'g');
-  return (text) => {
+  return (text, from = 0) => {
     const input = asText(text);
     const spans: Array<[start: number, end: number]> = [];
     pattern.lastIndex = 0;
@@ -395,12 +512,13 @@ export function credentialRedactor(patterns: readonly CredentialPattern[]): (tex
       pattern.lastIndex = start + 1;
     }
     let redacted = '';
-    let from = 0;
+    let at = from;
     for (const [start, end] of spans) {
-      redacted += `${input.slice(from, start)}redacted`;
-      from = end;
+      if (end <= from) continue;
+      redacted += `${input.slice(at, start)}redacted`;
+      at = end;
     }
-    return redacted + input.slice(from);
+    return redacted + input.slice(at);
   };
 }
 

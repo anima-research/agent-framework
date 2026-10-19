@@ -107,5 +107,14 @@ jobs:
         with:
           bun-version: 1.3.14
 
+      # Bun's WebSocket client quotes the url as dialed in a failed dial's
+      # message, which Node's never does, so the test that the dial's error
+      # masks it runs its probe under bun. The build-and-test job has no bun
+      # and skips it; here AF_TEST_REQUIRE_BUN makes a missing bun a failure.
+      - name: WebSocket dial errors under Bun
+        env:
+          AF_TEST_REQUIRE_BUN: '1'
+        run: node --import ./dist/test/helpers/force-exit-blocking-stdout.js --test --test-force-exit --test-timeout=600000 dist/test/mcpl-ws-transport.test.js
+
       - name: Packed release installs on its own
         run: node scripts/pack-installs-alone.mjs

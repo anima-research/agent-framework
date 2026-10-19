@@ -801,40 +801,6 @@ test('a throw from the wired tools/list_changed handler is contained, traced and
   assert.deepEqual(lines, ['[mcpl] srv tools-list-changed handler failed: "the tool list refresh failed"']);
 });
 
-test('after a throw from the wired tools/list_changed handler, its data-plane gate is still completed when its barrier settles, or failed with it', async (t) => {
-  const { framework, connection } = harness();
-  t.mock.method(console, 'error', () => {});
-  const unhandled: unknown[] = [];
-  const onUnhandled = (reason: unknown) => { unhandled.push(reason); };
-  process.on('unhandledRejection', onUnhandled);
-  try {
-    framework.handleToolsListChanged = () => { throw new Error('the tool list refresh failed'); };
-    const failed: unknown[][] = [];
-    framework.failMcplDataPlaneGate = async (barrier: unknown, what: string, error: unknown) => { failed.push([barrier, what, error]); };
-    // A barrier the data planes wait for, which settles: the gate completes.
-    framework.beginDiscordAwarenessBarrier = () => ({
-      requiresBarrier: true,
-      promise: Promise.resolve({ status: 'delivered', delivered: 0, failed: 0 }),
-    });
-    connection.emit('tools-list-changed');
-    const settling = framework.discordAwarenessBarrier;
-    assert.ok(settling, 'the gate is installed until its barrier settles');
-    await settle();
-    assert.equal(framework.discordAwarenessBarrier, null, 'the gate completed');
-    // One that fails: the gate is failed with it, and its rejection is handled.
-    const accounting = new Error('the awareness accounting failed');
-    framework.beginDiscordAwarenessBarrier = () => ({ requiresBarrier: true, promise: Promise.reject(accounting) });
-    connection.emit('tools-list-changed');
-    const failing = framework.discordAwarenessBarrier;
-    await settle();
-    await settle();
-    assert.deepEqual(failed, [[failing, 'tools-list reconciliation', accounting]]);
-    assert.deepEqual(unhandled, []);
-  } finally {
-    process.off('unhandledRejection', onUnhandled);
-  }
-});
-
 test('mcpl/manifestChanged and tools/list_changed sent as requests are answered with an empty result as they are admitted, whatever their handlers do', async (t) => {
   const { framework, connection, transport, traces } = wireHarness();
   t.mock.method(console, 'error', () => {});

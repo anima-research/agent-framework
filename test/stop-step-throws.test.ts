@@ -108,6 +108,8 @@ interface Row {
 
 /** The releases whose unread pass ran, in the unread pass's row. */
 const unreadPassed: string[] = [];
+/** The waiting outgoing completes that went out, in their row. */
+const sentCompletes: string[] = [];
 
 const ROWS: Row[] = [
   { step: "the push coalescer's suspend()", inject: (fw, e) => throwIn(internals(fw), 'pushCoalescer', 'suspend', e) },
@@ -138,6 +140,20 @@ const ROWS: Row[] = [
     },
   },
   { step: "cancelling provider admission", inject: (fw, e) => patchMethod(fw, 'cancelProviderAdmission', e) },
+  {
+    step: "a stream's waiting outgoing complete",
+    inject: (fw, e) => {
+      // Two streams' completes wait: the first one's throws.
+      sentCompletes.length = 0;
+      const waiting = internals(fw).pendingOutgoingCompletes as Set<() => void>;
+      const first = () => { throw e; };
+      const second = () => { sentCompletes.push('second'); };
+      waiting.add(first);
+      waiting.add(second);
+      return () => { waiting.delete(first); waiting.delete(second); };
+    },
+    check: () => assert.deepEqual(sentCompletes, ['second'], "the other stream's complete still went out"),
+  },
   { step: "the channel registry's stopAll()", inject: (fw, e) => throwIn(internals(fw), 'channelRegistry', 'stopAll', e) },
   { step: "the event gate's dispose()", inject: (fw, e) => throwIn(internals(fw), 'eventGate', 'dispose', e) },
   {

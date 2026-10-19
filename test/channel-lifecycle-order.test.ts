@@ -40,6 +40,9 @@ function fixture(onNotice?: NoticeHandler, store?: JsStore, coalesce?: RegistryO
   const routeFailures: Array<{ reason: string }> = [];
   // A server that answers an open for another channel, by requested id.
   const answeredFor = new Map<string, string>();
+  // The direction an open's answer declares, by the address the open was
+  // sent to; an address not here declares the descriptor's own.
+  const declares = new Map<string, ChannelDescriptor['direction']>();
   const serve = (kind: 'open' | 'close', params: { channelId?: string; address?: unknown }) => {
     const id = params.channelId!;
     calls.push({ kind, id, address: params.address });
@@ -47,7 +50,10 @@ function fixture(onNotice?: NoticeHandler, store?: JsStore, coalesce?: RegistryO
       const finish = () => {
         const target = kind === 'open' ? answeredFor.get(id) ?? id : id;
         actual.set(target, kind === 'open');
-        resolve(kind === 'open' ? { channel: descriptor(target) } : { closed: true });
+        const declared = declares.get(String((params.address as { value?: unknown } | undefined)?.value));
+        resolve(kind === 'open'
+          ? { channel: { ...descriptor(target), ...(declared ? { direction: declared } : {}) } }
+          : { closed: true });
       };
       if (held.has(id)) pending.push({ finish, fail: () => reject(new Error('fixture lifecycle failure')) });
       else finish();
@@ -87,7 +93,7 @@ function fixture(onNotice?: NoticeHandler, store?: JsStore, coalesce?: RegistryO
     assert.equal(settled, true, 'lifecycle operations must settle');
     await result;
   };
-  return { registry, actual, calls, pending, held, traces, isOpen, tool, drain, publishedWhileOpen, notices, routeFailures, replaceServer, answeredFor, setGrant };
+  return { registry, actual, calls, pending, held, traces, isOpen, tool, drain, publishedWhileOpen, notices, routeFailures, replaceServer, answeredFor, declares, setGrant };
 }
 
 test('remove/re-add during reconcile converges on the replacement desired state, with ACK first (#185)', async () => {
@@ -311,10 +317,341 @@ test('a draft published into a channel with a close pending waits for it and pos
   const outcome = await draft;
   assert.equal(outcome.status, 'failed');
   assert.match(outcome.reason ?? '', /^lifecycle work prevented delivery: /);
+  assert.deepEqual(outcome.destination, { serverId: 'test', channelId: 'x', label: 'x' });
   assert.equal(f.registry.getDesiredState('test', 'x'), 'closed');
   assert.equal(f.isOpen(), false);
   assert.deepEqual(f.publishedWhileOpen, [], 'nothing was published');
   assert.equal(f.notices.length, 0);
+});
+
+test('a channel declared inbound-only while a publish waits for its lifecycle work is refused, and nothing is published', async () => {
+  // A publish that finds the channel's lifecycle work queued waits for it.
+  // A channels/changed during that wait can declare the channel
+  // inbound-only, so the publish checks the channel again after the wait,
+  // just before it publishes, and refuses it there.
+  const f = fixture();
+  await f.registry.handleChanged('test', { added: [descriptor('x')] });
+  f.held.add('x');
+  const open = f.tool('open');
+  await tick();
+  const draft = f.registry.publish('resident', 'a draft', { serverId: 'test', channelId: 'x' });
+  await tick();
+  await f.registry.handleChanged('test', { updated: [{ ...descriptor('x'), direction: 'inbound' }] });
+  await f.drain(open, draft);
+  assert.equal((await open).success, true);
+  const outcome = await draft;
+  assert.equal(outcome.status, 'failed');
+  assert.match(outcome.reason ?? '', /^inbound-only: server "test" declared this channel's direction "inbound"/);
+  assert.deepEqual(f.publishedWhileOpen, [], 'nothing was published');
+  assert.equal(f.isOpen(), true, 'the open the agent asked for stands');
+});
+
+for (const change of ['announced again as inbound-only', 'removed'] as const) {
+  test(`a channel ${change} while its opening is announced is refused, and nothing is published`, async () => {
+    // The notice of an opening runs after the open and before the publish. A
+    // channels/changed there can replace the channel's entry or remove it,
+    // so the check before the publish reads the channel's current entry, not
+    // the one the open returned.
+    let announced: Promise<unknown> | undefined;
+    let f!: ReturnType<typeof fixture>;
+    f = fixture(() => {
+      announced = f.registry.handleChanged('test', change === 'removed'
+        ? { removed: ['x'] }
+        : { added: [{ ...descriptor('x'), direction: 'inbound' }] });
+    });
+    await f.registry.handleChanged('test', { added: [descriptor('x')] });
+    assert.equal(await f.registry.routeSpeech('resident', 'hello', 'x'), null);
+    assert.equal(f.notices.length, 1, 'the opening was announced');
+    assert.deepEqual(f.publishedWhileOpen, [], 'nothing was published');
+    assert.match(f.routeFailures[0]?.reason ?? '', change === 'removed'
+      ? /^the channel was removed before the words were published$/
+      : /^inbound-only: server "test" declared this channel's direction "inbound"/);
+    await announced;
+  });
+}
+
+for (const answer of ['opens', 'fails'] as const) {
+  test(`a channel registered again while its opening is announced takes the words only once its new registration's open ${answer === 'opens' ? 'succeeds' : 'fails, and then not at all'}`, async () => {
+    // A channels/changed during the opening's notice can replace the
+    // channel's entry with a fresh registration, which nothing has confirmed
+    // open: its reconcile queues the open. The words wait for that work and
+    // go out only into the channel it leaves open.
+    let announced: Promise<unknown> | undefined;
+    let f!: ReturnType<typeof fixture>;
+    f = fixture(() => {
+      f.held.add('x');
+      announced = f.registry.handleChanged('test', { added: [descriptor('x', false, 'replacement')] });
+    });
+    await f.registry.handleChanged('test', { added: [descriptor('x')] });
+    const speech = f.registry.routeSpeech('resident', 'hello', 'x');
+    for (let i = 0; i < 5; i++) await tick();
+    assert.equal(f.notices.length, 1, 'the opening was announced');
+    assert.equal(f.pending.length, 1, "the new registration's open is in flight");
+    assert.deepEqual(f.publishedWhileOpen, [], 'nothing is published before that open is answered');
+    if (answer === 'opens') f.pending.pop()!.finish();
+    else f.pending.pop()!.fail();
+    const outcome = await speech;
+    assert.deepEqual(f.calls.filter((c) => c.kind === 'open').map((c) => c.address), [{ value: 'original' }, { value: 'replacement' }]);
+    if (answer === 'opens') {
+      assert.equal(outcome?.delivered, true);
+      assert.deepEqual(f.publishedWhileOpen, [true]);
+      assert.deepEqual(f.routeFailures, []);
+    } else {
+      assert.equal(outcome, null);
+      assert.deepEqual(f.publishedWhileOpen, [], 'nothing was published');
+      assert.match(f.routeFailures[0]?.reason ?? '', /^lifecycle work prevented delivery: /);
+    }
+    await announced;
+  });
+}
+
+test('a channel retargeted while its opening is announced takes the words only once its new target is open', async () => {
+  // A retarget keeps the channel's registration but marks it unconfirmed,
+  // with an open of the new target queued, so the words wait for that open
+  // as they do for a new registration's.
+  let announced: Promise<unknown> | undefined;
+  let f!: ReturnType<typeof fixture>;
+  f = fixture(() => {
+    f.held.add('x');
+    announced = f.registry.handleChanged('test', { updated: [descriptor('x', false, 'retargeted')] });
+  });
+  await f.registry.handleChanged('test', { added: [descriptor('x')] });
+  const speech = f.registry.routeSpeech('resident', 'hello', 'x');
+  for (let i = 0; i < 5; i++) await tick();
+  assert.equal(f.pending.length, 1, "the new target's open is in flight");
+  assert.equal(f.isOpen('x'), false);
+  // The fixture's server keeps the channel open by id through a retarget,
+  // so this counts the publishes rather than reading publishedWhileOpen's values.
+  assert.equal(f.publishedWhileOpen.length, 0, "nothing is published before the new target's open is answered");
+  f.pending.pop()!.finish();
+  assert.equal((await speech)?.delivered, true);
+  assert.deepEqual(f.calls.filter((c) => c.kind === 'open').map((c) => c.address), [{ value: 'original' }, { value: 'retargeted' }]);
+  assert.equal(f.publishedWhileOpen.length, 1);
+  await announced;
+});
+
+test('a channel registered again while the words wait for a new registration takes them only once the newest is open', async () => {
+  // The server registers x again while the words wait for the first new
+  // registration's open. The words wait through the newer one's open too,
+  // and the check after the wait reads the registration that stands.
+  let announced: Promise<unknown> | undefined;
+  let f!: ReturnType<typeof fixture>;
+  f = fixture(() => {
+    f.held.add('x');
+    announced = f.registry.handleChanged('test', { added: [descriptor('x', false, 'second')] });
+  });
+  await f.registry.handleChanged('test', { added: [descriptor('x')] });
+  const speech = f.registry.routeSpeech('resident', 'hello', 'x');
+  for (let i = 0; i < 5; i++) await tick();
+  assert.equal(f.pending.length, 1, "the second registration's open is in flight");
+  const again = f.registry.handleChanged('test', { added: [descriptor('x', false, 'third')] });
+  f.pending.pop()!.finish();
+  for (let i = 0; i < 5; i++) await tick();
+  assert.ok(f.pending.length >= 1, "the third registration's lifecycle work is in flight");
+  assert.equal(f.publishedWhileOpen.length, 0, "nothing is published while it's in flight");
+  await f.drain(speech, announced!, again);
+  assert.equal((await speech)?.delivered, true);
+  const opens = f.calls.filter((c) => c.kind === 'open').map((c) => (c.address as { value: string }).value);
+  assert.equal(opens.at(-1), 'third', 'the last open is the newest registration\'s');
+  assert.equal(f.publishedWhileOpen.length, 1);
+});
+
+test('a grant without channels.publish by the time the words would be published refuses them', async () => {
+  // A grant reduced during the opening's notice holds at once (§6.7): the
+  // last check reads the grant as it is then.
+  let f!: ReturnType<typeof fixture>;
+  f = fixture(() => { f.setGrant(ALL_CAPABILITY_PATHS.filter((path) => path !== 'channels.publish')); });
+  await f.registry.handleChanged('test', { added: [descriptor('x')] });
+  const outcome = await f.registry.publish('resident', 'words', { serverId: 'test', channelId: 'x' });
+  assert.equal(f.notices.length, 1, 'the opening was announced');
+  assert.equal(outcome.status, 'failed');
+  assert.equal(outcome.reason, 'channels.publish not in "test"\'s effective grant (§14.1)');
+  assert.deepEqual(outcome.destination, { serverId: 'test', channelId: 'x', label: 'x' });
+  assert.deepEqual(f.publishedWhileOpen, [], 'nothing was published');
+});
+
+test('a grant without channels.publish after the words wait for a new registration refuses them', async () => {
+  // The grant is read after the wait the last check runs, not only before it.
+  let announced: Promise<unknown> | undefined;
+  let f!: ReturnType<typeof fixture>;
+  f = fixture(() => {
+    f.held.add('x');
+    announced = f.registry.handleChanged('test', { added: [descriptor('x', false, 'replacement')] });
+  });
+  await f.registry.handleChanged('test', { added: [descriptor('x')] });
+  const draft = f.registry.publish('resident', 'words', { serverId: 'test', channelId: 'x' });
+  for (let i = 0; i < 5; i++) await tick();
+  assert.equal(f.pending.length, 1, "the new registration's open is in flight");
+  f.setGrant(ALL_CAPABILITY_PATHS.filter((path) => path !== 'channels.publish'));
+  f.pending.pop()!.finish();
+  const outcome = await draft;
+  assert.equal(outcome.status, 'failed');
+  assert.equal(outcome.reason, 'channels.publish not in "test"\'s effective grant (§14.1)');
+  assert.deepEqual(f.publishedWhileOpen, [], 'nothing was published');
+  await announced;
+});
+
+test('a close decided while its opening is announced refuses the words, as a close decided while they wait does', async () => {
+  // The registration is the one the waits returned and still open, but a
+  // close is now decided and queued: the words wait for it and are refused.
+  let closing: Promise<unknown> | undefined;
+  let f!: ReturnType<typeof fixture>;
+  f = fixture(() => {
+    f.held.add('x');
+    closing = f.tool('close');
+  });
+  await f.registry.handleChanged('test', { added: [descriptor('x')] });
+  const speech = f.registry.routeSpeech('resident', 'hello', 'x');
+  for (let i = 0; i < 5; i++) await tick();
+  assert.equal(f.registry.getDesiredState('test', 'x'), 'closed');
+  assert.deepEqual(f.publishedWhileOpen, [], 'nothing is published while the close is queued');
+  await f.drain(closing!, speech);
+  assert.equal(await speech, null);
+  assert.deepEqual(f.publishedWhileOpen, [], 'nothing was published');
+  assert.match(f.routeFailures[0]?.reason ?? '', /^lifecycle work prevented delivery: /);
+  assert.equal(f.isOpen(), false, 'the close the agent decided stands');
+});
+
+test('a retarget with nothing queued for it refuses the words, rather than publishing into it unconfirmed', async () => {
+  // Without channels.lifecycle the host queues no open for a retarget, so
+  // nothing will confirm the new target: the words are refused, not sent.
+  let announced: Promise<unknown> | undefined;
+  let f!: ReturnType<typeof fixture>;
+  f = fixture(() => {
+    f.setGrant(ALL_CAPABILITY_PATHS.filter((path) => path !== 'channels.lifecycle'));
+    announced = f.registry.handleChanged('test', { updated: [descriptor('x', false, 'retargeted')] });
+  });
+  await f.registry.handleChanged('test', { added: [descriptor('x')] });
+  const outcome = await f.registry.publish('resident', 'words', { serverId: 'test', channelId: 'x' });
+  assert.equal(outcome.status, 'failed');
+  assert.match(outcome.reason ?? '', /^lifecycle work prevented delivery: /);
+  assert.deepEqual(f.publishedWhileOpen, [], 'nothing was published');
+  assert.deepEqual(f.calls.filter((c) => c.kind === 'open').map((c) => c.address), [{ value: 'original' }], 'no open was queued for the new target');
+  await announced;
+});
+
+test('a channel registered again and confirmed open by its traffic, once the host no longer directs its lifecycle, takes the words though decided closed', async () => {
+  // Without channels.lifecycle a decided close doesn't hold words back from
+  // a transport that is open, whichever registration carries it: the new
+  // registration's traffic confirms it open, and the words go out.
+  let closing: Promise<{ success: boolean }> | undefined;
+  let announced: Promise<unknown> | undefined;
+  let traffic: Promise<unknown> | undefined;
+  let f!: ReturnType<typeof fixture>;
+  f = fixture(() => {
+    f.setGrant(ALL_CAPABILITY_PATHS.filter((path) => path !== 'channels.lifecycle'));
+    closing = f.tool('close');
+    announced = f.registry.handleChanged('test', { added: [descriptor('x', false, 'replacement')] });
+    traffic = f.registry.handleIncoming('test', { messages: [message()] });
+  });
+  await f.registry.handleChanged('test', { added: [descriptor('x')] });
+  const outcome = await f.registry.publish('resident', 'words', { serverId: 'test', channelId: 'x' });
+  assert.equal((await closing!).success, false, 'the close is refused for the grant');
+  assert.equal(f.registry.getDesiredState('test', 'x'), 'closed', 'the refused close is still recorded as a decision');
+  assert.equal(outcome.status, 'delivered');
+  assert.deepEqual(f.publishedWhileOpen, [true]);
+  await announced;
+  await traffic;
+});
+
+test("a close decided while the words wait, once the host no longer directs the channel's lifecycle, leaves them going into the open transport", async () => {
+  // waitForOpenChannel takes a decided close as standing only where the host
+  // directs the server's lifecycle, as the last check does.
+  let announced: Promise<unknown> | undefined;
+  let f!: ReturnType<typeof fixture>;
+  f = fixture(() => {
+    f.held.add('x');
+    announced = f.registry.handleChanged('test', { added: [descriptor('x', false, 'replacement')] });
+  });
+  await f.registry.handleChanged('test', { added: [descriptor('x')] });
+  const draft = f.registry.publish('resident', 'words', { serverId: 'test', channelId: 'x' });
+  for (let i = 0; i < 5; i++) await tick();
+  assert.equal(f.pending.length, 1, "the new registration's open is in flight");
+  f.setGrant(ALL_CAPABILITY_PATHS.filter((path) => path !== 'channels.lifecycle'));
+  const closing = await f.tool('close');
+  assert.equal(closing.success, false, 'the close is refused for the grant');
+  f.pending.pop()!.finish();
+  const outcome = await draft;
+  assert.equal(f.registry.getDesiredState('test', 'x'), 'closed', 'the refused close is still recorded as a decision');
+  assert.equal(outcome.status, 'delivered');
+  assert.deepEqual(f.publishedWhileOpen, [true]);
+  await announced;
+});
+
+test('a channel registered again as inbound-only while its opening is announced is refused without waiting for its new open', async () => {
+  // Nothing would be published into it whatever its open does, so the words
+  // don't wait for that open: they're refused for the declaration at once.
+  let announced: Promise<unknown> | undefined;
+  let f!: ReturnType<typeof fixture>;
+  f = fixture(() => {
+    f.held.add('x');
+    announced = f.registry.handleChanged('test', { added: [{ ...descriptor('x', false, 'replacement'), direction: 'inbound' }] });
+  });
+  await f.registry.handleChanged('test', { added: [descriptor('x')] });
+  const speech = f.registry.routeSpeech('resident', 'hello', 'x');
+  for (let i = 0; i < 5; i++) await tick();
+  assert.equal(f.pending.length, 1, "the new registration's open is in flight");
+  assert.match(f.routeFailures[0]?.reason ?? '', /^inbound-only: server "test" declared this channel's direction "inbound"/);
+  assert.equal(await speech, null);
+  assert.deepEqual(f.publishedWhileOpen, [], 'nothing was published');
+  f.pending.pop()!.finish();
+  await announced;
+});
+
+for (const opener of ['tool', 'reconcile'] as const) {
+  test(`an open answered after the agent closed the channel during it leaves it closed, and its inbound-only declaration applies (${opener})`, async () => {
+    // The close is the newer decision, so the channel ends closed. The answer
+    // is still the server's word about the channel, so a later publish is
+    // refused before anything opens.
+    const f = fixture();
+    f.declares.set('original', 'inbound');
+    if (opener === 'tool') await f.registry.handleChanged('test', { added: [descriptor('x')] });
+    f.held.add('x');
+    const opening = opener === 'tool'
+      ? f.tool('open')
+      : f.registry.handleChanged('test', { added: [descriptor('x', true)] });
+    await tick();
+    assert.equal(f.pending.length, 1, 'the open is in flight');
+    const close = f.tool('close');
+    await f.drain(opening, close);
+    assert.equal((await close).success, true);
+    assert.equal(f.registry.getDesiredState('test', 'x'), 'closed');
+    assert.equal(f.isOpen(), false);
+    assert.equal(f.actual.get('x'), false);
+    assert.equal(f.registry.inboundOnlyServer('x', 'test'), 'test', "the late answer's declaration applies");
+    const opens = f.calls.filter((c) => c.kind === 'open').length;
+    const outcome = await f.registry.publish('resident', 'words', { serverId: 'test', channelId: 'x' });
+    assert.equal(outcome.status, 'failed');
+    assert.match(outcome.reason ?? '', /^inbound-only: /);
+    assert.equal(f.calls.filter((c) => c.kind === 'open').length, opens, 'refused before anything opens');
+  });
+}
+
+test("an open answered for another channel applies nothing of its answer to the channel opened", async () => {
+  // A substitution fails the open before the answer's declaration is read.
+  // That is what lets an answer whose channel names no id stand for the
+  // channel opened.
+  const f = fixture();
+  f.answeredFor.set('x', 'y');
+  f.declares.set('original', 'inbound');
+  await f.registry.handleChanged('test', { added: [descriptor('x')] });
+  assert.equal((await f.tool('open')).success, false);
+  assert.ok(f.traces.some((e) => e.type === 'mcpl:channel-open-substituted' && e.channelId === 'x'),
+    'the open reached the server and was answered for another channel');
+  assert.equal(f.registry.inboundOnlyServer('x', 'test'), undefined, "the other channel's declaration isn't applied");
+});
+
+test("an open's answer for a target the channel has since left applies nothing; the new target's answer decides", async () => {
+  const f = fixture();
+  f.declares.set('original', 'inbound');
+  f.held.add('x');
+  const opening = f.registry.handleChanged('test', { added: [descriptor('x', true)] });
+  await tick();
+  await f.registry.handleChanged('test', { updated: [descriptor('x', true, 'new-target')] });
+  await f.drain(opening);
+  assert.deepEqual(f.calls.map((c) => c.address), [{ value: 'original' }, { value: 'new-target' }]);
+  assert.equal(f.isOpen(), true);
+  assert.equal(f.registry.inboundOnlyServer('x', 'test'), undefined, "the old target's declaration isn't applied");
 });
 
 test('waiting for a backscroll does not issue new opens or auto-open notices for each speech', async () => {

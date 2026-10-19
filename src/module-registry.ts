@@ -341,14 +341,9 @@ export class ModuleRegistry {
       };
     }
 
-    // Create a call with the un-prefixed name (preserving caller identity and turn)
-    const moduleCall: ToolCall = {
-      id: call.id,
-      name: toolName,
-      input: call.input,
-      callerAgentName: call.callerAgentName,
-      ...(call.callerTurnId !== undefined ? { callerTurnId: call.callerTurnId } : {}),
-    };
+    // The call as it came, with the un-prefixed name: the caller's identity
+    // and everything else the dispatch set on it reach the module.
+    const moduleCall: ToolCall = { ...call, name: toolName };
 
     try {
       // The call against the tool's declared schema, before the module runs:

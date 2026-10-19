@@ -916,6 +916,22 @@ describe('a file tool naming a path passed over by design', () => {
     });
   }
 
+  test('edit_many edits files passed over by design, each by its path, as a sync naming them takes them in (#276)', async (t) => {
+    const env = new Env(t);
+    env.writeDisk('node_modules/pkg/a.d.ts', 'a v1\n');
+    env.writeDisk('build.log', 'log v1\n');
+    const m = await env.open({ ignore: ['node_modules', '*.log'], autoMaterialize: true });
+    await call(m, 'sync', {});
+    assert.deepEqual(env.store.treeList(TREE), [], 'a sync without a path passes over both');
+    await call(m, 'edit_many', { edits: [
+      { path: 'work/node_modules/pkg/a.d.ts', oldString: 'v1', newString: 'v2' },
+      { path: 'work/build.log', oldString: 'v1', newString: 'v2' },
+    ] });
+    assert.equal(env.readDisk('node_modules/pkg/a.d.ts'), 'a v2\n', 'the edits reached disk');
+    assert.equal(env.readDisk('build.log'), 'log v2\n');
+    assert.deepEqual(env.store.treeList(TREE).map((e: { path: string }) => e.path).sort(), ['build.log', 'node_modules/pkg/a.d.ts']);
+  });
+
   test("the nested mount's refusal comes first, and the lazy pass takes nothing in from another mount's directory", async (t) => {
     const env = new Env(t);
     env.writeDisk('node_modules/pkg/inner.txt', 'inner');
@@ -931,6 +947,8 @@ describe('a file tool naming a path passed over by design', () => {
       const said = await refused(m, tool, input);
       assert.ok(said.includes('mount "deep"') && said.includes('"deep/inner.txt"'), `${tool}: ${said}`);
     }
+    const many = await refused(m, 'edit_many', { edits: [{ path: 'work/node_modules/pkg/inner.txt', oldString: 'inner', newString: 'outer' }] });
+    assert.ok(many.includes('mount "deep"') && many.includes('"deep/inner.txt"') && many.includes('which neither reads nor writes it'), `edit_many: ${many}`);
     // The lazy pass itself, reached past the refusal, observes nothing there.
     const mount = (m as any).mounts.get('work');
     await (m as any).withMount(mount, () => (m as any).ensureSynced(mount, 'node_modules/pkg/inner.txt'));
@@ -1040,6 +1058,18 @@ describe("another mount's directory, to the outer mount's file tools and pushes"
       const said = await refused(m, tool, input as Record<string, unknown>);
       assert.ok(said.includes('mount "deep"') && said.includes(`"${use}"`), `${tool} ${input.path}: ${said}`);
     }
+    // edit and edit_many refuse such a path as they check it, before any pass
+    // (parseFilePath), and edit_many stores none of its edits, the outer
+    // mount's own included.
+    const nestedRefusal = '"work/a/b/inner.txt" lies in mount "deep", nested in mount "work", which neither reads nor writes it: use "deep/inner.txt".';
+    assert.equal(await refused(m, 'edit', { path: 'work/a/b/inner.txt', oldString: 'inner', newString: 'outer' }), nestedRefusal);
+    assert.equal(await refused(m, 'edit_many', { edits: [{ path: 'work/a/b/inner.txt', oldString: 'inner', newString: 'outer' }] }),
+      `The edit_many call stored none of its edits: 1 problem.\n\nedit 1: ${nestedRefusal}`);
+    assert.equal(await refused(m, 'edit_many', { edits: [
+      { path: 'work/top.txt', oldString: 'top', newString: 'TOP' },
+      { path: 'work/a/b/inner.txt', oldString: 'inner', newString: 'outer' },
+    ] }), `The edit_many call stored none of its edits: 1 problem.\n\nedit 2: ${nestedRefusal}`);
+    assert.match((await call(m, 'read', { path: 'work/top.txt' })).content, /^ +1\ttop$/, "the outer mount's own file is as it was");
     assert.equal(env.readDisk('a/b/inner.txt'), 'inner');
     assert.equal(existsSync(env.disk('a/b/sub/new.txt')), false);
     assert.equal(env.store.treeList(TREE).some((e: { path: string }) => e.path.startsWith('a/b/')), false, 'the outer store gains nothing there');
@@ -2549,7 +2579,7 @@ describe("a file's mode is kept with its bytes", () => {
     assert.equal(storedMode(env, 'n.txt'), 0o100644);
   });
 
-  for (const tool of ['write', 'edit', 'writeBinary'] as const) {
+  for (const tool of ['write', 'edit', 'edit_many', 'writeBinary'] as const) {
     test(`an autoMaterialize ${tool} whose mode stays as disk had it succeeds, and its result says so: its bytes reached disk`, async (t) => {
       const env = new Env(t);
       const m = await env.open({ autoMaterialize: true });
@@ -2565,7 +2595,10 @@ describe("a file's mode is kept with its bytes", () => {
           ? await call(m, 'write', { path: 'work/a.sh', content: 'echo a v2\n' })
           : tool === 'edit'
             ? await call(m, 'edit', { path: 'work/a.sh', oldString: 'echo a', newString: 'echo a v2' })
-            : ((await m.writeBinary('work/a.sh', Buffer.from('echo a v2\n'), 'text/x-sh')).data as Record<string, unknown>);
+            : tool === 'edit_many'
+              // edit_many gives it in the file's entry.
+              ? ((await call(m, 'edit_many', { edits: [{ path: 'work/a.sh', oldString: 'echo a', newString: 'echo a v2' }] })).files as Array<Record<string, unknown>>)[0]!
+              : ((await m.writeBinary('work/a.sh', Buffer.from('echo a v2\n'), 'text/x-sh')).data as Record<string, unknown>);
       } finally {
         restore();
       }
@@ -2575,6 +2608,36 @@ describe("a file's mode is kept with its bytes", () => {
       assert.equal(env.events.filter((x) => (x as { type?: string }).type === 'workspace:materialize-failed').length, 0);
     });
   }
+
+  test('an autoMaterialize edit_many that disk takes in part notes each file it took at the mode disk had, as its success answer does', async (t) => {
+    const env = new Env(t);
+    const m = await env.open({ autoMaterialize: true });
+    env.writeDisk('a.sh', 'echo a\n');
+    chmodSync(env.disk('a.sh'), 0o644);
+    env.writeDisk('linked.txt', 'shared\n');
+    await call(m, 'sync', {});
+    // A file with other hard links isn't written, so its push is refused.
+    linkSync(env.disk('linked.txt'), env.disk('linked-too.txt'));
+    const e = env.store.treeGet(TREE, 'a.sh')!;
+    env.store.treeSet(TREE, 'a.sh', { blobHash: e.blobHash, size: e.size, mode: 0o100755 });
+    const restore = await refuseChmod();
+    let error: string;
+    try {
+      error = await refused(m, 'edit_many', { edits: [
+        { path: 'work/a.sh', oldString: 'echo a', newString: 'echo a v2' },
+        { path: 'work/linked.txt', oldString: 'shared', newString: 'SHARED' },
+      ] });
+    } finally {
+      restore();
+    }
+    assert.equal(env.readDisk('a.sh'), 'echo a v2\n');
+    assert.equal(modeOf(env, 'a.sh'), 0o644, "disk's mode kept");
+    // The file disk refused makes one event, and the file it took makes none.
+    assert.deepEqual(env.events.filter((x) => (x as { type?: string }).type === 'workspace:materialize-failed')
+      .map((x) => { const { mount, path, op } = x as unknown as { mount: string; path: string; op: string }; return [mount, path, op]; }),
+    [['work', 'linked.txt', 'write']]);
+    assert.match(error, /\n\nDisk took 1 of the call's 2 files\. This file's push didn't complete:\n\nwork\/linked\.txt: not written: a file with other hard links[^\n]*\n\nDisk took work\/a\.sh: written, its mode left at 0644: the kernel refused the chmod, so the workspace's \(0755\) isn't given, and a sync takes disk's mode in\.$/);
+  });
 
   test("an autoMaterialize write whose narrowing the kernel refuses fails, saying why and from which mode to which, in the write tools' frame", async (t) => {
     const env = new Env(t);
@@ -3708,7 +3771,7 @@ describe('restarts and faults', () => {
     const m = await pendingAdoption(env);
     env.writeDisk('a.txt', 'C');
     const error = await refused(m, 'edit', { path: 'work/a.txt', oldString: 'A', newString: 'B' });
-    assert.match(error, /String not found/, 'the entry is disk\'s C by then, so an edit of A has nothing to replace');
+    assert.match(error, /^The edit did nothing: oldString isn't in work\/a\.txt\./, 'the entry is disk\'s C by then, so an edit of A has nothing to replace');
     assert.equal(await contentOf(m, 'a.txt'), 'C');
     assert.equal(await stateOf(m, 'a.txt'), 'synced');
   });
@@ -3720,7 +3783,8 @@ describe('restarts and faults', () => {
     assert.equal((m as any).agreement.get('work', 'a.txt').kind, 'pending');
     env.writeDisk('a.txt', 'C');
     const error = await refused(m, 'edit', { path: 'work/a.txt', oldString: 'A', newString: 'B' });
-    assert.match(error, /String not found/, 'the entry is disk\'s C by then, so an edit of A has nothing to replace');
+    assert.match(error, /^The edit did nothing: oldString isn't in work\/a\.txt\./, 'the entry is disk\'s C by then, so an edit of A has nothing to replace');
+    assert.match(error, /Disk's copy had changed since the workspace last agreed with it, so it was taken in first/);
     assert.equal(await contentOf(m, 'a.txt'), 'C');
   });
 

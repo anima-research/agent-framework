@@ -130,6 +130,14 @@ test('a read, write, edit and delete spelled in another case act on disk\'s file
     const edit = await call('edit', { path: 'work/Src/B.ts', oldString: '2', newString: '3' });
     assert.equal((edit.data as { path: string }).path, 'work/src/b.ts');
     assert.equal(readFileSync(join(dir, 'src', 'b.ts'), 'utf8'), 'export const b = 3;\n');
+    // edit_many takes two spellings of one file as that file, planned once
+    // from one text, and names it as disk does.
+    const many = await call('edit_many', { edits: [
+      { path: 'work/SRC/B.TS', oldString: 'b', newString: 'c' },
+      { path: 'work/src/b.ts', oldString: '3', newString: '4' },
+    ] });
+    assert.deepEqual((many.data as { files: Array<{ path: string; edits: number[] }> }).files.map((f) => [f.path, f.edits]), [['work/src/b.ts', [1, 2]]]);
+    assert.equal(readFileSync(join(dir, 'src', 'b.ts'), 'utf8'), 'export const c = 4;\n');
 
     const listed = await call('ls', { path: 'work', recursive: true });
     assert.deepEqual((listed.data as { entries: Array<{ path: string }> }).entries.map((e) => e.path), ['src/a.ts', 'src/b.ts']);

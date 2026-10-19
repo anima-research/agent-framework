@@ -165,9 +165,11 @@ test('a write, edit or delete that throws after its tree entry is set says the c
   const intents = ws.intents.get('work')!;
   const update = intents.update;
   writeFileSync(join(dir, 'e.txt'), 'line\n');
-  writeFileSync(join(dir, 'd.txt'), 'doomed\n');
   assert.equal((await call('read', { path: 'work/e.txt' })).success, true);
-  assert.equal((await call('read', { path: 'work/d.txt' })).success, true);
+  // A draft the workspace made, which disk never agreed with: its deletion
+  // clears the path's intent once the entry is gone. A deletion that leaves
+  // a tombstone writes it first (the test after this one).
+  assert.equal((await call('write', { path: 'work/d.txt', content: 'draft\n' })).success, true);
   intents.update = () => { throw new Error('injected intent exception'); };
   try {
     const write = await call('write', { path: 'work/w.txt', content: 'new\n' });
@@ -184,6 +186,404 @@ test('a write, edit or delete that throws after its tree entry is set says the c
   }
   assert.equal(await stored('w.txt'), 'new\n');
   assert.equal(await stored('e.txt'), 'line, edited\n');
+  assert.equal((await call('read', { path: 'work/d.txt' })).success, false);
+});
+
+test("a deletion whose tombstone can't be written is refused and stores nothing, so it can be sent again and a materialize deletes the file", async (t) => {
+  const { workspace, store, dir, call, stored, disk } = setup(t);
+  const ws = workspace as unknown as { intents: Map<string, { update: (...args: unknown[]) => unknown; get(path: string): unknown }> };
+  const intents = ws.intents.get('work')!;
+  const update = intents.update;
+  const pendingDeletions = async () => ((await call('status', { mount: 'work' })).data as Record<string, { pendingWorkspaceDeletions: number }>).work!.pendingWorkspaceDeletions;
+  writeFileSync(join(dir, 'd.txt'), 'doomed\n');
+  assert.equal((await call('read', { path: 'work/d.txt' })).success, true);
+  // agent-framework #553's case: the removal's record lands and the store
+  // throws after it (anima-research/chronicle#39), and every intent write
+  // fails. Stored without its tombstone, the deletion would read as a file
+  // this branch doesn't have, which no materialize deletes and no second
+  // delete can reach. The tombstone is written first, so its failure stops
+  // the deletion before the removal.
+  const s = store as unknown as Record<string, (...args: unknown[]) => unknown>;
+  const realRemove = store.treeRemove;
+  let removals = 0;
+  s.treeRemove = (...args) => {
+    removals++;
+    realRemove.apply(store, args as never);
+    throw new Error('No space left on device (os error 28)');
+  };
+  intents.update = () => { throw new Error('injected intent exception'); };
+  try {
+    assert.equal(errorOf(await call('delete', { path: 'work/d.txt' })), 'injected intent exception');
+  } finally {
+    delete s.treeRemove;
+    intents.update = update;
+  }
+  assert.equal(removals, 0, 'the removal never ran');
+  // The tombstone's record lands and the store throws after it: the
+  // deletion stops there too, and the tombstone is put back.
+  intents.update = (...args: unknown[]) => {
+    update.apply(intents, args);
+    throw new Error('No space left on device (os error 28)');
+  };
+  try {
+    assert.equal(errorOf(await call('delete', { path: 'work/d.txt' })), 'No space left on device (os error 28)');
+  } finally {
+    intents.update = update;
+  }
+  assert.equal(intents.get('d.txt'), null, 'the tombstone was put back');
+  assert.equal(await pendingDeletions(), 0);
+  assert.equal(await stored('d.txt'), 'doomed\n');
+  assert.equal(disk('d.txt')!.toString(), 'doomed\n');
+  const del = await call('delete', { path: 'work/d.txt' });
+  assert.equal(del.success, true, del.error);
+  assert.equal(await pendingDeletions(), 1);
+  const deleted = await call('materialize', { path: 'work/d.txt', applyDeletions: true });
+  assert.equal(deleted.success, true, deleted.error);
+  assert.equal(disk('d.txt'), null);
+});
+
+test("a deletion that lands gives up its path's store origin, and one whose removal fails puts the path's intent back as it was", async (t) => {
+  const { workspace, store, dir, call, stored } = setup(t);
+  type Intent = { tombstone?: unknown; origin?: string };
+  const ws = workspace as unknown as { intents: Map<string, { get(path: string): Intent | null; update(path: string, change: (cur: Intent) => Intent): void }> };
+  const intents = ws.intents.get('work')!;
+  writeFileSync(join(dir, 'k.txt'), 'kept\n');
+  assert.equal((await call('read', { path: 'work/k.txt' })).success, true);
+  // A store origin, given here directly. A draft keeps one while a push of
+  // it is pending or interrupted, which is when a deletion that keeps a
+  // tombstone meets one, and the tombstone's write gives it up.
+  intents.update('k.txt', (cur) => ({ ...cur, origin: 'store' }));
+  // A damaged intent record, whose blob the store lacks: what it held is
+  // unknown, so the put-back restores the record itself.
+  writeFileSync(join(dir, 'u.txt'), 'unknown\n');
+  assert.equal((await call('read', { path: 'work/u.txt' })).success, true);
+  const intentTree = (workspace as unknown as { intents: Map<string, { treeStateId: string }> }).intents.get('work')!.treeStateId;
+  store.treeSet(intentTree, 'u.txt', { blobHash: 'f'.repeat(64), size: 2, mode: 0 });
+  const damaged = store.treeGet(intentTree, 'u.txt');
+  assert.ok('unreadable' in (intents.get('u.txt') ?? {}));
+  // A deletion that lands leaves its tombstone alone, the origin given up,
+  // as before the tombstone was written first.
+  writeFileSync(join(dir, 'o.txt'), 'other\n');
+  assert.equal((await call('read', { path: 'work/o.txt' })).success, true);
+  intents.update('o.txt', (cur) => ({ ...cur, origin: 'store' }));
+  const mountTree = (workspace as unknown as { mounts: Map<string, { treeStateId: string }> }).mounts.get('work')!.treeStateId;
+  const deleted = store.treeGet(mountTree, 'o.txt')!.blobHash;
+  assert.equal((await call('delete', { path: 'work/o.txt' })).success, true);
+  assert.deepEqual(intents.get('o.txt'), { tombstone: { hash: deleted } });
+  const s = store as unknown as Record<string, (...args: unknown[]) => unknown>;
+  s.treeRemove = () => { throw new Error('injected store failure'); };
+  try {
+    assert.equal(errorOf(await call('delete', { path: 'work/k.txt' })), 'injected store failure');
+    assert.equal(errorOf(await call('delete', { path: 'work/u.txt' })), 'injected store failure');
+  } finally {
+    delete s.treeRemove;
+  }
+  assert.deepEqual(intents.get('k.txt'), { origin: 'store' }, 'the intent as it was, with no tombstone and its origin');
+  assert.deepEqual(store.treeGet(intentTree, 'u.txt'), damaged, 'the damaged record as it was');
+  assert.equal(await stored('k.txt'), 'kept\n');
+});
+
+test("a tombstone a put-back couldn't take back deletes nothing, is no deletion to status or a bare materialize, and goes at the next agreement", async (t) => {
+  const { workspace, store, dir, call, stored, disk } = setup(t);
+  const ws = workspace as unknown as { intents: Map<string, { get(path: string): { tombstone?: unknown } | null }> };
+  const intents = ws.intents.get('work')!;
+  const pendingDeletions = async () => ((await call('status', { mount: 'work' })).data as Record<string, { pendingWorkspaceDeletions: number }>).work!.pendingWorkspaceDeletions;
+  writeFileSync(join(dir, 'k.txt'), 'kept\n');
+  assert.equal((await call('read', { path: 'work/k.txt' })).success, true);
+  // The removal fails, and so does the put-back, which removes the record
+  // the tombstone's write made. The put-back's failure is logged, naming the
+  // mount and the path, and the call answers with the removal's error.
+  const s = store as unknown as Record<string, (...args: unknown[]) => unknown>;
+  s.treeRemove = () => { throw new Error('injected store failure'); };
+  const warn = console.warn;
+  const warnings: string[] = [];
+  console.warn = (...args: unknown[]) => { warnings.push(args.map(String).join(' ')); };
+  try {
+    assert.equal(errorOf(await call('delete', { path: 'work/k.txt' })), 'injected store failure');
+  } finally {
+    delete s.treeRemove;
+    console.warn = warn;
+  }
+  assert.equal(warnings.length, 1, warnings.join('\n'));
+  assert.match(warnings[0]!, /Mount "work": a change to k\.txt failed, and putting its branch intent back threw too \(injected store failure\)/);
+  assert.ok(intents.get('k.txt')?.tombstone, 'the tombstone is still beside the entry');
+  assert.equal(await pendingDeletions(), 0);
+  // Disk changes since it agreed. A bare materialize, forced, leaves an
+  // agreed entry out, the tombstone notwithstanding, so disk's change stays.
+  writeFileSync(join(dir, 'k.txt'), 'changed on disk\n');
+  const forced = await call('materialize', { force: true, applyDeletions: true });
+  assert.equal(forced.success, true, forced.error);
+  assert.equal(disk('k.txt')!.toString(), 'changed on disk\n');
+  // The next sync adopts disk's change, which clears the tombstone.
+  const synced = await call('sync', {});
+  assert.equal(synced.success, true, synced.error);
+  assert.equal(await stored('k.txt'), 'changed on disk\n');
+  assert.equal(intents.get('k.txt'), null);
+});
+
+test("a deletion whose removal lands while reading the tree back fails keeps its tombstone, so the deletion stays pending", async (t) => {
+  const { workspace, store, dir, call, disk } = setup(t);
+  const ws = workspace as unknown as {
+    intents: Map<string, { get(path: string): { tombstone?: unknown } | null }>;
+    mounts: Map<string, { treeStateId: string }>;
+  };
+  const intents = ws.intents.get('work')!;
+  const mountTree = ws.mounts.get('work')!.treeStateId;
+  const pendingDeletions = async () => ((await call('status', { mount: 'work' })).data as Record<string, { pendingWorkspaceDeletions: number }>).work!.pendingWorkspaceDeletions;
+  writeFileSync(join(dir, 'l.txt'), 'landed\n');
+  assert.equal((await call('read', { path: 'work/l.txt' })).success, true);
+  // The removal's record lands and the store throws after it
+  // (anima-research/chronicle#39), and reading the tree back throws once, so
+  // nothing can tell whether the removal landed. Putting the tombstone back
+  // here would leave #553's state: an entry gone with no tombstone, which no
+  // materialize deletes.
+  const s = store as unknown as Record<string, (...args: unknown[]) => unknown>;
+  const realRemove = store.treeRemove;
+  const realGet = store.treeGet;
+  let failRead = false;
+  s.treeRemove = (...args) => {
+    const record = realRemove.apply(store, args as never);
+    if (args[0] !== mountTree) return record;
+    failRead = true;
+    throw new Error('No space left on device (os error 28)');
+  };
+  s.treeGet = (...args) => {
+    if (failRead && args[0] === mountTree) {
+      failRead = false;
+      throw new Error('injected read failure');
+    }
+    return realGet.apply(store, args as never);
+  };
+  try {
+    assert.match(errorOf(await call('delete', { path: 'work/l.txt' })), /reading its entries back failed too \(injected read failure\), so whether the change is stored isn't known$/);
+  } finally {
+    delete s.treeRemove;
+    delete s.treeGet;
+  }
+  assert.ok(intents.get('l.txt')?.tombstone, 'the tombstone stays');
+  assert.equal(await pendingDeletions(), 1);
+  const deleted = await call('materialize', { path: 'work/l.txt', applyDeletions: true });
+  assert.equal(deleted.success, true, deleted.error);
+  assert.equal(disk('l.txt'), null);
+});
+
+test("a write over a deleted path clears its tombstone, and one that stops before its intent update leaves it beside the entry, which status doesn't count as a deletion", async (t) => {
+  const { workspace, dir, call, disk } = setup(t);
+  const ws = workspace as unknown as { intents: Map<string, { update: (...args: unknown[]) => unknown; get(path: string): { tombstone?: unknown } | null }> };
+  const intents = ws.intents.get('work')!;
+  const update = intents.update;
+  const pendingDeletions = async () => ((await call('status', { mount: 'work' })).data as Record<string, { pendingWorkspaceDeletions: number }>).work!.pendingWorkspaceDeletions;
+  writeFileSync(join(dir, 'h.txt'), 'gone\n');
+  assert.equal((await call('read', { path: 'work/h.txt' })).success, true);
+  assert.equal((await call('delete', { path: 'work/h.txt' })).success, true);
+  assert.ok(intents.get('h.txt')?.tombstone);
+  assert.equal((await call('write', { path: 'work/h.txt', content: 'back\n' })).success, true);
+  assert.equal(intents.get('h.txt'), null, 'the write took the tombstone away');
+  writeFileSync(join(dir, 'g.txt'), 'gone\n');
+  assert.equal((await call('read', { path: 'work/g.txt' })).success, true);
+  assert.equal((await call('delete', { path: 'work/g.txt' })).success, true);
+  assert.equal(await pendingDeletions(), 1);
+  intents.update = () => { throw new Error('injected intent exception'); };
+  try {
+    assert.match(errorOf(await call('write', { path: 'work/g.txt', content: 'back\n' })), /^The write of "work\/g\.txt" is stored in the workspace/);
+  } finally {
+    intents.update = update;
+  }
+  assert.ok(intents.get('g.txt')?.tombstone, 'the write left the tombstone');
+  assert.equal(await pendingDeletions(), 0);
+  const materialized = await call('materialize', { path: 'work/g.txt', applyDeletions: true });
+  assert.equal(materialized.success, true, materialized.error);
+  assert.equal(disk('g.txt')!.toString(), 'back\n');
+});
+
+test('a write, edit or delete whose store throws after recording it says the change is stored', async (t) => {
+  const { workspace, store, dir, call, stored } = setup(t);
+  writeFileSync(join(dir, 'e.txt'), 'line\n');
+  writeFileSync(join(dir, 'd.txt'), 'doomed\n');
+  assert.equal((await call('read', { path: 'work/e.txt' })).success, true);
+  assert.equal((await call('read', { path: 'work/d.txt' })).success, true);
+  // The change's record lands, then the store throws, as Chronicle 0.4 does
+  // when the auto-snapshot it writes after recording fails
+  // (anima-research/chronicle#39). Only that record's set throws: the
+  // intents' own records go through, a deletion's tombstone before it among
+  // them.
+  const s = store as unknown as Record<string, (...args: unknown[]) => unknown>;
+  const mountTree = (workspace as unknown as { mounts: Map<string, { treeStateId: string }> }).mounts.get('work')!.treeStateId;
+  let armed = false;
+  for (const name of ['treeSet', 'treeRemove']) {
+    const real = s[name]!;
+    s[name] = (...args) => {
+      const record = real.apply(store, args);
+      if (!armed || args[0] !== mountTree) return record;
+      armed = false;
+      throw new Error('No space left on device (os error 28)');
+    };
+  }
+  try {
+    armed = true;
+    assert.equal(errorOf(await call('write', { path: 'work/w.txt', content: 'new\n' })),
+      'The write of "work/w.txt" is stored in the workspace, so don\'t send it again. The store failed after recording it: No space left on device (os error 28).');
+    armed = true;
+    assert.equal(errorOf(await call('edit', { path: 'work/e.txt', oldString: 'line', newString: 'line, edited' })),
+      'The edit of "work/e.txt" is stored in the workspace, so don\'t send it again: a second edit can apply the change twice. '
+      + 'The store failed after recording it: No space left on device (os error 28).');
+    armed = true;
+    assert.equal(errorOf(await call('delete', { path: 'work/d.txt' })),
+      'The deletion of "work/d.txt" is stored in the workspace, so don\'t send it again. The store failed after recording it: No space left on device (os error 28).');
+    // writeBinary's peer callers read inChronicle as the file being there.
+    armed = true;
+    assert.deepEqual(await workspace.writeBinary('work/b.bin', Buffer.from([0, 1, 2]), 'application/octet-stream'), {
+      success: false,
+      isError: true,
+      error: 'Stored "work/b.bin" in Chronicle, but the store failed after recording it: No space left on device (os error 28).',
+      data: { inChronicle: true },
+    });
+    assert.equal(armed, false);
+  } finally {
+    delete s.treeSet;
+    delete s.treeRemove;
+  }
+  assert.equal(await stored('w.txt'), 'new\n');
+  assert.equal(await stored('e.txt'), 'line, edited\n');
+  assert.equal((await call('read', { path: 'work/d.txt' })).success, false);
+  // Its tombstone went in before the removal, so the deletion is pending,
+  // for a materialize with applyDeletions (on a mount that pushes, the test
+  // after this one makes it).
+  assert.equal(((await call('status', { mount: 'work' })).data as Record<string, { pendingWorkspaceDeletions: number }>).work!.pendingWorkspaceDeletions, 1);
+
+  // A store that throws before recording a change leaves it unstored, as
+  // reading it back shows, and the store's error is the answer.
+  writeFileSync(join(dir, 'k.txt'), 'kept\n');
+  assert.equal((await call('read', { path: 'work/k.txt' })).success, true);
+  for (const name of ['treeSet', 'treeRemove']) s[name] = () => { throw new Error('injected store failure'); };
+  try {
+    assert.equal(errorOf(await call('write', { path: 'work/k.txt', content: 'changed\n' })), 'injected store failure');
+    assert.equal(errorOf(await call('edit', { path: 'work/k.txt', oldString: 'kept', newString: 'changed' })), 'injected store failure');
+    assert.equal(errorOf(await call('delete', { path: 'work/k.txt' })), 'injected store failure');
+  } finally {
+    delete s.treeSet;
+    delete s.treeRemove;
+  }
+  assert.equal(await stored('k.txt'), 'kept\n');
+  // The read-back compares the whole entry, its mode included. An overwrite
+  // keeps the file's mode, so no tool sets the same bytes under another mode;
+  // the commit is called here as one would. A set the store records before
+  // throwing reads back as landed, and one it doesn't, as not.
+  const internals = workspace as unknown as {
+    mounts: Map<string, { treeStateId: string }>;
+    withMount<T>(mount: unknown, fn: () => Promise<T>): Promise<T>;
+    commitToolChanges(mount: unknown, changes: Array<{ path: string; change: { kind: 'set'; blobHash: string; size: number; mode: number } }>): Promise<unknown>;
+  };
+  const mount = internals.mounts.get('work')!;
+  const treeStateId = mount.treeStateId;
+  store.treeSet(treeStateId, 'k.txt', { ...store.treeGet(treeStateId, 'k.txt')!, mode: 0o755 });
+  const held = store.treeGet(treeStateId, 'k.txt')!;
+  const asMode644 = () => internals.withMount(mount, () => internals.commitToolChanges(mount,
+    [{ path: 'k.txt', change: { kind: 'set', blobHash: held.blobHash, size: held.size, mode: 0o644 } }]));
+  const realSet = store.treeSet;
+  for (const records of [false, true]) {
+    let once = true;
+    s.treeSet = (...args) => {
+      if (!once) return realSet.apply(store, args as never);
+      once = false;
+      if (records) realSet.apply(store, args as never);
+      throw new Error('No space left on device (os error 28)');
+    };
+    try {
+      await assert.rejects(asMode644(), (error: Error) => error.name === (records ? 'StoredThenFailed' : 'Error'));
+    } finally {
+      delete s.treeSet;
+    }
+    assert.equal(store.treeGet(treeStateId, 'k.txt')!.mode, records ? 0o644 : 0o755);
+  }
+  // The written path's intent followed the record, so the new file is a draft
+  // the workspace made, not a file disk may have deleted.
+  const edited = await call('edit', { path: 'work/w.txt', oldString: 'new', newString: 'newer' });
+  assert.equal(edited.success, true, edited.error);
+  assert.doesNotMatch(String((edited.data as { note?: string }).note ?? ''), /nothing records/);
+});
+
+test('on a mount that pushes, a write, edit or delete whose store throws after recording it says its push didn\'t run, and a materialize takes it to disk', async (t) => {
+  const { workspace, store, dir, call, disk } = setup(t, { autoMaterialize: true });
+  writeFileSync(join(dir, 'e.txt'), 'line\n');
+  writeFileSync(join(dir, 'd.txt'), 'doomed\n');
+  assert.equal((await call('read', { path: 'work/e.txt' })).success, true);
+  assert.equal((await call('read', { path: 'work/d.txt' })).success, true);
+  // As in the test above, only the change's own record throws.
+  const s = store as unknown as Record<string, (...args: unknown[]) => unknown>;
+  const mountTree = (workspace as unknown as { mounts: Map<string, { treeStateId: string }> }).mounts.get('work')!.treeStateId;
+  let armed = false;
+  for (const name of ['treeSet', 'treeRemove']) {
+    const real = s[name]!;
+    s[name] = (...args) => {
+      const record = real.apply(store, args);
+      if (!armed || args[0] !== mountTree) return record;
+      armed = false;
+      throw new Error('No space left on device (os error 28)');
+    };
+  }
+  const failed = 'The store failed after recording it: No space left on device (os error 28). ';
+  const writes = "Its push to disk didn't run, so disk lacks the change until a materialize of the path writes it.";
+  try {
+    armed = true;
+    assert.equal(errorOf(await call('write', { path: 'work/w.txt', content: 'new\n' })),
+      `The write of "work/w.txt" is stored in the workspace, so don't send it again. ${failed}${writes}`);
+    armed = true;
+    assert.equal(errorOf(await call('edit', { path: 'work/e.txt', oldString: 'line', newString: 'line, edited' })),
+      `The edit of "work/e.txt" is stored in the workspace, so don't send it again: a second edit can apply the change twice. ${failed}${writes}`);
+    armed = true;
+    assert.equal(errorOf(await call('delete', { path: 'work/d.txt' })),
+      `The deletion of "work/d.txt" is stored in the workspace, so don't send it again. ${failed}`
+      + "Its push to disk didn't run, so disk keeps the file until a materialize of the path with applyDeletions deletes it.");
+    armed = true;
+    assert.deepEqual(await workspace.writeBinary('work/b.bin', Buffer.from([0, 1, 2]), 'application/octet-stream'), {
+      success: false,
+      isError: true,
+      error: `Stored "work/b.bin" in Chronicle, but the store failed after recording it: No space left on device (os error 28). `
+        + "Its push to disk didn't run, so disk lacks the change until a materialize of the path writes it.",
+      data: { inChronicle: true },
+    });
+    assert.equal(armed, false);
+  } finally {
+    delete s.treeSet;
+    delete s.treeRemove;
+  }
+  assert.equal(disk('w.txt'), null);
+  assert.equal(disk('b.bin'), null);
+  assert.equal(disk('e.txt')!.toString(), 'line\n');
+  assert.equal(disk('d.txt')!.toString(), 'doomed\n');
+  // As each answer says, a materialize of the path takes the change to disk.
+  for (const path of ['work/w.txt', 'work/b.bin', 'work/e.txt']) {
+    const result = await call('materialize', { path });
+    assert.equal(result.success, true, result.error);
+  }
+  const deleted = await call('materialize', { path: 'work/d.txt', applyDeletions: true });
+  assert.equal(deleted.success, true, deleted.error);
+  assert.equal(disk('w.txt')!.toString(), 'new\n');
+  assert.deepEqual([...disk('b.bin')!], [0, 1, 2]);
+  assert.equal(disk('e.txt')!.toString(), 'line, edited\n');
+  assert.equal(disk('d.txt'), null);
+
+  // A write of the bytes its path holds already leaves nothing a read back
+  // could tell apart, so a set that throws is answered with the store's
+  // error, whether it recorded first or not.
+  const treeStateId = (workspace as unknown as { mounts: Map<string, { treeStateId: string }> }).mounts.get('work')!.treeStateId;
+  const realSet = store.treeSet;
+  for (const records of [false, true]) {
+    const sets: unknown[][] = [];
+    s.treeSet = (...args) => {
+      sets.push(args.slice(0, 2));
+      if (records) realSet.apply(store, args as never);
+      throw new Error('No space left on device (os error 28)');
+    };
+    try {
+      assert.equal(errorOf(await call('write', { path: 'work/e.txt', content: 'line, edited\n' })), 'No space left on device (os error 28)');
+    } finally {
+      delete s.treeSet;
+    }
+    assert.deepEqual(sets, [[treeStateId, 'e.txt']]);
+  }
+  assert.equal(disk('e.txt')!.toString(), 'line, edited\n');
 });
 
 // ---------------------------------------------------------------------------
@@ -252,11 +652,14 @@ test("an edit applies to disk's text when disk changed and the store didn't, and
 
   // Text only the older copy held isn't there to replace, and the refusal says why.
   writeFileSync(join(dir, 's.txt'), 'v3 from another writer\n');
-  assert.match(errorOf(await call('edit', { path: 'work/s.txt', oldString: 'LINE', newString: 'x' })),
-    /^String not found in work\/s\.txt\. Disk's copy had changed since the workspace last agreed with it, so it was taken in first, and the edit looked in that text\.$/);
+  assert.equal(errorOf(await call('edit', { path: 'work/s.txt', oldString: 'LINE', newString: 'x' })),
+    "The edit did nothing: oldString isn't in work/s.txt.\nMatch exactly, including whitespace and indentation.\n\n"
+    + "Disk's copy had changed since the workspace last agreed with it, so it was taken in first, and the edit looked in that text.");
   writeFileSync(join(dir, 's.txt'), 'v4 twice twice\n');
   assert.equal(errorOf(await call('edit', { path: 'work/s.txt', oldString: 'twice', newString: 'x' })),
-    "String found 2 times in work/s.txt. Use replaceAll: true or provide more context. Disk's copy had changed since the workspace last agreed with it, so it was taken in first, and the edit looked in that text.");
+    'The edit did nothing: oldString occurs 2 times in work/s.txt (on line 1). '
+    + 'Add the text around it to make it unique, or set replaceAll to replace every one.\n     1\tv4 twice twice\n\n'
+    + "Disk's copy had changed since the workspace last agreed with it, so it was taken in first, and the edit looked in that text.");
 });
 
 test('an edit of a draft whose disk copy also changed applies to the draft and names the conflict', async (t) => {
@@ -268,9 +671,12 @@ test('an edit of a draft whose disk copy also changed applies to the draft and n
 
   // A miss says so too: the text the agent sought may be disk's.
   assert.equal(errorOf(await call('edit', { path: 'work/k.txt', oldString: 'another', newString: 'x' })),
-    "String not found in work/k.txt. The path is in conflict with disk (both-changed): the edit looked in the workspace's copy. Sync the path to keep disk's copy and give up the workspace's, or materialize it with force to write the workspace's over disk's.");
+    "The edit did nothing: oldString isn't in work/k.txt.\nMatch exactly, including whitespace and indentation.\n\n"
+    + "The path is in conflict with disk (both-changed): the edit looked in the workspace's copy. Sync the path to keep disk's copy and give up the workspace's, or materialize it with force to write the workspace's over disk's.");
   assert.equal(errorOf(await call('edit', { path: 'work/k.txt', oldString: 'a', newString: 'x' })),
-    "String found 2 times in work/k.txt. Use replaceAll: true or provide more context. The path is in conflict with disk (both-changed): the edit looked in the workspace's copy. Sync the path to keep disk's copy and give up the workspace's, or materialize it with force to write the workspace's over disk's.");
+    'The edit did nothing: oldString occurs 2 times in work/k.txt (on line 1). Add the text around it to make it unique, or set replaceAll to replace every one.\n'
+    + '     1\tagent draft\n\n'
+    + "The path is in conflict with disk (both-changed): the edit looked in the workspace's copy. Sync the path to keep disk's copy and give up the workspace's, or materialize it with force to write the workspace's over disk's.");
   const edit = await call('edit', { path: 'work/k.txt', oldString: 'draft', newString: 'draft, edited' });
   assert.equal(edit.success, true, edit.error);
   assert.equal((edit.data as { note: string }).note,
@@ -287,7 +693,7 @@ test("an edit refused for a workspace copy that isn't valid UTF-8 names the path
   store.treeSet('workspace/work/tree', 'c.txt', { blobHash: store.storeBlob(latin1, 'text/plain'), size: latin1.byteLength, mode: 0o644 });
   writeFileSync(join(dir, 'c.txt'), 'disk copy\n');
   assert.match(errorOf(await call('edit', { path: 'work/c.txt', oldString: 'caf', newString: 'tea' })),
-    /^The edit did nothing: work\/c\.txt isn't valid UTF-8, .* The path is in conflict with disk \(unknown-provenance\): the edit looked in the workspace's copy\. Sync the path to keep disk's copy and give up the workspace's, or materialize it with force to write the workspace's over disk's\.$/);
+    /^The edit did nothing: work\/c\.txt isn't valid UTF-8, .*\n\nThe path is in conflict with disk \(unknown-provenance\): the edit looked in the workspace's copy\. Sync the path to keep disk's copy and give up the workspace's, or materialize it with force to write the workspace's over disk's\.$/);
 });
 
 // ---------------------------------------------------------------------------
@@ -337,7 +743,8 @@ test('a deletion whose path disk has made a directory is not told to write the f
 test('an edit that would replace nothing is refused, with replaceAll too', async (t) => {
   const { dir, call, disk } = setup(t, { autoMaterialize: true });
   writeFileSync(join(dir, 'r.txt'), 'abc\n');
-  assert.equal(errorOf(await call('edit', { path: 'work/r.txt', oldString: 'zzz', newString: 'y', replaceAll: true })), 'String not found in work/r.txt.');
+  assert.equal(errorOf(await call('edit', { path: 'work/r.txt', oldString: 'zzz', newString: 'y', replaceAll: true })),
+    "The edit did nothing: oldString isn't in work/r.txt.\nMatch exactly, including whitespace and indentation.");
   assert.equal(disk('r.txt')!.toString(), 'abc\n');
 });
 
@@ -371,7 +778,8 @@ test("an edit whose disk copy can't be checked says it used the workspace's copy
     }
     assert.equal(await stored('u.txt'), 'held, edited\n');
     assert.equal(errorOf(await call('edit', { path: 'work/u.txt', oldString: 'zzz', newString: 'x' })),
-      "String not found in work/u.txt. The path couldn't be checked against disk (a directory), so the edit looked in the workspace's copy.");
+      "The edit did nothing: oldString isn't in work/u.txt.\nMatch exactly, including whitespace and indentation.\n\n"
+      + "The path couldn't be checked against disk (a directory), so the edit looked in the workspace's copy.");
   }
 });
 
@@ -486,6 +894,33 @@ test('a deletion of a draft that met a disk file the workspace never saw complet
   const deleted = await call('delete', { path: 'work/c.txt' });
   assert.equal(deleted.success, true, String(deleted.error));
   assert.match(String((deleted.data as { note?: string }).note), /^nothing was unlinked: /);
+  assert.equal(disk('c.txt')!.toString(), 'disk text\n');
+});
+
+test('a deletion of such a draft whose store throws after recording it says it unlinked nothing, and no push was owed', async (t) => {
+  const { dir, store, call, disk } = setup(t, { autoMaterialize: true });
+  writeFileSync(join(dir, 'c.txt'), 'disk text\n');
+  assert.match(errorOf(await call('write', { path: 'work/c.txt', content: 'agent text\n' })), /conflict: store-origin-collision/);
+  const s = store as unknown as Record<string, (...args: unknown[]) => unknown>;
+  const real = store.treeRemove;
+  let armed = true;
+  s.treeRemove = (...args) => {
+    const record = real.apply(store, args as never);
+    if (!armed) return record;
+    armed = false;
+    throw new Error('No space left on device (os error 28)');
+  };
+  try {
+    // The deletion gives up the workspace's side, so it owes disk no push:
+    // the answer doesn't say one didn't run, and keeps its note.
+    assert.equal(errorOf(await call('delete', { path: 'work/c.txt' })),
+      'The deletion of "work/c.txt" is stored in the workspace, so don\'t send it again. The store failed after recording it: No space left on device (os error 28). '
+      + 'Nothing was unlinked: when last observed, disk held a file at work/c.txt that the workspace never took in (conflict: store-origin-collision), '
+      + 'and a sync observes whatever disk holds there.');
+    assert.equal(armed, false);
+  } finally {
+    delete s.treeRemove;
+  }
   assert.equal(disk('c.txt')!.toString(), 'disk text\n');
 });
 
@@ -658,7 +1093,8 @@ test("an edit of a draft whose disk copy was deleted says what a sync and a forc
     rmSync(join(dir, name));
   }
   assert.equal(errorOf(await call('edit', { path: 'work/s.txt', oldString: 'missing', newString: 'x' })),
-    `String not found in work/s.txt. The path is in conflict with disk (deleted-on-disk): the edit looked in the workspace's copy. ${DELETION_WAYS}`);
+    "The edit did nothing: oldString isn't in work/s.txt.\nMatch exactly, including whitespace and indentation.\n\n"
+    + `The path is in conflict with disk (deleted-on-disk): the edit looked in the workspace's copy. ${DELETION_WAYS}`);
   const edit = await call('edit', { path: 'work/f.txt', oldString: 'draft', newString: 'draft, edited' });
   assert.equal(edit.success, true, edit.error);
   assert.equal((edit.data as { note?: string }).note,
@@ -682,7 +1118,8 @@ test('a recorded conflict whose disk copy has since been deleted is answered for
     / \(both-changed\): the edit looked in the workspace's copy\. Sync the path to keep disk's copy and give up the workspace's/);
   rmSync(join(dir, 'k.txt'));
   assert.equal(errorOf(await call('edit', { path: 'work/k.txt', oldString: 'missing', newString: 'x' })),
-    `String not found in work/k.txt. The path is in conflict with disk (both-changed): the edit looked in the workspace's copy. ${DELETION_WAYS}`);
+    "The edit did nothing: oldString isn't in work/k.txt.\nMatch exactly, including whitespace and indentation.\n\n"
+    + `The path is in conflict with disk (both-changed): the edit looked in the workspace's copy. ${DELETION_WAYS}`);
   assert.match(JSON.stringify((await call('materialize', { path: 'work/k.txt' })).data),
     /k\.txt: disk has no copy of this file \(conflict: both-changed\) — sync this path to take disk's deletion, which removes the workspace's copy, or materialize it with force to write the workspace's copy back"/);
 
@@ -734,7 +1171,8 @@ for (const [kind, limit, copy] of [
     assert.equal((await call('write', { path: 'work/b.txt', content: 'agent draft\n' })).success, true);
     writeFileSync(join(dir, 'b.txt'), copy);
     assert.equal(errorOf(await call('edit', { path: 'work/b.txt', oldString: 'missing', newString: 'x' })),
-      "String not found in work/b.txt. The path is in conflict with disk (both-changed): the edit looked in the workspace's copy. "
+      "The edit did nothing: oldString isn't in work/b.txt.\nMatch exactly, including whitespace and indentation.\n\n"
+      + "The path is in conflict with disk (both-changed): the edit looked in the workspace's copy. "
       + "Sync the path to keep disk's copy and give up the workspace's, or materialize it with force to write the workspace's over disk's.");
     assert.equal((await call('sync', { path: 'work/b.txt' })).success, true);
     const after = await call('read', { path: 'work/b.txt' });

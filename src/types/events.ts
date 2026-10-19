@@ -246,6 +246,29 @@ export interface ToolCall {
    * put on the call, usually none.
    */
   callerTurnId?: number;
+  /**
+   * How long this call's result may be and still reach its caller whole,
+   * measured as the framework stores it: an error's text, or a success's data
+   * as JSON (a content array as its text). For a model's call it is the
+   * agent's inline cap, past which the framework spills the result to a
+   * workspace file and sends a preview. For a call from a running
+   * code_execution script it is the script's limit, past which a success's
+   * result is cut; an error reaches the script whole, after "Error: ". A
+   * result that carries `structured` reaches a script instead as one JSON
+   * object of its content, structured content and error, measured whole; one
+   * past the limit is saved to a workspace file in its place, or, where it
+   * can't be, isn't delivered. A tool
+   * that pages or budgets its answer can stay under it. The framework sets it
+   * on a model's, a script's and the operator's puppet's call to a module, a
+   * utility run through `utils` included. A call made in process with
+   * ModuleContext.callTool or executeToolCall carries what its caller put on
+   * it, as the puppet's does; the framework's own read_image tool passes a
+   * model's call to the workspace without it; and a utility run through
+   * `utils` carries what its `utils` call carried. Without it, a module holds
+   * its answer to a bound of its own, if any: the workspace's is the house
+   * default, 24,000.
+   */
+  resultMaxChars?: number;
 }
 
 // ============================================================================
