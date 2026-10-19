@@ -416,4 +416,50 @@ describe('surface batches at their edges, through the real scheduler', () => {
       await gated.close();
     }
   });
+
+  it('a gate window with a private message and an addressed channel one wakes a turn for each, in either order', async () => {
+    const gate = { config: { policies: [{ name: 'surface', match: { scope: ['external-message'] }, behavior: { debounce: 100 } }], default: 'skip' } };
+    for (const privateFirst of [true, false]) {
+      const rig = await surfaceRig({ gate });
+      try {
+        const events = [tuiMessage(), roomMessage(true)];
+        for (const event of privateFirst ? events : events.reverse()) rig.framework.pushEvent(event);
+        await rig.until(() => rig.starts.length >= 2, 'two turns');
+        await rig.framework.runUntilIdle();
+        const label = privateFirst ? 'private first' : 'channel first';
+        assert.equal(rig.starts.length, 2, `${label}: one turn per part of the window`);
+        assert.ok(rig.starts.some(privateStart), `${label}: a private turn`);
+        const room = rig.starts.find(roomStart);
+        assert.ok(room, `${label}: a turn for the room`);
+        assert.equal(room!.addressed, true, `${label}: the room's turn knows it was addressed`);
+        assert.deepEqual(rig.routed.map((r) => r.locus), [ROOM], `${label}: only the room's turn spoke, in the room`);
+      } finally {
+        await rig.close();
+      }
+    }
+  });
+
+  it('a gate window with a private message and an ambient channel event wakes one private turn, which routes nothing', async () => {
+    // The ambient event's wake names its room only as where it woke the
+    // agent, so it has no channel to answer in: it shares the private turn,
+    // whose content holds the operator's words too.
+    const gate = { config: { policies: [{ name: 'both', match: { scope: ['external-message', 'mcpl:channel-incoming'] }, behavior: { debounce: 100 } }], default: 'skip' } };
+    const rig = await surfaceRig({ gate });
+    try {
+      const eventGate = (rig.framework as unknown as { eventGate: { evaluate(info: Record<string, unknown>): unknown } }).eventGate;
+      rig.framework.pushEvent(tuiMessage());
+      eventGate.evaluate({
+        content: 'room chatter', eventType: 'mcpl:channel-incoming', serverId: 'discord', channelId: ROOM,
+        metadata: { author: { id: 'u1' } }, tags: [],
+      });
+      await rig.until(() => rig.starts.length >= 1, 'the turn');
+      await new Promise((r) => setTimeout(r, 300));
+      await rig.framework.runUntilIdle();
+      assert.equal(rig.starts.length, 1, JSON.stringify(rig.starts));
+      assert.ok(privateStart(rig.starts[0]!), JSON.stringify(rig.starts[0]));
+      assert.deepEqual(rig.routed, [], 'nothing is routed');
+    } finally {
+      await rig.close();
+    }
+  });
 });

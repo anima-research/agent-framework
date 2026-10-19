@@ -1618,9 +1618,28 @@ export class EventGate {
     // `routeChannelId` names the turn's speech locus too — the reply goes
     // back to whoever addressed the agent, not to whichever channel last saw
     // any traffic. Ambient-only batches carry telemetry only.
-    const provenance = wakeProvenance(events);
-    for (const agentName of this.getAgentNamesFn()) {
-      this.requestInferenceFn(agentName, 'gate:debounce', 'gate', provenance);
+    //
+    // A window can hold events from a private surface and others beside
+    // them: under one policy, or across policies, since every policy's
+    // events share one buffer while an agent infers or the host is
+    // quiesced. One wake from the whole window would be private, and its
+    // channel side would never be answered. So each part gets a wake of its
+    // own, from its own events, the part whose first event arrived first
+    // going first. Where the other part has a channel to answer in (an
+    // addressed event, or a channel-bound surface message), the scheduler
+    // runs the two in separate turns. An ambient channel event names its
+    // channel only as where it woke the agent, so its wake shares the
+    // private turn, and nothing answers it in its channel: the window's
+    // content above stays one message, the operator's words included.
+    const privateEvents = events.filter((e) => e.routingClass === 'private');
+    const otherEvents = events.filter((e) => e.routingClass !== 'private');
+    const parts = [privateEvents, otherEvents].filter((part) => part.length > 0)
+      .sort((a, b) => events.indexOf(a[0]!) - events.indexOf(b[0]!));
+    for (const part of parts) {
+      const provenance = wakeProvenance(part);
+      for (const agentName of this.getAgentNamesFn()) {
+        this.requestInferenceFn(agentName, 'gate:debounce', 'gate', provenance);
+      }
     }
   }
 
