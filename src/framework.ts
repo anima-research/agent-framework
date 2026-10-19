@@ -1825,9 +1825,9 @@ interface ManagerReinitFailure {
   /** For a disposal whose cause also stops the channel's next spawn, a
    *  template that's missing or refuses its work: what lets it spawn again. */
   remedy?: string;
-  /** For a disposal that failed partway, as when the store refused to drop
-   *  the agent's turn checkpoints: that failure. The agent was unregistered
-   *  and its channel unbound before the step that failed. */
+  /** For a disposal that failed partway, as when releasing the agent's window
+   *  threw: that failure. The agent was unregistered and its channel unbound
+   *  before the step that failed. */
   cleanupFailed?: string;
 }
 
@@ -10210,7 +10210,7 @@ export class AgentFramework {
       // the operator chose (or the restored source) — the same end-of-turn
       // flush driveStream/puppet perform, under the same guard — for every
       // agent free to take them, in queue order (writeDrainedInOrder). Each
-      // is traced as it lands, as the turn-start flush traces each message it
+      // one stored is traced, as the turn-start flush traces each message it
       // stores: the trace at its deferral had no id to give.
       if (this.deferredMessages.length > 0) {
         const free = [...reserved.keys()]
@@ -10285,10 +10285,10 @@ export class AgentFramework {
    * its own re-initialization failed, since seeding reads the template's
    * compile. Its channel unbinds, so the channel's next qualifying message
    * spawns a fresh fork, and the disposal is reported with the move's. A
-   * disposal that fails partway, as when the store refuses to drop the
-   * fork's turn checkpoints, is reported in the same record, and the pass
-   * goes on to the next fork: disposeConversationAgent unregisters the fork
-   * before its first step that can throw.
+   * disposal that fails partway, as when releasing the fork's window throws,
+   * is reported in the same record, and the pass goes on to the next fork:
+   * disposeConversationAgent unregisters the fork before its first step that
+   * can throw.
    *
    * `moved` says whether a move has joined the pass since it began (an
    * undo's or redo's, under the same reservation). Then the store may no
@@ -10863,8 +10863,9 @@ export class AgentFramework {
           // fork() switches the chronicle branch before awaiting strategy
           // initialization; a rejection can leave the store on the new
           // branch. Go back to the source, then retire the batch. A fork
-          // refused before it switched (a name already taken) left the store
-          // on the source, so nothing moved and no other manager is stale.
+          // refused before it switched (such as a name taken during the waits
+          // after the known-collision check) left the store on the source, so
+          // nothing moved and no other manager is stale.
           moved = this.store.currentBranch().name !== sourceBranch;
           const restored = await this.restoreSourceBranch(cm, sourceBranch, targetBranch, agentName);
           const retired = await this.retireAfterRestore(markerBatch, sourceBranch, agentName);
