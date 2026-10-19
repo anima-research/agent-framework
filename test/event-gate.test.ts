@@ -1167,3 +1167,42 @@ describe('quiesce suppression', () => {
     assert.strictEqual(gate.inferenceDiagnostics().bufferedEvents, 1);
   });
 });
+
+describe("a window's parts, in the order they arrived", () => {
+  afterEach(() => rmSync(TMP_DIR, { recursive: true, force: true }));
+  // The shared buffer holds each policy's events in the order its debounce
+  // fired, so these windows are set in the buffer directly, in an order that
+  // isn't the order of arrival.
+  type Pending = { policyName: string; content: string; eventType: string; timestamp: number; inContext: boolean;
+    channelId?: string; serverId?: string; authorId?: string; routingClass?: 'private' | 'channel'; addressed?: boolean };
+  const tui = (timestamp: number): Pending => ({ policyName: 'p', content: 'operator', eventType: 'external-message', timestamp, inContext: false, serverId: 'tui', routingClass: 'private' });
+  const room = (timestamp: number): Pending => ({
+    policyName: 'p', content: 'room', eventType: 'mcpl:channel-incoming', timestamp, inContext: true,
+    channelId: 'discord:g:room', serverId: 'discord', authorId: 'u1', addressed: true,
+  });
+  async function flush(buffer: Pending[]) {
+    const { gate, inferenceRequests } = makeGate(writeConfig('order.json', { policies: [], default: 'skip' }));
+    const internals = gate as unknown as { inferenceBuffer: Pending[] };
+    gate.onInferenceStarted('elsewhere');
+    internals.inferenceBuffer.push(...buffer);
+    gate.onInferenceEnded('elsewhere');
+    // The flush delivers in a microtask.
+    await new Promise((resolve) => setImmediate(resolve));
+    return inferenceRequests.map((r) => (r as { routingClass?: string }).routingClass === 'private' ? 'private' : 'room');
+  }
+
+  it('a part whose events came first goes first, though the buffer holds the other part first', async () => {
+    assert.deepStrictEqual(await flush([room(20), tui(10)]), ['private', 'room']);
+    assert.deepStrictEqual(await flush([tui(20), room(10)]), ['room', 'private']);
+  });
+
+  it("a part's arrival is its earliest event's, wherever that event sits in the part", async () => {
+    // The room's part holds a later event first and its earliest last.
+    assert.deepStrictEqual(await flush([room(30), tui(10), room(5)]), ['room', 'private']);
+  });
+
+  it('parts that arrived in the same millisecond go in the window\'s order', async () => {
+    assert.deepStrictEqual(await flush([room(10), tui(10)]), ['room', 'private']);
+    assert.deepStrictEqual(await flush([tui(10), room(10)]), ['private', 'room']);
+  });
+});

@@ -779,8 +779,9 @@ describe("the scheduler's split, and a private turn's other paths", () => {
         await rig.i.processInferenceRequests();
         const label = `open ${openPrivate ? 'private' : 'channel'} turn`;
         assert.ok(rig.i.pendingRequests.includes(other), `${label}: the other kind's wake waits: ${JSON.stringify(rig.starts)}`);
-        assert.ok(rig.starts.every((s) => s.suppressProse === true), `${label}: only the silent tick starts: ${JSON.stringify(rig.starts)}`);
-        assert.equal(rig.starts[0]?.nonChannelOrigin, undefined, `${label}: the tick takes its own kind, not the turn's`);
+        assert.equal(rig.starts.length, 1, `${label}: the silent tick starts, and only it: ${JSON.stringify(rig.starts)}`);
+        assert.equal(rig.starts[0]!.suppressProse, true, `${label}: ${JSON.stringify(rig.starts)}`);
+        assert.equal(rig.starts[0]!.nonChannelOrigin, undefined, `${label}: the tick takes its own kind, not the turn's`);
         assert.equal(rig.state.openLogical.get('scout'), routing, `${label}: the open turn is left as it was`);
       } finally {
         await rig.close();
@@ -841,9 +842,18 @@ describe("the scheduler's split, and a private turn's other paths", () => {
     const second = await surfaceRig();
     try {
       const routing = openChannelTurn(second);
+      const traces: Array<Record<string, unknown>> = [];
+      second.framework.onTrace((event) => { if (event.type === 'inference:request_stale') traces.push(event as unknown as Record<string, unknown>); });
       second.i.pendingRequests.push(tuiWake());
       await second.i.processInferenceRequests();
-      holdsOf(second).get('scout')!.since -= 31_000;
+      const since = holdsOf(second).get('scout')!.since;
+      // A pass under the bound keeps the turn open, and its clock.
+      holdsOf(second).get('scout')!.since -= 29_000;
+      await second.i.processInferenceRequests();
+      assert.equal(second.state.openLogical.get('scout'), routing, 'under the bound, the turn stays open');
+      assert.equal(holdsOf(second).get('scout')?.since, since - 29_000, 'and its clock runs on');
+      assert.equal(second.starts.length, 0);
+      holdsOf(second).get('scout')!.since -= 2_000;
       const lines: string[] = [];
       const error = console.error;
       console.error = (...args: unknown[]) => { lines.push(args.join(' ')); };
@@ -854,6 +864,10 @@ describe("the scheduler's split, and a private turn's other paths", () => {
       }
       assert.notEqual(second.state.openLogical.get('scout'), routing, 'past the bound, the turn ends');
       assert.ok(lines.some((line) => line.includes('[inference-stale] agent=scout') && line.includes('ending the turn')), JSON.stringify(lines));
+      assert.equal(traces.length, 1, JSON.stringify(traces));
+      assert.equal(traces[0]!.agentStatus, 'idle+turn-open');
+      assert.equal(traces[0]!.requestCount, 1);
+      assert.ok((traces[0]!.oldestRequestAge as number) >= 0, JSON.stringify(traces[0]));
       await second.until(() => second.starts.some(privateStart), 'the held wake starts its own turn');
       assert.deepEqual(second.routed, []);
     } finally {
@@ -1048,7 +1062,7 @@ describe("the scheduler's split, and a private turn's other paths", () => {
       routing.nonChannelOrigin = true;
       rig.state.openLogical.set('scout', routing);
       internalsOf.dispatchChannelToolCall('scout', { id: 'p1', name: 'channel_publish', input: { channelId: ROOM, content: 'hello' } });
-      await new Promise((r) => setTimeout(r, 20));
+      await rig.until(() => calls.length >= 1, 'the named publish');
       assert.deepEqual(calls.map((c) => (c.input as { channelId?: string }).channelId), [ROOM], 'the model\'s named publish went through');
       // A call made as the agent, during its private turn, keeps the rule.
       const refused = await internalsOf.executeToolCall({ id: 'p2', name: 'channel_publish', input: { content: 'hello' }, callerAgentName: 'scout' });
@@ -1214,6 +1228,31 @@ describe("the scheduler's split, and a private turn's other paths", () => {
     }
   });
 
+  it("a private turn's round that skip_reply silences counts its words as the resident's own choice, not the surface's", async () => {
+    const rig = await surfaceRig();
+    try {
+      (rig.state.channelRegistry as Record<string, unknown>).handleChannelToolCall = async (name: string) =>
+        name === 'skip_reply' ? { success: true, endTurn: true, data: { skipped: true } } : { success: true, data: {} };
+      rig.membrane.pushResponse(createMockResponse([
+        { type: 'text', text: 'not for anyone' },
+        { type: 'tool_use', id: 's1', name: 'skip_reply', input: {} },
+      ] as never, 'tool_use'));
+      rig.framework.pushEvent(tuiMessage());
+      await rig.until(() => rig.starts.length >= 1, 'the private turn');
+      await rig.framework.runUntilIdle();
+      assert.deepEqual(rig.routed, []);
+      assert.ok(privateStart(rig.starts[0]!), 'control: the turn was private');
+      // The turn's receipt names its tallies, which its end then spends.
+      const texts = (rig.framework.getAgent('scout')!.getContextManager().getAllMessages() as Array<{ content: Array<{ type: string; text?: string }> }>)
+        .flatMap((m) => m.content).filter((b) => b.type === 'text').map((b) => b.text ?? '');
+      const receipt = texts.find((t) => t.startsWith('[delivered]')) ?? '';
+      assert.match(receipt, /1 plain-speech segment\(s\) kept private \(skip_reply or a private think\)/, receipt);
+      assert.doesNotMatch(receipt, /non-channel turn/, receipt);
+    } finally {
+      await rig.close();
+    }
+  });
+
   it("a private hybrid turn's speech with no target, mid-turn and trailing, is kept private and held as no draft", async () => {
     const robot = {
       name: 'robot',
@@ -1241,6 +1280,25 @@ describe("the scheduler's split, and a private turn's other paths", () => {
       assert.match(receipt, /2 plain-speech segment\(s\) kept private \(non-channel turn — publish only with an explicit send tool or a >>> envelope\)/, receipt);
     } finally {
       await rig.close();
+    }
+  });
+
+  it("the notice that speech has no channel names a >>> envelope in hybrid mode, and only there", async () => {
+    for (const mode of ['locus', 'hybrid'] as const) {
+      const rig = await surfaceRig({ agent: { proseRouting: mode } });
+      try {
+        const announce = (rig.framework as unknown as { announceLocusIfChanged(agentName: string, locus: string | null): void })
+          .announceLocusIfChanged.bind(rig.framework);
+        announce('scout', ROOM);
+        announce('scout', null);
+        const notices = (rig.framework.getAgent('scout')!.getContextManager().getAllMessages() as Array<{ content: Array<{ type: string; text?: string }> }>)
+          .flatMap((m) => m.content).map((b) => b.text ?? '').filter((t) => t.startsWith('[routing] Your plain speech currently goes to no channel'));
+        assert.equal(notices.length, 1, `${mode}: ${JSON.stringify(notices)}`);
+        assert.equal(notices[0]!.includes('Use an explicit send tool or a >>> envelope to reach a channel.'), mode === 'hybrid', notices[0]);
+        assert.ok(notices[0]!.includes('Use an explicit send tool'), notices[0]);
+      } finally {
+        await rig.close();
+      }
     }
   });
 
