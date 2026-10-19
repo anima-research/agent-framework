@@ -690,6 +690,126 @@ export type TraceEvent =
       since?: number;
     })
 
+  /** A reader fork ended in prose without `deliver_summary`; its final prose was delivered as its report. */
+  | (TraceEventBase & {
+      type: 'tune-out:reader-prose-delivered';
+      agentName: string;
+      serverId: string;
+      channelId: string;
+      epochId: string;
+      chars: number;
+    })
+
+  /** Bounded work the host's stop() cut off: left live for the next boot to end as `host-restart`. */
+  | (TraceEventBase & {
+      type: 'dendrite:agent-interrupted';
+      agentName: string;
+      kind: string;
+      incarnation: number;
+      reason: 'host-stop';
+    })
+
+  /** A tune-out reader fork was derived for one invocation (subconscious.reader: 'forks'). */
+  | (TraceEventBase & {
+      type: 'tune-out:reader-fork';
+      agentName: string;
+      serverId: string;
+      channelId: string;
+      epochId: string;
+      trigger: 'cadence' | 'wake' | 'cancel';
+      held: number;
+    })
+
+  // Dendrite: agent registry and lifecycle.
+  // `agent-created` is the consent event: it names the kind of agent, what
+  // ends it, and what happens to it when its spawner ends.
+  | (TraceEventBase & {
+      type: 'dendrite:agent-created';
+      agentName: string;
+      kind: string;
+      /** Whose weights; `inherit.from` is whose context. */
+      model?: string;
+      incarnation: number;
+      lifetime: import('../dendrite/types.js').AgentLifetime;
+      spawnedBy?: string;
+      onParentEnd?: import('../dendrite/types.js').ParentEndPolicy;
+      resultTo?: import('../dendrite/types.js').ResultRoute;
+      inherit?: import('../dendrite/types.js').ContextInheritance;
+    })
+  | (TraceEventBase & {
+      type: 'dendrite:agent-ended';
+      agentName: string;
+      kind: string;
+      incarnation: number;
+      reason: string;
+      by?: string;
+    })
+  | (TraceEventBase & {
+      type: 'dendrite:agent-orphaned';
+      agentName: string;
+      formerParent: string;
+      reason: string;
+      /** Agents offered as a new parent, nearest first. */
+      candidates: string[];
+    })
+  | (TraceEventBase & {
+      type: 'dendrite:agent-reparented';
+      agentName: string;
+      parent: string;
+      by?: string;
+    })
+  | (TraceEventBase & {
+      type: 'dendrite:activation-cancelled';
+      agentName: string;
+      by?: string;
+      reason?: string;
+    })
+  /** The message entered the recipient's store (not merely queued for it). */
+  | (TraceEventBase & {
+      type: 'dendrite:mail-delivered';
+      mailId: string;
+      kind: string;
+      from: string;
+      to: string;
+    })
+  /** Queued for the recipient's next boundary; `mail-delivered` follows when it lands. */
+  | (TraceEventBase & {
+      type: 'dendrite:mail-deferred';
+      mailId: string;
+      kind: string;
+      from: string;
+      to: string;
+    })
+  | (TraceEventBase & {
+      type: 'dendrite:mail-held';
+      mailId: string;
+      kind: string;
+      from: string;
+      to: string;
+      reason: string;
+    })
+  /**
+   * The admission stage's decision for one inbound event (Dendrite §D):
+   * who may receive it, whether it is held (the epoch id) or delivered,
+   * whether it may wake them, and the gate's verdict.
+   */
+  | (TraceEventBase & {
+      type: 'admission:decided';
+      lane: 'channel' | 'push';
+      serverId: string;
+      channelId?: string;
+      messageId: string;
+      recipients: string[];
+      held: string | null;
+      wake: boolean;
+      gatePass: boolean;
+    })
+  /** Batched gate events dropped at delivery because their channel is held now. */
+  | (TraceEventBase & {
+      type: 'gate:held-dropped';
+      dropped: number;
+      channels: Array<string | undefined>;
+    })
   // Inbound acceptance observation (mcpl/inbound-source.ts): an installed
   // InboundAcceptanceObserver threw. Delivery is unaffected; the observer's
   // own coverage is interrupted for that acceptance.

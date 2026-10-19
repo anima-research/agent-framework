@@ -758,7 +758,7 @@ describe('mid-turn deliveries keep the window what the stream carried', () => {
     const copies = framework.getAgent('assistant')!.getContextManager().getAllMessages()
       .filter((m) => (m.metadata as { deferredWriteId?: string } | undefined)?.deferredWriteId === 'w1');
     assert.equal(copies.length, 1, 'stored once');
-    assert.deepEqual(open.arrivals, [{ messageId: copies[0]!.id, channelId: 'chan-beta' }], 'and noted as one of the open turn\'s arrivals');
+    assert.deepEqual(open.arrivals, [{ messageId: copies[0]!.id, channelId: 'chan-beta', addressed: false }], 'and noted as one of the open turn\'s arrivals');
     await framework.stop();
   });
 
@@ -788,8 +788,8 @@ describe('mid-turn deliveries keep the window what the stream carried', () => {
     const idOf = (writeId: string) => agent.getContextManager().getAllMessages()
       .find((m) => (m.metadata as { deferredWriteId?: string } | undefined)?.deferredWriteId === writeId)!.id;
     assert.deepEqual(open.arrivals, [
-      { messageId: idOf('w1'), channelId: 'chan-alpha' },
-      { messageId: idOf('w2'), channelId: 'chan-beta' },
+      { messageId: idOf('w1'), channelId: 'chan-alpha', addressed: false },
+      { messageId: idOf('w2'), channelId: 'chan-beta', addressed: false },
     ]);
     assert.equal(internals.remainingArrival(agent, open), 'chan-beta', "the turn's newest arrival is the later write's");
     await framework.stop();

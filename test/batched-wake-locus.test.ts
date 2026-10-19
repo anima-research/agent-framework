@@ -9,7 +9,9 @@
  *   - ambient AFTER the DM: the ambient channel became the fallback;
  *   - ambient BEFORE the DM: the DM never displaced it.
  * Now a batch containing an addressed message routes to that message's
- * registered channel; an ambient-only batch keeps the legacy fallback.
+ * registered channel. An ambient-only batch names no channel: under the
+ * default `speech.locus: 'delivery'` the turn has no locus and its prose
+ * stays private; under `'latest-inbound'` it keeps the legacy fallback.
  */
 import { describe, it, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
@@ -17,6 +19,7 @@ import { tmpdir } from 'node:os';
 import { mkdtempSync, rmSync, readFileSync, existsSync, writeFileSync, appendFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { AgentFramework } from '../src/index.js';
+import { conversationForkSpec } from '../src/dendrite/index.js';
 import { MockMembrane, createMockResponse } from './helpers/mock-membrane.js';
 
 const FIXTURE = join(import.meta.dirname, 'fixtures/wake-locus-mcpl-server.mjs');
@@ -34,7 +37,7 @@ async function waitFor(cond: () => boolean, what: string, timeoutMs = 15_000): P
   throw new Error(`timed out waiting for: ${what}`);
 }
 
-describe('batched wake routing', () => {
+function batchedWakeRig(speech?: { locus: 'delivery' | 'latest-inbound' }) {
   let tempDir: string;
   let statusPath: string;
   let commandPath: string;
@@ -52,6 +55,7 @@ describe('batched wake routing', () => {
       storePath: join(tempDir, 'test.chronicle'),
       membrane: membrane.asMembrane(),
       agents: [{ name: 'scout', model: 'test-model', systemPrompt: 'You are scout.' }],
+      ...(speech ? { speech } : {}),
       gate: {
         config: {
           policies: [{
@@ -93,6 +97,18 @@ describe('batched wake routing', () => {
       .filter((e) => e.event === 'publish')
       .map((e) => e.channelId!);
 
+  return {
+    membrane: () => membrane,
+    framework: () => framework,
+    dm, incoming, sent, publishes,
+  };
+}
+
+describe('batched wake routing', () => {
+  const rig = batchedWakeRig();
+  const { dm, incoming, sent, publishes } = rig;
+  const membrane = { pushResponse: (r: ReturnType<typeof createMockResponse>) => rig.membrane().pushResponse(r) };
+
   it('a DM followed one beat later by ambient chatter elsewhere: the reply goes to the DM', async () => {
     membrane.pushResponse(createMockResponse([{ type: 'text', text: 'answering the DM' }]));
     dm('are you there?');
@@ -120,8 +136,29 @@ describe('batched wake routing', () => {
     assert.deepEqual(publishes(), [ROOM]);
   });
 
-  it('an ambient-only batch keeps the legacy fallback (most recent inbound)', async () => {
+  it("an ambient-only batch names no channel: under the default rule the turn has no locus and its prose stays private", async () => {
     membrane.pushResponse(createMockResponse([{ type: 'text', text: 'joining in' }]));
+    incoming(ROOM, 'ambient', 'first');
+    await waitFor(() => sent('incoming-sent') === 1, 'first sent');
+    incoming(GENERAL, 'ambient', 'second');
+    await waitFor(() => rig.membrane().calls.length >= 1, 'the batch woke the agent');
+    await rig.framework().runUntilIdle();
+    assert.deepEqual(publishes(), [], 'nothing was published: no delivery woke this turn');
+    const texts = rig.framework().getAgent('scout')!.getContextManager().getAllMessages()
+      .flatMap((m) => m.content.filter((b) => b.type === 'text').map((b) => (b as { text: string }).text));
+    // The announce-on-change baseline treats "no channel" as the state a
+    // resident boots in, so a first turn without a locus adds no notice; a
+    // later turn that loses one is told (announceLocusIfChanged).
+    assert.ok(texts.includes('joining in'), 'the prose stays in the window');
+  });
+});
+
+describe("batched wake routing under speech.locus 'latest-inbound'", () => {
+  const rig = batchedWakeRig({ locus: 'latest-inbound' });
+  const { incoming, sent, publishes } = rig;
+
+  it('an ambient-only batch keeps the legacy fallback (most recent inbound)', async () => {
+    rig.membrane().pushResponse(createMockResponse([{ type: 'text', text: 'joining in' }]));
     incoming(ROOM, 'ambient', 'first');
     await waitFor(() => sent('incoming-sent') === 1, 'first sent');
     incoming(GENERAL, 'ambient', 'second');
@@ -141,8 +178,6 @@ describe('batched wake routing with conversation forks', () => {
       membrane: new MockMembrane().asMembrane(),
       agents: [
         { name: 'trunk', model: 'test-model', systemPrompt: 'You are trunk.' },
-        { name: 'fork-room', model: 'test-model', systemPrompt: 'You are a fork.' },
-        { name: 'fork-other', model: 'test-model', systemPrompt: 'You are a fork.' },
       ],
       gate: {
         config: {
@@ -161,12 +196,14 @@ describe('batched wake routing with conversation forks', () => {
 
   it('the addressed route applies only to the fork homed there; other forks and the trunk get none', async () => {
     const internals = framework as unknown as {
-      conversationAgentHomes: Map<string, string>;
+      registry: { register(spec: ReturnType<typeof conversationForkSpec>): unknown };
       pendingRequests: Array<{ agentName: string; channelId?: string; addressed?: boolean; counterparty?: string }>;
       eventGate: { evaluate(info: unknown): unknown };
     };
-    internals.conversationAgentHomes.set('fork-room', ROOM);
-    internals.conversationAgentHomes.set('fork-other', GENERAL);
+    // A conversation fork's home is its registry record (Dendrite); the gate
+    // fans out to every agent that receives gate wakes, forks included.
+    internals.registry.register(conversationForkSpec('fork-room', { template: 'trunk', channelId: ROOM, idleTtlMs: 60_000 }));
+    internals.registry.register(conversationForkSpec('fork-other', { template: 'trunk', channelId: GENERAL, idleTtlMs: 60_000 }));
     internals.eventGate.evaluate({
       content: '@agent hi', eventType: 'mcpl:channel-incoming', serverId: 'discord', channelId: ROOM,
       tags: ['chat:addressed'], metadata: { authorId: '5' },

@@ -2,8 +2,8 @@
 export * from './types/index.js';
 
 // Core classes
-export { AgentFramework, BudgetPreflightError, ProviderWaitNotSleptError, QuiesceBlockedError, ResumeBlockedError } from './framework.js';
-export type { RuntimeSettingsPreview, HostModeStatus } from './framework.js';
+export { AgentFramework, AgentStoppedError, BudgetPreflightError, ProviderWaitNotSleptError, QuiesceBlockedError, ResumeBlockedError } from './framework.js';
+export type { RuntimeSettingsPreview, HostModeStatus, DeriveAgentOptions } from './framework.js';
 export { Agent } from './agent.js';
 export type { StartStreamResult } from './agent.js';
 export { ProcessQueueImpl } from './queue.js';
@@ -11,6 +11,9 @@ export { ModuleRegistry } from './module-registry.js';
 export { ShutdownTimeoutError, DEFAULT_SHUTDOWN_TIMEOUT_MS } from './shutdown.js';
 export { formatZonedDateTime, formatZonedTime, isValidTimeZone, resolveTimeZone } from './timezone.js';
 export { REFUSAL_REACTIONS, REFUSAL_REACTION_FALLBACK, REFUSAL_REACTION_BASELINE } from './refusal-reactions.js';
+
+// Dendrite: agent registry, lifecycle and presets
+export * from './dendrite/index.js';
 
 // Built-in modules
 export * from './modules/index.js';
@@ -179,6 +182,16 @@ export type {
 } from './recovery/offline-branch.js';
 
 export * from "./tool-presentation.js";
+
+// Tune-out: the subconscious configuration and the default reader-fork framing.
+export { presentAuthor, authorLine, authorNamed, ANONYMOUS_PARTICIPANT } from './author-presentation.js';
+export {
+  defaultReaderFraming,
+  type SubconsciousConfig,
+  type PersistentReaderConfig,
+  type ForkReaderConfig,
+  type ReaderFramingContext,
+} from './tune-out/tools.js';
 export {
   SILENT_HEARTBEAT_SEPARATOR,
   silentHeartbeatOf,

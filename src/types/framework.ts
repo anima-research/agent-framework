@@ -110,11 +110,75 @@ export type ProviderHoldHook = (
 
 export interface FrameworkConfig {
   /**
+   * Dendrite agent lifecycle options.
+   */
+  dendrite?: {
+    /**
+     * When an agent ends while task work it spawned is still running, the
+     * orphan is always told. With this on (the default), the first agent
+     * that could adopt it — its nearest live ancestor, else the primary —
+     * also receives a factual notice, which is what makes the reparenting
+     * offer visible to a model. Turn it off when the host makes adoption
+     * decisions itself from the `dendrite:agent-orphaned` trace.
+     */
+    announceOrphans?: boolean;
+    /**
+     * Every derivation tells the agent it was made from, in one host-framed
+     * line. After this many derivations of one kind from one agent, that
+     * agent hears a count line every so many instead of a line per fork, so
+     * a reader loop that forks a hundred times a session doesn't fill its
+     * source's context with stamps; the registry and traces keep every
+     * record. Default 10; 0 never collapses.
+     */
+    collapseDerivationNoticesAfter?: number;
+  };
+
+  /**
    * The subconscious resident (issue #77): a persistent side-agent that
    * receives diverted traffic from tuned-out channels and reports to the
    * resident in its own voice. See src/tune-out/tools.ts.
    */
   subconscious?: import('../tune-out/tools.js').SubconsciousConfig;
+
+  /**
+   * Tune-out without a reader (issue #232 §3.3). The hold machinery always
+   * runs when MCPL channels exist, so a persisted epoch is resumed and
+   * released whatever the configuration; this switch only decides whether
+   * residents are offered `tune_out` when no reader is configured. Without
+   * a reader a tune-out is a silent hold: no cadence, no wake budget,
+   * mentions are acknowledged, the backlog is released on cancel.
+   */
+  tuneOut?: {
+    /** Offer `tune_out` without a subconscious. Default: only with one. */
+    enabled?: boolean;
+    /**
+     * Announce the all-except scope in the excepted channel: one bracketed
+     * line under the resident's name when it opens (who, for how long) and
+     * one when it closes. Default true — a hold the room cannot see is the
+     * failure the scope exists to prevent. `false` keeps both quiet.
+     */
+    announce?: boolean;
+  };
+
+  /**
+   * Where a turn's plain prose lands when nothing names a destination
+   * (architecture channel, 2026-10-06: the §3 carve-out accepted by the
+   * residents).
+   *
+   * - `'delivery'` (default): the locus comes only from the delivery that
+   *   woke the turn, a conversation fork's home channel, or a channel the
+   *   agent opened during the turn. Incoming traffic never moves it — not
+   *   between turns, not mid-turn. A turn with no such locus keeps its
+   *   prose private, and says so in a `[routing]` notice.
+   * - `'latest-inbound'`: the previous rule. The most recent delivered
+   *   inbound message is a global fallback locus for turns without one, and
+   *   an addressed message injected mid-turn re-pins the turn's locus.
+   *
+   * Held traffic never moves the locus under either rule.
+   */
+  speech?: {
+    locus?: 'delivery' | 'latest-inbound';
+  };
 
   /**
    * IANA zone used only when rendering wall-clock times for the agent.

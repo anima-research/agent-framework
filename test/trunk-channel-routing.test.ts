@@ -694,6 +694,7 @@ describe('Residents read one message slot', () => {
     held: 'scout' | 'shade',
     responses: Record<number, ContentBlock[][]>,
     first: ContentBlock[][] = [[]],
+    speech?: { locus: 'delivery' | 'latest-inbound' },
   ) {
     const framework = await AgentFramework.create({
       storePath: join(tempDir, 'test.chronicle'),
@@ -703,6 +704,7 @@ describe('Residents read one message slot', () => {
         { name: 'shade', model: 'test-model', systemPrompt: 'You are shade.' },
       ],
       modules: [pause],
+      ...(speech ? { speech } : {}),
     });
     const i = framework as unknown as Internals;
     const routed: Array<{ agent: string; text: string; locus: string | null }> = [];
@@ -768,12 +770,15 @@ describe('Residents read one message slot', () => {
   }
 
   const hereIAm = [[{ type: 'text', text: 'Here I am.' }] as ContentBlock[]];
+  /** An arrival moves the locus only under the legacy rule; the default
+   *  (`speech.locus: 'delivery'`) announces it instead — tested below. */
+  const LEGACY = { locus: 'latest-inbound' } as const;
 
   // Each row is also what main does, by re-resolving the held turn's locus
   // from its batch's addressed wake.
   for (const [held, role] of [['scout', 'the primary'], ['shade', 'a second resident']] as const) {
-    it(`${role}, held by a capacity hold, moves its locus to an addressed message from another channel`, async () => {
-      const { framework, i, routed, release } = await residents(held, { 2: hereIAm });
+    it(`${role}, held by a capacity hold, moves its locus to an addressed message from another channel (latest-inbound)`, async () => {
+      const { framework, i, routed, release } = await residents(held, { 2: hereIAm }, undefined, LEGACY);
       framework.pushEvent(residentIncoming('discord:guild:chanA', `${held}, take a look`, held, false));
       await framework.runUntilIdle();
       assert.ok(i.providerAccelerationCooldowns.has(held), 'the turn is held');
@@ -782,6 +787,26 @@ describe('Residents read one message slot', () => {
       await release(held);
 
       assert.deepEqual(routed, [{ agent: held, text: 'Here I am.', locus: 'discord:dm:antra' }]);
+      await framework.stop();
+    });
+
+    it(`${role}, held by a capacity hold, keeps its locus under the default rule and is told who addressed it from where`, async () => {
+      const { framework, i, routed, release } = await residents(held, { 2: hereIAm });
+      framework.pushEvent(residentIncoming('discord:guild:chanA', `${held}, take a look`, held, false));
+      await framework.runUntilIdle();
+      assert.ok(i.providerAccelerationCooldowns.has(held), 'the turn is held');
+      framework.pushEvent(residentIncoming('discord:dm:antra', `${held}, over here please`, held, true));
+      await framework.runUntilIdle();
+      await release(held);
+
+      assert.deepEqual(routed, [{ agent: held, text: 'Here I am.', locus: 'discord:guild:chanA' }],
+        'incoming traffic never moves the locus (§3 carve-out)');
+      const texts = framework.getAgent(held)!.getContextManager().getAllMessages()
+        .flatMap((m) => m.content.filter((b) => b.type === 'text').map((b) => (b as { text: string }).text));
+      const notice = texts.find((t) => t.includes('addressed you from discord:dm:antra'));
+      assert.ok(notice, "the turn's next start announces the arrival: who, from where");
+      assert.ok(notice!.includes('still lands in discord:guild:chanA'), 'and where the plain speech still lands');
+      assert.ok(!texts.some((t) => t.includes('The conversation moved')), 'no re-pin notice');
       await framework.stop();
     });
   }
@@ -793,7 +818,7 @@ describe('Residents read one message slot', () => {
     framework.pushEvent(residentIncoming('discord:guild:lounge', 'unrelated chatter', 'shade', false));
     await framework.runUntilIdle();
     assert.ok(framework.getAgent('shade')!.getContextManager().getAllMessages()
-      .some((m) => m.content.some((b) => b.type === 'text' && (b as { text: string }).text === 'unrelated chatter')),
+      .some((m) => m.content.some((b) => b.type === 'text' && (b as { text: string }).text === 'antra: unrelated chatter')),
     'shade reads the ambient message in the slot');
     await release('shade');
 
@@ -801,8 +826,8 @@ describe('Residents read one message slot', () => {
     await framework.stop();
   });
 
-  it("a second resident's turn weighs a message stored while it runs, at the turn's next start", async () => {
-    const { framework, i, routed, release } = await residents('shade', { 2: hereIAm });
+  it("a second resident's turn weighs a message stored while it runs, at the turn's next start (latest-inbound)", async () => {
+    const { framework, i, routed, release } = await residents('shade', { 2: hereIAm }, undefined, LEGACY);
     // While shade's start gathers its context, its turn is alive and no tool
     // cycle is open, so an addressed message for the idle primary is stored
     // at once. Shade's start has weighed its arrivals by then, and no
@@ -823,11 +848,11 @@ describe('Residents read one message slot', () => {
     await framework.stop();
   });
 
-  it("a second resident's held turn weighs a message the primary's own start stores", async () => {
+  it("a second resident's held turn weighs a message the primary's own start stores (latest-inbound)", async () => {
     const { framework, i, routed, release } = await residents('shade', {
       2: [[{ type: 'text', text: 'scout here' }] as ContentBlock[]],
       3: hereIAm,
-    });
+    }, undefined, LEGACY);
     framework.pushEvent(residentIncoming('discord:guild:chanA', 'shade, take a look', 'shade', false));
     await framework.runUntilIdle();
     // While scout's turn is alive, a message for the primary waits in its
@@ -847,11 +872,11 @@ describe('Residents read one message slot', () => {
     await framework.stop();
   });
 
-  it("a boundary that re-pins supersedes an arrival from another resident's store", async () => {
+  it("a boundary that re-pins supersedes an arrival from another resident's store (latest-inbound)", async () => {
     const { framework, i, routed, release } = await residents('scout', { 2: hereIAm }, [
       [{ type: 'tool_use', id: 'p1', name: 'pause--pause', input: {} }] as ContentBlock[],
       [] as ContentBlock[],
-    ]);
+    ], LEGACY);
     // While scout's tool runs, a message for shade is stored at once, an
     // arrival for scout's turn. Then one for scout waits in its queue, and
     // scout's boundary stores it after, re-pinning the turn there.
@@ -871,14 +896,14 @@ describe('Residents read one message slot', () => {
     await framework.stop();
   });
 
-  it("a second resident's held turn weighs a message the primary's tool boundary drains", async () => {
+  it("a second resident's held turn weighs a message the primary's tool boundary drains (latest-inbound)", async () => {
     const { framework, i, routed, release } = await residents('shade', {
       2: [
         [{ type: 'tool_use', id: 'p1', name: 'pause--pause', input: {} }] as ContentBlock[],
         [{ type: 'text', text: 'scout done' }] as ContentBlock[],
       ],
       3: hereIAm,
-    });
+    }, undefined, LEGACY);
     framework.pushEvent(residentIncoming('discord:guild:chanA', 'shade, take a look', 'shade', false));
     await framework.runUntilIdle();
     // The message comes while scout's tool runs, so it waits in scout's queue

@@ -196,7 +196,7 @@ describe('live operator surgery', () => {
     const internals = framework as unknown as {
       surgeryHold: unknown;
       pendingRequests: unknown[];
-      ephemeralCandidates: Map<unknown, unknown>;
+      ephemeralCandidates: Map<unknown, { contextManager: unknown } | undefined>;
       processInferenceRequests(): Promise<void>;
     };
     try {
@@ -208,7 +208,7 @@ describe('live operator surgery', () => {
         framework.runEphemeralToCompletion(worker.agent, worker.contextManager),
         /under live roll back/,
       );
-      assert.equal(internals.ephemeralCandidates.get(worker.agent), worker.contextManager,
+      assert.equal(internals.ephemeralCandidates.get(worker.agent)?.contextManager, worker.contextManager,
         'refused BEFORE consuming the generation ticket — a clean retry stays possible');
 
       // A wake arriving now is parked by the scheduler, not started.

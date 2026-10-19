@@ -359,8 +359,9 @@ describe('Conversation routing', () => {
     const { seeded, lines } = await seedOf(framework);
     const types = seeded.flatMap((m) => m.content.map((b) => b.type));
     assert.ok(!types.includes('tool_use') && !types.includes('thinking'), `no unanswered call or thinking in the seed: ${types}`);
-    // The seed is everything before the fork's own first message ('hi').
-    const firstOwn = seeded.findIndex((m) => JSON.stringify(m.content).includes('"hi"'));
+    // The seed is everything before the fork's own first message ('hi',
+    // stored as the model reads it: under its author's name).
+    const firstOwn = seeded.findIndex((m) => JSON.stringify(m.content).includes('"alice: hi"'));
     assert.ok(firstOwn > 1, 'the incoming message follows the seed');
     // The thinking goes first, so the round's row holds only its unanswered
     // call, which the pairing pass replaces with its placeholder.

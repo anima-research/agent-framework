@@ -16,12 +16,12 @@ import type {
 } from '../src/index.js';
 import { ChannelRegistry } from '../src/mcpl/channel-registry.js';
 import { MockMembrane, createMockResponse } from './helpers/mock-membrane.js';
+import { bindAsConversationFork, homeChannelOf } from './helpers/dendrite.js';
 
 const FORK_AGENT = 'conversation-chanA-g1';
 
 type FrameworkInternals = {
   channelRegistry: ChannelRegistry | null;
-  conversationAgentHomes: Map<string, string>;
   hookOrchestrator: {
     beforeInference(params: unknown): Promise<ContextInjection[]>;
     emitLifecycle(params: unknown): void;
@@ -85,7 +85,7 @@ function installChannelRegistry(
     () => {},
     () => {},
     {
-      homeChannelResolver: (agentName) => internals.conversationAgentHomes.get(agentName),
+      homeChannelResolver: (agentName) => homeChannelOf(framework, agentName),
     },
   );
   for (const channelId of channelIds) {
@@ -108,7 +108,7 @@ function installChannelRegistry(
 }
 
 function bindForkHome(framework: AgentFramework, agentName = FORK_AGENT, channelId = 'chanA'): void {
-  frameworkInternals(framework).conversationAgentHomes.set(agentName, channelId);
+  bindAsConversationFork(framework, agentName, channelId);
 }
 
 function installHookInjections(framework: AgentFramework, injections: ContextInjection[]): void {

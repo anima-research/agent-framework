@@ -69,8 +69,12 @@ function harness(
   let cancelCalls = 0;
   /** The reason of each inference requested, the subconscious's turns among them. */
   const inferences: string[] = [];
+  /** The coordinator's own durable state: the all-except hold lives here. */
+  const coordinatorState = new Map<string, unknown>();
   const registry = {
     listChannelsRaw: () => (state ? [{ serverId: 'disc', descriptor: { id: '#a' } }] : []),
+    readCoordinatorState: (id: string) => coordinatorState.get(id) ?? null,
+    writeCoordinatorState: (id: string, value: unknown) => { if (value === null) coordinatorState.delete(id); else coordinatorState.set(id, value); },
     getTuneOutState: () => state,
     enterTuneOut: (_s: string, _c: string, params: TuneOutParams) => {
       entered.push(params);
@@ -113,6 +117,8 @@ function harness(
     t.mock.timers.reset();
   });
   const cadenceTurns = () => inferences.filter((r) => r.startsWith('tune-out cadence'));
+  /** The resident's turns for a hold that ended, with the reason. */
+  const releases = () => inferences.filter((r) => r.startsWith('tune-out cancelled ('));
   const wakeTurns = () => inferences.filter((r) => r.startsWith('tune-out wake'));
   const noTimerPastOne = () => assert.ok(
     delays.every((ms) => ms <= ONE_TIMER_MS),
@@ -131,7 +137,7 @@ function harness(
   /** The arguments of each line written to stderr. */
   const stderrLines = () => stderr.mock.calls.map((c) => c.arguments as unknown[]);
   return {
-    coordinator, entered, cancels, cadenceTurns, wakeTurns, delays, noTimerPastOne, endInRegistry, active,
+    coordinator, entered, cancels, cadenceTurns, releases, wakeTurns, delays, noTimerPastOne, endInRegistry, active,
     failNext, timerFailures, ackFailures, notices, stderrLines, cancelCalls: () => cancelCalls,
   };
 }
@@ -328,6 +334,67 @@ it('an option below its floor is raised to it, as before', (t) => {
     [h.entered[0].expiresAtMs, h.entered[0].cadenceSeconds, h.entered[0].backlogCap, h.entered[0].maxWakes],
     [NOW + 60_000, 30, 0, 1],
   );
+});
+
+// The all-except hold (Dendrite) arms its own end time and cadence, and reads
+// its options by the same rule as a channel's tune-out.
+
+it('an all-except hold past one timer ends at its end time and not before', (t) => {
+  const h = harness(t);
+  assert.equal(h.coordinator.enterAllExcept({ serverId: 'disc', channelId: '#a' }, { durationSeconds: 30 * 86_400 }, 'agent-tool').ok, true);
+  t.mock.timers.tick(ONE_TIMER_MS);
+  assert.ok(h.coordinator.getAllExcept(), "still held after one timer's worth");
+  t.mock.timers.tick(30 * DAY_MS - ONE_TIMER_MS - 1);
+  assert.ok(h.coordinator.getAllExcept(), 'still held 1 ms before its end');
+  assert.deepEqual(h.releases(), [], 'the resident has not been woken');
+  t.mock.timers.tick(1);
+  assert.equal(h.coordinator.getAllExcept(), null, 'released at its end time');
+  assert.deepEqual(h.releases(), ['tune-out cancelled (duration elapsed)'], 'one wake, at the end time');
+  h.noTimerPastOne();
+});
+
+it('an all-except cadence past one timer gives the subconscious a turn each period for a held channel with traffic', (t) => {
+  const h = harness(t);
+  assert.equal(
+    h.coordinator.enterAllExcept({ serverId: 'disc', channelId: '#a' }, { durationSeconds: 90 * 86_400, cadenceSeconds: 30 * 86_400 }, 'agent-tool').ok,
+    true,
+  );
+  assert.ok(h.coordinator.onIncoming('disc', '#b', 'm1', undefined), 'a message in another channel is held');
+  t.mock.timers.tick(ONE_TIMER_MS);
+  t.mock.timers.tick(30 * DAY_MS - ONE_TIMER_MS - 1);
+  assert.deepEqual(h.cadenceTurns(), [], 'no turn before the cadence');
+  t.mock.timers.tick(1);
+  assert.deepEqual(h.cadenceTurns(), ['tune-out cadence: #b'], 'one turn at the cadence');
+  h.coordinator.onIncoming('disc', '#b', 'm2', undefined);
+  t.mock.timers.tick(ONE_TIMER_MS);
+  t.mock.timers.tick(30 * DAY_MS - ONE_TIMER_MS);
+  assert.equal(h.cadenceTurns().length, 2, 'a second turn a period later');
+  h.noTimerPastOne();
+});
+
+it('enterAllExcept refuses an option that gives no finite number, and a duration left out, before anything changes', (t) => {
+  const h = harness(t);
+  const except = { serverId: 'disc', channelId: '#a' };
+  const error = (r: { ok: boolean; error?: string }) => (assert.equal(r.ok, false), r.error);
+  assert.equal(
+    error(h.coordinator.enterAllExcept(except, { durationSeconds: 'abc' as unknown as number }, 'agent-tool')),
+    'Nothing was tuned out: durationSeconds must be a finite number of seconds, and it was the string "abc".',
+  );
+  assert.equal(
+    error(h.coordinator.enterAllExcept(except, { durationSeconds: 3600, cadenceSeconds: Number.NaN }, 'agent-tool')),
+    'Nothing was tuned out: cadenceSeconds must be a finite number of seconds, and it was NaN. Leave it out for the default, 1800.',
+  );
+  assert.equal(
+    error(h.coordinator.enterAllExcept(except, { durationSeconds: Number.MAX_VALUE }, 'agent-tool')),
+    `Nothing was tuned out: durationSeconds ${Number.MAX_VALUE} is longer than an end time can be kept.`,
+  );
+  assert.match(error(h.coordinator.enterAllExcept(except, {}, 'agent-tool'))!, /needs `durationSeconds`/);
+  assert.match(error(h.coordinator.enterAllExcept(except, { durationSeconds: null as unknown as number }, 'agent-tool'))!, /needs `durationSeconds`/);
+  assert.equal(h.coordinator.getAllExcept(), null, 'nothing was held');
+  assert.deepEqual(h.delays, [], 'no timer was armed');
+  const read = h.coordinator.enterAllExcept(except, { durationSeconds: '3600' as unknown as number }, 'agent-tool');
+  assert.equal(read.ok, true, 'a numeric string is read as its number');
+  assert.equal((read as { params: { expiresAtMs: number } }).params.expiresAtMs, NOW + 3_600_000);
 });
 
 it('armAt arms a deadline that has passed for the next turn of the loop, with no negative-delay warning', async () => {
