@@ -1287,9 +1287,9 @@ function logSeedOmissions(
  * A maintenance provider call withdrawn because a surgery holds the store,
  * because stop() has closed provider admission, or because the framework is
  * done with the agent (an ephemeral run that has left or been released by
- * cleanup(), a disposed conversation fork): each is the framework's own
- * doing, and no failure. It sent nothing: it was refused at the provider
- * gate, or woken there from its wait. It extends context-manager's
+ * cleanup(), a conversation fork disposed or not made): each is the
+ * framework's own doing, and no failure. It sent nothing: it was refused at
+ * the provider gate, or woken there from its wait. It extends context-manager's
  * CompressionWithdrawn, whose constructor sets the brand context-manager reads
  * a withdrawal by, so the call is no outcome of the compression: every rung
  * of the fallback ladder and the merge path rethrow it unchanged, recording
@@ -2351,9 +2351,9 @@ export class AgentFramework {
   private ephemeralAgents: WeakSet<Agent> = new WeakSet();
   /** Each ephemeral agent's or conversation fork's release, kept per Agent
    *  rather than per name: set once an ephemeral run has left or cleanup() has
-   *  released it, or as a conversation fork is disposed. From then on its
-   *  context manager's compression is withdrawn (ephemeralAuxiliaryMembraneFor,
-   *  conversationAuxiliaryMembraneFor). */
+   *  released it, or as a conversation fork is disposed or fails to be made.
+   *  From then on its context manager's compression is withdrawn
+   *  (ephemeralAuxiliaryMembraneFor, conversationAuxiliaryMembraneFor). */
   private agentReleases: WeakMap<Agent, { released: boolean }> = new WeakMap();
   /** Warn only once per Agent instance after utilities are registered. */
   private emptyUtilityPermissionWarnings: WeakSet<Agent> = new WeakSet();
@@ -4141,8 +4141,8 @@ export class AgentFramework {
    * after a message starts it, so it is withdrawn as a resident's is: a call
    * made while a surgery holds the store, or once stop() has closed provider
    * admission, is withdrawn without being sent. So is one made once the fork
-   * has been disposed (`release`): its context stays in Chronicle, and no
-   * turn compiles it again.
+   * has been disposed, or its creation has failed (`release`): its context
+   * stays in Chronicle, and no turn compiles it again.
    */
   private conversationAuxiliaryMembraneFor(agentName: string, release: { released: boolean }): Membrane {
     return this.membraneAdmitting(async (run, model) => {
@@ -12225,8 +12225,8 @@ export class AgentFramework {
       throw new Error(`Conversation agent name "${name}" is already registered or reserved`);
     }
     this.usedEphemeralAgentNames.set(name, 'conversation');
+    const release = { released: false };
     try {
-      const release = { released: false };
       const contextManager = await ContextManager.open({
         store: this.store,
         namespace: `conversations/${name}`,
@@ -12309,6 +12309,10 @@ export class AgentFramework {
       this.conversationAgentHomes.set(name, channelId);
       return agent;
     } catch (error) {
+      // A fork that fails partway, in its seed say, leaves a manager no agent
+      // owns, and the messages seeded before the failure may have started its
+      // drain: it is released as a disposed fork's is.
+      release.released = true;
       this.usedEphemeralAgentNames.delete(name);
       throw error;
     }

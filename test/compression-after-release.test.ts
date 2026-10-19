@@ -1,8 +1,9 @@
 /**
- * A context manager the framework is done with makes no provider call
+ * A context manager the framework is done with makes no further provider call
  * (anima-research/agent-framework#550): an ephemeral agent's compression is
  * withdrawn unsent once its run has left or cleanup() has released it, and a
- * conversation fork's once it has been disposed. An ephemeral agent's is
+ * conversation fork's once it has been disposed or its creation has failed
+ * partway. A call already out runs to its answer. An ephemeral agent's is
  * withdrawn too, as every agent's is, under a surgery's hold and once stop()
  * has begun. The withdrawal is context-manager's CompressionWithdrawn, so the
  * strategy's drain stops quietly and logs nothing.
@@ -213,6 +214,40 @@ describe('a context manager the framework is done with makes no compression call
       const at = Date.now();
       await sleep(800);
       assert.equal(membrane.since(at), 0, 'no compression call reached the provider after the fork was disposed');
+      assert.deepEqual(errors.lines, [], 'the withdrawal stopped the drain without a log line');
+    } finally {
+      errors.restore();
+      await quiesce(membrane);
+      await framework.stop();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("once its conversation fork's creation has failed partway, with compression its seed queued", { timeout: 60_000 }, async () => {
+    const membrane = new CompressionMembrane(100);
+    const dir = mkdtempSync(join(tmpdir(), 'af-fork-withdrawn-failed-'));
+    const framework = await AgentFramework.create({
+      storePath: join(dir, 'store.chronicle'), membrane: membrane.asMembrane(),
+      agents: [{ name: 'trunk', model: 'test-model', systemPrompt: 'test' }],
+      modules: [new Quiet()], syncIntervalMs: 0, maintenanceIntervalMs: 0,
+      conversations: { templateAgent: 'trunk', bind: { channel: 'mention' }, strategyFactory: () => drainingStrategy() },
+    });
+    const internals = framework as unknown as { createConversationAgent(name: string, channelId: string): Promise<unknown> };
+    const errors = captureDrainErrors();
+    try {
+      // The template's history is the fork's seed. Its last message, made
+      // malformed here, is refused by the fork's addMessage, so the seed
+      // stops after the 30 before it, which queue compression.
+      const template = framework.getAgent('trunk')!.getContextManager();
+      addBacklog(template, 30);
+      const compile = template.compile.bind(template);
+      template.compile = async (...args: Parameters<typeof compile>) => {
+        const compiled = await compile(...args);
+        return { ...compiled, messages: [...compiled.messages, { ...compiled.messages[0]!, content: ['not a content block'] as never }] };
+      };
+      await assert.rejects(internals.createConversationAgent('trunk-chan-g1', 'world:chan'), /refused/);
+      await sleep(800);
+      assert.equal(membrane.compressions.length, 0, "no compression call reached the provider for the fork that wasn't made");
       assert.deepEqual(errors.lines, [], 'the withdrawal stopped the drain without a log line');
     } finally {
       errors.restore();
