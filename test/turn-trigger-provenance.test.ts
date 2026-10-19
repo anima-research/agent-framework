@@ -885,6 +885,27 @@ describe("the scheduler's split, and a private turn's other paths", () => {
     }
   });
 
+  it("a gate window's channel-bound surface message keeps its own turn beside a private message, though newer ambient chatter shares its part", async () => {
+    const gate = { config: { policies: [{ name: 'both', match: { scope: ['external-message', 'mcpl:channel-incoming'] }, behavior: { debounce: 100 } }], default: 'skip' } };
+    const rig = await surfaceRig({ gate });
+    try {
+      const eventGate = (rig.framework as unknown as { eventGate: { evaluate(info: Record<string, unknown>): unknown } }).eventGate;
+      rig.framework.pushEvent(tuiMessage());
+      rig.framework.pushEvent(roomMessage(false));
+      await rig.framework.runUntilIdle();
+      eventGate.evaluate({
+        content: 'newer room chatter', eventType: 'mcpl:channel-incoming', serverId: 'discord', channelId: ROOM,
+        metadata: { author: { id: 'u2' } }, tags: [],
+      });
+      await rig.until(() => rig.starts.length >= 2, 'a turn for each part');
+      await rig.framework.runUntilIdle();
+      assert.ok(rig.starts.some(privateStart), JSON.stringify(rig.starts));
+      assert.ok(rig.starts.some(roomStart), `the channel-bound message's part keeps its channel: ${JSON.stringify(rig.starts)}`);
+    } finally {
+      await rig.close();
+    }
+  });
+
   it("a provider hold keeps a gate window's private wake beside its other part, though both have one reason, source and time", async () => {
     const rig = await surfaceRig();
     try {

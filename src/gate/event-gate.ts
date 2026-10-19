@@ -211,8 +211,11 @@ function isMetadataTruthy(value: unknown): boolean {
 /**
  * Provenance of a batched wake: the newest ADDRESSED channel-bearing event
  * wins (mention / reply / DM outranks newer ambient chatter — the framework's
- * own locus rule); else the newest channel-bearing event. Channel, author and
- * addressed all come from that one event, so they can never disagree.
+ * own locus rule); else the newest channel-bound surface message, which names
+ * a channel to answer in (routingClass 'channel'), so newer ambient chatter
+ * doesn't take that away; else the newest channel-bearing event. Channel,
+ * author and addressed all come from that one event, so they can never
+ * disagree.
  *
  * Give it one part of a window: a private surface's events, or the rest.
  * Events of both are one private wake whose channel side nobody answers,
@@ -221,6 +224,7 @@ function isMetadataTruthy(value: unknown): boolean {
 export function wakeProvenance(events: PendingEvent[]): WakeProvenance | undefined {
   let newest: PendingEvent | undefined;
   let newestAddressed: PendingEvent | undefined;
+  let newestBound: PendingEvent | undefined;
   for (const e of events) {
     // A resolved route counts as naming a channel only for an ADDRESSED
     // event: a push whose origin declares only `mcplChannelId` (no raw
@@ -232,8 +236,9 @@ export function wakeProvenance(events: PendingEvent[]): WakeProvenance | undefin
     if (!e.channelId && !e.authorId && !(e.addressed && e.routeChannelId)) continue;
     if (!newest || e.timestamp >= newest.timestamp) newest = e;
     if (e.addressed && (!newestAddressed || e.timestamp >= newestAddressed.timestamp)) newestAddressed = e;
+    if (e.routingClass === 'channel' && (!newestBound || e.timestamp >= newestBound.timestamp)) newestBound = e;
   }
-  const pick = newestAddressed ?? newest;
+  const pick = newestAddressed ?? newestBound ?? newest;
   const privateSurface = events.some((event) => event.routingClass === 'private');
   if (!pick && !privateSurface) return undefined;
   // push-event channel ids are the adapter's raw ids (a Discord snowflake):
