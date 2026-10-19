@@ -89,9 +89,10 @@ export function withheldResultNotice(spill: WithheldSpill, auditDurable: boolean
  * the order marked, serialized as a stored result is. Past the inline cap
  * they're cut, with a note that says so and where the whole result is, since
  * a later field can then be cut away entirely. Undefined when it keeps
- * nothing, as for a failed result (agent-framework #277). A write's file
- * list is evidence of what it did, rarely what drew a refusal, and keeping it
- * is what shows a clobbered file when the receipt is withheld.
+ * nothing, as for a failed result (agent-framework #277), or one whose claims
+ * can't be read whole (resultClaimsOf). A write's file list is evidence of
+ * what it did, rarely what drew a refusal, and keeping it is what shows a
+ * clobbered file when the receipt is withheld.
  */
 export function keptWhenWithheld(result: CompletedToolCall['result'], maxChars: number | undefined): string | undefined {
   const { data, keepWhenWithheld: keys } = result;
@@ -105,8 +106,12 @@ export function keptWhenWithheld(result: CompletedToolCall['result'], maxChars: 
   // text: picked out of it, a kept uri would lose the type that makes it a
   // reference, and be written out of the stub that hides it.
   // The kept fields are shown as the whole result claims (resultClaimsOf), so
-  // a never elsewhere in it still withholds a kept link's uri.
-  const whole = rfc005TextOf(fields) ?? toolResultDataToHistoryString(kept, undefined, { claims: resultClaimsOf(fields) });
+  // a never elsewhere in it still withholds a kept link's uri. Where a value
+  // stops that walk, such as a getter that throws, which the audit's JSON
+  // doesn't read, what the rest claims is unknown, and nothing is kept.
+  const claims = resultClaimsOf(fields);
+  if (claims === null) return undefined;
+  const whole = rfc005TextOf(fields) ?? toolResultDataToHistoryString(kept, undefined, { claims });
   if (!maxChars || whole.length <= maxChars) return whole;
   // Never half a surrogate pair: the stub goes to the provider as text, so
   // the cut can be one character short of the cap.

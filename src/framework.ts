@@ -19225,7 +19225,9 @@ export class AgentFramework {
       // A uri any of the result's references gives an expiry that counts
       // isn't fetched, as autoFetchReferences passes over one that any block
       // of an MCPL result marks expired.
-      claims = resultClaimsOf(result.data, result.dataIsContent);
+      // Where a value stops the walk, the records decide: the script gets
+      // the same stop when its text is written.
+      claims = resultClaimsOf(result.data, result.dataIsContent) ?? undefined;
       for (const block of result.data) {
         const c = classifyBlock(block);
         if (c.kind !== 'reference' || c.testimony.fromLink) continue;

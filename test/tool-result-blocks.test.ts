@@ -1099,6 +1099,20 @@ describe('one answer for every block of a result', () => {
     assert.ok(kept !== undefined && /^\{"files":\["\[ref_[^\]]+\] kept\.csv — from tool result — /.test(kept), kept);
   });
 
+  it("keeps nothing of a withheld result whose claims a value stops the walk of, since what the rest claims is unknown", () => {
+    const uri = 'https://zz-elsewhere.example/kept-unread.csv';
+    // A getter on the prototype, which the audit's JSON doesn't read, and
+    // the claims walk does.
+    class Status { get type(): string { throw new Error('zz-unreadable'); } }
+    const result = {
+      success: true,
+      data: { status: new Status(), withheld: { type: 'resource', uri, name: 'kept.csv', disposition: 'never' }, files: [{ type: 'resource_link', uri, name: 'kept.csv' }] },
+      keepWhenWithheld: ['files'],
+    };
+    assert.doesNotThrow(() => JSON.stringify(result));
+    assert.equal(keptWhenWithheld(result, undefined), undefined);
+  });
+
   it("reads a result's data once without a stored copy, and sends what that one reading made", () => {
     // Natively, beside an image, and as text, with none.
     for (const [data, expected] of [

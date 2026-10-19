@@ -121,9 +121,10 @@ function isContentArray(data: unknown, dataIsContent?: boolean): data is unknown
  * them: a content array's from its elements (contentClaims), and any other
  * data's by the walk serialization takes (claimsInHistory). For a decision
  * made about the result outside showing it, such as which of its references
- * to fetch, or for showing part of it as the rest of it claims.
+ * to fetch, or for showing part of it as the rest of it claims. Null where a
+ * value stops the walk, so what the data claims is unknown (claimsInHistory).
  */
-export function resultClaimsOf(data: unknown, dataIsContent?: boolean): ResultClaims {
+export function resultClaimsOf(data: unknown, dataIsContent?: boolean): ResultClaims | null {
   return isContentArray(data, dataIsContent) ? contentClaims(data) : claimsInHistory(data);
 }
 
@@ -368,13 +369,14 @@ function walkedInHistory(value: unknown, asText: (b: Record<string, unknown>) =>
  * (ResultClaims), read by the walk serialization takes (walkedInHistory),
  * through toJSON, the fields of inline data and every depth it shows: so
  * every reference whose stub the result shows counts, and nothing it doesn't
- * show does. A value serialization can't write, such as a cycle, stops the
- * walk where it would stop the result's serialization. It's a walk of its
- * own before the one that shows the data, so a value's toJSON and getters
- * run in both: one that answers differently the second time can claim what
- * the shown text doesn't show.
+ * show does. A value the walk can't read or write, such as a cycle or a
+ * getter that throws, stops it, and then it's null, since what the rest of
+ * the data claims is unknown. It's a walk of its own before the one that
+ * shows the data, so a value's toJSON and getters run in both: one that
+ * answers differently the second time can claim what the shown text doesn't
+ * show.
  */
-function claimsInHistory(data: unknown): ResultClaims {
+function claimsInHistory(data: unknown): ResultClaims | null {
   const testimonies: ReferenceTestimony[] = [];
   const read = (b: Record<string, unknown>): string | null => {
     const c = classifyBlock(b);
@@ -395,11 +397,11 @@ function claimsInHistory(data: unknown): ResultClaims {
       });
     }
   } catch {
-    // Showing the result meets the same failure at the same place, for a
-    // value that answers the same each time it's read. A withheld result
-    // shows only the fields it keeps, but the guard serialized the whole
-    // result for its audit before that (ToolResultGuard.archive), so such a
-    // value stopped it there.
+    // Showing the whole result stops at the same value, for a value that
+    // answers the same each time it's read. A caller that shows part of it,
+    // such as a withheld result's kept fields, can't know what the rest
+    // claims.
+    return null;
   }
   return resultClaims(testimonies);
 }
@@ -415,13 +417,17 @@ export function rfc005TextOf(value: unknown): string | null {
   return shown !== value && typeof shown === 'string' ? shown : null;
 }
 
+/** The claims of data that claims nothing. */
+const NO_CLAIMS: ResultClaims = new Map();
+
 /**
  * JSON of a tool result's data with each value in it shown as history shows
  * it (shownInHistory), at any depth. Data that is itself shown as text, such
  * as a bare reference, is that text.
  */
 function historyJson(data: unknown, given?: ResultClaims): string | undefined {
-  const claims = given ?? claimsInHistory(data);
+  // A walk that stopped claims nothing: showing stops at the same value.
+  const claims = given ?? claimsInHistory(data) ?? NO_CLAIMS;
   const root = shownInHistory(data, claims);
   if (root !== data && typeof root === 'string') return root;
   return JSON.stringify(data, (_key, value: unknown) => shownInHistory(value, claims)) as string | undefined;
