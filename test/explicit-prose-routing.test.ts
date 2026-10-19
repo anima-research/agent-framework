@@ -1421,7 +1421,12 @@ describe('explicit prose routing', () => {
       // continuation 2.)
       membrane.pushResponse(createMockResponse([{ type: 'text', text: '>>>skip_reply' }] as ContentBlock[]));
       feedTurn(framework, 2, [{ type: 'text', text: '>>>skip_reply' }] as ContentBlock[]);
-      trigger(framework);
+      // A message in the open turn's channel. A private surface's message
+      // would wait for that turn to end: a start that continues a turn takes
+      // no wake of the other kind.
+      framework.pushEvent({
+        type: 'external-message', source: 'test', content: 'go', metadata: { channelId: 'chan-alpha' },
+      } as unknown as ProcessEvent);
       await framework.runUntilIdle();
       for (const end = Date.now() + 5000; turns < 3 && Date.now() < end;) {
         await new Promise<void>((resolve) => setTimeout(resolve, 5));

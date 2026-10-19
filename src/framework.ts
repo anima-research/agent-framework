@@ -13725,22 +13725,41 @@ export class AgentFramework {
       // when the tool boundary appends a context-budget restart; selecting
       // requests[0] in that mixed batch bypassed the turn lock because a
       // restart existed, then treated the continuation as a fresh turn.
-      const trigger = budgetRestart ?? requests[0];
-      // A restart keeps its own kind. For a fresh batch led by a neutral wake,
-      // the first request that actually declares private/channel routing owns
-      // the turn kind; neutral causes may share that turn, the opposite kind may not.
-      const kindRequest = budgetRestart ?? requests.find(
+      let trigger = budgetRestart ?? requests[0];
+      // A start that continues a turn (continuedTurn), a budget restart's
+      // included, takes that turn's kind, since the turn's routing is what it
+      // speaks with; a batch's own kind could contradict it. A fresh batch
+      // takes the kind of the first request that declares private or channel
+      // routing, so one led by a neutral wake doesn't decide it. Neutral
+      // causes may share the turn; the opposite kind may not.
+      const continued = this.continuedTurn(agentName, trigger);
+      const kindRequest = continued ? undefined : requests.find(
         (request) => request.nonChannelOrigin === true || !!request.channelId,
       );
-      const turnIsPrivate = kindRequest?.nonChannelOrigin === true;
-      const turnIsChannel = !turnIsPrivate && !!kindRequest?.channelId;
+      const turnIsPrivate = continued ? continued.nonChannelOrigin === true : kindRequest?.nonChannelOrigin === true;
+      const turnIsChannel = !turnIsPrivate && (continued ? !!continued.triggerChannel : !!kindRequest?.channelId);
       if (turnIsPrivate || turnIsChannel) {
         const opposite = turnIsPrivate
           ? (request: InferenceRequest) => !!request.channelId
           : (request: InferenceRequest) => request.nonChannelOrigin === true;
-        const siblings = requests.filter((request) => request !== trigger && opposite(request));
-        if (siblings.length > 0) this.pendingRequests.push(...siblings);
-        requests = requests.filter((request) => request === trigger || !opposite(request));
+        // A fresh turn keeps the request that leads it. A start that
+        // continues a turn takes no wake of the other kind, the batch's first
+        // included, since a wake that arrived during a tool wait is queued
+        // ahead of the results' tool_results_ready. The wakes it takes none
+        // of are requeued, and each starts a turn of its own once this one
+        // ends. That relies on every open turn's continuation being queued
+        // with such wakes or before them (the non-streaming fallback's
+        // tool_results_ready, a capacity hold's held trigger, a derived
+        // retry), so a batch of the other kind alone starts nothing and waits
+        // for it. Were a turn left open with no continuation coming, wakes of
+        // the other kind would wait until a start of its own kind continued
+        // it or a stop() ended it.
+        const keeps = (request: InferenceRequest): boolean => (!continued && request === trigger) || !opposite(request);
+        const held = requests.filter((request) => !keeps(request));
+        if (held.length > 0) this.pendingRequests.push(...held);
+        requests = requests.filter(keeps);
+        if (requests.length === 0) continue;
+        trigger = budgetRestart ?? requests[0];
       }
       // Route this turn's auto-published speech to the channel that triggered
       // it (item-3 redux). A batched wake may carry several triggering channels
@@ -15058,6 +15077,21 @@ export class AgentFramework {
   }
 
 
+  /**
+   * The logical turn a start with this trigger continues, or undefined when
+   * the start opens one: a resume (a budget restart, a tool-result-guard
+   * retry) continues the agent's current turn, and any other start but a
+   * silent one continues the turn that is still open (openLogical). The
+   * start takes its routing from it (startAgentStream), and the scheduler
+   * takes its kind, so the two never disagree about whose turn a
+   * continuation is.
+   */
+  private continuedTurn(agentName: string, trigger: InferenceRequest | undefined): TurnRouting | undefined {
+    if (resumesLogicalTurn(trigger?.reason)) return this.turnRouting?.get(agentName);
+    if (trigger?.suppressProse) return undefined;
+    return this.openLogical?.get(agentName);
+  }
+
   /** Build a fresh request caused by a logical turn, retaining private origin. */
   private derivedTurnRequest(
     agentName: string,
@@ -16190,25 +16224,22 @@ export class AgentFramework {
     //    With no turn open, the start opens one.
     // A new object doesn't clear the previous turn's: prose that turn left
     // queued still reads and writes its own.
+    // continuedTurn decides it, as it decides for the scheduler which turn's
+    // kind a batch takes.
     let routing: TurnRouting;
     let opensTurn = false;
+    const continued = this.continuedTurn(agent.name, trigger);
     if (resumesTurn) {
-      routing = this.routingOf(agent.name);
+      routing = continued ?? this.routingOf(agent.name);
       // The turn a resume continues is open, unless a stop() ended every
       // open turn since: it opens again, so its later starts continue it.
       if (!trigger?.suppressProse && !this.openLogical.has(agent.name)) this.openLogical.set(agent.name, routing);
-    } else if (trigger?.suppressProse) {
-      routing = freshTurnRouting();
-      opensTurn = true;
+    } else if (continued) {
+      routing = continued;
     } else {
-      const open = this.openLogical.get(agent.name);
-      if (open) {
-        routing = open;
-      } else {
-        routing = freshTurnRouting();
-        this.openLogical.set(agent.name, routing);
-        opensTurn = true;
-      }
+      routing = freshTurnRouting();
+      if (!trigger?.suppressProse) this.openLogical.set(agent.name, routing);
+      opensTurn = true;
     }
     this.turnRouting.set(agent.name, routing);
 
