@@ -1409,6 +1409,7 @@ describe('present while acting', () => {
     const internals = framework as unknown as {
       turnRouting: Map<string, Routing>; openLogical: Map<string, Routing>; pendingRequests: InferenceRequest[];
       activeTurnTokens: Map<string, number>;
+      assembling: Set<string>;
       deferredMessages: Array<Record<string, unknown>>;
       addMessage(participant: string, content: ContentBlock[], metadata: Record<string, unknown>, opts?: { bypassDeferralFor?: string }): string;
     };
@@ -1422,7 +1423,9 @@ describe('present while acting', () => {
       // A delivery assembled while a start of the turn holds it (the
       // coalescing assembly writes past the deferral) is an arrival too.
       internals.activeTurnTokens.set('assistant', -1);
+      internals.assembling.add('assistant');
       internals.addMessage('Antra', [{ type: 'text', text: 'batched' }] as ContentBlock[], addressed('discord:dm:q'), { bypassDeferralFor: 'assistant' });
+      internals.assembling.delete('assistant');
       internals.activeTurnTokens.delete('assistant');
       assert.deepEqual(open.arrivals.map((a) => a.channelId), ['discord:dm:q']);
       // A message still deferred when the turn's next start begins lands in

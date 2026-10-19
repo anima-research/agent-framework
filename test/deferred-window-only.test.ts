@@ -1,7 +1,10 @@
 /**
  * What the window stores mid-turn is what the live stream carried.
  *
- * A message deferred during a turn is stored at the agent's next tool
+ * A message deferred during a turn's start, until its coalescing assembly
+ * ends, is stored before the turn's checkpoint, in that request, as the
+ * turn-start flush stores what came before. One deferred after that is
+ * stored at the agent's next tool
  * boundary and injected into the resumed stream (hear-while-acting), so the
  * next compile's prefix is the request the turn's later replies were minted
  * under. Two kinds of message can't be injected: one carrying tool blocks
@@ -331,11 +334,18 @@ describe('mid-turn deliveries keep the window what the stream carried', () => {
       pendingAssistantBlocks: Map<string, ContentBlock[]>;
       activeTurnTokens: Map<string, number>;
       activeStreams: Map<string, unknown>;
-      deferredMessages: Array<{ id: string; seq: number; participant: string; forAgent?: string }>;
+      deferredMessages: Array<{ id: string; seq: number; participant: string; forAgent?: string; content: ContentBlock[] }>;
+      unackedDeferredWrites: Array<{ id: string }>;
       deferredWritesPersisted: boolean;
+      quiesced: boolean;
+      assembling: Set<string>;
       drainDeferredFor: (name: string, stopAt?: unknown) => unknown[];
       readdDrained: (entries: unknown[], where: string) => unknown[];
-      addMessage(participant: string, content: ContentBlock[], metadata?: undefined, opts?: { forAgent?: string; fromQueue?: { id: string; seq: number } }): string;
+      ackDeferredWrites: () => void;
+      addMessage(participant: string, content: ContentBlock[], metadata?: undefined, opts?: {
+        forAgent?: string; fromQueue?: { id: string; seq: number }; bypassDeferralFor?: string;
+        placement?: { agent?: string; messageId?: string; deferredId?: string };
+      }): string;
     };
   }
   const otherCycle = (): ContentBlock[] => [{ type: 'tool_use', id: 'b1', name: 'robot--move', input: {} } as ContentBlock];
@@ -1086,5 +1096,165 @@ describe('mid-turn deliveries keep the window what the stream carried', () => {
       internals.activeTurnTokens.delete('assistant');
     }
     await framework.stop();
+  });
+
+  // The coalescing assembly writes past its agent's deferral, in the window
+  // the turn-start flush writes in (bypassDeferralFor). What was deferred
+  // for the agent before such a write came first, so it lands first.
+  const textsOf = (entries: Array<{ content: ContentBlock[] }>): string[] =>
+    entries.map((m) => m.content.map((b) => (b as { text?: string }).text ?? `<${b.type}>`).join(' '));
+
+  it("a write assembled for a turn's start lands after what was deferred for its agent before it, and acknowledges it", async () => {
+    const framework = await createFramework();
+    const internals = internalsOf(framework);
+    internals.deferredWritesPersisted = true;
+    internals.activeTurnTokens.set('assistant', 1);
+    internals.assembling.add('assistant');
+    try {
+      assert.equal(internals.addMessage('Antra', text('first')), '', 'deferred: the turn is alive');
+      // Another target's entry: it neither flushes nor holds this agent's write.
+      internals.deferredMessages.push({ id: 'ghost-1', seq: 0, participant: 'Antra', forAgent: 'ghost', content: text('elsewhere') });
+      const placement: { agent?: string; messageId?: string; deferredId?: string } = {};
+      const id = internals.addMessage('Antra', text('second'), undefined, { bypassDeferralFor: 'assistant', placement });
+      assert.notEqual(id, '', 'the assembled write is stored');
+      assert.equal(placement.deferredId, undefined);
+      assert.deepEqual(windowOf(framework).slice(-2), ['Antra: first', 'Antra: second'], 'what was deferred first lands first');
+      assert.deepEqual(textsOf(internals.deferredMessages), ['elsewhere'], "only the other target's entry is still queued");
+      assert.deepEqual(internals.unackedDeferredWrites, [], 'what the flush stored is acknowledged');
+    } finally {
+      internals.assembling.delete('assistant');
+      internals.activeTurnTokens.delete('assistant');
+      internals.deferredMessages.splice(0);
+    }
+    await framework.stop();
+  });
+
+  it("a write naming its agent's assembly after that assembly has ended is deferred like any write during the turn", async () => {
+    const framework = await createFramework();
+    const internals = internalsOf(framework);
+    internals.activeTurnTokens.set('assistant', 1);
+    try {
+      internals.addMessage('Antra', text('first'));
+      // An assembly that throws can leave a render running, which delivers
+      // after the window has closed.
+      const placement: { agent?: string; messageId?: string; deferredId?: string } = {};
+      assert.equal(internals.addMessage('Antra', text('late'), undefined, { bypassDeferralFor: 'assistant', placement }), '', 'deferred');
+      assert.ok(placement.deferredId);
+      assert.deepEqual(textsOf([...internals.deferredMessages].sort((a, b) => a.seq - b.seq)), ['first', 'late'], 'nothing was flushed into the live turn');
+      assert.ok(!windowOf(framework).some((line) => line === 'Antra: first' || line === 'Antra: late'));
+    } finally {
+      internals.activeTurnTokens.delete('assistant');
+    }
+    await framework.stop();
+  });
+
+  it("a write assembled for a turn's start waits behind a deferred write that can't be stored, and lands after it", async () => {
+    const framework = await createFramework();
+    const internals = internalsOf(framework);
+    const cm = framework.getAgent('assistant')!.getContextManager();
+    const add = cm.addMessage.bind(cm);
+    let failing = true;
+    (cm as unknown as { addMessage: typeof add }).addMessage = (...args) => {
+      if (failing && (args[1] as Array<{ text?: string }>).some((b) => b.text === 'first')) throw new Error('disk full');
+      return add(...args);
+    };
+    const errors: string[] = [];
+    const error = console.error;
+    console.error = (...args: unknown[]) => { errors.push(args.map(String).join(' ')); };
+    internals.activeTurnTokens.set('assistant', 1);
+    internals.assembling.add('assistant');
+    try {
+      internals.addMessage('Antra', text('first'));
+      const placement: { agent?: string; messageId?: string; deferredId?: string } = {};
+      assert.equal(internals.addMessage('Antra', text('second'), undefined, { bypassDeferralFor: 'assistant', placement }), '', 'deferred');
+      assert.ok(placement.deferredId, 'its placement names the queued entry');
+      assert.ok(errors.some((e) => e.includes('assembly flush for assistant') && e.includes('disk full')), errors.join('\n'));
+      assert.deepEqual(textsOf([...internals.deferredMessages].sort((a, b) => a.seq - b.seq)), ['first', 'second'], 'it waits behind the held write');
+      assert.ok(!windowOf(framework).includes('Antra: second'));
+    } finally {
+      internals.assembling.delete('assistant');
+      internals.activeTurnTokens.delete('assistant');
+      console.error = error;
+    }
+    failing = false;
+    internals.readdDrained(internals.drainDeferredFor('assistant'), 'the turn ends');
+    internals.ackDeferredWrites();
+    assert.deepEqual(windowOf(framework).slice(-2), ['Antra: first', 'Antra: second'], 'both land, in the order they arrived');
+    await framework.stop();
+  });
+
+  it("a write assembled for a turn's start waits behind what is queued for its agent while the host is quiesced", async () => {
+    const framework = await createFramework();
+    const internals = internalsOf(framework);
+    internals.activeTurnTokens.set('assistant', 1);
+    internals.assembling.add('assistant');
+    try {
+      internals.addMessage('Antra', text('first'));
+      // A quiesce that begins while the turn's assembly awaits a render lets
+      // the turn drain: what is queued waits for resume(), and so does what
+      // the assembly writes after it.
+      internals.quiesced = true;
+      const placement: { agent?: string; messageId?: string; deferredId?: string } = {};
+      assert.equal(internals.addMessage('Antra', text('second'), undefined, { bypassDeferralFor: 'assistant', placement }), '', 'deferred');
+      assert.ok(placement.deferredId);
+      assert.deepEqual(textsOf([...internals.deferredMessages].sort((a, b) => a.seq - b.seq)), ['first', 'second']);
+      assert.ok(!windowOf(framework).some((line) => line === 'Antra: first' || line === 'Antra: second'), 'nothing queued is written while quiesced');
+    } finally {
+      internals.quiesced = false;
+      internals.assembling.delete('assistant');
+      internals.activeTurnTokens.delete('assistant');
+    }
+    internals.readdDrained(internals.drainDeferredFor('assistant'), 'resume');
+    internals.ackDeferredWrites();
+    assert.deepEqual(windowOf(framework).slice(-2), ['Antra: first', 'Antra: second']);
+    await framework.stop();
+  });
+
+  it("a write assembled for a turn's start is stored while the host is quiesced when nothing is queued for its agent", async () => {
+    const framework = await createFramework();
+    const internals = internalsOf(framework);
+    internals.activeTurnTokens.set('assistant', 1);
+    internals.assembling.add('assistant');
+    internals.quiesced = true;
+    try {
+      // Another target's entry doesn't count as queued for this agent.
+      internals.deferredMessages.push({ id: 'ghost-1', seq: 0, participant: 'Antra', forAgent: 'ghost', content: text('elsewhere') });
+      assert.notEqual(internals.addMessage('Antra', text('assembled'), undefined, { bypassDeferralFor: 'assistant' }), '', 'stored, as the turn\'s own input');
+      assert.deepEqual(windowOf(framework).slice(-1), ['Antra: assembled']);
+      assert.deepEqual(textsOf(internals.deferredMessages), ['elsewhere'], 'and nothing of the queue was written');
+    } finally {
+      internals.quiesced = false;
+      internals.assembling.delete('assistant');
+      internals.activeTurnTokens.delete('assistant');
+      internals.deferredMessages.splice(0);
+    }
+    await framework.stop();
+  });
+
+  it("stop()'s drain, which writes past each agent's deferral, keeps its entries un-acked until it has stored them", async () => {
+    const framework = await createFramework();
+    const internals = internalsOf(framework);
+    internals.deferredWritesPersisted = true;
+    internals.activeTurnTokens.set('assistant', 1);
+    internals.addMessage('Antra', text('first'));
+    internals.addMessage('Antra', text('second'));
+    internals.activeTurnTokens.delete('assistant');
+    // An entry for a target that isn't registered stays queued through the
+    // drain, so the queue isn't empty while the drain writes.
+    internals.deferredMessages.push({ id: 'ghost-1', seq: 0, participant: 'Antra', forAgent: 'ghost', content: text('elsewhere') });
+    const cm = framework.getAgent('assistant')!.getContextManager();
+    const add = cm.addMessage.bind(cm);
+    const unackedAt: Record<string, string[]> = {};
+    (cm as unknown as { addMessage: typeof add }).addMessage = (...args) => {
+      const written = (args[1] as Array<{ text?: string }>).map((b) => b.text).join(' ');
+      unackedAt[written] = internals.unackedDeferredWrites.map((m) => m.id);
+      return add(...args);
+    };
+    const secondId = internals.deferredMessages.find((m) => textsOf([m])[0] === 'second')!.id;
+    const error = console.error;
+    console.error = () => {};
+    try { await framework.stop(); } finally { console.error = error; }
+    assert.ok(unackedAt.first?.includes(secondId), `'second' is still un-acked while 'first' is stored: ${JSON.stringify(unackedAt)}`);
+    assert.ok(unackedAt.second?.includes(secondId), `and while 'second' itself is stored: ${JSON.stringify(unackedAt)}`);
   });
 });

@@ -165,9 +165,11 @@ test('a write, edit or delete that throws after its tree entry is set says the c
   const intents = ws.intents.get('work')!;
   const update = intents.update;
   writeFileSync(join(dir, 'e.txt'), 'line\n');
-  writeFileSync(join(dir, 'd.txt'), 'doomed\n');
   assert.equal((await call('read', { path: 'work/e.txt' })).success, true);
-  assert.equal((await call('read', { path: 'work/d.txt' })).success, true);
+  // A draft the workspace made, which disk never agreed with: its deletion
+  // clears the path's intent once the entry is gone. A deletion that leaves
+  // a tombstone writes it first (the test after this one).
+  assert.equal((await call('write', { path: 'work/d.txt', content: 'draft\n' })).success, true);
   intents.update = () => { throw new Error('injected intent exception'); };
   try {
     const write = await call('write', { path: 'work/w.txt', content: 'new\n' });
@@ -184,6 +186,214 @@ test('a write, edit or delete that throws after its tree entry is set says the c
   }
   assert.equal(await stored('w.txt'), 'new\n');
   assert.equal(await stored('e.txt'), 'line, edited\n');
+  assert.equal((await call('read', { path: 'work/d.txt' })).success, false);
+});
+
+test("a deletion whose tombstone can't be written is refused and stores nothing, so it can be sent again and a materialize deletes the file", async (t) => {
+  const { workspace, store, dir, call, stored, disk } = setup(t);
+  const ws = workspace as unknown as { intents: Map<string, { update: (...args: unknown[]) => unknown; get(path: string): unknown }> };
+  const intents = ws.intents.get('work')!;
+  const update = intents.update;
+  const pendingDeletions = async () => ((await call('status', { mount: 'work' })).data as Record<string, { pendingWorkspaceDeletions: number }>).work!.pendingWorkspaceDeletions;
+  writeFileSync(join(dir, 'd.txt'), 'doomed\n');
+  assert.equal((await call('read', { path: 'work/d.txt' })).success, true);
+  // agent-framework #553's case: the removal's record lands and the store
+  // throws after it (anima-research/chronicle#39), and every intent write
+  // fails. Stored without its tombstone, the deletion would read as a file
+  // this branch doesn't have, which no materialize deletes and no second
+  // delete can reach. The tombstone is written first, so its failure stops
+  // the deletion before the removal.
+  const s = store as unknown as Record<string, (...args: unknown[]) => unknown>;
+  const realRemove = store.treeRemove;
+  let removals = 0;
+  s.treeRemove = (...args) => {
+    removals++;
+    realRemove.apply(store, args as never);
+    throw new Error('No space left on device (os error 28)');
+  };
+  intents.update = () => { throw new Error('injected intent exception'); };
+  try {
+    assert.equal(errorOf(await call('delete', { path: 'work/d.txt' })), 'injected intent exception');
+  } finally {
+    delete s.treeRemove;
+    intents.update = update;
+  }
+  assert.equal(removals, 0, 'the removal never ran');
+  // The tombstone's record lands and the store throws after it: the
+  // deletion stops there too, and the tombstone is put back.
+  intents.update = (...args: unknown[]) => {
+    update.apply(intents, args);
+    throw new Error('No space left on device (os error 28)');
+  };
+  try {
+    assert.equal(errorOf(await call('delete', { path: 'work/d.txt' })), 'No space left on device (os error 28)');
+  } finally {
+    intents.update = update;
+  }
+  assert.equal(intents.get('d.txt'), null, 'the tombstone was put back');
+  assert.equal(await pendingDeletions(), 0);
+  assert.equal(await stored('d.txt'), 'doomed\n');
+  assert.equal(disk('d.txt')!.toString(), 'doomed\n');
+  const del = await call('delete', { path: 'work/d.txt' });
+  assert.equal(del.success, true, del.error);
+  assert.equal(await pendingDeletions(), 1);
+  const deleted = await call('materialize', { path: 'work/d.txt', applyDeletions: true });
+  assert.equal(deleted.success, true, deleted.error);
+  assert.equal(disk('d.txt'), null);
+});
+
+test("a deletion that lands gives up its path's store origin, and one whose removal fails puts the path's intent back as it was", async (t) => {
+  const { workspace, store, dir, call, stored } = setup(t);
+  type Intent = { tombstone?: unknown; origin?: string };
+  const ws = workspace as unknown as { intents: Map<string, { get(path: string): Intent | null; update(path: string, change: (cur: Intent) => Intent): void }> };
+  const intents = ws.intents.get('work')!;
+  writeFileSync(join(dir, 'k.txt'), 'kept\n');
+  assert.equal((await call('read', { path: 'work/k.txt' })).success, true);
+  // A store origin, given here directly. A draft keeps one while a push of
+  // it is pending or interrupted, which is when a deletion that keeps a
+  // tombstone meets one, and the tombstone's write gives it up.
+  intents.update('k.txt', (cur) => ({ ...cur, origin: 'store' }));
+  // A damaged intent record, whose blob the store lacks: what it held is
+  // unknown, so the put-back restores the record itself.
+  writeFileSync(join(dir, 'u.txt'), 'unknown\n');
+  assert.equal((await call('read', { path: 'work/u.txt' })).success, true);
+  const intentTree = (workspace as unknown as { intents: Map<string, { treeStateId: string }> }).intents.get('work')!.treeStateId;
+  store.treeSet(intentTree, 'u.txt', { blobHash: 'f'.repeat(64), size: 2, mode: 0 });
+  const damaged = store.treeGet(intentTree, 'u.txt');
+  assert.ok('unreadable' in (intents.get('u.txt') ?? {}));
+  // A deletion that lands leaves its tombstone alone, the origin given up,
+  // as before the tombstone was written first.
+  writeFileSync(join(dir, 'o.txt'), 'other\n');
+  assert.equal((await call('read', { path: 'work/o.txt' })).success, true);
+  intents.update('o.txt', (cur) => ({ ...cur, origin: 'store' }));
+  const mountTree = (workspace as unknown as { mounts: Map<string, { treeStateId: string }> }).mounts.get('work')!.treeStateId;
+  const deleted = store.treeGet(mountTree, 'o.txt')!.blobHash;
+  assert.equal((await call('delete', { path: 'work/o.txt' })).success, true);
+  assert.deepEqual(intents.get('o.txt'), { tombstone: { hash: deleted } });
+  const s = store as unknown as Record<string, (...args: unknown[]) => unknown>;
+  s.treeRemove = () => { throw new Error('injected store failure'); };
+  try {
+    assert.equal(errorOf(await call('delete', { path: 'work/k.txt' })), 'injected store failure');
+    assert.equal(errorOf(await call('delete', { path: 'work/u.txt' })), 'injected store failure');
+  } finally {
+    delete s.treeRemove;
+  }
+  assert.deepEqual(intents.get('k.txt'), { origin: 'store' }, 'the intent as it was, with no tombstone and its origin');
+  assert.deepEqual(store.treeGet(intentTree, 'u.txt'), damaged, 'the damaged record as it was');
+  assert.equal(await stored('k.txt'), 'kept\n');
+});
+
+test("a tombstone a put-back couldn't take back deletes nothing, is no deletion to status or a bare materialize, and goes at the next agreement", async (t) => {
+  const { workspace, store, dir, call, stored, disk } = setup(t);
+  const ws = workspace as unknown as { intents: Map<string, { get(path: string): { tombstone?: unknown } | null }> };
+  const intents = ws.intents.get('work')!;
+  const pendingDeletions = async () => ((await call('status', { mount: 'work' })).data as Record<string, { pendingWorkspaceDeletions: number }>).work!.pendingWorkspaceDeletions;
+  writeFileSync(join(dir, 'k.txt'), 'kept\n');
+  assert.equal((await call('read', { path: 'work/k.txt' })).success, true);
+  // The removal fails, and so does the put-back, which removes the record
+  // the tombstone's write made. The put-back's failure is logged, naming the
+  // mount and the path, and the call answers with the removal's error.
+  const s = store as unknown as Record<string, (...args: unknown[]) => unknown>;
+  s.treeRemove = () => { throw new Error('injected store failure'); };
+  const warn = console.warn;
+  const warnings: string[] = [];
+  console.warn = (...args: unknown[]) => { warnings.push(args.map(String).join(' ')); };
+  try {
+    assert.equal(errorOf(await call('delete', { path: 'work/k.txt' })), 'injected store failure');
+  } finally {
+    delete s.treeRemove;
+    console.warn = warn;
+  }
+  assert.equal(warnings.length, 1, warnings.join('\n'));
+  assert.match(warnings[0]!, /Mount "work": a change to k\.txt failed, and putting its branch intent back threw too \(injected store failure\)/);
+  assert.ok(intents.get('k.txt')?.tombstone, 'the tombstone is still beside the entry');
+  assert.equal(await pendingDeletions(), 0);
+  // Disk changes since it agreed. A bare materialize, forced, leaves an
+  // agreed entry out, the tombstone notwithstanding, so disk's change stays.
+  writeFileSync(join(dir, 'k.txt'), 'changed on disk\n');
+  const forced = await call('materialize', { force: true, applyDeletions: true });
+  assert.equal(forced.success, true, forced.error);
+  assert.equal(disk('k.txt')!.toString(), 'changed on disk\n');
+  // The next sync adopts disk's change, which clears the tombstone.
+  const synced = await call('sync', {});
+  assert.equal(synced.success, true, synced.error);
+  assert.equal(await stored('k.txt'), 'changed on disk\n');
+  assert.equal(intents.get('k.txt'), null);
+});
+
+test("a deletion whose removal lands while reading the tree back fails keeps its tombstone, so the deletion stays pending", async (t) => {
+  const { workspace, store, dir, call, disk } = setup(t);
+  const ws = workspace as unknown as {
+    intents: Map<string, { get(path: string): { tombstone?: unknown } | null }>;
+    mounts: Map<string, { treeStateId: string }>;
+  };
+  const intents = ws.intents.get('work')!;
+  const mountTree = ws.mounts.get('work')!.treeStateId;
+  const pendingDeletions = async () => ((await call('status', { mount: 'work' })).data as Record<string, { pendingWorkspaceDeletions: number }>).work!.pendingWorkspaceDeletions;
+  writeFileSync(join(dir, 'l.txt'), 'landed\n');
+  assert.equal((await call('read', { path: 'work/l.txt' })).success, true);
+  // The removal's record lands and the store throws after it
+  // (anima-research/chronicle#39), and reading the tree back throws once, so
+  // nothing can tell whether the removal landed. Putting the tombstone back
+  // here would leave #553's state: an entry gone with no tombstone, which no
+  // materialize deletes.
+  const s = store as unknown as Record<string, (...args: unknown[]) => unknown>;
+  const realRemove = store.treeRemove;
+  const realGet = store.treeGet;
+  let failRead = false;
+  s.treeRemove = (...args) => {
+    const record = realRemove.apply(store, args as never);
+    if (args[0] !== mountTree) return record;
+    failRead = true;
+    throw new Error('No space left on device (os error 28)');
+  };
+  s.treeGet = (...args) => {
+    if (failRead && args[0] === mountTree) {
+      failRead = false;
+      throw new Error('injected read failure');
+    }
+    return realGet.apply(store, args as never);
+  };
+  try {
+    assert.match(errorOf(await call('delete', { path: 'work/l.txt' })), /reading its entries back failed too \(injected read failure\), so whether the change is stored isn't known$/);
+  } finally {
+    delete s.treeRemove;
+    delete s.treeGet;
+  }
+  assert.ok(intents.get('l.txt')?.tombstone, 'the tombstone stays');
+  assert.equal(await pendingDeletions(), 1);
+  const deleted = await call('materialize', { path: 'work/l.txt', applyDeletions: true });
+  assert.equal(deleted.success, true, deleted.error);
+  assert.equal(disk('l.txt'), null);
+});
+
+test("a write over a deleted path clears its tombstone, and one that stops before its intent update leaves it beside the entry, which status doesn't count as a deletion", async (t) => {
+  const { workspace, dir, call, disk } = setup(t);
+  const ws = workspace as unknown as { intents: Map<string, { update: (...args: unknown[]) => unknown; get(path: string): { tombstone?: unknown } | null }> };
+  const intents = ws.intents.get('work')!;
+  const update = intents.update;
+  const pendingDeletions = async () => ((await call('status', { mount: 'work' })).data as Record<string, { pendingWorkspaceDeletions: number }>).work!.pendingWorkspaceDeletions;
+  writeFileSync(join(dir, 'h.txt'), 'gone\n');
+  assert.equal((await call('read', { path: 'work/h.txt' })).success, true);
+  assert.equal((await call('delete', { path: 'work/h.txt' })).success, true);
+  assert.ok(intents.get('h.txt')?.tombstone);
+  assert.equal((await call('write', { path: 'work/h.txt', content: 'back\n' })).success, true);
+  assert.equal(intents.get('h.txt'), null, 'the write took the tombstone away');
+  writeFileSync(join(dir, 'g.txt'), 'gone\n');
+  assert.equal((await call('read', { path: 'work/g.txt' })).success, true);
+  assert.equal((await call('delete', { path: 'work/g.txt' })).success, true);
+  assert.equal(await pendingDeletions(), 1);
+  intents.update = () => { throw new Error('injected intent exception'); };
+  try {
+    assert.match(errorOf(await call('write', { path: 'work/g.txt', content: 'back\n' })), /^The write of "work\/g\.txt" is stored in the workspace/);
+  } finally {
+    intents.update = update;
+  }
+  assert.ok(intents.get('g.txt')?.tombstone, 'the write left the tombstone');
+  assert.equal(await pendingDeletions(), 0);
+  const materialized = await call('materialize', { path: 'work/g.txt', applyDeletions: true });
+  assert.equal(materialized.success, true, materialized.error);
+  assert.equal(disk('g.txt')!.toString(), 'back\n');
 });
 
 test('a write, edit or delete whose store throws after recording it says the change is stored', async (t) => {
@@ -195,14 +405,16 @@ test('a write, edit or delete whose store throws after recording it says the cha
   // The change's record lands, then the store throws, as Chronicle 0.4 does
   // when the auto-snapshot it writes after recording fails
   // (anima-research/chronicle#39). Only that record's set throws: the
-  // intents' own records after it go through.
+  // intents' own records go through, a deletion's tombstone before it among
+  // them.
   const s = store as unknown as Record<string, (...args: unknown[]) => unknown>;
+  const mountTree = (workspace as unknown as { mounts: Map<string, { treeStateId: string }> }).mounts.get('work')!.treeStateId;
   let armed = false;
   for (const name of ['treeSet', 'treeRemove']) {
     const real = s[name]!;
     s[name] = (...args) => {
       const record = real.apply(store, args);
-      if (!armed) return record;
+      if (!armed || args[0] !== mountTree) return record;
       armed = false;
       throw new Error('No space left on device (os error 28)');
     };
@@ -234,6 +446,10 @@ test('a write, edit or delete whose store throws after recording it says the cha
   assert.equal(await stored('w.txt'), 'new\n');
   assert.equal(await stored('e.txt'), 'line, edited\n');
   assert.equal((await call('read', { path: 'work/d.txt' })).success, false);
+  // Its tombstone went in before the removal, so the deletion is pending,
+  // for a materialize with applyDeletions (on a mount that pushes, the test
+  // after this one makes it).
+  assert.equal(((await call('status', { mount: 'work' })).data as Record<string, { pendingWorkspaceDeletions: number }>).work!.pendingWorkspaceDeletions, 1);
 
   // A store that throws before recording a change leaves it unstored, as
   // reading it back shows, and the store's error is the answer.
@@ -293,13 +509,15 @@ test('on a mount that pushes, a write, edit or delete whose store throws after r
   writeFileSync(join(dir, 'd.txt'), 'doomed\n');
   assert.equal((await call('read', { path: 'work/e.txt' })).success, true);
   assert.equal((await call('read', { path: 'work/d.txt' })).success, true);
+  // As in the test above, only the change's own record throws.
   const s = store as unknown as Record<string, (...args: unknown[]) => unknown>;
+  const mountTree = (workspace as unknown as { mounts: Map<string, { treeStateId: string }> }).mounts.get('work')!.treeStateId;
   let armed = false;
   for (const name of ['treeSet', 'treeRemove']) {
     const real = s[name]!;
     s[name] = (...args) => {
       const record = real.apply(store, args);
-      if (!armed) return record;
+      if (!armed || args[0] !== mountTree) return record;
       armed = false;
       throw new Error('No space left on device (os error 28)');
     };

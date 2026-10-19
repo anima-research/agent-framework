@@ -153,10 +153,11 @@ export interface AssemblyResult {
    *  read: empty or blank render (§5.2), cancelled, revoked before the render
    *  or at its response, a render-start that could not be made durable (the
    *  batch then waits for its recovery wake), a batch whose audience doesn't
-   *  include the agent, a render placed in another agent's deferred queue, a
-   *  render another assembly froze (its compile may show it, as that
-   *  request's), or a cause whose batch was withdrawn, displaced or consumed
-   *  by another request. */
+   *  include the agent, a render placed in a deferred queue (another
+   *  agent's, or this agent's own behind a write held there), a render
+   *  another assembly froze (its compile may show it, as that request's), or
+   *  a cause whose batch was withdrawn, displaced or consumed by another
+   *  request. */
   materialized: Set<string>;
 }
 
@@ -275,9 +276,9 @@ export interface CoalescerHost<E> {
   wakeForBatch(occurrence: CoalescedOccurrence<E>): Promise<void>;
   /** Queue an ordinary push wake for `agent`, under the batch's own wake
    *  policy, to read a render of the batch placed in its deferred queue that
-   *  no request consumed. It carries no subject, so the subject's other wakes,
-   *  and later withdrawals of them, leave it. */
-  wakeToRead(occurrence: CoalescedOccurrence<E>, agent: string): Promise<void>;
+   *  no request consumed, at `deferredId`. It carries no subject, so the
+   *  subject's other wakes, and later withdrawals of them, leave it. */
+  wakeToRead(occurrence: CoalescedOccurrence<E>, agent: string, deferredId?: string): Promise<void>;
   /** Withdraw unstarted wakes whose sole cause is this subject. */
   cancelWake(subject: string): void;
   /** The batch's audience still holds the authority it was admitted under. */
@@ -1056,13 +1057,17 @@ export class PushCoalescer<E = unknown> {
         const firstView = batch.firstView === true && state.history === 'none' && !state.occupant;
         const placement = await this.deliver({ ...occurrence, timestamp, content, ...(firstView ? { firstView: true } : {}) }, content, assemblingFor);
         if (placement?.deferredId) {
-          // Landed in another agent's deferred queue (its turn is alive): still
-          // unread there, so it stays replaceable and withdrawable. The turn
-          // being assembled doesn't read it, so it isn't materialized for that
-          // turn, and no request has consumed it. The freeze withdrew the
-          // queue's agent's wake for this batch; give it an ordinary wake, as
-          // any delivery during its turn has, beside any wakes a newer batch
-          // has, so that its next turn reads the content.
+          // Landed in a deferred queue: another agent's, whose turn is alive,
+          // or the assembling agent's own, behind a write held there (the
+          // host's bypassDeferralFor), or after its assembly ended, as any
+          // write during its turn. Still unread
+          // there, so it stays replaceable and withdrawable. The turn being
+          // assembled doesn't read it, so it isn't materialized for that turn,
+          // and no request has consumed it. The freeze withdrew the queue's
+          // agent's wake for this batch; give it an ordinary wake, as any
+          // delivery during its turn has, beside any wakes a newer batch has,
+          // so that its next turn reads the content (the wake starts no turn
+          // once the agent has read it, or it's removed).
           // The run's renders keep their own records, whatever else an
           // occupant carries, a first view's mark included.
           let before: Occupant['before'];
@@ -1076,7 +1081,7 @@ export class PushCoalescer<E = unknown> {
             await this.host.wakeForBatch(state.batch.latest);
           }
           state.audienceAgent = placement.agent;
-          await this.host.wakeToRead(occurrence, placement.agent);
+          await this.host.wakeToRead(occurrence, placement.agent, placement.deferredId);
           return;
         }
         // The materialized occurrence is consumed by the request being

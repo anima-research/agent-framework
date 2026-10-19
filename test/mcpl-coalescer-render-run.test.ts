@@ -18,7 +18,8 @@ interface Options {
  *  'other', an agent whose turn is alive, until it's removed, read, or gone,
  *  whichever agent assembled it. CoalescerHost leaves placement to the host,
  *  so this is one it allows; the framework stores the assembling agent's own
- *  render directly, which mcpl-coalescing's tests run. Its removal, like the
+ *  render directly while its assembly runs, after what is queued for it,
+ *  which mcpl-coalescing's tests run. Its removal, like the
  *  framework's, doesn't refuse a message a request has read. Each render says
  *  which notices it covers, as a notice-only server's does. */
 function makeHost(options: Options = {}) {

@@ -48,7 +48,9 @@ export interface McplPushEvent {
   targetAgents?: string[];
   /** RFC-006: set when the coalescer delivers; rides the wake it queues. */
   coalescingSubject?: string;
-  /** RFC-006 assembly: materialized for this agent's turn (store directly). */
+  /** RFC-006 assembly: materialized for this agent's turn, stored directly
+   *  while its assembly runs, after what is queued for it (the framework's
+   *  addMessage, bypassDeferralFor). */
   assemblingFor?: string;
   /** The coalescer's mark: the agent's first view of the subject (see
    *  CoalescedOccurrence.firstView). */

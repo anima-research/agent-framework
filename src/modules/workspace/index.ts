@@ -9,7 +9,7 @@ import { constants as fsConstants } from 'node:fs';
 import type { Stats } from 'node:fs';
 import { open, readdir, readlink, stat, lstat, realpath } from 'node:fs/promises';
 import { basename, dirname, isAbsolute, join, parse, resolve, relative, sep } from 'node:path';
-import type { JsStore } from '@animalabs/chronicle';
+import type { JsStore, JsTreeEntry } from '@animalabs/chronicle';
 import type { Module, ModuleContext, ProcessState, EventResponse } from '../../types/module.js';
 import type { ProcessEvent, ToolDefinition, ToolCall, ToolResult } from '../../types/events.js';
 import type {
@@ -39,7 +39,7 @@ import { WORKSPACE_FS_EVENT_TYPES, opToEventType } from './types.js';
 import { MountWatcher, type FsChange } from './watcher.js';
 import { hashContent, DEFAULT_MAX_FILE_SIZE } from './sync.js';
 import { DiskAgreement, sameRootIdentity } from './disk-agreement.js';
-import { BranchIntents } from './branch-intent.js';
+import { type BranchIntent, BranchIntents } from './branch-intent.js';
 import { IGNORED, NONBLOCK, OTHER_MOUNT, ROOT_REPLACED, ROOT_UNAVAILABLE, checkDir, checkRoot, diskSpelling, filesystemTrustsCtime, foldsCase, inOtherMount, leadsInto, linkLeads, linkOnTheWay, linkRefusal, linkWords, locateRoot, nestedAtReal, nestedHolder, passedOverAt, readPrefix, type CheckedDir, type LinkFound, type MountView, type NestedMount, type WorkspaceEntries } from './observe.js';
 import { TOOL_BATCH_HOOK_TIMEOUT_MS, ensureStateRegistered } from '../../module-registry.js';
 import { DEFAULT_TOOL_RESULT_INLINE_MAX_CHARS } from '../../tool-result-history.js';
@@ -2750,9 +2750,10 @@ export class WorkspaceModule implements Module {
   /**
    * Commit a tool's write or delete to the workspace tree, with the branch
    * intent it implies: store origin for a path disk never agreed with; for a
-   * deletion, a tombstone, unless the agreement's evidence for the path, P,
-   * holds no agreed disk copy (P absent, or no P and store origin), when it
-   * clears the path's intent and pushes nothing. It pushes the change to
+   * deletion, a tombstone, written before the entry is removed, unless the
+   * agreement's evidence for the path, P, holds no agreed disk copy (P
+   * absent, or no P and store origin), when it clears the path's intent and
+   * pushes nothing. It pushes the change to
    * disk when the mount opts in via
    * `autoMaterialize` — required for cross-agent pipelines, since another
    * agent's watcher on the same directory only sees real filesystem events.
@@ -2782,13 +2783,14 @@ export class WorkspaceModule implements Module {
   /**
    * commitToolChange for several paths of one mount at once, as edit_many
    * commits its files: every path's precondition is enforced before any entry
-   * is set, then every entry is set in one record of the store, which takes
-   * all of them or none, then each path's intent, by the rule
-   * commitToolChange's doc gives, which the loop below applies, with no await
-   * between, and one push takes the paths to disk, but for a deletion that
-   * clears its path's intent. `onCommitted` is told of each
-   * path once the entries are set, also when the store throws after setting
-   * them, whose error then goes on in place of the push (changesLanded).
+   * is set, then a deletion's tombstone is written, then every entry is set
+   * in one record of the store, which takes all of them or none, then each
+   * other path's intent, by the rule commitToolChange's doc gives, which the
+   * code below applies, with no await between, and one push takes the paths
+   * to disk, but for a deletion that clears its path's intent. `onCommitted`
+   * is told of each path once the entries are set, also when the store throws
+   * after setting them, whose error then goes on in place of the push
+   * (changesLanded).
    * Answers, by path, the reason for each that reached the workspace but not
    * disk (`refused`), and, apart from it, why one whose bytes reached disk
    * left the file's mode as disk had it (`modeKept`), and that a deletion
@@ -2810,6 +2812,107 @@ export class WorkspaceModule implements Module {
       settleAdoptionBeforeMutation(store, agreement, { name: mount.config.name, treeStateId: mount.treeStateId }, path);
     }
     const entry = (change: ToolChange & { kind: 'set' }) => ({ blobHash: change.blobHash, size: change.size, mode: change.mode ?? 0o644 });
+    // The changes the tree doesn't hold yet, which the read-back below checks,
+    // read before any intent is written, so no read comes between a
+    // tombstone's write and the put-back's guard.
+    const changing = changes.filter(({ path, change }) => !holds(store.treeGet(mount.treeStateId, path), change));
+    // Each path's intent, by the rule commitToolChange's doc gives. A
+    // deletion's tombstone is written before its entry is removed. Removed
+    // without it, the entry would read as a file this branch doesn't have,
+    // which no materialize deletes and no second delete can reach
+    // (anima-research/agent-framework#553). Every other intent is written
+    // after the tree change: what it gives up, the tombstone a write replaces
+    // or the origin and conflict a deletion clears, guards the path until the
+    // change lands.
+    const notes = new Map<string, string>();
+    const unpushed = new Set<string>();
+    const intentChanges = changes.map(({ path, change }): { path: string; first: boolean; next: (cur: BranchIntent) => BranchIntent } => {
+      const evidence = agreement.get(mount.config.name, path);
+      const cur = intents.get(path) ?? {};
+      if (change.kind === 'remove') {
+        // A deletion whose evidence holds no agreed disk copy (disk last
+        // agreed it had nothing here, or has never agreed with this entry,
+        // which the workspace created) puts the store back at the
+        // agreement. Nothing on disk is the workspace's to unlink, so it
+        // pushes nothing, and it clears the path's whole intent: no
+        // tombstone, so it needs no proof of absence, which a path disk
+        // can't show, such as one beneath a symlink the mount doesn't
+        // follow, would never give; and no conflict, which has nothing left
+        // to be about once the workspace has given up its side. Whatever
+        // disk holds there is a sync's to observe, a file the workspace
+        // never saw included. Any other deletion keeps its tombstone, which
+        // guards it: a copy disk agreed with, a push of ours that may have
+        // landed (pending or interrupted), or an entry from before the
+        // evidence.
+        if (!(evidence?.kind === 'absent' || (evidence === undefined && cur.origin === 'store'))) {
+          return {
+            path,
+            first: true,
+            next: (current) => {
+              const next = { ...current, tombstone: { hash: change.previousHash } };
+              delete next.origin;
+              return next;
+            },
+          };
+        }
+        unpushed.add(path);
+        // A conflict it clears may name a file disk held there, which the
+        // workspace never took in: the answer says that file wasn't
+        // unlinked, where the deletion alone would read as having removed
+        // it. The deletion doesn't look at disk, so a file nothing recorded
+        // gets no note.
+        if (cur.conflict?.disk) {
+          notes.set(path, `nothing was unlinked: when last observed, disk held a file at ${mount.config.name}/${path} `
+            + `that the workspace never took in (conflict: ${cur.conflict.kind}), and a sync observes whatever disk holds there`);
+        }
+        return { path, first: false, next: () => ({}) };
+      }
+      return {
+        path,
+        first: false,
+        next: (current) => {
+          const next = { ...current };
+          delete next.tombstone;
+          // Disk has never agreed with this path: a missing disk copy is a
+          // draft not yet materialized, not a deletion.
+          if (evidence === undefined) next.origin = 'store';
+          return next;
+        },
+      };
+    });
+    // A tombstone written for a change that then doesn't land is put back:
+    // the path's intent record as it was, a damaged one's bytes included, so
+    // a refused deletion changes nothing. The put-back is best effort, since
+    // the error that stopped the call is its answer. A tombstone it leaves
+    // beside the entry guards nothing: decide gives no verdict from one while
+    // the entry is there, status and materialize take it as no deletion, and
+    // the path's next agreement clears it.
+    const written: Array<{ path: string; record: JsTreeEntry | null }> = [];
+    const putBack = () => {
+      for (const { path, record } of written) {
+        try {
+          if (record) store.treeSet(intents.treeStateId, path, record);
+          else if (store.treeGet(intents.treeStateId, path)) store.treeRemove(intents.treeStateId, path);
+        } catch (error) {
+          // Left beside the entry, where it guards nothing (above).
+          console.warn(
+            `[workspace] Mount "${mount.config.name}": a change to ${path} failed, and putting its branch intent back threw too `
+            + `(${error instanceof Error ? error.message : String(error)}), so a tombstone may be left beside the entry. One there `
+            + `deletes nothing, and the path's next agreement with disk clears it`,
+          );
+        }
+      }
+    };
+    try {
+      for (const { path, first, next } of intentChanges) {
+        if (!first) continue;
+        written.push({ path, record: store.treeGet(intents.treeStateId, path) });
+        intents.update(path, next);
+      }
+    } catch (error) {
+      putBack();
+      throw error;
+    }
     // A store can fail after its record lands: Chronicle 0.4 writes a state's
     // auto-snapshot after appending its update, and that failure reaches the
     // caller with the update recorded (anima-research/chronicle#39). So a set
@@ -2818,7 +2921,6 @@ export class WorkspaceModule implements Module {
     // set, and then the error goes on in place of the push. A change the tree
     // already holds can't show whether the record is in, so a call whose every
     // change the tree holds already goes on as the store's own failure.
-    const changing = changes.filter(({ path, change }) => !holds(store.treeGet(mount.treeStateId, path), change));
     let landedThenThrew: { error: unknown } | null = null;
     try {
       if (changes.length === 1) {
@@ -2832,7 +2934,14 @@ export class WorkspaceModule implements Module {
           : { op: 'remove', path })));
       }
     } catch (error) {
-      if (changing.length === 0 || !changesLanded(store, mount.treeStateId, changing, error)) throw error;
+      // A read-back that fails can't tell whether the change landed, so its
+      // error goes on and a tombstone stays: put back where the removal did
+      // land, it would leave #553's state, and beside an entry it guards
+      // nothing.
+      if (changing.length === 0 || !changesLanded(store, mount.treeStateId, changing, error)) {
+        putBack();
+        throw error;
+      }
       landedThenThrew = { error };
     }
     // A later intent update or disk push can throw; the tree entries are
@@ -2840,51 +2949,7 @@ export class WorkspaceModule implements Module {
     // during the push, that branch's tree has the files and the new one may
     // not.
     for (const { path } of changes) onCommitted?.(path);
-    const notes = new Map<string, string>();
-    const unpushed = new Set<string>();
-    for (const { path, change } of changes) {
-      const evidence = agreement.get(mount.config.name, path);
-      intents.update(path, (cur) => {
-        if (change.kind === 'remove') {
-          // A deletion whose evidence holds no agreed disk copy (disk last
-          // agreed it had nothing here, or has never agreed with this entry,
-          // which the workspace created) puts the store back at the
-          // agreement. Nothing on disk is the workspace's to unlink, so it
-          // pushes nothing, and it clears the path's whole intent: no
-          // tombstone, so it needs no proof of absence, which a path disk
-          // can't show, such as one beneath a symlink the mount doesn't
-          // follow, would never give; and no conflict, which has nothing left
-          // to be about once the workspace has given up its side. Whatever
-          // disk holds there is a sync's to observe, a file the workspace
-          // never saw included. Any other deletion keeps its tombstone, which
-          // guards it: a copy disk agreed with, a push of ours that may have
-          // landed (pending or interrupted), or an entry from before the
-          // evidence.
-          if (!(evidence?.kind === 'absent' || (evidence === undefined && cur.origin === 'store'))) {
-            const next = { ...cur, tombstone: { hash: change.previousHash } };
-            delete next.origin;
-            return next;
-          }
-          unpushed.add(path);
-          // A conflict it clears may name a file disk held there, which the
-          // workspace never took in: the answer says that file wasn't
-          // unlinked, where the deletion alone would read as having removed
-          // it. The deletion doesn't look at disk, so a file nothing recorded
-          // gets no note.
-          if (cur.conflict?.disk) {
-            notes.set(path, `nothing was unlinked: when last observed, disk held a file at ${mount.config.name}/${path} `
-              + `that the workspace never took in (conflict: ${cur.conflict.kind}), and a sync observes whatever disk holds there`);
-          }
-          return {};
-        }
-        const next = { ...cur };
-        delete next.tombstone;
-        // Disk has never agreed with this path: a missing disk copy is a draft
-        // not yet materialized, not a deletion.
-        if (evidence === undefined) next.origin = 'store';
-        return next;
-      });
-    }
+    for (const { path, first, next } of intentChanges) if (!first) intents.update(path, next);
     const pushing = changes.filter(({ path }) => !unpushed.has(path));
     if (landedThenThrew) throw new StoredThenFailed(landedThenThrew.error, this.pushesOnCommit(mount) && pushing.length > 0, notes);
     const refused = new Map<string, string>();
@@ -3953,8 +4018,10 @@ export class WorkspaceModule implements Module {
       const intents = this.intents.get(name)!.list().filter(([p]) => own(p));
       const conflictPaths = intents.filter(([, bi]) => bi.conflict).map(([p]) => p);
       // A workspace deletion is pending until a push confirms it on disk:
-      // left there without applyDeletions, or unlinked but unconfirmed.
-      const deletionPaths = intents.filter(([, bi]) => bi.tombstone).map(([p]) => p);
+      // left there without applyDeletions, or unlinked but unconfirmed. A
+      // tombstone beside an entry that's still there, left by a deletion or
+      // a write that stopped partway (commitToolChanges), is no deletion.
+      const deletionPaths = intents.filter(([p, bi]) => bi.tombstone && !store.treeGet(mount.treeStateId, p)).map(([p]) => p);
       // Pending is what disk owes by the evidence: every entry it doesn't
       // show on disk (a refused or failed push stays owed), conflicts and
       // deletions. An entry from before the evidence isn't counted until a
@@ -4009,7 +4076,11 @@ export class WorkspaceModule implements Module {
 
     const { owed, unchecked, agreed } = this.entriesByEvidence(mount);
     for (const path of [...owed, ...unchecked]) selected.add(path);
-    for (const [p, bi] of intents) if (bi.conflict || bi.tombstone) selected.add(p);
+    // A tombstone is a deletion only where its entry is gone: one beside an
+    // entry that's still there, left by a change that stopped partway
+    // (commitToolChanges), would select an agreed entry, and a forced push
+    // would write it over a newer disk copy.
+    for (const [p, bi] of intents) if (bi.conflict || (bi.tombstone && !store.treeGet(mount.treeStateId, p))) selected.add(p);
     return { paths: [...selected], inPlace: agreed > 0 };
   }
 
