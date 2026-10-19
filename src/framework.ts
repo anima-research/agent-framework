@@ -13849,16 +13849,22 @@ export class AgentFramework {
       // tool_results_ready, a capacity hold's held trigger, a derived retry;
       // a tool-result guard's retry starts inline, in its stream), so a batch
       // of the other kind alone starts nothing and waits for it. The split
-      // runs only for an idle agent (the busy branch above requeues first), so
-      // a turn that has had nothing of its kind for OPEN_TURN_HOLD_MS, counted
-      // over passes like this one, has none coming: it ends, and the wakes it
-      // held start.
+      // runs only for an idle agent (the busy branch above requeues first).
+      // The hold's clock starts at the first such pass that holds a wake of
+      // the other kind with nothing of the turn's kind to start, and a pass
+      // that finds something of its kind, or finds the turn ended, resets it;
+      // a wake's own age, which counts its wait behind a busy agent, never
+      // starts it. Time the agent spends busy after the clock starts counts,
+      // since only a silent start can run beside the held turn. A turn that
+      // has had nothing of its kind for OPEN_TURN_HOLD_MS has none coming: it
+      // ends, and the wakes it held start. A turn whose token stays held, or
+      // one with no wake of the other kind waiting, isn't reached here.
       const held = requests.filter(opposite);
       if (held.length > 0) this.pendingRequests.push(...held);
       requests = requests.filter((request) => !opposite(request));
       const continuing = !!budgetRestart || requests.some((r) => r.suppressProse !== true);
+      const hold = this.openTurnHolds?.get(agentName);
       if (continued && held.length > 0 && !continuing) {
-        const hold = this.openTurnHolds?.get(agentName);
         if (hold?.turn !== continued) {
           this.openTurnHolds?.set(agentName, { turn: continued, since: now });
         } else if (now - hold.since >= OPEN_TURN_HOLD_MS) {
@@ -13876,7 +13882,10 @@ export class AgentFramework {
             `${Math.round((now - hold.since) / 1000)}s: ending the turn, so ${held.length} held request(s) can start`,
           );
         }
-      } else {
+      } else if (hold && (hold.turn === continued || this.openLogical?.get(agentName) !== hold.turn)) {
+        // Something of the held turn's kind came, or the turn is no longer
+        // open. A pass about another turn, such as a silent tick's budget
+        // restart, leaves its clock as it is.
         this.openTurnHolds?.delete(agentName);
       }
       if (requests.length === 0) continue;

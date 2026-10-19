@@ -861,6 +861,30 @@ describe("the scheduler's split, and a private turn's other paths", () => {
     }
   });
 
+  it("a pass about another turn, a silent tick's budget restart, leaves an open turn's hold clock as it is", async () => {
+    const rig = await surfaceRig();
+    try {
+      const holds = (rig.framework as unknown as { openTurnHolds: Map<string, { turn: unknown; since: number }> }).openTurnHolds;
+      const routing = routingOf(rig.framework);
+      routing.triggerChannel = ROOM;
+      rig.state.openLogical.set('scout', routing);
+      rig.i.pendingRequests.push(tuiWake());
+      await rig.i.processInferenceRequests();
+      const since = holds.get('scout')!.since;
+      // A silent tick ran beside the held turn, and its stream left a budget
+      // restart: the tick's routing is the agent's live one.
+      const tick = { ...(routing as object), nonChannelOrigin: false, triggerChannel: undefined } as Record<string, unknown>;
+      rig.state.turnRouting.set('scout', tick);
+      rig.i.pendingRequests.push({ agentName: 'scout', reason: 'context_budget_restart', source: 'framework', timestamp: Date.now(), suppressProse: true });
+      await rig.i.processInferenceRequests();
+      assert.ok(rig.starts.some((s) => s.reason === 'context_budget_restart'), `control: the restart ran: ${JSON.stringify(rig.starts)}`);
+      assert.equal(holds.get('scout')?.turn, routing, "the held turn's clock is still there");
+      assert.equal(holds.get('scout')?.since, since, 'and unchanged');
+    } finally {
+      await rig.close();
+    }
+  });
+
   it("a provider hold keeps a gate window's private wake beside its other part, though both have one reason, source and time", async () => {
     const rig = await surfaceRig();
     try {
