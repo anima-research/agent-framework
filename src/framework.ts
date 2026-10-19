@@ -2660,8 +2660,9 @@ export class AgentFramework {
    *  marks only that script, never the agent's next one. Its `turnId` is the
    *  turn of the code_execution call running it, which its calls carry.
    *  `calls` records each tool the script calls, for its round's routing
-   *  (ScriptRound). */
-  private scriptDeferredEndTurn: Map<string, { endTurn: boolean; turnId?: number; calls: RoundCall[] }> = new Map();
+   *  (ScriptRound). `startTurn` is the turn that started it, which judges
+   *  its calls' channel_publish (scriptStartTurn). */
+  private scriptDeferredEndTurn: Map<string, { endTurn: boolean; turnId?: number; calls: RoundCall[]; startTurn: TurnRouting | null }> = new Map();
   /** Per agent, a round that called code_execution and waits for those calls'
    *  results before its prose is routed (ScriptRound). */
   private scriptRounds: Map<string, ScriptRound> = new Map();
@@ -19366,6 +19367,7 @@ export class AgentFramework {
     // dispatched. Undefined off the model dispatch path (ephemeral callers),
     // whose code_execution call is not reported either.
     const origin = this.toolLifecycleEmitter?.scriptOrigin(agentName, call.id);
+    const startTurn = this.scriptStartTurn(agentName, call);
     const input = (call.input ?? {}) as {
       code?: unknown;
       background?: unknown;
@@ -19441,7 +19443,7 @@ export class AgentFramework {
     );
 
     if (input.background === true) {
-      const started = this.startBackgroundScript(agentName, input.code, injected, timeLimitMs, origin);
+      const started = this.startBackgroundScript(agentName, input.code, injected, timeLimitMs, origin, startTurn);
       if (capNote && started.success && started.data && typeof started.data === 'object') {
         (started.data as Record<string, unknown>).time_limit_note = capNote;
       }
@@ -19457,6 +19459,7 @@ export class AgentFramework {
       endTurn: false,
       turnId: call.callerTurnId,
       calls: this.scriptRounds.get(agentName)?.scripts.get(call.id) ?? [],
+      startTurn,
     };
     if (ownsRunner) this.scriptDeferredEndTurn.set(agentName, script);
     const ownsOrigin = origin !== undefined && ownsRunner;
@@ -19534,6 +19537,9 @@ export class AgentFramework {
     injected: import('./code-execution/py-runner.js').InjectedTool[],
     timeLimitMs?: number,
     origin?: ScriptCallOrigin,
+    /** The turn that started the script (scriptStartTurn), which judges its
+     *  calls' channel_publish for as long as it runs. */
+    startTurn: TurnRouting | null = null,
   ): ToolResult {
     // v1: primary-agent-only. A conversation fork's or ephemeral's daemon
     // would outlive its owner and its wake would land in the primary
@@ -19583,7 +19589,7 @@ export class AgentFramework {
       env: cfg?.env,
       inheritEnv: cfg?.inheritEnv,
       label: `${agentName}:${scriptId}`,
-      onToolCall: (toolName, args) => this.handleScriptToolCall(agentName, toolName, args, origin),
+      onToolCall: (toolName, args) => this.handleScriptToolCall(agentName, toolName, args, origin, undefined, startTurn),
     });
 
     const record: BackgroundScriptRecord = {
@@ -20088,7 +20094,10 @@ export class AgentFramework {
     args: Record<string, unknown>,
     origin?: ScriptCallOrigin,
     /** The foreground script that made the call; none for a background script. */
-    script?: { endTurn: boolean; turnId?: number; calls: RoundCall[] },
+    script?: { endTurn: boolean; turnId?: number; calls: RoundCall[]; startTurn: TurnRouting | null },
+    /** A background script's start turn (scriptStartTurn); a foreground
+     *  script's is on its record. */
+    backgroundStartTurn: TurnRouting | null = null,
   ): Promise<ScriptToolResult> {
     if (toolName === CODE_EXECUTION_TOOL_NAME) {
       return { text: 'Error: code_execution cannot be called from within a script', isError: true };
@@ -20100,7 +20109,9 @@ export class AgentFramework {
     // A foreground script's call was made in the turn of the code_execution
     // call whose script is running when it arrives. A background script runs
     // apart from any turn, so its calls carry none.
-    const result = await this.dispatchScriptToolCall(agentName, toolName, args, origin, script?.turnId);
+    const result = await this.dispatchScriptToolCall(
+      agentName, toolName, args, origin, script?.turnId, script ? script.startTurn : backgroundStartTurn,
+    );
     if (result.endTurn && script) {
       // Deferred: applied to the final code_execution result (see
       // scriptDeferredEndTurn) — ending the turn mid-script would cancel the
@@ -20227,6 +20238,8 @@ export class AgentFramework {
     args: Record<string, unknown>,
     origin?: ScriptCallOrigin,
     turnId?: number,
+    /** The turn that started the script (scriptStartTurn), null for none. */
+    startTurn: TurnRouting | null = null,
   ): Promise<ToolResult> {
     return new Promise<ToolResult>((resolve) => {
       const callId = `pytc-${randomUUID()}`;
@@ -20256,7 +20269,7 @@ export class AgentFramework {
       const call = { id: callId, name: toolName, input: args };
       if (origin) this.toolLifecycleEmitter?.registerScriptCall(agentName, origin, call);
       try {
-        this.dispatchToolCall(agentName, call, turnId);
+        this.dispatchToolCall(agentName, call, turnId, startTurn);
       } catch (error) {
         // Dispatch threw. Not a refusal (refusal sites call refuse() and
         // answer): the tool may have done work first (sleep sets the gate,
@@ -20714,9 +20727,11 @@ export class AgentFramework {
    * (TurnRouting.turnId), as its caller knows it: a model's call, the turn
    * whose stream made it; a foreground script's inner call, the turn of the
    * code_execution call whose script is running when the call arrives. A
-   * background script's call has none.
+   * background script's call has none. `startTurn`, for a script's call, is
+   * the turn that started the script (null for none), which judges its
+   * channel_publish; a model's call (undefined) is judged by its own turn.
    */
-  private dispatchToolCall(agentName: string, call: ToolCall, turnId?: number): void {
+  private dispatchToolCall(agentName: string, call: ToolCall, turnId?: number, startTurn?: TurnRouting | null): void {
     const refusal = this.agentToolPermissionFailure(agentName, call);
     if (refusal) {
       this.pushEvent({
@@ -20747,7 +20762,7 @@ export class AgentFramework {
 
     // Route synthesized channel tools
     if (enrichedCall.name.startsWith('channel_') && this.channelRegistry) {
-      this.dispatchChannelToolCall(agentName, enrichedCall);
+      this.dispatchChannelToolCall(agentName, enrichedCall, startTurn);
       return;
     }
 
@@ -20861,7 +20876,7 @@ export class AgentFramework {
           console.error(`[self-wake] agent=${agentName} armed in ${Math.round(inMs / 1000)}s (skip_reply)`);
         }
       }
-      this.dispatchChannelToolCall(agentName, enrichedCall);
+      this.dispatchChannelToolCall(agentName, enrichedCall, startTurn);
       return;
     }
 
@@ -26001,16 +26016,31 @@ export class AgentFramework {
   }
 
   /**
+   * The turn that starts a script, which judges its calls' channel_publish
+   * for as long as it runs (privatePublishRefusal): a model's code_execution
+   * call, the turn it was made in (callerTurnId), live while the call is
+   * dispatched; one made as the agent outside a stream, such as through
+   * executeToolCall, the agent's open turn then; null for none. The script
+   * carries out that turn's work, so a private turn's script publishes only
+   * where it names, after its turn ends too, and a later turn doesn't change
+   * how its calls are judged. Its wake_agent() wakes stay neutral.
+   */
+  private scriptStartTurn(agentName: string, call: ToolCall): TurnRouting | null {
+    return (call.callerTurnId !== undefined ? this.turnRouting?.get(agentName) : this.openLogical?.get(agentName)) ?? null;
+  }
+
+  /**
    * The refusal of a channel_publish that names no channel in a private
    * non-channel turn, or undefined. A turn from a private surface publishes
    * only where it names: an argument-less channel_publish infers no channel,
    * a fork's home included, since the turn was private wherever the agent
    * speaks. Judged on the call as it was made, and on the turn given: the
    * model's dispatch and its round's routing (roundCallOf) give the call's
-   * own turn, the agent's latest (turnRouting, read without making one),
-   * and a public call made as the agent (executeToolCall) gives the agent's
-   * open turn, so one made outside any turn isn't judged by a turn that has
-   * ended.
+   * own turn, the agent's live one (turnRouting, read without making one); a
+   * script's call gives the turn that started the script (scriptStartTurn),
+   * for as long as it runs; and a public call made as the agent
+   * (executeToolCall) gives the agent's open turn, so one made outside any
+   * turn isn't judged by a turn that has ended.
    */
   private privatePublishRefusal(
     agentName: string,
@@ -26030,11 +26060,13 @@ export class AgentFramework {
   /**
    * Dispatch a synthesized channel tool call.
    */
-  private dispatchChannelToolCall(agentName: string, call: ToolCall): void {
+  private dispatchChannelToolCall(agentName: string, call: ToolCall, startTurn?: TurnRouting | null): void {
     const home = this.conversationAgentHomes.get(agentName);
     // Judged on the call as the agent made it, before a fork's default below
-    // fills one in, and on the turn it was made in.
-    const error = this.privatePublishRefusal(agentName, call, this.turnRouting?.get(agentName));
+    // fills one in, and on its turn: a model's call, the turn it was made in;
+    // a script's, the turn that started the script.
+    const turn = startTurn !== undefined ? startTurn ?? undefined : this.turnRouting?.get(agentName);
+    const error = this.privatePublishRefusal(agentName, call, turn);
     if (error !== undefined) {
       this.toolLifecycleEmitter?.refuse(agentName, call.id);
       this.emitTrace({ type: 'tool:failed', module: 'channels', tool: call.name, callId: call.id, error });

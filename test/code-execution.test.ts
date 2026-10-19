@@ -1320,7 +1320,8 @@ describe("a round that runs code_execution is routed once its scripts return (re
   ];
 
   async function scriptRound(mode: 'locus' | 'hybrid' | 'explicit' | 'disabled', responses: ReturnType<typeof createMockResponse>[],
-    config: { sameRoundThinkTextPolicy?: 'private'; allowedTools?: string[] } = {}, options: { codeExecution?: boolean } = {}) {
+    config: { sameRoundThinkTextPolicy?: 'private'; allowedTools?: string[] } = {},
+    options: { codeExecution?: boolean; channelPublish?: boolean } = {}) {
     const { tempDir, storePath } = tempStorePath('pytc-round-');
     const membrane = new MockMembrane();
     for (const response of responses) membrane.pushResponse(response);
@@ -1365,7 +1366,9 @@ describe("a round that runs code_execution is routed once its scripts return (re
         if (name === 'channel_open') return { success: true, data: { channelId: input?.channelId } };
         return { success: true, data: {} };
       },
-      getChannelTools: () => CHANNEL_TOOLS,
+      getChannelTools: () => options.channelPublish
+        ? [...CHANNEL_TOOLS, { name: 'channel_publish', description: 'Publish.', inputSchema: { type: 'object' as const, properties: { channelId: { type: 'string' }, content: { type: 'string' } } } }]
+        : CHANNEL_TOOLS,
       getDefaultPublishChannel: () => null, isChannelOpen: () => true, getDescriptor: () => undefined,
     }, { get: (target, key: string) => (key in target ? (target as Record<string, unknown>)[key] : () => undefined) });
     const run = async () => {
@@ -1377,7 +1380,7 @@ describe("a round that runs code_execution is routed once its scripts return (re
       await framework.stop();
       rmSync(tempDir, { recursive: true, force: true });
     };
-    return { framework, module, log, run, done, directory };
+    return { framework, module, log, run, done, directory, membrane };
   }
 
   const scriptCall = (input: Record<string, unknown>, id = 'ce1') =>
@@ -2148,6 +2151,71 @@ describe("a round that runs code_execution is routed once its scripts return (re
     } finally {
       clearInterval(watch);
       clearTimeout(bound);
+      await h.done();
+    }
+  });
+
+  for (const startedPrivate of [true, false]) {
+    it(`a background script's channel_publish is judged by the turn that started it, not by a later ${startedPrivate ? 'channel' : 'private'} turn`, async () => {
+      // The watcher waits on the slow tool, which the test releases once the
+      // later turn has run, and then publishes naming no channel.
+      const watcher = 'await test__slow({})\nawait channel_publish({"content": "from the watcher"})';
+      const h = await scriptRound('locus', [
+        createMockResponse([scriptCall({ code: watcher, background: true }, 'bg')] as ContentBlock[], 'tool_use'),
+        createMockResponse([{ type: 'text', text: 'watching' }] as ContentBlock[]),
+      ], {}, { channelPublish: true });
+      const scripts = (h.framework as unknown as { backgroundScripts: Map<string, { status: string }> }).backgroundScripts;
+      // A surface message names a channel, or names none and opens a private turn.
+      const surface = (channelId?: string) => ({
+        type: 'external-message', source: channelId ? 'bridge' : 'tui', content: 'go', metadata: channelId ? { channelId } : {},
+      }) as unknown as ProcessEvent;
+      try {
+        h.framework.pushEvent(surface(startedPrivate ? undefined : 'world:test'));
+        await h.framework.runUntilIdle();
+        assert.equal(scripts.size, 1, 'control: the watcher started');
+        // Queued only now: a mock stream takes every response queued when it starts.
+        h.membrane.pushResponse(createMockResponse([{ type: 'text', text: 'the later turn' }] as ContentBlock[]));
+        h.framework.pushEvent(surface(startedPrivate ? 'world:test' : undefined));
+        await h.framework.runUntilIdle();
+        assert.ok(h.log.includes('publish:the later turn@world:test') === startedPrivate, `control: the later turn ran: ${JSON.stringify(h.log)}`);
+        h.module.releaseSlow();
+        // The script's calls come back as events, which the test's own runs
+        // of the framework process.
+        for (const deadline = Date.now() + 15_000; [...scripts.values()].some((s) => s.status === 'running');) {
+          if (Date.now() > deadline) throw new Error(`the watcher never settled: ${JSON.stringify(h.log)}`);
+          await new Promise((r) => setTimeout(r, 25));
+          await h.framework.runUntilIdle();
+        }
+        assert.ok(h.log.includes('slow:returned'), 'control: the watcher was released');
+        assert.equal(h.log.includes('tool:channel_publish'), !startedPrivate, JSON.stringify(h.log));
+      } finally {
+        await h.done();
+      }
+    });
+  }
+
+  it("a script that a call made as the agent starts outside any turn is judged by no turn, not by the private turn that ended", async () => {
+    const watcher = 'await test__slow({})\nawait channel_publish({"content": "from the watcher"})';
+    const h = await scriptRound('locus', [createMockResponse([{ type: 'text', text: 'private words' }] as ContentBlock[])], {}, { channelPublish: true });
+    const scripts = (h.framework as unknown as { backgroundScripts: Map<string, { status: string }> }).backgroundScripts;
+    const internals = h.framework as unknown as { turnRouting: Map<string, { nonChannelOrigin?: boolean }>; openLogical: Map<string, unknown> };
+    try {
+      h.framework.pushEvent({ type: 'external-message', source: 'tui', content: 'go', metadata: {} } as unknown as ProcessEvent);
+      await h.framework.runUntilIdle();
+      assert.equal(internals.turnRouting.get('assistant')?.nonChannelOrigin, true, "control: the agent's latest turn was private");
+      assert.equal(internals.openLogical.has('assistant'), false, 'control: and it has ended');
+      const started = await h.framework.executeToolCall({
+        id: 'host-bg', name: 'code_execution', input: { code: watcher, background: true }, callerAgentName: 'assistant',
+      } as never);
+      assert.equal(started.success, true, JSON.stringify(started));
+      h.module.releaseSlow();
+      for (const deadline = Date.now() + 15_000; [...scripts.values()].some((s) => s.status === 'running');) {
+        if (Date.now() > deadline) throw new Error(`the watcher never settled: ${JSON.stringify(h.log)}`);
+        await new Promise((r) => setTimeout(r, 25));
+        await h.framework.runUntilIdle();
+      }
+      assert.ok(h.log.includes('tool:channel_publish'), JSON.stringify(h.log));
+    } finally {
       await h.done();
     }
   });
