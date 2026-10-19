@@ -1214,8 +1214,12 @@ describe("a window's parts, in the order they arrived", () => {
       eventType: 'external-message', timestamp, inContext: false, channelId: channel, serverId: 'bridge', authorId: author,
       routingClass: 'channel', addressed: false });
     const ambient: Pending = { ...room(40), channelId: 'discord:g:d', authorId: 'u4', addressed: false };
-    const picked = wakeProvenance([bound(10, 'bridge:g:a', 'u1'), bound(30, 'bridge:g:c', 'u3'), ambient] as never);
-    assert.deepStrictEqual(picked, { channelId: 'bridge:g:c', counterparty: 'bridge:user:u3', routingClass: 'channel', at: 30 });
+    // Either one first: a part holds its events as their debounces fired.
+    for (const order of [[10, 30], [30, 10]]) {
+      const bounds = order.map((t) => t === 30 ? bound(30, 'bridge:g:c', 'u3') : bound(10, 'bridge:g:a', 'u1'));
+      const picked = wakeProvenance([...bounds, ambient] as never);
+      assert.deepStrictEqual(picked, { channelId: 'bridge:g:c', counterparty: 'bridge:user:u3', routingClass: 'channel', at: 30 }, `order ${order}`);
+    }
   });
 
   it('parts that arrived in the same millisecond go in the window\'s order', async () => {

@@ -2248,11 +2248,65 @@ describe("a round that runs code_execution is routed once its scripts return (re
         assert.equal(later.triggerChannel, laterTrigger, "the later turn's trigger channel stays as it was");
         assert.equal(startRouting.triggerChannel === 'world:other', !startedPrivate,
           `the turn that started the script records it, unless that turn is private: ${startRouting.triggerChannel}`);
+        assert.notEqual((startRouting as { locus?: string }).locus, 'world:other', "the ended turn's locus stays as it was");
       } finally {
         await h.done();
       }
     });
   }
+
+  it("a background script's channel_open moves the locus of the turn that started it while that turn is open", async () => {
+    const watcher = 'await test__slow({})\nawait channel_open({"channelId": "world:other"})';
+    const h = await scriptRound('locus', [
+      createMockResponse([scriptCall({ code: watcher, background: true }, 'bg')] as ContentBlock[], 'tool_use'),
+      createMockResponse([{ type: 'text', text: 'watching' }] as ContentBlock[]),
+    ]);
+    const internals = h.framework as unknown as {
+      turnRouting: Map<string, Routing & { locus?: string }>; openLogical: Map<string, unknown>; lastAnnouncedLocus: Map<string, string | null>;
+    };
+    try {
+      h.framework.pushEvent(surface('world:test'));
+      await h.framework.runUntilIdle();
+      const startRouting = internals.turnRouting.get('assistant')!;
+      assert.equal(startRouting.locus, 'world:test', "control: the turn's locus is its room");
+      // The turn is still open, between its streams, when the open lands.
+      internals.openLogical.set('assistant', startRouting);
+      await settleWatchers(h);
+      assert.equal(startRouting.locus, 'world:other', "the open moves the open turn's locus");
+      assert.equal(internals.lastAnnouncedLocus.get('assistant'), 'world:other', 'and announces it');
+    } finally {
+      internals.openLogical.delete('assistant');
+      await h.done();
+    }
+  });
+
+  it("a model's script started in a silent tick's stream is judged by the tick's own turn, not by a private turn held open beside it", async () => {
+    const code = 'r = await channel_publish({"content": "from the tick"})\nawait test__echo({"note": str(r)})';
+    const h = await scriptRound('locus', [createMockResponse([{ type: 'text', text: 'private words' }] as ContentBlock[])], {}, { channelPublish: true });
+    const internals = routingInternals(h);
+    try {
+      h.framework.pushEvent(surface());
+      await h.framework.runUntilIdle();
+      const privateRouting = internals.turnRouting.get('assistant')!;
+      assert.equal(privateRouting.nonChannelOrigin, true, 'control: a private turn ran');
+      // The private turn is held open, between its streams, and a silent
+      // heartbeat tick starts beside it.
+      internals.openLogical.set('assistant', privateRouting);
+      h.membrane.pushResponse(createMockResponse([scriptCall({ code }, 'tick-ce')] as ContentBlock[], 'tool_use'));
+      h.membrane.pushResponse(createMockResponse([{ type: 'text', text: 'silent words' }] as ContentBlock[]));
+      (h.framework as unknown as { pendingRequests: unknown[] }).pendingRequests.push({
+        agentName: 'assistant', reason: 'mcpl:push-event', source: 'heartbeat', timestamp: Date.now(), suppressProse: true,
+      });
+      await h.framework.runUntilIdle();
+      const tick = internals.turnRouting.get('assistant')!;
+      assert.ok(tick !== privateRouting && tick.nonChannelOrigin !== true, 'control: the tick ran with its own routing');
+      assert.ok(!watcherNote(h).includes(REFUSED), watcherNote(h));
+      assert.ok(h.log.includes('tool:channel_publish'), JSON.stringify(h.log));
+    } finally {
+      internals.openLogical.delete('assistant');
+      await h.done();
+    }
+  });
 
   for (const privateTurn of [true, false]) {
     it(`a foreground script's channel_publish naming no channel is judged by its own ${privateTurn ? 'private' : 'channel'} turn`, async () => {
@@ -2294,7 +2348,11 @@ describe("a round that runs code_execution is routed once its scripts return (re
   });
 
   it("a script that a call made as the agent starts outside any turn records its channel_open on no turn", async () => {
-    const watcher = 'await test__slow({})\nawait channel_open({"channelId": "world:other"})';
+    const watcher = [
+      'await test__slow({})',
+      'r = await channel_open({"channelId": "world:other"})',
+      'await test__echo({"note": ("error: " if r.is_error else "ok: ") + str(r)})',
+    ].join('\n');
     const h = await scriptRound('locus', [createMockResponse([{ type: 'text', text: 'room words' }] as ContentBlock[])]);
     const internals = routingInternals(h);
     try {
@@ -2309,6 +2367,7 @@ describe("a round that runs code_execution is routed once its scripts return (re
       assert.equal(started.success, true, JSON.stringify(started));
       await settleWatchers(h);
       assert.ok(h.log.includes('tool:channel_open'), `control: the watcher opened the channel: ${JSON.stringify(h.log)}`);
+      assert.ok(watcherNote(h).startsWith('note:ok: ') && watcherNote(h).includes('world:other'), `the script's open succeeded: ${watcherNote(h)}`);
       assert.equal(latest.triggerChannel, 'world:test', "the latest turn's trigger channel stays its own");
     } finally {
       await h.done();
