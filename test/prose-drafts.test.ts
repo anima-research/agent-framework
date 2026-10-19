@@ -2231,6 +2231,24 @@ describe('held drafts: exact runs, hybrid envelopes beside a send, and turn-end 
     }
   });
 
+  it("XML tool mode: a private turn's refused channel_publish silences nothing, so its round's envelope is delivered", async () => {
+    const h = await harness({ xml: true, agents: [{ name: 'scout', proseRouting: 'hybrid' }] });
+    try {
+      // The publish names no channel, which a private turn refuses
+      // (privatePublishRefusal): it posted nothing, so it's no send.
+      const round = [text(`>>>${GENERAL} the envelope's words`), call('p1', 'channel_publish', { content: 'no channel named' })];
+      await h.turn([
+        createMockResponse(round, 'tool_use'),
+        { ...createMockResponse(round), toolCalls: [] },
+      ], 'scout', 'private');
+      assert.ok(h.toolResults().some((r) => r.includes('channel_publish requires an explicit channelId')), `control: the publish was refused: ${JSON.stringify(h.toolResults())}`);
+      assert.deepEqual(h.drafts().map((d) => d.text), [], 'nothing is held');
+      assert.deepEqual(h.publishes().map((p) => p.text), ["the envelope's words"]);
+    } finally {
+      await h.close();
+    }
+  });
+
   it('XML tool mode: the same-round think policy is native-only, so prose beside think and a send is held like any other', async () => {
     const h = await harness({ xml: true, agents: [{ name: 'scout', sameRoundThinkTextPolicy: 'private' }] });
     try {

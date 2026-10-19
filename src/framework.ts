@@ -18134,11 +18134,16 @@ export class AgentFramework {
               // injected message can reset. The legacy/fallback path has no
               // reliable round boundaries, so retain its historical turn-wide
               // scan to avoid double-posting.
+              // A call the agent's list refuses posted nothing, and nor did a
+              // private turn's channel_publish that names no channel
+              // (privatePublishRefusal), as a live round counts them
+              // (roundCallOf).
               const toolCalls = response.content
                 .filter((b) => b.type === 'tool_use')
                 .map((b) => b as unknown as { name?: unknown; input?: unknown })
                 .filter((c): c is { name: string; input?: unknown } =>
-                  typeof c.name === 'string' && this.canAgentUseTool(agent.name, c.name));
+                  typeof c.name === 'string' && this.canAgentUseTool(agent.name, c.name)
+                  && this.privatePublishRefusal(agent.name, c as { name: string; input?: unknown }, streamRouting) === undefined);
               const toolNames = toolCalls.map((c) => c.name);
               // A refused skip_reply isn't a silencing call; a plain one is.
               const fallbackCause = liveProseRouting
