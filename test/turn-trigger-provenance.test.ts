@@ -316,3 +316,104 @@ describe('private non-channel trigger batching', () => {
   });
 
 });
+
+// ---------------------------------------------------------------------------
+// The batch rules at their edges: a gate window, a quiesce
+// and a continuation each keep a private surface's wake and a channel's
+// apart, a channel-bound surface message keeps its addressing, and a private
+// turn's sends name where they go.
+// ---------------------------------------------------------------------------
+
+const ROOM = 'discord:g:room';
+const tuiMessage = (content = 'private question') =>
+  ({ type: 'external-message', source: 'tui', content, metadata: {}, triggerInference: true }) as never;
+const roomMessage = (addressed: boolean, content = 'room message') => ({
+  type: 'external-message', source: 'bridge', content, triggerInference: true,
+  metadata: { channelId: ROOM, ...(addressed ? { tags: ['chat:addressed'] } : {}) },
+}) as never;
+
+/** A framework whose turns are recorded as they start, with a registry that
+ *  records routed speech and resolves a turn's locus to its trigger channel,
+ *  as the real registry's active-channel resolution does. */
+async function surfaceRig(opts: {
+  gate?: unknown;
+} = {}) {
+  const tempDir = mkdtempSync(join(tmpdir(), 'surface-edges-test-'));
+  const membrane = new MockMembrane();
+  // A mock stream takes every response queued when it starts, so each stream
+  // gets a reply of its own as it starts, unless the test queued one.
+  const streamYielding = membrane.streamYielding.bind(membrane);
+  let replies = 0;
+  membrane.streamYielding = (request, options) => {
+    const queue = membrane as unknown as { responses: unknown[]; responseIndex: number };
+    if (queue.responseIndex >= queue.responses.length) membrane.pushResponse(createMockResponse([{ type: 'text', text: `reply ${++replies}` }]));
+    return streamYielding(request, options);
+  };
+  const framework = await AgentFramework.create({
+    storePath: join(tempDir, 'store'), membrane: membrane.asMembrane(),
+    agents: [{
+      name: 'scout', model: 'test-model', systemPrompt: 'scout',
+    }],
+    modules: [new SurfaceModule()],
+    ...(opts.gate ? { gate: opts.gate } : {}),
+  } as never);
+  const routed: Array<{ text: string; locus: string | null }> = [];
+  const state = framework as unknown as {
+    turnRouting: Map<string, { nonChannelOrigin?: boolean; triggerChannel?: string; locus?: string }>;
+    openLogical: Map<string, unknown>;
+    channelRegistry: unknown;
+  };
+  state.channelRegistry = new Proxy({
+    getChannelTools: () => [],
+    resolveLocus: (agentName: string) => state.turnRouting.get(agentName)?.triggerChannel ?? 'discord:g:lounge',
+    routeSpeech: async (_agent: string, text: string, locus: string | null) => {
+      routed.push({ text, locus }); return { delivered: true, channelId: locus };
+    },
+    getDescriptor: () => undefined, getDefaultPublishChannel: () => 'discord:g:lounge',
+  }, { get: (target, prop: string) => prop in target ? target[prop as keyof typeof target] : () => undefined });
+  const i = internals(framework);
+  const starts: InferenceRequest[] = [];
+  const start = i.startAgentStream.bind(framework);
+  i.startAgentStream = async (agent, trigger) => { if (trigger) starts.push(trigger); return start(agent, trigger); };
+  // Polls, letting the scheduler run between looks: a debounce's wake is
+  // queued by its timer, after the test has pushed its events.
+  const until = async (cond: () => boolean, what: string) => {
+    const deadline = Date.now() + 10_000;
+    while (!cond()) {
+      if (Date.now() > deadline) throw new Error(`timed out: ${what} (starts: ${JSON.stringify(starts)})`);
+      await new Promise((r) => setTimeout(r, 10));
+      await framework.runUntilIdle();
+    }
+  };
+  return {
+    framework, membrane, routed, starts, state, i, until,
+    close: async () => { await framework.stop(); rmSync(tempDir, { recursive: true, force: true }); },
+  };
+}
+
+const privateStart = (r: InferenceRequest) => r.nonChannelOrigin === true && !r.channelId;
+const roomStart = (r: InferenceRequest) => r.channelId === ROOM && r.nonChannelOrigin !== true;
+
+describe('surface batches at their edges, through the real scheduler', () => {
+  it('a channel-bound surface message that addressed the agent says so, directly and through the gate', async () => {
+    const direct = await surfaceRig();
+    try {
+      direct.framework.pushEvent(roomMessage(true));
+      await direct.until(() => direct.starts.length >= 1, 'the turn');
+      assert.equal(direct.starts[0]!.channelId, ROOM);
+      assert.equal(direct.starts[0]!.addressed, true);
+    } finally {
+      await direct.close();
+    }
+    const gate = { config: { policies: [{ name: 'surface', match: { scope: ['external-message'] }, behavior: { debounce: 50 } }], default: 'skip' } };
+    const gated = await surfaceRig({ gate });
+    try {
+      gated.framework.pushEvent(roomMessage(true));
+      await gated.until(() => gated.starts.length >= 1, 'the debounced turn');
+      assert.equal(gated.starts[0]!.channelId, ROOM);
+      assert.equal(gated.starts[0]!.addressed, true);
+    } finally {
+      await gated.close();
+    }
+  });
+});

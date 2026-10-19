@@ -1079,6 +1079,14 @@ function surfaceChannelId(event: ProcessEvent): string | undefined {
   return typeof value === 'string' && value.trim().length > 0 ? value.trim() : undefined;
 }
 
+/** A surface event's MCPL tags (`metadata.tags`), as a channel-incoming
+ *  message carries them: `chat:addressed` marks a mention, reply or DM. */
+function surfaceTags(event: ProcessEvent): string[] | undefined {
+  if (event.type !== 'external-message' && event.type !== 'api:message') return undefined;
+  const value = (event.metadata as Record<string, unknown> | undefined)?.tags;
+  return Array.isArray(value) ? value.filter((tag): tag is string => typeof tag === 'string') : undefined;
+}
+
 export function isNonChannelSurfaceEvent(event: ProcessEvent): boolean {
   return (event.type === 'external-message' || event.type === 'api:message')
     && surfaceChannelId(event) === undefined;
@@ -3149,6 +3157,10 @@ export class AgentFramework {
         // debounce can fire).
         resolveRouteChannel: (info) => {
           if (info.eventType === 'mcpl:channel-incoming') return info.channelId || undefined;
+          // A channel-bound surface message names its channel's composite id
+          // itself (metadata.channelId), so an addressed one routes the reply
+          // there, fork rule included, as an addressed channel message does.
+          if (info.eventType === 'external-message' || info.eventType === 'api:message') return info.channelId || undefined;
           if (info.eventType === 'mcpl:push-event') {
             return framework.derivePushEventChannel(info.metadata)?.channelId;
           }
@@ -11773,7 +11785,7 @@ export class AgentFramework {
           serverId: source,
           channelId: surfaceChannel ?? '',
           ...((event.type === 'external-message' || event.type === 'api:message')
-            ? { routingClass: surfaceChannel ? 'channel' as const : 'private' as const }
+            ? { routingClass: surfaceChannel ? 'channel' as const : 'private' as const, tags: surfaceTags(event) }
             : {}),
         });
         if (!decision.trigger) return;
@@ -11796,6 +11808,9 @@ export class AgentFramework {
             source,
             timestamp: Date.now(),
             ...(surfaceChannelId(event) ? { channelId: surfaceChannelId(event) } : {}),
+            // A channel-bound surface message that addressed the agent outranks
+            // ambient ones for the turn's channel, as a channel-incoming one does.
+            ...(surfaceChannelId(event) && isAddressedMessage(surfaceTags(event)) ? { addressed: true } : {}),
             nonChannelOrigin: isNonChannelSurfaceEvent(event),
           });
         }
