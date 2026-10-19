@@ -2145,38 +2145,38 @@ describe('present while acting', () => {
   });
 
   for (const mode of ['locus', 'hybrid'] as const) {
-  it(`${mode}: channel_open keeps a private turn private and leaves its frozen pin unchanged`, async () => {
-    membrane.pushResponse(createMockResponse([
-      { type: 'tool_use', id: 'c-private', name: 'channel_open', input: { channelId: 'discord:guild:observatory' } },
-    ] as ContentBlock[], 'tool_use'));
-    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Still private after open.' }] as ContentBlock[]));
-    const framework = await createFramework({ proseRouting: mode });
-    const routed = stubChannelRegistry(framework);
-    const registry = (framework as unknown as { channelRegistry: Record<string, unknown> }).channelRegistry;
-    (registry as { handleChannelToolCall?: unknown }).handleChannelToolCall = async () =>
-      ({ success: true, data: { channelId: 'discord:guild:observatory', opened: true } });
-    const agent = framework.getAgent('assistant')!;
-    const internals = framework as unknown as {
-      turnRouting: Map<string, { locus?: string; triggerChannel?: string; nonChannelOrigin: boolean }>;
-      pushEvent(event: unknown): void;
-    };
-    const pushed: unknown[] = [];
-    const push = internals.pushEvent.bind(framework);
-    internals.pushEvent = (event: unknown) => { pushed.push(event); push(event); };
-    await (framework as unknown as { startAgentStream(agent: unknown, trigger: unknown): Promise<void> })
-      .startAgentStream(agent, {
-        agentName: 'assistant', reason: 'external-message', source: 'tui', timestamp: Date.now(), nonChannelOrigin: true,
-      });
-    await framework.runUntilIdle();
-    assert.deepEqual(routed, []);
-    assert.equal(internals.turnRouting.get('assistant')?.locus, undefined);
-    assert.equal(internals.turnRouting.get('assistant')?.triggerChannel, undefined, "the opened channel isn't the private turn's trigger channel");
-    assert.equal(internals.turnRouting.get('assistant')?.nonChannelOrigin, true);
-    const said = JSON.stringify(pushed);
-    assert.ok(said.includes('plain speech stays private'), said);
-    assert.equal(said.includes('or a >>> envelope'), mode === 'hybrid', `hybrid names its envelopes, locus doesn't: ${said}`);
-    await framework.stop();
-  });
+    it(`${mode}: channel_open keeps a private turn private and leaves its frozen pin unchanged`, async () => {
+      membrane.pushResponse(createMockResponse([
+        { type: 'tool_use', id: 'c-private', name: 'channel_open', input: { channelId: 'discord:guild:observatory' } },
+      ] as ContentBlock[], 'tool_use'));
+      membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Still private after open.' }] as ContentBlock[]));
+      const framework = await createFramework({ proseRouting: mode });
+      const routed = stubChannelRegistry(framework);
+      const registry = (framework as unknown as { channelRegistry: Record<string, unknown> }).channelRegistry;
+      (registry as { handleChannelToolCall?: unknown }).handleChannelToolCall = async () =>
+        ({ success: true, data: { channelId: 'discord:guild:observatory', opened: true } });
+      const agent = framework.getAgent('assistant')!;
+      const internals = framework as unknown as {
+        turnRouting: Map<string, { locus?: string; triggerChannel?: string; nonChannelOrigin: boolean }>;
+        pushEvent(event: unknown): void;
+      };
+      const pushed: unknown[] = [];
+      const push = internals.pushEvent.bind(framework);
+      internals.pushEvent = (event: unknown) => { pushed.push(event); push(event); };
+      await (framework as unknown as { startAgentStream(agent: unknown, trigger: unknown): Promise<void> })
+        .startAgentStream(agent, {
+          agentName: 'assistant', reason: 'external-message', source: 'tui', timestamp: Date.now(), nonChannelOrigin: true,
+        });
+      await framework.runUntilIdle();
+      assert.deepEqual(routed, []);
+      assert.equal(internals.turnRouting.get('assistant')?.locus, undefined);
+      assert.equal(internals.turnRouting.get('assistant')?.triggerChannel, undefined, "the opened channel isn't the private turn's trigger channel");
+      assert.equal(internals.turnRouting.get('assistant')?.nonChannelOrigin, true);
+      const said = JSON.stringify(pushed);
+      assert.ok(said.includes('plain speech stays private'), said);
+      assert.equal(said.includes('or a >>> envelope'), mode === 'hybrid', `hybrid names its envelopes, locus doesn't: ${said}`);
+      await framework.stop();
+    });
   }
 
   it("channel_open of an inbound-only channel in a private turn says plain speech there is refused, and offers no way to publish there", async () => {

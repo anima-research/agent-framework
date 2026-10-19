@@ -456,7 +456,9 @@ describe('surface batches at their edges, through the real scheduler', () => {
         metadata: { author: { id: 'u1' } }, tags: [],
       });
       await rig.until(() => rig.starts.length >= 1, 'the turn');
-      await new Promise((r) => setTimeout(r, 300));
+      // The gate's flush requests every part's wake at once, so once the
+      // first turn starts, a second part's wake is already queued, and
+      // running to idle would start its turn.
       await rig.framework.runUntilIdle();
       assert.equal(rig.starts.length, 1, JSON.stringify(rig.starts));
       assert.ok(privateStart(rig.starts[0]!), JSON.stringify(rig.starts[0]));
@@ -848,12 +850,12 @@ describe("the scheduler's split, and a private turn's other paths", () => {
       await second.i.processInferenceRequests();
       const since = holdsOf(second).get('scout')!.since;
       // A pass under the bound keeps the turn open, and its clock.
-      holdsOf(second).get('scout')!.since -= 29_000;
+      holdsOf(second).get('scout')!.since -= 20_000;
       await second.i.processInferenceRequests();
       assert.equal(second.state.openLogical.get('scout'), routing, 'under the bound, the turn stays open');
-      assert.equal(holdsOf(second).get('scout')?.since, since - 29_000, 'and its clock runs on');
+      assert.equal(holdsOf(second).get('scout')?.since, since - 20_000, 'and its clock runs on');
       assert.equal(second.starts.length, 0);
-      holdsOf(second).get('scout')!.since -= 2_000;
+      holdsOf(second).get('scout')!.since -= 11_000;
       const lines: string[] = [];
       const error = console.error;
       console.error = (...args: unknown[]) => { lines.push(args.join(' ')); };
@@ -899,8 +901,59 @@ describe("the scheduler's split, and a private turn's other paths", () => {
     }
   });
 
+  it("a budget restart batched with a wake of the held turn's kind leaves its clock, since the restart takes that wake into the tick's turn", async () => {
+    const rig = await surfaceRig();
+    try {
+      const holds = (rig.framework as unknown as { openTurnHolds: Map<string, { turn: unknown; since: number }> }).openTurnHolds;
+      const routing = routingOf(rig.framework);
+      routing.triggerChannel = ROOM;
+      rig.state.openLogical.set('scout', routing);
+      rig.i.pendingRequests.push(tuiWake());
+      await rig.i.processInferenceRequests();
+      const since = holds.get('scout')!.since;
+      // A silent tick ran beside the held turn and left a budget restart; a
+      // room's wake is batched with it.
+      const tick = { ...(routing as object), nonChannelOrigin: false, triggerChannel: undefined } as Record<string, unknown>;
+      rig.state.turnRouting.set('scout', tick);
+      rig.i.pendingRequests.push(
+        { agentName: 'scout', reason: 'context_budget_restart', source: 'framework', timestamp: Date.now(), suppressProse: true },
+        roomWake(),
+      );
+      await rig.i.processInferenceRequests();
+      const restart = rig.starts.find((s) => s.reason === 'context_budget_restart');
+      assert.ok(restart, `control: the restart ran: ${JSON.stringify(rig.starts)}`);
+      assert.equal(rig.state.openLogical.get('scout'), routing, 'the held turn is still open');
+      assert.equal(holds.get('scout')?.turn, routing, "the held turn's clock is still there");
+      assert.equal(holds.get('scout')?.since, since, 'and unchanged');
+    } finally {
+      await rig.close();
+    }
+  });
+
+  it("a pass after the held turn has ended drops its clock", async () => {
+    const rig = await surfaceRig();
+    try {
+      const holds = (rig.framework as unknown as { openTurnHolds: Map<string, { turn: unknown; since: number }> }).openTurnHolds;
+      const routing = routingOf(rig.framework);
+      routing.triggerChannel = ROOM;
+      rig.state.openLogical.set('scout', routing);
+      rig.i.pendingRequests.push(tuiWake());
+      await rig.i.processInferenceRequests();
+      assert.equal(holds.get('scout')?.turn, routing, 'control: the clock started');
+      // The turn ends, and the held private wake starts a fresh turn.
+      rig.state.openLogical.delete('scout');
+      await rig.i.processInferenceRequests();
+      assert.ok(rig.starts.some(privateStart), `control: the held wake started: ${JSON.stringify(rig.starts)}`);
+      assert.equal(holds.has('scout'), false, "the ended turn's clock is gone");
+    } finally {
+      await rig.close();
+    }
+  });
+
   it("a gate window's channel-bound surface message keeps its own turn beside a private message, though newer ambient chatter shares its part", async () => {
-    const gate = { config: { policies: [{ name: 'both', match: { scope: ['external-message', 'mcpl:channel-incoming'] }, behavior: { debounce: 100 } }], default: 'skip' } };
+    // A debounce long enough that the chatter joins the window the two
+    // pushed events opened, which the window's message then shows.
+    const gate = { config: { policies: [{ name: 'both', match: { scope: ['external-message', 'mcpl:channel-incoming'] }, behavior: { debounce: 1000 } }], default: 'skip' } };
     const rig = await surfaceRig({ gate });
     try {
       const eventGate = (rig.framework as unknown as { eventGate: { evaluate(info: Record<string, unknown>): unknown } }).eventGate;
@@ -913,6 +966,10 @@ describe("the scheduler's split, and a private turn's other paths", () => {
       });
       await rig.until(() => rig.starts.length >= 2, 'a turn for each part');
       await rig.framework.runUntilIdle();
+      const windows = (rig.framework.getAgent('scout')!.getContextManager().getAllMessages() as Array<{ content: Array<{ type: string; text?: string }> }>)
+        .flatMap((m) => m.content).map((b) => b.text ?? '').filter((t) => t.startsWith('[Gate: '));
+      assert.ok(windows.some((t) => t.startsWith('[Gate: 3 events matched]')),
+        `control: the three events shared one window: ${JSON.stringify(windows.map((t) => t.slice(0, 30)))}`);
       assert.ok(rig.starts.some(privateStart), JSON.stringify(rig.starts));
       assert.ok(rig.starts.some(roomStart), `the channel-bound message's part keeps its channel: ${JSON.stringify(rig.starts)}`);
     } finally {

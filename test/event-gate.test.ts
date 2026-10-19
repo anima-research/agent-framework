@@ -2,7 +2,7 @@ import { describe, it, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert';
 import { existsSync, mkdirSync, writeFileSync, rmSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { EventGate } from '../src/gate/event-gate.js';
+import { EventGate, wakeProvenance } from '../src/gate/event-gate.js';
 import type { GateConfig, GateEventInfo } from '../src/gate/types.js';
 
 // ---------------------------------------------------------------------------
@@ -1199,6 +1199,23 @@ describe("a window's parts, in the order they arrived", () => {
   it("a part's arrival is its earliest event's, wherever that event sits in the part", async () => {
     // The room's part holds a later event first and its earliest last.
     assert.deepStrictEqual(await flush([room(30), tui(10), room(5)]), ['room', 'private']);
+  });
+
+  it("a part's provenance takes an addressed event over a newer channel-bound surface message", () => {
+    const bound: Pending = { policyName: 'p', content: 'bound', eventType: 'external-message', timestamp: 20, inContext: false,
+      channelId: 'bridge:g:a', serverId: 'bridge', authorId: 'u1', routingClass: 'channel', addressed: false };
+    const addressed: Pending = { ...room(10), channelId: 'discord:g:b', authorId: 'u2' };
+    const picked = wakeProvenance([addressed, bound] as never);
+    assert.deepStrictEqual(picked, { channelId: 'discord:g:b', counterparty: 'discord:user:u2', addressed: true, at: 10 });
+  });
+
+  it("a part's provenance takes its newest channel-bound surface message, whose channel, author and time it reports, over newer ambient chatter", () => {
+    const bound = (timestamp: number, channel: string, author: string): Pending => ({ policyName: 'p', content: 'bound',
+      eventType: 'external-message', timestamp, inContext: false, channelId: channel, serverId: 'bridge', authorId: author,
+      routingClass: 'channel', addressed: false });
+    const ambient: Pending = { ...room(40), channelId: 'discord:g:d', authorId: 'u4', addressed: false };
+    const picked = wakeProvenance([bound(10, 'bridge:g:a', 'u1'), bound(30, 'bridge:g:c', 'u3'), ambient] as never);
+    assert.deepStrictEqual(picked, { channelId: 'bridge:g:c', counterparty: 'bridge:user:u3', routingClass: 'channel', at: 30 });
   });
 
   it('parts that arrived in the same millisecond go in the window\'s order', async () => {
