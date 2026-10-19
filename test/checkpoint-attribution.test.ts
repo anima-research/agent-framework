@@ -44,6 +44,7 @@ function makeFrameworkHarness(
   }> = [];
   const server = {
     id: 'srv',
+    isConnected: true,
     async sendToolsList() { return { tools }; },
     async sendToolsCall(
       name: string,

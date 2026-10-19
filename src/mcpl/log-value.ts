@@ -46,6 +46,16 @@ export function logValue(value: unknown): string {
 }
 
 /**
+ * `logValue` of a value a server chose whose text may hold a credential:
+ * its text, as logValue reads it (a JSON value as its JSON text), with
+ * `redact` applied, then printed as logValue prints a field. A value whose
+ * text holds nothing `redact` replaces prints exactly as logValue prints it.
+ */
+export function logValueRedacted(value: unknown, redact: (text: string) => string): string {
+  return printed(redact(textOf(value)), FIELD);
+}
+
+/**
  * The host's own message, as the free text that ends a log line after its
  * fields: `reason=coalesce-invalid field=payload.content: "content must be an
  * array"`. It prints as `logValue` prints a field, cut the same way, except

@@ -14,6 +14,7 @@ export type {
   ExecResult,
   PyRunnerOptions,
   ScriptToolCallHandler,
+  ScriptToolResult,
   BackgroundExecOptions,
 } from './py-runner.js';
 export { PYTHON_RUNTIME_SOURCE } from './runtime-py.js';

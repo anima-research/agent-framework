@@ -666,7 +666,7 @@ describe('live operator surgery', () => {
   it('a rewind whose newest message is the last shard of a body takes the whole body', async () => {
     const [s0, s1, s2] = appendShards('g-doc', ['d0', 'd1', 'd2']);
     const internals = framework as unknown as {
-      shedNewestTurn(agent: unknown): { kind: string; removedIds: string[] } | null;
+      shedNewestTurn(agent: unknown): { descriptor: string; removedIds: string[] } | null;
     };
     const record = internals.shedNewestTurn(framework.getAgent('scout'));
     assert.ok(record);
@@ -692,11 +692,11 @@ describe('live operator surgery', () => {
     c.removeMessages = (a: string, b: string) => { ranges.push([a, b]); original(a, b); };
     try {
       const internals = framework as unknown as {
-        shedNewestTurn(agent: unknown): { kind: string; removedIds: string[] } | null;
+        shedNewestTurn(agent: unknown): { descriptor: string; removedIds: string[] } | null;
       };
       const record = internals.shedNewestTurn(framework.getAgent('scout'));
       assert.ok(record);
-      assert.equal(record.kind, 'tool');
+      assert.equal(record.descriptor, 'a tool exchange (~1KB)');
       assert.deepEqual(record.removedIds, [result[1], result[0], turn[1], turn[0]]);
       assert.deepEqual(ranges, [[turn[0], result[1]]], "one removal, from the turn's first shard to the result's last");
     } finally {

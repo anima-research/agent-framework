@@ -109,7 +109,7 @@ function makeChannelRegistry(framework: AgentFramework) {
           data: {
             noted: true,
             note:
-              'Thought recorded (private — not sent anywhere). Same-round text routing depends on your current same_round_think_text_policy; use agent_settings get to inspect it, or call skip_reply to end the turn without replying.',
+              'Thought recorded (private — not sent anywhere). Same-round text routing depends on your current same_round_think_text_policy; use agent_settings get to inspect it.',
           },
         };
       }

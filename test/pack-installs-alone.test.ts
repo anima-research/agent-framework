@@ -7,10 +7,10 @@
 import { after, test } from "node:test";
 import assert from "node:assert/strict";
 import { execFile, execFileSync } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 const SCRIPT = fileURLToPath(new URL("../../scripts/pack-installs-alone.mjs", import.meta.url));
 
@@ -44,18 +44,33 @@ const BUN_BY_NODE = shim(
   `#!/bin/sh\n[ "$1" = --version ] && { echo 0.0.0-node; exit 0; }\n[ "$1" = -e ] && exec ${JSON.stringify(process.execPath)} --conditions=bun --input-type=module -e "$2"\nexit 2\n`,
 );
 
-function check(dir: string, bun = NO_BUN, extraPath = ""): Promise<{ code: number; stdout: string; stderr: string }> {
-  // npm's home and cache, outside the package, so npm pack doesn't take them in.
+/** A directory holding an `npm` that runs `body`, in which `pass()` hands
+ *  the call to the npm on PATH. */
+function npmShim(body: string): string {
+  const real = execFileSync("sh", ["-c", "command -v npm"], { encoding: "utf8" }).trim();
+  return shim(
+    "npm",
+    `#!/usr/bin/env node\nconst { execFileSync } = require("node:child_process");\nconst args = process.argv.slice(2);\nconst pass = () => { try { process.stdout.write(execFileSync(${JSON.stringify(real)}, args, { encoding: "utf8", stdio: ["inherit", "pipe", "inherit"] })); } catch (error) { process.stdout.write(error.stdout ?? ""); process.exit(error.status ?? 1); } };\n${body}\n`,
+  );
+}
+
+/** npm offline, with its home, cache and user config outside the package,
+ *  so npm pack doesn't take them in and nothing of the user's is read. */
+function isolated(): Record<string, string> {
   const home = mkdtempSync(join(tmpdir(), "pack-installs-alone-home-"));
   made.push(home);
-  const env = {
-    PATH: `${extraPath}${bun}:${process.env.PATH ?? ""}`,
+  return {
+    PATH: process.env.PATH ?? "",
     HOME: home,
     npm_config_cache: join(home, ".npm-cache"),
     npm_config_userconfig: join(home, ".npmrc"),
     npm_config_offline: "true",
     npm_config_update_notifier: "false",
   };
+}
+
+function check(dir: string, bun = NO_BUN, extraPath = "", extraEnv: Record<string, string> = {}): Promise<{ code: number; stdout: string; stderr: string }> {
+  const env = { ...isolated(), ...extraEnv, PATH: `${extraPath}${bun}:${process.env.PATH ?? ""}` };
   return new Promise((resolve) => {
     execFile(process.execPath, [SCRIPT], { cwd: dir, env }, (error, stdout, stderr) => {
       resolve({ code: error ? Number(error.code ?? 1) : 0, stdout, stderr });
@@ -193,9 +208,10 @@ test("a bin needs a '#!' line, and a node bin's imports must load; none is run",
     ...ENTRY, "dist/serve.js": "/**\n * no shebang\n */\nexport {};\n",
   }));
   assert.equal(noShebang.code, 1);
-  assert.equal(
+  // npm 10 warns that the linked install is experimental; npm 11.19 and later don't.
+  assert.match(
     noShebang.stderr,
-    "pack-installs-alone: bin 'zz-serve' (./dist/serve.js) has no '#!' line, so npm's link can't run it as a command: start its source with '#!/usr/bin/env node'.\n",
+    /(^|\n)pack-installs-alone: bin 'zz-serve' \(\.\/dist\/serve\.js\) has no '#!' line, so npm's link can't run it as a command: start its source with '#!\/usr\/bin\/env node'\.\n$/,
   );
   const unparsed = await check(fixture({ files: ["dist"], main: "./dist/index.js", bin: "./dist/serve.js" }, {
     ...ENTRY, "dist/serve.js": "#!/usr/bin/env node\nexport const = ;\n",
@@ -226,6 +242,30 @@ test("a bin needs a '#!' line, and a node bin's imports must load; none is run",
   assert.match(imports.stdout, /; bins start with '#!': zz-serve; ES module bins' static imports load: zz-serve\.\n$/m);
 });
 
+test("the bin load hook goes in through registerHooks where Node has it, and through register where it doesn't", async () => {
+  // A preload that wraps node:module's register and registerHooks, noting
+  // each call: the check shows a bin load's output only when the load
+  // fails, so a passing check's output can't say which one it called.
+  const dir = mkdtempSync(join(tmpdir(), "pack-installs-alone-spy-"));
+  made.push(dir);
+  const calls = join(dir, "calls.txt");
+  writeFileSync(join(dir, "spy.mjs"), `import { appendFileSync } from "node:fs";
+import { createRequire, syncBuiltinESMExports } from "node:module";
+const builtin = createRequire(import.meta.url)("node:module");
+for (const name of ["register", "registerHooks"]) {
+  const original = builtin[name];
+  if (typeof original === "function") builtin[name] = function (...args) { appendFileSync(${JSON.stringify(calls)}, name + "\\n"); return original.apply(this, args); };
+}
+syncBuiltinESMExports();
+`);
+  const result = await check(fixture({ files: ["dist"], bin: "./dist/serve.js" }, { "dist/serve.js": NODE_BIN }), NO_BUN, "", {
+    NODE_OPTIONS: `--import ${pathToFileURL(join(dir, "spy.mjs")).href}`,
+  });
+  assert.equal(result.code, 0, result.stderr);
+  const hooks = typeof (await import("node:module") as { registerHooks?: unknown }).registerHooks === "function";
+  assert.deepEqual(readFileSync(calls, "utf8").trim().split("\n"), [hooks ? "registerHooks" : "register"]);
+});
+
 test("a CommonJS bin is parsed, never run, whatever marks it CommonJS, and one that doesn't parse fails", async () => {
   const marks = mkdtempSync(join(tmpdir(), "pack-installs-alone-marks-"));
   made.push(marks);
@@ -250,14 +290,14 @@ test("a CommonJS bin is parsed, never run, whatever marks it CommonJS, and one t
   assert.match(unparsed.stderr, /pack-installs-alone: bin 'zz-cjs' \(\.\/dist\/serve\.js\) in zz-fixture-1\.0\.0\.tgz doesn't parse \(above\)\.\n$/);
 });
 
-test("a package imported only through another dependency's copy fails, since the install is nested", async () => {
+test("a package imported only through another dependency's copy, or a dependency's peer, fails, since the install is linked", async () => {
   // zz-cm depends on zz-chronicle; the fixture imports zz-chronicle but lists
   // it only in devDependencies, so a hoisted install would hand it zz-cm's.
   const tarballs = mkdtempSync(join(tmpdir(), "pack-installs-alone-deps-"));
   made.push(tarballs);
   const pack = (pkg: Record<string, unknown>, files: Record<string, string>) => {
     const dir = fixture(pkg, files);
-    const out = execFileSync("npm", ["pack", "--json", "--pack-destination", tarballs], { cwd: dir, encoding: "utf8", env: { ...process.env, npm_config_offline: "true" } });
+    const out = execFileSync("npm", ["pack", "--json", "--pack-destination", tarballs], { cwd: dir, encoding: "utf8", env: isolated() });
     const parsed = JSON.parse(out);
     return join(tarballs, (Array.isArray(parsed) ? parsed[0] : Object.values(parsed)[0] as { filename: string }).filename);
   };
@@ -275,6 +315,149 @@ test("a package imported only through another dependency's copy fails, since the
     imports,
   ));
   assert.equal(listed.code, 0, listed.stderr);
+  // zz-host asks for zz-peer as a peer, which npm installs beside it: a
+  // nested install would put it in the fixture's reach too.
+  const peer = pack({ name: "zz-peer", main: "./index.js" }, { "index.js": "export const peer = true;\n" });
+  const host = pack({ name: "zz-host", main: "./index.js", peerDependencies: { "zz-peer": `file:${peer}` } }, { "index.js": "import 'zz-peer';\nexport const host = true;\n" });
+  const peerImports = { "dist/index.js": "import 'zz-host';\nimport 'zz-peer';\nexport const ok = true;\n" };
+  const peerOnly = await check(fixture(
+    { files: ["dist"], main: "./dist/index.js", dependencies: { "zz-host": `file:${host}` }, devDependencies: { "zz-peer": `file:${peer}` } },
+    peerImports,
+  ));
+  assert.equal(peerOnly.code, 1);
+  assert.match(peerOnly.stderr, /Cannot find package 'zz-peer' imported from \S*\/dist\/index\.js/);
+  const peerListed = await check(fixture(
+    { files: ["dist"], main: "./dist/index.js", dependencies: { "zz-host": `file:${host}`, "zz-peer": `file:${peer}` } },
+    peerImports,
+  ));
+  assert.equal(peerListed.code, 0, peerListed.stderr);
+  // A package's own peer is installed beside it, so its import loads.
+  const ownPeer = await check(fixture(
+    { files: ["dist"], main: "./dist/index.js", peerDependencies: { "zz-peer": `file:${peer}` } },
+    { "dist/index.js": "import 'zz-peer';\nexport const ok = true;\n" },
+  ));
+  assert.equal(ownPeer.code, 0, ownPeer.stderr);
+});
+
+test("a load that outlives its limit fails at the limit even when it handles SIGTERM, and each limit must be a positive whole number", async () => {
+  // It ignores SIGTERM and would end on its own only after a minute, so a
+  // check that only asked it to stop would take that minute.
+  const hang = "process.on('SIGTERM', () => {});\nsetTimeout(() => process.exit(0), 60_000);\nawait new Promise(() => {});\n";
+  const limit = { PACK_INSTALLS_ALONE_LOAD_TIMEOUT_MS: "2000" };
+  let start = Date.now();
+  const root = await check(fixture({ files: ["dist"], main: "./dist/index.js" }, { "dist/index.js": hang }), NO_BUN, "", limit);
+  assert.ok(Date.now() - start < 40_000, `took ${Date.now() - start} ms`);
+  assert.equal(root.code, 1);
+  assert.match(root.stderr, /pack-installs-alone: loading '@zz\/fixture': it didn't finish within 2 s\.\n$/);
+  start = Date.now();
+  const bin = await check(
+    fixture({ files: ["dist"], bin: "./dist/serve.js" }, { "dist/serve.js": "#!/usr/bin/env node\nimport './hang.js';\n", "dist/hang.js": hang }),
+    NO_BUN,
+    "",
+    limit,
+  );
+  assert.ok(Date.now() - start < 40_000, `took ${Date.now() - start} ms`);
+  assert.equal(bin.code, 1);
+  assert.match(bin.stderr, /pack-installs-alone: loading bin 'fixture' \(\.\/dist\/serve\.js\) in zz-fixture-1\.0\.0\.tgz didn't finish within 2 s\.\n$/);
+  start = Date.now();
+  const underBun = await check(
+    fixture({ files: ["dist", "src"], exports: { ".": { bun: "./src/index.js", import: "./dist/index.js" } } }, { ...ENTRY, "src/index.js": hang }),
+    BUN_BY_NODE,
+    "",
+    limit,
+  );
+  assert.ok(Date.now() - start < 40_000, `took ${Date.now() - start} ms`);
+  assert.equal(underBun.code, 1);
+  assert.match(underBun.stderr, /pack-installs-alone: loading '@zz\/fixture' under bun: it didn't finish within 2 s\.\n$/);
+  for (const name of ["PACK_INSTALLS_ALONE_INSTALL_TIMEOUT_MS", "PACK_INSTALLS_ALONE_LOAD_TIMEOUT_MS"]) {
+    for (const value of ["soon", "0"]) {
+      const bad = await check(fixture({ files: ["dist"], main: "./dist/index.js" }, ENTRY), NO_BUN, "", { [name]: value });
+      assert.equal(bad.code, 1);
+      assert.equal(bad.stderr, `pack-installs-alone: ${name} is '${value}': give it a positive whole number of milliseconds.\n`);
+    }
+  }
+});
+
+test("npm pack or npm install that outlives its limit fails at the limit even when it handles SIGTERM", async () => {
+  // npm pack runs under the install's limit too, so the install's case
+  // leaves the real npm pack room on a loaded runner.
+  const hangOn = (command: string) =>
+    npmShim(`if (args[0] === ${JSON.stringify(command)}) { process.on("SIGTERM", () => {}); setTimeout(() => {}, 60_000); }\nelse pass();`);
+  let start = Date.now();
+  const install = await check(fixture({ files: ["dist"], main: "./dist/index.js" }, ENTRY), NO_BUN, `${hangOn("install")}:`, {
+    PACK_INSTALLS_ALONE_INSTALL_TIMEOUT_MS: "10000",
+  });
+  assert.ok(Date.now() - start < 40_000, `took ${Date.now() - start} ms`);
+  assert.equal(install.code, 1);
+  assert.match(install.stderr, /pack-installs-alone: zz-fixture-1\.0\.0\.tgz didn't install on its own into an empty directory: it didn't finish within 10 s\.\n$/);
+  start = Date.now();
+  const pack = await check(fixture({ files: ["dist"], main: "./dist/index.js" }, ENTRY), NO_BUN, `${hangOn("pack")}:`, {
+    PACK_INSTALLS_ALONE_INSTALL_TIMEOUT_MS: "2000",
+  });
+  assert.ok(Date.now() - start < 40_000, `took ${Date.now() - start} ms`);
+  assert.equal(pack.code, 1);
+  assert.match(pack.stderr, /pack-installs-alone: npm pack didn't finish within 2 s\.\n$/);
+});
+
+test("a null in an exports array gives way to the next item, and a target only node-addons or module-sync names is loaded on a Node that matches it", async () => {
+  const devOnly = { devDependencies: { "zz-dev-only": "1.0.0" } };
+  const array = await check(fixture(
+    { files: ["dist"], exports: [null, "./dist/index.js"], ...devOnly },
+    { "dist/index.js": "import 'zz-dev-only';\nexport const ok = true;\n" },
+  ));
+  assert.equal(array.code, 1);
+  assert.match(array.stderr, /Cannot find package 'zz-dev-only'/);
+  // Node matches node-addons unless it runs with --no-addons, which the
+  // check's loads don't.
+  const addons = await check(fixture(
+    { files: ["dist"], exports: { ".": { "node-addons": "./dist/addons.js" } }, ...devOnly },
+    { "dist/addons.js": "import 'zz-dev-only';\nexport const ok = true;\n" },
+  ));
+  assert.equal(addons.code, 1);
+  assert.match(addons.stderr, /Cannot find package 'zz-dev-only'/);
+  // With no other condition beside it, only module-sync leads to this target.
+  const sync = await check(fixture(
+    { files: ["dist"], exports: { ".": { "module-sync": "./dist/sync.js" } }, ...devOnly },
+    { "dist/sync.js": "import 'zz-dev-only';\nexport const ok = true;\n" },
+  ));
+  if ((process.features as { require_module?: boolean }).require_module) {
+    assert.equal(sync.code, 1);
+    assert.match(sync.stderr, /Cannot find package 'zz-dev-only'/);
+  } else {
+    assert.equal(sync.code, 0, sync.stderr);
+  }
+  // require() matches node-addons too, so a target only it names, beside an
+  // import target, is required.
+  const required = await check(fixture(
+    { files: ["dist"], exports: { ".": { import: "./dist/index.js", "node-addons": "./dist/addons.cjs" } }, ...devOnly },
+    { "dist/index.js": "export const ok = true;\n", "dist/addons.cjs": "require('zz-dev-only');\n" },
+  ));
+  assert.equal(required.code, 1);
+  assert.match(required.stderr, /Cannot find module 'zz-dev-only'/);
+  // So does module-sync, on a Node that can require ES modules: beside an
+  // import target, a target only module-sync names is required.
+  const syncRequired = await check(fixture(
+    { files: ["dist"], exports: { ".": { import: "./dist/index.js", "module-sync": "./dist/sync.js" } }, ...devOnly },
+    { "dist/index.js": "export const ok = true;\n", "dist/sync.js": "import 'zz-dev-only';\nexport const ok = true;\n" },
+  ));
+  if ((process.features as { require_module?: boolean }).require_module) {
+    assert.equal(syncRequired.code, 1);
+    assert.match(syncRequired.stderr, /\(require\) from the installed/);
+    assert.match(syncRequired.stderr, /Cannot find package 'zz-dev-only'/);
+  } else {
+    assert.equal(syncRequired.code, 0, syncRequired.stderr);
+  }
+});
+
+test("an import that a null, an array of nulls or an empty array blocks isn't attempted, and require() still loads the default", async () => {
+  for (const blocked of [null, [null], []]) {
+    const result = await check(fixture(
+      { files: ["dist"], exports: { ".": { import: blocked, default: "./dist/index.cjs" } } },
+      { "dist/index.cjs": "module.exports = { ok: true };\n" },
+    ));
+    assert.equal(result.code, 0, `${JSON.stringify(blocked)}: ${result.stderr}`);
+    assert.match(result.stdout, /; loaded '@zz\/fixture' \(require\)\.\n$/m);
+  }
 });
 
 test("with bun on PATH, a bun target is loaded under bun, and one that doesn't load fails, naming it", async () => {
@@ -284,7 +467,7 @@ test("with bun on PATH, a bun target is loaded under bun, and one that doesn't l
   assert.match(loads.stdout, /; loaded '@zz\/fixture' \(import\); loaded under bun: '@zz\/fixture'\.\n$/m);
   const broken = await check(fixture(pkg, { ...ENTRY, "src/index.js": "import './left-out.js';\n" }), BUN_BY_NODE);
   assert.equal(broken.code, 1);
-  assert.match(broken.stderr, /pack-installs-alone: loading '@zz\/fixture' under bun from the installed zz-fixture-1\.0\.0\.tgz failed \(above\)\. A file it imports that the package leaves out does that, a dependency only devDependencies supplied, or a dependency's new release \(rerun this on main to tell\)\.\n$/);
+  assert.match(broken.stderr, /pack-installs-alone: loading '@zz\/fixture' under bun \(from the installed zz-fixture-1\.0\.0\.tgz\) failed, as its output above shows\. A file it imports that the package leaves out does that, a dependency only devDependencies supplied, or a dependency's new release \(rerun this on main to tell\)\.\n$/);
 });
 
 test("the declaration the build wrote beside a packed module, left out of files, fails, whether types, typings or a types condition gives the package types, and exports: null falls back to main", async () => {

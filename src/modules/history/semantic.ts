@@ -376,9 +376,14 @@ export class SemanticIndexer {
   private readonly removedIds = new Set<string>();
   private detach: (() => void) | null = null;
   /**
-   * Set once the service answers 404 to /delete (a build without the route, or
-   * a store whose index doesn't exist yet): removals are dropped from then on,
-   * until the host restarts or binds the module again, which makes a new indexer.
+   * Set once the service answers 404 to /delete in a pass whose /stats
+   * answered with stats, which shows the index is made, so the 404 means a
+   * build without the route. From then on, removals are dropped as they come
+   * and no pass calls /delete, until the host restarts or binds the module
+   * again, which makes a new indexer. A pass whose /stats answers 404 has no
+   * index to remove from and makes no /delete call; a /delete 404 in a pass
+   * whose /stats answered with something that isn't stats is re-queued like
+   * any other failure, since that answer doesn't show the index is made.
    */
   private deleteUnsupported = false;
   /** Called whenever the pending edit/remove sets change. */
@@ -449,6 +454,9 @@ export class SemanticIndexer {
         if (!(e instanceof EmbedServiceError && e.status !== null && e.status >= 200 && e.status < 300)) throw e;
         notStats = e;
       }
+      // /stats answered 404, which stats() reads as a namespace that doesn't
+      // exist: there's no index to remove from.
+      const noIndex = stats === null && notStats === null;
       const msgWm = stats?.by_kind.message?.max_cursor ?? null;
       const sumWm = stats?.by_kind.summary?.max_cursor ?? null;
       let budget = maxItems;
@@ -469,8 +477,9 @@ export class SemanticIndexer {
         // Edits spend the budget like any other upsert, so a large queue left
         // by an outage cannot make a search's bounded catch-up unbounded; the
         // rest stay queued for the next pass.
-        // Only actionable edits (an upsert or a delete) spend it: one whose
-        // message left the branch is dropped for free.
+        // An edit whose message is on the branch spends it, one edited down to
+        // nothing indexable too, even in a pass that makes no /delete call; one
+        // whose message left the branch is dropped for free.
         this.removedIds.clear();
         const edited: string[] = [];
         const toDelete = removed.map((id) => `msg:${id}`);
@@ -490,26 +499,40 @@ export class SemanticIndexer {
           if (item) toUpsert.push(item); else { toDelete.push(`msg:${id}`); blanked.push(id); }
         }
         if (this.editedIds.size > 0) report.more = true;
-        if (toDelete.length > 0) {
+        // The removals and blanked edits are dropped with no /delete call in
+        // two cases. With no index (/stats answered 404), there's nothing to
+        // remove, and the index this pass makes takes only what the store
+        // holds and can index, which leaves them out. Once the service is known
+        // to lack the route (deleteUnsupported), the index keeps them, and
+        // search-time checks (on-branch, still indexable) keep them out of
+        // results.
+        if (toDelete.length > 0 && !noIndex && !this.deleteUnsupported) {
           try {
             await this.client.delete(toDelete);
           } catch (e) {
             const msg = e instanceof Error ? e.message : String(e);
-            if (e instanceof EmbedServiceError && e.status === 404) {
-              // A service build without /delete (or a namespace that does
-              // not exist). Drop the removals and blanked edits: search-time
-              // checks (on-branch, still indexable) keep them out of results.
+            // What the delete held, by kind, for the warning.
+            const what = [
+              removed.length > 0 ? `${removed.length} removal(s)` : null,
+              blanked.length > 0 ? `${blanked.length} edit(s) down to nothing indexable` : null,
+            ].filter((s): s is string => s !== null).join(' and ');
+            if (e instanceof EmbedServiceError && e.status === 404 && stats !== null) {
+              // This pass's /stats answered with stats, so the index is made
+              // and the 404 is the route's: a service build without /delete.
               this.deleteUnsupported = true;
               this.warn(
-                "/delete answered 404, so the service lacks that route or this index isn't made yet; "
-                  + `dropping ${toDelete.length} removal(s), and every later one until the host restarts or binds the `
-                  + `history module again: ${msg}`,
+                `/delete answered 404, so the service lacks that route; dropping ${what}. Later removals and edits `
+                  + `down to nothing indexable are dropped too, until the host restarts or binds the history module `
+                  + `again: ${msg}`,
               );
             } else {
+              // Any other failure, and a 404 in a pass whose /stats answered
+              // with something that isn't stats, which doesn't show the index
+              // is made: re-queued, for a later pass.
               for (const id of removed) this.removedIds.add(id);
               for (const id of blanked) if (!this.removedIds.has(id)) this.editedIds.add(id);
               phaseErrors.push(msg);
-              this.warn(`delete failed, ${removed.length} removal(s) re-queued: ${msg}`);
+              this.warn(`delete failed, ${what} re-queued: ${msg}`);
             }
           }
         }

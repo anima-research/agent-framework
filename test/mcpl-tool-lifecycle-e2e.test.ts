@@ -266,7 +266,7 @@ describe('tool lifecycle end to end (RFC-007)', () => {
       await waitFor(() => membrane.calls.length > callsBefore
         && (membrane.lastStream?.receivedToolResults.length ?? 0) >= 1, 'the refused call answered');
       const answer = JSON.stringify(membrane.lastStream!.receivedToolResults[0]);
-      assert.match(answer, /cannot open channels/, 'the guard did refuse it');
+      assert.match(answer, /can't open other channels, and nothing was opened/, 'the guard did refuse it');
       await new Promise((r) => setTimeout(r, 300));
       const after = readLog(obsLog).filter((e) => e.event === 'lifecycle').length;
       assert.equal(after, before, 'a refused host-tool call produces no events');

@@ -8,7 +8,7 @@
 import { test, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
 
-import { McplServerConnection } from '../src/mcpl/server-connection.js';
+import { McplRequestError, McplServerConnection } from '../src/mcpl/server-connection.js';
 import type { McplHostCapabilities, McplServerConfig } from '../src/mcpl/types.js';
 
 // What the stub's tools/list answer says when it wrote a held reply ahead of it.
@@ -29,7 +29,7 @@ process.stdin.on('data', (c) => {
     if (!line.trim()) continue;
     let m; try { m = JSON.parse(line); } catch { continue; }
     const reply = (result, id = m.id) => process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id, result }) + '\\n');
-    if (m.method === 'initialize') reply({ capabilities: {} });
+    if (m.method === 'initialize') reply({ protocolVersion: '2024-11-05', capabilities: {} });
     else if (m.method === 'tools/list') {
       const released = held !== null;
       if (held) { reply(held.result, held.id); held = null; }
@@ -72,7 +72,8 @@ afterEach(async () => {
   connection = null;
 });
 
-test('tools/call against a hung server rejects within the configured timeout', async () => {
+test('tools/call against a hung server rejects within the configured timeout', async (t) => {
+  const errors = t.mock.method(console, 'error', () => {});
   connection = await McplServerConnection.connect(config({ requestTimeoutMs: 250 }), HOST_CAPS);
   connection.ready();
 
@@ -80,9 +81,11 @@ test('tools/call against a hung server rejects within the configured timeout', a
   await assert.rejects(
     connection.sendToolsCall('stuck', {}),
     (err: Error) => {
-      assert.match(err.message, /did not respond to tools\/call/);
-      assert.match(err.message, /250ms/);
-      assert.match(err.message, /hung/);
+      // The agent's words name no method; the log keeps it and the id.
+      assert.match(err.message, /^The "hung" server didn't answer within 0\.25 seconds, so whether the request took effect is unknown/);
+      assert.ok(!err.message.includes('tools/call'), err.message);
+      assert.ok(errors.mock.calls.some((call) => /^MCPL server "hung" did not respond to tools\/call \(id=\d+\) within 250ms/
+        .test(String(call.arguments[0]))), 'the operator log has the method and id');
       return true;
     },
   );
@@ -128,6 +131,24 @@ test('requestTimeoutMs: 0 disables the per-request watchdog', async (t) => {
   assert.equal(settled, true);
 });
 
+test('requestTimeoutMs: 0 leaves channels/publish its own deadline, whose expiry is a no-response', async () => {
+  connection = await McplServerConnection.connect(config({ requestTimeoutMs: 0 }), HOST_CAPS);
+  connection.ready();
+  // The default is 60 s; the test shortens it rather than wait.
+  (connection as unknown as { publishDeadlineMs: number }).publishDeadlineMs = 150;
+  const started = Date.now();
+  await assert.rejects(
+    connection.sendChannelsPublish({ conversationId: 'c', channelId: 'x', content: [{ type: 'text', text: 'hi' }] }),
+    (err: Error) => {
+      assert.ok(err instanceof McplRequestError);
+      assert.equal(err.outcome, 'no-response');
+      assert.match(err.message, /^The "hung" server didn't answer within 0\.15 seconds, so whether the request took effect is unknown/);
+      return true;
+    },
+  );
+  assert.ok(Date.now() - started < 5000);
+});
+
 test('the timeout error warns the model the tool may have completed server-side', async () => {
   connection = await McplServerConnection.connect(config({ requestTimeoutMs: 150 }), HOST_CAPS);
   connection.ready();
@@ -135,8 +156,8 @@ test('the timeout error warns the model the tool may have completed server-side'
     connection.sendToolsCall('stuck', {}),
     (err: Error) => {
       // The model reads this string; it must not imply the call was cancelled.
-      assert.match(err.message, /may still have completed server-side/);
-      assert.match(err.message, /verify state before retrying/);
+      assert.match(err.message, /it was abandoned here, not cancelled, and may still complete on the server/);
+      assert.match(err.message, /Check its effect before trying again/);
       return true;
     },
   );
@@ -160,7 +181,7 @@ test('a timed-out request that later receives a response does not crash (orphane
   const orphaned: unknown[] = [];
   connection.on('orphaned-response', (info) => orphaned.push(info));
 
-  await assert.rejects(connection.sendToolsCall('stuck', {}), /did not respond/);
+  await assert.rejects(connection.sendToolsCall('stuck', {}), /didn't answer within/);
   liftRequestTimeout(connection);
   // The next tools/list makes the stub write the late reply ahead of the
   // list's own, on the same stream, so by the time the list resolves the late
@@ -188,7 +209,7 @@ test('a late STATEFUL orphaned response is surfaced via mcpl:orphaned-response (
   const orphaned: Array<{ hadState: boolean; hadCheckpoint: boolean }> = [];
   connection.on('orphaned-response', (info) => orphaned.push(info));
 
-  await assert.rejects(connection.sendToolsCall('stuck', {}), /did not respond/);
+  await assert.rejects(connection.sendToolsCall('stuck', {}), /didn't answer within/);
   liftRequestTimeout(connection);
   // The next tools/list releases the late reply ahead of its own answer, so it
   // has been handled by the time the list resolves, and the connection still
@@ -215,7 +236,7 @@ test('a mandatory call deadline overrides requestTimeoutMs: 0 and surfaces its l
   connection.on('orphaned-response', (info) => orphaned.push(info));
   await assert.rejects(
     connection.sendToolsCallWithDeadline('stuck', {}, 75),
-    /outcome is unknown.*verify state before retrying/i,
+    /took effect is unknown.*Check its effect before trying again/i,
   );
   // Only the deadline could settle the call, since the server sends nothing
   // until the next tools/list, which releases the late reply ahead of its own.

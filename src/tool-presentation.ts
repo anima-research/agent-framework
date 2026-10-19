@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from 'node:crypto';
-import { fchmodSync, closeSync, fstatSync, lstatSync, openSync, readSync, renameSync, unlinkSync, writeFileSync } from 'node:fs';
+import { constants, fchmodSync, closeSync, fstatSync, lstatSync, openSync, readSync, renameSync, unlinkSync, writeFileSync } from 'node:fs';
 import { closestNames } from './closest-names.js';
 import { boundedErrorMessage, errorMessage } from './error-message.js';
 import type { ToolDefinition, ToolResult } from './types/events.js';
@@ -24,6 +24,13 @@ export interface PresentationSnapshot {
   entries: { name: string; source: string; visible: boolean; originalDescription: string; description: string; descriptionSource?: string; inputSchema: ToolDefinition['inputSchema'] }[];
 }
 const MAX_BYTES = 256 * 1024;
+/**
+ * Opened with each read of a presentation file, as observe.ts opens workspace
+ * files: a FIFO at the operator's path opens at once and fails the regular-file
+ * check, where a blocking open would hold the whole process (it's synchronous)
+ * until something opened the FIFO for writing.
+ */
+const NONBLOCK = typeof constants.O_NONBLOCK === 'number' ? constants.O_NONBLOCK : 0;
 const MAX_DESCRIPTION_CHARS = 32768;
 const protectedNames = new Set(['set_tool_visibility', 'set_tool_description', 'workspace--read']);
 export const isPresentationTool = (name: string): boolean => name === 'set_tool_visibility' || name === 'set_tool_description';
@@ -173,7 +180,7 @@ export class ToolPresentation {
   constructor(readonly config: ToolPresentationConfig) {}
   private read(path = this.config.path, allowMissing = true): string {
     let fd: number;
-    try { fd = openSync(path, 'r'); }
+    try { fd = openSync(path, constants.O_RDONLY | NONBLOCK); }
     catch (error) {
       const code = (error as NodeJS.ErrnoException).code;
       if (code === 'ENOENT') {

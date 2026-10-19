@@ -68,6 +68,11 @@ class FakeConnection extends EventEmitter {
   // models a server whose initialize carried capabilities.tools.
   mcpToolsAdvertised = true;
   policyEstablished = false;
+  // A live transport (the real connection's view after a reconnect); the
+  // framework opens planes only on a connected transport, the one its
+  // exchange ran on.
+  isConnected = true;
+  transportEpoch = 0;
   establishGrant(grant: CapabilityGrant): void {
     this.grant = grant;
     this.policyEstablished = true;
@@ -110,6 +115,8 @@ async function makeHarness() {
   fw.channelRegistry = null;
   fw.inferenceRouter = null;
   fw.eventGate = null;
+  fw.mcplPolicyExchanges = new WeakMap();
+  fw.manifestRefreshState = new Map();
 
   fw.featureSetManager = new FeatureSetManager();
   fw.scopeManager = new ScopeManager();
@@ -135,7 +142,7 @@ async function makeHarness() {
   };
   fw.discordAwarenessBarrier = null;
   fw.discordAwarenessBarrierGeneration = 0;
-  fw.wireMcplEvents(connection);
+  fw.wireMcplEvents(connection, config);
   await fw.registerMcplServerFeatures(config, connection);
 
   // The push handler responds synchronously when no awareness barrier is

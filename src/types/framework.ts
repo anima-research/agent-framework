@@ -24,8 +24,6 @@ export interface ModuleProcessResponse {
 export interface ProcessLoggingConfig {
   /** Persist process logs to Chronicle (default: false) */
   persist?: boolean;
-  /** Broadcast process:completed trace events (default: false) */
-  broadcast?: boolean;
 }
 
 /**
@@ -76,6 +74,23 @@ export interface CodeExecutionConfig {
   /** Max wake_agent() calls per background script (default 100); further
    *  calls raise RuntimeError inside the script. */
   maxWakesPerScript?: number;
+  /** Variables for the python interpreter beyond the operating allowlist it
+   *  inherits (see CHILD_ENV_ALLOWLIST), such as PYTHONPATH. A recipe can
+   *  `${VAR}`-substitute them from .env. Other host variables aren't
+   *  inherited, which limits what model-authored code inherits, not what a
+   *  process running as the same user can read. The runner sets
+   *  PYTHONUNBUFFERED and PYTHONIOENCODING last, over any value given here,
+   *  since its protocol needs both. The interpreter's working directory is
+   *  its own runtime directory, so a relative path given here, as in
+   *  PYTHONPATH, resolves there: give absolute paths. */
+  env?: Record<string, string>;
+  /** The interpreter inherits the host's whole environment instead of the
+   *  allowlist: every host variable, provider keys included, reaches
+   *  model-authored code and every subprocess a script starts. Listing what
+   *  scripts need in `env` is the safer route. With code execution enabled,
+   *  `create()` refuses any value but true, false or null, which counts as
+   *  not set. */
+  inheritEnv?: boolean;
 }
 
 /** See `FrameworkConfig.providerHold`. */
@@ -212,8 +227,9 @@ export interface FrameworkConfig {
 
   /**
    * Client-side programmatic tool calling (`code_execution` tool). Omitted or
-   * `enabled: false` → tool absent, no python is ever spawned. A value that
-   * isn't an object is refused at `create()`.
+   * `enabled: false` → tool absent, no python is ever spawned. At runtime,
+   * untyped configs may also use `null` or `false` to omit this setting.
+   * Other values that aren't objects are refused at `create()`.
    */
   codeExecution?: CodeExecutionConfig;
 

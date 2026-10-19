@@ -594,6 +594,31 @@ test("MCPL checkpoint trees that can't be read, or that aren't checkpoint trees,
   await f.create();
 });
 
+test("an unreadable checkpoint store's error is quoted to 500 characters, counted in code points, without halving a surrogate pair", inStoreDir('boot-read-long-error-', async (storePath) => {
+  const store = JsStore.openOrCreate({ path: storePath });
+  // 499 characters, then an emoji whose two UTF-16 units straddle unit 500.
+  // Counted in code points, the emoji is the 500th character.
+  const message = `${'x'.repeat(499)}😀 and more`;
+  const proto = JsStore.prototype as unknown as { getStateJson(this: JsStore, id: string): unknown };
+  const original = proto.getStateJson;
+  proto.getStateJson = function (this: JsStore, id: string) {
+    if (id === 'mcpl/checkpoints') throw new Error(message);
+    return original.call(this, id);
+  };
+  try {
+    assert.throws(() => new CheckpointManager(store, () => {}), (error: Error) => {
+      assert.ok(
+        error.message.startsWith(`the MCPL checkpoint trees (mcpl/checkpoints) could not be read: ${'x'.repeat(499)}😀… (509 characters). MCPL doesn't start`),
+        `the cut keeps the emoji whole, and the count is of code points: …${JSON.stringify(error.message.slice(555, 600))}`,
+      );
+      return true;
+    });
+  } finally {
+    proto.getStateJson = original;
+    store.close();
+  }
+}));
+
 /** A stored host-managed checkpoint tree for `server`'s `featureSet`, holding `state`, as the checkpoint manager stores them. */
 function seedHostManaged(storePath: string, server: string, featureSet: string, state: unknown): void {
   const store = JsStore.openOrCreate({ path: storePath });

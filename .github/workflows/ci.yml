@@ -41,7 +41,8 @@ jobs:
           node-version: ${{ matrix.node }}
 
       # Root lockfiles are deliberately gitignored in this repo, so plain
-      # npm install (matching publish.yml). No lock to guard here.
+      # npm install, as publish.yml's build-and-test job does. No lock to
+      # guard here.
       - name: Install dependencies
         run: npm install
 
@@ -73,13 +74,13 @@ jobs:
   # install resolves dependencies from the registry as it stands, so a new
   # upstream release can turn it red on a change that touched nothing it
   # installs: when it fails, rerunning it on main tells a change's own break
-  # from the registry's drift.
+  # from the registry's drift. The job stops at 40 minutes, not at GitHub's 6
+  # hours: above the check's own limits (10 minutes each for npm pack and npm
+  # install, a minute for each load), so the check names what hung.
   pack-check:
     name: Packed release installs on its own
     runs-on: ubuntu-latest
-    # A limit for the same reason as build-and-test's. Passing runs take
-    # under a minute.
-    timeout-minutes: 10
+    timeout-minutes: 40
 
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0

@@ -9,7 +9,7 @@ import assert from 'node:assert/strict';
 import { convertBlock } from '../src/mcpl/convert-block.js';
 import type { McplContentBlock } from '../src/mcpl/types.js';
 
-const t = (b: unknown) => convertBlock(b as McplContentBlock, 'attachment on push event') as { type: string; text?: string; source?: { type: string } };
+const t = (b: unknown) => convertBlock(b as McplContentBlock, 'attachment on push event', 'push-srv') as { type: string; text?: string; source?: { type: string } };
 
 test('resource block converts to a bounded stub, never the raw uri', () => {
   const out = t({ type: 'resource', uri: 'https://host/files?path=x.wav', mimeType: 'audio/wav',
@@ -45,5 +45,5 @@ test('undecorated uri-form image keeps url-source handling (behavior preserved)'
 test('unknown block type fails visibly, never undefined', () => {
   const out = t({ type: 'holo', frames: 9000 });
   assert.equal(out.type, 'text');
-  assert.ok(out.text!.includes('unrecognized content block'));
+  assert.equal(out.text, `[Content not shown: this host can't display "holo" content.]`);
 });

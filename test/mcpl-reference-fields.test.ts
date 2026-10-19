@@ -1,8 +1,8 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
-  buildReferenceStub, classifyBlock, isReferenceExpired, sanitizeLabel, REFERENCE_LIMITS,
-  referenceRegistry, referenceStubOrNull, UNBOUND_REASON, unfetchableReason,
+  buildReferenceStub, classifyBlock, isReferenceExpired, sanitizeLabel, EXPIRY_REASON, REFERENCE_LIMITS,
+  referenceBlockForScript, referenceRegistry, referenceStubOrNull, UNBOUND_REASON, unfetchableReason,
 } from '../src/mcpl/references.js';
 
 const fields = ['name', 'mimeType', 'expiresAt'] as const;
@@ -116,10 +116,33 @@ test('the stub leaves out a type, or a provenance, that sanitizes to nothing', (
   assert.equal(originStub, `[${referenceRegistry.findByUri(originGone.uri)!.refId}] image/png — fetch with fetch_reference`);
 });
 
+test("an expired reference reaches a script with the reason its stub gives, and a live or saved one without it", () => {
+  // Each bound to its server, as a script's tool result binds them.
+  const cases = [['2001-01-01T00:00:00Z', EXPIRY_REASON.passed], ['not-a-date', EXPIRY_REASON.unparseable],
+    ['x'.repeat(REFERENCE_LIMITS.expiresAt + 1), EXPIRY_REASON.rejected]] as const;
+  for (const [i, [expiresAt, why]] of cases.entries()) {
+    const { block, testimony } = reference('resource', { uri: `https://example.test/script-expired-${i}`, expiresAt });
+    const view = referenceBlockForScript(block, 'srv') as { savedTo: unknown; expired?: string };
+    assert.equal(view.savedTo, null);
+    assert.equal(view.expired, why);
+    assert.ok(buildReferenceStub(testimony, undefined, 'srv').includes(why), 'the stub gives the same reason');
+  }
+  const live = reference('resource', { uri: 'https://example.test/script-live', expiresAt: '2999-01-01T00:00:00Z' }).block;
+  assert.equal((referenceBlockForScript(live, 'srv') as { expired?: string }).expired, undefined);
+  // Bound to its server, so the fetch its id offers can be made.
+  assert.deepEqual(referenceRegistry.findByUri(live.uri)?.serverIds, ['srv']);
+  // A copy saved before its expiry passed is still served, and the script gets its path.
+  const saved = reference('resource', { uri: 'https://example.test/script-expired-0', expiresAt: '2001-01-01T00:00:00Z' }).block;
+  referenceRegistry.findByUri(saved.uri)!.fetchedPath = 'scratch/refs/kept.png';
+  const view = referenceBlockForScript(saved, 'srv') as { savedTo: unknown; expired?: string };
+  assert.equal(view.savedTo, 'scratch/refs/kept.png');
+  assert.equal(view.expired, undefined);
+});
+
 test("an expired reference's stub says why, where a live one's advises fetch_reference", () => {
   // Each bound to its server, as a tool result's references are, so the expiry is what's left to say.
-  const cases = [['2001-01-01T00:00:00Z', /expired: its expiresAt has passed/], ['not-a-date', /treated as expired: its expiresAt does not parse/],
-    ['x'.repeat(REFERENCE_LIMITS.expiresAt + 1), /treated as expired: its expiresAt was rejected as a field/]] as const;
+  const cases = [['2001-01-01T00:00:00Z', /[\]—] expired$/], ['not-a-date', /[\]—] treated as expired, since its expiry time can't be read$/],
+    ['x'.repeat(REFERENCE_LIMITS.expiresAt + 1), /[\]—] treated as expired, since its expiry time isn't in a form this host accepts$/]] as const;
   for (const [i, [expiresAt, why]] of cases.entries()) {
     const { testimony } = reference('resource', { uri: `https://example.test/stub-expired-${i}`, expiresAt });
     const stub = buildReferenceStub(testimony, undefined, 'srv');

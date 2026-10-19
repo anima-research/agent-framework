@@ -116,9 +116,9 @@ never do.
   silently stranding an entry.
 - **The fragment lands with the change** — same commit, or at least the same
   PR. This binds direct pushes to `main` just as much as PRs. On PRs, CI
-  enforces it softly: touching `src/` without adding a fragment (or editing
-  `CHANGELOG.md`) fails the `changelog` check unless the `no-changelog`
-  label is applied.
+  enforces it softly: touching `src/` fails the `changelog` check unless the
+  PR adds a fragment, edits a pending one or edits `CHANGELOG.md`, or carries
+  the `no-changelog` label.
 - **What needs an entry:** anything a module developer, host, or downstream
   consumer would notice — behavior, event/trace surfaces, tool namespacing,
   config schema, agent state machine, public exports, defaults. Internal
@@ -146,15 +146,18 @@ never do.
   `Unreleased` above, and refuses to release when there is nothing to
   release; npm then commits and tags. `git push --follow-tags` triggers CI,
   which refuses a tag with no matching changelog section, checks in a job
-  of its own that the packed release installs on its own
-  (`node scripts/pack-installs-alone.mjs` packs it, installs the tarball
-  alone into an empty directory with its dependencies from npm, nested so
-  the package reaches only its own, and checks the installed package, as
-  the script's header lists; to run it by hand, `npm run build` first, for
-  example before `git push --follow-tags`, or dispatch the workflow on a
-  branch, where it publishes nothing), publishes
+  of its own that the packed release installs on its own, publishes
   `@animalabs/agent-framework` to npm once that check has passed, and
-  creates the GitHub release with that section as its notes. The two
+  creates the GitHub release with that section as its notes, cut at an
+  entry's start, with a link to the whole section, when it's longer than
+  120,000 characters, under GitHub's limit of 125,000. The check,
+  `node scripts/pack-installs-alone.mjs`, packs the release and installs
+  the tarball alone into an empty directory with its dependencies from
+  npm. The install is linked, so each package reaches only the
+  dependencies it declares. It then checks the installed package, as the
+  script's header lists. To run it by hand, run `npm run build` first,
+  for example before `git push --follow-tags`, or dispatch the workflow on
+  a branch, where it publishes nothing. The two
   release jobs are independent: some consumers run github-clone checkouts,
   so release notes must exist even when npm publish fails. Both need the
   build job, so a failed build stops both; past it, so do a tag with no

@@ -19,9 +19,19 @@ import assert from 'node:assert/strict';
 import { fixture, TS } from './helpers/coalescing-fixture.js';
 import { RefusalLines } from '../src/mcpl/refusal-lines.js';
 import { NON_STRING_TEXT_PLACEHOLDER } from '../src/mcpl/visible-content.js';
+import {
+  AUDIO_NO_DATA_TEXT,
+  AUDIO_NO_MEDIA_TYPE_TEXT,
+  IMAGE_NO_DATA_TEXT,
+  IMAGE_NO_MEDIA_TYPE_TEXT,
+  REFERENCE_NO_LINK_TEXT,
+} from '../src/mcpl/references.js';
 import { HookOrchestrator } from '../src/mcpl/hook-orchestrator.js';
 import { CapabilityGrant } from '../src/mcpl/capability-grant.js';
 import { logDetail, logValue } from '../src/mcpl/log-value.js';
+
+/** What every lane shows for a block whose type isn't a string. */
+const NO_TYPE = '[Content not shown: a part arrived with no type.]';
 
 /** Base64 for an image well over 1 MiB once serialized (a Retina screenshot). */
 const BIG_IMAGE = { type: 'image', data: 'A'.repeat(1_600_000), mimeType: 'image/png' };
@@ -243,13 +253,13 @@ test('a block whose type, text or source isn\'t a string converts on both lanes,
   // mimeType and uri also takes an array, a number and null.
   const odd = (marker: string) => [{ toString: 1 }, [marker], 424242, null];
   const malformed: Array<{ content: unknown[]; shows: string }> = [
-    { content: [{ type: { toString: 1 } }], shows: '[unrecognized content block: untyped]' },
-    { content: [{ type: 7 }], shows: '[unrecognized content block: untyped]' },
-    ...odd('array_data').map((data) => ({ content: [{ type: 'image', data, mimeType: 'image/png' }], shows: '[Image: no data]' })),
-    ...odd('array_uri').map((uri) => ({ content: [{ type: 'image', uri }], shows: '[Image: no data]' })),
+    { content: [{ type: { toString: 1 } }], shows: NO_TYPE },
+    { content: [{ type: 7 }], shows: NO_TYPE },
+    ...odd('array_data').map((data) => ({ content: [{ type: 'image', data, mimeType: 'image/png' }], shows: IMAGE_NO_DATA_TEXT })),
+    ...odd('array_uri').map((uri) => ({ content: [{ type: 'image', uri }], shows: IMAGE_NO_DATA_TEXT })),
     // Data whose media type is unusable is named as such, not as no data.
-    ...odd('array_mime').map((mimeType) => ({ content: [{ type: 'image', data: 'AAAA', mimeType }], shows: '[Image: no media type]' })),
-    ...odd('array_mime').map((mimeType) => ({ content: [{ type: 'audio', data: 'AAAA', mimeType }], shows: '[Audio: no media type]' })),
+    ...odd('array_mime').map((mimeType) => ({ content: [{ type: 'image', data: 'AAAA', mimeType }], shows: IMAGE_NO_MEDIA_TYPE_TEXT })),
+    ...odd('array_mime').map((mimeType) => ({ content: [{ type: 'audio', data: 'AAAA', mimeType }], shows: AUDIO_NO_MEDIA_TYPE_TEXT })),
     // A text block whose text isn't a string shows as its placeholder, so the
     // agent reads that a block was there; the text beside it shows as itself.
     ...odd('array_text').map((text, i) => ({
@@ -257,10 +267,10 @@ test('a block whose type, text or source isn\'t a string converts on both lanes,
     })),
     // Reference-shaped: a uri that isn't a non-empty string never makes a
     // reference, with a disposition or without.
-    { content: [{ type: 'resource', uri: 424242 }], shows: '[unrecognized content block: reference without string uri]' },
-    { content: [{ type: 'image', uri: 424242, disposition: 'ref' }], shows: '[Image: no data]' },
-    { content: [{ type: 'image', uri: '', disposition: 'ref' }], shows: '[Image: no data]' },
-    { content: [{ type: 'audio', uri: { toString: 1 }, disposition: 'ref' }], shows: '[Audio: no data]' },
+    { content: [{ type: 'resource', uri: 424242 }], shows: REFERENCE_NO_LINK_TEXT },
+    { content: [{ type: 'image', uri: 424242, disposition: 'ref' }], shows: IMAGE_NO_DATA_TEXT },
+    { content: [{ type: 'image', uri: '', disposition: 'ref' }], shows: IMAGE_NO_DATA_TEXT },
+    { content: [{ type: 'audio', uri: { toString: 1 }, disposition: 'ref' }], shows: AUDIO_NO_DATA_TEXT },
   ];
   const messages: unknown[] = malformed.flatMap(({ content }, i) => [
     { ...f.channel(`e${i}`, '', { initial: true }, 'chat', `coalesced${i}`), content },
@@ -340,7 +350,10 @@ test('content whose blocks aren\'t objects, or whose block of another type carri
   f.alwaysRespond();
   // Only a text block shown as the non-string text placeholder counts as
   // nothing; any other placeholder still counts as something.
-  for (const [i, content, shows] of [[0, [424242], 'untyped'], [1, [{ type: 'video', text: 5 }], 'video']] as const) {
+  for (const [i, content, shows] of [
+    [0, [424242], "[Content not shown: a part arrived in a form this host can't read.]"],
+    [1, [{ type: 'video', text: 5 }], `[Content not shown: this host can't display "video" content.]`],
+  ] as const) {
     const r = await f.send('channels/incoming', { messages: [
       { channelId: 'chat', messageId: `plain${i}`, timestamp: TS, author: { id: 'u', name: 'User' }, content },
     ] });
@@ -350,7 +363,7 @@ test('content whose blocks aren\'t objects, or whose block of another type carri
     assert.equal(plain.error, undefined);
     assert.equal(plain.result.accepted, true);
     await f.framework.runUntilIdle();
-    assert.equal(occurrences(f.context(), JSON.stringify(`[unrecognized content block: ${shows}]`)), 2);
+    assert.equal(occurrences(f.context(), JSON.stringify(shows)), 2);
   }
 });
 
@@ -369,7 +382,7 @@ test('a context injection\'s text block whose text isn\'t a string shows as the 
   const hooks = new HookOrchestrator({ getAllServers: () => [server] } as never, { validateInbound: () => {} } as never);
   const injections = await hooks.beforeInference({} as never);
   // The words themselves, which every other test takes from the constant.
-  const placeholder = "[Text not shown: the server's text block had no string text.]";
+  const placeholder = '[Text not shown: a text part arrived without readable text.]';
   assert.equal(NON_STRING_TEXT_PLACEHOLDER, placeholder);
   assert.deepEqual(injections.map((injection) => injection.content), [
     [{ type: 'text', text: placeholder }, { type: 'text', text: 'injected_text' }],
@@ -408,9 +421,9 @@ test('a malformed block in one server\'s injection shows as its placeholder, as 
   const injections = await hooks.beforeInference({} as never);
   assert.deepEqual(injections.map((injection) => injection.content), [
     [
-      { type: 'text', text: '[unrecognized content block: untyped]' },
-      { type: 'text', text: '[Image: no data]' },
-      { type: 'text', text: '[Audio: no data]' },
+      { type: 'text', text: NO_TYPE },
+      { type: 'text', text: IMAGE_NO_DATA_TEXT },
+      { type: 'text', text: AUDIO_NO_DATA_TEXT },
     ],
     [{ type: 'text', text: 'good_text' }],
   ]);
@@ -570,7 +583,7 @@ test('an inference filter reads the text conversion stores, a placeholder includ
   // doesn't handle, each of which converts to its placeholder; and visible
   // text.
   const content = [{ type: 'text', text: { toString: 1 } }, { type: 'video', uri: 'https://example.invalid/v.mp4' }, { type: 'text', text: 'visible_text' }];
-  const shown = `${NON_STRING_TEXT_PLACEHOLDER}\n[unrecognized content block: video]\nvisible_text`;
+  const shown = `${NON_STRING_TEXT_PLACEHOLDER}\n[Content not shown: this host can't display "video" content.]\nvisible_text`;
   const r = await f.send('channels/incoming', { messages: [
     { ...f.channel('e1', '', { initial: true }, 'chat', 'coalesced'), content },
     { channelId: 'chat', messageId: 'plain', timestamp: TS, author: { id: 'u', name: 'User' }, content },

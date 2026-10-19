@@ -59,23 +59,25 @@ function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise
 // ============================================================================
 
 /**
- * Convert MCPL injection content (string shorthand or block array) to membrane ContentBlock[].
+ * Convert MCPL injection content (string shorthand or block array), from the
+ * server `serverId`, to membrane ContentBlock[].
  */
-function convertContent(content: string | McplContentBlock[]): ContentBlock[] {
+function convertContent(content: string | McplContentBlock[], serverId: string): ContentBlock[] {
   if (typeof content === 'string') {
     return [{ type: 'text', text: content }];
   }
-  return content.map((block) => convertBlock(block, 'attachment on context injection'));
+  return content.map((block) => convertBlock(block, 'attachment on context injection', serverId));
 }
 
 /**
- * Convert an MCPL wire-format context injection to a context-manager ContextInjection.
+ * Convert an MCPL wire-format context injection, from the server `serverId`,
+ * to a context-manager ContextInjection.
  */
-function convertMcplInjection(mcplInj: McplContextInjection): ContextInjection {
+function convertMcplInjection(mcplInj: McplContextInjection, serverId: string): ContextInjection {
   return {
     namespace: mcplInj.namespace,
     position: mcplInj.position,
-    content: convertContent(mcplInj.content),
+    content: convertContent(mcplInj.content, serverId),
     metadata: mcplInj.metadata,
   };
 }
@@ -225,7 +227,7 @@ export class HookOrchestrator {
             continue;
           }
           if (typeof mcplInj.namespace !== 'string') this.readNamespace(server.id, mcplInj.namespace);
-          const injection = convertMcplInjection(mcplInj);
+          const injection = convertMcplInjection(mcplInj, server.id);
           if (injection.position === 'system') this.noteBlocksNotShown(server.id, mcplInj.namespace, injection.content);
           injections.push(injection);
         } catch (error) {

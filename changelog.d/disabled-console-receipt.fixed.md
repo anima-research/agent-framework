@@ -1,0 +1,1 @@
+- Under `proseRouting: "disabled"`, the turn-end receipt now reads `[delivered] plain speech → no channel — N plain-speech segment(s) kept in the transcript (…)` instead of `[delivered] nothing — N plain-speech segment(s) suppressed (…)`, which read to a resident talking with its operator through a console or Web UI as if its replies had reached no one (#225).

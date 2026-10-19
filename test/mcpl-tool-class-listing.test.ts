@@ -51,6 +51,8 @@ test('listMcplServers: nested prefixes attribute each tool to one server, the on
     ['nested', { id: 'nested', command: 'node', toolPrefix: 'foo--bar' }],
   ]);
   framework.mcplServerRegistry = { getServer: () => connection };
+  // Configuration refuses this pair since #265 (prefixesMeet). It's built
+  // here directly, to pin that attribution follows the listing, not a prefix.
   // The shorter prefix is registered first: insertion order must not decide.
   framework.mcplPrefixMap = new Map([['foo', 'foo'], ['foo--bar', 'nested']]);
   framework.mcplTools = [{ name: 'foo--ping' }, { name: 'foo--bar--baz' }, { name: 'foo--bar--qux' }];

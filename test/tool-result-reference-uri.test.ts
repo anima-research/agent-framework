@@ -11,6 +11,7 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { AgentFramework } from '../src/index.js';
+import type { ScriptToolResult } from '../src/index.js';
 import type { Module, ModuleContext, ToolCall, ToolResult, ToolDefinition } from '../src/types/index.js';
 import { nonErrorResultText, toolResultDataToHistoryString } from '../src/tool-result-history.js';
 import { parseImagePlaceholders } from '../src/tool-image-ledger.js';
@@ -24,7 +25,7 @@ const RESOURCE = { type: 'resource', uri: URI, mimeType: 'application/pdf', name
 const UNKNOWN = { type: 'zz-unknown', note: 'zz-kept' };
 const STUB = /\[ref_[^\]]+\] zz\.pdf — application\/pdf — from tool result/;
 const BASE64 = 'aGVsbG8gd29ybGQgaGVsbG8gd29ybGQ=';
-const WITHHELD = '[inline content withheld: inline data that also claims a uri or a bulk disposition]';
+const WITHHELD = '[Content not shown: its inline data arrived marked as a reference too, so this host withheld it.]';
 
 function parsed(text: string): unknown {
   return JSON.parse(text);
@@ -77,11 +78,11 @@ describe('data the serializer doesn\'t read as content blocks', () => {
 
   it('withholds what the reference lanes withhold, saying why', () => {
     const notAString = parsed(toolResultDataToHistoryString([UNKNOWN, { type: 'resource', uri: { sig: SIGNATURE } }])) as [unknown, string];
-    assert.equal(notAString[1], '[unrecognized content block: reference without string uri]');
+    assert.equal(notAString[1], '[Reference not shown: it arrived without a link.]');
     const tooLong = parsed(toolResultDataToHistoryString([UNKNOWN, { type: 'resource', uri: `${URI}${'x'.repeat(5000)}` }])) as [unknown, string];
-    assert.equal(tooLong[1], '[unrecognized content block: uri exceeds schema maximum]');
+    assert.equal(tooLong[1], '[Reference not shown: its link is longer than this host accepts.]');
     const objectUri = parsed(toolResultDataToHistoryString([UNKNOWN, { type: 'image', uri: { href: URI } }])) as [unknown, string];
-    assert.equal(objectUri[1], "[unrecognized content block: image block whose uri isn't a string]");
+    assert.equal(objectUri[1], '[Image not shown: it arrived with no usable data or link.]');
     const smuggled = toolResultDataToHistoryString([UNKNOWN, { type: 'image', data: BASE64, mimeType: 'image/png', uri: URI }]);
     assert.ok(!smuggled.includes(SIGNATURE) && !smuggled.includes(BASE64), smuggled);
     assert.deepEqual(parsed(smuggled), [UNKNOWN, WITHHELD]);
@@ -145,7 +146,7 @@ describe('data the serializer doesn\'t read as content blocks', () => {
 
   it("governs MCP's embedded resource, whose uri sits under resource, at any depth", () => {
     const embedded = { type: 'resource', resource: { uri: URI, mimeType: 'application/pdf', blob: BASE64 } };
-    const line = '[unrecognized content block: reference without string uri]';
+    const line = '[Reference not shown: it arrived without a link.]';
     const nested = toolResultDataToHistoryString({ result: { content: [embedded] } });
     assert.ok(!nested.includes(SIGNATURE) && !nested.includes(BASE64), nested);
     assert.deepEqual(parsed(nested), { result: { content: [line] } });
@@ -156,18 +157,18 @@ describe('data the serializer doesn\'t read as content blocks', () => {
     assert.equal(toolResultDataToHistoryString([{ type: 'text', text: 'zz-text' }, embedded]), `zz-text\n${line}`);
   });
 
-  it('governs media given a uri that is not a string, failing closed and saying which', () => {
+  it('governs media given a uri that is not a string, failing closed as the push lane does', () => {
     const text = toolResultDataToHistoryString({
       numeric: { type: 'image', uri: 42, name: 'zz-n' },
       both: { type: 'audio', data: [4, 5], uri: 43 },
     });
     assert.ok(!text.includes('4,5'), text);
     assert.deepEqual(parsed(text), {
-      numeric: "[unrecognized content block: image block whose uri isn't a string]",
-      both: "[unrecognized content block: audio block whose data and uri aren't strings]",
+      numeric: '[Image not shown: it arrived with no usable data or link.]',
+      both: '[Audio not shown: it arrived with no usable inline data.]',
     });
-    // In the lanes, a media block with neither keeps the line it had.
-    assert.deepEqual(classifyBlock({ type: 'image' }), { kind: 'invalid', reason: 'image block with neither data nor uri' });
+    // A media block with neither reads as it does with fields that aren't strings.
+    assert.deepEqual(classifyBlock({ type: 'image' }), { kind: 'invalid', shown: '[Image not shown: it arrived with no usable data or link.]' });
   });
 
   it("leaves a nested reference's stub out of save_recent_image's inventory, as main left the reference", () => {
@@ -308,14 +309,14 @@ describe('a model\'s call answered with such data', () => {
 describe('a script given such data', () => {
   type ScriptFramework = {
     dispatchScriptToolCall: (...args: unknown[]) => Promise<ToolResult>;
-    handleScriptToolCall(agentName: string, toolName: string, args: Record<string, unknown>): Promise<string>;
+    handleScriptToolCall(agentName: string, toolName: string, args: Record<string, unknown>): Promise<ScriptToolResult>;
   };
 
   it('gets the text history stores, with each reference as its stub and the rest as JSON writes it', async () => {
     const fw = Object.create(AgentFramework.prototype) as ScriptFramework;
     const shot = { type: 'image', data: BASE64, mimeType: 'image/png' };
     fw.dispatchScriptToolCall = async () => ({ success: true, data: { file: RESOURCE, shot, page: 2 } });
-    const text = await fw.handleScriptToolCall('zz-agent', 'zz_tool', {});
+    const { text } = await fw.handleScriptToolCall('zz-agent', 'zz_tool', {});
     assert.ok(!text.includes(SIGNATURE), text);
     const result = parsed(text) as { file: string; shot: unknown; page: number };
     assert.match(result.file, STUB);
@@ -331,12 +332,12 @@ describe('a script given such data', () => {
     console.error = (...args: unknown[]) => { logged.push(args.map(String).join(' ')); };
     let text: string;
     try {
-      text = await fw.handleScriptToolCall('zz-agent', 'zz_tool', {});
+      ({ text } = await fw.handleScriptToolCall('zz-agent', 'zz_tool', {}));
     } finally {
       console.error = error;
     }
     assert.ok(!text.includes(SIGNATURE), text);
     assert.match(text, /^zz-text\n\[ref_[^\]]+\] zz\.pdf — application\/pdf — from tool result/);
-    assert.ok(logged.some((line) => /\[rfc005\] script-demand fetch of ref_\S+ failed: reference unbound: no server is recorded to fetch it from/.test(line)), logged.join('\n'));
+    assert.ok(logged.some((line) => /\[rfc005\] script-demand fetch of ref_\S+ failed: it's not tied to any server, so there's nowhere to fetch it from$/.test(line)), logged.join('\n'));
   });
 });

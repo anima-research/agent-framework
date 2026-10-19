@@ -145,6 +145,13 @@ for (const inheritEnv of [false, true]) {
   });
 }
 
+test('win32: USERNAME passes, as USER and LOGNAME do on POSIX', () => {
+  const env = buildChildEnv({}, {
+    USERNAME: 'ada', USERDOMAIN: 'HOUSE', SystemRoot: 'C:\\Windows', OpenAI_Api_Key: 'host-secret',
+  }, 'win32');
+  assert.deepEqual(env, { USERNAME: 'ada', SystemRoot: 'C:\\Windows' });
+});
+
 test('win32: operating allowlist matches native mixed-case spellings', () => {
   const env = buildChildEnv({}, {
     Path: 'C:\\Windows', SystemRoot: 'C:\\Windows', ComSpec: 'C:\\Windows\\System32\\cmd.exe',

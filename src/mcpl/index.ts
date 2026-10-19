@@ -106,9 +106,22 @@ export {
 } from './errors.js';
 
 // Server connection and registry
-export { McplServerConnection } from './server-connection.js';
+export { McplServerConnection, McplRequestError, McplProtocolVersionError, McplUnreapedLaunchError } from './server-connection.js';
 export type { McplConnectionCloseInfo } from './server-connection.js';
 export type { TransportCloseInfo } from './transport.js';
+export { ModernMcpConnection } from './modern-connection.js';
+export type { ModernToolCallResult } from './modern-connection.js';
+export {
+  LEGACY_MCP_PROTOCOL_VERSION,
+  MODERN_MCP_PROTOCOL_VERSION,
+  MAX_TIMER_MS,
+  mcplPolicyGrants,
+  resolveServerBinding,
+  serverConfigProblems,
+  serverConfigWarnings,
+  checkServerConfig,
+} from './protocol-family.js';
+export type { McpProtocolFamily, McpTransportKind, ServerBinding } from './protocol-family.js';
 export { McplServerRegistry, type McplCapabilityQuery } from './server-registry.js';
 
 // Feature set management (permission layer)
@@ -158,6 +171,15 @@ export { InferenceRouter } from './inference-router.js';
 
 // Channel registry (channel lifecycle, incoming messages, synthesized tools)
 export { ChannelRegistry } from './channel-registry.js';
+
+// Inbound source envelope: where each accepted item came from, stamped once
+export { INBOUND_SOURCE_KEY, readInboundSource, conversationKey } from './inbound-source.js';
+export type {
+  InboundSource,
+  InboundChannelSource,
+  InboundUnscopedSource,
+  InboundSurfaceSource,
+} from './inbound-source.js';
 
 // Per-channel conversation routing (fork-per-channel agents)
 /** @deprecated Per-channel conversation routing is deprecated and will be removed (anima-research/agent-framework#235). */

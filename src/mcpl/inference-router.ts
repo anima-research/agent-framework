@@ -37,6 +37,9 @@ interface Responder {
   respondError(code: number, message: string, data?: unknown): void;
   /** The JSON-RPC request ID, used for streaming chunk correlation. */
   requestId?: string | number;
+  /** Sends a streamed chunk on the transport the request came on, as its
+   *  answer is sent. */
+  sendChunk?(params: InferenceChunkParams): void;
 }
 
 // ============================================================================
@@ -178,7 +181,6 @@ export class InferenceRouter {
   private featureSetManager: FeatureSetManager;
   private routingPolicy: InferenceRoutingPolicy | null;
   private emitTraceFn: (event: { type: string; [key: string]: unknown }) => void;
-  private sendChunkFn?: (serverId: string, params: InferenceChunkParams) => void;
 
   constructor(
     membrane: Membrane,
@@ -186,14 +188,12 @@ export class InferenceRouter {
     featureSetManager: FeatureSetManager,
     routingPolicy: InferenceRoutingPolicy | null,
     emitTraceFn: (event: { type: string; [key: string]: unknown }) => void,
-    sendChunkFn?: (serverId: string, params: InferenceChunkParams) => void,
   ) {
     this.membrane = membrane;
     this.hookOrchestrator = hookOrchestrator;
     this.featureSetManager = featureSetManager;
     this.routingPolicy = routingPolicy;
     this.emitTraceFn = emitTraceFn;
-    this.sendChunkFn = sendChunkFn;
   }
 
   /**
@@ -265,14 +265,15 @@ export class InferenceRouter {
 
     // Streaming needs a way to send chunks and an id to tag them with;
     // without either, the request is answered whole.
-    const chunkRequestId = params.stream && this.sendChunkFn ? responder.requestId : undefined;
+    const sendChunk = params.stream ? responder.sendChunk?.bind(responder) : undefined;
+    const chunkRequestId = sendChunk ? responder.requestId : undefined;
     const streamed = chunkRequestId != null;
 
     try {
       // 5. Run inference. Both modes end in membrane's response, and one
       // builder makes the result from it.
       const response = chunkRequestId != null
-        ? await this.streamResponse(serverId, request, chunkRequestId)
+        ? await this.streamResponse(request, chunkRequestId, sendChunk!)
         : await this.membrane.complete(request);
 
       // 6. Answer
@@ -375,9 +376,9 @@ export class InferenceRouter {
    * so nothing keeps running once the request is answered.
    */
   private async streamResponse(
-    serverId: string,
     request: NormalizedRequest,
     requestId: string | number,
+    sendChunk: (params: InferenceChunkParams) => void,
   ): Promise<NormalizedResponse> {
     const stream = this.membrane.streamYielding(request);
     let index = 0;
@@ -392,7 +393,7 @@ export class InferenceRouter {
           // naming a tag the stream parser opens a block for, or a thinking
           // block cut off before its close tag.
           if (event.meta.visible) {
-            this.sendChunkFn!(serverId, { requestId, index: index++, delta: event.content });
+            sendChunk({ requestId, index: index++, delta: event.content });
           }
           break;
         case 'tool-calls':

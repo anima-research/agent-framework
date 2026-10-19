@@ -4,9 +4,9 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { NormalizedRequest, StreamEvent, YieldingStream } from '@animalabs/membrane';
-import type { TraceEvent } from '../src/index.js';
+import type { EventResponse, Module, ProcessEvent, ToolDefinition, ToolResult, TraceEvent } from '../src/index.js';
 import { AgentFramework } from '../src/index.js';
-import { MockMembrane } from './helpers/mock-membrane.js';
+import { createMockResponse, MockMembrane, MockYieldingStream } from './helpers/mock-membrane.js';
 
 /**
  * A cancel that the stream reports as `error` is still a deliberate stop.
@@ -50,6 +50,27 @@ class SilentlyEndingOnCancelStream extends ErroringOnCancelStream {
   }
 }
 
+/** Parks until cancel(), then its iterator throws — the fourth shape: an
+ *  implementation whose cancel() surfaces as the iterator's own rejection. */
+class ThrowingOnCancelStream extends ErroringOnCancelStream {
+  override async *[Symbol.asyncIterator](): AsyncIterator<StreamEvent> {
+    const self = this as unknown as { cancelled: boolean; release: () => void };
+    if (!self.cancelled) await new Promise<void>((resolve) => { self.release = resolve; });
+    throw new Error('The operation was aborted');
+  }
+}
+
+/** Parks until cancel(), reports the cancel as an error event, and then its
+ *  iterator throws: the stream's end comes once, with the error event. */
+class ErroringThenThrowingOnCancelStream extends ErroringOnCancelStream {
+  override async *[Symbol.asyncIterator](): AsyncIterator<StreamEvent> {
+    const self = this as unknown as { cancelled: boolean; release: () => void };
+    if (!self.cancelled) await new Promise<void>((resolve) => { self.release = resolve; });
+    yield { type: 'error', error: new Error('stream cancelled') } as StreamEvent;
+    throw new Error('The operation was aborted');
+  }
+}
+
 /** Fails spontaneously — the genuine provider error the failure pipeline is for. */
 class SpontaneouslyErroringStream extends ErroringOnCancelStream {
   override async *[Symbol.asyncIterator](): AsyncIterator<StreamEvent> {
@@ -85,6 +106,14 @@ async function boot(prefix: string, make: () => YieldingStream) {
   });
   const traces: TraceEvent[] = [];
   framework.onTrace((t) => { traces.push(t); });
+  // Each stream's §10.5 lifecycle notifications, as an MCPL server with the
+  // grant would get them: 'started', then its terminal phase as it ends.
+  const lifecycle: string[] = [];
+  (framework as unknown as { hookOrchestrator: unknown }).hookOrchestrator = {
+    beforeInference: async () => [],
+    emitLifecycle: (params: { phase: string }) => { lifecycle.push(params.phase); },
+  };
+  const terminals = (): string[] => lifecycle.filter((phase) => phase !== 'started');
   const teardown = async () => {
     await framework.stop();
     rmSync(tempDir, { recursive: true, force: true });
@@ -108,7 +137,7 @@ async function boot(prefix: string, make: () => YieldingStream) {
     });
     throw error;
   });
-  return { framework, membrane, agent, traces, teardown };
+  return { framework, membrane, agent, traces, teardown, terminals };
 }
 
 function contextTexts(framework: AgentFramework): string[] {
@@ -208,6 +237,52 @@ describe('a cancel that the stream reports as `error` is still a deliberate stop
     }
   });
 
+  it('a cancel whose stream throws still ends as a deliberate stop', async (t) => {
+    // A stream whose iterator rejects once it's cancelled: the caller's
+    // cancel decides there too, before the failure path, and the throw is
+    // said on the console.
+    const errors: string[] = [];
+    t.mock.method(console, 'error', (...args: unknown[]) => { errors.push(args.map(String).join(' ')); });
+    const { framework, membrane, agent, traces, teardown, terminals } = await boot('cancel-throw-', () => new ThrowingOnCancelStream());
+    try {
+      framework.abortInference('assistant', 'thrown_stop');
+      // The stream's frame has ended once its terminal lifecycle phase is out.
+      await waitFor(() => terminals().length > 0);
+      assert.deepEqual(types(traces, 'inference:aborted', 'inference:failed', 'inference:exhausted'), ['inference:aborted'],
+        `terminals: ${JSON.stringify(types(traces, 'inference:aborted', 'inference:failed', 'inference:exhausted'))}`);
+      const aborted = traces.find((t) => t.type === 'inference:aborted') as { reason?: string };
+      assert.equal(aborted.reason, 'thrown_stop', 'the caller\'s reason rides the terminal');
+      assert.equal(agent.state.status, 'idle');
+      assert.equal(membrane.calls.length, 1, 'no retry of the inference that was stopped');
+      assert.ok(contextTexts(framework).some((t) => t.startsWith('[turn-interrupted]')), 'the neutral marker is written');
+      assert.ok(!contextTexts(framework).some((t) => t.startsWith('[inference-failed]')), 'and no failure note');
+      assert.deepEqual(terminals(), ['aborted'], "the stream's §10.5 terminal is `aborted`");
+      assert.ok(errors.some((line) => line.includes("the stream threw after a caller's stop (thrown_stop)") && line.includes('The operation was aborted')),
+        `the throw is said: ${JSON.stringify(errors)}`);
+    } finally {
+      await teardown();
+    }
+  });
+
+  it('a cancel whose stream reports an error and then throws ends once, as a deliberate stop', async () => {
+    // The error event is the stream's end; a throw after it isn't a second one.
+    const { framework, membrane, traces, teardown, terminals } = await boot('cancel-error-throw-', () => new ErroringThenThrowingOnCancelStream());
+    try {
+      framework.abortInference('assistant', 'error_then_throw');
+      // Once the stream's frame has ended, a throw it reached has already
+      // ended the turn a second time, as a failure.
+      await waitFor(() => terminals().length > 0);
+      assert.deepEqual(types(traces, 'inference:aborted', 'inference:failed', 'inference:exhausted'), ['inference:aborted'],
+        `terminals: ${JSON.stringify(types(traces, 'inference:aborted', 'inference:failed', 'inference:exhausted'))}`);
+      assert.equal(membrane.calls.length, 1, 'no retry of the inference that was stopped');
+      assert.ok(contextTexts(framework).some((t) => t.startsWith('[turn-interrupted]')), 'the neutral marker is written');
+      assert.ok(!contextTexts(framework).some((t) => t.startsWith('[inference-failed]')), 'and no failure note');
+      assert.deepEqual(terminals(), ['aborted'], "the stream's §10.5 terminal is `aborted`");
+    } finally {
+      await teardown();
+    }
+  });
+
   it('the reason of a cancel is consumed by the stream it ended, never by the next one', async () => {
     // A cancel whose stream reports NO terminal event at all (iterator just
     // ends) is collected at that stream's loop end — one inference:aborted,
@@ -256,6 +331,301 @@ describe("the stream's own word decides before a caller's record", () => {
       assert.ok(!types(traces, 'inference:aborted').length, `not a deliberate stop: ${JSON.stringify(types(traces, 'inference:aborted', 'inference:failed', 'inference:exhausted'))}`);
       assert.ok(types(traces, 'inference:exhausted').length > 0, 'the failure pipeline ends it');
       assert.ok(!contextTexts(framework).some((t) => t.startsWith('[turn-interrupted]')), 'no deliberate-stop marker');
+    } finally {
+      await teardown();
+    }
+  });
+});
+
+// endTurn and a budget restart cancel the stream themselves, at a tool
+// boundary, and mark it first. However the stream reports that cancel, as
+// `aborted`, as an `error`, by just closing, or by throwing, it ends as the
+// endTurn or the restart: not through the failure pipeline and never retried, an endTurn
+// with its delivery receipt, and a restart with its gate window kept for the
+// stream that follows.
+
+type CancelReport = 'aborted' | 'error' | 'close' | 'throw' | 'error-then-throw';
+
+/** One scripted response per stream; the first stream reports its cancel()
+ *  as `aborted` (as membrane's yielding stream does), as an `error` event, by
+ *  ending with no event at all, by its iterator throwing once it ends, or as
+ *  an `error` event after which its iterator throws. */
+class FirstStreamCancelledAs extends MockMembrane {
+  private next = 0;
+  /** Awaited before the second stream yields anything. */
+  beforeSecondStream: (() => Promise<void>) | undefined;
+  constructor(private readonly reports: CancelReport) { super(); }
+  override streamYielding(request: NormalizedRequest): YieldingStream {
+    this.calls.push(request);
+    const stream = new MockYieldingStream(this.responses.slice(this.next, ++this.next));
+    if (this.calls.length === 2 && this.beforeSecondStream !== undefined) {
+      const before = this.beforeSecondStream;
+      const events = MockYieldingStream.prototype[Symbol.asyncIterator].bind(stream);
+      (stream as unknown as { [Symbol.asyncIterator]: () => AsyncIterator<StreamEvent> })[Symbol.asyncIterator] = async function* () {
+        await before();
+        for await (const event of { [Symbol.asyncIterator]: events } as AsyncIterable<StreamEvent>) yield event;
+      };
+    }
+    if (this.calls.length === 1 && this.reports !== 'aborted') {
+      const reports = this.reports;
+      let cancelled = false;
+      const s = stream as unknown as {
+        cancel: () => void; _done: boolean; events: StreamEvent[]; pendingResolve: null | (() => void);
+        [Symbol.asyncIterator]: () => AsyncIterator<StreamEvent>;
+      };
+      if (reports === 'throw' || reports === 'error-then-throw') {
+        const events = MockYieldingStream.prototype[Symbol.asyncIterator].bind(stream);
+        s[Symbol.asyncIterator] = async function* () {
+          for await (const event of { [Symbol.asyncIterator]: events } as AsyncIterable<StreamEvent>) yield event;
+          if (cancelled) throw new Error('The operation was aborted');
+        };
+      }
+      s.cancel = function (this: typeof s) {
+        cancelled = true;
+        this._done = true;
+        if (reports === 'error' || reports === 'error-then-throw') this.events.push({ type: 'error', error: new Error('stream cancelled') } as StreamEvent);
+        const resolve = this.pendingResolve;
+        this.pendingResolve = null;
+        resolve?.();
+      };
+    }
+    this.lastStream = stream;
+    return stream;
+  }
+}
+
+/** `end` ends the turn; `fetch` returns a result large enough that the next
+ *  round would pass the physical window, so the framework restarts. */
+class TurnTools implements Module {
+  readonly name = 'turn';
+  async start(): Promise<void> {}
+  async stop(): Promise<void> {}
+  getTools(): ToolDefinition[] {
+    return [
+      { name: 'end', description: 'Finish the turn', inputSchema: { type: 'object', properties: {} } },
+      { name: 'fetch', description: 'A large result', inputSchema: { type: 'object', properties: {} } },
+    ];
+  }
+  async handleToolCall(call: { name: string }): Promise<ToolResult> {
+    if (call.name === 'end' || call.name.endsWith('--end')) return { success: true, data: { finished: true }, endTurn: true };
+    return { success: true, data: { blob: 'x'.repeat(30_000) } };
+  }
+  async onProcess(event: ProcessEvent): Promise<EventResponse> {
+    if (event.type === 'external-message') {
+      return {
+        addMessages: [{ participant: 'User', content: (event as { content: unknown }).content as never }],
+        requestInference: true,
+      };
+    }
+    return {};
+  }
+}
+
+async function toolTurn(tool: 'end' | 'fetch', reports: CancelReport) {
+  const tempDir = mkdtempSync(join(tmpdir(), `cancel-error-${tool}-`));
+  const membrane = new FirstStreamCancelledAs(reports);
+  const call = createMockResponse([
+    { type: 'text', text: 'Working…' },
+    { type: 'tool_use', id: 'call_1', name: `turn--${tool}`, input: {} },
+  ], 'tool_use');
+  // A near-cap real prompt (5k fresh + 195k cache-read), as
+  // physical-window-restart.test.ts uses, so `fetch`'s round restarts.
+  if (tool === 'fetch') (call as { usage: unknown }).usage = { inputTokens: 5_000, outputTokens: 5, cacheReadTokens: 195_000 };
+  membrane.pushResponse(call);
+  membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Recovered final answer' }]));
+  const framework = await AgentFramework.create({
+    storePath: join(tempDir, 'store'),
+    membrane: membrane.asMembrane(),
+    agents: [{
+      name: 'assistant',
+      model: 'test-model',
+      systemPrompt: 'Assist.',
+      allowedTools: 'all',
+      maxTokens: 4_000,
+      ...(tool === 'fetch' ? { physicalWindowTokens: 200_000 } : {}),
+    }],
+    modules: [new TurnTools()],
+    syncIntervalMs: 0,
+    // An event gate, so the test can see when the agent's inference window
+    // ends.
+    gate: { config: { policies: [], default: 'always' } },
+  }).catch((error: unknown) => {
+    rmSync(tempDir, { recursive: true, force: true });
+    throw error;
+  });
+  const teardown = async () => {
+    try {
+      await framework.stop();
+    } finally {
+      console.error = consoleError;
+      rmSync(tempDir, { recursive: true, force: true });
+    }
+  };
+  const traces: TraceEvent[] = [];
+  framework.onTrace((t) => { traces.push(t); });
+  const internals = framework as unknown as {
+    eventGate: { onInferenceEnded(name: string): void; inferenceDiagnostics(): { inferring: string[] } };
+    hookOrchestrator: { beforeInference(params: unknown): Promise<unknown[]>; emitLifecycle(params: { phase: string }): void } | null;
+  };
+  // Each stream's §10.5 lifecycle notifications, as an MCPL server with
+  // the grant would get them: 'started' when it starts, and its terminal
+  // phase when its frame ends.
+  const lifecycle: string[] = [];
+  internals.hookOrchestrator = {
+    beforeInference: async () => [],
+    emitLifecycle: (params) => { lifecycle.push(params.phase); },
+  };
+  // How often the agent's inference window closes: an end while the window
+  // is open. A budget restart's new stream continues the window its turn
+  // opened, taking it again if it closed in between (onInferenceResumed),
+  // so a kept window closes once, at the new stream's end, and a close
+  // before the new stream takes the window adds one.
+  let windowCloses = 0;
+  const gate = internals.eventGate;
+  const endWindow = gate.onInferenceEnded.bind(gate);
+  gate.onInferenceEnded = (name: string) => {
+    if (name === 'assistant' && gate.inferenceDiagnostics().inferring.includes('assistant')) windowCloses++;
+    endWindow(name);
+  };
+  // A close after the new stream has taken the window leaves the count at
+  // one, so the new stream also waits until the first stream's frame has
+  // ended (its finally ends the window, when it does, right after it emits
+  // its terminal phase) and then sees whether the window is still open.
+  let windowOpenAfterFirstStream: boolean | undefined;
+  if (tool === 'fetch') {
+    membrane.beforeSecondStream = async () => {
+      await waitFor(() => lifecycle.some((phase) => phase !== 'started'), 10_000);
+      await new Promise((resolve) => setImmediate(resolve));
+      windowOpenAfterFirstStream = gate.inferenceDiagnostics().inferring.includes('assistant');
+    };
+  }
+  // Each inference-log entry as the framework writes it: 'ok' for a
+  // success, 'failed' for a failure.
+  const written: string[] = [];
+  const log = framework as unknown as { logInference: (entry: { success?: boolean }) => void };
+  const writeLog = log.logInference.bind(framework);
+  log.logInference = (entry) => {
+    written.push(entry.success === false ? 'failed' : 'ok');
+    writeLog(entry);
+  };
+  // What the framework says on the console, such as a throw it ends as a
+  // cancel: recorded, and still printed, so a failing test shows it.
+  // Restored at teardown.
+  const errors: string[] = [];
+  const consoleError = console.error;
+  console.error = (...args: unknown[]) => { errors.push(args.map(String).join(' ')); consoleError(...args); };
+  // A channel to speak in, so a round's prose is delivered live and the
+  // turn's end writes its delivery receipt. Everything else the framework
+  // asks of the registry is a no-op.
+  const channels: Record<string, unknown> = {
+    resolveLocus: () => 'chan-live',
+    routeSpeech: async (_agent: string, _text: string, locus?: string | null) => (locus ? { delivered: true, channelId: locus } : null),
+    getDefaultPublishChannel: () => null,
+    isChannelOpen: () => true,
+    getDescriptor: () => undefined,
+    getChannelTools: () => [],
+  };
+  (framework as unknown as { channelRegistry: unknown }).channelRegistry = new Proxy(channels, {
+    get: (target, prop: string) => (prop in target ? target[prop] : () => undefined),
+  });
+  try {
+    framework.start();
+    framework.pushEvent({
+      type: 'external-message',
+      source: 'test',
+      content: [{ type: 'text', text: 'go' }],
+      metadata: {},
+      triggerInference: true,
+    } as unknown as ProcessEvent);
+  } catch (error) {
+    await teardown();
+    throw error;
+  }
+  // The terminal phases of the streams whose frames have ended, in order.
+  const terminals = (): string[] => lifecycle.filter((phase) => phase !== 'started');
+  return {
+    framework, membrane, traces, teardown, terminals, errors,
+    logged: () => [...written],
+    windowCloses: () => windowCloses,
+    windowOpenAfterFirstStream: () => windowOpenAfterFirstStream,
+  };
+}
+
+const REPORTED = { aborted: 'as aborted', error: 'as an error', close: 'by just closing', throw: 'by throwing', 'error-then-throw': 'as an error and then by throwing' } as const;
+for (const reports of ['aborted', 'error', 'close', 'throw', 'error-then-throw'] as const) describe(`endTurn and a budget restart over a stream that reports their cancel ${REPORTED[reports]}`, () => {
+  it('an endTurn ends the turn: no failure, nothing starts it again, its delivery receipt is written, and its lifecycle ends `aborted`', async () => {
+    const { framework, membrane, traces, teardown, terminals, errors, logged } = await toolTurn('end', reports);
+    try {
+      // The stream's frame has ended once its terminal lifecycle phase is out,
+      // and anything it queued has run once the framework is idle.
+      await waitFor(() => terminals().length > 0, 10_000);
+      await framework.runUntilIdle();
+      const ends = types(traces, 'inference:aborted', 'inference:failed', 'inference:exhausted');
+      assert.deepEqual(ends, [], `the ended turn is neither a stop nor a failure: ${JSON.stringify(ends)}; inference log: ${JSON.stringify(logged())}`);
+      assert.deepEqual(logged(), ['ok'], 'the inference log holds the boundary\'s own entry, and no failure');
+      assert.ok(!contextTexts(framework).some((t) => t.startsWith('[inference-failed]')), "no failure note in the agent's context");
+      assert.equal(membrane.calls.length, 1, 'nothing starts the ended turn again');
+      assert.deepEqual(contextTexts(framework).filter((t) => t.startsWith('[delivered]')), ['[delivered] plain speech → chan-live'],
+        "the turn's end writes the receipt for the prose its round delivered");
+      assert.deepEqual(terminals(), ['aborted'], "the stream's §10.5 terminal is `aborted`");
+      if (reports === 'throw') {
+        assert.ok(errors.some((line) => line.includes("the stream threw after the framework's cancel (turn_ended)")), `the throw is said: ${JSON.stringify(errors)}`);
+      }
+    } finally {
+      await teardown();
+    }
+  });
+
+  it('a budget restart ends as the restart: no stop, no failure, its gate window kept, its first stream ends `aborted`, and the turn finishes on the new stream', async () => {
+    const { framework, membrane, traces, teardown, terminals, errors, logged, windowCloses, windowOpenAfterFirstStream } = await toolTurn('fetch', reports);
+    try {
+      const answered = () => contextTexts(framework).some((t) => t.includes('Recovered final answer'));
+      // Both streams' frames have ended once both terminal phases are out.
+      await waitFor(() => terminals().length >= 2 || types(traces, 'inference:failed', 'inference:aborted').length > 0, 10_000);
+      const ends = types(traces, 'inference:aborted', 'inference:failed', 'inference:exhausted');
+      assert.equal(types(traces, 'inference:stream_restarted').length, 1, 'the framework restarted the stream');
+      assert.deepEqual(ends, [], `the restarted stream is neither a stop nor a failure: ${JSON.stringify(ends)}; inference log: ${JSON.stringify(logged())}`);
+      assert.deepEqual(logged(), ['ok', 'ok'], "the inference log holds the restart's entry and the new stream's, and no failure");
+      assert.ok(answered(), 'the turn finishes on the new stream');
+      assert.equal(membrane.calls.length, 2, 'the restart opens one stream, and nothing starts the first again');
+      assert.ok(!contextTexts(framework).some((t) => t.startsWith('[turn-interrupted]') || t.startsWith('[inference-failed]')),
+        "no note in the agent's context");
+      assert.equal(windowCloses(), 1, "the window closes once: the first stream's end doesn't close it before the new stream takes it");
+      assert.equal(windowOpenAfterFirstStream(), true, "the window is still open once the first stream's frame has ended, as the new stream runs");
+      assert.deepEqual(terminals(), ['aborted', 'completed'], "the first stream's §10.5 terminal is `aborted`, the new one's `completed`");
+      if (reports === 'throw') {
+        assert.ok(errors.some((line) => line.includes("the stream threw after the framework's cancel (budget_restart)")), `the throw is said: ${JSON.stringify(errors)}`);
+      }
+    } finally {
+      await teardown();
+    }
+  });
+
+  it("a budget restart whose new start fails before its stream exists ends the event gate's window", async () => {
+    // The first stream leaves the window open for the new stream. A new start
+    // that throws before it has a stream, here at its turn checkpoint's store
+    // write, has to end it: left open, every gate event buffers, for every
+    // agent.
+    const { framework, traces, teardown, terminals } = await toolTurn('fetch', reports);
+    const internals = framework as unknown as {
+      recordTurnCheckpoint: (name: string) => void;
+      eventGate: { inferenceDiagnostics(): { inferring: string[] } };
+    };
+    const record = internals.recordTurnCheckpoint.bind(framework);
+    let threw = 0;
+    internals.recordTurnCheckpoint = (name: string) => {
+      if (types(traces, 'inference:stream_restarted').length > 0) {
+        threw++;
+        throw new Error('ENOSPC: no space left on device');
+      }
+      record(name);
+    };
+    try {
+      await waitFor(() => threw > 0 && terminals().length > 0, 10_000);
+      // The failed start's catch runs a few microtasks after the throw.
+      await new Promise((resolve) => setImmediate(resolve));
+      assert.equal(threw, 1, "the restart's new start threw at its checkpoint");
+      assert.deepEqual(internals.eventGate.inferenceDiagnostics().inferring, [], 'no agent is left inferring at the event gate');
     } finally {
       await teardown();
     }

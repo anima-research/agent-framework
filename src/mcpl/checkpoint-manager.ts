@@ -14,6 +14,7 @@
 
 import type { JsStore } from '@animalabs/chronicle';
 import { ensureStateRegistered } from '../module-registry.js';
+import { boundedErrorMessage as thrownText } from '../error-message.js';
 
 import type { StateCheckpoint, JsonPatchOperation } from './types.js';
 
@@ -30,17 +31,6 @@ const STATE_PREFIX = 'mcpl/state';
 /** What the refusals below say about MCPL when stored trees or state can't be taken. */
 const MCPL_STOPS = `MCPL doesn't start without them, and neither does create() with MCPL servers configured, ` +
   `nor a first connectMcplServer()`;
-
-/** A thrown value's text, bounded and never throwing, as framework.ts's thrownText. */
-function thrownText(error: unknown): string {
-  let text: string;
-  try {
-    text = String(error instanceof Error ? error.message : error);
-  } catch {
-    text = '(a value that could not be read)';
-  }
-  return text.length <= 500 ? text : `${text.slice(0, 500)}… (${text.length} characters)`;
-}
 
 /** A stored JSON value's kind, for a refusal that names what it found without its content. */
 function storedKind(value: unknown): string {
