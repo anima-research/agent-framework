@@ -1284,8 +1284,10 @@ function logSeedOmissions(
 }
 
 /**
- * A maintenance provider call withdrawn because a surgery holds the store, or
- * because stop() has closed provider admission: either is the framework's own
+ * A maintenance provider call withdrawn because a surgery holds the store,
+ * because stop() has closed provider admission, or because the framework is
+ * done with the agent (an ephemeral run that has left or been released by
+ * cleanup(), a disposed conversation fork): each is the framework's own
  * doing, and no failure. It sent nothing: it was refused at the provider
  * gate, or woken there from its wait. It extends context-manager's
  * CompressionWithdrawn, whose constructor sets the brand context-manager reads
@@ -2347,6 +2349,12 @@ export class AgentFramework {
    *  by the object, not the run's record (ephemeralRuns), which its cleanup
    *  drops before a cancelled stream may count its last usage. */
   private ephemeralAgents: WeakSet<Agent> = new WeakSet();
+  /** Each ephemeral agent's or conversation fork's release, kept per Agent
+   *  rather than per name: set once an ephemeral run has left or cleanup() has
+   *  released it, or as a conversation fork is disposed. From then on its
+   *  context manager's compression is withdrawn (ephemeralAuxiliaryMembraneFor,
+   *  conversationAuxiliaryMembraneFor). */
+  private agentReleases: WeakMap<Agent, { released: boolean }> = new WeakMap();
   /** Warn only once per Agent instance after utilities are registered. */
   private emptyUtilityPermissionWarnings: WeakSet<Agent> = new WeakSet();
   /** Physical ephemeral frames deliberately disposed by their run watchdog/caller.
@@ -4127,23 +4135,45 @@ export class AgentFramework {
    * leave a gate behind. But its stated waits are recorded for (agent, model)
    * as a resident's are, so they bind its auxiliary calls too: a held model
    * is refused without a call, and an auxiliary call's own stated wait is
-   * recorded for it. (An ephemeral run records nothing, its name being
-   * single-use, so its context manager keeps the plain membrane.) Its
-   * compression is the background work a resident's is, whether a
-   * maintenance tick or a drain after a message starts it, so it is withdrawn
-   * as a resident's is: a call made while a surgery holds the store, or once
-   * stop() has closed provider admission, is withdrawn without being sent.
+   * recorded for it. (An ephemeral run's manager takes
+   * ephemeralAuxiliaryMembraneFor's instead.) Its compression is the
+   * background work a resident's is, whether a maintenance tick or a drain
+   * after a message starts it, so it is withdrawn as a resident's is: a call
+   * made while a surgery holds the store, or once stop() has closed provider
+   * admission, is withdrawn without being sent. So is one made once the fork
+   * has been disposed (`release`): its context stays in Chronicle, and no
+   * turn compiles it again.
    */
-  private conversationAuxiliaryMembraneFor(agentName: string): Membrane {
+  private conversationAuxiliaryMembraneFor(agentName: string, release: { released: boolean }): Membrane {
     return this.membraneAdmitting(async (run, model) => {
       this.withdrawMaintenanceUnderSurgery();
       this.withdrawMaintenanceWhenStopping(agentName);
+      if (release.released) throw new MaintenanceWithdrawnError(`conversation agent ${agentName} has been disposed`);
       this.refuseHeldProviderModel(agentName, model);
       try { return await run(); }
       catch (error) {
         if (model !== undefined && error instanceof Error) this.recordProviderWait(agentName, model, error);
         throw error;
       }
+    });
+  }
+  /**
+   * An ephemeral agent's auxiliary calls (its context manager's compression).
+   * Like a conversation agent's, they take no provider gate, and like any
+   * agent's compression they are withdrawn without being sent while a surgery
+   * holds the store or once stop() has closed provider admission. An
+   * ephemeral run records no stated wait, its name being single-use, so none
+   * binds them. They are withdrawn too once the manager's run has left or
+   * cleanup() has released it (`release`): nothing compiles its context for
+   * another turn then, so a drain still working through its queue would pay
+   * for summaries no one reads. What the run stored stays in its namespace.
+   */
+  private ephemeralAuxiliaryMembraneFor(agentName: string, release: { released: boolean }): Membrane {
+    return this.membraneAdmitting(async (run) => {
+      this.withdrawMaintenanceUnderSurgery();
+      this.withdrawMaintenanceWhenStopping(agentName);
+      if (release.released) throw new MaintenanceWithdrawnError(`ephemeral agent ${agentName} has been released`);
+      return run();
     });
   }
   /** The framework's membrane, with each complete() call passed through
@@ -7915,7 +7945,11 @@ export class AgentFramework {
    * `{namespace}/messages`, context log to `{namespace}/context`.
    *
    * Data persists after cleanup for investigation and cross-revert.
-   * Call cleanup() when done to release the ContextManager.
+   * Call cleanup() when done to release the ContextManager. Once its run has
+   * ended, or cleanup() has released it, the ContextManager makes no further
+   * provider call: compression its strategy still has queued is withdrawn
+   * unsent, as it is for every agent under a surgery's hold or once stop()
+   * has begun.
    */
   async createEphemeralAgent(config: AgentConfig): Promise<{
     agent: Agent;
@@ -7935,13 +7969,14 @@ export class AgentFramework {
     this.usedEphemeralAgentNames.set(config.name, 'run');
     try {
       const namespace = `subagent/${config.name}`;
+      const release = { released: false };
 
       const contextManager = await ContextManager.open({
         store: this.store,
         namespace,
         isolate: true,
         strategy: config.strategy ?? new PassthroughStrategy(),
-        membrane: this.membrane,
+        membrane: this.ephemeralAuxiliaryMembraneFor(config.name, release),
         debugLogContext: !!process.env.DEBUG_CONTEXT,
       });
 
@@ -7950,10 +7985,13 @@ export class AgentFramework {
       agent.markContextConsumed(); // RFC-006: nothing stored before now is replaceable
       this.ephemeralCandidates.set(agent, contextManager);
       this.ephemeralAgents.add(agent);
+      this.agentReleases.set(agent, release);
 
       const cleanup = () => {
-        // Don't close the store — it's shared. Just release the CM.
-        // Data persists in the store under the namespace for investigation.
+        // Don't close the store — it's shared. Data persists in the store
+        // under the namespace for investigation. The manager's compression is
+        // withdrawn from here on (ephemeralAuxiliaryMembraneFor).
+        release.released = true;
       };
 
       return { agent, contextManager, cleanup };
@@ -8223,6 +8261,10 @@ export class AgentFramework {
       } catch (error) {
         console.error(`[ephemeral] agent=${agent.name} its stream's cancel failed at the run's end; the run leaves all the same:`, error);
       }
+      // The run has left: its manager's compression is withdrawn from here on,
+      // writes landing below included (ephemeralAuxiliaryMembraneFor).
+      const release = this.agentReleases.get(agent);
+      if (release) release.released = true;
       if (this.ephemeralRuns.get(agent.name) === run) this.ephemeralRuns.delete(agent.name);
       if (this.agents.get(agent.name) === agent) {
         // What is still queued for the run, such as a message held for its
@@ -12184,7 +12226,7 @@ export class AgentFramework {
     }
     this.usedEphemeralAgentNames.set(name, 'conversation');
     try {
-
+      const release = { released: false };
       const contextManager = await ContextManager.open({
         store: this.store,
         namespace: `conversations/${name}`,
@@ -12194,7 +12236,7 @@ export class AgentFramework {
         // Provider cooldown ownership belongs to the persistent resident only;
         // generation-unique forks must not leak gates. A fork's own recorded
         // provider waits still bind its compression calls.
-        membrane: this.conversationAuxiliaryMembraneFor(name),
+        membrane: this.conversationAuxiliaryMembraneFor(name, release),
         debugLogContext: !!process.env.DEBUG_CONTEXT,
       });
 
@@ -12261,6 +12303,7 @@ export class AgentFramework {
       const agent = new Agent(config, contextManager, this.membrane);
       this.adoptToolResultGuard(agent);
       agent.markContextConsumed(); // RFC-006: nothing stored before now is replaceable
+      this.agentReleases.set(agent, release);
       this.agents.set(name, agent);
       this.agentConfigs.set(name, config);
       this.conversationAgentHomes.set(name, channelId);
@@ -12383,6 +12426,10 @@ export class AgentFramework {
     this.closingConversationAgents.delete(agentName);
     const channelId = this.conversationAgentHomes.get(agentName);
     const agent = this.agents.get(agentName);
+    // Its compression is withdrawn from here on, the writes its window's
+    // release lands below included (conversationAuxiliaryMembraneFor).
+    const release = agent && this.agentReleases.get(agent);
+    if (release) release.released = true;
     this.agents.delete(agentName);
     if (agent) this.releaseWindowNowOrAfterResume(agent);
     this.turnRouting.delete(agentName);
