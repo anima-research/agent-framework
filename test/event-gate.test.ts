@@ -354,7 +354,10 @@ describe('debounce', () => {
     });
     const { gate, inferenceRequests } = makeGate(path);
     gate.evaluate({ content: 'private', eventType: 'external-message', serverId: 'tui', channelId: '', routingClass: 'private' });
-    await new Promise((resolve) => setTimeout(resolve, 150));
+    // Waits for the flush itself, not a fixed time a loaded runner can overrun.
+    for (const deadline = Date.now() + 5_000; inferenceRequests.length === 0 && Date.now() < deadline;) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
     assert.equal(inferenceRequests.length, 1);
     assert.equal(inferenceRequests[0]?.routingClass, 'private');
     assert.equal(inferenceRequests[0]?.channelId, undefined);
@@ -368,7 +371,10 @@ describe('debounce', () => {
     });
     const { gate, inferenceRequests } = makeGate(path);
     gate.evaluate({ content: 'channel', eventType: 'external-message', serverId: 'bridge', channelId: 'discord:g:room', routingClass: 'channel' });
-    await new Promise((resolve) => setTimeout(resolve, 150));
+    // Waits for the flush itself, not a fixed time a loaded runner can overrun.
+    for (const deadline = Date.now() + 5_000; inferenceRequests.length === 0 && Date.now() < deadline;) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
     assert.equal(inferenceRequests.length, 1);
     assert.equal(inferenceRequests[0]?.routingClass, 'channel');
     assert.equal(inferenceRequests[0]?.channelId, 'discord:g:room');

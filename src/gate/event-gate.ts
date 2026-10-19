@@ -213,6 +213,10 @@ function isMetadataTruthy(value: unknown): boolean {
  * wins (mention / reply / DM outranks newer ambient chatter — the framework's
  * own locus rule); else the newest channel-bearing event. Channel, author and
  * addressed all come from that one event, so they can never disagree.
+ *
+ * Give it one part of a window: a private surface's events, or the rest.
+ * Events of both are one private wake whose channel side nobody answers,
+ * which is why deliverEvents wakes each part on its own.
  */
 export function wakeProvenance(events: PendingEvent[]): WakeProvenance | undefined {
   let newest: PendingEvent | undefined;
@@ -1617,7 +1621,9 @@ export class EventGate {
     // event addressed the agent and its registered channel is known,
     // `routeChannelId` names the turn's speech locus too — the reply goes
     // back to whoever addressed the agent, not to whichever channel last saw
-    // any traffic. Ambient-only batches carry telemetry only.
+    // any traffic. An ambient-only batch of channel events carries telemetry
+    // only; a channel-bound surface message names its own channel
+    // (routingClass 'channel'), addressed or not.
     //
     // A window can hold events from a private surface and others beside
     // them: under one policy, or across policies, since every policy's
@@ -1631,10 +1637,14 @@ export class EventGate {
     // channel only as where it woke the agent, so its wake shares the
     // private turn, and nothing answers it in its channel: the window's
     // content above stays one message, the operator's words included.
+    // A shared buffer holds each policy's events in the order its debounce
+    // fired, so arrival is read from the events' own times, and within one
+    // millisecond from their order in the window.
     const privateEvents = events.filter((e) => e.routingClass === 'private');
     const otherEvents = events.filter((e) => e.routingClass !== 'private');
+    const firstArrival = (part: PendingEvent[]): number => Math.min(...part.map((e) => e.timestamp));
     const parts = [privateEvents, otherEvents].filter((part) => part.length > 0)
-      .sort((a, b) => events.indexOf(a[0]!) - events.indexOf(b[0]!));
+      .sort((a, b) => firstArrival(a) - firstArrival(b) || events.indexOf(a[0]!) - events.indexOf(b[0]!));
     for (const part of parts) {
       const provenance = wakeProvenance(part);
       for (const agentName of this.getAgentNamesFn()) {

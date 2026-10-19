@@ -429,6 +429,7 @@ describe('surface batches at their edges, through the real scheduler', () => {
         await rig.framework.runUntilIdle();
         const label = privateFirst ? 'private first' : 'channel first';
         assert.equal(rig.starts.length, 2, `${label}: one turn per part of the window`);
+        assert.ok((privateFirst ? privateStart : roomStart)(rig.starts[0]!), `${label}: the part that arrived first goes first`);
         assert.ok(rig.starts.some(privateStart), `${label}: a private turn`);
         const room = rig.starts.find(roomStart);
         assert.ok(room, `${label}: a turn for the room`);
@@ -856,6 +857,81 @@ describe("the scheduler's split, and a private turn's other paths", () => {
       assert.deepEqual(second.routed, []);
     } finally {
       await second.close();
+    }
+  });
+
+  it("a provider hold keeps a gate window's private wake beside its other part, though both have one reason, source and time", async () => {
+    const rig = await surfaceRig();
+    try {
+      const cooldowns = (rig.framework as unknown as { providerAccelerationCooldowns: Map<string, Record<string, unknown>> }).providerAccelerationCooldowns;
+      const now = Date.now();
+      const timer = setTimeout(() => {}, 60_000);
+      try {
+        cooldowns.set('scout', { startedAt: now, until: now + 60_000, timer, heldRequests: [], reason: 'a test hold', failures: 1 });
+        rig.i.pendingRequests.push(
+          { agentName: 'scout', reason: 'gate:debounce', source: 'gate', timestamp: now },
+          { agentName: 'scout', reason: 'gate:debounce', source: 'gate', timestamp: now, nonChannelOrigin: true },
+        );
+        await rig.i.processInferenceRequests();
+        const held = cooldowns.get('scout')!.heldRequests as InferenceRequest[];
+        assert.equal(held.length, 2, JSON.stringify(held));
+        assert.ok(held.some((r) => r.nonChannelOrigin === true), 'the private wake is held, not dropped as the other part');
+      } finally {
+        clearTimeout(timer);
+        cooldowns.delete('scout');
+        rig.i.pendingRequests.length = 0;
+      }
+    } finally {
+      await rig.close();
+    }
+  });
+
+  it("a window's parts go in the order their first events arrived, though a shared buffer holds them as their debounces fired", async () => {
+    const gate = { config: { policies: [
+      { name: 'slow', match: { scope: ['external-message'] }, behavior: { debounce: 300 } },
+      { name: 'fast', match: { scope: ['mcpl:channel-incoming'] }, behavior: { debounce: 30 } },
+    ], default: 'skip' } };
+    const rig = await surfaceRig({ gate });
+    try {
+      const eventGate = (rig.framework as unknown as {
+        eventGate: { evaluate(info: Record<string, unknown>): unknown; onInferenceStarted(name: string): void; onInferenceEnded(name: string): void; inferenceDiagnostics(): { bufferedEvents: number } };
+      }).eventGate;
+      // While an agent infers, each policy's firing goes to one buffer.
+      eventGate.onInferenceStarted('elsewhere');
+      rig.framework.pushEvent(tuiMessage());
+      // The framework hands the operator's message to the gate as it
+      // processes it.
+      await rig.framework.runUntilIdle();
+      await new Promise((r) => setTimeout(r, 20));
+      eventGate.evaluate({
+        content: 'over here', eventType: 'mcpl:channel-incoming', serverId: 'discord', channelId: ROOM,
+        metadata: { author: { id: 'u1' } }, tags: ['chat:addressed'],
+      });
+      await rig.until(() => eventGate.inferenceDiagnostics().bufferedEvents >= 2, 'both firings buffered, the room\'s first');
+      eventGate.onInferenceEnded('elsewhere');
+      await rig.until(() => rig.starts.length >= 2, 'a turn for each part');
+      await rig.framework.runUntilIdle();
+      assert.ok(privateStart(rig.starts[0]!), `the operator's message arrived first, so its turn goes first: ${JSON.stringify(rig.starts)}`);
+      assert.ok(roomStart(rig.starts[1]!), JSON.stringify(rig.starts[1]));
+    } finally {
+      await rig.close();
+    }
+  });
+
+  it('a gate window with a private message and an unaddressed channel-bound one wakes a turn for each', async () => {
+    const gate = { config: { policies: [{ name: 'surface', match: { scope: ['external-message'] }, behavior: { debounce: 100 } }], default: 'skip' } };
+    const rig = await surfaceRig({ gate });
+    try {
+      rig.framework.pushEvent(tuiMessage());
+      rig.framework.pushEvent(roomMessage(false));
+      await rig.until(() => rig.starts.length >= 2, 'two turns');
+      await rig.framework.runUntilIdle();
+      assert.ok(rig.starts.some(privateStart), JSON.stringify(rig.starts));
+      const room = rig.starts.find(roomStart);
+      assert.ok(room, 'the channel-bound message names its channel, unaddressed as it is');
+      assert.notEqual(room!.addressed, true);
+    } finally {
+      await rig.close();
     }
   });
 });

@@ -3143,8 +3143,9 @@ export class AgentFramework {
             // message's channel. Without it the turn froze on the
             // process-global most-recent-inbound channel, which an ambient
             // message elsewhere could retarget between the DM's arrival and
-            // the debounce firing (2026-09-30). Ambient-only batches set no
-            // locus and keep the legacy fallback.
+            // the debounce firing (2026-09-30). An ambient-only batch of
+            // channel events sets no locus and keeps the legacy fallback; a
+            // channel-bound surface message's own channel is set above.
             //
             // The wake is broadcast to every agent, conversation forks
             // included, and a fork speaks only in its home channel: the
@@ -4180,9 +4181,13 @@ export class AgentFramework {
     }
     return { delayMs: ownMs, ownMs, stated: false };
   }
+  /** Whether two requests are one request held twice. A gate window's private
+   *  part and its other part are two wakes from one flush, with the same
+   *  reason, source and time, and may differ only in their routing class. */
   private sameInferenceRequest(a: InferenceRequest, b: InferenceRequest): boolean {
     return a.agentName === b.agentName && a.reason === b.reason && a.source === b.source &&
-      a.timestamp === b.timestamp && a.channelId === b.channelId;
+      a.timestamp === b.timestamp && a.channelId === b.channelId &&
+      (a.nonChannelOrigin === true) === (b.nonChannelOrigin === true);
   }
   private consultProviderHold(error: Error, agentName: string): { holdMs: number; reason: string } | undefined {
     if (!this.providerHoldHook) return undefined;
