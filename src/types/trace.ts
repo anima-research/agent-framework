@@ -207,9 +207,10 @@ export type TraceEvent =
        * (`delivered: false`), and one whose reply leaves `delivered` out.
        * `inference:tokens` stays the model's text as it is written (held, as
        * before, while a tool-result guard's batch is pending). A later
-       * publish to the same channel by the same stream opens with a paragraph
-       * break (`\n\n`), so a channel's chunks joined in `index` order are its
-       * text, its messages kept apart.
+       * publish to the same destination, a server and its channel, by the
+       * same stream opens with a paragraph break (`\n\n`), so a
+       * destination's chunks joined in `index` order are its text, its
+       * messages kept apart.
        * `mcpl:speech-routed` also reports speech publishes, with no stream
        * id, index or end, each once delivered: deliverSpeech's, the `sleep`
        * tool's announcement among them, and a subconscious's
@@ -220,7 +221,9 @@ export type TraceEvent =
        */
       type: 'inference:published';
       agentName: string;
-      /** Where the prose is published. */
+      /** The server the prose is published to, and its channel there: two
+       *  servers' channels with the same id are two destinations. */
+      serverId: string;
       channelId: string;
       /** The stream's id, shared with its `channels/outgoing/*` notifications. */
       inferenceId: string;
@@ -234,14 +237,18 @@ export type TraceEvent =
     })
   | (TraceEventBase & {
       /**
-       * A stream's end for one channel it published to (MCPL Spec 14.3
-       * `channels/outgoing/complete`), sent on every exit path once the
-       * stream has ended and its deliveries have run, or, when the host
-       * stops, at once: `text` is everything its `inference:published` chunks
-       * carried there, and none follows it.
+       * A stream's end for one destination it published to, a server and
+       * its channel, emitted on every exit path once the stream has ended
+       * and its deliveries have run, or, when the host stops, before its
+       * connections close: `text` is everything its `inference:published`
+       * chunks carried there by then, and none follows it. Like those
+       * chunks, it's emitted whether or not that server takes the stream,
+       * or registers the channel still; the MCPL
+       * `channels/outgoing/complete` goes to the server only when it does.
        */
       type: 'inference:published_complete';
       agentName: string;
+      serverId: string;
       channelId: string;
       inferenceId: string;
       text: string;

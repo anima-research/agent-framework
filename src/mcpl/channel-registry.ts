@@ -44,7 +44,7 @@ import { logDetail, logValue } from './log-value.js';
 import { RefusalLines } from './refusal-lines.js';
 import { CapabilityGrant } from './capability-grant.js';
 import type { InboundSource } from './inbound-source.js';
-import { McplRequestError } from './server-connection.js';
+import { McplRequestError, type McplServerConnection } from './server-connection.js';
 import { readSkipReplyWake } from './skip-reply-wake.js';
 
 // ============================================================================
@@ -256,9 +256,11 @@ interface ChannelEntry {
  * A channel its server declared inbound-only (SPEC §14.2 `direction`): its
  * messages come in, and the host publishes nothing into it. No publish, from
  * plain speech, `channel_publish` or `publishForAgent`, and no outgoing
- * stream. Typing and acknowledgements, which carry no content, still go
- * (SPEC §14.5: "Delivery occurs only via `channels/publish`"). A channel
- * declared `outbound` or `bidirectional`, or with no direction, isn't one.
+ * stream starts there, though one the channel took before the declaration
+ * ends there (sendOutgoingChunk). Typing and acknowledgements, which carry
+ * no content, still go (SPEC §14.5: "Delivery occurs only via
+ * `channels/publish`"). A channel declared `outbound` or `bidirectional`, or
+ * with no direction, isn't one.
  */
 function isInboundOnly(entry: ChannelEntry): boolean {
   return entry.descriptor.direction === 'inbound';
@@ -471,7 +473,8 @@ const CHANNEL_TOOL_DEFINITIONS: ToolDefinition[] = [
 // ============================================================================
 
 /** Bound connector values for notices, logs and an outcome's reason. A
- *  PublishOutcome keeps the connector's structured data (`detail`) whole. */
+ *  PublishOutcome keeps the connector's structured data (`detail`) as the
+ *  connection gives it, its strings redacted (redactedData). */
 export function connectorText(value: unknown): string {
   let text: string;
   try {
@@ -491,6 +494,12 @@ export interface PublishDestination {
   channelId: string;
   /** The channel's registered label when the attempt was made. */
   label?: string;
+}
+
+/** One key per destination, its server and channel: unlike joining the two
+ *  with a separator, no two destinations share one, whatever their ids hold. */
+export function destinationKey(to: PublishDestination): string {
+  return JSON.stringify([to.serverId, to.channelId]);
 }
 
 /**
@@ -515,7 +524,8 @@ export interface PublishOutcome {
   /** Why it failed, or why its outcome is unknown — for a connector error,
    *  its message, bounded (which may say what was already posted). */
   reason?: string;
-  /** The connector error's structured `data`, verbatim, when it sent one. */
+  /** The connector error's structured `data`, with the strings in it
+   *  redacted (redactedData), when it sent one. */
   detail?: unknown;
   /** When the outcome was established (epoch ms). */
   at: number;
@@ -747,6 +757,14 @@ export class ChannelRegistry {
 
   /** Registered channels, keyed by `{serverId}:{channelId}`. */
   private channels = new Map<string, ChannelEntry>();
+
+  /**
+   * Each outgoing stream, by `inferenceId`, with the destinations it has
+   * started at (destinationKey): the rest of the stream there goes on there,
+   * and its `complete` goes only there (sendOutgoingChunk). An entry goes
+   * with the stream's `complete` for its destination.
+   */
+  private takenStreams = new Map<string, Set<string>>();
 
   /** Holds back repeats of the line for a message refused because its
    *  channel isn't registered (RefusalLines). */
@@ -3632,35 +3650,76 @@ export class ChannelRegistry {
    * servers that never opted in receive nothing. Fire-and-forget and never
    * throws: streaming is an observer surface; the authoritative delivery is
    * channels/publish.
+   *
+   * `to` is the destination the publish went to, its server and channel.
+   * The chunk goes there while that server registers that channel (Spec
+   * 14.3: the recipient is "the server that registered the target
+   * channel"). A stream doesn't start in a channel its server has declared
+   * inbound-only (#350's rule), not even for a publish delivered there just
+   * before the declaration. One that started there before it goes on, since
+   * the declaration doesn't unregister the channel: a later chunk is for a
+   * publish delivered before it. A bare channel id is resolved as before, to
+   * the one server that registers it, at each call (streamingServerFor), and
+   * keeps no record: a stream sent by destination ends by destination, since
+   * only a destination's `complete` removes its record.
    */
   sendOutgoingChunk(
-    channelId: string,
+    to: string | PublishDestination,
     conversationId: string,
     inferenceId: string,
     index: number,
     delta: string,
   ): void {
-    const server = this.streamingServerFor(channelId);
+    let server: McplServerConnection | null;
+    if (typeof to === 'string') {
+      server = this.streamingServerFor(to);
+    } else {
+      const key = destinationKey(to);
+      let started = this.takenStreams.get(inferenceId);
+      const continuing = started?.has(key) ?? false;
+      server = this.streamingServerAt(to, !continuing);
+      if (server && !continuing) {
+        if (!started) this.takenStreams.set(inferenceId, started = new Set());
+        started.add(key);
+      }
+    }
     if (!server) return;
+    const channelId = typeof to === 'string' ? to : to.channelId;
     try {
       server.sendChannelsOutgoingChunk({ inferenceId, conversationId, channelId, index, delta });
     } catch { /* observer surface — never disturb the turn */ }
   }
 
-  /** Spec 14.3 companion: final moderated content per channel at stream end. */
+  /**
+   * Spec 14.3 companion: final moderated content per channel at stream end.
+   * Given a destination, it goes only where the stream started
+   * (sendOutgoingChunk), while that server still registers that channel,
+   * inbound-only or not, and its grant has `channels.streaming`: once per
+   * destination, whose consumer, such as a TTS utterance, finalizes on it
+   * and reconciles any chunk it missed. A bare channel id is resolved as
+   * before (streamingServerFor).
+   */
   sendOutgoingComplete(
-    channelId: string,
+    to: string | PublishDestination,
     conversationId: string,
     inferenceId: string,
     text: string,
   ): void {
-    const server = this.streamingServerFor(channelId);
+    let server: McplServerConnection | null;
+    if (typeof to === 'string') {
+      server = this.streamingServerFor(to);
+    } else {
+      const started = this.takenStreams.get(inferenceId);
+      if (!started?.delete(destinationKey(to))) return;
+      if (started.size === 0) this.takenStreams.delete(inferenceId);
+      server = this.streamingServerAt(to, false);
+    }
     if (!server) return;
     try {
       server.sendChannelsOutgoingComplete({
         inferenceId,
         conversationId,
-        channelId,
+        channelId: typeof to === 'string' ? to : to.channelId,
         content: [{ type: 'text', text }],
       });
     } catch { /* observer surface — never disturb the turn */ }
@@ -3684,6 +3743,21 @@ export class ChannelRegistry {
     // server was told anything was granted.
     if (!CapabilityGrant.of(server).has('channels.streaming')) return null;
     return server;
+  }
+
+  /**
+   * A destination's server, for a stream message: while that server
+   * registers that channel, and its grant has `channels.streaming` (as in
+   * streamingServerFor). A stream doesn't start in an inbound-only channel.
+   */
+  private streamingServerAt(to: PublishDestination, starting: boolean): McplServerConnection | null {
+    // The map's key joins the two ids with a colon, so another server's
+    // entry can sit under a destination's key: it has to be this server's.
+    const entry = this.channels.get(`${to.serverId}:${to.channelId}`);
+    if (!entry || entry.serverId !== to.serverId) return null;
+    if (starting && isInboundOnly(entry)) return null;
+    const server = this.serverRegistry.getServer(to.serverId);
+    return CapabilityGrant.of(server).has('channels.streaming') ? server : null;
   }
 
   /** Resolve the outbound locus (fork HOME → this-turn's TRIGGERING channel →
@@ -4059,11 +4133,12 @@ export class ChannelRegistry {
     conversationId: string,
     text: string,
     locusChannelId: string | null,
-  ): Promise<{ delivered: boolean; channelId: string; messageId?: string } | null> {
+  ): Promise<{ delivered: boolean; serverId: string; channelId: string; messageId?: string } | null> {
     const outcome = await this.deliverSpeech(conversationId, text, locusChannelId);
     if (outcome.status !== 'delivered') return null;
     return {
       delivered: true,
+      serverId: outcome.destination!.serverId,
       channelId: outcome.destination!.channelId,
       ...(outcome.messageId !== undefined ? { messageId: outcome.messageId } : {}),
     };

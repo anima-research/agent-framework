@@ -141,15 +141,16 @@ test("a server's error answer is shown as the server's, and its method, id and c
   assert.ok(logged(errors.mock.calls, /^MCPL server "words" answered tools\/call \(id=\d+\) with error -32000: 42$/), 'the log has the number');
 });
 
-test("a server's error answer that echoes a credential reaches the caller as sent, and the log redacted", async (t) => {
+test("a server's error answer that echoes a credential reaches the caller and the log redacted", async (t) => {
   const errors = t.mock.method(console, 'error', () => {});
   const token = 'tok-0123456789abcdef';
   const connection = await McplServerConnection.connect(config({ env: { API_TOKEN: token } }), HOST_CAPS);
   t.after(() => connection.close());
   connection.ready();
-  // A JSON-RPC answer passes as it is (redactServerText's scope).
+  // The server's words are in an error the caller gets, so a credential
+  // its configuration holds leaves them (redactServerText's scope).
   await assert.rejects(connection.sendToolsCall('echo-token', {}),
-    { message: `The "words" server answered with an error: bad token ${token}` });
+    { message: 'The "words" server answered with an error: bad token redacted' });
   // The log is a record of the server's text, so the credential leaves it,
   // in a message of any JSON value.
   await assert.rejects(connection.sendToolsCall('echo-token-object', {}), { message: NO_WORDS });
@@ -159,7 +160,7 @@ test("a server's error answer that echoes a credential reaches the caller as sen
   assert.ok(!lines.some((line) => line.includes(token)), 'no log line has the token');
 });
 
-test("an error answer whose configuration can't be read settles its call, and its log line withholds the server's text", async (t) => {
+test("an error answer whose configuration can't be read settles its call, and its error and its log line withhold the server's text", async (t) => {
   const errors = t.mock.method(console, 'error', () => {});
   // A stdio server's env, as the framework gives it, is a getter, which
   // throws once the reaction baseline's ledger can't be read.
@@ -174,7 +175,7 @@ test("an error answer whose configuration can't be read settles its call, and it
   connection.ready();
   unreadable = true;
   await within(assert.rejects(connection.sendToolsCall('refuse', {}),
-    { message: 'The "words" server answered with an error: Missing Access' }), 'settled call');
+    { message: `The "words" server answered with an error: ${WITHHELD_TEXT}` }), 'settled call');
   const lines = errors.mock.calls.map((call) => String(call.arguments[0]));
   assert.ok(!lines.some((line) => line.includes('Missing')), lines.join('\n'));
   assert.ok(lines.some((line) => /^MCPL server "words" answered tools\/call \(id=\d+\) with error -32000: /.test(line) && line.endsWith(logValue(WITHHELD_TEXT))), lines.join('\n'));
@@ -226,7 +227,7 @@ test("a request refused as not sent is refused through its promise when the host
   await assert.rejects(refused!, { outcome: 'not-sent' });
 });
 
-test("error answers' log lines read their connection's configuration until a read succeeds, and not after (#540's review, R1-2)", async (t) => {
+test("error answers read their connection's configuration once each until a read succeeds, and not after (#540's review, R1-2)", async (t) => {
   const errors = t.mock.method(console, 'error', () => {});
   // A stdio server's env, as the framework gives it, is a getter, which reads
   // the reaction baseline's ledger from disk each time, and throws while the
@@ -241,14 +242,14 @@ test("error answers' log lines read their connection's configuration until a rea
   const connection = await McplServerConnection.connect(counted, HOST_CAPS);
   t.after(() => { unreadable = false; return connection.close(); });
   connection.ready();
-  const refused = () => assert.rejects(connection.sendToolsCall('refuse', {}), { message: 'The "words" server answered with an error: Missing Access' });
+  const refused = (words = 'Missing Access') => assert.rejects(connection.sendToolsCall('refuse', {}), { message: `The "words" server answered with an error: ${words}` });
   const answerLines = () => errors.mock.calls.map((call) => String(call.arguments[0])).filter((line) => / answered tools\/call /.test(line));
-  // While the ledger can't be read, each answer's line is withheld, and the
-  // next answer reads it again.
+  // While the ledger can't be read, each answer's words and line are
+  // withheld, each answer reads it once, and the next answer reads it again.
   unreadable = true;
   let before = reads;
-  await refused();
-  await refused();
+  await refused(WITHHELD_TEXT);
+  await refused(WITHHELD_TEXT);
   assert.equal(reads - before, 2);
   assert.ok(answerLines().every((line) => line.endsWith(logValue(WITHHELD_TEXT))), answerLines().join('\n'));
   // Once a read succeeds, the redaction it built is kept.

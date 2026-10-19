@@ -1349,7 +1349,7 @@ describe("a round that runs code_execution is routed once its scripts return (re
       routeSpeech: async (_agent: string, text: string, channelId: string | null) => {
         if (!channelId) return null;
         log.push(`publish:${text}@${channelId}`);
-        return { delivered: true, channelId };
+        return { delivered: true, serverId: 'stub', channelId };
       },
       // A named or sticky destination posts through deliverSpeech, as with
       // the real registry, which reports the post's outcome.
@@ -1359,8 +1359,11 @@ describe("a round that runs code_execution is routed once its scripts return (re
         return { status: 'delivered', destination: { serverId: 'stub', channelId }, at: Date.now() };
       },
       resolveDestination: ({ channelId }: { channelId: string }) => ({ destination: { serverId: 'stub', channelId } }),
-      sendOutgoingChunk: (channelId: string, _agent: string, _id: string, _index: number, delta: string) => {
-        log.push(`chunk:${delta}@${channelId}`);
+      // Each delivery hands its stream the destination its publish went to,
+      // here the stub's server: a chunk for any other is logged with it, so
+      // a delivery that loses its server fails the test.
+      sendOutgoingChunk: (to: { serverId: string; channelId: string }, _agent: string, _id: string, _index: number, delta: string) => {
+        log.push(`chunk:${delta}@${to.serverId === 'stub' ? to.channelId : `${to.channelId} (server ${to.serverId})`}`);
       },
       handleChannelToolCall: async (name: string, input: Record<string, unknown> | undefined) => {
         log.push(`tool:${name}`);

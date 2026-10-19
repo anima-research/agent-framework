@@ -99,7 +99,7 @@ type Logged =
  * world:test, and every chunk, publish and complete lands in one ordered
  * log. A publish whose text is in `fails` fails.
  */
-function registry(framework: AgentFramework, options: { streaming?: boolean } = {}) {
+function registry(framework: AgentFramework, options: { streaming?: boolean; servers?: Record<string, string> } = {}) {
   const log: Logged[] = [];
   /** A publish whose text is held here doesn't return until the test lets it go. */
   const holds = new Map<string, Promise<void>>();
@@ -112,7 +112,9 @@ function registry(framework: AgentFramework, options: { streaming?: boolean } = 
   const fails = new Map<string, 'undelivered' | 'unknown' | 'throw'>();
   /** A publish of one of these texts is answered with this message id, as a server that returns one. */
   const messageIds = new Map<string, string>();
-  const known: Record<string, string> = { '#alpha': 'chan-alpha', '#cafe': 'chan-cafe', '@laria': 'discord:dm:99' };
+  const known: Record<string, string> = { '#alpha': 'chan-alpha', '#cafe': 'chan-cafe', '@laria': 'discord:dm:99', '#b-room': 'b:room', '#room': 'room' };
+  /** The server a channel belongs to: `options.servers` names some, and the stub's server has the rest. */
+  const serverOf = (channelId: string) => options.servers?.[channelId] ?? 'stub';
   let stopped = false;
   /** One post, with the outcome the real registry's deliverSpeech gives it. */
   const publish = async (body: string, channelId: string | null) => {
@@ -121,7 +123,7 @@ function registry(framework: AgentFramework, options: { streaming?: boolean } = 
     await holds.get(body);
     const failure = fails.get(body);
     if (failure === 'throw') throw new Error('synthetic publish failure');
-    const destination = { serverId: 'stub', channelId };
+    const destination = { serverId: serverOf(channelId), channelId };
     const messageId = messageIds.get(body);
     if (failure === 'unknown') {
       return { status: 'unknown' as const, destination, reason: 'the stub returned no delivery receipt (delivery uncertain)', at: Date.now() };
@@ -133,22 +135,27 @@ function registry(framework: AgentFramework, options: { streaming?: boolean } = 
   const target: Record<string, unknown> = {
     resolveLocus: () => 'world:test',
     resolveProseTarget: (spec: string) => (known[spec] ? { channelId: known[spec] } : { error: `no channel ${spec}` }),
-    resolveDestination: ({ channelId }: { channelId: string }) => ({ destination: { serverId: 'stub', channelId } }),
+    resolveDestination: ({ channelId }: { channelId: string }) => ({ destination: { serverId: serverOf(channelId), channelId } }),
     // Locus prose posts through routeSpeech, a named or sticky destination
     // through deliverSpeech, as with the real registry.
     deliverSpeech: async (_agent: string, body: string, channelId: string | null) => publish(body, channelId),
     routeSpeech: async (_agent: string, body: string, channelId: string | null) => {
       const outcome = await publish(body, channelId);
       return outcome.status === 'delivered'
-        ? { delivered: true, channelId: outcome.destination.channelId, ...(outcome.messageId !== undefined ? { messageId: outcome.messageId } : {}) }
+        ? { delivered: true, serverId: outcome.destination.serverId, channelId: outcome.destination.channelId, ...(outcome.messageId !== undefined ? { messageId: outcome.messageId } : {}) }
         : null;
     },
-    sendOutgoingChunk: (channelId: string, _agent: string, inferenceId: string, index: number, delta: string) => {
+    // Each delivery site hands its stream the destination its publish went
+    // to, its channel's server; a stream message for any other is logged as
+    // a mark, so a site that loses the server fails its test.
+    sendOutgoingChunk: ({ serverId, channelId }: { serverId: string; channelId: string }, _agent: string, inferenceId: string, index: number, delta: string) => {
       if (stopped) return;
+      if (serverId !== serverOf(channelId)) { log.push({ kind: 'mark', channelId, text: `chunk for server ${serverId}` }); return; }
       log.push({ kind: 'chunk', channelId, text: delta, inferenceId, index });
     },
-    sendOutgoingComplete: (channelId: string, _agent: string, inferenceId: string, body: string) => {
+    sendOutgoingComplete: ({ serverId, channelId }: { serverId: string; channelId: string }, _agent: string, inferenceId: string, body: string) => {
       if (stopped) return;
+      if (serverId !== serverOf(channelId)) { log.push({ kind: 'mark', channelId, text: `complete for server ${serverId}` }); return; }
       log.push({ kind: 'complete', channelId, text: body, inferenceId });
     },
     // As the real registry's stopAll forgets its channels, a chunk or
@@ -183,7 +190,7 @@ function registry(framework: AgentFramework, options: { streaming?: boolean } = 
   };
 }
 
-async function harness(scripts: NormalizedResponse[][], config: Partial<AgentConfig> = {}, options: { streaming?: boolean; gate?: boolean } = {}) {
+async function harness(scripts: NormalizedResponse[][], config: Partial<AgentConfig> = {}, options: { streaming?: boolean; gate?: boolean; servers?: Record<string, string> } = {}) {
   const dir = mkdtempSync(join(tmpdir(), 'af-outgoing-stream-')); dirs.push(dir);
   const membrane = new ScriptMembrane(scripts);
   const module = new ToolModule();
@@ -248,6 +255,7 @@ for (const mode of ['locus', 'hybrid', 'explicit'] as const) {
     const h = await harness([[round(text(aside), call('skip', 'skip_reply'))]], { proseRouting: mode });
     try {
       await h.run();
+      assert.equal(h.membrane.streams, 1, "the turn's inference ran");
       assert.deepEqual(h.publishes(), [], 'delivery keeps the round');
       assert.deepEqual(h.log, [], 'and the stream gets none of it');
       assert.deepEqual(h.traces, []);
@@ -273,6 +281,7 @@ for (const mode of ['locus', 'hybrid'] as const) {
       { proseRouting: mode });
     try {
       await h.run();
+      assert.equal(h.membrane.streams, 1, "the turn's inference ran");
       assert.deepEqual(h.publishes(), [], 'the send silences the turn from its round on');
       assert.deepEqual(h.log, [], 'and the stream carries none of it');
     } finally { await h.framework.stop(); }
@@ -298,6 +307,23 @@ test('explicit: a round starts where the sticky destination is, and its >> lines
       { channelId: 'chan-alpha', text: 'first\n\nmiddle' },
       { channelId: 'chan-cafe', text: 'later' },
     ]);
+  } finally { await h.framework.stop(); }
+});
+
+test("explicit: two destinations whose ids join to the same string are two destinations to the stream, each streamed and completed with its own words", async () => {
+  // Server a's channel `b:room` and server a:b's channel `room` would both be
+  // `a:b:room` joined with a colon.
+  const h = await harness([[round(text('>>#b-room first'), call('one', 'test--read')), final(text('>>#room second'))]],
+    { proseRouting: 'explicit' }, { servers: { 'b:room': 'a', room: 'a:b' } });
+  try {
+    await h.run();
+    assert.deepEqual(h.publishes(), [{ channelId: 'b:room', text: 'first' }, { channelId: 'room', text: 'second' }]);
+    assert.deepEqual(h.log.filter((e) => e.kind !== 'publish').map((e) => [e.kind, e.channelId, e.text]), [
+      ['chunk', 'b:room', 'first'],
+      ['chunk', 'room', 'second'],
+      ['complete', 'b:room', 'first'],
+      ['complete', 'room', 'second'],
+    ], "each destination's chunk carries no paragraph break, and its complete only its own words");
   } finally { await h.framework.stop(); }
 });
 
@@ -639,6 +665,125 @@ test("with the real channel registry, a stop() with a publish still out sends th
     releaseTwo();
     await framework.stop();
   }
+});
+
+/**
+ * A turn whose channel registry is real, with the channels given open in
+ * their servers, the locus `room`. What each server is sent lands in `wire`
+ * as `<server> <kind>:<text>`, and the stream's `inference:published*`
+ * traces in `traces`, each with its destination's server and channel.
+ * `during` runs inside the turn's tool call `one`, with the registry, to
+ * change the channels mid-turn.
+ */
+async function realRegistryTurn(
+  script: NormalizedResponse[],
+  channels: Array<[serverId: string, channelId: string]>,
+  during: (registry: ChannelRegistry, open: (serverId: string, channelId: string) => void) => Promise<void>,
+  /** Runs inside each publish, after the registry has sent it and before the server answers. */
+  onPublish?: (text: string, registry: ChannelRegistry, open: (serverId: string, channelId: string) => void) => Promise<void>,
+): Promise<{ wire: string[]; traces: string[] }> {
+  const dir = mkdtempSync(join(tmpdir(), 'af-outgoing-real-')); dirs.push(dir);
+  const membrane = new ScriptMembrane([script]);
+  const module = new ToolModule();
+  const framework = await AgentFramework.create({
+    storePath: join(dir, 'store'), membrane: membrane.asMembrane(),
+    agents: [{ name: 'assistant', model: 'test', systemPrompt: 'system' }], modules: [module], syncIntervalMs: 0,
+  });
+  const wire: string[] = [];
+  const traces: string[] = [];
+  framework.onTrace((event) => {
+    const e = event as { type: string; serverId?: string; channelId?: string; text?: string };
+    if (e.type === 'inference:published' || e.type === 'inference:published_complete') traces.push(`${e.type} ${JSON.stringify([e.serverId, e.channelId])} ${e.text}`);
+  });
+  const server = (name: string) => ({
+    grant: new CapabilityGrant(new Set(ALL_CAPABILITY_PATHS), []),
+    sendChannelsPublish: async (params: { content: Array<{ text: string }> }) => {
+      wire.push(`${name} publish:${params.content[0]!.text}`);
+      await onPublish?.(params.content[0]!.text, registry, open);
+      return { delivered: true };
+    },
+    sendChannelsOutgoingChunk: (params: { delta: string }) => { wire.push(`${name} chunk:${params.delta}`); },
+    sendChannelsOutgoingComplete: (params: { content: Array<{ text: string }> }) => { wire.push(`${name} complete:${params.content[0]!.text}`); },
+    sendChannelsTyping: () => {},
+  });
+  // Each server the registry asks for is connected, the one a channel moves to included.
+  const servers = new Map<string, ReturnType<typeof server>>();
+  const getServer = (id: string) => servers.get(id) ?? servers.set(id, server(id)).get(id)!;
+  const registry = new ChannelRegistry({ getServer } as never, {} as never, () => {}, () => {}, {});
+  const open = (serverId: string, channelId: string) => {
+    (registry as unknown as { channels: Map<string, unknown> }).channels.set(`${serverId}:${channelId}`,
+      { serverId, descriptor: { id: channelId, type: 'chat', label: channelId }, open: true });
+  };
+  for (const [serverId, channelId] of channels) open(serverId, channelId);
+  (framework as unknown as { channelRegistry: unknown }).channelRegistry = new Proxy(registry, {
+    get: (target, key: string) => {
+      if (key === 'resolveLocus') return () => 'room';
+      if (key === 'handleChannelToolCall') return async () => ({ success: true, data: {} });
+      if (key === 'getChannelTools') return () => [];
+      const value = (target as unknown as Record<string, unknown>)[key];
+      return typeof value === 'function' ? (value as (...args: unknown[]) => unknown).bind(target) : value;
+    },
+  });
+  module.during = async (c) => { if (c.id === 'one') await during(registry, open); };
+  try {
+    framework.pushEvent({ type: 'external-message', source: 'test', content: 'go', metadata: { channelId: 'room' } });
+    await framework.runUntilIdle();
+    await (framework as unknown as { proseSpeechChains: Map<string, Promise<void>> }).proseSpeechChains.get('assistant');
+  } finally {
+    await framework.stop();
+  }
+  return { wire, traces };
+}
+
+test("with the real channel registry, a stream ends in a channel its server declared inbound-only mid-turn: the complete carries what it streamed there", async () => {
+  const { wire } = await realRegistryTurn(
+    [round(text('first'), call('one', 'test--read')), final(text('second'))],
+    [['body', 'room']],
+    async (registry) => {
+      await registry.handleChanged('body', { updated: [{ id: 'room', type: 'chat', label: 'room', direction: 'inbound' }] } as never);
+    },
+  );
+  assert.deepEqual(wire, ['body publish:first', 'body chunk:first', 'body complete:first'],
+    'the later text is refused there, and the stream it took ends there');
+});
+
+test("with the real channel registry, a channel id that passes from one server to another mid-turn: each server is streamed only what was published to it", async () => {
+  const { wire, traces } = await realRegistryTurn(
+    [round(text('first'), call('one', 'test--read')), final(text('second'))],
+    [['a', 'room']],
+    async (registry, open) => {
+      await registry.handleChanged('a', { removed: ['room'] } as never);
+      open('b', 'room');
+    },
+  );
+  assert.deepEqual(wire, ['a publish:first', 'a chunk:first', 'b publish:second', 'b chunk:second', 'b complete:second'],
+    "b's words go to b alone, and a, which no longer registers the channel, gets no complete");
+  assert.deepEqual(traces, [
+    'inference:published ["a","room"] first',
+    'inference:published ["b","room"] second',
+    'inference:published_complete ["a","room"] first',
+    'inference:published_complete ["b","room"] second',
+  ], 'in-process consumers get each destination apart, by its server');
+});
+
+test("with the real channel registry, a chunk follows its publish's destination: a channel that moves to another server as the publish is answered streams none of it there", async () => {
+  // a removes `room` and b registers one while a's answer to the publish is
+  // on its way: the chunk is a's, which no longer registers the channel, so
+  // it goes nowhere, and never to b, whose channel got no publish.
+  const { wire, traces } = await realRegistryTurn(
+    [final(text('first'))],
+    [['a', 'room']],
+    async () => {},
+    async (_text, registry, open) => {
+      await registry.handleChanged('a', { removed: ['room'] } as never);
+      open('b', 'room');
+    },
+  );
+  assert.deepEqual(wire, ['a publish:first']);
+  assert.deepEqual(traces, [
+    'inference:published ["a","room"] first',
+    'inference:published_complete ["a","room"] first',
+  ], "the traces follow the publish's destination whatever the registry sends");
 });
 
 test('disabled: nothing streams, from a mid-turn round, trailing text or a text-only turn', async () => {

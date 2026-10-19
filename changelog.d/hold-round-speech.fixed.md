@@ -16,7 +16,7 @@
 
   The stream is now the prose that delivery published: each publish's
   text, to its channel, sent once the publish succeeds, a later one to the
-  same channel opening with a paragraph break. Tool publications, such as
+  same server's channel opening with a paragraph break. Tool publications, such as
   `send_message`, a `drafts` resend or the `sleep` tool's announcement,
   aren't part of it, as before. A publish succeeds only when the server
   confirms it (`delivered: true`), so one refused before sending, one that
@@ -87,12 +87,13 @@
   a draft, a log line names it, and in locus and hybrid mode the turn's
   delivery receipt counts it as suppressed.
 - Every stream now sends `channels/outgoing/complete` for each channel it
-  streamed to, on every exit path, as MCPL Spec 14.3 asks: once its
-  deliveries have run, or, when the host stops, at once, with what it has
-  sent, so a publish that succeeds after the stop began isn't streamed. A
-  stream that handed its turn to a budget restart or a tool-result-guard
-  retry never sent it, so a voice server never learned that stream's
-  utterance had ended.
+  streamed to, while its server registers it and takes the stream, on every
+  exit path, as MCPL Spec 14.3 asks: once its deliveries have run, or, when
+  the host stops, before its connections close, with what it has sent by
+  then, so a publish that succeeds after that isn't streamed. A stream that
+  handed its turn to a budget restart or a tool-result-guard retry never
+  sent it, so a voice server never learned that stream's utterance had
+  ended.
 - A membrane refusal retry no longer moves the outgoing stream to a new
   inference id. Nothing of the refused attempt was delivered, so none of it
   streamed; the rounds delivered before the refusal stay in the stream, and

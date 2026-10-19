@@ -306,7 +306,7 @@ configuration chooses the family, and nothing is probed:
 
 | Configuration | Family | Transport |
 |---|---|---|
-| `url: 'ws://…'` / `'wss://…'` | MCPL (MCP `2024-11-05`) | WebSocket |
+| `url: 'ws://…'` / `'wss://…'` | MCPL (MCP `2024-11-05`) | WebSocket (`token` / `accessProvider` as `?token=`, or as bearer with `tokenTransport: 'header'`) |
 | `url: 'http://…'` / `'https://…'` | modern MCP | Streamable HTTP (`token` / `accessProvider` as bearer) |
 | `command` | MCPL | stdio |
 | `command` + `protocol: 'modern'` | modern MCP | stdio |
@@ -322,6 +322,21 @@ configuration chooses the family, and nothing is probed:
 
 A configuration with both `command` and `url` needs `transport` to say which
 one is used; without it, it is refused rather than silently ignoring one.
+
+A WebSocket server's credential, its `token` or what its `accessProvider`
+returns for a dial, goes as a `token` query parameter by default
+(`tokenTransport: 'query'`). With `tokenTransport: 'header'` it goes as an
+`Authorization: Bearer` header on the upgrade instead, with no query
+parameter, so it stays out of the url and of the access logs that record it;
+the provider still runs at every dial and reconnect. Switch a server to
+`'header'` once it reads the header. A header carries a credential as
+configured only if it is printable ASCII with no space at either end, so
+header mode refuses any other, without quoting it: a static `token` when the
+server is added, and an access provider's at the dial. `tokenTransport` is
+refused on an http(s):// server, which always sends the header, and on a
+stdio server; `'header'` is refused with a url that carries a `token`
+parameter or userinfo of its own, since whenever the Bearer header carries a
+credential it replaces the userinfo's Basic one.
 
 A modern server's tools get the same prefix, `enabledTools`/`disabledTools`,
 class overrides and dispatch as an MCPL server's, and `listMcplServers()`
@@ -362,7 +377,7 @@ revisions the server says it supports ("none listed" for an empty list), or its 
 and when the list includes `2026-07-28` it says to configure the server with
 `protocol: 'modern'` (stdio) or reach it over http(s).
 
-Server and transport text the framework records has the server's configured credentials replaced, in both engines. That covers connection traces, console lines, stderr traces, ops alerts, and a tool call's failure as its caller, the model and the `tool:failed` trace get it. The credentials are those the configuration holds and those its dials sent: from the url as each dial sends it (a WebSocket dial sets the token in the query, which writes the whole query again, form-encoded, and an access provider's token can be in it), credential-like path segments and query names, credential-shaped or credential-named query values, and a WebSocket url's userinfo, in their encoded and decoded forms, replaced wherever they occur; every non-empty query parameter as its whole `name=value`, where no letter or digit adjoins it; the static `token`, and each token an access provider handed a dial, the newest sixteen, raw and url-encoded; and a stdio server's `env` values whose names have a part ending in a credential word, such as `GITHUB_TOKEN`, `PGPASSWORD` or `SESSION_COOKIE`, raw and url-encoded. A stdio server's command-line arguments aren't derived. Standalone strings shorter than eight characters stay unchanged because they may be ordinary words; short query values are still removed with their parameter names. Treat a submitted configuration as immutable while the server uses it: apply changes with `restartMcplServer(id, newConfig)`. Secrets neither the configuration holds nor a dial sent remain outside this filtering. JSON-RPC tool answers, and the error a host's own connect raises, pass through as sent.
+Server and transport text the framework records has the server's configured credentials replaced, in both engines. That covers connection traces, console lines, stderr traces, ops alerts, and a tool call's failure as its caller, the model and the `tool:failed` trace get it. The credentials are those the configuration holds and those its dials sent: from the url as each dial sends it (a WebSocket dial sets the token in the query, which writes the whole query again, form-encoded, and an access provider's token can be in it; with `tokenTransport: 'header'` it sets none), credential-like path segments and query names, credential-shaped or credential-named query values, and a WebSocket url's userinfo, in their encoded and decoded forms, replaced wherever they occur; every non-empty query parameter as its whole `name=value`, where no letter or digit adjoins it; the static `token`, and each token an access provider handed a dial, the newest sixteen, raw and url-encoded; and a stdio server's `env` values whose names have a part ending in a credential word, such as `GITHUB_TOKEN`, `PGPASSWORD` or `SESSION_COOKIE`, raw and url-encoded. A stdio server's command and arguments aren't derived. Standalone strings shorter than eight characters stay unchanged because they may be ordinary words; short query values are still removed with their parameter names. Treat a submitted configuration as immutable while the server uses it: apply changes with `restartMcplServer(id, newConfig)`. Secrets neither the configuration holds nor a dial sent remain outside this filtering. A JSON-RPC tool answer's result passes through as sent. No error a host's own call gets, whether thrown, rejected with or in an error answer's data, carries a credential this filtering replaces, whoever wrote its words: a server's words are redacted, then bounded, where an error is built from them, the strings in an error answer's data are redacted, and an error a library raised, such as a failed modern connect's, is handed on as its name and its redacted words alone. A stdio child that couldn't be started is refused with Node's words redacted, stopping before Node's quote of a value it refused at once, and a cause that keeps Node's error's name, those words and its `code`. With a configuration that can't be read, the server's words and data are withheld. A failed handshake's `stderrTail` is the end of the server's stderr, with every credential of up to 14,336 characters that reaches into it replaced whole. A number in an error answer's data is matched as JavaScript reads it, so one with more significant digits than a double holds has lost its last digits before it's matched. A close's or a cleanup's failure carries the transports' own words, a child's pid, its server's id and the wait it was given. A connection's events are inputs to the framework's records, which redact them.
 
 #### Feature sets
 

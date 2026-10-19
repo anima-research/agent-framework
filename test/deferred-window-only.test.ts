@@ -10,9 +10,12 @@
  * under. Two kinds of message can't be injected: one carrying tool blocks
  * (it would break the tool cycle membrane enforces) and one named as the
  * agent itself (a prefill). Those wait for the turn's end, and so does
- * everything queued behind them, so the queue's order holds. A provider that
- * binds signed thinking to its prefix (context-manager #155) refuses a reply
- * whose stored prefix holds a message its request didn't.
+ * everything queued behind them, so the queue's order holds. A message a
+ * tune-out holds from the residents is stored at the boundary and not
+ * injected, since the next compile leaves it out too
+ * (module-rows-held-from-residents). A provider that binds signed thinking
+ * to its prefix (context-manager #155) refuses a reply whose stored prefix
+ * holds a message its request didn't.
  *
  * A message the stream carried has been read: RFC-006's consumed watermark
  * covers it, so a coalesced replacement can no longer remove it. Only a

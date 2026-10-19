@@ -15,6 +15,15 @@ import { WorkspaceModule } from '../src/modules/workspace/index.js';
 import { DEFAULT_TOOL_RESULT_INLINE_MAX_CHARS } from '../src/tool-result-history.js';
 import { JsStore } from '@animalabs/chronicle';
 
+/**
+ * A stream message's channel as the test records it. Each delivery hands its
+ * stream the destination its publish went to, here the stub's server: one
+ * for any other server is recorded with it, so a delivery that loses its
+ * server fails the test.
+ */
+const streamedAt = (to: { serverId: string; channelId: string }) =>
+  (to.serverId === 'stub' ? to.channelId : `${to.channelId} (server ${to.serverId})`);
+
 // What a withheld result settles to with no writable workspace (#277): the
 // neutral notice, then where the original is kept. Written out, not computed
 // by withheldResultNotice, so a change of its wording fails here.
@@ -394,11 +403,11 @@ test('explicit mode: a guard retry streams on to the sticky destination delivery
     routeSpeech: async (_agent: string, speech: string, channelId: string) => {
       routed.push({ text: speech, channelId }); return { delivered: true, channelId };
     },
-    sendOutgoingChunk: (channelId: string, _agent: string, _id: string, _index: number, delta: string) => {
-      streamed.push({ channelId, delta });
+    sendOutgoingChunk: (to: { serverId: string; channelId: string }, _agent: string, _id: string, _index: number, delta: string) => {
+      streamed.push({ channelId: streamedAt(to), delta });
     },
-    sendOutgoingComplete: (channelId: string, _agent: string, inferenceId: string, text: string) => {
-      completed.push({ channelId, text, inferenceId });
+    sendOutgoingComplete: (to: { serverId: string; channelId: string }, _agent: string, inferenceId: string, text: string) => {
+      completed.push({ channelId: streamedAt(to), text, inferenceId });
     },
     getDefaultPublishChannel: () => null, isChannelOpen: () => true,
     getDescriptor: () => undefined, getChannelTools: () => [],
@@ -489,8 +498,8 @@ test('explicit mode: after a budget restart, the resumed reply streams where del
       order.push(`published:${text}`);
       return { delivered: true, channelId };
     },
-    sendOutgoingChunk: (channelId: string, _agent: string, _id: string, _index: number, delta: string) => {
-      streamed.push({ channelId, delta });
+    sendOutgoingChunk: (to: { serverId: string; channelId: string }, _agent: string, _id: string, _index: number, delta: string) => {
+      streamed.push({ channelId: streamedAt(to), delta });
       order.push(`chunk:${delta.trim()}`);
     },
     getDefaultPublishChannel: () => null, isChannelOpen: () => true,
@@ -552,8 +561,8 @@ test("explicit mode: a private round's prefix doesn't move where a budget restar
       routed.push({ text, channelId });
       return { delivered: true, channelId };
     },
-    sendOutgoingChunk: (channelId: string, _agent: string, _id: string, _index: number, delta: string) => {
-      streamed.push({ channelId, delta });
+    sendOutgoingChunk: (to: { serverId: string; channelId: string }, _agent: string, _id: string, _index: number, delta: string) => {
+      streamed.push({ channelId: streamedAt(to), delta });
     },
     handleChannelToolCall: async () => ({ success: true, data: { noted: true } }),
     getDefaultPublishChannel: () => null, isChannelOpen: () => true, getDescriptor: () => undefined,
@@ -631,8 +640,8 @@ async function heldRestart(mode: 'explicit' | 'locus', texts: { first: string; s
       if (text.trim() === 'first') await firstHeld;
       return { delivered: true, channelId };
     },
-    sendOutgoingChunk: (channelId: string, _agent: string, _id: string, _index: number, delta: string) => {
-      streamed.push({ channelId, delta });
+    sendOutgoingChunk: (to: { serverId: string; channelId: string }, _agent: string, _id: string, _index: number, delta: string) => {
+      streamed.push({ channelId: streamedAt(to), delta });
     },
     getDefaultPublishChannel: () => null, isChannelOpen: () => true,
     getDescriptor: () => undefined, getChannelTools: () => [],
@@ -705,11 +714,11 @@ function explicitRegistry(h: Awaited<ReturnType<typeof harness>>) {
       routed.push({ text: text.trim(), channelId });
       return { delivered: true, channelId };
     },
-    sendOutgoingChunk: (channelId: string, _agent: string, inferenceId: string, _index: number, delta: string) => {
-      streamed.push({ channelId, delta, inferenceId });
+    sendOutgoingChunk: (to: { serverId: string; channelId: string }, _agent: string, inferenceId: string, _index: number, delta: string) => {
+      streamed.push({ channelId: streamedAt(to), delta, inferenceId });
     },
-    sendOutgoingComplete: (channelId: string, _agent: string, inferenceId: string, text: string) => {
-      completed.push({ channelId, text, inferenceId });
+    sendOutgoingComplete: (to: { serverId: string; channelId: string }, _agent: string, inferenceId: string, text: string) => {
+      completed.push({ channelId: streamedAt(to), text, inferenceId });
     },
     handleChannelToolCall: async () => ({ success: true, data: { noted: true } }),
     getDefaultPublishChannel: () => null, isChannelOpen: () => true, getDescriptor: () => undefined,
@@ -1093,8 +1102,8 @@ for (const shape of ['text-only', 'trailing'] as const) {
         routed.push({ text: text.trim(), channelId });
         return { delivered: true, channelId };
       },
-      sendOutgoingChunk: (channelId: string, _agent: string, _id: string, _index: number, delta: string) => {
-        streamed.push({ channelId, delta });
+      sendOutgoingChunk: (to: { serverId: string; channelId: string }, _agent: string, _id: string, _index: number, delta: string) => {
+        streamed.push({ channelId: streamedAt(to), delta });
       },
       getDefaultPublishChannel: () => null, isChannelOpen: () => true,
       getDescriptor: () => undefined, getChannelTools: () => [],

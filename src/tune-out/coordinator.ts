@@ -63,6 +63,12 @@ export interface TuneOutFrameworkHooks {
   primaryName: () => string | null;
   /** Read the primary's stored messages (shared slot, unfiltered). */
   getStoredMessages: () => StoredMessage[];
+  /**
+   * Messages admitted for the primary but not yet in its store (deferred
+   * while a turn was alive), oldest first. A cancel reads them too, so a
+   * message held mid-turn is in the backlog it belongs to (#232 gap 7).
+   */
+  getDeferredMessages?: () => Array<Pick<StoredMessage, 'participant' | 'content' | 'metadata'>>;
   /** Current chronicle head sequence (window anchor for new epochs). */
   currentSequence: () => number;
   /** Move the subconscious window anchor (never forward past active epochs). */
@@ -302,22 +308,41 @@ export class TuneOutCoordinator {
     this.clearTimers(serverId, channelId);
     this.divertedSinceInvocation.delete(this.key(serverId, channelId));
 
-    // Backlog: every message stamped with this epoch, oldest first.
+    // Backlog: every message held under this epoch. The stored ones come in
+    // store order, then those still in the deferred queue (held mid-turn,
+    // not yet written), oldest first. That's arrival order, except when a
+    // held message stays queued while a later one is stored: a store write
+    // refused at a turn-start flush leaves it queued, and that turn's
+    // assembly can then store later coalesced messages directly.
     const epochId = ended.params.epochId;
-    const backlog = this.hooks.getStoredMessages().filter(
-      (m) => (m.metadata as { tuneOut?: { epochId?: string } } | undefined)?.tuneOut?.epochId === epochId,
-    );
+    const ofEpoch = (m: Pick<StoredMessage, 'metadata'>): boolean =>
+      (m.metadata as { tuneOut?: { epochId?: string } } | undefined)?.tuneOut?.epochId === epochId;
+    const held = (this.hooks.getDeferredMessages?.() ?? []).filter(ofEpoch);
+    const backlog: Array<Pick<StoredMessage, 'participant' | 'content' | 'metadata'>> = [
+      ...this.hooks.getStoredMessages().filter(ofEpoch),
+      ...held,
+    ];
     const cap = ended.params.backlogCap;
     const shown = cap > 0 ? backlog.slice(-cap) : [];
     const truncated = backlog.length - shown.length;
+    // The held messages the cap leaves out of the dump, the oldest of them.
+    // The subconscious's report covers what the dump leaves out, but its view
+    // holds stored rows only, so these go to it with its notice below. So does
+    // a held message the dump shows whose image or audio its text lines drop.
+    const heldLeftOut = held.slice(0, Math.max(0, held.length - shown.length));
+    const heldForReport = [
+      ...heldLeftOut,
+      ...held.slice(heldLeftOut.length).filter((m) => m.content.some((b) => b.type !== 'text')),
+    ];
 
+    const authorOf = (m: Pick<StoredMessage, 'participant' | 'metadata'>): string =>
+      (m.metadata as { author?: { name?: string } } | undefined)?.author?.name ?? m.participant;
     const lines = shown.map((m) => {
-      const author = (m.metadata as { author?: { name?: string } } | undefined)?.author?.name ?? m.participant;
       const text = m.content
         .filter((b): b is Extract<ContentBlock, { type: 'text' }> => b.type === 'text')
         .map((b) => b.text)
         .join('\n');
-      return `${author}: ${text}`;
+      return `${authorOf(m)}: ${text}`;
     });
     const attrs = [
       `channel="${channelId}"`,
@@ -346,20 +371,40 @@ export class TuneOutCoordinator {
     if (primary) {
       this.hooks.requestInference(primary, `tune-out cancelled (${reason})`, 'tune-out');
     }
-    // The subconscious gets one cancel turn of its own (unless it initiated
-    // the cancel — its note already carries its words): the issue's cancel
+    // The subconscious gets one cancel turn of its own: the issue's cancel
     // shape is dump + a report from the subconscious, and when the cap
-    // truncated the raw dump, its summary is what covers the tail.
-    if (source !== 'subconscious' && subName) {
+    // truncated the raw dump, its summary is what covers the tail. The held
+    // messages the dump can't give the resident whole follow the notice,
+    // each a row of its own with its own content, as its view can't have
+    // them until they're stored. A cancel the subconscious makes itself gets
+    // the notice and the turn when some do, since it wrote its note before
+    // it could see them, and when it wrote no note and the cap cut anything,
+    // since nothing else then covers what the dump leaves out. Otherwise its
+    // note speaks for what it saw.
+    const selfCancel = source === 'subconscious';
+    if (subName && (!selfCancel || heldForReport.length > 0 || (!subconsciousNote && truncated > 0))) {
       const truncNote = truncated > 0
-        ? ` ${truncated} of ${backlog.length} diverted messages were above the cap and not delivered raw.`
+        ? ` ${truncated} of ${backlog.length} diverted messages were above the cap and not delivered raw to the resident.`
+        : '';
+      const heldNote = heldForReport.length > 0
+        ? ` Still held at the cancel, so your view may not have them yet: the ${heldForReport.length} message${heldForReport.length === 1 ? '' : 's'} after this one.`
         : '';
       this.hooks.addMessage(
         'user',
-        [{ type: 'text', text: `[Tune-out cancelled: ${channelId} — ${reason}.${truncNote}]` }],
+        [{ type: 'text', text: `[Tune-out cancelled: ${channelId} — ${reason}.${truncNote}${heldNote}]` }],
         { system: true, kind: 'tune-out-cancel-report', channelId },
         subName,
       );
+      // Each held message is a row of its own, so a per-message cap cuts each
+      // one on its own, its author's label included, not the batch's newest.
+      for (const m of heldForReport) {
+        this.hooks.addMessage(
+          'user',
+          [{ type: 'text', text: `${authorOf(m)}:` }, ...m.content],
+          { system: true, kind: 'tune-out-cancel-held', channelId },
+          subName,
+        );
+      }
       this.hooks.requestInference(subName, `tune-out cancelled: ${channelId}`, 'tune-out');
     }
     this.hooks.emitTrace({ type: 'tune-out:cancelled', serverId, channelId, epochId, reason, wakeCount: ended.wakeCount });

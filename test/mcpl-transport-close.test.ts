@@ -215,7 +215,10 @@ for (const unreadable of [false, true]) test(`a failed handshake's transport err
   // The frame's error text, "invalid opcode 3", quotes this token.
   const config: McplServerConfig = { id: 'malformed', url: `ws://127.0.0.1:${port}`, token: 'invalid opcode' };
   if (unreadable) Object.defineProperty(config, 'env', { enumerable: true, get() { throw new Error('this configuration cannot be read'); } });
-  await assert.rejects(McplServerConnection.connect(config, { version: '0.5' }), /initialize error: refused by the test server/);
+  await assert.rejects(McplServerConnection.connect(config, { version: '0.5' }), (error: Error) => {
+    assert.equal(error.message, `MCPL server "malformed" initialize error: ${unreadable ? WITHHELD : 'refused by the test server'}`);
+    return true;
+  });
   await waitFor(() => logged.some((line) => line.includes('after the handshake settled')), 'the frame\'s error to be logged');
   const text = unreadable ? WITHHELD : 'Invalid WebSocket frame: redacted 3';
   assert.ok(

@@ -27,7 +27,8 @@ export interface MessageQuery {
 
 /**
  * A message as a module context's reads answer it: a stored row, or a row
- * for a write the framework holds (`held`).
+ * for a write the framework holds (`held`). Either is marked
+ * `heldFromResidents` when a tune-out holds it from the residents.
  */
 export type ModuleMessage = StoredMessage & {
   /**
@@ -42,6 +43,25 @@ export type ModuleMessage = StoredMessage & {
    * when it lands. Absent on a stored row.
    */
   held?: true;
+  /**
+   * True on a message a tune-out holds from the residents: one that arrived
+   * in a tuned-out channel, stamped `metadata.tuneOut` as it came in. The
+   * store keeps it, but no resident is shown the row itself: no resident's
+   * compiled view includes it, during the tune-out or after it, and a tool
+   * boundary of a turn alive when it arrived stores it without injecting it
+   * into the live turn. The subconscious reads it. Its text can still reach
+   * a resident in rows of their own, which aren't marked, such as the
+   * cancel's `<tuned-out-backlog>` row, with the text of the last
+   * `backlogCap` of the tune-out's messages, the stored ones first and then
+   * those still held; what the subconscious says of it, in its report or its
+   * note; and the result of a tool that reads history on request, such as a
+   * channel's `fetch_history` or the history module's `extract`. A module
+   * that builds on what the residents see, such as one choosing from the
+   * recent conversation, leaves a marked row out, and one that matches
+   * what's stored, such as a sync's dedupe, keeps it. A held write (`held`)
+   * is marked too when it carries the stamp. Absent on every other row.
+   */
+  heldFromResidents?: true;
 };
 
 /**
@@ -312,7 +332,9 @@ export interface ModuleContext {
   findMessageByExternalId(source: string, externalId: string): MessageId | null;
 
   /**
-   * Get a message by its id or a held write's handle.
+   * Get a message by its id or a held write's handle, marked
+   * `heldFromResidents` when a tune-out holds it from the residents
+   * (ModuleMessage).
    */
   getMessage(id: MessageId): ModuleMessage | null;
 
@@ -322,7 +344,9 @@ export interface ModuleContext {
    * The rows of writes the framework holds come after the stored rows, as
    * the newest, or before them in a reversed query, marked `held`
    * (ModuleMessage). Those the last process held show once create() has
-   * restored them, after every module's start() (addMessage).
+   * restored them, after every module's start() (addMessage). A message a
+   * tune-out holds from the residents is among the rows, marked
+   * `heldFromResidents` (ModuleMessage).
    */
   queryMessages(filter: MessageQuery): MessageQueryResult;
 

@@ -18,7 +18,7 @@ import assert from 'node:assert';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import type { NormalizedRequest, NormalizedResponse, YieldingStream } from '@animalabs/membrane';
+import type { ContentBlock, NormalizedRequest, NormalizedResponse, YieldingStream } from '@animalabs/membrane';
 import type {
   EventResponse,
   Module,
@@ -73,6 +73,62 @@ class BlobToolModule implements Module {
       };
     }
     return {};
+  }
+}
+
+/** A 1x1 PNG: a real image, so the message is one a store keeps as sent. */
+const PNG_1PX = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII=';
+const PHOTOS_TEXT = 'Here are the photos.';
+const image = (): ContentBlock => ({ type: 'image', source: { type: 'base64', data: PNG_1PX, mediaType: 'image/png' } }) as ContentBlock;
+
+/**
+ * A tool whose first call brings in a message with the given blocks beside
+ * a line of text while it runs, as someone sending photos mid-turn does.
+ * The framework holds the message, and the next round carries it as a
+ * mid-turn injection. Later calls bring in nothing.
+ */
+class PhotosDuringToolModule implements Module {
+  readonly name = 'canned';
+  framework: AgentFramework | undefined = undefined;
+  private messages = 0;
+  private brought = false;
+  private readonly blocks: ContentBlock[];
+  constructor(blocks: number | ContentBlock[]) {
+    this.blocks = typeof blocks === 'number' ? Array.from({ length: blocks }, image) : blocks;
+  }
+  async start(): Promise<void> {}
+  async stop(): Promise<void> {}
+  getTools(): ToolDefinition[] {
+    return [{ name: 'fetch', description: 'small', inputSchema: { type: 'object', properties: {} } }];
+  }
+  async handleToolCall(): Promise<ToolResult> {
+    if (!this.brought) {
+      this.brought = true;
+      const framework = this.framework!;
+      framework.pushEvent({
+        type: 'external-message',
+        source: 'test',
+        content: [{ type: 'text', text: PHOTOS_TEXT }, ...this.blocks],
+        metadata: {},
+      } as unknown as ProcessEvent);
+      // The call returns once the framework holds this message for the
+      // round's boundary.
+      const held = () => (framework as unknown as { deferredMessages: Array<{ content: ContentBlock[] }> }).deferredMessages
+        .some((m) => m.content.some((b) => b.type === 'text' && b.text === PHOTOS_TEXT));
+      for (const end = Date.now() + 5_000; !held();) {
+        if (Date.now() > end) throw new Error('the message was never held for the boundary');
+        await new Promise((r) => setTimeout(r, 5));
+      }
+    }
+    return { success: true, data: { ok: true } };
+  }
+  async onProcess(event: ProcessEvent): Promise<EventResponse> {
+    if (event.type !== 'external-message') return {};
+    // Only the first message, the turn's own, asks for a turn.
+    return {
+      addMessages: [{ participant: 'User', content: (event as { content: unknown }).content as never }],
+      ...(this.messages++ === 0 ? { requestInference: true } : {}),
+    };
   }
 }
 
@@ -268,6 +324,7 @@ describe('physical-window mid-turn restart (issue #92)', () => {
       modules: [module],
       syncIntervalMs: 0,
     });
+    if ('framework' in module) (module as { framework?: AgentFramework }).framework = framework;
     const traces: TraceEvent[] = [];
     framework.onTrace((e) => traces.push(e));
     framework.start();
@@ -495,6 +552,135 @@ describe('physical-window mid-turn restart (issue #92)', () => {
       assert.ok(t.done, 'the turn should finish');
       assert.deepStrictEqual(t.restarts, [], 'every boundary fits');
       assert.strictEqual(t.membrane.calls.length, 1);
+    } finally {
+      await t.close();
+    }
+  });
+
+  /** The messages of a request that carry the photos message's text. */
+  const photosIn = (request: { messages: Array<{ content: ContentBlock[] }> }) =>
+    request.messages.filter((m) => m.content.some((b) => b.type === 'text' && b.text.includes(PHOTOS_TEXT)));
+
+  for (const images of [0, 3]) {
+    it(`counts a mid-turn message's images toward a restart: ${images} image${images === 1 ? '' : 's'}`, async () => {
+      // A 163k prompt, 2k of output and the 32k reserve make 197k. The round
+      // appends a short tool result and a message, and each image in the
+      // message counts 1,600 tokens, as a tool result's does: with none the
+      // projection fits the 200k window, and three cross it.
+      const t = await windowTurn([
+        [
+          round('call_1', { inputTokens: 20_000, cacheReadTokens: 143_000, outputTokens: 2_000 }),
+          round(null, { inputTokens: 21_000, cacheReadTokens: 306_000, outputTokens: 2_500 }),
+        ],
+        afterRestart,
+      ], new PhotosDuringToolModule(images));
+      try {
+        assert.ok(t.done, 'the turn should finish');
+        if (images === 0) {
+          assert.strictEqual(t.restarts.length, 0, 'control: without images the round fits');
+          const injected = t.membrane.lastStream!.receivedToolResultOptions
+            .flatMap((o) => o?.injectedMessages ?? [])
+            .flatMap((m) => m.content as Array<{ type: string; text?: string }>);
+          assert.ok(injected.some((b) => b.text === PHOTOS_TEXT), 'control: the message rode into the next round');
+        } else {
+          assert.strictEqual(t.restarts.length, 1, "the message's images cross the window");
+          assert.strictEqual(t.restarts[0]!.reason, 'physical_window');
+          // The round's short texts and envelopes come to under 100 tokens,
+          // which this doesn't pin: the images' 1,600 each is what it checks.
+          const appended = t.restarts[0]!.inputTokens! - (163_000 + 2_000 + 32_000);
+          assert.ok(appended >= images * 1_600 && appended < images * 1_600 + 100, `the round's estimate counts each image at 1,600 tokens: ${appended}`);
+          assert.ok(storedTexts(t.framework).includes('Answered after a restart'), "the answer is the restarted stream's");
+          assert.strictEqual(t.membrane.calls.length, 2, 'the first stream, then the restart');
+          const carried = photosIn(t.membrane.calls[1]!);
+          assert.strictEqual(carried.length, 1, 'the restarted request carries the photos message once');
+          assert.strictEqual(carried[0]!.content.filter((b) => b.type === 'image').length, images, 'with its images');
+        }
+      } finally {
+        await t.close();
+      }
+    });
+  }
+
+  /** One round on the same figures as the image test, with a message of
+   *  the given blocks: whether it restarts, what the round added, and
+   *  whether the message reached the next round or the restarted request. */
+  async function photosRound(blocks: ContentBlock[]): Promise<{ restarted: boolean; appended: number | undefined; carried: boolean }> {
+    const t = await windowTurn([
+      [
+        round('call_1', { inputTokens: 20_000, cacheReadTokens: 143_000, outputTokens: 2_000 }),
+        round(null, { inputTokens: 21_000, cacheReadTokens: 306_000, outputTokens: 2_500 }),
+      ],
+      afterRestart,
+    ], new PhotosDuringToolModule(blocks));
+    try {
+      assert.ok(t.done, 'the turn should finish');
+      const restart = t.restarts[0];
+      const injected = t.membrane.lastStream!.receivedToolResultOptions
+        .flatMap((o) => o?.injectedMessages ?? [])
+        .some((m) => (m.content as ContentBlock[]).some((b) => b.type === 'text' && b.text === PHOTOS_TEXT));
+      const carried = restart !== undefined ? photosIn(t.membrane.calls[1]!).length === 1 : injected;
+      return { restarted: restart !== undefined, appended: restart ? restart.inputTokens! - (163_000 + 2_000 + 32_000) : undefined, carried };
+    } finally {
+      await t.close();
+    }
+  }
+
+  it("prices a mid-turn generated image as an image", async () => {
+    const generated = { type: 'generated_image', data: PNG_1PX, mimeType: 'image/png' } as ContentBlock;
+    const { restarted, appended } = await photosRound([generated, generated, generated]);
+    assert.ok(restarted, 'three generated images cross the window, as three images do');
+    assert.ok(appended! >= 3 * 1_600 && appended! < 3 * 1_600 + 100, `each at 1,600 tokens: ${appended}`);
+  });
+
+  it("prices a mid-turn image at its tokenEstimate stamp", async () => {
+    const stamped = { ...image(), tokenEstimate: 100 } as ContentBlock;
+    const { restarted, carried } = await photosRound([stamped, stamped, stamped]);
+    assert.ok(!restarted, 'three images stamped at 100 tokens fit, where three unstamped cross');
+    assert.ok(carried, 'the message rode into the next round');
+  });
+
+  for (const stamp of [Number.NaN, -1_600]) {
+    it(`prices a mid-turn image whose stamp is ${stamp} at 1,600, as an unstamped one`, async () => {
+      const stamped = { ...image(), tokenEstimate: stamp } as ContentBlock;
+      const { restarted, appended } = await photosRound([stamped, stamped, stamped]);
+      assert.ok(restarted, 'three such images cross the window, as three unstamped do');
+      assert.ok(appended! >= 3 * 1_600 && appended! < 3 * 1_600 + 100, `each at 1,600 tokens: ${appended}`);
+    });
+  }
+
+  for (const kind of ['document', 'audio', 'video'] as const) {
+    it(`prices a mid-turn ${kind} at 1,000 tokens, as the store does`, async () => {
+      const mediaType = { document: 'application/pdf', audio: 'audio/wav', video: 'video/mp4' }[kind];
+      const block = { type: kind, source: { type: 'base64', data: 'AAAA', mediaType } } as ContentBlock;
+      const { restarted, appended } = await photosRound([block, block, block, block]);
+      assert.ok(restarted, `four of them cross the window`);
+      assert.ok(appended! >= 4 * 1_000 && appended! < 4 * 1_000 + 100, `each at 1,000 tokens: ${appended}`);
+    });
+  }
+
+  it("carries a mid-turn message's images past a call that reports no prompt", async () => {
+    // Call 1 reports a 160k prompt and 2k of output. During its tool a
+    // message brings in three photos: 160k + 2k + the round (the photos'
+    // 4,800 and under 100 for its texts and envelopes) + the 32k reserve is
+    // under 199k, so the round fits and goes on, and what it appended joins
+    // the growth the next boundary carries. Call 2 reports 2k of output but
+    // no prompt, so the second boundary projects call 1's figures plus that
+    // growth, past the window. Without the photos in the growth it would
+    // project about 196.1k and dispatch.
+    const t = await windowTurn([
+      [
+        round('call_1', { inputTokens: 20_000, cacheReadTokens: 140_000, outputTokens: 2_000 }),
+        round('call_2', { inputTokens: 20_000, cacheReadTokens: 140_000, outputTokens: 4_000 }),
+        round(null, { inputTokens: 21_000, cacheReadTokens: 300_000, outputTokens: 4_500 }),
+      ],
+      afterRestart,
+    ], new PhotosDuringToolModule(3));
+    try {
+      assert.ok(t.done, 'the turn should finish');
+      assert.strictEqual(t.restarts.length, 1, 'the second boundary restarts, the first fits');
+      assert.strictEqual(t.membrane.calls.length, 2, 'the first stream, then the restart');
+      const carried = t.restarts[0]!.inputTokens! - (160_000 + 2_000 + 2_000 + 32_000);
+      assert.ok(carried >= 3 * 1_600 && carried < 3 * 1_600 + 100, `the growth carried the photos at 1,600 each: ${carried}`);
     } finally {
       await t.close();
     }

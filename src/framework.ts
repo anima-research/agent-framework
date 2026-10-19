@@ -71,7 +71,7 @@ import type {
   SameRoundThinkTextPolicy,
   ModuleMessage,
 } from './types/index.js';
-import { heldHandle, heldWriteId, matchesMessageQuery } from './held-writes.js';
+import { asModuleRow, heldHandle, heldWriteId, matchesMessageQuery } from './held-writes.js';
 import { ProcessQueueImpl } from './queue.js';
 import { DEFAULT_SHUTDOWN_TIMEOUT_MS, validateShutdownTimeout, shutdownErrorMessage, waitForShutdown, ShutdownTimeoutError } from './shutdown.js';
 import { REFUSAL_REACTIONS, REFUSAL_REACTION_FALLBACK, REFUSAL_REACTION_BASELINE } from './refusal-reactions.js';
@@ -102,7 +102,7 @@ import { isSilentHeartbeatMarker, isVisiblyEmptyContent, NON_STRING_TEXT_PLACEHO
 import { parseProsePrefix, parseHybridProsePrefix } from './mcpl/prose-grammar.js';
 import { detectKnownToolWrapperProse } from './tool-wrapper-prose-guard.js';
 import { InferenceRouter } from './mcpl/inference-router.js';
-import { ChannelRegistry, connectorText, journalToolDescription, type ChannelToolOrigin, type PublishDestination, type PublishOutcome } from './mcpl/channel-registry.js';
+import { ChannelRegistry, connectorText, destinationKey, journalToolDescription, type ChannelToolOrigin, type PublishDestination, type PublishOutcome } from './mcpl/channel-registry.js';
 import { KEEP_IDLE_MS, KEEP_NEWEST, ProseDraftStore, draftState, uncertainAttempt, type Draft, type DraftAttempt, type DraftReason, type DraftState, type InheritedRisk } from './prose-drafts.js';
 import { ConversationRouter, CONVERSATION_ROUTING_DEPRECATION_NOTICE } from './mcpl/conversation-router.js';
 import { INBOUND_SOURCE_KEY, type InboundAcceptanceObserver, type InboundChannelSource, type InboundLane, type InboundSource, type InboundUnscopedSource } from './mcpl/inbound-source.js';
@@ -336,11 +336,17 @@ const isConversationalInjection = (metadata?: MessageMetadata): boolean => {
 /**
  * Rough token estimate for the blocks a continuation round is about to
  * append to the live wire (issue #92 physical-window projection): the
- * spilled tool-result strings at chars/4, a flat per-image cost for native
- * image blocks the wire path preserves (provider vision tokens are
- * resolution-dependent; 1600 ≈ a max-size Anthropic tile), mid-turn injected
- * text at chars/4, and a small per-block envelope allowance. Deliberately a
- * ceiling-ish heuristic — the cost of overestimating is one early recompile;
+ * spilled tool-result strings at chars/4, a flat per-image cost for the
+ * native image blocks a tool result carries (provider vision tokens are
+ * resolution-dependent; 1600 ≈ one image at Anthropic's largest size), a
+ * mid-turn message's text at chars/4 and its other blocks about as
+ * context-manager's store prices them (injectedBlockTokens), and a small
+ * per-block envelope allowance. On membrane's native tool path a mid-turn
+ * message rides into the next round with its stored content as it is
+ * (provideToolResults' injectedMessages); its XML tool path drops injected
+ * messages, so there the estimate errs high. Deliberately a
+ * ceiling-ish heuristic, but for a mid-turn message's media at the store's
+ * flat prices — the cost of overestimating is one early recompile;
  * the cost of underestimating is the 400 this projection exists to prevent.
  */
 function estimateAppendedRoundTokens(
@@ -359,15 +365,52 @@ function estimateAppendedRoundTokens(
       }
     }
   }
+  let injectedTokens = 0;
   for (const inj of injections) {
     for (const block of inj.content) {
       if (block.type === 'text' && typeof (block as { text?: unknown }).text === 'string') {
         chars += (block as { text: string }).text.length;
+      } else {
+        injectedTokens += injectedBlockTokens(block);
       }
     }
   }
   const blockCount = toolResults.length + injections.length;
-  return Math.ceil(chars / 4) + images * 1600 + blockCount * 20;
+  return Math.ceil(chars / 4) + images * 1600 + injectedTokens + blockCount * 20;
+}
+
+/**
+ * A mid-turn message's non-text block, priced about as context-manager's store
+ * prices it (MessageStore's raw estimate at 0.14.1): an image at its
+ * `tokenEstimate` stamp, or 1600 without one, and a document, audio or video
+ * at 1000. These are the store's flat estimates, not ceilings: a PDF's pages
+ * can cost more than 1000. Of the writers in agent-framework, channel
+ * messages and MCPL bring images, MCPL push events and channel messages
+ * bring audio, and none writes a document or a video; a host module's
+ * addMessage can write any of them. Two departures err high. A generated
+ * image, which the store prices at 0, is priced as an image, since
+ * membrane's Anthropic formatter sends it as one. A stamp that isn't a
+ * finite number, 0 or more, is priced at 1600, where the store takes it as
+ * given: a NaN would make the whole projection NaN, and the round would
+ * never restart. Thinking and other blocks are priced at 0: they come from
+ * provider responses, stored as the agent's own messages, and nothing in
+ * agent-framework writes them under another participant, though a host
+ * module's addMessage could.
+ */
+function injectedBlockTokens(block: ContentBlock): number {
+  switch (block.type) {
+    case 'image':
+    case 'generated_image': {
+      const stamp = (block as { tokenEstimate?: unknown }).tokenEstimate;
+      return typeof stamp === 'number' && Number.isFinite(stamp) && stamp >= 0 ? stamp : 1600;
+    }
+    case 'document':
+    case 'audio':
+    case 'video':
+      return 1000;
+    default:
+      return 0;
+  }
 }
 
 /**
@@ -957,10 +1000,11 @@ function freshTurnRouting(): TurnRouting {
 
 /**
  * What a prose delivery tells its stream once a publish succeeds: the
- * channel and the text it published. The stream that queued the delivery
- * sends them on as its outgoing stream (MCPL Spec 14.3), so the stream
- * carries only what delivery published: nothing it withholds or holds as a
- * draft, and nothing whose publish failed or may not have gone out. A
+ * destination, its server and channel, and the text it published. The
+ * stream that queued the delivery sends them on as its outgoing stream
+ * (MCPL Spec 14.3), there and nowhere else, so the stream carries only what
+ * delivery published, where it published it: nothing it withholds or holds
+ * as a draft, and nothing whose publish failed or may not have gone out. A
  * publish succeeds when its outcome is `delivered`, which takes the
  * server's `delivered: true` (ChannelRegistry.publish). Nothing else is
  * streamed: a send refused before it goes out (such as for no channel, a
@@ -969,7 +1013,7 @@ function freshTurnRouting(): TurnRouting {
  * response, a timeout, a lost connection, a reply that leaves `delivered`
  * out, or `delivered: false`).
  */
-type SpeechPublished = (channelId: string, text: string, messageId: string | undefined) => void;
+type SpeechPublished = (to: PublishDestination, text: string, messageId: string | undefined) => void;
 
 /**
  * How a round's prose is delivered: under which turn's routing, and how what
@@ -3354,6 +3398,10 @@ export class AgentFramework {
               ? framework.agents.get(framework.primaryAgentName) : undefined;
             return primary ? primary.getContextManager().getAllMessages() : [];
           },
+          getDeferredMessages: () => framework.deferredMessages
+            .filter((m) => (m.forAgent ?? framework.primaryAgentName) === framework.primaryAgentName)
+            .sort(bySeq)
+            .map((m) => ({ participant: m.participant, content: m.content, metadata: m.metadata as Record<string, unknown> | undefined })),
           currentSequence: () => framework.store.currentSequence(),
           setSubconsciousAnchor: (sequence) =>
             framework.subconsciousStrategy?.setAnchor(sequence),
@@ -11437,6 +11485,12 @@ export class AgentFramework {
           // with everything queued behind it — the queue keeps its order —
           // for the turn-end flush, where no reply follows it in this stream.
           //
+          // A message a tune-out holds from the residents is drained and
+          // stored like any other, but not injected: every resident's
+          // viewFilter leaves it out of the next compile as well, so the
+          // window's compiled prefix and the live request still match without
+          // it (#232 gap 5).
+          //
           // A stream that declares it can't carry injected messages
           // (supportsInjectedMessages false: membrane's XML prefill path)
           // gets none, so nothing is drained here. Everything queued for
@@ -11462,6 +11516,11 @@ export class AgentFramework {
               // Every other resident reads what this boundary stores; for its
               // own agent, the boundary weighs what it injects below.
               this.noteForOtherResidents(agent, msg.metadata, id);
+              // A message a tune-out holds from the residents is stored (the
+              // subconscious reads it) and left out of every resident's
+              // compiled view; injecting it here would put in the live turn
+              // what the next compile hides (#232 gap 5).
+              if ((msg.metadata as { tuneOut?: unknown } | undefined)?.tuneOut) continue;
               const injection = {
                 participant: msg.participant,
                 content,
@@ -15530,7 +15589,7 @@ export class AgentFramework {
           this.recordProseDelivery(routing, outcome.status === 'delivered' ? { delivered: true, channelId: outcome.destination!.channelId } : null);
           if (outcome.status === 'delivered') {
             this.proseBounceStreaks.delete(agent.name);
-            round.onPublished?.(outcome.destination!.channelId, body, outcome.messageId);
+            round.onPublished?.(outcome.destination!, body, outcome.messageId);
           } else {
             delete routing.pin;
             routing.hybridHold = 'failed';
@@ -15571,7 +15630,7 @@ export class AgentFramework {
       try {
         const outcome = await this.channelRegistry!.routeSpeech(agent.name, envelope, target);
         this.recordProseDelivery(routing, outcome);
-        if (outcome?.delivered) round.onPublished?.(outcome.channelId, envelope, outcome.messageId);
+        if (outcome?.delivered) round.onPublished?.(outcome, envelope, outcome.messageId);
       } catch (err) {
         console.error('hybrid locus delivery failed:', err);
       }
@@ -15702,7 +15761,7 @@ export class AgentFramework {
       delivered = outcome.status === 'delivered';
       if (delivered) {
         this.proseBounceStreaks.delete(name);
-        round.onPublished?.(outcome.destination!.channelId, body, outcome.messageId);
+        round.onPublished?.(outcome.destination!, body, outcome.messageId);
       } else if (outcome.status === 'failed') {
         // Unknown deliveries are marker-only: offering a fresh draft would
         // invite a duplicate. Keep the authored body for the re-bounce rule.
@@ -17032,25 +17091,29 @@ export class AgentFramework {
     // and `channels/publish` stays the authoritative send.
     const outgoingInferenceId = `inf_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
     let outgoingIndex = 0;
-    // Per channel, everything this stream has sent there, which its
-    // `complete` carries.
-    const outgoingText = new Map<string, string>();
+    // Per destination, by its server and channel, everything this stream has
+    // sent there, which its `complete` carries. Two servers' channels with the
+    // same id are two destinations.
+    const outgoingText = new Map<string, { to: PublishDestination; text: string }>();
     // Set once the stream's `complete` has gone: no chunk follows it.
     let outgoingCompleted = false;
-    const streamSpeech: SpeechPublished = (channelId, text, messageId) => {
+    const streamSpeech: SpeechPublished = (published, text, messageId) => {
       if (outgoingCompleted) return;
-      // A later publish to the same channel is another message: a paragraph
+      const to = { serverId: published.serverId, channelId: published.channelId };
+      const key = destinationKey(to);
+      // A later publish to the same destination is another message: a paragraph
       // break keeps the two apart for a consumer that joins the chunks, so a
       // voice doesn't run "Let me look.Found it." together.
-      const sent = outgoingText.get(channelId);
+      const sent = outgoingText.get(key)?.text;
       const delta = sent === undefined ? text : `\n\n${text}`;
-      outgoingText.set(channelId, (sent ?? '') + delta);
+      outgoingText.set(key, { to, text: (sent ?? '') + delta });
       const index = outgoingIndex++;
-      this.channelRegistry?.sendOutgoingChunk(channelId, agent.name, outgoingInferenceId, index, delta);
+      this.channelRegistry?.sendOutgoingChunk(to, agent.name, outgoingInferenceId, index, delta);
       this.emitTrace({
         type: 'inference:published',
         agentName: agent.name,
-        channelId,
+        serverId: to.serverId,
+        channelId: to.channelId,
         inferenceId: outgoingInferenceId,
         index,
         text: delta,
@@ -17069,12 +17132,13 @@ export class AgentFramework {
       if (outgoingCompleted) return;
       outgoingCompleted = true;
       this.pendingOutgoingCompletes.delete(completeOutgoing);
-      for (const [channelId, text] of outgoingText) {
-        this.channelRegistry?.sendOutgoingComplete(channelId, agent.name, outgoingInferenceId, text);
+      for (const { to, text } of outgoingText.values()) {
+        this.channelRegistry?.sendOutgoingComplete(to, agent.name, outgoingInferenceId, text);
         this.emitTrace({
           type: 'inference:published_complete',
           agentName: agent.name,
-          channelId,
+          serverId: to.serverId,
+          channelId: to.channelId,
           inferenceId: outgoingInferenceId,
           text,
         });
@@ -17085,7 +17149,7 @@ export class AgentFramework {
       chainSpeech(async () => {
         const outcome = await this.channelRegistry!.routeSpeech(agent.name, text, locus);
         this.recordProseDelivery(streamRouting, outcome);
-        if (outcome?.delivered) streamSpeech(outcome.channelId, text, outcome.messageId);
+        if (outcome?.delivered) streamSpeech(outcome, text, outcome.messageId);
       }, 'mid-turn speech routing failed:');
     };
 
@@ -18131,7 +18195,7 @@ export class AgentFramework {
                     try {
                       const outcome = await this.channelRegistry.routeSpeech(agent.name, segment, locus);
                       this.recordProseDelivery(streamRouting, outcome);
-                      if (outcome?.delivered) streamSpeech(outcome.channelId, segment, outcome.messageId);
+                      if (outcome?.delivered) streamSpeech(outcome, segment, outcome.messageId);
                     } catch (err) {
                       console.error('speech routing failed:', err);
                     }
@@ -18236,7 +18300,7 @@ export class AgentFramework {
                   try {
                     const outcome = await this.channelRegistry.routeSpeech(agent.name, seg, locus);
                     this.recordProseDelivery(streamRouting, outcome);
-                    if (outcome?.delivered) streamSpeech(outcome.channelId, seg, outcome.messageId);
+                    if (outcome?.delivered) streamSpeech(outcome, seg, outcome.messageId);
                   } catch (err) {
                     console.error('speech routing failed:', err);
                   }
@@ -21112,8 +21176,9 @@ export class AgentFramework {
     // (activeStreams is kept as a belt-and-suspenders backstop.) Deferred
     // messages flush at the next turn's START (before its compile — riding
     // their own wake), at the agent's next tool boundary (where they are
-    // ALSO injected into the live stream — hear-while-acting), or in
-    // driveStream's finally when the turn ends.
+    // ALSO injected into the live stream — hear-while-acting — all but a
+    // message a tune-out holds from the residents), or in driveStream's
+    // finally when the turn ends.
     // Quiesce (issue #122): the window exists to run compression/refold
     // against a FROZEN context — module events and api message.send must not
     // append mid-surgery. Deferred here, flushed by resume(). tool_result
@@ -21768,11 +21833,12 @@ export class AgentFramework {
 
   /**
    * The writes held for `reader`'s store (heldWritesFor) as the rows a
-   * module's context reads: each under its handle, marked `held`, with the
-   * participant, content and metadata it was written with, the time it was
-   * first held as its timestamp, and a sequence after every row the store
-   * holds, in queue order. The sequence and timestamp are provisional: the
-   * stored row has the store's own.
+   * module's context reads: each under its handle, marked `held`, and
+   * `heldFromResidents` too when its metadata carries a tune-out's stamp
+   * (asModuleRow), with the participant, content and metadata it was
+   * written with, the time it was first held as its timestamp, and a
+   * sequence after every row the store holds, in queue order. The sequence
+   * and timestamp are provisional: the stored row has the store's own.
    */
   private heldRows(reader: Agent): ModuleMessage[] {
     const writes = this.heldWritesFor(reader);
@@ -21780,14 +21846,14 @@ export class AgentFramework {
     const cm = reader.getContextManager();
     const count = cm.getMessageCount();
     const last = count > 0 ? cm.getMessageWindow(count - 1, 1, { resolveBlobs: false }).messages[0]?.sequence ?? 0 : 0;
-    return writes.map((m, i) => ({
+    return writes.map((m, i) => asModuleRow({
       id: heldHandle(m.id),
       sequence: last + 1 + i,
       participant: m.participant,
       content: m.content,
       metadata: m.metadata,
       timestamp: new Date(m.heldAt),
-      held: true,
+      held: true as const,
     }));
   }
 
@@ -21872,8 +21938,10 @@ export class AgentFramework {
       return null;
     }
     const writeId = heldWriteId(id);
-    if (writeId === undefined) return agent.getContextManager().getMessage(id);
-    return this.heldRows(agent).find((row) => row.id === id) ?? this.landedRow(agent.getContextManager(), writeId);
+    const row = writeId === undefined
+      ? agent.getContextManager().getMessage(id)
+      : this.heldRows(agent).find((held) => held.id === id) ?? this.landedRow(agent.getContextManager(), writeId);
+    return row ? asModuleRow(row) : null;
   }
 
   private queryMessages(filter: MessageQuery): { messages: ModuleMessage[]; totalCount: number } {
@@ -21883,12 +21951,15 @@ export class AgentFramework {
     }
     const cm = agent.getContextManager();
     const held = this.heldRows(agent).filter((row) => matchesMessageQuery(row, filter));
-    if (held.length === 0) return cm.queryMessages(filter);
+    if (held.length === 0) {
+      const stored = cm.queryMessages(filter);
+      return { ...stored, messages: stored.messages.map(asModuleRow) };
+    }
     // The stored rows, then the held ones, reversed and cut to the limit as
     // the store's own query does it: it matches every row, then reverses,
     // then cuts.
     const { limit, reverse, ...match } = filter;
-    let messages: ModuleMessage[] = [...cm.queryMessages(match).messages, ...held];
+    let messages: ModuleMessage[] = [...cm.queryMessages(match).messages.map(asModuleRow), ...held];
     const totalCount = messages.length;
     if (reverse) messages = messages.reverse();
     if (limit !== undefined && limit < messages.length) messages = messages.slice(0, limit);
@@ -25209,10 +25280,13 @@ export class AgentFramework {
       error?: { code: unknown; message: unknown };
     }) => {
       // A late JSON-RPC error is recorded as the connection words a live one,
-      // `[code] message`, bounded and with its control characters replaced,
-      // since the server wrote it.
+      // `[code] message`: redacted as the server's text, as an on-time
+      // answer's record is, and then bounded with its control characters
+      // replaced, since the server wrote it. Redacting first keeps a
+      // credential the cut or a replaced character would split whole for the
+      // redactor.
       const error = info.error === undefined ? {} : {
-        error: boundedForLog(`[${describeCause(info.error.code)}] ${describeCause(info.error.message)}`, 500),
+        error: boundedForLog(recorded(`[${describeCause(info.error.code)}] ${describeCause(info.error.message)}`), 500),
       };
       // A push/render answered after its timeout, when the batch's fallback
       // was already materialized: RFC-006's audit records the discarded

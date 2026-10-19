@@ -21,7 +21,7 @@
     declared inbound-only after its target resolved ends the destination
     too, unless a later round has named another channel by then.
   - `channel_publish` and the subconscious's `speak_in_channel` return an
-    error that names it. The outgoing stream skips the channel, and the
+    error that names it. No outgoing stream starts in the channel, and the
     channel context names no default outgoing channel for it.
   - A channel the host knows only from a push is refused once the server's
     answer to opening it, wherever the host opens it, declares it
