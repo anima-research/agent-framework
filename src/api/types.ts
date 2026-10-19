@@ -210,7 +210,7 @@ export interface InferenceSearchParams {
   offset?: number;
   /** Regex pattern to match against log content */
   pattern?: string;
-  /** Only show failed inferences */
+  /** Only show inferences that didn't succeed: failed or stopped */
   errorsOnly?: boolean;
 }
 

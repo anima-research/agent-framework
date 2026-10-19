@@ -81,6 +81,14 @@ test('inheritEnv: true passes the whole host env, declared env on top', () => {
   assert.equal(env.EXTRA, '1');
 });
 
+test('only inheritEnv: true passes the whole host env; a quoted "false" or any other value keeps the allowlist', () => {
+  const allowlistOnly = buildChildEnv({}, HOST_ENV);
+  for (const inheritEnv of ['false', 'true', 'no', 1, 0, {}, [], null]) {
+    assert.deepEqual(buildChildEnv({ inheritEnv: inheritEnv as unknown as boolean }, HOST_ENV), allowlistOnly,
+      JSON.stringify(inheritEnv));
+  }
+});
+
 test('a real spawned stdio child sees only allowlist + declared env', async () => {
   const secretKey = 'MCPL_ENV_TEST_HOST_SECRET';
   const previousCaBundle = process.env.REQUESTS_CA_BUNDLE;
@@ -89,7 +97,7 @@ test('a real spawned stdio child sees only allowlist + declared env', async () =
   process.env.REQUESTS_CA_BUNDLE = '/host/internal-ca.pem';
   process.env.HTTPS_PROXY = 'http://proxy.example:8443';
   try {
-    const transport = StdioTransport.spawn({
+    const transport = await StdioTransport.spawn({
       id: 'env-probe',
       command: process.execPath,
       args: ['-e', 'console.log(JSON.stringify(process.env))'],
@@ -136,6 +144,13 @@ for (const inheritEnv of [false, true]) {
     }
   });
 }
+
+test('win32: USERNAME passes, as USER and LOGNAME do on POSIX', () => {
+  const env = buildChildEnv({}, {
+    USERNAME: 'ada', USERDOMAIN: 'HOUSE', SystemRoot: 'C:\\Windows', OpenAI_Api_Key: 'host-secret',
+  }, 'win32');
+  assert.deepEqual(env, { USERNAME: 'ada', SystemRoot: 'C:\\Windows' });
+});
 
 test('win32: operating allowlist matches native mixed-case spellings', () => {
   const env = buildChildEnv({}, {

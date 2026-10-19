@@ -15,7 +15,9 @@
  * that isn't that directory any more (an unmounted drive whose mountpoint is
  * now empty, a replaced directory) is an unavailable mount, never a disk on
  * which every file was deleted; only an explicit acceptance takes it, and
- * that starts its evidence afresh.
+ * that starts its evidence afresh. A place, where a walk stopped (`walks`),
+ * binds no root: it only says where the next walk starts, in whatever
+ * directory the root is by then.
  *
  * Every transition is write-ahead (see reconcile.ts): an `intent` entry
  * (`pending`, with the prior value and the expected one) is durable before the
@@ -46,9 +48,15 @@ export interface Fingerprint {
   hashedAt: number;
 }
 
+/**
+ * `mode`: the permission bits disk held (`st_mode & 0o777`). Evidence from
+ * before modes were recorded, or recorded after the kernel refused a
+ * widening of the workspace's own change, has none: a sync takes disk's mode
+ * in.
+ */
 export type Agreed =
   | { kind: 'absent' }
-  | { kind: 'content'; hash: string; size: number; fp?: Fingerprint };
+  | { kind: 'content'; hash: string; size: number; fp?: Fingerprint; mode?: number };
 
 export type Candidate = { kind: 'absent' } | { kind: 'content'; hash: string };
 
@@ -61,6 +69,21 @@ export interface Pending {
   expect: Candidate;
   /** Branch the intent was recorded on (an adoption's meaning is branch-relative). */
   branchId: string;
+  /**
+   * For a write whose plan gives the file a mode: the mode it saw (`from`)
+   * and the one it gives (`to`); a write that creates the file records `to`
+   * for both. A push that goes on as our own narrowing push, stopped before
+   * its bytes, records that push's `from`, the old bytes' own mode, and the
+   * store's mode now, or where the store records none, the mode the stopped
+   * push narrowed to, whether or not it gives a mode itself. It narrows to
+   * `from & to` before the bytes and widens to `to` after them, so a stop
+   * leaves disk at one of those three, with the old bytes or the new, and
+   * those are the push's own. A file that has setuid or setgid
+   * when the write checks it loses them before the bytes too, a chmod that
+   * keeps the permission bits it has then, so a stop after that chmod alone
+   * leaves disk at the mode the write saw, less those bits.
+   */
+  modes?: { from: number; to: number };
 }
 
 export interface Interrupted {
@@ -92,16 +115,30 @@ type JournalEntry =
   /** The root's identity; with `reset`, an accepted new root, whose evidence starts empty. */
   | { t: 'root'; mount: string; identity: RootIdentity; reset?: true }
   | { t: 'set'; mount: string; path: string; value: Physical }
-  | { t: 'forget'; mount: string; path: string };
+  | { t: 'forget'; mount: string; path: string }
+  /**
+   * Where a capped walk of `scope` stopped (the last entry it took), or null
+   * once a walk covered the scope. It carries no `path` field: agent-framework
+   * 0.22 replays an entry it doesn't know as a `forget` of `entry.path`, and
+   * so leaves the evidence alone when there is none.
+   */
+  | { t: 'walk'; mount: string; scope: string; after: string | null };
 
 interface MountEvidence {
   root: string;
   identity?: RootIdentity;
   paths: Map<string, Physical>;
+  /** By scope ('' for the mount root): where the next walk of it resumes. */
+  walks: Map<string, string>;
 }
 
 interface Snapshot {
-  mounts: Record<string, { root: string; identity?: RootIdentity; paths: Record<string, Physical> }>;
+  mounts: Record<string, {
+    root: string;
+    identity?: RootIdentity;
+    paths: Record<string, Physical>;
+    walks?: Record<string, string>;
+  }>;
 }
 
 export const DISK_AGREEMENT_RECORD_TYPE = 'workspace/disk-agreement';
@@ -117,21 +154,46 @@ export function sameCandidate(a: Candidate, b: Candidate): boolean {
   return a.kind === b.kind && (a.kind === 'absent' || a.hash === (b as { hash: string }).hash);
 }
 
+/** A record with no mode claimed: a content record's, and a pending intent's own modes and its prior's. */
+function withoutModes(value: Physical): Physical {
+  if (value.kind === 'content' && value.mode !== undefined) {
+    const { mode: _mode, ...rest } = value;
+    return rest;
+  }
+  if (value.kind === 'pending') {
+    const { modes: _modes, ...intent } = value;
+    if (intent.prior?.kind !== 'content' || intent.prior.mode === undefined) return intent;
+    const { mode: _mode, ...prior } = intent.prior;
+    return { ...intent, prior };
+  }
+  return value;
+}
+
 export class DiskAgreement {
   private readonly store: JsStore;
   private readonly journal: RecordJournal<JournalEntry, Snapshot>;
   private readonly mounts = new Map<string, MountEvidence>();
   private configured: Array<{ name: string; root: string }> = [];
   /**
-   * An append (or a rebuild) not yet made durable. Cleared only by a
-   * barrier that succeeds, so a failed barrier stays owed: a later pass with
-   * nothing new to record still settles it before deciding anything.
+   * An append of evidence (or a rebuild) not yet made durable. Cleared only
+   * by a barrier that succeeds, so a failed barrier stays owed: a later pass
+   * with nothing new to record still settles it before deciding anything. A
+   * place owes none (recordWalk).
    */
   private unsynced = false;
+  /**
+   * Whether memory holds a whole state: false until a rebuild first runs to
+   * its end. A rebuild fills a new map and swaps it in only at its end, so
+   * one that throws partway leaves whatever whole state came before it.
+   */
+  private whole = false;
+  /** Whether this host observes file modes (not on Windows): where it doesn't, no record it writes claims one. */
+  private readonly modesObserved: () => boolean;
 
-  constructor(store: JsStore) {
+  constructor(store: JsStore, opts: { modesObserved?: () => boolean } = {}) {
     this.store = store;
     this.journal = new RecordJournal<JournalEntry, Snapshot>(store, { type: DISK_AGREEMENT_RECORD_TYPE });
+    this.modesObserved = opts.modesObserved ?? (() => true);
   }
 
   /**
@@ -150,14 +212,22 @@ export class DiskAgreement {
    * recorded (the store may hold it where this process can't read it back),
    * and a decision from stale P can record what reopening contradicts, such
    * as a conflict that stays after the right evidence is back. So until the
-   * store is reopened, no evidence is read, written or checkpointed, and
-   * every pass and tool call that needs it fails.
+   * store is reopened, no evidence is read (but for rootIdentityForRead's
+   * one exception), written or checkpointed, and every pass and tool call
+   * that needs it fails. The same holds, the exception included, when the
+   * open's rebuild threw: there is no whole evidence to read.
    */
   ensureReconciled(): void {
     if (this.journal.needsReopen) {
       throw new Error(
         'Disk-agreement evidence is unavailable until the store is reopened, as at the next start: ' +
         'an append to its journal failed inside the store, and the evidence may lack what it recorded',
+      );
+    }
+    if (!this.whole) {
+      throw new Error(
+        'Disk-agreement evidence is unavailable until the store is reopened, as at the next start: ' +
+        'reading it back from the store failed',
       );
     }
     if (this.journal.needsReconcile) this.rebuild();
@@ -183,35 +253,62 @@ export class DiskAgreement {
         root: mount.root,
         ...(mount.identity ? { identity: mount.identity } : {}),
         paths: new Map(Object.entries(mount.paths)),
+        walks: new Map(Object.entries(mount.walks ?? {})),
       });
     }
     for (const { entry } of entries) {
       if (entry.t === 'mount') {
         const existing = replayed.get(entry.mount);
-        if (!existing || !sameRootPath(existing.root, entry.root)) replayed.set(entry.mount, { root: entry.root, paths: new Map() });
+        if (!existing || !sameRootPath(existing.root, entry.root)) {
+          replayed.set(entry.mount, { root: entry.root, paths: new Map(), walks: new Map() });
+        }
         continue;
       }
       const mount = replayed.get(entry.mount);
-      if (!mount) continue;
-      if (entry.t === 'root') applyRoot(mount, entry);
-      else if (entry.t === 'set') mount.paths.set(entry.path, entry.value);
-      else mount.paths.delete(entry.path);
+      if (mount) apply(mount, entry);
     }
-    this.mounts.clear();
+    // Filled apart and swapped in at the end, so an append that throws here
+    // leaves memory as it was, whole, rather than with the mounts after it
+    // missing. Nothing reaches that today: only an open with a moved mount
+    // appends here, the workspace opens each agreement once, and after the
+    // open a rebuild finds every mount's record and appends none.
+    const rebuilt = new Map<string, MountEvidence>();
     for (const { name, root } of this.configured) {
       const found = replayed.get(name);
       if (found && sameRootPath(found.root, root)) {
-        this.mounts.set(name, found);
+        rebuilt.set(name, found);
       } else {
-        this.mounts.set(name, { root, paths: new Map() });
+        rebuilt.set(name, { root, paths: new Map(), walks: new Map() });
         this.journal.append({ t: 'mount', mount: name, root });
       }
     }
+    this.mounts.clear();
+    for (const [name, mount] of rebuilt) this.mounts.set(name, mount);
+    this.whole = true;
   }
 
   /** The identity of the root this mount's evidence was gathered under, once any was. */
   rootIdentity(mount: string): RootIdentity | undefined {
     this.ensureReconciled();
+    return this.mounts.get(mount)?.identity;
+  }
+
+  /**
+   * The identity a disk read checks the mount's root against: the one in
+   * memory once memory is whole, in every state of the journal, and an error
+   * until then. It is the last identity whose append succeeded, since write()
+   * appends before it applies, and no reconcile can change it, since root
+   * entries are written without a sync; were one made durable, its failed
+   * sync would leave the identity from before it: an old one, which refuses
+   * the new root, or none, as for a mount with no recorded identity. This
+   * is the one exception to ensureReconciled's "no evidence is read": the
+   * layer stops reading so that a decision from stale evidence can't record
+   * what reopening contradicts, and a read records nothing. Refusing reads
+   * instead would stop every host read of the workspace's disk until a
+   * restart.
+   */
+  rootIdentityForRead(mount: string): RootIdentity | undefined {
+    if (!this.whole) this.ensureReconciled(); // throws: there's no whole state to read
     return this.mounts.get(mount)?.identity;
   }
 
@@ -251,6 +348,29 @@ export class DiskAgreement {
   }
 
   /**
+   * Where the next walk of `scope` ('' for the mount root) resumes: the last
+   * entry a walk of it took before its cap stopped it, if one did.
+   */
+  walkResumesAfter(mount: string, scope: string): string | undefined {
+    this.ensureReconciled();
+    return this.mounts.get(mount)?.walks.get(scope);
+  }
+
+  /**
+   * Record where a walk of `scope` stopped (`after`), or that one covered it
+   * (null). Kept with the evidence so a restart resumes there too. A place
+   * that's lost costs coverage, never a decision: an append that didn't land
+   * loses one, and a checkpoint written by a version that doesn't keep them
+   * (0.22) loses them all, and each scope's walks start at its top again.
+   * So recording one owes no barrier: a pass that moves only its place makes
+   * no store sync, and the place becomes durable with the next one.
+   */
+  recordWalk(mount: string, scope: string, after: string | null): void {
+    if ((this.walkResumesAfter(mount, scope) ?? null) === after) return;
+    this.write({ t: 'walk', mount, scope, after }, {});
+  }
+
+  /**
    * Record an intent. `durable` makes it (and every append before it) stable
    * before the caller performs the effect; batches pass it on their last one.
    */
@@ -275,7 +395,8 @@ export class DiskAgreement {
   /**
    * Put back exactly the evidence a path had before an intent whose effect
    * never touched it — whatever kind it was (agreed, pending, interrupted, or
-   * unknown) — so the intent leaves no trace in what P says.
+   * unknown) — so the intent leaves no trace in what P says; where modes go
+   * unobserved, less any mode it carried, as every record written there.
    */
   restore(mount: string, path: string, value: Physical | undefined): void {
     if (value === undefined) this.forget(mount, path);
@@ -284,14 +405,21 @@ export class DiskAgreement {
 
   private write(entry: JournalEntry, opts: { durable?: boolean; afterCommittedState?: boolean }): void {
     this.ensureReconciled();
-    this.unsynced = true; // until proven durable: a failed append may still have landed
+    // A host that doesn't observe modes has none that's true to record: a
+    // record it writes carries no mode, and a host that observes them reads
+    // the path's mode as unknown, as for evidence from before modes were
+    // recorded. This holds whatever built the record: disk, the store's
+    // entry, or an earlier record a POSIX host wrote, put back by a restore.
+    // (A checkpoint re-serializes the evidence as it stands, other hosts'
+    // records included, as replaying the journal would.)
+    if (entry.t === 'set' && !this.modesObserved()) entry = { ...entry, value: withoutModes(entry.value) };
+    // Evidence is owed a barrier until proven durable: a failed append may
+    // still have landed. A place isn't (recordWalk).
+    if (entry.t !== 'walk') this.unsynced = true;
     this.journal.append(entry, opts);
     if (opts.durable) this.unsynced = false; // synced after this append, and so everything before it
     const mount = this.mounts.get((entry as { mount: string }).mount);
-    if (!mount) return;
-    if (entry.t === 'root') applyRoot(mount, entry);
-    else if (entry.t === 'set') mount.paths.set(entry.path, entry.value);
-    else if (entry.t === 'forget') mount.paths.delete(entry.path);
+    if (mount) apply(mount, entry);
   }
 
   /** Checkpoint when the tail has outgrown the live evidence. */
@@ -307,6 +435,7 @@ export class DiskAgreement {
         root: mount.root,
         ...(mount.identity ? { identity: mount.identity } : {}),
         paths: Object.fromEntries(mount.paths),
+        ...(mount.walks.size > 0 ? { walks: Object.fromEntries(mount.walks) } : {}),
       };
     }
     this.journal.checkpoint(snapshot);
@@ -319,7 +448,23 @@ export class DiskAgreement {
   }
 }
 
+/** Apply one entry to a mount's evidence; one of a kind this version doesn't know changes nothing. */
+function apply(mount: MountEvidence, entry: JournalEntry): void {
+  if (entry.t === 'root') applyRoot(mount, entry);
+  else if (entry.t === 'set') mount.paths.set(entry.path, entry.value);
+  else if (entry.t === 'forget') mount.paths.delete(entry.path);
+  else if (entry.t === 'walk') {
+    if (entry.after === null) mount.walks.delete(entry.scope);
+    else mount.walks.set(entry.scope, entry.after);
+  }
+}
+
 function applyRoot(mount: MountEvidence, entry: Extract<JournalEntry, { t: 'root' }>): void {
   mount.identity = entry.identity;
-  if (entry.reset) mount.paths.clear();
+  if (entry.reset) {
+    // Evidence about another directory says nothing about this one, and the
+    // accepted root's walks start at its top.
+    mount.paths.clear();
+    mount.walks.clear();
+  }
 }

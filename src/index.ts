@@ -2,7 +2,7 @@
 export * from './types/index.js';
 
 // Core classes
-export { AgentFramework, BudgetPreflightError, ResumeBlockedError } from './framework.js';
+export { AgentFramework, BudgetPreflightError, ProviderWaitNotSleptError, QuiesceBlockedError, ResumeBlockedError } from './framework.js';
 export type { RuntimeSettingsPreview, HostModeStatus } from './framework.js';
 export { Agent } from './agent.js';
 export type { StartStreamResult } from './agent.js';
@@ -17,7 +17,7 @@ export * from './modules/index.js';
 
 // API
 export { ApiServer } from './api/server.js';
-export { McpServer } from './api/mcp-server.js';
+export { McpServer } from './api/mcp-server-core.js';
 export type {
   ApiServerConfig,
   ApiMessage,
@@ -74,6 +74,7 @@ export type {
   ExecResult,
   PyRunnerOptions,
   ScriptToolCallHandler,
+  ScriptToolResult,
 } from './code-execution/index.js';
 export type { SessionUsage, AgentUsage, SessionUsageSnapshot, UsageUpdatedEvent } from './usage/index.js';
 
@@ -84,14 +85,36 @@ export type { GateConfig, GateOptions, GatePolicy, GatePolicyMatch, GateBehavior
 // MCPL channel registry (exposed for modules that need channel-level operations)
 export { ChannelRegistry } from './mcpl/index.js';
 
+// Where each accepted inbound item came from (`metadata.inboundSource`)
+export { INBOUND_SOURCE_KEY, readInboundSource, conversationKey } from './mcpl/index.js';
+export type {
+  InboundSource,
+  InboundChannelSource,
+  InboundUnscopedSource,
+  InboundSurfaceSource,
+} from './mcpl/index.js';
+
 // MCPL server config (exposed for hosts that manage servers at runtime via
 // connectMcplServer / disconnectMcplServer / restartMcplServer)
 export type { McplServerConfig } from './mcpl/index.js';
 
-// MCPL client connection (exposed so external tooling — server playtests,
-// health probes, protocol harnesses — can dial an MCPL server exactly the
-// way the framework host does, over stdio or WebSocket)
-export { McplServerConnection } from './mcpl/index.js';
+// Both engines' client connections, and the configuration helpers and
+// protocol revisions they share (exposed so external tooling, such as server
+// playtests, health probes and protocol harnesses, can reach a server
+// exactly the way the framework host does: MCPL over stdio or WebSocket, and
+// modern MCP over stdio or Streamable HTTP)
+export { McplServerConnection, McplRequestError, McplProtocolVersionError, McplUnreapedLaunchError } from './mcpl/index.js';
+export { ModernMcpConnection } from './mcpl/index.js';
+export type { ModernToolCallResult } from './mcpl/index.js';
+export {
+  LEGACY_MCP_PROTOCOL_VERSION,
+  MODERN_MCP_PROTOCOL_VERSION,
+  resolveServerBinding,
+  serverConfigProblems,
+  serverConfigWarnings,
+  checkServerConfig,
+} from './mcpl/index.js';
+export type { McpProtocolFamily, McpTransportKind, ServerBinding } from './mcpl/index.js';
 export type { McplHostCapabilities, McplConnectionCloseInfo } from './mcpl/index.js';
 
 // MCPL tool lifecycle (RFC-007) and tool classes (RFC-008): the types a host
@@ -127,18 +150,35 @@ export { PassthroughStrategy, AutobiographicalStrategy, KnowledgeStrategy } from
 export type { KnowledgeConfig, PhaseType } from '@animalabs/context-manager';
 export type { Membrane, NormalizedMessage, NormalizedRequest, ContentBlock } from '@animalabs/membrane';
 
-// Offline outage recovery and branch-independent Discord awareness markers
+// Offline outage recovery and the Discord awareness-mark ledger
 export {
   DiscordAwarenessOutbox,
+  DiscordAwarenessRefusal,
   DEFAULT_DISCORD_AWARENESS_EMOJI,
   defaultDiscordAwarenessOutboxPath,
   extractDiscordAwarenessRefs,
+  isPermanentDiscordReactionFailure,
+  selectDiscordAwarenessRefs,
 } from './recovery/discord-awareness-outbox.js';
 export type {
+  DiscordAwarenessAction,
   DiscordAwarenessBatch,
-  DiscordAwarenessEntry,
-  DiscordAwarenessOperation,
+  DiscordAwarenessBatchStatus,
+  DiscordAwarenessBatchView,
+  DiscordAwarenessRetractView,
+  DiscordAwarenessView,
+  DiscordAwarenessCancelReceipt,
+  DiscordAwarenessMarks,
+  DiscordAwarenessOutcome,
+  DiscordAwarenessPrepareInput,
+  DiscordAwarenessReactionState,
+  DiscordAwarenessImportedUnsent,
   DiscordAwarenessRef,
+  DiscordAwarenessRequest,
+  DiscordAwarenessRetractReceipt,
+  DiscordAwarenessRetirement,
+  DiscordAwarenessScope,
+  DiscordAwarenessSettlement,
   DiscordSuppressionInterval,
 } from './recovery/discord-awareness-outbox.js';
 // Live operator surgery (rollback / suppress) and its durable action log
@@ -147,7 +187,9 @@ export type {
   OperatorLogEntry,
   OperatorLogInput,
   OperatorRequester,
+  SurgeryMarkerFacts,
   SurgeryMarkerReceipt,
+  SurgeryMarksPreview,
 } from './operator-log.js';
 export { createOfflineRecoveryBranch } from './recovery/offline-branch.js';
 export type {
@@ -159,6 +201,7 @@ export * from "./tool-presentation.js";
 export {
   SILENT_HEARTBEAT_SEPARATOR,
   silentHeartbeatOf,
+  type RequestOnlyPrompt,
   type SilentHeartbeatStamp,
   type SilentHeartbeatTick,
 } from './silent-heartbeat.js';

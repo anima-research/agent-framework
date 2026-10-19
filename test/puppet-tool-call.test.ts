@@ -54,6 +54,9 @@ function puppetHarness(opts?: {
   fw.deferredSeq = 0;
   fw.deferredScanFrom = new Map();
   fw.pendingAssistantBlocks = new Map();
+  // Window releases a quiesce postponed, which every by-name flush checks
+  // (drainDeferredFor): none here, as the constructor starts it.
+  fw.releasesAfterResume = new Map();
   // A puppet call is an operation stop() waits for.
   fw.operatorOperations = new Set();
   fw.primaryAgentName = 'princess';

@@ -61,6 +61,15 @@ the house default; plain descriptive titles are accepted.
 - The reviewer will typically **run your branch** (typecheck, test suite,
   sometimes exercising a module against a real store) and paste transcripts.
   Claims are checked, not trusted.
+- **Greptile** reviews only PRs labelled `greptile` (`.greptile/config.json`).
+  A scheduled workflow adds that label to each open, non-draft PR whose
+  additions plus deletions pass 400 lines, unless it carries `no-greptile`,
+  and the review starts when the label lands: within about half an hour of
+  the PR opening, passing 400 lines or being marked ready, and later when
+  GitHub's scheduler is busy. A smaller PR gets a Greptile review if a
+  maintainer adds the label. `no-greptile` skips the review. Removing
+  `greptile` from a PR past 400 lines doesn't skip it, since the next run
+  adds the label back.
 - Respond by pushing fix commits and replying per finding — "Addressed in
   `<sha>`" — rather than force-pushing a rewritten branch. A re-review then
   flips the verdict.
@@ -107,9 +116,9 @@ never do.
   silently stranding an entry.
 - **The fragment lands with the change** — same commit, or at least the same
   PR. This binds direct pushes to `main` just as much as PRs. On PRs, CI
-  enforces it softly: touching `src/` without adding a fragment (or editing
-  `CHANGELOG.md`) fails the `changelog` check unless the `no-changelog`
-  label is applied.
+  enforces it softly: touching `src/` fails the `changelog` check unless the
+  PR adds a fragment, edits a pending one or edits `CHANGELOG.md`, or carries
+  the `no-changelog` label.
 - **What needs an entry:** anything a module developer, host, or downstream
   consumer would notice — behavior, event/trace surfaces, tool namespacing,
   config schema, agent state machine, public exports, defaults. Internal
@@ -117,9 +126,11 @@ never do.
 - **Breaking entries are audience-scoped.** Open the bullet by naming who
   needs to act (`- **Module authors:** …`) and cover: **who needs to act**,
   **migration**, and **unchanged** (what readers might fear broke but
-  didn't). Because connectome-host and other hosts pin this package by
-  range, a breaking change here surfaces in their next install — spell out
-  the minimum sibling versions it requires.
+  didn't). A breaking change goes out in a new minor version before 1.0
+  (see **Breaking changes** below), so a host's caret range doesn't take
+  it until the host raises that range in a change of its own, which is
+  where these entries are read — spell out the minimum sibling versions it
+  requires.
 - **Editing `## Unreleased` in `CHANGELOG.md` directly still works** and is
   merged with the fragments at release time — it remains the right place to
   restructure pending entries, and the escape hatch for anything the
@@ -134,19 +145,66 @@ never do.
   `### Fixed` order), deletes the consumed fragments, keeps a fresh empty
   `Unreleased` above, and refuses to release when there is nothing to
   release; npm then commits and tags. `git push --follow-tags` triggers CI,
-  which refuses a tag with no matching changelog section, publishes
-  `@animalabs/agent-framework` to npm, and creates the GitHub release with
-  that section as its notes. The two release jobs are independent: some
-  consumers run github-clone checkouts, so release notes must exist even
-  when npm publish fails. Version bumps are a maintainer release-time
+  which refuses a tag with no matching changelog section, checks in a job
+  of its own that the packed release installs on its own, publishes
+  `@animalabs/agent-framework` to npm once that check has passed, and
+  creates the GitHub release with that section as its notes, cut at an
+  entry's start, with a link to the whole section, when it's longer than
+  120,000 characters, under GitHub's limit of 125,000. The check,
+  `node scripts/pack-installs-alone.mjs`, packs the release and installs
+  the tarball alone into an empty directory with its dependencies from
+  npm. The install is linked, so each package reaches only the
+  dependencies it declares. It then checks the installed package, as the
+  script's header lists. To run it by hand, run `npm run build` first,
+  for example before `git push --follow-tags`, or dispatch the workflow on
+  a branch, where it publishes nothing. The two
+  release jobs are independent: some consumers run github-clone checkouts,
+  so release notes must exist even when npm publish fails. Both need the
+  build job, so a failed build stops both; past it, so do a tag with no
+  changelog section, which neither can release, and an open release hold
+  (below), which each checks. Version bumps are a maintainer release-time
   action, not part of feature PRs.
+- **Breaking changes.** A dependent's caret range takes the later
+  versions of its line (0.22.x before 1.0, 1.x from 1.0, and 0.0.z alone),
+  so a breaking change released as a patch reaches each dependent whose
+  range takes it at its next fresh install. Before 1.0, a breaking change
+  goes out in a new minor version (0.22.x to 0.23.0), and from 1.0 in a
+  new major. File it as breaking, as a `breaking` fragment or under a
+  `### Breaking` subsection of `Unreleased`: that is what `npm version`
+  reads. While such an entry is pending, `npm version` refuses a version
+  that doesn't open a line no release has reached, before it bumps or
+  writes anything, and says where each entry is filed and the bump to run
+  instead. A prerelease counts as the release it leads to, so one in the
+  current line is refused too. One that opens the next line (a preminor
+  before 1.0, a premajor from 1.0) isn't, and nor is any later version of
+  that line. A version below the current line is refused as well. npm's
+  `--ignore-scripts` skips this check, but it also skips the fold, and the
+  publish workflow refuses a tag whose version has no changelog section.
+- **Release holds.** When releasing `main` as it stands would harm
+  someone running it, open an issue that says what has to happen first
+  and label it `release-hold`, or ask a maintainer to label it. Close it
+  once that's happened, or if it no longer applies. When what has to
+  happen is a fix that this package itself must release, close the hold
+  once the fix is merged, then release. While one is open, `npm version`
+  stops before it bumps anything, `npm publish` refuses, and the publish
+  workflow refuses both its npm publish and its GitHub release notes,
+  each checking when it runs. The check also stops a release when it
+  can't read the holds from GitHub, and says why. Closing the hold is
+  the way past it. npm's `--ignore-scripts` skips the check, but on
+  `npm version` it skips the changelog fold too, so the tag lands
+  without its changelog section and the publish workflow's changelog
+  check fails it. Publishing a tarball made earlier with `npm pack` runs
+  no lifecycle script, so no check sees it. A hold stops releases, not
+  merges, so when the hazard is in an open pull request, say so on that
+  pull request, naming what has to happen first: its comment thread is
+  the gate (see Review process).
 
 ## Building and testing
 
 ```bash
 npm install
 npm run build         # tsc; tests run from dist/, so build first
-npm test              # node --test dist/test/*.test.js
+npm test              # node --test --test-force-exit --test-timeout=600000 dist/test/*.test.js, with test/helpers/force-exit-blocking-stdout loaded first
 npx tsc --noEmit      # typecheck
 ```
 
@@ -154,9 +212,18 @@ npx tsc --noEmit      # typecheck
 code you no longer have — always build before testing, and after switching
 branches. The `pretest` hook copies `test/fixtures/*.mjs` into `dist/`.
 
+`--test-timeout=600000` bounds each test file as a whole under Node 20,
+and each test under Node 24, at ten minutes; the slowest file,
+`mcpl-runtime-lifecycle`, takes about three. Each job in `ci.yml` also has
+a `timeout-minutes` limit, which ends a hang the test timeout doesn't reach.
+
 Push-time CI (`ci.yml`) builds, typechecks and tests every push and PR on
 ubuntu and macos. Lockfiles are deliberately gitignored in this repo, so CI
-installs with plain `npm install` and there is no lock to keep in sync.
+installs with `npm install` rather than `npm ci`, and there is no lock to
+keep in sync. It also runs the pack check the publish workflow runs before
+publishing (`node scripts/pack-installs-alone.mjs`, on ubuntu, with bun set
+up), so a file left out of the package, or an import only `devDependencies`
+supply, fails the PR.
 
 When working against local sibling checkouts rather than published versions,
 see the ecosystem workspace setup — `bun install` at the `rust-connectome`

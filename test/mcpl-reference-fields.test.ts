@@ -1,8 +1,8 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
-  buildReferenceStub, classifyBlock, isReferenceExpired, sanitizeLabel, REFERENCE_LIMITS,
-  referenceRegistry, referenceStubOrNull,
+  buildReferenceStub, classifyBlock, isReferenceExpired, sanitizeLabel, EXPIRY_REASON, REFERENCE_LIMITS,
+  referenceBlockForScript, referenceRegistry, referenceStubOrNull, UNBOUND_REASON, unfetchableReason,
 } from '../src/mcpl/references.js';
 
 const fields = ['name', 'mimeType', 'expiresAt'] as const;
@@ -109,28 +109,68 @@ test('the stub shows every server label without controls, and leaves out one tha
 
 test('the stub leaves out a type, or a provenance, that sanitizes to nothing', () => {
   const typeGone = reference('resource', { uri: 'https://example.test/stub-type-gone', mimeType: '\u202E\u061C', sizeBytes: 10 }).testimony;
-  const typeStub = buildReferenceStub(typeGone, 'from a tool');
+  const typeStub = buildReferenceStub(typeGone, 'from a tool', 'srv');
   assert.equal(typeStub, `[${referenceRegistry.findByUri(typeGone.uri)!.refId}] 10B claimed — from a tool — fetch with fetch_reference`);
   const originGone = reference('resource', { uri: 'https://example.test/stub-origin-gone', mimeType: 'image/png' }).testimony;
-  const originStub = buildReferenceStub(originGone, '\u2066\u0085\u2069');
+  const originStub = buildReferenceStub(originGone, '\u2066\u0085\u2069', 'srv');
   assert.equal(originStub, `[${referenceRegistry.findByUri(originGone.uri)!.refId}] image/png — fetch with fetch_reference`);
 });
 
+test("an expired reference reaches a script with the reason its stub gives, and a live or saved one without it", () => {
+  // Each bound to its server, as a script's tool result binds them.
+  const cases = [['2001-01-01T00:00:00Z', EXPIRY_REASON.passed], ['not-a-date', EXPIRY_REASON.unparseable],
+    ['x'.repeat(REFERENCE_LIMITS.expiresAt + 1), EXPIRY_REASON.rejected]] as const;
+  for (const [i, [expiresAt, why]] of cases.entries()) {
+    const { block, testimony } = reference('resource', { uri: `https://example.test/script-expired-${i}`, expiresAt });
+    const view = referenceBlockForScript(block, 'srv') as { savedTo: unknown; expired?: string };
+    assert.equal(view.savedTo, null);
+    assert.equal(view.expired, why);
+    assert.ok(buildReferenceStub(testimony, undefined, 'srv').includes(why), 'the stub gives the same reason');
+  }
+  const live = reference('resource', { uri: 'https://example.test/script-live', expiresAt: '2999-01-01T00:00:00Z' }).block;
+  assert.equal((referenceBlockForScript(live, 'srv') as { expired?: string }).expired, undefined);
+  // Bound to its server, so the fetch its id offers can be made.
+  assert.deepEqual(referenceRegistry.findByUri(live.uri)?.serverIds, ['srv']);
+  // A copy saved before its expiry passed is still served, and the script gets its path.
+  const saved = reference('resource', { uri: 'https://example.test/script-expired-0', expiresAt: '2001-01-01T00:00:00Z' }).block;
+  referenceRegistry.findByUri(saved.uri)!.fetchedPath = 'scratch/refs/kept.png';
+  const view = referenceBlockForScript(saved, 'srv') as { savedTo: unknown; expired?: string };
+  assert.equal(view.savedTo, 'scratch/refs/kept.png');
+  assert.equal(view.expired, undefined);
+});
+
 test("an expired reference's stub says why, where a live one's advises fetch_reference", () => {
-  const cases = [['2001-01-01T00:00:00Z', /expired: its expiresAt has passed/], ['not-a-date', /treated as expired: its expiresAt does not parse/],
-    ['x'.repeat(REFERENCE_LIMITS.expiresAt + 1), /treated as expired: its expiresAt was rejected as a field/]] as const;
+  // Each bound to its server, as a tool result's references are, so the expiry is what's left to say.
+  const cases = [['2001-01-01T00:00:00Z', /[\]—] expired$/], ['not-a-date', /[\]—] treated as expired, since its expiry time can't be read$/],
+    ['x'.repeat(REFERENCE_LIMITS.expiresAt + 1), /[\]—] treated as expired, since its expiry time isn't in a form this host accepts$/]] as const;
   for (const [i, [expiresAt, why]] of cases.entries()) {
     const { testimony } = reference('resource', { uri: `https://example.test/stub-expired-${i}`, expiresAt });
-    const stub = buildReferenceStub(testimony);
+    const stub = buildReferenceStub(testimony, undefined, 'srv');
     assert.match(stub, why);
     assert.ok(!stub.includes('fetch_reference'), stub);
   }
   const live = reference('resource', { uri: 'https://example.test/stub-live', expiresAt: '2999-01-01T00:00:00Z' }).testimony;
-  assert.match(buildReferenceStub(live), /\] fetch with fetch_reference$/);
+  assert.match(buildReferenceStub(live, undefined, 'srv'), /\] fetch with fetch_reference$/);
   // A copy saved before its expiry passed is still served, and its stub says where.
   const saved = reference('resource', { uri: 'https://example.test/stub-expired-0', expiresAt: '2001-01-01T00:00:00Z' }).testimony;
-  referenceRegistry.findByUri(saved.uri)!.fetchedPath = 'scratch/refs/kept.png';
+  const savedRecord = referenceRegistry.findByUri(saved.uri)!;
+  savedRecord.fetchedPath = 'scratch/refs/kept.png';
   assert.match(buildReferenceStub(saved), /\] saved: scratch\/refs\/kept\.png$/);
+  // So no refusal is foreseen for it either, whoever asks.
+  assert.equal(unfetchableReason(savedRecord), null);
+});
+
+test("an unbound reference's stub says it can't be fetched and why, where a bound one's advises fetch_reference", () => {
+  // Registered with no server, as an in-process module's reference or a channel message's is.
+  const { testimony } = reference('resource', { uri: 'https://example.test/stub-unbound' });
+  const unbound = buildReferenceStub(testimony, 'from a module');
+  assert.ok(unbound.endsWith(`] from a module — ${UNBOUND_REASON}`), unbound);
+  assert.ok(!unbound.includes('fetch_reference'), unbound);
+  // Expired as well: the fetcher refuses it as unbound first, so the stub says that.
+  const { testimony: both } = reference('resource', { uri: 'https://example.test/stub-unbound-expired', expiresAt: '2001-01-01T00:00:00Z' });
+  assert.ok(buildReferenceStub(both).endsWith(`] ${UNBOUND_REASON}`));
+  // A later registration that knows its server binds the record, and the next stub advises fetch_reference.
+  assert.ok(buildReferenceStub(testimony, 'from a server', 'srv').endsWith('] from a server — fetch with fetch_reference'));
 });
 
 test('display labels lose every bidi control, the Arabic letter mark included', () => {
@@ -154,7 +194,7 @@ test('large invalid labels cannot change the bounded model-visible stub', () => 
   });
   assert.equal(testimony.name, undefined);
   assert.equal(testimony.mimeType, undefined);
-  const stub = buildReferenceStub(testimony, 'server');
+  const stub = buildReferenceStub(testimony, 'server', 'srv');
   assert.ok(stub.length < 150);
   assert.ok(stub.includes('claimed'));
   assert.ok(stub.includes('fetch with fetch_reference'), `an unfetched reference's stub: ${stub}`);

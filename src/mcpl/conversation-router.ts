@@ -34,6 +34,7 @@
  * follow-up.
  */
 
+import { createHash } from 'node:crypto';
 import type { ContextStrategy } from '@animalabs/context-manager';
 import type { ChannelDescriptor } from './types.js';
 
@@ -118,6 +119,10 @@ export interface ConversationBinding {
  * framework so the router stays free of event-shape knowledge. */
 export interface IncomingMessageFacts {
   channelId: string;
+  /** The MCPL server the channel belongs to. A spawned fork's name hashes it
+   *  with the channel id (see forkAgentName); left out, `null` stands in for
+   *  it there. */
+  serverId?: string;
   /** Personal mention of the bot (metadata.mentioned from the adapter). */
   mentioned: boolean;
   /** Channel classification (see classifyChannel). */
@@ -208,7 +213,7 @@ export class ConversationRouter {
     const generation = (this.generations.get(facts.channelId) ?? 0) + 1;
     return {
       kind: 'spawn',
-      agentName: this.forkAgentName(facts.channelId, generation),
+      agentName: forkAgentName(this.config.agentPrefix ?? 'conversation', facts.serverId, facts.channelId, generation),
       generation,
       trigger: this.shouldTrigger(facts),
     };
@@ -310,12 +315,27 @@ export class ConversationRouter {
       ?? (facts.kind === 'dm' ? 'always' : 'mention');
     return rule === 'always' || facts.mentioned;
   }
+}
 
-  /** `conversation-slack-C123-g2` — agent names double as Chronicle
-   * namespace components, so the channel id is sanitized. */
-  private forkAgentName(channelId: string, generation: number): string {
-    const prefix = this.config.agentPrefix ?? 'conversation';
-    const safe = channelId.replace(/[^A-Za-z0-9_-]+/g, '-');
-    return `${prefix}-${safe}-g${generation}`;
-  }
+/** The readable part of a fork's name stops here: uniqueness rides on the hash. */
+const FORK_NAME_READABLE_MAX = 64;
+
+/**
+ * A fork's agent name: `<prefix>-<readable>-g<generation>-<hash>`, such as
+ * `conversation-C123-g2-e08e564271867d16` for Slack's channel `C123` on the
+ * server `slack`. Agent names double as context-manager namespace components,
+ * so the readable part is the channel id with each run of characters other
+ * than letters, digits, `_` and `-` replaced by `-`, cut to 64 characters.
+ * Different ids can read alike (`foo bar`, `foo-bar`), so the hash is the first
+ * 64 bits of a SHA-256 of `JSON.stringify([serverId, channelId])`, where an
+ * absent server id is written as `null`: two channels' forks share a name, and
+ * with it a namespace, only if those 64 bits collide. The hash is fixed-length
+ * and last, so a name's parts read back unambiguously, and a pattern over its
+ * readable part and `-g`, such as `conversation-C123-g*`, matches each
+ * generation's fork.
+ */
+export function forkAgentName(prefix: string, serverId: string | undefined, channelId: string, generation: number): string {
+  const readable = channelId.replace(/[^A-Za-z0-9_-]+/g, '-').slice(0, FORK_NAME_READABLE_MAX);
+  const hash = createHash('sha256').update(JSON.stringify([serverId, channelId])).digest('hex').slice(0, 16);
+  return `${prefix}-${readable}-g${generation}-${hash}`;
 }

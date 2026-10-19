@@ -7,6 +7,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { toolResultDataToHistoryString } from '../src/tool-result-history.js';
+import { NON_STRING_TEXT_PLACEHOLDER } from '../src/mcpl/visible-content.js';
 
 test('text-only MCP content array: blocks join with newlines', () => {
   const data = [
@@ -50,6 +51,18 @@ test('mixed known + unknown block shape falls back to JSON (all-or-nothing)', ()
     { type: 'audio', data: 'XX', mimeType: 'audio/mpeg' },
   ];
   assert.equal(toolResultDataToHistoryString(data), JSON.stringify(data));
+});
+
+test('a text block whose text is not a string shows the placeholder, so a reference beside it is still a stub', () => {
+  // It used to send the whole array to the JSON fallback, the reference's
+  // uri included.
+  const data = [
+    { type: 'text', text: null },
+    { type: 'resource', uri: 'https://signed.example/f?token=RAW_TOKEN', mimeType: 'text/plain', sizeBytes: 10, name: 'f.txt', disposition: 'never' },
+  ];
+  const out = toolResultDataToHistoryString(data);
+  assert.ok(out.startsWith(`${NON_STRING_TEXT_PLACEHOLDER}\n[ref_`), out);
+  assert.ok(!out.includes('RAW_TOKEN'), out);
 });
 
 test('non-array data: JSON stringify', () => {
@@ -173,5 +186,5 @@ test('RFC-005: dispatch pre-registration and stub share ONE record (reviewer pro
   const stubId = out.match(/\[(ref_[a-z0-9_]+)\]/)?.[1];
   assert.equal(stubId, dispatchRecord.refId, 'stub id must equal dispatch id');
   assert.ok(out.includes('saved: scratch/refs/'), 'eager-fetched path must surface in the stub');
-  assert.equal(referenceRegistry.get(stubId!)?.serverId, 'srv', 'visible id must be server-bound');
+  assert.deepEqual(referenceRegistry.get(stubId!)?.serverIds, ['srv'], 'visible id must be server-bound');
 });

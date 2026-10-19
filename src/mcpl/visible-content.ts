@@ -31,6 +31,34 @@ export function isVisiblyEmptyContent(content: readonly unknown[] | null | undef
   return true;
 }
 
+/**
+ * What the converter (convertBlock, on every lane) shows for a text
+ * block whose text isn't a string, which only a nonconformant sender writes,
+ * so the agent learns that a block was there. It is the host's word, not the
+ * sender's, so it never makes content visible (isVisiblyEmptyConversion).
+ * The other blocks the converters can't show have theirs in references.ts.
+ */
+export const NON_STRING_TEXT_PLACEHOLDER = '[Text not shown: a text part arrived without readable text.]';
+
+/** A wire text block whose text isn't a string, which the converter shows as
+ *  NON_STRING_TEXT_PLACEHOLDER. */
+function isNonStringTextBlock(block: unknown): boolean {
+  if (!block || typeof block !== 'object') return false;
+  const b = block as { type?: unknown; text?: unknown };
+  return b.type === 'text' && typeof b.text !== 'string';
+}
+
+/**
+ * isVisiblyEmptyContent for content as a converter showed it, `wire` being
+ * the content as it arrived, block for block: a block shown as
+ * NON_STRING_TEXT_PLACEHOLDER counts as the nothing it held. So content that
+ * is only such blocks (or blank text) is still empty, and anything else is
+ * judged as the converted blocks show it, placeholders included.
+ */
+export function isVisiblyEmptyConversion(wire: readonly unknown[], converted: readonly unknown[]): boolean {
+  return isVisiblyEmptyContent(converted.filter((_, i) => !isNonStringTextBlock(wire[i])));
+}
+
 /** The server id and feature set the marker must carry. */
 export const SILENT_HEARTBEAT_SERVER_ID = 'heartbeat';
 export const SILENT_HEARTBEAT_FEATURE_SET = 'heartbeat';

@@ -13,7 +13,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 import { AgentFramework } from '../src/index.js';
-import type { EventResponse, Module, ModuleContext, ProcessEvent, ProcessState, ToolCall, ToolDefinition, ToolResult } from '../src/index.js';
+import type { EventResponse, Module, ModuleContext, ProcessEvent, ProcessState, ScriptToolResult, ToolCall, ToolDefinition, ToolResult } from '../src/index.js';
 import { MockMembrane, createMockResponse } from './helpers/mock-membrane.js';
 
 function cyclic(): Record<string, unknown> {
@@ -42,6 +42,8 @@ const RESULTS: Record<string, () => unknown> = {
   errerror: () => ({ success: false, isError: true, error: new Error('db timeout') }),
   nullerror: () => ({ success: false, isError: true, error: null }),
   quietfail: () => ({ success: false, error: 'unknown channel: c1', isError: false }),
+  // An unflagged failure whose own text starts like an error.
+  prefixquiet: () => ({ success: false, error: 'Error: quota is fine', isError: false }),
   noresult: () => undefined,
   nullresult: () => null,
   arrayresult: () => [],
@@ -275,13 +277,43 @@ test('a script reads a quiet failure as its error text, and an unusable result a
   // A script's call is answered through the event loop, so it has to run.
   framework.start();
   const script = (tool: string) => (framework as unknown as {
-    handleScriptToolCall(agent: string, tool: string, args: Record<string, unknown>): Promise<string>;
+    handleScriptToolCall(agent: string, tool: string, args: Record<string, unknown>): Promise<ScriptToolResult>;
   }).handleScriptToolCall('assistant', `odd--${tool}`, {});
-  assert.equal(await within(script('quietfail'), 10_000, 'the call'), 'unknown channel: c1');
-  assert.equal(await within(script('nulldataquiet'), 10_000, 'the call'), 'gone');
-  assert.equal(await within(script('cyclic'), 10_000, 'the call'), `Error: ${unconvertible('cyclic', 'Converting circular structure to JSON')}`);
-  assert.equal(await within(script('getterthrows'), 10_000, 'the call'), `Error: ${unreadable('getterthrows', 'a value with no text form')}`);
+  // A failure the tool doesn't flag reads as the model reads it, isError
+  // false: the script's .is_error follows the result's flag, not its text.
+  assert.deepEqual(await within(script('quietfail'), 10_000, 'the call'), { text: 'unknown channel: c1', isError: false });
+  assert.deepEqual(await within(script('nulldataquiet'), 10_000, 'the call'), { text: 'gone', isError: false });
+  // Text that only starts like an error isn't flagged as one: the flag is
+  // the result's, not the text's prefix.
+  assert.deepEqual(await within(script('prefixquiet'), 10_000, 'the call'), { text: 'Error: quota is fine', isError: false });
+  assert.deepEqual(await within(script('cyclic'), 10_000, 'the call'), { text: `Error: ${unconvertible('cyclic', 'Converting circular structure to JSON')}`, isError: true });
+  assert.deepEqual(await within(script('getterthrows'), 10_000, 'the call'), { text: `Error: ${unreadable('getterthrows', 'a value with no text form')}`, isError: true });
   await within(framework.stop(), 10_000, 'stop()');
+});
+
+test("a result the script's serializer can't convert reaches the script as an error, flagged as one", async (t) => {
+  // The dispatch's own check (storableToolResult) turns such a result into an
+  // error first, so these returns are reached only past it: here, with the
+  // dispatch answering a cyclic result directly.
+  const { framework } = await setUp(t, []);
+  const internals = framework as unknown as {
+    dispatchScriptToolCall: () => Promise<ToolResult>;
+    handleScriptToolCall(agent: string, tool: string, args: Record<string, unknown>): Promise<ScriptToolResult>;
+  };
+  const reason = 'Converting circular structure to JSON';
+  internals.dispatchScriptToolCall = async () => ({ success: true, data: cyclic() });
+  const text = await internals.handleScriptToolCall('assistant', 'odd--cyclic', {});
+  assert.equal(text.isError, true);
+  assert.equal(text.structuredJson, undefined);
+  assert.ok(text.text.startsWith("Error: tool 'odd--cyclic' returned a result that can't be converted to JSON, so the script can't receive it"), text.text);
+  assert.ok(text.text.includes(reason), text.text);
+  internals.dispatchScriptToolCall = async () => ({ success: true, structured: cyclic() });
+  const structured = await internals.handleScriptToolCall('assistant', 'odd--cyclic', {});
+  assert.equal(structured.isError, true);
+  assert.equal(structured.structuredJson, true);
+  const object = JSON.parse(structured.text) as { content: unknown[]; structuredContent: unknown; isError: boolean; error: string };
+  assert.deepEqual({ ...object, error: undefined }, { content: [], structuredContent: null, isError: true, error: undefined });
+  assert.ok(object.error.includes(reason), object.error);
 });
 
 test("the read_image tool's own handler gets the same check", async (t) => {

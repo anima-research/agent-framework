@@ -211,15 +211,22 @@ export interface McplChannelCapabilities {
 /**
  * Configuration for connecting to a single MCPL server.
  * Provided in FrameworkConfig.mcplServers[].
+ *
+ * Treat a submitted configuration and its nested values as immutable for as
+ * long as the server uses them. Apply changed settings with
+ * `restartMcplServer(id, newConfig)`; use `accessProvider` for a network
+ * server's rotating credentials (a stdio server's changed `env` goes through
+ * a restart with the new configuration).
  */
 export interface McplServerConfig {
   /** Unique server identifier */
   id: string;
 
   /**
-   * Command to spawn the server process (stdio transport). Mutually exclusive
-   * with `url`. Required for the stdio transport; omit it (and set `url`) for
-   * the WebSocket transport.
+   * Command to spawn the server process (stdio transport). Required for the
+   * stdio transport; omit it (and set `url`) for a network server, over
+   * WebSocket or HTTP. A configuration with both needs `transport` to say
+   * which one is used, and is refused without it.
    */
   command?: string;
 
@@ -238,27 +245,49 @@ export interface McplServerConfig {
   /**
    * Escape hatch: pass the host's entire environment (including secrets) to
    * the stdio child, as older versions did. Only for servers that genuinely
-   * need it. Default false.
+   * need it. Default false. Only `true` turns it on, and null counts as not
+   * set. For a stdio server, `create()`, `connectMcplServer` and
+   * `restartMcplServer` refuse any other value, such as a quoted "false". A
+   * WebSocket server never reads it.
    */
   inheritEnv?: boolean;
 
   /**
-   * WebSocket URL for the network transport (`ws://` or `wss://`). Mutually
-   * exclusive with `command`. When set (or `transport: 'websocket'`), the host
-   * dials this endpoint instead of spawning a process — newline-delimited
-   * JSON-RPC MCPL runs over the socket identically to stdio.
+   * URL for a network server, used instead of `command`. A configuration
+   * with both needs `transport` to say which one is used, and is refused
+   * without it. Its scheme decides the protocol family:
+   * - `ws://` or `wss://` is a legacy MCPL server over MCPL's WebSocket
+   *   binding. The host dials it and runs the same newline-delimited JSON-RPC
+   *   as over stdio.
+   * - `http://` or `https://` is a modern MCP (2026-07-28) server over
+   *   Streamable HTTP.
    */
   url?: string;
 
   /**
-   * Transport selector. Defaults to `'websocket'` when a bare `url` is given
-   * (no `command`), `'stdio'` otherwise. Set explicitly to disambiguate.
+   * Transport selector. When it is absent, a `command` means stdio and a
+   * `url` means the transport its scheme names; with both, it is required.
+   * When it is set, it decides which of the two is used and must agree with
+   * it: `'stdio'` needs a `command`, `'websocket'` a ws(s):// url and
+   * `'http'` an http(s):// url.
    */
-  transport?: 'stdio' | 'websocket';
+  transport?: 'stdio' | 'websocket' | 'http';
 
   /**
-   * Bearer token for WebSocket auth. Appended to `url` as a `token` query
-   * parameter (`?token=…`) on connect. Ignored by the stdio transport.
+   * Protocol family for a stdio (`command`) server. Defaults to `'legacy'`,
+   * which is MCP 2024-11-05 + MCPL and today's behavior. `'modern'` speaks
+   * MCP 2026-07-28 through the SDK-backed modern engine. A network server's
+   * family comes from its url's scheme, so setting this on one is a
+   * configuration error. There is no probing between families.
+   */
+  protocol?: 'legacy' | 'modern';
+
+  /**
+   * Bearer token for a network server. Where it travels depends on the
+   * transport: on a ws(s):// url it is appended as a `token` query parameter
+   * (`?token=…`) on connect; to an http(s):// server it is sent as an
+   * `Authorization: Bearer` header and never put in the url. A legacy stdio
+   * server ignores it, and a modern stdio server refuses it.
    */
   token?: string;
 
@@ -278,7 +307,9 @@ export interface McplServerConfig {
    * unstick). DEFAULT FALSE: no §6.2 capability path exists for it, and the
    * grant cannot confer it — only this config, decided by the operator, can
    * (PR #79 review blocker 9). The one legitimate fleet user is
-   * discord-mcpl's slash-command relay.
+   * discord-mcpl's slash-command relay. Only `true` turns it on, and null
+   * counts as not set. `create()`, `connectMcplServer` and
+   * `restartMcplServer` refuse any other value, such as a quoted "true".
    */
   allowHostCommands?: boolean;
 
@@ -351,6 +382,9 @@ export interface McplServerConfig {
    * When true, connect() resolves immediately (with null capabilities) if the
    * server is unavailable, and retries in the background.
    * Adapted from Anarchid/agent-framework@mcpl-module-proto.
+   * Only `true` turns it on, and null counts as not set. `create()`,
+   * `connectMcplServer` and `restartMcplServer` refuse any other value, such
+   * as a quoted "false".
    */
   reconnect?: boolean;
 
@@ -374,7 +408,22 @@ export interface McplServerConfig {
    * accepts a request and never responds would otherwise freeze the awaiting
    * agent turn forever; with the timeout the pending request rejects with a
    * descriptive error, which the framework surfaces as a normal isError
-   * tool_result. Set 0 to disable. Default: 60000 (60 seconds).
+   * tool_result. Request timeouts are the only bound for a stdio server that
+   * stops reading its stdin without closing it: the host's writes are
+   * buffered, no error is raised, and the connection stays up. Under Bun they
+   * are also the only bound for one that closes its stdin, since Bun emits no
+   * 'error' event for the writes to it. requestTimeoutMs is the timeout of
+   * every request that names none; the handshake's initialize has its own.
+   * Set 0 to disable, except for channels/publish and the channels/open a
+   * delivery may send first, which keep the 60 s default: a publish's outcome
+   * is reported to the resident and recorded for its draft, so it must end.
+   * Default: 60000 (60 seconds). A value above 2^31−1 is refused: Node runs a
+   * longer timer after about 1 ms, so every request would time out at once.
+   *
+   * For a modern server it is one deadline per tool call, across every leg
+   * of the call, and must be an integer from 1 to 2^31−1. It can't be
+   * disabled: the SDK reads 0 as "time out now". At the deadline
+   * cancellation is requested and the outcome is unknown.
    */
   requestTimeoutMs?: number;
 
@@ -404,7 +453,10 @@ export interface McplServerConfig {
    * `toolLifecycle.*.tools`) match these full names; `enabledTools` /
    * `disabledTools` use the bare server-side names.
    *
-   * Must not collide with any module name or another server's prefix.
+   * Must not equal any module name or another server's prefix, nor meet
+   * another server's prefix: two prefixes meet when one is the other
+   * followed by `-`, or begins with the other followed by `--`, as `foo-`
+   * and `foo--bar` each meet `foo` (prefixesMeet, #265).
    */
   toolPrefix?: string;
 
@@ -1060,7 +1112,15 @@ export interface ChannelsListResult {
  * Spec Section 14.3.
  */
 export interface ChannelsOpenParams {
-  /** Exact registered id. Preferred over type/address matching. */
+  /**
+   * The exact registered id to open. Without it, a server matches by `type`
+   * and `address`, as before. A server that doesn't know the id should
+   * refuse rather than open another channel: the host fails an open whose
+   * answer names a different channel id, by its `channel.id` or a history
+   * item's `channelId`, compared exactly, as the server's traffic is. When
+   * that other channel is registered and decided closed, the host closes it
+   * again.
+   */
   channelId?: string;
   type: string;
   address?: Record<string, unknown>;
@@ -1315,6 +1375,8 @@ export interface McpToolDefinition {
   name: string;
   description?: string;
   inputSchema: Record<string, unknown>;
+  /** Server metadata for the tool (e.g. RFC-008 `mcpl/class` hints). */
+  _meta?: Record<string, unknown>;
 }
 
 /**

@@ -9,6 +9,7 @@
  */
 
 import type { ToolDefinition } from '../types/index.js';
+import { assertBooleanSetting, holdsSettings, kindOf } from '../config-checks.js';
 import { formatLimit, MAX_TIMER_MS } from './py-runner.js';
 
 export const CODE_EXECUTION_TOOL_NAME = 'code_execution';
@@ -32,14 +33,26 @@ export function buildCodeExecutionToolDefinition(opts?: {
       "non-identifier character replaced by '_' " +
       "(e.g. tool 'mcpl--discord--fetch_history' is the function mcpl__discord__fetch_history, " +
       "and tool 'mcpl--dog-events--status' is mcpl__dog_events__status). " +
-      'Each function takes a single dict of arguments and returns a string — the same text ' +
-      'the tool would have returned to you directly; parse structured results with json.loads. ' +
+      'Each function takes a single dict of arguments and returns a string: the text the tool ' +
+      'would have returned to you directly, or "Error: ..." if the call failed. For a result ' +
+      'with structured content, the string is a JSON object to parse with json.loads: ' +
+      '{"content": [...], "structuredContent": ..., "isError": false}, with "error" added when ' +
+      `"isError" is true. "content" holds the server's content blocks. A reference to a payload ` +
+      'appears there as {"type": ..., "refId": ..., "savedTo": ...}, where "savedTo" is the ' +
+      `workspace path the payload was saved to (null if it wasn't) and "refId" is fetch_reference's ` +
+      'ref_id. A structured result over 5 MB is saved to the workspace instead, and the string is ' +
+      '{"isError": ..., "oversized": {"chars": ..., "savedTo": ...}}. ' +
+      'Each string also carries .is_error (True if the result is an error, else False; test it ' +
+      'rather than an "Error:" prefix) and .structured (the parsed "structuredContent" of the ' +
+      'JSON object above, or None). ' +
       "An exact-name lookup dict is also available: tools['mcpl--discord--fetch_history']({...}). " +
       'Use top-level await; run independent calls in parallel with asyncio.gather. ' +
       'Only what you print() (plus stderr and the exit code) comes back to you — intermediate ' +
       'tool results stay in the script, so filter or aggregate large data there and print only ' +
       'what you need. Interpreter state (variables, imports) persists across code_execution ' +
-      `calls but is reclaimed after ~${idleMinutes} minutes idle. A tool call that receives no ` +
+      `calls but is reclaimed after ~${idleMinutes} minutes idle. Relative paths resolve in a ` +
+      'scratch directory of the interpreter\'s, which goes whenever it stops or is reclaimed, so a file meant to ' +
+      'outlast the interpreter needs an absolute path. A tool call that receives no ' +
       `response within ~${callTimeoutSeconds}s raises TimeoutError inside the script. ` +
       `A foreground script is stopped after ${formatLimit(limits.defaultMs)}; pass time_limit_ms to set this call's limit ` +
       `(at most ${formatLimit(limits.maxMs)}; a background script runs up to ${formatLimit(limits.backgroundMaxMs)}). ` +
@@ -106,15 +119,43 @@ export function scriptTimeLimits(opts?: {
   const defaultMs = Math.min(MAX_TIMER_MS, opts?.scriptTimeoutMs ?? 600_000);
   return {
     defaultMs,
-    // A ceiling below the default is refused when the framework is created
-    // (validateCodeExecutionConfig); never below the default here either.
+    // A ceiling below the default is refused when a framework with code
+    // execution on is created (validateCodeExecutionConfig); never below the
+    // default here either.
     maxMs: Math.min(MAX_TIMER_MS, Math.max(defaultMs, opts?.maxScriptTimeoutMs ?? defaultMs)),
     backgroundMaxMs: Math.min(MAX_TIMER_MS, opts?.backgroundMaxLifetimeMs ?? 86_400_000),
   };
 }
 
-/** Refuse a configuration whose time limits contradict each other. */
-export function validateCodeExecutionConfig(cfg: { scriptTimeoutMs?: number; maxScriptTimeoutMs?: number }): void {
+/**
+ * Refuse a codeExecution that isn't an object, or whose switch is set to
+ * anything but true or false, and, once it's on, one whose time limits
+ * contradict each other or whose interpreter environment would be misread. A
+ * JSON config, or a `${VAR}` substituted as a string, can carry a quoted
+ * "false" where the type says boolean, and only `true` turns code execution
+ * on, so the quotes would hide what the value does; a bare
+ * `codeExecution: true` would be read as off. Likewise the runner passes the
+ * host's environment only for an `inheritEnv` of `true`, so a quoted "true"
+ * would quietly keep the allowlist. A null or false codeExecution, and a null
+ * setting, count as not set, as left-out ones do. The refusal names the
+ * value's kind, not the value. A configuration that isn't on has nothing else
+ * read.
+ */
+export function validateCodeExecutionConfig(cfg: {
+  enabled?: unknown;
+  scriptTimeoutMs?: number;
+  maxScriptTimeoutMs?: number;
+  env?: unknown;
+  inheritEnv?: unknown;
+}): void {
+  if (!holdsSettings('codeExecution', cfg, '{ enabled: true }')) return;
+  assertBooleanSetting(
+    'codeExecution.enabled',
+    cfg.enabled,
+    'true gives agents the code_execution tool, which runs their scripts in a python interpreter on the host, ' +
+      'and false or leaving it out doesn\'t',
+  );
+  if (cfg.enabled !== true) return;
   const defaultMs = cfg.scriptTimeoutMs ?? 600_000;
   if (cfg.maxScriptTimeoutMs !== undefined && !(cfg.maxScriptTimeoutMs >= defaultMs)) {
     throw new Error(
@@ -122,4 +163,41 @@ export function validateCodeExecutionConfig(cfg: { scriptTimeoutMs?: number; max
         'it is the most an agent may ask for, and the default is always allowed',
     );
   }
+  // None of the environment's refusals below shows the value it refuses,
+  // at most its kind: a substituted value can be a credential. null counts
+  // as not set, so a generated config that writes an unset setting as null
+  // keeps working.
+  assertBooleanSetting(
+    'codeExecution.inheritEnv',
+    cfg.inheritEnv,
+    "true hands the interpreter the host's whole environment, and false or leaving it out keeps the allowlist",
+  );
+  if (cfg.env !== undefined && cfg.env !== null) {
+    if (!isPlainObject(cfg.env)) {
+      throw new Error(`codeExecution.env must be an object of variable names and string values, not ${kindOf(cfg.env)}`);
+    }
+    for (const [name, value] of Object.entries(cfg.env)) {
+      // spawn writes each variable as name=value: a name that is empty or
+      // holds '=' doesn't reach the interpreter as written, and a NUL in a
+      // name or a value makes spawn throw at every start.
+      // Only what comes before an '=' or NUL is shown: what follows can be a
+      // value pasted into the name.
+      if (name === '' || name.includes('=') || name.includes('\0')) {
+        const shown = name === '' ? 'that is empty' : `starting ${JSON.stringify(name.split(/[=\0]/, 1)[0])} that holds '=' or NUL`;
+        throw new Error(`codeExecution.env has a variable name ${shown}, and a name can't be empty or hold '=' or NUL`);
+      }
+      if (typeof value !== 'string') {
+        throw new Error(`codeExecution.env.${name} must be a string, not ${kindOf(value)}: give its value as a string, or leave ${name} out`);
+      }
+      if (value.includes('\0')) {
+        throw new Error(`codeExecution.env.${name} holds a NUL character, which no environment variable can carry`);
+      }
+    }
+  }
+}
+
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  if (typeof value !== 'object' || value === null) return false;
+  const proto = Object.getPrototypeOf(value);
+  return proto === Object.prototype || proto === null;
 }

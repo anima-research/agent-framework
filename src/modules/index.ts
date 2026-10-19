@@ -21,6 +21,7 @@ export type {
   ReadInput,
   WriteInput,
   EditInput,
+  EditManyInput,
   DeleteInput,
   LsInput,
   GlobInput,
@@ -30,7 +31,7 @@ export type {
   SyncInput,
 } from './workspace/index.js';
 
-export { DiscordModule, DiscordJsClient } from './discord/index.js';
+export { DiscordModule, DiscordJsClient, DiscordRefusal } from './discord/index.js';
 export type { DiscordJsClientConfig } from './discord/index.js';
 export type {
   DiscordModuleConfig,
