@@ -25751,12 +25751,32 @@ export class AgentFramework {
    * Dispatch a synthesized channel tool call.
    */
   private dispatchChannelToolCall(agentName: string, call: ToolCall): void {
-    // Conversation forks act only on their home channel. channel_publish and
-    // channel_close default a missing channelId to home and reject foreign
-    // ones; channel_open is rejected outright — opening channels mutates
-    // framework-global state (the open-channel set every agent's injections
-    // are scoped against), which is not a fork's call to make.
     const home = this.conversationAgentHomes.get(agentName);
+    // A turn from a private surface publishes only where it names: an
+    // argument-less channel_publish infers no channel, a fork's home
+    // included, since the turn was private wherever the agent speaks.
+    // Judged on the call as the agent made it, before a fork's default
+    // below fills one in.
+    if (call.name === 'channel_publish'
+      && this.routingOf(agentName).nonChannelOrigin
+      && !(call.input as { channelId?: unknown } | undefined)?.channelId) {
+      const error = 'This private turn has no inferred channel; channel_publish requires an explicit channelId.'
+        + (home ? ` To publish in this conversation's channel, name "${home}".` : '');
+      this.toolLifecycleEmitter?.refuse(agentName, call.id);
+      this.emitTrace({ type: 'tool:failed', module: 'channels', tool: call.name, callId: call.id, error });
+      this.pushEvent({
+        type: 'tool-result', callId: call.id, toolName: call.name, agentName, moduleName: 'channels',
+        result: { success: false, error, isError: true },
+      });
+      return;
+    }
+
+    // Conversation forks act only on their home channel. channel_publish and
+    // channel_close default a missing channelId to home (outside a private
+    // turn, for channel_publish) and reject foreign ones; channel_open is
+    // rejected outright — opening channels mutates framework-global state
+    // (the open-channel set every agent's injections are scoped against),
+    // which is not a fork's call to make.
     if (home) {
       const reject = (error: string): void => {
         // RFC-007: the guard refuses before the tool runs — no lifecycle events.
@@ -25789,19 +25809,6 @@ export class AgentFramework {
           return;
         }
       }
-    }
-
-    if (call.name === 'channel_publish'
-      && this.routingOf(agentName).nonChannelOrigin
-      && !(call.input as { channelId?: unknown } | undefined)?.channelId) {
-      const error = 'This private turn has no inferred channel; channel_publish requires an explicit channelId.';
-      this.toolLifecycleEmitter?.refuse(agentName, call.id);
-      this.emitTrace({ type: 'tool:failed', module: 'channels', tool: call.name, callId: call.id, error });
-      this.pushEvent({
-        type: 'tool-result', callId: call.id, toolName: call.name, agentName, moduleName: 'channels',
-        result: { success: false, error, isError: true },
-      });
-      return;
     }
 
     this.emitTrace({ type: 'tool:started', module: 'channels', tool: call.name, callId: call.id, input: call.input });

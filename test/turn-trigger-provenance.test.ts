@@ -609,4 +609,34 @@ describe('surface batches at their edges, through the real scheduler', () => {
       }
     }
   });
+
+  it("a private turn's channel_publish names where it goes, a fork's home included", async () => {
+    const rig = await surfaceRig();
+    try {
+      const results: Array<{ success: boolean; error?: string }> = [];
+      const internalsOf = rig.framework as unknown as {
+        conversationAgentHomes: Map<string, string>;
+        routingOf(name: string): Record<string, unknown>;
+        dispatchChannelToolCall(agentName: string, call: { id: string; name: string; input: unknown }): void;
+        pushEvent(event: unknown): void;
+      };
+      const push = internalsOf.pushEvent.bind(rig.framework);
+      internalsOf.pushEvent = (event: unknown) => {
+        const e = event as { type?: string; result?: { success: boolean; error?: string } };
+        if (e.type === 'tool-result' && e.result) results.push(e.result);
+        else push(event);
+      };
+      internalsOf.routingOf('scout').nonChannelOrigin = true;
+      for (const fork of [false, true]) {
+        if (fork) internalsOf.conversationAgentHomes.set('scout', ROOM);
+        results.length = 0;
+        internalsOf.dispatchChannelToolCall('scout', { id: `c-${fork}`, name: 'channel_publish', input: { content: 'hello' } });
+        assert.equal(results[0]?.success, false, `${fork ? 'a fork' : 'a trunk agent'}: refused without a channelId`);
+        assert.match(results[0]!.error!, /channel_publish requires an explicit channelId/);
+        if (fork) assert.match(results[0]!.error!, new RegExp(`name "${ROOM}"`));
+      }
+    } finally {
+      await rig.close();
+    }
+  });
 });
