@@ -2803,6 +2803,10 @@ export class AgentFramework {
    * (config.dendrite.collapseDerivationNoticesAfter; 0 = never collapse).
    */
   private collapseDerivationNoticesAfter = 10;
+  /** Whether a source is told of its derivations (config.dendrite.announceDerivations). */
+  private announceDerivations = true;
+  /** What is asked of `subconscious.consent` (config.dendrite.consent). */
+  private readerConsentPolicy: 'required' | 'recorded' | 'none' = 'recorded';
   /** Per source agent, per kind: how many derivations, since when, and at which count the last note went. */
   private derivationTallies: Map<string, Map<string, { count: number; since: number }>> = new Map();
   /** Group commit: one fsync per event-loop turn, shared by every waiter. */
@@ -3268,6 +3272,8 @@ export class AgentFramework {
 
     framework.announceOrphans = config.dendrite?.announceOrphans ?? true;
     framework.collapseDerivationNoticesAfter = Math.max(0, Math.floor(config.dendrite?.collapseDerivationNoticesAfter ?? 10));
+    framework.announceDerivations = config.dendrite?.announceDerivations ?? true;
+    framework.readerConsentPolicy = config.dendrite?.consent ?? 'recorded';
     framework.speechLocus = config.speech?.locus ?? 'delivery';
     framework.tuneOutOffered = !!config.subconscious?.enabled || config.tuneOut?.enabled === true;
     framework.tuneOutAnnounce = config.tuneOut?.announce !== false;
@@ -5589,8 +5595,9 @@ export class AgentFramework {
     }
     if (this.tuneOutCoordinator && this.tuneOutOffered) {
       channelTools.push(AgentFramework.TUNE_OUT_TOOL, AgentFramework.FOCUS_TOOL);
-      // A resident whose reader is forks of itself can take its yes back.
-      if (this.readerForks) channelTools.push(AgentFramework.WITHDRAW_CONSENT_TOOL);
+      // A resident whose reader is forks of itself can take its yes back,
+      // where the host's policy knows a yes at all (dendrite.consent).
+      if (this.readerForks && this.readerConsentPolicy !== 'none') channelTools.push(AgentFramework.WITHDRAW_CONSENT_TOOL);
     }
     const gateTools = this.eventGate
       ? [
@@ -9015,7 +9022,7 @@ export class AgentFramework {
       ...(AgentFramework.readerConsentOf(record) ? { consent: AgentFramework.readerConsentOf(record)! } : {}),
     });
     const from = record.inherit?.from;
-    if (!from || from === record.name) return;
+    if (!from || from === record.name || !this.announceDerivations) return;
     const detail = {
       event: 'derived',
       agent: record.name,
@@ -12611,7 +12618,16 @@ export class AgentFramework {
     // A yes is to the configuration the resident saw. A section that has
     // changed since is a different thing to agree to, so it is refused
     // until asked again (connectome-host#334: the whole section, not a field).
-    if (cfg.consent) {
+    // Whether a yes is demanded at all is the host's policy
+    // (dendrite.consent): 'required' refuses forks without one; 'recorded',
+    // the default, checks and carries one that is given; 'none' reads none.
+    if (this.readerConsentPolicy === 'required' && !cfg.consent) {
+      throw new Error(
+        `subconscious.reader "forks": this host requires the resident's yes (dendrite.consent: 'required'): record \`subconscious.consent\` — ` +
+          'who said yes, when, where the public yes can be read, and the fork section as they saw it.',
+      );
+    }
+    if (cfg.consent && this.readerConsentPolicy !== 'none') {
       const c = cfg.consent;
       for (const field of ['by', 'at', 'where'] as const) {
         if (typeof c[field] !== 'string' || c[field].trim().length === 0) {
@@ -28082,7 +28098,7 @@ export class AgentFramework {
    * the withdrawal is cleared the first time it is read against it.
    */
   readerConsentWithdrawn(): { at: string; by: string; reason?: string; consentAt?: string } | null {
-    if (!this.readerForks || !this.channelRegistry) return null;
+    if (!this.readerForks || !this.channelRegistry || this.readerConsentPolicy === 'none') return null;
     if (this.readerConsentCache === undefined) {
       try {
         const raw = this.channelRegistry.readCoordinatorState(this.readerConsentStateId()) as { withdrawn?: { at: string; by: string; reason?: string; consentAt?: string } } | null;
@@ -28109,8 +28125,8 @@ export class AgentFramework {
     agentName: string,
     input: Record<string, unknown>,
   ): { success: boolean; data?: unknown; error?: string; isError?: boolean } {
-    if (!this.readerForks || !this.channelRegistry) {
-      return { success: false, error: 'withdraw_consent applies to reader forks, which this host does not run for you; there is nothing to withdraw.', isError: true };
+    if (!this.readerForks || !this.channelRegistry || this.readerConsentPolicy === 'none') {
+      return { success: false, error: 'withdraw_consent applies to reader forks under a consent policy, which this host does not run for you; there is nothing to withdraw.', isError: true };
     }
     if (agentName !== this.primaryAgentName) {
       return { success: false, error: `withdraw_consent is ${this.primaryAgentName ?? 'the resident'}'s to call: the forks are of them.`, isError: true };

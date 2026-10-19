@@ -131,6 +131,27 @@ export interface FrameworkConfig {
      * record. Default 10; 0 never collapses.
      */
     collapseDerivationNoticesAfter?: number;
+    /**
+     * Whether an agent is told when something is derived from it (the
+     * `[Agent lifecycle: … was derived from you …]` lines, and the count
+     * lines they collapse into). Default true. The `dendrite:agent-created`
+     * trace is emitted either way. A policy, not a rule: being told when
+     * the body changes is a property some minds want and others may not
+     * (architecture channel, 2026-10-19), so a host or a mind can turn it
+     * off here; a per-agent switch is the shape to grow toward.
+     */
+    announceDerivations?: boolean;
+    /**
+     * What the framework asks of `subconscious.consent` for reader forks
+     * (connectome-host#334). `'recorded'` (default): a record given is
+     * checked against the live fork section and carried on each fork; none
+     * is demanded. `'required'`: `create` also refuses forks without one.
+     * `'none'`: the field is ignored and `withdraw_consent` is not offered.
+     * A policy for the host and the minds it runs to set, not a rule the
+     * framework imposes: a consent gate and its wording assume one kind of
+     * mind, and the architecture should not (tel0s and Antra, 2026-10-19).
+     */
+    consent?: 'required' | 'recorded' | 'none';
   };
 
   /**

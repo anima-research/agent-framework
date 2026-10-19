@@ -89,6 +89,44 @@ describe('the consent record and its drift rule', () => {
   });
 });
 
+describe('the consent policy (dendrite.consent) and the derivation notices (dendrite.announceDerivations)', { skip }, () => {
+  const create = (dir: string, dendrite: Record<string, unknown>, consent?: ReaderConsent) => AgentFramework.create({
+    storePath: join(dir, `${Math.random().toString(36).slice(2)}.chronicle`), membrane: new MockMembrane().asMembrane(),
+    agents: [{ name: 'scout', model: 'test-model', systemPrompt: 'You are scout.' }],
+    subconscious: { enabled: true, reader: 'forks', ...SECTION, ...(consent ? { consent } : {}) },
+    dendrite, modules: [],
+  });
+
+  it("'recorded' (the default) demands no record, and checks one that is given", async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'consent-policy-'));
+    try {
+      const without = await create(dir, {});
+      assert.equal(internals(without).readerConsentWithdrawn(), null, 'a host with no record has nothing withdrawn');
+      await without.stop(); // withdraw_consent's offer is checked over the MCPL fixture below, where tune-out's tools exist
+      await assert.rejects(create(dir, {}, { ...CONSENT, section: { ...SECTION, voice: 'other' } }), /covers a different fork section/);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  it("'required' refuses forks without a record, naming the policy", async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'consent-policy-'));
+    try {
+      await assert.rejects(create(dir, { consent: 'required' }), /requires the resident's yes \(dendrite\.consent: 'required'\)/);
+      const ok = await create(dir, { consent: 'required' }, CONSENT);
+      await ok.stop();
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  it("'none' reads no consent — a drifted record is not checked — and offers no withdraw_consent", async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'consent-policy-'));
+    try {
+      const fw = await create(dir, { consent: 'none' }, { ...CONSENT, section: { ...SECTION, voice: 'other' } });
+      assert.equal(fw.getAllTools().some((t) => t.name === 'withdraw_consent'), false);
+      assert.equal(internals(fw).readerConsentWithdrawn(), null);
+      await fw.stop();
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+});
+
 describe('reader forks under a yes, and its withdrawal', { skip }, () => {
   let tempDir: string;
   let commandPath: string;
