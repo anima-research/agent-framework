@@ -6382,6 +6382,7 @@ export class AgentFramework {
       this.runReleasesAfterResume();
       await this.flushDeferredWrites('resume');
       this.persistHostMode(null);
+      this.hostModeRecordMayBeQuiesced = false;
       // See abortRouting: the gate may not exist in partial harnesses.
       this.eventGate?.admitOverdueWakeIntents();
     } finally {

@@ -3588,11 +3588,7 @@ export class ChannelRegistry {
    * tool, so any trailing prose this turn is NOT posted. Replaces the old
    * overloaded use of `think` for staying silent.
    */
-<<<<<<< HEAD
-  private handleToolSkipReply(input: { reason?: string; wake_in_seconds?: unknown }): ToolResult {
-=======
-  private handleToolSkipReply(input: { reason?: string; wake_in_seconds?: number; _wake_durable?: boolean }): ToolResult {
->>>>>>> 54b8e361 (fix(gate): report non-durable armed wakes (R1-5))
+  private handleToolSkipReply(input: { reason?: string; wake_in_seconds?: unknown; _wake_durable?: boolean }): ToolResult {
     // The self-wake itself is armed by the framework (which owns the
     // EventGate) BEFORE its dispatch reaches this handler, from the same
     // reading, and the framework refuses a wake the host can't set before
