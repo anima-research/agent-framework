@@ -12,6 +12,29 @@ Releases up to and including 0.7.3 predate this file; for their contents see
 
 ## Unreleased
 
+## 0.22.4 — 2026-10-19
+
+### Changed
+
+- Releases from the 0.22 line publish under the npm dist-tag `release-0.22`
+  instead of `latest`, which stays on the newest line, 0.23. The registry
+  won't move `latest` back from 0.23.0 implicitly, so without the tag a
+  0.22 release's publish fails after its tag is pushed, as 0.21.2's did. A
+  semver range such as `^0.22.2` resolves to the newest 0.22 release
+  without naming the tag. On GitHub, a 0.22 release isn't marked Latest.
+
+### Fixed
+
+- An agent's request no longer carries the `tokenEstimate` the framework
+  stamps on the thinking blocks it stores. Membrane sent a
+  `redacted_thinking` block to Anthropic and Bedrock with every field it
+  had, and the Messages API refuses a block carrying a field it doesn't
+  define ("Extra inputs are not permitted"). So once the framework stored a
+  stamped `redacted_thinking`, every later request carrying that turn was
+  refused. A framework turn's request and the direct API's (`runInference`)
+  now drop the stamp from the compiled messages. The stored block keeps it,
+  and context-manager still prices the block by it.
+
 ## 0.22.3 — 2026-10-18
 
 ### Added
