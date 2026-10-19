@@ -692,7 +692,11 @@ describe('Trunk channel routing (item-3 redux)', () => {
     await (framework as unknown as { startAgentStream(agent: unknown, trigger?: unknown): Promise<void> }).startAgentStream(scout, { agentName:'scout', reason:'external-message', source:'tui', timestamp:Date.now(), nonChannelOrigin:true });
     await framework.runUntilIdle();
     assert.equal(resolveCalls, 0);
+    assert.equal(i.turnRouting.get('scout')?.nonChannelOrigin, true, 'control: the private turn ran');
     assert.equal(i.turnRouting.get('scout')?.locus, undefined);
+    const texts = scout.getContextManager().getAllMessages().flatMap((m) => m.content)
+      .filter((b): b is { type: 'text'; text: string } => b.type === 'text').map((b) => b.text);
+    assert.ok(texts.some((t) => t.includes('[delivered] nothing') && t.includes('kept private')), 'and reached its speech, kept private');
     await framework.stop();
   });
 

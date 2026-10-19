@@ -320,13 +320,15 @@ test('routeSpeech precedence: fork HOME wins over the active triggering channel'
 });
 
 test('buildChannelContext uses the frozen turn pin and omits channel claims for a private turn', () => {
-  const active: Record<string, string> = { scout: 'chanA' };
+  // The live resolution has moved on to chanB since the turn froze chanA.
+  const active: Record<string, string> = { scout: 'chanB' };
   const { registry } = makeRegistry({ delivered: true }, () => undefined, (name) => active[name]);
   seedRegistered(registry, 'discord', 'chanA');
   registry.handleIncoming('discord', incoming('chanA', 'hi from A'));
   seedRegistered(registry, 'discord', 'chanB');
   registry.handleIncoming('discord', incoming('chanB', 'hi from B'));
 
+  assert.equal(registry.buildChannelContext('scout')?.defaultOutgoing?.channelId, 'chanB', 'control: live, it is chanB');
   const frozen = registry.buildChannelContext('scout', { frozenLocus: 'chanA' });
   assert.equal(frozen?.defaultOutgoing?.channelId, 'chanA');
   assert.equal(frozen?.incoming?.channelId, 'chanB');

@@ -405,6 +405,37 @@ describe('present while acting', () => {
     await framework.stop();
   });
 
+  it("an ADDRESSED mid-turn injection moves no private turn's locus", async () => {
+    membrane.pushResponse(createMockResponse([
+      { type: 'text', text: 'Station four, proceeding.' },
+      { type: 'tool_use', id: 'c1', name: 'robot--move', input: { dir: 'north' } },
+    ] as ContentBlock[], 'tool_use'));
+    membrane.pushResponse(createMockResponse([
+      { type: 'text', text: 'Still answering the operator.' },
+    ] as ContentBlock[]));
+
+    const framework = await createFramework();
+    const routed = stubChannelRegistry(framework);
+    module.toolDelayMs = 25;
+    module.interjection = 'hey, quick question over here?';
+    module.interjectionMetadata = { channelId: 'discord:dm:antra', tags: ['chat:addressed'] };
+
+    // An operator's message names no channel: a private turn.
+    framework.pushEvent({ type: 'external-message', source: 'tui', content: 'go', metadata: {} } as unknown as ProcessEvent);
+    await framework.runUntilIdle();
+
+    assert.deepEqual(routed, [], 'nothing is routed');
+    const turn = (framework as unknown as { turnRouting: Map<string, { locus?: string; nonChannelOrigin?: boolean }> }).turnRouting.get('assistant');
+    assert.equal(turn?.nonChannelOrigin, true, 'control: the turn was private');
+    assert.equal(turn?.locus, undefined, 'the addressed injection moved no locus');
+    const wired = membrane.lastStream!.receivedToolResultOptions
+      .flatMap((o) => o?.injectedMessages ?? []).map((m) => JSON.stringify(m.content));
+    assert.ok(wired.some((w) => w.includes('quick question')), 'control: the addressed message was injected');
+    assert.ok(!wired.some((w) => w.includes('[routing] The conversation moved to')), 'with no re-pin notice');
+
+    await framework.stop();
+  });
+
   /**
    * What the turn shows, beside what is delivered: the registry stub
    * resolves `#cafe` and delivers to it, and records typing and the text

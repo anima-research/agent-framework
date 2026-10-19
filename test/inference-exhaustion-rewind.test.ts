@@ -105,6 +105,19 @@ test('at the threshold, an invalid_request with no status (shedMayHelp) triggers
   assert.ok(errs.some((e) => e.includes('[inference-rewind]') && e.includes('auto-quarantined')));
 });
 
+test("a private turn's rewind retry asks for a private turn", () => {
+  const { fw, restore } = makeHarness();
+  // The turn that failed came from a private surface.
+  fw.turnRouting = new Map([['cairn', { nonChannelOrigin: true }]]);
+  try {
+    fw.noteInferenceExhausted('cairn', REASON, false, 'invalid_request');
+    fw.noteInferenceExhausted('cairn', REASON, false, 'invalid_request');
+    fw.noteInferenceExhausted('cairn', REASON, false, 'invalid_request');
+  } finally { restore(); }
+  assert.equal(fw.pendingRequests[0]?.reason, 'inference-failure-rewind-retry');
+  assert.equal(fw.pendingRequests[0]?.nonChannelOrigin, true);
+});
+
 test('retryable / unknown-retryability failures NEVER shed history (outages cost nothing)', () => {
   const { fw, removed, restore } = makeHarness();
   try {

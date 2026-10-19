@@ -1429,7 +1429,8 @@ test("guard recovery in a private turn keeps the silenced text private, and draf
       .flatMap((m) => m.content).filter((b) => b.type === 'text').map((b) => b.text ?? '');
     const receipt = texts.find((t) => t.startsWith('[delivered]')) ?? '';
     assert.match(receipt, /1 plain-speech segment\(s\) kept private \(non-channel turn/, receipt);
-    assert.doesNotMatch(receipt, /draft/, receipt);
+    const drafts = (h.framework as unknown as { proseDrafts: { open(agent: string): unknown[] } }).proseDrafts;
+    assert.deepEqual(drafts.open('assistant'), [], 'no draft holds the words');
   } finally { await h.framework.stop(); }
 });
 

@@ -23,7 +23,7 @@ class SurfaceModule implements Module {
   getTools() { return []; }
   async handleToolCall() { return { success: false, error: 'no tools' }; }
   async onProcess(event: ProcessEvent, _state: ProcessState): Promise<EventResponse> {
-    if (event.type !== 'external-message') return {};
+    if (event.type !== 'external-message' && event.type !== 'api:message') return {};
     return {
       addMessages: [{ participant: 'user', content: [{ type: 'text', text: String(event.content) }] }],
       requestInference: true,
@@ -955,6 +955,39 @@ describe("the scheduler's split, and a private turn's other paths", () => {
     }
   });
 
+  it('a quiesce keeps a channel-bound wake apart from an unclassified one with the same reason', async () => {
+    const rig = await surfaceRig();
+    try {
+      await rig.framework.quiesce();
+      const now = Date.now();
+      rig.i.pendingRequests.push(
+        { agentName: 'scout', reason: 'gate:debounce', source: 'gate', timestamp: now, channelId: ROOM },
+        { agentName: 'scout', reason: 'gate:debounce', source: 'gate', timestamp: now + 1 },
+      );
+      await rig.i.processInferenceRequests();
+      assert.equal(rig.starts.length, 0, 'control: nothing starts while quiesced');
+      await rig.framework.resume();
+      await rig.until(() => rig.starts.length >= 1, 'the turn after resume');
+      await rig.framework.runUntilIdle();
+      assert.equal(rig.starts[0]!.channelId, ROOM, `the newer unclassified wake didn't evict the channel's: ${JSON.stringify(rig.starts)}`);
+    } finally {
+      await rig.close();
+    }
+  });
+
+  it('an API message that names no channel opens a private turn', async () => {
+    const rig = await surfaceRig();
+    try {
+      rig.framework.pushEvent({ type: 'api:message', participant: 'user', content: 'from the API', metadata: {} } as never);
+      await rig.until(() => rig.starts.length >= 1, 'the turn');
+      await rig.framework.runUntilIdle();
+      assert.ok(privateStart(rig.starts[0]!), JSON.stringify(rig.starts[0]));
+      assert.deepEqual(rig.routed, []);
+    } finally {
+      await rig.close();
+    }
+  });
+
   it("a private turn's channel_publish that names a channel goes there, from the model and from a call made as the agent", async () => {
     const rig = await surfaceRig();
     try {
@@ -1064,6 +1097,47 @@ describe("the scheduler's split, and a private turn's other paths", () => {
     }
   });
 
+  it("a private turn's '!' continuation asks for a private turn", async () => {
+    const rig = await surfaceRig();
+    try {
+      const internalsOf = rig.framework as unknown as { requestProseContinuation(agent: unknown, routing: Routing): void };
+      const routing = routingOf(rig.framework);
+      routing.nonChannelOrigin = true;
+      routing.continuation = true;
+      internalsOf.requestProseContinuation(rig.framework.getAgent('scout'), routing);
+      const asked = rig.i.pendingRequests.at(-1);
+      assert.equal(asked?.reason, 'prose-continuation');
+      assert.equal(asked?.nonChannelOrigin, true);
+      rig.i.pendingRequests.length = 0;
+    } finally {
+      await rig.close();
+    }
+  });
+
+  it("a private turn's hooks are told its frozen state, through the real before-inference wiring", async () => {
+    const rig = await surfaceRig();
+    try {
+      const turns: unknown[] = [];
+      const internalsOf = rig.framework as unknown as { hookOrchestrator: unknown; channelRegistry: Record<string, unknown> };
+      // The orchestrator's other calls do nothing here.
+      internalsOf.hookOrchestrator = new Proxy({ beforeInference: async () => [] }, {
+        get: (target, prop: string) => prop in target ? target[prop as keyof typeof target] : () => undefined,
+      });
+      // In a turn's hooks, the registry is asked with the turn's frozen state.
+      internalsOf.channelRegistry.buildChannelContext = (_name: string, turn?: unknown) => { if (turn) turns.push(turn); return undefined; };
+      rig.framework.pushEvent(tuiMessage());
+      await rig.until(() => turns.length >= 1, 'the private turn\'s hooks');
+      await rig.framework.runUntilIdle();
+      rig.framework.pushEvent(roomMessage(true));
+      await rig.until(() => turns.length >= 2, 'the room\'s');
+      await rig.framework.runUntilIdle();
+      assert.deepEqual(turns[0], { frozenLocus: null, privateTurn: true });
+      assert.deepEqual(turns[1], { frozenLocus: ROOM, privateTurn: false });
+    } finally {
+      await rig.close();
+    }
+  });
+
   it("a private turn's same-round private think keeps its words as the resident's own choice", async () => {
     const robot = {
       name: 'robot',
@@ -1090,6 +1164,55 @@ describe("the scheduler's split, and a private turn's other paths", () => {
       const receipt = texts.find((t) => t.startsWith('[delivered]')) ?? '';
       assert.match(receipt, /1 plain-speech segment\(s\) kept private \(skip_reply or a private think\)/, receipt);
       assert.match(receipt, /1 plain-speech segment\(s\) kept private \(non-channel turn/, receipt);
+    } finally {
+      await rig.close();
+    }
+  });
+
+  it("a private hybrid turn's speech with no target, mid-turn and trailing, is kept private and held as no draft", async () => {
+    const robot = {
+      name: 'robot',
+      async start() {}, async stop() {},
+      getTools: () => [{ name: 'move', description: 'Move', inputSchema: { type: 'object', properties: {} } }],
+      async handleToolCall() { return { success: true, data: 'moved' }; },
+      async onProcess() { return {}; },
+    } as unknown as Module;
+    const rig = await surfaceRig({ modules: [robot], agent: { proseRouting: 'hybrid' } });
+    try {
+      rig.membrane.pushResponse(createMockResponse([
+        { type: 'text', text: 'on my way' },
+        { type: 'tool_use', id: 'm1', name: 'robot--move', input: {} },
+      ] as never, 'tool_use'));
+      rig.membrane.pushResponse(createMockResponse([{ type: 'text', text: 'arrived' }]));
+      rig.framework.pushEvent(tuiMessage());
+      await rig.until(() => rig.starts.length >= 1, 'the private turn');
+      await rig.framework.runUntilIdle();
+      assert.deepEqual(rig.routed, []);
+      const drafts = (rig.framework as unknown as { proseDrafts: { open(agent: string): unknown[] } }).proseDrafts;
+      assert.deepEqual(drafts.open('scout'), [], 'no draft holds them');
+      const texts = (rig.framework.getAgent('scout')!.getContextManager().getAllMessages() as Array<{ content: Array<{ type: string; text?: string }> }>)
+        .flatMap((m) => m.content).filter((b) => b.type === 'text').map((b) => b.text ?? '');
+      const receipt = texts.find((t) => t.startsWith('[delivered]')) ?? '';
+      assert.match(receipt, /2 plain-speech segment\(s\) kept private \(non-channel turn — publish only with an explicit send tool or a >>> envelope\)/, receipt);
+    } finally {
+      await rig.close();
+    }
+  });
+
+  it("a private turn's addressed arrival moves no locus, at a boundary or between streams", async () => {
+    const rig = await surfaceRig();
+    try {
+      const internalsOf = rig.framework as unknown as { noteArrival(agentName: string, metadata: unknown, messageId: string): void };
+      const routing = routingOf(rig.framework);
+      routing.nonChannelOrigin = true;
+      routing.arrivals = [];
+      rig.state.openLogical.set('scout', routing);
+      internalsOf.noteArrival('scout', { channelId: ROOM, tags: ['chat:addressed'], source: 'mcpl:channel-incoming' }, 'm1');
+      assert.deepEqual(routing.arrivals, [], 'nothing is noted to re-pin the private turn at its next start');
+      // Control: a channel turn notes it.
+      routing.nonChannelOrigin = false;
+      internalsOf.noteArrival('scout', { channelId: ROOM, tags: ['chat:addressed'], source: 'mcpl:channel-incoming' }, 'm2');
+      assert.equal((routing.arrivals as unknown[]).length, 1, JSON.stringify(routing.arrivals));
     } finally {
       await rig.close();
     }
