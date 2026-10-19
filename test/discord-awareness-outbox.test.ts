@@ -1626,6 +1626,8 @@ function hostCommandFramework(outbox: DiscordAwarenessOutbox | null, messages: A
   framework.overBudgetDrains = new Set();
   // Its hold wakes maintenance calls parked at the provider gates: here, none.
   framework.providerGates = new Map();
+  // A move is refused while a conversation agent is being created: here, none.
+  framework.conversationSpawnsInFlight = new Set();
   framework.operatorLog = new OperatorLog(undefined);
   framework.opsAlert = () => {};
   return { framework, removed, setBranch: (name: string) => { currentBranch = name; } };

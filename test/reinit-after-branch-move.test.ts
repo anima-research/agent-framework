@@ -267,6 +267,42 @@ describe('after a branch move, every agent on the store compiles without a resta
     assert.equal(reinitAlerts().length, 1);
   });
 
+  // R1-2: the release can't store a write for an agent whose manager refuses
+  // its work, so the write stays in that agent's queue rather than being lost.
+  it('a message deferred during the hold for an agent whose re-initialization fails stays queued at the release, and is stored once the agent recovers', async () => {
+    checkpointTurn();
+    const strategy = cmOf('b').getStrategy() as unknown as { initialize: (...args: unknown[]) => Promise<void> };
+    const initialize = strategy.initialize.bind(strategy);
+    let failNext = true;
+    strategy.initialize = async (...args: unknown[]) => {
+      if (failNext) { failNext = false; throw new Error('injected initialization failure'); }
+      return initialize(...args);
+    };
+    const queue = framework as unknown as {
+      addMessage(participant: string, content: unknown, metadata?: unknown, opts?: { forAgent?: string }): string;
+      deferredMessages: Array<{ forAgent?: string }>;
+    };
+    const held = 'for b, during the hold';
+    const textsOfB = () => cmOf('b').getAllMessages()
+      .flatMap((m) => m.content)
+      .flatMap((block) => (block.type === 'text' ? [block.text] : []));
+
+    assert.equal(framework.undoLastTurn('a').undone, true);
+    assert.ok(internals().surgeryHold, 'the undo holds the store while the managers re-initialize');
+    assert.equal(queue.addMessage('user', text(held), undefined, { forAgent: 'b' }), '', 'deferred, not stored');
+    await reinitDone();
+    assert.deepEqual(reinitAlerts().map((alert) => alert.agentName), ['b']);
+    assert.equal(internals().surgeryHold, null, 'the store is released');
+    assert.deepEqual(queue.deferredMessages.map((m) => m.forAgent), ['b'], 'still queued for b after the release');
+    assert.ok(!textsOfB().includes(held));
+
+    // The documented recovery: a switch to the branch the store is on.
+    await framework.switchBranch(framework.getStore().currentBranch().name);
+    await works('b');
+    assert.deepEqual(queue.deferredMessages, [], 'nothing is left queued');
+    assert.equal(textsOfB().filter((t) => t === held).length, 1, 'stored once, in b\'s window');
+  });
+
   it('a rollback whose switch fails and goes back to the source still leaves the other agent current', async () => {
     const a = cmOf('a') as unknown as { initializeStrategy: (...args: unknown[]) => Promise<void> };
     const initializeStrategy = a.initializeStrategy;
@@ -607,17 +643,25 @@ describe('after a branch move, every agent on the store compiles without a resta
     assert.doesNotMatch(alerts[0]!.message, /moved the store's branch/);
   });
 
-  it('a suppression refused before the store moved (its branch name is taken) re-initializes no other manager and raises no alert', async () => {
+  // A taken branch name is refused before anything is prepared (the
+  // known-collision check), so the fork's own refusal is injected here.
+  it('a suppression whose fork is refused before the store moved re-initializes no other manager and raises no alert', async () => {
     const store = framework.getStore();
-    store.createBranchAt('taken', 'main', store.currentSequence());
+    const cmA = cmOf('a') as unknown as { fork: (name: string) => Promise<string> };
+    const fork = cmA.fork;
     const strategy = cmOf('b').getStrategy() as unknown as { initialize: (...args: unknown[]) => Promise<void> };
     const initialize = strategy.initialize.bind(strategy);
     let initializations = 0;
     strategy.initialize = async (...args: unknown[]) => { initializations++; return initialize(...args); };
-    await assert.rejects(
-      framework.suppressMessages('a', { messageIds: [firstId], branchName: 'taken' }),
-      (e: unknown) => e instanceof OperatorActionError && e.code === 'failed' && /\btaken\b/.test(e.message),
-    );
+    cmA.fork = async () => { throw new Error('injected fork refusal'); };
+    try {
+      await assert.rejects(
+        framework.suppressMessages('a', { messageIds: [firstId], branchName: 'refused-fork' }),
+        (e: unknown) => e instanceof OperatorActionError && e.code === 'failed' && /injected fork refusal/.test(e.message),
+      );
+    } finally {
+      cmA.fork = fork;
+    }
     assert.equal(store.currentBranch().name, 'main');
     assert.equal(initializations, 0, "b's manager wasn't re-initialized: nothing moved");
     assert.deepEqual(reinitAlerts(), []);
@@ -1013,25 +1057,26 @@ describe('conversation forks and an undo', () => {
       framework.onTrace((event) => {
         if (event.type === 'ops:alert') alerts.push(event as unknown as { kind: string; agentName: string; message: string });
       });
-      // a-late-g1's seeding fails, and then the store refuses to drop its turn
-      // checkpoints when it's disposed.
+      // a-late-g1's seeding fails, and then releasing its window throws when
+      // it's disposed. (A store that refuses to drop its turn checkpoints no
+      // longer fails a disposal: evictTurnCheckpoints logs it and goes on.)
       const cmLate = framework.getAgent('a-late-g1')!.getContextManager();
       (cmLate as unknown as { addMessage: () => never }).addMessage = () => { throw new Error('injected seed failure'); };
-      const store = framework.getStore();
-      const treeGet = store.treeGet.bind(store);
-      (store as unknown as { treeGet: typeof treeGet }).treeGet = (treeId, key) => {
-        if (treeId === 'framework/turn-checkpoints/tree' && key === 'a-late-g1') throw new Error('injected checkpoint store failure');
-        return treeGet(treeId, key);
+      const released = framework as unknown as { releaseWindow: (agent: { name: string }) => void };
+      const releaseWindow = released.releaseWindow;
+      released.releaseWindow = function (this: unknown, agent: { name: string }) {
+        if (agent.name === 'a-late-g1') throw new Error('injected release failure');
+        return releaseWindow.call(this, agent);
       };
       try {
         assert.equal(framework.undoLastTurn('a').undone, true);
         await internals.syncMoveReinit!.done;
       } finally {
-        (store as unknown as { treeGet: typeof treeGet }).treeGet = treeGet;
+        released.releaseWindow = releaseWindow;
       }
       const reinit = alerts.filter((alert) => alert.kind === 'context-reinit-failed');
       assert.deepEqual(reinit.map((alert) => alert.agentName), ['a-late-g1'], JSON.stringify(alerts));
-      assert.match(reinit[0]!.message, /couldn't be seeded again, because its seeding from the template failed: .*injected seed failure\. It was unregistered and its channel unbound, but cleaning up after it then failed: .*injected checkpoint store failure\./);
+      assert.match(reinit[0]!.message, /couldn't be seeded again, because its seeding from the template failed: .*injected seed failure\. It was unregistered and its channel unbound, but cleaning up after it then failed: .*injected release failure\./);
       assert.equal(internals.surgeryHold, null, 'the store is released');
       assert.ok(!framework.getAgent('a-late-g1'), 'the fork is unregistered');
       assert.equal(router.getBinding('world:late'), undefined, 'its channel is unbound');
