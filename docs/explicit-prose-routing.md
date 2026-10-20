@@ -28,7 +28,10 @@ A prose segment's FIRST line may carry a routing prefix:
   provider-capacity hold defers the turn to. A round kept private (one that
   calls `skip_reply`, or has a same-round private think) sets no target. A
   target its server declared inbound-only is refused and clears the turn's
-  target, so later unprefixed segments bounce until a new `>>` target.
+  target, so later unprefixed segments bounce until a new `>>` target. So
+  does private-surface input that makes the turn private (a TUI or WebUI
+  message it takes in): a target named before that input is dropped, and a
+  round written before it, delivered after, sets none.
   Cross-turn, nothing is implicit.
 - **Continuation modifier:** ` !` immediately after the target
   (`>>#ops !` / `>>skip_reply !`) requests an immediate re-wake after this turn
