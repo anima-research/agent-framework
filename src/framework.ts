@@ -239,6 +239,29 @@ const silenceCauseOf = (calls: Array<{ name: string; input?: unknown }>): 'send'
 };
 
 /**
+ * The keys of a stored message's metadata that only the host writes and that
+ * some reader takes on its own as what the message is: `system` makes it a
+ * host notice, `draftOwner` and `draftIds` one that names those drafts,
+ * `tuneOut` a message a tune-out holds from the residents,
+ * `coalescingSubject` (beside the occurrence's `eventId`) the delivery of a
+ * coalesced occurrence, `deferredWriteId` the landed copy of a deferred
+ * write, `external` a module's own row for an outside message,
+ * `silentHeartbeat` a row of a silent heartbeat tick, which marks the tick
+ * started whoever's row it is (indexSilentTickRows), and
+ * `openaiResponsesItems` membrane's mark of an imported Responses history. A
+ * server's metadata, a channel message's `metadata` or a push event's
+ * `origin`, is stored without them, and the host writes its own after it:
+ * MCPL SPEC §16.6 makes metadata the producer's untrusted claims, which a
+ * host may disbelieve. Keys a server writes by protocol, such as `tags` and
+ * `mentioned`, stay. So does the Discord module's `discordTextFirst`, which
+ * it reads only on a row it found by `external`.
+ */
+const HOST_METADATA_KEYS = [
+  'system', 'draftOwner', 'draftIds', 'tuneOut', 'coalescingSubject', 'deferredWriteId', 'external',
+  'silentHeartbeat', 'openaiResponsesItems',
+] as const;
+
+/**
  * True when an injected message is real conversational input — something the
  * agent might actually be replying to — rather than ambient machinery.
  * System markers (`system: true` — send-failed notices, routing notices) and
@@ -10345,9 +10368,9 @@ export class AgentFramework {
           // turn ends. The window stores them here, right after the
           // tool_result message, which is exactly where the membrane appends
           // them in the live conversation — same participant, same content
-          // blocks, same metadata, and compile() emits recent messages
-          // verbatim, so the next turn's compiled prefix byte-matches the
-          // live request (prompt-cache safe).
+          // blocks, and neither carries the row's metadata — and compile()
+          // emits recent messages verbatim, so the next turn's compiled prefix
+          // byte-matches the live request (prompt-cache safe).
           //
           // The queue is drained ONLY at the target agent's own boundary:
           // draining at another agent's boundary would store the messages
@@ -10589,9 +10612,13 @@ export class AgentFramework {
             // Mid-turn messages collected above ride along as injected user
             // messages (membrane ≥0.5.72) — appended after the tool_result
             // envelope so the next round of THIS turn hears them.
+            // Each goes as its participant and content alone: a stored row's
+            // metadata is the host's record, not input for membrane.
             currentState.stream.provideToolResults(
               agent.toolResultGuard.submissionResults(membraneResults),
-              midTurnInjections.length > 0 ? { injectedMessages: midTurnInjections } : undefined,
+              midTurnInjections.length > 0
+                ? { injectedMessages: midTurnInjections.map(({ participant, content }) => ({ participant, content })) }
+                : undefined,
             );
             // RFC-006 §3.3: consumption is determined at assembly, and this
             // is assembly too when the stream carries the injected messages
@@ -10789,6 +10816,31 @@ export class AgentFramework {
   // Built-in MCPL event → context message conversion
   // ==========================================================================
 
+  /** The servers and keys whose drop withoutHostKeys has logged, each as
+   *  `${serverId}\u0000${key}`. */
+  private readonly hostKeysDropped = new Set<string>();
+
+  /**
+   * A server's metadata as it is stored: a copy without HOST_METADATA_KEYS.
+   * A server may use one of those names for something of its own, so the
+   * first drop of each key from each server is logged.
+   */
+  private withoutHostKeys(serverId: string, given: Record<string, unknown> | undefined): Record<string, unknown> {
+    const kept: Record<string, unknown> = { ...given };
+    for (const key of HOST_METADATA_KEYS) {
+      if (!Object.hasOwn(kept, key)) continue;
+      delete kept[key];
+      const logged = `${serverId}\u0000${key}`;
+      if (this.hostKeysDropped.has(logged)) continue;
+      this.hostKeysDropped.add(logged);
+      console.error(
+        `[mcpl] ${serverId}: dropped "${key}" from a message, since only the host writes that key ` +
+        `(logged once for each server and key)`,
+      );
+    }
+    return kept;
+  }
+
   /**
    * Convert an incoming MCPL channel message to a context message.
    * This replaces the old MCPLModule.onProcess() message conversion.
@@ -10825,7 +10877,7 @@ export class AgentFramework {
       return undefined;
     }
     const metadata: Record<string, unknown> = {
-      ...event.metadata,
+      ...this.withoutHostKeys(event.serverId, event.metadata),
       ...(event.eventId ? { eventId: event.eventId } : {}),
       ...(event.coalescingSubject ? { coalescingSubject: event.coalescingSubject } : {}),
       channelId: event.channelId,
@@ -12267,7 +12319,7 @@ export class AgentFramework {
     }
 
     const metadata: Record<string, unknown> = {
-      ...event.origin,
+      ...this.withoutHostKeys(event.serverId, event.origin),
       serverId: event.serverId,
       featureSet: event.featureSet,
       eventId: event.eventId,

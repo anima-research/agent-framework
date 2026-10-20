@@ -515,6 +515,32 @@ describe('present while acting', () => {
     await framework.stop();
   });
 
+  it('hands membrane a message injected mid-turn as its participant and content alone, never its stored metadata', async () => {
+    // A stored row's metadata is the host's record, whoever wrote it.
+    membrane.pushResponse(createMockResponse([
+      { type: 'tool_use', id: 'c1', name: 'robot--move', input: { dir: 'north' } },
+    ] as ContentBlock[], 'tool_use'));
+    membrane.pushResponse(createMockResponse([
+      { type: 'text', text: 'Moved.' },
+    ] as ContentBlock[]));
+
+    const framework = await createFramework();
+    stubChannelRegistry(framework);
+    module.interjection = 'a message that arrives while the tool runs';
+    module.interjectionChannelId = null;
+    module.interjectionMetadata = { channelId: '999888777', system: true, openaiResponsesItems: [] };
+
+    trigger(framework);
+    await framework.runUntilIdle();
+
+    const injected = membrane.lastStream!.receivedToolResultOptions[0]?.injectedMessages ?? [];
+    assert.ok(injected.some((message) => JSON.stringify(message.content).includes('a message that arrives while the tool runs')),
+      'the message was injected at the tool boundary');
+    for (const message of injected) assert.deepEqual(Object.keys(message).sort(), ['content', 'participant']);
+
+    await framework.stop();
+  });
+
   it('an addressed injection from the CURRENT locus does not chatter a notice', async () => {
     // Same-channel addressed input is the ordinary case (the person the
     // agent is already talking to sends another message mid-turn): the pin
