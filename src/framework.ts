@@ -1870,19 +1870,141 @@ interface SyncMoveReinit {
   done: Promise<void>;
 }
 
-/** What a restart costs while writes wait in the deferral queue: stop()
- *  stores what the agents' managers take, and a write one refuses stays
- *  queued, which only a persisted queue keeps past the process. */
-const RESTART_LOSES_QUEUED_WRITES = 'a restart does too, but loses them unless the deferral queue is persisted';
+/** A re-initialization alert's text (reportReinitFailures,
+ *  restoreSourceBranch): its opening, what happened and what to do or what
+ *  happens next, and the whole message, the opening first and the cause
+ *  last. The ops webhook keeps a long message's start and end
+ *  (opsWebhookText), and a cause can run to an error's whole diagnostic, so
+ *  every shape's opening is shorter than the start the webhook keeps, which
+ *  a test checks shape by shape. Branch names, whose length no shape sets,
+ *  come after the opening. */
+export interface ReinitAlertText {
+  opening: string;
+  message: string;
+}
 
-/** What an operator does about a manager a move left refusing its work. A
- *  write deferred for its agent while the store was held stays queued for
- *  it, since the release can't store it. Short enough that an alert's
- *  outcome and this fit in what the webhook keeps of a long message's start
- *  (reportReinitFailures). */
-const REINIT_REMEDY =
-  'It refuses its work until switchBranch() to the current branch re-initializes it and stores its queued ' +
-  `writes, at resume on a quiesced host; ${RESTART_LOSES_QUEUED_WRITES}.`;
+/** Every move after which the managers re-initialize, as its alerts name it. */
+export const REINIT_MOVES = ['undo', 'redo', 'rollback', 'suppression', 'branch switch'] as const;
+export type ReinitMove = (typeof REINIT_MOVES)[number];
+
+/** What lets a conversation agent's channel spawn again when the template it
+ *  seeds from is missing, or refuses its work (reseedEmptiedForks). */
+export const TEMPLATE_REMEDIES = {
+  missing: "an agent is registered under the template's name, or the router names a registered one",
+  refusing: 'a switchBranch() to the current branch or a restart re-initializes the template',
+} as const;
+type TemplateRemedy = (typeof TEMPLATE_REMEDIES)[keyof typeof TEMPLATE_REMEDIES];
+
+/** How a refusing manager's queued writes get stored: a write deferred for
+ *  its agent while the store was held stays queued for it, since the release
+ *  can't store it, and a quiesced host defers it again until its resume. */
+const STORES_QUEUED_WRITES = 'stores its queued writes, at resume on a quiesced host';
+
+/** What a restart does to an agent whose manager refuses its work. A
+ *  configured agent is created again and re-initialized, but the writes
+ *  queued for it outlast the process only in a persisted deferral queue. A
+ *  conversation agent isn't created again, since the router's bindings are
+ *  in memory: its channel's next qualifying message spawns a new fork. */
+function restartClause(conversationAgent: boolean): string {
+  return conversationAgent
+    ? "a restart ends it, and its channel's next qualifying message spawns a new fork."
+    : 'a restart re-initializes it too, but loses them unless the deferral queue is persisted.';
+}
+
+/** What follows a refusing manager's opening: what its refusal covers, and,
+ *  for a configured agent, what keeps its queued writes past a stop; for a
+ *  conversation agent, that the fork its channel spawns next gets none. */
+function refusalDetail(conversationAgent: boolean): string {
+  return ' The work it refuses includes compiles and message writes' + (conversationAgent
+    ? ', and a fork its channel spawns after a restart gets none of the writes queued for this one.'
+    : '. Quiescing the host before it stops persists the deferral queue.');
+}
+
+/** The alert for an agent whose manager failed to re-initialize after a move. */
+export function refusedWorkAlert(move: ReinitMove, conversationAgent: boolean, cause: string): ReinitAlertText {
+  const opening = `The ${move} moved the store's branch, and this agent's context manager failed to re-initialize. ` +
+    `It refuses its work until switchBranch() to the current branch re-initializes it and ${STORES_QUEUED_WRITES}; ` +
+    restartClause(conversationAgent);
+  return { opening, message: `${opening}${refusalDetail(conversationAgent)} Its re-initialization failed: ${cause}.` };
+}
+
+/** The alert for the agent a failed rollback or suppression named, whose
+ *  restore of the store's branch failed too (restoreSourceBranch): it put the
+ *  store back on `source` but the manager failed to re-initialize there
+ *  (`selected`), or it couldn't, and the store is still on `now`, where the
+ *  manager refuses its work, or is current (`managerCurrent`) and serves. */
+export function restoreAlert(restore: {
+  move: 'rollback' | 'suppression';
+  source: string;
+  now: string;
+  selected: boolean;
+  managerCurrent: boolean;
+  conversationAgent: boolean;
+  cause: string;
+}): ReinitAlertText {
+  const { move, source, now, selected, managerCurrent, conversationAgent, cause } = restore;
+  if (selected) {
+    const opening = `The ${move} failed and the store was put back, but this agent's context manager failed to re-initialize. ` +
+      `It refuses its work until switchBranch() to the current branch re-initializes it and ${STORES_QUEUED_WRITES}; ` +
+      restartClause(conversationAgent);
+    return {
+      opening,
+      message: `${opening}${refusalDetail(conversationAgent)} The store is on ${source}. Its re-initialization failed: ${cause}.`,
+    };
+  }
+  const where = ` The store is on ${now}, and the restore to ${source} failed: ${cause}.`;
+  if (managerCurrent) {
+    const opening = `The ${move} failed and the store couldn't be put back, so this agent's context manager is current on the ` +
+      `branch the ${move} made: it serves from there, which may be partly suppressed, until switchBranch() to the ` +
+      'branch it should run on moves it.';
+    return { opening, message: `${opening}${where}` };
+  }
+  const opening = `The ${move} failed and the store couldn't be put back, so this agent's context manager refuses its work ` +
+    `until switchBranch() to the branch it should run on re-initializes it and ${STORES_QUEUED_WRITES}; ` +
+    restartClause(conversationAgent);
+  return { opening, message: `${opening}${refusalDetail(conversationAgent)}${where}` };
+}
+
+/** The alert for a conversation agent a move emptied that couldn't be seeded
+ *  again, and so was disposed (reinitializeManagers). `remedy` is what lets
+ *  its channel spawn again when the cause stops that too; `heldWrites`, the
+ *  writes queued for it while the store was held, which went with it. */
+export function disposalAlert(disposal: {
+  move: ReinitMove;
+  remedy?: TemplateRemedy;
+  cleanupFailed?: string;
+  heldWrites?: number;
+  cause: string;
+}): ReinitAlertText {
+  const { move, remedy, cleanupFailed, heldWrites = 0, cause } = disposal;
+  const opening = `The ${move} left this conversation agent with no messages of its own, and it couldn't be seeded again, so ` +
+    (cleanupFailed
+      ? 'it was unregistered and its channel unbound, but its cleanup failed (below). '
+      : 'it was disposed and its channel unbound. ') +
+    (remedy
+      ? `Once ${remedy}, its channel's next qualifying message spawns a new fork.`
+      : "Its channel's next qualifying message spawns a new fork, unless its seeding fails again.");
+  const writes = heldWrites === 1 ? 'The write' : `The ${heldWrites} writes`;
+  const them = heldWrites === 1 ? 'it' : 'them';
+  const held = heldWrites === 0
+    ? ''
+    : cleanupFailed
+      ? ` ${writes} held for it while the store was held may be in its window or still queued under its name, ` +
+        'as far as that cleanup got, where no agent reads them.'
+      : ` ${writes} held for it while the store was held ${heldWrites === 1 ? 'goes' : 'go'} with it, so that fork ` +
+        `doesn't get ${them}: its window's release stores what its store takes of ${them} there, now or at resume on ` +
+        `a quiesced host, and passes any failed reply on to the primary agent. A stop before that resume leaves ` +
+        `${them} queued, and the restarted host drops ${them} when it resumes, if its persisted queue kept ${them}, ` +
+        'passing any failed reply on too.';
+  return {
+    opening,
+    message: `${opening} That fork is seeded from the template, under a new name.${held} ` +
+      "Its messages stay on the branches that hold them, but no agent reads them again, " +
+      "so a redo to a branch that holds them doesn't bring this one back. " +
+      `It couldn't be seeded because ${cause}.` +
+      (cleanupFailed ? ` Its cleanup failed: ${cleanupFailed}.` : ''),
+  };
+}
 
 /** How long a move may hold the store before a `store-held-long` ops alert
  *  says so. No turn starts while it's held, and nothing bounds what a hold
@@ -1911,16 +2033,17 @@ interface ManagerReinitFailure {
   seedingFailed?: true;
   /** For a disposal in an undo's or redo's re-initialization: the move whose
    *  branch its pass judged, which a move joining later doesn't change. */
-  after?: string;
+  after?: ReinitMove;
   /** For a disposal whose cause also stops the channel's next spawn, a
    *  template that's missing or refuses its work: what lets it spawn again. */
-  remedy?: string;
+  remedy?: TemplateRemedy;
   /** For a disposal that failed partway, as when releasing the agent's window
    *  threw: that failure. The agent was unregistered and its channel unbound
    *  before the step that failed. */
   cleanupFailed?: string;
   /** For a disposal: how many writes were queued for the agent, held while
-   *  the store was. Its window's release stores them there. */
+   *  the store was. Its window's release takes them: it stores what its store
+   *  accepts there, and passes a failed reply on to the primary. */
   heldWrites?: number;
 }
 
@@ -2003,6 +2126,12 @@ function boundFailureText(text: string, max: number = FAILURE_TEXT_MAX_CHARS): s
   let tailStart = text.length - tailLength;
   if (splitsPair(text, tailStart)) tailStart++;
   return `${text.slice(0, headEnd)} …[${tailStart - headEnd} of ${text.length} characters omitted]… ${text.slice(tailStart)}`;
+}
+
+/** What the ops webhook posts of an alert's message (opsAlert): the whole
+ *  of a short one, and a long one's start and end, 500 characters in all. */
+export function opsWebhookText(message: string): string {
+  return boundFailureText(message, OPS_WEBHOOK_MESSAGE_MAX_CHARS);
 }
 
 /** A provider error code, verbatim when token-sized; otherwise bounded. */
@@ -10529,15 +10658,15 @@ export class AgentFramework {
     const templateFailure = template ? failures.find((f) => f.agentName === template.name) : undefined;
     // A spawn seeds from the template too, so while the template is missing
     // or refuses its work, the channel's next spawn fails as well.
-    const templateDown: { reason: string; remedy: string } | null = !template
+    const templateDown: { reason: string; remedy: TemplateRemedy } | null = !template
       ? {
           reason: `no agent is registered as the conversation template "${router.templateAgent}"`,
-          remedy: "an agent is registered under the template's name, or the router names a registered one",
+          remedy: TEMPLATE_REMEDIES.missing,
         }
       : templateFailure
         ? {
             reason: `the template ${template.name}'s own context manager failed to re-initialize (${templateFailure.error})`,
-            remedy: 'a switchBranch() to the current branch or a restart re-initializes the template',
+            remedy: TEMPLATE_REMEDIES.refusing,
           }
         : null;
     for (const agentName of [...this.conversationAgentHomes.keys()]) {
@@ -10547,7 +10676,7 @@ export class AgentFramework {
       const contextManager = agent.getContextManager();
       if (contextManager.getMessageCount() > 0) continue;
       let cause: string;
-      let remedy: string | undefined;
+      let remedy: TemplateRemedy | undefined;
       if (templateDown === null) {
         try {
           const added = await this.seedConversationAgentIfEmpty(agentName, contextManager, template!, moved);
@@ -10566,9 +10695,10 @@ export class AgentFramework {
       }
       if (moved()) continue;
       const failure: ManagerReinitFailure = { agentName, error: cause, seedingFailed: true, ...(remedy ? { remedy } : {}) };
-      // What the hold deferred for it goes with it: its window's release,
-      // now or at resume while the host is quiesced, stores those writes
-      // there, where no agent reads them.
+      // What the hold deferred for it goes with it: its window's release, now
+      // or at resume while the host is quiesced, stores what its store
+      // accepts of those writes there, where no agent reads them, and passes
+      // a failed reply on to the primary.
       const heldWrites = this.deferredMessages.filter((msg) => (msg.forAgent ?? this.primaryAgentName) === agentName).length;
       if (heldWrites > 0) failure.heldWrites = heldWrites;
       try {
@@ -10585,42 +10715,17 @@ export class AgentFramework {
   }
 
   /** Say which agents a move left with a manager that refuses its work:
-   *  on the console, in failures.log and in an ops alert, one per agent.
-   *  Each says what happened and what happens next or what to do first, in
-   *  fewer characters than the webhook keeps of a long message's start, then
-   *  what becomes of the agent's writes, and the cause last: the webhook
+   *  on the console, in failures.log and in an ops alert, one per agent,
+   *  each in the words of its text builder (ReinitAlertText). The webhook
    *  keeps 500 characters of a long message, about 345 from its start and
-   *  the rest from its end (opsAlert), and a cause can run to an error's
-   *  whole diagnostic. The console, failures.log and the trace keep 2,000,
-   *  cut the same way. */
-  private reportReinitFailures(after: string, failures: ManagerReinitFailure[]): void {
+   *  the rest from its end (opsWebhookText); the console, failures.log and
+   *  the trace keep 2,000, cut the same way. */
+  private reportReinitFailures(after: ReinitMove, failures: ManagerReinitFailure[]): void {
     for (const { agentName, error, seedingFailed, after: judgedAfter, remedy, cleanupFailed, heldWrites } of failures) {
       const move = judgedAfter ?? after;
-      const writes = heldWrites === 1 ? 'The write' : `The ${heldWrites} writes`;
-      const them = heldWrites === 1 ? 'it' : 'them';
       this.reportReinitFailure(agentName, move, seedingFailed
-        ? `The ${move} left this conversation agent with no messages of its own, and it couldn't be seeded again, so ` +
-          (cleanupFailed
-            ? 'it was unregistered and its channel unbound, but its cleanup failed (below). '
-            : 'it was disposed and its channel unbound. ') +
-          (remedy
-            ? `Once ${remedy}, its channel's next qualifying message spawns a new fork. `
-            : "Its channel's next qualifying message spawns a new fork, unless its seeding fails again. ") +
-          (heldWrites
-            ? cleanupFailed
-              ? `${writes} held for it while the store was held may be in its window or still queued under its name, ` +
-                'as far as that cleanup got, where no agent reads them. '
-              : `${writes} held for it while the store was held ${heldWrites === 1 ? 'goes' : 'go'} with it, so that ` +
-                `fork doesn't get ${them}: its window's release stores what its store takes of ${them} there, now or ` +
-                `at resume on a quiesced host, where a stop before the resume leaves ${them} queued and the restarted ` +
-                `host drops ${them} when it resumes. `
-            : '') +
-          "Its messages stay on the branches that hold them, but no agent reads them again, " +
-          "so a redo to a branch that holds them doesn't bring this one back. " +
-          `It couldn't be seeded because ${error}.` +
-          (cleanupFailed ? ` Its cleanup failed: ${cleanupFailed}.` : '')
-        : `The ${after} moved the store's branch, and this agent's context manager failed to re-initialize. ` +
-          `${REINIT_REMEDY} Its re-initialization failed: ${error}.`);
+        ? disposalAlert({ move, remedy, cleanupFailed, heldWrites, cause: error }).message
+        : refusedWorkAlert(move, this.conversationAgentHomes.has(agentName), error).message);
     }
   }
 
@@ -10798,11 +10903,13 @@ export class AgentFramework {
    * After a failed switch or redaction: put the store back on `sourceBranch`
    * if it moved, and return a sentence saying what actually happened. Never
    * throws — the caller reports the original failure with this appended.
-   * `managerCurrent` says the agent's manager initialized on the failed
-   * branch, as after a suppression's fork whose removals then failed: if the
-   * restore can't select the source, the agent serves from that branch.
+   * `move` names the failed move, as its alert does. `managerCurrent` says
+   * the agent's manager initialized on the failed branch, as after a
+   * suppression's fork whose removals then failed: if the restore can't
+   * select the source, the agent serves from that branch.
    */
   private async restoreSourceBranch(
+    move: 'rollback' | 'suppression',
     cm: ContextManager,
     sourceBranch: string,
     failedBranch: string,
@@ -10820,30 +10927,28 @@ export class AgentFramework {
       // so a failed initialization leaves the store back on the source.
       const now = this.store.currentBranch().name;
       const selected = now === sourceBranch;
+      // A restart creates a configured agent again, but not a conversation
+      // agent (restartClause).
+      const conversationAgent = this.conversationAgentHomes.has(agentName);
+      const untilReinitialized = conversationAgent
+        ? ' re-initializes it (a restart ends it instead)'
+        : ', or a restart, re-initializes it';
       const status = selected
         ? `RESTORE TO ${sourceBranch} selected it, but re-initializing the agent's context manager for it FAILED (${detail}); ` +
-          'the agent refuses its work until switchBranch() to the current branch, or a restart, re-initializes it'
+          `the agent refuses its work until switchBranch() to the current branch${untilReinitialized}`
         : managerCurrent
           ? `RESTORE TO ${sourceBranch} ALSO FAILED (${detail}); the store is still on ${now}, where the agent's ` +
             'context manager is current, so the agent serves from that branch until switchBranch() moves it'
           : `RESTORE TO ${sourceBranch} ALSO FAILED (${detail}); the store is still on ${now}, ` +
-            'and the agent refuses its work until switchBranch(), or a restart, re-initializes it';
+            `and the agent refuses its work until switchBranch()${untilReinitialized}`;
       console.error(`[operator] agent=${agentName} ${status}`);
       // Its manager is left as the failed switch left it, as the others are
-      // after a failed re-initialization: alerted the same way, saying which
-      // branch the store is on.
+      // after a failed re-initialization, unless it's current on the failed
+      // branch: alerted the same way, saying which branch the store is on.
       try {
-        this.reportReinitFailure(agentName, `restore to ${sourceBranch}`, selected
-          ? `The restore to ${sourceBranch} put the store back there, and this agent's context manager failed to ` +
-            `re-initialize. ${REINIT_REMEDY} Its re-initialization failed: ${detail}.`
-          : managerCurrent
-            ? `The restore to ${sourceBranch} failed, so the store is still on ${now}, where this agent's context ` +
-              'manager is current: it serves from that branch, which may be partly suppressed, until switchBranch() ' +
-              `to the branch it should run on moves it. The restore failed: ${detail}.`
-            : `The restore to ${sourceBranch} failed, so the store is still on ${now}, and this agent's context ` +
-              'manager refuses its work until switchBranch() to the branch it should run on re-initializes it and ' +
-              `stores its queued writes, at resume on a quiesced host; ${RESTART_LOSES_QUEUED_WRITES}. ` +
-              `The restore failed: ${detail}.`);
+        this.reportReinitFailure(agentName, `restore to ${sourceBranch}`, restoreAlert({
+          move, source: sourceBranch, now, selected, managerCurrent, conversationAgent, cause: detail,
+        }).message);
       } catch (reportError) {
         console.error(`[operator] agent=${agentName} reporting the failed restore failed: ${boundFailureText(failureDescription(reportError))}`);
       }
@@ -10957,7 +11062,7 @@ export class AgentFramework {
           // go back to the source; keep the branch for diagnosis. A refusal
           // before the switch left the store on the source, so nothing moved.
           moved = this.store.currentBranch().name !== sourceBranch;
-          const restored = await this.restoreSourceBranch(cm, sourceBranch, targetBranch, agentName);
+          const restored = await this.restoreSourceBranch('rollback', cm, sourceBranch, targetBranch, agentName);
           const retired = await this.retireAfterRestore(markerBatch, sourceBranch, agentName);
           throw new OperatorActionError(
             'failed',
@@ -11129,7 +11234,7 @@ export class AgentFramework {
           // after the known-collision check) left the store on the source, so
           // nothing moved and no other manager is stale.
           moved = this.store.currentBranch().name !== sourceBranch;
-          const restored = await this.restoreSourceBranch(cm, sourceBranch, targetBranch, agentName);
+          const restored = await this.restoreSourceBranch('suppression', cm, sourceBranch, targetBranch, agentName);
           const retired = await this.retireAfterRestore(markerBatch, sourceBranch, agentName);
           throw new OperatorActionError(
             'failed',
@@ -11147,7 +11252,7 @@ export class AgentFramework {
           // for diagnosis, put the agent back on the untouched source — and
           // say honestly whether that restore happened. The fork initialized
           // the agent's manager on it, so it's current there.
-          const restored = await this.restoreSourceBranch(cm, sourceBranch, createdBranch, agentName, true);
+          const restored = await this.restoreSourceBranch('suppression', cm, sourceBranch, createdBranch, agentName, true);
           const retired = await this.retireAfterRestore(markerBatch, sourceBranch, agentName);
           throw new OperatorActionError(
             'failed',
@@ -12846,10 +12951,18 @@ export class AgentFramework {
     // stop() doesn't wait for a spawn, so one that comes to this point once a
     // stop() of this lifecycle has begun, as one that waited out a hold can,
     // fails here as a spawn that fails does, rather than opening a manager on
-    // a store stop() is tearing down. stopPromise is that stop: a start()
-    // after a completed one clears it, and a failed one clears itself unless
-    // it closed an owned store.
-    if (this.stopPromise) throw new Error(`conversation agent "${name}" not created: the framework is stopping`);
+    // a store stop() is tearing down or has torn down. That stop is under way
+    // or completed while stopPromise is set: stop() claims it before its
+    // first steps, which can emit traces while the framework still runs. A
+    // failed stop() clears it, unless it closed an owned store, and so do a
+    // start() and an addModule() after a completed one; until a start(), the
+    // framework isn't running and its queue, which only stop() closes, stays
+    // closed. stopHasBegun(), the operator calls' rule, reads the closed queue
+    // whether or not a start() came after, which doesn't reopen it, so it
+    // would refuse every spawn after a restart.
+    if (this.stopPromise || (!this.running && this.queue?.isClosed)) {
+      throw new Error(`conversation agent "${name}" not created: the framework is stopping`);
+    }
     const router = this.conversationRouter!;
     const templateConfig = this.agentConfigs.get(router.templateAgent);
     const template = this.agents.get(router.templateAgent);
@@ -23024,7 +23137,7 @@ export class AgentFramework {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({
-        content: `\u{1F6A8} **${agentName}** ${kind}: ${boundFailureText(wholeMessage, OPS_WEBHOOK_MESSAGE_MAX_CHARS)}`,
+        content: `\u{1F6A8} **${agentName}** ${kind}: ${opsWebhookText(wholeMessage)}`,
       }),
     }).catch((err) => console.error(
       `[ops-alert] webhook post failed (${key}):`,
