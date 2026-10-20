@@ -213,18 +213,23 @@ function isMetadataTruthy(value: unknown): boolean {
 /**
  * Provenance of a batched wake: the newest ADDRESSED channel-bearing event
  * wins (mention / reply / DM outranks newer ambient chatter — the framework's
- * own locus rule); else the newest channel-bearing event. Channel, author and
+ * own locus rule); else the newest channel-bearing event; else, in a window
+ * that holds only private surface messages, the newest of those, which names
+ * no channel or author but gives the wake its time. Channel, author and
  * addressed all come from that one event, so they can never disagree.
  *
  * A window that holds a private surface's message is private, whatever else
  * it holds: its one wake is a private turn's, which answers in no channel,
  * and it names no route, so the operator's words never start a turn whose
- * reply is published (private wins, one way).
+ * reply is published (private wins, one way). Its channel, author and
+ * addressed still say who woke it, as telemetry.
  */
 export function wakeProvenance(events: PendingEvent[]): WakeProvenance | undefined {
   let newest: PendingEvent | undefined;
   let newestAddressed: PendingEvent | undefined;
+  let newestPrivate: PendingEvent | undefined;
   for (const e of events) {
+    if (e.nonChannelOrigin === true && (!newestPrivate || e.timestamp >= newestPrivate.timestamp)) newestPrivate = e;
     // A resolved route counts as naming a channel only for an ADDRESSED
     // event: a push whose origin declares only `mcplChannelId` (no raw
     // channel id, no author) is still a routable addressed message, and
@@ -236,8 +241,8 @@ export function wakeProvenance(events: PendingEvent[]): WakeProvenance | undefin
     if (!newest || e.timestamp >= newest.timestamp) newest = e;
     if (e.addressed && (!newestAddressed || e.timestamp >= newestAddressed.timestamp)) newestAddressed = e;
   }
-  const privateSurface = events.some((e) => e.nonChannelOrigin === true);
-  const pick = newestAddressed ?? newest ?? (privateSurface ? events[events.length - 1] : undefined);
+  const privateSurface = newestPrivate !== undefined;
+  const pick = newestAddressed ?? newest ?? newestPrivate;
   if (!pick) return undefined;
   // push-event channel ids are the adapter's raw ids (a Discord snowflake):
   // not a composite channel id, so not reported as one

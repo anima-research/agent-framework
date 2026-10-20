@@ -2498,7 +2498,7 @@ describe('explicit prose routing', () => {
     await framework.stop();
   });
 
-  it('hybrid leaves unprefixed prose on the frozen locus', async () => {
+  it("hybrid keeps a private turn's unprefixed prose on its surface", async () => {
     membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Ordinary field speech.' }] as ContentBlock[]));
     const framework = await createFramework('hybrid');
     const routed = stubRegistry(framework);

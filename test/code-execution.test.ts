@@ -4092,6 +4092,9 @@ describe("a round that runs code_execution is routed once its scripts return (re
         await h.framework.runUntilIdle();
         assert.ok(scriptNote(h).includes(REFUSED), scriptNote(h));
         assert.ok(!h.log.includes('tool:channel_publish'), JSON.stringify(h.log));
+        // A refused publish sent nothing, so the turn's later speech isn't
+        // silenced as if it had: a channel turn's reply still goes out.
+        if (!privateTurn) assert.ok(h.log.includes('publish:done@world:test'), JSON.stringify(h.log));
       } finally {
         await h.done();
       }
@@ -4142,26 +4145,29 @@ describe("a round that runs code_execution is routed once its scripts return (re
     }
   });
 
-  it("a conversation fork's script that publishes naming no channel is told its conversation's channel", async () => {
-    const code = 'r = await channel_publish({"content": "from the script"})\nawait test__echo({"note": str(r)})';
-    const h = await scriptRound('locus', [
-      createMockResponse([scriptCall({ code })] as ContentBlock[], 'tool_use'),
-      createMockResponse([{ type: 'text', text: 'done' }] as ContentBlock[]),
-    ], {}, { channelPublish: true });
-    try {
-      // The agent stands for a fork bound to its home channel, which a
-      // broadcast wake doesn't reach, so its turn comes from its own wake.
-      const internals = h.framework as unknown as { conversationAgentHomes: Map<string, string>; pendingRequests: unknown[] };
-      internals.conversationAgentHomes.set('assistant', 'world:home');
-      internals.pendingRequests.push({ agentName: 'assistant', reason: 'test', source: 'test', timestamp: Date.now(), channelId: 'world:home' });
-      await h.framework.runUntilIdle();
-      assert.ok(scriptNote(h).includes(REFUSED), scriptNote(h));
-      assert.ok(scriptNote(h).includes('"world:home"'), scriptNote(h));
-      assert.ok(!h.log.includes('tool:channel_publish'), JSON.stringify(h.log));
-    } finally {
-      await h.done();
-    }
-  });
+  for (const named of [undefined, ''] as const) {
+    it(`a conversation fork's script that publishes ${named === undefined ? 'naming no channel' : 'with an empty channelId'} is told its conversation's channel`, async () => {
+      const args = named === undefined ? '{"content": "from the script"}' : '{"channelId": "", "content": "from the script"}';
+      const code = `r = await channel_publish(${args})\nawait test__echo({"note": str(r)})`;
+      const h = await scriptRound('locus', [
+        createMockResponse([scriptCall({ code })] as ContentBlock[], 'tool_use'),
+        createMockResponse([{ type: 'text', text: 'done' }] as ContentBlock[]),
+      ], {}, { channelPublish: true });
+      try {
+        // The agent stands for a fork bound to its home channel, which a
+        // broadcast wake doesn't reach, so its turn comes from its own wake.
+        const internals = h.framework as unknown as { conversationAgentHomes: Map<string, string>; pendingRequests: unknown[] };
+        internals.conversationAgentHomes.set('assistant', 'world:home');
+        internals.pendingRequests.push({ agentName: 'assistant', reason: 'test', source: 'test', timestamp: Date.now(), channelId: 'world:home' });
+        await h.framework.runUntilIdle();
+        assert.ok(scriptNote(h).includes(REFUSED), scriptNote(h));
+        assert.ok(scriptNote(h).includes('"world:home"'), scriptNote(h));
+        assert.ok(!h.log.includes('tool:channel_publish'), JSON.stringify(h.log));
+      } finally {
+        await h.done();
+      }
+    });
+  }
 
   it("locus: a script round's prose goes to the locus it was written for, though the script opens another channel", async () => {
     const h = await scriptRound('locus', [

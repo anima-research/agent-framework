@@ -4888,10 +4888,9 @@ export class ChannelRegistry {
       if (this.takesGlobalFallback?.(conversationId) === false) {
         return { status: 'failed', reason: "an ephemeral run's plain speech with no channel of its own is its caller's result", at: Date.now() };
       }
-      // The turn froze with no locus (a private turn, or no home, no
-      // triggering channel, no global inbound ever seen) — the agent was told
-      // its prose stays on the surface it was addressed from, if any; honor
-      // that.
+      // The turn froze with no locus (no home, no triggering channel, no
+      // global inbound ever seen) — the agent was told its prose stays on the
+      // surface it was addressed from, if any; honor that.
       // The locus froze at the turn's start, so this says what the turn had.
       const reason = 'this turn came from no channel, and it had no home or recent channel to reply in; if it should have ' +
         'had one, ask whoever runs this host';

@@ -1188,8 +1188,11 @@ describe("a window that holds a private surface's message", () => {
     assert.equal(alone[0]?.nonChannelOrigin, undefined);
   });
 
-  it("is private though nothing in it names a channel or an author", () => {
+  it("is private though nothing in it names a channel or an author, and takes its time from its newest message", () => {
     assert.deepStrictEqual(wakeProvenance([tui(10)] as never), { nonChannelOrigin: true, at: 10 });
+    for (const window of [[tui(10), tui(30)], [tui(30), tui(10)]]) {
+      assert.deepStrictEqual(wakeProvenance(window as never), { nonChannelOrigin: true, at: 30 }, 'the newest, in whatever order they sit');
+    }
     assert.equal(wakeProvenance([{ ...tui(10), nonChannelOrigin: undefined }] as never), undefined, 'control: an unmarked one has no provenance');
   });
 });
