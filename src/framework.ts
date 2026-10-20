@@ -1882,7 +1882,8 @@ const RESTART_LOSES_QUEUED_WRITES =
  *  it, since the release can't store it. */
 const REINIT_REMEDY =
   'Until it is re-initialized it refuses its work, compiles and message writes included: ' +
-  'switchBranch() to the current branch re-initializes it, and then stores the writes kept queued for it. ' +
+  'switchBranch() to the current branch re-initializes it, and then stores the writes kept queued for it, ' +
+  'at resume if the host is quiesced. ' +
   RESTART_LOSES_QUEUED_WRITES;
 
 /** How long a move may hold the store before a `store-held-long` ops alert
@@ -1893,6 +1894,14 @@ const REINIT_REMEDY =
  *  for, with 16 agents of 1,000 stored messages each and with 32 of 500, on
  *  a host under load. */
 const HOLD_ALERT_MS = 60_000;
+
+/** A hold's verb as the move's alerts name the move: "the rollback", where a
+ *  refusal says "Cannot roll back". The undo and the redo are their own. */
+const MOVE_NOUNS: Readonly<Record<string, string>> = {
+  'roll back': 'rollback',
+  suppress: 'suppression',
+  'switch branch': 'branch switch',
+};
 
 /** An agent whose context manager failed to re-initialize after a move, or a
  *  conversation agent the move emptied that couldn't be seeded again. */
@@ -4096,14 +4105,20 @@ export class AgentFramework {
       // context manager refuses its work after a move until a switchBranch()
       // re-initializes it. That's said once for the agent, with what becomes
       // of them. A quiesced host deferred its entries again on purpose.
+      // A persisted queue keeps them only while its record is current: one
+      // whose last write failed or met the cap is behind
+      // (deferredWritesFellBehind), and boot reads what it last held.
+      const keptWhere = (persisted: boolean, memoryOnly: string): string => !persisted
+        ? memoryOnly
+        : this.deferredWritesBehind
+          ? "the persisted queue's record is behind, since its last write failed or met the cap, so a restart can lose them"
+          : 'the persisted queue keeps them for boot';
       for (const name of this.quiesced ? [] : registered.filter((agent) => !stillStreaming.has(agent))) {
         const kept = this.deferredMessages.filter((msg) => (msg.forAgent ?? this.primaryAgentName) === name).length;
         if (kept > 0) {
           console.error(
             `[deferral] stop: ${kept} deferred write(s) for ${name} stay queued, not stored by the flush above; ` +
-            (this.deferredWritesPersisted
-              ? 'the persisted queue keeps them for boot'
-              : 'this memory-only queue loses them at exit'),
+            keptWhere(this.deferredWritesPersisted, 'this memory-only queue loses them at exit'),
           );
         }
       }
@@ -4112,9 +4127,8 @@ export class AgentFramework {
         if (held > 0) {
           console.error(
             `[deferral] stop: ${held} deferred write(s) for ${name} stay queued: its stream is still running and may still write; ` +
-            (this.deferredWritesPersisted || this.quiesced
-              ? 'the persisted queue keeps them for boot'
-              : 'this memory-only queue loses them if the process exits before that stream settles'),
+            keptWhere(this.deferredWritesPersisted || this.quiesced,
+              'this memory-only queue loses them if the process exits before that stream settles'),
           );
         }
       }
@@ -10416,22 +10430,22 @@ export class AgentFramework {
   private async reinitializeManagers(except?: string, moved: () => boolean = () => false): Promise<ManagerReinitFailure[]> {
     const failures: ManagerReinitFailure[] = [];
     const hold = this.surgeryHold;
-    try {
-      for (const [agentName, agent] of [...this.agents]) {
-        if (agentName === except) continue;
-        await new Promise<void>((resolve) => setImmediate(resolve));
-        if (hold) hold.reinitializing = agentName;
-        try {
-          const cm = agent.getContextManager();
-          await cm.setStrategy(cm.getStrategy());
-        } catch (error) {
-          failures.push({ agentName, error: failureDescription(error) });
-        }
+    for (const [agentName, agent] of [...this.agents]) {
+      if (agentName === except) continue;
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      // Named only while its re-initialization runs: an overdue timer runs at
+      // the turn before the next manager, when none is.
+      if (hold) hold.reinitializing = agentName;
+      try {
+        const cm = agent.getContextManager();
+        await cm.setStrategy(cm.getStrategy());
+      } catch (error) {
+        failures.push({ agentName, error: failureDescription(error) });
+      } finally {
+        if (hold) delete hold.reinitializing;
       }
-    } finally {
-      if (hold) delete hold.reinitializing;
     }
-    await this.reseedEmptiedForks(failures, except, moved);
+    await this.reseedEmptiedForks(failures, moved);
     return failures;
   }
 
@@ -10455,11 +10469,12 @@ export class AgentFramework {
       ? `, and is re-initializing ${reinitializing}'s context manager now`
       : waitingForMaintenance ? ', and is waiting for maintenance work that was already running to finish' : '';
     this.opsAlert('store-held-long', hold.agentName,
-      `The ${hold.verb} for ${hold.agentName} has held the store for ${Math.round(heldMs / 1000)} s${on}. ` +
-        `No agent's turn starts until it lets the store go, and the writes it defers for the agents wait in the ` +
-        `deferral queue (${queued === 1 ? '1 write' : `${queued} writes`} now). A restart ends it and ` +
-        're-initializes every manager, but loses the writes still queued when the process exits, unless the ' +
-        'deferral queue is persisted; stop() says how many it leaves queued.',
+      `The ${MOVE_NOUNS[hold.verb] ?? hold.verb} for ${hold.agentName} has held the store for ` +
+        `${Math.round(heldMs / 1000)} s${on}. No agent's turn starts until it lets the store go, and the writes it ` +
+        `defers for the agents wait in the deferral queue (${queued === 1 ? '1 write' : `${queued} writes`} now). ` +
+        'A restart ends it and re-initializes every manager, but loses the writes still queued when the process ' +
+        'exits, unless the deferral queue is persisted; stop() says how many it leaves queued, unless the host is ' +
+        'quiesced, which persists the queue.',
       {
         data: {
           verb: hold.verb,
@@ -10484,10 +10499,9 @@ export class AgentFramework {
    * to nothing on this branch still has it, and is left alone.
    *
    * Left to others: a fork whose re-initialization failed, which the failure
-   * report names, and the agent a rollback or suppression names, which is as
-   * its own operation leaves it. A rollback keeps its tail message, so it
-   * can't empty that agent; a suppression can, and seeding it again would
-   * bring back template copies the operator just removed.
+   * report names. The agent a rollback or suppression names is never empty
+   * here: a rollback keeps its tail message, and a suppression refuses to
+   * remove the last one (planSuppression).
    *
    * A fork that can't be seeded is disposed, as a spawn whose seeding fails
    * is never created: it would otherwise answer its channel with no history.
@@ -10507,7 +10521,7 @@ export class AgentFramework {
    * disposed, whatever the cause, since the next pass judges every fork
    * again on the branch the store is on then.
    */
-  private async reseedEmptiedForks(failures: ManagerReinitFailure[], except: string | undefined, moved: () => boolean): Promise<void> {
+  private async reseedEmptiedForks(failures: ManagerReinitFailure[], moved: () => boolean): Promise<void> {
     const router = this.conversationRouter;
     if (!router || this.conversationAgentHomes.size === 0) return;
     const failed = new Set(failures.map((f) => f.agentName));
@@ -10530,7 +10544,7 @@ export class AgentFramework {
           }
         : null;
     for (const agentName of [...this.conversationAgentHomes.keys()]) {
-      if (agentName === except || failed.has(agentName)) continue;
+      if (failed.has(agentName)) continue;
       const agent = this.agents.get(agentName);
       if (!agent) continue;
       const contextManager = agent.getContextManager();
@@ -10555,8 +10569,9 @@ export class AgentFramework {
       }
       if (moved()) continue;
       const failure: ManagerReinitFailure = { agentName, error: cause, seedingFailed: true, ...(remedy ? { remedy } : {}) };
-      // What the hold deferred for it goes with it: its window's release
-      // stores those writes there, where no agent reads them.
+      // What the hold deferred for it goes with it: its window's release,
+      // now or at resume while the host is quiesced, stores those writes
+      // there, where no agent reads them.
       const heldWrites = this.deferredMessages.filter((msg) => (msg.forAgent ?? this.primaryAgentName) === agentName).length;
       if (heldWrites > 0) failure.heldWrites = heldWrites;
       try {
@@ -10573,27 +10588,39 @@ export class AgentFramework {
   }
 
   /** Say which agents a move left with a manager that refuses its work:
-   *  on the console, in failures.log and in an ops alert, one per agent. */
+   *  on the console, in failures.log and in an ops alert, one per agent.
+   *  Each says what happened first, then what becomes of the agent's writes
+   *  and what happens next or what to do, and the cause last: the alert
+   *  webhook keeps 500 characters of a long message, its start and end
+   *  (opsAlert), and a cause can run to an error's whole diagnostic. The
+   *  console, failures.log and the trace keep 2,000, cut the same way. */
   private reportReinitFailures(after: string, failures: ManagerReinitFailure[]): void {
     for (const { agentName, error, seedingFailed, after: judgedAfter, remedy, cleanupFailed, heldWrites } of failures) {
       const move = judgedAfter ?? after;
+      const writes = heldWrites === 1 ? 'The write' : `The ${heldWrites} writes`;
       this.reportReinitFailure(agentName, move, seedingFailed
         ? `The ${move} moved the store's branch to one where this conversation agent had no messages of its own, ` +
-          `and it couldn't be seeded again, because ${error}. ` +
+          'and it couldn\'t be seeded again, so ' +
           (cleanupFailed
-            ? `It was unregistered and its channel unbound, but cleaning up after it then failed: ${cleanupFailed}. `
-            : 'It was disposed and its channel unbound. ') +
-          (heldWrites && !cleanupFailed
-            ? `${heldWrites === 1 ? 'The write' : `The ${heldWrites} writes`} held for it while the store was held ` +
-              `went with it, into its window, so the fork its channel spawns next doesn't get ${heldWrites === 1 ? 'it' : 'them'}. `
+            ? 'it was unregistered and its channel unbound, but cleaning up after it then failed (below). '
+            : 'it was disposed and its channel unbound. ') +
+          (heldWrites
+            ? cleanupFailed
+              ? `${writes} held for it while the store was held may be in its window or still queued under its name, ` +
+                'as far as that cleanup got, where no agent reads them. '
+              : `${writes} held for it while the store was held ${heldWrites === 1 ? 'goes' : 'go'} with it: its window's ` +
+                `release stores ${heldWrites === 1 ? 'it' : 'them'} there, now or at resume if the host is quiesced, so ` +
+                `the fork its channel spawns next doesn't get ${heldWrites === 1 ? 'it' : 'them'}. `
             : '') +
           "Its messages stay on the branches that hold them, but no agent reads them again, " +
           "so a redo to a branch that holds them doesn't bring this one back. " +
           (remedy
-            ? `Once ${remedy}, the channel's next qualifying message spawns a new fork seeded from the template, under a new name.`
-            : "The channel's next qualifying message spawns a new fork, under a new name, unless its seeding fails again.")
-        : `The ${after} moved the store's branch, and re-initializing this agent's context manager for it failed: ${error}. ` +
-          REINIT_REMEDY);
+            ? `Once ${remedy}, the channel's next qualifying message spawns a new fork seeded from the template, under a new name. `
+            : "The channel's next qualifying message spawns a new fork, under a new name, unless its seeding fails again. ") +
+          `It couldn't be seeded because ${error}.` +
+          (cleanupFailed ? ` Cleaning up after it failed: ${cleanupFailed}.` : '')
+        : `The ${after} moved the store's branch, and this agent's context manager failed to re-initialize for it. ` +
+          `${REINIT_REMEDY} Its re-initialization failed: ${error}.`);
     }
   }
 
@@ -10800,11 +10827,12 @@ export class AgentFramework {
       // branch the store is on.
       try {
         this.reportReinitFailure(agentName, `restore to ${sourceBranch}`, selected
-          ? `The restore to ${sourceBranch} put the store back on ${sourceBranch}, and re-initializing this agent's context manager for it failed: ${detail}. ${REINIT_REMEDY}`
-          : `The restore to ${sourceBranch} failed (${detail}), so the store is still on ${now}. ` +
+          ? `The restore to ${sourceBranch} put the store back on ${sourceBranch}, and this agent's context manager ` +
+            `failed to re-initialize for it. ${REINIT_REMEDY} Its re-initialization failed: ${detail}.`
+          : `The restore to ${sourceBranch} failed, so the store is still on ${now}. ` +
             'Until this agent\'s context manager is re-initialized it refuses its work, compiles and message writes included: ' +
-            'switchBranch() to the branch it should run on re-initializes it, and then stores the writes kept queued for it. ' +
-            RESTART_LOSES_QUEUED_WRITES);
+            'switchBranch() to the branch it should run on re-initializes it, and then stores the writes kept queued for it, ' +
+            `at resume if the host is quiesced. ${RESTART_LOSES_QUEUED_WRITES} The restore failed: ${detail}.`);
       } catch (reportError) {
         console.error(`[operator] agent=${agentName} reporting the failed restore failed: ${boundFailureText(failureDescription(reportError))}`);
       }
@@ -12803,6 +12831,11 @@ export class AgentFramework {
     // is on, seeded from the template's compile: wait until none holds it.
     // From then until it's registered, the spawn counts as busy for a move.
     for (let hold = this.surgeryHold; hold?.released; hold = this.surgeryHold) await hold.released;
+    // stop() doesn't wait for a spawn, so one that comes to this point once
+    // stop() has begun, as one that waited out a hold can, fails here as a
+    // spawn that fails does, rather than opening a manager on a store stop()
+    // is tearing down.
+    if (this.stopHasBegun()) throw new Error(`conversation agent "${name}" not created: the framework is stopping`);
     const router = this.conversationRouter!;
     const templateConfig = this.agentConfigs.get(router.templateAgent);
     const template = this.agents.get(router.templateAgent);

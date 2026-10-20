@@ -13,13 +13,20 @@
   host restarted. A manager whose re-initialization fails raises an ops
   alert, `context-reinit-failed`, naming its agent and the move; it is
   logged and traced each time, and the alert webhook posts it at most once
-  per agent and kind in 15 minutes, as it does every kind. That agent refuses its
+  per agent and kind in 15 minutes, as it does every kind. Each alert says
+  what happened first, then what becomes of the writes and what to do, and
+  its cause last, so the webhook's cut of a long message keeps what matters.
+  That agent refuses its
   work, compiles and message writes included, until `switchBranch()` (to
   the branch the store is already on, too) re-initializes it and stores the
-  writes kept queued for it meanwhile, or a restart does, which loses those
+  writes kept queued for it meanwhile, at resume on a quiesced host, or a
+  restart does, which loses those
   writes unless the deferral queue is persisted, as quiescing the host
   before it stops does. `stop()` says how many writes it leaves queued for
   an agent whose store didn't take them, and whether they're kept for boot.
+  That line, and its line for writes left queued behind a stream still
+  running, now say the persisted queue's record is behind, rather than that
+  boot keeps them, when the record's last write failed or met the cap.
   The move itself stands. A rollback or suppression whose switch back to the
   source branch fails as well raises the same alert for the agent it named,
   and says which branch the store is on. A rollback or suppression refused
@@ -53,13 +60,16 @@
   another branch while it's seeded by a switch the framework didn't make, or
   the template is missing or failed to re-initialize, is disposed rather than left to
   answer with no history: `context-reinit-failed` says so and why. The
-  writes held for it while the store was held go with it, into its window,
-  and once it's disposed the alert says how many, since the fork its channel
-  spawns next doesn't get them. If
+  writes held for it while the store was held go with it: its window's
+  release stores them there, now or at resume on a quiesced host, and the
+  alert says how many, since the fork its channel spawns next doesn't get
+  them. If
   disposing it fails partway, the alert says that too, and the move's other
   conversation agents are still seeded. Its channel's next qualifying message spawns a
   fresh one, unless its seeding
   fails again, and while the template is missing or refuses its work a
   spawn fails too, so the alert says what puts the template right first.
   Its messages stay in the store, but a redo doesn't bring the disposed one
-  back.
+  back. A spawn that comes to create a conversation agent once `stop()` has
+  begun, as one waiting out a move's hold can, fails as a failed spawn does,
+  rather than open its context manager on a store `stop()` is tearing down.

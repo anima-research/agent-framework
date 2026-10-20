@@ -383,7 +383,7 @@ describe('after a branch move, every agent on the store compiles without a resta
     await reinitDone(undone);
     const alerts = reinitAlerts();
     assert.deepEqual(alerts.map((alert) => alert.agentName), ['b']);
-    assert.match(alerts[0]!.message, /switchBranch\(\) to the current branch re-initializes it, and then stores the writes kept queued for it\. A restart re-initializes it too, but loses those writes unless the deferral queue is persisted, as quiescing the host before it stops does\.$/);
+    assert.match(alerts[0]!.message, /^The undo moved the store's branch, and this agent's context manager failed to re-initialize for it\. Until it is re-initialized it refuses its work, compiles and message writes included: switchBranch\(\) to the current branch re-initializes it, and then stores the writes kept queued for it, at resume if the host is quiesced\. A restart re-initializes it too, but loses those writes unless the deferral queue is persisted, as quiescing the host before it stops does\. Its re-initialization failed: .*injected initialization failure\.$/);
     const logged: string[] = [];
     const quiet = console.error;
     console.error = (...args: unknown[]) => { logged.push(args.map(String).join(' ')); };
@@ -398,6 +398,38 @@ describe('after a branch move, every agent on the store compiles without a resta
     );
     assert.ok(!logged.some((line) => /write\(s\) for a stay queued/.test(line)), `nothing is said for a, whose write the release stored: ${logged.join('\n')}`);
   });
+
+  // The same line, for a persisted queue: one whose record is current keeps
+  // the writes for boot, and one whose last write failed is behind.
+  for (const record of ['current', 'behind'] as const) {
+    it(`stop() says a persisted queue whose record is ${record} ${record === 'current' ? 'keeps' : 'can lose'} the writes it leaves for an agent whose manager refuses them`, async () => {
+      checkpointTurn();
+      const strategy = cmOf('b').getStrategy() as unknown as { initialize: (...args: unknown[]) => Promise<void> };
+      strategy.initialize = async () => { throw new Error('injected initialization failure'); };
+      const fw = framework as unknown as {
+        addMessage(participant: string, content: unknown, metadata?: unknown, opts?: { forAgent?: string }): string;
+        deferredWritesPersisted: boolean;
+        writeDeferredWrites: () => unknown;
+      };
+      const undone = framework.undoLastTurn('a');
+      assert.equal(fw.addMessage('user', text('for b, during the hold'), undefined, { forAgent: 'b' }), '', 'deferred, not stored');
+      await reinitDone(undone);
+      fw.deferredWritesPersisted = true;
+      if (record === 'behind') fw.writeDeferredWrites = () => { throw new Error('injected record write failure'); };
+      const logged: string[] = [];
+      const quiet = console.error;
+      console.error = (...args: unknown[]) => { logged.push(args.map(String).join(' ')); };
+      try {
+        await framework.stop();
+      } finally {
+        console.error = quiet;
+      }
+      assert.ok(logged.includes('[deferral] stop: 1 deferred write(s) for b stay queued, not stored by the flush above; ' + (record === 'current'
+        ? 'the persisted queue keeps them for boot'
+        : "the persisted queue's record is behind, since its last write failed or met the cap, so a restart can lose them")),
+      logged.join('\n'));
+    });
+  }
 
   it('a failed undo or redo leaves the store where it was, released, with its turn kept (createBranchAt and switchBranch throwing)', async () => {
     checkpointTurn();
@@ -491,43 +523,53 @@ describe('after a branch move, every agent on the store compiles without a resta
   // R3-4: no turn starts while a move holds the store, and nothing bounds
   // what the hold waits on, so a hold still up past its threshold is said,
   // once.
-  it("a hold on the store still up past its threshold raises one store-held-long alert, naming the move, its agent and the manager its pass is on", async () => {
+  it("a hold on the store names the move, its agent, the manager its pass is on and the writes waiting, when its timer goes off", async () => {
     checkpointTurn();
-    shortenHoldAlert(1_000);
+    const fw = framework as unknown as { reportLongHold(hold: unknown): void };
     const strategy = cmOf('b').getStrategy() as unknown as { initialize: (...args: unknown[]) => Promise<void> };
     const initialize = strategy.initialize.bind(strategy);
     let calls = 0;
+    let atGate = false;
     let release!: () => void;
     const gate = new Promise<void>((resolve) => { release = resolve; });
     // b's re-initialization in the undo's pass runs at once; in the pass the
     // redo's join starts, it waits at the gate.
     strategy.initialize = async (...args: unknown[]) => {
-      if (++calls === 2) await gate;
+      if (++calls === 2) {
+        atGate = true;
+        await gate;
+      }
       return initialize(...args);
+    };
+    const queue = framework as unknown as {
+      addMessage(participant: string, content: unknown, metadata?: unknown, opts?: { forAgent?: string }): string;
     };
     const undone = framework.undoLastTurn('a');
     const redone = framework.redo('a');
     assert.equal(redone.settled, undone.settled, 'one reservation, one pass that runs again');
     try {
-      await until(() => longHoldAlerts().length > 0, 'the store-held-long alert', 10_000);
-      // A hold has one timer, so nothing more comes while it's still up.
-      await new Promise((resolve) => setTimeout(resolve, 1_200));
+      await until(() => atGate, "b's second re-initialization to reach its gate", 10_000);
+      assert.equal(queue.addMessage('user', text('for a, during the hold'), undefined, { forAgent: 'a' }), '', 'deferred, not stored');
+      // What its timer does when the threshold passes, called here so the
+      // test needn't time the pass against it; the next test runs the timer.
+      const hold = internals().surgeryHold;
+      assert.ok(hold, 'the store is held');
+      fw.reportLongHold(hold);
       assert.equal(longHoldAlerts().length, 1, JSON.stringify(longHoldAlerts()));
       const [alert] = longHoldAlerts();
       assert.equal(alert!.agentName, 'a');
-      assert.match(alert!.message, /^The undo for a has held the store for \d+ s, and is re-initializing b's context manager now\. No agent's turn starts until it lets the store go, and the writes it defers for the agents wait in the deferral queue \(0 writes now\)\. A restart ends it and re-initializes every manager, but loses the writes still queued when the process exits, unless the deferral queue is persisted; stop\(\) says how many it leaves queued\.$/);
+      assert.match(alert!.message, /^The undo for a has held the store for \d+ s, and is re-initializing b's context manager now\. No agent's turn starts until it lets the store go, and the writes it defers for the agents wait in the deferral queue \(1 write now\)\. A restart ends it and re-initializes every manager, but loses the writes still queued when the process exits, unless the deferral queue is persisted; stop\(\) says how many it leaves queued, unless the host is quiesced, which persists the queue\.$/);
       const data = alert!.data as { verb?: string; reinitializing?: string; queued?: number; heldMs?: number; waitingForMaintenance?: boolean };
       assert.equal(data.verb, 'undo');
       assert.equal(data.reinitializing, 'b');
       assert.equal(data.waitingForMaintenance, undefined);
-      assert.equal(data.queued, 0);
-      assert.ok(typeof data.heldMs === 'number' && data.heldMs >= 1_000, JSON.stringify(data));
-      assert.ok(internals().surgeryHold, 'the store is still held');
+      assert.equal(data.queued, 1);
+      assert.ok(typeof data.heldMs === 'number' && data.heldMs >= 0, JSON.stringify(data));
     } finally {
       release();
     }
     await reinitDone(redone);
-    assert.equal(longHoldAlerts().length, 1, 'nothing more once the store is let go');
+    assert.equal(longHoldAlerts().length, 1, 'its timer, at the default threshold, went with the hold');
     assert.deepEqual(reinitAlerts(), []);
     await works('b');
   });
@@ -544,9 +586,13 @@ describe('after a branch move, every agent on the store compiles without a resta
       await settled();
       assert.ok(waited(), 'the rollback waits on the running maintenance pass');
       await until(() => longHoldAlerts().length > 0, 'the store-held-long alert', 10_000);
+      // A hold has one timer, so nothing more comes while it's still up.
+      await new Promise((resolve) => setTimeout(resolve, 1_500));
+      assert.equal(longHoldAlerts().length, 1, JSON.stringify(longHoldAlerts()));
       const [alert] = longHoldAlerts();
       assert.equal(alert!.agentName, 'a');
-      assert.match(alert!.message, /^The roll back for a has held the store for \d+ s, and is waiting for maintenance work that was already running to finish\. No agent's turn starts until it lets the store go/);
+      assert.ok(((alert!.data as { heldMs?: number }).heldMs ?? 0) >= 1_000, JSON.stringify(alert!.data));
+      assert.match(alert!.message, /^The rollback for a has held the store for \d+ s, and is waiting for maintenance work that was already running to finish\. No agent's turn starts until it lets the store go/);
       const data = alert!.data as { verb?: string; reinitializing?: string; waitingForMaintenance?: boolean };
       assert.equal(data.verb, 'roll back');
       assert.equal(data.waitingForMaintenance, true);
@@ -562,22 +608,40 @@ describe('after a branch move, every agent on the store compiles without a resta
   });
 
   it("a branch switch still holding the store for its config mount after its pass names no manager", async () => {
-    shortenHoldAlert(2_000);
-    const fw = framework as unknown as { moduleRegistry: { getModule(name: string): unknown } };
+    const fw = framework as unknown as {
+      moduleRegistry: { getModule(name: string): unknown };
+      reportLongHold(hold: unknown): void;
+    };
     const getModule = fw.moduleRegistry.getModule.bind(fw.moduleRegistry);
     let mounted!: () => void;
     const mount = new Promise<void>((resolve) => { mounted = resolve; });
     fw.moduleRegistry.getModule = (name: string) =>
       name === 'workspace' ? { materializeMount: async () => { await mount; } } : getModule(name);
+    // The pass has ended once both managers are re-initialized: this fixture
+    // has no conversation agent to seed again.
+    let reinitialized = 0;
+    for (const name of ['a', 'b']) {
+      const cm = cmOf(name) as unknown as { setStrategy: (s: unknown) => Promise<void> };
+      const setStrategy = cm.setStrategy.bind(cm);
+      cm.setStrategy = async (strategy: unknown) => {
+        try { return await setStrategy(strategy); } finally { reinitialized++; }
+      };
+    }
     let switching: Promise<void> | undefined;
     try {
       switching = framework.switchBranch(framework.getStore().currentBranch().name);
-      await until(() => longHoldAlerts().length > 0, 'the store-held-long alert', 10_000);
+      await until(() => reinitialized === 2, "the pass's re-initialization of both managers", 10_000);
+      const hold = (internals() as unknown as { surgeryHold: { reinitializing?: string } | null }).surgeryHold;
+      assert.ok(hold, 'the store is still held, for the config mount');
+      assert.equal(hold.reinitializing, undefined);
+      // What its timer does when the threshold passes, called here so the
+      // test needn't time the pass against it.
+      fw.reportLongHold(hold);
       const [alert] = longHoldAlerts();
       assert.equal(alert!.agentName, 'every agent');
-      assert.match(alert!.message, /^The switch branch for every agent has held the store for \d+ s\. No agent's turn starts until it lets the store go/);
+      assert.match(alert!.message, /^The branch switch for every agent has held the store for \d+ s\. No agent's turn starts until it lets the store go/);
       const data = alert!.data as { reinitializing?: string; waitingForMaintenance?: boolean };
-      assert.equal(data.reinitializing, undefined, 'its pass, on two short histories, ended well within 2 s');
+      assert.equal(data.reinitializing, undefined);
       assert.equal(data.waitingForMaintenance, undefined);
     } finally {
       mounted();
@@ -590,14 +654,67 @@ describe('after a branch move, every agent on the store compiles without a resta
     await works('b');
   });
 
-  it('a hold let go before its threshold says nothing, then or after', async () => {
+  it("between two managers' re-initializations, the hold names neither", async () => {
     checkpointTurn();
-    shortenHoldAlert(2_000);
+    const named: Array<string | undefined> = [];
+    const cm = cmOf('a') as unknown as { setStrategy: (s: unknown) => Promise<void> };
+    const setStrategy = cm.setStrategy.bind(cm);
+    cm.setStrategy = async (strategy: unknown) => {
+      try {
+        return await setStrategy(strategy);
+      } finally {
+        // Runs at the pass's turn of the event loop before b's, where an
+        // overdue timer would.
+        setImmediate(() => {
+          named.push((internals() as unknown as { surgeryHold: { reinitializing?: string } | null }).surgeryHold?.reinitializing);
+        });
+      }
+    };
+    await reinitDone(framework.undoLastTurn('a'));
+    assert.deepEqual(named, [undefined]);
+  });
+
+  it('an undo whose release throws still settles its settled, and says the release failed', async () => {
+    checkpointTurn();
+    const fw = framework as unknown as {
+      addMessage(participant: string, content: unknown, metadata?: unknown, opts?: { forAgent?: string }): string;
+      readdDrained: (...args: unknown[]) => unknown;
+    };
+    const logged: string[] = [];
+    const quiet = console.error;
+    console.error = (...args: unknown[]) => { logged.push(args.map(String).join(' ')); };
+    const readdDrained = fw.readdDrained;
+    try {
+      const undone = framework.undoLastTurn('a');
+      // The release's flush, which runs once the hold is cleared, throws.
+      assert.equal(fw.addMessage('user', text('for b, during the hold'), undefined, { forAgent: 'b' }), '', 'deferred, not stored');
+      fw.readdDrained = () => { throw new Error('injected release flush failure'); };
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const outcome = await Promise.race([
+        undone.settled!.then(() => 'settled', () => 'rejected'),
+        new Promise<string>((resolve) => { timer = setTimeout(() => resolve('still pending'), 10_000); }),
+      ]);
+      clearTimeout(timer);
+      assert.equal(outcome, 'settled');
+    } finally {
+      console.error = quiet;
+      fw.readdDrained = readdDrained;
+    }
+    assert.ok(logged.some((line) => /^\[operator\] releasing the store the undo reserved failed: .*injected release flush failure/.test(line)), logged.join('\n'));
+    assert.equal(internals().surgeryHold, null, 'the hold was cleared before the flush');
+  });
+
+  it('a hold let go before its threshold says nothing after it', async () => {
+    checkpointTurn();
+    shortenHoldAlert(1_000);
     await reinitDone(framework.undoLastTurn('a'));
     assert.equal(internals().surgeryHold, null);
-    assert.deepEqual(longHoldAlerts(), [], 'the undo let the store go well within 2 s');
-    await new Promise((resolve) => setTimeout(resolve, 2_500));
-    assert.deepEqual(longHoldAlerts(), [], 'its timer went with the hold');
+    // An undo of two short histories lets the store go well within 1 s. One
+    // that took longer on a slow host was said while the store was held, and
+    // still nothing may come after it.
+    const atRelease = longHoldAlerts().length;
+    await new Promise((resolve) => setTimeout(resolve, 1_500));
+    assert.equal(longHoldAlerts().length, atRelease, 'its timer went with the hold');
   });
 
   it('a suppression whose fork switches the store and then fails restores the source, and the other agent is current', async () => {
@@ -795,8 +912,8 @@ describe('after a branch move, every agent on the store compiles without a resta
     assert.doesNotMatch(message, /still on failed-twice/);
     const alerts = reinitAlerts().filter((alert) => alert.agentName === 'a');
     assert.equal(alerts.length, 1, JSON.stringify(reinitAlerts()));
-    assert.match(alerts[0]!.message, /The restore to main put the store back on main, and re-initializing/);
-    assert.match(alerts[0]!.message, /A restart re-initializes it too, but loses those writes unless the deferral queue is persisted, as quiescing the host before it stops does\.$/);
+    assert.match(alerts[0]!.message, /^The restore to main put the store back on main, and this agent's context manager failed to re-initialize for it\. Until it is re-initialized/);
+    assert.match(alerts[0]!.message, /A restart re-initializes it too, but loses those writes unless the deferral queue is persisted, as quiescing the host before it stops does\. Its re-initialization failed: .+\.$/);
   });
 
   it("a rollback whose restore can't even select the source says the store stayed on the failed branch", async () => {
@@ -823,8 +940,8 @@ describe('after a branch move, every agent on the store compiles without a resta
     assert.match(message, /RESTORE TO main ALSO FAILED \(injected restore refusal\); the store is still on failed-thrice/);
     const alerts = reinitAlerts().filter((alert) => alert.agentName === 'a');
     assert.equal(alerts.length, 1, JSON.stringify(reinitAlerts()));
-    assert.match(alerts[0]!.message, /The restore to main failed \(injected restore refusal\), so the store is still on failed-thrice\./);
-    assert.match(alerts[0]!.message, /switchBranch\(\) to the branch it should run on re-initializes it, and then stores the writes kept queued for it\. A restart re-initializes it too, but loses those writes unless the deferral queue is persisted, as quiescing the host before it stops does\.$/);
+    assert.match(alerts[0]!.message, /^The restore to main failed, so the store is still on failed-thrice\./);
+    assert.match(alerts[0]!.message, /switchBranch\(\) to the branch it should run on re-initializes it, and then stores the writes kept queued for it, at resume if the host is quiesced\. A restart re-initializes it too, but loses those writes unless the deferral queue is persisted, as quiescing the host before it stops does\. The restore failed: injected restore refusal\.$/);
     assert.doesNotMatch(alerts[0]!.message, /moved the store's branch/);
   });
 
@@ -933,6 +1050,21 @@ describe('after a branch move, every agent on the store compiles without a resta
     await works('a');
     await works('b');
   });
+
+  for (const [beneath, says] of [[0, 'No redo steps remain.'], [2, '2 redo steps remain.']] as const) {
+    it(`a redo whose branch was deleted, with ${beneath} step(s) beneath it, says "${says}"`, () => {
+      const stacks = (framework as unknown as { redoStacks: Map<string, Array<{ branchName: string; checkpoint: unknown }>> }).redoStacks;
+      const step = (branchName: string) => ({
+        branchName,
+        checkpoint: { agentName: 'a', turnIndex: 1, sequenceBefore: 0, branchName: 'main', timestamp: Date.now() },
+      });
+      stacks.set('a', [...Array.from({ length: beneath }, (_, i) => step(`beneath-${i}`)), step('deleted-before-its-redo')]);
+      assert.throws(() => framework.redo('a'), (e: unknown) => e instanceof OperatorActionError && e.code === 'failed'
+        && e.message.endsWith(`the branch this redo returns to, deleted-before-its-redo, no longer exists, so that step is dropped. ${says}`));
+      assert.equal(framework.getUndoRedoState('a').redoDepth, beneath);
+      assert.equal(internals().surgeryHold, null);
+    });
+  }
 
   it("a redo whose switch fails while the branch listing fails too keeps its step, and answers the switch's error", async () => {
     checkpointTurn();
@@ -1058,13 +1190,18 @@ describe('conversation forks and an undo', () => {
       const sequenceBefore = framework.getStore().currentSequence();
       cmA.addMessage('user', [{ type: 'text', text: 'a turn to undo' }]);
       internals.saveTurnCheckpoints('a', [{ agentName: 'a', turnIndex: 1, sequenceBefore, branchName: 'main', timestamp: Date.now() }]);
-      // The template's re-initialization takes 300 ms, so a fork that didn't
-      // wait would be seeded from it mid-initialization.
+      // The template's re-initialization waits at a gate the test opens once
+      // the spawn is waiting, so a fork that didn't wait would be seeded from
+      // it mid-initialization.
       const order: string[] = [];
       const strategy = cmA.getStrategy() as unknown as { initialize: (...args: unknown[]) => Promise<void> };
       const initialize = strategy.initialize.bind(strategy);
+      let atGate = false;
+      let open!: () => void;
+      const gate = new Promise<void>((resolve) => { open = resolve; });
       strategy.initialize = async (...args: unknown[]) => {
-        await new Promise((resolve) => setTimeout(resolve, 300));
+        atGate = true;
+        await gate;
         await initialize(...args);
         order.push('template re-initialized');
       };
@@ -1075,7 +1212,12 @@ describe('conversation forks and an undo', () => {
       };
       assert.equal(framework.undoLastTurn('a').undone, true);
       assert.ok(internals.syncMoveReinit, 'the re-initialization is running');
-      const fork = await internals.createConversationAgent('a-chan-g1', 'world:chan');
+      const spawning = internals.createConversationAgent('a-chan-g1', 'world:chan');
+      await until(() => atGate, "the template's re-initialization to reach its gate", 10_000);
+      await settled();
+      assert.equal(order.length, 0, `the spawn waits, and nothing has compiled the template: ${JSON.stringify(order)}`);
+      open();
+      const fork = await spawning;
       (cmA as unknown as { compile: typeof compile }).compile = compile;
       assert.equal(internals.surgeryHold, null, 'the spawn finished after the store was let go');
       const reinitialized = order.indexOf('template re-initialized');
@@ -1218,8 +1360,8 @@ describe('conversation forks and an undo', () => {
       }
       const reinit = alerts.filter((alert) => alert.kind === 'context-reinit-failed');
       assert.deepEqual(reinit.map((alert) => alert.agentName), ['a-late-g1'], JSON.stringify(alerts));
-      assert.match(reinit[0]!.message, /had no messages of its own, and it couldn't be seeded again, because its seeding from the template failed: .*injected template compile failure\. It was disposed and its channel unbound/);
-      assert.match(reinit[0]!.message, /no agent reads them again, so a redo to a branch that holds them doesn't bring this one back\. The channel's next qualifying message spawns a new fork, under a new name, unless its seeding fails again\.$/);
+      assert.match(reinit[0]!.message, /had no messages of its own, and it couldn't be seeded again, so it was disposed and its channel unbound\. .*It couldn't be seeded because its seeding from the template failed: .*injected template compile failure\.$/);
+      assert.match(reinit[0]!.message, /no agent reads them again, so a redo to a branch that holds them doesn't bring this one back\. The channel's next qualifying message spawns a new fork, under a new name, unless its seeding fails again\. It couldn't be seeded because /);
       assert.doesNotMatch(reinit[0]!.message, /refuses its work/);
       assert.equal(internals.surgeryHold, null, 'the store is released');
       assert.ok(!framework.getAgent('a-late-g1'), 'the fork is disposed rather than left to answer with no history');
@@ -1254,16 +1396,20 @@ describe('conversation forks and an undo', () => {
         if (agent.name === 'a-late-g1') throw new Error('injected release failure');
         return releaseWindow.call(this, agent);
       };
+      const queue = framework as unknown as {
+        addMessage(participant: string, content: unknown, metadata?: unknown, opts?: { forAgent?: string }): string;
+      };
       try {
         const undo = framework.undoLastTurn('a');
         assert.equal(undo.undone, true);
+        assert.equal(queue.addMessage('user', [{ type: 'text', text: 'for a-late-g1, during the hold' }], undefined, { forAgent: 'a-late-g1' }), '', 'deferred, not stored');
         await undo.settled;
       } finally {
         released.releaseWindow = releaseWindow;
       }
       const reinit = alerts.filter((alert) => alert.kind === 'context-reinit-failed');
       assert.deepEqual(reinit.map((alert) => alert.agentName), ['a-late-g1'], JSON.stringify(alerts));
-      assert.match(reinit[0]!.message, /couldn't be seeded again, because its seeding from the template failed: .*injected seed failure\. It was unregistered and its channel unbound, but cleaning up after it then failed: .*injected release failure\./);
+      assert.match(reinit[0]!.message, /couldn't be seeded again, so it was unregistered and its channel unbound, but cleaning up after it then failed \(below\)\. The write held for it while the store was held may be in its window or still queued under its name, as far as that cleanup got, where no agent reads them\. .*It couldn't be seeded because its seeding from the template failed: .*injected seed failure\. Cleaning up after it failed: .*injected release failure\.$/);
       assert.equal(internals.surgeryHold, null, 'the store is released');
       assert.ok(!framework.getAgent('a-late-g1'), 'the fork is unregistered');
       assert.equal(router.getBinding('world:late'), undefined, 'its channel is unbound');
@@ -1465,9 +1611,9 @@ describe('conversation forks and an undo', () => {
       const byAgent = new Map(alerts.filter((alert) => alert.kind === 'context-reinit-failed').map((alert) => [alert.agentName, alert.message]));
       assert.deepEqual([...byAgent.keys()].sort(), ['a', 'a-late-g1'], JSON.stringify(alerts));
       assert.match(byAgent.get('a')!, /injected template init failure/);
-      assert.match(byAgent.get('a-late-g1')!, /couldn't be seeded again, because the template a's own context manager failed to re-initialize \([^)]*injected template init failure[^)]*\)\. It was disposed/);
+      assert.match(byAgent.get('a-late-g1')!, /couldn't be seeded again, so it was disposed and its channel unbound\. .*It couldn't be seeded because the template a's own context manager failed to re-initialize \([^)]*injected template init failure[^)]*\)\.$/);
       // A spawn seeds from the template too, so the channel spawns again only once it's re-initialized.
-      assert.match(byAgent.get('a-late-g1')!, /Once the template is re-initialized, which a switchBranch\(\) to the current branch or a restart does, the channel's next qualifying message spawns a new fork seeded from the template, under a new name\.$/);
+      assert.match(byAgent.get('a-late-g1')!, /Once the template is re-initialized, which a switchBranch\(\) to the current branch or a restart does, the channel's next qualifying message spawns a new fork seeded from the template, under a new name\. It couldn't be seeded because /);
       assert.match(byAgent.get('a-late-g1')!, /no agent reads them again/);
       assert.ok(!framework.getAgent('a-late-g1'), 'the empty fork is disposed');
       assert.equal(framework.getConversationRouter()!.getBinding('world:late'), undefined);
@@ -1547,8 +1693,8 @@ describe('conversation forks and an undo', () => {
       await framework.switchBranch('earlier');
       const reinit = alerts.filter((alert) => alert.kind === 'context-reinit-failed');
       assert.deepEqual(reinit.map((alert) => alert.agentName), ['a-late-g1'], JSON.stringify(alerts));
-      assert.match(reinit[0]!.message, /couldn't be seeded again, because no agent is registered as the conversation template "a"\. It was disposed/);
-      assert.match(reinit[0]!.message, /Once an agent is registered under that name, or the conversation router is configured with a registered template, the channel's next qualifying message spawns a new fork seeded from the template, under a new name\.$/);
+      assert.match(reinit[0]!.message, /couldn't be seeded again, so it was disposed and its channel unbound\. .*It couldn't be seeded because no agent is registered as the conversation template "a"\.$/);
+      assert.match(reinit[0]!.message, /Once an agent is registered under that name, or the conversation router is configured with a registered template, the channel's next qualifying message spawns a new fork seeded from the template, under a new name\. It couldn't be seeded because /);
       assert.ok(!framework.getAgent('a-late-g1'), 'the empty fork is disposed');
       assert.ok(framework.getAgent('a-early-g1'), 'the fork with history stays');
     });
@@ -1714,8 +1860,10 @@ describe('conversation forks and an undo', () => {
           assert.equal(undo.undone, true);
           await undo.settled;
         }, async () => {
-          const placement = await internals.handleMcplChannelIncoming(channelMessage('world:late', 'MESSAGE DURING THE UNDO'));
-          assert.ok(placement?.deferredId && !placement.messageId, `deferred, not stored: ${JSON.stringify(placement)}`);
+          for (const words of ['FIRST DURING THE UNDO', 'SECOND DURING THE UNDO']) {
+            const placement = await internals.handleMcplChannelIncoming(channelMessage('world:late', words));
+            assert.ok(placement?.deferredId && !placement.messageId, `deferred, not stored: ${JSON.stringify(placement)}`);
+          }
           // The re-seed, once the maintenance pass ends, reads the template's
           // compile, which now fails.
           (cmA as unknown as { compile: () => Promise<never> }).compile = async () => { throw new Error('injected template compile failure'); };
@@ -1724,10 +1872,38 @@ describe('conversation forks and an undo', () => {
         (cmA as unknown as { compile: typeof compile }).compile = compile;
       }
       assert.ok(!framework.getAgent('a-late-g1'), 'disposed');
-      assert.deepEqual(storedTexts(late), ['MESSAGE DURING THE UNDO'], 'the held write is in its window');
+      assert.deepEqual(storedTexts(late), ['FIRST DURING THE UNDO', 'SECOND DURING THE UNDO'], 'the held writes are in its window');
       const reinit = alerts.filter((alert) => alert.kind === 'context-reinit-failed');
       assert.deepEqual(reinit.map((alert) => alert.agentName), ['a-late-g1'], JSON.stringify(alerts));
-      assert.match(reinit[0]!.message, /It was disposed and its channel unbound\. The write held for it while the store was held went with it, into its window, so the fork its channel spawns next doesn't get it\. Its messages stay on the branches/);
+      assert.match(reinit[0]!.message, /so it was disposed and its channel unbound\. The 2 writes held for it while the store was held go with it: its window's release stores them there, now or at resume if the host is quiesced, so the fork its channel spawns next doesn't get them\. Its messages stay on the branches/);
+    });
+  });
+
+  it("a spawn that waits out a move's hold into a stop() fails, as a failed spawn does", { timeout: 30_000 }, async () => {
+    await withForks('reinit-fork-spawn-stop-', async (framework, internals) => {
+      await forksAroundACheckpoint(framework, internals);
+      const cmA = framework.getAgent('a')!.getContextManager();
+      const strategy = cmA.getStrategy() as unknown as { initialize: (...args: unknown[]) => Promise<void> };
+      const initialize = strategy.initialize.bind(strategy);
+      let atGate = false;
+      let open!: () => void;
+      const gate = new Promise<void>((resolve) => { open = resolve; });
+      strategy.initialize = async (...args: unknown[]) => {
+        atGate = true;
+        await gate;
+        return initialize(...args);
+      };
+      assert.equal(framework.undoLastTurn('a').undone, true);
+      const spawning = internals.createConversationAgent('a-new-g1', 'world:new');
+      void spawning.catch(() => {});
+      await until(() => atGate, "the template's re-initialization to reach its gate", 10_000);
+      const stopping = framework.stop();
+      void stopping.catch(() => {});
+      await settled();
+      open();
+      await assert.rejects(spawning, /conversation agent "a-new-g1" not created: the framework is stopping/);
+      await stopping;
+      assert.ok(!framework.getAgent('a-new-g1'), 'not registered');
     });
   });
 
@@ -1818,7 +1994,7 @@ describe('conversation forks and an undo', () => {
       assert.equal(store.currentBranch().name, 'elsewhere');
       assert.deepEqual(storedTexts(late), [], 'nothing seeded from the compile of the branch the store left');
       assert.ok(!framework.getAgent('a-late-g1'), 'the fork is disposed');
-      assert.ok(logged.some((line) => /agent=a-late-g1 .*couldn't be seeded again, because its seeding from the template failed: Error: the store moved to another branch, [^,]+, while it was being seeded\./.test(line)),
+      assert.ok(logged.some((line) => /agent=a-late-g1 .*It couldn't be seeded because its seeding from the template failed: Error: the store moved to another branch, [^,]+, while it was being seeded\./.test(line)),
         logged.join('\n'));
     });
   });
