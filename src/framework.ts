@@ -949,7 +949,7 @@ interface TurnRouting {
    * mention, followed the stale pin into repligate's DM).
    */
   engaged: Set<string>;
-  /** The sticky destination, set by each `>>` (hybrid: `>>>`) prefix that resolves. */
+  /** The sticky destination, set by each `>>` (hybrid: `>>>`) prefix that resolves, while the turn isn't private (pinTurn). */
   pin?: string;
   /**
    * Hybrid: the router is fail-closed until a later `>>>` names a target that
@@ -11672,13 +11672,16 @@ export class AgentFramework {
           // surface (surfaceSourceFor), and only it does. The notice rides
           // this boundary's injections, as a re-pin's does; a stream that
           // restarts reads it from the window. A boundary that ends the turn,
-          // or a silent turn's, answers none of it, so it marks the agent
-          // instead, as any other store does, and its next start that can
+          // or a silent turn's, answers none of it, so it also marks the
+          // agent, as any other store does, and its next start that can
           // publish is private (notePrivateInput).
           if (midTurnInjections.some((inj) => readInboundSource(inj.metadata)?.kind === 'surface')) {
-            if (shouldEndTurn || this.activeTurnTriggers.get(agent.name)?.suppressProse === true) {
-              this.privateInputStored.add(agent.name);
-            } else {
+            const silent = this.activeTurnTriggers.get(agent.name)?.suppressProse === true;
+            if (shouldEndTurn || silent) this.privateInputStored.add(agent.name);
+            if (!shouldEndTurn) {
+              // A silent turn is made private too, so what it reads refuses
+              // its channel_publish that names no channel; it has no
+              // destination, so it gets no notice.
               const notice = this.makeTurnPrivate(agent, this.routingOf(agent.name));
               if (notice && !overBudget && currentState.stream) midTurnInjections.push(notice);
             }
@@ -15226,8 +15229,8 @@ export class AgentFramework {
   /**
    * A round's envelope names a destination its turn's later unprefixed speech
    * follows (`>>>` in hybrid mode, `>>` in explicit), unless the turn is
-   * private: its plain speech stays on its surface, as its notice tells the
-   * resident, so no envelope sets a destination for it, one written before
+   * private: its plain speech stays on its surface, as its notice tells a
+   * resident whose turn had a destination, so no envelope sets one for it, one written before
    * the private input and delivered after it on the speech chain included.
    * The envelope's own words still go where it names.
    */
@@ -15939,7 +15942,8 @@ export class AgentFramework {
         return;
       }
       targetChannel = res.channelId;
-      // Sticky within the turn: later unprefixed segments follow this target.
+      // Sticky within the turn, unless it's private (pinTurn): later
+      // unprefixed segments follow this target.
       this.pinTurn(round, targetChannel);
       body = parsed.body;
     } else {
@@ -16656,11 +16660,12 @@ export class AgentFramework {
     // queued still reads and writes its own.
     // A private surface's message stored for the agent since its last start
     // (notePrivateInput) is read by this one, which is private, as a private
-    // wake in its batch makes it. A silent start publishes nothing and leaves
-    // the mark to the next; it's spent once this start's stream has begun
-    // (startAgentStream), so a start that parks or ends before then leaves it
-    // to the next start too.
-    const privateInput = !trigger?.suppressProse && this.privateInputStored.has(agent.name);
+    // wake in its batch makes it. A silent start is private too, so its
+    // channel_publish names its channel, but it publishes nothing and leaves
+    // the mark to the next start; the mark is spent once a start that can
+    // publish has begun its stream (startAgentStream), so a start that parks
+    // or ends before then leaves it to the next start too.
+    const privateInput = this.privateInputStored.has(agent.name);
     let routing: TurnRouting;
     let opensTurn = false;
     if (resumesTurn) {

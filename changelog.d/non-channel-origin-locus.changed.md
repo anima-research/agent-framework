@@ -30,8 +30,8 @@
 
   A private turn's `channel_publish` must name its channel: a call without
   `channelId` is refused, a conversation fork's included. Its `channel_open`
-  doesn't move the locus, and says so. Outside explicit mode, its `.sleep`
-  announcement isn't posted. When the model refuses (a refusal stop), a
+  doesn't move the locus, and says so. Its `.sleep` announcement isn't
+  posted. When the model refuses (a refusal stop), a
   private turn's refusal reacts on no message, and its failure record names no
   channel.
 

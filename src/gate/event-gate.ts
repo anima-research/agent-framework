@@ -136,7 +136,8 @@ export interface WakeProvenance {
   /** The window held a private surface's message: its wake is private, and
    *  names no route (the framework's processInferenceRequests). */
   nonChannelOrigin?: boolean;
-  /** Timestamp (ms) of the chosen event, so a consumer coalescing several
+  /** Timestamp (ms) of the chosen event, or of a private window's newest
+   *  private message when that is later, so a consumer coalescing several
    *  requests can order by event recency, not by flush order. */
   at?: number;
 }
@@ -213,9 +214,10 @@ function isMetadataTruthy(value: unknown): boolean {
 /**
  * Provenance of a batched wake: the newest ADDRESSED channel-bearing event
  * wins (mention / reply / DM outranks newer ambient chatter — the framework's
- * own locus rule); else the newest channel-bearing event; else, in a window
- * that holds only private surface messages, the newest of those, which names
- * no channel or author but gives the wake its time. Channel, author and
+ * own locus rule); else the newest channel-bearing event (a private message
+ * that names its author counts as one); else, in a window that holds only
+ * private surface messages naming no author, the newest of those. A private
+ * window's wake is as recent as its newest private message. Channel, author and
  * addressed all come from that one event, so they can never disagree.
  *
  * A window that holds a private surface's message is private, whatever else

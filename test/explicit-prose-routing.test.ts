@@ -2430,8 +2430,8 @@ describe('explicit prose routing', () => {
   }
 
   it('a deliberate envelope is delivered alike in a private turn and a channel one; only hybrid\'s unprefixed prose differs', async () => {
-    // The trigger kinds: this file's own channel-less trigger, a private
-    // surface's, and the same message with a channel.
+    // The trigger kinds: a private surface's message, and the same message
+    // with a channel.
     const cases: Array<{ mode: 'explicit' | 'hybrid'; text: string; channel: unknown[]; private: unknown[] }> = [
       { mode: 'explicit', text: '>>#cafe A message meant for the café.',
         channel: [{ text: 'A message meant for the café.', locus: 'discord:g:cafe' }],

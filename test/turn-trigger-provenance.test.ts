@@ -697,6 +697,7 @@ describe('private wins, one way', () => {
       await rig.until(() => rig.starts.length >= 2, "the room's start");
       await rig.framework.runUntilIdle();
       assert.equal(rig.starts[0]!.suppressProse, true, 'control: the first start was silent');
+      assert.equal(rig.routings[0]!.nonChannelOrigin, true, 'the silent start is private too, so its publish names its channel');
       assert.equal(rig.routings[1]!.nonChannelOrigin, true, "the room's start, the first to publish, is private");
       assert.deepEqual(rig.routed, []);
     } finally {
@@ -787,6 +788,30 @@ describe('private wins, one way', () => {
         internalsOf.eventGate.clearSleep();
         await rig.close();
       }
+    }
+  });
+
+  it("a silent turn's boundary that stores private input makes that turn private and marks the next start", async () => {
+    let framework: AgentFramework | undefined;
+    const tool = robot(() => { storeOperatorMessage(framework!); });
+    const rig = await surfaceRig({ modules: [tool] });
+    framework = rig.framework;
+    try {
+      // A mock stream takes the responses queued when it starts, so the
+      // silent turn's round after its tool has one queued too.
+      rig.membrane.pushResponse(createMockResponse([{ type: 'tool_use', id: 'm1', name: 'robot--move', input: {} }] as never, 'tool_use'));
+      rig.membrane.pushResponse(createMockResponse([{ type: 'text', text: 'tidied up' }]));
+      rig.i.pendingRequests.push({ agentName: 'scout', reason: 'heartbeat', source: 'heartbeat', timestamp: Date.now(), suppressProse: true });
+      await rig.until(() => rig.starts.length >= 1 && rig.texts().includes('for your eyes only'), "the silent turn, and the boundary's store");
+      await rig.framework.runUntilIdle();
+      assert.equal(rig.routings[0]!.nonChannelOrigin, true, 'the silent turn is private from its boundary');
+      rig.i.pendingRequests.push(roomWake());
+      await rig.until(() => rig.starts.length >= 2, "the room's start");
+      await rig.framework.runUntilIdle();
+      assert.equal(rig.routings[1]!.nonChannelOrigin, true, "the room's start, the first that can publish, is private");
+      assert.deepEqual(rig.routed, []);
+    } finally {
+      await rig.close();
     }
   });
 
