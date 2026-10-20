@@ -646,7 +646,12 @@ export class ApiServer {
       throw new Error('agentName is required');
     }
 
-    const result = this.framework.undoLastTurn(params.agentName);
+    const { settled, ...result } = this.framework.undoLastTurn(params.agentName);
+    // The store stays reserved until every agent's context manager is
+    // re-initialized for the branch it moved to. A client that answers the
+    // event by reading an agent's context compiles on that manager, which
+    // refuses until then, so the event, and this answer, wait for it.
+    await settled;
 
     if (result.undone) {
       this.broadcast('branch:switched', {
@@ -664,7 +669,9 @@ export class ApiServer {
       throw new Error('agentName is required');
     }
 
-    const result = this.framework.redo(params.agentName);
+    const { settled, ...result } = this.framework.redo(params.agentName);
+    // As for an undo (cmdUndo).
+    await settled;
 
     if (result.redone) {
       this.broadcast('branch:switched', {

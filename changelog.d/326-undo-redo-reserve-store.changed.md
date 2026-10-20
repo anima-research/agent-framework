@@ -2,7 +2,8 @@
   branch moves under every agent sharing the store, so each is refused with
   `OperatorActionError` (`agent-busy`) while any of those agents is busy,
   the one named included (that one used to throw a plain `Error`). Each
-  still returns its result at once, with the store moved. The
+  still returns its result at once, with the store moved, and its `settled`
+  says when the store is let go. The
   re-initialization of every agent's context manager finishes after the
   call returns, and the store stays reserved until it's done: a turn asked for meanwhile starts after, and a
   `rollbackToMessage()`, `suppressMessages()` or `switchBranch()` made

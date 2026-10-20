@@ -9590,11 +9590,15 @@ export class AgentFramework {
 
     const requested = Math.max(1, Math.min(20, Math.floor(params.turns ?? 1)));
     let undone = 0;
+    // Each undo after the first moves the store under the first's
+    // reservation, so they settle together.
+    let settled: Promise<void> | undefined;
     try {
       for (let i = 0; i < requested; i++) {
         const r = this.runUndoLastTurn(agentName, hostCommandRequester(serverId, params));
         if (!r.undone) break;
         undone++;
+        settled = r.settled;
       }
     } catch (error) {
       // e.g. "Cannot undo while agent is streaming" — report what happened,
@@ -9615,7 +9619,7 @@ export class AgentFramework {
 
     // The preview compiles, so it waits for the managers the undos left
     // re-initializing.
-    await this.syncMoveReinit?.done;
+    await settled;
 
     return { ok: true, undone, requested, lastVisible: await this.lastVisiblePreview(agentName) };
   }
@@ -9988,12 +9992,20 @@ export class AgentFramework {
    * (`context-reinit-failed`). An undo or redo made before the managers are
    * done moves the store again under the same reservation, and they are
    * re-initialized for the branch the last one leaves.
+   *
+   * `settled`, present when the store moved, settles once that reservation
+   * is released, every manager re-initialized or its failure alerted, and
+   * never rejects. Await it before work that needs the store free: a
+   * compile on an agent's own context manager, or a write meant to land at
+   * once, which the reservation would defer. An undo or redo that moves the
+   * store again under the same reservation settles with it.
    */
   undoLastTurn(agentName: string, requester?: OperatorRequester): {
     undone: boolean;
     turnIndex?: number;
     fromBranch?: string;
     toBranch?: string;
+    settled?: Promise<void>;
   } {
     this.refuseOperatorAfterStop('undo');
     return this.runUndoLastTurn(agentName, requester);
@@ -10006,6 +10018,7 @@ export class AgentFramework {
     turnIndex?: number;
     fromBranch?: string;
     toBranch?: string;
+    settled?: Promise<void>;
   } {
     const agent = this.agents.get(agentName);
     if (!agent) {
@@ -10044,7 +10057,7 @@ export class AgentFramework {
       }
       throw error;
     }
-    move.landed();
+    const settled = move.landed();
 
     this.materializeConfigMountAfterBranchSwitch();
 
@@ -10076,6 +10089,7 @@ export class AgentFramework {
       turnIndex: checkpoint.turnIndex,
       fromBranch: currentBranch.name,
       toBranch: undoBranchName,
+      settled,
     };
   }
 
@@ -10086,12 +10100,13 @@ export class AgentFramework {
    * Returns false if there's nothing to redo.
    *
    * It reserves the store and re-initializes every agent's context manager
-   * as undoLastTurn() does.
+   * as undoLastTurn() does, and its result's `settled` is undoLastTurn()'s.
    */
   redo(agentName: string, requester?: OperatorRequester): {
     redone: boolean;
     fromBranch?: string;
     toBranch?: string;
+    settled?: Promise<void>;
   } {
     this.refuseOperatorAfterStop('redo');
     const agent = this.agents.get(agentName);
@@ -10143,7 +10158,7 @@ export class AgentFramework {
         { cause: error },
       );
     }
-    move.landed();
+    const settled = move.landed();
 
     this.materializeConfigMountAfterBranchSwitch();
 
@@ -10169,6 +10184,7 @@ export class AgentFramework {
       redone: true,
       fromBranch: currentBranch.name,
       toBranch: branchName,
+      settled,
     };
   }
 
@@ -10483,11 +10499,12 @@ export class AgentFramework {
    * re-initializing under their reservation (syncMoveReinit): then this move
    * is made under that one. `landed()`, once the store has moved, hands a
    * reservation this call took to the re-initialization that releases it
-   * (reinitializeAfterSyncMove), or has the joined one run again. `abandon()`,
+   * (reinitializeAfterSyncMove), or has the joined one run again, and returns
+   * the promise that settles when that reservation is released. `abandon()`,
    * when the move failed before the store moved, releases a reservation this
    * call took.
    */
-  private beginSyncMove(verb: 'undo' | 'redo', agentName: string): { landed(): void; abandon(): void } {
+  private beginSyncMove(verb: 'undo' | 'redo', agentName: string): { landed(): Promise<void>; abandon(): void } {
     const running = this.syncMoveReinit;
     if (running) {
       // Under the running reservation: every agent sharing the store is idle.
@@ -10502,7 +10519,7 @@ export class AgentFramework {
         );
       }
       return {
-        landed: () => { running.again = true; running.after = verb; },
+        landed: () => { running.again = true; running.after = verb; return running.done; },
         abandon: () => {},
       };
     }
@@ -10522,9 +10539,10 @@ export class AgentFramework {
    * `again`, and the pass runs again for the branch the store is on then.
    * A manager's failure is reported from the last pass only, since an
    * earlier pass can fail because of the later move. A fork disposed in any
-   * pass is reported, since a disposal isn't undone by a later pass.
+   * pass is reported, since a disposal isn't undone by a later pass. Returns
+   * the pass's `done`.
    */
-  private reinitializeAfterSyncMove(after: 'undo' | 'redo', release: () => void): void {
+  private reinitializeAfterSyncMove(after: 'undo' | 'redo', release: () => void): Promise<void> {
     const state: SyncMoveReinit = { again: false, after, done: Promise.resolve() };
     this.syncMoveReinit = state;
     state.done = (async () => {
@@ -10554,10 +10572,12 @@ export class AgentFramework {
         release();
       }
     })().catch((error: unknown) => {
-      // Nothing awaits this: a release that throws is said here, where a
-      // surgery's caller would hear it from the surgery.
+      // A caller awaiting `settled` doesn't hear it, since that never
+      // rejects: a release that throws is said here, where a surgery's
+      // caller would hear it from the surgery.
       console.error(`[operator] releasing the store the ${state.after} reserved failed: ${boundFailureText(failureDescription(error))}`);
     });
+    return state.done;
   }
 
   /**

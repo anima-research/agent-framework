@@ -26,6 +26,7 @@ import type {
 } from '@animalabs/context-manager';
 import { AgentFramework, OperatorActionError } from '../src/index.js';
 import type { TraceEvent } from '../src/index.js';
+import { ApiServer } from '../src/api/server.js';
 import { MockMembrane, createMockResponse } from './helpers/mock-membrane.js';
 
 function autobiographical(): AutobiographicalStrategy {
@@ -56,7 +57,7 @@ const settled = () => new Promise<void>((resolve) => { setImmediate(resolve); })
 type Internals = {
   surgeryHold: { verb: string } | null;
   activeTurnTokens: Map<string, number>;
-  syncMoveReinit: { done: Promise<void> } | null;
+  syncMoveReinit: unknown;
   saveTurnCheckpoints(agentName: string, checkpoints: unknown[]): void;
   getTurnCheckpoints(agentName: string): unknown[];
   handleHostCommand(serverId: string, params: Record<string, unknown>): Promise<Record<string, unknown>>;
@@ -85,11 +86,11 @@ describe('after a branch move, every agent on the store compiles without a resta
     cmOf('a').addMessage('user', text('a turn to undo'));
     internals().saveTurnCheckpoints('a', [{ agentName: 'a', turnIndex: 1, sequenceBefore, branchName: 'main', timestamp: Date.now() }]);
   };
-  /** Wait for the re-initialization an undo or redo started; one must be running. */
-  const reinitDone = async (): Promise<void> => {
-    const running = internals().syncMoveReinit;
-    assert.ok(running, 'a re-initialization is running');
-    await running.done;
+  /** Wait for the re-initialization an undo or redo started, by the
+   *  `settled` its result carries once the store has moved. */
+  const reinitDone = async (moved: { settled?: Promise<void> }): Promise<void> => {
+    assert.ok(moved.settled, 'a move answers with the promise of its re-initialization');
+    await moved.settled;
   };
   const reinitAlerts = () => traces.filter(
     (t): t is Extract<TraceEvent, { type: 'ops:alert' }> => t.type === 'ops:alert' && t.kind === 'context-reinit-failed',
@@ -162,7 +163,7 @@ describe('after a branch move, every agent on the store compiles without a resta
     assert.equal(framework.getStore().currentBranch().name, r.toBranch, 'the store moved before the undo returned');
     assert.ok(internals().surgeryHold, 'the store stays reserved while the managers re-initialize');
     assert.deepEqual([...internals().activeTurnTokens.keys()].sort(), ['a', 'b'], 'no turn can start meanwhile');
-    await reinitDone();
+    await reinitDone(r);
     assert.equal(internals().surgeryHold, null);
     assert.equal(internals().activeTurnTokens.size, 0, 'the reservation is released');
     await works('a');
@@ -171,13 +172,12 @@ describe('after a branch move, every agent on the store compiles without a resta
 
   it('redo(): both compile once the store is released', async () => {
     checkpointTurn();
-    framework.undoLastTurn('a');
-    await reinitDone();
+    await reinitDone(framework.undoLastTurn('a'));
     const r = framework.redo('a');
     assert.equal(r.redone, true);
     assert.equal(framework.getStore().currentBranch().name, 'main');
     assert.ok(internals().surgeryHold);
-    await reinitDone();
+    await reinitDone(r);
     assert.equal(internals().activeTurnTokens.size, 0);
     await works('a');
     await works('b');
@@ -196,12 +196,41 @@ describe('after a branch move, every agent on the store compiles without a resta
       framework.rollbackToMessage('a', { messageId: firstId }),
       (e: unknown) => e instanceof OperatorActionError && e.code === 'agent-busy' && /live undo for a/.test(e.message),
     );
-    await reinitDone();
+    assert.equal(redone.settled, undone.settled, "the redo moves the store under the undo's reservation, and settles with it");
+    await reinitDone(redone);
     assert.equal(internals().syncMoveReinit, null);
     assert.equal(internals().activeTurnTokens.size, 0);
     await works('a');
     await works('b');
     assert.deepEqual(reinitAlerts(), [], 'the pass the redo overtook is not reported');
+  });
+
+  it("the API server's undo and redo tell clients of the move once every manager is current, so a client that reads an agent's context then gets it", async () => {
+    checkpointTurn();
+    const api = new ApiServer(framework) as unknown as {
+      cmdUndo(params: { agentName: string }): Promise<Record<string, unknown>>;
+      cmdRedo(params: { agentName: string }): Promise<Record<string, unknown>>;
+      cmdAgentContext(params: { agentName: string }): Promise<{ context: unknown[] }>;
+      broadcast(event: string, data: unknown): void;
+    };
+    // A client that answers each move by reading the other agent's context,
+    // which compiles on that agent's own manager.
+    const held: boolean[] = [];
+    const reads: Array<Promise<{ context: unknown[] }>> = [];
+    api.broadcast = (event) => {
+      if (event !== 'branch:switched') return;
+      held.push(internals().surgeryHold !== null);
+      reads.push(api.cmdAgentContext({ agentName: 'b' }));
+    };
+    const undone = await api.cmdUndo({ agentName: 'a' });
+    assert.equal(undone.undone, true);
+    assert.ok(!('settled' in undone), `the answer carries no promise: ${Object.keys(undone).join(', ')}`);
+    const redone = await api.cmdRedo({ agentName: 'a' });
+    assert.equal(redone.redone, true);
+    assert.ok(!('settled' in redone), `the answer carries no promise: ${Object.keys(redone).join(', ')}`);
+    assert.deepEqual(held, [false, false], 'each event goes once the store is let go');
+    for (const read of await Promise.all(reads)) assert.ok(read.context.length > 0, "b's context compiled");
+    assert.deepEqual(reinitAlerts(), []);
   });
 
   it('a host/command turn undo answers with the preview, compiled once the managers are current', async () => {
@@ -227,8 +256,7 @@ describe('after a branch move, every agent on the store compiles without a resta
     } finally {
       internals().activeTurnTokens.delete('b');
     }
-    framework.undoLastTurn('a');
-    await reinitDone();
+    await reinitDone(framework.undoLastTurn('a'));
     internals().activeTurnTokens.set('b', 7);
     try {
       assert.throws(
@@ -287,10 +315,11 @@ describe('after a branch move, every agent on the store compiles without a resta
       .flatMap((m) => m.content)
       .flatMap((block) => (block.type === 'text' ? [block.text] : []));
 
-    assert.equal(framework.undoLastTurn('a').undone, true);
+    const undone = framework.undoLastTurn('a');
+    assert.equal(undone.undone, true);
     assert.ok(internals().surgeryHold, 'the undo holds the store while the managers re-initialize');
     assert.equal(queue.addMessage('user', text(held), undefined, { forAgent: 'b' }), '', 'deferred, not stored');
-    await reinitDone();
+    await reinitDone(undone);
     assert.deepEqual(reinitAlerts().map((alert) => alert.agentName), ['b']);
     assert.equal(internals().surgeryHold, null, 'the store is released');
     assert.deepEqual(queue.deferredMessages.map((m) => m.forAgent), ['b'], 'still queued for b after the release');
@@ -323,6 +352,7 @@ describe('after a branch move, every agent on the store compiles without a resta
     await works('a');
     await works('b');
   });
+
   it('a failed undo or redo leaves the store where it was, released, with its turn kept (createBranchAt and switchBranch throwing)', async () => {
     checkpointTurn();
     const store = framework.getStore() as unknown as { createBranchAt: (...args: unknown[]) => unknown; switchBranch: (name: string) => void };
@@ -338,8 +368,7 @@ describe('after a branch move, every agent on the store compiles without a resta
     assert.equal(internals().getTurnCheckpoints('a').length, 1, 'the checkpoint is kept');
     assert.equal(framework.getStore().currentBranch().name, 'main');
 
-    framework.undoLastTurn('a');
-    await reinitDone();
+    await reinitDone(framework.undoLastTurn('a'));
     const switchBranch = store.switchBranch;
     store.switchBranch = () => { throw new Error('injected switch failure'); };
     try {
@@ -352,7 +381,7 @@ describe('after a branch move, every agent on the store compiles without a resta
     assert.equal(framework.getUndoRedoState('a').redoDepth, 1, 'the redo entry is kept');
     const redone = framework.redo('a');
     assert.equal(redone.redone, true);
-    await reinitDone();
+    await reinitDone(redone);
   });
 
   for (const move of ['undo', 'branch switch', 'suppression'] as const) {
@@ -366,8 +395,7 @@ describe('after a branch move, every agent on the store compiles without a resta
       };
       if (move === 'undo') {
         checkpointTurn();
-        framework.undoLastTurn('a');
-        await reinitDone();
+        await reinitDone(framework.undoLastTurn('a'));
       } else if (move === 'branch switch') {
         const store = framework.getStore();
         store.createBranchAt('side', 'main', store.currentSequence());
@@ -396,8 +424,7 @@ describe('after a branch move, every agent on the store compiles without a resta
     };
     checkpointTurn();
     framework.undoLastTurn('a');
-    framework.redo('a');
-    await reinitDone();
+    await reinitDone(framework.redo('a'));
     assert.deepEqual(reinitAlerts(), [], 'the overtaken pass is not reported');
     await works('b');
 
@@ -408,8 +435,7 @@ describe('after a branch move, every agent on the store compiles without a resta
       return initialize(...args);
     };
     framework.undoLastTurn('a');
-    framework.redo('a');
-    await reinitDone();
+    await reinitDone(framework.redo('a'));
     failAll = false;
     const alerts = reinitAlerts();
     assert.equal(alerts.length, 1, JSON.stringify(alerts));
@@ -443,24 +469,23 @@ describe('after a branch move, every agent on the store compiles without a resta
 
   it("stop() waits for an undo's re-initialization before the store closes", async () => {
     checkpointTurn();
-    framework.undoLastTurn('a');
-    const running = internals().syncMoveReinit;
-    assert.ok(running);
+    const undone = framework.undoLastTurn('a');
+    assert.ok(undone.settled);
     let reinitEnded = false;
-    void running.done.then(() => { reinitEnded = true; });
+    void undone.settled.then(() => { reinitEnded = true; });
     await framework.stop();
     assert.equal(reinitEnded, true, 'the re-initialization finished before stop() returned');
   });
 
   it('a turn asked for while the managers re-initialize starts once the store is let go', async () => {
     checkpointTurn();
-    framework.undoLastTurn('a');
+    const undone = framework.undoLastTurn('a');
     membrane.pushResponse(createMockResponse([{ type: 'text', text: 'b answers after the undo' }]));
     framework.nudgeAgent('b', 'test');
     const run = framework.runUntilIdle();
     assert.ok(internals().surgeryHold, 'still reserved');
     assert.equal(membrane.calls.length, 0, 'no turn starts while the managers re-initialize');
-    await reinitDone();
+    await reinitDone(undone);
     await run;
     await framework.runUntilIdle();
     assert.equal(membrane.calls.length, 1, 'the turn ran once the store was let go');
@@ -501,7 +526,7 @@ describe('after a branch move, every agent on the store compiles without a resta
     } finally {
       idle();
     }
-    framework.undoLastTurn('a');
+    const undone = framework.undoLastTurn('a');
     idle = busy('b');
     try {
       assert.throws(
@@ -511,7 +536,7 @@ describe('after a branch move, every agent on the store compiles without a resta
     } finally {
       idle();
     }
-    await reinitDone();
+    await reinitDone(undone);
   });
 
   it("an undo's re-initialization waits for maintenance already running before any manager re-initializes", async () => {
@@ -527,13 +552,13 @@ describe('after a branch move, every agent on the store compiles without a resta
       cm.setStrategy = (strategy: unknown) => { calls.push(name); return setStrategy(strategy); };
     }
     try {
-      framework.undoLastTurn('a');
+      const undone = framework.undoLastTurn('a');
       await settled();
       assert.ok(waited(), 'the re-initialization is waiting on the pass');
       assert.deepEqual(calls, [], 'no manager re-initializes while the pass runs');
       settle();
       fw.maintenancePass = null;
-      await reinitDone();
+      await reinitDone(undone);
       assert.deepEqual(calls.sort(), ['a', 'b']);
     } finally {
       settle();
@@ -551,13 +576,13 @@ describe('after a branch move, every agent on the store compiles without a resta
       const setStrategy = cm.setStrategy.bind(cm);
       cm.setStrategy = (strategy: unknown) => { calls.push(name); return setStrategy(strategy); };
     }
-    framework.undoLastTurn('a');
+    const undone = framework.undoLastTurn('a');
     assert.deepEqual(calls, [], 'no manager re-initializes inside undoLastTurn()');
     // An immediate queued now runs on the event loop's next turn: before the
     // last manager re-initializes, since each waits for a turn of its own.
     const before = await new Promise<number>((resolve) => { setImmediate(() => resolve(calls.length)); });
     assert.ok(before < 2, `the event loop ran while the managers re-initialized (${before} of 2 had when it did)`);
-    await reinitDone();
+    await reinitDone(undone);
     assert.deepEqual(calls.sort(), ['a', 'b']);
     await works('a');
     await works('b');
@@ -575,13 +600,13 @@ describe('after a branch move, every agent on the store compiles without a resta
       cm.setStrategy = (strategy: unknown) => { calls.push(name); return setStrategy(strategy); };
     }
     try {
-      framework.undoLastTurn('a');
+      const undone = framework.undoLastTurn('a');
       await settled();
       assert.ok(waited(), 'the re-initialization is waiting on the kick');
       assert.deepEqual(calls, [], 'no manager re-initializes while the kick runs');
       settle();
       drains.delete(kick);
-      await reinitDone();
+      await reinitDone(undone);
       assert.deepEqual(calls.sort(), ['a', 'b']);
     } finally {
       settle();
@@ -704,11 +729,9 @@ describe('after a branch move, every agent on the store compiles without a resta
     const before2 = store.currentSequence();
     internals().saveTurnCheckpoints('a', [turn1, { agentName: 'a', turnIndex: 2, sequenceBefore: before2, branchName: 'main', timestamp: Date.now() }]);
     cmOf('a').addMessage('user', text('turn two'));
-    framework.undoLastTurn('a');
-    await reinitDone();
+    await reinitDone(framework.undoLastTurn('a'));
     const afterFirstUndo = store.currentBranch().name;
-    framework.undoLastTurn('a');
-    await reinitDone();
+    await reinitDone(framework.undoLastTurn('a'));
     const afterSecondUndo = store.currentBranch().name;
     assert.equal(framework.getUndoRedoState('a').redoDepth, 2);
     // The top entry returns to the branch the first undo left; delete it.
@@ -745,7 +768,7 @@ describe('after a branch move, every agent on the store compiles without a resta
 
     const redone = framework.redo('a');
     assert.equal(redone.redone, true, 'the step beneath it redoes');
-    await reinitDone();
+    await reinitDone(redone);
     assert.equal(store.currentBranch().name, 'main');
     await works('a');
     await works('b');
@@ -753,8 +776,7 @@ describe('after a branch move, every agent on the store compiles without a resta
 
   it("a redo whose switch fails while the branch listing fails too keeps its step, and answers the switch's error", async () => {
     checkpointTurn();
-    framework.undoLastTurn('a');
-    await reinitDone();
+    await reinitDone(framework.undoLastTurn('a'));
     assert.equal(framework.getUndoRedoState('a').redoDepth, 1);
     const store = framework.getStore() as unknown as { switchBranch: (name: string) => void; listBranches: () => unknown };
     const switchBranch = store.switchBranch;
@@ -769,8 +791,9 @@ describe('after a branch move, every agent on the store compiles without a resta
     }
     assert.equal(framework.getUndoRedoState('a').redoDepth, 1, 'the step is kept');
     assert.equal(internals().surgeryHold, null);
-    assert.equal(framework.redo('a').redone, true);
-    await reinitDone();
+    const redone = framework.redo('a');
+    assert.equal(redone.redone, true);
+    await reinitDone(redone);
     await works('a');
     await works('b');
   });
@@ -778,14 +801,14 @@ describe('after a branch move, every agent on the store compiles without a resta
   it("a runtime-settings change while an undo's managers re-initialize is refused, and nothing is applied", async () => {
     checkpointTurn();
     const before = framework.getAgentRuntimeSettings('b');
-    framework.undoLastTurn('a');
+    const undone = framework.undoLastTurn('a');
     assert.ok(internals().syncMoveReinit, 'the re-initialization is running');
     const next = before.sameRoundThinkTextPolicy === 'private' ? 'public' : 'private';
     assert.throws(
       () => framework.updateAgentRuntimeSettings('b', { sameRoundThinkTextPolicy: next }),
       (e: unknown) => e instanceof OperatorActionError && e.code === 'agent-busy' && /nothing was changed/.test(e.message),
     );
-    await reinitDone();
+    await reinitDone(undone);
     assert.equal(framework.getAgentRuntimeSettings('b').sameRoundThinkTextPolicy, before.sameRoundThinkTextPolicy);
     // Once the store is let go, the same change applies.
     assert.equal(framework.updateAgentRuntimeSettings('b', { sameRoundThinkTextPolicy: next }).sameRoundThinkTextPolicy, next);
@@ -796,7 +819,7 @@ describe('after a branch move, every agent on the store compiles without a resta
     const next = before.sameRoundThinkTextPolicy === 'private' ? 'public' : 'private';
     framework.updateAgentRuntimeSettings('b', { sameRoundThinkTextPolicy: next });
     checkpointTurn();
-    framework.undoLastTurn('a');
+    const undone = framework.undoLastTurn('a');
     assert.ok(internals().syncMoveReinit, 'the re-initialization is running');
     assert.throws(
       () => framework.resetAgentRuntimeSettings('b'),
@@ -806,7 +829,7 @@ describe('after a branch move, every agent on the store compiles without a resta
       () => framework.cancelAgentRuntimeSettingsTransition('b'),
       (e: unknown) => e instanceof OperatorActionError && e.code === 'agent-busy' && /nothing was changed/.test(e.message),
     );
-    await reinitDone();
+    await reinitDone(undone);
     assert.equal(framework.getAgentRuntimeSettings('b').sameRoundThinkTextPolicy, next, 'the override is still set');
     assert.equal(framework.resetAgentRuntimeSettings('b').sameRoundThinkTextPolicy, before.sameRoundThinkTextPolicy);
   });
@@ -840,7 +863,7 @@ describe('after a branch move, every agent on the store compiles without a resta
       }
     });
     const undone = framework.undoLastTurn('a');
-    await reinitDone();
+    await reinitDone(undone);
     assert.ok(
       redo instanceof OperatorActionError && redo.code === 'agent-busy' && /Cannot redo: the store is under live undo for a/.test(redo.message),
       `the redo was refused: ${redo instanceof Error ? redo.message : JSON.stringify(redo)}`,
@@ -962,8 +985,9 @@ describe('conversation forks and an undo', () => {
       await forksAroundACheckpoint(framework, internals);
       const router = framework.getConversationRouter()!;
 
-      assert.equal(framework.undoLastTurn('a').undone, true);
-      await internals.syncMoveReinit!.done;
+      const undo = framework.undoLastTurn('a');
+      assert.equal(undo.undone, true);
+      await undo.settled;
       assert.equal(router.getBinding('world:late')?.agentName, 'a-late-g1', 'the fork stays, bound to its channel');
       const late = await textsOf(framework, 'a-late-g1');
       assert.equal(count(late, 'hello a'), 1, `seeded again from the template's compile on this branch: ${JSON.stringify(late)}`);
@@ -978,8 +1002,9 @@ describe('conversation forks and an undo', () => {
       assert.equal(mark?.branch, framework.getStore().currentBranch().name, `the consumed mark is on the branch the undo landed on: ${JSON.stringify(mark)}`);
       assert.ok(mark !== null && mark.sequence >= lastSeeded, `the consumed mark covers the seeded copies: ${JSON.stringify(mark)}, last seeded ${lastSeeded}`);
 
-      assert.equal(framework.redo('a').redone, true);
-      await internals.syncMoveReinit!.done;
+      const redo = framework.redo('a');
+      assert.equal(redo.redone, true);
+      await redo.settled;
       const redone = await textsOf(framework, 'a-late-g1');
       assert.ok(redone.includes('late own') && redone.includes('a turn to undo'), `the redo brings back its own history: ${JSON.stringify(redone)}`);
       assert.equal(count(redone, 'hello a'), 1, `and seeds nothing over it: ${JSON.stringify(redone)}`);
@@ -1025,8 +1050,9 @@ describe('conversation forks and an undo', () => {
       const compile = cmA.compile.bind(cmA);
       (cmA as unknown as { compile: () => Promise<never> }).compile = async () => { throw new Error('injected template compile failure'); };
       try {
-        assert.equal(framework.undoLastTurn('a').undone, true);
-        await internals.syncMoveReinit!.done;
+        const undo = framework.undoLastTurn('a');
+        assert.equal(undo.undone, true);
+        await undo.settled;
       } finally {
         (cmA as unknown as { compile: typeof compile }).compile = compile;
       }
@@ -1069,8 +1095,9 @@ describe('conversation forks and an undo', () => {
         return releaseWindow.call(this, agent);
       };
       try {
-        assert.equal(framework.undoLastTurn('a').undone, true);
-        await internals.syncMoveReinit!.done;
+        const undo = framework.undoLastTurn('a');
+        assert.equal(undo.undone, true);
+        await undo.settled;
       } finally {
         released.releaseWindow = releaseWindow;
       }
@@ -1121,8 +1148,9 @@ describe('conversation forks and an undo', () => {
         (cmA as unknown as { compile: typeof compile }).compile = compile;
       }
       await spawning;
-      assert.equal(framework.undoLastTurn('a').undone, true);
-      await internals.syncMoveReinit!.done;
+      const undo = framework.undoLastTurn('a');
+      assert.equal(undo.undone, true);
+      await undo.settled;
       await textsOf(framework, 'a-chan-g1');
     });
   });
@@ -1141,8 +1169,9 @@ describe('conversation forks and an undo', () => {
       } finally {
         (cmA as unknown as { compile: typeof compile }).compile = compile;
       }
-      assert.equal(framework.undoLastTurn('a').undone, true, 'not refused as a fork being created');
-      await internals.syncMoveReinit!.done;
+      const undo = framework.undoLastTurn('a');
+      assert.equal(undo.undone, true, 'not refused as a fork being created');
+      await undo.settled;
     });
   });
 
@@ -1199,12 +1228,14 @@ describe('conversation forks and an undo', () => {
         });
         const held = holdTemplateCompile(framework, [joined.call]);
         try {
-          assert.equal(framework.undoLastTurn('a').undone, true);
-          const running = internals.syncMoveReinit!;
+          const undo = framework.undoLastTurn('a');
+          assert.equal(undo.undone, true);
           await held.reached; // the pass is seeding a-late-g1, inside the template's compile
-          assert.equal(framework.redo('a').redone, true, 'the redo joins the running re-initialization');
+          const redo = framework.redo('a');
+          assert.equal(redo.redone, true, 'the redo joins the running re-initialization');
+          assert.equal(redo.settled, undo.settled, 'and settles with it');
           held.release({ throws: joined.throws });
-          await running.done;
+          await redo.settled;
         } finally {
           held.restore();
         }
@@ -1232,12 +1263,13 @@ describe('conversation forks and an undo', () => {
       // a-late-g1's seed fails; a-late2-g1's is held while a redo joins.
       const held = holdTemplateCompile(framework, ['throw', 'hold']);
       try {
-        assert.equal(framework.undoLastTurn('a').undone, true);
-        const running = internals.syncMoveReinit!;
+        const undo = framework.undoLastTurn('a');
+        assert.equal(undo.undone, true);
         await held.reached;
-        assert.equal(framework.redo('a').redone, true);
+        const redo = framework.redo('a');
+        assert.equal(redo.redone, true);
         held.release();
-        await running.done;
+        await redo.settled;
       } finally {
         held.restore();
       }
@@ -1264,8 +1296,9 @@ describe('conversation forks and an undo', () => {
       const initialize = strategy.initialize.bind(strategy);
       strategy.initialize = async () => { throw new Error('injected template init failure'); };
       try {
-        assert.equal(framework.undoLastTurn('a').undone, true);
-        await internals.syncMoveReinit!.done;
+        const undo = framework.undoLastTurn('a');
+        assert.equal(undo.undone, true);
+        await undo.settled;
       } finally {
         strategy.initialize = initialize;
       }
@@ -1323,12 +1356,13 @@ describe('conversation forks and an undo', () => {
       // a-late-g1's comes after the second undo has joined, and the pass
       // judges it, rather than skipping it as failed.
       try {
-        assert.equal(framework.undoLastTurn('a').undone, true, 'the first undo keeps a-late-g1 its history');
-        const running = internals.syncMoveReinit!;
+        const first = framework.undoLastTurn('a');
+        assert.equal(first.undone, true, 'the first undo keeps a-late-g1 its history');
         await reached; // the first pass is re-initializing the template
-        assert.equal(framework.undoLastTurn('a').undone, true, 'the second undo joins, to before a-late-g1 was spawned');
+        const second = framework.undoLastTurn('a');
+        assert.equal(second.undone, true, 'the second undo joins, to before a-late-g1 was spawned');
         release();
-        await running.done;
+        await second.settled;
       } finally {
         strategy.initialize = initialize;
       }
@@ -1407,8 +1441,9 @@ describe('conversation forks and an undo', () => {
           return { ...(await compile(...args)), messages: [] };
         };
         try {
-          assert.equal(framework.undoLastTurn('a').undone, true);
-          await internals.syncMoveReinit!.done;
+          const undo = framework.undoLastTurn('a');
+          assert.equal(undo.undone, true);
+          await undo.settled;
         } finally {
           (early as unknown as { compile: typeof compile }).compile = compile;
         }
@@ -1445,7 +1480,8 @@ describe('conversation forks and an undo', () => {
     .filter((b): b is { type: 'text'; text: string } => (b as { type: string }).type === 'text')
     .map((b) => b.text);
   /** Hold a maintenance pass across `move()`, run `during()` while the move
-   *  waits for it, then let it go and wait for the move to finish. */
+   *  waits for it, then let it go and wait for the move to finish, its
+   *  managers' re-initialization included. */
   const duringMaintenanceWait = async (internals: HoldInternals, move: () => Promise<unknown>, during: () => Promise<void>): Promise<void> => {
     const { promise: pass, settle, waited } = watchedPromise();
     internals.maintenancePass = pass;
@@ -1460,7 +1496,6 @@ describe('conversation forks and an undo', () => {
       internals.maintenancePass = null;
     }
     await moved;
-    await internals.syncMoveReinit?.done;
   };
 
   it("while an undo waits for running maintenance, a fork's channel message and a correction for it are deferred, and land after it's seeded again", { timeout: 30_000 }, async () => {
@@ -1472,7 +1507,11 @@ describe('conversation forks and an undo', () => {
       framework.onTrace((event) => {
         if (event.type === 'message:added') added.push(event as unknown as { messageId: string; source: string });
       });
-      await duringMaintenanceWait(internals, async () => assert.equal(framework.undoLastTurn('a').undone, true), async () => {
+      await duringMaintenanceWait(internals, async () => {
+        const undo = framework.undoLastTurn('a');
+        assert.equal(undo.undone, true);
+        await undo.settled;
+      }, async () => {
         placements.push(await internals.handleMcplChannelIncoming(channelMessage('world:late', 'MESSAGE DURING THE UNDO')));
         placements.push(await internals.handleMcplChannelIncoming(channelMessage('world:late', 'CORRECTION DURING THE UNDO', { deliverTo: 'a-late-g1' })));
         for (const placement of placements) {
@@ -1502,7 +1541,11 @@ describe('conversation forks and an undo', () => {
       const internals = forkInternals as unknown as HoldInternals;
       const early = framework.getAgent('a-early-g1')!.getContextManager();
       let target: { id: string; text: string } | undefined;
-      await duringMaintenanceWait(internals, async () => assert.equal(framework.undoLastTurn('a').undone, true), async () => {
+      await duringMaintenanceWait(internals, async () => {
+        const undo = framework.undoLastTurn('a');
+        assert.equal(undo.undone, true);
+        await undo.settled;
+      }, async () => {
         const message = early.getAllMessages().at(-1)!;
         target = { id: message.id, text: storedTexts(early).at(-1)! };
         assert.equal(internals.removePlacement({ agent: 'a-early-g1', messageId: message.id }), false,
@@ -1520,7 +1563,11 @@ describe('conversation forks and an undo', () => {
       const internals = forkInternals as unknown as HoldInternals;
       const late = framework.getAgent('a-late-g1')!.getContextManager();
       const prompt = framework.getConversationRouter()!.closurePrompt;
-      await duringMaintenanceWait(internals, async () => assert.equal(framework.undoLastTurn('a').undone, true), async () => {
+      await duringMaintenanceWait(internals, async () => {
+        const undo = framework.undoLastTurn('a');
+        assert.equal(undo.undone, true);
+        await undo.settled;
+      }, async () => {
         framework.getConversationRouter()!.getBinding('world:late')!.lastActivity = 0;
         internals.lastConversationSweep = 0;
         internals.sweepExpiredConversations();
@@ -1566,8 +1613,9 @@ describe('conversation forks and an undo', () => {
         return compiled;
       };
       try {
-        assert.equal(framework.undoLastTurn('a').undone, true);
-        await forkInternals.syncMoveReinit!.done;
+        const undo = framework.undoLastTurn('a');
+        assert.equal(undo.undone, true);
+        await undo.settled;
       } finally {
         (cmA as unknown as { compile: typeof compile }).compile = compile;
       }
@@ -1634,7 +1682,6 @@ describe('an undo or redo while a maintenance call waits at the provider gate', 
       const internals = framework as unknown as {
         providerGate(name: string): { primaryPending: boolean; auxiliaryWaiters: Array<() => void> };
         surgeryHold: unknown;
-        syncMoveReinit: { done: Promise<void> } | null;
         saveTurnCheckpoints(agentName: string, checkpoints: unknown[]): void;
       };
       const gate = () => internals.providerGate('agent');
@@ -1645,16 +1692,15 @@ describe('an undo or redo while a maintenance call waits at the provider gate', 
       internals.saveTurnCheckpoints('agent', [{ agentName: 'agent', turnIndex: 1, sequenceBefore, branchName: 'main', timestamp: Date.now() }]);
       // Park a maintenance call at the gate, then make the move: its
       // re-initialization waits for the running pass, which the withdrawal ends.
-      const parkThen = async (label: string, move: () => unknown): Promise<void> => {
+      const parkThen = async (label: string, move: () => { settled?: Promise<void> }): Promise<void> => {
         gate().primaryPending = false;
         strategy.armed = true;
         await waitParked();
-        move();
-        const running = internals.syncMoveReinit;
-        assert.ok(running, `${label}: a re-initialization is running`);
+        const moved = move();
+        assert.ok(moved.settled, `${label}: a re-initialization is running`);
         // No clock bounds a correct re-initialization here: a hang fails at
         // the test's own timeout, which names the test.
-        await running.done;
+        await moved.settled;
         assert.equal(internals.surgeryHold, null, `${label}: the store is released`);
       };
       const waitParked = async () => {
@@ -1744,7 +1790,6 @@ describe('an undo while a maintenance tick runs', () => {
       (framework as unknown as { opsAlert: (kind: string, agentName: string, message: string) => void }).opsAlert =
         (kind, agentName, message) => alerts.push(`${kind}:${agentName}:${message}`);
       const internals = framework as unknown as {
-        syncMoveReinit: { done: Promise<void> } | null;
         saveTurnCheckpoints(agentName: string, checkpoints: unknown[]): void;
       };
       const cmA = framework.getAgent('a')!.getContextManager();
@@ -1764,13 +1809,13 @@ describe('an undo while a maintenance tick runs', () => {
           if (Date.now() - start > 8_000) throw new Error("b's tick never started");
           await new Promise((resolve) => setTimeout(resolve, 5));
         }
-        assert.equal(framework.undoLastTurn('a').undone, true);
-        const running = internals.syncMoveReinit;
-        assert.ok(running, 'a re-initialization is running');
+        const undo = framework.undoLastTurn('a');
+        assert.equal(undo.undone, true);
+        assert.ok(undo.settled, 'a re-initialization is running');
         // The move leaves b's manager on the old generation until its pass.
         gated.stale = true;
         gated.release!();
-        await running.done;
+        await undo.settled;
         assert.deepEqual(alerts.filter((alert) => alert.startsWith('context-maintenance-failed')), []);
         if (where === 'a provider failure in the tick') {
           assert.ok(logged.some((line) => /agent=b stopped: an undo moved the store under the tick: provider exploded/.test(line)), logged.join('\n'));
