@@ -817,12 +817,26 @@ test('start, with each root holding a lettered name, lists no directory above a 
   workspace.initStore(store);
   t.after(async () => { await workspace.stop(); store.close(); rmSync(root, { recursive: true, force: true }); });
   const { listed, looked } = await recordingReads(() => workspace.start({ isRestart: false, getState: () => null, setState: () => {}, pushEvent: () => {} } as unknown as ModuleContext));
+  // Each recorded path is compared where it lies, since start reads some
+  // through the configured paths and some through the real ones, which
+  // differ where the temporary directory is reached through a link, as
+  // macOS's /var is. A listed directory lies where it leads, as readdir
+  // follows it; a looked-up name lies in its directory, as lstat doesn't.
+  const realOf = (path: string): string => {
+    try {
+      return realpathSync(path);
+    } catch {
+      return join(realOf(dirname(path)), basename(path));
+    }
+  };
+  const lookedAt = (path: string): string => join(realOf(dirname(path)), basename(path));
   const real = realpathSync(dir);
   const above = (path: string) => real !== path && real.startsWith(path.endsWith(sep) ? path : path + sep);
-  assert.deepEqual(listed.filter(above), [], 'no directory above a root is listed');
+  assert.deepEqual(listed.map(realOf).filter(above), [], 'no directory above a root is listed');
   const onPaths = (path: string) => above(path) || path === real || path.startsWith(real + sep);
   const flipped = (path: string) => join(dirname(path), [...basename(path)].map((c) => (/[a-z]/.test(c) ? c.toUpperCase() : /[A-Z]/.test(c) ? c.toLowerCase() : c)).join(''));
-  assert.deepEqual(looked.filter((path) => !onPaths(path) && !onPaths(flipped(path)) && !path.startsWith(join(root, 'store'))), [], 'nothing beside the paths is looked up');
+  const storeReal = realOf(join(root, 'store'));
+  assert.deepEqual(looked.map(lookedAt).filter((path) => !onPaths(path) && !onPaths(flipped(path)) && !path.startsWith(storeReal)), [], 'nothing beside the paths is looked up');
 });
 
 /** Run `fn` with node:fs/promises' lstat wrapped by `wrap`, as the module under test sees it. */
