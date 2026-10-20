@@ -2228,6 +2228,88 @@ describe('held drafts: exact runs, hybrid envelopes beside a send, and turn-end 
     }
   });
 
+  // The fallback's count is the XML path's alone: a native turn whose
+  // completion carries the whole turn's content counts its private round once,
+  // as routeRound did when the round ended.
+  it('native mode: a private think beside a send is counted once, though the completion carries the whole turn', async () => {
+    const h = await harness({ agents: [{ name: 'scout', sameRoundThinkTextPolicy: 'private' }] });
+    try {
+      const round = [text('Prose beside think.'), call('t1', 'think', { content: 'hmm' }), explicitSend('s1')];
+      await h.turn([
+        createMockResponse(round, 'tool_use'),
+        { ...createMockResponse(round), toolCalls: [] },
+      ]);
+      assert.deepEqual(h.drafts(), [], 'never drafted');
+      assert.equal(h.texts().filter((t) => t.startsWith('[delivered]')).at(-1),
+        '[delivered] nothing — 1 plain-speech segment(s) kept private (skip_reply or a private think)');
+    } finally {
+      await h.close();
+    }
+  });
+
+  // routeRound counts a private round by whether the turn was silenced as that
+  // round ended, so a send in a later round leaves it uncounted on both paths.
+  for (const xml of [false, true]) {
+    it(`${xml ? 'XML tool mode' : 'native mode'}: a private think's round before a send in a later round is counted nowhere`, async () => {
+      const h = await harness({ xml, agents: [{ name: 'scout', sameRoundThinkTextPolicy: 'private' }] });
+      try {
+        const done = (id: string) => ({ type: 'tool_result', toolUseId: id, content: 'done', isError: false }) as ContentBlock;
+        const thinkRound = [text('Prose beside think.'), call('t1', 'think', { content: 'hmm' })];
+        await h.turn([
+          createMockResponse(thinkRound, 'tool_use'),
+          createMockResponse([explicitSend('s1')], 'tool_use'),
+          xml
+            ? { ...createMockResponse([...thinkRound, done('t1'), explicitSend('s1'), done('s1')]), toolCalls: [] }
+            : createMockResponse([]),
+        ]);
+        assert.deepEqual(h.drafts(), [], 'never drafted');
+        assert.deepEqual(h.publishes().map((p) => p.text), ['an explicit note elsewhere']);
+        const receipts = h.texts().filter((t) => t.startsWith('[delivered]'));
+        assert.ok(!receipts.some((t) => t.includes('kept private')), `no kept-private count: ${JSON.stringify(receipts)}`);
+      } finally {
+        await h.close();
+      }
+    });
+  }
+
+  // routeRound only logs an unsilenced private-think round's prose: it counts
+  // nothing, so no receipt line says it was kept private.
+  it('XML tool mode: a private think in a turn nothing silences is withheld and counted nowhere, as in native mode', async () => {
+    const h = await harness({ xml: true, agents: [{ name: 'scout', sameRoundThinkTextPolicy: 'private' }] });
+    try {
+      const round = [text('Prose beside think.'), call('t1', 'think', { content: 'hmm' })];
+      await h.turn([
+        createMockResponse(round, 'tool_use'),
+        { ...createMockResponse([...round, { type: 'tool_result', toolUseId: 't1', content: 'ok' } as unknown as ContentBlock, text('After the think.')]), toolCalls: [] },
+      ]);
+      assert.deepEqual(h.drafts(), [], 'never drafted');
+      const receipts = h.texts().filter((t) => t.startsWith('[delivered]'));
+      assert.ok(!receipts.some((t) => t.includes('kept private')), `no kept-private count: ${JSON.stringify(receipts)}`);
+    } finally {
+      await h.close();
+    }
+  });
+
+  // Under disabled routing, routeRound records a private-think round's prose
+  // as suppressed before it looks at the policy, so the fallback does too, and
+  // only the withheld round's segment joins the trailing one.
+  it('XML tool mode, proseRouting disabled: the prose beside a private think counts as kept in the transcript, as in native mode', async () => {
+    const h = await harness({ xml: true, agents: [{ name: 'scout', proseRouting: 'disabled', sameRoundThinkTextPolicy: 'private' }] });
+    try {
+      const round = [text('Prose beside think.'), call('t1', 'think', { content: 'hmm' })];
+      await h.turn([
+        createMockResponse(round, 'tool_use'),
+        { ...createMockResponse([...round, { type: 'tool_result', toolUseId: 't1', content: 'ok' } as unknown as ContentBlock, text('After the think.')]), toolCalls: [] },
+      ]);
+      const receipts = h.texts().filter((t) => t.startsWith('[delivered]'));
+      assert.ok(receipts.some((t) => t.includes('2 plain-speech segment(s) kept in the transcript (proseRouting=disabled')),
+        `both segments counted once, as suppressed: ${JSON.stringify(receipts)}`);
+      assert.ok(!receipts.some((t) => t.includes('kept private')), 'and none as kept private');
+    } finally {
+      await h.close();
+    }
+  });
+
   for (const mode of ['locus', 'hybrid'] as const) {
     it(`${mode}: prose around an all-refused XML attempt posts as two messages`, async () => {
       const h = await harness({ agents: [{ name: 'scout', proseRouting: mode }] });

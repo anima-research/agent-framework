@@ -41,8 +41,8 @@
   the fallback without `roundContent`, as in XML tool mode, an inner
   call counts only as a direct one does there. Nothing is routed until the
   turn ends, so a silencing send holds the whole turn's prose as drafts,
-  the rounds before it included. The private `think` hold and an explicit
-  round's `skip_reply` don't apply there (#307).
+  the rounds before it included. An explicit round's `skip_reply` doesn't
+  apply there (#307).
 - A round whose script can change its routing waits for the script, and its
   prose goes out when the script finishes. A script can change it when its
   code names a tool whose call changes the round's routing in the turn's

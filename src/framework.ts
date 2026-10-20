@@ -5828,7 +5828,7 @@ export class AgentFramework {
         'Reason privately. The think({content}) argument stays in your own context and is NOT sent ' +
         'to channels or other surfaces. ' +
         (policy === 'private'
-          ? 'Your current same_round_think_text_policy is private, so ordinary text emitted in the SAME native assistant round as think() is withheld from channel routing. Later rounds without think() route normally.'
+          ? 'Your current same_round_think_text_policy is private, so ordinary text emitted in the SAME assistant round as think() is withheld from channel routing. Later rounds without think() route normally.'
           : 'Your current same_round_think_text_policy is public, so ordinary text emitted in the SAME native assistant round as think() may still be routed publicly as your speech. Later rounds without think() route normally.'
         ) +
         ' Use think() to work things out privately. To inspect or change this policy, use agent_settings get/update on same_round_think_text_policy.' +
@@ -14096,9 +14096,9 @@ export class AgentFramework {
   /**
    * Silenced plain speech: an explicit send holds it as resendable drafts; a
    * deliberate silence (skip_reply, a silent turn, or a private think in
-   * the same native round, where that policy applies: an XML-mode round has
-   * no verbatim content to route live, so its prose is routed at the turn's
-   * end as ordinary speech) keeps it private —
+   * the same round, where that policy applies: an XML-mode round has no
+   * verbatim content to route live, so the turn's end drops its prose by the
+   * round's place) keeps it private —
    * counted for the receipt, never drafted. `segments` are the runs exactly
    * as written (splitProseRuns), so a draft keeps the resident's words byte
    * for byte. What it holds, keeps or moves is the round's turn's
@@ -17236,6 +17236,9 @@ export class AgentFramework {
     // turn-end delivery drops it by its place where nothing routed it live
     // (#296; XML mode and membranes without roundContent).
     const privateThinkRounds = new Set<number>();
+    // Those of them the turn was silenced at as they ended: their prose is
+    // counted as kept private, as holdSilencedProse counts it natively.
+    const silencedPrivateThinkRounds = new Set<number>();
     let toolRounds = 0;
     // A refused skip_reply silences only its own round: the silence before it,
     // saved with its cause as its round is routed (once its calls are
@@ -17651,6 +17654,7 @@ export class AgentFramework {
                 turnSilenced = true;
                 silenceCause = roundCause === 'private' || silenceCause === 'private' ? 'private' : 'send';
               }
+              if (hasSameRoundPrivateThink && turnSilenced) silencedPrivateThinkRounds.add(toolRound);
               if (roundSegments.length === 0) return;
               if (turnProseRouting === 'disabled') {
                 console.error(
@@ -18015,16 +18019,20 @@ export class AgentFramework {
                 : withoutRoundsProse(response.content, new Set([...refusedWakeRounds, ...privateThinkRounds])))
               : [];
             const finalSegments = finalRuns.map((run) => run.trim());
-            if (!liveProseRouting && hadToolCalls && privateThinkRounds.size > 0) {
-              // Counted as the native path counts a private round's prose, so
-              // the delivery receipt says it was kept private, not lost.
-              const withheld = splitProseRuns(withoutRoundsProse(response.content, refusedWakeRounds)).length - finalRuns.length;
-              if (withheld > 0) {
-                streamRouting.keptPrivate += withheld;
-                console.error(
-                  `[routing] ${agent.name}: ${withheld} prose segment(s) beside think() NOT routed (same_round_think_text_policy=private)`,
-                );
-              }
+            // The prose a private think's rounds kept back on the fallback
+            // path, counted with the trailing prose below as routeRound counts
+            // a private round's on the native path.
+            const privateThinkWithheld = !liveProseRouting && hadToolCalls && privateThinkRounds.size > 0
+              ? splitProseRuns(withoutRoundsProse(response.content, refusedWakeRounds)).length - finalRuns.length
+              : 0;
+            const privateThinkKept = privateThinkWithheld > 0 && silencedPrivateThinkRounds.size > 0
+              ? splitProseRuns(withoutRoundsProse(response.content, refusedWakeRounds)).length
+                - splitProseRuns(withoutRoundsProse(response.content, new Set([...refusedWakeRounds, ...silencedPrivateThinkRounds]))).length
+              : 0;
+            if (privateThinkWithheld > 0) {
+              console.error(
+                `[routing] ${agent.name}: ${privateThinkWithheld} prose segment(s) beside think() NOT routed (same_round_think_text_policy=private)`,
+              );
             }
             const admitFinal = turnProseRouting === 'explicit' && !!this.channelRegistry;
             // The final text is delivered under this turn's routing, as its
@@ -18300,6 +18308,17 @@ export class AgentFramework {
 
               const runs = finalRuns;
               const segments = finalSegments;
+
+              // As routeRound counts a private think's round: suppressed under
+              // disabled routing; outside explicit routing, kept private where
+              // the turn was silenced as the round ended; otherwise only logged.
+              if (privateThinkWithheld > 0) {
+                if (turnProseRouting === 'disabled') {
+                  this.recordProseSuppression(streamRouting, privateThinkWithheld);
+                } else if (turnProseRouting !== 'explicit') {
+                  streamRouting.keptPrivate += privateThinkKept;
+                }
+              }
 
               if (turnProseRouting === 'disabled') {
                 if (segments.length > 0) {
