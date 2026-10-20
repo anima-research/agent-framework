@@ -1,5 +1,6 @@
-- **After the store's branch moves, every registered agent sharing it works
-  again without a restart, unless its re-initialization fails.**
+- **After the store's branch moves, the context manager of every registered
+  agent sharing it works again without a restart, unless its
+  re-initialization fails.**
   `rollbackToMessage()`, `suppressMessages()`, `switchBranch()`,
   `undoLastTurn()` and `redo()` now re-initialize every agent's context
   manager for the branch the store is on, before the store is released. A
@@ -14,7 +15,11 @@
   logged and traced each time, and the alert webhook posts it at most once
   per agent and kind in 15 minutes, as it does every kind. That agent refuses its
   work, compiles and message writes included, until `switchBranch()` (to
-  the branch the store is already on, too) or a restart re-initializes it.
+  the branch the store is already on, too) re-initializes it and stores the
+  writes kept queued for it meanwhile, or a restart does, which loses those
+  writes unless the deferral queue is persisted, as quiescing the host
+  before it stops does. `stop()` says how many writes it leaves queued for
+  an agent whose store didn't take them, and whether they're kept for boot.
   The move itself stands. A rollback or suppression whose switch back to the
   source branch fails as well raises the same alert for the agent it named,
   and says which branch the store is on. A rollback or suppression refused
@@ -24,7 +29,13 @@
   reserved for longer as agents and their stored history grow, while the
   host goes on handling events between agents. Each agent's own
   re-initialization can still hold the host for its whole length, which
-  grows with that agent's stored history.
+  grows with that agent's stored history. Nothing bounds it, or the wait for
+  maintenance already running that comes before it, so a move whose hold on
+  the store is still up after 60 s raises one `store-held-long` ops alert.
+  It names the move and the agent it was for, and the manager its pass is
+  re-initializing or the maintenance it's waiting for, and says what a
+  restart costs. It's raised for every move that holds the store: a
+  rollback, a suppression and a branch switch, as well as an undo or redo.
 - **A conversation agent with no stored message of its own on the branch
   the store moves to is seeded again from the template,** as one spawned
   after the point a move returns to has none there. A conversation agent
@@ -41,7 +52,10 @@
   One that can't be seeded, because its seeding fails, the store moves to
   another branch while it's seeded by a switch the framework didn't make, or
   the template is missing or failed to re-initialize, is disposed rather than left to
-  answer with no history: `context-reinit-failed` says so and why. If
+  answer with no history: `context-reinit-failed` says so and why. The
+  writes held for it while the store was held go with it, into its window,
+  and once it's disposed the alert says how many, since the fork its channel
+  spawns next doesn't get them. If
   disposing it fails partway, the alert says that too, and the move's other
   conversation agents are still seeded. Its channel's next qualifying message spawns a
   fresh one, unless its seeding

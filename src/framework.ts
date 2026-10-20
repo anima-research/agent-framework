@@ -1870,10 +1870,29 @@ interface SyncMoveReinit {
   done: Promise<void>;
 }
 
-/** What an operator does about a manager a move left refusing its work. */
+/** What a restart costs while writes wait in the deferral queue: stop()
+ *  stores what the agents' managers take, and a write one refuses stays
+ *  queued, which only a persisted queue keeps past the process. */
+const RESTART_LOSES_QUEUED_WRITES =
+  'A restart re-initializes it too, but loses those writes unless the deferral queue is persisted, ' +
+  'as quiescing the host before it stops does.';
+
+/** What an operator does about a manager a move left refusing its work. A
+ *  write deferred for its agent while the store was held stays queued for
+ *  it, since the release can't store it. */
 const REINIT_REMEDY =
   'Until it is re-initialized it refuses its work, compiles and message writes included: ' +
-  'switchBranch() to the current branch, or a restart, re-initializes it.';
+  'switchBranch() to the current branch re-initializes it, and then stores the writes kept queued for it. ' +
+  RESTART_LOSES_QUEUED_WRITES;
+
+/** How long a move may hold the store before a `store-held-long` ops alert
+ *  says so. No turn starts while it's held, and nothing bounds what a hold
+ *  waits on: maintenance already running, the move itself, and every
+ *  manager's re-initialization, which grows with the agents and their stored
+ *  history. This is well past the 4.5 s and 10.9 s an undo held the store
+ *  for, with 16 agents of 1,000 stored messages each and with 32 of 500, on
+ *  a host under load. */
+const HOLD_ALERT_MS = 60_000;
 
 /** An agent whose context manager failed to re-initialize after a move, or a
  *  conversation agent the move emptied that couldn't be seeded again. */
@@ -1893,6 +1912,9 @@ interface ManagerReinitFailure {
    *  threw: that failure. The agent was unregistered and its channel unbound
    *  before the step that failed. */
   cleanupFailed?: string;
+  /** For a disposal: how many writes were queued for the agent, held while
+   *  the store was. Its window's release stores them there. */
+  heldWrites?: number;
 }
 
 /**
@@ -2818,7 +2840,15 @@ export class AgentFramework {
    * agent admitted mid-switch, a wake for an agent created later — at the
    * scheduler, ephemeral admission and puppet entry points.
    */
-  private surgeryHold: { verb: string; agentName: string; since: number; released?: Promise<void> } | null = null;
+  private surgeryHold: {
+    verb: string;
+    agentName: string;
+    since: number;
+    released?: Promise<void>;
+    /** The agent whose manager a re-initialization pass under the hold is
+     *  on (reinitializeManagers), for the alert a long hold raises. */
+    reinitializing?: string;
+  } | null = null;
   /** Conversation forks being created: from the moment a spawn finds the
    *  store free until it is registered, each counts as busy for a move
    *  (reserveStoreForSurgery), so no move lands under a spawn. */
@@ -2831,6 +2861,9 @@ export class AgentFramework {
    * again under that reservation and sets `again`, and the pass runs again.
    */
   private syncMoveReinit: SyncMoveReinit | null = null;
+  /** store-held-long's threshold (HOLD_ALERT_MS); a field, so a test can
+   *  shorten it. */
+  private holdAlertMs = HOLD_ALERT_MS;
   /** Serialize per-server drains so reconnect and an online undo cannot race. */
   private discordAwarenessDrains: Map<string, Promise<DiscordAwarenessDrainOutcome>> = new Map();
   /** The servers whose running pass a later trigger joined
@@ -4058,6 +4091,22 @@ export class AgentFramework {
         .flatMap((name) => this.drainDeferredFor(name));
       this.readdDrained(entries, 'stop', { bypassDeferral: !this.quiesced });
       this.ackDeferredWrites();
+      // Past the deferral, what an agent's store didn't take stays queued for
+      // it, each write's failure logged by the flush, as for an agent whose
+      // context manager refuses its work after a move until a switchBranch()
+      // re-initializes it. That's said once for the agent, with what becomes
+      // of them. A quiesced host deferred its entries again on purpose.
+      for (const name of this.quiesced ? [] : registered.filter((agent) => !stillStreaming.has(agent))) {
+        const kept = this.deferredMessages.filter((msg) => (msg.forAgent ?? this.primaryAgentName) === name).length;
+        if (kept > 0) {
+          console.error(
+            `[deferral] stop: ${kept} deferred write(s) for ${name} stay queued, not stored by the flush above; ` +
+            (this.deferredWritesPersisted
+              ? 'the persisted queue keeps them for boot'
+              : 'this memory-only queue loses them at exit'),
+          );
+        }
+      }
       for (const name of registered.filter((agent) => stillStreaming.has(agent))) {
         const held = this.deferredMessages.filter((msg) => (msg.forAgent ?? this.primaryAgentName) === name).length;
         if (held > 0) {
@@ -10297,6 +10346,11 @@ export class AgentFramework {
     let resolveHold!: () => void;
     const hold = { verb, agentName, since: Date.now(), released: new Promise<void>((resolve) => { resolveHold = resolve; }) };
     this.surgeryHold = hold;
+    // No turn starts while the store is held, and nothing bounds what the
+    // hold waits on, so one still up after holdAlertMs is said, once, for
+    // every move that holds it (reportLongHold).
+    const watchdog = setTimeout(() => this.reportLongHold(hold), this.holdAlertMs);
+    watchdog.unref?.();
     // Maintenance calls parked at a provider gate wake, find the hold and are
     // withdrawn, so the wait for running maintenance can't wait on them.
     for (const gate of this.providerGates.values()) for (const resolve of gate.auxiliaryWaiters.splice(0)) resolve();
@@ -10308,6 +10362,7 @@ export class AgentFramework {
     return () => {
       if (released) return;
       released = true;
+      clearTimeout(watchdog);
       // The release runs to its end before stop() can go on.
       settle();
       if (this.surgeryHold === hold) this.surgeryHold = null;
@@ -10353,21 +10408,67 @@ export class AgentFramework {
    * re-initialization failed. Each of those managers refuses its work, as
    * context-manager leaves a failed initialization, until another one
    * succeeds.
+   *
+   * Nothing bounds a manager's re-initialization, so the hold names the
+   * manager the pass is on, for the alert a long hold raises
+   * (reportLongHold).
    */
   private async reinitializeManagers(except?: string, moved: () => boolean = () => false): Promise<ManagerReinitFailure[]> {
     const failures: ManagerReinitFailure[] = [];
-    for (const [agentName, agent] of [...this.agents]) {
-      if (agentName === except) continue;
-      await new Promise<void>((resolve) => setImmediate(resolve));
-      try {
-        const cm = agent.getContextManager();
-        await cm.setStrategy(cm.getStrategy());
-      } catch (error) {
-        failures.push({ agentName, error: failureDescription(error) });
+    const hold = this.surgeryHold;
+    try {
+      for (const [agentName, agent] of [...this.agents]) {
+        if (agentName === except) continue;
+        await new Promise<void>((resolve) => setImmediate(resolve));
+        if (hold) hold.reinitializing = agentName;
+        try {
+          const cm = agent.getContextManager();
+          await cm.setStrategy(cm.getStrategy());
+        } catch (error) {
+          failures.push({ agentName, error: failureDescription(error) });
+        }
       }
+    } finally {
+      if (hold) delete hold.reinitializing;
     }
     await this.reseedEmptiedForks(failures, except, moved);
     return failures;
+  }
+
+  /**
+   * `store-held-long`: a move (an undo or redo, a rollback, a suppression or
+   * a branch switch) has held the store past holdAlertMs. It names the move
+   * and the agent it was for, and what the hold is on when that's known: the
+   * manager a re-initialization pass is on, or maintenance work that was
+   * running when the move took the store, which the move waits for before it
+   * goes on (no maintenance starts while the store is held). Until the hold
+   * is released no turn starts, and the writes it defers wait in the queue,
+   * so it says what a restart costs. The release clears its timer, so it
+   * comes at most once for a hold.
+   */
+  private reportLongHold(hold: { verb: string; agentName: string; since: number; reinitializing?: string }): void {
+    const heldMs = Date.now() - hold.since;
+    const queued = this.deferredMessages.length;
+    const reinitializing = hold.reinitializing;
+    const waitingForMaintenance = reinitializing === undefined && this.maintenanceRunning();
+    const on = reinitializing !== undefined
+      ? `, and is re-initializing ${reinitializing}'s context manager now`
+      : waitingForMaintenance ? ', and is waiting for maintenance work that was already running to finish' : '';
+    this.opsAlert('store-held-long', hold.agentName,
+      `The ${hold.verb} for ${hold.agentName} has held the store for ${Math.round(heldMs / 1000)} s${on}. ` +
+        `No agent's turn starts until it lets the store go, and the writes it defers for the agents wait in the ` +
+        `deferral queue (${queued === 1 ? '1 write' : `${queued} writes`} now). A restart ends it and ` +
+        're-initializes every manager, but loses the writes still queued when the process exits, unless the ' +
+        'deferral queue is persisted; stop() says how many it leaves queued.',
+      {
+        data: {
+          verb: hold.verb,
+          heldMs,
+          queued,
+          ...(reinitializing !== undefined ? { reinitializing } : {}),
+          ...(waitingForMaintenance ? { waitingForMaintenance } : {}),
+        },
+      });
   }
 
   /**
@@ -10454,6 +10555,10 @@ export class AgentFramework {
       }
       if (moved()) continue;
       const failure: ManagerReinitFailure = { agentName, error: cause, seedingFailed: true, ...(remedy ? { remedy } : {}) };
+      // What the hold deferred for it goes with it: its window's release
+      // stores those writes there, where no agent reads them.
+      const heldWrites = this.deferredMessages.filter((msg) => (msg.forAgent ?? this.primaryAgentName) === agentName).length;
+      if (heldWrites > 0) failure.heldWrites = heldWrites;
       try {
         const channelId = this.conversationAgentHomes.get(agentName);
         if (channelId !== undefined && this.conversationRouter?.getBinding(channelId)?.agentName === agentName) {
@@ -10470,7 +10575,7 @@ export class AgentFramework {
   /** Say which agents a move left with a manager that refuses its work:
    *  on the console, in failures.log and in an ops alert, one per agent. */
   private reportReinitFailures(after: string, failures: ManagerReinitFailure[]): void {
-    for (const { agentName, error, seedingFailed, after: judgedAfter, remedy, cleanupFailed } of failures) {
+    for (const { agentName, error, seedingFailed, after: judgedAfter, remedy, cleanupFailed, heldWrites } of failures) {
       const move = judgedAfter ?? after;
       this.reportReinitFailure(agentName, move, seedingFailed
         ? `The ${move} moved the store's branch to one where this conversation agent had no messages of its own, ` +
@@ -10478,6 +10583,10 @@ export class AgentFramework {
           (cleanupFailed
             ? `It was unregistered and its channel unbound, but cleaning up after it then failed: ${cleanupFailed}. `
             : 'It was disposed and its channel unbound. ') +
+          (heldWrites && !cleanupFailed
+            ? `${heldWrites === 1 ? 'The write' : `The ${heldWrites} writes`} held for it while the store was held ` +
+              `went with it, into its window, so the fork its channel spawns next doesn't get ${heldWrites === 1 ? 'it' : 'them'}. `
+            : '') +
           "Its messages stay on the branches that hold them, but no agent reads them again, " +
           "so a redo to a branch that holds them doesn't bring this one back. " +
           (remedy
@@ -10694,7 +10803,8 @@ export class AgentFramework {
           ? `The restore to ${sourceBranch} put the store back on ${sourceBranch}, and re-initializing this agent's context manager for it failed: ${detail}. ${REINIT_REMEDY}`
           : `The restore to ${sourceBranch} failed (${detail}), so the store is still on ${now}. ` +
             'Until this agent\'s context manager is re-initialized it refuses its work, compiles and message writes included: ' +
-            'switchBranch() to the branch it should run on, or a restart, re-initializes it.');
+            'switchBranch() to the branch it should run on re-initializes it, and then stores the writes kept queued for it. ' +
+            RESTART_LOSES_QUEUED_WRITES);
       } catch (reportError) {
         console.error(`[operator] agent=${agentName} reporting the failed restore failed: ${boundFailureText(failureDescription(reportError))}`);
       }
@@ -13931,13 +14041,16 @@ export class AgentFramework {
       return true;
     }
     if (!p.messageId) return false;
-    // While a move holds the store, nothing touches a manager's stored
-    // messages, which may be on the branch the move leaves or under a
+    // While a move holds the store, a coalesced removal leaves the stored
+    // message alone: it may be on the branch the move leaves, or under a
     // manager not yet re-initialized. Told the removal didn't happen, the
     // coalescer does what it does whenever one fails: a replacement, or a
     // retraction's notice, is appended and lands at the release with every
     // deferred write, beside the unread message, and a retraction with no
-    // notice leaves that message where it is.
+    // notice leaves that message where it is. Other writers still reach a
+    // manager while a move holds the store: a module's edit or removal of a
+    // stored message, and a write carrying a fresh tool result, which no
+    // deferral holds.
     if (this.surgeryHold) return false;
     const agent = this.agents.get(p.agent);
     if (!agent) return false;
