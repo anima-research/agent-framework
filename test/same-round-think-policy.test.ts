@@ -231,6 +231,74 @@ class LegacyNoRoundContentMembrane {
   }
 }
 
+/**
+ * The fallback path over several rounds (#296): no roundContent, so nothing
+ * routes live, and the whole turn's prose is routed once, at the end, from
+ * response.content, where tool_result blocks mark where each round ends.
+ * Round 0 reads, round 1 thinks, and the text after the last round is the
+ * trailing segment.
+ */
+const LEGACY_A = 'before the read';
+const LEGACY_B = 'beside the think';
+const LEGACY_C = 'after the last round';
+class LegacyThinkInSecondRoundStream {
+  private pendingResolve: (() => void) | null = null;
+  private cancelled = false;
+
+  provideToolResults(_results: unknown[]): void {
+    const resolve = this.pendingResolve;
+    this.pendingResolve = null;
+    resolve?.();
+  }
+
+  cancel(): void {
+    this.cancelled = true;
+    const resolve = this.pendingResolve;
+    this.pendingResolve = null;
+    resolve?.();
+  }
+
+  private round(id: string, name: string, input: unknown, preamble: string): StreamEvent {
+    return {
+      type: 'tool-calls',
+      calls: [{ id, name, input }],
+      context: { rawText: '', preamble, depth: 0, previousResults: [], accumulated: '' },
+    } as StreamEvent;
+  }
+
+  async *[Symbol.asyncIterator](): AsyncIterator<StreamEvent> {
+    for (const ev of [
+      this.round('read-1', 'tools--read', { path: 'project/secret.txt' }, LEGACY_A),
+      this.round('think-1', 'think', { content: TILDE_THINK_4416 }, LEGACY_B),
+    ]) {
+      yield ev;
+      await new Promise<void>((resolve) => { this.pendingResolve = resolve; });
+      if (this.cancelled) return;
+    }
+    yield {
+      type: 'complete',
+      response: createMockResponse([
+        { type: 'text', text: LEGACY_A },
+        { type: 'tool_use', id: 'read-1', name: 'tools--read', input: { path: 'project/secret.txt' } },
+        { type: 'tool_result', toolUseId: 'read-1', content: 'ok' },
+        { type: 'text', text: LEGACY_B },
+        { type: 'tool_use', id: 'think-1', name: 'think', input: { content: TILDE_THINK_4416 } },
+        { type: 'tool_result', toolUseId: 'think-1', content: 'ok' },
+        { type: 'text', text: LEGACY_C },
+      ] as ContentBlock[]),
+    } as StreamEvent;
+  }
+}
+
+class LegacyThinkInSecondRoundMembrane {
+  calls: NormalizedRequest[] = [];
+
+  streamYielding(request: NormalizedRequest): YieldingStream {
+    this.calls.push(request);
+    return new LegacyThinkInSecondRoundStream() as unknown as YieldingStream;
+  }
+}
+
 class PausedAfterFirstToolRoundStream implements YieldingStream {
   private events: StreamEvent[] = [];
   private done = false;
@@ -960,9 +1028,27 @@ describe('same-round think text policy', () => {
     }
   });
 
-  it('legacy/no-roundContent behavior remains unchanged', async () => {
+  // #296: the fallback path (no roundContent: XML tool mode, older membranes)
+  // used to route the text beside think() under a private policy, which this
+  // case pinned as "legacy behavior remains unchanged". The policy text makes
+  // no exception for it, so the turn-end delivery now drops that round's text
+  // by its place, as the native path does as the round ends.
+  it('legacy/no-roundContent: a private policy withholds the text beside think()', async () => {
     const membrane = new LegacyNoRoundContentMembrane();
     const { dir, framework, routed } = await createFramework({ policy: 'private', membrane });
+    try {
+      trigger(framework);
+      await framework.runUntilIdle();
+      assert.deepEqual(routed, []);
+    } finally {
+      await framework.stop();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('legacy/no-roundContent: a public policy still routes the text beside think()', async () => {
+    const membrane = new LegacyNoRoundContentMembrane();
+    const { dir, framework, routed } = await createFramework({ policy: 'public', membrane });
     try {
       trigger(framework);
       await framework.runUntilIdle();
@@ -970,6 +1056,24 @@ describe('same-round think text policy', () => {
     } finally {
       await framework.stop();
       rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('legacy/no-roundContent: only the round that called think() is withheld', async () => {
+    for (const [policy, want] of [
+      ['private', [LEGACY_A, LEGACY_C]],
+      ['public', [LEGACY_A, LEGACY_B, LEGACY_C]],
+    ] as const) {
+      const membrane = new LegacyThinkInSecondRoundMembrane();
+      const { dir, framework, routed } = await createFramework({ policy, membrane });
+      try {
+        trigger(framework);
+        await framework.runUntilIdle();
+        assert.deepEqual(routed, want, `policy=${policy}`);
+      } finally {
+        await framework.stop();
+        rmSync(dir, { recursive: true, force: true });
+      }
     }
   });
 });
