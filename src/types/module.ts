@@ -110,13 +110,18 @@ export interface Module {
    * Adapted from Anarchid/agent-framework@mcpl-module-proto.
    *
    * @deprecated Context injection is deprecated (agent-framework#171).
-   * Injections are per-compile overlays — never stored, re-anchored to the
-   * latest user message on every compile — so they break prompt-cache
-   * prefixes across activations (head-only hits on OpenAI lanes) and can
-   * land between a tool call and its result. Do not add new implementations:
-   * put durable content in the system prompt and deliver changing state as
-   * conversation content (events, tool results). Still called for now; the
-   * framework logs one `[deprecated]` line per module that injects.
+   * Injections are per-compile overlays, never stored in the conversation. A
+   * `beforeUser` or `afterUser` injection is re-anchored to the latest
+   * user-participant message on every compile, so it breaks prompt-cache
+   * prefixes across activations (head-only hits on OpenAI lanes), and a
+   * `beforeUser` injection can land between a tool call and its result. A
+   * `system` injection is appended to the system prompt, so whenever its text
+   * changes, the request changes from there on, ahead of every message. Do
+   * not add new implementations: durable content belongs in the agent's
+   * configured system prompt, which the host's configuration sets, and
+   * changing state in conversation content (events, tool results). Still
+   * called for now; the framework logs one `[deprecated]` line per module
+   * that injects.
    */
   gatherContext?(agentName: string): Promise<ContextInjection[]>;
 

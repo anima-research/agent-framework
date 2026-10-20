@@ -53,7 +53,7 @@ test('a module that injects is still applied and is named once across turns', as
   });
   assert.equal(first.length, 1, 'injection still applied');
   assert.equal(warnings.length, 1, `one warning for three turns, got ${JSON.stringify(warnings)}`);
-  assert.match(warnings[0], /module "hud" injected context/);
+  assert.match(warnings[0], /module "hud" returns context injections, which still apply\./);
   assert.match(warnings[0], /#171/);
 });
 
@@ -89,7 +89,7 @@ test('an MCPL server injection within its grant is still applied and named once'
   });
   assert.equal(applied.length, 1, 'injection still applied');
   assert.equal(warnings.length, 1);
-  assert.match(warnings[0], /MCPL server "recap-server" injected context \(position "beforeUser"\)/);
+  assert.match(warnings[0], /MCPL server "recap-server" returns context injections \(position "beforeUser"\), which still apply\./);
 });
 
 test('an injection outside the grant is dropped as before and does not warn', async () => {
