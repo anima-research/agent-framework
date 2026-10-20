@@ -20419,6 +20419,19 @@ export class AgentFramework {
     if (toolName === CODE_EXECUTION_TOOL_NAME) {
       return { text: 'Error: code_execution cannot be called from within a script', isError: true };
     }
+    // A script's channel_publish names its channel. A script runs apart from
+    // the turn that started it, a background one past that turn's end, so the
+    // default, the channel of the latest inbound message, is one nobody chose
+    // for it, and a private turn's script would publish there. A refused call
+    // posts nothing, so its round doesn't count it as a send.
+    if (toolName === 'channel_publish' && args.channelId == null) {
+      const home = this.conversationAgentHomes.get(agentName);
+      return {
+        text: 'Error: Nothing was posted. A script\'s channel_publish needs a channelId, since a script has no channel '
+          + `of its own to default to.${home ? ` This conversation's channel is "${home}".` : ''}`,
+        isError: true,
+      };
+    }
     // The call counts toward its round's routing however it turns out, as a
     // direct call does: a refused skip_reply as refused, and another call the
     // agent's allowedTools refuses for nothing.

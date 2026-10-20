@@ -4066,6 +4066,103 @@ describe("a round that runs code_execution is routed once its scripts return (re
     }
   });
 
+  // A surface message names a channel, or names none and opens a private turn.
+  const surface = (channelId?: string) => ({
+    type: 'external-message', source: channelId ? 'bridge' : 'tui', content: 'go', metadata: channelId ? { channelId } : {},
+  }) as unknown as ProcessEvent;
+  // The refusal of a script's channel_publish that names no channel.
+  const REFUSED = "A script's channel_publish needs a channelId";
+  type ScriptHarness = Awaited<ReturnType<typeof scriptRound>>;
+  /** What the script's publish answered, as it passed it to echo. */
+  const scriptNote = (h: ScriptHarness): string => {
+    const note = h.log.find((entry) => entry.startsWith('note:'));
+    assert.ok(note !== undefined, `control: the script ran to its end: ${JSON.stringify(h.log)}`);
+    return note!;
+  };
+
+  for (const privateTurn of [true, false]) {
+    it(`a script's channel_publish that names no channel is refused in a ${privateTurn ? 'private' : 'channel'} turn, and posts nothing`, async () => {
+      const code = 'r = await channel_publish({"content": "from the script"})\nawait test__echo({"note": str(r)})';
+      const h = await scriptRound('locus', [
+        createMockResponse([scriptCall({ code })] as ContentBlock[], 'tool_use'),
+        createMockResponse([{ type: 'text', text: 'done' }] as ContentBlock[]),
+      ], {}, { channelPublish: true });
+      try {
+        h.framework.pushEvent(surface(privateTurn ? undefined : 'world:test'));
+        await h.framework.runUntilIdle();
+        assert.ok(scriptNote(h).includes(REFUSED), scriptNote(h));
+        assert.ok(!h.log.includes('tool:channel_publish'), JSON.stringify(h.log));
+      } finally {
+        await h.done();
+      }
+    });
+  }
+
+  it("a script's channel_publish that names its channel goes there, in a private turn too", async () => {
+    const code = 'r = await channel_publish({"channelId": "world:test", "content": "from the script"})\nawait test__echo({"note": str(r)})';
+    const h = await scriptRound('locus', [
+      createMockResponse([scriptCall({ code })] as ContentBlock[], 'tool_use'),
+      createMockResponse([{ type: 'text', text: 'done' }] as ContentBlock[]),
+    ], {}, { channelPublish: true });
+    try {
+      h.framework.pushEvent(surface());
+      await h.framework.runUntilIdle();
+      assert.ok(!scriptNote(h).includes(REFUSED), scriptNote(h));
+      assert.ok(h.log.includes('tool:channel_publish'), JSON.stringify(h.log));
+    } finally {
+      await h.done();
+    }
+  });
+
+  it("a background script's channel_publish that names no channel is refused after its turn has ended", async () => {
+    const watcher = [
+      'await test__slow({})',
+      'r = await channel_publish({"content": "from the watcher"})',
+      'await test__echo({"note": str(r)})',
+    ].join('\n');
+    const h = await scriptRound('locus', [
+      createMockResponse([scriptCall({ code: watcher, background: true }, 'bg')] as ContentBlock[], 'tool_use'),
+      createMockResponse([{ type: 'text', text: 'watching' }] as ContentBlock[]),
+    ], {}, { channelPublish: true });
+    const scripts = (h.framework as unknown as { backgroundScripts: Map<string, { status: string }> }).backgroundScripts;
+    try {
+      h.framework.pushEvent(surface('world:test'));
+      await h.framework.runUntilIdle();
+      assert.ok(scripts.size > 0, 'control: a watcher started');
+      h.module.releaseSlow();
+      for (const deadline = Date.now() + 15_000; [...scripts.values()].some((s) => s.status === 'running');) {
+        if (Date.now() > deadline) throw new Error(`the watcher never settled: ${JSON.stringify(h.log)}`);
+        await new Promise((r) => setTimeout(r, 25));
+        await h.framework.runUntilIdle();
+      }
+      assert.ok(scriptNote(h).includes(REFUSED), scriptNote(h));
+      assert.ok(!h.log.includes('tool:channel_publish'), JSON.stringify(h.log));
+    } finally {
+      await h.done();
+    }
+  });
+
+  it("a conversation fork's script that publishes naming no channel is told its conversation's channel", async () => {
+    const code = 'r = await channel_publish({"content": "from the script"})\nawait test__echo({"note": str(r)})';
+    const h = await scriptRound('locus', [
+      createMockResponse([scriptCall({ code })] as ContentBlock[], 'tool_use'),
+      createMockResponse([{ type: 'text', text: 'done' }] as ContentBlock[]),
+    ], {}, { channelPublish: true });
+    try {
+      // The agent stands for a fork bound to its home channel, which a
+      // broadcast wake doesn't reach, so its turn comes from its own wake.
+      const internals = h.framework as unknown as { conversationAgentHomes: Map<string, string>; pendingRequests: unknown[] };
+      internals.conversationAgentHomes.set('assistant', 'world:home');
+      internals.pendingRequests.push({ agentName: 'assistant', reason: 'test', source: 'test', timestamp: Date.now(), channelId: 'world:home' });
+      await h.framework.runUntilIdle();
+      assert.ok(scriptNote(h).includes(REFUSED), scriptNote(h));
+      assert.ok(scriptNote(h).includes('"world:home"'), scriptNote(h));
+      assert.ok(!h.log.includes('tool:channel_publish'), JSON.stringify(h.log));
+    } finally {
+      await h.done();
+    }
+  });
+
   it("locus: a script round's prose goes to the locus it was written for, though the script opens another channel", async () => {
     const h = await scriptRound('locus', [
       createMockResponse([
