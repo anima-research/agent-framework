@@ -80,8 +80,10 @@ export interface SearchHit {
   kind: string;
   level: number | null;
   meta: Record<string, unknown>;
+  /** The text the service sends for the hit, where it keeps text; a service that keeps none leaves it out. */
   text?: string;
-  chars: number;
+  /** The length of the text the service holds for the hit; a service that keeps no text may leave it out too. */
+  chars?: number;
 }
 
 export interface SearchRequest {
@@ -315,12 +317,16 @@ export interface SummaryLike {
   parentId?: string;
 }
 
+/** The text a summary is indexed by: its content trimmed, and cut at `maxChars` at a whole character. */
+export function summaryIndexText(s: { content: string }, cfg: { maxChars?: number }): string {
+  return safeSlice(s.content.trim(), 0, cfg.maxChars ?? 32_000);
+}
+
 export function summaryToItem(s: SummaryLike, cfg: { maxChars?: number }): IndexItem | null {
-  const text = s.content.trim();
-  if (!text) return null;
+  if (!s.content.trim()) return null;
   return {
     id: `sum:${s.id}`,
-    text: safeSlice(text, 0, cfg.maxChars ?? 32_000),
+    text: summaryIndexText(s, cfg),
     ts: s.startMs / 1000,
     kind: 'summary',
     level: s.level,

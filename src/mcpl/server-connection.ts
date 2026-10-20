@@ -87,18 +87,30 @@ export interface McplConnectionCloseInfo {
  *  Spring Boot + JDA servers can take 5-10s to boot, so 30s is safe. */
 const INITIALIZE_TIMEOUT_MS = 30_000;
 
+/** How many errors down a `cause` chain stderrTailOf looks. */
+const STDERR_TAIL_CAUSE_LINKS = 8;
+
 /** A failed connect's `stderrTail`, the last of the server's stderr that its
- *  handshake's error keeps, when there is one. */
+ *  handshake's error keeps, when there is one: the error's own, or the
+ *  nearest one in its `cause` chain, since a launch that couldn't be reaped
+ *  (McplUnreapedLaunchError) and the framework's refusals wrap the
+ *  handshake's error. It looks at most STDERR_TAIL_CAUSE_LINKS causes down,
+ *  so a chain that loops ends. */
 export function stderrTailOf(error: unknown): string | undefined {
-  const tail = (error as { stderrTail?: unknown } | null | undefined)?.stderrTail;
-  return typeof tail === 'string' && tail !== '' ? tail : undefined;
+  let at = error;
+  for (let link = 0; link <= STDERR_TAIL_CAUSE_LINKS && typeof at === 'object' && at !== null; link++) {
+    const { stderrTail, cause } = at as { stderrTail?: unknown; cause?: unknown };
+    if (typeof stderrTail === 'string' && stderrTail !== '') return stderrTail;
+    at = cause;
+  }
+  return undefined;
 }
 
 /** For the host's own log line about a failed connect: the server's stderr
- *  that the error keeps as `stderrTail`, with the server's credentials
- *  taken out by `redact` (its redactServerText), one marked line per line of
- *  it, each through log-value, since it's the server's text. '' when there's
- *  none. */
+ *  that the error, or the nearest error it wraps, keeps as `stderrTail`
+ *  (stderrTailOf), with the server's credentials taken out by `redact` (its
+ *  redactServerText), one marked line per line of it, each through
+ *  log-value, since it's the server's text. '' when there's none. */
 export function withStderr(error: unknown, redact: (text: string) => string): string {
   const tail = stderrTailOf(error);
   if (tail === undefined) return '';
@@ -1534,9 +1546,13 @@ export class McplServerConnection extends EventEmitter {
     return this.sendRequest(McplMethod.ChannelsOpen, params as unknown as Record<string, unknown>, { timeoutMs }) as Promise<ChannelsOpenResult>;
   }
 
-  /** Send `channels/close` request and await result. */
+  /** Send `channels/close` request and await result. It keeps a deadline as
+   *  channels/open does: a delivery waits for a channel's queued lifecycle
+   *  work, closes included, so a close that is never answered would hold the
+   *  delivery, and the turn that waits for it, for good. */
   sendChannelsClose(params: ChannelsCloseParams): Promise<ChannelsCloseResult> {
-    return this.sendRequest(McplMethod.ChannelsClose, params as unknown as Record<string, unknown>) as Promise<ChannelsCloseResult>;
+    const timeoutMs = this.requestTimeoutMs > 0 ? this.requestTimeoutMs : this.publishDeadlineMs;
+    return this.sendRequest(McplMethod.ChannelsClose, params as unknown as Record<string, unknown>, { timeoutMs }) as Promise<ChannelsCloseResult>;
   }
 
   /** Send `channels/acknowledge` request and await result. */

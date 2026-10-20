@@ -2,11 +2,13 @@
  * What a tune-out's cancel makes of the messages still held when it ends.
  * The dump and the subconscious's report notice take the ended epoch's
  * messages only. After the notice come, each a row of its own with its own
- * content, the held ones the cap leaves out of the dump and the held ones
- * the dump shows whose media its text lines drop, since the subconscious's
+ * content, the held ones the dump leaves out and the held ones
+ * the dump shows whose media its text lines drop (and, in
+ * test/tune-out-dump-fit, a held newest it shows cut), since the subconscious's
  * view holds stored messages only. A cancel the subconscious makes itself gets that notice and
  * a report turn when some held message goes to it, or when it wrote no note
- * and the cap cut anything.
+ * and the dump left anything out. Here the cap does it; test/tune-out-dump-fit
+ * has the residents' per-message room do it too.
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
@@ -79,13 +81,13 @@ test("a cancel's dump shows only its own epoch's messages, and its notice tells 
   assert.ok(dump.includes('Ann: A1 stored') && dump.includes('Ann: A2 held'), 'the dump shows them');
   for (const other of ['B1 stored', 'P plain', 'B2 held']) assert.ok(!dump.includes(other), `and no "${other}"`);
   assert.ok(notice, 'the report gets its notice');
-  assert.ok(!textOf(notice.content).includes('above the cap'), 'with no count above the cap, as none is');
+  assert.ok(!textOf(notice.content).includes("weren't delivered raw"), 'with no count of messages left out, as none is');
   assert.ok(!textOf(notice.content).includes('Still held'), 'and no held message, as the dump shows them all');
   assert.deepEqual(held, [], 'so no held row follows it');
   assert.ok(inferences.includes('Subconscious'), 'and a report turn is requested');
 });
 
-test('the notice carries the held messages the cap leaves out, each under its author with its content, and the count above the cap', () => {
+test('the notice carries the held messages the cap leaves out, each under its author with its content, and the count left out', () => {
   const { dump, notice, held } = cancelWith({
     backlogCap: 0,
     source: 'agent-tool',
@@ -96,7 +98,7 @@ test('the notice carries the held messages the cap leaves out, each under its au
   assert.ok(notice, 'the report gets its notice');
   assert.equal(notice.forAgent, 'Subconscious');
   const noticeText = textOf(notice.content);
-  assert.ok(noticeText.includes('3 of 3 diverted messages were above the cap and not delivered raw to the resident'), 'it gives the count');
+  assert.ok(noticeText.includes("3 of 3 diverted messages, the oldest, weren't delivered raw to the resident"), 'it gives the count');
   assert.ok(noticeText.includes('the 2 messages after this one'), 'it counts the held rows that follow it');
   // Exactly the epoch's two held messages: not another epoch's held one
   // (B2), nor a stored one (A1), which the subconscious's view has.
@@ -124,7 +126,7 @@ test('with media on both sides of the cut, the notice carries each held message 
   assert.ok(dump.includes('messages=3 truncated=1'), 'the cap shows the newer two and cuts Ann');
   assert.ok(!dump.includes('A1 look:'), "the dump leaves Ann's message out");
   assert.ok(notice, 'the report gets its notice');
-  assert.ok(textOf(notice.content).includes('1 of 3 diverted messages were above the cap'), 'with the count');
+  assert.ok(textOf(notice.content).includes('1 of 3 diverted messages, the oldest,'), 'with the count');
   assert.deepEqual(held, [
     [text('Ann:'), text('A1 look:'), IMAGE],
     [text('Bo:'), URL_IMAGE],
@@ -139,7 +141,7 @@ test('a cancel the subconscious makes itself gets the notice and a report turn w
   const leftOut = cancelWith({ backlogCap: 0, source: 'subconscious', stored: [], held: [row('Ann', [text('A2 held')], 'eA')] });
   assert.ok(leftOut.notice, 'a held message left out brings the notice');
   assert.deepEqual(leftOut.held, [[text('Ann:'), text('A2 held')]], 'with the held message after it');
-  assert.ok(textOf(leftOut.notice.content).includes('1 of 1 diverted messages were above the cap'), 'and the count, since its note is optional');
+  assert.ok(textOf(leftOut.notice.content).includes('1 of 1 diverted messages, the oldest,'), 'and the count, since its note is optional');
   assert.ok(leftOut.inferences.includes('Subconscious'), 'and a report turn');
 
   const mediaShown = cancelWith({ backlogCap: 10, source: 'subconscious', stored: [], held: [row('Ann', [text('look:'), IMAGE], 'eA')] });
@@ -160,7 +162,7 @@ test('a cancel the subconscious makes itself with no note gets the notice and a 
   assert.ok(storedCut.dump.includes('messages=2 truncated=2'), 'at backlogCap 0 the dump counts both stored messages');
   assert.ok(!storedCut.dump.includes('S1 stored') && !storedCut.dump.includes('S2 stored'), 'and shows neither');
   assert.ok(storedCut.notice, 'with no note, nothing else covers them, so the notice comes');
-  assert.ok(textOf(storedCut.notice.content).includes('2 of 2 diverted messages were above the cap'), 'with the count');
+  assert.ok(textOf(storedCut.notice.content).includes('2 of 2 diverted messages, the oldest,'), 'with the count');
   assert.ok(!textOf(storedCut.notice.content).includes('Still held'), 'and no held message, as none is');
   assert.deepEqual(storedCut.held, [], 'so no held row follows it');
   assert.ok(storedCut.inferences.includes('Subconscious'), 'and a report turn');

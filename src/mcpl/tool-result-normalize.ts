@@ -36,7 +36,8 @@ export const MALFORMED_CONTENT_NOTICE =
   '[malformed result: its content is not a list of blocks; the tool may already have completed]';
 
 /** Saves a payload under a host-chosen name; resolves to its workspace path,
- *  or null when there is nowhere writable to put it. */
+ *  or null when there is no writable workspace mount without an include to
+ *  put it in. */
 export type SaveToolPayload = (fileName: string, bytes: Buffer, mimeType: string) => Promise<string | null>;
 
 /** Stub fields are bounded independently of anything the server sends. */

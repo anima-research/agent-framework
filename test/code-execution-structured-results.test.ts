@@ -154,10 +154,7 @@ test("a script reads a structured result whole, the model's calls and history ke
     // structured JSON only when the content has none.
     assert.equal(resultOf('model-direct'), JSON.stringify(transcript));
     assert.match(resultOf('model-only'), /\\"runId\\":\\"r41\\"/);
-    const python = JSON.parse(resultOf('model-python'));
-    assert.equal(python.stderr, '');
-    assert.equal(python.return_code, 0);
-    assert.equal(python.stdout.trim(), 'r41 running café 🌱');
+    assert.equal(resultOf('model-python'), 'exit code: 0\n--- stdout ---\nr41 running café 🌱\n');
     assert.deepEqual(calls, ['dual', 'dual', 'only', 'dual', 'empty', 'only', 'plain', 'absent', 'error', 'large']);
 
     // The stored history holds what the model read: the readable direct

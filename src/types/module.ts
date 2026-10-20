@@ -40,7 +40,9 @@ export type ModuleMessage = StoredMessage & {
    * and `timestamp` are provisional: the sequence comes after every stored
    * row's, the timestamp is when the framework held the write (for a write
    * an older release held, when its queue was read back), and both change
-   * when it lands. Absent on a stored row.
+   * when it lands. A held write whose earlier write may already be stored
+   * is looked up first, and answered as the stored row it is when the store
+   * holds it. Absent on a stored row.
    */
   held?: true;
   /**
@@ -51,10 +53,11 @@ export type ModuleMessage = StoredMessage & {
    * boundary of a turn alive when it arrived stores it without injecting it
    * into the live turn. The subconscious reads it. Its text can still reach
    * a resident in rows of their own, which aren't marked, such as the
-   * cancel's `<tuned-out-backlog>` row, with the text of the last
-   * `backlogCap` of the tune-out's messages, the stored ones first and then
-   * those still held; what the subconscious says of it, in its report or its
-   * note; and the result of a tool that reads history on request, such as a
+   * cancel's `<tuned-out-backlog>` row, with the text of the tune-out's newest
+   * messages, up to `backlogCap` of them and as many as fit in one of the
+   * residents' messages, the stored ones first and then those still held;
+   * what the subconscious says of it, in its report or its note; and the
+   * result of a tool that reads history on request, such as a
    * channel's `fetch_history` or the history module's `extract`. A module
    * that builds on what the residents see, such as one choosing from the
    * recent conversation, leaves a marked row out, and one that matches
@@ -310,13 +313,17 @@ export interface ModuleContext {
 
   /**
    * Edit a message, by its id or a held write's handle. A held write is
-   * stored with the new content.
+   * stored with the new content. One whose earlier write may already be
+   * stored, where the store can't be searched to tell, throws with nothing
+   * changed.
    */
   editMessage(id: MessageId, content: ContentBlock[]): void;
 
   /**
    * Remove a message, by its id or a held write's handle. A held write is
-   * dropped, so the agent never reads it.
+   * dropped, so the agent never reads it. One whose earlier write may
+   * already be stored, where the store can't be searched to tell, throws
+   * with nothing changed.
    */
   removeMessage(id: MessageId): void;
 

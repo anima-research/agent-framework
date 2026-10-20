@@ -3,14 +3,16 @@ import assert from 'node:assert/strict';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { AgentFramework } from '../src/index.js';
+import { AgentFramework, ShutdownTimeoutError } from '../src/index.js';
+import { JsStore } from '@animalabs/chronicle';
 import { ContextManager, PassthroughStrategy } from '@animalabs/context-manager';
 import { CapabilityGrant } from '../src/mcpl/capability-grant.js';
 import type { McplServerRegistry } from '../src/mcpl/server-registry.js';
 import type { ProcessEvent, Module, ModuleContext, ToolDefinition, ToolCall, ToolResult, EventResponse } from '../src/index.js';
-import type { ContentBlock } from '@animalabs/membrane';
+import type { ContentBlock, NormalizedResponse } from '@animalabs/membrane';
 import type { ChannelRegistry } from '../src/mcpl/channel-registry.js';
-import { HeldStream, MockMembrane, createMockResponse } from './helpers/mock-membrane.js';
+import { HeldStream, MockMembrane, MockYieldingStream, createMockResponse } from './helpers/mock-membrane.js';
+import { UNREACHED_WATCHDOG, silenceRun } from './helpers/run-watchdog.js';
 
 function internals(framework: AgentFramework) {
   return framework as unknown as {
@@ -36,16 +38,16 @@ function internals(framework: AgentFramework) {
   };
 }
 
-/** A HeldStream that says when the framework has taken its events: how many it
+/** A HeldStream that says when the framework has taken its events: which it
  *  yielded, and when it was left, by a consumer's break or at its end. */
 class WatchedHeldStream extends HeldStream {
-  yielded = 0;
+  readonly yielded: string[] = [];
   private finish!: () => void;
   readonly finished = new Promise<void>((resolve) => { this.finish = resolve; });
   override async *[Symbol.asyncIterator](): ReturnType<HeldStream[typeof Symbol.asyncIterator]> {
     try {
       for await (const event of super[Symbol.asyncIterator]()) {
-        this.yielded++;
+        this.yielded.push(event.type);
         yield event;
       }
     } finally {
@@ -94,10 +96,9 @@ describe('notices about an agent\'s own action', () => {
   let framework: AgentFramework;
   let membrane: MockMembrane;
 
-  beforeEach(async () => {
-    tempDir = mkdtempSync(join(tmpdir(), 'route-failure-targeting-'));
-    membrane = new MockMembrane();
-    framework = await AgentFramework.create({
+  /** The host, on the test's store: a restart makes it again over the same store. */
+  async function host() {
+    const created = await AgentFramework.create({
       storePath: join(tempDir, 'test.chronicle'),
       membrane: membrane.asMembrane(),
       agents: [
@@ -108,7 +109,14 @@ describe('notices about an agent\'s own action', () => {
       conversations: { templateAgent: 'primary' },
     });
     // Install the real framework callback and registry without a live connector.
-    await internals(framework).initializeMcpl([]);
+    await internals(created).initializeMcpl([]);
+    return created;
+  }
+
+  beforeEach(async () => {
+    tempDir = mkdtempSync(join(tmpdir(), 'route-failure-targeting-'));
+    membrane = new MockMembrane();
+    framework = await host();
   });
 
   afterEach(async () => {
@@ -119,22 +127,27 @@ describe('notices about an agent\'s own action', () => {
     rmSync(tempDir, { recursive: true, force: true });
   });
 
-  /** A real conversation fork: an incoming DM binds one, and its reply fails (no such channel). */
-  async function spawnFork(reply = 'Reply from the fork.') {
-    membrane.pushResponse(createMockResponse([{ type: 'text', text: reply }]));
-    framework.pushEvent({
+  /** An incoming DM on `channel`, which no channel the registry knows. */
+  function dm(messageId: string, text: string, channel = 'missing-channel'): ProcessEvent {
+    return {
       type: 'mcpl:channel-incoming',
       serverId: 'srv',
-      channelId: 'missing-channel',
-      messageId: 'incoming-1',
+      channelId: channel,
+      messageId,
       author: { id: 'user-1', name: 'User' },
-      content: [{ type: 'text', text: 'Hello fork.' }],
+      content: [{ type: 'text', text }],
       timestamp: new Date().toISOString(),
       metadata: { channel_type: 'im' },
       triggerInference: true,
-    } as unknown as ProcessEvent);
+    } as unknown as ProcessEvent;
+  }
+
+  /** A real conversation fork: an incoming DM binds one, and its reply fails (no such channel). */
+  async function spawnFork(reply = 'Reply from the fork.', channel = 'missing-channel') {
+    membrane.pushResponse(createMockResponse([{ type: 'text', text: reply }]));
+    framework.pushEvent(dm(channel === 'missing-channel' ? 'incoming-1' : `incoming-${channel}`, 'Hello fork.', channel));
     await framework.runUntilIdle();
-    const binding = framework.getConversationRouter()!.getBinding('missing-channel');
+    const binding = framework.getConversationRouter()!.getBinding(channel);
     assert.ok(binding, 'the incoming DM must spawn a real conversation fork');
     return framework.getAgent(binding.agentName)!;
   }
@@ -171,7 +184,7 @@ describe('notices about an agent\'s own action', () => {
       assert.equal(metadata?.system, true);
       assert.equal(metadata?.kind, 'discord-send-failed');
       assert.equal(metadata?.channelId, 'missing-channel');
-      assert.match(String(metadata?.reason), /no registered channel/);
+      assert.equal(metadata?.reason, 'no channel "missing-channel" is registered here');
       assert.equal(metadata?.textLen, 5);
       t.mock.restoreAll();
       const { messages } = await framework.getAgent('secondary')!.getContextManager().compile();
@@ -264,7 +277,7 @@ describe('notices about an agent\'s own action', () => {
       assert.equal(primary.mock.callCount(), 1);
       const [, content, metadata] = primary.mock.calls[0]!.arguments;
       assert.match(JSON.stringify(content),
-        /\[discord-send-failed\] A reply by released-conversation \(5 chars\) could not be delivered to missing-channel \(no registered channel[^)]*\)\. Nothing was posted\. released-conversation has ended\./);
+        /\[discord-send-failed\] A reply by released-conversation \(5 chars\) could not be delivered to missing-channel \(no channel \\"missing-channel\\" is registered here\)\. Nothing was posted\. released-conversation has ended\./);
       assert.equal(metadata?.speaker, 'released-conversation');
       assert.equal(metadata?.textLen, 5);
       assert.equal(internals(framework).pendingRequests.length, 0, 'context only: the primary is not woken');
@@ -533,7 +546,7 @@ describe('notices about an agent\'s own action', () => {
       const told = messages.filter((m) => JSON.stringify(m.content).includes(SEND_FAILED));
       assert.equal(told.length, 1);
       assert.match(JSON.stringify(told[0]!.content),
-        new RegExp(`A reply by ${fork.name} \\(${reply.length} chars\\) could not be delivered to missing-channel \\(no registered channel[^)]*\\)\\. Nothing was posted\\. ${fork.name} has ended\\.`));
+        new RegExp(`A reply by ${fork.name} \\(${reply.length} chars\\) could not be delivered to missing-channel \\(no channel \\\\"missing-channel\\\\" is registered here\\)\\. Nothing was posted\\. ${fork.name} has ended\\.`));
     });
 
     it('passes on only what a fork never read: a notice its later turn compiled stays its own', async () => {
@@ -560,6 +573,415 @@ describe('notices about an agent\'s own action', () => {
       const told = messages.filter((m) => JSON.stringify(m.content).includes(SEND_FAILED));
       assert.equal(told.length, 1);
       assert.match(JSON.stringify(told[0]!.content), new RegExp(`A reply by ${fork.name} \\(${second.length} chars\\)`));
+    });
+
+    /** A clean stop() and a restart on the same store: a restart re-creates no fork. */
+    async function restart() {
+      await framework.stop();
+      framework = await host();
+    }
+
+    /** The registry learns a label for `channel` after the fork's reply to it failed. */
+    function learnLabel(channel: string, label: string) {
+      (internals(framework).channelRegistry as unknown as { channels: Map<string, unknown> }).channels
+        .set(`srv:${channel}`, { serverId: 'srv', descriptor: { id: channel, type: 'discord', label }, open: true });
+    }
+
+    async function primaryNotices() {
+      const { messages } = await framework.getAgent('primary')!.getContextManager().compile();
+      return messages.map((m) => JSON.stringify(m.content)).filter((text) => text.includes(SEND_FAILED));
+    }
+
+    it('tells the primary of each failure notice a live fork never read when stop() ends the forks, by the channel\'s label, so it outlasts a restart', async () => {
+      const reply = 'Reply from the fork.';
+      const first = await spawnFork(reply);
+      const second = await spawnFork(reply, 'missing-channel-2');
+      // The label is the registry's until stop() forgets its channels, so the
+      // notice has it only if the forks end before that.
+      learnLabel('missing-channel', '#general');
+      const disposed: string[] = [];
+      framework.onTrace((event) => { if (event.type === 'mcpl:conversation-disposed') disposed.push(String(event.agentName)); });
+      const stopped = framework;
+
+      await restart();
+
+      assert.deepEqual(disposed, [first.name, second.name], 'stop() ends each fork as its end does');
+      assert.equal(stopped.getAgent(first.name), null, 'the fork is removed');
+      assert.equal(stopped.getAgent(second.name), null);
+      const told = await primaryNotices();
+      assert.equal(told.length, 2, told.join('\n'));
+      assert.match(told[0]!, new RegExp(`A reply by ${first.name} \\(${reply.length} chars\\) could not be delivered to #general \\(missing-channel\\).*${first.name} has ended\\.`));
+      assert.match(told[1]!, new RegExp(`A reply by ${second.name} \\(${reply.length} chars\\) could not be delivered to missing-channel-2 .*${second.name} has ended\\.`));
+    });
+
+    it('keeps that notice, and one queued for the fork, in the persisted queue when stop() ends the fork while quiesced, by the channel\'s label, and writes nothing to the fork\'s window, for the primary at resume', async () => {
+      const reply = 'Reply from the fork.';
+      const fork = await spawnFork(reply);
+      learnLabel('missing-channel', '#general');
+      await framework.quiesce({ reason: 'test window' });
+      internals(framework).addMessage('user', [{ type: 'text', text: 'QUEUED FOR THE FORK' }], undefined, { forAgent: fork.name });
+      internals(framework).addMessage('user', [{ type: 'text', text: `${SEND_FAILED} QUEUED FOR THE FORK.` }],
+        { system: true, kind: 'discord-send-failed', channelId: 'missing-channel', reason: 'a late failure', textLen: 7 }, { forAgent: fork.name });
+      assert.ok(internals(framework).deferredMessages.some((m) => m.forAgent === fork.name), 'the writes wait in the queue');
+
+      await restart();
+
+      assert.deepEqual(await primaryNotices(), [], 'deferred while quiesced, not stored');
+      const window = await ContextManager.open({
+        store: framework.getStore(), namespace: `conversations/${fork.name}`, isolate: true, strategy: new PassthroughStrategy(),
+      });
+      assert.ok(!window.getAllMessages().some((m) => JSON.stringify(m.content).includes('QUEUED FOR THE FORK')),
+        'a quiesced fork\'s release is postponed, so nothing queued for it lands in its window');
+      await framework.resume();
+      const told = await primaryNotices();
+      assert.equal(told.length, 2, told.join('\n'));
+      for (const length of [reply.length, 7]) {
+        assert.ok(told.some((text) => new RegExp(`A reply by ${fork.name} \\(${length} chars\\) could not be delivered to #general \\(missing-channel\\)`).test(text)),
+          told.join('\n'));
+      }
+    });
+
+    it('drops, logged, a failed reply queued for a quiesced fork with no channel to reach when stop() ends the fork', async () => {
+      const fork = await spawnFork();
+      await framework.quiesce({ reason: 'test window' });
+      internals(framework).addMessage('user', [{ type: 'text', text: `${SEND_FAILED} QUEUED FOR THE FORK.` }],
+        { system: true, kind: 'discord-send-failed', channelId: '', reason: 'no channel', textLen: 9 }, { forAgent: fork.name });
+      const errors: string[] = [];
+      const error = console.error;
+      console.error = (...args: unknown[]) => { errors.push(args.map(String).join(' ')); };
+      try {
+        await framework.stop();
+      } finally {
+        console.error = error;
+      }
+      assert.ok(!internals(framework).deferredMessages.some((m) => m.forAgent === fork.name), 'nothing stays queued for the fork');
+      assert.ok(errors.some((line) => line.includes(`${fork.name} has ended, and its reply had no channel to reach`)), errors.join('\n'));
+      framework = await host();
+      await framework.resume();
+      assert.ok(!(await primaryNotices()).some((text) => text.includes('(9 chars)')), 'no one is told of it');
+    });
+
+    it('looks a marked failed reply queued for a fork up in the primary\'s window when stop() ends the fork: a copy that landed there isn\'t written again', async () => {
+      const fork = await spawnFork();
+      const state = internals(framework) as ReturnType<typeof internals> & { deferredSeq: number };
+      // A failed reply held for the fork whose earlier write may have landed,
+      // its store unread, and a copy of it under its id that did land in the
+      // primary's window. (Not quiesced: there the entry is deferred again,
+      // and after resume the primary holds one copy with the mark's lookup or
+      // without it, so the test couldn't tell them apart.)
+      const id = 'marked-failed-reply';
+      (state.deferredMessages as unknown[]).push({
+        id, seq: ++state.deferredSeq, participant: 'user', heldAt: Date.now(), forAgent: fork.name, landing: 'unknown',
+        content: [{ type: 'text', text: `${SEND_FAILED} QUEUED FOR THE FORK.` }],
+        metadata: { system: true, kind: 'discord-send-failed', channelId: 'missing-channel', reason: 'a late failure', textLen: 7 },
+      });
+      framework.getAgent('primary')!.getContextManager()
+        .addMessage('user', [{ type: 'text', text: 'AN EARLIER COPY' }], { deferredWriteId: id } as never);
+
+      await restart();
+
+      const copies = framework.getAgent('primary')!.getContextManager().getAllMessages()
+        .filter((m) => (m.metadata as { deferredWriteId?: string } | undefined)?.deferredWriteId === id);
+      assert.equal(copies.length, 1, 'found by its id, it is not written to the primary again');
+    });
+
+    /** How `promise` ends within `ms`: it returned, it rejected, or it's still
+     *  waiting, as runUntilIdle() waits on a stream entry that outlives its
+     *  stream. */
+    async function outcomeWithin(promise: Promise<unknown>, ms: number): Promise<'returned' | 'rejected' | 'still waiting'> {
+      let timer!: ReturnType<typeof setTimeout>;
+      const late = new Promise<'still waiting'>((resolve) => { timer = setTimeout(() => resolve('still waiting'), ms); });
+      const outcome = await Promise.race([promise.then(() => 'returned' as const, () => 'rejected' as const), late]);
+      clearTimeout(timer);
+      return outcome;
+    }
+
+    it('ends a fork whose stream outlasts stop()\'s wait: its release tells the primary of the failure notice queued behind its turn, and no entry of its stream outlives the stream', { timeout: 30_000 }, async () => {
+      const reply = 'Reply from the fork.';
+      const fork = await spawnFork(reply);
+      let release!: () => void;
+      const released = new Promise<void>((resolve) => { release = resolve; });
+      membrane.streamYielding = (request) => {
+        membrane.calls.push(request);
+        return new HeldStream(released, [createMockResponse([{ type: 'text', text: 'A held reply.' }])]);
+      };
+      try {
+        framework.start();
+        framework.pushEvent(dm('incoming-2', 'Are you there?'));
+        // Registered, not just made: a stream made after stop() begins is
+        // dropped before it sends anything, and stop() has nothing to wait for.
+        const deadline = Date.now() + 10_000;
+        while (Date.now() < deadline && !internals(framework).activeStreams.has(fork.name)) {
+          await new Promise((resolve) => setTimeout(resolve, 10));
+        }
+        const handle = internals(framework).activeStreams.get(fork.name);
+        assert.ok(handle, "the fork's stream registered");
+        // This turn read the first reply's notice when it compiled. An earlier
+        // reply's failure that arrives now waits in the queue behind the turn.
+        (internals(framework).channelRegistry as unknown as {
+          onRouteFailure(info: { conversationId: string; channelId: string | null; reason: string; textLen: number }): void
+        }).onRouteFailure({ conversationId: fork.name, channelId: 'missing-channel', reason: 'a late failure', textLen: 5 });
+        assert.ok(internals(framework).deferredMessages.some((m) => m.forAgent === fork.name), 'the notice waits behind the turn');
+
+        const outcome = await framework.stop(100).then(() => null, (error: unknown) => error);
+        assert.ok(outcome instanceof ShutdownTimeoutError, String(outcome));
+        assert.equal(framework.getAgent(fork.name), null, 'a fork ends whatever its stream is doing');
+        const told = await primaryNotices();
+        assert.ok(told.some((text) => text.includes(`A reply by ${fork.name} (5 chars)`) && text.includes(`${fork.name} has ended.`)),
+          told.join('\n'));
+
+        release();
+        await handle!.then(() => {}, () => {});
+        assert.equal(internals(framework).activeStreams.has(fork.name), false, "no entry of the fork's stream outlives the stream");
+        assert.equal(await outcomeWithin(framework.runUntilIdle(), 10_000), 'returned');
+        await restart();
+
+        assert.ok((await primaryNotices()).some((text) => text.includes(`A reply by ${fork.name} (5 chars)`)), 'it outlasts a restart');
+      } finally {
+        release();
+      }
+    });
+
+    /** A stream that ignores its cancel and ends later with no event at all,
+     *  once `closed` settles. */
+    class SilentlyClosingStream extends MockYieldingStream {
+      constructor(private readonly closed: Promise<void>) { super([]); }
+      override async *[Symbol.asyncIterator](): AsyncGenerator<never> {
+        await this.closed;
+      }
+    }
+
+    it('ends a quiesced fork whose stream outlasts stop()\'s wait: stop() sends its queued failed reply to the primary, and the stream\'s late end leaves nothing behind', { timeout: 30_000 }, async () => {
+      const fork = await spawnFork('Reply from the fork.');
+      let close!: () => void;
+      const closed = new Promise<void>((resolve) => { close = resolve; });
+      membrane.streamYielding = (request) => {
+        membrane.calls.push(request);
+        return new SilentlyClosingStream(closed);
+      };
+      const state = internals(framework);
+      try {
+        framework.start();
+        framework.pushEvent(dm('incoming-2', 'Are you there?'));
+        const deadline = Date.now() + 10_000;
+        while (Date.now() < deadline && !state.activeStreams.has(fork.name)) {
+          await new Promise((resolve) => setTimeout(resolve, 10));
+        }
+        const handle = state.activeStreams.get(fork.name);
+        assert.ok(handle, "the fork's stream registered");
+        let settled = false;
+        void handle!.then(() => { settled = true; }, () => { settled = true; });
+        // What a context-budget restart that ended with no stream of its own
+        // leaves: its predecessor's stream still running, and no turn token
+        // held, so the quiesce has no turn to wait for.
+        state.activeTurnTokens.delete(fork.name);
+        await framework.quiesce({ reason: 'test window' });
+        (state.channelRegistry as unknown as {
+          onRouteFailure(info: { conversationId: string; channelId: string | null; reason: string; textLen: number }): void
+        }).onRouteFailure({ conversationId: fork.name, channelId: 'missing-channel', reason: 'a late failure', textLen: 5 });
+        const queued = state.deferredMessages.find((m) => m.forAgent === fork.name) as { id: string } | undefined;
+        assert.ok(queued, 'the late failed reply waits in the queue');
+
+        const outcome = await framework.stop(100).then(() => null, (error: unknown) => error);
+        assert.ok(outcome instanceof ShutdownTimeoutError, String(outcome));
+        assert.equal(framework.getAgent(fork.name), null, 'a fork ends whatever its stream is doing');
+        const entry = state.deferredMessages.find((m) => (m as { id?: string }).id === queued.id);
+        assert.ok(entry, 'the entry is still queued, under its own id');
+        assert.equal(entry.forAgent, undefined, 'for the primary');
+
+        // The stream ends with no event.
+        close();
+        const until = Date.now() + 5_000;
+        while (Date.now() < until && !settled) await new Promise((resolve) => setTimeout(resolve, 10));
+        assert.ok(settled, 'the stream ended');
+        assert.equal(state.activeStreams.has(fork.name), false, "no entry of the fork's stream outlives the stream");
+        assert.equal(await outcomeWithin(framework.runUntilIdle(), 10_000), 'returned');
+
+        await restart();
+        await framework.resume();
+        const told = await primaryNotices();
+        assert.ok(told.some((text) => text.includes(`A reply by ${fork.name} (5 chars)`)), told.join('\n'));
+      } finally {
+        close();
+      }
+    });
+
+    it('ends a fork whose turn holds its token: stop() sends its queued failed reply to the primary, so a flush of that turn into the fork\'s own window afterwards meets nothing', async () => {
+      const reply = 'Reply from the fork.';
+      const fork = await spawnFork(reply);
+      const state = internals(framework) as ReturnType<typeof internals> & {
+        flushForStart(agent: unknown, occasion: 'turn-start' | 'assembly'): boolean;
+      };
+      await framework.quiesce({ reason: 'test window' });
+      state.addMessage('user', [{ type: 'text', text: `${SEND_FAILED} QUEUED FOR THE FORK.` }],
+        { system: true, kind: 'discord-send-failed', channelId: 'missing-channel', reason: 'a late failure', textLen: 7 }, { forAgent: fork.name });
+      // Its turn holds its token without a stream, as one still assembling or
+      // compiling does. A stop() whose wait ran out on such a turn fails and
+      // leaves storage open; here a teardown step fails instead.
+      state.activeTurnTokens.set(fork.name, 7);
+      const registry = state.channelRegistry as unknown as { stopAll(): void };
+      const stopAll = registry.stopAll.bind(registry);
+      registry.stopAll = () => { throw new Error('zz a teardown step failed'); };
+      const failure = await framework.stop().then(() => null, (error: unknown) => error);
+      registry.stopAll = stopAll;
+      assert.match(String(failure), /zz a teardown step failed/);
+      assert.equal(framework.getAgent(fork.name), null, 'a fork ends whatever its turn is doing');
+      assert.ok(!state.deferredMessages.some((m) => m.forAgent === fork.name), "stop()'s pass took what was queued for it");
+
+      // The turn unwinds through its assembly, whose flush writes into the
+      // fork's own window, past readdDrained.
+      assert.equal(state.flushForStart(fork, 'assembly'), false);
+      assert.ok(!fork.getContextManager().getAllMessages().some((m) => JSON.stringify(m.content).includes('QUEUED FOR THE FORK')),
+        "nothing lands in the fork's window");
+      state.activeTurnTokens.delete(fork.name);
+      await restart();
+      await framework.resume();
+
+      const told = await primaryNotices();
+      assert.ok(told.some((text) => text.includes(`A reply by ${fork.name} (${reply.length} chars)`)), told.join('\n'));
+      assert.ok(told.some((text) => text.includes(`A reply by ${fork.name} (7 chars)`)), told.join('\n'));
+    });
+
+    it('settles the tool-result batch and the open tool round a fork still holds when stop() ends it', async () => {
+      const fork = await spawnFork('Reply from the fork.');
+      const guard = fork.toolResultGuard;
+      guard.setOverride(true);
+      guard.storeResults(
+        [{ type: 'tool_result', toolUseId: 'held-call', content: 'A held result.' }] as never,
+        [{ toolUseId: 'held-call', content: 'A held result.' }] as never,
+        [{ id: 'held-call', name: 'held--tool', input: {}, result: { toolUseId: 'held-call', content: 'A held result.' } }] as never,
+        undefined, undefined);
+      assert.ok(guard.hasPending, 'its batch is pending');
+      const abandoned: string[] = [];
+      const abandon = guard.abandon.bind(guard);
+      guard.abandon = (reason: string) => { abandoned.push(reason); abandon(reason); };
+      const state = internals(framework);
+      state.pendingAssistantBlocks.set(fork.name, []);
+
+      await restart();
+
+      assert.deepEqual(abandoned, ['aborted'], "the fork's end withheld its batch as aborted");
+      assert.equal(guard.hasPending, false);
+      assert.equal(state.pendingAssistantBlocks.has(fork.name), false, "and took its open tool round's entry");
+    });
+
+    it('ends a fork whose batch can\'t be settled all the same: stop() logs it, and the fork is deregistered and released', async () => {
+      const reply = 'Reply from the fork.';
+      const fork = await spawnFork(reply);
+      const guard = fork.toolResultGuard;
+      Object.defineProperty(guard, 'hasPending', { get: () => true, configurable: true });
+      guard.abandon = () => { throw new Error('zz the batch could not be settled'); };
+      const state = internals(framework);
+      state.pendingAssistantBlocks.set(fork.name, []);
+      const stopped = framework;
+      const errors: string[] = [];
+      const error = console.error;
+      console.error = (...args: unknown[]) => { errors.push(args.map(String).join(' ')); };
+      try {
+        await restart();
+      } finally {
+        console.error = error;
+      }
+
+      assert.ok(errors.some((line) => line.includes(`agent=${fork.name} failed to record a batch the fork left`)), errors.join('\n'));
+      assert.equal(stopped.getAgent(fork.name), null, 'the fork is deregistered');
+      assert.equal(state.pendingAssistantBlocks.has(fork.name), false, "its open tool round's entry is gone");
+      assert.ok((await primaryNotices()).some((text) => text.includes(`A reply by ${fork.name} (${reply.length} chars)`)), 'its release passed its notice on');
+    });
+
+    it('ends the other forks when one fork\'s end throws, fails with that error, and a second stop() ends that fork too', async () => {
+      const first = await spawnFork();
+      const second = await spawnFork('Reply from the fork.', 'missing-channel-2');
+      const owner = framework as unknown as { disposeConversationAgent(name: string): void };
+      const usual = owner.disposeConversationAgent.bind(framework);
+      const error = new Error("zz the first fork's end failed");
+      owner.disposeConversationAgent = (name: string) => {
+        if (name === first.name) throw error;
+        usual(name);
+      };
+
+      const failure = await framework.stop().then(() => null, (e: unknown) => e);
+
+      assert.ok(failure === error || (failure instanceof AggregateError && failure.errors.includes(error)), String(failure));
+      assert.equal(framework.getAgent(second.name), null, "the other fork's end still ran");
+      assert.equal(framework.getAgent(first.name), first, 'the fork whose end threw is still registered');
+      delete (owner as { disposeConversationAgent?: unknown }).disposeConversationAgent;
+      await restart();
+      const told = await primaryNotices();
+      assert.equal(told.length, 2, told.join('\n'));
+      assert.ok(told.some((text) => text.includes(`A reply by ${first.name} `)), told.join('\n'));
+    });
+
+    it('routes a message still queued at stop() to a new fork when the same instance starts again, since stop() unbinds the channel', async () => {
+      // start() after a settled stop() needs a store the host owns: an owned one is closed.
+      await framework.stop();
+      const store = JsStore.openOrCreate({ path: join(tempDir, 'host-owned.chronicle') });
+      try {
+        framework = await AgentFramework.create({
+          store,
+          membrane: membrane.asMembrane(),
+          agents: [{ name: 'primary', model: 'test-model', systemPrompt: 'Primary.', proseRouting: 'locus' }],
+          modules: [],
+          conversations: { templateAgent: 'primary' },
+        });
+        await internals(framework).initializeMcpl([]);
+        const fork = await spawnFork();
+        // After stop() the queue refuses new events, so only one already queued can reach the router.
+        framework.pushEvent(dm('incoming-2', 'LEFT QUEUED'));
+        await framework.stop();
+        assert.equal(framework.getConversationRouter()!.getBinding('missing-channel'), undefined, 'the channel unbinds with its fork');
+
+        membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Reply from the next fork.' }]));
+        framework.start();
+        const deadline = Date.now() + 10_000;
+        let next: string | undefined;
+        while (Date.now() < deadline && !(next = framework.getConversationRouter()!.getBinding('missing-channel')?.agentName)) {
+          await new Promise((resolve) => setTimeout(resolve, 20));
+        }
+        assert.ok(next && next !== fork.name, `a new generation binds the channel (bound: ${next})`);
+        await framework.stop();
+        const window = await ContextManager.open({ store, namespace: `conversations/${next}`, isolate: true, strategy: new PassthroughStrategy() });
+        assert.ok(window.getAllMessages().some((m) => JSON.stringify(m.content).includes('LEFT QUEUED')), 'the message lands in its window');
+      } finally {
+        await framework.stop().catch(() => {});
+        store.close();
+      }
+    });
+
+    it('fails a spawn whose fork stop() ends before the spawn binds it, so no binding names the fork, and the channel\'s next message spawns the next generation', async () => {
+      // stop() unbinds a channel only where its binding names the fork it
+      // ends, and a spawn binds only once its fork's creation has returned.
+      // Ending the fork in that gap as stop()'s loop does
+      // (disposeConversationAgent, with no binding to remove) stands in for a
+      // stop() that runs then.
+      const state = framework as unknown as {
+        createConversationAgent(name: string, channelId: string): Promise<unknown>;
+        disposeConversationAgent(name: string): void;
+      };
+      const create = state.createConversationAgent;
+      let ended: string | undefined;
+      state.createConversationAgent = async function (this: typeof state, name, channelId) {
+        const agent = await create.call(this, name, channelId);
+        this.disposeConversationAgent(name);
+        ended = name;
+        return agent;
+      };
+      const failed: string[] = [];
+      framework.onTrace((event) => { if (event.type === 'mcpl:conversation-spawn-failed') failed.push(String(event.error)); });
+
+      framework.pushEvent(dm('incoming-1', 'Hello fork.'));
+      await framework.runUntilIdle();
+      assert.ok(ended, 'the fork was created and then ended before its bind');
+      assert.equal(framework.getConversationRouter()!.getBinding('missing-channel'), undefined, 'no binding names the ended fork');
+      assert.equal(failed.length, 1, 'the spawn fails, as a failed spawn does');
+      assert.match(failed[0]!, /ended before its channel was bound/);
+
+      delete (state as { createConversationAgent?: unknown }).createConversationAgent;
+      membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Reply from the next fork.' }]));
+      framework.pushEvent(dm('incoming-2', 'Hello again.'));
+      await framework.runUntilIdle();
+      const next = framework.getConversationRouter()!.getBinding('missing-channel')?.agentName;
+      assert.ok(next && next !== ended, `the next generation binds the channel (bound: ${next}; failed: ${failed.join(' | ')})`);
     });
 
     it('does not reap a closing fork whose turn holds its token before its stream registers', async () => {
@@ -938,7 +1360,7 @@ describe('notices about an agent\'s own action', () => {
           const noticeIndex = messages.findIndex((m) => JSON.stringify(m.content).includes(SEND_FAILED));
           assert.ok(noticeIndex > replyIndex, 'the archived failure notice follows the closure reply');
           assert.equal(count(messages, SEND_FAILED), 1);
-          assert.match(JSON.stringify(messages[noticeIndex]!.content), /Your previous reply.*delivered:false/);
+          assert.match(JSON.stringify(messages[noticeIndex]!.content), /Your previous reply.*server said it didn't post the message/);
           // Every write of a drained entry carries its durable id (drainDeferredFor).
           const stored = archive.getAllMessages().find((m) => JSON.stringify(m.content).includes(SEND_FAILED));
           const id = (stored?.metadata as { deferredWriteId?: unknown } | undefined)?.deferredWriteId;
@@ -958,7 +1380,7 @@ describe('notices about an agent\'s own action', () => {
         const told = primary.messages.filter((m) => JSON.stringify(m.content).includes(SEND_FAILED));
         assert.equal(told.length, 1);
         assert.match(JSON.stringify(told[0]!.content),
-          new RegExp(`A reply by ${fork.name} \\(${finalReply.length} chars\\) could not be delivered to #closure test \\(closure-channel\\) \\(.*delivered:false.*\\)\\. Nothing was posted\\. ${fork.name} has ended\\.`));
+          new RegExp(`A reply by ${fork.name} \\(${finalReply.length} chars\\) could not be delivered to #closure test \\(closure-channel\\) \\(.*server said it didn't post the message\\)\\. Nothing was posted\\. ${fork.name} has ended\\.`));
         assert.equal(membrane.calls.length, 2, 'only the initial and closure turns ran');
         assert.equal(state.pendingRequests.length, 0, 'a failed closure reply does not wake another turn');
       });
@@ -1112,7 +1534,8 @@ describe('notices about an agent\'s own action', () => {
       created.contextManager.addMessage('user', [{ type: 'text', text: 'Run once.' }]);
       const state = internals(runFramework);
       runFramework.start();
-      const done = runFramework.runEphemeralToCompletion(created.agent, created.contextManager, { idleTimeoutMs: 300, idlePollMs: 50 });
+      const done = runFramework.runEphemeralToCompletion(created.agent, created.contextManager, UNREACHED_WATCHDOG);
+      const ended = done.then(() => null, (error: unknown) => error);
       for (let i = 0; i < 400 && !state.activeStreams.has('worker'); i++) await new Promise((resolve) => setTimeout(resolve, 5));
       assert.ok(state.activeStreams.has('worker'), 'the run\'s stream started');
       // A failed reply queued for the run's turn end, which the run's stall
@@ -1122,7 +1545,8 @@ describe('notices about an agent\'s own action', () => {
         content: [{ type: 'text', text: `${SEND_FAILED} Your previous reply (5 chars) could not be delivered to #x (missing-channel).` }],
         metadata: { system: true, kind: 'discord-send-failed', channelId: 'missing-channel', reason: 'no registered channel', textLen: 5 },
       });
-      await assert.rejects(done, /stalled/);
+      silenceRun(runFramework, 'worker');
+      assert.match(String(await ended), /stalled/, 'the idle watchdog ended the run');
       release();
       for (let i = 0; i < 20; i++) await new Promise((resolve) => setImmediate(resolve));
 
@@ -1192,6 +1616,32 @@ describe('notices about an agent\'s own action', () => {
       assert.equal(passed[0]!.metadata?.speaker, 'worker');
     });
 
+    it('passes a failed reply a run stored unread on to the primary\'s queue when stop()\'s sweep ends the run while the host is quiesced', async () => {
+      const created = await runFramework.createEphemeralAgent({
+        name: 'worker', model: 'test-model', systemPrompt: 'Do the task.', allowedTools: 'all', proseRouting: 'explicit',
+      });
+      created.contextManager.addMessage('user', [{ type: 'text', text: 'Run once.' }]);
+      created.contextManager.addMessage('user',
+        [{ type: 'text', text: `${SEND_FAILED} Your previous reply (5 chars) could not be delivered to #x (missing-channel).` }],
+        { system: true, kind: 'discord-send-failed', channelId: 'missing-channel', reason: 'no registered channel', textLen: 5 } as never);
+      const state = internals(runFramework) as unknown as ReturnType<typeof internals> & { releasesAfterResume: Map<string, unknown> };
+      // Not started, and its watchdog far off: stop()'s sweep ends it, and its
+      // end postpones its window's release after stop()'s first pass has run.
+      const ended = runFramework.runEphemeralToCompletion(created.agent, created.contextManager, { startupTimeoutMs: 60_000 })
+        .then(() => null, (error: unknown) => error);
+      state.quiesced = true;
+
+      await runFramework.stop();
+
+      assert.ok(await ended instanceof Error, 'stop() ended the run');
+      assert.equal(state.releasesAfterResume.size, 0, 'no release is left postponed');
+      const passed = (state.deferredMessages as unknown as Array<{ forAgent?: string; content: ContentBlock[]; metadata?: Record<string, unknown> }>)
+        .filter((m) => JSON.stringify(m.content).includes('A reply by worker'));
+      assert.equal(passed.length, 1, 'queued for the primary, for resume or boot');
+      assert.equal(passed[0]!.forAgent, undefined, "the primary's");
+      assert.equal(passed[0]!.metadata?.speaker, 'worker');
+    });
+
     it('completes a release whose window can\'t be read for what it left unread: what was queued lands, logged', async (t) => {
       const errors: string[] = [];
       t.mock.method(console, 'error', (...args: unknown[]) => { errors.push(args.map(String).join(' ')); });
@@ -1244,7 +1694,10 @@ describe('notices about an agent\'s own action', () => {
       runMembrane.streamYielding = (request) => {
         runMembrane.calls.push(request);
         // Yields nothing, cancel included, until released; then a tool call.
-        held = new WatchedHeldStream(released, [createMockResponse([{ type: 'tool_use', id: 'late-1', name: 'sender--noop', input: {} }], 'tool_use')]);
+        // The response has no usage, which the mock would yield before it.
+        const late: Partial<NormalizedResponse> = createMockResponse([{ type: 'tool_use', id: 'late-1', name: 'sender--noop', input: {} }], 'tool_use');
+        delete late.usage;
+        held = new WatchedHeldStream(released, [late as NormalizedResponse]);
         return held;
       };
       const calls = t.mock.method(sender, 'handleToolCall');
@@ -1254,11 +1707,13 @@ describe('notices about an agent\'s own action', () => {
       created.contextManager.addMessage('user', [{ type: 'text', text: 'Run once.' }]);
       const state = internals(runFramework);
       runFramework.start();
-      const done = runFramework.runEphemeralToCompletion(created.agent, created.contextManager, { idleTimeoutMs: 1000, idlePollMs: 50 });
+      const done = runFramework.runEphemeralToCompletion(created.agent, created.contextManager, UNREACHED_WATCHDOG);
+      const ended = done.then(() => null, (error: unknown) => error);
       for (let i = 0; i < 400 && !state.activeStreams.has('worker'); i++) await new Promise((resolve) => setTimeout(resolve, 5));
       assert.ok(state.activeStreams.has('worker'), 'the run\'s stream started');
       state.quiesced = true;
-      await assert.rejects(done, /stalled/);
+      silenceRun(runFramework, 'worker');
+      assert.match(String(await ended), /stalled/, 'the idle watchdog ended the run');
       assert.equal(runFramework.getAgent('worker'), null, 'the ended run is deregistered at once, quiesced or not');
       assert.ok((state as unknown as { releasesAfterResume: Map<string, unknown> }).releasesAfterResume.has('worker'), 'it ended while quiesced');
 
@@ -1269,7 +1724,7 @@ describe('notices about an agent\'s own action', () => {
       ]);
 
       assert.ok(left, 'its stream was left, before the 5 s bound');
-      assert.equal(held!.yielded, 1, 'it yielded the late tool call first');
+      assert.deepEqual(held!.yielded, ['tool-calls'], 'it yielded the late tool call, and nothing after it');
       assert.equal(calls.mock.callCount(), 0, 'its late tool call is not dispatched');
       await runFramework.resume({ force: true });
     });

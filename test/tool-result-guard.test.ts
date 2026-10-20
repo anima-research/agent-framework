@@ -11,6 +11,7 @@ import { AgentFramework, type AgentConfig, type AgentSettingsExtension, type Mod
   type ToolCall, type ToolResult, type ProcessEvent, type ProcessState } from '../src/index.js';
 import { TOOL_RESULT_GUARD_AUDIT_STATE, TOOL_RESULT_GUARD_NOTICE, keptWhenWithheld, withheldResultNotice } from '../src/tool-result-guard.js';
 import { MockYieldingStream, createMockResponse } from './helpers/mock-membrane.js';
+import { UNREACHED_WATCHDOG, silenceRun } from './helpers/run-watchdog.js';
 import { WorkspaceModule } from '../src/modules/workspace/index.js';
 import { DEFAULT_TOOL_RESULT_INLINE_MAX_CHARS } from '../src/tool-result-history.js';
 import { JsStore } from '@animalabs/chronicle';
@@ -2324,9 +2325,13 @@ for (const how of ['an uncaused error', 'an abort whose reason is timeout', 'the
       });
       created.contextManager.addMessage('user', [{ type: 'text', text: 'read' }]);
       const completion = h.framework.runEphemeralToCompletion(created.agent, created.contextManager,
-        how === 'the completion watchdog' ? { idleTimeoutMs: 200, idlePollMs: 20 } : undefined)
+        how === 'the completion watchdog' ? UNREACHED_WATCHDOG : undefined)
         .then(() => { outcome = 'resolved'; }, (e) => { outcome = `rejected: ${(e as Error).message}`; });
       h.framework.start();
+      if (how === 'the completion watchdog') {
+        await until(() => created.agent.toolResultGuard.hasPending, 'the results went in');
+        silenceRun(h.framework, 'ephemeral');
+      }
       await bounded(completion, 'the run settling');
       assert.equal(created.agent.toolResultGuard.hasPending, false, 'the run left no batch pending');
     } finally { await h.framework.stop(); }
@@ -2408,12 +2413,15 @@ for (const how of ["stop()'s sweep", 'the completion watchdog during a stop()'] 
       });
       created.contextManager.addMessage('user', [{ type: 'text', text: 'read' }]);
       const completion = h.framework.runEphemeralToCompletion(created.agent, created.contextManager,
-        how === "stop()'s sweep" ? undefined : { idleTimeoutMs: 200, idlePollMs: 20 })
+        how === "stop()'s sweep" ? undefined : UNREACHED_WATCHDOG)
         .then(() => { outcome = 'resolved'; }, (e) => { outcome = `rejected: ${(e as Error).message}`; });
       h.framework.start();
-      for (let i = 0; i < 400 && !created.agent.toolResultGuard.hasPending; i++) await new Promise((r) => setTimeout(r, 5));
-      assert.ok(created.agent.toolResultGuard.hasPending, 'the results went in');
-      const stopped = await h.framework.stop(how === "stop()'s sweep" ? 100 : 1_000).then(() => 'resolved', (e: unknown) => e);
+      await until(() => created.agent.toolResultGuard.hasPending, 'the results went in');
+      const stopping = h.framework.stop(how === "stop()'s sweep" ? 100 : 1_000);
+      // stop() has closed admission before it returns, so the watchdog's
+      // next poll ends the run as a stop, while stop() waits for the stream.
+      if (how !== "stop()'s sweep") silenceRun(h.framework, 'ephemeral');
+      const stopped = await stopping.then(() => 'resolved', (e: unknown) => e);
       assert.ok(stopped instanceof Error && /^Shutdown timed out/.test(stopped.message), `stop() waited for the stream: ${String(stopped)}`);
       await bounded(completion, 'the run settling');
       assert.equal(h.framework.getAgent('ephemeral'), null, 'the run has left');
@@ -2448,10 +2456,11 @@ test('an ephemeral run whose batch fails to record as it leaves still ends with 
     });
     created.agent.toolResultGuard.abandon = () => { throw new Error('audit unavailable'); };
     created.contextManager.addMessage('user', [{ type: 'text', text: 'read' }]);
-    const completion = h.framework.runEphemeralToCompletion(created.agent, created.contextManager,
-      { idleTimeoutMs: 200, idlePollMs: 20 })
+    const completion = h.framework.runEphemeralToCompletion(created.agent, created.contextManager, UNREACHED_WATCHDOG)
       .then(() => { outcome = 'resolved'; }, (e) => { outcome = `rejected: ${(e as Error).message}`; });
     h.framework.start();
+    await until(() => created.agent.toolResultGuard.hasPending, 'the results went in');
+    silenceRun(h.framework, 'ephemeral');
     await bounded(completion, 'the run settling');
     assert.equal(h.framework.getAgent('ephemeral'), null, 'the run is deregistered');
   } finally { await h.framework.stop(); }

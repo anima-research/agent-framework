@@ -163,7 +163,7 @@ test('routeSpeech surfaces a failure when the server reports delivered:false', a
   assert.equal(res, null, 'a non-delivered send must not report success');
   assert.equal(failures.length, 1, 'onRouteFailure should fire');
   assert.equal(failures[0].channelId, 'ch-x');
-  assert.match(failures[0].reason, /delivered:false/);
+  assert.equal(failures[0].reason, 'the "discord" server said it didn\'t post the message');
   assert.equal(failures[0].outcome, 'failed', 'the server said nothing was delivered');
   assert.ok(traces.some(t => t.type === 'mcpl:speech-route-failed' && t.outcome === 'failed'));
 });
@@ -265,13 +265,27 @@ test('buildChannelContext advertises the fork home as defaultOutgoing (item 3)',
 });
 
 test('routeSpeech surfaces a failure when there is no locus at all', async () => {
-  const { registry, failures } = makeRegistry({ delivered: true });
+  const { registry, failures, traces } = makeRegistry({ delivered: true });
   // No handleIncoming → defaultPublishChannel is null.
-  const res = await registry.routeSpeech('cairn', 'into the void', registry.resolveLocus('cairn'));
+  const lines: string[] = [];
+  const original = console.error;
+  console.error = (...args: unknown[]) => { lines.push(args.map(String).join(' ')); };
+  let res;
+  try {
+    res = await registry.routeSpeech('cairn', 'into the void', registry.resolveLocus('cairn'));
+  } finally {
+    console.error = original;
+  }
   assert.equal(res, null);
+  // connectome-doctor reads the [routeSpeech] line for "no locus".
+  assert.ok(lines.some((line) => line.startsWith('[routeSpeech]') && line.includes('no locus')), lines.join('\n'));
   assert.equal(failures.length, 1);
   assert.equal(failures[0].channelId, null);
-  assert.match(failures[0].reason, /no locus/);
+  assert.equal(failures[0].reason, 'this turn came from no channel, and it had no home or recent channel to reply in; if it ' +
+    'should have had one, ask whoever runs this host');
+  // The trace, like the log line connectome-doctor reads, keeps "no locus".
+  const failed = traces.filter((e) => e.type === 'mcpl:speech-route-failed');
+  assert.deepEqual(failed.map((e) => e.reason), ['turn has no locus (no home/trigger channel; nothing to deliver into)']);
 });
 
 // ── item-3 redux: single TRUNK agents route to the turn's triggering channel ──
@@ -450,12 +464,12 @@ test('routeSpeech does NOT deliver when the open-on-delivery fails', async () =>
   assert.equal(res, null, 'no delivery into a channel that could not be opened');
   assert.equal(publishCalls.length, publishesBefore, 'publish must not be attempted');
   assert.equal(failures.length, 1);
-  assert.match(failures[0]!.reason, /closed and open failed/);
+  assert.match(failures[0]!.reason, /^opening the channel for these words didn't complete: /);
   assert.equal(failures[0]!.outcome, 'failed', 'nothing was published');
 });
 
 test('routeSpeech with an omitted locus fails loudly as a routing bug', async () => {
-  const { registry, failures } = makeRegistry({ delivered: true });
+  const { registry, failures, traces } = makeRegistry({ delivered: true });
   seedRegistered(registry, 'discord', 'ch-y');
   registry.handleIncoming('discord', incoming('ch-y', 'hi'));
 
@@ -464,7 +478,11 @@ test('routeSpeech with an omitted locus fails loudly as a routing bug', async ()
 
   assert.equal(res, null);
   assert.equal(failures.length, 1);
-  assert.match(failures[0]!.reason, /routing bug/);
+  assert.equal(failures[0]!.reason, 'the host lost track of which channel this reply was for; if this keeps happening, ask ' +
+    'whoever runs this host');
+  const failed = traces.filter((e) => e.type === 'mcpl:speech-route-failed');
+  assert.deepEqual(failed.map((e) => e.reason),
+    ['caller passed no locus (routing bug: every speech path must snapshot the turn locus)']);
 });
 
 test('subscription allow-list opens channels discovered AFTER bootstrap (subscribed => open)', async () => {
@@ -1177,6 +1195,7 @@ test('publishForAgent into an inbound-only channel is refused and traced as fail
   const refused = await registry.publishForAgent('body:ears', 'a thought', 'Subconscious');
   assert.equal(refused.success, false);
   assert.match(String(refused.error), /inbound-only: server "body" declared this channel's direction "inbound"/);
+  assert.equal(refused.reason, 'inbound-only');
   assert.equal(publishCalls.length, 0, 'nothing was published');
   assert.equal(routed().length, 0, 'speech that was never posted is not traced as routed');
   const failed = traces.filter((t) => t.type === 'mcpl:speech-route-failed');
@@ -1188,6 +1207,7 @@ test('publishForAgent into an inbound-only channel is refused and traced as fail
 
   const posted = await registry.publishForAgent('body:home', 'a thought', 'Subconscious');
   assert.equal(posted.success, true);
+  assert.equal('reason' in posted, false);
   assert.deepEqual(publishCalls.map((c) => c.channelId), ['body:home']);
   // Shaped as routeSpeech's trace is, but without the surface's message id,
   // though the server named one ('m-77').
@@ -1205,13 +1225,14 @@ test('publishForAgent traces a publish the server reports undelivered as failed,
     added: [{ id: 'body:home', type: 'chat', label: 'Body · home', direction: 'bidirectional' }],
   } as never);
 
-  await registry.publishForAgent('body:home', 'a thought', 'Subconscious');
+  const undelivered = await registry.publishForAgent('body:home', 'a thought', 'Subconscious');
 
   assert.deepEqual(publishCalls.map((c) => c.channelId), ['body:home']);
+  assert.equal('reason' in undelivered, false, 'a publish that went out carries no reason');
   assert.deepEqual(traces.filter((t) => t.type === 'mcpl:speech-routed'), []);
   assert.deepEqual(
     traces.filter((t) => t.type === 'mcpl:speech-route-failed').map((t) => [t.conversationId, t.channelId, t.reason, t.outcome]),
-    [['Subconscious', 'body:home', 'server "body" reported delivered:false', 'failed']],
+    [['Subconscious', 'body:home', 'the "body" server said it didn\'t post the message', 'failed']],
   );
 });
 
@@ -1227,7 +1248,8 @@ test("publishForAgent traces what a rejected publish may have done: unknown afte
     throw new McplRequestError('The "body" server answered with an error: Rate limited after part 1', 'error-response', { posted: ['m-1'] });
   });
   const unconfirmed = await registry.publishForAgent('body:home', 'a long thought', 'Subconscious');
-  assert.equal(unconfirmed.error, 'Publish to body:home wasn\'t confirmed: The "body" server answered with an error: Rate limited after part 1 (delivery uncertain). It may or may not have been posted, so sending it again could post it twice. Connector detail: {"posted":["m-1"]}');
+  assert.equal('reason' in unconfirmed, false, 'a publish that went out carries no reason');
+  assert.equal(unconfirmed.error, 'Posting to channel "body:home" wasn\'t confirmed: The "body" server answered with an error: Rate limited after part 1 (delivery uncertain). It may or may not have been posted, so sending it again could post it twice. Connector detail: {"posted":["m-1"]}');
   assert.deepEqual(failed().map((t) => [t.reason, t.outcome, t.detail]),
     [['The "body" server answered with an error: Rate limited after part 1 (delivery uncertain)', 'unknown', '{"posted":["m-1"]}']],
     "the trace carries the connector's detail, as plain speech's does");
@@ -1236,7 +1258,8 @@ test("publishForAgent traces what a rejected publish may have done: unknown afte
   setOnPublish(async () => {
     throw new McplRequestError('MCPL server "body" did not respond to channels/publish within 30000ms', 'no-response');
   });
-  await registry.publishForAgent('body:home', 'a thought', 'Subconscious');
+  const timedOut = await registry.publishForAgent('body:home', 'a thought', 'Subconscious');
+  assert.equal('reason' in timedOut, false, 'nor does one that timed out');
   assert.equal(failed()[1]!.outcome, 'unknown');
 
   // Only a request that never left proves nothing was posted.
@@ -1244,7 +1267,8 @@ test("publishForAgent traces what a rejected publish may have done: unknown afte
     throw new McplRequestError('Cannot send request: connection to "body" is closed', 'not-sent');
   });
   const notSent = await registry.publishForAgent('body:home', 'another', 'Subconscious');
-  assert.match(notSent.error ?? '', /^Publish to body:home failed: .*is closed\. Nothing was posted\./);
+  assert.equal(notSent.error, 'Nothing was posted to channel "body:home": Cannot send request: connection to "body" is closed.');
+  assert.equal(notSent.reason, 'not-sent', 'one whose request was refused before anything was written is a refusal');
   assert.equal(failed()[2]!.outcome, 'failed');
   assert.equal('detail' in failed()[2]!, false, 'no detail when the connector sent none');
   assert.equal(traces.filter((t) => t.type === 'mcpl:speech-routed').length, 0);
@@ -1426,7 +1450,7 @@ test('a channel removed while the host opens it for speech is refused, and nothi
     assert.equal(await registry.routeSpeech('linn', 'hello', 'body:home'), null);
     assert.deepEqual(openCalls.map((c) => c.channelId), ['body:home']);
     assert.equal(publishCalls.length, 0, 'nothing was published to the removed channel');
-    assert.deepEqual(failures.map((f) => f.reason), ['channel is closed and open failed: Channel is no longer registered: body:home'],
+    assert.deepEqual(failures.map((f) => f.reason), ['opening the channel for these words didn\'t complete: the "body" server no longer lists the channel'],
       `refused as removed, after the answer ${JSON.stringify(answer)}`);
   }
 });
@@ -1439,14 +1463,16 @@ test("a server's refusal of an open or a tool's publish reaches the agent in its
   } as never);
   setOnOpen(async () => { throw refusal(); });
   assert.equal(await registry.routeSpeech('linn', 'hello', 'body:home'), null);
-  assert.deepEqual(failures.map((f) => f.reason), ['channel is closed and open failed: The "body" server answered with an error: Channel unavailable']);
+  assert.deepEqual(failures.map((f) => f.reason), ['opening the channel for these words didn\'t complete: The "body" server answered with an error: Channel unavailable']);
   const opened = await registry.handleChannelToolCall('channel_open', { channelId: 'body:home' }, { kind: 'agent', agentName: 'linn' });
-  assert.equal(opened.error, 'Failed to open channel: The "body" server answered with an error: Channel unavailable (it stays selected for opening: a later delivery or reconnect tries again, and channel_close withdraws that)');
+  assert.equal(opened.error, 'Opening channel "body:home" didn\'t complete; the open stays recorded, and this host tries it again when the ' +
+    '"body" server next registers this channel, if this host may open and close its channels then, or now if you call ' +
+    'channel_open again. The "body" server answered with an error: Channel unavailable.');
 
   setOnOpen(undefined);
   setOnPublish(async () => { throw new McplRequestError('The "body" server answered with an error: Channel not permitted', 'error-response'); });
   const published = await registry.handleChannelToolCall('channel_publish', { channelId: 'body:home', content: 'hi' }, { kind: 'agent', agentName: 'linn' });
-  assert.equal(published.error, 'Publish to body:home wasn\'t confirmed: The "body" server answered with an error: Channel not permitted (delivery uncertain). It may or may not have been posted, so sending it again could post it twice.');
+  assert.equal(published.error, 'Posting to channel "body:home" wasn\'t confirmed: The "body" server answered with an error: Channel not permitted (delivery uncertain). It may or may not have been posted, so sending it again could post it twice.');
 });
 
 test("an open's answer can't lift an inbound-only declaration: a server lifts it by changing or registering the channel (R1-3)", async () => {

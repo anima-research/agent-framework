@@ -430,9 +430,10 @@ export interface McplServerConfig {
    * are also the only bound for one that closes its stdin, since Bun emits no
    * 'error' event for the writes to it. requestTimeoutMs is the timeout of
    * every request that names none; the handshake's initialize has its own.
-   * Set 0 to disable, except for channels/publish and the channels/open a
-   * delivery may send first, which keep the 60 s default: a publish's outcome
-   * is reported to the resident and recorded for its draft, so it must end.
+   * Set 0 to disable, except for channels/publish, channels/open and
+   * channels/close, which keep the 60 s default: a publish's outcome is
+   * reported to the resident and recorded for its draft, so it must end, and
+   * a delivery waits for a channel's queued opens and closes.
    * Default: 60000 (60 seconds). A value above 2^31−1 is refused: Node runs a
    * longer timer after about 1 ms, so every request would time out at once.
    *

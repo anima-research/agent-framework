@@ -1,0 +1,1 @@
+- **Hosts:** a foreground `code_execution` result's `data` is now the text the model reads, as a list of one text block, and its fields, `stdout`, `stderr`, `return_code` and `time_limit_note`, are in `structured`. A host that reads those fields from `data` reads them from `structured`. We found no host that reads them. A background script's results are unchanged.

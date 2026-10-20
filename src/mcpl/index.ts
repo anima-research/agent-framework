@@ -171,6 +171,7 @@ export { InferenceRouter } from './inference-router.js';
 
 // Channel registry (channel lifecycle, incoming messages, synthesized tools)
 export { ChannelRegistry } from './channel-registry.js';
+export type { PublishRefusalReason } from './channel-registry.js';
 
 // Inbound source envelope: where each accepted item came from, stamped once
 export { INBOUND_SOURCE_KEY, readInboundSource, conversationKey } from './inbound-source.js';

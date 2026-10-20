@@ -257,11 +257,16 @@ export interface CoalescingReceiptRecord {
 }
 
 export interface CoalescerHost<E> {
-  /** True iff the placement still exists and no model request has included it. */
+  /** True iff the placement still exists and, as far as the host can tell,
+   *  no model request has included it. The host can't always tell: a
+   *  message injected into a stream that didn't say whether it carries
+   *  injections, as no membrane 0.5.x stream does, counts as unread though
+   *  a request may have included it. */
   isUnread(placement: CoalescingPlacement): boolean;
   /** True iff nothing may have shown the placement to the agent: it is still
-   *  in the deferred queue, or stored where no committing compile has begun
-   *  to assemble it and no tool boundary has injected past it. Unlike
+   *  in the deferred queue and known not to be stored already, or it is
+   *  stored where no committing compile has begun to assemble it and no tool
+   *  boundary has injected past it. Unlike
    *  isUnread, a compile counts from its start, and a boundary counts
    *  whether or not its stream says it carries injected messages: a doubt
    *  counts as shown. */
@@ -639,10 +644,10 @@ export class PushCoalescer<E = unknown> {
   }
 
   /**
-   * Re-check the occupant against the host, member by member: a member a
-   * request has read, or that is gone (isUnread is false either way), becomes
-   * history, and the run keeps the members still unread. Returns whether any
-   * are.
+   * Re-check the occupant against the host, member by member: a member the
+   * host counts as read, or that is gone (isUnread is false either way),
+   * becomes history, and the run keeps the members still unread. Returns
+   * whether any are.
    */
   private refreshOccupant(state: SubjectState<E>): boolean {
     const occupant = state.occupant;
@@ -660,9 +665,10 @@ export class PushCoalescer<E = unknown> {
   /**
    * Remove the occupant and the run it builds on, newest first, auditing each
    * as `kind`. Every member is unread: refreshOccupant has just run, under the
-   * lock, and the host's removal doesn't itself refuse a read message. A
-   * member the host can't remove may be read, so the walk stops there, leaving
-   * it and the renders it builds on, and the history becomes `unknown`.
+   * lock. The host's removal may still refuse one, such as a held write the
+   * host can't tell isn't already stored. A member the host
+   * can't remove may be read, so the walk stops there, leaving it and the
+   * renders it builds on, and the history becomes `unknown`.
    * Returns false then. It doesn't touch `state.occupant`, which still names
    * the members it removed: each caller clears it, so what the walk left is
    * history from then on, as an occupant whose removal failed always was.

@@ -2,7 +2,8 @@
  * McplRequestError: a request that produced no result says which of three
  * things happened, as a fact rather than a message to parse.
  *   not-sent        refused before anything was written (connection closed)
- *   error-response  the server answered with a JSON-RPC error (code, data kept)
+ *   error-response  the server answered with a JSON-RPC error (its words and
+ *                   data kept; the code goes to the log)
  *   no-response     the request was handed to the transport and no answer
  *                   came back (timeout, or the connection closed while
  *                   awaiting): it may or may not have reached the server
@@ -100,6 +101,20 @@ test('channels/open keeps a deadline when requestTimeoutMs is 0, as channels/pub
   connection = await McplServerConnection.connect(config({ requestTimeoutMs: 0 }), HOST_CAPS);
   (connection as unknown as { publishDeadlineMs: number }).publishDeadlineMs = 200;
   const err = await rejectsWith(connection.sendChannelsOpen({ type: 'channel', address: { id: 'nowhere' } } as never), 'no-response');
+  assert.match(err.message, /^The "outcome" server didn't answer within 0\.2 seconds/);
+});
+
+test('channels/close keeps a deadline when requestTimeoutMs is 0, as channels/open does', { timeout: 10_000 }, async () => {
+  connection = await McplServerConnection.connect(config({ requestTimeoutMs: 0 }), HOST_CAPS);
+  (connection as unknown as { publishDeadlineMs: number }).publishDeadlineMs = 200;
+  const err = await rejectsWith(connection.sendChannelsClose({ channelId: 'nowhere' } as never), 'no-response');
+  assert.match(err.message, /^The "outcome" server didn't answer within 0\.2 seconds/);
+});
+
+test('channels/close keeps a configured requestTimeoutMs rather than the deadline for 0', { timeout: 10_000 }, async () => {
+  connection = await McplServerConnection.connect(config({ requestTimeoutMs: 200 }), HOST_CAPS);
+  (connection as unknown as { publishDeadlineMs: number }).publishDeadlineMs = 60_000;
+  const err = await rejectsWith(connection.sendChannelsClose({ channelId: 'nowhere' } as never), 'no-response');
   assert.match(err.message, /^The "outcome" server didn't answer within 0\.2 seconds/);
 });
 

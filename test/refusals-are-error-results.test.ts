@@ -25,8 +25,9 @@ const FIXTURE = join(import.meta.dirname, 'fixtures/tune-out-mcpl-server.mjs');
 const CHANNEL = 'disc:guild:noisy';
 /** The api module's answer for a tool it doesn't have: it has none. */
 const API_UNKNOWN = 'There\'s no tool "api--lookup", so nothing ran. The api module has no tools of its own: every tool you can call is in your tool list.';
-const TUNED_OUT = `Channel ${CHANNEL} is tuned out. Cancel the tune-out (tune_out with mode: 'cancel') ` +
-  'to resume normal attention — cancelling delivers the diverted backlog.';
+const TUNED_OUT = `Channel "${CHANNEL}" is tuned out: its messages go to the subconscious, and channel_open doesn't change ` +
+  `that. Call tune_out with channelId "${CHANNEL}" and mode "cancel" for it to resume normal attention; cancelling ` +
+  'delivers the diverted backlog.';
 
 type SentResult = { toolUseId: string; content: unknown; isError: boolean };
 

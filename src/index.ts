@@ -84,6 +84,7 @@ export type { GateConfig, GateOptions, GatePolicy, GatePolicyMatch, GateBehavior
 
 // MCPL channel registry (exposed for modules that need channel-level operations)
 export { ChannelRegistry } from './mcpl/index.js';
+export type { PublishRefusalReason } from './mcpl/index.js';
 
 // Where each accepted inbound item came from (`metadata.inboundSource`)
 export { INBOUND_SOURCE_KEY, readInboundSource, conversationKey } from './mcpl/index.js';

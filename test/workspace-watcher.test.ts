@@ -610,7 +610,11 @@ describe('MountWatcher lifecycle', () => {
 
   // The identity is read from the descriptor held, so it's the held
   // directory's even when the root is replaced between the open and the read.
-  // Here the replacement happens inside the open, and a poll finds it.
+  // Here the replacement happens inside the open, and a poll finds it. The
+  // poll is driven at once, before chokidar's first instance is ready, as a
+  // loaded host's timer can run it first: the re-attach then closes that
+  // instance, whose ready never comes. So the test waits for a ready after
+  // the re-attach, which is what the watcher promises, not for two readies.
   it('reads the held root identity from what it holds, so a root replaced as it was opened is found', {
     skip: process.platform !== 'linux',
   }, async () => {
@@ -626,14 +630,16 @@ describe('MountWatcher lifecycle', () => {
       }
       return fd;
     }, async () => {
-      let readyCount = 0;
       let reattachCount = 0;
+      let readyAfterReattach = false;
       const { watcher } = collectWithNative(
-        { onReady: () => { readyCount++; }, onReattach: () => { reattachCount++; } },
-        { ...makeConfig(), path: root },
+        { onReady: () => { if (reattachCount > 0) readyAfterReattach = true; }, onReattach: () => { reattachCount++; } },
+        { ...makeConfig(), path: root, watchRootPollMs: EVENT_MS * 6 },
       );
       try {
-        await waitFor(() => reattachCount > 0 && readyCount > 1, 'expected a poll to find the root replaced as it was opened');
+        await (watcher as unknown as { checkRootLiveness(): Promise<void> }).checkRootLiveness();
+        assert.strictEqual(reattachCount, 1, 'a poll finds the root replaced as it was opened, and re-attaches');
+        await waitFor(() => readyAfterReattach, 'expected the watcher ready after the re-attach');
         assert.deepStrictEqual(descriptorsOf(root), [root], 'the watcher holds the root at its path');
         assert.deepStrictEqual(descriptorsOf(`${root}.away`), [], 'the watcher still holds the directory moved away');
       } finally {

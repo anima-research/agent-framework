@@ -47,9 +47,9 @@ export function buildCodeExecutionToolDefinition(opts?: {
       'JSON object above, or None). ' +
       "An exact-name lookup dict is also available: tools['mcpl--discord--fetch_history']({...}). " +
       'Use top-level await; run independent calls in parallel with asyncio.gather. ' +
-      'Only what you print() (plus stderr and the exit code) comes back to you — intermediate ' +
-      'tool results stay in the script, so filter or aggregate large data there and print only ' +
-      'what you need. Interpreter state (variables, imports) persists across code_execution ' +
+      'Only what the script and the commands it runs print (stdout and stderr), and the exit code, come back ' +
+      'to you — intermediate tool results stay in the script, so filter or aggregate large data there and ' +
+      'print only what you need. Interpreter state (variables, imports) persists across code_execution ' +
       `calls but is reclaimed after ~${idleMinutes} minutes idle. Relative paths resolve in a ` +
       'scratch directory of the interpreter\'s, which goes whenever it stops or is reclaimed, so a file meant to ' +
       'outlast the interpreter needs an absolute path. A tool call that receives no ' +
@@ -68,7 +68,7 @@ export function buildCodeExecutionToolDefinition(opts?: {
       'time) is delivered into your context and starts a turn for you. A script that ends ' +
       'without calling wake_agent wakes nobody — that silence is the point (poll cheaply, ' +
       'wake only on signal). If your background script CRASHES you are woken with the error. ' +
-      'Its print() output streams to a workspace log file you can read any time. Wakes are ' +
+      'If you have a writable workspace, its output streams to a log file there that you can read any time. Wakes are ' +
       'rate-limited (early wakes are delayed, not dropped) and capped per script. ' +
       'CAUTION: background scripts die silently if the host process restarts — for a wake ' +
       'you absolutely must not miss, also arm a wake rule as backup. ' +

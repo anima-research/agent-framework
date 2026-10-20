@@ -111,6 +111,40 @@ const unreadPassed: string[] = [];
 /** The waiting outgoing completes that went out, in their row. */
 const sentCompletes: string[] = [];
 
+/**
+ * Two releases a quiesce postponed, the first one's pass throwing, set before
+ * stop() for its first pass, or while it waits (from the liveness watchdog's
+ * stop(), which runs between its two passes) for its pass after the waits.
+ * Other agents, such as the run whose end releases its window, read their
+ * unread replies as usual.
+ */
+function postponedReleases(framework: AgentFramework, error: Error, when: 'before stop()' | 'while stop() waits'): () => void {
+  unreadPassed.length = 0;
+  const releases = internals(framework).releasesAfterResume as Map<string, { name: string }>;
+  const postpone = () => {
+    releases.set('first', { name: 'first' });
+    releases.set('second', { name: 'second' });
+  };
+  const watchdog = internals(framework).livenessWatchdog as { stop(): void };
+  const stop = watchdog.stop;
+  if (when === 'before stop()') postpone();
+  else watchdog.stop = function (this: unknown) { postpone(); return stop.call(this); };
+  const owner = framework as unknown as Record<string, unknown>;
+  const usual = (owner.unreadFailedReplies as (agent: unknown) => unknown[]).bind(framework);
+  owner.unreadFailedReplies = (agent: { name: string }) => {
+    if (agent.name === 'first') throw error;
+    if (agent.name !== 'second') return usual(agent);
+    unreadPassed.push(agent.name);
+    return [];
+  };
+  return () => { delete owner.unreadFailedReplies; watchdog.stop = stop; };
+}
+
+function checkPostponedReleases(framework: AgentFramework): void {
+  assert.deepEqual(unreadPassed, ['second'], "the other release's unread pass still ran");
+  assert.equal((internals(framework).releasesAfterResume as Map<string, unknown>).size, 0, 'the postponed releases are cleared');
+}
+
 const ROWS: Row[] = [
   { step: "the push coalescer's suspend()", inject: (fw, e) => throwIn(internals(fw), 'pushCoalescer', 'suspend', e) },
   { step: 'flushing the coalescing snapshot', inject: (fw, e) => patchMethod(fw, 'flushCoalescingSnapshot', e) },
@@ -154,6 +188,25 @@ const ROWS: Row[] = [
     },
     check: () => assert.deepEqual(sentCompletes, ['second'], "the other stream's complete still went out"),
   },
+  {
+    step: "a postponed release's unread pass, before the registry forgets its channels",
+    inject: (fw, e) => postponedReleases(fw, e, 'before stop()'),
+    check: (fw) => checkPostponedReleases(fw),
+  },
+  {
+    step: "the drain of what was queued for a postponed release, before the registry forgets its channels",
+    inject: (fw, e) => {
+      (internals(fw).releasesAfterResume as Map<string, { name: string }>).set('first', { name: 'first' });
+      const owner = fw as unknown as Record<string, unknown>;
+      const usual = (owner.readdDrained as (...args: unknown[]) => unknown).bind(fw);
+      owner.readdDrained = (...args: unknown[]) => {
+        if (args[1] === 'stop: postponed releases') throw e;
+        return usual(...args);
+      };
+      return () => { delete owner.readdDrained; };
+    },
+    check: (fw) => assert.equal((internals(fw).releasesAfterResume as Map<string, unknown>).size, 0, 'the postponed releases are cleared'),
+  },
   { step: "the channel registry's stopAll()", inject: (fw, e) => throwIn(internals(fw), 'channelRegistry', 'stopAll', e) },
   { step: "the event gate's dispose()", inject: (fw, e) => throwIn(internals(fw), 'eventGate', 'dispose', e) },
   {
@@ -167,30 +220,10 @@ const ROWS: Row[] = [
     },
   },
   {
-    step: "a postponed release's unread pass",
+    step: "a postponed release's unread pass, after the waits",
     finishing: true,
-    inject: (fw, e) => {
-      // Two releases a quiesce postponed: the first one's pass throws.
-      unreadPassed.length = 0;
-      const releases = internals(fw).releasesAfterResume as Map<string, { name: string }>;
-      releases.set('first', { name: 'first' });
-      releases.set('second', { name: 'second' });
-      // Other agents, such as the run whose end releases its window, read
-      // their unread replies as usual.
-      const owner = fw as unknown as Record<string, unknown>;
-      const usual = (owner.unreadFailedReplies as (agent: unknown) => unknown[]).bind(fw);
-      owner.unreadFailedReplies = (agent: { name: string }) => {
-        if (agent.name === 'first') throw e;
-        if (agent.name !== 'second') return usual(agent);
-        unreadPassed.push(agent.name);
-        return [];
-      };
-      return () => { delete owner.unreadFailedReplies; };
-    },
-    check: (fw) => {
-      assert.deepEqual(unreadPassed, ['second'], "the other release's unread pass still ran");
-      assert.equal((internals(fw).releasesAfterResume as Map<string, unknown>).size, 0, 'the postponed releases are cleared');
-    },
+    inject: (fw, e) => postponedReleases(fw, e, 'while stop() waits'),
+    check: (fw) => checkPostponedReleases(fw),
   },
   {
     step: 'the last flush of deferred writes',
