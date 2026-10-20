@@ -2317,6 +2317,57 @@ test('on a disk that keeps the normalization forms apart, a directory named in t
   assert.deepEqual(await listed('outer'), []);
 });
 
+test('on a disk that keeps the normalization forms apart, a listing or glob through a link passes over a file named in the other form of a nested mount\'s directory, as one without the link does, and lists a link so named, which a read through it reads, on a chronicle mount and a direct one', { skip: NORMALIZATION_APART_ONLY }, async (t) => {
+  // The outer mount follows links and holds inner's directory at caf\u00e9/, a
+  // file at cafe\u0301 beside it, which a read refuses as possibly inner's,
+  // second's directory at na\u00efve/, a link at nai\u0308ve beside it that
+  // leads to its own a.txt, and alias, a link to its own root.
+  const ctx = { isRestart: false, getState: () => null, setState: () => {}, pushEvent: () => {} } as unknown as ModuleContext;
+  for (const backend of ['chronicle', 'direct'] as const) {
+    const root = mkdtempSync(join(tmpdir(), 'workspace-path-spelling-alias-'));
+    const dir = join(root, 'mount');
+    mkdirSync(join(dir, 'caf\u00e9'), { recursive: true });
+    writeFileSync(join(dir, 'cafe\u0301'), 'a file in the other form\n');
+    writeFileSync(join(dir, 'a.txt'), "the outer mount's own\n");
+    mkdirSync(join(dir, 'na\u00efve'));
+    symlinkSync('a.txt', join(dir, 'nai\u0308ve'));
+    symlinkSync('.', join(dir, 'alias'));
+    const store = JsStore.openOrCreate({ path: join(root, 'store') });
+    const outer: MountConfig = backend === 'direct'
+      ? { name: 'outer', path: dir, mode: 'read-only', watch: 'never', followSymlinks: true, backend }
+      : { name: 'outer', path: dir, mode: 'read-write', watch: 'never', followSymlinks: true };
+    const workspace = new WorkspaceModule({ mounts: [
+      outer,
+      { name: 'inner', path: join(dir, 'caf\u00e9'), mode: 'read-write', watch: 'never' },
+      { name: 'second', path: join(dir, 'na\u00efve'), mode: 'read-write', watch: 'never' },
+    ] });
+    workspace.initStore(store);
+    const warn = console.warn;
+    console.warn = () => {};
+    try {
+      await workspace.start(ctx);
+    } finally {
+      console.warn = warn;
+    }
+    t.after(async () => { await workspace.stop(); store.close(); rmSync(root, { recursive: true, force: true }); });
+    const tool = (name: string, input: unknown) => workspace.handleToolCall({ id: name, name, input } as Parameters<WorkspaceModule['handleToolCall']>[0]);
+    const paths = async (name: 'ls' | 'glob', input: unknown): Promise<string[]> => {
+      const result = await tool(name, input);
+      assert.equal(result.success, true, `${backend}, ${name}: ${result.error}`);
+      const data = result.data as { entries?: Array<{ path: string }>; matches?: Array<{ path: string }> };
+      return (data.entries ?? data.matches ?? []).map((e) => e.path).sort();
+    };
+    assert.deepEqual(await paths('ls', { path: 'outer', recursive: true }), ['a.txt', 'alias'], backend);
+    assert.deepEqual(await paths('ls', { path: 'outer/alias', recursive: true }), ['alias/a.txt', 'alias/alias', 'alias/nai\u0308ve'], backend);
+    assert.deepEqual(await paths('glob', { pattern: '*', path: 'outer/alias' }), ['outer/alias/a.txt', 'outer/alias/alias', 'outer/alias/nai\u0308ve'], backend);
+    refusedAsInner(await tool('read', { path: 'outer/alias/cafe\u0301', offsetChars: 0, limitChars: 100 }), 'inner', `${backend}, a read through the link`);
+    for (const path of ['outer/alias/a.txt', 'outer/alias/nai\u0308ve']) {
+      const own = await tool('read', { path, offsetChars: 0, limitChars: 100 });
+      assert.equal((own.data as { content?: string } | undefined)?.content, "the outer mount's own\n", `${backend}, ${path}: ${own.error}`);
+    }
+  }
+});
+
 test('through a link the outer mount follows, a target that spells a nested mount\'s directory otherwise leads into it', { skip: FOLDING_ONLY }, async (t) => {
   const { tool, dir } = await nestedRig(t, 'inner', { follow: true, before: (d) => {
     mkdirSync(join(d, 'inner'));

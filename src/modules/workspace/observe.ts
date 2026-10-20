@@ -2430,9 +2430,13 @@ export async function walkScope(
       const childRel = rel ? `${rel}/${entry.name}` : entry.name;
       // Another mount's directory is passed over by its real path too, so a
       // walk that reaches one through a link to a directory above it lists
-      // none of that mount's names (nestedRootAtReal).
+      // none of that mount's names (nestedRootAtReal). So is any other entry
+      // the comparison may take for one, such as a file named like it in the
+      // other normalization form, which a read of it refuses. A link isn't
+      // checked where it lies, since a read through it is judged where it
+      // leads.
       const passedOver = passedOverBecause(childRel, entry.name, ignore, view.others)
-        ?? (entry.isDirectory() && nestedRootAtReal(dir.at(entry.name), view.nested) !== undefined ? OTHER_MOUNT : undefined);
+        ?? (!entry.isSymbolicLink() && nestedRootAtReal(dir.at(entry.name), view.nested) !== undefined ? OTHER_MOUNT : undefined);
       if (passedOver !== undefined) {
         others.push([childRel, passedOver]);
         regions.push({ path: childRel, reason: passedOver, kind: 'ignored' });
