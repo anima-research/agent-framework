@@ -875,9 +875,9 @@ function announcedDomainsOf(announce: unknown): string[] {
 /**
  * Whether a stream resumes its turn's request rather than starting one: a
  * budget restart, or a tool-result-guard retry. Such a start takes in no new
- * input, and keeps the turn's locus, trigger channel and tool-call count,
- * unless a private wake joins it or it reads private input stored since the
- * agent's last start (makeTurnPrivate). Its
+ * wake of its own, and keeps the turn's locus, trigger channel and tool-call
+ * count, unless a private wake is batched with it or it reads private input
+ * stored since the agent's last start (makeTurnPrivate). Its
  * routing state is the logical turn's, as for every start that continues the
  * turn (TurnRouting).
  */
@@ -1054,12 +1054,6 @@ type SpeechPublished = (to: PublishDestination, text: string, messageId: string 
 interface ProseRound {
   /** The routing state of the turn that queued the round. */
   routing: TurnRouting;
-  /** Whether that turn was private when it queued the round. A round queued
-   *  before its turn turned private (makeTurnPrivate) is delivered after it
-   *  on the agent's speech chain, so its envelopes still reach the targets
-   *  they name, but set no destination for the turn's later speech
-   *  (pinTurn). */
-  turnPrivate: boolean;
   notice: 'now' | 'later';
   keepPrivate?: boolean;
   /** The outgoing stream of the stream that queued the round. */
@@ -11675,13 +11669,19 @@ export class AgentFramework {
           // private from here (makeTurnPrivate): the operator's words are in
           // the next round's context, so its speech must not land in a
           // channel. The framework stamps every message stored for such a
-          // surface (surfaceSourceFor), and only it does. A boundary that ends
-          // the turn leaves it as it is, and the message's own wake starts a
-          // private turn. The notice rides this boundary's injections, as a
-          // re-pin's does; a stream that restarts reads it from the window.
-          if (!shouldEndTurn && midTurnInjections.some((inj) => readInboundSource(inj.metadata)?.kind === 'surface')) {
-            const notice = this.makeTurnPrivate(agent, this.routingOf(agent.name));
-            if (notice && !overBudget && currentState.stream) midTurnInjections.push(notice);
+          // surface (surfaceSourceFor), and only it does. The notice rides
+          // this boundary's injections, as a re-pin's does; a stream that
+          // restarts reads it from the window. A boundary that ends the turn,
+          // or a silent turn's, answers none of it, so it marks the agent
+          // instead, as any other store does, and its next start that can
+          // publish is private (notePrivateInput).
+          if (midTurnInjections.some((inj) => readInboundSource(inj.metadata)?.kind === 'surface')) {
+            if (shouldEndTurn || this.activeTurnTriggers.get(agent.name)?.suppressProse === true) {
+              this.privateInputStored.add(agent.name);
+            } else {
+              const notice = this.makeTurnPrivate(agent, this.routingOf(agent.name));
+              if (notice && !overBudget && currentState.stream) midTurnInjections.push(notice);
+            }
           }
 
           // Addressed re-pin (2026-07-31 Mythos misroutes, antra-ratified):
@@ -15225,14 +15225,14 @@ export class AgentFramework {
 
   /**
    * A round's envelope names a destination its turn's later unprefixed speech
-   * follows (`>>>` in hybrid mode, `>>` in explicit), unless the turn turned
-   * private after the round was queued: the round is delivered on the speech
-   * chain after the boundary that made the turn private, and a destination
-   * chosen before the private input mustn't carry speech written after it
-   * (makeTurnPrivate). The envelope's own words still go where it names.
+   * follows (`>>>` in hybrid mode, `>>` in explicit), unless the turn is
+   * private: its plain speech stays on its surface, as its notice tells the
+   * resident, so no envelope sets a destination for it, one written before
+   * the private input and delivered after it on the speech chain included.
+   * The envelope's own words still go where it names.
    */
   private pinTurn(round: ProseRound, channelId: string): void {
-    if (round.routing.nonChannelOrigin && !round.turnPrivate) return;
+    if (round.routing.nonChannelOrigin) return;
     round.routing.pin = channelId;
   }
 
@@ -15242,7 +15242,8 @@ export class AgentFramework {
    * message stored since the agent's last start (beginAgentTurn), or one of
    * its boundaries injected one. Private wins, one way: the operator's words
    * are in its context now, so none of its plain speech is published for the
-   * rest of the turn. Its locus, its trigger channel and its sticky `>>` or
+   * rest of the turn: an envelope's own body still goes where it names, but
+   * sets no destination for what follows (pinTurn). Its locus, its trigger channel and its sticky `>>` or
    * `>>>` destination go, so speech written after the private input doesn't
    * follow a destination chosen before it, and nothing re-pins it. Where its
    * plain speech had a destination, a durable `[routing]` notice says so
@@ -15541,11 +15542,9 @@ export class AgentFramework {
     round: { notice?: 'now' | 'later'; keepPrivate?: boolean } = {},
   ): Promise<void> {
     // The direct entry delivers as a live round does: under the live turn's
-    // routing, queued with its privacy as it is now.
-    const routing = this.routingOf(agent.name);
+    // routing.
     await this.deliverAdmittedProse(agent, this.admitProse(rawText), {
-      routing,
-      turnPrivate: routing.nonChannelOrigin,
+      routing: this.routingOf(agent.name),
       notice: round.notice ?? 'later',
       keepPrivate: round.keepPrivate,
     });
@@ -17792,7 +17791,6 @@ export class AgentFramework {
             // streamed by this stream once published.
             const holdOpts: ProseRound = {
               routing: streamRouting,
-              turnPrivate: streamRouting.nonChannelOrigin,
               notice: presentsInjections ? 'now' : 'later',
               onPublished: streamSpeech,
             };
@@ -18388,7 +18386,7 @@ export class AgentFramework {
             if (speechContent.length > 0 && this.channelRegistry) {
               const speechRuns = finalSpeechRuns;
               const speechSegments = finalSpeechSegments;
-              const textOnlyHold: ProseRound = { routing: finalRouting, turnPrivate: finalRouting.nonChannelOrigin, notice: 'later', onPublished: streamSpeech };
+              const textOnlyHold: ProseRound = { routing: finalRouting, notice: 'later', onPublished: streamSpeech };
               if (speechSegments.length > 0) {
                 if (turnProseRouting === 'disabled') {
                   console.error(`[routing] ${agent.name}: text-only prose NOT routed (proseRouting=disabled)`);
@@ -18478,7 +18476,7 @@ export class AgentFramework {
                 : turnSilenced || fallbackCause !== null;
               const trailingCause: 'send' | 'private' | null =
                 silenceCause === 'private' || fallbackCause === 'private' ? 'private' : (silenceCause ?? fallbackCause);
-              const trailingHold: ProseRound = { routing: finalRouting, turnPrivate: finalRouting.nonChannelOrigin, notice: 'later', onPublished: streamSpeech };
+              const trailingHold: ProseRound = { routing: finalRouting, notice: 'later', onPublished: streamSpeech };
 
               const runs = finalRuns;
               const segments = finalSegments;

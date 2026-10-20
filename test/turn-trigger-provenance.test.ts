@@ -351,12 +351,11 @@ async function surfaceRig(opts: {
     routings.push(state.turnRouting.get('scout')!);
     return result;
   };
-  // Polls while the scheduler runs: a debounce's wake is queued by its
-  // timer, after the test has pushed its events. One drive of the scheduler
-  // runs at a time, and the condition is looked at every few milliseconds
-  // while it does, since a held post can keep it from going idle. The
+  // Polls, letting the scheduler run to idle between looks: a debounce's
+  // wake is queued by its timer, after the test has pushed its events. The
   // deadline bounds a scheduler that never goes idle too, failing the wait
-  // rather than hanging it.
+  // rather than hanging it. A turn whose held posts keep it from going idle
+  // is watched with whileRunning instead.
   const until = async (cond: () => boolean, what: string) => {
     const deadline = Date.now() + 10_000;
     const timedOut = () => new Error(`timed out: ${what} (starts: ${JSON.stringify(starts)})`);
@@ -769,25 +768,6 @@ describe('private wins, one way', () => {
     }
   });
 
-  it("a continuation of a private turn keeps a destination the private turn chose", async () => {
-    const rig = await surfaceRig({ agent: { proseRouting: 'hybrid' } });
-    try {
-      const routing = routingOf(rig.framework);
-      routing.nonChannelOrigin = true;
-      routing.pin = 'discord:g:other';
-      rig.state.openLogical.set('scout', routing);
-      rig.i.pendingRequests.push({ agentName: 'scout', reason: 'tool_results_ready', source: 'framework', timestamp: Date.now() }, tuiWake());
-      await rig.until(() => rig.starts.length >= 1, 'the continuation');
-      await rig.framework.runUntilIdle();
-      assert.equal(routing.pin, 'discord:g:other', 'its own destination stays');
-      assert.deepEqual(rig.routed, [{ text: 'reply 1', locus: 'discord:g:other' }], 'and its speech follows it');
-      assert.ok(!rig.texts().some((t) => t.startsWith(PRIVATE_FROM_HERE)), 'it was private already');
-    } finally {
-      rig.state.openLogical.delete('scout');
-      await rig.close();
-    }
-  });
-
   it("a private turn's sleep announcement is posted nowhere, where a channel turn's goes to its locus", async () => {
     for (const privateTurn of [true, false]) {
       const rig = await surfaceRig({ gate: { config: { policies: [], default: 'always' } } });
@@ -810,9 +790,11 @@ describe('private wins, one way', () => {
     }
   });
 
-  it('a boundary that ends the turn leaves it as it is, and the private message waits for its own private turn', async () => {
+  it('a boundary that ends the turn leaves it a channel turn, and marks the private input it stored for the next start', async () => {
     let framework: AgentFramework | undefined;
-    const tool = robot(() => framework!.pushEvent(tuiMessage('for your eyes only')), { endTurn: true });
+    // Deferred while the turn is alive, with no wake of its own, and stored
+    // at the boundary that ends the turn.
+    const tool = robot(() => { storeOperatorMessage(framework!); }, { endTurn: true });
     const rig = await surfaceRig({ modules: [tool] });
     framework = rig.framework;
     try {
@@ -821,15 +803,41 @@ describe('private wins, one way', () => {
         { type: 'tool_use', id: 'm1', name: 'robot--move', input: {} },
       ] as never, 'tool_use'));
       rig.i.pendingRequests.push(roomWake());
-      await rig.until(() => rig.starts.length >= 2, "the room's turn, then the operator message's");
+      await rig.until(() => rig.starts.length >= 1 && rig.texts().includes('for your eyes only'), "the room's turn, and the boundary's store");
       await rig.framework.runUntilIdle();
-      assert.ok(roomStart(rig.starts[0]!), JSON.stringify(rig.starts[0]));
       assert.notEqual(rig.routings[0]!.nonChannelOrigin, true, "the room's turn ended a channel turn");
-      assert.ok(privateStart(rig.starts[1]!), JSON.stringify(rig.starts[1]));
-      assert.deepEqual(rig.routed, [{ text: 'on my way', locus: ROOM }]);
       assert.ok(!rig.texts().some((t) => t.startsWith(PRIVATE_FROM_HERE)), 'nothing made the ended turn private');
+      rig.i.pendingRequests.push(roomWake());
+      await rig.until(() => rig.starts.length >= 2, "the room's next start");
+      await rig.framework.runUntilIdle();
+      assert.equal(rig.routings[1]!.nonChannelOrigin, true, 'the next start, the first to read it, is private');
+      assert.deepEqual(rig.routed, [{ text: 'on my way', locus: ROOM }]);
     } finally {
       await rig.close();
+    }
+  });
+
+  it("a private turn's own envelope posts its body where it names, and sets no destination for its later rounds", async () => {
+    for (const mode of ['hybrid', 'explicit'] as const) {
+      const prefix = mode === 'hybrid' ? '>>>' : '>>';
+      const rig = await surfaceRig({ modules: [robot()], agent: { proseRouting: mode } });
+      try {
+        rig.membrane.pushResponse(createMockResponse([
+          { type: 'text', text: `${prefix}discord:g:other a note for them\nand the rest of it` },
+          { type: 'tool_use', id: 'm1', name: 'robot--move', input: {} },
+        ] as never, 'tool_use'));
+        // Its later round answers the operator, believing the notice.
+        rig.membrane.pushResponse(createMockResponse([{ type: 'text', text: 'about what you asked' }]));
+        rig.framework.pushEvent(tuiMessage());
+        await rig.until(() => rig.starts.length >= 1, `${mode}: the private turn`);
+        await rig.framework.runUntilIdle();
+        assert.ok(privateStart(rig.starts[0]!), `${mode}: control: the turn is private`);
+        assert.deepEqual(rig.routed, [{ text: 'a note for them\nand the rest of it', locus: 'discord:g:other' }],
+          `${mode}: the envelope runs to the next envelope line, and nothing later follows it: ${JSON.stringify(rig.routed)}`);
+        assert.equal(rig.routings[0]!.pin, undefined, `${mode}: no destination was set`);
+      } finally {
+        await rig.close();
+      }
     }
   });
 

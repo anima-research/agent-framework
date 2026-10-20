@@ -254,7 +254,8 @@ export function wakeProvenance(events: PendingEvent[]): WakeProvenance | undefin
     ...(pick.addressed ? { addressed: true } : {}),
     ...(pick.addressed && pick.routeChannelId && !privateSurface ? { routeChannelId: pick.routeChannelId } : {}),
     ...(privateSurface ? { nonChannelOrigin: true } : {}),
-    at: pick.timestamp,
+    // A private window's wake is as recent as its newest private message.
+    at: newestPrivate && newestPrivate.timestamp > pick.timestamp ? newestPrivate.timestamp : pick.timestamp,
   };
 }
 

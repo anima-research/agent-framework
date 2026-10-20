@@ -1193,6 +1193,9 @@ describe("a window that holds a private surface's message", () => {
     for (const window of [[tui(10), tui(30)], [tui(30), tui(10)]]) {
       assert.deepStrictEqual(wakeProvenance(window as never), { nonChannelOrigin: true, at: 30 }, 'the newest, in whatever order they sit');
     }
+    // An older one that names its author is the pick, but the wake is as
+    // recent as the newest.
+    assert.equal(wakeProvenance([{ ...tui(10), authorId: 'op' }, tui(30)] as never)?.at, 30);
     assert.equal(wakeProvenance([{ ...tui(10), nonChannelOrigin: undefined }] as never), undefined, 'control: an unmarked one has no provenance');
   });
 });

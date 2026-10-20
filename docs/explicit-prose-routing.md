@@ -30,8 +30,8 @@ A prose segment's FIRST line may carry a routing prefix:
   target its server declared inbound-only is refused and clears the turn's
   target, so later unprefixed segments bounce until a new `>>` target. So
   does private-surface input that makes the turn private (a TUI or WebUI
-  message it takes in): a target named before that input is dropped, and a
-  round written before it, delivered after, sets none.
+  message it takes in): its target is dropped, and while the turn is
+  private a `>>` envelope posts its own body but sets no target.
   Cross-turn, nothing is implicit.
 - **Continuation modifier:** ` !` immediately after the target
   (`>>#ops !` / `>>skip_reply !`) requests an immediate re-wake after this turn

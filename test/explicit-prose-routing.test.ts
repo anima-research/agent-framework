@@ -160,12 +160,15 @@ describe('explicit prose routing', () => {
     return framework;
   }
 
-  function trigger(framework: AgentFramework): void {
+  /** A message in the channel the stub registry resolves every locus to, so
+   *  the turn is a channel's, as these tests' turns were before private
+   *  surfaces had turns of their own; a private one names no channel. */
+  function trigger(framework: AgentFramework, privateSurface = false): void {
     framework.pushEvent({
       type: 'external-message',
       source: 'test',
       content: 'go',
-      metadata: {},
+      metadata: privateSurface ? {} : { channelId: 'world:commons' },
     } as unknown as ProcessEvent);
   }
 
@@ -1526,11 +1529,8 @@ describe('explicit prose routing', () => {
       try {
         // The scheduling turn asked for a continuation and left its tool
         // results pending; the scheduler then starts the agent with another
-        // wake, which consumes them. This file's wake names no channel, so
-        // it is a private surface's, which makes the turn it continues
-        // private; here that turn is private already.
+        // wake, which consumes them.
         const scheduling: RoutingState = routingState({ continuation: true });
-        (scheduling as RoutingState & { nonChannelOrigin?: boolean }).nonChannelOrigin = true;
         internals.openLogical.set('assistant', scheduling);
         internals.turnRouting.set('assistant', routingState());
         trigger(framework);
@@ -2489,7 +2489,7 @@ describe('explicit prose routing', () => {
     const start = internals.startAgentStream.bind(framework);
     internals.startAgentStream = async (agent, trigger) => { if (trigger) starts.push(trigger); return start(agent, trigger); };
     feedTurn(framework, 2, []);
-    trigger(framework);
+    trigger(framework, true);
     await framework.runUntilIdle();
     assert.deepEqual(starts.map((s) => [s.reason, s.nonChannelOrigin === true]), [
       ['external-message', true],
@@ -2502,7 +2502,7 @@ describe('explicit prose routing', () => {
     membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Ordinary field speech.' }] as ContentBlock[]));
     const framework = await createFramework('hybrid');
     const routed = stubRegistry(framework);
-    trigger(framework);
+    trigger(framework, true);
     await framework.runUntilIdle();
     assert.deepEqual(routed, [], 'channel-less hybrid prose cannot use an inferred locus');
     const receipts = context(framework).texts.filter((text) => text.startsWith('[delivered]'));

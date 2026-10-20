@@ -14,9 +14,9 @@
   of it: a start that continues it with a private wake or stored private
   input, or a tool boundary that injects a private surface's message, removes
   its locus, its trigger channel and its sticky `>>` or `>>>` destination, and
-  a `[routing]` notice says why. A round written before the turn became
-  private, and delivered after it, still posts where its envelopes name, but
-  sets no destination for the turn's later speech. What a private turn causes
+  a `[routing]` notice says why. While a turn is private, a `>>>` or `>>`
+  envelope posts its own body where it names but sets no destination for the
+  turn's later speech. What a private turn causes
   is private too: its budget restart, its tool results' re-inference, a ` !`
   continuation, a bounce's wake and a rewind's retry.
 
