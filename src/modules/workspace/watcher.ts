@@ -8,7 +8,7 @@
 import { watch, type FSWatcher } from 'chokidar';
 import { closeSync, constants, fstatSync, mkdirSync, openSync, statSync, type Stats } from 'node:fs';
 import { basename, resolve, sep } from 'node:path';
-import { passedOverAt } from './observe.js';
+import { passedOverAt, type NestedDir } from './observe.js';
 import { type MountConfig } from './types.js';
 
 export type FsOp = 'created' | 'modified' | 'deleted';
@@ -82,8 +82,8 @@ export class MountWatcher {
     config: MountConfig,
     onChange: (changes: FsChange[]) => void,
     lifecycle: WatcherLifecycle = {},
-    /** Other mounts' directories nested in this one, mount-relative: passed over as a walk passes over them. */
-    private readonly others: readonly string[] = [],
+    /** Other mounts' directories nested in this one, mount-relative (NestedDir): passed over as a walk passes over them. */
+    private readonly others: readonly NestedDir[] = [],
   ) {
     this.config = config;
     this.root = resolve(config.path);

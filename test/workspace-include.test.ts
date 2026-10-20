@@ -1690,8 +1690,8 @@ describe("the checks where disk is acted on, called directly as a push and a rea
     writeFileSync(at('a/b/sub/a.json'), "the inner mount's");
     symlinkSync('sub', at('a/b/l2'));
     symlinkSync(at('a/b/l2'), at('x'));
-    const nested = [{ dir: 'a/b', name: 'inner', real: realpathSync(at('a/b')), include: ['*.json'] }];
-    const view = { root: at(''), name: 'outer', followSymlinks: true, maxFileSize: 1 << 20, ignore: [], others: ['a/b'], nested } as MountView;
+    const nested = [{ dir: 'a/b', folds: [false, false], name: 'inner', real: realpathSync(at('a/b')), include: ['*.json'] }];
+    const view = { root: at(''), name: 'outer', followSymlinks: true, maxFileSize: 1 << 20, ignore: [], others: [{ dir: 'a/b', folds: [false, false] }], nested } as MountView;
     return { at, view, rootReal: realpathSync(at('')) };
   }
   const leaves = 'a symlink that leaves the mount';
@@ -1760,7 +1760,7 @@ describe("the checks where disk is acted on, called directly as a push and a rea
     mkdirSync(at('c'));
     writeFileSync(at('c/f'), "at the nested mount's root");
     symlinkSync(at('c'), at('e'));
-    const filed = { ...view, others: [...view.others, 'c/f'], nested: [...(view.nested ?? []), { dir: 'c/f', name: 'filed', real: join(rootReal, 'c', 'f'), include: ['*.json'] }] } as MountView;
+    const filed = { ...view, others: [...view.others, { dir: 'c/f', folds: [false, false] }], nested: [...(view.nested ?? []), { dir: 'c/f', folds: [false, false], name: 'filed', real: join(rootReal, 'c', 'f'), include: ['*.json'] }] } as MountView;
     const err = await unlinkContained(filed, rootReal, 'e/f', { kind: 'any' }).then(() => null, (e: unknown) => e);
     assert.ok(err instanceof EffectFailed, String(err));
     assert.equal(readFileSync(at('c/f'), 'utf8'), "at the nested mount's root");
@@ -1829,7 +1829,7 @@ describe("the checks where disk is acted on, called directly as a push and a rea
     const { at, view, rootReal } = rig(t);
     // A nested mount whose directory isn't there: a file the outer mount would create at its root is that
     // mount's place, so nothing is made there.
-    const gone = { ...view, nested: [...(view.nested ?? []), { dir: 'gone', name: 'later', real: join(rootReal, 'gone'), include: ['*.json'] }] } as MountView;
+    const gone = { ...view, nested: [...(view.nested ?? []), { dir: 'gone', folds: [false], name: 'later', real: join(rootReal, 'gone'), include: ['*.json'] }] } as MountView;
     const err = await writeContained(gone, rootReal, 'gone', Buffer.from('outer wrote'), { kind: 'absent' }).then(() => null, (e: unknown) => e);
     assert.ok(err instanceof EffectFailed, String(err));
     assert.equal(err.touched, false, 'nothing was touched');
