@@ -2207,7 +2207,10 @@ describe('held drafts: exact runs, hybrid envelopes beside a send, and turn-end 
     }
   });
 
-  it('XML tool mode: the same-round think policy is native-only, so prose beside think and a send is held like any other', async () => {
+  // #296: the policy used to be native-only, so in XML tool mode this prose
+  // was held as a resendable draft. It now keeps its round private there too,
+  // as 'deliberate privacy is never drafted' has it for native rounds.
+  it('XML tool mode: a same-round private think keeps its prose private beside a send, as in native mode', async () => {
     const h = await harness({ xml: true, agents: [{ name: 'scout', sameRoundThinkTextPolicy: 'private' }] });
     try {
       const round = [text('Prose beside think.'), call('t1', 'think', { content: 'hmm' }), explicitSend('s1')];
@@ -2215,8 +2218,11 @@ describe('held drafts: exact runs, hybrid envelopes beside a send, and turn-end 
         createMockResponse(round, 'tool_use'),
         { ...createMockResponse(round), toolCalls: [] },
       ]);
-      assert.deepEqual(h.drafts().map((d) => [d.text, d.reason]), [['Prose beside think.', 'explicit-send']]);
+      assert.deepEqual(h.drafts(), [], 'never drafted');
       assert.deepEqual(h.publishes().map((p) => p.text), ['an explicit note elsewhere']);
+      assert.equal(h.texts().filter((t) => t.startsWith('[delivered]')).at(-1),
+        '[delivered] nothing — 1 plain-speech segment(s) kept private (skip_reply or a private think)',
+        'the receipt counts it as the native one does');
     } finally {
       await h.close();
     }

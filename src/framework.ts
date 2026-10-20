@@ -17231,6 +17231,11 @@ export class AgentFramework {
     // later rounds remain deliverable: the turn-end delivery drops that round's
     // text by its place, the round's index among this stream's tool rounds.
     const refusedWakeRounds = new Set<number>();
+    // Likewise a round that called think() under the private same-round
+    // policy: the native path withholds its prose as the round ends, and the
+    // turn-end delivery drops it by its place where nothing routed it live
+    // (#296; XML mode and membranes without roundContent).
+    const privateThinkRounds = new Set<number>();
     let toolRounds = 0;
     // A refused skip_reply silences only its own round: the silence before it,
     // saved with its cause as its round is routed (once its calls are
@@ -17625,6 +17630,7 @@ export class AgentFramework {
               const hasSameRoundPrivateThink =
                 toolNames.includes('think') &&
                 requestSnapshot.sameRoundThinkTextPolicy === 'private';
+              if (hasSameRoundPrivateThink) privateThinkRounds.add(toolRound);
               // A refused skip_reply, called directly or from the round's
               // script, keeps its own round private and silences nothing
               // after it (roundCallOf): the silence before it, and the
@@ -18006,9 +18012,20 @@ export class AgentFramework {
             const finalRuns = hadToolCalls && allText.length > 0
               ? splitProseRuns(liveProseRouting
                 ? terminalContent
-                : withoutRoundsProse(response.content, refusedWakeRounds))
+                : withoutRoundsProse(response.content, new Set([...refusedWakeRounds, ...privateThinkRounds])))
               : [];
             const finalSegments = finalRuns.map((run) => run.trim());
+            if (!liveProseRouting && hadToolCalls && privateThinkRounds.size > 0) {
+              // Counted as the native path counts a private round's prose, so
+              // the delivery receipt says it was kept private, not lost.
+              const withheld = splitProseRuns(withoutRoundsProse(response.content, refusedWakeRounds)).length - finalRuns.length;
+              if (withheld > 0) {
+                streamRouting.keptPrivate += withheld;
+                console.error(
+                  `[routing] ${agent.name}: ${withheld} prose segment(s) beside think() NOT routed (same_round_think_text_policy=private)`,
+                );
+              }
+            }
             const admitFinal = turnProseRouting === 'explicit' && !!this.channelRegistry;
             // The final text is delivered under this turn's routing, as its
             // queued rounds are.

@@ -362,7 +362,10 @@ test("XML tool mode: a refused think's round goes as a permitted think's does", 
       dispositions.push(routed);
     } finally { await h.close(); }
   }
-  assert.ok(dispositions[0].includes('Public round prose'), "a permitted think's round goes out in XML tool mode, where no round is routed live");
+  // #296: under a private policy, a think's round stays private in XML tool
+  // mode too, as in native mode, where nothing is routed live.
+  assert.ok(!dispositions[0].includes('Public round prose'), "a permitted think's round stays private in XML tool mode");
+  assert.ok(dispositions[0].includes('Public trailing prose'), 'and what follows goes out');
   assert.deepEqual(dispositions[1], dispositions[0], 'the refusal changes nothing about which prose goes out');
 });
 
