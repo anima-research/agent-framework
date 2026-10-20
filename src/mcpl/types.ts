@@ -1068,9 +1068,7 @@ export interface ChannelHistoryRequest {
  * Spec Section 14.4.
  */
 export interface ChannelContext {
-  /** The most recent inbound message, process-global
-   *  (ChannelRegistry.buildChannelContext): usually the one that triggered
-   *  this inference, unless another arrived since. */
+  /** Channel that triggered this inference */
   incoming?: {
     channelId: string;
     messageId: string;

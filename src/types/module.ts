@@ -610,10 +610,11 @@ export interface SpeechContext {
   turnId?: number;
 
   /**
-   * True when the turn this speech ends is a private non-channel surface's
-   * (an operator's console, a WebUI, an API message naming no channel). Its
-   * plain speech stays on that surface: a handler that would publish speech,
-   * or the turn's thoughts, to a channel leaves it alone.
+   * True when the turn this speech ends is private: a private surface's
+   * input took part in it (an operator's console, a WebUI, an API message
+   * naming no channel). Its plain speech stays on that surface: a handler
+   * that would publish speech, or the turn's thoughts, to a channel leaves
+   * it alone.
    */
   nonChannelOrigin?: boolean;
 }

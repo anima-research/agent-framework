@@ -46,22 +46,14 @@ export type TraceEvent =
        * its unprefixed plain prose is published, unless a hybrid `>>>`
        * destination takes it, or a re-pin or a `channel_open` moves the locus
        * later in the turn. Omitted for a turn with no locus: explicit and
-       * disabled mode, a silent turn, a private non-channel surface's turn,
-       * and a heartbeat with no default channel. Observability only, like
+       * disabled mode, a silent turn, a private turn, and a heartbeat with
+       * no default channel. Observability only, like
        * every trace field; lets external taps (e.g. a TTS relay) tag the
        * whole activation with its channel without re-deriving routing.
        */
       channelId?: string;
       /** True for a control-plane wake that must not surface typing/prose. */
       silent?: boolean;
-      /**
-       * True when the turn is a private non-channel surface's (an operator's
-       * console, a WebUI, an API message naming no channel). Its activity
-       * stays on that surface: a listener that would show it in a channel,
-       * as a typing indicator does, leaves it alone, as the framework's own
-       * typing does.
-       */
-      nonChannelOrigin?: boolean;
     })
   | (TraceEventBase & {
       /**

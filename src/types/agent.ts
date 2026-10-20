@@ -427,8 +427,9 @@ export interface InferenceRequest {
    * request-only separator carrying the tick's instruction before the tick's
    * first surviving row (`SILENT_HEARTBEAT_SEPARATOR`). */
   silentHeartbeat?: SilentHeartbeatTick;
-  /** True when this inference is a private non-channel surface's: that
-   *  surface requested it, or a turn that one opened caused it (a derived
-   *  continuation, a bounce or a rewind carries the turn's privacy on). */
+  /** True when this request is a private surface's (a console, a WebUI, an
+   *  API message naming no channel), or a private turn caused it (its
+   *  restart, a ` !` continuation, a bounce or a rewind's retry). A start
+   *  that takes it in is private, and so is its turn from then on. */
   nonChannelOrigin?: boolean;
 }

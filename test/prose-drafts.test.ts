@@ -351,8 +351,8 @@ async function harness(opts: {
         (framework as unknown as { pendingRequests: unknown[] }).pendingRequests.push({
           agentName, reason: 'test', source: 'test', timestamp: Date.now(),
           ...(via === 'silent' ? { suppressProse: true } : {}),
-          // 'private': a turn opened from a private non-channel surface, as an
-          // operator's console message opens one.
+          // 'private': a private turn, as an operator's console message
+          // opens one.
           ...(via === 'private' ? { nonChannelOrigin: true } : {}),
         });
       }
@@ -552,21 +552,21 @@ describe('held prose drafts, end to end', () => {
     }
   });
 
-  it("a private non-channel turn's plain speech is never drafted, an explicit send's round included", async () => {
-    // A draft exists to be resent, and resending words written on a private
-    // surface is the step into a channel the turn's privacy keeps them from.
+  it("a private turn's words beside an explicit send, and after it, are held as drafts, as any turn's are", async () => {
+    // A private turn's own speech goes to no channel, but words a send
+    // silenced are drafted as in any turn: resending them takes a
+    // destination the resident names.
     for (const proseRouting of ['locus', 'hybrid'] as const) {
       const h = await harness({ agents: [{ name: 'scout', proseRouting }] });
       try {
         await h.turn([
-          createMockResponse([text('A reply on the private surface.'), explicitSend('s1')], 'tool_use'),
+          createMockResponse([text('Beside the send.'), explicitSend('s1')], 'tool_use'),
           createMockResponse([text('And one after the send.')]),
         ], 'scout', 'private');
         assert.deepEqual(h.publishes().map((p) => p.text), ['an explicit note elsewhere'], `${proseRouting}: only the explicit send went out`);
-        assert.deepEqual(h.drafts().map((d) => d.text), [], `${proseRouting}: nothing is held as a draft`);
+        assert.deepEqual(h.drafts().map((d) => d.text).sort(), ['And one after the send.', 'Beside the send.'], `${proseRouting}: both are held`);
         const receipt = h.texts().find((t) => t.startsWith('[delivered]')) ?? '';
-        assert.match(receipt, /2 plain-speech segment\(s\) kept private \(non-channel turn/, `${proseRouting}: ${receipt}`);
-        assert.doesNotMatch(receipt, /draft/, `${proseRouting}: ${receipt}`);
+        assert.doesNotMatch(receipt, /private turn/, `${proseRouting}: ${receipt}`);
       } finally {
         await h.close();
       }

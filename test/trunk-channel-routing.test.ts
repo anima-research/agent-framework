@@ -1021,7 +1021,4 @@ describe('Residents read one message slot', () => {
       [{ agent: 'shade', text: 'Here I am.', locus: 'discord:dm:antra' }]);
     await framework.stop();
   });
-
-
-
 });

@@ -2166,29 +2166,18 @@ export class ChannelRegistry {
   /**
    * Build channel context for inclusion in beforeInference params.
    *
-   * Returns undefined when it would hold nothing: no channel open, no
-   * outgoing locus and no incoming message, as for a private turn with no
-   * channel open. A turn with no locus, as in explicit and disabled modes,
-   * still gets `incoming`, the most recent inbound message (below), whether
-   * or not a channel is open.
+   * Returns undefined if no channels are active.
    */
-  buildChannelContext(
-    agentName?: string,
-    turn?: { frozenLocus: string | null; privateTurn?: boolean },
-  ): ChannelContext | undefined {
+  buildChannelContext(agentName?: string): ChannelContext | undefined {
     const openChannels = this.getOpenChannels();
 
-    // During a real turn, report the same frozen locus routeSpeech consumes.
-    // A private non-channel turn freezes null and has no truthful incoming
-    // channel either. Outside a turn (including preview), resolve the
-    // outbound locus the SAME way routeSpeech does for a turn that isn't
-    // private, so the agent is told the channel such a turn's speech lands in
-    // (none, when its server declared it inbound-only, since speech isn't
-    // posted there): a
-    // conversation fork's home channel, else this turn's channel (single
-    // trunk agent — item-3 redux: its locus, else its triggering channel),
-    // else the global default (heartbeats). Without this, a fork was
-    // advertised the global locus but published somewhere else; and a trunk
+    // Resolve the outbound locus the SAME way routeSpeech does, so the agent is
+    // told the channel its speech will actually land in (none, when its server
+    // declared it inbound-only, since speech isn't posted there): a conversation
+    // fork's home channel, else this turn's channel (single trunk agent — item-3
+    // redux: its locus, else its triggering channel), else the global default
+    // (heartbeats). Without this, a fork
+    // was advertised the global locus but published somewhere else; and a trunk
     // agent was told the wrong channel under concurrency.
     // Each lookup is keyed on whether a name was given, not its truthiness:
     // '' is a name an ephemeral run can have, and resolveLocus reads it too.
@@ -2198,25 +2187,27 @@ export class ChannelRegistry {
     // the latest inbound message's channel as its outgoing one, nor that
     // message as the one it is replying to.
     const fallback = agentName !== undefined ? this.globalFallbackFor(agentName) : this.defaultPublishChannel;
-    const outgoing = turn ? turn.frozenLocus : home ?? active ?? fallback;
-    // Incoming: the most recent inbound message that isn't a reaction,
-    // reaction removal, edit or deletion marker, apart from an edit the
-    // coalescer delivers on acceptance as the agent's first view: usually
-    // what the agent is replying to, unless another message arrived since.
-    // Left process-global — per-channel inbound tracking (the right messageId for
-    // a fork's own channel) is a separate concern from the outbound routing fix.
-    const incoming = !turn?.privateTurn && fallback && this.defaultPublishMessageId
-      ? { channelId: fallback, messageId: this.defaultPublishMessageId, threadId: this.defaultPublishThreadId }
-      : undefined;
+    const outgoing = home ?? active ?? fallback;
 
-    // A real turn with no locus (explicit or disabled mode) still gets the
-    // most recent inbound message.
-    if (openChannels.length === 0 && !outgoing && !incoming) {
+    if (openChannels.length === 0 && !outgoing) {
       return undefined;
     }
 
     const context: ChannelContext = {};
-    if (incoming) context.incoming = incoming;
+
+    // Incoming: the most recent inbound message that isn't a reaction,
+    // reaction removal, edit or deletion marker, apart from an edit the
+    // coalescer delivers on acceptance as the agent's first view (what the
+    // agent is replying to).
+    // Left process-global — per-channel inbound tracking (the right messageId for
+    // a fork's own channel) is a separate concern from the outbound routing fix.
+    if (fallback && this.defaultPublishMessageId) {
+      context.incoming = {
+        channelId: fallback,
+        messageId: this.defaultPublishMessageId,
+        threadId: this.defaultPublishThreadId,
+      };
+    }
 
     // Default outgoing: the resolved outbound locus (home channel for forks),
     // unless its server declared it inbound-only: routeSpeech publishes nothing

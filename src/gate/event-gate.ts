@@ -103,8 +103,9 @@ interface PendingEvent {
    *  whose `channelId` is the adapter's raw id (a bare Discord snowflake for a
    *  DM) — unroutable. Absent when the host could not resolve one. */
   routeChannelId?: string;
-  /** Operator-surface routing class retained across debounce. */
-  routingClass?: 'private' | 'channel';
+  /** The event is a private surface's message (the framework's
+   *  isNonChannelSurfaceEvent), which makes its window's wake private. */
+  nonChannelOrigin?: boolean;
 }
 
 /**
@@ -113,10 +114,9 @@ interface PendingEvent {
  * "who woke the agent" from it). Ids only, never content or display names.
  */
 export interface WakeProvenance {
-  /** Composite channel id of the chosen event, telemetry only, except for a
-   *  channel-bound surface message's wake (`routingClass` 'channel'), whose
-   *  turn answers in it. Omitted for `mcpl:push-event` events, whose channel
-   *  ids are raw server ids (unroutable and a second spelling of the same
+  /** Composite channel id of the chosen event — telemetry only, never a
+   *  speech locus. Omitted for `mcpl:push-event` events, whose channel ids
+   *  are raw server ids (unroutable and a second spelling of the same
    *  channel); the framework derives the composite id on the direct path. */
   channelId?: string;
   /** Server-namespaced author id: `<serverId>:user:<id>` (falls back to the
@@ -133,8 +133,9 @@ export interface WakeProvenance {
    *  (2026-09-30: a DM reply published into a guild channel). Ambient-only
    *  batches still set nothing and keep the legacy fallback. */
   routeChannelId?: string;
-  /** Operator-surface routing class retained across debounce. */
-  routingClass?: 'private' | 'channel';
+  /** The window held a private surface's message: its wake is private, and
+   *  names no route (the framework's processInferenceRequests). */
+  nonChannelOrigin?: boolean;
   /** Timestamp (ms) of the chosen event, so a consumer coalescing several
    *  requests can order by event recency, not by flush order. */
   at?: number;
@@ -212,20 +213,17 @@ function isMetadataTruthy(value: unknown): boolean {
 /**
  * Provenance of a batched wake: the newest ADDRESSED channel-bearing event
  * wins (mention / reply / DM outranks newer ambient chatter — the framework's
- * own locus rule); else the newest channel-bound surface message, which names
- * a channel to answer in (routingClass 'channel'), so newer ambient chatter
- * doesn't take that away; else the newest channel-bearing event. Channel,
- * author and addressed all come from that one event, so they can never
- * disagree.
+ * own locus rule); else the newest channel-bearing event. Channel, author and
+ * addressed all come from that one event, so they can never disagree.
  *
- * Give it one part of a window: a private surface's events, or the rest.
- * Events of both are one private wake whose channel side nobody answers,
- * which is why deliverEvents wakes each part on its own.
+ * A window that holds a private surface's message is private, whatever else
+ * it holds: its one wake is a private turn's, which answers in no channel,
+ * and it names no route, so the operator's words never start a turn whose
+ * reply is published (private wins, one way).
  */
 export function wakeProvenance(events: PendingEvent[]): WakeProvenance | undefined {
   let newest: PendingEvent | undefined;
   let newestAddressed: PendingEvent | undefined;
-  let newestBound: PendingEvent | undefined;
   for (const e of events) {
     // A resolved route counts as naming a channel only for an ADDRESSED
     // event: a push whose origin declares only `mcplChannelId` (no raw
@@ -237,23 +235,21 @@ export function wakeProvenance(events: PendingEvent[]): WakeProvenance | undefin
     if (!e.channelId && !e.authorId && !(e.addressed && e.routeChannelId)) continue;
     if (!newest || e.timestamp >= newest.timestamp) newest = e;
     if (e.addressed && (!newestAddressed || e.timestamp >= newestAddressed.timestamp)) newestAddressed = e;
-    if (e.routingClass === 'channel' && (!newestBound || e.timestamp >= newestBound.timestamp)) newestBound = e;
   }
-  const pick = newestAddressed ?? newestBound ?? newest;
-  const privateSurface = events.some((event) => event.routingClass === 'private');
-  if (!pick && !privateSurface) return undefined;
+  const privateSurface = events.some((e) => e.nonChannelOrigin === true);
+  const pick = newestAddressed ?? newest ?? (privateSurface ? events[events.length - 1] : undefined);
+  if (!pick) return undefined;
   // push-event channel ids are the adapter's raw ids (a Discord snowflake):
   // not a composite channel id, so not reported as one
-  const chosen = pick ?? events[events.length - 1]!;
-  const channelId = chosen.channelId && chosen.eventType !== 'mcpl:push-event' ? chosen.channelId : undefined;
-  const ns = chosen.serverId || (chosen.channelId ? chosen.channelId.split(':')[0] : '') || 'channel';
+  const channelId = pick.channelId && pick.eventType !== 'mcpl:push-event' ? pick.channelId : undefined;
+  const ns = pick.serverId || (pick.channelId ? pick.channelId.split(':')[0] : '') || 'channel';
   return {
     ...(channelId ? { channelId } : {}),
-    ...(chosen.authorId ? { counterparty: `${ns}:user:${chosen.authorId}` } : {}),
-    ...(chosen.addressed ? { addressed: true } : {}),
-    ...(chosen.addressed && chosen.routeChannelId ? { routeChannelId: chosen.routeChannelId } : {}),
-    ...(privateSurface ? { routingClass: 'private' as const } : chosen.routingClass ? { routingClass: chosen.routingClass } : {}),
-    at: chosen.timestamp,
+    ...(pick.authorId ? { counterparty: `${ns}:user:${pick.authorId}` } : {}),
+    ...(pick.addressed ? { addressed: true } : {}),
+    ...(pick.addressed && pick.routeChannelId && !privateSurface ? { routeChannelId: pick.routeChannelId } : {}),
+    ...(privateSurface ? { nonChannelOrigin: true } : {}),
+    at: pick.timestamp,
   };
 }
 
@@ -1527,7 +1523,7 @@ export class EventGate {
       serverId: info.serverId || undefined,
       addressed: Array.isArray(info.tags) && info.tags.includes('chat:addressed'),
       routeChannelId: this.routeChannelFor(info),
-      routingClass: info.routingClass,
+      ...(info.nonChannelOrigin ? { nonChannelOrigin: true } : {}),
     };
 
     const existing = this.debounceTimers.get(policy.name);
@@ -1624,44 +1620,16 @@ export class EventGate {
     });
 
     // Provenance of the batched wake (who/where woke the agent): the newest
-    // ADDRESSED event first, else the newest channel-bound surface message,
-    // else the newest event naming a channel or an author; channel + author +
-    // addressed from that ONE event (wakeProvenance). When that
+    // ADDRESSED event first, else the newest event naming a channel or an
+    // author; channel + author + addressed from that ONE event. When that
     // event addressed the agent and its registered channel is known,
     // `routeChannelId` names the turn's speech locus too — the reply goes
     // back to whoever addressed the agent, not to whichever channel last saw
-    // any traffic. An ambient-only batch of channel events carries telemetry
-    // only; a channel-bound surface message names its own channel
-    // (routingClass 'channel'), addressed or not.
-    //
-    // A window can hold events from a private surface and others beside
-    // them: under one policy, or across policies, since every policy's
-    // events share one buffer while an agent infers or the host is
-    // quiesced. One wake from the whole window would be private, and its
-    // channel side would never be answered. So each part gets a wake of its
-    // own, from its own events, the part whose first event arrived first
-    // going first. Where the other part has a channel to answer in (an
-    // addressed event whose registered channel the host resolved, or a
-    // channel-bound surface message with no addressed event beside it, since
-    // an addressed event outranks it), the scheduler runs the two in separate
-    // turns. An ambient channel event names its channel only as where it
-    // woke the agent, and an addressed one whose channel the host couldn't
-    // resolve names none, so a part whose pick names no channel shares the
-    // private turn, and nothing answers it in its channel: the window's
-    // content above stays one message, the operator's words included.
-    // A shared buffer holds each policy's events in the order its debounce
-    // fired, so arrival is read from the events' own times, and within one
-    // millisecond from their order in the window.
-    const privateEvents = events.filter((e) => e.routingClass === 'private');
-    const otherEvents = events.filter((e) => e.routingClass !== 'private');
-    const firstArrival = (part: PendingEvent[]): number => Math.min(...part.map((e) => e.timestamp));
-    const parts = [privateEvents, otherEvents].filter((part) => part.length > 0)
-      .sort((a, b) => firstArrival(a) - firstArrival(b) || events.indexOf(a[0]!) - events.indexOf(b[0]!));
-    for (const part of parts) {
-      const provenance = wakeProvenance(part);
-      for (const agentName of this.getAgentNamesFn()) {
-        this.requestInferenceFn(agentName, 'gate:debounce', 'gate', provenance);
-      }
+    // any traffic. Ambient-only batches carry telemetry only. A window that
+    // holds a private surface's message wakes a private turn, with no route.
+    const provenance = wakeProvenance(events);
+    for (const agentName of this.getAgentNamesFn()) {
+      this.requestInferenceFn(agentName, 'gate:debounce', 'gate', provenance);
     }
   }
 

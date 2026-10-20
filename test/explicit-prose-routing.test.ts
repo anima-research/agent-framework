@@ -1465,9 +1465,8 @@ describe('explicit prose routing', () => {
       // continuation 2.)
       membrane.pushResponse(createMockResponse([{ type: 'text', text: '>>>skip_reply' }] as ContentBlock[]));
       feedTurn(framework, 2, [{ type: 'text', text: '>>>skip_reply' }] as ContentBlock[]);
-      // A message in the open turn's channel. A private surface's message
-      // would wait for that turn to end: a start that continues a turn takes
-      // no wake of the other kind.
+      // A message in the open turn's channel, so the turn stays a channel's:
+      // a private surface's message would make it private.
       framework.pushEvent({
         type: 'external-message', source: 'test', content: 'go', metadata: { channelId: 'chan-alpha' },
       } as unknown as ProcessEvent);
@@ -1528,8 +1527,8 @@ describe('explicit prose routing', () => {
         // The scheduling turn asked for a continuation and left its tool
         // results pending; the scheduler then starts the agent with another
         // wake, which consumes them. This file's wake names no channel, so
-        // it is a private surface's, and the turn it continues is too: a
-        // private wake joins no turn that isn't private.
+        // it is a private surface's, which makes the turn it continues
+        // private; here that turn is private already.
         const scheduling: RoutingState = routingState({ continuation: true });
         (scheduling as RoutingState & { nonChannelOrigin?: boolean }).nonChannelOrigin = true;
         internals.openLogical.set('assistant', scheduling);

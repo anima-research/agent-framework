@@ -1067,7 +1067,7 @@ test("a fresh turn starts new routing state in every mode, and leaves the earlie
       assert.equal(now?.suppressed, 0, `${mode}: no suppression carried into the new turn`);
       assert.deepEqual(now?.drafts, [], `${mode}: no drafts carried into the new turn`);
       assert.equal(now?.keptPrivate, 0, `${mode}: no private count carried into the new turn`);
-      assert.equal(now?.triggerChannel, 'test:channel', `${mode}: the new turn uses its own triggering channel`);
+      assert.equal(now?.triggerChannel, undefined, `${mode}: no trigger channel carried into the new turn`);
       assert.notEqual(now?.locus, 'chan-earlier', `${mode}: no locus carried into the new turn`);
       assert.deepEqual([...(now?.engaged ?? [])], [], `${mode}: no engaged channels carried into the new turn`);
       assert.deepEqual(now?.arrivals, [], `${mode}: no arrival carried into the new turn`);
@@ -1420,27 +1420,6 @@ test('guard recovery keeps same-turn explicit-send suppression', async () => {
     await h.run();
     assert.equal(h.membrane.requests.length, 2);
     assert.ok(!routed.some((text) => text.includes('postscript')), `postscript routed: ${JSON.stringify(routed)}`);
-  } finally { await h.framework.stop(); }
-});
-
-test("guard recovery in a private turn keeps the silenced text private, and drafts none of it", async () => {
-  const h = await harness([[createMockResponse([
-    { type: 'tool_use', id: 'send', name: 'test--send_message', input: {} },
-    { type: 'tool_use', id: 'one', name: 'test--read', input: {} },
-  ], 'tool_use'), refused()], [createMockResponse([{ type: 'text', text: 'postscript' }])]], { toolResultGuard: true });
-  const routed = fakeRegistry(h.framework);
-  try {
-    // An operator's message, which names no channel, opens a private turn.
-    h.framework.pushEvent({ type: 'external-message', source: 'test', content: 'read', metadata: {} } as never);
-    await h.framework.runUntilIdle();
-    assert.equal(h.membrane.requests.length, 2);
-    assert.ok(!routed.some((text) => text.includes('postscript')), `postscript routed: ${JSON.stringify(routed)}`);
-    const texts = (h.framework.getAgent('assistant')!.getContextManager().getAllMessages() as Array<{ content: Array<{ type: string; text?: string }> }>)
-      .flatMap((m) => m.content).filter((b) => b.type === 'text').map((b) => b.text ?? '');
-    const receipt = texts.find((t) => t.startsWith('[delivered]')) ?? '';
-    assert.match(receipt, /1 plain-speech segment\(s\) kept private \(non-channel turn/, receipt);
-    const drafts = (h.framework as unknown as { proseDrafts: { open(agent: string): unknown[] } }).proseDrafts;
-    assert.deepEqual(drafts.open('assistant'), [], 'no draft holds the words');
   } finally { await h.framework.stop(); }
 });
 

@@ -333,37 +333,6 @@ test('routeSpeech precedence: fork HOME wins over the active triggering channel'
   assert.equal(publishCalls.at(-1)?.channelId, 'chanA');
 });
 
-test('buildChannelContext uses the frozen turn pin and omits channel claims for a private turn', () => {
-  // The live resolution has moved on to chanB since the turn froze chanA.
-  const active: Record<string, string> = { scout: 'chanB' };
-  const { registry } = makeRegistry({ delivered: true }, () => undefined, (name) => active[name]);
-  seedRegistered(registry, 'discord', 'chanA');
-  registry.handleIncoming('discord', incoming('chanA', 'hi from A'));
-  seedRegistered(registry, 'discord', 'chanB');
-  registry.handleIncoming('discord', incoming('chanB', 'hi from B'));
-
-  assert.equal(registry.buildChannelContext('scout')?.defaultOutgoing?.channelId, 'chanB', 'control: live, it is chanB');
-  const frozen = registry.buildChannelContext('scout', { frozenLocus: 'chanA' });
-  assert.equal(frozen?.defaultOutgoing?.channelId, 'chanA');
-  assert.equal(frozen?.incoming?.channelId, 'chanB');
-
-  const privateContext = registry.buildChannelContext('scout', { frozenLocus: null, privateTurn: true });
-  assert.equal(privateContext?.defaultOutgoing, undefined);
-  assert.equal(privateContext?.incoming, undefined);
-});
-
-test("buildChannelContext keeps a real turn's incoming message when no channel is open and the turn has no locus", () => {
-  const { registry } = makeRegistry({ delivered: true }, () => undefined, () => undefined);
-  seedRegistered(registry, 'discord', 'chanA');
-  registry.handleIncoming('discord', incoming('chanA', 'hi from A'));
-  // The channel has since closed.
-  (registry as unknown as { getOpenChannels(): unknown[] }).getOpenChannels = () => [];
-  const context = registry.buildChannelContext('scout', { frozenLocus: null });
-  assert.equal(context?.incoming?.channelId, 'chanA', 'an explicit- or disabled-mode turn still has what it replies to');
-  assert.equal(context?.defaultOutgoing, undefined);
-  assert.equal(registry.buildChannelContext('scout', { frozenLocus: null, privateTurn: true }), undefined, 'a private turn has neither');
-});
-
 test('buildChannelContext advertises the active triggering channel as defaultOutgoing (item-3 redux)', () => {
   const active: Record<string, string> = { scout: 'chanA' };
   const { registry } = makeRegistry(

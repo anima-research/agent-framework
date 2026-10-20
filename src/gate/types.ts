@@ -223,8 +223,9 @@ export interface GateEventInfo {
   serverId: string;
   channelId: string;
   metadata?: Record<string, unknown>;
-  /** Routing class for operator-surface events held by the gate. */
-  routingClass?: 'private' | 'channel';
+  /** A private surface's message (the framework's isNonChannelSurfaceEvent):
+   *  the window it joins wakes a private turn (wakeProvenance). */
+  nonChannelOrigin?: boolean;
   /** Workspace mount name (for workspace:* events). */
   mount?: string;
   /** Mount-prefixed paths touched (for workspace:* events). */

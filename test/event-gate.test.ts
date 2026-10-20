@@ -34,7 +34,7 @@ function makeGate(configPath: string, opts?: {
 }) {
   const traces: TraceEntry[] = [];
   const messages: Array<{ participant: string; content: unknown; metadata?: unknown }> = [];
-  const inferenceRequests: Array<{ agentName: string; reason: string; source: string; channelId?: string; counterparty?: string; addressed?: boolean; at?: number; routeChannelId?: string; routingClass?: 'private' | 'channel' }> = [];
+  const inferenceRequests: Array<{ agentName: string; reason: string; source: string; channelId?: string; counterparty?: string; addressed?: boolean; at?: number; routeChannelId?: string; nonChannelOrigin?: boolean }> = [];
 
   const gate = new EventGate({
     configPath,
@@ -349,37 +349,20 @@ describe('debounce', () => {
     assert.deepStrictEqual(d.behavior, { debounce: 100 });
   });
 
-  it('retains private surface routing class across debounce', async () => {
+  it("a private surface's message makes its debounce window's wake private", async () => {
     const path = writeConfig('debounce-private-surface.json', {
       policies: [{ name: 'surface', match: { scope: ['external-message'] }, behavior: { debounce: 100 } }],
       default: 'skip',
     });
     const { gate, inferenceRequests } = makeGate(path);
-    gate.evaluate({ content: 'private', eventType: 'external-message', serverId: 'tui', channelId: '', routingClass: 'private' });
+    gate.evaluate({ content: 'private', eventType: 'external-message', serverId: 'tui', channelId: '', nonChannelOrigin: true });
     // Waits for the flush itself, not a fixed time a loaded runner can overrun.
     for (const deadline = Date.now() + 5_000; inferenceRequests.length === 0 && Date.now() < deadline;) {
       await new Promise((resolve) => setTimeout(resolve, 10));
     }
     assert.equal(inferenceRequests.length, 1);
-    assert.equal(inferenceRequests[0]?.routingClass, 'private');
+    assert.equal(inferenceRequests[0]?.nonChannelOrigin, true);
     assert.equal(inferenceRequests[0]?.channelId, undefined);
-    gate.dispose();
-  });
-
-  it('retains channel-bound surface routing class and channel across debounce', async () => {
-    const path = writeConfig('debounce-channel-surface.json', {
-      policies: [{ name: 'surface', match: { scope: ['external-message'] }, behavior: { debounce: 100 } }],
-      default: 'skip',
-    });
-    const { gate, inferenceRequests } = makeGate(path);
-    gate.evaluate({ content: 'channel', eventType: 'external-message', serverId: 'bridge', channelId: 'discord:g:room', routingClass: 'channel' });
-    // Waits for the flush itself, not a fixed time a loaded runner can overrun.
-    for (const deadline = Date.now() + 5_000; inferenceRequests.length === 0 && Date.now() < deadline;) {
-      await new Promise((resolve) => setTimeout(resolve, 10));
-    }
-    assert.equal(inferenceRequests.length, 1);
-    assert.equal(inferenceRequests[0]?.routingClass, 'channel');
-    assert.equal(inferenceRequests[0]?.channelId, 'discord:g:room');
     gate.dispose();
   });
 
@@ -1170,63 +1153,44 @@ describe('quiesce suppression', () => {
   });
 });
 
-describe("a window's parts, in the order they arrived", () => {
+describe("a window that holds a private surface's message", () => {
   afterEach(() => rmSync(TMP_DIR, { recursive: true, force: true }));
-  // The shared buffer holds each policy's events in the order its debounce
-  // fired, so these windows are set in the buffer directly, in an order that
-  // isn't the order of arrival.
   type Pending = { policyName: string; content: string; eventType: string; timestamp: number; inContext: boolean;
-    channelId?: string; serverId?: string; authorId?: string; routingClass?: 'private' | 'channel'; addressed?: boolean };
-  const tui = (timestamp: number): Pending => ({ policyName: 'p', content: 'operator', eventType: 'external-message', timestamp, inContext: false, serverId: 'tui', routingClass: 'private' });
+    channelId?: string; serverId?: string; authorId?: string; nonChannelOrigin?: boolean; addressed?: boolean; routeChannelId?: string };
+  const tui = (timestamp: number): Pending => ({ policyName: 'p', content: 'operator', eventType: 'external-message', timestamp, inContext: false, serverId: 'tui', nonChannelOrigin: true });
   const room = (timestamp: number): Pending => ({
     policyName: 'p', content: 'room', eventType: 'mcpl:channel-incoming', timestamp, inContext: true,
-    channelId: 'discord:g:room', serverId: 'discord', authorId: 'u1', addressed: true,
+    channelId: 'discord:g:room', serverId: 'discord', authorId: 'u1', addressed: true, routeChannelId: 'discord:g:room',
   });
+  /** Flushes a window set in the gate's shared buffer, and returns its wakes. */
   async function flush(buffer: Pending[]) {
-    const { gate, inferenceRequests } = makeGate(writeConfig('order.json', { policies: [], default: 'skip' }));
+    const { gate, inferenceRequests } = makeGate(writeConfig('window.json', { policies: [], default: 'skip' }));
     const internals = gate as unknown as { inferenceBuffer: Pending[] };
     gate.onInferenceStarted('elsewhere');
     internals.inferenceBuffer.push(...buffer);
     gate.onInferenceEnded('elsewhere');
     // The flush delivers in a microtask.
     await new Promise((resolve) => setImmediate(resolve));
-    return inferenceRequests.map((r) => (r as { routingClass?: string }).routingClass === 'private' ? 'private' : 'room');
+    return inferenceRequests;
   }
 
-  it('a part whose events came first goes first, though the buffer holds the other part first', async () => {
-    assert.deepStrictEqual(await flush([room(20), tui(10)]), ['private', 'room']);
-    assert.deepStrictEqual(await flush([tui(20), room(10)]), ['room', 'private']);
-  });
-
-  it("a part's arrival is its earliest event's, wherever that event sits in the part", async () => {
-    // The room's part holds a later event first and its earliest last.
-    assert.deepStrictEqual(await flush([room(30), tui(10), room(5)]), ['room', 'private']);
-  });
-
-  it("a part's provenance takes an addressed event over a newer channel-bound surface message", () => {
-    const bound: Pending = { policyName: 'p', content: 'bound', eventType: 'external-message', timestamp: 20, inContext: false,
-      channelId: 'bridge:g:a', serverId: 'bridge', authorId: 'u1', routingClass: 'channel', addressed: false };
-    const addressed: Pending = { ...room(10), channelId: 'discord:g:b', authorId: 'u2' };
-    const picked = wakeProvenance([addressed, bound] as never);
-    assert.deepStrictEqual(picked, { channelId: 'discord:g:b', counterparty: 'discord:user:u2', addressed: true, at: 10 });
-  });
-
-  it("a part's provenance takes its newest channel-bound surface message, whose channel, author and time it reports, over newer ambient chatter", () => {
-    const bound = (timestamp: number, channel: string, author: string): Pending => ({ policyName: 'p', content: 'bound',
-      eventType: 'external-message', timestamp, inContext: false, channelId: channel, serverId: 'bridge', authorId: author,
-      routingClass: 'channel', addressed: false });
-    const ambient: Pending = { ...room(40), channelId: 'discord:g:d', authorId: 'u4', addressed: false };
-    // Either one first: a part holds its events as their debounces fired.
-    for (const order of [[10, 30], [30, 10]]) {
-      const bounds = order.map((t) => t === 30 ? bound(30, 'bridge:g:c', 'u3') : bound(10, 'bridge:g:a', 'u1'));
-      const picked = wakeProvenance([...bounds, ambient] as never);
-      assert.deepStrictEqual(picked, { channelId: 'bridge:g:c', counterparty: 'bridge:user:u3', routingClass: 'channel', at: 30 }, `order ${order}`);
+  it('wakes one private turn with no route, though an addressed channel message shares it, in either order', async () => {
+    for (const window of [[room(20), tui(10)], [tui(10), room(20)]]) {
+      const wakes = await flush(window);
+      assert.equal(wakes.length, 1, 'one wake for the window');
+      assert.equal(wakes[0]?.nonChannelOrigin, true);
+      assert.equal(wakes[0]?.routeChannelId, undefined, 'the private turn answers in no channel');
+      assert.equal(wakes[0]?.addressed, true, "the provenance still says who woke it, as telemetry");
     }
+    // Control: the room's message alone routes its reply.
+    const alone = await flush([room(20)]);
+    assert.equal(alone[0]?.routeChannelId, 'discord:g:room');
+    assert.equal(alone[0]?.nonChannelOrigin, undefined);
   });
 
-  it('parts that arrived in the same millisecond go in the window\'s order', async () => {
-    assert.deepStrictEqual(await flush([room(10), tui(10)]), ['room', 'private']);
-    assert.deepStrictEqual(await flush([tui(10), room(10)]), ['private', 'room']);
+  it("is private though nothing in it names a channel or an author", () => {
+    assert.deepStrictEqual(wakeProvenance([tui(10)] as never), { nonChannelOrigin: true, at: 10 });
+    assert.equal(wakeProvenance([{ ...tui(10), nonChannelOrigin: undefined }] as never), undefined, 'control: an unmarked one has no provenance');
   });
 });
 
