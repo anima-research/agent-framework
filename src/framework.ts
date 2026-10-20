@@ -15249,14 +15249,13 @@ export class AgentFramework {
    * plain speech had a destination, a durable `[routing]` notice says so
    * (storePrivateTurnNotice). Returns the notice as stored, for a live stream
    * to inject with its boundary's other messages, or undefined when the turn
-   * was private already, had no destination, or the notice couldn't be
-   * stored.
+   * had no destination, as a turn already private has none, or the notice
+   * couldn't be stored.
    */
   private makeTurnPrivate(
     agent: Agent,
     routing: TurnRouting,
   ): { participant: string; content: ContentBlock[]; metadata: MessageMetadata } | undefined {
-    if (routing.nonChannelOrigin) return undefined;
     routing.nonChannelOrigin = true;
     const had = routing.locus ?? routing.pin;
     delete routing.locus;
