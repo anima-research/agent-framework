@@ -32,8 +32,12 @@
  * a directory is checked by its canonical path and identity, not held open:
  * a parent replaced concurrently in the window between a check and its use
  * (or replaced and restored around it) can still redirect a listing or
- * lookup there. File contents are bound regardless: a file is read only
- * through a descriptor bound to its path first.
+ * lookup there. File contents are bound more tightly: a file is read only
+ * through a descriptor whose identity matches the file its path named, as a
+ * check before the open found it (hashAt) or as the path's realpath after
+ * the open finds it (openContainedFile), though a link put back after that
+ * realpath, leading to the opened file itself, still passes the check
+ * (sameLevels).
  */
 
 import { createHash } from 'node:crypto';
@@ -45,7 +49,11 @@ import { basename, dirname, isAbsolute, join, posix, relative, resolve, sep } fr
 import { sameRootIdentity, type Fingerprint, type RootIdentity } from './disk-agreement.js';
 
 export interface MountView {
-  /** Mount root as configured. */
+  /**
+   * The directory its readers read beneath: the mount's root as configured,
+   * or, for a direct mount, the root its view resolved (diskView), so a
+   * walk opens what it judges beneath one root.
+   */
   root: string;
   /** The mount's name, which a tool puts before a path in the mount. */
   name: string;
@@ -58,33 +66,35 @@ export interface MountView {
   /** Text above this size is not ingested. */
   maxFileSize: number;
   ignore: string[];
+  /** The mount's `include`: files and links it doesn't cover are outside the mount. Absent, everything is inside. */
+  include?: readonly string[];
   /**
    * Other mounts' directories nested inside this one, mount-relative. Every
    * pass passes over them, named or not, as another mount's directory.
    */
   others: readonly string[];
   /**
-   * The same mounts, each by its directory, its name and, where it has one,
-   * its real root (NestedMount), for a refusal that names the mount a path
-   * leads into: through a symlink this mount doesn't follow (linkWords), or
-   * through one it follows, or a root configured through one (nestedAtReal).
-   * Without it, no path is refused for where its links lead, and a link's
-   * refusal names no mount.
+   * The same mounts, each by its directory, its name, its own include and,
+   * where it has one, its real root (NestedMount), for a refusal that names
+   * the mount a path leads into: through a symlink this mount doesn't follow
+   * (linkWords), or through one it follows, or a root configured through one
+   * (nestedAtReal). Without it, no path is refused for where its links lead,
+   * and a link's refusal names no mount.
    */
   nested?: readonly NestedMount[];
 }
 
 /**
  * A mount nested in another: its directory in one of its spellings,
- * mount-relative and `/`-separated, its name, and its real root, which
- * every spelling shares. The real root is the root as realpath resolves it
- * (the nearest existing directory's, where the root isn't made yet) once
- * the module's start has read it, and the root as configured until then.
- * There's none where it's this mount's own or holds it: the mount is nested
- * by its configured path alone, since through its real root it would claim
- * this mount's every path.
+ * mount-relative and `/`-separated, its name, its real root, which every
+ * spelling shares, and its own include. The real root is the root as
+ * realpath resolves it (the nearest existing directory's, where the root
+ * isn't made yet) once the module's start has read it, and the root as
+ * configured until then. There's none where it's this mount's own or holds
+ * it: the mount is nested by its configured path alone, since through its
+ * real root it would claim this mount's every path.
  */
-export type NestedMount = { dir: string; name: string; real?: string };
+export type NestedMount = { dir: string; name: string; real?: string; include?: readonly string[] };
 
 export type StatFingerprint = Omit<Fingerprint, 'hashedAt'>;
 
@@ -247,9 +257,12 @@ export async function linkRefusal(
 
 /**
  * Where a symlink the walk found leads, for its refusal: to a path inside
- * the mount (mount-relative, and whether it's a directory), outside the
- * mount, or nowhere it can be resolved to. One realpath and one stat, made
- * only when refusing.
+ * the mount (mount-relative, as disk spells it, and whether it's a
+ * directory), outside the mount, or nowhere it can be resolved to. One
+ * realpath, one stat and the respelling, made only when refusing. realpath
+ * keeps the spelling the link's target gives, which on a disk that folds
+ * names need not be disk's, so the target is respelled before anything
+ * judges or names it (diskSpelling).
  */
 export type LinkLeads = { kind: 'inside'; target: string; directory: boolean } | { kind: 'outside' } | { kind: 'nowhere' };
 
@@ -258,7 +271,7 @@ export async function linkLeads(root: string, rootReal: string, link: string): P
   if (leads === null) return { kind: 'nowhere' };
   if (!contained(rootReal, leads)) return { kind: 'outside' };
   const directory = await stat(leads).then((info) => info.isDirectory(), () => false);
-  return { kind: 'inside', target: relative(rootReal, leads).split(sep).join('/'), directory };
+  return { kind: 'inside', target: await diskSpelling(rootReal, relative(rootReal, leads).split(sep).join('/')), directory };
 }
 
 /**
@@ -266,10 +279,117 @@ export async function linkLeads(root: string, rootReal: string, link: string): P
  * innermost where nested mounts nest, as #460 picks one; undefined when none
  * does.
  */
-export function nestedHolder(target: string, nested: readonly { dir: string; name: string }[]): { dir: string; name: string } | undefined {
+export function nestedHolder<N extends { dir: string; name: string }>(target: string, nested: readonly N[]): N | undefined {
   return nested
     .filter((n) => target === n.dir || target.startsWith(`${n.dir}/`))
     .sort((a, b) => b.dir.length - a.dir.length)[0];
+}
+
+/**
+ * Whether a link's refusal names `holder`, the nested mount whose directory
+ * holds the link's target. The target's path is one of that mount's own, so
+ * its include decides: the refusal names a directory, or a file the include
+ * covers. A refusal's code follows the same test (linkReadError's
+ * `other_mount`), so the code says no more than the message.
+ */
+export function namesHolder(leads: { target: string; directory: boolean }, holder: { dir: string; include?: readonly string[] }): boolean {
+  return namesNestedPlace(leads.target.slice(holder.dir.length + 1), holder.include, leads.directory);
+}
+
+/**
+ * Whether a refusal names a place in a nested mount's directory, `rest`
+ * beneath that mount's root, as a place of that mount's: a directory, or a
+ * file its include covers. The place is one of that mount's own paths, so
+ * its include decides, and a refusal's code follows the same test, so the
+ * code says no more than the message. Anywhere else the place is no mount's:
+ * the outer mount passes over the nested directory, and the nested mount's
+ * include leaves it out. So a link the outer mount doesn't follow is refused
+ * as one it doesn't follow (namesHolder), and a path that reaches the place
+ * through one it follows is refused as one that leaves the mount, in the
+ * words each such refusal already has (nestedAtReal's callers).
+ */
+export function namesNestedPlace(rest: string, include: readonly string[] | undefined, directory: boolean): boolean {
+  return directory || insideMount(rest, include);
+}
+
+/**
+ * Whether a path of a mount is one its passes decide and its listings may
+ * name: inside its include, and, in a nested mount's directory, a place
+ * that mount names (namesNestedPlace), its directory included. History the
+ * mount took in before another was nested there, which that mount's
+ * include leaves out, is no mount's, so no pass decides it, and no listing
+ * names it or a directory only it implies.
+ */
+export function withinIncludes(view: Pick<MountView, 'include' | 'nested'>, path: string): boolean {
+  if (!insideMount(path, view.include)) return false;
+  const holder = nestedHolder(path, view.nested ?? []);
+  return holder === undefined || path === holder.dir || namesNestedPlace(path.slice(holder.dir.length + 1), holder.include, false);
+}
+
+/**
+ * The path a mount's include judges for `given`, one of the mount's paths,
+ * which landed at `real`, its canonical path, inside the mount and in no
+ * nested mount's directory. Where realpath couldn't resolve it, as for a loop
+ * or a directory this process can't search, `real` is the path as
+ * path.resolve reads it, which this judges as named, so a caller refuses such
+ * a path first, as landingRefusal does (realBeneath's `unresolved`). The
+ * include is the operator's statement of which files' content the workspace
+ * holds, and a link is a path, not a grant of content, so where a followed
+ * path lands is judged as where it's named, as a nested mount's place is
+ * (namesNestedPlace). A path that meets no link lands where it's named, and
+ * is judged as named. realpath can spell such a path otherwise only as a disk
+ * that folds names does, with disk's stored names on macOS and Windows where
+ * a path keeps a workspace entry's spelling, so where the spellings differ
+ * only so, the path is judged as named where it reaches the landing itself,
+ * level by level (sameLevels). Otherwise the landing is judged, as disk
+ * spells it, since realpath keeps the spelling a link's target gives, which
+ * on a disk that folds names need not be disk's (diskSpelling).
+ */
+export async function judgedAt(rootReal: string, real: string, given: string): Promise<string> {
+  const landed = relative(rootReal, real).split(sep).join('/');
+  if (landed === given) return given;
+  if (foldedLoosely(landed) === foldedLoosely(given) && await sameLevels(rootReal, given, landed)) return given;
+  return diskSpelling(rootReal, landed);
+}
+
+/**
+ * Whether `given` reaches `landed`, two spellings of a path beneath
+ * `rootReal`, level by level: each directory on the way and the file itself
+ * are, as `lstat` finds them, one and the same on both sides, so the path as
+ * named passes through no link of its own that the landing doesn't. Beneath
+ * the last level both sides have, where neither has the next, a file a write
+ * would create there lands where it's named. A level only one side has, or
+ * one this can't ask, is no such path. It asks each level once, in turn: on a
+ * disk that folds names a level both spellings share is one entry, so a link
+ * disk puts there after the realpath meets both alike, and a name removed
+ * while this asks and put back after reads as a file a write would create.
+ * Where a read follows, its check of the opened file catches a link to
+ * another file, but not one back to the opened file itself; that race, like
+ * one where the spellings match, isn't closed here.
+ */
+async function sameLevels(rootReal: string, given: string, landed: string): Promise<boolean> {
+  const named = given.split('/');
+  const landing = landed.split('/');
+  const level = (segments: string[], i: number) => lstat(join(rootReal, ...segments.slice(0, i)), { bigint: true })
+    .then((st) => st, (err: unknown) => (errno(err) === 'ENOENT' || errno(err) === 'ENOTDIR' ? null : undefined));
+  for (let i = 1; i <= named.length; i++) {
+    const [a, b] = await Promise.all([level(named, i), level(landing, i)]);
+    if (a === undefined || b === undefined) return false;
+    if (a === null && b === null) return true;
+    if (a === null || b === null || !sameFile(a, b)) return false;
+  }
+  return true;
+}
+
+/**
+ * Whether a mount's own include covers the file one of its paths, `given`,
+ * lands on at `real` (judgedAt): a file it leaves out there is no file of
+ * this mount's, and a path that reaches it through a link is refused as one
+ * that leaves the mount, in the words each such refusal already has
+ * (nestedAtReal's callers). A mount without an include covers every file.
+ */
+export async function coversLanding(view: Pick<MountView, 'include'>, rootReal: string, real: string, given: string): Promise<boolean> {
+  return view.include === undefined || insideMount(await judgedAt(rootReal, real, given), view.include);
 }
 
 /**
@@ -284,9 +404,15 @@ export function nestedHolder(target: string, nested: readonly { dir: string; nam
  * path to use there in place of the link, and offers no setting, since
  * following the link would only reach into another mount's directory. For a
  * directory the walk couldn't ask, which one, and the answer it got. Paths
- * are spelled as the tools take them, from the mount's name.
+ * are spelled as the tools take them, from the mount's name. On a mount with
+ * an include, an inside target is named only where a tool could name it: a
+ * file the include covers, or a directory, which a listing names whatever
+ * lies beneath it. Anywhere else the refusal says only that the link isn't
+ * followed, so no tool names what lies outside the include. A link the
+ * include doesn't cover is outside the mount itself, so its refusal tells
+ * nothing of where it leads (shownLeads gives null for it).
  */
-export function linkWords(name: string, found: LinkFound, leads: LinkLeads | null, nested: readonly { dir: string; name: string }[] = []): string {
+export function linkWords(name: string, found: LinkFound, leads: LinkLeads | null, nested: readonly NestedMount[] = [], include?: readonly string[]): string {
   const spell = (rel: string) => `"${rel === '' ? name : `${name}/${rel}`}"`;
   if (!('link' in found)) return `${UNSURE_PREFIX}${name}/${found.unsure}" is a symlink (${found.code})`;
   const link = `${spell(found.link)} is a symlink`;
@@ -294,33 +420,52 @@ export function linkWords(name: string, found: LinkFound, leads: LinkLeads | nul
   if (leads.kind === 'outside') return `${link} leading outside the mount, which this mount does not follow`;
   const holder = nestedHolder(leads.target, nested);
   if (holder) {
+    if (!namesHolder(leads, holder)) return `${link}, which this mount does not follow`;
     const rest = leads.target.slice(holder.dir.length + 1);
     return `${link} to ${spell(leads.target)}, which this mount does not follow; it lies in mount "${holder.name}", ` +
       `nested in mount "${name}": use "${rest ? `${holder.name}/${rest}` : holder.name}" in place of ${spell(found.link)}`;
   }
-  const setting = leads.directory ? "; the mount's host can set followSymlinks: true" : '';
+  if (!leads.directory && !insideMount(leads.target, include)) return `${link}, which this mount does not follow`;
+  // Following it serves only what the include covers where it leads (judgedAt).
+  const setting = !leads.directory ? '' : include === undefined ? "; the mount's host can set followSymlinks: true"
+    : "; the mount's host can set followSymlinks: true, for what the include covers where it leads";
   return `${link} to ${spell(leads.target)}, which this mount does not follow${setting}`;
 }
 
-/** Why a path is refused for what linkOnTheWay found (linkWords, with where the link leads). */
-export async function linkReason(view: Pick<MountView, 'root' | 'name' | 'nested'>, rootReal: string, found: LinkFound): Promise<string> {
-  return linkWords(view.name, found, 'link' in found ? await linkLeads(view.root, rootReal, found.link) : null, view.nested);
+/**
+ * Where a link linkOnTheWay found leads, as its refusal may tell it
+ * (linkLeads), or null where the refusal tells nothing of it: where the walk
+ * found a directory it couldn't ask rather than a link, and where the mount's
+ * include doesn't cover the link, which is then outside the mount, so its
+ * refusal shows only that a link stands on the path. A refusal's code
+ * follows the same answer (linkReadError), so the code says no more than the
+ * message.
+ */
+export async function shownLeads(root: string, rootReal: string, found: LinkFound, include: readonly string[] | undefined): Promise<LinkLeads | null> {
+  return 'link' in found && insideMount(found.link, include) ? linkLeads(root, rootReal, found.link) : null;
+}
+
+/** Why a path is refused for what linkOnTheWay found (linkWords, with where the link leads, as shownLeads tells it). */
+export async function linkReason(view: Pick<MountView, 'root' | 'name' | 'nested' | 'include'>, rootReal: string, found: LinkFound): Promise<string> {
+  return linkWords(view.name, found, await shownLeads(view.root, rootReal, found, view.include), view.nested, view.include);
 }
 
 /**
  * The nested mount whose root holds `real`, a canonical path, the innermost,
- * with the path to use there; undefined when none does. A path the lexical
- * checks pass (inOtherMount, the tools' holderOf) reaches another mount's
- * directory this way through a symlink the mount follows, so each check that
- * resolves a path canonically asks this too.
+ * with the path to use there, the path beneath its root (`rest`) and its
+ * include; undefined when none does. A path the lexical checks pass
+ * (inOtherMount, the tools' holderOf) reaches another mount's directory this
+ * way through a symlink the mount follows, so each check that resolves a
+ * path canonically asks this too, and names the mount only where
+ * namesNestedPlace says the place is that mount's.
  */
-export function nestedAtReal(real: string, nested: readonly NestedMount[] = []): { name: string; use: string } | undefined {
+export function nestedAtReal(real: string, nested: readonly NestedMount[] = []): { name: string; use: string; rest: string; include?: readonly string[] } | undefined {
   const holder = nested
-    .flatMap((n) => (n.real !== undefined && contained(n.real, real) ? [{ name: n.name, real: n.real }] : []))
+    .flatMap((n) => (n.real !== undefined && contained(n.real, real) ? [{ name: n.name, real: n.real, include: n.include }] : []))
     .sort((a, b) => b.real.length - a.real.length)[0];
   if (!holder) return undefined;
   const rest = relative(holder.real, real).split(sep).join('/');
-  return { name: holder.name, use: rest ? `${holder.name}/${rest}` : holder.name };
+  return { name: holder.name, use: rest ? `${holder.name}/${rest}` : holder.name, rest, include: holder.include };
 }
 
 /**
@@ -469,6 +614,20 @@ function entryName(paths: readonly string[], prefix: string, segment: string): s
     if (found === null && lowered(name) === want) found = name;
   }
   return found;
+}
+
+/**
+ * Whether a path's segments begin with a directory's: exactly, or, with
+ * `loosely`, with each segment compared as loosely as listedName compares
+ * names (foldedLoosely), as a disk that folds names may compare them. That
+ * errs toward the directory: on a disk that tells some of those spellings
+ * apart, such as case, or `ß` from `ss`, a distinct directory spelled one of
+ * them matches too, and resolveAbsolutePath, the one caller that compares
+ * loosely, gives null for a path beneath it.
+ */
+export function beginsWithDir(segments: readonly string[], dir: readonly string[], loosely: boolean): boolean {
+  if (segments.length < dir.length) return false;
+  return dir.every((d, i) => segments[i] === d || (loosely && foldedLoosely(segments[i]!) === foldedLoosely(d)));
 }
 
 /**
@@ -770,9 +929,14 @@ async function locateDir(view: MountView, rootReal: string, rel: string): Promis
     return { kind: 'unobserved', reason: OUTSIDE_PARENT, outside: true };
   } else {
     // Through a link this mount follows, a directory can be a nested
-    // mount's, which the mount neither reads nor writes.
+    // mount's, which the mount neither reads nor writes. A place there that
+    // mount's include leaves out is no mount's, and holds nothing beneath it,
+    // as at any file (namesNestedPlace).
     const holder = nestedAtReal(real, view.nested);
-    if (holder) return { kind: 'unobserved', reason: leadsInto(view.name, rel, holder) };
+    if (holder) {
+      const directory = holder.include !== undefined && await stat(real).then((info) => info.isDirectory(), () => false);
+      return namesNestedPlace(holder.rest, holder.include, directory) ? { kind: 'unobserved', reason: leadsInto(view.name, rel, holder) } : { kind: 'missing' };
+    }
   }
   const checked = await checkedAt(view, rel, real);
   if (checked) {
@@ -997,19 +1161,24 @@ export async function filesystemTrustsCtime(root: string): Promise<boolean> {
 // ===========================================================================
 
 /**
- * Where a path's parent directory canonically lies: inside the mount, gone
- * (absence is then proven separately), or somewhere a no-follow open would
- * still reach through — O_NOFOLLOW guards only the final component — which
- * on a mount that doesn't follow symlinks is any symlink on the way.
+ * Where a path's parent directory canonically lies: inside the mount, with
+ * that real path, gone (absence is then proven separately), or somewhere a
+ * no-follow open would still reach through — O_NOFOLLOW guards only the
+ * final component — which on a mount that doesn't follow symlinks is any
+ * symlink on the way.
  */
-async function parentPlacement(view: MountView, rootReal: string, relativePath: string): Promise<'inside' | 'gone' | { reason: string }> {
+async function parentPlacement(view: MountView, rootReal: string, relativePath: string): Promise<{ inside: string } | 'gone' | { reason: string }> {
   try {
     const parent = await realpath(dirname(join(view.root, relativePath)));
     const found = await linkRefusal(view, rootReal, relativePath, parent, 'parents');
     if (found !== null) return { reason: await linkReason(view, rootReal, found) };
     if (!contained(rootReal, parent)) return { reason: OUTSIDE_PARENT };
     const holder = nestedAtReal(parent, view.nested);
-    return holder ? { reason: leadsInto(view.name, parentOf(relativePath), holder) } : 'inside';
+    if (!holder) return { inside: parent };
+    // A place there that the nested mount's include leaves out is no mount's,
+    // and holds nothing beneath it, as beneath any file (namesNestedPlace).
+    const directory = holder.include !== undefined && await stat(parent).then((info) => info.isDirectory(), () => false);
+    return namesNestedPlace(holder.rest, holder.include, directory) ? { reason: leadsInto(view.name, parentOf(relativePath), holder) } : 'gone';
   } catch (err) {
     const code = errno(err);
     if (code === 'ENOENT' || code === 'ENOTDIR') return 'gone';
@@ -1031,7 +1200,7 @@ export async function observePath(view: MountView, rootReal: string, relativePat
   const lexical = join(view.root, relativePath);
   const placement = await parentPlacement(view, rootReal, relativePath);
   if (placement === 'gone') return absence(view, rootReal, relativePath);
-  if (placement !== 'inside') return { kind: 'unobserved', reason: placement.reason };
+  if ('reason' in placement) return { kind: 'unobserved', reason: placement.reason };
   let info;
   try {
     info = await lstat(lexical, { bigint: true });
@@ -1056,15 +1225,27 @@ export async function observePath(view: MountView, rootReal: string, relativePat
     }
     if (!contained(rootReal, real)) return { kind: 'unobserved', reason: 'a symlink that leaves the mount' };
     const holder = nestedAtReal(real, view.nested);
-    if (holder) return { kind: 'unobserved', reason: leadsInto(view.name, relativePath, holder) };
+    // A place a nested mount's include leaves out is no mount's, so the link
+    // leaves this one (namesNestedPlace).
+    if (holder) {
+      return { kind: 'unobserved', reason: namesNestedPlace(holder.rest, holder.include, target.isDirectory()) ? leadsInto(view.name, relativePath, holder) : 'a symlink that leaves the mount' };
+    }
     if (!target.isFile()) {
       return { kind: 'unobserved', reason: target.isDirectory() ? 'a symlink to a directory, not walked' : 'not a regular file' };
     }
+    // A file this mount's own include leaves out where the link lands is no
+    // file of this mount's (coversLanding). It's judged here, and not only
+    // where the file is opened, since a pass takes a copy whose fingerprint
+    // the stat vouches for without opening it.
+    if (!(await coversLanding(view, rootReal, real, relativePath))) return { kind: 'unobserved', reason: 'a symlink that leaves the mount' };
     info = target;
   } else if (info.isDirectory()) {
     return { kind: 'unobserved', reason: 'a directory' };
   } else if (!info.isFile()) {
     return { kind: 'unobserved', reason: 'not a regular file' };
+  } else if (!(await coversLanding(view, rootReal, join(placement.inside, basename(lexical)), relativePath))) {
+    // So is one reached through a link among its directories.
+    return { kind: 'unobserved', reason: 'a symlink that leaves the mount' };
   }
   return { kind: 'file', size: Number(info.size), mtimeMs: Number(info.mtimeMs), mode: Number(info.mode & 0o777n), fp: statFingerprint(info) };
 }
@@ -1117,11 +1298,14 @@ async function openContained(
     const found = await linkRefusal(view, rootReal, relativePath, real);
     if (found !== null) return { kind: 'unobserved', reason: await linkReason(view, rootReal, found) };
     if (!info.isFile()) return { kind: 'unobserved', reason: info.isDirectory() ? 'a directory' : 'not a regular file' };
-    if (!contained(rootReal, real)) {
-      return { kind: 'unobserved', reason: view.followSymlinks ? 'a symlink that leaves the mount' : OUTSIDE_PARENT };
-    }
+    const leaves = view.followSymlinks ? 'a symlink that leaves the mount' : OUTSIDE_PARENT;
+    if (!contained(rootReal, real)) return { kind: 'unobserved', reason: leaves };
     const holder = nestedAtReal(real, view.nested);
-    if (holder) return { kind: 'unobserved', reason: leadsInto(view.name, relativePath, holder) };
+    // A place a nested mount's include leaves out is no mount's. Reached
+    // through a link this mount doesn't follow, the link is what's refused.
+    if (holder) return { kind: 'unobserved', reason: namesNestedPlace(holder.rest, holder.include, false) ? leadsInto(view.name, relativePath, holder) : view.followSymlinks ? leaves : NOT_FOLLOWED };
+    // So is a file this mount's own include leaves out (coversLanding).
+    if (!(await coversLanding(view, rootReal, real, relativePath))) return { kind: 'unobserved', reason: view.followSymlinks ? leaves : NOT_FOLLOWED };
     const named = await stat(real, { bigint: true }).catch(() => null);
     if (named === null || named.dev !== info.dev || named.ino !== info.ino) {
       return { kind: 'unobserved', reason: 'the file changed while it was read' };
@@ -1245,6 +1429,66 @@ export async function readPath(
   }
 }
 
+/** A file's bytes as readBytes read them, none hashed. */
+export interface BytesResult {
+  kind: 'bytes';
+  /**
+   * Its size in bytes: as read, for a file within the limit; as its fstat
+   * says, for one over it, and at least one past the limit where the reads
+   * found it grown past it.
+   */
+  size: number;
+  /** The whole file, when it is at most the limit both at its fstat and as read; null otherwise. */
+  bytes: Buffer | null;
+  /** Its first bytes (at most HEAD_BYTES), for binary detection and MIME sniffing. */
+  head: Buffer;
+}
+
+/**
+ * A mount-relative file's bytes, through the same located descriptor as
+ * readPath, for a direct mount's tools, which keep nothing: at most `limit`
+ * of them, and none hashed. A file over `limit` at its fstat has only its
+ * head read, and one that grew past it since is read no further than it.
+ * What the open refuses gets the reason a listing gives it, such as a link
+ * to a directory, except a regular file it couldn't open, which keeps the
+ * open's.
+ */
+export async function readBytes(
+  view: MountView,
+  rootReal: string,
+  relativePath: string,
+  limit: number,
+): Promise<BytesResult | Exclude<Observation, { kind: 'file' }>> {
+  const opened = await openContained(view, rootReal, relativePath);
+  if (!('handle' in opened)) {
+    // A walk takes a link to a directory as an entry, where the mount follows
+    // links, and the open may refuse it as a directory or, where it can't
+    // be opened, by its errno: either way it's named as a listing names it
+    // (observePath).
+    if (opened.kind === 'unobserved') {
+      const seen = await observePath(view, rootReal, relativePath);
+      return seen.kind === 'file' ? opened : seen;
+    }
+    return opened;
+  }
+  const { handle, info } = opened;
+  try {
+    const size = Number(info.size);
+    if (size > limit) {
+      const head = Buffer.alloc(Math.min(HEAD_BYTES, size));
+      const { bytesRead } = await handle.read(head, 0, head.length, 0);
+      return { kind: 'bytes', size, bytes: null, head: head.subarray(0, bytesRead) };
+    }
+    const { bytes, more } = await readPrefix(handle, limit, size);
+    if (more) return { kind: 'bytes', size: Math.max(Number((await handle.stat({ bigint: true })).size), bytes.length + 1), bytes: null, head: bytes.subarray(0, HEAD_BYTES) };
+    return { kind: 'bytes', size: bytes.byteLength, bytes, head: bytes.subarray(0, HEAD_BYTES) };
+  } catch (err) {
+    return { kind: 'unobserved', reason: `cannot read (${errno(err) ?? String(err)})` };
+  } finally {
+    await handle.close();
+  }
+}
+
 /**
  * The first bytes of a mount-relative file and its size, through the same
  * located descriptor as readPath — for listing a file nothing tracks, which
@@ -1310,6 +1554,15 @@ export interface Walk {
    * file name): present, unproven.
    */
   others: Map<string, string>;
+  /**
+   * The entries in `others` that the mount's include doesn't cover and that
+   * are neither directories nor links (a regular file, a FIFO, a socket or a
+   * device): present, unproven, and holding nothing beneath them. Only provenAbsent
+   * reads it, for a directory listed whole. A path beneath a name passed
+   * over by design is never decided (reconcile), so those need no such
+   * record.
+   */
+  otherFiles: Set<string>;
   /**
    * Directories whose listing the walk read whole, and that were still the
    * directory at their path once it had: every name in one is in `files`,
@@ -1395,6 +1648,84 @@ export function coveredByIgnore(relativePath: string, patterns: string[]): boole
   return false;
 }
 
+/** Why a walk passes over a file or link the mount's `include` doesn't cover, and a push leaves one alone. */
+export const OUTSIDE_INCLUDE = "outside the mount's include";
+
+/**
+ * The segments of a path after its mount's name, as the workspace reads them
+ * everywhere: split at `/`, and at `\` too where that's the platform's
+ * separator, with no empty or `.` segment. A `..` segment stays, for the
+ * parse to take back the segment before it or refuse as a climb.
+ */
+export function pathSegments(path: string, platformSep: string = sep): string[] {
+  return (platformSep === '\\' ? path.replaceAll('\\', '/') : path).split('/').filter((s) => s !== '' && s !== '.');
+}
+
+/**
+ * Whether a mount-relative path is spelled as the workspace's parsing spells
+ * one: segments between single `/`, none empty, `.` or `..`, with no `\`
+ * where that's the separator, or '' for the root. A walk and the watcher name
+ * paths this way. An earlier version stored a path as it was written, so the
+ * store can hold a key such as `a//b.txt` or `c/`, which no spelling names.
+ */
+export function parsedSpelling(relativePath: string, platformSep: string = sep): boolean {
+  if (relativePath === '') return true;
+  const segments = pathSegments(relativePath, platformSep);
+  return !segments.includes('..') && segments.join('/') === relativePath;
+}
+
+/**
+ * Whether a mount-relative path is inside its mount: spelled as parsing spells
+ * one (parsedSpelling), and covered by the mount's `include` when it has one.
+ * The mount's root, '', is inside. A store key no spelling names is outside,
+ * as an entry the include doesn't cover is: nothing lists, counts, syncs or
+ * writes it, and history keeps it as it was.
+ */
+export function insideMount(relativePath: string, include: readonly string[] | undefined): boolean {
+  if (!parsedSpelling(relativePath)) return false;
+  if (include === undefined || relativePath === '') return true;
+  return coveredByInclude(relativePath, include);
+}
+
+/**
+ * Whether the include's matcher can read `pattern`: a name or an `*.ext` glob,
+ * which covers a file by its own name, or a `dir/**` glob, with no empty, `.`
+ * or `..` segment, since those name no entry a path reaches. Where `\` is the
+ * platform's separator, as on Windows, a pattern holding one can't name a
+ * file either, since every path is read with `\` as a separator
+ * (pathSegments). A pattern the matcher can't read would match nothing, and
+ * take every file out of the mount unsaid, so the module refuses it.
+ */
+export function includePatternReadable(pattern: unknown, platformSep: string = sep): boolean {
+  const segment = (s: string): boolean => s.length > 0 && s !== '.' && s !== '..' && !(platformSep === '\\' && s.includes('\\'));
+  const name = (s: string): boolean => segment(s) && !s.includes('/') &&
+    (!s.includes('*') || (s.startsWith('*.') && s.length > 2 && !s.slice(1).includes('*')));
+  return typeof pattern === 'string' &&
+    (pattern.endsWith('/**') ? pattern.length > 3 && pattern.slice(0, -3).split('/').every((s) => segment(s) && !s.includes('*')) : name(pattern));
+}
+
+/**
+ * Whether a mount's include covers a mount-relative path. Its patterns take
+ * `ignore`'s forms, read for files: a name or `*.ext` pattern covers a path by
+ * its own last segment, at any depth, and `dir/**` covers what lies beneath
+ * `dir`, and not a file named `dir`. Unlike `ignore`, a pattern that matches
+ * a directory's name covers nothing beneath it: each file is covered by its
+ * own name, so `gate.json` covers `x/gate.json` and not `x/gate.json/run.sh`,
+ * and a subtree is named with `dir/**`. A directory is no file, so it needs
+ * no covering: where one is a scope, refusesAsOutside (index.ts) decides.
+ */
+function coveredByInclude(relativePath: string, include: readonly string[]): boolean {
+  const name = relativePath.slice(relativePath.lastIndexOf('/') + 1);
+  for (const pattern of include) {
+    if (pattern.endsWith('/**')) {
+      if (relativePath.startsWith(pattern.slice(0, -2))) return true;
+    } else if (pattern === name || (pattern.startsWith('*.') && name.endsWith(pattern.slice(1)))) {
+      return true;
+    }
+  }
+  return false;
+}
+
 /**
  * The ignore patterns a walk that names `scope` reads beneath it: a pattern
  * covering the scope itself, or a directory above it, doesn't apply beneath
@@ -1424,9 +1755,18 @@ export const IGNORED = 'ignored by the mount';
 /** The walk's reason for an entry `EDITOR_FILE` names. */
 const EDITOR_FILE_REASON = "an editor's swap or backup file";
 
+/**
+ * The walk's reason for a link it doesn't enter. On a mount with an include,
+ * a link the include's names don't cover is passed over with it, by design,
+ * since the walk takes no name the include leaves out as a file: on a mount
+ * that follows links, one that leads to a directory, and on one that
+ * doesn't, every one.
+ */
+const LINK_NOT_WALKED = 'a symlink, not walked';
+
 /** Whether a reason the walk gave an entry is one it passes over by design. */
 export function passedOverByDesign(why: string | undefined): boolean {
-  return why === IGNORED || why === EDITOR_FILE_REASON || why === OTHER_MOUNT;
+  return why === IGNORED || why === EDITOR_FILE_REASON || why === OTHER_MOUNT || why === OUTSIDE_INCLUDE || why === LINK_NOT_WALKED;
 }
 
 /** Why a pass passes over a directory that another mount nested in this one holds, and what lies beneath it. */
@@ -1548,7 +1888,7 @@ export async function walkScope(
   opts: { named?: boolean; resumeAfter?: string } = {},
 ): Promise<Walk> {
   const walk: Walk = {
-    files: new Set(), seen: new Set(), othersTaken: new Set(), dirs: new Set(), others: new Map(), complete: new Set(), missing: new Set(),
+    files: new Set(), seen: new Set(), othersTaken: new Set(), dirs: new Set(), others: new Map(), otherFiles: new Set(), complete: new Set(), missing: new Set(),
     incomplete: [],
   };
   // A walk that isn't named passes over a scope the mount passes over by
@@ -1638,6 +1978,7 @@ export async function walkScope(
     // The links, ignored names and other entries those listings showed, and
     // the regions they gave rise to, described the directory that was there.
     for (const [path] of walk.others) if (beneath(path) && !walk.othersTaken.has(path)) walk.others.delete(path);
+    for (const path of walk.otherFiles) if (!walk.others.has(path)) walk.otherFiles.delete(path);
     for (let i = walk.incomplete.length - 1; i >= 0; i--) {
       const region = walk.incomplete[i]!;
       if ((region.kind === 'symlink' || region.kind === 'ignored') && beneath(region.path)) walk.incomplete.splice(i, 1);
@@ -1685,16 +2026,53 @@ export async function walkScope(
       return null;
     }
     entries.sort((a, b) => compareNames(a.name, b.name));
+    // A scope named through a link is listed from where the link leads, so
+    // a file in it is judged where it lies as well as by its path, as
+    // coversLanding judges where a path lands (judgedAt, once for the
+    // listing).
+    const judgedDir = view.include === undefined ? rel : await judgedAt(rootReal, dir.real, rel);
     const leaves: Array<[string, boolean]> = [];
     const subdirs: string[] = [];
     const others: Array<[string, string]> = [];
+    const otherFiles: string[] = [];
     const regions: Walk['incomplete'] = [];
     for (const entry of entries) {
       const childRel = rel ? `${rel}/${entry.name}` : entry.name;
-      const passedOver = passedOverBecause(childRel, entry.name, ignore, view.others);
+      // Another mount's directory is passed over by its real path too, so a
+      // walk that reaches one through a link to a directory above it lists
+      // none of that mount's names (nestedAtReal).
+      const passedOver = passedOverBecause(childRel, entry.name, ignore, view.others)
+        ?? (entry.isDirectory() && nestedAtReal(dir.at(entry.name), view.nested) !== undefined ? OTHER_MOUNT : undefined);
       if (passedOver !== undefined) {
         others.push([childRel, passedOver]);
         regions.push({ path: childRel, reason: passedOver, kind: 'ignored' });
+        continue;
+      }
+      // A file or link the mount's include doesn't cover is outside the
+      // mount, a named scope's too. A directory is walked, since a name or an
+      // extension glob in include can match beneath it. Anything but a link
+      // (a regular file, a FIFO, a socket or a device) is noted as a file,
+      // since nothing can lie beneath it.
+      if (!entry.isDirectory() && (!insideMount(childRel, view.include) || (judgedDir !== rel && !insideMount(judgedDir === '' ? entry.name : `${judgedDir}/${entry.name}`, view.include)))) {
+        // The walk enters no link. A link gets the reason a mount without an
+        // include gives it, a symlink the walk doesn't enter, where that's
+        // what matters about it. On a mount that follows links, that's a link
+        // that leads to a directory: a name or an extension glob can cover
+        // what lies beneath it, as beneath a directory, and what's read
+        // through it is judged by its path and where it lands, so its own
+        // name doesn't put what lies there outside. On one that doesn't, it's
+        // every link, since nothing reads through one there, and such a mount
+        // resolves none to say where it leads. The link's name is no covered
+        // file's, so the walk passes it over as it does one, rather than
+        // taking it.
+        if (entry.isSymbolicLink() && (!view.followSymlinks || await stat(dir.at(entry.name)).then((info) => info.isDirectory(), () => false))) {
+          others.push([childRel, LINK_NOT_WALKED]);
+          regions.push({ path: childRel, reason: LINK_NOT_WALKED, kind: 'ignored' });
+          continue;
+        }
+        others.push([childRel, OUTSIDE_INCLUDE]);
+        if (!entry.isSymbolicLink()) otherFiles.push(childRel);
+        regions.push({ path: childRel, reason: OUTSIDE_INCLUDE, kind: 'ignored' });
         continue;
       }
       if (entry.isDirectory()) {
@@ -1705,7 +2083,7 @@ export async function walkScope(
         const symlink = entry.isSymbolicLink();
         leaves.push([childRel, false]);
         others.push([childRel, symlink ? 'a symlink' : 'not a regular file']);
-        if (symlink) regions.push({ path: childRel, reason: 'a symlink, not walked', kind: 'symlink' });
+        if (symlink) regions.push({ path: childRel, reason: LINK_NOT_WALKED, kind: 'symlink' });
       }
     }
     // A listing of a directory that was moved or replaced meanwhile says
@@ -1717,6 +2095,7 @@ export async function walkScope(
     for (const [p, isFile] of leaves) if (isFile) walk.seen.add(p);
     for (const d of subdirs) walk.dirs.add(d);
     for (const [p, why] of others) walk.others.set(p, why);
+    for (const p of otherFiles) walk.otherFiles.add(p);
     walk.incomplete.push(...regions);
     walk.complete.add(rel);
     const listing = { leaves, subdirs, ...dir.identity() };
@@ -1731,6 +2110,22 @@ export async function walkScope(
     if (stretch === 'all') return true;
     const at = subtreeAgainst(dir, after!);
     return at === 'holds' || at === (stretch === 'after' ? 'after' : 'before');
+  };
+
+  // Each nested root by which directory it is, read once, when the walk
+  // first descends: a directory the walk reaches through a link spelled
+  // otherwise than disk spells it, as a disk that folds names lets one, has
+  // a real path the check by path doesn't know, and is still another
+  // mount's directory.
+  let nestedRoots: Array<{ dev: string; ino: string }> | undefined;
+  const isNestedRoot = async (dir: CheckedDir): Promise<boolean> => {
+    if (!view.nested?.length) return false;
+    nestedRoots ??= (await Promise.all([...new Set(view.nested.flatMap((n) => (n.real === undefined ? [] : [n.real])))].map(async (real) => {
+      const at = await stat(real, { bigint: true }).catch(() => null);
+      return at === null ? [] : [{ dev: String(at.dev), ino: String(at.ino) }];
+    }))).flat();
+    const { dev, ino } = dir.identity();
+    return nestedRoots.some((r) => r.dev === dev && r.ino === ino);
   };
 
   const visit = async (dir: CheckedDir, stretch: Stretch): Promise<void> => {
@@ -1764,6 +2159,16 @@ export async function walkScope(
       // list() drops it from one that isn't.
       walk.missing.delete(sub);
       if (child.kind === 'checked') {
+        if (await isNestedRoot(child.dir)) {
+          // Passed over as another mount's directory, as the listing passes
+          // over one it knows by path.
+          walk.dirs.delete(sub);
+          if (!walk.others.has(sub)) {
+            walk.others.set(sub, OTHER_MOUNT);
+            walk.incomplete.push({ path: sub, reason: OTHER_MOUNT, kind: 'ignored' });
+          }
+          continue;
+        }
         await visit(child.dir, stretch);
         continue;
       }
@@ -1813,9 +2218,12 @@ export async function walkScope(
 
 /**
  * Whether the walk proves nothing exists at `path`: some ancestor directory
- * is missing, or a completely listed ancestor holds no entry that could lead
- * to it. Ancestors outside the walked scope are passed through, so a walk of
- * `a/b` decides paths beneath `a/b` and nothing else.
+ * is missing, a completely listed ancestor holds no entry that could lead
+ * to it, or an ancestor is a file the mount's include doesn't cover (anything
+ * but a directory or a link), which the walk passed over and which holds
+ * nothing beneath it.
+ * Ancestors outside the walked scope are passed through, so a walk of `a/b`
+ * decides paths beneath `a/b` and nothing else.
  */
 export function provenAbsent(walk: Walk, path: string): boolean {
   const parts = path.split('/');
@@ -1824,6 +2232,7 @@ export function provenAbsent(walk: Walk, path: string): boolean {
     if (walk.missing.has(dir)) return true;
     const child = dir ? `${dir}/${parts[i]}` : parts[i]!;
     if (walk.complete.has(dir)) {
+      if (i < parts.length - 1 && walk.otherFiles.has(child)) return true; // a file: nothing beneath it exists
       if (walk.others.has(child) || walk.seen.has(child)) return false; // present, but unproven
       if (i === parts.length - 1) return !walk.files.has(child) && !walk.dirs.has(child);
       if (!walk.dirs.has(child)) return true; // no directory there: nothing beneath can exist

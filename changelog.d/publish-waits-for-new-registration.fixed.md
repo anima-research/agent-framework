@@ -4,9 +4,9 @@
   registration or target open. They now wait for that queued lifecycle
   work, as they wait for any channel's, and go out only into the channel it
   leaves open. If it leaves none open, nothing is published, and the failure
-  reads as at the first wait: "lifecycle work prevented delivery: …". A
-  close decided in that window, where the host directs the server's
-  lifecycle, now stands, as one decided while the words wait already does.
+  reads as at the first wait. A close decided in that window, where the
+  host directs the server's lifecycle, now stands, as one decided while the
+  words wait already does.
 - A `channels.publish` grant withdrawn while the words wait now holds for
   them too: the check just before the publish reads the grant as it is
   then, and refuses as the check before the waits does.

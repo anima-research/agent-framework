@@ -198,6 +198,29 @@ test('HTTP: an auth wall on a call is an error-response with the status in data'
   });
 });
 
+test("HTTP: an auth wall's status stays this host's number when the server's configuration can't be read", async (t) => {
+  t.mock.method(console, 'error', () => {});
+  let allow = true;
+  let unreadable = false;
+  const { url, server } = await startServer(() => allow);
+  cleanups.push(() => new Promise<void>((resolve) => { server.closeAllConnections?.(); server.close(() => resolve()); }));
+  // An `env` getter that throws, as the framework's own can, makes the
+  // server's text withheld; the status is this host's, not the server's.
+  const config = { id: 'remote', url, token: 't' };
+  Object.defineProperty(config, 'env', { enumerable: true, get: () => { if (unreadable) throw new Error('unreadable'); return undefined; } });
+  const connection = await ModernMcpConnection.connect(config);
+  cleanups.push(() => { unreadable = false; return connection.close(); });
+  allow = false;
+  unreadable = true;
+  await assert.rejects(connection.callTool('echo', { text: 'x' }), (err: unknown) => {
+    assert.ok(err instanceof McplRequestError);
+    assert.equal(err.outcome, 'error-response');
+    // The server's own data is withheld, and the status stays.
+    assert.deepEqual(err.data, { httpStatus: 401 });
+    return true;
+  });
+});
+
 test('HTTP: an auth wall on a later round of a call is a no-response, since the first round may have acted', async (t) => {
   const consoleLines: string[] = [];
   t.mock.method(console, 'error', (...args: unknown[]) => consoleLines.push(args.map(String).join(' ')));
@@ -235,7 +258,7 @@ test('HTTP: an auth wall on a later round of a call is a no-response, since the 
   assert.ok(states.length >= 2 && states.slice(1).every((s) => s === 'state-1'), `each later round carried it: ${JSON.stringify(states)}`);
 });
 
-test("HTTP: an echoed path in a tool transport failure is redacted in the log and kept from the agent's text, but a JSON-RPC error is the server answer", async (t) => {
+test("HTTP: an echoed path in a tool transport failure or a JSON-RPC error is redacted in the log and kept from the caller's and the agent's text", async (t) => {
   const consoleLines: string[] = [];
   t.mock.method(console, 'error', (...args: unknown[]) => consoleLines.push(args.map(String).join(' ')));
   const secret = 'pathSecret0123456789';
@@ -243,7 +266,7 @@ test("HTTP: an echoed path in a tool transport failure is redacted in the log an
   const { url, server } = await startServer(() => true, (message, res) => {
     if (message.method !== 'tools/call') return false;
     if (rpc) {
-      res.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify({ jsonrpc: '2.0', id: message.id, error: { code: -32603, message: secret } }));
+      res.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify({ jsonrpc: '2.0', id: message.id, error: { code: -32603, message: secret, data: { echoed: secret } } }));
     } else {
       res.writeHead(500, { 'content-type': 'text/plain' }).end(`Cannot POST /api/mcp/s/${secret}/mcp`);
     }
@@ -254,7 +277,10 @@ test("HTTP: an echoed path in a tool transport failure is redacted in the log an
   cleanups.push(() => connection.close());
   await assert.rejects(connection.callTool('echo', {}), (error: unknown) => {
     assert.ok(error instanceof McplRequestError);
-    assert.match(error.message, new RegExp(secret));
+    // The server's words and data reach the caller with the url's
+    // credential redacted, as an error the framework hands a host does.
+    assert.equal(error.message, 'The "remote" server answered with an error: redacted');
+    assert.deepEqual(error.data, { echoed: 'redacted' });
     assert.equal(error.outcome, 'error-response');
     return true;
   });
@@ -301,7 +327,7 @@ test("HTTP: a 403 refusal's response body, which can echo the url, stays out of 
   connection.id = 'remote';
   connection.config = { id: 'remote', url: 'https://h/api/mcp/s/pathSecret0123456789/mcp' };
   const refusal = new SdkHttpError(SdkErrorCode.ClientHttpForbidden, 'Server returned 403 insufficient_scope', {
-    status: 403, statusText: 'Forbidden', text: 'denied for /api/mcp/s/pathSecret0123456789/mcp',
+    status: 403, statusText: 'Forbidden for /api/mcp/s/pathSecret0123456789/mcp', text: 'denied for /api/mcp/s/pathSecret0123456789/mcp',
   });
   const err = connection.requestFailure('tools/call "echo"', { method: 'tools/call', handedOff: true, answer: 'none' }, refusal);
   assert.ok(err instanceof McplRequestError);

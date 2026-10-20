@@ -183,9 +183,9 @@ test('model-issued Python cannot forge unlisted inner generic or builtin calls',
     }]);
     assert.equal(result.toolUseId, 'script');
     assert.ok(!result.isError);
-    const execution = JSON.parse(result.content) as { stdout: string; stderr: string; return_code: number };
-    assert.equal(execution.return_code, 0, execution.stderr);
-    assert.equal((execution.stdout.match(/not permitted.*allowedTools/g) ?? []).length, 2);
+    // The model reads the script's ending first, then its output, as text.
+    assert.match(result.content, /^exit code: 0\n/, result.content);
+    assert.equal((result.content.match(/not permitted.*allowedTools/g) ?? []).length, 2);
     assert.deepEqual(h.effects.map((c) => c.name), ['allowed']);
     assert.deepEqual(h.framework.getAgentRuntimeSettings('assistant'), before);
     assert.deepEqual(h.lifecycle.filter(event => ['probe--denied', 'agent_settings'].includes(event.tool)), []);
@@ -210,7 +210,7 @@ test('unregistered programmatic ephemeral script callers retain their full surfa
     try {
       const result = await pending;
       assert.equal(result.success, true);
-      assert.equal((result.data as { return_code: number }).return_code, 0);
+      assert.equal((result.structured as { return_code: number }).return_code, 0);
       assert.equal(h.effects.length, 1);
     } finally { clearInterval(processing); }
   } finally { await h.close(); }
@@ -638,7 +638,7 @@ test('script in flight cannot gain legacy permissions when its ephemeral run dis
     assert.equal(h.framework.getAgent(created.agent.name), null);
     release();
     const result = await script; assert.equal(result.success, true);
-    assert.match((result.data as { stdout: string }).stdout, /not a running agent.*only while registered/);
+    assert.match((result.structured as { stdout: string }).stdout, /not a running agent.*only while registered/);
     assert.deepEqual(h.effects.map(call => call.input), [{phase: 'barrier'}]);
     assert.equal(h.emitter.openCount, 0);
     assert.equal((h.framework as unknown as { scriptToolWaiters: Map<string, unknown> }).scriptToolWaiters.size, 0);

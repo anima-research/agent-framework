@@ -6,6 +6,7 @@ import { join } from 'node:path';
 import type { Module, ModuleContext, ProcessEvent, ProcessState, EventResponse, ToolDefinition, ToolCall, ToolResult } from '../src/index.js';
 import { AgentFramework } from '../src/index.js';
 import { MockMembrane, MockYieldingStream, createMockResponse } from './helpers/mock-membrane.js';
+import { UNREACHED_WATCHDOG, silenceRun } from './helpers/run-watchdog.js';
 import type { ContentBlock, NormalizedRequest, NormalizedResponse, StreamEvent, YieldingStream } from '@animalabs/membrane';
 
 class HeartbeatModule implements Module {
@@ -53,6 +54,7 @@ class ToolThenFrameworkRetryMembrane {
   asMembrane(): import('@animalabs/membrane').Membrane { return this as unknown as import('@animalabs/membrane').Membrane; }
 }
 
+/** Its late answer comes once the test releases it. */
 class LateCompletionAfterIdleStream implements YieldingStream {
   private events: StreamEvent[] = [];
   private wake: (() => void) | null = null;
@@ -61,17 +63,19 @@ class LateCompletionAfterIdleStream implements YieldingStream {
   get toolDepth() { return 0; }
   provideToolResults(): void {}
   cancel(): void { /* Simulate a provider that ignores cancellation and terminates later. */ }
-  constructor() {
-    setTimeout(() => {
+  constructor(released: Promise<void>, private readonly onDriven: () => void, private readonly onAnswerOut: () => void) {
+    void released.then(() => {
       this.events.push({ type: 'complete', response: createMockResponse([{ type: 'text', text: 'late answer' }] as ContentBlock[]) } as StreamEvent);
       this.wake?.(); this.wake = null;
-    }, 120);
+    });
   }
   async *[Symbol.asyncIterator](): AsyncIterator<StreamEvent> {
     yield { type: 'tokens', content: 'partial', meta: { type: 'text', visible: true, blockIndex: 0 } } as StreamEvent;
+    this.onDriven();
     while (true) {
       while (this.events.length) {
         const event = this.events.shift()!;
+        if (event.type === 'complete') this.onAnswerOut();
         yield event;
         if (event.type === 'complete') return;
       }
@@ -80,8 +84,22 @@ class LateCompletionAfterIdleStream implements YieldingStream {
   }
 }
 class LateCompletionAfterIdleMembrane {
+  /** Resolves once the framework has taken the stream's first event. */
+  readonly driven: Promise<void>;
+  /** Resolves as the stream hands the framework its late answer. */
+  readonly answerOut: Promise<void>;
+  /** Lets the stream's late answer come. */
+  release!: () => void;
+  private markDriven!: () => void;
+  private markAnswerOut!: () => void;
+  private readonly released: Promise<void>;
+  constructor() {
+    this.driven = new Promise((resolve) => { this.markDriven = resolve; });
+    this.answerOut = new Promise((resolve) => { this.markAnswerOut = resolve; });
+    this.released = new Promise((resolve) => { this.release = resolve; });
+  }
   async complete(): Promise<NormalizedResponse> { throw new Error('not used'); }
-  streamYielding(): YieldingStream { return new LateCompletionAfterIdleStream(); }
+  streamYielding(): YieldingStream { return new LateCompletionAfterIdleStream(this.released, this.markDriven, this.markAnswerOut); }
   asMembrane(): import('@animalabs/membrane').Membrane { return this as unknown as import('@animalabs/membrane').Membrane; }
 }
 
@@ -106,6 +124,22 @@ class RetryingWrapperMembrane {
 
 const dirs: string[] = [];
 afterEach(() => { while (dirs.length) rmSync(dirs.pop()!, { recursive: true, force: true }); });
+
+/**
+ * `promise`, or a failure once it has taken `ms`, so a test fails rather than
+ * hangs. It's a hang guard, not a check on how fast the host works, so it's
+ * set wide, as coalescing-fixture's REPLY_DEADLINE_MS is: a loaded host's
+ * stall needn't be in proportion to the work waited on.
+ */
+async function within<T>(what: string, promise: Promise<T>, ms = 60_000): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const late = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => reject(new Error(`${what} took longer than ${ms} ms`)), ms);
+  });
+  try {
+    return await Promise.race([promise, late]);
+  } finally { clearTimeout(timer); }
+}
 
 async function run(enabled?: boolean, allowedTools?: string[]) {
   const dir = mkdtempSync(join(tmpdir(), 'af-wrapper-guard-')); dirs.push(dir);
@@ -134,16 +168,42 @@ async function run(enabled?: boolean, allowedTools?: string[]) {
   return { routed, outgoing, all, module };
 }
 
+/** Its stream's late tool call comes once the test releases it. */
 class LateToolAfterIdleMembrane {
+  /** Resolves once the framework has taken the stream's first event. */
+  readonly driven: Promise<void>;
+  /** Resolves as the stream hands the framework its late tool call. */
+  readonly lateOut: Promise<void>;
+  /** Resolves once the framework has left the stream, at its end or by a break. */
+  readonly left: Promise<void>;
+  /** Lets the late tool call come. */
+  release!: () => void;
+  private markDriven!: () => void;
+  private markLateOut!: () => void;
+  private markLeft!: () => void;
+  private readonly released: Promise<void>;
+  constructor() {
+    this.driven = new Promise((resolve) => { this.markDriven = resolve; });
+    this.lateOut = new Promise((resolve) => { this.markLateOut = resolve; });
+    this.left = new Promise((resolve) => { this.markLeft = resolve; });
+    this.released = new Promise((resolve) => { this.release = resolve; });
+  }
   streamYielding(): YieldingStream {
+    const membrane = this;
     return {
       isWaitingForTools: false, pendingToolCallIds: [], toolDepth: 0,
       provideToolResults: () => {}, cancel: () => {},
       async *[Symbol.asyncIterator](): AsyncIterator<StreamEvent> {
-        yield { type: 'tokens', content: 'starting', meta: { type: 'text', visible: true, blockIndex: 0 } } as StreamEvent;
-        await new Promise((resolve) => setTimeout(resolve, 200));
-        yield { type: 'tool-calls', calls: [{ id: 'late', name: 'mcpl--heartbeat--heartbeat_status', input: {} }], context: { rawText: '', preamble: '', depth: 0, previousResults: [], accumulated: '', roundContent: [{ type: 'tool_use', id: 'late', name: 'mcpl--heartbeat--heartbeat_status', input: {} }] } } as StreamEvent;
-        yield { type: 'complete', response: createMockResponse([{ type: 'text', text: 'late' }]) } as StreamEvent;
+        try {
+          yield { type: 'tokens', content: 'starting', meta: { type: 'text', visible: true, blockIndex: 0 } } as StreamEvent;
+          membrane.markDriven();
+          await membrane.released;
+          membrane.markLateOut();
+          yield { type: 'tool-calls', calls: [{ id: 'late', name: 'mcpl--heartbeat--heartbeat_status', input: {} }], context: { rawText: '', preamble: '', depth: 0, previousResults: [], accumulated: '', roundContent: [{ type: 'tool_use', id: 'late', name: 'mcpl--heartbeat--heartbeat_status', input: {} }] } } as StreamEvent;
+          yield { type: 'complete', response: createMockResponse([{ type: 'text', text: 'late' }]) } as StreamEvent;
+        } finally {
+          membrane.markLeft();
+        }
       },
     } as YieldingStream;
   }
@@ -337,18 +397,34 @@ describe('tool wrapper prose guard integration', () => {
   it('idle-watchdog disposal cancels and ignores late tool events', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'af-wrapper-guard-late-tool-')); dirs.push(dir);
     const module = new HeartbeatModule();
-    const framework = await AgentFramework.create({ storePath: join(dir, 'store'), membrane: new LateToolAfterIdleMembrane().asMembrane(), agents: [], modules: [module] });
+    const membrane = new LateToolAfterIdleMembrane();
+    const framework = await AgentFramework.create({ storePath: join(dir, 'store'), membrane: membrane.asMembrane(), agents: [], modules: [module] });
     await framework.start();
     const created = await framework.createEphemeralAgent({ name: 'late-tool-after-idle', model: 'test', systemPrompt: 'sys', allowedTools: 'all', toolWrapperProseGuard: true });
     created.contextManager.addMessage('user', [{ type: 'text', text: 'check' }]);
-    await assert.rejects(framework.runEphemeralToCompletion(created.agent, created.contextManager, { startupTimeoutMs: 100, idleTimeoutMs: 20, idlePollMs: 5 }), /stalled/);
-    await new Promise((resolve) => setTimeout(resolve, 260));
-    assert.equal(module.calls, 0, 'late structured call never executes after disposal');
-    assert.equal(framework.getAgent(created.agent.name), null);
-    const internals = framework as unknown as { activeStreams: Map<string, unknown>; pendingAssistantBlocks: Map<string, unknown> };
-    assert.equal(internals.activeStreams.has(created.agent.name), false, 'disposal removes the old active stream handle');
-    assert.equal(internals.pendingAssistantBlocks.has(created.agent.name), false, 'disposal removes pending tool blocks');
-    await framework.stop();
+    const run = framework.runEphemeralToCompletion(created.agent, created.contextManager, UNREACHED_WATCHDOG);
+    const ended = run.then(() => null, (error: unknown) => error);
+    try {
+      // Once the stream is driven, the test makes the run look idle, and its
+      // idle watchdog disposes it. Only then does the late tool call come.
+      await within('the stream to be driven', membrane.driven);
+      silenceRun(framework, created.agent.name);
+      assert.match(String(await within('the run to end', ended)), /stalled/, 'the idle watchdog ended the run');
+      membrane.release();
+      await within('the late tool call to reach the framework', membrane.lateOut);
+      await within('the framework to leave the stream', membrane.left);
+      await within('the framework to go idle', framework.runUntilIdle());
+      assert.equal(module.calls, 0, 'late structured call never executes after disposal');
+      assert.equal(framework.getAgent(created.agent.name), null);
+      const internals = framework as unknown as { activeStreams: Map<string, unknown>; pendingAssistantBlocks: Map<string, unknown> };
+      assert.equal(internals.activeStreams.has(created.agent.name), false, 'disposal removes the old active stream handle');
+      assert.equal(internals.pendingAssistantBlocks.has(created.agent.name), false, 'disposal removes pending tool blocks');
+    } finally {
+      // A failure before the release would leave the stream held, and stop()
+      // waiting on it.
+      membrane.release();
+      await framework.stop();
+    }
   });
 
   it('refuses ephemeral name reuse before a stale stream can bind to a successor', async () => {
@@ -473,7 +549,8 @@ describe('tool wrapper prose guard integration', () => {
 
   it("idle-disposed ephemeral stops typing, and text it never delivered doesn't stream", async () => {
     const dir = mkdtempSync(join(tmpdir(), 'af-wrapper-guard-idle-terminal-')); dirs.push(dir);
-    const framework = await AgentFramework.create({ storePath: join(dir, 'store'), membrane: new LateCompletionAfterIdleMembrane().asMembrane(), agents: [], modules: [] });
+    const membrane = new LateCompletionAfterIdleMembrane();
+    const framework = await AgentFramework.create({ storePath: join(dir, 'store'), membrane: membrane.asMembrane(), agents: [], modules: [] });
     const events: string[] = [];
     (framework as unknown as { channelRegistry: unknown }).channelRegistry = new Proxy({
       resolveLocus: () => 'world:test',
@@ -489,18 +566,28 @@ describe('tool wrapper prose guard integration', () => {
     }, { get: (target, prop: string) => (prop in target ? (target as Record<string, unknown>)[prop] : () => undefined) });
     const created = await framework.createEphemeralAgent({ name: 'idle-terminal', model: 'test', systemPrompt: 'sys', allowedTools: 'all' });
     created.contextManager.addMessage('user', [{ type: 'text', text: 'go' }]);
-    const run = framework.runEphemeralToCompletion(created.agent, created.contextManager, { startupTimeoutMs: 500, idleTimeoutMs: 20, idlePollMs: 5 });
+    const run = framework.runEphemeralToCompletion(created.agent, created.contextManager, UNREACHED_WATCHDOG);
+    const ended = run.then(() => null, (error: unknown) => error);
     framework.start();
     try {
-      await assert.rejects(run, /stalled/);
+      // Once the stream is driven, the test makes the run look idle, and its
+      // idle watchdog disposes it. Only then does the late answer come.
+      await within('the stream to be driven', membrane.driven);
+      silenceRun(framework, created.agent.name);
+      assert.match(String(await within('the run to end', ended)), /stalled/, 'the idle watchdog ended the run');
       // The disposed frame's typing stops in its teardown, which runs once
       // its late answer has come in.
-      const until = Date.now() + 5000;
+      membrane.release();
+      await within('the late answer to reach the framework', membrane.answerOut);
+      const until = Date.now() + 60_000;
       while (Date.now() < until && !events.includes('stop:(all)')) await new Promise((resolve) => setTimeout(resolve, 5));
       assert.ok(events.includes('stop:(all)'), 'disposer-owned frame stops typing');
       assert.deepEqual(events.filter((event) => event.startsWith('chunk:') || event.startsWith('complete:')), [],
         "the partial text and the disposed frame's late answer were never delivered, so neither streams");
     } finally {
+      // A failure before the release would leave the stream held, and stop()
+      // waiting on it.
+      membrane.release();
       await framework.stop();
     }
   });

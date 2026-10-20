@@ -159,7 +159,7 @@ describe('ToolCall.resultMaxChars', () => {
       assert.equal(stored.get('call_at'), 'x'.repeat(BOUNDED), 'a result of resultMaxChars is stored whole');
       // This framework has no workspace to spill to, so the store keeps the start.
       assert.equal(stored.get('call_past'),
-        `${'x'.repeat(BOUNDED)}\n\n[truncated — original was ${BOUNDED + 1} chars; no writable workspace, full content not retained]`,
+        `${'x'.repeat(BOUNDED)}\n\n[truncated — original was ${BOUNDED + 1} chars; no writable workspace mount without an include, full content not retained]`,
         'one character more is cut at the cap');
       // A utility run through the utils tool is stored as that call's result.
       assert.equal(caps.get('call_utility'), BOUNDED);

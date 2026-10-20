@@ -11,9 +11,19 @@ import { AgentFramework, type AgentConfig, type AgentSettingsExtension, type Mod
   type ToolCall, type ToolResult, type ProcessEvent, type ProcessState } from '../src/index.js';
 import { TOOL_RESULT_GUARD_AUDIT_STATE, TOOL_RESULT_GUARD_NOTICE, keptWhenWithheld, withheldResultNotice } from '../src/tool-result-guard.js';
 import { MockYieldingStream, createMockResponse } from './helpers/mock-membrane.js';
+import { UNREACHED_WATCHDOG, silenceRun } from './helpers/run-watchdog.js';
 import { WorkspaceModule } from '../src/modules/workspace/index.js';
 import { DEFAULT_TOOL_RESULT_INLINE_MAX_CHARS } from '../src/tool-result-history.js';
 import { JsStore } from '@animalabs/chronicle';
+
+/**
+ * A stream message's channel as the test records it. Each delivery hands its
+ * stream the destination its publish went to, here the stub's server: one
+ * for any other server is recorded with it, so a delivery that loses its
+ * server fails the test.
+ */
+const streamedAt = (to: { serverId: string; channelId: string }) =>
+  (to.serverId === 'stub' ? to.channelId : `${to.channelId} (server ${to.serverId})`);
 
 // What a withheld result settles to with no writable workspace (#277): the
 // neutral notice, then where the original is kept. Written out, not computed
@@ -394,11 +404,11 @@ test('explicit mode: a guard retry streams on to the sticky destination delivery
     routeSpeech: async (_agent: string, speech: string, channelId: string) => {
       routed.push({ text: speech, channelId }); return { delivered: true, channelId };
     },
-    sendOutgoingChunk: (channelId: string, _agent: string, _id: string, _index: number, delta: string) => {
-      streamed.push({ channelId, delta });
+    sendOutgoingChunk: (to: { serverId: string; channelId: string }, _agent: string, _id: string, _index: number, delta: string) => {
+      streamed.push({ channelId: streamedAt(to), delta });
     },
-    sendOutgoingComplete: (channelId: string, _agent: string, inferenceId: string, text: string) => {
-      completed.push({ channelId, text, inferenceId });
+    sendOutgoingComplete: (to: { serverId: string; channelId: string }, _agent: string, inferenceId: string, text: string) => {
+      completed.push({ channelId: streamedAt(to), text, inferenceId });
     },
     getDefaultPublishChannel: () => null, isChannelOpen: () => true,
     getDescriptor: () => undefined, getChannelTools: () => [],
@@ -489,8 +499,8 @@ test('explicit mode: after a budget restart, the resumed reply streams where del
       order.push(`published:${text}`);
       return { delivered: true, channelId };
     },
-    sendOutgoingChunk: (channelId: string, _agent: string, _id: string, _index: number, delta: string) => {
-      streamed.push({ channelId, delta });
+    sendOutgoingChunk: (to: { serverId: string; channelId: string }, _agent: string, _id: string, _index: number, delta: string) => {
+      streamed.push({ channelId: streamedAt(to), delta });
       order.push(`chunk:${delta.trim()}`);
     },
     getDefaultPublishChannel: () => null, isChannelOpen: () => true,
@@ -552,8 +562,8 @@ test("explicit mode: a private round's prefix doesn't move where a budget restar
       routed.push({ text, channelId });
       return { delivered: true, channelId };
     },
-    sendOutgoingChunk: (channelId: string, _agent: string, _id: string, _index: number, delta: string) => {
-      streamed.push({ channelId, delta });
+    sendOutgoingChunk: (to: { serverId: string; channelId: string }, _agent: string, _id: string, _index: number, delta: string) => {
+      streamed.push({ channelId: streamedAt(to), delta });
     },
     handleChannelToolCall: async () => ({ success: true, data: { noted: true } }),
     getDefaultPublishChannel: () => null, isChannelOpen: () => true, getDescriptor: () => undefined,
@@ -631,8 +641,8 @@ async function heldRestart(mode: 'explicit' | 'locus', texts: { first: string; s
       if (text.trim() === 'first') await firstHeld;
       return { delivered: true, channelId };
     },
-    sendOutgoingChunk: (channelId: string, _agent: string, _id: string, _index: number, delta: string) => {
-      streamed.push({ channelId, delta });
+    sendOutgoingChunk: (to: { serverId: string; channelId: string }, _agent: string, _id: string, _index: number, delta: string) => {
+      streamed.push({ channelId: streamedAt(to), delta });
     },
     getDefaultPublishChannel: () => null, isChannelOpen: () => true,
     getDescriptor: () => undefined, getChannelTools: () => [],
@@ -705,11 +715,11 @@ function explicitRegistry(h: Awaited<ReturnType<typeof harness>>) {
       routed.push({ text: text.trim(), channelId });
       return { delivered: true, channelId };
     },
-    sendOutgoingChunk: (channelId: string, _agent: string, inferenceId: string, _index: number, delta: string) => {
-      streamed.push({ channelId, delta, inferenceId });
+    sendOutgoingChunk: (to: { serverId: string; channelId: string }, _agent: string, inferenceId: string, _index: number, delta: string) => {
+      streamed.push({ channelId: streamedAt(to), delta, inferenceId });
     },
-    sendOutgoingComplete: (channelId: string, _agent: string, inferenceId: string, text: string) => {
-      completed.push({ channelId, text, inferenceId });
+    sendOutgoingComplete: (to: { serverId: string; channelId: string }, _agent: string, inferenceId: string, text: string) => {
+      completed.push({ channelId: streamedAt(to), text, inferenceId });
     },
     handleChannelToolCall: async () => ({ success: true, data: { noted: true } }),
     getDefaultPublishChannel: () => null, isChannelOpen: () => true, getDescriptor: () => undefined,
@@ -1093,8 +1103,8 @@ for (const shape of ['text-only', 'trailing'] as const) {
         routed.push({ text: text.trim(), channelId });
         return { delivered: true, channelId };
       },
-      sendOutgoingChunk: (channelId: string, _agent: string, _id: string, _index: number, delta: string) => {
-        streamed.push({ channelId, delta });
+      sendOutgoingChunk: (to: { serverId: string; channelId: string }, _agent: string, _id: string, _index: number, delta: string) => {
+        streamed.push({ channelId: streamedAt(to), delta });
       },
       getDefaultPublishChannel: () => null, isChannelOpen: () => true,
       getDescriptor: () => undefined, getChannelTools: () => [],
@@ -2294,9 +2304,13 @@ for (const how of ['an uncaused error', 'an abort whose reason is timeout', 'the
       });
       created.contextManager.addMessage('user', [{ type: 'text', text: 'read' }]);
       const completion = h.framework.runEphemeralToCompletion(created.agent, created.contextManager,
-        how === 'the completion watchdog' ? { idleTimeoutMs: 200, idlePollMs: 20 } : undefined)
+        how === 'the completion watchdog' ? UNREACHED_WATCHDOG : undefined)
         .then(() => { outcome = 'resolved'; }, (e) => { outcome = `rejected: ${(e as Error).message}`; });
       h.framework.start();
+      if (how === 'the completion watchdog') {
+        await until(() => created.agent.toolResultGuard.hasPending, 'the results went in');
+        silenceRun(h.framework, 'ephemeral');
+      }
       await bounded(completion, 'the run settling');
       assert.equal(created.agent.toolResultGuard.hasPending, false, 'the run left no batch pending');
     } finally { await h.framework.stop(); }
@@ -2378,12 +2392,15 @@ for (const how of ["stop()'s sweep", 'the completion watchdog during a stop()'] 
       });
       created.contextManager.addMessage('user', [{ type: 'text', text: 'read' }]);
       const completion = h.framework.runEphemeralToCompletion(created.agent, created.contextManager,
-        how === "stop()'s sweep" ? undefined : { idleTimeoutMs: 200, idlePollMs: 20 })
+        how === "stop()'s sweep" ? undefined : UNREACHED_WATCHDOG)
         .then(() => { outcome = 'resolved'; }, (e) => { outcome = `rejected: ${(e as Error).message}`; });
       h.framework.start();
-      for (let i = 0; i < 400 && !created.agent.toolResultGuard.hasPending; i++) await new Promise((r) => setTimeout(r, 5));
-      assert.ok(created.agent.toolResultGuard.hasPending, 'the results went in');
-      const stopped = await h.framework.stop(how === "stop()'s sweep" ? 100 : 1_000).then(() => 'resolved', (e: unknown) => e);
+      await until(() => created.agent.toolResultGuard.hasPending, 'the results went in');
+      const stopping = h.framework.stop(how === "stop()'s sweep" ? 100 : 1_000);
+      // stop() has closed admission before it returns, so the watchdog's
+      // next poll ends the run as a stop, while stop() waits for the stream.
+      if (how !== "stop()'s sweep") silenceRun(h.framework, 'ephemeral');
+      const stopped = await stopping.then(() => 'resolved', (e: unknown) => e);
       assert.ok(stopped instanceof Error && /^Shutdown timed out/.test(stopped.message), `stop() waited for the stream: ${String(stopped)}`);
       await bounded(completion, 'the run settling');
       assert.equal(h.framework.getAgent('ephemeral'), null, 'the run has left');
@@ -2418,10 +2435,11 @@ test('an ephemeral run whose batch fails to record as it leaves still ends with 
     });
     created.agent.toolResultGuard.abandon = () => { throw new Error('audit unavailable'); };
     created.contextManager.addMessage('user', [{ type: 'text', text: 'read' }]);
-    const completion = h.framework.runEphemeralToCompletion(created.agent, created.contextManager,
-      { idleTimeoutMs: 200, idlePollMs: 20 })
+    const completion = h.framework.runEphemeralToCompletion(created.agent, created.contextManager, UNREACHED_WATCHDOG)
       .then(() => { outcome = 'resolved'; }, (e) => { outcome = `rejected: ${(e as Error).message}`; });
     h.framework.start();
+    await until(() => created.agent.toolResultGuard.hasPending, 'the results went in');
+    silenceRun(h.framework, 'ephemeral');
     await bounded(completion, 'the run settling');
     assert.equal(h.framework.getAgent('ephemeral'), null, 'the run is deregistered');
   } finally { await h.framework.stop(); }

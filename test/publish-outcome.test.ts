@@ -87,7 +87,7 @@ describe('ChannelRegistry.publish outcomes', () => {
     fails.seed('discord', 'c', '#c', false);
     const outcome = await fails.registry.publish('agent', 'x', { channelId: 'c' });
     assert.equal(outcome.status, 'failed');
-    assert.equal(outcome.reason, 'channel is closed and open failed: no such channel');
+    assert.equal(outcome.reason, 'opening the channel for these words didn\'t complete: no such channel');
     assert.deepEqual(fails.opened, [{ serverId: 'discord', channelId: 'c' }]);
     assert.deepEqual(fails.published, [], 'nothing dispatched after a failed open');
   });
@@ -120,7 +120,8 @@ describe('ChannelRegistry.publish outcomes', () => {
     seed('discord', 'c', '#c', false);
     const outcome = await registry.publish('agent', 'x', { channelId: 'c' });
     assert.equal(outcome.status, 'failed');
-    assert.match(outcome.reason!, /channels\.publish not in "discord"'s effective grant/);
+    assert.equal(outcome.reason, 'this host isn\'t permitted to post to the "discord" server\'s channels, and trying again ' +
+      'won\'t change that; if you need it, ask whoever runs this host');
     assert.deepEqual(opened, [], 'a refused send opens nothing');
     assert.deepEqual(published, []);
   });
@@ -138,7 +139,7 @@ describe('ChannelRegistry.publish outcomes', () => {
       seed('discord', 'c', '#c');
       const outcome = await registry.publish('agent', 'x', { channelId: 'c' });
       assert.equal(outcome.status, 'unknown');
-      assert.match(outcome.reason ?? '', /contradictory receipt/);
+      assert.match(outcome.reason ?? '', /^the "discord" server said it didn't post the message, along with a message id that isn't valid \(.*\) \(delivery uncertain\)$/);
       assert.equal(outcome.messageId, undefined);
     });
   }
@@ -276,7 +277,8 @@ describe('ChannelRegistry.publish outcomes', () => {
     seed('beta', 'discord:g1:room', '#room (Beta)');
     const shared = await registry.publish('agent', 'x', { channelId: 'discord:g1:room' });
     assert.equal(shared.status, 'failed');
-    assert.match(shared.reason ?? '', /more than one MCPL server/);
+    assert.equal(shared.reason, 'channel id "discord:g1:room" is on more than one server, and no server was named for these ' +
+      'words; if you need them there, ask whoever runs this host');
     assert.equal(published.length, 0, 'never routed through whichever server came first');
     const exact = await registry.publish('agent', 'x', { serverId: 'beta', channelId: 'discord:g1:room' });
     assert.equal(exact.status, 'delivered');
@@ -326,51 +328,57 @@ describe('channel_publish answers by the receipt rule', () => {
       const result = await publishWith(async () => receipt);
       assert.equal(result.success, false);
       assert.equal(result.isError, true);
-      assert.match(result.error ?? '', /^Publish to c wasn't confirmed: .*no valid delivery receipt.*\. It may or may not have been posted, so sending it again could post it twice\.$/);
+      assert.equal(result.error, 'Posting to channel "c" wasn\'t confirmed: the "discord" server\'s answer didn\'t say whether it posted ' +
+        'the message (delivery uncertain). It may or may not have been posted, so sending it again could post it twice.');
     });
   }
 
   it('answers delivered:false with no message id as failed: nothing was posted', async () => {
     const result = await publishWith(async () => ({ delivered: false }));
     assert.equal(result.success, false);
-    assert.match(result.error ?? '', /^Publish to c failed: server "discord" reported delivered:false\. Nothing was posted\.$/);
+    assert.equal(result.error, 'Nothing was posted to channel "c": the "discord" server said it didn\'t post the message.');
   });
 
   it('answers delivered:false beside a message id as unconfirmed', async () => {
     const result = await publishWith(async () => ({ delivered: false, messageId: 'part-1' }));
     assert.equal(result.success, false);
-    assert.match(result.error ?? '', /^Publish to c wasn't confirmed: .*named posted message part-1/);
+    assert.match(result.error ?? '', /^Posting to channel "c" wasn't confirmed: the "discord" server said it didn't post the message, yet named message part-1 as posted \(delivery uncertain\)\. /);
   });
 
   it('answers a request refused before it was written as failed, and an error response or a plain throw as unconfirmed', async () => {
     const notSent = await publishWith(async () => { throw new McplRequestError('Cannot send request: connection to "discord" is closed', 'not-sent'); });
-    assert.match(notSent.error ?? '', /^Publish to c failed: Cannot send request: connection to "discord" is closed\. Nothing was posted\.$/);
+    assert.equal(notSent.error, 'Nothing was posted to channel "c": Cannot send request: connection to "discord" is closed.');
     // The connection's messages are sentences, and the answer adds its own ending.
     const sentence = await publishWith(async () => {
       throw new McplRequestError('The request wasn\'t sent: the connection to the "discord" server is closed, so nothing ran. This host is reconnecting to it; try again later.', 'not-sent');
     });
-    assert.equal(sentence.error, 'Publish to c failed: The request wasn\'t sent: the connection to the "discord" server is closed, so nothing ran. ' +
-      'This host is reconnecting to it; try again later. Nothing was posted.');
+    assert.equal(sentence.error, 'Nothing was posted to channel "c": The request wasn\'t sent: the connection to the "discord" server is closed, ' +
+      'so nothing ran. This host is reconnecting to it; try again later.');
+    // A server's own words keep their final period, since they're its words.
+    const ended = await publishWith(async () => {
+      throw new McplRequestError('The "discord" server answered with an error: Part 2 failed.', 'error-response');
+    });
+    assert.match(ended.error ?? '', /^Posting to channel "c" wasn't confirmed: The "discord" server answered with an error: Part 2 failed\. \(delivery uncertain\)\. /);
     const answered = await publishWith(async () => { throw new McplRequestError('MCPL server "discord" returned error for channels/publish: [-32000] part 2 failed', 'error-response', { posted: ['111'] }); });
-    assert.match(answered.error ?? '', /^Publish to c wasn't confirmed: .*part 2 failed \(delivery uncertain\)\. It may or may not have been posted/);
+    assert.match(answered.error ?? '', /^Posting to channel "c" wasn't confirmed: .*part 2 failed \(delivery uncertain\)\. It may or may not have been posted/);
     // What the connector says was posted reaches the answer, as it does the marker.
     assert.ok(answered.error?.endsWith(' could post it twice. Connector detail: {"posted":["111"]}'), answered.error);
     const thrown = await publishWith(async () => { throw new Error('connector exploded'); });
-    assert.match(thrown.error ?? '', /^Publish to c wasn't confirmed: connector exploded \(delivery uncertain\)\./);
+    assert.match(thrown.error ?? '', /^Posting to channel "c" wasn't confirmed: connector exploded \(delivery uncertain\)\./);
     assert.ok(!thrown.error?.includes('Connector detail'), 'no data, no detail');
     // A long string comes through as itself, bounded.
     const long = await publishWith(async () => { throw new McplRequestError('timed out', 'no-response', 'q'.repeat(3000)); });
     assert.ok(long.error?.endsWith(` Connector detail: ${'q'.repeat(1987)}… [truncated]`), long.error?.slice(-80));
     // A request that never left posted nothing, whatever data rides on it.
     const refused = await publishWith(async () => { throw new McplRequestError('Cannot send request: connection to "discord" is closed', 'not-sent', { posted: [] }); });
-    assert.match(refused.error ?? '', /Nothing was posted\.$/);
+    assert.match(refused.error ?? '', /^Nothing was posted to channel "c": /);
   });
 
   it('publishForAgent, the subconscious\'s speak_in_channel path, answers by the same rule', async () => {
     const answers: Array<[unknown, RegExp]> = [
       [{ delivered: true, messageId: 'posted-1' }, /^$/],
-      [{ delivered: false }, /^Publish to c failed: server "discord" reported delivered:false\. Nothing was posted\.$/],
-      [undefined, /^Publish to c wasn't confirmed: .*no valid delivery receipt.*could post it twice\.$/],
+      [{ delivered: false }, /^Nothing was posted to channel "c": the "discord" server said it didn't post the message\.$/],
+      [undefined, /^Posting to channel "c" wasn't confirmed: .*didn't say whether it posted the message.*could post it twice\.$/],
     ];
     for (const [receipt, pattern] of answers) {
       const { registry, seed } = registryWith({ discord: { publish: async () => receipt } });

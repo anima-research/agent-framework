@@ -136,7 +136,7 @@ test('the child env is built at each spawn: a respawn after idle reclaim sees a 
   }
 });
 
-test('PYTHONUNBUFFERED and PYTHONIOENCODING are set last, over a declared env, since the protocol needs both', async () => {
+test('PYTHONUNBUFFERED and PYTHONIOENCODING are set last, over a declared env', async () => {
   const runner = new PyRunner({ onToolCall: async () => '', env: { PYTHONUNBUFFERED: '0', PYTHONIOENCODING: 'latin-1' } });
   try {
     const r = await runner.exec(`import os; print(os.environ.get('PYTHONUNBUFFERED'), os.environ.get('PYTHONIOENCODING'))`, []);
@@ -147,9 +147,9 @@ test('PYTHONUNBUFFERED and PYTHONIOENCODING are set last, over a declared env, s
   }
 });
 
-test("a script's output that UTF-8 can't encode still returns, each lone surrogate as U+FFFD", async () => {
-  // A result the interpreter failed to send would wait out the script's
-  // deadline, so a short one makes that a failure here rather than a hang.
+test("a script's output that UTF-8 can't encode still returns, each lone surrogate escaped as backslashreplace writes it", async () => {
+  // A result that didn't arrive would wait out the script's time limit, so a
+  // short one makes that a failure here rather than a ten-minute stall.
   const runner = new PyRunner({ onToolCall: async () => '', scriptTimeoutMs: 15_000 });
   try {
     // A filename byte that isn't UTF-8, as os.fsdecode gives it, and a lone
@@ -159,7 +159,23 @@ print(os.fsdecode(b"\xff"))
 print(json.loads('"\\ud800"'))
 print("after")`, []);
     assert.equal(r.returnCode, 0, r.stderr);
-    assert.equal(r.stdout, '\ufffd\n\ufffd\nafter\n');
+    assert.equal(r.stdout, '\\udcff\n\\ud800\nafter\n');
+  } finally {
+    runner.dispose();
+  }
+});
+
+test('a tool call carrying a lone surrogate reaches the host with U+FFFD in its place', async () => {
+  // The protocol's channel is strict UTF-8: unsent, the call would raise
+  // UnicodeEncodeError in the script. A wake's payload goes the same way.
+  const calls: Array<Record<string, unknown>> = [];
+  const runner = new PyRunner({ onToolCall: async (_name, args) => { calls.push(args); return 'sent'; }, scriptTimeoutMs: 15_000 });
+  try {
+    const r = await runner.exec(String.raw`import json, os
+print(await t({"name": os.fsdecode(b"\xff"), "text": json.loads('"a\\ud800b"')}))`, [{ pyName: 't', toolName: 't' }]);
+    assert.equal(r.returnCode, 0, r.stderr);
+    assert.equal(r.stdout, 'sent\n');
+    assert.deepEqual(calls, [{ name: '\ufffd', text: 'a\ufffdb' }]);
   } finally {
     runner.dispose();
   }

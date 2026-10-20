@@ -436,7 +436,7 @@ describe('tool-result spill completion (issue #89)', () => {
       const stored = await waitForStoredToolResult(h.framework);
       assert.ok(stored, 'tool result should be stored');
       assert.ok(stored.content.length < CAPPED, 'inline copy must be capped');
-      assert.match(stored.content, /no writable workspace, full content not retained/);
+      assert.match(stored.content, /no writable workspace mount without an include, full content not retained/);
       assert.doesNotMatch(stored.content, /workspace file/);
     } finally {
       await h.framework.stop();

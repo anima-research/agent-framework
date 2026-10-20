@@ -12,6 +12,9 @@
 //   reject-discover-later  launches after the first answer server/discover with an error
 //   reject-discover      every launch answers server/discover with an error
 //   ignore-sigterm       the process survives SIGTERM (only SIGKILL ends it)
+//   deaf-at-discover     as server/discover arrives, closes its stdin and only then
+//                        answers, so the client's next write (the connect-time
+//                        subscriptions/listen) fails with EPIPE; it stays up
 //   other-revision       every launch's server/discover lists only a revision the client doesn't speak
 //   other-revision-later  launches after the first do
 // Tools: op (outputSchema {value: integer}, answers with a string: invalid
@@ -26,7 +29,7 @@
 // vanish (exits without answering), deafen (answers, then closes its stdin and
 // stays up, so the next write to it fails with EPIPE).
 import { createInterface } from 'node:readline';
-import { appendFileSync, closeSync, existsSync, readFileSync } from 'node:fs';
+import { appendFileSync, closeSync, existsSync, openSync, readFileSync } from 'node:fs';
 
 const [flagList = '', log] = process.argv.slice(2);
 const flags = new Set(flagList.split(',').filter(Boolean));
@@ -43,6 +46,34 @@ const SUB = 'io.modelcontextprotocol/subscriptionId';
 
 let listens = 0;
 let subscription = null;
+
+const discovered = (id) => result(id, {
+  supportedVersions: ['2026-07-28'],
+  capabilities: { tools: { listChanged: true } },
+  ttlMs: 60000,
+  cacheScope: 'private',
+  _meta: { 'io.modelcontextprotocol/serverInfo': { name: 'raw-fixture', version: '1' } },
+});
+
+/** Close stdin and stay up, so the next write to this process fails with
+ *  EPIPE; `then` runs once the read end is closed. */
+function deafen(then = () => {}) {
+  // Node keeps a stdio descriptor open when its stream is destroyed, so
+  // the read end is closed by hand once the stream is done with it, and
+  // /dev/null takes fd 0 at once: libuv assumes fds 0 to 2 stay taken, and
+  // on macOS this sequence, with fd 0 left free, was aborted at its first
+  // stdout write by libuv's assertion `fd > STDERR_FILENO`.
+  process.stdin.once('close', () => {
+    try { closeSync(0); } catch { /* already closed */ }
+    openSync('/dev/null', 'r');
+    note({ event: 'deaf' });
+    then();
+  });
+  lines.close();
+  process.stdin.destroy();
+  // Nothing else keeps the process up once its stdin is gone.
+  setInterval(() => {}, 1 << 30);
+}
 
 const lines = createInterface({ input: process.stdin });
 lines.on('line', (line) => {
@@ -64,13 +95,8 @@ lines.on('line', (line) => {
       if (flags.has('hang-discover')) return;
       if (flags.has('reject-discover-later') && launch > 1) return error(m.id, -32603, 'not today');
       if (flags.has('reject-discover')) return error(m.id, -32603, 'not today');
-      return result(m.id, {
-        supportedVersions: ['2026-07-28'],
-        capabilities: { tools: { listChanged: true } },
-        ttlMs: 60000,
-        cacheScope: 'private',
-        _meta: { 'io.modelcontextprotocol/serverInfo': { name: 'raw-fixture', version: '1' } },
-      });
+      if (flags.has('deaf-at-discover')) return deafen(() => discovered(m.id));
+      return discovered(m.id);
     case 'subscriptions/listen':
       if (flags.has('exit-on-listen-first') && launch === 1) process.exit(0);
       listens++;
@@ -122,16 +148,7 @@ lines.on('line', (line) => {
       if (name === 'vanish') process.exit(6);
       if (name === 'deafen') {
         result(m.id, { content: [{ type: 'text', text: 'deaf now' }] });
-        // Node keeps a stdio descriptor open when its stream is destroyed, so
-        // the read end is closed by hand once the stream is done with it.
-        process.stdin.once('close', () => {
-          try { closeSync(0); } catch { /* already closed */ }
-          note({ event: 'deaf' });
-        });
-        lines.close();
-        process.stdin.destroy();
-        // Nothing else keeps the process up once its stdin is gone.
-        setInterval(() => {}, 1 << 30);
+        deafen();
         return;
       }
       if (name === 'task') return send({ jsonrpc: '2.0', id: m.id, result: { resultType: 'task', taskId: 'task-1' } });

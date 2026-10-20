@@ -2,18 +2,43 @@
  * Python driver for the code_execution runtime's stop table (runtime-py.ts,
  * _ScriptStop): it loads the runtime as a module and drives its own dispatch
  * and SIGINT handler, landing the signal (or the cancel op) at exact points.
- * Prints one JSON object: row name -> {rc, tail, secs, ops}.
+ * Prints one JSON object: row name -> {rc, tail, secs, ops}, where tail is
+ * what the row's script wrote, up to its end mark.
+ *
+ * The runtime writes a script's output to its fds 1 and 2, which its host
+ * reads. Here they're one file, read back after each row; the driver's own
+ * stdout, for the JSON, is a copy of fd 1 taken first.
  *
  * Usage: python3 driver.py <runtime.py>
  * Must not contain backticks or dollar+brace (TS template literal).
  */
 export const PYTC_STOP_ROWS_DRIVER: string = String.raw`
-import asyncio, importlib.util, io, json, signal, sys, threading, time
+import asyncio, importlib.util, io, json, os, signal, sys, tempfile, threading, time
 spec = importlib.util.spec_from_file_location("pytc_runtime", sys.argv[1])
 rt = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(rt)
 signal.signal(signal.SIGINT, rt._on_sigint)
 MAIN = threading.main_thread().ident
+
+DRIVER_OUT = os.dup(1)
+CAPTURE = tempfile.TemporaryFile()
+os.dup2(CAPTURE.fileno(), 1)
+os.dup2(CAPTURE.fileno(), 2)
+rt._take_std_fds()
+_read_to = 0
+
+
+def row_output(mark):
+    # What the row's script wrote, read without moving the offset the writers
+    # share. Its mark is here twice, once for each of fds 1 and 2.
+    global _read_to
+    data = os.pread(CAPTURE.fileno(), os.fstat(CAPTURE.fileno()).st_size - _read_to, _read_to)
+    mark = mark.encode()
+    at = data.find(mark)
+    if at < 0:
+        return data.decode("utf-8", "replace") + "[no end mark]"
+    _read_to += data.rfind(mark) + len(mark)
+    return data[:at].decode("utf-8", "replace")
 
 
 class Proto(io.StringIO):
@@ -43,14 +68,20 @@ async def wake_future():
     return next(iter(rt._pending_wake_futures.values()))
 
 
+_rows_run = 0
+
+
 async def run(code, steps=None, before=None, hook=None, before_exec=None):
+    global _rows_run
+    _rows_run += 1
+    mark = "\x1erow-end-" + str(_rows_run) + "\x1e"
     rt.PROTO_OUT = Proto()
     Proto.hook = hook
     rt._dispatch({"op": "init", "tools": [{"py_name": "t", "tool_name": "t"}], "background": True})
     if before_exec:
         before_exec()
     started = time.time()
-    rt._dispatch({"op": "exec", "id": "e", "code": code})
+    rt._dispatch({"op": "exec", "id": "e", "code": code, "mark": mark})
     if before:
         before()
     if steps:
@@ -61,7 +92,7 @@ async def run(code, steps=None, before=None, hook=None, before_exec=None):
         if done and rt._current_exec_task is None:
             break
         await asyncio.sleep(0.01)
-    return {"rc": done[0]["return_code"] if done else None, "tail": done[0]["tail"] if done else "",
+    return {"rc": done[0]["return_code"] if done else None, "tail": row_output(mark) if done else "",
             "secs": round(time.time() - started, 2), "ops": [m["op"] for m in lines]}
 
 
@@ -135,7 +166,7 @@ async def main():
     out = {}
     for name, row in ROWS.items():
         out[name] = await row()
-    print(json.dumps(out))
+    os.write(DRIVER_OUT, (json.dumps(out) + "\n").encode())
 
 
 asyncio.run(main())

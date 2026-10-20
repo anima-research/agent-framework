@@ -18,7 +18,7 @@ export const TOOL_RESULT_GUARD_AUDIT_STATE = 'framework/tool-result-guard';
  *  left the stub's branch when the file would have been committed
  *  (`branch_changed`), or because the batch used its deadline before this
  *  write could start (`batch_deadline`); or null when no file is written at all (no writable
- *  workspace, or the host is stopping). */
+ *  mount without an include, or the host is stopping). */
 export type WithheldSpill =
   | { path: string; error?: string; unfinished?: true }
   | { skipped: 'workspace_unanswered' | 'branch_changed' | 'batch_deadline' }
@@ -497,8 +497,9 @@ export class ToolResultGuard {
 
   /**
    * Turn a withheld batch's notices into stubs that say where each original
-   * is (agent-framework #277): written to the workspace when a writable mount
-   * takes it, else kept in the audit record. A stub also keeps the file
+   * is (agent-framework #277): written to the workspace when it has a
+   * writable mount without an include to take it, else kept in the audit
+   * record. A stub also keeps the file
    * lists its tool marked. Its own unedited placeholder is
    * the only thing it edits: an operator's later edit, removal or rollback
    * stands.
@@ -596,8 +597,8 @@ export class ToolResultGuard {
               if (block.type !== 'tool_result') return [];
               if (thrown.has(index)) return [{ toolUseId: block.toolUseId, error: thrown.get(index)! }];
               const spill = spills.get(index) ?? null;
-              // No file was written: no writable workspace, or the framework
-              // was stopping.
+              // No file was written: no writable mount without an include,
+              // or the framework was stopping.
               if (spill === null) return [{ toolUseId: block.toolUseId, skipped: 'no_workspace_file' }];
               if ('skipped' in spill) return [{ toolUseId: block.toolUseId, skipped: spill.skipped }];
               return [{ toolUseId: block.toolUseId, path: spill.path,

@@ -1057,39 +1057,50 @@ test('a call of 200,000 edits is refused with each of its problems named', async
   assert.match(misses, /^The edit_many call stored none of its edits: 200000 problems\.\n\nedit 1: oldString isn't in work\/m\.txt\./);
 });
 
-test('an edit names its path plainly: a path with an empty, "." or ".." segment is refused, naming the plain spelling', async (t) => {
+test('an edit reads its path in the one spelling every tool reads: an empty or "." segment, a ".." that takes one back, and a trailing "/" name the same file', async (t) => {
   const { dir, store, workspace, call, stored } = setup(t, { autoMaterialize: true });
   mkdirSync(join(dir, 'sub'));
   writeFileSync(join(dir, 'sub', 'b.txt'), 'one\ntwo\n');
   assert.equal((await call('ls', { path: 'work/sub' })).success, true);
-  const refusal = (path: string) =>
-    `${path} isn't the plain spelling of its path, and the workspace would keep it as an entry apart from work/sub/b.txt, the same file on disk; name it work/sub/b.txt.`;
-  // The mount's directory is "mount", so "../mount/" leaves it and comes back.
-  for (const path of ['work/sub//b.txt', 'work/./sub/b.txt', 'work/sub/../sub/b.txt', 'work/sub/b.txt/', 'work/../mount/sub/b.txt']) {
-    assert.equal(errorOf(await call('edit', { path, oldString: 'one', newString: 'ONE' })), refusal(path));
+  // Each spelling edits sub/b.txt, the one entry the workspace keeps for it.
+  let text = 'one';
+  for (const path of ['work/sub//b.txt', 'work/./sub/b.txt', 'work/sub/../sub/b.txt', 'work/sub/b.txt/']) {
+    dataOf(await call('edit', { path, oldString: text, newString: `${text}+` }));
+    text = `${text}+`;
   }
-  // These spellings of the mount's root, its bare name included, are refused
-  // as naming no file. A part in the mount that starts with a separator is
-  // absolute: parsePath refuses it where it resolves outside the mount, as
-  // "work//" does, and here the mount's own path names its root, and a file
-  // beneath it isn't that file's plain spelling.
-  const root = (path: string) => `${path} names the root of mount "work", which isn't a file; ls work lists the files in it.`;
-  for (const path of ['work', 'work/', 'work/.', 'work/sub/..', `work/${dir}`]) {
-    assert.equal(errorOf(await call('edit', { path, oldString: 'one', newString: 'ONE' })), root(path));
-  }
-  assert.equal(errorOf(await call('edit', { path: `work/${dir}/sub/b.txt`, oldString: 'one', newString: 'ONE' })), refusal(`work/${dir}/sub/b.txt`));
-  assert.equal(errorOf(await call('edit_many', { edits: [{ path: 'work/', oldString: 'one', newString: 'ONE' }] })),
-    `The edit_many call stored none of its edits: 1 problem.\n\nedit 1: ${root('work/')}`);
-  // Named two ways in one call, one file would be two plans of one text.
-  assert.equal(errorOf(await call('edit_many', {
+  assert.equal(await stored('sub/b.txt'), `${text}\ntwo\n`);
+  assert.equal(readFileSync(join(dir, 'sub', 'b.txt'), 'utf8'), `${text}\ntwo\n`);
+  // Named two ways in one call, it's one file, planned once, so each edit is
+  // matched in the text the call read.
+  dataOf(await call('edit_many', {
     edits: [
-      { path: 'work/sub/b.txt', oldString: 'one', newString: 'ONE' },
+      { path: 'work/sub/b.txt', oldString: text, newString: 'ONE' },
       { path: 'work/sub//b.txt', oldString: 'two', newString: 'TWO' },
     ],
-  })), `The edit_many call stored none of its edits: 1 problem.\n\nedit 2: ${refusal('work/sub//b.txt')}`);
-  assert.equal(await stored('sub/b.txt'), 'one\ntwo\n');
+  }));
+  assert.equal(await stored('sub/b.txt'), 'ONE\nTWO\n');
+  // A ".." with nothing before it to take back climbs above the mount's root,
+  // even where it comes back in by the mount directory's own name ("mount"),
+  // and a separator straight after the mount's name would make the rest an
+  // absolute path, even one inside the mount: the parse refuses both, as it
+  // does for every tool.
+  assert.equal(errorOf(await call('edit', { path: 'work/../mount/sub/b.txt', oldString: 'ONE', newString: 'one' })),
+    'Path traversal detected: "work/../mount/sub/b.txt" climbs above the root of mount "work".');
+  for (const path of [`work/${dir}`, `work/${dir}/sub/b.txt`]) {
+    assert.equal(errorOf(await call('edit', { path, oldString: 'ONE', newString: 'one' })),
+      `Path traversal detected: "${path}" has a separator right after mount "work", which makes it an absolute path: give it from the mount's root.`);
+  }
+  // These spellings of the mount's root, its bare name included, are refused
+  // as naming no file.
+  const root = (path: string) => `${path} names the root of mount "work", which isn't a file; ls work lists the files in it.`;
+  for (const path of ['work', 'work/', 'work/.', 'work/sub/..']) {
+    assert.equal(errorOf(await call('edit', { path, oldString: 'ONE', newString: 'one' })), root(path));
+  }
+  assert.equal(errorOf(await call('edit_many', { edits: [{ path: 'work/', oldString: 'ONE', newString: 'one' }] })),
+    `The edit_many call stored none of its edits: 1 problem.\n\nedit 1: ${root('work/')}`);
+  assert.equal(await stored('sub/b.txt'), 'ONE\nTWO\n');
   assert.deepEqual(store.treeList(treeStateOf(workspace), null).map((entry) => entry.path), ['sub/b.txt']);
-  // Dots inside a name are a plain spelling: the edit reaches the file.
+  // Dots inside a name are part of the name: the edit reaches the file.
   for (const name of ['..b.txt', 'b.', 'a..b']) {
     writeFileSync(join(dir, 'sub', name), 'one\n');
     dataOf(await call('edit', { path: `work/sub/${name}`, oldString: 'one', newString: 'ONE' }));

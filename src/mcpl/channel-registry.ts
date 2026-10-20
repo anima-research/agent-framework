@@ -44,7 +44,7 @@ import { logDetail, logValue } from './log-value.js';
 import { RefusalLines } from './refusal-lines.js';
 import { CapabilityGrant } from './capability-grant.js';
 import type { InboundSource } from './inbound-source.js';
-import { McplRequestError } from './server-connection.js';
+import { McplRequestError, type McplServerConnection } from './server-connection.js';
 import { readSkipReplyWake } from './skip-reply-wake.js';
 
 // ============================================================================
@@ -54,13 +54,96 @@ import { readSkipReplyWake } from './skip-reply-wake.js';
 const TYPING_INTERVAL_MS = 7_000;
 const MAX_CHANNEL_LIFECYCLE_ATTEMPTS = 5;
 
-/** A successful RPC can still fail to establish the latest channel target. */
-class ChannelLifecycleConvergenceError extends Error {}
-/** A channels/open answered for a channel other than the one it named. */
-class ChannelOpenSubstitutionError extends Error {}
-/** An operation queued for a server's registrations that were removed. */
-class ChannelLifecycleCancelledError extends Error {}
+/**
+ * Where a channel's server stands for a request this host would make of it
+ * (ChannelRegistry.serverReach). Only an `up` server's grant says what it
+ * allows: a connection's grant is empty from a transport drop until its next
+ * policy exchange settles, whatever the server will allow then.
+ * - `gone`: not registered, with no connect of its id in flight (closed for
+ *   good without reconnect, whose channels stay registered here, or removed),
+ *   or registered, closed and not reconnecting (one kept for a child it
+ *   couldn't reap), with no restart of it in flight. This host doesn't bring
+ *   it back on its own.
+ * - `connecting`: a connect or restart of its id in flight, or registered
+ *   and connected, with the policy exchange of the transport it's on still
+ *   in flight (the host's serverConnecting).
+ * - `down`: registered, between transports, and reconnecting.
+ * - `up`: connected, its exchange settled, granted or not, refused or
+ *   unanswered: the grant it holds is that transport's answer.
+ */
+type ServerReach = 'gone' | 'connecting' | 'down' | 'up';
+
+/** What a lifecycle failure tells the agent it can do next
+ *  (ChannelRegistry.lifecycleFailureText, openFailedReason). */
+type ChannelLifecycleFailure =
+  | 'unreachable'
+  | 'not-permitted'
+  | 'cancelled'
+  | 'unlisted'
+  | 'superseded'
+  | 'converge'
+  | 'substituted'
+  | 'removed'
+  | 'not-open'
+  | 'unrecorded'
+  | 'overtaken'
+  | 'put-back-unrecorded'
+  | 'selected-again';
+
+/**
+ * A channel's lifecycle operation, or a delivery waiting on one, that didn't
+ * complete. Its message is a clause in the agent's words, which its traces
+ * carry too, so the two never drift apart; `kind` says what the agent can do
+ * next, and `reach` where the server stood, for `unreachable`.
+ * - `unreachable`: its server isn't up (ServerReach).
+ * - `not-permitted`: its server is up, and its grant lacks channels.lifecycle.
+ * - `cancelled`: queued for a server whose registrations were removed.
+ * - `unlisted`: the server no longer lists the channel.
+ * - `superseded`: a later decision about the channel came first.
+ * - `converge`: a successful RPC kept failing to establish the latest target.
+ * - `substituted`: a channels/open answered for a channel other than the one
+ *   it named.
+ * - `removed`, `not-open`: a delivery's wait (waitForOpenChannel) ended with
+ *   the channel's registration gone, or with its close standing
+ *   (closeStands) or its open not confirmed. These are whole reasons for
+ *   words that didn't go out, said as they are.
+ * - `unrecorded`: the decision couldn't be written to the lifecycle log
+ *   (appendLifecycleEvent), so nothing changed and nothing was sent.
+ * - `overtaken`, `put-back-unrecorded`, `selected-again`: an open by speech
+ *   or a reply that failed (openChannelNow), carrying its own failure's
+ *   clause. `overtaken`: a decision made during its round-trip, such as the
+ *   agent's own close or channel_open, replaced the one the open wrote; that
+ *   decision stands, and nothing is put back. `put-back-unrecorded`: the
+ *   decision it replaced couldn't be put back on record, so the decision to
+ *   open stays, the channel stays selected for opening, and reconciliation
+ *   may open it later. `selected-again`: the pure default it put back is
+ *   lifted by the channel's current descriptor or the subscription policy,
+ *   so the channel is selected for opening again; `by` says which.
+ */
+class ChannelLifecycleError extends Error {
+  readonly by?: Exclude<SelectedForOpening, 'unrecorded'>;
+  constructor(
+    message: string,
+    readonly kind: ChannelLifecycleFailure,
+    readonly reach?: Exclude<ServerReach, 'up'>,
+    options?: { by?: Exclude<SelectedForOpening, 'unrecorded'>; cause?: unknown },
+  ) {
+    super(message, options && 'cause' in options ? { cause: options.cause } : undefined);
+    this.name = 'ChannelLifecycleError';
+    this.by = options?.by;
+  }
+}
+
+/** Why a channel is selected for opening after a failed open by speech or a
+ *  reply: its put-back couldn't be recorded, or the server's latest
+ *  announcement or the subscription policy lifted the default it restored. */
+export type SelectedForOpening = 'unrecorded' | 'server-bootstrap' | 'subscription-policy';
+
 const CHANNEL_LIFECYCLE_LOG_ID = 'mcpl/channel-lifecycle';
+
+/** The sources of a decision the agent itself made: channel_open and
+ *  channel_close, and channel_decline. */
+const AGENT_DECISION_SOURCES: ReadonlySet<string> = new Set(['agent-tool', 'invitation-declined']);
 
 /**
  * What a channels/open answer says about which channel the server opened:
@@ -116,8 +199,11 @@ export interface TuneOutParams {
   epochId: string;
   /** Subconscious summary cadence, in seconds. */
   cadenceSeconds: number;
-  /** Maximum messages dumped raw at cancel; above the cap the subconscious
-   *  curates a digest and `fetch_history` covers the rest. */
+  /** Maximum messages dumped raw at cancel, the newest. Where the residents'
+   *  strategies cap a message's size, the dump holds as many as fit whole in
+   *  one message, or, when even the newest doesn't, as much of the newest as
+   *  fits beside the cut's mark, if any does. For those left out the
+   *  subconscious curates a digest, and `fetch_history` covers them. */
   backlogCap: number;
   /** Wake invocations before the tune-out auto-cancels. */
   maxWakes: number;
@@ -256,9 +342,11 @@ interface ChannelEntry {
  * A channel its server declared inbound-only (SPEC §14.2 `direction`): its
  * messages come in, and the host publishes nothing into it. No publish, from
  * plain speech, `channel_publish` or `publishForAgent`, and no outgoing
- * stream. Typing and acknowledgements, which carry no content, still go
- * (SPEC §14.5: "Delivery occurs only via `channels/publish`"). A channel
- * declared `outbound` or `bidirectional`, or with no direction, isn't one.
+ * stream starts there, though one the channel took before the declaration
+ * ends there (sendOutgoingChunk). Typing and acknowledgements, which carry
+ * no content, still go (SPEC §14.5: "Delivery occurs only via
+ * `channels/publish`"). A channel declared `outbound` or `bidirectional`, or
+ * with no direction, isn't one.
  */
 function isInboundOnly(entry: ChannelEntry): boolean {
   return entry.descriptor.direction === 'inbound';
@@ -471,7 +559,8 @@ const CHANNEL_TOOL_DEFINITIONS: ToolDefinition[] = [
 // ============================================================================
 
 /** Bound connector values for notices, logs and an outcome's reason. A
- *  PublishOutcome keeps the connector's structured data (`detail`) whole. */
+ *  PublishOutcome keeps the connector's structured data (`detail`) as the
+ *  connection gives it, its strings redacted (redactedData). */
 export function connectorText(value: unknown): string {
   let text: string;
   try {
@@ -491,6 +580,12 @@ export interface PublishDestination {
   channelId: string;
   /** The channel's registered label when the attempt was made. */
   label?: string;
+}
+
+/** One key per destination, its server and channel: unlike joining the two
+ *  with a separator, no two destinations share one, whatever their ids hold. */
+export function destinationKey(to: PublishDestination): string {
+  return JSON.stringify([to.serverId, to.channelId]);
 }
 
 /**
@@ -515,10 +610,127 @@ export interface PublishOutcome {
   /** Why it failed, or why its outcome is unknown — for a connector error,
    *  its message, bounded (which may say what was already posted). */
   reason?: string;
-  /** The connector error's structured `data`, verbatim, when it sent one. */
+  /** The connector error's structured `data`, with the strings in it
+   *  redacted (redactedData), when it sent one. */
   detail?: unknown;
   /** When the outcome was established (epoch ms). */
   at: number;
+}
+
+/**
+ * A failed request's words, bounded, for a reason that a caller composes.
+ * This host's own words, for a request that wasn't sent or wasn't answered
+ * or for an error of its own, such as its store's, are sentences, and every
+ * composition of a reason adds its own ending, so one final period comes
+ * off them. A server's error answer keeps its words as they came.
+ */
+function requestErrorText(err: unknown): string {
+  const text = connectorText(err instanceof Error ? err.message : String(err));
+  return err instanceof McplRequestError && err.outcome === 'error-response' ? text : text.replace(/(?<!\.)\.$/, '');
+}
+
+/** A server that isn't up (ServerReach), as a clause the agent reads. */
+function unreachableClause(serverId: string, reach: Exclude<ServerReach, 'up'>): string {
+  switch (reach) {
+    case 'gone': return `the "${serverId}" server isn't connected, and this host won't reconnect to it on its own`;
+    case 'connecting': return `this host is connecting to the "${serverId}" server`;
+    case 'down': return `the "${serverId}" server isn't connected, and this host is reconnecting to it`;
+  }
+}
+
+/** What helps when a server isn't up (ServerReach), as the end of the
+ *  clause that says so. */
+function unreachableRemedy(reach: Exclude<ServerReach, 'up'>): string {
+  switch (reach) {
+    case 'gone': return '; if you need it, ask whoever runs this host';
+    case 'connecting': return ', so try again in a moment';
+    case 'down': return ', so try again later';
+  }
+}
+
+/** Whether an entry's descriptor carries the key a push's placeholder has
+ *  (ensureChannelRegistered's lazyRegistered metadata), as main reads it for
+ *  whether the server has declared the channel: a registration or a
+ *  channels/changed update brings the server's own descriptor, which
+ *  doesn't normally carry it. The traffic rule doesn't read it, since a
+ *  server's descriptor can (untargetedPushEntries). */
+function pushPlaceholder(entry: ChannelEntry): boolean {
+  return (entry.descriptor.metadata as { lazyRegistered?: boolean } | undefined)?.lazyRegistered === true;
+}
+
+/** When reconciling applies a recorded decision: at the server's next
+ *  registration of the channel, where this host directs its channels'
+ *  lifecycle then (reconcileChannels, §14.1). A channel made from a push
+ *  may never be registered at all, so for one the text says "if". */
+function laterClause(entry: ChannelEntry): string {
+  return pushPlaceholder(entry)
+    ? `if the "${entry.serverId}" server registers this channel at a time this host may open and close its channels`
+    : `when the "${entry.serverId}" server next registers this channel, if this host may open and close its channels then`;
+}
+
+/** A channel decision the lifecycle log refused to append, as on a full
+ *  disk: nothing changed (appendLifecycleEvent). */
+function unrecordedDecision(err: unknown): ChannelLifecycleError {
+  return new ChannelLifecycleError(`this host couldn't record the decision: ${requestErrorText(err)}`, 'unrecorded');
+}
+
+/** A failure's clause, then more said of the same failure. A server's own
+ *  words keep their final stop (requestErrorText), so after them the rest
+ *  is a sentence of its own. */
+function afterClause(clause: string, more: string): string {
+  return /[.!?]$/.test(clause) ? `${clause} ${more.charAt(0).toUpperCase()}${more.slice(1)}` : `${clause}; ${more}`;
+}
+
+/** A lifecycle failure as a clause: its own words, or its request's. */
+function lifecycleClause(err: unknown): string {
+  return err instanceof ChannelLifecycleError ? err.message : requestErrorText(err);
+}
+
+/** Why words didn't go out when their channel's registration went away
+ *  first, at a delivery's wait or at its last check. */
+const CHANNEL_REMOVED_CLAUSE = 'the channel was removed before these words went out';
+
+/**
+ * Why words a send opened their channel for didn't go out. The delivery's
+ * wait after the open says it whole (`removed`, `not-open`). The open's own
+ * failure is said as one, with what helps where there's a step to take. It
+ * names no state of the channel's transport: one decided closed can still
+ * be open, after a close that failed.
+ */
+function openFailedReason(err: unknown): string {
+  if (err instanceof ChannelLifecycleError && (err.kind === 'removed' || err.kind === 'not-open')) return err.message;
+  return `opening the channel for these words didn't complete: ${lifecycleClause(err)}${refusalRemedy(err)}`;
+}
+
+/** What helps after a lifecycle failure, as the end of the clause that says
+ *  it: the server state's remedy, whom to ask for a grant, or another try
+ *  where the channel's target kept changing or the decision couldn't be
+ *  recorded. Nothing for any other failure. */
+function refusalRemedy(err: unknown): string {
+  if (!(err instanceof ChannelLifecycleError)) return '';
+  if (err.kind === 'unreachable' && err.reach) return unreachableRemedy(err.reach);
+  if (err.kind === 'not-permitted') return '; if you need it, ask whoever runs this host';
+  if (err.kind === 'converge') return ', so try again';
+  if (err.kind === 'unrecorded') return ', so try again; if it fails the same way, ask whoever runs this host';
+  return '';
+}
+
+/** Why an open or a close doesn't stand when a later decision about the
+ *  channel came first (`now`, its desired state since). */
+function supersededClause(action: 'open' | 'close', now: DesiredChannelState | undefined): string {
+  if (now === 'tuned-out') return 'it was tuned out meanwhile';
+  return action === 'close' ? 'a later decision to keep it open came first' : 'a later decision to close it came first';
+}
+
+/** A clause as the start of a sentence. */
+function sentenceStart(clause: string): string {
+  return clause.charAt(0).toUpperCase() + clause.slice(1);
+}
+
+/** Words as a sentence's end: a stop, unless they end in one already, as a
+ *  server's own words may. */
+function withStop(text: string): string {
+  return /[.!?]$/.test(text) ? text : `${text}.`;
 }
 
 /**
@@ -530,12 +742,7 @@ export interface PublishOutcome {
  * a failed request this way.
  */
 function publishErrorOutcome(err: unknown, destination: PublishDestination, at: number): PublishOutcome {
-  // This host's own words for a request that wasn't sent or wasn't answered
-  // are sentences, and every composition of the reason adds its own ending,
-  // so one final period comes off them. A server's error answer keeps its
-  // words as they came.
-  const text = connectorText(err instanceof Error ? err.message : String(err));
-  const message = err instanceof McplRequestError && err.outcome !== 'error-response' ? text.replace(/(?<!\.)\.$/, '') : text;
+  const message = requestErrorText(err);
   const notSent = err instanceof McplRequestError && err.outcome === 'not-sent';
   const detail = err instanceof McplRequestError ? err.data : undefined;
   return {
@@ -564,16 +771,17 @@ function publishReceiptOutcome(result: unknown, destination: PublishDestination,
   }
   if (receipt.delivered === false) {
     if (receipt.messageId === undefined || receipt.messageId === null) {
-      return { status: 'failed', destination, reason: `server "${destination.serverId}" reported delivered:false`, at };
+      return { status: 'failed', destination, reason: `the "${destination.serverId}" server said it didn't post the message`, at };
     }
     return {
       status: 'unknown',
       destination,
       ...(messageId ? { messageId } : {}),
       reason: messageId
-        ? `server "${destination.serverId}" reported delivered:false but named posted message ${connectorText(messageId)} (delivery uncertain)`
-        : `server "${destination.serverId}" reported delivered:false beside a malformed message id ` +
-          `${connectorText(receipt.messageId)} (contradictory receipt; delivery uncertain)`,
+        ? `the "${destination.serverId}" server said it didn't post the message, yet named message ` +
+          `${connectorText(messageId)} as posted (delivery uncertain)`
+        : `the "${destination.serverId}" server said it didn't post the message, along with a message id that ` +
+          `isn't valid (${connectorText(receipt.messageId)}) (delivery uncertain)`,
       at,
     };
   }
@@ -581,7 +789,7 @@ function publishReceiptOutcome(result: unknown, destination: PublishDestination,
     status: 'unknown',
     destination,
     ...(messageId ? { messageId } : {}),
-    reason: `server "${destination.serverId}" returned no valid delivery receipt (delivery uncertain)`,
+    reason: `the "${destination.serverId}" server's answer didn't say whether it posted the message (delivery uncertain)`,
     at,
   };
 }
@@ -700,6 +908,14 @@ interface ChannelRegistryOptions {
   takesGlobalFallback?: (conversationId: string) => boolean;
   /** Whether this framework has EventGate and can honor skip_reply self-wakes. */
   eventGatePresent?: boolean;
+  /**
+   * Whether this host is connecting to the server of this id: a connect or a
+   * restart of the id is in flight, or the policy exchange of the transport
+   * its registered connection is on is. Its channel tools and speech then say
+   * so, as its tool calls do, rather than read the empty grant meanwhile as a
+   * refusal (serverReach). It words a refusal only: the grant decides.
+   */
+  serverConnecting?: (serverId: string) => boolean;
 }
 
 // ============================================================================
@@ -743,10 +959,19 @@ export class ChannelRegistry {
   private homeChannelResolver?: (agentName: string) => string | undefined;
   private activeChannelResolver?: (agentName: string) => string | undefined;
   private takesGlobalFallback?: (conversationId: string) => boolean;
+  private serverConnecting?: (serverId: string) => boolean;
   private store?: JsStore;
 
   /** Registered channels, keyed by `{serverId}:{channelId}`. */
   private channels = new Map<string, ChannelEntry>();
+
+  /**
+   * Each outgoing stream, by `inferenceId`, with the destinations it has
+   * started at (destinationKey): the rest of the stream there goes on there,
+   * and its `complete` goes only there (sendOutgoingChunk). An entry goes
+   * with the stream's `complete` for its destination.
+   */
+  private takenStreams = new Map<string, Set<string>>();
 
   /** Holds back repeats of the line for a message refused because its
    *  channel isn't registered (RefusalLines). */
@@ -848,9 +1073,18 @@ export class ChannelRegistry {
   // target before confirming anything. Unlike the tail, which settles a few
   // microtasks after its operation's last check, this drops at that check.
   private lifecycleOutstanding = new Map<string, number>();
+  // The removal count each channel's newest outstanding operation was queued
+  // under. Where it's older than its server's, every operation still
+  // outstanding for the channel cancels when it would run.
+  private lifecycleQueuedRemovals = new Map<string, number>();
   // Losing an open receipt does not confirm closure. Keep that distinction
   // private while preserving the public open:boolean availability projection.
   private unconfirmedChannelTargets = new WeakSet<ChannelEntry>();
+  // Entries ensureChannelRegistered made from a push, until a channels/changed
+  // update gives one a target (handleChanged's retarget). A registration makes
+  // a new entry, which isn't here. Kept by the host, not read from the
+  // descriptor, whose metadata a server's own registration supplies.
+  private untargetedPushEntries = new WeakSet<ChannelEntry>();
 
   private invalidateTransportConfirmation(entry: ChannelEntry): void {
     entry.open = false;
@@ -860,7 +1094,7 @@ export class ChannelRegistry {
   /** Whether the host directs this server's channel lifecycle (§14.1: its
    *  `channels.lifecycle` grant). Where it doesn't, the server opens and
    *  closes its own channels, and sends no receipt the host could wait for. */
-  private directsLifecycle(serverId: string): boolean {
+  directsLifecycle(serverId: string): boolean {
     return CapabilityGrant.of(this.serverRegistry.getServer(serverId)).has('channels.lifecycle');
   }
 
@@ -873,12 +1107,192 @@ export class ChannelRegistry {
       this.directsLifecycle(entry.serverId);
   }
 
-  /** A registration's entry: nothing about its transport is known until a
-   *  receipt for its target confirms it open or closed. */
-  private registerEntry(key: string, serverId: string, descriptor: ChannelDescriptor): void {
+  /** Where this server stands for a request this host would make of it
+   *  (ServerReach). One without a connection's state reads as connected.
+   *  A closed connection the host is restarting reads as connecting, as
+   *  one being connected does. */
+  private serverReach(serverId: string): ServerReach {
+    const server = this.serverRegistry.getServer(serverId);
+    const connecting = this.serverConnecting?.(serverId) ?? false;
+    if (!server) return connecting ? 'connecting' : 'gone';
+    if (server.isConnected === false) return connecting ? 'connecting' : server.willReconnect ? 'down' : 'gone';
+    return connecting ? 'connecting' : 'up';
+  }
+
+  /**
+   * Why this host won't open or close this server's channels, for a caller
+   * that found its grant without channels.lifecycle (§14.1), which decides:
+   * the server's state says why. It isn't up, or it's up without that grant.
+   * Neither the grant's name, which is the operator's, nor an empty grant's
+   * refusal, which needn't be the server's, reaches the agent.
+   */
+  private lifecycleRefusal(serverId: string): ChannelLifecycleError {
+    const reach = this.serverReach(serverId);
+    if (reach !== 'up') return new ChannelLifecycleError(unreachableClause(serverId, reach), 'unreachable', reach);
+    return new ChannelLifecycleError(`this host isn't permitted to open or close the "${serverId}" server's channels`, 'not-permitted');
+  }
+
+  /**
+   * Why a send to this server's channels is refused before anything goes
+   * out, as one clause with what works from there, for a caller that found
+   * no server or a grant without channels.publish (§14.1), which decides:
+   * the server's state says why. Plain speech gives it as its reason, and
+   * channel_publish and speak_in_channel as theirs, so one refusal has one
+   * wording. `checked` is the connection whose grant refused, where that
+   * was read before the words waited: one the registry has replaced since
+   * says nothing about the server that stands now.
+   */
+  private sendRefusal(serverId: string, checked?: McplServerConnection): string {
+    const now = this.serverRegistry.getServer(serverId);
+    const reach = this.serverReach(serverId);
+    // A replacement that would take the words is worth another try; one
+    // that wouldn't is worded as it stands.
+    if (checked && now && now !== checked && reach === 'up' && CapabilityGrant.of(now).has('channels.publish')) {
+      return `the "${serverId}" server's connection was replaced while these words waited, so try again`;
+    }
+    if (reach !== 'up') return unreachableClause(serverId, reach) + unreachableRemedy(reach);
+    return `this host isn't permitted to post to the "${serverId}" server's channels, and trying again won't change that; ` +
+      'if you need it, ask whoever runs this host';
+  }
+
+  /**
+   * What a failed channel_open or channel_close tells the agent. Its
+   * decision was recorded before the server was asked, and reconciling
+   * applies it when the server next registers the channel (for a push's
+   * placeholder, if it ever does), if this host directs their lifecycle then
+   * (laterClause). A decision the log refused changed nothing, so that comes
+   * first. A channel no longer registered
+   * can't be reached by any channel tool, so its text names none. A later
+   * decision that came first is what stands, so that comes next. Then the
+   * server's state: one that isn't up gets the change when it's back, though
+   * not a backscroll's history. For the request's own failure, its state is
+   * read now, since a request out when the server dropped may have taken
+   * effect, and reconciling settles it either way. A decision already in
+   * effect, with no other work for the channel under way, says so, as one
+   * whose backscroll alone failed is. Then the failure's kind, since each
+   * has its own next step (ChannelLifecycleError). A request's own failure
+   * is in the connection's words.
+   */
+  private lifecycleFailureText(
+    action: 'open' | 'close',
+    entry: ChannelEntry,
+    err: unknown,
+    opts?: { history?: boolean },
+  ): string {
+    const channel = `"${entry.descriptor.id}"`;
+    const tool = action === 'open' ? 'channel_open' : 'channel_close';
+    const done = action === 'open' ? 'opened' : 'closed';
+    const later = laterClause(entry);
+    // A decision never recorded is no decision a later one overtook, and
+    // nothing about the channel changed, whatever its transport's state.
+    if (err instanceof ChannelLifecycleError && err.kind === 'unrecorded') {
+      return `Nothing changed for channel ${channel}: ${err.message}, so nothing was sent to the server. ` +
+        `Calling ${tool} again tries again; if it fails the same way, ask whoever runs this host.`;
+    }
+    const failure = err instanceof ChannelLifecycleError ? err : undefined;
+    const now = this.getDesiredState(entry.serverId, entry.descriptor.id);
+    const current = this.channels.get(`${entry.serverId}:${entry.descriptor.id}`);
+    if (!current) {
+      // Its registration may have gone at the server's word or at this
+      // host's (removeServer). Only a failure that says which (cancelled,
+      // unlisted) names it; otherwise the server's state where it isn't up,
+      // and a request's own words where it failed with them. Another
+      // failure's words are about a request whose channel is gone.
+      const reach = this.serverReach(entry.serverId);
+      const why = failure?.kind === 'cancelled' || failure?.kind === 'unlisted' ? `: ${failure.message}`
+        : reach !== 'up' ? `: ${unreachableClause(entry.serverId, reach)}` : '';
+      // A tune-out is in effect already: only its transport waits for the
+      // server's next registration.
+      const stays = now === 'tuned-out' ? 'It was tuned out meanwhile, and that stays recorded.'
+        : `Its ${now === 'closed' ? 'close' : 'open'} stays recorded, and happens ${later}.`;
+      return `Channel ${channel} isn't registered here any more${why}. ${stays}` +
+        (reach === 'gone' ? ' If you need the server back, ask whoever runs this host.' : '') +
+        (failure === undefined ? ` ${withStop(lifecycleClause(err))}` : '');
+    }
+    // A tune-out sends the channel's messages to the subconscious, and
+    // channel_open refuses a tuned-out channel.
+    if (action === 'open' ? now !== 'open' : now !== 'closed') {
+      if (action === 'open' && now === 'tuned-out') {
+        return `Channel ${channel} was tuned out meanwhile: its messages go to the subconscious, and channel_open doesn't ` +
+          `change that. Call tune_out with channelId ${channel} and mode "cancel" for it to resume normal attention.`;
+      }
+      // The later decision's own work settles the transport, and its call
+      // says what became of it, so this says only that this call's change
+      // doesn't stand.
+      return `Channel ${channel}: ${supersededClause(action, now)}, so this ${action} doesn't stand. Call ${tool} again to ` +
+        `${action} it.`;
+    }
+    const reach = failure ? (failure.kind === 'unreachable' ? failure.reach : undefined) : this.serverReach(entry.serverId);
+    if (reach !== undefined && reach !== 'up') {
+      // Reconciling opens a channel, but asks for no history.
+      const history = action === 'open' && opts?.history;
+      return `${sentenceStart(unreachableClause(entry.serverId, reach))}, so channel ${channel} may not be ` +
+        `${action === 'open' ? 'open' : 'closed'} there yet. The ${action} is recorded and happens ${later}` +
+        (history
+          ? ', but the history you asked for doesn\'t come with it: calling channel_open with backscroll once the server is ' +
+            'connected asks for it.'
+          : `, so there's no need to call ${tool} again.`) +
+        (reach === 'gone' ? ' If you need the server back, ask whoever runs this host.' : '') +
+        (action === 'open' ? ' channel_close withdraws it.' : '');
+    }
+    const said = lifecycleClause(err);
+    // Other work for the channel still under way (lifecycleOutstanding,
+    // released as each operation's last look ends) may change its state.
+    const settled = !this.lifecycleOutstanding.has(this.lifecycleKey(entry.serverId, entry.descriptor.id));
+    // The registry's own reading, as its checks make it (channel_open's
+    // already-open return, the decline's refusal, delivery): a request that
+    // failed leaves the open flag as it was, and the unconfirmed mark counts
+    // only while the channel isn't open (runLifecycleOperation).
+    const inEffect = current !== undefined && settled && (action === 'open'
+      ? current.open
+      : !current.open && !this.unconfirmedChannelTargets.has(current));
+    if (inEffect) {
+      // What was asked already holds. Without the grant, nothing more can be
+      // asked of the server, so calling again won't change anything.
+      const state = `Channel ${channel} is ${action === 'open' ? 'open' : 'closed'}`;
+      if (action === 'open' && opts?.history) {
+        return failure?.kind === 'not-permitted'
+          ? `${state}, but the history you asked for didn't come: ${failure.message}, so calling channel_open again ` +
+            "won't change that. If you need it, ask whoever runs this host."
+          : withStop(`${state}, but the history you asked for didn't come: ${said}`) +
+            ' Calling channel_open again with backscroll tries once more.';
+      }
+      return failure?.kind === 'not-permitted'
+        ? `${state}. ${sentenceStart(failure.message)}, so it sent the server nothing.`
+        : withStop(`${state}, though this call didn't complete: ${said}`);
+    }
+    switch (failure?.kind) {
+      case 'not-permitted':
+        // The decision was recorded before the refusal, and reconciling
+        // applies it at a registration whose grant allows it.
+        return `${sentenceStart(failure.message)}, so this ${action} of channel ${channel} didn't go through, and calling ${tool} ` +
+          `again won't change that. The ${action} stays recorded, and happens ${later}. If you need it, ask whoever runs this host.`;
+      case 'cancelled':
+      case 'unlisted':
+        return `Channel ${channel} wasn't ${done}: ${failure.message}. The ${action} stays recorded, and happens ${later}.`;
+      case 'converge':
+        return `Channel ${channel} wasn't ${done}: ${failure.message}. The ${action} stays recorded, and calling ${tool} again ` +
+          'tries once more.';
+      case 'substituted':
+        // Only an open is answered for another channel.
+        return `Channel ${channel} wasn't ${done}: ${failure.message}. The ${action} stays recorded, and this host tries it ` +
+          `again ${later}; calling ${tool} again is likely to get the same answer. channel_close withdraws it.`;
+    }
+    return `${action === 'open' ? 'Opening' : 'Closing'} channel ${channel} didn't complete; the ${action} stays recorded, and this ` +
+      `host tries it again ${later}, or now if you call ${tool} again. ${withStop(said)}`;
+  }
+
+  /** A registration's entry, or a push's (ensureChannelRegistered): nothing
+   *  about its transport is known until a receipt for its target confirms it
+   *  open or closed, or the channel's traffic shows it open, which it does
+   *  where the host doesn't direct the lifecycle, and for a push's entry
+   *  decided open or tuned out that no update has given a target
+   *  (handleIncoming). */
+  private registerEntry(key: string, serverId: string, descriptor: ChannelDescriptor): ChannelEntry {
     const entry: ChannelEntry = { serverId, descriptor, open: false };
     this.channels.set(key, entry);
     this.unconfirmedChannelTargets.add(entry);
+    return entry;
   }
 
   private hasPendingLifecycle(entry: ChannelEntry): boolean {
@@ -932,6 +1346,7 @@ export class ChannelRegistry {
     this.homeChannelResolver = options?.homeChannelResolver;
     this.activeChannelResolver = options?.activeChannelResolver;
     this.takesGlobalFallback = options?.takesGlobalFallback;
+    this.serverConnecting = options?.serverConnecting;
     this.store = options?.store;
     this.initializeLifecycleStore();
     this.initializeLabelHistoryStore();
@@ -1051,13 +1466,16 @@ export class ChannelRegistry {
         // channel decided open (or tuned out) is opened at its new target.
         if (!sameChannelTarget(existing.descriptor, channel)) {
           this.invalidateTransportConfirmation(existing);
+          this.untargetedPushEntries.delete(existing);
           // An operation queued or running for this channel reads its target
           // again before it confirms anything, and after a failed RPC, so it
-          // opens the new one. With none, a channel decided open (or tuned
-          // out) is reconciled here.
+          // opens the new one, unless it was queued before its server's
+          // registrations were last removed: that one cancels when it would
+          // run. So a channel decided open (or tuned out) is reconciled here
+          // unless work queued since then is outstanding.
           const desired = this.getDesiredState(serverId, channel.id);
           if ((desired === 'open' || desired === 'tuned-out') &&
-              !this.lifecycleOutstanding.has(this.lifecycleKey(serverId, channel.id))) {
+              !this.outstandingWorkCarriesOut(serverId, this.lifecycleKey(serverId, channel.id))) {
             retargeted.push(channel);
           }
         }
@@ -1183,17 +1601,6 @@ export class ChannelRegistry {
       // inline base64) is allocation and parsing work done for a message
       // that must be rejected (Sol, PR #79 re-review blocker 2).
 
-      // Lazy-register the channel if we've never seen it. A channel can deliver
-      // an incoming message before its channels/register (boot enumeration) or
-      // channels/changed (post-boot create / View-permission grant) round-trip
-      // lands — or the registration event can be missed entirely (e.g. the bot
-      // gains visibility in a way that fires neither `channelCreate` nor a
-      // View-permission transition). Without a registry entry, routeSpeech()
-      // can't resolve this channel as an outbound locus and the agent's reply
-      // is silently dropped, even though this very message proves the channel
-      // is reachable. The inbound message carries enough to make it publishable,
-      // so register it here; a later authoritative channels/register or
-      // channels/changed will overwrite this descriptor with the richer one.
       // §14.5: channels/incoming is validated against the ACTUALLY
       // REGISTERED channel. An unknown claimed channelId is rejected
       // per-message with an itemized result — never minted by its first
@@ -1201,8 +1608,8 @@ export class ChannelRegistry {
       // self-attest a channel identity without ever passing
       // channels/register authorization). A server whose channel genuinely
       // exists registers it first; discord's DM case goes through
-      // ensureChannelRegistered on push/event, which creates a CLOSED
-      // routable entry rather than an open self-attested one.
+      // ensureChannelRegistered on push/event, which creates a routable
+      // entry that isn't open, rather than an open self-attested one.
       const incomingKey = `${serverId}:${message.channelId}`;
       if (!this.channels.has(incomingKey)) {
         // Loud, coalesced or not, like every other refusal of a message, but
@@ -1290,26 +1697,31 @@ export class ChannelRegistry {
           this.defaultPublishMessageId = message.messageId;
           this.defaultPublishThreadId = message.threadId;
         }
-        // Where the host directs this server's lifecycle, only a receipt for
-        // the current target confirms it: traffic shows the transport open
-        // only for a confirmed target, and only for a channel still decided
-        // open or tuned out. After a retarget, traffic for this id may still
-        // come from the old subscription, and a close receipt that landed
-        // first (or during the coalescer's await) stands. Where the host
-        // doesn't direct it, the server opens its own channels and its
-        // traffic is the only evidence the host gets, so it marks the
+        // Where the host directs this server's lifecycle, traffic shows the
+        // transport open only for a channel still decided open or tuned out,
+        // and, but for one exception, only for a confirmed target: after a
+        // retarget, traffic for this id may still come from the old
+        // subscription, and a close receipt that landed first (or during the
+        // coalescer's await) stands. The exception is an entry made from a
+        // push that no update has given a target (untargetedPushEntries):
+        // there's no earlier target its traffic could come from, so for the
+        // receipt rule's own reason its traffic shows the transport open. It
+        // stops being one when a registration replaces it (registerEntry) or
+        // a channels/changed update gives it a target (handleChanged's
+        // retarget), and the receipt rule holds from then. Where the host
+        // doesn't direct the lifecycle, the server opens its own channels and
+        // its traffic is the only evidence the host gets, so it marks the
         // channel open, as it always has. The entry is the one the message
         // was accepted for: one a re-registration put in its place meanwhile
         // waits for its own evidence. Durable desired state still changes
         // exclusively through lifecycle operations. A marker is evidence like
         // any other message.
         if (this.directsLifecycle(serverId)) {
-          if (this.unconfirmedChannelTargets.has(incomingEntry)) return;
+          if (this.unconfirmedChannelTargets.has(incomingEntry) && !this.untargetedPushEntries.has(incomingEntry)) return;
           const desired = this.getDesiredState(serverId, message.channelId);
           if (desired !== 'open' && desired !== 'tuned-out') return;
-        } else {
-          this.unconfirmedChannelTargets.delete(incomingEntry);
         }
+        this.unconfirmedChannelTargets.delete(incomingEntry);
         incomingEntry.open = true;
       };
       if (!coalesced) markAccepted();
@@ -1412,15 +1824,17 @@ export class ChannelRegistry {
    * locus. A push event from a closed channel must never mutate lifecycle
    * state: direct-address events are intentionally usable without subscribing.
    *
-   * Mirrors the lazy-registration inside handleIncoming(), but for channels
-   * that only ever arrive as push/events rather than channels/incoming — the
-   * motivating case is Discord DMs, which discord-mcpl forwards via push/event
-   * with the channel closed (`channelIsOpen:false`). Such a channel is never
-   * registered, so routeSpeech() can't resolve it and the agent's reply is
-   * silently dropped even though the inbound message proves the channel is
-   * reachable (item-3 redux, DM sub-case). Idempotent: a later authoritative
-   * channels/register or channels/changed overwrites this descriptor with the
-   * richer one.
+   * For channels that only ever arrive as push/events rather than
+   * channels/incoming — the motivating case is Discord DMs, which
+   * discord-mcpl forwards via push/event with the channel closed
+   * (`channelIsOpen:false`). Such a channel is never registered, so
+   * routeSpeech() can't resolve it and the agent's reply is silently dropped
+   * even though the inbound message proves the channel is reachable (item-3
+   * redux, DM sub-case). Its entry starts with its transport unknown, as a
+   * registration's does. Its traffic shows it open, for a channel decided
+   * open or tuned out, until an update gives it a target (handleIncoming).
+   * Idempotent: a later authoritative channels/register or channels/changed
+   * overwrites this descriptor with the richer one.
    */
   ensureChannelRegistered(
     serverId: string,
@@ -1434,7 +1848,7 @@ export class ChannelRegistry {
       // arrived with no label/recipient info gets a usable name the next
       // time a message reveals it (labels must show people, not ids).
       if (
-        (existing.descriptor.metadata as { lazyRegistered?: boolean } | undefined)?.lazyRegistered &&
+        pushPlaceholder(existing) &&
         label && existing.descriptor.label === channelId
       ) {
         const metadata = extraMetadata
@@ -1465,18 +1879,19 @@ export class ChannelRegistry {
     // label to record. A real label is recorded before the entry exists:
     // an append that throws registers nothing, so the next push tries again.
     if (label) this.appendLabelSighting(channelId, label, extractDmMeta(extraMetadata));
-    const key = `${serverId}:${channelId}`;
-    this.channels.set(key, {
-      serverId,
-      descriptor: {
-        id: channelId,
-        type: serverId,
-        label: label ?? channelId,
-        direction: 'bidirectional',
-        metadata: { lazyRegistered: true, ...(extraMetadata ?? {}) },
-      },
-      open: false,
+    // Its transport is as unknown as a registration's (registerEntry). After
+    // a restart, a push for a channel no registration has comes here, and
+    // the server may still hold a channel an earlier process opened. Counting
+    // it confirmed closed would answer a close or a decline as already done
+    // and send nothing, even where the server still delivers.
+    const entry = this.registerEntry(`${serverId}:${channelId}`, serverId, {
+      id: channelId,
+      type: serverId,
+      label: label ?? channelId,
+      direction: 'bidirectional',
+      metadata: { lazyRegistered: true, ...(extraMetadata ?? {}) },
     });
+    this.untargetedPushEntries.add(entry);
     this.emitTraceFn({
       type: 'mcpl:channel-lazy-registered',
       serverId,
@@ -1607,7 +2022,7 @@ export class ChannelRegistry {
    */
   isDeclaredChannel(serverId: string, channelId: string): boolean {
     const entry = this.channels.get(`${serverId}:${channelId}`);
-    return !!entry && !(entry.descriptor.metadata as { lazyRegistered?: boolean } | undefined)?.lazyRegistered;
+    return !!entry && !pushPlaceholder(entry);
   }
 
   getDescriptor(channelId: string): ChannelDescriptor | undefined {
@@ -1714,7 +2129,13 @@ export class ChannelRegistry {
         return this.handleToolSkipReply(input as { reason?: string; wake_in_seconds?: unknown });
 
       default:
-        return { success: false, error: `Unknown channel tool: ${toolName}`, isError: true };
+        // Not every agent is given every channel tool, so the refusal points
+        // to the ones this agent has rather than listing them all.
+        return {
+          success: false,
+          error: `There's no channel tool "${toolName}", so nothing ran. Use one of the channel tools you were given.`,
+          isError: true,
+        };
     }
   }
 
@@ -1796,7 +2217,7 @@ export class ChannelRegistry {
    */
   removeServer(serverId: string): void {
     // Every lifecycle operation queued for this server is cancelled when it
-    // would run (ChannelLifecycleCancelledError), so none acts on a closing
+    // would run (a ChannelLifecycleError of kind `cancelled`), so none acts on a closing
     // connection or on a later re-registration's entries.
     this.serverRemovals.set(serverId, (this.serverRemovals.get(serverId) ?? 0) + 1);
     for (const [key, entry] of this.channels) {
@@ -1888,7 +2309,9 @@ export class ChannelRegistry {
   /**
    * Each writer appends its record here before it changes memory for it, so
    * an append that throws, as on a full disk, fails the operation with that
-   * change unmade, and memory and the log still agree. A retry then records
+   * change unmade, and memory and the log still agree. A record that changes
+   * no memory, as a decline's of the invitation it declined, is its
+   * caller's to handle (handleToolDecline). A retry then records
    * the change rather than finding it in memory already, where
    * setDesiredState's same-state return would record nothing, and a restart
    * replays what memory held. appendLabelSighting keeps the same order for
@@ -2236,7 +2659,20 @@ export class ChannelRegistry {
     source: string,
   ): void {
     const key = this.lifecycleKey(serverId, channelId);
-    if (this.desiredStates.get(key)?.state === desired) return;
+    const current = this.desiredStates.get(key);
+    // A decision that records the state already on record changes nothing,
+    // so it writes nothing, unless it's the agent's own (channel_open,
+    // channel_close or channel_decline) and the record isn't. The record
+    // then says the agent decided, which is all handleToolClose's
+    // explicit-open guard and ensureInitialDesiredState's lift of a default
+    // ask of it. openChannelNow depends on it too: a failed open by speech
+    // or a reply tells a decision made during its round-trip by the record
+    // no longer being the object it wrote, and the agent's channel_open,
+    // the only decision of the same state that can be made then, gets a new
+    // record here.
+    if (current?.state === desired && !(AGENT_DECISION_SOURCES.has(source) && !AGENT_DECISION_SOURCES.has(current.source))) {
+      return;
+    }
     this.appendLifecycleEvent({
       kind: 'desired-state',
       serverId,
@@ -2393,7 +2829,7 @@ export class ChannelRegistry {
     // it awaits: the channel may be removed while the reply is pending.
     const serverId = this.findChannelEntry(channelId)?.serverId ?? '';
     const seen: { outcome?: PublishOutcome } = {};
-    const result = await this.handleToolPublish({ channelId, content: text }, undefined, seen);
+    const result = await this.handleToolPublish({ channelId, content: text }, undefined, seen, 'speak_in_channel');
     if (seen.outcome?.status === 'delivered') {
       this.emitTraceFn({
         type: 'mcpl:speech-routed',
@@ -2518,6 +2954,7 @@ export class ChannelRegistry {
     const removals = this.serverRemovals.get(serverId) ?? 0;
     const previous = this.channelLifecycleTails.get(lifecycleKey) ?? Promise.resolve();
     this.lifecycleOutstanding.set(lifecycleKey, (this.lifecycleOutstanding.get(lifecycleKey) ?? 0) + 1);
+    this.lifecycleQueuedRemovals.set(lifecycleKey, removals);
     const operation = previous.catch(() => {}).then(
       () => this.runLifecycleOperation(serverId, channelId, removals, options),
     );
@@ -2547,17 +2984,14 @@ export class ChannelRegistry {
       let attempts = 0;
       for (;;) {
         if ((this.serverRemovals.get(serverId) ?? 0) !== removals) {
-          throw new ChannelLifecycleCancelledError(
-            `Channel ${channelId}: its server's registrations were removed while this operation was queued`,
+          throw new ChannelLifecycleError(
+            `this host disconnected the "${serverId}" server while the change was being made`, 'cancelled',
           );
         }
         const entry = this.channels.get(channelKey);
-        if (!entry) throw new Error(`Channel is no longer registered: ${channelId}`);
+        if (!entry) throw new ChannelLifecycleError(`the "${serverId}" server no longer lists the channel`, 'unlisted');
         const server = this.serverRegistry.getServer(serverId);
-        if (!server) throw new Error(`Server not found: ${serverId}`);
-        if (!CapabilityGrant.of(server).has('channels.lifecycle')) {
-          throw new Error(`channels.lifecycle not in "${serverId}"'s effective grant (§14.1)`);
-        }
+        if (!server || !CapabilityGrant.of(server).has('channels.lifecycle')) throw this.lifecycleRefusal(serverId);
         const descriptor = entry.descriptor;
         const desired = this.getDesiredState(serverId, channelId);
         const open = desired === 'open' || desired === 'tuned-out';
@@ -2569,8 +3003,10 @@ export class ChannelRegistry {
         // target's RPC was answered or failed), or a receipt for this very
         // target.
         if (attempts >= MAX_CHANNEL_LIFECYCLE_ATTEMPTS) {
-          const error = new ChannelLifecycleConvergenceError(
-            `Channel ${channelId} did not converge after ${attempts} lifecycle attempts; its target or desired state kept changing`,
+          const error = new ChannelLifecycleError(
+            `the channel's address at the "${serverId}" server, or the decision about it, kept changing, and ${attempts} tries ` +
+            "didn't settle it",
+            'converge',
           );
           this.emitTraceFn({
             type: 'mcpl:channel-reconcile-failed',
@@ -2645,10 +3081,11 @@ export class ChannelRegistry {
         // its sends either.
         if (substitute !== undefined) {
           this.invalidateTransportConfirmation(entry);
-          throw new ChannelOpenSubstitutionError(
-            `Server "${serverId}" answered channels/open for ${channelId} with ` +
-            (substitute.kind === 'other' ? 'a different channel' : 'a channel id that is not a string') +
-            `; ${channelId} is not marked open, and nothing in the answer is used`,
+          throw new ChannelLifecycleError(
+            `the "${serverId}" server answered for ` +
+            (substitute.kind === 'other' ? 'a different channel' : 'a channel whose id isn\'t a string') +
+            ', so nothing in its answer is used',
+            'substituted',
           );
         }
         if (open) this.applyOpenDeclaration(entry, result);
@@ -2663,8 +3100,25 @@ export class ChannelRegistry {
       // on, nothing it does will open a new target.
       const left = (this.lifecycleOutstanding.get(lifecycleKey) ?? 1) - 1;
       if (left > 0) this.lifecycleOutstanding.set(lifecycleKey, left);
-      else this.lifecycleOutstanding.delete(lifecycleKey);
+      else {
+        this.lifecycleOutstanding.delete(lifecycleKey);
+        this.lifecycleQueuedRemovals.delete(lifecycleKey);
+      }
     }
+  }
+
+  /** Whether lifecycle work already outstanding for the channel will carry out
+   *  its current decision: some is, and the newest was queued since its
+   *  server's registrations were last removed, so it won't cancel when it
+   *  would run. Each operation reads the decision when it runs. It answers for
+   *  now: a removal after it cancels that work too, and takes the channel's
+   *  entry with it, so the channel's next registration by channels/register,
+   *  or as added by channels/changed, carries the decision out, where this
+   *  host directs the lifecycle then. A push's registration
+   *  (ensureChannelRegistered) queues no lifecycle work. */
+  private outstandingWorkCarriesOut(serverId: string, key: string): boolean {
+    return this.lifecycleOutstanding.has(key) &&
+      this.lifecycleQueuedRemovals.get(key) === (this.serverRemovals.get(serverId) ?? 0);
   }
 
   /**
@@ -2679,15 +3133,27 @@ export class ChannelRegistry {
   private closeSubstitutedChannel(serverId: string, channelId: string): void {
     if (!this.channels.has(`${serverId}:${channelId}`)) return;
     if (this.getDesiredState(serverId, channelId) !== 'closed') return;
+    this.applyThroughQueue(serverId, channelId);
+  }
+
+  /**
+   * Carry out a channel's decision through its lifecycle queue, for a
+   * transport the server may have opened without the host's knowing: one it
+   * opened for another channel's request (closeSubstitutedChannel), or one a
+   * failed open's request may have reached (openChannelNow). The decision is
+   * a closed one, except after a failed open whose put-back the server's
+   * latest announcement or the policy lifted. A failure is reported as a
+   * trace; the decision stands.
+   */
+  private applyThroughQueue(serverId: string, channelId: string): void {
     this.applyDesiredChannelState(serverId, channelId).catch((err) => {
       // Removal while queued is cancellation, as in reconcileChannels, and
       // exhausted convergence emitted its own diagnostic.
       if (!this.channels.has(`${serverId}:${channelId}`) ||
-          err instanceof ChannelLifecycleCancelledError ||
-          err instanceof ChannelLifecycleConvergenceError) return;
+          (err instanceof ChannelLifecycleError && (err.kind === 'cancelled' || err.kind === 'converge'))) return;
       this.emitTraceFn({
         type: 'mcpl:channel-reconcile-failed',
-        serverId, channelId, desired: 'closed', error: (err as Error).message,
+        serverId, channelId, desired: this.getDesiredState(serverId, channelId), error: (err as Error).message,
       });
     });
   }
@@ -2701,16 +3167,21 @@ export class ChannelRegistry {
    */
   private async waitForOpenChannel(entry: ChannelEntry): Promise<ChannelEntry> {
     const lifecycleKey = this.lifecycleKey(entry.serverId, entry.descriptor.id);
+    // The failure of the last work waited on, if it failed, which says why a
+    // channel it left unopened isn't open.
+    let failed: unknown;
     for (;;) {
       const pending = this.channelLifecycleTails.get(lifecycleKey);
       if (!pending) break;
       try {
         await pending;
+        failed = undefined;
       } catch (error) {
         // A redundant backscroll failure can leave a known-open channel
         // usable. Exhausted convergence is different: it never established
         // the current target, so joined delivery must fail visibly.
-        if (error instanceof ChannelLifecycleConvergenceError) throw error;
+        if (error instanceof ChannelLifecycleError && error.kind === 'converge') throw error;
+        failed = error;
       }
       // A settled tail releases its own key. One still current after it
       // settled would be awaited again without ever yielding to the event
@@ -2718,9 +3189,18 @@ export class ChannelRegistry {
       if (this.channelLifecycleTails.get(lifecycleKey) === pending) break;
     }
     const current = this.channels.get(`${entry.serverId}:${entry.descriptor.id}`);
-    if (!current) throw new Error('Channel registration was removed while delivery waited');
-    if (!current.open || this.closeStands(current)) {
-      throw new Error('Channel is not confirmed open for delivery, or was selected for closure while delivery waited');
+    if (!current) throw new ChannelLifecycleError(CHANNEL_REMOVED_CLAUSE, 'removed');
+    // A close that stands is what the words met, whatever became of an open,
+    // and whether or not the close itself took: one that failed may have
+    // left the transport open.
+    if (this.closeStands(current)) {
+      throw new ChannelLifecycleError('a decision to close the channel came before these words went out', 'not-open');
+    }
+    if (!current.open) {
+      throw new ChannelLifecycleError(
+        "the channel isn't confirmed open" + (failed !== undefined ? `: ${lifecycleClause(failed)}${refusalRemedy(failed)}` : ''),
+        'not-open',
+      );
     }
     return current;
   }
@@ -2785,9 +3265,8 @@ export class ChannelRegistry {
         // Exhausted convergence and a substituted answer already emitted
         // their own diagnostics.
         if (!this.channels.has(`${serverId}:${channel.id}`) ||
-            err instanceof ChannelLifecycleCancelledError ||
-            err instanceof ChannelLifecycleConvergenceError ||
-            err instanceof ChannelOpenSubstitutionError) return;
+            (err instanceof ChannelLifecycleError &&
+              (err.kind === 'cancelled' || err.kind === 'converge' || err.kind === 'substituted'))) return;
         this.emitTraceFn({
           type: 'mcpl:channel-reconcile-failed',
           serverId,
@@ -2865,19 +3344,28 @@ export class ChannelRegistry {
     channelId: string,
     serverId?: string,
   ): { entry?: ChannelEntry; error?: string } {
-    const matches = [...this.channels.values()].filter(
-      (entry) => entry.descriptor.id === channelId && (!serverId || entry.serverId === serverId),
-    );
+    const withId = [...this.channels.values()].filter((entry) => entry.descriptor.id === channelId);
+    const matches = withId.filter((entry) => !serverId || entry.serverId === serverId);
     if (matches.length === 0) {
+      if (serverId && withId.length > 0) {
+        // Leaving serverId out works only when one server has the id.
+        const servers = withId.map((entry) => `"${entry.serverId}"`);
+        return {
+          error: `No channel "${channelId}" is on server "${serverId}", so nothing ran. ` + (servers.length === 1
+            ? `It's on server ${servers[0]}: call again with serverId ${servers[0]}, or leave serverId out.`
+            : `It's on servers ${servers.join(', ')}: call again with serverId set to one of them.`),
+        };
+      }
       return {
         error: serverId
-          ? `Channel not found: ${channelId} on server ${serverId}`
-          : `Channel not found: ${channelId}`,
+          ? `No channel "${channelId}" is on server "${serverId}", so nothing ran. channel_list shows the channels and their servers.`
+          : `No channel has the id "${channelId}", so nothing ran. channel_list shows the channel ids.`,
       };
     }
     if (matches.length > 1) {
       return {
-        error: `Channel id is ambiguous across MCPL servers: ${channelId}. Include serverId.`,
+        error: `Channel "${channelId}" is on more than one server (${matches.map((entry) => `"${entry.serverId}"`).join(', ')}), ` +
+          'so nothing ran. Call again with serverId set to one of them.',
       };
     }
     return { entry: matches[0] };
@@ -2937,10 +3425,25 @@ export class ChannelRegistry {
    * into a closed locus, an explicit send into a closed channel — comes
    * here. Reconciliation queues that work directly, as the closes do
    * (channel_close, a decline, and the close of a substituted channel).
-   * Desired state is recorded BEFORE the server round-trip: intent sticks
-   * even if the subscribe fails, and reconciliation retries later.
-   * Automatic delivery needs open transport, not a change of attention:
-   * preserve tune-out epochs both before and during the round-trip.
+   * Desired state is recorded BEFORE the server round-trip. The agent's own
+   * open is a decision about the channel: it sticks even if the subscribe
+   * fails, and reconciliation retries later. An open by speech or a reply is
+   * incidental to its words: when its round-trip fails, the decision it
+   * wrote goes back to the one it replaced, so the agent, told the channel
+   * is closed and the open failed, isn't later put into it by that decision.
+   * That holds only while the record is still the one it wrote: a decision
+   * made meanwhile stands, and the failure then comes as `overtaken`
+   * (ChannelLifecycleError). Where the decision put back is a pure default,
+   * nobody had decided, so the channel then follows its server's latest
+   * announcement and the policy: a re-announcement during the round-trip
+   * found the open's own record and lifted nothing. If they select it for
+   * opening, the failure says so (`selected-again`). And since
+   * a failed request may have reached the server, the decision that stands
+   * is carried out on the wire too. An open by speech or a reply that can't
+   * send its request, on a server without channels.lifecycle, writes
+   * nothing. Automatic delivery needs open transport, not a change of
+   * attention: preserve tune-out epochs both before and during the
+   * round-trip.
    *
    * `opened` says whether this call turned a closed channel open, which is
    * what the delivery and reply notices tell the resident. Reconfirming the
@@ -2952,17 +3455,115 @@ export class ChannelRegistry {
     history?: ChannelHistoryRequest,
   ): Promise<{ result: ChannelsOpenResult; opened: boolean }> {
     const transportOnly = source !== 'agent-tool';
+    const key = this.lifecycleKey(entry.serverId, entry.descriptor.id);
+    if (transportOnly) {
+      // Without channels.lifecycle the open fails before any request leaves
+      // (§14.1), as it does without the server, so an incidental open would
+      // only write a decision to put back. It writes none.
+      const server = this.serverRegistry.getServer(entry.serverId);
+      if (!server || !CapabilityGrant.of(server).has('channels.lifecycle')) throw this.lifecycleRefusal(entry.serverId);
+    }
+    // The decision this open replaces. A channel with none on record, as one
+    // registered from a push, was closed by default: nobody had decided.
+    const replaced = this.desiredStates.get(key) ?? { state: 'closed' as const, source: 'default-closed' };
     const before = this.getDesiredState(entry.serverId, entry.descriptor.id);
     const opened = before !== 'open' && before !== 'tuned-out';
     if (!transportOnly || before !== 'tuned-out') {
-      this.setDesiredState(entry.serverId, entry.descriptor.id, 'open', source);
+      // A decision the log refused changed nothing, and its words say so
+      // rather than read as one a later decision overtook.
+      try {
+        this.setDesiredState(entry.serverId, entry.descriptor.id, 'open', source);
+      } catch (err) {
+        throw unrecordedDecision(err);
+      }
     }
-    const applied = await this.applyDesiredChannelState(entry.serverId, entry.descriptor.id, { history });
-    const desired = this.getDesiredState(entry.serverId, entry.descriptor.id);
-    if (!applied.open || (desired !== 'open' && !(transportOnly && desired === 'tuned-out'))) {
-      throw new Error('Channel open was superseded by a newer lifecycle decision');
+    // The record an incidental open wrote, to put back if its round-trip fails.
+    const wrote = transportOnly && opened ? this.desiredStates.get(key) : undefined;
+    try {
+      const applied = await this.applyDesiredChannelState(entry.serverId, entry.descriptor.id, { history });
+      const desired = this.getDesiredState(entry.serverId, entry.descriptor.id);
+      if (!applied.open || (desired !== 'open' && !(transportOnly && desired === 'tuned-out'))) {
+        throw new ChannelLifecycleError(supersededClause('open', desired), 'superseded');
+      }
+      return { result: applied.result!, opened };
+    } catch (err) {
+      if (wrote && this.desiredStates.get(key) !== wrote) {
+        // That decision stands, and the failure says so where its own clause
+        // doesn't, as a superseded open's does. What helps turns on that
+        // decision, so no step is offered.
+        const own = lifecycleClause(err);
+        throw new ChannelLifecycleError(
+          err instanceof ChannelLifecycleError && err.kind === 'superseded'
+            ? own : afterClause(own, 'a decision about the channel made while the open was out stands'),
+          'overtaken',
+          undefined,
+          { cause: err },
+        );
+      }
+      if (wrote) {
+        try {
+          this.setDesiredState(entry.serverId, entry.descriptor.id, replaced.state, replaced.source);
+        } catch (putBackErr) {
+          // The caller reports both: the channel isn't open, but it stays
+          // selected for opening, so reconciliation may open it later.
+          throw new ChannelLifecycleError(
+            afterClause(lifecycleClause(err), 'the channel stays selected for opening, as this host couldn\'t record ' +
+              `undoing that: ${requestErrorText(putBackErr)}`),
+            'put-back-unrecorded',
+            undefined,
+            { cause: err },
+          );
+        }
+        // The decision put back is a closed one: an open that turned the
+        // channel open replaced no open decision. Where it's a pure default,
+        // nobody had decided, so the channel follows its server's latest
+        // announcement and the policy, not the ones from before the open: a
+        // re-announcement during the round-trip found the open's own record
+        // and lifted nothing. The lift is ensureInitialDesiredState's own,
+        // which leaves every real decision alone. One that can't be recorded
+        // leaves the default, closed.
+        const current = this.channels.get(`${entry.serverId}:${entry.descriptor.id}`);
+        let selectedAgain: Exclude<SelectedForOpening, 'unrecorded'> | undefined;
+        if (current) {
+          try {
+            this.ensureInitialDesiredState(entry.serverId, current.descriptor);
+          } catch (liftErr) {
+            console.error(
+              `[channel] ${entry.serverId}:${logValue(entry.descriptor.id)}: the lift after a failed open couldn't be recorded:`,
+              liftErr,
+            );
+          }
+          const now = this.desiredStates.get(key);
+          if (now?.state === 'open' && (now.source === 'server-bootstrap' || now.source === 'subscription-policy')) {
+            selectedAgain = now.source;
+          }
+        }
+        // The failed request may have reached the server, so the decision
+        // that stands is carried out through the queue, as a decline's close
+        // is, unless other lifecycle work for the channel is queued that will
+        // carry it out anyway: work queued before its server's registrations
+        // were removed cancels instead. (An incidental open gets here only
+        // where the host directed the lifecycle when it opened: see the grant
+        // check above. Where the grant has lost channels.lifecycle since, as a
+        // transport drop clears it, the queued work fails for it, and the
+        // channel's next registration by channels/register, or as added by
+        // channels/changed, carries the decision out, where this host directs
+        // the lifecycle then.)
+        if (current && !this.outstandingWorkCarriesOut(entry.serverId, key)) {
+          this.applyThroughQueue(entry.serverId, entry.descriptor.id);
+        }
+        if (selectedAgain) {
+          throw new ChannelLifecycleError(
+            afterClause(lifecycleClause(err), 'the channel is selected for opening again, as ' +
+              (selectedAgain === 'server-bootstrap' ? 'its server announces it open' : 'the subscription policy admits it')),
+            'selected-again',
+            undefined,
+            { by: selectedAgain, cause: err },
+          );
+        }
+      }
+      throw err;
     }
-    return { result: applied.result!, opened };
   }
 
   /**
@@ -3195,7 +3796,17 @@ export class ChannelRegistry {
    * engaging a channel opens it, so typing indicators, reaction machinery,
    * and inbound forwarding all come alive with the first outbound message.
    * Accepts composite MCPL ids or raw server-internal ids (explicit send
-   * tools receive whatever the agent typed).
+   * tools receive whatever the agent typed). An `open-failed` answer says
+   * whether the open that failed was one that would have opened a channel
+   * not selected open (`opening`), as opposed to one reconfirming the
+   * transport of a channel already selected open or tuned out. It isn't one
+   * either where a decision made during its round-trip replaced it
+   * (`overtaken`), or where queued lifecycle work left the
+   * channel closed before any open was sent. `selectedForOpening` says the
+   * channel is selected for opening after the failure, and why: the put-back
+   * couldn't be recorded (`put-back-unrecorded`), or the server's latest
+   * announcement or the policy lifted the default it restored
+   * (`selected-again`).
    */
   async openIfClosedForSend(
     rawChannelId: string,
@@ -3204,6 +3815,8 @@ export class ChannelRegistry {
     status: 'opened' | 'already-open' | 'unknown-channel' | 'ambiguous' | 'open-failed';
     channelId?: string;
     label?: string;
+    opening?: boolean;
+    selectedForOpening?: SelectedForOpening;
   }> {
     let matches = [...this.channels.values()].filter(
       (e) => e.descriptor.id === rawChannelId && (!serverId || e.serverId === serverId),
@@ -3218,6 +3831,7 @@ export class ChannelRegistry {
     if (matches.length === 0) return { status: 'unknown-channel' };
     if (matches.length > 1) return { status: 'ambiguous' };
     let entry = matches[0]!;
+    let opening = false;
     try {
       if (this.hasPendingLifecycle(entry)) {
         entry = await this.waitForOpenChannel(entry);
@@ -3226,6 +3840,7 @@ export class ChannelRegistry {
       if (entry.open && (desired === 'open' || desired === 'tuned-out')) {
         return { status: 'already-open', channelId: entry.descriptor.id, label: entry.descriptor.label };
       }
+      opening = desired !== 'open' && desired !== 'tuned-out';
       const { opened } = await this.openChannelNow(entry, 'opened-by-reply');
       entry = await this.waitForOpenChannel(entry);
       if (opened) {
@@ -3237,6 +3852,10 @@ export class ChannelRegistry {
       }
       return { status: opened ? 'opened' : 'already-open', channelId: entry.descriptor.id, label: entry.descriptor.label };
     } catch (err) {
+      // Where a decision made during the open's round-trip replaced it, such
+      // as the agent's own close or channel_open, the channel is as that
+      // decision left it, and the agent isn't told the open failed.
+      if (err instanceof ChannelLifecycleError && err.kind === 'overtaken') opening = false;
       this.emitTraceFn({
         type: 'mcpl:channel-open-failed',
         serverId: entry.serverId,
@@ -3244,7 +3863,11 @@ export class ChannelRegistry {
         error: (err as Error).message,
       });
       const current = this.channels.get(`${entry.serverId}:${entry.descriptor.id}`);
-      return { status: 'open-failed', channelId: entry.descriptor.id,
+      return { status: 'open-failed', channelId: entry.descriptor.id, opening,
+        // Where the channel is selected for opening after the failure, the
+        // agent is told so and why, as speech's failure says.
+        ...(err instanceof ChannelLifecycleError && err.kind === 'put-back-unrecorded' ? { selectedForOpening: 'unrecorded' as const } : {}),
+        ...(err instanceof ChannelLifecycleError && err.kind === 'selected-again' ? { selectedForOpening: err.by } : {}),
         ...(current ? { label: current.descriptor.label } : {}) };
     }
   }
@@ -3276,15 +3899,28 @@ export class ChannelRegistry {
         success: false,
         isError: true,
         error:
-          `Channel ${input.channelId} is tuned out. Cancel the tune-out ` +
-          `(tune_out with mode: 'cancel') to resume normal attention — ` +
-          `cancelling delivers the diverted backlog.`,
+          `Channel "${input.channelId}" is tuned out: its messages go to the subconscious, and channel_open doesn't change ` +
+          `that. Call tune_out with channelId "${input.channelId}" and mode "cancel" for it to resume normal attention; ` +
+          'cancelling delivers the diverted backlog.',
         data: { refusal: 'tuned-out', channelId: input.channelId },
       };
     }
 
     const alreadyDesiredOpen = this.getDesiredState(entry.serverId, input.channelId) === 'open';
     if (entry.open && alreadyDesiredOpen && !input.backscroll && !this.hasPendingLifecycle(entry)) {
+      // Open already, perhaps because speech, a reply, the server or a
+      // policy opened it: the agent's open is still its decision, and is
+      // recorded as one (setDesiredState), so the explicit-open guard of
+      // handleToolClose reads it.
+      try {
+        this.setDesiredState(entry.serverId, input.channelId, 'open', 'agent-tool');
+      } catch (err) {
+        return {
+          success: false,
+          error: `Channel ${input.channelId} is already open, but recording your decision to open it failed: ${(err as Error).message}`,
+          isError: true,
+        };
+      }
       return {
         success: true,
         data: { channelId: input.channelId, status: 'already open' },
@@ -3310,17 +3946,12 @@ export class ChannelRegistry {
       };
     } catch (err) {
       // The decision was recorded before the round-trip and outlives its
-      // failure. Say so: otherwise a later delivery that opens the channel
-      // would be the resident's first sign that it was still wanted open.
-      const current = this.channels.get(`${entry.serverId}:${input.channelId}`);
-      const stillSelected = current !== undefined && !current.open &&
-        this.getDesiredState(entry.serverId, input.channelId) === 'open';
+      // failure. The text says so where it stands: otherwise a later
+      // delivery that opens the channel would be the resident's first sign
+      // that it was still wanted open.
       return {
         success: false,
-        error: `Failed to open channel: ${(err as Error).message}` +
-          (stillSelected
-            ? ' (it stays selected for opening: a later delivery or reconnect tries again, and channel_close withdraws that)'
-            : ''),
+        error: this.lifecycleFailureText('open', entry, err, { history: !!input.backscroll }),
         isError: true,
       };
     }
@@ -3355,15 +3986,6 @@ export class ChannelRegistry {
       };
     }
 
-    const alreadyDesiredClosed = this.getDesiredState(entry.serverId, input.channelId) === 'closed';
-    if (!entry.open && alreadyDesiredClosed && !this.hasPendingLifecycle(entry) &&
-        !this.unconfirmedChannelTargets.has(entry)) {
-      return {
-        success: true,
-        data: { channelId: input.channelId, status: 'already closed' },
-      };
-    }
-
     // Provenance comes from trusted dispatch, not from self-description:
     // only module-origin calls may record a machine source, and only from
     // the closed vocabulary. Agent-origin (or origin-less — the safe
@@ -3382,6 +4004,27 @@ export class ChannelRegistry {
         };
       }
       closeSource = input.source;
+    }
+
+    const alreadyDesiredClosed = this.getDesiredState(entry.serverId, input.channelId) === 'closed';
+    if (!entry.open && alreadyDesiredClosed && !this.hasPendingLifecycle(entry) &&
+        !this.unconfirmedChannelTargets.has(entry)) {
+      // Closed already, perhaps only by default: the agent's close is still
+      // its decision, and is recorded as one (setDesiredState), so a later
+      // registration's lift of a default leaves the channel closed.
+      try {
+        this.setDesiredState(entry.serverId, input.channelId, 'closed', closeSource);
+      } catch (err) {
+        return {
+          success: false,
+          error: `Channel ${input.channelId} is already closed, but recording the decision to close it failed: ${(err as Error).message}`,
+          isError: true,
+        };
+      }
+      return {
+        success: true,
+        data: { channelId: input.channelId, status: 'already closed' },
+      };
     }
 
     // Housekeeping must not override stated intent (issue #5: GC closes wore
@@ -3406,40 +4049,30 @@ export class ChannelRegistry {
       }
     }
 
-    this.setDesiredState(entry.serverId, input.channelId, 'closed', closeSource);
+    // A decision the log refused changed nothing, and the answer says so.
+    try {
+      this.setDesiredState(entry.serverId, input.channelId, 'closed', closeSource);
+    } catch (err) {
+      return { success: false, error: this.lifecycleFailureText('close', entry, unrecordedDecision(err)), isError: true };
+    }
     this.stopTyping(input.channelId);
 
-    const server = this.serverRegistry.getServer(entry.serverId);
-    if (!server) {
-      return {
-        success: false,
-        error: `Server not found: ${entry.serverId}`,
-        isError: true,
-      };
+    // Refused now, the close stays recorded for the server's next
+    // registration, and the text says so.
+    if (!this.directsLifecycle(entry.serverId)) {
+      return { success: false, error: this.lifecycleFailureText('close', entry, this.lifecycleRefusal(entry.serverId)), isError: true };
     }
 
     try {
-      if (!CapabilityGrant.of(server).has('channels.lifecycle')) {
-        return {
-          success: false,
-          error: `channels.lifecycle not in "${entry.serverId}"'s effective grant (§14.1)`,
-          isError: true,
-        };
-      }
       const applied = await this.applyDesiredChannelState(entry.serverId, input.channelId);
-      if (applied.open || this.getDesiredState(entry.serverId, input.channelId) !== 'closed') {
-        throw new Error('Channel close was superseded by a newer lifecycle decision');
-      }
+      const now = this.getDesiredState(entry.serverId, input.channelId);
+      if (applied.open || now !== 'closed') throw new ChannelLifecycleError(supersededClause('close', now), 'superseded');
       return {
         success: true,
         data: { channelId: input.channelId, status: 'closed' },
       };
     } catch (err) {
-      return {
-        success: false,
-        error: `Failed to close channel: ${(err as Error).message}`,
-        isError: true,
-      };
+      return { success: false, error: this.lifecycleFailureText('close', entry, err), isError: true };
     }
   }
 
@@ -3455,43 +4088,92 @@ export class ChannelRegistry {
       return { success: false, error: resolved.error, isError: true };
     }
     if (entry.open || this.getDesiredState(entry.serverId, input.channelId) === 'open') {
+      // channel_close is the call that closes it: its own answer says when,
+      // as for a server that isn't up. A server that's up without that grant
+      // keeps its channels as it chooses, so the text says so, and whom to
+      // ask.
+      const refusal = this.serverReach(entry.serverId) === 'up' && !this.directsLifecycle(entry.serverId)
+        ? this.lifecycleRefusal(entry.serverId) : undefined;
       return {
         success: false,
-        error: `Channel is already open: ${input.channelId}. Use channel_close to close it.`,
+        error: `Channel "${input.channelId}" is open, or set to open, so there's nothing to decline` +
+          (refusal ? `, and ${refusal.message}; if you need it closed, ask whoever runs this host.`
+            : '. If you need it closed, call channel_close.'),
         isError: true,
       };
     }
 
     // The lifecycle decision is authoritative even if the optional public
-    // acknowledgment cannot be rendered by the surface.
-    this.setDesiredState(entry.serverId, input.channelId, 'closed', 'invitation-declined');
+    // acknowledgment cannot be rendered by the surface. One the log refused
+    // changed nothing, and nothing after it runs.
+    try {
+      this.setDesiredState(entry.serverId, input.channelId, 'closed', 'invitation-declined');
+    } catch (err) {
+      return {
+        success: false,
+        error: `Nothing changed for channel "${input.channelId}": ${unrecordedDecision(err).message}, so no acknowledgment ` +
+          'was posted and nothing was sent to the server. Calling channel_decline again tries again; if it fails the same ' +
+          'way, ask whoever runs this host.',
+        isError: true,
+      };
+    }
 
     let acknowledged = false;
     let representation: string | undefined;
-    let acknowledgmentError: string | undefined;
+    // What became of an acknowledgment that wasn't posted, worded once the
+    // decline's own outcome is known: each says the decline is recorded,
+    // since it is whatever becomes of the acknowledgment, and a repeated
+    // decline records it again and posts, but only where another decline
+    // would be taken (`retry`).
+    let ackFailure: ((retry: string | undefined) => string) | undefined;
     if (input.acknowledge) {
       const server = this.serverRegistry.getServer(entry.serverId);
-      if (!server) {
-        acknowledgmentError = `Server not found: ${entry.serverId}`;
-      } else if (!CapabilityGrant.of(server).has('channels.acknowledge')) {
-        acknowledgmentError = `channels.acknowledge not in "${entry.serverId}"'s effective grant (§14.1)`;
-      } else {
+      if (server && CapabilityGrant.of(server).has('channels.acknowledge')) {
         try {
-          const result = await server.sendChannelsAcknowledge({
+          const result: unknown = await server.sendChannelsAcknowledge({
             channelId: input.channelId,
             messageId: input.messageId,
             intent: 'seen-not-opening',
             value: input.acknowledge,
           });
-          acknowledged = result.acknowledged;
-          representation = result.representation;
-          if (!acknowledged) {
-            acknowledgmentError = result.reason ??
-              'The channel integration could not post the acknowledgment.';
+          // An answer counts by #163's rule, as a publish's does: only
+          // acknowledged: true confirms a post, and only false denies one.
+          const receipt = (result ?? {}) as { acknowledged?: unknown; representation?: unknown; reason?: unknown };
+          if (receipt.acknowledged === true) {
+            acknowledged = true;
+            if (typeof receipt.representation === 'string') representation = receipt.representation;
+          } else if (receipt.acknowledged === false) {
+            // A reason that isn't a non-empty string is none.
+            const reason = typeof receipt.reason === 'string' && receipt.reason !== '' ? connectorText(receipt.reason) : undefined;
+            ackFailure = (retry) => reason !== undefined
+              ? withStop(`The decline is recorded, but the "${entry.serverId}" server didn't post the acknowledgment: ${reason}`)
+              : `The decline is recorded, but the "${entry.serverId}" server didn't post the acknowledgment, and gave no reason.` +
+                (retry ? ` To try once more, ${retry}.` : '');
+          } else {
+            ackFailure = (retry) => `The decline is recorded, but the "${entry.serverId}" server's answer didn't say whether it ` +
+              'posted the acknowledgment.' + (retry ? ' Calling channel_decline again with acknowledge could post it twice.' : '');
           }
         } catch (error) {
-          acknowledgmentError = (error as Error).message;
+          // Only a request that never left the host proves nothing was
+          // posted, as for a publish (publishErrorOutcome).
+          const words = requestErrorText(error);
+          ackFailure = error instanceof McplRequestError && error.outcome === 'not-sent'
+            ? (retry) => withStop(`The decline is recorded, but the acknowledgment wasn't posted: ${words}`) +
+              (retry ? ` To try again, ${retry}.` : '')
+            : (retry) => withStop(`The decline is recorded, but whether the acknowledgment was posted isn't known: ${words}`) +
+              (retry ? ' Calling channel_decline again with acknowledge could post it twice.' : '');
         }
+      } else {
+        const reach = this.serverReach(entry.serverId);
+        // Read when the acknowledgment was attempted. Where the server is up,
+        // the decline's close can await past a change to its grant, so that
+        // text says what kept the acknowledgment back then.
+        ackFailure = (retry) => reach === 'up'
+          ? `The decline is recorded, but this host wasn't permitted to post acknowledgments to the "${entry.serverId}" server, ` +
+            'so none was posted. If you need it, ask whoever runs this host.'
+          : `The decline is recorded, but the acknowledgment wasn't posted: ${unreachableClause(entry.serverId, reach)}.` +
+            (reach === 'gone' ? ' If you need it, ask whoever runs this host.'
+              : retry ? ` To post it, ${retry} ${reach === 'connecting' ? 'in a moment' : "once it's back"}.` : '');
       }
     }
 
@@ -3505,21 +4187,57 @@ export class ChannelRegistry {
     if (current && this.directsLifecycle(entry.serverId) &&
         (this.unconfirmedChannelTargets.has(current) || this.hasPendingLifecycle(current))) {
       try {
-        const applied = await this.applyDesiredChannelState(entry.serverId, input.channelId);
-        if (applied.open) closeError = 'the close was superseded by a newer lifecycle decision';
+        await this.applyDesiredChannelState(entry.serverId, input.channelId);
       } catch (error) {
-        closeError = (error as Error).message;
+        // Reconciling closes it when the server next registers the channel
+        // (for a push's placeholder, if it ever does), if this host directs
+        // their lifecycle then (§14.1). A registration that went while the
+        // close was out says so, since the server may have closed it first,
+        // and one that came back since says that.
+        const went = error instanceof ChannelLifecycleError && (error.kind === 'cancelled' || error.kind === 'unlisted');
+        closeError = withStop(
+          `The decline is recorded, and this host closes the channel ${laterClause(entry)}; ` +
+          (!went ? `closing it now didn't complete: ${lifecycleClause(error)}`
+            : this.channels.has(`${entry.serverId}:${input.channelId}`)
+              ? 'its registration went and came back while the close was out'
+              : `it isn't registered here any more: ${(error as ChannelLifecycleError).message}`),
+        );
       }
     }
+    // A decision made while the decline ran, to open the channel or tune it
+    // out, replaced it, and that is what stands.
+    const decided = this.getDesiredState(entry.serverId, input.channelId);
+    const stands = decided === 'closed';
+    if (!stands) {
+      closeError = decided === 'tuned-out'
+        ? 'The decline is recorded, but the channel was tuned out meanwhile, and that decision stands: its messages go to ' +
+          'the subconscious.'
+        : 'The decline is recorded, but a later decision to open the channel replaced it, and that decision stands.';
+    }
+    // Another decline is taken only where this one was: the channel
+    // registered, not open, and not decided open.
+    const after = this.channels.get(`${entry.serverId}:${input.channelId}`);
+    const again = stands && after !== undefined && !after.open;
+    const acknowledgmentError = ackFailure?.(again ? 'call channel_decline again with the same arguments' : undefined);
 
-    this.appendLifecycleEvent({
-      kind: 'invitation-declined',
-      serverId: entry.serverId,
-      channelId: input.channelId,
-      messageId: input.messageId,
-      acknowledgment: representation ?? input.acknowledge,
-      timestamp: new Date().toISOString(),
-    });
+    // An audit record nothing reads back: the decline took effect above, so
+    // a log that refuses it is the operator's to hear about, not a failure
+    // of the decline.
+    try {
+      this.appendLifecycleEvent({
+        kind: 'invitation-declined',
+        serverId: entry.serverId,
+        channelId: input.channelId,
+        messageId: input.messageId,
+        acknowledgment: representation ?? input.acknowledge,
+        timestamp: new Date().toISOString(),
+      });
+    } catch (err) {
+      console.error(
+        `[channel-decline] server=${entry.serverId} channel=${logValue(input.channelId)}: the declined invitation wasn't ` +
+        `recorded: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
     return {
       success: true,
       data: {
@@ -3528,7 +4246,7 @@ export class ChannelRegistry {
         acknowledged,
         ...(representation ? { representation } : {}),
         ...(acknowledgmentError ? { acknowledgmentError } : {}),
-        ...(closeError ? { closeError: `Failed to close the channel's transport: ${closeError}` } : {}),
+        ...(closeError ? { closeError } : {}),
       },
     };
   }
@@ -3623,35 +4341,76 @@ export class ChannelRegistry {
    * servers that never opted in receive nothing. Fire-and-forget and never
    * throws: streaming is an observer surface; the authoritative delivery is
    * channels/publish.
+   *
+   * `to` is the destination the publish went to, its server and channel.
+   * The chunk goes there while that server registers that channel (Spec
+   * 14.3: the recipient is "the server that registered the target
+   * channel"). A stream doesn't start in a channel its server has declared
+   * inbound-only (#350's rule), not even for a publish delivered there just
+   * before the declaration. One that started there before it goes on, since
+   * the declaration doesn't unregister the channel: a later chunk is for a
+   * publish delivered before it. A bare channel id is resolved as before, to
+   * the one server that registers it, at each call (streamingServerFor), and
+   * keeps no record: a stream sent by destination ends by destination, since
+   * only a destination's `complete` removes its record.
    */
   sendOutgoingChunk(
-    channelId: string,
+    to: string | PublishDestination,
     conversationId: string,
     inferenceId: string,
     index: number,
     delta: string,
   ): void {
-    const server = this.streamingServerFor(channelId);
+    let server: McplServerConnection | null;
+    if (typeof to === 'string') {
+      server = this.streamingServerFor(to);
+    } else {
+      const key = destinationKey(to);
+      let started = this.takenStreams.get(inferenceId);
+      const continuing = started?.has(key) ?? false;
+      server = this.streamingServerAt(to, !continuing);
+      if (server && !continuing) {
+        if (!started) this.takenStreams.set(inferenceId, started = new Set());
+        started.add(key);
+      }
+    }
     if (!server) return;
+    const channelId = typeof to === 'string' ? to : to.channelId;
     try {
       server.sendChannelsOutgoingChunk({ inferenceId, conversationId, channelId, index, delta });
     } catch { /* observer surface — never disturb the turn */ }
   }
 
-  /** Spec 14.3 companion: final moderated content per channel at stream end. */
+  /**
+   * Spec 14.3 companion: final moderated content per channel at stream end.
+   * Given a destination, it goes only where the stream started
+   * (sendOutgoingChunk), while that server still registers that channel,
+   * inbound-only or not, and its grant has `channels.streaming`: once per
+   * destination, whose consumer, such as a TTS utterance, finalizes on it
+   * and reconciles any chunk it missed. A bare channel id is resolved as
+   * before (streamingServerFor).
+   */
   sendOutgoingComplete(
-    channelId: string,
+    to: string | PublishDestination,
     conversationId: string,
     inferenceId: string,
     text: string,
   ): void {
-    const server = this.streamingServerFor(channelId);
+    let server: McplServerConnection | null;
+    if (typeof to === 'string') {
+      server = this.streamingServerFor(to);
+    } else {
+      const started = this.takenStreams.get(inferenceId);
+      if (!started?.delete(destinationKey(to))) return;
+      if (started.size === 0) this.takenStreams.delete(inferenceId);
+      server = this.streamingServerAt(to, false);
+    }
     if (!server) return;
     try {
       server.sendChannelsOutgoingComplete({
         inferenceId,
         conversationId,
-        channelId,
+        channelId: typeof to === 'string' ? to : to.channelId,
         content: [{ type: 'text', text }],
       });
     } catch { /* observer surface — never disturb the turn */ }
@@ -3675,6 +4434,21 @@ export class ChannelRegistry {
     // server was told anything was granted.
     if (!CapabilityGrant.of(server).has('channels.streaming')) return null;
     return server;
+  }
+
+  /**
+   * A destination's server, for a stream message: while that server
+   * registers that channel, and its grant has `channels.streaming` (as in
+   * streamingServerFor). A stream doesn't start in an inbound-only channel.
+   */
+  private streamingServerAt(to: PublishDestination, starting: boolean): McplServerConnection | null {
+    // The map's key joins the two ids with a colon, so another server's
+    // entry can sit under a destination's key: it has to be this server's.
+    const entry = this.channels.get(`${to.serverId}:${to.channelId}`);
+    if (!entry || entry.serverId !== to.serverId) return null;
+    if (starting && isInboundOnly(entry)) return null;
+    const server = this.serverRegistry.getServer(to.serverId);
+    return CapabilityGrant.of(server).has('channels.streaming') ? server : null;
   }
 
   /** Resolve the outbound locus (fork HOME → this-turn's TRIGGERING channel →
@@ -3727,13 +4501,17 @@ export class ChannelRegistry {
     if (matches.length === 0) {
       return {
         error: target.serverId
-          ? `no registered channel "${target.channelId}" on server "${target.serverId}"`
-          : `no registered channel "${target.channelId}"`,
+          ? `the "${target.serverId}" server has no channel "${target.channelId}" registered here`
+          : `no channel "${target.channelId}" is registered here`,
       };
     }
     if (matches.length > 1) {
       return {
-        error: `channel id "${target.channelId}" is registered by more than one MCPL server; the destination must name its server`,
+        // Speech names no server, and neither its >> prefix nor
+        // channel_publish can: whoever runs this host can. A caller that
+        // can name one reads that none was.
+        error: `channel id "${target.channelId}" is on more than one server, and no server was named for these words; ` +
+          'if you need them there, ask whoever runs this host',
       };
     }
     return { entry: matches[0]! };
@@ -3822,24 +4600,14 @@ export class ChannelRegistry {
       return { status: 'failed', destination, reason: inboundOnlyReason(entry), at: at() };
     }
     const server = this.serverRegistry.getServer(entry.serverId);
-    if (!server) {
-      return { status: 'failed', destination, reason: `server "${entry.serverId}" not found`, at: at() };
-    }
     // §14.1: channels/publish requires channels.publish in the grant. The
-    // host not sending is the enforcement, here and at the last check.
-    const ungranted = (): PublishOutcome => ({
-      status: 'failed',
-      destination,
-      reason: `channels.publish not in "${entry.serverId}"'s effective grant (§14.1)`,
-      at: at(),
-    });
-    if (!CapabilityGrant.of(server).has('channels.publish')) return ungranted();
+    // host not sending is the enforcement, here and at the last check, and
+    // the server's state words the refusal (sendRefusal).
+    const ungranted = (): PublishOutcome => ({ status: 'failed', destination, reason: this.sendRefusal(entry.serverId), at: at() });
+    if (!server || !CapabilityGrant.of(server).has('channels.publish')) return ungranted();
 
     const prevented = (err: unknown): PublishOutcome => ({
-      status: 'failed',
-      destination,
-      reason: `lifecycle work prevented delivery: ${connectorText(err instanceof Error ? err.message : String(err))}`,
-      at: at(),
+      status: 'failed', destination, reason: lifecycleClause(err) + refusalRemedy(err), at: at(),
     });
 
     // Lifecycle work already queued for the channel settles first: words go
@@ -3894,12 +4662,7 @@ export class ChannelRegistry {
           }
         }
       } catch (err) {
-        return {
-          status: 'failed',
-          destination,
-          reason: `channel is closed and open failed: ${connectorText(err instanceof Error ? err.message : String(err))}`,
-          at: at(),
-        };
+        return { status: 'failed', destination, reason: openFailedReason(err), at: at() };
       }
     }
 
@@ -3927,15 +4690,16 @@ export class ChannelRegistry {
       }
       current = this.channels.get(key);
     }
-    if (!current) {
-      return { status: 'failed', destination, reason: 'the channel was removed before the words were published', at: at() };
-    }
+    if (!current) return { status: 'failed', destination, reason: CHANNEL_REMOVED_CLAUSE, at: at() };
     if (isInboundOnly(current)) {
       return { status: 'failed', destination, reason: inboundOnlyReason(current), at: at() };
     }
     // A grant reduced during any of the waits holds at once (§6.7): the
-    // words already on their way take it too.
-    if (!CapabilityGrant.of(server).has('channels.publish')) return ungranted();
+    // words already on their way take it too. Its refusal is worded for the
+    // connection that refused (sendRefusal's `checked`).
+    if (!CapabilityGrant.of(server).has('channels.publish')) {
+      return { status: 'failed', destination, reason: this.sendRefusal(entry.serverId, server), at: at() };
+    }
 
     let result: unknown;
     try {
@@ -3980,16 +4744,18 @@ export class ChannelRegistry {
      *  An `unknown` outcome still gets its marker. */
     opts?: { heldOnFailure?: boolean },
   ): Promise<PublishOutcome> {
-    const fail = (channelId: string | null, reason: string, outcome: PublishOutcome): PublishOutcome => {
+    // `logged` is what the log line and the trace say, where it isn't the
+    // agent's reason (the two no-locus reasons below).
+    const fail = (channelId: string | null, reason: string, outcome: PublishOutcome, logged = reason): PublishOutcome => {
       const status = outcome.status === 'unknown' ? 'unknown' : 'failed';
       const detail = outcome.detail !== undefined ? connectorText(outcome.detail) : undefined;
       const detailText = detail !== undefined ? `; connector detail: ${detail}` : '';
-      console.error(`[routeSpeech] ${conversationId}: ${reason}${detailText} — speech ${status === 'unknown' ? 'delivery NOT confirmed' : 'NOT routed'} (${text.length} chars stay in chronicle)`);
+      console.error(`[routeSpeech] ${conversationId}: ${logged}${detailText} — speech ${status === 'unknown' ? 'delivery NOT confirmed' : 'NOT routed'} (${text.length} chars stay in chronicle)`);
       this.emitTraceFn({
         type: 'mcpl:speech-route-failed',
         conversationId,
         channelId: channelId ?? '',
-        reason,
+        reason: logged,
         textLen: text.length,
         outcome: status,
         ...(detail !== undefined ? { detail } : {}),
@@ -4000,12 +4766,19 @@ export class ChannelRegistry {
       return outcome;
     };
 
+    // These two reasons are the only ones whose log line and trace keep the
+    // operator's words rather than the agent's: connectome-host's
+    // connectome-doctor reads the last [routeSpeech] line for "no locus". Keep
+    // "no locus" in both logged texts. Each names no tool: whether one the
+    // agent may call could post the words isn't known here, and the notice
+    // calls it a routing or configuration situation.
     // Runtime backstop for JS callers the compiler can't see: an omitted
     // locus is a routing bug at the call site, never something to paper over
     // with a live re-resolution.
     if (locusChannelId === undefined) {
-      const reason = 'caller passed no locus (routing bug: every speech path must snapshot the turn locus)';
-      return fail(null, reason, { status: 'failed', reason, at: Date.now() });
+      const reason = 'the host lost track of which channel this reply was for; if this keeps happening, ask whoever runs this host';
+      return fail(null, reason, { status: 'failed', reason, at: Date.now() },
+        'caller passed no locus (routing bug: every speech path must snapshot the turn locus)');
     }
     if (!locusChannelId) {
       // An ephemeral run with no channel of its own: its plain speech is its
@@ -4017,8 +4790,11 @@ export class ChannelRegistry {
       // The turn froze with no locus (no home, no triggering channel, no
       // global inbound ever seen) — the agent was told its prose stays in
       // the archive; honor that.
-      const reason = 'turn has no locus (no home/trigger channel; nothing to deliver into)';
-      return fail(null, reason, { status: 'failed', reason, at: Date.now() });
+      // The locus froze at the turn's start, so this says what the turn had.
+      const reason = 'this turn came from no channel, and it had no home or recent channel to reply in; if it should have ' +
+        'had one, ask whoever runs this host';
+      return fail(null, reason, { status: 'failed', reason, at: Date.now() },
+        'turn has no locus (no home/trigger channel; nothing to deliver into)');
     }
 
     const outcome = await this.publish(conversationId, text, { channelId: locusChannelId, routed: true });
@@ -4049,33 +4825,48 @@ export class ChannelRegistry {
     conversationId: string,
     text: string,
     locusChannelId: string | null,
-  ): Promise<{ delivered: boolean; channelId: string; messageId?: string } | null> {
+  ): Promise<{ delivered: boolean; serverId: string; channelId: string; messageId?: string } | null> {
     const outcome = await this.deliverSpeech(conversationId, text, locusChannelId);
     if (outcome.status !== 'delivered') return null;
     return {
       delivered: true,
+      serverId: outcome.destination!.serverId,
       channelId: outcome.destination!.channelId,
       ...(outcome.messageId !== undefined ? { messageId: outcome.messageId } : {}),
     };
   }
 
+  /**
+   * channel_publish, and the subconscious's speak_in_channel
+   * (publishForAgent), which shares its delivery. Where an agent finds a
+   * channel id differs: the subconscious isn't offered channel_list, and is
+   * given speak_in_channel for the tuned-out channels whose messages it reads.
+   */
   private async handleToolPublish(
     input: { channelId?: string; content?: string; text?: string },
     origin?: ChannelToolOrigin,
     /** Filled with the publish's outcome once a request is attempted, for
      *  publishForAgent's trace. */
     seen?: { outcome?: PublishOutcome },
+    tool: 'channel_publish' | 'speak_in_channel' = 'channel_publish',
   ): Promise<ToolResult> {
-    // Resolve content: accept both `content` and `text` (backward compat)
+    const findIds = tool === 'channel_publish'
+      ? 'channel_list shows the channel ids.'
+      : 'Use the id of a tuned-out channel whose messages you are reading.';
+    // Resolve content: accept both `content` and `text` (backward compat).
+    // speak_in_channel checks its own text first, so only channel_publish
+    // reads this refusal.
     const messageText = input.content ?? input.text;
     if (!messageText) {
-      return {
-        success: false,
-        error: 'Either content or text parameter is required',
-        isError: true,
-      };
+      return { success: false, error: 'Nothing was posted: channel_publish needs the message in `content`.', isError: true };
     }
 
+    // An empty channelId names nothing, and isn't read as one left out.
+    // speak_in_channel's caller passes one left out as empty, so there it
+    // gets the refusal for one left out, as speak_in_channel has no default.
+    if (input.channelId === '' && tool === 'channel_publish') {
+      return { success: false, error: `Nothing was posted: channelId is empty. ${findIds}`, isError: true };
+    }
     // Resolve channelId: default to the channel of the most recent incoming
     // message that isn't a reaction, reaction removal, edit or deletion
     // marker, apart from an edit the coalescer delivers on acceptance as the
@@ -4086,21 +4877,19 @@ export class ChannelRegistry {
     if (!channelId) {
       return {
         success: false,
-        error: caller !== undefined && this.takesGlobalFallback?.(caller) === false
-          ? 'Nothing was published: name the channel with channelId. A subagent has no default channel, since its plain '
-            + 'speech is returned to whoever called it, so channel_publish sends only to a channel it names.'
-          : 'No channelId specified and no default channel available',
+        error: tool === 'speak_in_channel'
+          ? `Nothing was posted: speak_in_channel needs a \`channelId\`. ${findIds}`
+          : caller !== undefined && this.takesGlobalFallback?.(caller) === false
+            ? 'Nothing was posted: name the channel with channelId. A subagent has no default channel, since its plain '
+              + 'speech is returned to whoever called it, so channel_publish sends only to a channel it names.'
+            : `Nothing was posted: channel_publish needs a \`channelId\`, and there's no channel to default to yet. ${findIds}`,
         isError: true,
       };
     }
 
     const entry = this.findChannelEntry(channelId);
     if (!entry) {
-      return {
-        success: false,
-        error: `Channel not found: ${channelId}`,
-        isError: true,
-      };
+      return { success: false, error: `No channel has the id "${channelId}", so nothing was posted. ${findIds}`, isError: true };
     }
     if (isInboundOnly(entry)) {
       return {
@@ -4110,21 +4899,10 @@ export class ChannelRegistry {
       };
     }
 
+    // The same refusal, in the same words, as plain speech's (sendRefusal).
     const server = this.serverRegistry.getServer(entry.serverId);
-    if (!server) {
-      return {
-        success: false,
-        error: `Server not found: ${entry.serverId}`,
-        isError: true,
-      };
-    }
-
-    if (!CapabilityGrant.of(server).has('channels.publish')) {
-      return {
-        success: false,
-        error: `channels.publish not in "${server.id}"'s effective grant (§14.1)`,
-        isError: true,
-      };
+    if (!server || !CapabilityGrant.of(server).has('channels.publish')) {
+      return { success: false, error: `Nothing was posted to channel "${channelId}": ${this.sendRefusal(entry.serverId)}.`, isError: true };
     }
     const publishParams: ChannelsPublishParams = {
       conversationId: '', // Framework will fill this when wired
@@ -4154,8 +4932,8 @@ export class ChannelRegistry {
     return {
       success: false,
       error: (outcome.status === 'failed'
-        ? `Publish to ${channelId} failed: ${outcome.reason}. Nothing was posted.`
-        : `Publish to ${channelId} wasn't confirmed: ${outcome.reason}. ` +
+        ? `Nothing was posted to channel "${channelId}": ${outcome.reason}.`
+        : `Posting to channel "${channelId}" wasn't confirmed: ${outcome.reason}. ` +
           'It may or may not have been posted, so sending it again could post it twice.') + detail,
       isError: true,
     };

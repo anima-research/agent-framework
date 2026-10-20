@@ -193,11 +193,14 @@ export interface ToolResult {
   /** Whether this was an error (for LLM) */
   isError?: boolean;
   /**
-   * An MCP tool's `structuredContent`: its machine-readable result, beside
-   * `data`, which is the content view. Present exactly when the server sent
-   * one, so `false`, `0` and `null` are values here, not absence. Programs
-   * read it (scripts get it in their result object); the model sees content,
-   * and sees this rendered as JSON only when the content carries no text.
+   * The result's machine-readable form, beside `data`. Programs read it: a
+   * script gets it in its result object, and a host in the tool result
+   * event. The model never reads this field: it sees the value only where an
+   * MCP conversion put it in the content as JSON, which happens only when the
+   * server sent no text. An MCP tool's is its `structuredContent`, present
+   * exactly when the server sent one, so `false`, `0` and `null` are values
+   * here, not absence. Any other tool can set one too, as `code_execution`
+   * does with its script's stdout, stderr, exit code and any time-limit note.
    */
   structured?: unknown;
   /**

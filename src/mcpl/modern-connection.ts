@@ -68,10 +68,10 @@ import {
 
 import { StdioTransport, type McplTransport } from './transport.js';
 import { McplProtocolVersionError, McplRequestError, McplUnreapedLaunchError } from './server-connection.js';
-import { LEGACY_MCP_PROTOCOL_VERSION, MAX_TIMER_MS, MODERN_MCP_PROTOCOL_VERSION, checkServerConfig, describeCredentialError, noteDialSent, redactServerText, serverTextRedactor } from './protocol-family.js';
+import { LEGACY_MCP_PROTOCOL_VERSION, MAX_TIMER_MS, MODERN_MCP_PROTOCOL_VERSION, checkServerConfig, describeCredentialError, maskedError, noteDialSent, redactServerText, redactedData, serverTextRedactor, type ServerTextRedactor } from './protocol-family.js';
 import type { McplServerConfig, McpToolDefinition } from './types.js';
 import { boundedForLog } from './errors.js';
-import { logDetail, logValue, logValueRedacted } from './log-value.js';
+import { logDetail, logValue, logValueRedacted, loggedCode } from './log-value.js';
 
 const DEFAULT_REQUEST_TIMEOUT_MS = 60_000;
 /** Bound on establishing the connection (`server/discover`), like the legacy
@@ -357,11 +357,17 @@ class SpawnerStdioTransport implements Transport {
     line.on('unreaped', (failure: Error) => this.onUnreaped(`its stdio pipe failed with ${line.pipeFailure?.message ?? 'an error'}`, failure));
   }
 
+  /** The first error on the child's stdin or stdout, once there is one: the
+   *  line is ending the child then, and writes nothing more to it. */
+  get pipeFailure(): Error | undefined {
+    return this.line?.pipeFailure;
+  }
+
   async send(message: JSONRPCMessage): Promise<void> {
     if (!this.line || this.line.closed) throw new NotWrittenError(`MCP server "${this.config.id}" stdio transport is closed`);
     // Once the child's stdin or stdout has failed, the line is ending it and
     // writes nothing more to it, so a message is refused here as not sent.
-    const failed = this.line.pipeFailure;
+    const failed = this.pipeFailure;
     if (failed) throw new NotWrittenError(`MCP server "${this.config.id}" stdio pipe failed with ${failed.message}`, true);
     this.line.writeLine(JSON.stringify(message));
   }
@@ -415,6 +421,8 @@ interface Session {
   readonly generation: number;
   readonly client: Client;
   readonly wire: ObservedTransport;
+  /** Its stdio transport, under `wire`; null over HTTP. */
+  readonly stdio: SpawnerStdioTransport | null;
   /** Its transport has closed, whether or not the session was adopted yet. */
   lost: boolean;
 }
@@ -452,6 +460,13 @@ export class ModernMcpConnection extends EventEmitter {
    *  connect() returns), delivered to the first listener. Bounded: the
    *  newest lines are kept. */
   private stderrBacklog: string[] = [];
+  private redactor?: ServerTextRedactor;
+
+  /** The server's text with its configuration's credentials replaced, for
+   *  the errors this connection hands its caller and its records. */
+  private get recorded(): ServerTextRedactor {
+    return (this.redactor ??= serverTextRedactor(this.config));
+  }
 
   private constructor(private readonly config: McplServerConfig) {
     super();
@@ -585,10 +600,16 @@ export class ModernMcpConnection extends EventEmitter {
         this.reconnectEnabled = false;
         throw error;
       }
+      // Any other failure is the SDK's or the transport's: it goes on as its
+      // words alone, redacted, since its message can quote the url and its
+      // other properties, such as Bun's fetch error's `path` or a wrapper's
+      // `cause`, can carry it whole (maskedError). The protocol refusal
+      // above was built from redacted words.
+      const masked = maskedError(error, this.recorded);
       // A launch that couldn't be reaped halts reconnecting, so no retry
       // will come: the first connect fails, as one without reconnect does.
-      if (!this.reconnectEnabled || this.holdsUnreapedChild) throw error;
-      console.error(`MCP server "${this.id}" initial connect failed, will retry:`, redactServerText((error as Error).message, this.config));
+      if (!this.reconnectEnabled || this.holdsUnreapedChild) throw masked;
+      console.error(`MCP server "${this.id}" initial connect failed, will retry:`, masked.message);
       this.reconnectAttempts = 1;
       this.emit('connect-failed', { error: (error as Error).message, attempt: 0 });
       this.scheduleReconnect();
@@ -627,17 +648,19 @@ export class ModernMcpConnection extends EventEmitter {
     // reopen backs off from the base interval, not from the previous
     // generation's failures.
     this.relistenAttempts = 0;
-    const inner: Transport = this.transportKind === 'stdio'
+    const stdio = this.transportKind === 'stdio'
       ? new SpawnerStdioTransport(
         this.config,
         (line) => { if (this.isCurrent(generation)) this.deliverStderr(line); },
         // A child whose pipe failed and that outlived SIGKILL: a loss whose
         // launch is already known unreaped, so it's held as the loss is
         // handled (handleLost). During a connect there is no session to lose
-        // yet: the connect's own cleanup holds it, once the connect fails.
+        // yet: a connect whose pipe has failed fails, whether or not the SDK
+        // resolves it (establish), and its cleanup holds the launch.
         (reason, failure) => { if (this.isCurrent(generation)) this.handleLost(generation, reason, failure); },
       )
-      : new StreamableHTTPClientTransport(new URL(this.config.url!), { authProvider: bearerAuth(this.config) });
+      : null;
+    const inner: Transport = stdio ?? new StreamableHTTPClientTransport(new URL(this.config.url!), { authProvider: bearerAuth(this.config) });
     const wire = new ObservedTransport(inner);
 
     const client = new Client(
@@ -656,7 +679,7 @@ export class ModernMcpConnection extends EventEmitter {
         },
       },
     );
-    const session: Session = { generation, client, wire, lost: false };
+    const session: Session = { generation, client, wire, stdio, lost: false };
     client.onerror = (error: Error) => {
       // The SDK reports late responses to deadline-abandoned calls here
       // ("unknown message ID"), and a list-change subscription it could not
@@ -701,16 +724,23 @@ export class ModernMcpConnection extends EventEmitter {
       if (failure) this.holdUnreaped(session, failure);
       return;
     }
-    if (session.lost) {
-      // The transport closed while the client connected, such as a child
-      // that exited at the connect-time list-change subscribe: the SDK
-      // reports that subscribe's failure only as an error, and resolves the
-      // connect anyway (R1-2). Adopted, the session would read as connected
-      // with nothing behind it, and no later close would come to reconnect
-      // it. So the connect failed.
+    // The transport closed while the client connected, such as a child that
+    // exited at the connect-time list-change subscribe, or the child's stdio
+    // pipe failed, such as that subscribe's write meeting EPIPE: the SDK
+    // reports the subscribe's failure only as an error, and resolves the
+    // connect anyway (R1-2). Adopted, the session would read as connected
+    // with nothing it can write to behind it, and from a child that outlived
+    // SIGKILL, whose 'unreaped' came while there was no session to lose, no
+    // later close would come to reconnect it. So the connect failed: its
+    // close reaps the child, and a child it can't reap is held. A failed
+    // pipe is named whether or not the child has exited by now.
+    const pipe = session.stdio?.pipeFailure;
+    if (session.lost || pipe) {
       const failure = await ModernMcpConnection.closeSession(session);
       if (failure) this.holdUnreaped(session, failure);
-      throw new Error(`MCP server "${this.id}" closed its connection while connecting`);
+      throw new Error(pipe
+        ? `MCP server "${this.id}" stdio pipe failed with ${pipe.message} while connecting`
+        : `MCP server "${this.id}" closed its connection while connecting`);
     }
     this.session = session;
     this.protocolVersion = MODERN_MCP_PROTOCOL_VERSION;
@@ -726,7 +756,11 @@ export class ModernMcpConnection extends EventEmitter {
    */
   private versionVerdict(error: unknown): McplProtocolVersionError | null {
     if (!(error instanceof UnsupportedProtocolVersionError)) return null;
-    const data = (error as { data?: unknown }).data as { supported?: unknown } | undefined;
+    // The server's words and data, redacted before they're bounded or kept:
+    // the error goes to the host. One build for all of them, so a
+    // configuration that can't be read is read once.
+    const redact = this.recorded.now();
+    const data = redactedData((error as { data?: unknown }).data, redact) as { supported?: unknown } | undefined;
     const supported = Array.isArray(data?.supported) && data.supported.every((v) => typeof v === 'string')
       ? (data.supported as string[])
       : null;
@@ -740,13 +774,13 @@ export class ModernMcpConnection extends EventEmitter {
         : ` It speaks only legacy MCP, which this client reaches over stdio or WebSocket (ws://, wss://), not http(s).`;
     return new McplProtocolVersionError(
       `MCP server "${this.id}" does not support MCP ${MODERN_MCP_PROTOCOL_VERSION}` +
-        (supported ? ` (it supports: ${supported.join(', ') || 'none listed'}).` : ` (${error.message}).`) +
+        (supported ? ` (it supports: ${boundedForLog(supported.join(', ')) || 'none listed'}).` : ` (${boundedForLog(redact(error.message))}).`) +
         legacyHint,
       'rejected',
       null,
       supported,
       (error as { code?: unknown }).code === undefined ? undefined : Number((error as { code?: unknown }).code),
-      (error as { data?: unknown }).data,
+      data,
       MODERN_MCP_PROTOCOL_VERSION,
     );
   }
@@ -1116,7 +1150,10 @@ export class ModernMcpConnection extends EventEmitter {
   private requestFailure(what: string, record: WireRecord, error: unknown, timeoutMs?: number, lost = false): Error {
     const server = `the "${this.id}" server`;
     const Server = `The "${this.id}" server`;
-    const message = redactServerText(error instanceof Error ? error.message : String(error), this.config);
+    // One build of the redactor for all of this failure's texts, so a
+    // configuration that can't be read is read once.
+    const redact = this.recorded.now();
+    const message = redact(error instanceof Error ? error.message : String(error));
     const log = (line: string) => console.error(`MCP server "${this.id}" ${line}`);
     const listing = record.method === 'tools/list';
     // What a failure whose effect is in doubt says: for a tool call, that the
@@ -1140,18 +1177,21 @@ export class ModernMcpConnection extends EventEmitter {
     }
     if (record.answer === 'error' && record.error) {
       const { code, message: wireMessage, data } = record.error;
-      // A JSON-RPC answer reaches the caller unredacted (redactServerText's
-      // scope). The log is a record of the server's text, so the message is
-      // redacted there, whatever JSON value it is, as every other line this
-      // connection writes is.
-      log(`answered ${what} with error ${logValue(code)}: ${logValueRedacted(wireMessage, (text) => redactServerText(text, this.config))}`);
-      // The server's own words, bounded as errors.ts says. Only a string is
-      // words: a message of any other JSON value reads as none.
-      const said = typeof wireMessage === 'string' ? boundedForLog(wireMessage.trim()) : '';
+      // The log is a record of the server's text, so the code (loggedCode)
+      // and the message are redacted there, whatever JSON values they are,
+      // as every other line this connection writes is.
+      log(`answered ${what} with error ${loggedCode(code, redact)}: ${logValueRedacted(wireMessage, redact)}`);
+      // The server's own words, redacted and then bounded as errors.ts says,
+      // since they're in an error the caller gets (redactServerText's
+      // scope), and its data's strings redacted too. It's trimmed after it's
+      // redacted, so a credential that ends in a space is whole when it's
+      // matched. Only a string is words: a message of any other JSON value
+      // reads as none.
+      const said = typeof wireMessage === 'string' ? boundedForLog(redact(wireMessage).trim()) : '';
       return new McplRequestError(
         said ? `${Server} answered with an error: ${said}` : unknown(`${Server} answered with an error without saying what went wrong`),
         'error-response',
-        data,
+        redactedData(data, redact),
       );
     }
     if (record.answer === 'complete') {
@@ -1197,10 +1237,14 @@ export class ModernMcpConnection extends EventEmitter {
       // The response body (the SDK's `text`) is the server's text and can
       // echo the request's url, so it's left out of the data; the status stays.
       const { text: _body, ...data } = (error instanceof SdkHttpError && error.data && typeof error.data === 'object' ? error.data : {}) as Record<string, unknown>;
+      const redacted = redactedData(data, redact);
       return new McplRequestError(
         `${Server} refused this host access, so the request didn't run. If you need it, ask whoever runs this host.`,
         'error-response',
-        { ...data, httpStatus: refusedWith },
+        // The status is this host's own, so it's added after the server's
+        // data is redacted, and it stays when a configuration that can't be
+        // read withholds that data.
+        { ...(redacted !== null && typeof redacted === 'object' ? redacted : {}), httpStatus: refusedWith },
       );
     }
     if (deadline) {

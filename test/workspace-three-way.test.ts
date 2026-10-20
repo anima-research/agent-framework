@@ -28,9 +28,11 @@ import { confirmAbsent, fingerprintVouches, filesystemTrustsCtime, fsTypeTrustsC
 import { EffectFailed, syncDirectories, unlinkContained, writeContained } from '../src/modules/workspace/effects.js';
 import { pushPaths, settleAdoptionBeforeMutation } from '../src/modules/workspace/reconcile.js';
 import type { MountConfig, WorkspaceConfig } from '../src/modules/workspace/types.js';
+import type { FsChange } from '../src/modules/workspace/watcher.js';
 import type { ModuleContext } from '../src/types/module.js';
 import type { ProcessEvent } from '../src/types/events.js';
 import { changedAfterFstat, withFileHandle } from './helpers/file-handle.js';
+import { changesFlow, isProbe } from './helpers/watcher-flow.js';
 
 const FAULT_FIXTURE = join(import.meta.dirname, 'fixtures/workspace-fault.mjs');
 const TREE = 'workspace/work/tree';
@@ -732,6 +734,24 @@ async function until(ok: () => boolean, what: string, ms = 5000): Promise<void> 
   assert.fail(what);
 }
 
+/**
+ * Waits until each named mount's watcher hands `m` a change, so what a test
+ * writes there next is written while changes are delivered: ready says
+ * chokidar's first scan is done, not that the platform delivers events
+ * (changesFlow). Its probes land in each mount's root, where the mount takes
+ * them in, so a test's results leave them out (isProbe).
+ */
+async function watchersFlow(m: WorkspaceModule, roots: Record<string, string>): Promise<void> {
+  const heard = new Map(Object.keys(roots).map((name) => [name, [] as FsChange[][]]));
+  const internals = m as unknown as { handleFsChanges(mount: string, changes: FsChange[]): Promise<void> };
+  const handle = internals.handleFsChanges.bind(m);
+  internals.handleFsChanges = (mount, changes) => {
+    heard.get(mount)?.push(changes);
+    return handle(mount, changes);
+  };
+  for (const [name, root] of Object.entries(roots)) await changesFlow(root, heard.get(name)!, []);
+}
+
 describe("editors' swap and backup files are passed over by name (connectome-host #278)", () => {
 
   test('a sync without a path passes over them by their own whole name, wherever they are, and counts them', async (t) => {
@@ -1025,6 +1045,7 @@ describe('a mount nested inside another', () => {
     const deepTree = () => env.store.treeList('workspace/deep/tree').map((e: { path: string }) => e.path).sort();
     await until(() => !!mount.watcherReadyAt && !!deep.watcherReadyAt && tree().includes('top.txt') && deepTree().includes('inner.txt'),
       'both watchers are ready and their catch-up scans ran');
+    await watchersFlow(m, { work: env.dir, deep: env.disk('a/b') });
     // The inner mount takes its new file in, so the change has reached the
     // watchers; the outer mount's own new file, written after it, is taken
     // in after that. (MountWatcher's own test pins the outer watcher's filter.)
@@ -1032,7 +1053,8 @@ describe('a mount nested inside another', () => {
     await until(() => deepTree().includes('new.txt'), 'the inner mount takes its new file in');
     env.writeDisk('later.txt', 'outer');
     await until(() => tree().includes('later.txt'), 'the outer mount takes its own new file in');
-    assert.deepEqual(tree(), ['later.txt', 'top.txt']);
+    // The handshake's probe in the outer mount's root is its own; one beneath a/b would be the inner mount's.
+    assert.deepEqual(tree().filter((p) => p.includes('/') || !isProbe(p)), ['later.txt', 'top.txt']);
   });
 });
 
@@ -1127,10 +1149,11 @@ describe("another mount's directory, to the outer mount's file tools and pushes"
     assert.deepEqual(whole.results, []);
     assert.deepEqual(regions(whole), []);
     // Named, it's the answer to what was asked: its region names the holder.
-    for (const [path, use] of [['work/a/b', 'deep'], ['work/a/b/inner.txt', 'deep/inner.txt'], ['work/a//b/inner.txt', 'deep/inner.txt']]) {
+    // A doubled separator is the same path, named in its one spelling.
+    for (const [path, named, use] of [['work/a/b', 'work/a/b', 'deep'], ['work/a/b/inner.txt', 'work/a/b/inner.txt', 'deep/inner.txt'], ['work/a//b/inner.txt', 'work/a/b/inner.txt', 'deep/inner.txt']]) {
       const found = await call(m, 'grep', { path, pattern: 'stale' });
       assert.deepEqual(found.results, [], path);
-      assert.deepEqual(regions(found), [[path, `it lies in mount "deep", nested in this one: use "${use}"`]], path);
+      assert.deepEqual(regions(found), [[named, `it lies in mount "deep", nested in this one: use "${use}"`]], path);
     }
     // A file there the outer store doesn't hold is named too.
     env.writeDisk('a/b/other.txt', 'stale words');
@@ -1144,6 +1167,30 @@ describe("another mount's directory, to the outer mount's file tools and pushes"
       ['a/b', true], ['a/b/x', true], ['a//b/x', true], ['a/b/', true], ['./a/b/x', true], ['a/c/../b/x', true],
       ['a/b/../x', false], ['a/bc/x', false], ['a', false], ['', false],
     ] as const) assert.equal(inOtherMount(path, ['a/b']), inside, path);
+  });
+
+  test("a path into the nested directory is read in the outer mount's one spelling: a climb above the root and a separator after the mount's name are refused, and a `..` or a trailing separator names what it reaches", async (t) => {
+    const env = new Env(t);
+    env.writeDisk('a/x.txt', 'x');
+    env.writeDisk('a/b/inner.txt', 'inner');
+    const m = await env.open({}, nested(env));
+    // A `..` with nothing before it to take back climbs above the root, even
+    // where it comes back in by the mount directory's own name.
+    assert.match(await refused(m, 'ls', { path: 'work/../work/a/b' }), /climbs above the root of mount "work"/);
+    // A separator right after the mount's name would make the rest an absolute path.
+    assert.match(await refused(m, 'ls', { path: 'work//a/b' }), /has a separator right after mount "work"/);
+    // A `..` that takes back the nested directory's name names its parent.
+    const listed = async (path: string) => (await call(m, 'ls', { path })).entries;
+    assert.deepEqual(await listed('work/a/b/..'), await listed('work/a'));
+    // A trailing separator names the directory itself.
+    await call(m, 'write', { path: 'work/a/y.txt', content: 'y' });
+    const withSlash = await call(m, 'materialize', { path: 'work/a/' });
+    assert.deepEqual(withSlash.materialized, [{ mount: 'work', path: 'a/y.txt' }]);
+    await call(m, 'write', { path: 'work/a/y.txt', content: 'y, again' });
+    const plain = await call(m, 'materialize', { path: 'work/a' });
+    assert.deepEqual(plain.materialized, withSlash.materialized);
+    assert.deepEqual(Object.keys(plain).sort(), Object.keys(withSlash).sort());
+    assert.equal(env.readDisk('a/b/inner.txt'), 'inner', "the nested mount's file is as it was");
   });
 
   test('a doubled or trailing separator is the nested directory too: a sync or a listing of it takes nothing in, and no push of the outer mount writes there', async (t) => {
@@ -1383,6 +1430,7 @@ describe("an editor's save by rename, with the watcher running", () => {
     const mount = (m as any).mounts.get('work');
     const blob = () => env.store.treeGet(TREE, 'gate.json')?.blobHash;
     await until(() => !!mount.watcherReadyAt && blob() !== undefined, 'the watcher is ready and the catch-up scan took gate.json');
+    await watchersFlow(m, { work: env.dir });
     const v1 = blob();
     env.events.length = 0;
 
@@ -1401,7 +1449,7 @@ describe("an editor's save by rename, with the watcher running", () => {
 
     const v2 = blob();
     env.writeDisk('gate.json', 'v3');
-    await until(() => blob() !== v2, 'a later edit of the new file is taken in');
+    await until(() => blob() !== undefined && blob() !== v2, 'a later edit of the new file is taken in');
   });
 });
 
