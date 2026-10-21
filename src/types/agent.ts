@@ -133,10 +133,12 @@ export interface AgentConfig {
    * How the provider treats this agent's model's thinking. `binds` (default
    * true) says the model's thinking is bound to everything before it, so a
    * change to earlier bytes sets it aside. Under `toolDeclarations:
-   * 'entries'` a binding model consolidates only where no thinking sits
-   * before the compile's `firstChanged` (the first message that compile
+   * 'entries'` a binding model consolidates for free only where no thinking
+   * sits before the compile's `firstChanged` (the first message that compile
    * renders differently from the last one; thinking from there on is set
-   * aside by the compile's own change). The host's model records carry it,
+   * aside by the compile's own change). Past a fifth of the input, or when
+   * a compile is refused over budget with changes kept, it consolidates
+   * anyway, setting that thinking aside. The host's model records carry it,
    * beside "takes entries".
    */
   thinkingBinding?: {

@@ -20,12 +20,15 @@ interface Row { id: string; participant: string; content: ContentBlock[]; metada
 
 /** A context whose compile returns every stored row, with the system
  *  injections it's given, and which records each compile's options. */
-function fakeContext(rows: Row[] = [], opts: { kvUnified?: boolean; firstChanged?: () => number | null } = {}) {
+function fakeContext(rows: Row[] = [], opts: { kvUnified?: boolean; firstChanged?: () => number | null; overBudget?: (rows: Row[]) => boolean; fail?: () => Error | undefined } = {}) {
   let next = rows.length;
   const compiles: Array<{ kvUnifiedImmutablePrefixHash?: string; dryRun?: boolean } | undefined> = [];
   const cm = {
     compile: async (_budget: unknown, injections: Array<{ position: string; content: ContentBlock[] }> | undefined, o?: { kvUnifiedImmutablePrefixHash?: string; dryRun?: boolean }) => {
       compiles.push(o);
+      if (opts.overBudget?.(rows)) throw Object.assign(new Error('over budget'), { name: 'OverBudgetError' });
+      const failure = opts.fail?.();
+      if (failure) throw failure;
       return {
         messages: rows.map((r) => ({ participant: r.participant, content: r.content })),
         systemInjections: (injections ?? []).filter((i) => i.position === 'system').flatMap((i) => i.content),
@@ -447,6 +450,28 @@ describe('toolDeclarations', () => {
       assert.equal(moved.changesRemoved, 1);
       assert.equal(moved.inputTokens, 250);
       assert.ok(moved.changeTokens! * 10 >= 250);
+      assert.equal(moved.forced, undefined, 'a free move');
+    });
+
+    it('moves them anyway once they reach a fifth of the input with no free compile, and not below a fifth', async () => {
+      const price = Math.ceil(JSON.stringify({ type: 'system_change', defineTools: [tool('b')] }).length / 4);
+      const thought: Row = { id: 'thought', participant: 'agent', content: [{ type: 'thinking', thinking: 'why', signature: 's' } as ContentBlock, { type: 'text', text: 'so' }] };
+      const cases = [
+        ['after the change', () => (rows: Row[]) => changeIndex(rows) + 1, {}, false],
+        ['nothing to compare', () => () => null, {}, false],
+        ['a binding model with thinking before it', () => () => 2, { thinkingBinding: { binds: true } }, true],
+      ] as const;
+      for (const [what, makeAt, config, withThinking] of cases) {
+        for (const [input, moves] of [[price * 5, true], [price * 5 + 1, false]] as const) {
+          const rows: Row[] = withThinking ? [said('user', 'hello'), thought, said('user', 'and then')] : [said('user', 'hello')];
+          const at = makeAt();
+          const { agent, events } = await withOneChange(input, () => at(rows), config, rows);
+          const request = await agent.buildActivationRequest([tool('a'), tool('b')]);
+          assert.deepEqual(request.tools, moves ? [tool('a'), tool('b')] : [tool('a')], `${what}, input ${input}`);
+          assert.equal(changeRows(rows).length, moves ? 0 : 1, `${what}, input ${input}`);
+          if (moves) assert.equal((events.at(-1) as Extract<HeadEvent, { type: 'head:moved' }>).forced, 'share', `${what}: forced`);
+        }
+      }
     });
 
     it('keeps them where they happened when the compile re-renders only after them, or nothing changed, or they cost under a tenth', async () => {
@@ -456,6 +481,89 @@ describe('toolDeclarations', () => {
         const request = await agent.buildActivationRequest([tool('a'), tool('b')]);
         assert.deepEqual(request.tools, [tool('a')], `${input} ${at}: the recorded head`);
         assert.equal(changeRows(rows).length, 1, `${input} ${at}: the change stays`);
+      }
+    });
+
+    it('moves the head when a compile is refused over budget with changes kept, and compiles once more', async () => {
+      // Refused while a change row is kept; fits once the head has taken it.
+      const rows = [said('user', 'hello')];
+      let refuse = false;
+      const context = fakeContext(rows, { overBudget: (r) => refuse && r.some((row) => row.participant === 'system') });
+      const heads = memoryHeadDeclarations();
+      const events: HeadEvent[] = [];
+      const agent = agentOn(context, { toolDeclarations: 'entries' }, heads, events);
+      await agent.buildActivationRequest([tool('a')]);
+      await agent.buildActivationRequest([tool('a'), tool('b')]);
+      refuse = true;
+      const compiles = context.compiles.length;
+      const request = await agent.buildActivationRequest([tool('a'), tool('b')]);
+      assert.deepEqual(request.tools, [tool('a'), tool('b')], 'the head took the change');
+      assert.deepEqual(changeRows(rows), []);
+      assert.equal(context.compiles.length - compiles, 2, 'the refused compile, and one more');
+      assert.deepEqual(heads.read('agent')!.tools, [tool('a'), tool('b')]);
+      assert.deepEqual(events.at(-1), { type: 'head:moved', why: 'consolidated', changesRemoved: 1, forced: 'budget' });
+    });
+
+    it('lets a refusal over budget go on when no change is kept, when the compile after the move is refused too, or in a dry run', async () => {
+      const refusal = /over budget/;
+      {
+        const context = fakeContext([said('user', 'hello')], { overBudget: () => true });
+        await assert.rejects(agentOn(context, { toolDeclarations: 'entries' }).buildActivationRequest([tool('a')]), refusal, 'nothing recorded, nothing kept');
+      }
+      {
+        let refuse = false;
+        const context = fakeContext([said('user', 'hello')], { overBudget: () => refuse });
+        const heads = memoryHeadDeclarations();
+        const agent = agentOn(context, { toolDeclarations: 'entries' }, heads);
+        await agent.buildActivationRequest([tool('a')]);
+        refuse = true;
+        const compiles = context.compiles.length;
+        await assert.rejects(agent.buildActivationRequest([tool('a'), tool('b')]), refusal, 'a head recorded, no change kept');
+        assert.equal(context.compiles.length - compiles, 1, 'no compile again');
+        assert.deepEqual(heads.read('agent')!.tools, [tool('a')], 'and the record as it was');
+      }
+      {
+        const rows = [said('user', 'hello')];
+        let failure: Error | undefined;
+        const context = fakeContext(rows, { fail: () => failure });
+        const agent = agentOn(context, { toolDeclarations: 'entries' });
+        await agent.buildActivationRequest([tool('a')]);
+        await agent.buildActivationRequest([tool('a'), tool('b')]);
+        failure = new Error('the store is closed');
+        await assert.rejects(agent.buildActivationRequest([tool('a'), tool('b')]), /the store is closed/, 'another failure');
+        assert.equal(changeRows(rows).length, 1, 'moves nothing');
+      }
+      {
+        const rows = [said('user', 'hello')];
+        let refuse = false;
+        const context = fakeContext(rows, { overBudget: () => refuse });
+        const agent = agentOn(context, { toolDeclarations: 'entries' });
+        await agent.buildActivationRequest([tool('a')]);
+        await agent.buildActivationRequest([tool('a'), tool('b')]);
+        refuse = true;
+        const compiles = context.compiles.length;
+        await assert.rejects(agent.buildActivationRequest([tool('a'), tool('b')]), refusal, 'the changes weren\'t the cause');
+        assert.equal(context.compiles.length - compiles, 2, 'one more compile, not a loop');
+      }
+      {
+        const rows = [said('user', 'hello')];
+        let refuse = false;
+        const context = fakeContext(rows, { overBudget: () => refuse });
+        const agent = agentOn(context, { toolDeclarations: 'entries' });
+        await agent.buildActivationRequest([tool('a')]);
+        await agent.buildActivationRequest([tool('a'), tool('b')]);
+        refuse = true;
+        await assert.rejects(agent.buildActivationRequest([tool('a'), tool('b')], undefined, undefined, undefined, { dryRun: true }), refusal);
+        assert.equal(changeRows(rows).length, 1, 'a dry run moves nothing');
+      }
+      {
+        const rows = [said('user', 'hello')];
+        let refuse = false;
+        const context = fakeContext(rows, { overBudget: () => refuse });
+        const agent = agentOn(context, {});
+        await agent.buildActivationRequest([tool('a')]);
+        refuse = true;
+        await assert.rejects(agent.buildActivationRequest([tool('a'), tool('b')]), refusal, 'on the head');
       }
     });
 

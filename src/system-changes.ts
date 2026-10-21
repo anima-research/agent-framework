@@ -112,6 +112,8 @@ export type HeadEvent =
       changesRemoved: number;
       changeTokens?: number;
       inputTokens?: number;
+      /** A consolidation no compile made free: past a fifth of the input, or a compile refused over budget. */
+      forced?: 'share' | 'budget';
     };
 
 /** The difference between a head with its changes and what the agent advertises now. */
