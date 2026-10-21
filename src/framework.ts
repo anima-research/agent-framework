@@ -12339,10 +12339,13 @@ export class AgentFramework {
   /**
    * The fail-safe's trigger (system-changes.ts): a request that carried a
    * system change, refused with membrane's `systemChangeRefused` (its
-   * recognised wordings, or its own refusal before sending), or, on a model
-   * that doesn't bind its thinking, refused with any 400. A binding model
-   * waits for the recognised refusal, since moving its head sets its thinking
-   * aside, and a 400 about something else shouldn't cost that. True when
+   * recognised wordings, or its own refusal before sending) or with any
+   * other 400. A refusal in wording membrane doesn't know left the change
+   * stored, and every later request carrying it failed the same way, so a
+   * binding model resends too: moving its head sets its thinking aside, the
+   * cost a replacement or a consolidation already has, once per change,
+   * since the resend carries none. That case raises an operator line with
+   * the 400's text, so the cost shows and membrane can learn the wording. True when
    * the agent now keeps to its head until it's built again; the caller then
    * retries the turn at once (attempt + 1, so it continues the same turn:
    * no second undo checkpoint, the turn's tool-call count kept).
@@ -12351,9 +12354,14 @@ export class AgentFramework {
     if (!agent.declaresEntries() || !request?.messages.some(isSystemChangeMessage)) return false;
     const recognised = isMembraneError(error) && error.systemChangeRefused === true;
     const refused = isMembraneError(error) && error.httpStatus === 400;
-    if (!recognised && (agent.bindsThinking || !refused)) return false;
+    if (!recognised && !refused) return false;
     agent.keepToHeadUntilRestart();
     console.error(`[head-declarations] ${agent.name}: a request carrying a system change was refused, so it declares on its head until a restart: ${error.message}`);
+    if (!recognised) {
+      this.opsAlert('head-resend', agent.name,
+        `a 400 membrane doesn't recognise as a refused system change ended a request that carried one, so it goes again on the agent's head${agent.bindsThinking ? ', which sets aside the thinking the request held' : ''}. The 400 may not be about the change. The agent keeps to its head until a restart, so until then each change to its tools or system text rewrites its cache: ${error.message}`,
+        { data: { httpStatus: 400 } });
+    }
     this.emitTrace({ type: 'head:resend', agentName: agent.name, error: error.message });
     return true;
   }

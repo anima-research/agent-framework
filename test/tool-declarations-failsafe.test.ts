@@ -1,10 +1,9 @@
 /**
  * toolDeclarations' fail-safe: a request whose system change the
- * provider refused goes again at once on the agent's head, which it keeps to
- * until it's built again. A binding model waits for the refusal membrane
- * recognises; another resends after any 400 from a request that carried one.
- * The refusal never reaches the error policy, and the resend continues the
- * same turn.
+ * provider refused, or that a 400 ended while it carried one, goes again at
+ * once on the agent's head, which it keeps to until it's built again; a 400
+ * membrane doesn't recognise raises an operator line too. The refusal never
+ * reaches the error policy, and the resend continues the same turn.
  */
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
@@ -181,20 +180,26 @@ describe("toolDeclarations' fail-safe", () => {
     assert.equal(run.onHead, true);
   });
 
-  it('on a binding model, leaves a 400 membrane doesn\'t recognise to the error policy', async () => {
-    const run = await turns({ binds: true, refuse: (r) => (carriesChange(r) ? refusal(false) : undefined) });
-    assert.equal(run.calls.length, 2, 'no resend');
-    assert.equal(run.traces.filter((t) => t.type === 'inference:exhausted').length, 1, 'the refusal ended the turn');
-    assert.equal(run.onHead, false);
-    assert.equal(resends(run.traces), 0);
-    assert.deepEqual(run.policyCalls, [0]);
+  it('resends after a 400 membrane doesn\'t recognise, binding or not, and says so to the operator', async () => {
+    for (const binds of [true, false]) {
+      const run = await turns({ binds, refuse: (r) => (carriesChange(r) ? refusal(false) : undefined) });
+      assert.equal(run.calls.length, 3, `binds ${binds}: a resend`);
+      assert.ok(toolNames(run.calls[2]!).includes(B) && !carriesChange(run.calls[2]!));
+      assert.equal(run.onHead, true);
+      assert.deepEqual(run.policyCalls, []);
+      const alerts = run.traces.filter((t) => t.type === 'ops:alert' && (t as { kind: string }).kind === 'head-resend');
+      assert.equal(alerts.length, 1, `binds ${binds}: one operator line`);
+      const alert = alerts[0] as { message: string; data?: { httpStatus?: number } };
+      assert.match(alert.message, /role system not accepted here/, 'quoting the 400');
+      assert.match(alert.message, /keeps to its head until a restart/);
+      assert.equal(/sets aside the thinking/.test(alert.message), binds, `binds ${binds}: the thinking's cost said only where it's paid`);
+      assert.equal(alert.data?.httpStatus, 400);
+    }
+    const recognised = await turns({ binds: true, refuse: (r) => (carriesChange(r) ? refusal(true) : undefined) });
+    assert.equal(recognised.traces.filter((t) => t.type === 'ops:alert' && (t as { kind: string }).kind === 'head-resend').length, 0, 'a refusal membrane recognises needs none');
   });
 
-  it('on a model that doesn\'t bind, resends after any 400 from a request that carried a change, but not after another failure', async () => {
-    const after400 = await turns({ binds: false, refuse: (r) => (carriesChange(r) ? refusal(false) : undefined) });
-    assert.equal(after400.calls.length, 3);
-    assert.ok(toolNames(after400.calls[2]!).includes(B));
-    assert.equal(after400.onHead, true);
+  it('leaves a failure that isn\'t a 400 to the error policy', async () => {
     const after500 = await turns({ binds: false, refuse: (r) => (carriesChange(r) ? serverError() : undefined) });
     assert.equal(after500.calls.length, 2, 'a 500 is the error policy\'s');
     assert.equal(after500.onHead, false);
