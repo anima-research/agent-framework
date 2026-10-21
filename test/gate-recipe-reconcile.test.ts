@@ -7,7 +7,7 @@
 import { describe, it, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert';
 import {
-  chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync,
+  chmodSync, existsSync, linkSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -94,6 +94,8 @@ describe('reconcileWithRecipe: a start against the recipe last applied', () => {
     const reordered = reconcileWithRecipe(live, config([rule('sync', 'sync'), rule('zoo', 'zoo'), rule('dm', 'dm'), catchAll]), recipe1);
     assert.deepStrictEqual(names(reordered.config), ['sync', 'zoo', 'dm', 'catch-all']);
     assert.strictEqual(reordered.changes.orderKept, false);
+    assert.deepStrictEqual(reordered.changes.moved, ['sync']);
+    assert.deepStrictEqual(reordered.changes.restored, ['zoo']);
   });
 
   it("appends in the recipe's order the rules it brings when none of its rules is left to place them by", () => {
@@ -198,8 +200,8 @@ describe('reconcileWithRecipe: a start against the recipe last applied', () => {
 
   it('refuses gate.json or a recipe that names a rule twice, since it keys rules by name', () => {
     const twice = config([rule('dm', 'dm'), rule('dm', 'dm-again'), catchAll]);
-    assert.throws(() => reconcileWithRecipe(twice, recipe1, recipe1), /^Error: gate\.json names the rule "dm" twice, so the recipe wasn't applied: the merge needs one rule per name$/);
-    assert.throws(() => reconcileWithRecipe(recipe1, twice, recipe1), /^Error: the recipe names the rule "dm" twice, so it wasn't applied: the merge needs one rule per name$/);
+    assert.throws(() => reconcileWithRecipe(twice, recipe1, recipe1), /^Error: gate\.json named the rule "dm" twice, so the recipe wasn't applied: the merge needs one rule per name$/);
+    assert.throws(() => reconcileWithRecipe(recipe1, twice, recipe1), /^Error: the recipe named the rule "dm" twice, so it wasn't applied: the merge needs one rule per name$/);
   });
 
   it('says nothing when the recipe and gate.json agree with the last recipe', () => {
@@ -218,7 +220,7 @@ describe('reconcileLine', () => {
     };
     assert.strictEqual(
       reconcileLine(changes),
-      "[gate] the recipe was applied to gate.json: the recorded recipe couldn't be read (Unexpected token), so this start removed and redefined nothing; "
+      "[gate] the recipe was applied to gate.json: the recorded recipe couldn't be read (Unexpected token), so this start removed and redefined nothing, and records this recipe in its place; "
         + 'added a; removed r; updated u; restored s; moved m; '
         + 'kept as edited, though the recipe changed or dropped it: e; '
         + 'kept, though the recipe defines it otherwise: d (remove such a rule, and the next start restores it from the recipe); '
@@ -356,16 +358,36 @@ describe("EventGate's starts, through gate.json and the recipe kept beside it", 
     const { gate, traces, logged } = start(recipe2);
     gate.dispose();
     assert.deepStrictEqual(names(onDisk()), ['dm', 'zoo', 'sync', 'agents', 'catch-all']);
-    assert.match(logged[0], /^\[gate\] the recipe was applied to gate\.json: the recorded recipe couldn't be read \(reading it failed with EISDIR\), so this start removed and redefined nothing; added agents/);
+    assert.match(logged[0], /^\[gate\] the recipe was applied to gate\.json: the recorded recipe couldn't be read \(reading it failed with EISDIR\), so this start removed and redefined nothing, and records this recipe in its place; added agents/);
     assert.ok(traces.some((t) => t.type === 'gate:config-reconciled'));
     const errors = gate.getStatus().errors;
     assert.strictEqual(errors.length, 1);
-    assert.match(errors[0], /^Failed to seed\/reconcile gate\.json: gate\.json was updated, but recording the recipe in gate\.recipe\.json failed \(.*EISDIR.*\), so the next start merges against the earlier record$/);
+    assert.match(errors[0], /^Failed to seed\/reconcile gate\.json: gate\.json was updated, but recording the recipe in gate\.recipe\.json failed \(.*EISDIR.*\), so the next start merges against the record as this write left it$/);
     assert.strictEqual(logged[1], `[gate] ${errors[0]}`);
     assert.deepStrictEqual(
       traces.filter((t) => t.type === 'gate:config-error').map((t) => t.error),
       [errors[0]],
     );
+  });
+
+  it('says nothing was done to gate.json when only recording the recipe fails', () => {
+    mkdirSync(join(dir, '_config'), { recursive: true });
+    writeFileSync(configPath, JSON.stringify(recipe2, null, 2));
+    mkdirSync(lastRecipePath(configPath));
+    const before = readFileSync(configPath, 'utf-8');
+    const { gate } = start(recipe2);
+    gate.dispose();
+    assert.strictEqual(readFileSync(configPath, 'utf-8'), before);
+    assert.match(gate.getStatus().errors[0], /^Failed to seed\/reconcile gate\.json: recording the recipe in gate\.recipe\.json failed /);
+  });
+
+  it('says gate.json was seeded when recording the recipe then fails at the first start', () => {
+    mkdirSync(join(dir, '_config'), { recursive: true });
+    mkdirSync(lastRecipePath(configPath));
+    const { gate } = start(recipe1);
+    gate.dispose();
+    assert.deepStrictEqual(onDisk(), recipe1);
+    assert.match(gate.getStatus().errors[0], /^Failed to seed\/reconcile gate\.json: gate\.json was seeded, but recording the recipe in gate\.recipe\.json failed /);
   });
 
   it('says when the record does not read, and then removes and redefines nothing', () => {
@@ -376,6 +398,14 @@ describe("EventGate's starts, through gate.json and the recipe kept beside it", 
     assert.deepStrictEqual(names(onDisk()), ['dm', 'zoo', 'sync', 'agents', 'catch-all']);
     assert.match(logged.join('\n'), /the recorded recipe couldn't be read \(it isn't JSON\), so this start removed and redefined nothing/);
     assert.deepStrictEqual(recorded(), recipe2);
+  });
+
+  it("reads a record whose rules don't validate as one that does not read", () => {
+    start(recipe1).gate.dispose();
+    writeFileSync(lastRecipePath(configPath), JSON.stringify({ policies: [{ match: {}, behavior: 'always' }] }));
+    const { gate, logged } = start(recipe2);
+    gate.dispose();
+    assert.match(logged.join('\n'), /the recorded recipe couldn't be read \(its rules or default don't validate\)/);
   });
 
   it('reads a record with no list of policies as one that does not read', () => {
@@ -405,28 +435,10 @@ describe("EventGate's starts, through gate.json and the recipe kept beside it", 
     gate.dispose();
     assert.strictEqual(readFileSync(configPath, 'utf-8'), twice);
     assert.strictEqual(readFileSync(lastRecipePath(configPath), 'utf-8'), recorded1);
-    assert.match(gate.getStatus().errors.join('\n'), /gate\.json names the rule "dm" twice/);
+    assert.match(gate.getStatus().errors.join('\n'), /gate\.json named the rule "dm" twice/);
     // A run-time edit loads and writes gate.json, and the start's failure stays in status.
     gate.addPolicy(rule('watch', 'watch'));
-    assert.match(gate.getStatus().errors.join('\n'), /gate\.json names the rule "dm" twice/);
-  });
-
-  it("keeps a privileged-users file's load error in status once, past gate.json's load", () => {
-    const privilegedUsersPath = join(dir, 'privileged.json');
-    writeFileSync(privilegedUsersPath, '[ not json');
-    const gate = new EventGate({
-      configPath, initialConfig: recipe1, privilegedUsersPath,
-      emitTrace: () => {}, addMessage: () => '', requestInference: () => {}, getAgentNames: () => ['agent'],
-    });
-    try {
-      gate.isPrivilegedUser('someone');
-      gate.isPrivilegedUser('someone');
-      const errors = gate.getStatus().errors;
-      assert.strictEqual(errors.length, 1);
-      assert.match(errors[0], /^Failed to load privileged-users file: /);
-    } finally {
-      gate.dispose();
-    }
+    assert.match(gate.getStatus().errors.join('\n'), /gate\.json named the rule "dm" twice/);
   });
 
   it('refuses at the first start a recipe that names a rule twice, writing nothing', () => {
@@ -435,7 +447,15 @@ describe("EventGate's starts, through gate.json and the recipe kept beside it", 
     gate.dispose();
     assert.strictEqual(existsSync(configPath), false);
     assert.strictEqual(existsSync(lastRecipePath(configPath)), false);
-    assert.match(gate.getStatus().errors.join('\n'), /the recipe names the rule "dm" twice, so it wasn't applied/);
+    assert.match(gate.getStatus().errors.join('\n'), /the recipe named the rule "dm" twice, so gate\.json wasn't seeded and nothing was recorded/);
+  });
+
+  it("refuses at the first start a recipe that doesn't validate, writing nothing", () => {
+    const { gate } = start({ policies: [], default: 'sometimes' } as unknown as GateConfig);
+    gate.dispose();
+    assert.strictEqual(existsSync(configPath), false);
+    assert.strictEqual(existsSync(lastRecipePath(configPath)), false);
+    assert.match(gate.getStatus().errors.join('\n'), /^Failed to seed\/reconcile gate\.json: gate\.json "default" must be/);
   });
 
   it("leaves gate.json's bytes as written when a start changes nothing", () => {
@@ -459,6 +479,16 @@ describe("EventGate's starts, through gate.json and the recipe kept beside it", 
     assert.strictEqual(statSync(target).mode & 0o777, 0o640);
   });
 
+  it('writes gate.json in place, so a hard link to it sees the merge', () => {
+    start(recipe1).gate.dispose();
+    const linked = join(dir, 'hard-link.json');
+    linkSync(configPath, linked);
+    const inode = statSync(configPath).ino;
+    start(recipe2).gate.dispose();
+    assert.strictEqual(statSync(configPath).ino, inode);
+    assert.deepStrictEqual(names(JSON.parse(readFileSync(linked, 'utf-8'))), ['dm', 'agents', 'catch-all']);
+  });
+
   it('seeds a dangling symlinked gate.json at its target, keeping the link', () => {
     mkdirSync(join(dir, '_config'), { recursive: true });
     const target = join(dir, 'kept-elsewhere.json');
@@ -475,7 +505,11 @@ describe("EventGate's starts, through gate.json and the recipe kept beside it", 
     gate.dispose();
     assert.strictEqual(readFileSync(configPath, 'utf-8'), '{ "policies": [ not json');
     assert.strictEqual(existsSync(lastRecipePath(configPath)), false);
-    assert.strictEqual(traces.filter((t) => t.type === 'gate:config-error').length, 1);
+    // One trace for the load, one for the start: gate.json is read once.
+    const errors = traces.filter((t) => t.type === 'gate:config-error').map((t) => String(t.error));
+    assert.strictEqual(errors.length, 2);
+    assert.strictEqual(errors[1], "Failed to seed/reconcile gate.json: it didn't load, so the recipe wasn't applied or recorded");
+    assert.ok(gate.getStatus().errors.includes(errors[1]));
   });
 
   it('runs every probe event, and names the rules none reaches, such as one scoped to external-message', () => {

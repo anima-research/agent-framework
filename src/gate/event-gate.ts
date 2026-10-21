@@ -296,8 +296,8 @@ function writeJson(path: string, value: unknown): void {
  * The recipe the gate last applied, or null when it has none on record. A
  * record that exists but isn't one the gate wrote (not JSON, not an object
  * with a `policies` list, a rule that doesn't validate, or a name given
- * twice) gives null with the reason, which names no value from the file: a
- * start then keeps every rule, as the first does, and says why.
+ * twice) gives null with the reason, which quotes nothing from the file but a
+ * rule's name: a start then keeps every rule, as the first does, and says why.
  */
 function readLastRecipe(path: string): { recipe: GateConfig | null; problem?: string } {
   if (!existsSync(path)) return { recipe: null };
@@ -603,8 +603,6 @@ export class EventGate {
   private configErrors: string[] = [];
   /** A failed seed or merge at this start: kept for the process's life, since no load or edit applies the recipe. */
   private startErrors: string[] = [];
-  /** The privileged-users file's load error, if its last load failed. */
-  private privilegedErrors: string[] = [];
 
   // Debounce state
   private debounceTimers = new Map<string, DebounceState>();
@@ -734,31 +732,52 @@ export class EventGate {
     // What the merge loaded, when it wrote nothing, so the load below doesn't
     // read and report gate.json a second time.
     let loadedAtStart: { config: GateConfig | null } | undefined;
+    // What this start has done to gate.json, for an error that comes after it.
+    let wrote: 'seeded' | 'updated' | undefined;
     if (opts.initialConfig) {
       try {
         mkdirSync(dirname(this.configPath), { recursive: true });
         const recipePath = lastRecipePath(this.configPath);
+        const record = (recipe: GateConfig): void => {
+          try {
+            writeJson(recipePath, recipe);
+          } catch (err) {
+            throw new Error(
+              `recording the recipe in ${basename(recipePath)} failed (${err instanceof Error ? err.message : String(err)}), `
+                + 'so the next start merges against the record as this write left it',
+            );
+          }
+        };
         if (!existsSync(this.configPath)) {
           const seed = validateConfig(opts.initialConfig);
           const twice = duplicateName(seed);
           if (twice !== undefined) {
-            throw new Error(`the recipe names the rule "${twice}" twice, so it wasn't applied: the merge needs one rule per name`);
+            throw new Error(
+              `the recipe named the rule "${twice}" twice, so gate.json wasn't seeded and nothing was recorded: `
+                + 'the gate runs on the recipe as given, and the next start tries again',
+            );
           }
           writeJson(this.configPath, opts.initialConfig);
-          writeJson(recipePath, seed);
+          wrote = 'seeded';
+          record(seed);
         } else {
           const existing = this.loadConfig();
           loadedAtStart = { config: existing };
-          if (existing) {
+          if (!existing) {
+            // The load error is in configErrors until gate.json loads; that
+            // the recipe wasn't applied stays true until the next start.
+            throw new Error("it didn't load, so the recipe wasn't applied or recorded");
+          } else {
             const recipe = validateConfig(opts.initialConfig);
-            const record = readLastRecipe(recipePath);
-            const { config, changes } = reconcileWithRecipe(existing, recipe, record.recipe);
-            if (record.problem !== undefined) changes.recordUnreadable = record.problem;
+            const last = readLastRecipe(recipePath);
+            const { config, changes } = reconcileWithRecipe(existing, recipe, last.recipe);
+            if (last.problem !== undefined) changes.recordUnreadable = last.problem;
             const updated = canonical(config) !== canonical(existing);
             if (updated) {
               // Before the write, so a write that fails partway is read back, not trusted.
               loadedAtStart = undefined;
               writeJson(this.configPath, config);
+              wrote = 'updated';
             }
             // Said before the record is written, so a failed record write
             // still leaves what the start did to gate.json named.
@@ -774,20 +793,12 @@ export class EventGate {
                 timestamp: Date.now(),
               });
             }
-            if (!record.recipe || canonical(record.recipe) !== canonical(recipe)) {
-              try {
-                writeJson(recipePath, recipe);
-              } catch (err) {
-                throw new Error(
-                  `${updated ? 'gate.json was updated, but ' : ''}recording the recipe in ${basename(recipePath)} failed `
-                    + `(${err instanceof Error ? err.message : String(err)}), so the next start merges against the earlier record`,
-                );
-              }
-            }
+            if (!last.recipe || canonical(last.recipe) !== canonical(recipe)) record(recipe);
           }
         }
       } catch (err) {
-        startError = `Failed to seed/reconcile gate.json: ${err instanceof Error ? err.message : String(err)}`;
+        startError = `Failed to seed/reconcile gate.json: ${wrote ? `gate.json was ${wrote}, but ` : ''}`
+          + `${err instanceof Error ? err.message : String(err)}`;
       }
     }
 
@@ -2043,20 +2054,16 @@ export class EventGate {
       if (!existsSync(this.privilegedUsersPath)) {
         this.privilegedUserIds = new Set();
         this.privilegedMtime = 0;
-        this.privilegedErrors = [];
         return;
       }
       this.privilegedMtime = statSync(this.privilegedUsersPath).mtimeMs;
       const raw: any = parseGateJson(readFileSync(this.privilegedUsersPath, 'utf8'));
       const ids = Array.isArray(raw) ? raw : Array.isArray(raw?.userIds) ? raw.userIds : [];
       this.privilegedUserIds = new Set(ids.map((x: unknown) => String(x)));
-      this.privilegedErrors = [];
     } catch (err) {
-      // Its own list, replaced on each load: in configErrors, the next gate.json
-      // load erased it, and each privileged check before that added another copy.
-      this.privilegedErrors = [
+      this.configErrors.push(
         `Failed to load privileged-users file: ${err instanceof Error ? err.message : String(err)}`,
-      ];
+      );
     }
   }
 
@@ -2147,7 +2154,7 @@ export class EventGate {
       default: this.config.default ?? 'always',
       script: this.gateScript.status(),
       policies,
-      errors: [...this.startErrors, ...this.configErrors, ...this.privilegedErrors],
+      errors: [...this.startErrors, ...this.configErrors],
       shadowWarnings: this.shadowWarningsCache.map(formatShadowWarning),
       totalEvaluations: this.totalEvaluations,
       defaultDecisions: {

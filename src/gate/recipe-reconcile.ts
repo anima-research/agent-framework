@@ -132,11 +132,11 @@ export function reconcileWithRecipe(
 ): { config: GateConfig; changes: RecipeChanges } {
   const liveDuplicate = duplicateName(live);
   if (liveDuplicate !== undefined) {
-    throw new Error(`gate.json names the rule "${liveDuplicate}" twice, so the recipe wasn't applied: the merge needs one rule per name`);
+    throw new Error(`gate.json named the rule "${liveDuplicate}" twice, so the recipe wasn't applied: the merge needs one rule per name`);
   }
   const recipeDuplicate = duplicateName(recipe);
   if (recipeDuplicate !== undefined) {
-    throw new Error(`the recipe names the rule "${recipeDuplicate}" twice, so it wasn't applied: the merge needs one rule per name`);
+    throw new Error(`the recipe named the rule "${recipeDuplicate}" twice, so it wasn't applied: the merge needs one rule per name`);
   }
 
   const changes: RecipeChanges = {
@@ -262,7 +262,7 @@ export function reconcileWithRecipe(
 export function reconcileLine(changes: RecipeChanges): string | null {
   const parts: string[] = [];
   if (changes.recordUnreadable !== undefined) {
-    parts.push(`the recorded recipe couldn't be read (${changes.recordUnreadable}), so this start removed and redefined nothing`);
+    parts.push(`the recorded recipe couldn't be read (${changes.recordUnreadable}), so this start removed and redefined nothing, and records this recipe in its place`);
   }
   const list = (label: string, names: string[]) => {
     if (names.length > 0) parts.push(`${label} ${names.join(', ')}`);
