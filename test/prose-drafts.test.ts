@@ -584,9 +584,11 @@ describe('held prose drafts, end to end', () => {
       assert.equal(h.publishes().filter((p) => p.text === 'scout words').length, 0);
       // Residents of one framework share a message slot (#197), so the
       // notice is visible there too; it names whose drafts it means.
-      const held = h.texts('scout').find((t) => t.startsWith(`[drafts] scout: not sent — a plain-speech segment held as draft ${mine.id}`));
+      const held = h.texts('scout').find((t) => t.startsWith('[drafts] scout: '));
       assert.ok(held);
-      assert.ok(!held!.includes('scout words'), `the held-draft notice quotes none of the draft's words: ${held}`);
+      assert.ok(held!.startsWith(`[drafts] scout: your plain-speech message starting "scout words" was not sent and is instead ` +
+        `held as draft ${mine.id} because there was an explicit send in the same round as the plain speech. `),
+        `the held-draft notice names the message by its opening words, and why it was held: ${held}`);
     } finally {
       await h.close();
     }
@@ -2167,7 +2169,9 @@ describe('held drafts: exact runs, hybrid envelopes beside a send, and turn-end 
       const notice = h.messages().find((m) => (m.metadata as { kind?: string; draftIds?: string[] } | undefined)?.kind === 'prose-drafts'
         && (m.metadata as { draftIds?: string[] }).draftIds?.includes(copy.id))!;
       const words = notice.content.map((b) => (b as { text?: string }).text ?? '').join('');
-      assert.ok(words.startsWith(`[drafts] scout: 2 plain-speech segments held as drafts ${free.id}, ${copy.id} — `), `no "not sent" over words that may be out: ${words}`);
+      assert.ok(words.startsWith(`[drafts] scout: your 2 plain-speech messages are held as drafts ${free.id} (starting "plain words") ` +
+        `and ${copy.id} (starting "possibly sent and a new line") because there was an explicit send in the same round as the plain speech. `),
+        `no "not sent" over words that may be out: ${words}`);
       assert.ok(words.includes(`drafts(action: "resend", draftIds: ["${free.id}"], destination: "#channel") delivers it unchanged`), words);
       assert.ok(words.includes(`${copy.id} includes the words of ${original.id}, and ${original.id}'s attempt to #room (Guild One) (${ROOM})`), words);
       assert.ok(words.includes(`so resending ${copy.id} could post it twice (to send it anyway: drafts(action: "resend", draftIds: ["${copy.id}"], destination: "#channel", confirmDuplicate: true))`), words);
