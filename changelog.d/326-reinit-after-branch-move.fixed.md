@@ -76,9 +76,10 @@
   writes held for it while the store was held go with it: its window's
   release stores what its store takes of them there and passes any failed
   reply on to the primary agent. On a quiesced host that release is
-  postponed to the resume, and a `stop()` or a crash before the resume drops
-  all but a failed reply, logged, which goes to the primary at the restarted
-  host's resume. The alert says how many, and which of these the disposal
+  postponed to the resume. A `stop()` before the resume drops all but a
+  failed reply, logged, and after a crash the restarted host's resume drops
+  them the same way; that reply goes to the primary at the restarted host's
+  resume. The alert says how many, and which of these the disposal
   met, since the fork its channel spawns next, under a new name,
   doesn't get them. If
   disposing it fails partway, the alert says that too, and the move's other

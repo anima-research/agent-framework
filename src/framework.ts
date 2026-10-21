@@ -2063,8 +2063,9 @@ export function disposalAlert(disposal: {
     ? ''
     : releasePostponed
       ? `${goes}its window's release was postponed to the host's resume, which stores what its store takes of ${them} ` +
-        'there and passes any failed reply on to the primary agent; a stop() or a crash before the resume drops ' +
-        "all but a failed reply, logged, and that goes to the primary at the restarted host's resume."
+        'there and passes any failed reply on to the primary agent. A stop() before the resume drops all but a ' +
+        "failed reply, logged, and after a crash the restarted host's resume drops them the same way; that reply " +
+        "goes to the primary at the restarted host's resume."
       : cleanupFailed
         ? ` ${writes} held for it while the store was held may be in its window, where no agent reads ${them}, ` +
           'still queued under its name, or in neither, as far as that cleanup got. A flush that meets one still ' +

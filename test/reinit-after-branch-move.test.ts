@@ -11,7 +11,7 @@
 import { describe, it, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
 import { tmpdir } from 'node:os';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { cpSync, mkdtempSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { AutobiographicalStrategy, ContextManager as StoreWindow, PassthroughStrategy } from '@animalabs/context-manager';
 import { JsStore } from '@animalabs/chronicle';
@@ -2333,15 +2333,20 @@ describe('conversation forks and an undo', () => {
   // postponed releases (#616) drains them: a failed reply goes on to the
   // primary, and the rest is dropped.
   // A disposal whose cleanup fails after its release was postponed still has
-  // its release waiting, and the alert says so (af-353-r7's I6).
-  for (const after of ['resume', 'stop', 'cleanup', 'released before the report'] as const) {
+  // its release waiting, and the alert says so (af-353-r7's I6). A crash
+  // leaves the store and its recovery files as they are on disk: the copy of
+  // the host's directory right after the disposal stands in for it, and a
+  // second host boots from the copy (Naomi-2422, room-203 #178882).
+  for (const after of ['resume', 'stop', 'crash', 'cleanup', 'released before the report'] as const) {
     it(after === 'resume'
       ? "a fork disposed on a quiesced host: its window takes the writes held for it at the host's resume, and the primary is told of a failed reply"
       : after === 'stop'
         ? "a fork disposed on a quiesced host: a stop before the resume drops its held writes, logged, stored nowhere, and passes a failed reply on to the primary, told at the restarted host's resume"
-        : after === 'cleanup'
-          ? "a fork disposed on a quiesced host whose cleanup then fails: its alert says the release was postponed to the resume, which takes the writes held for it"
-          : "a fork disposed on a quiesced host whose postponed release runs before the alert is made: the alert says the release was postponed, as the disposal met it",
+        : after === 'crash'
+          ? "a fork disposed on a quiesced host: after a crash, the restarted host's resume drops its held writes, logged, stored nowhere, and passes a failed reply on to the primary"
+          : after === 'cleanup'
+            ? "a fork disposed on a quiesced host whose cleanup then fails: its alert says the release was postponed to the resume, which takes the writes held for it"
+            : "a fork disposed on a quiesced host whose postponed release runs before the alert is made: the alert says the release was postponed, as the disposal met it",
     { timeout: 90_000 }, async () => {
       const tempDir = mkdtempSync(join(tmpdir(), `reinit-fork-quiesced-${after}-`));
       const config = () => ({
@@ -2428,12 +2433,38 @@ describe('conversation forks and an undo', () => {
         }
         const reinit = alerts.filter((alert) => alert.kind === 'context-reinit-failed');
         assert.deepEqual(reinit.map((alert) => alert.agentName), ['a-late-g1'], JSON.stringify(alerts));
-        assert.match(reinit[0]!.message, / The 3 writes held for it while the store was held go with it, so that fork doesn't get them: its window's release was postponed to the host's resume, which stores what its store takes of them there and passes any failed reply on to the primary agent; a stop\(\) or a crash before the resume drops all but a failed reply, logged, and that goes to the primary at the restarted host's resume\. Its messages stay on the branches/);
+        assert.match(reinit[0]!.message, / The 3 writes held for it while the store was held go with it, so that fork doesn't get them: its window's release was postponed to the host's resume, which stores what its store takes of them there and passes any failed reply on to the primary agent\. A stop\(\) before the resume drops all but a failed reply, logged, and after a crash the restarted host's resume drops them the same way; that reply goes to the primary at the restarted host's resume\. Its messages stay on the branches/);
         if (after === 'cleanup') {
           assert.match(reinit[0]!.message, /, but its cleanup failed \(below\)\. /);
           assert.match(reinit[0]!.message, / Its cleanup failed: .*injected checkpoint eviction failure\.$/);
         }
-        if (after === 'released before the report') {
+        if (after === 'crash') {
+          // What a crash leaves: the store and its recovery files as they are
+          // on disk now, with the release's postponement gone with the process.
+          const crashed = join(tempDir, 'crashed');
+          cpSync(join(tempDir, 'store'), join(crashed, 'store'), { recursive: true });
+          await framework.stop();
+          const mark = logged.length;
+          const booted = await AgentFramework.create({ ...config(), storePath: join(crashed, 'store') });
+          try {
+            const kept = (booted as unknown as { deferredMessages: Array<{ forAgent?: string; content: unknown }> }).deferredMessages
+              .filter((msg) => /DURING THE UNDO|A REPLY THAT FAILED|A reply by a-late-g1/.test(JSON.stringify(msg.content)));
+            assert.equal(kept.length, 3, `the persisted queue kept the three: ${JSON.stringify(kept)}`);
+            await booted.resume();
+            assert.equal(queuedForFork(booted), 0, 'nothing stays queued for the fork');
+            const dropped = logged.slice(mark).filter((line) => /delivery target "a-late-g1" is not a registered agent/.test(line));
+            assert.equal(dropped.length, 2, logged.slice(mark).join('\n'));
+            assert.equal(notices(booted).length, 1, 'the primary is told of the failed reply');
+            const window = await StoreWindow.open({
+              store: booted.getStore(), namespace: 'conversations/a-late-g1', isolate: true, strategy: new PassthroughStrategy(),
+            });
+            for (const texts of [storedTexts(booted.getAgent('a')!.getContextManager()), storedTexts(window)]) {
+              assert.ok(!texts.some((text) => /DURING THE UNDO|A REPLY THAT FAILED/.test(text)), JSON.stringify(texts));
+            }
+          } finally {
+            await booted.stop();
+          }
+        } else if (after === 'released before the report') {
           await framework.resume();
           await framework.stop();
         } else if (after !== 'stop') {
