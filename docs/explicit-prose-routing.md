@@ -22,23 +22,56 @@ A prose segment's FIRST line may carry a routing prefix:
 ```
 
 - Body may start on the same line (`>>#ops deploy done`) or the next.
-- **Sticky within the turn:** the first resolved target applies to later
-  unprefixed segments of the SAME turn. Cross-turn, nothing is implicit.
+- **Sticky within the turn:** the latest resolved target applies to later
+  unprefixed segments of the SAME turn, including those a later stream of it
+  writes, such as a framework retry's, a budget restart's or the compile a
+  provider-capacity hold defers the turn to. A round kept private (one that
+  calls `skip_reply`, or has a same-round private think) sets no target. A
+  target its server declared inbound-only is refused and clears the turn's
+  target, so later unprefixed segments bounce until a new `>>` target.
+  Cross-turn, nothing is implicit.
 - **Continuation modifier:** ` !` immediately after the target
   (`>>#ops !` / `>>skip_reply !`) requests an immediate re-wake after this turn
   ends, instead of the default pause-until-next-event. Gives prose the same
   "keep going" ability tool turns have — wanted for robotics-like loops where
   an end-of-turn pause is undesirable.
 - `{{unsent}}` anywhere in the body is replaced at delivery with the
-  retained undelivered text (see below), enabling verbatim resend without retyping.
+  latest bounced text, held as a draft (see below), enabling verbatim resend
+  without retyping.
 
 ## The bounce (unprefixed prose)
 
-Unprefixed prose with no sticky target is **never delivered**. It is retained
-per-agent (latest-wins) and a system notice is appended telling the
-agent how to resend: `>>#channel {{unsent}}`. The notice requests inference so
-the resend can happen immediately — capped at 2 consecutive bounce-wakes per
-agent (then notices append without waking, breaking any loop).
+Unprefixed prose with no sticky target is **never delivered**. It is held as a
+draft (src/prose-drafts.ts) — never published except by the agent's own
+resend — and a system notice naming the draft tells
+the agent how to resend: `>>#channel {{unsent}}`, or the `drafts` tool by id.
+The notice requests inference so the resend can happen immediately — capped at
+2 consecutive bounce-wakes per agent (then notices append without waking,
+breaking any loop).
+
+`{{unsent}}` means the latest bounce while that draft is open (latest-wins, as
+the clipboard it replaced was), and `>>skip_reply {{unsent}}` dismisses it.
+Earlier bounces stay in the agent's drafts, by id, until resent, dismissed or
+let go (an agent's 100 newest drafts are always kept, and an older one for 7
+days after anything last happened to it); drafts survive restarts and branch
+moves, and a delivery through `{{unsent}}` is recorded on the draft like any
+resend.
+
+When the latest bounce may already have been posted (an attempt's outcome is
+unknown), or is being sent or queued in a resend right now, what happens
+depends on the route:
+- **Delivery** (`>>#channel … {{unsent}} …`): nothing is sent. The agent is
+  told. While the bounce is being sent or queued, it is told to wait for that
+  result; once the bounce may already have been posted, it can resend it with
+  the `drafts` tool's `confirmDuplicate`, though that could post it twice.
+  The envelope's own words are held as a new bounce draft, with `{{unsent}}`
+  written out and the risk carried, so that draft too can be resent only
+  with `confirmDuplicate`. A bare `{{unsent}}` holds nothing new: its words
+  already are the bounce.
+- **Hold** (an envelope that bounces, or one an explicit send held back): the
+  bounce's words are copied into the new draft with `{{unsent}}` written out,
+  and the draft carries the same risk (`inheritedRisk`), so it reads
+  unconfirmed until a confirmed delivery.
 
 ## What explicit mode retires (for that agent)
 
@@ -50,7 +83,7 @@ agent (then notices append without waking, breaking any loop).
 
 Explicit send tools (`send_message` etc.) are unchanged. Channel lifecycle
 invariants (send-opens-channel, subscribed⇒open) are unchanged — a `>>` send
-into a closed channel opens it, with the usual `[channels]` notice.
+into a channel decided closed opens it, with the usual `[channels]` notice.
 
 ## Teaching the grammar (teach-by-bounce)
 
@@ -58,8 +91,8 @@ The grammar is never injected into context. The mode switch appends one short
 durable notice (persisted per agent, so reboots never re-notice); the first
 undelivered text produces a bounce notice carrying the exact resend syntax —
 the model learns by doing, and the knowledge accretes into its own history.
-The full reference is available on demand via the **`prose_help` tool**, whose
-result is model-requested content. The system prompt is never touched: those
+When the agent's `allowedTools` permits `prose_help`, the full reference is
+available on demand through that tool. Its result is model-requested content. The system prompt is never touched: those
 bytes belong to the recipe, and the deepest KV prefix must not vary with
 framework code.
 

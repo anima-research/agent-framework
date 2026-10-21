@@ -2,16 +2,47 @@ import type { Membrane, NormalizedMessage, NormalizedRequest, ContentBlock, Yiel
 import { isAbortedResponse } from '@animalabs/membrane';
 import { createHash } from 'node:crypto';
 import type { CacheWireReceipt, KvUnifiedRequestHooks } from './kv-unified-wire.js';
-import { ToolResultGuard, TOOL_RESULT_GUARD_NOTICE } from './tool-result-guard.js';
+import { ToolResultGuard } from './tool-result-guard.js';
+import { withoutTokenEstimates } from './thinking-token-stamp.js';
+import { assertBooleanSetting, holdsSettings } from './config-checks.js';
 import {
-  toolResultDataToHistoryString,
+  CONTINUE_ROW,
+  continueTurn,
+  indexRequestOnlyRows,
+  renderRequestOnlyRows,
+  silentHeartbeatSeparatorTurn,
+  tickKey,
+  toolLoopPrompt,
+  type RequestOnlyPrompt,
+  type RequestOnlyRowIndex,
+  type SilentHeartbeatTick,
+  type StoredRowLike,
+} from './silent-heartbeat.js';
+import { randomUUID } from 'node:crypto';
+import {
+  nonErrorResultText,
   truncateForHistory,
   DEFAULT_TOOL_RESULT_INLINE_MAX_CHARS,
 } from './tool-result-history.js';
 
+export interface ActivationRequestOptions {
+  /** The silent heartbeat tick this request answers, if any. */
+  silentHeartbeat?: SilentHeartbeatTick;
+  /** A request that will never be sent (a preview): compile it as a dry
+   *  run (see `compileWithInjections` for what that leaves alone). */
+  dryRun?: boolean;
+}
+
 export interface StartStreamResult {
   stream: YieldingStream;
   request: NormalizedRequest;
+  /** The request-only `[Continue]` prompt this request's reply follows, if
+   *  any, read from the request: a new one when it ends on `[Continue]`;
+   *  else, when it ends on tool results, the prompt of the reply that called
+   *  those tools (`toolLoopPrompt`); else none. The framework stamps the
+   *  reply's rows with it (`metadata.promptedBy`), for later compiles to
+   *  render it before them. */
+  continuePrompt?: RequestOnlyPrompt;
   takeKvSubmission?: () => { submissionId: string; wireReceipt: CacheWireReceipt } | undefined;
   drainKvSubmissionIds?: () => string[];
 }
@@ -22,6 +53,7 @@ import type {
   CompileResult,
   HotContextSettingsStatus,
   HotContextSettingsUpdate,
+  MessageMetadata,
 } from '@animalabs/context-manager';
 import type {
   AgentConfig,
@@ -57,6 +89,53 @@ function stableHash(value: unknown): string {
 const DEFAULT_CONTEXT_BUDGET_TOKENS = 100_000;
 const DEFAULT_TRANSITION_PACE_TOKENS = 16_000;
 const DEFAULT_SAME_ROUND_THINK_TEXT_POLICY: SameRoundThinkTextPolicy = 'public';
+
+/**
+ * Refuse an agent config whose `promptCaching`, `toolResultGuard`,
+ * `toolWrapperProseGuard`, `thinking.enabled` or `refusalHandling.autoRewind`
+ * holds anything but true or false (assertBooleanSetting), or whose `thinking`
+ * or `refusalHandling` is anything but an object, null or false
+ * (holdsSettings). The constructor runs it first, so the rule holds wherever
+ * an Agent is built. `create()` also runs it for each of its agents before
+ * anything opens, and `createEphemeralAgent` before it reserves the name, so a
+ * refusal there leaves nothing behind. Membrane reads `thinking.enabled`, and
+ * the refusal is here because the setting is AgentConfig's.
+ */
+export function assertAgentSwitches(config: AgentConfig): void {
+  const agent = `Agent "${config.name}"`;
+  assertBooleanSetting(
+    `${agent} promptCaching`,
+    config.promptCaching,
+    'true or leaving it out marks requests for prompt caching, and false leaves the markers off, for transports that refuse them',
+  );
+  if (holdsSettings(`${agent} thinking`, config.thinking, '{ enabled: true }')) {
+    assertBooleanSetting(
+      `${agent} thinking.enabled`,
+      config.thinking.enabled,
+      'true asks the provider for extended thinking, and false or leaving it out doesn\'t',
+    );
+  }
+  if (holdsSettings(`${agent} refusalHandling`, config.refusalHandling, '{ autoRewind: true }')) {
+    assertBooleanSetting(
+      `${agent} refusalHandling.autoRewind`,
+      config.refusalHandling.autoRewind,
+      'true redacts the turn that tripped a refusal and runs again, up to maxRewinds times, ' +
+        'and false or leaving it out doesn\'t',
+    );
+  }
+  assertBooleanSetting(
+    `${agent} toolResultGuard`,
+    config.toolResultGuard,
+    'true turns on tool-output admission, with one guarded retry after a provider refusal, ' +
+      'and false or leaving it out doesn\'t',
+  );
+  assertBooleanSetting(
+    `${agent} toolWrapperProseGuard`,
+    config.toolWrapperProseGuard,
+    'true keeps a response whose whole prose is a tool-call-shaped wrapper from running or entering the agent\'s history, ' +
+      'and false or leaving it out doesn\'t',
+  );
+}
 
 /**
  * An agent wraps a context manager and manages inference state.
@@ -106,15 +185,38 @@ export class Agent {
    * closure) so the next activation can close whatever its predecessor left
    * open — see failOpenKvSubmissions. */
   private kvOpenQueue: Array<{ submissionId: string; wireReceipt: CacheWireReceipt }> | null = null;
+  /** The current stream's fresh input so far, as membrane's usage event
+   *  reports it (cumulative across the tool loop): what the maxStreamTokens
+   *  budget checks. */
   lastStreamInputTokens = 0;
-  /** Real prefix size of the last usage event: fresh + cache creation +
-   *  cache read. THE window-shaped number — `lastStreamInputTokens` alone
-   *  omits cached tokens, which are most of a warm stream's window. */
+  /** Real prompt size of the stream's latest provider call that reported a
+   *  prompt, which is what the provider billed it: fresh + cache creation +
+   *  cache read. A call that reports none leaves it as it was (see
+   *  lastStreamUnreportedTokens). Membrane's usage events are cumulative, so
+   *  this is the call's share of its event (cumulativeDelta): the whole event
+   *  for a stream's first call, and the event's own value where a counter
+   *  went back. THE window-shaped number — `lastStreamInputTokens` alone
+   *  omits cached tokens, which are most of a warm stream's window. 0 until a
+   *  call on this stream reports a prompt, and the physical-window
+   *  projection runs only once one has. */
   lastStreamRealInputTokens = 0;
-  /** Output tokens of the last usage event — the prior round's generated
-   *  thinking/text/tool_use, which becomes part of the NEXT round's input
-   *  and so belongs in the physical-window projection. */
+  /** Output tokens of the same call as lastStreamRealInputTokens, or
+   *  maxTokens, the bound on them, when it reported none (a call that ends at
+   *  a tool boundary wrote a tool_use, so a 0 is a count left unreported) —
+   *  the prior round's generated thinking/text/tool_use, which becomes part
+   *  of the NEXT round's input and so belongs in the physical-window
+   *  projection. */
   lastStreamOutputTokens = 0;
+  /** What the stream has grown by since the call lastStreamRealInputTokens
+   *  describes, for the physical-window projection: the blocks appended at
+   *  each boundary the stream continued past (counted only for an agent with
+   *  physicalWindowTokens, whose projection is this field's one reader), and
+   *  the output of each call that reported no prompt (its reported output,
+   *  or maxTokens, the bound on it, when it reported none either). After
+   *  calls that report no prompt, the next request holds the prompt and
+   *  output of the call lastStreamRealInputTokens describes, plus this. 0 at
+   *  stream start and whenever a call reports a prompt. */
+  lastStreamUnreportedTokens = 0;
   maxStreamTokens: number;
   /** Provider hard context cap (see AgentConfig.physicalWindowTokens). */
   readonly physicalWindowTokens?: number;
@@ -127,7 +229,52 @@ export class Agent {
   private readonly configuredTransitionPaceTokens?: number;
   private readonly configuredSameRoundThinkTextPolicy?: SameRoundThinkTextPolicy;
   private contextBudgetTargetTokens?: number;
-  private runtimeSettingsOverrides: AgentRuntimeSettingsOverrides = {};
+  private runtimeSettingsOverrides: AgentRuntimeSettingsPatch = {};
+  /**
+   * Counts changes of the live budget (an update, a reset, a restore, a
+   * settle). A compile speaks for the budget it planned at only if the live
+   * budget didn't change while it ran, and what it showed stands only until
+   * the next change.
+   */
+  private liveBudgetEpoch = 0;
+  /**
+   * Counts changes of the descent (each arm of one, the same target included,
+   * a reset, a cancel, a settle). A settle proves its target only to a
+   * compile that began under that same descent.
+   */
+  private descentEpoch = 0;
+  /** The live budget the last compile planned at, whether it fit, and the live budget's epoch then. */
+  private lastCompiledBudget?: { budget: number; fit: boolean; epoch: number };
+  /** Counts compiles at the live budget as they start. */
+  private compilesStarted = 0;
+  /** The start numbers of the compiles at the live budget still running. */
+  private readonly compilesRunning = new Set<number>();
+  /**
+   * For each budget, the start of the latest-started compile that has ended
+   * there with a fit or a refusal, whether or not what it showed was
+   * credited. Of two compiles at one budget, the later-started one planned
+   * at the newer store, so an earlier-started one that ends after it is
+   * ignored. That rests on the context manager selecting at the start of
+   * `compile`, before anything it awaits, so start order is selection order;
+   * a context manager that awaits before its select breaks it. (Injections
+   * are added after the select, so compiles with and without them plan
+   * alike.) An entry is
+   * kept only while a compile that started before it is still running, the
+   * only kind it can turn away, so the map is empty whenever no compile
+   * runs.
+   */
+  private readonly latestEndedStart = new Map<number, number>();
+  /** The last outcome the listener recorded; a failed record is told again, and so is any after a change. */
+  private recordedCompiledBudget?: { budget: number; fit: boolean; epoch: number };
+  /**
+   * A boot restore applied a proven budget below the live one at once. Until
+   * the budget is next written (an update that carries one, or a reset of
+   * it) or a compile at it fits, a refusal of a compile at it restores it
+   * paced instead.
+   */
+  private restoredAtOnce = false;
+  /** Told when that changes (the framework records it beside the persisted budget). */
+  private compiledBudgetListener?: (budget: number, fit: boolean) => boolean;
   private contextManager: ContextManager;
   private membrane: Membrane;
 
@@ -136,6 +283,7 @@ export class Agent {
     contextManager: ContextManager,
     membrane: Membrane
   ) {
+    assertAgentSwitches(config);
     this.name = config.name;
     this.model = config.model;
     this.systemPrompt = config.systemPrompt;
@@ -145,11 +293,11 @@ export class Agent {
     this.temperature = config.temperature;
     this.thinking = config.thinking;
     this.refusalHandling = config.refusalHandling;
-    this.toolResultGuard = new ToolResultGuard(config.name, contextManager, config.toolResultGuard);
+    this.toolResultGuard = new ToolResultGuard(config.name, contextManager, config.toolResultGuard === true);
     this.proseRouting = config.proseRouting ?? 'locus';
-    this.toolWrapperProseGuard = config.toolWrapperProseGuard ?? false;
+    this.toolWrapperProseGuard = config.toolWrapperProseGuard === true;
     this.cacheTtl = config.cacheTtl ?? '1h';
-    this.promptCaching = config.promptCaching ?? true;
+    this.promptCaching = config.promptCaching !== false;
     this.prefillUserMessage = config.prefillUserMessage;
     this.providerParams = config.providerParams;
     this.sameRoundThinkTextPolicy = config.sameRoundThinkTextPolicy;
@@ -266,10 +414,16 @@ export class Agent {
   getRuntimeSettings(): AgentRuntimeSettingsSnapshot {
     const hot = this.getHotContextSettings();
     return {
+      // The budget it's set to: the override, where there is one. That is
+      // the target of a descent toward it, or else the live budget, except
+      // while it's kept unapplied: at boot (keepRuntimeSettings), or after a
+      // refused at-once budget couldn't be restored paced (compileAtLiveBudget).
       contextBudgetTokens:
+        this.runtimeSettingsOverrides.contextBudgetTokens ??
         this.contextBudgetTargetTokens ??
         this.contextBudgetTokens ??
         DEFAULT_CONTEXT_BUDGET_TOKENS,
+      effectiveContextBudgetTokens: this.contextBudgetTokens ?? DEFAULT_CONTEXT_BUDGET_TOKENS,
       ...(hot ? { tailTokens: hot.tailTokens } : {}),
       ...(hot?.transitionPaceTokens !== undefined
         ? { transitionPaceTokens: hot.transitionPaceTokens }
@@ -294,6 +448,179 @@ export class Agent {
   }
 
   /**
+   * Set (or clear) the one listener told when a compile at the live budget
+   * comes out differently from the last: it fit at a budget the last one
+   * didn't plan at (after a settle, the target), or the context manager
+   * refused a budget the last one fit at.
+   */
+  onContextBudgetCompiled(listener: ((budget: number, fit: boolean) => boolean) | undefined): void {
+    this.compiledBudgetListener = listener;
+  }
+
+  /**
+   * The live budget the last compile planned at and fit, if it fit and the
+   * live budget hasn't changed since.
+   */
+  getProvenContextBudgetTokens(): number | undefined {
+    const last = this.lastCompiledBudget;
+    return last?.fit && last.epoch === this.liveBudgetEpoch ? last.budget : undefined;
+  }
+
+  /**
+   * Set the live budget and the descent target, counting a change of each.
+   * `armed` counts a descent armed here as a change even when its target is
+   * the one already set: a compile that began under the earlier arm isn't
+   * credited with this one's settle.
+   */
+  private setContextBudget(budget: number | undefined, target: number | undefined, armed = false): void {
+    if (budget !== this.contextBudgetTokens) this.liveBudgetEpoch++;
+    if (armed || target !== this.contextBudgetTargetTokens) this.descentEpoch++;
+    this.contextBudgetTokens = budget;
+    this.contextBudgetTargetTokens = target;
+  }
+
+  /**
+   * Claim the place of the latest compile to end at `budget` for the one that
+   * started as the `started`th, and say whether it got it: a compile that
+   * started before one that has already ended there is ignored, whichever
+   * finishes last.
+   */
+  private claimLatestAt(budget: number, started: number): boolean {
+    if (started < (this.latestEndedStart.get(budget) ?? 0)) return false;
+    this.latestEndedStart.set(budget, started);
+    return true;
+  }
+
+  /**
+   * Note what a compile at `budget`, planned at the live budget's `epoch`,
+   * showed. It speaks for the live budget only if that hasn't changed since;
+   * the listener is told either way, so a refusal withdraws the record's
+   * marker for the budget it planned at whatever changed meanwhile.
+   */
+  private noteCompiledBudget(budget: number, fit: boolean, epoch: number): void {
+    if (epoch === this.liveBudgetEpoch) this.lastCompiledBudget = { budget, fit, epoch };
+    const recorded = this.recordedCompiledBudget;
+    if (recorded?.budget === budget && recorded.fit === fit && recorded.epoch === epoch) return;
+    // A listener that couldn't record it returns false: nothing is assumed
+    // recorded then, so the next compile tells it again whatever it shows.
+    this.recordedCompiledBudget = this.compiledBudgetListener?.(budget, fit) !== false ? { budget, fit, epoch } : undefined;
+  }
+
+  /** Compile at the live budget (no explicit one), noting whether it fit. */
+  private async compileAtLiveBudget(compile: () => Promise<CompileResult>): Promise<CompileResult> {
+    const started = ++this.compilesStarted;
+    this.compilesRunning.add(started);
+    try {
+      return await this.compileAtLiveBudgetNoting(compile, started);
+    } finally {
+      this.compilesRunning.delete(started);
+      const earliest = Math.min(...this.compilesRunning);
+      for (const [budget, start] of this.latestEndedStart) {
+        if (start < earliest) this.latestEndedStart.delete(budget);
+      }
+    }
+  }
+
+  /** The compile at the live budget that started as the `started`th, and what it showed. */
+  private async compileAtLiveBudgetNoting(compile: () => Promise<CompileResult>, started: number): Promise<CompileResult> {
+    // The budget this compile plans at, and the descent under way when it
+    // started: a change of either while it runs is no part of what it shows.
+    const live = this.contextBudgetTokens ?? DEFAULT_CONTEXT_BUDGET_TOKENS;
+    const epoch = this.liveBudgetEpoch;
+    const descent = this.descentEpoch;
+    let result: CompileResult;
+    try {
+      result = await compile();
+    } catch (error) {
+      if ((error as { name?: unknown } | null)?.name !== 'OverBudgetError') throw error;
+      // A refusal shows the budget it planned at doesn't fit, whatever
+      // changed while it ran: the record's marker for it is withdrawn, and
+      // nothing is credited, unless a compile that started later has already
+      // ended at that budget.
+      if (this.claimLatestAt(live, started)) this.noteCompiledBudget(live, false, epoch);
+      // A budget a boot restore applied at once, refused at its first test,
+      // before anything wrote the budget: restore it paced instead, as the
+      // boot would have without its proof, and compile again from the
+      // recipe's budget. (While restoredAtOnce holds, the live budget is the
+      // one the boot applied: every write of the budget clears it, and no
+      // compile runs before the boot's restore.)
+      if (!this.restoredAtOnce) throw error;
+      this.restoredAtOnce = false;
+      // The persisted budget stays in the overrides, so if it can't be
+      // restored paced, no later write erases it.
+      this.setContextBudget(this.configuredContextBudgetTokens, undefined);
+      let outcome: string;
+      try {
+        this.updateRuntimeSettings({ contextBudgetTokens: live });
+        outcome = 'restored it as a paced descent from the recipe\'s budget';
+      } catch (fallback) {
+        outcome = `couldn't restore it paced (${fallback instanceof Error ? fallback.message : String(fallback)}), ` +
+          `so it compiles at the recipe's budget, with contextBudgetTokens=${live} kept set`;
+      }
+      console.error(
+        `[agent-settings] ${this.name}: the context manager refused contextBudgetTokens=${live}, which the boot ` +
+          `applied at once; ${outcome}`,
+      );
+      return this.compileAtLiveBudget(compile);
+    }
+    this.restoredAtOnce = false;
+    // A settle, here, of the descent this compile began under proves its
+    // target: the frontier fits the window prepared for it. Without a settle,
+    // the compile proves the budget it planned at. Either only if the live
+    // budget didn't change while it ran; a settle of a descent armed while it
+    // ran proves nothing (the next compile at the target does).
+    // A compile that ends here with a fit takes its place in the start order
+    // at the budget it planned at, credited or not; a settle credits its
+    // target only from the latest compile to end there.
+    const latest = this.claimLatestAt(live, started);
+    const sameLive = this.liveBudgetEpoch === epoch;
+    const sameDescent = this.descentEpoch === descent;
+    const settled = this.settleRuntimeSettingsTransition();
+    if (latest && sameLive && settled && sameDescent && this.claimLatestAt(this.contextBudgetTokens!, started)) {
+      this.noteCompiledBudget(this.contextBudgetTokens!, true, this.liveBudgetEpoch);
+    } else if (latest && sameLive && !settled) this.noteCompiledBudget(live, true, epoch);
+    return result;
+  }
+
+  /**
+   * The budget compiles plan at, the path a patch's budget takes from it, and
+   * whether a descent is in flight, from the agent's own state alone: what a
+   * runtime-settings preview can still say while the context manager refuses
+   * its queries.
+   * @internal For the framework's runtime-settings preview; not a host API.
+   */
+  runtimeBudgetPath(patch?: AgentRuntimeSettingsPatch): {
+    liveBudgetTokens: number;
+    path: 'immediate' | 'paced' | 'none';
+    transition: 'stable' | 'converging';
+  } {
+    const live = this.contextBudgetTokens ?? DEFAULT_CONTEXT_BUDGET_TOKENS;
+    const budget = patch?.contextBudgetTokens;
+    return {
+      liveBudgetTokens: live,
+      path: budget === undefined ? 'none' : budget >= live || patch?.immediate ? 'immediate' : 'paced',
+      transition: this.contextBudgetTargetTokens === undefined ? 'stable' : 'converging',
+    };
+  }
+
+  /**
+   * Whether the context manager answers its queries, as its readiness says.
+   * It refuses them while its strategy's initialization is pending or has
+   * failed, until a switchBranch or setStrategy succeeds, and a strategy can
+   * refuse its readiness on its own, as the autobiographical one does for a
+   * branch it hasn't reloaded.
+   * @internal For the framework's runtime-settings preview; not a host API.
+   */
+  contextManagerAnswers(): boolean {
+    try {
+      this.contextManager.isReady();
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  /**
    * Read-only mirror of `updateRuntimeSettings`' budget semantics: derive what
    * the next compile would actually plan at if `patch` were applied, WITHOUT
    * mutating anything. This is the settings→config mapping a feasibility
@@ -309,11 +636,17 @@ export class Agent {
    * - `path: 'none'` — patch absent or budget untouched.
    *
    * `overrides` uses strategy-config names (`recentWindowTokens`,
-   * `kvStableReachTokens`) suitable for `previewContext`. `preparedWindowTokens`
-   * is deliberately never mapped: it is strategy instance state, not config,
-   * and cannot be simulated by a preview. A `kvStableReachTokens` override is
-   * omitted while a prepared window is in flight — the live runtime pace
-   * shadows the config value there, so the override would not be observed.
+   * `kvStableReachTokens`) suitable for `previewContext`. The reach is the one
+   * the next compile plans at (context-manager's kv-stable picker): a
+   * descent's pace while a window is prepared for it, one this patch arms (a
+   * paced decrease) or one in flight that it leaves alone (a patch without a
+   * budget), and the configured reach otherwise. Config is a preview's only
+   * lever: `preparedWindowTokens` and the live runtime pace are strategy
+   * instance state, which a preview can't set. So a preview taken during a
+   * descent plans under that descent's prepared window, and at its live pace
+   * whenever the strategy carries one, which the picker reads before the
+   * configured reach. A boot restore's preflight never meets this: a new
+   * strategy has no window.
    */
   planRuntimeSettings(patch?: AgentRuntimeSettingsPatch): {
     effectiveBudgetTokens: number;
@@ -329,34 +662,33 @@ export class Agent {
       this.validateRuntimeSettingsPatch(patch);
     }
     const hot = this.getHotContextSettings();
-    const live = this.contextBudgetTokens ?? DEFAULT_CONTEXT_BUDGET_TOKENS;
+    const { liveBudgetTokens: live, path } = this.runtimeBudgetPath(patch);
+    const budget = patch?.contextBudgetTokens;
 
     const overrides: Record<string, unknown> = {};
     if (patch?.tailTokens !== undefined) {
       overrides.recentWindowTokens = patch.tailTokens;
     }
-    if (
-      patch?.transitionPaceTokens !== undefined &&
-      hot?.preparedWindowTokens === undefined
-    ) {
-      overrides.kvStableReachTokens = patch.transitionPaceTokens;
+    // A window is prepared at the next compile when this patch arms a
+    // descent, or leaves one in flight alone; an immediate change clears it.
+    const prepared = hot !== null && (path === 'paced' || (path === 'none' && hot.preparedWindowTokens !== undefined));
+    const reach = prepared
+      ? patch?.transitionPaceTokens ?? hot.transitionPaceTokens ?? DEFAULT_TRANSITION_PACE_TOKENS
+      : this.configuredTransitionPaceTokens;
+    if (reach !== undefined && reach !== this.configuredTransitionPaceTokens) {
+      overrides.kvStableReachTokens = reach;
     }
 
-    if (patch?.contextBudgetTokens === undefined) {
+    if (budget === undefined) {
       return { effectiveBudgetTokens: live, liveBudgetTokens: live, path: 'none', overrides };
     }
-    if (patch.contextBudgetTokens >= live || patch.immediate) {
-      return {
-        effectiveBudgetTokens: patch.contextBudgetTokens,
-        liveBudgetTokens: live,
-        path: 'immediate',
-        overrides,
-      };
+    if (path === 'immediate') {
+      return { effectiveBudgetTokens: budget, liveBudgetTokens: live, path, overrides };
     }
     return {
       effectiveBudgetTokens: live,
       liveBudgetTokens: live,
-      advisoryTargetTokens: patch.contextBudgetTokens,
+      advisoryTargetTokens: budget,
       path: 'paced',
       overrides,
     };
@@ -383,6 +715,8 @@ export class Agent {
     let nextContextBudget = this.contextBudgetTokens;
     let nextContextTarget = this.contextBudgetTargetTokens;
     let appliedDefaultPace = false;
+    // A paced decrease arms a descent, even to the target already set.
+    let armed = false;
     const hotPatch: {
       tailTokens?: number;
       transitionPaceTokens?: number | null;
@@ -414,21 +748,24 @@ export class Agent {
         }
         hotPatch.preparedWindowTokens = patch.contextBudgetTokens - this.maxTokens;
         nextContextTarget = patch.contextBudgetTokens;
+        armed = true;
       }
     }
 
     if (Object.keys(hotPatch).length > 0) {
       this.updateHotContextSettings(hotPatch);
     }
-    this.contextBudgetTokens = nextContextBudget;
-    this.contextBudgetTargetTokens = nextContextTarget;
+    this.setContextBudget(nextContextBudget, nextContextTarget, armed);
+    // A budget written here is a decision about it, whatever its value: the
+    // boot's at-once fallback (restoredAtOnce) no longer speaks for it.
+    if (patch.contextBudgetTokens !== undefined) this.restoredAtOnce = false;
     if (appliedDefaultPace) {
       this.runtimeSettingsOverrides.transitionPaceTokens = DEFAULT_TRANSITION_PACE_TOKENS;
     }
-    for (const [key, value] of Object.entries(patch)) {
-      if (key === 'sameRoundThinkTextPolicy') continue;
-      if (key === 'immediate') continue; // a mode for this apply, never a persisted setting
-      if (value !== undefined) (this.runtimeSettingsOverrides as Record<string, unknown>)[key] = value;
+    // Only settings reach the override map: `immediate` is a mode for this
+    // apply, and nothing else a caller passes is a setting.
+    for (const key of ['contextBudgetTokens', 'tailTokens', 'transitionPaceTokens'] as const) {
+      if (patch[key] !== undefined) this.runtimeSettingsOverrides[key] = patch[key];
     }
     if (patch.sameRoundThinkTextPolicy !== undefined) {
       this.runtimeSettingsOverrides.sameRoundThinkTextPolicy = patch.sameRoundThinkTextPolicy;
@@ -440,6 +777,8 @@ export class Agent {
     const reset = new Set(keys ?? ['contextBudgetTokens', 'tailTokens', 'transitionPaceTokens', 'sameRoundThinkTextPolicy']);
     let nextContextBudget = this.contextBudgetTokens;
     let nextContextTarget = this.contextBudgetTargetTokens;
+    // A reset to a recipe budget below the live one arms a descent to it.
+    let armed = false;
     const hotPatch: {
       tailTokens?: number;
       transitionPaceTokens?: number | null;
@@ -457,6 +796,7 @@ export class Agent {
           hotPatch.transitionPaceTokens = DEFAULT_TRANSITION_PACE_TOKENS;
         }
         nextContextTarget = configured;
+        armed = true;
       } else {
         nextContextBudget = this.configuredContextBudgetTokens;
         nextContextTarget = undefined;
@@ -473,9 +813,11 @@ export class Agent {
           : this.configuredTransitionPaceTokens ?? null;
     }
     if (Object.keys(hotPatch).length > 0) this.updateHotContextSettings(hotPatch);
-    this.contextBudgetTokens = nextContextBudget;
-    this.contextBudgetTargetTokens = nextContextTarget;
-    if (reset.has('contextBudgetTokens')) delete this.runtimeSettingsOverrides.contextBudgetTokens;
+    this.setContextBudget(nextContextBudget, nextContextTarget, armed);
+    if (reset.has('contextBudgetTokens')) {
+      delete this.runtimeSettingsOverrides.contextBudgetTokens;
+      this.restoredAtOnce = false;
+    }
     if (reset.has('tailTokens')) delete this.runtimeSettingsOverrides.tailTokens;
     if (reset.has('transitionPaceTokens')) {
       delete this.runtimeSettingsOverrides.transitionPaceTokens;
@@ -489,7 +831,7 @@ export class Agent {
   cancelRuntimeSettingsTransition(): AgentRuntimeSettingsSnapshot {
     if (this.contextBudgetTargetTokens !== undefined) {
       this.updateHotContextSettings({ preparedWindowTokens: null });
-      this.contextBudgetTargetTokens = undefined;
+      this.setContextBudget(this.contextBudgetTokens, undefined);
       const live = this.contextBudgetTokens ?? DEFAULT_CONTEXT_BUDGET_TOKENS;
       if (live === (this.configuredContextBudgetTokens ?? DEFAULT_CONTEXT_BUDGET_TOKENS)) {
         delete this.runtimeSettingsOverrides.contextBudgetTokens;
@@ -500,11 +842,56 @@ export class Agent {
     return this.getRuntimeSettings();
   }
 
-  restoreRuntimeSettings(overrides: AgentRuntimeSettingsOverrides): AgentRuntimeSettingsSnapshot {
-    return this.updateRuntimeSettings(overrides);
+  /**
+   * Apply persisted settings at construction. `provenBudget` is a budget the
+   * caller has shown fits (the framework, from the record and a preflight),
+   * applied at once: it stands as the last compile's until a compile here
+   * says otherwise. When it's below the live budget, where the proof is what
+   * took the restore off the paced path, a refusal of a compile at it
+   * restores it paced instead, until the budget is next written or a compile
+   * at it fits. At or above the live budget, the restore is at once either
+   * way, and a refusal has nothing to fall back to.
+   */
+  restoreRuntimeSettings(
+    settings: AgentRuntimeSettingsPatch,
+    opts?: { provenBudget?: number },
+  ): AgentRuntimeSettingsSnapshot {
+    if (Object.keys(settings).length === 0) return this.getRuntimeSettings();
+    const live = this.contextBudgetTokens ?? DEFAULT_CONTEXT_BUDGET_TOKENS;
+    const snapshot = this.updateRuntimeSettings(settings);
+    if (opts?.provenBudget !== undefined) {
+      this.lastCompiledBudget = { budget: opts.provenBudget, fit: true, epoch: this.liveBudgetEpoch };
+      this.restoredAtOnce = opts.provenBudget < live;
+    }
+    return snapshot;
+  }
+
+  /**
+   * Keep a persisted budget, tail or pace that couldn't be applied at
+   * construction: it stays in the override map, unapplied, so a later
+   * persisting write keeps it in the record. A budget is reported as the one
+   * set (`contextBudgetTokens`) beside the one compiles plan at
+   * (`effectiveContextBudgetTokens`); a tail or pace stays the strategy's.
+   */
+  keepRuntimeSettings(settings: Pick<AgentRuntimeSettingsPatch, 'contextBudgetTokens' | 'tailTokens' | 'transitionPaceTokens'>): void {
+    for (const key of ['contextBudgetTokens', 'tailTokens', 'transitionPaceTokens'] as const) {
+      if (settings[key] !== undefined) this.runtimeSettingsOverrides[key] = settings[key];
+    }
   }
 
   private validateRuntimeSettingsPatch(patch: AgentRuntimeSettingsPatch): void {
+    this.checkRuntimeSettingsPatch(patch);
+    if ((patch.tailTokens !== undefined || patch.transitionPaceTokens !== undefined) &&
+        !this.getHotContextSettings()) {
+      throw new Error('The active context strategy does not support live tail/transition settings');
+    }
+  }
+
+  /**
+   * The checks of a runtime-settings patch that need nothing from the context manager.
+   * @internal For the framework's runtime-settings preview; not a host API.
+   */
+  checkRuntimeSettingsPatch(patch: AgentRuntimeSettingsPatch): void {
     if (Object.keys(patch).length === 0) throw new Error('At least one setting is required');
     if (patch.contextBudgetTokens !== undefined) {
       if (!Number.isSafeInteger(patch.contextBudgetTokens) || patch.contextBudgetTokens <= this.maxTokens) {
@@ -524,37 +911,117 @@ export class Agent {
         patch.sameRoundThinkTextPolicy !== 'private') {
       throw new Error("sameRoundThinkTextPolicy must be 'public' or 'private'");
     }
-    if ((patch.tailTokens !== undefined || patch.transitionPaceTokens !== undefined) &&
-        !this.getHotContextSettings()) {
-      throw new Error('The active context strategy does not support live tail/transition settings');
-    }
   }
 
-  private settleRuntimeSettingsTransition(): void {
-    if (this.contextBudgetTargetTokens === undefined) return;
+  /** Settle a converging budget once the window is prepared; true if it settled. */
+  private settleRuntimeSettingsTransition(): boolean {
+    if (this.contextBudgetTargetTokens === undefined) return false;
     const hot = this.getHotContextSettings();
-    if (!hot?.prepared) return;
-    this.contextBudgetTokens = this.contextBudgetTargetTokens;
-    this.contextBudgetTargetTokens = undefined;
+    if (!hot?.prepared) return false;
+    this.setContextBudget(this.contextBudgetTargetTokens, undefined);
     this.updateHotContextSettings({ preparedWindowTokens: null });
+    return true;
   }
 
   /**
-   * RFC-006 consumed watermark: the newest stored message at the last compile
-   * of a model request, per branch. Everything above it has never been in a
-   * request and may still be replaced or withdrawn in place by its sender.
+   * RFC-006 consumed watermark, per branch: the newest stored message as of
+   * the latest of the agent's creation, a committing compile that returns,
+   * and a tool boundary that injected messages into a live stream declaring
+   * it carries them (`supportsInjectedMessages` true: membrane's native
+   * path, from membrane 0.6.0). A compile counts from when it takes its
+   * value, before it awaits, so one that began before a boundary's mark
+   * doesn't roll the mark back (applyCompileWatermark), and a dry run, such
+   * as previewActivation's, doesn't move it. Each move takes the store's
+   * head, a scalar, so it also covers stored messages the agent wasn't
+   * given, such as another slot's.
+   *
+   * A message above it may still be replaced or withdrawn in place by its
+   * sender, though it may already have been in one of the agent's requests.
+   * A live stream carries each round's own content and results, which it
+   * stores at its tool boundaries, into its next request. It can also carry
+   * the messages injected at a boundary whose stream didn't say whether it
+   * carries injections, as no membrane 0.5.x stream does: its native path
+   * carries them and its XML path drops them, and either way they stay
+   * above it.
    */
   private consumedWatermark: { branch: string; sequence: number } | null = null;
+  /** Counts marks (markContextConsumed's and applyCompileWatermark's), so a
+   *  compile that finishes can tell whether one was made while it ran. */
+  private watermarkMarks = 0;
+  /**
+   * The newest stored message a compile or a tool boundary may have put in
+   * front of the agent, per branch. It moves where the consumed watermark
+   * does, and sooner: when a committing compile takes its value, before it
+   * awaits, and at every tool boundary that injects, whether or not the
+   * stream says it carries injected messages. A message above it may still
+   * have been shown, though: for one, a live stream carries each round's own
+   * content and results, stored at a boundary that injected nothing, into its
+   * next request. A compile that throws assembled nothing, and gives its move
+   * back where it can (unshowFailedCompile). A scalar counts a prefix, so a
+   * message stored below it without having been shown counts as shown, which
+   * errs toward a marker.
+   */
+  private shownWatermark: { branch: string; sequence: number } | null = null;
 
   getConsumedWatermark(): { branch: string; sequence: number } | null {
     return this.consumedWatermark;
   }
 
-  /** Mark everything currently stored as consumed (boot, branch switch). */
+  getShownWatermark(): { branch: string; sequence: number } | null {
+    return this.shownWatermark;
+  }
+
+  /** Mark everything currently stored as consumed (the agent's creation, at
+   *  boot or later, and a tool boundary that injected messages into a live
+   *  stream declaring it carries them; see consumedWatermark). */
   markContextConsumed(): void {
     // Tolerates partial context-manager doubles (tests build Agents over
     // stubs): without a watermark nothing is ever treated as unread.
     this.consumedWatermark = this.pendingWatermark();
+    this.watermarkMarks++;
+    this.shownWatermark = this.consumedWatermark;
+  }
+
+  /** Mark everything currently stored as possibly shown (a tool boundary
+   *  that injected messages, whatever its stream says it carries). Without
+   *  a watermark everything counts as shown, as markContextConsumed counts
+   *  it read. */
+  markContextShown(): void {
+    this.shownWatermark = this.pendingWatermark();
+  }
+
+  /** A committing compile that threw assembled nothing, so its own move of
+   *  the shown watermark goes back, unless a boundary or another compile has
+   *  moved the watermark since. It goes back to the watermark as the compile
+   *  found it, which can be another compile's claim that has failed as well.
+   *  Of two overlapping committing compiles, if the first to start throws
+   *  first, it gives nothing back (the second's claim is current), and if
+   *  the second then throws, it restores the first's failed claim. Messages
+   *  up to that claim then count as shown, although no request held those
+   *  above the watermark the first compile found, which errs toward a marker
+   *  until the next compile or boundary moves the watermark. */
+  private unshowFailedCompile(
+    watermark: { branch: string; sequence: number } | null,
+    before: { branch: string; sequence: number } | null,
+  ): void {
+    if (watermark && this.shownWatermark === watermark) this.shownWatermark = before;
+  }
+
+  /**
+   * A finished compile's watermark, taken before it awaited. Within a branch
+   * the watermark only advances: if a mark was made while the compile ran,
+   * the compile's (older) one is applied only where it is later on that
+   * mark's branch, so a boundary's mark is never rolled back by a compile
+   * that started before it (a committing compile, such as compileContext's,
+   * run during a live turn; a dry run, such as previewActivation's, never
+   * reaches here).
+   */
+  private applyCompileWatermark(watermark: { branch: string; sequence: number }, marksBefore: number): void {
+    const current = this.consumedWatermark;
+    if (this.watermarkMarks !== marksBefore && current
+      && (current.branch !== watermark.branch || current.sequence >= watermark.sequence)) return;
+    this.consumedWatermark = watermark;
+    this.watermarkMarks++;
   }
 
   /** The watermark a successful compile will establish (taken before, applied after). */
@@ -577,32 +1044,79 @@ export class Agent {
     }
   }
 
+  /** A committing compile, as for a request that is sent: the context
+   * manager commits what it commits for one, the consumed watermark moves,
+   * and a prepared budget change settles. To inspect what the agent would
+   * see, use the framework's `previewActivation`, which compiles as a dry
+   * run. */
   async compileContext(budget?: TokenBudget): Promise<CompileResult> {
     // RFC-006 §3.3: consumption is determined at assembly — a compile that
     // fails assembled nothing, so the watermark moves only on success.
     const watermark = this.pendingWatermark();
-    const result = await this.contextManager.compile(this.compileBudget(budget));
-    if (watermark) this.consumedWatermark = watermark;
-    if (!budget) this.settleRuntimeSettingsTransition();
+    const marksBefore = this.watermarkMarks;
+    const shownBefore = this.shownWatermark;
+    if (watermark) this.shownWatermark = watermark;
+    const compile = () => this.contextManager.compile(this.compileBudget(budget));
+    let result: CompileResult;
+    try {
+      result = budget ? await compile() : await this.compileAtLiveBudget(compile);
+    } catch (error) {
+      this.unshowFailedCompile(watermark, shownBefore);
+      throw error;
+    }
+    if (watermark) this.applyCompileWatermark(watermark, marksBefore);
     return result;
   }
 
   /**
-   * Compile the context with injections.
-   * Same as compileContext but forwards injections (e.g. from MCPL servers)
-   * to the context manager so they are merged into the compiled messages.
+   * Compile the context with injections (e.g. from MCPL servers), which the
+   * context manager merges into the compiled messages. Without
+   * `opts.dryRun` it commits as `compileContext` does: the consumed
+   * watermark moves, and a compile at the live window settles a prepared
+   * budget change. With `opts.dryRun`, for a compile that will never be
+   * sent, it does neither (see below).
    */
   async compileWithInjections(
     budget?: TokenBudget,
     injections?: ContextInjection[],
-    opts?: { kvUnifiedImmutablePrefixHash?: string },
+    opts?: { kvUnifiedImmutablePrefixHash?: string; dryRun?: boolean },
   ): Promise<CompileResult> {
-    const watermark = this.pendingWatermark();
-    const result = await this.contextManager.compile(
-      this.compileBudget(budget), injections, opts as never,
-    );
-    if (watermark) this.consumedWatermark = watermark;
-    if (!budget) this.settleRuntimeSettingsTransition();
+    // A dry run is a compile that will never be sent. The context manager
+    // persists no fold resolutions for it and queues none of the compression
+    // or merge work its fold plan calls for. Its thinking binding
+    // (context-manager#160, not yet released) will commit stamps and add a
+    // compile awaiting acceptance for a committing compile only. Here nothing
+    // moves either: the agent never read what a dry run assembled, so the
+    // consumed watermark stays. A dry run proves nothing about the budget
+    // either, so it goes straight to the compile, around
+    // compileAtLiveBudget: it settles no descent (a prepared budget change
+    // waits for the compile that is sent), notes no compiled budget, and
+    // restores nothing the boot applied at once, whether it fits or is
+    // refused.
+    //
+    // Context-manager 0.14 leaves what a select leaves behind as the last
+    // committing compile left it, on every path out of a dry run, throws
+    // included: no chunk record and no compression queued for a chunk the
+    // dry run closes, no calibration, and none of the bookkeeping the next
+    // compile or an observer reads (its `SelectOptions.dryRun` gives the
+    // contract). The one thing a dry run can still leave is the release of a
+    // compression hold whose deadline has passed, which `compile` does for
+    // any compile before it selects.
+    const watermark = opts?.dryRun ? null : this.pendingWatermark();
+    const marksBefore = this.watermarkMarks;
+    // Shown from the compile's start: what it assembles is in front of the
+    // agent before the consumed watermark moves, once it returns.
+    const shownBefore = this.shownWatermark;
+    if (watermark) this.shownWatermark = watermark;
+    const compile = () => this.contextManager.compile(this.compileBudget(budget), injections, opts as never);
+    let result: CompileResult;
+    try {
+      result = budget || opts?.dryRun ? await compile() : await this.compileAtLiveBudget(compile);
+    } catch (error) {
+      this.unshowFailedCompile(watermark, shownBefore);
+      throw error;
+    }
+    if (watermark) this.applyCompileWatermark(watermark, marksBefore);
     return result;
   }
 
@@ -653,31 +1167,39 @@ export class Agent {
       const wireResults = content.flatMap((block) => block.type === 'tool_result'
         // buildToolResultMessages serializes every payload to a string.
         ? [{ toolUseId: block.toolUseId, content: block.content as string, isError: block.isError }] : []);
-      this.toolResultGuard.storeResults(content, wireResults, this._state.toolResults);
+      // Stored under the house default cap (buildToolResultMessages), as what a
+      // stub keeps is too.
+      this.toolResultGuard.storeResults(content, wireResults, this._state.toolResults, undefined,
+        DEFAULT_TOOL_RESULT_INLINE_MAX_CHARS);
     }
 
-    // Compile context (with optional injections)
-    const { messages, systemInjections } = await this.compileWithInjections(budget, injections);
-
-    // If we have pending tool results, add them
-    if (this._state.status === 'ready' && !guardedResults) {
-      const toolResultMessages = this.buildToolResultMessages(this._state.toolResults);
-      messages.push(...toolResultMessages);
-    }
-
-    const request: NormalizedRequest = {
-      messages: this.toolResultGuard.prepareRequest(messages, true),
-      system: this.buildSystemPrompt(systemInjections),
-      config: {
-        model: this.model,
-        maxTokens: this.maxTokens,
-        ...(this.temperature !== undefined && { temperature: this.temperature }),
-        ...(this.thinking !== undefined && { thinking: this.thinking }),
-      },
-      tools: tools.length > 0 ? tools : undefined,
-      ...(this.providerParams && { providerParams: this.providerParams }),
-      assistantParticipant: this.name,
+    // Compile the context (with optional injections) into a request. The
+    // guard's refusal retry is assembled the same way, afresh. It is compiled
+    // only once each withheld stub's annotation has finished, including one
+    // that began during the compile, and after a stub edit that failed has
+    // been retried; one whose store still fails is compiled as the bare
+    // notice.
+    let unguardedResults: ReturnType<Agent['buildToolResultMessages']> | undefined;
+    const assemble = async (): Promise<NormalizedRequest> => {
+      const compiled = await this.toolResultGuard.afterAnnotations(
+        () => this.compileWithInjections(budget, injections));
+      const { systemInjections } = compiled;
+      // The framework's own pricing stamp never goes out (thinking-token-stamp.ts).
+      const messages = withoutTokenEstimates(compiled.messages);
+      // Read once, after the first compile, since results may have become
+      // ready while it ran; the refusal retry, assembled while the agent is
+      // inferring, sends the same ones.
+      unguardedResults ??= this._state.status === 'ready' && !guardedResults
+        ? this.buildToolResultMessages(this._state.toolResults) : [];
+      messages.push(...unguardedResults);
+      return {
+        messages: this.toolResultGuard.prepareRequest(messages, true),
+        system: this.buildSystemPrompt(systemInjections),
+        tools: tools.length > 0 ? tools : undefined,
+        ...this.requestSettings(),
+      };
     };
+    const request = await assemble();
 
     const abortController = new AbortController();
     if (options?.signal) {
@@ -690,7 +1212,7 @@ export class Agent {
 
     // Set state to inferring
     this._inferenceStartedAt = Date.now();
-    const inferencePromise = this.doInference(request, abortController.signal);
+    const inferencePromise = this.doInference(request, abortController.signal, assemble);
     this._state = { status: 'inferring', promise: inferencePromise, abortController };
 
     try {
@@ -754,7 +1276,12 @@ export class Agent {
 
     // If all tools done, transition to ready
     if (this._state.pending.size === 0) {
-      this._state = { status: 'ready', toolResults: this._state.completed, stream: this._state.stream };
+      this._state = {
+        status: 'ready',
+        toolResults: this._state.completed,
+        stream: this._state.stream,
+        supportsInjectedMessages: this._state.supportsInjectedMessages,
+      };
     }
   }
 
@@ -773,19 +1300,30 @@ export class Agent {
    * Build the membrane-normalized request that WOULD be emitted for this
    * agent's next activation, given the supplied tools and injections.
    *
-   * This is the single source of truth for request assembly, shared by the
-   * real activation path (`startStreamWithInjections`) and debug/preview
-   * tooling (`Framework.previewActivation`). It is pure and non-mutating:
-   * it does not touch agent state and does not call the membrane, and
-   * `ContextManager.compile` is itself side-effect-free (compression runs in
-   * the background). Safe to call regardless of the agent's current status.
+   * This is the single source of truth for a framework turn's request,
+   * shared by the real activation path (`startStreamWithInjections`) and
+   * debug/preview tooling (`Framework.previewActivation`). It does not call
+   * the membrane. The direct API (`runInferenceWithInjections`) assembles its
+   * own messages, system prompt and tools, and both take the agent's
+   * settings from `requestSettings()`.
+   * A compile that is sent commits what the context manager commits for it
+   * (fold resolutions, the compression its fold plan calls for, the consumed
+   * watermark); a preview passes `options.dryRun`, so its compile commits
+   * none of that (see `compileWithInjections` for what a dry run still
+   * leaves). Either way the context manager is handed the compression tool
+   * definitions. Safe to call regardless of the agent's current status.
+   * It doesn't wait for the tool-result guard's annotations, so a preview
+   * never waits on a workspace write (rollback, undo and redo report one), and
+   * may show a withheld stub before its place is added; the activation waits
+   * for them around its call.
    */
-  async buildActivationRequest(
+  private async assembleActivationRequest(
     availableTools: ToolDefinition[],
     injections?: ContextInjection[],
     budget?: TokenBudget,
-    compressionTools: ToolDefinition[] = availableTools
-  ): Promise<NormalizedRequest> {
+    compressionTools: ToolDefinition[] = availableTools,
+    options: ActivationRequestOptions = {},
+  ): Promise<{ request: NormalizedRequest; continuePrompt?: RequestOnlyPrompt }> {
     // Compression may revisit hidden tools in recorded history. Keep its full
     // definition set separate from the resident's advertised tools: the
     // autobiographical strategy must declare the same tools on its
@@ -814,7 +1352,12 @@ export class Agent {
     let { messages, systemInjections } = await this.compileWithInjections(
       budget,
       injections,
-      immutablePrefixHash ? { kvUnifiedImmutablePrefixHash: immutablePrefixHash } : undefined,
+      immutablePrefixHash || options.dryRun
+        ? {
+            ...(immutablePrefixHash ? { kvUnifiedImmutablePrefixHash: immutablePrefixHash } : {}),
+            ...(options.dryRun ? { dryRun: true } : {}),
+          }
+        : undefined,
     );
 
     // Sanitize: strip empty/whitespace text blocks and drop messages left with
@@ -838,34 +1381,113 @@ export class Agent {
         ),
       }))
       .filter((m) => m.content.length > 0);
+    // The framework's own pricing stamp never goes out (thinking-token-stamp.ts).
+    messages = withoutTokenEstimates(messages);
 
-    // Safety: ensure messages don't end with an assistant message.
-    // Some models reject trailing assistant messages ("prefill not supported"),
-    // and after context compression a stale assistant turn can end up last.
-    if (messages.length > 0 && messages[messages.length - 1]!.participant === this.name) {
-      messages = [...messages, {
-        participant: 'user',
-        content: [{ type: 'text', text: '[Continue]' }],
-      }];
+    // Silent heartbeat ticks and replies to a [Continue] turn store no
+    // prompt row. Render each request-only turn before its response's first
+    // surviving row, so the wire formatter cannot merge the response into the
+    // previous assistant message and every later request keeps the prefix
+    // the response was minted under (see silent-heartbeat.ts for what can
+    // and cannot be matched). The request that minted the response ended on
+    // that same turn, so the prefix it caches is the one every later compile
+    // renders. "First" is per agent: a broadcast tick shares its eventId with
+    // every resident.
+    const index = this.indexRequestOnlyRows();
+    const rendered = renderRequestOnlyRows(messages, index, this.name);
+    messages = rendered.messages;
+    // A tick opens wherever its separator isn't already rendered: on its first
+    // request, and on a restart whose compile left none of the tick's rows,
+    // so the restart's reply follows the separator, where every later compile
+    // renders it.
+    const openingTick = options.silentHeartbeat !== undefined
+      && !rendered.separatedTicks.has(tickKey(options.silentHeartbeat));
+
+    // The [Continue] prompt this request's reply follows, read from the
+    // request itself: a new one when it ends on [Continue]; else, when it
+    // ends on tool results, the prompt of the reply that called those tools,
+    // whose tool loop this reply continues; else none. A request that ends
+    // on anything else (a message that arrived during a cooldown, say) gets
+    // a reply that follows that message and carries no prompt.
+    let continuePrompt: RequestOnlyPrompt | undefined;
+    if (openingTick) {
+      messages = [...messages, silentHeartbeatSeparatorTurn()];
+    } else if (messages.length > 0 && messages[messages.length - 1]!.participant === this.name) {
+      // Safety: ensure messages don't end with an assistant message.
+      // Some models reject trailing assistant messages ("prefill not supported"),
+      // and after context compression a stale assistant turn can end up last.
+      messages = [...messages, continueTurn()];
+      continuePrompt = { turn: randomUUID(), text: CONTINUE_ROW };
+    } else {
+      continuePrompt = toolLoopPrompt(messages.at(-1), index);
     }
 
-    return {
+    const request: NormalizedRequest = {
       messages: this.toolResultGuard.prepareRequest(messages),
       system: this.buildSystemPrompt(systemInjections),
+      tools: availableTools.length > 0 ? availableTools : undefined,
+      ...this.requestSettings(),
+      ...(kvUnified ? { cacheMarkers: 'cm-owned' as const } : {}),
+    };
+    return { request, ...(continuePrompt ? { continuePrompt } : {}) };
+  }
+
+  /**
+   * The request fields that come from this agent's own settings: its model
+   * config, prompt caching and cache TTL, prefill message, provider
+   * parameters and participant name. Every request the agent sends takes
+   * them from here, a framework turn's (assembleActivationRequest) and the
+   * direct API's (runInferenceWithInjections), so a setting reaches both or
+   * neither.
+   */
+  private requestSettings(): Pick<NormalizedRequest,
+    'config' | 'promptCaching' | 'cacheTtl' | 'prefillUserMessage' | 'providerParams' | 'assistantParticipant'> {
+    return {
       config: {
         model: this.model,
         maxTokens: this.maxTokens,
         ...(this.temperature !== undefined && { temperature: this.temperature }),
         ...(this.thinking !== undefined && { thinking: this.thinking }),
       },
-      tools: availableTools.length > 0 ? availableTools : undefined,
       promptCaching: this.promptCaching,
-      ...(kvUnified ? { cacheMarkers: 'cm-owned' as const } : {}),
       cacheTtl: this.cacheTtl,
       ...(this.prefillUserMessage && { prefillUserMessage: this.prefillUserMessage }),
       ...(this.providerParams && { providerParams: this.providerParams }),
       assistantParticipant: this.name,
     };
+  }
+
+  /** The request `assembleActivationRequest` builds (see there), for preview
+   * and debug tooling: what this agent's next activation would send. */
+  async buildActivationRequest(
+    availableTools: ToolDefinition[],
+    injections?: ContextInjection[],
+    budget?: TokenBudget,
+    compressionTools: ToolDefinition[] = availableTools,
+    options: ActivationRequestOptions = {},
+  ): Promise<NormalizedRequest> {
+    return (await this.assembleActivationRequest(availableTools, injections, budget, compressionTools, options)).request;
+  }
+
+  /** Stored rows that follow a request-only turn, memoized on the store's
+   * cached message array (ContextManager returns the same array until the
+   * store changes). */
+  private requestOnlyIndex: { source: readonly unknown[]; index: RequestOnlyRowIndex } | null = null;
+
+  private indexRequestOnlyRows(): RequestOnlyRowIndex {
+    const empty: RequestOnlyRowIndex = { ticks: new Map(), prompts: new Map() };
+    const cm = this.contextManager as Partial<ContextManager>;
+    if (typeof cm.getAllMessages !== 'function') return empty;
+    try {
+      const stored = cm.getAllMessages() as unknown as readonly StoredRowLike[];
+      if (this.requestOnlyIndex?.source === stored) return this.requestOnlyIndex.index;
+      const index = indexRequestOnlyRows(stored, this.name);
+      this.requestOnlyIndex = { source: stored, index };
+      return index;
+    } catch (error) {
+      console.error(`[request-only-rows] ${this.name}: could not index stored rows; request-only turns omitted:`, error);
+      return empty;
+    }
   }
 
   /**
@@ -876,7 +1498,8 @@ export class Agent {
     availableTools: ToolDefinition[],
     injections?: ContextInjection[],
     budget?: TokenBudget,
-    compressionTools: ToolDefinition[] = availableTools
+    compressionTools: ToolDefinition[] = availableTools,
+    options: ActivationRequestOptions = {},
   ): Promise<StartStreamResult> {
     if (this._state.status !== 'idle') {
       throw new Error(`Agent ${this.name} cannot start stream in state ${this._state.status}`);
@@ -900,18 +1523,34 @@ export class Agent {
     this.failOpenKvSubmissions();
 
     this._streamId++;
+    // A pending cancel belongs to the stream that was live when cancelStream()
+    // ran. The stream driver collects it on that stream's terminal event, or
+    // at the loop's end when the iterator closed without one, while the
+    // stream still owns the agent. This clear is for the records no driver
+    // collects: a dropped turn's, whose stream no driver iterates; one whose
+    // stream's terminal came after another stream took the agent; or a
+    // cancel after the stream's complete event. A fresh stream must not
+    // inherit one and read its own later error as a deliberate stop.
+    this._pendingCancel = undefined;
     this._inferenceStartedAt = Date.now();
     this.lastStreamInputTokens = 0;
     // Reset the cache-inclusive counters too: a new stream must not inherit
     // the prior stream's window size — on the physical-window restart path
     // that inherited value IS the oversized number that caused the restart,
     // and projecting on it before this stream's first usage event would
-    // restart again (loop). The `> 0` guard downstream means "no usage
-    // observed on THIS stream yet" only because of this reset.
+    // restart again (loop). The `> 0` guard downstream means "no call on
+    // THIS stream has reported a prompt yet" only because of this reset (a
+    // call that reports none leaves these as they were, and adds to
+    // lastStreamUnreportedTokens instead).
     this.lastStreamRealInputTokens = 0;
     this.lastStreamOutputTokens = 0;
+    this.lastStreamUnreportedTokens = 0;
 
-    const request = await this.buildActivationRequest(availableTools, injections, budget, compressionTools);
+    // Compiled only once each withheld stub's annotation has finished,
+    // including one that began during the compile, and after a stub edit that
+    // failed has been retried (see afterAnnotations).
+    const { request, continuePrompt } = await this.toolResultGuard.afterAnnotations(
+      () => this.assembleActivationRequest(availableTools, injections, budget, compressionTools, options));
     request.messages = this.toolResultGuard.prepareRequest(request.messages, true);
 
     const receiptAware = (this.contextManager as unknown as { getStrategy?: () => unknown })
@@ -960,6 +1599,7 @@ export class Agent {
     return {
       stream,
       request,
+      ...(continuePrompt ? { continuePrompt } : {}),
       ...(kvEnabled
         ? {
             takeKvSubmission: () => kvQueue.shift(),
@@ -993,9 +1633,10 @@ export class Agent {
 
   /**
    * Transition to waiting_for_tools when stream yields tool calls.
-   * Called by framework's driveStream.
+   * Called by framework's driveStream, with what the stream declared about
+   * carrying injected messages with this round's results (see AgentState).
    */
-  enterWaitingForTools(calls: ToolCall[], stream: YieldingStream): void {
+  enterWaitingForTools(calls: ToolCall[], stream: YieldingStream, supportsInjectedMessages?: boolean): void {
     const pending = new Map<ToolCallId, PendingToolCall>();
     for (const call of calls) {
       pending.set(call.id, {
@@ -1005,14 +1646,14 @@ export class Agent {
         startedAt: Date.now(),
       });
     }
-    this._state = { status: 'waiting_for_tools', pending, completed: [], stream };
+    this._state = { status: 'waiting_for_tools', pending, completed: [], stream, supportsInjectedMessages };
   }
 
   /**
    * Add an assistant response to context.
    * Called by framework when stream completes.
    */
-  addAssistantResponse(content: ContentBlock[]): void {
+  addAssistantResponse(content: ContentBlock[], metadata?: MessageMetadata): void {
     // A turn whose entire output is thinking blocks produced NOTHING: no
     // speech, no tool call. That is what a refusal looks like on the wire —
     // the provider returns signed thinking (often with empty text, the
@@ -1038,7 +1679,7 @@ export class Agent {
       );
       return;
     }
-    this.contextManager.addMessage(this.name, content);
+    this.contextManager.addMessage(this.name, content, metadata);
   }
 
   /**
@@ -1048,16 +1689,61 @@ export class Agent {
     this._state = { status: 'streaming', stream };
   }
 
+  /** The most recent cancelStream() of a live stream, until the stream
+   *  driver collects it on that stream's terminal event. Its presence is
+   *  the signal (a reasonless Stop is still a deliberate stop); its reason
+   *  is the caller's own word. Membrane reports every cancel() as reason
+   *  'user' — the call, not the actor — and a stream implementation may
+   *  report the cancel as `error` with no reason at all, so this record is
+   *  the only provenance a host-side cancel has. */
+  private _pendingCancel: { reason?: string } | undefined;
+
+  /** The most recent cancelStream() made while this agent held no stream:
+   *  during a turn's hooks or compile, while it waits to retry, or while no
+   *  check of a turn is ahead at all. The framework collects it at the check
+   *  ahead of it, which ends the turn, and the next start drops one no check
+   *  collected, so a stop made while none was ahead, such as a host's
+   *  interrupt of every agent, ends nothing. */
+  private _stopWithoutStream: { reason?: string } | undefined;
+
   /**
-   * Cancel any active stream and reset to idle.
+   * Cancel the stream this agent's state holds (streaming, waiting on its
+   * tools, or ready at a tool boundary with every result in), and reset to
+   * idle. With no stream, the stop is kept for the turn in progress, which
+   * the framework ends at its next check, before it sends anything more, if
+   * one is still ahead; otherwise the next start drops it. `reason` is
+   * provenance for the framework's inference:aborted trace and marker
+   * metadata (e.g. 'zombie_reclaim', 'subagent_cancel'); it never reaches
+   * the provider.
    */
-  cancelStream(): void {
-    if (this._state.status === 'streaming') {
+  cancelStream(reason?: string): void {
+    if ('stream' in this._state && this._state.stream) {
+      this._pendingCancel = { reason };
       this._state.stream.cancel();
-    } else if (this._state.status === 'waiting_for_tools' && this._state.stream) {
-      this._state.stream.cancel();
+    } else {
+      this._stopWithoutStream = { reason };
     }
     this._state = { status: 'idle' };
+  }
+
+  /** Collect (and clear) the cancelStream() made while this agent held no
+   *  stream, if one was made since the last collection. */
+  takeStopWithoutStream(): { reason?: string } | undefined {
+    const s = this._stopWithoutStream;
+    this._stopWithoutStream = undefined;
+    return s;
+  }
+
+  /** Collect (and clear) the cancel that ended the current stream, if this
+   *  side issued one. The stream driver calls it once, while the stream
+   *  still owns the agent, at the stream's terminal event (`aborted`
+   *  normally, `error` for implementations that report cancel() that way)
+   *  or at the loop's end when the stream closed without one. A record no
+   *  driver collects is cleared when the agent's next stream starts. */
+  takeCancel(): { reason?: string } | undefined {
+    const c = this._pendingCancel;
+    this._pendingCancel = undefined;
+    return c;
   }
 
   /**
@@ -1092,20 +1778,20 @@ export class Agent {
   }
 
   /**
-   * Build the effective system prompt, appending any system-position injections.
+   * Build the effective system prompt, appending any system-position
+   * injections, their blocks joined by line breaks. The system prompt is
+   * text, so a block of another type, such as an image a server or module
+   * injected there, can't go in it: a line in its place says so. The hook
+   * orchestrator tells a server's operator once per server and namespace,
+   * and the module registry tells a module's once per module and namespace.
    */
   private buildSystemPrompt(systemInjections: ContentBlock[]): string {
     if (systemInjections.length === 0) {
       return this.systemPrompt;
     }
 
-    const injectedText = systemInjections
-      .filter((block): block is ContentBlock & { type: 'text' } => block.type === 'text')
-      .map((block) => block.text);
-
-    if (injectedText.length === 0) {
-      return this.systemPrompt;
-    }
+    const injectedText = systemInjections.map((block) =>
+      block.type === 'text' ? block.text : `[${block.type} block not shown: the system prompt carries text only.]`);
 
     return this.systemPrompt + '\n' + injectedText.join('\n');
   }
@@ -1117,10 +1803,9 @@ export class Agent {
       return { aborted: true, durationMs };
     }
 
-    if (this._state.status === 'streaming' ||
-        (this._state.status === 'waiting_for_tools' && this._state.stream)) {
+    if ('stream' in this._state && this._state.stream) {
       const durationMs = Date.now() - this._inferenceStartedAt;
-      this.cancelStream();
+      this.cancelStream(reason);
       return { aborted: true, durationMs };
     }
 
@@ -1129,9 +1814,13 @@ export class Agent {
 
   private async doInference(
     request: NormalizedRequest,
-    signal?: AbortSignal
+    signal: AbortSignal | undefined,
+    /** Compiles the context into a request again, for the guard's retry. */
+    reassemble: () => Promise<NormalizedRequest>,
   ): Promise<InferenceResult> {
-    let response = await this.membrane.stream(request, { signal });
+    let response = signal?.aborted
+      ? { aborted: true as const, reason: 'user' as const }
+      : await this.membrane.stream(request, { signal });
     // Usage of a refused attempt abandoned by the guard; it was billed and
     // is added to the retry's usage below rather than overwritten.
     let abandonedUsage: { inputTokens: number; outputTokens: number } | undefined;
@@ -1141,12 +1830,14 @@ export class Agent {
       const ids = this.toolResultGuard.withhold('unknown');
       if (ids) {
         abandonedUsage = response.usage;
-        const withheld = new Set(ids);
-        request = { ...request, messages: request.messages.map((message) => ({
-          ...message, content: message.content.map((block) => block.type === 'tool_result' && withheld.has(block.toolUseId)
-            ? { type: 'tool_result', toolUseId: block.toolUseId, content: TOOL_RESULT_GUARD_NOTICE, isError: block.isError } : block),
-        })) };
-        response = await this.membrane.stream(request, { signal });
+        // The retry is compiled afresh, like every request: once each stub's
+        // annotation has finished (agent-framework #277), and against the
+        // budget without the batch's reservation, so a stub longer than its
+        // original can't carry the request past the budget.
+        const retry = await reassemble();
+        response = signal?.aborted
+          ? { aborted: true, reason: 'user', partialUsage: response.usage }
+          : await this.membrane.stream(retry, { signal });
       }
     }
 
@@ -1227,7 +1918,7 @@ export class Agent {
       toolUseId: r.id,
       content: r.result.isError
         ? truncateForHistory(r.result.error ?? 'Unknown error', DEFAULT_TOOL_RESULT_INLINE_MAX_CHARS)
-        : toolResultDataToHistoryString(r.result.data, DEFAULT_TOOL_RESULT_INLINE_MAX_CHARS),
+        : nonErrorResultText(r.result, DEFAULT_TOOL_RESULT_INLINE_MAX_CHARS),
       isError: r.result.isError,
     }));
 

@@ -8,17 +8,20 @@
  */
 
 import type { ContentBlock } from '@animalabs/membrane';
-import { INLINE_WITHHELD_TEXT, isInlineContradiction, referenceStubOrNull } from './references.js';
+import { convertBlock } from './convert-block.js';
 
 import type {
-  McplContentBlock,
   PushEventParams,
   PushEventResult,
 } from './types.js';
 import type { FeatureSetManager } from './feature-set-manager.js';
 import { McplFeatureSetError } from './feature-set-manager.js';
 import { expandCoreTags } from './tags.js';
-import { validateCoalescedContent } from './push-coalescer.js';
+import { coalesceRejectionReason, EmptyContentError, validateCoalescedContent } from './push-coalescer.js';
+import type { InboundSource } from './inbound-source.js';
+import { isSilentHeartbeatMarker, isVisiblyEmptyConversion } from './visible-content.js';
+import { logDetail, logValue } from './log-value.js';
+import { RefusalLines } from './refusal-lines.js';
 
 // ============================================================================
 // McplPushEvent (the ProcessEvent shape pushed to the queue)
@@ -45,77 +48,18 @@ export interface McplPushEvent {
   targetAgents?: string[];
   /** RFC-006: set when the coalescer delivers; rides the wake it queues. */
   coalescingSubject?: string;
-  /** RFC-006 assembly: materialized for this agent's turn (store directly). */
+  /** RFC-006 assembly: materialized for this agent's turn, stored directly
+   *  while its assembly runs, after what is queued for it (the framework's
+   *  addMessage, bypassDeferralFor). */
   assemblingFor?: string;
-}
-
-// ============================================================================
-// Content conversion: McplContentBlock → membrane ContentBlock
-// ============================================================================
-
-/**
- * Convert a single MCPL wire-format content block to a membrane ContentBlock.
- * Same logic as hook-orchestrator.ts.
- */
-export function convertBlock(block: McplContentBlock): ContentBlock {
-  switch (block.type) {
-    case 'text':
-      return { type: 'text', text: block.text };
-
-    case 'image':
-      if (isInlineContradiction(block)) {
-        // RFC-005 vector 2: inline data claiming bulk disposition — fail
-        // closed, withhold the data (checked BEFORE the data branch).
-        return { type: 'text', text: INLINE_WITHHELD_TEXT };
-      }
-      if (block.uri && block.disposition) {
-        // RFC-005 uri-form media with a disposition claim: stub, do not
-        // hand the URI to the provider or inline it.
-        return { type: 'text', text: referenceStubOrNull(block, 'attachment on push event') ?? '[reference]' };
-      }
-      if (block.data && block.mimeType) {
-        return {
-          type: 'image',
-          source: { type: 'base64', data: block.data, mediaType: block.mimeType },
-        } as ContentBlock;
-      }
-      if (block.uri) {
-        return {
-          type: 'image',
-          source: { type: 'url', url: block.uri },
-        } as ContentBlock;
-      }
-      return { type: 'text', text: '[Image: no data]' };
-
-    case 'audio':
-      if (isInlineContradiction(block)) {
-        // RFC-005 vector 2: inline data claiming bulk disposition — fail
-        // closed, withhold the data (checked BEFORE the data branch).
-        return { type: 'text', text: INLINE_WITHHELD_TEXT };
-      }
-      if (block.uri && block.disposition) {
-        // RFC-005 uri-form media with a disposition claim: stub, do not
-        // hand the URI to the provider or inline it.
-        return { type: 'text', text: referenceStubOrNull(block, 'attachment on push event') ?? '[reference]' };
-      }
-      if (block.data && block.mimeType) {
-        return {
-          type: 'audio',
-          source: { type: 'base64', data: block.data, mediaType: block.mimeType },
-        } as ContentBlock;
-      }
-      return { type: 'text', text: '[Audio: no data]' };
-
-    case 'resource':
-      // RFC-005: reference blocks become bounded stubs — never raw URIs
-      // (a signed URL is a bearer credential that looks like a location).
-      return { type: 'text', text: referenceStubOrNull(block, 'attachment on push event') ?? '[reference]' };
-
-    default:
-      // Unknown wire block types previously fell off the exhaustive switch
-      // and propagated `undefined` into ContentBlock[]. Fail visibly.
-      return { type: 'text', text: `[unrecognized content block: ${(block as { type?: string }).type ?? 'untyped'}]` };
-  }
+  /** The coalescer's mark: the agent's first view of the subject (see
+   *  CoalescedOccurrence.firstView). */
+  firstView?: boolean;
+  /** Host acceptance time (epoch ms), stamped where the push is admitted. */
+  acceptedAt?: number;
+  /** Framework-owned source envelope, frozen at a coalesced occurrence's
+   *  acceptance so its later delivery cannot restamp it (inbound-source.ts). */
+  inboundSource?: InboundSource;
 }
 
 // ============================================================================
@@ -170,6 +114,9 @@ export class PushHandler {
   private emitTraceFn: (event: { type: string; [key: string]: unknown }) => void;
   private shouldTriggerInference?: (content: string, metadata: Record<string, unknown>) => boolean;
   private dedup = new DedupSet(1000);
+  /** Holds back repeats of the line for a channel-scoped push refused because
+   *  its channel isn't declared (-32023) or may not be used (-32017). */
+  private channelRefusalLines = new RefusalLines();
 
   constructor(
     featureSetManager: FeatureSetManager,
@@ -177,6 +124,10 @@ export class PushHandler {
     emitTraceFn: (event: { type: string; [key: string]: unknown }) => void,
     shouldTriggerInference?: (content: string, metadata: Record<string, unknown>) => boolean,
     private readonly handleCoalesced?: (serverId: string, params: PushEventParams, event: McplPushEvent) => Promise<PushEventResult>,
+    /** An ordinary (uncoalesced) push was just admitted, before it is queued
+     *  or acknowledged: return its source envelope, frozen now
+     *  (mcpl/inbound-source.ts). Coalesced work is stamped by its own path. */
+    private readonly acceptInbound?: (event: McplPushEvent) => InboundSource | undefined,
   ) {
     this.featureSetManager = featureSetManager;
     this.pushEventFn = pushEventFn;
@@ -188,9 +139,9 @@ export class PushHandler {
    * Handle a push/event message from an MCPL server.
    *
    * 1. Validate feature set
-   * 2. Deduplicate by eventId
-   * 3. Optionally check shouldTriggerInference callback
-   * 4. Convert content blocks
+   * 2. Convert content blocks; reject visibly-empty content
+   * 3. Deduplicate by eventId
+   * 4. Optionally check shouldTriggerInference callback
    * 5. Push event to queue
    * 6. Emit trace
    * 7. Respond with accepted + inferenceId
@@ -220,7 +171,7 @@ export class PushHandler {
         : 'Feature set validation failed';
       // Loud rejection — a rejected push event is an agent that silently
       // never hears the message. (2026-07-09 diagnosability pass.)
-      console.error(`[push-event-rejected] server=${serverId} eventId=${params.eventId} reason=${reason}`);
+      console.error(`[push-event-rejected] server=${serverId} eventId=${logValue(params.eventId ?? '')} reason=${logValue(reason)}`);
       if (err instanceof McplFeatureSetError && responder?.respondError) {
         responder.respondError(err.code, reason, { featureSet: err.featureSet });
       } else {
@@ -229,29 +180,47 @@ export class PushHandler {
       return;
     }
 
-    // 2. Deduplicate by eventId. A coalesced occurrence is deduplicated by the
-    // coalescer's receipts instead (RFC-006 §3.1: a retry within the window
-    // gets its original result, which this set could not return).
     const coalesced = params.coalesce !== undefined && !!this.handleCoalesced;
+    // Empty content is meaningful only for a coalescing retraction (pure
+    // withdrawal, RFC-006 §6 — the coalescer appends nothing for it) and for
+    // the silent-heartbeat marker. Anything else that shows the model nothing
+    // would wake it with no visible cause.
+    const emptyAllowed = (coalesced && params.coalesce?.retract === true)
+      || isSilentHeartbeatMarker({ serverId, featureSet: params.featureSet, origin: params.origin, content: params.payload?.content });
     if (coalesced) {
       // RFC-006 §13: malformed content is a -32602, checked before conversion.
       try {
-        validateCoalescedContent(params.payload?.content);
+        validateCoalescedContent(params.payload?.content, { allowEmpty: emptyAllowed });
       } catch (error) {
         const err = error as Error & { code?: number; field?: string };
-        if (responder?.respondError) responder.respondError(err.code ?? -32602, err.message, { field: err.field });
-        else responder?.respond({ accepted: false, reason: err.message });
+        const code = err.code ?? -32602;
+        if (err instanceof EmptyContentError) this.traceEmptyRejection(serverId, params);
+        else this.traceCoalesceRejection(serverId, params, err, code);
+        if (responder?.respondError) responder.respondError(code, err.message, { field: err.field });
+        else responder?.respond({ accepted: false, reason: err instanceof EmptyContentError ? err.reason : err.message });
         return;
       }
     }
-    if (!coalesced && this.dedup.checkAndAdd(params.eventId)) {
-      console.error(`[push-event-rejected] server=${serverId} eventId=${params.eventId} reason=duplicate`);
-      responder?.respond({ accepted: false, reason: 'duplicate' });
+
+    // 2. Convert content blocks, and refuse content with nothing visible in
+    // it — before dedup, so a refused eventId is not burned for a retry.
+    const content: ContentBlock[] = params.payload.content.map((block) => convertBlock(block, 'attachment on push event', serverId));
+    if (!emptyAllowed && isVisiblyEmptyConversion(params.payload.content, content)) {
+      const err = new EmptyContentError();
+      this.traceEmptyRejection(serverId, params);
+      if (responder?.respondError) responder.respondError(err.code, err.message, { field: err.field });
+      else responder?.respond({ accepted: false, reason: err.reason });
       return;
     }
 
-    // 3. Convert content blocks
-    const content: ContentBlock[] = params.payload.content.map(convertBlock);
+    // 3. Deduplicate by eventId. A coalesced occurrence is deduplicated by the
+    // coalescer's receipts instead (RFC-006 §3.1: a retry within the window
+    // gets its original result, which this set could not return).
+    if (!coalesced && this.dedup.checkAndAdd(params.eventId)) {
+      console.error(`[push-event-rejected] server=${serverId} eventId=${logValue(params.eventId ?? '')} reason=duplicate`);
+      responder?.respond({ accepted: false, reason: 'duplicate' });
+      return;
+    }
 
     // 4. Check shouldTriggerInference callback
     let triggerInference = true;
@@ -260,12 +229,15 @@ export class PushHandler {
         .filter((b): b is ContentBlock & { type: 'text' } => b.type === 'text')
         .map((b) => b.text)
         .join('\n');
+      // The host's own fields come after the server's origin, as a channel
+      // message's do, so an origin can't give the gate another server's id,
+      // feature set, event id or event type.
       const metadata: Record<string, unknown> = {
+        ...(params.origin ?? {}),
         serverId,
         featureSet: params.featureSet,
         eventId: params.eventId,
         eventType: 'mcpl:push-event',
-        ...(params.origin ?? {}),
         ...(params.tags ? { tags: params.tags } : {}),
       };
       triggerInference = this.shouldTriggerInference(textContent, metadata);
@@ -286,6 +258,7 @@ export class PushHandler {
       timestamp: params.timestamp,
       inferenceId,
       triggerInference,
+      acceptedAt: Date.now(),
     };
     if (coalesced) {
       // RFC-006: the coalescer decides whether this occurrence replaces an
@@ -297,12 +270,18 @@ export class PushHandler {
         responder?.respond(result);
       } catch (error) {
         const err = error as Error & { code?: number; field?: string };
-        console.error(`[push-event-rejected] server=${serverId} eventId=${params.eventId} reason=${err.message}`);
-        if (responder?.respondError) responder.respondError(typeof err.code === 'number' ? err.code : -32603, err.message, { field: err.field });
+        const code = typeof err.code === 'number' ? err.code : -32603;
+        this.traceCoalesceRejection(serverId, params, err, code);
+        if (responder?.respondError) responder.respondError(code, err.message, { field: err.field });
         else responder?.respond({ accepted: false, reason: err.message });
       }
       return;
     }
+    // The source envelope is frozen at admission, before queueing or the
+    // acknowledgement: nothing that changes while the push waits in the
+    // queue can rewrite where it came from.
+    const inboundSource = this.acceptInbound?.(pushEvent);
+    if (inboundSource) pushEvent.inboundSource = inboundSource;
     this.pushEventFn(pushEvent);
 
     // 7. Emit trace
@@ -315,5 +294,65 @@ export class PushHandler {
 
     // 8. Respond
     responder?.respond({ accepted: true, inferenceId });
+  }
+
+  /**
+   * A coalesced occurrence the host refused, as loud as every other push
+   * rejection: its producer is told on the wire, and until now the host said
+   * nothing, so a dropped message left no trace where operators look
+   * (agent-framework#266). The producer gets the wire answer this lane gives
+   * (`answered`): the thrown error's code and message, or -32602 for a
+   * malformed occurrence without one. The reason follows that answer
+   * (coalesceRejectionReason): `coalesce-failed` when the host itself failed,
+   * `coalesce-invalid` when the producer's occurrence was refused, with the
+   * failing `field` and the error's message as `detail`. A missing eventId
+   * prints as `""` and traces as `''`, as the channel lane's missing id does.
+   * A channel-scoped push refused because its channel isn't declared or may
+   * not be used names the channel on its line and its trace, and is refused
+   * for as long as that lasts, so its line prints at most once a minute per
+   * channel (RefusalLines); every refusal is traced.
+   */
+  private traceCoalesceRejection(
+    serverId: string,
+    params: PushEventParams,
+    error: { field?: unknown; message: string },
+    answered: number,
+  ): void {
+    const reason = coalesceRejectionReason(answered);
+    const field = typeof error.field === 'string' && error.field ? error.field : undefined;
+    const scoped = params.coalesce?.channelId;
+    const channelId = (answered === -32023 || answered === -32017) && typeof scoped === 'string' ? scoped : undefined;
+    const held = channelId === undefined ? 0 : this.channelRefusalLines.admit(serverId, channelId);
+    if (held !== null) {
+      console.error(
+        `[push-event-rejected] server=${serverId} featureSet=${logValue(params.featureSet ?? '')} eventId=${logValue(params.eventId ?? '')} ` +
+        (channelId === undefined ? '' : `channel=${logValue(channelId)} `) +
+        `reason=${reason}${field ? ` field=${logValue(field)}` : ''}: ${logDetail(error.message)}` +
+        (held ? ` (${held} more since the last line)` : ''),
+      );
+    }
+    this.emitTraceFn({
+      type: 'mcpl:push-event-rejected',
+      serverId,
+      eventId: typeof params.eventId === 'string' ? params.eventId : '',
+      featureSet: params.featureSet,
+      reason,
+      ...(field ? { field } : {}),
+      ...(channelId === undefined ? {} : { channelId }),
+      detail: error.message,
+    });
+  }
+
+  /** Loud, like every other push rejection: the producer's wake went nowhere.
+   *  A missing eventId prints as `""` and traces as `''`, as on every push line. */
+  private traceEmptyRejection(serverId: string, params: PushEventParams): void {
+    console.error(`[push-event-rejected] server=${serverId} eventId=${logValue(params.eventId ?? '')} reason=empty-content`);
+    this.emitTraceFn({
+      type: 'mcpl:push-event-rejected',
+      serverId,
+      eventId: typeof params.eventId === 'string' ? params.eventId : '',
+      featureSet: params.featureSet,
+      reason: 'empty-content',
+    });
   }
 }

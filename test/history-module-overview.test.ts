@@ -553,7 +553,7 @@ describe('HistoryModule.overview', () => {
     );
     assert.equal(result.success, false);
     assert.equal(result.isError, true);
-    assert.match(result.error ?? '', /must not be after/);
+    assert.match(result.error ?? '', /is after "to"/);
   });
 
   it('caps the entry list at an explicit `limit`, keeping the most recent spans and signaling truncated/totalSpans (no-cap finding)', async () => {

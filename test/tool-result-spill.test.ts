@@ -436,7 +436,7 @@ describe('tool-result spill completion (issue #89)', () => {
       const stored = await waitForStoredToolResult(h.framework);
       assert.ok(stored, 'tool result should be stored');
       assert.ok(stored.content.length < CAPPED, 'inline copy must be capped');
-      assert.match(stored.content, /no writable workspace, full content not retained/);
+      assert.match(stored.content, /no writable workspace mount without an include, full content not retained/);
       assert.doesNotMatch(stored.content, /workspace file/);
     } finally {
       await h.framework.stop();
@@ -523,6 +523,31 @@ describe('tool-result spill completion (issue #89)', () => {
     } finally {
       await h.framework.stop();
       rmSync(h.tempDir, { recursive: true, force: true });
+    }
+  });
+
+  it('cuts a failed spill\'s reason at 200 units without halving a surrogate pair', async () => {
+    // 199 units, then an emoji whose two units straddle the 200-unit cut.
+    const reason = `${'r'.repeat(199)}😀 and the rest of the reason`;
+    const proto = WorkspaceModule.prototype as unknown as { writeBinary: (...args: unknown[]) => Promise<unknown> };
+    const writeBinary = proto.writeBinary;
+    proto.writeBinary = async () => ({ success: false, error: reason });
+    let h: SpillHarness | undefined;
+    try {
+      h = await startSpillTurn({
+        prefix: 'spill-pair-',
+        result: { success: true, data: { blob: 'w'.repeat(60_000) } },
+        withWorkspace: true,
+      });
+      const stored = await waitForStoredToolResult(h.framework);
+      assert.ok(stored, 'tool result should be stored');
+      assert.ok(stored.content.includes(`FAILED (${'r'.repeat(199)})`), `the cut leaves the emoji out whole: ${stored.content.slice(-400)}`);
+    } finally {
+      proto.writeBinary = writeBinary;
+      if (h) {
+        await h.framework.stop();
+        rmSync(h.tempDir, { recursive: true, force: true });
+      }
     }
   });
 

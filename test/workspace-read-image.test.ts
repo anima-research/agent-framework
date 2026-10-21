@@ -1,6 +1,6 @@
 import test, { type TestContext } from 'node:test';
 import assert from 'node:assert/strict';
-import { existsSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { appendFileSync, existsSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { JsStore } from '@animalabs/chronicle';
@@ -8,6 +8,7 @@ import { AgentFramework } from '../src/framework.js';
 import { WorkspaceModule } from '../src/modules/workspace/index.js';
 import { toolResultDataToHistoryString } from '../src/tool-result-history.js';
 import { MockMembrane, createMockResponse as createStreamResponse } from './helpers/mock-membrane.js';
+import { changedAfterFstat, countingLoads } from './helpers/file-handle.js';
 import type { Module, ModuleContext, ProcessState, EventResponse } from '../src/types/module.js';
 import type { ProcessEvent, ToolCall, ToolResult } from '../src/types/events.js';
 
@@ -378,6 +379,17 @@ test('extension and user-visible name do not override magic-byte MIME detection'
   expectImageResult(result, 'work/mismatch.jpg', TINY_IMAGES.png);
 });
 
+test('an image that grows past maxFileSize after the open is refused without loading more than the limit and the byte after it', async (t) => {
+  const { mountDir, workspace } = setupWorkspace(t, { maxFileSize: 100 });
+  const path = join(mountDir, 'growing.png');
+  writeFileSync(path, TINY_IMAGES.png.bytes);
+  assert.ok(TINY_IMAGES.png.bytes.length <= 100, 'within the limit at the open');
+  const { result, loaded } = await countingLoads(() => changedAfterFstat(path, () => appendFileSync(path, Buffer.alloc(4096)),
+    () => callReadImage(workspace, 'work/growing.png')));
+  assert.equal(result.error, 'Image file exceeds max size (100 bytes): work/growing.png');
+  assert.ok(loaded <= 101, `loaded ${loaded} bytes: no more than the limit, and the one byte that shows the file goes on`);
+});
+
 test('unknown mount, mount root, directory, unknown/truncated/empty/oversize files fail closed', async (t) => {
   const { mountDir, workspace } = setupWorkspace(t, { maxFileSize: 16 });
   mkdirSync(join(mountDir, 'folder'));
@@ -432,7 +444,7 @@ test('lexical traversal and symlink escape fail without leaking absolute paths',
   const traversal = await callReadImage(workspace, 'work/../outside/outside.png');
   assert.equal(traversal.success, false);
   assert.equal(traversal.isError, true);
-  assert.equal(traversal.error, 'Path traversal detected: "work/../outside/outside.png" resolves outside mount "work"');
+  assert.equal(traversal.error, 'Path traversal detected: "work/../outside/outside.png" climbs above the root of mount "work".');
   assert.ok(!traversal.error?.includes(root));
 
   const escape = await callReadImage(workspace, 'work/escape.png');

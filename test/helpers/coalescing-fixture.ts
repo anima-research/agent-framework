@@ -15,9 +15,22 @@ import { AgentFramework } from '../../src/framework.js';
 import { MockMembrane, MockYieldingStream, createMockResponse } from './mock-membrane.js';
 
 export const TS = '2026-09-30T00:00:00Z';
+
+/**
+ * How long the fixture's waits run before they fail: send() for a request's
+ * reply, answered() for the host's answers, eventually() for its condition,
+ * settles() for the work it's given.
+ * Each is a hang guard: it turns a wait that never ends into a failure
+ * instead of a hung run, and it isn't a check on how fast the host works. So
+ * it's set wide, and the same for every wait: a loaded host's stall needn't
+ * be in proportion to the work waited on, so a bound sized to the work can
+ * still cut off a host that's getting there.
+ */
+export const REPLY_DEADLINE_MS = 60_000;
+
 export const ok = () => createMockResponse([{ type: 'text', text: 'ok' }]);
 
-export async function fixture(options: { server?: Record<string, unknown>; framework?: Partial<FrameworkConfig>; agents?: unknown[]; dir?: string; port?: number } = {}) {
+export async function fixture(options: { server?: Record<string, unknown>; framework?: Partial<FrameworkConfig>; agents?: unknown[]; dir?: string; port?: number; featureSets?: Record<string, unknown>; mcpl?: Record<string, unknown>; tools?: unknown[]; toolsCall?: (params: Record<string, unknown>) => unknown } = {}) {
   const wss = new WebSocketServer({ port: options.port ?? 0, host: '127.0.0.1' });
   await once(wss, 'listening');
   let online = true;
@@ -40,14 +53,22 @@ export async function fixture(options: { server?: Record<string, unknown>; frame
         reply({ protocolVersion: '2024-11-05', capabilities: { tools: {}, experimental: { mcpl: {
           version: '0.5', pushEvents: true, inferenceRequest: true,
           channels: { incoming: true, register: true, lifecycle: true, publish: true },
-          featureSets: { doc: { description: 'doc', uses: ['pushEvents'] } },
+          featureSets: options.featureSets ?? { doc: { description: 'doc', uses: ['pushEvents'] } },
+          ...options.mcpl,
         } } }, serverInfo: { name: 'editor', version: '1' } });
       } else if (m.method === 'featureSets/update') reply({ accepted: true });
-      else if (m.method === 'tools/list') reply({ tools: [] });
+      else if (m.method === 'tools/list') reply({ tools: options.tools ?? [] });
+      else if (m.method === 'tools/call' && options.toolsCall) reply(options.toolsCall(m.params));
       else if (m.method === 'channels/publish') { published.push(m.params); if (m.id !== undefined) reply({ delivered: true }); }
       else if (m.method === 'channels/close') reply({ closed: true });
       else if (m.method === 'channels/open') reply({ channel: { id: m.params.channelId, type: 'discord', label: m.params.channelId } });
-      else if (m.method === 'push/render') { renders.push(m.params); reply(await renderer(m.params)); }
+      else if (m.method === 'push/render') {
+        renders.push(m.params);
+        const out = await renderer(m.params) as { error?: unknown } | undefined;
+        // A renderer may answer with a JSON-RPC error: { error: { code, message } }.
+        if (out && typeof out === 'object' && 'error' in out) ws.send(JSON.stringify({ jsonrpc: '2.0', id: m.id, error: out.error }));
+        else reply(out);
+      }
       else if (m.id !== undefined) reply({});
     });
   });
@@ -65,9 +86,10 @@ export async function fixture(options: { server?: Record<string, unknown>; frame
     } as FrameworkConfig);
     return framework;
   };
+  // Sends a request and waits for its reply, for up to REPLY_DEADLINE_MS.
   const send = (method: string, params: unknown): Promise<any> => new Promise((resolve, reject) => {
     const id = next++;
-    const timer = setTimeout(() => reject(new Error(`no reply to ${method}`)), 3000);
+    const timer = setTimeout(() => reject(new Error(`no reply to ${method} within ${REPLY_DEADLINE_MS / 1000} s`)), REPLY_DEADLINE_MS);
     replies.set(id, (value) => { clearTimeout(timer); resolve(value); });
     socket.send(JSON.stringify({ jsonrpc: '2.0', id, method, params }));
   });
@@ -78,6 +100,13 @@ export async function fixture(options: { server?: Record<string, unknown>; frame
     disconnect: () => socket.terminate(),
     online: (value: boolean) => { online = value; },
     register: (id = 'chat') => send('channels/register', { channels: [{ id, type: 'discord', label: id, metadata: { channelType: 'guild_text' } }] }),
+    /** Waits, as eventually() does, until the host has answered every request
+     *  the test sent through send(), including one whose send already failed
+     *  at its deadline. A test that leaves the host still working on such a
+     *  request waits for this before it closes, so the close doesn't take away
+     *  what that work uses. It polls on setTimeout, so call it with real
+     *  timers. */
+    answered: () => eventually(() => replies.size === 0, "the host's replies to the requests sent"),
     /** A coalesced channels/incoming message for platform message `m`. */
     channel: (eventId: string, text: string, flags: Record<string, unknown> = {}, channelId = 'chat', messageId = 'm') => ({
       channelId, messageId, eventId, timestamp: TS, author: { id: 'u', name: 'User' }, tags: ['chat:mention'],
@@ -110,9 +139,26 @@ export async function fixture(options: { server?: Record<string, unknown>; frame
   };
 }
 
+/** Waits until `predicate` holds, for up to REPLY_DEADLINE_MS. */
 export async function eventually(predicate: () => boolean, what = 'condition'): Promise<void> {
-  const deadline = Date.now() + 3000;
-  while (!predicate()) { assert(Date.now() < deadline, `${what} did not settle`); await new Promise((r) => setTimeout(r, 10)); }
+  // The monotonic clock: a wall-clock step must not fail a wait that's on schedule.
+  const deadline = performance.now() + REPLY_DEADLINE_MS;
+  while (!predicate()) { assert(performance.now() < deadline, `${what} did not settle within ${REPLY_DEADLINE_MS / 1000} s`); await new Promise((r) => setTimeout(r, 10)); }
+}
+
+/**
+ * Awaits `work`, failing with `what` if it hasn't settled within
+ * REPLY_DEADLINE_MS. Without it, a wait that never ends would run until a
+ * test timeout cut it off, which names nothing it waited on; this turns it
+ * into a failure that names what was awaited. When it fires, the work it
+ * waited on keeps running, and the test's close then runs under it.
+ */
+export async function settles<T>(work: Promise<T>, what: string): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const late = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => reject(new Error(`${what} did not settle within ${REPLY_DEADLINE_MS / 1000} s`)), REPLY_DEADLINE_MS);
+  });
+  try { return await Promise.race([work, late]); } finally { clearTimeout(timer); }
 }
 
 
