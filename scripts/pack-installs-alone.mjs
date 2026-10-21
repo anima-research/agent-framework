@@ -16,7 +16,7 @@
 //   - each entry point loads as a consumer loads it: the root and each
 //     subpath, patterns aside, through import() (a JSON target with its
 //     import attribute), and through require() where `require` picks a file
-//     import() doesn't; and, when bun is on PATH, each one with a `bun`
+//     import() doesn't; and, when bun runs here, each one with a `bun`
 //     condition through bun's import() of its name;
 //   - each bin starts with a `#!` line, without which npm's link can't run
 //     it as a command, and an ES module node bin's static imports load.
@@ -40,9 +40,9 @@ import { join, relative } from "node:path";
 import { pathToFileURL } from "node:url";
 import { npmCommand, SINGLE_THREADED } from "./single-threaded.mjs";
 
-// The limits of npm pack and npm install, and of each load, which
-// PACK_INSTALLS_ALONE_INSTALL_TIMEOUT_MS and
-// PACK_INSTALLS_ALONE_LOAD_TIMEOUT_MS set in milliseconds. A child that
+// The limits of npm pack and npm install, and of each load, each CommonJS
+// bin's parse and `bun --version`, which PACK_INSTALLS_ALONE_INSTALL_TIMEOUT_MS
+// and PACK_INSTALLS_ALONE_LOAD_TIMEOUT_MS set in milliseconds. A child that
 // outlives its limit is killed, not asked to stop. What it started itself
 // isn't killed with it: in CI, the job's timeout-minutes ends that.
 const INSTALL_TIMEOUT_MS = 10 * 60_000;
@@ -149,17 +149,29 @@ function hasCondition(value, condition) {
   return Object.entries(value).some(([key, inner]) => key === condition || hasCondition(inner, condition));
 }
 
-/** Whether `bun` runs here. */
-function bunOnPath() {
-  return spawnSync("bun", ["--version"], { stdio: "ignore" }).status === 0;
+/** Why `bun` doesn't run here, as the summary says it, from its `--version`
+ *  under the loads' limit; null when it runs. An exit is an answer, and a
+ *  hang isn't: a bun that outlives the limit is there and broken, so the
+ *  check fails, naming it, rather than skipping loads it never ran. */
+function whyNoBun(timeoutMs) {
+  const probe = spawnSync("bun", ["--version"], { stdio: "ignore", timeout: timeoutMs, killSignal: "SIGKILL" });
+  if (probe.error?.code === "ETIMEDOUT") throw new CheckError(`bun --version didn't finish within ${timeoutMs / 1000} s.`);
+  if (probe.error) return `bun doesn't run here: ${probe.error.code ?? probe.error.message}`;
+  if (probe.signal) return `bun doesn't run here: bun --version was killed by ${probe.signal}`;
+  if (probe.status !== 0) return `bun doesn't run here: bun --version exited ${probe.status}`;
+  return null;
 }
 
-/** Runs a command with its output going to ours; a failure throws `message`. */
-function run(file, args, options, message) {
+/** Runs a command with its output going to ours. A failure throws `message`,
+ *  and one at the limit `options.timeout` sets throws `timedOut`, or where
+ *  that isn't given, `message` up to its first ' (' with the limit. */
+function run(file, args, options, message, timedOut) {
   try {
     execFileSync(file, args, { stdio: ["ignore", "inherit", "inherit"], killSignal: "SIGKILL", ...options });
   } catch (error) {
-    throw new CheckError(error?.code === "ETIMEDOUT" ? `${message.split(" (")[0]}: it didn't finish within ${options.timeout / 1000} s.` : message);
+    throw new CheckError(
+      error?.code === "ETIMEDOUT" ? (timedOut ?? `${message.split(" (")[0]}: it didn't finish within ${options.timeout / 1000} s.`) : message,
+    );
   }
 }
 
@@ -305,12 +317,12 @@ function main() {
     // package's name under bun loads what a bun consumer gets: the `bun`
     // target where `bun` is the first condition bun matches.
     const bunLoads = [];
-    const bun = bunOnPath();
+    const noBun = whyNoBun(loadTimeoutMs);
     for (const [key, value] of roots) {
       if (key.includes("*") || !hasCondition(value, "bun")) continue;
       const specifier = key === "." ? pkg.name : `${pkg.name}${key.slice(1)}`;
       bunLoads.push(specifier);
-      if (!bun) continue;
+      if (noBun) continue;
       run(
         "bun",
         ["-e", `await import(${JSON.stringify(specifier)}); process.exit(0);`],
@@ -357,7 +369,13 @@ function main() {
         continue;
       }
       if (stderr.includes(NOT_MODULE)) {
-        run(process.execPath, [SINGLE_THREADED, "--check", file], {}, `bin '${bin}' (${path}) in ${packed.filename} doesn't parse (above).`);
+        run(
+          process.execPath,
+          [SINGLE_THREADED, "--check", file],
+          { timeout: loadTimeoutMs },
+          `bin '${bin}' (${path}) in ${packed.filename} doesn't parse (above).`,
+          `checking bin '${bin}' (${path}) in ${packed.filename} didn't finish within ${loadTimeoutMs / 1000} s.`,
+        );
         binsParsed.push(bin);
         continue;
       }
@@ -376,9 +394,9 @@ function main() {
       `${packed.filename} (${files.length} files) installs on its own; every file package.json's main, types, exports and bin name is in it` +
         (loads.length > 0 ? `; loaded ${loads.map(([s, how]) => `'${s}' (${how})`).join(", ")}` : "") +
         (bunLoads.length > 0
-          ? bun
+          ? noBun === null
             ? `; loaded under bun: ${bunLoads.map((s) => `'${s}'`).join(", ")}`
-            : `; bun targets present, not loaded (bun isn't on PATH): ${bunLoads.map((s) => `'${s}'`).join(", ")}`
+            : `; bun targets present, not loaded (${noBun}): ${bunLoads.map((s) => `'${s}'`).join(", ")}`
           : "") +
         (Object.keys(bins).length > 0 ? `; bins start with '#!': ${Object.keys(bins).join(", ")}` : "") +
         (binsLoaded.length > 0 ? `; ES module bins' static imports load: ${binsLoaded.join(", ")}` : "") +

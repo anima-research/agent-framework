@@ -1048,11 +1048,13 @@ export class EventGate {
     // rouse the agent — its own heartbeat (an internal clock, not an outside
     // interruption: each tick lets the agent reconsider and optionally `wake`)
     // and a privileged user's ping. The event always enters context regardless
-    // (the gate only governs inference triggering).
+    // (the gate only governs inference triggering). The heartbeat is the
+    // server the host knows as `heartbeat`, the server id the silent-heartbeat
+    // marker requires too: a `source` in an event's metadata is the server's
+    // own word, which any server can give.
     if (this.sleepUntil > this.now()) {
       this.reloadPrivilegedIfChanged();
-      const isHeartbeat =
-        info.metadata?.source === 'heartbeat' || info.serverId === 'heartbeat';
+      const isHeartbeat = info.serverId === 'heartbeat';
       const authorId = this.extractAuthorId(info.metadata);
       const privileged = authorId !== null && this.privilegedUserIds.has(authorId);
       if (!isHeartbeat && !privileged) {

@@ -399,13 +399,13 @@ describe('stop() with an operator operation in flight', () => {
 
   it('an awareness sync after a stop() that failed is refused', async () => {
     const framework = await create();
-    const fw = framework as unknown as Internals & { codeExecutionRunners: Map<string, { dispose(): void }> };
-    // A runner whose dispose throws fails stop() after the queue has closed,
+    const fw = framework as unknown as Internals & { codeExecution: unknown };
+    // Scripts whose dispose throws fail stop() after the queue has closed,
     // before stop() reaches its wait on the operator set.
-    fw.codeExecutionRunners.set('agent', { dispose() { throw new Error('dispose failed'); } });
+    fw.codeExecution = { scripts: { dispose() { throw new Error('dispose failed'); }, turnEnded() {}, leftRunning: () => 0 } };
     await assert.rejects(framework.stop(), /dispose failed/);
     await assert.rejects(framework.syncDiscordAwarenessMarkers(), /^Error: awareness sync refused: the framework is stopping$/);
-    fw.codeExecutionRunners.clear();
+    fw.codeExecution = null;
     await framework.stop();
     assert.equal(framework.getStore().isClosed(), true);
   });

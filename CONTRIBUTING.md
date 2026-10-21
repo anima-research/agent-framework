@@ -66,10 +66,13 @@ the house default; plain descriptive titles are accepted.
   additions plus deletions pass 400 lines, unless it carries `no-greptile`,
   and the review starts when the label lands: within about half an hour of
   the PR opening, passing 400 lines or being marked ready, and later when
-  GitHub's scheduler is busy. A smaller PR gets a Greptile review if a
-  maintainer adds the label. `no-greptile` skips the review. Removing
-  `greptile` from a PR past 400 lines doesn't skip it, since the next run
-  adds the label back.
+  GitHub's scheduler is busy. A PR updated in the two minutes before a run
+  waits for a later one. A smaller PR gets a Greptile review if a maintainer
+  adds the label a minute or more after it's opened, reopened or marked
+  ready. A label added seven seconds after opening has twice started no
+  review, and Greptile's reference counts reopening and marking ready as
+  openings too. `no-greptile` skips the review. Removing `greptile` from a PR
+  past 400 lines doesn't skip it, since a later run adds the label back.
 - Respond by pushing fix commits and replying per finding — "Addressed in
   `<sha>`" — rather than force-pushing a rewritten branch. A re-review then
   flips the verdict.

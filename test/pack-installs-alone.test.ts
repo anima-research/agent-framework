@@ -1,8 +1,8 @@
 // Black-box coverage of scripts/pack-installs-alone.mjs: each case runs the
 // real script in a throwaway package whose dependencies, if any, are local
 // tarballs, so npm packs and installs it offline, with its own cache and
-// user config. A `bun` shim in front of PATH decides whether bun is there:
-// by default it isn't; BUN_BY_NODE stands bun in with Node under the `bun`
+// user config. A `bun` shim in front of PATH decides whether bun runs: by
+// default it exits 127; BUN_BY_NODE stands bun in with Node under the `bun`
 // condition, so a bun target loads as bun would load it, with --single-threaded
 // as the script's own loads run. The tests start the real npm as the script
 // does (scripts/single-threaded.mjs).
@@ -88,12 +88,13 @@ function isolated(): Record<string, string> {
   };
 }
 
-/** How long the tests' own npm pack may take: past its second or two on a
- *  loaded host, and short of the runner's ten-minute timeout, so a hang in
- *  npm says which command it was. npm is killed at the limit, not asked to
- *  stop. What it started itself isn't killed with it, and, as with the
- *  script's own npm pack, the call waits on any of that still holding npm's
- *  output open. */
+/** How long an npm may take in these tests: the tests' own npm pack, and
+ *  the script's npm pack and npm install under check(). It's past their
+ *  second or two on a loaded host, and short of the runner's ten-minute
+ *  timeout, so a hang in npm says which command it was. The tests' own npm
+ *  pack is killed at the limit, not asked to stop. What it started itself
+ *  isn't killed with it, and, as with the script's own npm pack, the call
+ *  waits on any of that still holding npm's output open. */
 const PACK_LIMIT_MS = 120_000;
 
 /** Packs the package in `dir` into `tarballs`, offline, starting the npm
@@ -117,8 +118,17 @@ function packInto(dir: string, tarballs: string, path = process.env.PATH ?? "", 
   return join(tarballs, (Array.isArray(parsed) ? parsed[0] : Object.values(parsed)[0] as { filename: string }).filename);
 }
 
+/** Runs the script in `dir`. Its npm pack and npm install take PACK_LIMIT_MS,
+ *  not the script's own ten minutes, which the runner's timeout equals, so a
+ *  hang in either fails with the script's message naming it. A test's own
+ *  PACK_INSTALLS_ALONE_INSTALL_TIMEOUT_MS in `extraEnv` replaces it. */
 function check(dir: string, bun = NO_BUN, extraPath = "", extraEnv: Record<string, string> = {}): Promise<{ code: number; stdout: string; stderr: string }> {
-  const env = { ...isolated(), ...extraEnv, PATH: `${extraPath}${bun}:${process.env.PATH ?? ""}` };
+  const env = {
+    ...isolated(),
+    PACK_INSTALLS_ALONE_INSTALL_TIMEOUT_MS: String(PACK_LIMIT_MS),
+    ...extraEnv,
+    PATH: `${extraPath}${bun}:${process.env.PATH ?? ""}`,
+  };
   return new Promise((resolve) => {
     execFile(process.execPath, [SCRIPT], { cwd: dir, env }, (error, stdout, stderr) => {
       resolve({ code: error ? Number(error.code ?? 1) : 0, stdout, stderr });
@@ -160,7 +170,7 @@ test("a package whose files carry everything it names installs alone, and each e
   assert.doesNotMatch(result.stderr, /zz-serve ran/, "a bin is never run");
   assert.match(
     result.stdout,
-    /^zz-fixture-1\.0\.0\.tgz \(\d+ files\) installs on its own; every file package\.json's main, types, exports and bin name is in it; loaded '@zz\/fixture' \(import\), '@zz\/fixture\/extra' \(import\), '@zz\/fixture\/package\.json' \(import json\), '@zz\/fixture\/legacy' \(require\), '@zz\/fixture\/dual' \(import\), '@zz\/fixture\/dual' \(require\); bun targets present, not loaded \(bun isn't on PATH\): '@zz\/fixture'; bins start with '#!': zz-serve, zz-shell; ES module bins' static imports load: zz-serve; bins whose '#!' line names no node, not loaded: zz-shell; export patterns matched, not loaded: \.\/parts\/\*\.\n$/m,
+    /^zz-fixture-1\.0\.0\.tgz \(\d+ files\) installs on its own; every file package\.json's main, types, exports and bin name is in it; loaded '@zz\/fixture' \(import\), '@zz\/fixture\/extra' \(import\), '@zz\/fixture\/package\.json' \(import json\), '@zz\/fixture\/legacy' \(require\), '@zz\/fixture\/dual' \(import\), '@zz\/fixture\/dual' \(require\); bun targets present, not loaded \(bun doesn't run here: bun --version exited 127\): '@zz\/fixture'; bins start with '#!': zz-serve, zz-shell; ES module bins' static imports load: zz-serve; bins whose '#!' line names no node, not loaded: zz-shell; export patterns matched, not loaded: \.\/parts\/\*\.\n$/m,
   );
 });
 
@@ -382,36 +392,74 @@ test("a package imported only through another dependency's copy, or a dependency
   assert.equal(ownPeer.code, 0, ownPeer.stderr);
 });
 
-test("a load that outlives its limit fails at the limit even when it handles SIGTERM, and each limit must be a positive whole number", async () => {
-  // It ignores SIGTERM and would end on its own only after a minute, so a
-  // check that only asked it to stop would take that minute.
-  const hang = "process.on('SIGTERM', () => {});\nsetTimeout(() => process.exit(0), 60_000);\nawait new Promise(() => {});\n";
-  const limit = { PACK_INSTALLS_ALONE_LOAD_TIMEOUT_MS: "2000" };
+test("a load, a CommonJS bin's parse or the bun probe that outlives its limit fails at the limit even when it handles SIGTERM, and each limit must be a positive whole number", async () => {
+  // Each hang ignores SIGTERM and would end on its own only after a minute,
+  // so a check that only asked it to stop would take that minute. It notes
+  // once its handler is in: one the limit ended before then would have ended
+  // at SIGTERM too, so each case asserts the note, under a limit that leaves
+  // a hang room to start on a loaded host.
+  const notes = mkdtempSync(join(tmpdir(), "pack-installs-alone-ready-"));
+  made.push(notes);
+  const ready = (name: string) => join(notes, name);
+  const hang = (name: string) =>
+    `import { writeFileSync } from "node:fs";\nprocess.on('SIGTERM', () => {});\nwriteFileSync(${JSON.stringify(ready(name))}, "");\nsetTimeout(() => process.exit(0), 60_000);\nawait new Promise(() => {});\n`;
+  const limit = { PACK_INSTALLS_ALONE_LOAD_TIMEOUT_MS: "5000" };
   let start = Date.now();
-  const root = await check(fixture({ files: ["dist"], main: "./dist/index.js" }, { "dist/index.js": hang }), NO_BUN, "", limit);
+  const root = await check(fixture({ files: ["dist"], main: "./dist/index.js" }, { "dist/index.js": hang("root") }), NO_BUN, "", limit);
   assert.ok(Date.now() - start < 40_000, `took ${Date.now() - start} ms`);
   assert.equal(root.code, 1);
-  assert.match(root.stderr, /pack-installs-alone: loading '@zz\/fixture': it didn't finish within 2 s\.\n$/);
+  assert.match(root.stderr, /pack-installs-alone: loading '@zz\/fixture': it didn't finish within 5 s\.\n$/);
+  assert.ok(existsSync(ready("root")), "the load was ignoring SIGTERM when the limit came");
   start = Date.now();
   const bin = await check(
-    fixture({ files: ["dist"], bin: "./dist/serve.js" }, { "dist/serve.js": "#!/usr/bin/env node\nimport './hang.js';\n", "dist/hang.js": hang }),
+    fixture({ files: ["dist"], bin: "./dist/serve.js" }, { "dist/serve.js": "#!/usr/bin/env node\nimport './hang.js';\n", "dist/hang.js": hang("bin") }),
     NO_BUN,
     "",
     limit,
   );
   assert.ok(Date.now() - start < 40_000, `took ${Date.now() - start} ms`);
   assert.equal(bin.code, 1);
-  assert.match(bin.stderr, /pack-installs-alone: loading bin 'fixture' \(\.\/dist\/serve\.js\) in zz-fixture-1\.0\.0\.tgz didn't finish within 2 s\.\n$/);
+  assert.match(bin.stderr, /pack-installs-alone: loading bin 'fixture' \(\.\/dist\/serve\.js\) in zz-fixture-1\.0\.0\.tgz didn't finish within 5 s\.\n$/);
+  assert.ok(existsSync(ready("bin")), "the bin's load was ignoring SIGTERM when the limit came");
   start = Date.now();
   const underBun = await check(
-    fixture({ files: ["dist", "src"], exports: { ".": { bun: "./src/index.js", import: "./dist/index.js" } } }, { ...ENTRY, "src/index.js": hang }),
+    fixture({ files: ["dist", "src"], exports: { ".": { bun: "./src/index.js", import: "./dist/index.js" } } }, { ...ENTRY, "src/index.js": hang("bun") }),
     BUN_BY_NODE,
     "",
     limit,
   );
   assert.ok(Date.now() - start < 40_000, `took ${Date.now() - start} ms`);
   assert.equal(underBun.code, 1);
-  assert.match(underBun.stderr, /pack-installs-alone: loading '@zz\/fixture' under bun: it didn't finish within 2 s\.\n$/);
+  assert.match(underBun.stderr, /pack-installs-alone: loading '@zz\/fixture' under bun: it didn't finish within 5 s\.\n$/);
+  assert.ok(existsSync(ready("bun")), "the load under bun was ignoring SIGTERM when the limit came");
+  // A CommonJS bin is only parsed, so the hang is a preload, in --check alone.
+  const holdsCheck = join(notes, "holds-check.cjs");
+  writeFileSync(
+    holdsCheck,
+    `if (process.execArgv.includes("--check")) {\n  process.on("SIGTERM", () => {});\n  require("node:fs").writeFileSync(${JSON.stringify(ready("check"))}, "");\n  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 60_000);\n}\n`,
+  );
+  start = Date.now();
+  const parse = await check(
+    fixture({ files: ["dist"], bin: "./dist/serve.cjs" }, { "dist/serve.cjs": "#!/usr/bin/env node\nmodule.exports = 1;\n" }),
+    NO_BUN,
+    "",
+    { ...limit, NODE_OPTIONS: `--require ${JSON.stringify(holdsCheck)}` },
+  );
+  assert.ok(Date.now() - start < 40_000, `took ${Date.now() - start} ms`);
+  assert.equal(parse.code, 1);
+  assert.match(parse.stderr, /pack-installs-alone: checking bin 'fixture' \(\.\/dist\/serve\.cjs\) in zz-fixture-1\.0\.0\.tgz didn't finish within 5 s\.\n$/);
+  assert.ok(existsSync(ready("check")), "the bin's --check was ignoring SIGTERM when the limit came");
+  // `bun --version` is how the script asks whether bun is there, so this bun hangs there.
+  const hangingBun = shim(
+    "bun",
+    `#!/usr/bin/env node\nprocess.on("SIGTERM", () => {});\nrequire("node:fs").writeFileSync(${JSON.stringify(ready("bun-version"))}, "");\nsetTimeout(() => {}, 60_000);\n`,
+  );
+  start = Date.now();
+  const probe = await check(fixture({ files: ["dist"], main: "./dist/index.js" }, ENTRY), hangingBun, "", limit);
+  assert.ok(Date.now() - start < 40_000, `took ${Date.now() - start} ms`);
+  assert.equal(probe.code, 1);
+  assert.match(probe.stderr, /pack-installs-alone: bun --version didn't finish within 5 s\.\n$/);
+  assert.ok(existsSync(ready("bun-version")), "bun --version was ignoring SIGTERM when the limit came");
   for (const name of ["PACK_INSTALLS_ALONE_INSTALL_TIMEOUT_MS", "PACK_INSTALLS_ALONE_LOAD_TIMEOUT_MS"]) {
     for (const value of ["soon", "0"]) {
       const bad = await check(fixture({ files: ["dist"], main: "./dist/index.js" }, ENTRY), NO_BUN, "", { [name]: value });
@@ -422,10 +470,17 @@ test("a load that outlives its limit fails at the limit even when it handles SIG
 });
 
 test("npm pack or npm install that outlives its limit fails at the limit even when it handles SIGTERM", async () => {
-  // npm pack runs under the install's limit too, so the install's case
-  // leaves the real npm pack room on a loaded runner.
+  // Each hanging npm notes once its SIGTERM handler is in: one the limit
+  // ended before then would have ended at SIGTERM too, so each case asserts
+  // the note, under a limit that leaves the npm room to start on a loaded
+  // host. npm pack runs under the install's limit too, so the install's case
+  // leaves the real npm pack room as well.
+  const notes = mkdtempSync(join(tmpdir(), "pack-installs-alone-ready-"));
+  made.push(notes);
   const hangOn = (command: string) =>
-    npmShim(`if (args[0] === ${JSON.stringify(command)}) { process.on("SIGTERM", () => {}); setTimeout(() => {}, 60_000); }\nelse pass();`);
+    npmShim(
+      `if (args[0] === ${JSON.stringify(command)}) { process.on("SIGTERM", () => {}); require("node:fs").writeFileSync(${JSON.stringify(join(notes, command))}, ""); setTimeout(() => {}, 60_000); }\nelse pass();`,
+    );
   let start = Date.now();
   const install = await check(fixture({ files: ["dist"], main: "./dist/index.js" }, ENTRY), NO_BUN, `${hangOn("install")}:`, {
     PACK_INSTALLS_ALONE_INSTALL_TIMEOUT_MS: "10000",
@@ -433,13 +488,31 @@ test("npm pack or npm install that outlives its limit fails at the limit even wh
   assert.ok(Date.now() - start < 40_000, `took ${Date.now() - start} ms`);
   assert.equal(install.code, 1);
   assert.match(install.stderr, /pack-installs-alone: zz-fixture-1\.0\.0\.tgz didn't install on its own into an empty directory: it didn't finish within 10 s\.\n$/);
+  assert.ok(existsSync(join(notes, "install")), "npm install was ignoring SIGTERM when the limit came");
   start = Date.now();
   const pack = await check(fixture({ files: ["dist"], main: "./dist/index.js" }, ENTRY), NO_BUN, `${hangOn("pack")}:`, {
-    PACK_INSTALLS_ALONE_INSTALL_TIMEOUT_MS: "2000",
+    PACK_INSTALLS_ALONE_INSTALL_TIMEOUT_MS: "5000",
   });
   assert.ok(Date.now() - start < 40_000, `took ${Date.now() - start} ms`);
   assert.equal(pack.code, 1);
-  assert.match(pack.stderr, /pack-installs-alone: npm pack didn't finish within 2 s\.\n$/);
+  assert.match(pack.stderr, /pack-installs-alone: npm pack didn't finish within 5 s\.\n$/);
+  assert.ok(existsSync(join(notes, "pack")), "npm pack was ignoring SIGTERM when the limit came");
+});
+
+test("check() runs the script's npm under the tests' npm limit, short of the runner's own timeout", async () => {
+  // The npm notes the limit it was started under, then fails, so nothing is packed.
+  const notes = mkdtempSync(join(tmpdir(), "pack-installs-alone-limit-"));
+  made.push(notes);
+  const noted = join(notes, "limit");
+  const npm = shim("npm", `#!/usr/bin/env node\nrequire("node:fs").writeFileSync(${JSON.stringify(noted)}, String(process.env.PACK_INSTALLS_ALONE_INSTALL_TIMEOUT_MS));\nprocess.exit(3);\n`);
+  const result = await check(fixture({ files: ["dist"], main: "./dist/index.js" }, ENTRY), NO_BUN, `${npm}:`);
+  assert.equal(result.code, 1);
+  assert.match(result.stderr, /pack-installs-alone: npm pack failed \(its output is above\)\.\n$/);
+  assert.equal(readFileSync(noted, "utf8"), String(PACK_LIMIT_MS));
+  // npm test's own timeout, from the test script in package.json.
+  const { scripts } = JSON.parse(readFileSync(fileURLToPath(new URL("../../package.json", import.meta.url)), "utf8")) as { scripts: { test: string } };
+  const runner = Number(/--test-timeout=(\d+)/.exec(scripts.test)?.[1]);
+  assert.ok(PACK_LIMIT_MS < runner, `the tests' npm limit, ${PACK_LIMIT_MS} ms, is short of npm test's ${runner} ms`);
 });
 
 /** A file each Node that loads `noteFlags` adds the flags it started with to,
@@ -686,11 +759,15 @@ test("an import that a null, an array of nulls or an empty array blocks isn't at
   }
 });
 
-test("with bun on PATH, a bun target is loaded under bun, and one that doesn't load fails, naming it", async () => {
+test("with bun on PATH, a bun target is loaded under bun, one that doesn't load fails, naming it, and a bun that doesn't run leaves it unloaded, saying how", async () => {
   const pkg = { files: ["dist", "src"], exports: { ".": { bun: "./src/index.js", import: "./dist/index.js" } } };
   const loads = await check(fixture(pkg, { ...ENTRY, "src/index.js": "export const ok = 'bun';\n" }), BUN_BY_NODE);
   assert.equal(loads.code, 0, loads.stderr);
   assert.match(loads.stdout, /; loaded '@zz\/fixture' \(import\); loaded under bun: '@zz\/fixture'\.\n$/m);
+  // A bun that crashes when asked --version doesn't run here; a bun that exits is NO_BUN's case.
+  const crashed = await check(fixture(pkg, { ...ENTRY, "src/index.js": "export const ok = 'bun';\n" }), shim("bun", "#!/bin/sh\nkill -ILL $$\n"));
+  assert.equal(crashed.code, 0, crashed.stderr);
+  assert.match(crashed.stdout, /; bun targets present, not loaded \(bun doesn't run here: bun --version was killed by SIGILL\): '@zz\/fixture'\.\n$/m);
   const broken = await check(fixture(pkg, { ...ENTRY, "src/index.js": "import './left-out.js';\n" }), BUN_BY_NODE);
   assert.equal(broken.code, 1);
   assert.match(broken.stderr, /pack-installs-alone: loading '@zz\/fixture' under bun \(from the installed zz-fixture-1\.0\.0\.tgz\) failed, as its output above shows\. A file it imports that the package leaves out does that, a dependency only devDependencies supplied, or a dependency's new release \(rerun this on main to tell\)\.\n$/);

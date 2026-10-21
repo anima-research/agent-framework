@@ -1025,16 +1025,27 @@ test("an abandon stops the agent's running code_execution script with the turn",
     framework.start();
     framework.nudgeAgent('agent', 'operator');
     await waitFor('turn to start', () => membrane.calls.length === 1);
-    const scriptAborts: string[] = [];
-    (framework as unknown as { codeExecutionRunners: Map<string, unknown> }).codeExecutionRunners.set('agent', {
-      busy: true,
-      abort: (reason: string) => { scriptAborts.push(reason); },
-      dispose: () => {},
-    });
+    const ended: Array<[string, unknown, boolean, string | undefined]> = [];
+    (framework as unknown as { codeExecution: unknown }).codeExecution = {
+      scripts: {
+        turnEnded: (agent: string, turn: unknown, abandoned: boolean, reason?: string) => { ended.push([agent, turn, abandoned, reason]); },
+        dispose: async () => {},
+        leftRunning: () => 0,
+      },
+    };
     const status = await framework.quiesce({ timeoutMs: 1_000, abandon: true });
     assert.equal(status.drained, true);
     await waitFor('agent back to idle', () => framework.getAgent('agent')!.state.status === 'idle');
-    assert.deepEqual(scriptAborts, ['turn abandoned by quiesce']);
+    // The agent's scripts take it as an abandoned turn's end (AgentScripts.turnEnded):
+    // from the abandon, the quiesced stream's own turn, and again as that turn
+    // settles, which changes nothing more, naming no turn still live.
+    assert.equal(ended.length, 2);
+    const [first, second] = ended as Array<[string, { id: number; live: number[] }, boolean, string]>;
+    assert.deepEqual([first![0], first![2], first![3]], ['agent', true, 'turn abandoned by quiesce']);
+    assert.deepEqual([second![0], second![2], second![3]], ['agent', true, 'Turn abandoned by operator quiesce']);
+    assert.equal(typeof first![1].id, 'number');
+    assert.equal(second![1].id, first![1].id, 'the same turn, the stream\'s own');
+    assert.deepEqual(second![1].live, []);
   });
 });
 

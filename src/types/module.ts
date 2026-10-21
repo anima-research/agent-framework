@@ -602,8 +602,9 @@ export interface SpeechContext {
 
   /**
    * The turn this speech ends: the same id as `ToolCall.callerTurnId` on the
-   * calls made in it (its model's calls and its foreground scripts' inner
-   * calls), kept across the turn's streams (a context-budget restart or a
+   * calls made in it (its model's calls, and a script's calls that reach the
+   * host while a code_execution call of the turn watches the script), kept across the
+   * turn's streams (a context-budget restart or a
    * retry), and larger for the agent's next turn. Unique only within one run
    * of the process.
    */

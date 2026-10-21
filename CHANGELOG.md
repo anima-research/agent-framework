@@ -12,6 +12,15 @@ Releases up to and including 0.7.3 predate this file; for their contents see
 
 ## Unreleased
 
+## 0.23.2 — 2026-10-20
+
+### Fixed
+
+- A channel server can no longer set the metadata keys that only the host writes on a stored message. A `channels/incoming` message's `metadata` and a push event's `origin` are now stored without `system`, `kind`, `draftOwner`, `draftIds`, `tuneOut`, `coalescingSubject`, `deferredWriteId`, `external` and `openaiResponsesItems`, and the host writes its own after them, as it already did for the inbound source envelope. A key is in that set when only the host writes it and some reader takes it on its own as what the message is. Until now a server's copy of one was stored wherever the host wrote none, so a server's message could pass for one the host wrote: with `kind: "discord-send-failed"`, a message left unread in a conversation fork's window made the host tell the primary, when the fork was released, that the fork's reply had failed (#611).
+
+  The first time a server sends one of these keys, the host logs the server and the key, without the value, once for each server and key until it restarts. Every other key a server sends, such as `tags` or `mentioned`, is stored as before, beside the fields the host writes itself. Messages stored or queued before this change keep what they were stored or queued with.
+- A message that arrives while an agent's tools run now reaches membrane, at the tool boundary, as its participant and content alone. Its stored metadata stays the host's record, whoever wrote it.
+
 ## 0.23.1 — 2026-10-19
 
 ### Fixed

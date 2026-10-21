@@ -2,12 +2,16 @@
  * ToolCall.resultMaxChars: how long a call's result may be and still reach its
  * caller whole. A model's call gets the agent's inline cap as the store applies
  * it, so a result that long is stored whole and one a character longer isn't.
- * A call from a running script gets the script's limit, and a call for an agent
- * the framework doesn't hold gets the house default. A call made in process
- * carries what its caller put on it, and a utility run through `utils` carries
- * what its `utils` call did.
+ * A call from a running script gets the longest result that reaches the
+ * script whole whatever its characters, from the script's memory (a
+ * structured value, a deep nesting or a parse past the memory left can
+ * still not reach it), and a call for an agent the framework
+ * doesn't hold gets the house default. A call made in process carries what its
+ * caller put on it, and a utility run through `utils` carries what its `utils`
+ * call did.
  */
 
+import { constants as bufferConstants } from 'node:buffer';
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtempSync, rmSync } from 'node:fs';
@@ -17,7 +21,6 @@ import type {
   EventResponse,
   Module,
   ProcessEvent,
-  ScriptToolResult,
   ToolCall,
   ToolDefinition,
   ToolResult,
@@ -29,8 +32,6 @@ import { createMockResponse, MockMembrane } from './helpers/mock-membrane.js';
 /** The residence's cap, and the strategy's bound beneath it (1000 tokens, 4 characters each). */
 const CONFIGURED = 5000;
 const BOUNDED = 4000;
-/** handleScriptToolCall's bound on what a running script receives. */
-const SCRIPT_LIMIT = 5_000_000;
 
 class BoundedStrategy extends PassthroughStrategy {
   readonly maxMessageTokens = 1000;
@@ -38,7 +39,9 @@ class BoundedStrategy extends PassthroughStrategy {
 
 /**
  * Records each call. `look` with `over` answers a text `over` characters past
- * the call's resultMaxChars; without it, a short text. `peek` is a utility.
+ * the call's resultMaxChars, and with `fill` a text of exactly that many NUL
+ * characters (`over` more with it), each six bytes once escaped in JSON;
+ * without either, a short text. `peek` is a utility.
  */
 class ProbeModule implements Module {
   readonly name = 'probe';
@@ -57,8 +60,9 @@ class ProbeModule implements Module {
   }
   async handleToolCall(call: ToolCall): Promise<ToolResult> {
     this.calls.push(call);
-    const over = (call.input as { over?: number } | undefined)?.over;
-    const text = over === undefined ? 'ok' : 'x'.repeat((call.resultMaxChars ?? 0) + over);
+    const { over, fill } = (call.input ?? {}) as { over?: number; fill?: boolean };
+    const text = fill ? '\u0000'.repeat((call.resultMaxChars ?? 0) + (over ?? 0))
+      : over === undefined ? 'ok' : 'x'.repeat((call.resultMaxChars ?? 0) + over);
     return { success: true, data: [{ type: 'text', text }] };
   }
   async onProcess(event: ProcessEvent): Promise<EventResponse> {
@@ -72,7 +76,7 @@ class ProbeModule implements Module {
   }
 }
 
-async function makeFramework(membrane: MockMembrane = new MockMembrane()): Promise<{
+async function makeFramework(membrane: MockMembrane = new MockMembrane(), codeExecution?: { enabled: true; memoryMaxBytes: number }): Promise<{
   framework: AgentFramework;
   probe: ProbeModule;
   done: () => Promise<void>;
@@ -92,6 +96,7 @@ async function makeFramework(membrane: MockMembrane = new MockMembrane()): Promi
     modules: [probe],
     syncIntervalMs: 0,
     toolResultInlineMaxChars: CONFIGURED,
+    ...(codeExecution ? { codeExecution } : {}),
   });
   framework.start();
   return {
@@ -183,20 +188,141 @@ describe('ToolCall.resultMaxChars', () => {
     }
   });
 
-  it("a call from a running script carries the script's limit, under which the script gets its result whole", async () => {
-    const { framework, probe, done } = await makeFramework();
+  it("a call from a running script carries the longest result that reaches the script whole whatever its characters, from its memory, and a utility it runs carries the same", async () => {
+    // The script's answer, a text's JSON in an envelope of 80 bytes, may take
+    // a third of its memory, and a character of the text at most six bytes there.
+    const memoryMaxBytes = 8 * 1024 * 1024;
+    const limit = Math.floor((Math.floor(memoryMaxBytes / 3) - 80) / 6);
+    const { framework, probe, done } = await makeFramework(new MockMembrane(), { enabled: true, memoryMaxBytes });
     try {
-      const script = framework as unknown as {
-        handleScriptToolCall(agentName: string, toolName: string, args: Record<string, unknown>): Promise<ScriptToolResult>;
+      const result = await framework.executeToolCall({
+        id: 'script', name: 'code_execution', callerAgentName: 'prime', input: { code: [
+          'const r = await tools["probe--look"]({ fill: true });',
+          'await tools.utils({ action: "run", name: "probe--peek", args: {} });',
+          'const t = r.content[0].text;',
+          'let nul = true;',
+          'for (let i = 0; i < t.length; i++) if (t.charCodeAt(i) !== 0) { nul = false; break; }',
+          'return [t.length, nul, r.isError];',
+        ].join('\n') },
+      });
+      const text = result.isError ? result.error ?? '' : (result.data as Array<{ text?: string }>)[0]?.text ?? '';
+      assert.deepEqual(probe.calls.map((call) => [call.name, call.resultMaxChars]), [['look', limit], ['peek', limit]],
+        'a utility the script runs carries the same figure');
+      assert.match(text, new RegExp(`It returned: \\[${limit}, ?true, ?false\\]`),
+        'a result of exactly that many NUL characters, the most bytes a character can take, reaches the script whole');
+    } finally {
+      await done();
+    }
+  });
+
+  it('a result one character past the figure reaches the script as ResultTooLarge, the call having taken effect', async () => {
+    const memoryMaxBytes = 8 * 1024 * 1024;
+    const { framework, probe, done } = await makeFramework(new MockMembrane(), { enabled: true, memoryMaxBytes });
+    try {
+      const result = await framework.executeToolCall({
+        id: 'script', name: 'code_execution', callerAgentName: 'prime', input: { code: [
+          'try { await tools["probe--look"]({ fill: true, over: 1 }); return "reached"; }',
+          'catch (e) { return [e.name, /the call took effect/.test(e.message)]; }',
+        ].join('\n') },
+      });
+      const text = result.isError ? result.error ?? '' : (result.data as Array<{ text?: string }>)[0]?.text ?? '';
+      assert.equal(probe.calls.length, 1, 'the tool ran');
+      assert.match(text, /It returned: \["ResultTooLarge", ?true\]/);
+    } finally {
+      await done();
+    }
+  });
+
+  it("past about 1.5 GiB of a script's memory, on Node, the host's longest string bounds the figure", async () => {
+    const memoryMaxBytes = 2 * 1024 * 1024 * 1024;
+    const { framework, probe, done } = await makeFramework(new MockMembrane(), { enabled: true, memoryMaxBytes });
+    try {
+      await framework.executeToolCall({ id: 'script', name: 'code_execution', callerAgentName: 'prime', input: { code: 'await tools["probe--look"]({});' } });
+      // The answer is a string before it's bytes: six units a character at most, past the envelope.
+      const expected = Math.floor((Math.min(Math.floor(memoryMaxBytes / 3), bufferConstants.MAX_STRING_LENGTH) - 80) / 6);
+      assert.deepEqual(probe.calls.map((call) => call.resultMaxChars), [expected]);
+    } finally {
+      await done();
+    }
+  });
+
+  it("a code_execution return is held to its agent's inline cap, its output's first and last parts kept", async () => {
+    const { framework, done } = await makeFramework(new MockMembrane(), { enabled: true, memoryMaxBytes: 64 * 1024 * 1024 });
+    try {
+      const result = await framework.executeToolCall({
+        id: 'script', name: 'code_execution', callerAgentName: 'prime', input: { code: [
+          'text("FIRST" + "a".repeat(20000));',
+          'text("b".repeat(20000) + "LAST");',
+          'return "x".repeat(3000);',
+        ].join('\n') },
+      });
+      const text = result.isError ? result.error ?? '' : (result.data as Array<{ text?: string }>)[0]?.text ?? '';
+      // The strategy's bound beneath the residence's cap is the agent's cap.
+      assert.ok(text.length <= BOUNDED, `${text.length} characters, against the agent's cap of ${BOUNDED}`);
+      assert.ok(text.includes(`It returned: "${'x'.repeat(3000)}"`), 'the value whole');
+      assert.match(text, /Its output:\nFIRST/);
+      assert.match(text, /characters of output dropped here/);
+      assert.match(text, /LAST\n?$/, "the output's tail ends the return");
+    } finally {
+      await done();
+    }
+  });
+
+  it("a model's code_execution return is stored whole under its agent's cap, its output's last characters ending it", async () => {
+    const membrane = new MockMembrane();
+    membrane.pushResponse(createMockResponse([
+      { type: 'tool_use', id: 'call_script', name: 'code_execution', input: { code: 'text("FIRST" + "a".repeat(20000)); text("b".repeat(20000) + "LAST"); return 1;' } },
+    ], 'tool_use'));
+    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Done.' }]));
+    const { framework, done } = await makeFramework(membrane, { enabled: true, memoryMaxBytes: 64 * 1024 * 1024 });
+    try {
+      framework.pushEvent({
+        type: 'external-message', source: 'test', content: [{ type: 'text', text: 'run it' }], metadata: {}, triggerInference: true,
+      } as unknown as ProcessEvent);
+      const stored = await until('the stored return', () => storedResults(framework).get('call_script'));
+      assert.ok(stored.length <= BOUNDED, `${stored.length} characters stored, against the agent's cap of ${BOUNDED}`);
+      assert.doesNotMatch(stored, /\[truncated/, 'the store had nothing to cut');
+      assert.match(stored, /Its output:\nFIRST/);
+      assert.match(stored, /LAST\n?$/);
+    } finally {
+      await done();
+    }
+  });
+
+  it("the puppet stores a code_execution return under the cap its call carried, though the script lowers the agent's cap", async () => {
+    const { framework, probe, done } = await makeFramework(new MockMembrane(), { enabled: true, memoryMaxBytes: 64 * 1024 * 1024 });
+    try {
+      // The script's own call lowers its agent's cap while the puppeted call runs.
+      const overrides = (framework as unknown as { toolResultInlineMaxCharsOverride: Map<string, number> }).toolResultInlineMaxCharsOverride;
+      const handle = probe.handleToolCall.bind(probe);
+      probe.handleToolCall = async (call) => {
+        if (call.name === 'look') overrides.set('prime', 1_000);
+        return handle(call);
       };
-      const at = await script.handleScriptToolCall('prime', 'probe--look', { over: 0 });
-      const past = await script.handleScriptToolCall('prime', 'probe--look', { over: 1 });
-      await script.handleScriptToolCall('prime', 'utils', { action: 'run', name: 'probe--peek', args: {} });
-      assert.deepEqual(probe.calls.map((call) => [call.name, call.resultMaxChars]),
-        [['look', SCRIPT_LIMIT], ['look', SCRIPT_LIMIT], ['peek', SCRIPT_LIMIT]], 'a utility the script runs carries its limit too');
-      // The text a script's await returns (#538 gives it with isError beside it).
-      assert.deepEqual([at.text, at.isError], ['x'.repeat(SCRIPT_LIMIT), false], 'a result of resultMaxChars reaches the script whole');
-      assert.equal(past.text, `${'x'.repeat(SCRIPT_LIMIT)}\n\n[truncated — original was ${SCRIPT_LIMIT + 1} chars]`, 'one character more is cut at the limit');
+      const { toolUseId } = await framework.puppetToolCall('prime', 'code_execution', {
+        code: 'await tools["probe--look"]({}); text("FIRST" + "a".repeat(20000)); text("b".repeat(20000) + "LAST"); return 1;',
+      });
+      const stored = storedResults(framework).get(toolUseId);
+      assert.ok(stored, 'the pair was stored');
+      assert.ok(probe.calls.some((call) => call.name === 'look'), "the script's call ran");
+      assert.ok(stored.length > 1_000, `${stored.length} characters: the return was cut under the cap its call carried, not the lowered 1,000`);
+      assert.doesNotMatch(stored, /\[truncated/, 'the store had nothing to cut');
+      assert.match(stored, /LAST\n?$/);
+    } finally {
+      await done();
+    }
+  });
+
+  it("an in-process call's own resultMaxChars holds its code_execution return", async () => {
+    const { framework, done } = await makeFramework(new MockMembrane(), { enabled: true, memoryMaxBytes: 64 * 1024 * 1024 });
+    try {
+      const result = await framework.executeToolCall({
+        id: 'script', name: 'code_execution', callerAgentName: 'prime', resultMaxChars: 1_500,
+        input: { code: 'text("FIRST" + "a".repeat(20000)); text("b".repeat(20000) + "LAST"); return 1;' },
+      });
+      const text = result.isError ? result.error ?? '' : (result.data as Array<{ text?: string }>)[0]?.text ?? '';
+      assert.ok(text.length <= 1_500, `${text.length} characters, against the caller's 1,500`);
+      assert.match(text, /LAST\n?$/);
     } finally {
       await done();
     }

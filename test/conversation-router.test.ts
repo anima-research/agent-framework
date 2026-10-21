@@ -125,7 +125,7 @@ test('rebind after expiry gets a fresh generation and agent name', () => {
   if (d1.kind !== 'spawn') assert.fail('expected spawn');
   router.bind('slack:C1', d1.agentName, d1.generation, T0);
 
-  router.unbind('slack:C1'); // framework does this after the closure turn
+  router.unbind('slack:C1'); // the framework does this as the closure turn begins
 
   const d2 = router.route({ channelId: 'slack:C1', mentioned: true, kind: 'channel' });
   assert.equal(d2.kind, 'spawn');

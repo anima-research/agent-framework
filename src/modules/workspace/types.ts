@@ -240,10 +240,10 @@ export interface MountConfig {
    * anything else checks the path, so every spelling that resolves to its
    * registered path reads it, and none writes it. On a disk that folds names,
    * a spelling in another case isn't its path, and reaches whatever file disk
-   * has there. The framework keeps its own files (`tool-results/`, `refs/`,
-   * `background-scripts/`) only in a writable mount without an include, and
-   * what it kept in a mount before the mount had one is outside the mount
-   * once it has one, unless the include covers it.
+   * has there. The framework keeps its own files (`tool-results/`, `refs/`)
+   * only in a writable mount without an include, and what it kept in a mount
+   * before the mount had one is outside the mount once it has one, unless the
+   * include covers it.
    *
    * Left out, the mount holds everything under its path. Given, it's a list
    * of at least one string, each a name, an `*.ext` glob or a `dir/**` glob,

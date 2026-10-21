@@ -16,6 +16,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 import { AgentFramework } from '../src/index.js';
+import type { PublishRefusalReason } from '../src/index.js';
 import { ChannelRegistry } from '../src/mcpl/channel-registry.js';
 import { CapabilityGrant, ALL_CAPABILITY_PATHS } from '../src/mcpl/capability-grant.js';
 import { McplRequestError } from '../src/mcpl/server-connection.js';
@@ -399,31 +400,60 @@ test('channel_publish and speak_in_channel say what they need, and where to find
     'Nothing was posted: channelId is empty. channel_list shows the channel ids.');
   assert.equal((await f.call('channel_publish', { channelId: 'nope', content: 'hi' })).error,
     'No channel has the id "nope", so nothing was posted. channel_list shows the channel ids.');
-  // The subconscious isn't offered channel_list.
-  assert.equal((await f.registry.publishForAgent('', 'hi', 'subconscious')).error,
+  // The subconscious isn't offered channel_list. A refusal of the caller's
+  // own input carries no reason; one of the destination does.
+  const noId = await f.registry.publishForAgent('', 'hi', 'subconscious');
+  assert.equal(noId.error,
     'Nothing was posted: speak_in_channel needs a `channelId`. Use the id of a tuned-out channel whose messages you are reading.');
-  assert.equal((await f.registry.publishForAgent('nope', 'hi', 'subconscious')).error,
+  assert.equal('reason' in noId, false, 'no reason for the caller\'s own input');
+  const noText = await f.registry.publishForAgent('nope', '', 'subconscious');
+  // The no-text refusal, which speak_in_channel's own caller words first.
+  assert.match(String(noText.error), /^Nothing was posted: .* needs the message/);
+  assert.equal('reason' in noText, false, 'no reason for the caller\'s own input, checked before the destination');
+  const unknown = await f.registry.publishForAgent('nope', 'hi', 'subconscious');
+  assert.equal(unknown.error,
     'No channel has the id "nope", so nothing was posted. Use the id of a tuned-out channel whose messages you are reading.');
+  const refusal: PublishRefusalReason | undefined = unknown.reason;
+  assert.equal(refusal, 'channel-not-registered');
 });
 
 test('a send to a server that isn\'t up, or isn\'t permitted, says why in the same words on every send path', async () => {
   const f = await fixture({ a: ['x'] });
-  const cases: Array<[Server | undefined, boolean, string]> = [
-    [down(true), false, 'the "a" server isn\'t connected, and this host is reconnecting to it, so try again later'],
-    [undefined, true, 'this host is connecting to the "a" server, so try again in a moment'],
-    [undefined, false, 'the "a" server isn\'t connected, and this host won\'t reconnect to it on its own; if you need it, ask whoever runs this host'],
+  // publishForAgent's reason names the state its words come from.
+  const gone = 'the "a" server isn\'t connected, and this host won\'t reconnect to it on its own; if you need it, ask whoever runs this host';
+  const cases: Array<[Server | undefined, boolean, string, string]> = [
+    [down(true), false, 'the "a" server isn\'t connected, and this host is reconnecting to it, so try again later', 'server-down'],
+    [undefined, true, 'this host is connecting to the "a" server, so try again in a moment', 'server-connecting'],
+    [undefined, false, gone, 'server-gone'],
+    [down(false), false, gone, 'server-gone'],
     [up(['channels.publish']), false,
-      'this host isn\'t permitted to post to the "a" server\'s channels, and trying again won\'t change that; if you need it, ask whoever runs this host'],
+      'this host isn\'t permitted to post to the "a" server\'s channels, and trying again won\'t change that; if you need it, ask whoever runs this host',
+      'not-permitted'],
   ];
-  for (const [server, connecting, reason] of cases) {
+  for (const [server, connecting, reason, refusal] of cases) {
     f.servers.set('a', server);
     if (connecting) f.connecting.add('a'); else f.connecting.delete('a');
-    assert.equal((await f.call('channel_publish', { channelId: 'x', content: 'hi' })).error, `Nothing was posted to channel "x": ${reason}.`);
-    assert.equal((await f.registry.publishForAgent('x', 'hi', 'subconscious')).error, `Nothing was posted to channel "x": ${reason}.`);
+    const published = await f.call('channel_publish', { channelId: 'x', content: 'hi' });
+    assert.equal(published.error, `Nothing was posted to channel "x": ${reason}.`);
+    assert.equal('reason' in published, false, 'channel_publish\'s answer to the agent carries no reason');
+    const forAgent = await f.registry.publishForAgent('x', 'hi', 'subconscious');
+    assert.equal(forAgent.error, `Nothing was posted to channel "x": ${reason}.`);
+    assert.equal(forAgent.reason, refusal, reason);
     f.failures.length = 0;
     assert.equal(await f.registry.routeSpeech('agent', 'hello', 'x'), null);
     assert.deepEqual(f.failures.map((failure) => failure.reason), [reason], 'speech gives the same reason');
   }
+});
+
+test("publishForAgent's reason for an inbound-only channel is inbound-only, whatever its server's state", async () => {
+  const f = await fixture({ a: ['x'] });
+  await f.registry.handleChanged('a', { added: [{ id: 'in', type: 'chat', label: 'in', direction: 'inbound' }] } as never);
+  // The channel takes no posts, which a reconnect won't change, so that's
+  // what a host is told rather than that the server is reconnecting.
+  f.servers.set('a', down(true));
+  const answer = await f.registry.publishForAgent('in', 'hi', 'subconscious');
+  assert.match(String(answer.error), /^Channel in is inbound-only: server "a" declared/);
+  assert.equal(answer.reason, 'inbound-only');
 });
 
 test('speech that has to open its channel says why the open didn\'t happen, and what helps where it was refused', async () => {
@@ -548,10 +578,11 @@ test('channel_decline says the decline is recorded, and what became of its ackno
   await f.registry.handleRegister('a', { channels: [descriptor('y')] });
   const declined = await f.call('channel_decline', { channelId: 'y', messageId: 'm2' });
   assert.equal(declined.success, true);
+  assert.equal(declined.data?.status, 'declined', 'it stands, though its transport may be open');
   assert.equal(declined.data?.closeError,
     'The decline is recorded, and this host closes the channel when the "a" server next registers this channel, if this ' +
     'host may open and close its channels then; closing it now didn\'t complete: The "a" server didn\'t answer within 30 ' +
-    'seconds, so whether the request took effect is unknown.');
+    'seconds, so whether the request took effect is unknown. If you need it closed now, call channel_close.');
 
   server.sendChannelsClose = async () => ({});
   await f.call('channel_open', { channelId: 'x' });
@@ -582,8 +613,10 @@ test('a decline whose close a later open overtook says that decision stands', as
   answers.shift()!();
   const declined = await declining;
   assert.equal(declined.success, true);
+  assert.equal(declined.data?.status, 'replaced');
   assert.equal(declined.data?.closeError,
-    'The decline is recorded, but a later decision to open the channel replaced it, and that decision stands.');
+    'The decline is recorded, but a later decision to open the channel replaced it, and that decision stands. If you still ' +
+    'want it closed, call channel_close.');
   assert.equal((await opening).success, true);
 });
 
@@ -604,10 +637,12 @@ test('a decline that a later decision replaced while its acknowledgment was out 
   ];
   const events: Array<[string, (f: Awaited<ReturnType<typeof fixture>>) => Promise<void>, string]> = [
     ['an open', async (f) => { assert.equal((await f.call('channel_open', { channelId: 'x' })).success, true); },
-      'The decline is recorded, but a later decision to open the channel replaced it, and that decision stands.'],
+      'The decline is recorded, but a later decision to open the channel replaced it, and that decision stands. If you ' +
+      'still want it closed, call channel_close.'],
     ['a tune-out', async (f) => {
       f.registry.enterTuneOut('a', 'x', { epochId: 'e1', cadenceSeconds: 60, backlogCap: 10, maxWakes: 3, startedAtSequence: 0 }, 'agent-tool');
-    }, 'The decline is recorded, but the channel was tuned out meanwhile, and that decision stands: its messages go to the subconscious.'],
+    }, 'The decline is recorded, but the channel was tuned out meanwhile, and that decision stands: its messages go to the ' +
+      'subconscious. If you still want it closed, call channel_close.'],
   ];
   const declineHeld = async () => {
     const f = await fixture({ a: ['x'] });
@@ -627,6 +662,7 @@ test('a decline that a later decision replaced while its acknowledgment was out 
       settle(ack);
       const declined = await declining;
       assert.equal(declined.success, true, `${outcome}, ${event}`);
+      assert.equal(declined.data?.status, 'replaced', `${outcome}, ${event}`);
       assert.equal(declined.data?.acknowledgmentError, ackText, `${outcome}, ${event}`);
       assert.equal(declined.data?.closeError, closeText, `${outcome}, ${event}`);
     }
@@ -637,17 +673,91 @@ test('a decline that a later decision replaced while its acknowledgment was out 
   await f.registry.handleChanged('a', { removed: ['x'] });
   ack.reject(new McplRequestError(notSent, 'not-sent'));
   const declined = await declining;
-  assert.equal(declined.data?.closeError, undefined);
+  assert.equal(declined.data?.status, 'declined', 'a channel not registered here is not closed for certain');
+  assert.equal(declined.data?.closeError,
+    'The decline is recorded, and this host closes the channel when the "a" server next registers this channel, if this ' +
+    'host may open and close its channels then; it isn\'t registered here any more.');
   assert.equal(declined.data?.acknowledgmentError, `The decline is recorded, but the acknowledgment wasn't posted: ${notSent}`);
+  // Where its server is gone, nothing registers it again unless whoever
+  // runs this host brings the server back.
+  const gone = await declineHeld();
+  gone.f.servers.set('a', undefined);
+  await gone.f.registry.handleChanged('a', { removed: ['x'] });
+  gone.ack.reject(new McplRequestError(notSent, 'not-sent'));
+  const goneDeclined = await gone.declining;
+  assert.equal(goneDeclined.data?.status, 'declined');
+  assert.equal(goneDeclined.data?.closeError,
+    'The decline is recorded, and this host closes the channel when the "a" server next registers this channel, if this ' +
+    'host may open and close its channels then; it isn\'t registered here any more: the "a" server isn\'t connected, and ' +
+    'this host won\'t reconnect to it on its own. If you need the server back, ask whoever runs this host.');
+  // Where it's reconnecting, its next registration comes on its own.
+  const down1 = await declineHeld();
+  down1.f.servers.set('a', down(true));
+  await down1.f.registry.handleChanged('a', { removed: ['x'] });
+  down1.ack.reject(new McplRequestError(notSent, 'not-sent'));
+  const downDeclined = await down1.declining;
+  assert.equal(downDeclined.data?.status, 'declined');
+  assert.equal(downDeclined.data?.closeError,
+    'The decline is recorded, and this host closes the channel when the "a" server next registers this channel, if this ' +
+    'host may open and close its channels then; it isn\'t registered here any more: the "a" server isn\'t connected, and ' +
+    'this host is reconnecting to it.');
+
+  // A later open that replaced it, with the registration gone since: no
+  // channel tool can find the channel, so none is offered.
+  for (const gone of [false, true]) {
+    const r = await declineHeld();
+    assert.equal((await r.f.call('channel_open', { channelId: 'x' })).success, true, `gone: ${gone}`);
+    if (gone) r.f.servers.set('a', undefined);
+    await r.f.registry.handleChanged('a', { removed: ['x'] });
+    r.ack.reject(new McplRequestError(notSent, 'not-sent'));
+    const replaced = await r.declining;
+    assert.equal(replaced.data?.status, 'replaced', `gone: ${gone}`);
+    assert.equal(replaced.data?.closeError,
+      'The decline is recorded, but a later decision to open the channel replaced it, and that decision stands. It isn\'t ' +
+      'registered here any more, so no channel tool can reach it until it\'s registered here again.' +
+      (gone ? ' If you need the server back, ask whoever runs this host.' : ''), `gone: ${gone}`);
+  }
+  // I2: still registered, its server gone: channel_close records the close,
+  // which happens once the server is back.
+  const kept = await declineHeld();
+  assert.equal((await kept.f.call('channel_open', { channelId: 'x' })).success, true);
+  kept.f.servers.set('a', undefined);
+  kept.ack.reject(new McplRequestError(notSent, 'not-sent'));
+  const keptReplaced = await kept.declining;
+  assert.equal(keptReplaced.data?.status, 'replaced');
+  assert.equal(keptReplaced.data?.closeError,
+    'The decline is recorded, but a later decision to open the channel replaced it, and that decision stands. If you still ' +
+    'want it closed, call channel_close. If you need the server back, ask whoever runs this host.');
 });
 
-test('a decline whose channel its server\'s traffic shows open meanwhile offers no retry, which would be refused', async () => {
+test('a decline on a server whose channels this host can\'t open or close says it stands, but not that the channel closed', async () => {
   const tick = () => new Promise<void>((resolve) => setImmediate(resolve));
   const f = await fixture({});
-  // The server opens its own channels, and only its traffic shows one open.
   const server = up(['channels.lifecycle']);
   f.servers.set('a', server);
-  await f.registry.handleRegister('a', { channels: [descriptor('y')] });
+  await f.registry.handleRegister('a', { channels: [descriptor('x'), descriptor('y')] });
+  // The server keeps its channels as it chooses, and only its traffic shows
+  // one open, so the host can't say x closed, and says why.
+  const quiet = await f.call('channel_decline', { channelId: 'x', messageId: 'm1' });
+  assert.equal(quiet.success, true);
+  assert.equal(quiet.data?.status, 'declined');
+  assert.equal(quiet.data?.closeError,
+    'The decline is recorded, but this host isn\'t permitted to open or close the "a" server\'s channels, so the server ' +
+    'keeps this one open or closed as it chooses, and declining again won\'t change that. This host closes it when the "a" ' +
+    'server next registers this channel, if this host may open and close its channels then. If you need it closed sooner, ' +
+    'ask whoever runs this host.');
+  // A channel known only from a push starts as unconfirmed as a registered
+  // one, so its decline answers the same.
+  f.registry.ensureChannelRegistered('a', 'z', 'z');
+  const pushed = await f.call('channel_decline', { channelId: 'z', messageId: 'm5' });
+  assert.equal(pushed.success, true);
+  assert.equal(pushed.data?.status, 'declined');
+  assert.equal(pushed.data?.closeError,
+    'The decline is recorded, but this host isn\'t permitted to open or close the "a" server\'s channels, so the server ' +
+    'keeps this one open or closed as it chooses, and declining again won\'t change that. This host closes it if the "a" ' +
+    'server registers this channel at a time this host may open and close its channels. If you need it closed sooner, ask ' +
+    'whoever runs this host.');
+
   // Its traffic while the acknowledgment is out shows y open, so another
   // decline, which would be refused, isn't offered.
   const notSent = 'The "a" server isn\'t connected, so the request wasn\'t sent.';
@@ -664,6 +774,12 @@ test('a decline whose channel its server\'s traffic shows open meanwhile offers 
   }] });
   acks.shift()!();
   const declined = await declining;
+  assert.equal(declined.data?.status, 'declined');
+  assert.equal(declined.data?.closeError,
+    'The decline is recorded, but this host isn\'t permitted to open or close the "a" server\'s channels, so the server ' +
+    'keeps this one open or closed as it chooses, and declining again won\'t change that. This host closes it when the "a" ' +
+    'server next registers this channel, if this host may open and close its channels then. If you need it closed sooner, ' +
+    'ask whoever runs this host.');
   assert.equal(declined.data?.acknowledgmentError, `The decline is recorded, but the acknowledgment wasn't posted: ${notSent}`);
   // And another decline is refused, with no pointer to a channel_close that
   // couldn't close it here.
@@ -695,6 +811,334 @@ test('an acknowledgment refused for the grant says so, though the server drops w
     'If you need it, ask whoever runs this host.');
 });
 
+test('a decline while lifecycle work for its channel is outstanding doesn\'t say the channel remained closed', async () => {
+  // The open's request is out when the grant goes, so the decline can't
+  // close anything, and the open may yet land.
+  const tick = () => new Promise<void>((resolve) => setImmediate(resolve));
+  const f = await fixture({ a: ['x'] });
+  const server = f.servers.get('a')!;
+  const answers: Array<() => void> = [];
+  server.sendChannelsOpen = ({ channelId }) => new Promise((resolve) => { answers.push(() => resolve({ channel: descriptor(channelId) })); });
+  const opening = f.call('channel_open', { channelId: 'x' });
+  for (let i = 0; i < 50 && answers.length === 0; i++) await tick();
+  assert.equal(answers.length, 1, 'the open went out');
+  const closing = f.call('channel_close', { channelId: 'x' });
+  await tick();
+  f.servers.set('a', { ...up(['channels.lifecycle']), sendChannelsOpen: server.sendChannelsOpen });
+  const declined = await f.call('channel_decline', { channelId: 'x', messageId: 'm1' });
+  assert.equal(declined.success, true);
+  assert.equal(declined.data?.status, 'declined');
+  // Without the grant now, nothing this host does closes it, whatever work
+  // is still out.
+  assert.equal(declined.data?.closeError,
+    'The decline is recorded, but this host isn\'t permitted to open or close the "a" server\'s channels, so the server ' +
+    'keeps this one open or closed as it chooses, and declining again won\'t change that. This host closes it when the "a" ' +
+    'server next registers this channel, if this host may open and close its channels then. If you need it closed sooner, ' +
+    'ask whoever runs this host.');
+  answers.shift()!();
+  await opening;
+  await closing;
+});
+
+test('a decline while its server isn\'t up says the channel may not be closed there yet, and when this host closes it', async () => {
+  const later = 'when the "a" server next registers this channel, if this host may open and close its channels then';
+  const cases: Array<[string, Server | undefined, boolean, string]> = [
+    ['down', down(true), false, 'the "a" server isn\'t connected, and this host is reconnecting to it'],
+    ['connecting', undefined, true, 'this host is connecting to the "a" server'],
+    ['gone', undefined, false, 'the "a" server isn\'t connected, and this host won\'t reconnect to it on its own'],
+  ];
+  for (const [what, server, connecting, clause] of cases) {
+    const f = await fixture({});
+    // Registered without the grant, so its transport is unconfirmed.
+    f.servers.set('a', up(['channels.lifecycle']));
+    await f.registry.handleRegister('a', { channels: [descriptor('x')] });
+    f.servers.set('a', server);
+    if (connecting) f.connecting.add('a');
+    const declined = await f.call('channel_decline', { channelId: 'x', messageId: 'm1' });
+    assert.equal(declined.success, true, what);
+    assert.equal(declined.data?.status, 'declined', what);
+    assert.equal(declined.data?.closeError,
+      `The decline is recorded, but ${clause}, so the channel may not be closed there yet. This host closes it ${later}, so ` +
+      'there\'s no need to decline again to close it.' +
+      (what === 'gone' ? ' If you need the server back, ask whoever runs this host.' : ''),
+      what);
+  }
+});
+
+test('a decline that finishes while another decline\'s close for the channel is queued says that work applies it', async () => {
+  const tick = () => new Promise<void>((resolve) => setImmediate(resolve));
+  const f = await fixture({});
+  const server = up();
+  f.servers.set('a', server);
+  // The registration's close doesn't complete, so x's transport is
+  // unconfirmed and each decline closes it.
+  server.sendChannelsClose = async () => { throw new McplRequestError('The "a" server didn\'t answer within 30 seconds, so whether the request took effect is unknown.', 'no-response'); };
+  await f.registry.handleRegister('a', { channels: [descriptor('x')] });
+  for (let i = 0; i < 5; i++) await tick();
+  const answers: Array<() => void> = [];
+  // Read through a function, so an assertion on the count doesn't narrow
+  // it for the next wait.
+  const waiting = () => answers.length;
+  server.sendChannelsClose = () => new Promise((resolve) => { answers.push(() => resolve({})); });
+  const first = f.call('channel_decline', { channelId: 'x', messageId: 'm1' });
+  for (let i = 0; i < 50 && waiting() === 0; i++) await tick();
+  assert.equal(waiting(), 1, "the first decline's close went out");
+  const second = f.call('channel_decline', { channelId: 'x', messageId: 'm2' });
+  await tick();
+  answers.shift()!();
+  const declined = await first;
+  assert.equal(declined.success, true);
+  assert.equal(declined.data?.status, 'declined');
+  assert.equal(declined.data?.closeError,
+    'The decline is recorded, but the channel isn\'t closed for certain yet. Other work for it that\'s still under way ' +
+    'applies the decline when its turn comes, so there\'s no need to decline again to close it.');
+  for (let i = 0; i < 50 && waiting() === 0; i++) await tick();
+  assert.equal(waiting(), 1, "the second decline's close went out");
+  answers.shift()!();
+  const remained = await second;
+  assert.equal(remained.data?.status, 'remained closed');
+  assert.equal(remained.data?.closeError, undefined);
+});
+
+test('a decline closes a channel whose traffic showed it open while its acknowledgment was out, once this host directs it', async () => {
+  // Traffic marks a channel open where this host doesn't direct the
+  // server's channels; a grant that now lets it means the decline's
+  // decision is applied, not left to a registration.
+  const tick = () => new Promise<void>((resolve) => setImmediate(resolve));
+  const f = await fixture({});
+  const server = up(['channels.lifecycle']);
+  f.servers.set('a', server);
+  await f.registry.handleRegister('a', { channels: [descriptor('y')] });
+  const acks: Array<() => void> = [];
+  server.sendChannelsAcknowledge = () => new Promise((resolve) => { acks.push(() => resolve({ acknowledged: true })); });
+  const closes: string[] = [];
+  server.sendChannelsClose = async ({ channelId }) => { closes.push(channelId); return {}; };
+  const declining = f.call('channel_decline', { channelId: 'y', messageId: 'm1', acknowledge: '👀' });
+  for (let i = 0; i < 50 && acks.length === 0; i++) await tick();
+  assert.equal(acks.length, 1, 'the acknowledgment went out');
+  await f.registry.handleIncoming('a', { messages: [{
+    channelId: 'y', messageId: 'm2', author: { id: 'u1', name: 'someone' },
+    timestamp: '2026-10-19T00:00:00Z', content: [{ type: 'text', text: 'hello' }],
+  }] });
+  server.grant = grant();
+  acks.shift()!();
+  const declined = await declining;
+  assert.equal(declined.data?.status, 'remained closed');
+  assert.equal(declined.data?.closeError, undefined);
+  assert.deepEqual(closes, ['y'], 'the decline closed it');
+});
+
+test('a decline whose close fails says what helps after that failure, and none where the channel closed anyway', async () => {
+  // Each decline's close queues behind a channel_close whose request is
+  // out; the grant, or the server, goes before the decline's turn.
+  const tick = () => new Promise<void>((resolve) => setImmediate(resolve));
+  const timedOut = 'The "a" server didn\'t answer within 30 seconds, so whether the request took effect is unknown.';
+  const later = 'when the "a" server next registers this channel, if this host may open and close its channels then';
+  const setUp = async () => {
+    const f = await fixture({});
+    const server = up();
+    f.servers.set('a', server);
+    // The registration's close doesn't complete, so y is unconfirmed.
+    server.sendChannelsClose = async () => { throw new McplRequestError(timedOut, 'no-response'); };
+    await f.registry.handleRegister('a', { channels: [descriptor('y')] });
+    for (let i = 0; i < 5; i++) await tick();
+    const answers: Array<{ resolve: () => void; reject: (err: Error) => void }> = [];
+    server.sendChannelsClose = () => new Promise((resolve, reject) => { answers.push({ resolve: () => resolve({}), reject }); });
+    const closing = f.call('channel_close', { channelId: 'y' });
+    for (let i = 0; i < 50 && answers.length === 0; i++) await tick();
+    assert.equal(answers.length, 1, "channel_close's request went out");
+    const declining = f.call('channel_decline', { channelId: 'y', messageId: 'm1' });
+    return { f, server, answer: answers[0]!, closing, declining };
+  };
+
+  // The grant goes, and the earlier close confirms the channel closed: the
+  // decline's own close is refused, but the channel is closed for certain.
+  const confirmed = await setUp();
+  confirmed.server.grant = grant(['channels.lifecycle']);
+  confirmed.answer.resolve();
+  await confirmed.closing;
+  const remained = await confirmed.declining;
+  assert.equal(remained.data?.status, 'remained closed');
+  assert.equal(remained.data?.closeError, undefined);
+
+  // The grant goes, and the earlier close didn't complete.
+  const refused = await setUp();
+  refused.server.grant = grant(['channels.lifecycle']);
+  refused.answer.reject(new McplRequestError(timedOut, 'no-response'));
+  await refused.closing;
+  const notPermitted = await refused.declining;
+  assert.equal(notPermitted.data?.status, 'declined');
+  assert.equal(notPermitted.data?.closeError,
+    `The decline is recorded, and this host closes the channel ${later}; closing it now didn't complete: this host isn't ` +
+    'permitted to open or close the "a" server\'s channels. If you need it closed sooner, ask whoever runs this host.');
+
+  // The server goes for good.
+  const gone = await setUp();
+  gone.f.servers.set('a', undefined);
+  gone.answer.reject(new McplRequestError(timedOut, 'no-response'));
+  await gone.closing;
+  const unreachable = await gone.declining;
+  assert.equal(unreachable.data?.status, 'declined');
+  assert.equal(unreachable.data?.closeError,
+    `The decline is recorded, and this host closes the channel ${later}; closing it now didn't complete: the "a" server ` +
+    'isn\'t connected, and this host won\'t reconnect to it on its own. If you need the server back, ask whoever runs this host.');
+});
+
+test('a decline of a channel this host confirmed closed before the grant went still says it remained closed', async () => {
+  const f = await fixture({ a: ['x'] });
+  const server = f.servers.get('a')!;
+  const closes: string[] = [];
+  server.sendChannelsClose = async ({ channelId }) => { closes.push(channelId); return {}; };
+  server.grant = grant(['channels.lifecycle']);
+  const declined = await f.call('channel_decline', { channelId: 'x', messageId: 'm1' });
+  assert.equal(declined.data?.status, 'remained closed');
+  assert.equal(declined.data?.closeError, undefined);
+  assert.deepEqual(closes, [], 'nothing is asked of a server this host no longer directs');
+});
+
+test('a decline whose close failed after its channel was de-listed names no tool that can\'t find it', async () => {
+  const tick = () => new Promise<void>((resolve) => setImmediate(resolve));
+  const timedOut = 'The "a" server didn\'t answer within 30 seconds, so whether the request took effect is unknown.';
+  const f = await fixture({});
+  const server = up();
+  f.servers.set('a', server);
+  server.sendChannelsClose = async () => { throw new McplRequestError(timedOut, 'no-response'); };
+  await f.registry.handleRegister('a', { channels: [descriptor('y')] });
+  for (let i = 0; i < 5; i++) await tick();
+  const answers: Array<(err: Error) => void> = [];
+  server.sendChannelsClose = () => new Promise((_, reject) => { answers.push(reject); });
+  const declining = f.call('channel_decline', { channelId: 'y', messageId: 'm1' });
+  for (let i = 0; i < 50 && answers.length === 0; i++) await tick();
+  assert.equal(answers.length, 1, "the decline's close went out");
+  await f.registry.handleChanged('a', { removed: ['y'] });
+  answers.shift()!(new McplRequestError('Unknown channel.', 'error-response'));
+  const declined = await declining;
+  assert.equal(declined.data?.status, 'declined');
+  assert.equal(declined.data?.closeError,
+    'The decline is recorded, and this host closes the channel when the "a" server next registers this channel, if this ' +
+    'host may open and close its channels then; closing it now didn\'t complete: Unknown channel. It isn\'t registered ' +
+    'here any more.');
+});
+
+test('a decline that a later open replaced sends nothing for a channel that open already opened', async () => {
+  const tick = () => new Promise<void>((resolve) => setImmediate(resolve));
+  const f = await fixture({ a: ['x'] });
+  const server = f.servers.get('a')!;
+  const acks: Array<() => void> = [];
+  server.sendChannelsAcknowledge = () => new Promise((resolve) => { acks.push(() => resolve({ acknowledged: true })); });
+  let opens = 0;
+  server.sendChannelsOpen = async ({ channelId }) => { opens++; return { channel: descriptor(channelId) }; };
+  const declining = f.call('channel_decline', { channelId: 'x', messageId: 'm1', acknowledge: '👀' });
+  for (let i = 0; i < 50 && acks.length === 0; i++) await tick();
+  assert.equal((await f.call('channel_open', { channelId: 'x' })).success, true);
+  acks.shift()!();
+  const declined = await declining;
+  assert.equal(declined.data?.status, 'replaced');
+  assert.equal(declined.data?.closeError,
+    'The decline is recorded, but a later decision to open the channel replaced it, and that decision stands. If you still ' +
+    'want it closed, call channel_close.');
+  assert.equal(opens, 1, 'only the open itself went out');
+});
+
+test('a decline that a later open replaced while that open\'s request was out sends no second open', async () => {
+  const tick = () => new Promise<void>((resolve) => setImmediate(resolve));
+  const f = await fixture({ a: ['x'] });
+  const server = f.servers.get('a')!;
+  const acks: Array<() => void> = [];
+  server.sendChannelsAcknowledge = () => new Promise((resolve) => { acks.push(() => resolve({ acknowledged: true })); });
+  const held: Array<() => void> = [];
+  let opens = 0;
+  server.sendChannelsOpen = ({ channelId }) => {
+    opens++;
+    const answer = { channel: descriptor(channelId) };
+    return opens === 1 ? new Promise((resolve) => { held.push(() => resolve(answer)); }) : Promise.resolve(answer);
+  };
+  const declining = f.call('channel_decline', { channelId: 'x', messageId: 'm1', acknowledge: '👀' });
+  for (let i = 0; i < 50 && acks.length === 0; i++) await tick();
+  const opening = f.call('channel_open', { channelId: 'x' });
+  for (let i = 0; i < 50 && held.length === 0; i++) await tick();
+  assert.equal(held.length, 1, "the open's request went out");
+  acks.shift()!();
+  for (let i = 0; i < 5; i++) await tick();
+  held.shift()!();
+  assert.equal((await opening).success, true);
+  const declined = await declining;
+  for (let i = 0; i < 5; i++) await tick();
+  assert.equal(opens, 1, 'only the open itself went out');
+  assert.equal(declined.data?.status, 'replaced');
+  assert.equal(declined.data?.closeError,
+    'The decline is recorded, but a later decision to open the channel replaced it, and that decision stands. If you still ' +
+    'want it closed, call channel_close.');
+});
+
+test('a decline that a tune-out replaced sends nothing for that decision', async () => {
+  // A tune-out records its decision only: the transport is as a tune-out
+  // leaves it at any other time, which reconciling settles at the server's
+  // next registration.
+  const tick = () => new Promise<void>((resolve) => setImmediate(resolve));
+  const timedOut = 'The "a" server didn\'t answer within 30 seconds, so whether the request took effect is unknown.';
+  const f = await fixture({});
+  const server = up();
+  f.servers.set('a', server);
+  server.sendChannelsClose = async () => { throw new McplRequestError(timedOut, 'no-response'); };
+  await f.registry.handleRegister('a', { channels: [descriptor('y')] });
+  for (let i = 0; i < 5; i++) await tick();
+  const sent: string[] = [];
+  server.sendChannelsClose = async ({ channelId }) => { sent.push(`close ${channelId}`); return {}; };
+  server.sendChannelsOpen = async ({ channelId }) => { sent.push(`open ${channelId}`); return { channel: descriptor(channelId) }; };
+  const acks: Array<() => void> = [];
+  server.sendChannelsAcknowledge = () => new Promise((resolve) => { acks.push(() => resolve({ acknowledged: true })); });
+  const declining = f.call('channel_decline', { channelId: 'y', messageId: 'm1', acknowledge: '👀' });
+  for (let i = 0; i < 50 && acks.length === 0; i++) await tick();
+  assert.equal(acks.length, 1, 'the acknowledgment went out');
+  f.registry.enterTuneOut('a', 'y', { epochId: 'e1', cadenceSeconds: 60, backlogCap: 10, maxWakes: 3, startedAtSequence: 0 }, 'agent-tool');
+  acks.shift()!();
+  const declined = await declining;
+  for (let i = 0; i < 5; i++) await tick();
+  assert.deepEqual(sent, [], 'the decline sends nothing for a decision it no longer holds');
+  assert.equal(declined.data?.status, 'replaced');
+  assert.equal(declined.data?.closeError,
+    'The decline is recorded, but the channel was tuned out meanwhile, and that decision stands: its messages go to the ' +
+    'subconscious. If you still want it closed, call channel_close.');
+});
+
+test('a decline that a later open replaced, on a server whose channels this host can\'t open or close, says whom to ask', async () => {
+  const tick = () => new Promise<void>((resolve) => setImmediate(resolve));
+  const f = await fixture({});
+  const server = up(['channels.lifecycle']);
+  f.servers.set('a', server);
+  await f.registry.handleRegister('a', { channels: [descriptor('x')] });
+  const acks: Array<() => void> = [];
+  server.sendChannelsAcknowledge = () => new Promise((resolve) => { acks.push(() => resolve({ acknowledged: true })); });
+  const declining = f.call('channel_decline', { channelId: 'x', messageId: 'm1', acknowledge: '👀' });
+  for (let i = 0; i < 50 && acks.length === 0; i++) await tick();
+  assert.equal(acks.length, 1, 'the acknowledgment went out');
+  // Refused for the grant, the open is still recorded.
+  assert.equal((await f.call('channel_open', { channelId: 'x' })).success, false);
+  acks.shift()!();
+  const declined = await declining;
+  assert.equal(declined.data?.status, 'replaced');
+  assert.equal(declined.data?.closeError,
+    'The decline is recorded, but a later decision to open the channel replaced it, and that decision stands, and this ' +
+    'host isn\'t permitted to open or close the "a" server\'s channels; if you need it closed, ask whoever runs this host.');
+
+  // A server that isn't up has an empty grant until its next exchange, and
+  // channel_close closes the channel once it's back, so it's still named.
+  const g = await fixture({ a: ['x'] });
+  const held: Array<() => void> = [];
+  g.servers.get('a')!.sendChannelsAcknowledge = () => new Promise((resolve) => { held.push(() => resolve({ acknowledged: true })); });
+  const pending = g.call('channel_decline', { channelId: 'x', messageId: 'm1', acknowledge: '👀' });
+  for (let i = 0; i < 50 && held.length === 0; i++) await tick();
+  g.servers.set('a', down(true));
+  await g.call('channel_open', { channelId: 'x' });
+  held.shift()!();
+  const replaced = await pending;
+  assert.equal(replaced.data?.status, 'replaced');
+  assert.equal(replaced.data?.closeError,
+    'The decline is recorded, but a later decision to open the channel replaced it, and that decision stands. If you still ' +
+    'want it closed, call channel_close.');
+});
+
 test('a decline whose channel stops being registered while its close is out offers no retry, which couldn\'t find it', async () => {
   const tick = () => new Promise<void>((resolve) => setImmediate(resolve));
   const notSent = 'The "a" server isn\'t connected, so the request wasn\'t sent.';
@@ -710,6 +1154,9 @@ test('a decline whose channel stops being registered while its close is out offe
       'it isn\'t registered here any more: the "a" server no longer lists the channel', ''],
     ['this host removes the server', async (f) => { f.registry.removeServer('a'); },
       'it isn\'t registered here any more: this host disconnected the "a" server while the change was being made', ''],
+    ['this host removes the server, which is gone', async (f) => { f.registry.removeServer('a'); f.servers.set('a', undefined); },
+      'it isn\'t registered here any more: this host disconnected the "a" server while the change was being made. If you ' +
+      'need the server back, ask whoever runs this host', ''],
     ['this host removes the server, and it registers the channel again', async (f) => {
       f.registry.removeServer('a');
       // The registration's own reconcile waits behind the decline's close, so
@@ -717,7 +1164,8 @@ test('a decline whose channel stops being registered while its close is out offe
       registering = f.registry.handleRegister('a', { channels: [descriptor('y')] });
       for (let i = 0; i < 5; i++) await tick();
       assert.equal(f.registry.getChannelServerId('y'), 'a', 'y is registered again while the close is out');
-    }, 'its registration went and came back while the close was out', retry],
+    }, 'its registration went and came back while the close was out. Other work for it that\'s still under way applies the ' +
+      'decline when its turn comes, so there\'s no need to decline again to close it', retry],
   ];
   let registering: Promise<unknown> | undefined;
   for (const [what, go, why, ackRetry] of cases) {
@@ -738,6 +1186,7 @@ test('a decline whose channel stops being registered while its close is out offe
     answers.shift()!();
     const declined = await declining;
     assert.equal(declined.success, true, what);
+    assert.equal(declined.data?.status, 'declined', `${what}: the channel isn't closed for certain`);
     assert.equal(declined.data?.acknowledgmentError, `The decline is recorded, but the acknowledgment wasn't posted: ${notSent}${ackRetry}`, what);
     assert.equal(declined.data?.closeError, `The decline is recorded, and this host closes the channel ${later}; ${why}.`, what);
     // The registration that came back reconciles the decline's close; it's
@@ -749,6 +1198,49 @@ test('a decline whose channel stops being registered while its close is out offe
     await registering;
     registering = undefined;
   }
+});
+
+test('a decline whose registration came back, with only work a removal cancels still queued, names channel_close', async () => {
+  // A channel_close queues behind the decline's close; the server's
+  // registrations are removed, and it registers the channel again without
+  // channels.lifecycle, so nothing new is queued, then gains it. The queued
+  // close cancels when its turn comes, so it applies nothing.
+  const tick = () => new Promise<void>((resolve) => setImmediate(resolve));
+  const timedOut = 'The "a" server didn\'t answer within 30 seconds, so whether the request took effect is unknown.';
+  const f = await fixture({});
+  const server = up();
+  f.servers.set('a', server);
+  server.sendChannelsClose = async () => { throw new McplRequestError(timedOut, 'no-response'); };
+  await f.registry.handleRegister('a', { channels: [descriptor('y')] });
+  for (let i = 0; i < 5; i++) await tick();
+  const answers: Array<() => void> = [];
+  server.sendChannelsClose = () => new Promise((resolve) => { answers.push(() => resolve({})); });
+  const declining = f.call('channel_decline', { channelId: 'y', messageId: 'm1' });
+  for (let i = 0; i < 50 && answers.length === 0; i++) await tick();
+  assert.equal(answers.length, 1, "the decline's close went out");
+  const closing = f.call('channel_close', { channelId: 'y' });
+  for (let i = 0; i < 5; i++) await tick();
+  assert.equal(answers.length, 1, "channel_close's close waits behind it");
+  f.registry.removeServer('a');
+  const back = up(['channels.lifecycle']);
+  f.servers.set('a', back);
+  await f.registry.handleRegister('a', { channels: [descriptor('y')] });
+  back.grant = grant();
+  const closes: string[] = [];
+  back.sendChannelsClose = async ({ channelId }) => { closes.push(channelId); return {}; };
+  answers.shift()!();
+  const declined = await declining;
+  assert.equal(declined.data?.status, 'declined');
+  assert.equal(declined.data?.closeError,
+    'The decline is recorded, and this host closes the channel when the "a" server next registers this channel, if this ' +
+    'host may open and close its channels then; its registration went and came back while the close was out. If you need ' +
+    'it closed now, call channel_close.');
+  assert.equal((await closing).success, false);
+  assert.deepEqual(closes, [], 'the queued close applied nothing');
+  // The step does what it says.
+  const closed = await f.call('channel_close', { channelId: 'y' });
+  assert.equal(closed.data?.status, 'closed');
+  assert.deepEqual(closes, ['y']);
 });
 
 test('words whose open completed, then met a close decided while later work held them, say the close', async () => {

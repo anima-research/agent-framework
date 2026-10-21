@@ -5,7 +5,9 @@
   open or tuned out.
   - Where this host directs the channel's lifecycle, `channel_decline` in such
     a channel that isn't open sends its close through the lifecycle queue.
-    Until now it sent nothing. Its answer is still `remained closed`.
+    Until now it sent nothing. Its answer is still `remained closed` when
+    that close completes, no later decision has replaced the decline, and
+    nothing else is under way for the channel.
   - Where this host directs the channel's lifecycle, `channel_close` of such
     a channel already decided closed, as by a decision kept from before a
     restart, sends the close. Until now it answered `already closed` and sent

@@ -1633,7 +1633,7 @@ describe('mount include', () => {
       { name: 'config', mode: 'read-write', include: ['gate.json'] },
       { name: 'work', mode: 'read-write' },
     ]);
-    // Where tool-results/, refs/ and background-scripts/ go.
+    // Where tool-results/ and refs/ go.
     const firstWritable = (ws: WorkspaceModule): string | null =>
       (AgentFramework.prototype as unknown as { firstWritableMountName(w: WorkspaceModule): string | null }).firstWritableMountName.call(null, ws);
     assert.equal(firstWritable(both), 'work');

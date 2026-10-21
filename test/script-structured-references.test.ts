@@ -17,7 +17,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 import { AgentFramework, WorkspaceModule } from '../src/index.js';
-import type { ScriptToolResult, ToolResult } from '../src/index.js';
+import type { ToolResult } from '../src/index.js';
 import { EXPIRY_REASON, INLINE_WITHHELD_TEXT } from '../src/mcpl/references.js';
 import type { ReferenceRecord } from '../src/mcpl/references.js';
 import { MockMembrane } from './helpers/mock-membrane.js';
@@ -96,7 +96,7 @@ async function withPeers(fn: (h: Harness) => Promise<void>, opts: { eager?: bool
     mcplServerRegistry: unknown;
     mcplPrefixMap: Map<string, string>;
     getReferenceFetcher: () => unknown;
-    handleScriptToolCall: (agent: string, tool: string, args: Record<string, unknown>) => Promise<ScriptToolResult>;
+    scriptToolCall: (agent: string, tool: string, argsJson: string, context: object) => Promise<{ ok: boolean; json: string }>;
     dispatchMcplToolCall: (agent: string, call: { id: string; name: string; input: unknown }, serverId: string, prefix: string) => void;
     pushEvent: (event: { type: string; callId?: string; result?: ToolResult }) => void;
   };
@@ -130,9 +130,8 @@ async function withPeers(fn: (h: Harness) => Promise<void>, opts: { eager?: bool
   try {
     await fn({
       answer: (result) => { answer = result; },
-      // The string a script's call returns; its flags are pinned in
-      // mcp-modern-framework and code-execution.
-      script: async (tool) => (await internals.handleScriptToolCall.call(framework, 'agent', tool, {})).text,
+      // The JSON of the result a script's call gets: { content, structuredContent, isError }.
+      script: async (tool) => (await internals.scriptToolCall.call(framework, 'agent', tool, '{}', {})).json,
       modelCall,
       fetched,
       workspace,
@@ -195,7 +194,7 @@ test("content that isn't a list of blocks reaches a script as the model reads it
     const plainModel = await modelCall('attach', 'plain');
     assert.equal(plainModel.isError, true);
     assert.ok(plainModel.error?.startsWith(notice), plainModel.error);
-    assert.deepEqual(JSON.parse(await script('mcpl--plain--attach')), { content: [], structuredContent: { a: 1 }, isError: true, error: notice });
+    assert.deepEqual(JSON.parse(await script('mcpl--plain--attach')), { content: [{ type: 'text', text: notice }], structuredContent: { a: 1 }, isError: true });
     // An MCPL peer's reading has no content and reads the structured view, on both paths.
     const filesModel = await modelCall('attach', 'files');
     assert.equal(filesModel.isError, false);
@@ -225,16 +224,17 @@ test('without structured content, an MCPL peer\'s result reaches a script as stu
   });
 });
 
-test("an MCPL peer's structured result past the script cap is saved with its references as their ids, no URI in the file", async () => {
-  await withPeers(async ({ answer, script, workspace }) => {
+test("an MCPL peer's large structured result reaches a script whole, its references as their ids, no URI", async () => {
+  await withPeers(async ({ answer, script }) => {
+    // Past main's old 5 MB script cap, which saved such a result to the
+    // workspace: a result now reaches the script whole up to its memory's
+    // bound, past which it's refused as ResultTooLarge.
     answer({ content: blocks('oversized'), structuredContent: { pad: 'x'.repeat(5_000_000) } });
-    const out = JSON.parse(await script('mcpl--files--attach')) as { isError: boolean; oversized: { chars: number; savedTo: string } };
-    assert.equal(out.isError, false);
-    const read = await workspace.readBinary(out.oversized.savedTo);
-    assert.ok('data' in read, `the saved result is readable: ${out.oversized.savedTo}`);
-    const saved = read.data.toString('utf8');
-    assert.ok(!saved.includes('example.invalid'), 'no URI in the saved file');
-    const object = JSON.parse(saved) as { content: Array<{ refId?: string }> };
+    const out = await script('mcpl--files--attach');
+    assert.ok(!out.includes('example.invalid'), 'no URI reaches the script');
+    const object = JSON.parse(out) as { content: Array<{ refId?: string }>; structuredContent: { pad: string }; isError: boolean };
+    assert.equal(object.isError, false);
+    assert.equal(object.structuredContent.pad.length, 5_000_000);
     assert.deepEqual(object.content, treated(object.content[0]!.refId!, object.content[2]!.refId!, object.content[10]!.refId!));
   });
 });
@@ -247,7 +247,7 @@ test("only a script that reads the blocks gets the script-demand fetch: not the 
     assert.deepEqual(fetched, [], 'nothing here is eager-eligible, and the model\'s call gets no more than the eager pass');
 
     answer({ content: [blocks('error')[0], { type: 'text', text: 'the attach failed' }], isError: true });
-    assert.equal(await script('mcpl--files--attach'), 'Error: the attach failed');
+    assert.equal(await script('mcpl--files--attach'), JSON.stringify({ content: [{ type: 'text', text: 'the attach failed' }], structuredContent: null, isError: true }));
     assert.deepEqual(fetched, [], 'a script that reads an error as its text alone gets no more than the eager pass');
   });
 });
@@ -259,7 +259,7 @@ test("the eager pass still runs for the model's call and for an error a script r
     assert.deepEqual(fetched, [uris('eager-model').report]);
 
     answer({ content: [blocks('eager-error')[0], { type: 'text', text: 'the attach failed' }], isError: true });
-    assert.equal(await script('mcpl--files--attach'), 'Error: the attach failed');
+    assert.equal(await script('mcpl--files--attach'), JSON.stringify({ content: [{ type: 'text', text: 'the attach failed' }], structuredContent: null, isError: true }));
     assert.deepEqual(fetched, [uris('eager-model').report, uris('eager-error').report]);
   }, { eager: true });
 });
@@ -269,12 +269,11 @@ test('an error with structured content is fetched for the script, and reaches it
     answer({ content: [blocks('structured-error')[0], { type: 'text', text: 'the attach failed' }], structuredContent: { partial: true }, isError: true });
     const out = await script('mcpl--files--attach');
     assert.ok(!out.includes('example.invalid'), out);
-    const object = JSON.parse(out) as { content: Array<{ refId?: string }>; structuredContent: unknown; isError: boolean; error: string };
+    const object = JSON.parse(out) as { content: Array<{ refId?: string }>; structuredContent: unknown; isError: boolean };
     assert.deepEqual(object, {
       content: [treated(object.content[0]!.refId!, '', '')[0], { type: 'text', text: 'the attach failed' }],
       structuredContent: { partial: true },
       isError: true,
-      error: 'the attach failed',
     });
     assert.deepEqual(fetched, [uris('structured-error').report], 'the script reads the blocks, so its reference was fetched first');
   });

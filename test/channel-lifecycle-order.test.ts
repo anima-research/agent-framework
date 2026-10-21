@@ -1595,7 +1595,11 @@ test("a server the host doesn't direct opens its own channels: its traffic marks
   await f.registry.handleChanged('test', { added: [descriptor('y')] });
   const declined = await f.registry.handleChannelToolCall('channel_decline', { serverId: 'test', channelId: 'y', messageId: 'm3' });
   assert.equal(declined.success, true);
-  assert.equal(dataOf(declined).closeError, undefined);
+  assert.equal(dataOf(declined).closeError,
+    'The decline is recorded, but this host isn\'t permitted to open or close the "test" server\'s channels, so the server ' +
+    'keeps this one open or closed as it chooses, and declining again won\'t change that. This host closes it when the "test" ' +
+    'server next registers this channel, if this host may open and close its channels then. If you need it closed sooner, ' +
+    'ask whoever runs this host.');
   assert.equal(f.calls.length, 0, 'the host sends no lifecycle RPC to a server it does not direct');
 });
 

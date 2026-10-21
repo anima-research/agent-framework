@@ -7,8 +7,10 @@
  * others as a tool that ran and answered (in XML tool mode, as the tool's
  * stdout), and channel_open's refusal showed it only its data, never the
  * sentence that says how to cancel the tune-out. A script's call gets each
- * refusal as "Error: <text>", and a module calling in process gets the
- * result flagged, with the tuned-out refusal's data kept.
+ * tool's refusal as a result with isError and the refusal's text, and a call
+ * the dispatcher refused before it opened as an Error (ToolResult.refused); a module
+ * calling in process gets the result flagged, with the tuned-out refusal's
+ * data kept.
  */
 import { test, type TestContext } from 'node:test';
 import assert from 'node:assert/strict';
@@ -17,7 +19,8 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 import { AgentFramework, ApiModule } from '../src/index.js';
-import type { Module, ModuleContext, ScriptToolResult, ToolDefinition, ToolResult } from '../src/index.js';
+import type { Module, ModuleContext, ToolDefinition, ToolResult } from '../src/index.js';
+import { scriptCall } from './helpers/script-call.js';
 import { TUNE_OUT_DEFAULTS } from '../src/tune-out/coordinator.js';
 import { MockMembrane, createMockResponse } from './helpers/mock-membrane.js';
 
@@ -189,23 +192,24 @@ test('a script, and a module calling in process, get the refusals as errors too'
   const { framework } = await setUp(t, false, [keeper]);
   // A script's call is answered through the event loop, so it has to run.
   framework.start();
-  const script = (tool: string, input: Record<string, unknown>) => (framework as unknown as {
-    handleScriptToolCall(agent: string, tool: string, args: Record<string, unknown>): Promise<ScriptToolResult>;
-  }).handleScriptToolCall('scout', tool, input);
-  // Each refusal reaches the script as an error, flagged as one (.is_error).
-  assert.deepEqual(await script('tune_out', { channelId: 'disc:guild:none' }), { text: 'Error: unknown channel: disc:guild:none', isError: true });
-  assert.deepEqual(await script('api--lookup', {}), { text: `Error: ${API_UNKNOWN}`, isError: true });
+  const script = (tool: string, input: Record<string, unknown>) => scriptCall(framework, 'scout', tool, input);
+  const failed = (text: string) => ({ refused: false, content: [{ type: 'text', text }], structuredContent: null, isError: true });
+  // A tool's own refusal reaches the script as a result flagged as an error.
+  assert.deepEqual(await script('tune_out', { channelId: 'disc:guild:none' }), failed('unknown channel: disc:guild:none'));
+  // A module's answer for a tool it doesn't have comes once the call has opened:
+  // a failure whose text says nothing ran, not a refusal.
+  assert.deepEqual(await script('api--lookup', {}), failed(API_UNKNOWN));
   // A control: the same tool's success still reads as one.
   const { cadenceSeconds, backlogCap, maxWakes } = TUNE_OUT_DEFAULTS;
   assert.deepEqual(
     await script('tune_out', { channelId: CHANNEL }),
-    { text: JSON.stringify({ tunedOut: CHANNEL, cadenceSeconds, backlogCap, maxWakes }), isError: false },
+    { refused: false, content: [{ type: 'text', text: JSON.stringify({ tunedOut: CHANNEL, cadenceSeconds, backlogCap, maxWakes }) }], structuredContent: null, isError: false },
   );
-  assert.deepEqual(await script('channel_open', { channelId: CHANNEL }), { text: `Error: ${TUNED_OUT}`, isError: true });
-  // A script can't start a script: refused before any dispatch, as an error.
+  assert.deepEqual(await script('channel_open', { channelId: CHANNEL }), failed(TUNED_OUT));
+  // A script can't start a script: refused before any dispatch.
   assert.deepEqual(
-    await script('code_execution', { code: 'print(1)' }),
-    { text: 'Error: code_execution cannot be called from within a script', isError: true },
+    await script('code_execution', { code: 'return 1;' }),
+    { refused: true, name: 'ToolRefused', message: 'code_execution cannot be called from within a script; nothing was done', tool: 'code_execution' },
   );
   // A module gets the result as the registry returns it: flagged, with the
   // refusal's data kept, so it can still read why.
