@@ -603,6 +603,19 @@ test('a nested mount\'s directory is matched level by level as disk compares nam
   assert.equal(beneathNested(['fold', 'n'], below), false, 'another name');
   assert.equal(beneathNested(['fold'], below), false, 'a path above the directory is not in it');
   assert.equal(beneathNested(['fold', 'M'], { dir: 'fold/m', folds: [] }), true, 'a level not read yet counts as folding');
+  // At a level that folds case, as Linux's casefold compares names: with a
+  // default-ignorable code point passed over, and with case mapped on the
+  // decomposed name, as for Greek ΐ beside Ϊ́.
+  for (const [given, dir, what] of [
+    ['in\u00adner', 'inner', 'a soft hyphen'],
+    ['in\u200dner', 'inner', 'a zero-width joiner'],
+    ['inner\ufe0f', 'inner', 'a variation selector'],
+    ['\u03aa\u0301', '\u0390', 'Greek letters whose case mapping decomposes'],
+  ] as const) {
+    assert.equal(beneathNested([given, 'x.txt'], { dir, folds: [true] }), true, `${what}, where its level folds case`);
+    assert.equal(beneathNested([given, 'x.txt'], { dir, folds: [false] }), false, `${what}, where its level tells case apart`);
+  }
+  assert.equal(beneathNested(['\u03b1\u0345\u0313'], { dir: '\u1f80', folds: [true] }), true, 'marks in another order around a combining ypogegrammeni, whose upper case is a letter');
   // What lies beneath goes by segments, since a match can change a name's length.
   assert.equal(restBeneath('STRASSE/a/b', { dir: 'stra\u00dfe', folds: [true] }), 'a/b');
   assert.equal(restBeneath('cafe\u0301', { dir: 'caf\u00e9', folds: [false] }), '');
@@ -796,7 +809,7 @@ test('on a disk that tells case apart, a name with cased letters but none a-z or
   assert.equal(wrote.success, true, String(wrote.error));
 });
 
-test('start, with each root holding a lettered name, lists no directory above a mount\'s root, and looks up nothing beside the roots\' paths but a name\'s flipped spelling', async (t) => {
+test('start, with each root holding a lettered name, lists no directory above a mount\'s root, and looks up nothing beside the roots\' paths but a name\'s other spellings in case', async (t) => {
   // From Beth-2709's runs: reading each level above a root from a listing
   // looked up whatever names those directories held, as a share mounted
   // beside a mount's path, which a dead share would hold. Each root here
@@ -835,8 +848,11 @@ test('start, with each root holding a lettered name, lists no directory above a 
   assert.deepEqual(listed.map(realOf).filter(above), [], 'no directory above a root is listed');
   const onPaths = (path: string) => above(path) || path === real || path.startsWith(real + sep);
   const flipped = (path: string) => join(dirname(path), [...basename(path)].map((c) => (/[a-z]/.test(c) ? c.toUpperCase() : /[A-Z]/.test(c) ? c.toLowerCase() : c)).join(''));
+  // The name with its first letter alone flipped, which a lookup there
+  // takes where the flipped spelling finds another file.
+  const firstFlipped = (path: string) => join(dirname(path), basename(path).replace(/[A-Za-z]/, (c) => (/[a-z]/.test(c) ? c.toUpperCase() : c.toLowerCase())));
   const storeReal = realOf(join(root, 'store'));
-  assert.deepEqual(looked.map(lookedAt).filter((path) => !onPaths(path) && !onPaths(flipped(path)) && !path.startsWith(storeReal)), [], 'nothing beside the paths is looked up');
+  assert.deepEqual(looked.map(lookedAt).filter((path) => !onPaths(path) && !onPaths(flipped(path)) && !onPaths(firstFlipped(path)) && !path.startsWith(storeReal)), [], 'nothing beside the paths is looked up');
 });
 
 /** Run `fn` with node:fs/promises' lstat wrapped by `wrap`, as the module under test sees it. */
@@ -902,6 +918,97 @@ test('a lookup of the flipped spelling that fails other than by finding nothing 
   assert.equal(answer, null);
 });
 
+test('where the flipped spelling finds another file than the name does, the name with its first letter alone flipped settles it, read from a listing or from the name alone', async (t) => {
+  // A disk that tells case apart can hold a twin spelled with every letter
+  // flipped, and has nothing at the third spelling; one that folds case but
+  // numbers a file anew for each spelling it's looked up by, as a FUSE
+  // filesystem may, finds the one file under every spelling, each numbered
+  // anew. No disk here does either on cue, so lstat is replaced.
+  const root = mkdtempSync(join(tmpdir(), 'workspace-path-spelling-flip-other-'));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  for (const d of ['listed', 'short']) mkdirSync(join(root, d));
+  writeFileSync(join(root, 'listed', 'ab.txt'), '');
+  writeFileSync(join(root, 'short', 'a'), '');
+  mkdirSync(join(root, 'ab'));
+  mkdirSync(join(root, 'd'));
+  writeFileSync(join(root, 'other'), '');
+  const nothing = () => Promise.reject(Object.assign(new Error('ENOENT: no such file or directory'), { code: 'ENOENT' }));
+  const failed = () => Promise.reject(Object.assign(new Error('EIO: i/o error'), { code: 'EIO' }));
+  const lookups = (third: 'a file' | 'nothing' | 'an error') => (original: typeof fs.promises.lstat) => ((path: fs.PathLike, ...rest: unknown[]) => {
+    const name = basename(String(path));
+    const lookup = original as (...args: unknown[]) => Promise<unknown>;
+    if (['AB.TXT', 'AB', 'A', 'D'].includes(name)) return lookup(join(root, 'other'), ...rest);
+    if (['Ab.txt', 'Ab'].includes(name)) return third === 'a file' ? lookup(join(root, 'other'), ...rest) : third === 'nothing' ? nothing() : failed();
+    return lookup(path, ...rest);
+  }) as typeof fs.promises.lstat;
+  for (const [third, answer] of [['nothing', false], ['a file', null], ['an error', null]] as const) {
+    assert.equal(await withLstat(lookups(third), () => ownCaseFolding(join(root, 'listed'))), answer, `from a listing, with ${third} at the third spelling`);
+    assert.equal(await withLstat(lookups(third), () => ownCaseFolding(root, 'ab')), answer, `from the name alone, with ${third} at the third spelling`);
+  }
+  assert.equal(await withLstat(lookups('nothing'), () => ownCaseFolding(join(root, 'short'))), null, 'a name of one letter has no third spelling, from a listing');
+  assert.equal(await withLstat(lookups('nothing'), () => ownCaseFolding(root, 'd')), null, 'nor from the name alone');
+});
+
+test('a name removed while its third spelling is looked up tells nothing of its directory\'s folding', async (t) => {
+  // As a temporary file goes while start reads its directory: on a disk
+  // that folds case but numbers a file anew for each spelling, the third
+  // spelling then finds nothing, as it would where the disk tells case apart.
+  const root = mkdtempSync(join(tmpdir(), 'workspace-path-spelling-third-race-'));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  mkdirSync(join(root, 'd'));
+  writeFileSync(join(root, 'd', 'ab.txt'), '');
+  writeFileSync(join(root, 'other'), '');
+  let removed = false;
+  const answer = await withLstat((original) => ((path: fs.PathLike, ...rest: unknown[]) => {
+    const name = basename(String(path));
+    const lookup = original as (...args: unknown[]) => Promise<unknown>;
+    if (name === 'AB.TXT') return lookup(join(root, 'other'), ...rest);
+    if (name === 'Ab.txt') {
+      rmSync(join(root, 'd', 'ab.txt'));
+      removed = true;
+      return Promise.reject(Object.assign(new Error('ENOENT: no such file or directory'), { code: 'ENOENT' }));
+    }
+    return lookup(path, ...rest);
+  }) as typeof fs.promises.lstat, () => ownCaseFolding(join(root, 'd')));
+  assert.equal(removed, true, 'the third spelling was looked up');
+  assert.equal(answer, null);
+});
+
+test('a name re-created or renamed back under the same inode between its first and last lookups tells nothing, whichever other spelling found nothing', async (t) => {
+  // A name removed and made again can be given the freed inode number, and
+  // one renamed away and back keeps its own, so dev and ino alone would take
+  // it for the file looked up first; its change time moves either way. On a
+  // disk that folds case the other spelling, looked up while the name was
+  // gone, found nothing, which alone would read as telling case apart.
+  const root = mkdtempSync(join(tmpdir(), 'workspace-path-spelling-recreated-'));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  mkdirSync(join(root, 'd'));
+  writeFileSync(join(root, 'd', 'ab.txt'), '');
+  writeFileSync(join(root, 'other'), '');
+  const nothing = () => Promise.reject(Object.assign(new Error('ENOENT: no such file or directory'), { code: 'ENOENT' }));
+  for (const gone of ['AB.TXT', 'Ab.txt']) {
+    let named = 0;
+    const answer = await withLstat((original) => (async (path: fs.PathLike, ...rest: unknown[]) => {
+      const name = basename(String(path));
+      const lookup = original as (...args: unknown[]) => Promise<{ ctimeNs: bigint }>;
+      if (name === gone) return nothing();
+      if (name === 'AB.TXT') return lookup(join(root, 'other'), ...rest);
+      const found = await lookup(path, ...rest);
+      if (name !== 'ab.txt' || ++named < 2) return found;
+      return Object.assign(Object.create(Object.getPrototypeOf(found)), found, { ctimeNs: found.ctimeNs + 1n });
+    }) as typeof fs.promises.lstat, () => ownCaseFolding(join(root, 'd')));
+    assert.equal(named, 2, `${gone}: the name was looked up on each side`);
+    assert.equal(answer, null, `nothing at ${gone}`);
+  }
+});
+
+test('on a disk that tells case apart, a name read alone beside two others in case, spelled with every letter flipped and with its first alone, tells nothing', { skip: CASE_SENSITIVE_ONLY }, async (t) => {
+  const root = mkdtempSync(join(tmpdir(), 'workspace-path-spelling-three-twins-'));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  for (const name of ['ab', 'AB', 'Ab']) mkdirSync(join(root, name));
+  assert.equal(await ownCaseFolding(root, 'ab'), null);
+});
+
 test('before a start reads any level, a name in another case than a nested mount\'s directory may lie in it, and is refused saying so', async (t) => {
   const root = mkdtempSync(join(tmpdir(), 'workspace-path-spelling-unstarted-'));
   const dir = join(root, 'mount');
@@ -948,7 +1055,8 @@ test('a path lies surely in a nested mount\'s directory where each level is exac
   assert.deepEqual(nestedGuess('outer', ['caf\u00e9', 'x.txt'], { dir: 'cafe\u0301', folds: [false] }), shown('outer/caf\\u00e9', 'outer/cafe\\u0301'), 'one name in NFC, shown by its code points');
   assert.deepEqual(nestedGuess('outer', ['SUB', 'caf\u00e9'], { dir: 'sub/cafe\u0301', folds: [true, true] }), shown('outer/SUB/caf\\u00e9', 'outer/sub/cafe\\u0301'), 'each level shown as it differs');
   assert.deepEqual(nestedGuess('outer', ['\u{1d15e}'], { dir: '\u{1d157}\u{1d165}', folds: [false] }), shown('outer/\\u{1d15e}', 'outer/\\u{1d157}\\u{1d165}'), 'past the BMP');
-  assert.deepEqual(nestedGuess('outer', ['strasse'], { dir: 'stra\u00dfe', folds: [true] }), shown('outer/strasse', 'outer/stra\\u00dfe'), 'a pair only foldedLoosely joins');
+  assert.deepEqual(nestedGuess('outer', ['strasse'], { dir: 'stra\u00dfe', folds: [true] }), shown('outer/strasse', 'outer/stra\\u00dfe'), 'a pair only a full folding joins');
+  assert.deepEqual(nestedGuess('outer', ['in\u00adner'], { dir: 'inner', folds: [true] }), shown('outer/in\\u00adner', 'outer/inner'), 'a default-ignorable code point, which a disk that folds case may keep');
   assert.deepEqual(nestedGuess('outer', ['ilik'], { dir: '\u0131l\u0131k', folds: [true] }), shown('outer/ilik', 'outer/\\u0131l\\u0131k'), 'a dotless i beside its look-alike');
   assert.deepEqual(nestedGuess('outer', ['\u10d0'], { dir: '\u1c90', folds: [true] }), shown('outer/\\u10d0', 'outer/\\u1c90'), 'case past ASCII, which a disk with an older folding table may keep apart');
   assert.deepEqual(nestedGuess('outer', ['caf\u00e9-\\u00e9'], { dir: 'cafe\u0301-\\u00e9', folds: [false] }), shown('outer/caf\\u00e9-\\\\u00e9', 'outer/cafe\\u0301-\\\\u00e9'), 'a backslash of the name\'s own, doubled');

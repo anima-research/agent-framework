@@ -476,12 +476,14 @@ async function levelFolds(base: string, segments: readonly string[], roots: read
  * roots, is read from its entries, as the mount's own walk reads it and as
  * fromRoots' levels are. One above every root is read from the path's own
  * segment there alone: that name, its flipped spelling, and the name again,
- * with nothing listed, so no name off the path is looked up but a segment's
- * flipped spelling, which reaches another filesystem only where a sibling
- * of exactly that name is itself a mountpoint. There a segment with no
- * letter a-z or A-Z, or one not there yet, tells nothing, and a directory
- * bind-mounted at its own flipped name, on a disk that tells case apart,
- * reads as folding; each fails closed, as a level that told nothing does.
+ * and where the flipped spelling finds another directory, the name with its
+ * first letter's case alone flipped, with nothing listed, so no name off the
+ * path is looked up but those spellings of a segment, which reach another
+ * filesystem only where a sibling of exactly such a name is itself a
+ * mountpoint. There a segment with no letter a-z or A-Z, or one not there
+ * yet, tells nothing, and a directory bind-mounted at its own flipped name,
+ * on a disk that tells case apart, reads as folding; each fails closed, as a
+ * level that told nothing does.
  */
 async function realLevelFolds(real: string, roots: readonly string[]): Promise<(boolean | null)[]> {
   const { root } = parse(real);
@@ -2567,13 +2569,14 @@ export class WorkspaceModule implements Module {
    * resolves nothing but the directories on this mount's own configured path
    * and those beneath its root, and reads each level's folding of this root's
    * real path, and of such a mount's, above every root from the path's own
-   * name there, that name flipped and the name again, with nothing listed,
-   * and at or beneath a root as that mount's own walk reads it
-   * (realLevelFolds), so a share elsewhere that doesn't answer holds only its
-   * own calls, unless such a directory is a link into it, where that mount's
-   * files lie, a sibling named exactly as a flipped spelling is its
-   * mountpoint, or it's mounted in a directory that lies in a mount's root,
-   * which that mount's own walks read too. What it leaves to the next start:
+   * name there, that name flipped and the name again, and where the flipped
+   * name finds another directory, with its first letter's case alone flipped,
+   * with nothing listed, and at or beneath a root as that mount's own walk
+   * reads it (realLevelFolds), so a share elsewhere that doesn't answer holds
+   * only its own calls, unless such a directory is a link into it, where
+   * that mount's files lie, a sibling named exactly as one of those spellings
+   * is its mountpoint, or it's mounted in a directory that lies in a mount's
+   * root, which that mount's own walks read too. What it leaves to the next start:
    * a mount configured elsewhere whose own root has moved since, as when a
    * link on its configured path is repointed, this mount's own reached
    * through another link among them, that mount's spellings through other

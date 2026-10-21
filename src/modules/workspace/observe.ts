@@ -644,18 +644,39 @@ const flippedCase = (name: string): string =>
  */
 const flippedAscii = (name: string): string => name.replace(/[A-Za-z]/g, otherCase);
 
+/**
+ * The name with only its first ASCII letter's case flipped, a spelling
+ * neither the name nor flippedAscii's, or null for a name with fewer than
+ * two such letters, where there is no such spelling.
+ */
+const firstFlipped = (name: string): string | null => ((name.match(/[A-Za-z]/g)?.length ?? 0) < 2 ? null : name.replace(/[A-Za-z]/, otherCase));
+
 /** Names compared as NFC in lower case. */
 const folded = (name: string): string => name.normalize('NFC').toLowerCase();
 
 /**
  * Names compared more loosely, through upper case and back, which also folds
  * `ß` with `ss`, `ſ` with `s` and `ς` with `σ`, as a disk that folds fully
- * does. It also folds dotless `ı` with `i`, which a disk may keep apart:
- * listedName's same-file check keeps that from naming another file, and the
- * nested-mount comparison (sameLevel), which has no file to check, errs
- * toward the nested mount there.
+ * does. It also folds dotless `ı` with `i`, which a disk may keep apart;
+ * the same-file check keeps that from naming another file.
  */
 export const foldedLoosely = (name: string): string => name.normalize('NFC').toLowerCase().toUpperCase().toLowerCase();
+
+/**
+ * Names compared as fully as a disk that folds names may compare them: with
+ * every default-ignorable code point dropped, such as a soft hyphen, a
+ * zero-width joiner or a variation selector, then decomposed (NFD), through
+ * lower, upper and lower case, and decomposed again, in the shape of
+ * Unicode's canonical caseless match. Mapped on the decomposed name, case
+ * joins names whose marks come in another order around a combining
+ * ypogegrammeni (U+0345), whose upper case is a letter. Linux's casefold,
+ * which ext4 and f2fs set per directory, drops those code points, on every
+ * kernel but 6.12 to 6.12.4, where this joins more than the disk does, and
+ * compares names decomposed in full case folding, and HFS+ passes over some
+ * of them too.
+ */
+const foldedFully = (name: string): string =>
+  name.replace(/\p{Default_Ignorable_Code_Point}/gu, '').normalize('NFD').toLowerCase().toUpperCase().toLowerCase().normalize('NFD');
 
 /** What the workspace holds of a mount, as the spelling step reads it (diskSpelling). */
 export interface WorkspaceEntries {
@@ -728,31 +749,47 @@ export async function foldsCase(dir: string): Promise<boolean> {
  * folds case can't hold both. Null where its own entries tell nothing: it
  * lists no name with an ASCII letter, as an empty directory doesn't, or
  * isn't there yet, or can't be listed, or a lookup fails for another reason
- * than that nothing is there, or the name is gone by the time it's looked
- * up. foldsCase asks the directory holding it then, which tells this one's
+ * than that nothing is there, or the name is gone, or changed, by the time
+ * it's looked up again. foldsCase asks the directory holding it then, which tells this one's
  * folding only where a whole filesystem folds or doesn't: ext4's and
  * tmpfs's casefold is set per directory, so an empty folding directory can
- * sit in one that tells case apart. Given `name`, a name `dir` holds, such as
- * a path's own segment, that name alone is looked up, flipped and not, and
- * nothing is listed, so nothing else `dir` holds is read: the flipped
- * spelling finds the same directory where `dir` folds case, and nothing, or
- * another file, where it tells case apart; a name with no ASCII letter, or
- * one that isn't there, tells nothing.
+ * sit in one that tells case apart. Where the flipped spelling finds another
+ * file than the name does, as a disk that tells case apart can hold beside
+ * it, the name is looked up once more with only its first ASCII letter's
+ * case flipped (firstFlipped): nothing there tells case apart, and a file
+ * there tells nothing, since a disk that folds case but numbers a file anew
+ * for each spelling it's looked up by, as a FUSE filesystem may, finds the
+ * one file under every spelling. A name with no such spelling tells nothing
+ * then either. Given `name`, a name `dir` holds, such as a path's own
+ * segment, that name alone is looked up, in those spellings, and nothing is
+ * listed, so nothing else `dir` holds is read: the flipped spelling finds the
+ * same directory where `dir` folds case, and nothing, or another directory
+ * the third spelling doesn't find, where it tells case apart; a name with no
+ * ASCII letter, or one that isn't there, tells nothing.
  */
 export async function ownCaseFolding(dir: string, name?: string): Promise<boolean | null> {
   // A lookup that finds nothing answers null; one that fails otherwise, undefined.
   const look = (path: string) => lstat(path, { bigint: true }).catch((error: NodeJS.ErrnoException) => (error.code === 'ENOENT' ? null : undefined));
-  // The name is looked up on each side of its flipped spelling, so a name
-  // removed or replaced meanwhile, as an editor's save replaces a file,
-  // tells nothing rather than either answer. A hard link in the other case
-  // made meanwhile, in a directory that tells case apart, still reads as
+  // The name is looked up on each side of its other spellings, and must be
+  // the same file with the same change time at both, so a name removed,
+  // replaced, made again under the freed inode number or renamed away and
+  // back meanwhile, as an editor's save replaces a file, tells nothing
+  // rather than either answer: on a disk that folds case, another spelling
+  // looked up while the name was gone finds nothing too. So does a hard link
+  // made meanwhile, which changes the file's change time; one in the other
+  // case made before, in a directory that tells case apart, still reads as
   // folding.
+  const unchanged = (a: BigIntStats, b: BigIntStats) => sameFile(a, b) && a.ctimeNs === b.ctimeNs;
   const told = async (unpaired: string): Promise<boolean | null> => {
     const before = await look(join(dir, unpaired));
     const flipped = await look(join(dir, flippedAscii(unpaired)));
+    const other = before && flipped && !sameFile(before, flipped) ? firstFlipped(unpaired) : null;
+    const third = other === null ? null : await look(join(dir, other));
     const after = await look(join(dir, unpaired));
-    if (!before || !after || !sameFile(before, after) || flipped === undefined) return null;
-    return flipped !== null && sameFile(after, flipped);
+    if (!before || !after || !unchanged(before, after) || flipped === undefined) return null;
+    if (flipped === null) return false;
+    if (sameFile(after, flipped)) return true;
+    return other !== null && third === null ? false : null;
   };
   if (name !== undefined) return flippedAscii(name) === name ? null : told(name);
   let listed: Set<string>;
@@ -826,13 +863,14 @@ function entryName(paths: readonly string[], prefix: string, segment: string): s
  * Whether `given`, a name at one level of a path, is `name`, a nested
  * mount's directory's name at that level, as a disk may compare them: in
  * either Unicode normalization form at every level, and in any case where
- * the directory holding them folds case (`folds`), as loosely as listedName
- * compares names (foldedLoosely). Where it can't tell, it errs toward the
- * nested mount. So on a disk that keeps the normalization forms apart, a
- * name in the other form of a nested directory's name is taken for that
- * mount's directory, and so, at a level that folds case, is any name
- * foldedLoosely joins with it that the disk keeps apart, such as `ss`
- * beside a nested `ß` or `ı` beside a nested `i`. Such a directory, or
+ * the directory holding them folds case (`folds`), as fully as a disk that
+ * folds names may compare them (foldedFully). Where it can't tell, it errs
+ * toward the nested mount. So on a disk that keeps the normalization forms
+ * apart, a name in the other form of a nested directory's name is taken for
+ * that mount's directory, and so, at a level that folds case, is any name
+ * foldedFully joins with it that the disk keeps apart, such as `ss` beside a
+ * nested `ß`, `ı` beside a nested `i`, or, on a disk that keeps ignorable
+ * code points, `in\u00adner` beside a nested `inner`. Such a directory, or
  * file, is no mount's: this mount refuses it, naming the nested mount's
  * path, and the nested mount, whose directory it isn't, never sees it. That
  * fails closed, where comparing more strictly than the disk would let this
@@ -840,7 +878,7 @@ function entryName(paths: readonly string[], prefix: string, segment: string): s
  */
 function sameLevel(given: string, name: string, folds: boolean): boolean {
   if (given === name) return true;
-  return folds ? foldedLoosely(given) === foldedLoosely(name) : given.normalize('NFC') === name.normalize('NFC');
+  return folds ? foldedFully(given) === foldedFully(name) : given.normalize('NFC') === name.normalize('NFC');
 }
 
 /**
@@ -878,10 +916,11 @@ const asciiLower = (name: string): string => name.replace(/[A-Z]/g, (c) => c.toL
  * by `folds`), surely lie there: each of `dir`'s levels is matched exactly,
  * or differs only in its ASCII letters' case at a level whose own entries
  * told it folds. Any other match is where the comparison erred toward the
- * nested mount: another normalization form, a pair only foldedLoosely
- * joins, a case difference past ASCII, which a disk with an older folding
- * table may keep apart, or a case difference at a level whose own entries
- * told nothing.
+ * nested mount: another normalization form; a pair only foldedFully joins,
+ * such as `ss` beside `ß`, or a name beside itself with a default-ignorable
+ * code point inside, which a disk that folds case may keep apart; a case
+ * difference past ASCII, which a disk with an older folding table may keep
+ * apart; or a case difference at a level whose own entries told nothing.
  */
 function surelyBeneath(segments: readonly string[], dir: readonly string[], folds: Folding): boolean {
   return segments.length >= dir.length && dir.every((d, i) => segments[i] === d || (folds[i] === true && asciiLower(segments[i]!) === asciiLower(d)));

@@ -203,11 +203,13 @@ export interface MountConfig {
    * mount's directory's name is taken for that directory; so, at a level whose
    * own entries told nothing at start, is a name in another case; and so, at a
    * level that folds case or told nothing, is a name the comparison folds with
-   * it that the disk keeps apart, such as `ss` beside a nested `ß`. Such a
-   * directory, or file, is no mount's, and every tool that names it is refused
-   * as a path that may lie in the nested mount, with the two spellings the
-   * workspace can't tell apart, and, for a link, where it leads, when that lies
-   * in this mount. The answer gives a step for each thing the caller may have
+   * it that the disk keeps apart, such as `ss` beside a nested `ß`, or one that
+   * differs from it only by a default-ignorable code point, such as a soft
+   * hyphen, on a disk that folds case but keeps those. Such a directory, or
+   * file, is no mount's, and every tool that names it is refused as a path
+   * that may lie in the nested mount, with the two spellings the workspace
+   * can't tell apart, and, for a link, where it leads, when that lies in this
+   * mount. The answer gives a step for each thing the caller may have
    * meant: that mount's path to use; for a new file of this mount's, a path
    * outside both spellings; and for one already there, whoever runs the
    * workspace starting it again once the nested mount's directory is made,
@@ -223,16 +225,18 @@ export interface MountConfig {
    * level's folding is read at each start, and beneath a direct mount whose
    * root has moved since, at each call there, so one whose folding changes
    * meanwhile is judged as that read found it; on a disk whose folding goes
-   * past what the comparison folds, or that folds case for some names and not
-   * others, a name the comparison keeps apart can reach the directory; a second
-   * path to the directory that isn't a link, such as a bind mount, isn't found
-   * to lead there, though a walk passes over it, knowing each nested root by
-   * which directory it is; and a nested mount whose root moves while running,
-   * as `acceptRoot` takes, stays placed where it was until the next start; and
-   * where a direct mount's root is repointed between a read's parse and its
-   * open, a race left to whoever writes the disk, a mount nested in it by its
-   * directories alone, since its real root holds that root, can have the read
-   * serve a path in its directory.
+   * past the comparison's, which at a level that folds joins names that differ
+   * only by default-ignorable code points, in normalization form or in case,
+   * in full case folding, as Linux's casefold does, or that folds case for some
+   * names and not others, a name the comparison keeps apart can reach the
+   * directory; a second path to the directory that isn't a link, such as a
+   * bind mount, isn't found to lead there, though a walk passes over it,
+   * knowing each nested root by which directory it is; and a nested mount
+   * whose root moves while running, as `acceptRoot` takes, stays placed where
+   * it was until the next start; and where a direct mount's root is repointed
+   * between a read's parse and its open, a race left to whoever writes the
+   * disk, a mount nested in it by its directories alone, since its real root
+   * holds that root, can have the read serve a path in its directory.
    *
    * Text the host registers for a path (`registerGeneratedTextFile`) is
    * served there whatever the include says, since it isn't one of the
