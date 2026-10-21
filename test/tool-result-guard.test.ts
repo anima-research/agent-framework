@@ -1145,12 +1145,11 @@ test('backward-compatible direct Agent inference also guards tool results', asyn
     const first = await agent.runInference(h.framework.getAllTools());
     assert.equal(first.toolCalls.length, 1);
     agent.provideToolResult('one', { success: true, data: 'direct-original' });
-    const final = await agent.runInference(h.framework.getAllTools());
+    const final = await agent.runInference(h.framework.getAllTools(), undefined, { progressTimeoutMs: 4321 });
     assert.deepEqual(final.speechContent, [{ type: 'text', text: 'continued' }]);
     assert.equal(requests.length, 3);
-    // Each provider call carries the progress deadline, the refusal retry's too.
-    assert.deepEqual(deadlines, [DEFAULT_INFERENCE_PROGRESS_TIMEOUT_MS, DEFAULT_INFERENCE_PROGRESS_TIMEOUT_MS,
-      DEFAULT_INFERENCE_PROGRESS_TIMEOUT_MS]);
+    // Each provider call carries its call's progress deadline, the refusal retry's too.
+    assert.deepEqual(deadlines, [DEFAULT_INFERENCE_PROGRESS_TIMEOUT_MS, 4321, 4321]);
     assert.equal(final.usage?.inputTokens, 20, 'abandoned refused attempt usage is included');
     assert.match(JSON.stringify(requests[1]), /direct-original/);
     assert.doesNotMatch(JSON.stringify(requests[2]), /direct-original|discard-this/);

@@ -110,7 +110,9 @@ export type TraceEvent =
       agentName: string;
       /** The failure's message, bounded as every trace event's `error` is (2,000 characters). */
       error: string;
-      /** Whether membrane classified the failure as retryable (observability). */
+      /** Whether the failure was classified as retryable (observability):
+       *  membrane's classification, or for a progress deadline's expiry the
+       *  framework's, which is retryable since a new stream has its own. */
       retryable?: boolean;
       /**
        * The membrane error type (e.g. 'invalid_request', 'auth', 'context_length'),

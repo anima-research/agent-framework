@@ -4424,7 +4424,7 @@ export class AgentFramework {
    * as a resident's are, so they bind its auxiliary calls too: a held model
    * is refused without a call, and an auxiliary call's own stated wait is
    * recorded for it. (An ephemeral run records nothing, its name being
-   * single-use, so its context manager keeps the plain membrane.) Its
+   * single-use, so its context manager takes membraneWithDeadline.) Its
    * compression is the background work a resident's is, whether a
    * maintenance tick or a drain after a message starts it, so it is withdrawn
    * as a resident's is: a call made while a surgery holds the store, or once
@@ -4442,8 +4442,22 @@ export class AgentFramework {
       }
     });
   }
+  /** The framework's membrane, for a context manager whose compression
+   *  takes no admission (an ephemeral run's, the subconscious's): its
+   *  complete() calls get the progress deadline and nothing else. One
+   *  instance, which all of them share as they shared the plain membrane,
+   *  since context-manager keys a compression's comparison domain and its
+   *  pause by membrane instance (compressionDomain). */
+  private membraneWithDeadline(): Membrane {
+    return this.sharedDeadlineMembrane ??= this.membraneAdmitting((run) => run());
+  }
+  private sharedDeadlineMembrane: Membrane | undefined;
   /** The framework's membrane, with each complete() call passed through
-   *  `admit` along with the model it names. */
+   *  `admit` along with the model it names. A call whose options set no
+   *  `progressTimeoutMs`, such as context-manager's compression, gets the
+   *  framework's (inferenceProgressTimeoutMs), so a stalled compression can't
+   *  hold a resident's next turn behind waitForAuxiliaryIdle forever. A call
+   *  that streams no events is bounded as a whole. */
   private membraneAdmitting(admit: (run: () => Promise<unknown>, model: string | undefined) => Promise<unknown>): Membrane {
     const target = this.membrane as unknown as Record<PropertyKey, unknown>;
     return new Proxy(target, { get: (obj, prop, receiver) => {
@@ -4451,6 +4465,10 @@ export class AgentFramework {
       if (prop === 'complete' && typeof value === 'function') {
         return (...args: unknown[]) => {
           const model = (args[0] as { config?: { model?: unknown } } | undefined)?.config?.model;
+          const options = args[1] as { progressTimeoutMs?: number } | undefined;
+          if (options?.progressTimeoutMs === undefined) {
+            args[1] = { ...options, progressTimeoutMs: this.inferenceProgressTimeoutMs };
+          }
           return admit(() => Reflect.apply(value, this.membrane, args) as Promise<unknown>,
             typeof model === 'string' ? model : undefined);
         };
@@ -8238,7 +8256,7 @@ export class AgentFramework {
         namespace,
         isolate: true,
         strategy: config.strategy ?? new PassthroughStrategy(),
-        membrane: this.membrane,
+        membrane: this.membraneWithDeadline(),
         debugLogContext: !!process.env.DEBUG_CONTEXT,
       });
 
@@ -11432,7 +11450,7 @@ export class AgentFramework {
       // UNfiltered (no viewFilter here — stamped messages included).
       auxiliaryMessageViews: [{}],
       strategy,
-      membrane: this.membrane,
+      membrane: this.membraneWithDeadline(),
       debugLogContext: !!process.env.DEBUG_CONTEXT,
     });
 
@@ -17904,16 +17922,16 @@ export class AgentFramework {
         this.touchEphemeralRun(agent.name, true);
         // A provider call that went inferenceProgressTimeoutMs without a
         // parsed event (membrane's progressTimeoutMs) ends the stream as
-        // `aborted` with reason 'timeout'. Unless the framework recorded a
-        // cancel of this stream (frameworkCancelledStreams: a tool's endTurn,
-        // a budget restart, a quiesce abandon), that is a failed request, so
-        // it takes the `error` path: the error policy retries it, and a fresh
-        // stream gets a fresh deadline. A stall that persists exhausts the
-        // turn with its reason.
+        // `aborted` with reason 'timeout'. That is a failed request, so it
+        // takes the `error` path. There a cancel recorded for this stream
+        // still ends it as that cancel: the framework's (an endTurn, a budget
+        // restart, a quiesce abandon, stop()) or a caller's (abortInference).
+        // Otherwise the error policy retries it, and a fresh stream gets a
+        // fresh deadline. A stall that persists exhausts the turn with its
+        // reason.
         // Membrane types the expiry as non-retryable because that deadline
         // belongs to the one call; a new stream is a new call with its own.
         const event = arrived.type === 'aborted' && arrived.reason === 'timeout'
-          && !this.frameworkCancelledStreams.has(`${agent.name}:${myStreamId}`)
           ? {
               type: 'error' as const,
               error: new MembraneError({
@@ -19086,10 +19104,9 @@ export class AgentFramework {
                 return;
               }
             }
-            // A progress deadline's 'timeout' with no recorded cancel took the
-            // `error` path at the loop's head. Any other abort no recorded
-            // cancel explains, such as an operator's abortInference or stop(),
-            // settles the turn here.
+            // A progress deadline's 'timeout' took the `error` path at the
+            // loop's head. Any other abort the framework didn't record settles
+            // the turn here, a caller's abortInference ('user') included.
             const reason = event.reason ?? 'unknown';
             // Membrane (>= 0.5.81) reports reason 'user' exactly when the
             // request's signal was aborted, i.e. someone called cancel():

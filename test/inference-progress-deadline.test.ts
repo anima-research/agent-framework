@@ -6,7 +6,8 @@
  * provider that holds a stream open with keepalives while generating nothing
  * hangs a resident with no error, no retry and no trace. These tests pin where
  * the framework sets it (each agent turn, the direct Agent API, MCPL servers'
- * inference requests) and what an expiry does: a retryable timeout through the
+ * inference requests, context-manager's compression calls through the membrane
+ * the framework hands it) and what an expiry does: a retryable timeout through the
  * error policy, and an exhaustion with its reason if the stall persists. How
  * the deadline renews and expires is membrane's, and its tests pin that.
  */
@@ -15,7 +16,7 @@ import assert from 'node:assert/strict';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import type { AbortedResponse, NormalizedRequest, NormalizedResponse, StreamEvent, YieldingStream } from '@animalabs/membrane';
+import type { AbortedResponse, Membrane, NormalizedRequest, NormalizedResponse, StreamEvent, YieldingStream } from '@animalabs/membrane';
 import { MembraneError, TimeoutAbortError } from '@animalabs/membrane';
 import type {
   ErrorAction,
@@ -265,6 +266,31 @@ test('a stall that persists through the retries exhausts the turn with its reaso
     assert.equal(exhausted[0]!.retryable, true);
     assert.equal(traces.filter((t) => t.type === 'inference:failed').length, 3);
     await waitFor('the agent to go idle', () => framework.getAgent('agent')?.state.status === 'idle');
+
+    // The resident is told the reason, without the advice to change what it sends.
+    const markers = () => framework.getAgent('agent')!.getContextManager().queryMessages({}).messages
+      .flatMap((m) => m.content)
+      .filter((b): b is { type: 'text'; text: string } => b.type === 'text' && b.text.startsWith('[inference-failed]'));
+    await waitFor('the marker', () => markers().length === 1);
+    assert.match(markers()[0]!.text, /\(timeout\).* Reason: No stream progress within 1234ms \(inferenceProgressTimeoutMs\)\.$/);
+  });
+});
+
+test("an ephemeral run whose stream ends on its deadline is retried, then rejects with the deadline's message", async () => {
+  const membrane = new RecordingMembrane();
+  for (let i = 0; i < 2; i++) membrane.streams.push(() => new ExpiredStream());
+  const policy = recordingPolicy(1);
+  await withFramework(membrane, { errorPolicy: policy, inferenceProgressTimeoutMs: 1234 }, async (framework) => {
+    const created = await framework.createEphemeralAgent({ name: 'ephemeral', model: 'test-model', systemPrompt: 'test' });
+    created.contextManager.addMessage('user', [{ type: 'text', text: 'hello' }]);
+    const run = framework.runEphemeralToCompletion(created.agent, created.contextManager);
+    framework.start();
+    await assert.rejects(
+      within(5_000, 'the run to settle', run),
+      (error: unknown) => error instanceof Error && error.message === 'No stream progress within 1234ms (inferenceProgressTimeoutMs)',
+    );
+    assert.deepEqual(policy.seen.map((s) => s.attempt), [0, 1]);
+    assert.deepEqual(membrane.options.map((o) => o?.progressTimeoutMs), [1234, 1234]);
   });
 });
 
@@ -338,7 +364,75 @@ test("a deadline that expires as the framework ends the turn itself stays the fr
   });
 });
 
-test('the direct Agent API carries the deadline on each call: the default, or the call\'s own', async () => {
+test("a deadline that expires as an operator stops the turn ends as that stop, not as a failure", async () => {
+  // abortInference records the caller's cancel and cancels the stream, whose
+  // abort then says 'timeout', as when the deadline fired first. The error
+  // path reads the recorded cancel before any failure accounting, so the stop
+  // stands: no retry, no failure, one inference:aborted with its reason.
+  class StopRace implements YieldingStream {
+    private wake: (() => void) | null = null;
+    private cancelled = false;
+    cancel(): void { this.cancelled = true; this.wake?.(); }
+    provideToolResults(): void {}
+    get isWaitingForTools() { return false; }
+    get pendingToolCallIds(): string[] { return []; }
+    get toolDepth() { return 0; }
+    async *[Symbol.asyncIterator](): AsyncIterator<StreamEvent> {
+      if (!this.cancelled) await new Promise<void>((resolve) => { this.wake = resolve; });
+      yield { type: 'aborted', reason: 'timeout' } as StreamEvent;
+    }
+  }
+  const membrane = new RecordingMembrane();
+  membrane.streams.push(() => new StopRace());
+  const policy = recordingPolicy(1);
+  await withFramework(membrane, { errorPolicy: policy }, async (framework, traces) => {
+    framework.start();
+    framework.nudgeAgent('agent', 'operator');
+    await waitFor('the stream to start', () => membrane.calls.length === 1);
+    await waitFor('the agent to hold the stream', () => 'stream' in framework.getAgent('agent')!.state);
+    assert.equal(framework.abortInference('agent', 'operator_stop'), true);
+    await waitFor('the stop to settle', () => traces.some((t) => t.type === 'inference:aborted'));
+
+    assert.deepEqual(policy.seen, []);
+    assert.deepEqual(
+      traces.filter((t) => t.type === 'inference:aborted').map((t) => (t as { reason?: string }).reason),
+      ['operator_stop'],
+    );
+    assert.equal(traces.some((t) => t.type === 'inference:failed' || t.type === 'inference:exhausted'), false);
+    assert.equal(membrane.calls.length, 1);
+  });
+});
+
+test("context-manager's compression calls carry the framework's deadline unless they set their own", async () => {
+  // Context-manager calls membrane.complete(request, { formatter, signal })
+  // on the membrane the framework hands it. A hung call there would hold the
+  // resident's next turn behind its auxiliary work.
+  const membrane = new RecordingMembrane();
+  await withFramework(membrane, { inferenceProgressTimeoutMs: 1234, subconscious: { enabled: true, systemPrompt: 'test' } }, async (framework) => {
+    const membraneOf = (contextManager: unknown) => (contextManager as { membrane: Membrane }).membrane;
+    const request = { messages: [], config: { model: 'test-model' } } as unknown as NormalizedRequest;
+    const resident = membraneOf(framework.getAgent('agent')!.getContextManager());
+    const first = await framework.createEphemeralAgent({ name: 'ephemeral-1', model: 'test-model', systemPrompt: 'test' });
+    const second = await framework.createEphemeralAgent({ name: 'ephemeral-2', model: 'test-model', systemPrompt: 'test' });
+    const signal = new AbortController().signal;
+
+    await resident.complete(request, { formatter: 'native', signal } as never);
+    await membraneOf(first.contextManager).complete(request);
+    await resident.complete(request, { progressTimeoutMs: 99 } as never);
+    assert.deepEqual(membrane.options, [
+      { formatter: 'native', signal, progressTimeoutMs: 1234 },
+      { progressTimeoutMs: 1234 },
+      { progressTimeoutMs: 99 },
+    ]);
+    // Ephemeral runs and the subconscious share one membrane instance, as
+    // they shared the plain one: context-manager keys a compression's
+    // comparison domain by it.
+    assert.equal(membraneOf(first.contextManager), membraneOf(second.contextManager));
+    assert.equal(membraneOf(framework.getAgent('Subconscious')!.getContextManager()), membraneOf(first.contextManager));
+  });
+});
+
+test('the direct Agent API carries the deadline on each call, the default or the call\'s own, and refuses one membrane would read as none', async () => {
   const membrane = new RecordingMembrane();
   await withFramework(membrane, {}, async (framework) => {
     const agent = framework.getAgent('agent')!;
@@ -353,6 +447,11 @@ test('the direct Agent API carries the deadline on each call: the default, or th
       );
       assert.equal(agent.state.status, 'idle', 'a refused call leaves the agent as it was');
     }
+    await assert.rejects(
+      agent.startStreamWithInjections(framework.getAllTools(), undefined, undefined, framework.getAllTools(), { progressTimeoutMs: -1 }),
+      (error: unknown) => error instanceof RangeError && error.message.startsWith('progressTimeoutMs must be'),
+    );
+    assert.equal(agent.state.status, 'idle', 'a refused stream leaves the agent as it was');
     const started = await agent.startStream(framework.getAllTools());
     started.stream.cancel();
     assert.deepEqual(
