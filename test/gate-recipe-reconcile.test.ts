@@ -306,6 +306,18 @@ describe("EventGate's starts, through gate.json and the recipe kept beside it", 
     }
   });
 
+  it('merges against a record saved with a BOM, as gate.json is read', () => {
+    start(recipe1).gate.dispose();
+    writeFileSync(lastRecipePath(configPath), '\uFEFF' + JSON.stringify(recorded(), null, 2));
+    const { gate, logged } = start(recipe2);
+    try {
+      assert.deepStrictEqual(logged, ['[gate] the recipe was applied to gate.json: added agents; removed zoo, sync; updated dm']);
+      assert.deepStrictEqual(names(onDisk()), ['dm', 'agents', 'catch-all']);
+    } finally {
+      gate.dispose();
+    }
+  });
+
   it('starts on the old appended gate.json with no record: removes nothing, says what differs, and records the recipe', () => {
     // What the old appending left after recipe1 and then recipe2.
     mkdirSync(join(dir, '_config'), { recursive: true });

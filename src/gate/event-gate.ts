@@ -282,11 +282,11 @@ function behaviorFingerprint(b: import('./types.js').GateBehavior): string {
 // ---------------------------------------------------------------------------
 
 /**
- * Write `value` as JSON to `path` in place, as writeConfig writes gate.json at
- * every run-time edit, so a link, the owner and the mode stay as they are. A
- * stop mid-write fails safe: a torn gate.json doesn't load, so the next start
- * merges and records nothing and says so, and a torn record reads as one that
- * doesn't, so the next start merges as a first start does.
+ * Write `value` as JSON to `path` in place, for the start's writes and for
+ * writeConfig's at every run-time edit, so a link, the owner and the mode stay
+ * as they are. A stop mid-write fails safe: a torn gate.json doesn't load, so
+ * the next start merges and records nothing and says so, and a torn record
+ * reads as one that doesn't, so the next start merges as a first start does.
  */
 function writeJson(path: string, value: unknown): void {
   writeFileSync(path, JSON.stringify(value, null, 2) + '\n');
@@ -303,7 +303,7 @@ function readLastRecipe(path: string): { recipe: GateConfig | null; problem?: st
   if (!existsSync(path)) return { recipe: null };
   let raw: unknown;
   try {
-    raw = JSON.parse(readFileSync(path, 'utf-8'));
+    raw = parseGateJson(readFileSync(path, 'utf-8'));
   } catch (err) {
     const code = (err as NodeJS.ErrnoException).code;
     return { recipe: null, problem: code ? `reading it failed with ${code}` : "it isn't JSON" };
@@ -1066,7 +1066,7 @@ export class EventGate {
    */
   private writeConfig(config: GateConfig): void {
     mkdirSync(dirname(this.configPath), { recursive: true });
-    writeFileSync(this.configPath, JSON.stringify(config, null, 2) + '\n');
+    writeJson(this.configPath, config);
     this.config = config;
     this.compiledPolicies = this.compilePolicies(config);
     this.refreshShadowWarnings('policy-mutation');
