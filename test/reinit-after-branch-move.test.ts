@@ -740,7 +740,11 @@ describe('after a branch move, every agent on the store compiles without a resta
       assert.equal(longHoldAlerts().length, 1, JSON.stringify(longHoldAlerts()));
       const [alert] = longHoldAlerts();
       assert.equal(alert!.agentName, 'a');
-      assert.ok(((alert!.data as { heldMs?: number }).heldMs ?? 0) >= 1_000, JSON.stringify(alert!.data));
+      // The alert comes at its threshold, not before. The hold is measured
+      // by Date.now() and the timer runs on libuv's clock, each to the whole
+      // millisecond, so it can read just under 1,000 (as tool-result-guard's
+      // duration check allows).
+      assert.ok(((alert!.data as { heldMs?: number }).heldMs ?? 0) >= 1_000 - 5, JSON.stringify(alert!.data));
       assert.match(alert!.message, /^The rollback has held the store for \d+ s, so no turn starts .* The rollback is for a, and is waiting for maintenance work that was already running to finish\.$/);
       const data = alert!.data as { verb?: string; reinitializing?: string; waitingForMaintenance?: boolean };
       assert.equal(data.verb, 'roll back');
