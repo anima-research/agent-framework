@@ -108,8 +108,10 @@ export type HeadEvent =
   | { type: 'head:declared'; removed: string[]; defined: string[]; addedSystem: number }
   | {
       type: 'head:moved';
-      why: 'adopted' | 'replaced' | 'on-head';
+      why: 'adopted' | 'replaced' | 'consolidated' | 'on-head';
       changesRemoved: number;
+      changeTokens?: number;
+      inputTokens?: number;
     };
 
 /** The difference between a head with its changes and what the agent advertises now. */
