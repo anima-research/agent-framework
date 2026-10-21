@@ -27090,7 +27090,12 @@ export class AgentFramework {
     const fork = this.conversationAgentHomes.has(agentName);
     if (fork || this.ephemeralRuns.has(agentName)) {
       const one = fork ? 'conversation' : 'run';
+      // Only where the fork can follow it: skip_reply needs the channel
+      // registry, which a fork made from an event pushed straight to the
+      // framework (pushEvent, with no MCPL server) doesn't have, and a
+      // closing fork's wake ends with it.
       const comeBack = fork && this.channelRegistry && this.canAgentUseTool(agentName, 'skip_reply')
+        && !this.closingConversationAgents.has(agentName)
         ? ' To come back to this conversation later, call skip_reply with wake_in_seconds.'
         : '';
       const error = call.name === 'sleep'
