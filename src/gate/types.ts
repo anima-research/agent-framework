@@ -155,7 +155,14 @@ export interface GateConfig {
 export interface GateOptions {
   /** Path to gate.json. Default: derived from storePath. */
   configPath?: string;
-  /** Initial config, seeded to gate.json if the file doesn't exist. */
+  /**
+   * The recipe's gate config. The first start seeds gate.json with it. Each
+   * later start merges it into gate.json against the recipe last applied,
+   * which the gate keeps beside gate.json (`gate.recipe.json`): a rule the
+   * recipe dropped, renamed, moved or redefined follows it, a rule edited at
+   * run time or by hand stays, and so does one no recipe declared. See
+   * `recipe-reconcile.ts`.
+   */
   config?: GateConfig;
   /**
    * Path to a JSON file listing user ids that may wake the agent even while

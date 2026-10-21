@@ -11,10 +11,11 @@
  * inference tokens, not whether the agent should know about the event.
  */
 
-import { existsSync, readFileSync, statSync, writeFileSync, mkdirSync } from 'node:fs';
+import { existsSync, readFileSync, renameSync, statSync, writeFileSync, mkdirSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { GateScript } from './gate-script.js';
 import { MAX_TIMER_MS } from '../deadline-timer.js';
+import { canonical, lastRecipePath, reconcileLine, reconcileWithRecipe } from './recipe-reconcile.js';
 import { safeSlice } from '../safe-slice.js';
 
 import type { ToolDefinition } from '../types/events.js';
@@ -279,6 +280,26 @@ function behaviorFingerprint(b: import('./types.js').GateBehavior): string {
 // ---------------------------------------------------------------------------
 // Config validation
 // ---------------------------------------------------------------------------
+
+/** Write `value` as JSON to `path` whole: a reader sees the old file or the new one, never part. */
+function writeWhole(path: string, value: unknown): void {
+  const temp = `${path}.${process.pid}.tmp`;
+  writeFileSync(temp, JSON.stringify(value, null, 2) + '\n');
+  renameSync(temp, path);
+}
+
+/**
+ * The recipe the gate last applied, or null when it has none on record, or
+ * the record doesn't read: a start then keeps every rule, as the first does.
+ */
+function readLastRecipe(path: string): GateConfig | null {
+  if (!existsSync(path)) return null;
+  try {
+    return validateConfig(JSON.parse(readFileSync(path, 'utf-8')));
+  } catch {
+    return null;
+  }
+}
 
 function validateConfig(raw: unknown): GateConfig {
   if (!raw || typeof raw !== 'object') {
@@ -671,34 +692,40 @@ export class EventGate {
 
     // Seed or reconcile the on-disk config.
     //
-    // First start: write `initialConfig` verbatim.
-    // Subsequent starts: if the recipe/config source declares policies that
-    // aren't yet in gate.json (e.g. the user edited the recipe between
-    // sessions), append them by name. Existing policies are left alone so
-    // user edits via `workspace--edit _config/gate.json` survive.
-    // The `default` field is not reconciled — it's an explicit operator
-    // choice and a recipe change shouldn't silently flip live wake
-    // behavior for a session that's already been running.
+    // First start: write `initialConfig` verbatim, and record it as the
+    // recipe last applied, beside gate.json.
+    // Later starts: merge the recipe into gate.json against the recipe last
+    // applied (recipe-reconcile.ts), so a rule the recipe dropped, renamed,
+    // moved or redefined follows it, while a rule edited at run time or by
+    // `workspace--edit _config/gate.json`, and one no recipe declared, stays.
+    // `default` follows the same rule: an unedited one takes the recipe's.
+    // gate.json is written first and the recipe after it, each whole, so a
+    // stop between the two leaves the next start a state it reads rightly:
+    // the other order would make the old recipe's definitions read as edits.
+    // A gate.json that doesn't load is left alone, with nothing recorded.
     if (opts.initialConfig) {
       try {
         mkdirSync(dirname(this.configPath), { recursive: true });
+        const recipePath = lastRecipePath(this.configPath);
         if (!existsSync(this.configPath)) {
           writeFileSync(this.configPath, JSON.stringify(opts.initialConfig, null, 2) + '\n');
+          writeWhole(recipePath, validateConfig(opts.initialConfig));
         } else {
           const existing = this.loadConfig();
           if (existing) {
-            const existingNames = new Set(existing.policies.map(p => p.name));
-            const missing = opts.initialConfig.policies.filter(p => !existingNames.has(p.name));
-            if (missing.length > 0) {
-              const reconciled: GateConfig = {
-                ...existing,
-                policies: [...existing.policies, ...missing],
-              };
-              writeFileSync(this.configPath, JSON.stringify(reconciled, null, 2) + '\n');
+            const recipe = validateConfig(opts.initialConfig);
+            const last = readLastRecipe(recipePath);
+            const { config, changes } = reconcileWithRecipe(existing, recipe, last);
+            if (canonical(config) !== canonical(existing)) writeWhole(this.configPath, config);
+            if (!last || canonical(last) !== canonical(recipe)) writeWhole(recipePath, recipe);
+            const line = reconcileLine(changes);
+            if (line) {
+              console.log(line);
               opts.emitTrace({
                 type: 'gate:config-reconciled',
                 configPath: this.configPath,
-                addedPolicies: missing.map(p => p.name),
+                addedPolicies: changes.added,
+                ...changes,
                 timestamp: Date.now(),
               });
             }
@@ -1357,16 +1384,8 @@ export class EventGate {
     return { trigger, policyName: null, behavior: this.config.default ?? 'always' };
   }
 
-  /**
-   * Probe a canonical set of synthetic chat/heartbeat events and report which
-   * rule wins each and whether it would wake. Backs the before/after table in
-   * the wake_add_rule result — the point where a rule change's real semantics
-   * must become legible (af#105; the Mythos stand-back-density incident would
-   * have been visible as `dm: discord-direct-address → stand-back-density`).
-   * Probes are representative shapes, not an exhaustive event space — rules
-   * keyed on specific channels/mounts may not match any probe.
-   */
-  probeTable(): GateProbeRow[] {
+  /** The canonical synthetic events the probe table runs: chat shapes as MCPL delivers them, and a heartbeat. */
+  private probeEvents(): Array<{ label: string; info: GateEventInfo }> {
     const chat = (
       label: string,
       eventType: string,
@@ -1412,8 +1431,34 @@ export class EventGate {
         } as GateEventInfo,
       },
     ];
+    return probes;
+  }
 
-    return probes.map(({ label, info }) => {
+  /**
+   * The rules no probe event matches, such as one scoped to an event type
+   * the probes don't model (`external-message`, how a module's messages are
+   * gated): the probe table can't show what they do, so a result that shows
+   * the table names them rather than let its rows read as their effect.
+   */
+  probeUnreached(): string[] {
+    const events = this.probeEvents().map(({ info }) => info);
+    return this.compiledPolicies
+      .filter((compiled) => !events.some((info) => this.compiledMatches(compiled, info)))
+      .map((compiled) => compiled.policy.name);
+  }
+
+  /**
+   * Probe a canonical set of synthetic chat/heartbeat events and report which
+   * rule wins each and whether it would wake. Backs the before/after table in
+   * the wake_add_rule result — the point where a rule change's real semantics
+   * must become legible (af#105; the Mythos stand-back-density incident would
+   * have been visible as `dm: discord-direct-address → stand-back-density`).
+   * Probes are representative shapes, not an exhaustive event space — rules
+   * keyed on specific channels/mounts, or on other event types, may not match
+   * any probe; `probeUnreached` names those.
+   */
+  probeTable(): GateProbeRow[] {
+    return this.probeEvents().map(({ label, info }) => {
       const d = this.probe(info);
       return {
         probe: label,
