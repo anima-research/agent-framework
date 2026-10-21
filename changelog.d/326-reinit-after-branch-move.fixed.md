@@ -13,7 +13,8 @@
   host restarted. A manager whose re-initialization fails raises an ops
   alert, `context-reinit-failed`, naming its agent and the move; it is
   logged and traced each time, and the alert webhook posts it at most once
-  per agent and kind in 15 minutes, as it does every kind. Each alert says
+  per agent and kind in 15 minutes, as it does any alert without a key of
+  its own. Each alert says
   what happened and what to do or what happens next first, within the start
   the webhook keeps of a long message, whatever the branches it names, then
   what becomes of the writes, and its cause last.
@@ -23,9 +24,10 @@
   writes kept queued for it meanwhile, at resume on a quiesced host, or a
   restart does, which loses those
   writes unless the deferral queue is persisted, as quiescing the host
-  before it stops does. A restart doesn't create a conversation agent again:
-  its channel's next qualifying message spawns a new fork, which gets none
-  of the writes queued for it. `stop()` says how many writes it leaves queued for
+  before it stops does. A restart doesn't create a conversation agent or a
+  run again: a conversation agent's channel's next qualifying message
+  spawns a new fork, which gets none of the writes queued for it, and the
+  alerts say a restart ends the agent. `stop()` says how many writes it leaves queued for
   an agent whose store didn't take them, and whether they're kept for boot.
   That line, and its line for writes left queued behind a stream still
   running, now say the persisted queue's record is behind, rather than that
@@ -33,7 +35,8 @@
   The move itself stands. A rollback or suppression whose switch back to the
   source branch fails as well raises the same alert for the agent it named,
   and says which branch the store is on, and whether the agent's manager
-  refuses its work there or, after a suppression whose removals failed and
+  refuses its work there, where a restart would serve it from the branch
+  the store is on, or, after a suppression whose removals failed and
   whose switch back couldn't select the source, is current on the
   suppression's branch, which its fork initialized it for, and serves from
   there until a `switchBranch()` moves it. A rollback or suppression refused
@@ -48,7 +51,9 @@
   the store is still up after 60 s raises one `store-held-long` ops alert.
   It names the move and the agent it was for, and the manager its pass is
   re-initializing or the maintenance it's waiting for, and says what a
-  restart costs. It's raised for every move that holds the store: a
+  restart does: it ends the conversation agents and runs, and re-initializes
+  the configured agents, whose queued writes outlast the process only in a
+  persisted deferral queue. It's raised for every move that holds the store: a
   rollback, a suppression and a branch switch, as well as an undo or redo.
 - **A conversation agent with no stored message of its own on the branch
   the store moves to is seeded again from the template,** as one spawned
@@ -68,12 +73,12 @@
   the template is missing or failed to re-initialize, is disposed rather than left to
   answer with no history: `context-reinit-failed` says so and why. The
   writes held for it while the store was held go with it: its window's
-  release stores what its store takes of them there, now or at resume on a
-  quiesced host, and passes any failed reply on to the primary agent. A stop
-  before that resume leaves them queued, and the restarted host drops them
-  when it resumes, if its persisted queue kept them, passing any failed
-  reply on too. The alert says how many, since the fork its channel spawns
-  next, under a new name, doesn't get them. If
+  release stores what its store takes of them there and passes any failed
+  reply on to the primary agent. On a quiesced host that release waits for
+  the resume, and a `stop()` before the resume passes a failed reply on and
+  drops the rest, logged. The alert says how many, and which of these
+  happened, since the fork its channel spawns next, under a new name,
+  doesn't get them. If
   disposing it fails partway, the alert says that too, and the move's other
   conversation agents are still seeded. Its channel's next qualifying message spawns a
   fresh one, unless its seeding

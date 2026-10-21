@@ -1954,56 +1954,66 @@ type TemplateRemedy = (typeof TEMPLATE_REMEDIES)[keyof typeof TEMPLATE_REMEDIES]
  *  can't store it, and a quiesced host defers it again until its resume. */
 const STORES_QUEUED_WRITES = 'stores its queued writes, at resume on a quiesced host';
 
+/** Which agents a restart creates again (AgentFramework.agentKind). A
+ *  configured agent, one of the config's agents or its subconscious, is
+ *  created again by create(). A conversation agent isn't: stop() ends each
+ *  live fork, and the router's bindings are in memory, so its channel's next
+ *  qualifying message spawns a new one. A run isn't either: stop() ends each
+ *  run, and nothing starts it again. */
+export type AgentKind = 'configured' | 'conversation' | 'run';
+
 /** What a restart does to an agent whose manager refuses its work. A
- *  configured agent is created again and re-initialized, but the writes
- *  queued for it outlast the process only in a persisted deferral queue. A
- *  conversation agent isn't created again, since the router's bindings are
- *  in memory: its channel's next qualifying message spawns a new fork. */
-function restartClause(conversationAgent: boolean): string {
-  return conversationAgent
-    ? "a restart ends it, and its channel's next qualifying message spawns a new fork."
+ *  configured agent is created again and re-initialized on the branch the
+ *  store is on, but the writes queued for it outlast the process only in a
+ *  persisted deferral queue. With `elsewhere`, the store is on a branch the
+ *  agent shouldn't run on, which a restart would serve it from, and the
+ *  writes' loss is left to the alert's message, past its opening. */
+function restartClause(kind: AgentKind, elsewhere = false): string {
+  if (kind === 'conversation') return "a restart ends it, and its channel's next qualifying message spawns a new fork.";
+  if (kind === 'run') return 'a restart ends the run.';
+  return elsewhere
+    ? 'a restart re-initializes it on the branch the store is on instead.'
     : 'a restart re-initializes it too, but loses them unless the deferral queue is persisted.';
 }
 
 /** What follows a refusing manager's opening: what its refusal covers, and,
  *  for a configured agent, what keeps its queued writes past a stop; for a
  *  conversation agent, that the fork its channel spawns next gets none. */
-function refusalDetail(conversationAgent: boolean): string {
-  return ' The work it refuses includes compiles and message writes' + (conversationAgent
+function refusalDetail(kind: AgentKind): string {
+  return ' The work it refuses includes compiles and message writes' + (kind === 'conversation'
     ? ', and a fork its channel spawns after a restart gets none of the writes queued for this one.'
-    : '. Quiescing the host before it stops persists the deferral queue.');
+    : kind === 'run' ? '.' : '. Quiescing the host before it stops persists the deferral queue.');
 }
 
 /** The alert for an agent whose manager failed to re-initialize after a move. */
-export function refusedWorkAlert(move: ReinitMove, conversationAgent: boolean, cause: string): ReinitAlertText {
+export function refusedWorkAlert(move: ReinitMove, kind: AgentKind, cause: string): ReinitAlertText {
   const opening = `The ${move} moved the store's branch, and this agent's context manager failed to re-initialize. ` +
     `It refuses its work until switchBranch() to the current branch re-initializes it and ${STORES_QUEUED_WRITES}; ` +
-    restartClause(conversationAgent);
-  return { opening, message: `${opening}${refusalDetail(conversationAgent)} Its re-initialization failed: ${cause}.` };
+    restartClause(kind);
+  return { opening, message: `${opening}${refusalDetail(kind)} Its re-initialization failed: ${cause}.` };
 }
 
 /** The alert for the agent a failed rollback or suppression named, whose
  *  restore of the store's branch failed too (restoreSourceBranch): it put the
  *  store back on `source` but the manager failed to re-initialize there
  *  (`selected`), or it couldn't, and the store is still on `now`, where the
- *  manager refuses its work, or is current (`managerCurrent`) and serves. */
+ *  manager refuses its work, or, after a suppression's fork whose removals
+ *  failed, is current (`managerCurrent`) and serves. */
 export function restoreAlert(restore: {
-  move: 'rollback' | 'suppression';
   source: string;
   now: string;
   selected: boolean;
-  managerCurrent: boolean;
-  conversationAgent: boolean;
+  kind: AgentKind;
   cause: string;
-}): ReinitAlertText {
-  const { move, source, now, selected, managerCurrent, conversationAgent, cause } = restore;
+} & ({ move: 'rollback'; managerCurrent?: false } | { move: 'suppression'; managerCurrent: boolean })): ReinitAlertText {
+  const { move, source, now, selected, managerCurrent, kind, cause } = restore;
   if (selected) {
     const opening = `The ${move} failed and the store was put back, but this agent's context manager failed to re-initialize. ` +
       `It refuses its work until switchBranch() to the current branch re-initializes it and ${STORES_QUEUED_WRITES}; ` +
-      restartClause(conversationAgent);
+      restartClause(kind);
     return {
       opening,
-      message: `${opening}${refusalDetail(conversationAgent)} The store is on ${source}. Its re-initialization failed: ${cause}.`,
+      message: `${opening}${refusalDetail(kind)} The store is on ${source}. Its re-initialization failed: ${cause}.`,
     };
   }
   const where = ` The store is on ${now}, and the restore to ${source} failed: ${cause}.`;
@@ -2015,22 +2025,26 @@ export function restoreAlert(restore: {
   }
   const opening = `The ${move} failed and the store couldn't be put back, so this agent's context manager refuses its work ` +
     `until switchBranch() to the branch it should run on re-initializes it and ${STORES_QUEUED_WRITES}; ` +
-    restartClause(conversationAgent);
-  return { opening, message: `${opening}${refusalDetail(conversationAgent)}${where}` };
+    restartClause(kind, true);
+  const loss = kind === 'configured' ? ' A restart loses its queued writes unless the deferral queue is persisted.' : '';
+  return { opening, message: `${opening}${loss}${refusalDetail(kind)}${where}` };
 }
 
 /** The alert for a conversation agent a move emptied that couldn't be seeded
  *  again, and so was disposed (reinitializeManagers). `remedy` is what lets
  *  its channel spawn again when the cause stops that too; `heldWrites`, the
- *  writes queued for it while the store was held, which went with it. */
+ *  writes queued for it while the store was held, which went with it, and
+ *  `releasePostponed`, whether its window's release waits for a resume, as
+ *  on a quiesced host (releaseWindowNowOrAfterResume), or has run. */
 export function disposalAlert(disposal: {
   move: ReinitMove;
   remedy?: TemplateRemedy;
   cleanupFailed?: string;
   heldWrites?: number;
+  releasePostponed?: boolean;
   cause: string;
 }): ReinitAlertText {
-  const { move, remedy, cleanupFailed, heldWrites = 0, cause } = disposal;
+  const { move, remedy, cleanupFailed, heldWrites = 0, releasePostponed = false, cause } = disposal;
   const opening = `The ${move} left this conversation agent with no messages of its own, and it couldn't be seeded again, so ` +
     (cleanupFailed
       ? 'it was unregistered and its channel unbound, but its cleanup failed (below). '
@@ -2043,13 +2057,16 @@ export function disposalAlert(disposal: {
   const held = heldWrites === 0
     ? ''
     : cleanupFailed
-      ? ` ${writes} held for it while the store was held may be in its window or still queued under its name, ` +
-        'as far as that cleanup got, where no agent reads them.'
+      ? ` ${writes} held for it while the store was held may be in its window, where no agent reads ${them}, or ` +
+        'still queued under its name, as far as that cleanup got. A flush that meets one still queued passes a ' +
+        'failed reply on to the primary agent and drops anything else, logged.'
       : ` ${writes} held for it while the store was held ${heldWrites === 1 ? 'goes' : 'go'} with it, so that fork ` +
-        `doesn't get ${them}: its window's release stores what its store takes of ${them} there, now or at resume on ` +
-        `a quiesced host, and passes any failed reply on to the primary agent. A stop before that resume leaves ` +
-        `${them} queued, and the restarted host drops ${them} when it resumes, if its persisted queue kept ${them}, ` +
-        'passing any failed reply on too.';
+        `doesn't get ${them}: ` + (releasePostponed
+          ? `its window's release, at the host's resume, stores what its store takes of ${them} there and passes any ` +
+            `failed reply on to the primary agent. A stop() before the resume passes a failed reply on and drops the ` +
+            'rest, logged.'
+          : `its window's release stored what its store took of ${them} there and passed any failed reply on to the ` +
+            'primary agent.');
   return {
     opening,
     message: `${opening} That fork is seeded from the template, under a new name.${held} ` +
@@ -2081,6 +2098,9 @@ const MOVE_NOUNS: Readonly<Record<string, string>> = {
  *  conversation agent the move emptied that couldn't be seeded again. */
 interface ManagerReinitFailure {
   agentName: string;
+  /** What a restart does to the agent, taken when it failed, since a fork can
+   *  be disposed before the failure is reported. */
+  kind: AgentKind;
   error: string;
   /** A conversation agent the move emptied that couldn't be seeded again:
    *  disposed, and `error` says why. */
@@ -2099,6 +2119,9 @@ interface ManagerReinitFailure {
    *  the store was. Its window's release takes them: it stores what its store
    *  accepts there, and passes a failed reply on to the primary. */
   heldWrites?: number;
+  /** For a disposal: its window's release waits for the host's resume
+   *  (releaseWindowNowOrAfterResume postponed it). */
+  releasePostponed?: true;
 }
 
 /** The start of what a tool answered, for naming a call its script stopped waiting for: its first text, or its blocks' count. */
@@ -10730,7 +10753,7 @@ export class AgentFramework {
         const cm = agent.getContextManager();
         await cm.setStrategy(cm.getStrategy());
       } catch (error) {
-        failures.push({ agentName, error: failureDescription(error) });
+        failures.push({ agentName, kind: this.agentKind(agentName), error: failureDescription(error) });
       } finally {
         if (hold) delete hold.reinitializing;
       }
@@ -10747,8 +10770,8 @@ export class AgentFramework {
    * running when the move took the store, which the move waits for before it
    * goes on (no maintenance starts while the store is held). Until the hold
    * is released no turn starts, and the writes it defers wait in the queue,
-   * so it says what a restart costs. The release clears its timer, so it
-   * comes at most once for a hold.
+   * so it says what a restart costs, by the agents' kinds (AgentKind). The
+   * release clears its timer, so it comes at most once for a hold.
    */
   private reportLongHold(hold: { verb: string; agentName: string; since: number; reinitializing?: string }): void {
     const heldMs = Date.now() - hold.since;
@@ -10762,8 +10785,8 @@ export class AgentFramework {
       `The ${MOVE_NOUNS[hold.verb] ?? hold.verb} for ${hold.agentName} has held the store for ` +
         `${Math.round(heldMs / 1000)} s${on}. No agent's turn starts until it lets the store go, and the writes it ` +
         `defers for the agents wait in the deferral queue (${queued === 1 ? '1 write' : `${queued} writes`} now). ` +
-        'A restart ends it and re-initializes every manager, but loses the writes still queued when the process ' +
-        'exits, unless the deferral queue is persisted.',
+        'A restart ends it, ends the conversation agents and runs, and re-initializes the configured agents, whose ' +
+        'queued writes outlast the process only in a persisted deferral queue.',
       {
         data: {
           verb: hold.verb,
@@ -10857,7 +10880,9 @@ export class AgentFramework {
         remedy = templateDown.remedy;
       }
       if (moved()) continue;
-      const failure: ManagerReinitFailure = { agentName, error: cause, seedingFailed: true, ...(remedy ? { remedy } : {}) };
+      const failure: ManagerReinitFailure = {
+        agentName, kind: this.agentKind(agentName), error: cause, seedingFailed: true, ...(remedy ? { remedy } : {}),
+      };
       // What the hold deferred for it goes with it: its window's release, now
       // or at resume while the host is quiesced, stores what its store
       // accepts of those writes there, where no agent reads them, and passes
@@ -10870,6 +10895,7 @@ export class AgentFramework {
           this.conversationRouter.unbind(channelId);
         }
         this.disposeConversationAgent(agentName);
+        if (this.releasesAfterResume.has(agentName)) failure.releasePostponed = true;
       } catch (error) {
         failure.cleanupFailed = failureDescription(error);
       }
@@ -10884,12 +10910,21 @@ export class AgentFramework {
    *  the rest from its end (opsWebhookText); the console, failures.log and
    *  the trace keep 2,000, cut the same way. */
   private reportReinitFailures(after: ReinitMove, failures: ManagerReinitFailure[]): void {
-    for (const { agentName, error, seedingFailed, after: judgedAfter, remedy, cleanupFailed, heldWrites } of failures) {
+    for (const failure of failures) {
+      const { agentName, kind, error, seedingFailed, after: judgedAfter, remedy, cleanupFailed, heldWrites, releasePostponed } = failure;
       const move = judgedAfter ?? after;
       this.reportReinitFailure(agentName, move, seedingFailed
-        ? disposalAlert({ move, remedy, cleanupFailed, heldWrites, cause: error }).message
-        : refusedWorkAlert(move, this.conversationAgentHomes.has(agentName), error).message);
+        ? disposalAlert({ move, remedy, cleanupFailed, heldWrites, releasePostponed, cause: error }).message
+        : refusedWorkAlert(move, kind, error).message);
     }
+  }
+
+  /** What a restart does to a registered agent (AgentKind): the house's
+   *  test for an agent a restart doesn't create again, as
+   *  holdProviderAcceleration's. */
+  private agentKind(agentName: string): AgentKind {
+    if (this.conversationAgentHomes.has(agentName)) return 'conversation';
+    return this.ephemeralRuns.has(agentName) ? 'run' : 'configured';
   }
 
   private reportReinitFailure(agentName: string, after: string, message: string): void {
@@ -11090,27 +11125,28 @@ export class AgentFramework {
       // so a failed initialization leaves the store back on the source.
       const now = this.store.currentBranch().name;
       const selected = now === sourceBranch;
-      // A restart creates a configured agent again, but not a conversation
-      // agent (restartClause).
-      const conversationAgent = this.conversationAgentHomes.has(agentName);
-      const untilReinitialized = conversationAgent
-        ? ' re-initializes it (a restart ends it instead)'
-        : ', or a restart, re-initializes it';
+      // A restart creates a configured agent again, on the branch the store
+      // is on, but not a conversation agent or a run (restartClause).
+      const kind = this.agentKind(agentName);
+      const restart = kind === 'conversation' ? ' (a restart ends it instead)' : kind === 'run' ? ' (a restart ends the run instead)' : '';
       const status = selected
         ? `RESTORE TO ${sourceBranch} selected it, but re-initializing the agent's context manager for it FAILED (${detail}); ` +
-          `the agent refuses its work until switchBranch() to the current branch${untilReinitialized}`
+          `the agent refuses its work until switchBranch() to the current branch${kind === 'configured' ? ', or a restart,' : ''} ` +
+          `re-initializes it${restart}`
         : managerCurrent
           ? `RESTORE TO ${sourceBranch} ALSO FAILED (${detail}); the store is still on ${now}, where the agent's ` +
             'context manager is current, so the agent serves from that branch until switchBranch() moves it'
           : `RESTORE TO ${sourceBranch} ALSO FAILED (${detail}); the store is still on ${now}, ` +
-            `and the agent refuses its work until switchBranch()${untilReinitialized}`;
+            `and the agent refuses its work until switchBranch() to ${sourceBranch} re-initializes it` +
+            (kind === 'configured' ? ` (a restart re-initializes it on ${now} instead)` : restart);
       console.error(`[operator] agent=${agentName} ${status}`);
       // Its manager is left as the failed switch left it, as the others are
       // after a failed re-initialization, unless it's current on the failed
       // branch: alerted the same way, saying which branch the store is on.
       try {
+        const named = move === 'suppression' ? { move, managerCurrent } : { move };
         this.reportReinitFailure(agentName, `restore to ${sourceBranch}`, restoreAlert({
-          move, source: sourceBranch, now, selected, managerCurrent, conversationAgent, cause: detail,
+          ...named, source: sourceBranch, now, selected, kind, cause: detail,
         }).message);
       } catch (reportError) {
         console.error(`[operator] agent=${agentName} reporting the failed restore failed: ${boundFailureText(failureDescription(reportError))}`);
