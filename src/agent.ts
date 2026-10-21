@@ -4,7 +4,7 @@ import { createHash } from 'node:crypto';
 import type { CacheWireReceipt, KvUnifiedRequestHooks } from './kv-unified-wire.js';
 import { ToolResultGuard } from './tool-result-guard.js';
 import { withoutTokenEstimates } from './thinking-token-stamp.js';
-import { assertBooleanSetting, holdsSettings } from './config-checks.js';
+import { assertBooleanSetting, holdsSettings, kindOf } from './config-checks.js';
 import {
   CONTINUE_ROW,
   continueTurn,
@@ -111,14 +111,16 @@ export const DEFAULT_INFERENCE_PROGRESS_TIMEOUT_MS = 30 * 60_000;
  * Membrane reads zero, a negative or NaN as no deadline at all, so one written
  * meaning "off" would leave a stalled stream unbounded, and one written by
  * slip would do the same. Infinity is the way to run with no bound, and
- * `undefined` gets DEFAULT_INFERENCE_PROGRESS_TIMEOUT_MS where it's read.
+ * `undefined` gets DEFAULT_INFERENCE_PROGRESS_TIMEOUT_MS where it's read. As
+ * the other configuration refusals do, it names what the value is, never the
+ * value itself, which could be a secret pasted into the wrong field.
  */
 export function assertProgressTimeout(setting: string, value: unknown): void {
   if (value === undefined) return;
   if (typeof value !== 'number' || !(value > 0)) {
-    throw new RangeError(
-      `${setting} must be a positive number of ms, or Infinity to run with no bound; got ${String(value)}`,
-    );
+    const what = typeof value !== 'number' ? kindOf(value)
+      : Number.isNaN(value) ? 'NaN' : value === 0 ? 'zero' : 'a negative number';
+    throw new RangeError(`${setting} must be a positive number of ms, or Infinity to run with no bound, not ${what}`);
   }
 }
 

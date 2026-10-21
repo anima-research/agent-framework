@@ -276,9 +276,10 @@ export class InferenceRouter {
 
     try {
       // 5. Run inference. Both modes end in membrane's response, and one
-      // builder makes the result from it. A non-streaming call reports no
-      // progress before its response, so there the progress deadline bounds
-      // the whole call.
+      // builder makes the result from it. On most adapters a non-streaming
+      // call reports no progress before its response, so there the progress
+      // deadline bounds the whole call. (Membrane's OpenAI Responses adapter
+      // in subscription mode streams complete(), and its events renew it.)
       const response = chunkRequestId != null
         ? await this.streamResponse(request, chunkRequestId, sendChunk!)
         : await this.membrane.complete(request, { progressTimeoutMs: this.progressTimeoutMs });

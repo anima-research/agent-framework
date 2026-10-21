@@ -13,7 +13,7 @@
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { existsSync, mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { AbortedResponse, Membrane, NormalizedRequest, NormalizedResponse, StreamEvent, YieldingStream } from '@animalabs/membrane';
@@ -186,9 +186,11 @@ test('each agent turn carries the progress deadline: 30 minutes unless inference
 });
 
 test('create refuses a progress deadline membrane would read as none, and names Infinity as the way to have none', async () => {
-  // Membrane reads these as no deadline, which would leave the hang in place,
-  // so a host that writes one, meaning "off" or by slip, hears it at create.
-  for (const value of [0, -1, Number.NaN]) {
+  // Membrane reads the numbers as no deadline, which would leave the hang in
+  // place, so a host that writes one, meaning "off" or by slip, hears it at
+  // create, before the store opens. The refusal names what the value is, not
+  // the value, as the other configuration refusals do.
+  for (const [value, what] of [[0, 'zero'], [-1, 'a negative number'], [Number.NaN, 'NaN'], ['1800000', 'a string']] as const) {
     const dir = mkdtempSync(join(tmpdir(), 'progress-deadline-refused-'));
     try {
       await assert.rejects(
@@ -198,12 +200,13 @@ test('create refuses a progress deadline membrane would read as none, and names 
           agents: [{ name: 'agent', model: 'test-model', systemPrompt: 'test' }],
           modules: [],
           syncIntervalMs: 0,
-          inferenceProgressTimeoutMs: value,
+          inferenceProgressTimeoutMs: value as number,
         }),
         (error: unknown) => error instanceof RangeError
-          && error.message === `inferenceProgressTimeoutMs must be a positive number of ms, or Infinity to run with no bound; got ${value}`,
-        `inferenceProgressTimeoutMs ${value} is refused`,
+          && error.message === `inferenceProgressTimeoutMs must be a positive number of ms, or Infinity to run with no bound, not ${what}`,
+        `inferenceProgressTimeoutMs ${String(value)} is refused`,
       );
+      assert.equal(existsSync(join(dir, 'store')), false, 'refused before the store opens');
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
