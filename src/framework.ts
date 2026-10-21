@@ -1241,11 +1241,24 @@ interface DiscordAwarenessDrainPass {
   drain?: Promise<DiscordAwarenessDrainOutcome>;
 }
 
-/** A JSON Schema type that also admits null (`[type, 'null']`), typed as the
- *  one string membrane's ToolParameter declares. The native, XML and Responses
- *  paths pass or render the array through. */
-function nullableType(type: string): string {
-  return [type, 'null'] as unknown as string;
+/** Whether a synthesized tool's nullable field is in use: omission, null and
+ *  the empty string all mean it isn't, so a caller whose provider presents
+ *  every property as required can still leave one unset. Any other value is
+ *  in use, and its field checks it. */
+function fieldInUse(value: unknown): boolean {
+  return value !== undefined && value !== null && value !== '';
+}
+
+/** A synthesized tool's integer field: an integer number, or a string of ASCII
+ *  digits once trimmed (a model may write an integer as a string), within the
+ *  integers a number holds exactly; NaN for anything else. Number() would read
+ *  " ", false and [] as 0, and "2.0" or "+2" as 2, and a longer run of digits
+ *  as a different, rounded number. */
+function integerField(value: unknown): number {
+  const n = typeof value === 'number' ? value
+    : typeof value === 'string' && /^[0-9]+$/.test(value.trim()) ? Number(value.trim())
+    : Number.NaN;
+  return Number.isSafeInteger(n) ? n : Number.NaN;
 }
 
 function normalizeDiscordAwarenessDeadline(value: number | undefined): number {
@@ -5549,7 +5562,7 @@ export class AgentFramework {
     ];
   }
 
-  /** The registered workspace module, if any (used by save_image). */
+  /** The registered workspace module, if any (used by save_recent_image). */
   private getWorkspaceModule(): WorkspaceModule | undefined {
     const module = this.moduleRegistry.getAllModules().find((m) => m.name === 'workspace');
     return module && typeof (module as WorkspaceModule).writeBinary === 'function'
@@ -8724,10 +8737,10 @@ export class AgentFramework {
   /** Synthesized drafts tool — present whenever MCPL channels are
    *  configured. A resident's held drafts (src/prose-drafts.ts): plain speech
    *  that was not sent, never published except by its resident's resend, and
-   *  kept as that module's retention says. Nullable
-   *  fields, cast like save_recent_image's: a caller whose provider presents
-   *  every property as required can still say "not in use". */
-  private static readonly DRAFTS_TOOL = {
+   *  kept as that module's retention says. Its optional fields are nullable,
+   *  as save_recent_image's selectors are: a caller whose provider presents
+   *  every property as required can still say "not in use" (fieldInUse). */
+  private static readonly DRAFTS_TOOL: import('./types/index.js').ToolDefinition = {
     name: 'drafts',
     description:
       'Your held drafts: plain speech of yours that was NOT sent — held back because an explicit send in the ' +
@@ -8766,15 +8779,12 @@ export class AgentFramework {
       },
       required: ['action'],
     },
-  } as unknown as import('./types/index.js').ToolDefinition;
+  };
 
-  /** Synthesized save_image tool — present when a workspace module is
+  /** Synthesized save_recent_image tool — present when a workspace module is
    *  registered. Lets the agent persist an image it has already seen in its
    *  own context (Discord attachments arrive inlined as base64 and are
-   *  otherwise unreachable as files). The three nullable selectors need JSON
-   *  Schema's type array, which membrane's ToolParameter (`type: string`)
-   *  can't express, so only those `type` fields are cast (`nullableType`);
-   *  the rest of the definition is checked as a ToolDefinition. */
+   *  otherwise unreachable as files). Its three selectors are nullable. */
   private static readonly SAVE_IMAGE_TOOL: import('./types/index.js').ToolDefinition = {
     name: 'save_recent_image',
     description:
@@ -8800,25 +8810,26 @@ export class AgentFramework {
           description: 'Mount-prefixed destination path, e.g. "project/photos/name.png".',
         },
         // Nullable selectors: a caller whose provider presents every property
-        // as required must still be able to say "not this selector". null and
-        // omission mean the same thing; any other supplied value is checked.
+        // as required must still be able to say "not this selector". Omission,
+        // null and "" all mean it isn't used (fieldInUse); any other value is
+        // checked. The descriptions name null, the form to ask for.
         index: {
-          type: nullableType('integer'),
+          type: ['integer', 'null'],
           description:
             'Which image, counting back from the most recent (0 = most recent). Default 0. ' +
             'null, like omitting it, means the default.',
         },
         count: {
-          type: nullableType('integer'),
+          type: ['integer', 'null'],
           description:
             'How many images to save, starting at `index` and going further back. Default 1. ' +
             'null, like omitting it, means the default.',
         },
         ref: {
-          type: nullableType('string'),
+          type: ['string', 'null'],
           description:
             'Save a specific tool-result image by its history ref (e.g. "img_k7x3q2_7", as shown in its placeholder in your context) instead of by position. ' +
-            'Mutually exclusive with a non-null `index`/`count`. null, like omitting it, means no ref.',
+            'Mutually exclusive with `index`/`count`: pass null for the selector you are not using. null, like omitting it, means no ref.',
         },
       },
       required: ['path'],
@@ -14676,8 +14687,6 @@ export class AgentFramework {
     const refuse = (error: string): ToolResult => ({ success: false, error, isError: true });
     // Plain text, not a JSON-quoted string: draft text must read exactly as held.
     const ok = (text: string): ToolResult => ({ success: true, data: [{ type: 'text', text }] });
-    // null and omission mean the same thing: the field is not in use.
-    const present = (v: unknown): boolean => v !== undefined && v !== null;
     const action = input.action;
     if (action !== 'list' && action !== 'read' && action !== 'resend' && action !== 'dismiss') {
       return refuse('action must be one of "list", "read", "resend" or "dismiss".');
@@ -14686,7 +14695,7 @@ export class AgentFramework {
       refuse(`${field} is not used by action "${action}" — pass null or omit it.`);
 
     let ids: string[] = [];
-    if (present(input.draftIds)) {
+    if (fieldInUse(input.draftIds)) {
       if (action === 'list') return unused('draftIds');
       if (!Array.isArray(input.draftIds) || input.draftIds.some((id) => typeof id !== 'string' || !id.trim())) {
         return refuse('draftIds must be a list of draft ids such as "d-k7x3qm2", or null.');
@@ -14695,15 +14704,19 @@ export class AgentFramework {
       if (new Set(ids).size !== ids.length) return refuse('draftIds names a draft more than once.');
       if (ids.length > 20) return refuse('draftIds names more than 20 drafts; act on them in smaller groups.');
     }
-    if (present(input.destination) && action !== 'resend') return unused('destination');
-    if (present(input.confirmDuplicate) && action !== 'resend') return unused('confirmDuplicate');
-    if (present(input.offset) && action !== 'list') return unused('offset');
+    if (fieldInUse(input.destination) && action !== 'resend') return unused('destination');
+    // false is "don't confirm", which every other action already does, so only
+    // true is a confirmDuplicate those actions refuse.
+    if (fieldInUse(input.confirmDuplicate) && input.confirmDuplicate !== false && action !== 'resend') {
+      return unused('confirmDuplicate');
+    }
+    if (fieldInUse(input.offset) && action !== 'list') return unused('offset');
 
     if (action === 'list') {
       let offset = 0;
-      if (present(input.offset)) {
+      if (fieldInUse(input.offset)) {
         const raw = input.offset;
-        const n = typeof raw === 'number' ? raw : typeof raw === 'string' && /^\d+$/.test(raw.trim()) ? Number(raw) : NaN;
+        const n = integerField(raw);
         if (!Number.isInteger(n) || n < 0) return refuse('offset must be a whole number of drafts to skip (0 or more), or null.');
         offset = n;
       }
@@ -14820,13 +14833,13 @@ export class AgentFramework {
     if (!registry) return refuse('No channels are configured, so there is nowhere to resend to.');
     const home = this.conversationAgentHomes.get(agentName);
     let spec = typeof input.destination === 'string' ? input.destination.trim() : '';
-    if (present(input.destination) && typeof input.destination !== 'string') {
+    if (fieldInUse(input.destination) && typeof input.destination !== 'string') {
       return refuse('destination must be "#channel", "@person" or a channel id.');
     }
     if (!spec && home) spec = home;
     if (!spec) return refuse('resend needs a destination: "#channel", "@person" or a channel id.');
     let confirmDuplicate = false;
-    if (present(input.confirmDuplicate)) {
+    if (fieldInUse(input.confirmDuplicate)) {
       if (typeof input.confirmDuplicate !== 'boolean') return refuse('confirmDuplicate must be true, false or null.');
       confirmDuplicate = input.confirmDuplicate;
     }
@@ -27143,32 +27156,26 @@ export class AgentFramework {
         let count = 1;
         /** Direct-ref mode: the one ref to find in the scannable context. */
         let wantedRef: string | null = null;
-        // A selector is in use only when it carries a value. Omission, null and
-        // the empty string all mean "not this selector", so a caller whose
-        // provider presents every property as required can still choose one,
-        // whichever of the two it fills the other selector with. Any other
-        // value is supplied and checked, never read as absent: a whitespace
-        // or malformed ref, or an index that isn't an integer, is refused
-        // rather than turned into a different image than the one the caller
-        // named.
-        const supplied = (value: unknown): boolean => value !== undefined && value !== null && value !== '';
-        const unusedHint = ' (pass null, or leave it out, for a selector you are not using)';
-        /** An integer number, or a string of decimal digits (a model may write
-         *  an integer as a string); NaN for anything else. Number() would read
-         *  " ", false and [] as 0, the newest image, and "2.0" or "+2" as 2. */
-        const selectorInteger = (value: unknown): number => {
-          if (typeof value === 'number') return Number.isInteger(value) ? value : Number.NaN;
-          if (typeof value === 'string' && /^[0-9]+$/.test(value)) return Number(value);
-          return Number.NaN;
-        };
-        if (supplied(input.ref)) {
+        // A selector is in use only when it carries a value (fieldInUse), so a
+        // caller whose provider presents every property as required can still
+        // choose one, whichever of the two it fills the other selector with.
+        // Any other value is checked, never read as absent: a whitespace or
+        // malformed ref, or an index that isn't an integer, is refused rather
+        // than turned into a different image than the one the caller named.
+        // The hint goes only where another selector is in use beside the refused
+        // one: when the refused selector is the caller's only one, advice to drop
+        // a selector would read as advice to drop it, and the newest image would
+        // be saved instead of the one it meant.
+        const unusedHint = (inUseBeside: boolean): string =>
+          inUseBeside ? ' (pass null, or leave it out, for a selector you are not using)' : '';
+        if (fieldInUse(input.ref)) {
           if (typeof input.ref !== 'string' || !TOOL_IMAGE_REF_RE.test(input.ref)) {
             throw new Error(
               'save_recent_image: `ref` must look like "img_k7x3q2_7" (copy it from the image placeholder in your context)' +
-              unusedHint,
+              unusedHint(fieldInUse(input.index) || fieldInUse(input.count)),
             );
           }
-          if (supplied(input.index) || supplied(input.count)) {
+          if (fieldInUse(input.index) || fieldInUse(input.count)) {
             throw new Error(
               'save_recent_image: `ref` is mutually exclusive with `index`/`count` — pass null (or omit) ' +
               'for the selector you are not using',
@@ -27176,14 +27183,14 @@ export class AgentFramework {
           }
           wantedRef = input.ref;
         } else {
-          index = supplied(input.index) ? selectorInteger(input.index) : 0;
+          index = fieldInUse(input.index) ? integerField(input.index) : 0;
           if (!Number.isInteger(index) || index < 0) {
-            throw new Error(`save_recent_image: \`index\` must be a non-negative integer${unusedHint}`);
+            throw new Error(`save_recent_image: \`index\` must be a non-negative integer${unusedHint(fieldInUse(input.count))}`);
           }
-          count = supplied(input.count) ? selectorInteger(input.count) : 1;
+          count = fieldInUse(input.count) ? integerField(input.count) : 1;
           const MAX_COUNT = 20;
           if (!Number.isInteger(count) || count < 1 || count > MAX_COUNT) {
-            throw new Error(`save_recent_image: \`count\` must be an integer in 1..${MAX_COUNT}${unusedHint}`);
+            throw new Error(`save_recent_image: \`count\` must be an integer in 1..${MAX_COUNT}${unusedHint(fieldInUse(input.index))}`);
           }
         }
         const lastWanted = index + count - 1;

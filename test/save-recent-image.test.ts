@@ -1433,9 +1433,34 @@ function xmlCall(name: string, params: Record<string, string>): string {
   ].join('\n');
 }
 
-/** The input membrane's XML parser hands the framework for that call. */
-function parsedXmlInput(params: Record<string, string>): Record<string, unknown> {
-  const parsed = parseToolCalls(xmlCall('save_recent_image', params));
+/** The definition the framework actually offers when a workspace is registered. */
+async function offeredDefinition(): Promise<ToolDefinition> {
+  const tempDir = mkdtempSync(join(tmpdir(), 'sri-schema-'));
+  const mountDir = join(tempDir, 'mount');
+  mkdirSync(mountDir, { recursive: true });
+  const workspace = new WorkspaceModule({ mounts: [{ name: 'files', path: mountDir, mode: 'read-write', watch: 'never' }] });
+  const framework = await AgentFramework.create({
+    storePath: join(tempDir, 'store'),
+    membrane: new MockMembrane().asMembrane(),
+    agents: [{ name: 'prime', model: 'test-model', systemPrompt: 'You are prime.', allowedTools: 'all' }],
+    modules: [workspace as unknown as Module],
+    syncIntervalMs: 0,
+  });
+  try {
+    workspace.initStore(framework.getStore());
+    const definition = framework.getAllTools().find((t) => t.name === 'save_recent_image');
+    assert.ok(definition, 'save_recent_image is offered with a workspace');
+    return structuredClone(definition);
+  } finally {
+    await framework.stop();
+    rmSync(tempDir, { recursive: true, force: true });
+  }
+}
+
+/** The input membrane's XML parser hands the framework for that call, parsed
+ *  as membrane parses a round's calls: against the tools it declared. */
+function parsedXmlInput(params: Record<string, string>, definition: ToolDefinition): Record<string, unknown> {
+  const parsed = parseToolCalls(xmlCall('save_recent_image', params), { tools: [definition] });
   assert.ok(parsed && parsed.calls.length === 1, 'membrane parses the XML call');
   return parsed.calls[0]!.input;
 }
@@ -1449,7 +1474,7 @@ describe('save_recent_image selectors: omission, null and the empty string all m
   it('sparse and every-property calls each save the image they name', async () => {
     const ledger = new ToolImageLedger();
     const ref1 = `img_${ledger.nonce}_1`;
-    const xmlEveryProperty = parsedXmlInput({ path: 'files/xml.gif', ref: 'null', index: '1', count: 'null' });
+    const xmlEveryProperty = parsedXmlInput({ path: 'files/xml.gif', ref: 'null', index: '1', count: 'null' }, await offeredDefinition());
     assert.deepStrictEqual(xmlEveryProperty, { path: 'files/xml.gif', ref: null, index: 1, count: null },
       'the XML path delivers null selectors as null');
     const h = await startTurn({
@@ -1472,6 +1497,9 @@ describe('save_recent_image selectors: omission, null and the empty string all m
           saveCall('call_empty_all', { path: 'files/empty-all.png', ref: '', index: '', count: '' }),
           // The narrow compatibility form: decimal-digit strings.
           saveCall('call_digits', { path: 'files/digits.gif', ref: null, index: '1', count: '1' }),
+          // ...with surrounding whitespace trimmed: the digits still name the same image.
+          saveCall('call_padded', { path: 'files/padded.gif', ref: null, index: ' 1', count: '1 ' }),
+          saveCall('call_padded_range', { path: 'files/prange.png', ref: null, index: null, count: ' 2 ' }),
           // What the XML path delivers for an every-property call.
           saveCall('call_xml', xmlEveryProperty),
         ],
@@ -1500,6 +1528,7 @@ describe('save_recent_image selectors: omission, null and the empty string all m
       await expectGif('call_every_pos', 'files/every-pos.gif');
       await expectPng('call_every_ref', 'files/every-ref.png', 0);
       await expectGif('call_digits', 'files/digits.gif');
+      await expectGif('call_padded', 'files/padded.gif');
       await expectGif('call_empty_pos', 'files/empty-pos.gif');
       await expectPng('call_empty_ref', 'files/empty-ref.png', 0);
       await expectPng('call_empty_all', 'files/empty-all.png', 0);
@@ -1509,6 +1538,10 @@ describe('save_recent_image selectors: omission, null and the empty string all m
       assert.deepStrictEqual(range.map((f) => f.sha256), [sha(PNG), sha(GIF)], 'count 2 with null index is the newest two');
       assert.ok((await fileBytes(h, 'files/range-0.png'))?.equals(PNG));
       assert.ok((await fileBytes(h, 'files/range-1.png'))?.equals(GIF));
+      const padded = saved(await waitForToolResult(h.framework, 'call_padded_range'));
+      assert.deepStrictEqual(padded.map((f) => f.sha256), [sha(PNG), sha(GIF)], 'a padded count of 2 saves the newest two');
+      assert.ok((await fileBytes(h, 'files/prange-0.png'))?.equals(PNG));
+      assert.ok((await fileBytes(h, 'files/prange-1.png'))?.equals(GIF));
     } finally {
       await h.framework.stop();
       rmSync(h.tempDir, { recursive: true, force: true });
@@ -1522,8 +1555,14 @@ describe('save_recent_image selectors: omission, null and the empty string all m
     const INDEX = /`index` must be a non-negative integer/;
     const COUNT = /`count` must be an integer in 1\.\.20/;
     const CONFLICT = /`ref` is mutually exclusive with `index`\/`count` — pass null \(or omit\) for the selector you are not using/;
-    const cases: Array<{ id: string; input: Record<string, unknown>; refusal: RegExp }> = [
+    const HINT = 'pass null, or leave it out, for a selector you are not using';
+    const cases: Array<{ id: string; input: Record<string, unknown>; refusal: RegExp; hint?: boolean }> = [
       { id: 'ref_blank', input: { ref: '   ' }, refusal: REF_FORMAT },
+      // A refusal beside another selector in use carries the unused-selector hint;
+      // a refused selector that is the caller's only one doesn't.
+      { id: 'ref_malformed_with_index', input: { ref: 'img_1', index: 1, count: null }, refusal: REF_FORMAT, hint: true },
+      { id: 'ref_malformed_with_count', input: { ref: 'img_1', index: null, count: 2 }, refusal: REF_FORMAT, hint: true },
+      { id: 'ref_malformed_with_index_zero', input: { ref: 'img_1', index: 0 }, refusal: REF_FORMAT, hint: true },
       { id: 'ref_malformed', input: { ref: 'img_1' }, refusal: REF_FORMAT },
       { id: 'ref_number', input: { ref: 5 }, refusal: REF_FORMAT },
       { id: 'ref_false', input: { ref: false, index: null, count: null }, refusal: REF_FORMAT },
@@ -1537,9 +1576,16 @@ describe('save_recent_image selectors: omission, null and the empty string all m
       { id: 'index_decimal_text', input: { index: '1.0' }, refusal: INDEX },
       { id: 'index_negative', input: { index: -1 }, refusal: INDEX },
       { id: 'index_fraction', input: { index: 1.5 }, refusal: INDEX },
+      // Past the integers a number holds exactly, digits would read as another number.
+      { id: 'index_unsafe_digits', input: { index: '9007199254740993' }, refusal: INDEX },
+      { id: 'index_bad_with_count', input: { index: '1.5', count: 2 }, refusal: INDEX, hint: true },
+      { id: 'index_bad_beside_empty_count', input: { index: '1.5', count: '' }, refusal: INDEX },
       { id: 'count_true', input: { ref: null, index: null, count: true }, refusal: COUNT },
       { id: 'count_array', input: { count: [2] }, refusal: COUNT },
       { id: 'count_zero', input: { count: 0 }, refusal: COUNT },
+      { id: 'count_decimal_text', input: { count: '2.0' }, refusal: COUNT },
+      { id: 'count_blank', input: { count: ' ' }, refusal: COUNT },
+      { id: 'count_bad_with_index', input: { index: 0, count: 21 }, refusal: COUNT, hint: true },
       { id: 'count_over', input: { count: 21 }, refusal: COUNT },
       { id: 'conflict_count', input: { ref: ref1, count: 2 }, refusal: CONFLICT },
       { id: 'conflict_index', input: { ref: ref1, index: 0, count: null }, refusal: CONFLICT },
@@ -1558,6 +1604,9 @@ describe('save_recent_image selectors: omission, null and the empty string all m
       for (const c of cases) {
         const message = failed(await waitForToolResult(h.framework, `call_${c.id}`));
         assert.match(message, c.refusal, c.id);
+        // A refusal advises dropping a selector only beside another in use, so it
+        // never reads as advice to drop the caller's one selector.
+        if (c.refusal !== CONFLICT) assert.strictEqual(message.includes(HINT), c.hint === true, `${c.id}: hint`);
         assert.strictEqual(await fileBytes(h, `files/${c.id}.png`), null, `${c.id} wrote nothing`);
       }
     } finally {
@@ -1633,30 +1682,6 @@ describe('save_recent_image schema as each provider path is sent it (installed m
     { path: 'files/a.png', ref: null, index: null, count: null },
   ];
 
-  /** The definition the framework actually offers when a workspace is registered. */
-  async function offeredDefinition(): Promise<ToolDefinition> {
-    const tempDir = mkdtempSync(join(tmpdir(), 'sri-schema-'));
-    const mountDir = join(tempDir, 'mount');
-    mkdirSync(mountDir, { recursive: true });
-    const workspace = new WorkspaceModule({ mounts: [{ name: 'files', path: mountDir, mode: 'read-write', watch: 'never' }] });
-    const framework = await AgentFramework.create({
-      storePath: join(tempDir, 'store'),
-      membrane: new MockMembrane().asMembrane(),
-      agents: [{ name: 'prime', model: 'test-model', systemPrompt: 'You are prime.', allowedTools: 'all' }],
-      modules: [workspace as unknown as Module],
-      syncIntervalMs: 0,
-    });
-    try {
-      workspace.initStore(framework.getStore());
-      const definition = framework.getAllTools().find((t) => t.name === 'save_recent_image');
-      assert.ok(definition, 'save_recent_image is offered with a workspace');
-      return structuredClone(definition);
-    } finally {
-      await framework.stop();
-      rmSync(tempDir, { recursive: true, force: true });
-    }
-  }
-
   const options = (tools: ToolDefinition[], toolMode?: 'xml' | 'native') => ({
     participantMode: 'simple' as const,
     assistantParticipant: 'Claude',
@@ -1699,19 +1724,26 @@ describe('save_recent_image schema as each provider path is sent it (installed m
       assert.ok(match, `parameter ${name} is rendered`);
       return match[0];
     };
-    for (const name of ['ref', 'index', 'count']) {
-      // Published membrane (0.5.86) renders the type list as written
-      // (type="string,null"); membrane's main renders nullable="true". Each
-      // tells the model null is allowed; nothing else is accepted here.
-      assert.match(parameter(name), /type=\\"(?:string|integer),null\\"|nullable=\\"true\\"/, `${name} is marked nullable`);
+    for (const [name, base] of [['ref', 'string'], ['index', 'integer'], ['count', 'integer']] as const) {
+      // Each selector's own base type, with null marked one of the two ways
+      // membrane renders it: as written (type="string,null", membrane 0.5.86)
+      // or as nullable="true" (0.5.87 on). Nothing else is accepted here.
+      const nullable = new RegExp(`type=\\\\"${base}(?:,null\\\\"|\\\\"[^>]*nullable=\\\\"true\\\\")`);
+      assert.match(parameter(name), nullable, `${name} is ${base}, marked nullable`);
       assert.doesNotMatch(parameter(name), /required=/, `${name} is not required`);
     }
     assert.match(parameter('path'), /required=\\"true\\"/, 'path is required');
+    const refText = (definition.inputSchema as unknown as { properties: Record<string, { description?: string }> }).properties.ref?.description ?? '';
+    assert.match(refText, /pass null for the selector you are not using/, "ref's description says how to leave a selector unused");
 
     // And what the model writes back for an every-property call parses to the
     // shape the native schema accepts.
-    const input = parsedXmlInput({ path: 'files/a.png', ref: 'null', index: '1', count: '2' });
+    const input = parsedXmlInput({ path: 'files/a.png', ref: 'null', index: '1', count: '2' }, definition);
     assert.deepStrictEqual(input, { path: 'files/a.png', ref: null, index: 1, count: 2 });
+    // Parsed against the declared tool, a ref of one space stays one space, which
+    // the handler refuses; guessed without it, it would come back "", unused.
+    const spaced = parsedXmlInput({ path: 'files/a.png', ref: ' ', index: 'null', count: 'null' }, definition);
+    assert.strictEqual(spaced.ref, ' ', 'a declared string keeps its whitespace');
     assert.deepStrictEqual(schemaErrors(definition.inputSchema as unknown as Record<string, unknown>, input), []);
   });
 });
