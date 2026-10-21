@@ -434,8 +434,61 @@ describe("a turn's replies go out through the server whose message triggered it"
     }).handleScriptToolCall('scout', 'channel_publish', { channelId: X, content: 'background note' });
     await new Promise((r) => setTimeout(r, 500));
     assert.deepEqual(published('background note'), []);
-    assert.match(typeof result === 'string' ? result : result.text, /this tool can't choose between them/);
+    assert.match(typeof result === 'string' ? result : result.text, /Channel id is ambiguous across MCPL servers: discord:g1:room\. Include serverId\./);
+    const named = await (framework as unknown as {
+      handleScriptToolCall(agent: string, tool: string, input: Record<string, unknown>): Promise<string | { text: string }>;
+    }).handleScriptToolCall('scout', 'channel_publish', { channelId: X, serverId: 'discord', content: 'background note to discord' });
+    await new Promise((r) => setTimeout(r, 500));
+    assert.deepEqual(published('background note to discord'), ['discord'], 'a serverId it names is the server it goes through');
+    assert.doesNotMatch(typeof named === 'string' ? named : named.text, /Error/);
   });
+
+  it("a background script's channel_publish naming no channel goes through the server whose message set that default, or the server it names, and nowhere once that server withdrew the channel", async () => {
+    await registerX('slack', '#room (slack)');
+    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'lane reply' }]));
+    command('slack', { op: 'incoming', channelId: X, messageId: 'in-1', mode: 'addressed', text: 'a message slack sent' });
+    await waitFor(() => started > 0, 'the turn started');
+    await settle();
+    assert.equal(registry().fallbackServerFor(X), 'slack');
+    // A background script's call: no script record, so no turn.
+    const call = async (input: Record<string, unknown>) => {
+      const r = await (framework as unknown as {
+        handleScriptToolCall(agent: string, tool: string, input: Record<string, unknown>): Promise<string | { text: string }>;
+      }).handleScriptToolCall('scout', 'channel_publish', input);
+      return typeof r === 'string' ? r : r.text;
+    };
+    await call({ content: 'default while shared' });
+    await call({ serverId: 'discord', content: 'default named discord' });
+    await registry().handleChanged('slack', { removed: [X] });
+    const gone = await call({ content: 'default after withdrawal' });
+    const goneNamed = await call({ serverId: 'slack', content: 'default named slack after withdrawal' });
+    await new Promise((r) => setTimeout(r, 500));
+    assert.deepEqual(published('default after withdrawal'), [], 'nothing through the server left holding the id');
+    assert.deepEqual(published('default named slack after withdrawal'), []);
+    assert.match(gone, /Channel discord:g1:room, which this call took as its default, is no longer registered by the server whose message set that default, so nothing was published\.$/);
+    assert.match(goneNamed, /Channel not found: discord:g1:room on server slack/);
+    assert.deepEqual(published('default while shared'), ['slack'], "the default's own server");
+    assert.deepEqual(published('default named discord'), ['discord'], 'the server the call names');
+  });
+
+  for (const withdraws of [true, false]) {
+    it(`a channel_publish naming no channel, inside a turn, into a default another message set mid-turn goes through that message's server${withdraws ? ', and nowhere once it withdrew the channel' : ''}`, async () => {
+      await registerX('slack', '#room (slack)');
+      membrane.pushResponse(createMockResponse([
+        { type: 'tool_use', id: 'pub-default', name: 'channel_publish', input: { content: 'in-turn default' } },
+      ], 'tool_use'));
+      membrane.pushResponse(createMockResponse([]));
+      // The turn is slack's, on its own lobby; while it's held, a message of
+      // slack's on the shared channel makes that channel the default.
+      command('slack', { op: 'incoming', channelId: 'slack:T1:C1', messageId: 'in-lobby', mode: 'addressed', text: 'on the lobby' });
+      await waitFor(() => started > 0, 'the turn started');
+      command('slack', { op: 'incoming', channelId: X, messageId: 'in-ambient', mode: 'ambient', text: 'in passing' });
+      await waitFor(() => registry().fallbackServerFor(X) === 'slack', "the shared channel is the default, with slack's server");
+      if (withdraws) await registry().handleChanged('slack', { removed: [X] });
+      await settle();
+      assert.deepEqual(published('in-turn default'), withdraws ? [] : ['slack']);
+    });
+  }
 
   for (const withdraws of [true, false]) {
     it(`a turn with no trigger speaks into the latest message's channel through that message's server${withdraws ? ', and nowhere once it withdrew the channel' : ''}`, async () => {
@@ -474,23 +527,29 @@ describe("a turn's replies go out through the server whose message triggered it"
     assert.deepEqual(published('batched reply'), [], 'neither server is taken for the shared channel');
   });
 
-  it("a channel_publish naming the trigger's channel goes through the trigger's server; one naming another shared id is refused, saying why", async () => {
+  it("a channel_publish naming the trigger's channel goes through the trigger's server; another shared id takes the server the call names, and is refused without one", async () => {
     await registerX('slack', '#room (slack)');
     await registry().handleRegister('slack', { channels: [{ id: 'discord:g1:general', type: 'chat', label: '#general (slack)', direction: 'bidirectional' }] });
+    await registry().handleRegister('discord', { channels: [{ id: 'discord:g1:only', type: 'chat', label: '#only (Guild One)', direction: 'bidirectional' }] });
     membrane.pushResponse(createMockResponse([
       { type: 'tool_use', id: 'pub-1', name: 'channel_publish', input: { channelId: X, content: 'named reply' } },
       { type: 'tool_use', id: 'pub-2', name: 'channel_publish', input: { channelId: 'discord:g1:general', content: 'other reply' } },
+      { type: 'tool_use', id: 'pub-3', name: 'channel_publish', input: { channelId: 'discord:g1:general', serverId: 'slack', content: 'chosen reply' } },
+      { type: 'tool_use', id: 'pub-4', name: 'channel_publish', input: { channelId: 'discord:g1:only', serverId: 'slack', content: 'misnamed reply' } },
     ], 'tool_use'));
     membrane.pushResponse(createMockResponse([{ type: 'text', text: 'after the tools' }]));
     await pushX('slack', 'ev-tool');
     await settle();
     assert.deepEqual(published('named reply'), ['slack']);
     assert.deepEqual(published('other reply'), []);
+    assert.deepEqual(published('chosen reply'), ['slack'], 'the server the call names');
+    assert.deepEqual(published('misnamed reply'), [], 'a named server that does not register the id is held to, not passed over');
     const results = framework.getAgent('scout')!.getContextManager().getAllMessages()
       .flatMap((m) => m.content).filter((c) => c.type === 'tool_result')
       .map((c) => JSON.stringify(c));
-    assert.ok(results.some((r) => r.includes("registered by more than one MCPL server, and this tool can't choose between them, so nothing was published")),
+    assert.ok(results.some((r) => r.includes('Channel id is ambiguous across MCPL servers: discord:g1:general. Include serverId.')),
       results.join('\n'));
+    assert.ok(results.some((r) => r.includes('Channel not found: discord:g1:only on server slack')), results.join('\n'));
   });
 });
 
