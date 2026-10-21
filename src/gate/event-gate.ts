@@ -748,13 +748,22 @@ export class EventGate {
             );
           }
         };
+        // The recipe's own problems are named as the recipe's: the validator's
+        // words speak of gate.json, which it also reads.
+        const checkRecipe = (raw: GateConfig): GateConfig => {
+          try {
+            return validateConfig(raw);
+          } catch (err) {
+            throw new Error(`the recipe doesn't validate (${err instanceof Error ? err.message : String(err)}), so it wasn't applied`);
+          }
+        };
         if (!existsSync(this.configPath)) {
-          const seed = validateConfig(opts.initialConfig);
+          const seed = checkRecipe(opts.initialConfig);
           const twice = duplicateName(seed);
           if (twice !== undefined) {
             throw new Error(
               `the recipe named the rule "${twice}" twice, so gate.json wasn't seeded and nothing was recorded: `
-                + 'the gate runs on the recipe as given, and the next start tries again',
+                + 'the gate runs on the recipe as given, and a start whose recipe names each rule once seeds it',
             );
           }
           writeJson(this.configPath, opts.initialConfig);
@@ -766,9 +775,9 @@ export class EventGate {
           if (!existing) {
             // The load error is in configErrors until gate.json loads; that
             // the recipe wasn't applied stays true until the next start.
-            throw new Error("it didn't load, so the recipe wasn't applied or recorded");
+            throw new Error("it didn't load, so the recipe wasn't applied or recorded, and the gate runs on the recipe as given until gate.json loads");
           } else {
-            const recipe = validateConfig(opts.initialConfig);
+            const recipe = checkRecipe(opts.initialConfig);
             const last = readLastRecipe(recipePath);
             const { config, changes } = reconcileWithRecipe(existing, recipe, last.recipe);
             if (last.problem !== undefined) changes.recordUnreadable = last.problem;

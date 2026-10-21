@@ -262,7 +262,7 @@ export function reconcileWithRecipe(
 export function reconcileLine(changes: RecipeChanges): string | null {
   const parts: string[] = [];
   if (changes.recordUnreadable !== undefined) {
-    parts.push(`the recorded recipe couldn't be read (${changes.recordUnreadable}), so this start removed and redefined nothing, and records this recipe in its place`);
+    parts.push(`the recorded recipe couldn't be read (${changes.recordUnreadable}), so this start removed and redefined nothing`);
   }
   const list = (label: string, names: string[]) => {
     if (names.length > 0) parts.push(`${label} ${names.join(', ')}`);
