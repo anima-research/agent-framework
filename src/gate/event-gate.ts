@@ -1782,10 +1782,9 @@ export class EventGate {
 
   /**
    * `agentName` is gone, as a conversation fork's end or an ephemeral run's
-   * removes one: its pending self-wake is cancelled, and a sleep it set ends.
-   * The gate's sleep holds back every agent's wakes, so nobody is asleep once
-   * its agent is gone, and neither wake would reach a name that no longer
-   * exists. A sleep another agent set, or one set with no agent, stays.
+   * removes one: its pending self-wake is cancelled, rather than wake a name
+   * that no longer exists. It holds no sleep: neither can set one (the
+   * framework refuses their `sleep`).
    */
   agentGone(agentName: string): void {
     const selfWake = this.selfWakeTimers.get(agentName);
@@ -1793,7 +1792,6 @@ export class EventGate {
       clearTimeout(selfWake);
       this.selfWakeTimers.delete(agentName);
     }
-    if (this.sleepUntil !== 0 && this.sleepAgent === agentName) this.clearSleep();
   }
 
   // =========================================================================

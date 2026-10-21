@@ -257,14 +257,22 @@ describe('an ephemeral run takes no global fallback (#551)', () => {
     } finally { await f.close(); }
   });
 
-  it('a subagent\'s sleep announcement is not posted to the latest inbound channel', async () => {
+  it('a subagent\'s sleep is refused, so nothing is announced and the gate stays awake', async () => {
     const f = await fixture({ framework: { gate: { config: { default: 'always' } } } as never });
     const t = speechTraces(f);
+    const refusals: string[] = [];
+    f.framework.onTrace((e) => {
+      const failed = e as { type?: string; module?: string; tool?: string; error?: string };
+      if (failed.type === 'tool:failed' && failed.module === 'gate') refusals.push(`${failed.tool}: ${failed.error}`);
+    });
     try {
       await busyFallback(f);
       await runSubagent(f, 'sub-sleep', 'locus', true,
-        createMockResponse([{ type: 'tool_use', id: 's1', name: 'sleep', input: { seconds: 60, message: 'subagent going quiet' } }], 'tool_use'));
+        createMockResponse([{ type: 'tool_use', id: 's1', name: 'sleep', input: { seconds: 60, message: 'subagent going quiet' } }], 'tool_use'),
+        text('done'));
 
+      assert.deepEqual(refusals, ['sleep: sub-sleep: Nothing was set: a sleep quiets the whole agent, not one run.']);
+      assert.equal((f.framework as unknown as { eventGate: { getSleepState(): unknown } }).eventGate.getSleepState(), null, 'the gate stays awake');
       assert.ok(!publishedText(f).includes('subagent going quiet'), `not published: ${publishedText(f)}`);
       assert.deepEqual(t.seen.filter((x) => x.conversationId === 'sub-sleep'), [], 'neither routed nor counted as a failed route');
     } finally { t.off(); await f.close(); }

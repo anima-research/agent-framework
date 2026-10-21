@@ -680,8 +680,9 @@ describe('Conversation routing', () => {
     }
   });
 
-  // The gate's sleep is one for every agent, and its wake goes to the agent
-  // that set it: a fork's sleep ends with the fork.
+  // The gate's sleep quiets the whole agent, every conversation of it, so a
+  // fork's sleep and wake are refused (#646), and a fork's end tells the gate,
+  // which cancels the fork's pending self-wake.
   async function makeGatedFramework(conversations: Partial<ConversationRouterConfig> = {}) {
     return AgentFramework.create({
       storePath: join(tempDir, 'test.chronicle'),
@@ -693,53 +694,88 @@ describe('Conversation routing', () => {
     });
   }
   const gateOf = (framework: AgentFramework) => (framework as unknown as { eventGate: EventGate }).eventGate;
+  const gateRefusals = (framework: AgentFramework) => {
+    const refusals: string[] = [];
+    framework.onTrace((e: TraceEvent) => {
+      const failed = e as { type: string; module?: string; tool?: string; error?: string };
+      if (failed.type === 'tool:failed' && failed.module === 'gate') refusals.push(`${failed.tool}: ${failed.error}`);
+    });
+    return refusals;
+  };
+  const ordinaryWake = { eventType: 'external-message', serverId: 'test', channelId: '', content: 'tick' };
 
-  it("a fork's sleep ends when the idle sweep closes the fork", async () => {
+  it("a fork's sleep is refused, so the primary's ordinary wakes aren't held back", async () => {
+    membrane.pushResponse(createMockResponse([{ type: 'tool_use', id: 's1', name: 'sleep', input: { seconds: 3600, announce: false } }], 'tool_use'));
+    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'ok' }]));
+    const framework = await makeGatedFramework();
+    const gate = gateOf(framework);
+    const refusals = gateRefusals(framework);
+    try {
+      framework.pushEvent(incomingEvent({ channelId: 'slack:D9', text: 'hi', channelType: 'im' }));
+      await framework.runUntilIdle();
+      const fork = forkName('slack:D9', 1);
+      assert.deepStrictEqual(refusals, [`sleep: ${fork}: Nothing was set: a sleep quiets the whole agent, not one conversation.`]);
+      assert.equal(gate.getSleepState(), null, 'nothing is asleep');
+      assert.notEqual(gate.evaluate(ordinaryWake).policyName, 'asleep', "the primary's ordinary wake goes on to the policies");
+    } finally {
+      // So that a run where the sleep takes doesn't hold the file's process for its hour.
+      gate.clearSleep();
+      await framework.stop();
+    }
+  });
+
+  it("a fork's wake is refused, so the primary's sleep stays", async () => {
+    membrane.pushResponse(createMockResponse([{ type: 'tool_use', id: 'w1', name: 'wake', input: {} }], 'tool_use'));
+    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'ok' }]));
+    const framework = await makeGatedFramework();
+    const gate = gateOf(framework);
+    const refusals = gateRefusals(framework);
+    try {
+      gate.setSleep(3600, 'resting', 'trunk');
+      framework.pushEvent(incomingEvent({ channelId: 'slack:D10', text: 'hi', channelType: 'im' }));
+      await framework.runUntilIdle();
+      const fork = forkName('slack:D10', 1);
+      assert.deepStrictEqual(refusals, [`wake: ${fork}: Nothing was changed: a sleep is the agent's, so this conversation can't end one.`]);
+      assert.ok(gate.getSleepState() !== null, "the primary's sleep stays");
+    } finally {
+      gate.clearSleep();
+      await framework.stop();
+    }
+  });
+
+  it("a fork's end at the idle sweep tells the gate", async () => {
     const IDLE_TTL_MS = 60_000;
     membrane.pushResponse(createMockResponse([{ type: 'text', text: 'hello!' }]));
     const framework = await makeGatedFramework({ idleTtlMs: IDLE_TTL_MS });
+    const gone = goneNames(gateOf(framework));
     try {
       framework.pushEvent(incomingEvent({ channelId: 'slack:D7', text: 'hi', channelType: 'im' }));
       await framework.runUntilIdle();
       const fork = forkName('slack:D7', 1);
       assert.ok(framework.getAgent(fork), 'the fork exists');
-      gateOf(framework).setSleep(3600, 'resting', fork);
-      const gone = goneNames(gateOf(framework));
 
       forceExpiry(framework, 'slack:D7', IDLE_TTL_MS);
       membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Final report posted.' }]));
       framework.pushEvent({ type: 'external-message', source: 'test', content: 'tick', metadata: {} } as unknown as ProcessEvent);
       await framework.runUntilIdle();
-
       assert.equal(framework.getAgent(fork), null, 'the fork is disposed');
-      assert.equal(gateOf(framework).getSleepState(), null, "and its sleep ends with it, so the other agents' wakes aren't held back");
-      assert.deepStrictEqual(gone, [fork], "the fork's end told the gate, which ends its self-wake too");
+      assert.deepStrictEqual(gone, [fork], 'and its end told the gate, which cancels its self-wake');
     } finally {
-      // So that a run where the fork's end leaves the sleep doesn't hold the
-      // file's process for the sleep's hour.
-      gateOf(framework).clearSleep();
       await framework.stop();
     }
   });
 
-  it("a fork's sleep ends when stop() ends the fork", async () => {
+  it("a fork's end at stop() tells the gate", async () => {
     membrane.pushResponse(createMockResponse([{ type: 'text', text: 'hello!' }]));
     const framework = await makeGatedFramework();
+    const gone = goneNames(gateOf(framework));
     framework.pushEvent(incomingEvent({ channelId: 'slack:D8', text: 'hi', channelType: 'im' }));
     await framework.runUntilIdle();
     const fork = forkName('slack:D8', 1);
     assert.ok(framework.getAgent(fork), 'the fork exists');
-    const gate = gateOf(framework);
-    const gone = goneNames(gate);
-    try {
-      gate.setSleep(3600, 'resting', fork);
-      await framework.stop();
-      assert.equal(framework.getAgent(fork), null, 'stop() ends the fork');
-      assert.equal(gate.inferenceDiagnostics().sleepUntil, 0, 'and its sleep with it');
-      assert.deepStrictEqual(gone, [fork], "the fork's end told the gate, which ends its self-wake too");
-    } finally {
-      gate.clearSleep();
-    }
+    await framework.stop();
+    assert.equal(framework.getAgent(fork), null, 'stop() ends the fork');
+    assert.deepStrictEqual(gone, [fork], 'and its end told the gate');
   });
 
   it('a write deferred for a fork during its closure turn is stored in the fork before it is disposed', async () => {
