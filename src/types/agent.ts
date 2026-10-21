@@ -14,7 +14,12 @@ export type SameRoundThinkTextPolicySource =
  */
 export interface AgentConfig {
   toolPresentation?: import("../tool-presentation.js").ToolPresentationConfig;
-  /** Unique name for this agent */
+  /**
+   * Unique name for this agent: create() refuses two configured agents of one
+   * name. Names compare exactly, so `Dup` beside `dup` is two agents, though
+   * the history tool's author filter matches their own turns without letter
+   * case and can't tell them apart there.
+   */
   name: string;
 
   /** Model to use (e.g., 'claude-sonnet-4-20250514') */
@@ -27,9 +32,19 @@ export interface AgentConfig {
   strategy?: ContextStrategy;
 
   /**
-   * Which tools this agent can use.
+   * Enforced at dispatch for registered agent callers; omitted means 'all'.
    * - 'all': all available tools
-   * - string[]: specific tool names (with module prefix)
+   * - string[]: exact tool names, including module--utility names for utilities.
+   * Utilities aren't tools of their own: an agent's model and its scripts are
+   * offered them only through 'utils', whose run checks the utility's own
+   * name. An agent that should use a utility lists both 'utils' and
+   * 'module--utility'. The name alone passes the dispatch check for any call
+   * by that name, whether the host makes it with executeToolCall on the
+   * agent's behalf or the model or a script makes it without being offered
+   * it. The slot is hidden when no utility is permitted.
+   * Trusted module calls are exempt. Genuinely unidentified public callers,
+   * including unknown legacy names, remain unrestricted. Framework-created
+   * identities have tool authority only while registered.
    */
   allowedTools?: 'all' | string[];
 
@@ -93,11 +108,16 @@ export interface AgentConfig {
   promptCaching?: boolean;
 
   /**
-   * Prefill-formatter support: a synthetic user message appended after the
-   * conversation (e.g. chapterx's `<cmd>cat untitled.txt</cmd>` CLI-sim
-   * scaffold). Forwarded verbatim to membrane's prefill formatters; ignored
-   * by native formatting. Part of reproducing a prefill-era bot's exact
-   * prompting structure when migrating it into a resident.
+   * A synthetic user message for a request whose formatted conversation
+   * would otherwise begin with the assistant (e.g. chapterx's
+   * `<cmd>cat untitled.txt</cmd>` CLI-sim scaffold). A non-empty value is
+   * forwarded verbatim to membrane, on framework turns and the direct API
+   * alike. Membrane's anthropic-xml formatter makes it the first message,
+   * ahead of the assistant turn that carries the conversation. Its native
+   * formatter uses it as the text of a leading user turn that its tool-pair
+   * normalizer adds, in place of `[continuing]`. Part of reproducing a
+   * prefill-era bot's exact prompting structure when migrating it into a
+   * resident.
    */
   prefillUserMessage?: string;
 
@@ -167,12 +187,6 @@ export interface AgentConfig {
     autoRewind?: boolean;
     /** Max consecutive rewinds before giving up a turn. Default 3. */
     maxRewinds?: number;
-    /**
-     * When the rewound turn is a *human* message (not a machine tool result),
-     * announce the withholding on the conversational surface (Discord) rather
-     * than dropping it silently. Default true.
-     */
-    announceHumanTurns?: boolean;
   };
 
   /** Opt-in tool-output admission and one guarded retry after a provider
@@ -192,7 +206,8 @@ export interface AgentConfig {
    *   that publication envelope through the same authorized resolver.
    *   See docs/hybrid-prose-routing.md.
    * - 'disabled': generated prose is never published. Only explicit tools may
-   *   send externally; prose remains in Chronicle with a private suppression receipt.
+   *   send externally; prose remains in Chronicle, and a turn that wrote plain
+   *   speech ends with a private `[delivered] plain speech → no channel` receipt.
    */
   proseRouting?: 'locus' | 'explicit' | 'hybrid' | 'disabled';
 
@@ -312,13 +327,18 @@ export interface InferenceOptions {
 
 /**
  * Internal state of an agent.
+ *
+ * `supportsInjectedMessages` is what the stream declared with the round's
+ * tool calls (membrane's `ToolContext.supportsInjectedMessages`): whether it
+ * can carry messages injected with that round's results. It's absent when
+ * the stream doesn't say, as on membrane 0.5.87 and earlier.
  */
 export type AgentState =
   | { status: 'idle' }
   | { status: 'inferring'; promise: Promise<InferenceResult>; abortController: AbortController }
   | { status: 'streaming'; stream: YieldingStream }
-  | { status: 'waiting_for_tools'; pending: Map<ToolCallId, PendingToolCall>; completed: CompletedToolCall[]; stream?: YieldingStream }
-  | { status: 'ready'; toolResults: CompletedToolCall[]; stream?: YieldingStream };
+  | { status: 'waiting_for_tools'; pending: Map<ToolCallId, PendingToolCall>; completed: CompletedToolCall[]; stream?: YieldingStream; supportsInjectedMessages?: boolean }
+  | { status: 'ready'; toolResults: CompletedToolCall[]; stream?: YieldingStream; supportsInjectedMessages?: boolean };
 
 /**
  * A tool call that's in progress.
@@ -356,6 +376,10 @@ export interface InferenceRequest {
    *  all of them without materializing content, the turn has no cause left
    *  and does not run. */
   coalescingBatchSubjects?: string[];
+  /** Host-owned: this wake's sole cause is reading this deferred write, a
+   *  coalesced render placed in its agent's queue (wakeToRead). Once the
+   *  agent has read the write, or it was removed, the wake starts no turn. */
+  readsDeferredWrite?: string;
   agentName: string;
   reason: string;
   source: string;
@@ -367,7 +391,8 @@ export interface InferenceRequest {
    * replies in the channel it is answering — not the process-global most-recent-
    * inbound locus, which a concurrent message elsewhere can hijack (item-3
    * redux). Undefined for non-channel wakes (heartbeat, timers, module events),
-   * which correctly fall back to the global default channel.
+   * which correctly fall back to the global default channel, except an
+   * ephemeral run's (a subagent's), which takes no global fallback.
    */
   channelId?: string;
   /**
@@ -401,11 +426,10 @@ export interface InferenceRequest {
   /** Suppress every automatic plain-prose delivery for this logical turn.
    * Explicit tool calls remain available. Used by authenticated silent wakes. */
   suppressProse?: boolean;
-  /** Ephemeral system-position prompt for this turn only. Never written to
-   * Chronicle; callers must supply bounded non-secret control text. */
-  ephemeralSystemPrompt?: string;
-  /** The authenticated silent heartbeat tick this turn answers. Every row the
-   * turn stores is stamped `metadata.silentHeartbeat` with it, and request
-   * builds render a request-only separator before the tick's first row. */
+  /** The authenticated silent heartbeat tick this turn answers. The rows the
+   * turn's reply stores (its assistant responses and tool results) are
+   * stamped `metadata.silentHeartbeat` with it, and request builds render a
+   * request-only separator carrying the tick's instruction before the tick's
+   * first surviving row (`SILENT_HEARTBEAT_SEPARATOR`). */
   silentHeartbeat?: SilentHeartbeatTick;
 }

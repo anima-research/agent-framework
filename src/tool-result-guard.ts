@@ -3,8 +3,8 @@ import { isDeepStrictEqual } from 'node:util';
 import type { ContextManager, MessageId, MessageMetadata } from '@animalabs/context-manager';
 import type { ContentBlock, NormalizedMessage, ToolResult } from '@animalabs/membrane';
 import type { CompletedToolCall } from './types/index.js';
-import { isStateExistsError } from './module-registry.js';
-import { toolResultDataToHistoryString } from './tool-result-history.js';
+import { ensureStateRegistered } from './module-registry.js';
+import { rfc005TextOf, toolResultDataToHistoryString } from './tool-result-history.js';
 import { safeSlice } from './safe-slice.js';
 
 export const TOOL_RESULT_GUARD_NOTICE = 'Tool result withheld by the guard. The tool has already executed.';
@@ -18,7 +18,7 @@ export const TOOL_RESULT_GUARD_AUDIT_STATE = 'framework/tool-result-guard';
  *  left the stub's branch when the file would have been committed
  *  (`branch_changed`), or because the batch used its deadline before this
  *  write could start (`batch_deadline`); or null when no file is written at all (no writable
- *  workspace, or the host is stopping). */
+ *  mount without an include, or the host is stopping). */
 export type WithheldSpill =
   | { path: string; error?: string; unfinished?: true }
   | { skipped: 'workspace_unanswered' | 'branch_changed' | 'batch_deadline' }
@@ -101,7 +101,10 @@ export function keptWhenWithheld(result: CompletedToolCall['result'], maxChars: 
   const fields = data as Record<string, unknown>;
   const kept = Object.fromEntries(keys.filter((key) => Object.hasOwn(fields, key)).map((key) => [key, fields[key]]));
   if (Object.keys(kept).length === 0) return undefined;
-  const whole = toolResultDataToHistoryString(kept);
+  // Data that RFC-005 shows as text, such as a reference's stub, keeps that
+  // text: picked out of it, a kept uri would lose the type that makes it a
+  // reference, and be written out of the stub that hides it.
+  const whole = rfc005TextOf(fields) ?? toolResultDataToHistoryString(kept);
   if (!maxChars || whole.length <= maxChars) return whole;
   // Never half a surrogate pair: the stub goes to the provider as text, so
   // the cut can be one character short of the cap.
@@ -295,11 +298,7 @@ export class ToolResultGuard {
   private write(record: Record<string, unknown>): void {
     const store = this.cm.getStore();
     if (!this.registered) {
-      try {
-        store.registerState({ id: TOOL_RESULT_GUARD_AUDIT_STATE, strategy: 'append_log' });
-      } catch (error) {
-        if (!isStateExistsError(error)) throw error;
-      }
+      ensureStateRegistered(store, { id: TOOL_RESULT_GUARD_AUDIT_STATE, strategy: 'append_log' });
       this.registered = true;
     }
     store.appendToStateJson(TOOL_RESULT_GUARD_AUDIT_STATE, record);
@@ -498,8 +497,9 @@ export class ToolResultGuard {
 
   /**
    * Turn a withheld batch's notices into stubs that say where each original
-   * is (agent-framework #277): written to the workspace when a writable mount
-   * takes it, else kept in the audit record. A stub also keeps the file
+   * is (agent-framework #277): written to the workspace when it has a
+   * writable mount without an include to take it, else kept in the audit
+   * record. A stub also keeps the file
    * lists its tool marked. Its own unedited placeholder is
    * the only thing it edits: an operator's later edit, removal or rollback
    * stands.
@@ -597,8 +597,8 @@ export class ToolResultGuard {
               if (block.type !== 'tool_result') return [];
               if (thrown.has(index)) return [{ toolUseId: block.toolUseId, error: thrown.get(index)! }];
               const spill = spills.get(index) ?? null;
-              // No file was written: no writable workspace, or the framework
-              // was stopping.
+              // No file was written: no writable mount without an include,
+              // or the framework was stopping.
               if (spill === null) return [{ toolUseId: block.toolUseId, skipped: 'no_workspace_file' }];
               if ('skipped' in spill) return [{ toolUseId: block.toolUseId, skipped: spill.skipped }];
               return [{ toolUseId: block.toolUseId, path: spill.path,

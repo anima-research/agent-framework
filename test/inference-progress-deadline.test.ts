@@ -247,9 +247,10 @@ test('a stall that persists through the retries exhausts the turn with its reaso
 });
 
 test("an abort that isn't the deadline's, with no recorded cancel, still settles the turn as it did", async () => {
-  // Such as an operator's abortInference: reason 'user', nothing recorded.
+  // Such as a typed abort membrane reports as 'error', with nothing recorded.
+  // ('user' is a deliberate cancel, which settles without exhausting.)
   const membrane = new RecordingMembrane();
-  membrane.streams.push(() => new ExpiredStream('user'));
+  membrane.streams.push(() => new ExpiredStream('error'));
   const policy = recordingPolicy(1);
   await withFramework(membrane, { errorPolicy: policy }, async (framework, traces) => {
     framework.start();
@@ -258,7 +259,7 @@ test("an abort that isn't the deadline's, with no recorded cancel, still settles
 
     assert.deepEqual(policy.seen, []);
     const exhausted = traces.find((t) => t.type === 'inference:exhausted') as Extract<TraceEvent, { type: 'inference:exhausted' }>;
-    assert.equal(exhausted.error, 'Stream aborted: user');
+    assert.equal(exhausted.error, 'Stream aborted: error');
     assert.equal(membrane.calls.length, 1);
   });
 });
@@ -384,12 +385,12 @@ function routerHarness(stream: () => YieldingStream, routerOptions?: { progressT
     { validateInbound: () => {} } as never,
     null,
     (event) => traces.push(event),
-    (_serverId, params) => chunks.push(params),
     routerOptions,
   );
   const answers: Array<{ result?: unknown; error?: { code: number; message: string } }> = [];
   const responder = {
     requestId: 7,
+    sendChunk: (params: unknown) => chunks.push(params),
     respond: (result: unknown) => answers.push({ result }),
     respondError: (code: number, message: string) => answers.push({ error: { code, message } }),
   };
@@ -422,21 +423,8 @@ test('a streamed request that ends on its deadline answers the server with an er
   assert.equal(h.traces.some((t) => t.type === 'mcpl:inference_complete'), false);
 });
 
-test("a streamed request that ends on another abort answers the server with an error naming it", async () => {
-  const h = routerHarness(() => new ExpiredStream('error'));
+test('a streamed request that ends on another abort answers the server with that abort, not the deadline', async () => {
+  const h = routerHarness(() => new ExpiredStream('error'), { progressTimeoutMs: 1234 });
   await h.router.handleInferenceRequest('srv', { featureSet: 'f', stream: true, messages: [{ role: 'user', content: 'hi' }] }, h.responder);
-  assert.deepEqual(h.answers, [{ error: { code: -32603, message: 'Inference aborted (error)' } }]);
-});
-
-test("a streamed request whose stream fails answers the server with the stream's error", async () => {
-  class FailingStream extends ExpiredStream {
-    override async *[Symbol.asyncIterator](): AsyncIterator<StreamEvent> {
-      yield { type: 'tokens', content: 'partial ', meta: { type: 'text', visible: true, blockIndex: 0 } } as StreamEvent;
-      yield { type: 'error', error: new Error('upstream reset') } as StreamEvent;
-    }
-  }
-  const h = routerHarness(() => new FailingStream());
-  await h.router.handleInferenceRequest('srv', { featureSet: 'f', stream: true, messages: [{ role: 'user', content: 'hi' }] }, h.responder);
-  assert.equal(h.chunks.length, 1, 'what arrived was streamed as it came');
-  assert.deepEqual(h.answers, [{ error: { code: -32603, message: 'upstream reset' } }]);
+  assert.deepEqual(h.answers, [{ error: { code: -32603, message: 'The inference stopped before it finished (error)' } }]);
 });

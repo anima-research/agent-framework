@@ -14,6 +14,8 @@
 import { existsSync, readFileSync, statSync, writeFileSync, mkdirSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { GateScript } from './gate-script.js';
+import { MAX_TIMER_MS } from '../deadline-timer.js';
+import { safeSlice } from '../safe-slice.js';
 
 import type { ToolDefinition } from '../types/events.js';
 import type {
@@ -44,6 +46,15 @@ const MAX_TRACE_SNIPPET = 80;
 const MAX_INFERENCE_BUFFER = 100;
 /** Minimum interval between filesystem checks for config changes (ms). */
 const RELOAD_THROTTLE_MS = 1000;
+
+/**
+ * Parse a gate file's text as JSON. Some Windows editors save UTF-8 with a
+ * leading U+FEFF (BOM), which `readFileSync(…, 'utf-8')` keeps and
+ * `JSON.parse` rejects; drop exactly one before parsing (#395).
+ */
+function parseGateJson(text: string): unknown {
+  return JSON.parse(text.charCodeAt(0) === 0xfeff ? text.slice(1) : text);
+}
 /** Minimum debounce value (ms). */
 const MIN_DEBOUNCE_MS = 100;
 /** Maximum debounce value (ms). */
@@ -592,6 +603,9 @@ export class EventGate {
   private sleepSuppressed = 0;
   private sleepTimer: ReturnType<typeof setTimeout> | null = null;
   private sleepAgent: string | undefined;
+  // From dispose() to the next resumeSleep(): no sleep or self-wake timer is
+  // armed, though a turn a failed stop() left running can still ask for one.
+  private disposed = false;
 
   // Self-wake timers per agent (skip_reply's wake_in_seconds). Unlike sleep,
   // a self-wake suppresses NOTHING — it means "if nothing else wakes me by
@@ -722,7 +736,7 @@ export class EventGate {
       const raw = readFileSync(this.configPath, 'utf-8');
       const stat = statSync(this.configPath);
       this.configMtime = stat.mtimeMs;
-      const config = validateConfig(JSON.parse(raw));
+      const config = validateConfig(parseGateJson(raw));
       this.configSource = 'file';
       this.configErrors = [];
       return config;
@@ -1038,11 +1052,13 @@ export class EventGate {
     // rouse the agent — its own heartbeat (an internal clock, not an outside
     // interruption: each tick lets the agent reconsider and optionally `wake`)
     // and a privileged user's ping. The event always enters context regardless
-    // (the gate only governs inference triggering).
+    // (the gate only governs inference triggering). The heartbeat is the
+    // server the host knows as `heartbeat`, the server id the silent-heartbeat
+    // marker requires too: a `source` in an event's metadata is the server's
+    // own word, which any server can give.
     if (this.sleepUntil > this.now()) {
       this.reloadPrivilegedIfChanged();
-      const isHeartbeat =
-        info.metadata?.source === 'heartbeat' || info.serverId === 'heartbeat';
+      const isHeartbeat = info.serverId === 'heartbeat';
       const authorId = this.extractAuthorId(info.metadata);
       const privileged = authorId !== null && this.privilegedUserIds.has(authorId);
       if (!isHeartbeat && !privileged) {
@@ -1484,7 +1500,7 @@ export class EventGate {
     const event: PendingEvent = {
       policyName: policy.name,
       content: info.content.length > MAX_CONTENT_SNIPPET
-        ? info.content.slice(0, MAX_CONTENT_SNIPPET) + '...'
+        ? safeSlice(info.content, 0, MAX_CONTENT_SNIPPET) + '...'
         : info.content,
       eventType: info.eventType,
       timestamp: Date.now(),
@@ -1573,8 +1589,10 @@ export class EventGate {
       }
       for (const [channelId, { count, oldest, label }] of byChannel) {
         // Prefer the human-readable name; keep the id parenthesized so the
-        // agent can still address tools that want the composite id.
-        const channel = label ? `#${label} (${channelId})` : channelId;
+        // agent can still address tools that want the composite id. A name
+        // may carry its own `#`, so one is added only where the name lacks
+        // it, as at the other places that add a `#`.
+        const channel = label ? `${label.startsWith('#') ? label : `#${label}`} (${channelId})` : channelId;
         const age = Math.round((Date.now() - oldest) / 1000);
         lines.push(
           `- ${count} message${count > 1 ? 's' : ''} in ${channel} ` +
@@ -1618,6 +1636,17 @@ export class EventGate {
       clearTimeout(selfWake);
       this.selfWakeTimers.delete(agentName);
     }
+  }
+
+  /** A turn that continues another (a budget restart, a tool-result-guard
+   *  retry) holds the entry its predecessor kept for it, and takes it again
+   *  where that entry ended in between: at a stop(), whose dispose() clears
+   *  every entry, or at a provider hold that kept the turn from starting,
+   *  whose end queues it again. Unlike onInferenceStarted it leaves a
+   *  pending self-wake alone: the logical turn that armed it is the one
+   *  still running. */
+  onInferenceResumed(agentName: string): void {
+    this.inferring.add(agentName);
   }
 
   onInferenceEnded(agentName: string): void {
@@ -1710,9 +1739,9 @@ export class EventGate {
     this.sleepSuppressed = 0;
     // Arm the self-wake: when the window elapses, clear sleep and request an
     // inference so the agent resumes on its own (not dependent on a heartbeat
-    // tick or an incoming message). Cancelled by clearSleep()/`wake`.
-    if (this.sleepTimer) clearTimeout(this.sleepTimer);
-    this.sleepTimer = setTimeout(() => this.wakeFromSleep('sleep-expired'), ms);
+    // tick or an incoming message). Cancelled by clearSleep()/`wake`, and by
+    // dispose(), after which start() arms it again (resumeSleep).
+    this.armSleepWake();
     this.reloadPrivilegedIfChanged();
     this.emitTrace({
       type: 'gate:decision',
@@ -1723,6 +1752,48 @@ export class EventGate {
       timestamp: this.now(),
     });
     return { until: this.sleepUntil };
+  }
+
+  /**
+   * Arm timers again for a lifecycle that starts after a stop(), and the
+   * sleep's wake first: dispose() clears its timer and keeps the sleep. A
+   * sleep still ahead wakes the agent at its end; one that ended while
+   * stopped wakes it now, since that wake is what the agent asked for. With
+   * no sleep, wakeFromSleep does nothing.
+   */
+  resumeSleep(): void {
+    this.disposed = false;
+    if (this.sleepUntil > this.now()) this.armSleepWake();
+    else this.wakeFromSleep('sleep-expired');
+  }
+
+  /**
+   * Arm the sleep's wake for its end by the gate's own clock. One timer holds
+   * at most MAX_TIMER_MS, about 24.8 days, so a longer sleep waits in steps,
+   * and wakeFromSleep reads the clock as each one fires. Nothing is armed
+   * while the gate is disposed: resumeSleep() arms it at the next start().
+   */
+  private armSleepWake(): void {
+    if (this.sleepTimer) { clearTimeout(this.sleepTimer); this.sleepTimer = null; }
+    if (this.disposed) return;
+    const remaining = Math.max(0, this.sleepUntil - this.now());
+    this.sleepTimer = setTimeout(() => this.wakeFromSleep('sleep-expired'), Math.min(remaining, MAX_TIMER_MS));
+  }
+
+  /**
+   * `agentName` is gone, as a conversation fork's end or an ephemeral run's
+   * removes one: its pending self-wake is cancelled, and a sleep it set ends.
+   * The gate's sleep holds back every agent's wakes, so nobody is asleep once
+   * its agent is gone, and neither wake would reach a name that no longer
+   * exists. A sleep another agent set, or one set with no agent, stays.
+   */
+  agentGone(agentName: string): void {
+    const selfWake = this.selfWakeTimers.get(agentName);
+    if (selfWake) {
+      clearTimeout(selfWake);
+      this.selfWakeTimers.delete(agentName);
+    }
+    if (this.sleepUntil !== 0 && this.sleepAgent === agentName) this.clearSleep();
   }
 
   // =========================================================================
@@ -1736,8 +1807,11 @@ export class EventGate {
    * Cancelled by the agent's next turn start (see onInferenceStarted):
    * the semantics are "if nothing else wakes me by then, wake me".
    */
-  armSelfWake(agentName: string, seconds: number, source = 'skip_reply'): { inMs: number } {
+  armSelfWake(agentName: string, seconds: number, source = 'skip_reply'): { inMs: number; armed: boolean } {
     const ms = Math.max(1_000, Math.min(3_600_000, Math.floor(seconds * 1000)));
+    // A stopped framework's late turn arms no timer (disposed). A self-wake
+    // doesn't outlive a stop, as dispose() clearing the pending ones says.
+    if (this.disposed) return { inMs: ms, armed: false };
     const prev = this.selfWakeTimers.get(agentName);
     if (prev) clearTimeout(prev);
     const timer = setTimeout(() => {
@@ -1778,7 +1852,7 @@ export class EventGate {
       behavior: 'skip',
       timestamp: this.now(),
     });
-    return { inMs: ms };
+    return { inMs: ms, armed: true };
   }
 
   /** End sleep immediately. Returns true if the agent was asleep. */
@@ -1796,11 +1870,20 @@ export class EventGate {
    * Clears the sleep state and requests an inference so the agent wakes on its
    * own — this is what makes `sleep(N)` a real "wake me in N seconds" rather
    * than just a suppression window. No-op if sleep was already cleared (via
-   * `wake`) or re-armed to a later time by a fresh `sleep` call.
+   * `wake`). A timer that fires before the sleep's end by the gate's clock
+   * arms the rest: a step of a sleep longer than one timer holds, a timer that
+   * fires early (Node's can, by a millisecond), or a clock set back.
    */
   private wakeFromSleep(reason: string): void {
-    this.sleepTimer = null;
-    if (this.sleepUntil === 0 || this.sleepUntil > this.now()) return;
+    // The timer that called it has fired; from resumeSleep(), for a sleep
+    // already over, one may still be armed, and it goes, so no stale step of
+    // it can fire later.
+    if (this.sleepTimer) { clearTimeout(this.sleepTimer); this.sleepTimer = null; }
+    if (this.sleepUntil === 0) return;
+    if (this.sleepUntil > this.now()) {
+      this.armSleepWake();
+      return;
+    }
     const note = this.sleepNote;
     const agent = this.sleepAgent;
     this.sleepUntil = 0;
@@ -1856,7 +1939,7 @@ export class EventGate {
         return;
       }
       this.privilegedMtime = statSync(this.privilegedUsersPath).mtimeMs;
-      const raw = JSON.parse(readFileSync(this.privilegedUsersPath, 'utf8'));
+      const raw: any = parseGateJson(readFileSync(this.privilegedUsersPath, 'utf8'));
       const ids = Array.isArray(raw) ? raw : Array.isArray(raw?.userIds) ? raw.userIds : [];
       this.privilegedUserIds = new Set(ids.map((x: unknown) => String(x)));
     } catch (err) {
@@ -1978,10 +2061,27 @@ export class EventGate {
       clearTimeout(timer);
     }
     this.selfWakeTimers.clear();
+    // The sleep stays, with its note and agent, and its timer goes: fired
+    // after a stop(), its wake reached a framework that had stopped, and the
+    // timer held the process until the sleep's end. The next start() arms it
+    // again (resumeSleep). Until then nothing arms one, nor a self-wake: a
+    // turn a failed stop() left running can still call sleep or skip_reply.
+    if (this.sleepTimer) { clearTimeout(this.sleepTimer); this.sleepTimer = null; }
+    this.disposed = true;
     this.rateLimitBuckets.clear();
     this.passiveSampleCounters.clear();
     this.rateLimitDenied.clear();
     this.passiveSampleFires.clear();
     this.inferenceBuffer = [];
+    // stop() disposes the gate once its streams and event loop have ended (a
+    // turn still compiling then is dropped at its next check, before it sends
+    // anything), and a start() goes on with this gate. An agent left here by
+    // a turn whose exit didn't end it (a retry stop() cancelled, a successor
+    // stop() refused) would make every debounced batch buffer until that
+    // agent's next turn ended. A turn that continues after the start() takes
+    // its entry again (onInferenceResumed). A start() made during the stop()
+    // is refused, so no turn of a new lifecycle can have begun before this
+    // runs.
+    this.inferring.clear();
   }
 }

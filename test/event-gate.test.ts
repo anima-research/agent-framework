@@ -30,6 +30,7 @@ interface TraceEntry {
 function makeGate(configPath: string, opts?: {
   initialConfig?: GateConfig;
   resolveRouteChannel?: (info: GateEventInfo) => string | undefined;
+  privilegedUsersPath?: string;
 }) {
   const traces: TraceEntry[] = [];
   const messages: Array<{ participant: string; content: unknown; metadata?: unknown }> = [];
@@ -39,6 +40,7 @@ function makeGate(configPath: string, opts?: {
     configPath,
     initialConfig: opts?.initialConfig,
     ...(opts?.resolveRouteChannel ? { resolveRouteChannel: opts.resolveRouteChannel } : {}),
+    ...(opts?.privilegedUsersPath ? { privilegedUsersPath: opts.privilegedUsersPath } : {}),
     emitTrace: (e) => traces.push(e as TraceEntry),
     addMessage: (p, c, m) => { messages.push({ participant: p, content: c, metadata: m }); return ''; },
     requestInference: (a, r, s, p) => inferenceRequests.push({ agentName: a, reason: r, source: s, ...(p ?? {}) }),
@@ -377,6 +379,56 @@ describe('debounce', () => {
     assert.ok(!text.includes('edit 1'), 'must not re-quote in-context event content');
     assert.strictEqual(inferenceRequests.length, 1);
     assert.strictEqual(inferenceRequests[0].agentName, 'agent');
+  });
+
+  it('a batched wake names a channel whose channelName already starts with # with one #', () => {
+    // #406: a channel's name may carry its own `#`; the line adds one only
+    // where the name lacks it, as the other places that add a `#` do.
+    const path = writeConfig('debounce-hash-name.json', {
+      policies: [
+        { name: 'chat', match: { scope: ['mcpl:channel-incoming'] }, behavior: { debounce: 100 } },
+      ],
+      default: 'skip',
+    });
+    const { gate, messages } = makeGate(path);
+    gate.evaluate(event({ eventType: 'mcpl:channel-incoming', serverId: 'zulip', channelId: 'zulip:design', content: 'a',
+      metadata: { channelName: '#design' } }));
+    gate.evaluate(event({ eventType: 'mcpl:channel-incoming', serverId: 'discord', channelId: 'discord:g:portables', content: 'b',
+      metadata: { channelName: 'portables' } }));
+    // Fire the batch now rather than after a delay, so the verdict doesn't
+    // depend on how loaded the machine is.
+    const batch = gate as unknown as {
+      debounceTimers: Map<string, { timer: ReturnType<typeof setTimeout> }>;
+      fireDebounce(policyName: string): void;
+    };
+    clearTimeout(batch.debounceTimers.get('chat')!.timer);
+    batch.fireDebounce('chat');
+
+    assert.strictEqual(messages.length, 1);
+    const text = (messages[0].content as Array<{ text: string }>)[0].text;
+    assert.match(text, /1 message in #design \(zulip:design\)/);
+    assert.match(text, /1 message in #portables \(discord:g:portables\)/);
+    assert.doesNotMatch(text, /##/);
+  });
+
+  it('a quoted event\'s content is cut where no surrogate pair is halved', (t) => {
+    t.mock.timers.enable({ apis: ['setTimeout'] });
+    const path = writeConfig('debounce-pair.json', {
+      policies: [
+        { name: 'files', match: { scope: ['workspace:file-changed'] }, behavior: { debounce: 100 } },
+      ],
+      default: 'skip',
+    });
+    const { gate, messages } = makeGate(path);
+
+    // 199 units, then an emoji whose two units straddle the 200-unit cut.
+    gate.evaluate(event({ eventType: 'workspace:file-changed', content: `${'a'.repeat(199)}😀 and on` }));
+    t.mock.timers.tick(100);
+
+    assert.strictEqual(messages.length, 1);
+    const text = (messages[0].content as Array<{ text: string }>)[0].text;
+    assert.ok(text.includes(`: ${'a'.repeat(199)}...`), `the cut leaves the emoji out whole: ${JSON.stringify(text)}`);
+    assert.ok(!/[\ud800-\udbff](?![\udc00-\udfff])|(?<![\ud800-\udbff])[\udc00-\udfff]/.test(text), 'no half of a pair');
   });
 
   it('a batched wake carries the newest channel event\'s channel AND author together (provenance)', async () => {
@@ -1081,5 +1133,28 @@ describe('quiesce suppression', () => {
     await new Promise(r => setTimeout(r, 20));
     assert.strictEqual(messages.length, 0, 'buffer holds until resume, not turn end');
     assert.strictEqual(gate.inferenceDiagnostics().bufferedEvents, 1);
+  });
+});
+
+describe('sleep', () => {
+  // While asleep, only the agent's own heartbeat and a privileged author
+  // rouse it. The heartbeat is the server the host knows as `heartbeat`: a
+  // `source` in the metadata is what the server says, and any server says it.
+  it('lets through only the server the host names heartbeat, and a privileged author', () => {
+    const privileged = tmpPath('privileged.json');
+    writeFileSync(privileged, JSON.stringify({ userIds: ['P1'] }));
+    const path = writeConfig('sleep.json', { policies: [], default: 'always' });
+    const { gate } = makeGate(path, { privilegedUsersPath: privileged });
+    gate.setSleep(3600, 'resting', 'agent');
+    try {
+      const roused = (info: Partial<GateEventInfo>) => gate.evaluate(event(info)).trigger;
+      assert.strictEqual(roused({ serverId: 'discord', metadata: {} }), false, 'an ordinary event');
+      assert.strictEqual(roused({ serverId: 'discord', metadata: { source: 'heartbeat' } }), false, "another server saying it's the heartbeat");
+      assert.strictEqual(roused({ serverId: 'heartbeat', metadata: { source: 'heartbeat' } }), true, 'the heartbeat');
+      assert.strictEqual(roused({ serverId: 'heartbeat', metadata: { source: 'reminder' } }), true, "the heartbeat server's reminder");
+      assert.strictEqual(roused({ serverId: 'discord', metadata: { author: { id: 'P1' } } }), true, 'a privileged author');
+    } finally {
+      gate.clearSleep();
+    }
   });
 });

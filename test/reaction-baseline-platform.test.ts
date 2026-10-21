@@ -6,7 +6,7 @@ import type { McplServerConfig } from '../src/mcpl/types.js';
 import { REFUSAL_REACTION_BASELINE } from '../src/refusal-reactions.js';
 
 const KEY = 'DISCORD_SUPPRESSED_REACTIONS_BASELINE';
-/** The framework's protective default for the stub below (awareness emoji 🔕, no ledger). */
+/** The framework's protective default for the stub below (awareness emoji 🔕, an empty journal). */
 const DEFAULT = [...REFUSAL_REACTION_BASELINE, '💤', '🔕'].join(',');
 
 /** Exercise the real default-injection boundary, intercepting immediately
@@ -26,9 +26,10 @@ async function connectionEnv(
     mcplPrefixMap: new Map(),
     mcplServerConfigs: new Map(),
     channelRegistry: null,
-    discordAwarenessOutbox: null,
+    discordAwarenessOutbox: { batches: () => [] },
     discordAwarenessEmoji: '🔕',
     mcplServerRegistry: {
+      getServer: () => undefined,
       async addServer(config: McplServerConfig) {
         captured = config;
         throw stopBeforeSpawn;
@@ -136,4 +137,15 @@ test('POSIX reaction baseline keeps differently cased env names distinct', async
   assert.equal(composed[KEY.toLowerCase()], '');
   assert.ok(composed[KEY]!.split(',').includes('💤'));
   assert.ok(composed[KEY]!.split(',').includes('🔕'));
+});
+
+test('an inheritEnv that is not true never reads the host baseline: the protective default stands', async () => {
+  // create() and connectMcplServer refuse such a value; this is the read a
+  // config reaching connectMcplServerInternal unchecked would meet.
+  for (const inheritEnv of ['false', 'true', 1]) {
+    const composed = await connectionEnv('linux', {}, inheritEnv as unknown as boolean, { [KEY]: '🟦' });
+    assert.equal(composed[KEY], DEFAULT, JSON.stringify(inheritEnv));
+  }
+  const inherited = await connectionEnv('linux', {}, true, { [KEY]: '🟦' });
+  assert.equal(inherited[KEY], '🟦', 'true still inherits it');
 });

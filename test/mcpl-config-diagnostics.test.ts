@@ -18,6 +18,7 @@ import { join } from 'node:path';
 import { AgentFramework } from '../src/index.js';
 import type { EventResponse, Module, ModuleContext, ToolDefinition, ToolResult, TraceEvent } from '../src/index.js';
 import { FeatureSetManager } from '../src/mcpl/feature-set-manager.js';
+import { McplServerRegistry } from '../src/mcpl/server-registry.js';
 import { CapabilityGrant, computeGrant, expandAdvertisementShorthand } from '../src/mcpl/capability-grant.js';
 import { checkToolPattern } from '../src/mcpl/tool-pattern-check.js';
 import type { McplCapabilities, McplServerConfig } from '../src/mcpl/types.js';
@@ -333,7 +334,79 @@ test('FeatureSetManager: each §6.4 disablement is traced beside its console lin
   assert.equal(quiet.lines.length, 3, 'the console line stays');
 });
 
-test('registerMcplServerFeatures: a refused initial policy is traced, and fallback close closes', async () => {
+test("a refused initial policy's reason is recorded without the server's configured credentials", async () => {
+  const fw = Object.create(AgentFramework.prototype) as any;
+  fw.traceListeners = [];
+  fw.featureSetManager = new FeatureSetManager();
+  fw.checkpointManager = null;
+  const traces: Traced[] = [];
+  fw.onTrace((e: Traced) => traces.push(e));
+  const secret = 'srvSecret0123456789';
+  const connection = {
+    id: 'srv',
+    capabilities: { version: '0.5', pushEvents: true } as unknown as McplCapabilities,
+    mcpToolsAdvertised: false,
+    establishGrant: () => {},
+    sendFeatureSetsUpdateRequest: async () => ({ accepted: false, fallback: 'mcp-only', reason: `policy for ${secret} too narrow` }),
+    close: async () => {},
+  };
+  const capture = captureConsoleError();
+  try {
+    await fw.registerMcplServerFeatures({ id: 'srv', url: `wss://h/mcp/${secret}` } as McplServerConfig, connection);
+  } finally {
+    capture.stop();
+  }
+  const refused = traces.filter((t) => t.type === 'mcpl:policy-refused');
+  assert.equal(refused.length, 1);
+  assert.equal((refused[0] as { reason?: string }).reason, 'policy for redacted too narrow');
+  assert.ok(capture.lines.some((l) => l.includes('srv refused initial policy (policy for redacted too narrow)')), capture.lines.join('\n'));
+  assert.ok(!capture.lines.join('\n').includes(secret));
+});
+
+test("the initial policy's other records keep the credentials out too", async () => {
+  const secret = 'srvSecret0123456789';
+  const run = async (answer: () => Promise<unknown>) => {
+    const fw = Object.create(AgentFramework.prototype) as any;
+    fw.traceListeners = [];
+    fw.featureSetManager = new FeatureSetManager();
+    fw.checkpointManager = null;
+    const traces: Traced[] = [];
+    fw.onTrace((e: Traced) => traces.push(e));
+    const config = { id: 'srv', url: `wss://h/mcp/${secret}` } as McplServerConfig;
+    const connection = {
+      id: 'srv',
+      capabilities: { version: '0.5', pushEvents: true } as unknown as McplCapabilities,
+      mcpToolsAdvertised: false,
+      establishGrant: () => {},
+      sendFeatureSetsUpdateRequest: async () => answer(),
+      close: async () => {},
+    };
+    const capture = captureConsoleError();
+    try { await fw.registerMcplServerFeatures(config, connection); } finally { capture.stop(); }
+    const text = capture.lines.join('\n') + JSON.stringify(traces);
+    assert.ok(!text.includes(secret), text);
+    return { lines: capture.lines, traces };
+  };
+  // An unanswered request whose error quotes the url.
+  const unanswered = await run(async () => { throw new Error(`timed out talking to wss://h/mcp/${secret}`); });
+  assert.ok(unanswered.lines.some((l) => l.includes('did not answer the initial policy Request') && l.includes('timed out talking to wss://h/mcp/redacted')), unanswered.lines.join('\n'));
+  // A refusal whose fallback isn't one the host knows: it logs what it does.
+  const odd = await run(async () => ({ accepted: false, fallback: `close-${secret}`, reason: 'no' }));
+  assert.ok(odd.lines.some((l) => l.includes('refused initial policy (no) — fallback: mcp-only')), odd.lines.join('\n'));
+  // A degraded acceptance whose effect quotes the url, and an entry with no
+  // capability list, which is logged rather than read as an unanswered request.
+  const degraded = await run(async () => ({ accepted: true, mode: 'degraded', unavailableFeatures: [
+    { featureSet: 'fs', effect: `see ${secret}`, missingCapabilities: ['x'] },
+    { featureSet: 'odd', effect: 'none' },
+  ] }));
+  assert.ok(degraded.lines.some((l) => l.includes('srv degraded: fs (see redacted; missing x)')), degraded.lines.join('\n'));
+  assert.ok(degraded.lines.some((l) => l.includes('srv degraded: odd (none; missing unknown)')), degraded.lines.join('\n'));
+  assert.ok(!degraded.lines.some((l) => l.includes('did not answer')), degraded.lines.join('\n'));
+  // A refusal's reason, recorded with the derivation the operation began with.
+  await run(async () => ({ accepted: false, fallback: 'mcp-only', reason: `bad ${secret}` }));
+});
+
+test('registerMcplServerFeatures: a refused initial policy is traced, and fallback close closes the server and unregisters it', async () => {
   for (const fallback of ['close', 'mcp-only'] as const) {
     const fw = Object.create(AgentFramework.prototype) as any;
     fw.traceListeners = [];
@@ -343,6 +416,8 @@ test('registerMcplServerFeatures: a refused initial policy is traced, and fallba
     fw.onTrace((e: Traced) => traces.push(e));
     let closed = 0;
     let established = 0;
+    // Its close() emits no 'close', as a server's doesn't once it's down
+    // between retries, so only a close through the registry unregisters it.
     const connection = {
       id: 'srv',
       capabilities: { version: '0.5', pushEvents: true } as unknown as McplCapabilities,
@@ -351,6 +426,9 @@ test('registerMcplServerFeatures: a refused initial policy is traced, and fallba
       sendFeatureSetsUpdateRequest: async () => ({ accepted: false, fallback, reason: 'policy too narrow' }),
       close: async () => { closed++; },
     };
+    const registry = new McplServerRegistry();
+    (registry as any).servers.set('srv', connection);
+    fw.mcplServerRegistry = registry;
     const capture = captureConsoleError();
     try {
       await fw.registerMcplServerFeatures({ id: 'srv', command: 'unused' } as McplServerConfig, connection);
@@ -358,6 +436,7 @@ test('registerMcplServerFeatures: a refused initial policy is traced, and fallba
       capture.stop();
     }
     assert.equal(closed, fallback === 'close' ? 1 : 0, fallback);
+    assert.equal(registry.getServer('srv'), fallback === 'close' ? null : connection, `${fallback}: registered afterwards`);
     assert.equal(established, 0, 'a refusal never establishes the grant');
     assert.deepEqual(
       traces.filter((t) => t.type === 'mcpl:policy-refused').map(withoutTimestamp),
@@ -414,7 +493,9 @@ function manifestHarness(receipt: Record<string, unknown>) {
   const config: McplServerConfig = { id: 'srv', command: 'unused', enabledFeatureSets: ['chat', 'bare'] };
   fw.mcplServerConfigs = new Map([[config.id, config]]);
   const connection = new ManifestFake(receipt);
-  fw.mcplServerRegistry = { getAllServers: () => [connection], getServer: (id: string) => (id === 'srv' ? connection : null) };
+  const registry = new McplServerRegistry();
+  (registry as any).servers.set('srv', connection);
+  fw.mcplServerRegistry = registry;
   // Post-§5.3 state: initial policy done, full grant active.
   const grant = computeGrant(connection.capabilities!, config, { mcpToolsAdvertised: false });
   const quiet = captureConsoleError();
@@ -454,6 +535,83 @@ test('manifest change: a refused policy is traced with phase manifest-change, fo
     { type: 'mcpl:policy-refused', serverId: 'srv', phase: 'manifest-change', fallback: 'mcp-only', reason: null },
   ]);
 });
+
+test("a policy refusal's 'close' fallback whose close fails reports that failure, not an unanswered policy, and asks for the tool list to be refreshed", async () => {
+  const unreaped = () => new Error('stdio child 7 of MCP server "srv" did not exit within 2000ms of SIGKILL; it could not be reaped');
+  // At the initial policy.
+  const fw = Object.create(AgentFramework.prototype) as any;
+  fw.traceListeners = [];
+  fw.featureSetManager = new FeatureSetManager();
+  fw.checkpointManager = null;
+  const refreshed: string[] = [];
+  fw.handleToolsListChanged = (id: string) => { refreshed.push(id); };
+  const connection = {
+    id: 'srv',
+    capabilities: { version: '0.5', pushEvents: true } as unknown as McplCapabilities,
+    mcpToolsAdvertised: false,
+    establishGrant: () => {},
+    sendFeatureSetsUpdateRequest: async () => ({ accepted: false, fallback: 'close', reason: 'policy too narrow' }),
+    close: async () => { throw unreaped(); },
+  };
+  const registry = new McplServerRegistry();
+  (registry as any).servers.set('srv', connection);
+  fw.mcplServerRegistry = registry;
+  const initial = captureConsoleError();
+  try {
+    await assert.rejects(fw.registerMcplServerFeatures({ id: 'srv', command: 'unused' } as McplServerConfig, connection), /it could not be reaped$/);
+  } finally {
+    initial.stop();
+  }
+  assert.deepEqual(refreshed, ['srv'], 'a refresh of the tool list was asked for');
+  assert.equal(registry.getServer('srv'), connection, 'it stays registered, holding its id');
+  assert.ok(!initial.lines.some((l) => l.includes('did not answer')), initial.lines.join('\n'));
+
+  // At a manifest change.
+  const h = manifestHarness({ accepted: false, fallback: 'close', reason: 'too narrow' });
+  h.connection.close = () => Promise.reject(unreaped());
+  const changed: string[] = [];
+  h.fw.handleToolsListChanged = (id: string) => { changed.push(id); };
+  const later = captureConsoleError();
+  try {
+    await assert.rejects(h.fw.handleManifestChanged(h.connection, { revision: 'r2', domains: ['capabilities'] }), /it could not be reaped$/);
+  } finally {
+    later.stop();
+  }
+  assert.deepEqual(changed, ['srv'], 'a refresh of the tool list was asked for');
+  assert.ok(!later.lines.some((l) => l.includes('did not answer')), later.lines.join('\n'));
+});
+
+for (const queuedBehind of ['the fetch floor', 'a run in flight'] as const) {
+  test(`a manifest refresh queued behind ${queuedBehind}, whose 'close' fallback fails to close, logs that failure`, async () => {
+    const h = manifestHarness({ accepted: false, fallback: 'close', reason: 'too narrow' });
+    h.connection.close = () => Promise.reject(new Error('stdio child 7 of MCP server "srv" did not exit within 2000ms of SIGKILL; it could not be reaped'));
+    const announce = { revision: 'r2', domains: ['capabilities'] };
+    const capture = captureConsoleError();
+    try {
+      if (queuedBehind === 'the fetch floor') {
+        // The last refresh finished just inside the floor, so this one is
+        // queued, and runs on its own a few milliseconds later.
+        const floor = (AgentFramework as unknown as { MANIFEST_FETCH_FLOOR_MS: number }).MANIFEST_FETCH_FLOOR_MS;
+        h.fw.manifestRefreshState.set(h.connection, { inFlight: false, queued: false, lastCompletedAt: Date.now() - floor + 20 });
+        await h.fw.handleManifestChanged(h.connection, announce);
+        assert.equal(h.fw.manifestRefreshState.get(h.connection).queued, true, 'queued, not run yet');
+      } else {
+        // The second announcement comes while the first run is in flight, so
+        // it's queued, and runs once the fetch floor has passed after it.
+        const first = h.fw.handleManifestChanged(h.connection, announce).then(() => null, (error: unknown) => error);
+        await h.fw.handleManifestChanged(h.connection, announce);
+        assert.equal(h.fw.manifestRefreshState.get(h.connection).queued, true, 'queued behind the first');
+        assert.match(String(await first), /it could not be reaped$/, 'the first run rejects with its failed close');
+      }
+      await waitFor(
+        () => capture.lines.some((l) => l.includes('srv manifest-changed handler failed') && l.includes('it could not be reaped')),
+        'the queued run to log its failed close',
+      );
+    } finally {
+      capture.stop();
+    }
+  });
+}
 
 test('policy-refused traces report the branch the host took, not raw receipt fields', async () => {
   // Anything but `close` takes the mcp-only branch; a non-string reason is dropped.
