@@ -11,11 +11,11 @@
  * inference tokens, not whether the agent should know about the event.
  */
 
-import { existsSync, readFileSync, renameSync, statSync, writeFileSync, mkdirSync } from 'node:fs';
+import { chmodSync, existsSync, readFileSync, realpathSync, renameSync, rmSync, statSync, writeFileSync, mkdirSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { GateScript } from './gate-script.js';
 import { MAX_TIMER_MS } from '../deadline-timer.js';
-import { canonical, lastRecipePath, reconcileLine, reconcileWithRecipe } from './recipe-reconcile.js';
+import { canonical, duplicateName, lastRecipePath, reconcileLine, reconcileWithRecipe } from './recipe-reconcile.js';
 import { safeSlice } from '../safe-slice.js';
 
 import type { ToolDefinition } from '../types/events.js';
@@ -281,23 +281,42 @@ function behaviorFingerprint(b: import('./types.js').GateBehavior): string {
 // Config validation
 // ---------------------------------------------------------------------------
 
-/** Write `value` as JSON to `path` whole: a reader sees the old file or the new one, never part. */
+/**
+ * Write `value` as JSON to `path` whole: a reader sees the old file or the new
+ * one, never part. A symlinked file is written at its target, keeping the
+ * link, and an existing file keeps its permission bits. The staging file's
+ * name ends in `~`, which the workspace passes over as an editor's backup, so
+ * a watched `_config` mount never takes it in.
+ */
 function writeWhole(path: string, value: unknown): void {
-  const temp = `${path}.${process.pid}.tmp`;
-  writeFileSync(temp, JSON.stringify(value, null, 2) + '\n');
-  renameSync(temp, path);
+  const target = existsSync(path) ? realpathSync(path) : path;
+  const mode = existsSync(target) ? statSync(target).mode & 0o7777 : undefined;
+  const temp = `${target}.${process.pid}~`;
+  try {
+    writeFileSync(temp, JSON.stringify(value, null, 2) + '\n');
+    if (mode !== undefined) chmodSync(temp, mode);
+    renameSync(temp, target);
+  } catch (err) {
+    // A staging file this write left goes; anything else in its place stays.
+    try { rmSync(temp, { force: true }); } catch { /* not a file of ours */ }
+    throw err;
+  }
 }
 
 /**
- * The recipe the gate last applied, or null when it has none on record, or
- * the record doesn't read: a start then keeps every rule, as the first does.
+ * The recipe the gate last applied, or null when it has none on record. A
+ * record that exists but doesn't read, or names a rule twice, gives null with
+ * the reason: a start then keeps every rule, as the first does, and says why.
  */
-function readLastRecipe(path: string): GateConfig | null {
-  if (!existsSync(path)) return null;
+function readLastRecipe(path: string): { recipe: GateConfig | null; problem?: string } {
+  if (!existsSync(path)) return { recipe: null };
   try {
-    return validateConfig(JSON.parse(readFileSync(path, 'utf-8')));
-  } catch {
-    return null;
+    const recipe = validateConfig(JSON.parse(readFileSync(path, 'utf-8')));
+    const twice = duplicateName(recipe);
+    if (twice !== undefined) return { recipe: null, problem: `it names the rule "${twice}" twice` };
+    return { recipe };
+  } catch (err) {
+    return { recipe: null, problem: err instanceof Error ? err.message : String(err) };
   }
 }
 
@@ -702,43 +721,53 @@ export class EventGate {
     // gate.json is written first and the recipe after it, each whole, so a
     // stop between the two leaves the next start a state it reads rightly:
     // the other order would make the old recipe's definitions read as edits.
-    // A gate.json that doesn't load is left alone, with nothing recorded.
+    // A gate.json that doesn't load is left alone, with nothing recorded, and
+    // so is one that names a rule twice, since the merge keys rules by name.
+    let reconcileError: string | undefined;
     if (opts.initialConfig) {
       try {
         mkdirSync(dirname(this.configPath), { recursive: true });
         const recipePath = lastRecipePath(this.configPath);
         if (!existsSync(this.configPath)) {
-          writeFileSync(this.configPath, JSON.stringify(opts.initialConfig, null, 2) + '\n');
+          writeWhole(this.configPath, opts.initialConfig);
           writeWhole(recipePath, validateConfig(opts.initialConfig));
         } else {
           const existing = this.loadConfig();
           if (existing) {
             const recipe = validateConfig(opts.initialConfig);
-            const last = readLastRecipe(recipePath);
-            const { config, changes } = reconcileWithRecipe(existing, recipe, last);
+            const record = readLastRecipe(recipePath);
+            const { config, changes } = reconcileWithRecipe(existing, recipe, record.recipe);
+            if (record.problem !== undefined) changes.recordUnreadable = record.problem;
             if (canonical(config) !== canonical(existing)) writeWhole(this.configPath, config);
-            if (!last || canonical(last) !== canonical(recipe)) writeWhole(recipePath, recipe);
+            if (!record.recipe || canonical(record.recipe) !== canonical(recipe)) writeWhole(recipePath, recipe);
             const line = reconcileLine(changes);
             if (line) {
               console.log(line);
               opts.emitTrace({
                 type: 'gate:config-reconciled',
                 configPath: this.configPath,
-                addedPolicies: changes.added,
                 ...changes,
+                // As before this merge: every name the start added to gate.json.
+                addedPolicies: [...changes.added, ...changes.restored],
                 timestamp: Date.now(),
               });
             }
           }
         }
       } catch (err) {
-        const msg = err instanceof Error ? err.message : String(err);
-        this.configErrors.push(`Failed to seed/reconcile gate.json: ${msg}`);
+        reconcileError = `Failed to seed/reconcile gate.json: ${err instanceof Error ? err.message : String(err)}`;
       }
     }
 
     // Load config
     this.config = this.loadConfig() ?? opts.initialConfig ?? { ...DEFAULT_CONFIG };
+    // The load resets configErrors, so a failed merge is added after it, and
+    // said where an operator looks, since the gate goes on with gate.json as it was.
+    if (reconcileError !== undefined) {
+      this.configErrors.push(reconcileError);
+      console.error(`[gate] ${reconcileError}`);
+      opts.emitTrace({ type: 'gate:config-error', error: reconcileError, configPath: this.configPath, timestamp: Date.now() });
+    }
     this.compiledPolicies = this.compilePolicies(this.config);
     this.refreshShadowWarnings('startup');
 

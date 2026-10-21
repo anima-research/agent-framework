@@ -27024,7 +27024,7 @@ export class AgentFramework {
           ...(shadowWarnings.length > 0 ? { shadowWarnings } : {}),
           probes,
           ...(notProbed.length > 0
-            ? { notProbed, notProbedNote: 'No probe event matches these rules, so the probes above don\'t show what they do: the probes are MCPL chat events and a heartbeat, and these rules match other events, such as a module\'s messages (external-message), or only some sources, channels or paths.' }
+            ? { notProbed, notProbedNote: 'No probe event matches these rules, so the probes above don\'t show what they do: the probes are a few MCPL chat events and a heartbeat, and these rules ask for something none of them carries, such as another event type (a module\'s messages are external-message), a source, channel or path, or particular content, metadata or tags.' }
             : {}),
           ...(probes.some((p) => 'changed' in p)
             ? {}
