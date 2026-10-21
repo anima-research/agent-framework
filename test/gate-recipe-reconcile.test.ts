@@ -458,7 +458,7 @@ describe("EventGate's starts, through gate.json and the recipe kept beside it", 
     gate.dispose();
     assert.strictEqual(existsSync(configPath), false);
     assert.strictEqual(existsSync(lastRecipePath(configPath)), false);
-    assert.match(gate.getStatus().errors.join('\n'), /^Failed to seed\/reconcile gate\.json: the recipe doesn't validate \(gate\.json "default" must be .*\), so it wasn't applied$/);
+    assert.match(gate.getStatus().errors.join('\n'), /^Failed to seed\/reconcile gate\.json: the recipe doesn't validate \(gate\.json "default" must be .*\), so it wasn't applied: the gate runs on the recipe as given$/);
   });
 
   it("leaves gate.json as it is when a later start's recipe doesn't validate, and says it's the recipe", () => {
@@ -467,7 +467,7 @@ describe("EventGate's starts, through gate.json and the recipe kept beside it", 
     const { gate } = start({ policies: [], default: 'sometimes' } as unknown as GateConfig);
     gate.dispose();
     assert.strictEqual(readFileSync(configPath, 'utf-8'), before);
-    assert.match(gate.getStatus().errors.join('\n'), /^Failed to seed\/reconcile gate\.json: the recipe doesn't validate \(/);
+    assert.match(gate.getStatus().errors.join('\n'), /^Failed to seed\/reconcile gate\.json: the recipe doesn't validate \(.*\), so it wasn't applied: the gate runs on gate\.json as it stands$/);
   });
 
   it("leaves gate.json's bytes as written when a start changes nothing", () => {
