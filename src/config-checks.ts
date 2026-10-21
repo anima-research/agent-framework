@@ -35,6 +35,19 @@ export function assertBooleanSetting(setting: string, value: unknown, whatItDoes
 }
 
 /**
+ * Refuse a setting that holds anything but one of `allowed`. null counts as
+ * not set, as leaving it out does. `whatItDoes` ends the refusal: what each
+ * value does, and what leaving it out does.
+ */
+export function assertOneOfSetting(setting: string, value: unknown, allowed: readonly string[], whatItDoes: string): void {
+  if (value === undefined || value === null) return;
+  if (typeof value === 'string' && allowed.includes(value)) return;
+  // Never the value itself: it could be a secret pasted into the wrong field.
+  const shown = typeof value === 'string' ? 'another string' : kindOf(value);
+  throw new Error(`${setting} must be ${allowed.map((v) => `'${v}'`).join(' or ')}, not ${shown}: ${whatItDoes}`);
+}
+
+/**
  * Whether a settings object holds settings to check: false when it's null,
  * false or left out, which count as not set. Each of those has every setting
  * in it read as left out, which is what null and false ask for. Anything else

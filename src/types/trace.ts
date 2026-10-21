@@ -105,6 +105,26 @@ export type TraceEvent =
       /** Bounded like `error`. */
       stack?: string;
     })
+  // An agent's head under toolDeclarations 'entries' (system-changes.ts)
+  | (TraceEventBase & {
+      type: 'head:declared';
+      agentName: string;
+      /** Tools the change withdrew and offered, by name. */
+      removed: string[];
+      defined: string[];
+      /** Blocks of system text it added. */
+      addedSystem: number;
+    })
+  | (TraceEventBase & {
+      type: 'head:moved';
+      agentName: string;
+      /** What moved the head to what's current: the first request under
+       *  'entries', a replacement of system text, or a request on the head
+       *  that found changes left from an earlier period. */
+      why: 'adopted' | 'replaced' | 'on-head';
+      /** The change rows removed, since the head now holds them. */
+      changesRemoved: number;
+    })
   | (TraceEventBase & {
       type: 'inference:exhausted';
       agentName: string;

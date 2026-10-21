@@ -100,6 +100,32 @@ export interface AgentConfig {
   cacheTtl?: '5m' | '1h';
 
   /**
+   * How a request declares the agent's tools and system text.
+   *
+   * - `'head'` (default): every request carries the current tools and system
+   *   text, as before. A change to either rewrites the provider's cache from
+   *   the head.
+   * - `'entries'`: a request carries a fixed head, recorded once, and each
+   *   later change to the tools, or addition to the system text, goes into
+   *   the context as a system change at the point it took effect, which the
+   *   provider reads without rewriting what came before. A replacement of
+   *   system text moves the head to what's current, with one write. Only for models that
+   *   take mid-conversation system messages on the native formatter: the
+   *   host's model records say which. Membrane refuses a system change any
+   *   other way.
+   *
+   * What the framework adds: it keeps each agent's recorded head in its
+   * store, so a restart keeps the head. An Agent used without the framework
+   * keeps its head in memory. The direct API (runInference) declares
+   * nothing: it sends the tools its caller passes and the current system
+   * text, and leaves the context's changes out.
+   *
+   * Turning it on is a choice from those records, not a runtime toggle, so
+   * it isn't one of the agent's runtime settings.
+   */
+  toolDeclarations?: 'head' | 'entries';
+
+  /**
    * Whether to emit prompt-cache markers (cache_control) on requests.
    * Default true (Anthropic API). Set false for transports that reject
    * cache_control — e.g. Bedrock legacy Claude models, which fail with
