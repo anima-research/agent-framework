@@ -387,6 +387,12 @@ export interface InferenceRequest {
    */
   channelId?: string;
   /**
+   * Host-owned: the MCPL server whose message set `channelId`. A turn's
+   * replies to that channel go out through this server only. Unset where the
+   * wake's channel came from no one server's message.
+   */
+  serverId?: string;
+  /**
    * True when the triggering message explicitly addressed the agent (mention,
    * reply-to-bot, DM — `chat:addressed` in MCPL RFC-001 terms). When a wake
    * batch spans several channels, an addressed channel outranks ambient

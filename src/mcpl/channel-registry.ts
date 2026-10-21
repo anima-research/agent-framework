@@ -682,7 +682,17 @@ interface ChannelRegistryOptions {
  */
 export type ChannelToolOrigin =
   | { kind: 'module'; moduleName?: string }
-  | { kind: 'agent'; agentName: string };
+  | {
+    kind: 'agent';
+    agentName: string;
+    /** The calling turn's trigger channel with the server whose message it
+     *  was: a channel_publish into that channel goes out through that server
+     *  only. */
+    trigger?: { channelId: string; serverId: string };
+    /** The calling turn's locus with the server of the message that put it
+     *  there, where that isn't the trigger: the same holds for it. */
+    locus?: { channelId: string; serverId: string };
+  };
 
 /** The machine decision sources a module-origin channel_close may record.
  *  Closed on purpose: honest provenance means a small, auditable vocabulary,
@@ -772,6 +782,8 @@ export class ChannelRegistry {
 
   /** Most recent incoming channel ID — used for speech routing / default publish. */
   private defaultPublishChannel: string | null = null;
+  /** The server whose accepted message set defaultPublishChannel. */
+  private defaultPublishServer: string | null = null;
 
   /** Most recent incoming message metadata, used for buildChannelContext. */
   private defaultPublishMessageId: string | null = null;
@@ -932,7 +944,7 @@ export class ChannelRegistry {
       }
       const key = `${serverId}:${channel.id}`;
       this.registerEntry(key, serverId, channel);
-      this.appendLabelSighting(channel.id, channel.label, extractDmMeta(channel.metadata));
+      this.appendLabelSighting(serverId, channel.id, channel.label, extractDmMeta(channel.metadata));
       registeredIds.push(channel.id);
       results.push({ id: channel.id, accepted: true });
     }
@@ -1018,7 +1030,7 @@ export class ChannelRegistry {
           }
         }
         existing.descriptor = channel;
-        this.appendLabelSighting(channel.id, channel.label, extractDmMeta(channel.metadata));
+        this.appendLabelSighting(serverId, channel.id, channel.label, extractDmMeta(channel.metadata));
         addedResults.push({ id: channel.id, accepted: true });
       }
     }
@@ -1035,7 +1047,7 @@ export class ChannelRegistry {
         }
         const key = `${serverId}:${channel.id}`;
         this.registerEntry(key, serverId, channel);
-        this.appendLabelSighting(channel.id, channel.label, extractDmMeta(channel.metadata));
+        this.appendLabelSighting(serverId, channel.id, channel.label, extractDmMeta(channel.metadata));
         addedResults.push({ id: channel.id, accepted: true });
         accepted.push(channel);
       }
@@ -1237,6 +1249,7 @@ export class ChannelRegistry {
       const incomingEntry = this.channels.get(incomingKey)!;
       const markAccepted = () => {
         this.defaultPublishChannel = message.channelId;
+        this.defaultPublishServer = serverId;
         this.defaultPublishMessageId = message.messageId;
         this.defaultPublishThreadId = message.threadId;
         // Where the host directs this server's lifecycle, only a receipt for
@@ -1376,7 +1389,9 @@ export class ChannelRegistry {
     label?: string,
     extraMetadata?: Record<string, unknown>,
   ): void {
-    const existing = this.findChannelEntry(channelId);
+    // The pushing server's own entry: another server's entry for the same id
+    // is that server's, and a push leaves it as it was.
+    const existing = this.channels.get(`${serverId}:${channelId}`);
     if (existing) {
       // Backfill identity onto a bare lazy registration: a DM that first
       // arrived with no label/recipient info gets a usable name the next
@@ -1392,7 +1407,7 @@ export class ChannelRegistry {
         // Recorded before the live descriptor takes it, since this branch's
         // guard reads the descriptor: an append that throws leaves the
         // placeholder, so the next push tries again.
-        this.appendLabelSighting(existing.descriptor.id, label, extractDmMeta(metadata));
+        this.appendLabelSighting(serverId, existing.descriptor.id, label, extractDmMeta(metadata));
         existing.descriptor.label = label;
         existing.descriptor.metadata = metadata;
       }
@@ -1412,7 +1427,7 @@ export class ChannelRegistry {
     // routing; only the durable write is skipped when there's no real
     // label to record. A real label is recorded before the entry exists:
     // an append that throws registers nothing, so the next push tries again.
-    if (label) this.appendLabelSighting(channelId, label, extractDmMeta(extraMetadata));
+    if (label) this.appendLabelSighting(serverId, channelId, label, extractDmMeta(extraMetadata));
     const key = `${serverId}:${channelId}`;
     this.channels.set(key, {
       serverId,
@@ -1742,8 +1757,11 @@ export class ChannelRegistry {
       if (entry.serverId !== serverId) continue;
       this.channels.delete(key);
       this.stopTyping(entry.descriptor.id);
-      if (this.defaultPublishChannel === entry.descriptor.id) {
+      // The fallback goes with the server whose message set it, not with
+      // another server's entry for the same id.
+      if (this.defaultPublishChannel === entry.descriptor.id && this.defaultPublishServer === serverId) {
         this.defaultPublishChannel = null;
+        this.defaultPublishServer = null;
         this.defaultPublishMessageId = null;
         this.defaultPublishThreadId = undefined;
       }
@@ -1766,6 +1784,7 @@ export class ChannelRegistry {
 
     // Reset default publish tracking
     this.defaultPublishChannel = null;
+    this.defaultPublishServer = null;
     this.defaultPublishMessageId = null;
     this.defaultPublishThreadId = undefined;
   }
@@ -1910,11 +1929,17 @@ export class ChannelRegistry {
    * `resolveProseTargetDurable()`.
    */
   private appendLabelSighting(
+    serverId: string,
     channelId: string,
     label: string | undefined,
     dmMeta: { recipientId?: string; recipientName?: string; isDm?: boolean } = {},
   ): void {
     if (typeof label !== 'string' || !label) return;
+    // The log is kept by the bare id, and a durable lookup by label resolves
+    // to that id with no server. So a server's label for an id another
+    // server registers isn't recorded: it would name the other server's
+    // channel, across restarts.
+    if (this.registeredByAnotherServer(serverId, channelId)) return;
     const { recipientId, recipientName, isDm } = dmMeta;
     // Never let a bare-id placeholder (ensureChannelRegistered's fallback
     // `label ?? channelId` when no real label was ever supplied — e.g. a
@@ -2735,9 +2760,26 @@ export class ChannelRegistry {
       .map((e) => e.descriptor);
   }
 
+  /**
+   * The server whose accepted message set the global fallback, where
+   * `channelId` is the fallback's channel: a turn whose locus is the
+   * fallback resolves it with this server, taken with the locus.
+   */
+  fallbackServerFor(channelId: string): string | undefined {
+    return this.defaultPublishChannel === channelId ? this.defaultPublishServer ?? undefined : undefined;
+  }
+
   /** Server id owning a registered channel (by descriptor id), or null. */
   getChannelServerId(channelId: string): string | null {
     return this.findChannelEntry(channelId)?.serverId ?? null;
+  }
+
+  /** Whether a server other than `serverId` registers `channelId`. */
+  private registeredByAnotherServer(serverId: string, channelId: string): boolean {
+    for (const entry of this.channels.values()) {
+      if (entry.descriptor.id === channelId && entry.serverId !== serverId) return true;
+    }
+    return false;
   }
 
   /**
@@ -3488,8 +3530,11 @@ export class ChannelRegistry {
     inferenceId: string,
     index: number,
     delta: string,
+    /** The server the channel resolves with, as the speech's locus does
+     *  (deliverSpeech's locusServerId). */
+    serverId?: string,
   ): void {
-    const server = this.streamingServerFor(channelId);
+    const server = this.streamingServerFor(channelId, serverId);
     if (!server) return;
     try {
       server.sendChannelsOutgoingChunk({ inferenceId, conversationId, channelId, index, delta });
@@ -3502,8 +3547,10 @@ export class ChannelRegistry {
     conversationId: string,
     inferenceId: string,
     text: string,
+    /** As sendOutgoingChunk's. */
+    serverId?: string,
   ): void {
-    const server = this.streamingServerFor(channelId);
+    const server = this.streamingServerFor(channelId, serverId);
     if (!server) return;
     try {
       server.sendChannelsOutgoingComplete({
@@ -3515,14 +3562,18 @@ export class ChannelRegistry {
     } catch { /* observer surface — never disturb the turn */ }
   }
 
-  private streamingServerFor(channelId: string) {
+  private streamingServerFor(channelId: string, serverId?: string) {
     // The map is keyed `${serverId}:${channelId}`; stream targets arrive as
-    // bare descriptor ids (what resolveProseTarget returns). Scan like the
-    // resolver does, and fail closed on cross-server ambiguity — the same
-    // never-guess rule that governs delivery.
+    // bare descriptor ids (what resolveProseTarget returns). With the server
+    // the speech resolves with, only that server's entry; otherwise scan like
+    // the resolver does, and fail closed on cross-server ambiguity — the
+    // same never-guess rule that governs delivery.
     const matches = [...this.channels.values()].filter((e) => e.descriptor.id === channelId);
-    if (matches.length !== 1) return null;
-    const server = this.serverRegistry.getServer(matches[0]!.serverId);
+    const entry = serverId !== undefined
+      ? matches.find((e) => e.serverId === serverId)
+      : matches.length === 1 ? matches[0] : undefined;
+    if (!entry) return null;
+    const server = this.serverRegistry.getServer(entry.serverId);
     // §5.4: the GRANT gates streaming, not the raw advertisement. The old
     // `capabilities?.channels?.streaming` check was doubly wrong: undefined
     // for the boolean `channels: true` shape (masking discord-mcpl's latent
@@ -3762,8 +3813,13 @@ export class ChannelRegistry {
     locusChannelId: string | null,
     /** `heldOnFailure`: the caller holds a `failed` delivery's words as a
      *  draft with its own notice, so no failure marker is written for it.
-     *  An `unknown` outcome still gets its marker. */
-    opts?: { heldOnFailure?: boolean },
+     *  An `unknown` outcome still gets its marker. `locusServerId`: the
+     *  server the locus resolves with, snapshotted by the caller with the
+     *  locus: the server whose message triggered the turn, where the locus is
+     *  that message's channel. The speech goes out through that server only,
+     *  and fails where it no longer registers the channel. Without it, the
+     *  locus is taken only where exactly one server registers it. */
+    opts?: { heldOnFailure?: boolean; locusServerId?: string },
   ): Promise<PublishOutcome> {
     const fail = (channelId: string | null, reason: string, outcome: PublishOutcome): PublishOutcome => {
       const status = outcome.status === 'unknown' ? 'unknown' : 'failed';
@@ -3806,7 +3862,11 @@ export class ChannelRegistry {
       return fail(null, reason, { status: 'failed', reason, at: Date.now() });
     }
 
-    const outcome = await this.publish(conversationId, text, { channelId: locusChannelId, routed: true });
+    const outcome = await this.publish(conversationId, text, {
+      ...(opts?.locusServerId !== undefined ? { serverId: opts.locusServerId } : {}),
+      channelId: locusChannelId,
+      routed: true,
+    });
     const channelId = outcome.destination?.channelId ?? locusChannelId;
     if (outcome.status !== 'delivered') {
       return fail(channelId, outcome.reason ?? 'delivery not confirmed', outcome);
@@ -3829,13 +3889,16 @@ export class ChannelRegistry {
     return outcome;
   }
 
-  /** deliverSpeech, reduced to the confirmed delivery (null when there was none). */
+  /** deliverSpeech, reduced to the confirmed delivery (null when there was
+   *  none). `opts.locusServerId` is deliverSpeech's. */
   async routeSpeech(
     conversationId: string,
     text: string,
     locusChannelId: string | null,
+    opts?: { locusServerId?: string },
   ): Promise<{ delivered: boolean; channelId: string; messageId?: string } | null> {
-    const outcome = await this.deliverSpeech(conversationId, text, locusChannelId);
+    const outcome = await this.deliverSpeech(conversationId, text, locusChannelId,
+      opts?.locusServerId !== undefined ? { locusServerId: opts.locusServerId } : undefined);
     if (outcome.status !== 'delivered') return null;
     return {
       delivered: true,
@@ -3873,11 +3936,24 @@ export class ChannelRegistry {
       };
     }
 
-    const entry = this.findChannelEntry(channelId);
+    // Into the calling turn's trigger channel, through the server whose
+    // message it was; any other id only where exactly one server registers
+    // it. This tool names no server, so for a shared id it can't choose.
+    const trigger = origin?.kind === 'agent'
+      ? [origin.trigger, origin.locus].find((o) => o?.channelId === channelId)
+      : undefined;
+    const holders = [...this.channels.values()].filter((e) => e.descriptor.id === channelId);
+    const entry = trigger !== undefined
+      ? holders.find((e) => e.serverId === trigger.serverId)
+      : holders.length === 1 ? holders[0] : undefined;
     if (!entry) {
       return {
         success: false,
-        error: `Channel not found: ${channelId}`,
+        error: trigger !== undefined
+          ? `Channel ${channelId} is no longer registered by the server whose message brought you there, so nothing was published.`
+          : holders.length > 1
+            ? `Channel ${channelId} is registered by more than one MCPL server, and this tool can't choose between them, so nothing was published.`
+            : `Channel not found: ${channelId}`,
         isError: true,
       };
     }

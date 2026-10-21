@@ -1,0 +1,5 @@
+- `InferenceRequest.serverId`: the MCPL server whose message set the request's `channelId`. The turn's replies into that channel go out through this server only.
+- `WakeProvenance.routeServerId`: the server of the event whose channel `routeChannelId` names.
+- `ChannelRegistry.routeSpeech` takes an optional fourth argument, `{ locusServerId }`, and `deliverSpeech`'s options take `locusServerId` too: the server the locus resolves with, snapshotted with the locus. Speech then goes out through that server only, and fails where it no longer registers the channel.
+- `ChannelRegistry.sendOutgoingChunk` and `sendOutgoingComplete` take an optional last argument, the server the channel resolves with, as the speech's does.
+- `ChannelRegistry.fallbackServerFor(channelId)`: the server whose accepted message set the fallback channel, where `channelId` is that channel.

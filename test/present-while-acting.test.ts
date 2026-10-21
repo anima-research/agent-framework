@@ -158,6 +158,7 @@ function stubChannelRegistry(framework: AgentFramework) {
       return locus ? { delivered: true, channelId: locus } : null;
     },
     getDefaultPublishChannel: () => null,
+    resolveDestination: () => ({ error: 'not registered' }),
     isChannelOpen: () => true,
     getDescriptor: () => undefined,
     getChannelTools: () => [],
@@ -1587,6 +1588,8 @@ describe('present while acting', () => {
       framework.agents = new Map([['assistant', { proseRouting: 'locus' }]]);
       framework.channelRegistry = {
         handleChannelToolCall: () => new Promise((resolve) => { resolveOpen = resolve; }),
+        // The opened channel isn't registered here, so no server is taken with the locus.
+        resolveDestination: () => ({ error: 'not registered' }),
       };
       framework.turnRouting = new Map([['assistant', calling]]);
       framework.openLogical = new Map([['assistant', calling]]);
@@ -1626,6 +1629,7 @@ describe('present while acting', () => {
       framework.agents = new Map([['assistant', { proseRouting: 'locus' }]]);
       framework.channelRegistry = {
         handleChannelToolCall: async () => ({ success: true, data: { channelId: 'discord:guild:observatory' } }),
+        resolveDestination: () => ({ error: 'not registered' }),
       };
       framework.turnRouting = new Map([['assistant', calling]]);
       if (!silent) framework.openLogical = new Map([['assistant', calling]]);

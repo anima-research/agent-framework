@@ -28,7 +28,7 @@ async function emittedFor(category: string): Promise<string> {
       buildChannelContext: () => ({
         incoming: { channelId: 'discord:g1:c1', messageId: 'm1' },
       }),
-      getChannelServerId: () => 'srv1',
+      fallbackServerFor: () => 'srv1',
     },
     mcplServerRegistry: {
       getServer: () => ({

@@ -22,6 +22,7 @@ import type { InboundSource } from './inbound-source.js';
 import { isSilentHeartbeatMarker, isVisiblyEmptyConversion } from './visible-content.js';
 import { logDetail, logValue } from './log-value.js';
 import { RefusalLines } from './refusal-lines.js';
+import { channelNotPermitted } from './errors.js';
 
 // ============================================================================
 // McplPushEvent (the ProcessEvent shape pushed to the queue)
@@ -109,8 +110,9 @@ export class PushHandler {
   private emitTraceFn: (event: { type: string; [key: string]: unknown }) => void;
   private shouldTriggerInference?: (content: string, metadata: Record<string, unknown>) => boolean;
   private dedup = new DedupSet(1000);
-  /** Holds back repeats of the line for a channel-scoped push refused because
-   *  its channel isn't declared (-32023) or may not be used (-32017). */
+  /** Holds back repeats of the line for a push refused for its channel: a
+   *  channel-scoped one whose channel isn't declared (-32023) or may not be
+   *  used (-32017), and one naming a channel another server registers. */
   private channelRefusalLines = new RefusalLines();
 
   constructor(
@@ -123,6 +125,9 @@ export class PushHandler {
      *  or acknowledged: return its source envelope, frozen now
      *  (mcpl/inbound-source.ts). Coalesced work is stamped by its own path. */
     private readonly acceptInbound?: (event: McplPushEvent) => InboundSource | undefined,
+    /** The channel a push names, and the server that registers it, when
+     *  another server registers that channel id and this server doesn't. */
+    private readonly channelOfAnotherServer?: (serverId: string, params: PushEventParams) => { channelId: string; holder: string } | undefined,
   ) {
     this.featureSetManager = featureSetManager;
     this.pushEventFn = pushEventFn;
@@ -135,6 +140,7 @@ export class PushHandler {
    *
    * 1. Validate feature set
    * 2. Convert content blocks; reject visibly-empty content
+   *    Refuse a push naming a channel another server registers
    * 3. Deduplicate by eventId
    * 4. Optionally check shouldTriggerInference callback
    * 5. Push event to queue
@@ -205,6 +211,18 @@ export class PushHandler {
       this.traceEmptyRejection(serverId, params);
       if (responder?.respondError) responder.respondError(err.code, err.message, { field: err.field });
       else responder?.respond({ accepted: false, reason: err.reason });
+      return;
+    }
+
+    // A push is its own server's event, and the agent's reply to it goes to
+    // the channel the push names. A channel's id is the agent's locus, so a
+    // push naming a channel another server registers, which this server
+    // doesn't, would have the reply sent through that other server. It's
+    // refused, before dedup, so a retry once this server registers the
+    // channel isn't refused as a duplicate.
+    const elsewhere = this.channelOfAnotherServer?.(serverId, params);
+    if (elsewhere) {
+      this.refuseChannelOfAnotherServer(serverId, params, elsewhere, responder);
       return;
     }
 
@@ -333,6 +351,38 @@ export class PushHandler {
       ...(channelId === undefined ? {} : { channelId }),
       detail: error.message,
     });
+  }
+
+  /** A push naming a channel another server registers: refused with -32017.
+   *  The operator's line names the server that registers it; the answer to
+   *  the pushing server doesn't. The line prints at most once a minute per
+   *  channel, as the other channel refusals' do, and every refusal is traced. */
+  private refuseChannelOfAnotherServer(
+    serverId: string,
+    params: PushEventParams,
+    elsewhere: { channelId: string; holder: string },
+    responder: Responder | undefined,
+  ): void {
+    const held = this.channelRefusalLines.admit(serverId, elsewhere.channelId);
+    if (held !== null) {
+      console.error(
+        `[push-event-rejected] server=${serverId} featureSet=${logValue(params.featureSet ?? '')} eventId=${logValue(params.eventId ?? '')} ` +
+        `channel=${logValue(elsewhere.channelId)} reason=channel-of-another-server: registered by server ${logValue(elsewhere.holder)}, not this one` +
+        (held ? ` (${held} more since the last line)` : ''),
+      );
+    }
+    this.emitTraceFn({
+      type: 'mcpl:push-event-rejected',
+      serverId,
+      eventId: typeof params.eventId === 'string' ? params.eventId : '',
+      featureSet: params.featureSet,
+      reason: 'channel-of-another-server',
+      channelId: elsewhere.channelId,
+      detail: `registered by server ${elsewhere.holder}`,
+    });
+    const error = channelNotPermitted(elsewhere.channelId);
+    if (responder?.respondError) responder.respondError(error.code, error.message, error.data);
+    else responder?.respond({ accepted: false, reason: error.message });
   }
 
   /** Loud, like every other push rejection: the producer's wake went nowhere.

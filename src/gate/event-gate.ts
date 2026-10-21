@@ -130,6 +130,9 @@ export interface WakeProvenance {
    *  (2026-09-30: a DM reply published into a guild channel). Ambient-only
    *  batches still set nothing and keep the legacy fallback. */
   routeChannelId?: string;
+  /** The server whose event `routeChannelId` came from: the turn's replies
+   *  to that channel go out through this server only. */
+  routeServerId?: string;
   /** Timestamp (ms) of the chosen event, so a consumer coalescing several
    *  requests can order by event recency, not by flush order. */
   at?: number;
@@ -235,7 +238,9 @@ export function wakeProvenance(events: PendingEvent[]): WakeProvenance | undefin
     ...(channelId ? { channelId } : {}),
     ...(pick.authorId ? { counterparty: `${ns}:user:${pick.authorId}` } : {}),
     ...(pick.addressed ? { addressed: true } : {}),
-    ...(pick.addressed && pick.routeChannelId ? { routeChannelId: pick.routeChannelId } : {}),
+    ...(pick.addressed && pick.routeChannelId
+      ? { routeChannelId: pick.routeChannelId, ...(pick.serverId ? { routeServerId: pick.serverId } : {}) }
+      : {}),
     at: pick.timestamp,
   };
 }

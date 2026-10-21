@@ -769,7 +769,7 @@ describe('mid-turn deliveries keep the window what the stream carried', () => {
     const internals = framework as unknown as {
       openLogical: Map<string, unknown>;
       readdDrained(entries: Array<{ id: string; seq: number; participant: string; content: ContentBlock[]; metadata?: Record<string, unknown> }>, where: string): unknown[];
-      remainingArrival(agent: unknown, routing: unknown): string | undefined;
+      remainingArrival(agent: unknown, routing: unknown): { channelId: string } | undefined;
     };
     // An open turn engaged with both channels, between its streams: the
     // earlier write throws after it's stored, and the later one lands.
@@ -791,7 +791,7 @@ describe('mid-turn deliveries keep the window what the stream carried', () => {
       { messageId: idOf('w1'), channelId: 'chan-alpha' },
       { messageId: idOf('w2'), channelId: 'chan-beta' },
     ]);
-    assert.equal(internals.remainingArrival(agent, open), 'chan-beta', "the turn's newest arrival is the later write's");
+    assert.equal(internals.remainingArrival(agent, open)?.channelId, 'chan-beta', "the turn's newest arrival is the later write's");
     await framework.stop();
   });
 
