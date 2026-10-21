@@ -14,6 +14,7 @@ import { mkdtempSync, rmSync, readFileSync, existsSync, writeFileSync, appendFil
 import { join } from 'node:path';
 import { AgentFramework } from '../src/index.js';
 import { ChannelRegistry } from '../src/mcpl/channel-registry.js';
+import { ConversationRouter } from '../src/mcpl/conversation-router.js';
 import { PushHandler, type McplPushEvent } from '../src/mcpl/push-handler.js';
 import { CHANNEL_NOT_PERMITTED } from '../src/mcpl/errors.js';
 import { CapabilityGrant } from '../src/mcpl/capability-grant.js';
@@ -671,6 +672,150 @@ describe('in explicit and hybrid mode, a reply goes out through no server but th
       assert.deepEqual(published('held words'), where);
     });
   }
+});
+
+describe("with conversation routing, each server's channel is its own conversation", () => {
+  const X = 'discord:g1:room';
+  let dir: string;
+  let framework: AgentFramework | undefined;
+  let restoreErrors: () => void = () => {};
+  const paths = (id: string) => ({ status: join(dir, `${id}-status.jsonl`), command: join(dir, `${id}-commands.jsonl`) });
+  const command = (id: string, c: Record<string, unknown>) => appendFileSync(paths(id).command, JSON.stringify(c) + '\n');
+  const registry = () => (framework as unknown as { channelRegistry: ChannelRegistry }).channelRegistry;
+  // The forks holding a message with this text.
+  const holders = (text: string) => [...(framework as unknown as { agents: Map<string, { name: string; getContextManager(): { getAllMessages(): Array<{ content: Array<{ type: string; text?: string }> }> } }> }).agents.values()]
+    .filter((a) => a.name !== 'scout' && a.getContextManager().getAllMessages().some((m) => m.content.some((c) => c.type === 'text' && (c.text ?? '').includes(text))))
+    .map((a) => a.name);
+
+  // slack registers discord's channel id too, and it's open there as well.
+  async function registerOpen(): Promise<void> {
+    await registry().handleRegister('slack', { channels: [{ id: X, type: 'chat', label: '#room (slack)', direction: 'bidirectional' }] });
+    await registry().handleChannelToolCall('channel_open', { serverId: 'slack', channelId: X }, { kind: 'module' });
+  }
+
+  beforeEach(async () => {
+    dir = mkdtempSync(join(tmpdir(), 'reply-router-'));
+    for (const id of ['discord', 'slack']) writeFileSync(paths(id).command, '');
+    const original = console.error;
+    console.error = () => {};
+    restoreErrors = () => { console.error = original; };
+    const membrane = new MockMembrane();
+    framework = await AgentFramework.create({
+      storePath: join(dir, 'store'),
+      membrane: membrane.asMembrane(),
+      agents: [{ name: 'scout', model: 'test-model', systemPrompt: 'You are scout.' }],
+      mcplServers: [
+        { id: 'discord', command: process.execPath, args: [FIXTURE],
+          env: { STATUS_PATH: paths('discord').status, COMMAND_PATH: paths('discord').command } },
+        { id: 'slack', command: process.execPath, args: [FIXTURE],
+          env: { STATUS_PATH: paths('slack').status, COMMAND_PATH: paths('slack').command,
+            CHANNELS: JSON.stringify([{ id: 'slack:T1:C1', label: '#lobby (acme)' }]) } },
+      ],
+      modules: [],
+      conversations: { templateAgent: 'scout', bind: { channel: 'always' } },
+    });
+    await framework.start();
+    await waitFor(() => registry().listChannelsRaw().length >= 3, 'both servers registered');
+  });
+
+  afterEach(async () => {
+    await framework?.stop();
+    framework = undefined;
+    restoreErrors();
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it("a server that registers a bound channel's id too has its message answered in a fork of its own, not in the other server's", async () => {
+    await registerOpen();
+    command('discord', { op: 'incoming', channelId: X, messageId: 'd-1', mode: 'addressed', text: 'from discord' });
+    await waitFor(() => holders('from discord').length > 0, "discord's message reached a fork");
+    command('slack', { op: 'incoming', channelId: X, messageId: 's-1', mode: 'addressed', text: 'from slack' });
+    await waitFor(() => holders('from slack').length > 0, "slack's message reached a fork");
+    await framework!.runUntilIdle();
+    const [discordFork] = holders('from discord');
+    assert.deepEqual(holders('from discord'), [discordFork]);
+    assert.ok(!holders('from slack').includes(discordFork!), "slack's message is not in discord's fork");
+    assert.equal(holders('from slack').length, 1);
+    // A gate wake's route names the server of the message it came from, as
+    // the fork's bind does: each fork takes its own server's route only.
+    const [slackFork] = holders('from slack');
+    const take = (agent: string, server: string) =>
+      (framework as unknown as { mayTakeGateRoute(a: string, c: string, s?: string): boolean }).mayTakeGateRoute(agent, X, server);
+    assert.equal(take(discordFork!, 'discord'), true, "discord's fork takes discord's route");
+    assert.equal(take(discordFork!, 'slack'), false, "discord's fork doesn't take slack's");
+    assert.equal(take(slackFork!, 'slack'), true, "slack's fork takes slack's route");
+  });
+
+  it("each server's next message goes on to its own fork", async () => {
+    await registerOpen();
+    command('discord', { op: 'incoming', channelId: X, messageId: 'd-1', mode: 'addressed', text: 'discord first' });
+    await waitFor(() => holders('discord first').length > 0, "discord's first message reached a fork");
+    command('slack', { op: 'incoming', channelId: X, messageId: 's-1', mode: 'addressed', text: 'slack first' });
+    await waitFor(() => holders('slack first').length > 0, "slack's first message reached a fork");
+    command('discord', { op: 'incoming', channelId: X, messageId: 'd-2', mode: 'addressed', text: 'discord second' });
+    command('slack', { op: 'incoming', channelId: X, messageId: 's-2', mode: 'addressed', text: 'slack second' });
+    await waitFor(() => holders('discord second').length > 0 && holders('slack second').length > 0, 'both second messages reached a fork');
+    await framework!.runUntilIdle();
+    assert.deepEqual(holders('discord second'), holders('discord first'));
+    assert.deepEqual(holders('slack second'), holders('slack first'));
+    assert.notDeepEqual(holders('slack first'), holders('discord first'));
+  });
+});
+
+describe("the router's bindings, by server and id", () => {
+  it("keeps two servers' channels with one id apart, and a bare id names the one binding for it, or none where there are several", () => {
+    const router = new ConversationRouter({ templateAgent: 'scout' });
+    router.bind({ serverId: 'discord', channelId: 'c' }, 'fork-d', 1);
+    router.bind({ serverId: 'slack', channelId: 'c' }, 'fork-s', 2);
+    assert.equal(router.getBinding({ serverId: 'discord', channelId: 'c' })?.agentName, 'fork-d');
+    assert.equal(router.getBinding({ serverId: 'slack', channelId: 'c' })?.agentName, 'fork-s');
+    assert.equal(router.getBinding('c'), undefined, 'two servers bind the id, so a bare id names neither');
+    router.bind({ serverId: 'discord', channelId: 'only' }, 'fork-o', 1);
+    assert.equal(router.getBinding('only')?.agentName, 'fork-o', 'a bare id names the one binding for it');
+    router.bind('bare', 'fork-b', 1);
+    assert.equal(router.getBinding('bare')?.agentName, 'fork-b');
+    assert.equal(router.getBinding({ serverId: 'discord', channelId: 'bare' }), undefined, "a server's channel isn't the binding made with none");
+    router.unbind({ serverId: 'slack', channelId: 'c' });
+    assert.equal(router.getBinding({ serverId: 'discord', channelId: 'c' })?.agentName, 'fork-d', "unbinding one server's channel leaves the other's");
+    assert.equal(router.getBinding('c')?.agentName, 'fork-d');
+  });
+});
+
+describe("a gate wake's route, with two forks on one channel id", () => {
+  it("is taken only by the fork the router binds the route's server and channel to", () => {
+    const router = new ConversationRouter({ templateAgent: 'scout' });
+    router.bind({ serverId: 'discord', channelId: 'room' }, 'fork-d', 1);
+    router.bind({ serverId: 'slack', channelId: 'room' }, 'fork-s', 2);
+    const framework = Object.create(AgentFramework.prototype) as {
+      conversationRouter: ConversationRouter;
+      conversationAgentHomes: Map<string, string>;
+      mayTakeGateRoute(agentName: string, routeChannelId: string, routeServerId?: string): boolean;
+    };
+    framework.conversationRouter = router;
+    framework.conversationAgentHomes = new Map([['fork-d', 'room'], ['fork-s', 'room']]);
+    assert.equal(framework.mayTakeGateRoute('fork-s', 'room', 'slack'), true);
+    assert.equal(framework.mayTakeGateRoute('fork-d', 'room', 'slack'), false, "discord's fork doesn't take slack's route");
+    assert.equal(framework.mayTakeGateRoute('fork-d', 'room', 'discord'), true);
+    assert.equal(framework.mayTakeGateRoute('fork-s', 'room', 'discord'), false);
+    assert.equal(framework.mayTakeGateRoute('fork-d', 'room'), false, 'a route with no server names neither of two forks');
+    assert.equal(framework.mayTakeGateRoute('scout', 'room', 'slack'), false, 'nor does an agent that is no fork');
+  });
+
+  it("with one fork bound, it still takes its own server's route, and no agent takes another server's route on that id", () => {
+    const router = new ConversationRouter({ templateAgent: 'scout' });
+    router.bind({ serverId: 'discord', channelId: 'room' }, 'fork-d', 1);
+    const framework = Object.create(AgentFramework.prototype) as {
+      conversationRouter: ConversationRouter;
+      conversationAgentHomes: Map<string, string>;
+      mayTakeGateRoute(agentName: string, routeChannelId: string, routeServerId?: string): boolean;
+    };
+    framework.conversationRouter = router;
+    framework.conversationAgentHomes = new Map([['fork-d', 'room']]);
+    assert.equal(framework.mayTakeGateRoute('fork-d', 'room', 'discord'), true);
+    assert.equal(framework.mayTakeGateRoute('fork-d', 'room'), true, 'a route with no server names the one fork bound on the id');
+    assert.equal(framework.mayTakeGateRoute('fork-d', 'room', 'slack'), false);
+    assert.equal(framework.mayTakeGateRoute('scout', 'room', 'slack'), false);
+  });
 });
 
 describe('the refusal reaction marks the latest message through the server that sent it', () => {

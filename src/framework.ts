@@ -3025,7 +3025,7 @@ export class AgentFramework {
             // route applies to a fork only when it IS that home, and never to
             // another agent when a fork owns that channel. Otherwise a fork
             // bound elsewhere would show typing where it isn't replying.
-            ...(provenance?.routeChannelId && framework.mayTakeGateRoute(agentName, provenance.routeChannelId)
+            ...(provenance?.routeChannelId && framework.mayTakeGateRoute(agentName, provenance.routeChannelId, provenance.routeServerId)
               ? { channelId: provenance.routeChannelId, serverId: provenance.routeServerId, addressed: true }
               : {}),
           });
@@ -11523,8 +11523,9 @@ export class AgentFramework {
         const id = target.getContextManager().addMessage('user', event.content, metadata);
         // A correction may target an older engagement. Refresh only the
         // binding whose agent actually received the message.
-        if (this.conversationRouter.getBinding(event.channelId)?.agentName === target.name) {
-          this.conversationRouter.touch(event.channelId);
+        const channel = { serverId: event.serverId, channelId: event.channelId };
+        if (this.conversationRouter.getBinding(channel)?.agentName === target.name) {
+          this.conversationRouter.touch(channel);
         }
         this.emitTrace({ type: 'message:added', messageId: id, source: 'mcpl:channel-incoming' });
         if (event.triggerInference) {
@@ -11690,7 +11691,7 @@ export class AgentFramework {
       if (!agent) {
         // Bound agent vanished (e.g. external reset) — unbind so the next
         // qualifying message respawns a fresh fork.
-        router.unbind(event.channelId);
+        router.unbind({ serverId: event.serverId, channelId: event.channelId });
         this.emitTrace({
           type: 'mcpl:conversation-binding-orphaned',
           channelId: event.channelId,
@@ -11706,7 +11707,7 @@ export class AgentFramework {
     messageMetadata.triggered = trigger;
 
     const id = agent.getContextManager().addMessage('user', event.content, messageMetadata);
-    router.touch(event.channelId);
+    router.touch({ serverId: event.serverId, channelId: event.channelId });
     this.emitTrace({ type: 'message:added', messageId: id, source: 'mcpl:channel-incoming' });
 
     if (trigger) {
@@ -11863,7 +11864,7 @@ export class AgentFramework {
       }
       const decision = this.conversationRouter!.route(facts);
       if (decision.kind !== 'spawn') return decision;
-      return { ...decision, spawned: this.spawnConversationAgent(facts.channelId, decision) };
+      return { ...decision, spawned: this.spawnConversationAgent(facts, decision) };
     }
   }
 
@@ -11879,11 +11880,12 @@ export class AgentFramework {
    * so the entry it removes is its own. It's removed before anyone waiting
    * on it resumes, so a waiter that decides again doesn't find it.
    */
-  private spawnConversationAgent(channelId: string, decision: { agentName: string; generation: number }): Promise<Agent> {
+  private spawnConversationAgent(facts: IncomingMessageFacts, decision: { agentName: string; generation: number }): Promise<Agent> {
+    const channelId = facts.channelId;
     const spawn = (async () => {
       this.storeConversationGeneration(channelId, decision.generation);
       const agent = await this.createConversationAgent(decision.agentName, channelId);
-      this.conversationRouter!.bind(channelId, decision.agentName, decision.generation);
+      this.conversationRouter!.bind({ serverId: facts.serverId, channelId }, decision.agentName, decision.generation);
       return agent;
     })();
     const done = (): void => { this.conversationSpawns.delete(channelId); };
@@ -12013,7 +12015,7 @@ export class AgentFramework {
     this.lastConversationSweep = now;
 
     for (const binding of this.conversationRouter.expired(now)) {
-      this.conversationRouter.unbind(binding.channelId);
+      this.conversationRouter.unbind(binding);
       this.emitTrace({
         type: 'mcpl:conversation-closed',
         channelId: binding.channelId,
@@ -12693,7 +12695,7 @@ export class AgentFramework {
     if (explicit) return explicit.filter((n) => this.agents.has(n));
     if (occ.scope.kind === 'channel' && this.conversationRouter) {
       const router = this.conversationRouter;
-      const bound = router.getBinding(occ.scope.id)?.agentName;
+      const bound = router.getBinding({ serverId: occ.serverId, channelId: occ.scope.id })?.agentName;
       if (bound) return this.agents.has(bound) ? [bound] : [];
       // No fork yet: the same bind decision an incoming message would get. A
       // batch that qualifies spawns its fork now so it has someone to wake.
@@ -13048,11 +13050,18 @@ export class AgentFramework {
    * Whether a batched gate wake's addressed route may become `agentName`'s
    * speech locus. The gate broadcasts to every agent, conversation forks
    * included. A fork speaks only in its home channel, and a channel bound to
-   * a fork is that fork's conversation, so no other agent takes it.
+   * a fork is that fork's conversation, so no other agent takes it. Two
+   * servers' channels with one id are two conversations, each bound to its
+   * own fork with that id as its home, so a fork takes the route only where
+   * the router binds the route's channel, its server and id, to it; a route
+   * with no server names a fork only where one fork is bound to that id.
    */
-  private mayTakeGateRoute(agentName: string, routeChannelId: string): boolean {
+  private mayTakeGateRoute(agentName: string, routeChannelId: string, routeServerId?: string): boolean {
     const home = this.conversationAgentHomes.get(agentName);
-    if (home !== undefined) return home === routeChannelId;
+    if (home !== undefined) {
+      return home === routeChannelId
+        && this.conversationRouter?.getBinding({ serverId: routeServerId, channelId: routeChannelId })?.agentName === agentName;
+    }
     for (const boundChannel of this.conversationAgentHomes.values()) {
       if (boundChannel === routeChannelId) return false;
     }
