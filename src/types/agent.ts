@@ -135,10 +135,14 @@ export interface AgentConfig {
    *   other way.
    *
    * What the framework adds: it keeps each agent's recorded head in its
-   * store, so a restart keeps the head. An Agent used without the framework
-   * keeps its head in memory. The direct API (runInference) declares
-   * nothing: it sends the tools its caller passes and the current system
-   * text, and leaves the context's changes out.
+   * store, so a restart keeps the head; and when a request carrying a change
+   * is refused (with the refusal membrane recognises, or, on a model that
+   * doesn't bind its thinking, with any 400), the request goes again on the
+   * agent's head, which it keeps to until it's built again. An Agent used
+   * without the framework keeps its head in memory and has no such resend.
+   * The direct API (runInference) declares nothing: it sends the tools its
+   * caller passes and the current system text, and leaves the context's
+   * changes out.
    *
    * Turning it on is a choice from those records, not a runtime toggle, so
    * it isn't one of the agent's runtime settings.
@@ -251,11 +255,13 @@ export interface AgentConfig {
     /**
      * Whether the model's thinking is bound to everything before it (default
      * true), so a change to earlier bytes sets it aside. Under
-     * `toolDeclarations: 'entries'` a binding model consolidates only where no
-     * thinking sits before the compile's `firstChanged` (the first message
-     * that compile renders differently from the last one; thinking from there
-     * on is set aside by the compile's own change). The host's model records
-     * carry it, beside "takes entries".
+     * `toolDeclarations: 'entries'` it narrows two choices: a binding model
+     * resends with its changes in the head only after a refusal membrane
+     * recognises, and it consolidates only where no thinking sits before the
+     * compile's `firstChanged` (the first message that compile renders
+     * differently from the last one; thinking from there on is set aside by
+     * the compile's own change). The host's model records carry it, beside
+     * "takes entries".
      */
     binds?: boolean;
   };

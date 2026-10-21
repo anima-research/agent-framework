@@ -12336,6 +12336,28 @@ export class AgentFramework {
     }
   }
 
+  /**
+   * The fail-safe's trigger (system-changes.ts): a request that carried a
+   * system change, refused with membrane's `systemChangeRefused` (its
+   * recognised wordings, or its own refusal before sending), or, on a model
+   * that doesn't bind its thinking, refused with any 400. A binding model
+   * waits for the recognised refusal, since moving its head sets its thinking
+   * aside, and a 400 about something else shouldn't cost that. True when
+   * the agent now keeps to its head until it's built again; the caller then
+   * retries the turn at once (attempt + 1, so it continues the same turn:
+   * no second undo checkpoint, the turn's tool-call count kept).
+   */
+  private keepToHeadAfterRefusal(agent: Agent, error: Error, request: NormalizedRequest | undefined): boolean {
+    if (!agent.declaresEntries() || !request?.messages.some(isSystemChangeMessage)) return false;
+    const recognised = isMembraneError(error) && error.systemChangeRefused === true;
+    const refused = isMembraneError(error) && error.httpStatus === 400;
+    if (!recognised && (agent.bindsThinking || !refused)) return false;
+    agent.keepToHeadUntilRestart();
+    console.error(`[head-declarations] ${agent.name}: a request carrying a system change was refused, so it declares on its head until a restart: ${error.message}`);
+    this.emitTrace({ type: 'head:resend', agentName: agent.name, error: error.message });
+    return true;
+  }
+
   /** Give an agent the recorded heads, and trace what moves its head. An
    *  ephemeral agent keeps its own in memory: it doesn't outlive its run. */
   private attachHeads(agent: Agent, store: HeadDeclarationStore = this.headDeclarations): void {
@@ -21179,21 +21201,28 @@ export class AgentFramework {
 
             this.abandonAgentScripts(agent.name, 'stream error', streamRouting);
 
+            // The fail-safe (system-changes.ts): a request whose system
+            // change was refused goes again at once, on the agent's head,
+            // which it keeps to until it's built again. The refusal never
+            // reaches the error policy (a 400 is terminal there); the resend
+            // is a retry of the same turn. Bounded: it carries no change.
+            const onHead = this.keepToHeadAfterRefusal(agent, err, compiledRequest);
             // A hold takes the turn's retry, or, once stop() has closed
             // admission, the turn ends here (endFailureAtStop).
-            if (ownsProviderGate && this.holdProviderAcceleration(agent, err, trigger)) {
+            if (!onHead && ownsProviderGate && this.holdProviderAcceleration(agent, err, trigger)) {
               this.endFailureAtStop(agent.name, myTurnToken ?? -1, startTime);
               if (this.agents.get(agent.name) === agent && agent.streamId === myStreamId) this.eventGate?.onInferenceEnded(agent.name);
               break;
             }
-            const statedWait = ownsProviderGate ? undefined : this.nonOwningProviderWait(agent, err, trigger);
+            const statedWait = onHead || ownsProviderGate ? undefined : this.nonOwningProviderWait(agent, err, trigger);
             if (statedWait === 'held') {
               this.endFailureAtStop(agent.name, myTurnToken ?? -1, startTime);
               if (this.agents.get(agent.name) === agent && agent.streamId === myStreamId) this.eventGate?.onInferenceEnded(agent.name);
               break;
             }
 
-            const action: ErrorAction = statedWait === 'fail' ? { retry: false } : this.errorPolicy.onInferenceError(err, agent.name, attempt);
+            const action: ErrorAction = onHead ? { retry: true, delayMs: 0 }
+              : statedWait === 'fail' ? { retry: false } : this.errorPolicy.onInferenceError(err, agent.name, attempt);
             if (action.retry) {
               // A stop made during the wait reaches no stream: the check after
               // the wait ends the turn, as the guard's check after its wait
