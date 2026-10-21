@@ -1628,6 +1628,10 @@ function hostCommandFramework(outbox: DiscordAwarenessOutbox | null, messages: A
   framework.providerGates = new Map();
   // A move is refused while a conversation agent is being created: here, none.
   framework.conversationSpawnsInFlight = new Set();
+  // A surgery takes what a restart does to its agent when it reserves the
+  // store (agentKind), which reads these.
+  framework.conversationAgentHomes = new Map();
+  framework.ephemeralRuns = new Map();
   framework.operatorLog = new OperatorLog(undefined);
   framework.opsAlert = () => {};
   return { framework, removed, setBranch: (name: string) => { currentBranch = name; } };

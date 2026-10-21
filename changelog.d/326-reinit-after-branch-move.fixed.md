@@ -50,11 +50,11 @@
   grows with that agent's stored history. Nothing bounds it, or the wait for
   maintenance already running that comes before it, so a move whose hold on
   the store is still up after 60 s raises one `store-held-long` ops alert.
-  It names the move and the agent it was for, and the manager its pass is
-  re-initializing or the maintenance it's waiting for, and says what a
-  restart does: it ends the conversation agents and runs, and re-initializes
-  the configured agents, whose queued writes outlast the process only in a
-  persisted deferral queue. It's raised for every move that holds the store: a
+  It says what a restart does: it ends the move, the conversation agents
+  and the runs, and re-initializes the configured agents, and writes still
+  queued at exit survive only in a persisted deferral queue. Then it names
+  the agent the move was for, and the manager its pass is re-initializing
+  or the maintenance it's waiting for. It's raised for every move that holds the store: a
   rollback, a suppression and a branch switch, as well as an undo or redo.
 - **A conversation agent with no stored message of its own on the branch
   the store moves to is seeded again from the template,** as one spawned
@@ -75,10 +75,11 @@
   answer with no history: `context-reinit-failed` says so and why. The
   writes held for it while the store was held go with it: its window's
   release stores what its store takes of them there and passes any failed
-  reply on to the primary agent. On a quiesced host that release waits for
-  the resume, and a `stop()` before the resume passes a failed reply on and
-  drops the rest, logged. The alert says how many, and which of these
-  happened, since the fork its channel spawns next, under a new name,
+  reply on to the primary agent. On a quiesced host that release is
+  postponed to the resume, and a `stop()` or a crash before the resume drops
+  all but a failed reply, logged, which goes to the primary at the restarted
+  host's resume. The alert says how many, and which of these the disposal
+  met, since the fork its channel spawns next, under a new name,
   doesn't get them. If
   disposing it fails partway, the alert says that too, and the move's other
   conversation agents are still seeded. Its channel's next qualifying message spawns a
