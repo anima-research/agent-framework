@@ -5,6 +5,8 @@ export * from './types/index.js';
 export { AgentFramework, BudgetPreflightError, DefaultErrorPolicy, ProviderWaitNotSleptError, QuiesceBlockedError, ResumeBlockedError } from './framework.js';
 export type { RuntimeSettingsPreview, HostModeStatus } from './framework.js';
 export { Agent } from './agent.js';
+// A stored system change (toolDeclarations 'entries'), for a host's own readers of stored rows.
+export { isSystemChangeMessage } from './system-changes.js';
 export type { StartStreamResult } from './agent.js';
 export { ProcessQueueImpl } from './queue.js';
 export { ModuleRegistry } from './module-registry.js';

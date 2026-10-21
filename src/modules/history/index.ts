@@ -696,7 +696,8 @@ export class HistoryModule implements Module {
           'Fetch raw, uncompressed messages for a time range and/or channel, paginated oldest-first. ' +
           'Use after `stats` to pull the actual content. format:"text" flattens each message to a short ' +
           'readable string (tool_use/tool_result/thinking/images rendered as bracketed labels); ' +
-          'format:"raw" returns the content blocks unmodified. ' +
+          'format:"raw" returns the content blocks unmodified, except that a system change comes back as its type alone ' +
+          '(what it declared may be another agent\'s tools and system text, so it is withheld). ' +
           'Two extra modes: (1) aroundId — pass a message id (e.g. from `search`) to get the conversation ' +
           'around it: `before` messages before it, the message itself (anchor:true), and `after` messages ' +
           'after it, in the anchor\'s own channel unless channelId/allChannels says otherwise; from/to/offset/limit ' +
@@ -2437,8 +2438,18 @@ function projectMessage(msg: StoredMessage, format: 'text' | 'raw'): Record<stri
     participant: msg.participant,
     author: authorName(msg),
     channelId: getChannelId(msg) ?? null,
-    content: format === 'raw' ? msg.content : flattenContent(msg.content),
+    content: format === 'raw' ? msg.content.map(withoutDeclarations) : flattenContent(msg.content),
   };
+}
+
+/**
+ * A system change (toolDeclarations 'entries') as history shows it: that one
+ * was made, not what it declared. In the residents' shared slot it may be
+ * another agent's, whose tool definitions and system text (a live AGENTS.md,
+ * say) are that agent's alone, and history reads the slot as it is stored.
+ */
+function withoutDeclarations(block: ContentBlock): ContentBlock {
+  return block.type === 'system_change' ? ({ type: 'system_change' } as ContentBlock) : block;
 }
 
 /** Flatten a message's content blocks to one short, readable string. Text
@@ -2470,6 +2481,10 @@ function blockLabel(block: ContentBlock): string {
       return '[audio]';
     case 'video':
       return '[video]';
+    case 'system_change':
+      // That an agent's tools or system text changed, never what to: see
+      // withoutDeclarations.
+      return '[system change]';
     default:
       // Exhaustiveness guard: a future ContentBlock variant falls back to a
       // generic label instead of a compile error at a call site far from here.
