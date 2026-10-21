@@ -719,9 +719,10 @@ describe('stop() with an operator operation in flight', () => {
     } finally { await framework.stop(); }
   });
 
-  it('two API switches handled together each announce their own move', async () => {
-    // With no workspace module, a switch holds the store for no await, so a
-    // second one can move the store before the first's continuation runs.
+  it('two API switches handled together: the second is refused while the first holds the store, and only the first is announced', async () => {
+    // A switch holds the store until every agent's context manager is
+    // re-initialized for its branch, with or without a workspace module, so
+    // a second switch made meanwhile finds the store held.
     const framework = await create();
     try {
       const api = new ApiServer(framework) as unknown as {
@@ -734,13 +735,15 @@ describe('stop() with an operator operation in flight', () => {
       await api.cmdBranchCreate({ name: 'b' });
       const broadcasts: Array<[string, unknown]> = [];
       api.broadcast = (event, data) => { broadcasts.push([event, data]); };
-      await Promise.all([api.cmdBranchSwitch({ name: 'a' }), api.cmdBranchSwitch({ name: 'b' })]);
-      assert.deepEqual(broadcasts, [
-        ['branch:switched', { from: 'main', to: 'a' }],
-        ['branch:switched', { from: 'a', to: 'b' }],
-      ]);
-      assert.equal(framework.getStore().currentBranch().name, 'b');
-      assert.equal((await api.cmdBranchCurrent()).name, 'b');
+      const [first, second] = await Promise.allSettled([api.cmdBranchSwitch({ name: 'a' }), api.cmdBranchSwitch({ name: 'b' })]);
+      assert.equal(first.status, 'fulfilled');
+      assert.ok(
+        second.status === 'rejected' && second.reason instanceof OperatorActionError && second.reason.code === 'agent-busy',
+        second.status === 'rejected' ? String(second.reason) : 'the second switch went through',
+      );
+      assert.deepEqual(broadcasts, [['branch:switched', { from: 'main', to: 'a' }]]);
+      assert.equal(framework.getStore().currentBranch().name, 'a');
+      assert.equal((await api.cmdBranchCurrent()).name, 'a');
     } finally { await framework.stop(); }
   });
 

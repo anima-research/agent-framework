@@ -583,6 +583,35 @@ describe('stop() with work still in flight', () => {
       return { framework, release, residentStreaming, entered, letGo, order, push, internals, storedTexts };
     }
 
+    // The same line, for a persisted queue: one whose record is current keeps
+    // the writes for boot, and one whose last write failed is behind.
+    for (const record of ['current', 'behind'] as const) {
+      it(`a stream that outlasts the budget says a persisted queue whose record is ${record} ${record === 'current' ? 'keeps' : 'can lose'} its agent's queued writes`, { timeout: 30_000 }, async () => {
+        const { framework, release, residentStreaming, push, internals } = await frameworkWithHeldWork();
+        const fw = framework as unknown as { deferredWritesPersisted: boolean; writeDeferredWrites: () => unknown };
+        try {
+          framework.start();
+          push('go');
+          await residentStreaming;
+          fw.deferredWritesPersisted = true;
+          if (record === 'behind') fw.writeDeferredWrites = () => { throw new Error('injected record write failure'); };
+          push('a note for later');
+          await until(() => internals.deferredMessages.length === 1, 'the note to be deferred behind the stream');
+          const outcome = await settledWithin(framework.stop(100), 5_000);
+          assert.ok(outcome instanceof ShutdownTimeoutError, String(outcome));
+          assert.ok(logged.includes(
+            "[deferral] stop: 1 deferred write(s) for assistant stay queued: its stream is still running and may still write; " +
+            (record === 'current'
+              ? 'the persisted queue keeps them for boot'
+              : "the persisted queue's record is behind, since its last write failed or met the cap, so a restart can lose them")),
+          logged.join('\n'));
+        } finally {
+          release();
+          await framework.stop().catch(() => {});
+        }
+      });
+    }
+
     it("a stream that outlasts the budget fails the stop, keeps the store open, and keeps its agent's deferred write queued until its own end stores it", { timeout: 30_000 }, async () => {
       // The deferral's rule holds through the timeout: no entry lands ahead of
       // a stream that may still write.
