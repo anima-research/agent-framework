@@ -20,7 +20,7 @@ interface Row { id: string; participant: string; content: ContentBlock[]; metada
 
 /** A context whose compile returns every stored row, with the system
  *  injections it's given, and which records each compile's options. */
-function fakeContext(rows: Row[] = [], opts: { kvUnified?: boolean } = {}) {
+function fakeContext(rows: Row[] = [], opts: { kvUnified?: boolean; firstChanged?: () => number | null } = {}) {
   let next = rows.length;
   const compiles: Array<{ kvUnifiedImmutablePrefixHash?: string; dryRun?: boolean } | undefined> = [];
   const cm = {
@@ -29,6 +29,7 @@ function fakeContext(rows: Row[] = [], opts: { kvUnified?: boolean } = {}) {
       return {
         messages: rows.map((r) => ({ participant: r.participant, content: r.content })),
         systemInjections: (injections ?? []).filter((i) => i.position === 'system').flatMap((i) => i.content),
+        ...(opts.firstChanged ? { firstChanged: opts.firstChanged() } : {}),
       };
     },
     addMessage: (participant: string, content: ContentBlock[], metadata?: Record<string, unknown>) => {
@@ -415,8 +416,103 @@ describe('toolDeclarations', () => {
     assert.equal(sent!.messages.some((m) => m.content.some((b) => (b as { type: string }).type === 'system_change')), false);
   });
 
-  it('refuses a toolDeclarations it can\'t read, without echoing it', () => {
+  describe('consolidation', () => {
+    /** An agent with one change declared, and a response of `input` tokens
+     *  reported since; the next compile's `firstChanged` is `at()`. */
+    async function withOneChange(input: number, at: () => number | null, config: Partial<AgentConfig> = {}, rows: Row[] = [said('user', 'hello')]) {
+      const context = fakeContext(rows, { firstChanged: at });
+      const heads = memoryHeadDeclarations();
+      const events: HeadEvent[] = [];
+      const agent = agentOn(context, { toolDeclarations: 'entries', ...config }, heads, events);
+      await agent.buildActivationRequest([tool('a')]);
+      await agent.buildActivationRequest([tool('a'), tool('b')]);
+      agent.noteResponseInput(input);
+      return { agent, context, heads, events };
+    }
+    const changeIndex = (rows: Row[]) => rows.findIndex((r) => r.participant === 'system');
+    // The change is about 25 tokens from its JSON: a tenth of 250.
+
+    it('moves the changes into the head once they reach a tenth of the input, at a compile that re-renders from before them', async () => {
+      let at: number | null = null;
+      const { agent, context, heads, events } = await withOneChange(250, () => at);
+      at = changeIndex(context.rows);
+      const compiles = context.compiles.length;
+      const request = await agent.buildActivationRequest([tool('a'), tool('b')]);
+      assert.deepEqual(request.tools, [tool('a'), tool('b')], 'the head is what\'s current');
+      assert.deepEqual(changeRows(context.rows), []);
+      assert.equal(context.compiles.length - compiles, 2, 'and the compile ran again without them');
+      assert.deepEqual(heads.read('agent')!.tools, [tool('a'), tool('b')]);
+      const moved = events.at(-1) as Extract<HeadEvent, { type: 'head:moved' }>;
+      assert.equal(moved.why, 'consolidated');
+      assert.equal(moved.changesRemoved, 1);
+      assert.equal(moved.inputTokens, 250);
+      assert.ok(moved.changeTokens! * 10 >= 250);
+    });
+
+    it('keeps them where they happened when the compile re-renders only after them, or nothing changed, or they cost under a tenth', async () => {
+      for (const [input, at] of [[250, 'after'], [250, null], [100_000, 'first']] as const) {
+        const rows = [said('user', 'hello')];
+        const { agent } = await withOneChange(input, () => (at === null ? null : at === 'first' ? 0 : changeIndex(rows) + 1), {}, rows);
+        const request = await agent.buildActivationRequest([tool('a'), tool('b')]);
+        assert.deepEqual(request.tools, [tool('a')], `${input} ${at}: the recorded head`);
+        assert.equal(changeRows(rows).length, 1, `${input} ${at}: the change stays`);
+      }
+    });
+
+    it('waits for a first response before measuring', async () => {
+      const context = fakeContext([said('user', 'hello')], { firstChanged: () => 0 });
+      const agent = agentOn(context, { toolDeclarations: 'entries' });
+      await agent.buildActivationRequest([tool('a')]);
+      await agent.buildActivationRequest([tool('a'), tool('b')]);
+      await agent.buildActivationRequest([tool('a'), tool('b')]);
+      assert.equal(changeRows(context.rows).length, 1);
+    });
+
+    it("prices the changes from their JSON and moves at a tenth of the input, not below", async () => {
+      const price = Math.ceil(JSON.stringify({ type: 'system_change', defineTools: [tool('b')] }).length / 4);
+      for (const [input, moves] of [[price * 10, true], [price * 10 + 1, false]] as const) {
+        const rows = [said('user', 'hello')];
+        const { agent } = await withOneChange(input, () => changeIndex(rows), {}, rows);
+        const request = await agent.buildActivationRequest([tool('a'), tool('b')]);
+        assert.deepEqual(request.tools, moves ? [tool('a'), tool('b')] : [tool('a')], `input ${input}`);
+      }
+    });
+
+    it('on a binding model, minds only thinking before firstChanged, redacted thinking included', async () => {
+      const thought = (block: ContentBlock): Row => ({ id: `t-${block.type}`, participant: 'agent', content: [block, { type: 'text', text: 'so' }] });
+      const thinking = { type: 'thinking', thinking: 'why', signature: 's' } as ContentBlock;
+      const redacted = { type: 'redacted_thinking', data: 'x' } as ContentBlock;
+      // Thinking from firstChanged on is set aside by the compile's own change: it holds nothing back.
+      {
+        const rows = [said('user', 'hello'), thought(thinking), said('user', 'and then')];
+        const { agent } = await withOneChange(250, () => 1, { thinkingBinding: { binds: true } }, rows);
+        assert.deepEqual((await agent.buildActivationRequest([tool('a'), tool('b')])).tools, [tool('a'), tool('b')], 'thinking at firstChanged');
+      }
+      {
+        const rows = [said('user', 'hello'), thought(redacted), said('user', 'and then')];
+        const { agent } = await withOneChange(250, () => changeIndex(rows), { thinkingBinding: { binds: true } }, rows);
+        assert.deepEqual((await agent.buildActivationRequest([tool('a'), tool('b')])).tools, [tool('a')], 'redacted thinking before it');
+      }
+    });
+
+    it('on a binding model, leaves thinking the compile kept before its first change be', async () => {
+      const thought: Row = { id: 'thought', participant: 'agent', content: [{ type: 'thinking', thinking: 'why', signature: 's' } as ContentBlock, { type: 'text', text: 'so' }] };
+      const rows = () => [said('user', 'hello'), thought, said('user', 'and then')];
+      for (const binds of [true, false]) {
+        const stored = rows();
+        const { agent } = await withOneChange(250, () => changeIndex(stored), { thinkingBinding: { binds } }, stored);
+        const request = await agent.buildActivationRequest([tool('a'), tool('b')]);
+        assert.deepEqual(request.tools, binds ? [tool('a')] : [tool('a'), tool('b')], `binds ${binds}`);
+      }
+    });
+  });
+
+  it('refuses a toolDeclarations or thinkingBinding.binds it can\'t read', () => {
     const context = fakeContext();
     assert.throws(() => agentOn(context, { toolDeclarations: 'sk-pasted-secret' as never }), (e: Error) => /Agent "agent" toolDeclarations must be 'head' or 'entries', not another string:/.test(e.message) && !e.message.includes('sk-pasted-secret'));
+    assert.throws(() => agentOn(context, { thinkingBinding: true as never }), /Agent "agent" thinkingBinding/);
+    assert.throws(() => agentOn(context, { thinkingBinding: { binds: 'false' as never } }), /Agent "agent" thinkingBinding.binds must be true or false, unquoted, not a string/);
+    assert.equal(agentOn(context, { thinkingBinding: null as never }).bindsThinking, true);
+    assert.equal(agentOn(context, { thinkingBinding: { binds: false } }).bindsThinking, false);
   });
 });

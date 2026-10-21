@@ -119,11 +119,14 @@ export type TraceEvent =
       type: 'head:moved';
       agentName: string;
       /** What moved the head to what's current: the first request under
-       *  'entries', a replacement of system text, or a request on the head
-       *  that found changes left from an earlier period. */
-      why: 'adopted' | 'replaced' | 'on-head';
+       *  'entries', a replacement of system text, a consolidation, or a
+       *  request on the head that found changes left from an earlier period. */
+      why: 'adopted' | 'replaced' | 'consolidated' | 'on-head';
       /** The change rows removed, since the head now holds them. */
       changesRemoved: number;
+      /** For a consolidation: the changes' tokens, priced from their JSON, and the input they reached a tenth of. */
+      changeTokens?: number;
+      inputTokens?: number;
     })
   | (TraceEventBase & {
       type: 'inference:exhausted';

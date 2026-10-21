@@ -109,7 +109,8 @@ export interface AgentConfig {
    *   later change to the tools, or addition to the system text, goes into
    *   the context as a system change at the point it took effect, which the
    *   provider reads without rewriting what came before. A replacement of
-   *   system text moves the head to what's current, with one write. Only for models that
+   *   system text, and consolidation once changes reach a tenth of the input,
+   *   move the head to what's current, with one write. Only for models that
    *   take mid-conversation system messages on the native formatter: the
    *   host's model records say which. Membrane refuses a system change any
    *   other way.
@@ -124,6 +125,19 @@ export interface AgentConfig {
    * it isn't one of the agent's runtime settings.
    */
   toolDeclarations?: 'head' | 'entries';
+
+  /**
+   * How the provider treats this agent's model's thinking. `binds` (default
+   * true) says the model's thinking is bound to everything before it, so a
+   * change to earlier bytes sets it aside. Under `toolDeclarations:
+   * 'entries'` a binding model consolidates only where no thinking sits
+   * before the compile's `firstChanged` (the first message that compile renders differently from
+   * the last one; thinking from there on is set aside by the compile's own
+   * change). The host's model records carry it, beside "takes entries".
+   */
+  thinkingBinding?: {
+    binds?: boolean;
+  };
 
   /**
    * Whether to emit prompt-cache markers (cache_control) on requests.

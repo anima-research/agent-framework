@@ -1,4 +1,4 @@
-import type { Membrane, NormalizedMessage, NormalizedRequest, ContentBlock, YieldingStream } from '@animalabs/membrane';
+import type { Membrane, NormalizedMessage, NormalizedRequest, ContentBlock, SystemChangeContent, YieldingStream } from '@animalabs/membrane';
 import { isAbortedResponse, isSystemChangeContent } from '@animalabs/membrane';
 import { createHash } from 'node:crypto';
 import type { CacheWireReceipt, KvUnifiedRequestHooks } from './kv-unified-wire.js';
@@ -115,10 +115,11 @@ const DEFAULT_SAME_ROUND_THINK_TEXT_POLICY: SameRoundThinkTextPolicy = 'public';
 
 /**
  * Refuse an agent config whose `promptCaching`, `toolResultGuard`,
- * `toolWrapperProseGuard`, `thinking.enabled` or `refusalHandling.autoRewind`
- * holds anything but true or false (assertBooleanSetting), whose `thinking`
- * or `refusalHandling` is anything but an object, null or false
- * (holdsSettings), or whose `toolDeclarations` is anything but 'head' or 'entries'
+ * `toolWrapperProseGuard`, `thinking.enabled`, `refusalHandling.autoRewind`
+ * or `thinkingBinding.binds` holds anything but true or false
+ * (assertBooleanSetting), whose `thinking`, `refusalHandling` or
+ * `thinkingBinding` is anything but an object, null or false (holdsSettings),
+ * or whose `toolDeclarations` is anything but 'head' or 'entries'
  * (assertOneOfSetting). The constructor runs it first, so the rule holds wherever
  * an Agent is built. `create()` also runs it for each of its agents before
  * anything opens, and `createEphemeralAgent` before it reserves the name, so a
@@ -166,6 +167,13 @@ export function assertAgentSwitches(config: AgentConfig): void {
     '\'head\' or leaving it out sends the current tools and system text with every request, and \'entries\' keeps ' +
       'a recorded head and declares later changes in the context, for models that take them',
   );
+  if (holdsSettings(`${agent} thinkingBinding`, config.thinkingBinding, '{ binds: false }')) {
+    assertBooleanSetting(
+      `${agent} thinkingBinding.binds`,
+      config.thinkingBinding.binds,
+      'true or leaving it out says the model binds its thinking to everything before it, and false says it doesn\'t',
+    );
+  }
 }
 
 /**
@@ -208,10 +216,16 @@ export class Agent {
   readonly promptCaching: boolean;
   /** How requests declare tools and system text (see AgentConfig.toolDeclarations). */
   readonly toolDeclarations: NonNullable<AgentConfig['toolDeclarations']>;
+  /** Whether the model binds its thinking to everything before it (AgentConfig.thinkingBinding). */
+  readonly bindsThinking: boolean;
   /** Where the recorded head is kept (system-changes.ts). The framework
    *  gives its store's state; an agent built alone keeps it in memory. */
   private headDeclarations: HeadDeclarationStore = memoryHeadDeclarations();
   private onHeadEvent: ((event: HeadEvent) => void) | undefined;
+  /** The last response's reported input: its fresh tokens and its cache's
+   *  reads and writes, which consolidation measures the changes against.
+   *  Unknown until a response after this agent was built. */
+  private lastResponseInputTokens: number | undefined;
   /** Prefill scaffold user message (see AgentConfig.prefillUserMessage). */
   readonly prefillUserMessage?: string;
   /** Provider-specific request parameters forwarded unchanged by Membrane. */
@@ -341,6 +355,7 @@ export class Agent {
     this.cacheTtl = config.cacheTtl ?? '1h';
     this.promptCaching = config.promptCaching !== false;
     this.toolDeclarations = config.toolDeclarations ?? 'head';
+    this.bindsThinking = (config.thinkingBinding || undefined)?.binds !== false;
     this.prefillUserMessage = config.prefillUserMessage;
     this.providerParams = config.providerParams;
     this.sameRoundThinkTextPolicy = config.sameRoundThinkTextPolicy;
@@ -1896,6 +1911,11 @@ export class Agent {
     this.onHeadEvent = onEvent;
   }
 
+  /** A response's reported input, from the framework's usage handler. */
+  noteResponseInput(tokens: number): void {
+    if (tokens > 0) this.lastResponseInputTokens = tokens;
+  }
+
   /**
    * The head this request declares, and the change it adds, after the
    * committing compile (system-changes.ts). On the head, what's current goes
@@ -1934,6 +1954,8 @@ export class Agent {
     const blocks = changes.flatMap((message) => message.content.filter(isSystemChangeContent));
     const difference = declarationDifference(effectiveDeclaration(recorded, blocks), current);
     if (difference.kind === 'replace') return this.moveHead(compiled, compiledWith, current, 'replaced', dryRun, compile);
+    const consolidation = this.consolidation(compiled, blocks);
+    if (consolidation) return this.moveHead(compiled, compiledWith, current, 'consolidated', dryRun, compile, consolidation);
     if (difference.kind === 'none' || endsOnUnansweredCalls(compiled.messages, this.name) || this.storeEndsOnToolCall()) {
       return { compiled, head: recorded };
     }
@@ -1964,9 +1986,10 @@ export class Agent {
     compiled: CompileResult,
     compiledWith: HeadDeclaration | null,
     current: HeadDeclaration,
-    why: 'adopted' | 'replaced',
+    why: 'adopted' | 'replaced' | 'consolidated',
     dryRun: boolean,
     compile: (head: HeadDeclaration) => Promise<CompileResult>,
+    sizes?: { changeTokens: number; inputTokens: number },
   ): Promise<{ compiled: CompileResult; head: HeadDeclaration }> {
     if (dryRun) {
       const shown = compiledWith !== null && headHash(compiledWith) !== headHash(current) ? await compile(current) : compiled;
@@ -1974,9 +1997,44 @@ export class Agent {
     }
     const removed = this.removeOwnChanges();
     this.headDeclarations.write(this.name, copyHead(current));
-    this.onHeadEvent?.({ type: 'head:moved', why, changesRemoved: removed });
+    this.onHeadEvent?.({ type: 'head:moved', why, changesRemoved: removed, ...sizes });
     const again = removed > 0 || (compiledWith !== null && headHash(compiledWith) !== headHash(current));
     return { compiled: again ? await compile(current) : compiled, head: current };
+  }
+
+  /**
+   * Whether this compile is where the changes go into the head, and if so,
+   * their price and the input it reached a tenth of. Once the changes, priced
+   * from their JSON as context-manager prices them, reach a tenth of the last
+   * response's reported input, at the first committing compile whose
+   * `firstChanged` (context-manager's: the first compiled message whose bytes
+   * differ from the previous committing compile's) is at or before the first
+   * change. That compile already rewrites every change, so moving the head
+   * adds the head and any messages before `firstChanged`, never more than
+   * the whole prompt. On a binding model, also only where no thinking sits
+   * before `firstChanged`: moving the head sets aside every thinking block
+   * in the request, and the thinking the compile kept before `firstChanged`
+   * would go by our choice. A strategy that keeps changes ahead of its
+   * window (the passthrough strategies, once over budget) re-renders from
+   * the first change only at the compile where its window first passes it:
+   * after that the change stays first and unchanged, and `firstChanged`
+   * falls after it. `firstChanged` is null after a start, before the
+   * manager's first committing compile, when nothing says what the provider
+   * still holds, and nothing consolidates then.
+   */
+  private consolidation(compiled: CompileResult, blocks: SystemChangeContent[]): { changeTokens: number; inputTokens: number } | undefined {
+    const firstChange = compiled.messages.findIndex(isSystemChangeMessage);
+    const inputTokens = this.lastResponseInputTokens;
+    if (firstChange < 0 || inputTokens === undefined) return undefined;
+    const changeTokens = blocks.reduce((sum, block) => sum + Math.ceil(JSON.stringify(block).length / 4), 0);
+    if (changeTokens * 10 < inputTokens) return undefined;
+    // Read only once consolidation is in question: context-manager compares
+    // it when it's read.
+    const firstChanged = (compiled as { firstChanged?: number | null }).firstChanged;
+    if (firstChanged == null || firstChanged > firstChange) return undefined;
+    const thinkingKept = compiled.messages.slice(0, firstChanged)
+      .some((message) => message.content.some((block) => block.type === 'thinking' || block.type === 'redacted_thinking'));
+    return this.bindsThinking && thinkingKept ? undefined : { changeTokens, inputTokens };
   }
 
   /** Remove this agent's change rows from its context: by their metadata,

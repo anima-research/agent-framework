@@ -19678,6 +19678,7 @@ export class AgentFramework {
               : agent.maxTokens;
             if (realTotal > 0) {
               agent.lastStreamRealInputTokens = realTotal;
+              agent.noteResponseInput(realTotal);
               agent.lastStreamOutputTokens = callOutputTokens;
               agent.lastStreamUnreportedTokens = 0;
             } else {
