@@ -85,6 +85,20 @@ and permitted counts and migration advice, and a list containing `utils`
 logs one warning per Agent instance after registration.
 An empty registry still returns a successful empty list.
 
+**Tool declarations.** By default every request carries the agent's current
+tools and system text, so a change to either rewrites the provider's cache
+from the head. With `toolDeclarations: 'entries'`, for models that take
+mid-conversation system messages on the native formatter, a request carries
+a recorded head instead, and each later change to the tools, or addition to
+the system text, is stored in the agent's context as a system change where
+it took effect. A replacement of system text, a consolidation once the
+changes reach a tenth of the input, and a refusal of a change move the head
+to what's current, with one write; after a refusal the agent keeps to its
+head until it's built again. `thinkingBinding.binds` (default `true`) says
+the model binds its thinking to everything before it, which narrows when it
+consolidates and when it resends. The host chooses both from what it knows
+of the model; neither is a runtime setting.
+
 Trusted module calls are exempt from agent allowlists. Genuinely unidentified
 public callers, including unknown legacy caller names, remain unrestricted.
 Framework-created ephemeral and conversation identities fail closed while

@@ -129,6 +129,13 @@ export type TraceEvent =
       inputTokens?: number;
     })
   | (TraceEventBase & {
+      /** A request whose system change was refused goes again on the head. */
+      type: 'head:resend';
+      agentName: string;
+      /** The refusal's message, bounded as every trace event's `error` is (2,000 characters). */
+      error: string;
+    })
+  | (TraceEventBase & {
       type: 'inference:exhausted';
       agentName: string;
       /** The failure's message, bounded as every trace event's `error` is (2,000 characters). */

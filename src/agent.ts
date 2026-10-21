@@ -218,6 +218,9 @@ export class Agent {
   readonly toolDeclarations: NonNullable<AgentConfig['toolDeclarations']>;
   /** Whether the model binds its thinking to everything before it (AgentConfig.thinkingBinding). */
   readonly bindsThinking: boolean;
+  /** Set by the framework's fail-safe once the provider refused a system
+   *  change: this agent then declares on its head until it's built again. */
+  private headUntilRestart = false;
   /** Where the recorded head is kept (system-changes.ts). The framework
    *  gives its store's state; an agent built alone keeps it in memory. */
   private headDeclarations: HeadDeclarationStore = memoryHeadDeclarations();
@@ -1902,7 +1905,7 @@ export class Agent {
 
   /** Whether this agent's requests declare later changes in its context. */
   declaresEntries(): boolean {
-    return this.toolDeclarations === 'entries';
+    return this.toolDeclarations === 'entries' && !this.headUntilRestart;
   }
 
   /** The framework's record of heads, and its traces of what moved them. */
@@ -1914,6 +1917,11 @@ export class Agent {
   /** A response's reported input, from the framework's usage handler. */
   noteResponseInput(tokens: number): void {
     if (tokens > 0) this.lastResponseInputTokens = tokens;
+  }
+
+  /** The fail-safe: declare on the head until this agent is built again. */
+  keepToHeadUntilRestart(): void {
+    this.headUntilRestart = true;
   }
 
   /**
