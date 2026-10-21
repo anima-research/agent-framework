@@ -12,7 +12,11 @@
  *    so a message stamped slightly out of order is still picked up; the
  *    service dedups by id + text hash, so re-sending is free. Summaries are
  *    watermarked by `createdMs` (a fresh L3 spans months of old timestamps —
- *    its creation time is the only monotonic signal).
+ *    its creation time is the only monotonic signal), with the watermark kept
+ *    in the module's state, which follows the store's branches: a branch
+ *    made at an earlier point, as an undo makes one, mints summary ids its
+ *    parent already used, so each branch sends its own summaries, keyed
+ *    `sum:<id>@<created>`.
  *
  * What gets embedded per message: text blocks verbatim, plus the string
  * arguments of the agent's private-prose tools (think / journal / skip_reply
@@ -339,10 +343,37 @@ export function summaryIndexText(s: { content: string }, cfg: { maxChars?: numbe
   return safeSlice(s.content.trim(), 0, cfg.maxChars ?? 32_000);
 }
 
+/**
+ * A summary's index key, `sum:<id>@<created>`. A branch made at an earlier
+ * point mints ids its parent already used, so the id alone names two
+ * summaries; its creation time, set when it was minted and kept by a branch
+ * that inherits it, tells them apart.
+ */
+export function summaryKey(id: string, createdMs: number): string {
+  return `sum:${id}@${createdMs}`;
+}
+
+/**
+ * A `sum:` key read back: its summary id, and its creation time, or null for
+ * a key in the form written before summaries were keyed by it (`sum:<id>`).
+ * Null for a key that isn't a summary's. A finite number written as a string
+ * reads back as the same number, so the time compares equal to the
+ * summary's own.
+ */
+export function parseSummaryKey(key: string): { id: string; createdMs: number | null } | null {
+  if (!key.startsWith('sum:')) return null;
+  const rest = key.slice(4);
+  const at = rest.lastIndexOf('@');
+  if (at > 0 && /^-?\d+(?:\.\d+)?(?:e[+-]?\d+)?$/.test(rest.slice(at + 1))) {
+    return { id: rest.slice(0, at), createdMs: Number(rest.slice(at + 1)) };
+  }
+  return rest ? { id: rest, createdMs: null } : null;
+}
+
 export function summaryToItem(s: SummaryLike, cfg: { maxChars?: number }): IndexItem | null {
   if (!s.content.trim()) return null;
   return {
-    id: `sum:${s.id}`,
+    id: summaryKey(s.id, s.createdMs),
     text: summaryIndexText(s, cfg),
     ts: s.startMs / 1000,
     kind: 'summary',
@@ -354,6 +385,18 @@ export function summaryToItem(s: SummaryLike, cfg: { maxChars?: number }): Index
 
 /** Edits/removals not yet applied to the index (persisted by the host across restarts). */
 export interface PendingChanges { edited: string[]; removed: string[] }
+
+/**
+ * Where the summary cursor is kept: the creation time through which this
+ * branch's summaries are sent under their keys. HistoryModule keeps it in
+ * module state, which the store's branches carry, so a branch made at an
+ * earlier point starts from the cursor as it was there, and another branch's
+ * passes never move it.
+ */
+export interface SummaryCursorStore {
+  read(): number | null;
+  write(createdMs: number): void;
+}
 
 export interface SyncReport {
   pushed: number;
@@ -411,6 +454,41 @@ export class SemanticIndexer {
   private deleteUnsupported = false;
   /** Called whenever the pending edit/remove sets change. */
   onPendingChange: ((p: PendingChanges) => void) | null = null;
+  /**
+   * Where the summary cursor is kept, set by the host. Without one, as
+   * before the host wires module state, this indexer keeps it itself.
+   */
+  summaryCursorStore: SummaryCursorStore | null = null;
+  private ownSummaryCursor: number | null = null;
+
+  /** The creation time through which this branch's summaries have been sent under their keys, or null before its first pass. */
+  summaryCursor(): number | null {
+    return this.summaryCursorStore ? this.summaryCursorStore.read() : this.ownSummaryCursor;
+  }
+
+  private setSummaryCursor(createdMs: number): void {
+    if (this.summaryCursorStore) this.summaryCursorStore.write(createdMs);
+    else this.ownSummaryCursor = createdMs;
+  }
+
+  /**
+   * Deletes ids from the index. A 404 in a pass whose /stats answered with
+   * stats shows the index is made, so it means a service build without the
+   * route: that sets deleteUnsupported and answers the 404's message. Null
+   * when the ids are deleted; any other failure throws.
+   */
+  private async deleteIds(ids: string[], stats: IndexStats | null): Promise<string | null> {
+    try {
+      await this.client.delete(ids);
+      return null;
+    } catch (e) {
+      if (e instanceof EmbedServiceError && e.status === 404 && stats !== null) {
+        this.deleteUnsupported = true;
+        return e.message;
+      }
+      throw e;
+    }
+  }
 
   pendingSnapshot(): PendingChanges { return { edited: [...this.editedIds], removed: [...this.removedIds] }; }
 
@@ -481,7 +559,6 @@ export class SemanticIndexer {
       // exist: there's no index to remove from.
       const noIndex = stats === null && notStats === null;
       const msgWm = stats?.by_kind.message?.max_cursor ?? null;
-      const sumWm = stats?.by_kind.summary?.max_cursor ?? null;
       let budget = maxItems;
       let pending: IndexItem[] = [];
       const flush = async (): Promise<void> => {
@@ -530,33 +607,29 @@ export class SemanticIndexer {
         // search-time checks (on-branch, still indexable) keep them out of
         // results.
         if (toDelete.length > 0 && !noIndex && !this.deleteUnsupported) {
+          // What the delete held, by kind, for a warning.
+          const what = [
+            removed.length > 0 ? `${removed.length} removal(s)` : null,
+            blanked.length > 0 ? `${blanked.length} edit(s) down to nothing indexable` : null,
+          ].filter((s): s is string => s !== null).join(' and ');
           try {
-            await this.client.delete(toDelete);
-          } catch (e) {
-            const msg = e instanceof Error ? e.message : String(e);
-            // What the delete held, by kind, for the warning.
-            const what = [
-              removed.length > 0 ? `${removed.length} removal(s)` : null,
-              blanked.length > 0 ? `${blanked.length} edit(s) down to nothing indexable` : null,
-            ].filter((s): s is string => s !== null).join(' and ');
-            if (e instanceof EmbedServiceError && e.status === 404 && stats !== null) {
-              // This pass's /stats answered with stats, so the index is made
-              // and the 404 is the route's: a service build without /delete.
-              this.deleteUnsupported = true;
+            const missing = await this.deleteIds(toDelete, stats);
+            if (missing !== null) {
               this.warn(
                 `/delete answered 404, so the service lacks that route; dropping ${what}. Later removals and edits `
                   + `down to nothing indexable are dropped too, until the host restarts or binds the history module `
-                  + `again: ${msg}`,
+                  + `again: ${missing}`,
               );
-            } else {
-              // Any other failure, and a 404 in a pass whose /stats answered
-              // with something that isn't stats, which doesn't show the index
-              // is made: re-queued, for a later pass.
-              for (const id of removed) this.removedIds.add(id);
-              for (const id of blanked) if (!this.removedIds.has(id)) this.editedIds.add(id);
-              phaseErrors.push(msg);
-              this.warn(`delete failed, ${what} re-queued: ${msg}`);
             }
+          } catch (e) {
+            // Any other failure, and a 404 in a pass whose /stats answered
+            // with something that isn't stats, which doesn't show the index
+            // is made: re-queued, for a later pass.
+            const msg = e instanceof Error ? e.message : String(e);
+            for (const id of removed) this.removedIds.add(id);
+            for (const id of blanked) if (!this.removedIds.has(id)) this.editedIds.add(id);
+            phaseErrors.push(msg);
+            this.warn(`delete failed, ${what} re-queued: ${msg}`);
           }
         }
         try {
@@ -576,22 +649,63 @@ export class SemanticIndexer {
 
       // Summaries before messages: they are few, and a message backlog that
       // exceeds every tick's budget must not keep new summaries out forever.
+      // The cursor is this branch's, read at each pass, so a switch between
+      // passes is seen; it's written only while the store is still on the
+      // branch this pass read, so one branch's pass can't move another's
+      // cursor past a summary that branch hasn't sent.
       {
+        const branchOf = (): string | null =>
+          (this.cm as { currentBranch?: () => { id: string } | undefined }).currentBranch?.()?.id ?? null;
+        const branch = branchOf();
+        const cursor = this.summaryCursor();
         const all = this.cm.getSummariesInRange({ fromMs: 0, toMs: Number.MAX_SAFE_INTEGER }) as SummaryLike[];
         report.summariesScanned = all.length;
-        // `>=`: summaries sharing the watermark's millisecond may be only
-        // partly indexed (a bounded pass can stop inside a tie). Re-sending
-        // them is a dedup no-op for the service and costs no budget.
-        const fresh = all.filter((s) => sumWm === null || s.createdMs >= sumWm).sort((a, b) => a.createdMs - b.createdMs);
+        // `>=`: a summary minted in the cursor's millisecond after the pass
+        // that wrote it read the store is sent by the next one. Re-sending
+        // the others there is a dedup no-op for the service and costs no
+        // budget.
+        const fresh = all.filter((s) => cursor === null || s.createdMs >= cursor).sort((a, b) => a.createdMs - b.createdMs);
+        // Through which creation time this pass sent every summary it read.
+        // A pass whose budget runs out finishes the millisecond it's in, so
+        // a cursor never stops inside one.
+        let through: number | null = null;
+        // Each newly sent summary's key in the form written before keys
+        // carried the creation time, for deleting once its new item is in.
+        const oldKeys: string[] = [];
         for (const s of fresh) {
-          if (budget <= 0) { report.more = true; break; }
+          const isNew = cursor === null || s.createdMs > cursor;
+          if (budget <= 0 && s.createdMs !== through) { report.more = true; break; }
+          through = s.createdMs;
           const item = summaryToItem(s, this.cfg);
           if (!item) continue;
           pending.push(item);
-          if (sumWm === null || s.createdMs > sumWm) budget--;
+          if (isNew) { budget--; oldKeys.push(`sum:${s.id}`); }
           if (pending.length >= batchSize) await flush();
         }
         await flush();
+        // The index's old items go once their summaries' new ones are in. On
+        // a service without /delete they stay, and search drops an old-form
+        // hit once this branch's cursor covers its summary. A failed delete
+        // leaves the cursor, so the next pass sends those summaries and
+        // deletes again.
+        let deleted = true;
+        if (oldKeys.length > 0 && !noIndex && !this.deleteUnsupported) {
+          try {
+            const missing = await this.deleteIds(oldKeys, stats);
+            if (missing !== null) {
+              this.warn(
+                `/delete answered 404, so the service lacks that route; ${oldKeys.length} summaries' items from before `
+                  + `they were keyed by creation time stay, and search leaves them out: ${missing}`,
+              );
+            }
+          } catch (e) {
+            const msg = e instanceof Error ? e.message : String(e);
+            deleted = false;
+            phaseErrors.push(msg);
+            this.warn(`deleting ${oldKeys.length} summaries' items from before they were keyed by creation time failed; the next pass tries again: ${msg}`);
+          }
+        }
+        if (deleted && through !== null && through !== cursor && branchOf() === branch) this.setSummaryCursor(through);
       }
 
       // Messages: walk forward from (watermark - overlap) via the time index.

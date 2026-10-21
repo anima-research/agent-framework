@@ -49,7 +49,7 @@ import type { ToolDefinition, ToolCall, ToolResult, ProcessEvent } from '../../t
 import type { EventResponse, ProcessState } from '../../types/module.js';
 import type { SearchWorkerMessage, SearchWorkerMatch } from './search-regex-worker.js';
 import type { ChannelRegistry } from '../../mcpl/channel-registry.js';
-import { EmbedServiceError, SemanticIndexClient, SemanticIndexer, messageIndexText, summaryIndexText, type SearchResponse, type SemanticIndexConfig, type SyncReport, type PendingChanges } from './semantic.js';
+import { EmbedServiceError, SemanticIndexClient, SemanticIndexer, messageIndexText, parseSummaryKey, summaryIndexText, type SearchResponse, type SemanticIndexConfig, type SyncReport, type PendingChanges } from './semantic.js';
 import { unknownToolMessage } from '../unknown-tool.js';
 import { safeSlice } from '../../safe-slice.js';
 
@@ -623,6 +623,16 @@ export class HistoryModule implements Module {
     this.indexer.onPendingChange = (p) => {
       const prev = this.ctx?.getState<Record<string, unknown>>() ?? {};
       this.ctx?.setState({ ...prev, semanticPending: p });
+    };
+    // Module state follows the store's branches, so each branch keeps its
+    // own summary cursor, and a branch made at an earlier point inherits the
+    // cursor as it was there.
+    this.indexer.summaryCursorStore = {
+      read: () => this.ctx?.getState<{ semanticSummaryCursor?: number }>()?.semanticSummaryCursor ?? null,
+      write: (createdMs) => {
+        const prev = this.ctx?.getState<Record<string, unknown>>() ?? {};
+        this.ctx?.setState({ ...prev, semanticSummaryCursor: createdMs });
+      },
     };
     this.indexer.attach();
   }
@@ -1672,9 +1682,10 @@ export class HistoryModule implements Module {
     // to the model — getMessage/getSummary rebuild on branch switch, so an
     // undone message, or a summary this branch doesn't hold, answers null.
     // A branch made from an earlier point, as an undo makes one, can mint a
-    // summary id another branch already used, so a summary hit's score,
-    // timestamp and date filtering can still be that other summary's.
-    // k is small, so this is at most `limit` local lookups.
+    // summary id another branch already used, so a summary's key carries its
+    // creation time too, and a hit whose time isn't this branch's summary's
+    // is another branch's. k is small, so this is at most `limit` local
+    // lookups.
     // A message hit whose current text has nothing left to index (edited
     // blank, delete not yet applied) is dropped too, so its stale snippet is
     // never served. Dropped hits are replaced by over-fetching: when the
@@ -1685,14 +1696,13 @@ export class HistoryModule implements Module {
     // A message hit's snippet is rebuilt from the CURRENT local text, never
     // the remote copy: an edit not yet synced (or one the index never got)
     // must not leak a passage the edit removed. Only the ranking can be stale.
-    // A summary hit's snippet is rebuilt from the local summary too: a
-    // service that keeps only vectors and ids (no text) still yields one, and
-    // a summary whose id another branch also minted shows this branch's text
-    // in its snippet and chars.
+    // A summary hit's snippet is rebuilt from the local summary too, so a
+    // service that keeps only vectors and ids (no text) still yields one.
     const currentText = new Map<string, string>();
-    const keep = (h: { id: string }): 'ok' | 'offBranch' | 'stale' => {
+    const summaryCursor = this.indexer?.summaryCursor() ?? null;
+    const keep = (h: { id: string }): 'ok' | 'offBranch' | 'stale' | 'superseded' => {
       const msgId = /^msg:(.+)$/.exec(h.id)?.[1];
-      const sumId = /^sum:(.+)$/.exec(h.id)?.[1];
+      const sum = parseSummaryKey(h.id);
       if (msgId !== undefined) {
         const m = cm.getMessage(msgId);
         if (!m) return 'offBranch';
@@ -1701,9 +1711,19 @@ export class HistoryModule implements Module {
         currentText.set(h.id, text);
         return 'ok';
       }
-      if (sumId !== undefined) {
-        const s = cm.getSummary(sumId);
+      if (sum !== null) {
+        const s = cm.getSummary(sum.id);
         if (!s) return 'offBranch';
+        if (sum.createdMs !== null) {
+          if (s.created !== sum.createdMs) return 'offBranch';
+        } else if (summaryCursor !== null && s.created <= summaryCursor) {
+          // A key from before keys carried the creation time, left where the
+          // service lacks /delete or the delete hasn't gone through. This
+          // branch's cursor covers its summary, so that summary is in the
+          // index under its own key, and this item is an old copy of it or
+          // of another branch's under the same id. It isn't counted.
+          return 'superseded';
+        }
         const text = summaryIndexText(s, this.semanticCfg!);
         // An empty text here is mostly defensive: context-manager drops a
         // summary that's empty after trimming when it loads, and refuses to
@@ -1773,8 +1793,10 @@ export class HistoryModule implements Module {
         : null;
       const missing = [...(h.ts !== null && timestamp === null ? ['ts'] : []), ...(meta === null ? ['meta'] : [])];
       if (missing.length > 0) unread.push(`${shown(h.id)} (${missing.join(' and ')})`);
+      const sum = parseSummaryKey(h.id);
       return {
-        id: h.id,
+        // A summary is shown as `sum:<id>`, as it was before its key carried its creation time.
+        id: sum ? `sum:${sum.id}` : h.id,
         /** Raw message id for a `msg:` hit (null for summaries) — pass it to extract({ aroundId }). */
         messageId: h.id.startsWith('msg:') ? h.id.slice(4) : null,
         kind: h.kind,
