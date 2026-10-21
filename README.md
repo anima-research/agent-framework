@@ -96,8 +96,8 @@ changes reach a tenth of the input, and a refusal of a change move the head
 to what's current, with one write; after a refusal the agent keeps to its
 head until it's built again. `thinkingBinding.binds` (default `true`) says
 the model binds its thinking to everything before it, which narrows when it
-consolidates and when it resends. The host chooses both from what it knows
-of the model; neither is a runtime setting.
+consolidates. The host chooses both settings from what it knows of the
+model; neither is a runtime setting.
 
 Trusted module calls are exempt from agent allowlists. Genuinely unidentified
 public callers, including unknown legacy caller names, remain unrestricted.

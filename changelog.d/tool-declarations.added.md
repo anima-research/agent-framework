@@ -7,6 +7,6 @@
   of the last response's input, and a provider's refusal of a change move the
   head to what's current; after a refusal the agent keeps to its head until
   it's built again. `thinkingBinding.binds` (default `true`) narrows
-  consolidation and the resend for models that bind their thinking. The
+  consolidation for models that bind their thinking. The
   default, `'head'`, sends requests as before, leaving any system changes out.
   New trace events: `head:declared`, `head:moved` and `head:resend`.
