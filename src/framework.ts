@@ -2034,8 +2034,9 @@ export function restoreAlert(restore: {
  *  again, and so was disposed (reinitializeManagers). `remedy` is what lets
  *  its channel spawn again when the cause stops that too; `heldWrites`, the
  *  writes queued for it while the store was held, which went with it, and
- *  `releasePostponed`, whether its window's release still waits for a
- *  resume, as on a quiesced host (releaseWindowNowOrAfterResume). */
+ *  `releasePostponed`, whether its window's release was postponed to a
+ *  resume, as on a quiesced host (releaseWindowNowOrAfterResume): its text
+ *  says what the postponement means, which holds whatever follows it. */
 export function disposalAlert(disposal: {
   move: ReinitMove;
   remedy?: TemplateRemedy;
@@ -2061,9 +2062,9 @@ export function disposalAlert(disposal: {
   const held = heldWrites === 0
     ? ''
     : releasePostponed
-      ? `${goes}its window's release, at the host's resume, stores what its store takes of ${them} there and passes ` +
-        `any failed reply on to the primary agent. A stop() before the resume passes a failed reply on and drops the ` +
-        'rest, logged.'
+      ? `${goes}its window's release was postponed to the host's resume, which stores what its store takes of ${them} ` +
+        'there and passes any failed reply on to the primary agent; a stop() before the resume drops all but a ' +
+        "failed reply, which goes to the primary at the restarted host's resume."
       : cleanupFailed
         ? ` ${writes} held for it while the store was held may be in its window, where no agent reads ${them}, ` +
           'still queued under its name, or in neither, as far as that cleanup got. A flush that meets one still ' +
@@ -2083,7 +2084,8 @@ export function disposalAlert(disposal: {
 /** The `store-held-long` alert (reportLongHold): its opening says what the
  *  hold does and what a restart does to each kind of agent (AgentKind), and
  *  the move's agent and what the hold is on come after it, since names have
- *  no bound (a conversation agent's runs to 97 characters, forkAgentName). */
+ *  no bound (a conversation agent's runs to about 100 characters,
+ *  forkAgentName). */
 export function longHoldAlert(hold: {
   move: string;
   agentName: string;
@@ -2093,10 +2095,10 @@ export function longHoldAlert(hold: {
   waitingForMaintenance: boolean;
 }): ReinitAlertText {
   const { move, agentName, heldSeconds, queued, reinitializing, waitingForMaintenance } = hold;
-  const opening = `The ${move} has held the store for ${heldSeconds} s: no agent's turn starts until it lets the store go, ` +
-    `and the writes it defers wait in the deferral queue (${queued} now). A restart ends the ${move}, the ` +
-    'conversation agents and the runs, and re-initializes the configured agents, whose queued writes survive only in a ' +
-    'persisted deferral queue.';
+  const opening = `The ${move} has held the store for ${heldSeconds} s, so no turn starts and the writes it defers wait in ` +
+    `the deferral queue (${queued === 1 ? '1 write' : `${queued} writes`} now). A restart ends the ${move}, the ` +
+    'conversation agents and the runs, and re-initializes the configured agents; writes still queued at exit ' +
+    'survive only in a persisted deferral queue.';
   const on = reinitializing !== undefined
     ? `, and is re-initializing ${reinitializing}'s context manager now`
     : waitingForMaintenance ? ', and is waiting for maintenance work that was already running to finish' : '';
@@ -2124,8 +2126,8 @@ const MOVE_NOUNS: Readonly<Record<string, string>> = {
  *  conversation agent the move emptied that couldn't be seeded again. */
 interface ManagerReinitFailure {
   agentName: string;
-  /** What a restart does to the agent, taken when it failed, since a fork can
-   *  be disposed before the failure is reported. */
+  /** What a restart does to the agent, as it was when the failure was
+   *  recorded, since a fork can be disposed before the failure is reported. */
   kind: AgentKind;
   error: string;
   /** A conversation agent the move emptied that couldn't be seeded again:
@@ -2145,6 +2147,10 @@ interface ManagerReinitFailure {
    *  the store was. Its window's release takes them: it stores what its store
    *  accepts there, and passes a failed reply on to the primary. */
   heldWrites?: number;
+  /** For a disposal: its window's release was postponed to the host's resume
+   *  (releaseWindowNowOrAfterResume), as read right after the disposal, on
+   *  either of its paths. */
+  releasePostponed?: true;
 }
 
 /** The start of what a tool answered, for naming a call its script stopped waiting for: its first text, or its blocks' count. */
@@ -10772,16 +10778,18 @@ export class AgentFramework {
       // Named only while its re-initialization runs: an overdue timer runs at
       // the turn before the next manager, when none is.
       if (hold) hold.reinitializing = agentName;
-      // What a restart does to it, taken before the await: a run's end or a
-      // fork's disposal meanwhile takes it out of what agentKind reads.
-      const kind = this.agentKind(agentName);
       try {
         const cm = agent.getContextManager();
         await cm.setStrategy(cm.getStrategy());
       } catch (error) {
         // One that has left meanwhile, as a run its watchdog ended, refuses
-        // no one's work, so it isn't reported.
-        if (this.agents.get(agentName) === agent) failures.push({ agentName, kind, error: failureDescription(error) });
+        // no one's work, so it isn't reported. One still registered has the
+        // kind it had all along: every map agentKind reads changes together
+        // with this.agents, with no await between (a run's end, a fork's
+        // spawn and its disposal).
+        if (this.agents.get(agentName) === agent) {
+          failures.push({ agentName, kind: this.agentKind(agentName), error: failureDescription(error) });
+        }
       } finally {
         if (hold) delete hold.reinitializing;
       }
@@ -10905,6 +10913,10 @@ export class AgentFramework {
         remedy = templateDown.remedy;
       }
       if (moved()) continue;
+      // One that left during its seeding, as stop() ends a fork, has been
+      // disposed already, and refuses no one's work.
+      if (this.agents.get(agentName) !== agent) continue;
+      // Every agent judged here is a conversation agent (conversationAgentHomes).
       const failure: ManagerReinitFailure = {
         agentName, kind: 'conversation', error: cause, seedingFailed: true, ...(remedy ? { remedy } : {}),
       };
@@ -10923,6 +10935,11 @@ export class AgentFramework {
       } catch (error) {
         failure.cleanupFailed = failureDescription(error);
       }
+      // Whether its window's release was postponed, read now, after the
+      // disposal on either path: a stop() or a resume later empties the map,
+      // whatever it did with the writes, and disposalAlert's text for a
+      // postponed release holds whatever follows.
+      if (this.releasesAfterResume.has(agentName)) failure.releasePostponed = true;
       failures.push(failure);
     }
   }
@@ -10935,12 +10952,8 @@ export class AgentFramework {
    *  the trace keep 2,000, cut the same way. */
   private reportReinitFailures(after: ReinitMove, failures: ManagerReinitFailure[]): void {
     for (const failure of failures) {
-      const { agentName, kind, error, seedingFailed, after: judgedAfter, remedy, cleanupFailed, heldWrites } = failure;
+      const { agentName, kind, error, seedingFailed, after: judgedAfter, remedy, cleanupFailed, heldWrites, releasePostponed } = failure;
       const move = judgedAfter ?? after;
-      // Whether a disposed fork's window still waits for the resume, as it
-      // stands now: a resume since the disposal has run its release, and a
-      // disposal that threw after postponing it still has it waiting.
-      const releasePostponed = this.releasesAfterResume.has(agentName);
       this.reportReinitFailure(agentName, move, seedingFailed
         ? disposalAlert({ move, remedy, cleanupFailed, heldWrites, releasePostponed, cause: error }).message
         : refusedWorkAlert(move, kind, error).message);
@@ -11132,7 +11145,12 @@ export class AgentFramework {
    * `move` names the failed move, as its alert does. `managerCurrent` says
    * the agent's manager initialized on the failed branch, as after a
    * suppression's fork whose removals then failed: if the restore can't
-   * select the source, the agent serves from that branch.
+   * select the source, the agent serves from that branch. `kind` is what a
+   * restart does to the agent (restartClause): a restart creates a
+   * configured agent again, on the branch the store is on, but not a
+   * conversation agent or a run. Its surgery took it when it reserved the
+   * store, before any await, since a run its watchdog ends meanwhile leaves
+   * the maps agentKind reads.
    */
   private async restoreSourceBranch(
     move: 'rollback' | 'suppression',
@@ -11140,15 +11158,11 @@ export class AgentFramework {
     sourceBranch: string,
     failedBranch: string,
     agentName: string,
+    kind: AgentKind,
     managerCurrent = false,
   ): Promise<string> {
     const current = this.store.currentBranch().name;
     if (current !== failedBranch) return `active branch is ${current}`;
-    // What a restart does to the agent, taken before the await (as in
-    // reinitializeManagers). A restart creates a configured agent again, on
-    // the branch the store is on, but not a conversation agent or a run
-    // (restartClause).
-    const kind = this.agentKind(agentName);
     try {
       await cm.switchBranch(sourceBranch);
       return `active branch restored to ${sourceBranch}`;
@@ -11258,6 +11272,9 @@ export class AgentFramework {
       // recorded or reported, or the switch has been rolled back. Remote
       // delivery is not waited on.
       const release = this.reserveStoreForSurgery('roll back', agentName);
+      // What a restart does to the agent, for a failed restore's words,
+      // taken before any await (restoreSourceBranch).
+      const kind = this.agentKind(agentName);
       let branchName: string;
       let markers: SurgeryMarkerReceipt;
       let moved = false;
@@ -11291,7 +11308,7 @@ export class AgentFramework {
           // go back to the source; keep the branch for diagnosis. A refusal
           // before the switch left the store on the source, so nothing moved.
           moved = this.store.currentBranch().name !== sourceBranch;
-          const restored = await this.restoreSourceBranch('rollback', cm, sourceBranch, targetBranch, agentName);
+          const restored = await this.restoreSourceBranch('rollback', cm, sourceBranch, targetBranch, agentName, kind);
           const retired = await this.retireAfterRestore(markerBatch, sourceBranch, agentName);
           throw new OperatorActionError(
             'failed',
@@ -11425,6 +11442,8 @@ export class AgentFramework {
       // recorded or reported, or the source is restored. Remote delivery is
       // not waited on.
       const release = this.reserveStoreForSurgery('suppress', agentName);
+      // As for a rollback.
+      const kind = this.agentKind(agentName);
       let createdBranch: string;
       let markers: SurgeryMarkerReceipt;
       let moved = false;
@@ -11463,7 +11482,7 @@ export class AgentFramework {
           // after the known-collision check) left the store on the source, so
           // nothing moved and no other manager is stale.
           moved = this.store.currentBranch().name !== sourceBranch;
-          const restored = await this.restoreSourceBranch('suppression', cm, sourceBranch, targetBranch, agentName);
+          const restored = await this.restoreSourceBranch('suppression', cm, sourceBranch, targetBranch, agentName, kind);
           const retired = await this.retireAfterRestore(markerBatch, sourceBranch, agentName);
           throw new OperatorActionError(
             'failed',
@@ -11481,7 +11500,7 @@ export class AgentFramework {
           // for diagnosis, put the agent back on the untouched source — and
           // say honestly whether that restore happened. The fork initialized
           // the agent's manager on it, so it's current there.
-          const restored = await this.restoreSourceBranch('suppression', cm, sourceBranch, createdBranch, agentName, true);
+          const restored = await this.restoreSourceBranch('suppression', cm, sourceBranch, createdBranch, agentName, kind, true);
           const retired = await this.retireAfterRestore(markerBatch, sourceBranch, agentName);
           throw new OperatorActionError(
             'failed',

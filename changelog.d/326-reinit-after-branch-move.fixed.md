@@ -11,7 +11,8 @@
   switch, undo or redo every agent did. An autobiographical strategy then
   refused that agent's compiles, its readiness and its maintenance until the
   host restarted. A manager whose re-initialization fails raises an ops
-  alert, `context-reinit-failed`, naming its agent and the move; it is
+  alert, `context-reinit-failed`, naming its agent and the move, unless the
+  agent has left by then, as a run its watchdog ended; it is
   logged and traced each time, and the alert webhook posts it at most once
   per agent and kind in 15 minutes, as it does any alert without a key of
   its own. Each alert says
