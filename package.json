@@ -1,6 +1,6 @@
 {
   "name": "@animalabs/agent-framework",
-  "version": "0.23.1",
+  "version": "0.23.2",
   "description": "Multi-agent framework with pluggable modules, persistent state, and concurrent tool execution",
   "repository": {
     "type": "git",
@@ -26,7 +26,8 @@
   },
   "scripts": {
     "build": "tsc",
-    "postbuild": "node -e \"const fs=require('node:fs'); for (const p of ['dist/src/api/mcp-server.js','dist/src/recovery/recover-cli.js']) fs.chmodSync(p, 0o755)\"",
+    "postbuild": "node -e \"const fs=require('node:fs'); for (const p of ['dist/src/api/mcp-server.js','dist/src/recovery/recover-cli.js']) fs.chmodSync(p, 0o755); fs.copyFileSync('src/code-execution/quickjs.wasm', 'dist/src/code-execution/quickjs.wasm')\"",
+    "predev": "node -e \"const fs=require('node:fs'); fs.mkdirSync('dist/src/code-execution', { recursive: true }); fs.copyFileSync('src/code-execution/quickjs.wasm', 'dist/src/code-execution/quickjs.wasm')\"",
     "dev": "tsc --watch",
     "clean": "rm -rf dist",
     "typecheck": "tsc --noEmit",

@@ -2038,7 +2038,7 @@ export class WorkspaceModule implements Module {
         case 'materialize': return await this.handleMaterialize(input as unknown as MaterializeInput);
         case 'sync': return await this.handleSync(input as unknown as SyncInput);
         default:
-          return { success: false, error: `Unknown tool: ${call.name}`, isError: true };
+          return { success: false, error: `Unknown tool: ${call.name}, so nothing was done`, isError: true };
       }
     } catch (err) {
       return { success: false, error: err instanceof Error ? err.message : String(err), isError: true };

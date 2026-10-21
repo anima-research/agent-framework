@@ -193,14 +193,32 @@ export interface ToolResult {
   /** Whether this was an error (for LLM) */
   isError?: boolean;
   /**
+   * The dispatcher refused the call before it opened, RFC-007's refusal, so
+   * nothing ran and the call certainly had no effect. Only the dispatcher's
+   * path, the model's calls and a script's, sets it: the caller may not use
+   * the tool (allowedTools), a `skip_reply` wake was refused, the call's MCPL
+   * server is absent or still connecting, the host's policy for that server
+   * denies the tool, or a fork reached outside its channel. RFC-007's
+   * lifecycle refuses the call from the same place, so observers see no
+   * events for it. A check made after the call opened, such as a module's
+   * answer for a name it has no tool for or arguments that don't fit a
+   * schema, is a failure whose text says nothing was done, as is an MCPL
+   * request that couldn't be written. A programmatic call (`executeToolCall`,
+   * `ModuleContext.callTool`) opens no RFC-007 call, so it's never refused:
+   * the allowedTools check answers it with a failure saying the call didn't
+   * run, and the other checks it gets, such as the module registry's, answer
+   * as they do once a call has opened. A module's result never carries it. A script's call refused so reaches the script as an
+   * Error, where any other failure is a result with `isError`.
+   */
+  refused?: boolean;
+  /**
    * The result's machine-readable form, beside `data`. Programs read it: a
    * script gets it in its result object, and a host in the tool result
    * event. The model never reads this field: it sees the value only where an
    * MCP conversion put it in the content as JSON, which happens only when the
    * server sent no text. An MCP tool's is its `structuredContent`, present
    * exactly when the server sent one, so `false`, `0` and `null` are values
-   * here, not absence. Any other tool can set one too, as `code_execution`
-   * does with its script's stdout, stderr, exit code and any time-limit note.
+   * here, not absence. Any other tool can set one too.
    */
   structured?: unknown;
   /**
@@ -240,10 +258,10 @@ export interface ToolCall {
    * The turn the call was made in, the same id as that turn's
    * `SpeechContext.turnId`. Set by the framework dispatch layer, beside
    * `callerAgentName`: a model's call carries the turn whose stream made it, a
-   * foreground script's inner call the turn of the code_execution call whose
-   * script is running when the call arrives, and a utility run its `utils`
-   * call's. A background script runs apart from any turn, so its calls carry
-   * none. Ids increase, so a later turn's is larger, and they're unique only
+   * script's call the turn of the code_execution call watching the script when
+   * the call reaches the host, and a utility run its `utils` call's. A script left
+   * running, which no call watches, runs apart from any turn, so its calls
+   * carry none. Ids increase, so a later turn's is larger, and they're unique only
    * within one run of the process. A call made with `executeToolCall` or a
    * module's `callTool` skips that layer and carries whatever turn its caller
    * put on the call, usually none.
@@ -255,21 +273,30 @@ export interface ToolCall {
    * as JSON (a content array as its text). For a model's call it is the
    * agent's inline cap, past which the framework spills the result to a
    * workspace file and sends a preview. For a call from a running
-   * code_execution script it is the script's limit, past which a success's
-   * result is cut; an error reaches the script whole, after "Error: ". A
-   * result that carries `structured` reaches a script instead as one JSON
-   * object of its content, structured content and error, measured whole; one
-   * past the limit is saved to a workspace file in its place, or, where it
-   * can't be, isn't delivered. A tool
-   * that pages or budgets its answer can stay under it. The framework sets it
-   * on a model's, a script's and the operator's puppet's call to a module, a
-   * utility run through `utils` included. A call made in process with
-   * ModuleContext.callTool or executeToolCall carries what its caller put on
-   * it, as the puppet's does; the framework's own read_image tool passes a
-   * model's call to the workspace without it; and a utility run through
-   * `utils` carries what its `utils` call carried. Without it, a module holds
-   * its answer to a bound of its own, if any: the workspace's is the house
-   * default, 24,000.
+   * code_execution script it is the longest result that reaches the script
+   * whole whatever its characters, from the script's memory: the script
+   * takes an answer of up to a third of its memoryMaxBytes, in which a
+   * character of the result takes at most six bytes (a control character,
+   * escaped as `\u0000`), so the figure is that third, less the 80 bytes of a
+   * text answer's envelope, over six: 7,456,527 at the default 128 MiB. On
+   * Node, past about 1.5 GiB, the host's longest string bounds it instead.
+   * A result with a `structured` value reaches a script as its content's
+   * blocks as they are, beside that value as JSON, and the figure counts
+   * neither the value nor what the blocks carry past their text, such as each
+   * further block's keys or an image's data, so a tool that returns one
+   * leaves room for them; and a result nested past 2,000 levels, or whose parse
+   * needs more of the script's memory than is free, doesn't reach the script
+   * whatever its length. A result that doesn't reach it is answered
+   * ResultTooLarge, the call having taken effect. Nothing is cut or saved to
+   * a file. A tool that pages or budgets its answer can stay under it. The
+   * framework sets it on a model's, a script's and the operator's puppet's
+   * call to a module, a utility run through `utils` included. A call
+   * made in process with ModuleContext.callTool or executeToolCall carries
+   * what its caller put on it, as the puppet's does; the framework's own
+   * read_image tool passes a model's call to the workspace without it; and a
+   * utility run through `utils` carries what its `utils` call carried.
+   * Without it, a module holds its answer to a bound of its own, if any: the
+   * workspace's is the house default, 24,000.
    */
   resultMaxChars?: number;
 }

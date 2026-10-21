@@ -1,4 +1,5 @@
 import { ToolPresentation, presentationTools, isPresentationTool, renderCatalogue, type PresentationSnapshot } from "./tool-presentation.js";
+import { constants as bufferConstants } from 'node:buffer';
 import { dirname, join } from 'node:path';
 import { INLINE_WITHHELD_TEXT, REFERENCE_LIMITS, classifyBlock, isInlineContradiction, isReferenceExpired, referenceBlockForScript, referenceRegistry, referenceStubOrNull, sanitizeLabel } from './mcpl/references.js';
 import { ReferenceFetcher, DEFAULT_FETCH_MAX_BYTES, EAGER_FETCH_TIMEOUT_MS } from './mcpl/reference-fetcher.js';
@@ -105,9 +106,10 @@ import { InferenceRouter } from './mcpl/inference-router.js';
 import { ChannelRegistry, connectorText, destinationKey, journalToolDescription, type ChannelToolOrigin, type PublishDestination, type PublishOutcome, type SelectedForOpening } from './mcpl/channel-registry.js';
 import { KEEP_IDLE_MS, KEEP_NEWEST, ProseDraftStore, draftState, uncertainAttempt, type Draft, type DraftAttempt, type DraftReason, type DraftState, type InheritedRisk } from './prose-drafts.js';
 import { ConversationRouter, CONVERSATION_ROUTING_DEPRECATION_NOTICE } from './mcpl/conversation-router.js';
-import { INBOUND_SOURCE_KEY, type InboundAcceptanceObserver, type InboundChannelSource, type InboundLane, type InboundSource, type InboundUnscopedSource } from './mcpl/inbound-source.js';
+import { INBOUND_SOURCE_KEY, sourceBodyDigest, type InboundAcceptanceObserver, type InboundChannelSource, type InboundLane, type InboundSource, type InboundUnscopedSource } from './mcpl/inbound-source.js';
 import type { IncomingMessageFacts, RoutingDecision } from './mcpl/conversation-router.js';
 import { safeSlice } from './safe-slice.js';
+import { SEND_TOOLS, bareToolName } from './send-tools.js';
 import { boundedErrorMessage, errorMessage } from './error-message.js';
 import { ProviderWaits, EVERY_MODEL, isReleaseModel, withoutControls, type ProviderWait } from './provider-waits.js';
 import type { WorkspaceModule } from './modules/workspace/index.js';
@@ -132,15 +134,25 @@ import {
   type ShownRanges,
 } from './tool-image-ledger.js';
 import { randomUUID, createHash } from 'node:crypto';
-import { PyRunner, buildInjectedTools, formatLimit, type ScriptToolResult } from './code-execution/py-runner.js';
-import { scriptToolNames } from './code-execution/script-tool-names.js';
-import { scriptEndText, scriptEndTextWithin, type ScriptEnd } from './code-execution/result-text.js';
 import {
-  buildCodeExecutionToolDefinition,
+  describeCodeExecution,
   CODE_EXECUTION_TOOL_NAME,
-  scriptTimeLimits,
+  isolateSettings,
   validateCodeExecutionConfig,
+  type IsolateSettings,
 } from './code-execution/tool-definition.js';
+import {
+  AgentScripts,
+  endingWakes,
+  ScriptRefusal,
+  type ScriptCallContext,
+  type ScriptReturn,
+  type ScriptWatch,
+} from './code-execution/isolate/scripts.js';
+import { CHILD_ENTRY, ChildCapacity, maxResultBytes, type ToolAnswer } from './code-execution/isolate/runner.js';
+import { DEFAULT_OUTPUT_BOUNDS } from './code-execution/isolate/output.js';
+import type { PreludeTool } from './code-execution/isolate/prelude.js';
+import { bounded, renderList, renderReturn, VALUE_CHARS } from './code-execution/isolate/render.js';
 import { splitProseRuns, withoutRoundsProse } from './prose-segments.js';
 import { cumulativeDelta } from './usage-accounting.js';
 import { stampThinkingTokenEstimates } from './thinking-token-stamp.js';
@@ -229,9 +241,7 @@ function sniffImageMediaType(data: Buffer): string | undefined {
  * isn't a number of seconds): then the turn goes on, and only its own round
  * stays silent.
  */
-const SILENCING_TOOLS = new Set([
-  'skip_reply', 'channel_publish', 'send_message', 'reply_message', 'send_dm',
-]);
+const SILENCING_TOOLS = new Set(['skip_reply', ...SEND_TOOLS]);
 
 /**
  * World-surface publication tools (Eidoverse `say` / `whisper`). An explicit
@@ -306,6 +316,48 @@ const changesRouting = (
 
 /** The tools whose call can change a round's routing in some mode or policy (changesRouting). */
 const ROUTING_TOOLS = [...SILENCING_TOOLS, ...WORLD_PUBLICATION_TOOLS, 'drafts', 'think'];
+
+/** A routing tool's name standing as a whole identifier, as JavaScript reads one: no identifier character, `$` or joiner on either side. */
+const ROUTING_TOOL_NAMED = new RegExp(
+  `(?<![\\p{ID_Continue}$\\u200C\\u200D])(?:${ROUTING_TOOLS.map((name) => name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('|')})(?![\\p{ID_Continue}$\\u200C\\u200D])`,
+  'gu',
+);
+
+/**
+ * The routing tools a script's code names (ROUTING_TOOLS): each that stands
+ * in it as a whole identifier, anywhere, its comments and strings included,
+ * so `tools.say(...)`, `tools["say"]` and a prefixed `tools["chat--say"]`
+ * all name `say`, and `say_hello` doesn't. A coarse reading of what a script
+ * may call (AgentFramework.scriptMayRoute): a comment or a string that
+ * mentions a tool names it too, and `drafts` holds whatever the action its
+ * call asks, though only a resend changes routing. A tool the code doesn't
+ * spell out goes unseen: a name it builds at runtime or spells with escapes,
+ * or one it picks by enumerating ALL_TOOLS or `tools`.
+ */
+const routingToolsNamed = (code: string): Set<string> => new Set(code.match(ROUTING_TOOL_NAMED) ?? []);
+
+/**
+ * The keys of a stored message's metadata that only the host writes and that
+ * some reader takes on its own as what the message is: `system` and `kind`
+ * make it a host notice of that kind, `draftOwner` and `draftIds` one that
+ * names those drafts, `tuneOut` a message a tune-out holds from the
+ * residents, `coalescingSubject` (beside the occurrence's `eventId`) the
+ * delivery of a coalesced occurrence, `firstView` the coalescer's mark that
+ * no version of the message was shown, `deferredWriteId` the landed copy of
+ * a deferred write, `external` a module's own row for an outside message,
+ * and `openaiResponsesItems` membrane's mark of an imported Responses
+ * history. A server's metadata, a channel message's `metadata` or a
+ * push event's `origin`, is stored without them, and the host writes its own
+ * after it: MCPL SPEC §16.6 makes metadata the producer's untrusted claims,
+ * which a host may disbelieve. Keys a server writes by protocol, such as
+ * `tags` and `mentioned`, stay. So do the keys a reader takes only beside
+ * one of these: a failed reply's `reason` and `detail` beside its `kind`, and
+ * the Discord module's `discordTextFirst` on a row it found by `external`.
+ */
+const HOST_METADATA_KEYS = [
+  'system', 'kind', 'draftOwner', 'draftIds', 'tuneOut', 'coalescingSubject', 'firstView',
+  'deferredWriteId', 'external', 'openaiResponsesItems',
+] as const;
 
 /**
  * True when an injected message is real conversational input — something the
@@ -565,8 +617,6 @@ const PROSE_HELP_TOOL: import('./types/index.js').ToolDefinition = {
   description: 'Show the plain-text output routing syntax (destination prefixes, resend token, skip).',
   inputSchema: { type: 'object' as const, properties: {} },
 };
-/** Strip the `server--` MCPL prefix from a tool name. */
-const bareToolName = (n: string): string => n.split('--').pop()!;
 
 /** "1 registered utility", "2 registered utilities". */
 const registeredUtilities = (n: number): string => `${n} registered ${n === 1 ? 'utility' : 'utilities'}`;
@@ -884,6 +934,14 @@ function resumesLogicalTurn(reason: string | undefined): boolean {
 }
 
 /**
+ * The answers dispatchScriptToolCall's safety timer made, when no result came
+ * for a script's call: the tool may still be running, or its result was lost,
+ * and the host can't tell which, so the script's runner keeps the call's
+ * place in the host taken until its run ends.
+ */
+const SCRIPT_CALL_NO_RESULT = new WeakSet<ToolResult>();
+
+/**
  * One logical turn's routing state and receipt tallies
  * (AgentFramework.turnRouting): everything the turn has decided about where
  * its speech goes. Every stream of the turn shares it: the start that opens
@@ -903,9 +961,11 @@ interface TurnRouting {
    * routing of its own) gets a new one. Ids increase in the order routings
    * are made, so an agent's later turn has a larger id, and they start again
    * when the process does. Modules see it on the tool calls made in the turn
-   * (`ToolCall.callerTurnId`: its model's calls and its foreground scripts'
-   * inner calls) and on its speech (`SpeechContext.turnId`), so they can tell
-   * one turn's work from another's.
+   * (`ToolCall.callerTurnId`: its model's calls, and a script's calls that
+   * reach the host while a code_execution call of the turn watches the
+   * script; a script left running, which no call watches, carries none) and
+   * on its speech (`SpeechContext.turnId`), so they can tell one turn's work
+   * from another's.
    */
   turnId: number;
   /**
@@ -1043,10 +1103,11 @@ interface ProseRound {
 }
 
 /**
- * A call that counts toward a round's routing, made directly or by the
- * round's foreground script (AgentFramework.roundCallOf): why it silences the
- * round's prose, if it does (silenceCauseOf), and whether it's a refused
- * skip_reply, which silences only its own round.
+ * A call that counts toward a round's routing, made directly, or by a script
+ * and reaching the host while a run or wait call of the round watches it
+ * (ScriptRound, AgentFramework.roundCallOf): why it silences the round's
+ * prose, if it does (silenceCauseOf), and whether it's a refused skip_reply,
+ * which silences only its own round.
  */
 interface RoundCall {
   name: string;
@@ -1062,17 +1123,26 @@ const roundSilenceCause = (calls: readonly RoundCall[]): 'send' | 'private' | nu
 };
 
 /**
- * A round whose `code_execution` scripts can change its routing
- * (AgentFramework.scriptMayRoute), waiting for those calls to return before
- * its prose is routed: a foreground script's own calls count as the round's,
- * so a `skip_reply` or a send inside the script silences the round as a
- * direct call does (AgentFramework.scriptRounds).
+ * A round whose `code_execution` run or wait calls watch a script that can
+ * change its routing (AgentFramework.scriptMayRoute), waiting for those calls
+ * to return before its prose is routed: a script's calls that reach the host
+ * while one of the round's code_execution calls watches it count as the
+ * round's, a script the round doesn't wait on included, so a `skip_reply` or
+ * a send inside a script silences the round as a direct call does
+ * (AgentFramework.scriptRounds). What counts is the host's receipt, not the
+ * script's call: one the script makes while watched that waits, with 16 of
+ * its calls already out, until the watching call has returned, or that is
+ * still on its way when the call yields, isn't that call's round's, and its
+ * effect can come after the round's prose. It counts toward the round of the
+ * call watching the script when it arrives, such as a later round's wait,
+ * and toward none if no call does. A call returns at its script's end or at
+ * its yield, which bounds the wait.
  */
 interface ScriptRound {
   /** The agent and stream that dispatched the round. */
   agent: Agent;
   streamId: number;
-  /** Each code_execution call the round waits on, with the tools its foreground script has called so far, in order. */
+  /** Each code_execution call of the round, whether or not the round waits on it, with its script's calls that have reached the host so far while that call watches it, each kind once (scriptToolCall). */
   scripts: Map<string, RoundCall[]>;
   /** Those calls whose results haven't arrived. */
   pending: Set<string>;
@@ -1445,9 +1515,10 @@ export interface HostModeStatus {
    * scheduler's next pass consumes them). Continuations of a held turn
    * (budget restart, tool results) are never counted. */
   gatedRequests: number;
-  /** Background code-execution scripts still running. Quiesce does NOT stop
-   * them — they hold no turn token, so drain doesn't wait for them. Reported
-   * so the operator sees what is still acting during the window. */
+  /** code_execution scripts still running that no call is waiting on: left
+   * running after a yield, outside any turn. Quiesce does NOT stop them —
+   * they hold no turn token, so drain doesn't wait for them. Reported so the
+   * operator sees what is still acting during the window. */
   backgroundScripts: number;
   /** Context writes (module events, api message.send) withheld because the
    * host is quiesced. Persisted while quiesced and flushed by resume(). */
@@ -1835,23 +1906,6 @@ interface TraceRegistration {
  *  the caller awaits plus the liveness/progress bookkeeping the watchdogs and
  *  the stream driver share. One map entry per run — created and torn down in
  *  runEphemeralToCompletion — so the pieces cannot desync. */
-/** One model-authored background (daemon) script — see runCodeExecution. */
-interface BackgroundScriptRecord {
-  id: string;
-  agentName: string;
-  runner: PyRunner;
-  /** The agent-authored source (line numbers in wake envelopes index into it). */
-  code: string;
-  startedAt: number;
-  wakes: number;
-  lastWakeAt: number | null;
-  /** Mount-prefixed workspace path of the journal, null when no workspace. */
-  logPath: string | null;
-  status: 'running' | 'finished' | 'died' | 'cancelled';
-  /** Set when cancel/dispose already settled this script (suppresses wakes). */
-  cancelled: boolean;
-}
-
 interface EphemeralRun {
   settle: Deferred<AgentSettleResult>;
   inferenceStarted: boolean;
@@ -2047,27 +2101,66 @@ interface ManagerReinitFailure {
   heldWrites?: number;
 }
 
+/** The start of what a tool answered, for naming a call its script stopped waiting for: its first text, or its blocks' count. */
+function scriptResultBrief(content: unknown[]): string {
+  for (const block of content) {
+    if (block !== null && typeof block === 'object' && (block as { type?: unknown }).type === 'text') {
+      const text = (block as { text?: unknown }).text;
+      if (typeof text === 'string') return text;
+    }
+  }
+  return `${content.length} content block${content.length === 1 ? '' : 's'}`;
+}
+
 /**
  * What a script gets for a tool result that can't be converted to JSON,
  * such as a cyclic object or a BigInt that an in-process module returned.
  * It names the tool, and says the call itself completed, so a script that
  * reports it doesn't invite a blind retry. The host's log gets the same
  * line, since the tool that returned it needs fixing whether or not the
- * script reports it.
+ * script reports it. The reason and the tool's own error are cut to
+ * VALUE_CHARS each, so the failure reaches the script whatever its memory.
  */
 function unconvertibleScriptResult(toolName: string, err: unknown, ownError?: string): string {
   let reason: string;
   try {
-    reason = err instanceof Error ? err.message : String(err);
+    reason = bounded(err instanceof Error ? err.message : String(err), VALUE_CHARS);
   } catch {
     reason = 'a value with no text form'; // String() throws on an object with no prototype
   }
-  const own = ownError ? `, with this error: ${ownError}` : '.';
+  const own = ownError ? `, with this error: ${bounded(ownError, VALUE_CHARS)}` : '.';
   const text = `tool '${toolName}' returned a result that can't be converted to JSON, so the script can't receive it ` +
     `(${reason}). The call itself completed${own}`;
   console.error(`[code_execution] ${text}`);
   return text;
 }
+
+/** The bytes of a script's answer around a text result's own: its JSON with an empty text (scriptResultAnswer). */
+const SCRIPT_TEXT_ANSWER_ENVELOPE_BYTES = Buffer.byteLength(
+  JSON.stringify({ content: [{ type: 'text', text: '' }], structuredContent: null, isError: false }),
+);
+
+/**
+ * How long a result may be, as ToolCall.resultMaxChars measures it, and still
+ * reach a script whole whatever its characters: its answer's JSON stays
+ * within the bytes the script's memory takes (maxResultBytes), since one
+ * character of a result takes at most six bytes there, a control character
+ * escaped as `\u0000`, past a text answer's envelope. The answer is a string
+ * before it is bytes, at most six units a character, so it also stays within
+ * the host's longest string, which binds only on Node, past about 1.5 GiB of
+ * memoryMaxBytes. So the figure moves with memoryMaxBytes. What it can't
+ * count: a result's `structured` value, which the measure leaves out and the
+ * answer carries as JSON beside the content, and that result's blocks past
+ * their text, which the answer carries as they are (each further block's
+ * keys, an image's data); nesting past 2,000 levels; and a
+ * parse that needs more of the script's memory than is free, as for JSON
+ * dense in small objects or a script already holding most of its memory.
+ * Such a result, or one past the figure that doesn't fit, reaches the script
+ * as ResultTooLarge, saying the call took effect, and nothing of it is cut or
+ * saved.
+ */
+const scriptResultMaxChars = (memoryMaxBytes: number): number =>
+  Math.max(0, Math.floor((Math.min(maxResultBytes(memoryMaxBytes), bufferConstants.MAX_STRING_LENGTH) - SCRIPT_TEXT_ANSWER_ENVELOPE_BYTES) / 6));
 
 /**
  * Longest failure text the inference-failure pipeline writes to one sink: the
@@ -2724,6 +2817,12 @@ export class AgentFramework {
   // and its settle except that turn's own blocks, and, before its checkpoint,
   // the inputs its start writes (flushForStart).
   private activeTurnTokens: Map<string, number> = new Map();
+  /** Each turn whose settle has ended it (settleAgent, endDroppedTurn), for
+   *  its agent's scripts: its start's teardown can still hold the agent's
+   *  token, and a turn that has ended isn't live (liveTurns). A later start
+   *  that runs on the same routing, as a resume can, takes it out again
+   *  (beginAgentTurn). */
+  private settledTurns: WeakSet<TurnRouting> = new WeakSet();
   /** Agents whose fresh turn's coalescing assembly is running
    *  (beginAgentTurn): the window in which addMessage honours a write's
    *  bypassDeferralFor naming that agent. */
@@ -2824,7 +2923,10 @@ export class AgentFramework {
    */
   private readonly sharedSlotAgents = new Set<Agent>();
   /** The windows of forks and runs deregistered while the host was quiesced,
-   *  by agent name; resume() releases them (releaseWindowNowOrAfterResume). */
+   *  by agent name (releaseWindowNowOrAfterResume); resume() releases them
+   *  (runReleasesAfterResume), or stop() passes on what they left, unread or
+   *  queued, and clears them. While a name is here, no other flush drains
+   *  its queue (drainDeferredFor). */
   private readonly releasesAfterResume = new Map<string, Agent>();
   /** The coalescing commit in flight, if any (see commitCoalescingDurable). */
   private coalescingCommit: Promise<void> | null = null;
@@ -2851,42 +2953,24 @@ export class AgentFramework {
    * agents/agentConfigs/conversationAgentHomes) when their stream ends. */
   private closingConversationAgents: Set<string> = new Set();
   // Client-side programmatic tool calling (`code_execution`). Null unless
-  // config.codeExecution.enabled. One PyRunner per agent (interpreter state
-  // is per-agent, like a per-agent container); waiters resolve script-inner
-  // tool calls dispatched through the normal dispatchToolCall path.
-  private codeExecutionConfig: import('./types/index.js').CodeExecutionConfig | null = null;
-  private codeExecutionRunners: Map<string, PyRunner> = new Map();
+  // config.codeExecution.enabled: its settings, and every agent's scripts,
+  // each in a process of its own on the engine (AgentScripts). Waiters
+  // resolve script-inner tool calls dispatched through the normal
+  // dispatchToolCall path.
+  private codeExecution: { settings: IsolateSettings; scripts: AgentScripts } | null = null;
   private scriptToolWaiters: Map<string, (result: ToolResult) => void> = new Map();
-  /** Per agent, the foreground script now running. An endTurn-carrying inner
-   *  result marks the script that made the call, and is applied to that
-   *  script's code_execution result instead of cancelling the stream
-   *  mid-script (which would wedge the turn). A stopped script's late result
-   *  marks only that script, never the agent's next one. Its `turnId` is the
-   *  turn of the code_execution call running it, which its calls carry.
-   *  `calls` records each tool the script calls, for its round's routing
-   *  (ScriptRound). */
-  private scriptDeferredEndTurn: Map<string, { endTurn: boolean; turnId?: number; calls: RoundCall[] }> = new Map();
   /** Per agent, a round that called code_execution and waits for those calls'
    *  results before its prose is routed (ScriptRound). */
   private scriptRounds: Map<string, ScriptRound> = new Map();
   /** Each code_execution result, by the round that dispatched its call: it
    *  settles only that round, even if a newer round reuses its call id. */
   private scriptRoundOfResult: WeakMap<ToolResult, ScriptRound> = new WeakMap();
-  /** Per agent, the foreground interpreter (PyRunner.interpreter) that ran a
-   *  script leaving a tool that can change routing reachable, and the tools
-   *  its scripts named: a later script there can call them, so the agent's
-   *  script rounds wait while that interpreter lives, when one of them can
-   *  change that round's routing (scriptMayRoute). */
-  private scriptRoutingInterpreters: Map<string, { interpreter: number; names: Set<string> }> = new Map();
-  /** RFC-007: per agent, the origin of the foreground script its runner is
-   *  executing, handed to that script's inner calls (scripts run one at a
-   *  time per runner). Background runners capture theirs in the closure. */
-  private foregroundScriptOrigins: Map<string, ScriptCallOrigin> = new Map();
-  /** Background (daemon) scripts: model-authored watchers that outlive their
-   *  spawning turn. Each gets a DEDICATED PyRunner; wake_agent() injects a
-   *  provenance envelope + payload and requests inference. Keyed by script id. */
-  private backgroundScripts: Map<string, BackgroundScriptRecord> = new Map();
-  private backgroundScriptCounter = 0;
+  /** Each code_execution call of a round that waits, by its watch, whether
+   *  the round waits on that call or not, a stop's included, though no call
+   *  a script makes once its stop is asked reaches a tool, since the runner
+   *  refuses it: its script's calls that reach the host while that call
+   *  watches it, which the round counts (ScriptRound.scripts). */
+  private scriptRoundCalls: WeakMap<ScriptWatch, RoundCall[]> = new WeakMap();
   /** Resident-set per-agent tool-result inline cap (chars), via
    *  agent_settings `tool_result_inline_max_chars`. DURABLE: persisted in
    *  framework state like the core runtime settings and restored at create
@@ -3431,9 +3515,12 @@ export class AgentFramework {
     // that started with zero configured servers).
     framework.mcplInferenceRoutingConfig = config.inferenceRouting ?? null;
 
-    // Client-side programmatic tool calling (code_execution). Config is only
-    // retained when enabled — everything downstream gates on the field.
-    framework.codeExecutionConfig = config.codeExecution?.enabled === true ? config.codeExecution : null;
+    // Client-side programmatic tool calling (code_execution). Made only when
+    // enabled — everything downstream gates on the field. create() checked
+    // the configuration (validateCodeExecutionConfig).
+    framework.codeExecution = config.codeExecution?.enabled === true
+      ? framework.makeCodeExecution(isolateSettings(config.codeExecution as unknown as Record<string, unknown>))
+      : null;
 
     framework.toolClassOverrides = normalizeClassTable(config.toolClassOverrides, 'toolClassOverrides');
     framework.hostToolClasses = [
@@ -3749,6 +3836,13 @@ export class AgentFramework {
    *   iteration.
    * - a later stop() waits again, within its own budget, for any stream or
    *   loop this one left running, so the store never closes under it.
+   *
+   * Each conversation fork still live ends, as a closing fork's end does,
+   * whatever its stream is doing, as each run does: its channel unbinds, and
+   * its window's release passes on to the primary the failed replies it left,
+   * unread in its window or still queued for it. Its end settles a
+   * tool-result batch its stream still held and removes the stream's
+   * entries, and once it has left, its stream's late events are dropped.
    */
   stop(teardownTimeoutMs = DEFAULT_SHUTDOWN_TIMEOUT_MS): Promise<void> {
     try { validateShutdownTimeout(teardownTimeoutMs); }
@@ -3921,25 +4015,13 @@ export class AgentFramework {
     step(() => this.queue.close());
     step(() => this.tuneOutCoordinator?.stop());
 
-    // Kill running code_execution scripts before cancelling streams: a
+    // Stop running code_execution scripts before cancelling streams: a
     // zombie script must not keep firing side-effectful tool calls into a
-    // framework that is shutting down.
-    for (const runner of this.codeExecutionRunners.values()) {
-      step(() => runner.dispose());
-    }
-    this.codeExecutionRunners.clear();
-    this.scriptRoutingInterpreters.clear();
-    // Background daemons die with the process (documented limitation) —
-    // mark cancelled FIRST so their settle path stays silent (no crash-wake
-    // into a framework that is shutting down).
-    for (const record of this.backgroundScripts.values()) {
-      if (record.status === 'running') {
-        record.cancelled = true;
-        record.status = 'cancelled';
-      }
-      step(() => record.runner.dispose());
-    }
-    this.backgroundScripts.clear();
+    // framework that is shutting down, and the bridge refuses any it makes
+    // from here on (stopHasBegun). The stops are quiet: no wake into a
+    // framework that is shutting down. Waited for with the streams, below.
+    let scriptsStopped: Promise<void> | undefined;
+    step(() => { scriptsStopped = this.codeExecution?.scripts.dispose(); });
     // Retained tool images are per-process by design; a retained stopped
     // framework must not keep up to the whole ledger budget referenced.
     this.toolImageLedgers.clear();
@@ -4028,6 +4110,7 @@ export class AgentFramework {
     const waited = withLeftovers('stream', streams.filter(({ name }) => !uncancelled.has(name)));
     leaveRunning(streams.filter(({ name }) => uncancelled.has(name)), 'stream');
     await waitFor(waited, 'stream');
+    await waitFor(scriptsStopped ? [{ label: 'code_execution scripts', promise: scriptsStopped }] : []);
 
     // Stop sync timer
     if (this.syncTimer) {
@@ -4086,6 +4169,65 @@ export class AgentFramework {
     // ended by now, and one it no longer tracks, such as a disposed
     // ephemeral's, may still be finishing.
     for (const complete of [...this.pendingOutgoingCompletes]) step(complete);
+
+    // A restart ends every conversation fork still live: the router's
+    // bindings are in memory, and its generation counters are persisted so
+    // that no name is used twice, so the next qualifying message spawns a new
+    // generation and nothing reads the old fork's window again. So each live
+    // fork ends here as a closing fork's end disposes it, and its release
+    // passes on what it left unread, as any release does. Its channel unbinds
+    // first, as the idle sweep's does: a start() after this stop() would
+    // otherwise route a message still queued for it to a name that's gone. A
+    // fork whose spawn is still waiting for its creation to return has no
+    // binding yet, and its spawn binds nothing once it has ended
+    // (spawnConversationAgent).
+    // Each is a step of its own, and each fork ends whatever its stream or
+    // turn is doing, as each run does above: its end settles a tool-result
+    // batch its stream still held and removes the stream's entries
+    // (disposeConversationAgent), its stream's late events are dropped once
+    // it has left (driveStream), a reply of its that fails then is passed on
+    // by name (onRouteFailure), and its release, or the pass below, passes on
+    // what it left, unread or queued. A turn of its that hasn't streamed yet
+    // can still record its checkpoint before it drops, a key nothing reads,
+    // since the name is never used again. These releases, and the pass after
+    // them, come before the registry forgets its channels, since a notice
+    // names its channel by the label the registry holds (channelForNotice).
+    for (const name of [...this.conversationAgentHomes.keys()]) {
+      step(() => {
+        const home = this.conversationAgentHomes.get(name)!;
+        if (this.conversationRouter?.getBinding(home)?.agentName === name) this.conversationRouter.unbind(home);
+        this.disposeConversationAgent(name);
+      });
+    }
+    // A window release the quiesce postponed (releasesAfterResume) never runs
+    // once the host stops, so its unread pass runs here: each failed reply
+    // stored unread in that window goes to the primary now, deferred while
+    // quiesced like any write, so it waits in the queue with the rest. What
+    // was queued for that agent goes as boot would send it (readdDrained): a
+    // failed reply to the primary, deferred again under its own id, and
+    // anything else dropped, logged, since nothing lands while quiesced. So
+    // no flush that comes later meets a failed reply of an agent that has
+    // gone, not even one that writes into that agent's own window, as a turn
+    // of the fork's still assembling or at a tool boundary does
+    // (flushForStart). Each release's pass is a step of its own, and so is
+    // the drain: one that throws fails the stop() and leaves the others, and
+    // the final flush, to run. It runs again after the waits below, for a
+    // release an end they let settle postpones.
+    const passPostponedReleases = () => {
+      for (const agent of this.releasesAfterResume.values()) {
+        step(() => {
+          for (const metadata of this.unreadFailedReplies(agent)) this.passFailedReplyToPrimary(agent.name, metadata);
+        });
+      }
+      const released = [...this.releasesAfterResume.keys()];
+      this.releasesAfterResume.clear();
+      if (released.length === 0) return;
+      step(() => {
+        this.readdDrained(released.flatMap((name) => this.drainDeferredFor(name)), 'stop: postponed releases');
+        this.ackDeferredWrites();
+      });
+    };
+    passPostponedReleases();
 
     // Stop typing indicators, and forget the registry's channels
     step(() => this.channelRegistry?.stopAll());
@@ -4164,6 +4306,12 @@ export class AgentFramework {
       }
     }
 
+    // A release postponed since the pass above, by an end the waits since let
+    // settle (a run the sweep above ended, a stream that outlasted its wait),
+    // is passed on now. The registry has forgotten its channels, so these
+    // notices name a channel by its bare id.
+    passPostponedReleases();
+
     // No stream is left, unless its wait above ran out or its cancel threw:
     // from the start of stop() none registers and no agent turn starts
     // (providerAdmissionClosed, checked for every agent), and every stream
@@ -4189,10 +4337,12 @@ export class AgentFramework {
     // A quiesced host defers each entry again instead, into the persisted
     // queue, for boot recovery. Past the deferral, a write that throws stays
     // queued with what follows it for its target, and a memory-only queue
-    // still loses it at exit. An entry for a target no longer registered (a
-    // disposed fork) is left: dropped with a memory-only queue at exit, and
-    // from a persisted one, by the boot or resume flush that meets it, passed
-    // to the primary if it's a failed reply, and otherwise dropped, logged.
+    // still loses it at exit. An entry for a target no longer registered,
+    // such as one a release postponed after the pass above leaves, or one a
+    // quiesced boot restored for an agent gone before a crash, is left for
+    // the flush that meets it, which passes a failed reply on to the primary
+    // and drops anything else, logged (readdDrained): with a persisted queue,
+    // the boot or resume flush. A memory-only queue loses it at exit.
     //
     // A registered agent's stream that outlasted its wait, or whose cancel
     // threw, may still write, so that agent's entries stay queued, said once
@@ -4202,19 +4352,6 @@ export class AgentFramework {
     // lives on, its own turn-end flush takes them, as at any turn's end, and a
     // later stop() takes what that leaves. Until then a persisted queue keeps
     // them for boot, and a memory-only one loses them at exit.
-    // A window release the quiesce postponed (releasesAfterResume) never runs
-    // once the host stops, so its unread pass runs here: each failed reply
-    // stored unread in that window goes to the primary now, deferred while
-    // quiesced like any write, so it waits in the queue with the rest. What
-    // was queued for that agent stays queued, as a gone agent's. Each
-    // release's pass is a step of its own: one that throws fails the stop()
-    // and leaves the others, and the flush below, to run.
-    for (const agent of this.releasesAfterResume.values()) {
-      step(() => {
-        for (const metadata of this.unreadFailedReplies(agent)) this.passFailedReplyToPrimary(agent.name, metadata);
-      });
-    }
-    this.releasesAfterResume.clear();
     // Like a guard's storage work above and the final sync below, this flush
     // comes once everything else has stopped (teardownSucceeded): if it throws,
     // stop() fails with that, the final sync still runs, and an owned store
@@ -5422,6 +5559,9 @@ export class AgentFramework {
     reason: string;
     /** The settling stream's logical turn, as settleAgent takes it. */
     closes: TurnRouting | undefined;
+    /** The stream's own turn, whether or not it still owns the agent: the
+     *  turn its scripts take as abandoned. `closes` when not given. */
+    stream?: TurnRouting;
     /** The stream's own log writer (driveStream's logStream), so the
      *  terminal's entry carries the rounds the stream finished, once. */
     log: (entry: Omit<InferenceLogEntry, 'timestamp' | 'agentName' | 'requestId'>) => void;
@@ -5432,8 +5572,9 @@ export class AgentFramework {
     before?: 'sending' | 'finishing';
   }): void {
     const { agent, myStreamId, startTime, compiledRequest, reason, closes, log, before } = args;
+    const stream = args.stream ?? closes;
     const durationMs = Date.now() - startTime;
-    this.abortAgentScript(agent.name, 'stream cancelled');
+    if (stream) this.abandonAgentScripts(agent.name, 'stream cancelled', stream);
     agent.reset();
     // A stopped turn hands its tool-result batch to no successor, so abandon
     // the batch here, before the run is settled, as settleFrameworkCancel()
@@ -5455,7 +5596,7 @@ export class AgentFramework {
       stopReason: 'exhausted',
       speech: '',
       error: 'Stream cancelled',
-    }, closes);
+    }, closes, stream);
     // Distinct trace type: emitTrace funnels every inference:exhausted into
     // noteInferenceExhausted (streak, failures.log, marker); inference:aborted
     // carries the honest cause without any of that.
@@ -5543,7 +5684,16 @@ export class AgentFramework {
     const { agent, myStreamId, startTime, compiledRequest, kind, closes, log } = args;
     const durationMs = Date.now() - startTime;
     if (agent.streamId === myStreamId) {
-      this.abortAgentScript(agent.name, kind === 'shutdown' ? 'framework shutting down' : 'turn abandoned by quiesce');
+      // A quiesce abandons its own stream's turn, or every turn when it
+      // names none; the host stopping ends every turn. An abandoned turn
+      // stops a script its calls watch that hasn't returned, though the
+      // logical turn stays open, and lets go of one that has; a script of
+      // another turn is left to whether its own turn is live.
+      this.abandonAgentScripts(
+        agent.name,
+        kind === 'shutdown' ? 'framework shutting down' : 'turn abandoned by quiesce',
+        kind === 'shutdown' || !closes ? 'every' : closes,
+      );
       agent.reset();
       // A stop hands its tool-result batch to no successor, so abandon the
       // batch here, before the run is settled. driveStream's finally
@@ -5636,8 +5786,8 @@ export class AgentFramework {
         ? [AgentFramework.SAVE_IMAGE_TOOL, AgentFramework.READ_IMAGE_TOOL,
            AgentFramework.FETCH_REFERENCE_TOOL]
         : []),
-      ...(this.codeExecutionConfig
-        ? [buildCodeExecutionToolDefinition(this.codeExecutionConfig)]
+      ...(this.codeExecution
+        ? [describeCodeExecution(this.codeExecution.settings)]
         : []),
     ];
   }
@@ -5811,7 +5961,7 @@ export class AgentFramework {
           type: 'number',
           description:
             'Inline size cap (chars) for tool results (successes and errors) and ' +
-            'background-script wake payloads. Content over the cap is written to a workspace ' +
+            'script wake payloads (wake_agent()). Content over the cap is written to a workspace ' +
             'file under tool-results/ and replaced by a truncated preview + file reference. ' +
             'This is YOUR durable setting: it persists across restarts, like your other ' +
             'agent_settings. Update it when you want a different inline size; reset restores ' +
@@ -6357,8 +6507,7 @@ export class AgentFramework {
       activeTurns: this.activeTurnTokens.size,
       parkedAdmissions,
       gatedRequests: this.pendingRequests.filter((r) => !isTurnContinuation(r.reason)).length,
-      backgroundScripts: [...this.backgroundScripts.values()]
-        .filter((record) => record.status === 'running').length,
+      backgroundScripts: this.codeExecution?.scripts.leftRunning() ?? 0,
       deferredWrites: this.deferredMessages.length,
       ...(this.lastUnabandonable.length > 0 ? { unabandonable: [...this.lastUnabandonable] } : {}),
     };
@@ -6768,28 +6917,15 @@ export class AgentFramework {
     flush.sort(bySeq);
     this.deferredMessages = keep;
     this.handOffDeferredWrites(flush);
-    // A target no longer registered (a fork or a run gone before a crash
-    // that left this write to boot recovery) has no window to land in. A
-    // failed reply it never read becomes the primary's by-name notice, under
-    // the entry's own id and place in the queue (queuedFailedReplyForPrimary),
-    // and is written with the rest; any other write is dropped, logged, by
-    // addMessage.
-    let passed = 0;
-    const batch = flush.flatMap((msg) => {
-      if (msg.forAgent === undefined || this.agents.has(msg.forAgent)) return [msg];
-      if ((msg.metadata as { kind?: unknown } | undefined)?.kind !== 'discord-send-failed') return [msg];
-      const forPrimary = this.queuedFailedReplyForPrimary(msg.forAgent, msg);
-      if (!forPrimary) return [];
-      passed++;
-      return [forPrimary];
-    });
-    const stored = this.readdDrained(batch, `host-mode ${label}`).length;
+    // A write for a target no longer registered, such as a fork or a run gone
+    // before a crash that left it to boot recovery, goes as readdDrained
+    // sends it: a failed reply to the primary, anything else dropped, logged.
+    const stored = this.readdDrained(flush, `host-mode ${label}`).length;
     // Ack = sync the chronicle FIRST, then rewrite the durable queue without
     // the batch. Never the other way round.
     this.ackDeferredWrites();
     console.error(
       `[host-mode] ${label}: flushed ${stored}/${flush.length} deferred context write(s)` +
-      (passed > 0 ? `, ${passed} failed repl${passed === 1 ? 'y' : 'ies'} of a released agent passed to the primary` : '') +
       (keep.length > 0 ? `, ${keep.length} kept for a still-alive turn` : ''),
     );
   }
@@ -8330,6 +8466,10 @@ export class AgentFramework {
    */
   private endDroppedTurn(agentName: string, routing: TurnRouting): void {
     if (this.openLogical.get(agentName) === routing) this.openLogical.delete(agentName);
+    // Its scripts take it as a settle's end of the turn: the start sent
+    // nothing, so none of its own calls is waiting on a script.
+    this.settledTurns.add(routing);
+    this.codeExecution?.scripts.turnEnded(agentName, { id: routing.turnId, live: this.liveTurns(agentName, routing) }, false);
   }
 
   /** A logical turn's end, for every agent: it closes the agent's open
@@ -8351,10 +8491,30 @@ export class AgentFramework {
      *  still owns the agent: it ends here, so the agent's next fresh start
      *  opens a new one. A stream that no longer owns the agent passes none. */
     closes: TurnRouting | undefined,
+    /** The settling stream's own turn, whether or not it still owns the
+     *  agent, for the agent's scripts: `closes` when not given. */
+    stream: TurnRouting | undefined = closes,
   ): void {
     // The identity check keeps a settle that carries an earlier turn's
     // object from closing a newer turn; keep it when editing call sites.
-    if (closes && this.openLogical.get(agentName) === closes) this.openLogical.delete(agentName);
+    const open = this.openLogical.get(agentName);
+    if (closes && open === closes) this.openLogical.delete(agentName);
+    // The settling stream's turn ends here, however it ended, whether or not
+    // the stream still owns the agent: a non-primary agent's scripts whose
+    // turn isn't live end with it, and a turn that failed stops a script its
+    // calls watch whose return the agent never saw. Each script goes by its
+    // own turn (AgentScripts.turnEnded), so the scripts of a turn still open,
+    // or of the stream that now holds the agent, are left alone.
+    if (stream) {
+      // Ended, unless it's the logical turn this settle left open.
+      if (this.openLogical.get(agentName) !== stream) this.settledTurns.add(stream);
+      this.codeExecution?.scripts.turnEnded(
+        agentName,
+        { id: stream.turnId, live: this.liveTurns(agentName, stream) },
+        outcome.stopReason === 'exhausted',
+        outcome.error,
+      );
+    }
     const run = this.ephemeralRuns.get(agentName);
     if (!run) return;
     run.lastActivity = Date.now();
@@ -8551,7 +8711,8 @@ export class AgentFramework {
         // comes between the entry and the primary's notice.
         // Exact-generation disposal owns these name-keyed entries. Remove them
         // before deregistration; the late driveStream finally will see the
-        // generation mismatch and leave any future owner untouched.
+        // generation mismatch and leave any future owner untouched. A fork's
+        // end does the same (disposeConversationAgent).
         this.activeStreams.delete(agent.name);
         this.pendingAssistantBlocks.delete(agent.name);
         this.turnRouting.delete(agent.name);
@@ -8564,6 +8725,8 @@ export class AgentFramework {
         this.releaseWindowNowOrAfterResume(agent);
       }
       this.toolImageLedgers.delete(agent.name);
+      // Its scripts end with it: no turn of its is left for them to outlive.
+      this.codeExecution?.scripts.agentGone(agent.name);
       // Spawn-and-dispose bookkeeping (main, d453165/fee96a7): without this,
       // ephemeral agents leave checkpoint-tree keys and diagnostics map
       // entries behind for the life of the store/session.
@@ -9327,7 +9490,7 @@ export class AgentFramework {
    *   advancing merges during a quiesce window.
    *
    *   host-status — report the quiesce state (drained / parked wakes /
-   *   running background scripts).
+   *   scripts left running).
    *
    *   release-provider-wait — end an agent's provider wait (a provider's
    *   stated retry-after, kept across restarts) for one `model` or all, as an
@@ -12142,12 +12305,12 @@ export class AgentFramework {
           // turn ends. The window stores them here, right after the
           // tool_result message, which is exactly where the membrane appends
           // them in the live conversation — same participant, same content
-          // blocks, same metadata, and compile() emits recent messages
-          // verbatim, so the next turn's compiled prefix byte-matches the
-          // live request (prompt-cache safe). A write that threw after it was
-          // stored, whose landing couldn't be read, is the exception: it's
-          // carried at the flush that finds it, after what was stored since,
-          // so there the store and the live request differ
+          // blocks, and neither carries the row's metadata — and compile()
+          // emits recent messages verbatim, so the next turn's compiled prefix
+          // byte-matches the live request (prompt-cache safe). A write that
+          // threw after it was stored, whose landing couldn't be read, is the
+          // exception: it's carried at the flush that finds it, after what was
+          // stored since, so there the store and the live request differ
           // (writeDrainedInOrder).
           //
           // The queue is drained ONLY at the target agent's own boundary:
@@ -12424,10 +12587,14 @@ export class AgentFramework {
             // after the tool_result envelope, so the next round of THIS turn
             // hears them. Its XML prefill path drops them with a warning on
             // 0.5.x, and from 0.6.0 declares it can't carry them, so none are
-            // collected for it.
+            // collected for it. Each goes as its participant and content
+            // alone: a stored row's metadata is the host's record, not input
+            // for membrane.
             currentState.stream.provideToolResults(
               agent.toolResultGuard.submissionResults(membraneResults),
-              midTurnInjections.length > 0 ? { injectedMessages: midTurnInjections } : undefined,
+              midTurnInjections.length > 0
+                ? { injectedMessages: midTurnInjections.map(({ participant, content }) => ({ participant, content })) }
+                : undefined,
             );
             // RFC-006 §3.3: consumption is determined at assembly, and this
             // is assembly too when the stream carries the injected messages
@@ -12634,6 +12801,31 @@ export class AgentFramework {
   // Built-in MCPL event → context message conversion
   // ==========================================================================
 
+  /** The servers and keys whose drop withoutHostKeys has logged, each as
+   *  `${serverId}\u0000${key}`. */
+  private readonly hostKeysDropped = new Set<string>();
+
+  /**
+   * A server's metadata as it is stored: a copy without HOST_METADATA_KEYS.
+   * A server may use one of those names for something of its own, so the
+   * first drop of each key from each server is logged.
+   */
+  private withoutHostKeys(serverId: string, given: Record<string, unknown> | undefined): Record<string, unknown> {
+    const kept: Record<string, unknown> = { ...given };
+    for (const key of HOST_METADATA_KEYS) {
+      if (!Object.hasOwn(kept, key)) continue;
+      delete kept[key];
+      const logged = `${serverId}\u0000${key}`;
+      if (this.hostKeysDropped.has(logged)) continue;
+      this.hostKeysDropped.add(logged);
+      console.error(
+        `[mcpl] ${serverId}: dropped "${key}" from a message, since only the host writes that key ` +
+        `(logged once for each server and key)`,
+      );
+    }
+    return kept;
+  }
+
   /**
    * Convert an incoming MCPL channel message to a context message.
    * This replaces the old MCPLModule.onProcess() message conversion.
@@ -12671,7 +12863,7 @@ export class AgentFramework {
       return undefined;
     }
     const metadata: Record<string, unknown> = {
-      ...event.metadata,
+      ...this.withoutHostKeys(event.serverId, event.metadata),
       ...(event.eventId ? { eventId: event.eventId } : {}),
       ...(event.coalescingSubject ? { coalescingSubject: event.coalescingSubject } : {}),
       channelId: event.channelId,
@@ -12682,9 +12874,8 @@ export class AgentFramework {
     };
     if (event.threadId) metadata.threadId = event.threadId;
     if (event.tags) metadata.tags = event.tags;
-    // The coalescer's mark is the host's alone: a server's own is dropped.
+    // The coalescer's mark (a server's own was dropped with the other host keys).
     if (event.firstView === true) metadata.firstView = true;
-    else delete metadata.firstView;
     // The inbound source envelope (mcpl/inbound-source.ts): frozen at the
     // occurrence's acceptance when the coalescer delivers, else stamped now
     // from this event. Written after the adapter's metadata, so an adapter
@@ -12699,6 +12890,11 @@ export class AgentFramework {
       this.noteInboundAccepted(source);
     }
     metadata[INBOUND_SOURCE_KEY] = source;
+    // The delivered body's version identity (mcpl/inbound-source.ts
+    // sourceBodyDigest; room-220 #46752–#47210), from the body as delivered,
+    // before any host decoration. The stored copy's own digest is taken at
+    // each storage site below, over exactly the blocks stored there.
+    metadata.sourceBodyDigest = sourceBodyDigest(event.content);
 
     // Per-channel conversation routing: messages go to the channel's fork
     // agent (spawned from the template on first qualifying message), never
@@ -12711,7 +12907,7 @@ export class AgentFramework {
       if (!target) return undefined;
       if (this.conversationRouter && this.conversationAgentHomes.has(target.name)) {
         metadata.triggered = event.triggerInference ?? false;
-        const placement = this.writeToFork(target, event.content, metadata);
+        const placement = this.writeToFork(target, event.content, AgentFramework.withStoredDigest(metadata, event.content));
         // A correction may target an older engagement. Refresh only the
         // binding whose agent actually received the message.
         if (this.conversationRouter.getBinding(event.channelId)?.agentName === target.name) {
@@ -12780,7 +12976,7 @@ export class AgentFramework {
     }
 
     const placement: CoalescingPlacement = { agent: '' };
-    const id = this.addMessage('user', incomingContent, metadata, { placement, bypassDeferralFor: event.assemblingFor });
+    const id = this.addMessage('user', incomingContent, AgentFramework.withStoredDigest(metadata, incomingContent), { placement, bypassDeferralFor: event.assemblingFor });
     this.emitTrace({ type: 'message:added', messageId: id, source: 'mcpl:channel-incoming' });
 
     if (event.triggerInference && !divert) {
@@ -12894,7 +13090,7 @@ export class AgentFramework {
     const trigger = decision.trigger && event.triggerInference !== false;
     messageMetadata.triggered = trigger;
 
-    const placement = this.writeToFork(agent, event.content, messageMetadata);
+    const placement = this.writeToFork(agent, event.content, AgentFramework.withStoredDigest(messageMetadata, event.content));
     router.touch(event.channelId);
     this.emitTrace({ type: 'message:added', messageId: placement.messageId ?? '', source: 'mcpl:channel-incoming' });
 
@@ -13140,11 +13336,24 @@ export class AgentFramework {
    * in flight for the channel, and only this spawn's settlement removes it,
    * so the entry it removes is its own. It's removed before anyone waiting
    * on it resumes, so a waiter that decides again doesn't find it.
+   *
+   * It binds only while the fork it created is still the agent registered
+   * under its name. stop() ends each live fork and unbinds the channels
+   * bound to them, so a fork it ends while this spawn waits for the creation
+   * to return has no binding yet, and binding it then would route the
+   * channel to a name that's gone. The spawn rejects instead, as a failed
+   * spawn does. Its fork's name stays used, so the router's counter for the
+   * channel first moves to the spawn's generation, which the store already
+   * holds, and the channel's next qualifying message spawns the next one.
    */
   private spawnConversationAgent(channelId: string, decision: { agentName: string; generation: number }): Promise<Agent> {
     const spawn = (async () => {
       this.storeConversationGeneration(channelId, decision.generation);
       const agent = await this.createConversationAgent(decision.agentName, channelId);
+      if (this.agents.get(decision.agentName) !== agent) {
+        this.conversationRouter!.hydrateGenerations({ [channelId]: decision.generation });
+        throw new Error(`conversation fork "${decision.agentName}" ended before its channel was bound`);
+      }
       this.conversationRouter!.bind(channelId, decision.agentName, decision.generation);
       return agent;
     })();
@@ -13199,15 +13408,39 @@ export class AgentFramework {
   }
 
   /**
-   * Remove a closed conversation fork from the framework: its closure turn
-   * has finished, so the home mapping has served its purpose and keeping the
-   * agent registered would just grow every agent scan and broadcast filter
-   * forever. The fork's context stays in Chronicle for investigation.
+   * Remove a conversation fork from the framework, once its closure turn has
+   * finished or when stop() ends it: the home mapping has served its purpose,
+   * and keeping the agent registered would just grow every agent scan and
+   * broadcast filter forever. Its window is released now, or, while the host
+   * is quiesced, at resume (releaseWindowNowOrAfterResume); when stop() ends
+   * it then, stop()'s pass for postponed releases passes on the failed
+   * replies it left unread instead. No binding names it
+   * by then: the idle sweep unbinds its channel as the closure begins,
+   * stop() unbinds it just before it ends the fork, and a spawn whose fork
+   * stop() has ended binds nothing (spawnConversationAgent). The fork's
+   * context stays in Chronicle for investigation.
    */
   private disposeConversationAgent(agentName: string): void {
     this.closingConversationAgents.delete(agentName);
     const channelId = this.conversationAgentHomes.get(agentName);
     const agent = this.agents.get(agentName);
+    // A fork stop() ends can still be running: its stream, its tool round.
+    // Its name is never used again, so its end takes the stream's
+    // activeStreams and pendingAssistantBlocks entries, as a run's end does
+    // (runEphemeralToCompletion), and settles a batch its guard still holds,
+    // withheld as `aborted`: the stream's own finally does neither once the
+    // fork has gone. A fork the idle sweep ends has no stream entries left,
+    // and a batch still pending there is one whose successor never ran,
+    // which a run's end settles too.
+    if (agent?.toolResultGuard.hasPending) {
+      try {
+        agent.toolResultGuard.abandon('aborted');
+      } catch (error) {
+        console.error(`[tool-result-guard] agent=${agentName} failed to record a batch the fork left:`, error);
+      }
+    }
+    this.activeStreams.delete(agentName);
+    this.pendingAssistantBlocks.delete(agentName);
     this.agents.delete(agentName);
     if (agent) this.releaseWindowNowOrAfterResume(agent);
     this.turnRouting.delete(agentName);
@@ -13218,6 +13451,9 @@ export class AgentFramework {
     this.conversationAgentHomes.delete(agentName);
     this.evictTurnCheckpoints(agentName);
     if (agent) this.logicalTurnToolCalls.delete(agent);
+    // Its scripts go with it, and leave the map once they've ended: no later
+    // run of a fork's name trims them.
+    this.codeExecution?.scripts.agentGone(agentName);
     // A provider-wait hold (nonOwningProviderWait) goes with the agent: left,
     // its timer would requeue held wakes for an agent that is gone, and a wait
     // held until released would re-arm for the name indefinitely. The recorded
@@ -13528,6 +13764,27 @@ export class AgentFramework {
       ...(sourceTimestamp ? { sourceTimestamp } : {}),
       ...(fields.deferred ? { deferred: true as const } : {}),
     };
+  }
+
+  /**
+   * An inbound item's metadata with its stored copy's own digest
+   * (`storedBodyDigest`): the delivered-body digest's function over exactly
+   * the blocks handed to storage here — every decoration included, before
+   * storage shards them. That function hashes blocks as the store keeps them
+   * (inline media re-encoded and relabeled from its bytes), so an unsharded
+   * copy read back hashes to this too. A body the store shards (adaptive
+   * ingress chunking) carries this on every shard, with its metadata, and no
+   * shard hashes to it. Taken at each storage site, never earlier, because
+   * a path can still decorate the body after ingestion stamped it (the
+   * closed-channel invitation; room-220 #48282). An edit through
+   * editMessage keeps metadata but not this hash.
+   */
+  private static withStoredDigest(
+    metadata: Record<string, unknown>,
+    content: readonly ContentBlock[],
+  ): Record<string, unknown> {
+    metadata.storedBodyDigest = sourceBodyDigest(content);
+    return metadata;
   }
 
   /** Source envelope of a channels/incoming event (lane facts as given). */
@@ -14249,7 +14506,7 @@ export class AgentFramework {
     }
 
     const metadata: Record<string, unknown> = {
-      ...event.origin,
+      ...this.withoutHostKeys(event.serverId, event.origin),
       serverId: event.serverId,
       featureSet: event.featureSet,
       eventId: event.eventId,
@@ -14257,9 +14514,8 @@ export class AgentFramework {
       ...(event.tags ? { tags: event.tags } : {}),
       ...(event.coalescingSubject ? { coalescingSubject: event.coalescingSubject } : {}),
     };
-    // The coalescer's mark is the host's alone: a server's own is dropped.
+    // The coalescer's mark (a server's own was dropped with the other host keys).
     if (event.firstView === true) metadata.firstView = true;
-    else delete metadata.firstView;
     // `origin.channelId` is the server-internal raw id (a bare Discord
     // snowflake) — unroutable as a locus and unresolvable by the agent. Store
     // the composite MCPL id instead wherever we can derive it, so anything
@@ -14281,6 +14537,12 @@ export class AgentFramework {
     metadata[INBOUND_SOURCE_KEY] = source;
 
     const content = [...event.content];
+    // The delivered body's version identity, before any host decoration
+    // (the closed-channel invitation below). Every push that reaches here
+    // gets one, written over any value the adapter's origin carried. (A
+    // visibly-empty push is refused at admission; the silent-heartbeat marker
+    // stores nothing, so its metadata is never kept.)
+    metadata.sourceBodyDigest = sourceBodyDigest(content);
     if (triggerChannel) {
       const origin = (event.origin ?? {}) as Record<string, unknown>;
       const invitation = this.buildClosedChannelInvitation({
@@ -14309,7 +14571,7 @@ export class AgentFramework {
 
     const placement: CoalescingPlacement = { agent: '' };
     if (!silentHeartbeat) {
-      const id = this.addMessage('user', content, metadata, { placement, bypassDeferralFor: event.assemblingFor });
+      const id = this.addMessage('user', content, AgentFramework.withStoredDigest(metadata, content), { placement, bypassDeferralFor: event.assemblingFor });
       this.emitTrace({ type: 'message:added', messageId: id, source: 'mcpl:push-event' });
     } else {
       console.error(`[heartbeat] ${event.serverId}: accepted silent scheduled wake ${logValue(event.eventId ?? '')}`);
@@ -17190,6 +17452,10 @@ export class AgentFramework {
       }
     }
     this.turnRouting.set(agent.name, routing);
+    // A turn a start runs on is live again, though an earlier start's settle
+    // marked it settled: a resume takes the agent's latest routing, which can
+    // be a silent start's that has settled (settledTurns).
+    this.settledTurns.delete(routing);
 
     if (resumesTurn) {
       const previousLogicalToolState = this.logicalTurnToolCalls.get(agent);
@@ -18249,16 +18515,18 @@ export class AgentFramework {
             // note above — the fallback preamble is cumulative in XML mode).
             //
             // The round's tool calls decide whether its prose goes out, and a
-            // foreground script's own calls count as the round's: a skip_reply
-            // or a send inside the script silences the round as a direct call
-            // does. So a round whose script can call such a tool is routed
-            // once its scripts have returned (ScriptRound, scriptMayRoute),
-            // and its prose goes out when they finish. Any other round is
-            // routed now, a round with a script that can't call one included,
-            // so narration beside a script isn't held for the script's
-            // runtime. The turn's locus and an explicit round's admitted
-            // targets are taken now, at the round's tool-calls event, so a
-            // re-pin or a renamed label while a script runs doesn't move them.
+            // script's calls that reach the host while a run or wait call of
+            // the round watches it count as the round's: a skip_reply or a
+            // send inside the script silences the round as a direct call
+            // does. So a round whose watched script can call such a tool is
+            // routed once those calls have returned (ScriptRound,
+            // scriptMayRoute), at the script's end or its yield, and its
+            // prose goes out then. Any other round is routed now, a round
+            // with a script that can't call one included, so narration beside
+            // a script isn't held for the call's yield. The turn's locus and
+            // an explicit round's admitted targets are taken now, at the
+            // round's tool-calls event, so a re-pin or a renamed label while a
+            // script runs doesn't move them.
             // Hybrid's `>>>` targets, sticky pin and hold apply as its delivery
             // runs, as for any queued hybrid delivery.
             const roundToolNames = event.calls.map((c) => c.name);
@@ -18303,8 +18571,11 @@ export class AgentFramework {
               // round's other silencing calls, come back at the next round,
               // each with why it silences, and the turn-end delivery drops
               // the round's prose by its place where nothing routed it live
-              // (XML mode). A refused send posted nothing, so it counts for
-              // nothing.
+              // (XML mode). A send the allowedTools refuses, or the bridge
+              // refuses before dispatch, posted nothing, so it counts for
+              // nothing. A call is counted before it's dispatched, so one a
+              // module refuses then, such as a conversation's guard on a
+              // foreign channel, counts as made, directly or from a script.
               if (calls.some((c) => c.refused)) {
                 const otherCause = roundSilenceCause(calls.filter((c) => !c.refused));
                 silenceBeforeRefusal = silenceCause === 'private' || otherCause === 'private'
@@ -18388,12 +18659,15 @@ export class AgentFramework {
                 && this.scriptMayRoute(agent.name, c, turnProseRouting, requestSnapshot.sameRoundThinkTextPolicy === 'private'))
               .map((c) => c.id);
             if (scriptCallIds.length > 0) {
-              // In place before dispatch, so a foreground script records
-              // its calls here from its first one.
+              // In place before dispatch, so a script records its calls here
+              // from its first one. The round waits for the calls whose
+              // scripts can change its routing, and counts the calls of every
+              // script its code_execution calls watch while it waits, one
+              // whose code names no routing tool included.
               const round: ScriptRound = {
                 agent,
                 streamId: myStreamId,
-                scripts: new Map(scriptCallIds.map((id) => [id, []])),
+                scripts: new Map(event.calls.filter((c) => c.name === CODE_EXECUTION_TOOL_NAME).map((c) => [c.id, []])),
                 pending: new Set(scriptCallIds),
                 route: () => {
                   // Only while this stream still owns the agent and waits on
@@ -19094,6 +19368,7 @@ export class AgentFramework {
                   agent, myStreamId, startTime, compiledRequest,
                   reason: callerCancel.reason ?? 'user',
                   closes: this.agents.get(agent.name) === agent && agent.streamId === myStreamId ? streamRouting : undefined,
+                  stream: streamRouting,
                   log: logStream,
                 });
               }
@@ -19131,7 +19406,7 @@ export class AgentFramework {
             // Only reset + retry if this is still the active stream
             if (agent.streamId !== myStreamId) break;
 
-            this.abortAgentScript(agent.name, 'stream error');
+            this.abandonAgentScripts(agent.name, 'stream error', streamRouting);
 
             if (ownsProviderGate && this.holdProviderAcceleration(agent, err, trigger)) {
               if (this.agents.get(agent.name) === agent && agent.streamId === myStreamId) this.eventGate?.onInferenceEnded(agent.name);
@@ -19196,7 +19471,7 @@ export class AgentFramework {
                 stopReason: 'exhausted',
                 speech: '',
                 ...(statedWait === 'fail' ? this.statedWaitNotSlept(err) : { error: err.message }),
-              }, this.agents.get(agent.name) === agent && agent.streamId === myStreamId ? streamRouting : undefined);
+              }, this.agents.get(agent.name) === agent && agent.streamId === myStreamId ? streamRouting : undefined, streamRouting);
               this.emitTrace({
                 type: 'inference:exhausted',
                 agentName: agent.name,
@@ -19275,7 +19550,7 @@ export class AgentFramework {
                 lifecyclePhase = 'failed';
                 const durationMs = Date.now() - startTime;
                 const terminal = `Stream aborted: ${reason}`;
-                this.abortAgentScript(agent.name, `stream aborted (${reason})`);
+                this.abandonAgentScripts(agent.name, `stream aborted (${reason})`, streamRouting);
                 agent.reset();
                 this.settleAgent(agent.name, {
                   stopReason: 'exhausted',
@@ -19503,7 +19778,7 @@ export class AgentFramework {
         logStream({ success: false,
           error: `Provider acceleration cooldown: ${err.message}`,
           request: compiledRequest ?? { note: 'streaming request rate-limited' }, durationMs });
-        this.abortAgentScript(agent.name, 'provider acceleration cooldown');
+        this.abandonAgentScripts(agent.name, 'provider acceleration cooldown', streamRouting);
         lifecyclePhase = 'failed'; agent.reset(); if (this.agents.get(agent.name) === agent && agent.streamId === myStreamId) this.eventGate?.onInferenceEnded(agent.name);
         return;
       }
@@ -19517,7 +19792,7 @@ export class AgentFramework {
         logStream({ success: false,
           error: `Provider wait: ${err.message}`,
           request: compiledRequest ?? { note: 'streaming request rate-limited' }, durationMs });
-        this.abortAgentScript(agent.name, 'provider wait');
+        this.abandonAgentScripts(agent.name, 'provider wait', streamRouting);
         lifecyclePhase = 'failed'; agent.reset(); if (this.agents.get(agent.name) === agent && agent.streamId === myStreamId) this.eventGate?.onInferenceEnded(agent.name);
         return;
       }
@@ -19547,7 +19822,7 @@ export class AgentFramework {
         request: compiledRequest ?? { note: 'streaming request threw' },
         durationMs,
       });
-      this.abortAgentScript(agent.name, 'stream threw');
+      this.abandonAgentScripts(agent.name, 'stream threw', streamRouting);
       lifecyclePhase = 'failed'; // §10.5 — terminal emitted in finally
       agent.reset();
       if (this.agents.get(agent.name) === agent && agent.streamId === myStreamId) this.eventGate?.onInferenceEnded(agent.name);
@@ -19767,8 +20042,9 @@ export class AgentFramework {
 
   /**
    * Admin puppet: execute ONE tool call AS an agent and persist the
-   * tool_use + tool_result pair in that agent's window exactly as a
-   * model-initiated call is stored.
+   * tool_use + tool_result pair in that agent's window as a
+   * model-initiated call is stored, but under the inline cap its call
+   * carried, whereas a model's call takes the cap at the store.
    *
    * Born from the princess exemplar surgery (2026-08-23). Her folded
    * narrative said "I have no tools"; every past tool_use/tool_result pair
@@ -19865,7 +20141,8 @@ export class AgentFramework {
     let ownedToEnd = false;
     try {
       const started = Date.now();
-      // The pair is stored under the agent's inline cap, as a model's call is.
+      // The pair is stored under the cap its call carried, the agent's inline cap at the call: a call
+      // that changes the cap, as a script may, is stored as it was shaped.
       const call = { id: toolUseId, name: toolName, input, callerAgentName: agentName, resultMaxChars: this.resolveToolResultInlineCap(agent).cap };
       const returned = await this.executeToolCall(call);
       const durationMs = Date.now() - started;
@@ -19885,7 +20162,7 @@ export class AgentFramework {
       const { blocks } = await this.buildStoredToolResultContent(
         agentName,
         [{ id: toolUseId, name: toolName, input, result, durationMs }],
-        this.resolveToolResultInlineCap(agent).cap,
+        call.resultMaxChars,
       );
       const toolUse: ContentBlock[] = [
         { type: 'tool_use', id: toolUseId, name: toolName, input } as ContentBlock,
@@ -19946,15 +20223,20 @@ export class AgentFramework {
 
   private async executeToolCallFrom(call: ToolCall, origin: ChannelToolOrigin): Promise<ToolResult> {
     if (origin.kind === 'agent') {
-      const refusal = this.agentToolPermissionFailure(origin.agentName, call);
-      if (refusal) return refusal;
+      // A programmatic call, off the dispatcher: no RFC-007 call opened, so a
+      // denial here is a failure. It's this call's end, so it's traced here.
+      const failure = this.agentToolPermissionFailure(origin.agentName, call, false);
+      if (failure) {
+        this.emitTrace({ type: 'tool:failed', module: 'framework', tool: call.name, callId: call.id, error: failure.error ?? '' });
+        return failure;
+      }
     }
 
     if (isPresentationTool(call.name)) return this.editToolPresentation(call.callerAgentName ?? '__ephemeral__', call);
     // Client-side programmatic tool calling for promise-based callers
-    // (SubagentModule ephemerals). Keyed by callerAgentName so each ephemeral
-    // gets its own interpreter state.
-    if (call.name === CODE_EXECUTION_TOOL_NAME && this.codeExecutionConfig) {
+    // (SubagentModule ephemerals). Keyed by callerAgentName, so each
+    // ephemeral's scripts are its own.
+    if (call.name === CODE_EXECUTION_TOOL_NAME && this.codeExecution) {
       return this.runCodeExecution(call.callerAgentName ?? '__ephemeral__', call);
     }
 
@@ -19995,14 +20277,15 @@ export class AgentFramework {
     }
 
     // Module tools. The caller uses the result in process, so it gets the
-    // module's own result, as the module returned it.
+    // module's own result, as the module returned it, less a refusal it
+    // claims, which is the dispatcher's to say.
     return this.moduleRegistry.handleToolCall(call);
   }
 
   /** A programmatic call of an MCPL tool: `serverId` and `prefix` as resolveMcplTool matched them. */
   private async executeMcplToolCall(call: ToolCall, serverId: string, prefix: string): Promise<ToolResult> {
     if (!this.mcplServerRegistry) {
-      return { success: false, error: 'MCPL not initialized', isError: true };
+      return { success: false, error: 'MCPL not initialized, so the call didn\'t run', isError: true };
     }
     const modern = this.modernServers().get(serverId) ?? null;
     const server = modern ? null : this.mcplServerRegistry.getServer(serverId);
@@ -20063,10 +20346,13 @@ export class AgentFramework {
       input: call.input,
     });
     const startTime = Date.now();
-    // The round that waits on this call, registered just before dispatch.
+    // The round this call is part of, registered just before dispatch, if
+    // it waits: it counts the calls of this call's script that reach the
+    // host while the call watches it, and the result settles it if it waits
+    // on this call.
     const waitingRound = this.scriptRounds.get(agentName);
     const round = waitingRound?.pending.has(call.id) ? waitingRound : undefined;
-    this.runCodeExecution(agentName, call)
+    this.runCodeExecution(agentName, call, waitingRound?.scripts.get(call.id))
       .catch((error): ToolResult => {
         this.toolLifecycleEmitter?.markDispatchFailure(agentName, call.id);
         // runCodeExecution is designed not to reject; this is the last-resort
@@ -20118,17 +20404,21 @@ export class AgentFramework {
   }
 
   /**
-   * Whether a code_execution call's script can change its round's routing,
-   * so the round waits for it (ScriptRound). Its code must name a tool whose
-   * call can change the round's routing in the turn's mode, under its
-   * same-round policy (scriptToolNames, changesRouting), or the interpreter
-   * it will run in must have run a script that left such a tool reachable
-   * (scriptRoutingInterpreters), until that interpreter is reclaimed or
-   * restarted. What neither sees is routed at once, as a round was before
-   * scripts counted (scriptToolNames says what goes unseen). A background
-   * script, or a list or cancel action, returns at once, and its calls
-   * aren't the round's. Without code execution no script runs: the call is
-   * answered as an unknown tool, a result that settles no round.
+   * Whether a code_execution call watches a script that can change its
+   * round's routing, so the round waits for the call (ScriptRound): a run's
+   * script, or the script a wait names by its script_id, as it would watch
+   * it. Its code must name a tool whose call can change the round's routing
+   * in the turn's mode, under its same-round policy (routingToolsNamed,
+   * changesRouting). The reading is coarse, so a comment or a string naming
+   * such a tool holds the round as well, for no longer than the call's yield,
+   * and a name built at runtime isn't seen: its round is routed at once, as a
+   * round was before scripts counted. A stop's watch counts what reaches the
+   * host as any call's does (scriptRoundCalls), but nothing a script makes
+   * once its stop is asked reaches a tool, since the runner refuses it, so a
+   * stop holds no round, and a list returns at once.
+   * Without code execution, or for an agent whose allowedTools doesn't name
+   * code_execution, no script runs, and the call's answer settles no round,
+   * so a round waiting for it would be withheld when its stream ended.
    */
   private scriptMayRoute(
     agentName: string,
@@ -20136,349 +20426,173 @@ export class AgentFramework {
     mode: NonNullable<AgentConfig['proseRouting']>,
     privateThink: boolean,
   ): boolean {
-    if (!this.codeExecutionConfig) return false;
-    const input = (call.input ?? {}) as { code?: unknown; background?: unknown; action?: unknown };
-    if (input.background === true || (input.action !== undefined && input.action !== 'run')) return false;
-    if (typeof input.code === 'string' && changesRouting(scriptToolNames(input.code, ROUTING_TOOLS).names, mode, privateThink)) return true;
-    const interpreter = this.codeExecutionRunners.get(agentName)?.interpreter ?? null;
-    const mark = this.scriptRoutingInterpreters.get(agentName);
-    return interpreter !== null && mark?.interpreter === interpreter && changesRouting(mark.names, mode, privateThink);
+    const ce = this.codeExecution;
+    const input = call.input;
+    if (!ce || !this.canAgentUseTool(agentName, CODE_EXECUTION_TOOL_NAME)) return false;
+    if (input === null || typeof input !== 'object' || Array.isArray(input)) return false;
+    const fields = input as Record<string, unknown>;
+    const action = fields.action ?? 'run';
+    const code = action === 'run'
+      ? fields.code
+      : action === 'wait' && typeof fields.script_id === 'string' ? ce.scripts.codeOf(agentName, fields.script_id) : undefined;
+    return typeof code === 'string' && changesRouting(routingToolsNamed(code), mode, privateThink);
   }
 
   /**
-   * Run one code_execution script for an agent. Never rejects.
+   * One code_execution call: run a script, or wait for, stop or list the
+   * agent's scripts. Never rejects.
    *
-   * The script runs in the agent's persistent python interpreter with every
-   * tool on the agent's CURRENT surface injected (minus code_execution
-   * itself). Inner tool calls are dispatched through dispatchToolCall — the
-   * exact model path, including MCPL state/checkpoint handling, channel
-   * routing, and traces — and resolved via scriptToolWaiters, so their
-   * results reach the running script and never the model context.
+   * A script runs in a process of its own, on the engine, with every tool on
+   * the agent's CURRENT surface (minus code_execution itself). Its calls come
+   * back through dispatchToolCall as the agent's — the exact model path,
+   * including MCPL state/checkpoint handling, channel routing, and traces —
+   * and are resolved via scriptToolWaiters, so their results reach the script
+   * and never the model context (scriptToolCall). The return says how the
+   * script ended, or that it's still running, first; then its calls, its
+   * value and its output since the last return (renderReturn). `roundCalls`,
+   * when a round waits on this call (ScriptRound), takes the script's calls
+   * that reach the host while this call watches it.
    */
-  private async runCodeExecution(agentName: string, call: ToolCall): Promise<ToolResult> {
+  private async runCodeExecution(agentName: string, call: ToolCall, roundCalls?: RoundCall[]): Promise<ToolResult> {
+    const ce = this.codeExecution!;
+    const refuse = (error: string): ToolResult => ({ success: false, error, isError: true });
     // RFC-007: what the script's own tool calls are attributed to. Read
     // before the first await: it is only known while this call is being
     // dispatched. Undefined off the model dispatch path (ephemeral callers),
     // whose code_execution call is not reported either.
     const origin = this.toolLifecycleEmitter?.scriptOrigin(agentName, call.id);
-    const input = (call.input ?? {}) as {
-      code?: unknown;
-      background?: unknown;
-      action?: unknown;
-      script_id?: unknown;
-      time_limit_ms?: unknown;
-    };
-
-    // Management surface: the agent's own daemon fleet is inspectable and
-    // killable through the same tool that spawns it.
-    if (input.action === 'list') {
-      const scripts = [...this.backgroundScripts.values()]
-        .filter((s) => s.agentName === agentName)
-        .map((s) => ({
-          script_id: s.id,
-          status: s.status,
-          started_at: new Date(s.startedAt).toISOString(),
-          wakes: s.wakes,
-          last_wake_at: s.lastWakeAt ? new Date(s.lastWakeAt).toISOString() : null,
-          log: s.logPath,
-        }));
-      return { success: true, data: { background_scripts: scripts } };
+    const input = call.input;
+    if (input === null || typeof input !== 'object' || Array.isArray(input)) {
+      return refuse(
+        'code_execution takes an object: {"code": "..."} runs a script, and {"action": "wait" | "stop", "script_id": ...} ' +
+          'or {"action": "list"} manages your scripts. Nothing was run.',
+      );
     }
-    if (input.action === 'cancel') {
-      if (typeof input.script_id !== 'string') {
-        return { success: false, error: 'cancel requires `script_id`', isError: true };
+    const fields = input as Record<string, unknown>;
+    // The Python runner's inputs, refused by name with what replaced each.
+    if (fields.background !== undefined) {
+      return refuse(
+        'background is no longer an input: every script runs in your turn, and one still running after yield_time_ms yields ' +
+          'and keeps running, so you can leave it running then. Nothing was run.',
+      );
+    }
+    if (fields.time_limit_ms !== undefined) {
+      return refuse('time_limit_ms is now yield_time_ms: how long a run or a wait waits for the script before it yields. Nothing was run.');
+    }
+    const action = fields.action ?? 'run';
+    if (action === 'cancel') return refuse('cancel is now stop: {"action": "stop", "script_id": ...}. Nothing was changed.');
+    const asked = fields.yield_time_ms;
+    if (asked !== undefined && (typeof asked !== 'number' || !Number.isSafeInteger(asked) || asked < 0)) {
+      return refuse('yield_time_ms must be a whole number of milliseconds, 0 or more. Nothing was run.');
+    }
+    const yieldMs = asked as number | undefined;
+    const watch: ScriptWatch = { endTurn: false, ...(call.callerTurnId !== undefined ? { turnId: call.callerTurnId } : {}) };
+    // Before the script can make a call: each of its calls that reaches the
+    // host while this call watches it counts toward the round waiting on it.
+    if (roundCalls) this.scriptRoundCalls.set(watch, roundCalls);
+    let r: ScriptReturn;
+    try {
+      switch (action) {
+        case 'run':
+          if (typeof fields.code !== 'string' || fields.code.trim() === '') {
+            return refuse('a run needs `code`: the script to run, as a non-empty string. Nothing was run.');
+          }
+          // A script started once the host has begun to stop would outlive the stop's sweep.
+          if (this.stopHasBegun()) return refuse('this host is stopping, so no script starts now. Nothing was run.');
+          // An agent whose scripts end with their turn gets none for a turn that has ended.
+          if (call.callerTurnId !== undefined && this.primaryAgentName && agentName !== this.primaryAgentName &&
+            !this.liveTurns(agentName, undefined).includes(call.callerTurnId)) {
+            return refuse("the turn this call was made in has ended, and only the primary agent's scripts outlive a turn, so no script starts for it. Nothing was run.");
+          }
+          r = await ce.scripts.run(agentName, fields.code, yieldMs, { ...(origin ? { origin } : {}), watch });
+          break;
+        case 'wait':
+        case 'stop':
+          if (typeof fields.script_id !== 'string') {
+            return refuse(`${action} needs \`script_id\`, as a run or a list gave it. Nothing was changed.`);
+          }
+          r = action === 'wait'
+            ? await ce.scripts.wait(agentName, fields.script_id, yieldMs, watch)
+            : await ce.scripts.stop(agentName, fields.script_id, watch);
+          break;
+        case 'list':
+          return { success: true, data: [{ type: 'text', text: renderList(ce.scripts.list(agentName), Date.now()) }] };
+        default:
+          return refuse(`unknown action ${JSON.stringify(action)}: run (the default), wait, stop or list. Nothing was run.`);
       }
-      const record = this.backgroundScripts.get(input.script_id);
-      if (!record || record.agentName !== agentName) {
-        return { success: false, error: `no background script '${input.script_id}'`, isError: true };
-      }
-      if (record.status === 'running') {
-        record.cancelled = true;
-        record.status = 'cancelled';
-        record.runner.abort('cancelled by agent');
-        record.runner.dispose();
-      }
-      return {
-        success: true,
-        data: { script_id: record.id, status: record.status, log: record.logPath },
-      };
+    } catch (error) {
+      if (error instanceof ScriptRefusal) return refuse(error.message);
+      throw error;
     }
-    if (input.action !== undefined && input.action !== 'run') {
-      return { success: false, error: `unknown action ${JSON.stringify(input.action)}`, isError: true };
-    }
+    const text = renderReturn(r, {
+      boundMs: ce.scripts.bound(yieldMs),
+      lifetimeMs: ce.settings.scriptLifetimeMs,
+      // The cap its result is held to, which would cut it from its end: an
+      // in-process caller's own (ToolCall.resultMaxChars), or its agent's.
+      maxChars: call.resultMaxChars ?? this.resultMaxCharsFor(agentName, call.id),
+    });
+    // A script's call whose result ends the turn ends it at this result, the
+    // one watching the script (scriptToolCall).
+    const endTurn = watch.endTurn ? { endTurn: true } : {};
+    // An error exactly for the endings that wake a left script: it failed,
+    // crashed or was stopped at its limit.
+    // As a text block, which the model reads as the text itself.
+    return r.ending !== null && endingWakes(r.ending)
+      ? { success: false, error: text, isError: true, ...endTurn }
+      : { success: true, data: [{ type: 'text', text }], isError: false, ...endTurn };
+  }
 
-    if (typeof input.code !== 'string' || input.code.trim() === '') {
-      return {
-        success: false,
-        error: 'code_execution requires a non-empty `code` string',
-        isError: true,
-      };
-    }
+  // ---------------------------------------------------------------------------
+  // code_execution's scripts: what the host gives AgentScripts
+  // ---------------------------------------------------------------------------
 
-    // A per-call time limit, capped by the deployment's ceiling (the result says when it was capped).
-    if (input.time_limit_ms !== undefined && (typeof input.time_limit_ms !== 'number' || !Number.isFinite(input.time_limit_ms) || input.time_limit_ms < 1000)) {
-      return { success: false, error: '`time_limit_ms` must be a number of milliseconds, at least 1000', isError: true };
-    }
-    const limits = scriptTimeLimits(this.codeExecutionConfig ?? undefined);
-    const ceilingMs = input.background === true ? limits.backgroundMaxMs : limits.maxMs;
-    const requestedMs = input.time_limit_ms === undefined ? undefined : Math.floor(input.time_limit_ms);
-    const timeLimitMs = requestedMs === undefined ? undefined : Math.min(requestedMs, ceilingMs);
-    const capNote = requestedMs !== undefined && requestedMs > ceilingMs
-      ? `time_limit_ms ${requestedMs} was capped at ${ceilingMs}, this deployment's maximum`
-      : undefined;
+  /** code_execution's settings and every agent's scripts, made once code execution is on. */
+  private makeCodeExecution(settings: IsolateSettings): { settings: IsolateSettings; scripts: AgentScripts } {
+    const scripts = new AgentScripts(
+      {
+        tools: (agentName) => this.scriptTools(agentName),
+        dispatch: (agentName, toolName, argsJson, context) => this.scriptToolCall(agentName, toolName, argsJson, context),
+        wake: (agentName, scriptId, text, label) => this.scriptWake(agentName, scriptId, text, label),
+        // Only the primary agent's scripts outlive a turn, or any agent's
+        // when no primary agent is named.
+        outlivesTurn: (agentName) => !this.primaryAgentName || agentName === this.primaryAgentName,
+      },
+      {
+        childEntry: CHILD_ENTRY,
+        memoryMaxBytes: settings.memoryMaxBytes,
+        output: DEFAULT_OUTPUT_BOUNDS,
+        flushMs: 200,
+        yieldMs: settings.yieldMs,
+        maxYieldMs: settings.maxYieldMs,
+        lifetimeMs: settings.scriptLifetimeMs,
+        toolCallTimeoutMs: settings.toolCallTimeoutMs,
+        stopGraceMs: 5_000,
+        maxRunning: settings.maxRunningScripts,
+        keepEnded: 8,
+        wakeMinIntervalMs: settings.wakeMinIntervalMs,
+        maxWakesPerScript: settings.maxWakesPerScript,
+      },
+      new ChildCapacity(settings.maxScriptChildren),
+    );
+    return { settings, scripts };
+  }
 
+  /** The tools a script of this agent may call now: the agent's own surface, without code_execution. */
+  private scriptTools(agentName: string): PreludeTool[] {
     const agent = this.agents.get(agentName);
     const surface = agent
       ? this.getToolsForAgent(agentName).filter((t) => agent.canUseTool(t.name))
       : this.getAllTools(); // ephemeral agents: full surface, matching executeToolCall
-    const injected = buildInjectedTools(
-      surface.map((t) => t.name).filter((name) => name !== CODE_EXECUTION_TOOL_NAME),
-    );
-
-    if (input.background === true) {
-      const started = this.startBackgroundScript(agentName, input.code, injected, timeLimitMs, origin);
-      if (capNote && started.success && started.data && typeof started.data === 'object') {
-        (started.data as Record<string, unknown>).time_limit_note = capNote;
-      }
-      return started;
-    }
-
-    const runner = this.getOrCreateScriptRunner(agentName);
-    // A busy runner refuses this exec; the running script keeps its mark and
-    // its origin. The script records the tools it calls where its round
-    // reads them (ScriptRound), when a round dispatched it.
-    const ownsRunner = !runner.busy;
-    const script = {
-      endTurn: false,
-      turnId: call.callerTurnId,
-      calls: this.scriptRounds.get(agentName)?.scripts.get(call.id) ?? [],
-    };
-    if (ownsRunner) this.scriptDeferredEndTurn.set(agentName, script);
-    const ownsOrigin = origin !== undefined && ownsRunner;
-    if (ownsOrigin) this.foregroundScriptOrigins.set(agentName, origin);
-    let exec: import('./code-execution/py-runner.js').ExecResult;
-    try {
-      // A script stopped at its ceiling is offered background mode only when
-      // this agent could start a background script as this one starts: it
-      // runs them, and a slot is free under the cap.
-      const backgroundCeilingMs = this.runsBackgroundScripts(agentName)
-        && this.runningBackgroundScripts(agentName) < this.maxBackgroundScripts() ? limits.backgroundMaxMs : undefined;
-      exec = await runner.exec(input.code, injected, undefined, { deadlineMs: timeLimitMs, ceilingMs, backgroundCeilingMs });
-    } finally {
-      if (this.scriptDeferredEndTurn.get(agentName) === script) this.scriptDeferredEndTurn.delete(agentName);
-      if (ownsOrigin && this.foregroundScriptOrigins.get(agentName) === origin) {
-        this.foregroundScriptOrigins.delete(agentName);
-      }
-    }
-    const endTurn = script.endTurn;
-    // A script that left a tool reachable, such as a helper it defined, may
-    // call it from a later script in the same interpreter (scriptMayRoute).
-    // Whether that changes the later round's routing is its mode's and
-    // policy's to say, so the mark keeps the names.
-    const interpreter = runner.interpreter;
-    const { reachable } = scriptToolNames(input.code, ROUTING_TOOLS);
-    if (ownsRunner && interpreter !== null && reachable.size > 0) {
-      const mark = this.scriptRoutingInterpreters.get(agentName);
-      const earlier = mark?.interpreter === interpreter ? mark.names : [];
-      this.scriptRoutingInterpreters.set(agentName, { interpreter, names: new Set([...earlier, ...reachable]) });
-    }
-
-    // The model reads how the script ended as text, its ending first, within
-    // the bound its caller reads whole: the one the call carries, as an
-    // in-process caller may set it, or else the one the framework gives the
-    // calls it dispatches (resultMaxCharsFor), the agent's inline cap. Hosts
-    // read the fields in `structured`.
-    const cap = call.resultMaxChars ?? this.resultMaxCharsFor(agentName, call.id);
-    const text = await this.scriptEndResultText(
-      { stdout: exec.stdout, stderr: exec.stderr, returnCode: exec.returnCode, ...(capNote ? { timeLimitNote: capNote } : {}) },
-      cap,
-      call.id,
-    );
-    return {
-      success: true,
-      data: [{ type: 'text', text }],
-      structured: {
-        stdout: exec.stdout,
-        stderr: exec.stderr,
-        return_code: exec.returnCode,
-        ...(capNote ? { time_limit_note: capNote } : {}),
-      },
-      isError: false,
-      ...(endTurn ? { endTurn: true } : {}),
-    };
-  }
-
-  /**
-   * A foreground script's ending as the model reads it: whole when it fits
-   * `cap`, or else cut to fit beside a notice, with the whole text written
-   * to a file of its own in the tool results folder. Its name differs from
-   * the one the inline cap's spill gives the result before the call id,
-   * which a long id can cut short, so a later spill of the cut text, as at a
-   * cap lowered before the result is stored, can't write over it. The cut
-   * leaves room for the longest notice it could end with, so it's decided
-   * before anything is written. When the cap can't hold a cut of each stream
-   * beside that notice, the whole text comes back, unwritten. On a model's
-   * call, the inline cap's spill then keeps its head as the result is stored;
-   * an in-process caller that set so small a bound gets the whole text.
-   */
-  private async scriptEndResultText(end: ScriptEnd, cap: number, callId: string): Promise<string> {
-    const whole = scriptEndText(end);
-    if (whole.length <= cap) return whole;
-    const label = `${new Date().toISOString().slice(0, 10)}-output-${callId}`;
-    const keptIn = (path: string) =>
-      `[cut to fit; the whole output (${whole.length} chars): workspace file ${path}. ${this.spillPageAdvice(path, cap)}]`;
-    const writeFailed = (path: string, error: string) =>
-      `[cut to fit; writing the whole output (${whole.length} chars) to workspace file ${path} FAILED (${error.slice(0, 200)}); what was cut was not retained]`;
-    const noWorkspace = `[cut to fit; the whole output was ${whole.length} chars, and with no writable workspace mount without an include, what was cut was not retained]`;
-    const place = this.toolResultFilePlace(label);
-    const reserve = place
-      ? Math.max(keptIn(place.path).length, writeFailed(place.path, 'x'.repeat(200)).length, noWorkspace.length)
-      : noWorkspace.length;
-    const within = scriptEndTextWithin(end, cap - reserve);
-    if (within === null) return whole;
-    const written = place ? await this.writeToolResultFile(label, whole) : null;
-    if (!written) return within + noWorkspace;
-    return within + (written.error === undefined ? keptIn(written.path) : writeFailed(written.path, written.error));
-  }
-
-  // ---------------------------------------------------------------------------
-  // Background (daemon) scripts — model-authored watchers that outlive the turn
-  // ---------------------------------------------------------------------------
-
-  /** Background scripts are the primary agent's, or any agent's when no primary agent is named. */
-  private runsBackgroundScripts(agentName: string): boolean {
-    return !this.primaryAgentName || agentName === this.primaryAgentName;
-  }
-
-  /** How many background scripts an agent may have running at once. */
-  private maxBackgroundScripts(): number {
-    return this.codeExecutionConfig?.maxBackgroundScripts ?? 3;
-  }
-
-  /** How many of this agent's background scripts are running now. */
-  private runningBackgroundScripts(agentName: string): number {
-    return [...this.backgroundScripts.values()].filter((s) => s.agentName === agentName && s.status === 'running').length;
-  }
-
-  /**
-   * Start a background script: dedicated interpreter, output journaled to a
-   * workspace file, wake_agent() available in-script. The tool result
-   * returns immediately; the script runs until it ends, hits the lifetime
-   * ceiling, or is cancelled. Scripts DIE WITH THE HOST PROCESS — that
-   * limitation is stated in the tool description so agents can calibrate
-   * how much to rely on an armed wake.
-   */
-  private startBackgroundScript(
-    agentName: string,
-    code: string,
-    injected: import('./code-execution/py-runner.js').InjectedTool[],
-    timeLimitMs?: number,
-    origin?: ScriptCallOrigin,
-  ): ToolResult {
-    // v1: primary-agent-only. A conversation fork's or ephemeral's daemon
-    // would outlive its owner and its wake would land in the primary
-    // conversation anyway — refuse loudly instead of surprising anyone.
-    if (!this.runsBackgroundScripts(agentName)) {
-      return {
-        success: false,
-        error: 'background scripts are available to the primary agent only',
-        isError: true,
-      };
-    }
-    const cfg = this.codeExecutionConfig;
-    const maxScripts = this.maxBackgroundScripts();
-    if (this.runningBackgroundScripts(agentName) >= maxScripts) {
-      return {
-        success: false,
-        error: `background script limit reached (${maxScripts} running). ` +
-          'Use code_execution {"action": "list"} to inspect and {"action": "cancel", "script_id": ...} to free a slot.',
-        isError: true,
-      };
-    }
-
-    const scriptId = `bg-${++this.backgroundScriptCounter}`;
-    // The agent's time_limit_ms (already capped) shortens the lifetime; it never extends it.
-    const lifetimeMs = timeLimitMs ?? cfg?.backgroundMaxLifetimeMs ?? 86_400_000;
-
-    // Journal: a file under the agent's first read-write workspace mount
-    // without an include (firstWritableMountName), so their existing
-    // read/grep/shell tools work on it. The runner appends the script's output
-    // to the materialized path as it reads it; watch-mode mounts sync it back
-    // to the chronicle tree on their usual cadence.
-    let logPath: string | null = null;
-    let logAbsPath: string | null = null;
-    const workspace = this.getWorkspaceModule();
-    if (workspace) {
-      const mountName = this.firstWritableMountName(workspace);
-      if (mountName) {
-        logPath = `${mountName}/background-scripts/${scriptId}.log`;
-        logAbsPath = workspace.resolveAbsolutePath(logPath);
-      }
-    }
-
-    const runner = new PyRunner({
-      pythonPath: cfg?.pythonPath,
-      toolCallTimeoutMs: cfg?.toolCallTimeoutMs,
-      scriptTimeoutMs: cfg?.scriptTimeoutMs,
-      idleReclaimMs: 0, // dedicated runner; lifetime is the exec deadline
-      env: cfg?.env,
-      inheritEnv: cfg?.inheritEnv,
-      label: `${agentName}:${scriptId}`,
-      onToolCall: (toolName, args) => this.handleScriptToolCall(agentName, toolName, args, origin),
-    });
-
-    const record: BackgroundScriptRecord = {
-      id: scriptId,
-      agentName,
-      runner,
-      code,
-      startedAt: Date.now(),
-      wakes: 0,
-      lastWakeAt: null,
-      logPath,
-      status: 'running',
-      cancelled: false,
-    };
-    this.backgroundScripts.set(scriptId, record);
-    this.emitTrace({
-      type: 'tool:started', module: 'code_execution', tool: `background:${scriptId}`,
-      callId: scriptId, input: { lines: code.split('\n').length },
-    });
-
-    void runner
-      .exec(code, injected, {
-        logPath: logAbsPath,
-        lifetimeMs,
-        onWake: (line, payload) => this.handleScriptWake(record, line, payload),
-      }, { ceilingMs: scriptTimeLimits(cfg ?? undefined).backgroundMaxMs })
-      .then((exec) => this.settleBackgroundScript(record, exec))
-      .catch((err) => {
-        // exec never rejects by contract; this is the belt-and-suspenders.
-        console.error(`[pytc:${agentName}:${scriptId}] background exec rejected: ${String(err)}`);
-        this.settleBackgroundScript(record, {
-          stdout: '', stderr: String(err), returnCode: 1, aborted: true,
-        });
-      });
-
-    return {
-      success: true,
-      data: {
-        status: 'background script started',
-        script_id: scriptId,
-        log: logPath ?? 'not kept in a file: background script logs go to a writable workspace mount without an include, and this setup has none. wake_agent() reaches you, and if the script dies, the last of its output reaches you too',
-        lifetime_hours: Math.round(lifetimeMs / 3_600_000 * 10) / 10,
-        lifetime: formatLimit(lifetimeMs), // exact for short limits, which lifetime_hours rounds to 0
-        note: 'The script dies if the host process restarts. Manage with code_execution {"action": "list"|"cancel"}.',
-      },
-    };
+    return surface
+      .filter((t) => t.name !== CODE_EXECUTION_TOOL_NAME)
+      .map((t) => ({ name: t.name, description: t.description ?? '', inputSchema: t.inputSchema }));
   }
 
   /**
    * The first read-write mount without an include, or null. The framework
-   * keeps its own files there (`tool-results/`, `refs/`,
-   * `background-scripts/`). A mount with an include holds only the files it
-   * names, so it would refuse them, and a setup whose only writable mount
-   * has one is treated as having none.
+   * keeps its own files there (`tool-results/`, `refs/`). A mount with an
+   * include holds only the files it names, so it would refuse them, and a
+   * setup whose only writable mount has one is treated as having none.
    */
   private firstWritableMountName(workspace: WorkspaceModule): string | null {
     const mounts = (workspace as unknown as {
@@ -20492,115 +20606,37 @@ export class AgentFramework {
   }
 
   /**
-   * wake_agent() from a background script: enforce the per-script wake cap
-   * and rate floor (delay, not drop — the script awaits the ack), then
-   * inject the provenance envelope + payload and request inference.
-   * Resolves null on delivery; an error string refuses the wake (raises
-   * RuntimeError inside the script).
+   * A script's word to its agent: a wake_agent() payload, or the ending of a
+   * left script that failed, crashed or was stopped at its limit. It enters
+   * the agent's context, spilled to the workspace past the agent's inline
+   * cap, with an inference request. Deliberately does NOT consult the event
+   * gate — the agent armed this wake themselves (wake-through-sleep
+   * authority); it enters tagged so gate policies could be taught about it
+   * later if that ever needs revisiting. Throws when it can't be delivered,
+   * so the script's wake_agent() says so.
    */
-  private async handleScriptWake(
-    record: BackgroundScriptRecord,
-    line: number,
-    payload: unknown,
-  ): Promise<string | null> {
-    if (record.cancelled) return 'script was cancelled';
-    const cfg = this.codeExecutionConfig;
-    const maxWakes = cfg?.maxWakesPerScript ?? 100;
-    if (record.wakes >= maxWakes) {
-      return `wake limit reached (${maxWakes} per script)`;
-    }
-    const floorMs = cfg?.wakeMinIntervalMs ?? 60_000;
-    if (record.lastWakeAt !== null) {
-      const wait = record.lastWakeAt + floorMs - Date.now();
-      if (wait > 0) {
-        await new Promise((r) => {
-          const t = setTimeout(r, wait);
-          (t as { unref?: () => void }).unref?.();
-        });
-        if (record.cancelled) return 'script was cancelled';
-      }
-    }
-    record.wakes += 1;
-    record.lastWakeAt = Date.now();
-
-    const elapsedMin = Math.round((Date.now() - record.startedAt) / 60_000);
-    const payloadJson = payload === undefined || payload === null
-      ? 'null'
-      : JSON.stringify(payload, null, 1) ?? String(payload);
-    const agent = this.agents.get(record.agentName);
-    // Same resolved cap as tool results (override applies here too); an
-    // unknown agent still gets the bounded house default, never unbounded.
+  private async scriptWake(agentName: string, scriptId: string, text: string, label: string): Promise<void> {
+    // A host that has begun to stop wakes no one.
+    if (this.stopHasBegun()) throw new Error('this host is stopping');
+    // An agent that has gone gets nothing, its drop logged once (noticeTargetFor).
+    if (!this.noticeTargetFor(agentName, `script ${scriptId} wake`)) throw new Error(`agent ${agentName} has no context to wake`);
+    const agent = this.agents.get(agentName);
     const maxChars = agent
       ? this.resolveToolResultInlineCap(agent).cap
       : DEFAULT_TOOL_RESULT_INLINE_MAX_CHARS;
-    const { text: payloadText } = await this.spillOrTruncate(
-      payloadJson, maxChars, `${record.id}-wake${record.wakes}`,
-    );
-
-    const envelope =
-      `[background script ${record.id}] Woke you: wake_agent() called at line ${line} of your script, ` +
-      `${elapsedMin}m after you started it (wake ${record.wakes} of ${maxWakes}).\n` +
-      `Arguments:\n${payloadText}\n` +
-      (record.logPath ? `Script output so far: workspace file ${record.logPath}\n` : '') +
-      `Script status: still running`;
-
-    this.injectScriptWake(record, envelope);
-    return null;
-  }
-
-  /** Background script ended (clean, crash, deadline, cancel/dispose). */
-  private settleBackgroundScript(
-    record: BackgroundScriptRecord,
-    exec: import('./code-execution/py-runner.js').ExecResult,
-  ): void {
-    record.runner.dispose();
-    if (record.status === 'running') {
-      record.status = exec.returnCode === 0 ? 'finished' : 'died';
-    }
-    this.emitTrace({
-      type: 'tool:completed', module: 'code_execution', tool: `background:${record.id}`,
-      callId: record.id, durationMs: Date.now() - record.startedAt,
-    });
-    // Crash honesty: a resident sleeping on a promise must never have that
-    // promise die silently. Deliberate cancels/disposes stay silent (the
-    // agent or host chose them); clean exits stay silent (the null path).
-    if (record.status === 'died' && !record.cancelled) {
-      const output = exec.tail ?? exec.stderr ?? '';
-      const tail = safeSlice(output, Math.max(0, output.length - 2000), output.length);
-      const elapsedMin = Math.round((Date.now() - record.startedAt) / 60_000);
-      const envelope =
-        `[background script ${record.id}] Your background script DIED ${elapsedMin}m after start ` +
-        `(it did not call wake_agent and is no longer watching).\n` +
-        `Last output:\n${tail || '(none)'}\n` +
-        (record.logPath ? `Full journal: workspace file ${record.logPath}` : '');
-      this.injectScriptWake(record, envelope);
-    }
-    // Keep a short memory of settled scripts for {"action":"list"}, then drop.
-    const settled = [...this.backgroundScripts.values()]
-      .filter((s) => s.agentName === record.agentName && s.status !== 'running');
-    for (const old of settled.slice(0, Math.max(0, settled.length - 5))) {
-      this.backgroundScripts.delete(old.id);
-    }
-  }
-
-  /**
-   * Deliver a background-script event: provenance envelope into the agent's
-   * context + an inference request. Deliberately does NOT consult the event
-   * gate — the agent armed this wake themselves (wake-through-sleep
-   * authority); it enters tagged so gate policies could be taught about it
-   * later if that ever needs revisiting.
-   */
-  private injectScriptWake(record: BackgroundScriptRecord, envelope: string): void {
-    const target = this.noticeTargetFor(record.agentName, `background-script ${record.id} wake`);
-    if (!target) return;
+    const { text: shown } = await this.spillOrTruncate(text, maxChars, `script-${label}`);
+    // The spill can take a while: the agent may have gone since, or the host begun to stop.
+    if (this.stopHasBegun()) throw new Error('this host is stopping');
+    const target = this.noticeTargetFor(agentName, `script ${scriptId} wake`);
+    if (!target) throw new Error(`agent ${agentName} has no context to wake`);
     try {
-      const messageId = this.addMessage('user', [{ type: 'text', text: envelope }], {
-        source: 'background-script',
-        scriptId: record.id,
+      const messageId = this.addMessage('user', [{ type: 'text', text: shown }], {
+        source: 'code-execution-script',
+        scriptId,
         tags: ['script:wake'],
       }, target);
       this.pendingRequests.push({
-        agentName: record.agentName,
+        agentName,
         reason: 'script:wake',
         source: 'code_execution',
         timestamp: Date.now(),
@@ -20608,12 +20644,11 @@ export class AgentFramework {
       this.emitTrace({
         type: 'message:added',
         messageId: messageId || 'deferred',
-        source: `background-script:${record.id}`,
+        source: `code-execution-script:${label}`,
       });
     } catch (err) {
-      console.error(
-        `[pytc:${record.agentName}:${record.id}] wake injection failed: ${err instanceof Error ? err.message : String(err)}`,
-      );
+      console.error(`[code_execution:${agentName}:${label}] wake injection failed: ${err instanceof Error ? err.message : String(err)}`);
+      throw err;
     }
   }
 
@@ -20894,83 +20929,87 @@ export class AgentFramework {
     };
   }
 
-  private getOrCreateScriptRunner(agentName: string): PyRunner {
-    let runner = this.codeExecutionRunners.get(agentName);
-    if (!runner) {
-      const cfg = this.codeExecutionConfig;
-      runner = new PyRunner({
-        pythonPath: cfg?.pythonPath,
-        toolCallTimeoutMs: cfg?.toolCallTimeoutMs,
-        scriptTimeoutMs: cfg?.scriptTimeoutMs,
-        idleReclaimMs: cfg?.idleReclaimMs,
-        env: cfg?.env,
-        inheritEnv: cfg?.inheritEnv,
-        label: agentName,
-        // The script that made the call is the one running when it arrives.
-        onToolCall: (toolName, args) =>
-          this.handleScriptToolCall(
-            agentName, toolName, args,
-            this.foregroundScriptOrigins.get(agentName),
-            this.scriptDeferredEndTurn.get(agentName),
-          ),
-      });
-      this.codeExecutionRunners.set(agentName, runner);
+  /**
+   * The bridge: one of a script's calls, as its agent's, through the ordinary
+   * dispatcher, so the agent's allowlist and every gate apply as they do to
+   * its own call: the bridge's half of adding nothing to what the agent's
+   * tools allow. Never rejects. A call the dispatcher refused before it
+   * opened (ToolResult.refused) reaches the script as a ToolRefused Error with
+   * the refusal's text; any other result, a failure included, reaches it in
+   * the one shape every tool answers (scriptResultAnswer).
+   */
+  private async scriptToolCall(
+    agentName: string,
+    toolName: string,
+    argsJson: string,
+    context: ScriptCallContext,
+  ): Promise<ToolAnswer> {
+    const refused = (message: string): ToolAnswer => ({
+      ok: false,
+      json: JSON.stringify({ name: 'ToolRefused', message, tool: toolName }),
+      brief: message,
+    });
+    // The child is untrusted: its arguments are checked here, though the
+    // prelude sends only an object's JSON.
+    let args: unknown;
+    let parsed = true;
+    try {
+      args = JSON.parse(argsJson);
+    } catch {
+      parsed = false;
     }
-    return runner;
+    const input = parsed && args !== null && typeof args === 'object' && !Array.isArray(args) ? args as Record<string, unknown> : undefined;
+    const refusal = toolName === CODE_EXECUTION_TOOL_NAME ? 'code_execution cannot be called from within a script; nothing was done'
+      : this.stopHasBegun() ? 'this host is stopping; nothing was done'
+      : !parsed ? `${toolName}'s arguments weren't JSON; nothing was done`
+      : input === undefined ? `${toolName}'s arguments must be an object; nothing was done`
+      : undefined;
+    // A call that reaches the host while a run or wait call watches the
+    // script (context.watch) counts toward that call's round (ScriptRound),
+    // however it turns out, as a direct call does: one refused here as one
+    // the allowedTools refuses (a skip_reply as refused, another call for
+    // nothing), and one the dispatcher refuses as roundCallOf reads it. The
+    // round reads its calls as a set, so each kind of call is kept once: the
+    // list stays as long as the agent's tool list, however many calls the
+    // script makes.
+    const roundCalls = context.watch ? this.scriptRoundCalls.get(context.watch) : undefined;
+    if (roundCalls) {
+      const counted = this.roundCallOf(agentName, { name: toolName, input }, refusal !== undefined);
+      if (!roundCalls.some((c) => c.name === counted.name && c.cause === counted.cause && c.refused === counted.refused)) roundCalls.push(counted);
+    }
+    if (refusal !== undefined) return refused(refusal);
+    const result = await this.dispatchScriptToolCall(
+      agentName, toolName, input as Record<string, unknown>,
+      context.origin as ScriptCallOrigin | undefined, context.watch?.turnId,
+    );
+    // Deferred: applied to the result of the code_execution call watching
+    // the script — ending the turn mid-script would cancel the stream while
+    // the script still runs and wedge the tool round. A call a left script
+    // makes ends no turn.
+    // The call watching when the result comes, which may be a later wait than
+    // the one this call was made under.
+    const watching = context.watching ? context.watching() : context.watch;
+    if (result.endTurn && watching) watching.endTurn = true;
+    if (result.refused) return refused(result.error ?? `${toolName} was refused; nothing was done`);
+    const answer = await this.scriptResultAnswer(result, toolName);
+    return SCRIPT_CALL_NO_RESULT.has(result) ? { ...answer, held: true } : answer;
   }
 
   /**
-   * Resolve one script-inner tool call to the string the script's tool
-   * function returns, and whether that result is an error (the script's
-   * `.is_error`). Never rejects: a failure without structured content becomes
-   * an "Error: ..." string, matching the managed PTC runtime ("Claude's code
-   * receives this error"), and a structured one its JSON object.
-   *
-   * A result without structured content is serialized with the HISTORY
-   * serializer: images become placeholders, since a script variable holding
-   * megabytes of base64 helps nobody. A result with structured content is
-   * one JSON object holding both of the server's views
-   * (scriptStructuredResult), so its content blocks reach the script as the
-   * dispatch gave them, images and payloads included. A module's result that
-   * can't be stored or sent, such as a cyclic object or a BigInt, is already
-   * an error naming the tool when the dispatch returns it (storableToolResult),
-   * so a script reads that error's text.
+   * A dispatched result as a script receives it: `{ content, structuredContent,
+   * isError }`, one shape for every tool. `content` is
+   * what the model would read: a structured result's blocks as the dispatch
+   * gave them (the direct reading, with RFC-005's treatment of an MCPL peer's
+   * blocks), and otherwise one text block of the model's text, which for a
+   * failure is its error. `structuredContent` is the tool's own structured
+   * content where it sent one, `false`, `0` and `null` included, else null.
+   * A result that can't be converted to JSON (a cyclic object, a BigInt),
+   * which the dispatch's own check makes unlikely here, is a failure naming
+   * the tool and saying the call itself completed.
    */
-  private async handleScriptToolCall(
-    agentName: string,
-    toolName: string,
-    args: Record<string, unknown>,
-    origin?: ScriptCallOrigin,
-    /** The foreground script that made the call; none for a background script. */
-    script?: { endTurn: boolean; turnId?: number; calls: RoundCall[] },
-  ): Promise<ScriptToolResult> {
-    if (toolName === CODE_EXECUTION_TOOL_NAME) {
-      return { text: 'Error: code_execution cannot be called from within a script', isError: true };
-    }
-    // The call counts toward its round's routing however it turns out, as a
-    // direct call does: a refused skip_reply as refused, and another call the
-    // agent's allowedTools refuses for nothing.
-    script?.calls.push(this.roundCallOf(agentName, { name: toolName, input: args }));
-    // A foreground script's call was made in the turn of the code_execution
-    // call whose script is running when it arrives. A background script runs
-    // apart from any turn, so its calls carry none.
-    const result = await this.dispatchScriptToolCall(agentName, toolName, args, origin, script?.turnId);
-    if (result.endTurn && script) {
-      // Deferred: applied to the final code_execution result (see
-      // scriptDeferredEndTurn) — ending the turn mid-script would cancel the
-      // stream while the script still runs and wedge the tool round.
-      script.endTurn = true;
-    }
-    // An MCP structured result reaches the script whole, as one JSON object,
-    // so code can use structuredContent directly and doesn't have to parse
-    // it back out of text.
+  private async scriptResultAnswer(result: ToolResult, toolName: string): Promise<ToolAnswer> {
     const structured = Object.prototype.hasOwnProperty.call(result, 'structured');
-    if (result.isError && !structured) {
-      return { text: `Error: ${result.error ?? 'tool call failed'}`, isError: true };
-    }
-    if ((result.data === undefined || result.data === null) && !structured) {
-      return { text: nonErrorResultText(result, AgentFramework.SCRIPT_RESULT_MAX_CHARS), isError: false };
-    }
+    const isError = result.isError === true;
     // RFC-005 "eagerly lazy": a script receiving a result is the strongest
     // available signal that the bytes are wanted (scripts process, they do
     // not browse), so the stub the script receives carries a workspace path
@@ -20983,7 +21022,9 @@ export class AgentFramework {
     // itself has no server, so its fetch is refused (and logged here) and the
     // script gets its stub, as it does for a reference nested in other data,
     // which isn't fetched.
-    if (Array.isArray(result.data) && this.resolveMcplTool(toolName) === null) {
+    // Whenever the result's blocks reach the script: a structured failure's
+    // included, as a module's error can carry content.
+    if ((!isError || structured) && Array.isArray(result.data) && this.resolveMcplTool(toolName) === null) {
       const fetcher = this.getReferenceFetcher();
       for (const block of result.data) {
         const c = classifyBlock(block);
@@ -20994,74 +21035,47 @@ export class AgentFramework {
         if (!outcome.ok) console.error(`[rfc005] script-demand fetch of ${record.refId} failed: ${outcome.error}`);
       }
     }
-    // Scripts get (nearly) full data — the script environment IS the spill:
-    // filtering big results in code is the whole point. As in history, a
-    // reference is its stub at any depth and inline data claiming a uri or a
-    // disposition is withheld (RFC-005). 5MB protocol safety cap only; no
-    // context-cap truncation, no file spill.
-    if (structured) return this.scriptStructuredResult(result, toolName);
-    try {
-      return { text: toolResultDataToHistoryString(result.data, AgentFramework.SCRIPT_RESULT_MAX_CHARS), isError: false };
-    } catch (err) {
-      return { text: `Error: ${unconvertibleScriptResult(toolName, err)}`, isError: true };
-    }
-  }
-
-  /** The 5MB protocol safety cap on what a script receives. */
-  private static readonly SCRIPT_RESULT_MAX_CHARS = 5_000_000;
-
-  /**
-   * A structured MCP result as a script receives it: one JSON object holding
-   * both of the server's views, `{ content, structuredContent, isError }`,
-   * plus `error` (the text) on a tool error. `content` is the content array
-   * the dispatch gave this call (the direct reading): the server's blocks as
-   * sent, so payloads and images survive, except that an MCPL peer's blocks
-   * get the treatment RFC-005 gives them on every lane the model reads
-   * (referenceBlockForScript). `structuredContent` is the tool's own JSON, as
-   * sent. Past the size cap the result stays valid JSON: the whole object is
-   * saved to the workspace, and the script gets
-   * `{ isError, oversized: { chars, savedTo } }`. If it can't be saved, the
-   * script gets a failure to materialize the result, saying the tool may
-   * already have completed, never a success missing its result. A result
-   * that can't be converted to JSON (a cyclic object, a BigInt), which the
-   * dispatch's own check makes unlikely here, gets the same object empty,
-   * `{ content: [], structuredContent: null, isError: true, error }`, the
-   * error naming the tool. In every form, the script's `.is_error` is the
-   * `isError` of the object its string holds, and its `.structured` is read
-   * from that string.
-   */
-  private async scriptStructuredResult(result: ToolResult, toolName: string): Promise<ScriptToolResult> {
-    const asSent = <T extends { isError: boolean }>(value: T, json: string = JSON.stringify(value)): ScriptToolResult =>
-      ({ text: json, isError: value.isError, structuredJson: true });
-    const object = {
-      content: Array.isArray(result.data) ? result.data : [],
-      structuredContent: result.structured,
-      isError: result.isError === true,
-      ...(result.isError ? { error: result.error ?? '' } : {}),
+    const failed = (err: unknown): ToolAnswer => {
+      const error = unconvertibleScriptResult(toolName, err, isError ? result.error : undefined);
+      return {
+        ok: true,
+        json: JSON.stringify({ content: [{ type: 'text', text: error }], structuredContent: null, isError: true }),
+        isError: true,
+        brief: error,
+      };
     };
+    let content: unknown[];
+    let text: string | undefined;
+    // A structured result's blocks, as #538 gives them: none when its content
+    // isn't a list, the structured view carrying the result. A failure with
+    // no blocks reads as its error text.
+    if (structured && (!isError || (Array.isArray(result.data) && result.data.length > 0))) {
+      content = Array.isArray(result.data) ? result.data : [];
+    } else {
+      // As in history, a reference is its stub at any depth and inline data
+      // claiming a uri or a disposition is withheld (RFC-005).
+      try {
+        text = isError
+          ? result.error ?? 'tool call failed'
+          : result.data === undefined || result.data === null
+            ? nonErrorResultText(result)
+            : toolResultDataToHistoryString(result.data);
+      } catch (err) {
+        return failed(err);
+      }
+      content = [{ type: 'text', text }];
+    }
     let json: string;
     try {
-      json = JSON.stringify(object);
+      json = JSON.stringify({
+        content,
+        structuredContent: structured && result.structured !== undefined ? result.structured : null,
+        isError,
+      });
     } catch (err) {
-      const error = unconvertibleScriptResult(toolName, err, result.isError ? result.error : undefined);
-      return asSent({ content: [], structuredContent: null, isError: true, error });
+      return failed(err);
     }
-    if (json.length <= AgentFramework.SCRIPT_RESULT_MAX_CHARS) return asSent(object, json);
-    const workspace = this.getWorkspaceModule();
-    const mount = workspace ? this.firstWritableMountName(workspace) : null;
-    if (workspace && mount) {
-      const path = `${mount}/tool-results/${new Date().toISOString().slice(0, 10)}-script-${randomUUID()}.json`;
-      const written = await workspace.writeBinary(path, Buffer.from(json, 'utf8'), 'application/json').catch(() => null);
-      if (written?.success) {
-        return asSent({ isError: object.isError, oversized: { chars: json.length, savedTo: path } });
-      }
-    }
-    return asSent({
-      isError: true,
-      error: `the result (${json.length} chars) exceeds the ${AgentFramework.SCRIPT_RESULT_MAX_CHARS}-char script result cap ` +
-        `and could not be saved to the workspace, so it could not be delivered; the tool may already have completed`,
-      oversized: { chars: json.length, savedTo: null },
-    });
+    return { ok: true, json, isError, brief: text ?? scriptResultBrief(content) };
   }
 
   /**
@@ -21084,20 +21098,26 @@ export class AgentFramework {
   ): Promise<ToolResult> {
     return new Promise<ToolResult>((resolve) => {
       const callId = `pytc-${randomUUID()}`;
-      // Host-side leak guard: the python runtime already raises TimeoutError
-      // at toolCallTimeoutMs; this only reclaims the waiter if a dispatch path
-      // loses the result entirely (so the map cannot grow unboundedly).
-      const safetyMs = (this.codeExecutionConfig?.toolCallTimeoutMs ?? 270_000) + 30_000;
+      // Host-side leak guard: the script's runner already gives the script a
+      // TimeoutError at toolCallTimeoutMs; this only reclaims the waiter if a
+      // dispatch path loses the result entirely (so the map cannot grow
+      // unboundedly).
+      // At most the longest a timer can wait, which a longer delay overflows to fire at once.
+      const safetyMs = Math.min((this.codeExecution?.settings.toolCallTimeoutMs ?? 270_000) + 30_000, 2_147_483_647);
       const safety = setTimeout(() => {
         if (this.scriptToolWaiters.delete(callId)) {
           // RFC-007: no result reached the host — the call failed.
           this.toolLifecycleEmitter?.markDispatchFailure(agentName, callId);
           this.toolLifecycleEmitter?.onResult(agentName, callId, undefined);
-          resolve({
+          const noResult: ToolResult = {
             success: false,
             error: `tool '${toolName}' produced no result within ${Math.round(safetyMs / 1000)}s`,
             isError: true,
-          });
+          };
+          // The tool may still be running, or its result was lost: the
+          // script's runner keeps its place taken (ToolAnswer.held).
+          SCRIPT_CALL_NO_RESULT.add(noResult);
+          resolve(noResult);
         }
       }, safetyMs);
       safety.unref?.();
@@ -21132,12 +21152,39 @@ export class AgentFramework {
     });
   }
 
-  /** Abort the agent's script, running or still starting, when the turn it belongs to ends or is reset to run again. */
-  private abortAgentScript(agentName: string, reason: string): void {
-    const runner = this.codeExecutionRunners.get(agentName);
-    if (runner?.busy) {
-      runner.abort(reason);
-    }
+  /**
+   * A stream's turn ended without its calls' answers, or is reset to run
+   * again (a stream cancelled, failed or waiting on its provider): the
+   * agent's scripts take it as an abandoned end of that stream's turn
+   * (AgentScripts.turnEnded). A quiesce abandons its stream's own turn (or
+   * every turn, when it has none to name), and the host stopping every turn
+   * of the agent's (`'every'`).
+   */
+  private abandonAgentScripts(agentName: string, reason: string, stream: TurnRouting | 'every'): void {
+    this.codeExecution?.scripts.turnEnded(
+      agentName,
+      stream === 'every' ? 'every' : { id: stream.turnId, live: this.liveTurns(agentName, stream) },
+      true,
+      reason,
+    );
+  }
+
+  /**
+   * The agent's turns still live, for its scripts (AgentScripts.turnEnded):
+   * its open logical turn, and the turn of its start in progress, unless
+   * that's `ending`'s or has settled. A start is in progress while it holds
+   * the agent's turn token, from its dequeue through its hooks, compile,
+   * stream and restarts to its settled teardown (activeTurnTokens); its turn
+   * ends at its settle, and the teardown after it, such as its speech's
+   * delivery, is no longer the turn's (settledTurns).
+   */
+  private liveTurns(agentName: string, ending: TurnRouting | undefined): number[] {
+    const live: number[] = [];
+    const open = this.openLogical.get(agentName);
+    if (open) live.push(open.turnId);
+    const latest = this.turnRouting.get(agentName);
+    if (latest && latest !== ending && latest !== open && !this.settledTurns.has(latest) && this.activeTurnTokens.has(agentName)) live.push(latest.turnId);
+    return live;
   }
 
   private toMembraneToolResult(
@@ -21285,12 +21332,14 @@ export class AgentFramework {
   /**
    * A tool call's resultMaxChars: how long its result may be and still reach
    * its caller whole. A call from a running script resolves to the script,
-   * which takes up to SCRIPT_RESULT_MAX_CHARS. Any other call's result
-   * is stored in its agent's context under the agent's inline cap, and a call
-   * for an agent the framework doesn't hold gets the house default.
+   * which takes any result that fits its memory (scriptResultMaxChars). Any
+   * other call's result is stored in its agent's context under the agent's
+   * inline cap, and a call for an agent the framework doesn't hold gets the
+   * house default.
    */
   private resultMaxCharsFor(agentName: string, callId: string): number {
-    if (this.scriptToolWaiters.has(callId)) return AgentFramework.SCRIPT_RESULT_MAX_CHARS;
+    const ce = this.codeExecution;
+    if (ce && this.scriptToolWaiters.has(callId)) return scriptResultMaxChars(ce.settings.memoryMaxBytes);
     const agent = this.agents.get(agentName);
     return agent ? this.resolveToolResultInlineCap(agent).cap : DEFAULT_TOOL_RESULT_INLINE_MAX_CHARS;
   }
@@ -21514,16 +21563,29 @@ export class AgentFramework {
 
   private agentToolPermissionFailure(agentName: string, call: ToolCall, reportRefusal = true): ToolResult | undefined {
     if (this.canAgentUseTool(agentName, call.name)) return undefined;
-    const error = !this.agents.has(agentName) && this.usedEphemeralAgentNames.has(agentName)
-      ? `Caller '${agentName}' is not a running agent; framework-created agents have tool authority only while registered.`
-      : `Tool '${call.name}' is not permitted by this agent's allowedTools.`;
-    if (reportRefusal) {
-      this.toolLifecycleEmitter?.refuse(agentName, call.id);
-      this.emitTrace({
-        type: 'tool:failed', module: 'framework', tool: call.name, callId: call.id, error,
-      });
-    }
-    return { success: false, error, isError: true };
+    const why = !this.agents.has(agentName) && this.usedEphemeralAgentNames.has(agentName)
+      ? `Caller '${agentName}' is not a running agent; framework-created agents have tool authority only while registered`
+      : `Tool '${call.name}' is not permitted by this agent's allowedTools`;
+    // Off the dispatcher, nothing opened the call to refuse it in RFC-007's
+    // lifecycle, so it's a failure, not a refusal (ToolResult.refused), whose
+    // text says the call didn't run.
+    if (!reportRefusal) return { success: false, error: `${why}, so the call didn't run.`, isError: true };
+    const error = `${why}.`;
+    const refusal = this.refusedResult(agentName, call.id, error);
+    this.emitTrace({
+      type: 'tool:failed', module: 'framework', tool: call.name, callId: call.id, error,
+    });
+    return refusal;
+  }
+
+  /**
+   * A dispatched call answered without running its tool. RFC-007's lifecycle
+   * forgets it, and its result says it was refused (`ToolResult.refused`), both
+   * from here, so the two can't disagree.
+   */
+  private refusedResult(agentName: string, callId: string, error: string): ToolResult {
+    this.toolLifecycleEmitter?.refuse(agentName, callId);
+    return { success: false, error, isError: true, refused: true };
   }
 
   /**
@@ -21532,10 +21594,11 @@ export class AgentFramework {
    * any wake_in_seconds; with one, a wake_in_seconds that isn't a number of
    * seconds. Only when the channel registry handles skip_reply. The dispatch
    * that refuses the call reads it here, and so does the turn's bookkeeping of
-   * a refused round (roundCallOf), for the model's calls and its foreground
-   * script's: the silence before it, which comes back after its round, and in
-   * XML mode which round's prose stays private. A skip_reply round's own
-   * prose stays private by the tool's name, refused or not.
+   * a refused round (roundCallOf), for the model's calls and a script's calls
+   * that reach the host while a call of the round watches it: the silence
+   * before it, which comes back after its round, and in XML mode which round's
+   * prose stays private. A skip_reply round's own prose stays private by the
+   * tool's name, refused or not.
    */
   private skipReplyRefusal(call: { name?: string; input?: unknown }): string | undefined {
     if (call.name !== 'skip_reply' || !this.channelRegistry) return undefined;
@@ -21547,16 +21610,18 @@ export class AgentFramework {
   }
 
   /**
-   * A call as its round's routing counts it, made directly or by the round's
-   * foreground script. A skip_reply refused, because the agent's allowedTools
+   * A call as its round's routing counts it, made directly, or by a script
+   * and reaching the host while a run or wait call of the round watches it
+   * (ScriptRound). A skip_reply refused, because the agent's allowedTools
    * doesn't name it or because this host can't set the wake it asks for, is
-   * marked refused: it keeps its own round private and silences nothing
-   * after it. A refusal withholds the call's effect, not the model's choice
-   * to keep its words private. Any other call the list refuses posted
-   * nothing, so it gives no cause.
+   * marked refused: it keeps its own round private and silences nothing after
+   * it. A refusal withholds the call's effect, not the model's choice to keep
+   * its words private. Any other call the list refuses posted nothing, so it
+   * gives no cause. A script's call the bridge refuses before dispatch
+   * (`refusedHere`) counts as one the list refuses.
    */
-  private roundCallOf(agentName: string, call: { name: string; input?: unknown }): RoundCall {
-    const permitted = this.canAgentUseTool(agentName, call.name);
+  private roundCallOf(agentName: string, call: { name: string; input?: unknown }, refusedHere = false): RoundCall {
+    const permitted = !refusedHere && this.canAgentUseTool(agentName, call.name);
     const refused = bareToolName(call.name) === 'skip_reply' && (!permitted || this.refusesSelfWake(call));
     return { name: call.name, cause: permitted || refused ? silenceCauseOf([call]) : null, refused };
   }
@@ -21564,9 +21629,9 @@ export class AgentFramework {
   /**
    * Dispatch a call the agent made. `turnId` is the turn it was made in
    * (TurnRouting.turnId), as its caller knows it: a model's call, the turn
-   * whose stream made it; a foreground script's inner call, the turn of the
-   * code_execution call whose script is running when the call arrives. A
-   * background script's call has none.
+   * whose stream made it; a script's call, the turn of the code_execution
+   * call watching the script when the call reaches the host. A call of a
+   * script left running, which no call watches, has none.
    */
   private dispatchToolCall(agentName: string, call: ToolCall, turnId?: number): void {
     const refusal = this.agentToolPermissionFailure(agentName, call);
@@ -21702,9 +21767,9 @@ export class AgentFramework {
         if (error !== undefined) {
           const wakeValue = (enrichedCall.input as { wake_in_seconds?: unknown } | null | undefined)?.wake_in_seconds;
           console.error(`[self-wake] agent=${agentName} wake_in_seconds=${logValue(wakeValue)} skip_reply refused: ${logDetail(this.eventGate ? "wake_in_seconds isn't a number of seconds" : 'No EventGate configured (FrameworkConfig.gate is unset)')}`);
-          this.toolLifecycleEmitter?.refuse(agentName, enrichedCall.id);
+          const result = this.refusedResult(agentName, enrichedCall.id, error);
           this.emitTrace({ type: 'tool:failed', module: 'channels', tool: enrichedCall.name, callId: enrichedCall.id, error });
-          this.pushEvent({ type: 'tool-result', callId: enrichedCall.id, toolName: enrichedCall.name, agentName, moduleName: 'channels', result: { success: false, error, isError: true } });
+          this.pushEvent({ type: 'tool-result', callId: enrichedCall.id, toolName: enrichedCall.name, agentName, moduleName: 'channels', result });
           return;
         }
         const wake = readSkipReplyWake(enrichedCall.input);
@@ -21717,10 +21782,10 @@ export class AgentFramework {
       return;
     }
 
-    // Client-side programmatic tool calling: run a python script that calls
-    // the agent's other tools in-process (script-inner calls come back through
+    // Client-side programmatic tool calling: run a script that calls the
+    // agent's other tools in-process (script-inner calls come back through
     // this very dispatcher with waiter-tracked call IDs).
-    if (enrichedCall.name === CODE_EXECUTION_TOOL_NAME && this.codeExecutionConfig) {
+    if (enrichedCall.name === CODE_EXECUTION_TOOL_NAME && this.codeExecution) {
       this.dispatchCodeExecutionToolCall(agentName, enrichedCall);
       return;
     }
@@ -22022,8 +22087,10 @@ export class AgentFramework {
     if (this.deferredMessages.length === 0) return [];
     // A fork or run deregistered while the host is quiesced leaves its queue
     // to its window's release at resume (runReleasesAfterResume, which clears
-    // the name first): drained by any other flush, its entries would meet no
-    // registered agent, be dropped, and be acked.
+    // the name first), which stores its writes in that window, or to stop()'s
+    // pass for postponed releases, which clears the name and sends them as
+    // boot would. Drained by any other flush meanwhile, they would meet no
+    // registered agent and be dropped, or written into a window no one reads.
     if (this.releasesAfterResume.has(agentName)) return [];
     const mine: typeof this.deferredMessages = [];
     const rest: typeof this.deferredMessages = [];
@@ -22316,12 +22383,29 @@ export class AgentFramework {
    *  it again, in queue order and cut per target (writeDrainedInOrder). With
    *  `bypassDeferral`, each is stored past its target's deferral (stop()).
    *  With `traceAs`, each one stored is traced as `message:added` from that
-   *  source, in queue order. A write that threw after storing missed the
-   *  notes addMessage takes after a store, so they're taken for what landed
-   *  as soon as it's found, before the writes after it: an open turn's
-   *  arrivals keep the order the writes landed in, and its newest stays the
-   *  newest (remainingArrival). */
-  private readdDrained(entries: DeferredWrite[], where: string, opts?: { bypassDeferral?: boolean; traceAs?: string }): DeferredWrite[] {
+   *  source, in queue order. A write that threw after storing missed the notes addMessage takes after a
+   *  store, so they're taken for what landed as soon as it's found, before
+   *  the writes after it: an open turn's arrivals keep the order the writes
+   *  landed in, and its newest stays the newest (remainingArrival).
+   *
+   *  A target no longer registered (a fork or a run that has ended, here or
+   *  before a crash) has no window to land in: a failed reply it never read
+   *  becomes the primary's by-name notice, under the entry's own id and
+   *  place in the queue (queuedFailedReplyForPrimary), and is written with
+   *  the rest; any other write is dropped, logged, by addMessage. */
+  private readdDrained(drained: DeferredWrite[], where: string, opts?: { bypassDeferral?: boolean; traceAs?: string }): DeferredWrite[] {
+    let passed = 0;
+    const entries = drained.flatMap((msg) => {
+      if (msg.forAgent === undefined || this.agents.has(msg.forAgent)) return [msg];
+      if ((msg.metadata as { kind?: unknown } | undefined)?.kind !== 'discord-send-failed') return [msg];
+      const forPrimary = this.queuedFailedReplyForPrimary(msg.forAgent, msg);
+      if (!forPrimary) return [];
+      passed++;
+      return [forPrimary];
+    });
+    if (passed > 0) {
+      console.error(`[deferred-flush] ${where}: ${passed} failed repl${passed === 1 ? 'y' : 'ies'} of an agent that has ended passed to the primary`);
+    }
     const bypassFor = (msg: DeferredWrite): string | undefined =>
       opts?.bypassDeferral ? this.deliveryAgent(msg.forAgent)?.name : undefined;
     const written = this.writeDrainedInOrder(entries, where, (msg) =>
@@ -22341,8 +22425,8 @@ export class AgentFramework {
 
   /**
    * Where a notice about an agent's own action belongs: its failed reply, its
-   * bounced prose (beside its `{{unsent}}` clipboard), its background script's
-   * wake, the notices about its drafts. Every registered agent's notice is
+   * bounced prose (beside its `{{unsent}}` clipboard), its script's wake, the
+   * notices about its drafts. Every registered agent's notice is
    * addressed to that agent, so it lands in the window that agent reads and
    * waits on that agent's own turn, stream and tool cycle: a conversation
    * fork or an ephemeral run reads only its isolated slot, and a resident's
@@ -22373,19 +22457,22 @@ export class AgentFramework {
    * its window above its consumed watermark (flushed there at its turn's end,
    * or stored while it was idle) and not heard at a tool boundary, and each
    * one still queued for it. Writes still
-   * queued would wait for a boundary it never reaches, and the flush that
-   * finds it gone would drop them, so they land in its own window now, which
-   * Chronicle keeps for investigation. One whose earlier write may have
-   * landed (`landing` unknown) is looked up there by its id first: found,
-   * it's neither stored again nor passed to the primary; where the store
-   * can't be searched, it's stored anyway, with a line saying it may now be
-   * stored twice, or, where storing it fails too, that it may be stored
-   * once, twice or not at all. Its stream is over or cancelled, so it
-   * compiles nothing more. One path still stores after these writes: a
-   * `complete` that arrived while the agent still waited for tools awaits
-   * the spill of its last tool results, and stores them once that resolves,
-   * even if a watchdog has ended the run meanwhile. A tool boundary stores
-   * nothing for a round whose turn was stopped while its results were
+   * queued would wait for a boundary it never reaches, and a flush that
+   * finds it gone would drop all but its failed replies, so they land in its
+   * own window now, which Chronicle keeps for investigation. One whose
+   * earlier write may have landed (`landing` unknown) is looked up there by
+   * its id first: found, it's neither stored again nor passed to the
+   * primary; where the store can't be searched, it's stored anyway, with a
+   * line saying it may now be stored twice, or, where storing it fails too,
+   * that it may be stored once, twice or not at all. Its stream is over or
+   * cancelled, or, when stop() ends it, may still run past its cancel, and
+   * then drops each event that comes after the agent has left (driveStream);
+   * a turn of its still assembling or compiling, as when stop() ends it,
+   * drops before it sends anything. One path still stores after these
+   * writes: a `complete` that arrived while the agent still waited for tools
+   * awaits the spill of its last tool results, and stores them once that
+   * resolves, even if a watchdog has ended the run meanwhile. A tool boundary
+   * stores nothing for a round whose turn was stopped while its results were
    * prepared.
    */
   private releaseWindow(agent: Agent): void {
@@ -22562,13 +22649,21 @@ export class AgentFramework {
    * its own id and seq, now addressed to the primary. Written through the
    * drain, it lands stamped with that id, or waits in the queue under it, so
    * boot's exactly-once holds for it: a crash before the original's ack
-   * replays one entry, never the original and a separate notice. null when no
-   * one is told (logged): a reply that had no channel to reach, or no primary.
+   * replays one entry, never the original and a separate notice. An entry
+   * marked as one whose earlier write may have landed (`landing`) keeps the
+   * mark, so before it's written it's looked up by its id in the primary's
+   * window, where it would land now (writeDrainedInOrder). A release has
+   * looked in the speaker's own window first (releaseWindow). null when no
+   * one is told (logged): a reply that had no channel to reach, or no
+   * primary.
    */
   private queuedFailedReplyForPrimary(speaker: string, msg: DeferredWrite): DeferredWrite | null {
     const notice = this.failedReplyNoticeForPrimary(speaker, msg.metadata);
     if (!notice) return null;
-    return { id: msg.id, seq: msg.seq, participant: 'user', content: notice.content, metadata: notice.metadata, heldAt: msg.heldAt };
+    return {
+      id: msg.id, seq: msg.seq, participant: 'user', content: notice.content, metadata: notice.metadata, heldAt: msg.heldAt,
+      ...(msg.landing ? { landing: msg.landing } : {}),
+    };
   }
 
   /** The primary's by-name notice of `speaker`'s failed reply, or null when no
@@ -26747,21 +26842,20 @@ export class AgentFramework {
 
     if ((!modern && !server) || this.modernStillConnecting(modern)) {
       // RFC-007: refused before executing — no lifecycle events.
-      this.toolLifecycleEmitter?.refuse(agentName, call.id);
       this.pushEvent({
         type: 'tool-result',
         callId: call.id,
         toolName: call.name,
         agentName,
         moduleName: `mcpl:${serverId}`,
-        result: { success: false, error: this.mcplServerAbsentText(serverId, call.name), isError: true },
+        result: this.refusedResult(agentName, call.id, this.mcplServerAbsentText(serverId, call.name)),
       });
       return;
     }
 
     const config = this.mcplServerConfigs.get(serverId);
     if (!isToolAllowed(toolName, config)) {
-      this.toolLifecycleEmitter?.refuse(agentName, call.id);
+      const result = this.refusedResult(agentName, call.id, mcplToolDeniedText(serverId, call.name));
       this.emitTrace({ type: 'tool:failed', module: `mcpl:${serverId}`, tool: toolName, callId: call.id, error: 'denied by tool policy' });
       this.pushEvent({
         type: 'tool-result',
@@ -26769,7 +26863,7 @@ export class AgentFramework {
         toolName: call.name,
         agentName,
         moduleName: `mcpl:${serverId}`,
-        result: { success: false, error: mcplToolDeniedText(serverId, call.name), isError: true },
+        result,
       });
       return;
     }
@@ -26791,6 +26885,8 @@ export class AgentFramework {
       this.emitTrace({ type: 'tool:failed', module: `mcpl:${serverId}`, tool: toolName, callId: call.id, error: err.message, stack: err.stack });
       // RFC-007: transport error, closed connection or timeout — no result.
       this.toolLifecycleEmitter?.markDispatchFailure(agentName, call.id);
+      // A request that couldn't be written is a failure, not a refusal: the
+      // call had opened (RFC-007), and its error says it wasn't sent.
       this.pushEvent({
         type: 'tool-result',
         callId: call.id,
@@ -27108,7 +27204,7 @@ export class AgentFramework {
     if (home) {
       const reject = (error: string): void => {
         // RFC-007: the guard refuses before the tool runs — no lifecycle events.
-        this.toolLifecycleEmitter?.refuse(agentName, call.id);
+        const result = this.refusedResult(agentName, call.id, error);
         this.emitTrace({
           type: 'tool:failed', module: 'channels', tool: call.name, callId: call.id,
           error: `conversation agent ${agentName}: ${error}`,
@@ -27119,7 +27215,7 @@ export class AgentFramework {
           toolName: call.name,
           agentName,
           moduleName: 'channels',
-          result: { success: false, error, isError: true },
+          result,
         });
       };
 
@@ -27642,9 +27738,10 @@ export class AgentFramework {
    * every sibling in the round to settle; if one never does, fail closed
    * rather than trust an index the batch may still change. Sibling saves
    * produce no images and are not waited on (two saves in one batch would
-   * otherwise deadlock into a double timeout). Script-inner calls
-   * (`pytc-…`) run sequentially inside their script host and skip the
-   * barrier — the host call itself is the only pending sibling they'd see.
+   * otherwise deadlock into a double timeout). A script's own calls
+   * (`pytc-…`) skip the barrier: the batch's pending siblings include the
+   * code_execution call running that script, so waiting on them would wait
+   * on itself.
    */
   private async awaitSiblingToolCalls(agent: Agent, call: ToolCall): Promise<void> {
     if (call.id.startsWith('pytc-')) return;
@@ -28095,7 +28192,7 @@ export class AgentFramework {
       case 'run': {
         const def = allUtilities.find((u) => u.name === input.name);
         if (!def) {
-          return { success: false, isError: true, error: `No utility "${String(input.name)}". ${available()}` };
+          return { success: false, isError: true, error: `No utility "${String(input.name)}", so nothing was done. ${available()}` };
         }
         if (!options.trustedModule) {
           // The allowed outer utils call owns its lifecycle and terminal trace;

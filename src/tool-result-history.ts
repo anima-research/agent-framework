@@ -49,7 +49,7 @@ export interface HistorySerializeOptions {
 
 /**
  * House-safe default inline cap (chars) for tool results, error results, and
- * background-script wake payloads (issue #89: a resident should never eat a
+ * script wake payloads (issue #89: a resident should never eat a
  * 42k blob they didn't ask for). Durable per-residence value comes from
  * `FrameworkConfig.toolResultInlineMaxChars`; a per-agent value from
  * agent_settings `tool_result_inline_max_chars`.

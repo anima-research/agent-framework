@@ -21,7 +21,8 @@ import { MockMembrane, MockYieldingStream, createMockResponse } from './helpers/
 // A module can tell one turn's work from another's: the tool calls made in an
 // agent's turn carry the turn's id (`ToolCall.callerTurnId`), its speech
 // carries the same id (`SpeechContext.turnId`), the agent's next turn has a
-// new one, and a background script's call carries none.
+// new one, and a call of a script left running, which no call watches,
+// carries none.
 
 class TurnRecorder implements Module {
   readonly name = 'test';
@@ -219,7 +220,7 @@ test('a script\'s inner calls carry the turn of the code_execution call that run
     queueToolTurn(membrane, {
       id: 'call-ce',
       name: 'code_execution',
-      input: { code: 'await test__echo({"message": "first"})\nawait test__echo({"message": "second"})' },
+      input: { code: 'await tools["test--echo"]({ message: "first" });\nawait tools["test--echo"]({ message: "second" });' },
     });
     await runTurn(framework, 'go');
     const inner = recorder.calls.filter((c) => String(c.id).startsWith('pytc-'));
@@ -298,12 +299,12 @@ test('a dispatched call carries the turn it is dispatched with, or none, whateve
   });
 });
 
-test('a background script\'s call carries no turn, even while a foreground script of a turn runs', async () => {
+test('a left script\'s call carries no turn, even while a script a turn waits on runs', async () => {
   await withFramework({ codeExecution: true }, async ({ framework, membrane, recorder }) => {
-    // One round starts a background script and a foreground script. The
-    // background script's first call waits in the module until the foreground
-    // script's call is there; its second call is dispatched while the
-    // foreground script waits for that call's result, which waits for it.
+    // One round starts a script that yields at once, left running, and one
+    // the turn waits on. The left script's first call waits in the module
+    // until the other script's call is there; its second call is dispatched
+    // while the other script waits for that call's result, which waits for it.
     const foregroundCalled = signal();
     const backgroundCalledDuring = signal();
     recorder.onCall = async (call) => {
@@ -318,10 +319,10 @@ test('a background script\'s call carries no turn, even while a foreground scrip
     membrane.pushResponse(createMockResponse([
       { type: 'text', text: 'starting both' },
       { type: 'tool_use', id: 'call-bg', name: 'code_execution', input: {
-        background: true,
-        code: 'await test__echo({"message": "background, first"})\nawait test__echo({"message": "background, during"})',
+        yield_time_ms: 0,
+        code: 'await tools["test--echo"]({ message: "background, first" });\nawait tools["test--echo"]({ message: "background, during" });',
       } } as ContentBlock,
-      { type: 'tool_use', id: 'call-fg', name: 'code_execution', input: { code: 'await test__echo({"message": "foreground"})' } } as ContentBlock,
+      { type: 'tool_use', id: 'call-fg', name: 'code_execution', input: { code: 'await tools["test--echo"]({ message: "foreground" });' } } as ContentBlock,
     ], 'tool_use'));
     membrane.pushResponse(createMockResponse([{ type: 'text', text: 'done' }]));
     await runTurn(framework, 'go');
@@ -333,7 +334,9 @@ test('a background script\'s call carries no turn, even while a foreground scrip
     assert.equal(recorder.speeches.length, 1);
     assert.equal(typeof foreground.callerTurnId, 'number', 'the foreground script\'s call carries a turn');
     assert.equal(foreground.callerTurnId, recorder.speeches[0]!.turnId, 'the foreground script\'s call carries the turn');
-    assert.equal(byMessage('background, first')?.callerTurnId, undefined);
+    const first = byMessage('background, first');
+    assert.ok(first, 'the left script made its first call');
+    assert.equal(first.callerTurnId, undefined);
     assert.equal(during.callerTurnId, undefined);
   });
 });

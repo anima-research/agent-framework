@@ -25,67 +25,66 @@
   out are never streamed, and neither is text held as a draft. A
   `{{unsent}}` resend streams the draft's words it sends, rather than the
   token.
-- With native tool calls (`roundContent`), a call made inside a foreground
-  `code_execution` script now counts toward its round's routing, as the
-  same call made directly does (#306). In explicit mode an inner
-  `skip_reply` keeps the round's envelopes in the context. In locus and
-  hybrid mode an inner `skip_reply` keeps the round's prose private, and an
-  inner silencing send, a `drafts` resend among them, holds it and the
-  turn's later prose as drafts, as a direct one does. An inner
-  `think` under the private same-round policy holds the round back in
-  every mode. An inner `skip_reply` that's refused, because the agent's
-  allowedTools doesn't name it or because this host can't set the
-  `wake_in_seconds` it asks for, counts as a refused direct one: it keeps
-  only its own round private, and the turn goes on. An inner send the
-  allowedTools refuses, like a refused direct one, silences nothing. On
-  the fallback without `roundContent`, as in XML tool mode, an inner
-  call counts only as a direct one does there. Nothing is routed until the
-  turn ends, so a silencing send holds the whole turn's prose as drafts,
-  the rounds before it included. The private `think` hold and an explicit
-  round's `skip_reply` don't apply there (#307).
-- A round whose script can change its routing waits for the script, and its
-  prose goes out when the script finishes. A script can change it when its
-  code names a tool whose call changes the round's routing in the turn's
-  mode: in locus and hybrid mode `skip_reply`, a silencing send, `drafts`
-  (whose resend is one), `say` or `whisper`; in explicit mode only
-  `skip_reply`; and in either, `think` under the private same-round
-  policy. Disabled mode holds nothing. A name
-  counts in code wherever it stands as a whole word of ASCII letters, digits
-  and underscores, or after `__` as in `mcpl__world__say`, as a function is
-  called or a `tools[...]` key is written: `say_hello` doesn't name `say`. A
-  name in a comment doesn't count, since Python never runs one, while a name
-  anywhere in a string does, since a string can be a key or code to run. A
-  script can also change its round's routing when the interpreter it runs in
-  has run a script that left such a tool reachable, by naming the tool
-  inside a definition (a function or lambda, a class's methods among them)
-  or other than in a direct call, or by keeping a string that is the tool's
-  whole name, optionally namespaced, as a key kept for later is. That holds
-  until the interpreter is reclaimed or restarted. A direct call outside a
-  definition, a class's own body included, or a string that only mentions a
-  tool, as a printed sentence does, leaves nothing reachable. Without code
-  execution, a `code_execution` call holds nothing. Any other round is
-  routed at its tool-calls event, as before, so narration beside a script
-  isn't held for the script's runtime. What goes unseen is routed as it was
-  before scripts counted, such as a tool name the code doesn't spell out
-  (built at runtime, written with escapes, or in non-ASCII spellings), code
-  loaded from a file or module, an enumeration of the tools, a kept key
-  whose prefix, as the script writes it, contains whitespace, a call written
-  in a string's text (code run with `exec` or `eval`, or an f-string's
-  field), inside a definition too, a definition or alias made inside such a
-  string, a call that outlives its script (one it awaits only in a later
-  script, schedules as a task, or leaves in a generator expression), and
-  code a later script runs from a string an earlier one kept. The turn's
+- With native tool calls (`roundContent`), a call of a `code_execution`
+  script that reaches the host while a run or wait call of the round
+  watches the script now counts toward that round's routing, as the same
+  call made directly does (#306), whether or not the round waits on that
+  call's script. In explicit mode an inner `skip_reply` keeps the round's
+  envelopes in the context. In locus and hybrid mode an inner `skip_reply`
+  keeps the round's prose private, and an inner silencing send, a `drafts`
+  resend among them, holds it and the turn's later prose as drafts, as a
+  direct one does. An inner `think` under the private same-round policy
+  holds the round back in every mode but disabled. An inner `skip_reply`
+  that's refused at dispatch, because this host can't set the
+  `wake_in_seconds` it asks for or because the agent's allowedTools doesn't
+  name it, or that the host refuses before dispatch, as for arguments that
+  aren't an object, counts as a refused direct one: it keeps only its own
+  round private, and the turn goes on. An inner send refused so, like a
+  refused direct one, silences nothing. A script has only the tools its
+  agent's allowedTools names, so a call of
+  any other tool fails in the script and reaches no one. On the fallback
+  without `roundContent`, as in XML tool mode, an inner call counts only as
+  a direct one does there. Nothing is routed until the turn ends, so a
+  silencing send holds the whole turn's prose as drafts, the rounds before
+  it included. The private `think` hold and an explicit round's
+  `skip_reply` don't apply there (#307).
+- A round whose run or wait call watches a script that can change its
+  routing waits for that call to return, at the script's end or at the
+  call's yield, and its prose goes out then. A script can change it when
+  its code names a tool whose call changes the round's routing in the
+  turn's mode: in locus and hybrid mode `skip_reply`, a silencing send,
+  `drafts` (whose resend is one, so its name holds whatever action its
+  call asks), `say` or `whisper`; in explicit mode only
+  `skip_reply`; and in either, `think` under the private same-round policy.
+  Disabled mode holds nothing. A wait reads the code of the script it
+  names. A name counts wherever it stands in the code as a whole
+  JavaScript identifier, comments and strings included: `tools.say(...)`,
+  `tools["say"]` and `tools["world--say"]` name `say`, and `say_hello`
+  doesn't. So a comment or a string that mentions such a tool holds its
+  round too, for no longer than the call's yield: 30 seconds by default,
+  and up to `maxYieldMs`, 600 seconds by default, when the call asks. A
+  tool name the code doesn't spell out, built at runtime or written with
+  escapes, goes unseen, and its round is routed as it was before scripts
+  counted. A stop or a list holds nothing, and neither does a
+  `code_execution` call without code execution or one the agent's
+  allowedTools refuses. Any other round is routed at its tool-calls event,
+  as before, so narration beside a script isn't held for it. The turn's
   locus and an explicit round's `>>` targets are taken at the round's
   tool-calls event, when the model has finished writing it, not when its
-  scripts return; hybrid's `>>>` targets apply as its delivery runs, as for
-  any queued hybrid delivery. A background script's call returns as soon as
-  the script has started, and its later calls aren't the round's. A script's
-  result settles only the round that dispatched it, even when a newer round
-  reuses its call id. A round whose turn ends or stops waiting on it, or
-  that a newer round of the same agent replaces, before its scripts return,
-  as when the turn is stopped, is withheld: it is neither sent nor held as
-  a draft, a log line names it, and in locus and hybrid mode the turn's
-  delivery receipt counts it as suppressed.
+  calls return; hybrid's `>>>` targets apply as its delivery runs, as for
+  any queued hybrid delivery. What counts is the host's receipt of a call,
+  not the script's making it: a call that reaches the host while no call of
+  the round watches the script isn't the round's, as one made once its run
+  has yielded, one made while it was watched that waited, with 16 of the
+  script's calls already out, until the watching call had returned, and one
+  still on its way when the call yielded. Such a call's effect can come
+  after the round's prose. A call's result settles only the round that
+  dispatched it, even when a
+  newer round reuses its call id. A round whose turn ends or stops waiting
+  on it, or that a newer round of the same agent replaces, before its calls
+  return, as when the turn is stopped, is withheld: it is neither sent nor
+  held as a draft, a log line names it, and in locus and hybrid mode the
+  turn's delivery receipt counts it as suppressed.
 - Every stream now sends `channels/outgoing/complete` for each channel it
   streamed to, while its server registers it and takes the stream, on every
   exit path, as MCPL Spec 14.3 asks: once its deliveries have run, or, when

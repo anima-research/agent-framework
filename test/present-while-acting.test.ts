@@ -2313,6 +2313,32 @@ describe('present while acting', () => {
     await framework.stop();
   });
 
+  it('hands membrane a message injected mid-turn as its participant and content alone, never its stored metadata', async () => {
+    // A stored row's metadata is the host's record, whoever wrote it.
+    membrane.pushResponse(createMockResponse([
+      { type: 'tool_use', id: 'c1', name: 'robot--send_message', input: { text: 'reply to room4' } },
+    ] as ContentBlock[], 'tool_use'));
+    membrane.pushResponse(createMockResponse([
+      { type: 'text', text: 'Sent it.' },
+    ] as ContentBlock[]));
+
+    const framework = await createFramework();
+    stubChannelRegistry(framework);
+    module.interjection = 'a message that arrives while the tool runs';
+    module.interjectionChannelId = null;
+    module.interjectionMetadata = { channelId: '999888777', system: true, openaiResponsesItems: [] };
+
+    trigger(framework);
+    await framework.runUntilIdle();
+
+    const injected = membrane.lastStream!.receivedToolResultOptions[0]?.injectedMessages ?? [];
+    assert.ok(injected.some((message) => JSON.stringify(message.content).includes('a message that arrives while the tool runs')),
+      'the message was injected at the tool boundary');
+    for (const message of injected) assert.deepEqual(Object.keys(message).sort(), ['content', 'participant']);
+
+    await framework.stop();
+  });
+
   for (const tag of ['chat:reaction-remove', 'chat:edited', 'chat:deleted']) {
     it(`a ${tag} marker injected mid-turn does not clear send suppression (#157)`, async () => {
       // Edits, deletions and reaction removals (RFC-001 core tags, delivered

@@ -31,72 +31,66 @@ export interface ProcessLoggingConfig {
  */
 /**
  * Client-side programmatic tool calling: a synthesized `code_execution` tool
- * that runs model-authored Python on the host, with every framework tool
- * injected as an async function. Mirrors the trained surface of Anthropic's
- * server-side PTC; inner tool results never enter the model context.
+ * that runs model-authored JavaScript in QuickJS compiled to WebAssembly, in a
+ * child process of its own per script, with the agent's tools as async
+ * functions. Mirrors the trained surface of Anthropic's server-side PTC;
+ * inner tool results never enter the model context.
  *
- * Robustness boundary, not a security sandbox (same doctrine as gate.js —
- * the agent already has broader host access through its tools).
+ * A script adds nothing to what its agent's tools allow, provided the host
+ * runtime's WebAssembly engine and the glue around it are right. It claims no
+ * containment beyond that: the child runs as the host's user, with an empty
+ * environment and no operating-system sandbox around it.
  */
 export interface CodeExecutionConfig {
   /** Master switch — only `true` synthesizes the tool. `create()` refuses a
    *  value that isn't a boolean, a quoted "false" included; `null` or leaving
    *  it out counts as off. */
   enabled: boolean;
-  /**
-   * Python interpreter to spawn (default: 'python3' from PATH). The runner
-   * gives it the protocol on file descriptors 3 and 4, so a wrapper named
-   * here must pass those on: one that `exec`s Python does, while a container,
-   * or sudo with its default settings, closes them, and every script then
-   * fails to start, saying so.
-   */
-  pythonPath?: string;
-  /**
-   * Per-inner-tool-call timeout; exceeding it raises TimeoutError inside the
-   * script (default 270_000 ms, mirroring the managed runtime's message).
-   */
+  /** How long a run or a wait waits for its script before it yields, unless
+   *  the agent asks otherwise with `yield_time_ms` (default 30_000 ms). */
+  yieldMs?: number;
+  /** The most an agent may ask a run or a wait to wait (default 600_000 ms).
+   *  At least `yieldMs`. */
+  maxYieldMs?: number;
+  /** A script's limit: a script still running this long after it started is
+   *  stopped, as "stopped at its limit" (default 86_400_000 ms, a day). */
+  scriptLifetimeMs?: number;
+  /** Scripts one agent may have running at once, yielded ones included
+   *  (default 3). */
+  maxRunningScripts?: number;
+  /** Script processes the host runs at once, every agent's together
+   *  (default 16). A run past it is refused at once, and nothing runs. */
+  maxScriptChildren?: number;
+  /** How long one of a script's tool calls may go unanswered before the
+   *  script is told it timed out; the tool may still take effect
+   *  (default 270_000 ms). */
   toolCallTimeoutMs?: number;
-  /** Whole-script deadline: cancel → grace → SIGKILL (default 600_000 ms). */
-  scriptTimeoutMs?: number;
-  /**
-   * Longest deadline an agent may ask for on one call with `time_limit_ms`
-   * (default: `scriptTimeoutMs`, so agents can only shorten it until this is
-   * raised). Longer requests are capped, and the result says so.
-   */
-  maxScriptTimeoutMs?: number;
-  /**
-   * Idle interpreter reclaim — script globals are lost after this much
-   * inactivity (default 300_000 ms, mirroring ~5-minute container reclaim).
-   * 0 disables reclaim.
-   */
-  idleReclaimMs?: number;
-  /** Max concurrent background (daemon) scripts per agent (default 3). */
-  maxBackgroundScripts?: number;
-  /** Background script lifetime ceiling, ms (default 86_400_000 = 24h). */
-  backgroundMaxLifetimeMs?: number;
   /** Minimum interval between wake_agent() deliveries, ms (default 60_000).
-   *  Early wakes are delayed, not dropped (backpressure inside the script). */
+   *  Early wakes are delayed, not dropped. */
   wakeMinIntervalMs?: number;
-  /** Max wake_agent() calls per background script (default 100); further
-   *  calls raise RuntimeError inside the script. */
+  /** Max wake_agent() calls per script (default 100); further calls are
+   *  refused in the script. */
   maxWakesPerScript?: number;
-  /** Variables for the python interpreter beyond the operating allowlist it
-   *  inherits (see CHILD_ENV_ALLOWLIST), such as PYTHONPATH. A recipe can
-   *  `${VAR}`-substitute them from .env. Other host variables aren't
-   *  inherited, which limits what model-authored code inherits, not what a
-   *  process running as the same user can read. The runner sets
-   *  PYTHONUNBUFFERED and PYTHONIOENCODING last, over any value given here,
-   *  since its protocol needs both. The interpreter's working directory is
-   *  its own runtime directory, so a relative path given here, as in
-   *  PYTHONPATH, resolves there: give absolute paths. */
-  env?: Record<string, string>;
-  /** The interpreter inherits the host's whole environment instead of the
-   *  allowlist: every host variable, provider keys included, reaches
-   *  model-authored code and every subprocess a script starts. Listing what
-   *  scripts need in `env` is the safer route. With code execution enabled,
-   *  `create()` refuses any value but true, false or null, which counts as
-   *  not set. */
-  inheritEnv?: boolean;
+  /**
+   * The WebAssembly memory's maximum for each script, its budget: a whole
+   * number of 64 KiB pages from 4 MiB to 2 GiB (default 128 MiB). A script's
+   * process stays within about its runtime's base plus 2.7 times this, plus
+   * what its calls take as they go out: up to about 200 MiB under Node and
+   * 410 MiB under Bun. The host holds at most about 6 times this, plus 653 MiB,
+   * plus 128 KiB for each wake maxWakesPerScript allows, for a script: about
+   * 1.4 GiB at the defaults.
+   * That's its 16 calls out at once, each with at most 4 MiB of JSON
+   * arguments, timed-out ones whose tools still run included, up to 16 more
+   * waiting as their text for those to end, up to 16 answers until the child
+   * takes them, each at most a third of this, the frame from the child being
+   * read, and its waiting wakes. A tool's
+   * own result, and the one serialization the bridge makes of it to check its
+   * size, are the tool's, beside this. Size a host by both. A call past the 16
+   * the script waits on waits in the script, in this memory. A tool result too large for
+   * it reaches the script as ResultTooLarge; how much fits depends on the
+   * result's shape (see `IsolateSettings.memoryMaxBytes`).
+   */
+  memoryMaxBytes?: number;
 }
 
 /** See `FrameworkConfig.providerHold`. */
@@ -234,7 +228,7 @@ export interface FrameworkConfig {
 
   /**
    * Client-side programmatic tool calling (`code_execution` tool). Omitted or
-   * `enabled: false` → tool absent, no python is ever spawned. At runtime,
+   * `enabled: false` → tool absent, and no script's process is ever started. At runtime,
    * untyped configs may also use `null` or `false` to omit this setting.
    * Other values that aren't objects are refused at `create()`.
    */
@@ -242,7 +236,7 @@ export interface FrameworkConfig {
 
   /**
    * Durable inline cap (chars) for tool results — successes AND errors — and
-   * background-script wake payloads. Content over the cap is written to a
+   * script wake payloads (wake_agent()). Content over the cap is written to a
    * workspace file under `tool-results/` (deterministic `<date>-<callId>.txt`
    * name, overwritten on collision, retained until the workspace owner
    * deletes it — never auto-GC'd) and replaced inline by a bounded preview

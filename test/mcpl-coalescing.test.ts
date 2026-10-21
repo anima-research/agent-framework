@@ -2396,6 +2396,13 @@ async function sendThenSpeak(f: Fixture, ...during: Array<() => Promise<void>>) 
   };
 }
 
+/** Whether the stored row holding `text` carries the coalescer's first-view
+ *  mark, which the host reads there (isConversationalInjection): a tool
+ *  boundary hands membrane an injected message's content alone. */
+const storedFirstView = (f: Fixture, text: string): boolean =>
+  f.framework.getAgent('agent')!.getContextManager().getAllMessages()
+    .some((m) => JSON.stringify(m.content).includes(text) && (m.metadata as { firstView?: unknown } | undefined)?.firstView === true);
+
 const unreadFollowUp = (f: Fixture, initial = true) =>
   f.send('channels/incoming', { messages: [f.channel('c2', 'follow_up_wiht_typo', initial ? { initial: true } : {}, 'chat', 'm2')] });
 const pushTagged = async (f: Fixture, tags: string[], eventId = 'e2', text = 'follow_up_fixed') =>
@@ -2467,7 +2474,7 @@ test('#157: an edit of an edit of a follow-up the agent was shown at a tool boun
     await pushTagged(f, ['chat:edited'], 'e3', 'follow_up_fixed_again');
   });
   assert(r.injected[0].includes('follow_up_wiht_typo'), 'the first boundary showed the agent the follow-up');
-  assert(r.injected[1].includes('follow_up_fixed_again') && !r.injected[1].includes('"firstView":true'), 'the second boundary showed it the last edit, unmarked');
+  assert(r.injected[1].includes('follow_up_fixed_again') && !storedFirstView(f, 'follow_up_fixed_again'), 'the second boundary showed it the last edit, stored unmarked');
   assert(r.sent, 'both explicit sends posted');
   assert(!r.replied, 'the prose after the second send stayed withheld');
 });
@@ -2481,7 +2488,7 @@ test('#157: two edits of a follow-up the agent hasn\'t been shown leave the last
     outcomes.push(await pushTagged(f, ['chat:edited'], 'e3', 'follow_up_fixed_again'));
   });
   assert.deepEqual(outcomes, ['replaced', 'replaced']);
-  assert(r.injected[0].includes('follow_up_fixed_again') && r.injected[0].includes('"firstView":true'), 'the boundary showed the agent the last edit, marked');
+  assert(r.injected[0].includes('follow_up_fixed_again') && storedFirstView(f, 'follow_up_fixed_again'), 'the boundary showed the agent the last edit, stored with the mark');
   assert(r.sent, 'the explicit send posted');
   assert(r.replied, 'the reply to the follow-up posted');
 });
@@ -2514,7 +2521,7 @@ for (const [lane, deliver] of Object.entries(serverMarked)) test(`#157 (${lane})
   const r = await sendThenSpeak(f, async () => { outcome = await deliver(f); });
   assert.equal(outcome, 'appended');
   assert(r.injected[0].includes('edit_claiming_first_view'), 'the edit reached the boundary');
-  assert(!r.injected[0].includes('"firstView":true'), "the server's own mark was dropped");
+  assert(!storedFirstView(f, 'edit_claiming_first_view'), "the server's own mark was dropped");
   assert(r.sent, 'the explicit send posted');
   assert(!r.replied, 'the prose after the send stayed withheld');
 });
@@ -2590,7 +2597,7 @@ test('#157: an edit of a follow-up stored at once, which a turn then read, is ap
   let outcome: string | undefined;
   const r = await sendThenSpeak(f, async () => { outcome = await pushTagged(f, ['chat:edited']); });
   assert.equal(outcome, 'appended', 'the edit came after the agent read the follow-up, so it replaced nothing');
-  assert(r.injected[0].includes('follow_up_fixed') && !r.injected[0].includes('"firstView":true'), 'the edit reached the boundary unmarked');
+  assert(r.injected[0].includes('follow_up_fixed') && !storedFirstView(f, 'follow_up_fixed'), 'the edit reached the boundary, stored unmarked');
   assert(r.sent, 'the explicit send posted');
   assert(!r.replied, 'the prose after the send stayed withheld');
 });
@@ -2615,7 +2622,7 @@ test('#157: an edit admitted while a compile is assembling a message stored at o
   };
   const r = await sendThenSpeak(f, async () => {});
   assert(shown, 'the compile assembled the question');
-  assert(r.injected[0].includes('question_edited') && !r.injected[0].includes('"firstView":true'), 'the edit reached the boundary unmarked');
+  assert(r.injected[0].includes('question_edited') && !storedFirstView(f, 'question_edited'), 'the edit reached the boundary, stored unmarked');
   assert(r.sent, 'the explicit send posted');
   assert(!r.replied, 'the prose after the send stayed withheld');
 });

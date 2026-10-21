@@ -1164,6 +1164,7 @@ test('publishForAgent into an inbound-only channel is refused and traced as fail
   const refused = await registry.publishForAgent('body:ears', 'a thought', 'Subconscious');
   assert.equal(refused.success, false);
   assert.match(String(refused.error), /inbound-only: server "body" declared this channel's direction "inbound"/);
+  assert.equal(refused.reason, 'inbound-only');
   assert.equal(publishCalls.length, 0, 'nothing was published');
   assert.equal(routed().length, 0, 'speech that was never posted is not traced as routed');
   const failed = traces.filter((t) => t.type === 'mcpl:speech-route-failed');
@@ -1175,6 +1176,7 @@ test('publishForAgent into an inbound-only channel is refused and traced as fail
 
   const posted = await registry.publishForAgent('body:home', 'a thought', 'Subconscious');
   assert.equal(posted.success, true);
+  assert.equal('reason' in posted, false);
   assert.deepEqual(publishCalls.map((c) => c.channelId), ['body:home']);
   // Shaped as routeSpeech's trace is, but without the surface's message id,
   // though the server named one ('m-77').
@@ -1192,9 +1194,10 @@ test('publishForAgent traces a publish the server reports undelivered as failed,
     added: [{ id: 'body:home', type: 'chat', label: 'Body · home', direction: 'bidirectional' }],
   } as never);
 
-  await registry.publishForAgent('body:home', 'a thought', 'Subconscious');
+  const undelivered = await registry.publishForAgent('body:home', 'a thought', 'Subconscious');
 
   assert.deepEqual(publishCalls.map((c) => c.channelId), ['body:home']);
+  assert.equal('reason' in undelivered, false, 'a publish that went out carries no reason');
   assert.deepEqual(traces.filter((t) => t.type === 'mcpl:speech-routed'), []);
   assert.deepEqual(
     traces.filter((t) => t.type === 'mcpl:speech-route-failed').map((t) => [t.conversationId, t.channelId, t.reason, t.outcome]),
@@ -1214,6 +1217,7 @@ test("publishForAgent traces what a rejected publish may have done: unknown afte
     throw new McplRequestError('The "body" server answered with an error: Rate limited after part 1', 'error-response', { posted: ['m-1'] });
   });
   const unconfirmed = await registry.publishForAgent('body:home', 'a long thought', 'Subconscious');
+  assert.equal('reason' in unconfirmed, false, 'a publish that went out carries no reason');
   assert.equal(unconfirmed.error, 'Posting to channel "body:home" wasn\'t confirmed: The "body" server answered with an error: Rate limited after part 1 (delivery uncertain). It may or may not have been posted, so sending it again could post it twice. Connector detail: {"posted":["m-1"]}');
   assert.deepEqual(failed().map((t) => [t.reason, t.outcome, t.detail]),
     [['The "body" server answered with an error: Rate limited after part 1 (delivery uncertain)', 'unknown', '{"posted":["m-1"]}']],
@@ -1223,7 +1227,8 @@ test("publishForAgent traces what a rejected publish may have done: unknown afte
   setOnPublish(async () => {
     throw new McplRequestError('MCPL server "body" did not respond to channels/publish within 30000ms', 'no-response');
   });
-  await registry.publishForAgent('body:home', 'a thought', 'Subconscious');
+  const timedOut = await registry.publishForAgent('body:home', 'a thought', 'Subconscious');
+  assert.equal('reason' in timedOut, false, 'nor does one that timed out');
   assert.equal(failed()[1]!.outcome, 'unknown');
 
   // Only a request that never left proves nothing was posted.
@@ -1232,6 +1237,7 @@ test("publishForAgent traces what a rejected publish may have done: unknown afte
   });
   const notSent = await registry.publishForAgent('body:home', 'another', 'Subconscious');
   assert.equal(notSent.error, 'Nothing was posted to channel "body:home": Cannot send request: connection to "body" is closed.');
+  assert.equal(notSent.reason, 'not-sent', 'one whose request was refused before anything was written is a refusal');
   assert.equal(failed()[2]!.outcome, 'failed');
   assert.equal('detail' in failed()[2]!, false, 'no detail when the connector sent none');
   assert.equal(traces.filter((t) => t.type === 'mcpl:speech-routed').length, 0);
