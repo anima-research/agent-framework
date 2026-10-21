@@ -16,7 +16,7 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { AbortedResponse, NormalizedRequest, NormalizedResponse, StreamEvent, YieldingStream } from '@animalabs/membrane';
-import { MembraneError } from '@animalabs/membrane';
+import { MembraneError, TimeoutAbortError } from '@animalabs/membrane';
 import type {
   ErrorAction,
   ErrorPolicy,
@@ -67,9 +67,14 @@ class RecordingMembrane extends MockMembrane {
     return this.directAnswers.shift() ?? createMockResponse([{ type: 'text', text: 'direct' }]);
   }
 
+  /** What the next complete() call rejects with instead of answering. */
+  completeFailures: Error[] = [];
+
   override async complete(request: NormalizedRequest, options?: unknown): Promise<NormalizedResponse> {
     this.calls.push(request);
     this.options.push(options as Options);
+    const failure = this.completeFailures.shift();
+    if (failure) throw failure;
     return createMockResponse([{ type: 'text', text: 'completed' }]);
   }
 }
@@ -177,13 +182,30 @@ test('each agent turn carries the progress deadline: 30 minutes unless inference
   assert.equal((await turnOptions({ inferenceProgressTimeoutMs: 1234 }))?.progressTimeoutMs, 1234);
   // Infinity is the way to run with no bound: it passes, and membrane never fires it.
   assert.equal((await turnOptions({ inferenceProgressTimeoutMs: Infinity }))?.progressTimeoutMs, Infinity);
-  // Membrane reads these as no deadline, which would leave the hang in place.
+});
+
+test('create refuses a progress deadline membrane would read as none, and names Infinity as the way to have none', async () => {
+  // Membrane reads these as no deadline, which would leave the hang in place,
+  // so a host that writes one, meaning "off" or by slip, hears it at create.
   for (const value of [0, -1, Number.NaN]) {
-    assert.equal(
-      (await turnOptions({ inferenceProgressTimeoutMs: value }))?.progressTimeoutMs,
-      DEFAULT_INFERENCE_PROGRESS_TIMEOUT_MS,
-      `inferenceProgressTimeoutMs ${value} gets the default`,
-    );
+    const dir = mkdtempSync(join(tmpdir(), 'progress-deadline-refused-'));
+    try {
+      await assert.rejects(
+        AgentFramework.create({
+          storePath: join(dir, 'store'),
+          membrane: new RecordingMembrane().asMembrane(),
+          agents: [{ name: 'agent', model: 'test-model', systemPrompt: 'test' }],
+          modules: [],
+          syncIntervalMs: 0,
+          inferenceProgressTimeoutMs: value,
+        }),
+        (error: unknown) => error instanceof RangeError
+          && error.message === `inferenceProgressTimeoutMs must be a positive number of ms, or Infinity to run with no bound; got ${value}`,
+        `inferenceProgressTimeoutMs ${value} is refused`,
+      );
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   }
 });
 
@@ -209,11 +231,11 @@ test('a turn whose stream ended on its progress deadline goes to the error polic
   });
 });
 
-test('an expiry names the deadline the turn ran with, the default when the configured value would turn it off', async () => {
+test('an expiry names the deadline the turn ran with, the default when none is configured', async () => {
   const membrane = new RecordingMembrane();
   membrane.streams.push(() => new ExpiredStream());
   const policy = recordingPolicy(0);
-  await withFramework(membrane, { errorPolicy: policy, inferenceProgressTimeoutMs: 0 }, async (framework, traces) => {
+  await withFramework(membrane, { errorPolicy: policy }, async (framework, traces) => {
     framework.start();
     framework.nudgeAgent('agent', 'operator');
     await waitFor('the turn to exhaust', () => traces.some((t) => t.type === 'inference:exhausted'));
@@ -323,15 +345,19 @@ test('the direct Agent API carries the deadline on each call: the default, or th
     agent.getContextManager().addMessage('user', [{ type: 'text', text: 'hello' }]);
     await agent.runInference(framework.getAllTools());
     await agent.runInference(framework.getAllTools(), undefined, { progressTimeoutMs: 1234 });
-    // Values membrane would read as no deadline get the default here too.
-    await agent.runInference(framework.getAllTools(), undefined, { progressTimeoutMs: 0 });
-    await agent.runInference(framework.getAllTools(), undefined, { progressTimeoutMs: Number.NaN });
+    // A value membrane would read as no deadline is refused before the call starts.
+    for (const value of [0, Number.NaN]) {
+      await assert.rejects(
+        agent.runInference(framework.getAllTools(), undefined, { progressTimeoutMs: value }),
+        (error: unknown) => error instanceof RangeError && error.message.startsWith('InferenceOptions.progressTimeoutMs must be'),
+      );
+      assert.equal(agent.state.status, 'idle', 'a refused call leaves the agent as it was');
+    }
     const started = await agent.startStream(framework.getAllTools());
     started.stream.cancel();
     assert.deepEqual(
       membrane.options.map((o) => o?.progressTimeoutMs),
-      [DEFAULT_INFERENCE_PROGRESS_TIMEOUT_MS, 1234, DEFAULT_INFERENCE_PROGRESS_TIMEOUT_MS,
-        DEFAULT_INFERENCE_PROGRESS_TIMEOUT_MS, DEFAULT_INFERENCE_PROGRESS_TIMEOUT_MS],
+      [DEFAULT_INFERENCE_PROGRESS_TIMEOUT_MS, 1234, DEFAULT_INFERENCE_PROGRESS_TIMEOUT_MS],
     );
   });
 });
@@ -401,7 +427,6 @@ test('the router puts its deadline on both its calls: 30 minutes, or the one it 
   for (const [given, expected] of [
     [undefined, DEFAULT_INFERENCE_PROGRESS_TIMEOUT_MS],
     [1234, 1234],
-    [Number.NaN, DEFAULT_INFERENCE_PROGRESS_TIMEOUT_MS],
   ] as const) {
     const h = routerHarness(
       () => new MockYieldingStream([createMockResponse([{ type: 'text', text: 'streamed' }])]),
@@ -427,4 +452,16 @@ test('a streamed request that ends on another abort answers the server with that
   const h = routerHarness(() => new ExpiredStream('error'), { progressTimeoutMs: 1234 });
   await h.router.handleInferenceRequest('srv', { featureSet: 'f', stream: true, messages: [{ role: 'user', content: 'hi' }] }, h.responder);
   assert.deepEqual(h.answers, [{ error: { code: -32603, message: 'The inference stopped before it finished (error)' } }]);
+});
+
+test("a non-streamed request that ends on its deadline answers the server with membrane's own expiry", async () => {
+  // complete() rejects with membrane's TimeoutAbortError, whose message says
+  // when the call began and how many provider events it had. That is the
+  // answer, unlike a streamed request's, which names the setting to raise.
+  const h = routerHarness(() => new MockYieldingStream([]), { progressTimeoutMs: 1234 });
+  const expiry = 'No provider progress within 1234ms: the call began at 2026-10-21T22:00:00.000Z, provider events: 0';
+  h.membrane.completeFailures.push(new TimeoutAbortError(expiry));
+  await h.router.handleInferenceRequest('srv', { featureSet: 'f', messages: [{ role: 'user', content: 'hi' }] }, h.responder);
+  assert.deepEqual(h.answers, [{ error: { code: -32603, message: expiry } }]);
+  assert.deepEqual(h.membrane.options.map((o) => o?.progressTimeoutMs), [1234]);
 });

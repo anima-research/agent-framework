@@ -26,7 +26,7 @@ import type {
 import type { FeatureSetManager } from './feature-set-manager.js';
 import { McplFeatureSetError } from './feature-set-manager.js';
 import type { HookOrchestrator } from './hook-orchestrator.js';
-import { progressTimeoutOrDefault } from '../agent.js';
+import { DEFAULT_INFERENCE_PROGRESS_TIMEOUT_MS } from '../agent.js';
 
 // ============================================================================
 // Responder interface
@@ -198,7 +198,7 @@ export class InferenceRouter {
     this.featureSetManager = featureSetManager;
     this.routingPolicy = routingPolicy;
     this.emitTraceFn = emitTraceFn;
-    this.progressTimeoutMs = progressTimeoutOrDefault(options.progressTimeoutMs);
+    this.progressTimeoutMs = options.progressTimeoutMs ?? DEFAULT_INFERENCE_PROGRESS_TIMEOUT_MS;
   }
 
   /**

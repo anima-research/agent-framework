@@ -32,8 +32,9 @@ export interface ActivationRequestOptions {
    *  run (see `compileWithInjections` for what that leaves alone). */
   dryRun?: boolean;
   /** The stream's progress deadline, per provider call (membrane's
-   *  `progressTimeoutMs`): DEFAULT_INFERENCE_PROGRESS_TIMEOUT_MS when absent,
-   *  NaN, zero or negative. */
+   *  `progressTimeoutMs`): DEFAULT_INFERENCE_PROGRESS_TIMEOUT_MS when absent.
+   *  A value membrane would read as no deadline is refused
+   *  (assertProgressTimeout). */
   progressTimeoutMs?: number;
 }
 
@@ -106,13 +107,19 @@ const DEFAULT_SAME_ROUND_THINK_TEXT_POLICY: SameRoundThinkTextPolicy = 'public';
 export const DEFAULT_INFERENCE_PROGRESS_TIMEOUT_MS = 30 * 60_000;
 
 /**
- * A progress deadline to pass membrane: the value given, or the default for
- * one membrane would read as no deadline (absent, NaN, zero or negative), so
- * a slip in a caller's value can't bring the hang back. Infinity, the explicit
- * way to have no bound, passes.
+ * Refuse a progress deadline that isn't a positive number of ms or Infinity.
+ * Membrane reads zero, a negative or NaN as no deadline at all, so one written
+ * meaning "off" would leave a stalled stream unbounded, and one written by
+ * slip would do the same. Infinity is the way to run with no bound, and
+ * `undefined` gets DEFAULT_INFERENCE_PROGRESS_TIMEOUT_MS where it's read.
  */
-export function progressTimeoutOrDefault(value: number | undefined): number {
-  return value !== undefined && value > 0 ? value : DEFAULT_INFERENCE_PROGRESS_TIMEOUT_MS;
+export function assertProgressTimeout(setting: string, value: unknown): void {
+  if (value === undefined) return;
+  if (typeof value !== 'number' || !(value > 0)) {
+    throw new RangeError(
+      `${setting} must be a positive number of ms, or Infinity to run with no bound; got ${String(value)}`,
+    );
+  }
 }
 
 /**
@@ -1171,6 +1178,7 @@ export class Agent {
     budget?: TokenBudget,
     options?: InferenceOptions
   ): Promise<InferenceResult> {
+    assertProgressTimeout('InferenceOptions.progressTimeoutMs', options?.progressTimeoutMs);
     if (this._state.status === 'inferring') {
       throw new Error(`Agent ${this.name} is already inferring`);
     }
@@ -1238,7 +1246,7 @@ export class Agent {
     // Set state to inferring
     this._inferenceStartedAt = Date.now();
     const inferencePromise = this.doInference(request, abortController.signal, assemble,
-      progressTimeoutOrDefault(options?.progressTimeoutMs));
+      options?.progressTimeoutMs ?? DEFAULT_INFERENCE_PROGRESS_TIMEOUT_MS);
     this._state = { status: 'inferring', promise: inferencePromise, abortController };
 
     try {
@@ -1527,6 +1535,7 @@ export class Agent {
     compressionTools: ToolDefinition[] = availableTools,
     options: ActivationRequestOptions = {},
   ): Promise<StartStreamResult> {
+    assertProgressTimeout('progressTimeoutMs', options.progressTimeoutMs);
     if (this._state.status !== 'idle') {
       throw new Error(`Agent ${this.name} cannot start stream in state ${this._state.status}`);
     }
@@ -1607,7 +1616,7 @@ export class Agent {
       emitTokens: true,
       emitBlocks: false,
       emitUsage: true,
-      progressTimeoutMs: progressTimeoutOrDefault(options.progressTimeoutMs),
+      progressTimeoutMs: options.progressTimeoutMs ?? DEFAULT_INFERENCE_PROGRESS_TIMEOUT_MS,
       // Retry a content-policy refusal at the provider seam rather than at
       // the framework level: membrane replays the SAME request immediately
       // (cache-warm), where a framework-level requeue would recompile and

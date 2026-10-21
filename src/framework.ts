@@ -76,7 +76,7 @@ import { asModuleRow, heldHandle, heldWriteId, matchesMessageQuery } from './hel
 import { ProcessQueueImpl } from './queue.js';
 import { DEFAULT_SHUTDOWN_TIMEOUT_MS, validateShutdownTimeout, shutdownErrorMessage, waitForShutdown, ShutdownTimeoutError } from './shutdown.js';
 import { REFUSAL_REACTIONS, REFUSAL_REACTION_FALLBACK, REFUSAL_REACTION_BASELINE } from './refusal-reactions.js';
-import { Agent, DEFAULT_INFERENCE_PROGRESS_TIMEOUT_MS, assertAgentSwitches, progressTimeoutOrDefault } from './agent.js';
+import { Agent, DEFAULT_INFERENCE_PROGRESS_TIMEOUT_MS, assertAgentSwitches, assertProgressTimeout } from './agent.js';
 import { assertBooleanSetting, holdsSettings } from './config-checks.js';
 import { ModuleRegistry, checkedToolResult, ensureStateRegistered, storableToolResult, thrownResult } from './module-registry.js';
 import { McplServerRegistry } from './mcpl/server-registry.js';
@@ -3063,6 +3063,7 @@ export class AgentFramework {
     // Before anything opens or starts: a refused config must leave nothing behind.
     if (config.codeExecution != null) validateCodeExecutionConfig(config.codeExecution);
     assertFrameworkSwitches(config);
+    assertProgressTimeout('inferenceProgressTimeoutMs', config.inferenceProgressTimeoutMs);
     for (const agentConfig of config.agents) assertAgentSwitches(agentConfig);
     assertAgentNamesUnique(config.agents);
 
@@ -3254,7 +3255,7 @@ export class AgentFramework {
       new OperatorLog(operatorLogPath),
     );
     framework.providerHoldHook = config.providerHold;
-    framework.inferenceProgressTimeoutMs = progressTimeoutOrDefault(config.inferenceProgressTimeoutMs);
+    framework.inferenceProgressTimeoutMs = config.inferenceProgressTimeoutMs ?? DEFAULT_INFERENCE_PROGRESS_TIMEOUT_MS;
 
     // Before any delivery.
     await framework.reconcileDiscordAwarenessAtStartup();
