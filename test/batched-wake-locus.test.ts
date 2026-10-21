@@ -143,6 +143,7 @@ describe('batched wake routing with conversation forks', () => {
         { name: 'trunk', model: 'test-model', systemPrompt: 'You are trunk.' },
         { name: 'fork-room', model: 'test-model', systemPrompt: 'You are a fork.' },
         { name: 'fork-other', model: 'test-model', systemPrompt: 'You are a fork.' },
+        { name: 'fork-slack', model: 'test-model', systemPrompt: 'You are a fork.' },
       ],
       gate: {
         config: {
@@ -150,6 +151,7 @@ describe('batched wake routing with conversation forks', () => {
           default: 'skip',
         },
       },
+      conversations: { templateAgent: 'trunk' },
       modules: [],
     });
   });
@@ -162,11 +164,18 @@ describe('batched wake routing with conversation forks', () => {
   it('the addressed route applies only to the fork homed there; other forks and the trunk get none', async () => {
     const internals = framework as unknown as {
       conversationAgentHomes: Map<string, string>;
+      conversationRouter: { bind(channel: { serverId: string; channelId: string }, agentName: string, generation: number): unknown };
       pendingRequests: Array<{ agentName: string; channelId?: string; addressed?: boolean; counterparty?: string }>;
       eventGate: { evaluate(info: unknown): unknown };
     };
+    // Each fork is bound to its channel on discord, as a spawn binds it.
     internals.conversationAgentHomes.set('fork-room', ROOM);
     internals.conversationAgentHomes.set('fork-other', GENERAL);
+    internals.conversationRouter.bind({ serverId: 'discord', channelId: ROOM }, 'fork-room', 1);
+    internals.conversationRouter.bind({ serverId: 'discord', channelId: GENERAL }, 'fork-other', 1);
+    // Slack's channel with ROOM's id is a conversation of its own, with its own fork.
+    internals.conversationAgentHomes.set('fork-slack', ROOM);
+    internals.conversationRouter.bind({ serverId: 'slack', channelId: ROOM }, 'fork-slack', 2);
     internals.eventGate.evaluate({
       content: '@agent hi', eventType: 'mcpl:channel-incoming', serverId: 'discord', channelId: ROOM,
       tags: ['chat:addressed'], metadata: { authorId: '5' },
@@ -176,6 +185,7 @@ describe('batched wake routing with conversation forks', () => {
     assert.equal(byAgent.get('fork-room')?.channelId, ROOM, 'the fork that owns the channel takes the route');
     assert.equal(byAgent.get('fork-room')?.addressed, true);
     assert.equal(byAgent.get('fork-other')?.channelId, undefined, 'a fork bound elsewhere gets no locus');
+    assert.equal(byAgent.get('fork-slack')?.channelId, undefined, "slack's fork on the same id doesn't take discord's route");
     assert.equal(byAgent.get('trunk')?.channelId, undefined, 'the trunk never takes a fork-bound channel');
     // Telemetry provenance still reaches every agent.
     assert.equal(byAgent.get('fork-other')?.counterparty, 'discord:user:5');

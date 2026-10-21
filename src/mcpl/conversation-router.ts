@@ -108,6 +108,10 @@ export interface ConversationRouterConfig {
 
 export interface ConversationBinding {
   channelId: string;
+  /** The channel's MCPL server, where the binding was made with one: channel
+   *  ids are unique only within one server's connection (MCPL §14.2), so each
+   *  server's channel has its own binding. */
+  serverId?: string;
   agentName: string;
   /** Engagement counter per channel — fresh forks get a new generation. */
   generation: number;
@@ -157,11 +161,15 @@ export const DEFAULT_CLOSURE_PROMPT =
 export class ConversationRouter {
   private config: ConversationRouterConfig;
 
-  /** Active bindings, keyed by channelId. */
+  /** Active bindings, keyed by the channel's server and id (bindingKey):
+   *  two servers' channels with one id are two conversations. */
   private bindings = new Map<string, ConversationBinding>();
 
-  /** Engagement counter per channel — survives unbind, so a re-bound channel
-   * gets a distinct fork agent name. */
+  /** Engagement counter per channel id — survives unbind, so a re-bound
+   * channel gets a distinct fork agent name. Kept by bare id, as it's
+   * persisted: two servers sharing an id share a counter, which still never
+   * repeats a name, and their forks' names differ anyway, since each hashes
+   * its server (forkAgentName). */
   private generations = new Map<string, number>();
 
   constructor(config: ConversationRouterConfig) {
@@ -191,7 +199,7 @@ export class ConversationRouter {
    * unchanged; a failed spawn doesn't leave a dangling route.
    */
   route(facts: IncomingMessageFacts): RoutingDecision {
-    const existing = this.bindings.get(facts.channelId);
+    const existing = this.bindings.get(bindingKey(facts));
 
     if (existing) {
       return {
@@ -223,33 +231,57 @@ export class ConversationRouter {
    * Record a binding after the framework successfully spawned the fork.
    * Returns the new binding.
    */
-  bind(channelId: string, agentName: string, generation: number, now = Date.now()): ConversationBinding {
-    this.generations.set(channelId, generation);
+  bind(channel: string | ConversationChannel, agentName: string, generation: number, now = Date.now()): ConversationBinding {
+    const { channelId, serverId } = asChannel(channel);
+    // The counter is kept by bare id, and two servers' spawns on one id can
+    // run beside each other, so a bind can finish after a later spawn's: the
+    // counter keeps the higher, or the next spawn would propose a fork name
+    // already used.
+    this.generations.set(channelId, Math.max(this.generations.get(channelId) ?? 0, generation));
     const binding: ConversationBinding = {
       channelId,
+      ...(serverId !== undefined ? { serverId } : {}),
       agentName,
       generation,
       boundAt: now,
       lastActivity: now,
     };
-    this.bindings.set(channelId, binding);
+    this.bindings.set(bindingKey({ channelId, serverId }), binding);
     return binding;
   }
 
   /** Record delivered activity on an existing binding. Does not bind a
    * channel or advance its generation. Call after successful delivery, not
    * when previewing a route. The optional clock supports deterministic use. */
-  touch(channelId: string, now = Date.now()): void {
-    const binding = this.bindings.get(channelId);
-    if (binding) binding.lastActivity = now;
+  touch(channel: string | ConversationChannel, now = Date.now()): void {
+    const found = this.findBinding(channel);
+    if (found) found[1].lastActivity = now;
   }
 
-  unbind(channelId: string): void {
-    this.bindings.delete(channelId);
+  unbind(channel: string | ConversationChannel): void {
+    const found = this.findBinding(channel);
+    if (found) this.bindings.delete(found[0]);
   }
 
-  getBinding(channelId: string): ConversationBinding | undefined {
-    return this.bindings.get(channelId);
+  getBinding(channel: string | ConversationChannel): ConversationBinding | undefined {
+    return this.findBinding(channel)?.[1];
+  }
+
+  /**
+   * The binding a caller names, with its key. A channel given with its server
+   * names that server's binding only. A bare id, as callers gave it before
+   * bindings had servers, names the binding made with no server, else the one
+   * binding for that id; where several servers' channels with that id are
+   * bound, it names none.
+   */
+  private findBinding(channel: string | ConversationChannel): [string, ConversationBinding] | undefined {
+    const named = asChannel(channel);
+    const key = bindingKey(named);
+    const exact = this.bindings.get(key);
+    if (exact) return [key, exact];
+    if (named.serverId !== undefined) return undefined;
+    const matches = [...this.bindings.entries()].filter(([, b]) => b.channelId === named.channelId);
+    return matches.length === 1 ? matches[0] : undefined;
   }
 
   /** Reverse lookup: the channel an agent is bound to, if any. */
@@ -315,6 +347,25 @@ export class ConversationRouter {
       ?? (facts.kind === 'dm' ? 'always' : 'mention');
     return rule === 'always' || facts.mentioned;
   }
+}
+
+/**
+ * A channel as the router's bindings take it: its id, with the MCPL server it
+ * belongs to where the caller has one. A bare id, as callers gave it before,
+ * is the channel with no server.
+ */
+export interface ConversationChannel {
+  channelId: string;
+  serverId?: string;
+}
+
+function asChannel(channel: string | ConversationChannel): ConversationChannel {
+  return typeof channel === 'string' ? { channelId: channel } : channel;
+}
+
+/** A binding's key: its channel's server and id, unambiguous whatever either holds. */
+function bindingKey(channel: ConversationChannel): string {
+  return JSON.stringify([channel.serverId ?? null, channel.channelId]);
 }
 
 /** The readable part of a fork's name stops here: uniqueness rides on the hash. */
