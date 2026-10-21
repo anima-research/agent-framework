@@ -16,7 +16,7 @@ import assert from 'node:assert/strict';
 import { ContextManager, PassthroughStrategy } from '@animalabs/context-manager';
 import { fixture, eventually, settles, TS } from './helpers/coalescing-fixture.js';
 import { createMockResponse } from './helpers/mock-membrane.js';
-import { gateToolCalls } from './helpers/gone-names.js';
+import { gateToolCalls } from './helpers/gate-tool-calls.js';
 
 type Fixture = Awaited<ReturnType<typeof fixture>>;
 type Registry = {

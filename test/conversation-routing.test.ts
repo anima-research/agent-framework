@@ -16,7 +16,9 @@ import type { ContentBlock } from '@animalabs/membrane';
 import { MockMembrane, createMockResponse } from './helpers/mock-membrane.js';
 import { forkAgentName } from '../src/mcpl/conversation-router.js';
 import type { EventGate } from '../src/gate/event-gate.js';
-import { goneNames, gateToolCalls } from './helpers/gone-names.js';
+import { goneNames } from './helpers/gone-names.js';
+import { gateToolCalls } from './helpers/gate-tool-calls.js';
+import { forceExpiry } from './helpers/force-expiry.js';
 
 /** The name the router gives a channel's fork, for the `srv` server every
  *  event here comes from. */
@@ -81,15 +83,6 @@ describe('Conversation routing', () => {
       modules: [],
       conversations: { templateAgent: 'trunk', ...conversations },
     });
-  }
-
-  /** Make a binding look idle past the TTL and re-arm the sweep throttle —
-   * deterministic expiry instead of racing a 1ms TTL against the wall clock. */
-  function forceExpiry(framework: AgentFramework, channelId: string, idleTtlMs: number) {
-    const binding = framework.getConversationRouter()!.getBinding(channelId);
-    assert.ok(binding, `binding for ${channelId} should exist before forcing expiry`);
-    binding!.lastActivity = Date.now() - idleTtlMs - 1_000;
-    (framework as unknown as { lastConversationSweep: number }).lastConversationSweep = 0;
   }
 
   it('rejects an unknown template agent at creation', async () => {

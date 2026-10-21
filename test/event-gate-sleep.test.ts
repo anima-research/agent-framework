@@ -23,10 +23,36 @@ import { JsStore } from '@animalabs/chronicle';
 import { EventGate } from '../src/gate/event-gate.js';
 import { AgentFramework } from '../src/index.js';
 import { MockMembrane, createMockResponse } from './helpers/mock-membrane.js';
-import { goneNames, gateToolCalls } from './helpers/gone-names.js';
+import { goneNames } from './helpers/gone-names.js';
+import { gateToolCalls } from './helpers/gate-tool-calls.js';
+import { forceExpiry } from './helpers/force-expiry.js';
 import { fixture, eventually, TS, ok } from './helpers/coalescing-fixture.js';
 
 const TMP_DIR = join(import.meta.dirname, '../.test-tmp-gate-sleep');
+
+/** A framework whose agent forks a conversation for each message on the open
+ *  channel `channelId`, with a gate; `incoming` sends that channel a message. */
+async function forkFixture(channelId: string, options: { agents?: unknown[]; idleTtlMs?: number } = {}) {
+  const f = await fixture({
+    ...(options.agents ? { agents: options.agents } : {}),
+    framework: {
+      gate: { config: { policies: [], default: 'always' }, configPath: join(TMP_DIR, `gate-${channelId.replace(/\W/g, '-')}.json`) },
+      conversations: { templateAgent: 'agent', bind: { channel: 'always' }, trigger: { channel: 'always' }, ...(options.idleTtlMs ? { idleTtlMs: options.idleTtlMs } : {}) },
+    } as never,
+  });
+  const gate = (f.framework as unknown as { eventGate: EventGate }).eventGate;
+  const incoming = (messageId: string) => f.send('channels/incoming', {
+    messages: [{ channelId, messageId, timestamp: TS, author: { id: 'U1', name: 'antra' }, tags: ['chat:from-human'], content: [{ type: 'text', text: 'hello' }] }],
+  });
+  try {
+    await f.send('channels/register', { channels: [{ id: channelId, type: 'discord', label: channelId.split(':').pop(), initiallyOpen: true, metadata: { channelType: 'guild_text' } }] });
+    await eventually(() => (f.framework as unknown as { channelRegistry: { getDesiredState(s: string, c: string): string | undefined } }).channelRegistry.getDesiredState('editor', channelId) === 'open', 'the channel is open');
+  } catch (err) {
+    await f.close();
+    throw err;
+  }
+  return { f, gate, incoming };
+}
 
 function makeGate(now?: () => number) {
   const inferenceRequests: Array<{ agentName: string; reason: string; source: string }> = [];
@@ -260,18 +286,9 @@ describe("EventGate sleep: its wake, a stop and a fork's end", () => {
     // The gate decides a channel message's wake before it's routed to a fork,
     // so the primary's sleep quiets every conversation of the agent.
     const CH = 'discord:g1:dm';
-    const f = await fixture({ framework: {
-      gate: { config: { policies: [], default: 'always' }, configPath: join(TMP_DIR, 'gate-fork.json') },
-      conversations: { templateAgent: 'agent', bind: { channel: 'always' }, trigger: { channel: 'always' } },
-    } as never });
-    const gate = (f.framework as unknown as { eventGate: EventGate }).eventGate;
+    const { f, gate, incoming } = await forkFixture(CH);
     const router = () => (f.framework as unknown as { getConversationRouter(): { getBinding(id: string): { agentName: string } | undefined } }).getConversationRouter();
-    const incoming = (messageId: string) => f.send('channels/incoming', {
-      messages: [{ channelId: CH, messageId, timestamp: TS, author: { id: 'U1', name: 'antra' }, tags: ['chat:from-human'], content: [{ type: 'text', text: 'hello' }] }],
-    });
     try {
-      await f.send('channels/register', { channels: [{ id: CH, type: 'discord', label: 'dm', initiallyOpen: true, metadata: { channelType: 'guild_text' } }] });
-      await eventually(() => (f.framework as unknown as { channelRegistry: { getDesiredState(s: string, c: string): string | undefined } }).channelRegistry.getDesiredState('editor', CH) === 'open', 'the channel is open');
       gate.setSleep(3600, 'resting', 'agent');
       const before = f.membrane.calls.length;
       await incoming('m1');
@@ -297,20 +314,9 @@ describe("EventGate sleep: its wake, a stop and a fork's end", () => {
     ["can't call skip_reply isn't pointed at it", ['sleep', 'wake'], ''],
   ] as const) it(`a fork that ${what}, when its sleep is refused`, async () => {
     const CH = 'discord:g1:dm2';
-    const f = await fixture({
-      agents: [{ name: 'agent', model: 'test', systemPrompt: 'test', allowedTools }],
-      framework: {
-        gate: { config: { policies: [], default: 'always' }, configPath: join(TMP_DIR, 'gate-fork-remedy.json') },
-        conversations: { templateAgent: 'agent', bind: { channel: 'always' }, trigger: { channel: 'always' } },
-      } as never,
-    });
+    const { f, gate, incoming } = await forkFixture(CH, { agents: [{ name: 'agent', model: 'test', systemPrompt: 'test', allowedTools }] });
     const calls = gateToolCalls(f.framework);
-    const incoming = (messageId: string) => f.send('channels/incoming', {
-      messages: [{ channelId: CH, messageId, timestamp: TS, author: { id: 'U1', name: 'antra' }, tags: ['chat:from-human'], content: [{ type: 'text', text: 'hello' }] }],
-    });
     try {
-      await f.send('channels/register', { channels: [{ id: CH, type: 'discord', label: 'dm2', initiallyOpen: true, metadata: { channelType: 'guild_text' } }] });
-      await eventually(() => (f.framework as unknown as { channelRegistry: { getDesiredState(s: string, c: string): string | undefined } }).channelRegistry.getDesiredState('editor', CH) === 'open', 'the channel is open');
       await incoming('m1'); // the fork's first turn answers with the fixture's 'ok'
       await f.framework.runUntilIdle();
       f.membrane.pushResponse(createMockResponse([{ type: 'tool_use', id: 's1', name: 'sleep', input: { seconds: 3600, announce: false } }], 'tool_use'));
@@ -319,7 +325,7 @@ describe("EventGate sleep: its wake, a stop and a fork's end", () => {
       await f.framework.runUntilIdle();
       assert.deepStrictEqual(calls.refused, [`sleep: Nothing was set: a sleep quiets the whole agent, not one conversation.${remedy}`]);
     } finally {
-      (f.framework as unknown as { eventGate: EventGate }).eventGate.clearSleep();
+      gate.clearSleep();
       await f.close();
     }
   });
@@ -327,30 +333,19 @@ describe("EventGate sleep: its wake, a stop and a fork's end", () => {
   it("a closing fork isn't pointed at skip_reply when its sleep is refused, since its self-wake would end with it", async () => {
     const CH = 'discord:g1:dm3';
     const IDLE_TTL_MS = 60_000;
-    const f = await fixture({ framework: {
-      gate: { config: { policies: [], default: 'always' }, configPath: join(TMP_DIR, 'gate-fork-closing.json') },
-      conversations: { templateAgent: 'agent', bind: { channel: 'always' }, trigger: { channel: 'always' }, idleTtlMs: IDLE_TTL_MS },
-    } as never });
+    const { f, gate, incoming } = await forkFixture(CH, { idleTtlMs: IDLE_TTL_MS });
     const calls = gateToolCalls(f.framework);
     try {
-      await f.send('channels/register', { channels: [{ id: CH, type: 'discord', label: 'dm3', initiallyOpen: true, metadata: { channelType: 'guild_text' } }] });
-      await eventually(() => (f.framework as unknown as { channelRegistry: { getDesiredState(s: string, c: string): string | undefined } }).channelRegistry.getDesiredState('editor', CH) === 'open', 'the channel is open');
-      await f.send('channels/incoming', {
-        messages: [{ channelId: CH, messageId: 'm1', timestamp: TS, author: { id: 'U1', name: 'antra' }, tags: ['chat:from-human'], content: [{ type: 'text', text: 'hello' }] }],
-      });
+      await incoming('m1');
       await f.framework.runUntilIdle(); // the fork's first turn answers with the fixture's 'ok'
-      // As conversation-routing's forceExpiry does: idle past the TTL, and the sweep due.
-      const binding = (f.framework as unknown as { getConversationRouter(): { getBinding(id: string): { lastActivity: number } | undefined } }).getConversationRouter().getBinding(CH);
-      assert.ok(binding, 'the fork is bound');
-      binding.lastActivity = Date.now() - IDLE_TTL_MS - 1_000;
-      (f.framework as unknown as { lastConversationSweep: number }).lastConversationSweep = 0;
+      forceExpiry(f.framework, CH, IDLE_TTL_MS); // idle past the TTL, and the sweep due
       f.membrane.pushResponse(createMockResponse([{ type: 'tool_use', id: 's1', name: 'sleep', input: { seconds: 3600, announce: false } }], 'tool_use'));
       f.membrane.pushResponse(ok());
       f.framework.pushEvent({ type: 'external-message', source: 'test', content: 'tick', metadata: {} } as never);
       await f.framework.runUntilIdle();
       assert.deepStrictEqual(calls.refused, ['sleep: Nothing was set: a sleep quiets the whole agent, not one conversation.'], 'its closure turn is told no way back');
     } finally {
-      (f.framework as unknown as { eventGate: EventGate }).eventGate.clearSleep();
+      gate.clearSleep();
       await f.close();
     }
   });
