@@ -379,20 +379,26 @@ export class ModuleRegistry {
         MAX_CONTEXT_TIMEOUT_MS,
       );
       let timer: ReturnType<typeof setTimeout> | undefined;
+      // The race settles once: an answer after the timeout reaches neither
+      // the push nor the line, so it can't join injections already returned.
+      // The call runs inside a promise, so a module that throws before it
+      // returns one fails alone, as one that rejects does.
       const promise = Promise.race([
-        module.gatherContext(agentName).then(r => {
-          // Deprecated mechanism (agent-framework#171): still applied, but
-          // every injecting module is named once on stderr.
-          if (r.length > 0) warnContextInjectionDeprecated('module', module.name);
-          injections.push(...r);
-        }),
-        new Promise<void>((_, rej) => {
+        Promise.resolve().then(() => module.gatherContext!(agentName)),
+        new Promise<never>((_, rej) => {
           timer = setTimeout(
             () => rej(new Error(`gatherContext timed out after ${budgetMs}ms`)),
             budgetMs,
           );
         }),
       ])
+        .then(r => {
+          // Deprecated mechanism (agent-framework#171): still applied, and
+          // each module whose injections arrive in time is named once on
+          // stderr.
+          if (r.length > 0) warnContextInjectionDeprecated('module', module.name);
+          injections.push(...r);
+        })
         .catch(err => console.error(`[${module.name}] gatherContext:`, err))
         .finally(() => clearTimeout(timer));
 

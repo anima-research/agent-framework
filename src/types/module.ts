@@ -111,17 +111,20 @@ export interface Module {
    *
    * @deprecated Context injection is deprecated (agent-framework#171).
    * Injections are per-compile overlays, never stored in the conversation. A
-   * `beforeUser` or `afterUser` injection is re-anchored to the latest
-   * user-participant message on every compile, so it breaks prompt-cache
-   * prefixes across activations (head-only hits on OpenAI lanes), and a
-   * `beforeUser` injection can land between a tool call and its result. A
-   * `system` injection is appended to the system prompt, so whenever its text
-   * changes, the request changes from there on, ahead of every message. Do
-   * not add new implementations: durable content belongs in the agent's
-   * configured system prompt, which the host's configuration sets, and
-   * changing state in conversation content (events, tool results). Still
-   * called for now; the framework logs one `[deprecated]` line per module
-   * that injects.
+   * `beforeUser` or `afterUser` injection is placed beside the latest
+   * user-participant message, tool results included, on every compile, so it
+   * moves each time a newer one takes its place, which breaks prompt-cache
+   * prefixes at its old slot (head-only hits on OpenAI lanes), and a
+   * `beforeUser` injection placed beside a tool result lands between the tool
+   * call and its result. With no user-participant message, context-manager
+   * before 0.16 drops a `beforeUser` injection. A `system` injection's text is
+   * appended to the system prompt, which comes before every message, so with
+   * a prefix cache each new text of it misses the cache for everything after
+   * it. Do not add new implementations: durable content belongs in the
+   * agent's configured system prompt, which the host's configuration sets,
+   * and changing state belongs in conversation content (events, tool
+   * results). Still called for now; the framework logs one `[deprecated]`
+   * line per module whose injections it gathers in time.
    */
   gatherContext?(agentName: string): Promise<ContextInjection[]>;
 
