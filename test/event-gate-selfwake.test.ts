@@ -96,6 +96,17 @@ describe('EventGate self-wake', () => {
     gate.dispose();
   });
 
+  it('survives a turn that continues another (onInferenceResumed)', async () => {
+    const { gate, inferenceRequests } = makeGate();
+    gate.armSelfWake('agent', 1);
+    // A budget restart or a guard retry takes up the turn that armed it.
+    gate.onInferenceResumed('agent');
+    gate.onInferenceEnded('agent');
+    await sleep(1150);
+    assert.strictEqual(inferenceRequests.length, 1, 'the continuing turn leaves the self-wake armed');
+    gate.dispose();
+  });
+
   it('survives the arming turn itself (arm mid-turn, fire after end)', async () => {
     const { gate, inferenceRequests } = makeGate();
     // Turn starts, THEN skip_reply arms the wake mid-turn, then the turn ends

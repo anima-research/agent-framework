@@ -1,6 +1,7 @@
 import type { ContentBlock, YieldingStream } from '@animalabs/membrane';
 import type { ContextStrategy } from '@animalabs/context-manager';
 import type { ToolCallId, ToolResult, ToolCall } from './events.js';
+import type { SilentHeartbeatTick } from '../silent-heartbeat.js';
 
 export type SameRoundThinkTextPolicy = 'public' | 'private';
 export type SameRoundThinkTextPolicySource =
@@ -13,7 +14,12 @@ export type SameRoundThinkTextPolicySource =
  */
 export interface AgentConfig {
   toolPresentation?: import("../tool-presentation.js").ToolPresentationConfig;
-  /** Unique name for this agent */
+  /**
+   * Unique name for this agent: create() refuses two configured agents of one
+   * name. Names compare exactly, so `Dup` beside `dup` is two agents, though
+   * the history tool's author filter matches their own turns without letter
+   * case and can't tell them apart there.
+   */
   name: string;
 
   /** Model to use (e.g., 'claude-sonnet-4-20250514') */
@@ -26,9 +32,19 @@ export interface AgentConfig {
   strategy?: ContextStrategy;
 
   /**
-   * Which tools this agent can use.
+   * Enforced at dispatch for registered agent callers; omitted means 'all'.
    * - 'all': all available tools
-   * - string[]: specific tool names (with module prefix)
+   * - string[]: exact tool names, including module--utility names for utilities.
+   * Utilities aren't tools of their own: an agent's model and its scripts are
+   * offered them only through 'utils', whose run checks the utility's own
+   * name. An agent that should use a utility lists both 'utils' and
+   * 'module--utility'. The name alone passes the dispatch check for any call
+   * by that name, whether the host makes it with executeToolCall on the
+   * agent's behalf or the model or a script makes it without being offered
+   * it. The slot is hidden when no utility is permitted.
+   * Trusted module calls are exempt. Genuinely unidentified public callers,
+   * including unknown legacy names, remain unrestricted. Framework-created
+   * identities have tool authority only while registered.
    */
   allowedTools?: 'all' | string[];
 
@@ -52,11 +68,14 @@ export interface AgentConfig {
   /**
    * The model's PHYSICAL context window (provider hard cap, e.g. 200000).
    * When set, the framework projects each continuation round's real size
-   * (cache-inclusive input of the prior round + the blocks about to be
-   * appended + reserve for response) and restarts the stream through a fresh
-   * compile instead of dispatching a request the provider will 400
-   * (issue #92: a legal compile can walk past the physical window mid-turn).
-   * Unset → no projection; only the maxStreamTokens restart applies.
+   * (cache-inclusive input of the latest call that reported its prompt +
+   * that call's output + what the stream has grown by since, if later calls
+   * reported none + the blocks about to be appended + reserve for response)
+   * and restarts the stream through a fresh compile instead of dispatching a
+   * request the provider will 400 (issue #92: a legal compile can walk past
+   * the physical window mid-turn). The projection runs once a call on the
+   * stream has reported its prompt. Unset → no projection; only the
+   * maxStreamTokens restart applies.
    */
   physicalWindowTokens?: number;
 
@@ -89,11 +108,16 @@ export interface AgentConfig {
   promptCaching?: boolean;
 
   /**
-   * Prefill-formatter support: a synthetic user message appended after the
-   * conversation (e.g. chapterx's `<cmd>cat untitled.txt</cmd>` CLI-sim
-   * scaffold). Forwarded verbatim to membrane's prefill formatters; ignored
-   * by native formatting. Part of reproducing a prefill-era bot's exact
-   * prompting structure when migrating it into a resident.
+   * A synthetic user message for a request whose formatted conversation
+   * would otherwise begin with the assistant (e.g. chapterx's
+   * `<cmd>cat untitled.txt</cmd>` CLI-sim scaffold). A non-empty value is
+   * forwarded verbatim to membrane, on framework turns and the direct API
+   * alike. Membrane's anthropic-xml formatter makes it the first message,
+   * ahead of the assistant turn that carries the conversation. Its native
+   * formatter uses it as the text of a leading user turn that its tool-pair
+   * normalizer adds, in place of `[continuing]`. Part of reproducing a
+   * prefill-era bot's exact prompting structure when migrating it into a
+   * resident.
    */
   prefillUserMessage?: string;
 
@@ -163,12 +187,6 @@ export interface AgentConfig {
     autoRewind?: boolean;
     /** Max consecutive rewinds before giving up a turn. Default 3. */
     maxRewinds?: number;
-    /**
-     * When the rewound turn is a *human* message (not a machine tool result),
-     * announce the withholding on the conversational surface (Discord) rather
-     * than dropping it silently. Default true.
-     */
-    announceHumanTurns?: boolean;
   };
 
   /** Opt-in tool-output admission and one guarded retry after a provider
@@ -188,7 +206,8 @@ export interface AgentConfig {
    *   that publication envelope through the same authorized resolver.
    *   See docs/hybrid-prose-routing.md.
    * - 'disabled': generated prose is never published. Only explicit tools may
-   *   send externally; prose remains in Chronicle with a private suppression receipt.
+   *   send externally; prose remains in Chronicle, and a turn that wrote plain
+   *   speech ends with a private `[delivered] plain speech → no channel` receipt.
    */
   proseRouting?: 'locus' | 'explicit' | 'hybrid' | 'disabled';
 
@@ -222,7 +241,20 @@ export interface AgentRuntimeSettingsPatch {
 }
 
 export interface AgentRuntimeSettingsSnapshot {
+  /**
+   * The budget the agent is set to: while a lower one converges, its target,
+   * and while a persisted one the agent couldn't apply is kept, that one.
+   */
   contextBudgetTokens: number;
+  /**
+   * The budget compiles plan at now: the live budget, or the default when the
+   * recipe sets none (the context manager's own default is the same). It
+   * equals `contextBudgetTokens` except while a lower budget converges, when
+   * it is still the budget the descent started from (context-manager #162),
+   * and while a budget the agent couldn't apply is kept, when it is the
+   * budget the agent runs at instead.
+   */
+  effectiveContextBudgetTokens: number;
   tailTokens?: number;
   transitionPaceTokens?: number;
   sameRoundThinkTextPolicy: SameRoundThinkTextPolicy;
@@ -232,7 +264,27 @@ export interface AgentRuntimeSettingsSnapshot {
 }
 
 /** Persisted values differ from recipe defaults; omitted keys inherit config. */
-export type AgentRuntimeSettingsOverrides = AgentRuntimeSettingsPatch;
+export type AgentRuntimeSettingsOverrides = AgentRuntimeSettingsPatch & {
+  /**
+   * The record's own `contextBudgetTokens`, written when a compile at the
+   * agent's live budget fits at it, with nothing about the budget changed
+   * while it ran (a paced descent's settle included): the store fit that
+   * budget. A compile the context manager refuses at it as over budget
+   * withdraws it, unless a compile at it that started later has already
+   * ended.
+   * When it equals `contextBudgetTokens`, a restore applies that budget at
+   * once, rather than pacing a descent again from the recipe's budget
+   * (context-manager #162), if a preview at boot says it still fits; if not,
+   * a budget below the recipe's restores paced, and if a compile at one that
+   * the boot applied at once is refused, the agent restores it paced then.
+   * Since the store fit it when the field was written, the planner can fold
+   * to it at once even if its carried frontier was lost. Any other value is
+   * stale (the budget changed since, or an earlier release carried the field
+   * forward), and a budget below the recipe's restores paced, as it does
+   * without the field. Never part of a patch.
+   */
+  contextBudgetReachedTokens?: number;
+};
 
 /**
  * Result of running inference.
@@ -270,13 +322,18 @@ export interface InferenceOptions {
 
 /**
  * Internal state of an agent.
+ *
+ * `supportsInjectedMessages` is what the stream declared with the round's
+ * tool calls (membrane's `ToolContext.supportsInjectedMessages`): whether it
+ * can carry messages injected with that round's results. It's absent when
+ * the stream doesn't say, as on membrane 0.5.87 and earlier.
  */
 export type AgentState =
   | { status: 'idle' }
   | { status: 'inferring'; promise: Promise<InferenceResult>; abortController: AbortController }
   | { status: 'streaming'; stream: YieldingStream }
-  | { status: 'waiting_for_tools'; pending: Map<ToolCallId, PendingToolCall>; completed: CompletedToolCall[]; stream?: YieldingStream }
-  | { status: 'ready'; toolResults: CompletedToolCall[]; stream?: YieldingStream };
+  | { status: 'waiting_for_tools'; pending: Map<ToolCallId, PendingToolCall>; completed: CompletedToolCall[]; stream?: YieldingStream; supportsInjectedMessages?: boolean }
+  | { status: 'ready'; toolResults: CompletedToolCall[]; stream?: YieldingStream; supportsInjectedMessages?: boolean };
 
 /**
  * A tool call that's in progress.
@@ -306,6 +363,18 @@ export interface InferenceRequest {
   /** Host-owned identity for withdrawal of an unconsumed coalesced wake. */
   coalescingSubject?: string;
   coalescingEventId?: string;
+  /** Host-owned: this wake's cause is an RFC-006 deferred batch, which has
+   *  no model-visible content until it renders at the turn's assembly. */
+  coalescingBatch?: boolean;
+  /** Host-owned, set on a turn's trigger when EVERY request batched into it
+   *  was a deferred-batch wake: these are their subjects. If assembly settles
+   *  all of them without materializing content, the turn has no cause left
+   *  and does not run. */
+  coalescingBatchSubjects?: string[];
+  /** Host-owned: this wake's sole cause is reading this deferred write, a
+   *  coalesced render placed in its agent's queue (wakeToRead). Once the
+   *  agent has read the write, or it was removed, the wake starts no turn. */
+  readsDeferredWrite?: string;
   agentName: string;
   reason: string;
   source: string;
@@ -317,7 +386,8 @@ export interface InferenceRequest {
    * replies in the channel it is answering — not the process-global most-recent-
    * inbound locus, which a concurrent message elsewhere can hijack (item-3
    * redux). Undefined for non-channel wakes (heartbeat, timers, module events),
-   * which correctly fall back to the global default channel.
+   * which correctly fall back to the global default channel, except an
+   * ephemeral run's (a subagent's), which takes no global fallback.
    */
   channelId?: string;
   /**
@@ -351,7 +421,10 @@ export interface InferenceRequest {
   /** Suppress every automatic plain-prose delivery for this logical turn.
    * Explicit tool calls remain available. Used by authenticated silent wakes. */
   suppressProse?: boolean;
-  /** Ephemeral system-position prompt for this turn only. Never written to
-   * Chronicle; callers must supply bounded non-secret control text. */
-  ephemeralSystemPrompt?: string;
+  /** The authenticated silent heartbeat tick this turn answers. The rows the
+   * turn's reply stores (its assistant responses and tool results) are
+   * stamped `metadata.silentHeartbeat` with it, and request builds render a
+   * request-only separator carrying the tick's instruction before the tick's
+   * first surviving row (`SILENT_HEARTBEAT_SEPARATOR`). */
+  silentHeartbeat?: SilentHeartbeatTick;
 }

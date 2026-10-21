@@ -1,9 +1,11 @@
 /**
  * The exported REFUSAL_REACTION_BASELINE must be exactly the set of markers
  * reactToRefusal can emit — every category's emoji plus the unknown-category
- * fallback, nothing more, nothing less. Host composition serializes this
- * export into DISCORD_SUPPRESSED_REACTIONS_BASELINE; if the emitted set and
- * the export could drift, a framework annotation could re-enter a resident's
+ * fallback, nothing more, nothing less. It is the refusal set only: the
+ * protective default the framework injects into DISCORD_SUPPRESSED_REACTIONS_BASELINE
+ * is framework.getPlacedReactionBaseline(), which adds the awareness markers
+ * (test/placed-reaction-baseline.test.ts). If the emitted refusal set and the
+ * export could drift, a framework annotation could re-enter a resident's
  * context as a reaction event (the 8/3 Mythos self-amplifying refusal loop).
  * The implementation shares one constant; these tests pin the contract so a
  * refactor that splits them fails here first.
@@ -73,6 +75,12 @@ describe('refusal-reaction baseline export', () => {
     // Exactness both ways: the framework can emit everything the baseline
     // names — no stale entries suppressing markers nothing stamps anymore.
     assert.deepEqual(emitted, new Set(REFUSAL_REACTION_BASELINE));
+  });
+
+  it('a category named like an inherited property takes the fallback', async () => {
+    for (const category of ['constructor', 'toString', '__proto__']) {
+      assert.equal(await emittedFor(category), REFUSAL_REACTION_FALLBACK, category);
+    }
   });
 
   it('serialized baseline survives the Discord adapter env round-trip (comma-join)', () => {

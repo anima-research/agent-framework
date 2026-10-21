@@ -13,6 +13,11 @@ jobs:
   build-and-test:
     name: Build & Test (${{ matrix.os }}, node ${{ matrix.node }})
     runs-on: ${{ matrix.os }}
+    # Without a limit, a step that hangs leaves the check pending until
+    # GitHub's six-hour limit. Passing runs take under seven minutes. A
+    # test file stuck under Node 20, or a test stuck under Node 24, fails
+    # sooner and by name, through npm test's --test-timeout.
+    timeout-minutes: 20
     strategy:
       fail-fast: false
       # Both platforms: a package-lock.json regenerated over an existing
@@ -36,7 +41,8 @@ jobs:
           node-version: ${{ matrix.node }}
 
       # Root lockfiles are deliberately gitignored in this repo, so plain
-      # npm install (matching publish.yml). No lock to guard here.
+      # npm install, as publish.yml's build-and-test job does. No lock to
+      # guard here.
       - name: Install dependencies
         run: npm install
 
@@ -50,3 +56,113 @@ jobs:
       # are asynchronous on macOS), and ubuntu-only runs have missed that.
       - name: Test
         run: npm test
+
+      # npm test runs with --test-force-exit, which hides async work a test
+      # leaves running, such as a late arrival after stop() ("Queue is
+      # closed"). These files run unforced so that class fails here, not in a
+      # later PR's qualification. They get npm test's --test-timeout too:
+      # under Node 20 it fails a file whose leftover work keeps it alive, by
+      # name, and under Node 24 the job's limit ends such a file.
+      - name: Test unforced (work in flight at stop)
+        run: node --test --test-timeout=600000 dist/test/stop-with-work-in-flight.test.js dist/test/stop-with-host-operations.test.js dist/test/conversation-routing.test.js
+
+  # The release as npm would pack it, installed on its own and loaded, as
+  # the publish workflow checks before it publishes (see
+  # scripts/pack-installs-alone.mjs): here a change that leaves a file out
+  # of the package, or imports what only devDependencies supply, fails
+  # before it merges, not after a tag and its release notes are out. The
+  # install resolves dependencies from the registry as it stands, so a new
+  # upstream release can turn it red on a change that touched nothing it
+  # installs: when it fails, rerunning it on main tells a change's own break
+  # from the registry's drift. The job stops at 40 minutes, not at GitHub's 6
+  # hours: above the check's own limits (10 minutes each for npm pack and npm
+  # install, a minute for each load), so the check names what hung.
+  pack-check:
+    name: Packed release installs on its own
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+
+      - name: Setup Node.js
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with:
+          node-version: 24
+
+      # As publish installs, so a build that came to need a dependency's
+      # install script fails here, before a tag, rather than in publish.
+      - name: Install dependencies
+        run: npm install --ignore-scripts
+
+      - name: Build
+        run: npm run build
+
+      # bun loads the package's `bun` export target, which Node never reads.
+      # 1.3.14 is the bun connectome-host's CI runs this package under.
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: 1.3.14
+
+      # Bun's WebSocket client quotes the url as dialed in a failed dial's
+      # message, which Node's never does, so the test that the dial's error
+      # masks it runs its probe under bun. The build-and-test job has no bun
+      # and skips it; here AF_TEST_REQUIRE_BUN makes a missing bun a failure.
+      - name: WebSocket dial errors under Bun
+        env:
+          AF_TEST_REQUIRE_BUN: '1'
+        run: node --import ./dist/test/helpers/force-exit-blocking-stdout.js --test --test-force-exit --test-timeout=600000 dist/test/mcpl-ws-transport.test.js
+
+      - name: Packed release installs on its own
+        run: node scripts/pack-installs-alone.mjs
+
+      # create() refuses codeExecution on a Bun older than 1.4.0, reading the
+      # Bun it runs under: the settings file checks that here, under the Bun
+      # connectome-host's CI runs, which create() refuses.
+      - name: code_execution's settings under Bun 1.3.14, which create() refuses
+        run: bun test --timeout 60000 ./test/code-execution-isolate-settings.test.ts
+
+  # A Bun host runs a script's process on Bun too, from the package's source,
+  # so code_execution's files run there as well as under Node, each file in a
+  # process of its own, on both platforms, since the child's stdio and fd 3
+  # are where runtimes and platforms differ. code_execution needs Bun 1.4.0 or
+  # later (create() refuses it on an older one), so they run under 1.4.0, the
+  # oldest release it admits, and under 1.4.3.
+  code-execution-bun:
+    name: code_execution under Bun (${{ matrix.os }}, bun ${{ matrix.bun }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        bun: [1.4.0, 1.4.3]
+
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+
+      - name: Setup Node.js
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with:
+          node-version: 24
+
+      - name: Install dependencies
+        run: npm install --ignore-scripts
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: ${{ matrix.bun }}
+
+      - name: code_execution's tests under Bun, from source
+        run: |
+          for f in test/code-execution-isolate-*.test.ts test/code-execution-engine.test.ts test/code-execution.test.ts; do
+            echo "::group::$f"
+            bun test --timeout 60000 "./$f" || exit 1
+            echo "::endgroup::"
+          done

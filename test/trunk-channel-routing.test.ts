@@ -22,13 +22,27 @@ import { tmpdir } from 'node:os';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { AgentFramework } from '../src/index.js';
-import type { ProcessEvent } from '../src/index.js';
+import type {
+  ProcessEvent,
+  Module,
+  ModuleContext,
+  ToolDefinition,
+  ToolCall,
+  ToolResult,
+  EventResponse,
+} from '../src/index.js';
 import { MockMembrane, createMockResponse } from './helpers/mock-membrane.js';
+import { ChannelRegistry } from '../src/mcpl/channel-registry.js';
+import type { McplServerRegistry } from '../src/mcpl/server-registry.js';
+import type { FeatureSetManager } from '../src/mcpl/feature-set-manager.js';
+import { MembraneError } from '@animalabs/membrane';
+import type { ContentBlock } from '@animalabs/membrane';
+import type { ContextInjection } from '@animalabs/context-manager';
 
-/** Reach the private per-turn triggering-channel map + the pure channel-deriver. */
+/** Reach the private per-turn routing state (its triggering channel) + the pure channel-deriver. */
 function internals(framework: AgentFramework) {
   return framework as unknown as {
-    activeTriggerChannels: Map<string, string>;
+    turnRouting: Map<string, { triggerChannel?: string }>;
     pendingRequests: Array<{ agentName: string; reason: string; source: string; timestamp: number; channelId?: string }>;
     derivePushEventChannel(
       origin: Record<string, unknown> | undefined,
@@ -146,7 +160,9 @@ describe('Trunk channel routing (item-3 redux)', () => {
     i.channelRegistry = {
       ensureChannelRegistered: () => {},
       isChannelOpen: () => false,
+      getChannelLabel: () => undefined,
       getDescriptor: () => ({ capabilities: { history: { maxMessages: 80 } } }),
+      inboundOnlyServer: () => undefined,
       stopAll: () => {},
     };
 
@@ -182,10 +198,16 @@ describe('Trunk channel routing (item-3 redux)', () => {
     assert.match(text, /channel_decline/);
     assert.match(text, /optionally set acknowledge/);
     assert.match(text, /Doing nothing is also fine\./);
-    // 2026-08-05 accuracy pass: the delivery model must be stated correctly —
-    // direct addresses still arrive; un-@'d follow-ups to a reply do not.
-    assert.match(text, /address you directly/);
-    assert.match(text, /follow-ups to your reply will NOT reach you/);
+    // #406: what else reaches the agent is each server's delivery (slack-mcpl
+    // keeps its own subscription), so the invitation says only what holds on
+    // every server, and that a reply opens the channel, as routeSpeech does.
+    assert.match(
+      text,
+      /a channel you haven't opened\. Messages there that address you, such as an @-mention, reach you whether or not you open it\./,
+    );
+    assert.match(text, /prefixed with ">>#portables"; it will be delivered there, which opens the channel\./);
+    assert.match(text, /2\. Open the channel — call channel_open/);
+    assert.doesNotMatch(text, /invisible to you|follow-ups to your reply|without joining/);
     // No surface-tracked tally on this event → no missed-count sentence.
     assert.doesNotMatch(text, /passed there without you/);
     await framework.stop();
@@ -197,7 +219,9 @@ describe('Trunk channel routing (item-3 redux)', () => {
     i.channelRegistry = {
       ensureChannelRegistered: () => {},
       isChannelOpen: () => false,
+      getChannelLabel: () => undefined,
       getDescriptor: () => ({ capabilities: { history: { maxMessages: 80 } } }),
+      inboundOnlyServer: () => undefined,
       stopAll: () => {},
     };
 
@@ -262,8 +286,10 @@ describe('Trunk channel routing (item-3 redux)', () => {
     i.channelRegistry = {
       ensureChannelRegistered: () => {},
       isChannelOpen: () => false,
+      getChannelLabel: () => undefined,
       getDescriptor: () => ({ label: 'DM: _reim0n', capabilities: { history: { maxMessages: 80 } } }),
       proseTargetFor: (id: string, serverId?: string) => { asked.push(`${serverId}/${id}`); return '@_reim0n'; },
+      inboundOnlyServer: () => undefined,
       stopAll: () => {},
     };
     i.handleMcplPushEvent(dmEvent('m3'));
@@ -280,15 +306,17 @@ describe('Trunk channel routing (item-3 redux)', () => {
     i2.channelRegistry = {
       ensureChannelRegistered: () => {},
       isChannelOpen: () => false,
+      getChannelLabel: () => undefined,
       getDescriptor: () => ({ label: 'DM: _reim0n', capabilities: { history: { maxMessages: 80 } } }),
       proseTargetFor: () => undefined,
+      inboundOnlyServer: () => undefined,
       stopAll: () => {},
     };
     i2.handleMcplPushEvent(dmEvent('m4'));
     const t2 = textOf(fw2);
     assert.doesNotMatch(t2, /prefixed with ">>/);
-    assert.match(t2, /Reply without joining isn't available here/);
-    assert.match(t2, /channel_open with channelId "discord:dm:1555"/, 'joining stays available');
+    assert.match(t2, /Replying with a ">>" prefix isn't available here: .* Open it \(option 2\) to reply\./);
+    assert.match(t2, /channel_open with channelId "discord:dm:1555"/, 'opening stays available');
     await fw2.stop();
 
     // A registry stand-in without proseTargetFor: a whitespace-free guess, never the spaced label.
@@ -297,12 +325,165 @@ describe('Trunk channel routing (item-3 redux)', () => {
     i3.channelRegistry = {
       ensureChannelRegistered: () => {},
       isChannelOpen: () => false,
+      getChannelLabel: () => undefined,
       getDescriptor: () => undefined,
+      inboundOnlyServer: () => undefined,
       stopAll: () => {},
     };
     i3.handleMcplPushEvent(dmEvent('m5'));
     assert.match(textOf(fw3), /prefixed with ">>discord:dm:1555"/);
     await fw3.stop();
+  });
+
+  it('the invitation offers no reply into a channel its server declared inbound-only, and says why', async () => {
+    // pocket-body's live transcript: another agent speaking in the room arrives
+    // on it addressed, and the host publishes nothing into it, so a ">>" reply would
+    // only be refused.
+    const framework = await makeFramework();
+    const i = internals(framework);
+    i.channelRegistry = {
+      ensureChannelRegistered: () => {},
+      isChannelOpen: () => false,
+      getDescriptor: () => ({ label: 'Body · ears', direction: 'inbound' }),
+      getChannelLabel: () => 'Body · ears',
+      proseTargetFor: () => '#ears',
+      inboundOnlyServer: (id: string) => (id === 'body:ears' ? 'pocket-body' : undefined),
+      stopAll: () => {},
+    };
+    i.handleMcplPushEvent({
+      type: 'mcpl:push-event',
+      serverId: 'pocket-body',
+      featureSet: 'body',
+      eventId: 'ears_1',
+      content: [{ type: 'text', text: 'Fable: Linn, can you hear me?' }],
+      origin: { source: 'pocket-body', messageId: 'e1', mcplChannelId: 'body:ears', channelName: 'Body · ears' },
+      tags: ['chat:addressed'],
+      timestamp: new Date().toISOString(),
+      inferenceId: 'i-e1',
+      triggerInference: false,
+    });
+
+    const text = framework.getAgent('scout')!.getContextManager().queryMessages({}).messages.at(-1)?.content
+      .filter((block): block is { type: 'text'; text: string } => block.type === 'text')
+      .map((block) => block.text)
+      .join('\n') ?? '';
+    assert.match(text, /Channel invitation/);
+    assert.match(
+      text,
+      /1\. Replying there isn't available: pocket-body declared this channel inbound-only, so nothing you write is posted into it\. To speak there, use pocket-body's own tools\./,
+    );
+    assert.doesNotMatch(text, /prefixed with ">>/);
+    assert.match(text, /channel_open with channelId "body:ears"/, 'opening it, to hear the room, stays available');
+    await framework.stop();
+  });
+
+  it('the invitation adds a # only where the channel\'s name lacks one, and names an unlabelled channel by its id', async () => {
+    // #406's run: slack-mcpl registers "#general (acme)" and its push carries no
+    // channelName, so the invitation named the place "##general (acme)".
+    const framework = await makeFramework();
+    const i = internals(framework);
+    const labels: Record<string, string> = {
+      'slack:C1': '#general (acme)',
+      'slack:C2': '#random',
+      // A lazily registered channel carries its id as its label.
+      'slack:C3': 'slack:C3',
+    };
+    i.channelRegistry = {
+      ensureChannelRegistered: () => {},
+      isChannelOpen: () => false,
+      getDescriptor: (id: string) => ({ label: labels[id] }),
+      getChannelLabel: (_serverId: string, id: string) => labels[id],
+      inboundOnlyServer: () => undefined,
+      stopAll: () => {},
+    };
+    const textOf = () =>
+      framework.getAgent('scout')!.getContextManager().queryMessages({}).messages.at(-1)?.content
+        .filter((block): block is { type: 'text'; text: string } => block.type === 'text')
+        .map((block) => block.text)
+        .join('\n') ?? '';
+    const mention = (channel: string, id: string) => ({
+      type: 'mcpl:push-event' as const,
+      serverId: 'slack',
+      featureSet: 'slack.messaging',
+      eventId: `slack_msg_${channel}_${id}`,
+      content: [{ type: 'text' as const, text: 'U2: @UBOT can you look at this?' }],
+      origin: { source: 'slack', messageId: id, channelId: channel, mcplChannelId: `slack:${channel}`, authorName: 'U2' },
+      tags: ['chat:mention', 'chat:addressed'],
+      timestamp: new Date().toISOString(),
+      inferenceId: `i-${id}`,
+      triggerInference: false,
+    });
+
+    i.handleMcplPushEvent(mention('C1', '101.1'));
+    const t1 = textOf();
+    assert.match(t1, /addressed you in #general \(acme\) —/);
+    assert.doesNotMatch(t1, /##/);
+    assert.match(t1, /prefixed with ">>slack:C1"/, 'a spaced label is never the guess');
+
+    i.handleMcplPushEvent(mention('C2', '102.1'));
+    const t2 = textOf();
+    assert.match(t2, /addressed you in #random —/);
+    assert.match(t2, /prefixed with ">>#random"/, 'the guess strips the label\'s own # before adding one');
+    assert.doesNotMatch(t2, /##/);
+
+    // A label that is only the id names nothing, as at the other places that name a channel.
+    i.handleMcplPushEvent(mention('C3', '103.1'));
+    const t3 = textOf();
+    assert.match(t3, /addressed you in "slack:C3" —/);
+    assert.match(t3, /prefixed with ">>slack:C3"/);
+    assert.doesNotMatch(t3, /#slack:C3/);
+    await framework.stop();
+  });
+
+  it('channel_open and channel_close leave what a channel delivers to its server', () => {
+    // #406: slack-mcpl keeps its own subscription, so opening a Slack
+    // conversation needn't bring its other messages, and closing it needn't stop them.
+    const registry = new ChannelRegistry({} as McplServerRegistry, {} as FeatureSetManager, () => {}, () => {});
+    const description = (name: string) => registry.getChannelTools().find((t) => t.name === name)?.description ?? '';
+    assert.match(description('channel_open'), /What an open channel delivers to you depends on its MCPL server\./);
+    assert.doesNotMatch(description('channel_open'), /start receiving|ongoing traffic|subscribe/);
+    assert.match(
+      description('channel_close'),
+      /Messages that address you still reach you; what else stops reaching you depends on its server\./,
+    );
+    assert.doesNotMatch(description('channel_close'), /stop receiving/);
+  });
+
+  it('the "Now open" notice leaves what an open channel delivers to its server', async () => {
+    // #406's run: after the policy's "Ongoing traffic from this channel will reach you",
+    // an unsubscribed Slack conversation's next ordinary message never arrived.
+    const framework = await makeFramework();
+    const notice = internals(framework) as unknown as {
+      recordChannelAutoOpenNotice(
+        agentName: string | undefined,
+        channels: Array<{ channelId: string; label?: string }>,
+        cause: 'subscription-policy' | 'opened-by-delivery' | 'opened-by-reply',
+      ): void;
+    };
+    const lastText = () =>
+      framework.getAgent('scout')!.getContextManager().queryMessages({}).messages.at(-1)?.content
+        .filter((block): block is { type: 'text'; text: string } => block.type === 'text')
+        .map((block) => block.text)
+        .join('\n') ?? '';
+
+    // Each form an agent can read: a delivery or a send opens one channel, and
+    // only the subscription policy opens several at once.
+    notice.recordChannelAutoOpenNotice('scout', [{ channelId: 'slack:C1', label: '#general (acme)' }], 'opened-by-delivery');
+    const one = lastText();
+    assert.match(
+      one,
+      /Now open: #general \(acme\) \(slack:C1\): your own message into the closed channel opened it\. What an open channel delivers to you depends on its server\. If you don't want it, use channel_close/,
+    );
+    assert.doesNotMatch(one, /will reach you/);
+
+    notice.recordChannelAutoOpenNotice('scout', [{ channelId: 'slack:C1' }, { channelId: 'slack:C2' }], 'subscription-policy');
+    const two = lastText();
+    assert.match(
+      two,
+      /Selected for opening by subscription policy: slack:C1, slack:C2\. This records the admission decision; channel_list shows current transport state\. What an open channel delivers to you depends on its server\. If you don't want one of them, use channel_close/,
+    );
+    assert.doesNotMatch(two, /will reach you/);
+    await framework.stop();
   });
 
   it('a channel-incoming trunk turn records its triggering channel', async () => {
@@ -314,7 +495,7 @@ describe('Trunk channel routing (item-3 redux)', () => {
 
     assert.equal(membrane.calls.length, 1, 'the trunk should have run one turn');
     assert.equal(
-      internals(framework).activeTriggerChannels.get('scout'),
+      internals(framework).turnRouting.get('scout')?.triggerChannel,
       'discord:guild:chanA',
       'the turn must be routed to the channel that triggered it',
     );
@@ -330,7 +511,7 @@ describe('Trunk channel routing (item-3 redux)', () => {
 
     assert.equal(membrane.calls.length, 1, 'the trunk should wake for the DM');
     assert.equal(
-      internals(framework).activeTriggerChannels.get('scout'),
+      internals(framework).turnRouting.get('scout')?.triggerChannel,
       'discord:dm:42',
       'the DM reply must route to the DM channel, not the global locus',
     );
@@ -346,7 +527,7 @@ describe('Trunk channel routing (item-3 redux)', () => {
     membrane.pushResponse(createMockResponse([{ type: 'text', text: 'ans A' }]));
     framework.pushEvent(channelIncoming('discord:guild:chanA', 'A: hi'));
     await framework.runUntilIdle();
-    assert.equal(i.activeTriggerChannels.get('scout'), 'discord:guild:chanA');
+    assert.equal(i.turnRouting.get('scout')?.triggerChannel, 'discord:guild:chanA');
 
     // ...then a DM turn OVERWRITES it — the next turn's reply must never inherit
     // the previous turn's channel (the concurrency hazard this fix removes).
@@ -355,10 +536,91 @@ describe('Trunk channel routing (item-3 redux)', () => {
     await framework.runUntilIdle();
     assert.equal(membrane.calls.length, 2, 'both turns should have run');
     assert.equal(
-      i.activeTriggerChannels.get('scout'),
+      i.turnRouting.get('scout')?.triggerChannel,
       'discord:dm:42',
-      'the map must reflect the CURRENT turn’s channel, not chanA',
+      'the routing state must reflect the CURRENT turn’s channel, not chanA',
     );
+    await framework.stop();
+  });
+
+  it("the channel registry resolves and reports the current turn's trigger channel, then its locus", async () => {
+    const framework = await makeFramework();
+    const i = framework as unknown as {
+      initializeMcpl(servers: unknown[]): Promise<void>;
+      channelRegistry: {
+        resolveLocus(agentName: string): string | null;
+        buildChannelContext(agentName?: string): { defaultOutgoing?: { channelId: string } } | undefined;
+      };
+      turnRouting: Map<string, { triggerChannel?: string; locus?: string }>;
+    };
+    // The real registry, with no servers: its resolver reads the framework's turn state.
+    await i.initializeMcpl([]);
+    i.turnRouting.set('scout', { triggerChannel: 'discord:guild:chanA' });
+    assert.equal(i.channelRegistry.resolveLocus('scout'), 'discord:guild:chanA',
+      'the locus a turn freezes comes from its trigger channel');
+    assert.equal(i.channelRegistry.buildChannelContext('scout')?.defaultOutgoing?.channelId, 'discord:guild:chanA',
+      'and the agent is told the same channel');
+    // A re-pin moved the turn's locus: a later start of the turn tells the
+    // agent where its speech now lands.
+    i.turnRouting.set('scout', { triggerChannel: 'discord:guild:chanA', locus: 'discord:dm:42' });
+    assert.equal(i.channelRegistry.buildChannelContext('scout')?.defaultOutgoing?.channelId, 'discord:dm:42');
+    await framework.stop();
+  });
+
+  it("the compile a capacity hold defers a turn to keeps the turn's trigger channel", async () => {
+    // The first stream ends with an organization acceleration 429, which
+    // holds the turn; a message from another channel arrives during the hold.
+    membrane.pushResponse(createMockResponse([] as never[]));
+    const framework = await makeFramework();
+    const makeStream = membrane.streamYielding.bind(membrane);
+    let streams = 0;
+    membrane.streamYielding = (request, options) => {
+      const stream = makeStream(request, options);
+      const n = ++streams;
+      const iterate = stream[Symbol.asyncIterator].bind(stream);
+      stream[Symbol.asyncIterator] = async function* () {
+        for await (const event of { [Symbol.asyncIterator]: iterate }) {
+          if (event.type === 'complete' && n === 1) {
+            yield {
+              type: 'error' as const,
+              error: new MembraneError({
+                type: 'rate_limit', retryable: true, httpStatus: 429,
+                message: "This request would exceed your organization's maximum usage increase rate for input tokens per minute",
+                rawError: { status: 429 }, rawRequest: request,
+              }),
+            };
+            return;
+          }
+          yield event;
+        }
+      };
+      return stream;
+    };
+    const held = framework as unknown as {
+      providerAccelerationCooldowns: Map<string, { until: number; heldRequests: Array<{ channelId?: string }> }>;
+      releaseProviderAccelerationCooldown(agentName: string): void;
+    };
+    const triggerAtStart: Array<string | undefined> = [];
+    framework.onTrace((event) => {
+      if (event.type !== 'inference:started') return;
+      triggerAtStart.push(internals(framework).turnRouting.get('scout')?.triggerChannel);
+      if (triggerAtStart.length === 2) membrane.pushResponse(createMockResponse([{ type: 'text', text: 'back' }]));
+    });
+
+    framework.pushEvent(channelIncoming('discord:guild:chanA', 'A: what time is it'));
+    await framework.runUntilIdle();
+    assert.ok(held.providerAccelerationCooldowns.has('scout'), 'the turn is held');
+    framework.pushEvent(channelIncoming('discord:guild:chanB', 'B: unrelated chatter'));
+    await framework.runUntilIdle();
+    const hold = held.providerAccelerationCooldowns.get('scout')!;
+    assert.ok(hold.heldRequests.some((r) => r.channelId === 'discord:guild:chanB'), "chanB's wake waits in the hold with the turn's");
+    // What the hold's timer does when it fires, at the hold's deadline.
+    hold.until = Date.now();
+    held.releaseProviderAccelerationCooldown('scout');
+    await framework.runUntilIdle();
+
+    assert.deepEqual(triggerAtStart, ['discord:guild:chanA', 'discord:guild:chanA'],
+      "the deferred compile's batch names chanB, and the turn keeps chanA");
     await framework.stop();
   });
 
@@ -371,7 +633,7 @@ describe('Trunk channel routing (item-3 redux)', () => {
     // turn (an InferenceRequest with no channelId). startAgentStream must clear
     // the entry up front so routeSpeech falls back to the global locus rather
     // than replaying the stale channel.
-    i.activeTriggerChannels.set('scout', 'discord:guild:stale');
+    i.turnRouting.set('scout', { triggerChannel: 'discord:guild:stale' });
     const scout = framework.getAgent('scout')!;
     await (framework as unknown as {
       startAgentStream(agent: unknown, trigger?: unknown): Promise<void>;
@@ -381,10 +643,308 @@ describe('Trunk channel routing (item-3 redux)', () => {
     await framework.runUntilIdle();
 
     assert.equal(
-      i.activeTriggerChannels.has('scout'),
-      false,
+      i.turnRouting.get('scout')?.triggerChannel,
+      undefined,
       'a no-trigger turn must clear any stale triggering channel',
     );
+    await framework.stop();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Residents read one message slot
+// ---------------------------------------------------------------------------
+// Every ordinary resident reads the same message slot, and a tool boundary
+// weighs only the messages drained for its own agent. So each resident's open
+// turn weighs what lands in the slot by its own rule (an addressed message,
+// or a follow-up in a channel the turn engaged), whichever agent it was
+// stored for: by addMessage, by a boundary's drain, or by a start's own flush.
+
+/** A channel message as a channel server forwards it, waking only `target`. */
+function residentIncoming(channelId: string, text: string, target: string, addressed: boolean): ProcessEvent {
+  return {
+    type: 'mcpl:channel-incoming',
+    serverId: 'discord',
+    channelId,
+    messageId: `m-${Math.random().toString(36).slice(2)}`,
+    author: { id: 'U1', name: 'antra' },
+    content: [{ type: 'text', text }],
+    timestamp: new Date().toISOString(),
+    metadata: addressed ? { mentioned: true } : {},
+    tags: addressed ? ['chat:addressed'] : ['chat:ambient', 'chat:from-human'],
+    triggerInference: true,
+    targetAgents: [target],
+  } as unknown as ProcessEvent;
+}
+
+/** A module whose `pause` tool runs `during` before it returns, and whose
+ *  context gathering runs `startHook` once, in the named agent's next start. */
+class PauseModule implements Module {
+  readonly name = 'pause';
+  during: (() => Promise<void>) | null = null;
+  startHook: { agent: string; run: () => void } | null = null;
+  async start(_ctx: ModuleContext): Promise<void> {}
+  async stop(): Promise<void> {}
+  async gatherContext(agentName: string): Promise<ContextInjection[]> {
+    const hook = this.startHook;
+    if (hook?.agent === agentName) {
+      this.startHook = null;
+      hook.run();
+    }
+    return [];
+  }
+  getTools(): ToolDefinition[] {
+    return [{ name: 'pause', description: 'Pause briefly', inputSchema: { type: 'object', properties: {} } }];
+  }
+  async handleToolCall(_call: ToolCall): Promise<ToolResult> {
+    const during = this.during;
+    this.during = null;
+    if (during) await during();
+    return { success: true, data: { ok: true } };
+  }
+  async onProcess(): Promise<EventResponse> {
+    return {};
+  }
+}
+
+describe('Residents read one message slot', () => {
+  let tempDir: string;
+  let membrane: MockMembrane;
+  let pause: PauseModule;
+
+  beforeEach(() => {
+    tempDir = mkdtempSync(join(tmpdir(), 'resident-slot-test-'));
+    membrane = new MockMembrane();
+    pause = new PauseModule();
+  });
+
+  afterEach(() => {
+    rmSync(tempDir, { recursive: true, force: true });
+  });
+
+  type Internals = {
+    addMessage(participant: string, content: ContentBlock[], metadata?: Record<string, unknown>, opts?: { forAgent?: string }): string;
+    turnRouting: Map<string, { triggerChannel?: string }>;
+    activeTurnTokens: Map<string, number>;
+    deferredMessages: unknown[];
+    channelRegistry: unknown;
+    providerAccelerationCooldowns: Map<string, { until: number }>;
+    releaseProviderAccelerationCooldown(agentName: string): void;
+  };
+
+  /** Two residents, scout the primary and shade. A registry stand-in
+   *  resolves a fresh locus to the turn's trigger channel and records where
+   *  each agent's speech is routed. `held`'s first stream ends with an
+   *  organization acceleration 429, which holds its turn for a later
+   *  compile. `first` is that stream's rounds, and `responses[n]` feeds the
+   *  nth start (1-based) as it begins. */
+  async function residents(
+    held: 'scout' | 'shade',
+    responses: Record<number, ContentBlock[][]>,
+    first: ContentBlock[][] = [[]],
+  ) {
+    const framework = await AgentFramework.create({
+      storePath: join(tempDir, 'test.chronicle'),
+      membrane: membrane.asMembrane(),
+      agents: [
+        { name: 'scout', model: 'test-model', systemPrompt: 'You are scout.' },
+        { name: 'shade', model: 'test-model', systemPrompt: 'You are shade.' },
+      ],
+      modules: [pause],
+    });
+    const i = framework as unknown as Internals;
+    const routed: Array<{ agent: string; text: string; locus: string | null }> = [];
+    const registry: Record<string, unknown> = {
+      resolveLocus: (name: string) => i.turnRouting.get(name)?.triggerChannel ?? 'chan-default',
+      routeSpeech: async (agent: string, text: string, locus?: string | null) => {
+        routed.push({ agent, text, locus: locus ?? null });
+        return locus ? { delivered: true, channelId: locus } : null;
+      },
+      getDefaultPublishChannel: () => null,
+      isChannelOpen: () => true,
+      getDescriptor: () => undefined,
+      getChannelTools: () => [],
+    };
+    i.channelRegistry = new Proxy(registry, {
+      get: (target, prop: string) => (prop in target ? target[prop] : () => undefined),
+    });
+
+    first.forEach((blocks, n) => membrane.pushResponse(createMockResponse(blocks, n < first.length - 1 ? 'tool_use' : undefined)));
+    const makeStream = membrane.streamYielding.bind(membrane);
+    const firstStreamOf = new Set<string>();
+    membrane.streamYielding = (request, options) => {
+      const stream = makeStream(request, options);
+      const system = JSON.stringify((request as { system?: unknown }).system ?? '');
+      const agent = system.includes('You are shade.') ? 'shade' : 'scout';
+      const first = !firstStreamOf.has(agent);
+      firstStreamOf.add(agent);
+      const iterate = stream[Symbol.asyncIterator].bind(stream);
+      stream[Symbol.asyncIterator] = async function* () {
+        for await (const event of { [Symbol.asyncIterator]: iterate }) {
+          if (event.type === 'complete' && first && agent === held) {
+            yield {
+              type: 'error' as const,
+              error: new MembraneError({
+                type: 'rate_limit', retryable: true, httpStatus: 429,
+                message: "This request would exceed your organization's maximum usage increase rate for input tokens per minute",
+                rawError: { status: 429 }, rawRequest: request,
+              }),
+            };
+            return;
+          }
+          yield event;
+        }
+      };
+      return stream;
+    };
+    let starts = 0;
+    framework.onTrace((event) => {
+      if (event.type !== 'inference:started') return;
+      const feed = responses[++starts];
+      feed?.forEach((blocks, n) => membrane.pushResponse(createMockResponse(blocks, n < feed.length - 1 ? 'tool_use' : undefined)));
+    });
+
+    /** Bring `name`'s hold to its deadline and release it, as its timer does then. */
+    const release = async (name: string): Promise<void> => {
+      const hold = i.providerAccelerationCooldowns.get(name);
+      assert.ok(hold, `${name}'s turn is held`);
+      hold.until = Date.now();
+      i.releaseProviderAccelerationCooldown(name);
+      await framework.runUntilIdle();
+    };
+    return { framework, i, routed, release };
+  }
+
+  const hereIAm = [[{ type: 'text', text: 'Here I am.' }] as ContentBlock[]];
+
+  // Each row is also what main does, by re-resolving the held turn's locus
+  // from its batch's addressed wake.
+  for (const [held, role] of [['scout', 'the primary'], ['shade', 'a second resident']] as const) {
+    it(`${role}, held by a capacity hold, moves its locus to an addressed message from another channel`, async () => {
+      const { framework, i, routed, release } = await residents(held, { 2: hereIAm });
+      framework.pushEvent(residentIncoming('discord:guild:chanA', `${held}, take a look`, held, false));
+      await framework.runUntilIdle();
+      assert.ok(i.providerAccelerationCooldowns.has(held), 'the turn is held');
+      framework.pushEvent(residentIncoming('discord:dm:antra', `${held}, over here please`, held, true));
+      await framework.runUntilIdle();
+      await release(held);
+
+      assert.deepEqual(routed, [{ agent: held, text: 'Here I am.', locus: 'discord:dm:antra' }]);
+      await framework.stop();
+    });
+  }
+
+  it('a second resident, held by a capacity hold, keeps its locus for ambient traffic in another channel', async () => {
+    const { framework, routed, release } = await residents('shade', { 2: hereIAm });
+    framework.pushEvent(residentIncoming('discord:guild:chanA', 'shade, take a look', 'shade', false));
+    await framework.runUntilIdle();
+    framework.pushEvent(residentIncoming('discord:guild:lounge', 'unrelated chatter', 'shade', false));
+    await framework.runUntilIdle();
+    assert.ok(framework.getAgent('shade')!.getContextManager().getAllMessages()
+      .some((m) => m.content.some((b) => b.type === 'text' && (b as { text: string }).text === 'unrelated chatter')),
+    'shade reads the ambient message in the slot');
+    await release('shade');
+
+    assert.deepEqual(routed, [{ agent: 'shade', text: 'Here I am.', locus: 'discord:guild:chanA' }]);
+    await framework.stop();
+  });
+
+  it("a second resident's turn weighs a message stored while it runs, at the turn's next start", async () => {
+    const { framework, i, routed, release } = await residents('shade', { 2: hereIAm });
+    // While shade's start gathers its context, its turn is alive and no tool
+    // cycle is open, so an addressed message for the idle primary is stored
+    // at once. Shade's start has weighed its arrivals by then, and no
+    // boundary of shade's turn weighs it.
+    pause.startHook = {
+      agent: 'shade',
+      run: () => {
+        i.addMessage('Antra', [{ type: 'text', text: 'shade, over here please' }],
+          { channelId: 'discord:dm:antra', tags: ['chat:addressed'] });
+      },
+    };
+    framework.pushEvent(residentIncoming('discord:guild:chanA', 'shade, take a look', 'shade', false));
+    await framework.runUntilIdle();
+    assert.equal(pause.startHook, null, "shade's start stored the message");
+    await release('shade');
+
+    assert.deepEqual(routed, [{ agent: 'shade', text: 'Here I am.', locus: 'discord:dm:antra' }]);
+    await framework.stop();
+  });
+
+  it("a second resident's held turn weighs a message the primary's own start stores", async () => {
+    const { framework, i, routed, release } = await residents('shade', {
+      2: [[{ type: 'text', text: 'scout here' }] as ContentBlock[]],
+      3: hereIAm,
+    });
+    framework.pushEvent(residentIncoming('discord:guild:chanA', 'shade, take a look', 'shade', false));
+    await framework.runUntilIdle();
+    // While scout's turn is alive, a message for the primary waits in its
+    // queue, and scout's next start stores it.
+    i.activeTurnTokens.set('scout', 999);
+    framework.pushEvent(residentIncoming('discord:dm:antra', 'shade, over here please', 'shade', true));
+    await framework.runUntilIdle();
+    assert.equal(i.deferredMessages.length, 1, 'the message waits for scout');
+    i.activeTurnTokens.delete('scout');
+    framework.pushEvent(residentIncoming('discord:guild:chanC', 'scout, a word', 'scout', false));
+    await framework.runUntilIdle();
+    assert.equal(i.deferredMessages.length, 0, "scout's start stored it");
+    await release('shade');
+
+    assert.deepEqual(routed.filter((r) => r.agent === 'shade'),
+      [{ agent: 'shade', text: 'Here I am.', locus: 'discord:dm:antra' }]);
+    await framework.stop();
+  });
+
+  it("a boundary that re-pins supersedes an arrival from another resident's store", async () => {
+    const { framework, i, routed, release } = await residents('scout', { 2: hereIAm }, [
+      [{ type: 'tool_use', id: 'p1', name: 'pause--pause', input: {} }] as ContentBlock[],
+      [] as ContentBlock[],
+    ]);
+    // While scout's tool runs, a message for shade is stored at once, an
+    // arrival for scout's turn. Then one for scout waits in its queue, and
+    // scout's boundary stores it after, re-pinning the turn there.
+    pause.during = async () => {
+      i.addMessage('Antra', [{ type: 'text', text: 'shade, a word' }],
+        { channelId: 'discord:dm:xenia', tags: ['chat:addressed'] }, { forAgent: 'shade' });
+      i.addMessage('Antra', [{ type: 'text', text: 'scout, over here please' }],
+        { channelId: 'discord:dm:antra', tags: ['chat:addressed'] });
+    };
+    framework.pushEvent(residentIncoming('discord:guild:chanA', 'scout, take a look', 'scout', false));
+    await framework.runUntilIdle();
+    assert.equal(pause.during, null, "scout's tool ran");
+    await release('scout');
+
+    assert.deepEqual(routed, [{ agent: 'scout', text: 'Here I am.', locus: 'discord:dm:antra' }],
+      "the boundary's re-pin stands at the turn's next start");
+    await framework.stop();
+  });
+
+  it("a second resident's held turn weighs a message the primary's tool boundary drains", async () => {
+    const { framework, i, routed, release } = await residents('shade', {
+      2: [
+        [{ type: 'tool_use', id: 'p1', name: 'pause--pause', input: {} }] as ContentBlock[],
+        [{ type: 'text', text: 'scout done' }] as ContentBlock[],
+      ],
+      3: hereIAm,
+    });
+    framework.pushEvent(residentIncoming('discord:guild:chanA', 'shade, take a look', 'shade', false));
+    await framework.runUntilIdle();
+    // The message comes while scout's tool runs, so it waits in scout's queue
+    // until scout's boundary stores it.
+    let queued = -1;
+    pause.during = async () => {
+      i.addMessage('Antra', [{ type: 'text', text: 'shade, over here please' }],
+        { channelId: 'discord:dm:antra', tags: ['chat:addressed'] });
+      queued = i.deferredMessages.length;
+    };
+    framework.pushEvent(residentIncoming('discord:guild:chanC', 'scout, a word', 'scout', false));
+    await framework.runUntilIdle();
+    assert.equal(queued, 1, "the message waited in scout's queue while its tool ran");
+    assert.equal(i.deferredMessages.length, 0, "scout's boundary stored it");
+    await release('shade');
+
+    assert.deepEqual(routed.filter((r) => r.agent === 'shade'),
+      [{ agent: 'shade', text: 'Here I am.', locus: 'discord:dm:antra' }]);
     await framework.stop();
   });
 });

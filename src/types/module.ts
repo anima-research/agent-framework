@@ -15,17 +15,66 @@ import type { TraceEventListener } from './trace.js';
 export interface MessageQuery {
   /** Filter by external source (e.g., 'discord') */
   source?: string;
+  /** Filter by external IDs: messages whose metadata.external.id is one of these. An empty list filters nothing. */
+  externalIds?: string[];
   /** Filter by participant name */
   participant?: string;
-  /** Filter by metadata fields (shallow match) */
+  /** Filter by metadata fields: each key a path, dot-separated for a nested
+   *  field (such as 'external.channelId'), its value compared by strict
+   *  equality */
   metadata?: Record<string, unknown>;
 }
+
+/**
+ * A message as a module context's reads answer it: a stored row, or a row
+ * for a write the framework holds (`held`). Either is marked
+ * `heldFromResidents` when a tune-out holds it from the residents.
+ */
+export type ModuleMessage = StoredMessage & {
+  /**
+   * True while the framework holds the message's write, as it does while
+   * the write's agent has a turn alive or the host is quiesced, until a
+   * later boundary stores it. The row's `id` is then a handle, which
+   * getMessage, editMessage and removeMessage take as they take a stored
+   * id, and which names the stored row once the write lands. Its `sequence`
+   * and `timestamp` are provisional: the sequence comes after every stored
+   * row's, the timestamp is when the framework held the write (for a write
+   * an older release held, when its queue was read back), and both change
+   * when it lands. A held write whose earlier write may already be stored
+   * is looked up first, and answered as the stored row it is when the store
+   * holds it. Absent on a stored row.
+   */
+  held?: true;
+  /**
+   * True on a message a tune-out holds from the residents: one that arrived
+   * in a tuned-out channel, stamped `metadata.tuneOut` as it came in. The
+   * store keeps it, but no resident is shown the row itself: no resident's
+   * compiled view includes it, during the tune-out or after it, and a tool
+   * boundary of a turn alive when it arrived stores it without injecting it
+   * into the live turn. The subconscious reads it. Its text can still reach
+   * a resident in rows of their own, which aren't marked, such as the
+   * cancel's `<tuned-out-backlog>` row, with the text of the tune-out's newest
+   * messages, up to `backlogCap` of them and as many as fit in one of the
+   * residents' messages, the stored ones first and then those still held;
+   * what the subconscious says of it, in its report or its note; and the
+   * result of a tool that reads history on request, such as a
+   * channel's `fetch_history` or the history module's `extract`. A module
+   * that builds on what the residents see, such as one choosing from the
+   * recent conversation, leaves a marked row out, and one that matches
+   * what's stored, such as a sync's dedupe, keeps it. A held write (`held`)
+   * is marked too when it carries the stamp. Absent on every other row.
+   */
+  heldFromResidents?: true;
+};
 
 /**
  * Result of a message query.
  */
 export interface MessageQueryResult {
-  messages: StoredMessage[];
+  /** The matching stored rows, then, as the newest, the matching rows of
+   *  writes the framework holds (ModuleMessage.held): before the stored rows
+   *  in a reversed query */
+  messages: ModuleMessage[];
   totalCount: number;
 }
 
@@ -53,7 +102,12 @@ export interface Module {
 
   /**
    * Stop the module.
-   * Called when the framework stops or when the module is removed.
+   * Called when the framework stops or when the module is removed. Also called
+   * when a create() that started the module fails (#389): create() stops the
+   * framework before it rejects, so before the host has it and before anything
+   * a host wires up after create() returns, such as a WorkspaceModule's
+   * initStore(). A stop() that saves state can therefore run before that
+   * wiring, and shouldn't then save over state it was handed and hasn't used.
    */
   stop(): Promise<void>;
 
@@ -108,6 +162,21 @@ export interface Module {
    * Adapted from Anarchid/agent-framework@mcpl-module-proto.
    */
   gatherContext?(agentName: string): Promise<ContextInjection[]>;
+
+  /**
+   * Called once an agent's tool batch has completed — when the round's last
+   * pending result arrives, before it is provided to the agent and before
+   * anything that continues the turn (re-inference, stream resume). The
+   * framework awaits it, bounded at 30 s and fail-open, so a module can
+   * bring its state up to date with what the batch's tools did (the
+   * workspace's `watch: 'on-agent-action'` mounts scan disk here) before the
+   * agent's next inference. It's awaited in the framework's event loop, so
+   * a slow hook holds every agent's event processing, not only this one's.
+   * A hook still running from an earlier batch is skipped, not called again.
+   * Not called for script-inner tool calls, nor when the framework fills in
+   * error results for a batch whose stream ended before its tools answered.
+   */
+  onToolBatchComplete?(agentName: string): Promise<void>;
 
   /**
    * Declare extra settings for the synthesized `agent_settings` tool.
@@ -169,8 +238,11 @@ export interface ModuleContext {
    * `modules/<module>/<name>`. Idempotent — safe to call on every start().
    * Items are appended with `appendToLog` (one O(item) record per append) and
    * point-edited with `editLogItem`; Chronicle's append_log snapshot cadence
-   * handles consolidation. `name` must not be 'state' (reserved for the main
-   * snapshot state) and must not contain '/'.
+   * handles consolidation. The cadence applies when the state is first
+   * registered: a store that already holds the state keeps the cadence it was
+   * registered with. `name` must not be 'state' (reserved for the main
+   * snapshot state) and must not contain '/'. A registration that fails
+   * throws, naming the state, and leaves the name unregistered.
    */
   registerLogState(
     name: string,
@@ -202,14 +274,19 @@ export interface ModuleContext {
   getLogLength(name: string): number;
 
   /**
-   * Process queue for pushing events from external listeners.
+   * Process queue for pushing events from external listeners. Once stop()
+   * has begun, a push is dropped with a log line naming this module, as
+   * pushEvent()'s is.
    * @deprecated Use pushEvent() instead — it also emits process:received traces.
    */
   readonly queue: ProcessQueue;
 
   /**
    * Push a process event to the queue and emit a process:received trace.
-   * Preferred over direct queue.push() for proper observability.
+   * Preferred over direct queue.push() for proper observability. Once stop()
+   * has begun, nothing will process the event: it's dropped with a log line
+   * naming this module, untraced, rather than thrown into the listener or
+   * stop() that pushed it.
    */
   pushEvent(event: ProcessEvent): void;
 
@@ -219,7 +296,14 @@ export interface ModuleContext {
   getModule<T extends Module>(name: string): T | null;
 
   /**
-   * Add a message to the conversation.
+   * Add a message to the conversation, and answer its id. While the
+   * framework holds the write (the agent's turn is alive, or the host is
+   * quiesced), the id is a handle, `held:` and the write's id, which
+   * getMessage, editMessage and removeMessage take as they take a stored
+   * id, and which names the stored row once the write lands
+   * (ModuleMessage.held). The writes a process held, and keeps across a
+   * restart, show to the next process's modules once create() has restored
+   * them, which is after every module's start().
    */
   addMessage(
     participant: string,
@@ -228,28 +312,48 @@ export interface ModuleContext {
   ): MessageId;
 
   /**
-   * Edit a message.
+   * Edit a message, by its id or a held write's handle. A held write is
+   * stored with the new content. One whose earlier write may already be
+   * stored, where the store can't be searched to tell, throws with nothing
+   * changed.
    */
   editMessage(id: MessageId, content: ContentBlock[]): void;
 
   /**
-   * Remove a message.
+   * Remove a message, by its id or a held write's handle. A held write is
+   * dropped, so the agent never reads it. One whose earlier write may
+   * already be stored, where the store can't be searched to tell, throws
+   * with nothing changed.
    */
   removeMessage(id: MessageId): void;
 
   /**
-   * Find a message by external ID.
+   * Find the message for an external ID this context added a message under:
+   * the row it added, while the store holds it. For a write the framework
+   * held, whose id this context doesn't keep, the first row the store shows
+   * under that external ID, held rows included, a held row by its handle.
+   * Null when this context added none under it, when the row it added is
+   * gone, or when the store shows none for a held write, such as one the
+   * last process held, looked up in start().
    */
   findMessageByExternalId(source: string, externalId: string): MessageId | null;
 
   /**
-   * Get a message by ID.
+   * Get a message by its id or a held write's handle, marked
+   * `heldFromResidents` when a tune-out holds it from the residents
+   * (ModuleMessage).
    */
-  getMessage(id: MessageId): StoredMessage | null;
+  getMessage(id: MessageId): ModuleMessage | null;
 
   /**
    * Query messages by filter criteria.
    * Useful for finding messages from external sources, by participant, etc.
+   * The rows of writes the framework holds come after the stored rows, as
+   * the newest, or before them in a reversed query, marked `held`
+   * (ModuleMessage). Those the last process held show once create() has
+   * restored them, after every module's start() (addMessage). A message a
+   * tune-out holds from the residents is among the rows, marked
+   * `heldFromResidents` (ModuleMessage).
    */
   queryMessages(filter: MessageQuery): MessageQueryResult;
 
@@ -301,10 +405,15 @@ export interface ModuleContext {
    *
    * Modules use this to react to agent lifecycle without polling — e.g. an
    * adapter that wants to show a "typing" indicator can bracket it between
-   * `inference:started` and the terminal events (`inference:turn_ended`,
-   * `inference:aborted`, `inference:failed`, `inference:exhausted`), all of
-   * which carry `agentName`. The terminal events fire once per turn, after any
-   * tool-call cycles, so a single start/stop bracket spans the whole turn.
+   * `inference:started` and the terminal events: `inference:completed` (the
+   * model answered and the turn ended, with a final response or with a tool
+   * result that ended it, which `inference:turn_ended` then follows),
+   * `inference:aborted`, `inference:failed` and `inference:exhausted`, all of
+   * which carry `agentName`. A turn's tool-call cycles stay inside its
+   * stream, so one bracket spans them. A context-budget restart emits
+   * `inference:started` again with no terminal event for the stream it
+   * replaced, and a failing turn can emit `inference:failed` and then
+   * `inference:exhausted`, so a bracket should allow a repeated start or end.
    *
    * Returns an unsubscribe function. Call it in the module's `stop()` to avoid
    * leaking listeners across teardown/recreate (e.g. session switch).
@@ -355,14 +464,17 @@ export interface ProcessState {
   getActiveTools(): ToolDefinition[];
 
   /**
-   * Queue for emitting follow-up events.
+   * Queue for emitting follow-up events. Once stop() has begun, a push is
+   * dropped with a log line naming the module, as pushEvent()'s is.
    * @deprecated Use pushEvent() instead — it also emits process:received traces.
    */
   readonly queue: ProcessQueue;
 
   /**
    * Push a process event to the queue and emit a process:received trace.
-   * Preferred over direct queue.push() for proper observability.
+   * Preferred over direct queue.push() for proper observability. Once stop()
+   * has begun, the event is dropped with a log line naming the module,
+   * untraced.
    */
   pushEvent(event: ProcessEvent): void;
 }
@@ -409,12 +521,14 @@ export interface EventResponse {
   addMessages?: NewMessage[];
 
   /**
-   * Messages to edit.
+   * Messages to edit, each by its id or a held write's handle
+   * (ModuleContext.editMessage).
    */
   editMessages?: MessageEdit[];
 
   /**
-   * Messages to remove.
+   * Messages to remove, each by its id or a held write's handle
+   * (ModuleContext.removeMessage).
    */
   removeMessages?: MessageId[];
 
@@ -485,6 +599,16 @@ export interface SpeechContext {
    * Empty when no tool calls were made.
    */
   thoughts?: ContentBlock[];
+
+  /**
+   * The turn this speech ends: the same id as `ToolCall.callerTurnId` on the
+   * calls made in it (its model's calls, and a script's calls that reach the
+   * host while a code_execution call of the turn watches the script), kept across the
+   * turn's streams (a context-budget restart or a
+   * retry), and larger for the agent's next turn. Unique only within one run
+   * of the process.
+   */
+  turnId?: number;
 }
 
 /**

@@ -13,6 +13,8 @@ class FakeService {
   upserts: Item[][] = [];
   searches: Record<string, unknown>[] = [];
   failNext = 0;
+  /** Answer hits without text, as a service that keeps only vectors and ids does. */
+  omitText = false;
   server!: Server; url = '';
   async start(): Promise<void> {
     this.server = createServer((req, res) => {
@@ -43,7 +45,7 @@ class FakeService {
         const q = JSON.parse(body) as Record<string, unknown>; this.searches.push(q);
         const hits = [...this.items.values()].filter((it) => !q.kinds || (q.kinds as string[]).includes(it.kind))
           .filter((it) => !q.channel || it.channel === q.channel)
-          .map((it) => ({ id: it.id, score: it.text.includes(q.query as string) ? 0.9 : 0.1, ts: it.ts ?? null, channel: it.channel ?? null, kind: it.kind, level: it.level ?? null, meta: it.meta ?? {}, text: it.text.slice(0, 40), chars: it.text.length }))
+          .map((it) => ({ id: it.id, score: it.text.includes(q.query as string) ? 0.9 : 0.1, ts: it.ts ?? null, channel: it.channel ?? null, kind: it.kind, level: it.level ?? null, meta: it.meta ?? {}, ...(this.omitText ? {} : { text: it.text.slice(0, 40), chars: it.text.length }) }))
           .sort((a, b) => b.score - a.score).slice(0, (q.k as number) ?? 10);
         return json(200, { namespace: 'test/ns', hits, count_indexed: this.items.size, timing_ms: { embed: 1, search: 1 } });
       });
@@ -100,6 +102,28 @@ describe('HistoryModule semantic_search', () => {
     assert.equal(messageIndexText(messages[1]!), '[think] a private note about vortices and the second small body');
     assert.equal(messageIndexText(messages[2]!), '');
     assert.equal(messageIndexText(messages[1]!, false), '');
+  });
+
+  it('messageIndexText keeps what the resident sent through a send tool, and only the message', () => {
+    const sent = msg('m9', T0 + 9000, [
+      { type: 'tool_use', id: 'a', name: 'mcpl--slack--reply_message', input: { channelId: 'C123', messageId: '1700.1', content: 'the route moved to venue B at 09:30 ET' } },
+      { type: 'tool_use', id: 'b', name: 'zulip--send_message', input: { type: 'stream', to: 'rook_dev_support', topic: 'routing', content: 'posted in Slack too' } },
+      { type: 'tool_use', id: 'c', name: 'channel_publish', input: { channelId: 'chan-A', text: 'an older caller sends text' } },
+      { type: 'tool_use', id: 'f', name: 'mcpl--slack--send_dm', input: { userId: 'U42', content: 'a word to one person' } },
+      { type: 'tool_use', id: 'd', name: 'mcpl--slack--edit_message', input: { channelId: 'C123', messageId: '1700.2', content: 'venue B, not C' } },
+      { type: 'tool_use', id: 'e', name: 'mcpl--slack--add_reaction', input: { channelId: 'C123', messageId: '1700.1', emoji: 'eyes' } },
+    ] as ContentBlock[]);
+    const expected = [
+      '[reply_message] the route moved to venue B at 09:30 ET',
+      '[send_message] posted in Slack too',
+      '[channel_publish] an older caller sends text',
+      '[send_dm] a word to one person',
+      '[edit_message] venue B, not C',
+    ].join('\n');
+    assert.equal(messageIndexText(sent), expected);
+    // What it wrote to someone isn't a private note, so it is indexed with
+    // private tools left out.
+    assert.equal(messageIndexText(sent, false), expected);
   });
 
   it('syncs messages and summaries incrementally with cursors, then searches with mapped filters', async () => {
@@ -162,6 +186,111 @@ describe('HistoryModule semantic_search', () => {
     } finally { await svc2.stop(); }
   });
 
+  it('rebuilds a summary hit\'s snippet from the local summary when the service returns no text', async () => {
+    const svc2 = new FakeService(); await svc2.start();
+    try {
+      const mod = new HistoryModule({ semantic: { url: svc2.url, token: 'tok', namespace: 'test/ns', syncIntervalMs: 0 } });
+      mod.bind(stubCm(messages, summaries));
+      await mod.syncSemanticIndex()!;
+      svc2.omitText = true;
+      const res = await mod.handleToolCall({ id: 'n', name: 'semantic_search', input: { query: 'evening', level: 1 } });
+      assert.equal(res.success, true, JSON.stringify(res));
+      const hit = (res.data as { hits: Array<{ id: string; snippet: string; chars: number }> }).hits.find((h) => h.id === 'sum:s1');
+      assert.ok(hit, JSON.stringify(res.data));
+      assert.equal(hit.snippet, 'Summary of the evening');
+      assert.equal(hit.chars, 'Summary of the evening'.length);
+      await mod.stop();
+    } finally { await svc2.stop(); }
+  });
+
+  it('a summary hit\'s local snippet and chars are the summary\'s text as indexed: trimmed, and cut at maxChars at a whole character', async () => {
+    // One code point, two UTF-16 units, so after the "x" the 4th unit is the first half of the second one.
+    const grin = '\u{1F600}';
+    const svc2 = new FakeService(); await svc2.start();
+    try {
+      const mod = new HistoryModule({ semantic: { url: svc2.url, token: 'tok', namespace: 'test/ns', syncIntervalMs: 0, maxChars: 4 } });
+      mod.bind(stubCm(messages, [{ ...summaries[0], content: `\n  x${grin.repeat(3)}  \n` }]));
+      await mod.syncSemanticIndex()!;
+      assert.equal(svc2.items.get('sum:s1')?.text, `x${grin}`, 'the index holds the summary trimmed and cut at maxChars at a whole character');
+      svc2.omitText = true;
+      const res = await mod.handleToolCall({ id: 'n', name: 'semantic_search', input: { query: 'x', level: 1 } });
+      assert.equal(res.success, true, JSON.stringify(res));
+      const hit = (res.data as { hits: Array<{ id: string; snippet: string; chars: number }> }).hits.find((h) => h.id === 'sum:s1');
+      assert.ok(hit, JSON.stringify(res.data));
+      assert.equal(hit.snippet, `x${grin}`);
+      assert.equal(hit.chars, 3);
+      await mod.stop();
+    } finally { await svc2.stop(); }
+  });
+
+  it('a summary hit\'s snippet keeps up to 400 units of the local summary, one fewer at a split pair, with "…", whatever the service sends', async () => {
+    // One code point, two UTF-16 units, so after the "x" the 400th unit is the first half of the 200th of them.
+    const grin = '\u{1F600}';
+    for (const omitText of [false, true]) {
+      const svc2 = new FakeService(); await svc2.start();
+      try {
+        const mod = new HistoryModule({ semantic: { url: svc2.url, token: 'tok', namespace: 'test/ns', syncIntervalMs: 0 } });
+        mod.bind(stubCm(messages, [{ ...summaries[0], content: `x${grin.repeat(250)}` }]));
+        await mod.syncSemanticIndex()!;
+        svc2.omitText = omitText;
+        const res = await mod.handleToolCall({ id: 'n', name: 'semantic_search', input: { query: 'x', level: 1 } });
+        assert.equal(res.success, true, JSON.stringify(res));
+        const hit = (res.data as { hits: Array<{ id: string; snippet: string; chars: number }> }).hits.find((h) => h.id === 'sum:s1');
+        assert.ok(hit, JSON.stringify(res.data));
+        assert.equal(hit.snippet, `x${grin.repeat(199)}…`, `with the service ${omitText ? 'sending no text' : 'sending text'}`);
+        assert.equal(hit.chars, 501);
+        await mod.stop();
+      } finally { await svc2.stop(); }
+    }
+  });
+
+  it('a summary hit shows the local summary even when the index holds another summary\'s text under its id, with the index\'s score and timestamp', async () => {
+    // A branch made from an earlier point, as an undo makes one, can mint a
+    // summary id another branch already used, so the index can hold another
+    // summary's text and start under it. No catch-up before the search,
+    // which would send this summary again.
+    const svc2 = new FakeService(); await svc2.start();
+    try {
+      const local = [{ ...summaries[0] }];
+      const mod = new HistoryModule({ semantic: { url: svc2.url, token: 'tok', namespace: 'test/ns', syncIntervalMs: 0, maxSyncBeforeSearch: 0 } });
+      mod.bind(stubCm(messages, local));
+      await mod.syncSemanticIndex()!;
+      local[0]!.content = 'Summary of a morning on this branch';
+      local[0]!.startMs = T0 + 86_400_000;
+      const res = await mod.handleToolCall({ id: 'n', name: 'semantic_search', input: { query: 'evening', level: 1 } });
+      assert.equal(res.success, true, JSON.stringify(res));
+      const hit = (res.data as { hits: Array<{ id: string; snippet: string; chars: number; score: number; timestamp: string | null }> }).hits.find((h) => h.id === 'sum:s1');
+      assert.ok(hit, JSON.stringify(res.data));
+      assert.equal(svc2.items.get('sum:s1')?.text, 'Summary of the evening', 'the index still holds the other text');
+      assert.equal(hit.score, 0.9, 'the hit is still ranked by the text the index holds, the only one with "evening"');
+      assert.equal(hit.timestamp, new Date(T0).toISOString(), 'and dated by the start the index holds');
+      assert.equal(hit.snippet, 'Summary of a morning on this branch');
+      assert.equal(hit.chars, 'Summary of a morning on this branch'.length);
+      await mod.stop();
+    } finally { await svc2.stop(); }
+  });
+
+  it('a summary hit whose local summary is empty is dropped as stale, never shown with the index\'s text', async () => {
+    // context-manager drops a summary that's empty after trimming when it
+    // loads, so getSummary doesn't return one. The drop is defensive, against
+    // a store that did, while the index holds another summary's text.
+    const svc2 = new FakeService(); await svc2.start();
+    try {
+      const local = [{ ...summaries[0] }];
+      const mod = new HistoryModule({ semantic: { url: svc2.url, token: 'tok', namespace: 'test/ns', syncIntervalMs: 0, maxSyncBeforeSearch: 0 } });
+      mod.bind(stubCm(messages, local));
+      await mod.syncSemanticIndex()!;
+      local[0]!.content = '  ';
+      const res = await mod.handleToolCall({ id: 'n', name: 'semantic_search', input: { query: 'evening', level: 1 } });
+      assert.equal(res.success, true, JSON.stringify(res));
+      assert.equal(svc2.items.get('sum:s1')?.text, 'Summary of the evening', 'the index still holds the other text');
+      const data = res.data as { hits: Array<{ id: string }>; index: { droppedStale: number } };
+      assert.deepEqual(data.hits.map((h) => h.id), []);
+      assert.equal(data.index.droppedStale, 1);
+      await mod.stop();
+    } finally { await svc2.stop(); }
+  });
+
   it('service failure is a clean tool error and backs off sync', async () => {
     const mod = new HistoryModule({ semantic: { url: svc.url, token: 'tok', namespace: 'test/ns', syncIntervalMs: 0 } });
     mod.bind(stubCm(messages, summaries));
@@ -170,7 +299,7 @@ describe('HistoryModule semantic_search', () => {
     assert.equal(r.more, true);
     const res = await mod.handleToolCall({ id: 'c3', name: 'semantic_search', input: { query: 'anything' } });
     assert.equal(res.success, false);
-    assert.match(String(res.error), /embed-service|boom/);
+    assert.match(String(res.error), /^Nothing was searched: the semantic index service answered the search request with an error \(HTTP 500: boom\)\. /);
     await mod.stop();
   });
 

@@ -1,6 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { ConversationRouter } from '../src/mcpl/conversation-router.js';
+import { ConversationRouter, forkAgentName } from '../src/mcpl/conversation-router.js';
+import { globMatch } from '../src/mcpl/tool-glob.js';
 import type { ChannelDescriptor } from '../src/mcpl/types.js';
 
 const T0 = 1_750_000_000_000;
@@ -19,7 +20,8 @@ test('DM message binds without a mention (default dm bind: always)', () => {
   assert.equal(decision.kind, 'spawn');
   if (decision.kind === 'spawn') {
     assert.equal(decision.generation, 1);
-    assert.match(decision.agentName, /^conversation-slack-D1-g1$/);
+    // No serverId in these facts: the hash is of [null, 'slack:D1'].
+    assert.equal(decision.agentName, 'conversation-slack-D1-g1-c34bf75648e5ab52');
     assert.equal(decision.trigger, true);
   }
 });
@@ -123,15 +125,56 @@ test('rebind after expiry gets a fresh generation and agent name', () => {
   if (d1.kind !== 'spawn') assert.fail('expected spawn');
   router.bind('slack:C1', d1.agentName, d1.generation, T0);
 
-  router.unbind('slack:C1'); // framework does this after the closure turn
+  router.unbind('slack:C1'); // the framework does this as the closure turn begins
 
   const d2 = router.route({ channelId: 'slack:C1', mentioned: true, kind: 'channel' });
   assert.equal(d2.kind, 'spawn');
   if (d2.kind === 'spawn') {
     assert.equal(d2.generation, 2);
-    assert.match(d2.agentName, /-g2$/);
+    assert.match(d2.agentName, /-g2-[0-9a-f]{16}$/);
     assert.notEqual(d2.agentName, d1.agentName);
   }
+});
+
+// ---------------------------------------------------------------------------
+// Fork names (F109)
+// ---------------------------------------------------------------------------
+
+test('channels whose ids read alike, or one channel id on two servers, get forks of different names', () => {
+  const name = (serverId: string, channelId: string) => {
+    const d = makeRouter().route({ channelId, serverId, mentioned: false, kind: 'dm' });
+    if (d.kind !== 'spawn') assert.fail('expected spawn');
+    return d.agentName;
+  };
+  // The hash is the first 16 hex digits of sha256(JSON.stringify([serverId, channelId])).
+  assert.equal(name('srv', 'foo bar'), 'conversation-foo-bar-g1-5f535c1a79447b18');
+  assert.equal(name('srv', 'foo-bar'), 'conversation-foo-bar-g1-5498d38b2f759b7d');
+  assert.equal(name('other', 'foo bar'), 'conversation-foo-bar-g1-51f2373d8650175d');
+  assert.equal(forkAgentName('conversation', 'srv', 'foo bar', 1), name('srv', 'foo bar'));
+});
+
+test("a fork name's readable part stops at 64 characters, and the hash tells longer ids apart", () => {
+  const topic = 'zulip:general/' + 'a long topic name '.repeat(5);
+  const one = forkAgentName('conversation', 'zulip', `${topic} one`, 3);
+  const two = forkAgentName('conversation', 'zulip', `${topic} two`, 3);
+  // Sanitized, the id runs to 107 characters; its first 64 are kept.
+  assert.match(one, /^conversation-zulip-general-a-long-topic-name-a-long-topic-name-a-long-topic-n-g3-[0-9a-f]{16}$/);
+  assert.notEqual(one, two);
+  assert.equal(one.slice(0, -17), two.slice(0, -17), 'they differ only in the hash');
+});
+
+test("a conversations pattern over a fork name's readable part and -g matches each generation's fork", () => {
+  // A server's toolLifecycle narrowing matches whole agent names with globMatch.
+  const [first, second] = [1, 2].map((g) => forkAgentName('conversation', 'slack', 'C1', g));
+  assert.ok(globMatch('conversation-C1-g*', first) && globMatch('conversation-C1-g*', second));
+  assert.ok(!globMatch('conversation-C1-g1', first), 'a pattern that ends at the generation no longer matches');
+  assert.ok(globMatch('conversation-C1-g1-*', first) && !globMatch('conversation-C1-g1-*', second));
+});
+
+test('a fork name starts with the configured agentPrefix', () => {
+  const d = makeRouter({ agentPrefix: 'chat' }).route({ channelId: 'C1', serverId: 'slack', mentioned: false, kind: 'dm' });
+  if (d.kind !== 'spawn') assert.fail('expected spawn');
+  assert.match(d.agentName, /^chat-C1-g1-[0-9a-f]{16}$/);
 });
 
 test('channelForAgent reverse lookup', () => {
