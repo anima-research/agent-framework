@@ -147,6 +147,9 @@ describe('reconcileWithRecipe: a start against the recipe last applied', () => {
     const edited = reconcileWithRecipe(config(recipe1.policies, 'defer'), config(recipe1.policies, 'always'), recipe1);
     assert.strictEqual(edited.config.default, 'defer');
     assert.strictEqual(edited.changes.defaultKept, 'defer');
+    const unchangedRecipe = reconcileWithRecipe(config(recipe1.policies, 'defer'), recipe1, recipe1);
+    assert.strictEqual(unchangedRecipe.config.default, 'defer');
+    assert.strictEqual(unchangedRecipe.changes.defaultKept, undefined);
     const agrees = reconcileWithRecipe(config(recipe1.policies, 'always'), config(recipe1.policies, 'always'), recipe1);
     assert.strictEqual(agrees.config.default, 'always');
     assert.strictEqual(reconcileLine(agrees.changes), null);
@@ -202,6 +205,12 @@ describe('reconcileWithRecipe: a start against the recipe last applied', () => {
     const twice = config([rule('dm', 'dm'), rule('dm', 'dm-again'), catchAll]);
     assert.throws(() => reconcileWithRecipe(twice, recipe1, recipe1), /^Error: gate\.json named the rule "dm" twice, so the recipe wasn't applied: the merge needs one rule per name$/);
     assert.throws(() => reconcileWithRecipe(recipe1, twice, recipe1), /^Error: the recipe named the rule "dm" twice, so it wasn't applied: the merge needs one rule per name$/);
+  });
+
+  it("reads a rule whose keys come in another order as the same rule", () => {
+    const reordered = config(recipe1.policies.map((p) => JSON.parse(JSON.stringify({ behavior: p.behavior, name: p.name, match: p.match })) as GatePolicy));
+    const { changes } = reconcileWithRecipe(reordered, recipe1, recipe1);
+    assert.strictEqual(reconcileLine(changes), null);
   });
 
   it('says nothing when the recipe and gate.json agree with the last recipe', () => {
@@ -309,6 +318,7 @@ describe("EventGate's starts, through gate.json and the recipe kept beside it", 
     assert.match(logged[0], /moved agents/);
     assert.match(logged[0], /kept, though the recipe defines it otherwise: dm \(remove such a rule/);
     assert.match(logged[0], /kept, not in the recipe: zoo, sync \(a stale one can be removed/);
+    assert.doesNotMatch(logged[0], /couldn't be read/);
     assert.deepStrictEqual(recorded(), recipe2);
   });
 
@@ -470,6 +480,36 @@ describe("EventGate's starts, through gate.json and the recipe kept beside it", 
     assert.match(gate.getStatus().errors.join('\n'), /^Failed to seed\/reconcile gate\.json: the recipe doesn't validate \(.*\), so it wasn't applied: the gate runs on gate\.json as it stands$/);
   });
 
+  it("writes a default-only recipe change to gate.json, and seeds gate.json with the recipe as given", () => {
+    start({ policies: recipe1.policies } as GateConfig).gate.dispose();
+    // gate.json holds the recipe as given; the record holds it as the gate reads it.
+    assert.strictEqual('default' in onDisk(), false);
+    assert.strictEqual(recorded().default, 'always');
+    start(config(recipe1.policies, 'skip')).gate.dispose();
+    assert.strictEqual(onDisk().default, 'skip');
+  });
+
+  it('runs a rule edited at run time, kept through a restart that writes nothing', () => {
+    const first = start(recipe1).gate;
+    first.addPolicy(rule('dm', 'dm-edited', 'skip'));
+    first.dispose();
+    const { gate } = start(recipe1);
+    try {
+      assert.strictEqual(gate.evaluate(ext('dm-edited')).policyName, 'dm');
+      assert.strictEqual(gate.evaluate(ext('dm-edited')).trigger, false);
+    } finally {
+      gate.dispose();
+    }
+  });
+
+  it("leaves the record's bytes as written when the recipe hasn't changed", () => {
+    start(recipe1).gate.dispose();
+    const compact = JSON.stringify(recorded());
+    writeFileSync(lastRecipePath(configPath), compact);
+    start(recipe1).gate.dispose();
+    assert.strictEqual(readFileSync(lastRecipePath(configPath), 'utf-8'), compact);
+  });
+
   it("leaves gate.json's bytes as written when a start changes nothing", () => {
     start(recipe1).gate.dispose();
     const compact = JSON.stringify(onDisk());
@@ -520,7 +560,13 @@ describe("EventGate's starts, through gate.json and the recipe kept beside it", 
     // One trace for the load, one for the start: gate.json is read once.
     const errors = traces.filter((t) => t.type === 'gate:config-error').map((t) => String(t.error));
     assert.strictEqual(errors.length, 2);
-    assert.strictEqual(errors[1], "Failed to seed/reconcile gate.json: it didn't load, so the recipe wasn't applied or recorded, and the gate runs on the recipe as given until gate.json loads");
+    assert.strictEqual(
+      errors[1],
+      "Failed to seed/reconcile gate.json: it didn't load at this start, so the recipe wasn't applied or recorded: "
+        + "the gate runs on the recipe as given while gate.json doesn't load, and a start at which gate.json loads applies it",
+    );
+    // The gate runs on the recipe as given.
+    assert.strictEqual(gate.evaluate(ext('zoo')).policyName, 'zoo');
     assert.ok(gate.getStatus().errors.includes(errors[1]));
   });
 
@@ -579,10 +625,13 @@ describe("wake_add_rule's result", () => {
           + "and these rules ask for something none of them carries, such as another event type (a module's messages are external-message), "
           + 'a source, channel or path, or particular content, metadata or tags.',
       );
+      assert.strictEqual(unreached.probes.length, 8);
       assert.ok(unreached.probes.every((p) => !p.wouldWake));
       assert.match(unreached.note ?? '', /the new rule matches no probe event \(see notProbed\)/);
 
-      add('add-2', { name: 'wake-all', match: {}, behavior: 'always' });
+      const wakeAll = add('add-2', { name: 'wake-all', match: {}, behavior: 'always' }) as Data & { probes: Array<{ changed?: unknown }> };
+      assert.ok(wakeAll.probes.every((p) => 'changed' in p));
+      assert.strictEqual(wakeAll.note, undefined);
       // Behind wake-all, a rule every probe reaches changes no winner.
       const shadowed = add('add-3', { name: 'also-all', match: {}, behavior: 'skip' });
       assert.deepStrictEqual(shadowed.notProbed, ['zulip-addressed']);

@@ -777,7 +777,10 @@ export class EventGate {
           if (!existing) {
             // The load error is in configErrors until gate.json loads; that
             // the recipe wasn't applied stays true until the next start.
-            throw new Error("it didn't load, so the recipe wasn't applied or recorded, and the gate runs on the recipe as given until gate.json loads");
+            throw new Error(
+              "it didn't load at this start, so the recipe wasn't applied or recorded: the gate runs on the recipe as given "
+                + 'while gate.json doesn\'t load, and a start at which gate.json loads applies it',
+            );
           } else {
             const recipe = checkRecipe(opts.initialConfig, 'gate.json as it stands');
             const last = readLastRecipe(recipePath);
