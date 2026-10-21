@@ -130,6 +130,31 @@ describe('toolDeclarations in the framework', () => {
     });
   });
 
+  it('raises an operator line when the changes force the head to move', async () => {
+    await withFramework([{ ...resident('alpha'), thinkingBinding: { binds: true } }], async (framework) => {
+      const traces: TraceEvent[] = [];
+      framework.onTrace((event) => { traces.push(event); });
+      const alpha = framework.getAgent('alpha')!;
+      say(alpha, 'user', 'hello');
+      // A reply's thinking before the change, so no compile is free for a binding model.
+      alpha.getContextManager().addMessage('alpha', [{ type: 'thinking', thinking: 'why', signature: 's' } as ContentBlock, { type: 'text', text: 'so' } as ContentBlock]);
+      await alpha.buildActivationRequest([tool('a')]);
+      await alpha.buildActivationRequest([tool('a'), tool('b')]);
+      alpha.noteResponseInput(10);
+      const request = await alpha.buildActivationRequest([tool('a'), tool('b')]);
+      assert.deepEqual(request.tools?.map((t) => t.name), ['a', 'b'], 'past a fifth, the head moved');
+      const moved = traces.filter((t) => t.type === 'head:moved' && (t as { why: string }).why === 'consolidated');
+      assert.equal(moved.length, 1);
+      assert.equal((moved[0] as { forced?: string }).forced, 'share');
+      const alerts = traces.filter((t) => t.type === 'ops:alert' && (t as { kind: string }).kind === 'head-consolidated') as { message: string; data?: { inputTokens?: number; forced?: string } }[];
+      assert.equal(alerts.length, 1);
+      assert.match(alerts[0]!.message, /a fifth of the last response's 10/);
+      assert.match(alerts[0]!.message, /the thinking the request held set aside/);
+      assert.equal(alerts[0]!.data?.inputTokens, 10);
+      assert.equal(alerts[0]!.data?.forced, 'share');
+    });
+  });
+
   it("reports after host /undo the last conversational message the agent sees, not a change after it", async () => {
     await withFramework([resident('alpha')], async (framework) => {
       const alpha = framework.getAgent('alpha')!;

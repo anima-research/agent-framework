@@ -12369,7 +12369,17 @@ export class AgentFramework {
   /** Give an agent the recorded heads, and trace what moves its head. An
    *  ephemeral agent keeps its own in memory: it doesn't outlive its run. */
   private attachHeads(agent: Agent, store: HeadDeclarationStore = this.headDeclarations): void {
-    agent.attachHeadDeclarations(store, (event: HeadEvent) => this.emitTrace({ ...event, agentName: agent.name }));
+    agent.attachHeadDeclarations(store, (event: HeadEvent) => {
+      this.emitTrace({ ...event, agentName: agent.name });
+      if (event.type === 'head:moved' && event.forced) {
+        const why = event.forced === 'budget'
+          ? `a compile was refused over budget with ${event.changesRemoved} system changes kept, so the head took them and the compile ran again`
+          : `the system changes reached ${event.changeTokens} tokens, a fifth of the last response's ${event.inputTokens}, with no compile that rewrote them already, so the head took them`;
+        this.opsAlert('head-consolidated', agent.name,
+          `${why}: one whole write${agent.bindsThinking ? ', and the thinking the request held set aside' : ''}`,
+          { data: { forced: event.forced, changesRemoved: event.changesRemoved, ...(event.forced === 'share' ? { changeTokens: event.changeTokens, inputTokens: event.inputTokens } : {}) } });
+      }
+    });
   }
 
   private async createAgent(config: AgentConfig): Promise<Agent> {

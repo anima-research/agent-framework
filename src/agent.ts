@@ -1545,7 +1545,7 @@ export class Agent {
     // The head that goes out: under 'entries' the recorded one, and what's
     // current otherwise or before one is recorded (system-changes.ts).
     const entries = this.declaresEntries();
-    const recorded = entries ? this.headDeclarations.read(this.name) : null;
+    let recorded = entries ? this.headDeclarations.read(this.name) : null;
     const compile = (head: HeadDeclaration) => {
       const immutablePrefixHash = kvUnified ? headHash(head) : undefined;
       return this.compileWithInjections(
@@ -1559,9 +1559,28 @@ export class Agent {
           : undefined,
       );
     };
-    const compiledWith = recorded ?? this.currentHead(availableTools, prospectiveSystemInjections);
+    let compiledWith = recorded ?? this.currentHead(availableTools, prospectiveSystemInjections);
+    let first: CompileResult;
+    try {
+      first = await compile(compiledWith);
+    } catch (error) {
+      // The changes this agent keeps may be what no longer fits: a compile
+      // refused over budget with change rows kept moves the head to what's
+      // current, taking them, and compiles once more (a forced move by the
+      // budget). If that compile is refused too, the changes weren't the
+      // cause, and the error goes on as before. Never in a dry run.
+      if (!entries || options.dryRun || recorded === null || (error as { name?: unknown } | null)?.name !== 'OverBudgetError') throw error;
+      const current = this.currentHead(availableTools, prospectiveSystemInjections);
+      const removed = this.removeOwnChanges();
+      if (removed === 0) throw error;
+      this.headDeclarations.write(this.name, copyHead(current));
+      this.onHeadEvent?.({ type: 'head:moved', why: 'consolidated', changesRemoved: removed, forced: 'budget' });
+      recorded = current;
+      compiledWith = current;
+      first = await compile(current);
+    }
     const settled = await this.settleHead(
-      await compile(compiledWith),
+      first,
       kvUnified ? compiledWith : null,
       availableTools,
       recorded,
@@ -2151,7 +2170,7 @@ export class Agent {
     why: 'adopted' | 'replaced' | 'consolidated',
     dryRun: boolean,
     compile: (head: HeadDeclaration) => Promise<CompileResult>,
-    sizes?: { changeTokens: number; inputTokens: number },
+    sizes?: { changeTokens: number; inputTokens: number; forced?: 'share' },
   ): Promise<{ compiled: CompileResult; head: HeadDeclaration }> {
     if (dryRun) {
       const shown = compiledWith !== null && headHash(compiledWith) !== headHash(current) ? await compile(current) : compiled;
@@ -2166,7 +2185,7 @@ export class Agent {
 
   /**
    * Whether this compile is where the changes go into the head, and if so,
-   * their price and the input it reached a tenth of. Once the changes, priced
+   * their price and the input they reached a share of. Once the changes, priced
    * from their JSON as context-manager prices them, reach a tenth of the last
    * response's reported input, at the first committing compile whose
    * `firstChanged` (context-manager's: the first compiled message whose bytes
@@ -2182,9 +2201,19 @@ export class Agent {
    * after that the change stays first and unchanged, and `firstChanged`
    * falls after it. `firstChanged` is null after a start, before the
    * manager's first committing compile, when nothing says what the provider
-   * still holds, and nothing consolidates then.
+   * still holds, and nothing consolidates for free then.
+   *
+   * Such a compile may never come: a binding model's head window keeps its
+   * first replies' thinking, and a passthrough window passes the first
+   * change before the changes reach a tenth. So past a fifth of the input,
+   * with no free compile having taken them, the head moves at this compile
+   * anyway (`forced: 'share'`): one whole write, and on a binding model the
+   * thinking the request held. That bounds what every request carries, once
+   * per crossing, since the move takes every change. (A compile refused over
+   * budget with changes kept moves the head too, at the assembly: `forced:
+   * 'budget'`.)
    */
-  private consolidation(compiled: CompileResult, blocks: SystemChangeContent[]): { changeTokens: number; inputTokens: number } | undefined {
+  private consolidation(compiled: CompileResult, blocks: SystemChangeContent[]): { changeTokens: number; inputTokens: number; forced?: 'share' } | undefined {
     const firstChange = compiled.messages.findIndex(isSystemChangeMessage);
     const inputTokens = this.lastResponseInputTokens;
     if (firstChange < 0 || inputTokens === undefined) return undefined;
@@ -2193,10 +2222,10 @@ export class Agent {
     // Read only once consolidation is in question: context-manager compares
     // it when it's read.
     const firstChanged = (compiled as { firstChanged?: number | null }).firstChanged;
-    if (firstChanged == null || firstChanged > firstChange) return undefined;
-    const thinkingKept = compiled.messages.slice(0, firstChanged)
-      .some((message) => message.content.some((block) => block.type === 'thinking' || block.type === 'redacted_thinking'));
-    return this.bindsThinking && thinkingKept ? undefined : { changeTokens, inputTokens };
+    const free = firstChanged != null && firstChanged <= firstChange && !(this.bindsThinking && compiled.messages.slice(0, firstChanged)
+      .some((message) => message.content.some((block) => block.type === 'thinking' || block.type === 'redacted_thinking')));
+    if (free) return { changeTokens, inputTokens };
+    return changeTokens * 5 >= inputTokens ? { changeTokens, inputTokens, forced: 'share' } : undefined;
   }
 
   /** Remove this agent's change rows from its context: by their metadata,
