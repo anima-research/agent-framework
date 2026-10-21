@@ -12,11 +12,11 @@
  *    so a message stamped slightly out of order is still picked up; the
  *    service dedups by id + text hash, so re-sending is free. Summaries are
  *    watermarked by `createdMs` (a fresh L3 spans months of old timestamps —
- *    its creation time is the only monotonic signal), with the watermark kept
- *    in the module's state, which follows the store's branches: a branch
- *    made at an earlier point, as an undo makes one, mints summary ids its
- *    parent already used, so each branch sends its own summaries, keyed
- *    `sum:<id>@<created>`.
+ *    its creation time is the only monotonic signal). Both watermarks are
+ *    kept in the module's state, which follows the store's branches, so each
+ *    branch sends its own messages and summaries. A branch made at an earlier
+ *    point, as an undo makes one, mints summary ids its parent already used,
+ *    so a summary is keyed `sum:<id>@<created>`.
  *
  * What gets embedded per message: text blocks verbatim, plus the string
  * arguments of the agent's private-prose tools (think / journal / skip_reply
@@ -50,9 +50,13 @@ export interface SemanticIndexConfig {
   syncIntervalMs?: number;
   /** Items per upsert request. Default 128, max 256 (service limit). */
   syncBatch?: number;
-  /** Max items one background tick will push. Default 1024. */
+  /**
+   * Max new items one background tick will push. Default 1024. A tick whose
+   * budget runs out among summaries minted in one millisecond sends the rest
+   * of them too.
+   */
   maxSyncPerTick?: number;
-  /** Max items a pre-search catch-up will push before searching anyway. Default 256. */
+  /** Max new items a pre-search catch-up will push before searching anyway, as for `maxSyncPerTick`. Default 256. */
   maxSyncBeforeSearch?: number;
   /** Re-scan window behind the message watermark, ms. Default 10 min. */
   overlapMs?: number;
@@ -387,15 +391,21 @@ export function summaryToItem(s: SummaryLike, cfg: { maxChars?: number }): Index
 export interface PendingChanges { edited: string[]; removed: string[] }
 
 /**
- * Where the summary cursor is kept: the creation time through which this
- * branch's summaries are sent under their keys. HistoryModule keeps it in
- * module state, which the store's branches carry, so a branch made at an
- * earlier point starts from the cursor as it was there, and another branch's
- * passes never move it.
+ * A branch's sync cursors for one index: the creation time through which its
+ * summaries are sent under their keys, and the time through which its
+ * messages are sent. Null where nothing is sent yet.
  */
-export interface SummaryCursorStore {
-  read(): number | null;
-  write(createdMs: number): void;
+export interface SyncCursors { namespace: string; summaries: number | null; messages: number | null }
+
+/**
+ * Where the sync cursors are kept. HistoryModule keeps them in module state,
+ * which the store's branches carry, so a branch made at an earlier point
+ * starts from the cursors as they were there, and another branch's passes
+ * never move them.
+ */
+export interface SyncCursorStore {
+  read(): SyncCursors | null;
+  write(cursors: SyncCursors): void;
 }
 
 export interface SyncReport {
@@ -455,20 +465,25 @@ export class SemanticIndexer {
   /** Called whenever the pending edit/remove sets change. */
   onPendingChange: ((p: PendingChanges) => void) | null = null;
   /**
-   * Where the summary cursor is kept, set by the host. Without one, as
-   * before the host wires module state, this indexer keeps it itself.
+   * Where the sync cursors are kept, set by the host. Without one, as
+   * before the host wires module state, this indexer keeps them itself.
    */
-  summaryCursorStore: SummaryCursorStore | null = null;
-  private ownSummaryCursor: number | null = null;
+  cursorStore: SyncCursorStore | null = null;
+  private ownCursors: SyncCursors | null = null;
 
-  /** The creation time through which this branch's summaries have been sent under their keys, or null before its first pass. */
-  summaryCursor(): number | null {
-    return this.summaryCursorStore ? this.summaryCursorStore.read() : this.ownSummaryCursor;
+  /**
+   * This branch's cursors for this indexer's index. Cursors kept for another
+   * namespace, as before the host's index setting changed, are none here.
+   */
+  syncCursors(): { summaries: number | null; messages: number | null } {
+    const c = this.cursorStore ? this.cursorStore.read() : this.ownCursors;
+    return c && c.namespace === this.cfg.namespace ? c : { summaries: null, messages: null };
   }
 
-  private setSummaryCursor(createdMs: number): void {
-    if (this.summaryCursorStore) this.summaryCursorStore.write(createdMs);
-    else this.ownSummaryCursor = createdMs;
+  private setSyncCursors(c: { summaries: number | null; messages: number | null }): void {
+    const cursors: SyncCursors = { namespace: this.cfg.namespace, summaries: c.summaries, messages: c.messages };
+    if (this.cursorStore) this.cursorStore.write(cursors);
+    else this.ownCursors = cursors;
   }
 
   /**
@@ -523,8 +538,10 @@ export class SemanticIndexer {
   get backingOff(): boolean { return Date.now() < this.backoffUntil; }
 
   /**
-   * Push what the index is missing, up to `maxItems`. Coalesces: a call while
-   * a sync is already running returns that run's promise instead of racing it.
+   * Push what the index is missing, up to `maxItems` new items, and the rest
+   * of the summaries minted in the millisecond where that runs out.
+   * Coalesces: a call while a sync is already running returns that run's
+   * promise instead of racing it.
    */
   catchUp(maxItems: number): Promise<SyncReport> {
     if (this.inFlight) return this.inFlight;
@@ -543,11 +560,10 @@ export class SemanticIndexer {
     let notStats: EmbedServiceError | null = null;
     try {
       // A 2xx that isn't stats, such as a web page from a wrong route, gives no
-      // watermark: the pass walks from the start, as for a namespace that
-      // doesn't exist yet, and lastError names the answer. Every pass then
-      // starts over, and a history longer than a pass's budget is never
-      // walked to its end, so a pass whose budget runs out fails on that
-      // answer.
+      // service watermark, and lastError names the answer. A branch with no
+      // message cursor of its own then walks its messages from the beginning,
+      // as for a namespace that doesn't exist yet, so a pass whose budget
+      // runs out fails on that answer.
       let stats: IndexStats | null = null;
       try {
         stats = await this.client.stats();
@@ -558,7 +574,22 @@ export class SemanticIndexer {
       // /stats answered 404, which stats() reads as a namespace that doesn't
       // exist: there's no index to remove from.
       const noIndex = stats === null && notStats === null;
-      const msgWm = stats?.by_kind.message?.max_cursor ?? null;
+      // This branch's cursors, read at each pass so a switch between passes is
+      // seen, and written only while the store is still on the branch read
+      // here, so one branch's pass can't move another's cursor past what that
+      // branch hasn't sent. A namespace that doesn't exist holds nothing of
+      // this branch's, as after an index is deleted, so everything is sent. A
+      // branch with no message cursor starts from the service's watermark, as
+      // before cursors were kept per branch, so an upgrade doesn't walk every
+      // history again.
+      const branchOf = (): string | null =>
+        (this.cm as { currentBranch?: () => { id: string } | undefined }).currentBranch?.()?.id ?? null;
+      const branch = branchOf();
+      const kept = this.syncCursors();
+      const sumCursor = noIndex ? null : kept.summaries;
+      const msgWm = noIndex ? null : (kept.messages ?? stats?.by_kind.message?.max_cursor ?? null);
+      let sumNext = sumCursor;
+      let msgThrough: number | null = null;
       let budget = maxItems;
       let pending: IndexItem[] = [];
       const flush = async (): Promise<void> => {
@@ -649,15 +680,8 @@ export class SemanticIndexer {
 
       // Summaries before messages: they are few, and a message backlog that
       // exceeds every tick's budget must not keep new summaries out forever.
-      // The cursor is this branch's, read at each pass, so a switch between
-      // passes is seen; it's written only while the store is still on the
-      // branch this pass read, so one branch's pass can't move another's
-      // cursor past a summary that branch hasn't sent.
       {
-        const branchOf = (): string | null =>
-          (this.cm as { currentBranch?: () => { id: string } | undefined }).currentBranch?.()?.id ?? null;
-        const branch = branchOf();
-        const cursor = this.summaryCursor();
+        const cursor = sumCursor;
         const all = this.cm.getSummariesInRange({ fromMs: 0, toMs: Number.MAX_SAFE_INTEGER }) as SummaryLike[];
         report.summariesScanned = all.length;
         // `>=`: a summary minted in the cursor's millisecond after the pass
@@ -694,8 +718,10 @@ export class SemanticIndexer {
             const missing = await this.deleteIds(oldKeys, stats);
             if (missing !== null) {
               this.warn(
-                `/delete answered 404, so the service lacks that route; ${oldKeys.length} summaries' items from before `
-                  + `they were keyed by creation time stay, and search leaves them out: ${missing}`,
+                `/delete answered 404, so the service lacks that route; any items these ${oldKeys.length} summaries had `
+                  + `from before keys carried the creation time stay, and search leaves them out. Later removals and edits `
+                  + `down to nothing indexable are dropped too, until the host restarts or binds the history module `
+                  + `again: ${missing}`,
               );
             }
           } catch (e) {
@@ -705,7 +731,7 @@ export class SemanticIndexer {
             this.warn(`deleting ${oldKeys.length} summaries' items from before they were keyed by creation time failed; the next pass tries again: ${msg}`);
           }
         }
-        if (deleted && through !== null && through !== cursor && branchOf() === branch) this.setSummaryCursor(through);
+        if (deleted && through !== null) sumNext = through;
       }
 
       // Messages: walk forward from (watermark - overlap) via the time index.
@@ -736,6 +762,7 @@ export class SemanticIndexer {
           // indexed items and never reached the first new one — the index
           // froze at the watermark while reporting merely `more: true`.
           if (msgWm === null || item.cursor === undefined || item.cursor > msgWm) budget--;
+          if (item.cursor !== undefined && (msgThrough === null || item.cursor > msgThrough)) msgThrough = item.cursor;
           if (pending.length >= batchSize) await flush();
         }
         if (msgs.length < pageSize) break;
@@ -745,6 +772,12 @@ export class SemanticIndexer {
         fromMs = lastMs;
       }
       await flush();
+      // Every send of this pass is in, so its cursors stand. A pass with
+      // nothing new writes no state.
+      const msgNext = msgThrough ?? msgWm;
+      if ((sumNext !== kept.summaries || msgNext !== kept.messages) && branchOf() === branch) {
+        this.setSyncCursors({ summaries: sumNext, messages: msgNext });
+      }
       if (notStats && report.more) throw notStats;
       this.consecutiveFailures = 0; this.lastError = named(notStats?.message ?? null, ...phaseErrors); this.lastSyncAt = Date.now();
       return report;

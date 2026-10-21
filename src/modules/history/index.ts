@@ -49,7 +49,7 @@ import type { ToolDefinition, ToolCall, ToolResult, ProcessEvent } from '../../t
 import type { EventResponse, ProcessState } from '../../types/module.js';
 import type { SearchWorkerMessage, SearchWorkerMatch } from './search-regex-worker.js';
 import type { ChannelRegistry } from '../../mcpl/channel-registry.js';
-import { EmbedServiceError, SemanticIndexClient, SemanticIndexer, messageIndexText, parseSummaryKey, summaryIndexText, type SearchResponse, type SemanticIndexConfig, type SyncReport, type PendingChanges } from './semantic.js';
+import { EmbedServiceError, SemanticIndexClient, SemanticIndexer, messageIndexText, parseSummaryKey, summaryIndexText, type SearchResponse, type SemanticIndexConfig, type SyncReport, type PendingChanges, type SyncCursors } from './semantic.js';
 import { unknownToolMessage } from '../unknown-tool.js';
 import { safeSlice } from '../../safe-slice.js';
 
@@ -625,13 +625,13 @@ export class HistoryModule implements Module {
       this.ctx?.setState({ ...prev, semanticPending: p });
     };
     // Module state follows the store's branches, so each branch keeps its
-    // own summary cursor, and a branch made at an earlier point inherits the
-    // cursor as it was there.
-    this.indexer.summaryCursorStore = {
-      read: () => this.ctx?.getState<{ semanticSummaryCursor?: number }>()?.semanticSummaryCursor ?? null,
-      write: (createdMs) => {
+    // own sync cursors, and a branch made at an earlier point inherits them
+    // as they were there.
+    this.indexer.cursorStore = {
+      read: () => this.ctx?.getState<{ semanticCursors?: SyncCursors }>()?.semanticCursors ?? null,
+      write: (cursors) => {
         const prev = this.ctx?.getState<Record<string, unknown>>() ?? {};
-        this.ctx?.setState({ ...prev, semanticSummaryCursor: createdMs });
+        this.ctx?.setState({ ...prev, semanticCursors: cursors });
       },
     };
     this.indexer.attach();
@@ -1699,7 +1699,9 @@ export class HistoryModule implements Module {
     // A summary hit's snippet is rebuilt from the local summary too, so a
     // service that keeps only vectors and ids (no text) still yields one.
     const currentText = new Map<string, string>();
-    const summaryCursor = this.indexer?.summaryCursor() ?? null;
+    // Set by check() for the answer it checks, on the branch current then.
+    let summaryCursor: number | null = null;
+    let keyedHere = new Set<string>();
     const keep = (h: { id: string }): 'ok' | 'offBranch' | 'stale' | 'superseded' => {
       const msgId = /^msg:(.+)$/.exec(h.id)?.[1];
       const sum = parseSummaryKey(h.id);
@@ -1716,12 +1718,13 @@ export class HistoryModule implements Module {
         if (!s) return 'offBranch';
         if (sum.createdMs !== null) {
           if (s.created !== sum.createdMs) return 'offBranch';
-        } else if (summaryCursor !== null && s.created <= summaryCursor) {
+        } else if ((summaryCursor !== null && s.created <= summaryCursor) || keyedHere.has(sum.id)) {
           // A key from before keys carried the creation time, left where the
           // service lacks /delete or the delete hasn't gone through. This
-          // branch's cursor covers its summary, so that summary is in the
-          // index under its own key, and this item is an old copy of it or
-          // of another branch's under the same id. It isn't counted.
+          // branch's summary with that id is in the index under its own key,
+          // since this branch's cursor covers it or the same answer holds it,
+          // so this item is an old copy of it or of another branch's under
+          // the same id. It isn't counted.
           return 'superseded';
         }
         const text = summaryIndexText(s, this.semanticCfg!);
@@ -1753,6 +1756,13 @@ export class HistoryModule implements Module {
     // The last answer's hits on this branch, checked as they are now.
     const check = (): void => {
       droppedOffBranch = 0; droppedStale = 0;
+      // The branch can change while a search waits, so its cursor is read here.
+      summaryCursor = this.indexer?.syncCursors().summaries ?? null;
+      // The ids whose summary on this branch the answer holds under its own key.
+      keyedHere = new Set(res.hits.flatMap((h) => {
+        const sum = parseSummaryKey(h.id);
+        return sum !== null && sum.createdMs !== null && cm.getSummary(sum.id)?.created === sum.createdMs ? [sum.id] : [];
+      }));
       onBranch = res.hits.filter((h) => {
         const v = keep(h);
         if (v === 'offBranch') droppedOffBranch++;
@@ -1791,12 +1801,13 @@ export class HistoryModule implements Module {
       const meta = typeof h.meta === 'object' && h.meta !== null && !Array.isArray(h.meta)
         ? h.meta as { participant?: unknown; author?: unknown }
         : null;
-      const missing = [...(h.ts !== null && timestamp === null ? ['ts'] : []), ...(meta === null ? ['meta'] : [])];
-      if (missing.length > 0) unread.push(`${shown(h.id)} (${missing.join(' and ')})`);
+      // A summary is shown as `sum:<id>`, as it was before its key carried its creation time.
       const sum = parseSummaryKey(h.id);
+      const id = sum ? `sum:${sum.id}` : h.id;
+      const missing = [...(h.ts !== null && timestamp === null ? ['ts'] : []), ...(meta === null ? ['meta'] : [])];
+      if (missing.length > 0) unread.push(`${shown(id)} (${missing.join(' and ')})`);
       return {
-        // A summary is shown as `sum:<id>`, as it was before its key carried its creation time.
-        id: sum ? `sum:${sum.id}` : h.id,
+        id,
         /** Raw message id for a `msg:` hit (null for summaries) — pass it to extract({ aroundId }). */
         messageId: h.id.startsWith('msg:') ? h.id.slice(4) : null,
         kind: h.kind,

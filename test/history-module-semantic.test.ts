@@ -140,10 +140,10 @@ describe('HistoryModule semantic_search', () => {
     assert.equal(svc.items.get('msg:m1')!.cursor, T0 + 1000);
     assert.equal(svc.items.get(`sum:s1@${T0 + 9000}`)!.cursor, T0 + 9000);
     assert.equal(svc.items.get('msg:m1')!.channel, 'chan-A');
-    // second pass: overlap re-sends the recent messages but the service reports them unchanged; the summary is not re-sent
+    // Second pass: the overlap re-sends the recent messages, and the summary at
+    // the cursor's millisecond is sent again; the service reports them all unchanged.
     const r2 = await mod.syncSemanticIndex()!;
-    assert.equal(r2.inserted, 0);
-    assert.ok(!svc.upserts.at(-1)!.some((i) => i.id === `sum:s1@${T0 + 9000}`) || r2.pushed === 0);
+    assert.deepEqual({ inserted: r2.inserted, unchanged: r2.unchanged }, { inserted: 0, unchanged: r2.pushed });
 
     const res = await mod.handleToolCall({ id: 'c1', name: 'semantic_search', input: { query: 'fluid sim', from: '2026-09-22T00:00:00Z', kinds: 'messages', limit: 5 } });
     assert.equal(res.success, true, JSON.stringify(res));
