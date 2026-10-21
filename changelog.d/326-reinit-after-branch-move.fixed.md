@@ -35,8 +35,8 @@
   The move itself stands. A rollback or suppression whose switch back to the
   source branch fails as well raises the same alert for the agent it named,
   and says which branch the store is on, and whether the agent's manager
-  refuses its work there, where a restart would serve it from the branch
-  the store is on, or, after a suppression whose removals failed and
+  refuses its work there, where a restart would serve a configured agent
+  from the branch the store is on, or, after a suppression whose removals failed and
   whose switch back couldn't select the source, is current on the
   suppression's branch, which its fork initialized it for, and serves from
   there until a `switchBranch()` moves it. A rollback or suppression refused

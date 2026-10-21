@@ -2034,8 +2034,8 @@ export function restoreAlert(restore: {
  *  again, and so was disposed (reinitializeManagers). `remedy` is what lets
  *  its channel spawn again when the cause stops that too; `heldWrites`, the
  *  writes queued for it while the store was held, which went with it, and
- *  `releasePostponed`, whether its window's release waits for a resume, as
- *  on a quiesced host (releaseWindowNowOrAfterResume), or has run. */
+ *  `releasePostponed`, whether its window's release still waits for a
+ *  resume, as on a quiesced host (releaseWindowNowOrAfterResume). */
 export function disposalAlert(disposal: {
   move: ReinitMove;
   remedy?: TemplateRemedy;
@@ -2054,19 +2054,22 @@ export function disposalAlert(disposal: {
       : "Its channel's next qualifying message spawns a new fork, unless its seeding fails again.");
   const writes = heldWrites === 1 ? 'The write' : `The ${heldWrites} writes`;
   const them = heldWrites === 1 ? 'it' : 'them';
+  const goes = ` ${writes} held for it while the store was held ${heldWrites === 1 ? 'goes' : 'go'} with it, so that ` +
+    `fork doesn't get ${them}: `;
+  // A postponed release takes them whether or not the cleanup got past it;
+  // a cleanup that failed otherwise may not have released anything.
   const held = heldWrites === 0
     ? ''
-    : cleanupFailed
-      ? ` ${writes} held for it while the store was held may be in its window, where no agent reads ${them}, or ` +
-        'still queued under its name, as far as that cleanup got. A flush that meets one still queued passes a ' +
-        'failed reply on to the primary agent and drops anything else, logged.'
-      : ` ${writes} held for it while the store was held ${heldWrites === 1 ? 'goes' : 'go'} with it, so that fork ` +
-        `doesn't get ${them}: ` + (releasePostponed
-          ? `its window's release, at the host's resume, stores what its store takes of ${them} there and passes any ` +
-            `failed reply on to the primary agent. A stop() before the resume passes a failed reply on and drops the ` +
-            'rest, logged.'
-          : `its window's release stored what its store took of ${them} there and passed any failed reply on to the ` +
-            'primary agent.');
+    : releasePostponed
+      ? `${goes}its window's release, at the host's resume, stores what its store takes of ${them} there and passes ` +
+        `any failed reply on to the primary agent. A stop() before the resume passes a failed reply on and drops the ` +
+        'rest, logged.'
+      : cleanupFailed
+        ? ` ${writes} held for it while the store was held may be in its window, where no agent reads ${them}, ` +
+          'still queued under its name, or in neither, as far as that cleanup got. A flush that meets one still ' +
+          'queued passes a failed reply on to the primary agent and drops anything else, logged.'
+        : `${goes}its window's release stored what its store took of ${them} there and passed any failed reply on ` +
+          'to the primary agent.';
   return {
     opening,
     message: `${opening} That fork is seeded from the template, under a new name.${held} ` +
@@ -2075,6 +2078,29 @@ export function disposalAlert(disposal: {
       `It couldn't be seeded because ${cause}.` +
       (cleanupFailed ? ` Its cleanup failed: ${cleanupFailed}.` : ''),
   };
+}
+
+/** The `store-held-long` alert (reportLongHold): its opening says what the
+ *  hold does and what a restart does to each kind of agent (AgentKind), and
+ *  the move's agent and what the hold is on come after it, since names have
+ *  no bound (a conversation agent's runs to 97 characters, forkAgentName). */
+export function longHoldAlert(hold: {
+  move: string;
+  agentName: string;
+  heldSeconds: number;
+  queued: number;
+  reinitializing?: string;
+  waitingForMaintenance: boolean;
+}): ReinitAlertText {
+  const { move, agentName, heldSeconds, queued, reinitializing, waitingForMaintenance } = hold;
+  const opening = `The ${move} has held the store for ${heldSeconds} s: no agent's turn starts until it lets the store go, ` +
+    `and the writes it defers wait in the deferral queue (${queued} now). A restart ends the ${move}, the ` +
+    'conversation agents and the runs, and re-initializes the configured agents, whose queued writes survive only in a ' +
+    'persisted deferral queue.';
+  const on = reinitializing !== undefined
+    ? `, and is re-initializing ${reinitializing}'s context manager now`
+    : waitingForMaintenance ? ', and is waiting for maintenance work that was already running to finish' : '';
+  return { opening, message: `${opening} The ${move} is for ${agentName}${on}.` };
 }
 
 /** How long a move may hold the store before a `store-held-long` ops alert
@@ -2119,9 +2145,6 @@ interface ManagerReinitFailure {
    *  the store was. Its window's release takes them: it stores what its store
    *  accepts there, and passes a failed reply on to the primary. */
   heldWrites?: number;
-  /** For a disposal: its window's release waits for the host's resume
-   *  (releaseWindowNowOrAfterResume postponed it). */
-  releasePostponed?: true;
 }
 
 /** The start of what a tool answered, for naming a call its script stopped waiting for: its first text, or its blocks' count. */
@@ -10749,11 +10772,16 @@ export class AgentFramework {
       // Named only while its re-initialization runs: an overdue timer runs at
       // the turn before the next manager, when none is.
       if (hold) hold.reinitializing = agentName;
+      // What a restart does to it, taken before the await: a run's end or a
+      // fork's disposal meanwhile takes it out of what agentKind reads.
+      const kind = this.agentKind(agentName);
       try {
         const cm = agent.getContextManager();
         await cm.setStrategy(cm.getStrategy());
       } catch (error) {
-        failures.push({ agentName, kind: this.agentKind(agentName), error: failureDescription(error) });
+        // One that has left meanwhile, as a run its watchdog ended, refuses
+        // no one's work, so it isn't reported.
+        if (this.agents.get(agentName) === agent) failures.push({ agentName, kind, error: failureDescription(error) });
       } finally {
         if (hold) delete hold.reinitializing;
       }
@@ -10770,23 +10798,20 @@ export class AgentFramework {
    * running when the move took the store, which the move waits for before it
    * goes on (no maintenance starts while the store is held). Until the hold
    * is released no turn starts, and the writes it defers wait in the queue,
-   * so it says what a restart costs, by the agents' kinds (AgentKind). The
-   * release clears its timer, so it comes at most once for a hold.
+   * so it says what a restart costs, by the agents' kinds (AgentKind), in
+   * the words of its text builder (longHoldAlert). The release clears its
+   * timer, so it comes at most once for a hold.
    */
   private reportLongHold(hold: { verb: string; agentName: string; since: number; reinitializing?: string }): void {
     const heldMs = Date.now() - hold.since;
     const queued = this.deferredMessages.length;
     const reinitializing = hold.reinitializing;
     const waitingForMaintenance = reinitializing === undefined && this.maintenanceRunning();
-    const on = reinitializing !== undefined
-      ? `, and is re-initializing ${reinitializing}'s context manager now`
-      : waitingForMaintenance ? ', and is waiting for maintenance work that was already running to finish' : '';
     this.opsAlert('store-held-long', hold.agentName,
-      `The ${MOVE_NOUNS[hold.verb] ?? hold.verb} for ${hold.agentName} has held the store for ` +
-        `${Math.round(heldMs / 1000)} s${on}. No agent's turn starts until it lets the store go, and the writes it ` +
-        `defers for the agents wait in the deferral queue (${queued === 1 ? '1 write' : `${queued} writes`} now). ` +
-        'A restart ends it, ends the conversation agents and runs, and re-initializes the configured agents, whose ' +
-        'queued writes outlast the process only in a persisted deferral queue.',
+      longHoldAlert({
+        move: MOVE_NOUNS[hold.verb] ?? hold.verb, agentName: hold.agentName, heldSeconds: Math.round(heldMs / 1000),
+        queued, reinitializing, waitingForMaintenance,
+      }).message,
       {
         data: {
           verb: hold.verb,
@@ -10881,7 +10906,7 @@ export class AgentFramework {
       }
       if (moved()) continue;
       const failure: ManagerReinitFailure = {
-        agentName, kind: this.agentKind(agentName), error: cause, seedingFailed: true, ...(remedy ? { remedy } : {}),
+        agentName, kind: 'conversation', error: cause, seedingFailed: true, ...(remedy ? { remedy } : {}),
       };
       // What the hold deferred for it goes with it: its window's release, now
       // or at resume while the host is quiesced, stores what its store
@@ -10895,7 +10920,6 @@ export class AgentFramework {
           this.conversationRouter.unbind(channelId);
         }
         this.disposeConversationAgent(agentName);
-        if (this.releasesAfterResume.has(agentName)) failure.releasePostponed = true;
       } catch (error) {
         failure.cleanupFailed = failureDescription(error);
       }
@@ -10911,8 +10935,12 @@ export class AgentFramework {
    *  the trace keep 2,000, cut the same way. */
   private reportReinitFailures(after: ReinitMove, failures: ManagerReinitFailure[]): void {
     for (const failure of failures) {
-      const { agentName, kind, error, seedingFailed, after: judgedAfter, remedy, cleanupFailed, heldWrites, releasePostponed } = failure;
+      const { agentName, kind, error, seedingFailed, after: judgedAfter, remedy, cleanupFailed, heldWrites } = failure;
       const move = judgedAfter ?? after;
+      // Whether a disposed fork's window still waits for the resume, as it
+      // stands now: a resume since the disposal has run its release, and a
+      // disposal that threw after postponing it still has it waiting.
+      const releasePostponed = this.releasesAfterResume.has(agentName);
       this.reportReinitFailure(agentName, move, seedingFailed
         ? disposalAlert({ move, remedy, cleanupFailed, heldWrites, releasePostponed, cause: error }).message
         : refusedWorkAlert(move, kind, error).message);
@@ -11116,6 +11144,11 @@ export class AgentFramework {
   ): Promise<string> {
     const current = this.store.currentBranch().name;
     if (current !== failedBranch) return `active branch is ${current}`;
+    // What a restart does to the agent, taken before the await (as in
+    // reinitializeManagers). A restart creates a configured agent again, on
+    // the branch the store is on, but not a conversation agent or a run
+    // (restartClause).
+    const kind = this.agentKind(agentName);
     try {
       await cm.switchBranch(sourceBranch);
       return `active branch restored to ${sourceBranch}`;
@@ -11125,9 +11158,6 @@ export class AgentFramework {
       // so a failed initialization leaves the store back on the source.
       const now = this.store.currentBranch().name;
       const selected = now === sourceBranch;
-      // A restart creates a configured agent again, on the branch the store
-      // is on, but not a conversation agent or a run (restartClause).
-      const kind = this.agentKind(agentName);
       const restart = kind === 'conversation' ? ' (a restart ends it instead)' : kind === 'run' ? ' (a restart ends the run instead)' : '';
       const status = selected
         ? `RESTORE TO ${sourceBranch} selected it, but re-initializing the agent's context manager for it FAILED (${detail}); ` +
@@ -22419,10 +22449,11 @@ export class AgentFramework {
    *  it again, in queue order and cut per target (writeDrainedInOrder). With
    *  `bypassDeferral`, each is stored past its target's deferral (stop()).
    *  With `traceAs`, each one stored is traced as `message:added` from that
-   *  source, in queue order. A write that threw after storing missed the notes addMessage takes after a
-   *  store, so they're taken for what landed as soon as it's found, before
-   *  the writes after it: an open turn's arrivals keep the order the writes
-   *  landed in, and its newest stays the newest (remainingArrival).
+   *  source, in queue order. A write that threw after storing missed the
+   *  notes addMessage takes after a store, so they're taken for what landed
+   *  as soon as it's found, before the writes after it: an open turn's
+   *  arrivals keep the order the writes landed in, and its newest stays the
+   *  newest (remainingArrival).
    *
    *  A target no longer registered (a fork or a run that has ended, here or
    *  before a crash) has no window to land in: a failed reply it never read
