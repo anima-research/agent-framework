@@ -586,9 +586,10 @@ describe('held prose drafts, end to end', () => {
       // notice is visible there too; it names whose drafts it means.
       const held = h.texts('scout').find((t) => t.startsWith('[drafts] scout: '));
       assert.ok(held);
-      assert.ok(held!.startsWith(`[drafts] scout: your plain-speech message starting "scout words" was not sent and is instead ` +
-        `held as draft ${mine.id} because there was an explicit send in the same round as the plain speech. `),
-        `the held-draft notice names the message by its opening words, and why it was held: ${held}`);
+      assert.ok(held!.startsWith(`[drafts] scout: your plain-speech message (11 chars) was not sent and is instead held as draft ` +
+        `${mine.id} because you made an explicit send in this round or an earlier one this turn. `),
+        `the held-draft notice names the message and why it was held: ${held}`);
+      assert.ok(!held!.includes('scout words'), `the held-draft notice quotes none of the draft's words: ${held}`);
     } finally {
       await h.close();
     }
@@ -1320,6 +1321,53 @@ describe('draft notices and turn-end settlement', () => {
       assert.ok(receipt.startsWith('[delivered] nothing confirmed —'), `a let-go draft's unknown state makes no claim of non-delivery: ${receipt}`);
     } finally {
       t.mock.timers.reset();
+      await h.close();
+    }
+  });
+
+  it('the held-draft notice names each draft by length and order, gives its reason, and quotes none of its words', async () => {
+    const h = await catchUpFixture();
+    const f = h.framework as unknown as {
+      holdProseDrafts(agent: unknown, texts: Array<{ text: string; note?: string; inheritedRisk?: unknown }>, reason: string,
+        options: unknown): Array<{ id: string }>;
+    };
+    const routing = h.internals.routingOf('scout');
+    const notice = (ids: string[]): string => h.cm.getAllMessages()
+      .filter((m) => (m.metadata as { kind?: string; draftIds?: string[] } | undefined)?.kind === 'prose-drafts'
+        && ids.every((id) => (m.metadata as { draftIds: string[] }).draftIds.includes(id)))
+      .flatMap((m) => m.content).map((b) => (b as { text?: string }).text ?? '').join('');
+    const hold = (texts: Array<{ text: string; note?: string; inheritedRisk?: unknown }>, reason: string) => {
+      const ids = f.holdProseDrafts(h.agent, texts, reason, { routing, notice: 'now' }).map((d) => d.id);
+      const text = notice(ids);
+      for (const t of texts) assert.ok(!text.includes(t.text), `no words quoted: ${text}`);
+      return { ids, text };
+    };
+    const sendClause = 'you made an explicit send in this round or an earlier one this turn';
+    const failedEnvelope = 'had no destination — after a routing envelope failed, plain speech waits for a new valid target';
+    try {
+      // A hybrid draft's note (its routing token) is shown neither alone nor among several.
+      const one = hold([{ text: 'one two three', note: 'written for >>>#room' }], 'explicit-send');
+      const [a] = one.ids;
+      assert.equal(one.text, `[drafts] scout: your plain-speech message (13 chars) was not sent and is instead held as draft ${a} because ` +
+        `${sendClause}. drafts(action: "resend", draftIds: ["${a}"], destination: "#channel") delivers it unchanged; ` +
+        `drafts(action: "dismiss", draftIds: ["${a}"]) sets it aside.`);
+
+      // Every draft's text has a space, so no draft id (d- and seven of [a-z2-9]) can hold it.
+      const three = hold([{ text: 'first one' }, { text: 'the second one', note: 'written for >>>#room' }, { text: 'last one' }], 'explicit-send');
+      const [b, c, d] = three.ids;
+      assert.ok(three.text.startsWith(`[drafts] scout: your 3 plain-speech messages were not sent and are instead held as drafts ` +
+        `${b} (9 chars), ${c} (14 chars) and ${d} (8 chars), in the order you wrote them, because ${sendClause}. `),
+        three.text);
+      assert.ok(!three.text.includes('written for'), `a hybrid draft's note, its routing token, isn't quoted either: ${three.text}`);
+
+      const risky = hold([{ text: 'copied words', inheritedRisk: { draftId: 'd-aaaaaaa', reason: 'connection lost' } }], 'explicit-send');
+      assert.ok(risky.text.startsWith(`[drafts] scout: your plain-speech message (12 chars) is held as draft ${risky.ids[0]} because ${sendClause}. `),
+        `no "not sent" over words that may be out: ${risky.text}`);
+
+      const lost = hold([{ text: 'nowhere to go' }], 'no-destination');
+      assert.ok(lost.text.startsWith(`[drafts] scout: your plain-speech message (13 chars) was not sent and is instead held as draft ` +
+        `${lost.ids[0]} because it ${failedEnvelope}. `), lost.text);
+    } finally {
       await h.close();
     }
   });
@@ -2169,9 +2217,11 @@ describe('held drafts: exact runs, hybrid envelopes beside a send, and turn-end 
       const notice = h.messages().find((m) => (m.metadata as { kind?: string; draftIds?: string[] } | undefined)?.kind === 'prose-drafts'
         && (m.metadata as { draftIds?: string[] }).draftIds?.includes(copy.id))!;
       const words = notice.content.map((b) => (b as { text?: string }).text ?? '').join('');
-      assert.ok(words.startsWith(`[drafts] scout: your 2 plain-speech messages are held as drafts ${free.id} (starting "plain words") ` +
-        `and ${copy.id} (starting "possibly sent and a new line") because there was an explicit send in the same round as the plain speech. `),
+      assert.ok(words.startsWith(`[drafts] scout: your 2 plain-speech messages are held as drafts ${free.id} (11 chars) ` +
+        `and ${copy.id} (28 chars), in the order you wrote them, because you made an explicit send in this round or an earlier ` +
+        'one this turn. '),
         `no "not sent" over words that may be out: ${words}`);
+      assert.ok(!words.includes('plain words') && !words.includes('possibly sent'), `the notice quotes none of the drafts' words: ${words}`);
       assert.ok(words.includes(`drafts(action: "resend", draftIds: ["${free.id}"], destination: "#channel") delivers it unchanged`), words);
       assert.ok(words.includes(`${copy.id} includes the words of ${original.id}, and ${original.id}'s attempt to #room (Guild One) (${ROOM})`), words);
       assert.ok(words.includes(`so resending ${copy.id} could post it twice (to send it anyway: drafts(action: "resend", draftIds: ["${copy.id}"], destination: "#channel", confirmDuplicate: true))`), words);

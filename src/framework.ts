@@ -14397,7 +14397,11 @@ export class AgentFramework {
 
   /** Why the held-draft notice's drafts were held, as the clause after "because". */
   private static readonly DRAFT_REASON_BECAUSE: Record<DraftReason, (many: boolean) => string> = {
-    'explicit-send': () => 'there was an explicit send in the same round as the plain speech',
+    // A send silences plain speech in its own round and the turn's later
+    // rounds (turnSilenced), so a later round's drafts are held by a send
+    // made in an earlier one. Only the cause is named: new input clears the
+    // silence (adoptInjectedRound), and a budget restart starts without it.
+    'explicit-send': () => 'you made an explicit send in this round or an earlier one this turn',
     'no-destination': (many) => `${many ? 'they' : 'it'} had no destination — after a routing envelope failed, ` +
       'plain speech waits for a new valid target',
     bounced: (many) => `${many ? 'their' : 'its'} routing prefix bounced`,
@@ -14418,19 +14422,20 @@ export class AgentFramework {
       ...risky.map((d) => `${this.riskText(d)}, so resending ${d.id} could post it twice ` +
         `(to send it anyway: drafts(action: "resend", draftIds: ["${d.id}"], destination: "#channel", confirmDuplicate: true))`),
     ];
-    // Each draft is named with its opening words, so the resident can tell
-    // which of its messages this is.
-    const opening = (d: Draft): string => AgentFramework.draftPreview(d.text, 50);
-    const named = held.map((d) => `${d.id} (starting ${opening(d)})`);
+    // Each draft is told apart by its length and, among several, by its
+    // place: one hold keeps its segments in the order written. None of its
+    // words are quoted: they reach user-role text only through the drafts
+    // tool, when the resident asks.
+    const named = held.map((d) => `${d.id} (${d.text.length} chars)`);
     const which = many
       ? `your ${held.length} plain-speech messages`
-      : `your plain-speech message starting ${opening(held[0]!)}`;
+      : `your plain-speech message (${held[0]!.text.length} chars)`;
     // "Not sent" only when no copied words may already have been posted.
     const status = risky.length > 0
       ? `${many ? 'are' : 'is'} held as`
       : `${many ? 'were not sent and are' : 'was not sent and is'} instead held as`;
     const heldAs = many
-      ? `drafts ${named.slice(0, -1).join(', ')} and ${named.at(-1)}`
+      ? `drafts ${named.slice(0, -1).join(', ')} and ${named.at(-1)}, in the order you wrote them,`
       : `draft ${held[0]!.id}`;
     // Named: residents that share one message slot (#197) share this window.
     return (
@@ -14444,7 +14449,7 @@ export class AgentFramework {
     return formatZonedDateTime(t, this.timeZone).replace(/:\d\d\.\d{3}/, '');
   }
 
-  /** A draft's opening words, for the drafts tool's listing and the held-draft notice. */
+  /** A draft's opening words, for the drafts tool's listing only. */
   private static draftPreview(text: string, max = 80): string {
     const flat = text.replace(/\s+/g, ' ').trim();
     return JSON.stringify(flat.length > max ? `${flat.slice(0, max)}…` : flat);
