@@ -132,11 +132,11 @@ export function reconcileWithRecipe(
 ): { config: GateConfig; changes: RecipeChanges } {
   const liveDuplicate = duplicateName(live);
   if (liveDuplicate !== undefined) {
-    throw new Error(`gate.json names the rule "${liveDuplicate}" twice, so the recipe wasn't applied: give each rule its own name`);
+    throw new Error(`gate.json names the rule "${liveDuplicate}" twice, so the recipe wasn't applied: the merge needs one rule per name`);
   }
   const recipeDuplicate = duplicateName(recipe);
   if (recipeDuplicate !== undefined) {
-    throw new Error(`the recipe names the rule "${recipeDuplicate}" twice, so it wasn't applied: give each rule its own name`);
+    throw new Error(`the recipe names the rule "${recipeDuplicate}" twice, so it wasn't applied: the merge needs one rule per name`);
   }
 
   const changes: RecipeChanges = {
@@ -208,7 +208,10 @@ export function reconcileWithRecipe(
     order = staying.map((name) => (ordered.has(name) ? recipeRules[next++] : name));
   } else {
     order = staying;
-    changes.orderKept = canonical(shared(recipeOrder)) !== canonical(shared(lastOrder));
+    // Named only when it holds something back: the recipe reordered these
+    // rules, and gate.json doesn't already hold the recipe's order.
+    changes.orderKept = canonical(shared(recipeOrder)) !== canonical(shared(lastOrder))
+      && canonical(shared(liveOrder)) !== canonical(shared(recipeOrder));
   }
   // A recipe rule new to gate.json goes before the recipe rule that follows it
   // there, or after the one before it when none follows.
@@ -226,8 +229,9 @@ export function reconcileWithRecipe(
     else order.push(name);
   });
 
-  const stayedInOrder = longestShared(staying, order.filter((name) => inLive.has(name)));
-  changes.moved = order.filter((name) => inLive.has(name) && !stayedInOrder.has(name));
+  // Only the recipe's rules move; every other rule keeps its place.
+  const stayedInOrder = longestShared(staying.filter((name) => ordered.has(name)), order.filter((name) => ordered.has(name)));
+  changes.moved = order.filter((name) => ordered.has(name) && !stayedInOrder.has(name));
 
   const liveDefault = live.default ?? 'always';
   const recipeDefault = recipe.default ?? 'always';
@@ -284,7 +288,10 @@ export function reconcileLine(changes: RecipeChanges): string | null {
   if (changes.defaultChange) parts.push(`default ${changes.defaultChange.from} → ${changes.defaultChange.to}`);
   if (changes.defaultKept) parts.push(`default kept as edited (${changes.defaultKept}), though the recipe changed it`);
   if (changes.defaultDiffers) {
-    parts.push(`default kept as gate.json has it (${changes.defaultDiffers.kept}), though the recipe's is ${changes.defaultDiffers.recipe}`);
+    parts.push(
+      `default kept as gate.json has it (${changes.defaultDiffers.kept}), though the recipe's is ${changes.defaultDiffers.recipe} `
+        + "(set it to the recipe's, and later starts follow the recipe)",
+    );
   }
   if (changes.orderKept) parts.push("gate.json's order kept, though the recipe reordered its rules, since a recipe rule was moved in it");
   return parts.length > 0 ? `[gate] the recipe was applied to gate.json: ${parts.join('; ')}` : null;
