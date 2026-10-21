@@ -494,6 +494,126 @@ describe("a turn's replies go out through the server whose message triggered it"
   });
 });
 
+describe('in explicit and hybrid mode, a reply goes out through no server but the one whose message it answers', () => {
+  const X = 'discord:g1:room';
+  let dir: string;
+  let framework: AgentFramework | undefined;
+  let membrane: MockMembrane;
+  let release: () => void = () => {};
+  let started = 0;
+  let restoreErrors: () => void = () => {};
+  const paths = (id: string) => ({ status: join(dir, `${id}-status.jsonl`), command: join(dir, `${id}-commands.jsonl`) });
+  const lines = (path: string): Array<Record<string, unknown>> =>
+    existsSync(path) ? readFileSync(path, 'utf8').split('\n').filter(Boolean).map((l) => JSON.parse(l)) : [];
+  const command = (id: string, c: Record<string, unknown>) => appendFileSync(paths(id).command, JSON.stringify(c) + '\n');
+  const registry = () => (framework as unknown as { channelRegistry: ChannelRegistry }).channelRegistry;
+  const published = (text: string) => ['discord', 'slack'].flatMap((id) =>
+    lines(paths(id).status).filter((l) => l.event === 'publish' && String(l.text ?? '').includes(text)).map(() => id));
+
+  // As the suite above, with the agent in the given prose mode. Each turn's
+  // stream is held until release(), so a server can withdraw the channel
+  // between its message's admission and the reply.
+  async function start(proseRouting: 'explicit' | 'hybrid'): Promise<void> {
+    dir = mkdtempSync(join(tmpdir(), 'reply-mode-'));
+    for (const id of ['discord', 'slack']) writeFileSync(paths(id).command, '');
+    const original = console.error;
+    console.error = () => {};
+    restoreErrors = () => { console.error = original; };
+    started = 0;
+    const released = new Promise<void>((resolve) => { release = resolve; });
+    membrane = new MockMembrane();
+    const responses: Array<ReturnType<typeof createMockResponse>> = [];
+    membrane.pushResponse = (r) => { responses.push(r as ReturnType<typeof createMockResponse>); };
+    membrane.streamYielding = (request) => {
+      membrane.calls.push(request);
+      started++;
+      const turn = responses.splice(0);
+      return new HeldStream(released, turn.length > 0 ? turn : [createMockResponse([])]);
+    };
+    framework = await AgentFramework.create({
+      storePath: join(dir, 'store'),
+      membrane: membrane.asMembrane(),
+      agents: [{ name: 'scout', model: 'test-model', systemPrompt: 'You are scout.', proseRouting }],
+      mcplServers: [
+        { id: 'discord', command: process.execPath, args: [FIXTURE],
+          env: { STATUS_PATH: paths('discord').status, COMMAND_PATH: paths('discord').command } },
+        { id: 'slack', command: process.execPath, args: [FIXTURE],
+          env: { STATUS_PATH: paths('slack').status, COMMAND_PATH: paths('slack').command,
+            CHANNELS: JSON.stringify([{ id: 'slack:T1:C1', label: '#lobby (acme)' }]) } },
+      ],
+      modules: [],
+    });
+    await framework.start();
+    await waitFor(() => registry().listChannelsRaw().length >= 3, 'both servers registered');
+    await registry().handleRegister('slack', { channels: [{ id: X, type: 'chat', label: '#room (slack)', direction: 'bidirectional' }] });
+  }
+
+  afterEach(async () => {
+    release();
+    await framework?.stop();
+    framework = undefined;
+    restoreErrors();
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  // slack pushes into the channel both servers register; while its turn is
+  // held, `leaves` withdraws the channel; then the reply is let through.
+  async function replyAfter(leaves: 'slack' | 'discord'): Promise<void> {
+    command('slack', { op: 'push', eventId: `ev-${leaves}`, origin: { mcplChannelId: X, channelName: '#room (slack)' },
+      tags: ['chat:addressed', 'chat:mention'], text: 'a message pushed by slack' });
+    await waitFor(() => started > 0, 'the turn started');
+    await registry().handleChanged(leaves, { removed: [X] });
+    release();
+    for (let i = 0; i < 3; i++) {
+      await framework!.runUntilIdle();
+      await new Promise((r) => setTimeout(r, 300));
+    }
+  }
+
+  for (const leaves of ['slack', 'discord'] as const) {
+    const where = leaves === 'slack' ? [] : ['slack'];
+    const what = leaves === 'slack' ? 'goes nowhere once slack withdrew the channel' : 'goes through slack once discord withdrew it';
+
+    it(`explicit mode: a >> envelope naming the channel of slack's message ${what}`, async () => {
+      await start('explicit');
+      membrane.pushResponse(createMockResponse([{ type: 'text', text: `>>${X} envelope reply` }]));
+      await replyAfter(leaves);
+      assert.deepEqual(published('envelope reply'), where);
+    });
+
+    it(`hybrid mode: a >>> envelope naming it ${what}`, async () => {
+      await start('hybrid');
+      membrane.pushResponse(createMockResponse([{ type: 'text', text: `>>>${X} hybrid reply` }]));
+      await replyAfter(leaves);
+      assert.deepEqual(published('hybrid reply'), where);
+    });
+
+    it(`hybrid mode: unprefixed speech after a target-only >>> envelope, sent to that sticky target, ${what}`, async () => {
+      await start('hybrid');
+      membrane.pushResponse(createMockResponse([
+        { type: 'text', text: `>>>${X}` },
+        { type: 'tool_use', id: 'list-1', name: 'channel_list', input: {} },
+      ], 'tool_use'));
+      membrane.pushResponse(createMockResponse([{ type: 'text', text: 'sticky reply' }]));
+      await replyAfter(leaves);
+      assert.deepEqual(published('sticky reply'), where);
+    });
+
+    it(`explicit mode: a drafts resend into it, inside the turn, ${what}`, async () => {
+      await start('explicit');
+      const { held } = (framework as unknown as {
+        proseDrafts: { hold(agent: string, segments: Array<{ text: string }>, reason: string): { held: Array<{ id: string }> } };
+      }).proseDrafts.hold('scout', [{ text: 'held words' }], 'no-destination');
+      membrane.pushResponse(createMockResponse([
+        { type: 'tool_use', id: 'resend-1', name: 'drafts', input: { action: 'resend', draftIds: [held[0]!.id], destination: X } },
+      ], 'tool_use'));
+      membrane.pushResponse(createMockResponse([]));
+      await replyAfter(leaves);
+      assert.deepEqual(published('held words'), where);
+    });
+  }
+});
+
 describe('the refusal reaction marks the latest message through the server that sent it', () => {
   type Fake = Record<string, unknown>;
   const react = (AgentFramework.prototype as unknown as { reactToRefusal(this: Fake, agent: string, category: string): Promise<void> }).reactToRefusal;
