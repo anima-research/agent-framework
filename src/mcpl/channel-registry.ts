@@ -3463,7 +3463,7 @@ export class ChannelRegistry {
   }
 
   private async handleToolPublish(
-    input: { channelId?: string; content?: string; text?: string },
+    input: { channelId?: string; serverId?: string; content?: string; text?: string },
     origin?: ChannelToolOrigin,
   ): Promise<ToolResult> {
     // Resolve content: accept both `content` and `text` (backward compat)
@@ -3486,24 +3486,30 @@ export class ChannelRegistry {
       };
     }
 
-    // Into the calling turn's trigger channel, through the server whose
-    // message it was; any other id only where exactly one server registers
-    // it. This tool names no server, so for a shared id it can't choose.
-    const trigger = origin?.kind === 'agent'
+    // A serverId the call gives names the exact pair, as the other channel
+    // tools read theirs (this tool's schema doesn't declare one); with no
+    // channelId, it's the default channel on that server. A call naming no
+    // server takes the calling turn's server for its trigger's or locus's
+    // channel; else, for the default channel, the server whose accepted
+    // message set it; else a channelId only where exactly one server
+    // registers it.
+    const serverId = input.serverId;
+    const trigger = !serverId && origin?.kind === 'agent'
       ? [origin.trigger, origin.locus].find((o) => o?.channelId === channelId)
       : undefined;
-    const holders = [...this.channels.values()].filter((e) => e.descriptor.id === channelId);
-    const entry = trigger !== undefined
-      ? holders.find((e) => e.serverId === trigger.serverId)
-      : holders.length === 1 ? holders[0] : undefined;
+    const defaultServer = !serverId && trigger === undefined && input.channelId === undefined
+      ? this.fallbackServerFor(channelId)
+      : undefined;
+    const resolved = this.resolveToolChannelEntry(channelId, serverId || (trigger?.serverId ?? defaultServer));
+    const entry = resolved.entry;
     if (!entry) {
       return {
         success: false,
         error: trigger !== undefined
           ? `Channel ${channelId} is no longer registered by the server whose message brought you there, so nothing was published.`
-          : holders.length > 1
-            ? `Channel ${channelId} is registered by more than one MCPL server, and this tool can't choose between them, so nothing was published.`
-            : `Channel not found: ${channelId}`,
+          : defaultServer !== undefined
+            ? `Channel ${channelId}, which this call took as its default, is no longer registered by the server whose message set that default, so nothing was published.`
+            : resolved.error!,
         isError: true,
       };
     }
