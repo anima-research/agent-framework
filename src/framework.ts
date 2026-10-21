@@ -78,6 +78,7 @@ import { DEFAULT_SHUTDOWN_TIMEOUT_MS, validateShutdownTimeout, shutdownErrorMess
 import { REFUSAL_REACTIONS, REFUSAL_REACTION_FALLBACK, REFUSAL_REACTION_BASELINE } from './refusal-reactions.js';
 import { Agent, assertAgentSwitches, dryCompileStatsOf, type RenderStats } from './agent.js';
 import {
+  copyHead,
   isHeadDeclaration,
   isOthersSystemChange,
   isSystemChangeMessage,
@@ -9100,6 +9101,18 @@ export class AgentFramework {
   /**
    * Create an ephemeral agent that is NOT registered in the main event loop.
    *
+   * `headFrom` names a running agent whose recorded head (toolDeclarations
+   * 'entries') the new agent starts with, as a copy: a host that seeds the
+   * agent with that agent's messages, its system changes stamped with
+   * `systemChangeMetadata(config.name)`, then sends the same prefix, so the
+   * new agent reads that agent's cache and declares only its own difference.
+   * That holds for a fork of the same self: system text that is the named
+   * agent's head's blocks, plus additions. A new agent with its own system
+   * prompt, or other system injections, meets a replacement at its first
+   * request and moves to its own head, as an agent without it would. A named
+   * agent on its head, or with nothing recorded, gives nothing: the new agent
+   * adopts at its first request, as without it.
+   *
    * Used by SubagentModule (and similar) to prepare short-lived agents.
    * Call runEphemeralToCompletion(agent, contextManager) to register and run
    * the returned agent. Framework-created identities have tool authority only
@@ -9111,7 +9124,7 @@ export class AgentFramework {
    * Data persists after cleanup for investigation and cross-revert.
    * Call cleanup() when done to release the ContextManager.
    */
-  async createEphemeralAgent(config: AgentConfig): Promise<{
+  async createEphemeralAgent(config: AgentConfig, options: { headFrom?: string } = {}): Promise<{
     agent: Agent;
     contextManager: ContextManager;
     cleanup: () => void;
@@ -9120,6 +9133,12 @@ export class AgentFramework {
     // after the name is reserved and ContextManager.open has registered the
     // agent's message and context states in the store.
     assertAgentSwitches(config);
+    let seedHead: HeadDeclaration | null = null;
+    if (options.headFrom !== undefined) {
+      const parent = this.agents.get(options.headFrom);
+      if (!parent) throw new Error(`createEphemeralAgent: headFrom names no running agent: "${options.headFrom}"`);
+      seedHead = parent.declaresEntries() ? (this.headStores.get(parent)?.read(parent.name) ?? null) : null;
+    }
     // Names are Chronicle namespaces and generation identities. Reserve before
     // opening the namespace so a second creation cannot append to an earlier
     // generation before runEphemeralToCompletion has a chance to reject it.
@@ -9140,7 +9159,9 @@ export class AgentFramework {
       });
 
       const agent = new Agent(config, contextManager, this.membrane);
-      this.attachHeads(agent, memoryHeadDeclarations());
+      const heads = memoryHeadDeclarations();
+      if (seedHead) heads.write(config.name, copyHead(seedHead));
+      this.attachHeads(agent, heads);
       this.adoptToolResultGuard(agent);
       agent.markContextConsumed(); // RFC-006: nothing stored before now is replaceable
       this.ephemeralCandidates.set(agent, contextManager);
@@ -12366,9 +12387,13 @@ export class AgentFramework {
     return true;
   }
 
+  /** Each agent's head store, for an ephemeral agent's `headFrom`. */
+  private readonly headStores = new WeakMap<Agent, HeadDeclarationStore>();
+
   /** Give an agent the recorded heads, and trace what moves its head. An
    *  ephemeral agent keeps its own in memory: it doesn't outlive its run. */
   private attachHeads(agent: Agent, store: HeadDeclarationStore = this.headDeclarations): void {
+    this.headStores.set(agent, store);
     agent.attachHeadDeclarations(store, (event: HeadEvent) => {
       this.emitTrace({ ...event, agentName: agent.name });
       if (event.type === 'head:moved' && event.forced) {
