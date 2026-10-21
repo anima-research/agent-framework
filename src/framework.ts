@@ -755,6 +755,31 @@ interface TurnRouting {
    */
   triggerChannel?: string;
   /**
+   * The trigger's channel with the server whose message it was, frozen when
+   * the turn opens and never moved: a channel_open moves triggerChannel and
+   * a re-pin moves the locus, but neither carries this server with it. Every
+   * send of the turn whose destination id is this channel resolves with this
+   * server (triggerServerFor): speech, a channel_publish naming it or taking
+   * it as its default, a drafts resend, and the refusal reaction. So a
+   * message one server sent can't have its reply go out through another
+   * server that registers the same id, whatever the registry holds by then;
+   * the reply is refused where its server no longer registers the channel.
+   * Unset for a turn with no channel trigger, and where the requests batched
+   * into the trigger name its channel from more than one server: a bare id
+   * then resolves only where exactly one server registers it.
+   */
+  triggerOrigin?: { channelId: string; serverId: string };
+  /**
+   * The locus with the server of the message that put it there, where that
+   * isn't the trigger: the latest accepted message's (the global fallback a
+   * turn with no trigger channel takes), an arrival's or a mid-turn
+   * message's (a re-pin), or the server a channel_open opened it on. Set
+   * with the locus (setTurnLocus), and cleared when the locus moves to a
+   * channel no one server put there. A send into this channel resolves with
+   * this server, as one into the trigger's channel does with the trigger's.
+   */
+  locusOrigin?: { channelId: string; serverId: string };
+  /**
    * Locus and hybrid mode: where the turn's unpinned plain prose lands.
    * Frozen when the turn opens (home channel for a fork, else the trigger
    * channel, else the global default), so ambient chatter, reactions and
@@ -830,10 +855,59 @@ interface Arrival {
   messageId: MessageId;
   /** The channel it re-pins the locus to. */
   channelId: string;
+  /** The server whose message it is. */
+  serverId?: string;
+}
+
+/** The server a stored channel message came from, as the host wrote it. */
+function messageServerId(metadata: MessageMetadata | undefined): string | undefined {
+  const serverId = (metadata as { serverId?: unknown } | undefined)?.serverId;
+  return typeof serverId === 'string' && serverId ? serverId : undefined;
 }
 
 /** The last TurnRouting.turnId given out: ids increase, and are unique within the process. */
 let lastTurnId = 0;
+
+/**
+ * The server every request naming `channelId` came from, or undefined where
+ * one names no server or they name more than one (TurnRouting.triggerOrigin).
+ */
+function onlyServerFor(requests: readonly InferenceRequest[], channelId: string): string | undefined {
+  let serverId: string | undefined;
+  for (const r of requests) {
+    if (r.channelId !== channelId) continue;
+    if (!r.serverId || (serverId !== undefined && r.serverId !== serverId)) return undefined;
+    serverId = r.serverId;
+  }
+  return serverId;
+}
+
+/**
+ * The server a send in `routing`'s turn resolves `channelId` with: the
+ * trigger's, where `channelId` is the trigger's channel
+ * (TurnRouting.triggerOrigin), else the locus's, where it's the channel the
+ * locus's server put there (TurnRouting.locusOrigin).
+ */
+function triggerServerFor(routing: TurnRouting | undefined, channelId: string | null | undefined): string | undefined {
+  if (routing === undefined || !channelId) return undefined;
+  if (routing.triggerOrigin?.channelId === channelId) return routing.triggerOrigin.serverId;
+  if (routing.locusOrigin?.channelId === channelId) return routing.locusOrigin.serverId;
+  return undefined;
+}
+
+/** Move a turn's locus, with the server of the message that put it there
+ *  (TurnRouting.locusOrigin), or none. */
+function setTurnLocus(routing: TurnRouting, channelId: string, serverId: string | undefined): void {
+  routing.locus = channelId;
+  routing.locusOrigin = serverId !== undefined ? { channelId, serverId } : undefined;
+}
+
+/** routeSpeech's options for speech into `channelId` in `routing`'s turn:
+ *  the trigger's server, where it's the trigger's channel (triggerServerFor). */
+function speechServerOpts(routing: TurnRouting | undefined, channelId: string | null | undefined): { locusServerId: string } | undefined {
+  const serverId = triggerServerFor(routing, channelId);
+  return serverId !== undefined ? { locusServerId: serverId } : undefined;
+}
 
 function freshTurnRouting(): TurnRouting {
   return {
@@ -2728,7 +2802,7 @@ export class AgentFramework {
             // another agent when a fork owns that channel. Otherwise a fork
             // bound elsewhere would show typing where it isn't replying.
             ...(provenance?.routeChannelId && framework.mayTakeGateRoute(agentName, provenance.routeChannelId)
-              ? { channelId: provenance.routeChannelId, addressed: true }
+              ? { channelId: provenance.routeChannelId, serverId: provenance.routeServerId, addressed: true }
               : {}),
           });
         },
@@ -7960,7 +8034,9 @@ export class AgentFramework {
       // tools/call directly on its connection (bare tool name — no prefix
       // games), bypassing the agent event queue so no synthetic tool-result
       // is injected into a turn the agent never took.
-      const serverId = this.channelRegistry?.getChannelServerId(incoming.channelId);
+      // Through the server whose message it marks: the latest accepted
+      // message's, kept beside its channel and id (fallbackServerFor).
+      const serverId = this.channelRegistry?.fallbackServerFor(incoming.channelId);
       const server = serverId ? this.mcplServerRegistry?.getServer(serverId) : null;
       if (!server) {
         console.error(
@@ -8133,7 +8209,9 @@ export class AgentFramework {
       const parts = incoming.channelId.split(':');
       if (parts[0] !== 'discord') return;
       const channelId = parts[parts.length - 1];
-      const serverId = this.channelRegistry?.getChannelServerId(incoming.channelId);
+      // As reactToRefusal resolves it: through the server whose message the
+      // latest inbound is (fallbackServerFor).
+      const serverId = this.channelRegistry?.fallbackServerFor(incoming.channelId);
       const server = serverId ? this.mcplServerRegistry?.getServer(serverId) : null;
       if (!server) return;
       await server.sendToolsCall('send_message', {
@@ -10529,12 +10607,19 @@ export class AgentFramework {
             // The last injection that qualifies wins (repinChannel).
             const routing = this.routingOf(agent.name);
             let newLocus: string | undefined;
-            for (const inj of midTurnInjections) newLocus = this.repinChannel(inj.metadata, routing) ?? newLocus;
+            let newLocusServer: string | undefined;
+            for (const inj of midTurnInjections) {
+              const channelId = this.repinChannel(inj.metadata, routing);
+              if (channelId) {
+                newLocus = channelId;
+                newLocusServer = messageServerId(inj.metadata);
+              }
+            }
             if (newLocus) {
               // What this boundary just stored is newer than any arrival the
               // turn holds, so the arrivals can't move the locus back.
               routing.arrivals = [];
-              const notice = this.repinTurnLocus(agent, routing, newLocus, 'mid-turn addressed');
+              const notice = this.repinTurnLocus(agent, routing, newLocus, 'mid-turn addressed', newLocusServer);
               if (notice) midTurnInjections.push(notice);
             }
           } else if (routesLocus && !shouldEndTurn) {
@@ -10924,7 +11009,7 @@ export class AgentFramework {
         if (event.triggerInference) {
           this.pendingRequests.push({
             agentName: target.name, reason: 'mcpl:channel-incoming', source: event.serverId, timestamp: Date.now(),
-            channelId: event.channelId,
+            channelId: event.channelId, serverId: event.serverId,
             counterparty: event.author?.id ? `${event.serverId}:user:${event.author.id}` : undefined,
             addressed: isAddressedMessage(event.tags, event.metadata),
             ...(event.coalescingSubject ? { coalescingSubject: event.coalescingSubject } : {}),
@@ -11003,8 +11088,10 @@ export class AgentFramework {
           source: event.serverId,
           timestamp: Date.now(),
           // Route this turn's auto-published speech back to THIS channel, not
-          // the global most-recent-inbound locus (item-3 redux, trunk agents).
+          // the global most-recent-inbound locus (item-3 redux, trunk agents),
+          // through the server that sent it.
           channelId: event.channelId,
+          serverId: event.serverId,
           counterparty: event.author?.id ? `${event.serverId}:user:${event.author.id}` : undefined,
           // Addressed messages outrank ambient chatter when a batched wake
           // picks the turn's frozen speech locus.
@@ -11110,6 +11197,7 @@ export class AgentFramework {
         // A fork's home channel wins in routeSpeech regardless, but carry the
         // triggering channel too so the trunk/active path stays consistent.
         channelId: event.channelId,
+        serverId: event.serverId,
         counterparty: event.author?.id ? `${event.serverId}:user:${event.author.id}` : undefined,
         addressed: isAddressedMessage(event.tags, event.metadata),
         ...(event.coalescingSubject ? { coalescingSubject: event.coalescingSubject } : {}),
@@ -12180,6 +12268,7 @@ export class AgentFramework {
         source: occ.serverId,
         timestamp: Date.now(),
         channelId,
+        serverId: channelId !== undefined ? occ.serverId : undefined,
         counterparty: authorId ? `${occ.serverId}:user:${authorId}` : undefined,
         addressed: isAddressedMessage(occ.tags, origin),
         coalescingSubject: subject,
@@ -12394,6 +12483,7 @@ export class AgentFramework {
           source: event.serverId,
           timestamp: Date.now(),
           channelId: triggerChannel?.channelId,
+          serverId: triggerChannel ? event.serverId : undefined,
           // DMs and addressed-while-closed messages arrive as push events;
           // they must outrank ambient chatter in a batched wake's locus
           // selection just like their channels/incoming counterparts.
@@ -12425,6 +12515,31 @@ export class AgentFramework {
       if (boundChannel === routeChannelId) return false;
     }
     return true;
+  }
+
+  /**
+   * The channel a push names, and a server that registers it, when another
+   * server registers that channel id and the pushing server doesn't. A
+   * channel's id is the agent's locus on its own, so the reply to such a
+   * push would go out through the server that registers it: the push
+   * boundary refuses it (PushHandler). A push naming a channel no server
+   * registers isn't refused, and registers it for the pushing server
+   * (ensureChannelRegistered).
+   */
+  private channelOfAnotherServer(
+    serverId: string,
+    origin: Record<string, unknown> | undefined,
+  ): { channelId: string; holder: string } | undefined {
+    if (!this.channelRegistry) return undefined;
+    const channel = this.derivePushEventChannel(origin);
+    if (!channel) return undefined;
+    let holder: string | undefined;
+    for (const entry of this.channelRegistry.listChannelsRaw()) {
+      if (entry.descriptor.id !== channel.channelId) continue;
+      if (entry.serverId === serverId) return undefined;
+      holder ??= entry.serverId;
+    }
+    return holder === undefined ? undefined : { channelId: channel.channelId, holder };
   }
 
   /**
@@ -12751,6 +12866,7 @@ export class AgentFramework {
         ephemeralSystemPrompt: silentOnly ? trigger?.ephemeralSystemPrompt : undefined,
         silentHeartbeat: silentOnly ? trigger?.silentHeartbeat : undefined,
         channelId: channelReq?.channelId,
+        serverId: channelReq?.channelId !== undefined ? onlyServerFor(requests, channelReq.channelId) : undefined,
         addressed: addressedReq !== undefined,
         // A context-budget restart continues the same logical turn: it keeps
         // the channel for routing but names no author — the restart is its
@@ -13197,8 +13313,8 @@ export class AgentFramework {
   /** The drafts tool's answer to a resident's call, from the model's own
    *  dispatch or an agent-origin call through executeToolCall (a puppet's):
    *  a failure the handler throws is answered as one. */
-  private draftsToolResult(agentName: string, rawInput: unknown): Promise<ToolResult> {
-    return this.handleDraftsTool(agentName, rawInput).catch((err): ToolResult => ({
+  private draftsToolResult(agentName: string, rawInput: unknown, callerTurnId?: number): Promise<ToolResult> {
+    return this.handleDraftsTool(agentName, rawInput, callerTurnId).catch((err): ToolResult => ({
       success: false,
       error: `drafts failed: ${thrownText(err)}`,
       isError: true,
@@ -13211,7 +13327,7 @@ export class AgentFramework {
    * each draft is published verbatim, in order, through the normal publish
    * executor, its attempt journaled durably before the request leaves.
    */
-  private async handleDraftsTool(agentName: string, rawInput: unknown): Promise<ToolResult> {
+  private async handleDraftsTool(agentName: string, rawInput: unknown, callerTurnId?: number): Promise<ToolResult> {
     const input = (rawInput && typeof rawInput === 'object' && !Array.isArray(rawInput) ? rawInput : {}) as Record<string, unknown>;
     // The turn that sends: a resent draft's channel is recorded as engaged on
     // it, as a send tool's is, even when the result comes after the turn.
@@ -13378,7 +13494,17 @@ export class AgentFramework {
       const cand = resolved.candidates?.length ? ` It could mean: ${resolved.candidates.join(', ')}.` : '';
       return refuse(`Destination "${spec}" did not resolve: ${resolved.error}.${cand} Nothing was sent.`);
     }
-    const target = registry.resolveDestination({ channelId: resolved.channelId });
+    // A resend into a channel the calling turn recorded a server for goes
+    // through that server (triggerServerFor), where the call was made inside
+    // that turn; a background script's call carries no turn.
+    const callingRouting = this.turnRouting.get(agentName);
+    const triggerServer = callerTurnId !== undefined && callingRouting?.turnId === callerTurnId
+      ? triggerServerFor(callingRouting, resolved.channelId)
+      : undefined;
+    const target = registry.resolveDestination({
+      ...(triggerServer !== undefined ? { serverId: triggerServer } : {}),
+      channelId: resolved.channelId,
+    });
     if ('error' in target) return refuse(`Destination "${spec}": ${target.error}. Nothing was sent.`);
     const destination = target.destination;
     if (home && destination.channelId !== home) {
@@ -13724,7 +13850,10 @@ export class AgentFramework {
     if (!open) return;
     if ((metadata as { tuneOut?: unknown } | undefined)?.tuneOut) return;
     const channelId = this.repinChannel(metadata, open);
-    if (channelId) open.arrivals.push({ messageId, channelId });
+    if (channelId) {
+      const serverId = messageServerId(metadata);
+      open.arrivals.push({ messageId, channelId, ...(serverId !== undefined ? { serverId } : {}) });
+    }
   }
 
   /**
@@ -13760,14 +13889,14 @@ export class AgentFramework {
    * message in the store; the last compile can't be the test, since an
    * arrival between the turn's streams isn't in it yet.
    */
-  private remainingArrival(agent: Agent, routing: TurnRouting): string | undefined {
+  private remainingArrival(agent: Agent, routing: TurnRouting): Arrival | undefined {
     const cm = agent.getContextManager();
     for (let i = routing.arrivals.length - 1; i >= 0; i--) {
-      const { messageId, channelId } = routing.arrivals[i]!;
+      const arrival = routing.arrivals[i]!;
       // The store answers null for a message that isn't there. A store that
       // can't be read throws here, as anywhere else in the start, rather
       // than have its candidates read as withdrawn.
-      if (cm.getMessage(messageId)) return channelId;
+      if (cm.getMessage(arrival.messageId)) return arrival;
     }
     return undefined;
   }
@@ -13789,10 +13918,12 @@ export class AgentFramework {
     routing: TurnRouting,
     channelId: string,
     cause: string,
+    /** The server of the message that moved it. */
+    serverId?: string,
   ): { participant: string; content: ContentBlock[]; metadata: MessageMetadata } | undefined {
     if (routing.locus === channelId) return undefined;
     const prevPin = routing.locus ?? null;
-    routing.locus = channelId;
+    setTurnLocus(routing, channelId, serverId);
     const label = this.channelRegistry?.getDescriptor(channelId)?.label;
     const shown = label && label !== channelId
       ? `${label.startsWith('#') ? label : `#${label}`} (${channelId})`
@@ -14054,11 +14185,13 @@ export class AgentFramework {
     body: string,
     channelId: string,
     unsent: Draft | undefined,
+    /** The server the channel resolves with (triggerServerFor). */
+    serverId: string | undefined,
   ): Promise<PublishOutcome> {
     const registry = this.channelRegistry!;
     let attemptId: string | undefined;
     if (unsent) {
-      const target = registry.resolveDestination({ channelId });
+      const target = registry.resolveDestination({ ...(serverId !== undefined ? { serverId } : {}), channelId });
       if (!('error' in target)) {
         try {
           attemptId = this.proseDrafts.beginAttempt(agent.name, unsent.id, target.destination, 'unsent-token', false);
@@ -14079,7 +14212,8 @@ export class AgentFramework {
     try {
       // Both callers hold a failed delivery's words as a bounce draft, whose
       // notice says what happened, so the registry writes no second marker.
-      outcome = await registry.deliverSpeech(agent.name, body, channelId, { heldOnFailure: true });
+      outcome = await registry.deliverSpeech(agent.name, body, channelId,
+        { heldOnFailure: true, ...(serverId !== undefined ? { locusServerId: serverId } : {}) });
     } finally {
       if (flight) {
         this.draftsInFlight.delete(flight);
@@ -14177,7 +14311,7 @@ export class AgentFramework {
           continue;
         }
         try {
-          const outcome = await this.deliverWithUnsent(agent, body, resolved.channelId, unsent.draft);
+          const outcome = await this.deliverWithUnsent(agent, body, resolved.channelId, unsent.draft, triggerServerFor(routing, resolved.channelId));
           this.recordProseDelivery(routing, outcome.status === 'delivered' ? { delivered: true, channelId: outcome.destination!.channelId } : null);
           if (outcome.status === 'delivered') {
             this.proseBounceStreaks.delete(agent.name);
@@ -14219,7 +14353,7 @@ export class AgentFramework {
       }
       const target = sticky ?? locus;
       try {
-        const outcome = await this.channelRegistry!.routeSpeech(agent.name, envelope, target);
+        const outcome = await this.channelRegistry!.routeSpeech(agent.name, envelope, target, speechServerOpts(routing, target));
         this.recordProseDelivery(routing, outcome);
       } catch (err) {
         console.error('hybrid locus delivery failed:', err);
@@ -14340,7 +14474,7 @@ export class AgentFramework {
     }
 
     try {
-      const outcome = await this.deliverWithUnsent(agent, body, targetChannel, unsent.draft);
+      const outcome = await this.deliverWithUnsent(agent, body, targetChannel, unsent.draft, triggerServerFor(routing, targetChannel));
       if (outcome.status === 'delivered') {
         this.proseBounceStreaks.delete(name);
       } else if (outcome.status === 'failed') {
@@ -14931,6 +15065,9 @@ export class AgentFramework {
       // turn, which falls back to the global default rather than inheriting
       // a previous turn's channel.
       routing.triggerChannel = trigger?.channelId;
+      routing.triggerOrigin = trigger?.channelId && trigger.serverId
+        ? { channelId: trigger.channelId, serverId: trigger.serverId }
+        : undefined;
       // FREEZE the turn's outbound locus now (turn-frozen routing): the home
       // channel for forks, else the trigger channel, else the global default.
       // Mid-turn injections must not redirect the agent's plain prose
@@ -14945,7 +15082,14 @@ export class AgentFramework {
       // stability).
       if (turnProseRouting !== 'explicit' && turnProseRouting !== 'disabled') {
         const locus = this.channelRegistry?.resolveLocus(agent.name) ?? null;
-        if (locus !== null) routing.locus = locus;
+        // A locus that is neither the trigger's channel nor the agent's home
+        // is the global fallback: its server is the latest accepted
+        // message's, taken now, with the locus.
+        if (locus !== null) {
+          setTurnLocus(routing, locus, locus !== routing.triggerChannel && !this.conversationAgentHomes.has(agent.name)
+            ? this.channelRegistry?.fallbackServerFor(locus)
+            : undefined);
+        }
         if (attempt === 0) this.announceLocusIfChanged(agent.name, locus);
       }
     } else {
@@ -14958,7 +15102,7 @@ export class AgentFramework {
         ? this.remainingArrival(agent, routing)
         : undefined;
       routing.arrivals = [];
-      if (arrival) this.repinTurnLocus(agent, routing, arrival, 'arrival');
+      if (arrival) this.repinTurnLocus(agent, routing, arrival.channelId, 'arrival', arrival.serverId);
     }
     // A silent start, or a disabled agent's, has no locus to show, whatever a
     // channel_open in a silent turn left on its object.
@@ -15438,7 +15582,7 @@ export class AgentFramework {
     };
     const enqueueSpeech = (text: string, locus: string | null): void => {
       chainSpeech(async () => {
-        const outcome = await this.channelRegistry!.routeSpeech(agent.name, text, locus);
+        const outcome = await this.channelRegistry!.routeSpeech(agent.name, text, locus, speechServerOpts(streamRouting, locus));
         this.recordProseDelivery(streamRouting, outcome);
       }, 'mid-turn speech routing failed:');
     };
@@ -15558,6 +15702,7 @@ export class AgentFramework {
       for (const rd of deltas) {
         this.channelRegistry!.sendOutgoingChunk(
           rd.channelId, agent.name, outgoingInferenceId, outgoingIndex++, rd.delta,
+          triggerServerFor(streamRouting, rd.channelId),
         );
       }
     };
@@ -16363,7 +16508,7 @@ export class AgentFramework {
                   );
                   for (const segment of speechSegments) {
                     try {
-                      const outcome = await this.channelRegistry.routeSpeech(agent.name, segment, locus);
+                      const outcome = await this.channelRegistry.routeSpeech(agent.name, segment, locus, speechServerOpts(streamRouting, locus));
                       this.recordProseDelivery(streamRouting, outcome);
                     } catch (err) {
                       console.error('speech routing failed:', err);
@@ -16459,7 +16604,7 @@ export class AgentFramework {
                 // Deliver sequentially (await each) so the segments land in order.
                 for (const seg of segments) {
                   try {
-                    const outcome = await this.channelRegistry.routeSpeech(agent.name, seg, locus);
+                    const outcome = await this.channelRegistry.routeSpeech(agent.name, seg, locus, speechServerOpts(streamRouting, locus));
                     this.recordProseDelivery(streamRouting, outcome);
                   } catch (err) {
                     console.error('speech routing failed:', err);
@@ -17103,7 +17248,7 @@ export class AgentFramework {
       if (frameReachedTerminal && proseStream) {
         emitOutgoing(proseStream.finish());
         for (const [channelId, text] of proseStream.byChannel()) {
-          this.channelRegistry!.sendOutgoingComplete(channelId, agent.name, outgoingInferenceId, text);
+          this.channelRegistry!.sendOutgoingComplete(channelId, agent.name, outgoingInferenceId, text, triggerServerFor(streamRouting, channelId));
         }
       }
       this.frameworkCancelledStreams.delete(`${agent.name}:${myStreamId}`);
@@ -17395,7 +17540,7 @@ export class AgentFramework {
     // agent origin and acts as that resident, as the model's own call does
     // through dispatchToolCall. A module holds no drafts.
     if (call.name === 'drafts' && this.channelRegistry && origin.kind === 'agent') {
-      return this.draftsToolResult(origin.agentName, call.input);
+      return this.draftsToolResult(origin.agentName, call.input, call.callerTurnId);
     }
 
     // The utils meta-tool — programmatic callers (code_execution scripts,
@@ -18865,7 +19010,7 @@ export class AgentFramework {
     if (enrichedCall.name === 'drafts' && this.channelRegistry) {
       const startedAt = Date.now();
       this.emitTrace({ type: 'tool:started', module: 'framework', tool: 'drafts', callId: enrichedCall.id, input: enrichedCall.input });
-      void this.draftsToolResult(agentName, enrichedCall.input)
+      void this.draftsToolResult(agentName, enrichedCall.input, enrichedCall.callerTurnId)
         .then((result) => {
           this.emitTrace({ type: 'tool:completed', module: 'framework', tool: 'drafts', callId: enrichedCall.id, durationMs: Date.now() - startedAt });
           this.pushEvent({ type: 'tool-result', callId: enrichedCall.id, toolName: enrichedCall.name, agentName, moduleName: 'framework', result });
@@ -20017,6 +20162,7 @@ export class AgentFramework {
         this.noteInboundAccepted(source);
         return source;
       },
+      (serverId, params) => this.channelOfAnotherServer(serverId, params.origin),
     );
 
     // Server-initiated inference router (Step 6)
@@ -22475,8 +22621,17 @@ export class AgentFramework {
     // ordinary wake, starts only once its over-budget boundary has every
     // result of the round.
     const callingTurn = this.routingOf(agentName);
+    const inTurn = call.callerTurnId !== undefined && call.callerTurnId === callingTurn.turnId;
 
-    this.channelRegistry!.handleChannelToolCall(call.name, call.input, { kind: 'agent', agentName })
+    this.channelRegistry!.handleChannelToolCall(call.name, call.input, {
+      kind: 'agent',
+      agentName,
+      // The turn's recorded servers go only with a call made inside that
+      // turn: a background script's call carries no turn, and takes a bare
+      // id only where exactly one server registers it.
+      ...(inTurn && callingTurn.triggerOrigin !== undefined ? { trigger: callingTurn.triggerOrigin } : {}),
+      ...(inTurn && callingTurn.locusOrigin !== undefined ? { locus: callingTurn.locusOrigin } : {}),
+    })
       .then((result) => {
         const durationMs = Date.now() - startTime;
         this.emitTrace({
@@ -22514,7 +22669,13 @@ export class AgentFramework {
             if (openerAgent
               && (openerAgent.proseRouting === 'locus' || openerAgent.proseRouting === 'hybrid')
               && this.openLogical.get(agentName) === callingTurn) {
-              callingTurn.locus = opened;
+              const openedOn = this.channelRegistry!.resolveDestination({
+                ...(typeof (call.input as { serverId?: unknown } | undefined)?.serverId === 'string'
+                  ? { serverId: (call.input as { serverId: string }).serverId }
+                  : {}),
+                channelId: opened,
+              });
+              setTurnLocus(callingTurn, opened, 'error' in openedOn ? undefined : openedOn.destination.serverId);
               this.lastAnnouncedLocus.set(agentName, opened);
               result = {
                 ...result,
@@ -22788,17 +22949,21 @@ export class AgentFramework {
       } else if (agent?.proseRouting === 'explicit') {
         // Explicit mode: announce to the turn's sticky prose target if the
         // model has set one; otherwise stay quiet — never guess a channel.
-        const target = this.turnRouting.get(agentName)?.pin;
+        const routing = this.turnRouting.get(agentName);
+        const target = routing?.pin;
         if (target) {
-          this.channelRegistry.routeSpeech(agentName, text, target).catch((err) => {
+          this.channelRegistry.routeSpeech(agentName, text, target,
+            speechServerOpts(call.callerTurnId === routing?.turnId ? routing : undefined, target)).catch((err) => {
             console.error('[sleep] announce failed:', err instanceof Error ? err.message : err);
           });
         } else {
           console.error(`[sleep] ${agentName}: no prose target this turn — sleep announcement not posted (explicit mode never guesses)`);
         }
       } else {
-        const locus = this.turnRouting.get(agentName)?.locus ?? null;
-        this.channelRegistry.routeSpeech(agentName, text, locus).catch((err) => {
+        const routing = this.turnRouting.get(agentName);
+        const locus = routing?.locus ?? null;
+        this.channelRegistry.routeSpeech(agentName, text, locus,
+          speechServerOpts(call.callerTurnId === routing?.turnId ? routing : undefined, locus)).catch((err) => {
           console.error('[sleep] announce failed:', err instanceof Error ? err.message : err);
         });
       }
