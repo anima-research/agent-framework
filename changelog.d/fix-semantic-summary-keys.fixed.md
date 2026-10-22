@@ -30,4 +30,6 @@
   Messages start from the service's watermark, as before. The history
   module's state gains `semanticCursors`. Going back to an earlier release
   leaves summaries indexed under the new keys out of its searches until the
-  index is rebuilt.
+  index is rebuilt. An index restored from a backup taken before this
+  release needs rebuilding too: search leaves out its older summaries' old
+  items once a branch's cursor covers them, and no pass sends them again.
