@@ -236,11 +236,13 @@ test('the catalogue opens on what the resident hid, each with its source and the
   const p=new ToolPresentation({path,cataloguePath:'board/tools.md',defaults:[{source:'MCPL server: web',path:web}]});
   const tools=presentationTargets('web--fetch','web--post','mail--send','workspace--read');
   const sources=new Map([['web--fetch','MCPL server: web'],['web--post','MCPL server: web'],['mail--send','MCPL server: mail'],['workspace--read','Module: workspace']]);
-  // Hidden: one showing its configured default, one the resident reworded over two lines. Visible: the rest.
-  writeFileSync(path,JSON.stringify({version:1,tools:{'web--fetch':{visible:false},'mail--send':{visible:false,description:'my words\nsecond line'},'web--post':{visible:true}}}));
+  // Hidden: one showing its configured default, one the resident reworded over two lines, and one
+  // that isn't available right now, which only a diagnostic names. Visible: the rest.
+  writeFileSync(path,JSON.stringify({version:1,tools:{'web--fetch':{visible:false},'mail--send':{visible:false,description:'my words\nsecond line'},'web--post':{visible:true},'gone--tool':{visible:false}}}));
   const lines=renderCatalogue(p.resolve(tools,sources)).split('\n');
   const hiddenAt=lines.indexOf('## Hidden (2)'), indexAt=lines.indexOf('## Index by source');
-  assert.ok(hiddenAt>0 && hiddenAt<indexAt,'what was hidden comes before the index');
+  const diagnosticAt=lines.indexOf('Diagnostic: Not currently available: "gone--tool"');
+  assert.ok(diagnosticAt>0 && diagnosticAt<hiddenAt && hiddenAt<indexAt,'the diagnostics, then what was hidden, then the index');
   assert.deepEqual(lines.slice(hiddenAt,indexAt),['## Hidden (2)','',
    '### web--fetch (MCPL server: web)','','Fetch, as the host words it','',
    '### mail--send (MCPL server: mail)','','my words','second line','']);
@@ -265,7 +267,7 @@ test('an edit refusal names every problem with its arguments, the call that work
    'Nothing was changed: the arguments were an array, not an object. '
    +'set_tool_description takes {"name": a tool\'s exact name, "description": the new text, or null to restore the default}.');
   assert.equal(refusal('set_tool_visibility',{name:'exampel',visible:false}),
-   'Nothing was changed: you have no tool named "exampel", shown or hidden. Did you mean "example"? Copy the exact name from your tool catalogue\'s index, '
+   'Nothing was changed: you have no tool named "exampel" right now, shown or hidden. Did you mean "example"? Copy the exact name from your tool catalogue\'s index, '
    +'workspace--read {"path":"board/tools.md","limit":140}, reading on with "offset" if the index runs past that.');
   // A suggested name is quoted whole, however long, since it's what the agent copies.
   const long='mcpl--'+'research_assistant_'.repeat(3)+'search_archive';
@@ -274,7 +276,7 @@ test('an edit refusal names every problem with its arguments, the call that work
   assert.ok(long.length>60);
   assert.match(r.error!,new RegExp(`Did you mean ${JSON.stringify(long)}\\?`));
   // The name the agent typed is quoted as a file's names are: whole up to 60 characters, and past that cut, with its length.
-  assert.ok(r.error!.startsWith(`Nothing was changed: you have no tool named ${JSON.stringify(long.slice(0,57))}... (76 characters), shown or hidden.`),r.error);
+  assert.ok(r.error!.startsWith(`Nothing was changed: you have no tool named ${JSON.stringify(long.slice(0,57))}... (76 characters) right now, shown or hidden.`),r.error);
   assert.doesNotMatch(refusal('set_tool_visibility',{name:'deploy',visible:false})!,/Did you mean/,'a name close to nothing gets no guess');
   // Two close names are both offered, the closer first.
   const two=p.edit('set_tool_visibility',{name:'exampl',visible:false},[...tools,...presentationTargets('example_two')]);

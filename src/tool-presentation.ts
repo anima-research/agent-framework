@@ -326,7 +326,7 @@ export class ToolPresentation {
     const name = args.name as string;
     if (!available.some((t) => t.name === name)) {
       const near = closestNames(name, available.map((t) => t.name));
-      throw new PresentationRefusal(`Nothing was changed: you have no tool named ${quoted(name)}, shown or hidden.${near.length ? ` Did you mean ${quotedList(near, 'or', JSON.stringify)}?` : ''}`
+      throw new PresentationRefusal(`Nothing was changed: you have no tool named ${quoted(name)} right now, shown or hidden.${near.length ? ` Did you mean ${quotedList(near, 'or', JSON.stringify)}?` : ''}`
         + ` Copy the exact name from your tool catalogue's index, workspace--read {"path":${JSON.stringify(this.config.cataloguePath)},"limit":140}, reading on with "offset" if the index runs past that.`);
     }
     if (field === 'description' && typeof args.description === 'string' && characters(args.description) > MAX_DESCRIPTION_CHARS)
@@ -356,9 +356,12 @@ export function renderCatalogue(snapshot: PresentationSnapshot): string {
   ];
   // One line each: a quoted parse error can hold the file's own line breaks.
   for (const diagnostic of snapshot.diagnostics) lines.push('Diagnostic: '+diagnostic.replace(/\r\n|\r|\n/g, '\\n'));
-  // What the resident hid comes first, each with the description it would
-  // show, so a read from the top answers "what did I hide?" without a read
-  // per hidden tool or a pass through every visible tool's description.
+  // The available tools hidden from the resident come right after the header
+  // and any diagnostics, each with the description it would show, so a read
+  // from the top reaches them before the index, with no read per hidden tool
+  // and no pass through every visible tool's description. A long section
+  // pushes the index further down; the read's own truncation note says to
+  // read on.
   const hidden = snapshot.entries.filter(e => !e.visible);
   if (hidden.length) {
     lines.push(`## Hidden (${hidden.length})`, '');
