@@ -25,9 +25,9 @@ export function heldWriteId(id: MessageId): string | undefined {
 
 /**
  * Whether a row matches `filter` as context-manager's queryMessages matches a
- * stored one. That's its MessageStore's private matchesFilter at 0.14.1, which
- * the package doesn't export, so the rule is copied here, and a test compares
- * the two on the same rows. A row matches the external source, one of the
+ * stored one. That's its MessageStore's private matchesFilter, the same at
+ * 0.14.1, 0.16.0, 0.17.1 and 0.18.0, which the package doesn't export, so the rule is copied
+ * here, and a test compares the two on the same rows. A row matches the external source, one of the
  * external ids (an empty list filters nothing), the participant, and each
  * metadata path, dot-separated, by strict equality.
  */

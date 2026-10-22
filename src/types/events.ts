@@ -272,7 +272,11 @@ export interface ToolCall {
    * measured as the framework stores it: an error's text, or a success's data
    * as JSON (a content array as its text). For a model's call it is the
    * agent's inline cap, past which the framework spills the result to a
-   * workspace file and sends a preview. For a call from a running
+   * workspace file and sends a preview. A result that long is stored whole
+   * unless its round's results together pass the readers' per-message bound,
+   * or a save_recent_image in the round counted it by its share: then each
+   * result of the round takes an equal share of that bound, and one past its
+   * share spills. For a call from a running
    * code_execution script it is the longest result that reaches the script
    * whole whatever its characters, from the script's memory: the script
    * takes an answer of up to a third of its memoryMaxBytes, in which a

@@ -687,4 +687,4 @@ npm test           # Run tests
 npm run typecheck  # Type-check without emitting
 ```
 
-Requires Node.js >= 20. Chronicle requires a Rust toolchain for native module compilation (`npm run build` in the chronicle directory).
+Requires Node.js >= 22.12. Chronicle requires a Rust toolchain for native module compilation (`npm run build` in the chronicle directory).

@@ -976,7 +976,9 @@ export class Agent {
    *  stream declaring it carries them; see consumedWatermark). */
   markContextConsumed(): void {
     // Tolerates partial context-manager doubles (tests build Agents over
-    // stubs): without a watermark nothing is ever treated as unread.
+    // stubs). Without a watermark, a reader that looks for one takes its own
+    // side: the coalescer counts the message as read, and the framework's
+    // deferredWriteReadOrGone and unreadNoticesForPrimary count it as unread.
     this.consumedWatermark = this.pendingWatermark();
     this.watermarkMarks++;
     this.shownWatermark = this.consumedWatermark;
@@ -984,8 +986,8 @@ export class Agent {
 
   /** Mark everything currently stored as possibly shown (a tool boundary
    *  that injected messages, whatever its stream says it carries). Without
-   *  a watermark everything counts as shown, as markContextConsumed counts
-   *  it read. */
+   *  a watermark the coalescer counts a message as shown, as it counts one
+   *  read without a consumed watermark. */
   markContextShown(): void {
     this.shownWatermark = this.pendingWatermark();
   }

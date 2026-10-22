@@ -10,11 +10,11 @@ import {
 import { JsStore } from '@animalabs/chronicle';
 import type { Membrane, ContentBlock, NormalizedRequest, NormalizedResponse, YieldingStream, DetailedUsage, ToolResult as MembraneToolResult, ToolResultContentBlock } from '@animalabs/membrane';
 import { MembraneError } from '@animalabs/membrane';
-import { ContextManager, PassthroughStrategy, WindowedPassthroughStrategy, OverBudgetError, UncoveredDropError, stripUnpairedToolBlocks, continuesBody } from '@animalabs/context-manager';
+import { ContextManager, PassthroughStrategy, WindowedPassthroughStrategy, OverBudgetError, UncoveredDropError, stripUnpairedToolBlocks, continuesBody, MalformedContentError, malformedContentPlaces, CompressionWithdrawn } from '@animalabs/context-manager';
 import type { CacheWireReceipt } from './kv-unified-wire.js';
 import { SILENT_HEARTBEAT_SEPARATOR, type RequestOnlyPrompt, type RequestOnlyStamps } from './silent-heartbeat.js';
 import { SUBCONSCIOUS_TOOLS, SUBCONSCIOUS_TOOL_NAMES, type SubconsciousConfig } from './tune-out/tools.js';
-import { TuneOutCoordinator, TUNE_OUT_DEFAULTS } from './tune-out/coordinator.js';
+import { TuneOutCoordinator, TUNE_OUT_DEFAULTS, alreadyTunedOutText } from './tune-out/coordinator.js';
 import type {
   MessageId,
   MessageMetadata,
@@ -103,7 +103,7 @@ import { isSilentHeartbeatMarker, isVisiblyEmptyContent, NON_STRING_TEXT_PLACEHO
 import { parseProsePrefix, parseHybridProsePrefix } from './mcpl/prose-grammar.js';
 import { detectKnownToolWrapperProse } from './tool-wrapper-prose-guard.js';
 import { InferenceRouter } from './mcpl/inference-router.js';
-import { ChannelRegistry, connectorText, desiredStateInLog, destinationKey, journalToolDescription, type ChannelToolOrigin, type PublishDestination, type PublishOutcome, type SelectedForOpening } from './mcpl/channel-registry.js';
+import { ChannelRegistry, TUNE_OUT_REPLACED, connectorText, desiredStateInLog, destinationKey, journalToolDescription, NON_HOLDER_CHANNEL_DESCRIPTIONS, type ChannelToolOrigin, type PublishDestination, type PublishOutcome, type SelectedForOpening } from './mcpl/channel-registry.js';
 import { KEEP_IDLE_MS, KEEP_NEWEST, ProseDraftStore, draftState, uncertainAttempt, type Draft, type DraftAttempt, type DraftReason, type DraftState, type InheritedRisk } from './prose-drafts.js';
 import { ConversationRouter, CONVERSATION_ROUTING_DEPRECATION_NOTICE } from './mcpl/conversation-router.js';
 import { INBOUND_SOURCE_KEY, sourceBodyDigest, type InboundAcceptanceObserver, type InboundChannelSource, type InboundLane, type InboundSource, type InboundUnscopedSource } from './mcpl/inbound-source.js';
@@ -124,12 +124,13 @@ import {
 import {
   TOOL_IMAGE_REF_RE,
   ToolImageLedger,
-  cutStoredToolResult,
+  cutStoredToolResultToFit,
   formatKeptImageSlots,
   parseImagePlaceholders,
   sha256Hex,
   storedImageSlots,
   toolResultCutAt,
+  toolResultShare,
   type ParsedImagePlaceholder,
   type ShownRanges,
 } from './tool-image-ledger.js';
@@ -387,6 +388,24 @@ const isConversationalInjection = (metadata?: MessageMetadata): boolean => {
 };
 
 /**
+ * The first message a module's process response adds, or edit it makes,
+ * whose content context-manager won't store: `where` names it in the
+ * response, such as `addMessages[1]`, and `places` is malformedContentPlaces'
+ * answer for it. Null when the response holds none.
+ */
+function malformedResponseContent(response: EventResponse): { where: string; places: string[] } | null {
+  const writes = [
+    ...(response.addMessages ?? []).map((msg, i) => [`addMessages[${i}]`, msg.content] as const),
+    ...(response.editMessages ?? []).map((edit, i) => [`editMessages[${i}]`, edit.content] as const),
+  ];
+  for (const [where, content] of writes) {
+    const places = malformedContentPlaces(content);
+    if (places.length > 0) return { where, places };
+  }
+  return null;
+}
+
+/**
  * Rough token estimate for the blocks a continuation round is about to
  * append to the live wire (issue #92 physical-window projection): the
  * spilled tool-result strings at chars/4, a flat per-image cost for the
@@ -396,8 +415,9 @@ const isConversationalInjection = (metadata?: MessageMetadata): boolean => {
  * context-manager's store prices them (injectedBlockTokens), and a small
  * per-block envelope allowance. On membrane's native tool path a mid-turn
  * message rides into the next round with its stored content as it is
- * (provideToolResults' injectedMessages); its XML tool path drops injected
- * messages, so there the estimate errs high. Deliberately a
+ * (provideToolResults' injectedMessages). Its XML tool path declares that it
+ * can't carry injected messages, so the tool boundary injects none there and
+ * that term is zero. Deliberately a
  * ceiling-ish heuristic, but for a mid-turn message's media at the store's
  * flat prices — the cost of overestimating is one early recompile;
  * the cost of underestimating is the 400 this projection exists to prevent.
@@ -848,6 +868,17 @@ type StoredCopy = { id: MessageId; content: ContentBlock[]; bodyGroupId?: string
 const storedCopy = (m: { id: MessageId; content: ContentBlock[]; bodyGroupId?: string }): StoredCopy =>
   ({ id: m.id, content: m.content, ...(m.bodyGroupId !== undefined ? { bodyGroupId: m.bodyGroupId } : {}) });
 
+/** A tool result's spill file as writeToolResultFile left it: its path, with
+ *  an error if the write failed, or null with no writable workspace. */
+type SpillWrite = { path: string; error?: string; branchLeft?: true } | null;
+
+/** A released agent's window as its pass to the primary reads it
+ *  (AgentFramework.releasedWindow). */
+type ReleasedWindow = {
+  unread: MessageMetadata[];
+  held: Map<string, { copies: StoredCopy[]; unread: boolean }>;
+};
+
 /** Stamp a deferred write's durable id into the metadata it is stored with
  *  (boot recovery dedups replays by it). Idempotent for an already-stamped
  *  message. */
@@ -1087,9 +1118,10 @@ type SpeechPublished = (to: PublishDestination, text: string, messageId: string 
 
 /**
  * How a round's prose is delivered: under which turn's routing, and how what
- * it doesn't send is held. `notice` says when the notice for an envelope that
- * bounces or is held back as a draft is presented: with this round's tool
- * results ('now') or at the next boundary that presents messages ('later').
+ * it doesn't send is held. `notice` says whether the notice for an envelope
+ * that bounces or is held back as a draft is queued now, for this round's tool
+ * boundary on a stream that presents injected messages ('now'), or not at all
+ * ('later'), which leaves the drafts to be named as holdProseDrafts says.
  * `keepPrivate` is a skip_reply round: its envelopes all stay in the context,
  * and none is sent, bounced or held.
  */
@@ -1373,27 +1405,70 @@ function releasePairedRawItem(block: ContentBlock): ContentBlock {
   return rest as ContentBlock;
 }
 
+/** The text of each notice in `stored` judged for its agent as the primary:
+ *  a channel notice (a system notice of kind `channel-notice`: an open, a
+ *  failed open or a policy admission), and a by-name notice of another
+ *  agent's reply or channel (a system notice with a `speaker`). A fork is
+ *  seeded from its template, which is the primary where connectome-host
+ *  routes conversations, and a seed that kept these would give the fork what
+ *  other conversations did and which channels were opened, with advice
+ *  judged for the primary: a fork closes only its home channel, and only its
+ *  home's traffic is delivered to it. The template's tool calls that caused
+ *  its own notices stay in the seed. `kind: 'channel-notice'` has marked
+ *  every channel notice since the first (0.7.0), so notices stored by
+ *  earlier builds are recognized too, whatever their wording. */
+function primaryNoticeTexts(stored: readonly StoredMessage[]): Set<string> {
+  const texts = new Set<string>();
+  for (const message of stored) {
+    const meta = message.metadata as { system?: unknown; speaker?: unknown; kind?: unknown } | undefined;
+    if (meta?.system !== true) continue;
+    if (typeof meta.speaker !== 'string' && meta.kind !== 'channel-notice') continue;
+    for (const block of message.content) {
+      if (block.type === 'text') texts.add(block.text);
+    }
+  }
+  return texts;
+}
+
+/** Messages copied into a fork's seed without the text blocks whose text is
+ *  in `texts` (primaryNoticeTexts), wherever such a block is. A message with
+ *  no content left is left out, since a request can't carry an empty
+ *  message. */
+function withoutPrimaryNotices<M extends { content: ContentBlock[] }>(messages: readonly M[], texts: ReadonlySet<string>): M[] {
+  const out: M[] = [];
+  for (const message of messages) {
+    const content = message.content.filter((b) => b.type !== 'text' || !texts.has(b.text));
+    if (content.length > 0) out.push({ ...message, content });
+  }
+  return out;
+}
+
 /** One log line for a fork's seed that left something out, so an operator who
  *  sees a fork answer differently from its template has something to check:
- *  the template's thinking blocks, and the tool blocks the pairing pass
- *  dropped (calls with no result in the seed, results whose call isn't in
- *  it). `withoutReasoning` is the seed before that pass, `seed` after it. */
+ *  the template's thinking blocks, its channel and by-name notices
+ *  (primaryNoticeTexts, counting any text block that repeats one word for
+ *  word), and the tool blocks the pairing pass dropped (calls
+ *  with no result in the seed, results whose call isn't in it).
+ *  `withoutReasoning` is the seed without thinking, `withoutNotices` without
+ *  those notices too, and `seed` after the pairing pass. */
 function logSeedOmissions(
   fork: string,
   template: string,
   compiled: readonly { content: ContentBlock[] }[],
   withoutReasoning: readonly { content: ContentBlock[] }[],
+  withoutNotices: readonly { content: ContentBlock[] }[],
   seed: readonly { content: ContentBlock[] }[],
 ): void {
   const count = (messages: readonly { content: ContentBlock[] }[], test: (b: ContentBlock) => boolean) =>
     messages.reduce((n, m) => n + m.content.filter(test).length, 0);
   const thinking = count(compiled, isThinkingBlock);
-  const calls = count(withoutReasoning, (b) => b.type === 'tool_use') - count(seed, (b) => b.type === 'tool_use');
-  const results = count(withoutReasoning, (b) => b.type === 'tool_result') - count(seed, (b) => b.type === 'tool_result');
-  if (thinking + calls + results === 0) return;
+  const notices = count(withoutReasoning, (b) => b.type === 'text') - count(withoutNotices, (b) => b.type === 'text');
+  const calls = count(withoutNotices, (b) => b.type === 'tool_use') - count(seed, (b) => b.type === 'tool_use');
+  const results = count(withoutNotices, (b) => b.type === 'tool_result') - count(seed, (b) => b.type === 'tool_result');
+  if (thinking + notices + calls + results === 0) return;
   console.log(
     `[conversation] ${fork}: seeded from ${template} without ${thinking} thinking block(s), ` +
-    `${calls} unanswered tool call(s) and ${results} orphaned tool result(s)`,
+    `${notices} channel or by-name notice(s), ${calls} unanswered tool call(s) and ${results} orphaned tool result(s)`,
   );
 }
 
@@ -1401,21 +1476,17 @@ function logSeedOmissions(
  * A maintenance provider call withdrawn because a surgery holds the store, or
  * because stop() has closed provider admission: either is the framework's own
  * doing, and no failure. It sent nothing: it was refused at the provider
- * gate, or woken there from its wait. For a call outside context-manager
- * 0.14's compression fallback ladder, a merge's or a chunk's canonical call
- * with its retries after a tool_use stop, context-manager counts no attempt.
- * A merge keeps its queue entry, so the next tick after the hold, or after
- * the next start, does it again. A chunk's compression has already left the
- * queue: it logs "Failed to compress chunk (hierarchical)" with this error
- * and records the call, and the chunk, still uncompressed, is queued again at
- * that manager's next rebuild (its next initialization, message, sent compile
- * or released hold). A call inside the ladder, after a chunk's canonical call
- * was refused or cut short, is caught by the rung that made it and recorded
- * as a provider error, since 0.14 rethrows only its own
- * CompressionBranchDiscard there; once every rung has failed, the chunk's
- * request family is quarantined, with its alert, and the tick returns.
+ * gate, or woken there from its wait. It extends context-manager's
+ * CompressionWithdrawn, whose constructor sets the brand context-manager reads
+ * a withdrawal by, so the call is no outcome of the compression: every rung
+ * of the fallback ladder and the merge path rethrow it unchanged, recording
+ * no outcome, attempt, streak or quarantine event. Its tick puts the chunk
+ * back at the head of the queue, unless a rebuild decided the queue afresh
+ * while the call was out, and a merge stays at the head of its own, for the
+ * next tick once calls are let through again (context-manager's
+ * CompressionWithdrawn doc has the rest).
  */
-class MaintenanceWithdrawnError extends Error {
+class MaintenanceWithdrawnError extends CompressionWithdrawn {
   constructor(reason: string) {
     super(`maintenance call withdrawn: ${reason}`);
     this.name = 'MaintenanceWithdrawnError';
@@ -2211,8 +2282,8 @@ function boundFailureFields(record: Record<string, unknown>): Record<string, unk
  *   adapter files every status it doesn't list (404, 405, 409, 410, 413,
  *   415, 422 …) as invalid_request, so it alone produces an invalid_request
  *   at 413 or 422, and no 0.5.86 adapter produces a context_length at 413.
- * - From membrane 0.5.87 (membrane #56 and #107), this package's floor, every
- *   adapter sends an HTTP failure through one status table
+ * - From membrane 0.5.87 (membrane #56 and #107), below this package's
+ *   floor, every adapter sends an HTTP failure through one status table
  *   (errorFromProviderStatus). On a 400 or 422, auth codes and reasons and
  *   the two account refusals it recognizes by their text (a balance too low,
  *   usage limits reached) are auth, and a context overflow, by its code or
@@ -2811,6 +2882,10 @@ export class AgentFramework {
    * ephemeral agents have isolated slots and are their own only readers.
    */
   private readonly sharedSlotAgents = new Set<Agent>();
+  /** Rounds of tool calls, by their results array, that a save_recent_image
+   *  in the round counted by their share of the bound: such a round is
+   *  stored by its share whether or not it fits (buildStoredToolResultContent). */
+  private readonly toolRoundsByShare = new WeakSet<CompletedToolCall[]>();
   /** The windows of forks and runs deregistered while the host was quiesced,
    *  by agent name (releaseWindowNowOrAfterResume); resume() releases them
    *  (runReleasesAfterResume), or stop() passes on what they left, unread or
@@ -3709,8 +3784,9 @@ export class AgentFramework {
    *
    * Each conversation fork still live ends, as a closing fork's end does,
    * whatever its stream is doing, as each run does: its channel unbinds, and
-   * its window's release passes on to the primary the failed replies it left,
-   * unread in its window or still queued for it. Its end settles a
+   * its window's release passes on to the primary the notices it left that
+   * the primary takes in its place, unread in its window, or still queued
+   * for it unless it read the copy that landed there. Its end settles a
    * tool-result batch its stream still held and removes the stream's
    * entries, and once it has left, its stream's late events are dropped.
    */
@@ -4070,31 +4146,47 @@ export class AgentFramework {
       });
     }
     // A window release the quiesce postponed (releasesAfterResume) never runs
-    // once the host stops, so its unread pass runs here: each notice stored
-    // unread in that window that the primary takes in its place (a failed
-    // reply, or a channel notice its reader could act on) goes to the
-    // primary now, deferred while quiesced like any write, so it waits in the
-    // queue with the rest. What was queued for that agent goes as boot would
-    // send it (readdDrained): such a notice to the primary, deferred again
-    // under its own id, and anything else dropped, logged, since nothing
-    // lands while quiesced. So no flush that comes later meets such a notice
-    // of an agent that has gone, not even one that writes into that agent's
-    // own window, as a turn of the fork's still assembling or at a tool
-    // boundary does (flushForStart). Each release's pass is a step of its
-    // own, and so is the drain: one that throws fails the stop() and leaves
-    // the others, and the final flush, to run. It runs again after the waits
-    // below, for a release an end they let settle postpones.
+    // once the host stops, so its pass to the primary runs here, deferred
+    // while quiesced like any write, so it waits in the queue with the rest:
+    // each notice stored unread in that window that the primary takes in its
+    // place (a failed reply, or a channel notice its reader could act on),
+    // and each such notice still queued for that agent, under its own id,
+    // unless the agent read a copy of it that landed in its window
+    // (passOnFromReleasedWindow). What else was queued for it goes as boot
+    // would send it (readdDrained): dropped, logged, since nothing lands
+    // while quiesced. So no flush that comes later meets such a notice of an
+    // agent that has gone, not even one that writes into that agent's own
+    // window, as a turn of the fork's still assembling or at a tool boundary
+    // does (flushForStart). Each release's pass is a step of its own, and so
+    // is the drain: one that throws fails the stop() and leaves the others,
+    // and the final flush, to run, and the drain sends a queue whose pass
+    // threw as boot would, its notices to the primary whether read or not,
+    // un-acked ones included. It runs again after the waits below, for a
+    // release an end they let settle postpones.
     const passPostponedReleases = () => {
-      for (const agent of this.releasesAfterResume.values()) {
-        step(() => {
-          for (const metadata of this.unreadNoticesForPrimary(agent)) this.passNoticeToPrimary(agent.name, metadata);
-        });
-      }
-      const released = [...this.releasesAfterResume.keys()];
+      const agents = [...this.releasesAfterResume.values()];
+      // Each pass reads its window, and what is queued for it, before the
+      // drain below moves its pending entries into the un-acked set.
+      const passes = new Map<string, ReturnType<AgentFramework['passOnFromReleasedWindow']>>();
+      for (const agent of agents) step(() => { passes.set(agent.name, this.passOnFromReleasedWindow(agent)); });
       this.releasesAfterResume.clear();
-      if (released.length === 0) return;
+      if (agents.length === 0) return;
       step(() => {
-        this.readdDrained(released.flatMap((name) => this.drainDeferredFor(name)), 'stop: postponed releases');
+        const entries: DeferredWrite[] = [];
+        for (const agent of agents) {
+          const pass = passes.get(agent.name);
+          // A pass that threw passed on none of the agent's un-acked entries,
+          // which the ack below would drop, so their notices go too: taken
+          // before the drain hands its pending entries to the un-acked set.
+          const unacked = pass ? [] : this.unackedDeferredWrites
+            .filter((msg) => (msg.forAgent ?? this.primaryAgentName) === agent.name && passesToPrimary(msg.metadata));
+          for (const msg of this.drainDeferredFor(agent.name)) {
+            if (pass && passesToPrimary(msg.metadata)) pass.passOn(msg);
+            else entries.push(msg);
+          }
+          entries.push(...(pass ? pass.forPrimary : unacked));
+        }
+        this.readdDrained(entries, 'stop: postponed releases');
         this.ackDeferredWrites();
       });
     };
@@ -4207,8 +4299,9 @@ export class AgentFramework {
     //
     // A quiesced host defers each entry again instead, into the persisted
     // queue, for boot recovery. Past the deferral, a write that throws stays
-    // queued with what follows it for its target, and a memory-only queue
-    // still loses it at exit. An entry for a target no longer registered,
+    // queued with what follows it for its target, unless context-manager
+    // refuses it as malformed, when it is dropped (writeDrainedInOrder).
+    // A memory-only queue still loses queued entries at exit. An entry for a target no longer registered,
     // such as one a release postponed after the pass above leaves, or one a
     // quiesced boot restored for an agent gone before a crash, is left for
     // the flush that meets it, which passes a failed reply, or a channel
@@ -4752,9 +4845,8 @@ export class AgentFramework {
   /**
    * Refuse an auxiliary call to a model the provider asked this agent to wait
    * on, without calling it. The refusal is a retryable rate limit carrying
-   * the remaining wait, so a caller that paces (context-manager's compression
-   * lane, from its corrective round #138 on) waits it out instead of spending
-   * a call. It is marked
+   * the remaining wait, so a caller that paces waits it out instead of
+   * spending a call. It is marked
    * `providerAdmission: 'deferred'`: no call was made, so a caller can keep
    * the wait without counting a failed call (room-225 #47927).
    */
@@ -4805,17 +4897,16 @@ export class AgentFramework {
     for (const { wait, release } of released) {
       console.error(`[provider-wait] agent=${agentName} model=${wait.model} released by ${by} (${release})`);
     }
-    // The agent's context strategy may pace its own provider calls by the
-    // same stated wait (context-manager's compression lane, from its
-    // corrective round #138 on; 0.14.0 has no releaseCompressionPause, so this
-    // calls nothing there). The release is the operator's word on that wait
-    // too, so it is offered to the lane with its scope even when no wait
-    // binds here: the lane can hold a pause after
-    // this framework's own wait is gone (the records read again, the wait
-    // passed, or it was released in another process). The strategy's own
-    // backoff stays, and the receipt still lists only waits released here.
-    // Read inside the try: the release is already recorded, so a strategy
-    // that throws must not keep the hold below from being released.
+    // The agent's context strategy may pace its own provider calls by the same
+    // stated wait. From context-manager 0.17, its compression lane exposes
+    // releaseCompressionPause. The release is the operator's word on that
+    // wait too, so it is offered to the
+    // lane with its scope even when no wait binds here: the lane can hold a
+    // pause after this framework's own wait is gone (the records read again,
+    // the wait passed, or it was released in another process). The strategy's
+    // own backoff stays, and the receipt still lists only waits released here.
+    // Read inside the try: the release is already recorded, so a strategy that
+    // throws must not keep the hold below from being released.
     try {
       const strategy = this.agents.get(agentName)?.getContextManager().getStrategy() as
         { releaseCompressionPause?: (model?: string) => boolean } | undefined;
@@ -6084,6 +6175,10 @@ export class AgentFramework {
         );
       }
       if (tool.name === 'journal' && !canSkipReply) return { ...tool, description: journalToolDescription(false) };
+      // A holder's words are the registry's, so its cached tool list doesn't change.
+      if ((tool.name === 'channel_open' || tool.name === 'channel_close') && !this.holdsChannelTrafficForTools(agentName)) {
+        return { ...tool, description: NON_HOLDER_CHANNEL_DESCRIPTIONS[tool.name] };
+      }
       return tool;
     });
   }
@@ -6709,14 +6804,16 @@ export class AgentFramework {
    * acknowledged once: the chronicle is synced, then the persisted queue is
    * rewritten without the batch (ackDeferredWrites). Until then the batch
    * stays in the durable queue, so a crash mid-flush replays it at the next
-   * boot, which skips each entry that already landed, by its deferredWriteId
-   * — no loss, no duplicates. The batch is stored in queue order, whatever
-   * its targets (writeDrainedInOrder). A write the store rejects stays
-   * queued, logged, with what is queued behind it for its target, so the
-   * flush never stores that target's later entries ahead of it, and other
-   * targets' entries go on. (A write that isn't deferred can still land
-   * ahead of it, such as one for an idle agent once the host has resumed.)
-   * A boot that meets it again logs it and goes on.
+   * boot, which skips each entry that already landed, by its deferredWriteId —
+   * no loss, no duplicates. The batch is stored in queue order, whatever its
+   * targets (writeDrainedInOrder). A write the store rejects stays queued,
+   * logged, with what is queued behind it for its target, so the flush never
+   * stores that target's later entries ahead of it, and other targets' entries
+   * go on. One the store refuses as malformed, which it would at every flush,
+   * is logged and dropped instead, and what is behind it goes on. (A write
+   * that isn't deferred can still land ahead of it, such as one for an idle
+   * agent once the host has resumed.) A boot that meets it again logs it and
+   * goes on.
    *
    * Per-target: an agent whose turn is still alive keeps ITS messages
    * deferred for its own turn boundary; everyone else's flush now.
@@ -7232,19 +7329,21 @@ export class AgentFramework {
       }
     }
     // An entry the queue's readers can't handle has no place in it: one whose
-    // participant isn't text, whose content isn't an array, that holds a
-    // block that isn't an object, or whose `forAgent` is present but not a
-    // name, is dropped here with a line naming it, rather than held. Reading
-    // a null block's type throws, at the tool boundary and in the store. The
-    // store keeps a string or number block as given, but the context
-    // manager's token estimate keys a WeakMap on each block, which such a
-    // value can't be: once one is stored, every compile for that agent
-    // throws, and a restart doesn't clear it. What a block holds, such as a
-    // tool result's content, isn't checked here, as it isn't for a fresh
-    // write. The framework writes `forAgent` only as a non-empty name, so
-    // another value comes from damage or a hand edit, and the agent it
-    // meant can't be known: sent to the primary, as a falsy one would be, it
-    // could put another agent's message in the primary's window.
+    // participant isn't text, whose content isn't an array, that holds a block
+    // that isn't an object, or whose `forAgent` is present but not a name, is
+    // dropped here with a line naming it, rather than held. Reading a null
+    // block's type throws, at the tool boundary and in the store. From
+    // context-manager 0.16.0 the store refuses a string or number block and
+    // its reads leave one out; an older store kept it as given, and since the
+    // context manager's token estimate keys a WeakMap on each block, every
+    // compile for that agent then threw, and a restart didn't clear it. What a
+    // block holds, such as a tool result's content, isn't checked here: a
+    // recovered write whose content context-manager refuses is dropped at the
+    // flush that meets it (writeDrainedInOrder). The framework writes
+    // `forAgent` only as a non-empty name, so another value comes from damage
+    // or a hand edit, and the agent it meant can't be known: sent to the
+    // primary, as a falsy one would be, it could put another agent's message
+    // in the primary's window.
     const wellFormed = (m: unknown): m is Omit<DeferredWrite, 'id' | 'seq' | 'heldAt'> & { id?: unknown; seq?: unknown; heldAt?: unknown } => {
       if (!m || typeof m !== 'object') return false;
       const { participant, content, forAgent } = m as { participant?: unknown; content?: unknown; forAgent?: unknown };
@@ -8532,7 +8631,8 @@ export class AgentFramework {
         // investigation, now or, while quiesced, at resume. A failed reply, or
         // a channel notice the run could act on, among it goes on to the
         // primary as the same queue entry, so no ack comes between the entry
-        // and the primary's notice.
+        // and the primary's notice, unless the run read the copy of it that
+        // landed in its window.
         // Exact-generation disposal owns these name-keyed entries. Remove them
         // before deregistration; the late driveStream finally will see the
         // generation mismatch and leave any future owner untouched. A fork's
@@ -8590,7 +8690,15 @@ export class AgentFramework {
       'whether mentions merit interrupting, and able to cancel. People who ' +
       'mention you get an automatic reaction so they know you saw nothing. ' +
       'Cancelling (mode "cancel") delivers the diverted backlog. The ' +
-      'tune-out auto-cancels after maxWakes mention-bursts.',
+      'tune-out auto-cancels after maxWakes mention-bursts. A tuned-out ' +
+      'channel is kept open, so its traffic reaches your subconscious: where ' +
+      'this host opens and closes the server\'s channels, this opens a ' +
+      'channel you closed, and answers once that open is done. Where the ' +
+      'channel isn\'t open then, the answer\'s openError says why, and when ' +
+      'its messages will reach your subconscious where that\'s known. ' +
+      'Calling tune_out again for a channel already tuned out keeps its ' +
+      'settings, and, where this host can open the channel, tries the open ' +
+      'again if it isn\'t open.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -11597,7 +11705,7 @@ export class AgentFramework {
         if (currentState.status === 'ready') {
           // Effective inline cap: agent_settings override → durable config →
           // house default, clamped to the strategy bound (see resolver).
-          const maxChars = this.resolveToolResultInlineCap(agent).cap;
+          const { cap: maxChars, bound } = this.resolveToolResultInlineCap(agent);
 
           // Oversized results — successes AND errors — spill to a workspace
           // file (truncated preview + file reference) instead of being
@@ -11605,8 +11713,8 @@ export class AgentFramework {
           // history copy and the live wire copy below — the two must stay
           // byte-matched (the window stores what the membrane sends;
           // divergence breaks the compile prefix).
-          const { blocks: toolResultContent, spilled } =
-            await this.buildStoredToolResultContent(agent.name, currentState.toolResults, maxChars);
+          const { blocks: toolResultContent, spilled, keptCap } =
+            await this.buildStoredToolResultContent(agent.name, currentState.toolResults, maxChars, bound);
 
           // A spill writes to the workspace, and the turn can be stopped
           // meanwhile. A host's cancelStream, stop() and abortInference cancel
@@ -11662,7 +11770,7 @@ export class AgentFramework {
           const membraneResults = currentState.toolResults.map(tc =>
             this.toMembraneToolResult(tc.id, tc.result, maxChars, spilled.get(tc.id))
           );
-          agent.toolResultGuard.storeResults(toolResultContent, membraneResults, currentState.toolResults, turnRowMetadata, maxChars);
+          agent.toolResultGuard.storeResults(toolResultContent, membraneResults, currentState.toolResults, turnRowMetadata, keptCap);
 
           // Flush any messages that were deferred while this turn was in
           // flight: this agent's own entries, those addressed to it and, for
@@ -11724,11 +11832,12 @@ export class AgentFramework {
             const deferred = this.drainDeferredFor(agent.name, (msg) => !isInjectableMidTurn(msg, agent.name));
             // Stored in queue order, cut at the first that can't be stored: it
             // and what follows wait for the turn's end, and only what was
-            // stored is injected (the round's results go on either way). A
-            // sharded body read back from its store is injected as later
-            // compiles render it, its shards joined, and a write that threw
-            // after storing, which counts as stored, as what landed of it
-            // (writeDrainedInOrder).
+            // stored is injected (the round's results go on either way). One
+            // the store refuses as malformed is dropped instead, and what
+            // follows goes on. A sharded body read back from its store is
+            // injected as later compiles render it, its shards joined, and a
+            // write that threw after storing, which counts as stored, as what
+            // landed of it (writeDrainedInOrder).
             const stored = this.writeDrainedInOrder(deferred, `tool boundary for ${agent.name}`, (msg) =>
               agent.getContextManager().addMessage(msg.participant, msg.content, withDeferredWriteId(msg.metadata, msg.id)));
             for (const [msg, { id, content }] of stored) {
@@ -12062,14 +12171,37 @@ export class AgentFramework {
       }
     }
 
+    // A response holding content context-manager won't store, in a message
+    // it adds or an edit it makes, is refused whole before any response is
+    // applied: none of it is applied, its module state update and inference
+    // request included, so no turn runs for content that was never stored,
+    // and it doesn't count as accepting a surface's input. A line and a
+    // trace name the module and where, and the other modules' responses
+    // apply. process:completed and the process log list the responses that
+    // applied, so a view built on them doesn't show a refused response's
+    // messages as the event's. A store error while a response applies, such
+    // as a shard the store refuses when a strategy's chunking makes one,
+    // propagates as any store error does.
+    const applying = responses.filter(({ moduleName, response }) => {
+      const refusal = malformedResponseContent(response);
+      if (refusal === null) return true;
+      const { where, places } = refusal;
+      console.error(
+        `[process-response-refused] module=${moduleName} event=${event.type} reason=malformed-content: ` +
+        logDetail(new MalformedContentError(`${where} refused`, places).message),
+      );
+      this.emitTrace({ type: 'process:response-refused', moduleName, eventType: event.type, where, places });
+      return false;
+    });
+
     // Apply responses. Console/API input is conversation from a non-channel
     // surface: one acceptance per event, whose envelope every message the
     // modules add for it carries.
     const surface = this.surfaceSourceFor(event);
-    if (surface && responses.some(({ response }) => (response.addMessages?.length ?? 0) > 0)) {
+    if (surface && applying.some(({ response }) => (response.addMessages?.length ?? 0) > 0)) {
       this.noteInboundAccepted(surface);
     }
-    for (const { moduleName, response } of responses) {
+    for (const { moduleName, response } of applying) {
       await this.applyProcessResponse(response, event, moduleName, surface);
     }
 
@@ -12081,11 +12213,11 @@ export class AgentFramework {
     const durationMs = Date.now() - startTime;
 
     // Always emit trace for observability (UI needs this)
-    this.emitTrace({ type: 'process:completed', processEvent: event, responses, durationMs });
+    this.emitTrace({ type: 'process:completed', processEvent: event, responses: applying, durationMs });
 
     // Log to Chronicle (if enabled)
     if (this.processLoggingPersist) {
-      this.logProcessEvent(event, responses);
+      this.logProcessEvent(event, applying);
     }
   }
 
@@ -12223,6 +12355,23 @@ export class AgentFramework {
     acceptedAt?: number;
     inboundSource?: InboundSource;
   }): Promise<CoalescingPlacement | undefined> {
+    // context-manager won't store content that doesn't match ContentBlock
+    // (malformedContentPlaces names where). Content from the wire can't be
+    // such content, since the MCPL boundary converts every block into one the
+    // store accepts, so this is the backstop for events that never crossed
+    // it, as the empty-content check below is. Refused here, such a message
+    // stores no row, spawns no fork and queues no wake, and the line names
+    // the server and channel it came from; past this point its write would
+    // throw. Absent content is the empty-content check's.
+    const malformed = event.content == null ? [] : malformedContentPlaces(event.content);
+    if (malformed.length > 0) {
+      console.error(`[channel-incoming-refused] server=${event.serverId} channel=${logValue(event.channelId)} messageId=${logValue(event.messageId)} reason=malformed-content: ${logDetail(malformed.join('; '))}`);
+      this.emitTrace({
+        type: 'mcpl:malformed-content-refused', lane: 'channel', serverId: event.serverId, places: malformed,
+        channelId: event.channelId, messageId: event.messageId, ...(event.eventId ? { eventId: event.eventId } : {}),
+      });
+      return undefined;
+    }
     // Same backstop as the push lane: no row, no wake, no fork spawned for a
     // message with nothing visible in it.
     if (isVisiblyEmptyContent(event.content)) {
@@ -12485,10 +12634,10 @@ export class AgentFramework {
   /**
    * Spawn a persistent per-channel conversation agent ("fork") from the
    * template agent: own ContextManager under `conversations/{name}`, seeded
-   * with the template's compiled context without its thinking or its unpaired
-   * tool blocks (the SubagentModule wholesale-copy pattern; see the seeding
-   * comment below), registered in the event loop like any agent — but never
-   * primary.
+   * with the template's compiled context without its thinking, its channel
+   * and by-name notices, or its unpaired tool blocks (the SubagentModule
+   * wholesale-copy pattern; see the seeding comment below), registered in the
+   * event loop like any agent — but never primary.
    */
   private async createConversationAgent(name: string, channelId: string): Promise<Agent> {
     const router = this.conversationRouter!;
@@ -12550,6 +12699,15 @@ export class AgentFramework {
       // vouch for the copies. On models that don't bind thinking to its
       // prefix a copy would have been kept, so there the fork loses the
       // template's reasoning.
+      // It leaves out, too, the template's channel notices and its by-name
+      // notices of other agents (primaryNoticeTexts), the channel's own next
+      // fork included. The compile carries no metadata, so each text block
+      // whose text is such a notice's in the template's store goes, wherever
+      // it is, a block of the template's own that repeats one word for word
+      // included. A summary an adaptive template wrote while a notice was in
+      // its window can still mention it, and so can the template's own words.
+      // A notice compiled to other text, as one long enough to be sharded at
+      // ingest or cut by a per-message cap, matches nothing and stays.
       // Then context-manager's stripUnpairedToolBlocks drops each call whose
       // result isn't in the seed and each result whose call isn't, keeping
       // the rest of their messages (a message left with nothing becomes its
@@ -12567,8 +12725,10 @@ export class AgentFramework {
         const { messages: compiled } = await template.toolResultGuard.afterAnnotations(
           () => template.getContextManager().compile(undefined, undefined, { dryRun: true }));
         const withoutReasoning = withoutThinking(compiled);
-        const seed = stripUnpairedToolBlocks(withoutReasoning);
-        logSeedOmissions(name, template.name, compiled, withoutReasoning, seed);
+        const withoutNotices = withoutPrimaryNotices(
+          withoutReasoning, primaryNoticeTexts(template.getContextManager().getAllMessages()));
+        const seed = stripUnpairedToolBlocks(withoutNotices);
+        logSeedOmissions(name, template.name, compiled, withoutReasoning, withoutNotices, seed);
         for (const msg of seed) {
           const participant = msg.participant === template.name ? name : msg.participant;
           contextManager.addMessage(participant, msg.content);
@@ -13774,6 +13934,19 @@ export class AgentFramework {
    * Convert an MCPL push event to a context message.
    */
   private handleMcplPushEvent(event: McplPushEvent): CoalescingPlacement | undefined {
+    // Content context-manager won't store is refused first, as on the
+    // channel lane (handleMcplChannelIncoming): no row, no wake. Absent
+    // content is the empty-content backstop's.
+    const malformed = event.content == null ? [] : malformedContentPlaces(event.content);
+    if (malformed.length > 0) {
+      const channelId = this.derivePushEventChannel(event.origin)?.channelId;
+      console.error(`[push-event-refused] server=${event.serverId}${channelId ? ` channel=${logValue(channelId)}` : ''} eventId=${logValue(event.eventId ?? '')} reason=malformed-content: ${logDetail(malformed.join('; '))}`);
+      this.emitTrace({
+        type: 'mcpl:malformed-content-refused', lane: 'push', serverId: event.serverId, places: malformed,
+        eventId: event.eventId, ...(channelId ? { channelId } : {}),
+      });
+      return undefined;
+    }
     // Backstop for the MCPL boundary's empty-content rejection, covering
     // events that never crossed it (module-emitted, coalescer deliveries):
     // content with nothing visible stores no row and queues no wake — the
@@ -15382,21 +15555,23 @@ export class AgentFramework {
   /**
    * Durable window notice for a channel the agent did not ask to open: a
    * subscription-policy admission, announced as the decision before its
-   * transport RPC (a failed open keeps the decision, and channel_list shows
-   * transport state), or an open that the agent's own delivery or reply
-   * caused (`opened-by-delivery`, `opened-by-reply`), once its transport is
-   * confirmed. It names `channel_close` as the opt-out (their decision
-   * outranks policy) only where the agent it's addressed to can call it for
-   * every channel it names (canCloseChannels): a conversation fork may close
-   * only its home channel, and an agent's allowedTools can leave
-   * channel_close out. Others can read it too: the other residents, where
-   * several share one slot (#291), and forks spawned from the primary
-   * afterwards, from its window (#235). Where an
+   * transport RPC (a failed open keeps the decision, and the host tries again
+   * when the server next registers the channel), or an open that the agent's
+   * own delivery or reply caused (`opened-by-delivery`, `opened-by-reply`),
+   * once its transport is confirmed. It names `channel_close` as the opt-out
+   * (neither the subscription policy nor the server's default reopens a
+   * channel the agent closed) only where the agent it's addressed to can
+   * call it for every channel it names (canCloseChannels): a conversation
+   * fork may close only its home channel, and an agent's allowedTools can leave
+   * channel_close out. The other residents can read it too, where several
+   * share one slot (#291); a fork's seed leaves it out (primaryNoticeTexts).
+   * Where an
    * agent's own send opened a channel it can't close, the primary is told by
    * name too, if it's registered and can close it, and the agent is told
    * that it was. What an open channel delivers is its server's to say (#406),
-   * so the notice doesn't promise its traffic, and it says even that only to
-   * an agent whose window holds the channel's traffic (holdsChannelTraffic).
+   * so the notice says how servers differ rather than promising its traffic,
+   * and says that only to an agent whose window holds the channel's traffic
+   * (holdsChannelTraffic).
    * System message: never triggers inference, never conversational, never
    * locus-eligible.
    */
@@ -15463,8 +15638,10 @@ export class AgentFramework {
     // traffic (holdsChannelTraffic), and channel_close is named only to one
     // that can call it for every one of them.
     const optOut = (holds: boolean, canClose: boolean) =>
-      (holds ? ' What an open channel delivers to you depends on its server.' : '') +
-      (canClose ? ` If you don't want ${plural ? 'one of them' : 'it'}, use channel_close; your choice outranks policy.` : '');
+      (holds ? ' What an open channel brings you is up to its server: some send every message in it, and others only ' +
+        "what addresses you unless you're subscribed to it; their own tools can change that." : '') +
+      (canClose ? ` If you don't want ${plural ? 'one of them' : 'it'}, use channel_close: neither the subscription policy ` +
+        "nor its server's own default opens it again." : '');
     // An open caused by an agent's own send is that agent's to hear about, in
     // the window it reads; a policy admission with no agent behind it goes to
     // the primary. An agent that has ended (a run whose final reply is routed
@@ -15502,7 +15679,11 @@ export class AgentFramework {
       this.canCloseChannels(primary, ids);
     const readerText = (told: string) => (cause === 'subscription-policy'
       ? `[channels] Selected for opening by subscription policy: ${shown}. ` +
-        'This records the admission decision; channel_list shows current transport state.'
+        (plural
+          ? "The host opens them, and if one doesn't open, tries again when its server next registers it; " +
+            'channel_list shows whether each is open yet.'
+          : 'The host opens it, and if that fails, tries again when its server next registers it; ' +
+            "channel_list shows whether it's open yet.")
       : `[channels] Now open: ${shown}: your own message into the closed channel opened it.`) +
       optOut(this.holdsChannelTraffic(who, ids), canClose) + told;
     const reader: ChannelNotice = {
@@ -15567,6 +15748,25 @@ export class AgentFramework {
       return channelIds.every((id) => id === home && this.conversationRouter?.getBinding(id)?.agentName === who);
     }
     if (this.conversationRouter) return false;
+    return this.residentHoldsTraffic(who);
+  }
+
+  /**
+   * Whether `who`'s window holds the traffic of the channels it may open or close, for the words its channel_open and
+   * channel_close carry. A conversation fork does for its home, the one
+   * channel it may close, decided by the home rather than the binding, so a fork whose binding expired keeps its words
+   * through its closure turn: changing them then would send its whole window uncached, for a sentence false for that
+   * turn only. Otherwise as holdsChannelTraffic has it: on a host that routes conversations, the trunk holds none, and
+   * otherwise the delivery agent and the readers of the residents' shared slot do. An ephemeral run holds none.
+   */
+  private holdsChannelTrafficForTools(who: string): boolean {
+    if (this.conversationAgentHomes.has(who)) return true;
+    if (this.conversationRouter) return false;
+    return this.residentHoldsTraffic(who);
+  }
+
+  /** Whether `who` is the delivery agent, or reads the residents' shared slot it stores into. */
+  private residentHoldsTraffic(who: string): boolean {
     const delivery = this.deliveryAgent();
     const agent = this.agents.get(who);
     if (delivery === undefined || agent === undefined) return false;
@@ -15625,9 +15825,8 @@ export class AgentFramework {
    * channel_open as the way to try again only where the agent it's addressed
    * to can call it: a conversation fork's channel_open is refused outright
    * (dispatchChannelToolCall), and an agent's allowedTools can leave it out.
-   * Others can read it too: the other residents, where several share one
-   * slot (#291), and forks spawned from the primary afterwards, from its
-   * window (#235).
+   * The other residents can read it too, where several share one slot
+   * (#291); a fork's seed leaves it out (primaryNoticeTexts).
    * Where the channel is selected for opening, it says so and why, as
    * speech's failure does, and what that means: where the host couldn't
    * record putting the channel's decision back, a later delivery or
@@ -16646,6 +16845,7 @@ export class AgentFramework {
       // In queue order and cut at the first that can't be stored, as every
       // flush is (readdDrained), so a store failure neither lands the
       // messages behind it out of order nor replaces the start's own error.
+      // One refused as malformed is dropped, not cut at.
       // Gated on this agent's own tool cycle, as the turn-end flush is.
       if (!tokenHandedOff && !this.activeTurnTokens.has(agent.name)
         && this.deferredMessages.length > 0 && !this.pendingAssistantBlocks.has(agent.name)) {
@@ -16789,7 +16989,9 @@ export class AgentFramework {
       // One poison message, or a transient store-write failure, must not
       // abort the turn or drop the messages behind it in the queue: the
       // drain cuts there, and it and what follows stay queued, in order
-      // (writeDrainedInOrder).
+      // (writeDrainedInOrder). A message the store refuses as malformed,
+      // which it would at every flush, is dropped instead, and what follows
+      // goes on.
       this.flushForStart(agent, 'turn-start');
     }
 
@@ -18316,15 +18518,16 @@ export class AgentFramework {
               // one door a giant blob still walks through).
               const readyState = agent.state as AgentState;
               if (readyState.status === 'ready') {
-                const cap = this.resolveToolResultInlineCap(agent).cap;
-                const { blocks: toolResultContent, spilled } = await this.buildStoredToolResultContent(
+                const { cap, bound } = this.resolveToolResultInlineCap(agent);
+                const { blocks: toolResultContent, spilled, keptCap } = await this.buildStoredToolResultContent(
                   agent.name,
                   readyState.toolResults,
                   cap,
+                  bound,
                 );
                 agent.toolResultGuard.storeResults(toolResultContent, readyState.toolResults.map((tc) =>
                   this.toMembraneToolResult(tc.id, tc.result, cap, spilled.get(tc.id))), readyState.toolResults,
-                  this.silentTurnRowMetadata(agent.name), cap);
+                  this.silentTurnRowMetadata(agent.name), keptCap);
                 // The response is already complete: this batch is never
                 // submitted in this turn, so it cannot be refused. Admit it.
                 agent.toolResultGuard.settleTurnEnded();
@@ -19634,10 +19837,12 @@ export class AgentFramework {
       // token (as during a real tool call) and lands AFTER the pair, never
       // between tool_use and its tool_result. The two addMessage calls
       // below are synchronous and adjacent — nothing can interleave.
+      const { bound } = this.resolveToolResultInlineCap(agent);
       const { blocks } = await this.buildStoredToolResultContent(
         agentName,
         [{ id: toolUseId, name: toolName, input, result, durationMs }],
         call.resultMaxChars,
+        bound,
       );
       const toolUse: ContentBlock[] = [
         { type: 'tool_use', id: toolUseId, name: toolName, input } as ContentBlock,
@@ -19648,6 +19853,9 @@ export class AgentFramework {
       // still be stored — not under that turn: queue it as a unit for the
       // next flush (drainDeferredFor keeps order; the tool_result entry is
       // never split from its tool_use because both ride the same drain).
+      // One exception: a tool_use context-manager refuses as malformed is
+      // dropped at the drain, and the tool_result behind it is then stored
+      // alone (writeDrainedInOrder).
       // The finally below flushes it itself if that turn is already over.
       ownedToEnd = this.activeTurnTokens.get(agentName) === turnToken;
       if (ownedToEnd) {
@@ -20096,10 +20304,12 @@ export class AgentFramework {
     // An agent that has gone gets nothing, its drop logged once (noticeTargetFor).
     if (!this.noticeTargetFor(agentName, `script ${scriptId} wake`)) throw new Error(`agent ${agentName} has no context to wake`);
     const agent = this.agents.get(agentName);
-    const maxChars = agent
-      ? this.resolveToolResultInlineCap(agent).cap
-      : DEFAULT_TOOL_RESULT_INLINE_MAX_CHARS;
-    const { text: shown } = await this.spillOrTruncate(text, maxChars, `script-${label}`);
+    // A reader's strategy cuts the wake's whole message, so its spill fits the
+    // readers' bound with its notice.
+    const { cap: maxChars, bound } = agent
+      ? this.resolveToolResultInlineCap(agent)
+      : { cap: DEFAULT_TOOL_RESULT_INLINE_MAX_CHARS, bound: undefined };
+    const { text: shown } = await this.spillOrTruncate(text, maxChars, `script-${label}`, null, bound);
     // The spill can take a while: the agent may have gone since, or the host begun to stop.
     if (this.stopHasBegun()) throw new Error('this host is stopping');
     const target = this.noticeTargetFor(agentName, `script ${scriptId} wake`);
@@ -20149,15 +20359,38 @@ export class AgentFramework {
     agentName: string,
     toolResults: CompletedToolCall[],
     maxChars: number | undefined,
+    /** The readers' smallest per-message bound (resolveToolResultInlineCap). */
+    bound: number | undefined = undefined,
   ): Promise<{
     blocks: ContentBlock[];
     spilled: Map<string, { text: string; filePath: string | null }>;
+    /** Where a withheld stub's kept fields are cut: the share's keptCap
+     *  (toolResultShare), which is the cap where there's no bound. */
+    keptCap: number | undefined;
   }> {
     const spilled = new Map<string, { text: string; filePath: string | null }>();
     const dateLabel = new Date().toISOString().slice(0, 10);
+    // The results are stored as one message, whose bound a reader's
+    // strategy spends across them in order. Each is stored as it would be
+    // alone, unless together they pass the bound, or a save in the round
+    // counted the round by its share (toolRoundsByShare): then each is
+    // stored under its share (toolResultShare). A result carrying an image
+    // keeps its live copy cut at the cap; any other's live copy is its stored
+    // text.
+    const alone = new Map<string, { text: string; shown: ShownRanges | null; stored: { text: string; filePath: string | null; written?: SpillWrite } }>();
     for (const tc of toolResults) {
       const { text, shown } = this.storedToolResultText(agentName, tc, maxChars);
-      spilled.set(tc.id, await this.spillOrTruncate(text, maxChars, `${dateLabel}-${tc.id}`, shown));
+      alone.set(tc.id, { text, shown, stored: await this.spillOrTruncate(text, maxChars, `${dateLabel}-${tc.id}`, shown, bound) });
+    }
+    const share = maxChars === undefined ? undefined : toolResultShare(maxChars, bound, toolResults.length);
+    const total = [...alone.values()].reduce((sum, { stored }) => sum + stored.text.length, 0);
+    const byShare = share?.bound !== undefined && toolResults.length > 1
+      && (this.toolRoundsByShare.has(toolResults) || total > bound!);
+    for (const tc of toolResults) {
+      const { text, shown, stored } = alone.get(tc.id)!;
+      spilled.set(tc.id, byShare
+        ? await this.spillOrTruncate(text, share!.cap, `${dateLabel}-${tc.id}`, shown, share!.bound, stored.written)
+        : stored);
     }
     const blocks: ContentBlock[] = toolResults.map(tc => ({
       type: 'tool_result' as const,
@@ -20168,7 +20401,10 @@ export class AgentFramework {
       content: spilled.get(tc.id)!.text,
       isError: tc.result.isError,
     }));
-    return { blocks, spilled };
+    // A withheld round's stubs carry the guard's notice and place beside the
+    // fields they keep, so under a bound their fields are cut within the
+    // share, whether or not the round's results were stored by it.
+    return { blocks, spilled, keptCap: share?.keptCap ?? maxChars };
   }
 
   /**
@@ -20297,7 +20533,7 @@ export class AgentFramework {
     label: string,
     content: string,
     branch?: string,
-  ): Promise<{ path: string; error?: string; branchLeft?: true } | null> {
+  ): Promise<SpillWrite> {
     const place = this.toolResultFilePlace(label);
     if (!place) return null;
     const { workspace, path, safeLabel } = place;
@@ -20341,16 +20577,18 @@ export class AgentFramework {
   }
 
   /** How to read a tool result's file back a page at a time, with each page
-   *  sized to come back within `cap`. */
-  private spillPageAdvice(path: string, cap: number): string {
+   *  sized to come back within `cap`, and, where `canRaise`, that raising
+   *  the inline cap would show more: where a cap at the readers' bound would
+   *  keep a longer head, or the whole result. */
+  private spillPageAdvice(path: string, cap: number, canRaise: boolean): string {
     // JSON serialization can expand each read-back code unit to six
     // chars (\\u0000). Leave room for the page's metadata and a possible
     // extra code unit at a surrogate-pair boundary.
     const pageOverhead = JSON.stringify(path).length + 256;
     const readLimit = Math.max(1, Math.min(2000, Math.floor((cap - pageOverhead) / 6) - 1));
     return `Page with workspace--read ${JSON.stringify({ path, offsetChars: 0, limitChars: readLimit })}; `
-      + 'use nextOffsetChars as offsetChars until null, keeping limitChars. Or raise the inline cap via '
-      + 'agent_settings update tool_result_inline_max_chars.';
+      + 'use nextOffsetChars as offsetChars until null, keeping limitChars.'
+      + (canRaise ? ' Or raise the inline cap via agent_settings update tool_result_inline_max_chars.' : '');
   }
 
   private async spillOrTruncate(
@@ -20360,7 +20598,14 @@ export class AgentFramework {
     /** What the live copy showed beside this text (storedToolResultText);
      *  null when the live copy was this text. */
     shown: ShownRanges | null = null,
-  ): Promise<{ text: string; filePath: string | null }> {
+    /** The most a reader's strategy keeps of this copy: the readers'
+     *  smallest per-message bound, or the result's share of it
+     *  (buildStoredToolResultContent). */
+    bound: number | undefined = undefined,
+    /** The spill file an earlier cut of this text wrote: reused, not written
+     *  again. Undefined when none was cut. */
+    written?: SpillWrite,
+  ): Promise<{ text: string; filePath: string | null; written?: SpillWrite }> {
     if (!cap || content.length <= cap) return { text: content, filePath: null };
     // The stored text is the only place save_recent_image discovers tool
     // images. When the live wire delivered them beside the text, whatever
@@ -20368,20 +20613,24 @@ export class AgentFramework {
     // saw that the index would silently slide past (issue #104), so the
     // newest slots past the cut that the live copy showed are re-appended
     // after the notice. Otherwise the live copy is this text, and nothing
-    // past the cut is kept (#403).
-    const cut = cutStoredToolResult(content, cap, shown);
+    // past the cut is kept (#403). The stored copy, notice and kept slots
+    // included, fits `bound`, the most a reader's strategy keeps of it, so
+    // no reader's cut takes the notice (cutStoredToolResultToFit), and the
+    // spill notices name the head they kept.
+    const cut = cutStoredToolResultToFit(content, cap, shown, bound);
     const { head } = cut;
     const kept = formatKeptImageSlots(cut);
 
-    const written = await this.writeToolResultFile(label, content);
+    if (written === undefined) written = await this.writeToolResultFile(label, content);
     if (written && written.error === undefined) {
       const path = written.path;
       return {
         text: head
           + `\n\n[truncated — showing ${head.length} of ${content.length} chars; full content: workspace file ${path}`
-          + `. ${this.spillPageAdvice(path, cap)}]`
+          + `. ${this.spillPageAdvice(path, cap, bound === undefined || cutStoredToolResultToFit(content, bound, shown, bound).head.length > head.length)}]`
           + kept,
         filePath: path,
+        written,
       };
     }
     if (written) {
@@ -20394,6 +20643,7 @@ export class AgentFramework {
           + ` (${written.error}); content over the cap was not retained]`
           + kept,
         filePath: null,
+        written,
       };
     }
     return {
@@ -20401,6 +20651,7 @@ export class AgentFramework {
         + '\n\n[truncated — original was ' + content.length + ' chars; no writable workspace mount without an include, full content not retained]'
         + kept,
       filePath: null,
+      written,
     };
   }
 
@@ -20704,8 +20955,10 @@ export class AgentFramework {
    * the array is text-only (let JSON path handle it; saves a code path).
    * `maxChars`, when provided, caps each accompanying text block so an image
    * inlined alongside an enormous text payload can't blow the context. A
-   * block is cut as the stored copy is (toolResultCutAt), never inside a
-   * slot, so the stored copy can keep exactly the slots this showed (#403).
+   * block is cut at the cap as the stored copy's cut at that cap is
+   * (toolResultCutAt), never inside a slot, so the stored copy can keep
+   * exactly the slots this showed (#403); under a readers' bound the stored
+   * copy's cut can come earlier (cutStoredToolResultToFit).
    */
   private tryNativeToolResultContent(
     data: unknown,
@@ -20782,12 +21035,21 @@ export class AgentFramework {
    * (Sol's #94 ruling: a durable preference must not be a durable path for
    * one tool result to exceed maxMessageTokens; the way to see the whole
    * result is the spill file, not an over-bound blob in live context).
+   * An ordinary resident's results land in the shared slot, which each of
+   * its readers compiles under its own strategy, so the bound is the
+   * smallest of theirs, as the tune-out dump's is (residentMessageChars); a
+   * fork's or an ephemeral agent's store has itself as its only reader.
    */
   private resolveToolResultInlineCap(agent: Agent): {
     cap: number;
     source: 'agent-settings-override' | 'framework-config' | 'default';
-    /** Set when the desired value was reduced to the strategy bound. */
-    clampedBy: 'strategy-bound' | null;
+    /** Set when the desired value was reduced to a bound: the agent's own
+     *  strategy's, or a smaller one of another reader of its slot. */
+    clampedBy: 'strategy-bound' | 'reader-bound' | null;
+    /** The smallest per-message bound among the readers of the agent's
+     *  store, which a stored copy, notice included, must fit
+     *  (cutStoredToolResultToFit); undefined when no reader has one. */
+    bound: number | undefined;
   } {
     const override = this.toolResultInlineMaxCharsOverride.get(agent.name);
     const configured = this.toolResultInlineMaxCharsConfig;
@@ -20795,12 +21057,24 @@ export class AgentFramework {
     const source = override !== undefined
       ? 'agent-settings-override' as const
       : configured !== null ? 'framework-config' as const : 'default' as const;
-    const strategyBound = this.strategyDerivedToolResultChars(agent);
-    const clamped = strategyBound !== undefined && strategyBound < desired;
+    let bound = this.strategyDerivedToolResultChars(agent);
+    let byReader = false;
+    if (this.isOrdinaryResident(agent)) {
+      for (const reader of this.sharedSlotAgents) {
+        if (reader === agent) continue;
+        const readerBound = this.strategyDerivedToolResultChars(reader);
+        if (readerBound !== undefined && (bound === undefined || readerBound < bound)) {
+          bound = readerBound;
+          byReader = true;
+        }
+      }
+    }
+    const clamped = bound !== undefined && bound < desired;
     return {
-      cap: clamped ? strategyBound : desired,
+      cap: clamped ? bound! : desired,
       source,
-      clampedBy: clamped ? 'strategy-bound' : null,
+      clampedBy: clamped ? (byReader ? 'reader-bound' : 'strategy-bound') : null,
+      bound,
     };
   }
 
@@ -20809,8 +21083,9 @@ export class AgentFramework {
    * its caller whole. A call from a running script resolves to the script,
    * which takes any result that fits its memory (scriptResultMaxChars). Any
    * other call's result is stored in its agent's context under the agent's
-   * inline cap, and a call for an agent the framework doesn't hold gets the
-   * house default.
+   * inline cap, unless its round's results together pass the readers' bound,
+   * when each takes its share (buildStoredToolResultContent), and a call for
+   * an agent the framework doesn't hold gets the house default.
    */
   private resultMaxCharsFor(agentName: string, callId: string): number {
     const ce = this.codeExecution;
@@ -21425,6 +21700,12 @@ export class AgentFramework {
       const { deferredWriteId: _theFrameworks, ...rest } = metadata as MessageMetadata & { deferredWriteId?: unknown };
       metadata = rest as MessageMetadata;
     }
+    // Content context-manager won't store is refused here, as the store's own
+    // write refuses it, whether this write is stored now or deferred: the
+    // writer learns at once, not from a line at a drain it never sees. Content
+    // the store mends, such as a tool_use whose input isn't an object, passes.
+    const malformed = malformedContentPlaces(content);
+    if (malformed.length > 0) throw new MalformedContentError('Message refused', malformed);
     const agent = this.deliveryAgent(opts?.forAgent);
     if (!agent) {
       if (opts?.forAgent) {
@@ -21565,9 +21846,11 @@ export class AgentFramework {
     // A fork or run deregistered while the host is quiesced leaves its queue
     // to its window's release at resume (runReleasesAfterResume, which clears
     // the name first), which stores its writes in that window, or to stop()'s
-    // pass for postponed releases, which clears the name and sends them as
-    // boot would. Drained by any other flush meanwhile, they would meet no
-    // registered agent and be dropped, or written into a window no one reads.
+    // pass for postponed releases, which clears the name, passes its notices
+    // on as that release would (as boot would, where its pass throws), and
+    // drops the rest, logged. Drained by any
+    // other flush meanwhile, they would meet no registered agent and be
+    // dropped, or written into a window no one reads.
     if (this.releasesAfterResume.has(agentName)) return [];
     const mine: typeof this.deferredMessages = [];
     const rest: typeof this.deferredMessages = [];
@@ -21613,12 +21896,34 @@ export class AgentFramework {
    *
    * So none of a target's entries lands ahead of an earlier one, and a queued
    * tool_use that can't be stored keeps the tool_result queued behind it from
-   * being stored alone. (A tool_use that is stored, followed by a tool_result
-   * that can't be, stays stored without it until the tool_result lands at a
-   * later flush. The only queued pair is puppetToolCall's defensive one,
-   * which no path reaches today.) An entry that keeps failing is logged by
-   * id at each flush, and holds its target's later queued writes rather than
-   * letting them land out of order.
+   * being stored alone, unless context-manager refused it as malformed
+   * (below). (A tool_use that is stored, followed by a tool_result that
+   * can't be, stays stored without it until the tool_result lands at a later
+   * flush, or for good when the store refuses the tool_result as malformed.
+   * The only queued pair is puppetToolCall's, queued only when its turn's
+   * token is no longer its own once the pair is built, which its comment
+   * calls defensive.) An entry that keeps failing is logged by id at each
+   * flush, and holds its target's later queued writes rather than letting
+   * them land out of order.
+   *
+   * An entry context-manager refuses as malformed (MalformedContentError) is
+   * the exception for the store's own validation: context-manager checks
+   * content and every shard before writing. A custom synchronous strategy
+   * hook can throw the same class after append (context-manager #288);
+   * unreadable landing in that callback escape remains a limitation until
+   * the CM follow-up lands. A copy actually found still counts first. Other
+   * ambiguous errors remain queued for ID reconciliation before retry. A
+   * malformed refusal would fail every flush and hold its target's later
+   * writes for good, so it's logged and dropped instead, and its
+   * target isn't cut: left in the un-acked set, the next ack drops it from
+   * the durable queue. A tool_use dropped this way leaves a tool_result
+   * queued behind it to be stored alone. context-manager mends a tool_use
+   * whose input isn't an object, so it refuses one only when that input has
+   * no JSON form or the block itself is malformed. addMessage refuses such
+   * content before it's queued, so an entry meets this here from a queue an
+   * earlier process persisted, as puppetToolCall's pair, which it queues
+   * itself, or when the strategy's chunking splits well-formed content into a
+   * shard the store refuses, which the store's error names.
    *
    * From a fresh turn's start to the end of its coalescing assembly, before
    * its checkpoint, every write deferred for its agent lands in that
@@ -21647,8 +21952,8 @@ export class AgentFramework {
    * written, at most once: the entry isn't requeued and stored a second
    * time, and what landed, as later compiles render it (asCompiled), is what
    * it returns as the entry's content. For a sharded body, that can be its
-   * first shards alone, since the append loop stops at the throw; the rest
-   * of the body isn't stored. (Requeued, the
+   * first shards alone if rollback could not remove them; context-manager
+   * from 0.15 otherwise removes shards from a failed append. (Requeued, the
    * landed shards would be stored twice, and only the rest could not be
    * appended later without splitting the body.) Boot's scan for landed
    * writes counts a landed shard the same way. When the store can't be read
@@ -21660,14 +21965,15 @@ export class AgentFramework {
    * the store can't be searched, it stays queued, holding what's behind it.
    *
    * Returns what was written (stored, or deferred again by addMessage, whose
-   * id is then empty), in queue order: for one target, a prefix of its
-   * entries. Each comes with its content: as given, unless the store took it
-   * as more than one message (a sharded body) and can be read back, when its
-   * copies are returned joined, as later compiles render them (asCompiled),
-   * or its write threw after storing it (above). `onLanded` hears an entry
-   * whose write threw after storing it, with the id it landed under, as soon
-   * as it's found: before the writes after it, so whatever it records keeps
-   * their order.
+   * id is then empty), in queue order: for one target, its entries up to the
+   * first that couldn't be stored, less entries refused as malformed and dropped. Each comes
+   * with its content: as given, unless the store took it as more than one
+   * message (a sharded body) and can be read back, when its copies are
+   * returned joined, as later compiles render them (asCompiled), or its write
+   * threw after storing it (above). `onLanded` hears an entry whose write
+   * threw after storing it, with the id it landed under, as soon as it's
+   * found: before the writes after it, so whatever it records keeps their
+   * order.
    */
   private writeDrainedInOrder(
     entries: DeferredWrite[],
@@ -21730,6 +22036,14 @@ export class AgentFramework {
           onLanded?.(msg, landed[0]!.id);
           continue;
         }
+        // The store's own validation refuses content/shards before append.
+        // A synchronous custom strategy can escape after append (CM #288);
+        // this is not a guarantee for that callback when readback also fails.
+        // Any copy readback did find was already handled above.
+        if (error instanceof MalformedContentError) {
+          this.logDeferredWriteError(msg, where, error, 'dropped');
+          continue;
+        }
         // Requeued as unstored, a write that had landed would be stored a
         // second time; so one whose landing is unknown is marked, and looked
         // up by its id before it's written again (above).
@@ -21783,7 +22097,9 @@ export class AgentFramework {
   }
 
   /** The line naming a drained write that threw: one that couldn't be stored,
-   *  which is already back in the queue; with a count, one stored before the
+   *  which is already back in the queue; with 'dropped', a malformed refusal
+   *  from the store's pre-write validation (see the CM #288 caveat above);
+   *  with a count, one stored before the
    *  throw (for a sharded body, how many of its shards), or, with
    *  `foundLater`, one an earlier write of which landed and was found by its
    *  id; with `'unknown'`, one whose store couldn't be read to tell
@@ -21795,7 +22111,7 @@ export class AgentFramework {
     msg: DeferredWrite,
     where: string,
     error: unknown,
-    outcome?: { count: number; sharded: boolean; foundLater?: boolean } | 'unknown' | 'still-unknown',
+    outcome?: { count: number; sharded: boolean; foundLater?: boolean } | 'unknown' | 'still-unknown' | 'dropped',
   ): void {
     let reason: string;
     try {
@@ -21808,7 +22124,9 @@ export class AgentFramework {
       ? `${landed.count} shard${landed.count === 1 ? '' : 's'} of its body ${landed.count === 1 ? 'was' : 'were'} stored`
       : 'it was stored';
     let what: string;
-    if (outcome === 'unknown') {
+    if (outcome === 'dropped') {
+      what = `was refused as malformed, so it's dropped rather than queued again, and what is queued behind it for that agent goes on: ${reason}`;
+    } else if (outcome === 'unknown') {
       what = `threw, and its store couldn't be read to tell whether it was stored; ${held}, and is looked up ` +
         `by its id before it's written again: ${reason}`;
     } else if (outcome === 'still-unknown') {
@@ -21829,14 +22147,15 @@ export class AgentFramework {
 
   /**
    * Write what is queued for `agent` into its window past its deferral, in
-   * queue order and cut at a write that fails (writeDrainedInOrder), between
-   * a fresh turn's start and its checkpoint, where what is stored is the
-   * turn's input: at the start, before each write the coalescing assembly
-   * makes for the agent, and once the assembly ends, the last two not while
-   * the host is quiesced, when what is queued waits for resume(). What is
-   * stored is weighed for the start now beginning and for every other
-   * resident's open turn. Returns whether anything is still queued for the
-   * agent.
+   * queue order and cut at a write that fails, though one the store refuses
+   * as malformed is dropped and what follows goes on (writeDrainedInOrder),
+   * between a fresh turn's start and its checkpoint, where what is stored is
+   * the turn's input: at the start, before each write the coalescing
+   * assembly makes for the agent, and once the assembly ends, the last two
+   * not while the host is quiesced, when what is queued waits for resume().
+   * What is stored is weighed for the start now beginning and for every
+   * other resident's open turn. Returns whether anything is still queued for
+   * the agent.
    */
   private flushForStart(agent: Agent, occasion: 'turn-start' | 'assembly'): boolean {
     const stored = this.writeDrainedInOrder(this.drainDeferredFor(agent.name), `${occasion} flush for ${agent.name}`, (msg) =>
@@ -21865,11 +22184,13 @@ export class AgentFramework {
    *  landed in, and its newest stays the newest (remainingArrival).
    *
    *  A target no longer registered (a fork or a run that has ended, here or
-   *  before a crash) has no window to land in: a failed reply it never read,
+   *  before a crash) has no window to land in: a failed reply queued for it,
    *  or a channel notice it could have acted on, becomes the primary's
    *  by-name notice, under the entry's own id and place in the queue
    *  (queuedNoticeForPrimary), and is written with the rest; any other write
-   *  is dropped, logged, by addMessage. */
+   *  is dropped, logged, by addMessage. Nothing here reads the gone agent's
+   *  window, so such a notice an earlier write of which landed there, and
+   *  which the agent read, goes on too. */
   private readdDrained(drained: DeferredWrite[], where: string, opts?: { bypassDeferral?: boolean }): DeferredWrite[] {
     let passed = 0;
     const entries = drained.flatMap((msg) => {
@@ -21929,49 +22250,53 @@ export class AgentFramework {
    *
    * The agent never reads its window again, so every failed-reply notice it
    * never read, and every channel notice it could act on and never read, is
-   * passed to the primary, by name, once (passesToPrimary): each one stored
-   * in its window above its consumed watermark (flushed there at its turn's
-   * end, or stored while it was idle) and not heard at a tool boundary, as
-   * unreadNoticesForPrimary counts them, and each one still queued for it.
-   * Writes still queued would wait for a boundary it never reaches, and a
-   * flush that finds it gone would drop all but the notices it passes on, so
-   * they land in its own window now, which Chronicle keeps for
-   * investigation. One whose earlier write may have landed (`landing`
-   * unknown) is looked up there by its id first: found, it's neither stored
-   * again nor passed to the primary; where the store can't be searched, it's
-   * stored anyway, with a line saying it may now be stored twice, or, where
-   * storing it fails too, that it may be stored once, twice or not at all.
-   * Its stream is over or cancelled, or, when stop() ends it, may still run
-   * past its cancel, and then drops each event that comes after the agent
-   * has left (driveStream); a turn of its still assembling or compiling, as
-   * when stop() ends it, drops before it sends anything. One path still
-   * stores after these writes: a `complete` that arrived while the agent
-   * still waited for tools awaits the spill of its last tool results, and
-   * stores them once that resolves, even if a watchdog has ended the run
-   * meanwhile. A tool boundary stores nothing for a round whose turn was
-   * stopped while its results were prepared.
+   * passed to the primary, by name, once (passesToPrimary,
+   * passOnFromReleasedWindow): each one stored in its window above its
+   * consumed watermark (flushed there at its turn's end, or stored while it
+   * was idle) and not heard at a tool boundary, and each one still queued
+   * for it, pending or un-acked. One with an entry still in the durable
+   * queue goes on only as that entry, under its own id and seq, so a crash
+   * before the ack below replays it once; a copy of it in the window decides
+   * only whether the agent read it. Writes still queued would wait for a
+   * boundary it never reaches, and a flush that finds it gone would drop all
+   * but the notices it passes on, so they land in its own window now, which
+   * Chronicle keeps for investigation. One whose earlier write may have
+   * landed (`landing` unknown) is looked up there by its id first, or, where
+   * the store can't be searched, in the window's own read: found, it isn't
+   * stored again; where neither can see the store, it's stored anyway, with
+   * a line saying it may now be stored twice, or, where storing it fails
+   * too, that it may be stored once, twice or not at all. Its stream is over
+   * or cancelled, or, when stop() ends it, may still run past its cancel, and
+   * then drops each event that comes after the agent has left (driveStream);
+   * a turn of its still assembling or compiling, as when stop() ends it,
+   * drops before it sends anything. One path still stores after these
+   * writes: a `complete` that arrived while the agent still waited for tools
+   * awaits the spill of its last tool results, and stores them once that
+   * resolves, even if a watchdog has ended the run meanwhile. A tool boundary
+   * stores nothing for a round whose turn was stopped while its results were
+   * prepared.
    */
   private releaseWindow(agent: Agent): void {
-    for (const metadata of this.unreadNoticesForPrimary(agent)) this.passNoticeToPrimary(agent.name, metadata);
+    const { window, passOn, forPrimary, unacked } = this.passOnFromReleasedWindow(agent);
     const queued = this.drainDeferredFor(agent.name);
-    if (queued.length === 0) return;
+    // Nothing of its in the durable queue: nothing to store, pass on or ack.
+    if (queued.length === 0 && unacked === 0) return;
     const cm = agent.getContextManager();
-    const forPrimary: DeferredWrite[] = [];
     for (const msg of queued) {
       // An entry whose earlier write may have landed (landing unknown) is
       // looked up by its id, as settleUnknownLandings looks one up
-      // elsewhere, but in the released agent's own store. Found, it landed:
-      // it's neither stored again nor passed on below, since the loop above
-      // has passed its stored copy if it's a notice the primary takes in its
-      // place that the agent hadn't read, by its window as that loop reads
-      // it. When the store can't be searched, it's stored anyway where the
-      // store takes it, since no later flush will try again, and a copy its
-      // deferredWriteId tells apart costs less than a write lost without a
-      // trace.
-      const found = msg.landing === 'unknown' ? this.landedCopiesById(agent, msg.id) : [];
+      // elsewhere, but in the released agent's own store. Where the store
+      // can't be searched, a copy the window's read saw tells the same.
+      // Found, it landed, and it isn't stored again. When neither can see
+      // it, it's stored anyway where the store takes it, since no later
+      // flush will try again, and a copy its deferredWriteId tells apart
+      // costs less than a write lost without a trace.
+      const lookedUp = msg.landing === 'unknown' ? this.landedCopiesById(agent, msg.id) : [];
+      const found = lookedUp ?? window?.held.get(msg.id)?.copies;
       if (found && found.length > 0) {
         this.logDeferredWriteError(msg, `release of ${agent.name}`, undefined,
           { count: found.length, sharded: found[0]!.bodyGroupId !== undefined, foundLater: true });
+        passOn(msg);
         continue;
       }
       try {
@@ -21993,35 +22318,75 @@ export class AgentFramework {
           err,
         );
       }
-      // A failed reply, or a channel notice its reader could act on, now in a
-      // window no one reads: the entry itself goes on to the primary as its
-      // by-name notice, under its own id and seq, so a crash before the ack
-      // below replays it once, not twice.
-      if (!passesToPrimary(msg.metadata)) continue;
-      const passed = this.queuedNoticeForPrimary(agent.name, msg);
-      if (passed) forPrimary.push(passed);
+      passOn(msg);
     }
     if (forPrimary.length > 0) this.readdDrained(forPrimary, `release of ${agent.name}`);
     this.ackDeferredWrites();
   }
 
   /**
-   * The notices stored in `agent`'s window that it never read and the primary
-   * takes in its place (passesToPrimary): its failed replies, and the channel
-   * notices it was told it could act on. Those are the ones above the lower
-   * of its consumed watermark and the point where the watermark's branch and
-   * the current one part (branchesPartAt), or every one, when it has no
-   * watermark. The watermark is set when the agent is created, and moves at
-   * a compile, and at a tool boundary whose stream declares it carries the
-   * messages injected there (markContextConsumed). So a notice such a stream
-   * carried is under it.
-   * One a boundary stored without sending (a turn a tool ended, a budget
-   * restart) is above it, and so is one injected into a stream that doesn't
-   * declare it carries injections, which may have dropped it: counted as
-   * unread, it goes to the primary even if the agent heard it, rather than to
-   * no one where the stream dropped it.
+   * The part of a released agent's pass to the primary that its release and
+   * stop() share (stop() runs it for a release the quiesce postponed). Each
+   * notice stored in its window that it never read and the primary takes in
+   * its place (passesToPrimary: a failed reply, or a channel notice its
+   * reader could act on) goes on as stored, by name (passNoticeToPrimary),
+   * except a copy of an entry for it still in the durable queue, pending or
+   * un-acked: that entry is the notice's one identity until its ack, the one
+   * boot's check for landed writes knows, so it's the entry that goes on, as
+   * the primary's by-name notice under its own id and seq (`passOn`,
+   * queuedNoticeForPrimary), and a crash before the ack replays it once, not
+   * twice. A queued notice goes on unless the agent read a copy of it that
+   * landed in its window; where the window can't be read, it goes on, since
+   * telling the primary of a notice the agent may have read costs less than
+   * telling no one. Both callers run this before their drain, which hands
+   * pending entries to the un-acked set, so the un-acked entries for the
+   * agent here have all landed (their write went through, or a lookup found
+   * it: settleFound), and they go on here; the pending ones are the
+   * caller's. Returns the window's read, `passOn`, what it has queued so far
+   * for the primary, and how many un-acked entries the agent had.
    */
-  private unreadNoticesForPrimary(agent: Agent): MessageMetadata[] {
+  private passOnFromReleasedWindow(agent: Agent): {
+    window: ReleasedWindow | null;
+    passOn: (msg: DeferredWrite) => void;
+    forPrimary: DeferredWrite[];
+    unacked: number;
+  } {
+    const mine = (msg: DeferredWrite): boolean => (msg.forAgent ?? this.primaryAgentName) === agent.name;
+    const unacked = this.unackedDeferredWrites.filter(mine);
+    const window = this.releasedWindow(agent, new Set([...this.deferredMessages.filter(mine), ...unacked].map((m) => m.id)));
+    for (const metadata of window?.unread ?? []) this.passNoticeToPrimary(agent.name, metadata);
+    const forPrimary: DeferredWrite[] = [];
+    const passOn = (msg: DeferredWrite): void => {
+      if (!passesToPrimary(msg.metadata)) return;
+      if (window?.held.get(msg.id)?.unread === false) return;
+      const passed = this.queuedNoticeForPrimary(agent.name, msg);
+      if (passed) forPrimary.push(passed);
+    };
+    for (const msg of unacked) passOn(msg);
+    return { window, passOn, forPrimary, unacked: unacked.length };
+  }
+
+  /**
+   * What a released agent's window holds that its pass to the primary reads
+   * (passOnFromReleasedWindow): `unread`, the notices stored there that it
+   * never read and the primary takes in its place (passesToPrimary: its
+   * failed replies, and the channel notices it was told it could act on),
+   * other than copies of the entries `held` names; and `held`, for each of
+   * those entries with a copy there, its copies and whether any of them is
+   * unread. A notice is read below the lower of its consumed watermark and
+   * the point where the watermark's branch and the current one part
+   * (branchesPartAt), and unread everywhere when it has no watermark. The
+   * watermark is set when the agent is created, and moves at a compile, and
+   * at a tool boundary whose stream declares it carries the messages
+   * injected there (markContextConsumed). So a notice such a stream carried
+   * is under it. One a boundary stored without sending (a turn a tool ended,
+   * a budget restart) is above it, and so is one injected into a stream that
+   * doesn't declare it carries injections, which may have dropped it:
+   * counted as unread, it goes to the primary even if the agent heard it,
+   * rather than to no one where the stream dropped it. null when the window
+   * can't be read, which is logged.
+   */
+  private releasedWindow(agent: Agent, held: ReadonlySet<string>): ReleasedWindow | null {
     try {
       const cm = agent.getContextManager();
       const watermark = agent.getConsumedWatermark();
@@ -22033,15 +22398,26 @@ export class AgentFramework {
       // so a shard that continues the body before it isn't taken again. Which
       // messages make up a body is context-manager's rule (continuesBody,
       // pairwise in store order): a group id names the text, so the same text
-      // stored twice is two bodies under one id.
+      // stored twice is two bodies under one id. A held entry's copies are
+      // kept whole, each shard among them, as its lookup by id finds them.
+      const read: ReleasedWindow = { unread: [], held: new Map() };
       const messages = cm.getAllMessages();
-      return messages
-        .filter((m, i) => m.sequence > floor && passesToPrimary(m.metadata) && !continuesBody(messages[i - 1], m))
-        .map((m) => m.metadata as MessageMetadata);
+      messages.forEach((m, i) => {
+        const id = (m.metadata as { deferredWriteId?: unknown } | undefined)?.deferredWriteId;
+        if (typeof id === 'string' && held.has(id)) {
+          const copies = read.held.get(id) ?? { copies: [], unread: false };
+          copies.copies.push(storedCopy(m));
+          copies.unread ||= m.sequence > floor;
+          read.held.set(id, copies);
+        } else if (m.sequence > floor && passesToPrimary(m.metadata) && !continuesBody(messages[i - 1], m)) {
+          read.unread.push(m.metadata as MessageMetadata);
+        }
+      });
+      return read;
     } catch (err) {
       // A release must complete whatever its window's read meets.
       console.error(`[route-failure] ${agent.name}: could not read its window for unread notices the primary would take:`, err);
-      return [];
+      return null;
     }
   }
 
@@ -22467,6 +22843,10 @@ export class AgentFramework {
     if (!agent) {
       throw new Error('No agents configured');
     }
+    // As the store's own edit does, and before a held write's content is
+    // replaced: a malformed edit leaves the write as it was.
+    const malformed = malformedContentPlaces(content);
+    if (malformed.length > 0) throw new MalformedContentError(`Edit of ${id} refused`, malformed);
     // The held writes are settled first (heldWritesFor), and by a stored id
     // the row it names too (settleByCopy): a held write that landed is a
     // stored row from then on, and the edit reaches it as one.
@@ -27047,6 +27427,10 @@ export class AgentFramework {
     const entry = this.channelRegistry?.listChannelsRaw()
       .find((e) => e.descriptor.id === channelId);
     let result: { success: boolean; data?: unknown; error?: string; isError?: boolean };
+    // An open that throws is answered too, never left unhandled.
+    const openThrew = (err: unknown): string =>
+      'The tune-out is recorded, but its messages may not reach the subconscious, since opening its channel ' +
+      `failed: ${thrownText(err)}`;
     if (!entry) {
       result = { success: false, error: `unknown channel: ${channelId}`, isError: true };
     } else if (input.mode === 'cancel') {
@@ -27061,17 +27445,66 @@ export class AgentFramework {
         maxWakes: input.maxWakes,
         durationSeconds: input.durationSeconds,
       }, 'agent-tool');
-      result = r.ok
-        ? {
-            success: true,
-            data: {
-              tunedOut: channelId,
-              cadenceSeconds: r.params.cadenceSeconds,
-              backlogCap: r.params.backlogCap,
-              maxWakes: r.params.maxWakes,
-            },
-          }
-        : { success: false, error: r.error, isError: true };
+      if (r.ok) {
+        const data = {
+          tunedOut: channelId,
+          cadenceSeconds: r.params.cadenceSeconds,
+          backlogCap: r.params.backlogCap,
+          maxWakes: r.params.maxWakes,
+        };
+        // A tuned-out channel's traffic must keep arriving for the
+        // subconscious, so the answer waits for its transport (openForTuneOut).
+        // The tune-out is recorded either way, so it's a success, and where
+        // the transport isn't open, openError says why its messages don't or
+        // may not reach the subconscious, and when they will where that's
+        // known, or that the tune-out isn't in effect any more. A rejection is
+        // answered too, never left unhandled, and the result goes through
+        // pushEvent, as every other tool's does.
+        void this.channelRegistry!.openForTuneOut(entry.serverId, channelId)
+          .catch(openThrew)
+          .then((openError) => {
+            this.pushEvent({
+              type: 'tool-result',
+              callId: call.id,
+              toolName: call.name,
+              agentName,
+              moduleName: 'tune-out',
+              result: { success: true, data: { ...data, ...(openError ? { openError } : {}) } },
+            });
+          });
+        return;
+      }
+      // tune_out repeated on a channel already tuned out is where an agent
+      // retries a transport the first open left closed, so where it isn't
+      // open, or work is queued for it, the repeat goes through
+      // openForTuneOut, which joins the open in flight or waits and, where
+      // this host can open the channel, opens it again; the refusal says
+      // what its transport is now.
+      const tuneOut = this.channelRegistry!.getTuneOutState(entry.serverId, channelId);
+      if (r.alreadyTunedOut && tuneOut && !this.channelRegistry!.tuneOutTransportOpen(entry.serverId, channelId)) {
+        void this.channelRegistry!.openForTuneOut(entry.serverId, channelId)
+          .catch(openThrew)
+          .then((openError) => {
+            // The tune-out is read again: one that ended or was replaced while
+            // the open was out isn't described as standing, whatever the open
+            // answered for it.
+            const now = this.channelRegistry!.getTuneOutState(entry.serverId, channelId);
+            const error = now?.params.epochId === tuneOut.params.epochId
+              ? alreadyTunedOutText(channelId, now.params,
+                openError ?? 'Its transport is open now, so its messages reach the subconscious.')
+              : TUNE_OUT_REPLACED;
+            this.pushEvent({
+              type: 'tool-result',
+              callId: call.id,
+              toolName: call.name,
+              agentName,
+              moduleName: 'tune-out',
+              result: { success: false, error, isError: true },
+            });
+          });
+        return;
+      }
+      result = { success: false, error: r.error, isError: true };
     }
     this.pushEvent({
       type: 'tool-result',
@@ -27592,11 +28025,24 @@ export class AgentFramework {
         // carries the same ref.
         const state = agent.state;
         if (state.status === 'waiting_for_tools') {
-          const cap = this.resolveToolResultInlineCap(agent).cap;
+          // The commit stores a round as each result would be alone, or by
+          // its share where they pass the bound together, which a sibling
+          // still running can decide. Where the two ways differ for a result
+          // counted here, the round is marked to be stored by its share
+          // (toolRoundsByShare), so the count holds either way: a result
+          // counted before the mark is the same both ways. The share is of
+          // the round's calls, finished or not.
+          const { cap, bound } = this.resolveToolResultInlineCap(agent);
+          const share = toolResultShare(cap, bound, state.pending.size + state.completed.length);
           for (let i = state.completed.length - 1; i >= 0 && collecting(); i--) {
             const tc = state.completed[i]!;
             const { text, shown } = this.storedToolResultText(agentName, tc, cap);
-            considerToolResultImages(tc.id, tc.name, storedImageSlots(text, cap, shown), 0);
+            const alone = storedImageSlots(text, cap, shown, bound);
+            const byShare = storedImageSlots(text, share.cap, shown, share.bound);
+            if (alone.length !== byShare.length || alone.some((slot, j) => slot.text !== byShare[j]!.text)) {
+              this.toolRoundsByShare.add(state.completed);
+            }
+            considerToolResultImages(tc.id, tc.name, this.toolRoundsByShare.has(state.completed) ? byShare : alone, 0);
           }
         }
 

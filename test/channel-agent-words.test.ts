@@ -1072,9 +1072,9 @@ test('a decline that a later open replaced while that open\'s request was out se
 });
 
 test('a decline that a tune-out replaced sends nothing for that decision', async () => {
-  // A tune-out records its decision only: the transport is as a tune-out
-  // leaves it at any other time, which reconciling settles at the server's
-  // next registration.
+  // The tune-out is recorded through the registry alone (enterTuneOut), as
+  // tune_out records it before its dispatch opens the transport
+  // (openForTuneOut), so this test sees only what the decline sends.
   const tick = () => new Promise<void>((resolve) => setImmediate(resolve));
   const timedOut = 'The "a" server didn\'t answer within 30 seconds, so whether the request took effect is unknown.';
   const f = await fixture({});

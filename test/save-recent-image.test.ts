@@ -17,11 +17,12 @@
  *
  * Second review round (#140) added three more representations of the same
  * failure, each pinned below:
- *   6. truncation/spill never drops an image slot the resident saw, and
- *      keeps none they didn't see: a result carrying images keeps past its
- *      cut the image slots its live copy showed, the newest 64 of them; a
- *      text result, whose live copy is its stored text, keeps none past the
- *      cut; and no cut ends in part of a slot (#403).
+ *   6. truncation/spill keeps the image slots the resident saw, and keeps
+ *      none they didn't see: a result carrying images keeps past its cut
+ *      the image slots its live copy showed, the newest 64 of them that fit
+ *      the readers' bound, saying how many it left out; a text result,
+ *      whose live copy is its stored text, keeps none past the cut; and no
+ *      cut ends in part of a slot (#403).
  *   7. a save dispatched in the same batch as the snapshot waits for it.
  *   8. refs are namespaced per ledger — a stale ref resolves to nothing,
  *      and a direct `ref` is saved through its occurrence in context.
@@ -114,6 +115,15 @@ const SPLIT_TEXTS = {
   split_quoted: `${'x'.repeat(500)}\n${QUOTED_LINE}`,
   giant_line: QUOTED_LINE,
 } as const;
+/** A text result with an attachment line inside its cap (1000) but past the
+ *  head a bound of 1000 leaves it, with room for the notice. */
+const MID_SLOT_TEXT = `${'x'.repeat(500)}\n${attachmentLine(0)}\n${'x'.repeat(1000)}`;
+/** A text result within a cap of 1000, with an attachment line past what a
+ *  bound of 1200 leaves the head beside the notice's room. */
+const NEAR_SLOT_TEXT = `${'x'.repeat(700)}\n${attachmentLine(0)}\n${'x'.repeat(100)}`;
+/** 24 attachment lines, 12 of them images: under a cap of 4000 its block is
+ *  shown whole, and its slots take more than the notice's room leaves. */
+const LISTING_24 = Array.from({ length: 24 }, (_, i) => attachmentLine(i)).join('\n');
 
 /** World module: `snap` returns a native PNG image block; the other tools
  *  are the review's representations of the same result, one shape each. */
@@ -143,6 +153,9 @@ class SnapModule implements Module {
       { name: 'snap_quoting', description: 'A picture, then a caption quoting a reference line.', inputSchema: schema },
       { name: 'snap_named_ref', description: 'A picture, then a referenced one with a long name.', inputSchema: schema },
       ...Object.keys(SPLIT_TEXTS).map((name) => ({ name, description: 'Text cut inside a stub-shaped line.', inputSchema: schema })),
+      { name: 'mid_slot', description: 'Text with an attachment line inside the cap.', inputSchema: schema },
+      { name: 'near_slot', description: 'Text within the cap, with an attachment line near its end.', inputSchema: schema },
+      { name: 'snap_listed', description: 'Text, a snapshot, then 24 attachment lines.', inputSchema: schema },
       { name: 'quiet_failure', description: 'A failure not flagged as an error.', inputSchema: schema },
       { name: 'loud_failure', description: 'An error result.', inputSchema: schema },
     ];
@@ -195,6 +208,12 @@ class SnapModule implements Module {
       case 'split_quoted':
       case 'giant_line':
         return { success: true, data: [{ type: 'text', text: SPLIT_TEXTS[call.name as keyof typeof SPLIT_TEXTS] }] };
+      case 'mid_slot':
+        return { success: true, data: [{ type: 'text', text: MID_SLOT_TEXT }] };
+      case 'near_slot':
+        return { success: true, data: [{ type: 'text', text: NEAR_SLOT_TEXT }] };
+      case 'snap_listed':
+        return { success: true, data: [{ type: 'text', text: 'x'.repeat(3000) }, png, { type: 'text', text: LISTING_24 }] };
       case 'quiet_failure':
         // No data, so its error text is what history stores, and it quotes
         // a placeholder from before retention existed.
@@ -251,6 +270,9 @@ async function startTurn(opts: {
   /** The agent's resolved inline cap, below the configurable minimum, as a
    *  small strategy bound gives one. */
   inlineCap?: number;
+  /** With inlineCap, the smallest per-message bound among the readers of
+   *  the agent's store, which a stored copy must fit. */
+  inlineBound?: number;
   world?: (module: SnapModule) => void;
   workspace?: (workspace: WorkspaceModule) => void;
 }): Promise<Harness> {
@@ -278,7 +300,9 @@ async function startTurn(opts: {
   workspace.initStore(framework.getStore());
   if (opts.inlineCap !== undefined) {
     const cap = opts.inlineCap;
-    (framework as unknown as { resolveToolResultInlineCap: () => { cap: number } }).resolveToolResultInlineCap = () => ({ cap });
+    const bound = opts.inlineBound;
+    (framework as unknown as { resolveToolResultInlineCap: () => { cap: number; bound: number | undefined } })
+      .resolveToolResultInlineCap = () => ({ cap, bound });
   }
   // Install the ledger up front so tests know the nonce its refs will carry.
   const ledger = opts.ledger ?? new ToolImageLedger();
@@ -1107,6 +1131,42 @@ describe('save_recent_image provenance (issue #104)', () => {
     }
   });
 
+  it("under a reader's bound, a result carrying an image keeps its notice and the slots its live copy showed, all within the bound", async () => {
+    const h = await startTurn({
+      prefix: 'sri-captioned-bound-',
+      inlineCap: 1000,
+      inlineBound: 1000,
+      responses: [
+        [{ type: 'tool_use', id: 'call_captioned', name: 'world--snap_captioned', input: {} } as ContentBlock],
+        [saveCall('call_save_snap', { path: 'files/snap.png', index: 1 })],
+        [saveCall('call_save_gif', { path: 'files/avatar.gif', index: 2 })],
+        done,
+      ],
+    });
+    try {
+      const stored = await waitForToolResult(h.framework, 'call_captioned');
+      // The cap is the bound, so the head moves back until the notice and the
+      // kept slots fit after it: a reader's cut at the bound loses none.
+      assert.ok(stored.content.length <= 1000, `the stored copy is ${stored.content.length} characters`);
+      assert.match(stored.content, /\n\n\[truncated — showing \d+ of \d+ chars; full content: workspace file [^\]]+\]\n\[2 image slot\(s\) fell past the cut; /);
+      assert.deepStrictEqual(
+        parseImagePlaceholders(stored.content).map((s) => (s.kind === 'inline' ? s.ref : s.text)),
+        [refOf(h, 1), attachmentLine(0)],
+      );
+      // The inventory counted the slots as the bound cut them: index 1 is the
+      // snapshot and index 2 the older GIF.
+      const snap = saved(await waitForToolResult(h.framework, 'call_save_snap'));
+      assert.strictEqual(snap[0]!.toolCallId, 'call_captioned');
+      assert.strictEqual(snap[0]!.sha256, sha(PNG));
+      const gif = saved(await waitForToolResult(h.framework, 'call_save_gif'));
+      assert.strictEqual(gif[0]!.source, 'attachment');
+      assert.strictEqual(gif[0]!.sha256, sha(GIF));
+    } finally {
+      await h.framework.stop();
+      rmSync(h.tempDir, { recursive: true, force: true });
+    }
+  });
+
   it('a result whose array the converters give up on keeps nothing past its cut: its live copy is its stored text', async () => {
     const h = await startTurn({
       prefix: 'sri-mystery-cut-',
@@ -1173,6 +1233,203 @@ describe('save_recent_image provenance (issue #104)', () => {
         assert.strictEqual(receipt[0]!.source, 'attachment', id);
         assert.strictEqual(receipt[0]!.sha256, sha(GIF), id);
       }
+    } finally {
+      await h.framework.stop();
+      rmSync(h.tempDir, { recursive: true, force: true });
+    }
+  });
+
+  it("under a reader's bound, kept slots longer than the notice's spare room move the head back far enough for all of them to fit", async () => {
+    const h = await startTurn({
+      prefix: 'sri-listed-bound-',
+      inlineCap: 4000,
+      inlineBound: 4000,
+      responses: [[{ type: 'tool_use', id: 'call_listed', name: 'world--snap_listed', input: {} } as ContentBlock], done],
+    });
+    try {
+      // Each block is within the cap, so the live copy showed the snapshot and
+      // every line. Cut at the cap, the stored copy would pass the bound; the
+      // head moves back past the snapshot and the listing, and each of their
+      // slots is kept after the notice, the copy still within the bound.
+      const stored = await waitForToolResult(h.framework, 'call_listed');
+      assert.ok(stored.content.length <= 4000, `the stored copy is ${stored.content.length} characters`);
+      assert.match(stored.content, /^x+\n\n\[truncated — showing \d+ of \d+ chars; full content: workspace file [^\]]+\]\n\[13 image slot\(s\) fell past the cut; /);
+      assert.deepStrictEqual(
+        parseImagePlaceholders(stored.content).map((s) => (s.kind === 'inline' ? s.ref : s.text)),
+        [refOf(h, 1), ...Array.from({ length: 12 }, (_, i) => attachmentLine(2 * i))],
+      );
+    } finally {
+      await h.framework.stop();
+      rmSync(h.tempDir, { recursive: true, force: true });
+    }
+  });
+
+  it("under a reader's bound, where kept slots hold the head below the cap, the notice doesn't offer raising the cap, which would keep no more", async () => {
+    const h = await startTurn({
+      prefix: 'sri-listed-noraise-',
+      inlineCap: 3000,
+      inlineBound: 4000,
+      responses: [[{ type: 'tool_use', id: 'call_listed', name: 'world--snap_listed', input: {} } as ContentBlock], done],
+    });
+    try {
+      // The cap of 3000 is under the bound less the notice's room (3360), but
+      // the 13 kept slots take more than the 360 between them, so the head
+      // moves back below the cap, as it would under any higher cap.
+      const stored = await waitForToolResult(h.framework, 'call_listed');
+      const head = /^x*/.exec(stored.content)![0];
+      assert.ok(head.length < 3000, `the head is ${head.length} characters`);
+      assert.match(stored.content, /\[13 image slot\(s\) fell past the cut; /);
+      assert.doesNotMatch(stored.content, /raise the inline cap/);
+    } finally {
+      await h.framework.stop();
+      rmSync(h.tempDir, { recursive: true, force: true });
+    }
+  });
+
+  it("under a reader's bound that holds only some of the kept slots, the newest that fit are kept and the rest are said to be left out", async () => {
+    const h = await startTurn({
+      prefix: 'sri-listed-some-',
+      inlineCap: 4000,
+      inlineBound: 1500,
+      responses: [[{ type: 'tool_use', id: 'call_listed', name: 'world--snap_listed', input: {} } as ContentBlock], done],
+    });
+    try {
+      // The 13 slots the live copy showed take more than the 860 characters
+      // the bound leaves beside the notice, so the head is empty and the
+      // oldest slots are left out until the rest fit.
+      const stored = await waitForToolResult(h.framework, 'call_listed');
+      assert.ok(stored.content.length <= 1500, `the stored copy is ${stored.content.length} characters`);
+      const all = [refOf(h, 1), ...Array.from({ length: 12 }, (_, i) => attachmentLine(2 * i))];
+      const kept = parseImagePlaceholders(stored.content).map((s) => (s.kind === 'inline' ? s.ref : s.text));
+      assert.ok(kept.length > 0 && kept.length < all.length, `${kept.length} slots kept`);
+      assert.deepStrictEqual(kept, all.slice(-kept.length), 'the newest slots, in order');
+      assert.ok(stored.content.includes(`[13 image slot(s) fell past the cut. The last ${kept.length} are kept here in order so save_recent_image still counts them; the ${13 - kept.length} before them are left out, and it doesn't count them:]`), stored.content.slice(-400));
+    } finally {
+      await h.framework.stop();
+      rmSync(h.tempDir, { recursive: true, force: true });
+    }
+  });
+
+  it("under a reader's bound, a text result's cut counts no slot it moved back past, before its commit or after", async () => {
+    const h = await startTurn({
+      prefix: 'sri-mid-slot-',
+      inlineCap: 1000,
+      inlineBound: 1000,
+      responses: [
+        [
+          { type: 'tool_use', id: 'call_mid', name: 'world--mid_slot', input: {} } as ContentBlock,
+          saveCall('call_save_batch', { path: 'files/batch.gif', index: 0 }),
+        ],
+        [saveCall('call_save_after', { path: 'files/after.gif', index: 0 })],
+        done,
+      ],
+    });
+    try {
+      // The cap would keep the attachment line, at 501; the bound moves the
+      // head back before it, alone or beside the save, and a text result
+      // keeps nothing past its cut.
+      const stored = await waitForToolResult(h.framework, 'call_mid');
+      assert.ok(stored.content.length <= 1000, `the stored copy is ${stored.content.length} characters`);
+      assert.deepStrictEqual(parseImagePlaceholders(stored.content), []);
+      // So the save in its batch, counted before the commit, and the save
+      // after it both reach past it to the GIF.
+      for (const id of ['call_save_batch', 'call_save_after']) {
+        const receipt = saved(await waitForToolResult(h.framework, id));
+        assert.strictEqual(receipt[0]!.source, 'attachment', id);
+        assert.strictEqual(receipt[0]!.sha256, sha(GIF), id);
+      }
+    } finally {
+      await h.framework.stop();
+      rmSync(h.tempDir, { recursive: true, force: true });
+    }
+  });
+
+  it("a save in its batch that counts a result by its share marks the round, which is stored by its share though it fits", async () => {
+    const h = await startTurn({
+      prefix: 'sri-mid-slot-marked-',
+      inlineCap: 1000,
+      inlineBound: 2000,
+      responses: [
+        [
+          { type: 'tool_use', id: 'call_mid', name: 'world--mid_slot', input: {} } as ContentBlock,
+          saveCall('call_save_batch', { path: 'files/batch.gif', index: 0 }),
+        ],
+        done,
+      ],
+    });
+    try {
+      // Alone, the result keeps the attachment line, at 501, in a head cut at
+      // the cap, and the round would fit. Beside the save its share is 1000,
+      // whose fit leaves a head of 360, before the line. The two ways differ,
+      // so the save counts by the share and marks the round, which is then
+      // stored by it: the stored copy holds no slot, and index 0 is the GIF.
+      const stored = await waitForToolResult(h.framework, 'call_mid');
+      assert.ok(stored.content.length <= 1000, `the stored copy is ${stored.content.length} characters`);
+      assert.deepStrictEqual(parseImagePlaceholders(stored.content), []);
+      const receipt = saved(await waitForToolResult(h.framework, 'call_save_batch'));
+      assert.strictEqual(receipt[0]!.source, 'attachment');
+      assert.strictEqual(receipt[0]!.sha256, sha(GIF));
+    } finally {
+      await h.framework.stop();
+      rmSync(h.tempDir, { recursive: true, force: true });
+    }
+  });
+
+  it("a save in its batch counts a result within the cap as stored whole alone, so the round it marks is stored by its share", async () => {
+    const h = await startTurn({
+      prefix: 'sri-near-slot-',
+      inlineCap: 1000,
+      inlineBound: 1200,
+      responses: [
+        [
+          { type: 'tool_use', id: 'call_near', name: 'world--near_slot', input: {} } as ContentBlock,
+          saveCall('call_save_batch', { path: 'files/batch.gif', index: 0 }),
+        ],
+        done,
+      ],
+    });
+    try {
+      // Alone, the result is within the cap and would be stored whole, its
+      // attachment line at 701 included. By its share beside the save, 600,
+      // the line is cut away. The two ways differ, so the round is marked and
+      // stored by its share: the stored copy holds no slot, as the save counted.
+      const stored = await waitForToolResult(h.framework, 'call_near');
+      assert.ok(stored.content.length <= 600, `the stored copy is ${stored.content.length} characters`);
+      assert.deepStrictEqual(parseImagePlaceholders(stored.content), []);
+      const receipt = saved(await waitForToolResult(h.framework, 'call_save_batch'));
+      assert.strictEqual(receipt[0]!.sha256, sha(GIF));
+    } finally {
+      await h.framework.stop();
+      rmSync(h.tempDir, { recursive: true, force: true });
+    }
+  });
+
+  it("a save in its batch counts a result carrying an image as its share of the bound will store it", async () => {
+    const h = await startTurn({
+      prefix: 'sri-captioned-share-',
+      inlineCap: 1000,
+      inlineBound: 1000,
+      responses: [
+        [
+          { type: 'tool_use', id: 'call_captioned', name: 'world--snap_captioned', input: {} } as ContentBlock,
+          saveCall('call_save_batch', { path: 'files/batch.gif', index: 0 }),
+        ],
+        done,
+      ],
+    });
+    try {
+      // Alone, the snapshot would keep its two slots under the bound; by its
+      // share beside the save, 500, under the notice's room, it keeps none.
+      // The two ways differ, so the save counts by the share and marks the
+      // round, which is then stored by it.
+      const stored = await waitForToolResult(h.framework, 'call_captioned');
+      assert.deepStrictEqual(parseImagePlaceholders(stored.content), []);
+      assert.match(stored.content, /\n\[2 image slot\(s\) fell past the cut and are left out, and save_recent_image doesn't count them\.\]$/);
+      // So the save, counted before the commit, takes index 0 as the older
+      // GIF, not a slot the stored copy doesn't hold.
+      const receipt = saved(await waitForToolResult(h.framework, 'call_save_batch'));
+      assert.strictEqual(receipt[0]!.source, 'attachment');
+      assert.strictEqual(receipt[0]!.sha256, sha(GIF));
     } finally {
       await h.framework.stop();
       rmSync(h.tempDir, { recursive: true, force: true });

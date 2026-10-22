@@ -268,6 +268,16 @@ export interface ReadFileFromDiskOptions {
   maxBytes?: number;
 }
 
+/**
+ * Why a pass decided nothing, or null where it decided its paths. A pass gives
+ * up deciding, and reports no path, when the selected branch kept changing
+ * while it gathered, or when a sync's branch was no longer selected; it then
+ * carries no branchId, and the region it leaves incomplete says why.
+ */
+function undecidedOf(pass: PassResult): string | null {
+  return pass.branchId === undefined ? (pass.incomplete[0]?.reason ?? 'the pass decided nothing') : null;
+}
+
 function errnoOf(err: unknown): string | undefined {
   return typeof err === 'object' && err !== null && 'code' in err && typeof (err as { code?: unknown }).code === 'string'
     ? (err as { code: string }).code
@@ -2284,9 +2294,9 @@ export class WorkspaceModule implements Module {
     if (mount.direct) return this.bytesFromDisk(mount, relativePath, mountPrefixedPath, mount.config.maxFileSize ?? DEFAULT_MAX_FILE_SIZE);
     const store = this.getStore();
     return this.withMount(mount, async () => {
-      await this.ensureSynced(mount, relativePath);
+      const { report, undecided } = await this.ensureSynced(mount, relativePath);
       const entry = store.treeGet(mount.treeStateId, relativePath);
-      if (!entry) return { error: `File not found: ${mountPrefixedPath}` };
+      if (!entry) return { error: undecided !== null ? this.notCheckedYet(mountPrefixedPath, undecided) : this.notInWorkspace(mountPrefixedPath, report) };
       const blob = store.getBlob(entry.blobHash);
       if (!blob) return { error: `Blob not found for: ${mountPrefixedPath}` };
       return { data: blob };
@@ -3676,13 +3686,24 @@ export class WorkspaceModule implements Module {
    * path, as a file tool names the one it acts on: a path the mount passes
    * over by design is observed, as a sync naming it would observe it (#276),
    * while a path in another mount's directory is refused before this, and
-   * passed over by any pass. The caller holds the mount's turn.
+   * passed over by any pass. Answers the pass's report on the path, and why
+   * the pass decided nothing where it did (undecidedOf), which leaves disk
+   * unchecked. The caller holds the mount's turn.
    */
-  private async ensureSynced(mount: MountState, relativePath: string): Promise<PathReport | undefined> {
+  private async ensureSynced(mount: MountState, relativePath: string): Promise<{ report: PathReport | undefined; undecided: string | null }> {
     const store = this.getStore();
-    if (store.treeGet(mount.treeStateId, relativePath)) return undefined;
+    if (store.treeGet(mount.treeStateId, relativePath)) return { report: undefined, undecided: null };
     const pass = await this.passUnlocked(mount, { kind: 'paths', paths: [relativePath] }, { named: true });
-    return pass.reports.get(relativePath);
+    return { report: pass.reports.get(relativePath), undecided: undecidedOf(pass) };
+  }
+
+  /**
+   * Why the workspace holds no entry at a path, after a pass over it that
+   * decided nothing: disk wasn't checked, so it may have a copy, and the same
+   * call made again checks it.
+   */
+  private notCheckedYet(path: string, reason: string): string {
+    return `${this.notInWorkspace(path, { path, state: 'unverified', note: reason })} Make the same call again, which checks disk first.`;
   }
 
   /** Why the workspace holds no entry at a path, when disk explains it. */
@@ -3715,7 +3736,7 @@ export class WorkspaceModule implements Module {
     if (mount.direct) return this.bytesOnDisk(mount, relativePath, path);
     const store = this.getStore();
     return this.withMount(mount, async () => {
-      const report = await this.ensureSynced(mount, relativePath);
+      const { report } = await this.ensureSynced(mount, relativePath);
       const entry = store.treeGet(mount.treeStateId, relativePath);
       if (!entry) return { error: this.notInWorkspace(path, report) };
       const blob = store.getBlob(entry.blobHash);
@@ -4086,6 +4107,8 @@ export class WorkspaceModule implements Module {
         // As every file tool's pass does, it names the paths it acts on, so a
         // file the mount passes over by design is observed (see PassOptions.named).
         const pass = await this.passUnlocked(mount, { kind: 'paths', paths: [...targets.values()].map((target) => target.relativePath) }, { named: true });
+        // A pass that decided nothing checked no file's disk copy.
+        const undecided = undecidedOf(pass);
         // Nothing below awaits until the commit's push.
         const maxSize = mount.config.maxFileSize ?? DEFAULT_MAX_FILE_SIZE;
         const hints = hintBudget();
@@ -4109,6 +4132,20 @@ export class WorkspaceModule implements Module {
           // workspace didn't hold has no older copy, so taking it in needs no
           // word.
           const subject = tool === 'edit' ? 'the edit' : editList(target.edits);
+          // A pass that decided nothing checked no copy on disk, held or not,
+          // and took nothing in, so the edits would apply to text disk may
+          // have moved past, on whichever branch is selected once it gave up.
+          // They're refused, as a call made again can check.
+          if (undecided !== null) {
+            problems.push({
+              kind: 'file',
+              edits: target.edits,
+              path: target.path,
+              text: `${target.path} couldn't be checked against disk (${undecided}), so ${subject} changed nothing. Make the same call again, which checks disk first.`,
+              whole: true,
+            });
+            continue;
+          }
           const whichCopy = (verb: string): string | null => took('modified')
             ? `Disk's copy${tool === 'edit' ? '' : ` of ${target.path}`} had changed since the workspace last agreed with it, so it was taken in first, and ${subject} ${verb} that text.`
             : report?.state === 'unverified'
@@ -4378,11 +4415,12 @@ export class WorkspaceModule implements Module {
     let committed = false;
     try {
       return await this.withMount(mount, async (): Promise<ToolResult> => {
-        const report = await this.ensureSynced(mount, relativePath);
+        const { report, undecided } = await this.ensureSynced(mount, relativePath);
         await this.settleBeforeMutation(mount, relativePath);
         const entry = store.treeGet(mount.treeStateId, relativePath);
         if (!entry) {
-          return { success: false, error: this.notInWorkspace(input.path, report), isError: true };
+          const error = undecided !== null ? this.notCheckedYet(input.path, undecided) : this.notInWorkspace(input.path, report);
+          return { success: false, error, isError: true };
         }
 
         const { refused, note } = await this.commitToolChange(mount, relativePath, { kind: 'remove', previousHash: entry.blobHash },

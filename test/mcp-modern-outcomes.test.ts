@@ -768,15 +768,40 @@ test('a connection lost between continuation rounds is no-response, not an answe
   const log = scratchLog();
   const connection = await connect('', log);
   await connection.listTools();
-  await assert.rejects(connection.callTool('cont', { leg1: 'exit', leg2: 'ok' }), (err: unknown) => {
-    assert.ok(err instanceof McplRequestError, String(err));
-    assert.equal(err.outcome, 'no-response');
-    assert.equal(err.message, 'The "raw" server didn\'t finish the request: it asked for more from this host, and the call ended ' +
-      'before this host sent it, so whether the request took effect is unknown. Check its effect before trying again.');
-    return true;
-  });
-  loggedLine(logged, /^MCP server "raw" did not finish tools\/call cont: it asked for another round \(input_required\), and the call ended before that round was sent: "Not connected\."$/);
-  assert.equal(calls(log, 'cont'), 1);
+  // The server stops reading before it answers leg 1, and exits once that
+  // answer is written, so leg 2 can't reach it. What this host meets first
+  // decides what it can say, and each account is the true one for what it
+  // saw:
+  // - leg 1's answer, then the exit before the SDK's pacing (250 ms) lets
+  //   leg 2 go: the call ended before this host sent leg 2;
+  // - the exit before it reads leg 1's answer (the transport closes on the
+  //   child's exit), or its own write of leg 2 into the closed pipe, if
+  //   this process is held up for the pacing between reading the answer
+  //   and the exit: to it, the connection closed before the server
+  //   answered.
+  const accounts = [
+    {
+      message: 'The "raw" server didn\'t finish the request: it asked for more from this host, and the call ended ' +
+        'before this host sent it, so whether the request took effect is unknown. Check its effect before trying again.',
+      line: /^MCP server "raw" did not finish tools\/call cont: it asked for another round \(input_required\), and the call ended before that round was sent: "Not connected\."$/,
+    },
+    {
+      message: 'The connection to the "raw" server closed before it answered, so whether the request took effect is unknown. ' +
+        'This host won\'t reconnect to it on its own. If you need it, ask whoever runs this host.',
+      line: /^MCP server "raw" tools\/call cont failed: "Connection closed"$/,
+    },
+  ];
+  const failure = await connection.callTool('cont', { leg1: 'exit', leg2: 'ok' }).then(() => null, (err: unknown) => err);
+  assert.ok(failure instanceof McplRequestError, String(failure));
+  assert.equal(failure.outcome, 'no-response');
+  const account = accounts.find((a) => a.message === failure.message);
+  assert.ok(account, `one of the two accounts, not: ${failure.message}`);
+  // The line carries the SDK's reason, which records how the call ended, so
+  // it pins the account to the order: a host that gave the generic close
+  // after reading leg 1's answer would log that with "Not connected", the
+  // reason, and fail here.
+  loggedLine(logged, account.line);
+  assert.equal(calls(log, 'cont'), 1, 'only leg 1 reached the server');
 });
 
 test('a continuation this client cannot go on with is no-response: the server may have acted', async () => {

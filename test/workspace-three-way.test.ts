@@ -7064,6 +7064,163 @@ describe('on-agent-action', () => {
     assert.deepEqual(data.incomplete, [{ path: '', reason: 'the selected branch kept changing while the scan ran' }]);
   });
 
+  /**
+   * Run `fn` with the selected branch changing during each of a pass's
+   * gathers, so the pass decides nothing, and then no more: each file a gather
+   * reads switches the branch, three times in all, as many as a pass gathers.
+   */
+  const whileBranchKeepsChanging = <T>(env: Env, fn: () => Promise<T>): Promise<T> => {
+    const main = env.store.currentBranch().name;
+    env.store.createBranch('other', main);
+    return withReadHook((n) => { if (n <= 3) env.store.switchBranch(n % 2 === 1 ? 'other' : main); }, fn);
+  };
+  const KEPT_CHANGING = 'the selected branch kept changing while the scan ran';
+  /**
+   * Date a file's mtime past now, so no fingerprint recorded for it vouches
+   * (fingerprintVouches needs the hash taken past the racy window after the
+   * change), and every gather of a pass reads it.
+   */
+  const unvouched = (env: Env, path: string) => {
+    const later = new Date(Date.now() + 60_000);
+    utimesSync(env.disk(path), later, later);
+  };
+
+  test('a file the workspace doesn\'t hold, under a pass that decided nothing, is answered as unchecked by delete, readBinary, edit and edit_many, not as not found', async (t) => {
+    const answers: Record<string, string> = {};
+    for (const tool of ['delete', 'readBinary', 'edit', 'edit_many'] as const) {
+      const env = new Env(t);
+      const m = await env.open();
+      env.writeDisk('new.txt', 'hello on disk\n');
+      const input = tool === 'delete' ? { path: 'work/new.txt' }
+        : tool === 'edit' ? { path: 'work/new.txt', oldString: 'hello', newString: 'bye' }
+          : { edits: [{ path: 'work/new.txt', oldString: 'hello', newString: 'bye' }] };
+      answers[tool] = await whileBranchKeepsChanging(env, async () => {
+        if (tool === 'readBinary') {
+          const read = await m.readBinary('work/new.txt');
+          return 'error' in read ? read.error : `read ${read.data.length} bytes`;
+        }
+        const res = await m.handleToolCall({ id: 't', name: tool, input });
+        assert.equal(res.success, false, JSON.stringify(res));
+        return String(res.error);
+      });
+      // Disk's file is untouched, and the same call, made again, finds it.
+      assert.equal(env.readDisk('new.txt'), 'hello on disk\n');
+      if (tool === 'readBinary') {
+        const again = await m.readBinary('work/new.txt');
+        assert.ok('data' in again && again.data.toString() === 'hello on disk\n', JSON.stringify(again));
+      } else {
+        const again = await m.handleToolCall({ id: 't', name: tool, input });
+        assert.equal(again.success, true, `${tool} again: ${JSON.stringify(again)}`);
+      }
+    }
+    const unchecked = `work/new.txt is not in the workspace, and disk could not be checked (${KEPT_CHANGING}). Make the same call again, which checks disk first.`;
+    assert.deepEqual(answers, {
+      delete: unchecked,
+      readBinary: unchecked,
+      edit: `work/new.txt couldn't be checked against disk (${KEPT_CHANGING}), so the edit changed nothing. Make the same call again, which checks disk first.`,
+      edit_many: 'The edit_many call stored none of its edits: 1 problem.\n\n'
+        + `edit 1: work/new.txt couldn't be checked against disk (${KEPT_CHANGING}), so edit 1 changed nothing. Make the same call again, which checks disk first.`,
+    });
+  });
+
+  for (const autoMaterialize of [true, false]) {
+    test(`an edit of a file the workspace holds, under a pass that decided nothing, changes nothing on either branch or disk, and says to try again (${autoMaterialize ? 'a mount that pushes' : "one that doesn't push"})`, async (t) => {
+      for (const disk of ['unchanged', 'changed'] as const) {
+        const env = new Env(t);
+        const m = await env.open({ autoMaterialize });
+        await seedSynced(env, m, 'a.txt', 'A line\n');
+        const main = env.store.currentBranch().name;
+        if (disk === 'changed') env.writeDisk('a.txt', 'disk says A2\n');
+        unvouched(env, 'a.txt');
+        const edit = await whileBranchKeepsChanging(env, () => m.handleToolCall({ id: 't', name: 'edit', input: { path: 'work/a.txt', oldString: 'A line', newString: 'A edited' } }));
+        assert.equal(edit.success, false, JSON.stringify(edit));
+        assert.equal(edit.error, `work/a.txt couldn't be checked against disk (${KEPT_CHANGING}), so the edit changed nothing. Make the same call again, which checks disk first.`, disk);
+        // So does edit_many's, the branch left on `other` by the edit's pass
+        // changing under its three gathers in turn.
+        assert.equal(env.store.currentBranch().name, 'other');
+        const many = await withReadHook((n) => { if (n <= 3) env.store.switchBranch(n % 2 === 1 ? main : 'other'); },
+          () => m.handleToolCall({ id: 't', name: 'edit_many', input: { edits: [{ path: 'work/a.txt', oldString: 'A line', newString: 'A edited' }] } }));
+        assert.equal(many.success, false, JSON.stringify(many));
+        assert.equal(many.error, 'The edit_many call stored none of its edits: 1 problem.\n\n'
+          + `edit 1: work/a.txt couldn't be checked against disk (${KEPT_CHANGING}), so edit 1 changed nothing. Make the same call again, which checks disk first.`, disk);
+        // Disk is as it was, and each branch's workspace copy is the one the
+        // edits found, read from the store, which no pass changes.
+        const onDisk = disk === 'changed' ? 'disk says A2\n' : 'A line\n';
+        assert.equal(env.readDisk('a.txt'), onDisk);
+        const treeStateId = (m as any).mounts.get('work').treeStateId as string;
+        for (const branch of [main, 'other']) {
+          env.store.switchBranch(branch);
+          const entry = env.store.treeGet(treeStateId, 'a.txt');
+          assert.equal(entry && env.store.getBlob(entry.blobHash)?.toString(), 'A line\n', `${disk} on ${branch}`);
+        }
+        // Made again, the edit checks disk: it applies to the text disk holds,
+        // and where disk changed, that text no longer has the old line.
+        env.store.switchBranch(main);
+        const again = await m.handleToolCall({ id: 't', name: 'edit', input: { path: 'work/a.txt', oldString: 'A line', newString: 'A edited' } });
+        if (disk === 'unchanged') assert.equal(again.success, true, JSON.stringify(again));
+        else assert.match(String(again.error), /^The edit did nothing: oldString isn't in work\/a\.txt\./);
+      }
+    });
+  }
+
+  test('edit_many under a pass that decided nothing refuses every file it names, held or not, and stores nothing on any branch', async (t) => {
+    const env = new Env(t);
+    const m = await env.open({ autoMaterialize: true });
+    await seedSynced(env, m, 'a.txt', 'A line\n');
+    await seedSynced(env, m, 'b.txt', 'B line\n');
+    env.writeDisk('new.txt', 'N line\n');
+    for (const path of ['a.txt', 'b.txt', 'new.txt']) unvouched(env, path);
+    // Each file a gather reads selects a branch made for it, so every gather
+    // ends on another branch than it began on, however many files it reads.
+    const branches = [env.store.currentBranch().name];
+    const many = await withReadHook((n) => {
+      const name = `churn-${n}`;
+      env.store.createBranch(name, env.store.currentBranch().name);
+      env.store.switchBranch(name);
+      branches.push(name);
+    }, () => m.handleToolCall({ id: 't', name: 'edit_many', input: { edits: [
+      { path: 'work/a.txt', oldString: 'A line', newString: 'A edited' },
+      { path: 'work/b.txt', oldString: 'B line', newString: 'B edited' },
+      { path: 'work/new.txt', oldString: 'N line', newString: 'N edited' },
+    ] } }));
+    assert.equal(many.success, false, JSON.stringify(many));
+    const refused = (i: number, path: string) => `edit ${i}: work/${path} couldn't be checked against disk (${KEPT_CHANGING}), so edit ${i} changed nothing. Make the same call again, which checks disk first.`;
+    assert.equal(many.error, ['The edit_many call stored none of its edits: 3 problems.', refused(1, 'a.txt'), refused(2, 'b.txt'), refused(3, 'new.txt')].join('\n\n'));
+    assert.deepEqual(['a.txt', 'b.txt', 'new.txt'].map((p) => env.readDisk(p)), ['A line\n', 'B line\n', 'N line\n']);
+    const treeStateId = (m as any).mounts.get('work').treeStateId as string;
+    for (const branch of branches) {
+      env.store.switchBranch(branch);
+      const text = (path: string) => { const entry = env.store.treeGet(treeStateId, path); return entry ? env.store.getBlob(entry.blobHash)?.toString() : null; };
+      assert.deepEqual([text('a.txt'), text('b.txt'), text('new.txt')], ['A line\n', 'B line\n', null], branch);
+    }
+  });
+
+  test('readBinary and delete answer alike for a file the workspace doesn\'t hold whose disk copy couldn\'t be read', { skip: IS_ROOT ? 'root reads every file' : false }, async (t) => {
+    const env = new Env(t);
+    const m = await env.open();
+    env.writeDisk('new.txt', 'hello on disk\n');
+    chmodSync(env.disk('new.txt'), 0o000);
+    const read = await m.readBinary('work/new.txt');
+    const deleted = await m.handleToolCall({ id: 't', name: 'delete', input: { path: 'work/new.txt' } });
+    assert.ok('error' in read, JSON.stringify(read));
+    assert.match(read.error, /^work\/new\.txt is not in the workspace, and disk could not be checked \(.+\)\.$/);
+    assert.equal(read.error, deleted.error);
+  });
+
+  test("an edit under a pass that decided, with a region left incomplete, applies to the workspace's copy and says so, where one that decided nothing refuses", async (t) => {
+    const env = new Env(t);
+    const m = await env.open();
+    await seedSynced(env, m, 'a.txt', 'A line\n');
+    // Another directory where the mount's root was: a pass decides every
+    // path as disk couldn't check it, and leaves the root's region incomplete.
+    renameSync(env.dir, join(env.root, 'unmounted'));
+    mkdirSync(env.dir);
+    writeFileSync(join(env.dir, 'a.txt'), 'A line\n');
+    const edit = await m.handleToolCall({ id: 't', name: 'edit', input: { path: 'work/a.txt', oldString: 'A line', newString: 'A edited' } });
+    assert.equal(edit.success, true, JSON.stringify(edit));
+    assert.match(JSON.stringify(edit.data), /couldn't be checked against disk \(the mount root is not the directory disk last agreed with/);
+  });
+
   test('a branch switched away during the root check and back during a read is decided on the branch enumerated', async (t) => {
     const env = new Env(t);
     const m = await env.open();

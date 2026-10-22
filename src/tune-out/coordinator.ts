@@ -40,6 +40,26 @@ const EXPIRY_RETRY_MS = 60_000;
 /** Ends a backlog line cut to fit in one of the residents' messages. */
 const CUT_MARK = " [cut to fit; the whole message is in the channel's history]";
 
+/**
+ * tune_out's refusal of a channel already tuned out: its settings, then what
+ * its transport is now where the repeat tried to open it again (`transport`,
+ * from the framework's dispatch), then how to change the settings.
+ */
+export function alreadyTunedOutText(channelId: string, p: TuneOutParams, transport?: string): string {
+  // A duration so long its end is past what a Date can hold has no time to show.
+  const expires = p.expiresAtMs !== undefined ? new Date(p.expiresAtMs) : undefined;
+  const until = expires && Number.isFinite(expires.getTime())
+    ? `, until ${expires.toISOString().replace(/\.\d+Z$/, 'Z')}`
+    : '';
+  // A thrown error's words may end without a stop.
+  const now = transport === undefined ? '' : /[.!?]$/.test(transport) ? `${transport} ` : `${transport}. `;
+  return `Nothing changed${transport !== undefined ? ' in the tune-out' : ''}: ${JSON.stringify(channelId)} is already `
+    + `tuned out, with cadenceSeconds ${p.cadenceSeconds}, backlogCap ${p.backlogCap} and maxWakes ${p.maxWakes}${until}. `
+    + now
+    + 'To change those, cancel it first with tune_out mode "cancel", which delivers its backlog to you now, then call '
+    + 'tune_out again with the new settings.';
+}
+
 /** The first `length` code units of `text`, one fewer where the last would be
  *  the first half of a surrogate pair. */
 function prefixOf(text: string, length: number): string {
@@ -203,7 +223,7 @@ export class TuneOutCoordinator {
     channelId: string,
     opts: { cadenceSeconds?: number; backlogCap?: number; maxWakes?: number; durationSeconds?: number },
     source: string,
-  ): { ok: true; params: TuneOutParams } | { ok: false; error: string } {
+  ): { ok: true; params: TuneOutParams } | { ok: false; error: string; alreadyTunedOut?: true } {
     if (!this.hooks.subconsciousName()) {
       return {
         ok: false,
@@ -222,21 +242,7 @@ export class TuneOutCoordinator {
       };
     }
     const current = this.channelRegistry.getTuneOutState(serverId, channelId);
-    if (current) {
-      const p = current.params;
-      // A duration so long its end is past what a Date can hold has no time to show.
-      const expires = p.expiresAtMs !== undefined ? new Date(p.expiresAtMs) : undefined;
-      const until = expires && Number.isFinite(expires.getTime())
-        ? `, until ${expires.toISOString().replace(/\.\d+Z$/, 'Z')}`
-        : '';
-      return {
-        ok: false,
-        error: `Nothing changed: ${JSON.stringify(channelId)} is already tuned out, with cadenceSeconds `
-          + `${p.cadenceSeconds}, backlogCap ${p.backlogCap} and maxWakes ${p.maxWakes}${until}. To change those, `
-          + 'cancel it first with tune_out mode "cancel", which delivers its backlog to you now, then call tune_out '
-          + 'again with the new settings.',
-      };
-    }
+    if (current) return { ok: false, error: alreadyTunedOutText(channelId, current.params), alreadyTunedOut: true };
     // A tool's input reaches here as the model wrote it, and the store can't
     // keep a NaN or an Infinity: its append would throw after the registry
     // had marked the channel tuned out. So each option is read as a number

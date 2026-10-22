@@ -1,7 +1,8 @@
 /**
  * What the tune-out coordinator tells the agent, and the subconscious, when it
  * refuses: that nothing changed, why, and what to do instead. A channel that's
- * already tuned out gives its settings and how to change them; a cancel of one
+ * already tuned out gives its settings and how to change them, and is marked
+ * for the dispatch, which tries a repeat's transport again; a cancel of one
  * that isn't names the connected ones that are, and the backlog's reader as
  * its caller knows the resident.
  */
@@ -56,6 +57,7 @@ test('tune_out and cancel_tuneout say why nothing changed, and name the connecte
     error: 'Nothing changed: "disc:guild:noisy" is already tuned out, with cadenceSeconds 300, backlogCap 50 and '
       + 'maxWakes 3, until 2026-10-15T06:30:00Z. To change those, cancel it first with tune_out mode "cancel", which '
       + 'delivers its backlog to you now, then call tune_out again with the new settings.',
+    alreadyTunedOut: true,
   });
 
   const busy = coordinator({ tunedOut: [{ channelId: 'disc:guild:noisy' }, { channelId: 'disc:guild:busy' }] });
@@ -76,7 +78,7 @@ test('a tune-out with no end, or one past what a date can hold, is described wit
     + 'call tune_out again with the new settings.';
   for (const expiresAtMs of [undefined, 8.64e15 + 1]) {
     const busy = coordinator({ tunedOut: [{ channelId: 'disc:guild:noisy', ...(expiresAtMs !== undefined ? { expiresAtMs } : {}) }] });
-    assert.deepEqual(busy.enter('disc', 'disc:guild:noisy', {}, 'agent-tool'), { ok: false, error: settled }, String(expiresAtMs));
+    assert.deepEqual(busy.enter('disc', 'disc:guild:noisy', {}, 'agent-tool'), { ok: false, error: settled, alreadyTunedOut: true }, String(expiresAtMs));
   }
 });
 

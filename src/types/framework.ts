@@ -247,7 +247,9 @@ export interface FrameworkConfig {
    * takes precedence over this for that agent; the EFFECTIVE cap for every
    * source is min(desired, strategy bound) — desired values above the
    * strategy-derived bound (maxMessageTokens * 4) are hard-clamped to it,
-   * with the clamp reported via agent_settings get.
+   * with the clamp reported via agent_settings get. For an ordinary resident
+   * the bound is the smallest among the agents that read the shared slot,
+   * reported as clamped by `reader-bound` when another reader's sets it.
    */
   toolResultInlineMaxChars?: number;
 
@@ -461,13 +463,16 @@ export interface InferenceLogEntry {
 }
 
 /**
- * Entry in the process log - records a processed event with all module responses.
+ * Entry in the process log - records a processed event with the module
+ * responses that applied.
  */
 export interface ProcessLogEntry {
   timestamp: number;
   /** The process event that was handled */
   processEvent: ProcessEvent;
-  /** Responses from all modules, or blob ID if large */
+  /** The modules' responses that applied, or blob ID if large. A response
+   *  refused for content context-manager won't store is left out; its stderr
+   *  line and process:response-refused trace name it. */
   responses: ModuleProcessResponse[] | { blobId: string };
 }
 
@@ -477,7 +482,7 @@ export interface ProcessLogEntry {
 export interface ProcessLogQuery {
   /** Filter by process event type */
   eventType?: string;
-  /** Filter by module name (modules that responded) */
+  /** Filter by module name (modules whose responses applied) */
   moduleName?: string;
   /** Max number of logs to return */
   limit?: number;

@@ -86,10 +86,11 @@ export function withheldResultNotice(spill: WithheldSpill, auditDurable: boolean
 /**
  * What a withheld result's stub keeps of it: the fields of its data that its
  * tool marked as saying what it acted on (ToolResult.keepWhenWithheld), in
- * the order marked, serialized as a stored result is. Past the inline cap
- * they're cut, with a note that says so and where the whole result is, since
- * a later field can then be cut away entirely. Undefined when it keeps
- * nothing, as for a failed result (agent-framework #277). A write's file
+ * the order marked, serialized as a stored result is. Past `maxChars`, the
+ * inline cap or less (storeResults' keptCap), they're cut, with a note that
+ * says so and where the whole result is, since a later field can then be cut
+ * away entirely. Undefined when it keeps nothing, as for a failed result
+ * (agent-framework #277). A write's file
  * list is evidence of what it did, rarely what drew a refusal, and keeping it
  * is what shows a clobbered file when the receipt is withheld.
  */
@@ -109,7 +110,7 @@ export function keptWhenWithheld(result: CompletedToolCall['result'], maxChars: 
   // Never half a surrogate pair: the stub goes to the provider as text, so
   // the cut can be one character short of the cap.
   const head = safeSlice(whole, 0, maxChars);
-  return `${head} [cut at the inline cap: ${head.length} of these fields' ${whole.length} ` +
+  return `${head} [cut: ${head.length} of these fields' ${whole.length} ` +
     'characters; the whole result is where this note says]';
 }
 
@@ -313,15 +314,16 @@ export class ToolResultGuard {
       : JSON.parse(json);
   }
 
-  /** `inlineCap` is the cap the caller stored `content` under; what a stub
-   *  keeps of a withheld result is cut at it too. */
+  /** `keptCap` is where what a stub keeps of a withheld result is cut: the
+   *  cap the caller stored `content` under, less the stub's notice room where
+   *  its message's bound sets it (toolResultShare, tool-image-ledger.ts). */
   storeResults(
     content: ContentBlock[],
     wireResults: ToolResult[],
     originals: CompletedToolCall[],
     metadata: MessageMetadata | undefined,
-    /** The cap the results were stored under: what a stub keeps is cut there too. */
-    inlineCap: number | undefined,
+    /** Where what a stub keeps is cut. */
+    keptCap: number | undefined,
   ): MessageId {
     if (!this.enabled) return this.cm.addMessage('user', content, metadata);
     if (this.pending) {
@@ -355,7 +357,7 @@ export class ToolResultGuard {
     const kept = new Map<number, string>();
     for (const [index, block] of content.entries()) {
       const result = block.type === 'tool_result' ? results.get(block.toolUseId) : undefined;
-      const text = result ? keptWhenWithheld(result, inlineCap) : undefined;
+      const text = result ? keptWhenWithheld(result, keptCap) : undefined;
       if (text !== undefined) kept.set(index, text);
     }
     // Compression hold (CM >= 0.12): placed BEFORE onNewMessage fires, so no

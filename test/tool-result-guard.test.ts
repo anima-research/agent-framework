@@ -3296,14 +3296,14 @@ test('#277: a result keeps the fields its tool marked, in the order marked, cut 
   assert.ok(whole.length > 1000);
   // The note says what was cut and where the rest is, not "original was N",
   // which would read as the whole result's size.
-  assert.equal(cut, `${whole.slice(0, 1000)} [cut at the inline cap: 1000 of these fields' ${whole.length} characters; ` +
+  assert.equal(cut, `${whole.slice(0, 1000)} [cut: 1000 of these fields' ${whole.length} characters; ` +
     'the whole result is where this note says]');
   // A cut never leaves half a surrogate pair.
   // '{"name":"' is 9 characters and each emoji 2, so a cap of 14 falls inside the third.
   const emoji = keptWhenWithheld({ success: true, data: { name: '\u{1F600}'.repeat(10) }, keepWhenWithheld: ['name'] }, 14)!;
   const loneSurrogate = /[\ud800-\udbff](?![\udc00-\udfff])|(?<![\ud800-\udbff])[\udc00-\udfff]/;
   assert.doesNotMatch(emoji, loneSurrogate, `well-formed: ${JSON.stringify(emoji)}`);
-  assert.match(emoji, /^\{"name":"\u{1F600}\u{1F600} \[cut at the inline cap: 13 of these fields' 31 characters;/u);
+  assert.match(emoji, /^\{"name":"\u{1F600}\u{1F600} \[cut: 13 of these fields' 31 characters;/u);
 });
 
 test('#277: a withheld batch keeps what each marked result listed; an unmarked one keeps nothing, and its file has everything', async () => {
@@ -3353,8 +3353,92 @@ test('#277: with no writable workspace the stub still keeps the file lists, cut 
     await h.run();
     const stub = String(toolResults(h.framework)[0].content);
     const whole = JSON.stringify({ written });
-    assert.equal(stub, `${AUDIT_STUB}${LISTS}${whole.slice(0, 1000)} [cut at the inline cap: 1000 of these fields' ` +
+    assert.equal(stub, `${AUDIT_STUB}${LISTS}${whole.slice(0, 1000)} [cut: 1000 of these fields' ` +
       `${whole.length} characters; the whole result is where this note says]`);
+  } finally { await h.framework.stop(); }
+});
+
+/** A strategy whose per-message bound is 4000 characters (1000 tokens). */
+class BoundedStrategy extends PassthroughStrategy {
+  readonly maxMessageTokens = 1000;
+}
+
+test("#277: a withheld round's stubs share their message's bound, each keeping its fields cut within its share", async () => {
+  const written = Array.from({ length: 1000 }, (_, i) => `file-${i}.txt`);
+  const marked: ToolResult = { success: true, data: { written }, keepWhenWithheld: ['written'] };
+  const h = await harness([[calls('marked', 'marked2'), refused()], [answer()]],
+    { toolResultGuard: true, strategy: new BoundedStrategy() as never }, { marked, marked2: marked });
+  try {
+    await h.run();
+    const stubs = toolResults(h.framework).map((block) => String(block.content));
+    // Two results share the bound of 4000, so each stub keeps 2000 less the
+    // notice's room of 640: 1360 characters of its fields.
+    const whole = JSON.stringify({ written });
+    assert.deepEqual(stubs, [marked, marked].map(() => `${AUDIT_STUB}${LISTS}${whole.slice(0, 1360)} [cut: 1360 of these fields' ` +
+      `${whole.length} characters; the whole result is where this note says]`));
+    const total = stubs.reduce((sum, stub) => sum + stub.length, 0);
+    assert.ok(total <= 4000, `the stubs are ${total} characters together`);
+  } finally { await h.framework.stop(); }
+});
+
+test("#277: a withheld result alone under a bound keeps its fields cut within the bound less the notice's room, so its stub fits", async () => {
+  const written = Array.from({ length: 1000 }, (_, i) => `file-${i}.txt`);
+  const h = await harness([[calls('marked'), refused()], [answer()]],
+    { toolResultGuard: true, strategy: new BoundedStrategy() as never },
+    { marked: { success: true, data: { written }, keepWhenWithheld: ['written'] } });
+  try {
+    await h.run();
+    const stub = String(toolResults(h.framework)[0].content);
+    // The bound of 4000 clamps the cap to 4000, and the stub keeps 4000 less
+    // the notice's room of 640: 3360 characters of its fields.
+    const whole = JSON.stringify({ written });
+    assert.equal(stub, `${AUDIT_STUB}${LISTS}${whole.slice(0, 3360)} [cut: 3360 of these fields' ` +
+      `${whole.length} characters; the whole result is where this note says]`);
+    assert.ok(stub.length <= 4000, `the stub is ${stub.length} characters`);
+  } finally { await h.framework.stop(); }
+});
+
+test("#277: a withheld result alone whose bound leaves room for its cap and the notice keeps its fields at the cap, as before", async () => {
+  const written = Array.from({ length: 1000 }, (_, i) => `file-${i}.txt`);
+  const h = await harness([[calls('marked'), refused()], [answer()]],
+    { toolResultGuard: true, strategy: new BoundedStrategy() as never },
+    { marked: { success: true, data: { written }, keepWhenWithheld: ['written'] } });
+  try {
+    const spill = [...(h.framework as unknown as {
+      collectAgentSettingsExtensions(): Map<string, AgentSettingsExtension>;
+    }).collectAgentSettingsExtensions().values()].find((ext) => ext.keys.includes('tool_result_inline_max_chars'))!;
+    spill.update('assistant', { tool_result_inline_max_chars: 1000 });
+    await h.run();
+    // A cap of 1000 under a bound of 4000 is below 4000 less the notice's
+    // room, so the stub keeps its fields to the cap.
+    const stub = String(toolResults(h.framework)[0].content);
+    const whole = JSON.stringify({ written });
+    assert.equal(stub, `${AUDIT_STUB}${LISTS}${whole.slice(0, 1000)} [cut: 1000 of these fields' ` +
+      `${whole.length} characters; the whole result is where this note says]`);
+  } finally { await h.framework.stop(); }
+});
+
+test("#277: a withheld round whose results fit the bound still cuts its stubs' fields within the share, so every stub's place survives the reader's cut", async () => {
+  // About 3,600 characters of fields beside a one-file result: the results fit
+  // 4000 together and are stored as each alone. A stub adds the guard's notice
+  // and place to its fields, so stubs cut at the cap would pass 4000 together.
+  const written = Array.from({ length: 250 }, (_, i) => `file-${i}.txt`);
+  const results = {
+    marked: { success: true, data: { written }, keepWhenWithheld: ['written'] } as ToolResult,
+    marked2: { success: true, data: { written: ['one.txt'] }, keepWhenWithheld: ['written'] } as ToolResult,
+  };
+  const h = await harness([[calls('marked', 'marked2'), refused()], [answer()]],
+    { toolResultGuard: true, strategy: new BoundedStrategy() as never }, results);
+  try {
+    await h.run();
+    const stubs = toolResults(h.framework).map((block) => String(block.content));
+    const whole = JSON.stringify({ written });
+    assert.ok(whole.length > 1360 && whole.length < 3800, `${whole.length} characters of fields`);
+    assert.equal(stubs[0], `${AUDIT_STUB}${LISTS}${whole.slice(0, 1360)} [cut: 1360 of these fields' ` +
+      `${whole.length} characters; the whole result is where this note says]`);
+    assert.equal(stubs[1], `${AUDIT_STUB}${LISTS}${JSON.stringify({ written: ['one.txt'] })}`);
+    const total = stubs.reduce((sum, stub) => sum + stub.length, 0);
+    assert.ok(total <= 4000, `the stubs are ${total} characters together`);
   } finally { await h.framework.stop(); }
 });
 
@@ -3377,7 +3461,7 @@ test('#277: direct API: a withheld result keeps its file lists, cut at the house
     const whole = JSON.stringify({ written });
     assert.ok(whole.length > DEFAULT_TOOL_RESULT_INLINE_MAX_CHARS);
     assert.equal(stub, `${AUDIT_STUB}${LISTS}${whole.slice(0, DEFAULT_TOOL_RESULT_INLINE_MAX_CHARS)}` +
-      ` [cut at the inline cap: ${DEFAULT_TOOL_RESULT_INLINE_MAX_CHARS} of these fields' ${whole.length} characters; ` +
+      ` [cut: ${DEFAULT_TOOL_RESULT_INLINE_MAX_CHARS} of these fields' ${whole.length} characters; ` +
       'the whole result is where this note says]');
   } finally { await h.framework.stop(); }
 });

@@ -25,6 +25,7 @@ import type {
 import { AgentFramework, PassthroughStrategy } from '../src/index.js';
 import { DEFAULT_TOOL_RESULT_INLINE_MAX_CHARS } from '../src/tool-result-history.js';
 import { WorkspaceModule } from '../src/modules/workspace/index.js';
+import { TOOL_RESULT_NOTICE_ROOM } from '../src/tool-image-ledger.js';
 import { createMockResponse, MockMembrane } from './helpers/mock-membrane.js';
 
 /**
@@ -563,7 +564,10 @@ describe('tool-result spill completion (issue #89)', () => {
     try {
       const stored = await waitForStoredToolResult(h.framework);
       assert.ok(stored, 'tool result should be stored');
-      assert.match(stored.content, /showing 4000 of \d+ chars/);
+      // The cap is the strategy's bound, so the head moves back to leave the
+      // notice its room: the stored copy, notice included, fits the bound.
+      assert.ok(stored.content.length <= 4000, `the stored copy is ${stored.content.length} characters`);
+      assert.match(stored.content, new RegExp(`showing ${4000 - TOOL_RESULT_NOTICE_ROOM} of \\d+ chars`));
       const prov = capProvenance(h.framework);
       assert.strictEqual(prov.tool_result_inline_max_chars_effective, 4000);
       assert.strictEqual(prov.tool_result_inline_max_chars_source, 'default');
@@ -641,7 +645,10 @@ describe('tool-result spill completion (issue #89)', () => {
       // The clamp is enforced on the wire, not just reported.
       const stored = await waitForStoredToolResult(h.framework);
       assert.ok(stored, 'tool result should be stored');
-      assert.match(stored.content, /showing 4000 of \d+ chars/);
+      // The cap is the strategy's bound, so the head moves back to leave the
+      // notice its room: the stored copy, notice included, fits the bound.
+      assert.ok(stored.content.length <= 4000, `the stored copy is ${stored.content.length} characters`);
+      assert.match(stored.content, new RegExp(`showing ${4000 - TOOL_RESULT_NOTICE_ROOM} of \\d+ chars`));
     } finally {
       await h.framework.stop();
       rmSync(h.tempDir, { recursive: true, force: true });
