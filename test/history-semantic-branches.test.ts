@@ -211,6 +211,7 @@ it('a summary a branch minted and left before a sync is indexed once that branch
   const dates = r.summaries().find((s) => s.content.includes('dates'))!;
   assert.ok(dates, JSON.stringify(r.summaries()));
   await r.manager.switchBranch(trunk);
+  await new Promise((res) => setTimeout(res, 5));
   await r.talk('elderberries', 16);
   await r.mod.syncSemanticIndex();
   const trunkCursor = cursors(r).summaries as number;
@@ -234,6 +235,7 @@ it('a pass the store leaves its branch during writes no cursor, so the branch it
   const figs = r.summaries().find((s) => s.content.includes('figs'))!;
   assert.ok(figs, JSON.stringify(r.summaries()));
   await r.manager.switchBranch(trunk);
+  await new Promise((res) => setTimeout(res, 5));
   await r.talk('grapes');
   const grapes = r.summaries().find((s) => s.content.includes('grapes'))!;
   assert.ok(grapes.created > figs.created, 'the premise: the trunk\'s new summary is newer than the side\'s');
@@ -307,6 +309,7 @@ it('an old item is still its summary\'s hit while a bounded pass hasn\'t reached
   const r = await rig(t, { maxSyncBeforeSearch: 1 });
   r.svc.noDelete = true;
   await r.talk('apples');
+  await new Promise((res) => setTimeout(res, 5));
   await r.talk('bananas');
   const mine = r.summaries().sort((a, b) => a.created - b.created);
   const newest = mine.at(-1)!;
@@ -419,7 +422,11 @@ it('a pass whose summaries\' upsert fails deletes no old item and writes no curs
 it('a deleted index gets every message and summary again, and so does an index under another name', async (t) => {
   // No overlap, so only the cursors decide where the message walk starts.
   const r = await rig(t, { overlapMs: 0 });
+  // A few milliseconds apart, so the apples messages have messages older and newer than all of them.
+  await r.talk('early', 2);
+  await new Promise((res) => setTimeout(res, 5));
   await r.talk('apples');
+  await new Promise((res) => setTimeout(res, 5));
   await r.talk('bananas');
   await r.mod.syncSemanticIndex();
   const keys = r.summaries().map((s) => `sum:${s.id}@${s.created}`).sort();
@@ -615,6 +622,7 @@ it('after stop(), a pass on another branch doesn\'t take the cursors written on 
   const cherries = r.summaries().find((s) => s.content.includes('cherries'))!;
   assert.ok(cherries, JSON.stringify(r.summaries()));
   await r.manager.switchBranch(trunk);
+  await new Promise((res) => setTimeout(res, 5));
   await r.talk('bananas');
   const bananas = r.summaries().find((s) => s.content.includes('bananas'))!;
   assert.ok(bananas.created > cherries.created, 'the premise: the trunk\'s summary is newer than the side\'s');
