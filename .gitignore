@@ -5,3 +5,6 @@ data/
 package-lock.json
 bun.lock
 logs/
+
+# Node diagnostic reports (written to cwd on SIGUSR2 by the diagnostics tests); they list the environment
+report.*.json
