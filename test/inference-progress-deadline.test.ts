@@ -438,10 +438,13 @@ test("context-manager's compression calls carry the framework's deadline unless 
     await resident.complete(request, { formatter: 'native', signal } as never);
     await membraneOf(first.contextManager).complete(request);
     await resident.complete(request, { progressTimeoutMs: 99 } as never);
+    // null counts as not set, as in the configuration checks.
+    await resident.complete(request, { progressTimeoutMs: null } as never);
     assert.deepEqual(membrane.options, [
       { formatter: 'native', signal, progressTimeoutMs: 1234 },
       { progressTimeoutMs: 1234 },
       { progressTimeoutMs: 99 },
+      { progressTimeoutMs: 1234 },
     ]);
     // Ephemeral runs and the subconscious share one membrane instance, as
     // they shared the plain one: context-manager keys a compression's
@@ -494,14 +497,17 @@ test("the direct Agent API returns an expiry as an aborted result, with abortRea
 });
 
 test("an MCPL server's inference request carries the framework's deadline", async () => {
+  // The router is built in create's own startup, from the configured value. A
+  // server entry whose command can't start is enough to drive that path: its
+  // connect fails open, and startup goes on to build the router.
   const membrane = new RecordingMembrane();
-  await withFramework(membrane, { inferenceProgressTimeoutMs: 4321 }, async (framework) => {
+  const mcplServers = [{ id: 'srv', command: join(tmpdir(), 'no-such-mcpl-server-for-progress-deadline') }];
+  await withFramework(membrane, { inferenceProgressTimeoutMs: 4321, mcplServers }, async (framework) => {
     const internals = framework as unknown as {
-      initializeMcpl(servers: unknown[]): Promise<void>;
       featureSetManager: { validateInbound(serverId: string, featureSet: string): void };
       inferenceRouter: InferenceRouter;
     };
-    await internals.initializeMcpl([]);
+    assert.ok(internals.inferenceRouter, 'startup built the router');
     internals.featureSetManager.validateInbound = () => {};
     const responses: unknown[] = [];
     await internals.inferenceRouter.handleInferenceRequest(

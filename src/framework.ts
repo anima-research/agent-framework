@@ -4521,7 +4521,8 @@ export class AgentFramework {
   private sharedDeadlineMembrane: Membrane | undefined;
   /** The framework's membrane, with each complete() call passed through
    *  `admit` along with the model it names. A call whose options set no
-   *  `progressTimeoutMs`, such as context-manager's compression, gets the
+   *  `progressTimeoutMs` (left out or null), such as context-manager's
+   *  compression, gets the
    *  framework's (inferenceProgressTimeoutMs), so a stalled compression can't
    *  hold a resident's next turn behind waitForAuxiliaryIdle forever. A call
    *  that streams no events is bounded as a whole. */
@@ -4533,7 +4534,7 @@ export class AgentFramework {
         return (...args: unknown[]) => {
           const model = (args[0] as { config?: { model?: unknown } } | undefined)?.config?.model;
           const options = args[1] as { progressTimeoutMs?: number } | undefined;
-          if (options?.progressTimeoutMs === undefined) {
+          if (options?.progressTimeoutMs == null) {
             args[1] = { ...options, progressTimeoutMs: this.inferenceProgressTimeoutMs };
           }
           return admit(() => Reflect.apply(value, this.membrane, args) as Promise<unknown>,
