@@ -114,7 +114,7 @@ interface Rig {
   store: { currentSequence(): number; createBranchAt(name: string, from: string, at: number): unknown; getStateJson(id: string): unknown; setStateJson(id: string, v: unknown): unknown };
   mod: HistoryModule;
   talk(topic: string, n?: number): Promise<void>;
-  search(query: string, limit?: number): Promise<{ hits: string[]; droppedOffBranch: number; droppedStale: number }>;
+  search(query: string, limit?: number): Promise<{ hits: string[]; droppedOffBranch: number; droppedStale: number; behind: boolean | null }>;
   summaries(): Array<{ id: string; content: string; created: number }>;
   state(): Record<string, unknown> | null;
   /** How many times the module has written its state. */
@@ -157,8 +157,8 @@ async function rig(t: { after(fn: () => Promise<void>): void }, opts: { maxSyncB
     async search(query, limit) {
       const res = await mod.handleToolCall({ id: 'q', name: 'semantic_search', input: { query, level: 1, ...(limit ? { limit } : {}) } } as never);
       assert.equal(res.success, true, JSON.stringify(res));
-      const data = res.data as { hits: Array<{ id: string; snippet: string; score: number }>; index: { droppedOffBranch: number; droppedStale: number } };
-      return { hits: data.hits.filter((h) => h.score > 0.5).map((h) => `${h.id} ${h.snippet}`), droppedOffBranch: data.index.droppedOffBranch, droppedStale: data.index.droppedStale };
+      const data = res.data as { hits: Array<{ id: string; snippet: string; score: number }>; index: { droppedOffBranch: number; droppedStale: number; behind: boolean | null } };
+      return { hits: data.hits.filter((h) => h.score > 0.5).map((h) => `${h.id} ${h.snippet}`), droppedOffBranch: data.index.droppedOffBranch, droppedStale: data.index.droppedStale, behind: data.index.behind };
     },
     summaries: () => (manager.getSummariesInRange({}) as Array<{ id: string; content: string; createdMs: number }>).map((s) => ({ id: s.id, content: s.content, created: s.createdMs })),
     state: () => store.getStateJson(stateId) as Record<string, unknown> | null,
@@ -368,8 +368,9 @@ it('a failed delete of old items leaves the cursor, so the next pass sends those
   r.svc.items.set(`sum:${apples!.id}`, { id: `sum:${apples!.id}`, text: apples!.content, kind: 'summary', cursor: apples!.created });
   r.svc.failDeletes = 1;
   t.mock.method(console, 'warn', () => {});
-  await r.mod.syncSemanticIndex();
+  const report = (await r.mod.syncSemanticIndex())!;
   assert.ok(r.svc.items.has(`sum:${apples!.id}`), 'the delete failed');
+  assert.equal(report.more, true, 'the pass says the delete is still owed');
   assert.equal(cursors(r).summaries ?? null, null, 'so no summary cursor was written');
   assert.match((r.mod as unknown as { indexer: { lastError: string | null } }).indexer.lastError ?? '', /boom/);
   // Both items are in the index now, and the answer holds both: one hit for the summary.
@@ -424,6 +425,7 @@ it('a deleted index gets every message and summary again, and so does an index u
   const keys = r.summaries().map((s) => `sum:${s.id}@${s.created}`).sort();
   assert.deepEqual(r.svc.summaryKeys(), keys);
   const messageKeys = [...r.svc.items.keys()].filter((k) => k.startsWith('msg:')).sort();
+  const messageCursors = new Map([...r.svc.items.values()].filter((it) => it.kind === 'message').map((it) => [it.id, it.cursor!]));
   // The namespace is deleted: /stats answers 404 until the next pass makes it again.
   r.svc.items.clear();
   await r.mod.syncSemanticIndex();
@@ -433,7 +435,10 @@ it('a deleted index gets every message and summary again, and so does an index u
   // Another module over the same state, configured for another index that already exists.
   const other = new FakeService(); await other.start();
   t.after(() => other.stop());
-  other.items.set('msg:elsewhere', { id: 'msg:elsewhere', text: 'something else', kind: 'message', cursor: 1 });
+  // Its watermark sits among this store's messages: the newest apples message's.
+  const watermark = Math.max(...[...messageCursors].filter(([id]) => r.svc.items.get(id)!.text.includes('topic-apples')).map(([, c]) => c));
+  assert.ok([...messageCursors.values()].some((c) => c < watermark) && [...messageCursors.values()].some((c) => c > watermark), 'the premise: messages on both sides of it');
+  other.items.set('msg:elsewhere', { id: 'msg:elsewhere', text: 'something else', kind: 'message', cursor: watermark });
   const stateId = 'modules/history/state';
   const ctx = { getState: () => r.store.getStateJson(stateId), setState: (v: unknown) => { r.store.setStateJson(stateId, v); } } as never;
   const mod2 = new HistoryModule({ semantic: { url: other.url, namespace: 'ns2', syncIntervalMs: 0, overlapMs: 0 } });
@@ -442,8 +447,9 @@ it('a deleted index gets every message and summary again, and so does an index u
   t.after(() => mod2.stop());
   await mod2.syncSemanticIndex();
   assert.deepEqual(other.summaryKeys(), keys);
-  // Its walk starts at that index's own watermark, not at the cursor kept for the other.
-  assert.deepEqual([...other.items.keys()].filter((k) => k.startsWith('msg:') && k !== 'msg:elsewhere').sort(), messageKeys);
+  // Its walk starts at that index's own watermark, not at the cursor kept for the other, nor at the start.
+  assert.deepEqual([...other.items.keys()].filter((k) => k.startsWith('msg:') && k !== 'msg:elsewhere').sort(),
+    messageKeys.filter((k) => messageCursors.get(k)! >= watermark));
   assert.equal(cursors(r).namespace, 'ns2');
 });
 
@@ -617,6 +623,24 @@ it('after stop(), a pass on another branch doesn\'t take the cursors written on 
   await r.manager.switchBranch('side');
   await r.mod.syncSemanticIndex();
   assert.ok(r.svc.items.has(`sum:${cherries.id}@${cherries.created}`), JSON.stringify(r.svc.summaryKeys()));
+  // Back on the trunk, its own cursors still stand: nothing there is new, so no old key is deleted.
+  const deletes = r.svc.deleteCalls;
+  await r.manager.switchBranch(trunk);
+  await r.mod.syncSemanticIndex();
+  assert.equal(r.svc.deleteCalls, deletes);
+});
+
+it('a search the store leaves the branch its catch-up synced says the index is behind', async (t) => {
+  const r = await rig(t);
+  await r.talk('apples');
+  await r.mod.syncSemanticIndex();
+  const trunk = r.manager.currentBranch().name;
+  r.store.createBranchAt('side', trunk, r.store.currentSequence());
+  // The trunk's catch-up finds nothing new; the store moves to the side while the search waits.
+  r.svc.onSearch = async () => { r.svc.onSearch = null; await r.manager.switchBranch('side'); };
+  const found = await r.search('apples');
+  assert.equal(r.manager.currentBranch().name, 'side', 'the premise: the store moved');
+  assert.equal(found.behind, true);
 });
 
 it('a pass whose summaries are read on another branch writes no cursor', async (t) => {
@@ -654,6 +678,7 @@ it('a pass the store leaves between message pages writes no cursor', async (t) =
   assert.equal(report.messagesScanned, 300);
   assert.equal(r.manager.currentBranch().name, trunk);
   assert.deepEqual(cursors(r), {});
+  assert.equal(report.more, true);
 });
 
 it('a pass the store leaves after its last read writes no cursor where it lands', async (t) => {

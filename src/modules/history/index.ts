@@ -1623,6 +1623,8 @@ export class HistoryModule implements Module {
 
     // Bounded catch-up so the newest messages are searchable; never block on a backlog.
     let sync: SyncReport | null = null;
+    // The branch the catch-up synced, which the search may leave while it waits.
+    const syncedOn = this.indexer?.branchId();
     if (this.indexer) {
       try { sync = await this.indexer.catchUp(this.semanticCfg.maxSyncBeforeSearch ?? 256); } catch { /* reported via indexer.lastError */ }
     }
@@ -1833,7 +1835,7 @@ export class HistoryModule implements Module {
         hits,
         index: {
           indexed: res.count_indexed,
-          behind: sync ? sync.more : this.indexer === null ? null : true,
+          behind: sync && this.indexer?.branchId() === syncedOn ? sync.more : this.indexer === null ? null : true,
           syncedThisCall: sync ? sync.pushed : 0,
           lastError: this.indexer?.lastError ?? null,
           /** Hits the index returned for messages/summaries not on the current branch (undone, checked out past). */

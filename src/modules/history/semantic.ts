@@ -416,8 +416,10 @@ export interface SyncReport {
   unchanged: number;
   /**
    * True when items may be left to send: the pass hit its item cap before
-   * the end of the store, edits are still queued, it failed or was backing
-   * off, or the store left the branch it read during it.
+   * the end of the store or of the queued edits, a delete of summaries' old
+   * items failed, it failed or was backing off, or the store left the branch
+   * it read during it. An edit or removal that a failed send queued again
+   * doesn't set it; the next pass sends it.
    */
   more: boolean;
   messagesScanned: number;
@@ -479,8 +481,8 @@ export class SemanticIndexer {
   /** The cursors this indexer last wrote, by branch id ('' for a store without branches). */
   private readonly ownCursors = new Map<string, SyncCursors>();
 
-  /** The store's current branch, by id. */
-  private branchId(): string {
+  /** The store's current branch, by id ('' for a store without branches). */
+  branchId(): string {
     return (this.cm as { currentBranch?: () => { id: string } | undefined }).currentBranch?.()?.id ?? '';
   }
 
@@ -599,6 +601,8 @@ export class SemanticIndexer {
       const branch = this.branchId();
       // Set when a read of the store finds it on another branch.
       let strayed = false;
+      // Set when a delete of summaries' old items fails.
+      let oldItemsOwed = false;
       const reading = (): void => { if (this.branchId() !== branch) strayed = true; };
       let kept = this.syncCursors();
       // A namespace that doesn't exist holds nothing of this branch's, as after
@@ -751,6 +755,7 @@ export class SemanticIndexer {
           } catch (e) {
             const msg = e instanceof Error ? e.message : String(e);
             deleted = false;
+            oldItemsOwed = true;
             phaseErrors.push(msg);
             this.warn(`deleting ${oldKeys.length} summaries' items from before they were keyed by creation time failed; the next pass tries again: ${msg}`);
           }
@@ -806,8 +811,9 @@ export class SemanticIndexer {
         this.setSyncCursors({ summaries: sumNext, messages: msgNext }, branch);
       }
       if (notStats && report.more) throw notStats;
-      // The current branch may then have items this pass didn't send.
-      if (left) report.more = true;
+      // The current branch may then have items this pass didn't send, and
+      // old items a failed delete left are still to go.
+      if (left || oldItemsOwed) report.more = true;
       this.consecutiveFailures = 0; this.lastError = named(notStats?.message ?? null, ...phaseErrors); this.lastSyncAt = Date.now();
       return report;
     } catch (e) {
