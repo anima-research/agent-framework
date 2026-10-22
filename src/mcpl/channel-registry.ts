@@ -4788,7 +4788,7 @@ export class ChannelRegistry {
    * tool, so any trailing prose this turn is NOT posted. Replaces the old
    * overloaded use of `think` for staying silent.
    */
-  private handleToolSkipReply(input: { reason?: string; wake_in_seconds?: unknown }): ToolResult {
+  private handleToolSkipReply(input: { reason?: string; wake_in_seconds?: unknown; _wake_durable?: boolean }): ToolResult {
     // The self-wake itself is armed by the framework (which owns the
     // EventGate) BEFORE its dispatch reaches this handler, from the same
     // reading, and the framework refuses a wake the host can't set before
@@ -4811,8 +4811,10 @@ export class ChannelRegistry {
       data: {
         skipped: true,
         note: selfWake !== undefined
-          ? `Turn ended; nothing sent. Self-wake in ~${selfWake}s unless something wakes you first.`
+          ? `Turn ended; nothing sent. Self-wake in ~${selfWake}s unless something wakes you first.` +
+            (input._wake_durable === false ? ' Its journal write failed, so it may not survive a restart.' : '')
           : 'Turn ended; nothing sent.',
+        ...(selfWake !== undefined ? { durable: input._wake_durable !== false } : {}),
       },
     };
   }

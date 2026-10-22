@@ -3550,8 +3550,9 @@ export class AgentFramework {
           `since ${hostMode.since ? new Date(hostMode.since).toISOString() : 'unknown'}).\n` +
           `[host-mode] No wakes will start turns and MCPL data planes stay paused\n` +
           `[host-mode] until resume() — via host/command, the API server, or the\n` +
-          `[host-mode] framework API. Wakes parked before the restart were in-memory\n` +
-          `[host-mode] and are gone; recurring sources re-deliver on their own cadence.\n` +
+          `[host-mode] framework API. Durable sleep/self-wake intents restore from their journal\n` +
+          `[host-mode] and are admitted at resume. Ordinary parked wakes and gate buffers\n` +
+          `[host-mode] were in memory and are gone; recurring sources re-deliver on cadence.\n` +
           `[host-mode] ${restoredWrites} deferred context write(s) restored from the store;\n` +
           `[host-mode] they land at resume().\n` +
           `[host-mode] ============================================================`,
@@ -3564,6 +3565,11 @@ export class AgentFramework {
       }
     }
 
+    // Restore sleep suppression and future timers before MCPL can release
+    // buffered input. Overdue intents stay durable until startup is complete.
+    framework.eventGate?.restoreWakeIntents();
+
+    try {
     // Initialize MCPL subsystems if configured
     if (config.mcplServers && config.mcplServers.length > 0) {
       // Check every server's config before any is brought up: its boolean
@@ -3656,7 +3662,12 @@ export class AgentFramework {
     framework.toolPatternChecksArmed = true;
     framework.checkToolPatterns();
 
+    if (!framework.quiesced) framework.eventGate?.admitOverdueWakeIntents();
     return framework;
+    } catch (error) {
+      framework.eventGate?.dispose();
+      throw error;
+    }
   }
 
   /**
@@ -3983,6 +3994,10 @@ export class AgentFramework {
     // The generation this stop ends; withheld spills close for it alone, so a
     // start() after this stop has settled reopens them for its own.
     const stoppingGeneration = this.lifecycleGeneration;
+    // Stop wake timers before closing the queue. A deadline in the old gap
+    // could otherwise consume its durable intent and enqueue into a queue
+    // this stop immediately closes, losing the wake across restart.
+    step(() => this.eventGate?.dispose());
     step(() => this.queue.close());
     step(() => this.tuneOutCoordinator?.stop());
 
@@ -4220,8 +4235,6 @@ export class AgentFramework {
     // Stop typing indicators, and forget the registry's channels
     step(() => this.channelRegistry?.stopAll());
 
-    // Dispose EventGate (clear debounce timers)
-    step(() => this.eventGate?.dispose());
     step(() => this.livenessWatchdog?.stop());
     AgentFramework.diagnosed.delete(this);
 
@@ -6773,7 +6786,6 @@ export class AgentFramework {
       );
     }
 
-    const releasedRequests = this.pendingRequests.length;
     // In-memory first: addMessage must stop deferring so the flush below can
     // land. The DURABLE flag is cleared only after the flush completes — a
     // crash in between then boots quiesced with the un-acked remainder
@@ -6799,6 +6811,8 @@ export class AgentFramework {
       await this.flushDeferredWrites('resume');
       this.persistHostMode(null);
       this.hostModeRecordMayBeQuiesced = false;
+      // See abortRouting: the gate may not exist in partial harnesses.
+      this.eventGate?.admitOverdueWakeIntents();
     } finally {
       this.resumeInFlight = false;
       // Reopen MCPL data planes (quiesced is already false). In `finally`
@@ -6806,17 +6820,16 @@ export class AgentFramework {
       // plane still paused.
       this.readyMcplPlanes();
 
+      const releasedRequests = this.pendingRequests.length;
       this.emitTrace({
         type: 'host:resume',
         ...(opts?.force && failing.length > 0 ? { forced: true } : {}),
         releasedRequests,
       });
-      // NOTE: parked wakes and gate buffers are in-memory only — a restart
-      // mid-quiesce boots quiesced but with these queues empty (sources like
-      // heartbeats re-deliver on their own cadence; one-shot wakes are lost).
-      // Deferred context WRITES are persisted while quiesced and survive,
-      // apart from any whose write failed or met the cap and that no later
-      // write carried (persistDeferredWrites).
+      // NOTE: ordinary parked wakes and gate buffers are in-memory only. Durable
+      // sleep/self-wake intents restore from their journal and are admitted here;
+      // recurring sources re-deliver on cadence. Deferred writes also survive.
+
       console.error(this.queue?.isClosed
         ? `[host-mode] resumed — ${releasedRequests} parked wake(s) won't run because the framework is stopping`
         : `[host-mode] resumed — ${releasedRequests} parked wake(s) released`);
@@ -21729,7 +21742,10 @@ export class AgentFramework {
         }
         const wake = readSkipReplyWake(enrichedCall.input);
         if (wake.kind === 'wake' && this.eventGate) {
-          const { inMs, armed } = this.eventGate.armSelfWake(agentName, wake.seconds, 'skip_reply');
+          const { inMs, armed, durable } = this.eventGate.armSelfWake(agentName, wake.seconds, 'skip_reply');
+          // The receipt's durability note (channel-registry) reads this; a wake
+          // nothing armed has no journal entry to describe.
+          if (armed) enrichedCall.input = { ...((enrichedCall.input ?? {}) as Record<string, unknown>), _wake_durable: durable };
           console.error(armed
             ? `[self-wake] agent=${agentName} armed in ${Math.round(inMs / 1000)}s (skip_reply)`
             : `[self-wake] agent=${agentName} not armed: the framework has stopped (skip_reply)`);
@@ -27864,8 +27880,8 @@ export class AgentFramework {
     };
 
     if (call.name === 'wake') {
-      const was = gate.clearSleep();
-      finish({ success: true, data: { woke: was } });
+      const { woke, durable } = gate.clearSleep();
+      finish({ success: true, data: { woke, durable } });
       return;
     }
 
@@ -27875,7 +27891,7 @@ export class AgentFramework {
       return;
     }
 
-    const { until } = gate.setSleep(seconds, input.message, agentName);
+    const { until, durable } = gate.setSleep(seconds, input.message, agentName);
     const announce = input.announce !== false; // default true
     const human =
       seconds >= 3600 ? `${(seconds / 3600).toFixed(1)}h`
@@ -27919,6 +27935,8 @@ export class AgentFramework {
         until,
         untilLocal: formatZonedDateTime(until, this.timeZone),
         timeZone: this.timeZone,
+        durable,
+        ...(!durable ? { note: 'Wake is armed in this process, but its journal write failed; it may not survive a restart.' } : {}),
       },
       endTurn: true,
     });
