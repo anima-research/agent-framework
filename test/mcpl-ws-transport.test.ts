@@ -3,11 +3,12 @@ import assert from 'node:assert/strict';
 import http from 'node:http';
 import { WebSocketServer, WebSocket } from 'ws';
 import type { AddressInfo } from 'node:net';
+import type { IncomingMessage } from 'node:http';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { McplServerConnection, type McplConnectionCloseInfo } from '../src/mcpl/server-connection.js';
 import { buildWebSocketUrl, clientErrorText, isWebSocketTransport, openTransport } from '../src/mcpl/transport.js';
-import { noteDialSent } from '../src/mcpl/protocol-family.js';
+import { noteDialSent, redactServerText, serverConfigProblems } from '../src/mcpl/protocol-family.js';
 import type { McplHostCapabilities } from '../src/mcpl/types.js';
 
 const HOST_CAPS: McplHostCapabilities = { version: '0.4', pushEvents: true, featureSets: true };
@@ -16,12 +17,12 @@ const HOST_CAPS: McplHostCapabilities = { version: '0.4', pushEvents: true, feat
  * A minimal in-process MCPL server over WebSocket: answers the initialize
  * handshake, tools/list, and an `echo` tools/call. One JSON-RPC message per WS
  * frame (as McplServerConnection sends). `onSocket` lets a test grab the raw
- * socket to simulate a mid-session drop.
+ * socket to simulate a mid-session drop, and the upgrade request it came on.
  */
-function startMockMcplWsServer(onSocket?: (ws: WebSocket) => void) {
+function startMockMcplWsServer(onSocket?: (ws: WebSocket, req: IncomingMessage) => void) {
   const wss = new WebSocketServer({ port: 0, host: '127.0.0.1' });
-  wss.on('connection', (ws) => {
-    onSocket?.(ws);
+  wss.on('connection', (ws, req) => {
+    onSocket?.(ws, req);
     ws.on('message', (data) => {
       let msg: { id?: unknown; method?: string; params?: { name?: string; arguments?: Record<string, unknown> } };
       try {
@@ -89,6 +90,27 @@ test('buildWebSocketUrl validates protocol and appends the token as a query para
   // A url that doesn't parse can't be redacted, so the error doesn't echo it.
   assert.throws(() => buildWebSocketUrl({ id: 's', url: 'not a url ?token=sekret' }),
     (error: Error) => /invalid WebSocket url/.test(error.message) && !error.message.includes('sekret'));
+});
+
+test("buildWebSocketUrl appends no token with tokenTransport 'header', and 'query' is the default", () => {
+  assert.equal(
+    buildWebSocketUrl({ id: 's', url: 'wss://example.com/mcpl?v=2', token: 'sekret', tokenTransport: 'header' }),
+    'wss://example.com/mcpl?v=2',
+  );
+  // Nor a provider's token handed in for the dial.
+  assert.equal(
+    buildWebSocketUrl({ id: 's', url: 'wss://example.com/mcpl', tokenTransport: 'header' }, 'provided'),
+    'wss://example.com/mcpl',
+  );
+  assert.equal(
+    buildWebSocketUrl({ id: 's', url: 'wss://example.com/mcpl', token: 'sekret', tokenTransport: 'query' }),
+    'wss://example.com/mcpl?token=sekret',
+  );
+  // null counts as not set, as a generated JSON configuration may write it.
+  assert.equal(
+    buildWebSocketUrl({ id: 's', url: 'wss://example.com/mcpl', token: 'sekret', tokenTransport: null as unknown as 'query' }),
+    'wss://example.com/mcpl?token=sekret',
+  );
 });
 
 test('buildWebSocketUrl refuses a url with a fragment, which the ws library refuses to dial', () => {
@@ -651,5 +673,208 @@ test("under Bun, a failed dial's error leaves no credential in its message, caus
     for (const text of [result.message, result.stack, result.inspected]) {
       assert.ok(text && !SECRETS.test(text), `${result.id}: ${text}`);
     }
+  }
+});
+
+/** A mock server that records each upgrade's Authorization header and query. */
+function recordingServer() {
+  const upgrades: Array<{ authorization: string | undefined; search: string }> = [];
+  const sockets: WebSocket[] = [];
+  const wss = startMockMcplWsServer((ws, req) => {
+    sockets.push(ws);
+    upgrades.push({ authorization: req.headers.authorization, search: new URL(req.url ?? '/', 'ws://x').search });
+  });
+  return { wss, upgrades, sockets };
+}
+
+test("tokenTransport 'header' sends the token as an Authorization header on the upgrade, with no query parameter", async () => {
+  const { wss, upgrades } = recordingServer();
+  await waitListening(wss);
+  try {
+    const conn = await McplServerConnection.connect(
+      { id: 'editor', url: `${wsUrl(wss)}?v=2`, token: 'tok-sekret', tokenTransport: 'header' },
+      HOST_CAPS,
+    );
+    conn.ready();
+    assert.deepEqual(upgrades, [{ authorization: 'Bearer tok-sekret', search: '?v=2' }]);
+    const result = await conn.sendToolsCall('echo', { text: 'over a header' });
+    assert.equal((result.content as Array<{ text?: string }>)[0].text, 'over a header');
+    await conn.close();
+  } finally {
+    wss.close();
+  }
+});
+
+test("tokenTransport 'header' with no credential dials with no Authorization header and no token parameter", async () => {
+  // No static token, and a provider that has none for this dial.
+  for (const config of [{}, { accessProvider: async () => null }]) {
+    const { wss, upgrades } = recordingServer();
+    await waitListening(wss);
+    try {
+      const conn = await McplServerConnection.connect({ id: 'editor', url: wsUrl(wss), tokenTransport: 'header', ...config }, HOST_CAPS);
+      assert.deepEqual(upgrades, [{ authorization: undefined, search: '' }]);
+      await conn.close();
+    } finally {
+      wss.close();
+    }
+  }
+});
+
+test("the default, and tokenTransport 'query', send the token as ?token= and no Authorization header, as before", async () => {
+  for (const tokenTransport of [undefined, 'query'] as const) {
+    const { wss, upgrades } = recordingServer();
+    await waitListening(wss);
+    try {
+      const conn = await McplServerConnection.connect(
+        { id: 'editor', url: wsUrl(wss), token: 'tok-sekret', ...(tokenTransport ? { tokenTransport } : {}) },
+        HOST_CAPS,
+      );
+      assert.deepEqual(upgrades, [{ authorization: undefined, search: '?token=tok-sekret' }]);
+      await conn.close();
+    } finally {
+      wss.close();
+    }
+  }
+});
+
+test("tokenTransport 'header' carries an access provider's credential, fresh on each reconnect", async () => {
+  const { wss, upgrades, sockets } = recordingServer();
+  await waitListening(wss);
+  let conn: McplServerConnection | undefined;
+  try {
+    let dial = 0;
+    conn = await McplServerConnection.connect(
+      {
+        id: 'editor',
+        url: wsUrl(wss),
+        token: 'static-fallback',
+        tokenTransport: 'header',
+        reconnect: true,
+        reconnectIntervalMs: 100,
+        accessProvider: async () => `provided-${++dial}`,
+      },
+      HOST_CAPS,
+    );
+    const reconnected = new Promise<void>((resolve) => conn!.once('reconnect', () => resolve()));
+    conn.ready();
+    sockets[0].close(4001, 'token expired');
+    await withDeadline(reconnected, 5_000, "'reconnect' after a 4001 close");
+    assert.deepEqual(upgrades, [
+      { authorization: 'Bearer provided-1', search: '' },
+      { authorization: 'Bearer provided-2', search: '' },
+    ]);
+  } finally {
+    await conn?.close().catch(() => { /* already closed */ });
+    wss.close();
+  }
+});
+
+test("a header-mode provider credential stays out of a failed dial's error, and the server text recorded for it has it replaced", async () => {
+  const config = {
+    id: 'dead', url: 'ws://127.0.0.1:1/mcpl', tokenTransport: 'header' as const,
+    accessProvider: async () => 'provided-sekret-credential',
+  };
+  await assert.rejects(McplServerConnection.connect(config, HOST_CAPS), (error: Error) => {
+    assert.match(error.message, /WebSocket connect (failed|timed out).*\(ws:\/\/127\.0\.0\.1:1\/mcpl\)/);
+    assert.ok(!error.message.includes('provided-sekret'), error.message);
+    return true;
+  });
+  // The url carries no token in header mode, so the dial notes the token itself.
+  assert.ok(!redactServerText('refused Bearer provided-sekret-credential', config).includes('provided-sekret'));
+});
+
+test('before any dial, a header-mode server\'s text has its static token, and its url\'s pairs as dialed, replaced', () => {
+  // Header mode dials the url as configured, so its pairs are covered as written, not as setting a token parameter
+  // would write the query again (a space as +). The static token, which the url no longer carries, goes on its own.
+  const config = { id: 's', url: 'ws://127.0.0.1:1/mcpl?room=a%20b', token: 'static-sekret-credential', tokenTransport: 'header' as const };
+  const text = redactServerText('refused ws://127.0.0.1:1/mcpl?room=a%20b for Bearer static-sekret-credential', config);
+  assert.ok(!text.includes('room=a%20b'), text);
+  assert.ok(!text.includes('static-sekret'), text);
+});
+
+test('header mode sends a credential only if it is printable ASCII with no space at either end, and never quotes one it refuses', async () => {
+  const { wss, upgrades } = recordingServer();
+  await waitListening(wss);
+  try {
+    // Control characters (CR and LF, NUL, TAB, DEL), a space at either end, and characters past U+007E: a header
+    // can't carry any of them as configured, so each is refused before the dial.
+    const refused = [
+      'sekret-1234\r\nX-Injected: yes', 'sekret-\u00001234', 'sekret-\t1234', 'sekret-1234\u007f',
+      ' sekret-1234', 'sekret-1234 ', 'sekret-\u00e91234', 'sekret-\u263a1234',
+    ];
+    for (const credential of refused) {
+      await assert.rejects(
+        McplServerConnection.connect({ id: 'editor', url: wsUrl(wss), tokenTransport: 'header', accessProvider: async () => credential }, HOST_CAPS),
+        (error: Error) => {
+          assert.match(error.message, /its credential isn't printable ASCII with no space at either end/);
+          assert.ok(!/sekret|Injected/.test(error.message), error.message);
+          return true;
+        },
+        JSON.stringify(credential),
+      );
+    }
+    assert.deepEqual(upgrades, []);
+    // A space inside, and every ASCII punctuation character, goes byte for byte.
+    const sent = 'sekret 1234 !"#$%&\'()*+,-./:;<=>?@[\\]^_`{|}~';
+    const conn = await McplServerConnection.connect({ id: 'editor', url: wsUrl(wss), tokenTransport: 'header', accessProvider: async () => sent }, HOST_CAPS);
+    assert.deepEqual(upgrades, [{ authorization: `Bearer ${sent}`, search: '' }]);
+    await conn.close();
+  } finally {
+    wss.close();
+  }
+});
+
+test('a header-mode static token a header can\'t carry as configured is refused when the server is added, and never quoted', () => {
+  for (const token of ['static-sekret-1234\n', ' static-sekret-1234', 'static-sekret-\u00e9']) {
+    const problems = serverConfigProblems({ id: 's', url: 'wss://x/mcpl', tokenTransport: 'header', token }).join();
+    assert.match(problems, /with tokenTransport 'header', "token" must be printable ASCII \(U\+0020 to U\+007E\) with no space at either end/);
+    assert.ok(!problems.includes('sekret'), problems);
+    // In query mode the url carries it percent-encoded, as before.
+    assert.deepEqual(serverConfigProblems({ id: 's', url: 'wss://x/mcpl', tokenTransport: 'query', token }), []);
+  }
+});
+
+test("header mode refuses a url that carries a token parameter or userinfo of its own, and every dial refuses a tokenTransport that is neither mode", async () => {
+  const withToken = { id: 's', url: 'wss://x/mcpl?token=url-sekret', tokenTransport: 'header' as const };
+  const problems = serverConfigProblems(withToken).join();
+  assert.match(problems, /must not carry a "token" query parameter/);
+  assert.ok(!problems.includes('url-sekret'), problems);
+  assert.throws(() => buildWebSocketUrl(withToken), (error: Error) => /must not carry a "token" query parameter/.test(error.message) && !error.message.includes('url-sekret'));
+  // In query mode the url's own parameter goes as it always did.
+  assert.equal(buildWebSocketUrl({ ...withToken, tokenTransport: 'query' }), 'wss://x/mcpl?token=url-sekret');
+  // Nor userinfo: a request has one Authorization header, and the Bearer one replaces the userinfo's Basic credential
+  // whenever it carries a credential.
+  const withUserinfo = { id: 's', url: 'wss://user:pass-sekret@x/mcpl', tokenTransport: 'header' as const };
+  const userinfoProblems = serverConfigProblems(withUserinfo).join();
+  assert.match(userinfoProblems, /must not carry userinfo \(user:password@\), since the Bearer header replaces the userinfo's Basic credential whenever it carries a credential; leave out "tokenTransport"/);
+  assert.ok(!userinfoProblems.includes('pass-sekret'), userinfoProblems);
+  assert.throws(() => buildWebSocketUrl(withUserinfo), (error: Error) => /must not carry userinfo/.test(error.message) && !error.message.includes('pass-sekret'));
+  // Query mode sends both, as before.
+  assert.equal(buildWebSocketUrl({ ...withUserinfo, tokenTransport: 'query', token: 't' }), 'wss://user:pass-sekret@x/mcpl?token=t');
+  // Straight to the transport, past serverConfigProblems: refused before any dial (x.invalid never resolves).
+  await assert.rejects(
+    openTransport({ id: 's', url: 'wss://x.invalid/mcpl', token: 't', tokenTransport: 'Header' as 'header' }),
+    /tokenTransport must be 'query' or 'header', not another string/,
+  );
+});
+
+test("tokenTransport is refused unless it is 'query' or 'header', on a ws(s):// server, and the refusal never quotes the value", () => {
+  assert.deepEqual(serverConfigProblems({ id: 's', url: 'wss://x/mcpl', tokenTransport: 'header' }), []);
+  assert.deepEqual(serverConfigProblems({ id: 's', url: 'wss://x/mcpl', tokenTransport: 'query' }), []);
+  // The value's kind, never the value, which could be a credential pasted into the wrong field.
+  for (const [value, kind] of [['pasted-sekret', 'another string'], [{ sekret: 1 }, 'an object'], [['sekret'], 'an array'], [7, 'a number']] as const) {
+    const problems = serverConfigProblems({ id: 's', url: 'wss://x/mcpl', tokenTransport: value as unknown as 'header' }).join();
+    assert.match(problems, new RegExp(`tokenTransport must be 'query' or 'header', not ${kind}`));
+    assert.ok(!problems.includes('sekret'), problems);
+  }
+  // null counts as not set, as a generated JSON configuration may write it, on every kind of server.
+  for (const config of [{ id: 's', url: 'wss://x/mcpl' }, { id: 's', url: 'https://x/mcp' }, { id: 's', command: 'srv' }]) {
+    assert.deepEqual(serverConfigProblems({ ...config, tokenTransport: null as unknown as 'header' }), []);
+  }
+  for (const config of [{ id: 's', url: 'https://x/mcp' }, { id: 's', command: 'srv' }]) {
+    assert.match(
+      serverConfigProblems({ ...config, tokenTransport: 'header' }).join(),
+      /"tokenTransport" applies only to a ws\(s\):\/\/ server/,
+    );
   }
 });

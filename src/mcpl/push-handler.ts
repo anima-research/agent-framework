@@ -229,12 +229,15 @@ export class PushHandler {
         .filter((b): b is ContentBlock & { type: 'text' } => b.type === 'text')
         .map((b) => b.text)
         .join('\n');
+      // The host's own fields come after the server's origin, as a channel
+      // message's do, so an origin can't give the gate another server's id,
+      // feature set, event id or event type.
       const metadata: Record<string, unknown> = {
+        ...(params.origin ?? {}),
         serverId,
         featureSet: params.featureSet,
         eventId: params.eventId,
         eventType: 'mcpl:push-event',
-        ...(params.origin ?? {}),
         ...(params.tags ? { tags: params.tags } : {}),
       };
       triggerInference = this.shouldTriggerInference(textContent, metadata);

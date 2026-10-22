@@ -49,7 +49,7 @@ export interface HistorySerializeOptions {
 
 /**
  * House-safe default inline cap (chars) for tool results, error results, and
- * background-script wake payloads (issue #89: a resident should never eat a
+ * script wake payloads (issue #89: a resident should never eat a
  * 42k blob they didn't ask for). Durable per-residence value comes from
  * `FrameworkConfig.toolResultInlineMaxChars`; a per-agent value from
  * agent_settings `tool_result_inline_max_chars`.
@@ -101,7 +101,8 @@ export function nonErrorResultText(
 }
 
 /** Bounded copy of an arbitrary string with the standard truncation notice,
- *  cut at the cap as a tool result's stored copy is (toolResultCutAt), so it
+ *  cut at the cap where a tool result's stored copy is cut at that cap
+ *  (toolResultCutAt), so it
  *  never ends in part of a slot. Each of its callers' readers sees this
  *  very text, never the images behind a placeholder, so nothing past the cut
  *  is kept for save_recent_image's index (#403). The framework stores a tool

@@ -15,6 +15,8 @@ import { Membrane, OpenAIResponsesAPIAdapter, OpenAIResponsesFormatter } from '@
 import type { ContentBlock } from '@animalabs/membrane';
 import { MockMembrane, createMockResponse } from './helpers/mock-membrane.js';
 import { forkAgentName } from '../src/mcpl/conversation-router.js';
+import type { EventGate } from '../src/gate/event-gate.js';
+import { goneNames } from './helpers/gone-names.js';
 
 /** The name the router gives a channel's fork, for the `srv` server every
  *  event here comes from. */
@@ -250,9 +252,9 @@ describe('Conversation routing', () => {
   }
 
   /** The line a spawn logs for a seed that left something out. */
-  function seedLine(thinking: number, calls: number, results: number): string {
+  function seedLine(thinking: number, calls: number, results: number, notices = 0): string {
     return `[conversation] ${forkName('slack:D3', 1)}: seeded from trunk without ${thinking} thinking block(s), ` +
-      `${calls} unanswered tool call(s) and ${results} orphaned tool result(s)`;
+      `${notices} channel or by-name notice(s), ${calls} unanswered tool call(s) and ${results} orphaned tool result(s)`;
   }
 
   it('fork inherits the template context, and a seed that leaves nothing out logs nothing', async () => {
@@ -479,6 +481,92 @@ describe('Conversation routing', () => {
     await framework.stop();
   });
 
+  it("a fork's seed leaves out the trunk's channel notices and its by-name notices, whichever build stored them, and keeps the rest", async () => {
+    // A stream takes every response queued when it starts, so each fork's
+    // turn gets its response just before that fork spawns.
+    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'ok' }]));
+    const framework = await makeFramework();
+    const trunk = framework.getAgent('trunk')!.getContextManager();
+    trunk.addMessage('user', [{ type: 'text', text: 'HANDBOOK: always check the logs first.' }]);
+    // Not a system notice, so its keys mark nothing.
+    trunk.addMessage('user', [{ type: 'text', text: 'MODULE NOTE: from the ops board.' }], { speaker: 'board', kind: 'channel-notice' });
+    // A live fork, away from its home in the reply notice below.
+    framework.pushEvent(incomingEvent({ channelId: 'slack:D1', text: 'hi', channelType: 'im' }));
+    await framework.runUntilIdle();
+    const live = forkName('slack:D1', 1);
+    assert.ok(framework.getAgent(live), 'the D1 fork is live');
+    const ended = forkName('slack:D9', 1); // never registered, as an agent that has ended
+    const internals = framework as unknown as {
+      passNoticeToPrimary(speaker: string, metadata: Record<string, unknown>): void;
+      recordChannelAutoOpenNotice(agentName: string | undefined, serverId: string, channels: Array<{ channelId: string; label?: string }>, cause: string): void;
+      recordReplyOpenFailedNotice(agentName: string | undefined, serverId: string, channel: { channelId: string; label?: string }, selected?: string): void;
+    };
+    const quiet = mock.method(console, 'error', () => {});
+    try {
+      internals.passNoticeToPrimary(ended, {
+        system: true, kind: 'discord-send-failed', channelId: 'slack:D9', reason: 'rate limited', textLen: 42, outcome: 'failed',
+      });
+      internals.recordChannelAutoOpenNotice(ended, 'srv', [{ channelId: 'slack:D9', label: '@dora' }], 'opened-by-reply');
+      internals.recordReplyOpenFailedNotice(ended, 'srv', { channelId: 'slack:D8', label: '@erin' }, 'subscription-policy');
+      internals.recordReplyOpenFailedNotice(live, 'srv', { channelId: 'slack:D2', label: '@carol' }, 'subscription-policy');
+      internals.recordChannelAutoOpenNotice(undefined, 'srv', [{ channelId: 'slack:D7', label: '@frank' }], 'subscription-policy');
+      // The trunk's own open: its message into a closed channel opened it.
+      internals.recordChannelAutoOpenNotice('trunk', 'srv', [{ channelId: 'slack:C1', label: '#general' }], 'opened-by-reply');
+      // A policy admission as 0.22.3 and 0.22.4 worded and stored it.
+      trunk.addMessage('user', [{
+        type: 'text', text: "[channels] Now open: @gail (slack:D6) — your subscription policy just admitted it. What an open channel delivers to you depends on its server. If you don't want it, use channel_close — your choice sticks; neither policy nor a later send will silently reopen it.",
+      }], { system: true, kind: 'channel-notice' });
+      // The trunk's own failed reply, which onRouteFailure stores in this shape.
+      trunk.addMessage('user', [{
+        type: 'text', text: '[discord-send-failed] Your previous reply (10 chars) could not be delivered to slack:C1 (rate limited). Nothing was posted; it is saved in your archive.',
+      }], { system: true, kind: 'discord-send-failed', channelId: 'slack:C1', reason: 'rate limited', textLen: 10 });
+    } finally {
+      quiet.mock.restore();
+    }
+    const held: Array<[string, RegExp]> = [
+      ["an ended fork's failed reply", /A reply by conversation-slack-D9-g1-\w+ \(42 chars\) could not be delivered to slack:D9/],
+      ['a channel its reply opened', /Now open: @dora \(slack:D9\): a message from conversation-slack-D9-g1-\w+ into the closed channel opened it/],
+      ["a channel its reply couldn't open", /Not open: @erin \(slack:D8\)\. A reply from conversation-slack-D9-g1-\w+ went out there/],
+      ["a channel a live fork's reply couldn't open, which it can't close", /Not open: @carol \(slack:D2\)\. A reply from your fork in slack:D1, named conversation-slack-D1-g1-\w+, went out there/],
+      ['a policy admission', /Selected for opening by subscription policy: @frank \(slack:D7\)/],
+      ["the trunk's own open", /Now open: #general \(slack:C1\): your own message into the closed channel opened it/],
+      ["a policy admission in 0.22.4's words", /Now open: @gail \(slack:D6\) — your subscription policy just admitted it/],
+    ];
+    const kept = ['HANDBOOK', 'MODULE NOTE', 'Your previous reply (10 chars) could not be delivered to slack:C1', 'MY PLAN'];
+    const trunkTexts = trunk.getAllMessages().map((m) => JSON.stringify(m.content));
+    for (const [row, pattern] of held) {
+      assert.equal(trunkTexts.filter((t) => pattern.test(t)).length, 1, `the trunk holds ${row}`);
+    }
+    // A reply of the trunk's own that repeats a notice word for word loses
+    // that block, and keeps the rest.
+    const admission = trunk.getAllMessages().flatMap((m) => m.content)
+      .find((b) => b.type === 'text' && b.text.includes('Selected for opening by subscription policy: @frank')) as { text: string };
+    trunk.addMessage('trunk', [{ type: 'text', text: admission.text }, { type: 'text', text: 'MY PLAN: answer the ops board first.' }]);
+
+    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'ok' }]));
+    const { seeded, lines } = await seedOf(framework);
+    const seedTexts = seeded.map((m) => JSON.stringify(m.content));
+    for (const [row, pattern] of held) {
+      assert.ok(!seedTexts.some((t) => pattern.test(t)), `the seed leaves out ${row}`);
+    }
+    for (const text of kept) assert.ok(seedTexts.some((t) => t.includes(text)), `the seed keeps ${text}`);
+    assert.ok(seeded.every((m) => m.content.length > 0), 'no message is stored empty');
+    assert.deepEqual(lines, [seedLine(0, 0, 0, held.length + 1)], 'the line counts the notices left out, and the repeat');
+    const after = trunk.getAllMessages().map((m) => JSON.stringify(m.content));
+    for (const [row, pattern] of held) assert.ok(after.some((t) => pattern.test(t)), `the trunk keeps ${row}`);
+
+    // The ended fork's own channel spawns its next generation from the trunk too.
+    framework.getConversationRouter()!.hydrateGenerations({ 'slack:D9': 1 });
+    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'ok' }]));
+    framework.pushEvent(incomingEvent({ channelId: 'slack:D9', text: 'back again', channelType: 'im' }));
+    await framework.runUntilIdle();
+    const next = framework.getAgent(forkName('slack:D9', 2))!.getContextManager().getAllMessages()
+      .map((m) => JSON.stringify(m.content));
+    assert.ok(next.some((t) => t.includes('HANDBOOK')), "the channel's next fork is seeded from the trunk");
+    for (const [row, pattern] of held) assert.ok(!next.some((t) => pattern.test(t)), `the channel's next fork leaves out ${row}`);
+    await framework.stop();
+  });
+
   it("a fork whose namespace already holds history isn't seeded again", async () => {
     membrane.pushResponse(createMockResponse([{ type: 'text', text: 'noted' }]));
     const fw1 = await makeFramework({}, 'reseed.chronicle');
@@ -675,6 +763,68 @@ describe('Conversation routing', () => {
       assert.equal(framework.getAgent(name), null, 'and no new agent took it');
     } finally {
       await framework.stop();
+    }
+  });
+
+  // The gate's sleep is one for every agent, and its wake goes to the agent
+  // that set it: a fork's sleep ends with the fork.
+  async function makeGatedFramework(conversations: Partial<ConversationRouterConfig> = {}) {
+    return AgentFramework.create({
+      storePath: join(tempDir, 'test.chronicle'),
+      membrane: membrane.asMembrane(),
+      agents: [{ name: 'trunk', model: 'test-model', systemPrompt: 'You are the trunk.' }],
+      modules: [],
+      conversations: { templateAgent: 'trunk', ...conversations },
+      gate: { config: { policies: [], default: 'always' }, configPath: join(tempDir, 'gate.json') },
+    });
+  }
+  const gateOf = (framework: AgentFramework) => (framework as unknown as { eventGate: EventGate }).eventGate;
+
+  it("a fork's sleep ends when the idle sweep closes the fork", async () => {
+    const IDLE_TTL_MS = 60_000;
+    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'hello!' }]));
+    const framework = await makeGatedFramework({ idleTtlMs: IDLE_TTL_MS });
+    try {
+      framework.pushEvent(incomingEvent({ channelId: 'slack:D7', text: 'hi', channelType: 'im' }));
+      await framework.runUntilIdle();
+      const fork = forkName('slack:D7', 1);
+      assert.ok(framework.getAgent(fork), 'the fork exists');
+      gateOf(framework).setSleep(3600, 'resting', fork);
+      const gone = goneNames(gateOf(framework));
+
+      forceExpiry(framework, 'slack:D7', IDLE_TTL_MS);
+      membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Final report posted.' }]));
+      framework.pushEvent({ type: 'external-message', source: 'test', content: 'tick', metadata: {} } as unknown as ProcessEvent);
+      await framework.runUntilIdle();
+
+      assert.equal(framework.getAgent(fork), null, 'the fork is disposed');
+      assert.equal(gateOf(framework).getSleepState(), null, "and its sleep ends with it, so the other agents' wakes aren't held back");
+      assert.deepStrictEqual(gone, [fork], "the fork's end told the gate, which ends its self-wake too");
+    } finally {
+      // So that a run where the fork's end leaves the sleep doesn't hold the
+      // file's process for the sleep's hour.
+      gateOf(framework).clearSleep();
+      await framework.stop();
+    }
+  });
+
+  it("a fork's sleep ends when stop() ends the fork", async () => {
+    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'hello!' }]));
+    const framework = await makeGatedFramework();
+    framework.pushEvent(incomingEvent({ channelId: 'slack:D8', text: 'hi', channelType: 'im' }));
+    await framework.runUntilIdle();
+    const fork = forkName('slack:D8', 1);
+    assert.ok(framework.getAgent(fork), 'the fork exists');
+    const gate = gateOf(framework);
+    const gone = goneNames(gate);
+    try {
+      gate.setSleep(3600, 'resting', fork);
+      await framework.stop();
+      assert.equal(framework.getAgent(fork), null, 'stop() ends the fork');
+      assert.equal(gate.inferenceDiagnostics().sleepUntil, 0, 'and its sleep with it');
+      assert.deepStrictEqual(gone, [fork], "the fork's end told the gate, which ends its self-wake too");
+    } finally {
+      gate.clearSleep();
     }
   });
 

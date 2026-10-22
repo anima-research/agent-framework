@@ -30,6 +30,7 @@ interface TraceEntry {
 function makeGate(configPath: string, opts?: {
   initialConfig?: GateConfig;
   resolveRouteChannel?: (info: GateEventInfo) => string | undefined;
+  privilegedUsersPath?: string;
 }) {
   const traces: TraceEntry[] = [];
   const messages: Array<{ participant: string; content: unknown; metadata?: unknown }> = [];
@@ -39,6 +40,7 @@ function makeGate(configPath: string, opts?: {
     configPath,
     initialConfig: opts?.initialConfig,
     ...(opts?.resolveRouteChannel ? { resolveRouteChannel: opts.resolveRouteChannel } : {}),
+    ...(opts?.privilegedUsersPath ? { privilegedUsersPath: opts.privilegedUsersPath } : {}),
     emitTrace: (e) => traces.push(e as TraceEntry),
     addMessage: (p, c, m) => { messages.push({ participant: p, content: c, metadata: m }); return ''; },
     requestInference: (a, r, s, p) => inferenceRequests.push({ agentName: a, reason: r, source: s, ...(p ?? {}) }),
@@ -1131,5 +1133,28 @@ describe('quiesce suppression', () => {
     await new Promise(r => setTimeout(r, 20));
     assert.strictEqual(messages.length, 0, 'buffer holds until resume, not turn end');
     assert.strictEqual(gate.inferenceDiagnostics().bufferedEvents, 1);
+  });
+});
+
+describe('sleep', () => {
+  // While asleep, only the agent's own heartbeat and a privileged author
+  // rouse it. The heartbeat is the server the host knows as `heartbeat`: a
+  // `source` in the metadata is what the server says, and any server says it.
+  it('lets through only the server the host names heartbeat, and a privileged author', () => {
+    const privileged = tmpPath('privileged.json');
+    writeFileSync(privileged, JSON.stringify({ userIds: ['P1'] }));
+    const path = writeConfig('sleep.json', { policies: [], default: 'always' });
+    const { gate } = makeGate(path, { privilegedUsersPath: privileged });
+    gate.setSleep(3600, 'resting', 'agent');
+    try {
+      const roused = (info: Partial<GateEventInfo>) => gate.evaluate(event(info)).trigger;
+      assert.strictEqual(roused({ serverId: 'discord', metadata: {} }), false, 'an ordinary event');
+      assert.strictEqual(roused({ serverId: 'discord', metadata: { source: 'heartbeat' } }), false, "another server saying it's the heartbeat");
+      assert.strictEqual(roused({ serverId: 'heartbeat', metadata: { source: 'heartbeat' } }), true, 'the heartbeat');
+      assert.strictEqual(roused({ serverId: 'heartbeat', metadata: { source: 'reminder' } }), true, "the heartbeat server's reminder");
+      assert.strictEqual(roused({ serverId: 'discord', metadata: { author: { id: 'P1' } } }), true, 'a privileged author');
+    } finally {
+      gate.clearSleep();
+    }
   });
 });

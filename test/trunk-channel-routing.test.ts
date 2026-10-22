@@ -456,6 +456,7 @@ describe('Trunk channel routing (item-3 redux)', () => {
     const notice = internals(framework) as unknown as {
       recordChannelAutoOpenNotice(
         agentName: string | undefined,
+        serverId: string,
         channels: Array<{ channelId: string; label?: string }>,
         cause: 'subscription-policy' | 'opened-by-delivery' | 'opened-by-reply',
       ): void;
@@ -468,19 +469,19 @@ describe('Trunk channel routing (item-3 redux)', () => {
 
     // Each form an agent can read: a delivery or a send opens one channel, and
     // only the subscription policy opens several at once.
-    notice.recordChannelAutoOpenNotice('scout', [{ channelId: 'slack:C1', label: '#general (acme)' }], 'opened-by-delivery');
+    notice.recordChannelAutoOpenNotice('scout', 'slack', [{ channelId: 'slack:C1', label: '#general (acme)' }], 'opened-by-delivery');
     const one = lastText();
     assert.match(
       one,
-      /Now open: #general \(acme\) \(slack:C1\): your own message into the closed channel opened it\. What an open channel delivers to you depends on its server\. If you don't want it, use channel_close/,
+      /Now open: #general \(acme\) \(slack:C1\): your own message into the closed channel opened it\. What an open channel brings you is up to its server: some send every message in it, and others only what addresses you unless you're subscribed to it; their own tools can change that\. If you don't want it, use channel_close: neither the subscription policy nor its server's own default opens it again\./,
     );
     assert.doesNotMatch(one, /will reach you/);
 
-    notice.recordChannelAutoOpenNotice('scout', [{ channelId: 'slack:C1' }, { channelId: 'slack:C2' }], 'subscription-policy');
+    notice.recordChannelAutoOpenNotice('scout', 'slack', [{ channelId: 'slack:C1' }, { channelId: 'slack:C2' }], 'subscription-policy');
     const two = lastText();
     assert.match(
       two,
-      /Selected for opening by subscription policy: slack:C1, slack:C2\. This records the admission decision; channel_list shows current transport state\. What an open channel delivers to you depends on its server\. If you don't want one of them, use channel_close/,
+      /Selected for opening by subscription policy: slack:C1, slack:C2\. The host opens them, and if one doesn't open, tries again when its server next registers it; channel_list shows whether each is open yet\. What an open channel brings you is up to its server: some send every message in it, and others only what addresses you unless you're subscribed to it; their own tools can change that\. If you don't want one of them, use channel_close: neither the subscription policy nor its server's own default opens it again\./,
     );
     assert.doesNotMatch(two, /will reach you/);
     await framework.stop();

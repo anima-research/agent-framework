@@ -23,7 +23,7 @@ import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import { SdkError, SdkErrorCode, SdkHttpError, UnsupportedProtocolVersionError } from '@modelcontextprotocol/client';
+import { Client, SdkError, SdkErrorCode, SdkHttpError, UnsupportedProtocolVersionError } from '@modelcontextprotocol/client';
 import { ModernMcpConnection } from '../src/mcpl/modern-connection.js';
 import { StdioTransport } from '../src/mcpl/transport.js';
 import { McplProtocolVersionError, McplRequestError } from '../src/mcpl/server-connection.js';
@@ -390,6 +390,115 @@ test('with reconnect, a child that exits during the connect-time subscribe is a 
 });
 
 /**
+ * The first launch from here on, as the transport its spawn yields: whether
+ * its pipe has failed, and when it reports its child unreaped. With `stuck`,
+ * no signal reaches the child, so it outlives SIGTERM and SIGKILL, and
+ * cleanup really ends it.
+ */
+function firstLaunch(stuck: boolean): { readonly pid: number; pipeFailed: () => Promise<void>; unreaped: Promise<void> } {
+  const realSpawn = StdioTransport.spawn;
+  let first: StdioTransport | null = null;
+  let markUnreaped!: () => void;
+  const unreaped = new Promise<void>((resolve) => { markUnreaped = resolve; });
+  (StdioTransport as unknown as { spawn: typeof StdioTransport.spawn }).spawn = async (config) => {
+    const transport = await realSpawn.call(StdioTransport, config);
+    if (first) return transport;
+    first = transport;
+    transport.once('unreaped', () => markUnreaped());
+    if (stuck) {
+      const child = (transport as unknown as { child: { pid: number; kill: (signal?: string) => boolean } }).child;
+      const realKill = child.kill.bind(child);
+      child.kill = () => true; // signals never arrive: the child outlives both bounds
+      cleanups.push(async () => {
+        realKill('SIGKILL');
+        await until(() => !alive(child.pid), 'the stuck child killed');
+      });
+    }
+    return transport;
+  };
+  cleanups.push(() => { (StdioTransport as unknown as { spawn: typeof StdioTransport.spawn }).spawn = realSpawn; });
+  return {
+    get pid() {
+      assert.ok(first, 'a launch');
+      return (first as unknown as { child: { pid: number } }).child.pid;
+    },
+    pipeFailed: () => until(() => first?.pipeFailure !== undefined, "the launch's pipe to fail"),
+    unreaped,
+  };
+}
+
+/**
+ * The connect-time list-change subscribe, failed once `when` settles, as a
+ * subscribe whose acknowledgement never comes fails at its timeout: the SDK
+ * reports it and resolves the connect anyway. It's still written; only its
+ * end moves, to the event a test is about.
+ */
+function failSubscribeWhen(when: Promise<unknown>): void {
+  const real = Client.prototype.listen;
+  Client.prototype.listen = function (this: Client, ...args: Parameters<Client['listen']>) {
+    const listening = real.apply(this, args);
+    listening.catch(() => { /* it ends later, at its own timeout or the client's close */ });
+    return Promise.race([listening, when.then(() => { throw new Error('no acknowledgement came'); })]);
+  };
+  cleanups.push(() => { Client.prototype.listen = real; });
+}
+
+test("a connect whose stdio pipe failed, and whose child was found unreaped before the connect resolved, fails holding the launch, rather than reading as connected", async () => {
+  const log = scratchLog();
+  const launch = firstLaunch(true);
+  // The subscribe went to a child that had closed its stdin, so it's never
+  // acknowledged. It ends once the transport has found the child unreaped,
+  // when there was no session yet to lose.
+  failSubscribeWhen(launch.unreaped);
+  const connection = ModernMcpConnection.create({ id: 'raw', command: process.execPath, args: [SERVER, 'deaf-at-discover', log], protocol: 'modern' });
+  cleanups.push(() => connection.close());
+  const errors: string[] = [];
+  connection.on('error', (error: Error) => errors.push(error.message));
+  const closes: unknown[] = [];
+  connection.on('close', (info: unknown) => closes.push(info));
+  await assert.rejects(connection.start(), /^Error: MCP server "raw" stdio pipe failed with write EPIPE while connecting$/);
+  assert.equal(connection.isConnected, false);
+  assert.equal(connection.holdsUnreapedChild, true);
+  // The hold is reported once, by the connect's own cleanup.
+  const held = errors.filter((m) => /Not starting another launch while it may still be running/.test(m));
+  assert.equal(held.length, 1, errors.join('\n'));
+  assert.match(held[0]!, /^MCP server "raw": stdio child \d+ of MCP server "raw" did not exit within 2000ms of SIGKILL; it could not be reaped\. /);
+  assert.deepEqual(closes, [], 'it never connected, so nothing closed');
+  assert.equal(wire(log).filter((e) => e.event === 'start').length, 1, 'one launch');
+  // close() retries the reap: refused while the child runs, then done.
+  await assert.rejects(connection.close(), /could not be reaped/);
+  process.kill(launch.pid, 'SIGKILL');
+  await until(() => !alive(launch.pid), 'the child to be killed');
+  await connection.close();
+  assert.equal(connection.holdsUnreapedChild, false);
+});
+
+test("a connect whose stdio pipe failed fails even when it resolves while its child is still running and unreported: the check reads the pipe", async () => {
+  const log = scratchLog();
+  const launch = firstLaunch(false);
+  // The subscribe ends as soon as the pipe has failed. The child ignores
+  // SIGTERM, so it runs until SIGKILL, 2 s on, and nothing has reported it.
+  let runningAtEnd: boolean | undefined;
+  failSubscribeWhen(launch.pipeFailed().then(() => { runningAtEnd = alive(launch.pid); }));
+  const connection = ModernMcpConnection.create({ id: 'raw', command: process.execPath, args: [SERVER, 'deaf-at-discover,ignore-sigterm', log], protocol: 'modern' });
+  cleanups.push(() => connection.close());
+  connection.on('error', () => { /* the subscribe's failure, reported by the SDK */ });
+  await assert.rejects(connection.start(), /^Error: MCP server "raw" stdio pipe failed with write EPIPE while connecting$/);
+  assert.equal(runningAtEnd, true, 'the child was still running when the subscribe ended');
+  assert.equal(connection.isConnected, false);
+  assert.equal(connection.holdsUnreapedChild, false);
+  assert.equal(alive(launch.pid), false, "gone once the connect failed: the connect's close reaped it");
+});
+
+test("a connect whose stdio pipe failed reads that way when the failure has already ended the child", async () => {
+  const log = scratchLog();
+  // The subscribe meets EPIPE, the transport ends the child with SIGTERM,
+  // and the close ends the subscribe.
+  await assert.rejects(connect('deaf-at-discover', log), /^Error: MCP server "raw" stdio pipe failed with write EPIPE while connecting$/);
+  assert.equal(wire(log).filter((e) => e.event === 'start').length, 1, 'one launch');
+});
+
+/**
  * The stdio line under a connection's live session, reached from inside, to
  * stand for a loss read from a failed pipe while the child still runs: the
  * transport closes before the child has exited (R1-1).
@@ -659,15 +768,40 @@ test('a connection lost between continuation rounds is no-response, not an answe
   const log = scratchLog();
   const connection = await connect('', log);
   await connection.listTools();
-  await assert.rejects(connection.callTool('cont', { leg1: 'exit', leg2: 'ok' }), (err: unknown) => {
-    assert.ok(err instanceof McplRequestError, String(err));
-    assert.equal(err.outcome, 'no-response');
-    assert.equal(err.message, 'The "raw" server didn\'t finish the request: it asked for more from this host, and the call ended ' +
-      'before this host sent it, so whether the request took effect is unknown. Check its effect before trying again.');
-    return true;
-  });
-  loggedLine(logged, /^MCP server "raw" did not finish tools\/call cont: it asked for another round \(input_required\), and the call ended before that round was sent: "Not connected\."$/);
-  assert.equal(calls(log, 'cont'), 1);
+  // The server stops reading before it answers leg 1, and exits once that
+  // answer is written, so leg 2 can't reach it. What this host meets first
+  // decides what it can say, and each account is the true one for what it
+  // saw:
+  // - leg 1's answer, then the exit before the SDK's pacing (250 ms) lets
+  //   leg 2 go: the call ended before this host sent leg 2;
+  // - the exit before it reads leg 1's answer (the transport closes on the
+  //   child's exit), or its own write of leg 2 into the closed pipe, if
+  //   this process is held up for the pacing between reading the answer
+  //   and the exit: to it, the connection closed before the server
+  //   answered.
+  const accounts = [
+    {
+      message: 'The "raw" server didn\'t finish the request: it asked for more from this host, and the call ended ' +
+        'before this host sent it, so whether the request took effect is unknown. Check its effect before trying again.',
+      line: /^MCP server "raw" did not finish tools\/call cont: it asked for another round \(input_required\), and the call ended before that round was sent: "Not connected\."$/,
+    },
+    {
+      message: 'The connection to the "raw" server closed before it answered, so whether the request took effect is unknown. ' +
+        'This host won\'t reconnect to it on its own. If you need it, ask whoever runs this host.',
+      line: /^MCP server "raw" tools\/call cont failed: "Connection closed"$/,
+    },
+  ];
+  const failure = await connection.callTool('cont', { leg1: 'exit', leg2: 'ok' }).then(() => null, (err: unknown) => err);
+  assert.ok(failure instanceof McplRequestError, String(failure));
+  assert.equal(failure.outcome, 'no-response');
+  const account = accounts.find((a) => a.message === failure.message);
+  assert.ok(account, `one of the two accounts, not: ${failure.message}`);
+  // The line carries the SDK's reason, which records how the call ended, so
+  // it pins the account to the order: a host that gave the generic close
+  // after reading leg 1's answer would log that with "Not connected", the
+  // reason, and fail here.
+  loggedLine(logged, account.line);
+  assert.equal(calls(log, 'cont'), 1, 'only leg 1 reached the server');
 });
 
 test('a continuation this client cannot go on with is no-response: the server may have acted', async () => {

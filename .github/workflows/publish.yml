@@ -27,7 +27,7 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
         with:
-          node-version: 20
+          node-version: '22.12.0'
 
       # The same check `npm version` runs first (see CONTRIBUTING.md): an
       # open issue labelled release-hold stops the release. Both jobs that
@@ -64,11 +64,18 @@ jobs:
   # 6 hours: above the check's own limits (10 minutes each for npm pack and
   # npm install, a minute for each load), so the check names what hung.
   pack-check:
-    name: Packed release installs on its own
+    name: Packed release installs on its own (node ${{ matrix.node }})
     runs-on: ubuntu-latest
     timeout-minutes: 40
     permissions:
       contents: read
+    # The engines floor and current LTS: the check's load hook goes in through
+    # register below Node 22.15 and through registerHooks from there, so each
+    # branch a host takes runs before a release.
+    strategy:
+      fail-fast: false
+      matrix:
+        node: ['22.12.0', 24]
 
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
@@ -78,7 +85,7 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
         with:
-          node-version: 24
+          node-version: ${{ matrix.node }}
 
       # As publish installs, so a build that came to need a dependency's
       # install script fails here rather than in publish.

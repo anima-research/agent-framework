@@ -11,7 +11,8 @@
 // of a workspace entry it equals in simple case folding, on a disk that folds
 // case. Neither applies where disk's spelling puts the path in a nested
 // mount's directory. Four run only where the disk tells case apart, and those
-// about starting and stopping run anywhere.
+// about starting and stopping, and the one about an absolute path, run
+// anywhere.
 import test, { type TestContext } from 'node:test';
 import assert from 'node:assert/strict';
 import fs, { existsSync, linkSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
@@ -20,7 +21,7 @@ import { tmpdir } from 'node:os';
 import { basename, join } from 'node:path';
 import { JsStore } from '@animalabs/chronicle';
 import { WorkspaceModule, WorkspaceReadError } from '../src/modules/workspace/index.js';
-import { diskSpelling, foldsCase } from '../src/modules/workspace/observe.js';
+import { beginsWithDir, diskSpelling, foldsCase } from '../src/modules/workspace/observe.js';
 import type { MountConfig } from '../src/modules/workspace/types.js';
 import type { ModuleContext } from '../src/types/module.js';
 import type { ProcessEvent, ToolResult } from '../src/types/events.js';
@@ -57,6 +58,8 @@ const FINAL_SIGMA_FOLDING_ONLY = folds.finalSigma ? false
   : 'the temp directory keeps \u03c2 apart from \u03c3, so \u039f\u0394\u039f\u03a3 reaches nothing where disk has \u03bf\u03b4\u03bf\u03c2';
 const CASE_SENSITIVE_ONLY = folds.case
   ? 'the temp directory folds case, so two names that differ only in case are one name here' : false;
+const CASE_NOT_SHARP_S_ONLY = folds.case && !folds.sharpS ? false
+  : 'these need a temp directory that folds case and keeps \u00df apart from ss';
 
 /** A mount whose writes stay drafts until they're materialized, as by default. */
 const drafts = (dir: string): MountConfig[] => [{ name: 'work', path: dir, mode: 'read-write', watch: 'never' }];
@@ -305,16 +308,196 @@ test('the step reads no further than a symlink or a `..` at the root, goes back 
   assert.equal(await diskSpelling(root, '/REAL/SUB'), '/REAL/SUB', 'an absolute path is not walked from the mount\'s root');
 });
 
-test('a path whose part after the mount\'s name is absolute keeps its spelling, so a disk reader reads the file it names', { skip: FOLDING_ONLY }, async (t) => {
+test('a path whose part after the mount\'s name is absolute is refused before the step reads it', async (t) => {
   const { workspace, dir } = await setup(t);
   // The mount holds a directory spelled as the first segment of its own
-  // absolute path in another case, so walking that path from the mount's
-  // root would respell it and lead to a place outside the mount.
+  // absolute path in another case, so on a disk that folds case, walking
+  // that path from the mount's root would respell it and lead to a place
+  // outside the mount. The path's reader refuses a separator right after the
+  // mount's name before the step sees the path, on any disk.
   const first = dir.split('/')[1]!;
   mkdirSync(join(dir, first === first.toUpperCase() ? first.toLowerCase() : first.toUpperCase()));
   const fromDisk = await workspace.readBinaryFromDisk(`work/${join(dir, 'src', 'a.ts')}`);
-  assert.ok('absolutePath' in fromDisk, JSON.stringify(fromDisk));
-  assert.equal(fromDisk.absolutePath, join(dir, 'src', 'a.ts'));
+  assert.ok('error' in fromDisk, JSON.stringify(fromDisk));
+  assert.match(fromDisk.error, /has a separator right after mount "work", which makes it an absolute path/);
+});
+
+// A mount's include decides what a tool may name, and disk's spelling of a
+// name is something about the file: a refusal that showed it would tell
+// whether a file is there.
+test('a name a mount\'s include doesn\'t cover is refused as given, whether disk has it in another spelling or not', { skip: FOLDING_ONLY }, async (t) => {
+  const { workspace, dir } = await setup(t, (d) => [
+    { name: 'work', path: d, mode: 'read-write', watch: 'never', include: ['*.ts'] },
+  ]);
+  writeFileSync(join(dir, 'secret.txt'), 'secret\n');
+  for (const name of ['SECRET.TXT', 'NOPE.TXT']) {
+    const path = `work/${name}`;
+    const refusal = `"${path}" is outside the mount's include: mount "work" holds only *.ts. The host's operator sets the include in the mount's configuration, so calling again with this path changes nothing.`;
+    for (const tool of ['read', 'write', 'ls', 'glob', 'grep', 'sync', 'materialize']) {
+      const input = tool === 'glob' || tool === 'grep' ? { path, pattern: 's' } : tool === 'write' ? { path, content: 'x' } : { path };
+      const result = await workspace.handleToolCall({ id: tool, name: tool, input } as Parameters<WorkspaceModule['handleToolCall']>[0]);
+      assert.equal(result.error, refusal, `${tool} ${path}`);
+    }
+    await assert.rejects(workspace.readFileFromDisk(path),
+      (err: unknown) => err instanceof WorkspaceReadError && err.code === 'outside_include' && err.message === refusal);
+  }
+  assert.equal(readFileSync(join(dir, 'secret.txt'), 'utf8'), 'secret\n');
+});
+
+test("through a link a mount follows, the include judges where the path lands as disk spells it, whatever spelling the link's target gives", { skip: FOLDING_ONLY }, async (t) => {
+  const { workspace, dir, call } = await setup(t, (d) => [
+    { name: 'work', path: d, mode: 'read-write', watch: 'never', followSymlinks: true, include: ['*.json', 'via/**', 'ELSE/**'] },
+  ]);
+  // Disk spells the first file outside the include, and the link's target spells it inside it.
+  writeFileSync(join(dir, 'Y.JSON'), 'outside the include as disk spells it\n');
+  symlinkSync('y.json', join(dir, 'x.json'));
+  // And the other way round: a covered file the link's target spells otherwise reads through.
+  writeFileSync(join(dir, 'k.json'), '{"covered": 1}\n');
+  symlinkSync('K.JSON', join(dir, 'w.json'));
+  // A listing from where a link leads judges each file there as disk spells its directory, too.
+  mkdirSync(join(dir, 'else', 'sub'), { recursive: true });
+  writeFileSync(join(dir, 'else', 'sub', 'y.txt'), 'outside the include as disk spells it\n');
+  symlinkSync('ELSE', join(dir, 'via'));
+  const read = await workspace.handleToolCall({ id: 'read', name: 'read', input: { path: 'work/x.json' } } as Parameters<WorkspaceModule['handleToolCall']>[0]);
+  assert.equal(read.success, false);
+  assert.ok(String(read.error).endsWith('Symlink escape detected: work/x.json'), String(read.error));
+  await assert.rejects(workspace.readFileFromDisk('work/x.json'), (err: unknown) => err instanceof WorkspaceReadError && err.code === 'escape');
+  await call('sync', {});
+  assert.equal((((await call('grep', { path: 'work', pattern: 'outside the include' })).data) as { totalMatches: number }).totalMatches, 0);
+  assert.match(JSON.stringify((await call('read', { path: 'work/w.json' })).data), /covered/);
+  const listing = JSON.stringify((await call('ls', { path: 'work/via/sub' })).data);
+  assert.ok(!listing.includes('y.txt'), listing);
+});
+
+test("a covered name whose file disk spells otherwise is outside the include, judged as disk spells it", { skip: FOLDING_ONLY }, async (t) => {
+  const { workspace, dir } = await setup(t, (d) => [
+    { name: 'work', path: d, mode: 'read-write', watch: 'never', include: ['gate.json'] },
+  ]);
+  writeFileSync(join(dir, 'GATE.JSON'), '{}\n');
+  const read = await workspace.handleToolCall({ id: 'read', name: 'read', input: { path: 'work/gate.json' } } as Parameters<WorkspaceModule['handleToolCall']>[0]);
+  assert.equal(read.success, false);
+  assert.match(String(read.error), /"work\/gate\.json" is outside the mount's include/);
+});
+
+test("a segment on a path's way that isn't a directory and that the include doesn't cover is named as disk spells it, as every answer but the include's own refusal names a path", { skip: FOLDING_ONLY }, async (t) => {
+  const { workspace, dir } = await setup(t, (d) => [
+    { name: 'work', path: d, mode: 'read-write', watch: 'never', include: ['*.json'] },
+  ]);
+  writeFileSync(join(dir, 'secret.txt'), 'outside the include\n');
+  mkdirSync(join(dir, 'real'));
+  writeFileSync(join(dir, 'real', 'a.json'), '{}\n');
+  symlinkSync('real', join(dir, 'link'));
+  for (const [path, given, disk, segment] of [['work/SECRET.TXT/a.json', 'SECRET.TXT', 'secret.txt', 'secret.txt'], ['work/LINK/a.json', 'LINK', '"work/link"', 'link']] as const) {
+    // Nothing beneath it is served, and the refusal names the segment in the one spelling, disk's, and never
+    // as the caller spelled it.
+    const read = await workspace.handleToolCall({ id: 'read', name: 'read', input: { path } } as Parameters<WorkspaceModule['handleToolCall']>[0]);
+    assert.equal(read.success, false, path);
+    assert.ok(String(read.error).includes(disk) && !String(read.error).includes(given), `${path}: ${read.error}`);
+    let message = '';
+    await assert.rejects(workspace.readFileFromDisk(path), (err: unknown) => { message = String((err as Error).message); return err instanceof WorkspaceReadError; });
+    assert.ok(message.includes(disk) && !message.includes(given), `${path}: ${message}`);
+    const deleted = await workspace.handleToolCall({ id: 'delete', name: 'delete', input: { path } } as Parameters<WorkspaceModule['handleToolCall']>[0]);
+    assert.equal(deleted.success, false, path);
+    assert.ok(String(deleted.error).includes(disk) && !String(deleted.error).includes(given), `${path}: ${deleted.error}`);
+    // What a sync of the path says it skipped names it the same way.
+    const synced = JSON.stringify(await workspace.handleToolCall({ id: 'sync', name: 'sync', input: { path } } as Parameters<WorkspaceModule['handleToolCall']>[0]));
+    assert.ok(!synced.includes(given), `${path}: ${synced}`);
+    // Beneath a link the mount doesn't follow, the sync names what it skipped in disk's spelling; beneath a
+    // file, there's nothing to take in or skip.
+    if (segment === 'link') assert.ok(synced.includes('link/a.json'), `the sync names what it skipped in disk's spelling: ${synced}`);
+    else assert.ok(synced.includes('"totalSynced":0') && !synced.includes('skipped'), `nothing beneath a file: ${synced}`);
+  }
+  // The include's own refusal answers the path asked about, as given.
+  const outside = await workspace.handleToolCall({ id: 'read', name: 'read', input: { path: 'work/SECRET.TXT' } } as Parameters<WorkspaceModule['handleToolCall']>[0]);
+  assert.equal(outside.success, false);
+  assert.match(String(outside.error), /"work\/SECRET\.TXT" is outside the mount's include/);
+});
+
+test("a path is judged as disk spells it, and the include's own refusal shows it as given", { skip: FOLDING_ONLY }, async (t) => {
+  const { workspace, dir } = await setup(t, (d) => [
+    { name: 'work', path: d, mode: 'read-write', watch: 'never', followSymlinks: true, include: ['LINK/**', 'real/**'] },
+  ]);
+  mkdirSync(join(dir, 'real'));
+  writeFileSync(join(dir, 'real', 'a.txt'), 'covered where it lands\n');
+  symlinkSync('real', join(dir, 'link'));
+  // Disk spells the path `link/a.txt`, which `LINK/**` doesn't cover.
+  const read = await workspace.handleToolCall({ id: 'read', name: 'read', input: { path: 'work/LINK/a.txt' } } as Parameters<WorkspaceModule['handleToolCall']>[0]);
+  assert.equal(read.success, false);
+  assert.match(String(read.error), /"work\/LINK\/a\.txt" is outside the mount's include/);
+});
+
+test("a link's target is judged and named as disk spells it, on a mount that doesn't follow links", { skip: FOLDING_ONLY }, async (t) => {
+  const { workspace, dir } = await setup(t, (d) => [
+    { name: 'work', path: d, mode: 'read-write', watch: 'never', include: ['*.json'] },
+  ]);
+  // The link's target spells a file inside the include that disk spells outside it, and the other way round.
+  writeFileSync(join(dir, 'Y.JSON'), 'outside the include as disk spells it\n');
+  symlinkSync('y.json', join(dir, 'l.json'));
+  writeFileSync(join(dir, 'k.json'), '{}\n');
+  symlinkSync('K.JSON', join(dir, 'w.json'));
+  const said = async (path: string): Promise<string> => {
+    let message = '';
+    await assert.rejects(workspace.readFileFromDisk(path), (err: unknown) => { message = String((err as Error).message); return err instanceof WorkspaceReadError; });
+    return message;
+  };
+  // A link on a path's way is described by where it leads; one at the path itself is refused as a link.
+  const uncovered = await said('work/l.json/a.json');
+  assert.ok(!/y\.json/i.test(uncovered), uncovered);
+  assert.match(await said('work/w.json/a.json'), /"work\/w\.json" is a symlink to "work\/k\.json"/);
+});
+
+test("a key no spelling names, as an earlier version stored, spells no path a write takes", { skip: FOLDING_ONLY }, async (t) => {
+  const { workspace, dir, call } = await setup(t);
+  // What an earlier version stored for `work/Docs/`, a key with a trailing separator.
+  const store = (workspace as unknown as { getStore(): JsStore }).getStore();
+  const bytes = Buffer.from('stale\n');
+  store.treeSet('workspace/work/tree', 'Docs/', { blobHash: store.storeBlob(bytes, 'text/plain'), size: bytes.length, mode: 0o644 });
+  await call('write', { path: 'work/docs/new.txt', content: 'new\n' });
+  assert.deepEqual(readdirSync(dir).sort(), ['docs', 'src'], 'the directory takes the caller\'s spelling, not the stale key\'s');
+});
+
+test("past the innermost nested mount's directory a path stays as given, with two levels nested", { skip: FOLDING_ONLY }, async (t) => {
+  const { workspace } = await setup(t, (d) => {
+    mkdirSync(join(d, 'a', 'b'), { recursive: true });
+    // Disk has the file, so taken as disk spells it the tail would be `x.txt`.
+    writeFileSync(join(d, 'a', 'b', 'x.txt'), 'the inner mount\'s\n');
+    return [
+      { name: 'work', path: d, mode: 'read-write', watch: 'never' },
+      { name: 'inner1', path: join(d, 'a'), mode: 'read-write', watch: 'never' },
+      { name: 'inner2', path: join(d, 'a', 'b'), mode: 'read-write', watch: 'never' },
+    ];
+  });
+  const read = await workspace.handleToolCall({ id: 'read', name: 'read', input: { path: 'work/a/B/X.txt' } } as Parameters<WorkspaceModule['handleToolCall']>[0]);
+  assert.equal(read.success, false);
+  assert.match(String(read.error), /use "inner2\/X\.txt"/);
+});
+
+// Past a nested mount's directory a path is that mount's, and its own include
+// decides what a tool may name there, so the outer mount's answers show the
+// rest of the path as given. The directory itself takes disk's spelling, as a
+// listing names it.
+test('past a nested mount\'s directory, an answer shows the path as given', { skip: FOLDING_ONLY }, async (t) => {
+  const { workspace } = await setup(t, (d) => {
+    mkdirSync(join(d, 'inner'), { recursive: true });
+    writeFileSync(join(d, 'inner', 'hidden.txt'), 'hidden\n');
+    return [
+      { name: 'outer', path: d, mode: 'read-write', watch: 'never' },
+      { name: 'inner', path: join(d, 'inner'), mode: 'read-write', watch: 'never', include: ['*.json'] },
+    ];
+  });
+  for (const name of ['HIDDEN.TXT', 'NOPE.TXT']) {
+    const path = `outer/INNER/${name}`;
+    const read = await workspace.handleToolCall({ id: 'r', name: 'read', input: { path } } as Parameters<WorkspaceModule['handleToolCall']>[0]);
+    assert.equal(read.error, `"outer/inner/${name}" lies in mount "inner", nested in mount "outer", which neither reads nor writes it: use "inner/${name}".`);
+    await assert.rejects(workspace.readFileFromDisk(path),
+      (err: unknown) => err instanceof WorkspaceReadError && err.code === 'other_mount' && err.message === read.error);
+    for (const tool of ['ls', 'glob', 'grep', 'sync', 'materialize']) {
+      const input = tool === 'glob' || tool === 'grep' ? { path, pattern: 'h' } : { path };
+      const answer = JSON.stringify(await workspace.handleToolCall({ id: tool, name: tool, input } as Parameters<WorkspaceModule['handleToolCall']>[0]));
+      assert.ok(answer.includes(`inner/${name}`), `${tool} ${path}: ${answer}`);
+      assert.ok(!answer.includes('hidden.txt'), `${tool} ${path} shows disk's spelling: ${answer}`);
+    }
+  }
 });
 
 test('a link into a nested mount\'s directory configured in another spelling than disk\'s is refused as that mount\'s', { skip: FOLDING_ONLY }, async (t) => {
@@ -341,7 +524,51 @@ test('a link into a nested mount\'s directory configured in another spelling tha
   });
 });
 
-test('on a disk that tells case apart, a directory spelled otherwise than a nested mount\'s is the outer mount\'s own',
+test('resolveAbsolutePath takes a nested mount\'s directory in any spelling disk folds to it as that mount\'s', { skip: FOLDING_ONLY }, async (t) => {
+  const { workspace } = await setup(t, (d) => {
+    mkdirSync(join(d, 'inner'), { recursive: true });
+    writeFileSync(join(d, 'inner', 'x.txt'), 'inner\n');
+    return [
+      { name: 'outer', path: d, mode: 'read-write', watch: 'never' },
+      { name: 'inner', path: join(d, 'inner'), mode: 'read-write', watch: 'never', include: ['a.json'] },
+    ];
+  });
+  // Configured and listed as `inner`, so the last three spell it neither way.
+  for (const path of ['outer/inner/x.txt', 'outer/INNER/x.txt', 'outer/Inner/x.txt', 'outer/INNER']) {
+    assert.equal(workspace.resolveAbsolutePath(path), null, path);
+  }
+  assert.notEqual(workspace.resolveAbsolutePath('outer/src/a.ts'), null, "the outer mount's own file");
+});
+
+test('resolveAbsolutePath takes a nested mount\'s directory where the real roots place it as that mount\'s in any spelling disk folds to it, as it does the configured one', { skip: FOLDING_ONLY }, async (t) => {
+  const { workspace } = await setup(t, (d) => {
+    mkdirSync(join(d, 'real', 'inner'), { recursive: true });
+    writeFileSync(join(d, 'real', 'inner', 'x.txt'), 'inner\n');
+    symlinkSync(join(d, 'real'), join(d, 'link'));
+    return [
+      { name: 'outer', path: d, mode: 'read-write', watch: 'never' },
+      // Configured through a link: its directory is link/inner as configured, and real/inner where disk has it.
+      { name: 'inner', path: join(d, 'link', 'inner'), mode: 'read-write', watch: 'never' },
+    ];
+  });
+  for (const path of ['outer/real/inner/x.txt', 'outer/REAL/inner/x.txt', 'outer/real/INNER/x.txt', 'outer/link/INNER/x.txt']) {
+    assert.equal(workspace.resolveAbsolutePath(path), null, path);
+  }
+  assert.notEqual(workspace.resolveAbsolutePath('outer/src/a.ts'), null, "the outer mount's own file");
+});
+
+test('resolveAbsolutePath takes a nested mount\'s directory in the other normalization form as that mount\'s', { skip: NORMALIZATION_FOLDING_ONLY }, async (t) => {
+  const { workspace } = await setup(t, (d) => {
+    mkdirSync(join(d, 'caf\u00e9'), { recursive: true });
+    return [
+      { name: 'outer', path: d, mode: 'read-write', watch: 'never' },
+      { name: 'cafe', path: join(d, 'caf\u00e9'), mode: 'read-write', watch: 'never' },
+    ];
+  });
+  for (const path of ['outer/caf\u00e9/x.txt', 'outer/cafe\u0301/x.txt']) assert.equal(workspace.resolveAbsolutePath(path), null, path);
+});
+
+test('on a disk that tells case apart, the tools take a directory spelled otherwise than a nested mount\'s as the outer mount\'s own, and resolveAbsolutePath errs toward the nested mount',
   { skip: CASE_SENSITIVE_ONLY }, async (t) => {
     const { workspace, call } = await setup(t, (d) => {
       mkdirSync(join(d, 'inner'), { recursive: true });
@@ -354,10 +581,60 @@ test('on a disk that tells case apart, a directory spelled otherwise than a nest
     });
     const read = await call('read', { path: 'outer/Inner/x.txt', offsetChars: 0, limitChars: 100 });
     assert.equal((read.data as { content: string }).content, 'outer\n');
-    assert.notEqual(workspace.resolveAbsolutePath('outer/Inner/x.txt'), null);
+    // Synchronous, it compares the path as given loosely, as a disk that
+    // folds names may, so it takes Inner for the nested mount's directory.
+    assert.equal(workspace.resolveAbsolutePath('outer/Inner/x.txt'), null);
     const listed = await call('ls', { path: 'outer', recursive: true });
     assert.deepEqual((listed.data as { entries: Array<{ path: string }> }).entries.map((e) => e.path), ['Inner/x.txt', 'src/a.ts']);
   });
+
+test('a nested mount\'s directory is matched exactly, or loosely, as a disk that folds names may compare it', () => {
+  // Exactly, as the tools compare a path they've respelled as disk spells it.
+  assert.equal(beginsWithDir(['inner', 'x.txt'], ['inner'], false), true);
+  assert.equal(beginsWithDir(['INNER', 'x.txt'], ['inner'], false), false);
+  // Loosely, as resolveAbsolutePath compares a path as given: case, the other
+  // Unicode normalization form, and case through upper case and back.
+  assert.equal(beginsWithDir(['fold', 'M', 'x.txt'], ['fold', 'm'], true), true);
+  assert.equal(beginsWithDir(['cafe\u0301', 'x'], ['caf\u00e9'], true), true, 'another normalization form');
+  assert.equal(beginsWithDir(['CAFE\u0301'], ['caf\u00e9'], true), true);
+  assert.equal(beginsWithDir(['STRASSE'], ['stra\u00dfe'], true), true, 'as listedName compares case, loosely too');
+  assert.equal(beginsWithDir(['fold', 'n'], ['fold', 'm'], true), false, 'another name');
+  assert.equal(beginsWithDir(['fold'], ['fold', 'm'], true), false, 'a path above the directory is not in it');
+});
+
+test('where disk folds case and keeps \u00df apart from ss, the tools take a directory spelled with ss as the outer mount\'s own', { skip: CASE_NOT_SHARP_S_ONLY }, async (t) => {
+  const { workspace, call } = await setup(t, (d) => {
+    mkdirSync(join(d, 'stra\u00dfe'), { recursive: true });
+    mkdirSync(join(d, 'strasse'), { recursive: true });
+    writeFileSync(join(d, 'strasse', 'x.txt'), 'outer\n');
+    return [
+      { name: 'outer', path: d, mode: 'read-write', watch: 'never' },
+      { name: 'nested', path: join(d, 'stra\u00dfe'), mode: 'read-write', watch: 'never' },
+    ];
+  });
+  // The tools compare a respelled path exactly, so `strasse` is the outer
+  // mount's own directory, as disk keeps it.
+  const read = await call('read', { path: 'outer/strasse/x.txt', offsetChars: 0, limitChars: 100 });
+  assert.equal((read.data as { content: string }).content, 'outer\n');
+  // resolveAbsolutePath folds case as listedName does, loosely too, with no
+  // same-file check, so it errs toward the nested mount and gives null.
+  assert.equal(workspace.resolveAbsolutePath('outer/strasse/x.txt'), null);
+});
+
+test('resolveAbsolutePath takes a nested mount\'s directory in another case as that mount\'s, whether or not it was on disk at start', async (t) => {
+  const { workspace, dir } = await setup(t, (d) => [
+    { name: 'outer', path: d, mode: 'read-write', watch: 'never' },
+    { name: 'later', path: join(d, 'later'), mode: 'read-write', watch: 'never' },
+  ]);
+  mkdirSync(join(dir, 'later'), { recursive: true });
+  // A spelling that may reach the directory gives null, as one that does.
+  for (const path of ['outer/later/x.txt', 'outer/LATER/x.txt']) assert.equal(workspace.resolveAbsolutePath(path), null, path);
+  assert.notEqual(workspace.resolveAbsolutePath('outer/src/a.ts'), null, "the outer mount's own file");
+  // And so after a start that finds the directory.
+  await workspace.stop();
+  await workspace.start({ isRestart: true, getState: () => null, setState: () => {}, pushEvent: () => {} } as unknown as ModuleContext);
+  for (const path of ['outer/later/x.txt', 'outer/LATER/x.txt']) assert.equal(workspace.resolveAbsolutePath(path), null, `${path} after a start found later`);
+});
 
 /** A workspace with a mount nested in another, stored but not yet started. */
 function nestedWorkspace(t: TestContext, watch?: 'never'): { workspace: WorkspaceModule; ls: () => Promise<ToolResult> } {
@@ -374,6 +651,29 @@ function nestedWorkspace(t: TestContext, watch?: 'never'): { workspace: Workspac
   const ls = () => workspace.handleToolCall({ id: 'l', name: 'ls', input: { path: 'outer' } } as Parameters<WorkspaceModule['handleToolCall']>[0]);
   return { workspace, ls };
 }
+
+test('before its first start, resolveAbsolutePath takes a nested mount\'s directory in another case as that mount\'s', (t) => {
+  const { workspace } = nestedWorkspace(t, 'never');
+  for (const path of ['outer/inner/x.txt', 'outer/INNER/x.txt']) assert.equal(workspace.resolveAbsolutePath(path), null, path);
+});
+
+test('before its first start, each level of a nested mount\'s directory is compared loosely, and the outer mount\'s own paths resolve', (t) => {
+  const root = mkdtempSync(join(tmpdir(), 'workspace-path-spelling-unstarted-'));
+  const dir = join(root, 'mount');
+  mkdirSync(join(dir, 'a', 'caf\u00e9'), { recursive: true });
+  const store = JsStore.openOrCreate({ path: join(root, 'store') });
+  const workspace = new WorkspaceModule({ mounts: [
+    { name: 'outer', path: dir, mode: 'read-write', watch: 'never' },
+    { name: 'deep', path: join(dir, 'a', 'caf\u00e9'), mode: 'read-write', watch: 'never' },
+  ] });
+  workspace.initStore(store);
+  t.after(async () => { await workspace.stop(); store.close(); rmSync(root, { recursive: true, force: true }); });
+  // Another case at the first level, and the other normalization form at the second.
+  for (const path of ['outer/a/caf\u00e9/x.txt', 'outer/A/caf\u00e9/x.txt', 'outer/a/cafe\u0301/x.txt', 'outer/A/CAFE\u0301/x.txt']) {
+    assert.equal(workspace.resolveAbsolutePath(path), null, path);
+  }
+  assert.equal(workspace.resolveAbsolutePath('outer/a/x.txt'), join(dir, 'a', 'x.txt'), "the outer mount's own path");
+});
 
 test('a stop made while start reads a nested mount\'s directory leaves the workspace stopped, watching nothing', async (t) => {
   // Both mounts watch by default, so a start that went on after the stop
@@ -457,6 +757,40 @@ test('on a disk that tells case apart, two hard links that differ only in case k
     // Nor do the two links make the directory look as if it folds case.
     assert.equal(await foldsCase(root), false);
   });
+
+test("a walk through a link that spells a directory above a nested mount's otherwise than disk does passes over that mount's directory", { skip: FOLDING_ONLY }, async (t) => {
+  const root = mkdtempSync(join(tmpdir(), 'workspace-path-spelling-walk-alias-'));
+  const dir = join(root, 'mount');
+  mkdirSync(join(dir, 'a', 'sub', 'in'), { recursive: true });
+  writeFileSync(join(dir, 'a', 'sub', 'in', 'secret.txt'), 'not the nested mount\'s\n');
+  writeFileSync(join(dir, 'a', 'sub', 'in', 'kept.json'), '{}\n');
+  writeFileSync(join(dir, 'a', 'sub', 'own.txt'), 'the outer mount\'s\n');
+  // The link spells the directory above the nested one in another case than disk does.
+  symlinkSync('A', join(dir, 'x'));
+  const store = JsStore.openOrCreate({ path: join(root, 'store') });
+  const workspace = new WorkspaceModule({ mounts: [
+    { name: 'outer', path: dir, mode: 'read-write', watch: 'never', followSymlinks: true },
+    { name: 'nested', path: join(dir, 'a', 'sub', 'in'), mode: 'read-write', watch: 'never', include: ['*.json'] },
+  ] });
+  workspace.initStore(store);
+  await workspace.start({ isRestart: false, getState: () => null, setState: () => {}, pushEvent: () => {} } as unknown as ModuleContext);
+  t.after(async () => { await workspace.stop(); store.close(); rmSync(root, { recursive: true, force: true }); });
+  const tool = async (name: string, input: Record<string, unknown>): Promise<Record<string, unknown>> => {
+    const res = await workspace.handleToolCall({ id: name, name, input } as Parameters<WorkspaceModule['handleToolCall']>[0]);
+    assert.equal(res.success, true, `${name}: ${String(res.error)}`);
+    return res.data as Record<string, unknown>;
+  };
+  const listing = await tool('ls', { path: 'outer/x/sub', recursive: true });
+  assert.deepEqual((listing.entries as Array<{ path: string }>).map((e) => e.path), ['x/sub/own.txt']);
+  const synced = await tool('sync', { path: 'outer/x/sub' });
+  // The nested root was passed over as another mount's directory, not left as one the walk didn't reach.
+  assert.ok(JSON.stringify(synced.passedOver ?? []).includes("another mount's directory"), JSON.stringify(synced));
+  assert.ok(!JSON.stringify([listing, synced]).includes('not visited'), JSON.stringify([listing, synced]));
+  const grepped = await tool('grep', { path: 'outer/x/sub', pattern: 'mount' });
+  assert.deepEqual((grepped.results as Array<{ file: string }>).map((r) => r.file), ['outer/x/sub/own.txt']);
+  const answers = JSON.stringify([listing, synced, grepped]);
+  assert.ok(!answers.includes('secret') && !answers.includes('kept.json'), answers);
+});
 
 test('on a disk that tells case apart, an empty directory with no letter in its name, or with a link at its flipped name, or that is a link to its flipped twin, tells case apart',
   { skip: CASE_SENSITIVE_ONLY }, async (t) => {
@@ -814,4 +1148,67 @@ test('on a disk that tells case apart, two drafts that differ only in case stay 
   await call('materialize', { mount: 'work' });
   assert.deepEqual(readdirSync(join(dir, 'src')).sort(), ['NEW.txt', 'New.txt', 'a.ts']);
   assert.deepEqual(readdirSync(dir).sort(), ['DOCS', 'docs', 'src']);
+});
+
+test("only history the mount's include covers spells a draft's path: an entry the include leaves out, from before it, doesn't respell a covered one", { skip: FOLDING_ONLY }, async (t) => {
+  const root = mkdtempSync(join(tmpdir(), 'workspace-path-spelling-'));
+  const dir = join(root, 'mount');
+  mkdirSync(join(dir, 'NOTES'), { recursive: true });
+  writeFileSync(join(dir, 'NOTES', 'old.bin'), 'taken in before the include\n');
+  const store = JsStore.openOrCreate({ path: join(root, 'store') });
+  let workspace: WorkspaceModule | undefined;
+  t.after(async () => { await workspace?.stop(); if (!store.isClosed()) store.close(); rmSync(root, { recursive: true, force: true }); });
+  const ctx = { isRestart: false, getState: () => null, setState: () => {}, pushEvent: () => {} } as unknown as ModuleContext;
+  const before = new WorkspaceModule({ mounts: [{ name: 'work', path: dir, mode: 'read-write', watch: 'never' }] });
+  before.initStore(store);
+  await before.start(ctx);
+  const taken = JSON.stringify(await before.handleToolCall({ id: 's', name: 'sync', input: {} } as Parameters<WorkspaceModule['handleToolCall']>[0]));
+  assert.ok(taken.includes('"synced":["NOTES/old.bin"]'), `history takes in the entry that could spell the directory: ${taken}`);
+  await before.stop();
+  // Disk no longer has the directory, so only history could spell it. It's removed by the spelling the write
+  // names: a disk that keeps each spelling's lookup a while, as the test's passthrough does for a second,
+  // would otherwise still show `notes` there.
+  rmSync(join(dir, 'notes'), { recursive: true, force: true });
+  assert.ok(!existsSync(join(dir, 'notes')), 'disk has no directory to spell the draft');
+  workspace = new WorkspaceModule({ mounts: [{ name: 'work', path: dir, mode: 'read-write', watch: 'never', include: ['notes/**'] }] });
+  workspace.initStore(store);
+  await workspace.start(ctx);
+  const write = await workspace.handleToolCall({ id: 'w', name: 'write', input: { path: 'work/notes/new.md', content: 'covered\n' } } as Parameters<WorkspaceModule['handleToolCall']>[0]);
+  assert.equal(write.success, true, String(write.error));
+  const read = await workspace.handleToolCall({ id: 'r', name: 'read', input: { path: 'work/notes/new.md' } } as Parameters<WorkspaceModule['handleToolCall']>[0]);
+  assert.equal(read.success, true, String(read.error));
+  const listed = JSON.stringify(await workspace.handleToolCall({ id: 'l', name: 'ls', input: { path: 'work', recursive: true } } as Parameters<WorkspaceModule['handleToolCall']>[0]));
+  assert.ok(listed.includes('notes/new.md') && !listed.includes('NOTES'), listed);
+});
+
+test("history in a nested mount's directory that mount's include leaves out still spells a draft naming the directory, so the draft is that mount's though the directory isn't on disk", { skip: FOLDING_ONLY }, async (t) => {
+  const ctx = { isRestart: false, getState: () => null, setState: () => {}, pushEvent: () => {} } as unknown as ModuleContext;
+  const root = mkdtempSync(join(tmpdir(), 'workspace-path-spelling-'));
+  const dir = join(root, 'mount');
+  mkdirSync(join(dir, 'inner'), { recursive: true });
+  writeFileSync(join(dir, 'inner', 'secret.md'), 'taken in before the nesting\n');
+  const store = JsStore.openOrCreate({ path: join(root, 'store') });
+  t.after(() => { if (!store.isClosed()) store.close(); rmSync(root, { recursive: true, force: true }); });
+  const before = new WorkspaceModule({ mounts: [{ name: 'work', path: dir, mode: 'read-write', watch: 'never' }] });
+  before.initStore(store);
+  await before.start(ctx);
+  const taken = JSON.stringify(await before.handleToolCall({ id: 's', name: 'sync', input: {} } as Parameters<WorkspaceModule['handleToolCall']>[0]));
+  assert.ok(taken.includes('"synced":["inner/secret.md"]'), `history takes in the entry that spells the directory: ${taken}`);
+  await before.stop();
+  // Removed by the spelling the write names, as in the test above.
+  rmSync(join(dir, 'INNER'), { recursive: true, force: true });
+  assert.ok(!existsSync(join(dir, 'INNER')), 'disk has no directory to spell the draft');
+  const workspace = new WorkspaceModule({ mounts: [
+    { name: 'work', path: dir, mode: 'read-write', watch: 'never' },
+    { name: 'inner', path: join(dir, 'inner'), mode: 'read-write', watch: 'never', include: ['keep.md'] },
+  ] });
+  workspace.initStore(store);
+  await workspace.start(ctx);
+  try {
+    const write = await workspace.handleToolCall({ id: 'w', name: 'write', input: { path: 'work/INNER/new.md', content: 'through the outer mount\n' } } as Parameters<WorkspaceModule['handleToolCall']>[0]);
+    assert.equal(write.success, false, `the outer mount took ${JSON.stringify(write.data)}`);
+    assert.match(String(write.error), /lies in mount "inner", nested in mount "work".*use "inner\/new\.md"/);
+  } finally {
+    await workspace.stop();
+  }
 });

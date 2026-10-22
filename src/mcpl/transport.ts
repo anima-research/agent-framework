@@ -12,7 +12,9 @@
  *  - StdioTransport      — spawns `config.command` and speaks over stdin/stdout;
  *                          child stderr is surfaced as 'stderr' lines.
  *  - WebSocketTransport  — dials `config.url` (ws:// or wss://) with the `ws`
- *                          library, appending `?token=` when `config.token` is
+ *                          library, sending the credential as `?token=` (or
+ *                          as an Authorization header, `tokenTransport:
+ *                          'header'`) when `config.token` is
  *                          set; each WS text frame is one JSON-RPC line.
  */
 
@@ -23,7 +25,7 @@ import { StringDecoder } from 'node:string_decoder';
 import WebSocket from 'ws';
 
 import type { McplServerConfig } from './types.js';
-import { WITHHELD_TEXT, describeCredentialError, maskedError, noteDialSent, redactServerText, redactUrl, resolveServerBinding, serverTextRedactor, urlAsDialed, type Redaction } from './protocol-family.js';
+import { WITHHELD_TEXT, describeCredentialError, headerCarries, maskedError, noteDialSent, redactServerText, redactUrl, resolveServerBinding, serverTextRedactor, tokenTransportProblem, urlAsDialed, type Redaction } from './protocol-family.js';
 import { assertBooleanSetting } from '../config-checks.js';
 import { logDetail } from './log-value.js';
 
@@ -585,8 +587,11 @@ export class WebSocketTransport extends McplTransport {
   }
 
   /**
-   * Dial `config.url` and resolve once the socket is OPEN. Appends `?token=`
-   * when `config.token` is set. Rejects on connect error / timeout (and tears
+   * Dial `config.url` and resolve once the socket is OPEN. Sends the
+   * credential (`config.token`, or the access provider's) as a `?token=`
+   * query parameter, or with `tokenTransport: 'header'` as an
+   * `Authorization: Bearer` header on the upgrade, refusing before the dial
+   * one a header can't carry as configured. Rejects on connect error / timeout (and tears
    * the socket down) so a failed dial never leaks an open handle. `signal`
    * ends a dial whose connection is closed meanwhile, at once, rather than
    * at the open timeout.
@@ -617,16 +622,29 @@ export class WebSocketTransport extends McplTransport {
       }
     }
     const url = buildWebSocketUrl(config, token);
-    // A provider's token is in this url, and the query may be re-encoded:
-    // the server's text is recorded with what the dial sent, the token in
-    // each form a token is replaced in.
+    // A provider's token is in this url when the dial sends it in the query,
+    // which may then be written again, and in the header alone in header
+    // mode: the server's text is recorded with what the dial sent, the token
+    // in each form a token is replaced in.
     noteDialSent(config, { url, token: token ?? undefined });
     // Error strings travel: traces, logs, tool results the model reads. They
     // get the endpoint, never the credential.
     const redacted = redactUrl(config.url);
+    // In header mode the url carries no credential (buildWebSocketUrl): the
+    // upgrade request does, if a header can carry it as configured
+    // (headerCarries). A static token is refused earlier, by
+    // serverConfigProblems; this refuses an access provider's, and a static
+    // one dialed past that check. A client that throws as the socket is
+    // constructed can quote the url, so its text is masked (clientErrorText).
+    const headerMode = config.tokenTransport === 'header' && !!token;
+    if (headerMode && token && !headerCarries(token)) {
+      throw new Error(`MCPL server "${config.id}" WebSocket connect failed: its credential isn't printable ASCII with no space at either end, which is all a header carries as configured (${redacted})`);
+    }
     let ws: WebSocket;
     try {
-      ws = new WebSocket(url);
+      ws = headerMode
+        ? new WebSocket(url, { headers: { Authorization: `Bearer ${token}` } })
+        : new WebSocket(url);
     } catch (err) {
       throw new Error(`MCPL server "${config.id}" WebSocket connect failed: ${clientErrorText(err, config, url)} (${redacted})`);
     }
@@ -742,7 +760,11 @@ export function clientErrorText(err: unknown, config: McplServerConfig, dialed: 
 /**
  * Build the dial URL: validate it's a ws(s):// URL the ws library will dial,
  * which refuses one with a fragment, and append the auth token as a `token`
- * query param when provided (preserving any existing query).
+ * query param when provided (preserving any existing query). With
+ * `tokenTransport: 'header'` no token is appended: the dial sends it as a
+ * header, and a url that carries a `token` parameter of its own is refused,
+ * as is a `tokenTransport` that is neither mode, so a dial that skipped
+ * serverConfigProblems still can't fall back to the query.
  */
 export function buildWebSocketUrl(config: McplServerConfig, tokenOverride?: string | null): string {
   if (!config.url) {
@@ -763,7 +785,10 @@ export function buildWebSocketUrl(config: McplServerConfig, tokenOverride?: stri
   if (parsed.hash) {
     throw new Error(`MCPL server "${config.id}": websocket url must not have a fragment, got "${parsed.hash}"`);
   }
-  const token = tokenOverride !== undefined ? tokenOverride : config.token;
+  const problem = tokenTransportProblem(config, parsed);
+  if (problem) throw new Error(problem);
+  const token = config.tokenTransport === 'header' ? null
+    : tokenOverride !== undefined ? tokenOverride : config.token;
   return urlAsDialed(parsed, token).toString();
 }
 

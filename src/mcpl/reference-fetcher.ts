@@ -224,7 +224,7 @@ export class ReferenceFetcher {
   constructor(
     private readonly resolveServer: (serverId: string) => ServerResolution | undefined,
     /** Persist the payload; returns a mount-prefixed path or null when no
-     *  writable workspace exists. File name is host-generated (§7.3). */
+     *  writable mount without an include exists. File name is host-generated (§7.3). */
     private readonly saveFile: (fileName: string, data: Buffer, mimeType: string) => Promise<string | null>,
   ) {}
 
@@ -463,9 +463,9 @@ export class ReferenceFetcher {
       const observedMime = sniffMime(data) ?? headerMime ?? claimedMime ?? 'application/octet-stream';
       const ext = EXT_BY_MIME.get(observedMime) ?? EXT_BY_MIME.get(headerMime ?? '') ?? EXT_BY_MIME.get(claimedMime ?? '') ?? 'bin';
       // §7.3: host-generated storage name; the server's `name` is display-only.
-      // A null from the save hook covers no workspace, no writable mount and
-      // a failed write, and the hook logs which. A throw is the save's failure
-      // too, not the fetch's, so it's logged here.
+      // A null from the save hook covers no workspace, no writable mount
+      // without an include and a failed write, and the hook logs which. A
+      // throw is the save's failure too, not the fetch's, so it's logged here.
       const fileName = `${record.refId}.${ext}`;
       let path: string | null;
       try {

@@ -13,7 +13,11 @@
  * the tool-result boundary AND injected into the live stream via
  * provideToolResults(results, { injectedMessages }) (membrane ≥0.5.72), so
  * the next round of the SAME turn sees them instead of the agent staying
- * deaf until the turn ends.
+ * deaf until the turn ends. (A message a tune-out holds from the residents
+ * is stored there but not injected: module-rows-held-from-residents.) That
+ * holds on a stream that can carry them, as membrane 0.6.0's native tool path
+ * declares; on its XML tool path, which declares it can't, they wait for the
+ * turn's end.
  */
 
 import { describe, it, beforeEach, afterEach } from 'node:test';
@@ -114,10 +118,10 @@ class RobotModule implements Module {
             ? { channelId: this.interjectionChannelId }
             : {}),
       } as unknown as ProcessEvent);
-      // Give the run loop a beat to process the queued message while this
-      // tool round is still pending (pendingAssistantBlocks non-empty), so
-      // it lands in deferredMessages before the tool-result event.
-      await new Promise((r) => setTimeout(r, 30));
+      // The run loop takes this message while the tool round is still
+      // pending (pendingAssistantBlocks non-empty), so it lands among the
+      // deferred messages: it's queued here, before this call returns, and
+      // the round's result is queued only after the call returns.
     }
     return { success: true, data: { ok: true, tool: call.name } };
   }
@@ -1519,7 +1523,9 @@ describe('present while acting', () => {
         name: 'worker', model: 'test-model', systemPrompt: 'Do the task.', allowedTools: 'all',
       });
       contextManager.addMessage('user', [{ type: 'text', text: 'Run once.' }]);
-      const run = framework.runEphemeralToCompletion(agent, contextManager, { startupTimeoutMs: 3_000 });
+      // The default startup limit, 30 s, so only a host stalled that long
+      // ends the run before its start's error does.
+      const run = framework.runEphemeralToCompletion(agent, contextManager);
       framework.start();
       await assert.rejects(run, /checkpoint store unavailable/, "the run fails with its start's error");
     } finally {
@@ -1790,6 +1796,7 @@ describe('present while acting', () => {
     framework.checkpointManager = null;
     framework.channelRegistry = {
       openIfClosedForSend: () => new Promise((resolve) => { resolveOpen = resolve; }),
+      directsLifecycle: () => true,
     };
     framework.turnRouting = new Map([['assistant', sending]]);
     const results: unknown[] = [];
@@ -2305,6 +2312,32 @@ describe('present while acting', () => {
     // missed it would leave the suppression set as well.
     const injected = JSON.stringify(membrane.lastStream!.receivedToolResultOptions[0]?.injectedMessages ?? []);
     assert.ok(injected.includes('[reaction] @someone reacted'), 'the reaction was injected at the send\'s tool boundary');
+
+    await framework.stop();
+  });
+
+  it('hands membrane a message injected mid-turn as its participant and content alone, never its stored metadata', async () => {
+    // A stored row's metadata is the host's record, whoever wrote it.
+    membrane.pushResponse(createMockResponse([
+      { type: 'tool_use', id: 'c1', name: 'robot--send_message', input: { text: 'reply to room4' } },
+    ] as ContentBlock[], 'tool_use'));
+    membrane.pushResponse(createMockResponse([
+      { type: 'text', text: 'Sent it.' },
+    ] as ContentBlock[]));
+
+    const framework = await createFramework();
+    stubChannelRegistry(framework);
+    module.interjection = 'a message that arrives while the tool runs';
+    module.interjectionChannelId = null;
+    module.interjectionMetadata = { channelId: '999888777', system: true, openaiResponsesItems: [] };
+
+    trigger(framework);
+    await framework.runUntilIdle();
+
+    const injected = membrane.lastStream!.receivedToolResultOptions[0]?.injectedMessages ?? [];
+    assert.ok(injected.some((message) => JSON.stringify(message.content).includes('a message that arrives while the tool runs')),
+      'the message was injected at the tool boundary');
+    for (const message of injected) assert.deepEqual(Object.keys(message).sort(), ['content', 'participant']);
 
     await framework.stop();
   });

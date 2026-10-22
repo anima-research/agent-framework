@@ -61,15 +61,8 @@ the house default; plain descriptive titles are accepted.
 - The reviewer will typically **run your branch** (typecheck, test suite,
   sometimes exercising a module against a real store) and paste transcripts.
   Claims are checked, not trusted.
-- **Greptile** reviews only PRs labelled `greptile` (`.greptile/config.json`).
-  A scheduled workflow adds that label to each open, non-draft PR whose
-  additions plus deletions pass 400 lines, unless it carries `no-greptile`,
-  and the review starts when the label lands: within about half an hour of
-  the PR opening, passing 400 lines or being marked ready, and later when
-  GitHub's scheduler is busy. A smaller PR gets a Greptile review if a
-  maintainer adds the label. `no-greptile` skips the review. Removing
-  `greptile` from a PR past 400 lines doesn't skip it, since the next run
-  adds the label back.
+- **Greptile** doesn't review new PRs. It reviews only PRs labelled
+  `greptile` (`.greptile/config.json`), so don't add that label to a new PR.
 - Respond by pushing fix commits and replying per finding — "Addressed in
   `<sha>`" — rather than force-pushing a rewritten branch. A re-review then
   flips the verdict.
@@ -212,10 +205,11 @@ npx tsc --noEmit      # typecheck
 code you no longer have — always build before testing, and after switching
 branches. The `pretest` hook copies `test/fixtures/*.mjs` into `dist/`.
 
-`--test-timeout=600000` bounds each test file as a whole under Node 20,
-and each test under Node 24, at ten minutes; the slowest file,
-`mcpl-runtime-lifecycle`, takes about three. Each job in `ci.yml` also has
-a `timeout-minutes` limit, which ends a hang the test timeout doesn't reach.
+`--test-timeout=600000` bounds each test file as a whole under Node
+22.12, as it did under Node 20, and each test under Node 24, at ten
+minutes; the slowest file, `mcpl-runtime-lifecycle`, takes about three.
+Each job in `ci.yml` also has a `timeout-minutes` limit, which ends a hang
+the test timeout doesn't reach.
 
 Push-time CI (`ci.yml`) builds, typechecks and tests every push and PR on
 ubuntu and macos. Lockfiles are deliberately gitignored in this repo, so CI
@@ -228,3 +222,8 @@ supply, fails the PR.
 When working against local sibling checkouts rather than published versions,
 see the ecosystem workspace setup — `bun install` at the `rust-connectome`
 root links the four packages together.
+
+
+CI check contexts follow the workflow matrices. When a matrix changes, a
+maintainer should check that the repository's required-status list matches it;
+workflow edits do not change branch-protection settings themselves.

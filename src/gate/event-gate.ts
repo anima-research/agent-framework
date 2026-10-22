@@ -14,6 +14,7 @@
 import { existsSync, readFileSync, statSync, writeFileSync, mkdirSync, renameSync } from 'node:fs';
 import { basename, dirname, join } from 'node:path';
 import { GateScript } from './gate-script.js';
+import { MAX_TIMER_MS } from '../deadline-timer.js';
 import { safeSlice } from '../safe-slice.js';
 
 import type { ToolDefinition } from '../types/events.js';
@@ -624,6 +625,10 @@ export class EventGate {
    * gate-global (unchanged semantics): its agentName is informational for the
    * eventual wake target; self-wake agentName is authoritative per-agent state. */
   private wakeStatePath: string;
+  // From dispose() to the next resumeSleep(): no sleep or self-wake timer is
+  // armed, though a turn a failed stop() left running can still ask for one.
+  // The durable intents stay (in memory and in the journal) for resumeSleep().
+  private disposed = false;
 
   // Self-wake timers per agent (skip_reply's wake_in_seconds). Unlike sleep,
   // a self-wake suppresses NOTHING — it means "if nothing else wakes me by
@@ -1080,11 +1085,13 @@ export class EventGate {
     // rouse the agent — its own heartbeat (an internal clock, not an outside
     // interruption: each tick lets the agent reconsider and optionally `wake`)
     // and a privileged user's ping. The event always enters context regardless
-    // (the gate only governs inference triggering).
+    // (the gate only governs inference triggering). The heartbeat is the
+    // server the host knows as `heartbeat`, the server id the silent-heartbeat
+    // marker requires too: a `source` in an event's metadata is the server's
+    // own word, which any server can give.
     if (this.sleepUntil > this.now()) {
       this.reloadPrivilegedIfChanged();
-      const isHeartbeat =
-        info.metadata?.source === 'heartbeat' || info.serverId === 'heartbeat';
+      const isHeartbeat = info.serverId === 'heartbeat';
       const authorId = this.extractAuthorId(info.metadata);
       const privileged = authorId !== null && this.privilegedUserIds.has(authorId);
       if (!isHeartbeat && !privileged) {
@@ -1767,10 +1774,14 @@ export class EventGate {
     this.sleepNote = note;
     this.sleepAgent = agentName;
     this.sleepSuppressed = 0;
-    // Arm first: a persistence failure must never leave sleep set without a
-    // process-local wake. Persist before returning success whenever storage is
-    // available; failure is loud but the live timer remains authoritative.
-    this.armSleepTimer();
+    // Arm the wake first: when the window elapses, clear sleep and request an
+    // inference so the agent resumes on its own (not dependent on a heartbeat
+    // tick or an incoming message). Cancelled by clearSleep()/`wake`, and by
+    // dispose(), after which start() arms it again (resumeSleep). A
+    // persistence failure must never leave sleep set without a process-local
+    // wake, so the journal is written after the timer: its failure is loud,
+    // and the live timer stays authoritative.
+    this.armSleepWake();
     const durable = this.tryPersistWakeState('arming sleep');
     this.reloadPrivilegedIfChanged();
     this.emitTrace({
@@ -1784,6 +1795,56 @@ export class EventGate {
     return { until: this.sleepUntil, durable };
   }
 
+  /**
+   * Arm timers again for a lifecycle that starts after a stop(), and the
+   * sleep's wake first: dispose() clears its timer and keeps the sleep. A
+   * sleep still ahead wakes the agent at its end; one that ended while
+   * stopped wakes it now, since that wake is what the agent asked for. With
+   * no sleep, wakeFromSleep does nothing. Self-wake intents kept through
+   * dispose() get their timers back the same way: one still ahead fires at
+   * its end, one already over fires now (fireRestoredSelfWake), and a
+   * quiesced gate keeps either for admitOverdueWakeIntents() at resume.
+   */
+  resumeSleep(): void {
+    this.disposed = false;
+    if (this.sleepUntil > this.now()) this.armSleepWake();
+    else this.wakeFromSleep('sleep-expired');
+    for (const intent of this.selfWakeIntents.values()) {
+      if (!this.selfWakeTimers.has(intent.agentName!)) this.armRestoredSelfWake(intent);
+    }
+  }
+
+  /**
+   * Arm the sleep's wake for its end by the gate's own clock. One timer holds
+   * at most MAX_TIMER_MS, about 24.8 days, so a longer sleep waits in steps,
+   * and wakeFromSleep reads the clock as each one fires. Nothing is armed
+   * while the gate is disposed: resumeSleep() arms it at the next start().
+   */
+  private armSleepWake(): void {
+    if (this.sleepTimer) { clearTimeout(this.sleepTimer); this.sleepTimer = null; }
+    if (this.disposed) return;
+    const remaining = Math.max(0, this.sleepUntil - this.now());
+    this.sleepTimer = setTimeout(() => this.wakeFromSleep('sleep-expired'), Math.min(remaining, MAX_TIMER_MS));
+  }
+
+  /**
+   * `agentName` is gone, as a conversation fork's end or an ephemeral run's
+   * removes one: its pending self-wake is cancelled, and a sleep it set ends.
+   * The gate's sleep holds back every agent's wakes, so nobody is asleep once
+   * its agent is gone, and neither wake would reach a name that no longer
+   * exists. A sleep another agent set, or one set with no agent, stays.
+   */
+  agentGone(agentName: string): void {
+    const selfWake = this.selfWakeTimers.get(agentName);
+    if (selfWake) {
+      clearTimeout(selfWake);
+      this.selfWakeTimers.delete(agentName);
+    }
+    // Its durable intent goes too, or a restart would wake the gone name.
+    if (this.selfWakeIntents.delete(agentName)) this.tryPersistWakeState('ending a gone agent\'s self-wake');
+    if (this.sleepUntil !== 0 && this.sleepAgent === agentName) this.clearSleep();
+  }
+
   // =========================================================================
   // Self-wake (skip_reply wake_in_seconds)
   // =========================================================================
@@ -1795,8 +1856,12 @@ export class EventGate {
    * Cancelled by the agent's next turn start (see onInferenceStarted):
    * the semantics are "if nothing else wakes me by then, wake me".
    */
-  armSelfWake(agentName: string, seconds: number, source = 'skip_reply'): { inMs: number; durable: boolean } {
+  armSelfWake(agentName: string, seconds: number, source = 'skip_reply'): { inMs: number; armed: boolean; durable: boolean } {
     const ms = Math.max(1_000, Math.min(3_600_000, Math.floor(seconds * 1000)));
+    // A stopped framework's late turn arms no timer and journals no intent
+    // (disposed): nothing asked for after a stop() reaches the next start().
+    // Intents armed before the stop stay durable; resumeSleep() arms them.
+    if (this.disposed) return { inMs: ms, armed: false, durable: false };
     const prev = this.selfWakeTimers.get(agentName);
     if (prev) clearTimeout(prev);
     const armedAt = this.now();
@@ -1849,7 +1914,7 @@ export class EventGate {
       behavior: 'skip',
       timestamp: this.now(),
     });
-    return { inMs: ms, durable };
+    return { inMs: ms, armed: true, durable };
   }
 
   /** End sleep immediately. Returns true if the agent was asleep. */
@@ -1870,24 +1935,18 @@ export class EventGate {
    * Clears the sleep state and requests an inference so the agent wakes on its
    * own — this is what makes `sleep(N)` a real "wake me in N seconds" rather
    * than just a suppression window. No-op if sleep was already cleared (via
-   * `wake`) or re-armed to a later time by a fresh `sleep` call.
+   * `wake`). A timer that fires before the sleep's end by the gate's clock
+   * arms the rest: a step of a sleep longer than one timer holds, a timer that
+   * fires early (Node's can, by a millisecond), or a clock set back.
    */
-  private armSleepTimer(): void {
-    if (this.sleepTimer) clearTimeout(this.sleepTimer);
-    const remaining = Math.max(0, this.sleepUntil - this.now());
-    // Node clamps larger delays to ~1ms. Chunk long sleeps and check the wall
-    // deadline on each callback instead of firing years early.
-    const delay = Math.min(remaining, 0x7fffffff);
-    this.sleepTimer = setTimeout(() => this.wakeFromSleep('sleep-expired'), delay);
-  }
-
   private wakeFromSleep(reason: string): void {
-    this.sleepTimer = null;
+    // The timer that called it has fired; from resumeSleep(), for a sleep
+    // already over, one may still be armed, and it goes, so no stale step of
+    // it can fire later.
+    if (this.sleepTimer) { clearTimeout(this.sleepTimer); this.sleepTimer = null; }
     if (this.sleepUntil === 0) return;
-    // A relative timer may fire before its wall deadline after a backward clock
-    // step. Re-arm for the remaining wall time instead of losing the promise.
     if (this.sleepUntil > this.now()) {
-      this.armSleepTimer();
+      this.armSleepWake();
       return;
     }
     // A deadline reached during runtime quiescence releases only its timer
@@ -2011,7 +2070,7 @@ export class EventGate {
   /** Admit restored overdue intents at the final safe startup/resume boundary. */
   admitOverdueWakeIntents(): void {
     const now = this.now();
-    if (this.sleepUntil > now && !this.sleepTimer) this.armSleepTimer();
+    if (this.sleepUntil > now && !this.sleepTimer) this.armSleepWake();
     for (const intent of this.selfWakeIntents.values()) {
       if (intent.wakeAt > now && !this.selfWakeTimers.has(intent.agentName!)) this.armRestoredSelfWake(intent);
     }
@@ -2069,9 +2128,12 @@ export class EventGate {
 
   private armRestoredSelfWake(intent: PersistedWakeIntent): void {
     const previous = this.selfWakeTimers.get(intent.agentName!);
-    if (previous) clearTimeout(previous);
+    if (previous) { clearTimeout(previous); this.selfWakeTimers.delete(intent.agentName!); }
+    // Nothing is armed while the gate is disposed (see armSleepWake); the
+    // intent stays for resumeSleep().
+    if (this.disposed) return;
     const remaining = Math.max(0, intent.wakeAt - this.now());
-    const delay = Math.min(remaining, 0x7fffffff);
+    const delay = Math.min(remaining, MAX_TIMER_MS);
     const timer = setTimeout(() => {
       if (intent.wakeAt > this.now()) { this.armRestoredSelfWake(intent); return; }
       this.fireRestoredSelfWake(intent);
@@ -2257,7 +2319,13 @@ export class EventGate {
     // Only process-local timer handles are released; startup follows the same
     // future/re-arm or overdue/reconcile path as an abrupt process loss.
     this.selfWakeTimers.clear();
+    // The sleep stays, with its note and agent, and its timer goes: fired
+    // after a stop(), its wake reached a framework that had stopped, and the
+    // timer held the process until the sleep's end. The next start() arms it
+    // again (resumeSleep). Until then nothing arms one, nor a self-wake: a
+    // turn a failed stop() left running can still call sleep or skip_reply.
     if (this.sleepTimer) { clearTimeout(this.sleepTimer); this.sleepTimer = null; }
+    this.disposed = true;
     this.rateLimitBuckets.clear();
     this.passiveSampleCounters.clear();
     this.rateLimitDenied.clear();

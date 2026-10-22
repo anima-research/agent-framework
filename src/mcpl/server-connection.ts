@@ -87,18 +87,30 @@ export interface McplConnectionCloseInfo {
  *  Spring Boot + JDA servers can take 5-10s to boot, so 30s is safe. */
 const INITIALIZE_TIMEOUT_MS = 30_000;
 
+/** How many errors down a `cause` chain stderrTailOf looks. */
+const STDERR_TAIL_CAUSE_LINKS = 8;
+
 /** A failed connect's `stderrTail`, the last of the server's stderr that its
- *  handshake's error keeps, when there is one. */
+ *  handshake's error keeps, when there is one: the error's own, or the
+ *  nearest one in its `cause` chain, since a launch that couldn't be reaped
+ *  (McplUnreapedLaunchError) and the framework's refusals wrap the
+ *  handshake's error. It looks at most STDERR_TAIL_CAUSE_LINKS causes down,
+ *  so a chain that loops ends. */
 export function stderrTailOf(error: unknown): string | undefined {
-  const tail = (error as { stderrTail?: unknown } | null | undefined)?.stderrTail;
-  return typeof tail === 'string' && tail !== '' ? tail : undefined;
+  let at = error;
+  for (let link = 0; link <= STDERR_TAIL_CAUSE_LINKS && typeof at === 'object' && at !== null; link++) {
+    const { stderrTail, cause } = at as { stderrTail?: unknown; cause?: unknown };
+    if (typeof stderrTail === 'string' && stderrTail !== '') return stderrTail;
+    at = cause;
+  }
+  return undefined;
 }
 
 /** For the host's own log line about a failed connect: the server's stderr
- *  that the error keeps as `stderrTail`, with the server's credentials
- *  taken out by `redact` (its redactServerText), one marked line per line of
- *  it, each through log-value, since it's the server's text. '' when there's
- *  none. */
+ *  that the error, or the nearest error it wraps, keeps as `stderrTail`
+ *  (stderrTailOf), with the server's credentials taken out by `redact` (its
+ *  redactServerText), one marked line per line of it, each through
+ *  log-value, since it's the server's text. '' when there's none. */
 export function withStderr(error: unknown, redact: (text: string) => string): string {
   const tail = stderrTailOf(error);
   if (tail === undefined) return '';
@@ -1194,21 +1206,22 @@ export class McplServerConnection extends EventEmitter {
         },
       };
 
+      // When the transport fails, the end of the server's stderr often says
+      // why, such as a missing token or a crash at startup. It goes on the
+      // error as `stderrTail`, never into the message: an error's message
+      // travels to traces and tool results, and a server's stderr is its own
+      // text, which can hold a credential.
+      const failed = (failure: string): Error & { stderrTail?: string } => {
+        // It goes to the host too, so it's redacted, from a window of the
+        // stream longer than the tail, so a credential the tail's cut
+        // would split is whole when it's matched (stderrTailRedacted).
+        const tail = transport.stderrTailRedacted(serverTextRedactor(config)).trimEnd();
+        return Object.assign(new Error(failure), tail ? { stderrTail: tail } : {});
+      };
+
       // Await the initialize response, racing an early transport close/error,
       // a timeout and the owner's close. Every path cleans up its listeners.
       const { mcpl: rawCapabilities, mcpToolsAdvertised, protocolVersion } = await new Promise<{ mcpl: McplCapabilities | null; mcpToolsAdvertised: boolean; protocolVersion: string }>((resolve, reject) => {
-        // When the transport fails, the end of the server's stderr often says
-        // why, such as a missing token or a crash at startup. It goes on the
-        // error as `stderrTail`, never into the message: an error's message
-        // travels to traces and tool results, and a server's stderr is its
-        // own text, which can hold a credential.
-        const failed = (failure: string): Error & { stderrTail?: string } => {
-          // It goes to the host too, so it's redacted, from a window of the
-          // stream longer than the tail, so a credential the tail's cut
-          // would split is whole when it's matched (stderrTailRedacted).
-          const tail = transport.stderrTailRedacted(serverTextRedactor(config)).trimEnd();
-          return Object.assign(new Error(failure), tail ? { stderrTail: tail } : {});
-        };
         const cleanup = () => {
           transport.off('line', onLine);
           transport.off('close', onClose);
@@ -1312,6 +1325,22 @@ export class McplServerConnection extends EventEmitter {
         transport.on('error', onError);
         transport.writeLine(JSON.stringify(initRequest));
       });
+
+      // The transport has found the child's stdin or stdout failed before the
+      // handshake could hand it on, such as when this host's answer to a ping
+      // the server sent met EPIPE. Nothing more is written to the child then,
+      // so the connection couldn't serve. It's read here, once the answer has
+      // passed its own checks, rather than as the answer arrives: a write's
+      // EPIPE is reported only once the callback that wrote it has returned,
+      // so a ping and the answer read in one callback would pass a check made
+      // there. A child that outlived SIGKILL may already have said so with
+      // nothing listening (the transport's 'unreaped' is wired only once the
+      // handshake hands it on). So the handshake fails, and its cleanup holds
+      // the launch if it can't reap the child. A failure of the write below
+      // is reported only once the caller has wired the transport, so it
+      // reaches the connection as a loss, like any later one.
+      const pipeFailure = transport.pipeFailure;
+      if (pipeFailure) throw failed(`MCPL server "${config.id}" stdio pipe failed with ${pipeFailure.message} during the handshake`);
 
       // Send `initialized` notification (no id)
       transport.writeLine(JSON.stringify({ jsonrpc: '2.0', method: 'notifications/initialized' }));
@@ -1517,9 +1546,13 @@ export class McplServerConnection extends EventEmitter {
     return this.sendRequest(McplMethod.ChannelsOpen, params as unknown as Record<string, unknown>, { timeoutMs }) as Promise<ChannelsOpenResult>;
   }
 
-  /** Send `channels/close` request and await result. */
+  /** Send `channels/close` request and await result. It keeps a deadline as
+   *  channels/open does: a delivery waits for a channel's queued lifecycle
+   *  work, closes included, so a close that is never answered would hold the
+   *  delivery, and the turn that waits for it, for good. */
   sendChannelsClose(params: ChannelsCloseParams): Promise<ChannelsCloseResult> {
-    return this.sendRequest(McplMethod.ChannelsClose, params as unknown as Record<string, unknown>) as Promise<ChannelsCloseResult>;
+    const timeoutMs = this.requestTimeoutMs > 0 ? this.requestTimeoutMs : this.publishDeadlineMs;
+    return this.sendRequest(McplMethod.ChannelsClose, params as unknown as Record<string, unknown>, { timeoutMs }) as Promise<ChannelsCloseResult>;
   }
 
   /** Send `channels/acknowledge` request and await result. */
@@ -2606,8 +2639,10 @@ export class McplServerConnection extends EventEmitter {
     // reconnecting, and is lost as on a close, with the permanent failure
     // that raises the alert and takes its tools off the list. Its id stays
     // held until close() confirms the exit. A close the host has begun
-    // reports the failure itself. During a handshake nothing listens yet:
-    // the handshake's own cleanup holds the launch, once the handshake fails.
+    // reports the failure itself. During a handshake nothing listens yet: a
+    // handshake whose pipe has failed fails, when its answer comes (it's
+    // refused then), when the child's exit closes the transport, or at its
+    // timeout, and its own cleanup holds the launch.
     transport.on('unreaped', (failure: Error) => {
       if (this.closed || this.transport !== transport) return;
       this.holdUnreaped(transport, failure);

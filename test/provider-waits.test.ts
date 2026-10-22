@@ -1254,8 +1254,9 @@ const accelerationLimited = (retryAfterMs: number, request: NormalizedRequest) =
   rawError: { status: 429 }, rawRequest: request,
 });
 
-test("releasing the stated wait of an organization-acceleration hold leaves AF's own pacing; another model's release leaves the hold", async () => {
+test("releasing the stated wait of an organization-acceleration hold leaves AF's own pacing; another model's release leaves the hold", async (t) => {
   await withStoreDir(async (path) => {
+    const clock = holdClock(t);
     const log = silence();
     const twentyMinutes = 20 * 60_000;
     const membrane = new WaitingMembrane(0, undefined);
@@ -1278,6 +1279,9 @@ test("releasing the stated wait of an organization-acceleration hold leaves AF's
       const statedUntil = hold.until;
       assert.ok(statedUntil >= before + twentyMinutes, 'its length is the stated wait');
 
+      // The operator releases 400 ms after the failure, so pacing restarted
+      // at the release would end past the failure's own.
+      clock.advance(400);
       const other = await internal.handleHostCommand('zz-surface', { command: 'release-provider-wait', agentName: 'resident', model: 'zz-other', requesterName: 'zz-operator' });
       assert.equal(other.ok, true);
       assert.equal(internal.providerAccelerationCooldowns.get('resident')?.until, statedUntil, "another model's release leaves the hold");
@@ -1287,9 +1291,12 @@ test("releasing the stated wait of an organization-acceleration hold leaves AF's
       const paced = internal.providerAccelerationCooldowns.get('resident');
       assert.ok(paced, "AF's own pacing for the failure still holds");
       assert.ok(paced.until >= before + 1_000 && paced.until <= armedBy + 1_000, `held to AF's own pacing (${paced.until - before} ms after the failure)`);
+      // Real time passes that pacing, as on a loaded host, while the clock stays inside it.
+      await clock.outlast(1_000);
       await fw.runUntilIdle();
       assert.equal(membrane.primary, 1, 'not before that pacing passes');
 
+      clock.pass(1_000);
       await waitFor(fw, () => membrane.primary >= 2, 'the held turn after that pacing');
       assert.equal(membrane.primary, 2, 'the held turn runs once it has');
     } finally { await fw.stop(); log.restore(); }
@@ -2254,14 +2261,23 @@ const foreignRateLimit = (retryAfterMs: unknown) => Object.assign(new Error('zz 
 
 for (const who of ['resident', 'conversation agent', 'ephemeral run'] as const) {
   const outcome = who === 'ephemeral run' ? 'ends the run at once, marked' : 'is recorded, not slept in the turn';
-  test(`a 429 from another copy of membrane that states a wait ${outcome} (${who})`, async () => {
+  test(`a 429 from another copy of membrane that states a wait ${outcome} (${who})`, async (t) => {
     await withStoreDir(async (path) => {
+      const clock = holdClock(t);
       const log = silence();
       // An ephemeral run doesn't record: a wait past its cap ends it at once.
       const stated = who === 'ephemeral run' ? 1_200_000 : 400;
       const membrane = new FailingAt(1, 'stream', () => foreignRateLimit(stated));
       const { fw, internal } = await framework(path, membrane);
       const nonOwning = internal as NonOwning;
+      // Left to the error policy, the stated wait would be slept in the turn.
+      // With the clock held, the retry after that sleep is held at its last
+      // boundary, so only the policy's calls tell the two apart.
+      const policy = (fw as unknown as { errorPolicy: { onInferenceError(error: Error, agentName: string, attempt: number): unknown } }).errorPolicy;
+      const decide = policy.onInferenceError.bind(policy);
+      const toPolicy: string[] = [];
+      policy.onInferenceError = (error, agentName, attempt) => { toPolicy.push(error.message); return decide(error, agentName, attempt); };
+      const heldAt = Date.now();
       try {
         if (who === 'ephemeral run') {
           const outcome = await ephemeralRun(fw, 'zz-ephemeral-foreign');
@@ -2278,10 +2294,16 @@ for (const who of ['resident', 'conversation agent', 'ephemeral run'] as const) 
           await fw.runUntilIdle();
         } else {
           await conversationTurn(fw, nonOwning, 'zz-first');
+          // The turn's stream runs on after the start returns.
+          await waitFor(fw, () => internal.providerAccelerationCooldowns.has('resident'), 'the hold');
         }
-        assert.deepEqual(fw.providerWaitSnapshot('resident').map((w) => w.model), ['zz-model'], 'the stated wait is recorded');
+        // Real time passes the wait, as on a loaded host, while the clock stays inside it.
+        await clock.outlast(stated);
+        assert.deepEqual(fw.providerWaitSnapshot('resident').map((w) => [w.model, w.until]), [['zz-model', new Date(heldAt + stated).toISOString()]], 'the stated wait is recorded');
         assert.equal(internal.providerAccelerationCooldowns.get('resident')?.waitModel, 'zz-model', 'the turn is held by it');
         assert.equal(membrane.primary, 1, 'not retried inside the wait');
+        assert.deepEqual(toPolicy, [], 'never left to the error policy');
+        clock.pass(stated);
         await waitFor(fw, () => membrane.primary >= 2, 'the held turn after the wait');
         assert.equal(membrane.primary, 2, 'run once after it');
       } finally { await fw.stop(); log.restore(); }

@@ -74,7 +74,11 @@ test('an open answered for another channel fails, and that channel\'s history go
   const { value: result, lines } = await capturingErrors(() => f.openX(5));
 
   assert.equal(result.success, false);
-  assert.match(String(result.error), /answered channels\/open for x with a different channel/);
+  // The open stays recorded, as every failed open's does.
+  assert.equal(result.error, 'Channel "x" wasn\'t opened: the "test" server answered for a different channel, so nothing in its ' +
+    'answer is used. The open stays recorded, and this host tries it again when the "test" server next registers this ' +
+    'channel, if this host may open and close its channels then; calling channel_open again is likely to get the same ' +
+    'answer. channel_close withdraws it.');
   assert.equal(result.data, undefined, 'no history, or anything else from the answer, reaches the resident');
   assert.equal(f.isOpen('x'), false, 'the requested channel is not marked open');
   assert.equal(f.isOpen('y'), false, 'nor is the channel the server answered for');
@@ -146,7 +150,8 @@ test('a channel admitted open stays closed on a substituted answer, reports it o
   assert.equal(delivery, null);
   assert.deepEqual(f.published, [], 'nothing is sent into a channel the server would not confirm');
   assert.equal(f.routeFailures.length, 1);
-  assert.match(f.routeFailures[0]!.reason, /answered channels\/open for x with a different channel/);
+  assert.equal(f.routeFailures[0]!.reason, 'opening the channel for these words didn\'t complete: the "test" server ' +
+    'answered for a different channel, so nothing in its answer is used');
 });
 
 test('a known-open channel loses its confirmation on a substituted answer, and reopens once the server answers for it', async () => {
@@ -217,7 +222,7 @@ test('an answer whose channel id is not a string fails the open, and closes noth
     const { value: result } = await capturingErrors(() => f.openX());
     await tick();
     assert.equal(result.success, false);
-    assert.match(String(result.error), /with a channel id that is not a string/);
+    assert.match(String(result.error), /answered for a channel whose id isn't a string, so nothing in its answer is used\./);
     assert.equal(f.isOpen('x'), false);
     assert.match(String(f.substituted()[0]?.answeredFor), /^(5|false)$/, 'logValue prints a non-string id as its JSON text');
     assert.deepEqual(f.calls, [{ kind: 'open', id: 'x' }], 'nothing registered by that id to close');

@@ -4,7 +4,9 @@
  * appends to the store before it changes memory. So an operation whose
  * append throws, as on a full disk, fails without its change, a retry
  * records it rather than taking a same-state return, and a registry rebuilt
- * from the store replays what memory held. Before, memory changed first: a retried `channel_close`
+ * from the store replays what memory held. A record that changes no memory,
+ * a decline's of the invitation it declined, is written once the decline has
+ * taken effect, so its failure goes to the operator's log instead. Before, memory changed first: a retried `channel_close`
  * reported success without recording anything, and after a restart the
  * old record came back, so subscription policy could lift a close the
  * agent had been told succeeded.
@@ -33,10 +35,11 @@ type Write = { id: string; item: unknown };
 function failingStore(path: string) {
   const real = JsStore.openOrCreate({ path });
   let chosen: ((write: Write) => boolean) | undefined;
+  let message = '';
   const throwIfChosen = (write: Write) => {
     if (chosen?.(write)) {
       chosen = undefined;
-      throw new Error('ENOSPC: no space left on device');
+      throw new Error(message);
     }
   };
   const store = {
@@ -49,8 +52,9 @@ function failingStore(path: string) {
   } as unknown as JsStore;
   return {
     store,
-    failNext: (choose: (write: Write) => boolean) => {
+    failNext: (choose: (write: Write) => boolean, words = 'ENOSPC: no space left on device') => {
       chosen = choose;
+      message = words;
     },
     close: () => real.close(),
   };
@@ -95,6 +99,7 @@ function makeRegistry(store: JsStore) {
       ackCalls.push(params.messageId);
       return { acknowledged: true, representation: 'not now' };
     },
+    sendChannelsPublish: undefined as undefined | (() => Promise<unknown>),
   };
   const registry = new ChannelRegistry(
     { getServer: () => server } as unknown as McplServerRegistry,
@@ -103,7 +108,7 @@ function makeRegistry(store: JsStore) {
     () => {},
     { store },
   );
-  return { registry, openCalls, closeCalls, ackCalls };
+  return { registry, openCalls, closeCalls, ackCalls, server };
 }
 
 /** The decision on record in memory, with its source. */
@@ -131,7 +136,7 @@ const lifecycleWrite = ({ id }: Write) => id === LIFECYCLE;
 const decisionWrite = ({ id, item }: Write) =>
   id === LIFECYCLE && (item as { kind?: string }).kind === 'desired-state';
 
-test('a channel_close whose record fails to append fails and leaves the channel open; its retry records the close a restart replays', withStore('log-first-close', async ({ store, failNext }) => {
+test('a channel_close whose record fails to append answers that nothing changed and leaves the channel open; its retry records the close a restart replays', withStore('log-first-close', async ({ store, failNext }) => {
   const { registry, closeCalls } = makeRegistry(store);
   await registry.handleRegister('discord', { channels: [commons] });
   assert.equal((await registry.handleChannelToolCall('channel_open', { channelId: 'c1' })).success, true);
@@ -139,7 +144,11 @@ test('a channel_close whose record fails to append fails and leaves the channel 
   const closesBefore = closeCalls.length;
 
   failNext(lifecycleWrite);
-  await assert.rejects(registry.handleChannelToolCall('channel_close', { channelId: 'c1' }), DISK_FULL);
+  const failed = await registry.handleChannelToolCall('channel_close', { channelId: 'c1' });
+  assert.equal(failed.success, false);
+  assert.equal(failed.isError, true);
+  assert.match(failed.error ?? '', DISK_FULL);
+  assert.match(failed.error ?? '', /^Nothing changed for channel "c1": this host couldn't record the decision: .*, so nothing was sent to the server\. Calling channel_close again tries again; if it fails the same way, ask whoever runs this host\.$/);
   assert.deepEqual(decision(registry, 'c1'), { state: 'open', source: 'agent-tool' });
   assert.equal(closeCalls.length, closesBefore, 'nothing went to the server');
 
@@ -162,6 +171,8 @@ test('a channel_open whose decision fails to append answers the failure and open
   const failed = await registry.handleChannelToolCall('channel_open', { channelId: 'c1' });
   assert.equal(failed.success, false);
   assert.match(failed.error ?? '', DISK_FULL);
+  // A decision never recorded isn't read as one a later decision overtook.
+  assert.match(failed.error ?? '', /^Nothing changed for channel "c1": this host couldn't record the decision: .*, so nothing was sent to the server\. Calling channel_open again tries again; if it fails the same way, ask whoever runs this host\.$/);
   assert.deepEqual(decision(registry, 'c1'), before);
   assert.equal(openCalls.length, opensBefore, 'nothing went to the server');
 
@@ -172,7 +183,7 @@ test('a channel_open whose decision fails to append answers the failure and open
   assert.deepEqual(decision(restarted, 'c1'), { state: 'open', source: 'agent-tool' });
 }));
 
-test('a channel_decline whose decision fails to append fails and acknowledges nothing; its retry records the decline a restart replays', withStore('log-first-decline', async ({ store, failNext }) => {
+test('a channel_decline whose decision fails to append answers that nothing changed and acknowledges nothing; its retry records the decline a restart replays', withStore('log-first-decline', async ({ store, failNext }) => {
   // A channel first seen in a push has no decision yet, so the decline's
   // decision is a change of state and has a record to append.
   const { registry, ackCalls } = makeRegistry(store);
@@ -181,7 +192,11 @@ test('a channel_decline whose decision fails to append fails and acknowledges no
   const decline = { channelId: 'c7', messageId: 'm1', acknowledge: 'not now' };
 
   failNext(decisionWrite);
-  await assert.rejects(registry.handleChannelToolCall('channel_decline', decline), DISK_FULL);
+  const failed = await registry.handleChannelToolCall('channel_decline', decline);
+  assert.equal(failed.success, false);
+  assert.equal(failed.isError, true);
+  assert.match(failed.error ?? '', DISK_FULL);
+  assert.match(failed.error ?? '', /^Nothing changed for channel "c7": this host couldn't record the decision: .*, so no acknowledgment was posted and nothing was sent to the server\. Calling channel_decline again tries again; if it fails the same way, ask whoever runs this host\.$/);
   assert.equal(decision(registry, 'c7'), undefined);
   assert.equal(ackCalls.length, 0, 'nothing went to the server');
 
@@ -190,6 +205,44 @@ test('a channel_decline whose decision fails to append fails and acknowledges no
   assert.deepEqual(ackCalls, ['m1']);
   const restarted = makeRegistry(store).registry;
   assert.deepEqual(decision(restarted, 'c7'), { state: 'closed', source: 'invitation-declined' });
+}));
+
+test('speech whose open fails to append its decision says nothing changed, and what helps', withStore('log-first-speech', async ({ store, failNext }) => {
+  const { registry, openCalls, server } = makeRegistry(store);
+  server.sendChannelsPublish = async () => ({ delivered: true });
+  registry.ensureChannelRegistered('discord', 'c1', '#commons');
+  // A store's words that end in a period lose it where the reason composes
+  // them.
+  failNext(decisionWrite, 'The disk is full.');
+  const outcome = await registry.deliverSpeech('agent', 'hello', 'c1');
+  assert.equal(outcome.status, 'failed');
+  assert.equal(outcome.reason, "opening the channel for these words didn't complete: this host couldn't record the decision: " +
+    'The disk is full, so try again; if it fails the same way, ask whoever runs this host');
+  assert.equal(decision(registry, 'c1'), undefined);
+  assert.deepEqual(openCalls, [], 'nothing went to the server');
+}));
+
+test('a channel_decline whose declined invitation fails to append still declines, and tells the operator', withStore('log-first-declined-record', async ({ store, failNext }) => {
+  // The record of the invitation declined is an audit record, written once
+  // the decline has taken effect: the decision, the acknowledgment and the
+  // close.
+  const { registry, ackCalls } = makeRegistry(store);
+  registry.ensureChannelRegistered('discord', 'c7', '#lobby');
+  failNext(({ id, item }) => id === LIFECYCLE && (item as { kind?: string }).kind === 'invitation-declined');
+  const lines: string[] = [];
+  const original = console.error;
+  console.error = (...args: unknown[]) => { lines.push(args.map(String).join(' ')); };
+  let declined;
+  try {
+    declined = await registry.handleChannelToolCall('channel_decline', { channelId: 'c7', messageId: 'm1', acknowledge: 'not now' });
+  } finally {
+    console.error = original;
+  }
+  assert.equal(declined.success, true);
+  assert.equal((declined.data as { status?: string }).status, 'remained closed');
+  assert.deepEqual(ackCalls, ['m1'], 'the acknowledgment went out once');
+  assert.deepEqual(decision(registry, 'c7'), { state: 'closed', source: 'invitation-declined' });
+  assert.ok(lines.some((line) => line.startsWith('[channel-decline]') && DISK_FULL.test(line)), lines.join('\n'));
 }));
 
 test('a tune-out whose record fails to append fails and leaves the channel undecided; its retry is what a restart replays', withStore('log-first-tune-out', ({ store, failNext }) => {
