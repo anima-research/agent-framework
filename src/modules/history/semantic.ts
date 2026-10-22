@@ -414,7 +414,11 @@ export interface SyncReport {
   inserted: number;
   updated: number;
   unchanged: number;
-  /** True when the tick hit its item cap before reaching the end of the store. */
+  /**
+   * True when items may be left to send: the pass hit its item cap before
+   * the end of the store, edits are still queued, it failed or was backing
+   * off, or the store left the branch it read during it.
+   */
   more: boolean;
   messagesScanned: number;
   summariesScanned: number;
@@ -467,24 +471,34 @@ export class SemanticIndexer {
   onPendingChange: ((p: PendingChanges) => void) | null = null;
   /**
    * Where the sync cursors are kept, set by the host. Without one, as
-   * before the host wires module state, this indexer keeps them itself.
+   * before the host wires module state or after it unwires it, this indexer
+   * goes on from the cursors it last wrote for each branch, which it keeps
+   * in memory. A branch it wrote none for starts with none.
    */
   cursorStore: SyncCursorStore | null = null;
-  private ownCursors: SyncCursors | null = null;
+  /** The cursors this indexer last wrote, by branch id ('' for a store without branches). */
+  private readonly ownCursors = new Map<string, SyncCursors>();
+
+  /** The store's current branch, by id. */
+  private branchId(): string {
+    return (this.cm as { currentBranch?: () => { id: string } | undefined }).currentBranch?.()?.id ?? '';
+  }
 
   /**
-   * This branch's cursors for this indexer's index. Cursors kept for another
-   * namespace, as before the host's index setting changed, are none here.
+   * The current branch's cursors for this indexer's index. Cursors kept for
+   * another namespace, as before the host's index setting changed, are none
+   * here.
    */
   syncCursors(): { summaries: number | null; messages: number | null } {
-    const c = this.cursorStore ? this.cursorStore.read() : this.ownCursors;
+    const c = this.cursorStore ? this.cursorStore.read() : this.ownCursors.get(this.branchId()) ?? null;
     return c && c.namespace === this.cfg.namespace ? c : { summaries: null, messages: null };
   }
 
-  private setSyncCursors(c: { summaries: number | null; messages: number | null }): void {
+  /** Writes the current branch's cursors, which must be `branch`'s. */
+  private setSyncCursors(c: { summaries: number | null; messages: number | null }, branch: string): void {
     const cursors: SyncCursors = { namespace: this.cfg.namespace, summaries: c.summaries, messages: c.messages };
-    if (this.cursorStore) this.cursorStore.write(cursors);
-    else this.ownCursors = cursors;
+    this.ownCursors.set(branch, cursors);
+    this.cursorStore?.write(cursors);
   }
 
   /**
@@ -582,12 +596,10 @@ export class SemanticIndexer {
       // another's cursor past what that branch hasn't sent. A branch with no
       // message cursor starts from the service's watermark, as before cursors
       // were kept per branch, so an upgrade doesn't walk every history again.
-      const branchOf = (): string | null =>
-        (this.cm as { currentBranch?: () => { id: string } | undefined }).currentBranch?.()?.id ?? null;
-      const branch = branchOf();
+      const branch = this.branchId();
       // Set when a read of the store finds it on another branch.
       let strayed = false;
-      const reading = (): void => { if (branchOf() !== branch) strayed = true; };
+      const reading = (): void => { if (this.branchId() !== branch) strayed = true; };
       let kept = this.syncCursors();
       // A namespace that doesn't exist holds nothing of this branch's, as after
       // an index is deleted, so the cursors start over, at once, so a pass
@@ -595,7 +607,7 @@ export class SemanticIndexer {
       // over.
       if (noIndex && (kept.summaries !== null || kept.messages !== null)) {
         kept = { summaries: null, messages: null };
-        this.setSyncCursors(kept);
+        this.setSyncCursors(kept, branch);
       }
       const sumCursor = kept.summaries;
       const msgWm = kept.messages ?? stats?.by_kind.message?.max_cursor ?? null;
@@ -785,13 +797,17 @@ export class SemanticIndexer {
         fromMs = lastMs;
       }
       await flush();
-      // Every send of this pass is in, so its cursors stand. A pass that moves
-      // neither cursor writes no state.
+      // Every send of this pass is in, so its cursors stand, unless the store
+      // left the branch the pass read during it: what it read may then be
+      // another branch's. A pass that moves neither cursor writes no state.
       const msgNext = msgThrough ?? msgWm;
-      if ((sumNext !== kept.summaries || msgNext !== kept.messages) && !strayed && branchOf() === branch) {
-        this.setSyncCursors({ summaries: sumNext, messages: msgNext });
+      const left = strayed || this.branchId() !== branch;
+      if ((sumNext !== kept.summaries || msgNext !== kept.messages) && !left) {
+        this.setSyncCursors({ summaries: sumNext, messages: msgNext }, branch);
       }
       if (notStats && report.more) throw notStats;
+      // The current branch may then have items this pass didn't send.
+      if (left) report.more = true;
       this.consecutiveFailures = 0; this.lastError = named(notStats?.message ?? null, ...phaseErrors); this.lastSyncAt = Date.now();
       return report;
     } catch (e) {

@@ -126,7 +126,7 @@ const cursors = (r: Rig): { namespace?: string; summaries?: number | null; messa
   (r.state()?.semanticCursors ?? {}) as { namespace?: string; summaries?: number | null; messages?: number | null };
 
 /** A store, a history module started on the store's module state and bound to it, and a fake service. */
-async function rig(t: { after(fn: () => Promise<void>): void }, opts: { maxSyncBeforeSearch?: number; overlapMs?: number } = {}): Promise<Rig> {
+async function rig(t: { after(fn: () => Promise<void>): void }, opts: { maxSyncBeforeSearch?: number; overlapMs?: number; syncBatch?: number } = {}): Promise<Rig> {
   const svc = new FakeService();
   await svc.start();
   const dir = mkdtempSync(join(tmpdir(), 'semantic-branches-'));
@@ -436,12 +436,14 @@ it('a deleted index gets every message and summary again, and so does an index u
   other.items.set('msg:elsewhere', { id: 'msg:elsewhere', text: 'something else', kind: 'message', cursor: 1 });
   const stateId = 'modules/history/state';
   const ctx = { getState: () => r.store.getStateJson(stateId), setState: (v: unknown) => { r.store.setStateJson(stateId, v); } } as never;
-  const mod2 = new HistoryModule({ semantic: { url: other.url, namespace: 'ns2', syncIntervalMs: 0 } });
+  const mod2 = new HistoryModule({ semantic: { url: other.url, namespace: 'ns2', syncIntervalMs: 0, overlapMs: 0 } });
   await mod2.start(ctx);
   mod2.bind(r.manager);
   t.after(() => mod2.stop());
   await mod2.syncSemanticIndex();
   assert.deepEqual(other.summaryKeys(), keys);
+  // Its walk starts at that index's own watermark, not at the cursor kept for the other.
+  assert.deepEqual([...other.items.keys()].filter((k) => k.startsWith('msg:') && k !== 'msg:elsewhere').sort(), messageKeys);
   assert.equal(cursors(r).namespace, 'ns2');
 });
 
@@ -514,10 +516,11 @@ it('a pass that reads another branch and comes back writes no cursor', async (t)
   // and the messages' upsert moves it back.
   let n = 0;
   r.svc.onUpsert = async () => { n++; if (n === 1) await r.manager.switchBranch('side'); else if (n === 2) { r.svc.onUpsert = null; await r.manager.switchBranch(trunk); } };
-  await r.mod.syncSemanticIndex();
+  const report = (await r.mod.syncSemanticIndex())!;
   assert.equal(r.manager.currentBranch().name, trunk);
   assert.ok(n >= 2, 'the premise: both upserts ran');
   assert.deepEqual(cursors(r), {}, 'no cursor written from the side\'s reads');
+  assert.equal(report.more, true, 'and the pass says items may be left');
 });
 
 it('a pass that finds its index deleted starts the cursors over even if it fails partway through', async (t) => {
@@ -527,8 +530,10 @@ it('a pass that finds its index deleted starts the cursors over even if it fails
   await r.mod.syncSemanticIndex();
   assert.notDeepEqual(cursors(r), {});
   r.svc.items.clear();
-  r.svc.failMessageUpserts = 1;
+  // The pass's first upsert, the summaries', fails.
+  r.svc.failUpserts = 1;
   await r.mod.syncSemanticIndex();
+  assert.equal(r.svc.failUpserts, 0, 'the premise: the upsert was refused');
   assert.equal(cursors(r).summaries ?? null, null);
   assert.equal(cursors(r).messages ?? null, null);
 });
@@ -539,6 +544,7 @@ it('a pass whose messages\' upsert fails after its summaries went in writes no c
   await r.talk('apples');
   r.svc.failMessageUpserts = 1;
   await r.mod.syncSemanticIndex();
+  assert.equal(r.svc.failMessageUpserts, 0, 'the premise: the messages\' upsert was refused');
   assert.ok(r.svc.summaryKeys().length > 0, 'the premise: the summaries went in');
   assert.deepEqual(cursors(r), {});
 });
@@ -553,11 +559,16 @@ it('an old item holding another branch\'s text is left out once the cursor cover
   // An item from before keys carried the creation time, under this summary's id, with another branch's text.
   r.svc.items.set(`sum:${apples!.id}`, { id: `sum:${apples!.id}`, text: 'Summary about cherries.', kind: 'summary', cursor: apples!.created });
   // One hit asked for: the first answer is the old item alone.
-  assert.deepEqual((await r.search('cherries', 1)).hits, []);
+  const res = await r.search('cherries', 1);
+  assert.deepEqual(res.hits, []);
+  // Left out by the cursor, which counts nothing, not as off the branch or stale.
+  assert.equal(res.droppedOffBranch, 0);
+  assert.equal(res.droppedStale, 0);
 });
 
 it('a hit for a summary whose ts can\'t be read is named by its id in the host\'s log', async (t) => {
-  const r = await rig(t);
+  // No catch-up before the search, which would send the summary again with its ts.
+  const r = await rig(t, { maxSyncBeforeSearch: 0 });
   const warn = t.mock.method(console, 'warn', () => {});
   await r.talk('apples');
   await r.mod.syncSemanticIndex();
@@ -570,15 +581,125 @@ it('a hit for a summary whose ts can\'t be read is named by its id in the host\'
   assert.ok(said[0]!.includes(`"sum:${apples!.id}" (ts)`), said[0]);
 });
 
-it('after stop(), the indexer keeps its own cursors, so its passes don\'t send everything again', async (t) => {
+it('after stop(), a pass goes on from the cursors last written for its branch', async (t) => {
   const r = await rig(t);
   await r.talk('apples');
   await r.mod.syncSemanticIndex();
   await r.mod.stop();
-  // The first pass after stop() starts from no cursors, so it sends every summary as new.
-  await r.mod.syncSemanticIndex();
+  const earlier = new Set(r.summaries().map((s) => `${s.id}@${s.created}`));
+  await r.talk('bananas');
+  const added = r.summaries().filter((s) => !earlier.has(`${s.id}@${s.created}`));
+  assert.ok(added.length > 0, 'the premise: new summaries');
   const deletes = r.svc.deleteCalls;
-  // The second starts from the cursors the first kept, so nothing is new and no old key is deleted.
+  const report = (await r.mod.syncSemanticIndex())!;
+  assert.equal(report.summariesScanned, r.summaries().length, 'the premise: the pass ran');
+  assert.ok(added.every((s) => r.svc.items.has(`sum:${s.id}@${s.created}`)), 'the new summaries were sent');
+  // Only the new summaries were new to it, so only their old keys were deleted.
+  assert.equal(r.svc.deleteCalls, deletes + 1);
+  assert.deepEqual(r.svc.deletes.slice(-1)[0]!.sort(), added.map((s) => `sum:${s.id}`).sort());
+});
+
+it('after stop(), a pass on another branch doesn\'t take the cursors written on the last one', async (t) => {
+  const r = await rig(t);
+  await r.talk('apples');
+  const trunk = r.manager.currentBranch().name;
+  r.store.createBranchAt('side', trunk, r.store.currentSequence());
+  await r.manager.switchBranch('side');
+  await r.talk('cherries');
+  const cherries = r.summaries().find((s) => s.content.includes('cherries'))!;
+  assert.ok(cherries, JSON.stringify(r.summaries()));
+  await r.manager.switchBranch(trunk);
+  await r.talk('bananas');
+  const bananas = r.summaries().find((s) => s.content.includes('bananas'))!;
+  assert.ok(bananas.created > cherries.created, 'the premise: the trunk\'s summary is newer than the side\'s');
   await r.mod.syncSemanticIndex();
-  assert.equal(r.svc.deleteCalls, deletes);
+  await r.mod.stop();
+  await r.manager.switchBranch('side');
+  await r.mod.syncSemanticIndex();
+  assert.ok(r.svc.items.has(`sum:${cherries.id}@${cherries.created}`), JSON.stringify(r.svc.summaryKeys()));
+});
+
+it('a pass whose summaries are read on another branch writes no cursor', async (t) => {
+  const r = await rig(t);
+  await r.talk('apples');
+  await r.mod.syncSemanticIndex();
+  const before = cursors(r);
+  const trunk = r.manager.currentBranch().name;
+  r.store.createBranchAt('side', trunk, r.store.currentSequence());
+  const id = r.manager.addMessage('user', say('edited', 0));
+  r.manager.editMessage(id, [{ type: 'text', text: 'topic-edited, in other words' }] as never);
+  // The edit's upsert moves the store to the side, where the summaries are read,
+  // and the summaries' upsert moves it back, before the message walk reads.
+  let n = 0;
+  r.svc.onUpsert = async () => { n++; if (n === 1) await r.manager.switchBranch('side'); else if (n === 2) { r.svc.onUpsert = null; await r.manager.switchBranch(trunk); } };
+  const report = (await r.mod.syncSemanticIndex())!;
+  assert.ok(n >= 2, 'the premise: the edit\'s and the summaries\' upserts ran');
+  assert.equal(r.manager.currentBranch().name, trunk);
+  assert.deepEqual(cursors(r), before, 'the new message\'s cursor isn\'t written');
+  assert.equal(report.more, true);
+});
+
+it('a pass the store leaves between message pages writes no cursor', async (t) => {
+  // One flush per page of 256, so the store can move between the pages' reads.
+  const r = await rig(t, { syncBatch: 256 });
+  const trunk = r.manager.currentBranch().name;
+  for (let i = 0; i < 300; i++) r.manager.addMessage(i % 2 ? 'agent' : 'user', say('many', i));
+  r.store.createBranchAt('side', trunk, r.store.currentSequence());
+  // The first page's upsert moves the store to the side, where the second page is read,
+  // and the last upsert moves it back.
+  let n = 0;
+  r.svc.onUpsert = async () => { n++; if (n === 1) await r.manager.switchBranch('side'); else if (n === 2) { r.svc.onUpsert = null; await r.manager.switchBranch(trunk); } };
+  const report = (await r.mod.syncSemanticIndex())!;
+  assert.equal(n, 2, 'the premise: one upsert per page');
+  assert.equal(report.messagesScanned, 300);
+  assert.equal(r.manager.currentBranch().name, trunk);
+  assert.deepEqual(cursors(r), {});
+});
+
+it('a pass the store leaves after its last read writes no cursor where it lands', async (t) => {
+  const r = await rig(t);
+  await r.talk('apples');
+  const trunk = r.manager.currentBranch().name;
+  r.store.createBranchAt('side', trunk, r.store.currentSequence());
+  // The last upsert, the messages', moves the store to the side, after every read.
+  let n = 0;
+  r.svc.onUpsert = async () => { n++; if (n === 2) { r.svc.onUpsert = null; await r.manager.switchBranch('side'); } };
+  const report = (await r.mod.syncSemanticIndex())!;
+  assert.equal(n, 2, 'the premise: the summaries\' and the messages\' upserts');
+  assert.equal(r.manager.currentBranch().name, 'side');
+  assert.deepEqual(cursors(r), {}, 'no cursor written into the side\'s state');
+  assert.equal(report.more, true);
+});
+
+it('a deleted index whose branch kept only a summary cursor sends every summary again', async (t) => {
+  const r = await rig(t);
+  await r.talk('apples');
+  // Later summaries, a millisecond or more after the first ones, so a cursor at the newest leaves those out.
+  await new Promise((res) => setTimeout(res, 5));
+  await r.talk('bananas');
+  await r.mod.syncSemanticIndex();
+  const keys = r.svc.summaryKeys();
+  const newest = Math.max(...r.summaries().map((s) => s.created));
+  assert.ok(r.summaries().some((s) => s.created < newest), 'the premise: a summary older than the cursor');
+  r.store.setStateJson('modules/history/state', { semanticCursors: { namespace: 'ns', summaries: newest, messages: null } });
+  r.svc.items.clear();
+  await r.mod.syncSemanticIndex();
+  assert.deepEqual(r.svc.summaryKeys(), keys);
+});
+
+it('a deleted index whose branch kept only a message cursor sends every message again', async (t) => {
+  // No overlap, so only the cursor decides where the walk starts.
+  const r = await rig(t, { overlapMs: 0 });
+  // A message a millisecond or more older than the cursor's, which a walk from the cursor doesn't reach.
+  r.manager.addMessage('user', say('early', 0));
+  await new Promise((res) => setTimeout(res, 5));
+  await r.talk('apples');
+  await r.mod.syncSemanticIndex();
+  const messageKeys = [...r.svc.items.keys()].filter((k) => k.startsWith('msg:')).sort();
+  const early = [...r.svc.items.values()].filter((it) => it.kind === 'message' && it.text.includes('topic-early'));
+  assert.ok(early.length === 1 && early[0]!.cursor! < cursors(r).messages!, 'the premise: the early message is older than the cursor');
+  r.store.setStateJson('modules/history/state', { semanticCursors: { namespace: 'ns', summaries: null, messages: cursors(r).messages } });
+  r.svc.items.clear();
+  await r.mod.syncSemanticIndex();
+  assert.deepEqual([...r.svc.items.keys()].filter((k) => k.startsWith('msg:')).sort(), messageKeys);
 });
