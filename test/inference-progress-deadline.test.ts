@@ -213,6 +213,22 @@ test('create refuses a progress deadline membrane would read as none, and names 
   }
 });
 
+test('null counts as not set: create and a direct call take the default', async () => {
+  // As in the other configuration checks, so a generated config that writes
+  // an unset setting as null keeps working.
+  assert.equal(
+    (await turnOptions({ inferenceProgressTimeoutMs: null as unknown as number }))?.progressTimeoutMs,
+    DEFAULT_INFERENCE_PROGRESS_TIMEOUT_MS,
+  );
+  const membrane = new RecordingMembrane();
+  await withFramework(membrane, {}, async (framework) => {
+    const agent = framework.getAgent('agent')!;
+    agent.getContextManager().addMessage('user', [{ type: 'text', text: 'hello' }]);
+    await agent.runInference(framework.getAllTools(), undefined, { progressTimeoutMs: null as unknown as number });
+    assert.deepEqual(membrane.options.map((o) => o?.progressTimeoutMs), [DEFAULT_INFERENCE_PROGRESS_TIMEOUT_MS]);
+  });
+});
+
 test('a turn whose stream ended on its progress deadline goes to the error policy as a retryable timeout, and the retry gets its own deadline', async () => {
   const membrane = new RecordingMembrane();
   membrane.streams.push(() => new ExpiredStream());

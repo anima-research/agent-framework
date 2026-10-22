@@ -32,8 +32,8 @@ export interface ActivationRequestOptions {
    *  run (see `compileWithInjections` for what that leaves alone). */
   dryRun?: boolean;
   /** The stream's progress deadline, per provider call (membrane's
-   *  `progressTimeoutMs`): DEFAULT_INFERENCE_PROGRESS_TIMEOUT_MS when absent.
-   *  A value membrane would read as no deadline is refused
+   *  `progressTimeoutMs`): DEFAULT_INFERENCE_PROGRESS_TIMEOUT_MS when absent
+   *  or null. A value membrane would read as no deadline is refused
    *  (assertProgressTimeout). */
   progressTimeoutMs?: number;
 }
@@ -110,13 +110,15 @@ export const DEFAULT_INFERENCE_PROGRESS_TIMEOUT_MS = 30 * 60_000;
  * Refuse a progress deadline that isn't a positive number of ms or Infinity.
  * Membrane reads zero, a negative or NaN as no deadline at all, so one written
  * meaning "off" would leave a stalled stream unbounded, and one written by
- * slip would do the same. Infinity is the way to run with no bound, and
- * `undefined` gets DEFAULT_INFERENCE_PROGRESS_TIMEOUT_MS where it's read. As
- * the other configuration refusals do, it names what the value is, never the
- * value itself, which could be a secret pasted into the wrong field.
+ * slip would do the same. Infinity is the way to run with no bound.
+ * `undefined` and `null` count as not set, as in the other configuration
+ * checks, so a generated config that writes an unset setting as null keeps
+ * working; either gets DEFAULT_INFERENCE_PROGRESS_TIMEOUT_MS where it's read.
+ * As the other configuration refusals do, it names what the value is, never
+ * the value itself, which could be a secret pasted into the wrong field.
  */
 export function assertProgressTimeout(setting: string, value: unknown): void {
-  if (value === undefined) return;
+  if (value === undefined || value === null) return;
   if (typeof value !== 'number' || !(value > 0)) {
     const what = typeof value !== 'number' ? kindOf(value)
       : Number.isNaN(value) ? 'NaN' : value === 0 ? 'zero' : 'a negative number';

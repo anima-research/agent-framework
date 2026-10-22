@@ -213,9 +213,10 @@ export interface FrameworkConfig {
    * error policy retries it, each attempt with a fresh deadline, and a stall
    * that persists exhausts the turn with its reason. With the default policy
    * that is four attempts, so about two hours at the default bound. Infinity
-   * never expires. Anything else that isn't a positive number of ms, such as
-   * zero, a negative number or NaN, which membrane would read as no deadline,
-   * is refused at create with a RangeError.
+   * never expires. Left out or null, it's the default. Anything else that
+   * isn't a positive number of ms, such as zero, a negative number or NaN,
+   * which membrane would read as no deadline, is refused at create with a
+   * RangeError.
    */
   inferenceProgressTimeoutMs?: number;
 

@@ -319,8 +319,9 @@ export interface InferenceOptions {
   /** Abort signal for cancellation */
   signal?: AbortSignal;
   /** Each provider call's progress deadline (membrane's `progressTimeoutMs`):
-   *  DEFAULT_INFERENCE_PROGRESS_TIMEOUT_MS when absent. Anything but a positive
-   *  number of ms or Infinity throws a RangeError before the call starts.
+   *  DEFAULT_INFERENCE_PROGRESS_TIMEOUT_MS when absent or null. Anything else
+   *  but a positive number of ms or Infinity throws a RangeError before the
+   *  call starts.
    *  On expiry the result is aborted, with `abortReason: 'timeout'`: the direct
    *  API doesn't retry, so what to do next is the caller's. */
   progressTimeoutMs?: number;

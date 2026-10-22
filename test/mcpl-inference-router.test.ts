@@ -303,7 +303,7 @@ for (const mode of ['native', 'xml'] as const) {
       // only one the router's calls carry is the progress deadline, so the
       // answer names the setting to raise.
       const answer = await ask(
-        { chunks: ['A summ'], fails: new TimeoutAbortError('no event for 120000ms') },
+        { chunks: ['A summ'], fails: new TimeoutAbortError('No provider progress within 1800000ms') },
         { stream: true, mode },
       );
       const message = 'No stream progress within 1800000ms (inferenceProgressTimeoutMs)';
