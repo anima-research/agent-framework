@@ -785,3 +785,30 @@ it('an index that loses every summary but keeps its messages gets every summary 
   await r.mod.syncSemanticIndex();
   assert.deepEqual(r.svc.summaryKeys(), keys);
 });
+
+it('an index restored from before summaries were keyed leaves out the old items this branch\'s cursor covers, until it is rebuilt', async (t) => {
+  const r = await rig(t);
+  await r.talk('apples');
+  await new Promise((res) => setTimeout(res, 5));
+  await r.talk('bananas');
+  await new Promise((res) => setTimeout(res, 5));
+  await r.talk('cherries');
+  await r.mod.syncSemanticIndex();
+  const mine = r.summaries();
+  const only = (topic: string) => mine.find((s) => s.content === `Summary about ${topic}.`)!;
+  const [apples, bananas, cherries] = [only('apples'), only('bananas'), only('cherries')];
+  assert.ok(apples && bananas && cherries, JSON.stringify(mine));
+  // Restored from a backup taken before the upgrade, and before cherries: each summary under its id alone, as
+  // an earlier version indexed it, with its creation time as its cursor, and the namespace kept.
+  const restored = mine.filter((s) => s.created < cherries.created);
+  r.svc.items.clear();
+  for (const s of restored) r.svc.items.set(`sum:${s.id}`, { id: `sum:${s.id}`, text: s.content, kind: 'summary', cursor: s.created });
+  const newest = Math.max(...restored.map((s) => s.created));
+  assert.ok(apples.created < newest && newest < (cursors(r).summaries as number),
+    'the premise: apples is older than the index\'s newest item, so no pass sends it again, and the cursor is newer still');
+  const shown = `sum:${apples.id} ${apples.content}`;
+  assert.ok(!(await r.search('apples')).hits.includes(shown), 'its old item is left out');
+  // A rebuild: the namespace deleted, so the next pass sends everything again.
+  r.svc.items.clear();
+  assert.ok((await r.search('apples')).hits.includes(shown));
+});

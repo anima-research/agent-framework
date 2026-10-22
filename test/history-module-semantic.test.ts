@@ -273,11 +273,33 @@ describe('HistoryModule semantic_search', () => {
       assert.deepEqual(edata.hits.filter((h) => h.score > 0.5), [], 'the other branch\'s summary is not a hit here');
       assert.equal(edata.index.droppedOffBranch, 1);
       const morning = await mod.handleToolCall({ id: 'm', name: 'semantic_search', input: { query: 'morning', level: 1 } });
-      const hit = (morning.data as { hits: Array<{ id: string; snippet: string; score: number; timestamp: string | null }> }).hits.find((h) => h.id === 'sum:s1');
+      const hit = (morning.data as { hits: Array<{ id: string; snippet: string; chars: number; score: number; timestamp: string | null }> }).hits.find((h) => h.id === 'sum:s1');
       assert.ok(hit, JSON.stringify(morning.data));
       assert.equal(hit.score, 0.9, 'ranked by its own text');
       assert.equal(hit.timestamp, new Date(T0 + 86_400_000).toISOString(), 'and dated by its own start');
       assert.equal(hit.snippet, 'Summary of a morning on this branch');
+      assert.equal(hit.chars, 'Summary of a morning on this branch'.length);
+      await mod.stop();
+    } finally { await svc2.stop(); }
+  });
+
+  it('an item from before keys carried the creation time is shown with the local summary and its chars while no cursor covers it, whatever text the index holds', async () => {
+    // Before this branch's passes reach the summary, its old-form item is
+    // checked as before: ranked by the text the index holds, shown with the
+    // local summary's.
+    const svc2 = new FakeService(); await svc2.start();
+    try {
+      const local = [{ ...summaries[0], content: 'Summary of a morning on this branch' }];
+      svc2.items.set('sum:s1', { id: 'sum:s1', text: 'Summary of the evening', kind: 'summary', level: 1, ts: T0, cursor: T0 + 9000 } as never);
+      const mod = new HistoryModule({ semantic: { url: svc2.url, token: 'tok', namespace: 'test/ns', syncIntervalMs: 0, maxSyncBeforeSearch: 0 } });
+      mod.bind(stubCm(messages, local));
+      const res = await mod.handleToolCall({ id: 'o', name: 'semantic_search', input: { query: 'evening', level: 1 } });
+      assert.equal(res.success, true, JSON.stringify(res));
+      const hit = (res.data as { hits: Array<{ id: string; snippet: string; chars: number; score: number }> }).hits.find((h) => h.id === 'sum:s1');
+      assert.ok(hit, JSON.stringify(res.data));
+      assert.equal(hit.score, 0.9, 'ranked by the text the index holds, the only one with "evening"');
+      assert.equal(hit.snippet, 'Summary of a morning on this branch');
+      assert.equal(hit.chars, 'Summary of a morning on this branch'.length);
       await mod.stop();
     } finally { await svc2.stop(); }
   });
