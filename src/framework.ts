@@ -1239,6 +1239,10 @@ const RETRY_CANCELLED_BY_STOP = 'a retry waiting while the framework was stoppin
  *  revive the earlier lifecycle's turn in the next one. */
 const RETRY_ACROSS_RESTART = 'a retry waiting while the framework was stopped and started again is dropped before it sends anything';
 
+/** The reason on the inference:aborted that ends a turn whose continuation
+ *  was dropped before it started, other than by an abandon or a stop. */
+const CONTINUATION_DROPPED = "a turn's continuation was dropped before it started";
+
 /** One frame's window while it holds a turn with no stream and one of its
  *  checks is ahead (AgentFramework.checkAhead). `abandoned` is an operator's
  *  quiesce abandon that reached the turn there, which the frame's check
@@ -1603,14 +1607,20 @@ export interface HostModeStatus {
   quiesced: boolean;
   reason?: string;
   since?: number;
-  /** True when no turn is alive (activeTurnTokens empty — the token spans
-   * dequeue → settled teardown, strictly wider than activeStreams). */
+  /** True when no turn is alive: no turn token (the token spans dequeue →
+   * settled teardown, strictly wider than activeStreams) and no continuation
+   * of a turn on its way to its start (a budget restart's or a tool-result
+   * guard's retry, queued, held by a provider hold, parked or in a scheduler
+   * pass), and no wake parked on provider admission. It covers the
+   * framework's own turns: a caller of the direct Agent API
+   * (`Agent.runInference`) owns its turns' timing. */
   drained: boolean;
   activeTurns: number;
-  /** The agents holding a turn, the ones `activeTurns` counts, sorted: each
-   * from its turn's dequeue to its settled teardown, so a turn in its hooks
-   * or compile, or one finishing its deliveries, is listed. These are the
-   * agents an abandon or a stop() made now would find mid-turn. */
+  /** The agents with a turn alive, the ones `activeTurns` counts, sorted:
+   * each from its turn's dequeue to its settled teardown, so a turn in its
+   * hooks or compile, one finishing its deliveries, or one whose continuation
+   * is on its way to its start, is listed. These are the agents an abandon or
+   * a stop() made now would find mid-turn. */
   activeTurnAgents: string[];
   /** Wakes that own provider admission while waiting for an in-flight
    * auxiliary call — no turn token yet, but a turn is one settle away. The
@@ -1837,6 +1847,9 @@ interface ProviderAccelerationCooldown {
   /** Armed by an auxiliary (compression) failure with no primary involved:
    *  release reopens auxiliary admission without synthesising an inference. */
   auxiliaryOrigin?: boolean;
+  /** Its held requests were taken out by dropContinuations: release reopens
+   *  admission without synthesising an inference in their place. */
+  emptiedByDrop?: boolean;
   /** Set when this hold is a provider wait (a stated retry-after) for the
    *  agent's primary model: it holds primary turns only. Auxiliary calls are
    *  admitted per model by the provider waits themselves, so a compression
@@ -2383,6 +2396,11 @@ type McpRestartClaim = { readonly restarting: string; endedBy?: string };
 /** Why the framework cancelled a stream it owns: the mark it records, by
  *  agent and stream, before the cancel, for the stream's terminal to read. */
 type FrameworkCancelKind = 'turn_ended' | 'budget_restart' | 'quiesce_abandoned' | 'shutdown';
+/** How a turn whose continuation is dropped before it starts ends: an
+ *  operator's quiesce abandon or stop() settles it as a stop ends a turn's
+ *  start; any other drop ends it as a start dropped before it sends anything.
+ *  `why` is said in the line its end logs. */
+type ContinuationDrop = { kind: 'quiesce_abandoned' | 'shutdown' | 'dropped'; why: string };
 
 /** What opened a channel the agent didn't ask to open
  *  (recordChannelAutoOpenNotice). */
@@ -2813,6 +2831,15 @@ export class AgentFramework {
   // and its settle except that turn's own blocks, and, before its checkpoint,
   // the inputs its start writes (flushForStart).
   private activeTurnTokens: Map<string, number> = new Map();
+  /** Each running scheduler pass's requests, which it took from
+   *  pendingRequests: it holds them while it awaits each agent's start in
+   *  turn, so a continuation among them is still on its way
+   *  (pendingContinuationAgents). */
+  private passRequests: Set<Map<string, InferenceRequest[]>> = new Set();
+  /** Continuations whose start waits on provider admission behind an
+   *  auxiliary call, in no queue meanwhile. A drop takes one out and gives
+   *  its admission back; the park, woken, then finds it gone. */
+  private parkedContinuations: Set<InferenceRequest> = new Set();
   /** Each turn whose settle has ended it (settleAgent, endDroppedTurn), for
    *  its agent's scripts: its start's teardown can still hold the agent's
    *  token, and a turn that has ended isn't live (liveTurns). A later start
@@ -4010,6 +4037,16 @@ export class AgentFramework {
     // framework must not keep up to the whole ledger budget referenced.
     this.toolImageLedgers.clear();
 
+    // A turn whose continuation is still on its way ends with the stop, as
+    // a turn's start a stop reaches does: the continuation would start only
+    // after a start(), in a lifecycle where its logical turn is gone
+    // (openLogical, below). Before the holds and the parks go, so the
+    // continuation leaves them with its turn.
+    step(() => {
+      for (const agentName of this.pendingContinuationAgents()) {
+        this.dropContinuations(agentName, { kind: 'shutdown', why: 'the framework is stopping' });
+      }
+    });
     // A stopped host must never hang behind its own cooldown.
     step(() => this.cancelProviderAdmission());
     // An open logical turn doesn't survive a stop: a start after a restart
@@ -4665,7 +4702,8 @@ export class AgentFramework {
       // The stated wait (recorded above for agent.model) set this hold's
       // length: an operator release of it returns the hold to AF's own pacing.
       ...(pacing?.stated ? { statedWait: { model: agent.model, ownUntil: now + pacing.ownMs } } : {}),
-      ...(auxiliary && (!existing || existing.auxiliaryOrigin) ? { auxiliaryOrigin: true } : {}) });
+      ...(auxiliary && (!existing || existing.auxiliaryOrigin) ? { auxiliaryOrigin: true } : {}),
+      ...(existing?.emptiedByDrop && held.length === 0 ? { emptiedByDrop: true } : {}) });
     if (auxiliary && !existing) {
       console.error(`[provider-cooldown] agent=${agent.name} host hold (${hostHold!.reason}) from an auxiliary call — ` +
         `holding primary/auxiliary for ${delayMs}ms`);
@@ -4772,9 +4810,12 @@ export class AgentFramework {
           ? `no longer holds primary turns: the primary model is now ${model} (the wait stays recorded)`
           : `primary hold ended after ${Date.now() - cooldown.startedAt}ms`));
     }
-    if (cooldown.auxiliaryOrigin && cooldown.heldRequests.length === 0) {
-      // Nobody asked for an inference while parked: just reopen the gate.
-      console.error(`[provider-cooldown] agent=${agentName} auxiliary hold released after ${Date.now() - cooldown.startedAt}ms`);
+    if ((cooldown.auxiliaryOrigin || cooldown.emptiedByDrop) && cooldown.heldRequests.length === 0) {
+      // Nobody asked for an inference while parked, or what was held was a
+      // continuation since dropped with its turn: just reopen the gate. A
+      // primary the hold left pending won't run, so its recovery ends.
+      console.error(`[provider-cooldown] agent=${agentName} ${cooldown.auxiliaryOrigin ? 'auxiliary hold' : 'hold, its held continuation dropped,'} released after ${Date.now() - cooldown.startedAt}ms`);
+      if (cooldown.emptiedByDrop) this.endPendingPrimary(agentName);
       this.flushAuxiliaryAdmission(agentName);
       return;
     }
@@ -6451,15 +6492,49 @@ export class AgentFramework {
     return n;
   }
 
+  /**
+   * A continuation the framework queues for a turn (a budget restart, or a
+   * tool-result guard's retry) holds no turn token until its start takes one:
+   * its turn's stream has ended, and its start can wait in the queue, a
+   * provider hold, a park on admission or a scheduler pass's hands. Its turn
+   * is alive meanwhile. These are the agents with one on its way. A
+   * `tool_results_ready` continuation comes only from the direct Agent API,
+   * whose caller owns its turn's timing, so it isn't counted.
+   */
+  private pendingContinuationAgents(except?: readonly InferenceRequest[]): Set<string> {
+    const agents = new Set<string>();
+    const add = (r: InferenceRequest): void => {
+      if (resumesLogicalTurn(r.reason) && !except?.includes(r)) agents.add(r.agentName);
+    };
+    for (const r of this.pendingRequests) add(r);
+    for (const cooldown of this.providerAccelerationCooldowns?.values() ?? []) for (const r of cooldown.heldRequests) add(r);
+    for (const r of this.parkedContinuations ?? []) add(r);
+    for (const pass of this.passRequests ?? []) for (const requests of pass.values()) for (const r of requests) add(r);
+    return agents;
+  }
+
+  /** The agents with a turn alive: holding a turn token, or with a
+   *  continuation of their turn on its way. */
+  private turnHolders(): Set<string> {
+    const holders = this.pendingContinuationAgents();
+    for (const name of this.activeTurnTokens.keys()) holders.add(name);
+    return holders;
+  }
+
+  private hasTurn(agentName: string): boolean {
+    return this.activeTurnTokens.has(agentName) || this.pendingContinuationAgents().has(agentName);
+  }
+
   getHostModeStatus(): HostModeStatus {
     const parkedAdmissions = this.parkedAdmissionCount();
+    const holders = this.turnHolders();
     return {
       quiesced: this.quiesced,
       ...(this.quiesceReason ? { reason: this.quiesceReason } : {}),
       ...(this.quiescedAt !== undefined ? { since: this.quiescedAt } : {}),
-      drained: this.activeTurnTokens.size === 0 && parkedAdmissions === 0,
-      activeTurns: this.activeTurnTokens.size,
-      activeTurnAgents: [...this.activeTurnTokens.keys()].sort(),
+      drained: holders.size === 0 && parkedAdmissions === 0,
+      activeTurns: holders.size,
+      activeTurnAgents: [...holders].sort(),
       parkedAdmissions,
       gatedRequests: this.pendingRequests.filter((r) => !isTurnContinuation(r.reason)).length,
       backgroundScripts: this.codeExecution?.scripts.leftRunning() ?? 0,
@@ -6489,7 +6564,10 @@ export class AgentFramework {
    * On drain timeout the host STAYS quiesced (`drained: false` in the
    * result); with `abandon: true` the undrained streams are cancelled via a
    * dedicated cancel kind that settles the turn without feeding the
-   * inference-failure accounting.
+   * inference-failure accounting, and a turn whose continuation hasn't
+   * started ends with the continuation dropped. Drain covers the framework's
+   * own turns: a caller of the direct Agent API (`Agent.runInference`) owns
+   * its turns' timing.
    */
   async quiesce(opts?: {
     reason?: string;
@@ -6515,13 +6593,13 @@ export class AgentFramework {
       // out undrained must be escalatable with a second quiesce({abandon})
       // without resume()+re-quiesce (which would reopen data planes and
       // release parked wakes mid-surgery).
-      if (opts?.abandon && this.activeTurnTokens.size > 0) {
+      if (opts?.abandon && this.turnHolders().size > 0) {
         const unabandonable = await this.abandonActiveTurns();
         this.emitTrace({
           type: 'host:quiesce',
           ...(this.quiesceReason ? { reason: this.quiesceReason } : {}),
-          drained: this.activeTurnTokens.size === 0,
-          activeTurns: this.activeTurnTokens.size,
+          drained: this.turnHolders().size === 0,
+          activeTurns: this.turnHolders().size,
           abandoned: true,
           ...(unabandonable.length > 0 ? { unabandonable } : {}),
         });
@@ -6547,7 +6625,7 @@ export class AgentFramework {
     this.lastUnabandonable = [];
     console.error(
       `[host-mode] quiescing${opts?.reason ? ` (${opts.reason})` : ''}: parking wakes, ` +
-      `pausing MCPL data planes, draining ${this.activeTurnTokens.size} in-flight turn(s)`,
+      `pausing MCPL data planes, draining ${this.turnHolders().size} in-flight turn(s)`,
     );
     this.eventGate?.setQuiesced(true);
     for (const connection of this.mcplServerRegistry?.getAllServers() ?? []) {
@@ -6573,7 +6651,7 @@ export class AgentFramework {
     while (
       this.quiesced &&
       !this.queue?.isClosed &&
-      (this.activeTurnTokens.size > 0 || this.parkedAdmissionCount() > 0) &&
+      (this.turnHolders().size > 0 || this.parkedAdmissionCount() > 0) &&
       Date.now() < deadline
     ) {
       await new Promise((resolve) => setTimeout(resolve, 250));
@@ -6597,7 +6675,7 @@ export class AgentFramework {
 
     let abandoned = false;
     let unabandonable: string[] = [];
-    if (this.activeTurnTokens.size > 0 && opts?.abandon) {
+    if (this.turnHolders().size > 0 && opts?.abandon) {
       abandoned = true;
       unabandonable = await this.abandonActiveTurns();
       if (!this.quiesced) return this.getHostModeStatus();
@@ -6630,7 +6708,18 @@ export class AgentFramework {
    *  the already-quiesced escalation path. */
   private async abandonActiveTurns(): Promise<string[]> {
     const unabandonable: string[] = [];
+    // A turn whose continuation is still on its way ends with the
+    // continuation dropped. Its stream has ended; a frame still letting go of
+    // its token ends on its own, and settles nothing, since it handed the turn
+    // to the continuation.
+    const handedOff = new Set<string>();
+    for (const agentName of this.pendingContinuationAgents()) {
+      console.error(`[host-mode] abandoning ${agentName}'s turn before its continuation starts: the continuation is dropped`);
+      this.dropContinuations(agentName, { kind: 'quiesce_abandoned', why: 'its turn was abandoned' });
+      handedOff.add(agentName);
+    }
     for (const agentName of [...this.activeTurnTokens.keys()]) {
+      if (handedOff.has(agentName)) continue;
       const agent = this.agents.get(agentName);
       const state = agent?.state;
       const stream = state && 'stream' in state ? state.stream : undefined;
@@ -10509,7 +10598,7 @@ export class AgentFramework {
     const busy: string[] = [];
     for (const [name, a] of this.agents) {
       if (a.state.status !== 'idle') busy.push(`${name} is ${a.state.status}`);
-      else if (this.activeTurnTokens.has(name)) busy.push(`${name} is idle+turn-alive`);
+      else if (this.hasTurn(name)) busy.push(`${name} is idle+turn-alive`);
     }
     for (const name of this.activeTurnTokens.keys()) {
       if (!this.agents.has(name)) busy.push(`${name} is turn-alive`);
@@ -12111,7 +12200,23 @@ export class AgentFramework {
               this.streamBoundaryEnds.get(currentState.stream)?.('turn_ended');
             }
             this.emitTrace({ type: 'inference:turn_ended', agentName: agent.name });
+          } else if ((overBudget || overPhysical) && this.providerAdmissionClosed) {
+            // A stopping framework starts no continuation: the turn ends with
+            // its stream, as stop() ends a live stream's turn.
+            if (currentState.stream) this.frameworkCancelledStreams.set(`${agent.name}:${agent.streamId}`, 'shutdown');
+            agent.cancelStream();
           } else if (overBudget || overPhysical) {
+            // The continuation is queued first, before the boundary's usage
+            // report and the restart's trace, so a listener that stops or
+            // quiesces the host on either finds the turn waiting for it.
+            this.pendingRequests.push({
+              agentName: agent.name,
+              reason: 'context_budget_restart',
+              source: 'framework',
+              timestamp: Date.now(),
+              suppressProse: this.activeTurnTriggers.get(agent.name)?.suppressProse,
+              silentHeartbeat: this.activeTurnTriggers.get(agent.name)?.silentHeartbeat,
+            });
             // Context budget exceeded: break the stream, let compile() compress.
             // Mark the cancel as framework-initiated BEFORE cancelling: the
             // membrane delivers `aborted` before the restart bumps streamId,
@@ -12135,14 +12240,6 @@ export class AgentFramework {
               reason: overBudget ? 'context_budget' : 'physical_window',
               inputTokens: overBudget ? agent.lastStreamInputTokens : projectedRealTokens,
               budget: overBudget ? agent.maxStreamTokens : (agent.physicalWindowTokens ?? 0),
-            });
-            this.pendingRequests.push({
-              agentName: agent.name,
-              reason: 'context_budget_restart',
-              source: 'framework',
-              timestamp: Date.now(),
-              suppressProse: this.activeTurnTriggers.get(agent.name)?.suppressProse,
-              silentHeartbeat: this.activeTurnTriggers.get(agent.name)?.silentHeartbeat,
             });
           } else if (currentState.stream) {
             // What this round appends is in the next call's prompt. If that
@@ -12993,6 +13090,8 @@ export class AgentFramework {
    */
   private disposeConversationAgent(agentName: string): void {
     this.closingConversationAgents.delete(agentName);
+    // A continuation of its turn still on its way goes with it.
+    this.dropContinuations(agentName, { kind: 'dropped', why: 'its agent was disposed' });
     const channelId = this.conversationAgentHomes.get(agentName);
     const agent = this.agents.get(agentName);
     // A fork stop() ends can still be running: its stream, its tool round.
@@ -14259,17 +14358,28 @@ export class AgentFramework {
     return undefined;
   }
 
+  /** One scheduler pass, whose requests stay visible as on their way while
+   *  it runs (passRequests). */
   private async processInferenceRequests(): Promise<void> {
     if (this.pendingRequests.length === 0) {
       return;
     }
+    const requestsByAgent = new Map<string, InferenceRequest[]>();
+    this.passRequests?.add(requestsByAgent);
+    try {
+      await this.runInferencePass(requestsByAgent);
+    } finally {
+      this.passRequests?.delete(requestsByAgent);
+    }
+  }
+
+  private async runInferencePass(requestsByAgent: Map<string, InferenceRequest[]>): Promise<void> {
 
     const STALE_REQUEST_MS = 30_000;
     const now = Date.now();
     const state = this.createFrameworkState();
 
     // Group requests by agent
-    const requestsByAgent = new Map<string, InferenceRequest[]>();
     for (const req of this.pendingRequests) {
       const existing = requestsByAgent.get(req.agentName) ?? [];
       existing.push(req);
@@ -14282,6 +14392,9 @@ export class AgentFramework {
     // Check each agent
     for (const [agentName, groupedRequests] of requestsByAgent) {
       let requests = groupedRequests;
+      // A drop while this pass awaited an earlier agent's start can have
+      // taken every request of this agent's (dropContinuations).
+      if (requests.length === 0) continue;
       const agent = this.agents.get(agentName);
       if (!agent) {
         // Agent not found — request is orphaned. Emit warning and drop.
@@ -14294,6 +14407,10 @@ export class AgentFramework {
           oldestRequestAge: now - oldest,
         });
         console.error(`[inference-dropped] agent=${agentName} reason=agent_not_found requests=${requests.length}`);
+        // A continuation among them leaves its turn to end here.
+        if (requests.some((r) => resumesLogicalTurn(r.reason))) {
+          this.endContinuedTurn(agentName, { kind: 'dropped', why: 'its agent is gone' });
+        }
         continue;
       }
 
@@ -14383,7 +14500,11 @@ export class AgentFramework {
         requests.push(...passThrough);
       }
 
-      const turnAlive = !budgetRestart && this.activeTurnTokens.has(agentName);
+      // Turn-alive includes a continuation of the agent's turn still on its
+      // way elsewhere (a park, another pass's hands), not among these
+      // requests: a fresh wake waits for it, as for a turn holding its token.
+      const turnAlive = !budgetRestart &&
+        (this.activeTurnTokens.has(agentName) || this.pendingContinuationAgents(requests).has(agentName));
       const providerGate = this.providerGates?.get(agentName);
       // A primary can own provider admission while yielding to an already in-flight
       // auxiliary call. Keep this agent's later wakes queued, but do not block the
@@ -14461,9 +14582,12 @@ export class AgentFramework {
           `[inference-dropped] agent=${agentName} reason=policy-skip ` +
           `requests=${requests.length} triggers=${requests.map((r) => r.reason).join(',')}`,
         );
-        // A context-budget restart inherits the predecessor's EventGate liveness.
-        // If policy drops the queued successor, no driveStream remains to release it.
-        if (budgetRestart) this.eventGate?.onInferenceEnded(agentName);
+        // A continuation inherits its predecessor's EventGate liveness and
+        // logical turn. If policy drops it, no driveStream remains to end them,
+        // so its turn ends here (endContinuedTurn).
+        if (requests.some((r) => resumesLogicalTurn(r.reason))) {
+          this.endContinuedTurn(agentName, { kind: 'dropped', why: 'the inference policy dropped its continuation' });
+        }
         this.endPendingPrimary(agentName);
         continue;
       }
@@ -16918,7 +17042,12 @@ export class AgentFramework {
         // Do not await inside processInferenceRequests: one slow auxiliary call for
         // this resident must not block events or other residents. Admission stays
         // owned and the continuation receives it after the in-flight call settles.
+        const parkedContinuation = trigger !== undefined && resumesLogicalTurn(trigger.reason);
+        if (parkedContinuation) this.parkedContinuations.add(trigger);
         void this.waitForAuxiliaryIdle(agent.name).then(async () => {
+          // A continuation dropped while it was parked left the set then, with
+          // its admission given back.
+          if (parkedContinuation && !this.parkedContinuations.delete(trigger)) return;
           if (this.providerAdmissionClosed) {
             this.releasePrimaryProviderGate(agent.name);
             return;
@@ -17079,6 +17208,92 @@ export class AgentFramework {
   }
 
   /**
+   * Drop every continuation of `agentName`'s turn still on its way, wherever
+   * it waits: the queue, a provider hold (which, left empty, then releases
+   * with nothing to run), a park on admission (whose admission it gives
+   * back), or a scheduler pass's hands (which then never reach it). If one
+   * was there, the turn ends (endContinuedTurn).
+   */
+  private dropContinuations(agentName: string, drop: ContinuationDrop): void {
+    const isContinuation = (r: InferenceRequest): boolean => r.agentName === agentName && resumesLogicalTurn(r.reason);
+    let dropped = false;
+    const take = (requests: InferenceRequest[]): InferenceRequest[] => {
+      const left = requests.filter((r) => !isContinuation(r));
+      if (left.length < requests.length) dropped = true;
+      return left;
+    };
+    this.pendingRequests = take(this.pendingRequests);
+    const hold = this.providerAccelerationCooldowns.get(agentName);
+    if (hold) {
+      const held = hold.heldRequests.length;
+      hold.heldRequests = take(hold.heldRequests);
+      if (held > 0 && hold.heldRequests.length === 0) hold.emptiedByDrop = true;
+    }
+    for (const parked of [...this.parkedContinuations]) {
+      if (!isContinuation(parked)) continue;
+      this.parkedContinuations.delete(parked);
+      this.releasePrimaryProviderGate(agentName);
+      dropped = true;
+    }
+    for (const pass of this.passRequests) {
+      const requests = pass.get(agentName);
+      if (!requests) continue;
+      const left = take(requests);
+      requests.length = 0;
+      requests.push(...left);
+    }
+    if (!dropped) return;
+    // A primary a provider hold left pending for what it released won't run
+    // now, when nothing else of the agent's waits (endPendingPrimary).
+    if (!this.pendingRequests.some((r) => r.agentName === agentName) && !this.providerAccelerationCooldowns.get(agentName)?.heldRequests.length) {
+      this.endPendingPrimary(agentName);
+    }
+    this.endContinuedTurn(agentName, drop);
+  }
+
+  /**
+   * End a turn whose continuation won't run. The frame that handed the turn
+   * to it kept the turn open for it: its logical turn, the EventGate's
+   * window, the tool-result guard's batch and recovery, its typing. An
+   * abandon or a stop of a registered agent settles the turn as it settles a
+   * turn's start (endStoppedStart: one inference:aborted, the turn settled,
+   * the gate released). Any other drop ends it as a start dropped before it
+   * sends anything ends. That frame, if it hasn't let go of its token yet,
+   * ends on its own and settles nothing. What was deferred for the agent
+   * lands now, or at that frame's end.
+   */
+  private endContinuedTurn(agentName: string, drop: ContinuationDrop): void {
+    console.error(`[turn-continuation] ${agentName}: its turn ends without its continuation: ${drop.why}`);
+    const agent = this.agents.get(agentName);
+    const startedAt = this.lastInferenceAt.get(agentName)?.startedAt ?? Date.now();
+    if (agent && drop.kind !== 'dropped') {
+      const routing = this.openLogical.get(agentName) ?? this.routingOf(agentName);
+      this.endStoppedStart(agent, { kind: drop.kind }, routing, startedAt, undefined, false);
+    } else {
+      const owner = this.activeTurnTokens.get(agentName);
+      this.abortDroppedTurn(agentName, owner ?? -1, drop.kind === 'dropped' ? CONTINUATION_DROPPED : drop.kind, startedAt);
+      this.channelRegistry?.stopTyping();
+      if (agent) {
+        agent.toolResultGuard.recovering = false;
+        if (agent.toolResultGuard.hasPending) {
+          try {
+            agent.toolResultGuard.abandon('aborted');
+          } catch (error) {
+            console.error(`[tool-result-guard] agent=${agentName} failed to record aborted batch:`, error);
+          }
+        }
+      }
+      const routing = this.openLogical.get(agentName) ?? this.turnRouting.get(agentName);
+      if (routing) this.endDroppedTurn(agentName, routing);
+      this.eventGate?.onInferenceEnded(agentName);
+    }
+    if (!this.activeTurnTokens.has(agentName) && this.deferredMessages.length > 0 && !this.pendingAssistantBlocks.has(agentName)) {
+      this.readdDrained(this.drainDeferredFor(agentName), 'continuation-drop flush');
+      this.ackDeferredWrites();
+    }
+  }
+
+  /**
    * End a turn that beginAgentTurn drops before it sends anything. The turn
    * emitted inference:started, and listeners that bracket a turn, such as a
    * typing loop or an activity indicator, end it on a terminal event, so it
@@ -17128,7 +17343,7 @@ export class AgentFramework {
    */
   private endStoppedStart(
     agent: Agent,
-    stop: { kind: 'quiesce_abandoned' } | { kind: 'caller'; reason?: string },
+    stop: { kind: 'quiesce_abandoned' | 'shutdown' } | { kind: 'caller'; reason?: string },
     routing: TurnRouting,
     turnStartedAt: number,
     compiledRequest: NormalizedRequest | undefined,
@@ -17138,7 +17353,7 @@ export class AgentFramework {
      *  so the note says it was stopped before it finished. */
     opensTurn: boolean,
   ): void {
-    console.error(`[turn] ${agent.name}: ${stop.kind === 'caller' ? 'a stop' : 'a quiesce abandon'} reached the turn's start before it ${opensTurn ? 'sent anything' : 'finished'}; it ends there`);
+    console.error(`[turn] ${agent.name}: ${stop.kind === 'caller' ? 'a stop' : stop.kind === 'shutdown' ? "the framework's stop" : 'a quiesce abandon'} reached the turn's start before it ${opensTurn ? 'sent anything' : 'finished'}; it ends there`);
     this.channelRegistry?.stopTyping();
     // A start that continues a turn (a budget or guard restart) follows a
     // frame that kept the turn's tool-result batch, and the guard's recovery,
@@ -17166,7 +17381,7 @@ export class AgentFramework {
     if (stop.kind === 'caller') {
       this.settleDeliberateCancel({ ...common, reason: stop.reason ?? 'user', before: opensTurn ? 'sending' : 'finishing' });
     } else {
-      this.settleFrameworkCancel({ ...common, kind: 'quiesce_abandoned' });
+      this.settleFrameworkCancel({ ...common, kind: stop.kind });
     }
     const last = this.lastInferenceAt.get(agent.name);
     if (last?.startedAt === turnStartedAt) this.lastInferenceAt.set(agent.name, { ...last, endedAt: Date.now() });
@@ -19897,7 +20112,11 @@ export class AgentFramework {
       // its ids when a successor turn has already taken the agent. A fork or
       // run deregistered while the host is quiesced leaves its queue to its
       // window's release at resume (drainDeferredFor).
-      if (frameReachedTerminal && this.deferredMessages.length > 0 && !this.pendingAssistantBlocks.has(agent.name)) {
+      // A frame that handed its turn to a continuation since dropped
+      // (endContinuedTurn, which couldn't land it while this frame held the
+      // token) lands it too: the turn is over.
+      const handedOffTurnOver = preserveEventGateForSuccessor && !this.hasTurn(agent.name);
+      if ((frameReachedTerminal || handedOffTurnOver) && this.deferredMessages.length > 0 && !this.pendingAssistantBlocks.has(agent.name)) {
         this.readdDrained(this.drainDeferredFor(agent.name), 'turn-end flush');
         this.ackDeferredWrites();
       }
@@ -20013,7 +20232,7 @@ export class AgentFramework {
         `puppet refused: the store is under live ${this.surgeryHold.verb} for ${this.surgeryHold.agentName} — retry when it completes`,
       );
     }
-    if (agent.state.status !== 'idle' || this.activeTurnTokens.has(agentName)) {
+    if (agent.state.status !== 'idle' || this.hasTurn(agentName)) {
       const shown = agent.state.status === 'idle' ? 'idle+turn-alive' : agent.state.status;
       throw new Error(
         `puppet refused: agent ${agentName} is ${shown} (requires idle — ` +
