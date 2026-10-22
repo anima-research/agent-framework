@@ -613,8 +613,20 @@ export class SemanticIndexer {
         kept = { summaries: null, messages: null };
         this.setSyncCursors(kept, branch);
       }
-      const sumCursor = kept.summaries;
-      const msgWm = kept.messages ?? stats?.by_kind.message?.max_cursor ?? null;
+      // A branch's cursor is its own while the index holds what it sent, and
+      // the index's when it doesn't. Every branch's items are in the one
+      // index, so an index whose newest item of a kind is older than the
+      // cursor has lost what this branch sent, as a restore from an older
+      // backup leaves it, and the pass walks from the index's newest, as the
+      // service's watermark did before cursors were kept. A kind the stats
+      // don't list has no items left.
+      const held = (cursor: number | null, kind: string): number | null => {
+        if (cursor === null || stats === null) return cursor;
+        const newest = stats.by_kind[kind]?.max_cursor ?? null;
+        return newest === null ? null : Math.min(cursor, newest);
+      };
+      const sumCursor = held(kept.summaries, 'summary');
+      const msgWm = held(kept.messages, 'message') ?? stats?.by_kind.message?.max_cursor ?? null;
       let sumNext = sumCursor;
       let msgThrough: number | null = null;
       let budget = maxItems;

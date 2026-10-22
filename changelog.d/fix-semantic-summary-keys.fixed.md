@@ -16,7 +16,10 @@
   meanwhile. A branch with no message cursor yet, from before the upgrade or
   made at a point before its first pass after it, starts its walk at the
   service's watermark, as before. A deleted index starts the cursors over,
-  and cursors kept for another namespace aren't used.
+  and cursors kept for another namespace aren't used. A cursor is taken as
+  no later than the index's newest item of its kind, so an index that keeps
+  its namespace and loses its newest items, as a restore from an older
+  backup leaves it, gets them again from the next pass, as before.
 - **Hosts:** after upgrading, each branch a pass syncs embeds every summary
   it holds once more under its new key, a one-time cost on the embed service
   of one embedding per summary, and deletes the summary's old item,

@@ -728,3 +728,60 @@ it('a deleted index whose branch kept only a message cursor sends every message 
   await r.mod.syncSemanticIndex();
   assert.deepEqual([...r.svc.items.keys()].filter((k) => k.startsWith('msg:')).sort(), messageKeys);
 });
+
+// An index restored from an older backup keeps its namespace and loses its newest items. The service's
+// watermark fell with the loss before cursors were kept, so the next pass sent them again; a cursor that
+// records what the branch sent has to come back to what the index holds for that to stay true.
+async function threeTopics(r: Rig): Promise<void> {
+  // A few milliseconds apart, so each topic's messages and summaries sit at times of their own.
+  await r.talk('apples');
+  await new Promise((res) => setTimeout(res, 5));
+  await r.talk('pears');
+  await new Promise((res) => setTimeout(res, 5));
+  await r.talk('plums');
+  await r.mod.syncSemanticIndex();
+}
+
+/** Drops the newest items of a kind, keeping the namespace, and returns them. */
+function loseNewest(r: Rig, kind: string, keep: number): Item[] {
+  const items = [...r.svc.items.values()].filter((i) => i.kind === kind).sort((a, b) => a.cursor! - b.cursor!);
+  const lost = items.slice(keep);
+  const kept = items.slice(0, keep);
+  assert.ok(kept.length > 0 && lost.length > 0, 'the premise: items both kept and lost');
+  assert.ok(lost[0]!.cursor! > kept[kept.length - 1]!.cursor!, 'the premise: the lost items are newer than every kept one');
+  for (const i of lost) r.svc.items.delete(i.id);
+  return lost;
+}
+
+it('an index that loses its newest messages but keeps its namespace gets them again', async (t) => {
+  // No overlap, so only the cursor decides where the walk starts.
+  const r = await rig(t, { overlapMs: 0 });
+  await threeTopics(r);
+  const apples = [...r.svc.items.values()].filter((i) => i.kind === 'message' && i.text.includes('topic-apples')).length;
+  const lost = loseNewest(r, 'message', apples);
+  assert.ok(lost.some((i) => i.cursor! < cursors(r).messages!),
+    'the premise: a lost message older than the cursor, which a walk from the cursor doesn\'t reach');
+  await r.mod.syncSemanticIndex();
+  assert.deepEqual(lost.map((i) => i.id).filter((id) => !r.svc.items.has(id)), []);
+});
+
+it('an index that loses its newest summaries but keeps its namespace gets them again', async (t) => {
+  const r = await rig(t);
+  await threeTopics(r);
+  const summaries = [...r.svc.items.values()].filter((i) => i.kind === 'summary');
+  const oldest = Math.min(...summaries.map((i) => i.cursor!));
+  const lost = loseNewest(r, 'summary', summaries.filter((i) => i.cursor === oldest).length);
+  assert.ok(lost.some((i) => i.cursor! < cursors(r).summaries!), 'the premise: a lost summary older than the cursor');
+  await r.mod.syncSemanticIndex();
+  assert.deepEqual(lost.map((i) => i.id).filter((id) => !r.svc.items.has(id)), []);
+});
+
+it('an index that loses every summary but keeps its messages gets every summary again', async (t) => {
+  const r = await rig(t);
+  await threeTopics(r);
+  const keys = r.svc.summaryKeys();
+  for (const k of keys) r.svc.items.delete(k);
+  assert.ok(r.svc.items.size > 0, 'the premise: the namespace is kept, with its messages');
+  await r.mod.syncSemanticIndex();
+  assert.deepEqual(r.svc.summaryKeys(), keys);
+});
