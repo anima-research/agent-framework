@@ -641,13 +641,15 @@ export class HistoryModule implements Module {
     this.ctx = null;
     if (this.syncTimer) { clearInterval(this.syncTimer); this.syncTimer = null; }
     if (this.firstSyncTimer) { clearTimeout(this.firstSyncTimer); this.firstSyncTimer = null; }
-    if (this.indexer) this.indexer.onPendingChange = null;
+    // Unwired from the state it can no longer reach, the indexer keeps its
+    // cursors itself, so a pass after stop() doesn't send everything again.
+    if (this.indexer) { this.indexer.onPendingChange = null; this.indexer.cursorStore = null; }
     this.indexer?.dispose();
   }
 
   /**
    * Background sync into the semantic index: every `syncIntervalMs` (default
-   * 60 s) push up to `maxSyncPerTick` new items. Idempotent to call — starts
+   * 60 s) push up to `maxSyncPerTick` new items, as its doc counts them. Idempotent to call — starts
    * once we have both a context-manager (bind) and a config; `unref`'d so it
    * never keeps a shutting-down process alive. A first tick runs after 5 s so
    * a fresh store starts backfilling immediately rather than a minute later.

@@ -51,9 +51,10 @@ export interface SemanticIndexConfig {
   /** Items per upsert request. Default 128, max 256 (service limit). */
   syncBatch?: number;
   /**
-   * Max new items one background tick will push. Default 1024. A tick whose
-   * budget runs out among summaries minted in one millisecond sends the rest
-   * of them too.
+   * Max new items one background tick will push. Default 1024. A tick can
+   * go over it: one whose budget runs out among summaries minted in one
+   * millisecond sends the rest of them too, and the message walk checks the
+   * budget once per page of 256.
    */
   maxSyncPerTick?: number;
   /** Max new items a pre-search catch-up will push before searching anyway, as for `maxSyncPerTick`. Default 256. */
@@ -538,8 +539,9 @@ export class SemanticIndexer {
   get backingOff(): boolean { return Date.now() < this.backoffUntil; }
 
   /**
-   * Push what the index is missing, up to `maxItems` new items, and the rest
-   * of the summaries minted in the millisecond where that runs out.
+   * Push what the index is missing, up to `maxItems` new items, with the
+   * rest of the summaries minted in the millisecond where that runs out, and
+   * the rest of the message page it runs out in.
    * Coalesces: a call while a sync is already running returns that run's
    * promise instead of racing it.
    */
@@ -575,19 +577,28 @@ export class SemanticIndexer {
       // exist: there's no index to remove from.
       const noIndex = stats === null && notStats === null;
       // This branch's cursors, read at each pass so a switch between passes is
-      // seen, and written only while the store is still on the branch read
-      // here, so one branch's pass can't move another's cursor past what that
-      // branch hasn't sent. A namespace that doesn't exist holds nothing of
-      // this branch's, as after an index is deleted, so everything is sent. A
-      // branch with no message cursor starts from the service's watermark, as
-      // before cursors were kept per branch, so an upgrade doesn't walk every
-      // history again.
+      // seen. They're written only when every read this pass made of the
+      // store was on the branch read here, so one branch's pass can't move
+      // another's cursor past what that branch hasn't sent. A branch with no
+      // message cursor starts from the service's watermark, as before cursors
+      // were kept per branch, so an upgrade doesn't walk every history again.
       const branchOf = (): string | null =>
         (this.cm as { currentBranch?: () => { id: string } | undefined }).currentBranch?.()?.id ?? null;
       const branch = branchOf();
-      const kept = this.syncCursors();
-      const sumCursor = noIndex ? null : kept.summaries;
-      const msgWm = noIndex ? null : (kept.messages ?? stats?.by_kind.message?.max_cursor ?? null);
+      // Set when a read of the store finds it on another branch.
+      let strayed = false;
+      const reading = (): void => { if (branchOf() !== branch) strayed = true; };
+      let kept = this.syncCursors();
+      // A namespace that doesn't exist holds nothing of this branch's, as after
+      // an index is deleted, so the cursors start over, at once, so a pass
+      // that fails partway through sending everything again still finds them
+      // over.
+      if (noIndex && (kept.summaries !== null || kept.messages !== null)) {
+        kept = { summaries: null, messages: null };
+        this.setSyncCursors(kept);
+      }
+      const sumCursor = kept.summaries;
+      const msgWm = kept.messages ?? stats?.by_kind.message?.max_cursor ?? null;
       let sumNext = sumCursor;
       let msgThrough: number | null = null;
       let budget = maxItems;
@@ -682,6 +693,7 @@ export class SemanticIndexer {
       // exceeds every tick's budget must not keep new summaries out forever.
       {
         const cursor = sumCursor;
+        reading();
         const all = this.cm.getSummariesInRange({ fromMs: 0, toMs: Number.MAX_SAFE_INTEGER }) as SummaryLike[];
         report.summariesScanned = all.length;
         // `>=`: a summary minted in the cursor's millisecond after the pass
@@ -748,6 +760,7 @@ export class SemanticIndexer {
       const pageSize = 256;
       for (;;) {
         if (budget <= 0) { report.more = true; break; }
+        reading();
         const page = this.cm.queryMessagesByTime({ fromMs, offset, limit: pageSize });
         const msgs = page.messages;
         report.messagesScanned += msgs.length;
@@ -772,10 +785,10 @@ export class SemanticIndexer {
         fromMs = lastMs;
       }
       await flush();
-      // Every send of this pass is in, so its cursors stand. A pass with
-      // nothing new writes no state.
+      // Every send of this pass is in, so its cursors stand. A pass that moves
+      // neither cursor writes no state.
       const msgNext = msgThrough ?? msgWm;
-      if ((sumNext !== kept.summaries || msgNext !== kept.messages) && branchOf() === branch) {
+      if ((sumNext !== kept.summaries || msgNext !== kept.messages) && !strayed && branchOf() === branch) {
         this.setSyncCursors({ summaries: sumNext, messages: msgNext });
       }
       if (notStats && report.more) throw notStats;

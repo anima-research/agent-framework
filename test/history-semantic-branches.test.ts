@@ -30,6 +30,10 @@ class FakeService {
   onUpsert: (() => Promise<void>) | null = null;
   /** Answer this many upserts with 500. */
   failUpserts = 0;
+  /** Answer this many upserts that carry a message with 500. */
+  failMessageUpserts = 0;
+  /** Every upsert call, answered or refused. */
+  upsertCalls = 0;
   /** Awaited before a search is answered. */
   onSearch: (() => Promise<void>) | null = null;
   server!: Server; url = '';
@@ -63,8 +67,12 @@ class FakeService {
           }
           if (m[2] === 'upsert') {
             const items = (JSON.parse(body) as { items: Item[] }).items;
+            this.upsertCalls++;
             await this.onUpsert?.();
             if (this.failUpserts > 0) { this.failUpserts--; return json(500, { error: { message: 'boom' } }); }
+            if (this.failMessageUpserts > 0 && items.some((it) => it.kind === 'message')) {
+              this.failMessageUpserts--; return json(500, { error: { message: 'boom' } });
+            }
             for (const it of items) this.items.set(it.id, it);
             return json(200, { namespace: 'ns', inserted: items.length, updated: 0, unchanged: 0, count: this.items.size });
           }
@@ -106,7 +114,7 @@ interface Rig {
   store: { currentSequence(): number; createBranchAt(name: string, from: string, at: number): unknown; getStateJson(id: string): unknown; setStateJson(id: string, v: unknown): unknown };
   mod: HistoryModule;
   talk(topic: string, n?: number): Promise<void>;
-  search(query: string): Promise<{ hits: string[]; droppedOffBranch: number; droppedStale: number }>;
+  search(query: string, limit?: number): Promise<{ hits: string[]; droppedOffBranch: number; droppedStale: number }>;
   summaries(): Array<{ id: string; content: string; created: number }>;
   state(): Record<string, unknown> | null;
   /** How many times the module has written its state. */
@@ -146,8 +154,8 @@ async function rig(t: { after(fn: () => Promise<void>): void }, opts: { maxSyncB
       for (let i = 0; i < count; i++) manager.addMessage(n++ % 2 ? 'agent' : 'user', say(topic, i));
       await drain(manager);
     },
-    async search(query) {
-      const res = await mod.handleToolCall({ id: 'q', name: 'semantic_search', input: { query, level: 1 } } as never);
+    async search(query, limit) {
+      const res = await mod.handleToolCall({ id: 'q', name: 'semantic_search', input: { query, level: 1, ...(limit ? { limit } : {}) } } as never);
       assert.equal(res.success, true, JSON.stringify(res));
       const data = res.data as { hits: Array<{ id: string; snippet: string; score: number }>; index: { droppedOffBranch: number; droppedStale: number } };
       return { hits: data.hits.filter((h) => h.score > 0.5).map((h) => `${h.id} ${h.snippet}`), droppedOffBranch: data.index.droppedOffBranch, droppedStale: data.index.droppedStale };
@@ -401,6 +409,7 @@ it('a pass whose summaries\' upsert fails deletes no old item and writes no curs
   r.svc.items.set(`sum:${apples!.id}`, { id: `sum:${apples!.id}`, text: apples!.content, kind: 'summary', cursor: apples!.created });
   r.svc.failUpserts = 1;
   await r.mod.syncSemanticIndex();
+  assert.equal(r.svc.upsertCalls, 1, 'the summaries\' upsert was sent, and refused');
   assert.equal(r.svc.deleteCalls, 0);
   assert.ok(r.svc.items.has(`sum:${apples!.id}`));
   assert.deepEqual(cursors(r), {});
@@ -491,6 +500,85 @@ it('a branch with no message cursor, as after an upgrade, starts its walk at the
   await r.mod.syncSemanticIndex();
   // As before cursors were kept: the state has none.
   r.store.setStateJson('modules/history/state', {});
+  assert.deepEqual(cursors(r), {});
   const report = (await r.mod.syncSemanticIndex())!;
   assert.equal(report.messagesScanned, 1, 'only the message at the watermark is walked again');
+});
+
+it('a pass that reads another branch and comes back writes no cursor', async (t) => {
+  const r = await rig(t);
+  const trunk = r.manager.currentBranch().name;
+  await r.talk('apples');
+  r.store.createBranchAt('side', trunk, r.store.currentSequence());
+  // The summaries' upsert moves the store to the side, where the message walk reads,
+  // and the messages' upsert moves it back.
+  let n = 0;
+  r.svc.onUpsert = async () => { n++; if (n === 1) await r.manager.switchBranch('side'); else if (n === 2) { r.svc.onUpsert = null; await r.manager.switchBranch(trunk); } };
+  await r.mod.syncSemanticIndex();
+  assert.equal(r.manager.currentBranch().name, trunk);
+  assert.ok(n >= 2, 'the premise: both upserts ran');
+  assert.deepEqual(cursors(r), {}, 'no cursor written from the side\'s reads');
+});
+
+it('a pass that finds its index deleted starts the cursors over even if it fails partway through', async (t) => {
+  const r = await rig(t);
+  t.mock.method(console, 'warn', () => {});
+  await r.talk('apples');
+  await r.mod.syncSemanticIndex();
+  assert.notDeepEqual(cursors(r), {});
+  r.svc.items.clear();
+  r.svc.failMessageUpserts = 1;
+  await r.mod.syncSemanticIndex();
+  assert.equal(cursors(r).summaries ?? null, null);
+  assert.equal(cursors(r).messages ?? null, null);
+});
+
+it('a pass whose messages\' upsert fails after its summaries went in writes no cursor', async (t) => {
+  const r = await rig(t);
+  t.mock.method(console, 'warn', () => {});
+  await r.talk('apples');
+  r.svc.failMessageUpserts = 1;
+  await r.mod.syncSemanticIndex();
+  assert.ok(r.svc.summaryKeys().length > 0, 'the premise: the summaries went in');
+  assert.deepEqual(cursors(r), {});
+});
+
+it('an old item holding another branch\'s text is left out once the cursor covers this branch\'s summary, though the answer lacks the keyed item', async (t) => {
+  const r = await rig(t);
+  r.svc.noDelete = true;
+  t.mock.method(console, 'warn', () => {});
+  await r.talk('apples');
+  await r.mod.syncSemanticIndex();
+  const [apples] = r.summaries();
+  // An item from before keys carried the creation time, under this summary's id, with another branch's text.
+  r.svc.items.set(`sum:${apples!.id}`, { id: `sum:${apples!.id}`, text: 'Summary about cherries.', kind: 'summary', cursor: apples!.created });
+  // One hit asked for: the first answer is the old item alone.
+  assert.deepEqual((await r.search('cherries', 1)).hits, []);
+});
+
+it('a hit for a summary whose ts can\'t be read is named by its id in the host\'s log', async (t) => {
+  const r = await rig(t);
+  const warn = t.mock.method(console, 'warn', () => {});
+  await r.talk('apples');
+  await r.mod.syncSemanticIndex();
+  const [apples] = r.summaries();
+  const key = `sum:${apples!.id}@${apples!.created}`;
+  r.svc.items.set(key, { ...r.svc.items.get(key)!, ts: 'not a time' as never });
+  await r.search(apples!.content);
+  const said = warn.mock.calls.map((c) => String(c.arguments[0])).filter((l) => l.includes("couldn't be read"));
+  assert.equal(said.length, 1, JSON.stringify(said));
+  assert.ok(said[0]!.includes(`"sum:${apples!.id}" (ts)`), said[0]);
+});
+
+it('after stop(), the indexer keeps its own cursors, so its passes don\'t send everything again', async (t) => {
+  const r = await rig(t);
+  await r.talk('apples');
+  await r.mod.syncSemanticIndex();
+  await r.mod.stop();
+  // The first pass after stop() starts from no cursors, so it sends every summary as new.
+  await r.mod.syncSemanticIndex();
+  const deletes = r.svc.deleteCalls;
+  // The second starts from the cursors the first kept, so nothing is new and no old key is deleted.
+  await r.mod.syncSemanticIndex();
+  assert.equal(r.svc.deleteCalls, deletes);
 });
