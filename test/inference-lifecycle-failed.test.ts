@@ -6,7 +6,8 @@
  * `finally`, whose phase the exit paths decide. An `error` event that no
  * cancel explains is a failure: the framework settles the turn as exhausted,
  * retries it, or holds it for a provider's wait. So is an `aborted` event
- * whose reason isn't a stop's, which settles the turn as exhausted. The
+ * whose reason isn't a stop's: a progress deadline's 'timeout' takes the
+ * `error` path, and any other settles the turn as exhausted. The
  * holds already ended `failed`; the other endings left the default
  * `completed` standing, so an MCPL server was told that a failed inference
  * completed.

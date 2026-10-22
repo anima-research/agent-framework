@@ -4,7 +4,7 @@ import { createHash } from 'node:crypto';
 import type { CacheWireReceipt, KvUnifiedRequestHooks } from './kv-unified-wire.js';
 import { ToolResultGuard } from './tool-result-guard.js';
 import { withoutTokenEstimates } from './thinking-token-stamp.js';
-import { assertBooleanSetting, holdsSettings } from './config-checks.js';
+import { assertBooleanSetting, holdsSettings, kindOf } from './config-checks.js';
 import {
   CONTINUE_ROW,
   continueTurn,
@@ -31,6 +31,11 @@ export interface ActivationRequestOptions {
   /** A request that will never be sent (a preview): compile it as a dry
    *  run (see `compileWithInjections` for what that leaves alone). */
   dryRun?: boolean;
+  /** The stream's progress deadline, per provider call (membrane's
+   *  `progressTimeoutMs`): DEFAULT_INFERENCE_PROGRESS_TIMEOUT_MS when absent
+   *  or null. A value membrane would read as no deadline is refused
+   *  (assertProgressTimeout). */
+  progressTimeoutMs?: number;
 }
 
 export interface StartStreamResult {
@@ -89,6 +94,37 @@ function stableHash(value: unknown): string {
 const DEFAULT_CONTEXT_BUDGET_TOKENS = 100_000;
 const DEFAULT_TRANSITION_PACE_TOKENS = 16_000;
 const DEFAULT_SAME_ROUND_THINK_TEXT_POLICY: SameRoundThinkTextPolicy = 'public';
+
+/**
+ * How long one provider call may go without a parsed provider event before
+ * membrane abandons it as stalled (its `progressTimeoutMs`), when the caller
+ * sets no other. Keepalives aren't progress, so a provider that holds a
+ * stream open with them while generating nothing ends the call here instead
+ * of hanging the agent. Thirty minutes is three times membrane's 600 s
+ * Anthropic idle default: generous, since healthy thinking can be silent
+ * for minutes (agent-framework #268).
+ */
+export const DEFAULT_INFERENCE_PROGRESS_TIMEOUT_MS = 30 * 60_000;
+
+/**
+ * Refuse a progress deadline that isn't a positive number of ms or Infinity.
+ * Membrane reads zero, a negative or NaN as no deadline at all, so one written
+ * meaning "off" would leave a stalled stream unbounded, and one written by
+ * slip would do the same. Infinity is the way to run with no bound.
+ * `undefined` and `null` count as not set, as in the other configuration
+ * checks, so a generated config that writes an unset setting as null keeps
+ * working; either gets DEFAULT_INFERENCE_PROGRESS_TIMEOUT_MS where it's read.
+ * As the other configuration refusals do, it names what the value is, never
+ * the value itself, which could be a secret pasted into the wrong field.
+ */
+export function assertProgressTimeout(setting: string, value: unknown): void {
+  if (value === undefined || value === null) return;
+  if (typeof value !== 'number' || !(value > 0)) {
+    const what = typeof value !== 'number' ? kindOf(value)
+      : Number.isNaN(value) ? 'NaN' : value === 0 ? 'zero' : 'a negative number';
+    throw new RangeError(`${setting} must be a positive number of ms, or Infinity to run with no bound, not ${what}`);
+  }
+}
 
 /**
  * Refuse an agent config whose `promptCaching`, `toolResultGuard`,
@@ -1148,6 +1184,7 @@ export class Agent {
     budget?: TokenBudget,
     options?: InferenceOptions
   ): Promise<InferenceResult> {
+    assertProgressTimeout('InferenceOptions.progressTimeoutMs', options?.progressTimeoutMs);
     if (this._state.status === 'inferring') {
       throw new Error(`Agent ${this.name} is already inferring`);
     }
@@ -1214,7 +1251,8 @@ export class Agent {
 
     // Set state to inferring
     this._inferenceStartedAt = Date.now();
-    const inferencePromise = this.doInference(request, abortController.signal, assemble);
+    const inferencePromise = this.doInference(request, abortController.signal, assemble,
+      options?.progressTimeoutMs ?? DEFAULT_INFERENCE_PROGRESS_TIMEOUT_MS);
     this._state = { status: 'inferring', promise: inferencePromise, abortController };
 
     try {
@@ -1503,6 +1541,7 @@ export class Agent {
     compressionTools: ToolDefinition[] = availableTools,
     options: ActivationRequestOptions = {},
   ): Promise<StartStreamResult> {
+    assertProgressTimeout('progressTimeoutMs', options.progressTimeoutMs);
     if (this._state.status !== 'idle') {
       throw new Error(`Agent ${this.name} cannot start stream in state ${this._state.status}`);
     }
@@ -1583,6 +1622,7 @@ export class Agent {
       emitTokens: true,
       emitBlocks: false,
       emitUsage: true,
+      progressTimeoutMs: options.progressTimeoutMs ?? DEFAULT_INFERENCE_PROGRESS_TIMEOUT_MS,
       // Retry a content-policy refusal at the provider seam rather than at
       // the framework level: membrane replays the SAME request immediately
       // (cache-warm), where a framework-level requeue would recompile and
@@ -1819,10 +1859,12 @@ export class Agent {
     signal: AbortSignal | undefined,
     /** Compiles the context into a request again, for the guard's retry. */
     reassemble: () => Promise<NormalizedRequest>,
+    /** Each provider call's progress deadline (membrane's `progressTimeoutMs`). */
+    progressTimeoutMs: number,
   ): Promise<InferenceResult> {
     let response = signal?.aborted
       ? { aborted: true as const, reason: 'user' as const }
-      : await this.membrane.stream(request, { signal });
+      : await this.membrane.stream(request, { signal, progressTimeoutMs });
     // Usage of a refused attempt abandoned by the guard; it was billed and
     // is added to the retry's usage below rather than overwritten.
     let abandonedUsage: { inputTokens: number; outputTokens: number } | undefined;
@@ -1839,7 +1881,7 @@ export class Agent {
         const retry = await reassemble();
         response = signal?.aborted
           ? { aborted: true, reason: 'user', partialUsage: response.usage }
-          : await this.membrane.stream(retry, { signal });
+          : await this.membrane.stream(retry, { signal, progressTimeoutMs });
       }
     }
 

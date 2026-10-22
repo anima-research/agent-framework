@@ -76,7 +76,7 @@ import { asModuleRow, heldHandle, heldWriteId, matchesMessageQuery } from './hel
 import { ProcessQueueImpl } from './queue.js';
 import { DEFAULT_SHUTDOWN_TIMEOUT_MS, validateShutdownTimeout, shutdownErrorMessage, waitForShutdown, ShutdownTimeoutError } from './shutdown.js';
 import { REFUSAL_REACTIONS, REFUSAL_REACTION_FALLBACK, REFUSAL_REACTION_BASELINE } from './refusal-reactions.js';
-import { Agent, assertAgentSwitches } from './agent.js';
+import { Agent, DEFAULT_INFERENCE_PROGRESS_TIMEOUT_MS, assertAgentSwitches, assertProgressTimeout } from './agent.js';
 import { assertBooleanSetting, holdsSettings } from './config-checks.js';
 import { ModuleRegistry, checkedToolResult, ensureStateRegistered, storableToolResult, thrownResult } from './module-registry.js';
 import { McplServerRegistry } from './mcpl/server-registry.js';
@@ -2539,6 +2539,8 @@ export class AgentFramework {
   private providerAccelerationDefaultCooldownMs = PROVIDER_ACCELERATION_DEFAULT_COOLDOWN_MS;
   private providerAccelerationJitterMs = PROVIDER_ACCELERATION_JITTER_MS;
   private providerHoldHook: ProviderHoldHook | undefined;
+  /** Each provider call's progress deadline (FrameworkConfig.inferenceProgressTimeoutMs). */
+  private inferenceProgressTimeoutMs = DEFAULT_INFERENCE_PROGRESS_TIMEOUT_MS;
   /** Provider waits (stated retry-after) per (agent, model), kept across restarts. */
   private providerWaits: ProviderWaits | undefined;
   /** Wakers for error-policy retry waits in progress: stop() ends them. */
@@ -3144,6 +3146,7 @@ export class AgentFramework {
     // Before anything opens or starts: a refused config must leave nothing behind.
     if (config.codeExecution != null) validateCodeExecutionConfig(config.codeExecution);
     assertFrameworkSwitches(config);
+    assertProgressTimeout('inferenceProgressTimeoutMs', config.inferenceProgressTimeoutMs);
     for (const agentConfig of config.agents) assertAgentSwitches(agentConfig);
     assertAgentNamesUnique(config.agents);
 
@@ -3335,6 +3338,7 @@ export class AgentFramework {
       new OperatorLog(operatorLogPath),
     );
     framework.providerHoldHook = config.providerHold;
+    framework.inferenceProgressTimeoutMs = config.inferenceProgressTimeoutMs ?? DEFAULT_INFERENCE_PROGRESS_TIMEOUT_MS;
 
     // Before any delivery.
     await framework.reconcileDiscordAwarenessAtStartup();
@@ -4522,7 +4526,7 @@ export class AgentFramework {
    * as a resident's are, so they bind its auxiliary calls too: a held model
    * is refused without a call, and an auxiliary call's own stated wait is
    * recorded for it. (An ephemeral run records nothing, its name being
-   * single-use, so its context manager keeps the plain membrane.) Its
+   * single-use, so its context manager takes membraneWithDeadline.) Its
    * compression is the background work a resident's is, whether a
    * maintenance tick or a drain after a message starts it, so it is withdrawn
    * as a resident's is: a call made while a surgery holds the store, or once
@@ -4540,8 +4544,23 @@ export class AgentFramework {
       }
     });
   }
+  /** The framework's membrane, for a context manager whose compression
+   *  takes no admission (an ephemeral run's, the subconscious's): its
+   *  complete() calls get the progress deadline and nothing else. One
+   *  instance, which all of them share as they shared the plain membrane,
+   *  since context-manager keys a compression's comparison domain and its
+   *  pause by membrane instance (compressionDomain). */
+  private membraneWithDeadline(): Membrane {
+    return this.sharedDeadlineMembrane ??= this.membraneAdmitting((run) => run());
+  }
+  private sharedDeadlineMembrane: Membrane | undefined;
   /** The framework's membrane, with each complete() call passed through
-   *  `admit` along with the model it names. */
+   *  `admit` along with the model it names. A call whose options set no
+   *  `progressTimeoutMs` (left out or null), such as context-manager's
+   *  compression, gets the
+   *  framework's (inferenceProgressTimeoutMs), so a stalled compression can't
+   *  hold a resident's next turn behind waitForAuxiliaryIdle forever. A call
+   *  that streams no events is bounded as a whole. */
   private membraneAdmitting(admit: (run: () => Promise<unknown>, model: string | undefined) => Promise<unknown>): Membrane {
     const target = this.membrane as unknown as Record<PropertyKey, unknown>;
     return new Proxy(target, { get: (obj, prop, receiver) => {
@@ -4549,6 +4568,10 @@ export class AgentFramework {
       if (prop === 'complete' && typeof value === 'function') {
         return (...args: unknown[]) => {
           const model = (args[0] as { config?: { model?: unknown } } | undefined)?.config?.model;
+          const options = args[1] as { progressTimeoutMs?: number } | undefined;
+          if (options?.progressTimeoutMs == null) {
+            args[1] = { ...options, progressTimeoutMs: this.inferenceProgressTimeoutMs };
+          }
           return admit(() => Reflect.apply(value, this.membrane, args) as Promise<unknown>,
             typeof model === 'string' ? model : undefined);
         };
@@ -8340,7 +8363,7 @@ export class AgentFramework {
         namespace,
         isolate: true,
         strategy: config.strategy ?? new PassthroughStrategy(),
-        membrane: this.membrane,
+        membrane: this.membraneWithDeadline(),
         debugLogContext: !!process.env.DEBUG_CONTEXT,
       });
 
@@ -11543,7 +11566,7 @@ export class AgentFramework {
       // UNfiltered (no viewFilter here — stamped messages included).
       auxiliaryMessageViews: [{}],
       strategy,
-      membrane: this.membrane,
+      membrane: this.membraneWithDeadline(),
       debugLogContext: !!process.env.DEBUG_CONTEXT,
     });
 
@@ -17389,6 +17412,7 @@ export class AgentFramework {
         continuePrompt,
       } = await agent.startStreamWithInjections(tools, injections, undefined, compressionTools, {
         silentHeartbeat: trigger?.silentHeartbeat,
+        progressTimeoutMs: this.inferenceProgressTimeoutMs,
       });
       // The compile can wait for annotations (each batch has one spill
       // deadline), so check ownership, admission, and the lifecycle again.
@@ -18081,7 +18105,7 @@ export class AgentFramework {
     // finally, which sends it, and a stop() can send it sooner.
     this.pendingOutgoingCompletes.add(completeOutgoing);
     try {
-      for await (const event of stream) {
+      for await (const arrived of stream) {
         // Ignore every late event from an Agent generation that no longer owns
         // this name (ephemeral watchdog/disposal, conversation replacement).
         if (this.agents.get(agent.name) !== agent || agent.streamId !== myStreamId) {
@@ -18091,6 +18115,28 @@ export class AgentFramework {
           break;
         }
         this.touchEphemeralRun(agent.name, true);
+        // A provider call that went inferenceProgressTimeoutMs without a
+        // parsed event (membrane's progressTimeoutMs) ends the stream as
+        // `aborted` with reason 'timeout'. That is a failed request, so it
+        // takes the `error` path. There a cancel recorded for this stream
+        // still ends it as that cancel: the framework's (an endTurn, a budget
+        // restart, a quiesce abandon, stop()) or a caller's (abortInference).
+        // Otherwise the error policy retries it, and a fresh stream gets a
+        // fresh deadline. A stall that persists exhausts the turn with its
+        // reason.
+        // Membrane types the expiry as non-retryable because that deadline
+        // belongs to the one call; a new stream is a new call with its own.
+        const event = arrived.type === 'aborted' && arrived.reason === 'timeout'
+          ? {
+              type: 'error' as const,
+              error: new MembraneError({
+                type: 'timeout',
+                retryable: true,
+                message: `No stream progress within ${this.inferenceProgressTimeoutMs}ms (inferenceProgressTimeoutMs)`,
+                rawError: undefined,
+              }),
+            }
+          : arrived;
         // The model's content in a round, or its retry after a refusal, comes
         // after the boundary that may have moved the turn's locus: show the
         // round where it is, before its traces name the channel. The results
@@ -19254,6 +19300,9 @@ export class AgentFramework {
                 return;
               }
             }
+            // A progress deadline's 'timeout' took the `error` path at the
+            // loop's head. Any other abort the framework didn't record settles
+            // the turn here, a caller's abortInference ('user') included.
             const reason = event.reason ?? 'unknown';
             // Membrane (>= 0.5.81) reports reason 'user' exactly when the
             // request's signal was aborted, i.e. someone called cancel():
@@ -23484,6 +23533,13 @@ export class AgentFramework {
       const cause = [errorType, httpStatus !== undefined ? `HTTP ${httpStatus}` : undefined]
         .filter((part): part is string => part !== undefined)
         .join(', ');
+      // A timeout is the provider or the connection going quiet, which agent
+      // turns have already retried; the advice, about what a request carries,
+      // doesn't fit it.
+      const advice = errorType === 'timeout'
+        ? ''
+        : ' If this recurs with the same cause, change approach rather than ' +
+          'retrying identically (e.g. drop an oversized attachment or an unsupported setting).';
       try {
         agent.getContextManager().addMessage(
           'user',
@@ -23492,9 +23548,7 @@ export class AgentFramework {
             text:
               `[inference-failed] Your previous turn did not complete: the model ` +
               `call failed${cause ? ` (${cause})` : ''} and produced no response, so nothing was sent. Reason: ` +
-              `${markerReason}. If this recurs with the same cause, change approach ` +
-              `rather than retrying identically (e.g. drop an oversized attachment ` +
-              `or an unsupported setting).`,
+              `${markerReason}.${advice}`,
           }],
           { system: true, kind: 'inference-failed', reason: markerReason, consecutive: streak, ...classification, ...cutAt(markerReason) },
         );
@@ -23752,6 +23806,7 @@ export class AgentFramework {
       this.featureSetManager,
       inferenceRouting ?? null,
       (event) => this.emitTrace(event as { type: TraceEvent['type']; [key: string]: unknown }),
+      { progressTimeoutMs: this.inferenceProgressTimeoutMs },
     );
 
     // Checkpoint manager (Step 8), built and loaded at the top

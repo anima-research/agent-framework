@@ -190,6 +190,37 @@ export interface FrameworkConfig {
   errorPolicy?: ErrorPolicy;
 
   /**
+   * How long one provider call may go without a parsed provider event before
+   * it is abandoned as stalled (membrane's `progressTimeoutMs`), in ms. It
+   * bounds each agent turn the framework streams, each MCPL server's
+   * inference request, and each compression call a context manager makes
+   * through the membrane the framework gives it, unless that call sets its
+   * own. The direct Agent API doesn't read it. Default 30 minutes
+   * (DEFAULT_INFERENCE_PROGRESS_TIMEOUT_MS).
+   *
+   * Keepalives aren't progress, so a provider that holds a stream open with
+   * them while generating nothing ends here instead of hanging the agent. A
+   * stretch with no parsed event counts as no progress whatever the model is
+   * doing, such as thinking a provider doesn't stream, so keep it above the
+   * longest such stretch you expect. A call that streams no events is bounded
+   * as a whole: on most adapters an MCPL server's non-streaming request and a
+   * compression call, both made with complete(), and any call through an
+   * adapter that doesn't stream, such as membrane's Images adapter. Membrane's
+   * OpenAI Responses adapter in subscription mode streams complete(), so there
+   * its events renew the deadline.
+   *
+   * An agent turn's expiry fails the request as a retryable `timeout`: the
+   * error policy retries it, each attempt with a fresh deadline, and a stall
+   * that persists exhausts the turn with its reason. With the default policy
+   * that is four attempts, so about two hours at the default bound. Infinity
+   * never expires. Left out or null, it's the default. Anything else that
+   * isn't a positive number of ms, such as zero, a negative number or NaN,
+   * which membrane would read as no deadline, is refused at create with a
+   * RangeError.
+   */
+  inferenceProgressTimeoutMs?: number;
+
+  /**
    * Host verdict on a failed inference: "this cannot succeed until later".
    * Consulted before the error policy and before the built-in
    * organization-acceleration classification, for a persistent agent's

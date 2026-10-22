@@ -26,6 +26,7 @@ import type {
 import type { FeatureSetManager } from './feature-set-manager.js';
 import { McplFeatureSetError } from './feature-set-manager.js';
 import type { HookOrchestrator } from './hook-orchestrator.js';
+import { DEFAULT_INFERENCE_PROGRESS_TIMEOUT_MS } from '../agent.js';
 
 // ============================================================================
 // Responder interface
@@ -181,6 +182,8 @@ export class InferenceRouter {
   private featureSetManager: FeatureSetManager;
   private routingPolicy: InferenceRoutingPolicy | null;
   private emitTraceFn: (event: { type: string; [key: string]: unknown }) => void;
+  /** Each provider call's progress deadline (membrane's `progressTimeoutMs`). */
+  private progressTimeoutMs: number;
 
   constructor(
     membrane: Membrane,
@@ -188,12 +191,14 @@ export class InferenceRouter {
     featureSetManager: FeatureSetManager,
     routingPolicy: InferenceRoutingPolicy | null,
     emitTraceFn: (event: { type: string; [key: string]: unknown }) => void,
+    options: { progressTimeoutMs?: number } = {},
   ) {
     this.membrane = membrane;
     this.hookOrchestrator = hookOrchestrator;
     this.featureSetManager = featureSetManager;
     this.routingPolicy = routingPolicy;
     this.emitTraceFn = emitTraceFn;
+    this.progressTimeoutMs = options.progressTimeoutMs ?? DEFAULT_INFERENCE_PROGRESS_TIMEOUT_MS;
   }
 
   /**
@@ -271,10 +276,13 @@ export class InferenceRouter {
 
     try {
       // 5. Run inference. Both modes end in membrane's response, and one
-      // builder makes the result from it.
+      // builder makes the result from it. On most adapters a non-streaming
+      // call reports no progress before its response, so there the progress
+      // deadline bounds the whole call. (Membrane's OpenAI Responses adapter
+      // in subscription mode streams complete(), and its events renew it.)
       const response = chunkRequestId != null
         ? await this.streamResponse(request, chunkRequestId, sendChunk!)
-        : await this.membrane.complete(request);
+        : await this.membrane.complete(request, { progressTimeoutMs: this.progressTimeoutMs });
 
       // 6. Answer
       const result = resultFrom(response, model);
@@ -380,7 +388,7 @@ export class InferenceRouter {
     requestId: string | number,
     sendChunk: (params: InferenceChunkParams) => void,
   ): Promise<NormalizedResponse> {
-    const stream = this.membrane.streamYielding(request);
+    const stream = this.membrane.streamYielding(request, { progressTimeoutMs: this.progressTimeoutMs });
     let index = 0;
 
     for await (const event of stream) {
@@ -403,7 +411,12 @@ export class InferenceRouter {
         case 'error':
           throw event.error;
         case 'aborted':
-          throw new Error(`The inference stopped before it finished (${event.reason})`);
+          // Nothing cancels the stream while it runs, so an abort is the
+          // progress deadline expiring ('timeout'), answered with the setting
+          // to raise, or a failure that ended the call.
+          throw new Error(event.reason === 'timeout'
+            ? `No stream progress within ${this.progressTimeoutMs}ms (inferenceProgressTimeoutMs)`
+            : `The inference stopped before it finished (${event.reason})`);
       }
     }
     throw new Error('The inference stream ended without a result');

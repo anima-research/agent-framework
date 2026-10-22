@@ -132,6 +132,16 @@ test('a small unclassified reason produces exactly the marker it did before', ()
   assert.ok(errs.includes('[inference-failed] agent=cairn consecutive=1: 400 image exceeds 5 MB'));
 });
 
+test("a timeout's marker gives the reason without advice to change what the turn sends", () => {
+  const { fw, markers, restore } = makeHarness();
+  try {
+    fw.noteInferenceExhausted('cairn', 'No stream progress within 1800000ms (inferenceProgressTimeoutMs)', true, 'timeout');
+  } finally { restore(); }
+  assert.equal(markers[0].text,
+    '[inference-failed] Your previous turn did not complete: the model call failed (timeout) and produced no response, ' +
+    'so nothing was sent. Reason: No stream progress within 1800000ms (inferenceProgressTimeoutMs).');
+});
+
 const isHigh = (text: string, index: number) => { const code = text.charCodeAt(index); return code >= 0xd800 && code <= 0xdbff; };
 const isLow = (text: string, index: number) => { const code = text.charCodeAt(index); return code >= 0xdc00 && code <= 0xdfff; };
 

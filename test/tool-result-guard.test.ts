@@ -7,8 +7,8 @@ import { PassthroughStrategy, type StoredMessage, type StrategyContext } from '@
 import type { ContentBlock, Membrane, NormalizedRequest, NormalizedResponse, YieldingStreamOptions } from '@animalabs/membrane';
 import { MembraneError, Membrane as RealMembrane, NativeFormatter, type ProviderAdapter, type ProviderRequest,
   type ProviderResponse, type StreamCallbacks } from '@animalabs/membrane';
-import { AgentFramework, type AgentConfig, type AgentSettingsExtension, type Module, type ModuleContext,
-  type ToolCall, type ToolResult, type ProcessEvent, type ProcessState } from '../src/index.js';
+import { AgentFramework, DEFAULT_INFERENCE_PROGRESS_TIMEOUT_MS, type AgentConfig, type AgentSettingsExtension,
+  type Module, type ModuleContext, type ToolCall, type ToolResult, type ProcessEvent, type ProcessState } from '../src/index.js';
 import { TOOL_RESULT_GUARD_AUDIT_STATE, TOOL_RESULT_GUARD_NOTICE, keptWhenWithheld, withheldResultNotice } from '../src/tool-result-guard.js';
 import { MockYieldingStream, createMockResponse } from './helpers/mock-membrane.js';
 import { UNREACHED_WATCHDOG, silenceRun } from './helpers/run-watchdog.js';
@@ -1129,8 +1129,12 @@ test('backward-compatible direct Agent inference also guards tool results', asyn
   const h = await harness([], { toolResultGuard: true });
   const responses = [calls('one'), refused(), answer()];
   const requests: NormalizedRequest[] = [];
-  (h.membrane as unknown as { stream: (request: NormalizedRequest) => Promise<NormalizedResponse> }).stream = async (request) => {
+  const deadlines: Array<number | undefined> = [];
+  (h.membrane as unknown as {
+    stream: (request: NormalizedRequest, options?: { progressTimeoutMs?: number }) => Promise<NormalizedResponse>;
+  }).stream = async (request, options) => {
     requests.push(structuredClone(request));
+    deadlines.push(options?.progressTimeoutMs);
     const response = responses.shift();
     assert.ok(response);
     return response;
@@ -1141,9 +1145,11 @@ test('backward-compatible direct Agent inference also guards tool results', asyn
     const first = await agent.runInference(h.framework.getAllTools());
     assert.equal(first.toolCalls.length, 1);
     agent.provideToolResult('one', { success: true, data: 'direct-original' });
-    const final = await agent.runInference(h.framework.getAllTools());
+    const final = await agent.runInference(h.framework.getAllTools(), undefined, { progressTimeoutMs: 4321 });
     assert.deepEqual(final.speechContent, [{ type: 'text', text: 'continued' }]);
     assert.equal(requests.length, 3);
+    // Each provider call carries its call's progress deadline, the refusal retry's too.
+    assert.deepEqual(deadlines, [DEFAULT_INFERENCE_PROGRESS_TIMEOUT_MS, 4321, 4321]);
     assert.equal(final.usage?.inputTokens, 20, 'abandoned refused attempt usage is included');
     assert.match(JSON.stringify(requests[1]), /direct-original/);
     assert.doesNotMatch(JSON.stringify(requests[2]), /direct-original|discard-this/);
@@ -2280,7 +2286,7 @@ const SETTLED_AS_IT_LEFT = ['staged', 'linked', 'withheld', 'annotated', 'stub_u
 // gone with it. Pinned for a failure whose stream ends only after the run's
 // caller has deregistered the agent, in both shapes, and for a run the
 // completion watchdog ends while its stream says nothing.
-for (const how of ['an uncaused error', 'an abort whose reason is timeout', 'the completion watchdog'] as const) {
+for (const how of ['an uncaused error', 'an abort whose reason is error', 'the completion watchdog'] as const) {
   test(`an ephemeral run that ends by ${how} with its batch pending settles the batch as it leaves`, async () => {
     const h = await harness([[calls('one')]]);
     if (how !== 'the completion watchdog') waitAfterTerminal(h.membrane, () => h.framework.getAgent('ephemeral') === null);
@@ -2293,8 +2299,10 @@ for (const how of ['an uncaused error', 'an abort whose reason is timeout', 'the
       stream.processResponse = () => {};
       if (how === 'an uncaused error') {
         stream.events.push({ type: 'error', error: new MembraneError({ type: 'auth', retryable: false, message: 'key revoked', rawError: { status: 401 } }) });
-      } else if (how === 'an abort whose reason is timeout') {
-        stream.events.push({ type: 'aborted', reason: 'timeout' });
+      } else if (how === 'an abort whose reason is error') {
+        // Not 'timeout': that is the progress deadline's, which the error
+        // policy retries rather than ending the run.
+        stream.events.push({ type: 'aborted', reason: 'error' });
       }
     };
     let outcome = 'pending';
@@ -2315,7 +2323,7 @@ for (const how of ['an uncaused error', 'an abort whose reason is timeout', 'the
       assert.equal(created.agent.toolResultGuard.hasPending, false, 'the run left no batch pending');
     } finally { await h.framework.stop(); }
     assert.match(outcome, how === 'the completion watchdog' ? /^rejected: Ephemeral agent "ephemeral" stalled/
-      : how === 'an uncaused error' ? /^rejected: key revoked/ : /^rejected: Stream aborted: timeout/, 'the run ends as expected');
+      : how === 'an uncaused error' ? /^rejected: key revoked/ : /^rejected: Stream aborted: error/, 'the run ends as expected');
     assert.equal(spills, 1, "the batch's original is offered to the host's spill once");
     const audit = await ephemeralBatchAudit(h.base);
     assert.deepEqual(audit.types, SETTLED_AS_IT_LEFT, 'the batch is settled once, and its stub says where its original is');

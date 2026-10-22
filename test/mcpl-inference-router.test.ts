@@ -299,14 +299,18 @@ for (const mode of ['native', 'xml'] as const) {
     });
 
     it('answers a stream that stopped before it finished with the error', async () => {
+      // A TimeoutAbortError is how membrane ends a call on a deadline, and the
+      // only one the router's calls carry is the progress deadline, so the
+      // answer names the setting to raise.
       const answer = await ask(
-        { chunks: ['A summ'], fails: new TimeoutAbortError('no event for 120000ms') },
+        { chunks: ['A summ'], fails: new TimeoutAbortError('No provider progress within 1800000ms') },
         { stream: true, mode },
       );
+      const message = 'No stream progress within 1800000ms (inferenceProgressTimeoutMs)';
 
       assert.strictEqual(answer.result, undefined);
-      assert.deepStrictEqual(answer.error, { code: -32603, message: 'The inference stopped before it finished (timeout)' });
-      assert.deepStrictEqual(answer.sent, ['chunk:A summ', 'error:The inference stopped before it finished (timeout)']);
+      assert.deepStrictEqual(answer.error, { code: -32603, message });
+      assert.deepStrictEqual(answer.sent, ['chunk:A summ', `error:${message}`]);
     });
 
     it('answers a refusal with the error, not end_turn', async () => {
