@@ -129,14 +129,14 @@ function postponedReleases(framework: AgentFramework, error: Error, when: 'befor
   if (when === 'before stop()') postpone();
   else watchdog.stop = function (this: unknown) { postpone(); return stop.call(this); };
   const owner = framework as unknown as Record<string, unknown>;
-  const usual = (owner.unreadNoticesForPrimary as (agent: unknown) => unknown[]).bind(framework);
-  owner.unreadNoticesForPrimary = (agent: { name: string }) => {
+  const usual = (owner.releasedWindow as (agent: unknown, held: Set<string>) => unknown).bind(framework);
+  owner.releasedWindow = (agent: { name: string }, held: Set<string>) => {
     if (agent.name === 'first') throw error;
-    if (agent.name !== 'second') return usual(agent);
+    if (agent.name !== 'second') return usual(agent, held);
     unreadPassed.push(agent.name);
-    return [];
+    return { unread: [], held: new Map() };
   };
-  return () => { delete owner.unreadNoticesForPrimary; watchdog.stop = stop; };
+  return () => { delete owner.releasedWindow; watchdog.stop = stop; };
 }
 
 function checkPostponedReleases(framework: AgentFramework): void {

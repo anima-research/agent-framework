@@ -115,10 +115,10 @@ class RobotModule implements Module {
             ? { channelId: this.interjectionChannelId }
             : {}),
       } as unknown as ProcessEvent);
-      // Give the run loop a beat to process the queued message while this
-      // tool round is still pending (pendingAssistantBlocks non-empty), so
-      // it lands in deferredMessages before the tool-result event.
-      await new Promise((r) => setTimeout(r, 30));
+      // The run loop takes this message while the tool round is still
+      // pending (pendingAssistantBlocks non-empty), so it lands among the
+      // deferred messages: it's queued here, before this call returns, and
+      // the round's result is queued only after the call returns.
     }
     return { success: true, data: { ok: true, tool: call.name } };
   }

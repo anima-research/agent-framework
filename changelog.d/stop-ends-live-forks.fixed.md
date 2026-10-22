@@ -19,6 +19,9 @@
 - A failed reply still queued for a fork or a run that ended while the
   host was quiesced is now passed to the primary when `stop()` runs, named
   as the registry knows its channel then, and lands when the host resumes.
-  Before, the next boot's flush passed it on. A memory-only queue still
-  loses it at exit. Any other write queued for such an agent is still
-  dropped, logged.
+  It isn't passed on where the fork or run had read the copy of it that
+  landed in its window, unless `stop()`'s pass over that window fails,
+  when it goes on as boot would send it, read or not. Before, the next
+  boot's flush passed it on. A memory-only queue still loses it at exit.
+  Any other write queued for such an agent, but a channel notice it could
+  act on, is still dropped, logged.

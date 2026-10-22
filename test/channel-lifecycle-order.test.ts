@@ -788,14 +788,25 @@ test('failed policy opening records intent once, with truthful resident text thr
       .map((b) => (b as { text: string }).text);
     assert.equal(noticeTexts().length, 1);
     assert.match(noticeTexts()[0], /Selected for opening by subscription policy/);
-    assert.match(noticeTexts()[0], /admission decision; channel_list shows current transport state/);
+    assert.match(noticeTexts()[0], /The host opens it, and if that fails, tries again when its server next registers it; channel_list shows whether it's open yet\./);
     assert.doesNotMatch(noticeTexts()[0], /Now open/);
+
+    // The server registers the channel again while the host runs: the host
+    // asks it to open the channel again, with no new admission or notice.
+    f.held.delete('x');
+    await f.registry.handleRegister('test', { channels: [descriptor()] });
+    assert.deepEqual(f.calls.filter((c) => c.kind === 'open').map((c) => c.id), ['x', 'x']);
+    assert.equal(f.actual.get('x'), true);
+    assert.equal(f.isOpen(), true);
+    assert.equal(f.notices.length, 1);
 
     // Reconstruct the registry from the same Chronicle state before retrying.
     // The admission persists even though its first transport attempt failed.
     const retry = fixture(onNotice, framework.getStore());
     retry.registry.setSubscriptionPolicy('test', 'auto');
     await retry.registry.handleChanged('test', { added: [descriptor()] });
+    assert.deepEqual(retry.calls.filter((c) => c.kind === 'open').map((c) => c.id), ['x']);
+    assert.equal(retry.actual.get('x'), true);
     assert.equal(retry.isOpen(), true);
     assert.equal(retry.notices.length, 0);
     assert.equal(noticeTexts().length, 1);
@@ -1570,12 +1581,15 @@ test('the notices say what happened, name the opt-out, and state no rule about l
       .map((b) => (b as { text: string }).text);
     assert.deepEqual(texts, [
       "[channels] Now open: #general (discord:g1:c1): your own message into the closed channel opened it. " +
-        "What an open channel delivers to you depends on its server. If you don't want it, use channel_close; your choice outranks policy.",
+        "What an open channel brings you is up to its server: some send every message in it, and others only what addresses you unless you're subscribed to it; their own tools can change that. If you don't want it, " +
+          "use channel_close: neither the subscription policy nor its server's own default opens it again.",
       "[channels] Now open: c2: your own message into the closed channel opened it. " +
-        "What an open channel delivers to you depends on its server. If you don't want it, use channel_close; your choice outranks policy.",
+        "What an open channel brings you is up to its server: some send every message in it, and others only what addresses you unless you're subscribed to it; their own tools can change that. If you don't want it, " +
+          "use channel_close: neither the subscription policy nor its server's own default opens it again.",
       '[channels] Selected for opening by subscription policy: c3, ops (c4). ' +
-        'This records the admission decision; channel_list shows current transport state. ' +
-        "What an open channel delivers to you depends on its server. If you don't want one of them, use channel_close; your choice outranks policy.",
+        "The host opens them, and if one doesn't open, tries again when its server next registers it; channel_list shows whether each is open yet. " +
+        "What an open channel brings you is up to its server: some send every message in it, and others only what addresses you unless you're subscribed to it; their own tools can change that. If you don't want one of them, " +
+        "use channel_close: neither the subscription policy nor its server's own default opens it again.",
     ]);
   } finally {
     await framework.stop();
@@ -2541,18 +2555,18 @@ test("where a reply's reader can't close a channel selected for opening, the pri
 
 // The opened notice follows the reply notice's rule: channel_close is named
 // only where the agent it's addressed to can call it for every channel named
-// (other residents of one slot, and forks spawned from the primary later, may
-// read it too: #291, #235), and where an
-// agent's send opened a channel it can't close, the primary is told by name
-// too, if it can close it. The reader's notice carries its inputs only where
-// it was told it can close the channels, so a release passes on only that.
+// (other residents of one slot may read it too, #291; a fork's seed leaves it
+// out), and where an agent's send opened a channel it can't close, the
+// primary is told by name too, if it can close it. The reader's notice
+// carries its inputs only where it was told it can close the channels, so a
+// release passes on only that.
 test('the opened notice names channel_close only where the agent it\'s addressed to can call it, says what the channel delivers only to the agent that holds its traffic, and tells the primary by name where the agent whose send opened it can\'t close it', () => {
   // What the channel delivers: said to the agent whose window holds its
   // traffic. Where conversations are routed (router), that's a fork for its
   // home alone; elsewhere, the agent addMessage delivers to.
-  const optOut = ' What an open channel delivers to you depends on its server.';
-  const close = " If you don't want it, use channel_close; your choice outranks policy.";
-  const closeMany = " If you don't want one of them, use channel_close; your choice outranks policy.";
+  const optOut = " What an open channel brings you is up to its server: some send every message in it, and others only what addresses you unless you're subscribed to it; their own tools can change that.";
+  const close = " If you don't want it, use channel_close: neither the subscription policy nor its server's own default opens it again.";
+  const closeMany = " If you don't want one of them, use channel_close: neither the subscription policy nor its server's own default opens it again.";
   const own = '[channels] Now open: #x (x): your own message into the closed channel opened it.';
   const opened = (passOn: unknown) => ({ system: true, kind: 'channel-notice', passOn });
   const fromReply = { notice: 'channel-opened', serverId: 'srv', cause: 'opened-by-reply', channels: [{ channelId: 'x', label: '#x' }] };
@@ -2617,17 +2631,17 @@ test('the opened notice names channel_close only where the agent it\'s addressed
       ] },
     { why: 'a policy admission, to the primary that can close it', cause: 'subscription-policy', agents: [['primary', []]], primary: 'primary',
       // Addressed to no agent of its own, so it carries no inputs to pass on.
-      told: [{ text: '[channels] Selected for opening by subscription policy: #x (x). This records the admission decision; channel_list shows current transport state.' + optOut + close,
+      told: [{ text: "[channels] Selected for opening by subscription policy: #x (x). The host opens it, and if that fails, tries again when its server next registers it; channel_list shows whether it's open yet." + optOut + close,
         metadata: { system: true, kind: 'channel-notice' } }] },
     { why: 'a policy admission where conversations are routed, to the primary, whose window holds no channel traffic', cause: 'subscription-policy', agents: [['primary', []]], router: true, primary: 'primary',
-      told: [{ text: '[channels] Selected for opening by subscription policy: #x (x). This records the admission decision; channel_list shows current transport state.' + close,
+      told: [{ text: "[channels] Selected for opening by subscription policy: #x (x). The host opens it, and if that fails, tries again when its server next registers it; channel_list shows whether it's open yet." + close,
         metadata: { system: true, kind: 'channel-notice' } }] },
     { why: "a policy admission, to a primary that can't close it", cause: 'subscription-policy', agents: [['primary', ['channel_close']]], primary: 'primary',
-      told: [{ text: '[channels] Selected for opening by subscription policy: #x (x). This records the admission decision; channel_list shows current transport state.' + optOut,
+      told: [{ text: "[channels] Selected for opening by subscription policy: #x (x). The host opens it, and if that fails, tries again when its server next registers it; channel_list shows whether it's open yet." + optOut,
         metadata: { system: true, kind: 'channel-notice' } }] },
     { why: "a policy admission with no primary, to the first agent, a run whose store is its own, which can't close it", cause: 'subscription-policy',
       agents: [['worker', ['channel_close']]], isolated: ['worker'], primary: null,
-      told: [{ text: '[channels] Selected for opening by subscription policy: #x (x). This records the admission decision; channel_list shows current transport state.' + optOut,
+      told: [{ text: "[channels] Selected for opening by subscription policy: #x (x). The host opens it, and if that fails, tries again when its server next registers it; channel_list shows whether it's open yet." + optOut,
         metadata: { system: true, kind: 'channel-notice' } }] },
     { why: "an agent that has ended, with a primary that can't close it", name: 'gone', agents: [['primary', ['channel_close']]], primary: 'primary',
       told: [{ text: '[channels] Now open: #x (x): a message from gone into the closed channel opened it; gone has ended.' + optOut,

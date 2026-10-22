@@ -879,17 +879,23 @@ describe('mid-turn deliveries keep the window what the stream carried', () => {
   it("a released window doesn't pass a failed reply on a second time when its store holds the reply's copy", async () => {
     const framework = await createFramework();
     const internals = drainInternals(framework);
-    const agent = framework.getAgent('assistant')!;
-    const cm = agent.getContextManager();
+    // A run, whose window is its own: the primary's notice of its failed
+    // reply goes to another window, which the notice is looked up in by its
+    // id before it's written (queuedNoticeForPrimary keeps the mark).
+    const { agent, contextManager: cm } = await framework.createEphemeralAgent({
+      name: 'worker', model: 'test-model', systemPrompt: 'Do the task.', allowedTools: 'all',
+    });
     const failed = { kind: 'discord-send-failed', channelId: 'c1', reason: 'gone', textLen: 5, outcome: 'failed' };
-    // Its earlier write landed. The release's first pass reads that copy as
-    // unread and passes it on; the queued entry mustn't be passed again.
-    cm.addMessage('assistant', text('hello'), { ...failed, deferredWriteId: 'w-fail' } as never);
-    internals.deferredMessages.push({ ...entry('w-fail', 'hello'), participant: 'assistant', metadata: failed, landing: 'unknown' });
+    // Its earlier write landed. The release passes the entry on under its
+    // own id, and the copy in the run's window, which it reads as unread,
+    // isn't passed on as well.
+    cm.addMessage('worker', text('hello'), { ...failed, deferredWriteId: 'w-fail' } as never);
+    internals.deferredMessages.push({ ...entry('w-fail', 'hello'), participant: 'worker', forAgent: 'worker', metadata: failed, landing: 'unknown' });
     const error = console.error;
     console.error = () => {};
     try { internals.releaseWindow(agent); } finally { console.error = error; }
-    const notices = cm.queryMessages({} as never).messages.filter((m) => (m.metadata as { speaker?: unknown } | undefined)?.speaker === 'assistant');
+    const notices = framework.getAgent('assistant')!.getContextManager().queryMessages({} as never).messages
+      .filter((m) => (m.metadata as { speaker?: unknown } | undefined)?.speaker === 'worker');
     assert.equal(notices.length, 1, 'the primary is told once');
     await framework.stop();
   });
@@ -897,19 +903,24 @@ describe('mid-turn deliveries keep the window what the stream carried', () => {
   it("a released window doesn't pass on a failed reply the agent had read, when its store holds the reply's copy", async () => {
     const framework = await createFramework();
     const internals = drainInternals(framework);
-    const agent = framework.getAgent('assistant')!;
-    const cm = agent.getContextManager();
+    // A run, whose window is its own, as in the test before: the primary's
+    // window holds no copy under the entry's id to answer for the read check.
+    const { agent, contextManager: cm } = await framework.createEphemeralAgent({
+      name: 'worker', model: 'test-model', systemPrompt: 'Do the task.', allowedTools: 'all',
+    });
     const failed = { kind: 'discord-send-failed', channelId: 'c1', reason: 'gone', textLen: 5, outcome: 'failed' };
-    cm.addMessage('assistant', text('hello'), { ...failed, deferredWriteId: 'w-read' } as never);
-    // The agent read its copy: the release's first pass skips it, as main
-    // skips a failed reply the agent heard, and the queued entry mustn't
-    // pass it on either.
+    cm.addMessage('worker', text('hello'), { ...failed, deferredWriteId: 'w-read' } as never);
+    // The run read its copy: the window's read skips it, as main skips a
+    // failed reply the agent heard, and the queued entry mustn't pass it on
+    // either.
     agent.markContextConsumed();
-    internals.deferredMessages.push({ ...entry('w-read', 'hello'), participant: 'assistant', metadata: failed, landing: 'unknown' });
+    internals.deferredMessages.push({ ...entry('w-read', 'hello'), participant: 'worker', forAgent: 'worker', metadata: failed, landing: 'unknown' });
     const error = console.error;
     console.error = () => {};
     try { internals.releaseWindow(agent); } finally { console.error = error; }
-    const notices = cm.queryMessages({} as never).messages.filter((m) => (m.metadata as { speaker?: unknown } | undefined)?.speaker === 'assistant');
+    assert.ok(!internals.deferredMessages.some((m) => m.id === 'w-read'), 'the release took the entry from the queue');
+    const notices = framework.getAgent('assistant')!.getContextManager().queryMessages({} as never).messages
+      .filter((m) => (m.metadata as { speaker?: unknown } | undefined)?.speaker === 'worker');
     assert.equal(notices.length, 0, "the primary isn't told");
     await framework.stop();
   });

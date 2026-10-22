@@ -473,7 +473,7 @@ describe('Trunk channel routing (item-3 redux)', () => {
     const one = lastText();
     assert.match(
       one,
-      /Now open: #general \(acme\) \(slack:C1\): your own message into the closed channel opened it\. What an open channel delivers to you depends on its server\. If you don't want it, use channel_close/,
+      /Now open: #general \(acme\) \(slack:C1\): your own message into the closed channel opened it\. What an open channel brings you is up to its server: some send every message in it, and others only what addresses you unless you're subscribed to it; their own tools can change that\. If you don't want it, use channel_close: neither the subscription policy nor its server's own default opens it again\./,
     );
     assert.doesNotMatch(one, /will reach you/);
 
@@ -481,7 +481,7 @@ describe('Trunk channel routing (item-3 redux)', () => {
     const two = lastText();
     assert.match(
       two,
-      /Selected for opening by subscription policy: slack:C1, slack:C2\. This records the admission decision; channel_list shows current transport state\. What an open channel delivers to you depends on its server\. If you don't want one of them, use channel_close/,
+      /Selected for opening by subscription policy: slack:C1, slack:C2\. The host opens them, and if one doesn't open, tries again when its server next registers it; channel_list shows whether each is open yet\. What an open channel brings you is up to its server: some send every message in it, and others only what addresses you unless you're subscribed to it; their own tools can change that\. If you don't want one of them, use channel_close: neither the subscription policy nor its server's own default opens it again\./,
     );
     assert.doesNotMatch(two, /will reach you/);
     await framework.stop();

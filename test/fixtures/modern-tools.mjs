@@ -1,6 +1,6 @@
 // Tools for the modern-MCP fixture servers (SDK 2.x McpServer), shared by the
 // stdio fixture (modern-mcp-server.mjs) and the in-process HTTP test server.
-import { appendFileSync } from 'node:fs';
+import { appendFileSync, existsSync } from 'node:fs';
 import { fromJsonSchema, McpServer } from '@modelcontextprotocol/server';
 
 const obj = (properties = {}) => fromJsonSchema({ type: 'object', properties });
@@ -55,12 +55,24 @@ export function createServer(opts = {}) {
     async () => ({ content: media, structuredContent: { blocks: media.length } }));
   server.registerTool('fail', { description: 'Reports a tool error', inputSchema: obj() },
     async () => ({ content: [{ type: 'text', text: 'the tool failed on purpose' }], isError: true }));
-  server.registerTool('slow', { description: 'Sleeps, then answers', inputSchema: obj({ ms: { type: 'number' } }) },
+  server.registerTool('slow', {
+    description: 'Sleeps, or waits until a release file exists, then answers',
+    inputSchema: obj({ ms: { type: 'number' }, release: { type: 'string' } }),
+  },
     async (args, ctx) => {
       const ms = Number(args.ms ?? 1000);
       const signal = ctx?.mcpReq?.signal;
       note('slow-start');
       signal?.addEventListener('abort', () => note('slow-aborted'));
+      if (typeof args.release === 'string') {
+        // Held until the test lets it go, so the call stays in flight for as
+        // long as the test needs, however slow the machine is, or until the
+        // call is cancelled.
+        while (!existsSync(args.release) && !signal?.aborted) await new Promise((resolve) => setTimeout(resolve, 10));
+        if (signal?.aborted) return { content: [{ type: 'text', text: 'cancelled' }] };
+        note('slow-finished');
+        return { content: [{ type: 'text', text: 'released' }] };
+      }
       await new Promise((resolve) => setTimeout(resolve, ms));
       note('slow-finished');
       return { content: [{ type: 'text', text: `slept ${ms}` }] };
