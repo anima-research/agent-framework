@@ -12,6 +12,36 @@ Releases up to and including 0.7.3 predate this file; for their contents see
 
 ## Unreleased
 
+## 0.23.3 — 2026-10-22
+
+### Added
+
+- `InferenceRequest.serverId`: the MCPL server whose message set the request's `channelId`. The turn's replies into that channel go out through this server only.
+- `WakeProvenance.routeServerId`: the server of the event whose channel `routeChannelId` names.
+- `ChannelRegistry.routeSpeech` takes an optional fourth argument, `{ locusServerId }`, and `deliverSpeech`'s options take `locusServerId` too: the server the locus resolves with, snapshotted with the locus. Speech then goes out through that server only, and fails where it no longer registers the channel.
+- `ChannelRegistry.sendOutgoingChunk` and `sendOutgoingComplete` take an optional last argument, the server the channel resolves with, as the speech's does.
+- `ChannelRegistry.fallbackServerFor(channelId)`: the server whose accepted message set the fallback channel, where `channelId` is that channel.
+- `channel_publish` reads a `serverId` the call gives, as `channel_open`, `channel_close` and `channel_decline` read theirs: the message goes out through that server only, into the named channel or, with no `channelId`, the default one. The tool's schema doesn't declare it, so no tool's text changes; the refusal of a shared id asks for it.
+- `ConversationRouter`'s `bind`, `touch`, `unbind` and `getBinding` take a channel with its server, `{ channelId, serverId? }`, beside the bare id they took. A bare id names the binding made with no server, else the one binding for that id. `ConversationBinding.serverId` is the server a binding was made with.
+
+### Changed
+
+- Releases from the 0.23 line publish under the npm dist-tag `release-0.23`
+  instead of `latest`, which stays on the newest line, 0.24. The registry
+  won't move `latest` back from 0.24.0 implicitly, so without the tag a
+  0.23 release's publish fails after its tag is pushed. A semver range such
+  as `^0.23.1` resolves to the newest 0.23 release without naming the tag.
+  On GitHub, a 0.23 release isn't marked Latest.
+
+### Fixed
+
+- A turn's replies now go out only through the server whose message brought them to their channel. For the channel whose message triggered the turn, that's the server that sent it; for a turn with no trigger channel, which speaks into the channel of the latest message the host accepted, it's that message's server; after a mid-turn move of the turn's channel, it's the moving message's server; after a `channel_open`, it's the server the channel was opened on. This covers plain speech and its streamed output, a `>>` envelope naming the channel, a `channel_publish` that names it or takes it as its default, a drafts resend into it, and the sleep announcement. The turn records the channel and server together, and where the server no longer registers the channel by the time the reply goes out, the reply is refused rather than sent through another server that registers the same id. A tool call takes the turn's servers only when it is made inside that turn, so a background script's call does not. Where several servers register one channel, the reply to each one's message now goes back through that server, where it was refused before. A turn whose batched messages name one channel from more than one server takes neither, and its reply there is refused as before. The refusal reaction now goes through the server whose message it marks.
+- `channel_publish` into any other channel now goes through the server the call names, or, where it names none, only where exactly one server registers that channel id. A shared id with no server named is refused in the words `channel_open` and `channel_close` use for an ambiguous id, which ask for `serverId`, and nothing is published; it used to go through whichever server registered the id first. A `serverId` the call names is now held to, and the call is refused where that server doesn't register the channel; it used to be ignored, so a call naming one server could publish through another. A `channel_publish` that names no channel takes the most recent incoming message's channel, as before, and now goes out through the server that message came through, unless the turn recorded another server for that channel or the call names one; it is refused where that server no longer registers the channel, where it used to go through whichever other server held the id. `publishForAgent`, which names no server, gives the same refusal for a shared id.
+- A push event that names a channel another server registers, while the pushing server doesn't, is now refused with `-32017` (channel not permitted) instead of taken. The host logs each refusal with the server that registers the channel, at most once a minute for each channel. A push that names a channel no server registers is taken as before, and registers that channel for the server that pushed it.
+- A push's label now applies only to the pushing server's own entry for its channel, never to another server's.
+- A server's label for a channel id that another server registers is no longer written to the durable label history. That history is kept by the channel id alone, and the history tools' label lookups read it across restarts.
+- With conversation routing, a channel's conversation is now bound by its server and id. A message from a server that registers the id of another server's bound channel goes to a conversation of its own, where it used to go into that channel's conversation and be answered with its history in view. A batched wake's route is taken only by the conversation its message's server and channel are bound to.
+
 ## 0.23.2 — 2026-10-20
 
 ### Fixed

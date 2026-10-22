@@ -1,7 +1,0 @@
-- `InferenceRequest.serverId`: the MCPL server whose message set the request's `channelId`. The turn's replies into that channel go out through this server only.
-- `WakeProvenance.routeServerId`: the server of the event whose channel `routeChannelId` names.
-- `ChannelRegistry.routeSpeech` takes an optional fourth argument, `{ locusServerId }`, and `deliverSpeech`'s options take `locusServerId` too: the server the locus resolves with, snapshotted with the locus. Speech then goes out through that server only, and fails where it no longer registers the channel.
-- `ChannelRegistry.sendOutgoingChunk` and `sendOutgoingComplete` take an optional last argument, the server the channel resolves with, as the speech's does.
-- `ChannelRegistry.fallbackServerFor(channelId)`: the server whose accepted message set the fallback channel, where `channelId` is that channel.
-- `channel_publish` reads a `serverId` the call gives, as `channel_open`, `channel_close` and `channel_decline` read theirs: the message goes out through that server only, into the named channel or, with no `channelId`, the default one. The tool's schema doesn't declare it, so no tool's text changes; the refusal of a shared id asks for it.
-- `ConversationRouter`'s `bind`, `touch`, `unbind` and `getBinding` take a channel with its server, `{ channelId, serverId? }`, beside the bare id they took. A bare id names the binding made with no server, else the one binding for that id. `ConversationBinding.serverId` is the server a binding was made with.
