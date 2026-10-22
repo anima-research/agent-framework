@@ -32,8 +32,8 @@ const MAX_BYTES = 256 * 1024;
  */
 const NONBLOCK = typeof constants.O_NONBLOCK === 'number' ? constants.O_NONBLOCK : 0;
 const MAX_DESCRIPTION_CHARS = 32768;
-const protectedNames = new Set(['set_tool_visibility', 'set_tool_description', 'list_hidden_tools', 'workspace--read']);
-export const isPresentationTool = (name: string): boolean => name === 'set_tool_visibility' || name === 'set_tool_description' || name === 'list_hidden_tools';
+const protectedNames = new Set(['set_tool_visibility', 'set_tool_description', 'workspace--read']);
+export const isPresentationTool = (name: string): boolean => name === 'set_tool_visibility' || name === 'set_tool_description';
 const hash = (value: string): string => createHash('sha256').update(value).digest('hex');
 
 /**
@@ -166,14 +166,12 @@ function lockLeftBehind(error: unknown): string {
 }
 
 export function presentationTools(path: string): ToolDefinition[] {
-  const signpost = ' Hidden tools remain available to call; list_hidden_tools shows what you hid, with descriptions. Changes affect the next newly compiled request, not an in-flight stream.';
+  const signpost = ` Read the generated catalogue with workspace--read {"path":${JSON.stringify(path)},"limit":140}. Hidden tools remain available; changes affect the next newly compiled request, not an in-flight stream.`;
   return [
     {name:'set_tool_visibility', description:'Show or hide a tool definition. Hiding does not revoke permission.' + signpost,
       inputSchema:{type:'object',properties:{name:{type:'string'},visible:{type:'boolean'}},required:['name','visible'],additionalProperties:false}},
     {name:'set_tool_description', description:'Set a personal tool description; null restores the configured component default, or the installed description when none is configured.' + signpost,
       inputSchema:{type:'object',properties:{name:{type:'string'},description:{type:['string','null']}},required:['name','description'],additionalProperties:false}},
-    {name:'list_hidden_tools', description:'List the tools you have hidden, each with its description, so you can decide whether to show one again with set_tool_visibility. Hidden tools remain available to call.',
-      inputSchema:{type:'object',properties:{},additionalProperties:false}},
   ] as unknown as ToolDefinition[];
 }
 
@@ -234,7 +232,7 @@ export class ToolPresentation {
       let description = override?.description ?? componentDefault?.description ?? tool.description;
       const descriptionSource = override?.description !== undefined ? this.config.path : componentDefault?.path ?? "installed component";
       if (isPresentationTool(tool.name) && (override?.description !== undefined || componentDefault !== undefined))
-        description += `\nHidden tools remain available to call; list_hidden_tools shows what you hid. Changes affect the next newly compiled request.`;
+        description += `\nCatalogue: workspace--read {"path":${JSON.stringify(this.config.cataloguePath)},"limit":140}. Changes affect the next newly compiled request.`;
       return {name:tool.name,source:sources.get(tool.name) ?? 'Unattributed',visible:override?.visible ?? true,originalDescription:tool.description,description,descriptionSource,inputSchema:structuredClone(tool.inputSchema)};
     });
     const available = tools.map((tool,i) => ({...structuredClone(tool),description:entries[i].description}));
@@ -242,11 +240,6 @@ export class ToolPresentation {
       advertised:available.filter((_,i)=>entries[i].visible),entries};
   }
   edit(tool: string, input: unknown, available: ToolDefinition[]): ToolResult {
-    if (tool === 'list_hidden_tools') {
-      const hidden = this.resolve(available).entries.filter((e) => !e.visible).map((e) => ({name:e.name, description:e.description}));
-      if (!hidden.length) return {success:true, data:{count:0, hidden:[], message:'Nothing is hidden: every available tool is in your tool list.'}};
-      return {success:true, data:{count:hidden.length, hidden, note:'These stay available to call. set_tool_visibility {"name":"…","visible":true} shows one again from the next newly compiled request.'}};
-    }
     const lock = this.config.path + '.lock';
     let fd: number | undefined, tempFd: number | undefined, temp: string | undefined;
     let result: ToolResult, lockLeft: { error: unknown } | undefined;
@@ -333,13 +326,13 @@ export class ToolPresentation {
     const name = args.name as string;
     if (!available.some((t) => t.name === name)) {
       const near = closestNames(name, available.map((t) => t.name));
-      throw new PresentationRefusal(`Nothing was changed: no tool named ${quoted(name)} is available to you.${near.length ? ` Did you mean ${quotedList(near, 'or', JSON.stringify)}?` : ''}`
-        + ' Copy the exact name from your tool list.');
+      throw new PresentationRefusal(`Nothing was changed: you have no tool named ${quoted(name)} right now, shown or hidden.${near.length ? ` Did you mean ${quotedList(near, 'or', JSON.stringify)}?` : ''}`
+        + ` Copy the exact name from your tool catalogue's index, workspace--read {"path":${JSON.stringify(this.config.cataloguePath)},"limit":140}, reading on with "offset" if the index runs past that.`);
     }
     if (field === 'description' && typeof args.description === 'string' && characters(args.description) > MAX_DESCRIPTION_CHARS)
       throw new PresentationRefusal(`Nothing was changed: the description is ${count(characters(args.description))} characters, over the ${count(MAX_DESCRIPTION_CHARS)} allowed. Shorten it and call set_tool_description again.`);
     if (field === 'visible' && args.visible === false && protectedNames.has(name))
-      throw new PresentationRefusal(`Nothing was changed: ${name} can't be hidden, since set_tool_visibility, set_tool_description and list_hidden_tools are how you see and undo these changes. Calling this again won't change that.`);
+      throw new PresentationRefusal(`Nothing was changed: ${name} can't be hidden, since workspace--read, set_tool_visibility and set_tool_description are how you read the catalogue and undo these changes. Calling this again won't change that.`);
     return name;
   }
 }
@@ -363,6 +356,17 @@ export function renderCatalogue(snapshot: PresentationSnapshot): string {
   ];
   // One line each: a quoted parse error can hold the file's own line breaks.
   for (const diagnostic of snapshot.diagnostics) lines.push('Diagnostic: '+diagnostic.replace(/\r\n|\r|\n/g, '\\n'));
+  // The available tools hidden from the resident come right after the header
+  // and any diagnostics, each with the description it would show, so a read
+  // from the top reaches them before the index, with no read per hidden tool
+  // and no pass through every visible tool's description. A long section
+  // pushes the index further down; the read's own truncation note says to
+  // read on.
+  const hidden = snapshot.entries.filter(e => !e.visible);
+  if (hidden.length) {
+    lines.push(`## Hidden (${hidden.length})`, '');
+    for (const entry of hidden) lines.push(`### ${entry.name} (${entry.source})`, '', ...entry.description.split('\n'), '');
+  }
   lines.push('## Index by source', '');
   const index = new Map<string, number>();
   for (const [source, entries] of groups) {
