@@ -1607,6 +1607,11 @@ export interface HostModeStatus {
    * dequeue → settled teardown, strictly wider than activeStreams). */
   drained: boolean;
   activeTurns: number;
+  /** The agents holding a turn, the ones `activeTurns` counts, sorted: each
+   * from its turn's dequeue to its settled teardown, so a turn in its hooks
+   * or compile, or one finishing its deliveries, is listed. These are the
+   * agents an abandon or a stop() made now would find mid-turn. */
+  activeTurnAgents: string[];
   /** Wakes that own provider admission while waiting for an in-flight
    * auxiliary call — no turn token yet, but a turn is one settle away. The
    * admission continuation rechecks quiesce and requeues them; `drained`
@@ -6454,6 +6459,7 @@ export class AgentFramework {
       ...(this.quiescedAt !== undefined ? { since: this.quiescedAt } : {}),
       drained: this.activeTurnTokens.size === 0 && parkedAdmissions === 0,
       activeTurns: this.activeTurnTokens.size,
+      activeTurnAgents: [...this.activeTurnTokens.keys()].sort(),
       parkedAdmissions,
       gatedRequests: this.pendingRequests.filter((r) => !isTurnContinuation(r.reason)).length,
       backgroundScripts: this.codeExecution?.scripts.leftRunning() ?? 0,
