@@ -228,6 +228,30 @@ test('replaced temporary pathname cannot redirect permission changes',()=>{
 // "Nothing was changed", names every problem it can see, and says what helps.
 const presentationTargets=(...names:string[])=>names.map(name=>({name,description:'original',inputSchema:{type:'object' as const}}));
 
+test('the catalogue opens on what the resident hid, each with its source and the description it would show',()=>{
+ const dir=mkdtempSync(join(tmpdir(),'catalogue-hidden-first-'));
+ try {
+  const web=join(dir,'web.json'), path=join(dir,'tools.json');
+  writeFileSync(web,JSON.stringify({version:1,tools:{'web--fetch':{description:'Fetch, as the host words it'}}}));
+  const p=new ToolPresentation({path,cataloguePath:'board/tools.md',defaults:[{source:'MCPL server: web',path:web}]});
+  const tools=presentationTargets('web--fetch','web--post','mail--send','workspace--read');
+  const sources=new Map([['web--fetch','MCPL server: web'],['web--post','MCPL server: web'],['mail--send','MCPL server: mail'],['workspace--read','Module: workspace']]);
+  // Hidden: one showing its configured default, one the resident reworded over two lines. Visible: the rest.
+  writeFileSync(path,JSON.stringify({version:1,tools:{'web--fetch':{visible:false},'mail--send':{visible:false,description:'my words\nsecond line'},'web--post':{visible:true}}}));
+  const lines=renderCatalogue(p.resolve(tools,sources)).split('\n');
+  const hiddenAt=lines.indexOf('## Hidden (2)'), indexAt=lines.indexOf('## Index by source');
+  assert.ok(hiddenAt>0 && hiddenAt<indexAt,'what was hidden comes before the index');
+  assert.deepEqual(lines.slice(hiddenAt,indexAt),['## Hidden (2)','',
+   '### web--fetch (MCPL server: web)','','Fetch, as the host words it','',
+   '### mail--send (MCPL server: mail)','','my words','second line','']);
+  assert.ok(lines.slice(0,hiddenAt).includes('4 tools: 2 visible, 2 hidden.'));
+  // Nothing hidden: no section, and the header says so.
+  writeFileSync(path,JSON.stringify({version:1,tools:{}}));
+  const none=renderCatalogue(p.resolve(tools,sources));
+  assert.ok(!none.includes('## Hidden'),none); assert.match(none,/4 tools: 4 visible, 0 hidden\./);
+ } finally {rmSync(dir,{recursive:true,force:true});}
+});
+
 test('an edit refusal names every problem with its arguments, the call that works, and the closest names',()=>{
  const dir=mkdtempSync(join(tmpdir(),'presentation-refusals-'));
  try {
@@ -241,7 +265,8 @@ test('an edit refusal names every problem with its arguments, the call that work
    'Nothing was changed: the arguments were an array, not an object. '
    +'set_tool_description takes {"name": a tool\'s exact name, "description": the new text, or null to restore the default}.');
   assert.equal(refusal('set_tool_visibility',{name:'exampel',visible:false}),
-   'Nothing was changed: no tool named "exampel" is available to you. Did you mean "example"? Copy the exact name from your tool list.');
+   'Nothing was changed: you have no tool named "exampel", shown or hidden. Did you mean "example"? Copy the exact name from your tool catalogue\'s index, '
+   +'workspace--read {"path":"board/tools.md","limit":140}, reading on with "offset" if the index runs past that.');
   // A suggested name is quoted whole, however long, since it's what the agent copies.
   const long='mcpl--'+'research_assistant_'.repeat(3)+'search_archive';
   const withLong=[...tools,...presentationTargets(long)];
@@ -249,7 +274,7 @@ test('an edit refusal names every problem with its arguments, the call that work
   assert.ok(long.length>60);
   assert.match(r.error!,new RegExp(`Did you mean ${JSON.stringify(long)}\\?`));
   // The name the agent typed is quoted as a file's names are: whole up to 60 characters, and past that cut, with its length.
-  assert.ok(r.error!.startsWith(`Nothing was changed: no tool named ${JSON.stringify(long.slice(0,57))}... (76 characters) is available to you.`),r.error);
+  assert.ok(r.error!.startsWith(`Nothing was changed: you have no tool named ${JSON.stringify(long.slice(0,57))}... (76 characters), shown or hidden.`),r.error);
   assert.doesNotMatch(refusal('set_tool_visibility',{name:'deploy',visible:false})!,/Did you mean/,'a name close to nothing gets no guess');
   // Two close names are both offered, the closer first.
   const two=p.edit('set_tool_visibility',{name:'exampl',visible:false},[...tools,...presentationTargets('example_two')]);
@@ -264,7 +289,7 @@ test('an edit refusal names every problem with its arguments, the call that work
    'Nothing was changed: "description" is 5, not a string or null. '
    +'set_tool_description takes {"name": a tool\'s exact name, "description": the new text, or null to restore the default}.');
   for (const name of ['workspace--read','set_tool_visibility','set_tool_description']) assert.equal(refusal('set_tool_visibility',{name,visible:false}),
-   `Nothing was changed: ${name} can't be hidden, since set_tool_visibility, set_tool_description and list_hidden_tools are how you see and undo these changes. Calling this again won't change that.`);
+   `Nothing was changed: ${name} can't be hidden, since workspace--read, set_tool_visibility and set_tool_description are how you read the catalogue and undo these changes. Calling this again won't change that.`);
   assert.equal(existsSync(path),false,'no refusal wrote the file');
   assert.equal(p.edit('set_tool_description',{name:'example',description:'\u{1F600}'.repeat(32768)},tools).success,true,'at the limit in characters, though twice it in UTF-16 units');
  } finally {rmSync(dir,{recursive:true,force:true});}
@@ -517,33 +542,5 @@ test('a FIFO at the presentation file is refused at once, not waited on with the
   const out=JSON.parse(child.stdout);
   assert.match(out.diagnostics[0],/^Your tool presentation file can't be used \(it isn't a regular file\)/);
   assert.equal(out.description,'original','the default description stays');
- } finally {rmSync(dir,{recursive:true,force:true});}
-});
-
-test('list_hidden_tools lists only hidden tools, each with its description',()=>{
- const dir=mkdtempSync(join(tmpdir(),'presentation-'));
- try {
-  const path=join(dir,'tools.json'), p=new ToolPresentation({path,cataloguePath:'board/tools.md'});
-  const tools=[{name:'alpha',description:'first',inputSchema:{type:'object' as const}},{name:'beta',description:'second',inputSchema:{type:'object' as const}},...presentationTools('board/tools.md'),{name:'workspace--read',description:'read',inputSchema:{type:'object' as const}}];
-  type Listing={count:number;hidden:{name:string;description:string}[]};
-  assert.deepEqual(presentationTools('board/tools.md').map(t=>t.name),['set_tool_visibility','set_tool_description','list_hidden_tools']);
-  for (const t of presentationTools('board/tools.md')) assert.equal(/catalogue/i.test(t.description),false,`${t.name} no longer sends the resident to read the catalogue`);
-  const empty=p.edit('list_hidden_tools',{},tools);
-  assert.equal(empty.success,true);
-  assert.deepEqual((empty.data as Listing).hidden,[]);
-  assert.equal((empty.data as Listing).count,0);
-  assert.equal(p.edit('set_tool_visibility',{name:'alpha',visible:false},tools).success,true);
-  assert.equal(p.edit('set_tool_description',{name:'alpha',description:'my words'},tools).success,true);
-  assert.equal(p.edit('set_tool_visibility',{name:'beta',visible:false},tools).success,true);
-  const listed=p.edit('list_hidden_tools',{},tools);
-  assert.equal(listed.success,true);
-  assert.deepEqual((listed.data as Listing).hidden,[{name:'alpha',description:'my words'},{name:'beta',description:'second'}],'hidden tools, with the description each would show');
-  assert.equal((listed.data as Listing).count,2);
-  assert.equal(p.resolve(tools).advertised.some(t=>t.name==='alpha'||t.name==='beta'),false,'listing changes nothing');
-  assert.equal(p.edit('set_tool_visibility',{name:'list_hidden_tools',visible:false},tools).success,false,'the listing tool is protected like the editing tools');
-  const unknown=p.edit('set_tool_visibility',{name:'alpah',visible:false},tools);
-  assert.equal(unknown.success,false);
-  assert.match(String(unknown.error),/"alpha"/,'closest names are still offered');
-  assert.equal(/catalogue/i.test(String(unknown.error)),false,'the refusal no longer sends the resident to read the catalogue');
  } finally {rmSync(dir,{recursive:true,force:true});}
 });
