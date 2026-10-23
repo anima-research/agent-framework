@@ -3570,6 +3570,35 @@ test("a receipt whose write failed is written by the producer's retry with the s
   assert.equal(p.delivered.length, 1, 'the rendered notice is not delivered again');
 });
 
+test("a receipt a retry writes while its batch renders records that batch, so a crash before the render's content is stored brings it back for its fallback", async () => {
+  const state = { shown: false, read: false };
+  const p = firstViewProbe(state, { held: ['n1'] });
+  const records: CoalescingReceiptRecord[] = [];
+  let failing = 1;
+  p.host.recordReceipt = (record) => {
+    if (failing > 0) { failing--; throw new Error('ENOSPC simulated'); }
+    records.push(structuredClone(record));
+  };
+  await assert.rejects(p.coalescer.accept(p.occurrence('n1', { deferred: true, initial: true })), (error: { code?: number }) => error.code === -32000);
+  const assembling = p.coalescer.assemble('agent');
+  await p.renderStarted('n1');
+  // The render-start snapshot, then the producer's retry while the render runs.
+  const snapshot = p.coalescer.snapshot();
+  const retry = await p.coalescer.accept(p.occurrence('n1', { deferred: true, initial: true }));
+  assert.deepEqual(retry, { accepted: true, coalesce: { outcome: 'first' } });
+  assert.equal(records.length, 1, 'the retry wrote the record');
+  assert.equal(records[0].batch?.latest.eventId, 'n1', 'with the rendering batch as pending');
+  // A crash before the render's content is stored: the snapshot and the record survive.
+  const restored = new PushCoalescer<null>(p.host);
+  restored.restore(snapshot);
+  restored.restoreReceipts(records);
+  assert.deepEqual(restored.pendingBatchOccurrences().map((o) => o.eventId), ['n1'], 'the accepted notice comes back');
+  await restored.assemble('agent');
+  assert.deepEqual(p.delivered.map((d) => d.eventId), ['n1'], 'and its fallback is delivered');
+  p.release('n1');
+  await assembling;
+});
+
 test('an admission whose receipt is never written is observed once, after its effects', async () => {
   const state = { shown: false, read: false };
   const p = firstViewProbe(state, { held: [], stored: ['p1'] });

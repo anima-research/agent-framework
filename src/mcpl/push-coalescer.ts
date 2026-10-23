@@ -266,7 +266,9 @@ export interface CoalescingReceiptRecord {
    *  itself (so a crash before the snapshot flush cannot lose it while keeping
    *  the receipt that suppresses its retry), or `null` when the acceptance
    *  left no batch — a retraction or plain replacement must be recoverable
-   *  too. Records replay in order, so the last one per subject wins. */
+   *  too. Records replay in order, so the last one per subject wins. A
+   *  record a retry writes (its first write failed) takes the batch the
+   *  subject has then, a rendering one included. */
   batch: { latest: CoalescedOccurrence<unknown>; notices: DeferredNotice[]; dropped: number } | null;
 }
 
@@ -657,13 +659,19 @@ export class PushCoalescer<E = unknown> {
    *  subject's first-view end and pending batch as they are now. A record
    *  written by a retry follows any written since its admission, and records
    *  replay in order, so it carries the batch the subject has now, not the
-   *  one it had then. Throws when the host's write does. */
+   *  one it had then. That includes a batch whose render has started, which
+   *  the render-start snapshot holds too: a `null` would clear it at a
+   *  restore, and a crash before the render's content is stored would lose
+   *  the accepted work. (At an admission no batch is rendering without a
+   *  pending one: a plain occurrence or a retraction cancels the render, and
+   *  a deferred notice opens a batch.) Throws when the host's write does. */
   private recordReceipt(key: string, entry: ReceiptEntry, fixed: { subject: string; born?: SubjectState<unknown>['history'] }): void {
     const state = this.subjects.get(fixed.subject);
+    const batch = state?.batch ?? state?.rendering?.batch;
     this.host.recordReceipt?.({
       key, result: entry.result, at: entry.at, subject: fixed.subject, ...(fixed.born ? { born: fixed.born } : {}),
       ...(state?.firstViewEnded ? { firstViewEnded: true as const } : {}),
-      batch: state?.batch ? structuredClone({ latest: state.batch.latest as CoalescedOccurrence<unknown>, notices: state.batch.notices, dropped: state.batch.dropped }) : null,
+      batch: batch ? structuredClone({ latest: batch.latest as CoalescedOccurrence<unknown>, notices: batch.notices, dropped: batch.dropped }) : null,
     });
   }
 
@@ -1228,9 +1236,9 @@ export class PushCoalescer<E = unknown> {
       if (r.batch === undefined) continue; // pre-round-3 record: no batch information
       // The subject's batch AFTER that acceptance, newer than the snapshot:
       // the accepted deferred work itself, or null for a withdrawal /
-      // replacement that cleared it. It never began rendering before the
-      // record was written, but the snapshot cannot say whether it did
-      // afterwards: take the fallback.
+      // replacement that cleared it. Its render may have started before the
+      // record was written (a retry's record) or after, and the snapshot
+      // cannot say whether it ran: take the fallback.
       const state = this.subjects.get(r.subject) ?? { history: 'unknown' as const, touchedAt: now };
       state.batch = r.batch
         ? { latest: r.batch.latest as CoalescedOccurrence<E>, notices: r.batch.notices, dropped: r.batch.dropped, noRender: true }
