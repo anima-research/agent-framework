@@ -229,9 +229,10 @@ function shownInHistory(value: unknown): unknown {
   const b = value as Record<string, unknown>;
   if (!governedByRfc005(b)) return value;
   if ((b.type === 'image' || b.type === 'audio') && typeof b.data === 'string') {
-    // JSON writes every field, so here inline data beside a uri of any value
+    // JSON writes every field, so here inline data beside a uri of any type
     // is withheld, not only beside a string one as in the lanes, which show
-    // no uri: an object can carry a credential. An empty uri carries none.
+    // no uri: an object can carry a credential. A null, absent or empty uri
+    // carries none (hasUri).
     return hasUri(b.uri) || b.disposition !== undefined ? INLINE_WITHHELD_TEXT : value;
   }
   return referenceStubOrNull(b, 'from tool result') ?? value;
@@ -243,7 +244,9 @@ function shownInHistory(value: unknown): unknown {
  * RFC-005 governs is shown as the script lane shows it, a reference as its
  * stub's facts without its uri and an invalid one as the notice
  * (referenceBlockForScript), and inline data that also claims a uri of any
- * value or a disposition as the withheld notice, each as a text block. Any
+ * type or a disposition as the withheld notice, each as a text block. A
+ * null, absent or empty uri claims none (hasUri), so inline data beside one
+ * is itself. Any
  * other value is itself. What it gives is either a stub or a notice, which
  * RFC-005 doesn't govern, or the value itself, which it gives again, so
  * applying it twice gives what applying it once gave.
@@ -256,6 +259,22 @@ export function shownToScript(value: unknown): unknown {
     return hasUri(b.uri) || b.disposition !== undefined ? { type: 'text', text: INLINE_WITHHELD_TEXT } : value;
   }
   return referenceBlockForScript(b);
+}
+
+/**
+ * A value nested in an MCPL peer's content block as a script reads it, as a
+ * JSON replacer applies it inside the blocks: what RFC-005 governs
+ * (governedByRfc005, history's guard, since the classifier would make a
+ * notice of an object that isn't a content block, such as a peer's own
+ * nested data) gets the treatment the script lane gives a
+ * peer's block (referenceBlockForScript), its reference bound to the server
+ * that sent it, and any other value is itself. A stub or a notice isn't
+ * governed, so a block the top-level pass already treated is left as it is.
+ */
+export function shownToScriptFromServer(value: unknown, serverId: string): unknown {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return value;
+  const b = value as Record<string, unknown>;
+  return governedByRfc005(b) ? referenceBlockForScript(b, serverId) : value;
 }
 
 /**

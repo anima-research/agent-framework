@@ -455,8 +455,8 @@ export function referenceStubOrNull(block: unknown, provenance?: string, serverI
  * result, which carries blocks rather than text. It makes the decision
  * referenceStubOrNull makes for the model's lanes, since what a script prints
  * comes back to the model, except that a script reads every field, so inline
- * data beside a uri of any value is withheld, where the model's lanes, which
- * show no uri, withhold it beside a string one. A reference becomes the stub's facts as data,
+ * data beside a uri of any type but null or absent is withheld, where the
+ * model's lanes, which show no uri, withhold it beside a string one. A reference becomes the stub's facts as data,
  * without its URI: the host's reference id, what the server said about it in
  * this block (its labels stripped and bounded as in the stub), and `savedTo`,
  * the workspace path its payload was fetched to, or null when it wasn't
@@ -470,8 +470,8 @@ export function referenceStubOrNull(block: unknown, provenance?: string, serverI
  * it arrived (a module's ctx.callTool registers an MCPL peer's references),
  * or a new one bound to no server. A block the classifier
  * rejects becomes the notice the model's lanes show, and inline data that
- * also claims a bulk disposition, or a uri of any value, the withheld
- * notice, each as a text block.
+ * also claims a bulk disposition, or a uri of any type but null or absent
+ * (an empty string included), the withheld notice, each as a text block.
  * A text block, or inline data that claims nothing, is returned as sent.
  */
 export function referenceBlockForScript(block: unknown, serverId?: string): unknown {
@@ -480,7 +480,7 @@ export function referenceBlockForScript(block: unknown, serverId?: string): unkn
     case 'text': return block;
     case 'inline': {
       // A script reads every field, as history's JSON writes it, so inline
-      // data beside a uri of any value is withheld here, not only beside a
+      // data beside a uri of any type is withheld here, not only beside a
       // string one as in the model's lanes, which show no uri: an object can
       // carry a credential. An absent or null uri carries none; a string one,
       // an empty one included, is already the classifier's contradiction.
