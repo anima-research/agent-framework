@@ -1218,7 +1218,11 @@ export class Agent {
    * manager commits what it commits for one, the consumed watermark moves,
    * and a prepared budget change settles. To inspect what the agent would
    * see, use the framework's `previewActivation`, which compiles as a dry
-   * run. */
+   * run. Call it only while none of this agent's requests is streaming: a
+   * context manager that keeps a thinking-binding record takes a reply stored
+   * after a committing compile as sent under that compile's request, so one
+   * made while an earlier request still streams would have that request's
+   * replies sent later with thinking whose earlier conversation changed. */
   async compileContext(budget?: TokenBudget): Promise<CompileResult> {
     // RFC-006 §3.3: consumption is determined at assembly — a compile that
     // fails assembled nothing, so the watermark moves only on success.
@@ -1296,7 +1300,9 @@ export class Agent {
 
   /**
    * Run inference and return result with tool calls and speech content.
-   * Updates agent state during execution.
+   * Updates agent state during execution. Its compile commits, so call it
+   * only while none of this agent's requests is streaming (see
+   * compileContext).
    */
   async runInference(
     availableTools: ToolDefinition[],
@@ -1308,7 +1314,9 @@ export class Agent {
 
   /**
    * Run inference with context injections.
-   * Same as runInference but passes injections through to compile.
+   * Same as runInference but passes injections through to compile. Its
+   * compile commits, as runInference's does, so call either only while none
+   * of this agent's requests is streaming (see compileContext).
    */
   async runInferenceWithInjections(
     availableTools: ToolDefinition[],
