@@ -159,23 +159,23 @@ describe('tune-out, all-except scope', () => {
     try {
       await registerOpen(f, 'work', 'noisy');
       const i = internals(f);
-      const noDuration = i.handleTuneOutTool('agent', { channelId: 'work', scope: 'all-except' });
+      const noDuration = await i.handleTuneOutTool('agent', { channelId: 'work', scope: 'all-except' });
       assert.equal(noDuration.success, false);
       assert.match(noDuration.error ?? '', /durationSeconds/);
-      const entered = i.handleTuneOutTool('agent', { channelId: 'work', scope: 'all-except', durationSeconds: 120 });
+      const entered = await i.handleTuneOutTool('agent', { channelId: 'work', scope: 'all-except', durationSeconds: 120 });
       assert.ok(entered.success, entered.error);
       assert.equal((entered.data as { except?: string }).except, 'work');
       await incoming(f, 'noisy', 'n1', 'noise');
       await settle(f);
-      const check = i.handleTuneOutTool('agent', { mode: 'check', peek: 'noisy' });
+      const check = await i.handleTuneOutTool('agent', { mode: 'check', peek: 'noisy' });
       assert.ok(check.success, check.error);
       assert.deepEqual((check.data as { allExcept: { held: Record<string, number> } }).allExcept.held, { noisy: 1 });
       assert.deepEqual((check.data as { peek: string[] }).peek, ['antra: noise']);
-      const cancelled = i.handleTuneOutTool('agent', { mode: 'cancel', scope: 'all-except' });
+      const cancelled = await i.handleTuneOutTool('agent', { mode: 'cancel', scope: 'all-except' });
       assert.ok(cancelled.success, cancelled.error);
       assert.equal(i.tuneOutCoordinator!.getAllExcept(), null);
 
-      const focus = (f.framework as unknown as { handleFocusTool(agent: string, input: Record<string, unknown>): { success: boolean; error?: string; data?: unknown } })
+      const focus = await (f.framework as unknown as { handleFocusTool(agent: string, input: Record<string, unknown>): { success: boolean; error?: string; data?: unknown } })
         .handleFocusTool('agent', { channelId: 'work', durationSeconds: 120 });
       assert.ok(focus.success, focus.error);
       assert.equal(i.tuneOutCoordinator!.getAllExcept()!.params.except.channelId, 'work');
@@ -232,7 +232,7 @@ describe('tune-out, all-except scope', () => {
     f.framework.onTrace((t) => { traces.push(t.type); });
     try {
       await registerOpen(f, 'work', 'noisy');
-      const entered = internals(f).handleTuneOutTool('agent', { channelId: 'work', scope: 'all-except', durationSeconds: 120 });
+      const entered = await internals(f).handleTuneOutTool('agent', { channelId: 'work', scope: 'all-except', durationSeconds: 120 });
       assert.ok(entered.success, entered.error);
       assert.equal((entered.data as { announcedIn?: string | null }).announcedIn, 'work', 'the tool result names where the entry was announced');
       await until(() => f.published.length >= 1, 'the entry is announced');
@@ -253,7 +253,7 @@ describe('tune-out, all-except scope', () => {
     const quiet = await fixture({ framework: { subconscious: SUB, tuneOut: { announce: false } } as Partial<FrameworkConfig> });
     try {
       await registerOpen(quiet, 'work', 'noisy');
-      const entered = internals(quiet).handleTuneOutTool('agent', { channelId: 'work', scope: 'all-except', durationSeconds: 120 });
+      const entered = await internals(quiet).handleTuneOutTool('agent', { channelId: 'work', scope: 'all-except', durationSeconds: 120 });
       assert.ok(entered.success, entered.error);
       assert.equal((entered.data as { announcedIn?: string | null }).announcedIn, null);
       await incoming(quiet, 'noisy', 'n1', 'held');

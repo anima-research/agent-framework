@@ -72,6 +72,7 @@ import {
   readPath,
   sniffImageMime,
   walkScope,
+  withinIncludes,
 } from './observe.js';
 import { EffectFailed, type Expect, chainOf, chmodContained, narrowedTo, syncDirectories, unlinkContained, writeContained } from './effects.js';
 
@@ -856,16 +857,22 @@ async function gather(store: JsStore, agreement: DiskAgreement, mount: MountRunt
   }
 
   // Which paths to decide: what disk shows, and what the store, P and intent
-  // track. The tracked ones are read synchronously, on this branch.
+  // track. The tracked ones are read synchronously, on this branch. A path
+  // the mount's include doesn't cover is outside the mount, so no pass
+  // decides it: the workspace's history may hold it from before the include,
+  // and it stays there as it is. So is one in a nested mount's directory
+  // that mount's include leaves out, such as history taken in before the
+  // mount was nested there: it's no mount's (namesNestedPlace).
   const candidates = new Set<string>();
+  const inside = (p: string): boolean => withinIncludes(mount.view, p);
   let walk: Walk | null = null;
   if (scope.kind === 'paths') {
-    for (const p of scope.paths) candidates.add(p);
+    for (const p of scope.paths) if (inside(p)) candidates.add(p);
   } else {
     const prefix = scope.dir ? scope.dir + '/' : undefined;
-    for (const e of store.treeList(mount.treeStateId, prefix)) if (inScope(e.path, scope)) candidates.add(e.path);
-    for (const [p] of agreement.paths(mount.name, scope.dir)) if (inScope(p, scope)) candidates.add(p);
-    for (const [p] of mount.intents.list(scope.dir)) if (inScope(p, scope)) candidates.add(p);
+    for (const e of store.treeList(mount.treeStateId, prefix)) if (inScope(e.path, scope) && inside(e.path)) candidates.add(e.path);
+    for (const [p] of agreement.paths(mount.name, scope.dir)) if (inScope(p, scope) && inside(p)) candidates.add(p);
+    for (const [p] of mount.intents.list(scope.dir)) if (inScope(p, scope) && inside(p)) candidates.add(p);
     if (rootUnavailable === null) {
       const resumeAfter = opts.resume ? agreement.walkResumesAfter(mount.name, scope.dir) : undefined;
       walk = await walkScope(mount.view, mount.rootReal, scope.dir, scope.recursive, opts.cap ?? mount.walkCap, {
@@ -1146,8 +1153,8 @@ export async function reconcilePass(
       // it, so it's always named. Another mount's directory met beneath the
       // scope is passed over by design even where this mount's tree holds
       // copies there: no tool of this mount syncs, pushes or clears them
-      // (listings show them, naming their holder), so naming the directory
-      // as unreached would never clear.
+      // (listings show those that mount's include covers, naming their
+      // holder), so naming the directory as unreached would never clear.
       const wholeScope = scope.kind === 'dir' && scope.dir !== '' && region.path === scope.dir;
       const unreached = hides && region.reason !== OTHER_MOUNT;
       if (region.kind === 'error' || region.kind === 'cap' || unreached || wholeScope) result.incomplete.push({ path: region.path, reason: region.reason });

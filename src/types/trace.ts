@@ -33,8 +33,22 @@ export type TraceEvent =
   | (TraceEventBase & {
       type: 'process:completed';
       processEvent: ProcessEvent;
+      /** The modules' responses that applied: one refused for malformed
+       *  content is left out, and named by process:response-refused. */
       responses: ModuleProcessResponse[];
       durationMs: number;
+    })
+  /** A module's process response held content context-manager won't store,
+   *  in a message it adds or an edit it makes, and was refused whole before
+   *  any response to the event applied. `where` names the first such message
+   *  or edit in the response, such as `addMessages[1]`, and `places` is
+   *  malformedContentPlaces' answer for it. */
+  | (TraceEventBase & {
+      type: 'process:response-refused';
+      moduleName: string;
+      eventType: string;
+      where: string;
+      places: string[];
     })
 
   // Inference lifecycle
@@ -199,9 +213,10 @@ export type TraceEvent =
        * (`delivered: false`), and one whose reply leaves `delivered` out.
        * `inference:tokens` stays the model's text as it is written (held, as
        * before, while a tool-result guard's batch is pending). A later
-       * publish to the same channel by the same stream opens with a paragraph
-       * break (`\n\n`), so a channel's chunks joined in `index` order are its
-       * text, its messages kept apart.
+       * publish to the same destination, a server and its channel, by the
+       * same stream opens with a paragraph break (`\n\n`), so a
+       * destination's chunks joined in `index` order are its text, its
+       * messages kept apart.
        * `mcpl:speech-routed` also reports speech publishes, with no stream
        * id, index or end, each once delivered: deliverSpeech's, the `sleep`
        * tool's announcement among them, and a subconscious's
@@ -212,7 +227,9 @@ export type TraceEvent =
        */
       type: 'inference:published';
       agentName: string;
-      /** Where the prose is published. */
+      /** The server the prose is published to, and its channel there: two
+       *  servers' channels with the same id are two destinations. */
+      serverId: string;
       channelId: string;
       /** The stream's id, shared with its `channels/outgoing/*` notifications. */
       inferenceId: string;
@@ -226,14 +243,18 @@ export type TraceEvent =
     })
   | (TraceEventBase & {
       /**
-       * A stream's end for one channel it published to (MCPL Spec 14.3
-       * `channels/outgoing/complete`), sent on every exit path once the
-       * stream has ended and its deliveries have run, or, when the host
-       * stops, at once: `text` is everything its `inference:published` chunks
-       * carried there, and none follows it.
+       * A stream's end for one destination it published to, a server and
+       * its channel, emitted on every exit path once the stream has ended
+       * and its deliveries have run, or, when the host stops, before its
+       * connections close: `text` is everything its `inference:published`
+       * chunks carried there by then, and none follows it. Like those
+       * chunks, it's emitted whether or not that server takes the stream,
+       * or registers the channel still; the MCPL
+       * `channels/outgoing/complete` goes to the server only when it does.
        */
       type: 'inference:published_complete';
       agentName: string;
+      serverId: string;
       channelId: string;
       inferenceId: string;
       text: string;
@@ -281,10 +302,11 @@ export type TraceEvent =
     })
   | (TraceEventBase & {
       /**
-       * A writable workspace existed but the oversized-result spill write
-       * failed (size cap, storeBlob failure, …) — the over-cap tail was NOT
+       * The workspace had a writable mount without an include, where spills
+       * go, but the oversized-result spill write failed (size cap, storeBlob failure, …) — the over-cap tail was NOT
        * retained. Distinct from the no-workspace fallback, which is silent
-       * by design (nothing unexpected happened).
+       * by design (nothing unexpected happened), whether the setup has no
+       * writable mount or every writable mount has an include, as configured.
        */
       type: 'tool:spill_failed';
       label: string;
@@ -366,6 +388,18 @@ export type TraceEvent =
       reason: string;
       field?: string;
       detail?: string;
+    })
+  /** MCPL content that context-manager won't store, because it doesn't
+   *  match ContentBlock, reached the store/wake site and was refused there:
+   *  no row, no wake. `places` is malformedContentPlaces' answer for it. */
+  | (TraceEventBase & {
+      type: 'mcpl:malformed-content-refused';
+      lane: 'push' | 'channel';
+      serverId: string;
+      places: string[];
+      eventId?: string;
+      channelId?: string;
+      messageId?: string;
     })
   /** MCPL content with nothing model-visible reached the store/wake site
    *  (module-emitted or coalescer-delivered) and was dropped: no row, no wake. */

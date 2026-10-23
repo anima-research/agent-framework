@@ -7,6 +7,8 @@
  * - a failed launch that can't be reaped is held, never orphaned: connect()
  *   hands its owner to the caller, connectWithReconnect() and the reconnect
  *   loop halt, and close() retries the reap;
+ * - a handshake whose stdio pipe failed fails, even when it's answered, so
+ *   no connection is adopted that can't write to its child;
  * - close() during a reconnect handshake ends that launch before resolving;
  * - no reconnect launches while the previous child may still be running.
  */
@@ -19,7 +21,7 @@ import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { WebSocketServer } from 'ws';
 
-import { McplServerConnection, McplUnreapedLaunchError } from '../src/mcpl/server-connection.js';
+import { McplServerConnection, McplUnreapedLaunchError, stderrTailOf } from '../src/mcpl/server-connection.js';
 import { McplServerRegistry } from '../src/mcpl/server-registry.js';
 import { StdioTransport, openTransport } from '../src/mcpl/transport.js';
 import { createServer, type Socket } from 'node:net';
@@ -61,11 +63,12 @@ const RECONNECT = { reconnect: true, reconnectIntervalMs: 20, reconnectMaxInterv
 /**
  * Launches from the `from`-th on can't be signalled, so their cleanup can't
  * reap them (Olive-1804's pattern in mcp-modern-outcomes). `kill` really ends
- * one; cleanup restores spawning and ends any left.
+ * one, and `unreaped` settles when its transport reports it unreaped; cleanup
+ * restores spawning and ends any left.
  */
-function unreapableFrom(from: number): Array<{ pid: number; kill: () => void }> {
+function unreapableFrom(from: number): Array<{ pid: number; kill: () => void; unreaped: Promise<void> }> {
   const realSpawn = StdioTransport.spawn;
-  const stuck: Array<{ pid: number; kill: () => void }> = [];
+  const stuck: Array<{ pid: number; kill: () => void; unreaped: Promise<void> }> = [];
   let launches = 0;
   (StdioTransport as unknown as { spawn: typeof StdioTransport.spawn }).spawn = async (c) => {
     const transport = await realSpawn.call(StdioTransport, c);
@@ -73,7 +76,8 @@ function unreapableFrom(from: number): Array<{ pid: number; kill: () => void }> 
       const child = (transport as unknown as { child: { pid: number; kill: (signal?: string) => boolean } }).child;
       const realKill = child.kill.bind(child);
       child.kill = () => true;
-      stuck.push({ pid: child.pid, kill: () => { realKill('SIGKILL'); } });
+      const unreaped = new Promise<void>((resolve) => { transport.once('unreaped', () => resolve()); });
+      stuck.push({ pid: child.pid, kill: () => { realKill('SIGKILL'); }, unreaped });
     }
     return transport;
   };
@@ -82,6 +86,35 @@ function unreapableFrom(from: number): Array<{ pid: number; kill: () => void }> 
     for (const s of stuck) s.kill();
   });
   return stuck;
+}
+
+/**
+ * The first launch from here on, as the transport its spawn yields, and for
+ * each line that transport hands over, whether it came in the same callback
+ * as the line before it.
+ */
+function firstLaunch(): { transport: () => StdioTransport | undefined; sameCallback: boolean[] } {
+  const realSpawn = StdioTransport.spawn;
+  let first: StdioTransport | undefined;
+  const sameCallback: boolean[] = [];
+  (StdioTransport as unknown as { spawn: typeof StdioTransport.spawn }).spawn = async (c) => {
+    const transport = await realSpawn.call(StdioTransport, c);
+    if (first) return transport;
+    first = transport;
+    // A callback's lines are handed over with no microtask between them.
+    let inCallback = false;
+    transport.on('line', () => {
+      sameCallback.push(inCallback);
+      inCallback = true;
+      queueMicrotask(() => { inCallback = false; });
+    });
+    return transport;
+  };
+  cleanups.push(() => { (StdioTransport as unknown as { spawn: typeof StdioTransport.spawn }).spawn = realSpawn; });
+  // The launch is ended once its test is over too, so a test that fails
+  // before its handshake ends doesn't leave the child running.
+  cleanups.push(() => first?.close().catch(() => {}));
+  return { transport: () => first, sameCallback };
 }
 
 async function killAndWait(stuck: { pid: number; kill: () => void }): Promise<void> {
@@ -158,6 +191,46 @@ test('a failed connect that cannot be reaped hands its owner to the caller, who 
   await assert.rejects(owner.close(), /could not be reaped/, 'still running: the reap fails again');
   await killAndWait(stuck[0]!);
   await owner.close();
+});
+
+test("a handshake answered after its stdio pipe failed fails, holding a child that outlived SIGKILL, rather than adopting a connection that can't write to it", async () => {
+  const log = scratchLog();
+  const stuck = unreapableFrom(1);
+  const connecting = McplServerConnection.connect(config('deaf-ping', log), HOST_CAPS).then(() => null, (e: unknown) => e);
+  // The server closed its stdin and pinged this host, whose answer met EPIPE.
+  // The reap gives up on the child while the handshake still waits, with
+  // nothing listening for that yet; only then does the server answer.
+  await until(() => stuck.length === 1, 'the launch');
+  await stuck[0]!.unreaped;
+  process.kill(stuck[0]!.pid, 'SIGUSR2');
+  const error = await connecting;
+  assert.ok(error instanceof McplUnreapedLaunchError, String(error));
+  assert.match(error.message, /^MCPL server "legacy" stdio pipe failed with write EPIPE during the handshake; its cleanup also failed: stdio child \d+ of MCP server "legacy" did not exit within \d+ms of SIGKILL; it could not be reaped$/);
+  const owner = error.connection;
+  assert.equal(owner.isConnected, false);
+  assert.equal(owner.willReconnect, false);
+  await assert.rejects(owner.close(), /could not be reaped/, 'still running: the reap fails again');
+  await killAndWait(stuck[0]!);
+  await owner.close();
+});
+
+test('a handshake fails when its answer is read in the same callback as a ping whose answer met EPIPE, and its cleanup reaps the child', async () => {
+  const log = scratchLog();
+  const launch = firstLaunch();
+  const connecting = McplServerConnection.connect(config('deaf-ping-answered', log), HOST_CAPS).then(() => null, (e: unknown) => e);
+  // The server has closed its stdin and said so on stderr, and that line is
+  // in this host's stderr tail. Only then does it write a ping and its answer
+  // together, so this host reads both in one callback: its answer to the ping
+  // meets EPIPE, which is reported only once that callback has returned.
+  await until(() => /deaf-ping: stdin closed/.test(launch.transport()?.stderrTail ?? ''), "the server's stderr line");
+  const [pid] = starts(log);
+  process.kill(pid!, 'SIGUSR2');
+  const error = await connecting;
+  assert.deepEqual(launch.sameCallback, [false, true], 'the ping and the answer were read in one callback');
+  assert.ok(error instanceof Error && !(error instanceof McplUnreapedLaunchError), String(error));
+  assert.match(String(error), /^Error: MCPL server "legacy" stdio pipe failed with write EPIPE during the handshake$/);
+  assert.match(stderrTailOf(error) ?? '', /deaf-ping: stdin closed/, "the server's stderr goes with it, as with the handshake's other failures");
+  assert.equal(alive(pid!), false, "gone once the connect failed: the handshake's cleanup reaped it");
 });
 
 test('with reconnect too, a failed first launch that cannot be reaped throws, handing over its owner, as without', async () => {

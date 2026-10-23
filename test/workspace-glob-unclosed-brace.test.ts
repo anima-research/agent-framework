@@ -95,6 +95,8 @@ test('a "{" that never closes is named as that, with a closed group after it', (
 test('glob and grep refuse a group inside another', () => {
   assertRefused('glob', { pattern: 'src/{a,{b,c}}.ts' }, 'src/{a,{b,c}}.ts', NESTED);
   assertRefused('grep', { pattern: 'export', glob: 'src/{a,{b,c}}.ts' }, 'src/{a,{b,c}}.ts', NESTED);
+  // …and so is one with a `/` after it, which an alternative would otherwise take in
+  assertRefused('glob', { pattern: '{a,{b/**,c}}/x' }, '{a,{b/**,c}}/x', NESTED);
 });
 
 test('glob and grep refuse a group with no ",", an empty one included', () => {

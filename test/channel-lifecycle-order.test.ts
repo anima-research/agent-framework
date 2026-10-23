@@ -2,12 +2,13 @@ import { test } from 'node:test';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import type { JsStore } from '@animalabs/chronicle';
+import { JsStore } from '@animalabs/chronicle';
 import { AgentFramework } from '../src/index.js';
 import { MockMembrane } from './helpers/mock-membrane.js';
 import assert from 'node:assert/strict';
 import { ChannelRegistry } from '../src/mcpl/channel-registry.js';
 import { CapabilityGrant, ALL_CAPABILITY_PATHS } from '../src/mcpl/capability-grant.js';
+import { McplRequestError } from '../src/mcpl/server-connection.js';
 import type { McplServerRegistry } from '../src/mcpl/server-registry.js';
 import type { FeatureSetManager } from '../src/mcpl/feature-set-manager.js';
 import type { ChannelDescriptor, ChannelIncomingMessage, ChannelsOpenResult } from '../src/mcpl/types.js';
@@ -22,6 +23,9 @@ type NoticeHandler = NonNullable<RegistryOptions['onChannelAutoOpened']>;
 
 /** A tool result's data, as the channel tools shape it. */
 const dataOf = (result: { data?: unknown }) => (result.data ?? {}) as { status?: string; closeError?: string };
+/** Why words aren't sent where the fixture's connected server's grant lacks channels.publish. */
+const NOT_PERMITTED_TO_POST = 'this host isn\'t permitted to post to the "test" server\'s channels, and trying again won\'t ' +
+  'change that; if you need it, ask whoever runs this host';
 
 function message(channelId = 'x', messageId = 'm1'): ChannelIncomingMessage {
   return {
@@ -33,7 +37,7 @@ function message(channelId = 'x', messageId = 'm1'): ChannelIncomingMessage {
 function fixture(onNotice?: NoticeHandler, store?: JsStore, coalesce?: RegistryOptions['handleCoalescedIncoming']) {
   const actual = new Map<string, boolean>();
   const calls: Array<{ kind: 'open' | 'close'; id: string; address?: unknown }> = [];
-  const pending: Array<{ finish: () => void; fail: () => void }> = [];
+  const pending: Array<{ finish: () => void; fail: (err?: Error) => void }> = [];
   const held = new Set<string>();
   const publishedWhileOpen: boolean[] = [];
   const notices: Array<{ source: string; channels: Array<{ channelId: string; label?: string }> }> = [];
@@ -55,7 +59,7 @@ function fixture(onNotice?: NoticeHandler, store?: JsStore, coalesce?: RegistryO
           ? { channel: { ...descriptor(target), ...(declared ? { direction: declared } : {}) } }
           : { closed: true });
       };
-      if (held.has(id)) pending.push({ finish, fail: () => reject(new Error('fixture lifecycle failure')) });
+      if (held.has(id)) pending.push({ finish, fail: (err?: Error) => reject(err ?? new Error('fixture lifecycle failure')) });
       else finish();
     });
   };
@@ -140,8 +144,11 @@ for (const firstKind of ['open', 'close'] as const) {
     const last = f.tool(lastKind);
     await f.drain(first, last);
     assert.equal((await first).success, false);
-    assert.match(String((await first).error), /superseded by a newer lifecycle decision/);
-    assert.doesNotMatch(String((await first).error), /stays selected/, 'a newer decision replaced it');
+    assert.equal((await first).error, firstKind === 'open'
+      ? 'Channel "x": a later decision to close it came first, so this open doesn\'t stand. Call channel_open again to open it.'
+      : 'Channel "x": a later decision to keep it open came first, so this close doesn\'t stand. Call channel_close again to ' +
+        'close it.');
+    assert.doesNotMatch(String((await first).error), /is recorded|stays recorded/, 'a newer decision replaced it');
     assert.equal((await last).success, true);
     const desired = lastKind === 'open';
     assert.equal(f.registry.getDesiredState('test', 'x'), lastKind === 'open' ? 'open' : 'closed');
@@ -279,7 +286,9 @@ test('a failed backscroll open preserves an already-live subscription', async ()
   await tick();
   f.pending.shift()!.fail();
   assert.equal((await backscroll).success, false);
-  assert.doesNotMatch(String((await backscroll).error), /stays selected/, 'the channel is still open');
+  assert.equal((await backscroll).error,
+    'Channel "x" is open, but the history you asked for didn\'t come: fixture lifecycle failure. ' +
+    'Calling channel_open again with backscroll tries once more.', 'the channel is still open');
   assert.equal(f.isOpen(), true, 'a failed redundant open is not a confirmed close');
   const speech = f.registry.routeSpeech('resident', 'hello', 'x');
   await f.drain(speech);
@@ -316,7 +325,7 @@ test('a draft published into a channel with a close pending waits for it and pos
   assert.equal((await close).success, true);
   const outcome = await draft;
   assert.equal(outcome.status, 'failed');
-  assert.match(outcome.reason ?? '', /^lifecycle work prevented delivery: /);
+  assert.equal(outcome.reason, 'a decision to close the channel came before these words went out');
   assert.deepEqual(outcome.destination, { serverId: 'test', channelId: 'x', label: 'x' });
   assert.equal(f.registry.getDesiredState('test', 'x'), 'closed');
   assert.equal(f.isOpen(), false);
@@ -364,7 +373,7 @@ for (const change of ['announced again as inbound-only', 'removed'] as const) {
     assert.equal(f.notices.length, 1, 'the opening was announced');
     assert.deepEqual(f.publishedWhileOpen, [], 'nothing was published');
     assert.match(f.routeFailures[0]?.reason ?? '', change === 'removed'
-      ? /^the channel was removed before the words were published$/
+      ? /^the channel was removed before these words went out$/
       : /^inbound-only: server "test" declared this channel's direction "inbound"/);
     await announced;
   });
@@ -399,7 +408,7 @@ for (const answer of ['opens', 'fails'] as const) {
     } else {
       assert.equal(outcome, null);
       assert.deepEqual(f.publishedWhileOpen, [], 'nothing was published');
-      assert.match(f.routeFailures[0]?.reason ?? '', /^lifecycle work prevented delivery: /);
+      assert.equal(f.routeFailures[0]?.reason, "the channel isn't confirmed open: fixture lifecycle failure");
     }
     await announced;
   });
@@ -465,7 +474,7 @@ test('a grant without channels.publish by the time the words would be published 
   const outcome = await f.registry.publish('resident', 'words', { serverId: 'test', channelId: 'x' });
   assert.equal(f.notices.length, 1, 'the opening was announced');
   assert.equal(outcome.status, 'failed');
-  assert.equal(outcome.reason, 'channels.publish not in "test"\'s effective grant (§14.1)');
+  assert.equal(outcome.reason, NOT_PERMITTED_TO_POST);
   assert.deepEqual(outcome.destination, { serverId: 'test', channelId: 'x', label: 'x' });
   assert.deepEqual(f.publishedWhileOpen, [], 'nothing was published');
 });
@@ -486,7 +495,7 @@ test('a grant without channels.publish after the words wait for a new registrati
   f.pending.pop()!.finish();
   const outcome = await draft;
   assert.equal(outcome.status, 'failed');
-  assert.equal(outcome.reason, 'channels.publish not in "test"\'s effective grant (§14.1)');
+  assert.equal(outcome.reason, NOT_PERMITTED_TO_POST);
   assert.deepEqual(f.publishedWhileOpen, [], 'nothing was published');
   await announced;
 });
@@ -508,7 +517,7 @@ test('a close decided while its opening is announced refuses the words, as a clo
   await f.drain(closing!, speech);
   assert.equal(await speech, null);
   assert.deepEqual(f.publishedWhileOpen, [], 'nothing was published');
-  assert.match(f.routeFailures[0]?.reason ?? '', /^lifecycle work prevented delivery: /);
+  assert.equal(f.routeFailures[0]?.reason, 'a decision to close the channel came before these words went out');
   assert.equal(f.isOpen(), false, 'the close the agent decided stands');
 });
 
@@ -524,7 +533,7 @@ test('a retarget with nothing queued for it refuses the words, rather than publi
   await f.registry.handleChanged('test', { added: [descriptor('x')] });
   const outcome = await f.registry.publish('resident', 'words', { serverId: 'test', channelId: 'x' });
   assert.equal(outcome.status, 'failed');
-  assert.match(outcome.reason ?? '', /^lifecycle work prevented delivery: /);
+  assert.equal(outcome.reason, "the channel isn't confirmed open");
   assert.deepEqual(f.publishedWhileOpen, [], 'nothing was published');
   assert.deepEqual(f.calls.filter((c) => c.kind === 'open').map((c) => c.address), [{ value: 'original' }], 'no open was queued for the new target');
   await announced;
@@ -760,9 +769,9 @@ test('failed policy opening records intent once, with truthful resident text thr
   });
   try {
     const recordNotice = (framework as unknown as {
-      recordChannelAutoOpenNotice(agent: undefined, channels: Array<{ channelId: string; label?: string }>, cause: 'subscription-policy' | 'opened-by-delivery'): void;
+      recordChannelAutoOpenNotice(agent: undefined, serverId: string, channels: Array<{ channelId: string; label?: string }>, cause: 'subscription-policy' | 'opened-by-delivery'): void;
     }).recordChannelAutoOpenNotice.bind(framework);
-    const onNotice: NoticeHandler = (info) => recordNotice(undefined, info.channels, info.source);
+    const onNotice: NoticeHandler = (info) => recordNotice(undefined, info.serverId, info.channels, info.source);
     const f = fixture(onNotice, framework.getStore());
     f.registry.setSubscriptionPolicy('test', 'auto');
     f.held.add('x');
@@ -779,14 +788,25 @@ test('failed policy opening records intent once, with truthful resident text thr
       .map((b) => (b as { text: string }).text);
     assert.equal(noticeTexts().length, 1);
     assert.match(noticeTexts()[0], /Selected for opening by subscription policy/);
-    assert.match(noticeTexts()[0], /admission decision; channel_list shows current transport state/);
+    assert.match(noticeTexts()[0], /The host opens it, and if that fails, tries again when its server next registers it; channel_list shows whether it's open yet\./);
     assert.doesNotMatch(noticeTexts()[0], /Now open/);
+
+    // The server registers the channel again while the host runs: the host
+    // asks it to open the channel again, with no new admission or notice.
+    f.held.delete('x');
+    await f.registry.handleRegister('test', { channels: [descriptor()] });
+    assert.deepEqual(f.calls.filter((c) => c.kind === 'open').map((c) => c.id), ['x', 'x']);
+    assert.equal(f.actual.get('x'), true);
+    assert.equal(f.isOpen(), true);
+    assert.equal(f.notices.length, 1);
 
     // Reconstruct the registry from the same Chronicle state before retrying.
     // The admission persists even though its first transport attempt failed.
     const retry = fixture(onNotice, framework.getStore());
     retry.registry.setSubscriptionPolicy('test', 'auto');
     await retry.registry.handleChanged('test', { added: [descriptor()] });
+    assert.deepEqual(retry.calls.filter((c) => c.kind === 'open').map((c) => c.id), ['x']);
+    assert.equal(retry.actual.get('x'), true);
     assert.equal(retry.isOpen(), true);
     assert.equal(retry.notices.length, 0);
     assert.equal(noticeTexts().length, 1);
@@ -918,15 +938,19 @@ test('descriptor churn exhausts convergence and fails the tool plus joined deliv
     assert.equal(replySettled, true, 'reply preparation must receive a terminal result');
     assert.equal(f.calls.length, 5, 'at most five transport attempts per operation');
     assert.equal((await opening).success, false);
-    assert.match((await opening).error!, /did not converge/);
+    assert.equal((await opening).error, 'Channel "x" wasn\'t opened: the channel\'s address at the "test" server, or the ' +
+      'decision about it, kept changing, and 5 tries didn\'t settle it. The open stays recorded, and calling channel_open ' +
+      'again tries once more.');
     assert.equal(await speech, null);
     assert.equal((await reply).status, 'open-failed');
     assert.equal(f.isOpen(), false, 'an unconfirmed current target is not reported open');
     assert.deepEqual(f.publishedWhileOpen, []);
     assert.equal(f.routeFailures.length, 1);
-    assert.match(f.routeFailures[0].reason, /did not converge/);
-    assert.ok(f.traces.some((e) => e.type === 'mcpl:channel-reconcile-failed' &&
-      String(e.error).includes('did not converge')));
+    // The agent's reason and the trace carry the one clause, and the
+    // agent's says what helps.
+    const unsettled = 'the channel\'s address at the "test" server, or the decision about it, kept changing, and 5 tries didn\'t settle it';
+    assert.equal(f.routeFailures[0].reason, `${unsettled}, so try again`);
+    assert.ok(f.traces.some((e) => e.type === 'mcpl:channel-reconcile-failed' && e.error === unsettled));
   } finally {
     // Original code needs one stable receipt to release its unbounded loop.
     await f.drain(opening, speech, reply);
@@ -958,7 +982,7 @@ test('background reconciliation reports supersession exhaustion and still permit
     assert.equal(f.calls.filter((call) => call.id === 'x').length, 5);
     const failures = f.traces.filter((e) => e.type === 'mcpl:channel-reconcile-failed');
     assert.equal(failures.length, 1);
-    assert.match(String(failures[0].error), /did not converge/);
+    assert.match(String(failures[0].error), /kept changing, and 5 tries didn't settle it$/);
     assert.equal(f.registry.getDesiredState('test', 'x'), 'open', 'failure does not erase desired intent');
   } finally { await f.drain(reconcile); }
 });
@@ -1065,7 +1089,10 @@ test('speech into a channel decided closed keeps publishing where no open can su
   f.setGrant(ALL_CAPABILITY_PATHS.filter((path) => path !== 'channels.lifecycle'));
   const closing = await f.tool('close');
   assert.equal(closing.success, false);
-  assert.match(String(closing.error), /channels\.lifecycle/);
+  assert.equal(closing.error, 'This host isn\'t permitted to open or close the "test" server\'s channels, so this close of ' +
+    'channel "x" didn\'t go through, and calling channel_close again won\'t change that. The close stays recorded, and ' +
+    'happens when the "test" server next registers this channel, if this host may open and close its channels then. If you ' +
+    'need it, ask whoever runs this host.');
   assert.equal(f.registry.getDesiredState('test', 'x'), 'closed', 'the refused close is still recorded as a decision');
   f.calls.length = 0;
   assert.equal((await f.registry.routeSpeech('resident', 'hello', 'x'))?.delivered, true);
@@ -1074,7 +1101,7 @@ test('speech into a channel decided closed keeps publishing where no open can su
   assert.equal(f.notices.length, 0);
 });
 
-test('a failed explicit open says the channel stays selected for opening, and a later delivery opens it quietly', async () => {
+test('a failed explicit open says the open stays recorded, and a later delivery opens it quietly', async () => {
   const f = fixture();
   await f.registry.handleChanged('test', { added: [descriptor()] });
   f.calls.length = 0;
@@ -1084,12 +1111,14 @@ test('a failed explicit open says the channel stays selected for opening, and a 
   f.pending.shift()!.fail();
   const result = await opening;
   assert.equal(result.success, false);
-  assert.match(String(result.error), /stays selected for opening/);
+  assert.equal(result.error, 'Opening channel "x" didn\'t complete; the open stays recorded, and this host tries it again ' +
+    'when the "test" server next registers this channel, if this host may open and close its channels then, or now if you ' +
+    'call channel_open again. fixture lifecycle failure.');
   assert.equal(f.registry.getDesiredState('test', 'x'), 'open', 'the decision outlives a failed round-trip');
   f.held.delete('x');
   await tick();
   assert.equal((await f.registry.routeSpeech('resident', 'hello', 'x'))?.delivered, true);
-  assert.equal(f.notices.length, 0, 'the resident was already told the channel stays selected for opening');
+  assert.equal(f.notices.length, 0, 'the resident was already told the open stays recorded');
   assert.deepEqual(f.calls.map((c) => c.kind), ['open', 'open']);
 });
 
@@ -1167,7 +1196,7 @@ test('a corrective close that cannot converge reports its exhaustion once', asyn
     assert.equal(f.calls.filter((c) => c.id === 'y' && c.kind === 'close').length, 5);
     const failures = f.traces.filter((e) => e.type === 'mcpl:channel-reconcile-failed' && e.channelId === 'y');
     assert.equal(failures.length, 1);
-    assert.match(String(failures[0].error), /did not converge/);
+    assert.match(String(failures[0].error), /kept changing, and 5 tries didn't settle it$/);
   } finally {
     f.held.delete('y');
     while (f.pending.length > 0) f.pending.shift()!.finish();
@@ -1282,7 +1311,8 @@ test("a re-registration's entry is unconfirmed until a receipt, so channel_close
   assert.equal(f.calls.length, 0);
   const result = await f.tool('close');
   assert.equal(result.success, false);
-  assert.match(String(result.error), /channels\.lifecycle not in/, 'refused for the grant, not answered already closed');
+  assert.match(String(result.error), /^This host isn't permitted to open or close the "test" server's channels, so this close of channel "x" didn't go through/,
+    'refused for the grant, not answered already closed');
 });
 
 test('traffic after a retarget confirms nothing: only a receipt for the new target does', async () => {
@@ -1389,10 +1419,84 @@ test("removing a server cancels its queued lifecycle work, even across a re-regi
   const reregistration = f.registry.handleChanged('test', { added: [descriptor('x', true)] });
   await f.drain(closing, reopening, reregistration);
   assert.equal((await reopening).success, false, 'the open queued before the removal never runs');
-  assert.match(String((await reopening).error), /removed while this operation was queued/);
+  // Its text is written when it fails, before the re-registration's own
+  // open, which applies the recorded open.
+  assert.equal((await reopening).error,
+    'Channel "x" wasn\'t opened: this host disconnected the "test" server while the change was being made. ' +
+    'The open stays recorded, and happens when the "test" server next registers this channel, if this host may open and ' +
+    'close its channels then.');
   assert.deepEqual(f.calls.map((c) => c.kind), ['close', 'open'], "the close in flight, then the re-registration's own open");
   assert.equal(f.isOpen(), true);
   assert.equal(f.traces.filter((e) => e.type === 'mcpl:channel-reconcile-failed').length, 0);
+});
+
+// Work queued before a server's removal cancels when it would run, so it
+// carries out no decision for the channel's later entry. A retarget then
+// opens the new target itself, as it does with nothing queued.
+for (const decision of ['open', 'tuned-out'] as const) {
+  test(`a retarget after its server's removal opens the new target, though work queued before the removal is still outstanding, for a channel decided ${decision}`, async () => {
+    const f = fixture();
+    f.held.add('x');
+    const opening = f.registry.handleChanged('test', { added: [descriptor('x', true, 'A')] });
+    await tick();
+    if (decision === 'tuned-out') {
+      f.registry.enterTuneOut('test', 'x', {
+        epochId: 'e1', cadenceSeconds: 60, backlogCap: 20, maxWakes: 3, startedAtSequence: 1,
+      }, 'agent-tool');
+    }
+    f.registry.removeServer('test');
+    // A push names the channel before its server registers it again.
+    f.registry.ensureChannelRegistered('test', 'x', 'x');
+    const retarget = f.registry.handleChanged('test', { updated: [descriptor('x', true, 'B')] });
+    f.held.delete('x');
+    await f.drain(opening, retarget);
+    assert.equal(f.registry.getDesiredState('test', 'x'), decision);
+    assert.deepEqual(f.calls.map((c) => [c.kind, c.address]), [['open', { value: 'A' }], ['open', { value: 'B' }]]);
+    assert.equal(f.isOpen(), true);
+    assert.deepEqual(f.traces.filter((t) => t.type === 'mcpl:channel-reconcile-failed'), []);
+  });
+}
+
+test("a retarget once the lifecycle grant is back opens the new target, though work queued before the server's removal is still outstanding", async () => {
+  const f = fixture();
+  f.held.add('x');
+  const opening = f.registry.handleChanged('test', { added: [descriptor('x', true, 'A')] });
+  await tick();
+  f.registry.removeServer('test');
+  // Registered again where the host doesn't direct the lifecycle, which
+  // reconciles nothing, then retargeted once it does.
+  f.setGrant(ALL_CAPABILITY_PATHS.filter((p) => p !== 'channels.lifecycle'));
+  await f.registry.handleChanged('test', { added: [descriptor('x', true, 'A')] });
+  f.setGrant(ALL_CAPABILITY_PATHS);
+  const retarget = f.registry.handleChanged('test', { updated: [descriptor('x', true, 'B')] });
+  f.held.delete('x');
+  await f.drain(opening, retarget);
+  assert.equal(f.registry.getDesiredState('test', 'x'), 'open');
+  assert.deepEqual(f.calls.map((c) => [c.kind, c.address]), [['open', { value: 'A' }], ['open', { value: 'B' }]]);
+  assert.equal(f.isOpen(), true);
+  assert.deepEqual(f.traces.filter((t) => t.type === 'mcpl:channel-reconcile-failed'), []);
+});
+
+test("a retarget while work queued since its server's removal is outstanding queues nothing more: that work opens the new target", async () => {
+  const f = fixture();
+  f.held.add('x');
+  const opening = f.registry.handleChanged('test', { added: [descriptor('x', true, 'A')] });
+  await tick();
+  f.registry.removeServer('test');
+  f.registry.ensureChannelRegistered('test', 'x', 'x');
+  // Queues an open under the new removal count, behind the held open to A.
+  const toB = f.registry.handleChanged('test', { updated: [descriptor('x', true, 'B')] });
+  f.pending.shift()!.finish();
+  for (let i = 0; i < 100 && f.calls.length < 2; i++) await tick();
+  assert.deepEqual(f.calls.map((c) => [c.kind, c.address]), [['open', { value: 'A' }], ['open', { value: 'B' }]]);
+  // The open to B is outstanding and counted since the removal, so it
+  // carries out the retarget to C: no second open is queued for C.
+  const toC = f.registry.handleChanged('test', { updated: [descriptor('x', true, 'C')] });
+  f.held.delete('x');
+  await f.drain(opening, toB, toC);
+  assert.deepEqual(f.calls.map((c) => [c.kind, c.address]), [['open', { value: 'A' }], ['open', { value: 'B' }], ['open', { value: 'C' }]]);
+  assert.equal(f.isOpen(), true);
+  assert.deepEqual(f.traces.filter((t) => t.type === 'mcpl:channel-reconcile-failed'), []);
 });
 
 test('a substitute removed while its corrective close is queued is cancelled, not traced as failed', async () => {
@@ -1443,10 +1547,13 @@ test('declining an invitation closes an unconfirmed transport for real, and wait
 test("a settled operation releases its channel's queue key", async () => {
   const f = fixture();
   await f.registry.handleChanged('test', { added: [descriptor('x', true)] });
-  const internals = f.registry as unknown as { channelLifecycleTails: Map<string, unknown>; lifecycleOutstanding: Map<string, number> };
+  const internals = f.registry as unknown as {
+    channelLifecycleTails: Map<string, unknown>; lifecycleOutstanding: Map<string, number>; lifecycleQueuedRemovals: Map<string, number>;
+  };
   for (let i = 0; i < 3; i++) await tick();
   assert.equal(internals.channelLifecycleTails.size, 0);
   assert.equal(internals.lifecycleOutstanding.size, 0);
+  assert.equal(internals.lifecycleQueuedRemovals.size, 0, 'the removal count kept for the queue goes with it');
 });
 
 test('the notices say what happened, name the opt-out, and state no rule about later sends', async () => {
@@ -1460,25 +1567,29 @@ test('the notices say what happened, name the opt-out, and state no rule about l
     const recordNotice = (framework as unknown as {
       recordChannelAutoOpenNotice(
         agent: undefined,
+        serverId: string,
         channels: Array<{ channelId: string; label?: string }>,
         cause: 'subscription-policy' | 'opened-by-delivery' | 'opened-by-reply',
       ): void;
     }).recordChannelAutoOpenNotice.bind(framework);
-    recordNotice(undefined, [{ channelId: 'discord:g1:c1', label: '#general' }], 'opened-by-reply');
-    recordNotice(undefined, [{ channelId: 'c2' }], 'opened-by-delivery');
-    recordNotice(undefined, [{ channelId: 'c3' }, { channelId: 'c4', label: 'ops' }], 'subscription-policy');
+    recordNotice(undefined, 'srv', [{ channelId: 'discord:g1:c1', label: '#general' }], 'opened-by-reply');
+    recordNotice(undefined, 'srv', [{ channelId: 'c2' }], 'opened-by-delivery');
+    recordNotice(undefined, 'srv', [{ channelId: 'c3' }, { channelId: 'c4', label: 'ops' }], 'subscription-policy');
     const texts = framework.getAgent('resident')!.getContextManager().getAllMessages()
       .flatMap((m) => m.content)
       .filter((b) => b.type === 'text' && b.text.startsWith('[channels]'))
       .map((b) => (b as { text: string }).text);
     assert.deepEqual(texts, [
       "[channels] Now open: #general (discord:g1:c1): your own message into the closed channel opened it. " +
-        "What an open channel delivers to you depends on its server. If you don't want it, use channel_close; your choice outranks policy.",
+        "What an open channel brings you is up to its server: some send every message in it, and others only what addresses you unless you're subscribed to it; their own tools can change that. If you don't want it, " +
+          "use channel_close: neither the subscription policy nor its server's own default opens it again.",
       "[channels] Now open: c2: your own message into the closed channel opened it. " +
-        "What an open channel delivers to you depends on its server. If you don't want it, use channel_close; your choice outranks policy.",
+        "What an open channel brings you is up to its server: some send every message in it, and others only what addresses you unless you're subscribed to it; their own tools can change that. If you don't want it, " +
+          "use channel_close: neither the subscription policy nor its server's own default opens it again.",
       '[channels] Selected for opening by subscription policy: c3, ops (c4). ' +
-        'This records the admission decision; channel_list shows current transport state. ' +
-        "What an open channel delivers to you depends on its server. If you don't want one of them, use channel_close; your choice outranks policy.",
+        "The host opens them, and if one doesn't open, tries again when its server next registers it; channel_list shows whether each is open yet. " +
+        "What an open channel brings you is up to its server: some send every message in it, and others only what addresses you unless you're subscribed to it; their own tools can change that. If you don't want one of them, " +
+        "use channel_close: neither the subscription policy nor its server's own default opens it again.",
     ]);
   } finally {
     await framework.stop();
@@ -1499,7 +1610,11 @@ test("a server the host doesn't direct opens its own channels: its traffic marks
   await f.registry.handleChanged('test', { added: [descriptor('y')] });
   const declined = await f.registry.handleChannelToolCall('channel_decline', { serverId: 'test', channelId: 'y', messageId: 'm3' });
   assert.equal(declined.success, true);
-  assert.equal(dataOf(declined).closeError, undefined);
+  assert.equal(dataOf(declined).closeError,
+    'The decline is recorded, but this host isn\'t permitted to open or close the "test" server\'s channels, so the server ' +
+    'keeps this one open or closed as it chooses, and declining again won\'t change that. This host closes it when the "test" ' +
+    'server next registers this channel, if this host may open and close its channels then. If you need it closed sooner, ' +
+    'ask whoever runs this host.');
   assert.equal(f.calls.length, 0, 'the host sends no lifecycle RPC to a server it does not direct');
 });
 
@@ -1574,4 +1689,1527 @@ test('a channel its server registers while a disconnect closes it is removed wit
     await framework.stop();
     rmSync(dir, { recursive: true, force: true });
   }
+});
+
+// An open by speech or a reply is incidental to its words. When its
+// round-trip fails, the decision it wrote goes back to the one it replaced,
+// while the record is still its own. The agent's own channel_open keeps its
+// decision through a failed round-trip (#210).
+
+/** The decision on record for a channel, with its source. */
+function decision(registry: ChannelRegistry, id = 'x') {
+  const internals = registry as unknown as {
+    desiredStates: Map<string, { state: string; source: string }>;
+    lifecycleKey(serverId: string, channelId: string): string;
+  };
+  const record = internals.desiredStates.get(internals.lifecycleKey('test', id));
+  return record && { state: record.state, source: record.source };
+}
+
+/** The lifecycle records the registry appends from now on, with their state and source. */
+function recordLog(registry: ChannelRegistry) {
+  const log: Array<{ desired?: string; source?: string }> = [];
+  const r = registry as unknown as { appendLifecycleEvent(e: { desired?: string; source?: string }): void };
+  const original = r.appendLifecycleEvent.bind(registry);
+  r.appendLifecycleEvent = (e) => { original(e); log.push({ desired: e.desired, source: e.source }); };
+  return log;
+}
+
+/** Makes the registry's next lifecycle append, or the one `skip` appends later, fail as a full store would. */
+function failAppend(registry: ChannelRegistry, skip = 0) {
+  const r = registry as unknown as { appendLifecycleEvent(e: unknown): void };
+  const original = r.appendLifecycleEvent.bind(registry);
+  let left = skip;
+  r.appendLifecycleEvent = (e) => {
+    if (left-- === 0) {
+      r.appendLifecycleEvent = original;
+      throw new Error('ENOSPC: no space left on device');
+    }
+    original(e);
+  };
+}
+
+/** Starts speech into `x` while the server holds its open, and fails that open. */
+async function speechWhoseOpenFails(f: ReturnType<typeof fixture>, others: () => Promise<unknown>[] = () => [], failure?: Error) {
+  f.held.add('x');
+  const speech = f.registry.publish('agent', 'words', { serverId: 'test', channelId: 'x' });
+  await tick();
+  const meanwhile = others();
+  await tick();
+  f.pending.shift()!.fail(failure);
+  f.held.delete('x');
+  await f.drain(speech, ...meanwhile);
+  return { outcome: await speech, meanwhile };
+}
+
+async function replyWhoseOpenFails(f: ReturnType<typeof fixture>, others: () => Promise<unknown>[] = () => []) {
+  f.held.add('x');
+  const reply = f.registry.openIfClosedForSend('x', 'test');
+  await tick();
+  const meanwhile = others();
+  await tick();
+  f.pending.shift()!.fail();
+  f.held.delete('x');
+  await f.drain(reply, ...meanwhile);
+  return { answer: await reply, meanwhile };
+}
+
+test("speech whose open fails puts back the decision it replaced, and the next speech's open is a fresh one with its notice", async () => {
+  const f = fixture();
+  await f.registry.handleChanged('test', { added: [descriptor('x', false)] });
+  assert.deepEqual(decision(f.registry), { state: 'closed', source: 'default-closed' });
+
+  const { outcome } = await speechWhoseOpenFails(f);
+  assert.equal(outcome.status, 'failed');
+  assert.match(outcome.reason ?? '', /^opening the channel for these words didn't complete/);
+  assert.deepEqual(decision(f.registry), { state: 'closed', source: 'default-closed' }, 'what the agent was told stays true');
+  assert.equal(f.notices.length, 0);
+
+  const again = await f.registry.publish('agent', 'more words', { serverId: 'test', channelId: 'x' });
+  assert.equal(again.status, 'delivered');
+  assert.equal(f.isOpen(), true);
+  assert.deepEqual(f.notices.map((n) => n.source), ['opened-by-delivery'], 'the open that succeeds tells the agent the channel is open');
+});
+
+test('after speech whose open failed, the server announcing the channel again opens nothing', async () => {
+  const f = fixture();
+  await f.registry.handleChanged('test', { added: [descriptor('x', false)] });
+  await speechWhoseOpenFails(f);
+  const opens = f.calls.filter((c) => c.kind === 'open').length;
+
+  const before = f.calls.length;
+  await f.drain(f.registry.handleChanged('test', { removed: ['x'], added: [descriptor('x', false)] }));
+  assert.deepEqual(f.calls.slice(before).map((c) => c.kind), ['close'], "the registration's reconcile ran, and carried out the closed decision");
+  assert.equal(f.calls.filter((c) => c.kind === 'open').length, opens, 'no open is sent');
+  assert.equal(f.isOpen(), false);
+  assert.deepEqual(f.notices, []);
+});
+
+test("the agent's close made while speech's open is out stands when that open fails", async () => {
+  const f = fixture();
+  await f.registry.handleChanged('test', { added: [descriptor('x', false)] });
+  const { outcome } = await speechWhoseOpenFails(f, () => [f.tool('close')]);
+  assert.equal(outcome.status, 'failed');
+  assert.equal(outcome.reason, "opening the channel for these words didn't complete: fixture lifecycle failure; a decision about the " +
+    'channel made while the open was out stands', "the open's own failure, carried as overtaken, and the decision that stands");
+  assert.deepEqual(decision(f.registry), { state: 'closed', source: 'agent-tool' });
+});
+
+test("speech whose open was answered after the agent closed the channel meanwhile names that close once", async () => {
+  // The open's own failure is the later close, so its clause names it, and
+  // the overtaken failure adds nothing to it.
+  const f = fixture();
+  await f.registry.handleChanged('test', { added: [descriptor('x', false)] });
+  f.held.add('x');
+  const speech = f.registry.publish('agent', 'words', { serverId: 'test', channelId: 'x' });
+  await tick();
+  assert.equal(f.pending.length, 1, "speech's open is out");
+  const closing = f.tool('close');
+  await tick();
+  f.held.delete('x');
+  f.pending.shift()!.finish();
+  await f.drain(speech, closing);
+  const outcome = await speech;
+  assert.equal(outcome.status, 'failed');
+  assert.equal(outcome.reason, "opening the channel for these words didn't complete: a later decision to close it came first");
+  assert.deepEqual(decision(f.registry), { state: 'closed', source: 'agent-tool' });
+});
+
+test("the agent's channel_open made while speech's open is out stands when that open fails", async () => {
+  // channel_open records the state speech's open already recorded. It still
+  // gets its own record, so the failed open sees a decision made meanwhile
+  // and puts nothing back.
+  const f = fixture();
+  await f.registry.handleChanged('test', { added: [descriptor('x', false)] });
+  const { meanwhile } = await speechWhoseOpenFails(f, () => [f.tool('open')]);
+  const opened = (await meanwhile[0]) as { success: boolean };
+  assert.equal(opened.success, true, "the agent's open goes through");
+  assert.deepEqual(decision(f.registry), { state: 'open', source: 'agent-tool' });
+  assert.equal(f.isOpen(), true);
+});
+
+test("a reply whose open fails puts back the agent's close", async () => {
+  const f = fixture();
+  await f.registry.handleChanged('test', { added: [descriptor('x', true)] });
+  await f.drain(f.tool('close'));
+  assert.deepEqual(decision(f.registry), { state: 'closed', source: 'agent-tool' });
+
+  f.held.add('x');
+  const reply = f.registry.openIfClosedForSend('x', 'test');
+  await tick();
+  f.pending.shift()!.fail();
+  f.held.delete('x');
+  assert.deepEqual(await reply, { status: 'open-failed', channelId: 'x', label: 'x', opening: true }, 'an open that would have opened the channel');
+  assert.deepEqual(decision(f.registry), { state: 'closed', source: 'agent-tool' }, "the agent's close is on record again");
+});
+
+test("a reply's open that the agent's own close replaced during its round-trip isn't an opening that failed", async () => {
+  // The agent replies and leaves in one turn: the open-on-send is
+  // fire-and-forget, so its channel_close can land while the reply's open is
+  // out. The open's operation then carries out the close (Cordelia-2434's
+  // PROBE 8).
+  const f = fixture();
+  await f.registry.handleChanged('test', { added: [descriptor('x', false)] });
+  f.held.add('x');
+  const reply = f.registry.openIfClosedForSend('x', 'test');
+  await tick();
+  assert.equal(f.pending.length, 1, "the reply's open is out when the agent's close lands");
+  const closed = f.tool('close');
+  await tick();
+  f.held.delete('x');
+  await f.drain(reply, closed);
+  assert.equal(((await closed) as { success: boolean }).success, true);
+  assert.deepEqual(await reply, { status: 'open-failed', channelId: 'x', label: 'x', opening: false }, 'nothing to tell an agent that just closed it');
+  assert.deepEqual(decision(f.registry), { state: 'closed', source: 'agent-tool' }, "the agent's close stands");
+  assert.equal(f.isOpen(), false);
+});
+
+test("a reply's failed open after the agent's channel_open during its round-trip isn't an opening that failed", async () => {
+  const f = fixture();
+  await f.registry.handleChanged('test', { added: [descriptor('x', false)] });
+  const { answer, meanwhile } = await replyWhoseOpenFails(f, () => [f.tool('open')]);
+  assert.deepEqual(answer, { status: 'open-failed', channelId: 'x', label: 'x', opening: false }, "the agent's own open answers for itself");
+  assert.deepEqual(f.traces.filter((t) => t.type === 'mcpl:channel-open-failed').map((t) => t.error),
+    ['fixture lifecycle failure; a decision about the channel made while the open was out stands'],
+    "the open's own failure, carried as overtaken, and the decision that stands");
+  assert.equal(((await meanwhile[0]) as { success: boolean }).success, true, "the agent's open goes through");
+  assert.deepEqual(decision(f.registry), { state: 'open', source: 'agent-tool' });
+  assert.equal(f.isOpen(), true);
+});
+
+test("a reply's failed open whose put-back can't be recorded is still an opening that failed, and says the channel stays selected", async () => {
+  const f = fixture();
+  await f.registry.handleChanged('test', { added: [descriptor('x', false)] });
+  failAppend(f.registry, 1); // the open's own record goes through; the put-back's doesn't
+  const closes = f.calls.filter((c) => c.kind === 'close').length;
+  const { answer } = await replyWhoseOpenFails(f);
+  assert.deepEqual(answer, { status: 'open-failed', channelId: 'x', label: 'x', opening: true, selectedForOpening: 'unrecorded' });
+  assert.deepEqual(decision(f.registry), { state: 'open', source: 'opened-by-reply' }, 'the channel stays selected for opening');
+  await tick(); await tick();
+  assert.equal(f.calls.filter((c) => c.kind === 'close').length, closes, 'no close is sent: the decision stays open');
+});
+
+test("a channel registered from a push, with no decision on record, is put back as closed by default when speech's open fails", async () => {
+  const f = fixture();
+  f.registry.ensureChannelRegistered('test', 'x', 'x');
+  assert.equal(decision(f.registry), undefined, 'nobody has decided');
+  const { outcome } = await speechWhoseOpenFails(f);
+  assert.equal(outcome.status, 'failed');
+  assert.deepEqual(decision(f.registry), { state: 'closed', source: 'default-closed' });
+});
+
+test("the put-back is durable: a registry rebuilt from the store doesn't hold the failed open's decision", async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'failed-speech-open-'));
+  const store = JsStore.openOrCreate({ path: join(dir, 'store') });
+  try {
+    const f = fixture(undefined, store);
+    await f.registry.handleChanged('test', { added: [descriptor('x', false)] });
+    await speechWhoseOpenFails(f);
+
+    const rebuilt = fixture(undefined, store);
+    assert.deepEqual(decision(rebuilt.registry), { state: 'closed', source: 'default-closed' });
+  } finally {
+    store.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('when speech\'s open fails while the server announces the channel again, the queued reconcile carries out the put-back: one close, no notice', async () => {
+  const f = fixture();
+  await f.registry.handleChanged('test', { added: [descriptor('x', false)] });
+  f.held.add('x');
+  const speech = f.registry.publish('agent', 'words', { serverId: 'test', channelId: 'x' });
+  await tick();
+  assert.equal(f.pending.length, 1, "speech's open is out");
+  const reannounce = f.registry.handleChanged('test', { added: [descriptor('x', false)] });
+  await tick();
+  const before = f.calls.length;
+  f.pending.shift()!.fail();
+  f.held.delete('x');
+  await f.drain(speech, reannounce);
+  assert.equal((await speech).status, 'failed');
+  assert.deepEqual(f.calls.slice(before).map((c) => c.kind), ['close'], 'the queued reconcile closes x, and nothing else does');
+  assert.equal(f.isOpen(), false);
+  assert.deepEqual(f.notices, []);
+});
+
+test("when an open by speech or a reply fails while the server announces the channel again as initially open, the default put back follows that announcement: the channel is selected for opening again, the queued work opens it, and the failure says why", async () => {
+  for (const via of ['speech', 'reply'] as const) {
+    const f = fixture();
+    await f.registry.handleChanged('test', { added: [descriptor('x', false)] });
+    const reannounce = () => [f.registry.handleChanged('test', { added: [descriptor('x', true)] })];
+    if (via === 'speech') {
+      const { outcome } = await speechWhoseOpenFails(f, reannounce);
+      assert.equal(outcome.status, 'failed');
+      assert.equal(outcome.reason,
+        "opening the channel for these words didn't complete: fixture lifecycle failure; the channel is selected for opening again, because its server lists it as open by default");
+      // A server's own words keep their stop, so what follows is a sentence.
+      const g = fixture();
+      await g.registry.handleChanged('test', { added: [descriptor('x', false)] });
+      const answered = await speechWhoseOpenFails(g, () => [g.registry.handleChanged('test', { added: [descriptor('x', true)] })],
+        new McplRequestError('Opening x is not allowed here.', 'error-response'));
+      assert.equal(answered.outcome.reason, "opening the channel for these words didn't complete: Opening x is not allowed here. " +
+        'The channel is selected for opening again, because its server lists it as open by default');
+    } else {
+      const { answer } = await replyWhoseOpenFails(f, reannounce);
+      assert.deepEqual(answer, { status: 'open-failed', channelId: 'x', label: 'x', opening: true, selectedForOpening: 'server-bootstrap' });
+    }
+    await tick(); await tick();
+    assert.deepEqual(decision(f.registry), { state: 'open', source: 'server-bootstrap' },
+      `${via}: the announcement the open's own record hid applies to the default put back`);
+    assert.deepEqual(f.calls.map((c) => c.kind), ['close', 'open', 'open'],
+      `${via}: the registration's close, the open that failed, then the queued work's open; nothing closes x`);
+    assert.equal(f.isOpen(), true, via);
+    assert.deepEqual(f.notices, [], `${via}: the failure itself says why, so no other notice`);
+  }
+});
+
+test("when a reply's open fails after the subscription policy came to admit the channel, the default put back follows the policy, and the failure says so", async () => {
+  const f = fixture();
+  await f.registry.handleChanged('test', { added: [descriptor('x', false)] });
+  const { answer } = await replyWhoseOpenFails(f, () => { f.registry.setSubscriptionPolicy('test', 'auto'); return []; });
+  assert.deepEqual(answer, { status: 'open-failed', channelId: 'x', label: 'x', opening: true, selectedForOpening: 'subscription-policy' });
+  assert.deepEqual(f.traces.filter((t) => t.type === 'mcpl:channel-open-failed').map((t) => t.error),
+    ['fixture lifecycle failure; the channel is selected for opening again, because the subscription policy admits it']);
+  await tick(); await tick();
+  assert.deepEqual(decision(f.registry), { state: 'open', source: 'subscription-policy' });
+  assert.equal(f.isOpen(), true);
+  assert.deepEqual(f.notices, [], 'the failure says it, so no separate admission notice');
+});
+
+test("when a reply's open fails while its server is removed and added again as initially open, the default put back follows the new registration", async () => {
+  const f = fixture();
+  await f.registry.handleChanged('test', { added: [descriptor('x', false)] });
+  const { answer, meanwhile } = await replyWhoseOpenFails(f, () => {
+    f.registry.removeServer('test');
+    return [f.registry.handleChanged('test', { added: [descriptor('x', true)] })];
+  });
+  void meanwhile;
+  assert.equal(answer.status, 'open-failed');
+  assert.equal(answer.selectedForOpening, 'server-bootstrap');
+  await tick(); await tick();
+  assert.deepEqual(decision(f.registry), { state: 'open', source: 'server-bootstrap' });
+  assert.deepEqual(f.calls.slice(f.calls.findIndex((c) => c.kind === 'open') + 1).map((c) => c.kind), ['open'],
+    "the new registration's queued work carries the decision out, so the put-back queues nothing of its own");
+  assert.equal(f.isOpen(), true);
+});
+
+test("when an open's server is removed and its channel comes back from a push while the open is out, the decision the put-back leaves is still carried out: work queued before the removal cancels instead", async () => {
+  for (const policy of [true, false]) {
+    const f = fixture();
+    await f.registry.handleChanged('test', { added: [descriptor('x', false)] });
+    const { answer } = await replyWhoseOpenFails(f, () => {
+      // A reconcile queued behind the open, then the removal that will cancel it.
+      const reannounce = f.registry.handleChanged('test', { added: [descriptor('x', false)] });
+      f.registry.removeServer('test');
+      f.registry.ensureChannelRegistered('test', 'x');
+      if (policy) f.registry.setSubscriptionPolicy('test', 'auto');
+      return [reannounce];
+    });
+    await tick(); await tick();
+    const after = f.calls.slice(f.calls.findIndex((c) => c.kind === 'open') + 1).map((c) => c.kind);
+    if (policy) {
+      assert.equal(answer.selectedForOpening, 'subscription-policy');
+      assert.deepEqual(decision(f.registry), { state: 'open', source: 'subscription-policy' });
+      assert.deepEqual(after, ['open'], 'the lifted decision is carried out after the cancelled work');
+      assert.equal(f.isOpen(), true);
+    } else {
+      assert.equal(answer.selectedForOpening, undefined);
+      assert.deepEqual(decision(f.registry), { state: 'closed', source: 'default-closed' });
+      assert.deepEqual(after, ['close'], "the put-back's close goes out, since the failed request may have reached the server");
+    }
+  }
+});
+
+test("a lifted put-back's queued open that fails is traced as an open that failed, and the decision stands", async () => {
+  const f = fixture();
+  await f.registry.handleChanged('test', { added: [descriptor('x', false)] });
+  f.held.add('x');
+  const reply = f.registry.openIfClosedForSend('x', 'test');
+  await tick();
+  f.registry.setSubscriptionPolicy('test', 'auto');
+  f.pending.shift()!.fail();
+  for (let i = 0; i < 20 && f.pending.length === 0; i++) await tick();
+  assert.equal(f.pending.length, 1, "the queued work's open is out");
+  f.pending.shift()!.fail();
+  f.held.delete('x');
+  await f.drain(reply);
+  for (let i = 0; i < 10; i++) await tick();
+  assert.equal((await reply).selectedForOpening, 'subscription-policy');
+  assert.deepEqual(f.traces.filter((t) => t.type === 'mcpl:channel-reconcile-failed').map((t) => t.desired), ['open']);
+  assert.deepEqual(decision(f.registry), { state: 'open', source: 'subscription-policy' });
+});
+
+test("a failed open's put-back whose lift can't be recorded leaves the default, closed, and reports the open's own failure", async () => {
+  const f = fixture();
+  await f.registry.handleChanged('test', { added: [descriptor('x', false)] });
+  const { outcome } = await speechWhoseOpenFails(f, () => {
+    failAppend(f.registry, 1); // the put-back's record goes through; the lift's doesn't
+    return [f.registry.handleChanged('test', { added: [descriptor('x', true)] })];
+  });
+  assert.equal(outcome.reason, "opening the channel for these words didn't complete: fixture lifecycle failure");
+  await tick(); await tick();
+  assert.deepEqual(decision(f.registry), { state: 'closed', source: 'default-closed' });
+  assert.deepEqual(f.calls.map((c) => c.kind), ['close', 'open', 'close'], 'the queued work carries out the close');
+});
+
+test("a failed open by speech that put back a decision the agent made isn't lifted by the server's announcement: only a pure default follows it", async () => {
+  const f = fixture();
+  await f.registry.handleChanged('test', { added: [descriptor('x', true)] });
+  await tick(); await tick();
+  // The agent's close fails at the server, so x is decided closed with its
+  // transport still open, and speech engages it.
+  f.held.add('x');
+  const close = f.tool('close');
+  await tick();
+  f.pending.shift()!.fail();
+  f.held.delete('x');
+  await f.drain(close);
+  assert.deepEqual(decision(f.registry), { state: 'closed', source: 'agent-tool' });
+  const { outcome } = await speechWhoseOpenFails(f, () => [f.registry.handleChanged('test', { added: [descriptor('x', true)] })]);
+  assert.equal(outcome.status, 'failed');
+  assert.equal(outcome.reason, "opening the channel for these words didn't complete: fixture lifecycle failure", 'nothing selects it for opening again');
+  await tick(); await tick();
+  assert.deepEqual(decision(f.registry), { state: 'closed', source: 'agent-tool' }, "the agent's close stands");
+});
+
+test('speech that waits on a failed open into a channel the agent closed is refused, as the close is on record again', async () => {
+  const f = fixture();
+  await f.registry.handleChanged('test', { added: [descriptor('x', true)] });
+  await tick(); await tick();
+  assert.equal(f.actual.get('x'), true);
+  // The agent's close fails at the server, so x is decided closed with its
+  // transport still open.
+  f.held.add('x');
+  const close = f.tool('close');
+  await tick();
+  f.pending.shift()!.fail();
+  f.held.delete('x');
+  await f.drain(close);
+  assert.equal((await close).success, false);
+  assert.deepEqual(decision(f.registry), { state: 'closed', source: 'agent-tool' });
+
+  f.held.add('x');
+  const first = f.registry.publish('agent', 'first', { serverId: 'test', channelId: 'x' });
+  await tick();
+  assert.equal(f.pending.length, 1, "the first speech's open is out");
+  const second = f.registry.publish('agent', 'second', { serverId: 'test', channelId: 'x' });
+  await tick();
+  f.pending.shift()!.fail();
+  f.held.delete('x');
+  await f.drain(first, second);
+  assert.equal((await first).status, 'failed');
+  assert.equal((await second).status, 'failed', 'the second speech waited on that open and is refused');
+  assert.deepEqual(f.publishedWhileOpen, [], 'nothing is published into the channel the agent closed');
+  assert.deepEqual(decision(f.registry), { state: 'closed', source: 'agent-tool' });
+});
+
+test("an open whose answer is lost after the server opened the channel is closed on the wire too, since its transport wasn't confirmed", async () => {
+  const f = fixture();
+  await f.registry.handleChanged('test', { added: [descriptor('x', false)] });
+  f.held.add('x');
+  const speech = f.registry.publish('agent', 'words', { serverId: 'test', channelId: 'x' });
+  await tick();
+  const open = f.pending.shift()!;
+  f.actual.set('x', true); // the server opened x ...
+  open.fail();             // ... and its answer was lost, as on a timeout
+  f.held.delete('x');
+  const before = f.calls.length;
+  await f.drain(speech);
+  for (let i = 0; i < 5; i++) await tick();
+  assert.equal((await speech).status, 'failed');
+  assert.deepEqual(f.calls.slice(before).map((c) => c.kind), ['close'], 'the put-back is carried out through the queue');
+  assert.equal(f.actual.get('x'), false, "the server's transport is closed");
+  assert.deepEqual(decision(f.registry), { state: 'closed', source: 'default-closed' });
+  assert.deepEqual(f.notices, []);
+});
+
+test("a reply on a server without channels.lifecycle writes no decision, so the agent's close stays the only record", async () => {
+  const f = fixture();
+  await f.registry.handleChanged('test', { added: [descriptor('x', true)] });
+  await tick(); await tick();
+  f.setGrant(ALL_CAPABILITY_PATHS.filter((p) => p !== 'channels.lifecycle'));
+  assert.equal((await f.tool('close')).success, false, 'the close itself is refused for the grant');
+  assert.deepEqual(decision(f.registry), { state: 'closed', source: 'agent-tool' }, "the agent's close is recorded");
+  await f.registry.handleIncoming('test', { messages: [message()] });
+  const log = recordLog(f.registry);
+  for (let i = 0; i < 3; i++) {
+    assert.equal((await f.registry.openIfClosedForSend('x', 'test')).status, 'open-failed');
+  }
+  await tick();
+  assert.deepEqual(log, [], 'no record is written');
+  assert.deepEqual(decision(f.registry), { state: 'closed', source: 'agent-tool' });
+});
+
+test("speech into a channel that isn't open, on a server without channels.lifecycle, writes no decision", async () => {
+  const f = fixture();
+  await f.registry.handleChanged('test', { added: [descriptor('x', false)] });
+  await tick(); await tick();
+  f.setGrant(ALL_CAPABILITY_PATHS.filter((p) => p !== 'channels.lifecycle'));
+  const log = recordLog(f.registry);
+  const outcome = await f.registry.publish('agent', 'words', { serverId: 'test', channelId: 'x' });
+  await tick();
+  assert.equal(outcome.status, 'failed');
+  assert.match(outcome.reason ?? '', /^opening the channel for these words didn't complete: this host isn't permitted to open or close the "test" server's channels/);
+  assert.deepEqual(log, [], 'no record is written');
+  assert.deepEqual(decision(f.registry), { state: 'closed', source: 'default-closed' });
+});
+
+test("the agent's channel_open over a channel its server opened at registration is the agent's decision, which a housekeeping close doesn't override", async () => {
+  const f = fixture();
+  await f.registry.handleChanged('test', { added: [descriptor('x', true)] });
+  await tick(); await tick();
+  assert.equal(f.isOpen(), true);
+  assert.deepEqual(decision(f.registry), { state: 'open', source: 'server-bootstrap' });
+
+  assert.equal(dataOf(await f.tool('open')).status, 'already open');
+  assert.deepEqual(decision(f.registry), { state: 'open', source: 'agent-tool' });
+  const housekeeping = await f.registry.handleChannelToolCall(
+    'channel_close', { serverId: 'test', channelId: 'x', source: 'housekeeping' }, { kind: 'module' },
+  );
+  assert.equal(housekeeping.success, false, "the agent's explicit open stands against housekeeping");
+  assert.equal(f.isOpen(), true);
+});
+
+test("the agent's channel_close of a channel closed by default is recorded, so a later registration's initiallyOpen doesn't open it", async () => {
+  const f = fixture();
+  await f.registry.handleChanged('test', { added: [descriptor('x', false)] });
+  await tick(); await tick();
+  assert.deepEqual(decision(f.registry), { state: 'closed', source: 'default-closed' });
+
+  assert.equal(dataOf(await f.tool('close')).status, 'already closed');
+  assert.deepEqual(decision(f.registry), { state: 'closed', source: 'agent-tool' });
+  await f.drain(f.registry.handleChanged('test', { removed: ['x'], added: [descriptor('x', true)] }));
+  assert.deepEqual(decision(f.registry), { state: 'closed', source: 'agent-tool' }, "the agent's close stands");
+  assert.equal(f.isOpen(), false);
+});
+
+test("the agent's decline of a channel closed by default is recorded, so a later registration's initiallyOpen doesn't open it", async () => {
+  const f = fixture();
+  await f.registry.handleChanged('test', { added: [descriptor('x', false)] });
+  await tick(); await tick();
+  assert.deepEqual(decision(f.registry), { state: 'closed', source: 'default-closed' });
+
+  const declined = await f.registry.handleChannelToolCall('channel_decline', { serverId: 'test', channelId: 'x', messageId: 'm1' });
+  assert.equal(declined.success, true);
+  assert.deepEqual(decision(f.registry), { state: 'closed', source: 'invitation-declined' });
+  await f.drain(f.registry.handleChanged('test', { removed: ['x'], added: [descriptor('x', true)] }));
+  assert.deepEqual(decision(f.registry), { state: 'closed', source: 'invitation-declined' }, "the agent's decline stands");
+  assert.equal(f.isOpen(), false);
+});
+
+test('a housekeeping close of a channel closed by default records nothing, and the channel stays undecided', async () => {
+  const f = fixture();
+  await f.registry.handleChanged('test', { added: [descriptor('x', false)] });
+  await tick(); await tick();
+  const log = recordLog(f.registry);
+  const housekeeping = await f.registry.handleChannelToolCall(
+    'channel_close', { serverId: 'test', channelId: 'x', source: 'housekeeping' }, { kind: 'module' },
+  );
+  assert.equal(dataOf(housekeeping).status, 'already closed');
+  assert.deepEqual(log, []);
+  assert.deepEqual(decision(f.registry), { state: 'closed', source: 'default-closed' });
+});
+
+test("a module close outside the machine-close vocabulary is refused on a channel already closed too, where it got 'already closed'", async () => {
+  // The source is checked before the "already closed" answer, since that
+  // answer now records the decision with it.
+  const f = fixture();
+  await f.registry.handleChanged('test', { added: [descriptor('x', false)] });
+  await tick(); await tick();
+  const log = recordLog(f.registry);
+  const gremlin = await f.registry.handleChannelToolCall(
+    'channel_close', { serverId: 'test', channelId: 'x', source: 'gremlin-module' }, { kind: 'module' },
+  );
+  assert.equal(gremlin.success, false);
+  assert.equal(gremlin.isError, true);
+  assert.match(gremlin.error ?? '', /^Unknown machine close source 'gremlin-module'/);
+  assert.deepEqual(log, []);
+  assert.deepEqual(decision(f.registry), { state: 'closed', source: 'default-closed' });
+});
+
+test("the agent's channel_open twice over a channel speech opened writes one record", async () => {
+  const f = fixture();
+  await f.registry.handleChanged('test', { added: [descriptor('x', false)] });
+  assert.equal((await f.registry.publish('agent', 'words', { serverId: 'test', channelId: 'x' })).status, 'delivered');
+  const log = recordLog(f.registry);
+  assert.equal(dataOf(await f.tool('open')).status, 'already open');
+  assert.equal(dataOf(await f.tool('open')).status, 'already open');
+  assert.deepEqual(log, [{ desired: 'open', source: 'agent-tool' }]);
+});
+
+test("when putting back the decision a failed open replaced can't be recorded, speech's failure says the channel stays selected for opening", async () => {
+  const f = fixture();
+  await f.registry.handleChanged('test', { added: [descriptor('x', false)] });
+  failAppend(f.registry, 1); // the open's own record goes through; the put-back's doesn't
+  const closes = f.calls.filter((c) => c.kind === 'close').length;
+  const { outcome } = await speechWhoseOpenFails(f);
+  assert.equal(outcome.status, 'failed');
+  assert.match(outcome.reason ?? '', /^opening the channel for these words didn't complete: fixture lifecycle failure; the channel stays selected for opening, because this host couldn't record undoing that: ENOSPC/);
+  assert.deepEqual(decision(f.registry), { state: 'open', source: 'opened-by-delivery' });
+  await tick(); await tick();
+  assert.equal(f.calls.filter((c) => c.kind === 'close').length, closes, 'no close is sent: the decision stays open');
+});
+
+test("channel_open and channel_close on a channel already so say what failed when the agent's decision can't be recorded", async () => {
+  const f = fixture();
+  await f.registry.handleChanged('test', { added: [descriptor('x', false)] });
+  assert.equal((await f.registry.publish('agent', 'words', { serverId: 'test', channelId: 'x' })).status, 'delivered');
+  failAppend(f.registry);
+  const opened = await f.tool('open');
+  assert.equal(opened.success, false);
+  assert.equal(opened.isError, true);
+  assert.match(opened.error ?? '', /^Channel x is already open, but recording your decision to open it failed: ENOSPC/);
+
+  const g = fixture();
+  await g.registry.handleChanged('test', { added: [descriptor('x', false)] });
+  await tick(); await tick();
+  failAppend(g.registry);
+  const closed = await g.tool('close');
+  assert.equal(closed.success, false);
+  assert.equal(closed.isError, true);
+  assert.match(closed.error ?? '', /^Channel x is already closed, but recording the decision to close it failed: ENOSPC/);
+});
+
+// The framework's half of a reply's failed open: what it tells the agent
+// once the registry has answered a send's open. The registry's half, the
+// put-back and `opening`, is pinned by the registry tests. The harness is a
+// bare framework, as in checkpoint-attribution.
+async function replyOpenFailedNotices(opts: {
+  opening: boolean; directs: boolean; agentName?: string; live?: string[]; homes?: Array<[string, string]>; denied?: string[];
+  selectedForOpening?: 'unrecorded' | 'server-bootstrap' | 'subscription-policy'; primary?: string; dropsDuring?: true;
+  opened?: true;
+}) {
+  const agentName = opts.agentName ?? 'agent';
+  const told: Array<{ text: string; metadata: unknown; forAgent?: string }> = [];
+  const logged: string[] = [];
+  // The server's id isn't its tool prefix, so the notice's inputs can't take
+  // one for the other.
+  const server = {
+    id: 'chat-server',
+    isConnected: true,
+    async sendToolsList() { return { tools: [{ name: 'send_message', inputSchema: { type: 'object' } }] }; },
+    async sendToolsCall() { return { content: [{ type: 'text', text: 'sent' }] }; },
+  };
+  const framework = Object.create(AgentFramework.prototype) as any;
+  framework.mcplTools = [];
+  framework.mcplToolFeatureSets = new Map();
+  framework.mcplServerConfigs = new Map([['chat-server', { id: 'chat-server', toolPrefix: 'srv' }]]);
+  framework.mcplServerRegistry = { getAllServers: () => [server], getServer: (id: string) => (id === 'chat-server' ? server : null) };
+  framework.checkpointManager = null;
+  framework.turnRouting = new Map();
+  framework.agents = new Map((opts.live ?? [agentName]).map((name) => [name, { canUseTool: (tool: string) => !(opts.denied ?? []).includes(tool) }]));
+  framework.usedEphemeralAgentNames = new Set();
+  framework.registry = { homeChannel: (name: string) => new Map(opts.homes ?? []).get(name), readsSharedSlot: (name: string) => [...(framework.sharedSlotAgents ?? [])].some((a: { name: string }) => a.name === name) };
+  framework.sharedSlotAgents = new Set();
+  framework.primaryAgentName = opts.primary;
+  framework.emitTrace = () => {};
+  framework.addMessage = (_participant: string, content: Array<{ text: string }>, metadata: unknown, routed?: { forAgent?: string }) => {
+    told.push({ text: content[0]!.text, metadata, ...(routed ? { forAgent: routed.forAgent } : {}) });
+    return 'm';
+  };
+  // A transport that drops while the open is out clears the server's grant
+  // before the open's failure arrives (dropsDuring).
+  let opened = false;
+  framework.channelRegistry = {
+    openIfClosedForSend: async () => {
+      opened = true;
+      if (opts.opened) return { status: 'opened', channelId: 'x', label: '#x' };
+      return { status: 'open-failed', channelId: 'x', label: '#x', opening: opts.opening,
+        ...(opts.selectedForOpening ? { selectedForOpening: opts.selectedForOpening } : {}) };
+    },
+    directsLifecycle: () => opts.directs && !(opts.dropsDuring && opened),
+  };
+  const handled = (l: string) => l.includes('open-on-send failed') || l.includes('opened (send implies engagement)');
+  const error = console.error;
+  console.error = (...args: unknown[]) => { logged.push(args.map(String).join(' ')); };
+  try {
+    await framework.refreshMcplTools();
+    const sent = await new Promise<{ success?: boolean; error?: string }>((resolve) => {
+      framework.pushEvent = (event: { type: string; result: { success?: boolean; error?: string } }) => {
+        if (event.type === 'tool-result') resolve(event.result);
+      };
+      framework.dispatchMcplToolCall(agentName, { id: 'c1', name: 'srv--send_message', input: { channelId: 'x' } }, 'chat-server', 'srv');
+    });
+    assert.equal(sent.success, true, `the send went out: ${sent.error ?? ''}`);
+    // The open's answer is handled once its console line is written.
+    for (let i = 0; i < 50 && !logged.some(handled); i++) await tick();
+  } finally {
+    console.error = error;
+  }
+  assert.ok(logged.some(handled), 'the open was handled');
+  return { told, logged };
+}
+
+test("a reply whose open would have opened the channel, and failed, tells the agent; a failed reconfirm, or a server without channels.lifecycle, tells it nothing", async () => {
+  assert.deepEqual((await replyOpenFailedNotices({ opening: true, directs: true })).told, [{
+    text: '[channels] Not open: #x (x). Your reply there went out, but opening the channel failed. channel_open tries again.',
+    metadata: { system: true, kind: 'channel-notice' },
+    forAgent: 'agent',
+  }]);
+  assert.deepEqual((await replyOpenFailedNotices({ opening: false, directs: true })).told, [],
+    'a failed reconfirm of a channel already selected open changes nothing the agent was told');
+  assert.deepEqual((await replyOpenFailedNotices({ opening: true, directs: false })).told, [],
+    "where the server opens and closes its own channels, channel_open can't open one either");
+  assert.deepEqual((await replyOpenFailedNotices({ opening: true, directs: true, dropsDuring: true })).told.map((t) => t.text), [
+    '[channels] Not open: #x (x). Your reply there went out, but opening the channel failed. channel_open tries again.',
+  ], "a transport that drops while the open is out clears the grant before the failure arrives: whether the host directs the lifecycle is read before the open");
+  assert.deepEqual((await replyOpenFailedNotices({ opening: true, directs: true, selectedForOpening: 'unrecorded' })).told.map((t) => t.text), [
+    "[channels] Not open: #x (x). Your reply there went out, but opening the channel failed. It stays selected for opening, because the host couldn't record undoing that: a later delivery or reconnect tries again, and channel_close withdraws that. channel_open tries again.",
+  ], "where the put-back couldn't be recorded, as speech's failure says, in channel_open's own failure's words");
+  assert.deepEqual((await replyOpenFailedNotices({ opening: true, directs: true, selectedForOpening: 'server-bootstrap' })).told.map((t) => t.text), [
+    "[channels] Not open: #x (x). Your reply there went out, but opening the channel failed. It's selected for opening again, because its server lists it as open by default: the host tries again, and channel_close withdraws that.",
+  ], "where the server's announcement lifted the default put back, the host tries again itself, so channel_open isn't named");
+  assert.deepEqual((await replyOpenFailedNotices({ opening: true, directs: true, selectedForOpening: 'subscription-policy' })).told.map((t) => t.text), [
+    "[channels] Not open: #x (x). Your reply there went out, but opening the channel failed. It's selected for opening again, because the subscription policy admits it: the host tries again, and channel_close withdraws that.",
+  ], 'where the subscription policy lifted it');
+});
+
+test("the reply notice names channel_open and channel_close only where the agent it's addressed to can call them; where the replying agent has ended, no one is told unless the channel is selected for opening, and then the primary is, by name", async () => {
+  const facts = '[channels] Not open: #x (x). Your reply there went out, but opening the channel failed.';
+  const stays = " It stays selected for opening, because the host couldn't record undoing that: a later delivery or reconnect tries again";
+  const fork = await replyOpenFailedNotices({ opening: true, directs: true, homes: [['agent', 'x']] });
+  assert.deepEqual(fork.told.map((t) => t.text), [facts], "a conversation fork's channel_open is refused outright");
+
+  const sendOnly = await replyOpenFailedNotices({ opening: true, directs: true, denied: ['channel_open'] });
+  assert.deepEqual(sendOnly.told.map((t) => t.text), [facts], "an agent whose allowedTools leave channel_open out");
+
+  const forkHome = await replyOpenFailedNotices({ opening: true, directs: true, homes: [['agent', 'x']], selectedForOpening: 'unrecorded' });
+  assert.deepEqual(forkHome.told.map((t) => t.text), [facts + stays + ', and channel_close withdraws that.'],
+    'a fork may close its home channel, though not open it');
+  assert.equal((forkHome.told[0]!.metadata as { passOn?: { serverId?: unknown } }).passOn?.serverId, 'chat-server',
+    "its inputs name the send's server, not its tool prefix");
+  // A send that opens its channel tells the agent, and its inputs name the
+  // send's server too.
+  const sendOpened = await replyOpenFailedNotices({ opening: true, directs: true, homes: [['agent', 'x']], opened: true });
+  assert.match(sendOpened.told[0]?.text ?? '', /^\[channels\] Now open: #x \(x\): your own message into the closed channel opened it\./);
+  assert.equal((sendOpened.told[0]!.metadata as { passOn?: { serverId?: unknown } }).passOn?.serverId, 'chat-server');
+  const forkElsewhere = await replyOpenFailedNotices({ opening: true, directs: true, homes: [['agent', 'y']], selectedForOpening: 'unrecorded' });
+  assert.deepEqual(forkElsewhere.told.map((t) => t.text), [facts + stays + '.'],
+    "a fork's channel_close is refused for a channel that isn't its home");
+  const noOpen = await replyOpenFailedNotices({ opening: true, directs: true, denied: ['channel_open'], selectedForOpening: 'unrecorded' });
+  assert.deepEqual(noOpen.told.map((t) => t.text), [facts + stays + ', and channel_close withdraws that.'],
+    'an agent without channel_open is still told how to withdraw the selection');
+  const noClose = await replyOpenFailedNotices({ opening: true, directs: true, denied: ['channel_close'], selectedForOpening: 'unrecorded' });
+  assert.deepEqual(noClose.told.map((t) => t.text), [facts + stays + '. channel_open tries again.'],
+    'an agent whose allowedTools leave channel_close out');
+
+  const again = " It's selected for opening again, because its server lists it as open by default: the host tries again";
+  const forkAgain = await replyOpenFailedNotices({ opening: true, directs: true, homes: [['agent', 'x']], selectedForOpening: 'server-bootstrap' });
+  assert.deepEqual(forkAgain.told.map((t) => t.text), [facts + again + ', and channel_close withdraws that.'],
+    'a fork told the server lifted its home channel may close it');
+
+  const ended = await replyOpenFailedNotices({ opening: true, directs: true, live: ['primary'], primary: 'primary' });
+  assert.deepEqual(ended.told, [], 'the channel stays closed, so nothing follows from the failure');
+  assert.ok(ended.logged.some((l) => l.includes("agent has ended; not telling it that #x (x) couldn't be opened")));
+
+  const endedFacts = "[channels] Not open: #x (x). A reply from agent went out there, but opening the channel failed; agent has ended.";
+  const endedAgain = await replyOpenFailedNotices({ opening: true, directs: true, live: ['primary'], primary: 'primary', selectedForOpening: 'server-bootstrap' });
+  assert.deepEqual(endedAgain.told, [{
+    text: endedFacts + again + ', and channel_close withdraws that.',
+    metadata: { system: true, kind: 'channel-notice', speaker: 'agent' },
+  }], 'selected for opening, so the primary is told by name, unrouted, with advice judged for it');
+  assert.ok(endedAgain.logged.some((l) => l === '[channel] reply open-failed notice -> the primary, by name (agent has ended): #x (x)'));
+  const endedStays = await replyOpenFailedNotices({ opening: true, directs: true, live: ['primary'], primary: 'primary', selectedForOpening: 'unrecorded' });
+  assert.deepEqual(endedStays.told.map((t) => t.text), [endedFacts + stays + ', and channel_close withdraws that. channel_open tries again.']);
+  const endedPrimaryNoClose = await replyOpenFailedNotices({ opening: true, directs: true, live: ['primary'], primary: 'primary', denied: ['channel_close'], selectedForOpening: 'server-bootstrap' });
+  assert.deepEqual(endedPrimaryNoClose.told.map((t) => t.text), [endedFacts + again + '.'],
+    "the advice is judged for the primary, which can't close it, not for the agent that ended");
+  const endedPrimaryNoOpen = await replyOpenFailedNotices({ opening: true, directs: true, live: ['primary'], primary: 'primary', denied: ['channel_open'], selectedForOpening: 'unrecorded' });
+  assert.deepEqual(endedPrimaryNoOpen.told.map((t) => t.text), [endedFacts + stays + ', and channel_close withdraws that.'],
+    "nor is channel_open named to a primary that can't call it");
+  const endedPrimaryGone = await replyOpenFailedNotices({ opening: true, directs: true, live: ['other'], primary: 'gone', selectedForOpening: 'server-bootstrap' });
+  assert.deepEqual(endedPrimaryGone.told, [], 'a primary named but not registered is no one to tell');
+  const endedNoPrimary = await replyOpenFailedNotices({ opening: true, directs: true, live: [], selectedForOpening: 'server-bootstrap' });
+  assert.deepEqual(endedNoPrimary.told, [], 'with no primary there is no one to tell');
+  assert.ok(endedNoPrimary.logged.some((l) => l.includes("agent has ended, and there is no primary to tell that #x (x) couldn't be opened and is selected for opening")));
+});
+
+test("a reply notice with no agent named, or an empty name, goes out unrouted, with its advice judged for, and its log naming, the agent addMessage delivers to", () => {
+  const facts = '[channels] Not open: #x (x). Your reply there went out, but opening the channel failed.';
+  const stays = " It stays selected for opening, because the host couldn't record undoing that: a later delivery or reconnect tries again";
+  const cases: Array<{
+    why: string; name?: string; agents: Array<[string, string[]]>; primary: string | null;
+    selectedForOpening?: 'unrecorded' | 'server-bootstrap' | 'subscription-policy';
+    reader: string; text: string;
+  }> = [
+    { why: 'no name, the primary', agents: [['primary', []]], primary: 'primary', reader: 'primary', text: facts + ' channel_open tries again.' },
+    { why: 'an empty name, the primary', name: '', agents: [['primary', []]], primary: 'primary', reader: 'primary', text: facts + ' channel_open tries again.' },
+    { why: 'a primary without channel_open', agents: [['primary', ['channel_open']]], primary: 'primary', reader: 'primary', text: facts },
+    { why: 'stays selected, a primary that can close', agents: [['primary', []]], primary: 'primary', selectedForOpening: 'unrecorded',
+      reader: 'primary', text: facts + stays + ', and channel_close withdraws that. channel_open tries again.' },
+    { why: 'stays selected, a primary without channel_close', agents: [['primary', ['channel_close']]], primary: 'primary', selectedForOpening: 'unrecorded',
+      reader: 'primary', text: facts + stays + '. channel_open tries again.' },
+    { why: 'selected again by the server, a primary that can open and close', agents: [['primary', []]], primary: 'primary',
+      selectedForOpening: 'server-bootstrap', reader: 'primary',
+      text: facts + " It's selected for opening again, because its server lists it as open by default: the host tries again, and channel_close withdraws that." },
+    { why: 'no primary: the first registered agent', agents: [['first', ['channel_open']], ['second', []]], primary: null,
+      reader: 'first', text: facts },
+    { why: 'a primary that is not the first registered agent', agents: [['first', ['channel_open']], ['second', []]], primary: 'second',
+      reader: 'second', text: facts + ' channel_open tries again.' },
+  ];
+  for (const c of cases) {
+    const told: Array<{ text: string; forAgent?: string }> = [];
+    const logged: string[] = [];
+    const framework = Object.create(AgentFramework.prototype) as any;
+    framework.agents = new Map(c.agents.map(([name, denied]) => [name, { name, canUseTool: (tool: string) => !denied.includes(tool) }]));
+    framework.primaryAgentName = c.primary;
+    framework.usedEphemeralAgentNames = new Set();
+    framework.registry = { homeChannel: (name: string) => new Map().get(name), readsSharedSlot: (name: string) => [...(framework.sharedSlotAgents ?? [])].some((a: { name: string }) => a.name === name) };
+    framework.sharedSlotAgents = new Set();
+    framework.addMessage = (_participant: string, content: Array<{ text: string }>, _metadata: unknown, routed?: { forAgent?: string }) => {
+      told.push({ text: content[0]!.text, ...(routed ? { forAgent: routed.forAgent } : {}) });
+      return 'm';
+    };
+    const error = console.error;
+    console.error = (...args: unknown[]) => { logged.push(args.map(String).join(' ')); };
+    try {
+      framework.recordReplyOpenFailedNotice(c.name, 'srv', { channelId: 'x', label: '#x' }, c.selectedForOpening);
+    } finally {
+      console.error = error;
+    }
+    assert.deepEqual(told, [{ text: c.text }], `${c.why}: no forAgent, so addMessage delivers it to ${c.reader}`);
+    assert.deepEqual(logged, [`[channel] reply open-failed notice -> ${c.reader}: #x (x)`], `${c.why}: the log names ${c.reader}`);
+  }
+});
+
+test("where a reply's reader can't close a channel selected for opening, the primary is told by name too, if it can close it", () => {
+  const facts = '[channels] Not open: #x (x). Your reply there went out, but opening the channel failed.';
+  const stays = " It stays selected for opening, because the host couldn't record undoing that: a later delivery or reconnect tries again";
+  const again = " It's selected for opening again, because its server lists it as open by default: the host tries again";
+  const byName = (first: string, again: string) => `[channels] Not open: #x (x). A reply from ${first} went out there, but opening the channel failed, and ${again} can't close it.`;
+  const forkByName = byName('your fork in y, named fork,', 'that fork');
+  const told = (primary: string) => ` ${primary} has been told, and can withdraw that.`;
+  const cases: Array<{
+    why: string; name: string; agents: Array<[string, string[]]>; homes?: Array<[string, string]>; primary: string | null;
+    selectedForOpening?: 'unrecorded' | 'server-bootstrap';
+    told: Array<{ text: string; metadata: unknown; forAgent?: string }>;
+  }> = [
+    { why: 'a fork away from its home, selected again by its server', name: 'fork', agents: [['fork', []], ['primary', []]], homes: [['fork', 'y']],
+      primary: 'primary', selectedForOpening: 'server-bootstrap',
+      told: [
+        { text: forkByName + again + ', and channel_close withdraws that.', metadata: { system: true, kind: 'channel-notice', speaker: 'fork' } },
+        { text: facts + again + '.' + told('Your primary'), metadata: { system: true, kind: 'channel-notice' }, forAgent: 'fork' },
+      ] },
+    { why: "an agent whose allowedTools leave channel_close out, the put-back unrecorded", name: 'helper', agents: [['helper', ['channel_close']], ['primary', []]],
+      primary: 'primary', selectedForOpening: 'unrecorded',
+      told: [
+        { text: byName('helper', 'helper') + stays + ', and channel_close withdraws that. channel_open tries again.', metadata: { system: true, kind: 'channel-notice', speaker: 'helper' } },
+        { text: facts + stays + '.' + told('primary') + ' channel_open tries again.', metadata: { system: true, kind: 'channel-notice' }, forAgent: 'helper' },
+      ] },
+    { why: 'a reader who can close it, beside a primary that can too', name: 'helper', agents: [['helper', []], ['primary', []]],
+      primary: 'primary', selectedForOpening: 'server-bootstrap',
+      // Its inputs, so a release that finds it unread tells the primary.
+      told: [{ text: facts + again + ', and channel_close withdraws that.', forAgent: 'helper', metadata: { system: true, kind: 'channel-notice',
+        passOn: { notice: 'reply-open-failed', serverId: 'srv', channel: { channelId: 'x', label: '#x' }, selectedForOpening: 'server-bootstrap' } } }] },
+    { why: 'a reader who can close it, the put-back unrecorded', name: 'helper', agents: [['helper', []], ['primary', []]],
+      primary: 'primary', selectedForOpening: 'unrecorded',
+      told: [{ text: facts + stays + ', and channel_close withdraws that. channel_open tries again.', forAgent: 'helper', metadata: { system: true, kind: 'channel-notice',
+        passOn: { notice: 'reply-open-failed', serverId: 'srv', channel: { channelId: 'x', label: '#x' }, selectedForOpening: 'unrecorded' } } }] },
+    { why: "a primary that can close it but not open it, the put-back unrecorded", name: 'fork', agents: [['fork', []], ['primary', ['channel_open']]],
+      homes: [['fork', 'y']], primary: 'primary', selectedForOpening: 'unrecorded',
+      told: [
+        { text: forkByName + stays + ', and channel_close withdraws that.', metadata: { system: true, kind: 'channel-notice', speaker: 'fork' } },
+        { text: facts + stays + '.' + told('Your primary'), metadata: { system: true, kind: 'channel-notice' }, forAgent: 'fork' },
+      ] },
+    { why: 'a fork that has ended, its home still known while it is released, the channel selected again', name: 'fork', agents: [['primary', []]],
+      homes: [['fork', 'y']], primary: 'primary', selectedForOpening: 'server-bootstrap',
+      told: [{ text: '[channels] Not open: #x (x). A reply from your fork in y, named fork, went out there, but opening the channel failed; that fork has ended.' +
+        again + ', and channel_close withdraws that.', metadata: { system: true, kind: 'channel-notice', speaker: 'fork' } }] },
+    { why: 'a fork away from its home, the channel left closed', name: 'fork', agents: [['fork', []], ['primary', []]], homes: [['fork', 'y']],
+      primary: 'primary',
+      told: [{ text: facts, metadata: { system: true, kind: 'channel-notice' }, forAgent: 'fork' }] },
+    { why: "a primary that can't close it either", name: 'fork', agents: [['fork', []], ['primary', ['channel_close']]], homes: [['fork', 'y']],
+      primary: 'primary', selectedForOpening: 'server-bootstrap',
+      told: [{ text: facts + again + '.', metadata: { system: true, kind: 'channel-notice' }, forAgent: 'fork' }] },
+    { why: 'no primary', name: 'fork', agents: [['fork', []]], homes: [['fork', 'y']], primary: null, selectedForOpening: 'server-bootstrap',
+      told: [{ text: facts + again + '.', metadata: { system: true, kind: 'channel-notice' }, forAgent: 'fork' }] },
+    { why: "the primary itself, without channel_close", name: 'primary', agents: [['primary', ['channel_close']]], primary: 'primary', selectedForOpening: 'unrecorded',
+      told: [{ text: facts + stays + '. channel_open tries again.', metadata: { system: true, kind: 'channel-notice' }, forAgent: 'primary' }] },
+  ];
+  for (const c of cases) {
+    const told: Array<{ text: string; metadata: unknown; forAgent?: string }> = [];
+    const logged: string[] = [];
+    const framework = Object.create(AgentFramework.prototype) as any;
+    framework.agents = new Map(c.agents.map(([name, denied]) => [name, { name, canUseTool: (tool: string) => !denied.includes(tool) }]));
+    framework.primaryAgentName = c.primary;
+    framework.usedEphemeralAgentNames = new Set();
+    framework.registry = { homeChannel: (name: string) => new Map(c.homes ?? []).get(name), readsSharedSlot: (name: string) => [...(framework.sharedSlotAgents ?? [])].some((a: { name: string }) => a.name === name) };
+    framework.sharedSlotAgents = new Set();
+    // Forks are made where conversations are routed, here from the primary.
+    framework.conversationRouter = c.homes ? { templateAgent: 'primary' } : undefined;
+    framework.addMessage = (_participant: string, content: Array<{ text: string }>, metadata: unknown, routed?: { forAgent?: string }) => {
+      told.push({ text: content[0]!.text, metadata, ...(routed ? { forAgent: routed.forAgent } : {}) });
+      return 'm';
+    };
+    const error = console.error;
+    console.error = (...args: unknown[]) => { logged.push(args.map(String).join(' ')); };
+    try {
+      framework.recordReplyOpenFailedNotice(c.name, 'srv', { channelId: 'x', label: '#x' }, c.selectedForOpening);
+    } finally {
+      console.error = error;
+    }
+    assert.deepEqual(told, c.told, c.why);
+    if (c.told.length === 2) {
+      assert.ok(logged.includes(`[channel] reply open-failed notice -> the primary, by name (${c.name} can't close it): #x (x)`), `${c.why}: the log says why`);
+    }
+  }
+});
+
+// The opened notice follows the reply notice's rule: channel_close is named
+// only where the agent it's addressed to can call it for every channel named
+// (other residents of one slot may read it too, #291; a fork's seed leaves it
+// out), and where an agent's send opened a channel it can't close, the
+// primary is told by name too, if it can close it. The reader's notice
+// carries its inputs only where it was told it can close the channels, so a
+// release passes on only that.
+test('the opened notice names channel_close only where the agent it\'s addressed to can call it, says what the channel delivers only to the agent that holds its traffic, and tells the primary by name where the agent whose send opened it can\'t close it', () => {
+  // What the channel delivers: said to the agent whose window holds its
+  // traffic. Where conversations are routed (router), that's a fork for its
+  // home alone; elsewhere, the agent addMessage delivers to.
+  const optOut = " What an open channel brings you is up to its server: some send every message in it, and others only what addresses you unless you're subscribed to it; their own tools can change that.";
+  const close = " If you don't want it, use channel_close: neither the subscription policy nor its server's own default opens it again.";
+  const closeMany = " If you don't want one of them, use channel_close: neither the subscription policy nor its server's own default opens it again.";
+  const own = '[channels] Now open: #x (x): your own message into the closed channel opened it.';
+  const opened = (passOn: unknown) => ({ system: true, kind: 'channel-notice', passOn });
+  const fromReply = { notice: 'channel-opened', serverId: 'srv', cause: 'opened-by-reply', channels: [{ channelId: 'x', label: '#x' }] };
+  const cases: Array<{
+    why: string; name?: string; cause?: 'opened-by-reply' | 'subscription-policy'; channels?: Array<{ channelId: string; label?: string }>;
+    agents: Array<[string, string[]]>; homes?: Array<[string, string]>; labels?: Array<[string, string]>; isolated?: string[];
+    router?: boolean; template?: string; expired?: string[]; subconscious?: string; primary: string | null;
+    told: Array<{ text: string; metadata: unknown; forAgent?: string }>;
+  }> = [
+    { why: "a second resident that can close it, which reads the residents' shared slot", name: 'helper', agents: [['helper', []], ['primary', []]], primary: 'primary',
+      told: [{ text: own + optOut + close, metadata: opened(fromReply), forAgent: 'helper' }] },
+    { why: 'a run that can close it, whose store is its own and holds no channel traffic', name: 'run', agents: [['run', []], ['primary', []]], isolated: ['run'], primary: 'primary',
+      told: [{ text: own + close, metadata: opened(fromReply), forAgent: 'run' }] },
+    { why: 'a fork away from its home', name: 'fork', agents: [['fork', []], ['primary', []]], homes: [['fork', 'y']], router: true, primary: 'primary',
+      told: [
+        { text: "[channels] Now open: #x (x): a message from your fork in y, named fork, into the closed channel opened it, and that fork can't close it." + close,
+          metadata: { system: true, kind: 'channel-notice', speaker: 'fork' } },
+        { text: own + ' Your primary has been told and can close it.', metadata: { system: true, kind: 'channel-notice' }, forAgent: 'fork' },
+      ] },
+    { why: 'a fork away from a home the registry labels', name: 'fork', agents: [['fork', []], ['primary', []]], homes: [['fork', 'y']], labels: [['y', '#dm-y']], router: true, primary: 'primary',
+      told: [
+        { text: "[channels] Now open: #x (x): a message from your fork in #dm-y (y), named fork, into the closed channel opened it, and that fork can't close it." + close,
+          metadata: { system: true, kind: 'channel-notice', speaker: 'fork' } },
+        { text: own + ' Your primary has been told and can close it.', metadata: { system: true, kind: 'channel-notice' }, forAgent: 'fork' },
+      ] },
+    { why: "a fork made from a template that isn't the primary", name: 'fork', agents: [['fork', []], ['primary', []], ['other', []]], homes: [['fork', 'y']],
+      router: true, template: 'other', primary: 'primary',
+      told: [
+        { text: "[channels] Now open: #x (x): a message from the fork in y, named fork, into the closed channel opened it, and that fork can't close it." + close,
+          metadata: { system: true, kind: 'channel-notice', speaker: 'fork' } },
+        { text: own + ' primary has been told and can close it.', metadata: { system: true, kind: 'channel-notice' }, forAgent: 'fork' },
+      ] },
+    { why: 'a fork at its home', name: 'fork', agents: [['fork', []], ['primary', []]], homes: [['fork', 'x']], router: true, primary: 'primary',
+      told: [{ text: own + optOut + close, metadata: opened(fromReply), forAgent: 'fork' }] },
+    { why: 'a fork at its home whose binding the sweep has ended, closing: its home routes to it no more', name: 'fork', agents: [['fork', []], ['primary', []]],
+      homes: [['fork', 'x']], router: true, expired: ['fork'], primary: 'primary',
+      told: [{ text: own + close, metadata: opened(fromReply), forAgent: 'fork' }] },
+    { why: 'a fork at its home, which the router has bound to a newer fork since: its home routes to that one', name: 'fork',
+      agents: [['fork', []], ['newer', []], ['primary', []]], homes: [['fork', 'x'], ['newer', 'x']], router: true, primary: 'primary',
+      told: [{ text: own + close, metadata: opened(fromReply), forAgent: 'fork' }] },
+    { why: 'the subconscious, which reads the shared slot through its merged view', name: 'sub', agents: [['sub', []], ['primary', []]], subconscious: 'sub', primary: 'primary',
+      told: [{ text: own + optOut + close, metadata: opened(fromReply), forAgent: 'sub' }] },
+    { why: 'a second resident whose allowedTools leave channel_close out', name: 'helper', agents: [['helper', ['channel_close']], ['primary', []]], primary: 'primary',
+      told: [
+        { text: "[channels] Now open: #x (x): a message from helper into the closed channel opened it, and helper can't close it." + optOut + close,
+          metadata: { system: true, kind: 'channel-notice', speaker: 'helper' } },
+        { text: own + optOut + ' primary has been told and can close it.', metadata: { system: true, kind: 'channel-notice' }, forAgent: 'helper' },
+      ] },
+    { why: "a primary that can't close it either", name: 'fork', agents: [['fork', []], ['primary', ['channel_close']]], homes: [['fork', 'y']], router: true, primary: 'primary',
+      told: [{ text: own, metadata: { system: true, kind: 'channel-notice' }, forAgent: 'fork' }] },
+    { why: 'a primary named but not registered', name: 'fork', agents: [['fork', []], ['other', []]], homes: [['fork', 'y']], router: true, primary: 'gone',
+      told: [{ text: own, metadata: { system: true, kind: 'channel-notice' }, forAgent: 'fork' }] },
+    { why: 'the primary itself, without channel_close', name: 'primary', agents: [['primary', ['channel_close']]], primary: 'primary',
+      told: [{ text: own + optOut, metadata: { system: true, kind: 'channel-notice' }, forAgent: 'primary' }] },
+    { why: "several channels, one away from a fork's home", name: 'fork', channels: [{ channelId: 'y', label: '#y' }, { channelId: 'x', label: '#x' }],
+      agents: [['fork', []], ['primary', []]], homes: [['fork', 'y']], router: true, primary: 'primary',
+      told: [
+        { text: "[channels] Now open: #y (y), #x (x): a message from your fork in y, named fork, into the closed channel opened it, and that fork can't close them." + closeMany,
+          metadata: { system: true, kind: 'channel-notice', speaker: 'fork' } },
+        { text: '[channels] Now open: #y (y), #x (x): your own message into the closed channel opened it. Your primary has been told and can close them.',
+          metadata: { system: true, kind: 'channel-notice' }, forAgent: 'fork' },
+      ] },
+    { why: 'a policy admission, to the primary that can close it', cause: 'subscription-policy', agents: [['primary', []]], primary: 'primary',
+      // Addressed to no agent of its own, so it carries no inputs to pass on.
+      told: [{ text: "[channels] Selected for opening by subscription policy: #x (x). The host opens it, and if that fails, tries again when its server next registers it; channel_list shows whether it's open yet." + optOut + close,
+        metadata: { system: true, kind: 'channel-notice' } }] },
+    { why: 'a policy admission where conversations are routed, to the primary, whose window holds no channel traffic', cause: 'subscription-policy', agents: [['primary', []]], router: true, primary: 'primary',
+      told: [{ text: "[channels] Selected for opening by subscription policy: #x (x). The host opens it, and if that fails, tries again when its server next registers it; channel_list shows whether it's open yet." + close,
+        metadata: { system: true, kind: 'channel-notice' } }] },
+    { why: "a policy admission, to a primary that can't close it", cause: 'subscription-policy', agents: [['primary', ['channel_close']]], primary: 'primary',
+      told: [{ text: "[channels] Selected for opening by subscription policy: #x (x). The host opens it, and if that fails, tries again when its server next registers it; channel_list shows whether it's open yet." + optOut,
+        metadata: { system: true, kind: 'channel-notice' } }] },
+    { why: "a policy admission with no primary, to the first agent, a run whose store is its own, which can't close it", cause: 'subscription-policy',
+      agents: [['worker', ['channel_close']]], isolated: ['worker'], primary: null,
+      told: [{ text: "[channels] Selected for opening by subscription policy: #x (x). The host opens it, and if that fails, tries again when its server next registers it; channel_list shows whether it's open yet." + optOut,
+        metadata: { system: true, kind: 'channel-notice' } }] },
+    { why: "an agent that has ended, with a primary that can't close it", name: 'gone', agents: [['primary', ['channel_close']]], primary: 'primary',
+      told: [{ text: '[channels] Now open: #x (x): a message from gone into the closed channel opened it; gone has ended.' + optOut,
+        metadata: { system: true, kind: 'channel-notice', speaker: 'gone' } }] },
+    { why: 'an agent that has ended, where conversations are routed', name: 'gone', agents: [['primary', []]], router: true, primary: 'primary',
+      told: [{ text: '[channels] Now open: #x (x): a message from gone into the closed channel opened it; gone has ended.' + close,
+        metadata: { system: true, kind: 'channel-notice', speaker: 'gone' } }] },
+  ];
+  for (const c of cases) {
+    const told: Array<{ text: string; metadata: unknown; forAgent?: string }> = [];
+    const logged: string[] = [];
+    const framework = Object.create(AgentFramework.prototype) as any;
+    framework.agents = new Map(c.agents.map(([name, denied]) => [name, { name, canUseTool: (tool: string) => !denied.includes(tool) }]));
+    framework.primaryAgentName = c.primary;
+    framework.usedEphemeralAgentNames = new Set();
+    framework.registry = { homeChannel: (name: string) => new Map(c.homes ?? []).get(name), readsSharedSlot: (name: string) => [...(framework.sharedSlotAgents ?? [])].some((a: { name: string }) => a.name === name) };
+    framework.sharedSlotAgents = new Set();
+    // Each fork is bound to its home, unless the sweep has ended its binding;
+    // of two forks with one home, the router binds the later.
+    const bound = new Map((c.homes ?? []).filter(([fork]) => !(c.expired ?? []).includes(fork)).map(([fork, home]) => [home, fork]));
+    framework.conversationRouter = c.router
+      ? { templateAgent: c.template ?? 'primary', getBinding: (id: string) => (bound.has(id) ? { channelId: id, agentName: bound.get(id) } : undefined) }
+      : undefined;
+    framework.subconsciousAgentName = c.subconscious;
+    // Residents, and the subconscious through its merged view, read one shared
+    // slot; a fork's store, or a run's, is its own.
+    framework.sharedSlotAgents = new Set([...framework.agents.values()]
+      .filter((a: { name: string }) => !framework.registry.homeChannel(a.name) !== undefined && !(c.isolated ?? []).includes(a.name)));
+    const labels = new Map(c.labels ?? []);
+    framework.channelRegistry = { getDescriptor: (id: string) => (labels.has(id) ? { id, label: labels.get(id) } : undefined) };
+    framework.addMessage = (_participant: string, content: Array<{ text: string }>, metadata: unknown, routed?: { forAgent?: string }) => {
+      told.push({ text: content[0]!.text, metadata, ...(routed ? { forAgent: routed.forAgent } : {}) });
+      return 'm';
+    };
+    const error = console.error;
+    console.error = (...args: unknown[]) => { logged.push(args.map(String).join(' ')); };
+    try {
+      framework.recordChannelAutoOpenNotice(c.name, 'srv', c.channels ?? [{ channelId: 'x', label: '#x' }], c.cause ?? 'opened-by-reply');
+    } finally {
+      console.error = error;
+    }
+    assert.deepEqual(told, c.told, c.why);
+    if (c.told.length === 2) {
+      assert.ok(logged.some((l) => l.startsWith(`[channel] auto-open notice (opened-by-reply) -> the primary, by name (${c.name} can't close`)), `${c.why}: the log says why`);
+    }
+  }
+});
+
+// Each notice is written on its own: one that can't be written leaves the
+// other to be written still. The primary's is written first, and the
+// reader's says the primary was told only where the primary's landed.
+test("each channel notice is written on its own, and the reader's says the primary was told only where the primary's landed, for both notices", () => {
+  for (const write of ['opened', 'reply'] as const) {
+    for (const refused of ['reader', 'primary'] as const) {
+      const told: Array<{ text: string; forAgent?: string }> = [];
+      const logged: string[] = [];
+      const framework = Object.create(AgentFramework.prototype) as any;
+      framework.agents = new Map([['fork', { name: 'fork', canUseTool: () => true }], ['primary', { name: 'primary', canUseTool: () => true }]]);
+      framework.primaryAgentName = 'primary';
+      framework.usedEphemeralAgentNames = new Set();
+      framework.registry = { homeChannel: (name: string) => new Map([['fork', 'y']]).get(name), readsSharedSlot: (name: string) => [...(framework.sharedSlotAgents ?? [])].some((a: { name: string }) => a.name === name) };
+      framework.sharedSlotAgents = new Set();
+      framework.conversationRouter = { templateAgent: 'primary' };
+      framework.addMessage = (_participant: string, content: Array<{ text: string }>, _metadata: unknown, routed?: { forAgent?: string }) => {
+        // The reader's notice is addressed to the fork; the primary's to no one.
+        if ((refused === 'reader') === !!routed?.forAgent) throw new Error('store refused the write');
+        told.push({ text: content[0]!.text, ...(routed?.forAgent ? { forAgent: routed.forAgent } : {}) });
+        return 'm';
+      };
+      const error = console.error;
+      console.error = (...args: unknown[]) => { logged.push(args.map(String).join(' ')); };
+      try {
+        if (write === 'opened') framework.recordChannelAutoOpenNotice('fork', 'srv', [{ channelId: 'x', label: '#x' }], 'opened-by-reply');
+        else framework.recordReplyOpenFailedNotice('fork', 'srv', { channelId: 'x', label: '#x' }, 'server-bootstrap');
+      } finally {
+        console.error = error;
+      }
+      const why = `${write}, the ${refused}'s write refused`;
+      assert.equal(told.length, 1, `${why}: the other notice is written`);
+      if (refused === 'reader') {
+        assert.equal(told[0]!.forAgent, undefined, why);
+        assert.match(told[0]!.text, /that fork can't close it/, why);
+      } else {
+        assert.equal(told[0]!.forAgent, 'fork', why);
+        assert.equal(told[0]!.text, write === 'opened'
+          ? '[channels] Now open: #x (x): your own message into the closed channel opened it.'
+          : "[channels] Not open: #x (x). Your reply there went out, but opening the channel failed. It's selected for opening again, because its server lists it as open by default: the host tries again.",
+        `${why}: the reader isn't told the primary was`);
+      }
+      assert.ok(logged.some((l) => l.startsWith(write === 'opened' ? 'recordChannelAutoOpenNotice failed:' : 'recordReplyOpenFailedNotice failed:')),
+        `${why}: the failure is logged`);
+    }
+  }
+});
+
+// A release finds a channel notice its reader could act on unread: the
+// primary is told in its place, in the words the notice's builder gives an
+// agent that has ended, judged for the primary. A notice whose inputs don't
+// read back as this build writes them, or that carries none, isn't passed on.
+test("a channel notice's inputs give the primary's by-name notice once its reader has ended, and malformed ones give none", () => {
+  const framework = Object.create(AgentFramework.prototype) as any;
+  framework.agents = new Map([['primary', { name: 'primary', canUseTool: (tool: string) => tool !== 'channel_open' }]]);
+  framework.primaryAgentName = 'primary';
+  framework.usedEphemeralAgentNames = new Set();
+  framework.registry = { homeChannel: (name: string) => new Map().get(name), readsSharedSlot: (name: string) => [...(framework.sharedSlotAgents ?? [])].some((a: { name: string }) => a.name === name) };
+  framework.sharedSlotAgents = new Set();
+  // Every channel still as the notice says: open, or still waiting to open.
+  framework.channelRegistry = { getDesiredState: () => 'open', isChannelOpen: () => false };
+  const error = console.error;
+  console.error = () => {};
+  try {
+    const reply = framework.noticeForPrimary('gone', { system: true, kind: 'channel-notice',
+      passOn: { notice: 'reply-open-failed', serverId: 'srv', channel: { channelId: 'x', label: '#x' }, selectedForOpening: 'unrecorded' } });
+    assert.deepEqual(reply?.content, [{ type: 'text', text:
+      "[channels] Not open: #x (x). A reply from gone went out there, but opening the channel failed; gone has ended. " +
+      "It stays selected for opening, because the host couldn't record undoing that: a later delivery or reconnect tries again, and channel_close withdraws that." }],
+      "judged for the primary, which can close it and can't call channel_open");
+    assert.deepEqual(reply?.metadata, { system: true, kind: 'channel-notice', speaker: 'gone' });
+    for (const passOn of [
+      undefined,
+      { notice: 'channel-opened', serverId: 'srv', cause: 'opened-by-reply', channels: [] },
+      { notice: 'channel-opened', serverId: 'srv', cause: 'opened-by-whim', channels: [{ channelId: 'x' }] },
+      { notice: 'channel-opened', serverId: 'srv', cause: 'opened-by-reply', channels: [{ channelId: '' }] },
+      { notice: 'reply-open-failed', serverId: 'srv', channel: { channelId: 'x' } },
+      { notice: 'reply-open-failed', serverId: 'srv', channel: { channelId: 'x' }, selectedForOpening: 'maybe' },
+      { notice: 'channel-opened', serverId: 'srv', cause: 'opened-by-reply', channels: [{ channelId: 7 }] },
+      { notice: 'channel-opened', serverId: 'srv', cause: 'opened-by-reply', channels: 'x' },
+      { notice: 'channel-opened', serverId: 'srv', cause: 'subscription-policy', channels: [{ channelId: 'x' }] },
+      { notice: 'reply-open-failed', serverId: 'srv', channel: null, selectedForOpening: 'unrecorded' },
+      { notice: 'something-else', serverId: 'srv' },
+      // Each channel is checked on its own server, so a notice must name one.
+      { notice: 'channel-opened', cause: 'opened-by-reply', channels: [{ channelId: 'x' }] },
+      { notice: 'channel-opened', serverId: '', cause: 'opened-by-reply', channels: [{ channelId: 'x' }] },
+      { notice: 'reply-open-failed', serverId: 7, channel: { channelId: 'x' }, selectedForOpening: 'unrecorded' },
+    ]) {
+      assert.equal(framework.noticeForPrimary('gone', { system: true, kind: 'channel-notice', ...(passOn ? { passOn } : {}) }), null, JSON.stringify(passOn));
+    }
+    assert.equal(framework.noticeForPrimary('gone', { system: true, kind: 'routing-notice', passOn: { notice: 'channel-opened', serverId: 'srv', cause: 'opened-by-reply', channels: [{ channelId: 'x' }] } }), null,
+      'only a channel notice');
+    // A channel with no label, or one whose label isn't text, is named by its
+    // id, and so is one whose label is its id.
+    const unlabeled = framework.noticeForPrimary('gone', { system: true, kind: 'channel-notice',
+      passOn: { notice: 'channel-opened', serverId: 'srv', cause: 'opened-by-delivery', channels: [{ channelId: 'x', label: 9 }] } });
+    assert.match(unlabeled?.content[0]?.text ?? '', /^\[channels\] Now open: x: a message from gone into the closed channel opened it; gone has ended\./);
+    const labelIsId = framework.noticeForPrimary('gone', { system: true, kind: 'channel-notice',
+      passOn: { notice: 'channel-opened', serverId: 'srv', cause: 'opened-by-delivery', channels: [{ channelId: 'x', label: 'x' }] } });
+    assert.match(labelIsId?.content[0]?.text ?? '', /^\[channels\] Now open: x: a message from gone into the closed channel opened it; gone has ended\./);
+  } finally {
+    console.error = error;
+  }
+});
+
+test("a reply's open that only reconfirms a tuned-out channel's transport, and fails, isn't one that would have opened it", async () => {
+  const f = fixture();
+  await f.registry.handleChanged('test', { added: [descriptor('x', true, 'A')] });
+  f.registry.enterTuneOut('test', 'x', {
+    epochId: 'kept-epoch', cadenceSeconds: 60, backlogCap: 20, maxWakes: 3, startedAtSequence: 1,
+  }, 'agent-tool');
+  f.held.add('x');
+  const retarget = f.registry.handleChanged('test', { updated: [descriptor('x', true, 'B')] });
+  await tick();
+  f.pending.shift()!.fail();
+  await retarget;
+  assert.equal(f.isOpen(), false);
+  const reply = f.registry.openIfClosedForSend('x', 'test');
+  await tick();
+  f.pending.shift()!.fail();
+  f.held.delete('x');
+  assert.deepEqual(await reply, { status: 'open-failed', channelId: 'x', label: 'x', opening: false });
+  assert.equal(f.registry.getDesiredState('test', 'x'), 'tuned-out');
+});
+
+test("a reply's open that only reconfirms a channel selected open, and fails, isn't one that would have opened it", async () => {
+  const f = fixture();
+  await f.registry.handleChanged('test', { added: [descriptor('x', true, 'A')] });
+  f.held.add('x');
+  const retarget = f.registry.handleChanged('test', { updated: [descriptor('x', true, 'B')] });
+  await tick();
+  f.pending.shift()!.fail();
+  await retarget;
+  assert.equal(f.isOpen(), false);
+  assert.equal(f.registry.getDesiredState('test', 'x'), 'open');
+  const reply = f.registry.openIfClosedForSend('x', 'test');
+  await tick();
+  f.pending.shift()!.fail();
+  f.held.delete('x');
+  assert.deepEqual(await reply, { status: 'open-failed', channelId: 'x', label: 'x', opening: false });
+  assert.equal(f.registry.getDesiredState('test', 'x'), 'open', 'the decision stands');
+});
+
+test("a reply that waits on a queued close, which leaves the channel closed, isn't an opening that failed: nothing was opened", async () => {
+  const f = fixture();
+  await f.registry.handleChanged('test', { added: [descriptor('x', true)] });
+  await tick(); await tick();
+  assert.equal(f.isOpen(), true);
+  f.held.add('x');
+  const closed = f.tool('close');
+  await tick();
+  const reply = f.registry.openIfClosedForSend('x', 'test');
+  await tick();
+  f.held.delete('x');
+  const before = f.calls.length;
+  await f.drain(closed, reply);
+  assert.deepEqual(await reply, { status: 'open-failed', channelId: 'x', label: 'x', opening: false });
+  assert.deepEqual(f.calls.slice(before).filter((c) => c.kind === 'open'), [], 'the reply sent no open');
+  assert.deepEqual(decision(f.registry), { state: 'closed', source: 'agent-tool' });
+});
+
+test("a reply into a channel whose server is gone writes no decision and queues no close", async () => {
+  const f = fixture();
+  await f.registry.handleChanged('test', { added: [descriptor('x', false)] });
+  await tick(); await tick();
+  const log = recordLog(f.registry);
+  const calls = f.calls.length;
+  // The server is gone while its channel is still registered.
+  (f.registry as unknown as { serverRegistry: { getServer: () => undefined } }).serverRegistry = { getServer: () => undefined };
+  const answer = await f.registry.openIfClosedForSend('x', 'test');
+  await tick(); await tick();
+  assert.equal(answer.status, 'open-failed');
+  assert.deepEqual(f.traces.filter((t) => t.type === 'mcpl:channel-open-failed').map((t) => t.error), ['the "test" server isn\'t connected, and this host won\'t reconnect to it on its own'],
+    'the failure names the missing server, not a missing grant');
+  assert.deepEqual(log, [], 'nothing to put back, and no close to queue');
+  assert.equal(f.calls.length, calls);
+  assert.deepEqual(decision(f.registry), { state: 'closed', source: 'default-closed' });
+});
+
+test("the agent's channel_close over its own decline writes nothing: both are the agent's", async () => {
+  const f = fixture();
+  await f.registry.handleChanged('test', { added: [descriptor('x', false)] });
+  await tick(); await tick();
+  const declined = await f.registry.handleChannelToolCall('channel_decline', { serverId: 'test', channelId: 'x', messageId: 'm1' });
+  assert.equal(declined.success, true);
+  const log = recordLog(f.registry);
+  const closed = await f.tool('close');
+  assert.equal(dataOf(closed).status, 'already closed');
+  assert.deepEqual(log, []);
+  assert.deepEqual(decision(f.registry), { state: 'closed', source: 'invitation-declined' });
+});
+
+test("channel_open on a server without channels.lifecycle still records the agent's decision, though its open fails", async () => {
+  const f = fixture();
+  await f.registry.handleChanged('test', { added: [descriptor('x', false)] });
+  await tick(); await tick();
+  f.setGrant(ALL_CAPABILITY_PATHS.filter((p) => p !== 'channels.lifecycle'));
+  const opened = await f.tool('open');
+  assert.equal(opened.success, false);
+  assert.match(opened.error ?? '', /^This host isn't permitted to open or close the "test" server's channels/);
+  assert.deepEqual(decision(f.registry), { state: 'open', source: 'agent-tool' }, "the agent's own open stays selected (#210), unlike speech's");
+});
+
+test("the agent's channel_open after a lost answer waits behind the put-back's close in the channel's queue", async () => {
+  const f = fixture();
+  await f.registry.handleChanged('test', { added: [descriptor('x', false)] });
+  f.held.add('x');
+  const speech = f.registry.publish('agent', 'words', { serverId: 'test', channelId: 'x' });
+  await tick();
+  const open = f.pending.shift()!;
+  const before = f.calls.length;
+  f.actual.set('x', true); // the server opened x, and its answer was lost
+  open.fail();
+  await tick(); await tick();
+  assert.equal((await speech).status, 'failed');
+  assert.equal(f.pending.length, 1, "the put-back's close is out");
+  const reopened = f.tool('open');
+  await tick(); await tick();
+  assert.equal(f.pending.length, 1, "the agent's open waits for that close: one request per channel at a time");
+  f.held.delete('x');
+  await f.drain(reopened);
+  assert.equal((await reopened).success, true);
+  const after = f.calls.slice(before).map((c) => c.kind);
+  assert.equal(after[0], 'close', `the put-back's close goes first: ${JSON.stringify(after)}`);
+  assert.equal(after.at(-1), 'open', `and the agent's open after it: ${JSON.stringify(after)}`);
+  assert.equal(f.actual.get('x'), true);
+  assert.deepEqual(decision(f.registry), { state: 'open', source: 'agent-tool' });
+});
+
+test("the agent's channel_open over a channel speech opened is the agent's decision, which a housekeeping close doesn't override", async () => {
+  const f = fixture();
+  await f.registry.handleChanged('test', { added: [descriptor('x', false)] });
+  assert.equal((await f.registry.publish('agent', 'words', { serverId: 'test', channelId: 'x' })).status, 'delivered');
+  assert.deepEqual(decision(f.registry), { state: 'open', source: 'opened-by-delivery' });
+
+  assert.equal((await f.tool('open')).success, true);
+  assert.deepEqual(decision(f.registry), { state: 'open', source: 'agent-tool' });
+  const housekeeping = await f.registry.handleChannelToolCall(
+    'channel_close', { serverId: 'test', channelId: 'x', source: 'housekeeping' }, { kind: 'module' },
+  );
+  assert.equal(housekeeping.success, false);
+  assert.match(housekeeping.error ?? '', /was explicitly opened \(source: agent-tool\)/);
+  assert.equal(f.isOpen(), true);
+});
+
+// A channel only a push has registered (ensureChannelRegistered) starts with
+// its transport unknown, as a registration's does: after a restart the server
+// may still hold a channel an earlier process opened. Its traffic shows it
+// open when it's decided open or tuned out, since it has no target a retarget
+// could have left behind. In each test below the server holds it open.
+
+test('a close of a channel only a push has registered, decided closed before a restart, is sent to the server, not answered as already closed', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'push-registered-close-'));
+  const store = JsStore.openOrCreate({ path: join(dir, 'store') });
+  try {
+    const earlier = fixture(undefined, store);
+    earlier.registry.ensureChannelRegistered('test', 'x', 'x');
+    assert.equal((await earlier.tool('close')).success, true);
+
+    // A decision kept from an earlier process says nothing about the transport.
+    const f = fixture(undefined, store);
+    f.actual.set('x', true);
+    f.registry.ensureChannelRegistered('test', 'x', 'x');
+    assert.equal(f.registry.getDesiredState('test', 'x'), 'closed');
+    const result = await f.tool('close');
+    assert.equal(result.success, true);
+    assert.equal(dataOf(result).status, 'closed');
+    assert.deepEqual(f.calls.map((c) => [c.kind, c.id]), [['close', 'x']]);
+    assert.equal(f.actual.get('x'), false);
+  } finally {
+    store.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('a decline in a channel only a push has registered, after its traffic, sends its close through the lifecycle queue', async () => {
+  const f = fixture();
+  f.actual.set('x', true);
+  f.registry.ensureChannelRegistered('test', 'x', 'x');
+  // With nothing decided, its traffic doesn't show it open.
+  await f.registry.handleIncoming('test', { messages: [message()] });
+  assert.equal(f.isOpen(), false);
+  const result = await f.registry.handleChannelToolCall('channel_decline', { serverId: 'test', channelId: 'x', messageId: 'm1' });
+  assert.equal(result.success, true);
+  assert.equal(dataOf(result).status, 'remained closed');
+  assert.equal(dataOf(result).closeError, undefined);
+  assert.deepEqual(f.calls.map((c) => [c.kind, c.id]), [['close', 'x']]);
+  assert.equal(f.actual.get('x'), false);
+});
+
+test("a close refused for the grant, in a channel only a push has registered, doesn't say the channel is closed, nor once the close is recorded", async () => {
+  const f = fixture();
+  f.actual.set('x', true);
+  f.setGrant(ALL_CAPABILITY_PATHS.filter((path) => path !== 'channels.lifecycle'));
+  f.registry.ensureChannelRegistered('test', 'x', 'x');
+  // The second close finds the first one's decision recorded.
+  for (const attempt of [1, 2]) {
+    const result = await f.tool('close');
+    assert.equal(result.success, false, `close ${attempt}`);
+    assert.equal(result.error,
+      'This host isn\'t permitted to open or close the "test" server\'s channels, so this close of channel "x" didn\'t ' +
+      'go through, and calling channel_close again won\'t change that. The close stays recorded, and happens if the ' +
+      '"test" server registers this channel at a time this host may open and close its channels. If you need it, ask ' +
+      'whoever runs this host.', `close ${attempt}`);
+    assert.equal(f.registry.getDesiredState('test', 'x'), 'closed', `close ${attempt}`);
+  }
+  assert.deepEqual(f.calls, []);
+});
+
+test('traffic in a tuned-out channel only a push has registered shows it open, whether or not this host directs its lifecycle, so a decline leaves the tune-out', async () => {
+  for (const directs of [true, false]) {
+    const f = fixture();
+    f.actual.set('x', true);
+    if (!directs) f.setGrant(ALL_CAPABILITY_PATHS.filter((path) => path !== 'channels.lifecycle'));
+    f.registry.ensureChannelRegistered('test', 'x', 'x');
+    f.registry.enterTuneOut('test', 'x', {
+      epochId: 'e1', cadenceSeconds: 60, backlogCap: 20, maxWakes: 3, startedAtSequence: 1,
+    }, 'agent-tool');
+    await f.registry.handleIncoming('test', { messages: [message()] });
+    // An entry made from a push has no target a retarget could have left
+    // behind, so its traffic shows the transport open even where this host
+    // directs the lifecycle.
+    assert.equal(f.isOpen(), true, `directs: ${directs}`);
+    const declined = await f.registry.handleChannelToolCall('channel_decline', { serverId: 'test', channelId: 'x', messageId: 'm1' });
+    assert.equal(declined.success, false, `directs: ${directs}`);
+    assert.equal(f.registry.getDesiredState('test', 'x'), 'tuned-out', `directs: ${directs}`);
+    assert.deepEqual(f.calls, [], `directs: ${directs}`);
+  }
+});
+
+test("a registration, over a push's entry or carrying the push's placeholder metadata, still waits for a receipt before its traffic shows it open", async () => {
+  for (const registration of ['over a push', 'with the placeholder key'] as const) {
+    const f = fixture();
+    f.actual.set('x', true);
+    f.held.add('x');
+    if (registration === 'over a push') f.registry.ensureChannelRegistered('test', 'x', 'x');
+    f.registry.enterTuneOut('test', 'x', {
+      epochId: 'e1', cadenceSeconds: 60, backlogCap: 20, maxWakes: 3, startedAtSequence: 1,
+    }, 'agent-tool');
+    // channels/register over the push's entry; channels/changed's added for
+    // the descriptor with the key.
+    const registering = registration === 'over a push'
+      ? f.registry.handleRegister('test', { channels: [descriptor('x', true)] })
+      : f.registry.handleChanged('test', { added: [{ ...descriptor('x', true), metadata: { lazyRegistered: true } }] });
+    await tick();
+    await f.registry.handleIncoming('test', { messages: [message()] });
+    assert.equal(f.isOpen(), false, `${registration}: its traffic is no receipt`);
+    f.held.delete('x');
+    await f.drain(registering);
+    assert.equal(f.isOpen(), true, `${registration}: the reconcile's receipt confirms it`);
+  }
+});
+
+test('an update that keeps the target of a channel only a push has registered leaves its traffic showing it open; one that gives it a target waits for a receipt', async () => {
+  for (const retarget of [false, true]) {
+    const f = fixture();
+    f.actual.set('x', true);
+    f.held.add('x');
+    f.registry.ensureChannelRegistered('test', 'x', 'x');
+    f.registry.enterTuneOut('test', 'x', {
+      epochId: 'e1', cadenceSeconds: 60, backlogCap: 20, maxWakes: 3, startedAtSequence: 1,
+    }, 'agent-tool');
+    // The push's entry has the server id as its type and no address.
+    const update: ChannelDescriptor = retarget
+      ? descriptor('x', false, 'B')
+      : { id: 'x', type: 'test', label: 'x, renamed', direction: 'bidirectional' };
+    const updating = f.registry.handleChanged('test', { updated: [update] });
+    await tick();
+    await f.registry.handleIncoming('test', { messages: [message()] });
+    assert.equal(f.isOpen(), !retarget, `retarget: ${retarget}`);
+    f.held.delete('x');
+    await f.drain(updating);
+    assert.equal(f.isOpen(), true, `retarget: ${retarget}`);
+  }
+});
+
+test("a transport's close withdraws what it confirmed for that server's channels only, so channel_open and channel_close ask the server again", async () => {
+  const f = fixture();
+  await f.registry.handleChanged('test', { added: [descriptor('x'), descriptor('z')] });
+  await f.registry.handleChanged('other', { added: [descriptor('y')] });
+  assert.equal(dataOf(await f.tool('open')).status, 'opened');
+  assert.equal(dataOf(await f.registry.handleChannelToolCall('channel_open', { serverId: 'other', channelId: 'y' })).status, 'opened');
+  f.calls.length = 0;
+  f.registry.transportClosed('test');
+  assert.equal(f.isOpen('x'), false, "x's open was the closed transport's");
+  assert.equal(f.isOpen('y'), true, "another server's channel keeps its confirmation");
+  assert.equal(f.registry.getDesiredState('test', 'x'), 'open', 'the decision stays');
+  assert.equal(f.registry.getChannelLabel('test', 'x'), 'x', 'the entry stays');
+  assert.equal(f.calls.length, 0, 'the close itself asks the server nothing');
+  assert.notEqual(dataOf(await f.tool('open')).status, 'already open');
+  // z's close was confirmed by a receipt from the closed transport, so it's unknown now too
+  assert.notEqual(dataOf(await f.registry.handleChannelToolCall('channel_close', { serverId: 'test', channelId: 'z' })).status, 'already closed');
+  assert.deepEqual(f.calls.map((c) => `${c.kind} ${c.id}`), ['open x', 'close z'], 'each asks the server');
+  assert.equal(f.isOpen('x'), true, 'the new receipt confirms x open');
+});
+
+test("a request in flight when the transport closes fails without undoing the close's withdrawal, and the next channel_close asks again", async () => {
+  const f = fixture();
+  await f.registry.handleChanged('test', { added: [descriptor()] });
+  assert.equal(dataOf(await f.tool('open')).status, 'opened');
+  f.held.add('x');
+  const closing = f.tool('close');
+  await tick();
+  assert.equal(f.pending.length, 1, 'the close is out on the transport');
+  f.registry.transportClosed('test');
+  // The connection's close rejects every request still out on the closed transport.
+  f.pending.shift()!.fail(new Error('the transport closed'));
+  await closing;
+  assert.equal(f.isOpen(), false, "the failure leaves the open flag where the transport's close put it");
+  f.held.delete('x');
+  f.calls.length = 0;
+  assert.notEqual(dataOf(await f.tool('close')).status, 'already closed');
+  assert.deepEqual(f.calls.map((c) => c.kind), ['close']);
+});
+
+test("where the host doesn't direct the lifecycle, a close withdraws what traffic confirmed: delivery is refused until the next transport's traffic confirms it", async () => {
+  const f = fixture();
+  f.setGrant(ALL_CAPABILITY_PATHS.filter((path) => path !== 'channels.lifecycle'));
+  await f.registry.handleChanged('test', { added: [descriptor()] });
+  await f.registry.handleIncoming('test', { messages: [message()] });
+  assert.equal(f.isOpen(), true, 'its traffic showed it open');
+  f.registry.transportClosed('test');
+  assert.equal(f.isOpen(), false);
+  f.calls.length = 0;
+  const outcome = await f.registry.publish('resident', 'words', { serverId: 'test', channelId: 'x' });
+  assert.equal(outcome.status, 'failed');
+  assert.match(String(outcome.reason), /isn't permitted to open or close the "test" server's channels/, 'refused because the host may not open it');
+  assert.deepEqual(f.calls, [], 'nothing is sent to open it');
+  assert.deepEqual(f.publishedWhileOpen, []);
+  await f.registry.handleIncoming('test', { messages: [message('x', 'm2')] });
+  assert.equal(f.isOpen(), true, "the next transport's traffic shows it open again");
+});
+
+test('traffic that arrives before a close and is admitted after it is still admitted, and marks nothing open: a coalesced message held across it, and a sibling behind it', async () => {
+  const admits: Array<() => void> = [];
+  const f = fixture(undefined, undefined, async (_serverId, held) => {
+    await new Promise<void>((resolve) => { admits.push(resolve); });
+    return { messageId: held.messageId, accepted: true };
+  });
+  await f.registry.handleChanged('test', { added: [descriptor('x', true), descriptor('y', true)] });
+  await f.registry.handleChanged('other', { added: [descriptor('z')] });
+  // An earlier drop, and the channels opened again on the next transport.
+  f.registry.transportClosed('test');
+  for (const id of ['x', 'y']) {
+    assert.equal((await f.registry.handleChannelToolCall('channel_open', { serverId: 'test', channelId: id })).success, true);
+    assert.equal(f.isOpen(id), true, `${id} is confirmed open again`);
+  }
+  assert.equal(f.isOpen('z'), false, "the other server's z is confirmed closed");
+  const answered: unknown[] = [];
+  const incoming = f.registry.handleIncoming('test', {
+    messages: [{ ...message('x', 'm1'), coalesce: { key: 'subject' } }, message('y', 'm1')],
+  }, { respond: (result) => { answered.push(result); } });
+  const elsewhere = f.registry.handleIncoming('other', { messages: [{ ...message('z', 'm1'), coalesce: { key: 'subject' } }] });
+  await tick();
+  assert.equal(admits.length, 2, 'both coalesced messages wait on the coalescer');
+  f.registry.transportClosed('test');
+  // The close leaves the connection's grant empty until the next
+  // transport's, so this host now reads as one that doesn't direct the
+  // lifecycle: where traffic alone would mark a channel open.
+  f.setGrant(ALL_CAPABILITY_PATHS.filter((path) => path !== 'channels.lifecycle'));
+  for (const admit of admits) admit();
+  await Promise.all([incoming, elsewhere]);
+  assert.equal(f.isOpen('x'), false, "the held message's admission doesn't confirm x");
+  assert.equal(f.isOpen('y'), false, 'nor does the sibling admitted behind it confirm y');
+  assert.deepEqual(answered, [{ results: [{ messageId: 'm1', accepted: true }, { messageId: 'm1', accepted: true }] }], 'both are still admitted');
+  assert.equal(f.isOpen('z'), true, "the other server's traffic, under way across that close, still shows z open");
+  // The next transport's grant: x is unconfirmed, not confirmed closed.
+  f.setGrant(ALL_CAPABILITY_PATHS);
+  f.calls.length = 0;
+  assert.notEqual(dataOf(await f.registry.handleChannelToolCall('channel_close', { serverId: 'test', channelId: 'x' })).status, 'already closed');
+  assert.deepEqual(f.calls.map((c) => `${c.kind} ${c.id}`), ['close x']);
+});
+
+test("an untargeted push entry, where the host directs the lifecycle, is confirmed by the next transport's traffic, but not by traffic held across the close", async () => {
+  const admits: Array<() => void> = [];
+  const f = fixture(undefined, undefined, async (_serverId, held) => {
+    await new Promise<void>((resolve) => { admits.push(resolve); });
+    return { messageId: held.messageId, accepted: true };
+  });
+  f.registry.ensureChannelRegistered('test', 'dm', 'DM with someone');
+  f.registry.enterTuneOut('test', 'dm', {
+    epochId: 'e1', cadenceSeconds: 60, backlogCap: 20, maxWakes: 3, startedAtSequence: 1,
+  }, 'agent-tool');
+  await f.registry.handleIncoming('test', { messages: [message('dm', 'm0')] });
+  assert.equal(f.isOpen('dm'), true, 'its traffic shows it open');
+  const held = f.registry.handleIncoming('test', { messages: [{ ...message('dm', 'm1'), coalesce: { key: 'subject' } }] });
+  await tick();
+  f.registry.transportClosed('test');
+  assert.equal(f.isOpen('dm'), false);
+  // The next transport's grant, which directs the lifecycle again, has
+  // arrived before the held message is admitted.
+  admits.shift()!();
+  await held;
+  assert.equal(f.isOpen('dm'), false, "the closed transport's traffic doesn't confirm it");
+  await f.registry.handleIncoming('test', { messages: [message('dm', 'm2')] });
+  assert.equal(f.isOpen('dm'), true, "the next transport's traffic does");
+});
+
+test("a lifecycle receipt from before a transport's close confirms nothing: on the closed connection the open is refused as unreachable, and the decision stays", async () => {
+  const f = fixture();
+  await f.registry.handleChanged('test', { added: [descriptor()] });
+  f.held.add('x');
+  const opening = f.tool('open');
+  await tick();
+  assert.equal(f.pending.length, 1, 'the open is out on the transport');
+  // The connection closes as a real one does: its grant is emptied and it
+  // reads as down before the registry hears of the close.
+  const server = (f.registry as unknown as { serverRegistry: { getServer(id: string): Record<string, unknown> } })
+    .serverRegistry.getServer('test');
+  f.setGrant([]);
+  Object.assign(server, { isConnected: false, willReconnect: true });
+  f.registry.transportClosed('test');
+  // Its answer was read before the close, and is applied after it.
+  f.pending.shift()!.finish();
+  const result = await opening;
+  assert.equal(f.isOpen(), false, "the closed transport's receipt confirms nothing");
+  assert.equal(result.success, false);
+  assert.match(String(result.error), /isn't connected/, 'the agent is told the server is down');
+  assert.equal(f.calls.filter((c) => c.kind === 'open').length, 1, 'nothing more is sent on the closed connection');
+  assert.equal(f.registry.getDesiredState('test', 'x'), 'open', 'the decision stays recorded');
 });

@@ -8,8 +8,10 @@
  * the file behind the link, a write created or overwrote one there, and a
  * sync took its bytes in. A link among the parents that leads out of the
  * mount was refused before as well, and now gets the link's own answer. The
- * refusal names the link and where it leads, and only for a link to a
- * directory inside the mount does it offer a way out. A mount that follows
+ * refusal names the link, and where it leads only where a tool could name
+ * that: on a mount with an include, nothing of where a link the include
+ * leaves out leads, and no target the include leaves out. Only for a link to
+ * a directory inside the mount does it offer a way out. A mount that follows
  * links keeps following an inside one, and a root that is itself a link is
  * still the root.
  */
@@ -752,7 +754,7 @@ describe('a deletion whose evidence holds no agreed disk copy', () => {
 });
 
 describe('a mount root that is itself a symlink', () => {
-  test('is the root, also where a path names it on its way back into the mount', async (t) => {
+  test('is the root, and a path that climbs out of it and back in through its link is refused as a climb', async (t) => {
     const holder = mkdtempSync(join(tmpdir(), 'af-ws-parent-link-root-'));
     t.after(() => rmSync(holder, { recursive: true, force: true }));
     mkdirSync(join(holder, 'real'));
@@ -761,7 +763,10 @@ describe('a mount root that is itself a symlink', () => {
     env.writeDisk('d/x.txt', 'v1\n');
     const m = await env.open(t);
     assert.equal((await m.readFileFromDisk('work/d/x.txt')).bytes.toString(), 'v1\n');
-    assert.equal((await m.readFileFromDisk('work/../m/d/x.txt')).bytes.toString(), 'v1\n');
+    // A path that climbs out of the root and back in by the root's own link
+    // is refused before anything is looked up: a `..` above the root climbs
+    // above it whatever it reaches afterwards.
+    await assert.rejects(m.readFileFromDisk('work/../m/d/x.txt'), /climbs above the root of mount "work"/);
     assert.equal((await call(m, 'read', { path: 'work/d/x.txt' })).content.includes('v1'), true);
   });
 });

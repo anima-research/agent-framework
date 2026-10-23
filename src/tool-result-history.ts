@@ -9,12 +9,14 @@
  * `maxChars` slice and re-introduces, one turn deferred, exactly the silent
  * hallucination this feature exists to kill.
  *
- * For MCP-shaped content arrays, this helper keeps text blocks verbatim and
+ * For MCP-shaped content arrays, this helper keeps text blocks verbatim,
+ * apart from a lone UTF-16 surrogate, which becomes U+FFFD (#695), and
  * replaces image blocks with a short `[image: mimeType, ~NKB]` placeholder.
- * For anything else it falls back to JSON, written by RFC-005's rules at
- * every depth (historyJson): a reference is shown as its stub wherever it
- * sits in the data, so its uri never reaches history, and inline data that
- * claims a uri or a disposition is withheld.
+ * A string is already text and is kept as it is. For anything else it falls
+ * back to JSON, written by RFC-005's rules at every depth (historyJson): a
+ * reference is shown as its stub wherever it sits in the data, so its uri
+ * never reaches history, and inline data that claims a uri or a disposition
+ * is withheld.
  */
 
 import { INLINE_WITHHELD_TEXT, isInlineContradiction, referenceStubOrNull } from './mcpl/references.js';
@@ -49,7 +51,7 @@ export interface HistorySerializeOptions {
 
 /**
  * House-safe default inline cap (chars) for tool results, error results, and
- * background-script wake payloads (issue #89: a resident should never eat a
+ * script wake payloads (issue #89: a resident should never eat a
  * 42k blob they didn't ask for). Durable per-residence value comes from
  * `FrameworkConfig.toolResultInlineMaxChars`; a per-agent value from
  * agent_settings `tool_result_inline_max_chars`.
@@ -72,9 +74,19 @@ export function toolResultDataToHistoryString(
   options?: HistorySerializeOptions,
 ): string {
   const fromArray = tryHistoryStringFromContentArray(data, options);
+  // A string is the text the tool means to say, kept as it is: JSON would
+  // quote it and escape every newline, so a multi-line result would reach
+  // the model, a script and its spill file as one escaped line. Kept well
+  // formed: a lone UTF-16 surrogate, which JSON escaped, isn't text, a
+  // provider can refuse a request that carries one, and UTF-8 can't store
+  // it in a spill file, so it reads as U+FFFD.
   // JSON leaves out undefined, a function and a symbol: a result with no data
   // is stored as no text, as an empty content array is.
-  const str = fromArray ?? historyJson(data) ?? '';
+  // RFC-005 shows only objects otherwise (shownInHistory), so a string has
+  // nothing for historyJson to stub or withhold.
+  const str = fromArray
+    ?? (typeof data === 'string' ? data.toWellFormed() : historyJson(data))
+    ?? '';
   return maxChars ? truncateForHistory(str, maxChars) : str;
 }
 
@@ -86,6 +98,14 @@ export function toolResultDataToHistoryString(
  *
  * Each field is read once: the direct Agent API passes its caller's own
  * result here, unchecked, and a getter needn't answer the same way twice.
+ *
+ * Each text a tool result's copies carry is made well formed where it's
+ * taken from the result: a lone UTF-16 surrogate becomes U+FFFD, as the
+ * context store makes it when it writes, so the copy sent to membrane and the
+ * copy stored carry the same text (#695). Other data goes through JSON,
+ * which escapes a lone half. toWellFormed() keeps the length,
+ * so the cut, the spans and the slots are computed from the well-formed text
+ * as before; a cut at a lone high half no longer steps back over it.
  */
 export function nonErrorResultText(
   result: { data?: unknown; error?: string },
@@ -95,13 +115,17 @@ export function nonErrorResultText(
   const data = result.data;
   if (data === undefined || data === null) {
     const error = result.error;
-    if (typeof error === 'string' && error) return maxChars ? truncateForHistory(error, maxChars) : error;
+    if (typeof error === 'string' && error) {
+      const text = error.toWellFormed();
+      return maxChars ? truncateForHistory(text, maxChars) : text;
+    }
   }
   return toolResultDataToHistoryString(data, maxChars, options);
 }
 
 /** Bounded copy of an arbitrary string with the standard truncation notice,
- *  cut at the cap as a tool result's stored copy is (toolResultCutAt), so it
+ *  cut at the cap where a tool result's stored copy is cut at that cap
+ *  (toolResultCutAt), so it
  *  never ends in part of a slot. Each of its callers' readers sees this
  *  very text, never the images behind a placeholder, so nothing past the cut
  *  is kept for save_recent_image's index (#403). The framework stores a tool
@@ -127,7 +151,9 @@ function tryHistoryStringFromContentArray(data: unknown, options?: HistorySerial
     if (b.type === 'text') {
       // A text that isn't a string shows as the converters' placeholder,
       // rather than sending the whole array to the JSON fallback.
-      parts.push({ kind: 'text', text: typeof b.text === 'string' ? b.text : NON_STRING_TEXT_PLACEHOLDER });
+      // Read once: a direct Agent API result is unchecked.
+      const text = b.text;
+      parts.push({ kind: 'text', text: typeof text === 'string' ? text.toWellFormed() : NON_STRING_TEXT_PLACEHOLDER });
     } else if (isInlineContradiction(b)) {
       // RFC-005 vector 2: checked before the data branch so inline data
       // claiming bulk disposition is withheld, not rendered.

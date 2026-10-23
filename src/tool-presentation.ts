@@ -85,7 +85,8 @@ function quotedList(names: string[], conjunction: 'and' | 'or' = 'and', quote: (
 
 /**
  * Every problem that keeps a document from being used, each by where it is;
- * none for a usable one. A defaults file (`descriptionsOnly`) may set
+ * none for a usable one. An object with no keys never reaches this:
+ * parseDocument() reads it as the empty document first. A defaults file (`descriptionsOnly`) may set
  * descriptions only, since visibility is the resident's to choose.
  */
 function documentProblems(doc: unknown, descriptionsOnly: boolean): string[] {
@@ -125,6 +126,12 @@ function parseDocument(raw: string, descriptionsOnly: boolean): PresentationDocu
   let doc: unknown;
   try { doc = JSON.parse(raw); }
   catch (error) { throw new PresentationFileError([`it isn't valid JSON: ${errorMessage(error)}`]); }
+  // An object with no keys carries no settings, so it's the empty document,
+  // as a missing resident file is: it's what an operator writes by hand to
+  // start one. A missing defaults file is still reported, by read().
+  // A 0-byte file isn't JSON and still refuses, since the store's
+  // temp-and-rename never writes one: that's what a lost file looks like.
+  if (doc && typeof doc === 'object' && !Array.isArray(doc) && Object.keys(doc).length === 0) return { version: 1, tools: {} };
   const problems = documentProblems(doc, descriptionsOnly);
   if (problems.length) throw new PresentationFileError(problems);
   return doc as PresentationDocument;

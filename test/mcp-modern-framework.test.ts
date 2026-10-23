@@ -10,14 +10,16 @@
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, readFileSync, existsSync, rmSync } from 'node:fs';
+import { mkdtempSync, readFileSync, existsSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { AgentFramework, WorkspaceModule } from '../src/index.js';
-import type { EventResponse, Module, ModuleContext, ProcessEvent, ProcessState, ScriptToolResult, ToolDefinition, ToolResult } from '../src/index.js';
+import type { EventResponse, Module, ModuleContext, ProcessEvent, ProcessState, ToolDefinition, ToolResult } from '../src/index.js';
 import { MockMembrane, createMockResponse } from './helpers/mock-membrane.js';
+import { answerText, scriptCall } from './helpers/script-call.js';
+import { schedulerPasses } from './helpers/scheduler-passes.js';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const MODERN = join(here, 'fixtures', 'modern-mcp-server.mjs');
@@ -154,43 +156,54 @@ test('model path: the result reaches the model, structured-only as JSON', async 
     membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Done.' }]));
     framework.pushEvent({ type: 'external-message', source: 'test', content: 'go', metadata: {} } as never);
     await waitFor('the tool round', () => (membrane.lastStream?.receivedToolResults.length ?? 0) >= 1);
-    // The framework renders string data JSON-encoded, as it does for every
-    // string tool result; decoded, it is the structured value's JSON.
+    // The result's data is the structured value's JSON, a string, which
+    // reaches the model as that text.
     const [delivered] = membrane.lastStream!.receivedToolResults[0] as Array<{ content: string }>;
-    assert.deepEqual(JSON.parse(JSON.parse(delivered!.content)), { answer: 42, ok: false, nothing: null });
+    assert.deepEqual(JSON.parse(delivered!.content), { answer: 42, ok: false, nothing: null });
   });
 });
 
-/** A script's result with its JSON string parsed, to compare whole. */
-const parsedText = (result: ScriptToolResult) => ({ ...result, text: JSON.parse(result.text) as unknown });
+/** The JSON a script's call gets, parsed: { content, structuredContent, isError }. */
+const scriptHandle = (framework: AgentFramework) => async (agent: string, tool: string, args: Record<string, unknown>) => {
+  const answer = await (framework as unknown as {
+    scriptToolCall: (agent: string, tool: string, argsJson: string, context: object) => Promise<{ ok: boolean; json: string; isError?: boolean }>;
+  }).scriptToolCall(agent, tool, JSON.stringify(args), {});
+  return { ok: answer.ok, isError: answer.isError === true, value: JSON.parse(answer.json) as unknown };
+};
 
-test('scripts get structured results whole, as one JSON object', async () => {
+const sizedObject = (pad: number, isError = false) => ({
+  // A tool error with no text reads as the framework's own error text, as
+  // the model's dispatch words it.
+  content: isError
+    ? [{
+        type: 'text',
+        text: 'The "modern" server reported an error for mcpl--modern--sized without saying what went wrong. ' +
+          'Whether it did anything is unknown: check before calling it again.',
+      }]
+    : [],
+  structuredContent: { pad: 'x'.repeat(pad) },
+  isError,
+});
+
+test('scripts get every result in one shape, structured results whole', async () => {
   await withModern(async ({ framework }) => {
     framework.start();
-    const handle = (framework as unknown as {
-      handleScriptToolCall: (agent: string, tool: string, args: Record<string, unknown>) => Promise<ScriptToolResult>;
-    }).handleScriptToolCall.bind(framework);
-    // Beside the string: isError, which the script reads as .is_error, and
-    // structuredJson, which has it read .structured from the string.
-    assert.deepEqual(parsedText(await handle('agent', 'mcpl--modern--structured_and_text', {})), {
-      text: {
+    const handle = scriptHandle(framework);
+    // Beside the object: isError, which the runner records the call by.
+    assert.deepEqual(await handle('agent', 'mcpl--modern--structured_and_text', {}), {
+      ok: true,
+      isError: false,
+      value: {
         content: [{ type: 'text', text: 'Found 2 rows.' }],
         structuredContent: { rows: [{ id: 1 }, { id: 2 }] },
         isError: false,
       },
-      isError: false,
-      structuredJson: true,
     });
-    // A structured tool error is flagged as one beside its string.
-    assert.deepEqual(parsedText(await handle('agent', 'mcpl--modern--sized', { pad: 1, isError: true })), {
-      text: sizedObject(1, true),
-      isError: true,
-      structuredJson: true,
-    });
+    // A structured tool error is flagged as one, its text in content.
+    assert.deepEqual(await handle('agent', 'mcpl--modern--sized', { pad: 1, isError: true }), { ok: true, isError: true, value: sizedObject(1, true) });
     // Image plus scores: both views reach the script whole, the image's
     // payload included (no placeholder stands in for it).
-    const scored = JSON.parse((await handle('agent', 'mcpl--modern--scored_image', {})).text);
-    assert.deepEqual(scored, {
+    assert.deepEqual((await handle('agent', 'mcpl--modern--scored_image', {})).value, {
       content: [{ type: 'image', data: 'iVBORw0KGgo=', mimeType: 'image/png' }],
       structuredContent: { score: 0.9, label: 'cat' },
       isError: false,
@@ -198,8 +211,7 @@ test('scripts get structured results whole, as one JSON object', async () => {
     // A resource link, embedded resources and audio are ordinary MCP blocks
     // from a modern server, not RFC-005 references: the script reads them as
     // the server sent them.
-    const media = JSON.parse((await handle('agent', 'mcpl--modern--structured_media', {})).text);
-    assert.deepEqual(media, {
+    assert.deepEqual((await handle('agent', 'mcpl--modern--structured_media', {})).value, {
       content: [
         { type: 'text', text: 'before' },
         { type: 'resource_link', uri: 'file:///srv/report.pdf', name: 'report.pdf', mimeType: 'application/pdf' },
@@ -211,32 +223,22 @@ test('scripts get structured results whole, as one JSON object', async () => {
       structuredContent: { blocks: 6 },
       isError: false,
     });
-    // Without structured content the script contract is unchanged (pinned):
-    // the history rendering, which JSON-encodes a text result. No
-    // structuredJson, so the script's .structured is None.
-    assert.deepEqual(await handle('agent', 'mcpl--modern--echo', { text: 'x' }), { text: JSON.stringify('echo:x'), isError: false });
+    // Without structured content, content is the model's text: the history
+    // rendering, which for a text result is that text. structuredContent is null.
+    assert.deepEqual(await handle('agent', 'mcpl--modern--echo', { text: 'x' }), {
+      ok: true,
+      isError: false,
+      value: { content: [{ type: 'text', text: 'echo:x' }], structuredContent: null, isError: false },
+    });
   });
 });
 
-// The script cap measures the serialized object's length: `sized` pads
-// structuredContent so that length is exact.
-const SCRIPT_CAP = 5_000_000;
-const sizedObject = (pad: number, isError = false) => ({
-  content: [],
-  structuredContent: { pad: 'x'.repeat(pad) },
-  isError,
-  // A tool error with no text carries the framework's own error text, as
-  // the model's dispatch words it.
-  ...(isError ? {
-    error: 'The "modern" server reported an error for mcpl--modern--sized without saying what went wrong. ' +
-      'Whether it did anything is unknown: check before calling it again.',
-  } : {}),
-});
-/** The pad that makes the script's JSON exactly `chars` long. */
-const padFor = (chars: number, isError = false) => chars - JSON.stringify(sizedObject(0, isError)).length;
-const scriptHandle = (framework: AgentFramework) => (framework as unknown as {
-  handleScriptToolCall: (agent: string, tool: string, args: Record<string, unknown>) => Promise<ScriptToolResult>;
-}).handleScriptToolCall.bind(framework);
+/** A saved file's bytes, read back through the workspace as a resident would. */
+async function readSaved(workspace: WorkspaceModule, path: string): Promise<string> {
+  const read = await workspace.readBinary(path);
+  assert.ok('data' in read, `readable: ${path} (${'error' in read ? read.error : ''})`);
+  return read.data.toString('utf8');
+}
 
 async function withWorkspace(fn: (h: Harness & { workspace: WorkspaceModule }) => Promise<void>): Promise<void> {
   const board = mkdtempSync(join(tmpdir(), 'modern-board-'));
@@ -252,65 +254,19 @@ async function withWorkspace(fn: (h: Harness & { workspace: WorkspaceModule }) =
   }
 }
 
-/** A saved file's bytes, read back through the workspace as a resident would. */
-async function readSaved(workspace: WorkspaceModule, path: string): Promise<string> {
-  const read = await workspace.readBinary(path);
-  assert.ok('data' in read, `readable: ${path} (${'error' in read ? read.error : ''})`);
-  return read.data.toString('utf8');
-}
-
-async function savedObject(workspace: WorkspaceModule, savedTo: string): Promise<unknown> {
-  assert.match(savedTo, /^board\/tool-results\/\d{4}-\d{2}-\d{2}-script-[0-9a-f-]{36}\.json$/);
-  return JSON.parse(await readSaved(workspace, savedTo));
-}
-
-test('script results: exactly at the cap arrive inline; one past it are saved whole, a tool error included', async () => {
+test("a script's result past main's old 5 MB cap reaches it whole, and nothing is saved to the workspace", async () => {
   await withWorkspace(async ({ framework, workspace }) => {
     framework.start();
-    const handle = scriptHandle(framework);
-
-    const at = await handle('agent', 'mcpl--modern--sized', { pad: padFor(SCRIPT_CAP) });
-    assert.equal(at.text.length, SCRIPT_CAP);
-    assert.deepEqual(parsedText(at), { text: sizedObject(padFor(SCRIPT_CAP)), isError: false, structuredJson: true });
-
-    // Past the cap the string holds where the object went, and is still
-    // marked as a structured result's object: .structured reads none from it.
-    const overResult = await handle('agent', 'mcpl--modern--sized', { pad: padFor(SCRIPT_CAP + 1) });
-    assert.deepEqual({ isError: overResult.isError, structuredJson: overResult.structuredJson }, { isError: false, structuredJson: true });
-    const over = JSON.parse(overResult.text);
-    assert.deepEqual(Object.keys(over).sort(), ['isError', 'oversized']);
-    assert.equal(over.isError, false);
-    assert.equal(over.oversized.chars, SCRIPT_CAP + 1);
-    assert.deepEqual(await savedObject(workspace, over.oversized.savedTo), sizedObject(padFor(SCRIPT_CAP + 1)), 'the whole object, recoverable');
-
-    const failedResult = await handle('agent', 'mcpl--modern--sized', { pad: padFor(SCRIPT_CAP + 1, true), isError: true });
-    assert.equal(failedResult.isError, true, 'flagged beside the string too');
-    const failed = JSON.parse(failedResult.text);
-    assert.equal(failed.isError, true, 'a tool error stays visible without reading the file');
-    assert.equal(failed.oversized.chars, SCRIPT_CAP + 1);
-    assert.notEqual(failed.oversized.savedTo, over.oversized.savedTo);
-    assert.deepEqual(await savedObject(workspace, failed.oversized.savedTo), sizedObject(padFor(SCRIPT_CAP + 1, true), true));
-  });
-});
-
-test('script results past the cap: no workspace, or a failed write, is a failure to deliver, never a success', async () => {
-  const assertUndelivered = (result: ScriptToolResult) => {
-    // Not delivered: flagged as an error beside a string that says the tool
-    // may already have completed.
-    assert.deepEqual({ isError: result.isError, structuredJson: result.structuredJson }, { isError: true, structuredJson: true });
-    const out = JSON.parse(result.text) as { isError: boolean; error: string; oversized: unknown };
-    assert.equal(out.isError, true);
-    assert.match(out.error, /exceeds the 5000000-char script result cap and could not be saved to the workspace, so it could not be delivered; the tool may already have completed/);
-    assert.deepEqual(out.oversized, { chars: SCRIPT_CAP + 1, savedTo: null });
-  };
-  await withModern(async ({ framework }) => {
-    framework.start();
-    assertUndelivered(await scriptHandle(framework)('agent', 'mcpl--modern--sized', { pad: padFor(SCRIPT_CAP + 1) }));
-  });
-  await withWorkspace(async ({ framework, workspace }) => {
-    framework.start();
-    workspace.writeBinary = async () => ({ success: false, error: 'disk full', isError: true });
-    assertUndelivered(await scriptHandle(framework)('agent', 'mcpl--modern--sized', { pad: padFor(SCRIPT_CAP + 1) }));
+    let writes = 0;
+    const write = workspace.writeBinary.bind(workspace);
+    workspace.writeBinary = async (...args: Parameters<typeof write>) => {
+      writes += 1;
+      return write(...args);
+    };
+    const pad = 5_000_001;
+    assert.deepEqual(await scriptHandle(framework)('agent', 'mcpl--modern--sized', { pad }), { ok: true, isError: false, value: sizedObject(pad) });
+    assert.deepEqual(await scriptHandle(framework)('agent', 'mcpl--modern--sized', { pad, isError: true }), { ok: true, isError: true, value: sizedObject(pad, true) });
+    assert.equal(writes, 0, 'no spill: a result too large for the script is refused as ResultTooLarge in the runner instead');
   });
 });
 
@@ -448,7 +404,7 @@ process.stdin.on('data', (c) => {
     const [delivered] = membrane.lastStream!.receivedToolResults[0] as Array<{ content: string; isError: boolean }>;
     assert.equal(delivered!.isError, false);
     // No server text block: the structured value is shown beside the stubs.
-    assert.equal(JSON.parse(delivered!.content),
+    assert.equal(delivered!.content,
       '[resource link "a.md": https://example.invalid/a.md; not fetched]\n[resource memo://n, text/plain]\nnote body\n{"count":2}');
     const status = framework.listMcplServers().find((s) => s.id === 'plain')!;
     assert.equal(status.family, 'legacy');
@@ -459,23 +415,30 @@ process.stdin.on('data', (c) => {
 test('quiesce: a modern call already in flight completes, and its result reaches the turn', async () => {
   await withModern(async ({ framework, membrane, dir }) => {
     framework.start();
+    // The call is held server-side until the test writes this file.
+    const release = join(dir, 'release-slow');
     membrane.pushResponse(createMockResponse([
-      { type: 'tool_use', id: 'toolu_01MODERNSLOW0000000000000', name: 'mcpl--modern--slow', input: { ms: 1500 } },
+      { type: 'tool_use', id: 'toolu_01MODERNSLOW0000000000000', name: 'mcpl--modern--slow', input: { release } },
     ] as never, 'tool_use'));
     membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Done.' }]));
     framework.pushEvent({ type: 'external-message', source: 'test', content: 'go', metadata: {} } as never);
     await waitFor('the slow call to start server-side', () => lines(join(dir, 'events.log')).includes('slow-start'));
 
-    // Quiesce begins while the call is provably still running server-side,
-    // so its resolving after 'slow-finished' shows it waited for the call.
-    const quiescing = framework.quiesce({ reason: 'maintenance', timeoutMs: 10_000 });
+    // Quiesce begins while the call is still running server-side, held there
+    // until it's released, so its resolving after 'slow-finished' shows it
+    // waited for the call. Its window is sized for a hang, not for the call.
+    let settled = false;
+    const quiescing = framework.quiesce({ reason: 'maintenance', timeoutMs: 60_000 }).finally(() => { settled = true; });
+    await waitFor('quiesce to begin', () => framework.getHostModeStatus().quiesced);
     assert.ok(!lines(join(dir, 'events.log')).includes('slow-finished'), 'the call is still in flight as quiesce begins');
+    assert.equal(settled, false, 'quiesce waits for the call in flight');
+    writeFileSync(release, '');
     const status = await quiescing;
     assert.equal(status.quiesced, true);
     assert.equal(status.drained, true, 'the turn drained: its modern call completed');
     assert.ok(lines(join(dir, 'events.log')).includes('slow-finished'));
     assert.ok(!lines(join(dir, 'events.log')).includes('slow-aborted'), 'quiesce did not cancel it');
-    assert.match(JSON.stringify(membrane.lastStream!.receivedToolResults[0]), /slept 1500/);
+    assert.match(JSON.stringify(membrane.lastStream!.receivedToolResults[0]), /released/);
     await framework.resume();
   });
 });
@@ -484,13 +447,15 @@ test('quiesce: a list change refreshes the inventory, and its wake parks until r
   await withModern(async ({ framework, membrane }) => {
     framework.start();
     await framework.quiesce({ reason: 'maintenance' });
+    const nextPass = schedulerPasses(framework, waitFor);
     const callsBefore = membrane.calls.length;
     const gatedBefore = framework.getHostModeStatus().gatedRequests;
 
     await framework.executeToolCall(call('mcpl--modern--add_tool'));
     await waitFor('the refreshed inventory', () => framework.getAllTools().some((t) => t.name === 'mcpl--modern--added_1'));
     await waitFor('the wake to park', () => framework.getHostModeStatus().gatedRequests > gatedBefore);
-    await new Promise((r) => setTimeout(r, 200));
+    // A pass over the parked wake, which would have started its turn.
+    await nextPass();
     assert.equal(membrane.calls.length, callsBefore, 'no inference while quiesced');
 
     await framework.resume();
@@ -502,14 +467,28 @@ test('quiesce: a lost modern child reconnects and relists without starting a tur
   await withModern(async ({ framework, membrane, dir }) => {
     framework.start();
     await framework.quiesce({ reason: 'maintenance' });
+    const nextPass = schedulerPasses(framework, waitFor);
     const callsBefore = membrane.calls.length;
     const gatedBefore = framework.getHostModeStatus().gatedRequests;
+    const internals = framework as unknown as {
+      mcplToolsRefreshStarted: number;
+      mcplToolRefreshInFlight: boolean;
+      queue: { depth: number };
+    };
+    const refreshesBefore = internals.mcplToolsRefreshStarted;
 
     await framework.executeToolCall(call('mcpl--modern--die'));
     await waitFor('a second launch', () => lines(join(dir, 'starts.log')).length === 2);
     await waitFor('reconnected', () => framework.listMcplServers()[0]!.connected);
-    await waitFor('the relisted inventory', () => framework.getAllTools().some((t) => t.name === 'mcpl--modern--echo'));
-    await new Promise((r) => setTimeout(r, 200));
+    // The reconnect starts a relist. Once one started after the child died
+    // has settled, any wake it queued is in the event queue; once the queue
+    // is empty, the loop has taken that event, and the next pass sees its
+    // request.
+    await waitFor('the reconnect\'s relist to settle', () =>
+      internals.mcplToolsRefreshStarted > refreshesBefore && !internals.mcplToolRefreshInFlight);
+    await waitFor('the event queue to drain', () => internals.queue.depth === 0);
+    await nextPass();
+    assert.ok(framework.getAllTools().some((t) => t.name === 'mcpl--modern--echo'), 'the relisted inventory');
 
     assert.equal(membrane.calls.length, callsBefore, 'no turn started');
     assert.equal(framework.getHostModeStatus().gatedRequests, gatedBefore, 'no wake parked: the inventory is unchanged');
@@ -539,13 +518,12 @@ test("the framework owns a modern connect in flight: a second connect is refused
     assert.equal(during.error, 'This host is connecting to the "hang" server that provides mcpl--hang--echo, so the call didn\'t run. Try again in a moment.');
     assert.equal(lines(log).filter((l) => l.includes('tools/call')).length, 0, 'nothing reached the server');
     const pid = (JSON.parse(lines(log)[0]!) as { pid: number }).pid;
-    // stop() ends the connect in flight rather than waiting for its handshake.
-    const stopping = Date.now();
+    // stop() ends the connect in flight rather than waiting for its handshake:
+    // the connect fails in the stop's words, not its handshake's timeout's.
     await framework.stop();
-    assert.ok(Date.now() - stopping < 10_000, `stop() took ${Date.now() - stopping} ms, as if it waited out the connect`);
+    await assert.rejects(pending, /^Error: MCP server "hang" was not connected: the framework stopped while it was connecting$/);
     const alive = (p: number) => { try { process.kill(p, 0); return true; } catch { return false; } };
     assert.equal(alive(pid), false, 'the launch in flight was reaped by stop()');
-    await pending.catch(() => {});
     assert.ok(!framework.listMcplServers().some((s) => s.id === 'hang' && s.connected), 'nothing installed after stop');
     // A connect that arrives after stop() is refused before anything spawns.
     const before = lines(log).length;
@@ -597,4 +575,30 @@ test("a modern tool's error result is traced as tool:failed, not tool:completed"
     assert.equal(outcome.type, 'tool:failed');
     assert.match(outcome.error ?? '', /the tool failed on purpose/);
   }, [], [watcher]);
+});
+
+test("a call whose request couldn't be written is a failure saying it wasn't sent, on the direct path and the dispatch path", async () => {
+  // The raw server's tool advertises an outputSchema the SDK can't compile, so
+  // the SDK rejects the call before sending it (McplRequestError, not-sent).
+  // The call had opened (RFC-007), so it's no refusal (ToolResult.refused).
+  const RAW = join(here, 'fixtures', 'modern-raw-server.mjs');
+  const log = join(mkdtempSync(join(tmpdir(), 'modern-raw-')), 'raw.jsonl');
+  await withModern(async ({ framework }) => {
+    await waitFor('the raw server\'s tool', () => framework.getAllTools().some((t) => t.name === 'mcpl--raw--op'));
+    const direct = await framework.executeToolCall(call('mcpl--raw--op'));
+    assert.equal(direct.refused, undefined, JSON.stringify(direct));
+    assert.equal(direct.isError, true);
+    // The words for a request that couldn't be written, not those for a closed connection's.
+    assert.match(direct.error ?? '', /The request wasn't sent: this host couldn't send it to/);
+    const pending = scriptCall(framework, 'agent', 'mcpl--raw--op');
+    const processing = setInterval(() => { void framework.runUntilIdle(); }, 5);
+    try {
+      const dispatched = await pending;
+      assert.equal(dispatched.refused, false, JSON.stringify(dispatched));
+      assert.equal(dispatched.refused ? null : dispatched.isError, true);
+      assert.match(answerText(dispatched), /The request wasn't sent: this host couldn't send it to/);
+    } finally {
+      clearInterval(processing);
+    }
+  }, [{ id: 'raw', command: process.execPath, args: [RAW, 'invalid-schema', log], protocol: 'modern' }]);
 });

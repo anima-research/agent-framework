@@ -629,6 +629,10 @@ test('a render result is delivered only when the converters show each block as i
     { block: { type: 'image', uri: 'https://example.invalid/i.png' }, delivered: true },
     { block: { type: 'audio', data: 'AAAA', mimeType: 'audio/wav' }, delivered: true },
     { block: { type: 'audio', uri: 'https://example.invalid/a.wav', disposition: 'ref' }, delivered: true },
+    // Any disposition given makes a uri-form block a reference, a falsy one
+    // included, so it shows as a stub.
+    { block: { type: 'audio', uri: 'https://example.invalid/a.wav', disposition: false }, delivered: true },
+    { block: { type: 'image', uri: 'https://example.invalid/i.png', disposition: '' }, delivered: true },
     { block: { type: 'resource', uri: 'https://example.invalid/doc' }, delivered: true },
     // Each of these converts to a placeholder, so the occurrence's own
     // content is delivered instead.
@@ -640,6 +644,7 @@ test('a render result is delivered only when the converters show each block as i
     { block: { type: 'resource', uri: '' }, delivered: false },
     { block: { type: 'resource', uri: `https://example.invalid/${'x'.repeat(4096)}` }, delivered: false },
     { block: { type: 'audio', uri: `https://example.invalid/${'x'.repeat(4096)}`, disposition: 'ref' }, delivered: false },
+    { block: { type: 'image', uri: `https://example.invalid/${'x'.repeat(4096)}`, disposition: 0 }, delivered: false },
     { block: { type: 'image', uri: '' }, delivered: false },
     { block: { type: 'video', data: 'AAAA', mimeType: 'video/mp4' }, delivered: false },
   ];

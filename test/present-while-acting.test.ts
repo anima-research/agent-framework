@@ -13,7 +13,11 @@
  * the tool-result boundary AND injected into the live stream via
  * provideToolResults(results, { injectedMessages }) (membrane ≥0.5.72), so
  * the next round of the SAME turn sees them instead of the agent staying
- * deaf until the turn ends.
+ * deaf until the turn ends. (A message a tune-out holds from the residents
+ * is stored there but not injected: module-rows-held-from-residents.) That
+ * holds on a stream that can carry them, as membrane 0.6.0's native tool path
+ * declares; on its XML tool path, which declares it can't, they wait for the
+ * turn's end.
  */
 
 import { describe, it, beforeEach, afterEach } from 'node:test';
@@ -114,10 +118,10 @@ class RobotModule implements Module {
             ? { channelId: this.interjectionChannelId }
             : {}),
       } as unknown as ProcessEvent);
-      // Give the run loop a beat to process the queued message while this
-      // tool round is still pending (pendingAssistantBlocks non-empty), so
-      // it lands in deferredMessages before the tool-result event.
-      await new Promise((r) => setTimeout(r, 30));
+      // The run loop takes this message while the tool round is still
+      // pending (pendingAssistantBlocks non-empty), so it lands among the
+      // deferred messages: it's queued here, before this call returns, and
+      // the round's result is queued only after the call returns.
     }
     return { success: true, data: { ok: true, tool: call.name } };
   }
@@ -351,6 +355,34 @@ describe('present while acting', () => {
     assert.deepEqual(routed, [
       { text: 'Yes, I want to try the VR space.', locus: 'chan-live-1' },
     ]);
+
+    await framework.stop();
+  });
+
+  it("injects a re-pin notice with its channel's id as the store keeps it, a lone surrogate as U+FFFD", async () => {
+    // The notice is built from the channel's id as the server gave it, and
+    // stored, which mends it; the live round sends it as the store keeps it.
+    membrane.pushResponse(createMockResponse([
+      { type: 'tool_use', id: 'c1', name: 'robot--move', input: { dir: 'north' } },
+    ] as ContentBlock[], 'tool_use'));
+    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Answering.' }] as ContentBlock[]));
+
+    const framework = await createFramework();
+    stubChannelRegistry(framework);
+    module.toolDelayMs = 25;
+    module.interjection = 'hey, over here?';
+    module.interjectionMetadata = { channelId: 'discord:dm:an\ud83d', tags: ['chat:addressed'] };
+
+    trigger(framework);
+    await framework.runUntilIdle();
+
+    const wired = membrane.lastStream!.receivedToolResultOptions
+      .flatMap((o) => o?.injectedMessages ?? [])
+      .flatMap((m) => (m.content as Array<{ text?: string }>).map((b) => b.text ?? ''))
+      .filter((t) => t.includes('[routing]'));
+    assert.equal(wired.length, 1, 'the premise: the re-pin notice was injected');
+    assert.ok(wired[0]!.isWellFormed(), `the notice is well formed: ${JSON.stringify(wired[0])}`);
+    assert.ok(wired[0]!.includes('discord:dm:an\ufffd'), 'its channel id holds U+FFFD');
 
     await framework.stop();
   });
@@ -1450,6 +1482,72 @@ describe('present while acting', () => {
     await framework.stop();
   });
 
+  it("an addressed message a boundary leaves out of the injection doesn't re-pin the turn: the live stream heard only the notice of it", async () => {
+    // The control is the test above that re-pins: the same DM, injected,
+    // moves the trailing prose to the DM. The notice is a system line, which
+    // moves no locus.
+    membrane.pushResponse(createMockResponse([
+      { type: 'text', text: 'Station four, proceeding.' },
+      { type: 'tool_use', id: 'c1', name: 'robot--move', input: { dir: 'north' } },
+    ] as ContentBlock[], 'tool_use'));
+    membrane.pushResponse(createMockResponse([
+      { type: 'text', text: 'Carrying on where I was.' },
+    ] as ContentBlock[]));
+
+    const framework = await createFramework();
+    const routed = stubChannelRegistry(framework);
+    const cm = framework.getAgent('assistant')!.getContextManager();
+    let rendered = 0;
+    (cm as { renderAsNewest: unknown }).renderAsNewest = (ids: readonly string[]) => { rendered++; return ids.map(() => null); };
+    module.toolDelayMs = 25;
+    module.interjection = 'hey, quick question over here?';
+    module.interjectionMetadata = { channelId: 'discord:dm:antra', tags: ['chat:addressed'] };
+
+    trigger(framework);
+    await framework.runUntilIdle();
+
+    assert.equal(rendered, 1, 'the premise: the boundary rendered the DM, and left it out');
+    const injected = membrane.lastStream!.receivedToolResultOptions[0]?.injectedMessages ?? [];
+    assert.equal(injected.length, 1, 'only the notice of what was left out is injected');
+    assert.ok(JSON.stringify(injected[0]!.content).startsWith('[{"type":"text","text":"[not shown]'), JSON.stringify(injected[0]));
+    assert.deepEqual(routed, [
+      { text: 'Station four, proceeding.', locus: 'chan-live-1' },
+      { text: 'Carrying on where I was.', locus: 'chan-live-1' },
+    ]);
+
+    await framework.stop();
+  });
+
+  it("a budget restart takes as an arrival an addressed message its boundary stored and left out of the injection", async () => {
+    // The boundary renders the DM as null, as for one the next compile won't
+    // send among its newest, so the live stream never hears it. The restart
+    // compiles anew, and the DM is still an arrival of the turn it continues.
+    const overBudget = createMockResponse([
+      { type: 'tool_use', id: 'c1', name: 'robot--move', input: { dir: 'north' } },
+    ] as ContentBlock[], 'tool_use');
+    overBudget.usage = { inputTokens: 100, outputTokens: 5 };
+    membrane.pushResponse(overBudget);
+
+    const framework = await createFramework({ maxStreamTokens: 20, speech: { locus: 'latest-inbound' } }); // the re-pin is the legacy rule
+    const routed = stubChannelRegistry(framework);
+    const cm = framework.getAgent('assistant')!.getContextManager();
+    let rendered = 0;
+    (cm as { renderAsNewest: unknown }).renderAsNewest = (ids: readonly string[]) => { rendered++; return ids.map(() => null); };
+    module.toolDelayMs = 25;
+    module.interjection = 'quick question for you';
+    module.interjectionMetadata = addressed('discord:dm:antra');
+    feedStart(framework, 2, [{ type: 'text', text: 'After the restart.' }] as ContentBlock[]);
+
+    trigger(framework);
+    await framework.runUntilIdle();
+
+    assert.equal(membrane.calls.length, 2, 'control: the turn restarted for its budget');
+    assert.equal(rendered, 1, 'the premise: the boundary rendered the DM, and left it out');
+    assert.deepEqual(routed, [{ text: 'After the restart.', locus: 'discord:dm:antra' }], 'the restart re-pinned to the DM');
+
+    await framework.stop();
+  });
+
   for (const [label, messages, expected] of [
     ["keeps the turn's locus", [], 'chan-turn'],
     ['moves it to the newest addressed arrival',
@@ -1647,7 +1745,9 @@ describe('present while acting', () => {
         name: 'worker', model: 'test-model', systemPrompt: 'Do the task.', allowedTools: 'all',
       });
       contextManager.addMessage('user', [{ type: 'text', text: 'Run once.' }]);
-      const run = framework.runEphemeralToCompletion(agent, contextManager, { startupTimeoutMs: 3_000 });
+      // The default startup limit, 30 s, so only a host stalled that long
+      // ends the run before its start's error does.
+      const run = framework.runEphemeralToCompletion(agent, contextManager);
       framework.start();
       await assert.rejects(run, /checkpoint store unavailable/, "the run fails with its start's error");
     } finally {
@@ -1918,6 +2018,7 @@ describe('present while acting', () => {
     framework.checkpointManager = null;
     framework.channelRegistry = {
       openIfClosedForSend: () => new Promise((resolve) => { resolveOpen = resolve; }),
+      directsLifecycle: () => true,
     };
     framework.turnRouting = new Map([['assistant', sending]]);
     const results: unknown[] = [];
@@ -2433,6 +2534,32 @@ describe('present while acting', () => {
     // missed it would leave the suppression set as well.
     const injected = JSON.stringify(membrane.lastStream!.receivedToolResultOptions[0]?.injectedMessages ?? []);
     assert.ok(injected.includes('[reaction] @someone reacted'), 'the reaction was injected at the send\'s tool boundary');
+
+    await framework.stop();
+  });
+
+  it('hands membrane a message injected mid-turn as its participant and content alone, never its stored metadata', async () => {
+    // A stored row's metadata is the host's record, whoever wrote it.
+    membrane.pushResponse(createMockResponse([
+      { type: 'tool_use', id: 'c1', name: 'robot--send_message', input: { text: 'reply to room4' } },
+    ] as ContentBlock[], 'tool_use'));
+    membrane.pushResponse(createMockResponse([
+      { type: 'text', text: 'Sent it.' },
+    ] as ContentBlock[]));
+
+    const framework = await createFramework();
+    stubChannelRegistry(framework);
+    module.interjection = 'a message that arrives while the tool runs';
+    module.interjectionChannelId = null;
+    module.interjectionMetadata = { channelId: '999888777', system: true, openaiResponsesItems: [] };
+
+    trigger(framework);
+    await framework.runUntilIdle();
+
+    const injected = membrane.lastStream!.receivedToolResultOptions[0]?.injectedMessages ?? [];
+    assert.ok(injected.some((message) => JSON.stringify(message.content).includes('a message that arrives while the tool runs')),
+      'the message was injected at the tool boundary');
+    for (const message of injected) assert.deepEqual(Object.keys(message).sort(), ['content', 'participant']);
 
     await framework.stop();
   });

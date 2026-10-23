@@ -67,6 +67,15 @@ class ToolboxModule implements Module {
   }
 }
 
+/**
+ * A stream message's channel as the test records it. Each delivery hands its
+ * stream the destination its publish went to, here the stub's server: one
+ * for any other server is recorded with it, so a delivery that loses its
+ * server fails the test.
+ */
+const streamedAt = (to: { serverId: string; channelId: string }) =>
+  (to.serverId === 'stub' ? to.channelId : `${to.channelId} (server ${to.serverId})`);
+
 /** Registry stub: two known channels (#alpha guild, laria's DM) + capture. */
 function stubRegistry(framework: AgentFramework, plan: Array<'delivered' | 'false' | 'unknown' | 'throw'> = []) {
   const routed: Array<{ text: string; locus: string | null }> = [];
@@ -104,7 +113,7 @@ function stubRegistry(framework: AgentFramework, plan: Array<'delivered' | 'fals
     routeSpeech: async (agent: string, text: string, locus?: string | null) => {
       const outcome = await deliverSpeech(agent, text, locus);
       return outcome.status === 'delivered'
-        ? { delivered: true, channelId: outcome.destination.channelId }
+        ? { delivered: true, serverId: outcome.destination.serverId, channelId: outcome.destination.channelId }
         : null;
     },
     resolveDestination: ({ channelId }: { channelId: string }) => ({ destination: { serverId: 'stub', channelId } }),
@@ -267,11 +276,11 @@ describe('explicit prose routing', () => {
     const chunks: Array<{ channelId: string; delta: string }> = [];
     const completes: Array<{ channelId: string; text: string }> = [];
     const registry = (framework as unknown as { channelRegistry: Record<string, unknown> }).channelRegistry;
-    registry.sendOutgoingChunk = (channelId: string, _agent: string, _id: string, _index: number, delta: string) => {
-      chunks.push({ channelId, delta });
+    registry.sendOutgoingChunk = (to: { serverId: string; channelId: string }, _agent: string, _id: string, _index: number, delta: string) => {
+      chunks.push({ channelId: streamedAt(to), delta });
     };
-    registry.sendOutgoingComplete = (channelId: string, _agent: string, _id: string, text: string) => {
-      completes.push({ channelId, text });
+    registry.sendOutgoingComplete = (to: { serverId: string; channelId: string }, _agent: string, _id: string, text: string) => {
+      completes.push({ channelId: streamedAt(to), text });
     };
     return { chunks, completes };
   }
@@ -1733,7 +1742,7 @@ describe('explicit prose routing', () => {
     const routed = stubRegistry(framework);
     const gateway = framework as unknown as {
       deliverHybridProse(agent: unknown, text: string, locus: string, allowLocus: boolean,
-        round: { routing: RoutingState; notice: 'later'; onPublished?: (channelId: string, text: string) => void }): Promise<void>;
+        round: { routing: RoutingState; notice: 'later'; onPublished?: (to: { channelId: string }, text: string) => void }): Promise<void>;
       turnRouting: Map<string, RoutingState>;
     };
     const agent = framework.getAgent('assistant')!;
@@ -1762,7 +1771,7 @@ describe('explicit prose routing', () => {
     const routed = stubRegistry(framework);
     const gateway = framework as unknown as {
       deliverHybridProse(agent: unknown, text: string, locus: string, allowLocus: boolean,
-        round: { routing: RoutingState; notice: 'later'; onPublished?: (channelId: string, text: string) => void }): Promise<void>;
+        round: { routing: RoutingState; notice: 'later'; onPublished?: (to: { channelId: string }, text: string) => void }): Promise<void>;
       turnRouting: Map<string, RoutingState>;
     };
     const agent = framework.getAgent('assistant')!;
@@ -1776,7 +1785,7 @@ describe('explicit prose routing', () => {
         const round = {
           routing: queued,
           notice: 'later' as const,
-          onPublished: (channelId: string, text: string) => { streamed.push({ channelId, text }); },
+          onPublished: ({ channelId }: { channelId: string }, text: string) => { streamed.push({ channelId, text }); },
         };
         await gateway.deliverHybridProse(agent, '>>>#alpha first', 'chan-locus', true, round);
         await gateway.deliverHybridProse(agent, prefix, 'chan-locus', true, round);
@@ -2185,11 +2194,11 @@ describe('explicit prose routing', () => {
     registry.inboundOnlyServer = (channelId: string) => (channelId === 'body:ears' ? 'body' : undefined);
     const chunks: Array<{ channelId: string; delta: string }> = [];
     const completes: Array<{ channelId: string; text: string }> = [];
-    registry.sendOutgoingChunk = (channelId: string, _agent: string, _inference: string, _index: number, delta: string) => {
-      chunks.push({ channelId, delta });
+    registry.sendOutgoingChunk = (to: { serverId: string; channelId: string }, _agent: string, _inference: string, _index: number, delta: string) => {
+      chunks.push({ channelId: streamedAt(to), delta });
     };
-    registry.sendOutgoingComplete = (channelId: string, _agent: string, _inference: string, text: string) => {
-      completes.push({ channelId, text });
+    registry.sendOutgoingComplete = (to: { serverId: string; channelId: string }, _agent: string, _inference: string, text: string) => {
+      completes.push({ channelId: streamedAt(to), text });
     };
     feedTurn(framework, 2, [{ type: 'text', text: '>>skip_reply' }] as ContentBlock[]);
     trigger(framework);
@@ -2846,6 +2855,71 @@ describe('explicit prose routing', () => {
       } finally {
         release();
         if (running) await running;
+        await framework.stop();
+      }
+    });
+  }
+
+  // The bounce-wake cap (PROSE_BOUNCE_WAKE_CAP = 2) stops a bounce → wake →
+  // bounce loop. Its count used to reset only when a prose envelope was
+  // delivered, so a resident that recovered from each bounce some other way
+  // (a send tool, setting the draft aside) kept the count across turns, and
+  // from the third bounce on, a reply to a fresh message bounced with no wake.
+  for (const mode of ['explicit', 'hybrid'] as const) {
+    const prefix = mode === 'explicit' ? '>>' : '>>>';
+    // Words that bounce in each mode: unprefixed prose in explicit mode; in
+    // hybrid, where unprefixed prose goes to the locus, a target that names
+    // no channel.
+    const bouncing = (n: number): string => mode === 'explicit' ? `reply ${n}` : `>>>#nowhere reply ${n}`;
+    const setAside = `${prefix}skip_reply {{unsent}}`;
+
+    it(`${mode}: a turn with a cause of its own resets the bounce-wake count, so recovering without a prose delivery doesn't silence later bounces`, async () => {
+      const framework = await createFramework(mode);
+      const routed = stubRegistry(framework);
+      let turns = 0;
+      framework.onTrace((e) => {
+        if ((e as { type: string }).type === 'inference:started') turns++;
+      });
+      // Three messages. Each reply bounces; each bounce wake sets the draft
+      // aside instead of delivering prose.
+      feedTurn(framework, 1, [{ type: 'text', text: bouncing(1) }] as ContentBlock[]);
+      feedTurn(framework, 2, [{ type: 'text', text: setAside }] as ContentBlock[]);
+      feedTurn(framework, 3, [{ type: 'text', text: bouncing(2) }] as ContentBlock[]);
+      feedTurn(framework, 4, [{ type: 'text', text: setAside }] as ContentBlock[]);
+      feedTurn(framework, 5, [{ type: 'text', text: bouncing(3) }] as ContentBlock[]);
+      feedTurn(framework, 6, [{ type: 'text', text: setAside }] as ContentBlock[]);
+      try {
+        for (let message = 1; message <= 3; message++) {
+          trigger(framework);
+          await framework.runUntilIdle();
+          assert.equal(turns, message * 2, `message ${message}: its reply bounced and the bounce woke the agent`);
+        }
+        assert.equal(routed.length, 0, 'nothing was delivered');
+        assert.equal(context(framework).bounces, 3, 'three bounce notices');
+      } finally {
+        await framework.stop();
+      }
+    });
+
+    it(`${mode}: a bounce loop with no other cause still stops waking after two bounces`, async () => {
+      const framework = await createFramework(mode);
+      stubRegistry(framework);
+      let turns = 0;
+      framework.onTrace((e) => {
+        if ((e as { type: string }).type === 'inference:started') turns++;
+      });
+      feedTurn(framework, 1, [{ type: 'text', text: bouncing(1) }] as ContentBlock[]);
+      feedTurn(framework, 2, [{ type: 'text', text: bouncing(2) }] as ContentBlock[]);
+      feedTurn(framework, 3, [{ type: 'text', text: bouncing(3) }] as ContentBlock[]);
+      // Were the third bounce to wake, this turn would run: it answers, so
+      // the test fails on the count rather than hanging.
+      feedTurn(framework, 4, [{ type: 'text', text: setAside }] as ContentBlock[]);
+      try {
+        trigger(framework);
+        await framework.runUntilIdle();
+        assert.equal(turns, 3, 'the message, then two bounce wakes; the third bounce wakes nothing');
+        assert.equal(context(framework).bounces, 3, 'every bounce still leaves its notice');
+      } finally {
         await framework.stop();
       }
     });

@@ -1,909 +1,116 @@
 /**
- * Client-side programmatic tool calling (code_execution) tests.
- *
- * PyRunner tests spawn a REAL python3 subprocess — the protocol, top-level
- * await, tool-function injection, timeout, and deadline behavior are all
- * exercised end-to-end. Framework tests drive a full agent turn through the
- * MockMembrane and assert the load-bearing invariant: inner tool results
- * reach the running script but never the model-facing tool_result.
+ * code_execution through the framework: an agent's script runs on the engine,
+ * in a process of its own, and its calls come back through the ordinary
+ * dispatcher as the agent's. Each test drives a full agent turn through the
+ * MockMembrane, or the promise path (executeToolCall), and asserts what the
+ * model and the modules see: inner tool results reach the running script but
+ * never the model-facing tool_result.
  */
 
 import { describe, it } from 'node:test';
 import assert from 'node:assert';
-import { ChildProcess, execFileSync } from 'node:child_process';
-import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import type {
-  EventResponse,
-  Module,
-  ModuleContext,
-  ProcessEvent,
-  ProcessState,
-  ScriptToolResult,
-  ToolCall,
-  ToolDefinition,
-  ToolResult,
-} from '../src/index.js';
-import { AgentFramework, PYTHON_RUNTIME_SOURCE, PyRunner, buildInjectedTools } from '../src/index.js';
-import { createMockResponse, MockMembrane } from './helpers/mock-membrane.js';
-import type { ContentBlock } from '@animalabs/membrane';
-import { PYTC_STOP_ROWS_DRIVER } from './helpers/pytc-stop-rows.js';
+import type { ErrorAction, ErrorPolicy, EventResponse, Module, ModuleContext, ProcessEvent, ProcessState, ToolCall, ToolDefinition, ToolResult } from '../src/index.js';
+import { AgentFramework } from '../src/index.js';
+import { storableToolResult } from '../src/module-registry.js';
+import { createMockResponse, MockMembrane, MockYieldingStream } from './helpers/mock-membrane.js';
+import type { ContentBlock, NormalizedRequest, StreamEvent, YieldingStream } from '@animalabs/membrane';
+import { UNREACHED_WATCHDOG, silenceRun } from './helpers/run-watchdog.js';
 
-const ECHO_TOOLS: { pyName: string; toolName: string }[] = [
-  { pyName: 'test__echo', toolName: 'test--echo' },
-];
-
-/** Wait for a condition, failing after 10 s rather than hanging the run. */
+/** Wait for a condition, failing after 15 s rather than hanging the run. */
 const until = async (cond: () => boolean, what: string) => {
-  const deadline = Date.now() + 10_000;
+  const deadline = Date.now() + 15_000;
   while (!cond()) {
     if (Date.now() > deadline) throw new Error(`timed out waiting for ${what}`);
     await new Promise((r) => setTimeout(r, 20));
   }
 };
 
-/** Wait for a promise, failing after 10 s rather than hanging the run. */
-const within = <T>(promise: Promise<T>, what: string): Promise<T> => {
-  let timer: ReturnType<typeof setTimeout> | undefined;
-  const late = new Promise<never>((_, reject) => {
-    timer = setTimeout(() => reject(new Error(`timed out waiting for ${what}`)), 10_000);
-  });
-  return Promise.race([promise, late]).finally(() => clearTimeout(timer));
-};
-
-/** Whether a process is still there to signal. */
-const alive = (pid: number): boolean => {
-  try {
-    process.kill(pid, 0);
+/** A module's own result class, whose data and turn-ending are prototype getters, as a module may write one. */
+class ClassResult {
+  success = true;
+  refused: boolean;
+  constructor(refused: boolean) {
+    this.refused = refused;
+  }
+  get data(): unknown {
+    return { from: 'a getter' };
+  }
+  get endTurn(): boolean {
     return true;
-  } catch {
-    return false;
   }
-};
+}
 
-describe('buildInjectedTools', () => {
-  it('sanitizes -- to __ and keeps valid identifiers', () => {
-    const injected = buildInjectedTools(['mcpl--discord--send_message', 'think']);
-    assert.deepStrictEqual(injected, [
-      { pyName: 'mcpl__discord__send_message', toolName: 'mcpl--discord--send_message' },
-      { pyName: 'think', toolName: 'think' },
-    ]);
-  });
-
-  it('sanitizes single hyphens inside segments (live fleet names)', () => {
-    // Found on the first Mica canary run: module/server ids with single
-    // hyphens were skipped entirely. They must inject.
-    const injected = buildInjectedTools([
-      'mcpl-admin--mcpl_deploy',
-      'mcpl--dog-events--dog_events_status',
-      'channel-mode--set_channel_mode',
-    ]);
-    assert.deepStrictEqual(injected, [
-      { pyName: 'mcpl_admin__mcpl_deploy', toolName: 'mcpl-admin--mcpl_deploy' },
-      { pyName: 'mcpl__dog_events__dog_events_status', toolName: 'mcpl--dog-events--dog_events_status' },
-      { pyName: 'channel_mode__set_channel_mode', toolName: 'channel-mode--set_channel_mode' },
-    ]);
-  });
-
-  it('prefixes a leading digit', () => {
-    const injected = buildInjectedTools(['3d-tools--render']);
-    assert.deepStrictEqual(injected, [{ pyName: '_3d_tools__render', toolName: '3d-tools--render' }]);
-  });
-
-  it('skips colliding sanitized names loudly (first wins)', () => {
-    const logs: string[] = [];
-    const injected = buildInjectedTools(['a--b', 'a__b'], (m) => logs.push(m));
-    assert.deepStrictEqual(injected, [{ pyName: 'a__b', toolName: 'a--b' }]);
-    assert.strictEqual(logs.length, 1);
-    assert.match(logs[0], /collides/);
-  });
-});
-
-describe('PyRunner (real python3)', () => {
-  it("no two runners' interpreters share a number, so a mark keyed by one can't match another's", async () => {
-    const first = new PyRunner({ onToolCall: async () => '' });
-    const second = new PyRunner({ onToolCall: async () => '' });
-    try {
-      assert.strictEqual(first.interpreter, null, 'no interpreter before the first script');
-      await first.exec('x = 1', []);
-      await second.exec('x = 1', []);
-      assert.notStrictEqual(first.interpreter, null);
-      assert.notStrictEqual(second.interpreter, null);
-      assert.notStrictEqual(first.interpreter, second.interpreter, 'each interpreter has its own number');
-    } finally {
-      first.dispose();
-      second.dispose();
-    }
-    assert.strictEqual(first.interpreter, null, 'and none once the runner is disposed');
-  });
-
-  it('an interpreter killed by a signal the runner didn\'t send has no number: it is gone', async () => {
-    const runner = new PyRunner({ onToolCall: async () => '' });
-    try {
-      await runner.exec('x = 1', []);
-      const child = (runner as unknown as { child: import('node:child_process').ChildProcess }).child;
-      assert.notStrictEqual(runner.interpreter, null, 'live while it runs');
-      const exited = new Promise((resolve) => child.once('exit', resolve));
-      process.kill(child.pid!, 'SIGKILL');
-      await exited;
-      assert.equal(child.killed, false, 'the runner sent no signal');
-      assert.strictEqual(runner.interpreter, null, 'and once the signal ended it, none is live');
-    } finally {
-      runner.dispose();
-    }
-  });
-
-  it('runs a script and returns stdout', async () => {
-    const runner = new PyRunner({ onToolCall: async () => '' });
-    try {
-      const result = await runner.exec('print("hello from python")', []);
-      assert.strictEqual(result.returnCode, 0);
-      assert.match(result.stdout, /hello from python/);
-      assert.strictEqual(result.stderr, '');
-    } finally {
-      runner.dispose();
-    }
-  });
-
-  it('round-trips a tool call as an awaited async function', async () => {
-    const calls: Array<{ name: string; args: Record<string, unknown> }> = [];
-    const runner = new PyRunner({
-      onToolCall: async (name, args) => {
-        calls.push({ name, args });
-        return JSON.stringify({ echoed: args });
-      },
-    });
-    try {
-      const result = await runner.exec(
-        [
-          'import json',
-          'r = json.loads(await test__echo({"message": "alpha"}))',
-          'print("echoed:", r["echoed"]["message"])',
-        ].join('\n'),
-        ECHO_TOOLS,
-      );
-      assert.strictEqual(result.returnCode, 0, result.stderr);
-      assert.match(result.stdout, /echoed: alpha/);
-      assert.deepStrictEqual(calls, [{ name: 'test--echo', args: { message: 'alpha' } }]);
-    } finally {
-      runner.dispose();
-    }
-  });
-
-  it('gives a script each result as its string, with .is_error and .structured beside it', async () => {
-    const structured = JSON.stringify({ content: [], structuredContent: { rows: [1, 2] }, isError: false });
-    const oversized = JSON.stringify({ isError: true, oversized: { chars: 9, savedTo: null } });
-    const results: Record<string, string | ScriptToolResult> = {
-      failed: { text: 'Error: boom', isError: true },
-      // Text that merely starts like an error, the case .is_error is for.
-      textlike: { text: 'Error: a line of the file, not a failure', isError: false },
-      structured: { text: structured, isError: false, structuredJson: true },
-      oversized: { text: oversized, isError: true, structuredJson: true },
-      // A handler that returns a plain string says nothing about it.
-      plain: 'a string, nothing said',
-      // Unmarked text holding a structuredContent key is still text.
-      jsonlike: { text: '{"structuredContent": {"a": 1}}', isError: false },
-    };
-    const runner = new PyRunner({
-      onToolCall: async (_name, args) => {
-        if (args.kind === 'rejects') throw new Error('handler broke');
-        // A JS handler can resolve with what its type rules out; the call is
-        // still answered, as before this change.
-        if (args.kind === 'nothing') return undefined as unknown as string;
-        return results[String(args.kind)]!;
-      },
-    });
-    try {
-      const result = await runner.exec(
-        [
-          'import copy, json, pickle',
-          'out = {}',
-          'for kind in ["failed", "textlike", "structured", "oversized", "plain", "rejects", "jsonlike", "nothing"]:',
-          '    r = await test__echo({"kind": kind})',
-          '    out[kind] = {"text": str(r), "is_error": r.is_error, "structured": r.structured,',
-          '                 "type": type(r).__name__, "is_str": isinstance(r, str)}',
-          'r = await test__echo({"kind": "structured"})',
-          'out["parsed"] = json.loads(r)["structuredContent"]',
-          'out["copies"] = [[c.is_error, c.structured, c == r] for c in (copy.copy(r), pickle.loads(pickle.dumps(r)))]',
-          'key = await test__echo({"kind": "plain"})',
-          'try:',
-          '    await test__echo({key: 1}, extra=2)',
-          'except TypeError as e:',
-          '    out["refusal"] = str(e)',
-          'print(json.dumps(out))',
-        ].join('\n'),
-        ECHO_TOOLS,
-      );
-      assert.strictEqual(result.returnCode, 0, result.stderr);
-      const out = JSON.parse(result.stdout) as Record<string, unknown>;
-      const seen = (text: string, isError: boolean | null, value: unknown) =>
-        ({ text, is_error: isError, structured: value, type: 'ToolResult', is_str: true });
-      assert.deepStrictEqual(out.failed, seen('Error: boom', true, null));
-      assert.deepStrictEqual(out.textlike, seen('Error: a line of the file, not a failure', false, null));
-      assert.deepStrictEqual(out.structured, seen(structured, false, { rows: [1, 2] }));
-      // Marked as a structured result's object, but holding no
-      // structuredContent: none to read.
-      assert.deepStrictEqual(out.oversized, seen(oversized, true, null));
-      assert.deepStrictEqual(out.plain, seen('a string, nothing said', null, null));
-      // A handler that rejects reaches the script as an error, flagged.
-      assert.deepStrictEqual(out.rejects, seen('Error: handler broke', true, null));
-      // The string is unchanged for code that parses it itself.
-      assert.deepStrictEqual(out.parsed, { rows: [1, 2] });
-      // copy and pickle keep both attributes.
-      assert.deepStrictEqual(out.copies, [[false, { rows: [1, 2] }, true], [false, { rows: [1, 2] }, true]]);
-      assert.deepStrictEqual(out.jsonlike, seen('{"structuredContent": {"a": 1}}', false, null));
-      assert.deepStrictEqual(out.nothing, seen('', null, null));
-      // A refusal shows a key that is a tool's result as its text, the key the
-      // agent has to write, as it shows any str key.
-      assert.match(String(out.refusal), /\{'a string, nothing said': <int>, 'extra': <int>\}/);
-    } finally {
-      runner.dispose();
-    }
-  });
-
-  it('supports the exact-name tools[...] escape hatch', async () => {
-    const runner = new PyRunner({
-      onToolCall: async (_name, args) => `got:${String(args.v)}`,
-    });
-    try {
-      const result = await runner.exec(
-        'print(await tools["test--echo"]({"v": 7}))',
-        ECHO_TOOLS,
-      );
-      assert.strictEqual(result.returnCode, 0, result.stderr);
-      assert.match(result.stdout, /got:7/);
-    } finally {
-      runner.dispose();
-    }
-  });
-
-  it('runs parallel tool calls via asyncio.gather', async () => {
-    let inFlight = 0;
-    let maxInFlight = 0;
-    const runner = new PyRunner({
-      onToolCall: async (_name, args) => {
-        inFlight++;
-        maxInFlight = Math.max(maxInFlight, inFlight);
-        await new Promise((r) => setTimeout(r, 150));
-        inFlight--;
-        return String(args.i);
-      },
-    });
-    try {
-      const result = await runner.exec(
-        [
-          'import asyncio',
-          'results = await asyncio.gather(*(test__echo({"i": i}) for i in range(3)))',
-          'print(",".join(results))',
-        ].join('\n'),
-        ECHO_TOOLS,
-      );
-      assert.strictEqual(result.returnCode, 0, result.stderr);
-      assert.match(result.stdout, /0,1,2/);
-      assert.ok(maxInFlight >= 2, `expected parallel dispatch, max in flight was ${maxInFlight}`);
-    } finally {
-      runner.dispose();
-    }
-  });
-
-  it('persists interpreter state across execs (container-reuse semantics)', async () => {
-    const runner = new PyRunner({ onToolCall: async () => '' });
-    try {
-      const first = await runner.exec('x = 41', []);
-      assert.strictEqual(first.returnCode, 0, first.stderr);
-      const second = await runner.exec('print(x + 1)', []);
-      assert.strictEqual(second.returnCode, 0, second.stderr);
-      assert.match(second.stdout, /42/);
-    } finally {
-      runner.dispose();
-    }
-  });
-
-  it('reports script exceptions as a traceback with return_code 1', async () => {
-    const runner = new PyRunner({ onToolCall: async () => '' });
-    try {
-      const result = await runner.exec('raise ValueError("boom")', []);
-      assert.strictEqual(result.returnCode, 1);
-      assert.match(result.stderr, /ValueError: boom/);
-      assert.match(result.stderr, /Traceback/);
-    } finally {
-      runner.dispose();
-    }
-  });
-
-  it('delivers tool errors as plain strings the script can handle', async () => {
-    const runner = new PyRunner({
-      onToolCall: async () => 'Error: Query timeout - table lock exceeded',
-    });
-    try {
-      const result = await runner.exec(
-        [
-          'r = await test__echo({})',
-          'if r.startswith("Error:"):',
-          '    print("handled:", r)',
-        ].join('\n'),
-        ECHO_TOOLS,
-      );
-      assert.strictEqual(result.returnCode, 0, result.stderr);
-      assert.match(result.stdout, /handled: Error: Query timeout/);
-    } finally {
-      runner.dispose();
-    }
-  });
-
-  it('raises TimeoutError inside the script when a tool call gets no response', async () => {
-    const runner = new PyRunner({
-      toolCallTimeoutMs: 1000,
-      onToolCall: () => new Promise((resolve) => setTimeout(() => resolve('late'), 5000)),
-    });
-    try {
-      const result = await runner.exec('await test__echo({})', ECHO_TOOLS);
-      assert.strictEqual(result.returnCode, 1);
-      assert.match(result.stderr, /TimeoutError: Calling tool \['test--echo'\] timed out/);
-    } finally {
-      runner.dispose();
-    }
-  });
-
-  it('cancels a script that exceeds the deadline', async () => {
-    const runner = new PyRunner({
-      scriptTimeoutMs: 1000,
-      onToolCall: async () => '',
-    });
-    try {
-      const started = Date.now();
-      const result = await runner.exec('import asyncio\nawait asyncio.sleep(60)', []);
-      assert.strictEqual(result.returnCode, 1);
-      assert.match(result.stderr, /cancelled by host/);
-      assert.ok(Date.now() - started < 15_000, 'deadline cancel took too long');
-    } finally {
-      runner.dispose();
-    }
-  });
-
-  it('abort() settles a running script and reclaims the interpreter', async () => {
-    let called!: () => void;
-    const running = new Promise<void>((resolve) => {
-      called = resolve;
-    });
-    const runner = new PyRunner({
-      onToolCall: async () => {
-        called();
-        return 'echo';
-      },
-    });
-    try {
-      const pending = runner.exec('marker = 1\nawait test__echo({})\nimport asyncio\nawait asyncio.sleep(60)', ECHO_TOOLS);
-      // The script's tool call says it's running. An exec that settles first,
-      // or a call that never comes, fails the test rather than leaving it waiting.
-      await within(
-        Promise.race([
-          running,
-          pending.then((r) => assert.fail(`the exec settled before its script called its tool: ${r.stderr}`)),
-        ]),
-        'the script to call its tool',
-      );
-      assert.strictEqual(runner.busy, true);
-      runner.abort('test abort');
-      const result = await pending;
-      assert.strictEqual(result.aborted, true);
-      assert.match(result.stderr, /aborted by host: test abort/);
-      // Runner remains usable after reclaim, in a fresh interpreter: the
-      // aborted script's state is gone.
-      const after = await runner.exec('try:\n    marker\n    print("kept")\nexcept NameError:\n    print("fresh")', []);
-      assert.strictEqual(after.returnCode, 0, after.stderr);
-      assert.strictEqual(after.stdout, 'fresh\n');
-    } finally {
-      runner.dispose();
-    }
-  });
-
-  it('rejects concurrent execs on one runner', async () => {
-    const runner = new PyRunner({ onToolCall: async () => '' });
-    try {
-      const first = runner.exec('import asyncio\nawait asyncio.sleep(2)', []);
-      await new Promise((r) => setTimeout(r, 300));
-      const second = await runner.exec('print("nope")', []);
-      assert.strictEqual(second.returnCode, 1);
-      assert.strictEqual(second.stderr, "script didn't run: another code_execution script of yours is already running, and they run one at a time. "
-        + 'Run this one again once that one has finished, or combine the two into one script.');
-      runner.abort('cleanup');
-      await first;
-    } finally {
-      runner.dispose();
-    }
-  });
-
-  it('rejects a second exec issued before the first has started (same tick)', async () => {
-    // exec() awaits the interpreter, so a claim made only after that await
-    // would let two execs in at once.
-    const runner = new PyRunner({ onToolCall: async () => '' });
-    try {
-      for (const warm of [false, true]) {
-        const first = runner.exec('import asyncio\nawait asyncio.sleep(0.2)\nprint("first ran")', []);
-        const second = runner.exec('print("second ran")', []);
-        const [a, b] = await Promise.race([
-          Promise.all([first, second]),
-          new Promise<never>((_, reject) => setTimeout(() => reject(new Error(`warm=${warm}: an exec never settled`)), 10_000)),
-        ]);
-        assert.strictEqual(b.returnCode, 1, `warm=${warm}`);
-        assert.match(b.stderr, /already running/);
-        assert.strictEqual(a.returnCode, 0, `warm=${warm}: ${a.stderr}`);
-        assert.match(a.stdout, /first ran/);
-        assert.ok(!a.stdout.includes('second ran') && !b.stdout.includes('second ran'));
-      }
-    } finally {
-      runner.dispose();
-    }
-  });
-
-  it('fails gracefully when the python binary is missing, and says code_execution can\'t run here', async () => {
-    const runner = new PyRunner({
-      pythonPath: '/definitely/not/a/python',
-      onToolCall: async () => '',
-    });
-    try {
-      const result = await runner.exec('print(1)', []);
-      assert.strictEqual(result.returnCode, 1);
-      assert.strictEqual(result.stderr, "script didn't run: this host can't start its Python interpreter, /definitely/not/a/python (ENOENT), "
-        + "so code_execution can't run scripts here until whoever runs this host installs it or points this host at one. Calling it again before then fails the same way.");
-    } finally {
-      runner.dispose();
-    }
-  });
-
-  it('an interpreter path that is no program, or that runs through a file, says which, and only the first rules out trying again', async () => {
-    const dir = mkdtempSync(join(tmpdir(), 'pytc-start-'));
-    const notExecutable = join(dir, 'python3');
-    writeFileSync(notExecutable, '#!/bin/sh\n', { mode: 0o644 });
-    const noExec = new PyRunner({ pythonPath: notExecutable, onToolCall: async () => '' });
-    const throughFile = new PyRunner({ pythonPath: join(notExecutable, 'python3'), onToolCall: async () => '' });
-    try {
-      assert.strictEqual((await noExec.exec('print(1)', [])).stderr, `script didn't run: this host can't start its Python interpreter, ${notExecutable} (EACCES), `
-        + "so code_execution can't run scripts here until whoever runs this host makes it executable or points this host at another. Calling it again before then fails the same way.");
-      assert.strictEqual((await throughFile.exec('print(1)', [])).stderr, `script didn't run: the Python interpreter, ${join(notExecutable, 'python3')}, `
-        + "couldn't be started (ENOTDIR), so none of the script ran. Run it again; if it fails the same way, ask whoever runs this host.");
-    } finally {
-      noExec.dispose();
-      throughFile.dispose();
-      rmSync(dir, { recursive: true, force: true });
-    }
-  });
-
-  it("a runtime whose files can't be written says so, with the error's path cut at 500 characters, not that the interpreter failed", async () => {
-    const dir = mkdtempSync(join(tmpdir(), 'pytc-files-'));
-    // Nested past 500 characters, so Node's message, which quotes the path, is cut.
-    const missing = join(dir, ...Array.from({ length: 6 }, () => 'm'.repeat(90)));
-    const saved = process.env.TMPDIR;
-    process.env.TMPDIR = missing;
-    const runner = new PyRunner({ onToolCall: async () => '' });
-    try {
-      const result = await runner.exec('print(1)', []);
-      assert.strictEqual(result.returnCode, 1);
-      const message = `ENOENT: no such file or directory, mkdtemp '${join(missing, 'af-pytc-XXXXXX')}'`;
-      assert.ok(message.length > 500, 'the message is long enough to be cut');
-      assert.strictEqual(result.stderr, "script didn't run: this host couldn't create or write the files its Python runtime starts from ("
-        + `${message.slice(0, 500)}… (${message.length} characters)), so none of the script ran. Run it again; if it fails the same way, ask whoever runs this host.`);
-    } finally {
-      if (saved === undefined) delete process.env.TMPDIR; else process.env.TMPDIR = saved;
-      runner.dispose();
-      rmSync(dir, { recursive: true, force: true });
-    }
-  });
-
-  it('an interpreter that exits as it starts: nothing in the script ran, and one more try is worth it', async () => {
-    // Node, given the runtime's Python source, exits on its syntax at once.
-    const runner = new PyRunner({ pythonPath: process.execPath, onToolCall: async () => '' });
-    try {
-      const result = await runner.exec('print(1)', []);
-      assert.strictEqual(result.returnCode, 1);
-      assert.strictEqual(result.stderr, `script didn't run: the Python interpreter, ${process.execPath}, exited as it started, so none of the script ran. `
-        + 'Run it again; if it fails the same way, ask whoever runs this host.');
-    } finally {
-      runner.dispose();
-    }
-  });
-
-  it('an interpreter that exits under a script says the rest didn\'t run and its state is gone', async () => {
-    const runner = new PyRunner({ onToolCall: async () => '' });
-    try {
-      assert.strictEqual((await runner.exec('x = 41', [])).returnCode, 0);
-      const result = await runner.exec('import os\nos._exit(3)', []);
-      assert.strictEqual(result.returnCode, 1);
-      assert.strictEqual(result.stderr, "script stopped: the Python interpreter exited with code 3 while it ran, so the rest of the script didn't run, "
-        + 'and variables from earlier scripts are gone. Tool calls it had already made keep their effects, so check them before you run it again in a new interpreter. '
-        + 'If it stops the same way, check whether the script itself ends the process, for example with os._exit(); if not, ask whoever runs this host.');
-      assert.match((await runner.exec('print(x)', [])).stderr, /NameError: name 'x' is not defined/);
-      const killed = await runner.exec('import os, signal\nos.kill(os.getpid(), signal.SIGKILL)', []);
-      assert.strictEqual(killed.stderr, "script stopped: the Python interpreter was ended by SIGKILL while it ran, so the rest of the script didn't run, "
-        + 'and variables from earlier scripts are gone. Tool calls it had already made keep their effects, so check them before you run it again in a new interpreter. '
-        + 'If it stops the same way, check whether the script itself ends the process, for example by using too much memory; if not, ask whoever runs this host.');
-    } finally {
-      runner.dispose();
-    }
-  });
-
-  it('a tool function given keyword arguments or a non-dict is not called, and says the dict to write', async () => {
-    const calls: string[] = [];
-    const runner = new PyRunner({ onToolCall: async (name) => { calls.push(name); return ''; } });
-    try {
-      const result = await runner.exec(
-        [
-          'class Loud(str):',
-          '    def __repr__(self):',
-          '        raise RuntimeError("repr ran")',
-          'class Int(int):',
-          '    def __repr__(self):',
-          '        raise RuntimeError("repr ran")',
-          'class Meta(type):',
-          '    def __eq__(cls, other):',
-          '        raise RuntimeError("metaclass __eq__ ran")',
-          '    __hash__ = type.__hash__',
-          '    @property',
-          '    def __name__(cls):',
-          '        raise RuntimeError("metaclass __name__ ran")',
-          'class Odd(metaclass=Meta):',
-          '    def __repr__(self):',
-          '        raise RuntimeError("repr ran")',
-          'for call in (lambda: test__echo(message="alpha", limit=5, items=[1]), lambda: test__echo({"message": "alpha"}, limit=5), lambda: test__echo("alpha"),',
-          '             lambda: test__echo("alpha", limit=5),',
-          '             lambda: test__echo(text=Loud("x"), n=Int(3)), lambda: test__echo({Int(4): "a"}, n=1),',
-          '             lambda: test__echo({"k" * 61: 1, "j" * 60: 2}, n=1), lambda: test__echo(Odd(), n=1)):',
-          '    try:',
-          '        await call()',
-          '    except TypeError as e:',
-          '        print(e)',
-        ].join('\n'),
-        ECHO_TOOLS,
-      );
-      assert.strictEqual(result.returnCode, 0, result.stderr);
-      assert.deepStrictEqual(result.stdout.trimEnd().split('\n'), [
-        "test__echo wasn't called: a tool function takes one dict of arguments, not keyword arguments, so write await test__echo({'message': <str>, 'limit': <int>, 'items': <list>})",
-        "test__echo wasn't called: a tool function takes one dict of arguments, not keyword arguments, so write await test__echo({'message': <str>, 'limit': <int>})",
-        "test__echo wasn't called: a tool function takes one dict of arguments, such as await test__echo({...}), and this call gave it <str>",
-        "test__echo wasn't called: a tool function takes one dict of arguments, not keyword arguments, and this call also gave it <str>, "
-          + 'so put every argument in one dict: await test__echo({...})',
-        // A value of a subclass is shown by its type: its own __repr__ never runs.
-        "test__echo wasn't called: a tool function takes one dict of arguments, not keyword arguments, so write await test__echo({'text': <Loud>, 'n': <Int>})",
-        // A key that isn't a str is shown as a value is, so its __repr__ doesn't run either.
-        "test__echo wasn't called: a tool function takes one dict of arguments, not keyword arguments, so write await test__echo({<Int>: <str>, 'n': <int>})",
-        // A str key is shown whole up to 60 characters, and past that by its type.
-        "test__echo wasn't called: a tool function takes one dict of arguments, not keyword arguments, so write await test__echo("
-          + `{<str>: <int>, '${'j'.repeat(60)}': <int>, 'n': <int>})`,
-        // A class's metaclass code doesn't run either: its type is named through type's own descriptor.
-        "test__echo wasn't called: a tool function takes one dict of arguments, not keyword arguments, and this call also gave it <Odd>, "
-          + 'so put every argument in one dict: await test__echo({...})',
-      ]);
-      assert.deepStrictEqual(calls, []);
-    } finally {
-      runner.dispose();
-    }
-  });
-
-  it('a tool function takes args= on its own as the dict, and None either way as no arguments, as it always has', async () => {
-    const calls: unknown[] = [];
-    const runner = new PyRunner({ onToolCall: async (_name, args) => { calls.push(args); return 'ok'; } });
-    try {
-      const result = await runner.exec([
-        'await test__echo(None)',
-        'await test__echo(args=None)',
-        'await test__echo(args={"message": "a"})',
-        'await test__echo({"message": "b"})',
-      ].join('\n'), ECHO_TOOLS);
-      assert.strictEqual(result.returnCode, 0, result.stderr);
-      assert.deepStrictEqual(calls, [{}, {}, { message: 'a' }, { message: 'b' }]);
-    } finally {
-      runner.dispose();
-    }
-  });
-
-  it('a keyword named args beside other keywords stays in the dict to write, and two positional arguments are refused', async () => {
-    const runner = new PyRunner({ onToolCall: async () => 'called' });
-    try {
-      const result = await runner.exec([
-        'for call in (lambda: test__echo(message="alpha", args={"limit": 5}), lambda: test__echo({"message": "alpha"}, args={"limit": 5}),',
-        '             lambda: test__echo(args="notes.md"), lambda: test__echo({"a": 1}, {"b": 2})):',
-        '    try:',
-        '        await call()',
-        '    except TypeError as e:',
-        '        print(e)',
-      ].join('\n'), ECHO_TOOLS);
-      assert.strictEqual(result.returnCode, 0, result.stderr);
-      assert.deepStrictEqual(result.stdout.trimEnd().split('\n'), [
-        "test__echo wasn't called: a tool function takes one dict of arguments, not keyword arguments, so write await test__echo({'message': <str>, 'args': <dict>})",
-        "test__echo wasn't called: a tool function takes one dict of arguments, not keyword arguments, so write await test__echo({'message': <str>, 'args': <dict>})",
-        "test__echo wasn't called: a tool function takes one dict of arguments, such as await test__echo({...}), and this call gave it <str>",
-        "test__echo wasn't called: a tool function takes one dict of arguments, such as await test__echo({...}), and this call gave it 2 positional arguments",
-      ]);
-    } finally {
-      runner.dispose();
-    }
-  });
-});
-
-// While the interpreter starts, the exec has claimed the runner but its
-// script hasn't been sent. An abort or a dispose then settles the exec, and
-// the script never runs.
-describe('PyRunner: an abort or dispose while the interpreter starts (real python3)', () => {
-  /** An executable standing in for python3: a shell script with the given body. */
-  const standIn = (body: string): { path: string; dir: string; done: () => void } => {
-    const dir = mkdtempSync(join(tmpdir(), 'af-pytc-standin-'));
-    const path = join(dir, 'python3');
-    writeFileSync(path, `#!/bin/sh\n${body}\n`);
-    chmodSync(path, 0o755);
-    return { path, dir, done: () => rmSync(dir, { recursive: true, force: true }) };
-  };
-  // The stand-ins are shell scripts.
-  const posix = { skip: process.platform === 'win32' ? 'the stand-ins need /bin/sh' : false };
-  // A write's failure comes back through the event loop: two turns of it.
-  const turns = () => new Promise<void>((r) => setImmediate(() => setImmediate(r)));
-
-  it('an abort settles the exec at once, and its script never runs', async () => {
-    const calls: string[] = [];
-    const runner = new PyRunner({
-      onToolCall: async (name) => {
-        calls.push(name);
-        return 'echo';
-      },
-    });
-    try {
-      const started = Date.now();
-      const pending = runner.exec('await test__echo({})\nimport asyncio\nawait asyncio.sleep(2)', ECHO_TOOLS);
-      assert.strictEqual(runner.busy, true);
-      runner.abort('turn abandoned');
-      assert.strictEqual(runner.busy, false, 'the next turn can run a script');
-      const result = await pending;
-      assert.strictEqual(result.aborted, true);
-      assert.match(result.stderr, /aborted by host: turn abandoned/);
-      // Waiting on the killed interpreter's readiness would take its 15 s start timeout.
-      const took = Date.now() - started;
-      assert.ok(took < 10_000, `settled after ${took} ms`);
-      const after = await runner.exec('print("alive")', []);
-      assert.strictEqual(after.returnCode, 0, after.stderr);
-      assert.strictEqual(after.stdout, 'alive\n');
-      assert.deepStrictEqual(calls, [], 'the aborted script never ran');
-    } finally {
-      runner.dispose();
-    }
-  });
-
-  it('an abort while the interpreter is still starting settles the exec and kills the interpreter', posix, async () => {
-    // The flaky abort test's case, an abort that lands while the interpreter
-    // starts. The stand-in writes its pid and never says it's ready, so the
-    // abort lands while it starts, however late it comes.
-    const never = standIn('echo $$ > "$(dirname "$0")/pid"\nexec sleep 30');
-    const runner = new PyRunner({ pythonPath: never.path, onToolCall: async () => '' });
-    try {
-      const pending = runner.exec('print("ran")', []);
-      const pidFile = join(never.dir, 'pid');
-      await until(() => existsSync(pidFile) && readFileSync(pidFile, 'utf8').endsWith('\n'), 'the interpreter to start');
-      const pid = Number(readFileSync(pidFile, 'utf8'));
-      assert.strictEqual(runner.busy, true);
-      runner.abort('test abort');
-      const result = await pending;
-      assert.strictEqual(result.aborted, true);
-      assert.strictEqual(result.stderr, 'script aborted by host: test abort');
-      assert.strictEqual(result.stdout, '');
-      // Left running, the stand-in would sleep on for 30 s.
-      await until(() => !alive(pid), 'the starting interpreter to be killed');
-    } finally {
-      runner.dispose();
-      never.done();
-    }
-  });
-
-  it('a second exec, issued on the tick an abort settles the first, runs whole in a fresh interpreter', async () => {
-    const runner = new PyRunner({ onToolCall: async () => '' });
-    try {
-      const first = runner.exec('import asyncio\nawait asyncio.sleep(2)', []);
-      runner.abort('turn abandoned');
-      const second = runner.exec('print("second")', []);
-      const [a, b] = await Promise.all([first, second]);
-      assert.strictEqual(a.aborted, true);
-      assert.match(a.stderr, /aborted by host: turn abandoned/);
-      assert.strictEqual(b.returnCode, 0, b.stderr);
-      assert.strictEqual(b.stdout, 'second\n');
-    } finally {
-      runner.dispose();
-    }
-  });
-
-  it('an abort on a warm interpreter, on the tick exec is called, settles it before its script is sent', async () => {
-    const runner = new PyRunner({ onToolCall: async () => '' });
-    try {
-      await runner.exec('print("warm")', []);
-      const first = runner.exec('import asyncio\nawait asyncio.sleep(2)', [], undefined, { deadlineMs: 300 });
-      runner.abort('turn abandoned');
-      const stopped = await first;
-      assert.strictEqual(stopped.aborted, true);
-      assert.match(stopped.stderr, /aborted by host: turn abandoned/);
-      // Had the aborted exec gone on to arm its deadline, that would interrupt
-      // this next script at 300 ms.
-      const next = await runner.exec('import asyncio\nawait asyncio.sleep(1)\nprint("whole")', []);
-      assert.strictEqual(next.returnCode, 0, next.stderr);
-      assert.strictEqual(next.stdout, 'whole\n');
-    } finally {
-      runner.dispose();
-    }
-  });
-
-  const stops: [string, (runner: PyRunner) => void, RegExp][] = [
-    ['a dispose', (runner) => runner.dispose(), /^code_execution runner disposed$/],
-    [
-      'an abort then a dispose (a background cancel)',
-      (runner) => {
-        runner.abort('cancelled by agent');
-        runner.dispose();
-      },
-      /^script aborted by host: cancelled by agent$/,
-    ],
-  ];
-  for (const [how, stop, says] of stops) {
-    it(`${how} settles the exec at once`, async () => {
-      const runner = new PyRunner({ onToolCall: async () => '' });
-      const started = Date.now();
-      const pending = runner.exec('import asyncio\nawait asyncio.sleep(2)', []);
-      stop(runner);
-      const result = await pending;
-      assert.strictEqual(result.aborted, true);
-      assert.match(result.stderr, says);
-      // Waiting on the killed interpreter's readiness would take its 15 s start timeout.
-      const took = Date.now() - started;
-      assert.ok(took < 10_000, `settled after ${took} ms`);
-    });
+/** A result class whose structured view is a prototype getter, carrying a symbol-keyed field too. */
+class StructuredResult {
+  success = true;
+  refused = true;
+  constructor() {
+    (this as unknown as Record<symbol, unknown>)[Symbol.for('test.tag')] = 'tagged';
   }
+  get structured(): unknown {
+    return { from: 'a getter' };
+  }
+  get keepWhenWithheld(): string[] {
+    return ['path'];
+  }
+}
 
-  it('an abort while an interpreter that has stopped reading its input starts throws nothing', posix, async () => {
-    // The stand-in closes its input, says so, and never gets ready, so the
-    // abort's write meets a pipe nobody reads.
-    const closed = standIn('exec 0<&-\ntouch "$(dirname "$0")/closed"\nexec sleep 30');
-    const runner = new PyRunner({ pythonPath: closed.path, onToolCall: async () => '' });
-    try {
-      const pending = runner.exec('print(1)', []);
-      await until(() => existsSync(join(closed.dir, 'closed')), 'the stand-in to close its input');
-      runner.abort('turn abandoned');
-      const result = await pending;
-      assert.strictEqual(result.stderr, 'script aborted by host: turn abandoned');
-      // An unheard write error would fail this test as an uncaught exception.
-      await turns();
-    } finally {
-      runner.dispose();
-      closed.done();
-    }
-  });
+/** How many times the 'counted' odd claim's data getter has been read. */
+let countedReads = 0;
+/** How many times the 'endturn-throws' odd claim's endTurn getter has been read. */
+let endTurnReads = 0;
+/** How many times the 'error-throws' odd claim's error getter has been read. */
+let errorReads = 0;
 
-  it("an exec whose interpreter has stopped reading its input but runs on is settled at the failed write", posix, async () => {
-    // As after a script closes file descriptor 0: the interpreter is alive,
-    // and the exec's own writes, the init and the exec, meet a pipe nobody
-    // reads. Left running, the exec would wait out its 10-minute time limit.
-    const closes = standIn(`exec 0<&-\necho '{"op":"ready"}'\nexec sleep 30`);
-    const runner = new PyRunner({ pythonPath: closes.path, onToolCall: async () => '' });
-    try {
-      const result = await within(runner.exec('print(1)', []), 'the exec to settle');
-      assert.strictEqual(result.aborted, true);
-      assert.match(result.stderr, /^python runtime stopped reading its input, so it was killed/);
-      assert.strictEqual(runner.busy, false);
-      await turns();
-    } finally {
-      runner.dispose();
-      closes.done();
-    }
-  });
-
-  it("an abort or a dispose on the tick exec is called, with an interpreter that can't be spawned, kills no child without a pid", async () => {
-    // A failed spawn's child has no pid, and its exitCode stays null until
-    // Node's 'error' for it, a tick later. A kill() in that tick signals
-    // whatever pid Node's handle held: in a fresh Node 20 process that was 0,
-    // the caller's own process group. So the stub records such a kill
-    // instead, and passes on only a child's with a pid.
-    const kill = ChildProcess.prototype.kill;
-    const pidless: (NodeJS.Signals | number | undefined)[] = [];
-    ChildProcess.prototype.kill = function (this: ChildProcess, signal?: NodeJS.Signals | number) {
-      if (this.pid === undefined) {
-        pidless.push(signal);
-        return false;
-      }
-      return kill.call(this, signal);
-    };
-    try {
-      for (const stop of ['abort', 'dispose'] as const) {
-        const runner = new PyRunner({ pythonPath: '/definitely/not/a/python', onToolCall: async () => '' });
-        try {
-          const pending = runner.exec('print(1)', []);
-          if (stop === 'abort') runner.abort('stopped on the spawn tick');
-          else runner.dispose();
-          const result = await within(pending, `the exec stopped by ${stop}`);
-          assert.strictEqual(result.aborted, true, stop);
-          assert.strictEqual(
-            result.stderr,
-            stop === 'abort' ? 'script aborted by host: stopped on the spawn tick' : 'code_execution runner disposed',
-          );
-          assert.deepStrictEqual(pidless, [], `${stop}: a kill reached a child with no pid`);
-        } finally {
-          runner.dispose();
-        }
-      }
-    } finally {
-      ChildProcess.prototype.kill = kill;
-    }
-  });
-
-  it('an interpreter that exits before it is ready still reads as a failed start', posix, async () => {
-    const exits = standIn('exit 3');
-    const runner = new PyRunner({ pythonPath: exits.path, onToolCall: async () => '' });
-    try {
-      const result = await runner.exec('print(1)', []);
-      assert.strictEqual(result.aborted, true);
-      assert.strictEqual(
-        result.stderr,
-        `script didn't run: the Python interpreter, ${exits.path}, exited as it started, so none of the script ran. `
-          + 'Run it again; if it fails the same way, ask whoever runs this host.',
-      );
-    } finally {
-      runner.dispose();
-      exits.done();
-    }
-  });
-});
-
-// Inner-call ids restart in every interpreter: a result that outlives its
-// interpreter must not resolve a call of the one that replaced it.
-describe('code_execution inner-call results after the interpreter is replaced (real python3)', () => {
-  const stops: Record<string, { code: string; stop?: (runner: PyRunner) => void }> = {
-    aborted: { code: 'print(await test__echo({}))', stop: (runner) => runner.abort('turn abandoned') },
-    crashed: {
-      code: 'import asyncio, os\nasyncio.get_running_loop().call_later(0.2, os._exit, 1)\nprint(await test__echo({}))',
-    },
-  };
-
-  for (const [how, { code, stop }] of Object.entries(stops)) {
-    it(`a late result from a script whose interpreter ${how} does not reach the next script`, async () => {
-      const calls: Array<(result: string) => void> = [];
-      const runner = new PyRunner({
-        onToolCall: () => new Promise<string>((resolve) => calls.push(resolve)),
-      });
-      const logged: string[] = [];
-      const consoleError = console.error;
-      console.error = (...args: unknown[]) => {
-        logged.push(args.map(String).join(' '));
-        consoleError(...args);
+/** Results of odd shapes that claim a refusal, for the in-process route's copy. */
+function oddClaim(kind: string): unknown {
+  switch (kind) {
+    case 'structured': return new StructuredResult();
+    // Own fields named like Object.prototype's members are fields.
+    case 'proto-names': return { success: true, refused: true, toString: 'mine', constructor: 'also mine' };
+    case 'unreadable-refused': return { success: true, data: 1, get refused(): boolean { throw new Error('no claim to read'); } };
+    // The claim can't be read, but the turn's end and the module's error can.
+    case 'unreadable-refused-kept': return { success: false, endTurn: true, error: 'finished', get refused(): boolean { throw new Error('no claim to read'); } };
+    // The turn's end and the module's error are read before success, which throws.
+    case 'endturn-then-throw': return { isError: true, refused: true, endTurn: true, error: 'the module said why', get success(): boolean { throw new Error('unreadable success'); } };
+    // The turn's end can't be read, the first time it's asked; the module's error can.
+    case 'endturn-throws': {
+      endTurnReads = 0;
+      return {
+        isError: true, refused: true, error: 'original failure',
+        get endTurn(): boolean { endTurnReads += 1; if (endTurnReads === 1) throw new Error('no turn end'); return true; },
       };
-      try {
-        const first = runner.exec(code, ECHO_TOOLS);
-        await until(() => calls.length === 1, 'the first script to call its tool');
-        stop?.(runner);
-        const stopped = await first;
-        assert.strictEqual(stopped.aborted, true, stopped.stderr);
-
-        const second = runner.exec('print(await test__echo({}))', ECHO_TOOLS);
-        await until(() => calls.length === 2, 'the second script to call its tool');
-        // Both calls are the first of their interpreter.
-        calls[0]('stale result of the stopped script');
-        await new Promise((r) => setTimeout(r, 300));
-        calls[1]('result of this script');
-        const result = await second;
-        assert.strictEqual(result.returnCode, 0, result.stderr);
-        assert.strictEqual(result.stdout, 'result of this script\n');
-        assert.ok(
-          logged.some((l) => /dropped late result of test--echo call t1: the interpreter that asked for it is gone/.test(l)),
-          'the dropped result is logged',
-        );
-      } finally {
-        console.error = consoleError;
-        runner.dispose();
-      }
-    });
+    }
+    // The module's error can't be read, the first time it's asked.
+    case 'error-throws': {
+      errorReads = 0;
+      return {
+        isError: true, refused: true,
+        get error(): string { errorReads += 1; if (errorReads === 1) throw new Error('no error text'); return 'real failure'; },
+      };
+    }
+    // An error whose own text can't be read, on a result that can't be copied.
+    case 'unreadable-error': return { refused: true, endTurn: true, error: { get message(): string { throw new Error('no text'); } }, get data(): unknown { throw new Error('unreadable data'); } };
+    // A field named __proto__, as JSON makes one.
+    case 'proto-field': return JSON.parse('{"success": true, "refused": true, "__proto__": "mine"}');
+    // An own getter for a declared field, read once.
+    case 'counted': {
+      countedReads = 0;
+      return { success: true, refused: true, get data(): number { countedReads += 1; return countedReads; } };
+    }
+    case 'function': return Object.assign(() => 1, { refused: true, success: true });
+    default: throw new Error(`no odd claim ${kind}`);
   }
-});
+}
 
-// ---------------------------------------------------------------------------
-// Framework integration
-// ---------------------------------------------------------------------------
-
+/** Echoes its input, ends the turn, or answers when released. */
 class ScriptToolModule implements Module {
   readonly name = 'test';
   readonly calls: ToolCall[] = [];
+  private readonly gates: Array<() => void> = [];
 
   async start(_ctx: ModuleContext): Promise<void> {}
   async stop(): Promise<void> {}
@@ -915,34 +122,49 @@ class ScriptToolModule implements Module {
         description: 'Echo input. Returns JSON: {"echoed": <input>}.',
         inputSchema: { type: 'object', properties: { message: { type: 'string' } } },
       },
-      {
-        name: 'finish',
-        description: 'End the turn.',
-        inputSchema: { type: 'object', properties: {} },
-      },
+      { name: 'finish', description: 'End the turn.', inputSchema: { type: 'object', properties: {} } },
+      { name: 'slow', description: 'Answers when the test releases it.', inputSchema: { type: 'object', properties: {} } },
+      { name: 'claims_refused', description: 'Fails, claiming a refusal.', inputSchema: { type: 'object', properties: {} } },
+      { name: 'slow_finish', description: 'Ends the turn when the test releases it.', inputSchema: { type: 'object', properties: {} } },
+      { name: 'class_result', description: 'Answers with a result class whose data is a getter.', inputSchema: { type: 'object', properties: { refused: { type: 'boolean' } } } },
+      { name: 'unreadable_claim', description: 'Claims a refusal on a result one of whose fields throws.', inputSchema: { type: 'object', properties: {} } },
+      { name: 'odd_claim', description: 'Claims a refusal on a result of an odd shape.', inputSchema: { type: 'object', properties: { kind: { type: 'string' } } } },
     ];
+  }
+
+  /** Answer the oldest slow call waiting. */
+  release(): boolean {
+    const gate = this.gates.shift();
+    gate?.();
+    return gate !== undefined;
+  }
+
+  get waiting(): number {
+    return this.gates.length;
   }
 
   async handleToolCall(call: ToolCall): Promise<ToolResult> {
     this.calls.push(call);
-    const baseName = call.name.includes('--')
-      ? call.name.slice(call.name.lastIndexOf('--') + 2)
-      : call.name;
-    if (baseName === 'finish') {
+    const baseName = call.name.includes('--') ? call.name.slice(call.name.lastIndexOf('--') + 2) : call.name;
+    if (baseName === 'finish') return { success: true, data: { finished: true }, endTurn: true };
+    if (baseName === 'slow') await new Promise<void>((resolve) => this.gates.push(resolve));
+    if (baseName === 'claims_refused') return { success: false, isError: true, refused: true, error: 'the tool says it refused' };
+    if (baseName === 'slow_finish') {
+      await new Promise<void>((resolve) => this.gates.push(resolve));
       return { success: true, data: { finished: true }, endTurn: true };
     }
+    if (baseName === 'class_result') return new ClassResult(Boolean((call.input as { refused?: boolean }).refused)) as unknown as ToolResult;
+    if (baseName === 'unreadable_claim') {
+      return { success: false, isError: true, refused: true, get error(): string { throw new Error('unreadable'); } } as ToolResult;
+    }
+    if (baseName === 'odd_claim') return oddClaim(String((call.input as { kind?: unknown }).kind)) as ToolResult;
     return { success: true, data: { echoed: call.input } };
   }
 
   async onProcess(event: ProcessEvent, _state: ProcessState): Promise<EventResponse> {
     if (event.type === 'external-message') {
-      const content = Array.isArray((event as { content?: unknown }).content)
-        ? ((event as { content: unknown }).content as Array<{ type: string; text?: string }>)
-        : [{ type: 'text', text: String((event as { content?: unknown }).content) }];
-      return {
-        addMessages: [{ participant: 'User', content: content as never }],
-        requestInference: true,
-      };
+      const content = (event as { content?: unknown }).content as Array<{ type: string; text?: string }>;
+      return { addMessages: [{ participant: 'User', content: content as never }], requestInference: true };
     }
     return {};
   }
@@ -953,349 +175,1000 @@ function tempStorePath(prefix: string): { tempDir: string; storePath: string } {
   return { tempDir, storePath: join(tempDir, 'store.chronicle') };
 }
 
-async function createFrameworkWithCodeExecution(storePath: string, membrane: MockMembrane, module: Module) {
-  return AgentFramework.create({
+async function withFramework(
+  prefix: string,
+  options: { membrane?: MockMembrane; module?: Module; codeExecution?: Record<string, unknown>; resident?: boolean; errorPolicy?: ErrorPolicy },
+  body: (framework: AgentFramework, membrane: MockMembrane) => Promise<void>,
+): Promise<void> {
+  const { tempDir, storePath } = tempStorePath(prefix);
+  const membrane = options.membrane ?? new MockMembrane();
+  const framework = await AgentFramework.create({
     storePath,
     membrane: membrane.asMembrane(),
-    agents: [],
-    modules: [module],
+    agents: options.resident
+      ? [{ name: 'prime', model: 'test-model', systemPrompt: 'You are prime.', allowedTools: 'all' }]
+      : [],
+    modules: [options.module ?? new ScriptToolModule()],
     syncIntervalMs: 0,
-    codeExecution: { enabled: true },
+    codeExecution: { enabled: true, ...(options.codeExecution ?? {}) },
+    ...(options.errorPolicy ? { errorPolicy: options.errorPolicy } : {}),
   });
+  try {
+    await body(framework, membrane);
+  } finally {
+    await framework.stop();
+    rmSync(tempDir, { recursive: true, force: true });
+  }
 }
 
-/** A host variable no allowlist names, and a declared one, for the env tests below. */
-const HOST_ONLY = 'AF_CODE_EXEC_TEST_HOST_ONLY';
-const DECLARED = 'AF_CODE_EXEC_TEST_DECLARED';
+/** Run one ephemeral agent's turn to its end. */
+async function runEphemeral(framework: AgentFramework, name: string): Promise<{ speech: string; toolCallsCount: number }> {
+  const created = await framework.createEphemeralAgent({ name, model: 'test-model', systemPrompt: 'Do the task.', allowedTools: 'all' });
+  created.contextManager.addMessage('user', [{ type: 'text', text: 'Go.' }]);
+  const promise = framework.runEphemeralToCompletion(created.agent, created.contextManager);
+  framework.start();
+  return promise as Promise<{ speech: string; toolCallsCount: number }>;
+}
 
-describe('framework code_execution integration (real python3)', () => {
-  it("a script gets codeExecution.env and not a host variable outside the allowlist", async () => {
-    const { tempDir, storePath } = tempStorePath('pytc-env-');
-    const membrane = new MockMembrane();
-    const code = `import os; print("declared:", os.environ.get("${DECLARED}"), "host:", repr(os.environ.get("${HOST_ONLY}")))`;
-    membrane.pushResponse(createMockResponse([
-      { type: 'tool_use', id: 'call_env_1', name: 'code_execution', input: { code } },
-    ], 'tool_use'));
-    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Done.' }]));
-    const framework = await AgentFramework.create({
-      storePath,
-      membrane: membrane.asMembrane(),
-      agents: [],
-      modules: [new ScriptToolModule()],
-      syncIntervalMs: 0,
-      codeExecution: { enabled: true, env: { [DECLARED]: 'from-config' } },
+/** A stream whose provider fails before it sends anything: its first event is the error, as membrane reports one. */
+class ProviderErrorStream implements YieldingStream {
+  isWaitingForTools = false;
+  pendingToolCallIds: string[] = [];
+  toolDepth = 0;
+  isCancelled = false;
+  constructor(private readonly error: Error) {}
+  provideToolResults(): void {}
+  cancel(): void {
+    this.isCancelled = true;
+  }
+  async *[Symbol.asyncIterator](): AsyncIterator<StreamEvent> {
+    yield { type: 'error', error: this.error } as StreamEvent;
+  }
+}
+
+type WireResult = { toolUseId: string; content: string; isError?: boolean };
+
+/** A code_execution result's text: its one text block, or its error. */
+const resultText = (result: ToolResult): string =>
+  result.isError ? result.error ?? '' : ((result.data as Array<{ text?: string }> | undefined)?.[0]?.text ?? '');
+
+describe('code_execution through the framework', () => {
+  it('is offered only when enabled, and says how a script calls its tools', async () => {
+    const { tempDir, storePath } = tempStorePath('ce-off-');
+    const off = await AgentFramework.create({
+      storePath, membrane: new MockMembrane().asMembrane(), agents: [], modules: [new ScriptToolModule()], syncIntervalMs: 0,
     });
     try {
-      process.env[HOST_ONLY] = 'host-value';
-      const created = await framework.createEphemeralAgent({
-        name: 'worker', model: 'test-model', systemPrompt: 'Do the task.', allowedTools: 'all',
-      });
-      created.contextManager.addMessage('user', [{ type: 'text', text: 'Go.' }]);
-      const promise = framework.runEphemeralToCompletion(created.agent, created.contextManager);
-      framework.start();
-      await promise;
-      const wireResult = membrane.lastStream!.receivedToolResults[0][0] as { content: string };
-      assert.match(wireResult.content, /declared: from-config host: None/, wireResult.content);
+      assert.ok(!off.getAllTools().some((t) => t.name === 'code_execution'));
     } finally {
-      await framework.stop();
-      delete process.env[HOST_ONLY];
+      await off.stop();
       rmSync(tempDir, { recursive: true, force: true });
     }
-  });
-
-  it("with codeExecution.inheritEnv: true, a script gets the host's variables beside codeExecution.env", async () => {
-    const { tempDir, storePath } = tempStorePath('pytc-envinherit-');
-    const membrane = new MockMembrane();
-    const code = `import os; print("declared:", os.environ.get("${DECLARED}"), "host:", repr(os.environ.get("${HOST_ONLY}")))`;
-    membrane.pushResponse(createMockResponse([
-      { type: 'tool_use', id: 'call_env_2', name: 'code_execution', input: { code } },
-    ], 'tool_use'));
-    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Done.' }]));
-    const framework = await AgentFramework.create({
-      storePath,
-      membrane: membrane.asMembrane(),
-      agents: [],
-      modules: [new ScriptToolModule()],
-      syncIntervalMs: 0,
-      codeExecution: { enabled: true, env: { [DECLARED]: 'from-config' }, inheritEnv: true },
+    await withFramework('ce-on-', {}, async (framework) => {
+      const tool = framework.getAllTools().find((t) => t.name === 'code_execution');
+      assert.ok(tool, 'code_execution is synthesized');
+      assert.match(tool.description, /Run JavaScript/);
+      assert.match(tool.description, /tools\["module--tool"\]\(\{ \.\.\.its arguments \}\)/);
+      assert.match(tool.description, /A script has 128 MiB of memory/);
     });
-    try {
-      process.env[HOST_ONLY] = 'host-value';
-      const created = await framework.createEphemeralAgent({
-        name: 'worker', model: 'test-model', systemPrompt: 'Do the task.', allowedTools: 'all',
-      });
-      created.contextManager.addMessage('user', [{ type: 'text', text: 'Go.' }]);
-      const promise = framework.runEphemeralToCompletion(created.agent, created.contextManager);
-      framework.start();
-      await promise;
-      const wireResult = membrane.lastStream!.receivedToolResults[0][0] as { content: string };
-      assert.match(wireResult.content, /declared: from-config host: 'host-value'/, wireResult.content);
-    } finally {
-      await framework.stop();
-      delete process.env[HOST_ONLY];
-      rmSync(tempDir, { recursive: true, force: true });
-    }
   });
 
-  it('create() refuses a codeExecution.inheritEnv that is not a boolean', async () => {
-    const { tempDir, storePath } = tempStorePath('pytc-inherit-');
-    try {
-      await assert.rejects(AgentFramework.create({
-        storePath,
-        membrane: new MockMembrane().asMembrane(),
-        agents: [],
-        modules: [new ScriptToolModule()],
-        syncIntervalMs: 0,
-        codeExecution: { enabled: true, inheritEnv: 'false' as unknown as boolean },
-      }), /codeExecution\.inheritEnv must be true or false, unquoted, not a string: /);
-    } finally {
-      rmSync(tempDir, { recursive: true, force: true });
-    }
-  });
-
-  it('synthesizes the tool only when enabled', async () => {
-    const { tempDir, storePath } = tempStorePath('pytc-tools-');
-    const membrane = new MockMembrane();
-    const framework = await AgentFramework.create({
-      storePath,
-      membrane: membrane.asMembrane(),
-      agents: [],
-      modules: [new ScriptToolModule()],
-      syncIntervalMs: 0,
-    });
-    try {
-      assert.ok(!framework.getAllTools().some((t) => t.name === 'code_execution'));
-    } finally {
-      await framework.stop();
-      rmSync(tempDir, { recursive: true, force: true });
-    }
-
-    const { tempDir: tempDir2, storePath: storePath2 } = tempStorePath('pytc-tools2-');
-    const membrane2 = new MockMembrane();
-    const framework2 = await createFrameworkWithCodeExecution(storePath2, membrane2, new ScriptToolModule());
-    try {
-      const tool = framework2.getAllTools().find((t) => t.name === 'code_execution');
-      assert.ok(tool, 'code_execution tool should be synthesized');
-      assert.match(tool.description, /async Python function/);
-      assert.match(tool.description, /__/);
-    } finally {
-      await framework2.stop();
-      rmSync(tempDir2, { recursive: true, force: true });
-    }
-  });
-
-  it('runs a script that calls module tools; intermediates never reach the model', async () => {
-    const { tempDir, storePath } = tempStorePath('pytc-run-');
+  it("runs a script that calls module tools as the agent's; intermediates never reach the model", async () => {
     const membrane = new MockMembrane();
     const module = new ScriptToolModule();
-
     const code = [
-      'import json',
-      'names = []',
-      'flags = []',
-      'for m in ["alpha", "beta"]:',
-      '    raw = await test__echo({"message": m})',
-      '    flags.append(raw.is_error)',
-      '    r = json.loads(raw)',
-      '    names.append(r["echoed"]["message"].upper())',
-      'print("summary:", "+".join(names))',
-      'print("is_error:", flags)',
+      'const names = [];',
+      'for (const m of ["alpha", "beta"]) {',
+      '  const r = await tools["test--echo"]({ message: m });',
+      '  names.push(JSON.parse(r.content[0].text).echoed.message.toUpperCase() + ":" + r.isError);',
+      '}',
+      'text("summary: " + names.join("+"));',
+      'return names.length;',
     ].join('\n');
-
     membrane.pushResponse(createMockResponse([
       { type: 'text', text: 'Let me fan out.' },
       { type: 'tool_use', id: 'call_ce_1', name: 'code_execution', input: { code } },
     ], 'tool_use'));
-    membrane.pushResponse(createMockResponse([
-      { type: 'text', text: 'Final answer.' },
-    ]));
-
-    const framework = await createFrameworkWithCodeExecution(storePath, membrane, module);
-    try {
-      const created = await framework.createEphemeralAgent({
-        name: 'worker',
-        model: 'test-model',
-        systemPrompt: 'Do the task.',
-        allowedTools: 'all',
-      });
-      created.contextManager.addMessage('user', [{ type: 'text', text: 'Go.' }]);
-      const promise = framework.runEphemeralToCompletion(created.agent, created.contextManager);
-      framework.start();
-      const result = await promise;
-
+    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Final answer.' }]));
+    await withFramework('ce-run-', { membrane, module }, async (framework) => {
+      const result = await runEphemeral(framework, 'worker');
       assert.strictEqual(result.speech, 'Final answer.');
-
-      // The module saw both inner calls, dispatched with pytc- IDs (waiter
-      // path), not the model's call ID.
-      const echoCalls = module.calls.filter((c) => c.name.endsWith('--echo') || c.name === 'echo');
+      // The module saw both inner calls, dispatched with pytc- ids (the
+      // waiter path), not the model's call id.
+      const echoCalls = module.calls.filter((c) => c.name.endsWith('echo'));
       assert.strictEqual(echoCalls.length, 2);
-      for (const call of echoCalls) {
-        assert.match(String(call.id), /^pytc-/);
-      }
+      for (const call of echoCalls) assert.match(String(call.id), /^pytc-/);
+      const [results] = membrane.lastStream!.receivedToolResults as WireResult[][];
+      assert.strictEqual(results!.length, 1);
+      const wire = results![0]!;
+      assert.strictEqual(wire.toolUseId, 'call_ce_1');
+      assert.match(wire.content, /^Script s\d+-[0-9a-z]{4} finished\./);
+      assert.match(wire.content, /Its calls: 2 \(2 answered\)\./);
+      assert.match(wire.content, /It returned: 2/);
+      assert.match(wire.content, /summary: ALPHA:false\+BETA:false/);
+      assert.ok(!wire.content.includes('"echoed"'), 'intermediate tool results must not reach the model-facing result');
+    });
+  });
 
-      // The model-facing tool_result carries the script's stdout...
-      const stream = membrane.lastStream!;
-      assert.strictEqual(stream.receivedToolResults.length, 1);
-      const wireResult = stream.receivedToolResults[0][0] as { toolUseId: string; content: string };
-      assert.strictEqual(wireResult.toolUseId, 'call_ce_1');
-      assert.match(wireResult.content, /summary: ALPHA\+BETA/);
-      // Through the framework, each result says it isn't an error (a
-      // handler that passed on only the string would make it None).
-      assert.match(wireResult.content, /is_error: \[False, False\]/);
-      assert.match(wireResult.content, /"return_code":\s*0/);
-      // ...and NOT the intermediate tool results.
-      assert.ok(
-        !wireResult.content.includes('"echoed"'),
-        'intermediate tool results must not reach the model-facing result',
-      );
+  it('a module tool that returns a string hands the script that string, not its JSON encoding', async () => {
+    // The tool contract: a script's tool function returns "the same text the
+    // tool would have returned to you directly". For a string result that
+    // is the string itself, newlines and quotes intact.
+    const listing = 'As of 10:00.\n[review] org/repo#1 "Fix it"';
+    class ListingModule extends ScriptToolModule {
+      override getTools(): ToolDefinition[] {
+        return [...super.getTools(), {
+          name: 'listing',
+          description: 'A line-per-item listing.',
+          inputSchema: { type: 'object', properties: {} },
+        }];
+      }
+      override async handleToolCall(call: ToolCall): Promise<ToolResult> {
+        if (call.name.endsWith('listing')) return { success: true, data: listing };
+        return super.handleToolCall(call);
+      }
+    }
+    const membrane = new MockMembrane();
+    const code = [
+      'const r = await tools["test--listing"]({});',
+      'const t = r.content[0].text;',
+      'const lines = t.split("\\n");',
+      'text("count: " + lines.length);',
+      'text("second: " + lines[1]);',
+      'text("quoted: " + t.startsWith(\'"\'));',
+    ].join('\n');
+    membrane.pushResponse(createMockResponse([
+      { type: 'tool_use', id: 'call_ce_str', name: 'code_execution', input: { code } },
+    ], 'tool_use'));
+    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Done.' }]));
+    await withFramework('ce-string-', { membrane, module: new ListingModule() }, async (framework) => {
+      await runEphemeral(framework, 'worker');
+      const [results] = membrane.lastStream!.receivedToolResults as WireResult[][];
+      const wire = results![0]!;
+      assert.strictEqual(wire.toolUseId, 'call_ce_str');
+      assert.match(wire.content, /count: 2/);
+      assert.match(wire.content, /second: \[review\] org\/repo#1 "Fix it"/);
+      assert.match(wire.content, /quoted: false/);
+    });
+  });
+
+  it("an MCP tool's text-only result reaches the model and a script as that text, not its JSON encoding", async () => {
+    // The MCPL tool-result mapping hands a result whose blocks are all text
+    // on as their joined text, so an MCP tool's text answer is string data
+    // too: the model and a script get the text as the server sent it.
+    const listing = 'As of 10:00.\n[review] org/repo#1 "Fix it"';
+    // A stdio MCPL server whose one tool answers with a single text block
+    // holding the `text` it was given. It accepts the framework's initial
+    // featureSets/update, as the fixtures' servers do, so the connection
+    // doesn't wait out the policy request's timeout.
+    const server = `
+      let buf = '';
+      process.stdin.on('data', (c) => {
+        buf += c.toString('utf8');
+        let i;
+        while ((i = buf.indexOf('\\n')) >= 0) {
+          const line = buf.slice(0, i); buf = buf.slice(i + 1);
+          if (!line.trim()) continue;
+          let m; try { m = JSON.parse(line); } catch { continue; }
+          const reply = (result) => process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: m.id, result }) + '\\n');
+          if (m.method === 'initialize') reply({ protocolVersion: '2024-11-05', serverInfo: { name: 'echo', version: '1.0.0' }, capabilities: { tools: {}, experimental: { mcpl: { version: '0.4' } } } });
+          else if (m.method === 'tools/list') reply({ tools: [{ name: 'echo', description: 'e', inputSchema: { type: 'object' } }] });
+          else if (m.method === 'tools/call') reply({ content: [{ type: 'text', text: String(m.params.arguments.text) }] });
+          else if (m.method === 'featureSets/update') { if (m.id !== undefined) reply({ accepted: true }); }
+        }
+      });
+    `;
+    const { tempDir, storePath } = tempStorePath('ce-mcp-string-');
+    const membrane = new MockMembrane();
+    const code = [
+      `const r = await tools["mcpl--echo--echo"]({ text: ${JSON.stringify(listing)} });`,
+      'const t = r.content[0].text;',
+      'const lines = t.split("\\n");',
+      'text("count: " + lines.length);',
+      'text("second: " + lines[1]);',
+      'text("quoted: " + t.startsWith(\'"\'));',
+    ].join('\n');
+    membrane.pushResponse(createMockResponse([
+      { type: 'tool_use', id: 'call_mcp_direct', name: 'mcpl--echo--echo', input: { text: listing } },
+      { type: 'tool_use', id: 'call_mcp_script', name: 'code_execution', input: { code } },
+    ], 'tool_use'));
+    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Done.' }]));
+
+    const framework = await AgentFramework.create({
+      storePath,
+      membrane: membrane.asMembrane(),
+      agents: [],
+      modules: [],
+      mcplServers: [{ id: 'echo', command: process.execPath, args: ['-e', server] }],
+      syncIntervalMs: 0,
+      codeExecution: { enabled: true },
+    });
+    try {
+      await framework.start();
+      await until(() => framework.getAllTools().some((t) => t.name === 'mcpl--echo--echo'), 'the echo server\'s tool');
+      const created = await framework.createEphemeralAgent({ name: 'worker', model: 'test-model', systemPrompt: 'Do the task.', allowedTools: 'all' });
+      created.contextManager.addMessage('user', [{ type: 'text', text: 'Go.' }]);
+      await framework.runEphemeralToCompletion(created.agent, created.contextManager);
+      const wire = membrane.lastStream!.receivedToolResults[0] as WireResult[];
+      const direct = wire.find((r) => r.toolUseId === 'call_mcp_direct');
+      assert.strictEqual(direct?.content, listing, 'the model gets the text, not its JSON encoding');
+      const script = wire.find((r) => r.toolUseId === 'call_mcp_script');
+      assert.ok(script, 'the script call has a result');
+      assert.match(script.content, /count: 2/);
+      assert.match(script.content, /second: \[review\] org\/repo#1 "Fix it"/);
+      assert.match(script.content, /quoted: false/);
     } finally {
       await framework.stop();
       rmSync(tempDir, { recursive: true, force: true });
     }
   });
 
-  it('two code_execution calls in one response: one runs, the other is refused, the turn completes', async () => {
-    const { tempDir, storePath } = tempStorePath('pytc-two-');
+  it('two code_execution calls in one response both run, and the turn completes', async () => {
     const membrane = new MockMembrane();
     const module = new ScriptToolModule();
-    const code = (label: string) => [
-      'import asyncio, json',
-      `r = json.loads(await test__echo({"message": "${label}"}))`,
-      'await asyncio.sleep(0.2)',
-      `print("ran:", r["echoed"]["message"])`,
-    ].join('\n');
-
+    const code = (label: string) => `const r = await tools["test--echo"]({ message: "${label}" }); text("ran: " + JSON.parse(r.content[0].text).echoed.message);`;
     membrane.pushResponse(createMockResponse([
       { type: 'tool_use', id: 'call_two_a', name: 'code_execution', input: { code: code('a') } },
       { type: 'tool_use', id: 'call_two_b', name: 'code_execution', input: { code: code('b') } },
     ], 'tool_use'));
     membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Both answered.' }]));
-
-    const framework = await createFrameworkWithCodeExecution(storePath, membrane, module);
-    try {
-      const created = await framework.createEphemeralAgent({
-        name: 'pair',
-        model: 'test-model',
-        systemPrompt: 'Run both.',
-        allowedTools: 'all',
-      });
-      created.contextManager.addMessage('user', [{ type: 'text', text: 'Go.' }]);
-      const promise = framework.runEphemeralToCompletion(created.agent, created.contextManager);
-      framework.start();
-      const result = await Promise.race([
-        promise,
-        new Promise<never>((_, reject) => setTimeout(() => reject(new Error('the turn never completed')), 15_000)),
-      ]);
+    await withFramework('ce-two-', { membrane, module }, async (framework) => {
+      const result = await runEphemeral(framework, 'pair');
       assert.strictEqual(result.speech, 'Both answered.');
-
-      const [results] = membrane.lastStream!.receivedToolResults as Array<Array<{ toolUseId: string; content: string }>>;
-      const byId = new Map(results.map((r) => [r.toolUseId, r.content]));
-      assert.match(byId.get('call_two_a') ?? '', /ran: a/, 'the first script ran');
-      assert.match(byId.get('call_two_b') ?? '', /already running/, 'the second was refused');
-      assert.ok(!(byId.get('call_two_b') ?? '').includes('ran: b'));
-      const echoed = module.calls.filter((c) => c.name.endsWith('--echo') || c.name === 'echo').map((c) => (c.input as { message: string }).message);
-      assert.deepStrictEqual(echoed, ['a']);
-    } finally {
-      await framework.stop();
-      rmSync(tempDir, { recursive: true, force: true });
-    }
+      const [results] = membrane.lastStream!.receivedToolResults as WireResult[][];
+      const byId = new Map(results!.map((r) => [r.toolUseId, r.content]));
+      assert.match(byId.get('call_two_a') ?? '', /ran: a/);
+      assert.match(byId.get('call_two_b') ?? '', /ran: b/);
+    });
   });
 
-  it('defers endTurn from inner calls to the code_execution result', async () => {
-    const { tempDir, storePath } = tempStorePath('pytc-endturn-');
+  it("a script's call whose result ends the turn ends it at the code_execution result", async () => {
     const membrane = new MockMembrane();
     const module = new ScriptToolModule();
-
-    const code = [
-      'r = await test__finish({})',
-      'print("after finish:", r)',
-    ].join('\n');
-
     membrane.pushResponse(createMockResponse([
       { type: 'text', text: 'Finishing via script.' },
-      { type: 'tool_use', id: 'call_ce_2', name: 'code_execution', input: { code } },
+      { type: 'tool_use', id: 'call_ce_2', name: 'code_execution', input: { code: 'const r = await tools["test--finish"]({}); await tools["test--echo"]({ message: "after finish: " + r.isError });' } },
     ], 'tool_use'));
     // No further response: endTurn must settle the turn without another round.
-
-    const framework = await createFrameworkWithCodeExecution(storePath, membrane, module);
-    try {
-      const created = await framework.createEphemeralAgent({
-        name: 'finisher',
-        model: 'test-model',
-        systemPrompt: 'Finish.',
-        allowedTools: 'all',
-      });
-      created.contextManager.addMessage('user', [{ type: 'text', text: 'Wrap up.' }]);
-      const promise = framework.runEphemeralToCompletion(created.agent, created.contextManager);
-      framework.start();
-      const result = await promise;
-
-      // The script ran to completion (endTurn was deferred, not applied
-      // mid-script), and the turn then ended without another model round.
-      const finishCalls = module.calls.filter((c) => c.name.endsWith('--finish') || c.name === 'finish');
-      assert.strictEqual(finishCalls.length, 1);
+    await withFramework('ce-endturn-', { membrane, module }, async (framework) => {
+      const result = await runEphemeral(framework, 'finisher');
+      assert.strictEqual(module.calls.filter((c) => c.name.endsWith('finish')).length, 1);
+      // The script went on after the call that ends the turn, to its own end.
+      assert.deepEqual(module.calls.filter((c) => c.name.endsWith('echo')).map((c) => c.input), [{ message: 'after finish: false' }]);
       assert.strictEqual(result.toolCallsCount, 1); // one model-visible call: code_execution
-    } finally {
+    });
+  });
+
+  it('a script still running after yield_time_ms yields with its output, and a wait returns what came since', async () => {
+    const module = new ScriptToolModule();
+    await withFramework('ce-yield-', { module }, async (framework) => {
+      framework.start();
+      const run = (input: Record<string, unknown>) => framework.executeToolCall({ id: `ce-${Math.random()}`, name: 'code_execution', input });
+      const first = await run({ code: 'text("before"); await tools["test--slow"]({}); text("after"); return "done";', yield_time_ms: 100 });
+      const firstText = resultText(first);
+      assert.ok(first.success, firstText);
+      assert.match(firstText, /^Script (s\d+-[0-9a-z]{4}) is still running after 100 ms\./);
+      const id = /^Script (s\d+-[0-9a-z]{4})/.exec(firstText)![1];
+      // Once its call waits, what it wrote first has come back by one return or the next.
+      await until(() => module.waiting === 1, 'the slow call');
+      const middle = await run({ action: 'wait', script_id: id, yield_time_ms: 0 });
+      const middleText = resultText(middle);
+      assert.match(middleText, /Its calls so far: 1 \(1 still running\)\./);
+      const outputOf = (text: string) => /\n(?:Its output|Its output since the last return):\n([\s\S]*)$/.exec(text)?.[1] ?? '';
+      assert.equal(outputOf(firstText) + outputOf(middleText), 'before\n');
+      module.release();
+      const second = await run({ action: 'wait', script_id: id });
+      const secondText = resultText(second);
+      assert.match(secondText, new RegExp(`^Script ${id} finished\\.`));
+      assert.match(secondText, /It returned: "done"/);
+      assert.match(secondText, /Its output since the last return:\nafter\n$/);
+    });
+  });
+
+  it("a module's result can't claim a refusal: the script gets the tool's failure, and its record counts the call as answered", async () => {
+    await withFramework('ce-claims-', {}, async (framework) => {
+      framework.start();
+      const result = await framework.executeToolCall({
+        id: 'ce-claims',
+        name: 'code_execution',
+        input: { code: 'try { const r = await tools["test--claims_refused"]({}); return [r.isError, r.content[0].text]; } catch (e) { return ["threw", e.name]; }' },
+      });
+      const text = resultText(result);
+      assert.ok(result.success, text);
+      assert.match(text, /It returned: \[true,"the tool says it refused"\]/);
+      assert.match(text, /Its calls: 1 \(1 answered with an error\)\./);
+      // Called directly, in process, the module's result doesn't carry the claim either.
+      const direct = await framework.executeToolCall({ id: 'claims-direct', name: 'test--claims_refused', input: {} });
+      assert.equal(direct.isError, true);
+      assert.equal(direct.refused, undefined);
+      assert.equal(direct.error, 'the tool says it refused');
+      // Nor does the result stored, for a module called outside the registry's route.
+      const stored = storableToolResult({ id: 'claims-stored', name: 'test--claims_refused', input: {} }, { success: false, isError: true, refused: true, error: 'the tool says it refused' });
+      assert.equal(stored.refused, undefined);
+      assert.equal(stored.isError, true);
+      assert.equal(stored.error, 'the tool says it refused');
+      // A result class claiming it keeps its getters' values, less the claim.
+      const classed = await framework.executeToolCall({ id: 'class-claims', name: 'test--class_result', input: { refused: true } });
+      assert.equal(classed.refused, undefined);
+      assert.deepEqual(classed.data, { from: 'a getter' });
+      assert.equal(classed.endTurn, true);
+      // One with no claim is the module's own object, its getters as they are.
+      const own = await framework.executeToolCall({ id: 'class-own', name: 'test--class_result', input: { refused: false } });
+      assert.ok(own instanceof ClassResult);
+      // A claim on a result that can't be read for its copy: a failure saying so, never the claim.
+      const unreadable = await framework.executeToolCall({ id: 'unreadable', name: 'test--unreadable_claim', input: {} });
+      assert.equal(unreadable.refused, undefined);
+      assert.equal(unreadable.isError, true);
+      assert.match(unreadable.error ?? '', /returned a result that couldn't be read \(unreadable\)\. The call itself completed\./);
+      const odd = (kind: string) => framework.executeToolCall({ id: `odd-${kind}`, name: 'test--odd_claim', input: { kind } });
+      // Every field ToolResult declares is read by name, a prototype getter's included, and a symbol field stays.
+      const structured = await odd('structured') as ToolResult & Record<symbol, unknown>;
+      assert.equal(structured.refused, undefined);
+      assert.deepEqual(structured.structured, { from: 'a getter' });
+      assert.deepEqual(structured.keepWhenWithheld, ['path']);
+      assert.equal(structured[Symbol.for('test.tag')], 'tagged');
+      // Own fields named like Object.prototype's members are copied as fields.
+      const named = await odd('proto-names') as unknown as Record<string, unknown>;
+      assert.equal(Object.prototype.hasOwnProperty.call(named, 'toString'), true);
+      assert.equal(named.toString, 'mine');
+      assert.equal(named.constructor, 'also mine');
+      // A claim that can't be read is a result that can't be read: a failure, never a success without it.
+      const unreadableClaim = await odd('unreadable-refused');
+      assert.equal(unreadableClaim.success, false);
+      assert.equal(unreadableClaim.refused, undefined);
+      assert.match(unreadableClaim.error ?? '', /couldn't be read \(no claim to read\)\. The call itself completed\.$/);
+      // A failure keeps the turn's end and the module's error, read before the field that threw.
+      const kept = await odd('endturn-then-throw');
+      assert.equal(kept.endTurn, true);
+      assert.match(kept.error ?? '', /couldn't be read \(unreadable success\)\. The call itself completed, with this error: the module said why$/);
+      // A turn's end that can't be read leaves the failure ending no turn, and keeps the
+      // module's error; its getter is asked once, not again for the failure.
+      const throwsEnd = await odd('endturn-throws');
+      assert.equal(throwsEnd.endTurn, undefined);
+      assert.match(throwsEnd.error ?? '', /couldn't be read \(no turn end\)\. The call itself completed, with this error: original failure$/);
+      assert.equal(endTurnReads, 1);
+      // So is an error that can't be read: the failure says why, and doesn't ask again.
+      const throwsError = await odd('error-throws');
+      assert.match(throwsError.error ?? '', /couldn't be read \(no error text\)\. The call itself completed\.$/);
+      assert.equal(errorReads, 1);
+      // A claim that can't be read keeps them too.
+      const keptUnclaimed = await odd('unreadable-refused-kept');
+      assert.equal(keptUnclaimed.endTurn, true);
+      assert.match(keptUnclaimed.error ?? '', /couldn't be read \(no claim to read\)\. The call itself completed, with this error: finished$/);
+      // An error whose own text can't be read: the failure says only why.
+      const noText = await odd('unreadable-error');
+      assert.equal(noText.endTurn, true);
+      assert.match(noText.error ?? '', /couldn't be read \(unreadable data\)\. The call itself completed\.$/);
+      // A field named __proto__ stays a field, and the copy's prototype is an object's.
+      const protoField = await odd('proto-field') as unknown as Record<string, unknown>;
+      assert.equal(Object.prototype.hasOwnProperty.call(protoField, '__proto__'), true);
+      assert.equal(Object.getOwnPropertyDescriptor(protoField, '__proto__')?.value, 'mine');
+      assert.equal(Object.getPrototypeOf(protoField), Object.prototype);
+      // A declared field's own getter is read once.
+      const counted = await odd('counted');
+      assert.equal(counted.data, 1);
+      assert.equal(countedReads, 1);
+      // A function result is checked for the claim too, and its non-enumerable own fields aren't copied.
+      const fn = await odd('function');
+      assert.equal(fn.refused, undefined);
+      assert.equal(fn.success, true);
+      assert.equal(Object.prototype.hasOwnProperty.call(fn, 'name'), false);
+      assert.equal(Object.prototype.hasOwnProperty.call(fn, 'length'), false);
+    });
+  });
+
+  it("a script's call whose result ends the turn ends it at the call watching when it comes, a later wait's", async () => {
+    const module = new ScriptToolModule();
+    await withFramework('ce-late-endturn-', { module }, async (framework) => {
+      framework.start();
+      const run = (input: Record<string, unknown>) => framework.executeToolCall({ id: `ce-${Math.random()}`, name: 'code_execution', input });
+      const first = await run({ code: 'await tools["test--slow_finish"]({}); return "after";', yield_time_ms: 100 });
+      assert.equal(first.endTurn, undefined, 'the run yielded before the result');
+      const id = /^Script (s\d+-[0-9a-z]{4})/.exec(resultText(first))![1]!;
+      await until(() => module.waiting === 1, 'the gated call');
+      const scripts = (framework as unknown as { codeExecution: { scripts: { scripts: Map<string, { watch: unknown }> } } }).codeExecution.scripts;
+      const waiting = run({ action: 'wait', script_id: id });
+      await until(() => scripts.scripts.get(id)?.watch != null, 'the wait watching the script');
+      module.release();
+      const second = await waiting;
+      assert.match(resultText(second), /It returned: "after"/);
+      assert.equal(second.endTurn, true, "the later wait's result ends the turn");
+    });
+  });
+
+  it("a stop watches with its own call's watch, so a turn-ending result that comes during it ends the stop's turn", async () => {
+    await withFramework('ce-stop-watch-', {}, async (framework) => {
+      framework.start();
+      const run = (input: Record<string, unknown>) => framework.executeToolCall({ id: `ce-${Math.random()}`, name: 'code_execution', input });
+      const first = await run({ code: 'for (;;) {}', yield_time_ms: 100 });
+      assert.match(resultText(first), /is still running after/);
+      const id = /^Script (s\d+-[0-9a-z]{4})/.exec(resultText(first))![1]!;
+      const scripts = (framework as unknown as { codeExecution: { scripts: { stop(agent: string, id: string, watch?: { endTurn: boolean }): Promise<unknown> } } }).codeExecution.scripts;
+      const realStop = scripts.stop.bind(scripts);
+      let passed: { endTurn: boolean } | undefined;
+      // A turn-ending result that comes while the stop watches marks the watch it was given.
+      scripts.stop = async (agent, scriptId, watch) => {
+        passed = watch;
+        if (watch) watch.endTurn = true;
+        return realStop(agent, scriptId, watch);
+      };
+      const stopped = await run({ action: 'stop', script_id: id });
+      assert.ok(passed, "the stop was given the call's watch");
+      assert.match(resultText(stopped), /was stopped, as you asked/);
+      assert.equal(stopped.endTurn, true);
+    });
+  });
+
+  it("a script call that got no result from the host is answered for by the bridge's timer, marked so its place stays taken", async (t) => {
+    await withFramework('ce-no-result-', {}, async (framework) => {
+      const fw = framework as unknown as {
+        codeExecution: { settings: { toolCallTimeoutMs: number } };
+        dispatchToolCall(agent: string, call: unknown, turnId?: number): void;
+        scriptToolCall(agent: string, tool: string, args: string, context: Record<string, unknown>): Promise<{ held?: boolean; json: string }>;
+        toolLifecycleEmitter: unknown;
+      };
+      // The dispatch loses the call: no result ever comes.
+      fw.dispatchToolCall = () => {};
+      // What observers are told of the call (RFC-007).
+      const told: Array<[string, unknown[]]> = [];
+      fw.toolLifecycleEmitter = new Proxy({}, { get: (_t, name) => (...args: unknown[]) => { told.push([String(name), args]); } });
+      t.mock.timers.enable({ apis: ['setTimeout'] });
+      const answering = fw.scriptToolCall('agent', 'test--echo', '{}', {});
+      t.mock.timers.tick(fw.codeExecution.settings.toolCallTimeoutMs + 30_000);
+      // The timer answers at the tick: a few turns of the loop bound the wait, so a timer that never fired fails here.
+      const answer = await Promise.race([
+        answering,
+        (async () => {
+          for (let i = 0; i < 100; i++) await new Promise((res) => setImmediate(res));
+          throw new Error('no answer came after the tick');
+        })(),
+      ]);
+      t.mock.timers.reset();
+      assert.equal(answer.held, true);
+      assert.match(answer.json, /produced no result within/);
+      // The call is closed for observers as one that failed with no result:
+      // marked failed first, so its result closes it as a failure.
+      const names = told.map(([name]) => name);
+      const failedAt = names.indexOf('markDispatchFailure');
+      const closedAt = names.indexOf('onResult');
+      assert.ok(failedAt >= 0 && closedAt > failedAt, names.join(', '));
+      assert.equal(told[failedAt]![1][1], told[closedAt]![1][1], 'the same call');
+      assert.equal(told[closedAt]![1][2], undefined, 'with no result');
+    });
+  });
+
+  it("a non-primary agent's run made in a turn that has ended is refused: its script would outlive the turn", async () => {
+    await withFramework('ce-ended-turn-', {}, async (framework) => {
+      const fw = framework as unknown as { primaryAgentName: string | undefined; openLogical: Map<string, object> };
+      fw.primaryAgentName = 'prime';
+      const run = (agent: string, turnId: number | undefined) => framework.executeToolCall({
+        id: `ce-${Math.random()}`, name: 'code_execution', input: { code: 'return 1;', yield_time_ms: 10_000 },
+        callerAgentName: agent, ...(turnId === undefined ? {} : { callerTurnId: turnId }),
+      });
+      const refused = await run('helper', 999);
+      assert.equal(refused.isError, true);
+      assert.match(refused.error ?? '', /the turn this call was made in has ended, and only the primary agent's scripts outlive a turn/);
+      // The primary agent's scripts outlive turns, and a call made in no turn has none to outlive.
+      assert.match(resultText(await run('prime', 999)), /finished/);
+      assert.match(resultText(await run('helper', undefined)), /finished/);
+      // A run made in the helper's turn still open runs.
+      fw.openLogical.set('helper', { turnId: 5 });
+      assert.match(resultText(await run('helper', 5)), /finished/);
+      fw.openLogical.delete('helper');
+      // With no primary agent, every agent's scripts outlive its turns.
+      fw.primaryAgentName = undefined;
+      assert.match(resultText(await run('helper', 999)), /finished/);
+    });
+  });
+
+  it("a cancelled stream that no longer owns its agent abandons its own turn, and its settle ends that turn, not every turn", async () => {
+    await withFramework('ce-cancel-own-turn-', {}, async (framework) => {
+      const fw = framework as unknown as {
+        settleDeliberateCancel(args: Record<string, unknown>): void;
+        codeExecution: { scripts: { turnEnded(agent: string, turn: unknown, abandoned: boolean): void } };
+      };
+      const ended: unknown[] = [];
+      fw.codeExecution.scripts.turnEnded = (agent, turn, abandoned) => { ended.push([agent, turn, abandoned]); };
+      // A newer stream (2) took the agent; this one (1) is cancelled.
+      const agent = { name: 'helper', streamId: 2, reset: () => {}, toolResultGuard: { hasPending: false }, getContextManager: () => ({ addMessage: () => {} }) };
+      fw.settleDeliberateCancel({ agent, myStreamId: 1, startTime: Date.now(), compiledRequest: undefined, reason: 'user', closes: undefined, stream: { turnId: 3 }, log: () => {} });
+      assert.deepEqual(ended, [['helper', { id: 3, live: [] }, true], ['helper', { id: 3, live: [] }, true]]);
+    });
+  });
+
+  it("a conversation fork that is disposed tells the scripts its agent has gone", async () => {
+    await withFramework('ce-fork-gone-', {}, async (framework) => {
+      const fw = framework as unknown as {
+        disposeConversationAgent(agent: string): void;
+        codeExecution: { scripts: { agentGone(agent: string): void } };
+      };
+      const gone: string[] = [];
+      fw.codeExecution.scripts.agentGone = (agent) => { gone.push(agent); };
+      fw.disposeConversationAgent('fork-1');
+      assert.deepEqual(gone, ['fork-1']);
+    });
+  });
+
+  it("with toolCallTimeoutMs at the longest a timer can wait, the bridge's own timer doesn't fire at once", async () => {
+    await withFramework('ce-longest-timeout-', {}, async (framework) => {
+      const fw = framework as unknown as {
+        codeExecution: { settings: { toolCallTimeoutMs: number } };
+        scriptToolWaiters: Map<string, (result: ToolResult) => void>;
+        dispatchToolCall(agent: string, call: { id: string }, turnId?: number): void;
+        scriptToolCall(agent: string, tool: string, args: string, context: Record<string, unknown>): Promise<{ held?: boolean; json: string }>;
+      };
+      fw.codeExecution.settings.toolCallTimeoutMs = 2_147_483_647;
+      // The tool answers after 50 ms: a timer that overflowed would have answered for it within 1 ms.
+      fw.dispatchToolCall = (_agent, call) => {
+        setTimeout(() => fw.scriptToolWaiters.get(call.id)?.({ success: true, data: { echoed: true } }), 50);
+      };
+      const answer = await fw.scriptToolCall('agent', 'test--echo', '{}', {});
+      assert.equal(answer.held, undefined);
+      assert.match(answer.json, /echoed/);
+    });
+  });
+
+  it("every settle that carries its turn ends that turn's scripts, naming the turns still live", async () => {
+    await withFramework('ce-stale-settle-', {}, async (framework) => {
+      const fw = framework as unknown as {
+        openLogical: Map<string, object>;
+        turnRouting: Map<string, object>;
+        activeTurnTokens: Map<string, number>;
+        settleAgent(agent: string, outcome: { stopReason: string; speech: string }, closes: object | undefined, stream?: object): void;
+        abandonAgentScripts(agent: string, reason: string, stream: object | 'every'): void;
+        endDroppedTurn(agent: string, routing: object): void;
+        liveTurns(agent: string, ending: object | undefined): number[];
+        codeExecution: { scripts: { turnEnded(agent: string, turn: unknown, abandoned: boolean): void } };
+      };
+      const ended: unknown[] = [];
+      fw.codeExecution.scripts.turnEnded = (agent, turn, abandoned) => { ended.push([agent, turn, abandoned]); };
+      // Routings as freshTurnRouting numbers them: a later one has a larger id.
+      const [turn1, turn2, silent3, newer4] = [{ turnId: 1 }, { turnId: 2 }, { turnId: 3 }, { turnId: 4 }];
+      // A stale settle: turn 2 is open, and stays so, and is named live.
+      fw.openLogical.set('a', turn2);
+      fw.settleAgent('a', { stopReason: 'exhausted', speech: '' }, turn1);
+      assert.deepEqual(ended.at(-1), ['a', { id: 1, live: [2] }, true]);
+      assert.equal(fw.openLogical.get('a'), turn2);
+      // The open turn's own settle closes it: no turn is live after it.
+      fw.settleAgent('a', { stopReason: 'end_turn', speech: '' }, turn2);
+      assert.deepEqual(ended.at(-1), ['a', { id: 2, live: [] }, false]);
+      // A silent turn beside an open one names that turn live, so its scripts are left alone.
+      fw.openLogical.set('c', turn2);
+      fw.settleAgent('c', { stopReason: 'end_turn', speech: '' }, silent3);
+      assert.deepEqual(ended.at(-1), ['c', { id: 3, live: [2] }, false]);
+      // A stream that no longer owns the agent still ends its own turn, and the
+      // start in progress that took the agent, holding its turn, is live.
+      fw.turnRouting.set('d', newer4);
+      fw.activeTurnTokens.set('d', 1);
+      fw.settleAgent('d', { stopReason: 'end_turn', speech: '' }, undefined, silent3);
+      assert.deepEqual(ended.at(-1), ['d', { id: 3, live: [4] }, false]);
+      // Each exclusion on its own: the ending's own routing isn't live though its
+      // start holds the turn, and a latest start that holds no turn isn't live.
+      assert.deepEqual(fw.liveTurns('d', newer4), []);
+      fw.activeTurnTokens.delete('d');
+      assert.deepEqual(fw.liveTurns('d', silent3), []);
+      fw.activeTurnTokens.set('d', 1);
+      assert.deepEqual(fw.liveTurns('d', silent3), [4]);
+      fw.activeTurnTokens.delete('d');
+      // A settle with no turn at all ends nothing.
+      const before = ended.length;
+      fw.settleAgent('d', { stopReason: 'end_turn', speech: '' }, undefined);
+      assert.equal(ended.length, before);
+      // An abandoned stream abandons its own turn, not the latest start's,
+      // naming the open one live; every turn is the host's stop.
+      fw.turnRouting.set('c', newer4);
+      fw.abandonAgentScripts('c', 'stream error', silent3);
+      assert.deepEqual(ended.at(-1), ['c', { id: 3, live: [2] }, true]);
+      fw.activeTurnTokens.set('c', 2);
+      fw.abandonAgentScripts('c', 'stream error', silent3);
+      assert.deepEqual(ended.at(-1), ['c', { id: 3, live: [2, 4] }, true]);
+      fw.activeTurnTokens.delete('c');
+      fw.abandonAgentScripts('c', 'framework shutting down', 'every');
+      assert.deepEqual(ended.at(-1), ['c', 'every', true]);
+      // A start dropped before its stream sent anything ends its turn too.
+      const dropped5 = { turnId: 5 };
+      fw.openLogical.set('e', dropped5);
+      fw.turnRouting.set('e', dropped5);
+      fw.activeTurnTokens.set('e', 4);
+      fw.endDroppedTurn('e', dropped5);
+      assert.deepEqual(ended.at(-1), ['e', { id: 5, live: [] }, false]);
+      assert.equal(fw.openLogical.get('e'), undefined);
+      assert.deepEqual(fw.liveTurns('e', undefined), [], 'and it is no longer live, though its start still holds the token');
+      fw.activeTurnTokens.delete('e');
+      // A turn that has settled isn't live, though its start's teardown, such
+      // as its speech's delivery, still holds the agent's token.
+      const late6 = { turnId: 6 };
+      fw.turnRouting.set('f', late6);
+      fw.activeTurnTokens.set('f', 3);
+      assert.deepEqual(fw.liveTurns('f', undefined), [6]);
+      fw.settleAgent('f', { stopReason: 'end_turn', speech: '' }, undefined, late6);
+      assert.deepEqual(fw.liveTurns('f', undefined), []);
+      fw.activeTurnTokens.delete('f');
+    });
+  });
+
+  it("a stream whose provider fails abandons its own turn, not every turn of its agent's, before the retry", async () => {
+    const membrane = new MockMembrane();
+    let streams = 0;
+    membrane.streamYielding = (request: NormalizedRequest): YieldingStream => {
+      membrane.calls.push(request);
+      streams += 1;
+      return streams === 1
+        ? new ProviderErrorStream(new Error('provider unavailable'))
+        : new MockYieldingStream([createMockResponse([{ type: 'text', text: 'done' }])]);
+    };
+    const errorPolicy: ErrorPolicy = {
+      maxRetries: 1,
+      onInferenceError: (_error: Error, _agent: string, attempt: number): ErrorAction => (attempt < 1 ? { retry: true, delayMs: 0 } : { retry: false }),
+    };
+    await withFramework('ce-stream-error-turn-', { membrane, errorPolicy }, async (framework) => {
+      const scripts = (framework as unknown as {
+        codeExecution: { scripts: { turnEnded(agent: string, turn: unknown, abandoned: boolean, reason?: string): void } };
+      }).codeExecution.scripts;
+      const turnEnded = scripts.turnEnded.bind(scripts);
+      const ended: Array<[string, unknown, boolean, string | undefined]> = [];
+      scripts.turnEnded = (agent, turn, abandoned, reason) => {
+        ended.push([agent, turn, abandoned, reason]);
+        turnEnded(agent, turn, abandoned, reason);
+      };
+      const { speech } = await runEphemeral(framework, 'helper');
+      assert.equal(speech, 'done');
+      assert.equal(streams, 2, 'the failed stream was retried');
+      const abandons = ended.filter(([agent, , abandoned, reason]) => agent === 'helper' && abandoned && reason === 'stream error');
+      assert.equal(abandons.length, 1, 'the failure abandons once');
+      const turn = abandons[0][1];
+      assert.notEqual(turn, 'every', "the failed stream's own turn, not every turn of its agent's");
+      assert.equal(typeof (turn as { id?: unknown }).id, 'number');
+      assert.ok(Array.isArray((turn as { live?: unknown }).live), 'with the turns still live');
+    });
+  });
+
+  it("the Python runner's inputs are refused by name, saying what replaced each", async () => {
+    await withFramework('ce-old-', {}, async (framework) => {
+      framework.start();
+      const run = (input: Record<string, unknown>) => framework.executeToolCall({ id: `ce-${Math.random()}`, name: 'code_execution', input });
+      const background = await run({ code: 'return 1;', background: true });
+      assert.equal(background.isError, true);
+      assert.match(background.error ?? '', /^background is no longer an input: .* yields and keeps running/);
+      assert.match((await run({ code: 'return 1;', time_limit_ms: 1000 })).error ?? '', /^time_limit_ms is now yield_time_ms/);
+      assert.match((await run({ action: 'cancel', script_id: 's1' })).error ?? '', /^cancel is now stop/);
+      assert.match((await run({ code: '' })).error ?? '', /a run needs `code`/);
+      assert.match((await run({ action: 'wait' })).error ?? '', /wait needs `script_id`/);
+    });
+  });
+
+  it('list and stop manage scripts, and a run past maxRunningScripts is refused with nothing run', async () => {
+    const module = new ScriptToolModule();
+    await withFramework('ce-list-', { module, codeExecution: { maxRunningScripts: 1 } }, async (framework) => {
+      framework.start();
+      const run = (input: Record<string, unknown>) => framework.executeToolCall({ id: `ce-${Math.random()}`, name: 'code_execution', input });
+      const first = await run({ code: 'await tools["test--slow"]({});', yield_time_ms: 100 });
+      const id = /^Script (s\d+-[0-9a-z]{4})/.exec(resultText(first))![1]!;
+      await until(() => module.waiting === 1, 'the slow call');
+      const second = await run({ code: 'return 1;' });
+      assert.equal(second.isError, true);
+      assert.match(second.error ?? '', /You have 1 scripts running, your most\..*Nothing was run\./s);
+      assert.match(resultText(await run({ action: 'list' })), new RegExp(`- ${id}: running for under a minute`));
+      const stopped = await run({ action: 'stop', script_id: id });
+      assert.ok(stopped.success, 'the agent\'s own stop is not an error');
+      assert.match(resultText(stopped), new RegExp(`^Script ${id} was stopped, as you asked\\.`));
+      assert.match(resultText(stopped), /\n- still running when the script ended, so it may or may not take effect: tools\["test--slow"\]\(\{\}\)\n/);
+      assert.match(resultText(await run({ action: 'list' })), new RegExp(`- ${id}: stopped by you`));
+    });
+  });
+
+  it("a resident's left script wakes it with wake_agent(), and its failure wakes it too", async () => {
+    const membrane = new MockMembrane();
+    const module = new ScriptToolModule();
+    const code = [
+      'await tools["test--slow"]({});',
+      'await wake_agent({ found: "signal" });',
+      'await tools["test--slow"]({});',
+      'throw new Error("watcher broke");',
+    ].join('\n');
+    // Turn 1: start the script, which yields; then rest.
+    membrane.pushResponse(createMockResponse([
+      { type: 'text', text: 'Arming watcher.' },
+      { type: 'tool_use', id: 'call_bg1', name: 'code_execution', input: { code, yield_time_ms: 100 } },
+    ], 'tool_use'));
+    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Watcher armed; resting.' }]));
+    // Turns 2 and 3, the wakes, get their responses just before each starts:
+    // the stand-in membrane gives a stream every response queued when it opens.
+    await withFramework('ce-wake-', { membrane, module, resident: true, codeExecution: { wakeMinIntervalMs: 0 } }, async (framework) => {
+      framework.start();
+      framework.pushEvent({
+        type: 'external-message', source: 'test', content: [{ type: 'text', text: 'arm a watcher' }], metadata: {}, triggerInference: true,
+      } as unknown as ProcessEvent);
+      const wakes = () => ((framework.getAgent('prime')?.getContextManager().queryMessages({}).messages ?? []) as unknown as Array<{
+        content: Array<{ text?: string }>; metadata?: { source?: string; tags?: string[]; scriptId?: string };
+      }>).filter((m) => m.metadata?.source === 'code-execution-script');
+      await until(() => module.waiting === 1, 'the first slow call');
+      membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Woke and handled.' }]));
+      module.release();
+      await until(() => wakes().length === 1, 'the wake_agent() wake');
+      assert.match(wakes()[0]!.content[0]!.text ?? '', /^\[script s\d+-[0-9a-z]{4}\] Woke you with wake_agent\(\), 0 min after it started \(wake 1 of 100\): \{"found":"signal"\}$/);
+      // The wake asks for a turn: an inference whose request carries it.
+      const requested = (text: string) => membrane.calls.some((request) => JSON.stringify(request).includes(text));
+      await until(() => requested('Woke you with wake_agent()'), "the wake's inference request");
+      assert.deepEqual(wakes()[0]!.metadata?.tags, ['script:wake']);
+      assert.match(String(wakes()[0]!.metadata?.scriptId), /^s\d+-[0-9a-z]{4}$/);
+      await until(() => module.waiting === 1, 'the second slow call');
+      membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Saw the failure.' }]));
+      module.release();
+      await until(() => wakes().length === 2, 'the failure wake');
+      // The script's own source says "watcher broke" too, so the notice's own words are what's looked for.
+      await until(() => requested('Your script failed: Error: watcher broke'), "the failure wake's inference request");
+      assert.match(wakes()[1]!.content[0]!.text ?? '', /^\[script (s\d+-[0-9a-z]{4})\] Your script failed: Error: watcher broke\. \{"action": "wait", "script_id": "\1"\} gives its result\.$/);
+    });
+  });
+
+  it('stop() stops every script still running, quietly', async () => {
+    const module = new ScriptToolModule();
+    const { tempDir, storePath } = tempStorePath('ce-stop-');
+    const framework = await AgentFramework.create({
+      storePath, membrane: new MockMembrane().asMembrane(), agents: [], modules: [module], syncIntervalMs: 0, codeExecution: { enabled: true },
+    });
+    try {
+      framework.start();
+      const left = await framework.executeToolCall({ id: 'ce-left', name: 'code_execution', input: { code: 'await tools["test--slow"]({});', yield_time_ms: 100 } });
+      assert.match(resultText(left), /is still running/);
+      await until(() => module.waiting === 1, 'the slow call');
+      const scripts = (framework as unknown as { codeExecution: { scripts: { running(agent: string): number; list(agent: string): Array<{ ending: unknown }>; live: Set<unknown> } } }).codeExecution.scripts;
+      const woke: unknown[] = [];
+      (framework as unknown as { scriptWake: (...args: unknown[]) => Promise<void> }).scriptWake = async (...args) => { woke.push(args); };
       await framework.stop();
+      // Its stop has been awaited: the script has ended and its process has exited.
+      assert.equal(scripts.running('__ephemeral__'), 0);
+      assert.equal(scripts.live.size, 0);
+      assert.deepEqual(scripts.list('__ephemeral__')[0]!.ending, { how: 'stopped', reason: 'limit', why: 'the host stopped' });
+      assert.deepEqual(woke, [], 'a stop by the host wakes no one');
+    } finally {
       rmSync(tempDir, { recursive: true, force: true });
     }
   });
 
-  it("a stopped script's late end-turn request does not end the next script's turn", async () => {
-    let releaseFinish: () => void = () => {};
-    const finishReleased = new Promise<void>((resolve) => { releaseFinish = resolve; });
-    let finishStarted = false;
-    class SlowFinishModule extends ScriptToolModule {
-      override async handleToolCall(call: ToolCall): Promise<ToolResult> {
-        if (call.name.endsWith('finish')) {
-          finishStarted = true;
-          await finishReleased;
-        }
-        return super.handleToolCall(call);
-      }
-    }
-    const { tempDir, storePath } = tempStorePath('pytc-stale-endturn-');
-    const framework = await createFrameworkWithCodeExecution(storePath, new MockMembrane(), new SlowFinishModule());
-    const run = (input: Record<string, unknown>) =>
-      framework.executeToolCall({ id: `ce-${Math.random()}`, name: 'code_execution', input });
-    framework.start();
-    try {
-      // The first script is stopped at its time limit while its call that ends the turn is running.
-      const stopped = await run({ code: 'await test__finish({})', time_limit_ms: 1000 });
-      assert.ok(finishStarted);
-      assert.match((stopped.data as { stderr: string }).stderr, /reached its 1s time limit/);
-      assert.ok(!stopped.endTurn);
+  it("an ephemeral agent's scripts end with its run", async () => {
+    const membrane = new MockMembrane();
+    const module = new ScriptToolModule();
+    membrane.pushResponse(createMockResponse([
+      { type: 'tool_use', id: 'call_eph', name: 'code_execution', input: { code: 'await tools["test--slow"]({});', yield_time_ms: 100 } },
+    ], 'tool_use'));
+    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Left it running.' }]));
+    await withFramework('ce-eph-', { membrane, module }, async (framework) => {
+      const result = await runEphemeral(framework, 'helper');
+      assert.strictEqual(result.speech, 'Left it running.');
+      const [results] = membrane.lastStream!.receivedToolResults as WireResult[][];
+      assert.match(results![0]!.content, /is still running after 100 ms/);
+      const scripts = (framework as unknown as { codeExecution: { scripts: { running(agent: string): number } } }).codeExecution.scripts;
+      await until(() => scripts.running('helper') === 0, "the ephemeral agent's script to stop");
+    });
+  });
 
-      // The call finishes while the next script runs; its request belonged to the stopped script.
-      const next = run({ code: 'import asyncio\nawait asyncio.sleep(1)\nprint("next done")' });
-      await new Promise((r) => setTimeout(r, 300));
-      releaseFinish();
-      const result = await next;
-      assert.strictEqual((result.data as { stdout: string }).stdout, 'next done\n');
-      assert.ok(!result.endTurn, "the stopped script's request ended the next script's turn");
+  it("an ephemeral agent's left script stops when its run ends, though no primary agent is named and its scripts outlive a turn", async () => {
+    const membrane = new MockMembrane();
+    membrane.pushResponse(createMockResponse([
+      { type: 'tool_use', id: 'call_spin', name: 'code_execution', input: { code: 'for (;;) {}', yield_time_ms: 100 } },
+    ], 'tool_use'));
+    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Left it spinning.' }]));
+    await withFramework('ce-eph-gone-', { membrane }, async (framework) => {
+      const scripts = (framework as unknown as { codeExecution: { scripts: {
+        running(agent: string): number;
+        list(agent: string): Array<{ ending: unknown }>;
+        run(...args: unknown[]): Promise<{ ending: unknown }>;
+      } } }).codeExecution.scripts;
+      // The run that left it running: its return had no ending.
+      const realRun = scripts.run.bind(scripts);
+      let leftRunning = false;
+      scripts.run = async (...args: unknown[]) => {
+        const r = await realRun(...args);
+        if (r.ending === null) leftRunning = true;
+        return r;
+      };
+      const result = await runEphemeral(framework, 'spinner');
+      assert.strictEqual(result.speech, 'Left it spinning.');
+      assert.ok(leftRunning, 'the script was left running');
+      // Its turn's end left the script running; only the agent's end stops it.
+      await until(() => scripts.running('spinner') === 0, "the ephemeral agent's script to stop");
+      // A gone agent keeps no scripts: nothing could wait on them or list them.
+      assert.deepEqual(scripts.list('spinner'), []);
+    });
+  });
+
+  it("the bridge refuses a script's call that isn't JSON, isn't an object, or comes once the host is stopping, with nothing sent", async () => {
+    const module = new ScriptToolModule();
+    await withFramework('ce-bridge-', { module }, async (framework) => {
+      const bridge = (args: string) => (framework as unknown as {
+        scriptToolCall(agent: string, tool: string, argsJson: string, context: object): Promise<{ ok: boolean; json: string }>;
+      }).scriptToolCall('__ephemeral__', 'test--echo', args, {});
+      const refusal = async (args: string) => { const a = await bridge(args); assert.equal(a.ok, false); return (JSON.parse(a.json) as { message: string }).message; };
+      assert.match(await refusal('{"oops'), /test--echo's arguments weren't JSON; nothing was done/);
+      assert.match(await refusal('[1]'), /test--echo's arguments must be an object; nothing was done/);
+      const stopping = framework.stop();
+      assert.match(await refusal('{}'), /this host is stopping; nothing was done/);
+      await stopping;
+      assert.equal(module.calls.length, 0);
+    });
+  });
+
+  it('once the host has begun to stop, a run starts no script', async () => {
+    const module = new ScriptToolModule();
+    await withFramework('ce-stopping-', { module }, async (framework) => {
+      framework.start();
+      const stopping = framework.stop();
+      const r = await framework.executeToolCall({ id: 'ce-late', name: 'code_execution', input: { code: 'return 1;' } });
+      assert.equal(r.success, false);
+      assert.match(r.error ?? '', /stopping/);
+      await stopping;
+      const scripts = (framework as unknown as { codeExecution: { scripts: { list(agent: string): unknown[] } } }).codeExecution.scripts;
+      assert.deepEqual(scripts.list('__ephemeral__'), []);
+    });
+  });
+
+  it("a script's ALL_TOOLS carries each tool's description and input schema as its agent's tool list gives them", async () => {
+    const module = new ScriptToolModule();
+    await withFramework('ce-alltools-', { module }, async (framework) => {
+      framework.start();
+      const r = await framework.executeToolCall({
+        id: 'ce-all', name: 'code_execution',
+        input: { code: 'const t = ALL_TOOLS.find((x) => x.name === "test--echo"); return { description: t.description, inputSchema: t.inputSchema };', yield_time_ms: 30_000 },
+      });
+      const echo = framework.getAllTools().find((t) => t.name === 'test--echo')!;
+      const returned = JSON.parse(/\nIt returned: (.*)\n/.exec(resultText(r))![1]!) as unknown;
+      assert.deepEqual(returned, { description: echo.description, inputSchema: echo.inputSchema });
+    });
+  });
+
+  it('the host status counts scripts left running', async () => {
+    const module = new ScriptToolModule();
+    await withFramework('ce-status-', { module }, async (framework) => {
+      framework.start();
+      assert.equal(framework.getHostModeStatus().backgroundScripts, 0);
+      await framework.executeToolCall({ id: 'ce-left', name: 'code_execution', input: { code: 'await tools["test--slow"]({});', yield_time_ms: 0 } });
+      await until(() => framework.getHostModeStatus().backgroundScripts === 1, 'the left script counted');
+      await until(() => module.waiting === 1, 'the slow call');
+      module.release();
+      await until(() => framework.getHostModeStatus().backgroundScripts === 0, 'the ended script uncounted');
+    });
+  });
+
+  it("the host's settings reach its scripts: the bound, a call's timeout, the wake cap and the memory", async () => {
+    const module = new ScriptToolModule();
+    await withFramework('ce-settings-', { module, codeExecution: { yieldMs: 150, maxYieldMs: 150, toolCallTimeoutMs: 300, maxWakesPerScript: 1, wakeMinIntervalMs: 0, memoryMaxBytes: 8 * 1024 * 1024 } }, async (framework) => {
+      framework.start();
+      const tool = framework.getAllTools().find((t) => t.name === 'code_execution')!;
+      assert.match(tool.description, /A script has 8 MiB of memory\./);
+      const run = (input: Record<string, unknown>) => framework.executeToolCall({ id: `ce-${Math.random()}`, name: 'code_execution', input });
+      /** A script run to its end, waiting as often as it yields. */
+      const toEnd = async (code: string): Promise<string> => {
+        let text = resultText(await run({ code }));
+        const id = /^Script (s\d+-[0-9a-z]{4})/.exec(text)![1]!;
+        for (let i = 0; i < 40 && / is still running /.test(text); i++) text = resultText(await run({ action: 'wait', script_id: id }));
+        return text;
+      };
+      const yielded = await run({ code: 'await tools["test--slow"]({});', yield_time_ms: 60_000 });
+      assert.match(resultText(yielded), /is still running after 150 ms\./, 'the bound asked is capped at maxYieldMs');
+      await run({ action: 'stop', script_id: /^Script (s\d+-[0-9a-z]{4})/.exec(resultText(yielded))![1]! });
+      assert.match(await toEnd('try { await tools["test--slow"]({}); } catch (e) { return e.name; }'), /It returned: "TimeoutError"/);
+      assert.match(await toEnd('try { await wake_agent(1); } catch {} try { await wake_agent(2); } catch (e) { return e.message; }'), /It returned: "wake limit reached: 1 per script, set by the host's maxWakesPerScript; nothing was sent,/);
+      // 16 MiB doesn't fit the 8 MiB set, where it would fit the default 128 MiB.
+      assert.match(
+        await toEnd('try { const keep = []; for (let i = 0; i < 16; i++) keep.push(new Uint8Array(1 << 20)); return "fit"; } catch (e) { return String(e); }'),
+        /It returned: ".*out of memory/i,
+      );
+      while (module.release()) { /* free the calls left waiting */ }
+    });
+  });
+
+  it("malformed code_execution inputs are refused, each saying what's wrong, with nothing run", async () => {
+    await withFramework('ce-malformed-', {}, async (framework) => {
+      framework.start();
+      const run = (input: unknown) => framework.executeToolCall({ id: `ce-${Math.random()}`, name: 'code_execution', input: input as Record<string, unknown> });
+      for (const [input, refusal] of [
+        ['a string', /^code_execution takes an object/],
+        [[1, 2], /^code_execution takes an object/],
+        [{ code: 1 }, /a run needs `code`/],
+        [{ code: '   ' }, /a run needs `code`/],
+        [{ code: 'return 1;', yield_time_ms: -1 }, /yield_time_ms must be a whole number of milliseconds, 0 or more/],
+        [{ code: 'return 1;', yield_time_ms: 1.5 }, /yield_time_ms must be a whole number/],
+        [{ code: 'return 1;', yield_time_ms: '10' }, /yield_time_ms must be a whole number/],
+        [{ action: 'nope' }, /unknown action "nope": run \(the default\), wait, stop or list/],
+        [{ action: 'stop' }, /stop needs `script_id`/],
+        [{ action: 'wait', script_id: 7 }, /wait needs `script_id`/],
+      ] as const) {
+        const r = await run(input);
+        assert.equal(r.success, false, JSON.stringify(input));
+        assert.match(r.error ?? '', refusal, JSON.stringify(input));
+        assert.equal(r.refused, undefined, `${JSON.stringify(input)} is a failure, not the dispatcher's refusal`);
+      }
+      const scripts = (framework as unknown as { codeExecution: { scripts: { list(agent: string): unknown[] } } }).codeExecution.scripts;
+      assert.deepEqual(scripts.list('__ephemeral__'), [], 'none of them ran a script');
+    });
+  });
+
+  it("a turn that settles while the settling stream owns the agent ends its scripts' turn, and an exhausted one as abandoned", async () => {
+    await withFramework('ce-settle-', {}, async (framework) => {
+      const ended: Array<[string, unknown, boolean, string | undefined]> = [];
+      const internals = framework as unknown as {
+        codeExecution: unknown;
+        settleAgent(agent: string, outcome: { stopReason: string; speech: string; error?: string }, closes: unknown): void;
+      };
+      const real = internals.codeExecution;
+      internals.codeExecution = { scripts: { turnEnded: (agent: string, turn: unknown, abandoned: boolean, reason?: string) => { ended.push([agent, turn, abandoned, reason]); }, dispose: async () => {}, leftRunning: () => 0 } };
+      try {
+        internals.settleAgent('helper', { stopReason: 'turn_ended', speech: '' }, { turnId: 1 });
+        internals.settleAgent('helper', { stopReason: 'exhausted', speech: '', error: 'Stream threw' }, { turnId: 2 });
+        // A settle with no turn at all ends nothing.
+        internals.settleAgent('helper', { stopReason: 'exhausted', speech: '', error: 'late' }, undefined);
+      } finally {
+        internals.codeExecution = real;
+      }
+      assert.deepEqual(ended, [['helper', { id: 1, live: [] }, false, undefined], ['helper', { id: 2, live: [] }, true, 'Stream threw']]);
+    });
+  });
+
+  it('create() refuses a setting the Python runner took, naming what replaced it, and a switch that is not a boolean', async () => {
+    const { tempDir, storePath } = tempStorePath('ce-config-');
+    const create = (codeExecution: unknown) => AgentFramework.create({
+      storePath, membrane: new MockMembrane().asMembrane(), agents: [], modules: [], syncIntervalMs: 0,
+      codeExecution: codeExecution as never,
+    });
+    try {
+      await assert.rejects(create({ enabled: true, pythonPath: '/usr/bin/python3' }), /codeExecution\.pythonPath is no longer read: scripts are JavaScript now/);
+      // Refused before anything opened: its store was never made.
+      assert.equal(existsSync(storePath), false);
+      await assert.rejects(create({ enabled: true, scriptTimeoutMs: 1000 }), /codeExecution\.scriptTimeoutMs is no longer read: .*set yieldMs/);
+      assert.equal(existsSync(storePath), false);
+      await assert.rejects(create({ enabled: 'false' }), /codeExecution\.enabled must be true or false, unquoted, not a string/);
+      assert.equal(existsSync(storePath), false);
+      await assert.rejects(create(true), /codeExecution must be an object, such as \{ enabled: true \}, not a boolean/);
+      assert.equal(existsSync(storePath), false);
+      // Off: nothing else is read, so a retired setting in a configuration that's off is no refusal.
+      for (const off of [null, false, { enabled: false, pythonPath: 'x' }, { enabled: null }]) {
+        const framework = await create(off);
+        try {
+          assert.ok(!framework.getAllTools().some((t) => t.name === 'code_execution'));
+        } finally {
+          await framework.stop();
+        }
+      }
     } finally {
-      await framework.stop();
       rmSync(tempDir, { recursive: true, force: true });
     }
   });
 });
 
+
 // ---------------------------------------------------------------------------
-// A round that runs code_execution: its script's calls count as the round's
+// A round that runs code_execution: the calls a script makes while a run or
+// wait call of the round watches it count as the round's
 // ---------------------------------------------------------------------------
 
-describe("a round that runs code_execution is routed once its scripts return (real python3)", () => {
-  /** echo, send_message and a `slow` tool held until the test lets it go; each call is logged. */
+describe('a round whose run or wait call watches a script that can change its routing is routed once that call returns', () => {
+  /** echo, send_message, and `slow` and `gate`, each held until the test lets it go; each call is logged. */
   class RoundToolModule implements Module {
     readonly name = 'test';
     releaseSlow: () => void = () => {};
+    releaseGate: () => void = () => {};
+    releaseBatch: () => void = () => {};
+    /** A send holds until the gate is released, as `gate` does. */
+    holdSend = false;
+    /** The batch-completion hook holds until releaseBatch. */
+    holdBatch = false;
     private slowReleased = new Promise<void>((resolve) => { this.releaseSlow = resolve; });
+    private gateReleased = new Promise<void>((resolve) => { this.releaseGate = resolve; });
+    private batchReleased = new Promise<void>((resolve) => { this.releaseBatch = resolve; });
     constructor(private readonly log: string[]) {}
+    async onToolBatchComplete(): Promise<void> {
+      if (!this.holdBatch) return;
+      this.log.push('hook:called');
+      await this.batchReleased;
+      this.log.push('hook:returned');
+    }
     async start(_ctx: ModuleContext): Promise<void> {}
     async stop(): Promise<void> {}
     getTools(): ToolDefinition[] {
       const tool = (name: string): ToolDefinition => ({ name, description: name, inputSchema: { type: 'object', properties: {} } });
-      return [tool('echo'), tool('send_message'), tool('slow')];
+      return [tool('echo'), tool('send_message'), tool('slow'), tool('gate')];
     }
     async handleToolCall(call: ToolCall): Promise<ToolResult> {
       const name = call.name.includes('--') ? call.name.slice(call.name.lastIndexOf('--') + 2) : call.name;
@@ -1303,6 +1176,14 @@ describe("a round that runs code_execution is routed once its scripts return (re
       if (name === 'slow') {
         await this.slowReleased;
         this.log.push('slow:returned');
+      }
+      if (name === 'gate') {
+        await this.gateReleased;
+        this.log.push('gate:returned');
+      }
+      if (name === 'send_message' && this.holdSend) {
+        await this.gateReleased;
+        this.log.push('send:returned');
       }
       return { success: true, data: { ok: true } };
     }
@@ -1320,8 +1201,8 @@ describe("a round that runs code_execution is routed once its scripts return (re
   ];
 
   async function scriptRound(mode: 'locus' | 'hybrid' | 'explicit' | 'disabled', responses: ReturnType<typeof createMockResponse>[],
-    config: { sameRoundThinkTextPolicy?: 'private'; allowedTools?: string[] } = {}, options: { codeExecution?: boolean } = {}) {
-    const { tempDir, storePath } = tempStorePath('pytc-round-');
+    config: { sameRoundThinkTextPolicy?: 'private'; allowedTools?: string[] } = {}, options: { codeExecution?: boolean; toolCallTimeoutMs?: number } = {}) {
+    const { tempDir, storePath } = tempStorePath('ce-round-');
     const membrane = new MockMembrane();
     for (const response of responses) membrane.pushResponse(response);
     const log: string[] = [];
@@ -1332,8 +1213,11 @@ describe("a round that runs code_execution is routed once its scripts return (re
       agents: [{ name: 'assistant', model: 'test-model', systemPrompt: 'Act.', proseRouting: mode, ...config }],
       modules: [module],
       syncIntervalMs: 0,
-      ...(options.codeExecution === false ? {} : { codeExecution: { enabled: true } }),
+      ...(options.codeExecution === false ? {} : { codeExecution: { enabled: true, ...(options.toolCallTimeoutMs === undefined ? {} : { toolCallTimeoutMs: options.toolCallTimeoutMs }) } }),
     });
+    // Script ids s1-test, s2-test, …, so a later round's wait can name one.
+    const scripts = (framework as unknown as { codeExecution: { scripts: { idTag: string } } | null }).codeExecution?.scripts;
+    if (scripts) scripts.idTag = 'test';
     // The registry stub: skip_reply and think are on the agent's surface, so
     // its scripts get them too, and skip_reply ends the turn as the real one
     // does.
@@ -1345,7 +1229,7 @@ describe("a round that runs code_execution is routed once its scripts return (re
       routeSpeech: async (_agent: string, text: string, channelId: string | null) => {
         if (!channelId) return null;
         log.push(`publish:${text}@${channelId}`);
-        return { delivered: true, channelId };
+        return { delivered: true, serverId: 'stub', channelId };
       },
       // A named or sticky destination posts through deliverSpeech, as with
       // the real registry, which reports the post's outcome.
@@ -1355,8 +1239,11 @@ describe("a round that runs code_execution is routed once its scripts return (re
         return { status: 'delivered', destination: { serverId: 'stub', channelId }, at: Date.now() };
       },
       resolveDestination: ({ channelId }: { channelId: string }) => ({ destination: { serverId: 'stub', channelId } }),
-      sendOutgoingChunk: (channelId: string, _agent: string, _id: string, _index: number, delta: string) => {
-        log.push(`chunk:${delta}@${channelId}`);
+      // Each delivery hands its stream the destination its publish went to,
+      // here the stub's server: a chunk for any other is logged with it, so
+      // a delivery that loses its server fails the test.
+      sendOutgoingChunk: (to: { serverId: string; channelId: string }, _agent: string, _id: string, _index: number, delta: string) => {
+        log.push(`chunk:${delta}@${to.serverId === 'stub' ? to.channelId : `${to.channelId} (server ${to.serverId})`}`);
       },
       handleChannelToolCall: async (name: string, input: Record<string, unknown> | undefined) => {
         log.push(`tool:${name}`);
@@ -1374,6 +1261,8 @@ describe("a round that runs code_execution is routed once its scripts return (re
     };
     const done = async () => {
       module.releaseSlow();
+      module.releaseGate();
+      module.releaseBatch();
       await framework.stop();
       rmSync(tempDir, { recursive: true, force: true });
     };
@@ -1386,15 +1275,33 @@ describe("a round that runs code_execution is routed once its scripts return (re
   const heldDrafts = (framework: AgentFramework) =>
     (framework as unknown as { proseDrafts: { open(agent: string): Array<{ text: string; reason: string }> } })
       .proseDrafts.open('assistant').map((d) => ({ text: d.text, reason: d.reason })).reverse();
+  /** Polls until `cond` holds, or a bound passes, so a run the code gets wrong still ends and fails its asserts. */
+  const soon = async (cond: () => boolean) => {
+    const deadline = Date.now() + 15_000;
+    while (!cond() && Date.now() < deadline) await new Promise((r) => setTimeout(r, 10));
+  };
   // A script holds its round only when it can change the round's routing:
   // its code names such a tool (scriptMayRoute). A script given this suffix
   // names skip_reply on a line that never runs, so its round waits for it.
-  const HOLDS = '\nif False: await skip_reply({})';
-  // An agent whose allowedTools names only code_execution and test--echo: a
-  // script reaches any other tool only by forging a call through echo's
-  // globals, and the host refuses that call at dispatch.
-  const LISTED = { allowedTools: ['code_execution', 'test--echo'] };
-  const FORGE = 'make = test__echo.__globals__["_make_tool_fn"]\n';
+  const HOLDS = '\nif (false) await tools.skip_reply({});';
+  // An agent whose allowedTools leaves out skip_reply and send_message: its
+  // scripts don't have them.
+  const LISTED = { allowedTools: ['code_execution', 'test--echo', 'test--slow'] };
+  /**
+   * Sends `forged` through the bridge with the context of the script's call
+   * of `test--slow`, as a child that ignores the tools it was given could:
+   * the host's dispatch refuses it. Resolves once it's answered.
+   */
+  const forgeBeside = (framework: AgentFramework, forged: string, forgedArgs = '{}'): Promise<unknown> => {
+    const bridge = framework as unknown as { scriptToolCall(agent: string, tool: string, args: string, context: unknown): Promise<unknown> };
+    const real = bridge.scriptToolCall.bind(bridge);
+    return new Promise((resolve) => {
+      bridge.scriptToolCall = (agent, tool, args, context) => {
+        if (tool === 'test--slow') void real(agent, forged, forgedArgs, context).then(resolve);
+        return real(agent, tool, args, context);
+      };
+    });
+  };
 
   for (const mode of ['locus', 'hybrid', 'explicit'] as const) {
     it(`${mode}: a skip_reply inside the script keeps its round's prose from delivery and the stream`, async () => {
@@ -1402,7 +1309,7 @@ describe("a round that runs code_execution is routed once its scripts return (re
       const h = await scriptRound(mode, [
         createMockResponse([
           { type: 'text', text: prose },
-          scriptCall({ code: 'await skip_reply({})' }),
+          scriptCall({ code: 'await tools.skip_reply({});' }),
         ] as ContentBlock[], 'tool_use'),
       ]);
       try {
@@ -1423,7 +1330,7 @@ describe("a round that runs code_execution is routed once its scripts return (re
       const h = await scriptRound(mode, [
         createMockResponse([
           { type: 'text', text: kept },
-          scriptCall({ code: 'await skip_reply({"wake_in_seconds": 60})' }),
+          scriptCall({ code: 'try { await tools.skip_reply({ wake_in_seconds: 60 }); } catch (error) { text(error.name); }' }),
         ] as ContentBlock[], 'tool_use'),
         createMockResponse([{ type: 'text', text: said }] as ContentBlock[]),
       ]);
@@ -1438,58 +1345,91 @@ describe("a round that runs code_execution is routed once its scripts return (re
     });
 
     // A skip_reply the agent's allowedTools leaves out isn't among the
-    // script's functions, so the script forges the call, and the host refuses
-    // it at dispatch. It counts as a refused direct one does: its own round
-    // stays private, and the next round's prose is published.
-    it(`${mode}: a skip_reply the allowedTools refuses inside the script keeps only its own round private`, async () => {
+    // script's tools. A child that sends the call anyway is refused at
+    // dispatch, and the call counts as a refused direct one does: its own
+    // round stays private, and the next round's prose is published.
+    it(`${mode}: a skip_reply sent past the script's tools, which the allowedTools refuses at dispatch, keeps only its own round private`, async () => {
       const kept = mode === 'explicit' ? '>>#alpha checking quietly' : 'checking quietly';
       const said = mode === 'explicit' ? '>>#alpha not mine to skip, so now' : 'not mine to skip, so now';
       const to = mode === 'explicit' ? 'chan-alpha' : 'world:test';
       const h = await scriptRound(mode, [
         createMockResponse([
           { type: 'text', text: kept },
-          scriptCall({ code: `${FORGE}print(await make("skip_reply", "forged")({}))` }),
+          scriptCall({ code: 'await tools["test--slow"]({});' + HOLDS }),
         ] as ContentBlock[], 'tool_use'),
         createMockResponse([{ type: 'text', text: said }] as ContentBlock[]),
       ], LISTED);
+      // The script's slow call goes once the forged call has its answer.
+      let forged: { ok?: boolean; json?: string } | undefined;
+      void forgeBeside(h.framework, 'skip_reply').then((answer) => { forged = answer as typeof forged; h.module.releaseSlow(); });
+      const bound = setTimeout(() => h.module.releaseSlow(), 15000);
       try {
         await h.run();
+        assert.equal(forged?.ok, false, 'the forged call was made, and refused');
+        assert.equal(JSON.parse(forged?.json ?? '{}').name, 'ToolRefused');
         assert.ok(!h.log.includes('tool:skip_reply'), 'the host refused the call before the registry saw it');
         const published = h.log.filter((e) => e.startsWith('publish:'));
         assert.deepStrictEqual(published, [`publish:not mine to skip, so now@${to}`],
           "the refused call's round is kept, and the next round's prose is published");
         assert.ok(!h.log.some((e) => e.startsWith('chunk:checking quietly')), "nor does the kept round's prose stream");
         assert.deepStrictEqual(heldDrafts(h.framework), [], 'and nothing is held as a draft');
-      } finally { await h.done(); }
+      } finally {
+        clearTimeout(bound);
+        await h.done();
+      }
     });
   }
 
-  // A send the agent's allowedTools leaves out posted nothing, so, refused
-  // inside the script as a direct one would be, it silences nothing: its round
-  // and the next are published, and nothing is held as a draft.
-  for (const mode of ['locus', 'hybrid'] as const) it(`${mode}: a send the allowedTools refuses inside the script silences nothing`, async () => {
-    const h = await scriptRound(mode, [
+  it("a call of a tool the script doesn't have never leaves the script, so it counts for nothing", async () => {
+    const h = await scriptRound('locus', [
       createMockResponse([
-        { type: 'text', text: 'posting the summary' },
-        scriptCall({ code: `${FORGE}print(await make("test--send_message", "forged")({}))` }),
+        { type: 'text', text: 'checking quietly' },
+        scriptCall({ code: 'try { await tools.skip_reply({}); } catch (error) { text(error.message); }' }),
       ] as ContentBlock[], 'tool_use'),
       createMockResponse([{ type: 'text', text: 'done' }] as ContentBlock[]),
     ], LISTED);
     try {
       await h.run();
+      assert.ok(!h.log.includes('tool:skip_reply'), 'the script threw at the name, and nothing was sent');
+      assert.deepStrictEqual(h.log.filter((e) => e.startsWith('publish:')),
+        ['publish:checking quietly@world:test', 'publish:done@world:test'], 'both rounds are published, as with no call at all');
+    } finally { await h.done(); }
+  });
+
+  // A send the agent's allowedTools leaves out posted nothing, so, refused at
+  // dispatch as a direct one would be, it silences nothing: its round and the
+  // next are published, and nothing is held as a draft.
+  for (const mode of ['locus', 'hybrid'] as const) it(`${mode}: a send sent past the script's tools, which the allowedTools refuses, silences nothing`, async () => {
+    const h = await scriptRound(mode, [
+      createMockResponse([
+        { type: 'text', text: 'posting the summary' },
+        scriptCall({ code: 'await tools["test--slow"]({});' + HOLDS }),
+      ] as ContentBlock[], 'tool_use'),
+      createMockResponse([{ type: 'text', text: 'done' }] as ContentBlock[]),
+    ], LISTED);
+    let forged: { ok?: boolean; json?: string } | undefined;
+    void forgeBeside(h.framework, 'test--send_message').then((answer) => { forged = answer as typeof forged; h.module.releaseSlow(); });
+    const bound = setTimeout(() => h.module.releaseSlow(), 15000);
+    try {
+      await h.run();
+      assert.equal(forged?.ok, false, 'the forged send was made, and refused');
+      assert.equal(JSON.parse(forged?.json ?? '{}').name, 'ToolRefused');
       assert.ok(!h.log.includes('tool:send_message'), 'the host refused the send before the module saw it');
       assert.deepStrictEqual(h.log.filter((e) => e.startsWith('publish:')),
         ['publish:posting the summary@world:test', 'publish:done@world:test'],
         'the round and the next are published, as with no send at all');
       assert.deepStrictEqual(heldDrafts(h.framework), [], 'and nothing is held as a draft');
-    } finally { await h.done(); }
+    } finally {
+      clearTimeout(bound);
+      await h.done();
+    }
   });
 
   for (const mode of ['locus', 'hybrid'] as const) it(`${mode}: a send inside the script silences its round and the turn's later prose`, async () => {
     const h = await scriptRound(mode, [
       createMockResponse([
         { type: 'text', text: 'posting the summary' },
-        scriptCall({ code: 'await test__send_message({})' }),
+        scriptCall({ code: 'await tools["test--send_message"]({});' }),
       ] as ContentBlock[], 'tool_use'),
       createMockResponse([{ type: 'text', text: 'done' }] as ContentBlock[]),
     ]);
@@ -1513,7 +1453,7 @@ describe("a round that runs code_execution is routed once its scripts return (re
     const h = await scriptRound(mode, [
       createMockResponse([
         { type: 'text', text: 'sending the earlier reply again' },
-        scriptCall({ code: 'print(await drafts({"action": "resend", "draftIds": ["d-0000000"], "destination": "#alpha"}))' }),
+        scriptCall({ code: 'try { text(await tools.drafts({ action: "resend", draftIds: ["d-0000000"], destination: "#alpha" })); } catch (error) { text(error.message); }' }),
       ] as ContentBlock[], 'tool_use'),
       createMockResponse([{ type: 'text', text: 'done' }] as ContentBlock[]),
     ]);
@@ -1534,7 +1474,7 @@ describe("a round that runs code_execution is routed once its scripts return (re
     const h = await scriptRound(mode, [
       createMockResponse([
         { type: 'text', text: 'posting the summary, then going quiet' },
-        scriptCall({ code: 'await test__send_message({})\nawait skip_reply({})' }),
+        scriptCall({ code: 'await tools["test--send_message"]({});\nawait tools.skip_reply({});' }),
       ] as ContentBlock[], 'tool_use'),
     ]);
     try {
@@ -1549,7 +1489,7 @@ describe("a round that runs code_execution is routed once its scripts return (re
     const h = await scriptRound('explicit', [
       createMockResponse([
         { type: 'text', text: '>>#alpha posting the summary' },
-        scriptCall({ code: 'await test__send_message({})' }),
+        scriptCall({ code: 'await tools["test--send_message"]({});' }),
       ] as ContentBlock[], 'tool_use'),
       createMockResponse([{ type: 'text', text: '>>#alpha done' }] as ContentBlock[]),
     ]);
@@ -1569,7 +1509,7 @@ describe("a round that runs code_execution is routed once its scripts return (re
     const h = await scriptRound(mode, [
       createMockResponse([
         { type: 'text', text: `${prefix}working it through` },
-        scriptCall({ code: 'await think({"content": "notes"})' }),
+        scriptCall({ code: 'await tools.think({ content: "notes" });' }),
       ] as ContentBlock[], 'tool_use'),
       createMockResponse([{ type: 'text', text: `${prefix}the answer` }] as ContentBlock[]),
     ], { sameRoundThinkTextPolicy: 'private' });
@@ -1585,7 +1525,7 @@ describe("a round that runs code_execution is routed once its scripts return (re
     const h = await scriptRound('locus', [
       createMockResponse([
         { type: 'text', text: 'on it' },
-        scriptCall({ code: 'print(await test__echo({}))' + HOLDS }),
+        scriptCall({ code: 'text(JSON.stringify(await tools["test--echo"]({})));' + HOLDS }),
         { type: 'tool_use', id: 'slow1', name: 'test--slow', input: {} },
       ] as ContentBlock[], 'tool_use'),
       createMockResponse([{ type: 'text', text: 'done' }] as ContentBlock[]),
@@ -1593,13 +1533,12 @@ describe("a round that runs code_execution is routed once its scripts return (re
     // Let the slow tool go once the round's prose has gone out, or after a
     // bound, so a round that waited for it still ends and fails the order.
     const watch = setInterval(() => { if (h.log.includes('publish:on it@world:test')) h.module.releaseSlow(); }, 10);
-    // The bound only matters when the code is wrong: a round that waited
-    // for the slow tool still ends, and fails the order.
     const bound = setTimeout(() => h.module.releaseSlow(), 15000);
     try {
       await h.run();
       const at = (entry: string) => h.log.indexOf(entry);
       assert.ok(at('publish:on it@world:test') >= 0, 'the prose was delivered');
+      assert.ok(at('tool:echo') >= 0, 'the script made its call');
       assert.ok(at('tool:echo') < at('publish:on it@world:test'), "it waited for the script's own call");
       assert.ok(at('publish:on it@world:test') < at('slow:returned'), 'and not for the slow tool beside it');
       assert.ok(at('publish:on it@world:test') < at('chunk:on it@world:test'), 'and its chunk followed its publish');
@@ -1610,32 +1549,8 @@ describe("a round that runs code_execution is routed once its scripts return (re
     }
   });
 
-  it("a script whose code names no tool that changes routing doesn't hold its round: its prose goes out while the script runs", async () => {
-    const h = await scriptRound('locus', [
-      createMockResponse([
-        { type: 'text', text: 'running the analysis' },
-        scriptCall({ code: 'await test__slow({})' }),
-      ] as ContentBlock[], 'tool_use'),
-      createMockResponse([{ type: 'text', text: 'done' }] as ContentBlock[]),
-    ]);
-    // The script waits in its slow call until the round's prose has gone out,
-    // or until a bound, so a round that waited for the script still ends.
-    const watch = setInterval(() => { if (h.log.includes('publish:running the analysis@world:test')) h.module.releaseSlow(); }, 10);
-    const bound = setTimeout(() => h.module.releaseSlow(), 15000);
-    try {
-      await h.run();
-      const at = (entry: string) => h.log.indexOf(entry);
-      assert.ok(at('publish:running the analysis@world:test') >= 0, 'the prose was delivered');
-      assert.ok(at('publish:running the analysis@world:test') < at('slow:returned'), 'while the script was still running');
-    } finally {
-      clearInterval(watch);
-      clearTimeout(bound);
-      await h.done();
-    }
-  });
-
   /** Runs a one-script round whose prose should go out while its script waits in a slow call. */
-  const publishedWhileScriptRuns = async (mode: 'locus' | 'explicit', code: string) => {
+  const publishedWhileScriptRuns = async (mode: 'locus' | 'explicit', code: string, config: { sameRoundThinkTextPolicy?: 'private' } = {}) => {
     const prefix = mode === 'explicit' ? '>>#alpha ' : '';
     const target = mode === 'explicit' ? 'chan-alpha' : 'world:test';
     const h = await scriptRound(mode, [
@@ -1644,7 +1559,7 @@ describe("a round that runs code_execution is routed once its scripts return (re
         scriptCall({ code }),
       ] as ContentBlock[], 'tool_use'),
       createMockResponse([{ type: 'text', text: `${prefix}done` }] as ContentBlock[]),
-    ]);
+    ], config);
     const published = `publish:running the analysis@${target}`;
     const watch = setInterval(() => { if (h.log.includes(published)) h.module.releaseSlow(); }, 10);
     const bound = setTimeout(() => h.module.releaseSlow(), 15000);
@@ -1660,51 +1575,12 @@ describe("a round that runs code_execution is routed once its scripts return (re
     }
   };
 
-  it("a name inside a longer identifier, as say_hello or my_say, doesn't hold its round", async () => {
-    await publishedWhileScriptRuns('locus', 'say_hello = 1\nmy_say = 2\nsend_message_log = []\nawait test__slow({})');
-  });
-
-  it("a comment that names a routing tool doesn't hold its round, since Python never runs it", async () => {
-    await publishedWhileScriptRuns('locus', 'await test__slow({})  # then skip_reply, or say so');
-  });
-
-  it("explicit: a script that names only a send doesn't hold its round, since a send can't change an explicit round's routing", async () => {
-    await publishedWhileScriptRuns('explicit', 'await test__slow({})\nif False: await test__send_message({})');
-  });
-
-  it("disabled: a script that names skip_reply doesn't hold its round, since nothing is routed", async () => {
-    const h = await scriptRound('disabled', [
-      createMockResponse([
-        { type: 'text', text: 'never routed' },
-        scriptCall({ code: 'await test__slow({})' + HOLDS }),
-      ] as ContentBlock[], 'tool_use'),
-      createMockResponse([{ type: 'text', text: 'done' }] as ContentBlock[]),
-    ]);
-    const rounds = (h.framework as unknown as { scriptRounds: Map<string, unknown> }).scriptRounds;
-    let waitedOn: boolean | undefined;
-    const watch = setInterval(() => {
-      if (!h.log.includes('tool:slow')) return;
-      clearInterval(watch);
-      waitedOn = rounds.has('assistant');
-      h.module.releaseSlow();
-    }, 10);
-    const bound = setTimeout(() => h.module.releaseSlow(), 15000);
-    try {
-      await h.run();
-      assert.equal(waitedOn, false, 'no round waited on the script');
-      assert.deepStrictEqual(h.log.filter((e) => e.startsWith('publish:')), [], 'and nothing was published');
-    } finally {
-      clearInterval(watch);
-      clearTimeout(bound);
-      await h.done();
-    }
-  });
-
-  it("a script whose code names a world utterance, as say, holds its round until it returns", async () => {
+  /** Runs a one-script round whose prose should wait for its script, which waits in a slow call: the round goes out once the script returns. */
+  const heldUntilScriptReturns = async (code: string) => {
     const h = await scriptRound('locus', [
       createMockResponse([
         { type: 'text', text: 'about to speak' },
-        scriptCall({ code: 'await test__slow({})\nif False: await mcpl__world__say({})' }),
+        scriptCall({ code }),
       ] as ContentBlock[], 'tool_use'),
       createMockResponse([{ type: 'text', text: 'done' }] as ContentBlock[]),
     ]);
@@ -1733,13 +1609,68 @@ describe("a round that runs code_execution is routed once its scripts return (re
       clearTimeout(bound);
       await h.done();
     }
+  };
+
+  it("a script whose code names no tool that changes routing doesn't hold its round: its prose goes out while the script runs", async () => {
+    await publishedWhileScriptRuns('locus', 'await tools["test--slow"]({});');
   });
 
-  it("a tool name a script builds at runtime goes unseen: its round is routed at its tool-calls event, as before scripts counted", async () => {
+  it("a name inside a longer identifier, as say_hello, my_say or $say, doesn't hold its round", async () => {
+    await publishedWhileScriptRuns('locus', 'const say_hello = 1, my_say = 2, $say = 3, say$ = 4, send_message_log = [];\nawait tools["test--slow"]({});');
+  });
+
+  it('a script whose code names a world utterance, as say, holds its round until it returns', async () => {
+    await heldUntilScriptReturns('await tools["test--slow"]({});\nif (false) await tools["world--say"]({});');
+  });
+
+  // The reading is coarse: a name in a comment or a string holds the round
+  // too, for no longer than its call's yield.
+  it('a comment or a string that names a routing tool holds its round as a call would', async () => {
+    await heldUntilScriptReturns('await tools["test--slow"]({}); // then skip_reply');
+    await heldUntilScriptReturns('await tools["test--slow"]({}); const note = "say it later";');
+  });
+
+  it("explicit: a script that names only a send doesn't hold its round, since a send can't change an explicit round's routing", async () => {
+    await publishedWhileScriptRuns('explicit', 'await tools["test--slow"]({});\nif (false) await tools["test--send_message"]({});');
+  });
+
+  it("under the public same-round policy, a script that calls think doesn't hold its round", async () => {
+    await publishedWhileScriptRuns('locus', 'await tools.think({ content: "notes" });\nawait tools["test--slow"]({});');
+  });
+
+  it("disabled: a script that names skip_reply doesn't hold its round, since nothing is routed", async () => {
+    const h = await scriptRound('disabled', [
+      createMockResponse([
+        { type: 'text', text: 'never routed' },
+        scriptCall({ code: 'await tools["test--slow"]({});' + HOLDS }),
+      ] as ContentBlock[], 'tool_use'),
+      createMockResponse([{ type: 'text', text: 'done' }] as ContentBlock[]),
+    ]);
+    const rounds = (h.framework as unknown as { scriptRounds: Map<string, unknown> }).scriptRounds;
+    let waitedOn: boolean | undefined;
+    const watch = setInterval(() => {
+      if (!h.log.includes('tool:slow')) return;
+      clearInterval(watch);
+      waitedOn = rounds.has('assistant');
+      h.module.releaseSlow();
+    }, 10);
+    const bound = setTimeout(() => h.module.releaseSlow(), 15000);
+    try {
+      await h.run();
+      assert.equal(waitedOn, false, 'no round waited on the script');
+      assert.deepStrictEqual(h.log.filter((e) => e.startsWith('publish:')), [], 'and nothing was published');
+    } finally {
+      clearInterval(watch);
+      clearTimeout(bound);
+      await h.done();
+    }
+  });
+
+  it('a tool name a script builds at runtime goes unseen: its round is routed at its tool-calls event, as before scripts counted', async () => {
     const h = await scriptRound('locus', [
       createMockResponse([
         { type: 'text', text: 'not held' },
-        scriptCall({ code: 'name = "skip" + "_reply"\nawait tools[name]({})' }),
+        scriptCall({ code: 'const name = "skip" + "_reply";\nawait tools[name]({});' }),
       ] as ContentBlock[], 'tool_use'),
       createMockResponse([{ type: 'text', text: 'done' }] as ContentBlock[]),
     ]);
@@ -1752,33 +1683,11 @@ describe("a round that runs code_execution is routed once its scripts return (re
     } finally { await h.done(); }
   });
 
-  it("under the public same-round policy, a script that calls think doesn't hold its round", async () => {
-    const h = await scriptRound('locus', [
-      createMockResponse([
-        { type: 'text', text: 'thinking it over' },
-        scriptCall({ code: 'await think({"content": "notes"})\nawait test__slow({})' }),
-      ] as ContentBlock[], 'tool_use'),
-      createMockResponse([{ type: 'text', text: 'done' }] as ContentBlock[]),
-    ]);
-    const watch = setInterval(() => { if (h.log.includes('publish:thinking it over@world:test')) h.module.releaseSlow(); }, 10);
-    const bound = setTimeout(() => h.module.releaseSlow(), 15000);
-    try {
-      await h.run();
-      const at = (entry: string) => h.log.indexOf(entry);
-      assert.ok(at('publish:thinking it over@world:test') >= 0, 'the prose was delivered');
-      assert.ok(at('publish:thinking it over@world:test') < at('slow:returned'), 'while the script was still running');
-    } finally {
-      clearInterval(watch);
-      clearTimeout(bound);
-      await h.done();
-    }
-  });
-
   it("without code execution, a code_execution call holds nothing: its round is routed at its tool-calls event", async () => {
     const h = await scriptRound('locus', [
       createMockResponse([
         { type: 'text', text: 'not a script after all' },
-        scriptCall({ code: 'await skip_reply({})' }),
+        scriptCall({ code: 'await tools.skip_reply({});' }),
       ] as ContentBlock[], 'tool_use'),
       createMockResponse([{ type: 'text', text: 'done' }] as ContentBlock[]),
     ], {}, { codeExecution: false });
@@ -1789,46 +1698,52 @@ describe("a round that runs code_execution is routed once its scripts return (re
     } finally { await h.done(); }
   });
 
-  it("a helper an earlier script defined holds a later script's round: the interpreter ran a script that names a tool that changes routing", async () => {
+  it("an agent whose allowedTools leaves out code_execution holds nothing on a code_execution call: its round is routed, not withheld", async () => {
     const h = await scriptRound('locus', [
       createMockResponse([
-        { type: 'text', text: 'defining a helper' },
-        scriptCall({ code: 'async def post():\n    await test__send_message({})' }, 'ce1'),
-      ] as ContentBlock[], 'tool_use'),
-      createMockResponse([
-        { type: 'text', text: 'posting the summary' },
-        scriptCall({ code: 'await post()' }, 'ce2'),
+        { type: 'text', text: 'not mine to run' },
+        scriptCall({ code: 'await tools.skip_reply({});' }),
       ] as ContentBlock[], 'tool_use'),
       createMockResponse([{ type: 'text', text: 'done' }] as ContentBlock[]),
-    ]);
+    ], { allowedTools: ['test--echo'] });
     try {
       await h.run();
-      assert.ok(h.log.includes('tool:send_message'), 'the helper sent');
-      assert.deepStrictEqual(h.log.filter((e) => e.startsWith('publish:')), ['publish:defining a helper@world:test'],
-        "the send through the helper silences its round and the turn's later prose, as a direct send does");
+      assert.deepStrictEqual(h.log.filter((e) => e.startsWith('publish:')),
+        ['publish:not mine to run@world:test', 'publish:done@world:test'],
+        'the refused call runs no script, so its round is routed at its tool-calls event');
     } finally { await h.done(); }
   });
 
-  it("a script that only calls a routing tool directly, by name or by key, leaves no mark: a later script's round isn't held for it", async () => {
+  // A run returns at its yield: its round waits no longer, and the calls its
+  // script makes after it are no round's.
+  it('a round whose script yields is routed at the yield, and the calls the script makes after it are no round\'s', async () => {
     const h = await scriptRound('locus', [
       createMockResponse([
-        { type: 'text', text: 'thinking first' },
-        scriptCall({ code: 'await think({"content": "notes"})\nawait tools["think"]({"content": "more"})' }, 'ce1'),
+        { type: 'text', text: 'starting a watcher' },
+        scriptCall({ code: 'await tools["test--slow"]({});\nawait tools["test--send_message"]({});', yield_time_ms: 100 }),
       ] as ContentBlock[], 'tool_use'),
-      createMockResponse([
-        { type: 'text', text: 'running the analysis' },
-        scriptCall({ code: 'await test__slow({})' }, 'ce2'),
-      ] as ContentBlock[], 'tool_use'),
+      // The turn waits in a later round until the left script has sent, so
+      // the send comes while the turn's later prose is still to come.
+      createMockResponse([{ type: 'tool_use', id: 'gate1', name: 'test--gate', input: {} }] as ContentBlock[], 'tool_use'),
       createMockResponse([{ type: 'text', text: 'done' }] as ContentBlock[]),
-    ], { sameRoundThinkTextPolicy: 'private' });
-    const watch = setInterval(() => { if (h.log.includes('publish:running the analysis@world:test')) h.module.releaseSlow(); }, 10);
-    const bound = setTimeout(() => h.module.releaseSlow(), 15000);
+    ]);
+    // The script goes on, to its send, once its round has gone out; the turn goes on once it has sent.
+    const watch = setInterval(() => {
+      if (h.log.includes('publish:starting a watcher@world:test')) h.module.releaseSlow();
+      if (h.log.includes('tool:send_message')) h.module.releaseGate();
+    }, 10);
+    const bound = setTimeout(() => { h.module.releaseSlow(); h.module.releaseGate(); }, 15000);
     try {
       await h.run();
+      h.framework.start();
+      await soon(() => h.log.includes('publish:done@world:test'));
       const at = (entry: string) => h.log.indexOf(entry);
-      assert.ok(!h.log.includes('publish:thinking first@world:test'), 'the round whose script thought stays private');
-      assert.ok(at('publish:running the analysis@world:test') >= 0, "the later round's prose was delivered");
-      assert.ok(at('publish:running the analysis@world:test') < at('slow:returned'), 'while its script was still running');
+      assert.ok(at('publish:starting a watcher@world:test') >= 0 && at('publish:starting a watcher@world:test') < at('slow:returned'),
+        'the round went out at the yield, while the script ran on');
+      assert.ok(at('tool:send_message') > at('slow:returned'), 'the script sent once it was left');
+      assert.ok(at('tool:send_message') < at('publish:done@world:test'), "and before the turn's later prose");
+      assert.ok(at('publish:done@world:test') >= 0, "which went out");
+      assert.deepStrictEqual(heldDrafts(h.framework), [], "and the left script's send held nothing as a draft");
     } finally {
       clearInterval(watch);
       clearTimeout(bound);
@@ -1836,182 +1751,116 @@ describe("a round that runs code_execution is routed once its scripts return (re
     }
   });
 
-  it("a key an earlier script kept holds a later script's round, as an alias does", async () => {
-    const h = await scriptRound('locus', [
-      createMockResponse([
-        { type: 'text', text: 'keeping a key' },
-        scriptCall({ code: 'name = "test--send_message"' }, 'ce1'),
-      ] as ContentBlock[], 'tool_use'),
-      createMockResponse([
-        { type: 'text', text: 'posting the summary' },
-        scriptCall({ code: 'await tools[name]({})' }, 'ce2'),
-      ] as ContentBlock[], 'tool_use'),
-      createMockResponse([{ type: 'text', text: 'done' }] as ContentBlock[]),
-    ]);
-    try {
-      await h.run();
-      assert.ok(h.log.includes('tool:send_message'), 'the kept key sent');
-      assert.deepStrictEqual(h.log.filter((e) => e.startsWith('publish:')), ['publish:keeping a key@world:test'],
-        "the send through the kept key silences its round and the turn's later prose, as a direct send does");
-    } finally { await h.done(); }
-  });
-
-  it("an alias an earlier script bound to a routing tool holds a later script's round, as a helper does", async () => {
-    const h = await scriptRound('locus', [
-      createMockResponse([
-        { type: 'text', text: 'keeping a handle' },
-        scriptCall({ code: 'post = test__send_message' }, 'ce1'),
-      ] as ContentBlock[], 'tool_use'),
-      createMockResponse([
-        { type: 'text', text: 'posting the summary' },
-        scriptCall({ code: 'await post({})' }, 'ce2'),
-      ] as ContentBlock[], 'tool_use'),
-      createMockResponse([{ type: 'text', text: 'done' }] as ContentBlock[]),
-    ]);
-    try {
-      await h.run();
-      assert.ok(h.log.includes('tool:send_message'), 'the alias sent');
-      assert.deepStrictEqual(h.log.filter((e) => e.startsWith('publish:')), ['publish:keeping a handle@world:test'],
-        "the send through the alias silences its round and the turn's later prose, as a direct send does");
-    } finally { await h.done(); }
-  });
-
-  /** The agent's interpreter mark: the names it holds, or undefined when there is none. */
-  const markOf = (framework: AgentFramework) => {
-    const mark = (framework as unknown as { scriptRoutingInterpreters: Map<string, { names: Set<string> }> })
-      .scriptRoutingInterpreters.get('assistant');
-    return mark && [...mark.names].sort();
-  };
-
-  it("a script that calls a routing tool directly, beside a definition that doesn't use it, leaves no mark", async () => {
-    const h = await scriptRound('locus', [
-      createMockResponse([
-        { type: 'text', text: 'formatting notes' },
-        scriptCall({ code: 'def fmt(x):\n    return x.upper()\nawait think({"content": fmt("notes")})' }, 'ce1'),
-      ] as ContentBlock[], 'tool_use'),
-      createMockResponse([{ type: 'text', text: 'done' }] as ContentBlock[]),
-    ]);
-    try {
-      await h.run();
-      assert.ok(h.log.includes('tool:think'), 'the script thought');
-      assert.equal(markOf(h.framework), undefined, 'fmt can still be called, but it reaches no routing tool');
-    } finally { await h.done(); }
-  });
-
-  it('a later mark in the same interpreter adds its names to the earlier ones', async () => {
-    const h = await scriptRound('locus', [
-      createMockResponse([
-        { type: 'text', text: 'defining a helper' },
-        scriptCall({ code: 'async def post():\n    await test__send_message({})' }, 'ce1'),
-      ] as ContentBlock[], 'tool_use'),
-      createMockResponse([
-        { type: 'text', text: 'keeping a handle' },
-        scriptCall({ code: 't = think' }, 'ce2'),
-      ] as ContentBlock[], 'tool_use'),
-      createMockResponse([{ type: 'text', text: 'done' }] as ContentBlock[]),
-    ]);
-    try {
-      await h.run();
-      assert.deepStrictEqual(markOf(h.framework), ['send_message', 'think'], 'the helper the first script left is still there');
-    } finally { await h.done(); }
-  });
-
-  it('a script the busy runner refuses leaves no mark, though its code would have', async () => {
+  it("a round with two code_execution calls waits for both: the first returns at once, and the second's later skip_reply still counts", async () => {
     const h = await scriptRound('locus', [
       createMockResponse([
         { type: 'text', text: 'two scripts at once' },
-        scriptCall({ code: 'await test__slow({})' }, 'ce1'),
-        scriptCall({ code: 'post = test__send_message' }, 'ce2'),
+        scriptCall({ code: 'text("first");' + HOLDS }, 'ce1'),
+        scriptCall({ code: 'await tools["test--slow"]({});\nawait tools.skip_reply({});' }, 'ce2'),
       ] as ContentBlock[], 'tool_use'),
-      // The control: the same script, run alone, marks.
-      createMockResponse([
-        { type: 'text', text: 'now alone' },
-        scriptCall({ code: 'post = test__send_message' }, 'ce3'),
-      ] as ContentBlock[], 'tool_use'),
-      createMockResponse([{ type: 'text', text: 'done' }] as ContentBlock[]),
     ]);
-    // Let the first script go once the second's refusal has come back, and
-    // read the mark once the first has finished, before the control runs.
+    // Let the second script go once the first's result has come back.
     const results: string[] = [];
-    let markAfterRefusal: string[] | undefined = ['unread'];
     h.framework.onTrace((event) => {
       if ((event.type === 'tool:completed' || event.type === 'tool:failed') && event.tool === 'code_execution') {
         results.push(event.callId);
-        if (event.callId === 'ce2') h.module.releaseSlow();
-        if (event.callId === 'ce1') markAfterRefusal = markOf(h.framework);
+        if (event.callId === 'ce1') h.module.releaseSlow();
       }
     });
     const bound = setTimeout(() => h.module.releaseSlow(), 15000);
     try {
       await h.run();
-      assert.deepStrictEqual(results, ['ce2', 'ce1', 'ce3'], "the second script was refused while the first ran");
-      assert.equal(markAfterRefusal, undefined, 'the refused alias never ran, so it marked nothing');
-      assert.deepStrictEqual(markOf(h.framework), ['send_message'], 'the same script, run alone, marks');
+      assert.deepStrictEqual(results, ['ce1', 'ce2'], "the first script's result came back while the second ran");
+      assert.ok(h.log.includes('tool:skip_reply'), "the second script's skip_reply ran");
+      assert.deepStrictEqual(h.log.filter((e) => e.startsWith('publish:') || e.startsWith('chunk:')), [],
+        "the round waited for the second script too, so its skip_reply kept the round's prose");
     } finally {
       clearTimeout(bound);
       await h.done();
     }
   });
 
-  it("a mark left in an earlier interpreter doesn't hold a round once a newer interpreter runs", async () => {
+  it("a left script's calls aren't the round's, even while a run of the round watches another script", async () => {
     const h = await scriptRound('locus', [
       createMockResponse([
-        { type: 'text', text: 'defining a helper' },
-        scriptCall({ code: 'async def post():\n    await test__send_message({})' }, 'ce1'),
+        scriptCall({ code: 'await tools["test--slow"]({});\nawait tools["test--send_message"]({});', yield_time_ms: 100 }, 'ce1'),
       ] as ContentBlock[], 'tool_use'),
       createMockResponse([
-        { type: 'text', text: 'starting fresh' },
-        scriptCall({ code: 'x = 1' }, 'ce2'),
-      ] as ContentBlock[], 'tool_use'),
-      createMockResponse([
-        { type: 'text', text: 'running the analysis' },
-        scriptCall({ code: 'await test__slow({})' }, 'ce3'),
+        { type: 'text', text: 'still mine to say' },
+        scriptCall({ code: 'await tools["test--gate"]({});' + HOLDS }, 'ce2'),
       ] as ContentBlock[], 'tool_use'),
       createMockResponse([{ type: 'text', text: 'done' }] as ContentBlock[]),
     ]);
-    // The helper's interpreter is reclaimed once its script returns; the next
-    // script starts a newer one, which is live when the third round is decided.
+    // The second round's script holds its round open until the left script has sent.
+    const watch = setInterval(() => {
+      if (h.log.includes('tool:gate')) h.module.releaseSlow();
+      if (h.log.includes('tool:send_message')) h.module.releaseGate();
+    }, 10);
+    const bound = setTimeout(() => { h.module.releaseSlow(); h.module.releaseGate(); }, 15000);
+    try {
+      await h.run();
+      const at = (entry: string) => h.log.indexOf(entry);
+      assert.ok(at('tool:send_message') >= 0 && at('tool:send_message') < at('gate:returned'),
+        'the left script sent while the round waited on its own script');
+      assert.deepStrictEqual(h.log.filter((e) => e.startsWith('publish:')),
+        ['publish:still mine to say@world:test', 'publish:done@world:test'], "the left script's send didn't silence the round");
+      assert.deepStrictEqual(heldDrafts(h.framework), [], 'nor hold anything as a draft');
+    } finally {
+      clearInterval(watch);
+      clearTimeout(bound);
+      await h.done();
+    }
+  });
+
+  it("a skip_reply a script makes while a later round's wait watches it keeps that round's prose private", async () => {
+    const h = await scriptRound('locus', [
+      createMockResponse([
+        { type: 'text', text: 'starting' },
+        scriptCall({ code: 'await tools["test--slow"]({});\nawait tools.skip_reply({});', yield_time_ms: 100 }, 'ce1'),
+      ] as ContentBlock[], 'tool_use'),
+      createMockResponse([
+        { type: 'text', text: 'waiting on it' },
+        scriptCall({ action: 'wait', script_id: 's1-test' }, 'ce2'),
+      ] as ContentBlock[], 'tool_use'),
+      createMockResponse([{ type: 'text', text: 'never reached' }] as ContentBlock[]),
+    ]);
+    // The script goes on once the wait has begun to watch it.
     h.framework.onTrace((event) => {
-      if (event.type === 'tool:completed' && event.callId === 'ce1') {
-        const runner = (h.framework as unknown as { codeExecutionRunners: Map<string, { reclaim(why: string): void }> })
-          .codeExecutionRunners.get('assistant')!;
-        runner.reclaim('test');
-      }
+      if (event.type === 'tool:started' && event.callId === 'ce2') setTimeout(() => h.module.releaseSlow(), 20);
     });
-    const watch = setInterval(() => { if (h.log.includes('publish:running the analysis@world:test')) h.module.releaseSlow(); }, 10);
     const bound = setTimeout(() => h.module.releaseSlow(), 15000);
     try {
       await h.run();
-      const at = (entry: string) => h.log.indexOf(entry);
-      assert.ok(at('publish:running the analysis@world:test') >= 0, 'the third round was delivered');
-      assert.ok(at('publish:running the analysis@world:test') < at('slow:returned'), 'while its script was still running');
+      assert.ok(h.log.includes('tool:skip_reply'), 'the script called skip_reply while the wait watched it');
+      assert.deepStrictEqual(h.log.filter((e) => e.startsWith('publish:')), ['publish:starting@world:test'],
+        "the first round went out at its run's yield, and the wait's round is kept, as a direct skip_reply would keep it");
+      assert.ok(!h.log.some((e) => e.includes('waiting on it') || e.includes('never reached')), 'nothing of it streamed, and the turn ended there');
     } finally {
-      clearInterval(watch);
       clearTimeout(bound);
       await h.done();
     }
   });
 
-  it("under the public same-round policy, a helper that calls think doesn't hold a later script's round", async () => {
+  it("a wait on a script whose code names no routing tool doesn't hold its round, though another of the agent's scripts names one", async () => {
     const h = await scriptRound('locus', [
       createMockResponse([
-        { type: 'text', text: 'defining a helper' },
-        scriptCall({ code: 'async def note():\n    await think({"content": "notes"})' }, 'ce1'),
+        scriptCall({ code: 'await tools["test--slow"]({});', yield_time_ms: 100 }, 'ce1'),
+        // s2-test: its code names skip_reply, so a wait that read its code for s1-test's would hold.
+        scriptCall({ code: 'text("other");' + HOLDS }, 'ce0'),
       ] as ContentBlock[], 'tool_use'),
       createMockResponse([
-        { type: 'text', text: 'running the analysis' },
-        scriptCall({ code: 'await note()\nawait test__slow({})' }, 'ce2'),
+        { type: 'text', text: 'waiting on it' },
+        scriptCall({ action: 'wait', script_id: 's1-test' }, 'ce2'),
       ] as ContentBlock[], 'tool_use'),
       createMockResponse([{ type: 'text', text: 'done' }] as ContentBlock[]),
     ]);
-    const watch = setInterval(() => { if (h.log.includes('publish:running the analysis@world:test')) h.module.releaseSlow(); }, 10);
+    const watch = setInterval(() => { if (h.log.includes('publish:waiting on it@world:test')) h.module.releaseSlow(); }, 10);
     const bound = setTimeout(() => h.module.releaseSlow(), 15000);
     try {
       await h.run();
       const at = (entry: string) => h.log.indexOf(entry);
-      assert.ok(h.log.includes('tool:think'), 'the helper thought');
-      assert.ok(at('publish:running the analysis@world:test') >= 0, 'the prose was delivered');
-      assert.ok(at('publish:running the analysis@world:test') < at('slow:returned'), 'while the script was still running');
+      assert.ok(at('publish:waiting on it@world:test') >= 0 && at('publish:waiting on it@world:test') < at('slow:returned'),
+        "the wait's round went out while the script it watched ran");
     } finally {
       clearInterval(watch);
       clearTimeout(bound);
@@ -2019,55 +1868,240 @@ describe("a round that runs code_execution is routed once its scripts return (re
     }
   });
 
-  it("under the private same-round policy, a helper that calls think holds a later script's round back", async () => {
+  it('a stop holds nothing: its round is routed at its tool-calls event', async () => {
     const h = await scriptRound('locus', [
       createMockResponse([
-        { type: 'text', text: 'defining a helper' },
-        scriptCall({ code: 'async def note():\n    await think({"content": "notes"})' }, 'ce1'),
+        scriptCall({ code: 'await tools["test--slow"]({});\nawait tools.skip_reply({});', yield_time_ms: 100 }, 'ce1'),
       ] as ContentBlock[], 'tool_use'),
+      createMockResponse([
+        { type: 'text', text: 'stopping it' },
+        scriptCall({ action: 'stop', script_id: 's1-test' }, 'ce2'),
+      ] as ContentBlock[], 'tool_use'),
+      createMockResponse([{ type: 'text', text: 'done' }] as ContentBlock[]),
+    ]);
+    // The stop returns only once its round's prose is out, or after a bound,
+    // so a round that waited for it shows in the order.
+    const scripts = (h.framework as unknown as { codeExecution: { scripts: { stop: (...args: unknown[]) => Promise<unknown> } } }).codeExecution.scripts;
+    const stop = scripts.stop.bind(scripts);
+    let releaseStop!: () => void;
+    const stopHeld = new Promise<void>((resolve) => { releaseStop = resolve; });
+    scripts.stop = async (...args) => { const r = await stop(...args); await stopHeld; h.log.push('stop:returned'); return r; };
+    const watch = setInterval(() => { if (h.log.includes('publish:stopping it@world:test')) releaseStop(); }, 10);
+    const bound = setTimeout(() => releaseStop(), 15000);
+    try {
+      await h.run();
+      const at = (entry: string) => h.log.indexOf(entry);
+      assert.ok(at('publish:stopping it@world:test') >= 0 && at('publish:stopping it@world:test') < at('stop:returned'),
+        "the stop's round went out before the stop returned");
+      assert.deepStrictEqual(h.log.filter((e) => e.startsWith('publish:')), ['publish:stopping it@world:test', 'publish:done@world:test'],
+        "the stop's round and the next are published");
+      assert.ok(!h.log.includes('tool:skip_reply'), 'and the stopped script never called skip_reply');
+    } finally {
+      clearInterval(watch);
+      clearTimeout(bound);
+      await h.done();
+    }
+  });
+
+  it("a call the bridge refuses for its arguments still counts toward its round: a think given no object holds the round back under the private policy", async () => {
+    const h = await scriptRound('locus', [
       createMockResponse([
         { type: 'text', text: 'working it through' },
-        scriptCall({ code: 'await note()' }, 'ce2'),
+        scriptCall({ code: 'try { await tools.think(null); } catch {}' }),
       ] as ContentBlock[], 'tool_use'),
       createMockResponse([{ type: 'text', text: 'the answer' }] as ContentBlock[]),
     ], { sameRoundThinkTextPolicy: 'private' });
     try {
       await h.run();
-      assert.ok(h.log.includes('tool:think'), 'the helper thought');
-      assert.deepStrictEqual(h.log.filter((e) => e.startsWith('publish:')),
-        ['publish:defining a helper@world:test', 'publish:the answer@world:test'],
-        'the round whose helper thought stays private, as with a direct think, and the rounds around it are delivered');
+      assert.ok(!h.log.includes('tool:think'), 'the bridge refused it before dispatch');
+      assert.deepStrictEqual(h.log.filter((e) => e.startsWith('publish:')), ['publish:the answer@world:test'],
+        'the round beside the think stays private, as with a direct think, and the next round is delivered');
     } finally { await h.done(); }
   });
 
-  it("once the interpreter is reclaimed, a script that names no such tool doesn't hold its round, since the helpers went with it", async () => {
+  it('a send the bridge refuses for its arguments counts as one the allowedTools refuses: it silences nothing', async () => {
     const h = await scriptRound('locus', [
       createMockResponse([
-        { type: 'text', text: 'defining a helper' },
-        scriptCall({ code: 'async def post():\n    await test__send_message({})' }, 'ce1'),
-      ] as ContentBlock[], 'tool_use'),
-      createMockResponse([
-        { type: 'text', text: 'running the analysis' },
-        scriptCall({ code: 'await test__slow({})' }, 'ce2'),
+        { type: 'text', text: 'posting the summary' },
+        scriptCall({ code: 'try { await tools["test--send_message"](null); } catch {}' }),
       ] as ContentBlock[], 'tool_use'),
       createMockResponse([{ type: 'text', text: 'done' }] as ContentBlock[]),
     ]);
-    // The interpreter that ran the helper's script is reclaimed once that
-    // script returns, as an idle reclaim or a restart would.
-    h.framework.onTrace((event) => {
-      if (event.type === 'tool:completed' && event.callId === 'ce1') {
-        const runner = (h.framework as unknown as { codeExecutionRunners: Map<string, { reclaim(why: string): void }> })
-          .codeExecutionRunners.get('assistant')!;
-        runner.reclaim('test');
-      }
-    });
-    const watch = setInterval(() => { if (h.log.includes('publish:running the analysis@world:test')) h.module.releaseSlow(); }, 10);
+    try {
+      await h.run();
+      assert.ok(!h.log.includes('tool:send_message'), 'the bridge refused it before dispatch');
+      assert.deepStrictEqual(h.log.filter((e) => e.startsWith('publish:')), ['publish:posting the summary@world:test', 'publish:done@world:test'],
+        'the round and the next are published, as with no send at all');
+    } finally { await h.done(); }
+  });
+
+  it('a skip_reply the bridge refuses for its arguments counts as a refused direct one: it keeps only its own round private', async () => {
+    const h = await scriptRound('locus', [
+      createMockResponse([
+        { type: 'text', text: 'checking quietly' },
+        scriptCall({ code: 'try { await tools.skip_reply(null); } catch {}' }),
+      ] as ContentBlock[], 'tool_use'),
+      createMockResponse([{ type: 'text', text: 'no object given, so now' }] as ContentBlock[]),
+    ]);
+    try {
+      await h.run();
+      assert.ok(!h.log.includes('tool:skip_reply'), 'the bridge refused it before dispatch');
+      assert.deepStrictEqual(h.log.filter((e) => e.startsWith('publish:')), ['publish:no object given, so now@world:test'],
+        "the refused call's round is kept, and the turn goes on to publish the next");
+      assert.deepStrictEqual(heldDrafts(h.framework), [], 'and nothing is held as a draft');
+    } finally { await h.done(); }
+  });
+
+  it("a call whose arguments aren't JSON still counts toward its round: such a think holds the round back under the private policy", async () => {
+    const h = await scriptRound('locus', [
+      createMockResponse([
+        { type: 'text', text: 'working it through' },
+        scriptCall({ code: 'await tools["test--slow"]({});' + HOLDS }),
+      ] as ContentBlock[], 'tool_use'),
+      createMockResponse([{ type: 'text', text: 'the answer' }] as ContentBlock[]),
+    ], { sameRoundThinkTextPolicy: 'private' });
+    // A child that ignores the prelude sends a think whose arguments aren't JSON, beside the script's slow call.
+    let forged: { ok?: boolean; json?: string } | undefined;
+    void forgeBeside(h.framework, 'think', '{not json').then((answer) => { forged = answer as typeof forged; h.module.releaseSlow(); });
     const bound = setTimeout(() => h.module.releaseSlow(), 15000);
     try {
       await h.run();
+      assert.equal(forged?.ok, false, 'the forged call was made, and refused');
+      assert.match(JSON.parse(forged?.json ?? '{}').message ?? '', /weren't JSON/);
+      assert.ok(!h.log.includes('tool:think'), 'the bridge refused it before dispatch');
+      assert.deepStrictEqual(h.log.filter((e) => e.startsWith('publish:')), ['publish:the answer@world:test'],
+        'the round beside the think stays private, as with a direct think, and the next round is delivered');
+    } finally {
+      clearTimeout(bound);
+      await h.done();
+    }
+  });
+
+  it("a start that resumes a turn its settle ended makes that turn live again while it runs", async () => {
+    const h = await scriptRound('locus', [
+      createMockResponse([{ type: 'text', text: 'all done' }] as ContentBlock[]),
+      createMockResponse([{ type: 'text', text: 'carrying on' }] as ContentBlock[]),
+    ]);
+    const fw = h.framework as unknown as {
+      pendingRequests: Array<Record<string, unknown>>;
+      turnRouting: Map<string, { turnId: number }>;
+      settledTurns: WeakSet<object>;
+      liveTurns(agent: string, ending: object | undefined): number[];
+    };
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      await h.run();
+      const settled = fw.turnRouting.get('assistant');
+      assert.ok(settled && fw.settledTurns.has(settled), 'the turn settled');
+      assert.deepEqual(fw.liveTurns('assistant', undefined), [], 'and is no longer live');
+      // A silent budget restart resumes the agent's latest routing, the one
+      // that settled: while it runs, holding the agent's turn, that turn is live,
+      // so a non-primary agent's run made in it starts.
+      let live: number[] | undefined;
+      const off = h.framework.onTrace((event) => {
+        if (event.type === 'inference:started' && live === undefined) live = fw.liveTurns('assistant', undefined);
+      });
+      fw.pendingRequests.push({ agentName: 'assistant', reason: 'context_budget_restart', source: 'framework', timestamp: Date.now(), suppressProse: true });
+      void h.framework.runUntilIdle().catch(() => {});
+      await new Promise<void>((resolve, reject) => {
+        const poll = setInterval(() => { if (live !== undefined) { clearInterval(poll); resolve(); } }, 10);
+        timer = setTimeout(() => { clearInterval(poll); reject(new Error('the resumed start never began')); }, 30_000);
+      });
+      off();
+      assert.equal(fw.turnRouting.get('assistant'), settled, 'the restart runs on that routing');
+      assert.deepEqual(live, [settled!.turnId]);
+    } finally {
+      clearTimeout(timer);
+      await h.done();
+    }
+  });
+
+  it('a send counts toward its round once the host has it, though its tool is still running when the run yields', async () => {
+    const h = await scriptRound('locus', [
+      createMockResponse([
+        { type: 'text', text: 'posting the summary' },
+        // The send is held, so the run yields at its bound: three seconds for the child to start and the send to reach the host
+        // first, within bun test's default five seconds a test.
+        scriptCall({ code: 'await tools["test--send_message"]({});', yield_time_ms: 3_000 }),
+      ] as ContentBlock[], 'tool_use'),
+      createMockResponse([{ type: 'text', text: 'done' }] as ContentBlock[]),
+    ]);
+    h.module.holdSend = true;
+    // The send goes on once the turn is over, or after a bound.
+    const bound = setTimeout(() => h.module.releaseGate(), 15000);
+    try {
+      await h.run();
+      assert.ok(h.log.includes('tool:send_message'), 'the send reached its tool');
+      assert.ok(!h.log.includes('send:returned'), 'and was still running when the run yielded');
+      assert.deepStrictEqual(h.log.filter((e) => e.startsWith('publish:')), [], 'the send silenced the round and the turn after it');
+    } finally {
+      clearTimeout(bound);
+      await h.done();
+    }
+  });
+
+  it("a call made while a run watches, that waits for room in the host until the run has yielded, counts toward the later wait's round, not the run's", async () => {
+    // The script's 16 slow calls time out in it while their tools still hold the host's 16 places, so its skip_reply,
+    // made while the run watches, waits for room past the run's yield, and the host receives it while the wait watches.
+    // Esther-2584's probe: what counts is the host's receipt of a call, not the script's making it. A call's timeout
+    // runs from its making, so 2 s ends the skip_reply's about a second past the wait's start, and its making about a
+    // second before the yield (Esther's sweep at 1.5 s passed three runs of three, and below it began to fail).
+    const h = await scriptRound('locus', [
+      createMockResponse([
+        { type: 'text', text: 'starting' },
+        scriptCall({ code: [
+          'const slow = Array.from({ length: 16 }, () => tools["test--slow"]({}).catch((e) => e.name));',
+          'await Promise.all(slow);',
+          'await tools.skip_reply({});',
+        ].join('\n'), yield_time_ms: 3_000 }, 'ce1'),
+      ] as ContentBlock[], 'tool_use'),
+      createMockResponse([
+        { type: 'text', text: 'waiting on it' },
+        scriptCall({ action: 'wait', script_id: 's1-test' }, 'ce2'),
+      ] as ContentBlock[], 'tool_use'),
+      createMockResponse([{ type: 'text', text: 'never reached' }] as ContentBlock[]),
+    ], {}, { toolCallTimeoutMs: 2_000 });
+    type Run = { hostCalls: number; snapshot(): { calls: { waiting: number } } };
+    const scripts = (h.framework as unknown as { codeExecution: { scripts: { scripts: Map<string, { run: Run }> } } }).codeExecution.scripts;
+    let atWait: { waiting: number; hostCalls: number } | null = null;
+    h.framework.onTrace((event) => {
+      if (event.type === 'tool:started' && event.callId === 'ce2') {
+        const run = scripts.scripts.get('s1-test')?.run;
+        atWait = run ? { waiting: run.snapshot().calls.waiting, hostCalls: run.hostCalls } : null;
+        setTimeout(() => h.module.releaseSlow(), 20);
+      }
+    });
+    const bound = setTimeout(() => h.module.releaseSlow(), 30_000);
+    try {
+      await h.run();
+      assert.deepStrictEqual(atWait, { waiting: 1, hostCalls: 16 }, 'as the wait began, the skip_reply waited for room, the 16 places taken');
+      // The run's round went out, and the skip_reply reached its tool only after it.
+      assert.deepStrictEqual(h.log.filter((e) => e.startsWith('publish:')), ['publish:starting@world:test']);
+      assert.ok(h.log.indexOf('tool:skip_reply') > h.log.indexOf('publish:starting@world:test'), h.log.join(' | '));
+      // The wait's round was kept private, and the turn ended there.
+      assert.ok(!h.log.some((e) => e.includes('waiting on it') || e.includes('never reached')), h.log.join(' | '));
+    } finally {
+      clearTimeout(bound);
+      await h.done();
+    }
+  });
+
+  it("a round's prose is routed before the tool-result handler awaits a module's batch-completion hook", async () => {
+    const h = await scriptRound('locus', [
+      createMockResponse([
+        { type: 'text', text: 'on it' },
+        scriptCall({ code: 'text("x");' + HOLDS }),
+      ] as ContentBlock[], 'tool_use'),
+      createMockResponse([{ type: 'text', text: 'done' }] as ContentBlock[]),
+    ]);
+    h.module.holdBatch = true;
+    const watch = setInterval(() => { if (h.log.includes('publish:on it@world:test')) h.module.releaseBatch(); }, 10);
+    const bound = setTimeout(() => h.module.releaseBatch(), 15000);
+    try {
+      await h.run();
       const at = (entry: string) => h.log.indexOf(entry);
-      assert.ok(at('publish:running the analysis@world:test') >= 0, 'the prose was delivered');
-      assert.ok(at('publish:running the analysis@world:test') < at('slow:returned'), 'while the script was still running');
+      assert.ok(at('hook:called') >= 0, 'the hook ran for the batch');
+      assert.ok(at('publish:on it@world:test') >= 0 && at('publish:on it@world:test') < at('hook:returned'), 'the round went out while the hook held');
     } finally {
       clearInterval(watch);
       clearTimeout(bound);
@@ -2075,22 +2109,50 @@ describe("a round that runs code_execution is routed once its scripts return (re
     }
   });
 
-  it("a background script's round is routed as soon as the script starts", async () => {
+  it("a model's code_execution call whose input isn't an object holds nothing and throws nothing: its round's prose goes out", async () => {
+    for (const input of [null, 'run it']) {
+      const h = await scriptRound('locus', [
+        createMockResponse([
+          { type: 'text', text: 'trying it' },
+          { type: 'tool_use', id: 'ce1', name: 'code_execution', input } as unknown as ContentBlock,
+        ] as ContentBlock[], 'tool_use'),
+        createMockResponse([{ type: 'text', text: 'done' }] as ContentBlock[]),
+      ]);
+      try {
+        await h.run();
+        assert.deepStrictEqual(h.log.filter((e) => e.startsWith('publish:')), ['publish:trying it@world:test', 'publish:done@world:test'], String(input));
+      } finally { await h.done(); }
+    }
+  });
+
+  it("a name a Unicode letter or a joiner continues isn't the tool's name", async () => {
+    await publishedWhileScriptRuns('locus', 'await tools["test--slow"]({}); // πsay sayπ say\u200D \u200Csay say\u00E9');
+  });
+
+  it('a script whose code names whisper holds its round until it returns', async () => {
+    await heldUntilScriptReturns('await tools["test--slow"]({});\nif (false) await tools["world--whisper"]({});');
+  });
+
+  it("a script that makes many calls of one kind keeps one entry for them in its round's count", async () => {
     const h = await scriptRound('locus', [
       createMockResponse([
-        { type: 'text', text: 'starting a watcher' },
-        scriptCall({ code: 'import asyncio\nawait asyncio.sleep(30)', background: true }),
-        { type: 'tool_use', id: 'slow1', name: 'test--slow', input: {} },
+        { type: 'text', text: 'counting' },
+        scriptCall({ code: 'for (let i = 0; i < 40; i++) await tools["test--echo"]({});\nawait tools["test--gate"]({});' + HOLDS }),
       ] as ContentBlock[], 'tool_use'),
       createMockResponse([{ type: 'text', text: 'done' }] as ContentBlock[]),
     ]);
-    const watch = setInterval(() => { if (h.log.includes('publish:starting a watcher@world:test')) h.module.releaseSlow(); }, 10);
-    const bound = setTimeout(() => h.module.releaseSlow(), 15000);
+    const rounds = (h.framework as unknown as { scriptRounds: Map<string, { scripts: Map<string, unknown[]> }> }).scriptRounds;
+    let kept: number | undefined;
+    const watch = setInterval(() => {
+      if (kept !== undefined || !h.log.includes('tool:gate')) return;
+      kept = rounds.get('assistant')?.scripts.get('ce1')?.length;
+      h.module.releaseGate();
+    }, 10);
+    const bound = setTimeout(() => h.module.releaseGate(), 15000);
     try {
       await h.run();
-      const at = (entry: string) => h.log.indexOf(entry);
-      assert.ok(at('publish:starting a watcher@world:test') >= 0, 'the prose was delivered');
-      assert.ok(at('publish:starting a watcher@world:test') < at('slow:returned'), 'without waiting for the slow tool');
+      assert.equal(h.log.filter((e) => e === 'tool:echo').length, 40, 'every call went out');
+      assert.equal(kept, 2, 'one echo and one gate, while the round still waited');
     } finally {
       clearInterval(watch);
       clearTimeout(bound);
@@ -2098,53 +2160,42 @@ describe("a round that runs code_execution is routed once its scripts return (re
     }
   });
 
-  it("a round with two code_execution calls waits for both: the second is refused at once, and the first's later skip_reply still counts", async () => {
+  it("a drafts list and then a resend in one script are both kept in its round's count: the resend still holds the round", async () => {
     const h = await scriptRound('locus', [
       createMockResponse([
-        { type: 'text', text: 'two scripts at once' },
-        scriptCall({ code: 'await test__slow({})\nawait skip_reply({})' }, 'ce1'),
-        scriptCall({ code: 'print("second")' + HOLDS }, 'ce2'),
+        { type: 'text', text: 'checking the drafts, then sending one' },
+        scriptCall({ code: 'try { await tools.drafts({ action: "list" }); } catch {}\ntry { await tools.drafts({ action: "resend", draftIds: ["d-0000000"], destination: "#alpha" }); } catch {}' }),
       ] as ContentBlock[], 'tool_use'),
+      createMockResponse([{ type: 'text', text: 'done' }] as ContentBlock[]),
     ]);
-    // Let the first script go once the second's refusal has come back.
-    const results: string[] = [];
-    h.framework.onTrace((event) => {
-      if ((event.type === 'tool:completed' || event.type === 'tool:failed') && event.tool === 'code_execution') {
-        results.push(event.callId);
-        if (event.callId === 'ce2') h.module.releaseSlow();
-      }
-    });
-    const bound = setTimeout(() => h.module.releaseSlow(), 15000);
     try {
       await h.run();
-      assert.deepStrictEqual(results, ['ce2', 'ce1'], "the second script's refusal came back while the first ran");
-      assert.ok(h.log.includes('tool:skip_reply'), "the first script's skip_reply ran");
       assert.deepStrictEqual(h.log.filter((e) => e.startsWith('publish:') || e.startsWith('chunk:')), [],
-        "the round waited for the first script, so its skip_reply kept the round's prose");
-    } finally {
-      clearTimeout(bound);
-      await h.done();
-    }
+        'the resend silences the round and what follows, though a call of the same tool that sends nothing came first');
+      assert.deepStrictEqual(heldDrafts(h.framework), [
+        { text: 'checking the drafts, then sending one', reason: 'explicit-send' },
+        { text: 'done', reason: 'explicit-send' },
+      ], 'and their words are held as drafts');
+    } finally { await h.done(); }
   });
 
-  it("a background script's calls aren't its round's, even while a foreground script in the round runs", async () => {
+  it("a round that waits counts the calls of a script it doesn't wait on: a skip_reply by a name built at runtime keeps it private", async () => {
     const h = await scriptRound('locus', [
       createMockResponse([
-        { type: 'text', text: 'still mine to say' },
-        scriptCall({ code: 'await test__send_message({})', background: true }, 'bg'),
-        scriptCall({ code: 'await test__slow({})' + HOLDS }, 'fg'),
+        { type: 'text', text: 'two at once' },
+        scriptCall({ code: 'await tools["test--gate"]({}); // and maybe skip_reply' }, 'ce1'),
+        scriptCall({ code: 'await tools["skip" + "_reply"]({});' }, 'ce2'),
       ] as ContentBlock[], 'tool_use'),
-      createMockResponse([{ type: 'text', text: 'done' }] as ContentBlock[]),
+      createMockResponse([{ type: 'text', text: 'never reached' }] as ContentBlock[]),
     ]);
-    // The foreground script holds the round open until the background send has run.
-    const watch = setInterval(() => { if (h.log.includes('tool:send_message')) h.module.releaseSlow(); }, 10);
-    const bound = setTimeout(() => h.module.releaseSlow(), 15000);
+    // The waited-on script goes on once the other's skip_reply has reached the host.
+    const watch = setInterval(() => { if (h.log.includes('tool:skip_reply')) h.module.releaseGate(); }, 10);
+    const bound = setTimeout(() => h.module.releaseGate(), 15000);
     try {
       await h.run();
-      const at = (entry: string) => h.log.indexOf(entry);
-      assert.ok(at('tool:send_message') >= 0 && at('tool:send_message') < at('slow:returned'),
-        'the background send ran while the round waited on its foreground script');
-      assert.ok(h.log.includes('publish:still mine to say@world:test'), "the background send didn't silence the round");
+      assert.ok(h.log.includes('tool:skip_reply'), 'the second script called skip_reply');
+      assert.deepStrictEqual(h.log.filter((e) => e.startsWith('publish:') || e.startsWith('chunk:')), [],
+        'the round, waiting on the first script, counted the second\'s skip_reply and kept its prose');
     } finally {
       clearInterval(watch);
       clearTimeout(bound);
@@ -2156,7 +2207,7 @@ describe("a round that runs code_execution is routed once its scripts return (re
     const h = await scriptRound('locus', [
       createMockResponse([
         { type: 'text', text: 'for the room I was in' },
-        scriptCall({ code: 'await channel_open({"channelId": "chan-other"})' + HOLDS }),
+        scriptCall({ code: 'await tools.channel_open({ channelId: "chan-other" });' + HOLDS }),
       ] as ContentBlock[], 'tool_use'),
       createMockResponse([{ type: 'text', text: 'now over here' }] as ContentBlock[]),
     ]);
@@ -2169,40 +2220,37 @@ describe("a round that runs code_execution is routed once its scripts return (re
     } finally { await h.done(); }
   });
 
-  it("an ephemeral disposed while its round's script runs doesn't publish the round when the script returns", async () => {
+  it("an ephemeral disposed while its round's script runs doesn't publish the round when the script's call returns", async () => {
     const h = await scriptRound('locus', []);
     const membrane = (h.framework as unknown as { membrane: MockMembrane }).membrane;
     membrane.pushResponse(createMockResponse([
       { type: 'text', text: 'never decided' },
-      scriptCall({ code: 'await test__slow({})' + HOLDS }),
+      scriptCall({ code: 'await tools["test--slow"]({});' + HOLDS }),
     ] as ContentBlock[], 'tool_use'));
     const lines: string[] = [];
     const error = console.error;
     console.error = (...args: unknown[]) => { lines.push(args.map(String).join(' ')); error(...args); };
+    let resulted = false;
+    h.framework.onTrace((event) => {
+      if ((event.type === 'tool:completed' || event.type === 'tool:failed') && event.tool === 'code_execution') resulted = true;
+    });
     try {
       const created = await h.framework.createEphemeralAgent({ name: 'eph-script', model: 'test-model', systemPrompt: 'Act.', allowedTools: 'all' });
       created.contextManager.addMessage('user', [{ type: 'text', text: 'go' }]);
       // The idle watchdog disposes the ephemeral while its script waits in the
-      // slow call. Its threshold is too long for python3's start to trip it, so
-      // the run is made to look idle only once the script is in the slow call,
-      // and the next poll disposes it.
-      const run = h.framework.runEphemeralToCompletion(created.agent, created.contextManager, { startupTimeoutMs: 15000, idleTimeoutMs: 60_000, idlePollMs: 20 });
+      // slow call: the run is made to look idle only once the script is in the
+      // slow call, and the next poll disposes it.
+      const run = h.framework.runEphemeralToCompletion(created.agent, created.contextManager, { ...UNREACHED_WATCHDOG, startupTimeoutMs: 15000 });
       const stalled = assert.rejects(run, /stalled/);
       h.framework.start();
-      const deadline = Date.now() + 15000;
-      while (Date.now() < deadline && !h.log.includes('tool:slow')) await new Promise((r) => setTimeout(r, 10));
+      await soon(() => h.log.includes('tool:slow'));
       assert.ok(h.log.includes('tool:slow'), 'the script reached the slow call');
-      const runs = (h.framework as unknown as { ephemeralRuns: Map<string, { lastActivity: number }> }).ephemeralRuns;
-      runs.get(created.agent.name)!.lastActivity = 0;
+      silenceRun(h.framework, created.agent.name);
       await stalled;
-      // The script now returns, and its result arrives with the framework still running.
-      let resulted!: () => void;
-      const result = new Promise<void>((resolve) => { resulted = resolve; });
-      h.framework.onTrace((event) => {
-        if ((event.type === 'tool:completed' || event.type === 'tool:failed') && event.tool === 'code_execution') resulted();
-      });
+      // The agent's end stops its script, and the run call returns with the framework still running.
       h.module.releaseSlow();
-      await result;
+      await soon(() => resulted);
+      assert.ok(resulted, "the script's run call returned");
       await h.framework.runUntilIdle();
       assert.deepStrictEqual(h.log.filter((e) => e.startsWith('publish:') || e.startsWith('chunk:')), [],
         "the round's routing was never decided, so the late result publishes nothing");
@@ -2225,11 +2273,11 @@ describe("a round that runs code_execution is routed once its scripts return (re
       (agent as unknown as { _streamId: number })._streamId++;
     },
   };
-  for (const [how, leave] of Object.entries(leaveRound)) it(`a round is withheld when its script returns if, meanwhile, ${how}`, async () => {
+  for (const [how, leave] of Object.entries(leaveRound)) it(`a round is withheld when its script's call returns if, meanwhile, ${how}`, async () => {
     const h = await scriptRound('locus', [
       createMockResponse([
         { type: 'text', text: 'never decided' },
-        scriptCall({ code: 'await test__slow({})' + HOLDS }),
+        scriptCall({ code: 'await tools["test--slow"]({});' + HOLDS }),
       ] as ContentBlock[], 'tool_use'),
     ]);
     const lines: string[] = [];
@@ -2240,8 +2288,7 @@ describe("a round that runs code_execution is routed once its scripts return (re
     try {
       h.framework.pushEvent({ type: 'external-message', source: 'test', content: 'go', metadata: {} } as unknown as ProcessEvent);
       void h.framework.runUntilIdle().catch(() => {});
-      const started = Date.now();
-      while (!h.log.includes('tool:slow') && Date.now() - started < 15000) await new Promise((r) => setTimeout(r, 10));
+      await soon(() => h.log.includes('tool:slow'));
       assert.ok(h.log.includes('tool:slow'), 'the script reached its slow call');
       // The turn's routing state, whose receipt counts what the turn suppressed.
       const routing = (h.framework as unknown as { turnRouting: Map<string, { suppressed: number; drafts: unknown[] }> }).turnRouting.get('assistant')!;
@@ -2250,17 +2297,15 @@ describe("a round that runs code_execution is routed once its scripts return (re
       agent = h.framework.getAgent('assistant')! as unknown as { state: { stream?: { cancel(): void } }; reset(): void };
       stream = agent.state.stream;
       leave(h.framework, agent);
-      let resulted!: () => void;
-      const result = new Promise<void>((resolve) => { resulted = resolve; });
+      let resulted = false;
       h.framework.onTrace((event) => {
-        if ((event.type === 'tool:completed' || event.type === 'tool:failed') && event.tool === 'code_execution') resulted();
+        if ((event.type === 'tool:completed' || event.type === 'tool:failed') && event.tool === 'code_execution') resulted = true;
       });
       h.module.releaseSlow();
-      await result;
-      const until = Date.now() + 15000;
-      while (Date.now() < until && !lines.some((line) => line.includes('prose segment(s) withheld'))) await new Promise((r) => setTimeout(r, 10));
+      await soon(() => resulted);
+      await soon(() => lines.some((line) => line.includes('prose segment(s) withheld')));
       assert.ok(lines.some((line) => line.includes('assistant: round [code_execution] -> 1 prose segment(s) withheld: its turn no longer waits on it')),
-        'the script result found the round undecidable and withheld it');
+        "the script's call found the round undecidable and withheld it");
       assert.deepStrictEqual(h.log.filter((e) => e.startsWith('publish:') || e.startsWith('chunk:')), [], 'and published nothing');
       assert.equal(routing.suppressed, suppressedBefore + 1, "and the turn's receipt counts the withheld segment as suppressed");
       assert.deepStrictEqual(routing.drafts, [], 'and holds none of it as a draft, since the script might have kept it private');
@@ -2278,11 +2323,11 @@ describe("a round that runs code_execution is routed once its scripts return (re
     }
   });
 
-  it("a round whose stream is stopped before its script returns is withheld", async () => {
+  it("a round whose stream is stopped before its script's call returns is withheld", async () => {
     const h = await scriptRound('locus', [
       createMockResponse([
         { type: 'text', text: 'never decided' },
-        scriptCall({ code: 'await test__slow({})\nawait skip_reply({})' }),
+        scriptCall({ code: 'await tools["test--slow"]({});\nawait tools.skip_reply({});' }),
       ] as ContentBlock[], 'tool_use'),
     ]);
     const lines: string[] = [];
@@ -2292,8 +2337,7 @@ describe("a round that runs code_execution is routed once its scripts return (re
       h.framework.pushEvent({ type: 'external-message', source: 'test', content: 'go', metadata: {} } as unknown as ProcessEvent);
       void h.framework.runUntilIdle().catch(() => {});
       // The script is running, held in its slow call.
-      const started = Date.now();
-      while (!h.log.includes('tool:slow') && Date.now() - started < 15000) await new Promise((r) => setTimeout(r, 10));
+      await soon(() => h.log.includes('tool:slow'));
       assert.ok(h.log.includes('tool:slow'), 'the script reached its slow call');
       await h.framework.stop();
       h.module.releaseSlow();
@@ -2321,11 +2365,11 @@ describe("a round that runs code_execution is routed once its scripts return (re
     };
   };
 
-  it("a script's result settles only the round that dispatched it, though a newer round waits on the same call id", async () => {
+  it("a script call's result settles only the round that dispatched it, though a newer round waits on the same call id", async () => {
     const h = await scriptRound('locus', [
       createMockResponse([
         { type: 'text', text: 'the first round' },
-        scriptCall({ code: 'await test__slow({})' + HOLDS }, 'ce1'),
+        scriptCall({ code: 'await tools["test--slow"]({});' + HOLDS }, 'ce1'),
       ] as ContentBlock[], 'tool_use'),
       createMockResponse([{ type: 'text', text: 'done' }] as ContentBlock[]),
     ]);
@@ -2359,7 +2403,7 @@ describe("a round that runs code_execution is routed once its scripts return (re
     const h = await scriptRound('locus', [
       createMockResponse([
         { type: 'text', text: 'the newer round' },
-        scriptCall({ code: 'print("quick")' }, 'ce1'),
+        scriptCall({ code: 'text("quick");' }, 'ce1'),
       ] as ContentBlock[], 'tool_use'),
       createMockResponse([{ type: 'text', text: 'done' }] as ContentBlock[]),
     ]);
@@ -2379,7 +2423,7 @@ describe("a round that runs code_execution is routed once its scripts return (re
     const h = await scriptRound('locus', [
       createMockResponse([
         { type: 'text', text: 'the newer round' },
-        scriptCall({ code: 'print("quick")' + HOLDS }),
+        scriptCall({ code: 'text("quick");' + HOLDS }),
       ] as ContentBlock[], 'tool_use'),
       createMockResponse([{ type: 'text', text: 'done' }] as ContentBlock[]),
     ]);
@@ -2405,11 +2449,15 @@ describe("a round that runs code_execution is routed once its scripts return (re
         ] as ContentBlock[], 'tool_use'),
         createMockResponse([{ type: 'text', text: 'done' }] as ContentBlock[]),
       ]);
-      // pendingRound's round has stream id -1, which no stream has.
+      // pendingRound's round has stream id -1, which no stream has: the later
+      // stream's case. Another agent object's round takes this stream's own
+      // id, so only the agent check tells it apart.
       const successor = pendingRound(whose === 'another agent object' ? {} : h.framework.getAgent('assistant'));
       const rounds = (h.framework as unknown as { scriptRounds: Map<string, unknown> }).scriptRounds;
       h.framework.onTrace((event) => {
-        if (event.type === 'tool:completed' && event.callId === 'r1') rounds.set('assistant', successor.round);
+        if (event.type !== 'tool:completed' || event.callId !== 'r1') return;
+        if (whose === 'another agent object') successor.round.streamId = (h.framework.getAgent('assistant') as unknown as { streamId: number }).streamId;
+        rounds.set('assistant', successor.round);
       });
       try {
         await h.run();
@@ -2424,7 +2472,7 @@ describe("a round that runs code_execution is routed once its scripts return (re
     const h = await scriptRound('explicit', [
       createMockResponse([
         { type: 'text', text: '>>#alpha written for alpha' },
-        scriptCall({ code: 'await test__slow({})' + HOLDS }),
+        scriptCall({ code: 'await tools["test--slow"]({});' + HOLDS }),
       ] as ContentBlock[], 'tool_use'),
       createMockResponse([{ type: 'text', text: '>>skip_reply done' }] as ContentBlock[]),
     ]);
@@ -2441,1060 +2489,6 @@ describe("a round that runs code_execution is routed once its scripts return (re
       clearInterval(watch);
       clearTimeout(bound);
       await h.done();
-    }
-  });
-});
-
-// ---------------------------------------------------------------------------
-// Background scripts (wake_agent) + spill-to-file
-// ---------------------------------------------------------------------------
-
-describe('PyRunner background mode (real python3)', () => {
-  it('wake_agent reports the caller line and payload; log file journals output', async () => {
-    const tempDir = mkdtempSync(join(tmpdir(), 'pytc-bg-'));
-    const logPath = join(tempDir, 'nested', 'bg.log');
-    const wakes: Array<{ line: number; payload: unknown }> = [];
-    const runner = new PyRunner({ onToolCall: async () => '' });
-    try {
-      const code = [
-        'print("watcher starting")',        // line 1
-        'x = 1',                            // line 2
-        'await wake_agent({"hit": x})',     // line 3
-        'print("after wake")',              // line 4
-      ].join('\n');
-      const result = await runner.exec(code, [], {
-        logPath,
-        lifetimeMs: 30_000,
-        onWake: async (line, payload) => {
-          wakes.push({ line, payload });
-          return null;
-        },
-      });
-      assert.strictEqual(result.returnCode, 0, result.tail ?? '');
-      assert.strictEqual(wakes.length, 1);
-      assert.strictEqual(wakes[0].line, 3);
-      assert.deepStrictEqual(wakes[0].payload, { hit: 1 });
-      const { readFileSync } = await import('node:fs');
-      const log = readFileSync(logPath, 'utf8');
-      assert.match(log, /watcher starting/);
-      assert.match(log, /after wake/);
-      assert.match(result.tail ?? '', /after wake/);
-    } finally {
-      runner.dispose();
-      rmSync(tempDir, { recursive: true, force: true });
-    }
-  });
-
-  it('a refused wake raises RuntimeError inside the script', async () => {
-    const runner = new PyRunner({ onToolCall: async () => '' });
-    try {
-      const result = await runner.exec('await wake_agent({"n": 1})', [], {
-        logPath: null,
-        lifetimeMs: 30_000,
-        onWake: async () => 'wake limit reached (test)',
-      });
-      assert.strictEqual(result.returnCode, 1);
-      assert.match(result.tail ?? '', /RuntimeError: wake_agent refused by host: wake limit reached/);
-    } finally {
-      runner.dispose();
-    }
-  });
-
-  it('wake_agent is absent in foreground scripts', async () => {
-    const runner = new PyRunner({ onToolCall: async () => '' });
-    try {
-      const result = await runner.exec('print("wake_agent" in globals())', []);
-      assert.strictEqual(result.returnCode, 0, result.stderr);
-      assert.match(result.stdout, /False/);
-    } finally {
-      runner.dispose();
-    }
-  });
-});
-
-describe('framework background scripts + spill (real python3)', () => {
-  async function createBgFramework(storePath: string, membrane: MockMembrane, opts?: {
-    mountDir?: string;
-    codeExecution?: Record<string, unknown>;
-  }) {
-    const { WorkspaceModule } = await import('../src/modules/workspace/index.js');
-    const modules: Module[] = [new ScriptToolModule()];
-    let workspace: InstanceType<typeof WorkspaceModule> | null = null;
-    if (opts?.mountDir) {
-      workspace = new WorkspaceModule({
-        mounts: [{ name: 'files', path: opts.mountDir, mode: 'read-write', watch: 'never' }],
-      });
-      modules.push(workspace as unknown as Module);
-    }
-    const framework = await AgentFramework.create({
-      storePath,
-      membrane: membrane.asMembrane(),
-      agents: [{
-        name: 'prime',
-        model: 'test-model',
-        systemPrompt: 'You are prime.',
-        allowedTools: 'all',
-      }],
-      modules,
-      syncIntervalMs: 0,
-      codeExecution: {
-        enabled: true,
-        wakeMinIntervalMs: 0,
-        ...(opts?.codeExecution ?? {}),
-      },
-    });
-    // Host wiring (fkm does this in production): mounts populate in initStore.
-    workspace?.initStore(framework.getStore());
-    return framework;
-  }
-
-  it('background script detaches, wakes the agent with provenance, and triggers inference', async () => {
-    const { tempDir, storePath } = tempStorePath('pytc-bgfw-');
-    const mountDir = join(tempDir, 'mount');
-    const { mkdirSync } = await import('node:fs');
-    mkdirSync(mountDir, { recursive: true });
-    const membrane = new MockMembrane();
-
-    const bgCode = [
-      'import asyncio',
-      'await asyncio.sleep(0.2)',
-      'r = await test__echo({"message": "bg"})',
-      'await wake_agent({"found": "signal", "is_error": r.is_error})',
-    ].join('\\n');
-
-    // Turn 1: spawn the background script, then finish the turn.
-    membrane.pushResponse(createMockResponse([
-      { type: 'text', text: 'Arming watcher.' },
-      { type: 'tool_use', id: 'call_bg1', name: 'code_execution', input: { code: bgCode.split('\\n').join('\n'), background: true } },
-    ], 'tool_use'));
-    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Watcher armed; resting.' }]));
-    // Turn 2 (the wake): agent answers.
-    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Woke and handled.' }]));
-
-    const framework = await createBgFramework(storePath, membrane, { mountDir });
-    try {
-      framework.start();
-      framework.pushEvent({
-        type: 'external-message',
-        source: 'test',
-        content: [{ type: 'text', text: 'arm a watcher' }],
-        metadata: {},
-        triggerInference: true,
-      } as unknown as ProcessEvent);
-
-      // Wait for: turn 1 result mentions script started, then wake message lands.
-      const deadline = Date.now() + 20_000;
-      let wakeMessage: { content: ContentBlockLike[] } | null = null;
-      while (Date.now() < deadline && !wakeMessage) {
-        await new Promise((r) => setTimeout(r, 100));
-        const cm = framework.getAgent('prime')?.getContextManager();
-        const msgs = (cm?.queryMessages({}).messages ?? []) as unknown as Array<{ content: ContentBlockLike[]; metadata?: { source?: string } }>;
-        wakeMessage = msgs.find((m) => m.metadata?.source === 'background-script') ?? null;
-      }
-      assert.ok(wakeMessage, 'wake message should be injected');
-      const text = (wakeMessage.content[0] as { text?: string }).text ?? '';
-      assert.match(text, /\[background script bg-\d+\] Woke you/);
-      assert.match(text, /line 4 of your script/);
-      assert.match(text, /"found": "signal"/);
-      // A background script's results carry the flag too (None if only the
-      // string were passed on).
-      assert.match(text, /"is_error": false/);
-      assert.match(text, /workspace file files\/background-scripts\/bg-\d+\.log/);
-      assert.match(text, /Script status: still running|Script status/);
-    } finally {
-      await framework.stop();
-      rmSync(tempDir, { recursive: true, force: true });
-    }
-  });
-
-  it('a background script gets codeExecution.env and not a host variable outside the allowlist', async () => {
-    const { tempDir, storePath } = tempStorePath('pytc-bgenv-');
-    const membrane = new MockMembrane();
-    const bgCode = `import os\nawait wake_agent({"declared": os.environ.get("${DECLARED}"), "host": os.environ.get("${HOST_ONLY}")})`;
-    membrane.pushResponse(createMockResponse([
-      { type: 'tool_use', id: 'call_bgenv', name: 'code_execution', input: { code: bgCode, background: true } },
-    ], 'tool_use'));
-    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Armed.' }]));
-    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Woke.' }]));
-    const framework = await createBgFramework(storePath, membrane, { codeExecution: { env: { [DECLARED]: 'from-config' } } });
-    try {
-      process.env[HOST_ONLY] = 'host-value';
-      framework.start();
-      framework.pushEvent({
-        type: 'external-message', source: 'test', content: [{ type: 'text', text: 'arm it' }], metadata: {}, triggerInference: true,
-      } as unknown as ProcessEvent);
-      const deadline = Date.now() + 20_000;
-      let wakeText = '';
-      while (Date.now() < deadline && !wakeText) {
-        await new Promise((r) => setTimeout(r, 100));
-        const msgs = (framework.getAgent('prime')?.getContextManager().queryMessages({}).messages ?? []) as unknown as Array<{ content: ContentBlockLike[]; metadata?: { source?: string } }>;
-        const wake = msgs.find((m) => m.metadata?.source === 'background-script');
-        wakeText = (wake?.content[0] as { text?: string } | undefined)?.text ?? '';
-      }
-      assert.match(wakeText, /"declared": "from-config"/, wakeText);
-      assert.match(wakeText, /"host": null/, wakeText);
-    } finally {
-      await framework.stop();
-      delete process.env[HOST_ONLY];
-      rmSync(tempDir, { recursive: true, force: true });
-    }
-  });
-
-  it("with codeExecution.inheritEnv: true, a background script gets the host's variables beside codeExecution.env", async () => {
-    const { tempDir, storePath } = tempStorePath('pytc-bgenvinherit-');
-    const membrane = new MockMembrane();
-    const bgCode = `import os\nawait wake_agent({"declared": os.environ.get("${DECLARED}"), "host": os.environ.get("${HOST_ONLY}")})`;
-    membrane.pushResponse(createMockResponse([
-      { type: 'tool_use', id: 'call_bgenv_inherit', name: 'code_execution', input: { code: bgCode, background: true } },
-    ], 'tool_use'));
-    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Armed.' }]));
-    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Woke.' }]));
-    const framework = await createBgFramework(storePath, membrane, { codeExecution: { env: { [DECLARED]: 'from-config' }, inheritEnv: true } });
-    try {
-      process.env[HOST_ONLY] = 'host-value';
-      framework.start();
-      framework.pushEvent({
-        type: 'external-message', source: 'test', content: [{ type: 'text', text: 'arm it' }], metadata: {}, triggerInference: true,
-      } as unknown as ProcessEvent);
-      const deadline = Date.now() + 20_000;
-      let wakeText = '';
-      while (Date.now() < deadline && !wakeText) {
-        await new Promise((r) => setTimeout(r, 100));
-        const msgs = (framework.getAgent('prime')?.getContextManager().queryMessages({}).messages ?? []) as unknown as Array<{ content: ContentBlockLike[]; metadata?: { source?: string } }>;
-        const wake = msgs.find((m) => m.metadata?.source === 'background-script');
-        wakeText = (wake?.content[0] as { text?: string } | undefined)?.text ?? '';
-      }
-      assert.match(wakeText, /"declared": "from-config"/, wakeText);
-      assert.match(wakeText, /"host": "host-value"/, wakeText);
-    } finally {
-      await framework.stop();
-      delete process.env[HOST_ONLY];
-      rmSync(tempDir, { recursive: true, force: true });
-    }
-  });
-
-  it('list and cancel manage the daemon fleet; cap enforced', async () => {
-    const { tempDir, storePath } = tempStorePath('pytc-bglist-');
-    const membrane = new MockMembrane();
-    const framework = await createBgFramework(storePath, membrane, {
-      codeExecution: { maxBackgroundScripts: 1 },
-    });
-    try {
-      const idle = 'import asyncio\nawait asyncio.sleep(60)';
-      const first = await framework.executeToolCall({
-        id: 'c1', name: 'code_execution', input: { code: idle, background: true }, callerAgentName: 'prime',
-      });
-      assert.strictEqual(first.success, true, JSON.stringify(first));
-      const firstId = (first.data as { script_id: string }).script_id;
-
-      const second = await framework.executeToolCall({
-        id: 'c2', name: 'code_execution', input: { code: idle, background: true }, callerAgentName: 'prime',
-      });
-      assert.strictEqual(second.isError, true);
-      assert.match(String(second.error), /limit reached/);
-
-      const list = await framework.executeToolCall({
-        id: 'c3', name: 'code_execution', input: { action: 'list' }, callerAgentName: 'prime',
-      });
-      const scripts = (list.data as { background_scripts: Array<{ script_id: string; status: string }> }).background_scripts;
-      assert.strictEqual(scripts.filter((s) => s.status === 'running').length, 1);
-
-      const cancel = await framework.executeToolCall({
-        id: 'c4', name: 'code_execution', input: { action: 'cancel', script_id: firstId }, callerAgentName: 'prime',
-      });
-      assert.strictEqual(cancel.success, true);
-      assert.strictEqual((cancel.data as { status: string }).status, 'cancelled');
-    } finally {
-      await framework.stop();
-      rmSync(tempDir, { recursive: true, force: true });
-    }
-  });
-
-  it('crashed background script wakes the agent with the error tail', async () => {
-    const { tempDir, storePath } = tempStorePath('pytc-bgcrash-');
-    const membrane = new MockMembrane();
-    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'noted' }]));
-    const framework = await createBgFramework(storePath, membrane, {});
-    try {
-      framework.start();
-      const started = await framework.executeToolCall({
-        id: 'c1',
-        name: 'code_execution',
-        input: { code: 'import asyncio\nawait asyncio.sleep(0.1)\nraise ValueError("watcher exploded")', background: true },
-        callerAgentName: 'prime',
-      });
-      assert.strictEqual(started.success, true, JSON.stringify(started));
-
-      const deadline = Date.now() + 20_000;
-      let crashMessage: { content: ContentBlockLike[] } | null = null;
-      while (Date.now() < deadline && !crashMessage) {
-        await new Promise((r) => setTimeout(r, 100));
-        const cm = framework.getAgent('prime')?.getContextManager();
-        const msgs = (cm?.queryMessages({}).messages ?? []) as unknown as Array<{ content: ContentBlockLike[]; metadata?: { source?: string } }>;
-        crashMessage = msgs.find((m) => m.metadata?.source === 'background-script') ?? null;
-      }
-      assert.ok(crashMessage, 'crash wake should be injected');
-      const text = (crashMessage.content[0] as { text?: string }).text ?? '';
-      assert.match(text, /DIED/);
-      assert.match(text, /ValueError: watcher exploded/);
-    } finally {
-      await framework.stop();
-      rmSync(tempDir, { recursive: true, force: true });
-    }
-  });
-
-  it('a background script stopped at its lifetime is told that is the longest one runs here', async () => {
-    const { tempDir, storePath } = tempStorePath('pytc-bglimit-');
-    const membrane = new MockMembrane();
-    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'noted' }]));
-    const framework = await createBgFramework(storePath, membrane, { codeExecution: { backgroundMaxLifetimeMs: 1000 } });
-    try {
-      framework.start();
-      const started = await framework.executeToolCall({
-        id: 'l1',
-        name: 'code_execution',
-        input: { code: 'import asyncio\nawait asyncio.sleep(60)', background: true },
-        callerAgentName: 'prime',
-      });
-      assert.strictEqual(started.success, true, JSON.stringify(started));
-      const deadline = Date.now() + 20_000;
-      let stopMessage: { content: ContentBlockLike[] } | null = null;
-      while (Date.now() < deadline && !stopMessage) {
-        await new Promise((r) => setTimeout(r, 100));
-        const cm = framework.getAgent('prime')?.getContextManager();
-        const msgs = (cm?.queryMessages({}).messages ?? []) as unknown as Array<{ content: ContentBlockLike[]; metadata?: { source?: string } }>;
-        stopMessage = msgs.find((m) => m.metadata?.source === 'background-script') ?? null;
-      }
-      assert.ok(stopMessage, 'the stop should wake the agent');
-      const text = (stopMessage.content[0] as { text?: string }).text ?? '';
-      assert.match(text, /script stopped: it reached its 1s time limit\./);
-      assert.match(text, /1s is the longest a background script runs here; starting it again runs it from the top\./, 'the background ceiling reaches the message');
-    } finally {
-      await framework.stop();
-      rmSync(tempDir, { recursive: true, force: true });
-    }
-  });
-
-  it('a dead script\'s last output is cut at 2000 units without halving a surrogate pair', async () => {
-    // 1500 emoji, then the traceback. Whichever parity the cut 2000 units
-    // from the end has, one of the two runs (with or without one more unit
-    // after the emoji) puts it on a pair's second half.
-    for (const after of ['', 'x']) {
-      const { tempDir, storePath } = tempStorePath('pytc-bgpair-');
-      const membrane = new MockMembrane();
-      membrane.pushResponse(createMockResponse([{ type: 'text', text: 'noted' }]));
-      const framework = await createBgFramework(storePath, membrane, {});
-      try {
-        framework.start();
-        const started = await framework.executeToolCall({
-          id: 'c1',
-          name: 'code_execution',
-          input: {
-            code: `import asyncio\nprint("\\U0001F600" * 1500 + "${after}", flush=True)\nawait asyncio.sleep(0.1)\nraise ValueError("done")`,
-            background: true,
-          },
-          callerAgentName: 'prime',
-        });
-        assert.strictEqual(started.success, true, JSON.stringify(started));
-
-        const deadline = Date.now() + 20_000;
-        let crashMessage: { content: ContentBlockLike[] } | null = null;
-        while (Date.now() < deadline && !crashMessage) {
-          await new Promise((r) => setTimeout(r, 100));
-          const cm = framework.getAgent('prime')?.getContextManager();
-          const msgs = (cm?.queryMessages({}).messages ?? []) as unknown as Array<{ content: ContentBlockLike[]; metadata?: { source?: string } }>;
-          crashMessage = msgs.find((m) => m.metadata?.source === 'background-script') ?? null;
-        }
-        assert.ok(crashMessage, 'crash wake should be injected');
-        const text = (crashMessage.content[0] as { text?: string }).text ?? '';
-        // A halved pair would be stored as U+FFFD, or kept as a lone surrogate.
-        const last = text.split('Last output:\n')[1] ?? '';
-        assert.ok(last.startsWith('\u{1F600}'),
-          `the last output starts on a whole emoji (after ${JSON.stringify(after)}): ${JSON.stringify(last.slice(0, 4))}`);
-        assert.ok(!text.includes('\ufffd') && !/[\ud800-\udbff](?![\udc00-\udfff])|(?<![\ud800-\udbff])[\udc00-\udfff]/.test(text),
-          `no half of a pair (after ${JSON.stringify(after)})`);
-      } finally {
-        await framework.stop();
-        rmSync(tempDir, { recursive: true, force: true });
-      }
-    }
-  });
-
-  it('oversized tool results spill to a workspace file with a reference', async () => {
-    const { tempDir, storePath } = tempStorePath('pytc-spill-');
-    const mountDir = join(tempDir, 'mount');
-    const { mkdirSync } = await import('node:fs');
-    mkdirSync(mountDir, { recursive: true });
-    const membrane = new MockMembrane();
-
-    // big module: returns ~600KB (strategy default maxMessageTokens absent →
-    // maxChars undefined → no spill). Force the cap via agent_settings-style
-    // override path by configuring a small maxMessageTokens on the agent.
-    class BigToolModule implements Module {
-      readonly name = 'big';
-      async start(): Promise<void> {}
-      async stop(): Promise<void> {}
-      getTools(): ToolDefinition[] {
-        return [{ name: 'blob', description: 'Returns JSON: huge string.', inputSchema: { type: 'object', properties: {} } }];
-      }
-      async handleToolCall(): Promise<ToolResult> {
-        return { success: true, data: { blob: 'x'.repeat(600_000) } };
-      }
-      async onProcess(event: ProcessEvent): Promise<EventResponse> {
-        if (event.type === 'external-message') {
-          return {
-            addMessages: [{ participant: 'User', content: (event as { content: unknown }).content as never }],
-            requestInference: true,
-          };
-        }
-        return {};
-      }
-    }
-
-    membrane.pushResponse(createMockResponse([
-      { type: 'text', text: 'Fetching blob.' },
-      { type: 'tool_use', id: 'call_blob', name: 'big--blob', input: {} },
-    ], 'tool_use'));
-    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Handled.' }]));
-
-    const { WorkspaceModule } = await import('../src/modules/workspace/index.js');
-    const spillWorkspace = new WorkspaceModule({
-      mounts: [{ name: 'files', path: mountDir, mode: 'read-write', watch: 'never' }],
-    });
-    const framework = await AgentFramework.create({
-      storePath,
-      membrane: membrane.asMembrane(),
-      agents: [{
-        name: 'prime',
-        model: 'test-model',
-        systemPrompt: 'You are prime.',
-        allowedTools: 'all',
-        strategy: new CappedPassthroughStrategy() as never,
-      }],
-      modules: [
-        new BigToolModule(),
-        spillWorkspace as unknown as Module,
-      ],
-      syncIntervalMs: 0,
-      codeExecution: { enabled: true },
-    });
-    spillWorkspace.initStore(framework.getStore());
-    try {
-      framework.start();
-      framework.pushEvent({
-        type: 'external-message',
-        source: 'test',
-        content: [{ type: 'text', text: 'get the blob' }],
-        metadata: {},
-        triggerInference: true,
-      } as unknown as ProcessEvent);
-
-      const deadline = Date.now() + 20_000;
-      let toolResultText: string | null = null;
-      while (Date.now() < deadline && !toolResultText) {
-        await new Promise((r) => setTimeout(r, 100));
-        const cm = framework.getAgent('prime')?.getContextManager();
-        const msgs = (cm?.queryMessages({}).messages ?? []) as unknown as Array<{ content: Array<{ type: string; content?: string }> }>;
-        for (const m of msgs) {
-          for (const b of m.content ?? []) {
-            if (b.type === 'tool_result' && typeof b.content === 'string' && b.content.includes('[truncated')) {
-              toolResultText = b.content;
-            }
-          }
-        }
-      }
-      assert.ok(toolResultText, 'spilled tool result should be stored');
-      assert.match(toolResultText, /full content: workspace file files\/tool-results\//);
-      assert.match(toolResultText, /tool_result_inline_max_chars/);
-      assert.ok(toolResultText.length < 20_000, 'inline copy must be capped');
-      // The full content lives in the chronicle tree — the same place the
-      // agent's own read tool looks (disk materialization is async and
-      // watch-mode-dependent; not what we're testing here).
-      const refMatch = toolResultText.match(/workspace file (files\/tool-results\/\S+\.txt)/);
-      assert.ok(refMatch, 'reference should name the spill file');
-      const spilledFile = await spillWorkspace.readBinary(refMatch[1]);
-      assert.ok('data' in spilledFile, `spill file should be readable: ${JSON.stringify(spilledFile)}`);
-      assert.ok((spilledFile as { data: Buffer }).data.byteLength >= 600_000, 'full content in file');
-    } finally {
-      await framework.stop();
-      rmSync(tempDir, { recursive: true, force: true });
-    }
-  });
-});
-
-type ContentBlockLike = { type: string; text?: string };
-
-import { PassthroughStrategy } from '../src/index.js';
-class CappedPassthroughStrategy extends PassthroughStrategy {
-  readonly maxMessageTokens = 1000;
-}
-
-describe('code_execution per-call time limit (time_limit_ms)', () => {
-  it('PyRunner: a per-exec deadline replaces scriptTimeoutMs, and the result says the time ran out', async () => {
-    const runner = new PyRunner({ scriptTimeoutMs: 600_000, onToolCall: async () => '' });
-    try {
-      const started = Date.now();
-      const result = await runner.exec('import asyncio\nawait asyncio.sleep(60)', [], undefined, { deadlineMs: 1000 });
-      assert.strictEqual(result.returnCode, 1);
-      assert.match(result.stderr, /script stopped: it reached its 1s time limit/);
-      assert.ok(Date.now() - started < 15_000, 'the per-exec deadline was not applied');
-    } finally {
-      runner.dispose();
-    }
-  });
-
-  // On a deployment without maxScriptTimeoutMs the ceiling is the default, and a
-  // larger time_limit_ms would only buy a second run that stops the same way.
-  it('PyRunner: a script stopped at its limit is offered a longer one only below the ceiling', async () => {
-    const code = 'import asyncio\nawait asyncio.sleep(60)';
-    const effects = 'Tool calls it had already made keep their effects, so check them before running it again.';
-    const runner = new PyRunner({ onToolCall: async () => '' });
-    const background = new PyRunner({ onToolCall: async () => '', idleReclaimMs: 0 });
-    const backgroundBelow = new PyRunner({ onToolCall: async () => '', idleReclaimMs: 0 });
-    try {
-      const below = await runner.exec(code, [], undefined, { deadlineMs: 1000, ceilingMs: 5000 });
-      assert.ok(below.stderr.endsWith(`script stopped: it reached its 1s time limit. ${effects} To give it longer, pass time_limit_ms up to 5000 (5s).\n`), below.stderr);
-      const at = await runner.exec(code, [], undefined, { deadlineMs: 1000, ceilingMs: 1000 });
-      assert.ok(at.stderr.endsWith(`${effects} 1s is the longest a script can run here, so split the work across shorter scripts.\n`), at.stderr);
-      const longerInBackground = await runner.exec(code, [], undefined, { deadlineMs: 1000, ceilingMs: 1000, backgroundCeilingMs: 86_400_000 });
-      assert.ok(longerInBackground.stderr.endsWith(`${effects} 1s is the longest a script can run here, so split the work across shorter scripts, `
-        + 'or run it with background: true, where a script can run up to 24 h.\n'), longerInBackground.stderr);
-      const noLongerInBackground = await runner.exec(code, [], undefined, { deadlineMs: 1000, ceilingMs: 1000, backgroundCeilingMs: 1000 });
-      assert.ok(noLongerInBackground.stderr.endsWith('so split the work across shorter scripts.\n'), noLongerInBackground.stderr);
-      const unknown = await runner.exec(code, [], undefined, { deadlineMs: 1000 });
-      assert.ok(unknown.stderr.endsWith(`script stopped: it reached its 1s time limit. ${effects}\n`), unknown.stderr);
-      const watcher = await background.exec(code, [], { logPath: null, lifetimeMs: 1000, onWake: async () => null }, { ceilingMs: 1000 });
-      assert.ok(watcher.stderr.endsWith(`${effects} 1s is the longest a background script runs here; starting it again runs it from the top.\n`), watcher.stderr);
-      const shortWatcher = await backgroundBelow.exec(code, [], { logPath: null, lifetimeMs: 1000, onWake: async () => null }, { ceilingMs: 5000 });
-      assert.ok(shortWatcher.stderr.endsWith(`${effects} To give it longer, start it with time_limit_ms up to 5000 (5s).\n`), shortWatcher.stderr);
-    } finally {
-      runner.dispose();
-      background.dispose();
-      backgroundBelow.dispose();
-    }
-  });
-
-  it('PyRunner: a script that catches the cancellation and finishes is not reported as stopped', async () => {
-    const runner = new PyRunner({ onToolCall: async () => '' });
-    try {
-      const code = 'import asyncio\ntry:\n    await asyncio.sleep(60)\nexcept asyncio.CancelledError:\n    print("cleaned up")';
-      const result = await runner.exec(code, [], undefined, { deadlineMs: 1000 });
-      assert.strictEqual(result.returnCode, 0, result.stderr);
-      assert.match(result.stdout, /cleaned up/);
-      assert.doesNotMatch(result.stderr, /script stopped/);
-    } finally {
-      runner.dispose();
-    }
-  });
-
-  it('PyRunner: a deadline beyond Node timers (~24.8 days) is clamped, not fired at once', async () => {
-    const runner = new PyRunner({ onToolCall: async () => '' });
-    try {
-      const result = await runner.exec('import asyncio\nawait asyncio.sleep(0.3)\nprint("done")', [], undefined, { deadlineMs: 30 * 86_400_000 });
-      assert.strictEqual(result.returnCode, 0, result.stderr);
-      assert.match(result.stdout, /done/);
-    } finally {
-      runner.dispose();
-    }
-  });
-
-  it('a ceiling below the default is refused when the framework is created', async () => {
-    const { tempDir, storePath } = tempStorePath('pytc-badcfg-');
-    try {
-      await assert.rejects(
-        AgentFramework.create({
-          storePath,
-          membrane: new MockMembrane().asMembrane(),
-          agents: [],
-          modules: [],
-          syncIntervalMs: 0,
-          codeExecution: { enabled: true, scriptTimeoutMs: 600_000, maxScriptTimeoutMs: 60_000 },
-        }),
-        /maxScriptTimeoutMs \(60000\) must be at least scriptTimeoutMs \(600000\)/,
-      );
-    } finally {
-      rmSync(tempDir, { recursive: true, force: true });
-    }
-  });
-
-  const createWith = (storePath: string, codeExecution: unknown) =>
-    AgentFramework.create({
-      storePath,
-      membrane: new MockMembrane().asMembrane(),
-      agents: [],
-      modules: [],
-      syncIntervalMs: 0,
-      codeExecution: codeExecution as never,
-    });
-
-  /** create() refuses each config with exactly its message, before anything
-   *  opens: no store is left at storePath. */
-  async function assertRefused(cases: ReadonlyArray<readonly [unknown, string]>): Promise<void> {
-    const { tempDir, storePath } = tempStorePath('pytc-refused-');
-    try {
-      for (const [codeExecution, message] of cases) {
-        await assert.rejects(createWith(storePath, codeExecution), (error: Error) => {
-          assert.equal(error.message, message);
-          return true;
-        });
-        assert.equal(existsSync(storePath), false, 'the refused config opened no store');
-      }
-    } finally {
-      rmSync(tempDir, { recursive: true, force: true });
-    }
-  }
-
-  it('create() refuses a codeExecution.enabled that is not true or false, a quoted "false" included', async () => {
-    // A quoted "false" is truthy, so it turned code execution on, and 0 is
-    // falsy, so it was read as off without a word. Each message names the
-    // value's kind, never the value, since a substituted value can be a
-    // credential.
-    const whatTrueDoes = 'true gives agents the code_execution tool, which runs their scripts in a python interpreter on the host, '
-      + 'and false or leaving it out doesn\'t';
-    await assertRefused([
-      [{ enabled: 'false' }, `codeExecution.enabled must be true or false, unquoted, not a string: ${whatTrueDoes}`],
-      [{ enabled: 'sk-secret-token' }, `codeExecution.enabled must be true or false, unquoted, not a string: ${whatTrueDoes}`],
-      [{ enabled: 0 }, `codeExecution.enabled must be true or false, not a number: ${whatTrueDoes}`],
-      [{ enabled: { on: true } }, `codeExecution.enabled must be true or false, not an object: ${whatTrueDoes}`],
-    ]);
-  });
-
-  it('create() refuses a codeExecution that is not an object, null or false, since it would read as off', async () => {
-    await assertRefused([
-      [true, 'codeExecution must be an object, such as { enabled: true }, not a boolean'],
-      ['true', 'codeExecution must be an object, such as { enabled: true }, not a string'],
-      [[], 'codeExecution must be an object, such as { enabled: true }, not an array'],
-    ]);
-  });
-
-  it('a null or false codeExecution, or a null or left-out codeExecution.enabled, counts as off, and a configuration that is off has nothing else checked', async () => {
-    // Contradictory limits, and an env or inheritEnv that would be refused,
-    // are checked only once code execution is on.
-    const contradictory = { scriptTimeoutMs: 600_000, maxScriptTimeoutMs: 60_000 };
-    for (const codeExecution of [
-      null,
-      false,
-      { enabled: null, ...contradictory },
-      { enabled: false, ...contradictory },
-      { ...contradictory },
-      { enabled: false, inheritEnv: 'true', env: 7 },
-    ]) {
-      const { tempDir, storePath } = tempStorePath('pytc-enabled-off-');
-      let framework: AgentFramework | undefined;
-      try {
-        framework = await createWith(storePath, codeExecution);
-        assert.equal(framework.getAllTools().some((tool) => tool.name === 'code_execution'), false);
-      } finally {
-        await framework?.stop();
-        rmSync(tempDir, { recursive: true, force: true });
-      }
-    }
-  });
-
-  async function withFramework(
-    codeExecution: Record<string, unknown>,
-    body: (framework: AgentFramework) => Promise<void>,
-    agents: Parameters<typeof AgentFramework.create>[0]['agents'] = [],
-  ): Promise<void> {
-    const { tempDir, storePath } = tempStorePath('pytc-timeout-');
-    const framework = await AgentFramework.create({
-      storePath,
-      membrane: new MockMembrane().asMembrane(),
-      agents,
-      modules: [new ScriptToolModule()],
-      syncIntervalMs: 0,
-      codeExecution: { enabled: true, ...codeExecution },
-    });
-    try {
-      await body(framework);
-    } finally {
-      await framework.stop();
-      rmSync(tempDir, { recursive: true, force: true });
-    }
-  }
-
-  const run = (framework: AgentFramework, input: Record<string, unknown>) =>
-    framework.executeToolCall({ id: `ce-${Math.random()}`, name: 'code_execution', input });
-  const dataOf = (r: ToolResult) => r.data as { stdout: string; stderr: string; return_code: number; time_limit_note?: string };
-
-  it('the tool tells the agent its time limit and offers time_limit_ms', async () => {
-    await withFramework({ scriptTimeoutMs: 300_000, maxScriptTimeoutMs: 1_800_000 }, async (framework) => {
-      const tool = framework.getAllTools().find((t) => t.name === 'code_execution')!;
-      assert.match(tool.description, /A foreground script is stopped after 5 min; pass time_limit_ms to set this call's limit \(at most 30 min; a background script runs up to 24 h\)/);
-      const props = (tool.inputSchema as { properties: Record<string, { description: string }> }).properties;
-      assert.match(props.time_limit_ms.description, /Default 300000, at most 1800000/);
-    });
-  });
-
-  it('time_limit_ms shortens one call; the deployment default is unchanged for the next', async () => {
-    await withFramework({ scriptTimeoutMs: 600_000 }, async (framework) => {
-      const short = dataOf(await run(framework, { code: 'import asyncio\nawait asyncio.sleep(60)', time_limit_ms: 1000 }));
-      assert.strictEqual(short.return_code, 1);
-      assert.match(short.stderr, /reached its 1s time limit/);
-      assert.match(short.stderr, /To give it longer, pass time_limit_ms up to 600000 \(10 min\)\.\n$/, 'the deployment ceiling reaches the message');
-      const normal = dataOf(await run(framework, { code: 'import asyncio\nawait asyncio.sleep(1.5)\nprint("done")' }));
-      assert.strictEqual(normal.return_code, 0);
-      assert.match(normal.stdout, /done/);
-    });
-  });
-
-  it('a request above the ceiling is capped, and the result says so', async () => {
-    await withFramework({ scriptTimeoutMs: 1000 }, async (framework) => {
-      const started = Date.now();
-      const r = dataOf(await run(framework, { code: 'import asyncio\nawait asyncio.sleep(60)', time_limit_ms: 60_000 }));
-      assert.strictEqual(r.return_code, 1);
-      assert.strictEqual(r.time_limit_note, "time_limit_ms 60000 was capped at 1000, this deployment's maximum");
-      assert.match(r.stderr, /1s is the longest a script can run here, so split the work across shorter scripts, or run it with background: true, where a script can run up to 24 h\.\n$/,
-        "no larger limit is offered at the ceiling, and the deployment's background lifetime reaches the message");
-      assert.ok(Date.now() - started < 15_000, 'the cap was not applied');
-    });
-  });
-
-  it('at the ceiling, background mode is offered only to an agent that could start a background script', async () => {
-    const atCeiling = (framework: AgentFramework, callerAgentName?: string) => framework.executeToolCall({
-      id: `ce-${Math.random()}`, name: 'code_execution', input: { code: 'import asyncio\nawait asyncio.sleep(60)' }, ...(callerAgentName ? { callerAgentName } : {}),
-    });
-    const noOffer = /1s is the longest a script can run here, so split the work across shorter scripts\.\n$/;
-    // Background scripts are the primary agent's.
-    await withFramework({ scriptTimeoutMs: 1000 }, async (framework) => {
-      assert.match(dataOf(await atCeiling(framework, 'prime')).stderr, /, or run it with background: true, where a script can run up to 24 h\.\n$/);
-      assert.match(dataOf(await atCeiling(framework, 'other')).stderr, noOffer);
-    }, [{ name: 'prime', model: 'test-model', systemPrompt: 'You are prime.', allowedTools: 'all' }]);
-    // A deployment that allows none offers none.
-    await withFramework({ scriptTimeoutMs: 1000, maxBackgroundScripts: 0 }, async (framework) => {
-      assert.match(dataOf(await atCeiling(framework)).stderr, noOffer);
-    });
-    // Nor does an agent whose background slots are all taken.
-    await withFramework({ scriptTimeoutMs: 1000, maxBackgroundScripts: 1 }, async (framework) => {
-      const started = await framework.executeToolCall({
-        id: 'bg-1', name: 'code_execution', input: { code: 'import asyncio\nawait asyncio.sleep(60)', background: true }, callerAgentName: 'prime',
-      });
-      assert.strictEqual(started.success, true, JSON.stringify(started));
-      assert.match(dataOf(await atCeiling(framework, 'prime')).stderr, noOffer);
-    }, [{ name: 'prime', model: 'test-model', systemPrompt: 'You are prime.', allowedTools: 'all' }]);
-  });
-
-  it('maxScriptTimeoutMs lets an agent ask for longer than the default', async () => {
-    await withFramework({ scriptTimeoutMs: 1000, maxScriptTimeoutMs: 10_000 }, async (framework) => {
-      const code = 'import asyncio\nawait asyncio.sleep(2)\nprint("long done")';
-      const defaulted = dataOf(await run(framework, { code }));
-      assert.strictEqual(defaulted.return_code, 1, 'without time_limit_ms the 1s default applies');
-      const longer = dataOf(await run(framework, { code, time_limit_ms: 5000 }));
-      assert.strictEqual(longer.return_code, 0);
-      assert.match(longer.stdout, /long done/);
-      assert.strictEqual(longer.time_limit_note, undefined);
-    });
-  });
-
-  it('an invalid time_limit_ms is refused before anything runs', async () => {
-    await withFramework({}, async (framework) => {
-      for (const time_limit_ms of ['soon', 10, -5, Number.NaN]) {
-        const r = await run(framework, { code: 'print("ran")', time_limit_ms });
-        assert.strictEqual(r.success, false, String(time_limit_ms));
-        assert.match(String(r.error), /time_limit_ms/);
-      }
-    });
-  });
-
-  it('a background script: time_limit_ms shortens its lifetime, capped at the lifetime ceiling', async () => {
-    await withFramework({ backgroundMaxLifetimeMs: 1500 }, async (framework) => {
-      const r = await run(framework, { code: 'import asyncio\nawait asyncio.sleep(60)', background: true, time_limit_ms: 60_000 });
-      assert.strictEqual(r.success, true);
-      const data = r.data as { script_id: string; time_limit_note?: string; lifetime: string };
-      assert.strictEqual(data.time_limit_note, "time_limit_ms 60000 was capped at 1500, this deployment's maximum");
-      assert.strictEqual(data.lifetime, '2s', 'a short lifetime is reported exactly, not rounded to 0 hours');
-      let status = 'running';
-      const until = Date.now() + 15_000;
-      while (status === 'running' && Date.now() < until) {
-        await new Promise((res) => setTimeout(res, 200));
-        const listed = (await run(framework, { action: 'list' })).data as { background_scripts: Array<{ script_id: string; status: string }> };
-        status = listed.background_scripts.find((s) => s.script_id === data.script_id)?.status ?? 'gone';
-      }
-      assert.strictEqual(status, 'died', 'the script was stopped at its capped lifetime');
-    });
-  });
-});
-
-// The deadline's cancel op is an asyncio cancellation, which lands only when a
-// script awaits; the SIGINT that follows it stops blocking code (#235 F3).
-describe('code_execution time limit vs blocking code (real python3)', { skip: process.platform === 'win32' }, () => {
-  const pidOf = (stdout: string) => /pid=(\d+)/.exec(stdout)?.[1];
-
-  it('blocking code stops at the time limit, keeping its output, and the interpreter survives', async () => {
-    const runner = new PyRunner({ onToolCall: async () => '' });
-    try {
-      const first = await runner.exec('import os\nprint(f"pid={os.getpid()}")', []);
-      const pid = pidOf(first.stdout);
-      assert.ok(pid, first.stdout);
-      const blocking: Record<string, string> = {
-        sleep: 'import time\nprint("before")\ntime.sleep(60)\nprint("after")',
-        'busy loop': 'print("before")\nn = 0\nwhile True:\n    n += 1\nprint("after")',
-        'blocking read': 'import socket\nprint("before")\na, b = socket.socketpair()\na.recv(1)\nprint("after")',
-      };
-      for (const [shape, code] of Object.entries(blocking)) {
-        const started = Date.now();
-        const result = await runner.exec(code, [], undefined, { deadlineMs: 1000 });
-        const elapsed = Date.now() - started;
-        assert.strictEqual(result.returnCode, 1, shape);
-        assert.strictEqual(result.aborted, undefined, `${shape}: interrupted, not killed`);
-        assert.strictEqual(result.stdout, 'before\n', `${shape}: output before the limit is kept`);
-        assert.match(result.stderr, /KeyboardInterrupt: script interrupted by host/, shape);
-        assert.match(result.stderr, /script stopped: it reached its 1s time limit/, shape);
-        assert.match(result.stderr, /File "<script>", line \d+/, `${shape}: says where the script was`);
-        assert.doesNotMatch(result.stderr, /runtime\.py/, `${shape}: no runtime frames`);
-        assert.ok(elapsed < 5000, `${shape}: stopped at the limit, not the kill grace (${elapsed}ms)`);
-      }
-      const last = await runner.exec('import os\nprint(f"pid={os.getpid()}")', []);
-      assert.strictEqual(pidOf(last.stdout), pid, 'same interpreter: nothing was killed');
-    } finally {
-      runner.dispose();
-    }
-  });
-
-  it('variables survive an interrupted script', async () => {
-    const runner = new PyRunner({ onToolCall: async () => '' });
-    try {
-      const set = await runner.exec('x = 41', []);
-      assert.strictEqual(set.returnCode, 0, set.stderr);
-      const stopped = await runner.exec('import time\ny = 1\ntime.sleep(60)', [], undefined, { deadlineMs: 1000 });
-      assert.match(stopped.stderr, /reached its 1s time limit/);
-      const after = await runner.exec('print(x + y)', []);
-      assert.strictEqual(after.returnCode, 0, after.stderr);
-      assert.strictEqual(after.stdout, '42\n');
-    } finally {
-      runner.dispose();
-    }
-  });
-
-  it('a script waiting on an await is still stopped by the cancel', async () => {
-    const runner = new PyRunner({
-      onToolCall: () => new Promise((resolve) => setTimeout(() => resolve('late'), 5000)),
-    });
-    try {
-      const started = Date.now();
-      const result = await runner.exec('print("before")\nawait test__echo({})\nprint("after")', ECHO_TOOLS, undefined, { deadlineMs: 1000 });
-      assert.strictEqual(result.returnCode, 1);
-      assert.strictEqual(result.stdout, 'before\n');
-      assert.match(result.stderr, /KeyboardInterrupt: script cancelled by host/);
-      assert.doesNotMatch(result.stderr, /interrupted by host/);
-      assert.match(result.stderr, /script stopped: it reached its 1s time limit/);
-      assert.ok(Date.now() - started < 5000, 'stopped at the limit');
-    } finally {
-      runner.dispose();
-    }
-  });
-
-  it('SIGINT between scripts does nothing', async () => {
-    const runner = new PyRunner({ onToolCall: async () => '' });
-    try {
-      const first = await runner.exec('import os\nx = 1\nprint(f"pid={os.getpid()}")', []);
-      const pid = Number(pidOf(first.stdout));
-      assert.ok(pid > 0, first.stdout);
-      process.kill(pid, 'SIGINT');
-      await new Promise((r) => setTimeout(r, 200));
-      const result = await runner.exec('print(x)\nprint(f"pid={os.getpid()}")', []);
-      assert.strictEqual(result.returnCode, 0, result.stderr);
-      assert.strictEqual(result.stdout, `1\npid=${pid}\n`);
-    } finally {
-      runner.dispose();
-    }
-  });
-
-  it('SIGINT while a script waits cancels it before it can resume into blocking code', async () => {
-    let pid = 0;
-    const runner = new PyRunner({
-      onToolCall: async () => {
-        // The script is suspended on this call. The signal arrives with no cancel op behind it;
-        // the result does, and the script would then block.
-        process.kill(pid, 'SIGINT');
-        await new Promise((r) => setTimeout(r, 200));
-        return 'tool ok';
-      },
-    });
-    try {
-      const first = await runner.exec('import os\nprint(f"pid={os.getpid()}")', []);
-      pid = Number(pidOf(first.stdout));
-      assert.ok(pid > 0, first.stdout);
-      const started = Date.now();
-      const result = await runner.exec('import time\nprint(await test__echo({}))\ntime.sleep(30)', ECHO_TOOLS);
-      assert.strictEqual(result.returnCode, 1);
-      assert.strictEqual(result.stdout, '');
-      // Cancelled at its await (or, if the signal beat the script to it, interrupted there).
-      assert.match(result.stderr, /KeyboardInterrupt: script (cancelled|interrupted) by host/);
-      assert.ok(Date.now() - started < 5000, 'stopped at once, not after the blocking call');
-      const after = await runner.exec('print(f"pid={os.getpid()}")', []);
-      assert.strictEqual(after.stdout, `pid=${pid}\n`, 'same interpreter');
-    } finally {
-      runner.dispose();
-    }
-  });
-
-  it('a script that resumes from an await into blocking code at its limit is stopped', async () => {
-    const runner = new PyRunner({ onToolCall: async () => '' });
-    try {
-      for (let i = 0; i < 3; i++) {
-        const started = Date.now();
-        const result = await runner.exec('import asyncio, time\nawait asyncio.sleep(1)\ntime.sleep(5)\nprint("after")', [], undefined, { deadlineMs: 1000 });
-        assert.strictEqual(result.returnCode, 1, result.stderr);
-        assert.strictEqual(result.stdout, '');
-        assert.match(result.stderr, /script stopped: it reached its 1s time limit/);
-        assert.ok(Date.now() - started < 3000, `stopped at the limit (${Date.now() - started}ms)`);
-      }
-    } finally {
-      runner.dispose();
-    }
-  });
-
-  it("the runtime's stop table: each place a signal or cancel op can land stops the script once", () => {
-    const dir = mkdtempSync(join(tmpdir(), 'pytc-stop-rows-'));
-    try {
-      writeFileSync(join(dir, 'runtime.py'), PYTHON_RUNTIME_SOURCE);
-      writeFileSync(join(dir, 'driver.py'), PYTC_STOP_ROWS_DRIVER);
-      type Row = { rc: number | null; tail: string; secs: number; ops: string[] };
-      const rows = JSON.parse(
-        execFileSync('python3', [join(dir, 'driver.py'), join(dir, 'runtime.py')], { encoding: 'utf8', timeout: 60_000 }),
-      ) as Record<string, Row>;
-      const printed = (row: Row, line: string) => row.tail.split('\n').includes(line);
-      const interrupted = /KeyboardInterrupt: script interrupted by host/;
-      const cancelled = /KeyboardInterrupt: script cancelled by host/;
-      const stopped = (name: string, how: RegExp, has: string[] = [], hasNot: string[] = []) => {
-        const row = rows[name];
-        assert.ok(row, name);
-        assert.strictEqual(row.rc, 1, `${name}: ${row.tail}`);
-        assert.match(row.tail, how, name);
-        for (const w of has) assert.ok(printed(row, w), `${name}: printed ${w}`);
-        for (const w of hasNot) assert.ok(!printed(row, w), `${name}: did not print ${w}`);
-        assert.ok(row.secs < 2, `${name}: stopped at once (${row.secs}s)`);
-      };
-      const finished = (name: string, has: string[]) => {
-        const row = rows[name];
-        assert.ok(row, name);
-        assert.strictEqual(row.rc, 0, `${name}: ${row.tail}`);
-        for (const w of has) assert.ok(printed(row, w), `${name}: printed ${w}`);
-        assert.doesNotMatch(row.tail, /by host/, `${name}: never stopped (again) by us`);
-      };
-
-      stopped('1 own code', interrupted, ['a'], ['b']);
-      stopped('2 waiting on an await', cancelled, [], ['b']);
-      // Cancelling inside the handler here raised InvalidStateError out of main().
-      stopped('3 mid-dispatch, reply behind', cancelled, [], ['woke']);
-      stopped('4 protocol write', cancelled, [], ['b']);
-      assert.ok(rows['4 protocol write'].ops.includes('tool_call'), 'the protocol line stayed whole');
-      stopped('5 reply ahead, then await', cancelled, ['woke'], ['b']);
-      // Interrupted in its blocking code; the queued cancellation must not cut its cleanup short.
-      finished('6 reply ahead, then block', ['woke', 'cleaned']);
-      finished('7 reply ahead, then finish', ['woke']);
-      finished('7 next script', ['ok']);
-      stopped('8 before start, signal', cancelled, [], ['ran']);
-      // The cancel op before the script started used to leave it reporting nothing.
-      stopped('8 before start, cancel op', cancelled, [], ['ran']);
-      finished('9 cancel op first', ['cleaned']);
-      finished('10 after delivery', ['cleaned']);
-      finished('11 reporting', ['done']);
-      finished('12 between scripts', ['ok']);
-      if (rows['13 next script blocks']) {
-        // Python 3.12+: an eager task factory left installed by an earlier script.
-        finished('13 eager task factory installed', ['installed']);
-        stopped('13 next script blocks', interrupted, ['a'], ['b']);
-      }
-    } finally {
-      rmSync(dir, { recursive: true, force: true });
-    }
-  });
-
-  it('an eager task factory installed by an earlier script does not hide the next one from the deadline', async (t) => {
-    const runner = new PyRunner({ onToolCall: async () => '', cancelGraceMs: 3000 });
-    try {
-      const install = await runner.exec(
-        'import asyncio, sys\nif sys.version_info >= (3, 12):\n    asyncio.get_running_loop().set_task_factory(asyncio.eager_task_factory)\n    print("installed")',
-        [],
-      );
-      assert.strictEqual(install.returnCode, 0, install.stderr);
-      if (install.stdout !== 'installed\n') {
-        t.skip('asyncio.eager_task_factory needs Python 3.12+');
-        return;
-      }
-      const started = Date.now();
-      const result = await runner.exec('import time\nprint("before")\ntime.sleep(30)', [], undefined, { deadlineMs: 1000 });
-      assert.strictEqual(result.aborted, undefined, 'interrupted, not killed');
-      assert.strictEqual(result.stdout, 'before\n');
-      assert.match(result.stderr, /KeyboardInterrupt: script interrupted by host/);
-      assert.match(result.stderr, /script stopped: it reached its 1s time limit/);
-      assert.ok(Date.now() - started < 2500, `stopped at the limit (${Date.now() - started}ms)`);
-    } finally {
-      runner.dispose();
-    }
-  });
-
-  it('a script that ignores the interrupt is killed after the grace, and its interpreter state is gone', async () => {
-    const runner = new PyRunner({ onToolCall: async () => '', cancelGraceMs: 500 });
-    try {
-      assert.strictEqual((await runner.exec('x = 41', [])).returnCode, 0);
-      const code = 'import time\ntry:\n    time.sleep(60)\nexcept KeyboardInterrupt:\n    time.sleep(60)';
-      const started = Date.now();
-      const killed = await runner.exec(code, [], undefined, { deadlineMs: 1000, ceilingMs: 2000 });
-      assert.strictEqual(killed.aborted, true);
-      assert.strictEqual(killed.returnCode, 1);
-      assert.strictEqual(
-        killed.stderr,
-        'script stopped: it reached its 1s time limit and did not respond, so it was killed and the interpreter restarted (variables from earlier scripts are gone). '
-          + 'Tool calls it had already made keep their effects, so check them before running it again. To give it longer, pass time_limit_ms up to 2000 (2s).',
-      );
-      assert.ok(Date.now() - started < 5000, `killed after the grace (${Date.now() - started}ms)`);
-      const after = await runner.exec('print(x)', []);
-      assert.strictEqual(after.returnCode, 1);
-      assert.match(after.stderr, /NameError: name 'x' is not defined/);
-    } finally {
-      runner.dispose();
-    }
-  });
-
-  it('a background script killed at its lifetime is not told of an interpreter it never shared', async () => {
-    const runner = new PyRunner({ onToolCall: async () => '', cancelGraceMs: 500, idleReclaimMs: 0 });
-    try {
-      const code = 'import time\ntry:\n    time.sleep(60)\nexcept KeyboardInterrupt:\n    time.sleep(60)';
-      const killed = await runner.exec(code, [], { logPath: null, lifetimeMs: 1000, onWake: async () => null }, { ceilingMs: 1000 });
-      assert.strictEqual(killed.aborted, true);
-      assert.strictEqual(
-        killed.stderr,
-        'script stopped: it reached its 1s time limit and did not respond, so it was killed. Tool calls it had already made keep their effects, '
-          + 'so check them before running it again. 1s is the longest a background script runs here; starting it again runs it from the top.',
-      );
-    } finally {
-      runner.dispose();
-    }
-  });
-
-  it('a background script whose interpreter exits under it is not told of earlier scripts\' variables', async () => {
-    const runner = new PyRunner({ onToolCall: async () => '' });
-    try {
-      const exited = await runner.exec('import os\nos._exit(3)', [], { logPath: null, lifetimeMs: 60_000, onWake: async () => null });
-      assert.strictEqual(exited.returnCode, 1);
-      assert.strictEqual(exited.stderr, "script stopped: the Python interpreter exited with code 3 while it ran, so the rest of the script didn't run. "
-        + 'Tool calls it had already made keep their effects, so check them before you run it again in a new interpreter. '
-        + 'If it stops the same way, check whether the script itself ends the process, for example with os._exit(); if not, ask whoever runs this host.');
-    } finally {
-      runner.dispose();
-    }
-  });
-
-  it('the time-limit note starts on a line of its own after an interpreter exit, whose text ends without one', async () => {
-    const runner = new PyRunner({ onToolCall: async () => '' });
-    try {
-      // The interrupt at the limit ends the interpreter, so the exit handler settles the exec.
-      const code = 'import os, signal, time\nsignal.signal(signal.SIGINT, lambda *_: os._exit(3))\ntime.sleep(30)';
-      const result = await runner.exec(code, [], undefined, { deadlineMs: 1000 });
-      assert.strictEqual(result.returnCode, 1);
-      assert.strictEqual(
-        result.stderr,
-        "script stopped: the Python interpreter exited with code 3 while it ran, so the rest of the script didn't run, "
-          + 'and variables from earlier scripts are gone. Tool calls it had already made keep their effects, so check them before you run it again '
-          + 'in a new interpreter. If it stops the same way, check whether the script itself ends the process, for example with os._exit(); '
-          + 'if not, ask whoever runs this host.\n'
-          + 'script stopped: it reached its 1s time limit. Tool calls it had already made keep their effects, so check them before running it again.\n',
-      );
-    } finally {
-      runner.dispose();
     }
   });
 });

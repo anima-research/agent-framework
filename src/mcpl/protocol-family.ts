@@ -26,6 +26,7 @@ import { DENY_BY_DEFAULT, capabilityPatternMatches } from './capability-grant.js
 import { DEFAULT_EAGER_FETCH_MAX_BYTES, DEFAULT_MAX_TOTAL_BYTES } from './reference-fetcher.js';
 import { DEFAULT_MAX_INPUT_BYTES } from './tool-lifecycle.js';
 import type { McplServerConfig, ScopeConfig } from './types.js';
+import { kindOf } from '../config-checks.js';
 
 /** The one revision the legacy engine offers and accepts. */
 export const LEGACY_MCP_PROTOCOL_VERSION = '2024-11-05';
@@ -148,7 +149,7 @@ export function redactUrl(url: string | undefined): string {
  * runs where a throw has nowhere to go, such as inside a transport's 'error'
  * listener.
  */
-export function redactServerText(text: unknown, config: Pick<McplServerConfig, 'url' | 'token' | 'env'>): string {
+export function redactServerText(text: unknown, config: Pick<McplServerConfig, 'url' | 'token' | 'env' | 'tokenTransport'>): string {
   return serverTextRedactor(config)(text);
 }
 
@@ -175,7 +176,7 @@ const withheld: Redaction = () => WITHHELD_TEXT;
  * line. A build that can't read the configuration withholds that call's
  * text, and the next call builds again.
  */
-export function serverTextRedactor(config: Pick<McplServerConfig, 'url' | 'token' | 'env'>): ServerTextRedactor {
+export function serverTextRedactor(config: Pick<McplServerConfig, 'url' | 'token' | 'env' | 'tokenTransport'>): ServerTextRedactor {
   let built = -1;
   let redact!: Redaction;
   const now = (): Redaction => {
@@ -316,10 +317,12 @@ export function noteDialSent(config: object, sent: { readonly url?: string; read
 }
 
 /**
- * The url a dial sends. A WebSocket dial sets the token as the `token`
- * parameter, and setting it makes URLSearchParams write the whole query
- * again, form-encoded (a space as `+`), so the url as sent can differ from
- * the url as configured. An http(s) dial sends the url as configured.
+ * The url a dial sends. A WebSocket dial that sends its token in the query
+ * sets it as the `token` parameter, and setting it makes URLSearchParams
+ * write the whole query again, form-encoded (a space as `+`), so the url as
+ * sent can differ from the url as configured. A header-mode WebSocket dial,
+ * which is given no token here, and an http(s) dial send the url as
+ * configured.
  */
 export function urlAsDialed(url: URL, token: string | null | undefined): URL {
   const dialed = new URL(url);
@@ -340,7 +343,7 @@ export interface CredentialPattern {
  * that begins inside another configuration's, or shares its start, can't
  * leave any of that one in place.
  */
-export function serverCredentialPatterns(config: Pick<McplServerConfig, 'url' | 'token' | 'env'>): CredentialPattern[] {
+export function serverCredentialPatterns(config: Pick<McplServerConfig, 'url' | 'token' | 'env' | 'tokenTransport'>): CredentialPattern[] {
   // Strings replaced wherever they occur (after an escape or inside a longer
   // token too), and name=value pairs, replaced only where no letter or digit
   // adjoins them, so a pair such as v=2 leaves dev=2 alone. A pair's value is
@@ -437,7 +440,7 @@ export function serverCredentialPatterns(config: Pick<McplServerConfig, 'url' | 
   const configuredUrl = config.url ?? '';
   let url: URL | undefined;
   try { url = new URL(configuredUrl); } catch { /* Still remove the static token. */ }
-  if (url) addUrl(urlAsDialed(url, config.token));
+  if (url) addUrl(urlAsDialed(url, config.tokenTransport === 'header' ? null : config.token));
   // What the dials sent beyond that: urls dialed with an access provider's
   // token, and its tokens sent in a header.
   const sent = dialsSent.get(config);
@@ -701,6 +704,22 @@ export function serverConfigProblems(config: McplServerConfig): string[] {
       );
     }
   }
+  if (config.tokenTransport !== undefined && config.tokenTransport !== null) {
+    if (binding.transport !== 'websocket') {
+      problems.push(
+        `MCP server "${config.id}": "tokenTransport" applies only to a ws(s):// server; an http(s):// server always sends its credential as a header, and a stdio server sends none`,
+      );
+    } else {
+      const problem = tokenTransportProblem(config, new URL(config.url!));
+      if (problem) problems.push(problem);
+      // A static token known now that no dial could send as configured.
+      else if (config.tokenTransport === 'header' && config.token && !headerCarries(config.token)) {
+        problems.push(
+          `MCP server "${config.id}": with tokenTransport 'header', "token" must be printable ASCII (U+0020 to U+007E) with no space at either end, which is all a header carries as configured`,
+        );
+      }
+    }
+  }
   if (config.protocol !== undefined) {
     if (config.protocol !== 'legacy' && config.protocol !== 'modern') {
       problems.push(`MCP server "${config.id}": protocol must be 'legacy' or 'modern', got ${JSON.stringify(config.protocol)}`);
@@ -714,7 +733,7 @@ export function serverConfigProblems(config: McplServerConfig): string[] {
   if (binding.family === 'modern') {
     if (timeout !== undefined && !(Number.isInteger(timeout) && timeout >= 1 && timeout <= MAX_TIMER_MS)) {
       problems.push(
-        `MCP server "${config.id}": requestTimeoutMs must be an integer from 1 to ${MAX_TIMER_MS} for a modern server (got ${String(timeout)}); every modern call has a deadline`,
+        `MCP server "${config.id}": requestTimeoutMs must be an integer from 1 to ${MAX_TIMER_MS} for a modern server (got ${asText(timeout)}); every modern call has a deadline`,
       );
     }
     for (const path of mcplPolicyGrants(config)) {
@@ -736,6 +755,47 @@ export function serverConfigProblems(config: McplServerConfig): string[] {
     );
   }
   return problems;
+}
+
+/**
+ * What's wrong with a WebSocket server's `tokenTransport`, as a message, or
+ * undefined: a value that is neither mode, or `'header'` with a url that
+ * carries a `token` query parameter of its own, which would still put a
+ * credential in the url, or userinfo, whose Basic credential the Bearer
+ * header replaces whenever it carries a credential, since a request has one
+ * Authorization header. null counts as not set, as config-checks.ts has it.
+ * The refusal names the value's kind, never the value, which could be a
+ * credential pasted into the wrong field, and quotes nothing of the url.
+ */
+export function tokenTransportProblem(config: Pick<McplServerConfig, 'id' | 'tokenTransport'>, url: URL): string | undefined {
+  // A configuration read from JSON can hold anything here.
+  const mode: unknown = config.tokenTransport;
+  if (mode === undefined || mode === null || mode === 'query') return undefined;
+  if (mode !== 'header') {
+    return `MCP server "${config.id}": tokenTransport must be 'query' or 'header', not ${typeof mode === 'string' ? 'another string' : kindOf(mode)}`;
+  }
+  if (url.searchParams.has('token')) {
+    return `MCP server "${config.id}": with tokenTransport 'header' the url must not carry a "token" query parameter, which would still put a credential in it; give it as "token" or "accessProvider"`;
+  }
+  if (url.username || url.password) {
+    return `MCP server "${config.id}": with tokenTransport 'header' the url must not carry userinfo (user:password@), since the Bearer header replaces the userinfo's Basic credential whenever it carries a credential; leave out "tokenTransport" to send the userinfo as before, or give the credential as "token" or "accessProvider"`;
+  }
+  return undefined;
+}
+
+/**
+ * Whether a header-mode credential can go in an `Authorization: Bearer`
+ * header as it is: printable ASCII (U+0020 to U+007E), with no space at
+ * either end. Node and Bun send exactly those bytes, so the server checks the
+ * credential that was configured, and the redactor's patterns match whatever
+ * it echoes. Outside that set a header can't carry it as configured: a space
+ * at either end is dropped (by Bun before sending, by an HTTP parser on
+ * arrival), a control character can't go in a header, and a character past
+ * U+007E goes out as different bytes from Node and from Bun, or is refused
+ * when the socket is built.
+ */
+export function headerCarries(credential: string): boolean {
+  return /^[\x21-\x7e](?:[\x20-\x7e]*[\x21-\x7e])?$/.test(credential);
 }
 
 /** A host a connection to which never leaves this machine, as the WHATWG URL

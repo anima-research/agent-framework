@@ -434,7 +434,10 @@ export function unfetchableReason(record: ReferenceRecord, nowMs = Date.now()): 
 /**
  * RFC-005 treatment for one MCPL wire block, for the model-visible text
  * lanes. Returns a replacement string, or null when the block should keep
- * its existing (inline/text) handling.
+ * its existing (inline/text) handling. A reference's stub carries text taken
+ * from the block's own fields, so it's made well formed (a lone UTF-16
+ * surrogate becomes U+FFFD), as the context store would make it: a tool
+ * result's copies then carry the same text (#695).
  */
 export function referenceStubOrNull(block: unknown, provenance?: string, serverId?: string): string | null {
   const c = classifyBlock(block);
@@ -442,7 +445,7 @@ export function referenceStubOrNull(block: unknown, provenance?: string, serverI
     case 'text': return null;
     case 'inline':
       return c.contradiction ? INLINE_WITHHELD_TEXT : null;
-    case 'reference': return buildReferenceStub(c.testimony, provenance, serverId);
+    case 'reference': return buildReferenceStub(c.testimony, provenance, serverId).toWellFormed();
     case 'invalid': return c.shown;
   }
 }

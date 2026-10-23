@@ -158,8 +158,8 @@ exchange, its unsubmitted payload is not admitted to memory.
 
 Each withheld result's original is written, as the result was stored (its
 text; for a result over the inline cap, its capped text, whose own note names
-the file with the whole output), to a file under the first writable mount's
-`tool-results/` directory, named
+the file with the whole output), to a file under the `tool-results/`
+directory of the first writable mount without an include, named
 `<date>-withheld-<batch>-<index>-<toolUseId>.txt` with any character outside
 `A-Za-z0-9._-` replaced and the name cut to 80 characters. Its stub names it:
 
@@ -168,9 +168,9 @@ the file with the whole output), to a file under the first writable mount's
 
 Otherwise the stub names the guard's audit record, for an operator:
 
-- with no writable workspace, or once the framework is stopping: "Its result is
-  kept in the guard's audit record (framework/tool-result-guard), for an
-  operator.";
+- with no writable mount without an include, or once the framework is
+  stopping: "Its result is kept in the guard's audit record
+  (framework/tool-result-guard), for an operator.";
 - when the write failed: "Writing its result to workspace file … failed, so it
   is kept only in the guard's audit record …". The error itself stays in the
   audit record and the logs;
@@ -224,8 +224,8 @@ Two audit records describe it, each with `batchId`, `messageId` and
   `{ toolUseId, path }` is a written file; with `error`, a failed write; with
   `unfinished: true`, a write still under way at the deadline. `{ toolUseId,
   error }` is a write that threw. `{ toolUseId, skipped }` is no write:
-  `no_workspace_file` (no writable workspace, or the framework was stopping),
-  `workspace_unanswered` (an earlier write was still under way past its
+  `no_workspace_file` (no writable mount without an include, or the framework
+  was stopping), `workspace_unanswered` (an earlier write was still under way past its
   deadline), `batch_deadline` (the batch had no time left to start another write), or `branch_changed` (the workspace declined the write before its tree entry was set).
 
 The `annotated` record describes what each spill reported when the batch's annotation finished. An `unfinished` entry is not updated when the underlying write later settles.

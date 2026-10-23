@@ -205,7 +205,7 @@ describe('admission: the hold is decided once, before any side effect', () => {
     } finally { await g.close(); }
   });
 
-  it('gap 9 — channel_close on a tuned-out channel goes through the cancel flow', async () => {
+  it('gap 9 — channel_close on a tuned-out channel is refused: its cancel is what ends the hold, and the release follows', async () => {
     const f = await fixture({ framework: { subconscious: SUB } as Partial<FrameworkConfig> });
     try {
       await registerOpen(f, 'noisy');
@@ -213,11 +213,21 @@ describe('admission: the hold is decided once, before any side effect', () => {
       await incoming(f, 'noisy', 'n1', 'held before close');
       await settle(f);
       assert.equal(stored(f).filter(held).length, 1);
+      // main's rule: a tuned-out channel's decision is the tune-out; a close
+      // recorded over it would end it without its cancel, so the backlog it
+      // diverted would never reach the agent. The close is refused and says so.
       const result = await f.framework.executeToolCall({ id: 'c1', name: 'channel_close', input: { channelId: 'noisy' }, callerAgentName: 'agent' } as never);
-      assert.ok(result.success, result.error);
-      assert.equal(internals(f).channelRegistry.getDesiredState('editor', 'noisy'), 'closed');
+      assert.equal(result.success, false);
+      assert.match(result.error ?? '', /is tuned out: its messages go to the subconscious, and channel_close doesn't change that/);
+      assert.equal(internals(f).channelRegistry.getDesiredState('editor', 'noisy'), 'tuned-out', 'nothing changed');
+      assert.equal(stored(f).filter(held).length, 1, 'the held message is still held');
+      // The cancel ends it, with the release — and the channel can be closed after.
+      assert.ok(internals(f).tuneOutCoordinator!.cancel('editor', 'noisy', 'agent-tool', 'test').ok);
       assert.equal(internals(f).channelRegistry.getTuneOutState('editor', 'noisy'), null, 'the epoch ended');
       assert.match(textOf(find(f, '<tuned-out-backlog')), /antra: held before close/, 'the release was delivered');
+      const closed = await f.framework.executeToolCall({ id: 'c2', name: 'channel_close', input: { channelId: 'noisy' }, callerAgentName: 'agent' } as never);
+      assert.ok(closed.success, closed.error);
+      assert.equal(internals(f).channelRegistry.getDesiredState('editor', 'noisy'), 'closed');
     } finally { await f.close(); }
   });
 
@@ -243,10 +253,10 @@ describe('admission: the hold is decided once, before any side effect', () => {
       const i = internals(f);
       // A second server with the same channel id.
       i.channelRegistry.channels.set('other:noisy', { serverId: 'other', descriptor: { id: 'noisy', type: 'discord', label: 'noisy' }, open: true });
-      const ambiguous = i.handleTuneOutTool('agent', { channelId: 'noisy' });
+      const ambiguous = await i.handleTuneOutTool('agent', { channelId: 'noisy' });
       assert.equal(ambiguous.success, false);
-      assert.match(ambiguous.error ?? '', /ambiguous/);
-      const resolved = i.handleTuneOutTool('agent', { channelId: 'noisy', serverId: 'editor' });
+      assert.match(ambiguous.error ?? '', /ambiguous|is on more than one server/);
+      const resolved = await i.handleTuneOutTool('agent', { channelId: 'noisy', serverId: 'editor' });
       assert.ok(resolved.success, resolved.error);
       assert.ok(i.channelRegistry.getTuneOutState('editor', 'noisy'));
     } finally { await f.close(); }

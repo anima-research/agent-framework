@@ -124,7 +124,7 @@ function harness(
     delays.every((ms) => ms <= ONE_TIMER_MS),
     `no timer longer than one holds (${delays.filter((ms) => !(ms <= ONE_TIMER_MS)).join(', ')})`,
   );
-  /** End the tune-out in the registry alone, as a send into the channel or a close does. */
+  /** End the tune-out in the registry alone, without the coordinator's cancel. */
   const endInRegistry = () => { state = null; };
   const active = () => state !== null;
   /** Make the step's next call throw `thrown`. */
@@ -191,7 +191,7 @@ it("after a cancel, a new tune-out on the channel isn't ended at the old one's e
   h.noTimerPastOne();
 });
 
-it("a tune-out that ends in the registry, as a send or a close ends it, leaves none of its timers to act on the channel's next one", (t) => {
+it("a tune-out that ends in the registry without its cancel leaves none of its timers to act on the channel's next one", (t) => {
   const h = harness(t);
   // A two-day end time (short enough for one timer, so main's single timer
   // shows the same case), the default 1800 s cadence, and a wake coalescing

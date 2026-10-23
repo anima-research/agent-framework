@@ -10,6 +10,8 @@ export { ProcessQueueImpl } from './queue.js';
 export { ModuleRegistry } from './module-registry.js';
 export { ShutdownTimeoutError, DEFAULT_SHUTDOWN_TIMEOUT_MS } from './shutdown.js';
 export { formatZonedDateTime, formatZonedTime, isValidTimeZone, resolveTimeZone } from './timezone.js';
+export { CLOCK_ROW_KIND, resolveClockConfig } from './clock-rows.js';
+export type { ClockConfig, ClockStamp, ResolvedClockConfig } from './clock-rows.js';
 export { REFUSAL_REACTIONS, REFUSAL_REACTION_FALLBACK, REFUSAL_REACTION_BASELINE } from './refusal-reactions.js';
 
 // Dendrite: agent registry, lifecycle and presets
@@ -62,23 +64,9 @@ export type {
 // Usage tracking
 export { UsageTracker } from './usage/index.js';
 
-// Client-side programmatic tool calling (code_execution): exposed so external
-// tooling can drive the python runtime the way the framework does (protocol
-// harnesses, runtime smoke tests).
-export {
-  PyRunner,
-  buildInjectedTools,
-  buildCodeExecutionToolDefinition,
-  CODE_EXECUTION_TOOL_NAME,
-  PYTHON_RUNTIME_SOURCE,
-} from './code-execution/index.js';
-export type {
-  InjectedTool,
-  ExecResult,
-  PyRunnerOptions,
-  ScriptToolCallHandler,
-  ScriptToolResult,
-} from './code-execution/index.js';
+// Client-side programmatic tool calling (code_execution): the tool's name,
+// and its definition as an agent reads it.
+export { buildCodeExecutionToolDefinition, CODE_EXECUTION_TOOL_NAME } from './code-execution/index.js';
 export type { SessionUsage, AgentUsage, SessionUsageSnapshot, UsageUpdatedEvent } from './usage/index.js';
 
 // EventGate
@@ -87,9 +75,12 @@ export type { GateConfig, GateOptions, GatePolicy, GatePolicyMatch, GateBehavior
 
 // MCPL channel registry (exposed for modules that need channel-level operations)
 export { ChannelRegistry } from './mcpl/index.js';
+export type { PublishRefusalReason } from './mcpl/index.js';
 
-// Where each accepted inbound item came from (`metadata.inboundSource`)
-export { INBOUND_SOURCE_KEY, readInboundSource, conversationKey } from './mcpl/index.js';
+// Where each accepted inbound item came from (`metadata.inboundSource`), and
+// the digest its delivered and stored bodies are stamped with
+// (`metadata.sourceBodyDigest`, `metadata.storedBodyDigest`)
+export { INBOUND_SOURCE_KEY, readInboundSource, conversationKey, sourceBodyDigest } from './mcpl/index.js';
 export type {
   InboundSource,
   InboundChannelSource,

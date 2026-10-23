@@ -1,6 +1,6 @@
 {
   "name": "@animalabs/agent-framework",
-  "version": "0.23.1",
+  "version": "0.24.1",
   "description": "Multi-agent framework with pluggable modules, persistent state, and concurrent tool execution",
   "repository": {
     "type": "git",
@@ -26,7 +26,8 @@
   },
   "scripts": {
     "build": "tsc",
-    "postbuild": "node -e \"const fs=require('node:fs'); for (const p of ['dist/src/api/mcp-server.js','dist/src/recovery/recover-cli.js']) fs.chmodSync(p, 0o755)\"",
+    "postbuild": "node -e \"const fs=require('node:fs'); for (const p of ['dist/src/api/mcp-server.js','dist/src/recovery/recover-cli.js']) fs.chmodSync(p, 0o755); fs.copyFileSync('src/code-execution/quickjs.wasm', 'dist/src/code-execution/quickjs.wasm')\"",
+    "predev": "node -e \"const fs=require('node:fs'); fs.mkdirSync('dist/src/code-execution', { recursive: true }); fs.copyFileSync('src/code-execution/quickjs.wasm', 'dist/src/code-execution/quickjs.wasm')\"",
     "dev": "tsc --watch",
     "clean": "rm -rf dist",
     "typecheck": "tsc --noEmit",
@@ -48,8 +49,8 @@
   "license": "MIT",
   "dependencies": {
     "@animalabs/chronicle": "^0.4.0",
-    "@animalabs/context-manager": "^0.14.1",
-    "@animalabs/membrane": "^0.5.87",
+    "@animalabs/context-manager": "^0.18.0",
+    "@animalabs/membrane": "^0.6.0",
     "@modelcontextprotocol/client": "^2.3.1",
     "chokidar": "^4.0.3",
     "discord.js": "^14.25.1",
@@ -64,6 +65,6 @@
     "typescript": "^7.0.2"
   },
   "engines": {
-    "node": ">=20.0.0"
+    "node": ">=22.12.0"
   }
 }

@@ -5,7 +5,7 @@
  * context-manager 0.14.0 mishandled: it left later compiles reading message
  * positions from before the removal, so with the middle of three messages
  * removed, the agent's next turn was refused with UncoveredDropError
- * (anima-research/context-manager#180, fixed in 0.14.1, this package's floor).
+ * (anima-research/context-manager#180, fixed in 0.14.1, below this package's floor).
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';

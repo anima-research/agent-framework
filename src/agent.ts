@@ -4,6 +4,7 @@ import { createHash } from 'node:crypto';
 import type { CacheWireReceipt, KvUnifiedRequestHooks } from './kv-unified-wire.js';
 import { ToolResultGuard } from './tool-result-guard.js';
 import { withoutTokenEstimates } from './thinking-token-stamp.js';
+import { injectionsAsStored } from './text-as-stored.js';
 import { assertBooleanSetting, holdsSettings } from './config-checks.js';
 import {
   CONTINUE_ROW,
@@ -19,6 +20,7 @@ import {
   type StoredRowLike,
 } from './silent-heartbeat.js';
 import { randomUUID } from 'node:crypto';
+import { resolveClockConfig, type ResolvedClockConfig } from './clock-rows.js';
 import {
   nonErrorResultText,
   truncateForHistory,
@@ -167,6 +169,10 @@ export class Agent {
   readonly proseRouting: 'locus' | 'explicit' | 'hybrid' | 'disabled';
   /** Exact whole-response known-tool wrapper containment (default off). */
   readonly toolWrapperProseGuard: boolean;
+  /** Clock rows' interval and precision (see AgentConfig.clock); undefined
+   *  when the agent writes none of its own (a resident still reads those
+   *  another resident writes into the shared slot). */
+  readonly clock: ResolvedClockConfig | undefined;
   /** Prompt-cache TTL forwarded to the provider (see AgentConfig.cacheTtl). */
   readonly cacheTtl: NonNullable<AgentConfig['cacheTtl']>;
   /** Emit prompt-cache markers on requests (see AgentConfig.promptCaching). */
@@ -301,6 +307,7 @@ export class Agent {
     this.toolResultGuard = new ToolResultGuard(config.name, contextManager, config.toolResultGuard === true);
     this.proseRouting = config.proseRouting ?? 'locus';
     this.toolWrapperProseGuard = config.toolWrapperProseGuard === true;
+    this.clock = resolveClockConfig(config.name, config.clock);
     this.cacheTtl = config.cacheTtl ?? '1h';
     this.promptCaching = config.promptCaching !== false;
     this.prefillUserMessage = config.prefillUserMessage;
@@ -962,22 +969,39 @@ export class Agent {
   }
 
   /**
-   * RFC-006 consumed watermark: the newest stored message at the last compile
-   * of a model request, or at the last tool boundary that injected messages
-   * into a live one, per branch. Everything above it has never been in a
-   * request and may still be replaced or withdrawn in place by its sender.
+   * RFC-006 consumed watermark, per branch: the newest stored message as of
+   * the latest of the agent's creation, a committing compile that returns,
+   * and a tool boundary that injected messages into a live stream declaring
+   * it carries them (`supportsInjectedMessages` true: membrane's native
+   * path, from membrane 0.6.0). A compile counts from when it takes its
+   * value, before it awaits, so one that began before a boundary's mark
+   * doesn't roll the mark back (applyCompileWatermark), and a dry run, such
+   * as previewActivation's, doesn't move it. Each move takes the store's
+   * head, a scalar, so it also covers stored messages the agent wasn't
+   * given, such as another slot's.
+   *
+   * A message above it may still be replaced or withdrawn in place by its
+   * sender, though it may already have been in one of the agent's requests.
+   * A live stream carries each round's own content and results, which it
+   * stores at its tool boundaries, into its next request. It can also carry
+   * the messages injected at a boundary whose stream didn't say whether it
+   * carries injections, as no membrane 0.5.x stream does: its native path
+   * carries them and its XML path drops them, and either way they stay
+   * above it.
    */
   private consumedWatermark: { branch: string; sequence: number } | null = null;
-  /** Counts marks: a compile writes its watermark back only if no mark was
-   *  made while it ran (a tool boundary's, or another compile's). */
+  /** Counts marks (markContextConsumed's and applyCompileWatermark's), so a
+   *  compile that finishes can tell whether one was made while it ran. */
   private watermarkMarks = 0;
   /**
    * The newest stored message a compile or a tool boundary may have put in
    * front of the agent, per branch. It moves where the consumed watermark
    * does, and sooner: when a committing compile takes its value, before it
    * awaits, and at every tool boundary that injects, whether or not the
-   * stream says it carries injected messages. So nothing above it can have
-   * been shown. A compile that throws assembled nothing, and gives its move
+   * stream says it carries injected messages. A message above it may still
+   * have been shown, though: for one, a live stream carries each round's own
+   * content and results, stored at a boundary that injected nothing, into its
+   * next request. A compile that throws assembled nothing, and gives its move
    * back where it can (unshowFailedCompile). A scalar counts a prefix, so a
    * message stored below it without having been shown counts as shown, which
    * errs toward a marker.
@@ -993,11 +1017,13 @@ export class Agent {
   }
 
   /** Mark everything currently stored as consumed (the agent's creation, at
-   *  boot or later, and a tool boundary that injected messages into the live
-   *  stream). */
+   *  boot or later, and a tool boundary that injected messages into a live
+   *  stream declaring it carries them; see consumedWatermark). */
   markContextConsumed(): void {
     // Tolerates partial context-manager doubles (tests build Agents over
-    // stubs): without a watermark nothing is ever treated as unread.
+    // stubs). Without a watermark, a reader that looks for one takes its own
+    // side: the coalescer counts the message as read, and the framework's
+    // deferredWriteReadOrGone and unreadNoticesForPrimary count it as unread.
     this.consumedWatermark = this.pendingWatermark();
     this.watermarkMarks++;
     this.shownWatermark = this.consumedWatermark;
@@ -1005,8 +1031,8 @@ export class Agent {
 
   /** Mark everything currently stored as possibly shown (a tool boundary
    *  that injected messages, whatever its stream says it carries). Without
-   *  a watermark everything counts as shown, as markContextConsumed counts
-   *  it read. */
+   *  a watermark the coalescer counts a message as shown, as it counts one
+   *  read without a consumed watermark. */
   markContextShown(): void {
     this.shownWatermark = this.pendingWatermark();
   }
@@ -1033,7 +1059,9 @@ export class Agent {
    * the watermark only advances: if a mark was made while the compile ran,
    * the compile's (older) one is applied only where it is later on that
    * mark's branch, so a boundary's mark is never rolled back by a compile
-   * that started before it (a preview during a live turn).
+   * that started before it (a committing compile, such as compileContext's,
+   * run during a live turn; a dry run, such as previewActivation's, never
+   * reaches here).
    */
   private applyCompileWatermark(watermark: { branch: string; sequence: number }, marksBefore: number): void {
     const current = this.consumedWatermark;
@@ -1168,6 +1196,8 @@ export class Agent {
     if (this._state.status === 'inferring') {
       throw new Error(`Agent ${this.name} is already inferring`);
     }
+    // Unstored, so they leave for the request here (text-as-stored.ts).
+    injections = injectionsAsStored(injections);
 
     if (this._state.status === 'waiting_for_tools') {
       throw new Error(`Agent ${this.name} is waiting for tool results`);
@@ -1345,6 +1375,9 @@ export class Agent {
     compressionTools: ToolDefinition[] = availableTools,
     options: ActivationRequestOptions = {},
   ): Promise<{ request: NormalizedRequest; continuePrompt?: RequestOnlyPrompt }> {
+    // Unstored, so they leave for the request here (text-as-stored.ts), the
+    // layout hash below included.
+    injections = injectionsAsStored(injections);
     // Compression may revisit hidden tools in recorded history. Keep its full
     // definition set separate from the resident's advertised tools: the
     // autobiographical strategy must declare the same tools on its
@@ -1936,14 +1969,21 @@ export class Agent {
     // via buildStoredToolResultContent, with workspace spill). No workspace
     // is reachable from here, so the house default cap applies as plain
     // truncation — bounded beats unbounded, for errors too.
-    const content = results.map((r) => ({
-      type: 'tool_result' as const,
-      toolUseId: r.id,
-      content: r.result.isError
-        ? truncateForHistory(r.result.error ?? 'Unknown error', DEFAULT_TOOL_RESULT_INLINE_MAX_CHARS)
-        : nonErrorResultText(r.result, DEFAULT_TOOL_RESULT_INLINE_MAX_CHARS),
-      isError: r.result.isError,
-    }));
+    const content = results.map((r) => {
+      // This API's results are unchecked (nonErrorResultText), so each field
+      // is read once, and only an error that is a string is made well formed;
+      // any other error value is passed on as it was before.
+      const isError = r.result.isError;
+      const error: unknown = isError ? r.result.error ?? 'Unknown error' : undefined;
+      return {
+        type: 'tool_result' as const,
+        toolUseId: r.id,
+        content: isError
+          ? truncateForHistory(typeof error === 'string' ? error.toWellFormed() : error as string, DEFAULT_TOOL_RESULT_INLINE_MAX_CHARS)
+          : nonErrorResultText(r.result, DEFAULT_TOOL_RESULT_INLINE_MAX_CHARS),
+        isError,
+      };
+    });
 
     return [{
       participant: 'user',

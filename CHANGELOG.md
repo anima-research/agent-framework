@@ -12,6 +12,1371 @@ Releases up to and including 0.7.3 predate this file; for their contents see
 
 ## Unreleased
 
+## 0.24.1 — 2026-10-22
+
+### Added
+
+- **Clock rows** (`AgentConfig.clock`, off by default): with
+  `clock: { intervalMinutes: 10 }` (or `intervalSeconds`, and `precision:
+  'minutes' | 'seconds'`), an agent's window takes a `Clock: 10:50
+  Europe/Berlin (UTC+02:00)` row whenever a boundary of that interval on its
+  local wall clock (from local midnight, in the framework's `timeZone`) has
+  passed since its last clock: before an incoming event, at a fresh turn's
+  start (a silent heartbeat tick included), and mid-turn after a tool
+  round's results, where it also joins the live stream as an injected
+  message (not on a stream that can't carry injected messages, such as
+  membrane's XML prefill path: there the next event or turn start writes
+  it). Only the latest boundary is written, and a window that holds no
+  clock row yet, a conversation fork's seeded one included, takes one at the
+  next of these. A clock reads the boundary's time where that tick would have
+  stood, else the time it is written (after a tool round or a reply that
+  spanned the boundary), so it never reads earlier than a row before it; it
+  shows the weekday and date when the day has changed since the last clock.
+  Clock rows are `system: true`, `kind: 'clock'`, with `metadata.clock: {
+  at, onBoundary, zone }`; they wake no one, move no routing locus and clear
+  no send suppression. None is written while the host is quiesced, or into
+  the residents' shared slot while another of its readers has a turn alive.
+  Residents share one window, so every resident reads the clock rows any of
+  them writes, one with no `clock` of its own included; each writes one when
+  a boundary of its own interval has passed since the window's last clock.
+  The subconscious takes none of its own. On some models a clock after a
+  tool's results drops the loop's earlier thinking from the request, as any
+  message heard while acting does there, at most once an interval. An
+  invalid `clock` setting makes `AgentFramework.create` throw, naming the
+  agent. `resolveClockConfig` (the validation `create` runs, for a host
+  checking a recipe up front), `CLOCK_ROW_KIND` and the `ClockConfig` /
+  `ClockStamp` / `ResolvedClockConfig` types are exported.
+
+### Changed
+
+- The workspace's `edit` and `edit_many` refuse a file the workspace holds
+  when the check of disk before them decided nothing, because the selected
+  branch kept changing while it ran. They store nothing, and say so, with
+  that reason and to make the same call again. Before, they applied to the
+  workspace's copy without a word, so where disk had changed they edited
+  text disk had moved past and left the path in conflict, and they committed
+  on whichever branch was selected when the check gave up. Where disk's copy
+  couldn't be read, an `edit` or `edit_many` still applies to the
+  workspace's copy and says so.
+
+- A cut tool result's spill notice, which names the workspace file holding
+  the rest, now survives every reader's per-message cut until a turn's
+  notices alone fill the bound, or a mount name past about seventy
+  characters makes the notice longer than its room. Past six results at a
+  bound of 4,000, or 62 at 40,000, a turn's share is under the notice's
+  room, so each result longer than its share is stored as its notice alone,
+  with no head; where a workspace is writable, its file holds the whole
+  result. Past about 11 results at 4,000, or 119 at 40,000, the notices
+  themselves pass the bound, and the reader's cut takes the later ones. An
+  ordinary
+  resident's inline cap is at most the smallest per-message bound among the
+  agents that read the shared slot, and `agent_settings` get reports a cap
+  set by another reader's bound as
+  `tool_result_inline_max_chars_clamped_by: "reader-bound"`. Where a cut
+  result's stored copy, notice and kept image slots included, would pass
+  that bound, its head moves back until it fits, and image slots that still
+  don't fit keep the newest. A reader's strategy spends its bound across a
+  message, and a turn's results are stored as one message, so where they
+  pass the bound together, which used to cut or leave out a later result
+  silently, each now takes an equal share of it. A turn whose results fit is
+  stored as each result would be alone, unless a `save_recent_image` in it
+  counted a result whose kept image slots the share would change: that turn
+  is stored by its share, so the images the save counted are the ones
+  stored. A withheld turn under a bound, whether or not its results fit,
+  cuts each stub's kept fields within its share less the notice's room, so
+  every stub's notice and place survive the reader's cut too, under a note
+  that now reads
+  `[cut: N of these fields' M characters; …]`; under a share of about 640
+  characters or less a stub keeps a single character of its fields. The
+  notice offers raising the inline cap only where a cap at the bound would
+  keep more of the result, and a stored copy that leaves out every image
+  slot past its cut says so.
+
+### Fixed
+
+- The workspace's `delete`, `edit` and `edit_many`, and its `readBinary`
+  method, no longer answer "File not found" for a path the workspace doesn't
+  hold when the check of disk before them decided nothing, because the
+  selected branch kept changing while it ran. Each now says that disk
+  couldn't be checked, with that reason, and to make the same call again.
+  Before, they answered "File not found" even when disk held the file
+  (#552). `readBinary` also gives `delete`'s answer for every other path the
+  workspace doesn't hold, such as one whose disk copy couldn't be read, where
+  it said "File not found" whatever the reason.
+
+- `channel_close` refuses a channel that's tuned out, as `channel_open` and
+  `channel_decline` do, and says to cancel the tune-out with `tune_out` mode
+  "cancel", which delivers what it diverted (#633). The channel can be closed
+  after that. Until now the close answered success and ended the tune-out
+  without its cancel, so its diverted backlog never reached the agent, and a
+  later cancel found nothing to cancel. A module's close, such as one that
+  certifies an idle lease (`overrideExplicitOpen`), is refused the same way,
+  with `isError: false` and `data.refusal` `'tuned-out'`, so it can stand
+  down as it does on the explicit-open refusal. A close that a tune-out
+  overtook now answers in the refusal's words, and a decline that one
+  overtook says to cancel the tune-out before calling `channel_close`.
+  Before, both said to call `channel_close`, which now refuses it.
+- A tune-out on record where the host has no tune-out coordinator, at a
+  start with no subconscious or when a start with no servers connects its
+  first one, now ends as the channels come up, and its channel is decided
+  open again, as a cancel leaves it, still the agent's decision. A log line
+  names the channel and says how many of the messages the tune-out diverted
+  are held, which nothing will deliver as its backlog. Before, nothing
+  diverted the channel's traffic or could cancel the tune-out, `tune_out`
+  wasn't offered, and `channel_open`, `channel_decline` and now
+  `channel_close` refused the channel, so its decision couldn't change.
+
+- A modern MCP server whose `requestTimeoutMs` is a value `String()` can't
+  print, such as `{"toString": 1}`, which a JSON configuration can hold, is
+  now refused like any other wrong deadline, with the value shown as
+  `[a value that cannot be printed]`. Before, checking the configuration
+  threw a `TypeError` instead: connecting to the server failed with that
+  error's text, and `listMcplServers` threw rather than list any server.
+
+- A message that arrives during a turn's tool call is injected into the
+  live stream as the next compile would send it, where it was injected
+  whole. The agent's strategy renders the boundary's messages as the newest
+  of its window (context-manager's `renderAsNewest`): cut by the
+  per-message cap, a sharded body joined, and its images as the image
+  limits leave them, counted newest-first across the batch. So the next
+  turn's request matches what the live rounds carried, and its prompt cache
+  holds, where a message over `maxMessageTokens`, or with more images than
+  `maxLiveImages`, made the next request differ there. A message that
+  arrives later can still take an injected one past an image limit, as it
+  can any message. A message the next compile won't send among its newest,
+  such as one in a batch bigger than the memory strategy's recent window,
+  isn't injected, and a log line names it. In its place a stored system
+  line after the batch, `[not shown]`, tells the agent who sent it, its
+  size in characters and images, and the `history--extract` call that reads
+  it, or its id where the agent isn't shown that tool. It names the agent
+  it's for, since residents sharing a slot read it too. Where that boundary
+  marks what it stored as read, the message counts as read with it, so a
+  coalesced render's wake to read it is dropped and a release doesn't pass
+  it to the primary. A strategy without `renderAsNewest`, or a render that
+  throws, which is logged, gets the message as stored, as before.
+
+## 0.24.0 — 2026-10-22
+
+### Breaking
+
+- **Agents with `code_execution`, and whoever writes their prompts:** scripts are JavaScript now, not Python, and each runs in a process of its own, in QuickJS compiled to WebAssembly, on the host's own runtime (Node or Bun). A script reaches nothing but its agent's tools: no network, files, timers, packages or environment.
+  - **Calling tools:** by exact name, `await tools["workspace--read"]({ path: "work/notes.md" })`, one argument, an object. The mangled Python names (`workspace__read`) are gone. `ALL_TOOLS` lists each tool's name, description and `inputSchema`. A name that isn't one of the agent's tools throws at once in the script, naming close matches, and nothing is sent. At most 16 of a script's calls are out at once: one past them waits until an earlier one's answer has reached the script, and is never refused, so a `Promise.all` over many calls is paced rather than refused. Calls that timed out count against the 16 the host holds until their tools end, so a call made while 16 of those still run waits, and one that waits past its timeout gets a `TimeoutError` saying it was never sent. A call whose tool gives no result within `toolCallTimeoutMs` and 30 s more, which the host stops waiting for then, keeps its place until the script ends, since its tool may still be running. A call's arguments may be up to 4 MiB of JSON holding at most 100,000 values: past either, the call throws `ArgumentsTooLarge`, and nothing is sent.
+  - **Results:** every tool answers one shape, `{ content, structuredContent, isError }`: `content` is what the model would read (a structured result's blocks, otherwise one text block), `structuredContent` the tool's own structured content or `null`, and `isError` true when the tool failed. A structured result's blocks are as its tool sent them, so images survive. A call refused before its tool ran (`ToolResult.refused`) throws an `Error` instead, `ToolRefused`, and nothing was done. A result that can't be converted to JSON, such as a cyclic object from an in-process module, comes as a failure in the same shape, its text naming the tool and saying the call completed. Before, a script got a string, the tool's text or `Error: …` for a failure, carrying `.is_error` and `.structured`, and a result with structured content got `{ content, structuredContent, isError, error? }`, with a failure's text in `error`.
+  - **`code_execution`'s own result** is an error (`isError`) when its script failed, crashed or was stopped at its limit, or the call was refused, with the text the model reads as its `error`; otherwise that text is its `data`, as a list of one text block. It carries no `structured`. Before, a script's result was a success whatever its `return_code`, and its `data` an object of `stdout`, `stderr`, `return_code` and, when the call's limit was capped, `time_limit_note`.
+  - **One kind of script:** a script runs in its agent's turn; past `yield_time_ms` (default 30 s, at most `maxYieldMs`, 10 min by default) it yields with its output so far and keeps running. Then `{"action": "wait", "script_id": …}` waits again, `{"action": "stop", …}` stops it and `{"action": "list"}` lists the agent's scripts, each with the wakes the host delivered for it. Each return shows the output since the previous one, its first and last 8,000 characters, cut alike to fit the agent's inline cap for tool results where the rest of the return leaves them room. The primary agent may leave a script running past its turn: `wake_agent()` is open to any running script, and a left script that fails, crashes or reaches its limit (24 h) wakes its agent; any other agent's scripts stop when its turn ends. The background log file is gone, its place taken by each return's output.
+  - **Refused inputs, each naming its replacement:** `background` (every script can yield and keep running), `time_limit_ms` (`yield_time_ms`) and the `cancel` action (`stop`).
+  - **Nothing is kept between scripts:** each starts fresh, so globals no longer persist until an idle reclaim. A script writes what must last with a tool.
+  - **Large results:** a result too large for the script's memory (past a third of it, or one that doesn't fit when it's parsed), or nested more than 2,000 deep, isn't passed to the script: the call's `ResultTooLarge` error says the tool ran, and a refusal the script can't take stays a refusal, with its start. Any other result reaches the script whole. Before, a text result was cut at 5,000,000 characters, and a structured one past that length was saved to the workspace, the script getting `{ isError, oversized: { chars, savedTo } }` in its place, or, when it couldn't be saved, a failure saying the tool may have completed.
+  - **Unchanged:** a script's calls go through the ordinary dispatcher as its agent's, with its allowlist and every gate; intermediate results stay out of the model's context; a call's `endTurn` ends the turn at the `code_execution` result watching the script; `wake_agent()` keeps its spacing and cap; RFC-007 observers see a script's calls as before.
+  - **Wakes:** a `wake_agent()` still waiting for its spacing when its script ends is dropped, however the script ended. Before, only a cancel dropped it, and a script that finished or died still woke its agent after the wait, saying it was still running. New: a wake's payload may be up to 64 KiB of JSON, and past it `wake_agent()` throws `WakeRefused`, with nothing sent.
+- **Operators with `codeExecution` enabled:** the host no longer needs a Python interpreter. On Bun it needs Bun 1.4.0 or later: `create()` refuses `codeExecution` on an older Bun, since Bun 1.3.14 loses, at some starts, the pipe a script's process answers on, which crashes the script. `create()` refuses each setting the Python runner took, naming what to do: `pythonPath`, `idleReclaimMs`, `env` and `inheritEnv` are gone, since a script has no interpreter, nothing to reclaim and no environment, and `scriptTimeoutMs`, `maxScriptTimeoutMs`, `backgroundMaxLifetimeMs` and `maxBackgroundScripts` become `yieldMs`, `maxYieldMs`, `scriptLifetimeMs` and `maxRunningScripts`. New: `maxScriptChildren` (default 16), the script processes a host runs at once, and `memoryMaxBytes` (default 128 MiB, 4 MiB to 2 GiB in 64 KiB pages), each script's budget. A script's process stays within about its runtime's base plus 2.7 times `memoryMaxBytes`, plus what its calls take as they go out, up to about 200 MiB under Node and 410 MiB under Bun, and the host holds at most about 6 times `memoryMaxBytes`, plus 653 MiB, plus 128 KiB for each wake `maxWakesPerScript` allows, for a script, about 1.4 GiB at the defaults, for its 16 calls out at once, timed-out ones whose tools still run included, up to 16 more waiting for those, their answers, the frame from its process being read and its waiting wakes: size a host by both. `toolCallTimeoutMs`, `wakeMinIntervalMs` and `maxWakesPerScript` are unchanged. A connectome-host recipe that sets `codeExecution.pythonPath`, `env`, `scriptTimeoutMs` or `idleReclaimMs` is refused the same way.
+  - **What it promises:** `code_execution` adds nothing to what an agent's tools allow, provided the host runtime's WebAssembly engine, Bun's or Node's, and our glue are right. It claims no containment beyond that.
+- **Library users:** `PyRunner`, `buildInjectedTools`, `PYTHON_RUNTIME_SOURCE` and the types `InjectedTool`, `ExecResult`, `PyRunnerOptions`, `ScriptToolCallHandler` and `ScriptToolResult` are no longer exported. `CodeExecutionConfig` has the new keys, and `buildCodeExecutionToolDefinition()` takes them, as `create()` does, where it took the Python runner's options. `HostModeStatus.backgroundScripts` counts scripts left running after a yield. A script's wake enters the agent's context with `metadata.source` `code-execution-script` (was `background-script`), tagged `script:wake` as before.
+
+- **Hosts that read usage by agent:** every ephemeral agent's usage (`createEphemeralAgent`) now counts in one shared `byAgent` entry, named `ephemeral agents` and marked `ephemeral: true`, instead of an entry under each agent's own name. Each ephemeral agent runs under a new name, and the usage record is rewritten whole after every inference, so an entry per name made every later write bigger for good.
+  - **Migration:** a host that looks up a subagent's usage by its name in `getSessionUsage()` no longer finds it there, and reads the entry marked `ephemeral: true` instead, which holds every ephemeral agent's usage together. A host that lists `byAgent`, such as connectome-host's `/usage`, shows one line for all subagents instead of one each. connectome-host's web UI lists that line in its per-agent cost when it carries a cost.
+  - **Stored entries:** at the first start after upgrading, the entries a store holds under ephemeral agents' names fold into the shared entry, for good once the record is written again. An entry folds when the store has that name's ephemeral namespace (`subagent/<name>`), unless a persistent agent has the name: a configured agent, the configured subconscious, or one with a resident's or a conversation agent's namespace (`agents/<name>`, `conversations/<name>`).
+  - **Costs in two currencies:** once inferences priced in two currencies are counted in one tally, the totals or any entry, its `estimatedCost` stays absent from then on, and `mixedCurrencies: true` marks it. Before, a later cost started the sum again from itself, so the tally reported only part of its cost. At the first start, the totals are also marked when the stored entries show two currencies met. The shared entry's cost, like the totals', counts only the inferences membrane priced.
+  - **Unchanged:** the totals, the inference count and each other agent's entry, apart from a cost after two currencies meet. The `usage:updated` trace still names each run's own agent.
+  - **Rolling back:** a framework from before this shows the shared entry as an agent named `ephemeral agents` and writes it back without its mark, and this version takes it back as the shared entry. If an agent is itself named `ephemeral agents`, the older framework keys both by that name, so the shared entry replaces the agent's own, and after upgrading again that entry stays the agent's. The older framework also drops `mixedCurrencies`, so a tally in which two currencies met starts its cost again from its next priced inference. The totals' counts don't change.
+
+- **Hosts:** agent-framework now depends on membrane `^0.6.0` and
+  context-manager `^0.18.0`, where it depended on `^0.5.87` and `^0.14.1`.
+  context-manager 0.18.0 requires membrane `^0.6.0` itself, so the two
+  install one membrane between them. What reaches a host through
+  agent-framework, from those releases' notes:
+  - **Your own membrane:** a host that builds its own `Membrane` and hands it
+    to agent-framework raises its own `@animalabs/membrane` range to
+    `^0.6.0`. context-manager counts a compression attempt's prompt through
+    that instance, and with an older membrane it counts Gemini's cached input
+    twice (below 0.5.81, OpenAI's too, and OpenRouter's on routes that report
+    OpenAI's `cached_tokens`), so a compression fallback that fits can be
+    rejected at admission and its chunk quarantined (context-manager 0.16.0).
+  - **Your own context-manager:** a host that constructs strategies from its
+    own `@animalabs/context-manager` must also raise that range to `^0.18.0`,
+    matching agent-framework's dependency, and verify that installation has
+    one compatible copy. Leaving the host on 0.14.x installs two copies and
+    hands an older strategy to a newer manager; strategy interfaces and
+    compression-pause/quarantine behavior differ between those versions.
+  - **The kv-unified hysteresis certificate is on by default** for a
+    strategy built from a recipe: a `kvUnified` block without
+    `hysteresisCertificate` takes the certified exit, and
+    `hysteresisCertificate: false` restores the full solver on every compile
+    (context-manager 0.15.0).
+  - **Content context-manager won't store** is refused where agent-framework
+    writes it, as the entry on malformed content says.
+  - **Stored history:** content an older context-manager stored that doesn't
+    match `ContentBlock` is now read mended, or left out, with one line per
+    message naming each place, where some such content made every compile
+    throw. A `tool_use` stored with `input: null`, as membrane 0.5.87's
+    OpenAI-family adapters gave it for the arguments `null`, reads as `{}`
+    with `null` in `unparseableInput`. A request compiled from such a message
+    can change there, so a provider's prompt cache misses from that point,
+    once (context-manager 0.16.0).
+  - **Tools given `null` arguments:** an OpenAI-family tool call whose
+    arguments are the text `null` reaches the tool as `{}`, where it reached
+    it as `null`. membrane keeps the arguments' text on the `tool_use` block
+    as `unparseableInput` (membrane 0.6.0).
+  - **Anthropic streams:** after a stream's first event, SSE `ping`
+    keepalives now count as activity for its idle deadline, so a stream that
+    keeps sending only pings no longer ends at it (membrane 0.6.0).
+  - **Media notes:** two of the notes membrane writes in place of media it
+    doesn't send now say the model isn't seeing it. The first request after
+    upgrading carries the new text wherever it renders such a note, so a
+    provider's prompt cache misses once, from the first such note on
+    (membrane 0.6.0).
+  - **Caller-supplied blob references:** context-manager 0.16.0 and later refuse
+    `blob_ref` writes with `MalformedContentError`; these references are
+    store-internal. Read with blobs resolved (the default) before copying a
+    body into a new write. An unresolved read is not a write-ready payload.
+  - **Compression quarantine status:** callers that inspect or compare
+    `getCompressionQuarantineStatus()` must account for its `spans` field,
+    including an empty array when no spans are quarantined.
+  - **kv-unified policy:** context-manager 0.17 adds age bands, joint latent
+    demand and the subtree engine. Explicit recipe overrides remain important:
+    `policy.ageBandSteps: 0` requests exact ages, `latentDemandMode: 'individual'`
+    chooses independent ranking, and `engine: 'dag'` selects the DAG engine.
+  - **Merges across an unowned message:** the floor is 0.18.0, not 0.17.x,
+    because before it a merge could group the summaries on either side of a
+    message no chunk owns (a raw pin, a message an unpin freed, or a head
+    window `resetHeadWindow` left mid-stream), and under kv-unified without
+    `treeifyNonContiguousSummaries` or `preserveGapBearingSummaries` every
+    compile after it threw `CanonicalForestError`. A store already holding
+    such a summary loads as before (context-manager 0.18.0, #287).
+  - **`close()` is final:** after a context manager's `close()`, every
+    operation that writes or calls into its strategy throws, with an
+    app-owned store too; open a new manager on the store to go on with it
+    (context-manager 0.18.0).
+  - **Compression debt:** `getCompressionDebt()` answers `unknown` when it
+    can't read what decides its state, with `null` for each count it couldn't
+    compute and an operator-facing `error`. A host that shows the report
+    treats `unknown` as needing attention and never shows a `null` count as
+    0 (context-manager 0.18.0).
+  - **Strategy subclasses:** `AutobiographicalStrategy`'s protected
+    `pruneToolEntries` is removed; override `toolPruning` or `prunedForSend`
+    instead (context-manager 0.18.0).
+  - The rest is in membrane 0.6.0's notes and context-manager 0.15.0's,
+    0.16.0's, 0.17.x's and 0.18.0's.
+
+- **Hosts:** membrane 0.6.0, which agent-framework now depends on, says
+  with each round of tool calls whether its stream can carry messages
+  injected with the round's results: yes on its native tool path, no on its
+  XML tool path. membrane 0.5.87 said neither, and agent-framework now acts
+  on what 0.6.0 says:
+  - **On the native path,** a tool boundary that injects messages marks
+    everything stored so far as read, as a compile does: the injected
+    messages, and anything stored before them. A later coalesced update of
+    one of their subjects is then added after the earlier version rather
+    than replacing it, and a wake queued only to have the agent read one of
+    them starts no turn. With 0.5.87 they stayed unread.
+  - **A notice the primary would take over** when a run or a conversation
+    fork ends and its window is released (a failed reply, or a channel its
+    message opened or couldn't open) is no longer passed on to the primary
+    if it was injected at such a boundary, since the agent read it. It may
+    still be if the window can't be read at the release. With 0.5.87 it was
+    passed on.
+  - **On the XML path,** a tool boundary injects nothing. Messages queued for
+    the agent after a turn's first request wait for the turn's end and are
+    stored then. With 0.5.87, a tool boundary stored those it could inject
+    there and offered them to the stream, which ignored them. While they
+    wait they are in the deferral queue, which is saved to disk only from a
+    quiesce until the queue next drains, so at other times a crash before
+    the turn ends loses them.
+  - **Migration:** nothing to change in code. A host whose agents use XML
+    tool mode should expect a message that arrives during a long turn to
+    reach the agent, and the store, only when the turn ends, and a crash
+    before then to lose it.
+  - **Unchanged:** each round's tool results, what a turn's start stores
+    before its first request, and which messages the native path injects.
+  - **Added after the release:** this entry was written after 0.24.0 was
+    published, so the `CHANGELOG.md` at its tag, `v0.24.0`, doesn't have
+    it.
+
+- **Anyone running agent-framework on a Node before 22.12:** agent-framework
+  now declares `engines.node` `>=22.12.0`, where it declared `>=20.0.0`, as
+  membrane 0.6.0 and context-manager 0.18.0, which it now depends on, both
+  do. CI tests at Node 22.12.0 exactly, at 24 and at the newest Node, where it
+  tested 20 and 24, and the publish workflow builds and tests at 22.12.0.
+  npm warns when it installs agent-framework on an older Node, and refuses
+  only with `engine-strict` set. Nothing in agent-framework's code changes
+  with this; older Node versions are simply no longer tested.
+  - **Migration:** run Node 22.12 or later.
+
+- **Hosts and operator surfaces that remove Discord messages from an agent's
+  context:** awareness marks are now an explicit publication choice, and the
+  default is none. Previously every live rollback or suppression,
+  message-granular `host/command` undo, and offline `agent-framework-recover`
+  run queued a 💤 reaction on every removed Discord message, including other
+  people's ambient messages in a busy channel. In the incident behind this
+  change, one web-UI rollback queued 918 of them. The contract is in the
+  README's [Live surgery and Discord awareness marks](README.md#live-surgery-and-discord-awareness-marks).
+  - **Who needs to act:** a surface that should keep offering marks passes the
+    operator's choice: `marks: { scope: 'addressed' | 'all', refs? }` on
+    `rollbackToMessage`/`suppressMessages`, `marks: 'addressed' | 'all'` on
+    a `host/command` `undo` by messages, and `--marks addressed|all` on the
+    CLI. Show `previewSurgeryMarks()` before
+    the choice, and pass a scope's `refs` back to bind the choice to exactly
+    the previewed messages. Any other `marks` value is refused rather than
+    guessed (`invalid`, from the two methods). `hide` and an `undo` by turns
+    place no marks, and refuse a `marks` choice other than `none`. A
+    framework with an app-owned `store` and no `storePath` has no awareness
+    ledger unless `discordAwarenessOutboxPath` names one, and refuses a marks
+    choice (`invalid`) rather than place none.
+  - **Receipts (`markers`):** their `status` is `none`, `queued` or
+    `not-scheduled`. `unresolved` is gone: a batch that can be neither
+    activated nor retired stays prepared, and a start retires it, none of
+    its marks sent, so it is `not-scheduled`, whose `error` says so.
+    Receipts now also carry `scope`, `unmarked` and `notRemoved`.
+  - **Unchanged:** the body change itself (fork, switch, redaction), the
+    emoji (`discordAwarenessEmoji`) and the reaction deadline
+    (`discordAwarenessDeadlineMs`). Marks already on Discord are left
+    alone.
+  - discord-mcpl 0.3.0's `/hide` reacts 💤 to every message in `hiddenRefs`
+    itself, whatever this framework does: those marks are its own, outside
+    the ledger.
+- **Code using `DiscordAwarenessOutbox` directly:** the ledger is version 3,
+  a table with one entry per reaction. The constructor takes the path and,
+  for the sync before a write that activates, completes or retires a batch,
+  the store, with a callback told of a directory a write couldn't sync:
+  `new DiscordAwarenessOutbox(path, { store?, onUnsyncedWrite? })`. Every call that
+  writes is async and resolves once its write is on disk; the views
+  (`view()`, `batches()`, `due()` and `pendingSuppressionsFor()`) read
+  memory. `pending()`,
+  `reconcileForBranch()`, `activatePreparedForBranch()`,
+  `preparedSuppressionsForBranch()`, `recordSuccess()`, `recordFailure()`
+  and `acknowledge()` are gone. Use `claim()` and `recordOutcome()`,
+  `view()`, `cancel()`, `retract()` and `settleActivation()`. `prepare()`
+  takes no `activationPolicy`: a batch that names removal intervals is a
+  suppression, and only its surgery activates it. The exported
+  `DiscordAwarenessEntry` and `DiscordAwarenessOperation` types went with the
+  version 2 shape: a request is `DiscordAwarenessRequest`, a batch
+  `DiscordAwarenessBatch`, and `view()` returns `DiscordAwarenessView`. An
+  operator control the outbox won't carry out throws
+  `DiscordAwarenessRefusal`.
+- **Hosts with an awareness ledger from 0.22.x** (by default
+  `<store>/recovery/discord-awareness-outbox.json`): it is rewritten as
+  version 3 in place by its first write, at a start or an offline recovery,
+  and the marks 0.22.x had still to add or remove are never sent, since
+  nobody chose them. The rewrite names their batches on stderr wherever it
+  runs, and in a `discord-awareness-import-unsent` ops alert at the host's
+  start that makes it, each before the rewrite is written. A batch 0.22.x
+  never activated placed no marks; a retract of a batch takes off the mark
+  of its emoji from each of its messages, whichever batch placed it. A
+  version 1 ledger, which only an unreleased commit wrote, is refused until
+  it is moved away, and its error says what that gives up. 0.22.x reads only
+  versions 1 and 2, and its start stops on a version 3 file: to go back to
+  0.22.x, move the file aside first, and 0.22.x then starts with no marks
+  history.
+- **Hosts that call `startDiscordAwarenessDelivery()`:** 0.22.1 added it
+  for a host to start the marks' delivery after its own branch moves. It is
+  removed: a branch move adds or removes no marks now, and queued work is
+  delivered in the background on its own. `syncDiscordAwarenessMarkers()`
+  delivers what is queued now and waits for that pass. Once `stop()` has
+  begun it rejects, where the removed method logged and returned, so await
+  it, or catch its refusal.
+- **`createOfflineRecoveryBranch` and `agent-framework-recover`:** in the
+  result (and the CLI's JSON output), `discordMarkersQueued` is the marks
+  queued (planned, for a dry run), no longer every addressable removed
+  message, with `markers`, the receipt, beside it, and `discordAddressable`,
+  `marksScope`, `unmarked` and `notRemoved` are new.
+
+- **Operators whose workspace history holds paths written with `//` or a trailing `/`:** every tool now reads a path in one spelling (see Fixed), so an entry an earlier version stored under another spelling, such as `a//b.txt` or `c/`, is outside the mount: no tool lists, counts, syncs or writes it, and since no spelling names it, a `materialize` doesn't report it under `skipped`. A draft written under such a key that hadn't reached disk when the host upgraded stays in history and never reaches disk. To keep it, read it from the store under its old key, on its branch (`treeGet` on the mount's tree state, `workspace/<mount>/tree`, then `getBlob` with the entry's `blobHash`), and write it again under its new spelling. Unchanged: the workspace's history keeps such an entry as it was, and where such a write reached disk, the file is the one its new spelling names, which the next sync of the mount takes in.
+- **Hosts matching the traversal refusal's text, or reading a file by a path with a separator right after the mount's name:** a path that climbs above a mount's root is refused with `Path traversal detected: "<path>" climbs above the root of mount "<mount>".`, where a climb that left the mount was refused with `Path traversal detected: "<path>" resolves outside mount "<mount>"`. A path with a separator straight after the mount's name, such as `work//a.txt`, is refused by every tool and reader, `readFileFromDisk` included, with the code `traversal`, where `readFileFromDisk` read the file before. Give such a path from the mount's root, as `work/a.txt`. Unchanged: a path that leaves the mount by any other way is refused as before.
+
+### Added
+
+- `inference:published` and `inference:published_complete` traces carry the
+  outgoing stream to in-process consumers: each chunk once its publish
+  succeeds, with the `serverId` and `channelId` it was published to, its
+  `inferenceId`, `index` and `text`, and the `messageId` the channel's
+  server returned for that publish, when it returned one; and the
+  `complete` for each server's channel it published to. They are emitted
+  whether or not the channel's server takes the stream, and carry only what
+  delivery published, so a host relay that voices them, such as a TTS
+  bridge, never speaks text that
+  `skip_reply`, a send or a private `think` withheld, or a publish the
+  server didn't confirm. `inference:tokens` is unchanged: it carries the
+  model's text as it is written, held, as before, while a tool-result
+  guard's batch is pending.
+  `mcpl:speech-routed` also reports speech publishes, with no stream id,
+  index or end: among them the `sleep` tool's announcement and a
+  subconscious's `speak_in_channel`. A relay that voices the agent's prose
+  takes the `inference:published` stream, with its
+  `inference:published_complete`, and not `mcpl:speech-routed` as well, and
+  takes each message's id from `inference:published` to edit what it voiced.
+
+- **Delivered-body digests on every stored MCPL inbound item.** Both MCPL
+  lanes stamp two fields, outside the frozen source envelope (console and API
+  input, and the host's own notices, carry neither):
+  - `metadata.sourceBodyDigest` is the version identity of the body as
+    delivered, taken at ingestion, after MCPL conversion and before any host
+    decoration or storage sharding. It is the SHA-256 (hex) of `[blocks]`
+    as canonical JSON (keys sorted at every level, `undefined` object entries
+    dropped, and an `undefined` array element written as `null` as JSON
+    writes it, though the store refuses a body holding one), with the blocks
+    as the store keeps them: inline media as
+    the store hands it back (base64 re-encoded from its bytes, an image's
+    media type taken from its bytes' signature, only `type` and `source`
+    kept), strings well-formed (a lone surrogate as U+FFFD) and an entry
+    whose key isn't well-formed dropped, as the store's append drops it. So
+    the body hashes alike as delivered, as handed to storage and as read
+    back, and an undecorated, unsharded stored copy hashes to it.
+  - `metadata.storedBodyDigest` uses the same function over exactly the
+    blocks handed to storage, decorations included, taken where each path
+    stores.
+
+  Both are always the host's own: values an adapter supplies are replaced.
+  A stored copy, read back with its blobs resolved, that no longer hashes to
+  its `storedBodyDigest` was changed after it arrived (`editMessage` keeps
+  metadata). That check is of an unsharded copy: a body the store shards
+  (context-manager's adaptive ingress chunking) carries the whole body's two
+  digests on every shard (`bodyGroupId` and `shardIndex` mark them), and no
+  shard hashes to them. A `blob_ref` block is digested as given, while the
+  store resolves it on read, so a copy holding one doesn't match; the MCPL
+  lanes never store one. `sourceBodyDigest(blocks)` is exported from the
+  package root as the one implementation consumers share; it carries the
+  framing and the store's normalization, so check a copy with it rather than
+  hashing your own serialization.
+
+- A workspace mount can name the files it holds with `include`, in the same pattern forms as `ignore`, read for files: a name or an extension glob covers a file by its own name, at any depth, and a `dir/**` glob covers what lies beneath that directory, and not a file named like it. Unlike `ignore`, a pattern that matches a directory's name covers nothing beneath it, since each file is covered by its own name: `include: ["gate.json"]` holds every file named `gate.json`, and no other file beneath a directory of that name. Left out, nothing changes. An empty list, an entry that isn't a string, or a pattern the matcher can't read (a path with `/` that isn't a `dir/**` glob, a `*` anywhere but a leading `*.`, an empty, `.` or `..` segment, or a `\` where it's the platform's separator, as on Windows) is refused when the module is created, naming the mount and the pattern. Any other pattern is a file name, matched literally. So connectome-host can give its `_config` mount, which versions the host's config files, an include naming them, and a file saved beside them then stays out of its history and is never written back (connectome-host #278).
+  - **What it guarantees:** no workspace path reads, stores, serves or writes back a file the include leaves out, including one in a nested mount's directory that mount's include leaves out, and no tool lists, matches or names one. A refusal may show that something occupies a path the caller named. On a mount that follows links, it may also say whether that path leads out of the mount or into a nested mount that covers it, with the path to use there. A link the include covers is described as on any mount, its target included unless that's a file the include leaves out. Otherwise, a refusal names nothing the include leaves out beyond the path the caller gave, which it may spell as disk does, and on a mount that doesn't follow links, it tells nothing of where a link the include leaves out leads. A sync's `passedOver` counts what it passed over.
+  - **How it holds:** a walk passes over a file the include doesn't cover, and on a mount that follows links a link it doesn't cover that leads anywhere but to a directory, and counts it under `passedOver` as "outside the mount's include", a change the watcher reports there is dropped before it takes the mount's turn, and `materializeMount` and `materialize` never write one back, even when the workspace's history holds it from before the include (a `materialize` naming a directory inside the mount counts each such entry beneath it under `passedOver`, with that reason and without its path). `read`, `read_image`, `write`, `edit`, `edit_many`, `delete`, `readBinary`, `writeBinary`, `readBinaryFromDisk` and `readFileFromDisk` refuse any path it doesn't cover, a directory's included, saying it's outside the mount's include (`readFileFromDisk`'s code is `outside_include`), and `resolveAbsolutePath` returns null for one; the mount's root is inside. A `sync`, `materialize`, `grep`, `glob` or `ls` that names a path the include doesn't cover takes it as a directory, its scope, exactly where a listing names one: where disk has a directory reached from the mount's root through directories, with no link among them, or the workspace's history holds an entry beneath it that the include covers, and that a nested mount's include covers too where it lies in that mount's directory. A directory `ignore` covers is a scope too when it's named, though a listing passes over it. Each refuses any other path the include doesn't cover. A covered path is a file to a `sync`, `materialize` or `grep` when disk or the workspace's history has a file there, and otherwise a directory, and a `glob` takes its path as a directory. Beneath a directory, each passes over what the include doesn't cover, and a listing shows only covered files, beside each directory disk has beneath its path and each that covered history implies. `ignore` still applies to what `include` covers, and `ls` without a path lists each mount's include.
+  - **Nested mounts:** a path in a nested mount's directory is that mount's, whatever this mount's include covers: every tool names the mount holding it and the path to use there, as on a mount without an include. Through a link this mount follows, a place in that directory is named only where it's a directory, or a file that mount's include covers with no file on its way; otherwise no answer names that mount or the place, and the file tools and `readFileFromDisk` refuse the path as one that leaves the mount (`Symlink escape detected: <path>`, code `escape`). A walk through a link to a directory above a nested mount's directory passes over that directory too.
+  - **Links:** on a mount that follows links, a path is judged where it lands as well as where it's named, as disk spells it there: a covered path that reaches a file the include leaves out, through a link at the path or on its way, is refused as one that leaves the mount, in the words a place a nested mount's include leaves out gets. The file tools refuse it before anything is stored, and they and `readFileFromDisk` answer `Symlink escape detected: <path>`, code `escape`. A listing from where a link leads passes over such a file, and nothing a materialize writes through that path reaches disk, a file it would create included. So with `include: ["docs/**"]`, where `docs` is a link to `site/docs`, the mount holds nothing beneath `docs/` unless the include names `site/docs/**` too. A covered path whose landing realpath can't resolve, as for a loop or a directory this process can't search, is refused by every file tool, a delete included, and by `readFileFromDisk` (`Unable to resolve file: <path>`, code `not_found`), since where it lands can't be judged. A link the include doesn't cover that leads to a directory is passed over with the reason a mount without an include gives a link, "a symlink, not walked", since a name or an extension glob can cover what lies beneath it and what's read through it is judged by its path and where it lands, and history beneath it is unverified for that reason. On a mount that doesn't follow links, every link the include doesn't cover gets that reason, since nothing reads through one there, and such a mount resolves none to tell where it leads. On a mount that doesn't follow links, a link's refusal names an inside target only where the include covers the link and a tool could name the target: a directory, or a file the include of the mount it lies in covers. Only a refusal that names a nested mount has the code `other_mount`, so a link at the path to a file there that mount's include leaves out keeps `symlink`. A link the include doesn't cover is outside the mount itself, and its refusal names nothing of where it leads, with the code `parent_symlink` on a path's way.
+  - **Disks that fold names:** a path is judged as disk spells it, as the walk judges what it lists, so a covered name whose file disk spells otherwise, such as `gate.json` where disk has `GATE.JSON`, is outside the mount, and its refusal shows the path as given. A path that names one of the workspace's entries exactly, or does once its directories take disk's spelling, keeps the entry's spelling, and what lies past a link on a path's way keeps the spelling given. Otherwise answers name a path in disk's spelling, a name the include leaves out included. Where a followed path lands is judged as disk spells it, and a path that meets no link as named, and a link's target is judged and named as disk spells it. `resolveAbsolutePath`, which is synchronous, judges the include on the path as given and follows no link: it returns the path that reaches such a file, and null for a covered file named in another case. It takes a path into a nested mount's directory in any spelling a disk that folds names may fold to it as that mount's, and gives null for it, so on a disk that tells names apart, a directory of the outer mount's own spelled like a nested one in another case gets null too.
+  - **Where a nested mount is found:** its root is placed where disk has it at each start, and its directory is matched by spelling, so four cases fall outside the guarantee, as for any nested mount: on a disk that folds names, a mount configured through a link that spells a directory otherwise than disk does isn't found nested, and the outer mount holds its files as its own; on such a disk, a path through a link of the outer mount that spells a nested mount's directory otherwise than that mount's configured path does, whether the link or the configured path is the one spelled otherwise than disk, isn't found to lead there, and the outer mount reads, lists, searches and writes there as its own, creating files too, though a walk from its root passes over the directory; on such a disk, a place in a nested mount's directory that a link does lead to is judged by that mount's include, and named, in the spelling the link's target gives, so a refusal can name a file disk spells outside that include, or leave a covered one unnamed; and a nested mount whose root moves while running, as `acceptRoot` takes, stays placed where it was until the next start.
+  - **Registered text:** text a host registers for a path with `registerGeneratedTextFile` is served there whatever the include says: every spelling that resolves to its path reads it, and none writes it. On a disk that folds names, a spelling in another case isn't its path, and reaches whatever file disk has there.
+  - History from before the include stays as it was: no pass decides an entry outside it, a `materialize` of the whole mount leaves a deletion or conflict held outside it alone (one that names a directory inside the mount counts those beneath it under `passedOver`), the mount's `status` counts only what's inside, and a listing shows no directory that only such history holds.
+  - The framework keeps its own files (`tool-results/`, `refs/`) in the first read-write mount without an include, and a setup whose only writable mount has one is treated as having none. The over-cap notice and the host's log line for a fetched reference it can't store say there is no writable mount without an include. What it kept in a mount before the mount had an include is outside the mount once it has one, unless the include covers it, so a `read` of a path an earlier spill note or reference gave is refused.
+
+- `ChannelRegistry.publishForAgent`'s failure carries a `reason` when the
+  destination refused it before anything went out: `channel-not-registered`,
+  `inbound-only`, `server-gone`, `server-connecting`, `server-down` or
+  `not-permitted`, the state its words come from, or `not-sent`, where its
+  connection refused the request before anything was written. The type is
+  exported as `PublishRefusalReason`. A host that matched the words these
+  refusals had before this release, such as `Channel not found` or
+  `Server not found`, reads `reason` instead. A refusal of the caller's own
+  input, and a publish that went out, carry none.
+
+- Operator controls for awareness marks, described in the README's
+  [Live surgery and Discord awareness marks](README.md#live-surgery-and-discord-awareness-marks):
+  - `previewSurgeryMarks(agent, { rollbackTo } | { suppress })` shows what a
+    surgery would remove and which messages each scope would mark, per
+    channel.
+  - `listDiscordAwareness()` lists the ledger's batches and retract
+    requests, each with its reactions counted by state.
+  - `cancelDiscordAwareness(batch | retractRequest)` stops a batch's marks,
+    or a retract's removals, from being sent or sent again, and never removes
+    or undoes anything.
+  - `retractDiscordAwareness(batch | 'all')` queues removal of this bot's
+    reaction, through each message's configured MCPL route, for every
+    selected message, whatever was answered before.
+
+  Cancel and retract resolve with their receipts once the ledger holds what
+  they did. The same controls are the `host/command` `marks` verb
+  (`action: list | cancel | retract`, `target`). Each control that changes
+  the ledger is recorded in the operator log, and refuses once `stop()` has
+  begun, like every operator entry point.
+
+- **Module authors:** a tool call now carries `resultMaxChars`: how long its result may be and still reach its caller whole, measured as the framework stores it (an error's text, or a success's `data` as JSON, with a content array taken as its text). A tool that pages or budgets its answer can stay under it.
+  - A model's call carries the agent's effective inline cap: its `tool_result_inline_max_chars` setting, else the residence's `toolResultInlineMaxChars`, else the default 24,000, lowered to the strategy's per-message bound. Past it, the framework writes the result to a workspace file and stores its start, or only its start where no file can be written. A utility run through `utils` carries the same, and so does an operator's puppet call, a utility run through it included.
+  - A call from a running `code_execution` script carries the longest result that reaches the script whole whatever its characters, from the script's memory. The script takes an answer of up to a third of its `memoryMaxBytes`, and a character of a result takes at most six bytes there, a control character escaped as `\u0000`. So the figure is that third, less the 80 bytes of a text answer's envelope, over six: 7,456,527 characters at the default 128 MiB, moving with the setting. On Node, past about 1.5 GiB, the host's longest string bounds it instead. A result with a `structured` value reaches the script as its content's blocks as they are, beside that value as JSON, and the figure counts neither the value nor what the blocks carry past their text, such as each further block's keys or an image's data, so a tool that returns one leaves room for them. A result nested deeper than 2,000 levels, or whose parse needs more of the script's memory than is free, doesn't reach the script whatever its length. A result that doesn't reach it is answered `ResultTooLarge`, saying the call took effect. Nothing is cut or saved to a file. A utility the script runs through `utils` carries the same figure.
+  - A call made in process (`ModuleContext.callTool`, `executeToolCall`) carries what its caller put on it, and a utility it runs through `utils` carries what that call carried. Without it, a module holds its answer to a bound of its own, if any.
+  - The module registry now passes every field of a call on to the module, `resultMaxChars` included. It used to pass `id`, `name`, `input`, `callerAgentName` and `callerTurnId` alone.
+
+- **`ToolResult.refused`:** `true` when the dispatcher refused the call before it opened, as RFC-007's lifecycle refuses one, so nothing ran and the call certainly had no effect: the agent may not use the tool (its `allowedTools`), a `skip_reply` wake was refused, the call's MCPL server is absent or still connecting, the host's policy for that server denies the tool, or a fork reached outside its channel. The lifecycle refuses the call from the same place, so observers see no events for it. A check made after the call opened is a failure whose text says nothing was done, and a module's result can't claim `refused`. A script's call refused so reaches the script as an `Error`, any other failure as a result with `isError`.
+
+- **A direct workspace mount, for a checkout an agent reads:** a mount whose config sets `backend: 'direct'` (the default is `'chronicle'`, the store-backed kind every mount has been) is read straight from disk. `read`, `read_image`, `ls`, `glob` and `grep` give its files as they are when they run, with no scan, watcher or pass, so no call waits behind one, and none of its files go into the store. It's read-only: the workspace refuses a direct mount with any `mode` but `'read-only'`, and one that sets `watch` other than `'never'`, `watchDebounceMs`, `watchRootPollMs`, a `wakeOnChange` that would wake, or `autoMaterialize: true`, since none of them would ever act there. Its paths, links, `include`, other mounts' directories, size limit and walk cap hold as on a store-backed mount. Where it differs:
+  - **What its listings say:** each file with its `size`, and no state or MIME type, or, for a link the mount doesn't follow or another entry it doesn't take, with why as `note`. A listing looks at each entry with `lstat`, so it lists a file it can't open with its size, and reading that file says why. `grep`'s results say `version: 'disk'`, and it lists under `skipped` a binary file, one over the size limit and one it doesn't read, each with why. `read` refuses a binary file and one over the size limit, as a store-backed mount's `read` refuses one it never took in from disk.
+  - **Its ignore list:** with none in its config, it takes `node_modules`, `dist`, `.git`, `build`, `coverage`, `target`, `__pycache__` and `.venv`. Walks of the whole mount pass over what the list covers, and a path a listing, glob or grep names, or its pattern's directory, is walked all the same, as a sync naming a path walks it on a store-backed mount. `ls` without a path, and `status`, give a mount configured direct its `backend`, as it runs this session, and the list it goes by. A direct mount's `status` gives only its `path`, `mode`, `backend` and `ignore`, since it keeps nothing to count.
+  - **Its root:** it reads beneath whatever directory is at its path now, with no check against the one a store-backed run of it last agreed with. Where its root now lies elsewhere than the last start placed it, as when a link it's configured through is repointed, it nests what a start would nest there now: a mount configured beneath its path, where that path leads, and a mount whose root the last start placed beneath where its root lies now, or whose configured path lies beneath a directory that start found there. Their files are those mounts'. A mount configured elsewhere whose own root has moved since, and the other mounts' own placements, wait for the next start, so a direct root moved into another mount's directory is still that mount's directory too.
+  - **`sync`:** passes over it, listing it under `skipped`. `materialize` passes over it too, naming it under `skipped`, as it does any read-only mount.
+  - **A mount the store holds changes on that disk lacks** (a draft, a workspace deletion, a conflict, or an intent it can't read, on the branch selected at a start, where its `include` covers it) runs store-backed from that start, so they stay in view. It runs unwatched, and with the direct default ignore list where its config names none. The workspace says so on stderr and in one ops alert (`workspace-mount-not-direct`). The alert first gives the two ways to start such a mount direct: give each change up with a sync of its path, or configure the mount `'chronicle'` and read-write, materialize it, follow materialize's answer, and restore its direct config; its next start then runs it direct. Where an intent it can't read is held, it says to sync that path. Then it names every such mount and what's held there, counting an intent it can't read as one. A mount that ran direct and runs store-backed again takes in what disk changed meanwhile as its listings, searches and syncs reach it, as an unwatched store-backed mount does.
+  - **Tool descriptions:** `ls`, `glob`, `grep` and `sync` gain a sentence about the direct kind only on a host with a mount that runs direct; elsewhere they're unchanged.
+
+- The workspace has an `edit_many` tool: several exact edits, in one file or across files of one mount, stored all or none. Each edit gives `path`, `oldString`, `newString` and `occurrences`, how many times `oldString` must occur (1 when left out), and every occurrence is replaced. Each edit is matched in its file as the call reads it, never in another edit's result, so the list's order doesn't matter, and two edits' matches may touch but not overlap. Matching is `edit`'s. Its input is checked item by item, as every workspace tool's input is checked.
+  - Any problem stores none of the call's edits. The refusal names every problem it finds, in edit order, each by its edit's number from 1, a run of three or more as a range: a miss with its closest region, from one search of 2,097,152 UTF-16 code units that the call's misses share, a count that differs with the lines that matched, an old text read more than one way (by the rule `edit` refuses one by), edits whose matches overlap, an edit's own refused input, a path no mount holds, a path that names its mount's root (by the rule `edit` refuses one by), a read-only mount, a generated file (by the rule `edit` refuses one by), a file it can't edit, and edits naming files in more than one mount.
+  - Two or more edits of one file that ask, past the 20 occurrences a refusal shows, for more occurrences between them than its text is long, in UTF-16 code units with its line ends read as LF, can't all apply, since each occurrence takes one or more. They don't keep each occurrence's place: when each finds what it asks for, or stops counting short of it (below), the refusal says they ask for more occurrences between them than the text is long, so some of their matches would overlap. When one of them finds a different number than it asks for, the refusal names that, and names the overlap only where the rest still ask for more occurrences than the text is long; where they don't, it names each that stopped counting short of its ask by its count, as a floor.
+  - A call counts the occurrences no answer needs, past what an edit asks for and the one more that shows it finds more, only as many as the larger of its mount's limit and its largest file, in bytes, all of its edits together, so that many edits of a text with millions of occurrences don't each count them all. Past that, an edit's count is a floor, and its refusal says so, and that sent in a call of its own the edit has every one counted, unless they overlap.
+  - Edits naming files in more than one mount are refused at once. Otherwise every path is first settled with disk, in one pass, as `edit` settles its one, and a refusal says what that pass took in. Then every file is read and planned, and every entry set in one record of the store, with nothing awaited between, so no other call, pass or branch change moves the tree between a file's read and its set. A call that fails before its entries are set answers that it stored none of its edits. A store that throws as it sets them is read back, since it can throw once the record is in, as Chronicle 0.4 does when the snapshot it writes after a record fails: where the entries hold the edits, the answer says every edit is stored and that the store failed after recording them, and on a mount with `autoMaterialize`, that their push to disk didn't run, so disk lacks them until a materialize of their files writes them, and on a mount without it, it names each conflict with disk, as its success does; where they don't, it says it stored none. Where the entries can't be read back either, it says it can't tell, and to read the files before sending the call again. A call whose every file already held what its edits leave, such as edits matched with quotes treated as equal that change no byte, gets the store's error, as a failure before the set does, since reading the files back can't show whether the store recorded the call.
+  - On a mount with `autoMaterialize`, disk can still refuse a file once every edit is stored. The answer then leads with the fact that every edit is stored, so the call mustn't be sent again, and names each file disk refused, with its push's reason, and each file disk took with its mode left as disk had it, as `modeKept` says in a success. A call that fails after its entries are set says so too.
+  - The answer gives each file's `size`, `replacements`, `edits` and `note`, and `modeKept` where its push left the file's mode as disk had it, as `edit`'s answer gives it, and `changed`, each edit's first changed region, numbered, a line over 2,000 characters as a stretch from at most 80 characters before each change on it. Every answer is held to the call's `resultMaxChars`, or with none to 24,000 characters: past it, regions are named by their lines, a file is listed without its notes or edits' numbers and then counted rather than listed, a refusal names its problems before it explains any, and its last line counts what it left out. From 1,000 characters, the least a residence or an agent can set, a refusal names at least its first problem. Below that, which a strategy's per-message bound can set, a refusal may name no problem, and its last line then asks nothing of the agent; an answer is never shorter than its head and last line.
+
+- A WebSocket MCPL server takes `tokenTransport: 'header'`, which sends its
+  credential, the static `token` or what its `accessProvider` returns for
+  each dial, as an `Authorization: Bearer` header on the upgrade, with no
+  `token` query parameter. The credential then stays out of the url and of
+  the proxy and server access logs that record it. The default,
+  `tokenTransport: 'query'`, dials exactly as before, and `null` counts as
+  not set. A header carries a credential as configured only if it is
+  printable ASCII (U+0020 to U+007E) with no space at either end, so header
+  mode refuses any other, without quoting it: a static `token` as a
+  configuration error, and an access provider's at the dial. Also refused as
+  configuration errors (`serverConfigProblems`): a value other than
+  `'query'` or `'header'`, named by its kind and never quoted,
+  `tokenTransport` on an http(s):// or stdio server, and `'header'` with a
+  url that carries a `token` query parameter or userinfo of its own
+  (whenever the Bearer header carries a credential, it replaces the
+  userinfo's Basic one). A WebSocket dial refuses the first and the last
+  of these again, so a dial that skipped the configuration check can't
+  fall back to the query.
+  In header mode a dial puts nothing in the url's query, so the 0.23.0 note
+  on redacting the query a WebSocket dial writes applies only to query mode.
+
+### Changed
+
+- **Hosts that read the `channelId` of `inference:tokens` or
+  `inference:content_block` traces:** in `locus` and `hybrid` mode it now
+  follows the turn's locus. It was documented as "the turn's locus as the
+  stream started", so after an addressed re-pin, or the agent's own
+  `channel_open`, moved the locus between rounds, it kept naming the old
+  channel for the rest of the stream. It now names the new locus from the
+  next round on: from the model's first content in that round, or from its
+  retry after a refusal. It is still the channel the stream shows typing in,
+  and in `hybrid` mode still the locus whether or not a `>>>` envelope sends
+  the text elsewhere.
+  - **Migration:** a consumer that keeps the first `channelId` it sees for an
+    activation, as a voice relay may, works as before, and stays on the old
+    channel after a re-pin; to follow the move, read each trace's
+    `channelId`. A consumer that groups one stream's chunks by `channelId`
+    now finds a stream whose locus moved under two channels.
+  - **Unchanged:** `explicit` mode's traces, which name the trigger channel,
+    and the live outgoing stream (`channels/outgoing/chunk` and `complete`).
+
+- What the channel tools and speech tell an agent when they can't do what it asked now says what happened, whether anything took effect, and what works from there, or that calling again won't change it. They gave the registry's own words, such as `channels.lifecycle not in "<server>"'s effective grant (§14.1)`, `Server not found: <server>`, `Channel not found: <id>`, `lifecycle work prevented delivery: …` or `channel is closed and open failed: …`.
+  - **A server's state is read before its grant is quoted.** By our reading, a connection's grant is empty from a transport drop until its next policy exchange ends, and that emptiness read as a refusal. Now a server this host is reconnecting to, is connecting to, or won't reconnect to on its own says so, with when to try again or whom to ask. Only a connected server whose exchange has ended, granted or not, is read by its grant: one without what was asked reads "this host isn't permitted to …", with "if you need it, ask whoever runs this host". The grant still decides every refusal, as before, and the state only words it. `ChannelRegistryOptions.serverConnecting`, new and optional, says when the host is connecting to a server. The framework's callback reads a connect or restart of the id in flight, and a connected registered connection's policy exchange in flight.
+  - **`channel_open` and `channel_close`** say that a change the server couldn't take now is recorded and when it happens, that a later decision came first and what changes it, that the change already holds, or what the request met and whether calling again helps. A promise of a later change names its conditions: the server registers the channel again, and this host may open and close its channels then. A backscroll's history isn't among what happens then, and the text says so. A channel no longer registered here says so, with why it went where the failure says (this host's disconnect or the server's de-listing), or else the server's state where it isn't up, and a request's own words where it failed with them, and names no channel tool, since none can find it. A change a later decision replaced, or one refused for the grant, says that this call's change doesn't stand or didn't go through, not what the channel's transport is, which other work may hold. A channel id on another server, or on several, names them.
+  - **`channel_decline`** says the decline is recorded, whatever became of its acknowledgment and its close, and a later decision that replaced it: an open, or a tune-out. It offers posting the acknowledgment again only where another decline would be taken, and only where nothing could have been posted: where the request may have reached the server with no answer saying it wasn't posted (no answer, an error answer, or one that didn't say), the text says declining again with it could post it twice. Only `acknowledged: true` counts as posted, and only `false` as not posted.
+  - **A decision the lifecycle log refuses to append,** as on a full disk, gets an answer from `channel_close` and `channel_decline`, as from `channel_open`: nothing changed and nothing was sent. They rejected with the store's error. By our reading, a host watching tool calls through RFC-007 now gets `completed` with `isError` as their terminal, where it got `failed`. A decline's record of the invitation it declined, written once the decline has taken effect, no longer fails it when the log refuses it; the `[channel-decline]` log line says so, and, by the same reading, the call's RFC-007 terminal on that path is `completed`, where it was `failed`.
+  - **`channel_publish`**, and the subconscious's `speak_in_channel`, frame a refusal as `Nothing was posted to channel "<id>": <reason>.` and an unconfirmed post as `Posting to channel "<id>" wasn't confirmed: …`, where they read `Publish to <id> failed: <reason>. Nothing was posted.` and `Publish to <id> wasn't confirmed: …`. A refusal for the server's state or grant reads as speech's does. `speak_in_channel`'s point to the tuned-out channels the subconscious reads, since it isn't offered `channel_list`. `channel_publish` refuses an empty `channelId` as empty, where it said there was no channel to default to.
+  - **A delivery's reason** (`PublishOutcome.reason`) is one clause that reads in each text that composes it (the `[discord-send-failed]` notice, the drafts tool's lines, a `>>` bounce, `channel_publish`'s frame), and in the `[routeSpeech]` log line and the `mcpl:speech-route-failed` trace. Words that waited for a channel's lifecycle work say what the wait found: the channel was removed before they went out, a decision to close it came before they went out, or it isn't confirmed open. Words checked against a connection the registry replaced while they waited say so where the replacement would take them, and otherwise describe the replacement as it stands. Speech whose channel id is on more than one server says no server was named for the words, and whom to ask. The two reasons for speech with no channel to go to say whom to ask, and keep their words in the log line and the trace, where, by our reading, connectome-host's `connectome-doctor` looks for "no locus".
+  - **A host that composes a channel tool's error into its own text,** as, by our reading, connectome-host's channel mode does, now carries these sentences.
+
+- The notices that tell an agent a channel was opened for it now say what happens next, how servers differ in what an open channel brings, and what won't reopen a channel the agent closed.
+  - **A subscription policy's notice** reads "The host opens it, and if that fails, tries again when its server next registers it; channel_list shows whether it's open yet." It read "This records the admission decision; channel_list shows current transport state." For several channels it reads "The host opens them, and if one doesn't open, tries again when its server next registers it; channel_list shows whether each is open yet."
+  - **Where the agent's window holds the channel's traffic,** a notice reads "What an open channel brings you is up to its server: some send every message in it, and others only what addresses you unless you're subscribed to it; their own tools can change that." It read "What an open channel delivers to you depends on its server."
+  - **Where the agent can close the channel,** a notice reads "If you don't want it, use channel_close: neither the subscription policy nor its server's own default opens it again." It read "use channel_close; your choice outranks policy."
+
+- `channel_decline`'s `status` says what the decline found, where it said `remained closed` every time: `remained closed` where the channel is closed for certain (registered, not open, its target confirmed, and no lifecycle work for it outstanding), `declined` where the decline stands but the channel may not be closed (its close didn't complete, this host never confirmed it closed, work for it is outstanding, or its registration went), or `replaced` where a later decision, an open or a tune-out, replaced it. Every status but `remained closed` comes with a `closeError` sentence saying what became of the channel and what follows: when this host closes it, that there's no need to decline again to close it, `channel_close` where that would close it now, or whom to ask. `replaced`'s names `channel_close` as the call that closes the channel after all, whoever runs this host where this host isn't permitted to open or close the server's channels, or, where the channel isn't registered any more, that no channel tool can reach it. A decline in a channel whose traffic showed it open while the decline's acknowledgment was out now closes it, where this host directs the server's channels by then. For a channel registered, or known only from a push, while its server lacked `channels.lifecycle`, a decline made before the server gains it now answers `declined` with a `closeError`, where it answered `remained closed` with none; while the server is up, that sentence says the server keeps the channel open or closed as it chooses, and whom to ask.
+
+- **MCPL servers that take the outgoing stream (`channels.streaming`):**
+  chunks now arrive once each publish succeeds, one per published
+  message, rather than token by token while the model writes. A round
+  reaches a voice server once the model has finished writing it, its
+  routing is decided and its publish succeeds, after any earlier post
+  of the agent's still in flight. A later message to the same channel
+  within one stream opens with a paragraph break (`\n\n`), so the
+  channel's chunks joined in `index` order are its text, which `complete`
+  carries, with its messages kept apart. A server that read chunks as a
+  sign the agent is composing, such as eidoverse-worlds' typing dots, now
+  sees them only as a reply is published; `channels/typing`, which the
+  host sends to a server granted `channels.typing` while a turn runs on
+  one of its channels, is that signal.
+- Agents with `toolWrapperProseGuard` now stream their delivered prose. The
+  stream was off for them because it ran ahead of the guard's
+  classification; it now carries only prose that delivery published, and a
+  wrapper the guard contains is never published. Wrapper-shaped text the
+  guard doesn't match, as in a turn that has made a real tool call, was
+  already posted as ordinary prose, and now streams too.
+
+- Awareness marks are one-shot. Switching branches, a turn undo, a redo and
+  restarts no longer request marks or removals of their own; previously a
+  mark followed the branch, removed when the source branch became active and
+  re-added when the recovery branch did. Nothing more is sent for a mark
+  after three unconfirmed attempts at it, or after a refusal no retry can
+  change, and giving up raises a `discord-awareness-delivery` ops alert. The
+  README's
+  [Live surgery and Discord awareness marks](README.md#live-surgery-and-discord-awareness-marks)
+  describes the ledger, its receipts and how acts are ordered.
+- A start never activates a surgery's marks. A batch an interrupted surgery
+  left is retired at the next start, none of its marks sent; one that had
+  marks to apply raises a `discord-awareness-not-scheduled` ops alert that
+  names the surgery and the redo that applies them. An interrupted
+  suppression's removals are still finished, at the first start on its
+  branch. Each of these notices comes before the start records what it
+  reports, so a start that doesn't get that record written gives the notice
+  again at the next start.
+- A ledger write that certifies a body change (a marks activation, a
+  completed suppression or a retired batch) now syncs the store first.
+  Previously a crash could keep marks active for a rollback the store had
+  lost. Every ledger write is now durable too: the file is synced before it
+  replaces the ledger, and its directory and that directory's parent after,
+  as the framework's recovery files are. Previously an operating system
+  crash or a power failure could lose a write the host had already acted
+  on. A directory that can't be synced raises the `recovery-sync` ops alert,
+  and the write stands. Writes leave the event loop free while the disk
+  works: only serializing the ledger runs on it.
+- Awareness delivery no longer holds MCPL traffic. Previously every MCPL
+  data plane waited at startup, at reconnect, at a runtime
+  `connectMcplServer` or `restartMcplServer`, at a tools list change, at
+  `resume()`, after each surgery and in `syncDiscordAwarenessMarkers()`
+  until every queued mark had been attempted, which at Discord's pace could
+  leave the resident deaf for minutes. When that accounting failed, a
+  runtime connect or restart failed, and every running server was recycled,
+  one without `reconnect: true` closing for good, except while the host was
+  stopping. Delivery now runs in the background, and a route that is not
+  connected keeps its work queued until it connects. Nothing but startup's
+  staged open and `resume()` now opens every MCPL connection's planes, and
+  a connection whose §5.3 policy exchange is in flight still stays closed
+  through both until its grant exists. The marks a drain
+  hadn't sent when `stop()` began stay queued in the awareness ledger, and
+  the next start delivers them in the background. A ledger that cannot
+  be read still stops startup, as does one in a version this build doesn't
+  read: it can hold a suppression whose removals a start must finish before
+  the agent's context is served. A runtime connect or restart is refused
+  over a ledger that can't be read only for a stdio server with no reaction
+  baseline of its own, whose default is derived from the ledger.
+
+- The workspace's `edit` matches and replaces through a planner ported from hands-mcp's, and says more when it can't apply:
+  - A miss shows the stretch of the file most like the first line of `oldString` with two or more characters, at most its first 2,000 characters, as many as the stretch shows of a line, numbered as `read` numbers lines, and says to match exactly. A file over 2,097,152 UTF-16 code units gets no such region, and the refusal says to find the text with `grep`.
+  - A count other than one, without `replaceAll`, names the lines of up to 20 occurrences, each line once, and shows each of those lines, a long one as an excerpt around its match.
+  - Occurrences that overlap one another each count, so "aa" occurs twice in "aaa", and can't each be replaced: an edit whose occurrences overlap is refused, with `replaceAll` too. Since it's refused whatever their number, overlapping occurrences are counted only until the refusal has the 20 it shows, and it says "at least".
+  - An `oldString` with LF line ends matches a file's CRLF ones, and the new text takes, by position, the line ends of the text it replaces. A BOM, a lone CR and every byte outside the replaced text stay as they were. A line whose own text ends in a CR shows its CRLF end's CR too wherever `edit` or `edit_many` shows the line, as `read` shows such a line, since a CR before a line feed in `oldString` is read as part of the line end; so lines copied across it match where they came from. A receipt tells a line's own CRs from its line end's by the bytes the edit stores, so a CR the edit puts before a bare LF, which disk then holds as a CRLF end, shows as that end. Before, an LF `oldString` missed in a CRLF file, and a CRLF one could mix the file's line ends.
+  - An `oldString` that starts with the file's BOM or ends with a line's CR, as a character page shows them, is also read without the one, the other or both: without the BOM only at the file's start, and without the CR only before a CRLF line end. A BOM or CR at the same end of `newString` is read the same way, so the file keeps its one BOM and its line end. Where one reading finds it, that one is taken, and the answer says so where it isn't as given. Where more than one does, the edit is refused, naming the lines of each, since which the edit means can't be told: a line whose own text ends in one CR, shown with its end's CR, reads as given as a line whose own text ends in two. So is an `oldString` that is the BOM or a CR alone, found as given, where it could be the file's BOM or a CRLF line end's CR. A reading in which the edit changes nothing counts as much as any, since a copy of a line end's CR or the BOM may mean the file's own, which an edit can't change, and the refusal says where it changes nothing. A `replaceAll` counts neither such reading, since edits keep line ends and the BOM: it replaces the occurrences that change. An edit whose only change, read this way, is the BOM or CR is refused as one with nothing to change. Before, such an `oldString` matched the file's raw text, BOM and CRs included.
+  - When `oldString` isn't in the file in any of these readings, straight and curly quotes are matched as equal, and the answer says so.
+  - `oldString` and `newString` that are the same, once CRLF line ends are read as LF, are refused before anything is read. Where they differ only in their line ends, the refusal says that an edit keeps the file's line ends and that `write` replaces the whole file, line ends included. Before, such an edit changed the line ends of the text it replaced.
+  - An edit that would take a file past its mount's `maxFileSize` is refused, as `write` refuses content past it, and the refusal says the edit must leave the file within the limit. One that its counts take past the limit, such as a `replaceAll` that lengthens or widens millions of occurrences, is refused before its new text is built, from the least its bytes can be, and the refusal says the file would be at least that many bytes. Before, such an edit was built whole, and one past V8's longest string was refused with "Invalid string length".
+  - A path that names the mount's root, such as `work/.`, is refused as not a file. Before, `edit` took such a path as written.
+  - A miss or a count that differs is refused with "The edit did nothing:", where it said "String not found in …" or "String found N times in …". What the edit's settling with disk took in follows the problem after a blank line, where it followed on the same line.
+- A successful `edit` answers with `replacements` and `changed` beside `path` and `size`: the changed region with two lines on each side, numbered as `read` numbers lines, a line over 2,000 characters from at most 80 characters before the change on it. Its `note` also says, where they apply, that the file's CRLF or mixed line ends were kept, that the text matched with quotes treated as equal or without the BOM or a line end's CR it carried, and on which lines `replaceAll`'s other replacements are.
+- A `write`, `edit` or `delete` whose store throws after recording the change, as Chronicle 0.4 does when the snapshot it writes after a record fails, answers that the change is stored and mustn't be sent again, and that the store failed after recording it, with its error. On a mount with `autoMaterialize` it says the push to disk didn't run, and that a materialize of the path takes the change there (with `applyDeletions` for a deletion). On a mount without it, `edit` names a conflict with disk, as its success does. Before, it answered with the store's error alone, as a call whose every change the tree already holds still does, such as a `write` of the bytes its path holds, since reading the path back can't show whether the store recorded it. Where the change can't be read back either, `edit` says whether it's stored isn't known, and to read the file before sending the edit again. `writeBinary` gives its peer callers the same words with `inChronicle: true`, where it threw the store's error, so `save_recent_image` lists such an image as saved, with them as its `diskCopyError`.
+- A call that would change an agent's own generated file, such as a `write`, `edit` or `delete`, is refused with the tools that change what the file shows, `set_tool_visibility` and `set_tool_description`, where the refusal said to edit the presentation configuration.
+- `edit`'s note on a conflict says what a sync of the path does, from what disk holds at the call, whatever kind the conflict was recorded as: where disk no longer has the file, a sync takes disk's deletion, which removes the workspace's copy; where disk has one, a sync keeps disk's copy and gives up the workspace's. Either way, it says, a forced materialize writes the workspace's copy to disk.
+- `edit`'s description and its parameters' descriptions changed, and the workspace has a new tool, `edit_many`, so the first request after the upgrade that carries the workspace's tools misses the prompt cache from its tool block on.
+- `edit`'s refusal and receipt are held to the call's `resultMaxChars`, or with none to 24,000 characters, so that a closest region or a long receipt doesn't push them past what reaches the agent whole: past it, a refusal's problem keeps its first line, and the receipt names a region by its lines rather than showing it. A receipt whose path and notes alone pass the cap keeps them and shows no region. A refusal is never longer than the cap unless its head and its last line alone are.
+
+### Fixed
+
+- A deferred push's render that's still unread now stays where it was
+  placed when a later render or notice of the same subject arrives, as
+  RFC-006 §5.2 and §3.3 have it: each render describes what changed since
+  the one before, so the later render lands after it. A retraction removes
+  the subject's unread renders, newest first, and a plain occurrence
+  displaces them. A later render used to take the subject's place, so a
+  retraction withdrew only that one and left the earlier render queued
+  (#548), and a notice arriving after a render had landed unread removed
+  it, so the model never read what it described.
+
+- A maintenance call agent-framework withdraws, under a surgery's hold or
+  once `stop()` has begun, no longer counts against a chunk's compression
+  (#549). `MaintenanceWithdrawnError` now extends context-manager's
+  `CompressionWithdrawn`, so context-manager rethrows it unchanged from every
+  rung of its compression fallback ladder and its merge path, recording no
+  outcome, attempt or quarantine event. Before, a call withdrawn after a
+  chunk's canonical call was refused was recorded as that rung's provider
+  error, and once every rung had failed, the chunk's request family was
+  quarantined, with its alert.
+
+- The workspace's `delete` writes the deletion's tombstone before it removes
+  the file's entry, and puts the tombstone back if the removal doesn't land
+  (#553). A store that failed between the two had left the entry gone with
+  no tombstone, so the deletion read as a file the branch doesn't have: no
+  materialize deleted the disk copy, and a second `delete` found nothing to
+  delete. Now a deletion whose tombstone can't be written is refused before
+  anything is removed, and can be sent again. A tombstone beside an entry
+  that's still there is no longer counted by `status` as a pending deletion,
+  or a reason for a bare `materialize` to take its path up, which forced
+  could write the entry over a newer disk copy.
+
+- After an addressed re-pin, or the agent's own `channel_open`, moves a
+  `locus` or `hybrid` turn's locus between rounds, the `inference:tokens` and
+  `inference:content_block` traces now name the new locus, and the typing
+  indicator moves there, from the next round on (#555). Before, both stayed
+  on the channel the stream started in for the rest of the stream, while the
+  round's prose was delivered to the new locus, and after a budget restart
+  or a guard retry the old channel's indicator kept running beside the new
+  one until the turn ended. Both name the conversation the turn is
+  attending: in `hybrid` mode they follow the locus whether or not a `>>>`
+  envelope sends the text elsewhere. An `explicit` turn's typing and traces
+  still show its trigger channel.
+
+- When an MCPL server's connection closes, its channels no longer read as
+  open, or as confirmed closed, on the connection that follows (#644). The
+  closed transport's confirmations held for that transport only, but they
+  stayed: between a reconnect and the server's next registration,
+  `channel_open` answered "already open" and asked the server nothing, and
+  `channel_close` answered "already closed". Now each channel reads as a
+  freshly registered one does until it's confirmed again: it's left out of
+  the open-channel list, and an addressed message there arrives as the
+  invitation a closed channel's does. While the server is down,
+  `channel_open` and `channel_close` say so and record the decision. Once
+  it's back, where this host opens and closes the server's channels (its
+  `channels.lifecycle` grant), they ask the server, and delivery opens the
+  channel before it publishes. Where it doesn't, the channel reads as open
+  again once its traffic shows it, and delivery is refused until then, as
+  after a registration. Messages and lifecycle answers that were under way
+  when the connection closed no longer confirm a channel after it; messages
+  the connection held across the reconnect are admitted with the next
+  connection, as before.
+- A conversation fork now leaves out every other registered channel's
+  context injections, open or not. Before, it left out only another open
+  channel's, so a channel the agent had closed, or one not yet confirmed,
+  had its injections shown to every fork as general context.
+
+- What was deferred for an agent before a coalesced render or message the
+  agent's turn assembles now lands ahead of it, in the order it arrived. The
+  assembly's write used to be stored at once, ahead of a write still queued
+  for the agent, so a render could be read before the earlier render it
+  builds on: after a render landed in the agent's queue during its own
+  assembly, or after the turn's start couldn't store a queued render. When a
+  queued write can't be stored, the assembled one now waits behind it. What
+  is deferred for the agent while its assembly awaits a render, such as a
+  render another agent's assembly placed in its queue, now lands in that
+  turn's request, rather than at the turn's first tool boundary or its end.
+- A render's wake to read it, given when the render lands in an agent's
+  deferred queue, no longer starts a turn if, when the scheduler comes to
+  start it, the agent has already read the render or the render was
+  retracted.
+- A provider hold no longer keeps two wakes from the same millisecond as
+  one when one of them is a coalesced batch's wake or a wake to read a
+  render, so withdrawing the batch, or dropping the read render's wake,
+  no longer takes the other wake's cause with it.
+- A reply to a `[Continue]` turn that a coalesced batch's wake or a wake to
+  read a render started now keeps its `promptedBy` stamp, so later
+  requests render `[Continue]` before it as they do for other such replies.
+- A render that settles after its turn's assembly has failed, while the turn
+  is still alive, is now deferred like any other write during the turn,
+  rather than stored into the turn after its compile. While the host is
+  quiesced, the assembly's writes wait behind what is queued for the agent,
+  and land when it does.
+
+- The notice that a channel opened without the agent asking (an open its
+  own send or reply caused, or a subscription-policy admission) names
+  `channel_close` only to an agent that can call it there for every channel
+  it names, except where several residents share one slot (#291), and where
+  a fork's seed still carries it: in an adaptive template's summary, or in a
+  notice long enough for its template to shard or cut. A conversation fork can
+  close only its home channel, and an agent's `allowedTools` can leave
+  `channel_close` out. Before, such an agent
+  was told to use `channel_close`, and couldn't call it, or its call was
+  refused. Where an agent's own send opened a channel it can't close, the
+  primary is now told by name too, if it can close it, and the agent is told
+  that it was.
+- The opened notice says what an open channel brings, which is up to its
+  server, only to an agent whose window holds the channel's traffic.
+  Before, a conversation fork was told this about a channel other than its
+  home, whose messages never reach it.
+- The primary's notices name a conversation fork by the channel it's bound
+  to, then by its generated name. The notice of an open by an agent that has
+  ended says "a message from" it, where it said "opened by X's reply" whether
+  a reply or speech had opened the channel. The reply notice and speech's
+  failure notice say why a channel is selected for opening again with
+  "because", where they said "as".
+- When a conversation fork or an ephemeral run is released without reading a
+  channel notice it could act on (a channel its own send opened, or a
+  channel its reply couldn't open that is selected for opening), the primary
+  is told by name in its place, as for a reply whose delivery failed, of what
+  still holds then: a channel closed since is left out, and so is one no
+  longer selected for opening, or open since. Before, the notice stayed
+  unread in the released agent's window.
+
+- `channel_open` and `channel_close` promise delivery only to an agent whose
+  window holds the channel's traffic. An ephemeral run, and on a host that
+  routes conversations every agent but a conversation fork, are now told that
+  opening or closing a channel does so for every agent on the host, that
+  opening it brings them none of its messages and closing it stops none
+  reaching them, and that `channel_open`'s history comes back in its result.
+  Before, they were told "Messages that address you still reach you" and
+  offered history "preceding the message that invited you", though a channel's
+  messages go to the residents, or to its fork or nowhere. Residents of a host
+  that doesn't route conversations, and conversation forks, keep the words they
+  had, so their cached tool lists don't change; a fork keeps them through its
+  closure turn after its binding expires. On a host with no residents, the run channel messages are stored
+  with is a holder, so when it ends, the next run's words change to the
+  holder's.
+
+- A `channel_decline` that a later decision replaced while its
+  acknowledgment was out no longer has this host send the server anything
+  for that decision. Until now:
+  - where a `channel_open` replaced it, with the open's request still out
+    when the acknowledgment was answered, this host sent the server that
+    open a second time;
+  - where a tune-out replaced it, in a channel this host hadn't confirmed
+    closed, this host sent a `channels/open` for the tune-out.
+
+- A deferred context write whose write threw, and whose store then couldn't
+  be read to tell whether it had landed, is no longer put back as one that
+  wasn't stored. Until now a later flush stored it again, so a write that
+  had landed appeared twice. It's now put back marked as unknown, and before
+  it's written again the store is searched for its id: found, it counts as
+  written and isn't stored again; not found, it's written; and while the
+  store can't be searched, it stays queued, holding what's queued behind it
+  for that agent, as a write that keeps failing does. Such an entry's mark
+  is persisted with the queue, so after a restart it's still looked up
+  before it's written.
+  - A write found this way at a flush is carried there, after what the turn
+    stored since, though the store holds it before those, so later requests
+    place it earlier.
+  - Wherever held writes are read or changed, by a module's context, the
+    coalescer, a wake's check or a tune-out's backlog, such a write is
+    looked up first. One that landed is a stored message from then on, read
+    and changed as one, and isn't carried into the turn; one that didn't is
+    an ordinary held write. Where the store can't be searched, the
+    coalescer reads it as possibly read and shown.
+  - A module context's `editMessage` and `removeMessage` can now throw for
+    such a held write: where its store can't be searched to tell whether
+    it landed, nothing is changed, and the error reads "held write held:…
+    may already be stored, and its store can't be searched to tell, so
+    nothing was changed. It's refused the same way while the store can't be
+    searched; the host log names the store's error".
+  - A conversation fork's or ephemeral run's queue, stored when it's
+    released, looks such an entry up the same way, and, where the store
+    can't be searched, in the window the release reads: found, it isn't
+    stored again; where neither can see the store, it's stored anyway where
+    the store takes it, and the log says it may now be stored twice. A
+    failed reply, or a channel notice the fork or run could act on, among
+    such entries reaches the primary once, as the entry itself under its own
+    id, so a crash or a restart doesn't tell it twice, as long as the
+    release's sync went through. It isn't passed on where the release finds
+    the fork or run had read the copy that landed, at its release or at the
+    `stop()` that ends it. Where a crash or a failed sync leaves the entry
+    to the next boot, boot passes it on anyway, since it can't read that
+    window.
+
+- A Discord message stored twice in shards now loses both copies when it's
+  deleted, by a live delete or by a history sync that finds it gone. The
+  module removed one body per shard group id, and the group id names the
+  text, so the second copy, under the same id, outlived the delete. It now
+  removes each body as context-manager reads them (`continuesBody`, in store
+  order).
+
+- When an open that speech or a reply made fails, the channel's decision goes
+  back to what it was. So an agent told the open failed isn't later put
+  into the channel by that open's decision. Before, the
+  decision to open stayed: the agent's next speech there, or reconciliation
+  when the server announced the channel again, opened it without the notice
+  that says it's open and how to close it. A decision made while the open
+  was out stands. Since the failed request may have reached the server, as
+  when its answer is lost to a timeout, the host also closes the channel on
+  the server. Where the decision put back means nobody had decided, the
+  channel then follows its server's latest announcement and the
+  subscription policy, which a re-announcement during the open couldn't
+  apply: if they select it for opening, the host tries the open again, and
+  the failure says why. Where the host can't record putting the decision
+  back, the decision stays, no close is sent, and the failure says the
+  channel stays selected for opening. `channel_open`'s own decision still
+  outlives a failed open, as its failure says.
+- A reply into a closed channel whose open fails now tells the agent that
+  the reply went out and opening the channel failed, and that
+  `channel_open` tries again, where the agent can call it: a conversation
+  fork can't, and an agent's `allowedTools` can leave it out. The notice
+  comes where the host directs the server's lifecycle
+  (`channels.lifecycle`), and only when no decision about the channel, such
+  as the agent closing it, was made while the open was out. A reply whose
+  open only reconfirms a channel the agent already has open gets none.
+  Where the channel is selected for opening after the failure, the notice
+  says so and why, as speech's failure does, and that `channel_close`
+  withdraws that, where the agent can call it: where the host couldn't
+  record putting the channel's decision back, a later delivery or
+  reconnect tries again; where the
+  server's latest announcement or the policy selected it again, the host
+  tries again itself. Where the channel is selected for opening and the
+  replying agent has ended, the primary is told by name instead, if one is
+  registered; where the replying agent can't close the channel, as a fork
+  away from its home can't, the primary is told by name too, if it can.
+  Before, the failure reached only the logs.
+- On a server without `channels.lifecycle`, an open by speech or a reply,
+  which fails there before any request is sent, no longer records a decision.
+- `channel_open` on a channel that's already open, and `channel_close` on one
+  that's already closed, now record the agent's decision, and so does
+  `channel_decline` on a channel closed by default. So a module's
+  housekeeping close is refused for a channel the agent opened itself, even
+  where speech, a reply, the server or a policy had opened it first. And a
+  channel the agent closed or declined isn't opened later because its server
+  registers it as initially open, or a policy admits it.
+- `channels/close` now has the deadline `channels/open` has when
+  `requestTimeoutMs` is 0. A close the server never answers no longer holds,
+  for good, the deliveries that wait for the channel's lifecycle work.
+
+- `semantic_search` finds what the resident wrote through a send tool. The
+  index took text blocks and private-prose tool arguments only, so a resident
+  with `proseRouting: "disabled"`, which speaks only through send tools, had
+  none of its own replies indexed. The message argument, `content` (or `text`,
+  as older `channel_publish` callers send it), of `channel_publish`,
+  `send_message`, `reply_message`, `send_dm` and `edit_message`, under any
+  MCPL prefix, is now indexed as `[<tool>] …`, with or without
+  `includePrivateTools`. Messages stored before this change are not indexed
+  again, so earlier send-only messages stay out of the index.
+
+- `semantic_search` builds a summary hit's snippet and `chars` from the local
+  summary, as it already does for message hits, instead of taking the
+  service's copy: up to 400 UTF-16 units of the text as indexed, with "…" when
+  it's longer than that. A service that stores only vectors and ids, and
+  returns no text, now gives summary hits a snippet instead of an empty one.
+  Where a branch made from an earlier point, as an undo makes one, minted a
+  summary id another branch already used, the hit's snippet and `chars` come
+  from this branch's summary; its score, timestamp and date filtering are
+  still the index's.
+
+- Where conversations are routed to per-channel forks (`FrameworkConfig.conversations`), a fork's seed no longer copies its template's channel notices, or its by-name notices of what another agent's reply did. That's each `[channels]` notice of an open, a failed open or a subscription policy's admission, whichever build stored it, and each notice telling the primary by name of another agent's failed reply or channel. They were copied into the forks spawned after them, so a fork serving one channel held which channels other conversations opened and whose replies failed, with advice judged for the primary, such as "use channel_close", which a fork can follow only for its home channel. The template keeps them. A text block that repeats one word for word is left out too, and the spawn's log line counts what was left out: `[conversation] <fork>: seeded from <template> without N thinking block(s), N channel or by-name notice(s), N unanswered tool call(s) and N orphaned tool result(s)`. A summary an adaptive template wrote while one was in its window can still mention it, a notice long enough for its template to shard or cut compiles to other text and stays, and a fork spawned before this change keeps what its seed copied.
+
+- The MCPL outgoing stream (`channels/outgoing/chunk` and `complete`) no
+  longer carries text that delivery withholds or sends elsewhere. It
+  streamed each round's text as the model wrote it, but whether a round is
+  delivered is decided only once its tool calls are known. So a streaming
+  server received, and discord-mcpl's voice spoke:
+  - a round that called `skip_reply`, a silencing send such as
+    `send_message` or `channel_publish`, or a `think` under
+    `same_round_think_text_policy: private`;
+  - a round its stream never finished, such as one cut off by a stream
+    error;
+  - in hybrid mode, in a later stream of the turn, such as a budget
+    restart's, a framework retry's or a re-inference's, text the turn's
+    hold kept back or its pin sent to another channel;
+  - in locus and hybrid mode, after a mid-turn re-pin, text bound for the
+    new locus, which streamed to the old one.
+
+  The stream is now the prose that delivery published: each publish's
+  text, to its channel, sent once the publish succeeds, a later one to the
+  same server's channel opening with a paragraph break. Tool publications, such as
+  `send_message`, a `drafts` resend or the `sleep` tool's announcement,
+  aren't part of it, as before. A publish succeeds only when the server
+  confirms it (`delivered: true`), so one refused before sending, one that
+  throws, times out or gets an error response, one the server reports
+  undelivered (`delivered: false`) and one whose reply leaves `delivered`
+  out are never streamed, and neither is text held as a draft. A
+  `{{unsent}}` resend streams the draft's words it sends, rather than the
+  token.
+- With native tool calls (`roundContent`), a call of a `code_execution`
+  script that reaches the host while a run or wait call of the round
+  watches the script now counts toward that round's routing, as the same
+  call made directly does (#306), whether or not the round waits on that
+  call's script. In explicit mode an inner `skip_reply` keeps the round's
+  envelopes in the context. In locus and hybrid mode an inner `skip_reply`
+  keeps the round's prose private, and an inner silencing send, a `drafts`
+  resend among them, holds it and the turn's later prose as drafts, as a
+  direct one does. An inner `think` under the private same-round policy
+  holds the round back in every mode but disabled. An inner `skip_reply`
+  that's refused at dispatch, because this host can't set the
+  `wake_in_seconds` it asks for or because the agent's allowedTools doesn't
+  name it, or that the host refuses before dispatch, as for arguments that
+  aren't an object, counts as a refused direct one: it keeps only its own
+  round private, and the turn goes on. An inner send refused so, like a
+  refused direct one, silences nothing. A script has only the tools its
+  agent's allowedTools names, so a call of
+  any other tool fails in the script and reaches no one. On the fallback
+  without `roundContent`, as in XML tool mode, an inner call counts only as
+  a direct one does there. Nothing is routed until the turn ends, so a
+  silencing send holds the whole turn's prose as drafts, the rounds before
+  it included. The private `think` hold and an explicit round's
+  `skip_reply` don't apply there (#307).
+- A round whose run or wait call watches a script that can change its
+  routing waits for that call to return, at the script's end or at the
+  call's yield, and its prose goes out then. A script can change it when
+  its code names a tool whose call changes the round's routing in the
+  turn's mode: in locus and hybrid mode `skip_reply`, a silencing send,
+  `drafts` (whose resend is one, so its name holds whatever action its
+  call asks), `say` or `whisper`; in explicit mode only
+  `skip_reply`; and in either, `think` under the private same-round policy.
+  Disabled mode holds nothing. A wait reads the code of the script it
+  names. A name counts wherever it stands in the code as a whole
+  JavaScript identifier, comments and strings included: `tools.say(...)`,
+  `tools["say"]` and `tools["world--say"]` name `say`, and `say_hello`
+  doesn't. So a comment or a string that mentions such a tool holds its
+  round too, for no longer than the call's yield: 30 seconds by default,
+  and up to `maxYieldMs`, 600 seconds by default, when the call asks. A
+  tool name the code doesn't spell out, built at runtime or written with
+  escapes, goes unseen, and its round is routed as it was before scripts
+  counted. A stop or a list holds nothing, and neither does a
+  `code_execution` call without code execution or one the agent's
+  allowedTools refuses. Any other round is routed at its tool-calls event,
+  as before, so narration beside a script isn't held for it. The turn's
+  locus and an explicit round's `>>` targets are taken at the round's
+  tool-calls event, when the model has finished writing it, not when its
+  calls return; hybrid's `>>>` targets apply as its delivery runs, as for
+  any queued hybrid delivery. What counts is the host's receipt of a call,
+  not the script's making it: a call that reaches the host while no call of
+  the round watches the script isn't the round's, as one made once its run
+  has yielded, one made while it was watched that waited, with 16 of the
+  script's calls already out, until the watching call had returned, and one
+  still on its way when the call yielded. Such a call's effect can come
+  after the round's prose. A call's result settles only the round that
+  dispatched it, even when a
+  newer round reuses its call id. A round whose turn ends or stops waiting
+  on it, or that a newer round of the same agent replaces, before its calls
+  return, as when the turn is stopped, is withheld: it is neither sent nor
+  held as a draft, a log line names it, and in locus and hybrid mode the
+  turn's delivery receipt counts it as suppressed.
+- Every stream now sends `channels/outgoing/complete` for each channel it
+  streamed to, while its server registers it and takes the stream, on every
+  exit path, as MCPL Spec 14.3 asks: once its deliveries have run, or, when
+  the host stops, before its connections close, with what it has sent by
+  then, so a publish that succeeds after that isn't streamed. A stream that
+  handed its turn to a budget restart or a tool-result-guard retry never
+  sent it, so a voice server never learned that stream's utterance had
+  ended.
+- A membrane refusal retry no longer moves the outgoing stream to a new
+  inference id. Nothing of the refused attempt was delivered, so none of it
+  streamed; the rounds delivered before the refusal stay in the stream, and
+  its `complete` carries them. The stream's `inference/lifecycle` `started`
+  and terminal now carry that one id too. The retry re-minted the id
+  between them, so a server matching them by `inferenceId` saw the first
+  inference never end, and a terminal for an id that never started.
+
+- An error a host's own call to agent-framework gets, thrown, rejected with
+  or in an error answer's data, no longer carries a credential the framework
+  replaces in its records, whoever wrote its words. Before:
+  - a server's words in an error built from them were cut to 200 code
+    points, with control characters replaced, before anything redacted
+    them. That covers an initialize error, a refusal of the protocol
+    revision, the revision a legacy server answered with, and a tool call's
+    error answer. A credential the cut split kept its start in the
+    framework's records and in an agent's tool result, and one holding a
+    control character survived changed. An error answer's words were also
+    trimmed first, so a credential ending in a space at their end survived
+    whole. The caller of a connection got the server's words, an error
+    answer's data, the revisions a refusal lists and a tools/list cursor in
+    its errors unredacted;
+  - a failed legacy handshake's `stderrTail` was the end of the server's
+    stderr as written, cut before anything redacted it;
+  - a modern connection's failed connect handed the host the SDK's error as
+    raised, with the url in its words, and under Bun in its `path`;
+  - a legacy stdio server that couldn't be started was refused with Node's
+    error as the `cause`, its command line in `spawnargs`, and an argument
+    Node refuses quoted in the words;
+  - `McplUnreapedLaunchError` printed its connection's configuration,
+    credentials included, wherever the error was inspected.
+
+  Now each error redacts the server's words where it's built, then trims and
+  bounds them, and redacts the strings in an error answer's data. In that
+  data, a number whose digits hold a credential, as JavaScript reads the
+  number, becomes a string, its digits with the credential replaced; a
+  number with more significant digits than a double holds has lost its last
+  ones before that. A redacted key that comes out the same as another key is
+  numbered (`redacted (2)`), and data nested past 64 levels reads
+  `[withheld: nested too deep to redact]`. A failed handshake's `stderrTail`
+  is the same end of the server's stderr, with every credential of up to
+  14,336 characters that reaches into it replaced whole. A library's error
+  is handed on as its name and its redacted words alone, with a launch
+  failure's `code`: a legacy stdio server that couldn't be started is
+  refused with its words redacted and a `cause` that keeps Node's error's
+  name, those words and its `code`, and nothing else of it; when Node
+  refuses an argument or an env value at once, the words leave the value
+  out. `McplUnreapedLaunchError.connection` isn't enumerable. With a
+  configuration that can't be read, the server's words are withheld, as the
+  records already withhold them, and an error answer's data is withheld
+  whole.
+- The record of a tools/call or push/render answer that came after its
+  deadline is redacted as an on-time answer's record is.
+
+- The host no longer publishes into a channel its server declared inbound-only
+  (`direction: "inbound"`, SPEC §14.2). A server's live-transcript channel can
+  be one, where an agent speaking in the room arrives addressed. Until now
+  that moved a resident's plain speech there, the delivery attempt opened the
+  channel if she had closed it, and the server refused the publish.
+  - Every publish of plain speech into such a channel is refused before the
+    channel is opened or published to, a drafts resend and `{{unsent}}`
+    included, with a reason that names the declaration and says to use that
+    server's own tools. A channel declared inbound-only while the publish
+    waits, on the channel's lifecycle work, its open or anything else, is
+    refused too, and so is one whose registration is gone by the time the
+    words would be published. Nothing is published to either. A declaration
+    that comes with the channel's own opening leaves the channel open: the
+    agent gets the failure for its words, and the notice that the channel is
+    open if this open is what opened it.
+  - A `>>` or `>>>` target naming the channel bounces with the same reason,
+    and the closed-channel invitation offers no reply into it. In explicit
+    mode the refused target also clears the turn's destination, so the turn's
+    later text without a prefix bounces too, rather than going to the
+    destination named before it. A delivery refused because the channel was
+    declared inbound-only after its target resolved ends the destination
+    too, unless a later round has named another channel by then.
+  - `channel_publish` and the subconscious's `speak_in_channel` return an
+    error that names it. No outgoing stream starts in the channel, and the
+    channel context names no default outgoing channel for it.
+  - A channel the host knows only from a push is refused once the server's
+    answer to opening it, wherever the host opens it, declares it
+    inbound-only.
+  - The routing notices say plain speech is refused there, and to use that
+    server's own tools. The locus and hybrid mode primers, shown when an
+    agent's mode changes, say plain speech goes to the locus unless its server
+    declared that channel inbound-only.
+- `speak_in_channel`'s `mcpl:speech-routed` trace now follows a confirmed
+  delivery, with `serverId`, `delivered` and `textLen` as plain speech's trace
+  has them, and no `messageId`, as before. Any other result is traced as
+  `mcpl:speech-route-failed`, with the publish's reason, the connector's
+  detail when it sent some, and `outcome: "unknown"` when the words may have
+  been posted or `"failed"` when nothing was, a refusal included.
+
+- Content context-manager won't store is refused where it's written, and a deferred write that context-manager refuses no longer holds its agent's later writes. From context-manager 0.16.0, a write whose content doesn't match `ContentBlock` is refused with a `MalformedContentError` (context-manager #184). Before it, such content was stored as given, and a compile that read it could throw.
+  - **Writes and edits through the framework:** a module's write, and its edit of a write still held for a turn's end, throw `MalformedContentError`, naming each place, as the store's own write and edit do. They throw whether the write would be stored at once or deferred while a turn runs, where a deferred one used to be refused only at a later flush. Content the store mends, a `tool_use` whose input isn't an object, is written as before. The API's `message.send` refuses content that isn't text with an error, where it answered `pending` and stored the message as given.
+  - **A process response** with such content, in a message it adds or an edit it makes, is refused whole before any response to the event is applied. None of it is applied, its module state update and inference request included, and it doesn't count as accepting console or API input. A `[process-response-refused]` line and a `process:response-refused` trace name the module, the other modules' responses apply, and the `process:completed` trace and the process log list only the responses that applied.
+  - **The push and channel lanes** check content with context-manager's `malformedContentPlaces` before anything else. Content from an MCPL server is converted at the boundary into blocks the store accepts, so this catches events that never crossed it. When it names any place, the message stores no row and queues no wake. A stderr line, `[push-event-refused]` or `[channel-incoming-refused]`, names the server, the channel where there is one, the event or message, and the places. A new trace, `mcpl:malformed-content-refused`, carries the same, with the places as `places`. Content that's absent is still the empty-content check's.
+  - **A deferred write that context-manager refuses as malformed is dropped at the drain** and logged, rather than queued again: it would be refused at every flush, and so would hold every later deferred write for its agent for good. Since writes through the framework's `addMessage` are refused before they're queued, this meets an entry a process before this release persisted, a pair `puppetToolCall` queues itself, or a write the strategy's chunking splits into a shard the store refuses, which the line names. Any other failure keeps the entry queued, as before, unless a read-back shows it landed. A `tool_use` dropped this way lets a `tool_result` queued behind it be stored alone.
+
+    The store's own validation checks all content and shards before append, so
+    an unavailable readback does not make such a refusal retryable. Other errors
+    whose landing is unknown remain queued and are reconciled by ID before retry.
+    A synchronous custom strategy hook throwing this same error after append is
+    tracked separately in context-manager #288; this is not a general guarantee
+    for arbitrary host callbacks when readback is also unavailable.
+
+- **A tool call whose arguments JSON can't write is refused as not sent
+  (`not-sent`), in both engines** (#556). Such arguments, a BigInt or a
+  cyclic object, can come only from in-process code. The modern engine
+  reported the call as possibly executed (`no-response`: "whether it took
+  effect is unknown"), though nothing reached the server. The legacy engine
+  already refused it, but said to try again later, which fails the same way.
+  Both now say "If calling it again fails, ask whoever runs this host", and
+  the host's log line names the serializer's error.
+- **A legacy request refused as not sent stays a `not-sent` refusal when the
+  host's `console.error` throws:** for these arguments, for a stdio pipe
+  that has failed, and for a write the transport refuses at once. Before,
+  the call threw the logger's error, or failed with it. The refusal's log
+  line is then lost.
+- **A request that fails over HTTP is reported once** (#556), by whatever
+  made it: a tool call or a listing to its caller and in the host's own log
+  line. Its failure no longer also raises the modern connection's `'error'`
+  event, and with it the framework's `mcpl:server-error` trace. A host that
+  logs that trace, as connectome-host does in each server's `mcpl-stderr`
+  log, no longer shows a failed tool call there; its HTTP status and the
+  server's words stay in the host's own log line. A failed listing still
+  shows there once, as the framework's `tools/list failed` trace, and so
+  does a failure the SDK reports itself, such as a list-change
+  subscription's. A connection with no `'error'` listener of the host's no
+  longer logs a second line for it. A failed notification is reported as
+  before, since what sent it may report nothing of it.
+- **A stdio MCP server whose pipe fails and whose child outlives SIGKILL no
+  longer has calls told that the host is reconnecting to it** (from the
+  review of #540). The modern engine now holds the launch before the calls
+  the failure ends are answered, as the legacy engine does, so they, and a
+  call made as the connection closes, read that the host won't reconnect to
+  it on its own.
+- **A legacy stdio server the framework launched no longer has the Discord
+  awareness ledger read from disk for each JSON-RPC error answer's log
+  line** (from the review of #540). The connection builds that line's
+  redaction at its first error answer and keeps it. If the ledger can't be
+  read when it builds, that line is withheld, and the next answer builds
+  again.
+
+- **A stdio MCP server whose pipe fails while it's connecting no longer reads
+  as connected, in both engines.** Such a connect now fails: one whose
+  transport found the child's stdin or stdout failed before the connection
+  was taken on, as when the modern engine's connect-time list-change
+  subscribe, or the legacy engine's answer to a ping the server sent during
+  the handshake, meets EPIPE. Before, unless the child had already exited,
+  the modern connect was taken on once that subscribe gave up, and the legacy
+  handshake took an initialize answer that came afterwards. The connection
+  then read as connected while refusing every call as not sent, and said the
+  host was reconnecting to it when reconnect was on, until the child exited;
+  for a child that outlived SIGKILL that never came, and nothing held or
+  reported the launch. The connect's error is now `MCP server "<id>" stdio
+  pipe failed with <error> while connecting` (modern) or `MCPL server "<id>"
+  stdio pipe failed with <error> during the handshake` (legacy). A child that
+  can't be reaped is held as for any failed connect: `connect()` throws
+  `McplUnreapedLaunchError`, and a reconnect's failure is a permanent
+  `reconnect-failed`. A modern connect that the SDK resolved after such a
+  failure had already ended the child, which read `MCP server "<id>" closed
+  its connection while connecting`, now names the pipe too. A connect that
+  fails some other way after its pipe failed, such as one the SDK rejects,
+  keeps its words.
+
+- A message a tune-out holds from the residents is no longer injected into a resident's live turn. One that arrives while the resident's turn is alive is held, and the next tool boundary stored it and injected it into the turn with the other held writes, though the resident's compiled view leaves it out. The boundary now stores it without injecting it.
+- A module's `ctx.queryMessages` and `ctx.getMessage` now mark such a message with `heldFromResidents: true` (on `ModuleMessage`): a message that arrived in a tuned-out channel, stored with `metadata.tuneOut`, whose row no resident is shown, during the tune-out or after it. A module's context answered it as an ordinary row, so a module that leaves out `held: true` rows to keep to what the residents see took it in. A held write that carries the stamp is marked as well as `held`, and so is its stored row once it lands. Its text can still reach a resident in rows of their own, which aren't marked, such as the cancel's `<tuned-out-backlog>` row, with the text of the tune-out's newest messages, up to `backlogCap` of them and as many as fit in one of the residents' messages, the stored ones first and then those still held, what the subconscious says of it, and the result of a tool that reads history on request.
+- A cancel's `<tuned-out-backlog>` now carries the tune-out's messages still held, oldest first, after its stored ones. It carried only stored ones, so a message held while the resident's turn was alive was left out of it. The held messages the backlog leaves out, all of them when `backlogCap` is 0, now follow the subconscious's cancel report notice, each a row of its own with its own content, since its view holds only stored messages. So does a held message the backlog shows whose image or audio its text lines drop. A cancel the subconscious makes itself now gets that notice and a report turn too when any held message follows the notice, since it wrote its note, if any, before it could see them.
+- A cancel the subconscious makes itself with no note now gets the report notice and a report turn when the `<tuned-out-backlog>` left messages out. It got neither, so at `backlogCap` 0, where the tool says the subconscious's report is the whole delivery, the resident was left an empty backlog and nothing else.
+
+- **Edit/delete/reaction-remove markers now preserve explicit-send suppression, like reaction markers** (#157). `isConversationalInjection` exempted only `chat:reaction`, so the RFC-001 marker tags `chat:edited`, `chat:deleted` and `chat:reaction-remove` (now delivered as synthetic incoming messages by e.g. zulip_mcp) cleared explicit-send suppression — an edit notice arriving right after a `send_message` re-opened auto-routing for the same round's prose. The four tags live in a shared `NON_CONVERSATIONAL_TAGS` set (`src/mcpl/tags.ts`). All four marker tags also leave ChannelRegistry's default publish channel and `context.incoming`'s message/thread anchor unchanged. An edit the agent sees first still counts as the message it replaced: it clears explicit-send suppression, can move the turn's speech channel at a tool boundary, and, for a channel message the coalescer delivers when it accepts it, moves the default publish channel and `context.incoming` as that message would. The host knows that case when RFC-006 coalescing delivers a version of a subject whose producer marked its first occurrence `initial` and of which no version may have been shown to the agent yet, whether the version is a plain occurrence that replaced an unread one, a deferred notice's render, or a plain occurrence that replaced a pending notice; an edit of such an edit is the agent's first view too. A doubt counts as shown, so the host errs toward a marker: a message counts as shown once a compile of any agent that can read it has begun to assemble it (a compile that throws gives that back, unless a tool boundary or another compile has moved the agent's position since) or a tool boundary of one may have injected it (residents sharing a message slot can all read it), and so does any message stored before one that was, since the host keeps one position per agent. `channel_publish`'s description now says that an omitted `channelId` goes to a conversation agent's own channel when it is bound to one, and otherwise to the channel of the most recent incoming message the host received on any channel, whether or not the agent has been shown it, apart from markers, and that a message pushed to the agent never sets it.
+
+- The physical-window projection (`physicalWindowTokens`) prices what a mid-turn message brings into a continuation round: an image or a generated image at its `tokenEstimate`, or 1,600 tokens without a usable one, and a document, audio or video at 1,000, the flat estimates context-manager's store uses for images and other media. It priced only such a message's text, so a round that carried photos or audio could cross the window the projection exists to keep a request inside.
+
+- Words for a channel that its server registered again or retargeted after
+  the publish's last wait, as it can while the channel's opening is
+  announced, were published before anything had confirmed the new
+  registration or target open. They now wait for that queued lifecycle
+  work, as they wait for any channel's, and go out only into the channel it
+  leaves open. If it leaves none open, nothing is published, and the failure
+  reads as at the first wait. A close decided in that window, where the
+  host directs the server's lifecycle, now stands, as one decided while the
+  words wait already does.
+- A `channels.publish` grant withdrawn while the words wait now holds for
+  them too: the check just before the publish reads the grant as it is
+  then, and refuses as the check before the waits does.
+- On a server whose channel lifecycle the host doesn't direct (no
+  `channels.lifecycle` grant), a channel decided closed no longer refuses
+  words that waited for queued lifecycle work: the host can't close it, so
+  they go into its open transport, as they already did when nothing was
+  queued.
+- Words for a channel whose registration is no longer marked open, with no
+  lifecycle work queued for it, are now refused where they used to be
+  published. That happens, for example, when a server answers an open of
+  the channel for another one. On a server without `channels.lifecycle`,
+  words for a retargeted channel are refused the same way, unless the
+  server's traffic has confirmed the new target open first.
+
+- A channel the host knows only from a push event no longer counts as
+  confirmed closed before anything has shown its state: after a restart, the
+  server may still hold a channel an earlier process opened. Its traffic shows
+  it open as before: where this host directs the lifecycle, once it's decided
+  open or tuned out.
+  - Where this host directs the channel's lifecycle, `channel_decline` in such
+    a channel that isn't open sends its close through the lifecycle queue.
+    Until now it sent nothing. Its answer is still `remained closed` when
+    that close completes, no later decision has replaced the decline, and
+    nothing else is under way for the channel.
+  - Where this host directs the channel's lifecycle, `channel_close` of such
+    a channel already decided closed, as by a decision kept from before a
+    restart, sends the close. Until now it answered `already closed` and sent
+    nothing.
+  - Where this host isn't permitted to open or close the server's channels,
+    `channel_close` of such a channel is refused as for a registered channel,
+    saying the close didn't go through and stays recorded. Until now a refused
+    close said the channel was closed, and a channel already decided closed
+    was answered `already closed`. Since such a channel may never be
+    registered, the refusal says the close happens if the server registers
+    it at a time this host may open and close its channels.
+
+- A channel decided open (or tuned out) that its server retargets now opens
+  at the new target when the only lifecycle work still outstanding for it
+  was queued before the server's registrations were last removed. That work
+  cancels when it would run, so it opens nothing. Before, the retarget left
+  the new target to it, and the channel stayed unopened there although
+  decided open. It needs the channel to be registered again in a way that
+  queues no lifecycle work, before that work settles: from a push, or while
+  the host doesn't direct the server's lifecycle (`channels.lifecycle`).
+
+- A sleeping agent's wake no longer outlives its framework's `stop()`. The event gate's `dispose()` left the sleep's timer armed, so the stopped framework kept the process running until the sleep's end, and then queued a wake there. `dispose()` now clears that timer and keeps the sleep, and until the next `start()` nothing arms a sleep's or a self-wake's timer, even for a turn a failed `stop()` left running. The next `start()` on the same framework arms the wake again for the sleep's end, or wakes the agent at once if the sleep ended while it was stopped, as the queued wake did before.
+- A sleep now wakes the agent at its end by the gate's clock, whatever its length. Its timer could fire before the end, and the wake was then dropped, so the agent slept on until something else woke it. On Node a timer can fire a millisecond early: in a probe on Linux with Node 24.22.0, 7 to 10 of every 1,000 timers of 1 to 40 ms, armed the way a sleep arms them, did, and with Bun 1.4.3 none of 2,000 did. A clock set back did the same on any runtime, and a sleep longer than about 24.8 days fired its timer at once.
+- A sleep a conversation fork or an ephemeral run set ends when it does, at a fork's idle close or at `stop()`, or at the run's end, and so does a `skip_reply` self-wake it left pending. The gate's sleep holds back every agent's wakes but the heartbeat's and a privileged user's, so they were held back until its end, and its wake, like the self-wake's, then went to a name that no longer existed.
+
+- While an agent sleeps, an event wakes it as its heartbeat only when it comes from the MCPL server configured under the id `heartbeat`. Any server's push or channel message whose metadata said `source: 'heartbeat'` woke a sleeping agent, as did a push whose `origin` gave the server id `heartbeat`. The `heartbeat` server's ticks and reminders still wake it, and so does a privileged author, as before.
+- The event gate reads a push event's server id, feature set, event id and event type as the host has them. A push's `origin` that held fields of those names took their place, so a server could match a policy written for another server's id, or for channel messages. The origin's other fields reach the gate as before.
+
+- `stop()` now ends each conversation fork that's still live, as a closing
+  fork's end does, whatever its stream or turn is doing, as it ends each
+  ephemeral run. So a failed reply the fork stored and never read reaches
+  the primary instead of being lost at a restart. A restart re-creates no
+  fork: the next qualifying message on the fork's channel spawns a new
+  generation, and nothing reads the old fork's window again. Each fork
+  `stop()` ends emits `mcpl:conversation-disposed`, and its channel
+  unbinds, so after a `start()` of the same instance each such fork's
+  conversation starts again from the template at its channel's next
+  qualifying message, a message still queued for that channel included;
+  what a `start()` after a settled `stop()` should do is #315's open
+  question.
+  The notices `stop()` passes on before the registry forgets its channels
+  now name the channel by the label the registry has for it, as other
+  notices do, rather than by its bare id. A release postponed later, as a
+  run's that `stop()`'s sweep ended can be, still names it by its bare id.
+  A crash runs no release, so after one a notice a fork stored unread is
+  still lost.
+- A failed reply still queued for a fork or a run that ended while the
+  host was quiesced is now passed to the primary when `stop()` runs, named
+  as the registry knows its channel then, and lands when the host resumes.
+  It isn't passed on where the fork or run had read the copy of it that
+  landed in its window, unless `stop()`'s pass over that window fails,
+  when it goes on as boot would send it, read or not. Before, the next
+  boot's flush passed it on. A memory-only queue still loses it at exit.
+  Any other write queued for such an agent, but a channel notice it could
+  act on, is still dropped, logged.
+
+- An MCPL outgoing stream now goes where each of its publishes went, that
+  server's channel, and ends there with its `channels/outgoing/complete`.
+  It looked each channel up again by its bare id, for every chunk and for
+  the `complete`, so:
+  - a stream lost its `complete` when the channel's server declared it
+    inbound-only mid-stream, or when a second server registered the same
+    channel id, and a consumer that finalizes on it, such as a TTS
+    utterance, was left open;
+  - when a channel id passed from one server to another mid-stream, the
+    `complete` the new server got carried the old server's words too.
+
+  A stream that started in a channel goes on there while its server
+  registers the channel and takes the stream, an inbound-only declaration
+  included, so a chunk for a publish delivered just before the declaration
+  is sent too. No stream starts in a channel declared inbound-only, as
+  before. A channel gets nothing of the stream while its server doesn't
+  register it, as after the server removes it or is disconnected, until
+  the server registers it again, or while the server isn't granted the
+  stream, as during a reconnect until its grant is settled again.
+
+- Awareness marks queued just as a delivery pass finishes are now sent on
+  their own trigger. A pass that had found nothing more to send stayed
+  joinable for one more microtask, so a request made then (an operator's
+  retract, say) joined a pass that would never look again, and its work
+  waited for the next surgery, operator act, reconnect, `tools/list_changed`
+  or restart. A pass now stops being joinable as soon as its last claim
+  finds nothing more to send, before a later act can make more work owed.
+
+- A tune-out cancel's `<tuned-out-backlog>` now holds only as many of the newest diverted messages as fit whole in one message of each resident that reads it: the smallest of their strategies' `maxMessageTokens` at four characters a token. The dump is one message, and a resident's strategy cut it like any message over that cap, keeping its first characters. So a long backlog lost its newest messages and its closing tag, while they still counted as shown, and the subconscious's report wasn't told of them. The messages the dump now leaves out are the oldest, and they count as left out wherever those above `backlogCap` do: in `truncated=`, in the report notice's count, and for the notice and report turn that a cancel the subconscious makes itself with no note gets. Held ones among them follow the report notice as rows of their own. A newest message too long to fit by itself is shown cut to the room left, when at least a character of it fits beside the mark, and marked `[cut to fit; the whole message is in the channel's history]`, and if it's still held, it also follows the notice as a row of its own. The notice's count now reads "N of M diverted messages, the oldest, weren't delivered raw to the resident".
+- A `backlogCap` between 0 and 1 now delivers no raw backlog. It delivered every diverted message, since the backlog was taken with `slice(-backlogCap)`, which starts at the first message for such a cap.
+
+- `tune_out` of a channel whose transport is closed now opens it, so the
+  subconscious gets the traffic it was told to watch. Until now it recorded
+  the tune-out and answered success, and the channel's traffic didn't arrive
+  until its server next registered it. Where the transport doesn't end open,
+  or the tune-out ended while it was being opened, the answer is still a
+  success, since the tune-out was recorded, and its new `openError` field
+  says why the channel's messages don't, or may not, reach the subconscious
+  yet and when they will, or that the tune-out isn't in effect any more. The
+  answer now comes once the channel's lifecycle work has settled: the work
+  already queued for it, the tune-out's own open where the transport may
+  not be open, and the work queued while that open was out, each request
+  up to its deadline. `tune_out` called again for a channel already tuned
+  out tries the open again where its transport may not be open and this
+  host can open the channel, and its refusal says what the transport is
+  now.
+- `channel_decline` refuses a channel that's tuned out, whatever its
+  transport, and says to cancel the tune-out with `tune_out` mode "cancel",
+  which delivers what it diverted. Until now a decline of one whose
+  transport wasn't open answered success and ended the tune-out without its
+  cancel, so its diverted backlog never reached the agent.
+
+- At startup, a failed MCPL connect whose launch couldn't be reaped, or
+  that `stop()` or a disconnect ended, now keeps the server's stderr that
+  its handshake's error kept in its `mcpl:server-connect-failed` trace and
+  its `Failed to connect MCPL server` console line, redacted, as other
+  failed connects do. The handshake's error carries the stderr as
+  `stderrTail`, and `McplUnreapedLaunchError` and the framework's own
+  refusals wrap that error, so the trace and the line, which read only the
+  outermost error, found none.
+
+- A uri-form image or audio block that gives a `disposition`, even a falsy one
+  such as `0`, `false`, `""` or `null`, becomes a reference stub in pushed
+  events, channel messages and context injections, as one with `"ref"` or
+  `"never"` does, and as tool results already showed it. Before, such an image
+  went to the provider with its `uri` as the image's source, except in a
+  `system` injection, which can't carry an image, and such audio showed the
+  no-data notice. A reference's own reading of the block, and the check for
+  inline data that claims a disposition, already counted any disposition
+  given. Pushed events and channel messages are converted once, when they're
+  accepted or a coalesced one is delivered, and stored that way, so history
+  from before the upgrade keeps such a block as it was: an image there stays
+  a provider url source while its message is in context. A server's
+  `beforeInference` injection is converted at each turn, so one that keeps
+  injecting such a block changes there at the first turn after the upgrade,
+  whose first request misses the prompt cache from that injection on: from
+  the system prompt on, for a `system` injection. As for a `"ref"` block, the
+  stub names a reference id this host keeps only in memory, so the same miss
+  comes again after each restart.
+
+- The 0.23.0 notes said that `readFileFromDisk` keeps the code `symlink` for a file that is itself a link. One that leads into a nested mount's directory gets `other_mount`, with words naming that mount and the path to use there, as the same release's note on nested mounts says. 0.23.0 already answers so, and nothing changes; this corrects the note for hosts and module authors who choose advice by the code.
+
+- The workspace's tools read a path after its mount's name one way everywhere: `/` between segments, `\` too on Windows, with no empty or `.` segment and no trailing `/`, and a `..` takes back the segment before it. So `work/./a.txt`, `work/a//b.txt`, `work/docs/` and `work/sub/../a.txt` name the workspace entries `a.txt`, `a/b.txt`, `docs` and `a.txt`, the files the disk operations already reached. Before, the workspace's history kept a path as written: `work/a//b.txt` became a second entry for `a/b.txt`, a write to `work/./a.txt` or `work/sub/../a.txt` failed with the store's "Invalid tree path", and a `materialize` naming `work/docs/` found nothing. A `..` with nothing before it to take back climbs above the mount's root and is refused, whatever it reaches afterwards, a path that comes back in by the mount directory's own name included. Before, the traversal guard let that through: a disk read reached the file, and the other tools failed with the store's "Invalid tree path". A separator straight after the mount's name (`work//a.txt`) is refused too, since it would make the rest an absolute path, even where that path lies inside the mount, which the traversal guard let through before: a disk read reached the file, and the other tools found nothing or failed. What hosts and operators may need to do about these is under Breaking.
+
+- A WebSocket client's error no longer quotes the server's credentials.
+  Under Bun, the client's own message for a failed dial names the url as
+  dialed (its user, password, path and query, and the token, a static one
+  or an access provider's), and the dial's error carried that message on as
+  it read, to the caller of `connectMcplServer` among others. The client's
+  text, for a failed dial, for a client that throws as the socket is
+  constructed, and for an error after the socket opened, now has the url as
+  dialed and as configured shown as `redactUrl` shows it, the strings the
+  configuration and its dials know to be credentials replaced
+  (`redactServerText`), and any other ws(s) url masked the same way; the
+  error is a new one with no `cause` holding the client's original. Node's
+  `ws` quotes no url, so its errors read as before.
+
+## 0.23.2 — 2026-10-20
+
+### Fixed
+
+- A channel server can no longer set the metadata keys that only the host writes on a stored message. A `channels/incoming` message's `metadata` and a push event's `origin` are now stored without `system`, `kind`, `draftOwner`, `draftIds`, `tuneOut`, `coalescingSubject`, `deferredWriteId`, `external` and `openaiResponsesItems`, and the host writes its own after them, as it already did for the inbound source envelope. A key is in that set when only the host writes it and some reader takes it on its own as what the message is. Until now a server's copy of one was stored wherever the host wrote none, so a server's message could pass for one the host wrote: with `kind: "discord-send-failed"`, a message left unread in a conversation fork's window made the host tell the primary, when the fork was released, that the fork's reply had failed (#611).
+
+  The first time a server sends one of these keys, the host logs the server and the key, without the value, once for each server and key until it restarts. Every other key a server sends, such as `tags` or `mentioned`, is stored as before, beside the fields the host writes itself. Messages stored or queued before this change keep what they were stored or queued with.
+- A message that arrives while an agent's tools run now reaches membrane, at the tool boundary, as its participant and content alone. Its stored metadata stays the host's record, whoever wrote it.
+
 ## 0.23.1 — 2026-10-19
 
 ### Fixed

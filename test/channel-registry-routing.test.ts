@@ -179,7 +179,7 @@ test('routeSpeech surfaces a failure when the server reports delivered:false', a
   assert.equal(res, null, 'a non-delivered send must not report success');
   assert.equal(failures.length, 1, 'onRouteFailure should fire');
   assert.equal(failures[0].channelId, 'ch-x');
-  assert.match(failures[0].reason, /delivered:false/);
+  assert.equal(failures[0].reason, 'the "discord" server said it didn\'t post the message');
   assert.equal(failures[0].outcome, 'failed', 'the server said nothing was delivered');
   assert.ok(traces.some(t => t.type === 'mcpl:speech-route-failed' && t.outcome === 'failed'));
 });
@@ -236,7 +236,7 @@ test('routeSpeech routes a conversation fork to its HOME channel, not the global
   assert.equal(registry.getDefaultPublishChannel(), 'chanB');
 
   const res = await registry.routeSpeech('conversation-chanA-g1', 'reply for A', registry.resolveLocus('conversation-chanA-g1'));
-  assert.deepEqual(res, { delivered: true, channelId: 'chanA' },
+  assert.deepEqual(res, { delivered: true, serverId: 'discord', channelId: 'chanA' },
     'fork must route to its home channel, not the global last-inbound');
   assert.equal(publishCalls.at(-1)?.channelId, 'chanA');
 });
@@ -255,7 +255,7 @@ test('routeSpeech falls back to the global locus for the trunk agent (no home)',
   deliver(registry, 'chanB', 'hi from B');
 
   const res = await registry.routeSpeech('trunk', 'heartbeat reply', registry.resolveLocus('trunk'));
-  assert.deepEqual(res, { delivered: true, channelId: 'chanB' });
+  assert.deepEqual(res, { delivered: true, serverId: 'discord', channelId: 'chanB' });
   assert.equal(publishCalls.at(-1)?.channelId, 'chanB');
 });
 
@@ -281,13 +281,27 @@ test('buildChannelContext advertises the fork home as defaultOutgoing (item 3)',
 });
 
 test('routeSpeech surfaces a failure when there is no locus at all', async () => {
-  const { registry, failures } = makeRegistry({ delivered: true });
+  const { registry, failures, traces } = makeRegistry({ delivered: true });
   // No handleIncoming → defaultPublishChannel is null.
-  const res = await registry.routeSpeech('cairn', 'into the void', registry.resolveLocus('cairn'));
+  const lines: string[] = [];
+  const original = console.error;
+  console.error = (...args: unknown[]) => { lines.push(args.map(String).join(' ')); };
+  let res;
+  try {
+    res = await registry.routeSpeech('cairn', 'into the void', registry.resolveLocus('cairn'));
+  } finally {
+    console.error = original;
+  }
   assert.equal(res, null);
+  // connectome-doctor reads the [routeSpeech] line for "no locus".
+  assert.ok(lines.some((line) => line.startsWith('[routeSpeech]') && line.includes('no locus')), lines.join('\n'));
   assert.equal(failures.length, 1);
   assert.equal(failures[0].channelId, null);
-  assert.match(failures[0].reason, /no locus/);
+  assert.equal(failures[0].reason, 'this turn came from no channel, and it had no home or recent channel to reply in; if it ' +
+    'should have had one, ask whoever runs this host');
+  // The trace, like the log line connectome-doctor reads, keeps "no locus".
+  const failed = traces.filter((e) => e.type === 'mcpl:speech-route-failed');
+  assert.deepEqual(failed.map((e) => e.reason), ['turn has no locus (no home/trigger channel; nothing to deliver into)']);
 });
 
 // ── item-3 redux: single TRUNK agents route to the turn's triggering channel ──
@@ -312,7 +326,7 @@ test('routeSpeech routes a TRUNK agent to its ACTIVE triggering channel, not the
   assert.equal(registry.getDefaultPublishChannel(), 'chanB');
 
   const res = await registry.routeSpeech('scout', 'the date is ...', registry.resolveLocus('scout'));
-  assert.deepEqual(res, { delivered: true, channelId: 'chanA' },
+  assert.deepEqual(res, { delivered: true, serverId: 'discord', channelId: 'chanA' },
     'trunk reply must go to the channel that triggered the turn, not the global last-inbound');
   assert.equal(publishCalls.at(-1)?.channelId, 'chanA');
 });
@@ -331,7 +345,7 @@ test('routeSpeech precedence: fork HOME wins over the active triggering channel'
   deliver(registry, 'chanB', 'hi');
 
   const res = await registry.routeSpeech('conversation-chanA-g1', 'reply', registry.resolveLocus('conversation-chanA-g1'));
-  assert.deepEqual(res, { delivered: true, channelId: 'chanA' });
+  assert.deepEqual(res, { delivered: true, serverId: 'discord', channelId: 'chanA' });
   assert.equal(publishCalls.at(-1)?.channelId, 'chanA');
 });
 
@@ -379,7 +393,7 @@ test('ensureChannelRegistered keeps a DM closed while making its one-shot reply 
   assert.ok(traces.some((t) => t.type === 'mcpl:channel-lazy-registered'));
 
   const res = await registry.routeSpeech('scout', 'replying in the DM', registry.resolveLocus('scout'));
-  assert.deepEqual(res, { delivered: true, channelId: dm },
+  assert.deepEqual(res, { delivered: true, serverId: 'discord', channelId: dm },
     'the DM reply must route back to the DM channel, not the global locus');
   assert.equal(publishCalls.at(-1)?.channelId, dm);
 });
@@ -412,7 +426,7 @@ test('routeSpeech into a closed locus opens the channel first, then delivers', a
 
   const res = await registry.routeSpeech('sol', 'a reply meant for the DM', 'dm-alice');
 
-  assert.deepEqual(res, { delivered: true, channelId: 'dm-alice' });
+  assert.deepEqual(res, { delivered: true, serverId: 'discord', channelId: 'dm-alice' });
   assert.equal(openCalls.length, 1, 'delivery into a closed channel must open it');
   assert.equal(openCalls[0]!.channelId, 'dm-alice');
   assert.equal(lookup('dm-alice')!.open, true, 'live state flips open');
@@ -435,12 +449,12 @@ test('routeSpeech does NOT deliver when the open-on-delivery fails', async () =>
   assert.equal(res, null, 'no delivery into a channel that could not be opened');
   assert.equal(publishCalls.length, publishesBefore, 'publish must not be attempted');
   assert.equal(failures.length, 1);
-  assert.match(failures[0]!.reason, /closed and open failed/);
+  assert.match(failures[0]!.reason, /^opening the channel for these words didn't complete: /);
   assert.equal(failures[0]!.outcome, 'failed', 'nothing was published');
 });
 
 test('routeSpeech with an omitted locus fails loudly as a routing bug', async () => {
-  const { registry, failures } = makeRegistry({ delivered: true });
+  const { registry, failures, traces } = makeRegistry({ delivered: true });
   seedRegistered(registry, 'discord', 'ch-y');
   deliver(registry, 'ch-y', 'hi');
 
@@ -449,7 +463,11 @@ test('routeSpeech with an omitted locus fails loudly as a routing bug', async ()
 
   assert.equal(res, null);
   assert.equal(failures.length, 1);
-  assert.match(failures[0]!.reason, /routing bug/);
+  assert.equal(failures[0]!.reason, 'the host lost track of which channel this reply was for; if this keeps happening, ask ' +
+    'whoever runs this host');
+  const failed = traces.filter((e) => e.type === 'mcpl:speech-route-failed');
+  assert.deepEqual(failed.map((e) => e.reason),
+    ['caller passed no locus (routing bug: every speech path must snapshot the turn locus)']);
 });
 
 test('subscription allow-list opens channels discovered AFTER bootstrap (subscribed => open)', async () => {
@@ -805,14 +823,286 @@ test('channel_publish into an inbound-only channel is refused, naming the declar
   assert.deepEqual(publishCalls, [], 'nothing was published');
 });
 
-test('an inbound-only channel gets no outgoing stream', async () => {
+test('no outgoing stream starts in an inbound-only channel, by its destination or by its bare id', async () => {
   const { registry, streamCalls } = makeRegistry({ delivered: true });
   await registerInboundOnly(registry);
 
-  registry.sendOutgoingChunk('body:ears', 'linn', 'inf_1', 0, 'Hello');
-  registry.sendOutgoingComplete('body:ears', 'linn', 'inf_1', 'Hello, room.');
+  registry.sendOutgoingChunk({ serverId: 'body', channelId: 'body:ears' }, 'linn', 'inf_1', 0, 'Hello');
+  registry.sendOutgoingComplete({ serverId: 'body', channelId: 'body:ears' }, 'linn', 'inf_1', 'Hello');
+  registry.sendOutgoingChunk('body:ears', 'linn', 'inf_2', 0, 'Hello');
+  registry.sendOutgoingComplete('body:ears', 'linn', 'inf_2', 'Hello, room.');
 
   assert.deepEqual(streamCalls, []);
+});
+
+/**
+ * A registry over connections the test names and can replace, as a
+ * server's reconnect does, each recording the stream messages it gets.
+ */
+function makeStreamingRegistry() {
+  const sent: Array<{ to: string; kind: 'chunk' | 'complete'; channelId: string; inferenceId: string; text: string }> = [];
+  let thrown = 0;
+  const connection = (name: string) => ({
+    grant: new CapabilityGrant(new Set(ALL_CAPABILITY_PATHS), []),
+    refuses: false,
+    sendChannelsOutgoingChunk(p: { channelId: string; inferenceId: string; delta: string }) {
+      if (this.refuses) { thrown++; throw new Error('transport closed'); }
+      sent.push({ to: name, kind: 'chunk', channelId: p.channelId, inferenceId: p.inferenceId, text: p.delta });
+    },
+    sendChannelsOutgoingComplete(p: { channelId: string; inferenceId: string; content: Array<{ text: string }> }) {
+      if (this.refuses) { thrown++; throw new Error('transport closed'); }
+      sent.push({ to: name, kind: 'complete', channelId: p.channelId, inferenceId: p.inferenceId, text: p.content[0]!.text });
+    },
+    sendChannelsOpen: async () => ({}),
+    sendChannelsClose: async () => ({}),
+  });
+  const servers = new Map<string, ReturnType<typeof connection>>();
+  const serverRegistry = { getServer: (id: string) => servers.get(id) ?? null } as unknown as McplServerRegistry;
+  const registry = new ChannelRegistry(serverRegistry, {} as FeatureSetManager, () => {}, () => {});
+  return {
+    registry,
+    sent,
+    /** How many sends a refusing connection has thrown on. */
+    thrown: () => thrown,
+    /** The server's connection, named `name` in `sent`, in place of any earlier one. */
+    connect: (serverId: string, name = serverId) => { servers.set(serverId, connection(name)); },
+    /** Registers a channel of the server's, as channels/changed does. */
+    register: (serverId: string, channelId: string, direction?: 'inbound') =>
+      registry.handleChanged(serverId, { added: [{ id: channelId, type: 'chat', label: channelId, ...(direction ? { direction } : {}) }] } as never),
+    /** Whether the server's connection throws on each stream message, as one whose transport has closed can. */
+    refuse: (serverId: string, refuse: boolean) => { servers.get(serverId)!.refuses = refuse; },
+    /** The server's grant without `channels.streaming`, as a reducing featureSets/update leaves it. */
+    revokeStreaming: (serverId: string) => {
+      servers.get(serverId)!.grant = new CapabilityGrant(new Set(ALL_CAPABILITY_PATHS.filter((p) => p !== 'channels.streaming')), []);
+    },
+    /** How many streams the registry still keeps a record of. */
+    streamsKept: () => (registry as unknown as { takenStreams: Map<string, unknown> }).takenStreams.size,
+  };
+}
+
+const at = (serverId: string, channelId: string) => ({ serverId, channelId });
+
+test("a stream that started in a channel goes on there and ends there after its server declares the channel inbound-only, and a new stream starts nothing there", async () => {
+  const { registry, sent, connect, register } = makeStreamingRegistry();
+  connect('body');
+  await register('body', 'body:room');
+
+  registry.sendOutgoingChunk(at('body', 'body:room'), 'linn', 'inf_1', 0, 'Hello');
+  await registry.handleChanged('body', {
+    updated: [{ id: 'body:room', type: 'chat', label: 'body:room', direction: 'inbound' }],
+  } as never);
+  // A publish delivered before the declaration, streamed after it.
+  registry.sendOutgoingChunk(at('body', 'body:room'), 'linn', 'inf_1', 1, '\n\nand more');
+  registry.sendOutgoingComplete(at('body', 'body:room'), 'linn', 'inf_1', 'Hello\n\nand more');
+  registry.sendOutgoingChunk(at('body', 'body:room'), 'linn', 'inf_2', 0, 'Later');
+  registry.sendOutgoingComplete(at('body', 'body:room'), 'linn', 'inf_2', 'Later');
+
+  assert.deepEqual(sent, [
+    { to: 'body', kind: 'chunk', channelId: 'body:room', inferenceId: 'inf_1', text: 'Hello' },
+    { to: 'body', kind: 'chunk', channelId: 'body:room', inferenceId: 'inf_1', text: '\n\nand more' },
+    { to: 'body', kind: 'complete', channelId: 'body:room', inferenceId: 'inf_1', text: 'Hello\n\nand more' },
+  ], 'the stream the channel took goes on to its end there, and the next stream starts nothing');
+});
+
+test('two servers whose channels share an id are two destinations: each gets only its own part of a stream, its complete included', async () => {
+  const { registry, sent, connect, register } = makeStreamingRegistry();
+  connect('a');
+  connect('b');
+  await register('a', 'room');
+  await register('b', 'room');
+
+  registry.sendOutgoingChunk(at('a', 'room'), 'linn', 'inf_1', 0, 'to a');
+  registry.sendOutgoingChunk(at('b', 'room'), 'linn', 'inf_1', 1, 'to b');
+  registry.sendOutgoingComplete(at('a', 'room'), 'linn', 'inf_1', 'to a');
+  registry.sendOutgoingComplete(at('b', 'room'), 'linn', 'inf_1', 'to b');
+
+  assert.deepEqual(sent.map((s) => [s.to, s.kind, s.text]), [
+    ['a', 'chunk', 'to a'], ['b', 'chunk', 'to b'], ['a', 'complete', 'to a'], ['b', 'complete', 'to b'],
+  ]);
+});
+
+test("a channel id that passes from one server to another mid-stream: what's published to the new server streams there, and the old server gets none of it", async () => {
+  const { registry, sent, connect, register } = makeStreamingRegistry();
+  connect('a');
+  connect('b');
+  await register('a', 'room');
+
+  registry.sendOutgoingChunk(at('a', 'room'), 'linn', 'inf_1', 0, 'to a');
+  await registry.handleChanged('a', { removed: ['room'] } as never);
+  await register('b', 'room');
+  registry.sendOutgoingChunk(at('b', 'room'), 'linn', 'inf_1', 1, 'to b');
+  registry.sendOutgoingComplete(at('a', 'room'), 'linn', 'inf_1', 'to a');
+  registry.sendOutgoingComplete(at('b', 'room'), 'linn', 'inf_1', 'to b');
+
+  assert.deepEqual(sent.map((s) => [s.to, s.kind, s.text]), [
+    ['a', 'chunk', 'to a'], ['b', 'chunk', 'to b'], ['b', 'complete', 'to b'],
+  ], 'a, which no longer registers the channel, gets no complete');
+});
+
+test('a server disconnected and connected again mid-stream gets the rest of the stream once it registers the channel again, and nothing before', async () => {
+  const { registry, sent, connect, register } = makeStreamingRegistry();
+  connect('body', 'first');
+  await register('body', 'body:room');
+
+  registry.sendOutgoingChunk(at('body', 'body:room'), 'linn', 'inf_1', 0, 'Hello');
+  // The framework's disconnect path: the server's channels go with it.
+  registry.removeServer('body');
+  connect('body', 'second');
+  registry.sendOutgoingChunk(at('body', 'body:room'), 'linn', 'inf_1', 1, '\n\nwhile away');
+  await register('body', 'body:room');
+  registry.sendOutgoingChunk(at('body', 'body:room'), 'linn', 'inf_1', 2, '\n\nback');
+  registry.sendOutgoingComplete(at('body', 'body:room'), 'linn', 'inf_1', 'Hello\n\nwhile away\n\nback');
+
+  assert.deepEqual(sent.map((s) => [s.to, s.kind, s.text]), [
+    ['first', 'chunk', 'Hello'],
+    ['second', 'chunk', '\n\nback'],
+    ['second', 'complete', 'Hello\n\nwhile away\n\nback'],
+  ], 'a consumer that kept its utterance across the reconnect reconciles it from the complete');
+});
+
+test('a destination no chunk of a stream started at gets no complete for it, and a stream that started there gets one, once', async () => {
+  const { registry, sent, connect, register, revokeStreaming } = makeStreamingRegistry();
+  connect('a');
+  connect('b');
+  await register('a', 'room');
+  await register('a', 'hall');
+  await register('b', 'room');
+  revokeStreaming('b');
+
+  // b's grant doesn't take the stream, so nothing starts there.
+  registry.sendOutgoingChunk(at('b', 'room'), 'linn', 'inf_1', 0, 'to b');
+  registry.sendOutgoingChunk(at('a', 'room'), 'linn', 'inf_1', 1, 'to a');
+  registry.sendOutgoingComplete(at('b', 'room'), 'linn', 'inf_1', 'to b');
+  registry.sendOutgoingComplete(at('a', 'hall'), 'linn', 'inf_1', 'never sent');
+  registry.sendOutgoingComplete(at('a', 'room'), 'linn', 'inf_1', 'to a');
+  registry.sendOutgoingComplete(at('a', 'room'), 'linn', 'inf_1', 'to a');
+  registry.sendOutgoingComplete(at('a', 'room'), 'linn', 'inf_9', 'no such stream');
+
+  assert.deepEqual(sent.map((s) => [s.to, s.kind, s.inferenceId]), [['a', 'chunk', 'inf_1'], ['a', 'complete', 'inf_1']]);
+});
+
+test("a stream's rest goes nowhere once its server's grant has lost channels.streaming, and its record goes with its complete", async () => {
+  const { registry, sent, connect, register, revokeStreaming, streamsKept } = makeStreamingRegistry();
+  connect('body');
+  await register('body', 'body:room');
+
+  registry.sendOutgoingChunk(at('body', 'body:room'), 'linn', 'inf_1', 0, 'Hello');
+  revokeStreaming('body');
+  registry.sendOutgoingChunk(at('body', 'body:room'), 'linn', 'inf_1', 1, '\n\nand more');
+  registry.sendOutgoingComplete(at('body', 'body:room'), 'linn', 'inf_1', 'Hello\n\nand more');
+
+  assert.deepEqual(sent.map((s) => [s.kind, s.text]), [['chunk', 'Hello']]);
+  assert.equal(streamsKept(), 0, 'the complete that went nowhere still ended the record');
+});
+
+test("two streams at one destination are kept apart: one's complete leaves the other going on", async () => {
+  const { registry, sent, connect, register } = makeStreamingRegistry();
+  connect('body');
+  await register('body', 'body:room');
+
+  registry.sendOutgoingChunk(at('body', 'body:room'), 'linn', 'inf_1', 0, 'one');
+  registry.sendOutgoingChunk(at('body', 'body:room'), 'linn', 'inf_2', 0, 'two');
+  registry.sendOutgoingComplete(at('body', 'body:room'), 'linn', 'inf_1', 'one');
+  await registry.handleChanged('body', {
+    updated: [{ id: 'body:room', type: 'chat', label: 'body:room', direction: 'inbound' }],
+  } as never);
+  registry.sendOutgoingChunk(at('body', 'body:room'), 'linn', 'inf_2', 1, '\n\nstill two');
+  registry.sendOutgoingComplete(at('body', 'body:room'), 'linn', 'inf_2', 'two\n\nstill two');
+
+  assert.deepEqual(sent.map((s) => [s.kind, s.inferenceId, s.text]), [
+    ['chunk', 'inf_1', 'one'], ['chunk', 'inf_2', 'two'], ['complete', 'inf_1', 'one'],
+    ['chunk', 'inf_2', '\n\nstill two'], ['complete', 'inf_2', 'two\n\nstill two'],
+  ]);
+});
+
+test("a chunk whose send throws still started the stream, so its complete follows, for the consumer to reconcile; a complete whose send throws throws nothing out", async () => {
+  const { registry, sent, thrown, connect, register, refuse } = makeStreamingRegistry();
+  connect('body');
+  await register('body', 'body:room');
+
+  refuse('body', true);
+  registry.sendOutgoingChunk(at('body', 'body:room'), 'linn', 'inf_1', 0, 'Hello');
+  refuse('body', false);
+  registry.sendOutgoingComplete(at('body', 'body:room'), 'linn', 'inf_1', 'Hello');
+  registry.sendOutgoingChunk(at('body', 'body:room'), 'linn', 'inf_2', 0, 'Hi');
+  refuse('body', true);
+  assert.doesNotThrow(() => registry.sendOutgoingComplete(at('body', 'body:room'), 'linn', 'inf_2', 'Hi'));
+
+  assert.equal(thrown(), 2, 'the chunk and the second complete each reached the connection and threw');
+  assert.deepEqual(sent.map((s) => [s.kind, s.inferenceId]), [['complete', 'inf_1'], ['chunk', 'inf_2']]);
+});
+
+test('a stream keeps no record in the registry once each destination it started at has its complete', async () => {
+  // Every stream records where it started. A record that outlived its
+  // stream would stay for as long as the process runs.
+  const { registry, connect, register, streamsKept } = makeStreamingRegistry();
+  connect('body');
+  await register('body', 'body:room');
+  await register('body', 'body:hall');
+
+  registry.sendOutgoingChunk(at('body', 'body:room'), 'linn', 'inf_1', 0, 'Hello');
+  registry.sendOutgoingChunk(at('body', 'body:hall'), 'linn', 'inf_1', 1, 'Hi');
+  registry.sendOutgoingComplete(at('body', 'body:room'), 'linn', 'inf_1', 'Hello');
+  assert.equal(streamsKept(), 1, 'the stream still has the hall to end');
+  registry.sendOutgoingComplete(at('body', 'body:hall'), 'linn', 'inf_1', 'Hi');
+  assert.equal(streamsKept(), 0);
+});
+
+test('a bare channel id is resolved as before, at each call: to the one server that registers it, whose grant takes the stream, and nowhere once it is inbound-only', async () => {
+  const { registry, sent, connect, register, revokeStreaming } = makeStreamingRegistry();
+  connect('body');
+  connect('a');
+  connect('b');
+  connect('mute');
+  await register('body', 'body:room');
+  await register('a', 'shared');
+  await register('b', 'shared');
+  await register('mute', 'mute:room');
+  revokeStreaming('mute');
+
+  registry.sendOutgoingChunk('body:room', 'linn', 'inf_1', 0, 'Hello');
+  registry.sendOutgoingComplete('body:room', 'linn', 'inf_1', 'Hello');
+  // Two servers register the id, so it names no one channel.
+  registry.sendOutgoingChunk('shared', 'linn', 'inf_2', 0, 'to whom?');
+  registry.sendOutgoingComplete('shared', 'linn', 'inf_2', 'to whom?');
+  // Its server's grant doesn't take the stream.
+  registry.sendOutgoingChunk('mute:room', 'linn', 'inf_3', 0, 'unheard');
+  registry.sendOutgoingComplete('mute:room', 'linn', 'inf_3', 'unheard');
+  registry.sendOutgoingChunk('body:room', 'linn', 'inf_4', 0, 'Hi');
+  await registry.handleChanged('body', {
+    updated: [{ id: 'body:room', type: 'chat', label: 'body:room', direction: 'inbound' }],
+  } as never);
+  registry.sendOutgoingChunk('body:room', 'linn', 'inf_4', 1, '\n\nand more');
+  registry.sendOutgoingComplete('body:room', 'linn', 'inf_4', 'Hi\n\nand more');
+
+  assert.deepEqual(sent.map((s) => [s.to, s.kind, s.inferenceId, s.text]), [
+    ['body', 'chunk', 'inf_1', 'Hello'],
+    ['body', 'complete', 'inf_1', 'Hello'],
+    ['body', 'chunk', 'inf_4', 'Hi'],
+  ]);
+});
+
+test("two destinations whose ids join to the same string, registered one after the other, are still two destinations to the stream", async () => {
+  // Server a's channel `b:room` and server a:b's channel `room` would both be
+  // `a:b:room` joined with a colon.
+  const { registry, sent, connect, register } = makeStreamingRegistry();
+  connect('a');
+  connect('a:b');
+  await register('a', 'b:room');
+
+  registry.sendOutgoingChunk(at('a', 'b:room'), 'linn', 'inf_1', 0, 'to a');
+  await registry.handleChanged('a', { removed: ['b:room'] } as never);
+  await register('a:b', 'room');
+  await registry.handleChanged('a:b', {
+    updated: [{ id: 'room', type: 'chat', label: 'room', direction: 'inbound' }],
+  } as never);
+  // A new stream at a:b's inbound-only channel: it starts nothing there.
+  registry.sendOutgoingChunk(at('a:b', 'room'), 'linn', 'inf_1', 1, 'to a:b');
+  registry.sendOutgoingComplete(at('a', 'b:room'), 'linn', 'inf_1', 'to a');
+  registry.sendOutgoingComplete(at('a:b', 'room'), 'linn', 'inf_1', 'to a:b');
+
+  assert.deepEqual(sent.map((s) => [s.to, s.kind, s.text]), [['a', 'chunk', 'to a']],
+    "a, which no longer registers b:room, gets no complete, and a:b's stream never started");
 });
 
 test('a channel declared outbound or bidirectional, or with no direction, still takes speech, channel_publish and the stream', async () => {
@@ -898,6 +1188,7 @@ test('publishForAgent into an inbound-only channel is refused and traced as fail
   const refused = await registry.publishForAgent('body:ears', 'a thought', 'Subconscious');
   assert.equal(refused.success, false);
   assert.match(String(refused.error), /inbound-only: server "body" declared this channel's direction "inbound"/);
+  assert.equal(refused.reason, 'inbound-only');
   assert.equal(publishCalls.length, 0, 'nothing was published');
   assert.equal(routed().length, 0, 'speech that was never posted is not traced as routed');
   const failed = traces.filter((t) => t.type === 'mcpl:speech-route-failed');
@@ -909,6 +1200,7 @@ test('publishForAgent into an inbound-only channel is refused and traced as fail
 
   const posted = await registry.publishForAgent('body:home', 'a thought', 'Subconscious');
   assert.equal(posted.success, true);
+  assert.equal('reason' in posted, false);
   assert.deepEqual(publishCalls.map((c) => c.channelId), ['body:home']);
   // Shaped as routeSpeech's trace is, but without the surface's message id,
   // though the server named one ('m-77').
@@ -926,13 +1218,14 @@ test('publishForAgent traces a publish the server reports undelivered as failed,
     added: [{ id: 'body:home', type: 'chat', label: 'Body · home', direction: 'bidirectional' }],
   } as never);
 
-  await registry.publishForAgent('body:home', 'a thought', 'Subconscious');
+  const undelivered = await registry.publishForAgent('body:home', 'a thought', 'Subconscious');
 
   assert.deepEqual(publishCalls.map((c) => c.channelId), ['body:home']);
+  assert.equal('reason' in undelivered, false, 'a publish that went out carries no reason');
   assert.deepEqual(traces.filter((t) => t.type === 'mcpl:speech-routed'), []);
   assert.deepEqual(
     traces.filter((t) => t.type === 'mcpl:speech-route-failed').map((t) => [t.conversationId, t.channelId, t.reason, t.outcome]),
-    [['Subconscious', 'body:home', 'server "body" reported delivered:false', 'failed']],
+    [['Subconscious', 'body:home', 'the "body" server said it didn\'t post the message', 'failed']],
   );
 });
 
@@ -948,7 +1241,8 @@ test("publishForAgent traces what a rejected publish may have done: unknown afte
     throw new McplRequestError('The "body" server answered with an error: Rate limited after part 1', 'error-response', { posted: ['m-1'] });
   });
   const unconfirmed = await registry.publishForAgent('body:home', 'a long thought', 'Subconscious');
-  assert.equal(unconfirmed.error, 'Publish to body:home wasn\'t confirmed: The "body" server answered with an error: Rate limited after part 1 (delivery uncertain). It may or may not have been posted, so sending it again could post it twice. Connector detail: {"posted":["m-1"]}');
+  assert.equal('reason' in unconfirmed, false, 'a publish that went out carries no reason');
+  assert.equal(unconfirmed.error, 'Posting to channel "body:home" wasn\'t confirmed: The "body" server answered with an error: Rate limited after part 1 (delivery uncertain). It may or may not have been posted, so sending it again could post it twice. Connector detail: {"posted":["m-1"]}');
   assert.deepEqual(failed().map((t) => [t.reason, t.outcome, t.detail]),
     [['The "body" server answered with an error: Rate limited after part 1 (delivery uncertain)', 'unknown', '{"posted":["m-1"]}']],
     "the trace carries the connector's detail, as plain speech's does");
@@ -957,7 +1251,8 @@ test("publishForAgent traces what a rejected publish may have done: unknown afte
   setOnPublish(async () => {
     throw new McplRequestError('MCPL server "body" did not respond to channels/publish within 30000ms', 'no-response');
   });
-  await registry.publishForAgent('body:home', 'a thought', 'Subconscious');
+  const timedOut = await registry.publishForAgent('body:home', 'a thought', 'Subconscious');
+  assert.equal('reason' in timedOut, false, 'nor does one that timed out');
   assert.equal(failed()[1]!.outcome, 'unknown');
 
   // Only a request that never left proves nothing was posted.
@@ -965,7 +1260,8 @@ test("publishForAgent traces what a rejected publish may have done: unknown afte
     throw new McplRequestError('Cannot send request: connection to "body" is closed', 'not-sent');
   });
   const notSent = await registry.publishForAgent('body:home', 'another', 'Subconscious');
-  assert.match(notSent.error ?? '', /^Publish to body:home failed: .*is closed\. Nothing was posted\./);
+  assert.equal(notSent.error, 'Nothing was posted to channel "body:home": Cannot send request: connection to "body" is closed.');
+  assert.equal(notSent.reason, 'not-sent', 'one whose request was refused before anything was written is a refusal');
   assert.equal(failed()[2]!.outcome, 'failed');
   assert.equal('detail' in failed()[2]!, false, 'no detail when the connector sent none');
   assert.equal(traces.filter((t) => t.type === 'mcpl:speech-routed').length, 0);
@@ -1125,7 +1421,7 @@ test("an open's answer that declares no direction, or one that isn't inbound, le
     const { registry, publishCalls, failures, setOpenResult } = makeRegistry({ delivered: true });
     registry.ensureChannelRegistered('body', 'body:ears', 'Body · ears');
     setOpenResult(answer);
-    assert.deepEqual(await registry.routeSpeech('linn', 'hello', 'body:ears'), { delivered: true, channelId: 'body:ears' },
+    assert.deepEqual(await registry.routeSpeech('linn', 'hello', 'body:ears'), { delivered: true, serverId: 'body', channelId: 'body:ears' },
       `published after the answer ${JSON.stringify(answer)}`);
     assert.equal(publishCalls.length, 1);
     assert.equal(failures.length, 0);
@@ -1147,7 +1443,7 @@ test('a channel removed while the host opens it for speech is refused, and nothi
     assert.equal(await registry.routeSpeech('linn', 'hello', 'body:home'), null);
     assert.deepEqual(openCalls.map((c) => c.channelId), ['body:home']);
     assert.equal(publishCalls.length, 0, 'nothing was published to the removed channel');
-    assert.deepEqual(failures.map((f) => f.reason), ['channel is closed and open failed: Channel is no longer registered: body:home'],
+    assert.deepEqual(failures.map((f) => f.reason), ['opening the channel for these words didn\'t complete: the "body" server no longer lists the channel'],
       `refused as removed, after the answer ${JSON.stringify(answer)}`);
   }
 });
@@ -1160,14 +1456,16 @@ test("a server's refusal of an open or a tool's publish reaches the agent in its
   } as never);
   setOnOpen(async () => { throw refusal(); });
   assert.equal(await registry.routeSpeech('linn', 'hello', 'body:home'), null);
-  assert.deepEqual(failures.map((f) => f.reason), ['channel is closed and open failed: The "body" server answered with an error: Channel unavailable']);
+  assert.deepEqual(failures.map((f) => f.reason), ['opening the channel for these words didn\'t complete: The "body" server answered with an error: Channel unavailable']);
   const opened = await registry.handleChannelToolCall('channel_open', { channelId: 'body:home' }, { kind: 'agent', agentName: 'linn' });
-  assert.equal(opened.error, 'Failed to open channel: The "body" server answered with an error: Channel unavailable (it stays selected for opening: a later delivery or reconnect tries again, and channel_close withdraws that)');
+  assert.equal(opened.error, 'Opening channel "body:home" didn\'t complete; the open stays recorded, and this host tries it again when the ' +
+    '"body" server next registers this channel, if this host may open and close its channels then, or now if you call ' +
+    'channel_open again. The "body" server answered with an error: Channel unavailable.');
 
   setOnOpen(undefined);
   setOnPublish(async () => { throw new McplRequestError('The "body" server answered with an error: Channel not permitted', 'error-response'); });
   const published = await registry.handleChannelToolCall('channel_publish', { channelId: 'body:home', content: 'hi' }, { kind: 'agent', agentName: 'linn' });
-  assert.equal(published.error, 'Publish to body:home wasn\'t confirmed: The "body" server answered with an error: Channel not permitted (delivery uncertain). It may or may not have been posted, so sending it again could post it twice.');
+  assert.equal(published.error, 'Posting to channel "body:home" wasn\'t confirmed: The "body" server answered with an error: Channel not permitted (delivery uncertain). It may or may not have been posted, so sending it again could post it twice.');
 });
 
 test("an open's answer can't lift an inbound-only declaration: a server lifts it by changing or registering the channel (R1-3)", async () => {
@@ -1186,7 +1484,7 @@ test("an open's answer can't lift an inbound-only declaration: a server lifts it
   await registry.handleChanged('body', {
     updated: [{ id: 'body:ears', type: 'chat', label: 'Body · ears', direction: 'bidirectional' }],
   } as never);
-  assert.deepEqual(await registry.routeSpeech('linn', 'now', 'body:ears'), { delivered: true, channelId: 'body:ears' });
+  assert.deepEqual(await registry.routeSpeech('linn', 'now', 'body:ears'), { delivered: true, serverId: 'body', channelId: 'body:ears' });
   assert.equal(publishCalls.length, 1);
 });
 

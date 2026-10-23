@@ -88,7 +88,8 @@ describe('surgery and awareness marks', () => {
   // Reactions the fake server holds stay held for as long as a test needs
   // them to: the deadline is the longest the framework takes, unless a test
   // means it to run out.
-  async function start(withDiscord: boolean, awarenessDeadlineMs = 60_000): Promise<void> {
+  const AWARENESS_DEADLINE_MS = 60_000;
+  async function start(withDiscord: boolean, awarenessDeadlineMs = AWARENESS_DEADLINE_MS): Promise<void> {
     framework = await AgentFramework.create({
       storePath,
       membrane: new MockMembrane().asMembrane(),
@@ -531,13 +532,28 @@ describe('surgery and awareness marks', () => {
     // what it counted as able to land, one request per mark.
     assert.equal(sentBeforeRetract, cancelled.mayStillLand);
 
+    // The short deadline has done its part. A removal that went unanswered
+    // within it would stay owed, or be sent again, so the removals get the
+    // 60 s this file's start() gives by default. Once the first removal
+    // reaches Discord, Discord holds its answers for a second, past the
+    // short deadline, as a loaded host's slow round trip can.
+    (framework as unknown as { discordAwarenessDeadlineMs: number }).discordAwarenessDeadlineMs = AWARENESS_DEADLINE_MS;
+    rmSync(holdPath);
     const retracted = await framework.retractDiscordAwareness(batchId, { requester: { via: 'test', name: 'operator' } });
     assert.equal(retracted.removalsQueued, 3, 'one removal per selected message, whatever history says');
     assert.ok(retracted.keysWithUnresolvedAdds >= 1, 'the unknown add is disclosed, not assumed absent');
-    await waitFor('the removals to be sent', () =>
-      calls().slice(sentBeforeRetract).filter((c) => c.name === 'remove_reaction').length === retracted.removalsQueued);
-    await waitFor('nothing left to send', () => outbox().due().length === 0);
-    assert.ok(calls().slice(sentBeforeRetract).every((c) => c.name === 'remove_reaction'), 'the retract revived no add');
+    await waitFor('the first removal on the wire', () =>
+      calls().slice(sentBeforeRetract).some((c) => c.name === 'remove_reaction'));
+    await new Promise((resolve) => setTimeout(resolve, 1_000));
+    // Each add sent was answered at the first release, and no removal yet.
+    assert.equal(answered(), sentBeforeRetract, 'Discord answered no removal while it held its answers');
+    writeFileSync(holdPath, '1');
+    // Each removal is confirmed on its first try: one that went unanswered
+    // would stay owed, or be sent again.
+    await waitFor('each removal to be confirmed', () =>
+      entries().length === retracted.removalsQueued && entries().every((entry) => entry.confirmed === 'absent'));
+    assert.deepEqual(calls().slice(sentBeforeRetract).map((c) => c.name), Array(retracted.removalsQueued).fill('remove_reaction'),
+      'one removal sent per mark, and no add revived');
     const kinds = framework.getOperatorLog({ limit: 10 }).map((e) => e.kind);
     assert.ok(kinds.includes('awareness-cancel') && kinds.includes('awareness-retract'));
   });

@@ -43,9 +43,10 @@ const echo = (id: string, text: string, ...more: string[]): Round => ({
   results: `<function_results>${[id, ...more].map(() => '<result><stdout>{"echoed":"x"}</stdout></result>').join('')}</function_results>`,
 });
 const refusedWake = (id: string, text: string, wake: unknown = 60): Round => ({ text, calls: [{ id, name: 'skip_reply', input: { reason: 'later', wake_in_seconds: wake } }], results: '<function_results><error>refused</error></function_results>' });
-/** A round whose one call is a foreground code_execution script. */
+/** A round whose one call runs a code_execution script. */
 const script = (id: string, text: string, code: string): Round => ({ text, calls: [{ id, name: 'code_execution', input: { code } }], results: '<function_results><result><stdout></stdout></result></function_results>' });
-const REFUSED_IN_SCRIPT = 'await skip_reply({"wake_in_seconds": 60})';
+/** The refusal reaches the script as a ToolRefused Error, which it takes, so the script finishes. */
+const REFUSED_IN_SCRIPT = 'try { await tools.skip_reply({ wake_in_seconds: 60 }); } catch (error) { text(error.name); }';
 
 class XmlStream implements YieldingStream {
   private events: StreamEvent[] = [];
