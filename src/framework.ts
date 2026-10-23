@@ -9608,8 +9608,10 @@ export class AgentFramework {
     ok: boolean;
     error?: string;
     agentName?: string;
-    /** Agent state at queue time — 'idle' means the turn starts on the next
-     *  scheduler pass; anything else means it runs after the current turn. */
+    /** Agent state at queue time — 'idle' means no turn holds the agent, so
+     *  the turn starts on the next scheduler pass unless a provider hold (a
+     *  provider's stated wait, or a capacity cooldown) holds it until the hold
+     *  ends; anything else means it runs after the current turn. */
     agentStatus?: string;
     /** True when the host is quiesced: the wake is PARKED, not running, until resume(). */
     quiesced?: boolean;
@@ -9619,7 +9621,9 @@ export class AgentFramework {
     if (!name || !agent) {
       return { ok: false, error: `Unknown agent: ${String(agentName ?? '(none registered)')}` };
     }
-    const agentStatus = this.activeTurnTokens.has(name) && agent.state.status === 'idle'
+    // A turn is alive while its continuation is on its way, token or not
+    // (hasTurn), as the scheduler, which runs this wake, reads it.
+    const agentStatus = this.hasTurn(name) && agent.state.status === 'idle'
       ? 'idle+turn-alive'
       : agent.state.status;
     this.pendingRequests.push({
@@ -9720,8 +9724,10 @@ export class AgentFramework {
     /** For `nudge`/`unstick`: the host is quiesced, so the request is parked
      *  until resume rather than running. */
     quiesced?: boolean;
-    /** For `nudge`: agent state at queue time ('idle' = runs immediately,
-     *  else it runs once the current turn settles). */
+    /** For `nudge`: agent state at queue time ('idle' = no turn holds the
+     *  agent, so it runs on the next pass unless a provider hold, a stated
+     *  wait or a capacity cooldown, holds it; else it runs once the current
+     *  turn settles). */
     agentStatus?: string;
     /** For `release-provider-wait`: the waits released. */
     released?: Array<{ model: string; until: string | null }>;

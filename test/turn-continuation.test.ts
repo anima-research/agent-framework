@@ -1365,3 +1365,20 @@ describe("stop() and the turns whose continuations are on their way", () => {
     }
   });
 });
+
+describe("a nudge while the agent's turn waits for its continuation", () => {
+  it('reports the agent as idle+turn-alive, as the scheduler reads it', async () => {
+    const h = await restartTurn({ wait: true });
+    try {
+      await waitFor('the continuation to be held, its frame gone', () => heldForWait(h.framework) && frameLetGo(h.framework));
+      const result = h.framework.nudgeAgent('prime', 'zz-operator');
+      assert.deepEqual(result, { ok: true, agentName: 'prime', agentStatus: 'idle+turn-alive' });
+      assert.ok(h.logged.includes('[nudge] agent=prime queued by=zz-operator status=idle+turn-alive'));
+      const recorded = h.traces.find((t) => t.type === 'operator:action' && (t as { kind?: string }).kind === 'nudge') as { result?: { agentStatus?: string } } | undefined;
+      assert.equal(recorded?.result?.agentStatus, 'idle+turn-alive', 'the operator-action record says so too');
+      assert.deepEqual(h.framework.getHostModeStatus().activeTurnAgents, ['prime']);
+    } finally {
+      await h.cleanup();
+    }
+  });
+});
