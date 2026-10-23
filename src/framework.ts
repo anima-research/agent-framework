@@ -14793,8 +14793,12 @@ export class AgentFramework {
       // downstream turn semantics. An ordinary wake can already be pending
       // when the tool boundary appends a context-budget restart; selecting
       // requests[0] in that mixed batch bypassed the turn lock because a
-      // restart existed, then treated the continuation as a fresh turn.
-      const trigger = budgetRestart ?? requests[0];
+      // restart existed, then treated the continuation as a fresh turn. The
+      // same holds for the tool-result guard's retry, which a provider hold
+      // can release in one batch with a wake it held before it: a batch that
+      // carries a continuation of the agent's turn starts as that
+      // continuation, a budget restart first.
+      const trigger = budgetRestart ?? requests.find((r) => r.reason === 'tool_result_guard_retry') ?? requests[0];
       // The bounce-wake cap (bounceProse) stops a bounce → wake → bounce loop
       // that nothing else feeds. A turn with a cause of its own is not that
       // loop, so the count starts again. Otherwise only a delivered prose

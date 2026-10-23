@@ -945,6 +945,76 @@ describe('a turn whose continuation is dropped ends there', () => {
 });
 
 
+/** prime's tool-result guard retry, held by a provider wait stated while
+ *  its tool ran, its frame gone. `duringTool` runs as the tool starts. The
+ *  start of each stream records the trigger it ran on (startedTriggers). */
+async function guardRetryHeld(duringTool?: (framework: AgentFramework) => void) {
+  const tempDir = mkdtempSync(join(tmpdir(), 'turn-continuation-'));
+  const membrane = new SequentialStreamMembrane([2]);
+  membrane.pushResponse(createMockResponse([{ type: 'tool_use', id: 'call_1', name: 'guarded--read', input: {} }], 'tool_use'));
+  membrane.pushResponse({
+    ...createMockResponse([{ type: 'text', text: 'partial' }], 'refusal'),
+    raw: { request: {}, response: { stop_details: { category: 'test-category' } } },
+  } as NormalizedResponse);
+  membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Recovered.' }]));
+  membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Again.' }]));
+  let framework!: AgentFramework;
+  const module = {
+    name: 'guarded',
+    async start() {},
+    async stop() {},
+    getTools: () => [{ name: 'read', description: 'read', inputSchema: { type: 'object', properties: {} } }],
+    async handleToolCall() {
+      duringTool?.(framework);
+      await sleep(50);
+      internals(framework).providerWaits.set('prime', 'test-model', WAIT_MS, 'stated while the tool ran');
+      await sleep(50);
+      return { success: true, data: 'payload' };
+    },
+    async onProcess() { return {}; },
+  } as unknown as Module;
+  framework = await AgentFramework.create({
+    storePath: join(tempDir, 'store'),
+    membrane: membrane.asMembrane(),
+    agents: [{
+      name: 'prime', model: 'test-model', systemPrompt: 'You are prime.', allowedTools: 'all',
+      toolResultGuard: true, refusalHandling: { retries: 3 },
+    } as never],
+    modules: [module],
+    syncIntervalMs: 0,
+    gate: { config: { policies: [], default: 'always' } },
+  } as never);
+  const traces: TraceEvent[] = [];
+  const startedTriggers: string[] = [];
+  framework.onTrace((e) => {
+    traces.push(e);
+    if (e.type === 'inference:started') {
+      const t = (framework as unknown as { activeTurnTriggers: Map<string, InferenceRequest> }).activeTurnTriggers.get('prime');
+      startedTriggers.push(t?.reason ?? 'none');
+    }
+  });
+  const logged: string[] = [];
+  const origError = console.error;
+  console.error = (...args: unknown[]) => { logged.push(args.map(String).join(' ')); origError(...args); };
+  const cleanup = async () => {
+    console.error = origError;
+    await framework.stop();
+    rmSync(tempDir, { recursive: true, force: true });
+  };
+  try {
+    framework.getAgent('prime')!.getContextManager().addMessage('user', [{ type: 'text', text: 'read it' }]);
+    framework.start();
+    internals(framework).pendingRequests.push({ agentName: 'prime', reason: 'mcpl:push-event', source: 'test', timestamp: Date.now() });
+    await waitFor('the guard retry to be held, its frame gone', () =>
+      (internals(framework).providerAccelerationCooldowns.get('prime')?.heldRequests.some((r) => r.reason === 'tool_result_guard_retry') ?? false)
+      && frameLetGo(framework), 15_000);
+  } catch (error) {
+    await cleanup();
+    throw error;
+  }
+  return { framework, membrane, traces, logged, cleanup, startedTriggers };
+}
+
 describe('a framework cancel that throws', () => {
   it('a restart whose cancel throws leaves the turn going, with no mark and no continuation, for a caller to stop', async () => {
     // What a listener of the operator alert finds queued as the alert goes out.
@@ -1193,4 +1263,31 @@ describe('a framework cancel that throws', () => {
       }
     });
   }
+});
+
+describe('a batch that carries a continuation of the turn', () => {
+  it("starts as a tool-result guard's retry when a provider hold releases it with a wake it held before it", async () => {
+    const h = await guardRetryHeld((fw) => {
+      // A wake for prime arrives while its tool runs, and the hold takes it before the retry.
+      internals(fw).pendingRequests.push({ agentName: 'prime', reason: 'timer', source: 'test', timestamp: Date.now() });
+    });
+    try {
+      const held = internals(h.framework).providerAccelerationCooldowns.get('prime')!.heldRequests.map((r) => r.reason);
+      assert.deepEqual(held, ['timer', 'tool_result_guard_retry'], 'the wake is held ahead of the retry');
+      const gate = internals(h.framework).eventGate as { onInferenceStarted(name: string): void; onInferenceResumed(name: string): void };
+      const windows: string[] = [];
+      const started = gate.onInferenceStarted.bind(gate);
+      const resumed = gate.onInferenceResumed.bind(gate);
+      gate.onInferenceStarted = (name) => { if (name === 'prime') windows.push('started'); started(name); };
+      gate.onInferenceResumed = (name) => { if (name === 'prime') windows.push('resumed'); resumed(name); };
+      h.framework.releaseProviderWait('prime');
+      await waitFor('the turn to answer', () => h.traces.some((t) => t.type === 'inference:completed'));
+      // The start runs on the retry, and resumes its turn's gate window rather than opening one.
+      assert.deepEqual({ triggers: h.startedTriggers, windows }, { triggers: ['mcpl:push-event', 'tool_result_guard_retry'], windows: ['resumed'] });
+      await aPass(h, 'a pass after the turn');
+      assert.equal(h.startedTriggers.length, 2, 'the wake went with that start, and starts no turn of its own');
+    } finally {
+      await h.cleanup();
+    }
+  });
 });
