@@ -509,6 +509,59 @@ describe('a stream counts its usage once, however it ends', () => {
   }
 });
 
+/** Its first stream holds a tool round over the budget and the turn's end; a later stream, a restart's, the end alone. */
+class ToolRoundThenFinal extends MockMembrane {
+  override streamYielding(request: NormalizedRequest): YieldingStream {
+    this.calls.push(request);
+    const stream = new MockYieldingStream(this.calls.length === 1
+      ? [toolResponse('echo', 'echo-1', firstUsage), finalResponse('Recovered.', secondUsage)]
+      : [finalResponse('Recovered.', secondUsage)]);
+    this.lastStream = stream;
+    return stream;
+  }
+}
+
+describe('an agent whose model binds its thinking, with its window size set, takes no new stream mid-turn for budget alone', () => {
+  // A budget restart compiles afresh mid-turn, and what that compile changes ahead of the turn's own earlier rounds
+  // takes their reasoning out of the request (context-manager #155's part 3). The window projection still guards.
+  const huge = 1_000_000;
+  for (const [label, limits, restarts] of [
+    ['binds, with a window size: the stream goes on', { thinkingBinding: { binds: true }, physicalWindowTokens: huge }, false],
+    ['binds, with no window size: the budget restart, as before', { thinkingBinding: { binds: true } }, true],
+    ['a window size, without binds: the budget restart, as before', { physicalWindowTokens: huge }, true],
+  ] as const) {
+    it(label, async () => {
+      const dir = mkdtempSync(join(tmpdir(), 'af-binds-budget-'));
+      const membrane = new ToolRoundThenFinal();
+      const framework = await AgentFramework.create({
+        storePath: join(dir, 'store.chronicle'), membrane: membrane.asMembrane(), agents: [],
+        modules: [new TurnTools()], syncIntervalMs: 0,
+      });
+      const traces: TraceEvent[] = [];
+      framework.onTrace((event) => traces.push(event));
+      framework.start();
+      const tornDown = streamsDriven(framework);
+      try {
+        const { agent, contextManager } = await framework.createEphemeralAgent({
+          name: 'worker', model: 'test-model', systemPrompt: 'Do the task.', allowedTools: 'all',
+          proseRouting: 'disabled', maxStreamTokens: 50, ...limits,
+        });
+        contextManager.addMessage('user', [{ type: 'text', text: 'Run once.' }]);
+        await framework.runEphemeralToCompletion(agent, contextManager);
+        await tornDown();
+        const restarted = traces.filter((e) => e.type === 'inference:stream_restarted');
+        assert.ok(firstUsage.inputTokens! > 50, 'the first call is over the budget');
+        assert.deepEqual(restarted.map((e) => (e as { reason?: string }).reason), restarts ? ['context_budget'] : []);
+        assert.equal(membrane.calls.length, restarts ? 2 : 1, restarts ? 'the restart opened a second stream' : 'one stream, its tool round included');
+        assert.equal(traces.filter((e) => e.type === 'inference:completed').length, 1, 'the turn completed');
+      } finally {
+        await framework.stop();
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
+  }
+});
+
 class InputModule implements Module {
   readonly name = 'input';
   async start() {}

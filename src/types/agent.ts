@@ -81,7 +81,11 @@ export interface AgentConfig {
   temperature?: number;
 
   /** Max input tokens before framework breaks a yielding stream and
-   *  restarts with recompiled (compressed) context. Default: 150000. */
+   *  restarts with recompiled (compressed) context. Default: 150000. Not
+   *  checked mid-turn for an agent whose model binds its thinking
+   *  (`thinkingBinding.binds`) with `physicalWindowTokens` set: a new stream
+   *  there would take the turn's own earlier reasoning out of the request, and
+   *  the window projection still guards the provider's hard cap. */
   maxStreamTokens?: number;
 
   /**

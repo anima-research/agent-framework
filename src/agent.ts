@@ -261,8 +261,10 @@ export class Agent {
    *  conversation changed (see AgentConfig.thinkingBinding.dropBlock). */
   private readonly thinkingDropBlock: boolean;
   /** Whether the model binds its signed thinking to the conversation before
-   *  it (see AgentConfig.thinkingBinding.binds). */
-  private readonly thinkingBinds: boolean;
+   *  it (see AgentConfig.thinkingBinding.binds). The framework reads it at a
+   *  tool boundary: such an agent with a window size set takes no new stream
+   *  mid-turn for budget alone. */
+  readonly thinkingBinds: boolean;
   /** Refusal auto-rewind policy (see AgentConfig.refusalHandling). */
   readonly refusalHandling: AgentConfig['refusalHandling'];
   readonly toolResultGuard: ToolResultGuard;

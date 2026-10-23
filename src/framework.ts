@@ -12513,8 +12513,13 @@ export class AgentFramework {
           // Check if any tool result requested endTurn
           const shouldEndTurn = currentState.toolResults.some(tc => tc.result.endTurn);
 
-          // Check if accumulated input tokens exceed the agent's budget
+          // Check if accumulated input tokens exceed the agent's budget. Not for an agent whose model binds its
+          // thinking with its window size set (thinkingBinding.binds, physicalWindowTokens): a new stream mid-turn
+          // compiles afresh, and what that compile changes ahead of the turn's own earlier rounds takes their
+          // reasoning out of the request mid-step. The window projection below still breaks the stream before a
+          // request the window can't hold (issue #92).
           const overBudget = currentState.stream
+            && !(agent.thinkingBinds && agent.physicalWindowTokens !== undefined)
             && agent.lastStreamInputTokens > 0
             && agent.lastStreamInputTokens > agent.maxStreamTokens;
 
