@@ -10,10 +10,10 @@
   stretch, as during any live turn.
 - A turn whose continuation is dropped by an abandon, `stop()`, the
   inference policy, the agent's removal or a conversation agent's disposal
-  now ends. It writes one `inference:aborted`, releases the EventGate window
-  it held for the continuation, closes its logical turn and stops its
-  typing, and the tool-result guard's pending batch is withheld from later
-  requests, as for a turn that ends before it sends anything. A provider
-  hold left empty by the drop releases without queueing a retry turn. An
-  ephemeral run that ends takes such a continuation with it, its own end
-  having ended the turn.
+  now ends, with one `inference:aborted`. A drop other than an abandon or a
+  stop also releases the EventGate window held for the continuation,
+  closes the turn's logical turn and withholds the tool-result guard's
+  pending batch from later requests, as for a turn that ends before it
+  sends anything. A provider hold left empty by the drop releases without
+  queueing a retry turn. An ephemeral run that ends takes such a
+  continuation with it, its own end having ended the turn.
