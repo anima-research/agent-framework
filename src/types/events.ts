@@ -299,7 +299,10 @@ export interface ToolCall {
    * leaves room for them; and a result nested past 2,000 levels, or whose parse
    * needs more of the script's memory than is free, doesn't reach the script
    * whatever its length. A result that doesn't reach it is answered
-   * ResultTooLarge, the call having taken effect. Nothing is cut or saved to
+   * ResultTooLarge, the call having taken effect. One the host can't convert
+   * to JSON at all, such as one nested deeper than its runtime's
+   * JSON.stringify can take, is answered instead as a failure naming the
+   * tool and saying the call itself completed. Nothing is cut or saved to
    * a file. A tool that pages or budgets its answer can stay under it. The
    * framework sets it on a model's, a script's and the operator's puppet's
    * call to a module, a utility run through `utils` included. A call

@@ -123,6 +123,9 @@ interface Harness {
   prefixes: Map<string, string>;
   /** Runs while a server answers a call, before its answer. */
   duringServerCall: (fn: () => void) => void;
+  /** From now on, records what the tool lifecycle (RFC-007) is told, each
+   *  method's name and arguments, and the framework's traces of tools' outcomes. */
+  observe: () => { lifecycle: unknown[][]; outcomes: Array<{ type: string; error?: string }> };
 }
 
 async function withPeers(fn: (h: Harness) => Promise<void>, opts: { eager?: boolean } = {}): Promise<void> {
@@ -190,6 +193,21 @@ async function withPeers(fn: (h: Harness) => Promise<void>, opts: { eager?: bool
       exit: async (result, tool, toServer) => (await internals.scriptResultAnswer.call(framework, result, tool, toServer)).json,
       prefixes: internals.mcplPrefixMap,
       duringServerCall: (fn) => { during = fn; },
+      observe: () => {
+        // Each method answers undefined, as an absent emitter's optional
+        // call does, so the calls take the path a host with no lifecycle
+        // observers takes, and onResult is told what a terminal reads.
+        const lifecycle: unknown[][] = [];
+        const outcomes: Array<{ type: string; error?: string }> = [];
+        (framework as unknown as { toolLifecycleEmitter: unknown }).toolLifecycleEmitter = new Proxy({}, {
+          get: (_target, method) => (...args: unknown[]) => { lifecycle.push([method, ...args]); return undefined; },
+        });
+        framework.onTrace((event) => {
+          const { type, error } = event as { type: string; error?: string };
+          if (type === 'tool:completed' || type === 'tool:failed') outcomes.push({ type, ...(error !== undefined ? { error } : {}) });
+        });
+        return { lifecycle, outcomes };
+      },
     });
   } finally {
     await framework.stop();
@@ -490,6 +508,58 @@ test("a module's structured blocks that JSON can't convert reach a script as a f
     assert.equal(object.isError, true);
     assert.equal(object.structuredContent, null);
     assert.match(object.content[0].text, /^tool 'fwd--whole' returned a result that can't be converted to JSON/);
+  });
+});
+
+test("an MCPL peer's structured blocks too deep to convert to JSON reach a script as a failure naming the tool, the call completed", async () => {
+  await withPeers(async ({ answer, script, observe }) => {
+    const seen = observe();
+    // JSON.stringify overflows the stack past some depth where JSON.parse
+    // doesn't: on Node 24.19 an array 5,000 deep does, on Bun 1.4.4 one
+    // 200,000 deep. This one is 200,000 deep, for both.
+    let deep: unknown = 'bottom';
+    for (let i = 0; i < 200_000; i++) deep = [deep];
+    answer({ content: [{ type: 'text', text: 'a deep report', deep }], structuredContent: {} });
+    const object = JSON.parse(await script('mcpl--files--attach')) as {
+      content: [{ text: string }]; structuredContent: unknown; isError: boolean;
+    };
+    assert.equal(object.isError, true);
+    assert.equal(object.structuredContent, null);
+    // The reason is the overflow the guard caught, in both runtimes' words.
+    assert.match(object.content[0].text, /^tool 'mcpl--files--attach' returned a result that can't be converted to JSON, so the script can't receive it \(Maximum call stack size exceeded\.?\)\. The call itself completed\.$/);
+    // No failed dispatch: only the script lane's treatment failed, so the
+    // trace and the call's terminal read the peer's own answer, a success,
+    // as on v0.26.1.
+    assert.deepEqual(seen.outcomes, [{ type: 'tool:completed' }]);
+    assert.deepEqual(seen.lifecycle.filter(([method]) => method === 'markDispatchFailure'), []);
+    const terminals = seen.lifecycle.filter(([method]) => method === 'onResult').map(([, , , result]) => result as ToolResult);
+    assert.deepEqual(terminals.map((r) => [r.success, r.isError === true, r.data]), [[true, false, []]]);
+    // A failing answer that deep keeps the peer's own error, as the exit's
+    // answer to any failing result it can't convert does.
+    answer({ content: [{ type: 'text', text: 'the vault refused', deep }], structuredContent: {}, isError: true });
+    const failing = JSON.parse(await script('mcpl--files--attach')) as { content: [{ text: string }]; isError: boolean };
+    assert.equal(failing.isError, true);
+    assert.match(failing.content[0].text, /\. The call itself completed, with this error: the vault refused$/);
+    // Its trace and terminal read the peer's error answer, with no blocks,
+    // and no failed dispatch is marked for either call.
+    assert.deepEqual(seen.outcomes[1], { type: 'tool:failed', error: 'the vault refused' });
+    assert.deepEqual(seen.lifecycle.filter(([method]) => method === 'markDispatchFailure'), []);
+    const both = seen.lifecycle.filter(([method]) => method === 'onResult').map(([, , , result]) => result as ToolResult);
+    assert.deepEqual(both.map((r) => [r.success, r.isError === true, r.data]), [[true, false, []], [false, true, []]]);
+  });
+});
+
+test("a reference nested in an MCPL peer's block reaches a script with savedTo: null, as it isn't fetched", async () => {
+  await withPeers(async ({ answer, script, fetched }) => {
+    // Both would be saved if fetched (the test's fetcher saves a report.pdf).
+    const top = { type: 'resource', uri: 'https://files.example.invalid/top/report.pdf?sig=top-token', name: 'report.pdf', mimeType: 'application/pdf' };
+    const nested = { ...top, uri: 'https://files.example.invalid/nested/report.pdf?sig=nested-token' };
+    answer({ content: [top, { type: 'text', text: 'see attached', attachment: nested }], structuredContent: {} });
+    const [shownTop, block] = (JSON.parse(await script('mcpl--files--attach')) as { content: Array<Record<string, unknown>> }).content;
+    assert.equal(shownTop.savedTo, SAVED, 'a top-level reference is fetched for the script');
+    const attachment = block.attachment as Record<string, unknown>;
+    assert.deepEqual([typeof attachment.refId, attachment.savedTo, 'uri' in attachment], ['string', null, false]);
+    assert.deepEqual(fetched, [top.uri], 'the nested reference is registered, not fetched');
   });
 });
 
