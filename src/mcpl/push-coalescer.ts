@@ -258,9 +258,10 @@ export interface CoalescingReceiptRecord {
   /** History the subject was created with, for a subject first seen by this receipt. */
   born?: SubjectState<unknown>['history'];
   /** The subject's first view had ended by this acceptance
-   *  (SubjectState.firstViewEnded), so a crash before the snapshot flush
-   *  can't forget the end. A record written before this field existed has
-   *  none and reads as not ended, as a snapshot does. */
+   *  (SubjectState.firstViewEnded), or by the time a retry wrote the record,
+   *  so a crash before the snapshot flush can't forget the end. A record
+   *  written before this field existed has none and reads as not ended, as a
+   *  snapshot does. */
   firstViewEnded?: true;
   /** The subject's pending batch AFTER this acceptance: the accepted work
    *  itself (so a crash before the snapshot flush cannot lose it while keeping
@@ -599,9 +600,11 @@ export class PushCoalescer<E = unknown> {
   }
 
   private async admit(occurrence: CoalescedOccurrence<E>): Promise<PushEventResult> {
-    if (this.suspended) throw new CoalesceError('serverId', 'host is stopping', -32000);
-    const subject = coalescingSubjectKey(occurrence.serverId, occurrence.binding, occurrence.scope, occurrence.key);
     const duplicate = this.receiptEntry(coalescingReceiptKey(occurrence.serverId, occurrence.binding, occurrence.eventId));
+    // A retry of an occurrence admitted before the stop is refused too, but
+    // as one admitted: its effects are in, so no lane may say it wasn't.
+    if (this.suspended) throw new CoalesceError('serverId', 'host is stopping', -32000, duplicate ? { admitted: true } : {});
+    const subject = coalescingSubjectKey(occurrence.serverId, occurrence.binding, occurrence.scope, occurrence.key);
     if (duplicate) {
       // A producer retrying acknowledged work is also a chance to notice a
       // batch left asleep by a failed freeze: wake it now, without effects.
@@ -638,8 +641,9 @@ export class PushCoalescer<E = unknown> {
     // §3.1). Its record is written and made durable before an acknowledgement
     // (acknowledge), by this answer or a retry's. While this process lives,
     // the in-memory receipt deduplicates a retry, which writes or commits
-    // what failed; after a kill nothing of it exists and the retry is a fresh
-    // acceptance.
+    // what failed. The snapshot carries it too, so a later save and commit
+    // keep it across a restart; a kill before either leaves nothing of it,
+    // and the retry is a fresh acceptance.
     const entry: ReceiptEntry = {
       result: structuredClone(result), at: this.now(), committed: false, unwritten: { subject, ...(born ? { born } : {}) },
       ...(this.deliveredFirstView ? { firstView: true as const } : {}),
@@ -669,7 +673,9 @@ export class PushCoalescer<E = unknown> {
     const state = this.subjects.get(fixed.subject);
     const batch = state?.batch ?? state?.rendering?.batch;
     this.host.recordReceipt?.({
-      key, result: entry.result, at: entry.at, subject: fixed.subject, ...(fixed.born ? { born: fixed.born } : {}),
+      // A birth is the subject's only while the coalescer still holds it: one
+      // evicted since its admission is untracked, `unknown` (prune).
+      key, result: entry.result, at: entry.at, subject: fixed.subject, ...(fixed.born && state ? { born: fixed.born } : {}),
       ...(state?.firstViewEnded ? { firstViewEnded: true as const } : {}),
       batch: batch ? structuredClone({ latest: batch.latest as CoalescedOccurrence<unknown>, notices: batch.notices, dropped: batch.dropped }) : null,
     });

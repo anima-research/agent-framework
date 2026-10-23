@@ -8,13 +8,17 @@
   is kept. A retry writes it again and makes it durable, then answers the first
   result without repeating an effect, as RFC-006 §3.1 has a coalescing host
   do. While the write keeps failing, each retry gets the same answer and
-  repeats nothing. A retry that reaches a host restarted since, when nothing
-  of the receipt was saved before the restart, as after a kill, is still
-  admitted as a new occurrence.
+  repeats nothing. A host killed before a later save and commit carried the
+  receipt still admits the retry as a new occurrence.
 - On `channels/incoming`, a coalesced message admitted whose receipt couldn't
   be written or made durable was answered `accepted: false`, which says it
   wasn't admitted, so a producer could hold it as never delivered. The request
-  is now answered with a -32000 error carrying the same message, the answer
-  the spec gives when a message may have been admitted, and the messages after
-  it in the request aren't admitted until they're sent again. A failure before
-  any effect, such as "host is stopping", is still a per-message refusal.
+  is now answered with a -32000 error carrying the same message, since a
+  per-message result can only say a message was taken or wasn't, and the
+  messages after it in the request aren't admitted until they're sent again.
+  An uncoalesced message before it in the same request is admitted again when
+  the request is sent again. A retry of an admitted message while the host is
+  stopping fails the request the same way. A failure before any effect, such
+  as "host is stopping" for a new message, is still a per-message refusal.
+- A save of the coalescing state that fails is kept for the next save or the
+  host's stop, instead of being dropped until the state next changes.

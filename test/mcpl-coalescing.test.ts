@@ -842,14 +842,15 @@ test('R10: a retry after a failed commit is acknowledged only once the commit su
   assert.equal(f.framework.getAgent('agent')!.getContextManager().getAllMessages().filter((m) => JSON.stringify(m.content).includes('other')).length, 1, 'plain: delivered exactly once across the failed and successful acknowledgement');
 });
 
-/** Make the host's next `times` writes of the coalescing receipt records
- *  fail, as a full disk would; returns how many are still to fail. */
+/** Make the host's next `times` writes of a coalescing receipt record fail,
+ *  as a full disk would; returns how many are still to fail. A write that
+ *  only empties the list, as the snapshot flush's does, isn't counted. */
 function failReceiptWrites(f: Awaited<ReturnType<typeof fixture>>, times: number): () => number {
   const store = (f.framework as unknown as { store: { setStateJson: (id: string, value: unknown) => void } }).store;
   const orig = store.setStateJson.bind(store);
   let left = times;
   store.setStateJson = (id, value) => {
-    if (id === 'mcpl/coalescing-recent' && left > 0) { left--; throw new Error('ENOSPC simulated'); }
+    if (id === 'mcpl/coalescing-recent' && Array.isArray(value) && value.length > 0 && left > 0) { left--; throw new Error('ENOSPC simulated'); }
     orig(id, value);
   };
   return () => left;
@@ -943,6 +944,41 @@ test('a coalescer failure before any effect stays a per-message refusal on the c
   const answer = await f.send('channels/incoming', { messages: [f.channel('s1', 'stopping_message', { initial: true })] });
   assert.deepEqual(answer.result, { results: [{ messageId: 'm', accepted: false, reason: 'host is stopping' }] });
   assert.equal(copies(f, 'stopping_message'), 0);
+});
+
+test('a retry of an admitted message while the host is stopping fails the request on the channel lane, not the message', async (t) => {
+  const f = await fixture(); t.after(f.close);
+  await f.register();
+  failReceiptWrites(f, 1);
+  const send = () => f.send('channels/incoming', { messages: [f.channel('s1', 'stop_copy', { initial: true })] });
+  assert.equal((await send()).error?.code, -32000);
+  (f.framework as unknown as { pushCoalescer: PushCoalescer<unknown> }).pushCoalescer.suspend();
+  const retry = await send();
+  assert.deepEqual(retry.error && { code: retry.error.code, message: retry.error.message }, { code: -32000, message: 'host is stopping' });
+});
+
+test('a coalescing save that fails stays unsaved, so the stop saves it and a retry after the restart is answered from the receipt it carries', async (t) => {
+  const f = await fixture(); t.after(f.close);
+  f.alwaysRespond();
+  failReceiptWrites(f, 1);
+  const store = (f.framework as unknown as { store: { setStateJson: (id: string, value: unknown) => void } }).store;
+  const write = store.setStateJson.bind(store);
+  let failSnapshot = 1;
+  store.setStateJson = (id, value) => {
+    if (id === 'mcpl/coalescing' && failSnapshot > 0) { failSnapshot--; throw new Error('ENOSPC simulated'); }
+    write(id, value);
+  };
+  const send = () => f.send('push/event', f.params('e1', 'plain_copy', { initial: true }));
+  assert.equal((await send()).error?.code, -32000, "the receipt's record wasn't written");
+  // The throttled save fails too: only the receipt in memory holds the admission.
+  (f.framework as unknown as { flushCoalescingSnapshot: () => void }).flushCoalescingSnapshot();
+  assert.equal(failSnapshot, 0, 'the save failed');
+  await f.framework.runUntilIdle();
+  await f.framework.stop(); await f.create();
+  const retry = await send();
+  assert.deepEqual(retry.result, { accepted: true, coalesce: { outcome: 'first' } }, 'answered from the receipt the stop saved');
+  await f.framework.runUntilIdle();
+  assert.equal(copies(f, 'plain_copy'), 1);
 });
 
 test('a receipt write that fails on the send and every resend repeats no effect, and the first resend after it works answers the first result', async (t) => {
@@ -3563,6 +3599,8 @@ test("a receipt whose write failed is written by the producer's retry with the s
   assert.deepEqual(retry, { accepted: true, coalesce: { outcome: 'first' } }, "the retry answers the admission's result");
   assert.equal(records.length, 1, 'the retry wrote the record');
   assert.equal(records[0].batch, null, 'with the batch the subject has now: none, since it rendered');
+  await p.coalescer.accept(p.occurrence('n1', { deferred: true, initial: true }));
+  assert.equal(records.length, 1, 'once written, a later retry writes it no more');
   // A crash before the throttled snapshot: only the record survives.
   const restored = new PushCoalescer<null>(p.host);
   restored.restoreReceipts(records);
@@ -3599,15 +3637,54 @@ test("a receipt a retry writes while its batch renders records that batch, so a 
   await assembling;
 });
 
+test('a snapshot carries a receipt whose record was never written, so a coalescer restored from it answers the retry from that receipt', async () => {
+  const state = { shown: false, read: false };
+  const p = firstViewProbe(state, { held: [], stored: ['p1'] });
+  p.host.recordReceipt = () => { throw new Error('ENOSPC simulated'); };
+  await assert.rejects(p.coalescer.accept(p.occurrence('p1', { initial: true })), (error: { code?: number }) => error.code === -32000);
+  const snapshot = p.coalescer.snapshot();
+  const restored = new PushCoalescer<null>({ ...p.host, recordReceipt: () => {} });
+  restored.restore(snapshot);
+  const retry = await restored.accept(p.occurrence('p1', { initial: true }));
+  assert.deepEqual(retry, { accepted: true, coalesce: { outcome: 'first' } });
+  assert.deepEqual(p.delivered, [{ eventId: 'p1' }], 'delivered once');
+});
+
+test("a retry's record for a subject evicted since its admission says nothing of the subject's birth", async () => {
+  const state = { shown: false, read: false };
+  const p = firstViewProbe(state, { held: [], stored: ['p1', 'q1'] });
+  const records: CoalescingReceiptRecord[] = [];
+  let failing = 1;
+  p.host.recordReceipt = (record) => {
+    if (failing > 0) { failing--; throw new Error('ENOSPC simulated'); }
+    records.push(structuredClone(record));
+  };
+  const coalescer = new PushCoalescer<null>(p.host, { maxSubjects: 1 });
+  await assert.rejects(coalescer.accept(p.occurrence('p1', { initial: true })), (error: { code?: number }) => error.code === -32000);
+  // Read, then withdrawn with nothing to say: the subject is idle.
+  state.read = true;
+  assert.equal((await coalescer.accept(p.occurrence('r1', { retract: true, content: [] }))).coalesce?.outcome, 'consumed');
+  state.read = false;
+  // A second subject evicts it.
+  await coalescer.accept({ ...p.occurrence('q1', { initial: true }), key: 'other' });
+  const retry = await coalescer.accept(p.occurrence('p1', { initial: true }));
+  assert.deepEqual(retry, { accepted: true, coalesce: { outcome: 'first' } });
+  const rewritten = records.find((r) => r.key.includes('"p1"'));
+  assert.ok(rewritten, 'the retry wrote the record');
+  assert.equal(rewritten.born, undefined, 'no birth: the subject is untracked now');
+});
+
 test('an admission whose receipt is never written is observed once, after its effects', async () => {
   const state = { shown: false, read: false };
   const p = firstViewProbe(state, { held: [], stored: ['p1'] });
   const observed: string[] = [];
-  p.host.accepted = (occurrence) => { observed.push(occurrence.eventId); };
+  const deliveredWhenObserved: number[] = [];
+  p.host.accepted = (occurrence) => { observed.push(occurrence.eventId); deliveredWhenObserved.push(p.delivered.length); };
   p.host.recordReceipt = () => { throw new Error('ENOSPC simulated'); };
   for (let attempt = 0; attempt < 6; attempt++) {
     await assert.rejects(p.coalescer.accept(p.occurrence('p1', { initial: true })), (error: { code?: number }) => error.code === -32000);
   }
   assert.deepEqual(p.delivered, [{ eventId: 'p1' }], 'delivered once');
   assert.deepEqual(observed, ['p1'], 'observed once, though no write landed');
+  assert.deepEqual(deliveredWhenObserved, [1], 'after its delivery');
 });

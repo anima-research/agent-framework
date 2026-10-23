@@ -13630,6 +13630,9 @@ export class AgentFramework {
       this.store.setStateJson(COALESCING_RECENT_ID, []);
     } catch (err) {
       console.error('[coalescing] could not persist coalescing state:', err);
+      // Still unsaved: the next persist, or the stop's flush, writes it. No
+      // timer of its own, so a store that keeps failing isn't retried here.
+      this.coalescingSnapshotDirty ??= snapshot;
     }
   }
 

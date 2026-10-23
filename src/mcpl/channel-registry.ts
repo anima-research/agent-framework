@@ -1936,7 +1936,9 @@ export class ChannelRegistry {
             // answer for that. Nothing after this message is admitted, since
             // the producer sends the request's messages again: a coalesced
             // one is answered from its receipt, and an uncoalesced one
-            // before this message is admitted again.
+            // before this message is admitted again. (A responder without
+            // respondError, which only an in-process caller passes, gets the
+            // per-message answer below: it can't be told anything else.)
             requestError = { code, message: err.message };
             break;
           }
