@@ -32,9 +32,14 @@ export type CoalesceOutcome = typeof COALESCE_OUTCOMES[number];
 class CancelledRender extends Error {}
 
 export class CoalesceError extends Error {
-  constructor(readonly field: string, message: string, readonly code = -32602) {
+  /** Set on a failure that came after the occurrence's effects: it was
+   *  admitted, and only its acknowledgement failed (acknowledge). A lane
+   *  must not answer it as not admitted. */
+  readonly admitted: boolean;
+  constructor(readonly field: string, message: string, readonly code = -32602, options: { admitted?: true } = {}) {
     super(message);
     this.name = 'CoalesceError';
+    this.admitted = options.admitted === true;
   }
 }
 
@@ -561,7 +566,7 @@ export class PushCoalescer<E = unknown> {
         this.recordReceipt(key, entry, entry.unwritten);
       } catch (error) {
         this.host.audit({ kind: 'persist-failed', subject, eventId, error: String(error) });
-        throw new CoalesceError('eventId', 'host could not persist the acceptance; retry', -32000);
+        throw new CoalesceError('eventId', 'host could not persist the acceptance; retry', -32000, { admitted: true });
       }
       delete entry.unwritten;
     }
@@ -571,7 +576,7 @@ export class PushCoalescer<E = unknown> {
         entry.committed = true;
       } catch (error) {
         this.host.audit({ kind: 'persist-failed', subject, eventId, error: String(error) });
-        throw new CoalesceError('eventId', 'host could not make the acceptance durable; retry', -32000);
+        throw new CoalesceError('eventId', 'host could not make the acceptance durable; retry', -32000, { admitted: true });
       }
     }
     return structuredClone(entry.result);

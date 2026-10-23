@@ -906,11 +906,43 @@ for (const [what, c] of Object.entries(failedReceiptWrite)) test(`a failed recei
   const left = failReceiptWrites(f, 1);
   const [first, ...resends] = await sendAndResend(f, () => c.send(f));
   assert.equal(left(), 0, 'the write failed once');
-  if ('results' in c.first) assert.equal(first.result?.results?.[0]?.accepted, false, "the channel lane's refusal of the first send");
-  else assert.equal(first.error?.code, -32000, 'the first send is answered -32000');
+  // The channel lane too answers the request -32000: a per-message
+  // `accepted: false` would say the message wasn't admitted.
+  assert.equal(first.error?.code, -32000, 'the first send is answered -32000');
+  assert.equal(first.error?.message, 'host could not persist the acceptance; retry');
   for (const resend of resends) assert.deepEqual(resend.result, c.first, 'a resend answers the first result');
   assert.equal(copies(f, c.text), 1, 'one copy reached the agent');
   if (what === 'a deferred notice') assert.equal(f.renders.length, 1, 'one render');
+});
+
+test('a channels/incoming request stops at a message admitted without its receipt: the request is answered -32000, nothing after it is admitted, and the resend answers both', async (t) => {
+  const f = await fixture(); t.after(f.close);
+  f.alwaysRespond();
+  await f.register();
+  failReceiptWrites(f, 1);
+  const request = { messages: [f.channel('a1', 'first_message', { initial: true }, 'chat', 'ma'), f.channel('b1', 'second_message', { initial: true }, 'chat', 'mb')] };
+  const first = await f.send('channels/incoming', request);
+  assert.equal(first.error?.code, -32000);
+  await f.framework.runUntilIdle();
+  assert.equal(copies(f, 'first_message'), 1, 'the first message was admitted');
+  assert.equal(copies(f, 'second_message'), 0, 'nothing after it was');
+  const resend = await f.send('channels/incoming', request);
+  assert.deepEqual(resend.result, { results: [
+    { messageId: 'ma', accepted: true, coalesce: { outcome: 'first' } },
+    { messageId: 'mb', accepted: true, coalesce: { outcome: 'first' } },
+  ] });
+  await f.framework.runUntilIdle();
+  assert.equal(copies(f, 'first_message'), 1);
+  assert.equal(copies(f, 'second_message'), 1);
+});
+
+test('a coalescer failure before any effect stays a per-message refusal on the channel lane', async (t) => {
+  const f = await fixture(); t.after(f.close);
+  await f.register();
+  (f.framework as unknown as { pushCoalescer: PushCoalescer<unknown> }).pushCoalescer.suspend();
+  const answer = await f.send('channels/incoming', { messages: [f.channel('s1', 'stopping_message', { initial: true })] });
+  assert.deepEqual(answer.result, { results: [{ messageId: 'm', accepted: false, reason: 'host is stopping' }] });
+  assert.equal(copies(f, 'stopping_message'), 0);
 });
 
 test('a receipt write that fails on the send and every resend repeats no effect, and the first resend after it works answers the first result', async (t) => {
@@ -3474,7 +3506,8 @@ test("#157: a channel edit that is the agent's first view moves context.incoming
   internals.commitCoalescingDurable = () => { internals.commitCoalescingDurable = commit; return Promise.reject(new Error('EIO simulated')); };
   const message = { ...f.channel('a2', 'question_fixed', {}, 'other', 'ma'), tags: ['chat:edited'] };
   const first = await f.send('channels/incoming', { messages: [message] });
-  assert.equal(first.result.results[0].accepted, false, 'the failed commit leaves the edit unacknowledged');
+  // Admitted, so not refused: the request fails, which leaves it unacknowledged.
+  assert.equal(first.error?.code, -32000, 'the failed commit leaves the edit unacknowledged');
   const delivered = storedWith(f, 'question_fixed');
   assert(isMarked(delivered), "the edit was delivered as the agent's first view");
   assert.equal(incomingAnchor(f)?.messageId, 'mb', 'an unacknowledged acceptance moves no anchor');

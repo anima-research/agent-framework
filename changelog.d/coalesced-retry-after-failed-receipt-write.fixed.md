@@ -11,3 +11,10 @@
   repeats nothing. A retry that reaches a host restarted since, when nothing
   of the receipt was saved before the restart, as after a kill, is still
   admitted as a new occurrence.
+- On `channels/incoming`, a coalesced message admitted whose receipt couldn't
+  be written or made durable was answered `accepted: false`, which says it
+  wasn't admitted, so a producer could hold it as never delivered. The request
+  is now answered with a -32000 error carrying the same message, the answer
+  the spec gives when a message may have been admitted, and the messages after
+  it in the request aren't admitted until they're sent again. A failure before
+  any effect, such as "host is stopping", is still a per-message refusal.

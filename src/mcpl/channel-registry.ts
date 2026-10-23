@@ -1708,6 +1708,9 @@ export class ChannelRegistry {
     responder?: Responder,
   ): Promise<void> {
     const results: ChannelIncomingMessageResult[] = [];
+    // Set when a coalesced message was admitted but its acknowledgement
+    // failed: the request is then answered with this error (below).
+    let requestError: { code: number; message: string } | undefined;
     // The batch came on the transport open now: a close after this point
     // (transportClosed) leaves its traffic nothing to confirm.
     const closesAtArrival = this.transportCloses.get(serverId) ?? 0;
@@ -1919,10 +1922,24 @@ export class ChannelRegistry {
           if (result.accepted) markAccepted(firstView === true);
           results.push(result);
         } catch (error) {
-          const err = error as Error & { code?: number; field?: string };
+          const err = error as Error & { code?: number; field?: string; admitted?: boolean };
           // -32602 is answered coalesce_invalid; anything else as its message,
           // a plain Error standing for an internal error (-32603).
-          this.traceCoalesceRejection(serverId, message, err, typeof err.code === 'number' ? err.code : -32603);
+          const code = typeof err.code === 'number' ? err.code : -32603;
+          this.traceCoalesceRejection(serverId, message, err, code);
+          if (err.admitted && responder?.respondError) {
+            // Admitted, with its effects in: only the acknowledgement failed,
+            // so `accepted: false`, which says the message wasn't admitted,
+            // would be untrue, and a producer would hold it as never
+            // delivered. A per-message result can't say "may have been
+            // admitted" (§14.3); an error for the request is the spec's
+            // answer for that. Nothing after this message is admitted, since
+            // the producer sends the request's messages again: a coalesced
+            // one is answered from its receipt, and an uncoalesced one
+            // before this message is admitted again.
+            requestError = { code, message: err.message };
+            break;
+          }
           results.push({
             messageId: message.messageId,
             accepted: false,
@@ -1950,8 +1967,8 @@ export class ChannelRegistry {
       });
     }
 
-    const result: ChannelsIncomingResult = { results };
-    responder?.respond(result);
+    if (requestError) responder!.respondError!(requestError.code, requestError.message);
+    else responder?.respond({ results } satisfies ChannelsIncomingResult);
 
     this.emitTraceFn({
       type: 'mcpl:channels-incoming',
