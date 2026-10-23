@@ -6,7 +6,9 @@
  * reference id, what the server said about it in that block, and `savedTo`,
  * the workspace path the dispatch fetched its payload to for the script; a
  * block the classifier rejects arrives as the notice the model's lanes show,
- * and inline data that claims a bulk disposition as the withheld notice. A
+ * and inline data that claims a bulk disposition as the withheld notice; the
+ * same holds for what RFC-005 governs nested at any depth in a block's other
+ * fields, its references bound to the peer. A
  * standard peer's blocks arrive as the server sent them. A module's blocks,
  * such as an MCPL peer's it got through ctx.callTool and returns whole, are
  * read as the model's history reads a module's data: what RFC-005 governs,
@@ -332,6 +334,19 @@ test('an error with structured content is fetched for the script, and reaches it
   });
 });
 
+test("an MCPL peer's structured failure reaches a script with what's nested in its blocks treated too", async () => {
+  await withPeers(async ({ answer, script }) => {
+    const sealed = never('nested-failure');
+    answer({ content: [{ type: 'text', text: 'the attach failed', attachment: sealed }], structuredContent: { partial: true }, isError: true });
+    const out = await script('mcpl--files--attach');
+    assert.equal(out.includes('never-token'), false, out);
+    const object = JSON.parse(out) as { content: Array<Record<string, unknown>>; isError: boolean };
+    const attachment = object.content[0]!.attachment as Record<string, unknown>;
+    assert.deepEqual([object.isError, attachment.refId, 'uri' in attachment], [true, referenceRegistry.findByUri(sealed.uri)?.refId, false]);
+    assert.equal(typeof attachment.refId, 'string');
+  });
+});
+
 test("a module's structured result, an MCPL peer's it got through ctx.callTool, reaches a script with each block read as the model's lanes read a module's", async () => {
   await withPeers(async ({ answer, script, fetched }) => {
     answer({ content: [...blocks('module'), never('module')], structuredContent: { attachments: 2 } });
@@ -390,18 +405,25 @@ test("a module's reference deeper in its blocks reaches a script as the model's 
       ],
       structuredContent: { nested: true },
       isError: false,
-    }, 'inline data beside a uri of any value is withheld, and a value RFC-005 doesn\'t govern keeps its fields');
+    }, 'inline data beside a uri of any type is withheld, and a value RFC-005 doesn\'t govern keeps its fields');
     // A reference the module made itself is bound to no server.
     assert.deepEqual(referenceRegistry.findByUri(sealed.uri)?.serverIds, []);
   });
 });
 
-test("an MCPL peer's treated blocks, returned again as a module's, are left as they are", async () => {
+test("an MCPL peer's treated blocks, returned again as a module's, are left as they are, while a raw reference beside them is treated", async () => {
   await withPeers(async ({ answer, script, exit }) => {
     answer({ content: [...blocks('twice'), never('twice')], structuredContent: { attachments: 2 } });
     const once = JSON.parse(await script('mcpl--files--attach')) as { content: unknown[]; structuredContent: unknown };
-    const again = JSON.parse(await exit({ success: true, data: once.content, structured: once.structuredContent }, 'fwd--whole', false));
-    assert.deepEqual(again, { content: once.content, structuredContent: { attachments: 2 }, isError: false });
+    // A raw reference beside the treated blocks shows that the exit treats
+    // this result at all, so the blocks left as they are were treated again.
+    const raw = { type: 'resource', uri: 'https://files.example.test/raw.pdf?sig=RAW-TWICE', name: 'raw.pdf', mimeType: 'application/pdf' };
+    const again = JSON.parse(await exit({ success: true, data: [...once.content, raw], structured: once.structuredContent }, 'fwd--whole', false)) as { content: unknown[] };
+    assert.deepEqual({ ...again, content: again.content.slice(0, -1) }, { content: once.content, structuredContent: { attachments: 2 }, isError: false });
+    const last = again.content.at(-1) as Record<string, unknown>;
+    assert.deepEqual([last.type, last.name, typeof last.refId, 'uri' in last], ['resource', 'raw.pdf', 'string', false]);
+    assert.equal(last.refId, referenceRegistry.findByUri(raw.uri)?.refId, 'the stub names the raw reference\'s own record');
+    assert.equal(JSON.stringify(again).includes('files.example.test/raw.pdf'), false);
   });
 });
 
@@ -484,6 +506,16 @@ test("an MCPL peer's inline data beside a uri that isn't a string reaches a scri
   });
 });
 
+test("inline data beside an empty uri reaches a script as sent from a module, as history reads it, and withheld from an MCPL peer", async () => {
+  await withPeers(async ({ answer, script, forward }) => {
+    const inline = { type: 'image', data: 'iVBORw0KGgo=', mimeType: 'image/png', uri: '' };
+    forward.nested = [inline];
+    assert.deepEqual((JSON.parse(await script('fwd--nested')) as { content: unknown }).content, [inline]);
+    answer({ content: [inline], structuredContent: {} });
+    assert.deepEqual((JSON.parse(await script('mcpl--files--attach')) as { content: unknown }).content, [{ type: 'text', text: INLINE_WITHHELD_TEXT }]);
+  });
+});
+
 test("inline data beside a null uri reaches a script as sent, from an MCPL peer and from a module", async () => {
   await withPeers(async ({ answer, script, forward }) => {
     const inline = { type: 'image', data: 'iVBORw0KGgo=', mimeType: 'image/png', uri: null };
@@ -494,11 +526,59 @@ test("inline data beside a null uri reaches a script as sent, from an MCPL peer 
   });
 });
 
-test("an MCPL peer's reference nested under another block's fields reaches a script whole, as its structured content does", async () => {
+test("an MCPL peer's reference nested under another block's fields reaches a script as its stub's facts, bound to the peer, while its structured content stays whole", async () => {
   await withPeers(async ({ answer, script }) => {
-    const text = { type: 'text', text: 'one report', attachment: never('nested-peer') };
+    const sealed = never('nested-peer');
+    const inline = { type: 'image', data: 'iVBORw0KGgo=', mimeType: 'image/png', uri: 'https://files.example.invalid/nested-peer/pic.png?sig=inline-token' };
+    const text = { type: 'text', text: 'one report', attachment: sealed, deeper: { list: [inline, { note: 'plain data', type: 'note' }] } };
+    answer({ content: [text], structuredContent: { attachment: sealed } });
+    const object = JSON.parse(await script('mcpl--files--attach')) as { content: Array<Record<string, unknown>>; structuredContent: unknown };
+    const [block] = object.content;
+    const attachment = block.attachment as Record<string, unknown>;
+    assert.deepEqual([block.type, block.text, attachment.type, attachment.name, typeof attachment.refId, 'uri' in attachment], ['text', 'one report', 'resource', 'sealed.pdf', 'string', false]);
+    assert.equal(attachment.refId, referenceRegistry.findByUri(sealed.uri)?.refId, 'the stub names the nested reference\'s own record');
+    assert.deepEqual(referenceRegistry.findByUri(sealed.uri)?.serverIds, ['files'], 'a nested reference is bound to the peer that sent it');
+    // Inline data beside a uri, nested, is withheld; other nested data is as sent.
+    assert.deepEqual(block.deeper, { list: [{ type: 'text', text: INLINE_WITHHELD_TEXT }, { note: 'plain data', type: 'note' }] });
+    assert.equal(JSON.stringify(object.content).includes('never-token') || JSON.stringify(object.content).includes('inline-token'), false);
+    assert.deepEqual(object.structuredContent, { attachment: sealed }, 'structuredContent is the server\'s own data, whole');
+  });
+});
+
+test("each shape RFC-005 governs, nested in an MCPL peer's block, reaches a script by the peer's reading", async () => {
+  await withPeers(async ({ answer, script }) => {
+    const embedded = { type: 'resource', resource: { uri: 'https://files.example.invalid/nested-shapes/doc.txt?sig=embedded-token', text: 'the doc' } };
+    const byUri = { type: 'image', uri: 'https://files.example.invalid/nested-shapes/pic.png?sig=image-token', mimeType: 'image/png' };
+    const emptyUri = { type: 'image', data: 'iVBORw0KGgo=', mimeType: 'image/png', uri: '' };
+    const sealedInline = { type: 'audio', data: 'AAAA', mimeType: 'audio/wav', disposition: 'never' };
+    const objectUri = { type: 'resource', uri: { href: 'https://files.example.invalid/nested-shapes/obj?sig=object-token' }, name: 'obj' };
+    const text = { type: 'text', text: 'shapes', embedded, byUri, emptyUri, sealedInline, objectUri };
     answer({ content: [text], structuredContent: {} });
-    assert.deepEqual((JSON.parse(await script('mcpl--files--attach')) as { content: unknown }).content, [text],
-      'RFC-005 governs content blocks: a field a server puts beside a block\'s own is its data');
+    const [block] = (JSON.parse(await script('mcpl--files--attach')) as { content: Array<Record<string, unknown>> }).content;
+    // An MCP-form embedded resource is the classifier's invalid block, so its notice, without its text.
+    const shownEmbedded = block.embedded as Record<string, unknown>;
+    assert.equal(shownEmbedded.type, 'text');
+    assert.equal(String(shownEmbedded.text).includes('the doc'), false);
+    // A reference by uri alone is a stub bound to the peer.
+    const shownByUri = block.byUri as Record<string, unknown>;
+    assert.deepEqual([typeof shownByUri.refId, 'uri' in shownByUri], ['string', false]);
+    assert.deepEqual(referenceRegistry.findByUri(byUri.uri)?.serverIds, ['files']);
+    // An empty uri beside inline data is the classifier's contradiction on a peer's lane.
+    assert.deepEqual(block.emptyUri, { type: 'text', text: INLINE_WITHHELD_TEXT });
+    // Inline data claiming only a disposition is withheld, and a uri that isn't a string is the classifier's notice.
+    assert.deepEqual(block.sealedInline, { type: 'text', text: INLINE_WITHHELD_TEXT });
+    assert.equal((block.objectUri as Record<string, unknown>).type, 'text');
+    assert.equal(/embedded-token|image-token|object-token/.test(JSON.stringify(block)), false);
+  });
+});
+
+test("an MCPL peer's block already in the script lane's shapes is left as it is by the nested pass", async () => {
+  await withPeers(async ({ answer, script }) => {
+    // A stub's facts and a notice aren't governed, so neither is read twice.
+    const stub = { type: 'resource', refId: 'ref_9_abcd', name: 'sealed.pdf', mimeType: 'application/pdf', savedTo: null };
+    const notice = { type: 'text', text: INLINE_WITHHELD_TEXT };
+    const text = { type: 'text', text: 'already treated', attachment: stub, withheld: notice };
+    answer({ content: [text, notice], structuredContent: {} });
+    assert.deepEqual((JSON.parse(await script('mcpl--files--attach')) as { content: unknown }).content, [text, notice]);
   });
 });

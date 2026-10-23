@@ -117,6 +117,7 @@ import type { ToolResultGuard, WithheldSpill } from './tool-result-guard.js';
 import {
   nonErrorResultText,
   shownToScript,
+  shownToScriptFromServer,
   toolResultDataToHistoryString,
   truncateForHistory,
   DEFAULT_TOOL_RESULT_INLINE_MAX_CHARS,
@@ -27490,16 +27491,26 @@ export class AgentFramework {
     // generated JSON) stands in for what the server sent. An MCPL peer's
     // content blocks are the exception: what a script prints comes back to
     // the model, so each gets the treatment RFC-005 gives it on every lane
-    // the model reads, here, where the server that sent them is known. A
-    // module's blocks get it at the script lane's exit (scriptResultAnswer).
-    // A standard peer's blocks reach the script as sent.
+    // the model reads, here, where the server that sent them is known, and
+    // so does what RFC-005 governs at any depth within them, by the same
+    // peer reading, bound to that server (shownToScriptFromServer). A
+    // module's blocks get it at
+    // the script lane's exit (scriptResultAnswer). A standard peer's blocks
+    // reach the script as sent.
     const forScript = this.scriptToolWaiters?.has(call.id) ?? false;
     const reading = async (result: { content?: unknown; isError?: boolean; structuredContent?: unknown }, mcpl: boolean): Promise<ToolResult> => {
       if (!forScript || !Object.prototype.hasOwnProperty.call(result, 'structuredContent')) {
         return this.mcpToolResult(result, call.id, mcpl, serverId, call.name);
       }
       const direct = AgentFramework.directToolResult(result, serverId, call.name);
-      if (mcpl) return Array.isArray(direct.data) ? { ...direct, data: direct.data.map((block: unknown) => referenceBlockForScript(block, serverId)) } : direct;
+      if (mcpl) {
+        if (!Array.isArray(direct.data)) return direct;
+        // Each block by the classifier, then what's nested in each, at any
+        // depth. The blocks came from the wire as JSON, so the round trip
+        // changes nothing else.
+        const blocks = direct.data.map((block: unknown) => referenceBlockForScript(block, serverId));
+        return { ...direct, data: JSON.parse(JSON.stringify(blocks, (_key, value: unknown) => shownToScriptFromServer(value, serverId))) as unknown[] };
+      }
       // A standard peer's content that isn't a list of blocks is a malformed
       // result on the model's reading (normalizeStandardToolResult), so the
       // script reads it that way too, its structured content kept.
@@ -27724,7 +27735,8 @@ export class AgentFramework {
    * direct path (a module's callTool, a channel's tool call) doesn't come
    * here: it returns the server's result itself (directToolResult), for
    * either engine, as does a script's call whose result is structured, with
-   * an MCPL peer's blocks given RFC-005's treatment (referenceBlockForScript).
+   * an MCPL peer's blocks given RFC-005's treatment (referenceBlockForScript),
+   * and what's nested in them at any depth (shownToScriptFromServer).
    */
   private async mcpToolResult(
     result: { content?: unknown; isError?: boolean; structuredContent?: unknown },
