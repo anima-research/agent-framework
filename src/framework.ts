@@ -9078,10 +9078,15 @@ export class AgentFramework {
     if (!record.namespace) {
       throw new Error(`Agent "${record.name}": its record names no context to reopen`);
     }
+    // A reader of the residents' shared slot (a resident dropped from the
+    // configuration, say) is reopened as createAgent opened it: on the
+    // shared slot, through the residents' view. Isolated, its namespace
+    // holds none of what it read (nissa's #546 review, round 2).
+    const sharedSlot = record.readsSharedSlot === true;
     return ContextManager.open({
       store: this.store,
       namespace: record.namespace,
-      isolate: true,
+      ...(sharedSlot ? { viewFilter: RESIDENT_VIEW_FILTER } : { isolate: true }),
       strategy: strategy ?? new PassthroughStrategy(),
       membrane: this.membrane,
       debugLogContext: !!process.env.DEBUG_CONTEXT,
@@ -9357,19 +9362,10 @@ export class AgentFramework {
       content,
       ...(options.causedBy?.length ? { causedBy: options.causedBy } : {}),
     });
-    // A finished job's output must survive a hard exit from here on.
-    // Held durably before it is delivered, or not delivered: a sync that
-    // fails fails this call, and the result stays held for the next attempt.
-    try {
-      this.store.sync();
-    } catch (error) {
-      throw new Error(
-        `deliverAgentResult: the result from "${from}" is held in the registry but could not be made durable ` +
-          `(sync failed: ${thrownText(error)}), so it was not delivered. It stays held; a later delivery attempt ` +
-          'or the next boot delivers it.',
-        { cause: error },
-      );
-    }
+    // A finished job's output survives a hard exit from here on: the hold is
+    // in the registry's recovery file as it is written (persistAgentRegistry),
+    // and holdMail failed this call if it couldn't be. The release, once the
+    // message has landed, waits for the store's sync (releaseLandedMail).
     return { mailId: mail.id, delivered: this.attemptMailDelivery(mail), to: route.to };
   }
 
@@ -24061,6 +24057,17 @@ export class AgentFramework {
   private releaseLandedMail(metadata: MessageMetadata | undefined, recipient: string): void {
     const stamp = (metadata as { dendrite?: { mailId?: unknown; kind?: unknown; from?: { agent?: unknown } } } | undefined)?.dendrite;
     if (typeof stamp?.mailId !== 'string') return;
+    // The message is in the recipient's store; the release is written only
+    // once the store has synced it, so a hard exit between the two leaves
+    // the mail held and the next boot's check of the recipient's store
+    // settles it — never a release on disk for a message that isn't (nissa's
+    // #546 review, round 2, K). A sync that fails leaves it held the same way.
+    try {
+      this.store.sync();
+    } catch (error) {
+      console.error(`[dendrite] mail ${stamp.mailId} landed for ${recipient} but the store did not sync, so it stays held until the next boot settles it:`, error);
+      return;
+    }
     this.registry.releaseMail(stamp.mailId);
     this.emitTrace({
       type: 'dendrite:mail-delivered',

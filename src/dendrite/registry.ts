@@ -40,6 +40,14 @@ export interface AgentRegistryOptions {
   appendEnded?: (record: AgentRecord) => void;
   /** How many ended records stay inspectable in memory (oldest dropped first). */
   endedRetention?: number;
+  /**
+   * Told when a write that records something that has already happened — a
+   * release, a held mark, a message path — fails. The change stays in memory
+   * and the next write carries it; the call that made it is not failed, since
+   * what it records is done (nissa's #546 review, round 2). Absent, the
+   * failure is logged.
+   */
+  onRecordWriteFailed?: (what: string, error: unknown) => void;
 }
 
 /** What a restore found that the previous process left unfinished. */
@@ -72,11 +80,14 @@ export class AgentRegistry {
   private readonly persistFn?: (snapshot: RegistrySnapshot) => void;
   private readonly appendEndedFn?: (record: AgentRecord) => void;
   private readonly endedRetention: number;
+  private readonly onRecordWriteFailed: (what: string, error: unknown) => void;
 
   constructor(options: AgentRegistryOptions = {}) {
     this.now = options.now ?? Date.now;
     this.persistFn = options.persist;
     this.appendEndedFn = options.appendEnded;
+    this.onRecordWriteFailed = options.onRecordWriteFailed
+      ?? ((what, error) => console.error(`[dendrite] the registry could not record ${what}; it stays in memory and the next write carries it:`, error));
     this.endedRetention = options.endedRetention ?? DEFAULT_ENDED_RETENTION;
   }
 
@@ -94,6 +105,10 @@ export class AgentRegistry {
    * to be live. Who it reports to still does.
    */
   register(spec: AgentSpec, options: { resume?: boolean } = {}): AgentRecord {
+    return this.requested(() => this.registerUnguarded(spec, options));
+  }
+
+  private registerUnguarded(spec: AgentSpec, options: { resume?: boolean } = {}): AgentRecord {
     this.validate(spec, options.resume === true);
     const previous = this.awaiting.get(spec.name);
     this.awaiting.delete(spec.name);
@@ -290,7 +305,7 @@ export class AgentRegistry {
     const record = this.live.get(from);
     if (!record || record.relationships.messagePeers.includes(to)) return;
     record.relationships.messagePeers.push(to);
-    this.persist();
+    this.persistRecord(`the message path ${from} -> ${to}`);
   }
 
   // ==========================================================================
@@ -304,6 +319,10 @@ export class AgentRegistry {
    * of dropping it, so a later adoption can still receive the result.
    */
   end(name: AgentName, reason: AgentEndReason, by?: string): EndOutcome | null {
+    return this.requested(() => this.endUnguarded(name, reason, by));
+  }
+
+  private endUnguarded(name: AgentName, reason: AgentEndReason, by?: string): EndOutcome | null {
     const record = this.live.get(name);
     if (!record) return null;
     const outcome = this.endRecursive(record, reason, by);
@@ -352,6 +371,10 @@ export class AgentRegistry {
    * caller can deliver it.
    */
   reparent(name: AgentName, newParent: AgentName): { record: AgentRecord; deliverable: HeldMail[] } {
+    return this.requested(() => this.reparentUnguarded(name, newParent));
+  }
+
+  private reparentUnguarded(name: AgentName, newParent: AgentName): { record: AgentRecord; deliverable: HeldMail[] } {
     const record = this.live.get(name);
     if (!record) throw new AgentSpecError(name, 'is not a registered agent');
     if (!this.live.has(newParent)) throw new AgentSpecError(name, `new parent "${newParent}" is not a registered agent`);
@@ -405,7 +428,7 @@ export class AgentRegistry {
   releaseMail(id: string): void {
     const before = this.mail.length;
     this.mail = this.mail.filter((item) => item.id !== id);
-    if (this.mail.length !== before) this.persist();
+    if (this.mail.length !== before) this.persistRecord(`the release of mail ${id}`);
   }
 
   /** Mark why an item is still held (delivery attempted and not possible yet). */
@@ -413,7 +436,7 @@ export class AgentRegistry {
     const item = this.mail.find((candidate) => candidate.id === id);
     if (!item || item.heldBecause === because) return;
     item.heldBecause = because;
-    this.persist();
+    this.persistRecord(`why mail ${id} is held (${because})`);
   }
 
   listMail(filter: { to?: AgentName; from?: AgentName } = {}): HeldMail[] {
@@ -465,9 +488,14 @@ export class AgentRegistry {
     for (const [name, value] of Object.entries(snapshot.incarnations ?? {})) {
       if (typeof value === 'number') this.incarnations.set(name, value);
     }
-    this.mail = Array.isArray(snapshot.mail) ? clone(snapshot.mail) : [];
+    // Damaged in its content rather than its version: refused the same way,
+    // since taken as empty it would be overwritten.
+    if (!Array.isArray(snapshot.mail) || !Array.isArray(snapshot.records)) {
+      throw new Error('the agent registry reads as version 1 but its records or mail are not lists; nothing was restored');
+    }
+    this.mail = clone(snapshot.mail);
 
-    for (const raw of snapshot.records ?? []) {
+    for (const raw of snapshot.records) {
       const record = clone(raw);
       if (record.ended) continue; // history lives in the ended log
       if (record.lifetime.kind === 'persistent') {
@@ -515,6 +543,43 @@ export class AgentRegistry {
     if (!this.appendEndedFn) return;
     // A failed append fails the end that made it, as a failed persist does.
     this.appendEndedFn(clone(record));
+  }
+
+  /**
+   * Run a change a caller asks for — a registration, an end, a reparent, a
+   * hold — so that a write failing on the way puts memory back as it was:
+   * the call fails and changes nothing, and a retry does it once (nissa's
+   * #546 review, round 2: a stop whose write failed left the agent recorded
+   * as stopped while it kept running).
+   */
+  private requested<T>(change: () => T): T {
+    const saved = {
+      live: new Map([...this.live].map(([k, v]) => [k, clone(v)])),
+      ended: this.ended.map(clone),
+      awaiting: new Map([...this.awaiting].map(([k, v]) => [k, clone(v)])),
+      incarnations: new Map(this.incarnations),
+      mail: this.mail.map(clone),
+    };
+    try {
+      return change();
+    } catch (error) {
+      this.live.clear(); for (const [k, v] of saved.live) this.live.set(k, v);
+      this.ended = saved.ended;
+      this.awaiting.clear(); for (const [k, v] of saved.awaiting) this.awaiting.set(k, v);
+      this.incarnations.clear(); for (const [k, v] of saved.incarnations) this.incarnations.set(k, v);
+      this.mail = saved.mail;
+      throw error;
+    }
+  }
+
+  /** Persist a record of something that has already happened: a failure
+   *  alerts and leaves the change in memory for the next write to carry. */
+  private persistRecord(what: string): void {
+    try {
+      this.persist();
+    } catch (error) {
+      this.onRecordWriteFailed(what, error);
+    }
   }
 
   /** Write the snapshot through the host's persist hook. A write that fails

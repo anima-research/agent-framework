@@ -18,3 +18,20 @@
   by the idle reap, with its parent — is released through one path, which
   releases its window as the reap did: a failure notice it never read
   reaches the primary, and a write queued for it lands in its window.
+- The second round of the same review: a change a caller asks for — a
+  registration, an end, a reparent, a hold — is put back when its write
+  fails, so the call fails and changes nothing and a retry does it once (a
+  stop whose write failed had left the agent recorded as stopped while it
+  ran). A write that records something that has already happened — a
+  release, a held mark, a message path — is not failed: it alerts, stays in
+  memory, and the next write carries it. A result's hold is durable as it is
+  written, so no store sync decides the delivery; the release is written
+  only once the store has synced the landed message, so a hard exit between
+  the two leaves the mail held and the next boot's check of the recipient's
+  store settles it, never a release on disk for a message that isn't. A
+  version-1 registry whose records or mail are not lists is refused, not
+  taken as empty. A reader of the residents' shared slot that ends — a
+  resident dropped from the configuration — is reopened on the slot it
+  read, through the residents' view, where before an isolated namespace
+  showed none of its messages.
+

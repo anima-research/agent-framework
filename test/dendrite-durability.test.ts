@@ -33,12 +33,12 @@ const ENDED = 'framework/dendrite/ended';
 type Method = 'setStateJson' | 'appendToStateJson' | 'sync';
 
 /** Make one store method throw (for one state id, if given) until the returned undo runs. */
-function failOn(store: JsStore, method: Method, stateId?: string): () => void {
+function failOn(store: JsStore, method: Method, stateId?: string, when: (args: unknown[]) => boolean = () => true): () => void {
   const original = (store as unknown as Record<Method, (...args: unknown[]) => unknown>)[method].bind(store);
   Object.defineProperty(store, method, {
     configurable: true, writable: true,
     value: (...args: unknown[]) => {
-      if (stateId === undefined || args[0] === stateId) throw new Error(`EIO: simulated ${method} failure`);
+      if ((stateId === undefined || args[0] === stateId) && when(args)) throw new Error(`EIO: simulated ${method} failure`);
       return original(...args);
     },
   });
@@ -148,9 +148,9 @@ describe('the registry\'s durable state (findings 1 to 4)', () => {
     try {
       assert.throws(() => first.stopAgent('boss', { by: 'mira' }), /EIO: simulated appendToStateJson failure/, 'the stop fails with the append');
     } finally { undo(); }
-    // The stop that failed is a stop in memory — boss is ended — and the
-    // caller was told its record is not durable, rather than told it was.
-    assert.equal(first.getAgentRecord('boss')?.ended?.reason, 'stopped');
+    // The stop that failed changed nothing: boss is live, and the next stop ends it once.
+    assert.equal(first.getAgentRecord('boss')?.ended, undefined);
+    first.stopAgent('boss', { by: 'mira' });
     gates.release('g-job');
     assert.ok((await job.settled).ok);
     undo = failOn(store, 'setStateJson', REGISTRY);
@@ -162,7 +162,7 @@ describe('the registry\'s durable state (findings 1 to 4)', () => {
     assert.equal(first.listHeldMail().length, 1);
   });
 
-  it('2b: a failed sync before a result\'s delivery fails the delivery, and the result stays held', async () => {
+  it('2b: the hold is durable as written, so a failed sync delays the release, never the delivery', async () => {
     const gates = new GateModule();
     const first = await boot(gates);
     first.start();
@@ -170,13 +170,13 @@ describe('the registry\'s durable state (findings 1 to 4)', () => {
     gates.release('g-job2');
     assert.ok((await job.settled).ok);
     const undo = failOn(first.getStore(), 'sync');
-    try {
-      assert.throws(() => first.deliverAgentResult('job2', [{ type: 'text', text: 'RESULT-2' }]), /could not be made durable \(sync failed: .*EIO/, 'the delivery fails');
-    } finally { undo(); }
-    assert.equal(rowsWith(first, 'mira', 'RESULT-2').length, 0, 'not delivered');
-    assert.equal(first.listHeldMail().filter((m) => m.to === 'mira').length, 1, 'still held');
-    const again = first.deliverAgentResult('job2', [{ type: 'text', text: 'RESULT-2' }]);
-    assert.equal(again.delivered, true, 'a later attempt delivers it');
+    let delivery: { delivered: boolean };
+    try { delivery = first.deliverAgentResult('job2', [{ type: 'text', text: 'RESULT-2' }]); } finally { undo(); }
+    assert.equal(delivery.delivered, true, 'delivered: the hold was durable before it');
+    assert.equal(rowsWith(first, 'mira', 'RESULT-2').length, 1);
+    assert.equal(first.listHeldMail().filter((m) => m.to === 'mira').length, 1, 'held until a sync carries the message');
+    const file = JSON.parse(readFileSync(registryFile(), 'utf8')) as { mail: unknown[] };
+    assert.equal(file.mail.length, 1, 'the hold is in the recovery file');
   });
 
   it('4: at a quiesced boot, held mail waits with the deferred queue and lands once, at resume', async () => {
@@ -196,6 +196,108 @@ describe('the registry\'s durable state (findings 1 to 4)', () => {
     assert.equal(rowsWith(second, 'mira', 'PLAIN-1').length, 1);
     assert.equal(rowsWith(second, 'mira', 'MAIL-1').length, 1, 'the mail lands once, at resume');
     assert.equal(second.listHeldMail().length, 0, 'and is released');
+  });
+});
+
+describe('round 2: a change is put back when its write fails; a record of what happened is not failed; the release waits for the sync', () => {
+  let tempDir: string;
+  let membrane: RoutedMembrane;
+  let frameworks: AgentFramework[];
+  beforeEach(() => { tempDir = mkdtempSync(join(tmpdir(), 'dendrite-durable2-')); membrane = new RoutedMembrane(); frameworks = []; });
+  afterEach(async () => {
+    for (const framework of frameworks.reverse()) { try { await framework.stop(); } catch { /* already stopped */ } }
+    rmSync(tempDir, { recursive: true, force: true });
+  });
+  const storePath = () => join(tempDir, 'store.chronicle');
+  async function boot(gates = new GateModule(), agents = ['mira', 'oren']): Promise<AgentFramework> {
+    const framework = await AgentFramework.create({
+      storePath: storePath(), membrane: membrane.asMembrane(),
+      agents: agents.map((name) => ({ name, model: 'test-model', systemPrompt: `You are ${name}.` })),
+      modules: [gates], syncIntervalMs: 0,
+    });
+    frameworks.push(framework);
+    return framework;
+  }
+  async function startBlocked(framework: AgentFramework, gates: GateModule, name: string, gate: string, spec: Omit<AgentSpec, 'name'>, finalText = `${name} done`) {
+    membrane.script(name, waitCall(gate), say(finalText));
+    const { agent, contextManager } = await framework.createEphemeralAgent({ name, model: 'test-model', systemPrompt: 'Do the task.', allowedTools: 'all' }, spec);
+    contextManager.addMessage('user', [{ type: 'text', text: 'Go.' }]);
+    const settled = framework.runEphemeralToCompletion(agent, contextManager).then((value) => ({ ok: true as const, value }), (error: unknown) => ({ ok: false as const, error }));
+    await until(() => gates.entered.has(gate), `${name} to block on ${gate}`);
+    return { settled };
+  }
+
+  it('T: a stop whose write fails changes nothing — the agent stays live, and a second stop ends it once', async () => {
+    const gates = new GateModule();
+    const first = await boot(gates);
+    first.start();
+    await startBlocked(first, gates, 'boss', 'g-boss', workerSpec('boss', { spawnedBy: 'oren' }));
+    const undo = failOn(first.getStore(), 'appendToStateJson', ENDED);
+    try {
+      assert.throws(() => first.stopAgent('boss', { by: 'mira' }), /EIO: simulated appendToStateJson failure/);
+    } finally { undo(); }
+    assert.equal(first.getAgentRecord('boss')?.ended, undefined, 'still live: the failed stop was put back');
+    const outcome = first.stopAgent('boss', { by: 'mira' });
+    assert.equal(outcome.ended.name, 'boss');
+    assert.equal(first.getAgentRecord('boss')?.ended?.reason, 'stopped');
+  });
+
+  it('R and K: a release whose write fails is not a failed delivery, and a release is written only once the store has synced', async () => {
+    const gates = new GateModule();
+    const first = await boot(gates);
+    first.start();
+    const job = await startBlocked(first, gates, 'job', 'g-job', workerSpec('job', { spawnedBy: 'mira', resultTo: { to: 'mira', as: 'message' } }), 'job result');
+    gates.release('g-job');
+    assert.ok((await job.settled).ok);
+    // K: the store's sync fails as the message lands, so the release is not written and the mail stays held.
+    let undo = failOn(first.getStore(), 'sync');
+    let delivery: { delivered: boolean };
+    try { delivery = first.deliverAgentResult('job', [{ type: 'text', text: 'RESULT-K' }]); } finally { undo(); }
+    assert.equal(delivery.delivered, true, 'in the window');
+    assert.equal(rowsWith(first, 'mira', 'RESULT-K').length, 1);
+    assert.equal(first.listHeldMail().length, 1, 'held until a sync carries the message');
+    // The next boot's check of the recipient's store settles it, once.
+    await first.stop();
+    const second = await boot(gates);
+    assert.equal(rowsWith(second, 'mira', 'RESULT-K').length, 1, 'once');
+    assert.equal(second.listHeldMail().length, 0, 'released by the check');
+    // R: a release whose branch-local registry write fails is a record of what happened: no throw, released in memory.
+    second.start();
+    const job2 = await startBlocked(second, gates, 'job2', 'g-job2', workerSpec('job2', { spawnedBy: 'mira', resultTo: { to: 'mira', as: 'message' } }), 'job2 result');
+    gates.release('g-job2');
+    assert.ok((await job2.settled).ok);
+    const errors: string[] = [];
+    const original = console.error;
+    console.error = (...args: unknown[]) => { errors.push(args.map(String).join(' ')); };
+    // Only the release's write fails: the snapshot with no mail left in it.
+    undo = failOn(second.getStore(), 'setStateJson', REGISTRY, (args) => ((args[1] as { mail?: unknown[] }).mail ?? []).length === 0);
+    let held: { delivered: boolean };
+    try { held = second.deliverAgentResult('job2', [{ type: 'text', text: 'RESULT-R' }]); } finally { undo(); console.error = original; }
+    assert.equal(held.delivered, true, 'no failure for a record of what happened');
+    assert.equal(rowsWith(second, 'mira', 'RESULT-R').length, 1, 'once');
+    assert.equal(second.listHeldMail().length, 0, 'released in memory');
+    assert.ok(errors.some((e) => /could not record the release of mail/.test(e)), 'and the failure is alerted');
+  });
+
+  it('a version-1 registry whose records or mail are not lists is refused, not taken as empty', async () => {
+    const first = await boot();
+    await first.stop();
+    const file = join(storePath(), 'recovery', 'dendrite-registry.json');
+    const stored = JSON.parse(readFileSync(file, 'utf8')) as Record<string, unknown>;
+    writeFileSync(file, JSON.stringify({ ...stored, mail: 'none' }));
+    await assert.rejects(boot(), /reads as version 1 but its records or mail are not lists/);
+  });
+
+  it('a resident dropped from the configuration reopens with what it read of the shared slot', async () => {
+    const first = await boot(new GateModule(), ['mira', 'nova']);
+    for (let i = 0; i < 6; i++) first.getAgent('nova')!.getContextManager().addMessage('user', [{ type: 'text', text: `shared ${i}` }]);
+    assert.equal(first.getAgent('mira')!.getContextManager().getAllMessages().length, 6, 'residents share the slot');
+    await first.stop();
+    const second = await boot(new GateModule(), ['mira']);
+    const nova = second.getAgentRecord('nova');
+    assert.equal(nova?.ended?.reason, 'not-configured');
+    const reopened = await second.inspectAgentContext('nova');
+    assert.equal(reopened.getAllMessages().length, 6, 'reopened on the shared slot it read');
   });
 });
 
