@@ -221,6 +221,20 @@ export interface AgentConfig {
      * Default false: nothing is sent, and the account's default applies.
      */
     dropBlock?: boolean;
+    /**
+     * Whether this agent's model binds its signed thinking to the
+     * conversation before it, as the host knows from its own model records.
+     * Set, each compile the agent sends tells the context manager so
+     * (`thinkingBinding`, with `dropBlock` as set here), with digests of what
+     * the request carries ahead of its messages (`identity`: the system text
+     * with its system-position injections, the tools in the order sent, the
+     * model, and the thinking config, `maxTokens` and `providerParams`). A
+     * context manager that keeps a record of what a branch sent can then
+     * leave out thinking whose earlier conversation changed before the
+     * provider sees it. Default false: compiles are as they were, with
+     * neither.
+     */
+    binds?: boolean;
   };
   /**
    * How to handle a model content-policy refusal (`stop_reason: refusal`).

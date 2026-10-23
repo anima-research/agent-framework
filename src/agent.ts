@@ -58,6 +58,15 @@ export function dryCompileStatsOf(request: object): RenderStats | null {
   return dryCompileStats.get(request) ?? null;
 }
 
+/**
+ * What a compile is told when the agent's model binds its thinking: context-manager #155's part 1 options on
+ * `compile()`, as agent-framework holds the binding and as digests of the request's head (bindingCompileOptions).
+ */
+export interface BindingCompileOptions {
+  thinkingBinding?: { binds: boolean; dropBlock: boolean };
+  identity?: { system: string; tools: string; model: string; request: string };
+}
+
 export interface StartStreamResult {
   stream: YieldingStream;
   request: NormalizedRequest;
@@ -122,8 +131,8 @@ const DEFAULT_SAME_ROUND_THINK_TEXT_POLICY: SameRoundThinkTextPolicy = 'public';
 
 /**
  * Refuse an agent config whose `promptCaching`, `toolResultGuard`,
- * `toolWrapperProseGuard`, `thinking.enabled`, `thinkingBinding.dropBlock` or
- * `refusalHandling.autoRewind` holds anything but true or false
+ * `toolWrapperProseGuard`, `thinking.enabled`, `thinkingBinding.dropBlock`,
+ * `thinkingBinding.binds` or `refusalHandling.autoRewind` holds anything but true or false
  * (assertBooleanSetting), or whose `thinking`, `thinkingBinding` or
  * `refusalHandling` is anything but an object, null or false (holdsSettings),
  * or whose `autoContinue` resolveAutoContinue refuses. The constructor runs it
@@ -153,6 +162,12 @@ export function assertAgentSwitches(config: AgentConfig): void {
       config.thinkingBinding.dropBlock,
       'true asks the provider to drop a signed thinking block whose earlier conversation changed rather than refuse the request, ' +
         'and false or leaving it out sends nothing, so the account\'s default applies',
+    );
+    assertBooleanSetting(
+      `${agent} thinkingBinding.binds`,
+      config.thinkingBinding.binds,
+      'true says the model binds its signed thinking to the conversation before it, so each compile tells the context manager so, ' +
+        'and false or leaving it out compiles as before',
     );
   }
   if (holdsSettings(`${agent} refusalHandling`, config.refusalHandling, '{ autoRewind: true }')) {
@@ -242,6 +257,9 @@ export class Agent {
   /** Whether requests ask the provider to drop signed thinking whose earlier
    *  conversation changed (see AgentConfig.thinkingBinding.dropBlock). */
   private readonly thinkingDropBlock: boolean;
+  /** Whether the model binds its signed thinking to the conversation before
+   *  it (see AgentConfig.thinkingBinding.binds). */
+  private readonly thinkingBinds: boolean;
   /** Refusal auto-rewind policy (see AgentConfig.refusalHandling). */
   readonly refusalHandling: AgentConfig['refusalHandling'];
   readonly toolResultGuard: ToolResultGuard;
@@ -382,6 +400,7 @@ export class Agent {
     this.temperature = config.temperature;
     this.thinking = config.thinking;
     this.thinkingDropBlock = config.thinkingBinding?.dropBlock === true;
+    this.thinkingBinds = config.thinkingBinding?.binds === true;
     this.refusalHandling = config.refusalHandling;
     this.toolResultGuard = new ToolResultGuard(config.name, contextManager, config.toolResultGuard === true);
     this.proseRouting = config.proseRouting ?? 'locus';
@@ -1225,7 +1244,7 @@ export class Agent {
   async compileWithInjections(
     budget?: TokenBudget,
     injections?: ContextInjection[],
-    opts?: { kvUnifiedImmutablePrefixHash?: string; dryRun?: boolean },
+    opts?: { kvUnifiedImmutablePrefixHash?: string; dryRun?: boolean } & BindingCompileOptions,
   ): Promise<CompileResult> {
     // A dry run is a compile that will never be sent. The context manager
     // persists no fold resolutions for it and queues none of the compression
@@ -1328,9 +1347,12 @@ export class Agent {
     // been retried; one whose store still fails is compiled as the bare
     // notice.
     let unguardedResults: ReturnType<Agent['buildToolResultMessages']> | undefined;
+    const binding = this.bindingCompileOptions(tools, (injections ?? [])
+      .filter((injection) => injection.position === 'system')
+      .flatMap((injection) => injection.content));
     const assemble = async (): Promise<NormalizedRequest> => {
       const compiled = await this.toolResultGuard.afterAnnotations(
-        () => this.compileWithInjections(budget, injections));
+        () => this.compileWithInjections(budget, injections, binding.thinkingBinding ? binding : undefined));
       const { systemInjections } = compiled;
       // The framework's own pricing stamp never goes out (thinking-token-stamp.ts).
       const messages = withoutTokenEstimates(compiled.messages);
@@ -1500,13 +1522,15 @@ export class Agent {
           system: this.buildSystemPrompt(prospectiveSystemInjections),
         })
       : undefined;
+    const binding = this.bindingCompileOptions(availableTools, prospectiveSystemInjections);
     const compiledResult = await this.compileWithInjections(
       budget,
       injections,
-      immutablePrefixHash || options.dryRun
+      immutablePrefixHash || options.dryRun || binding.thinkingBinding
         ? {
             ...(immutablePrefixHash ? { kvUnifiedImmutablePrefixHash: immutablePrefixHash } : {}),
             ...(options.dryRun ? { dryRun: true } : {}),
+            ...binding,
           }
         : undefined,
     );
@@ -1630,6 +1654,29 @@ export class Agent {
     if (!this.thinkingDropBlock) return this.thinking;
     const own = this.thinking !== null && typeof this.thinking === 'object' ? this.thinking : { enabled: false };
     return { ...own, blockBinding: { prefixMismatchBehavior: 'drop_block' } };
+  }
+
+  /**
+   * What a compile the agent sends tells the context manager when the model binds its thinking
+   * (`thinkingBinding.binds`): the binding as set, and a digest of each part of the request ahead of its
+   * messages, so a changed one can stand for a first difference (context-manager #155's part 1). The system
+   * text is the one the request will carry, built from the system-position injections given to the compile
+   * as the kv-unified prefix hash builds it; the tools are the ones it will carry, in their order; `request`
+   * covers the thinking config, `maxTokens` and `providerParams`, where a host puts its own thinking config
+   * and `tool_choice`. Nothing without `binds`: the compile is as it was.
+   */
+  private bindingCompileOptions(tools: readonly ToolDefinition[], systemInjections: ContentBlock[]): BindingCompileOptions {
+    if (!this.thinkingBinds) return {};
+    const { config, providerParams } = this.requestSettings();
+    return {
+      thinkingBinding: { binds: true, dropBlock: this.thinkingDropBlock },
+      identity: {
+        system: stableHash(this.buildSystemPrompt(systemInjections)),
+        tools: stableHash(tools),
+        model: stableHash(this.model),
+        request: stableHash({ thinking: config.thinking ?? null, maxTokens: config.maxTokens, providerParams: providerParams ?? null }),
+      },
+    };
   }
 
   /** The request `assembleActivationRequest` builds (see there), for preview
