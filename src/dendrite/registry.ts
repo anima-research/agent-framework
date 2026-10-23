@@ -48,6 +48,8 @@ export interface AgentRegistryOptions {
    * failure is logged.
    */
   onRecordWriteFailed?: (what: string, error: unknown) => void;
+  /** Told after a requested change was put back: the host puts back what it wrote alongside (its ended log). */
+  onRollback?: () => void;
 }
 
 /** What a restore found that the previous process left unfinished. */
@@ -81,11 +83,15 @@ export class AgentRegistry {
   private readonly appendEndedFn?: (record: AgentRecord) => void;
   private readonly endedRetention: number;
   private readonly onRecordWriteFailed: (what: string, error: unknown) => void;
+  private readonly onRollback?: () => void;
+  /** Above zero while a record of what happened is being written: its writes alert rather than throw. */
+  private recordingDepth = 0;
 
   constructor(options: AgentRegistryOptions = {}) {
     this.now = options.now ?? Date.now;
     this.persistFn = options.persist;
     this.appendEndedFn = options.appendEnded;
+    this.onRollback = options.onRollback;
     this.onRecordWriteFailed = options.onRecordWriteFailed
       ?? ((what, error) => console.error(`[dendrite] the registry could not record ${what}; it stays in memory and the next write carries it:`, error));
     this.endedRetention = options.endedRetention ?? DEFAULT_ENDED_RETENTION;
@@ -318,8 +324,16 @@ export class AgentRegistry {
    * that pointed at it are left in place — delivery holds the mail instead
    * of dropping it, so a later adoption can still receive the result.
    */
-  end(name: AgentName, reason: AgentEndReason, by?: string): EndOutcome | null {
-    return this.requested(() => this.endUnguarded(name, reason, by));
+  /**
+   * End an agent. A stop a caller asks for is a requested change: a write that
+   * fails puts memory back and fails the call. A run's own end or an idle
+   * reap (`record: true`) records what has already happened: a write that
+   * fails alerts, and the next write carries it (nissa's #546 review, round 3).
+   */
+  end(name: AgentName, reason: AgentEndReason, by?: string, options: { record?: boolean } = {}): EndOutcome | null {
+    return options.record
+      ? this.recording(() => this.endUnguarded(name, reason, by))
+      : this.requested(() => this.endUnguarded(name, reason, by));
   }
 
   private endUnguarded(name: AgentName, reason: AgentEndReason, by?: string): EndOutcome | null {
@@ -541,7 +555,16 @@ export class AgentRegistry {
       this.ended.splice(0, this.ended.length - this.endedRetention);
     }
     if (!this.appendEndedFn) return;
-    // A failed append fails the end that made it, as a failed persist does.
+    // A failed append fails the end that made it, as a failed persist does —
+    // unless the end records a run that has ended, when it alerts instead.
+    if (this.recordingDepth > 0) {
+      try {
+        this.appendEndedFn(clone(record));
+      } catch (error) {
+        this.onRecordWriteFailed(`the end of ${record.name}`, error);
+      }
+      return;
+    }
     this.appendEndedFn(clone(record));
   }
 
@@ -568,8 +591,24 @@ export class AgentRegistry {
       this.awaiting.clear(); for (const [k, v] of saved.awaiting) this.awaiting.set(k, v);
       this.incarnations.clear(); for (const [k, v] of saved.incarnations) this.incarnations.set(k, v);
       this.mail = saved.mail;
+      this.onRollback?.();
       throw error;
     }
+  }
+
+  /** Run a record of something that has already happened: its writes alert and stay in memory rather than throw. */
+  private recording<T>(change: () => T): T {
+    this.recordingDepth++;
+    try {
+      return change();
+    } finally {
+      this.recordingDepth--;
+    }
+  }
+
+  /** The ended records in memory, newest last. */
+  endedHistory(): AgentRecord[] {
+    return this.ended.map(clone);
   }
 
   /** Persist a record of something that has already happened: a failure
@@ -588,6 +627,14 @@ export class AgentRegistry {
    *  succeeded while a restart would lose it. */
   private persist(): void {
     if (!this.persistFn) return;
+    if (this.recordingDepth > 0) {
+      try {
+        this.persistFn(this.snapshot());
+      } catch (error) {
+        this.onRecordWriteFailed('a change already made', error);
+      }
+      return;
+    }
     this.persistFn(this.snapshot());
   }
 }

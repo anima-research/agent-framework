@@ -34,4 +34,10 @@
   resident dropped from the configuration — is reopened on the slot it
   read, through the residents' view, where before an isolated namespace
   showed none of its messages.
+- The split between a requested change and a record is the caller's: an end
+  `stopAgent` asks for is put back when its write fails, while a run's own
+  end and an idle reap record what has already happened — their writes
+  alert and the run still settles. An end that was put back comes off the
+  ended log's recovery file too, and a registry refused for its content
+  names the state it read, as one refused for its version does.
 

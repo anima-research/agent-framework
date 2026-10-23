@@ -279,13 +279,43 @@ describe('round 2: a change is put back when its write fails; a record of what h
     assert.ok(errors.some((e) => /could not record the release of mail/.test(e)), 'and the failure is alerted');
   });
 
+  it('U: a run\'s own end is a record of what happened — a failed write alerts, the run still settles, the record is ended', async () => {
+    const gates = new GateModule();
+    const first = await boot(gates);
+    first.start();
+    const job = await startBlocked(first, gates, 'job', 'g-job', workerSpec('job', { spawnedBy: 'mira' }), 'job result');
+    const errors: string[] = [];
+    const original = console.error;
+    console.error = (...args: unknown[]) => { errors.push(args.map(String).join(' ')); };
+    const undo = failOn(first.getStore(), 'setStateJson', REGISTRY);
+    let done: { ok: boolean };
+    try { gates.release('g-job'); done = await job.settled; } finally { undo(); console.error = original; }
+    assert.equal(done.ok, true, 'the run finished, and says so');
+    assert.equal(first.getAgentRecord('job')?.ended?.reason, 'completed', 'ended in the registry');
+    assert.equal(first.getAgent('job'), null);
+    assert.ok(errors.some((e) => /could not record a change already made/.test(e)), 'the write failure is alerted');
+  });
+
+  it('T, the ended log: an end that was put back comes off the recovery file too', async () => {
+    const gates = new GateModule();
+    const first = await boot(gates);
+    first.start();
+    await startBlocked(first, gates, 'boss', 'g-boss', workerSpec('boss', { spawnedBy: 'oren' }));
+    // The snapshot's write fails after the ended record was appended.
+    const undo = failOn(first.getStore(), 'setStateJson', REGISTRY);
+    try { assert.throws(() => first.stopAgent('boss', { by: 'mira' })); } finally { undo(); }
+    first.stopAgent('boss', { by: 'mira' });
+    const ended = (JSON.parse(readFileSync(join(storePath(), 'recovery', 'dendrite-ended.json'), 'utf8')) as { ended: Array<{ name: string; ended: { reason: string } }> }).ended;
+    assert.equal(ended.filter((r) => r.name === 'boss').length, 1, 'one stopped record for the one stop that held');
+  });
+
   it('a version-1 registry whose records or mail are not lists is refused, not taken as empty', async () => {
     const first = await boot();
     await first.stop();
     const file = join(storePath(), 'recovery', 'dendrite-registry.json');
     const stored = JSON.parse(readFileSync(file, 'utf8')) as Record<string, unknown>;
     writeFileSync(file, JSON.stringify({ ...stored, mail: 'none' }));
-    await assert.rejects(boot(), /reads as version 1 but its records or mail are not lists/);
+    await assert.rejects(boot(), /the agent registry \(.*dendrite-registry\.json\) reads as a version-1 registry whose records or mail are not lists/);
   });
 
   it('a resident dropped from the configuration reopens with what it read of the shared slot', async () => {
@@ -356,6 +386,18 @@ describe('5: stopAgent releases the window as the idle reap does', () => {
     return archive.getAllMessages().some((m) => JSON.stringify(m.content).includes(needle));
   }
   const count = (messages: Array<{ content: unknown }>, needle: string) => messages.filter((m) => JSON.stringify(m.content).includes(needle)).length;
+
+  it('V: an idle reap is a record of what happened — a failed write alerts, the fork is gone, its record ended', async () => {
+    const fork = await spawnFork();
+    const errors: string[] = [];
+    const original = console.error;
+    console.error = (...args: unknown[]) => { errors.push(args.map(String).join(' ')); };
+    const undo = failOn(framework.getStore(), 'setStateJson', 'framework/dendrite');
+    try { reap(fork.name); } finally { undo(); console.error = original; }
+    assert.equal(framework.getAgent(fork.name), null, 'gone');
+    assert.equal(framework.getAgentRecord(fork.name)?.ended?.reason, 'idle-ttl', 'ended in the registry');
+    assert.ok(errors.some((e) => /could not record a change already made/.test(e)), 'alerted');
+  });
 
   for (const how of ['reap', 'stopAgent'] as const) {
     it(`5a, ${how}: a failure notice the fork stored but never read reaches the primary`, async () => {

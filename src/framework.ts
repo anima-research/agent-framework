@@ -3132,6 +3132,9 @@ export class AgentFramework {
   private readonly registry: AgentRegistry = new AgentRegistry({
     persist: (snapshot) => this.persistAgentRegistry(snapshot),
     appendEnded: (record) => this.appendEndedAgentRecord(record),
+    // A requested end that was put back: its ended record came off the
+    // registry's memory, so it comes off the recovery file too.
+    onRollback: () => this.rewriteEndedRecovery(this.registry.endedHistory()),
   });
   /** Tell the first adoption candidate when task work is orphaned (config.dendrite.announceOrphans). */
   private announceOrphans = true;
@@ -9714,12 +9717,14 @@ export class AgentFramework {
   /** An ended record: appended to the branch-local log, and the recovery
    *  file rewritten with the newest records (as many as a restart reads). */
   private appendEndedAgentRecord(record: AgentRecord): void {
-    this.endedRecovery.push(record);
-    if (this.endedRecovery.length > AGENT_REGISTRY_ENDED_RELOAD) {
-      this.endedRecovery.splice(0, this.endedRecovery.length - AGENT_REGISTRY_ENDED_RELOAD);
-    }
-    if (this.agentRegistryEndedPath) this.writeRecoveryFile(this.agentRegistryEndedPath, { version: 1, ended: this.endedRecovery });
+    this.rewriteEndedRecovery([...this.endedRecovery, record]);
     this.store.appendToStateJson(AGENT_REGISTRY_ENDED_ID, record);
+  }
+
+  /** The ended log's recovery file, rewritten as the newest records (as many as a restart reads). */
+  private rewriteEndedRecovery(ended: AgentRecord[]): void {
+    this.endedRecovery = ended.slice(-AGENT_REGISTRY_ENDED_RELOAD);
+    if (this.agentRegistryEndedPath) this.writeRecoveryFile(this.agentRegistryEndedPath, { version: 1, ended: this.endedRecovery });
   }
 
   /**
@@ -9754,6 +9759,12 @@ export class AgentFramework {
     if (snapshot !== null && (typeof snapshot !== 'object' || (snapshot as { version?: unknown }).version !== 1)) {
       const version = (snapshot as { version?: unknown } | null)?.version;
       throw refuse(snapshotFrom, `reads as something other than a version-1 registry (version ${JSON.stringify(version)})`);
+    }
+    if (snapshot !== null) {
+      const { records, mail } = snapshot as { records?: unknown; mail?: unknown };
+      if (!Array.isArray(records) || !Array.isArray(mail)) {
+        throw refuse(snapshotFrom, 'reads as a version-1 registry whose records or mail are not lists');
+      }
     }
 
     let ended: unknown;
@@ -10207,7 +10218,7 @@ export class AgentFramework {
       } else {
         // The identity ends with its run. Whatever it spawned is settled by
         // the registry's rules (attention tenants end, task work is orphaned).
-        this.settleEndedAgent(this.registry.end(agent.name, run.endReason ?? 'failed', run.endedBy));
+        this.settleEndedAgent(this.registry.end(agent.name, run.endReason ?? 'failed', run.endedBy, { record: true }));
       }
     }
   }
@@ -14796,7 +14807,7 @@ export class AgentFramework {
       this.openLogical.delete(agentName);
       this.codeExecution?.scripts.agentGone(agentName);
     }
-    this.settleEndedAgent(this.registry.end(agentName, 'idle-ttl', 'framework'));
+    this.settleEndedAgent(this.registry.end(agentName, 'idle-ttl', 'framework', { record: true }));
     this.emitTrace({
       type: 'mcpl:conversation-disposed',
       agentName,
@@ -14856,7 +14867,7 @@ export class AgentFramework {
         // Agent vanished (external reset) — nothing to close, just make sure
         // its bookkeeping doesn't linger.
         this.agentConfigs.delete(binding.agentName);
-        this.settleEndedAgent(this.registry.end(binding.agentName, 'idle-ttl', 'framework'));
+        this.settleEndedAgent(this.registry.end(binding.agentName, 'idle-ttl', 'framework', { record: true }));
         continue;
       }
       agent.getContextManager().addMessage(
