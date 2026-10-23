@@ -85,7 +85,11 @@ export function roundRows(
 
 /**
  * A results block as compared: what a request sends of it, its id, content and error flag, with `isError` as a
- * boolean, where a stored block may leave a false one out. The store's own fields beside them, such as
+ * boolean, where a stored block may leave a false one out. A stream's envelope sends a submitted result's
+ * `is_error: false` and the next request, from the stored block, sends none; the provider's thinking binding takes
+ * the two alike (read from the provider on 2026-10-23: Haiku 5.5 with the drop control, on an enforcing API-key
+ * organization and on a subscription account, reported no drop for either, and dropped both replies' blocks when an
+ * earlier user message changed). The store's own fields beside them, such as
  * `toolName`, don't reach the provider on membrane's native path, the only one noted (membrane 0.7.1's XML
  * formatter reads `toolName`, and an XML stream is never noted).
  */
