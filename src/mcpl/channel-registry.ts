@@ -1710,7 +1710,7 @@ export class ChannelRegistry {
     const results: ChannelIncomingMessageResult[] = [];
     // Set when a coalesced message was admitted but its acknowledgement
     // failed: the request is then answered with this error (below).
-    let requestError: { code: number; message: string } | undefined;
+    let requestError: { code: number; message: string; field?: string } | undefined;
     // The batch came on the transport open now: a close after this point
     // (transportClosed) leaves its traffic nothing to confirm.
     const closesAtArrival = this.transportCloses.get(serverId) ?? 0;
@@ -1939,7 +1939,7 @@ export class ChannelRegistry {
             // before this message is admitted again. (A responder without
             // respondError, which only an in-process caller passes, gets the
             // per-message answer below: it can't be told anything else.)
-            requestError = { code, message: err.message };
+            requestError = { code, message: err.message, ...(err.field ? { field: err.field } : {}) };
             break;
           }
           results.push({
@@ -1969,7 +1969,7 @@ export class ChannelRegistry {
       });
     }
 
-    if (requestError) responder!.respondError!(requestError.code, requestError.message);
+    if (requestError) responder!.respondError!(requestError.code, requestError.message, { field: requestError.field });
     else responder?.respond({ results } satisfies ChannelsIncomingResult);
 
     this.emitTraceFn({

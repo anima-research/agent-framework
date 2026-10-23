@@ -937,6 +937,36 @@ test('a channels/incoming request stops at a message admitted without its receip
   assert.equal(copies(f, 'second_message'), 1);
 });
 
+test('a channels/incoming request whose coalesced message is admitted without its receipt, after an uncoalesced one, fails; the resend admits the uncoalesced message again and answers the coalesced one from its receipt', async (t) => {
+  const f = await fixture(); t.after(f.close);
+  f.alwaysRespond();
+  await f.register();
+  failReceiptWrites(f, 1);
+  const { coalesce: _none, ...uncoalesced } = f.channel('u1', 'loose_copy', {}, 'chat', 'mu');
+  const request = { messages: [uncoalesced, f.channel('c1', 'coalesced_copy', { initial: true }, 'chat', 'mc')] };
+  const first = await f.send('channels/incoming', request);
+  assert.deepEqual(first.error && { code: first.error.code, data: first.error.data }, { code: -32000, data: { field: 'eventId' } });
+  await f.framework.runUntilIdle();
+  const resend = await f.send('channels/incoming', request);
+  assert.deepEqual(resend.result, { results: [
+    { messageId: 'mu', accepted: true },
+    { messageId: 'mc', accepted: true, coalesce: { outcome: 'first' } },
+  ] });
+  await f.framework.runUntilIdle();
+  // The cost named in the change: the uncoalesced message has no receipt.
+  assert.equal(copies(f, 'loose_copy'), 2);
+  assert.equal(copies(f, 'coalesced_copy'), 1);
+});
+
+test("a receipt record whose write failed doesn't stay on the host's list of records to write", async (t) => {
+  const f = await fixture(); t.after(f.close);
+  failReceiptWrites(f, 1);
+  const answer = await f.send('push/event', f.params('e1', 'plain_copy', { initial: true }));
+  assert.equal(answer.error?.code, -32000);
+  const list = (f.framework as unknown as { coalescingRecentReceipts: Array<{ key: string }> }).coalescingRecentReceipts;
+  assert.equal(list.some((r) => r.key.includes('"e1"')), false, 'not left to be written later with the batch it held');
+});
+
 test('a coalescer failure before any effect stays a per-message refusal on the channel lane', async (t) => {
   const f = await fixture(); t.after(f.close);
   await f.register();
