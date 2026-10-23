@@ -1000,6 +1000,20 @@ function resumesLogicalTurn(reason: string | undefined): boolean {
 const SCRIPT_CALL_NO_RESULT = new WeakSet<ToolResult>();
 
 /**
+ * An MCPL peer's results whose blocks couldn't be given RFC-005's treatment
+ * for a script, because JSON couldn't hold them (dispatchMcplToolCall's
+ * reading), each with why. The failure is the script lane's alone: the
+ * model's lane reads the same answer with no such round trip. So such a
+ * result keeps the peer's own outcome, its blocks dropped, and the trace and
+ * the call's terminal report what the peer answered, as on v0.26.1, while
+ * the script lane's exit answers it as a result it can't convert to JSON
+ * (scriptResultAnswer). A module's result that JSON can't hold differs: no
+ * route can store or send it, so its dispatch makes it an error result for
+ * everyone (checkedToolResult).
+ */
+const SCRIPT_RESULT_UNCONVERTIBLE = new WeakMap<ToolResult, unknown>();
+
+/**
  * One logical turn's routing state and receipt tallies
  * (AgentFramework.turnRouting): everything the turn has decided about where
  * its speech goes. Every stream of the turn shares it: the start that opens
@@ -2049,12 +2063,14 @@ function scriptResultBrief(content: unknown[]): string {
 
 /**
  * What a script gets for a tool result that can't be converted to JSON,
- * such as a cyclic object or a BigInt that an in-process module returned.
+ * such as a cyclic object or a BigInt that an in-process module returned,
+ * or an MCPL peer's blocks nested deeper than JSON.stringify can take.
  * It names the tool, and says the call itself completed, so a script that
  * reports it doesn't invite a blind retry. The host's log gets the same
- * line, since the tool that returned it needs fixing whether or not the
- * script reports it. The reason and the tool's own error are cut to
- * VALUE_CHARS each, so the failure reaches the script whatever its memory.
+ * line, since the tool, a module's or a server's, returns what a script
+ * can't receive, whether or not the script reports it. The reason and the
+ * tool's own error are cut to VALUE_CHARS each, so the failure reaches the
+ * script whatever its memory.
  */
 function unconvertibleScriptResult(toolName: string, err: unknown, ownError?: string): string {
   let reason: string;
@@ -2092,7 +2108,9 @@ const SCRIPT_TEXT_ANSWER_ENVELOPE_BYTES = Buffer.byteLength(
  * dense in small objects or a script already holding most of its memory.
  * Such a result, or one past the figure that doesn't fit, reaches the script
  * as ResultTooLarge, saying the call took effect, and nothing of it is cut or
- * saved.
+ * saved. One the host can't convert to JSON at all, such as one nested deeper
+ * than its runtime's JSON.stringify can take, is answered instead as a
+ * failure naming the tool and saying the call itself completed.
  */
 const scriptResultMaxChars = (memoryMaxBytes: number): number =>
   Math.max(0, Math.floor((Math.min(maxResultBytes(memoryMaxBytes), bufferConstants.MAX_STRING_LENGTH) - SCRIPT_TEXT_ANSWER_ENVELOPE_BYTES) / 6));
@@ -21259,7 +21277,9 @@ export class AgentFramework {
    * content where it sent one, `false`, `0` and `null` included, else null.
    * A result that can't be converted to JSON (a cyclic object, a BigInt),
    * which the dispatch's own check makes unlikely here, is a failure naming
-   * the tool and saying the call itself completed.
+   * the tool and saying the call itself completed. So is an MCPL peer's
+   * result whose blocks were too deep for the dispatch's treatment, which
+   * the dispatch marks (SCRIPT_RESULT_UNCONVERTIBLE).
    */
   private async scriptResultAnswer(result: ToolResult, toolName: string, toServer: boolean): Promise<ToolAnswer> {
     const structured = Object.prototype.hasOwnProperty.call(result, 'structured');
@@ -21301,6 +21321,9 @@ export class AgentFramework {
         brief: error,
       };
     };
+    // An MCPL peer's result whose blocks JSON couldn't hold, so that RFC-005's
+    // treatment couldn't be given them at dispatch.
+    if (SCRIPT_RESULT_UNCONVERTIBLE.has(result)) return failed(SCRIPT_RESULT_UNCONVERTIBLE.get(result));
     let content: unknown[];
     let text: string | undefined;
     // A structured result's blocks, as #538 gives them: none when its content
@@ -27070,8 +27093,8 @@ export class AgentFramework {
   }
 
   /** An MCP tool call's trace: a result the server marked an error (or one
-   *  the reading couldn't complete) is tool:failed, as on the other tool
-   *  paths; anything else is tool:completed. */
+   *  the reading takes as one, such as malformed content) is tool:failed, as
+   *  on the other tool paths; anything else is tool:completed. */
   private traceMcpToolOutcome(serverId: string, tool: string, callId: string, result: ToolResult, durationMs: number): void {
     if (result.isError) {
       this.emitTrace({ type: 'tool:failed', module: `mcpl:${serverId}`, tool, callId, durationMs, error: result.error ?? 'tool returned an error' });
@@ -27507,9 +27530,25 @@ export class AgentFramework {
         if (!Array.isArray(direct.data)) return direct;
         // Each block by the classifier, then what's nested in each, at any
         // depth. The blocks came from the wire as JSON, so the round trip
-        // changes nothing else.
+        // changes nothing else. But a value that parsed can still fail to
+        // go back: past some depth JSON.stringify overflows the stack where
+        // JSON.parse didn't (on Node 24.19 an array 5,000 deep does, on Bun
+        // 1.4.4 one 200,000 deep). That fails the script lane's treatment
+        // alone, and the peer answered: the result keeps the peer's outcome
+        // for the trace and the call's terminal, and the script lane's exit
+        // answers it as a result it can't convert, not as a failed dispatch
+        // (SCRIPT_RESULT_UNCONVERTIBLE). Its blocks are dropped, since they
+        // are untreated and the result travels on, to the waiter and to the
+        // listeners of its event's trace. Its structured content is kept, as
+        // every result keeps it, since RFC-005's treatment doesn't reach it.
         const blocks = direct.data.map((block: unknown) => referenceBlockForScript(block, serverId));
-        return { ...direct, data: JSON.parse(JSON.stringify(blocks, (_key, value: unknown) => shownToScriptFromServer(value, serverId))) as unknown[] };
+        try {
+          return { ...direct, data: JSON.parse(JSON.stringify(blocks, (_key, value: unknown) => shownToScriptFromServer(value, serverId))) as unknown[] };
+        } catch (err) {
+          const unconvertible: ToolResult = { ...direct, data: [] };
+          SCRIPT_RESULT_UNCONVERTIBLE.set(unconvertible, err);
+          return unconvertible;
+        }
       }
       // A standard peer's content that isn't a list of blocks is a malformed
       // result on the model's reading (normalizeStandardToolResult), so the
