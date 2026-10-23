@@ -98,4 +98,21 @@ describe('the stream start\'s placeDrops', () => {
       [[{ messageId: 'r1', sequence: 4 }, { messageId: 'r1b', sequence: 5 }]]);
     agent.cancelStream();
   });
+
+  it('carries the compile\'s thinkingRecordedAfter when it gives a sequence, and nothing otherwise', async () => {
+    const start = async (thinkingRecordedAfter: unknown) => {
+      const contextManager = {
+        compile: async () => ({ messages: compiledMessages, systemInjections: [], provenance: compiled.provenance, thinkingRecordedAfter }),
+      } as unknown as ContextManager;
+      const agent = new Agent({ name: 'agent', model: 'claude-opus-5-5', systemPrompt: 'test' } as never, contextManager, new MockMembrane().asMembrane());
+      const result = await agent.startStreamWithInjections([]);
+      agent.cancelStream();
+      return result;
+    };
+    assert.equal((await start(6)).thinkingRecordedAfter, 6);
+    assert.equal((await start(0)).thinkingRecordedAfter, 0, 'a sequence of 0 is one');
+    for (const none of [undefined, null, -1, 1.5, '6', Number.NaN]) {
+      assert.equal('thinkingRecordedAfter' in (await start(none)), false, String(none));
+    }
+  });
 });

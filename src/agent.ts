@@ -4,7 +4,7 @@ import { createHash } from 'node:crypto';
 import type { CacheWireReceipt, KvUnifiedRequestHooks } from './kv-unified-wire.js';
 import { ToolResultGuard } from './tool-result-guard.js';
 import { withoutTokenEstimates } from './thinking-token-stamp.js';
-import { placeThinkingDrops, type CompiledForRequest, type PlacedDrop } from './thinking-drops.js';
+import { placeThinkingDrops, recordedAfterOf, type CompiledForRequest, type PlacedDrop } from './thinking-drops.js';
 import { injectionsAsStored } from './text-as-stored.js';
 import { assertBooleanSetting, holdsSettings, kindOf } from './config-checks.js';
 import {
@@ -83,6 +83,9 @@ export interface StartStreamResult {
    *  request's compile rendered, a round the stream appended, or neither (placeThinkingDrops). Optional, so a
    *  stand-in for the stream start needn't supply it; without it, no drop can be placed. */
   placeDrops?: (entries: readonly ThinkingBindingEntry[]) => PlacedDrop[];
+  /** The compile's `thinkingRecordedAfter`, when it gave one: a reply stored at or below it predates the branch's
+   *  thinking-binding record, so the provider may drop its thinking with no strip having missed. */
+  thinkingRecordedAfter?: number;
 }
 import type {
   ContextManager,
@@ -1541,7 +1544,12 @@ export class Agent {
     const { renderStats } = compiledResult as typeof compiledResult & { renderStats?: RenderStats };
     // What the request is built from, as the compile returned it: a block the provider drops is found again in
     // it, through the copies below, by its signature (placeThinkingDrops).
-    const compiled: CompiledForRequest = { messages: compiledResult.messages, ...(compiledResult.provenance ? { provenance: compiledResult.provenance } : {}) };
+    const recordedAfter = recordedAfterOf(compiledResult);
+    const compiled: CompiledForRequest = {
+      messages: compiledResult.messages,
+      ...(compiledResult.provenance ? { provenance: compiledResult.provenance } : {}),
+      ...(recordedAfter !== undefined ? { recordedAfter } : {}),
+    };
 
     // Sanitize: strip empty/whitespace text blocks and drop messages left with
     // no content. The Anthropic API rejects empty text blocks with 400
@@ -1830,6 +1838,7 @@ export class Agent {
       ...(continuePrompt ? { continuePrompt } : {}),
       // Read against the messages the stream sends, which membrane's report indexes (RoundReport's coordinates).
       placeDrops: (entries) => placeThinkingDrops(entries, request.messages, compiled),
+      ...(compiled.recordedAfter !== undefined ? { thinkingRecordedAfter: compiled.recordedAfter } : {}),
       ...(kvEnabled
         ? {
             takeKvSubmission: () => kvQueue.shift(),

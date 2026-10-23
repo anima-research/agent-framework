@@ -160,6 +160,7 @@ import { splitProseRuns, withoutRoundsProse } from './prose-segments.js';
 import { AUTO_CONTINUE_REASON, AUTO_CONTINUE_STOP_REASONS, autoContinueNotice } from './auto-continue.js';
 import { cumulativeDelta } from './usage-accounting.js';
 import { stampThinkingTokenEstimates } from './thinking-token-stamp.js';
+import type { StreamThinkingDrops } from './thinking-drops.js';
 import { contentAsStored, nameAsStored } from './text-as-stored.js';
 
 /** An MCPL tool call refused because its server isn't in the registry: one
@@ -18894,6 +18895,8 @@ export class AgentFramework {
         takeKvSubmission,
         drainKvSubmissionIds,
         continuePrompt,
+        placeDrops,
+        thinkingRecordedAfter,
       } = await agent.startStreamWithInjections(tools, injections, undefined, compressionTools, {
         silentHeartbeat: trigger?.silentHeartbeat,
         // This turn's retries are the framework's (errorPolicy below), not
@@ -19003,6 +19006,7 @@ export class AgentFramework {
         takeKvSubmission,
         drainKvSubmissionIds,
         new Set(tools.map((tool) => tool.name)),
+        placeDrops ? { place: placeDrops, ...(thinkingRecordedAfter !== undefined ? { recordedAfter: thinkingRecordedAfter } : {}) } : undefined,
       );
       this.activeStreams.set(agent.name, handle);
       // Handoff: driveStream captured the token in its synchronous prefix;
@@ -19163,6 +19167,9 @@ export class AgentFramework {
     takeKvSubmission?: () => { submissionId: string; wireReceipt: CacheWireReceipt } | undefined,
     drainKvSubmissionIds?: () => string[],
     knownToolNames: ReadonlySet<string> = new Set(),
+    /** Where each block a call reports the provider dropped came from, and the compile's thinking-binding
+     *  record start (StartStreamResult's `placeDrops` and `thinkingRecordedAfter`). */
+    thinkingDrops?: StreamThinkingDrops,
   ): Promise<void> {
     const turnProseRouting = trigger?.suppressProse ? 'disabled' : agent.proseRouting;
     const startTime = Date.now();

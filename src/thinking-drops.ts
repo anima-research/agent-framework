@@ -17,10 +17,27 @@ export type PlacedDrop =
   | { kind: 'round'; round: number; entry: ThinkingBindingEntry }
   | { kind: 'unplaced'; entry: ThinkingBindingEntry };
 
-/** What a request was assembled from: the compile's messages as it returned them, and its provenance. */
+/**
+ * What a request was assembled from: the compile's messages as it returned them, its provenance, and, when the
+ * compile gave one, the sequence at or below which a reply was stored before the branch's thinking-binding record
+ * began (context-manager's `CompileResult.thinkingRecordedAfter`, part 1 of its #155).
+ */
 export interface CompiledForRequest {
   messages: readonly NormalizedMessage[];
   provenance?: CompileProvenance;
+  recordedAfter?: number;
+}
+
+/** What a stream's driver reads a call's dropped blocks against (`StartStreamResult`'s two fields, together). */
+export interface StreamThinkingDrops {
+  place: (entries: readonly ThinkingBindingEntry[]) => PlacedDrop[];
+  recordedAfter?: number;
+}
+
+/** A compile's `thinkingRecordedAfter`, read where context-manager gives it: a sequence, or nothing. */
+export function recordedAfterOf(result: unknown): number | undefined {
+  const v = (result as { thinkingRecordedAfter?: unknown } | null | undefined)?.thinkingRecordedAfter;
+  return typeof v === 'number' && Number.isSafeInteger(v) && v >= 0 ? v : undefined;
 }
 
 /** A signed block's identity on the wire: a thinking block's signature, a redacted block's data. */
