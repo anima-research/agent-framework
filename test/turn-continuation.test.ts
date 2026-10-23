@@ -1507,6 +1507,24 @@ describe('a batch that carries a continuation of the turn', () => {
       await h.cleanup();
     }
   });
+
+  it("leaves an autoContinue wake queued beside a budget restart to a turn of its own, which writes its [continue] row", async () => {
+    const ROW = '[continue] prime, another turn starts now.';
+    const h = await restartBehind(() => ({
+      agentName: 'prime', reason: 'auto-continue', source: 'framework', timestamp: Date.now(), autoContinueRun: { stop: 'call skip_reply' },
+    }), { hold: false });
+    try {
+      await waitFor("the restart's turn to answer", () => completions(h) > 0);
+      assert.equal(h.starts[1]?.reason, 'context_budget_restart', 'the start runs on the restart');
+      assert.ok(!requestTexts(h.membrane.calls[1]).includes(ROW), "the restart's request carries no row");
+      await waitFor("the continuation's wake to start a turn of its own", () => h.starts.length > 2);
+      assert.equal(h.starts[2]?.reason, 'auto-continue');
+      await waitFor('that turn to answer', () => completions(h) > 1);
+      assert.ok(requestTexts(h.membrane.calls[2]).includes(ROW), "its turn's request carries its row");
+    } finally {
+      await h.cleanup();
+    }
+  });
 });
 
 describe("an ephemeral run whose turn's continuation is dropped", () => {

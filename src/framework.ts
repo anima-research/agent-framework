@@ -14917,18 +14917,13 @@ export class AgentFramework {
       // carries its mark, and the turn writes its `[continue]` row as it
       // starts (startAgentStream), past every gate that could still stop it.
       // A batch with a cause of its own is that cause's turn: no row, and the
-      // run starts again below.
+      // run starts again below. A batch that resumes a logical turn holds only
+      // the turn's continuations by now (above), and none of them carries a
+      // mark: an autoContinue wake beside it waits for a turn of its own.
       const continuation = requests.find(carriesContinuation);
-      let continuationMark = continuation?.autoContinueRun && !requests.some(hasOwnCauseForRun)
+      const continuationMark = continuation?.autoContinueRun && !requests.some(hasOwnCauseForRun)
         ? { ...continuation.autoContinueRun, sole: requests.every(carriesContinuation) }
         : undefined;
-      // A batch that resumes a logical turn (a budget restart, a guard retry)
-      // takes the continuation's wake into that turn, which writes no start
-      // inputs: its count goes back, and it writes no row.
-      if (continuationMark && requests.some((r) => resumesLogicalTurn(r.reason))) {
-        this.giveBackAutoContinue(agentName, 'a resumed turn took its wake');
-        continuationMark = undefined;
-      }
       // Its row goes into the residents' shared slot, which no write may
       // enter while another reader's turn is alive (as for a clock row): the
       // continuation waits until that turn has ended.

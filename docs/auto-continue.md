@@ -82,10 +82,11 @@ It is short and event-shaped: longer instruction blocks about output, sent as
 user-role messages, have tripped provider classifiers.
 
 The row is never written for a turn that doesn't run: a wake the inference
-policy drops, or that a quiesce drops, writes none and gives back its count,
-as does one a resumed turn (a budget restart) takes in; a row that can't be
-stored gives back its count, and withdraws a turn the continuation alone
-caused. A write that throws after its row landed counts as written. It is appended before the turn compiles and never
+policy drops, or that a quiesce drops, writes none and gives back its count;
+a row that can't be stored gives back its count, and withdraws a turn the
+continuation alone caused. A continuation's wake queued beside a turn's
+budget restart, or released beside a tool-result guard's retry by a provider
+hold, waits for that turn, then writes its row as its own turn starts. A write that throws after its row landed counts as written. It is appended before the turn compiles and never
 retracted, so the prompt-cache prefix stays stable.
 
 ## The next turn
