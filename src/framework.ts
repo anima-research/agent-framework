@@ -2970,6 +2970,15 @@ export class AgentFramework {
   /** True once the cap has been met in the current run, so its line is
    *  logged once a run, whatever began the run. */
   private deferredWritesCapLogged = false;
+  /** The agent registry and its ended log, as recovery files beside the store
+   *  (nissa's #546 finding 3): Chronicle state follows the store's branch, and
+   *  an undo or an operator's surgery must not erase a result held for
+   *  delivery or the record of work that ran. The file wins where it exists;
+   *  the branch-local state is read only for stores that predate it. */
+  private agentRegistryPath: string | undefined;
+  private agentRegistryEndedPath: string | undefined;
+  /** The ended log as the recovery file keeps it: the newest records, bounded. */
+  private endedRecovery: AgentRecord[] = [];
   /** Branch-independent recovery files (see FrameworkConfig.hostModePath /
    *  deferredWritesPath). Undefined → branch-local slot fallback. */
   private hostModePath: string | undefined;
@@ -3599,7 +3608,10 @@ export class AgentFramework {
 
     // What the previous process left in the agent registry. Read before any
     // agent is declared so a restored persistent agent becomes a new
-    // incarnation of the same identity rather than a stranger.
+    // incarnation of the same identity rather than a stranger. The registry
+    // lives in recovery files beside the store (see agentRegistryPath).
+    framework.agentRegistryPath = config.storePath ? join(config.storePath, 'recovery', 'dendrite-registry.json') : undefined;
+    framework.agentRegistryEndedPath = config.storePath ? join(config.storePath, 'recovery', 'dendrite-ended.json') : undefined;
     const interruptedAgents = framework.restoreAgentRegistry();
 
     // Create agents
@@ -3618,11 +3630,6 @@ export class AgentFramework {
         await framework.createSubconsciousAgent(config.subconscious);
       }
     }
-
-    // Configuration has now declared its agents: settle what the previous
-    // process left unfinished (interrupted bounded work, persistent agents
-    // no longer configured, results still held for delivery).
-    framework.reconcileAgentRegistry(interruptedAgents);
 
     // Finish any branch-local suppression interrupted after Chronicle switched
     // branches. This runs before modules, MCPL connections, or inbound traffic.
@@ -3828,6 +3835,15 @@ export class AgentFramework {
     }
 
     // Initialize MCPL subsystems if configured
+    // Configuration has now declared its agents, and host mode and the
+    // deferred-write queue are restored: settle what the previous process
+    // left unfinished (interrupted bounded work, persistent agents no longer
+    // configured, results still held for delivery). After the restore, so a
+    // quiesced host holds the restart notices and redelivered mail as it
+    // holds any write, and mail an entry of the restored queue carries is
+    // left to that entry's landing (nissa's #546 finding 4).
+    framework.reconcileAgentRegistry(interruptedAgents);
+
     if (config.mcplServers && config.mcplServers.length > 0) {
       // Check every server's config before any is brought up: its boolean
       // settings, and its tool prefix, which mustn't collide with a module
@@ -9342,7 +9358,18 @@ export class AgentFramework {
       ...(options.causedBy?.length ? { causedBy: options.causedBy } : {}),
     });
     // A finished job's output must survive a hard exit from here on.
-    try { this.store.sync(); } catch (error) { console.error('[dendrite] sync after holding a result failed:', error); }
+    // Held durably before it is delivered, or not delivered: a sync that
+    // fails fails this call, and the result stays held for the next attempt.
+    try {
+      this.store.sync();
+    } catch (error) {
+      throw new Error(
+        `deliverAgentResult: the result from "${from}" is held in the registry but could not be made durable ` +
+          `(sync failed: ${thrownText(error)}), so it was not delivered. It stays held; a later delivery attempt ` +
+          'or the next boot delivers it.',
+        { cause: error },
+      );
+    }
     return { mailId: mail.id, delivered: this.attemptMailDelivery(mail), to: route.to };
   }
 
@@ -9555,16 +9582,42 @@ export class AgentFramework {
     }
     const agent = this.agents.get(name);
     if (!agent) return;
-    if (record.homeChannel && this.conversationRouter?.getBinding(record.homeChannel)?.agentName === name) {
-      this.conversationRouter.unbind(record.homeChannel);
+    this.releaseAgentRuntime(agent, record.homeChannel);
+  }
+
+  /**
+   * Everything the process holds for a live, non-ephemeral agent that has
+   * ended, released once, on every path an agent ends by — stopAgent, the
+   * idle reap of a conversation fork, an end that cascades from a parent's
+   * (nissa's #546 finding 5: a stop that skipped the window release dropped a
+   * write queued for the agent at the next flush, and a failure notice it
+   * never read reached no one). The window release delivers what the agent
+   * never read to the primary, now or after a resume, as the idle reap did.
+   */
+  private releaseAgentRuntime(agent: Agent, homeChannel?: string): void {
+    const name = agent.name;
+    if (homeChannel && this.conversationRouter?.getBinding(homeChannel)?.agentName === name) {
+      this.conversationRouter.unbind(homeChannel);
     }
     this.closingConversationAgents.delete(name);
+    // A batch its guard still holds is settled as `aborted`: the stream's
+    // own finally does neither once the agent has gone.
+    if (agent.toolResultGuard.hasPending) {
+      try {
+        agent.toolResultGuard.abandon('aborted');
+      } catch (error) {
+        console.error(`[tool-result-guard] agent=${name} failed to record a batch the fork left:`, error);
+      }
+    }
     // Cancel before deregistration: a late stream event is discarded by
     // driveStream's Agent-identity check once the name no longer maps to it.
-    agent.cancelStream();
+    if (this.activeStreams.has(name)) agent.cancelStream();
     this.activeStreams.delete(name);
     this.pendingAssistantBlocks.delete(name);
     this.eventGate?.onInferenceEnded(name);
+    // Its sleep and self-wake end with it (the gate's sleep holds back every
+    // agent's wakes), and neither wake goes to a name that's gone.
+    this.eventGate?.agentGone(name);
     this.agents.delete(name);
     this.agentConfigs.delete(name);
     this.toolImageLedgers.delete(name);
@@ -9573,6 +9626,25 @@ export class AgentFramework {
     this.activeTurnTriggers.delete(name);
     this.logicalTurnToolCalls.delete(agent);
     this.pendingRequests = this.pendingRequests.filter((request) => request.agentName !== name);
+    this.releaseWindowNowOrAfterResume(agent);
+    this.turnRouting.delete(name);
+    this.proseSpeechChains.delete(name);
+    this.openLogical.delete(name);
+    // Its scripts go with it, and leave the map once they've ended: no later
+    // run of the name trims them.
+    this.codeExecution?.scripts.agentGone(name);
+    // A provider-wait hold (nonOwningProviderWait) goes with the agent: left,
+    // its timer would requeue held wakes for an agent that is gone, and a wait
+    // held until released would re-arm for the name indefinitely. The recorded
+    // wait stays, and binds the name if its channel binds again.
+    const cooldown = this.providerAccelerationCooldowns.get(name);
+    if (cooldown) {
+      clearTimeout(cooldown.timer);
+      this.providerAccelerationCooldowns.delete(name);
+      console.error(`[provider-wait] agent=${name} ended while held` +
+        `${cooldown.waitModel !== undefined ? ` on ${cooldown.waitModel}` : ''}: ` +
+        `${cooldown.heldRequests.length} held request(s) dropped with it (the recorded wait stays)`);
+    }
     if (name === this.subconsciousAgentName) {
       this.tuneOutCoordinator?.stop();
       this.subconsciousAgentName = null;
@@ -9633,30 +9705,78 @@ export class AgentFramework {
     }
   }
 
+  /** The registry's snapshot: the recovery file first (atomic, fsynced; it
+   *  wins at the next boot), then the branch-local state, kept for inspection
+   *  and for stores read by older code. Either write failing fails the call
+   *  that changed the registry (nissa's #546 finding 2): a change that isn't
+   *  durable isn't a success. */
   private persistAgentRegistry(snapshot: RegistrySnapshot): void {
+    if (this.agentRegistryPath) this.writeRecoveryFile(this.agentRegistryPath, snapshot);
     this.store.setStateJson(AGENT_REGISTRY_STATE_ID, snapshot);
   }
 
+  /** An ended record: appended to the branch-local log, and the recovery
+   *  file rewritten with the newest records (as many as a restart reads). */
   private appendEndedAgentRecord(record: AgentRecord): void {
+    this.endedRecovery.push(record);
+    if (this.endedRecovery.length > AGENT_REGISTRY_ENDED_RELOAD) {
+      this.endedRecovery.splice(0, this.endedRecovery.length - AGENT_REGISTRY_ENDED_RELOAD);
+    }
+    if (this.agentRegistryEndedPath) this.writeRecoveryFile(this.agentRegistryEndedPath, { version: 1, ended: this.endedRecovery });
     this.store.appendToStateJson(AGENT_REGISTRY_ENDED_ID, record);
   }
 
-  /** Load the previous process's registry. Returns the bounded work it interrupted. */
+  /**
+   * Load the previous process's registry. Returns the bounded work it
+   * interrupted. A registry that can't be read, or that reads as anything
+   * but a version-1 registry, refuses the start and names the state (nissa's
+   * #546 finding 1, main's rule for the framework's own state): taken as
+   * empty, the results it holds for delivery and the records of the work it
+   * ran would be overwritten by this boot's first registration.
+   */
   private restoreAgentRegistry(): AgentRecord[] {
-    let snapshot: RegistrySnapshot | null = null;
-    let ended: AgentRecord[] = [];
+    const refuse = (what: string, problem: string, cause?: unknown): Error => new Error(
+      `the agent registry (${what}) ${problem}. The framework doesn't start without it: taken as empty, the results ` +
+        'it holds for delivery and the records of the work it ran would be overwritten at this boot. ' +
+        (cause === undefined
+          ? "It's unchanged, and the framework starts once it holds a version-1 registry, such as " +
+            '{"version":1,"records":[],"mail":[],"incarnations":{}} for an empty one.'
+          : "It's unchanged, and the framework starts once it can be read."),
+      cause === undefined ? undefined : { cause },
+    );
+    let snapshot: unknown;
+    let snapshotFrom = this.agentRegistryPath ?? AGENT_REGISTRY_STATE_ID;
     try {
-      snapshot = this.store.getStateJson(AGENT_REGISTRY_STATE_ID) as RegistrySnapshot | null;
-    } catch {
-      // No persisted registry yet
+      snapshot = this.agentRegistryPath ? this.readRecoveryFile(this.agentRegistryPath) : undefined;
+      if (snapshot === undefined) {
+        snapshotFrom = AGENT_REGISTRY_STATE_ID;
+        snapshot = this.store.getStateJson(AGENT_REGISTRY_STATE_ID) ?? null;
+      }
+    } catch (error) {
+      throw refuse(snapshotFrom, "can't be read", error);
     }
+    if (snapshot !== null && (typeof snapshot !== 'object' || (snapshot as { version?: unknown }).version !== 1)) {
+      const version = (snapshot as { version?: unknown } | null)?.version;
+      throw refuse(snapshotFrom, `reads as something other than a version-1 registry (version ${JSON.stringify(version)})`);
+    }
+
+    let ended: unknown;
+    let endedFrom = this.agentRegistryEndedPath ?? AGENT_REGISTRY_ENDED_ID;
     try {
-      const tail = this.store.getStateTail(AGENT_REGISTRY_ENDED_ID, AGENT_REGISTRY_ENDED_RELOAD);
-      if (tail) ended = JSON.parse(tail.toString('utf8')) as AgentRecord[];
-    } catch {
-      // No ended history yet
+      const file = this.agentRegistryEndedPath ? this.readRecoveryFile(this.agentRegistryEndedPath) : undefined;
+      if (file !== undefined) {
+        ended = (file as { ended?: unknown } | null)?.ended;
+      } else {
+        endedFrom = AGENT_REGISTRY_ENDED_ID;
+        const tail = this.store.getStateTail(AGENT_REGISTRY_ENDED_ID, AGENT_REGISTRY_ENDED_RELOAD);
+        ended = tail ? JSON.parse(tail.toString('utf8')) : [];
+      }
+    } catch (error) {
+      throw refuse(endedFrom, "has an ended log that can't be read", error);
     }
-    return this.registry.restore(snapshot, Array.isArray(ended) ? ended : []).interrupted;
+    if (!Array.isArray(ended)) throw refuse(endedFrom, 'has an ended log that reads as something other than a list of records');
+    this.endedRecovery = (ended as AgentRecord[]).slice(-AGENT_REGISTRY_ENDED_RELOAD);
+    return this.registry.restore(snapshot as RegistrySnapshot | null, ended as AgentRecord[]).interrupted;
   }
 
   /**
@@ -9711,6 +9831,13 @@ export class AgentFramework {
           continue;
         }
       }
+      // A write the restored deferred queue still holds for this mail lands
+      // at the next flush and releases it then (releaseLandedMail); a second
+      // delivery here would put it in the window twice under one mail id.
+      const queued = this.deferredMessages.some(
+        (m) => (m.metadata as { dendrite?: { mailId?: unknown } } | undefined)?.dendrite?.mailId === mail.id,
+      );
+      if (queued) continue;
       this.attemptMailDelivery(mail);
     }
   }
@@ -14659,54 +14786,21 @@ export class AgentFramework {
    * context stays in Chronicle for investigation.
    */
   private disposeConversationAgent(agentName: string): void {
-    this.closingConversationAgents.delete(agentName);
     const channelId = this.registry.homeChannel(agentName);
     const agent = this.agents.get(agentName);
-    // A fork stop() ends can still be running: its stream, its tool round.
-    // Its name is never used again, so its end takes the stream's
-    // activeStreams and pendingAssistantBlocks entries, as a run's end does
-    // (runEphemeralToCompletion), and settles a batch its guard still holds,
-    // withheld as `aborted`: the stream's own finally does neither once the
-    // fork has gone. A fork the idle sweep ends has no stream entries left,
-    // and a batch still pending there is one whose successor never ran,
-    // which a run's end settles too.
-    if (agent?.toolResultGuard.hasPending) {
-      try {
-        agent.toolResultGuard.abandon('aborted');
-      } catch (error) {
-        console.error(`[tool-result-guard] agent=${agentName} failed to record a batch the fork left:`, error);
-      }
+    // The one release every ended agent gets (releaseAgentRuntime), then the
+    // registry's end, whose outcome settles what the fork spawned.
+    if (agent) {
+      this.releaseAgentRuntime(agent, channelId);
+    } else {
+      // Nothing live under the name: only what the process keeps by name.
+      this.closingConversationAgents.delete(agentName);
+      this.turnRouting.delete(agentName);
+      this.proseSpeechChains.delete(agentName);
+      this.openLogical.delete(agentName);
+      this.codeExecution?.scripts.agentGone(agentName);
     }
-    this.activeStreams.delete(agentName);
-    this.pendingAssistantBlocks.delete(agentName);
-    this.agents.delete(agentName);
-    // Its sleep and self-wake end with it (the gate's sleep holds back every
-    // agent's wakes), and neither wake goes to a name that's gone.
-    this.eventGate?.agentGone(agentName);
-    if (agent) this.releaseWindowNowOrAfterResume(agent);
-    this.turnRouting.delete(agentName);
-    this.proseSpeechChains.delete(agentName);
-    this.openLogical.delete(agentName);
-    this.toolImageLedgers.delete(agentName);
-    this.agentConfigs.delete(agentName);
     this.settleEndedAgent(this.registry.end(agentName, 'idle-ttl', 'framework'));
-    this.evictTurnCheckpoints(agentName);
-    if (agent) this.logicalTurnToolCalls.delete(agent);
-    // Its scripts go with it, and leave the map once they've ended: no later
-    // run of a fork's name trims them.
-    this.codeExecution?.scripts.agentGone(agentName);
-    // A provider-wait hold (nonOwningProviderWait) goes with the agent: left,
-    // its timer would requeue held wakes for an agent that is gone, and a wait
-    // held until released would re-arm for the name indefinitely. The recorded
-    // wait stays, and binds the name if its channel binds again.
-    const cooldown = this.providerAccelerationCooldowns.get(agentName);
-    if (cooldown) {
-      clearTimeout(cooldown.timer);
-      this.providerAccelerationCooldowns.delete(agentName);
-      console.error(`[provider-wait] agent=${agentName} disposed while held` +
-        `${cooldown.waitModel !== undefined ? ` on ${cooldown.waitModel}` : ''}: ` +
-        `${cooldown.heldRequests.length} held request(s) dropped with it (the recorded wait stays)`);
-    }
     this.emitTrace({
       type: 'mcpl:conversation-disposed',
       agentName,

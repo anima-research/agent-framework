@@ -390,7 +390,14 @@ export class AgentRegistry {
       content: clone(mail.content),
     };
     this.mail.push(item);
-    this.persist();
+    // A hold that isn't durable isn't held: the persist's failure fails this
+    // call, and the item leaves memory too, so a retry holds it once.
+    try {
+      this.persist();
+    } catch (error) {
+      this.mail.pop();
+      throw error;
+    }
     return item;
   }
 
@@ -450,7 +457,10 @@ export class AgentRegistry {
     for (const raw of endedHistory.slice(-this.endedRetention)) {
       if (raw && typeof raw === 'object' && raw.ended) this.ended.push(clone(raw));
     }
-    if (!snapshot || snapshot.version !== 1) return { interrupted };
+    if (!snapshot) return { interrupted };
+    if (snapshot.version !== 1) {
+      throw new Error(`the agent registry reads as version ${JSON.stringify(snapshot.version)}, which this code doesn't read; nothing was restored`);
+    }
 
     for (const [name, value] of Object.entries(snapshot.incarnations ?? {})) {
       if (typeof value === 'number') this.incarnations.set(name, value);
@@ -503,19 +513,16 @@ export class AgentRegistry {
       this.ended.splice(0, this.ended.length - this.endedRetention);
     }
     if (!this.appendEndedFn) return;
-    try {
-      this.appendEndedFn(clone(record));
-    } catch (error) {
-      console.error('[dendrite] failed to append an ended agent record:', error);
-    }
+    // A failed append fails the end that made it, as a failed persist does.
+    this.appendEndedFn(clone(record));
   }
 
+  /** Write the snapshot through the host's persist hook. A write that fails
+   *  fails the change that made it (nissa's #546 finding 2): the change is in
+   *  memory, and the caller is told it is not durable, rather than told it
+   *  succeeded while a restart would lose it. */
   private persist(): void {
     if (!this.persistFn) return;
-    try {
-      this.persistFn(this.snapshot());
-    } catch (error) {
-      console.error('[dendrite] failed to persist the agent registry:', error);
-    }
+    this.persistFn(this.snapshot());
   }
 }

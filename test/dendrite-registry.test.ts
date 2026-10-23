@@ -292,10 +292,12 @@ describe('AgentRegistry restart behaviour follows lifetime', () => {
     assert.equal(registry.list({ includeEnded: true }).filter((r) => r.name === 'job').length, 2);
   });
 
-  it('tolerates a missing or unreadable snapshot', () => {
+  it('tolerates a missing snapshot, and refuses one in a version it does not read', () => {
     const registry = new AgentRegistry();
     assert.deepEqual(registry.restore(null), { interrupted: [] });
-    assert.deepEqual(registry.restore({ version: 9 } as unknown as RegistrySnapshot), { interrupted: [] });
+    // Taken as empty, a registry in another version would be overwritten by the
+    // first registration, with the results it holds (nissa's #546 finding 1).
+    assert.throws(() => registry.restore({ version: 9 } as unknown as RegistrySnapshot), /reads as version 9, which this code doesn't read/);
     registry.register(residentSpec('mira', { primary: true }));
     assert.equal(registry.get('mira')!.incarnation, 1);
   });
