@@ -116,6 +116,7 @@ import type { WorkspaceModule } from './modules/workspace/index.js';
 import type { ToolResultGuard, WithheldSpill } from './tool-result-guard.js';
 import {
   nonErrorResultText,
+  shownToScript,
   toolResultDataToHistoryString,
   truncateForHistory,
   DEFAULT_TOOL_RESULT_INLINE_MAX_CHARS,
@@ -2084,8 +2085,8 @@ const SCRIPT_TEXT_ANSWER_ENVELOPE_BYTES = Buffer.byteLength(
  * memoryMaxBytes. So the figure moves with memoryMaxBytes. What it can't
  * count: a result's `structured` value, which the measure leaves out and the
  * answer carries as JSON beside the content, and that result's blocks past
- * their text, which the answer carries as they are (each further block's
- * keys, an image's data); nesting past 2,000 levels; and a
+ * their text, which the answer carries as the script lane gives them (each
+ * further block's keys, an image's data); nesting past 2,000 levels; and a
  * parse that needs more of the script's memory than is free, as for JSON
  * dense in small objects or a script already holding most of its memory.
  * Such a result, or one past the figure that doesn't fit, reaches the script
@@ -2984,9 +2985,17 @@ export class AgentFramework {
   // config.codeExecution.enabled: its settings, and every agent's scripts,
   // each in a process of its own on the engine (AgentScripts). Waiters
   // resolve script-inner tool calls dispatched through the normal
-  // dispatchToolCall path.
+  // dispatchToolCall path. A waiter's route is where the dispatch sent its
+  // call: `toServer` is set when it went to a server's own tool (an MCPL or
+  // MCP-only peer's), so the script lane's exit treats every other result as
+  // a module's (scriptResultAnswer), by where the call went rather than by a
+  // name lookup a connect or disconnect can change while it runs. A
+  // framework tool that talks to a server itself, such as a channel tool,
+  // builds its own result, which counts as a module's. A caller of
+  // dispatchScriptToolCall that passes no route gets one left false, the
+  // reading that withholds more.
   private codeExecution: { settings: IsolateSettings; scripts: AgentScripts } | null = null;
-  private scriptToolWaiters: Map<string, (result: ToolResult) => void> = new Map();
+  private scriptToolWaiters: Map<string, { resolve: (result: ToolResult) => void; route: { toServer: boolean } }> = new Map();
   /** Per agent, a round that called code_execution and waits for those calls'
    *  results before its prose is routed (ScriptRound). */
   private scriptRounds: Map<string, ScriptRound> = new Map();
@@ -11765,7 +11774,7 @@ export class AgentFramework {
         // was killed while the call ran: the result reaches no one, but the
         // call did finish.
         this.toolLifecycleEmitter?.onResult(event.agentName, event.callId, event.result);
-        scriptWaiter(event.result);
+        scriptWaiter.resolve(event.result);
         return;
       }
 
@@ -21217,9 +21226,10 @@ export class AgentFramework {
       if (!roundCalls.some((c) => c.name === counted.name && c.cause === counted.cause && c.refused === counted.refused)) roundCalls.push(counted);
     }
     if (refusal !== undefined) return refused(refusal);
+    const route = { toServer: false };
     const result = await this.dispatchScriptToolCall(
       agentName, toolName, input as Record<string, unknown>,
-      context.origin as ScriptCallOrigin | undefined, context.watch?.turnId,
+      context.origin as ScriptCallOrigin | undefined, context.watch?.turnId, route,
     );
     // Deferred: applied to the result of the code_execution call watching
     // the script — ending the turn mid-script would cancel the stream while
@@ -21230,7 +21240,7 @@ export class AgentFramework {
     const watching = context.watching ? context.watching() : context.watch;
     if (result.endTurn && watching) watching.endTurn = true;
     if (result.refused) return refused(result.error ?? `${toolName} was refused; nothing was done`);
-    const answer = await this.scriptResultAnswer(result, toolName);
+    const answer = await this.scriptResultAnswer(result, toolName, route.toServer);
     return SCRIPT_CALL_NO_RESULT.has(result) ? { ...answer, held: true } : answer;
   }
 
@@ -21239,14 +21249,18 @@ export class AgentFramework {
    * isError }`, one shape for every tool. `content` is
    * what the model would read: a structured result's blocks as the dispatch
    * gave them (the direct reading, with RFC-005's treatment of an MCPL peer's
-   * blocks), and otherwise one text block of the model's text, which for a
-   * failure is its error. `structuredContent` is the tool's own structured
+   * blocks there, bound to the server that sent them), a module's under
+   * history's reading of RFC-005 at every depth (shownToScript), and
+   * otherwise one text block of the model's text, which for a failure is its
+   * error. A module's is any result whose call the dispatch didn't send to
+   * a server (`toServer`, from the call's waiter). `structuredContent` is the
+   * tool's own structured
    * content where it sent one, `false`, `0` and `null` included, else null.
    * A result that can't be converted to JSON (a cyclic object, a BigInt),
    * which the dispatch's own check makes unlikely here, is a failure naming
    * the tool and saying the call itself completed.
    */
-  private async scriptResultAnswer(result: ToolResult, toolName: string): Promise<ToolAnswer> {
+  private async scriptResultAnswer(result: ToolResult, toolName: string, toServer: boolean): Promise<ToolAnswer> {
     const structured = Object.prototype.hasOwnProperty.call(result, 'structured');
     const isError = result.isError === true;
     // RFC-005 "eagerly lazy": a script receiving a result is the strongest
@@ -21263,7 +21277,10 @@ export class AgentFramework {
     // which isn't fetched.
     // Whenever the result's blocks reach the script: a structured failure's
     // included, as a module's error can carry content.
-    if ((!isError || structured) && Array.isArray(result.data) && this.resolveMcplTool(toolName) === null) {
+    // Not a server's result: a module's, whose blocks no dispatch has given
+    // RFC-005's treatment.
+    const fromModule = !toServer;
+    if ((!isError || structured) && Array.isArray(result.data) && fromModule) {
       const fetcher = this.getReferenceFetcher();
       for (const block of result.data) {
         const c = classifyBlock(block);
@@ -21290,6 +21307,20 @@ export class AgentFramework {
     // no blocks reads as its error text.
     if (structured && (!isError || (Array.isArray(result.data) && result.data.length > 0))) {
       content = Array.isArray(result.data) ? result.data : [];
+      // A module's blocks, such as an MCPL peer's it got from ctx.callTool
+      // and returns whole, are read as history reads a module's data: what
+      // RFC-005 governs, at any depth, as the script lane shows it, and
+      // anything else as sent. What a script prints comes back to the model,
+      // so no uri the model's lanes withhold reaches it. What this gives is
+      // a stub, a notice or the value itself, so a module that returns
+      // blocks it already gave has them left as they are.
+      if (fromModule) {
+        try {
+          content = JSON.parse(JSON.stringify(content, (_key, value: unknown) => shownToScript(value))) as unknown[];
+        } catch (err) {
+          return failed(err);
+        }
+      }
     } else {
       // As in history, a reference is its stub at any depth and inline data
       // claiming a uri or a disposition is withheld (RFC-005).
@@ -21326,7 +21357,9 @@ export class AgentFramework {
    * RFC-007: with an `origin`, observers see the call as they see a model
    * call (register, dispatch with its refusal sites, open; the terminal at
    * the waiter intercept), under the inner tool's own name and class.
-   * `turnId` is the turn the call was made in (dispatchToolCall).
+   * `turnId` is the turn the call was made in (dispatchToolCall). `route` is
+   * the waiter's: the dispatch sets `toServer` when it sends the call to a
+   * server.
    */
   private dispatchScriptToolCall(
     agentName: string,
@@ -21334,6 +21367,7 @@ export class AgentFramework {
     args: Record<string, unknown>,
     origin?: ScriptCallOrigin,
     turnId?: number,
+    route: { toServer: boolean } = { toServer: false },
   ): Promise<ToolResult> {
     return new Promise<ToolResult>((resolve) => {
       const callId = `pytc-${randomUUID()}`;
@@ -21361,9 +21395,12 @@ export class AgentFramework {
       }, safetyMs);
       safety.unref?.();
 
-      this.scriptToolWaiters.set(callId, (result) => {
-        clearTimeout(safety);
-        resolve(result);
+      this.scriptToolWaiters.set(callId, {
+        resolve: (result) => {
+          clearTimeout(safety);
+          resolve(result);
+        },
+        route,
       });
 
       const call = { id: callId, name: toolName, input: args };
@@ -21922,6 +21959,10 @@ export class AgentFramework {
     // Route MCPL tool calls to the appropriate server via prefix map
     const mcplMatch = this.resolveMcplTool(enrichedCall.name);
     if (mcplMatch && this.mcplServerRegistry) {
+      // A script's call: its waiter keeps that it went to a server, for the
+      // script lane's exit (scriptToolWaiters).
+      const scriptWaiter = this.scriptToolWaiters.get(enrichedCall.id);
+      if (scriptWaiter) scriptWaiter.route.toServer = true;
       this.dispatchMcplToolCall(agentName, enrichedCall, mcplMatch[0], mcplMatch[1]);
       return;
     }
@@ -27449,7 +27490,9 @@ export class AgentFramework {
     // generated JSON) stands in for what the server sent. An MCPL peer's
     // content blocks are the exception: what a script prints comes back to
     // the model, so each gets the treatment RFC-005 gives it on every lane
-    // the model reads. A standard peer's blocks reach the script as sent.
+    // the model reads, here, where the server that sent them is known. A
+    // module's blocks get it at the script lane's exit (scriptResultAnswer).
+    // A standard peer's blocks reach the script as sent.
     const forScript = this.scriptToolWaiters?.has(call.id) ?? false;
     const reading = async (result: { content?: unknown; isError?: boolean; structuredContent?: unknown }, mcpl: boolean): Promise<ToolResult> => {
       if (!forScript || !Object.prototype.hasOwnProperty.call(result, 'structuredContent')) {
