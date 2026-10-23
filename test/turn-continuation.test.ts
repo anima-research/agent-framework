@@ -238,6 +238,9 @@ async function restartTurn(opts: {
   /** More agents and modules beside prime and its tool. */
   extraAgents?: Array<{ name: string; model: string; systemPrompt: string }>;
   extraModules?: Module[];
+  /** The turn starts on a silent wake (suppressProse), with the message
+   *  already stored, rather than on the message's own wake. */
+  silentFirst?: boolean;
 }) {
   const tempDir = mkdtempSync(join(tmpdir(), 'turn-continuation-'));
   const membrane = new SequentialStreamMembrane([], (index, responses) => {
@@ -279,10 +282,16 @@ async function restartTurn(opts: {
     origError(...args);
   };
   opts.beforeStart?.(framework);
-  framework.start();
-  framework.pushEvent({
-    type: 'external-message', source: 'test', content: [{ type: 'text', text: 'fetch it' }], metadata: {}, triggerInference: true,
-  } as unknown as ProcessEvent);
+  if (opts.silentFirst) {
+    framework.getAgent('prime')!.getContextManager().addMessage('user', [{ type: 'text', text: 'fetch it' }]);
+    framework.start();
+    internals(framework).pendingRequests.push({ agentName: 'prime', reason: 'heartbeat', source: 'test', timestamp: Date.now(), suppressProse: true });
+  } else {
+    framework.start();
+    framework.pushEvent({
+      type: 'external-message', source: 'test', content: [{ type: 'text', text: 'fetch it' }], metadata: {}, triggerInference: true,
+    } as unknown as ProcessEvent);
+  }
   try {
     await waitFor('the budget restart', () => (opts.until ?? ((t) => t.some((e) => e.type === 'inference:stream_restarted')))(traces));
   } catch (error) {
@@ -354,6 +363,8 @@ function assertTurnEnded(h: { framework: AgentFramework }): void {
   assert.equal(gateInferring(h.framework), false, "the gate's window is released");
 }
 
+/** prime's turn token has gone with its restarted frame: the turn waits for
+ *  its continuation with no token held. */
 const frameLetGo = (framework: AgentFramework): boolean => !internals(framework).activeTurnTokens.has('prime');
 
 /** A scheduler pass has run since `mark` was pushed (agent_not_found for a
@@ -363,8 +374,6 @@ async function aPass(h: { framework: AgentFramework; logged: string[] }, label: 
   internals(h.framework).pendingRequests.push({ agentName: 'nobody', reason: 'operator', source: 'test', timestamp: Date.now() });
   await waitFor(label, () => h.logged.filter((l) => l.includes('agent=nobody reason=agent_not_found')).length > before);
 }
-/** prime's turn token has gone with its restarted frame: the turn waits for
- *  its continuation with no token held. */
 
 /**
  * prime's continuation in a scheduler pass's hands: the pass took it from
@@ -452,7 +461,7 @@ describe('a turn whose continuation is on its way', () => {
     }
   });
 
-  it("a message arriving then is in the continuation's request, as on main, and its wake goes with the continuation", async () => {
+  it("a message arriving then is in the continuation's request, as on main, and its wake starts a turn of its own after the continuation", async () => {
     const h = await restartTurn({ wait: true });
     try {
       await waitFor('the continuation to be held, its frame gone', () => heldForWait(h.framework) && frameLetGo(h.framework));
@@ -461,9 +470,13 @@ describe('a turn whose continuation is on its way', () => {
       h.framework.releaseProviderWait('prime');
       await waitFor('the continuation to run once the wait ends', () => h.membrane.calls.length >= 2);
       assert.ok(requestTexts(h.membrane.calls[1]).includes(MID), "the continuation's request carries the message");
-      await waitFor('the turn to end', () => h.framework.getHostModeStatus().drained);
-      await aPass(h, 'a pass after the turn');
-      assert.equal(h.membrane.calls.length, 2, 'the wake went with the continuation: no second turn');
+      // The hold released the wake with the continuation, which starts alone:
+      // the wake waits for the turn, then starts one of its own.
+      await waitFor("the wake's own turn", () => h.membrane.calls.length >= 3);
+      assert.ok(requestTexts(h.membrane.calls[2]).includes(MID), "the wake's turn reads the message too");
+      await waitFor('the turns to end', () => h.framework.getHostModeStatus().drained);
+      await aPass(h, 'a pass after the turns');
+      assert.equal(h.membrane.calls.length, 3, 'no turn after the wake\'s');
     } finally {
       await h.cleanup();
     }
@@ -951,9 +964,10 @@ describe('a turn whose continuation is dropped ends there', () => {
 
 
 /** prime's tool-result guard retry, held by a provider wait stated while
- *  its tool ran, its frame gone. `duringTool` runs as the tool starts. The
- *  start of each stream records the trigger it ran on (startedTriggers). */
-async function guardRetryHeld(duringTool?: (framework: AgentFramework) => void) {
+ *  its tool ran, its frame gone. `duringTool` runs as the tool starts, and
+ *  `original` adds fields to the wake that started the turn. The start of
+ *  each stream records a copy of the trigger it ran on (starts). */
+async function guardRetryHeld(duringTool?: (framework: AgentFramework) => void, original: Partial<InferenceRequest> = {}) {
   const tempDir = mkdtempSync(join(tmpdir(), 'turn-continuation-'));
   const membrane = new SequentialStreamMembrane([2]);
   membrane.pushResponse(createMockResponse([{ type: 'tool_use', id: 'call_1', name: 'guarded--read', input: {} }], 'tool_use'));
@@ -973,7 +987,12 @@ async function guardRetryHeld(duringTool?: (framework: AgentFramework) => void) 
       duringTool?.(framework);
       await sleep(50);
       internals(framework).providerWaits.set('prime', 'test-model', WAIT_MS, 'stated while the tool ran');
-      await sleep(50);
+      // What duringTool queued goes into the hold before the round ends, and
+      // so before the guard's retry.
+      if (duringTool) {
+        await waitFor('the hold to take what was queued while the tool ran', () =>
+          (internals(framework).providerAccelerationCooldowns.get('prime')?.heldRequests.length ?? 0) > 0);
+      }
       return { success: true, data: 'payload' };
     },
     async onProcess() { return {}; },
@@ -990,12 +1009,12 @@ async function guardRetryHeld(duringTool?: (framework: AgentFramework) => void) 
     gate: { config: { policies: [], default: 'always' } },
   } as never);
   const traces: TraceEvent[] = [];
-  const startedTriggers: string[] = [];
+  const starts: Array<InferenceRequest | undefined> = [];
   framework.onTrace((e) => {
     traces.push(e);
     if (e.type === 'inference:started') {
       const t = (framework as unknown as { activeTurnTriggers: Map<string, InferenceRequest> }).activeTurnTriggers.get('prime');
-      startedTriggers.push(t?.reason ?? 'none');
+      starts.push(t && { ...t });
     }
   });
   const logged: string[] = [];
@@ -1009,7 +1028,7 @@ async function guardRetryHeld(duringTool?: (framework: AgentFramework) => void) 
   try {
     framework.getAgent('prime')!.getContextManager().addMessage('user', [{ type: 'text', text: 'read it' }]);
     framework.start();
-    internals(framework).pendingRequests.push({ agentName: 'prime', reason: 'mcpl:push-event', source: 'test', timestamp: Date.now() });
+    internals(framework).pendingRequests.push({ agentName: 'prime', reason: 'mcpl:push-event', source: 'test', timestamp: Date.now(), ...original });
     await waitFor('the guard retry to be held, its frame gone', () =>
       (internals(framework).providerAccelerationCooldowns.get('prime')?.heldRequests.some((r) => r.reason === 'tool_result_guard_retry') ?? false)
       && frameLetGo(framework), 15_000);
@@ -1017,7 +1036,48 @@ async function guardRetryHeld(duringTool?: (framework: AgentFramework) => void) 
     await cleanup();
     throw error;
   }
-  return { framework, membrane, traces, logged, cleanup, startedTriggers };
+  return { framework, membrane, traces, logged, cleanup, starts };
+}
+
+/** The reasons of the requests prime's provider hold holds, in order. */
+const heldReasons = (framework: AgentFramework): string[] =>
+  internals(framework).providerAccelerationCooldowns.get('prime')?.heldRequests.map((r) => r.reason) ?? [];
+
+/** Who and where a turn's trigger names as having woken it (telemetry). */
+const provenanceOf = (r: InferenceRequest | undefined) => ({ counterparty: r?.counterparty, wakeChannelId: r?.wakeChannelId, wakeAt: r?.wakeAt });
+
+/** A gate wake for prime from alice, as the EventGate queues one. */
+function aliceWake(): InferenceRequest {
+  return { agentName: 'prime', reason: 'mcpl:channel-incoming', source: 'test', timestamp: Date.now(),
+    counterparty: 'srv:user:alice', wakeChannelId: 'srv:chan-alice', wakeAt: Date.now() };
+}
+
+/** A coalesced batch's wake for prime, subject s1 (RFC-006). */
+function batchWake(): InferenceRequest {
+  return { agentName: 'prime', reason: 'mcpl:push-event', source: 'test', timestamp: Date.now(),
+    coalescingBatch: true, coalescingSubject: 's1', coalescingBatchSubjects: ['s1'] };
+}
+
+/**
+ * A stand-in for the push coalescer, of which a turn's start reads
+ * pendingBatches() and assemble(): one batch, subject s1, pending from arm()
+ * until an assembly takes it. `assembled` lists each assembly's agent and
+ * causes.
+ */
+function standInCoalescer(framework: AgentFramework) {
+  let pending = false;
+  const assembled: string[] = [];
+  internals(framework).pushCoalescer = {
+    pendingBatches: () => (pending ? 1 : 0),
+    assemble: async (agent: string, subjects?: readonly string[]) => {
+      assembled.push(`${agent}:${(subjects ?? []).join(',')}`);
+      const had = pending;
+      pending = false;
+      return { materialized: new Set(had ? ['s1'] : []), settled: new Set(subjects ?? []) };
+    },
+    suspend: () => {},
+  };
+  return { arm: () => { pending = true; }, pending: () => pending, assembled };
 }
 
 describe('a framework cancel that throws', () => {
@@ -1282,14 +1342,18 @@ describe('a framework cancel that throws', () => {
 });
 
 describe('a batch that carries a continuation of the turn', () => {
-  it("starts as a tool-result guard's retry when a provider hold releases it with a wake it held before it", async () => {
+  const completions = (h: { traces: TraceEvent[] }): number => h.traces.filter((t) => t.type === 'inference:completed').length;
+  const BOB = { counterparty: 'srv:user:bob', wakeChannelId: 'srv:chan-bob', wakeAt: 1_000 };
+
+  it("starts a tool-result guard's retry alone, with its turn's provenance, when a provider hold releases it with a wake it held before it, and the wake then starts a turn of its own", async () => {
+    let alice!: InferenceRequest;
     const h = await guardRetryHeld((fw) => {
-      // A wake for prime arrives while its tool runs, and the hold takes it before the retry.
-      internals(fw).pendingRequests.push({ agentName: 'prime', reason: 'timer', source: 'test', timestamp: Date.now() });
-    });
+      // A wake for prime from alice arrives while its tool runs, and the hold takes it before the retry.
+      alice = aliceWake();
+      internals(fw).pendingRequests.push(alice);
+    }, BOB);
     try {
-      const held = internals(h.framework).providerAccelerationCooldowns.get('prime')!.heldRequests.map((r) => r.reason);
-      assert.deepEqual(held, ['timer', 'tool_result_guard_retry'], 'the wake is held ahead of the retry');
+      assert.deepEqual(heldReasons(h.framework), ['mcpl:channel-incoming', 'tool_result_guard_retry'], 'the wake is held ahead of the retry');
       const gate = internals(h.framework).eventGate as { onInferenceStarted(name: string): void; onInferenceResumed(name: string): void };
       const windows: string[] = [];
       const started = gate.onInferenceStarted.bind(gate);
@@ -1297,11 +1361,148 @@ describe('a batch that carries a continuation of the turn', () => {
       gate.onInferenceStarted = (name) => { if (name === 'prime') windows.push('started'); started(name); };
       gate.onInferenceResumed = (name) => { if (name === 'prime') windows.push('resumed'); resumed(name); };
       h.framework.releaseProviderWait('prime');
-      await waitFor('the turn to answer', () => h.traces.some((t) => t.type === 'inference:completed'));
-      // The start runs on the retry, and resumes its turn's gate window rather than opening one.
-      assert.deepEqual({ triggers: h.startedTriggers, windows }, { triggers: ['mcpl:push-event', 'tool_result_guard_retry'], windows: ['resumed'] });
-      await aPass(h, 'a pass after the turn');
-      assert.equal(h.startedTriggers.length, 2, 'the wake went with that start, and starts no turn of its own');
+      await waitFor("the retry's turn to answer", () => completions(h) > 0);
+      // The start runs on the retry alone: it resumes its turn's gate window,
+      // and names its turn's author, not the wake's.
+      assert.equal(h.starts[1]?.reason, 'tool_result_guard_retry');
+      assert.deepEqual(windows, ['resumed'], "the retry resumes its turn's gate window");
+      assert.deepEqual(provenanceOf(h.starts[1]), BOB, "the retry's start names its turn's provenance");
+      await waitFor('the wake to start a turn of its own', () => h.starts.length > 2);
+      assert.equal(h.starts[2]?.reason, 'mcpl:channel-incoming');
+      assert.deepEqual(windows, ['resumed', 'started'], 'the wake opens a gate window of its own');
+      assert.deepEqual(provenanceOf(h.starts[2]), provenanceOf(alice), "the wake's turn names its own provenance");
+    } finally {
+      await h.cleanup();
+    }
+  });
+
+  it("leaves a coalesced batch whose wake a provider hold took ahead of a guard retry to the wake's own turn, which assembles it", async () => {
+    let coalescer!: ReturnType<typeof standInCoalescer>;
+    const h = await guardRetryHeld((fw) => {
+      // A batch for prime opens while its tool runs, and the hold takes its wake before the retry.
+      coalescer = standInCoalescer(fw);
+      coalescer.arm();
+      internals(fw).pendingRequests.push(batchWake());
+    });
+    try {
+      assert.deepEqual(heldReasons(h.framework), ['mcpl:push-event', 'tool_result_guard_retry'], "the batch's wake is held ahead of the retry");
+      h.framework.releaseProviderWait('prime');
+      await waitFor("the retry's turn to answer", () => completions(h) > 0);
+      assert.equal(h.starts[1]?.reason, 'tool_result_guard_retry', 'the start runs on the retry alone');
+      assert.deepEqual(coalescer.assembled, [], 'the retry assembles nothing');
+      await waitFor("the batch's wake to start a turn of its own", () => h.starts.length > 2);
+      await waitFor("that turn to answer", () => completions(h) > 1);
+      assert.deepEqual(coalescer.assembled, ['prime:s1'], 'its turn assembles the batch');
+      assert.equal(coalescer.pending(), false, 'and the batch is read');
+    } finally {
+      await h.cleanup();
+    }
+  });
+
+  /** prime's budget restart with a wake queued beside it: `during` runs
+   *  while the tool runs, and queues the request it returns, if any. With
+   *  `hold`, a provider wait stated as the tool returns holds both, the wake
+   *  ahead of the restart; without it, the wake waits for the turn and the
+   *  restart is queued behind it. With `injects` false, each stream declares
+   *  it can't carry injected messages. Each start records a copy of its
+   *  trigger (starts). */
+  async function restartBehind(during: (framework: AgentFramework) => InferenceRequest | undefined,
+    { hold = true, silentFirst = false, injects = true } = {}) {
+    const starts: Array<InferenceRequest | undefined> = [];
+    let unblock!: () => void;
+    const h = await restartTurn({
+      wait: hold, silentFirst, until: () => true,
+      ...(injects ? {} : { makeStream: (_index: number, responses: NormalizedResponse[]) => new MockYieldingStream(responses, false) }),
+      blockFirstTool: new Promise<void>((r) => { unblock = r; }),
+      onTrace: (framework, event) => {
+        if (event.type === 'inference:started') {
+          const t = framework.getActiveTurnTrigger('prime');
+          starts.push(t && { ...t });
+        }
+      },
+    });
+    let request: InferenceRequest | undefined;
+    try {
+      await waitFor('the tool to start', () => h.module.firstToolStarted);
+      request = during(h.framework);
+      if (request) internals(h.framework).pendingRequests.push(request);
+      unblock();
+      if (hold) await waitFor('the restart to be held', () => heldForWait(h.framework));
+    } catch (error) {
+      unblock();
+      await h.cleanup();
+      throw error;
+    }
+    return { ...h, starts, request };
+  }
+
+  it('starts a budget restart alone when a provider hold releases it with a wake it held before it, and the wake then starts a turn of its own, with its own provenance', async () => {
+    const h = await restartBehind(() => aliceWake());
+    try {
+      assert.deepEqual(heldReasons(h.framework), ['mcpl:channel-incoming', 'context_budget_restart'], 'the wake is held ahead of the restart');
+      h.framework.releaseProviderWait('prime');
+      await waitFor("the restart's turn to answer", () => completions(h) > 0);
+      assert.equal(h.starts[1]?.reason, 'context_budget_restart', 'the start runs on the restart');
+      assert.deepEqual(provenanceOf(h.starts[1]), provenanceOf(undefined), 'which names no author, as before');
+      await waitFor('the wake to start a turn of its own', () => h.starts.length > 2);
+      assert.equal(h.starts[2]?.reason, 'mcpl:channel-incoming');
+      assert.deepEqual(provenanceOf(h.starts[2]), provenanceOf(h.request), "the wake's turn names its own provenance");
+    } finally {
+      await h.cleanup();
+    }
+  });
+
+  it("leaves a coalesced batch whose wake a provider hold took ahead of a budget restart to the wake's own turn, which assembles it", async () => {
+    let coalescer!: ReturnType<typeof standInCoalescer>;
+    const h = await restartBehind((fw) => {
+      coalescer = standInCoalescer(fw);
+      coalescer.arm();
+      return batchWake();
+    });
+    try {
+      assert.deepEqual(heldReasons(h.framework), ['mcpl:push-event', 'context_budget_restart'], "the batch's wake is held ahead of the restart");
+      h.framework.releaseProviderWait('prime');
+      await waitFor("the restart's turn to answer", () => completions(h) > 0);
+      assert.equal(h.starts[1]?.reason, 'context_budget_restart', 'the start runs on the restart');
+      assert.deepEqual(coalescer.assembled, [], 'the restart assembles nothing');
+      await waitFor("the batch's wake to start a turn of its own", () => h.starts.length > 2);
+      await waitFor('that turn to answer', () => completions(h) > 1);
+      assert.deepEqual(coalescer.assembled, ['prime:s1'], 'its turn assembles the batch');
+      assert.equal(coalescer.pending(), false, 'and the batch is read');
+    } finally {
+      await h.cleanup();
+    }
+  });
+
+  it("starts a silent turn's budget restart alone and silent when an ordinary wake waited for the turn, and the wake then starts a turn of its own", async () => {
+    // No provider hold: the wake waits for the turn, and the restart is queued behind it.
+    const h = await restartBehind(() => aliceWake(), { hold: false, silentFirst: true });
+    try {
+      assert.equal(h.starts[0]?.suppressProse, true, 'the turn is silent');
+      await waitFor("the restart's turn to answer", () => completions(h) > 0);
+      assert.equal(h.starts[1]?.reason, 'context_budget_restart', 'the start runs on the restart');
+      assert.equal(h.starts[1]?.suppressProse, true, 'and resumes the turn silent');
+      await waitFor('the wake to start a turn of its own', () => h.starts.length > 2);
+      assert.equal(h.starts[2]?.reason, 'mcpl:channel-incoming');
+      assert.equal(h.starts[2]?.suppressProse, undefined, "the wake's turn is its own, not silent");
+    } finally {
+      await h.cleanup();
+    }
+  });
+
+  it("leaves a message the restart's turn couldn't hear to its wake's own turn, which reads it", async () => {
+    // The streams carry no injected messages, so the message waits through the
+    // tool boundary, deferred, and the restart's start flushes nothing.
+    const HEARD_LATE = 'A message that arrived while the tool ran, which no stream could inject.';
+    const h = await restartBehind((fw) => { pushMessage(fw, HEARD_LATE); return undefined; }, { hold: false, injects: false });
+    const carries = (): boolean[] => h.membrane.calls.map((c) => JSON.stringify(c).includes(HEARD_LATE));
+    try {
+      await waitFor("the restart's turn to answer", () => completions(h) > 0);
+      assert.equal(h.starts[1]?.reason, 'context_budget_restart', 'the start runs on the restart');
+      assert.deepEqual(carries().slice(0, 2), [false, false], "neither the turn's request nor the restart's carries the message");
+      await waitFor("the message's wake to start a turn of its own", () => h.starts.length > 2);
+      await waitFor('that turn to answer', () => completions(h) > 1);
+      assert.deepEqual(carries(), [false, false, true], "the wake's turn reads it");
     } finally {
       await h.cleanup();
     }

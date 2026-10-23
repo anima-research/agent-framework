@@ -14708,6 +14708,28 @@ export class AgentFramework {
         requests.push(...passThrough);
       }
 
+      // A batch that carries a continuation which resumes its logical turn
+      // (resumesLogicalTurn: a budget restart, a tool-result guard's retry)
+      // starts with the turn's continuations alone. A resume takes in no new
+      // input: beginAgentTurn writes no clock, flushes nothing and assembles
+      // nothing for it. Merged into it, a wake would get no turn of its own: a
+      // coalesced batch it carries would go unassembled, a guard retry would
+      // record the wake's author as its own, and a silent turn's resume would
+      // take on the wake's prose routing. So the batch's other requests go
+      // back to the queue, wait for the turn as any wake does, and then start
+      // a turn of their own, as the quiesce path above parks them. The turn's
+      // continuations (isTurnContinuation) stay together, as they pass a
+      // quiesce together.
+      if (requests.some((r) => resumesLogicalTurn(r.reason))) {
+        const siblings = requests.filter((r) => !isTurnContinuation(r.reason));
+        if (siblings.length > 0) {
+          this.pendingRequests.push(...siblings);
+          const continuations = requests.filter((r) => isTurnContinuation(r.reason));
+          requests.length = 0;
+          requests.push(...continuations);
+        }
+      }
+
       // Turn-alive includes a continuation of the agent's turn still on its
       // way elsewhere (a park, another pass's hands): a fresh wake waits for
       // it, as for a turn holding its token.
@@ -14795,7 +14817,10 @@ export class AgentFramework {
         if (requests.some((r) => resumesLogicalTurn(r.reason))) {
           this.endContinuedTurn(agentName, { kind: 'dropped', why: 'the inference policy dropped its continuation' });
         }
-        this.endPendingPrimary(agentName);
+        // A primary a provider hold left pending stays pending while a wake
+        // this batch sent back to the queue (above) waits to run, as when
+        // dropContinuations drops one.
+        if (!this.pendingRequests.some((r) => r.agentName === agentName)) this.endPendingPrimary(agentName);
         continue;
       }
 
@@ -14804,12 +14829,13 @@ export class AgentFramework {
       // downstream turn semantics. An ordinary wake can already be pending
       // when the tool boundary appends a context-budget restart; selecting
       // requests[0] in that mixed batch bypassed the turn lock because a
-      // restart existed, then treated the continuation as a fresh turn. The
-      // same holds for the tool-result guard's retry, which a provider hold
-      // can release in one batch with a wake it held before it: a batch that
-      // carries a continuation of the agent's turn starts as that
-      // continuation, a budget restart first.
-      const trigger = budgetRestart ?? requests.find((r) => r.reason === 'tool_result_guard_retry') ?? requests[0];
+      // restart existed, then treated the continuation as a fresh turn. A
+      // batch that carries a continuation which resumes the turn holds only
+      // the turn's continuations by now (above), and starts as the one that
+      // resumes it, a budget restart first. Any other batch, one with a
+      // tool_results_ready wake among its wakes included, starts as its first
+      // request.
+      const trigger = budgetRestart ?? requests.find((r) => resumesLogicalTurn(r.reason)) ?? requests[0];
       // The bounce-wake cap (bounceProse) stops a bounce → wake → bounce loop
       // that nothing else feeds. A turn with a cause of its own is not that
       // loop, so the count starts again. Otherwise only a delivered prose
@@ -28399,9 +28425,8 @@ export class AgentFramework {
     // turn is still open, even once another start's routing is the agent's
     // live one. A silent turn's open moves no locus: no silent start or
     // resume registers its routing state as the open turn (openLogical), and
-    // a non-silent resume that does, a budget restart batched with an
-    // ordinary wake, starts only once its over-budget boundary has every
-    // result of the round.
+    // a silent turn's resume stays silent, since a batch that carries it
+    // starts it apart from the batch's wakes (runInferencePass).
     // The turn the call was made in, none for one made outside it (a script
     // left running, or one an earlier turn started): only the turn's own call
     // moves its routing (callingTurnOf).
