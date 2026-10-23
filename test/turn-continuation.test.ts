@@ -1291,3 +1291,50 @@ describe('a batch that carries a continuation of the turn', () => {
     }
   });
 });
+
+describe("an ephemeral run whose turn's continuation is dropped", () => {
+  for (const drop of [true, false]) {
+    it(drop ? "settles at once, rejecting with the drop's reason" : 'completes when its continuation runs (control)', async () => {
+      const tempDir = mkdtempSync(join(tmpdir(), 'turn-continuation-'));
+      const membrane = new SequentialStreamMembrane();
+      membrane.pushResponse(nearCapToolResponse());
+      membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Recovered.' }]));
+      const module = new RestartToolModule(false);
+      const origError = console.error;
+      console.error = () => {};
+      const framework = await AgentFramework.create({
+        storePath: join(tempDir, 'store'), membrane: membrane.asMembrane(), agents: [], modules: [module], syncIntervalMs: 0,
+        // The policy drops the budget restart's continuation.
+        inferencePolicy: { shouldInfer: (_agent: string, requests: InferenceRequest[]) => !drop || !requests.some((r) => r.reason === 'context_budget_restart') } as never,
+      });
+      module.framework = framework;
+      const traces: TraceEvent[] = [];
+      framework.onTrace((e) => { traces.push(e); });
+      try {
+        const created = await framework.createEphemeralAgent({
+          name: 'worker', model: 'test-model', systemPrompt: 'You work.', allowedTools: 'all', maxTokens: 4_000, physicalWindowTokens: 200_000,
+        } as never);
+        created.contextManager.addMessage('user', [{ type: 'text', text: 'fetch it' }]);
+        // The idle watchdog would end a run left unsettled, with its own message, after 5 s.
+        const ended = framework.runEphemeralToCompletion(created.agent, created.contextManager, { idleTimeoutMs: 5_000, idlePollMs: 50 })
+          .then((result) => ({ result }), (error: unknown) => ({ error }));
+        framework.start();
+        const outcome = await ended;
+        if (drop) {
+          assert.ok('error' in outcome, 'the run rejects');
+          const error = outcome.error as Error;
+          assert.equal(error.constructor, Error, 'a plain Error');
+          assert.equal(error.message, "worker's turn ended without its continuation: the inference policy dropped its continuation");
+          assert.deepEqual(traces.filter((t) => t.type === 'inference:aborted').map((t) => (t as { reason?: string }).reason), [CONTINUATION_DROPPED]);
+        } else {
+          assert.ok('result' in outcome, `the run completes: ${'error' in outcome ? String(outcome.error) : ''}`);
+          assert.match(outcome.result.speech, /Recovered\./);
+        }
+      } finally {
+        console.error = origError;
+        await framework.stop();
+        rmSync(tempDir, { recursive: true, force: true });
+      }
+    });
+  }
+});

@@ -17580,7 +17580,8 @@ export class AgentFramework {
    * abandon or a stop of a registered agent settles the turn as it settles a
    * turn's start (endStoppedStart: one inference:aborted, the turn settled,
    * the gate released). Any other drop ends it as a start dropped before it
-   * sends anything ends. That frame, if it hasn't let go of its token yet,
+   * sends anything ends, and settles a registered ephemeral run's turn with
+   * the drop's reason. That frame, if it hasn't let go of its token yet,
    * ends on its own and settles nothing. What was deferred for the agent
    * lands now, or at that frame's end.
    */
@@ -17608,6 +17609,10 @@ export class AgentFramework {
       const routing = this.openLogical.get(agentName) ?? this.turnRouting.get(agentName);
       if (routing) this.endDroppedTurn(agentName, routing);
       this.eventGate?.onInferenceEnded(agentName);
+      // A registered ephemeral run's caller waits on the run's settle, which
+      // no frame gives once its continuation is gone: the turn's end is the
+      // run's, with the drop's reason.
+      this.settleAgent(agentName, { stopReason: 'exhausted', speech: '', error: `${agentName}'s turn ended without its continuation: ${drop.why}` }, undefined);
     }
     if (!this.activeTurnTokens.has(agentName) && this.deferredMessages.length > 0 && !this.pendingAssistantBlocks.has(agentName)) {
       this.readdDrained(this.drainDeferredFor(agentName), 'continuation-drop flush');
