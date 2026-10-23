@@ -19,6 +19,7 @@ import type { NormalizedRequest, NormalizedResponse, YieldingStream } from '@ani
 import type { EventResponse, InferenceRequest, Module, ProcessEvent, ToolDefinition, ToolResult, TraceEvent } from '../src/index.js';
 import { AgentFramework, OperatorActionError } from '../src/index.js';
 import { createMockResponse, MockMembrane, MockYieldingStream } from './helpers/mock-membrane.js';
+import { forkAgentName } from '../src/mcpl/conversation-router.js';
 import type { StreamEvent } from '@animalabs/membrane';
 
 /** Long enough that no test sees it pass: a test that wants the continuation
@@ -165,6 +166,8 @@ class RestartToolModule implements Module {
   /** The first tool call waits for this before it answers. */
   blockFirstTool: Promise<void> | null = null;
   firstToolStarted = false;
+  /** The agent the provider states its wait for. */
+  waitFor = 'prime';
   private calls = 0;
   constructor(private readonly wait: boolean) {}
   async start(): Promise<void> {}
@@ -179,7 +182,7 @@ class RestartToolModule implements Module {
     this.firstToolStarted = true;
     if (this.blockFirstTool) await this.blockFirstTool;
     if (this.endTurnFirst) return { success: true, data: { finished: true }, endTurn: true };
-    if (this.wait) internals(this.framework!).providerWaits.set('prime', 'test-model', WAIT_MS, 'stated while the tool ran');
+    if (this.wait) internals(this.framework!).providerWaits.set(this.waitFor, 'test-model', WAIT_MS, 'stated while the tool ran');
     if (this.auxiliaryDuringRestart) internals(this.framework!).providerGate('prime').auxiliaryInFlight++;
     if (this.closeAdmissionDuringRestart) internals(this.framework!).providerAdmissionClosed = true;
     return { success: true, data: { blob: 'x'.repeat(30_000) } };
@@ -1379,6 +1382,55 @@ describe("a nudge while the agent's turn waits for its continuation", () => {
       assert.deepEqual(h.framework.getHostModeStatus().activeTurnAgents, ['prime']);
     } finally {
       await h.cleanup();
+    }
+  });
+});
+
+describe("a conversation agent's disposal while its turn's continuation is held", () => {
+  it('ends the turn and empties the hold', async () => {
+    const tempDir = mkdtempSync(join(tmpdir(), 'turn-continuation-'));
+    const membrane = new SequentialStreamMembrane();
+    membrane.pushResponse(nearCapToolResponse());
+    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Recovered.' }]));
+    const module = new RestartToolModule(true);
+    const fork = forkAgentName('conversation', 'zz-server', 'zz-chat', 1);
+    module.waitFor = fork;
+    const logged: string[] = [];
+    const origError = console.error;
+    console.error = (...args: unknown[]) => { logged.push(args.map(String).join(' ')); };
+    const framework = await AgentFramework.create({
+      storePath: join(tempDir, 'store'), membrane: membrane.asMembrane(), modules: [module], syncIntervalMs: 0,
+      agents: [{ name: 'prime', model: 'test-model', systemPrompt: 'You are prime.', allowedTools: 'all', maxTokens: 4_000, physicalWindowTokens: 200_000 }],
+      conversations: { templateAgent: 'prime', bind: { channel: 'always' }, trigger: { channel: 'mention' } },
+    } as never);
+    module.framework = framework;
+    const traces: TraceEvent[] = [];
+    framework.onTrace((e) => { traces.push(e); });
+    const internal = framework as unknown as Internals & {
+      spawnConversationAgent(channel: { serverId: string; channelId: string }, decision: { agentName: string; generation: number }): Promise<unknown>;
+      conversationAgentHomes: Map<string, unknown>;
+    };
+    try {
+      framework.start();
+      // The channel's fork, spawned as a routing spawns it, takes a turn whose tool round restarts it.
+      await internal.spawnConversationAgent({ serverId: 'zz-server', channelId: 'zz-chat' }, { agentName: fork, generation: 1 });
+      assert.ok(internal.conversationAgentHomes.has(fork), 'a conversation agent');
+      framework.getAgent(fork)!.getContextManager().addMessage('User', [{ type: 'text', text: 'fetch it' }]);
+      internal.pendingRequests.push({ agentName: fork, reason: 'conversation', source: 'test', timestamp: Date.now() });
+      await waitFor("the fork's continuation to be held, its frame gone", () =>
+        (internal.providerAccelerationCooldowns.get(fork)?.heldRequests.some((r) => r.reason === 'context_budget_restart') ?? false)
+        && !internal.activeTurnTokens.has(fork));
+      assert.deepEqual(framework.getHostModeStatus().activeTurnAgents, [fork]);
+      internal.disposeConversationAgent(fork);
+      assert.deepEqual(framework.getHostModeStatus().activeTurnAgents, [], 'no turn is left alive');
+      assert.deepEqual(internal.providerAccelerationCooldowns.get(fork)?.heldRequests ?? [], [], 'the hold keeps nothing of it');
+      assert.ok(logged.some((l) => l === `[turn-continuation] ${fork}: its turn ends without its continuation: its agent was disposed`));
+      assert.deepEqual(traces.filter((t) => t.type === 'inference:aborted').map((t) => (t as { reason?: string }).reason), [CONTINUATION_DROPPED]);
+      assert.equal(membrane.calls.length, 1, 'the continuation never ran');
+    } finally {
+      console.error = origError;
+      await framework.stop();
+      rmSync(tempDir, { recursive: true, force: true });
     }
   });
 });
