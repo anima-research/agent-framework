@@ -12636,6 +12636,11 @@ export class AgentFramework {
             for (const { msg, id } of heard) this.noteArrival(agent.name, msg.metadata, id);
           }
 
+          // A boundary that ends the stream (a result that ends the turn, a restart, a stopping framework) has
+          // stored the stream's last reply above: its final row. Its results go nowhere this stream sends.
+          if (currentState.stream && (shouldEndTurn || overBudget || overPhysical)) {
+            this.noteStreamEnd(agent, currentState.stream, { kind: 'reply', id: replyId, sent: replySent ?? [] }, replySent == null);
+          }
           if (shouldEndTurn) {
             // endTurn: what this boundary stored stays; cancel stream, reset to idle.
             // The batch is never submitted, so nothing can refuse it: admit
@@ -20158,8 +20163,6 @@ export class AgentFramework {
               agent.toolResultGuard.accept();
             }
             if (!guardRefusal) releaseGuardHeld();
-            // The last batch has settled, and the last reply isn't stored yet.
-            this.renoteStreamEnd(agent, stream);
 
             // If the agent is still waiting_for_tools when 'complete' fires
             // (shouldn't happen after incomplete-tool-call fix, but guard anyway),
@@ -20180,8 +20183,12 @@ export class AgentFramework {
               // Flush pending assistant blocks
               const pending = this.pendingAssistantBlocks.get(agent.name);
               if (pending) {
-                agent.addAssistantResponse(pending, this.silentTurnRowMetadata(agent.name));
+                const pendingId = agent.addAssistantResponse(pending, this.silentTurnRowMetadata(agent.name));
                 this.pendingAssistantBlocks.delete(agent.name);
+                const pendingSent = this.pendingRoundSent.get(agent.name);
+                this.pendingRoundSent.delete(agent.name);
+                // The stream's last reply, stored: its final row.
+                this.noteStreamEnd(agent, stream, { kind: 'reply', id: pendingId, sent: pendingSent ?? [] }, pendingSent == null);
               }
               // Store tool results — same bounded spill policy as the
               // ordinary path (issue #89: this guard path must not become the
@@ -20217,10 +20224,9 @@ export class AgentFramework {
                 b.type === 'tool_use' || b.type === 'tool_result' ? i : last,
               -1
             );
-            const terminalContent = stampThinkingTokenEstimates(
-              lastToolIdx >= 0 ? response.content.slice(lastToolIdx + 1) : response.content,
-              outputTokensSinceStamp,
-            );
+            // What membrane returned of the last reply, beside the stamped copy the store keeps.
+            const terminalSent = lastToolIdx >= 0 ? response.content.slice(lastToolIdx + 1) : response.content;
+            const terminalContent = stampThinkingTokenEstimates(terminalSent, outputTokensSinceStamp);
             outputTokensSinceStamp = 0;
             // This is a whole-response boundary, not a trailing-prose
             // classifier. If the turn executed any genuine structured tool
@@ -20246,12 +20252,19 @@ export class AgentFramework {
               console.error(
                 `[tool-boundary] ${agent.name}: contained whole-response prose wrapper for registered tool ${guardedWrapperTool}; no tool called`,
               );
+              // A system row stands where the reply would be: the stream's reply isn't stored as returned.
+              this.noteStreamEnd(agent, stream, { kind: 'reply', id: undefined, sent: terminalSent }, false);
             } else if (lastToolIdx >= 0) {
               if (terminalContent.length > 0) {
-                agent.addAssistantResponse(terminalContent, this.silentTurnRowMetadata(agent.name));
+                const terminalId = agent.addAssistantResponse(terminalContent, this.silentTurnRowMetadata(agent.name));
+                this.noteStreamEnd(agent, stream, { kind: 'reply', id: terminalId, sent: terminalSent }, false);
+              } else {
+                // Nothing after the last results: the rows are judged as of now, the last batch settled.
+                this.noteStreamEnd(agent, stream, undefined, false);
               }
             } else {
-              agent.addAssistantResponse(terminalContent, this.silentTurnRowMetadata(agent.name));
+              const terminalId = agent.addAssistantResponse(terminalContent, this.silentTurnRowMetadata(agent.name));
+              this.noteStreamEnd(agent, stream, { kind: 'reply', id: terminalId, sent: terminalSent }, false);
             }
 
             // Bind the cooldown receipt to this fresh, successful request —
@@ -25353,15 +25366,19 @@ export class AgentFramework {
   }
 
   /**
-   * At the stream's end, before its last reply is stored: the rows of the last request noted, judged again, since
-   * the store can have changed under them since, as when the tool-result guard's last batch settles to the
-   * originals the stream was sent. Noted again only where a verdict changed, so the last reply keeps what the
-   * request it answers can now be vouched for.
+   * At the stream's end, after its last reply is stored: every row so far, judged as of now, with that reply as the
+   * final row (or none, where the stream's last request had no reply after it). Past the record's end nothing
+   * keeps its thinking, so the last reply keeps its own only by being noted here. Judged as of now, a batch the
+   * tool-result guard held at its boundary and has since settled to the originals is named. A reply with no
+   * `roundContent` to vouch for ends noting instead, as a round's does.
    */
-  private renoteStreamEnd(agent: Agent, stream: YieldingStream): void {
+  private noteStreamEnd(agent: Agent, stream: YieldingStream, reply: RoundRow | undefined, unvouched: boolean): void {
     const notes = this.streamRequestNotes.get(stream);
-    if (!notes || notes.stopped || notes.rounds.length === 0) return;
-    this.noteStreamRows(agent, notes, false);
+    if (!notes || notes.stopped) return;
+    if (unvouched) { notes.stopped = true; return; }
+    if (reply) notes.rounds.push(reply);
+    notes.stopped = true;
+    this.noteStreamRows(agent, notes, true);
   }
 
   /** Each round's rows judged as of now (roundRows), and noted where `always` says or a verdict changed. */

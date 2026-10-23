@@ -71,24 +71,27 @@ class Tools implements Module {
   async start() {}
   async stop() {}
   async onProcess() { return {}; }
-  getTools() { return [{ name: 'echo', description: 'echo', inputSchema: { type: 'object' as const, properties: {} } }]; }
-  async handleToolCall(_call: ToolCall) { return { success: true, data: { echoed: true } }; }
+  getTools() {
+    return ['echo', 'end'].map((name) => ({ name, description: name, inputSchema: { type: 'object' as const, properties: {} } }));
+  }
+  async handleToolCall(call: ToolCall) { return { success: true, data: { echoed: true }, ...(call.name.endsWith('end') ? { endTurn: true } : {}) }; }
 }
 const usage = { inputTokens: 100, outputTokens: 10, cacheCreationTokens: 0, cacheReadTokens: 0 };
-const round = (id: string, content: ContentBlock[]): NormalizedResponse =>
-  Object.assign(createMockResponse([...content, { type: 'tool_use', name: 'test--echo', id, input: {} }], 'tool_use'), { usage });
-const final = (): NormalizedResponse => {
-  const response = Object.assign(createMockResponse([{ type: 'text', text: 'Done.' }]), { usage });
+const round = (id: string, content: ContentBlock[], tool = 'echo'): NormalizedResponse =>
+  Object.assign(createMockResponse([...content, { type: 'tool_use', name: `test--${tool}`, id, input: {} }], 'tool_use'), { usage });
+const final = (content: ContentBlock[] = [signed('sig-3'), text('Done.')]): NormalizedResponse => {
+  const response = Object.assign(createMockResponse(content), { usage });
   response.details!.usage = usage;
   return response;
 };
+const twoRounds = (first: ContentBlock[]) => [round('c1', first), round('c2', [signed('sig-2'), text('Again.')]), final()];
 
-/** One stream of two tool rounds and an end, its tool-calls events passed through `alter`. */
-class TwoRounds extends MockMembrane {
-  constructor(private readonly first: ContentBlock[], private readonly alter?: (stream: YieldingStream) => YieldingStream) { super(); }
+/** Each stream takes the next script, its tool-calls events passed through `alter`. */
+class Scripted extends MockMembrane {
+  constructor(private readonly scripts: NormalizedResponse[][], private readonly alter?: (stream: YieldingStream) => YieldingStream) { super(); }
   override streamYielding(request: NormalizedRequest): YieldingStream {
     this.calls.push(request);
-    const stream = new MockYieldingStream([round('c1', this.first), round('c2', [signed('sig-2'), text('Again.')]), final()]);
+    const stream = new MockYieldingStream(this.scripts.shift() ?? [final()]);
     this.lastStream = stream;
     return this.alter ? this.alter(stream) : stream;
   }
@@ -108,10 +111,16 @@ const withoutRoundContent = (stream: YieldingStream): YieldingStream => new Prox
   },
 });
 
-/** A turn of a binding agent over a context manager that records each note, with what the store held then. */
-async function turn(opts: { first?: ContentBlock[]; alter?: (s: YieldingStream) => YieldingStream; guard?: boolean; binds?: boolean } = {}) {
+type Logged = { kind: 'note'; rows: SentRow[]; identity: unknown; storedIds: string[] } | { kind: 'compile'; dryRun: boolean; identity: unknown };
+
+/** A turn of a binding agent over a context manager that logs each note, with what the store held then, and each
+ *  compile, in order. */
+async function turn(opts: {
+  scripts?: NormalizedResponse[][]; first?: ContentBlock[]; alter?: (s: YieldingStream) => YieldingStream;
+  guard?: boolean; binds?: boolean; agent?: Record<string, unknown>;
+} = {}) {
   const dir = mkdtempSync(join(tmpdir(), 'af-sent-rows-'));
-  const membrane = new TwoRounds(opts.first ?? [signed('sig-1'), text('Calling.')], opts.alter);
+  const membrane = new Scripted(opts.scripts ?? [twoRounds(opts.first ?? [signed('sig-1'), text('Calling.')])], opts.alter);
   const framework = await AgentFramework.create({
     storePath: join(dir, 'store.chronicle'), membrane: membrane.asMembrane(), agents: [], modules: [new Tools()], syncIntervalMs: 0,
   });
@@ -119,60 +128,87 @@ async function turn(opts: { first?: ContentBlock[]; alter?: (s: YieldingStream) 
   try {
     const { agent, contextManager } = await framework.createEphemeralAgent({
       name: 'worker', model: 'claude-opus-5-5', systemPrompt: 'Do the task.', allowedTools: 'all', proseRouting: 'disabled',
-      thinkingBinding: { binds: opts.binds ?? true }, ...(opts.guard ? { toolResultGuard: true } : {}),
+      thinkingBinding: { binds: opts.binds ?? true }, ...(opts.guard ? { toolResultGuard: true } : {}), ...opts.agent,
     } as never);
-    const notes: Array<{ rows: SentRow[]; identity: unknown; storedIds: string[] }> = [];
-    const compiledIdentity: unknown[] = [];
+    const log: Logged[] = [];
     (contextManager as unknown as { noteRequestSent: unknown }).noteRequestSent = (rows: SentRow[], identity: unknown) => {
-      notes.push({ rows: [...rows], identity, storedIds: contextManager.getAllMessages().map((m) => m.id) });
+      log.push({ kind: 'note', rows: [...rows], identity, storedIds: contextManager.getAllMessages().map((m) => m.id) });
       return true;
     };
     const compile = contextManager.compile.bind(contextManager);
     contextManager.compile = ((budget, injections, o) => {
-      compiledIdentity.push((o as { identity?: unknown } | undefined)?.identity);
+      log.push({ kind: 'compile', dryRun: (o as { dryRun?: boolean } | undefined)?.dryRun === true, identity: (o as { identity?: unknown } | undefined)?.identity });
       return compile(budget, injections, o);
     }) as typeof compile;
     contextManager.addMessage('user', [{ type: 'text', text: 'Run twice.' }]);
     await framework.runEphemeralToCompletion(agent, contextManager);
-    assert.equal(membrane.calls.length, 1, 'one stream');
     const stored = contextManager.getAllMessages();
-    return { notes, compiledIdentity, stored };
+    const notes = log.filter((e): e is Extract<Logged, { kind: 'note' }> => e.kind === 'note');
+    const compiledIdentity = log.filter((e) => e.kind === 'compile').map((e) => e.identity);
+    return { log, notes, compiledIdentity, stored, streams: membrane.calls.length };
   } finally {
     await framework.stop();
     rmSync(dir, { recursive: true, force: true });
   }
 }
+const replies = (stored: Array<{ id: string; participant: string }>) => stored.filter((m) => m.participant === 'worker').map((m) => m.id);
+const resultRows = (stored: Array<{ id: string; content: ContentBlock[] }>) => stored.filter((m) => m.content.some((b) => b.type === 'tool_result')).map((m) => m.id);
 
-describe('a stream\'s later rounds, noted at each tool boundary', () => {
-  it('notes every round so far, reply then results in sent order, before the round\'s reply exists, with the compile\'s head', async () => {
-    const { notes, compiledIdentity, stored } = await turn();
-    assert.equal(notes.length, 2, 'one note per round that continues, and none more at the end, where nothing changed');
-    const ofParticipant = (p: string) => stored.filter((m) => m.participant === p).map((m) => m.id);
-    const [reply1, reply2, reply3] = ofParticipant('worker');
-    const results = stored.filter((m) => m.content.some((b) => b.type === 'tool_result')).map((m) => m.id);
+describe('a stream\'s rounds, noted at each tool boundary and at its end', () => {
+  it('notes every round so far, reply then results in sent order, before the round\'s reply exists, and the last reply at the end', async () => {
+    const { notes, compiledIdentity, stored, streams } = await turn();
+    assert.equal(streams, 1);
+    assert.equal(notes.length, 3, 'one note per round that continues, and one at the end');
+    const [reply1, reply2, reply3] = replies(stored);
+    const results = resultRows(stored);
     assert.deepEqual(notes[0]!.rows, [reply1, results[0]]);
     assert.deepEqual(notes[1]!.rows, [reply1, results[0], reply2, results[1]], 'the second note holds both rounds');
+    assert.deepEqual(notes[2]!.rows, [reply1, results[0], reply2, results[1], reply3], 'the end note adds the last reply');
     assert.equal(notes[0]!.storedIds.includes(reply2!), false, 'noted before the reply to it was stored');
-    assert.equal(notes[1]!.storedIds.includes(reply3!), false);
+    assert.equal(notes[2]!.storedIds.includes(reply3!), true, 'the end note comes after the last reply is stored');
     assert.deepEqual(notes[0]!.identity, compiledIdentity[0], 'the head the stream\'s compile was given');
     assert.ok(notes[0]!.identity);
   });
 
+  it('notes a single-round turn once, at its end, with its reply', async () => {
+    const { notes, stored } = await turn({ scripts: [[final()]] });
+    assert.deepEqual(notes.map((n) => n.rows), [replies(stored)]);
+  });
+
+  it('notes a stream a result ends at that boundary, with the round\'s reply and not its results', async () => {
+    const { notes, stored } = await turn({ scripts: [[round('c1', [signed('sig-1'), text('Ending.')], 'end')]] });
+    assert.deepEqual(notes.map((n) => n.rows), [replies(stored)]);
+  });
+
+  it('notes a stream a budget restart ends before the restart\'s compile, and the restart\'s own stream after it', async () => {
+    const { log, notes, stored, streams } = await turn({
+      agent: { maxStreamTokens: 50 }, scripts: [[round('c1', [signed('sig-1'), text('Calling.')]), final()], [final()]],
+    });
+    assert.equal(streams, 2, 'the restart opened a second stream');
+    const [reply1, reply2] = replies(stored);
+    assert.deepEqual(notes[0]!.rows, [reply1], 'the first stream, ended at its boundary');
+    const committing = log.map((e, i) => [e, i] as const).filter(([e]) => e.kind === 'compile' && !e.dryRun).map(([, i]) => i);
+    const firstNote = log.findIndex((e) => e.kind === 'note');
+    assert.ok(committing.length >= 2, 'the restart compiled');
+    assert.ok(firstNote < committing[1]!, 'the end note lands before the restart\'s compile');
+    assert.deepEqual(notes.at(-1)!.rows, [reply2], 'the restart\'s stream notes its own reply after its compile');
+  });
+
   it('takes no empty text block in a reply as a difference, since neither request carries one', async () => {
     const { notes } = await turn({ first: [signed('sig-1'), { type: 'text', text: '' } as ContentBlock, text('Calling.')] });
-    assert.equal(notes.length, 2);
-    assert.ok(notes[1]!.rows.every((row) => typeof row === 'string'), JSON.stringify(notes[1]!.rows));
+    assert.equal(notes.length, 3);
+    assert.ok(notes[2]!.rows.every((row) => typeof row === 'string'), JSON.stringify(notes[2]!.rows));
   });
 
   it('marks results while the tool-result guard holds them, and names them once its batch settles to the originals', async () => {
     const { notes } = await turn({ guard: true });
-    assert.equal(notes.length, 3, 'at each boundary, and once more at the end');
+    assert.equal(notes.length, 3, 'at each boundary, and at the end');
     assert.equal(typeof notes[0]!.rows[0], 'string', 'the reply');
     assert.deepEqual(notes[0]!.rows[1], UNSTORED, 'round 1\'s results, held: placeholders stored, originals sent');
     assert.equal(typeof notes[1]!.rows[1], 'string', 'round 1\'s results, settled at round 2\'s calls');
     assert.deepEqual(notes[1]!.rows[3], UNSTORED, 'round 2\'s results, held');
-    assert.ok(notes[2]!.rows.every((row) => typeof row === 'string'), 'at the end, every batch settled, before the last reply is stored');
-    assert.deepEqual(notes[2]!.rows.length, 4);
+    assert.equal(notes[2]!.rows.length, 5);
+    assert.ok(notes[2]!.rows.every((row) => typeof row === 'string'), 'at the end, every batch settled, the last reply stored');
   });
 
   it('notes nothing of a stream whose rounds have no roundContent, nor for an agent whose model doesn\'t bind', async () => {
