@@ -71,8 +71,7 @@ import type {
   AgentRuntimeSettingsSnapshot,
   AgentSettingsExtension,
   SameRoundThinkTextPolicy,
-  ModuleMessage,
-} from './types/index.js';
+  ModuleMessage, AutoContinueRun } from './types/index.js';
 import { asModuleRow, heldHandle, heldWriteId, matchesMessageQuery } from './held-writes.js';
 import { ProcessQueueImpl } from './queue.js';
 import { DEFAULT_SHUTDOWN_TIMEOUT_MS, validateShutdownTimeout, shutdownErrorMessage, waitForShutdown, ShutdownTimeoutError } from './shutdown.js';
@@ -117,6 +116,7 @@ import type { WorkspaceModule } from './modules/workspace/index.js';
 import type { ToolResultGuard, WithheldSpill } from './tool-result-guard.js';
 import {
   nonErrorResultText,
+  shownToScript,
   toolResultDataToHistoryString,
   truncateForHistory,
   DEFAULT_TOOL_RESULT_INLINE_MAX_CHARS,
@@ -156,6 +156,7 @@ import { DEFAULT_OUTPUT_BOUNDS } from './code-execution/isolate/output.js';
 import type { PreludeTool } from './code-execution/isolate/prelude.js';
 import { bounded, renderList, renderReturn, VALUE_CHARS } from './code-execution/isolate/render.js';
 import { splitProseRuns, withoutRoundsProse } from './prose-segments.js';
+import { AUTO_CONTINUE_REASON, AUTO_CONTINUE_STOP_REASONS, autoContinueNotice } from './auto-continue.js';
 import { cumulativeDelta } from './usage-accounting.js';
 import { stampThinkingTokenEstimates } from './thinking-token-stamp.js';
 import { contentAsStored, nameAsStored } from './text-as-stored.js';
@@ -681,8 +682,8 @@ const utilityOneLiner = (description: string): string => {
 import { CheckpointManager } from './mcpl/checkpoint-manager.js';
 import { isToolAllowed } from './mcpl/tool-policy.js';
 import { toolArgsProblems } from './tool-args.js';
-import { EventGate, formatShadowWarning } from './gate/event-gate.js';
-import type { GateEntryRef } from './gate/types.js';
+import { EventGate, formatShadowWarning, wakeLineText } from './gate/event-gate.js';
+import type { GateEntryRef, WakeLine } from './gate/types.js';
 import { EPHEMERAL_USAGE_NAME, UsageTracker, persistedUsageProblem, type PersistedUsageState } from './usage/usage-tracker.js';
 import type { SessionUsageSnapshot, UsageUpdatedEvent } from './usage/types.js';
 import { McplProtocolVersionError, McplRequestError, McplUnreapedLaunchError, stderrTailOf, withStderr, type McplConnectionCloseInfo, type McplServerConnection } from './mcpl/server-connection.js';
@@ -1094,6 +1095,20 @@ interface TurnRouting {
   hybridHold?: 'private' | 'failed';
   /** The turn asked for a ` !` continuation; taken once. */
   continuation: boolean;
+  /**
+   * Explicit mode: the turn's latest envelope was `>>skip_reply`, so it
+   * ended on a deliberate skip and autoContinue leaves it paused. (Hybrid
+   * reads `hybridHold === 'private'`, which a `>>>skip_reply` leaves until a
+   * destination is named.)
+   */
+  lastEnvelopeSkipped?: boolean;
+  /**
+   * Explicit or hybrid mode: the turn's latest envelope bounced (no
+   * destination, an unresolved or refused one, a failed send). Its bounce,
+   * with the bounce-wake cap, is that turn's answer, so autoContinue leaves
+   * it to the bounce.
+   */
+  lastEnvelopeBounced?: boolean;
   /** Successful plain-prose destinations in delivery order; deduped by the receipt. */
   deliveries: ChannelRef[];
   /** Plain-prose segments the turn suppressed without drafts (proseRouting=disabled, or a round withheld before its scripts returned: ScriptRound.withhold), reported by its receipt. */
@@ -1294,6 +1309,21 @@ function isTurnContinuation(reason: string): boolean {
  *  other source — a channel message, a heartbeat or other server event, a
  *  gate flush, a timer, an operator nudge — is a cause of its own. */
 const FRAMEWORK_WAKE_SOURCES = new Set(['framework', 'scheduler']);
+
+/** Whether a wake is a cause of its own for an autoContinue run: one from
+ *  outside the framework that isn't a silent heartbeat tick. A batch holding
+ *  one is that cause's turn: the run starts again, and no `[continue]` row is
+ *  written for the continuation it carries. A silent tick is neither: batched
+ *  with a continuation it neither restarts the run nor takes its notice. */
+function hasOwnCauseForRun(r: InferenceRequest): boolean {
+  return !FRAMEWORK_WAKE_SOURCES.has(r.source) && r.suppressProse !== true;
+}
+
+/** Whether a wake carries an autoContinue continuation: its own wake, or a
+ *  requeued turn trigger that kept the mark (InferenceRequest.autoContinueRun). */
+function carriesContinuation(r: InferenceRequest): boolean {
+  return r.autoContinueRun !== undefined;
+}
 const CONVERSATION_ROUTER_STATE_ID = 'framework/conversation-router';
 const INFERENCE_LOG_ID = 'framework/inference-log';
 const PROCESS_LOG_ID = 'framework/process-log';
@@ -2153,8 +2183,8 @@ const SCRIPT_TEXT_ANSWER_ENVELOPE_BYTES = Buffer.byteLength(
  * memoryMaxBytes. So the figure moves with memoryMaxBytes. What it can't
  * count: a result's `structured` value, which the measure leaves out and the
  * answer carries as JSON beside the content, and that result's blocks past
- * their text, which the answer carries as they are (each further block's
- * keys, an image's data); nesting past 2,000 levels; and a
+ * their text, which the answer carries as the script lane gives them (each
+ * further block's keys, an image's data); nesting past 2,000 levels; and a
  * parse that needs more of the script's memory than is free, as for JSON
  * dense in small objects or a script already holding most of its memory.
  * Such a result, or one past the figure that doesn't fit, reaches the script
@@ -2549,6 +2579,25 @@ function passesToPrimary(metadata: unknown): boolean {
     channelNoticePassOn(metadata) !== null;
 }
 
+/** The batched-wake lines a merge of wakes carries (InferenceRequest
+ *  wakeLines), one per event, in request order; undefined for none. */
+function mergeWakeLines(requests: readonly InferenceRequest[]): WakeLine[] | undefined {
+  const byEntry = new Map<string, WakeLine>();
+  for (const request of requests) {
+    for (const line of request.wakeLines ?? []) {
+      const key = wakeLineKey(line);
+      if (!byEntry.has(key)) byEntry.set(key, line);
+    }
+  }
+  return byEntry.size > 0 ? [...byEntry.values()] : undefined;
+}
+
+/** A batched-wake line's identity: its event's stored entry. */
+function wakeLineKey(line: WakeLine): string {
+  const { eventType, serverId, channelId, messageId, eventId } = line.entry;
+  return JSON.stringify([eventType, serverId ?? null, channelId ?? null, messageId ?? null, eventId ?? null]);
+}
+
 export class AgentFramework {
   private toolPresentations = new Map<string, ToolPresentation>();
   private presentationPreviews = new WeakMap<object, PresentationSnapshot>();
@@ -2735,6 +2784,10 @@ export class AgentFramework {
   /** Consecutive bounce-wakes per agent; capped so an agent that keeps
    *  emitting unprefixed prose can't wake-loop (notices still append). */
   private proseBounceStreaks: Map<string, number> = new Map();
+  /** Consecutive autoContinue continuations per agent, capped by its
+   *  maxConsecutive. Cleared when a turn starts with a cause of its own
+   *  (processInferenceRequests) or a tool ends a turn (skip_reply). */
+  private autoContinueStreaks: Map<string, number> = new Map();
   private pendingAssistantBlocks: Map<string, ContentBlock[]> = new Map();
   /** Streams the FRAMEWORK cancelled for non-terminal reasons, keyed
    *  `${agentName}:${streamId}`: an endTurn tool result or a context-budget
@@ -3009,6 +3062,9 @@ export class AgentFramework {
    * ephemeral agents have isolated slots and are their own only readers.
    */
   private readonly sharedSlotAgents = new Set<Agent>();
+  /** The batched-wake lines already written (placeWakeLines), so every agent a
+   *  wake was for, and every later start of it, writes each at most once. */
+  private readonly placedWakeLines = new WeakSet<WakeLine>();
   /** Rounds of tool calls, by their results array, that a save_recent_image
    *  in the round counted by their share of the bound: such a round is
    *  stored by its share whether or not it fits (buildStoredToolResultContent). */
@@ -3047,9 +3103,17 @@ export class AgentFramework {
   // config.codeExecution.enabled: its settings, and every agent's scripts,
   // each in a process of its own on the engine (AgentScripts). Waiters
   // resolve script-inner tool calls dispatched through the normal
-  // dispatchToolCall path.
+  // dispatchToolCall path. A waiter's route is where the dispatch sent its
+  // call: `toServer` is set when it went to a server's own tool (an MCPL or
+  // MCP-only peer's), so the script lane's exit treats every other result as
+  // a module's (scriptResultAnswer), by where the call went rather than by a
+  // name lookup a connect or disconnect can change while it runs. A
+  // framework tool that talks to a server itself, such as a channel tool,
+  // builds its own result, which counts as a module's. A caller of
+  // dispatchScriptToolCall that passes no route gets one left false, the
+  // reading that withholds more.
   private codeExecution: { settings: IsolateSettings; scripts: AgentScripts } | null = null;
-  private scriptToolWaiters: Map<string, (result: ToolResult) => void> = new Map();
+  private scriptToolWaiters: Map<string, { resolve: (result: ToolResult) => void; route: { toServer: boolean } }> = new Map();
   /** A script's call being dispatched, by its call id: the turn the script
    *  was started in, if one was (callOwnChannels). Kept only while the
    *  dispatch runs (dispatchScriptToolCall). */
@@ -3535,6 +3599,9 @@ export class AgentFramework {
             ...(provenance?.channelId ? { wakeChannelId: provenance.channelId } : {}),
             ...(provenance?.counterparty ? { counterparty: provenance.counterparty } : {}),
             ...(provenance?.at ? { wakeAt: provenance.at } : {}),
+            // The batch's line, when the gate left it to the turn's start
+            // (beginAgentTurn decides it: placeWakeLines).
+            ...(provenance?.line ? { wakeLines: [provenance.line] } : {}),
             // A batch that contains an ADDRESSED message (mention / reply /
             // DM) routes like the direct path does: the reply goes to that
             // message's channel. Without it the turn froze on the
@@ -3567,8 +3634,9 @@ export class AgentFramework {
         // A batched wake's summary names each channel as the agent names it
         // back, with its server where another server shares its id.
         channelShown: (channel) => framework.channelRegistry?.nameShown(channel) ?? channel.channelId,
-        // A batched wake for one message still newest in the window writes no
-        // `[Gate: …]` line: the message right above is its whole cause.
+        // A batched wake for one message still newest in the window hands its
+        // `[Gate: …]` line to the wake, for a fresh start of the wake's turn
+        // to decide (placeWakeLines).
         isNewestEntry: (entry) => framework.isNewestContextEntry(entry),
         resolveRouteChannel: (info) => {
           if (info.eventType === 'mcpl:channel-incoming') return info.channelId || undefined;
@@ -4721,7 +4789,8 @@ export class AgentFramework {
     return a.agentName === b.agentName && a.reason === b.reason && a.source === b.source &&
       a.timestamp === b.timestamp && a.channelId === b.channelId && a.channelServerId === b.channelServerId &&
       a.coalescingSubject === b.coalescingSubject && batchSubjects(a) === batchSubjects(b) &&
-      a.readsDeferredWrite === b.readsDeferredWrite;
+      a.readsDeferredWrite === b.readsDeferredWrite &&
+      (a.wakeLines ?? []).map(wakeLineKey).join('\n') === (b.wakeLines ?? []).map(wakeLineKey).join('\n');
   }
   private consultProviderHold(error: Error, agentName: string): { holdMs: number; reason: string } | undefined {
     if (!this.providerHoldHook) return undefined;
@@ -11877,7 +11946,7 @@ export class AgentFramework {
         // was killed while the call ran: the result reaches no one, but the
         // call did finish.
         this.toolLifecycleEmitter?.onResult(event.agentName, event.callId, event.result);
-        scriptWaiter(event.result);
+        scriptWaiter.resolve(event.result);
         return;
       }
 
@@ -14679,6 +14748,21 @@ export class AgentFramework {
       // kept): heartbeat/gate wakes arrive once per tick and nothing else
       // bounds a multi-day maintenance window's accumulation.
       if (this.quiesced) {
+        // An autoContinue continuation doesn't outlast a quiesce: at resume,
+        // possibly hours later, "another turn starts now" would be untrue.
+        // Its own wake is dropped and the run's count given back; a requeued
+        // trigger that carried one parks without the mark.
+        if (requests.some(carriesContinuation)) {
+          this.giveBackAutoContinue(agentName, 'the host is quiesced');
+          requests = requests
+            .filter((r) => r.reason !== AUTO_CONTINUE_REASON)
+            .map((r) => {
+              if (!carriesContinuation(r)) return r;
+              const { autoContinueRun: _mark, ...rest } = r;
+              return rest;
+            });
+          if (requests.length === 0) continue;
+        }
         // Continuations of a held turn (budget restart, non-streaming tool
         // results) pass; everything else parks.
         const passThrough = requests.filter((r) => isTurnContinuation(r.reason));
@@ -14695,9 +14779,12 @@ export class AgentFramework {
           // may absorb an unrelated wake that would vanish with it.
           const key = `${request.reason}|${request.addressed ? 'a' : 'n'}|${request.coalescingSubject ?? ''}|${request.readsDeferredWrite ?? ''}`;
           const prev = newestByKey.get(key);
-          if (!prev || request.timestamp >= prev.timestamp) {
-            newestByKey.set(key, request);
-          }
+          const kept = !prev || request.timestamp >= prev.timestamp ? request : prev;
+          // The wake it absorbs hands on its lines (WakeLine): each event's
+          // line stays to be decided when the host resumes.
+          const lines = prev ? mergeWakeLines([prev, request]) : undefined;
+          if (lines) kept.wakeLines = lines;
+          newestByKey.set(key, kept);
         }
         this.pendingRequests.push(...newestByKey.values());
         if (passThrough.length === 0) continue;
@@ -14817,10 +14904,36 @@ export class AgentFramework {
         if (requests.some((r) => resumesLogicalTurn(r.reason))) {
           this.endContinuedTurn(agentName, { kind: 'dropped', why: 'the inference policy dropped its continuation' });
         }
+        if (requests.some(carriesContinuation)) this.giveBackAutoContinue(agentName, 'the inference policy dropped its wake');
         // A primary a provider hold left pending stays pending while a wake
         // this batch sent back to the queue (above) waits to run, as when
         // dropContinuations drops one.
         if (!this.pendingRequests.some((r) => r.agentName === agentName)) this.endPendingPrimary(agentName);
+        continue;
+      }
+
+      // An autoContinue continuation is the turn's when nothing in the batch
+      // is a cause of its own (hasOwnCauseForRun): then the turn's trigger
+      // carries its mark, and the turn writes its `[continue]` row as it
+      // starts (startAgentStream), past every gate that could still stop it.
+      // A batch with a cause of its own is that cause's turn: no row, and the
+      // run starts again below.
+      const continuation = requests.find(carriesContinuation);
+      let continuationMark = continuation?.autoContinueRun && !requests.some(hasOwnCauseForRun)
+        ? { ...continuation.autoContinueRun, sole: requests.every(carriesContinuation) }
+        : undefined;
+      // A batch that resumes a logical turn (a budget restart, a guard retry)
+      // takes the continuation's wake into that turn, which writes no start
+      // inputs: its count goes back, and it writes no row.
+      if (continuationMark && requests.some((r) => resumesLogicalTurn(r.reason))) {
+        this.giveBackAutoContinue(agentName, 'a resumed turn took its wake');
+        continuationMark = undefined;
+      }
+      // Its row goes into the residents' shared slot, which no write may
+      // enter while another reader's turn is alive (as for a clock row): the
+      // continuation waits until that turn has ended.
+      if (continuationMark && this.sharedSlotBusy(agent)) {
+        this.pendingRequests.push(...requests);
         continue;
       }
 
@@ -14845,6 +14958,14 @@ export class AgentFramework {
       // (Optional chaining: prototype-built harnesses leave the map unset.)
       if (requests.some((r) => !FRAMEWORK_WAKE_SOURCES.has(r.source))) {
         this.proseBounceStreaks?.delete(agentName);
+      }
+      // Likewise autoContinue's cap bounds only a run of continuations that
+      // nothing else feeds. A silent heartbeat tick doesn't feed it: batched
+      // with a continuation it would otherwise restart the run at every tick,
+      // and a resident whose ticks come faster than its turns would never
+      // reach the cap (hasOwnCauseForRun).
+      if (requests.some(hasOwnCauseForRun)) {
+        this.autoContinueStreaks?.delete(agentName);
       }
       // Route this turn's auto-published speech to the channel that triggered
       // it (item-3 redux). A batched wake may carry several triggering channels
@@ -14872,12 +14993,21 @@ export class AgentFramework {
       const eventAt = (r: InferenceRequest): number => r.wakeAt ?? r.timestamp;
       let ambientReq: InferenceRequest | undefined;
       let addressedReq: InferenceRequest | undefined;
+      // An autoContinue wake names the finished turn's locus. It speaks for
+      // the turn only when nothing else in the batch names a channel: a
+      // message that arrived meanwhile, ambient included, outranks it, though
+      // its wake was queued first.
+      let continuationReq: InferenceRequest | undefined;
       for (const r of requests) {
         if (!r.channelId) continue;
+        if (r.reason === AUTO_CONTINUE_REASON) {
+          continuationReq ??= r;
+          continue;
+        }
         if (!ambientReq || eventAt(r) >= eventAt(ambientReq)) ambientReq = r;
         if (r.addressed && (!addressedReq || eventAt(r) >= eventAt(addressedReq))) addressedReq = r;
       }
-      const channelReq = addressedReq ?? ambientReq;
+      const channelReq = addressedReq ?? ambientReq ?? continuationReq;
       // Telemetry provenance (who/where woke the agent). An ADDRESSED winner
       // is its own provenance, even when it names no author (a push event
       // can route without an author id): borrowing another request's author
@@ -14917,12 +15047,17 @@ export class AgentFramework {
         // take no other cause with it.
         readsDeferredWrite: requests.every((r) => r.readsDeferredWrite === trigger?.readsDeferredWrite)
           ? trigger?.readsDeferredWrite : undefined,
+        // Every merged wake's handed line, each event's once: the turn's start
+        // decides each (beginAgentTurn).
+        wakeLines: mergeWakeLines(requests),
         suppressProse: silentOnly ? trigger?.suppressProse : undefined,
         silentHeartbeat: silentOnly ? trigger?.silentHeartbeat : undefined,
         // The channel and its server from the one request, so the turn's
         // channel is that message's, never one server's id with another's.
         channelId: channelReq?.channelId,
         channelServerId: channelReq?.channelServerId,
+        // Only the mark this batch decided, never one requests[0] carried.
+        autoContinueRun: continuationMark,
         addressed: addressedReq !== undefined,
         // A context-budget restart continues the same logical turn: it keeps
         // the channel for routing but names no author — the restart is its
@@ -16017,12 +16152,7 @@ export class AgentFramework {
     occasion: 'event' | 'turn-start' | 'tool-boundary',
   ): { id: MessageId; content: ContentBlock[]; metadata: MessageMetadata } | undefined {
     const config = agent.clock;
-    if (!config || this.quiesced) return undefined;
-    if (this.sharedSlotAgents.has(agent)) {
-      for (const reader of this.sharedSlotAgents) {
-        if (reader !== agent && this.turnAlive(reader)) return undefined;
-      }
-    }
+    if (!config || this.slotHeldFrom(agent)) return undefined;
     let planned: ReturnType<typeof planClock>;
     try {
       planned = planClock({ now: Date.now(), ...this.lastClockOf(agent.getContextManager()), config, zone: this.timeZone });
@@ -16053,6 +16183,18 @@ export class AgentFramework {
     }
     this.emitTrace({ type: 'message:added', messageId: id, source: `clock:${occasion}` });
     return { id, content: planned.content, metadata };
+  }
+
+  /**
+   * Whether a write the framework makes into `agent`'s window of its own
+   * accord (a clock row, a batched wake's line) waits: while the host is
+   * quiesced, or, for a reader of the residents' shared slot (the
+   * subconscious, which reads it through a merged view, included), while
+   * another reader of it has a turn alive, where it would land inside that
+   * turn.
+   */
+  private slotHeldFrom(agent: Agent): boolean {
+    return this.quiesced || this.sharedSlotBusy(agent);
   }
 
   /** Rows a window's last-clock scan reads at a time. */
@@ -16611,6 +16753,169 @@ export class AgentFramework {
     });
   }
 
+  /**
+   * autoContinue (AgentConfig.autoContinue): after a turn the model ended
+   * itself (AUTO_CONTINUE_STOP_REASONS), with prose or with nothing, queue
+   * another, unless its last word was a skip (`>>skip_reply`, or a hybrid
+   * `>>>skip_reply` hold still standing). Runs at the logical turn end of a
+   * stream's `complete`, after the turn's deliveries and `[delivered]`
+   * receipt, and only when the turn asked for no ` !` continuation (that one
+   * runs instead). A tool that ends the turn (skip_reply, sleep) never
+   * reaches here, and clears the run's count.
+   *
+   * It continues only an agent that has a way to stop it is offered: the
+   * skip_reply tool, or in explicit/hybrid mode a skip envelope. It leaves
+   * a turn whose closing prose bounced to the bounce, and never continues an
+   * ephemeral run or a conversation fork. The wake names
+   * the turn's locus, or the unresolved channel of a turn that had none, so
+   * the next turn speaks, or doesn't, where this one did; a batched message's
+   * channel outranks it. Its mark (InferenceRequest.autoContinueRun) holds
+   * what the `[continue]` row says, written as the turn starts
+   * (startAgentStream). A run is capped at maxConsecutive; the last allowed
+   * row says so, and the cap holds until a turn starts with a cause of its own.
+   */
+  private autoContinueAfterTurn(
+    agent: Agent,
+    routing: TurnRouting,
+    trigger: InferenceRequest | undefined,
+    stopReason: string,
+    opts: { heldAfterSend?: boolean } = {},
+  ): void {
+    const config = agent.autoContinue;
+    if (!config) return;
+    const name = agent.name;
+    if (!AUTO_CONTINUE_STOP_REASONS.has(stopReason)) return;
+    // A silent heartbeat tick is a private self-check, never the start of a run.
+    if (trigger?.suppressProse) return;
+    // A subagent's run ends with its result; a conversation fork answers
+    // its home channel's message.
+    if (this.ephemeralRuns.has(name) || this.conversationAgentHomes.has(name)) return;
+    if (this.providerAdmissionClosed || this.agents.get(name) !== agent) {
+      console.error(`[continue] ${name}: not continued — ${this.providerAdmissionClosed ? 'the framework is stopping' : 'the agent is no longer registered'}`);
+      return;
+    }
+    const skipped = agent.proseRouting === 'explicit'
+      ? routing.lastEnvelopeSkipped === true
+      : agent.proseRouting === 'hybrid' && routing.hybridHold === 'private';
+    if (skipped) {
+      this.autoContinueStreaks.delete(name);
+      console.error(`[continue] ${name}: turn ended on a skip_reply envelope — waiting for the next event`);
+      return;
+    }
+    const stop = this.autoContinueStop(agent);
+    if (!stop) {
+      console.error(`[continue] ${name}: not continued — no way to stop is offered (no skip_reply tool, no skip envelope in ${agent.proseRouting} mode)`);
+      return;
+    }
+    // The turn's closing prose bounced: the bounce, with its own cap, is
+    // explicit and hybrid mode's answer to that turn, and continuing past
+    // the cap would restart the loop the cap breaks.
+    if (routing.lastEnvelopeBounced) {
+      console.error(`[continue] ${name}: not continued — the turn's closing prose bounced`);
+      return;
+    }
+    const count = (this.autoContinueStreaks.get(name) ?? 0) + 1;
+    if (count > config.maxConsecutive) {
+      console.error(`[continue] ${name}: ${config.maxConsecutive} continuation(s) in a row already — waiting for the next event`);
+      return;
+    }
+    this.autoContinueStreaks.set(name, count);
+    console.error(
+      `[continue] ${name}: turn ended (${stopReason}) without skip_reply — continuation ${count} of ${config.maxConsecutive}` +
+        (routing.locus ? ` in ${this.channelRegistry?.nameShown(routing.locus) ?? routing.locus.channelId}` : ''),
+    );
+    // The next turn speaks where this one did (locus and hybrid modes): the
+    // locus's server and id, as the framework's own wakes name a channel. A
+    // turn that had no channel (noChannel: its wake named one that resolves
+    // to none) passes its wake's channel on, so the next has none either,
+    // rather than taking the global fallback this one refused.
+    const channel = routing.locus
+      ? { channelId: routing.locus.channelId, channelServerId: routing.locus.serverId }
+      : routing.noChannel && trigger?.channelId
+        ? { channelId: trigger.channelId, ...(trigger.channelServerId ? { channelServerId: trigger.channelServerId } : {}) }
+        : {};
+    this.pendingRequests.push({
+      agentName: name,
+      reason: AUTO_CONTINUE_REASON,
+      source: 'framework',
+      timestamp: Date.now(),
+      ...channel,
+      autoContinueRun: { stop, ...(opts.heldAfterSend ? { heldAfterSend: true } : {}) },
+    });
+  }
+
+  /** How an autoContinue agent stops a run, as its `[continue]` row says it,
+   *  or undefined when no way is offered: the skip_reply tool when the
+   *  channel registry offers it and the agent may call it, else a skip
+   *  envelope in explicit or hybrid mode. */
+  private autoContinueStop(agent: Agent): string | undefined {
+    if (this.channelRegistry && this.canAgentUseTool(agent.name, 'skip_reply')) return 'call skip_reply';
+    if (agent.proseRouting === 'explicit') return 'end with a >>skip_reply envelope';
+    if (agent.proseRouting === 'hybrid') return 'end with a >>>skip_reply envelope';
+    return undefined;
+  }
+
+  /**
+   * Store a continuation's `[continue]` row in the agent's window as its turn
+   * starts (startAgentStream), with the run's count as it stands and the
+   * agent's cap. False when it couldn't be stored.
+   */
+  private writeAutoContinueNotice(agent: Agent, mark: AutoContinueRun): boolean {
+    const count = this.autoContinueStreaks.get(agent.name) ?? 1;
+    const max = agent.autoContinue?.maxConsecutive ?? count;
+    const text = autoContinueNotice({
+      agentName: agent.name, stop: mark.stop, last: count >= max, heldAfterSend: mark.heldAfterSend,
+    });
+    const before = this.storedCountOf(agent);
+    let id: MessageId;
+    try {
+      id = agent.getContextManager().addMessage(
+        'user',
+        [{ type: 'text', text }],
+        { system: true, kind: 'auto-continue', agentName: agent.name, continuation: count, maxConsecutive: max } as MessageMetadata,
+      );
+    } catch (err) {
+      // A write can throw after its row landed (context-manager's own
+      // propagation failing): read back from where the store stood, as the
+      // clock row does, so a row that is there isn't called missing.
+      const landed = before === undefined
+        ? undefined
+        : this.storedSince(agent, before, (m) => {
+          const meta = m.metadata as { kind?: unknown; agentName?: unknown } | undefined;
+          return meta?.kind === 'auto-continue' && meta.agentName === agent.name;
+        }, 'continue', 'the continuation row');
+      if (!landed || landed.length === 0) {
+        console.error(`[continue] ${agent.name}: row not stored${landed ? '' : ' (whether it landed is unknown)'}, so not continued:`, err);
+        return false;
+      }
+      console.error(`[continue] ${agent.name}: the continuation row landed though its write threw:`, err);
+      id = landed[0]!.id;
+    }
+    this.emitTrace({ type: 'message:added', messageId: id, source: 'auto-continue' });
+    console.error(`[continue] ${agent.name}: continuation ${count} of ${max} starts`);
+    return true;
+  }
+
+  /** Whether another reader of the residents' shared slot has a turn alive,
+   *  so no row may be written there now (as storeDueClock checks). */
+  private sharedSlotBusy(agent: Agent): boolean {
+    if (!this.sharedSlotAgents.has(agent)) return false;
+    for (const reader of this.sharedSlotAgents) {
+      if (reader !== agent && this.turnAlive(reader)) return true;
+    }
+    return false;
+  }
+
+  /** A continuation whose turn doesn't run: the run's count goes back to
+   *  what it was before it was queued. */
+  private giveBackAutoContinue(agentName: string, why: string): void {
+    const count = this.autoContinueStreaks?.get(agentName);
+    if (!count) return;
+    if (count <= 1) this.autoContinueStreaks.delete(agentName);
+    else this.autoContinueStreaks.set(agentName, count - 1);
+    console.error(`[continue] ${agentName}: continuation ${count} dropped — ${why}`);
+  }
+
   /** The agent's routing state for its current turn, made when it has none. */
   private routingOf(agentName: string): TurnRouting {
     let routing = this.turnRouting.get(agentName);
@@ -16905,6 +17210,7 @@ export class AgentFramework {
   ): Promise<void> {
     const routing = round.routing;
     for (const envelope of splitHybridEnvelopes(rawText)) {
+      routing.lastEnvelopeBounced = false;
       const normalized = envelope;
       const attempted = normalized.startsWith('>>>');
       const parsed = parseHybridProsePrefix(normalized);
@@ -17049,6 +17355,8 @@ export class AgentFramework {
     // A private round (one that called skip_reply) asks for no publication
     // or continuation, even when delivery runs after that turn has ended.
     if (parsed.continueTurn && !round.keepPrivate) routing.continuation = true;
+    routing.lastEnvelopeSkipped = parsed.kind === 'private';
+    routing.lastEnvelopeBounced = false;
 
     if (parsed.kind === 'private') {
       // The text already lives in the assistant message (window/chronicle);
@@ -17221,6 +17529,7 @@ export class AgentFramework {
     after: { substituted?: Draft; outcome?: 'unknown' } = {},
   ): void {
     const name = agent.name;
+    round.routing.lastEnvelopeBounced = true;
     if (after.outcome === 'unknown' && !after.substituted) {
       // Words with no draft behind them, whose send threw, may have gone
       // out. Like an unknown outcome, that is marker-only: holding them as a
@@ -17958,6 +18267,51 @@ export class AgentFramework {
     // agent's assembly placed in this agent's queue (freeze's `joined`,
     // vector 25). Not once the host is quiesced, when it waits for resume().
     if (assembled && !this.quiesced && this.deferredMessages.length > 0) this.flushForStart(agent, 'assembly');
+
+    // The batched-wake lines the gate left to this start (WakeLine), decided
+    // now that the turn's inputs are in and before its checkpoint: on the
+    // delivery agent's own start (a co-resident's places none,
+    // placeWakeLines), from here to the compile an arrival into its window is
+    // deferred past this request. Not on a start that resumes a logical turn,
+    // as the flushes above: it takes in no new input. Each line is written at
+    // most once (placeWakeLines); one left out is decided again by a later
+    // fresh start of the same wake (a provider hold's release, a requeue),
+    // whose window may have taken arrivals while the turn was held. Fresh
+    // starts only, as the flushes: a retry re-sends the same turn, and what
+    // follows the message by then is mostly the first attempt's own notices or
+    // rounds, so a line would land after them, mid-turn.
+    if (trigger?.wakeLines && attempt === 0 && !resumesTurn) this.placeWakeLines(agent, trigger.wakeLines);
+
+    // An autoContinue continuation's `[continue]` row, written here: the
+    // turn has passed every gate that could still stop it (a stopping
+    // framework, a provider park's requeue, a stated wait), and the row is
+    // the newest of its inputs, before its checkpoint. The trigger goes on
+    // without the mark, so a retry doesn't write it again. A row that can't
+    // be stored gives back the run's count, and withdraws a turn the
+    // continuation alone caused: it would wake to nothing it can read.
+    if (attempt === 0 && !resumesTurn && trigger?.autoContinueRun) {
+      const mark = trigger.autoContinueRun;
+      const { autoContinueRun: _mark, ...unmarked } = trigger;
+      trigger = unmarked;
+      // Another reader's turn may have started since the scheduler checked.
+      const busy = this.sharedSlotBusy(agent);
+      if (busy || !this.writeAutoContinueNotice(agent, mark)) {
+        this.giveBackAutoContinue(agent.name, busy ? "another resident's turn is alive in the shared slot" : 'its row could not be stored');
+        if (mark.sole) {
+          console.error(`[continue] ${agent.name}: turn not started (the continuation was its only cause)`);
+          if (this.activeTurnTokens.get(agent.name) === turnToken) {
+            this.activeTurnTokens.delete(agent.name);
+            this.activeTurnTriggers.delete(agent.name);
+          }
+          if (!this.activeTurnTokens.has(agent.name)
+            && this.deferredMessages.length > 0 && !this.pendingAssistantBlocks.has(agent.name)) {
+            this.readdDrained(this.drainDeferredFor(agent.name), 'withdrawn-turn flush');
+            this.ackDeferredWrites();
+          }
+          return false;
+        }
+      }
+    }
 
     // The turn has passed its gate, so from here it goes on with a copy of
     // its trigger without a batch wake's marks or the mark of a wake to read
@@ -18919,6 +19273,10 @@ export class AgentFramework {
       // deliveries have run. Explicit mode doesn't hold the turn
       // for them, so it checks at the end of its chain.
       if (cancelKind === 'turn_ended') {
+        // A tool ended the turn (skip_reply, sleep): the agent stopped on
+        // purpose, so a later autoContinue run counts from one again.
+        // (Optional chaining: prototype-built harnesses leave the map unset.)
+        this.autoContinueStreaks?.delete(agent.name);
         if (turnProseRouting === 'explicit') {
           void turnSpeechChain.then(() => this.requestProseContinuation(agent, streamRouting));
         } else {
@@ -19923,7 +20281,17 @@ export class AgentFramework {
             // A `!` continuation this turn asked for. This gives prose the
             // same continuation ability tool rounds have (wanted for
             // robotics-style loops where an end-of-turn pause is harmful).
+            // Otherwise autoContinue, for an agent that has it, continues a
+            // turn the model ended itself unless that end was a skip.
+            const askedToContinue = finalRouting.continuation;
             this.requestProseContinuation(agent, finalRouting);
+            if (!askedToContinue) {
+              // Closing words held, not sent, because the turn had already
+              // sent with a send tool: the continuation's row says so.
+              const heldAfterSend = turnProseRouting !== 'explicit' && turnSilenced && silenceCause === 'send'
+                && terminalContent.some((b) => b.type === 'text' && (b as { text: string }).text.trim().length > 0);
+              this.autoContinueAfterTurn(agent, finalRouting, trigger, response.stopReason, { heldAfterSend });
+            }
 
             break;
           }
@@ -21696,9 +22064,10 @@ export class AgentFramework {
       if (!roundCalls.some((c) => c.name === counted.name && c.cause === counted.cause && c.refused === counted.refused)) roundCalls.push(counted);
     }
     if (refusal !== undefined) return refused(refusal);
+    const route = { toServer: false };
     const result = await this.dispatchScriptToolCall(
       agentName, toolName, input as Record<string, unknown>,
-      context.origin as ScriptCallOrigin | undefined, context.watch?.turnId, context.startTurnId,
+      context.origin as ScriptCallOrigin | undefined, context.watch?.turnId, context.startTurnId, route,
     );
     // Deferred: applied to the result of the code_execution call watching
     // the script — ending the turn mid-script would cancel the stream while
@@ -21709,7 +22078,7 @@ export class AgentFramework {
     const watching = context.watching ? context.watching() : context.watch;
     if (result.endTurn && watching) watching.endTurn = true;
     if (result.refused) return refused(result.error ?? `${toolName} was refused; nothing was done`);
-    const answer = await this.scriptResultAnswer(result, toolName);
+    const answer = await this.scriptResultAnswer(result, toolName, route.toServer);
     return SCRIPT_CALL_NO_RESULT.has(result) ? { ...answer, held: true } : answer;
   }
 
@@ -21718,14 +22087,18 @@ export class AgentFramework {
    * isError }`, one shape for every tool. `content` is
    * what the model would read: a structured result's blocks as the dispatch
    * gave them (the direct reading, with RFC-005's treatment of an MCPL peer's
-   * blocks), and otherwise one text block of the model's text, which for a
-   * failure is its error. `structuredContent` is the tool's own structured
+   * blocks there, bound to the server that sent them), a module's under
+   * history's reading of RFC-005 at every depth (shownToScript), and
+   * otherwise one text block of the model's text, which for a failure is its
+   * error. A module's is any result whose call the dispatch didn't send to
+   * a server (`toServer`, from the call's waiter). `structuredContent` is the
+   * tool's own structured
    * content where it sent one, `false`, `0` and `null` included, else null.
    * A result that can't be converted to JSON (a cyclic object, a BigInt),
    * which the dispatch's own check makes unlikely here, is a failure naming
    * the tool and saying the call itself completed.
    */
-  private async scriptResultAnswer(result: ToolResult, toolName: string): Promise<ToolAnswer> {
+  private async scriptResultAnswer(result: ToolResult, toolName: string, toServer: boolean): Promise<ToolAnswer> {
     const structured = Object.prototype.hasOwnProperty.call(result, 'structured');
     const isError = result.isError === true;
     // RFC-005 "eagerly lazy": a script receiving a result is the strongest
@@ -21742,7 +22115,10 @@ export class AgentFramework {
     // which isn't fetched.
     // Whenever the result's blocks reach the script: a structured failure's
     // included, as a module's error can carry content.
-    if ((!isError || structured) && Array.isArray(result.data) && this.resolveMcplTool(toolName) === null) {
+    // Not a server's result: a module's, whose blocks no dispatch has given
+    // RFC-005's treatment.
+    const fromModule = !toServer;
+    if ((!isError || structured) && Array.isArray(result.data) && fromModule) {
       const fetcher = this.getReferenceFetcher();
       for (const block of result.data) {
         const c = classifyBlock(block);
@@ -21769,6 +22145,20 @@ export class AgentFramework {
     // no blocks reads as its error text.
     if (structured && (!isError || (Array.isArray(result.data) && result.data.length > 0))) {
       content = Array.isArray(result.data) ? result.data : [];
+      // A module's blocks, such as an MCPL peer's it got from ctx.callTool
+      // and returns whole, are read as history reads a module's data: what
+      // RFC-005 governs, at any depth, as the script lane shows it, and
+      // anything else as sent. What a script prints comes back to the model,
+      // so no uri the model's lanes withhold reaches it. What this gives is
+      // a stub, a notice or the value itself, so a module that returns
+      // blocks it already gave has them left as they are.
+      if (fromModule) {
+        try {
+          content = JSON.parse(JSON.stringify(content, (_key, value: unknown) => shownToScript(value))) as unknown[];
+        } catch (err) {
+          return failed(err);
+        }
+      }
     } else {
       // As in history, a reference is its stub at any depth and inline data
       // claiming a uri or a disposition is withheld (RFC-005).
@@ -21808,7 +22198,8 @@ export class AgentFramework {
    * `turnId` is the turn the call was made in (dispatchToolCall), the turn
    * of the run or wait call watching the script; `startTurnId` is the turn
    * the script was started in, whose words its calls carry
-   * (scriptCallStartTurns).
+   * (scriptCallStartTurns). `route` is the waiter's: the dispatch sets
+   * `toServer` when it sends the call to a server.
    */
   private dispatchScriptToolCall(
     agentName: string,
@@ -21817,6 +22208,7 @@ export class AgentFramework {
     origin?: ScriptCallOrigin,
     turnId?: number,
     startTurnId?: number,
+    route: { toServer: boolean } = { toServer: false },
   ): Promise<ToolResult> {
     return new Promise<ToolResult>((resolve) => {
       const callId = `pytc-${randomUUID()}`;
@@ -21844,9 +22236,12 @@ export class AgentFramework {
       }, safetyMs);
       safety.unref?.();
 
-      this.scriptToolWaiters.set(callId, (result) => {
-        clearTimeout(safety);
-        resolve(result);
+      this.scriptToolWaiters.set(callId, {
+        resolve: (result) => {
+          clearTimeout(safety);
+          resolve(result);
+        },
+        route,
       });
 
       const call = { id: callId, name: toolName, input: args };
@@ -22410,6 +22805,10 @@ export class AgentFramework {
     // Route MCPL tool calls to the appropriate server via prefix map
     const mcplMatch = this.resolveMcplTool(enrichedCall.name);
     if (mcplMatch && this.mcplServerRegistry) {
+      // A script's call: its waiter keeps that it went to a server, for the
+      // script lane's exit (scriptToolWaiters).
+      const scriptWaiter = this.scriptToolWaiters.get(enrichedCall.id);
+      if (scriptWaiter) scriptWaiter.route.toServer = true;
       this.dispatchMcplToolCall(agentName, enrichedCall, mcplMatch[0], mcplMatch[1]);
       return;
     }
@@ -22825,11 +23224,11 @@ export class AgentFramework {
    * Whether an MCPL event's own stored entry is the newest entry in the window
    * a batched wake's line is written to (deliveryAgent(): the primary's), with
    * no turn alive there (turnAlive: started, streaming, or waiting on its
-   * tools) and nothing waiting to be written (deferred). The
-   * gate then wakes the agent without the line, the message right above being
-   * the wake's whole cause. A channel message is found by its server, channel
-   * and message id, a push event by its server and event id. A message a
-   * tune-out holds from the residents is never "newest" here.
+   * tools) and nothing waiting to be written (deferred). The gate then hands
+   * the line to the wake (WakeLine) instead of writing it, and the turn's
+   * start decides it (placeWakeLines). A channel message is found by its
+   * server, channel and message id, a push event by its server and event id.
+   * A message a tune-out holds from the residents is never "newest" here.
    */
   private isNewestContextEntry(entry: GateEntryRef): boolean {
     const agent = this.deliveryAgent();
@@ -22838,7 +23237,100 @@ export class AgentFramework {
     // message, and the line says which message the wake is for.
     if (this.turnAlive(agent)) return false;
     if (this.deferredMessages.some((m) => (m.forAgent ?? this.primaryAgentName) === agent.name)) return false;
-    const [newest] = agent.getContextManager().queryMessages({ limit: 1, reverse: true }).messages;
+    return this.isNewestIn(agent, entry);
+  }
+
+  /**
+   * Write the batched-wake lines the gate left to this turn's start (WakeLine)
+   * into the window they name, the delivery agent's (the residents' shared
+   * slot where it is one), on that agent's own start only. Called by a fresh
+   * start that doesn't resume a logical turn, after the turn's own inputs (a
+   * due clock row, the deferred-write and assembly flushes) and before its
+   * checkpoint, so a line lands after whatever arrived since the gate's
+   * decision, before the notices the turn's start writes itself (the locus
+   * notice among them), and before the agent's answer to the wake.
+   *
+   * - A wake's one line whose event is still the newest entry is left out:
+   *   no message follows the wake's, so it is the wake's whole cause, and the
+   *   start's token defers an arrival into the window past its request. (The
+   *   start's own notices, written after this, aren't messages a reply could
+   *   be meant for.)
+   * - A co-resident's start places nothing. Every resident gets every
+   *   batched wake, so a co-resident writing the line would put it under the
+   *   message, the line #727 left out, or after the delivery agent's answer,
+   *   a wake line for a message already answered. Its request shows what the
+   *   slot holds, as on `main`: a reply after the message is in the message's
+   *   own channel, but a message from another channel that lands between the
+   *   gate's decision and its compile follows the message with no line.
+   * - Two or more lines are all written, each naming its message, its age
+   *   counted to now.
+   * - None is written while the host is quiesced or another reader of the
+   *   slot has a turn alive (slotHeldFrom, as for a clock row): written, a
+   *   line would land inside that turn, and deferred, it would wait for the
+   *   delivery agent's next boundary, never reaching this request
+   *   (overlapping turns in the slot, #286). They stay undecided, and are
+   *   written only if another fresh start of the wake comes (a provider
+   *   hold's release, a requeue): this start's request goes without them.
+   *
+   * A line left out is traced. Each line is written once (placedWakeLines),
+   * across the wake's retries and holds, whichever copy of its trigger a
+   * start carries: every request for the wake carries the same line. A line
+   * left out, or whose write fails, stays undecided for a later fresh start.
+   */
+  private placeWakeLines(agent: Agent, lines: readonly WakeLine[]): void {
+    const slot = this.deliveryAgent();
+    if (!slot || agent !== slot) return;
+    const open = lines.filter((line) => !this.placedWakeLines.has(line));
+    const held = this.slotHeldFrom(agent);
+    const leftOut = held
+      || (lines.length === 1 && open.length === 1 && this.isNewestIn(slot, open[0].entry));
+    if (leftOut) {
+      const reason = held ? 'held' : 'newest';
+      for (const line of open) {
+        this.emitTrace({
+          type: 'gate:wake-line-omitted',
+          reason,
+          policyNames: line.policyNames,
+          eventType: line.entry.eventType,
+          ...(line.channelId !== undefined ? { channelId: line.channelId } : {}),
+        });
+      }
+      return;
+    }
+    for (const line of open) {
+      const metadata = { source: 'gate:debounce', policies: line.policyNames } as MessageMetadata;
+      // A line is the wake's context, not its cause, so a write that fails
+      // doesn't fail the start: the line stays undecided, for a later fresh
+      // start of the wake. One whose write threw after its row landed counts
+      // as written, read back as the clock row's is.
+      const before = this.storedCountOf(slot);
+      let id: MessageId;
+      try {
+        id = slot.getContextManager().addMessage('user', [{ type: 'text', text: wakeLineText(line, Date.now()) }], metadata);
+      } catch (err) {
+        const landed = before === undefined ? undefined
+          : this.storedSince(slot, before, (m) => (m.metadata as { source?: unknown } | undefined)?.source === 'gate:debounce', 'gate', 'a batched wake\'s line');
+        if (!landed || landed.length === 0) {
+          console.error(`[gate] ${agent.name}: a batched wake's line could not be written${landed ? '' : ' (whether it landed is unknown)'}:`, err);
+          continue;
+        }
+        console.error(`[gate] ${agent.name}: a batched wake's line landed though its write threw:`, err);
+        id = landed[0]!.id;
+      }
+      this.emitTrace({ type: 'message:added', messageId: id, source: 'gate:wake-line' });
+      this.placedWakeLines.add(line);
+    }
+  }
+
+  /** Whether `entry`'s own stored entry is the newest in `agent`'s window,
+   *  a clock row after it aside: a channel message by its server, channel and
+   *  message id, a push event by its server and event id, and never one a
+   *  tune-out holds. */
+  private isNewestIn(agent: Agent, entry: GateEntryRef): boolean {
+    // A clock row the framework wrote after it (a turn start's, an event's)
+    // isn't a message a reply could be meant for, so it doesn't count.
+    const newest = agent.getContextManager().queryMessages({ limit: 2, reverse: true }).messages
+      .find((m) => (m.metadata as { kind?: unknown } | undefined)?.kind !== CLOCK_ROW_KIND);
     const md = newest?.metadata as Record<string, unknown> | undefined;
     if (!md || 'tuneOut' in md || entry.serverId === undefined || md.serverId !== entry.serverId) return false;
     if (entry.eventType === 'mcpl:channel-incoming') {
@@ -27991,7 +28483,9 @@ export class AgentFramework {
     // generated JSON) stands in for what the server sent. An MCPL peer's
     // content blocks are the exception: what a script prints comes back to
     // the model, so each gets the treatment RFC-005 gives it on every lane
-    // the model reads. A standard peer's blocks reach the script as sent.
+    // the model reads, here, where the server that sent them is known. A
+    // module's blocks get it at the script lane's exit (scriptResultAnswer).
+    // A standard peer's blocks reach the script as sent.
     const forScript = this.scriptToolWaiters?.has(call.id) ?? false;
     const reading = async (result: { content?: unknown; isError?: boolean; structuredContent?: unknown }, mcpl: boolean): Promise<ToolResult> => {
       if (!forScript || !Object.prototype.hasOwnProperty.call(result, 'structuredContent')) {

@@ -243,6 +243,35 @@ export interface GateEntryRef {
   eventId?: string;
 }
 
+/** A batched wake's `[Gate: …]` line that the gate handed to the wake rather
+ *  than wrote: its batch was one event whose entry was still the newest in
+ *  the window when the batch fired (EventGate's `isNewestEntry`). A fresh
+ *  start of the wake's turn decides it (the framework's placeWakeLines): the
+ *  delivery agent's own start leaves it out while that entry is still the
+ *  newest, and writes it once something follows; a co-resident's start
+ *  places none; two or more such lines are each written;
+ *  and none is written while the host is quiesced or another reader of the
+ *  residents' shared slot has a turn alive. A line left out stays for a
+ *  later fresh start of the same wake. Its text is rendered when it's
+ *  written (wakeLineText), so its age is true then.
+ *
+ *  Every request for one wake carries the same object: the framework writes
+ *  each line once by its identity, across the wake's retries and holds. A
+ *  host that hands the gate's requests on itself passes the line on as it
+ *  is, not a copy per agent. */
+export interface WakeLine {
+  /** The event's own entry. */
+  entry: GateEntryRef;
+  policyNames: string[];
+  /** The channel as the line names it to the agent. */
+  shown: string;
+  /** When the event arrived (ms): the line's age is counted from it to when
+   *  the line is written (wakeLineText). */
+  at: number;
+  /** The channel the line names, as the omission's trace reports it. */
+  channelId?: string;
+}
+
 /** Per-policy runtime statistics (for gate:status). */
 export interface GatePolicyStats {
   name: string;

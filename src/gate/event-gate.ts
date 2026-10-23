@@ -25,6 +25,7 @@ import type {
   GateBehavior,
   GateDecision,
   GateEntryRef,
+  WakeLine,
   GateEventInfo,
   GatePolicyStats,
   GateStatus,
@@ -33,7 +34,7 @@ import type {
 } from './types.js';
 
 // Re-export types consumers need
-export type { GateConfig, GateOptions, GateDecision, GateEntryRef, GateEventInfo } from './types.js';
+export type { GateConfig, GateOptions, GateDecision, GateEntryRef, GateEventInfo, WakeLine } from './types.js';
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -114,7 +115,8 @@ interface PendingEvent {
 /**
  * Where a gate-requested wake came from, handed to the framework alongside the
  * reason so the turn's InferenceRequest can carry it (host telemetry stamps
- * "who woke the agent" from it). Ids only, never content or display names.
+ * "who woke the agent" from it). Ids only, never content or display names,
+ * except `line`, which is the batch's own text for the agent's window.
  */
 export interface WakeProvenance {
   /** Composite channel id of the chosen event — telemetry only, never a
@@ -143,6 +145,13 @@ export interface WakeProvenance {
   /** Timestamp (ms) of the chosen event, so a consumer coalescing several
    *  requests can order by event recency, not by flush order. */
   at?: number;
+  /** The batch's `[Gate: …]` line, when the gate handed it to the wake rather
+   *  than wrote it: a WakeLine, the parts its text is rendered from when it's
+   *  written (wakeLineText), decided by a fresh start of the wake's turn as
+   *  WakeLine says. Unlike the fields above, this is content for the agent's
+   *  window, not telemetry: it carries the channel's name as the agent is
+   *  shown it. */
+  line?: WakeLine;
 }
 
 interface DebounceState {
@@ -249,6 +258,32 @@ export function wakeProvenance(events: PendingEvent[]): WakeProvenance | undefin
       ? { routeChannelId: pick.routeChannelId, ...(pick.serverId ? { routeServerId: pick.serverId } : {}) }
       : {}),
     at: pick.timestamp,
+  };
+}
+
+/** A `[Gate: …]` line's reference to messages already in the window: how
+ *  many, in which channel, and how long ago the oldest arrived, as of `now`. */
+function referenceLine(count: number, channel: string, oldest: number, now: number): string {
+  const age = Math.round((now - oldest) / 1000);
+  return `- ${count} message${count > 1 ? 's' : ''} in ${channel} ` +
+    `(oldest ~${age}s ago) — already shown above at arrival; this is a ` +
+    `batched wake, not new content`;
+}
+
+/** A handed batched-wake line's text (WakeLine), as it reads when written at
+ *  `now`: the gate's words, its message's age counted to then. */
+export function wakeLineText(line: WakeLine, now: number): string {
+  return `[Gate: 1 event matched]\n\n${referenceLine(1, line.shown, line.at, now)}`;
+}
+
+/** The event's own stored entry, as the framework is asked about it. */
+function entryRef(event: PendingEvent): GateEntryRef {
+  return {
+    eventType: event.eventType,
+    ...(event.serverId !== undefined ? { serverId: event.serverId } : {}),
+    ...(event.channelId !== undefined ? { channelId: event.channelId } : {}),
+    ...(event.messageId !== undefined ? { messageId: event.messageId } : {}),
+    ...(event.eventId !== undefined ? { eventId: event.eventId } : {}),
   };
 }
 
@@ -679,8 +714,9 @@ export class EventGate {
     /** Whether an MCPL event's own context entry is still the newest entry in
      *  the window a batched wake's line would be written to, with nothing
      *  waiting to be written there. A batched wake for that one message
-     *  writes no line: the message, right above, is its whole cause. Absent:
-     *  every batched wake writes its line, as before. */
+     *  doesn't write its line when it fires: it hands the line to the wake
+     *  (WakeProvenance.line), for a fresh start of the wake's turn to decide
+     *  (WakeLine). Absent: every batched wake writes its line, as before. */
     isNewestEntry?: (entry: GateEntryRef) => boolean;
   }) {
     this.configPath = opts.configPath;
@@ -1602,6 +1638,8 @@ export class EventGate {
     const referenced = events.filter(e => e.inContext);
 
     const lines: string[] = quoted.map(e => `- [${e.policyName}] (${e.eventType}): ${e.content}`);
+    // How each referenced channel is named in the line, in order.
+    const shown: string[] = [];
     if (referenced.length > 0) {
       // By channel, its server and its id: two servers' channels can share
       // an id.
@@ -1632,32 +1670,31 @@ export class EventGate {
         // may carry its own `#`, so one is added only where the name lacks
         // it, as at the other places that add a `#`.
         const channel = label ? `${label.startsWith('#') ? label : `#${label}`} (${name})` : name;
-        const age = Math.round((Date.now() - oldest) / 1000);
-        lines.push(
-          `- ${count} message${count > 1 ? 's' : ''} in ${channel} ` +
-          `(oldest ~${age}s ago) — already shown above at arrival; this is a ` +
-          `batched wake, not new content`,
-        );
+        shown.push(channel);
+        lines.push(referenceLine(count, channel, oldest, Date.now()));
       }
     }
 
     // The line says which messages a wake is for. For one message that is
     // still the newest thing in the window it would be written to, it says
-    // nothing the message right above doesn't: the wake runs without it, its
-    // provenance (and the reply's channel) unchanged. Several messages, one
-    // with anything after it, or content the line quotes, keep the line.
+    // nothing the message right above doesn't. But the turn compiles later,
+    // and what lands in between puts the message above other entries, so the
+    // gate hands the line to the wake (WakeProvenance.line) and a fresh start
+    // of the wake's turn decides it (WakeLine). Several messages, one with
+    // anything after it, or content the line quotes, keep the line now.
+    const text = `[Gate: ${events.length} event${events.length > 1 ? 's' : ''} matched]\n\n${lines.join('\n')}`;
     const only = events.length === 1 && events[0].inContext ? events[0] : undefined;
+    let line: WakeLine | undefined;
     if (only && this.newestEntry(only)) {
       const shownChannel = only.routeChannelId ?? only.channelId;
-      this.emitTrace({
-        type: 'gate:wake-line-omitted',
+      line = {
+        entry: entryRef(only),
         policyNames,
-        eventType: only.eventType,
+        shown: shown[0],
+        at: only.timestamp,
         ...(shownChannel !== undefined ? { channelId: shownChannel } : {}),
-        timestamp: Date.now(),
-      });
+      };
     } else {
-      const text = `[Gate: ${events.length} event${events.length > 1 ? 's' : ''} matched]\n\n${lines.join('\n')}`;
       this.addMessageFn('user', [{ type: 'text', text }], {
         source: 'gate:debounce',
         policies: policyNames,
@@ -1670,8 +1707,11 @@ export class EventGate {
     // event addressed the agent and its registered channel is known,
     // `routeChannelId` names the turn's speech locus too — the reply goes
     // back to whoever addressed the agent, not to whichever channel last saw
-    // any traffic. Ambient-only batches carry telemetry only.
-    const provenance = wakeProvenance(events);
+    // any traffic. Ambient-only batches set no locus. A batch whose line the
+    // gate left to the turn's start carries it too (`line`), one object
+    // shared by every agent the batch wakes, so it is written once.
+    const chosen = wakeProvenance(events);
+    const provenance = line ? { ...chosen, line } : chosen;
     for (const agentName of this.getAgentNamesFn()) {
       this.requestInferenceFn(agentName, 'gate:debounce', 'gate', provenance);
     }
@@ -1681,13 +1721,7 @@ export class EventGate {
   private newestEntry(event: PendingEvent): boolean {
     if (!this.isNewestEntryFn) return false;
     try {
-      return this.isNewestEntryFn({
-        eventType: event.eventType,
-        ...(event.serverId !== undefined ? { serverId: event.serverId } : {}),
-        ...(event.channelId !== undefined ? { channelId: event.channelId } : {}),
-        ...(event.messageId !== undefined ? { messageId: event.messageId } : {}),
-        ...(event.eventId !== undefined ? { eventId: event.eventId } : {}),
-      }) === true;
+      return this.isNewestEntryFn(entryRef(event)) === true;
     } catch {
       return false;
     }
