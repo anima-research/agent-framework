@@ -241,8 +241,7 @@ test('an edit refusal names every problem with its arguments, the call that work
    'Nothing was changed: the arguments were an array, not an object. '
    +'set_tool_description takes {"name": a tool\'s exact name, "description": the new text, or null to restore the default}.');
   assert.equal(refusal('set_tool_visibility',{name:'exampel',visible:false}),
-   'Nothing was changed: no tool named "exampel" is available to you. Did you mean "example"? Copy the exact name from your tool catalogue\'s index, '
-   +'workspace--read {"path":"board/tools.md","limit":140}, reading on with "offset" if the index runs past that.');
+   'Nothing was changed: no tool named "exampel" is available to you. Did you mean "example"? Copy the exact name from your tool list.');
   // A suggested name is quoted whole, however long, since it's what the agent copies.
   const long='mcpl--'+'research_assistant_'.repeat(3)+'search_archive';
   const withLong=[...tools,...presentationTargets(long)];
@@ -265,7 +264,7 @@ test('an edit refusal names every problem with its arguments, the call that work
    'Nothing was changed: "description" is 5, not a string or null. '
    +'set_tool_description takes {"name": a tool\'s exact name, "description": the new text, or null to restore the default}.');
   for (const name of ['workspace--read','set_tool_visibility','set_tool_description']) assert.equal(refusal('set_tool_visibility',{name,visible:false}),
-   `Nothing was changed: ${name} can't be hidden, since workspace--read, set_tool_visibility and set_tool_description are how you read the catalogue and undo these changes. Calling this again won't change that.`);
+   `Nothing was changed: ${name} can't be hidden, since set_tool_visibility, set_tool_description and list_hidden_tools are how you see and undo these changes. Calling this again won't change that.`);
   assert.equal(existsSync(path),false,'no refusal wrote the file');
   assert.equal(p.edit('set_tool_description',{name:'example',description:'\u{1F600}'.repeat(32768)},tools).success,true,'at the limit in characters, though twice it in UTF-16 units');
  } finally {rmSync(dir,{recursive:true,force:true});}
@@ -563,5 +562,33 @@ test('a FIFO at the presentation file is refused at once, not waited on with the
   const out=JSON.parse(child.stdout);
   assert.match(out.diagnostics[0],/^Your tool presentation file can't be used \(it isn't a regular file\)/);
   assert.equal(out.description,'original','the default description stays');
+ } finally {rmSync(dir,{recursive:true,force:true});}
+});
+
+test('list_hidden_tools lists only hidden tools, each with its description',()=>{
+ const dir=mkdtempSync(join(tmpdir(),'presentation-'));
+ try {
+  const path=join(dir,'tools.json'), p=new ToolPresentation({path,cataloguePath:'board/tools.md'});
+  const tools=[{name:'alpha',description:'first',inputSchema:{type:'object' as const}},{name:'beta',description:'second',inputSchema:{type:'object' as const}},...presentationTools('board/tools.md'),{name:'workspace--read',description:'read',inputSchema:{type:'object' as const}}];
+  type Listing={count:number;hidden:{name:string;description:string}[]};
+  assert.deepEqual(presentationTools('board/tools.md').map(t=>t.name),['set_tool_visibility','set_tool_description','list_hidden_tools']);
+  for (const t of presentationTools('board/tools.md')) assert.equal(/catalogue/i.test(t.description),false,`${t.name} no longer sends the resident to read the catalogue`);
+  const empty=p.edit('list_hidden_tools',{},tools);
+  assert.equal(empty.success,true);
+  assert.deepEqual((empty.data as Listing).hidden,[]);
+  assert.equal((empty.data as Listing).count,0);
+  assert.equal(p.edit('set_tool_visibility',{name:'alpha',visible:false},tools).success,true);
+  assert.equal(p.edit('set_tool_description',{name:'alpha',description:'my words'},tools).success,true);
+  assert.equal(p.edit('set_tool_visibility',{name:'beta',visible:false},tools).success,true);
+  const listed=p.edit('list_hidden_tools',{},tools);
+  assert.equal(listed.success,true);
+  assert.deepEqual((listed.data as Listing).hidden,[{name:'alpha',description:'my words'},{name:'beta',description:'second'}],'hidden tools, with the description each would show');
+  assert.equal((listed.data as Listing).count,2);
+  assert.equal(p.resolve(tools).advertised.some(t=>t.name==='alpha'||t.name==='beta'),false,'listing changes nothing');
+  assert.equal(p.edit('set_tool_visibility',{name:'list_hidden_tools',visible:false},tools).success,false,'the listing tool is protected like the editing tools');
+  const unknown=p.edit('set_tool_visibility',{name:'alpah',visible:false},tools);
+  assert.equal(unknown.success,false);
+  assert.match(String(unknown.error),/"alpha"/,'closest names are still offered');
+  assert.equal(/catalogue/i.test(String(unknown.error)),false,'the refusal no longer sends the resident to read the catalogue');
  } finally {rmSync(dir,{recursive:true,force:true});}
 });
