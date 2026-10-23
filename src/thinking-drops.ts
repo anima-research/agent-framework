@@ -83,3 +83,44 @@ export function placeThinkingDrops(
     return { kind: 'reply', bodies: source.bodies.map((b) => ({ messageId: b.messageId, sequence: b.sequence })), entry };
   });
 }
+
+/**
+ * A call's placed drops against the branch's binding-record start (`thinkingRecordedAfter`). Expected: a block of a
+ * stored reply whose every body sits at or below it, minted before the context manager recorded what the branch
+ * sent, so the provider may drop its thinking with no strip having missed. Unexpected: everything else, a reply
+ * above it, a block of the stream's own rounds, or one that couldn't be placed, which the record says the request
+ * carried intact.
+ */
+export function splitThinkingDrops(
+  placed: readonly PlacedDrop[],
+  recordedAfter: number,
+): { expected: PlacedDrop[]; unexpected: PlacedDrop[] } {
+  const expected: PlacedDrop[] = [];
+  const unexpected: PlacedDrop[] = [];
+  for (const drop of placed) {
+    const before = drop.kind === 'reply' && drop.bodies.every((body) => body.sequence <= recordedAfter);
+    (before ? expected : unexpected).push(drop);
+  }
+  return { expected, unexpected };
+}
+
+/**
+ * When an agent's unexpected drops call for an operator alert: at the first call that shows any, and again only
+ * when a call shows more than the alert last counted. Each call of a stream, and each stream until a strip takes
+ * them out, drops the same blocks again, so an unchanged count isn't news. A call whose report shows none ends the
+ * incident, and the next one alerts afresh.
+ */
+export class ThinkingLossIncidents {
+  private readonly alerted = new Map<string, number>();
+
+  /** A call's report of `unexpected` drops for `agent`: the count to alert with, or undefined for no alert. */
+  observe(agent: string, unexpected: number): number | undefined {
+    if (unexpected === 0) {
+      this.alerted.delete(agent);
+      return undefined;
+    }
+    if (unexpected <= (this.alerted.get(agent) ?? 0)) return undefined;
+    this.alerted.set(agent, unexpected);
+    return unexpected;
+  }
+}

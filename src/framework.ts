@@ -160,7 +160,7 @@ import { splitProseRuns, withoutRoundsProse } from './prose-segments.js';
 import { AUTO_CONTINUE_REASON, AUTO_CONTINUE_STOP_REASONS, autoContinueNotice } from './auto-continue.js';
 import { cumulativeDelta } from './usage-accounting.js';
 import { stampThinkingTokenEstimates } from './thinking-token-stamp.js';
-import type { StreamThinkingDrops } from './thinking-drops.js';
+import { splitThinkingDrops, ThinkingLossIncidents, type PlacedDrop, type StreamThinkingDrops } from './thinking-drops.js';
 import { contentAsStored, nameAsStored } from './text-as-stored.js';
 
 /** An MCPL tool call refused because its server isn't in the registry: one
@@ -3272,6 +3272,8 @@ export class AgentFramework {
    *  publish the call makes is credited with (publishReadThrough). Kept only
    *  while the dispatch runs (dispatchScriptToolCall). */
   private readonly scriptCallStarts = new Map<string, { turnId?: number; readThrough: { branch: string; sequence: number } | null }>();
+  /** Per agent, the unexpected thinking drops its last operator alert counted (noteThinkingLoss). */
+  private readonly thinkingLossIncidents = new ThinkingLossIncidents();
   /** Per agent, a round that called code_execution and waits for those calls'
    *  results before its prose is routed (ScriptRound). */
   private scriptRounds: Map<string, ScriptRound> = new Map();
@@ -21014,6 +21016,11 @@ export class AgentFramework {
             const thinkingReport = event.round?.thinking;
             const thinkingDropped = (thinkingReport?.dropped.length ?? 0) > 0;
             if (thinkingDropped) thinkingDroppedInStream = true;
+            // Against the branch's binding record, when the context manager keeps one: a drop it can't account
+            // for tells the operators (noteThinkingLoss).
+            if (thinkingReport && thinkingDrops?.recordedAfter !== undefined) {
+              this.noteThinkingLoss(agent.name, thinkingDrops.place(thinkingReport.dropped), thinkingDrops.recordedAfter);
+            }
             try {
               if (!thinkingDroppedInStream) {
                 strat?.reportRealInputTokens?.(
@@ -25299,6 +25306,35 @@ export class AgentFramework {
     data?: Record<string, unknown>,
   ): void {
     this.opsAlert(kind, agentName, message, { data });
+  }
+
+  /**
+   * A call's dropped blocks, placed, against the branch's binding-record start. Replies stored at or below it may
+   * lose their thinking with no strip having missed, since the context manager recorded nothing they were sent
+   * under. Any other drop is one the record says the request carried intact, which means a thinking strip missed
+   * a change ahead of it: the operators hear of it once per incident, again only if a call shows more, and the
+   * incident ends at a report that shows none (ThinkingLossIncidents).
+   */
+  private noteThinkingLoss(agentName: string, placed: readonly PlacedDrop[], recordedAfter: number): void {
+    const { unexpected } = splitThinkingDrops(placed, recordedAfter);
+    const count = this.thinkingLossIncidents.observe(agentName, unexpected.length);
+    if (count === undefined) return;
+    const replies = unexpected.filter((drop) => drop.kind === 'reply');
+    const rounds = unexpected.filter((drop) => drop.kind === 'round');
+    const unplaced = unexpected.filter((drop) => drop.kind === 'unplaced');
+    this.opsAlert('thinking-binding-loss', agentName,
+      `the provider dropped ${count} signed thinking block${count === 1 ? '' : 's'} that the context manager's ` +
+      `binding record says the request carried intact (${replies.length} in stored replies after the record ` +
+      `began at sequence ${recordedAfter}, ${rounds.length} from the stream's own rounds, ${unplaced.length} not ` +
+      'placed): a thinking strip may have missed a change ahead of them, and the agent loses that reasoning',
+      { data: {
+        blocks: count,
+        recordedAfter,
+        replies: replies.flatMap((drop) => drop.bodies.map((body) => body.messageId)),
+        rounds: rounds.map((drop) => drop.round),
+        unplaced: unplaced.length,
+        reasons: [...new Set(unexpected.map((drop) => drop.entry.reason))],
+      } });
   }
 
   private opsAlert(
