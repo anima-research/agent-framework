@@ -109,6 +109,26 @@ describe('thinkingBinding.binds', () => {
     }
   });
 
+  it('tells a preview of the agent\'s context the binding its compiles are told, and tells none without binds', async () => {
+    for (const binds of [true, false]) {
+      const dir = mkdtempSync(join(tmpdir(), 'af-binds-preview-context-'));
+      const framework = await AgentFramework.create({
+        storePath: join(dir, 'store.chronicle'), membrane: new MockMembrane().asMembrane(),
+        agents: [config({ thinkingBinding: { binds } })], modules: [], syncIntervalMs: 0, maintenanceIntervalMs: 0,
+      });
+      try {
+        const cm = framework.getAgent('agent')!.getContextManager() as unknown as { previewContext: unknown };
+        const seen: unknown[] = [];
+        cm.previewContext = (_budget: unknown, _overrides: unknown, opts: unknown) => { seen.push(opts); return null; };
+        framework.previewContextSettings('agent', 10_000, undefined, { render: false });
+        assert.deepEqual(seen, [binds ? { render: false, thinkingBinding: { binds: true, dropBlock: false, participant: 'agent' } } : { render: false }], String(binds));
+      } finally {
+        await framework.stop();
+        rmSync(dir, { recursive: true, force: true });
+      }
+    }
+  });
+
   it('refuses a binds that is not true or false', () => {
     for (const binds of ['true', 1, {}]) {
       assert.throws(() => new Agent(config({ thinkingBinding: { binds } as never }), recording().contextManager, {} as Membrane),

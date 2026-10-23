@@ -1690,20 +1690,31 @@ export class Agent {
   /** The stream's way to tell the context manager what its later rounds sent, with the head its compile was given:
    *  where the agent's model binds its thinking and the context manager can be told (its `noteRequestSent`, from
    *  a release that keeps a thinking-binding record). */
-  private requestNotes(binding: BindingCompileOptions): Pick<StartStreamResult, 'noteRequestSent'> {
+  private requestNotes(binding: BindingCompileOptions, compiled: CompiledForRequest): Pick<StartStreamResult, 'noteRequestSent'> {
     const identity = binding.identity;
+    // Each note names the compile the stream was built from, so a note can't vouch for this stream under a record a
+    // later committing compile wrote. A compile that reports no provenance gives the stream nothing to name, and the
+    // stream notes nothing: its replies go without their thinking at the next compile, never refused.
+    const compileId = compiled.provenance?.compileId;
     const cm = this.contextManager as unknown as {
-      noteRequestSent?: (rows: readonly SentRow[], identity: NonNullable<BindingCompileOptions['identity']>) => boolean;
+      noteRequestSent?: (rows: readonly SentRow[], identity: NonNullable<BindingCompileOptions['identity']>, compileId: string) => boolean;
     };
-    if (!identity || typeof cm.noteRequestSent !== 'function') return {};
-    return { noteRequestSent: (rows) => cm.noteRequestSent!(rows, identity) };
+    if (!identity || typeof compileId !== 'string' || typeof cm.noteRequestSent !== 'function') return {};
+    return { noteRequestSent: (rows) => cm.noteRequestSent!(rows, identity, compileId) };
+  }
+
+  /** The binding a compile of this agent is told of (bindingCompileOptions), and a preview of its context too: the
+   *  participant whose messages are its replies is its own name. Undefined where the model doesn't bind. */
+  thinkingBindingOption(): { binds: true; dropBlock: boolean; participant: string } | undefined {
+    return this.thinkingBinds ? { binds: true, dropBlock: this.thinkingDropBlock, participant: this.name } : undefined;
   }
 
   private bindingCompileOptions(tools: readonly ToolDefinition[], systemInjections: ContentBlock[]): BindingCompileOptions {
-    if (!this.thinkingBinds) return {};
+    const thinkingBinding = this.thinkingBindingOption();
+    if (!thinkingBinding) return {};
     const { config, providerParams } = this.requestSettings();
     return {
-      thinkingBinding: { binds: true, dropBlock: this.thinkingDropBlock, participant: this.name },
+      thinkingBinding,
       identity: {
         system: stableHash(this.buildSystemPrompt(systemInjections)),
         tools: stableHash(tools),
@@ -1864,7 +1875,7 @@ export class Agent {
       ...(continuePrompt ? { continuePrompt } : {}),
       // Read against the messages the stream sends, which membrane's report indexes (RoundReport's coordinates).
       placeDrops: (entries) => placeThinkingDrops(entries, request.messages, compiled),
-      ...this.requestNotes(binding),
+      ...this.requestNotes(binding, compiled),
       ...(compiled.recordedAfter !== undefined ? { thinkingRecordedAfter: compiled.recordedAfter } : {}),
       ...(kvEnabled
         ? {

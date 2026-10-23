@@ -8185,10 +8185,13 @@ export class AgentFramework {
       previewContext?: (
         budget: TokenBudget,
         overrides?: Record<string, unknown>,
-        opts?: { render?: boolean },
+        opts?: { render?: boolean; thinkingBinding?: unknown },
       ) => unknown;
     };
     if (typeof cm.previewContext !== 'function') return null;
+    // A preview prices what the agent's compile would send, so it's told the binding a compile is (a context
+    // manager that keeps a thinking-binding record prices a summary's carriers by it).
+    const thinkingBinding = agent.thinkingBindingOption();
     // reserveForResponse mirrors the live compile so the previewed middle is
     // comparable to what the agent actually gets. `opts.render` additionally
     // returns the rendered entries — opt-in, since they are megabytes on a
@@ -8196,7 +8199,7 @@ export class AgentFramework {
     return cm.previewContext(
       { maxTokens: budgetTokens, reserveForResponse: agent.maxTokens },
       overrides,
-      opts,
+      thinkingBinding ? { ...opts, thinkingBinding } : opts,
     );
   }
 

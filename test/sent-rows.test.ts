@@ -111,13 +111,14 @@ const withoutRoundContent = (stream: YieldingStream): YieldingStream => new Prox
   },
 });
 
-type Logged = { kind: 'note'; rows: SentRow[]; identity: unknown; storedIds: string[] } | { kind: 'compile'; dryRun: boolean; identity: unknown };
+type Logged = { kind: 'note'; rows: SentRow[]; identity: unknown; compileId: unknown; storedIds: string[] }
+  | { kind: 'compile'; dryRun: boolean; identity: unknown; compileId?: string };
 
 /** A turn of a binding agent over a context manager that logs each note, with what the store held then, and each
  *  compile, in order. */
 async function turn(opts: {
   scripts?: NormalizedResponse[][]; first?: ContentBlock[]; alter?: (s: YieldingStream) => YieldingStream;
-  guard?: boolean; binds?: boolean; agent?: Record<string, unknown>;
+  guard?: boolean; binds?: boolean; agent?: Record<string, unknown>; noProvenance?: boolean;
 } = {}) {
   const dir = mkdtempSync(join(tmpdir(), 'af-sent-rows-'));
   const membrane = new Scripted(opts.scripts ?? [twoRounds(opts.first ?? [signed('sig-1'), text('Calling.')])], opts.alter);
@@ -131,14 +132,17 @@ async function turn(opts: {
       thinkingBinding: { binds: opts.binds ?? true }, ...(opts.guard ? { toolResultGuard: true } : {}), ...opts.agent,
     } as never);
     const log: Logged[] = [];
-    (contextManager as unknown as { noteRequestSent: unknown }).noteRequestSent = (rows: SentRow[], identity: unknown) => {
-      log.push({ kind: 'note', rows: [...rows], identity, storedIds: contextManager.getAllMessages().map((m) => m.id) });
+    (contextManager as unknown as { noteRequestSent: unknown }).noteRequestSent = (rows: SentRow[], identity: unknown, compileId: unknown) => {
+      log.push({ kind: 'note', rows: [...rows], identity, compileId, storedIds: contextManager.getAllMessages().map((m) => m.id) });
       return true;
     };
     const compile = contextManager.compile.bind(contextManager);
-    contextManager.compile = ((budget, injections, o) => {
-      log.push({ kind: 'compile', dryRun: (o as { dryRun?: boolean } | undefined)?.dryRun === true, identity: (o as { identity?: unknown } | undefined)?.identity });
-      return compile(budget, injections, o);
+    contextManager.compile = (async (budget, injections, o) => {
+      const result = await compile(budget, injections, o);
+      if (opts.noProvenance) delete (result as { provenance?: unknown }).provenance;
+      log.push({ kind: 'compile', dryRun: (o as { dryRun?: boolean } | undefined)?.dryRun === true, identity: (o as { identity?: unknown } | undefined)?.identity,
+        ...(result.provenance ? { compileId: result.provenance.compileId } : {}) });
+      return result;
     }) as typeof compile;
     contextManager.addMessage('user', [{ type: 'text', text: 'Run twice.' }]);
     await framework.runEphemeralToCompletion(agent, contextManager);
@@ -168,6 +172,14 @@ describe('a stream\'s rounds, noted at each tool boundary and at its end', () =>
     assert.equal(notes[2]!.storedIds.includes(reply3!), true, 'the end note comes after the last reply is stored');
     assert.deepEqual(notes[0]!.identity, compiledIdentity[0], 'the head the stream\'s compile was given');
     assert.ok(notes[0]!.identity);
+  });
+
+  it('names on every note the compile the stream was built from, and notes nothing where that compile reports no provenance', async () => {
+    const { log, notes } = await turn();
+    const compiled = log.find((e): e is Extract<Logged, { kind: 'compile' }> => e.kind === 'compile' && !e.dryRun);
+    assert.equal(typeof compiled?.compileId, 'string');
+    assert.deepEqual(notes.map((n) => n.compileId), notes.map(() => compiled!.compileId), 'the end note too');
+    assert.equal((await turn({ noProvenance: true })).notes.length, 0);
   });
 
   it('notes a single-round turn once, at its end, with its reply', async () => {
