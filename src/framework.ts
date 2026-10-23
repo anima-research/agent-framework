@@ -9683,7 +9683,8 @@ export class AgentFramework {
     /** Agent state at queue time — 'idle' means no turn holds the agent, so
      *  the turn starts on the next scheduler pass unless a provider hold (a
      *  provider's stated wait, or a capacity cooldown) holds it until the hold
-     *  ends; anything else means it runs after the current turn. */
+     *  ends, or a start of the agent's that waits for an auxiliary call to
+     *  finish goes first; anything else means it runs after the current turn. */
     agentStatus?: string;
     /** True when the host is quiesced: the wake is PARKED, not running, until resume(). */
     quiesced?: boolean;
@@ -9798,8 +9799,9 @@ export class AgentFramework {
     quiesced?: boolean;
     /** For `nudge`: agent state at queue time ('idle' = no turn holds the
      *  agent, so it runs on the next pass unless a provider hold, a stated
-     *  wait or a capacity cooldown, holds it; else it runs once the current
-     *  turn settles). */
+     *  wait or a capacity cooldown, holds it, or a start of the agent's that
+     *  waits for an auxiliary call to finish goes first; else it runs once the
+     *  current turn settles). */
     agentStatus?: string;
     /** For `release-provider-wait`: the waits released. */
     released?: Array<{ model: string; until: string | null }>;
