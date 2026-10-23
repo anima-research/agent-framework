@@ -523,7 +523,7 @@ class ToolRoundThenFinal extends MockMembrane {
 
 describe('an agent whose model binds its thinking, with its window size set, takes no new stream mid-turn for budget alone', () => {
   // A budget restart compiles afresh mid-turn, and what that compile changes ahead of the turn's own earlier rounds
-  // takes their reasoning out of the request (context-manager #155's part 3). The window projection still guards.
+  // takes their reasoning out of the request. The window projection still guards.
   const huge = 1_000_000;
   for (const [label, limits, restarts] of [
     ['binds, with a window size: the stream goes on', { thinkingBinding: { binds: true }, physicalWindowTokens: huge }, false],

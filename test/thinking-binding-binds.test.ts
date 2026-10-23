@@ -1,18 +1,23 @@
 /**
  * `thinkingBinding.binds` says the agent's model binds its signed thinking to the conversation before it. Set, each
  * compile the agent sends, a framework turn's and the direct API's, tells the context manager so, with digests of
- * the request's head (context-manager #155's part 1 options). Unset, compiles carry neither.
+ * the request's head, the options a context manager that keeps a thinking-binding record reads. Unset, compiles
+ * carry neither.
  */
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import type { ContextInjection, ContextManager } from '@animalabs/context-manager';
 import type { Membrane, NormalizedRequest } from '@animalabs/membrane';
 
-import { Agent } from '../src/index.js';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+
+import { Agent, AgentFramework } from '../src/index.js';
 import type { AgentConfig, ToolDefinition } from '../src/index.js';
 import { createMockResponse, MockMembrane } from './helpers/mock-membrane.js';
 
-type Opts = { thinkingBinding?: { binds: boolean; dropBlock: boolean }; identity?: Record<'system' | 'tools' | 'model' | 'request', string> } | undefined;
+type Opts = { thinkingBinding?: { binds: boolean; dropBlock: boolean; participant: string }; identity?: Record<'system' | 'tools' | 'model' | 'request', string> } | undefined;
 
 /** A context manager that records the options each compile is given. */
 function recording(): { contextManager: ContextManager; seen: Opts[] } {
@@ -47,10 +52,10 @@ async function turnOptions(settings: Partial<AgentConfig>, tools: ToolDefinition
 describe('thinkingBinding.binds', () => {
   it('tells each compile a framework turn sends the binding and the request head\'s digests, and tells nothing without it', async () => {
     const binding = await turnOptions({ thinkingBinding: { binds: true, dropBlock: true } }, [tool('a')]);
-    assert.deepEqual(binding?.thinkingBinding, { binds: true, dropBlock: true });
+    assert.deepEqual(binding?.thinkingBinding, { binds: true, dropBlock: true, participant: 'agent' }, 'the agent\'s own name, which its replies are stored under');
     assert.deepEqual(Object.keys(binding?.identity ?? {}).sort(), ['model', 'request', 'system', 'tools']);
     for (const digest of Object.values(binding!.identity!)) assert.match(digest, /^[0-9a-f]{64}$/);
-    assert.deepEqual((await turnOptions({ thinkingBinding: { binds: true } }))?.thinkingBinding, { binds: true, dropBlock: false });
+    assert.deepEqual((await turnOptions({ thinkingBinding: { binds: true } }))?.thinkingBinding, { binds: true, dropBlock: false, participant: 'agent' });
     for (const settings of [{}, { thinkingBinding: { dropBlock: true } }, { thinkingBinding: { binds: false } }]) {
       const opts = await turnOptions(settings);
       assert.equal(opts?.thinkingBinding, undefined, JSON.stringify(settings));
@@ -80,6 +85,28 @@ describe('thinkingBinding.binds', () => {
     const agent = new Agent(config({ thinkingBinding: { binds: true } }), contextManager, membrane);
     await agent.runInferenceWithInjections([tool('a')], [systemNote('one')]);
     assert.deepEqual(seen[0], await turnOptions({ thinkingBinding: { binds: true } }, [tool('a')], [systemNote('one')]));
+  });
+
+  it('tells the framework\'s preview, a dry compile, the same', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'af-binds-preview-'));
+    const framework = await AgentFramework.create({
+      storePath: join(dir, 'store.chronicle'), membrane: new MockMembrane().asMembrane(),
+      agents: [config({ thinkingBinding: { binds: true } })], modules: [], syncIntervalMs: 0, maintenanceIntervalMs: 0,
+    });
+    try {
+      const cm = framework.getAgent('agent')!.getContextManager();
+      const seen: Opts[] = [];
+      const compile = cm.compile.bind(cm);
+      cm.compile = ((budget, injections, opts) => { seen.push(opts as Opts); return compile(budget, injections, opts); }) as typeof compile;
+      await framework.previewActivation('agent');
+      assert.equal(seen.length, 1);
+      assert.equal((seen[0] as { dryRun?: boolean }).dryRun, true, 'a dry run');
+      assert.deepEqual(seen[0]?.thinkingBinding, { binds: true, dropBlock: false, participant: 'agent' });
+      assert.deepEqual(Object.keys(seen[0]?.identity ?? {}).sort(), ['model', 'request', 'system', 'tools']);
+    } finally {
+      await framework.stop();
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 
   it('refuses a binds that is not true or false', () => {

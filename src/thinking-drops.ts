@@ -20,7 +20,7 @@ export type PlacedDrop =
 /**
  * What a request was assembled from: the compile's messages as it returned them, its provenance, and, when the
  * compile gave one, the sequence at or below which a reply was stored before the branch's thinking-binding record
- * began (context-manager's `CompileResult.thinkingRecordedAfter`, part 1 of its #155).
+ * began (context-manager's `CompileResult.thinkingRecordedAfter`, where it keeps a thinking-binding record).
  */
 export interface CompiledForRequest {
   messages: readonly NormalizedMessage[];

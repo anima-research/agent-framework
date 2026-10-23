@@ -59,11 +59,12 @@ export function dryCompileStatsOf(request: object): RenderStats | null {
 }
 
 /**
- * What a compile is told when the agent's model binds its thinking: context-manager #155's part 1 options on
- * `compile()`, as agent-framework holds the binding and as digests of the request's head (bindingCompileOptions).
+ * What a compile is told when the agent's model binds its thinking: `compile()`'s options for a context manager
+ * that keeps a thinking-binding record, as agent-framework holds the binding (with the participant whose messages
+ * are the agent's own replies) and as digests of the request's head (bindingCompileOptions).
  */
 export interface BindingCompileOptions {
-  thinkingBinding?: { binds: boolean; dropBlock: boolean };
+  thinkingBinding?: { binds: boolean; dropBlock: boolean; participant: string };
   identity?: { system: string; tools: string; model: string; request: string };
 }
 
@@ -1676,8 +1677,10 @@ export class Agent {
 
   /**
    * What a compile the agent sends tells the context manager when the model binds its thinking
-   * (`thinkingBinding.binds`): the binding as set, and a digest of each part of the request ahead of its
-   * messages, so a changed one can stand for a first difference (context-manager #155's part 1). The system
+   * (`thinkingBinding.binds`): the binding as set, with the agent's own name as the participant whose messages
+   * are its replies (an agent stores its replies under its name), and a digest of each part of the request ahead of its
+   * messages, so a changed one can stand for a first difference where the context manager keeps a
+   * thinking-binding record. The system
    * text is the one the request will carry, built from the system-position injections given to the compile
    * as the kv-unified prefix hash builds it; the tools are the ones it will carry, in their order; `request`
    * covers the thinking config, `maxTokens` and `providerParams`, where a host puts its own thinking config
@@ -1687,7 +1690,7 @@ export class Agent {
     if (!this.thinkingBinds) return {};
     const { config, providerParams } = this.requestSettings();
     return {
-      thinkingBinding: { binds: true, dropBlock: this.thinkingDropBlock },
+      thinkingBinding: { binds: true, dropBlock: this.thinkingDropBlock, participant: this.name },
       identity: {
         system: stableHash(this.buildSystemPrompt(systemInjections)),
         tools: stableHash(tools),
