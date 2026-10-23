@@ -8,8 +8,9 @@ import {
   writeFileSync,
 } from 'node:fs';
 import { JsStore } from '@animalabs/chronicle';
-import type { Membrane, ContentBlock, NormalizedRequest, NormalizedResponse, YieldingStream, DetailedUsage, ToolResult as MembraneToolResult, ToolResultContentBlock } from '@animalabs/membrane';
+import type { Membrane, ContentBlock, NormalizedRequest, NormalizedResponse, StreamEvent, YieldingStream, DetailedUsage, ToolResult as MembraneToolResult, ToolResultContentBlock } from '@animalabs/membrane';
 import { MembraneError } from '@animalabs/membrane';
+import { classifyFailure, retryDecision, type RetryClass, type RetrySchedule, type RetrySettings } from '@animalabs/membrane/retry';
 import { ContextManager, PassthroughStrategy, WindowedPassthroughStrategy, OverBudgetError, UncoveredDropError, stripUnpairedToolBlocks, continuesBody, MalformedContentError, malformedContentPlaces, CompressionWithdrawn } from '@animalabs/context-manager';
 import type { CacheWireReceipt } from './kv-unified-wire.js';
 import { SILENT_HEARTBEAT_SEPARATOR, type RequestOnlyPrompt, type RequestOnlyStamps } from './silent-heartbeat.js';
@@ -111,7 +112,8 @@ import type { IncomingMessageFacts, RoutingDecision } from './mcpl/conversation-
 import { safeSlice } from './safe-slice.js';
 import { SEND_TOOLS, bareToolName } from './send-tools.js';
 import { boundedErrorMessage, errorMessage } from './error-message.js';
-import { ProviderWaits, EVERY_MODEL, isReleaseModel, withoutControls, type ProviderWait } from './provider-waits.js';
+import { ProviderWaits, EVERY_MODEL, isReleaseModel, isInstant, withoutControls, type ProviderWait } from './provider-waits.js';
+import { ProviderStorms, type ProviderStorm } from './provider-storm.js';
 import type { WorkspaceModule } from './modules/workspace/index.js';
 import type { ToolResultGuard, WithheldSpill } from './tool-result-guard.js';
 import {
@@ -1252,6 +1254,9 @@ const CONTINUATION_DROPPED = "a turn's continuation was dropped before it starte
  *  the wait is over, it does nothing. */
 interface CheckWindow {
   abandoned: boolean;
+  /** A stop of the turn woke this window: a wait in it ends for good, even
+   *  one a storm's change had asked to sleep again (sleepInStorm). */
+  stopped?: boolean;
   wake?: () => void;
 }
 
@@ -1755,9 +1760,48 @@ function describeRequester(r: OperatorRequester | undefined): string {
  *  made. The refusal of an auxiliary call and the trace of a turn held once
  *  compiled say it the same way. */
 function providerWaitText(agentName: string, model: string, wait: ProviderWait): string {
+  if ((wait as ProviderHold).storm) return providerStormText(agentName, model, wait as ProviderHold & { until: number });
   return `Provider wait: ${model} is held for ${agentName} ` +
     `${wait.until === null ? 'until an operator releases it' : `until ${new Date(wait.until).toISOString()}`} ` +
     `(recorded ${new Date(wait.setAt).toISOString()}: ${wait.reason}); no call was made`;
+}
+
+/** What holds an (agent, model) now: a provider's stated wait, or the
+ *  agent's release point in a capacity storm on the model, whichever ends
+ *  later. `storm` is set when the storm's point is the later. */
+type ProviderHold = ProviderWait & { storm?: ProviderStorm };
+
+/** What a turn that doesn't own provider admission does with a provider's
+ *  failure (nonOwningProviderWait): held as a resident's is, slept in its
+ *  turn (an ephemeral run in a capacity storm), or ended with the text its
+ *  caller hears. */
+type NonOwningDisposition =
+  | { held: true }
+  | { sleepMs: number }
+  | { ends: { error: string; statedWaitMs?: number } };
+
+/** A stream that fails at once with `error`, sending nothing: an ephemeral
+ *  run's turn deferred by a capacity storm, which driveStream's failure
+ *  handling sleeps as it sleeps a storm's 529. */
+class FailedStream implements YieldingStream {
+  readonly isWaitingForTools = false;
+  readonly pendingToolCallIds: string[] = [];
+  readonly toolDepth = 0;
+  constructor(private readonly error: Error) {}
+  provideToolResults(): void {
+    throw new Error('A failed stream waits for no tool results');
+  }
+  cancel(): void {}
+  async *[Symbol.asyncIterator](): AsyncIterator<StreamEvent> {
+    yield { type: 'error', error: this.error } as StreamEvent;
+  }
+}
+
+function providerStormText(agentName: string, model: string, hold: ProviderHold & { until: number }): string {
+  const storm = hold.storm!;
+  return `Provider storm: ${model} has answered with overloaded errors (529) since ` +
+    `${new Date(storm.since).toISOString()}, so ${agentName} is held until ${new Date(hold.until).toISOString()}, ` +
+    `its turn to try again (step ${Math.round(storm.stepMs / 1000)} s; ${storm.reason}); no call was made`;
 }
 
 /** Who asked for an operator act, as a durable record and a log line carry
@@ -1777,32 +1821,81 @@ function hostCommandRequester(serverId: string, params: HostCommandParams): Oper
 }
 
 
+/** A turn's tries in all under the default error policy, its first send
+ *  included. */
+const TURN_TRIES = 4;
+
 /**
- * Default error policy - retry with exponential backoff.
+ * The default error policy's retry settings, the turn path's: a rate-limited
+ * or other retryable failure is tried TURN_TRIES times in all, retried at 1,
+ * 2 and 4 s. A provider's stated wait only lengthens a retry's wait, and any
+ * finite one is waited out (a `null` ceiling; the decision ends on Infinity,
+ * which no one can wait out): an ephemeral run that may not wait one out ends
+ * before the policy is asked (nonOwningProviderWait), and a resident's or
+ * conversation agent's is held as a provider wait. There is no overloaded
+ * schedule: a 529 the policy meets is one no storm took (such as one from a
+ * call sent before a storm that has ended since), and the decision gives it
+ * the retryable schedule, unjittered.
+ */
+const TURN_RETRY_SCHEDULE: RetrySchedule = {
+  maxAttempts: TURN_TRIES, firstDelayMs: 1_000, multiplier: 2, maxDelayMs: 4_000, statedWaitCeilingMs: null,
+};
+const TURN_RETRY_SETTINGS: RetrySettings = { rate_limited: TURN_RETRY_SCHEDULE, retryable: TURN_RETRY_SCHEDULE };
+
+/**
+ * A turn call's failure as the retry decision classes it (classifyFailure),
+ * from either copy of membrane (isMembraneError), so by its fields. A failure
+ * that isn't a membrane error is `retryable`, as the default policy has always
+ * retried one, and so is a membrane error from another copy that carries no
+ * `retryable`: only one that says it may not be retried is final. No deadline
+ * is read: the turn path has no deadline schedule.
+ */
+function turnFailureClass(error: Error): RetryClass {
+  if (!isMembraneError(error)) return 'retryable';
+  return classifyFailure({
+    retryable: error.retryable !== false, type: error.type, httpStatus: error.httpStatus, message: error.message,
+  });
+}
+
+/** A capacity storm's deferral of an ephemeral run (stormDeferral): a 529
+ *  that sent nothing. A provider wait's refusal of an auxiliary call is a
+ *  deferral too, but a rate limit with no status, whatever its words quote. */
+function isStormDeferral(error: Error): boolean {
+  return (error as { providerAdmission?: string }).providerAdmission === 'deferred'
+    && isMembraneError(error) && error.httpStatus === 529;
+}
+
+/** A provider's stated wait on a failure, as the framework reads it: a number
+ *  of milliseconds on a membrane error from either copy (the retry decision
+ *  reads NaN as none). */
+function statedWaitOf(error: Error): number | undefined {
+  if (!isMembraneError(error) || typeof error.retryAfterMs !== 'number') return undefined;
+  return error.retryAfterMs;
+}
+
+/**
+ * Default error policy: the retry decision (membrane's
+ * `@animalabs/membrane/retry`) on the turn path's settings
+ * (TURN_RETRY_SETTINGS).
  *
- * Respects MembraneError.retryable: non-retryable errors (400 invalid_request,
- * 401 auth, context_length, safety) are terminal on attempt 0. Retrying them
- * burns API quota without any chance of success — the payload doesn't change
- * between attempts. Production traces showed clerk + reviewer wasting 4
- * inferences on each 400 due to blind retries.
- *
- * For retryable errors, honors retryAfterMs when present (rate limits),
- * otherwise falls back to exponential backoff capped at maxRetries.
+ * A failure that may not be retried (400 invalid_request, 401 auth,
+ * context_length, safety) ends on its first try. Retrying it burns API quota
+ * without any chance of success, since the payload doesn't change between
+ * attempts: production traces showed clerk + reviewer wasting 4 inferences
+ * on each 400 to blind retries.
  */
 class DefaultErrorPolicy implements ErrorPolicy {
-  maxRetries = 3;
+  readonly settings: RetrySettings = TURN_RETRY_SETTINGS;
+  /** Retries after a turn's first try. */
+  readonly maxRetries = TURN_TRIES - 1;
 
   onInferenceError(error: Error, _agentName: string, attempt: number): ErrorAction {
-    if (isMembraneError(error) && error.retryable === false) {
-      return { retry: false };
-    }
-    if (attempt < this.maxRetries) {
-      const delayMs = isMembraneError(error) && typeof error.retryAfterMs === 'number'
-        ? error.retryAfterMs
-        : Math.pow(2, attempt) * 1000;
-      return { retry: true, delayMs };
-    }
-    return { retry: false };
+    // `attempt` counts this policy's retries so far in the turn, from 0; the
+    // decision counts tries made, so after the first try fails it is 1.
+    // A wait is stated only as a number, as the provider waits read it.
+    const stated = statedWaitOf(error);
+    const decision = retryDecision(turnFailureClass(error), attempt + 1, stated, this.settings);
+    return decision.retry ? { retry: true, delayMs: decision.delayMs } : { retry: false };
   }
 }
 
@@ -1849,8 +1942,10 @@ interface ProviderAccelerationCooldown {
   /** Armed by an auxiliary (compression) failure with no primary involved:
    *  release reopens auxiliary admission without synthesising an inference. */
   auxiliaryOrigin?: boolean;
-  /** Its held requests were taken out by dropContinuations: release reopens
-   *  admission without synthesising an inference in their place. */
+  /** Its held requests were taken out, by dropContinuations or by
+   *  coalescing's withdrawal of the wakes they were (cancelCoalescedWakes):
+   *  release reopens admission without synthesising an inference in their
+   *  place. */
   emptiedByDrop?: boolean;
   /** Set when this hold is a provider wait (a stated retry-after) for the
    *  agent's primary model: it holds primary turns only. Auxiliary calls are
@@ -1889,10 +1984,19 @@ const PROVIDER_ACCELERATION_DEFAULT_COOLDOWN_MS = 65_000;
  *  longest stated wait an ephemeral run sleeps in its turn: a longer one ends
  *  the run instead (nonOwningProviderWait). */
 const PROVIDER_ACCELERATION_MAX_COOLDOWN_MS = 10 * 60_000;
+/** How long an ephemeral run may sleep in capacity storms in all before it
+ *  ends, saying so: about what membrane's overloaded schedule gave its call
+ *  (seven tries over about ten minutes). Its own number, apart from the
+ *  acceleration hold's. */
+const EPHEMERAL_STORM_ALLOWANCE_MS = 10 * 60_000;
 const PROVIDER_ACCELERATION_JITTER_MS = 5_000;
 /** Longest delay one setTimeout can represent (2^31-1 ms, about 24.8 days);
  *  a longer timer fires almost at once, so longer waits re-arm in steps. */
 const MAX_TIMER_DELAY_MS = 2_147_483_647;
+/** How often an agent's wait before its next call says it is still waiting
+ *  (the `inference:waiting` trace). Under two minutes, which is how long
+ *  connectome-host's subagent reaper lets a run go silent. */
+const WAITING_TRACE_EVERY_MS = 60_000;
 /** A stated wait recorded to hold a model longer than this, or until
  *  released, raises an ops alert. It is honoured in full either way: a hold
  *  that long is a quota-scale event or a provider's mistake, and a person
@@ -2033,6 +2137,26 @@ interface EphemeralRun {
   inferenceStarted: boolean;
   lastActivity: number;
   toolCallsCount: number;
+  /** How long the run has slept in capacity storms, against
+   *  EPHEMERAL_STORM_ALLOWANCE_MS. */
+  stormSleptMs: number;
+  /** When the latest wait a provider stated on the run's turn calls in a
+   *  capacity storm ends: its storm sleeps last at least until then, past
+   *  the storm's end too, until an operator releases the run. */
+  statedUntil?: number;
+}
+
+/** An ephemeral run asleep in a capacity storm (sleepInStorm). */
+interface StormSleeper {
+  readonly model: string;
+  /** When its current sleep ends. */
+  until: number;
+  /** Set by a change in the storm that wakes it: it sleeps again from what
+   *  holds it then, rather than trying. */
+  retime: boolean;
+  /** An operator released it: nothing the storm or a stated wait set holds it. */
+  released: boolean;
+  wake(): void;
 }
 
 /** The start of what a tool answered, for naming a call its script stopped waiting for: its first text, or its blocks' count. */
@@ -2402,7 +2526,11 @@ type FrameworkCancelKind = 'turn_ended' | 'budget_restart' | 'quiesce_abandoned'
  *  operator's quiesce abandon or stop() settles it as a stop ends a turn's
  *  start; any other drop ends it as a start dropped before it sends anything.
  *  `why` is said in the line its end logs. */
-type ContinuationDrop = { kind: 'quiesce_abandoned' | 'shutdown' | 'dropped'; why: string };
+type ContinuationDrop = { kind: 'quiesce_abandoned' | 'shutdown' | 'dropped'; why: string }
+  /** A caller's stop (abortInference), which ends the turn as a stop, with
+   *  its reason: it also takes a failed turn's retry on its way
+   *  (failedTurnRetries), which is the turn it stops. */
+  | { kind: 'caller'; reason?: string; why: string };
 
 /** What opened a channel the agent didn't ask to open
  *  (recordChannelAutoOpenNotice). */
@@ -2575,9 +2703,43 @@ export class AgentFramework {
   private providerHoldHook: ProviderHoldHook | undefined;
   /** Provider waits (stated retry-after) per (agent, model), kept across restarts. */
   private providerWaits: ProviderWaits | undefined;
+  /** Capacity storms (overloaded 529s on turn calls) per model, held for
+   *  every agent on the model; in memory only. */
+  private providerStorms = Object.assign(new ProviderStorms(), {
+    // A lapse wakes no one and releases nothing, since every point in the
+    // storm has passed; it is said, as a storm's end is.
+    onLapse: (storm: ProviderStorm, now: number): void => {
+      console.error(`[provider-storm] model=${storm.model} storm lapsed: a read found nothing had stepped it, and no call ` +
+        `had gone out into it, for ${Math.round((now - Math.max(storm.stepStartedAt + storm.stepMs, storm.lastSentAt)) / 1000)} s ` +
+        `after its step and its last call (it lapses after ${Math.round(this.providerStorms.lapseMs / 1000)} s); it began ` +
+        `${Math.round((now - storm.since) / 1000)} s ago. An overloaded error from a call sent after this arms a storm of its own`);
+    },
+  });
+  /** The storm round each agent's latest turn call was sent in
+   *  (ProviderStorms.roundOf and sent: the storm's round, or with none on its model,
+   *  the round its last storm's end took, undefined if it never had one), or
+   *  once the call has answered, the round current then: a 529 from a call
+   *  stamped with the current round steps the storm, one stamped earlier
+   *  joins it, and one stamped before a storm armed and ended arms nothing.
+   *  So a call that answered and then fails (an overloaded error mid-stream)
+   *  is the provider's word as of its answer. Keyed by the Agent, so a
+   *  disposed run's entry goes with it. */
+  private stormSentRounds = new WeakMap<Agent, number | undefined>();
+  /** Ephemeral runs asleep in a capacity storm, by name: a step, the storm's
+   *  end and an operator's release wake them (sleepInStorm). */
+  private stormSleepers = new Map<string, StormSleeper>();
+  /** The requests that are a failed turn's retry, on their way to its start:
+   *  the trigger a provider hold keeps for a turn whose call failed (or a
+   *  request made for it), wherever it waits, a hold, the queue its release
+   *  goes back to, a park or a scheduler pass's hands. Its turn is alive until
+   *  that start (continuesTurn), and a stop or an abandon ends it there. */
+  private failedTurnRetries = new WeakSet<InferenceRequest>();
   /** Wakers for error-policy retry waits in progress: stop() ends them. */
   private retryWaitWakers = new Set<() => void>();
   private providerAdmissionClosed = false;
+  /** The membrane every ephemeral run's context manager is handed: the
+   *  admitting proxy with no admission (createEphemeralAgent). */
+  private ephemeralContextMembrane: Membrane | undefined;
   /** Invalidates framework turns still assembling when stop begins. */
   private lifecycleGeneration = 0;
   /** Last time we reported stale (busy-requeued) inference requests, per agent. */
@@ -2792,6 +2954,9 @@ export class AgentFramework {
   private hostModePath: string | undefined;
   private deferredWritesPath: string | undefined;
   private recoveryFallbackWarned = false;
+  /** How often a wait before an agent's next call emits `inference:waiting`
+   *  (WAITING_TRACE_EVERY_MS); a field so tests can shorten it. */
+  private waitingTraceEveryMs = WAITING_TRACE_EVERY_MS;
   /**
    * Deferred writes that have been handed to a context manager but whose
    * chronicle state is NOT yet durably synced. They stay in the durable
@@ -2890,11 +3055,13 @@ export class AgentFramework {
    * one, such as its retry's stream waiting to retry, leaves that one open.
    * An operator's abandon marks the window, and the frame's check collects
    * the mark, which goes with the window. abortInference() and the abandon
-   * count a turn with no stream only here; a stop made anywhere else, as
-   * while an agent is idle, a turn finishes its last delivery or a provider
-   * hold has parked it, has no check to end it, and the next start drops
-   * it. Keyed by the Agent, so a replacement agent under the same name
-   * never shares one.
+   * count a turn with no stream here, or as one on its way to its next
+   * start (a continuation, or a failed call's retry a provider hold keeps or
+   * its release queued), which they end through dropContinuations; a stop
+   * made anywhere else, as while an agent is idle or a turn finishes its
+   * last delivery, has no check to end it, and the next start drops it.
+   * Keyed by the Agent, so a replacement agent under the same name never
+   * shares one.
    */
   private checkAhead: Map<Agent, CheckWindow> = new Map();
 
@@ -4583,7 +4750,7 @@ export class AgentFramework {
    * as a resident's are, so they bind its auxiliary calls too: a held model
    * is refused without a call, and an auxiliary call's own stated wait is
    * recorded for it. (An ephemeral run records nothing, its name being
-   * single-use, so its context manager keeps the plain membrane.) Its
+   * single-use, so its context manager takes no admission.) Its
    * compression is the background work a resident's is, whether a
    * maintenance tick or a drain after a message starts it, so it is withdrawn
    * as a resident's is: a call made while a surgery holds the store, or once
@@ -4602,7 +4769,10 @@ export class AgentFramework {
     });
   }
   /** The framework's membrane, with each complete() call passed through
-   *  `admit` along with the model it names. */
+   *  `admit` along with the model it names, and its options given
+   *  `retry: false`, over any the caller passed: every call through it is
+   *  resent, if at all, by its caller (a context strategy's lane), so
+   *  membrane retries none inside it. Other properties are the membrane's. */
   private membraneAdmitting(admit: (run: () => Promise<unknown>, model: string | undefined) => Promise<unknown>): Membrane {
     const target = this.membrane as unknown as Record<PropertyKey, unknown>;
     return new Proxy(target, { get: (obj, prop, receiver) => {
@@ -4610,7 +4780,12 @@ export class AgentFramework {
       if (prop === 'complete' && typeof value === 'function') {
         return (...args: unknown[]) => {
           const model = (args[0] as { config?: { model?: unknown } } | undefined)?.config?.model;
-          return admit(() => Reflect.apply(value, this.membrane, args) as Promise<unknown>,
+          // Each resend of an auxiliary call comes back through admission, its
+          // hold and its recorded wait, and the context strategy's own lane
+          // backoff paces it: membrane retries none inside the admitted call.
+          const [request, options, ...rest] = args;
+          const call = [request, { ...(options as object | undefined), retry: false }, ...rest];
+          return admit(() => Reflect.apply(value, this.membrane, call) as Promise<unknown>,
             typeof model === 'string' ? model : undefined);
         };
       }
@@ -4631,6 +4806,40 @@ export class AgentFramework {
       return { delayMs: Math.max(1_000, stated) + jitter, ownMs, stated: true };
     }
     return { delayMs: ownMs, ownMs, stated: false };
+  }
+  /** A request that continues a turn on its way to its start: a
+   *  continuation (a budget restart, a tool-result guard's retry) or a failed
+   *  turn's retry (failedTurnRetries). */
+  private continuesTurn(r: InferenceRequest): boolean {
+    return resumesLogicalTurn(r.reason) || (this.failedTurnRetries?.has(r) ?? false);
+  }
+  /** The retry of a turn whose call failed: its trigger, or a request made
+   *  for it when it had none, marked as the turn's (failedTurnRetries). */
+  private retryOfFailedTurn(agentName: string, trigger?: InferenceRequest, reason = 'provider-acceleration-retry'): InferenceRequest {
+    const retry = trigger ?? { agentName, reason, source: 'framework', timestamp: Date.now() } satisfies InferenceRequest;
+    this.markFailedTurnRetry(retry);
+    return retry;
+  }
+  /** Add requests to a hold's, once each; with `turns`, or for one that
+   *  is a failed turn's retry already, each is (or the one already held in
+   *  its place becomes) a failed turn's retry. */
+  private holdRequests(held: InferenceRequest[], requests: InferenceRequest[], turns: boolean): void {
+    for (const request of requests) {
+      const same = held.find((r) => this.sameInferenceRequest(r, request));
+      if (!same) held.push(request);
+      if (turns || this.failedTurnRetries?.has(request)) this.markFailedTurnRetry(same ?? request);
+    }
+  }
+  /** A request a quiesce lets through admission, since its turn is in
+   *  flight: a turn's continuation, or a failed turn's retry. Read wherever a
+   *  quiesce tells such a request from a wake it parks. */
+  private passesQuiesce(r: InferenceRequest): boolean {
+    return isTurnContinuation(r.reason) || (this.failedTurnRetries?.has(r) ?? false);
+  }
+  private markFailedTurnRetry(request: InferenceRequest): void {
+    // A framework built from its prototype, as some suites build one, has no
+    // set until it marks one.
+    (this.failedTurnRetries ??= new WeakSet()).add(request);
   }
   /** Whether two requests are one wake, for a provider hold's dedup: the
    *  same agent, reason, source, time and channel, and the same coalescing
@@ -4690,6 +4899,17 @@ export class AgentFramework {
     // disposition, whatever its wording (a stated wait still binds after it).
     const acceleration = !hostHold && !auxiliary && (error as MembraneError).retryable !== false
       && isOrganizationAccelerationRateLimit(error);
+    // A capacity storm on the model (an overloaded 529 on a turn call) holds
+    // the agent until its release point in the storm, or until the stated
+    // wait ends if that is later. An auxiliary (compression) call's 529
+    // neither arms a storm nor is held by one: the context strategy's lane
+    // paces its own calls.
+    // (A stopping framework joins no storm: while it stops, a 529 is taken
+    // by its class alone, and the stop takes it: endHeldTurnIfStopping.)
+    if (!acceleration && !hostHold && !auxiliary
+      && (this.providerAdmissionClosed ? turnFailureClass(error) === 'overloaded' : this.joinProviderStorm(agent, error))) {
+      return this.holdForStorm(agent, trigger);
+    }
     // The stated wait binds later calls whatever the failure was. Retaining
     // and retrying THIS request is for a failure the provider says may be
     // retried: a non-retryable one keeps its terminal disposition (marker,
@@ -4698,12 +4918,16 @@ export class AgentFramework {
       return wait !== undefined && isMembraneError(error) && error.retryable === true
         && this.holdForProviderWait(agent, wait, trigger ? [trigger] : [], true);
     }
+    // Taken by the stop (endHeldTurnIfStopping); an auxiliary call has no
+    // turn to take.
+    if (this.providerAdmissionClosed) return !auxiliary;
     const now = Date.now();
     const pacing = hostHold ? undefined : this.accelerationCooldownMs(agent.name, error as MembraneError);
     const delayMs = hostHold ? hostHold.holdMs : pacing!.delayMs;
     const existing = this.providerAccelerationCooldowns.get(agent.name);
     const held = existing?.heldRequests ?? [];
-    if (trigger && !held.some((r) => this.sameInferenceRequest(r, trigger))) held.push(trigger);
+    // A turn's failure leaves its retry to the hold; an auxiliary one none.
+    this.holdRequests(held, auxiliary ? (trigger ? [trigger] : []) : [this.retryOfFailedTurn(agent.name, trigger)], !auxiliary);
     if (existing) clearTimeout(existing.timer);
     const timer = setTimeout(() => this.releaseProviderAccelerationCooldown(agent.name), Math.min(delayMs, MAX_TIMER_DELAY_MS)); timer.unref?.();
     this.providerAccelerationCooldowns.set(agent.name, { startedAt: existing?.startedAt ?? now,
@@ -4730,7 +4954,8 @@ export class AgentFramework {
   /**
    * A provider's stated wait on a turn that doesn't own provider admission:
    * a conversation agent's or an ephemeral run's. Left to the error policy,
-   * which returns a stated wait as it is, a 429 stating two hours would hold
+   * which waits a stated wait (or its backoff, if that is longer), a 429
+   * stating two hours would hold
    * the turn asleep two hours, up to three times, with nothing recorded and
    * nothing raised (membrane #56 review, M3). So:
    * - A conversation agent's turns come through the scheduler as a resident's
@@ -4742,32 +4967,274 @@ export class AgentFramework {
    *   bind nothing, and its caller is waiting on it. A retryable stated wait
    *   up to PROVIDER_ACCELERATION_MAX_COOLDOWN_MS is left to the error policy,
    *   slept and retried. A longer one, or one that can't be represented, ends
-   *   the run now ('fail'): it is never retried before the provider's time,
+   *   the run now (`ends`): it is never retried before the provider's time,
    *   and the caller hears why at once.
+   * A capacity storm (an overloaded 529) holds a conversation agent as it
+   * holds a resident. An ephemeral run sleeps in its turn until its own
+   * release point, or a wait the provider stated on its storm's 529 if that
+   * ends later (`sleepMs`), and its sleeps in storms add up to at most
+   * EPHEMERAL_STORM_ALLOWANCE_MS before the run ends instead. A
+   * storm's sleep is not one of the error policy's attempts, and is charged
+   * to the allowance as it is slept (sleepInStorm).
    * Anything else is the error policy's.
    */
-  private nonOwningProviderWait(agent: Agent, error: Error, trigger?: InferenceRequest): 'held' | 'fail' | undefined {
+  private nonOwningProviderWait(agent: Agent, error: Error, trigger?: InferenceRequest): NonOwningDisposition | undefined {
+    const storm = this.joinProviderStorm(agent, error);
     // From either copy of membrane (isMembraneError), a wait is stated only
-    // as a number, as the default error policy reads it.
-    if (!isMembraneError(error) || typeof error.retryAfterMs !== 'number') return undefined;
+    // as a number. A NaN one, a wait stated but unreadable, ends a run below
+    // (it can't be slept to the provider's time); where the default error
+    // policy decides, the retry decision reads NaN as none.
+    const stated = isMembraneError(error) && typeof error.retryAfterMs === 'number' ? error.retryAfterMs : undefined;
     if (this.conversationAgentHomes.has(agent.name)) {
-      const wait = this.recordProviderWait(agent.name, agent.model, error);
-      return error.retryable === true && wait !== undefined && this.holdForProviderWait(agent, wait, trigger ? [trigger] : [], true)
-        ? 'held'
+      const wait = stated === undefined ? undefined : this.recordProviderWait(agent.name, agent.model, error);
+      if (storm || (this.providerAdmissionClosed && turnFailureClass(error) === 'overloaded')) {
+        return this.holdForStorm(agent, trigger) ? { held: true } : undefined;
+      }
+      return (error as MembraneError).retryable === true && wait !== undefined
+        && this.holdForProviderWait(agent, wait, trigger ? [trigger] : [], true)
+        ? { held: true }
         : undefined;
     }
-    if (this.ephemeralRuns.has(agent.name) && error.retryable === true
-      && !(error.retryAfterMs <= PROVIDER_ACCELERATION_MAX_COOLDOWN_MS)) {
-      return 'fail';
+    if (!this.ephemeralRuns.has(agent.name)) return undefined;
+    // Retryable as the turn's failure class reads it: anything that doesn't
+    // say it may not be retried (turnFailureClass).
+    if (stated !== undefined && (error as MembraneError).retryable !== false
+      && !(stated <= PROVIDER_ACCELERATION_MAX_COOLDOWN_MS)) {
+      return { ends: this.statedWaitNotSlept(error) };
     }
-    return undefined;
+    const run = this.ephemeralRuns.get(agent.name)!;
+    const now = Date.now();
+    // A storm's deferral sent nothing: if the storm that deferred it has ended
+    // since, the run tries again once a wait the provider stated on its storm
+    // has passed (at once, with none), as no attempt of the error policy's.
+    if (!storm) {
+      return isStormDeferral(error) ? { sleepMs: Math.max(0, (run.statedUntil ?? now) - now) } : undefined;
+    }
+    // A stated wait binds the run's later sleeps too, so it is kept on the
+    // run: a step or the storm's end that wakes its sleep leaves it asleep to
+    // the stated time.
+    if (stated !== undefined) run.statedUntil = Math.max(run.statedUntil ?? 0, now + stated);
+    const point = this.providerStorms.holdUntil(agent.name, agent.model, now) ?? now;
+    const sleepMs = Math.max(point, run.statedUntil ?? now) - now;
+    // The sleep is charged as it is slept (sleepInStorm), so a sleep a storm's
+    // end cuts short costs the run only the time it took, and a sleep the
+    // failure's site doesn't take costs nothing. A sleep longer than what is
+    // left of the run's allowance sleeps what is left, in case the storm ends
+    // meanwhile; then its retry's deferral ends the run here.
+    // A run with nothing left to wait for tries now, whatever its allowance:
+    // a timer's lateness can leave it slept past the allowance.
+    const left = EPHEMERAL_STORM_ALLOWANCE_MS - run.stormSleptMs;
+    if (sleepMs > 0 && sleepMs > left && left > 0) return { sleepMs: left };
+    if (sleepMs > 0 && sleepMs > left) {
+      return { ends: { error: `${agent.model} has answered turn calls with overloaded errors (529) since ` +
+        `${new Date(storm.since).toISOString()}. This ephemeral run has slept ${Math.round(run.stormSleptMs / 1000)} s ` +
+        `in capacity storms, and a run sleeps at most ${EPHEMERAL_STORM_ALLOWANCE_MS / 1000} s in them, so it ` +
+        `ends now; it can be run again once the model answers. The provider said: ${storm.reason}` } };
+    }
+    return { sleepMs };
   }
+
+  /**
+   * Sleep an ephemeral run in a capacity storm until what holds it passes:
+   * its point in the storm, or a wait a provider stated on its calls if that
+   * ends later (`ms`, as nonOwningProviderWait found it). It is registered
+   * meanwhile (stormSleepers), so each change in the storm reaches it: a step
+   * wakes it to sleep to its point in the new step, the storm's end to sleep
+   * only what a stated wait still asks, and an operator's release ends it,
+   * stated wait included, as release-provider-wait lifts a resident's
+   * recorded waits. Each stretch slept while a storm stands is charged to
+   * the run's allowance as it is slept; a sleep the allowance can't cover
+   * stops where it runs out, and the retry's deferral then ends the run,
+   * saying so. A stop, or a stop of its turn, ends it for the site to read,
+   * as does the run's end (its watchdog). While it sleeps, its window at the
+   * event gate is closed.
+   */
+  private async sleepInStorm(agent: Agent, window: CheckWindow, ms: number): Promise<void> {
+    const run = this.ephemeralRuns.get(agent.name);
+    // The failure's inference:failed has just named the agent.
+    const said = { at: Date.now() };
+    const entry: StormSleeper = {
+      model: agent.model, until: Date.now() + ms, retime: false, released: false,
+      wake: () => { entry.retime = true; window.wake?.(); },
+    };
+    this.stormSleepers.set(agent.name, entry);
+    // A run asleep isn't inferring: while its window stays open at the event
+    // gate, every gate event buffers, for every agent, for as long as the
+    // storm lasts. Its retry's start takes the window again.
+    this.eventGate?.onInferenceEnded(agent.name);
+    try {
+      for (;;) {
+        const started = Date.now();
+        const storm = this.providerStorms.get(agent.model);
+        await this.waitForRetry(entry.until - started, window, { agent, reason: 'capacity-storm', until: entry.until, said });
+        // Charged while the storm stood: a stated wait slept past its lapse,
+        // which wakes no one, isn't storm (an end by an answer wakes the
+        // sleep, so the next stretch's read sees it).
+        if (run && storm) run.stormSleptMs += Math.min(Date.now(), this.providerStorms.lapsesAt(storm)) - started;
+        // Its time came, or a stop ended the sleep: the site reads which.
+        // A run that has ended since (its watchdog) sleeps no more, even when a
+        // step's retime lands with the end's wake.
+        if (!entry.retime || entry.released || window.stopped || window.abandoned || this.providerAdmissionClosed
+          || !run || this.ephemeralRuns.get(agent.name) !== run) return;
+        entry.retime = false;
+        const now = Date.now();
+        const point = this.providerStorms.holdUntil(agent.name, agent.model, now);
+        let until = Math.max(point ?? now, run.statedUntil ?? now);
+        // While a storm stands, its sleep is charged to the allowance, whether
+        // its point or a stated wait past it holds the run: past what the
+        // allowance has left, the retry's deferral ends the run.
+        if (this.providerStorms.get(agent.model) !== undefined) {
+          until = Math.min(until, now + Math.max(0, EPHEMERAL_STORM_ALLOWANCE_MS - run.stormSleptMs));
+        }
+        if (until <= now) return;
+        entry.until = until;
+      }
+    } finally {
+      if (this.stormSleepers.get(agent.name) === entry) this.stormSleepers.delete(agent.name);
+    }
+  }
+
+  /**
+   * Arm, step or join the capacity storm on `agent`'s model for an overloaded
+   * failure (HTTP 529) of its turn call, by the round the call was sent in.
+   * An ephemeral run's deferral (no call was made) joins without stepping.
+   * Returns the storm, or undefined when no storm takes the failure: one that
+   * isn't overloaded, a 529 from a call sent before a storm that has ended
+   * since, or a deferral whose storm has ended (the run's to retry,
+   * nonOwningProviderWait). Past PROVIDER_WAIT_ALERT_MS, the storm raises one
+   * ops alert.
+   */
+  private joinProviderStorm(agent: Agent, error: Error): ProviderStorm | undefined {
+    if (turnFailureClass(error) !== 'overloaded') return undefined;
+    // A stopping framework arms and steps no storm, as it installs no hold:
+    // stop() has cleared every storm, and one armed after would outlive it.
+    if (this.providerAdmissionClosed) return undefined;
+    // A refusal that sent nothing arms nothing: only a storm's own deferral
+    // joins one, and a provider wait's refusal, whose words may quote a 529,
+    // is a rate limit.
+    if ((error as { providerAdmission?: string }).providerAdmission === 'deferred' && !isStormDeferral(error)) return undefined;
+    const now = Date.now();
+    let storm: ProviderStorm | undefined;
+    if (isStormDeferral(error)) {
+      storm = this.providerStorms.get(agent.model);
+    } else {
+      // The provider's words, bounded, and never starting a line of their own.
+      const reason = safeSlice(withoutControls(error.message), 0, 300);
+      const joined = this.providerStorms.failed(agent.model, this.stormSentRounds.get(agent), reason, now);
+      // A call sent in a storm that has ended since arms nothing: a call on
+      // the model has answered after it was sent, or the storm lapsed with
+      // the call still out (STORM_LAPSE_MS). Its failure is the error
+      // policy's.
+      if (!joined) return undefined;
+      storm = joined.storm;
+      if (joined.change !== 'joined') {
+        console.error(`[provider-storm] model=${agent.model} ${joined.change === 'armed' ? 'storm armed' : 'storm stepped'} ` +
+          `by agent=${agent.name}'s overloaded error: every agent on the model is held, each released at its own ` +
+          `point within ${storm.stepMs}ms`);
+      }
+      // A storm armed or stepped takes every point again: each hold on the
+      // model reads its new one now, and each run asleep on the model sleeps
+      // to its own (one sleeping a stated wait past an earlier storm's end
+      // included, whose sleep counts against its allowance from here), so no
+      // timer is left at a point from before.
+      if (joined.change !== 'joined') {
+        for (const [name, cooldown] of this.providerAccelerationCooldowns) {
+          if (cooldown.waitModel === agent.model) this.releaseProviderAccelerationCooldown(name);
+        }
+        for (const sleeper of [...this.stormSleepers.values()]) if (sleeper.model === agent.model) sleeper.wake();
+      }
+    }
+    if (storm && !storm.alerted && now - storm.since > PROVIDER_WAIT_ALERT_MS) {
+      storm.alerted = true;
+      this.opsAlert('provider-storm', agent.name,
+        `${agent.model} has answered turn calls with overloaded errors (529) since ${new Date(storm.since).toISOString()}; ` +
+        `every agent on it is held, trying again every ${Math.round(storm.stepMs / 1000)} s (${storm.reason}). ` +
+        "An agent released with release-provider-wait tries at once, unless a host hold or the organization's acceleration hold also binds it",
+        { data: { model: agent.model, since: new Date(storm.since).toISOString(), stepMs: storm.stepMs } });
+    }
+    return storm;
+  }
+
+  /** What an ephemeral run's turn fails with, without calling, while a
+   *  capacity storm holds it (its point, or a wait the provider stated on its
+   *  storm, still ahead, the storm standing or not): an overloaded error,
+   *  marked as a deferral (no call was made), so it sleeps the run without
+   *  stepping the storm, or with no storm standing, to the stated wait
+   *  (nonOwningProviderWait). */
+  private stormDeferral(agent: Agent, point: number): Error {
+    const storm = this.providerStorms.get(agent.model);
+    return Object.assign(new MembraneError({
+      type: 'server', retryable: true, httpStatus: 529,
+      message: storm
+        ? providerStormText(agent.name, agent.model,
+          { agent: agent.name, model: agent.model, until: point, reason: storm.reason, setAt: storm.since, storm })
+        : `${agent.name} is held until ${new Date(point).toISOString()}, a wait ${agent.model} stated on an overloaded ` +
+          'error (529) in a capacity storm that has ended since; no call was made',
+      rawError: undefined,
+    }), { providerAdmission: 'deferred' as const });
+  }
+
+  /**
+   * Hold a turn whose call met a capacity storm: until the later of its
+   * release point and any stated wait, as a provider wait is held. With its
+   * point in this round already passed (its call was sent in an earlier
+   * round, which no probe has failed since), it goes back to the scheduler at
+   * once and tries again, as a released hold does.
+   */
+  private holdForStorm(agent: Agent, trigger?: InferenceRequest): boolean {
+    // Taken by the stop (endHeldTurnIfStopping).
+    if (this.providerAdmissionClosed) return true;
+    const hold = this.providerHoldFor(agent.name, agent.model);
+    if (hold) return this.holdForProviderWait(agent, hold, trigger ? [trigger] : [], true);
+    this.pendingRequests.push(this.retryOfFailedTurn(agent.name, trigger, 'provider-storm-retry'));
+    return true;
+  }
+
+  /**
+   * What holds `agentName`'s turns on `model` now: the later of a stated wait
+   * recorded for (agent, model) and the agent's release point in a capacity
+   * storm on the model. Admission and a hold's release both ask here, so a
+   * hold taken for either ends only once neither binds.
+   */
+  private providerHoldFor(agentName: string, model: string): ProviderHold | undefined {
+    const wait = this.providerWaits?.active(agentName, model);
+    // One clock for both reads, so a storm that gave a point is the one read.
+    const now = Date.now();
+    const point = this.providerStorms?.holdUntil(agentName, model, now);
+    if (point === undefined || (wait && (wait.until === null || wait.until >= point))) return wait;
+    const storm = this.providerStorms.get(model, now)!;
+    return { agent: agentName, model, until: point, reason: `overloaded (529) since ${new Date(storm.since).toISOString()}: ${storm.reason}`,
+      setAt: storm.since, storm };
+  }
+
+  /**
+   * A turn call on `agent`'s model answered: a capacity storm on the model is
+   * over. Every agent it held is released now, and every run asleep in it
+   * wakes, unless a stated wait still binds it.
+   */
+  private providerStormSucceeded(agent: Agent): void {
+    const storm = this.providerStorms.succeeded(agent.model);
+    if (!storm) return;
+    let held = 0;
+    for (const [name, cooldown] of this.providerAccelerationCooldowns) {
+      if (cooldown.waitModel !== storm.model) continue;
+      held++;
+      this.releaseProviderAccelerationCooldown(name);
+    }
+    for (const sleeper of [...this.stormSleepers.values()]) {
+      if (sleeper.model !== storm.model) continue;
+      held++;
+      sleeper.wake();
+    }
+    console.error(`[provider-storm] model=${storm.model} storm over: agent=${agent.name}'s call answered after ` +
+      `${Date.now() - storm.since}ms of overloaded errors; ${held} held agent(s) released unless a stated wait binds them`);
+  }
+
   /** Why an ephemeral run ended instead of sleeping a provider's stated wait,
    *  for its caller: the text, and the wait itself, which its rejection
    *  carries (ProviderWaitNotSleptError). */
   private statedWaitNotSlept(error: Error): { error: string; statedWaitMs: number } {
-    // Called only after nonOwningProviderWait answered 'fail', which takes a
-    // numeric stated wait.
+    // Called only for a numeric stated wait (nonOwningProviderWait).
     const stated = isMembraneError(error) && typeof error.retryAfterMs === 'number' ? error.retryAfterMs : Number.NaN;
     const cap = `${PROVIDER_ACCELERATION_MAX_COOLDOWN_MS / 1000} s`;
     if (Number.isNaN(stated)) {
@@ -4799,9 +5266,12 @@ export class AgentFramework {
     // A wait hold lasts exactly as long as its wait binds: longer once the
     // wait is extended, while it is indefinite, and over once no wait binds
     // (passed, released, or the stand-in for unreadable records lifted because
-    // they read again). A different primary model now is not bound by it.
+    // they read again). A capacity storm's point counts as a wait here
+    // (providerHoldFor): a storm stepped since the hold began holds the agent
+    // to its point in the new step, and a storm that is over holds nothing. A
+    // different primary model now is not bound by it.
     if (cooldown.waitModel !== undefined && this.agents.get(agentName)?.model === cooldown.waitModel) {
-      const wait = this.providerWaits?.active(agentName, cooldown.waitModel);
+      const wait = this.providerHoldFor(agentName, cooldown.waitModel);
       cooldown.until = wait ? (wait.until ?? Number.POSITIVE_INFINITY) : Date.now();
     }
     const remaining = cooldown.until - Date.now();
@@ -4821,10 +5291,11 @@ export class AgentFramework {
           : `primary hold ended after ${Date.now() - cooldown.startedAt}ms`));
     }
     if ((cooldown.auxiliaryOrigin || cooldown.emptiedByDrop) && cooldown.heldRequests.length === 0) {
-      // Nobody asked for an inference while parked, or what was held was a
-      // continuation since dropped with its turn: just reopen the gate. A
-      // primary the hold left pending won't run, so its recovery ends.
-      console.error(`[provider-cooldown] agent=${agentName} ${cooldown.auxiliaryOrigin ? 'auxiliary hold' : 'hold, its held continuation dropped,'} released after ${Date.now() - cooldown.startedAt}ms`);
+      // Nobody asked for an inference while parked, or what was held was
+      // dropped with its turn, withdrawn by coalescing, or taken by a stop:
+      // just reopen the gate. A primary the hold left pending won't run, so
+      // its recovery ends.
+      console.error(`[provider-cooldown] agent=${agentName} ${cooldown.auxiliaryOrigin ? 'auxiliary hold' : 'hold, what it held dropped or withdrawn,'} released after ${Date.now() - cooldown.startedAt}ms`);
       if (cooldown.emptiedByDrop) this.endPendingPrimary(agentName);
       this.flushAuxiliaryAdmission(agentName);
       return;
@@ -4838,30 +5309,79 @@ export class AgentFramework {
       `fresh compile queued with ${requests.length} retained request(s)`);
   }
   /**
-   * Wait an error policy's retry delay, all of it: the delay can be a
-   * provider's retry-after, and a single timer past 2^31-1 ms fires almost at
-   * once. Steps through longer waits; stop() wakes it so a shutting-down
-   * framework is never left with a wait parked for days. The frame's window
-   * (checkWindow) carries a waker that ends the whole wait: a stop
-   * abortInference() records, or an operator's abandon, wakes it.
+   * Wait an error policy's retry delay, all of it by the wall clock: the
+   * delay can be a provider's retry-after, a wall time, and a single timer
+   * past 2^31-1 ms fires almost at once. Steps through longer waits; stop()
+   * wakes it so a shutting-down framework is never left with a wait parked
+   * for days. The frame's window (checkWindow) carries a waker that ends the
+   * whole wait: a stop abortInference() records, or an operator's abandon,
+   * wakes it.
    */
-  private async waitForRetry(ms: number, checkWindow: CheckWindow): Promise<void> {
+  private async waitForRetry(
+    ms: number,
+    checkWindow: CheckWindow,
+    /** A wait on the provider's behalf, which says it is still waiting
+     *  (`inference:waiting`) every WAITING_TRACE_EVERY_MS while its agent is
+     *  the one registered under its name, so a host's watch for agents gone
+     *  quiet doesn't take it for stuck. `said` is the cadence's clock, moved
+     *  at each due point (said or not) or set when the wait began, carried
+     *  across the calls one sleep makes (a storm sleep
+     *  calls again at each retime), so the cadence runs over the whole sleep;
+     *  `until` is when the wait ends as it stands. */
+    waiting?: { agent: Agent; reason: 'capacity-storm' | 'retry'; until: number; said: { at: number } },
+  ): Promise<void> {
     // An infinite delay waits until stop(), like any wait too long to end; a
-    // delay that isn't a number, or is 0 or less, waits none.
+    // delay that isn't a number, or is 0 or less, waits none. What is left
+    // drops by each step, or to what the clock says is left when that is
+    // less, so a timer late under load, or a listener that holds the loop,
+    // doesn't lengthen the wait. Its end is the caller's `until` when that
+    // comes sooner, so the wait never says it is waiting past that end.
     let remaining = ms > 0 ? ms : 0;
-    // stop() wakes this step through retryWaitWakers and ends the rest by
-    // closing admission; the window's waker ends the rest itself.
+    const deadline = Math.min(Date.now() + remaining, waiting && isInstant(waiting.until) ? waiting.until : Infinity);
+    const every = this.waitingTraceEveryMs ?? WAITING_TRACE_EVERY_MS;
+    // stop() and the window's waker end the rest of the wait. One waker, set
+    // before anything is said, so a stop or an abort (and, for a storm's
+    // sleep, an operator's release) made from a listener of
+    // inference:waiting, or between two steps, ends it too; the finally takes
+    // it off on every way out.
     let ended = false;
-    while (remaining > 0 && !ended && !this.providerAdmissionClosed) {
-      const step = Math.min(remaining, MAX_TIMER_DELAY_MS);
-      remaining -= step;
-      await new Promise<void>((resolve) => {
-        const wakers = this.retryWaitWakers;
-        const done = (): void => { clearTimeout(timer); wakers.delete(done); resolve(); };
-        const timer = setTimeout(done, step);
-        wakers.add(done);
-        checkWindow.wake = () => { ended = true; done(); };
-      });
+    let wakeStep: (() => void) | undefined;
+    const stop = (): void => { ended = true; wakeStep?.(); };
+    const wakers = this.retryWaitWakers;
+    wakers.add(stop);
+    checkWindow.wake = stop;
+    // Whether the wait is over: its time has come, or something ended it.
+    const over = (): boolean => {
+      remaining = Math.min(remaining, deadline - Date.now());
+      return !(remaining > 0) || ended || this.providerAdmissionClosed;
+    };
+    try {
+      for (;;) {
+        if (over()) return;
+        if (waiting && Date.now() - waiting.said.at >= every) {
+          // Said only by the agent still registered under its name, and its
+          // cadence moves on either way, from before its listeners run.
+          waiting.said.at = Date.now();
+          if (this.agents?.get(waiting.agent.name) === waiting.agent) {
+            this.emitTrace({
+              type: 'inference:waiting', agentName: waiting.agent.name,
+              // An end too far to be a date is no end a reader can use.
+              ...(isInstant(waiting.until) ? { until: waiting.until } : {}), reason: waiting.reason,
+            });
+          }
+          // Its listeners can end the wait, or outlast it.
+          if (over()) return;
+        }
+        const step = Math.min(remaining, MAX_TIMER_DELAY_MS, waiting ? Math.max(1, waiting.said.at + every - Date.now()) : Infinity);
+        await new Promise<void>((resolve) => {
+          const timer = setTimeout(resolve, step);
+          wakeStep = () => { clearTimeout(timer); resolve(); };
+        });
+        wakeStep = undefined;
+        remaining -= step;
+      }
+    } finally {
+      wakers.delete(stop);
     }
   }
 
@@ -4904,15 +5424,23 @@ export class AgentFramework {
    * the wait ends: the same path an acceleration cooldown takes, without
    * parking auxiliary calls to other models.
    */
-  private holdForProviderWait(agent: Agent, wait: ProviderWait, requests: InferenceRequest[], failed = false): boolean {
+  private holdForProviderWait(
+    agent: Agent, wait: ProviderWait, requests: InferenceRequest[], failed = false,
+    /** The hold takes a turn that has begun (its call failed, or a check in
+     *  its start found the wait): what it holds is that turn's retry
+     *  (failedTurnRetries), a request made for it if the turn had none. */
+    turnHeld = failed,
+  ): boolean {
     const now = Date.now();
     const until = wait.until ?? Number.POSITIVE_INFINITY;
     if (until <= now) return false;
+    // A failure is taken by the stop (endHeldTurnIfStopping). At admission a
+    // stopping framework holds nothing, and the start returns at its own
+    // closed check.
+    if (this.providerAdmissionClosed) return failed;
     const existing = this.providerAccelerationCooldowns.get(agent.name);
     const held = existing?.heldRequests ?? [];
-    for (const request of requests) {
-      if (!held.some((r) => this.sameInferenceRequest(r, request))) held.push(request);
-    }
+    this.holdRequests(held, turnHeld && requests.length === 0 ? [this.retryOfFailedTurn(agent.name)] : requests, turnHeld);
     // An acceleration or host hold already parks the whole agent; its release
     // re-checks this wait at admission.
     if (existing && existing.waitModel === undefined) return true;
@@ -4923,9 +5451,10 @@ export class AgentFramework {
       startedAt: existing?.startedAt ?? now, until, timer, heldRequests: held,
       // A failed call counts; a turn arriving at a wait recorded earlier doesn't.
       reason: wait.reason, failures: (existing?.failures ?? 0) + (failed ? 1 : 0), waitModel: wait.model,
+      ...(existing?.emptiedByDrop && held.length === 0 ? { emptiedByDrop: true } : {}),
     });
     if (!existing) {
-      console.error(`[provider-wait] agent=${agent.name} model=${wait.model} holding primary turns ` +
+      console.error(`[${(wait as ProviderHold).storm ? 'provider-storm' : 'provider-wait'}] agent=${agent.name} model=${wait.model} holding primary turns ` +
         `${wait.until === null ? 'until released' : `until ${new Date(wait.until).toISOString()}`}; ${held.length} request(s) retained`);
     }
     return true;
@@ -4962,9 +5491,18 @@ export class AgentFramework {
    * wait back; held primary turns are released into one fresh compile. An
    * acceleration hold the released wait lengthened keeps only AF's own pacing
    * for its failure; a host hold stays the host's.
+   *
+   * It also takes the agent out of a capacity storm on the model (with no
+   * model named, on the agent's primary model) when the storm holds it,
+   * listed with `release: 'storm'` and `until` when the storm would have
+   * released it: the agent tries at once, unless a host hold or the
+   * organization's acceleration hold also binds it, and an ephemeral run
+   * asleep in the storm wakes, its stated wait lifted too (after the storm's
+   * end as well). Its success ends the storm for every agent, and its overloaded
+   * error holds it again. The storm stays for the other agents.
    */
   releaseProviderWait(agentName: string, model?: string, by = 'operator'): Array<{
-    model: string; until: string | null; release: 'recorded' | 'pending' | 'in-process override';
+    model: string; until: string | null; release: 'recorded' | 'pending' | 'in-process override' | 'storm';
   }> {
     // A release names one of this framework's agents, or the agent of a wait
     // the listing shows (a disposed conversation fork's wait stays recorded):
@@ -4985,6 +5523,46 @@ export class AgentFramework {
     const released = this.providerWaits?.release(agentName, model, by) ?? [];
     for (const { wait, release } of released) {
       console.error(`[provider-wait] agent=${agentName} model=${wait.model} released by ${by} (${release})`);
+    }
+    // A storm holds an agent's turn calls, which go to its primary model: a
+    // release naming no model takes it out of the storm on that one.
+    const stormModel = model ?? this.agents.get(agentName)?.model;
+    // An ephemeral run asleep in the storm is held by it, whether its sleep
+    // runs to its point or to a stated wait past it, and whether or not a
+    // step has cleared its point.
+    // So is one whose retry is under way while a wait its storm's 529 stated
+    // still binds it, which its check after the compile would read.
+    const run = this.ephemeralRuns.get(agentName);
+    const statedUntil = run?.statedUntil !== undefined && run.statedUntil > Date.now()
+      && this.agents.get(agentName)?.model === stormModel ? run.statedUntil : undefined;
+    // A sleeper already released, or woken by its storm's end with no stated
+    // wait left, is about to try: nothing holds it.
+    const sleeper = this.stormSleepers.get(agentName);
+    const asleep = sleeper !== undefined && sleeper.model === stormModel && !sleeper.released
+      && (this.providerStorms.get(sleeper.model) !== undefined || statedUntil !== undefined) ? sleeper : undefined;
+    // Either is released from the storm's current round too, so its check
+    // after the compile, which draws a point where a step cleared its own,
+    // doesn't hold it again. One held on a stated wait after its storm's end
+    // has no storm to be released from, and its wait, which the storm's 529
+    // stated, is lifted all the same.
+    const held = asleep !== undefined || statedUntil !== undefined;
+    const stormRelease = stormModel === undefined ? null
+      : this.providerStorms.release(agentName, stormModel, Date.now(), held)
+        ?? (held ? { until: asleep?.until ?? statedUntil } : null);
+    // When the hold would have ended: an asleep run's sleep, or else the later
+    // of its point and its stated wait.
+    const stormReleased = stormRelease === null ? []
+      : [{ model: stormModel!, until: asleep?.until ?? Math.max(stormRelease.until ?? 0, statedUntil ?? 0) }];
+    if (stormRelease !== null) {
+      console.error(`[provider-storm] agent=${agentName} model=${stormModel} released from the storm by ${by}: it tries ` +
+        "at once, unless a host hold or the organization's acceleration hold also binds it");
+      // The run tries now, its stated wait lifted as a resident's recorded
+      // wait is above, whether it sleeps or its retry is under way.
+      if (run) delete run.statedUntil;
+      if (asleep) {
+        asleep.released = true;
+        asleep.wake();
+      }
     }
     // The agent's context strategy may pace its own provider calls by the same
     // stated wait. From context-manager 0.17, its compression lane exposes
@@ -5020,9 +5598,14 @@ export class AgentFramework {
       delete cooldown.statedWait;
       this.releaseProviderAccelerationCooldown(agentName);
     }
-    return released.map(({ wait, release }) => ({
-      model: wait.model, until: wait.until === null ? null : new Date(wait.until).toISOString(), release,
-    }));
+    return [
+      ...released.map(({ wait, release }) => ({
+        model: wait.model, until: wait.until === null ? null : new Date(wait.until).toISOString(), release,
+      })),
+      ...stormReleased.map(({ model: stormModel, until }) => ({
+        model: stormModel, until: new Date(until).toISOString(), release: 'storm' as const,
+      })),
+    ];
   }
 
   /** Provider waits binding now, for health and doctor tooling. */
@@ -5059,6 +5642,9 @@ export class AgentFramework {
   private cancelProviderAdmission(): void {
     for (const cooldown of this.providerAccelerationCooldowns.values()) clearTimeout(cooldown.timer);
     this.providerAccelerationCooldowns.clear(); this.providerAccelerationRecoveries.clear();
+    // A stop forgets capacity storms as a restart does. (Runs asleep in one
+    // are woken by stop() through retryWaitWakers.)
+    this.providerStorms?.clear(); this.stormSleepers?.clear();
     for (const gate of this.providerGates.values()) {
       gate.primaryDepth = 0; gate.primaryPending = false;
       for (const resolve of gate.auxiliaryWaiters.splice(0)) resolve();
@@ -5517,9 +6103,12 @@ export class AgentFramework {
 
   /**
    * Abort an in-flight inference for an agent. True when there was one to
-   * stop: a stream, or a turn with no stream and one of its checks ahead (its
+   * stop: a stream; a turn with no stream and one of its checks ahead (its
    * hooks or compile, a wait to retry, the tool-result guard's wait), which
-   * ends at that check, before it sends anything more.
+   * ends at that check, before it sends anything more; or a turn on its way
+   * to its next start (a continuation waiting to start, or a failed call's
+   * retry a provider hold keeps or its release queued), which ends now, its
+   * continuation or retry dropped.
    */
   abortInference(agentName: string, reason?: string): boolean {
     const agent = this.agents.get(agentName);
@@ -5538,6 +6127,22 @@ export class AgentFramework {
     if (result && !hadStream) {
       this.emitTrace({ type: 'inference:aborted', agentName, reason, durationMs: result.durationMs });
     }
+    // A turn on its way to its start with no frame of its own: a failed
+    // call's retry (a provider hold's, a storm's included, or the queue's its
+    // release sent it to) or a continuation. The stop ends it, as it ends a
+    // live stream: its retry and its continuations are taken
+    // (dropContinuations), and the one inference:aborted carries the stop's
+    // reason. Wakes that arrived during a hold stay, and start a turn at its
+    // release; a hold of those alone keeps no turn, and there is nothing to
+    // stop. Before the check-ahead window below: a start that failed into a
+    // hold keeps its window until startAgentStream's finally, a microtask
+    // after the hold took its retry, and no check of that window is ahead to
+    // read a stop marked on it, so a stop in that gap would be reported taken
+    // while the hold kept the retry.
+    if (!result && this.pendingContinuationAgents().has(agentName)) {
+      this.dropContinuations(agentName, { kind: 'caller', reason, why: 'a stop reached it while it waited to retry or continue' });
+      return true;
+    }
     // A turn with no stream and a check still ahead (checkAhead) ends at that
     // check, before it sends anything more, and reports the stop there. One
     // waiting to retry reaches its check now, not when the wait runs out:
@@ -5546,6 +6151,7 @@ export class AgentFramework {
     const checkWindow = this.checkAhead.get(agent);
     if (!result && checkWindow) {
       agent.cancelStream(reason);
+      checkWindow.stopped = true;
       checkWindow.wake?.();
       return true;
     }
@@ -6518,7 +7124,7 @@ export class AgentFramework {
    */
   private pendingContinuationAgents(): Set<string> {
     const agents = new Set<string>();
-    const add = (r: InferenceRequest): void => { if (resumesLogicalTurn(r.reason)) agents.add(r.agentName); };
+    const add = (r: InferenceRequest): void => { if (this.continuesTurn(r)) agents.add(r.agentName); };
     // Read defensively: a framework built from the prototype, as the
     // operator tests build one, sets none of these.
     for (const r of this.pendingRequests ?? []) add(r);
@@ -6551,7 +7157,7 @@ export class AgentFramework {
       activeTurns: holders.size,
       activeTurnAgents: [...holders].sort(),
       parkedAdmissions,
-      gatedRequests: this.pendingRequests.filter((r) => !isTurnContinuation(r.reason)).length,
+      gatedRequests: this.pendingRequests.filter((r) => !this.passesQuiesce(r)).length,
       backgroundScripts: this.codeExecution?.scripts.leftRunning() ?? 0,
       deferredWrites: this.deferredMessages.length,
       ...(this.lastUnabandonable.length > 0 ? { unabandonable: [...this.lastUnabandonable] } : {}),
@@ -6581,7 +7187,8 @@ export class AgentFramework {
    * result); with `abandon: true` the undrained streams are cancelled via a
    * dedicated cancel kind that settles the turn without feeding the
    * inference-failure accounting, and a turn whose continuation hasn't
-   * started ends with the continuation dropped. Drain covers the framework's
+   * started, or whose failed call's retry a provider hold keeps, ends with
+   * the continuation or the retry dropped. Drain covers the framework's
    * own turns: a caller of the direct Agent API (`Agent.runInference`) owns
    * its turns' timing.
    */
@@ -8460,7 +9067,13 @@ export class AgentFramework {
         namespace,
         isolate: true,
         strategy: config.strategy ?? new PassthroughStrategy(),
-        membrane: this.membrane,
+        // A run owns no provider gate, so its context manager's calls take no
+        // admission; but its strategy's lane resends a failed compression, so
+        // membrane retries none inside the call (membraneAdmitting). One proxy
+        // for every run, as every run shared the framework's membrane: a
+        // context strategy keys its compression evidence and lane pause by
+        // the membrane it is handed.
+        membrane: this.ephemeralContextMembrane ??= this.membraneAdmitting((run) => run()),
         debugLogContext: !!process.env.DEBUG_CONTEXT,
       });
 
@@ -8662,6 +9275,7 @@ export class AgentFramework {
       inferenceStarted: false,
       lastActivity: Date.now(),
       toolCallsCount: 0,
+      stormSleptMs: 0,
     };
     this.ephemeralRuns.set(agent.name, run);
 
@@ -8767,6 +9381,11 @@ export class AgentFramework {
         console.error(`[ephemeral] agent=${agent.name} its stream's cancel failed at the run's end; the run leaves all the same:`, error);
       }
       if (this.ephemeralRuns.get(agent.name) === run) this.ephemeralRuns.delete(agent.name);
+      // A run gone waits for nothing: its wait, a storm's sleep or the error
+      // policy's retry, ends now (its window's waker), with what it says of
+      // it (inference:waiting), and its retry, finding the run gone, starts
+      // nothing.
+      this.checkAhead?.get(agent)?.wake?.();
       if (this.agents.get(agent.name) === agent) {
         // What is still queued for the run, such as a message held for its
         // turn's end, is left to its window's release below
@@ -10615,9 +11234,23 @@ export class AgentFramework {
       );
     }
     const busy: string[] = [];
+    // A turn a provider hold keeps to start again (a failed call's retry, or
+    // a continuation) stays alive until the hold ends, which for a stated
+    // wait can be hours, and a quiesce lets it through rather than draining
+    // it: the refusal names the hold and how to end the turn now.
+    let heldTurns = false;
     for (const [name, a] of this.agents) {
       if (a.state.status !== 'idle') busy.push(`${name} is ${a.state.status}`);
-      else if (this.hasTurn(name)) busy.push(`${name} is idle+turn-alive`);
+      else if (this.hasTurn(name)) {
+        const hold = this.activeTurnTokens.has(name) ? undefined : this.providerAccelerationCooldowns.get(name);
+        if (hold && hold.heldRequests.some((r) => this.continuesTurn(r))) {
+          heldTurns = true;
+          const until = Number.isFinite(hold.until) ? `until ${new Date(hold.until).toISOString()}` : 'until released';
+          busy.push(`${name} is idle+turn-alive (a provider hold keeps its turn to start again, ${until}: ${hold.reason})`);
+        } else {
+          busy.push(`${name} is idle+turn-alive`);
+        }
+      }
     }
     for (const name of this.activeTurnTokens.keys()) {
       if (!this.agents.has(name)) busy.push(`${name} is turn-alive`);
@@ -10625,7 +11258,13 @@ export class AgentFramework {
     if (busy.length > 0) {
       throw new OperatorActionError(
         'agent-busy',
-        `Cannot ${verb} while ${busy.join(', ')} — every agent sharing the store must be idle (quiesce the host first)`,
+        `Cannot ${verb} while ${busy.join(', ')} — every agent sharing the store must be idle (quiesce the host first)` +
+          (heldTurns
+            ? '; a quiesce lets a turn a provider hold keeps finish when the hold ends: to go on sooner, end the turn with a ' +
+              'host\'s own abortInference(), or with quiesce with abandon: true once its wait for the drain runs out, or lift a ' +
+              'stated wait or a capacity storm\'s hold with release-provider-wait, so the turn tries again once no host\'s or ' +
+              'acceleration hold binds it'
+            : ''),
       );
     }
     const reserved = new Map<string, number>();
@@ -11559,10 +12198,11 @@ export class AgentFramework {
       // Direct inference requests (e.g. runEphemeralToCompletion) bypass the
       // event queue — without this the loop can exit before they're drained.
       // While quiesced, gate-parked requests are NOT progress and must not
-      // block idle (only a budget restart can still run); identity-equivalent
-      // to `.length > 0` when not quiesced.
+      // block idle (only what a quiesce lets through can still run: a turn's
+      // continuation or a failed turn's retry, passesQuiesce);
+      // identity-equivalent to `.length > 0` when not quiesced.
       this.pendingRequests.some(
-        (r) => !this.quiesced || isTurnContinuation(r.reason),
+        (r) => !this.quiesced || this.passesQuiesce(r),
       ) ||
       this.activeStreams.size > 0 ||
       Array.from(this.agents.values()).some((a) => a.state.status !== 'idle')
@@ -12286,7 +12926,9 @@ export class AgentFramework {
             // for membrane. Each goes with its name and text as the store
             // keeps them, whether it's a heard message, rendered or not, or a
             // notice the boundary made: this is where they leave for the
-            // request.
+            // request. The next round is a turn call of its own, sent in the
+            // storm round current now (stormSentRounds).
+            this.stormSentRounds.set(agent, this.providerStorms.sent(agent.model));
             currentState.stream.provideToolResults(
               agent.toolResultGuard.submissionResults(membraneResults),
               midTurnInjections.length > 0
@@ -14069,7 +14711,14 @@ export class AgentFramework {
   private cancelCoalescedWakes(subject: string): void {
     this.pendingRequests = this.pendingRequests.filter((r) => r.coalescingSubject !== subject);
     for (const cooldown of this.providerAccelerationCooldowns.values()) {
+      // A hold whose every held wake is withdrawn holds nothing anyone still
+      // asks for: its release starts nothing (emptiedByDrop), where it would
+      // otherwise synthesise a turn in their place. A failed turn's retry it
+      // keeps carries no subject (beginAgentTurn strips it), so it stays, and
+      // the hold isn't empty.
+      const held = cooldown.heldRequests.length;
       cooldown.heldRequests = cooldown.heldRequests.filter((r) => r.coalescingSubject !== subject);
+      if (held > 0 && cooldown.heldRequests.length === 0) cooldown.emptiedByDrop = true;
     }
   }
 
@@ -14397,6 +15046,21 @@ export class AgentFramework {
     return undefined;
   }
 
+  /**
+   * A turn that continues (a budget restart, or tool results its turn takes
+   * up again) arrives with the window its predecessor kept open at the event
+   * gate. Held at the scheduler, no frame would close it, and while it is
+   * open every gate event buffers, for every agent, until the hold ends:
+   * close it, as the last boundary does. Its later start takes the window
+   * again. Only while the scheduler's pass is the current lifecycle's: one
+   * that a stop() and start() overtook mid-pass holds a stale request, and
+   * the window may be a newer start's.
+   */
+  private closeHeldContinuationWindow(agentName: string, requests: InferenceRequest[], lifecycle: number): void {
+    if (lifecycle !== this.lifecycleGeneration) return;
+    if (requests.some((r) => isTurnContinuation(r.reason))) this.eventGate?.onInferenceEnded(agentName);
+  }
+
   /** One scheduler pass, whose requests stay visible as on their way until
    *  it takes their agent up (passRequests). */
   private async processInferenceRequests(): Promise<void> {
@@ -14417,6 +15081,7 @@ export class AgentFramework {
     const STALE_REQUEST_MS = 30_000;
     const now = Date.now();
     const state = this.createFrameworkState();
+    const lifecycle = this.lifecycleGeneration;
 
     // Group requests by agent
     for (const req of this.pendingRequests) {
@@ -14451,7 +15116,7 @@ export class AgentFramework {
         });
         console.error(`[inference-dropped] agent=${agentName} reason=agent_not_found requests=${requests.length}`);
         // A continuation among them leaves its turn to end here.
-        if (requests.some((r) => resumesLogicalTurn(r.reason))) {
+        if (requests.some((r) => this.continuesTurn(r))) {
           this.endContinuedTurn(agentName, { kind: 'dropped', why: 'its agent is gone' });
         }
         continue;
@@ -14463,13 +15128,10 @@ export class AgentFramework {
         // selected now, the turn proceeds (the wait stays recorded).
         const otherModel = providerCooldown.waitModel !== undefined && providerCooldown.waitModel !== agent.model;
         if (!otherModel && (now < providerCooldown.until || this.extendHostProviderHold(agentName, providerCooldown))) {
-          for (const req of requests) {
-            if (!providerCooldown.heldRequests.some((r) => this.sameInferenceRequest(r, req))) {
-              providerCooldown.heldRequests.push(req);
-            }
-          }
+          this.holdRequests(providerCooldown.heldRequests, requests, false);
           const recovery = this.providerAccelerationRecoveries.get(agentName);
           if (recovery) recovery.heldRequests = providerCooldown.heldRequests.length;
+          this.closeHeldContinuationWindow(agentName, requests, lifecycle);
           // The timer owns release. Do not hot-poll these requests.
           continue;
         }
@@ -14482,11 +15144,16 @@ export class AgentFramework {
         requests = [...providerCooldown.heldRequests, ...requests];
       }
       // A provider's stated wait on this agent's primary model, including one
-      // recorded before a restart, holds the turn until it passes. An
-      // ephemeral run records nothing, its name being single-use, so no wait,
-      // known or unreadable, binds it (as at the last boundary).
-      const providerWait = this.providerWaits?.active(agentName, agent.model);
-      if (providerWait && !this.ephemeralRuns.has(agentName) && this.holdForProviderWait(agent, providerWait, requests)) continue;
+      // recorded before a restart, or a capacity storm on it, holds the turn
+      // until the later of the two passes (providerHoldFor). An ephemeral run
+      // records nothing, its name being single-use, so no wait, known or
+      // unreadable, binds it (as at the last boundary), and it sleeps a storm
+      // in its own turn.
+      const providerWait = this.ephemeralRuns?.has(agentName) ? undefined : this.providerHoldFor(agentName, agent.model);
+      if (providerWait && this.holdForProviderWait(agent, providerWait, requests)) {
+        this.closeHeldContinuationWindow(agentName, requests, lifecycle);
+        continue;
+      }
 
       // Skip if agent is busy (inferring, streaming, or waiting for tools) —
       // or if a turn is alive at all (activeTurnTokens): the state machine
@@ -14516,8 +15183,9 @@ export class AgentFramework {
       if (this.quiesced) {
         // Continuations of a held turn (budget restart, non-streaming tool
         // results) pass; everything else parks.
-        const passThrough = requests.filter((r) => isTurnContinuation(r.reason));
-        const parked = requests.filter((r) => !isTurnContinuation(r.reason));
+        // A failed turn's retry passes too: its turn is alive until its start.
+        const passThrough = requests.filter((r) => this.passesQuiesce(r));
+        const parked = requests.filter((r) => !this.passesQuiesce(r));
         // Coalesce per (reason, addressed): every channel wake shares one
         // reason, so keying on reason alone would let an ambient message
         // parked later evict a DM/mention parked earlier — and the
@@ -14627,7 +15295,7 @@ export class AgentFramework {
         // A continuation inherits its predecessor's EventGate liveness and
         // logical turn. If policy drops it, no driveStream remains to end them,
         // so its turn ends here (endContinuedTurn).
-        if (requests.some((r) => resumesLogicalTurn(r.reason))) {
+        if (requests.some((r) => this.continuesTurn(r))) {
           this.endContinuedTurn(agentName, { kind: 'dropped', why: 'the inference policy dropped its continuation' });
         }
         this.endPendingPrimary(agentName);
@@ -14705,7 +15373,7 @@ export class AgentFramework {
       // exists only once assembly renders it. Recorded for the whole batch
       // (not inherited from requests[0]), so a requeued trigger stays honest.
       const batchOnly = !budgetRestart && requests.every((r) => r.coalescingBatch === true && !!r.coalescingSubject);
-      await this.startAgentStream(agent, {
+      const merged: InferenceRequest = {
         ...trigger,
         coalescingBatch: batchOnly || undefined,
         coalescingBatchSubjects: batchOnly
@@ -14733,7 +15401,14 @@ export class AgentFramework {
         counterparty: budgetRestart ? undefined : provReq?.counterparty,
         wakeChannelId: budgetRestart ? undefined : provReq?.wakeChannelId,
         wakeAt: budgetRestart ? undefined : provReq?.wakeAt,
-      });
+      };
+      // The start gets the merge, a new request: it is a failed turn's retry
+      // when one of the requests it merges is, so the start's own checks (a
+      // park behind auxiliary work, a hold at its last boundary) see the turn
+      // as alive. A wake merged with it is then part of that turn, as it is
+      // once the turn starts, and a stop that ends the turn takes it too.
+      if (requests.some((r) => this.failedTurnRetries?.has(r))) this.markFailedTurnRetry(merged);
+      await this.startAgentStream(agent, merged);
     }
   }
 
@@ -17068,6 +17743,11 @@ export class AgentFramework {
     trigger?: InferenceRequest,
     attempt = 0,
     providerGateAlreadyHeld = false,
+    /** This start retries its turn's failed call after an ephemeral run's
+     *  sleep in a storm, in the failed start's own frame, which isn't one of
+     *  the error policy's attempts: the turn goes on, as after the policy's
+     *  retries (beginAgentTurn's `fresh`). */
+    continues = false,
   ): Promise<void> {
     const ownsProviderGate =
       !this.ephemeralRuns.has(agent.name) && !this.conversationAgentHomes.has(agent.name);
@@ -17084,7 +17764,7 @@ export class AgentFramework {
         // Do not await inside processInferenceRequests: one slow auxiliary call for
         // this resident must not block events or other residents. Admission stays
         // owned and the continuation receives it after the in-flight call settles.
-        const parkedContinuation = trigger !== undefined && resumesLogicalTurn(trigger.reason);
+        const parkedContinuation = trigger !== undefined && this.continuesTurn(trigger);
         if (parkedContinuation) this.parkedContinuations.add(trigger);
         void this.waitForAuxiliaryIdle(agent.name).then(async () => {
           // A continuation dropped while it was parked left the set then, with
@@ -17117,7 +17797,7 @@ export class AgentFramework {
           // context the operator believes frozen. Give admission back and
           // requeue — the scheduler re-parks it (coalesced) until resume.
           // Continuations of a held turn pass, as they do at the gate.
-          if (this.quiesced && !isTurnContinuation(trigger?.reason ?? '')) {
+          if (this.quiesced && !(trigger && this.passesQuiesce(trigger))) {
             this.releasePrimaryProviderGate(agent.name);
             this.pendingRequests.push(trigger ?? {
               agentName: agent.name, reason: 'provider-admission:requeue', source: 'scheduler', timestamp: Date.now(),
@@ -17152,8 +17832,10 @@ export class AgentFramework {
     // installs no hold: its turn is dropped after the compile, as main drops
     // any such turn.
     if (!this.ephemeralRuns.has(agent.name) && this.agents.get(agent.name) === agent) {
-      const wait = this.providerWaits?.active(agent.name, agent.model);
-      if (wait && this.holdForProviderWait(agent, wait, trigger ? [trigger] : [])) {
+      const wait = this.providerHoldFor(agent.name, agent.model);
+      // A retry of a turn whose call failed (the error policy's, attempt 1
+      // on) is that turn's retry where it is held: alive, and a stop's.
+      if (wait && this.holdForProviderWait(agent, wait, trigger ? [trigger] : [], false, attempt > 0)) {
         if (ownsProviderGate) this.releasePrimaryProviderGate(agent.name);
         // A retry or an in-turn restart arrives with its turn still open at
         // the event gate: the failed attempt, or the predecessor that kept
@@ -17162,7 +17844,7 @@ export class AgentFramework {
         // buffers, for every agent, until the wait ends.
         this.eventGate?.onInferenceEnded(agent.name);
         console.error(`[provider-wait] agent=${agent.name} model=${agent.model} binds at admission ` +
-          `(recorded after the wake was scheduled); wake held, not started`);
+          `(${wait.storm ? 'a capacity storm on the model' : 'recorded after the wake was scheduled'}); wake held, not started`);
         return;
       }
     }
@@ -17197,7 +17879,7 @@ export class AgentFramework {
     this.checkAhead.set(agent, checkWindow);
     let tokenHandedOff = false;
     try {
-      tokenHandedOff = await this.beginAgentTurn(agent, trigger, attempt, turnToken, ownsProviderGate, checkWindow);
+      tokenHandedOff = await this.beginAgentTurn(agent, trigger, attempt, continues, turnToken, ownsProviderGate, checkWindow);
     } catch (error) {
       // A throw outside the stream's own failure handling (the checkpoint,
       // locus resolution, the typing indicator) drops this start's trigger,
@@ -17258,7 +17940,7 @@ export class AgentFramework {
    * caller has ended the turn already.
    */
   private dropContinuations(agentName: string, drop: ContinuationDrop | null): void {
-    const isContinuation = (r: InferenceRequest): boolean => r.agentName === agentName && resumesLogicalTurn(r.reason);
+    const isContinuation = (r: InferenceRequest): boolean => r.agentName === agentName && this.continuesTurn(r);
     let dropped = false;
     const take = (requests: InferenceRequest[]): InferenceRequest[] => {
       const left = requests.filter((r) => !isContinuation(r));
@@ -17269,6 +17951,8 @@ export class AgentFramework {
     const hold = this.providerAccelerationCooldowns.get(agentName);
     if (hold) {
       const held = hold.heldRequests.length;
+      // Wakes that arrived during the hold stay, and start a turn at its
+      // release.
       hold.heldRequests = take(hold.heldRequests);
       if (held > 0 && hold.heldRequests.length === 0) hold.emptiedByDrop = true;
     }
@@ -17295,6 +17979,34 @@ export class AgentFramework {
   }
 
   /**
+   * A stopping framework installs no hold (holdProviderAcceleration,
+   * holdForProviderWait, holdForStorm) and joins no storm: stop() has
+   * already ended every hold and every turn on its way, and a hold installed
+   * after it would keep a turn and its timer past the stop. A failure a hold
+   * would have taken is taken by the stop instead: the installer reports it
+   * taken, so its failure site goes no further than for a held turn (no
+   * retry, no exhaustion marker, no failure streak: the stop is why nothing
+   * retries), and the site, once it has reported the failure, ends the turn
+   * here as stop() ends a held turn (inference:aborted with `shutdown`, after
+   * the call's inference:failed). `stopping` is whether admission was closed
+   * when the installer answered: a stop() made after it, as from a listener
+   * of the failure, finds the turn in the hold it installed and ends it
+   * there itself. A frame whose agent was replaced or removed ends nothing
+   * of the agent now under its name.
+   */
+  private endHeldTurnIfStopping(
+    agent: Agent,
+    stopping: boolean,
+    /** A failed call, whose own row the stream's site writes (`failed`), or
+     *  a start's failed compile, which writes none, so the stop's row says
+     *  no request was made, as at the start's other stops (`start`). */
+    at: 'failed' | 'start' = 'failed',
+  ): void {
+    if (stopping && this.agents.get(agent.name) === agent) {
+      this.endContinuedTurn(agent.name, { kind: 'shutdown', why: 'the framework is stopping' }, at);
+    }
+  }
+  /**
    * End a turn whose continuation won't run. The frame that handed the turn
    * to it kept the turn open for it: its logical turn, the EventGate's
    * window, the tool-result guard's batch and recovery, its typing. An
@@ -17305,16 +18017,28 @@ export class AgentFramework {
    * ends on its own and settles nothing. What was deferred for the agent
    * lands now, or at that frame's end.
    */
-  private endContinuedTurn(agentName: string, drop: ContinuationDrop): void {
-    console.error(`[turn-continuation] ${agentName}: its turn ends without its continuation: ${drop.why}`);
+  private endContinuedTurn(
+    agentName: string,
+    drop: ContinuationDrop,
+    /** Where the turn was when it ended: waiting to start again (its retry
+     *  or continuation on its way), or at a failed call, or a start's failed
+     *  compile, that a hold would have taken, which the stop takes instead
+     *  while the framework stops (endHeldTurnIfStopping). */
+    at: 'waiting' | 'failed' | 'start' = 'waiting',
+  ): void {
+    console.error(`[turn-continuation] ${agentName}: its turn ends ${at === 'failed' ? 'at its failed call' : at === 'start' ? 'at its failed start' : 'without its continuation'}: ${drop.why}`);
     const agent = this.agents.get(agentName);
     const startedAt = this.lastInferenceAt.get(agentName)?.startedAt ?? Date.now();
     if (agent && drop.kind !== 'dropped') {
       const routing = this.openLogical.get(agentName) ?? this.routingOf(agentName);
-      this.endStoppedStart(agent, { kind: drop.kind }, routing, startedAt, undefined, false);
+      // Its calls so far were compiled and sent, and logged by the frames
+      // that sent them.
+      this.endStoppedStart(agent, drop.kind === 'caller' ? { kind: 'caller', reason: drop.reason } : { kind: drop.kind },
+        routing, startedAt, undefined, false, at);
     } else {
       const owner = this.activeTurnTokens.get(agentName);
-      this.abortDroppedTurn(agentName, owner ?? -1, drop.kind === 'dropped' ? CONTINUATION_DROPPED : drop.kind, startedAt);
+      this.abortDroppedTurn(agentName, owner ?? -1,
+        drop.kind === 'dropped' ? CONTINUATION_DROPPED : drop.kind === 'caller' ? (drop.reason ?? 'user') : drop.kind, startedAt);
       this.channelRegistry?.stopTyping();
       if (agent) {
         agent.toolResultGuard.recovering = false;
@@ -17395,19 +18119,36 @@ export class AgentFramework {
      *  continues one (a restart or a retry) may follow rounds already sent,
      *  so the note says it was stopped before it finished. */
     opensTurn: boolean,
+    /** Where the stop reached the turn: at a start's check (`start`); while
+     *  it waited to start again, its retry or its continuation on its way
+     *  (`waiting`, dropContinuations); or at a failed call that a hold would
+     *  have taken, which the stop takes instead while the framework stops
+     *  (`failed`, endHeldTurnIfStopping). In the last two, its calls so far
+     *  were compiled and sent, and the frames that sent them logged them; at
+     *  a failed call the failure's own row is the call's, and the stop writes
+     *  none. */
+    at: 'start' | 'waiting' | 'failed' = 'start',
   ): void {
-    console.error(`[turn] ${agent.name}: ${stop.kind === 'caller' ? 'a stop' : stop.kind === 'shutdown' ? "the framework's stop" : 'a quiesce abandon'} reached the turn's start before it ${opensTurn ? 'sent anything' : 'finished'}; it ends there`);
+    const where = at === 'waiting' ? 'the turn while it waited to start again'
+      : at === 'failed' ? 'the turn at its failed call, which nothing retries'
+        : `the turn's start before it ${opensTurn ? 'sent anything' : 'finished'}`;
+    console.error(`[turn] ${agent.name}: ${stop.kind === 'caller' ? 'a stop' : stop.kind === 'shutdown' ? "the framework's stop" : 'a quiesce abandon'} reached ${where}; it ends there`);
+    const noRequest = at === 'waiting'
+      ? 'no request: the turn was stopped while its retry or continuation waited to start'
+      : 'no request: the turn was stopped before a compile made one';
     this.channelRegistry?.stopTyping();
     // A start that continues a turn (a budget or guard restart) follows a
     // frame that kept the turn's tool-result batch, and the guard's recovery,
     // for its successor. The terminals below let a pending batch go; a
     // recovery with no batch left ends here too.
     agent.toolResultGuard.recovering = false;
-    // No stream ran, so there is no stream's logStream to write through and
-    // no usage to carry: the stop's entry is written directly, as the only
-    // entry of a request that was never sent. A stop before a compile made a
-    // request, or after one failed, has none to record, so the entry says
-    // that rather than a stream's note.
+    // No stream ran for this stop, so there is no stream's logStream to
+    // write through and no usage to carry: the stop's entry is written
+    // directly, as the only entry of a request that was never sent. A stop
+    // before a compile made a request, or after one failed, has none to
+    // record, so the entry says that rather than a stream's note. At a
+    // failed call, the failure's own entry is the call's, and the stop
+    // writes none.
     const requestId = `${agent.name}-${turnStartedAt}-${Math.random().toString(36).slice(2, 8)}`;
     const common = {
       agent,
@@ -17415,10 +18156,10 @@ export class AgentFramework {
       startTime: turnStartedAt,
       compiledRequest,
       closes: routing,
-      log: (entry: Omit<InferenceLogEntry, 'timestamp' | 'agentName' | 'requestId'>) =>
+      log: (entry: Omit<InferenceLogEntry, 'timestamp' | 'agentName' | 'requestId'>) => at === 'failed' ? undefined :
         this.logInference({
           timestamp: turnStartedAt, agentName: agent.name, requestId, ...entry,
-          request: compiledRequest ?? { note: 'no request: the turn was stopped before a compile made one' },
+          request: compiledRequest ?? { note: noRequest },
         }),
     };
     if (stop.kind === 'caller') {
@@ -17439,6 +18180,7 @@ export class AgentFramework {
     agent: Agent,
     trigger: InferenceRequest | undefined,
     attempt: number,
+    continues: boolean,
     turnToken: number,
     ownsProviderGate: boolean,
     /** This start's window (checkAhead), which its checks read for an
@@ -17447,6 +18189,17 @@ export class AgentFramework {
   ): Promise<boolean> {
     const lifecycle = this.lifecycleGeneration;
     const resumesTurn = resumesLogicalTurn(trigger?.reason);
+    // Whether this start begins a turn rather than retrying the turn's
+    // failed call from inside the failed start's own frame: after the error
+    // policy's wait (attempt) or an ephemeral run's storm sleep (continues).
+    // Nothing merges into such a retry, so it goes on with its turn, as
+    // membrane's in-call retries did: its checkpoint, its tool count, its
+    // inputs. A retry the scheduler starts after a hold is a start like any
+    // other (attempt 0), since wakes merge into it there: it assembles what
+    // the coalescer holds pending for it, such as the batch of a wake merged
+    // into it (a merge of mixed causes names no batch, so the start finds it
+    // pending), which only a start that begins a turn does.
+    const fresh = attempt === 0 && !continues;
     const turnProseRouting = trigger?.suppressProse ? 'disabled' : agent.proseRouting;
     // Flush messages deferred during the PREVIOUS turn — before the
     // checkpoint, the locus announcement, and the compile — so a turn started
@@ -17471,9 +18224,9 @@ export class AgentFramework {
     // only, as the flush below: a turn that resumes continues its logical
     // turn, which took its clock at its start or at a tool boundary that
     // could carry one.
-    if (attempt === 0 && !resumesTurn) this.storeDueClock(agent, 'turn-start');
+    if (fresh && !resumesTurn) this.storeDueClock(agent, 'turn-start');
     if (
-      attempt === 0 &&
+      fresh &&
       !resumesTurn &&
       this.deferredMessages.length > 0
     ) {
@@ -17497,7 +18250,7 @@ export class AgentFramework {
     const batchSubjects = trigger?.coalescingBatchSubjects;
     let assembly: AssemblyResult | undefined;
     let assembled = false;
-    if (attempt === 0 && !resumesTurn && this.pushCoalescer
+    if (fresh && !resumesTurn && this.pushCoalescer
       && (batchSubjects?.length || this.pushCoalescer.pendingBatches())) {
       assembled = true;
       // An assembly that throws can leave renders it started running: their
@@ -17568,8 +18321,8 @@ export class AgentFramework {
       trigger = retry;
     }
 
-    // Record turn checkpoint before inference (only on first attempt, not retries)
-    if (attempt === 0 && trigger?.reason !== 'tool_result_guard_retry') {
+    // Record turn checkpoint before inference (only when the start begins a turn, not on a retry)
+    if (fresh && trigger?.reason !== 'tool_result_guard_retry') {
       this.recordTurnCheckpoint(agent.name);
       this.redoStacks.delete(agent.name); // new work invalidates redo
     }
@@ -17629,12 +18382,12 @@ export class AgentFramework {
       const previousLogicalToolState = this.logicalTurnToolCalls.get(agent);
       this.logicalTurnToolCalls.set(agent, { turnToken, count: previousLogicalToolState?.count ?? 0 });
     } else {
-      if (attempt === 0) this.maybePrimeProseMode(agent);
+      if (fresh) this.maybePrimeProseMode(agent);
       // Name any held drafts no notice reached (a crash, an aborted turn),
       // privately, before this turn's compile.
-      if (attempt === 0) this.noticeUnnoticedDrafts(agent);
+      if (fresh) this.noticeUnnoticedDrafts(agent);
       const previousLogicalToolState = this.logicalTurnToolCalls.get(agent);
-      if (attempt === 0) {
+      if (fresh) {
         // A true new turn gets a fresh generation and count.
         this.logicalTurnToolCalls.set(agent, { turnToken, count: 0 });
       } else {
@@ -17668,7 +18421,7 @@ export class AgentFramework {
       if (turnProseRouting !== 'explicit' && turnProseRouting !== 'disabled') {
         const locus = this.channelRegistry?.resolveLocus(agent.name) ?? null;
         if (locus !== null) routing.locus = locus;
-        if (attempt === 0) this.announceLocusIfChanged(agent.name, locus);
+        if (fresh) this.announceLocusIfChanged(agent.name, locus);
       }
     } else {
       // Every other start of the turn keeps its locus: a resume, or a start
@@ -17805,6 +18558,11 @@ export class AgentFramework {
         }
       }
 
+      // A stream that fails as it is made is stamped with the round of its
+      // compile (stormSentRounds); one that is made is stamped again as it
+      // goes out, just before driveStream, the send a storm's lapse counts
+      // from (a compile can fail, or the turn be held, with nothing sent).
+      this.stormSentRounds.set(agent, this.providerStorms.roundOf(agent.model));
       const {
         stream,
         request: compiledRequest,
@@ -17813,7 +18571,10 @@ export class AgentFramework {
         continuePrompt,
       } = await agent.startStreamWithInjections(tools, injections, undefined, compressionTools, {
         silentHeartbeat: trigger?.silentHeartbeat,
+        // The framework retries a turn's failures itself: membrane, none.
+        membraneRetries: false,
       });
+      let driven: YieldingStream = stream;
       // The compile can wait for annotations (each batch has one spill
       // deadline), so check ownership, admission, and the lifecycle again.
       // A stop followed by start must not revive this earlier turn.
@@ -17858,13 +18619,16 @@ export class AgentFramework {
       }
       // A conversation agent takes no provider gate, so its own compression
       // can record a wait while this turn compiles, after the last boundary
-      // checked. Check its waits again here, where nothing has been sent, and
-      // hold the turn as the boundary would rather than send it into the wait.
-      if (this.conversationAgentHomes.has(agent.name)) {
-        const wait = this.providerWaits?.active(agent.name, agent.model);
-        if (wait && this.holdForProviderWait(agent, wait, trigger ? [trigger] : [])) {
+      // checked. And any agent's turn call can meet a capacity storm another
+      // agent's 529 armed while this turn compiled. Check again here, where
+      // nothing has been sent, and hold the turn as the boundary would rather
+      // than send it into the wait or the storm. (An ephemeral run records no
+      // wait and takes no hold: it reads the storm below instead.)
+      if (!this.ephemeralRuns.has(agent.name)) {
+        const wait = this.providerHoldFor(agent.name, agent.model);
+        if (wait && this.holdForProviderWait(agent, wait, trigger ? [trigger] : [], false, true)) {
           console.error(`[provider-wait] agent=${agent.name} model=${agent.model} binds after the compile ` +
-            `(recorded while the turn compiled); turn held, nothing sent`);
+            `(${wait.storm ? 'a capacity storm armed' : 'recorded'} while the turn compiled); turn held, nothing sent`);
           // The stream the compile made won't be sent: it's cancelled, and
           // this start's window closes, before the hold is reported, so a stop
           // made while inference:failed is delivered finds neither, and the
@@ -17883,6 +18647,26 @@ export class AgentFramework {
           this.eventGate?.onInferenceEnded(agent.name);
           return false;
         }
+      } else {
+        // An ephemeral run takes no hold, so it reads a capacity storm on its
+        // model here, after its compile, before its first call as before each
+        // retry: until its own release point it sends nothing. The stream the
+        // compile made is cancelled unsent, and the run's stream fails at once
+        // with the deferral in its place: driveStream's failure handling then
+        // sleeps the run as it sleeps a storm's 529 (or ends it past its storm
+        // allowance), stepping nothing since no call was made, and apart from
+        // the scheduler, which awaits this start and would hold every other
+        // agent's turns for the sleep.
+        // A wait the provider stated on the run's storm holds it too, past
+        // its point and past the storm's end: a sleep its allowance cut short
+        // ends at neither.
+        const point = this.providerStorms.holdUntil(agent.name, agent.model);
+        const stated = this.ephemeralRuns.get(agent.name)?.statedUntil;
+        const until = Math.max(point ?? 0, stated ?? 0);
+        if (until > Date.now()) {
+          stream.cancel();
+          driven = new FailedStream(this.stormDeferral(agent, until));
+        }
       }
       // The [Continue] prompt this stream's first round follows, if any, as
       // the Agent read it from the request: the round's rows carry it
@@ -17900,9 +18684,16 @@ export class AgentFramework {
       // start's checks are behind it, so its window closes now, before
       // driveStream can report a stream that fails at once.
       if (this.checkAhead.get(agent) === checkWindow) this.checkAhead.delete(agent);
+      // The call goes out now, unless a storm's deferral stands in for it: a
+      // storm's lapse counts from it (sent), and it goes in the storm round
+      // current as it goes (stormSentRounds). A storm that armed or stepped
+      // while it compiled has held the turn at the checks above, before
+      // anything was sent; one that ended meanwhile leaves a call sent after
+      // its end, whose 529 arms the next.
+      if (driven === stream) this.stormSentRounds.set(agent, this.providerStorms.sent(agent.model));
       const handle = this.driveStream(
         agent,
-        stream,
+        driven,
         requestSnapshot,
         trigger,
         attempt,
@@ -17962,20 +18753,30 @@ export class AgentFramework {
         // Capacity scheduling is not poisoned history. The cooldown timer owns
         // one later fresh compile; no immediate retry or exhaustion marker.
         this.eventGate?.onInferenceEnded(agent.name);
+        this.endHeldTurnIfStopping(agent, this.providerAdmissionClosed, 'start');
         return false;
       }
-      const statedWait = ownsProviderGate ? undefined : this.nonOwningProviderWait(agent, err, trigger);
-      if (statedWait === 'held') {
-        // A conversation agent held by the provider's stated wait, as a
-        // resident is: the hold's release owns the later compile.
+      const disposition = ownsProviderGate ? undefined : this.nonOwningProviderWait(agent, err, trigger);
+      if (disposition && 'held' in disposition) {
+        // A conversation agent held by the provider's stated wait or a
+        // capacity storm, as a resident is: the hold's release owns the later
+        // compile.
         this.eventGate?.onInferenceEnded(agent.name);
+        this.endHeldTurnIfStopping(agent, this.providerAdmissionClosed, 'start');
         return false;
       }
 
-      const action: ErrorAction = statedWait === 'fail' ? { retry: false } : this.errorPolicy.onInferenceError(err, agent.name, attempt);
+      const action: ErrorAction = disposition && 'ends' in disposition ? { retry: false }
+        : disposition && 'sleepMs' in disposition ? { retry: true, delayMs: disposition.sleepMs }
+          : this.errorPolicy.onInferenceError(err, agent.name, attempt);
       if (action.retry) {
-        // A policy's delay can be a provider's retry-after: wait all of it.
-        await this.waitForRetry(action.delayMs, checkWindow);
+        // A policy's delay can be a provider's retry-after: wait all of it. A
+        // storm's sleep follows the storm (sleepInStorm). Both run inside the
+        // scheduler's await of this start, as on main, so an ephemeral run's
+        // storm deferral doesn't come here: it fails its stream instead, and
+        // sleeps in driveStream (after the compile, below).
+        if (disposition && 'sleepMs' in disposition) await this.sleepInStorm(agent, checkWindow, disposition.sleepMs);
+        else await this.waitForRetry(action.delayMs, checkWindow, { agent, reason: 'retry', until: Date.now() + action.delayMs, said: { at: Date.now() } });
         if (this.providerAdmissionClosed || lifecycle !== this.lifecycleGeneration) {
           // stop() ended the wait: that cancels the retry, it does not hasten
           // it. A stop() and a start() since this start began cancel it too,
@@ -18001,9 +18802,14 @@ export class AgentFramework {
           this.endStoppedStart(agent, stopAfterWait, routing, turnStartedAt, undefined, opensTurn);
           return false;
         }
+        // A run or fork disposed while it waited isn't started again.
+        if (this.agents.get(agent.name) !== agent) return false;
         // The retry re-enters startAgentStream, which replaces this frame's
-        // turn token with its own; cleanup belongs to the innermost frame.
-        await this.startAgentStream(agent, trigger, attempt + 1);
+        // turn token with its own; cleanup belongs to the innermost frame. A
+        // storm's sleep isn't one of the error policy's attempts, and its
+        // retry goes on with the turn, as the policy's do (continues).
+        const slept = disposition !== undefined && 'sleepMs' in disposition;
+        await this.startAgentStream(agent, trigger, slept ? attempt : attempt + 1, false, slept);
       } else {
         // Terminal failure with no driveStream: this frame owns teardown.
         // Token-matched (like the finally in driveStream) so a stale frame
@@ -18019,7 +18825,7 @@ export class AgentFramework {
         this.settleAgent(agent.name, {
           stopReason: 'exhausted',
           speech: '',
-          ...(statedWait === 'fail' ? this.statedWaitNotSlept(err) : { error: err.message }),
+          ...(disposition && 'ends' in disposition ? disposition.ends : { error: err.message }),
         }, routing);
         this.emitTrace({
           type: 'inference:exhausted',
@@ -18504,6 +19310,12 @@ export class AgentFramework {
     // The stream's `complete` is pending from here: every exit reaches the
     // finally, which sends it, and a stop() can send it sooner.
     this.pendingOutgoingCompletes.add(completeOutgoing);
+    // Whether the model has answered the stream's current provider call: the
+    // first answer of each call ends a capacity storm on the model.
+    let callAnswered = false;
+    // The current call is one membrane made after a call's end, unseen: an
+    // automatic resumption, or nothing (text membrane flushes after the end).
+    let callUnseen = false;
     try {
       for await (const event of stream) {
         // Ignore every late event from an Agent generation that no longer owns
@@ -18525,6 +19337,45 @@ export class AgentFramework {
         const modelContent = (event.type === 'tokens' && event.meta.type !== 'tool_result')
           || (event.type === 'block' && event.event.block.type !== 'tool_result');
         if (modelContent || event.type === 'retrying') followTurnLocus();
+        // A provider call answering is a turn call's success: a capacity
+        // storm on its model is over. A call the framework saw sent (the
+        // stream's first, a tool round's after its tool calls, a refusal's
+        // re-issue) answers with its first content; any call answers with its
+        // end (membrane's usage event, which ends each call it makes: an
+        // answer with only tool calls or nothing in it) or with a refusal
+        // membrane re-issues. Content after a call's end with no tool calls
+        // or re-issue between counts for nothing: it may be text membrane's
+        // XML parser held back and flushes after the end, or a false stop's
+        // put-back, which no event tells from an automatic resumption's first
+        // words, so a resumption answers at its own end. Later events of the
+        // same call answered a call sent before any storm that has armed
+        // since, so they end nothing; the stream's completion comes after the
+        // usage of the call it ends.
+        if (event.type === 'tool-calls') callUnseen = false;
+        if ((modelContent && !callUnseen) || event.type === 'usage' || event.type === 'retrying') {
+          if (!callAnswered) {
+            this.providerStormSucceeded(agent);
+            // A storm this answer ended is over for the call too: a 529 it
+            // meets after its first words (an overloaded error mid-stream) is
+            // the provider's word now, and arms the next.
+            this.stormSentRounds.set(agent, this.providerStorms.roundOf(agent.model));
+          }
+          callAnswered = true;
+          if (event.type === 'usage' || event.type === 'retrying') {
+            // The call is over. The next, if membrane makes one (an automatic
+            // resumption, the refusal's re-issue), goes in the storm round
+            // current now (stormSentRounds); a tool round's is stamped again
+            // as its results are handed over.
+            callAnswered = false;
+            callUnseen = event.type === 'usage';
+            // A refusal's re-issue is a call membrane says it is making now,
+            // so a storm's lapse counts from it (sent). At a call's end
+            // (usage), whether membrane makes a next call, an automatic
+            // resumption, isn't known, so it is a round read.
+            this.stormSentRounds.set(agent, event.type === 'retrying'
+              ? this.providerStorms.sent(agent.model) : this.providerStorms.roundOf(agent.model));
+          }
+        }
         switch (event.type) {
           case 'tokens': {
             const trace: Parameters<AgentFramework['emitTrace']>[0] = {
@@ -19565,12 +20416,16 @@ export class AgentFramework {
               stack: err.stack,
             });
 
-            logStream({
-              success: false,
-              error: err.message,
-              request: compiledRequest ?? { note: 'streaming request failed' },
-              durationMs,
-            });
+            // A storm's deferral of an ephemeral run (FailedStream) sent
+            // nothing, so the inference log, a log of calls, records none.
+            if ((err as { providerAdmission?: string }).providerAdmission !== 'deferred') {
+              logStream({
+                success: false,
+                error: err.message,
+                request: compiledRequest ?? { note: 'streaming request failed' },
+                durationMs,
+              });
+            }
 
             // Only reset + retry if this is still the active stream
             if (agent.streamId !== myStreamId) break;
@@ -19579,15 +20434,19 @@ export class AgentFramework {
 
             if (ownsProviderGate && this.holdProviderAcceleration(agent, err, trigger)) {
               if (this.agents.get(agent.name) === agent && agent.streamId === myStreamId) this.eventGate?.onInferenceEnded(agent.name);
+              this.endHeldTurnIfStopping(agent, this.providerAdmissionClosed);
               break;
             }
-            const statedWait = ownsProviderGate ? undefined : this.nonOwningProviderWait(agent, err, trigger);
-            if (statedWait === 'held') {
+            const disposition = ownsProviderGate ? undefined : this.nonOwningProviderWait(agent, err, trigger);
+            if (disposition && 'held' in disposition) {
               if (this.agents.get(agent.name) === agent && agent.streamId === myStreamId) this.eventGate?.onInferenceEnded(agent.name);
+              this.endHeldTurnIfStopping(agent, this.providerAdmissionClosed);
               break;
             }
 
-            const action: ErrorAction = statedWait === 'fail' ? { retry: false } : this.errorPolicy.onInferenceError(err, agent.name, attempt);
+            const action: ErrorAction = disposition && 'ends' in disposition ? { retry: false }
+              : disposition && 'sleepMs' in disposition ? { retry: true, delayMs: disposition.sleepMs }
+                : this.errorPolicy.onInferenceError(err, agent.name, attempt);
             if (action.retry) {
               // A stop made during the wait reaches no stream: the check after
               // the wait ends the turn, as the guard's check after its wait
@@ -19596,7 +20455,9 @@ export class AgentFramework {
               const retryWindow: CheckWindow = { abandoned: false };
               this.checkAhead.set(agent, retryWindow);
               // A policy's delay can be a provider's retry-after: wait all of it.
-              await this.waitForRetry(action.delayMs, retryWindow);
+              // A storm's sleep follows the storm (sleepInStorm).
+              if (disposition && 'sleepMs' in disposition) await this.sleepInStorm(agent, retryWindow, disposition.sleepMs);
+              else await this.waitForRetry(action.delayMs, retryWindow, { agent, reason: 'retry', until: Date.now() + action.delayMs, said: { at: Date.now() } });
               if (this.checkAhead.get(agent) === retryWindow) this.checkAhead.delete(agent);
               // stop() ending the wait cancels the retry (this frame's finally
               // clears the token); it is never permission to retry at once.
@@ -19619,7 +20480,14 @@ export class AgentFramework {
                   }
                   return;
                 }
-                await this.startAgentStream(agent, trigger, attempt + 1);
+                // A storm's sleep isn't one of the error policy's attempts, and
+                // its retry goes on with the turn, as the policy's do
+                // (continues). A run or fork disposed while it waited isn't started again:
+                // its name may be a resident's by now, or nobody's.
+                if (this.agents.get(agent.name) === agent) {
+                  const slept = disposition !== undefined && 'sleepMs' in disposition;
+                  await this.startAgentStream(agent, trigger, slept ? attempt : attempt + 1, false, slept);
+                }
               } else {
                 // The turn ends here, and its inference:failed doesn't say so,
                 // since a retry usually follows one: an inference:aborted
@@ -19639,7 +20507,7 @@ export class AgentFramework {
               this.settleAgent(agent.name, {
                 stopReason: 'exhausted',
                 speech: '',
-                ...(statedWait === 'fail' ? this.statedWaitNotSlept(err) : { error: err.message }),
+                ...(disposition && 'ends' in disposition ? disposition.ends : { error: err.message }),
               }, this.agents.get(agent.name) === agent && agent.streamId === myStreamId ? streamRouting : undefined, streamRouting);
               this.emitTrace({
                 type: 'inference:exhausted',
@@ -19943,25 +20811,37 @@ export class AgentFramework {
       // while inference:failed is delivered finds no stream.
       agent.reset();
       if (ownsProviderGate && this.holdProviderAcceleration(agent, err, trigger)) {
+        // Read as the installer answered: a stop() a listener of the failure
+        // makes later ends the turn in the hold itself.
+        const stopping = this.providerAdmissionClosed;
         this.emitTrace({ type: 'inference:failed', agentName: agent.name, error: err.message, stack: err.stack });
+        this.endHeldTurnIfStopping(agent, stopping);
         logStream({ success: false,
-          error: `Provider acceleration cooldown: ${err.message}`,
+          error: `${stopping ? 'Framework stopping' : 'Provider acceleration cooldown'}: ${err.message}`,
           request: compiledRequest ?? { note: 'streaming request rate-limited' }, durationMs });
-        this.abandonAgentScripts(agent.name, 'provider acceleration cooldown', streamRouting);
+        this.abandonAgentScripts(agent.name, stopping ? 'the framework is stopping' : 'provider acceleration cooldown', streamRouting);
         lifecyclePhase = 'failed'; agent.reset(); if (this.agents.get(agent.name) === agent && agent.streamId === myStreamId) this.eventGate?.onInferenceEnded(agent.name);
         return;
       }
       // The same rule for a turn that doesn't own provider admission as at
       // the other two failure sites: a conversation agent's stated wait is
-      // recorded and its turn held; an ephemeral run whose wait it won't sleep
-      // says why it ends.
-      const statedWait = ownsProviderGate ? undefined : this.nonOwningProviderWait(agent, err, trigger);
-      if (statedWait === 'held') {
+      // recorded and its turn held, as it is in a capacity storm; an
+      // ephemeral run whose wait it won't sleep says why it ends. Nothing is
+      // retried at this site, so an ephemeral run's storm sleep isn't taken
+      // here: the run ends with the failure, as it did before storms, and
+      // nothing is charged to its storm allowance, which counts only sleeps
+      // taken. (A membrane stream reports a provider's failure as an error
+      // event, never as a throw, so only a stream of another make throws one
+      // here.)
+      const disposition = ownsProviderGate ? undefined : this.nonOwningProviderWait(agent, err, trigger);
+      if (disposition && 'held' in disposition) {
+        const stopping = this.providerAdmissionClosed;
         this.emitTrace({ type: 'inference:failed', agentName: agent.name, error: err.message, stack: err.stack });
+        this.endHeldTurnIfStopping(agent, stopping);
         logStream({ success: false,
-          error: `Provider wait: ${err.message}`,
+          error: `${stopping ? 'Framework stopping' : 'Provider wait'}: ${err.message}`,
           request: compiledRequest ?? { note: 'streaming request rate-limited' }, durationMs });
-        this.abandonAgentScripts(agent.name, 'provider wait', streamRouting);
+        this.abandonAgentScripts(agent.name, stopping ? 'the framework is stopping' : 'provider wait', streamRouting);
         lifecyclePhase = 'failed'; agent.reset(); if (this.agents.get(agent.name) === agent && agent.streamId === myStreamId) this.eventGate?.onInferenceEnded(agent.name);
         return;
       }
@@ -19974,7 +20854,7 @@ export class AgentFramework {
       this.settleAgent(agent.name, {
         stopReason: 'exhausted',
         speech: '',
-        ...(statedWait === 'fail' ? this.statedWaitNotSlept(err) : { error: err.message }),
+        ...(disposition && 'ends' in disposition ? disposition.ends : { error: err.message }),
       }, streamRouting);
       this.emitTrace({
         type: 'inference:exhausted',
@@ -23697,6 +24577,28 @@ export class AgentFramework {
       at: new Date().toISOString(),
       uptimeSec: Math.round(process.uptime()),
       gate: this.eventGate?.inferenceDiagnostics() ?? null,
+      /** Capacity storms (overloaded 529s on turn calls) holding every
+       *  agent on their model: the step, when the next held agent tries
+       *  (the earliest end among the holds on the model and the runs asleep
+       *  in it; null while none has one), and how many agents' turns are
+       *  held on the model (by the storm, or a stated wait that ends later)
+       *  or asleep in it. */
+      providerStorms: (this.providerStorms?.list() ?? []).map((storm) => {
+        const ends = [
+          ...[...this.providerAccelerationCooldowns.values()].filter((c) => c.waitModel === storm.model).map((c) => c.until),
+          ...[...this.stormSleepers.values()].filter((sleeper) => sleeper.model === storm.model).map((sleeper) => sleeper.until),
+        ];
+        // A hold until released has no time of its own.
+        const timed = ends.filter((end) => Number.isFinite(end));
+        return {
+          model: storm.model,
+          since: new Date(storm.since).toISOString(),
+          stepMs: storm.stepMs,
+          nextRelease: timed.length === 0 ? null : new Date(Math.min(...timed)).toISOString(),
+          heldAgents: ends.length,
+          reason: storm.reason,
+        };
+      }),
       pendingRequests: this.pendingRequests.length,
       activeStreams: [...this.activeStreams.keys()],
       agents: [...this.agents.entries()].map(([name, agent]) => ({

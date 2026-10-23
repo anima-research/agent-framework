@@ -162,7 +162,7 @@ const fieldsOf = (value: unknown): Record<string, unknown> | undefined =>
   typeof value === 'object' && value !== null && !Array.isArray(value) ? value as Record<string, unknown> : undefined;
 const isText = (value: unknown): value is string => typeof value === 'string';
 /** A number a Date can hold (NaN and the infinities fail the comparison). */
-const isInstant = (value: unknown): value is number => typeof value === 'number' && Math.abs(value) <= MAX_DATE_MS;
+export const isInstant = (value: unknown): value is number => typeof value === 'number' && Math.abs(value) <= MAX_DATE_MS;
 const isDeadline = (value: unknown): value is number | null => value === null || isInstant(value);
 
 function isWait(value: unknown): value is ProviderWait {

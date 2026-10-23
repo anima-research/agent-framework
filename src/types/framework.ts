@@ -187,7 +187,15 @@ export interface FrameworkConfig {
   /** Custom inference policy */
   inferencePolicy?: InferencePolicy;
 
-  /** Custom error policy */
+  /**
+   * Custom error policy. A turn call's overloaded error (HTTP 529) doesn't
+   * reach it: the framework holds a capacity storm on the model for every
+   * agent calling it, and sleeps an ephemeral run's turn through it. The
+   * exception is a 529 from a call sent before a storm on the model armed
+   * and ended (a call on the model has answered since it was sent), with no
+   * newer storm standing: it arms nothing, a wait it states is held as any
+   * stated wait is, and otherwise it comes here.
+   */
   errorPolicy?: ErrorPolicy;
 
   /**
@@ -196,7 +204,13 @@ export interface FrameworkConfig {
    * organization-acceleration classification, for a persistent agent's
    * primary inference and for its auxiliary (compression) calls. Ephemeral
    * runs (subagents) and conversation forks are NOT covered: they have no
-   * provider-admission gate and keep the ordinary error policy. A hold parks the agent's provider
+   * provider-admission gate, and their failures take the error policy, with
+   * these exceptions. A capacity storm (an overloaded 529) holds a
+   * conversation fork as it holds a persistent agent, and sleeps an
+   * ephemeral run in its turn. A provider's stated wait holds a conversation
+   * fork as a persistent agent's is held, and ends an ephemeral run when it
+   * is longer than 10 minutes (a shorter one is the error policy's to
+   * sleep). A hold parks the agent's provider
    * admission (primary and auxiliary) instead of retrying, and — like the
    * built-in organization-acceleration cooldown — records no failed turn and
    * does not feed the hard-down streak. The motivating case is a subscription

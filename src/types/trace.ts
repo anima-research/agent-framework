@@ -106,6 +106,30 @@ export type TraceEvent =
       stack?: string;
     })
   | (TraceEventBase & {
+      /**
+       * The agent's turn is still waiting before it calls the provider again:
+       * asleep in a capacity storm, or on the wait its 529 stated once the
+       * storm has ended (`'capacity-storm'`), or waiting out the error
+       * policy's retry delay (`'retry'`), which a provider's stated wait can
+       * lengthen. An agent a storm or a provider wait holds at admission,
+       * with a new turn or its turn's continuation queued behind the hold,
+       * says nothing; a subagent is an ephemeral run, which sleeps in its
+       * turn instead. Emitted every 60 seconds while such a wait lasts and
+       * its end is ahead, a storm's step that re-times it included, and only
+       * while the agent is still the one registered under its name: one
+       * replaced or gone says nothing while it isn't. Never as it
+       * starts (the failure's `inference:failed` has just gone out), and
+       * never after the wait ends, by its time coming, a release, an abort, a
+       * stop or the run's end. It is there so a host watching for agents gone
+       * quiet can tell a waiting one from a stuck one.
+       */
+      type: 'inference:waiting';
+      agentName: string;
+      /** When the wait ends as it stands (epoch ms); absent for a wait with no end, or one too far off to be a date. */
+      until?: number;
+      reason: 'capacity-storm' | 'retry';
+    })
+  | (TraceEventBase & {
       type: 'inference:exhausted';
       agentName: string;
       /** The failure's message, bounded as every trace event's `error` is (2,000 characters). */

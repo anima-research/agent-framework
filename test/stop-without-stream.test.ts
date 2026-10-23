@@ -7,7 +7,9 @@
  * end the turn at its next check,
  * or where its hooks or compile fail, before it sends anything more,
  * through the terminal the same stop gets on a live stream. A stop made
- * where no check of a turn is ahead ends nothing.
+ * where no check of a turn is ahead, and no turn is on its way to its next
+ * start (a continuation, or a failed call's retry a provider hold keeps),
+ * ends nothing.
  */
 
 import { describe, it } from 'node:test';
@@ -1276,9 +1278,14 @@ describe('a stop while no turn is running', () => {
       framework.start();
       const agent = framework.getAgent('prime')!;
       framework.pushEvent({ type: 'external-message', source: 'test', content: 'hello', metadata: {}, triggerInference: true } as unknown as ProcessEvent);
-      await waitFor('the hold to park the turn', () => cooldowns.has('prime') && framework.getHostModeStatus().activeTurns === 0);
+      // The turn is alive while the hold keeps it for its retry; its frame has let go.
+      const tokens = (framework as unknown as { activeTurnTokens: Map<string, unknown> }).activeTurnTokens;
+      await waitFor('the hold to park the turn', () => cooldowns.has('prime') && !tokens.has('prime'));
+      assert.equal(framework.getHostModeStatus().activeTurns, 1, 'its turn is alive while the hold keeps it');
       assert.equal(membrane.calls.length, 1, 'the first request failed on the quota');
-      assert.equal(framework.abortInference('prime', 'user'), false, 'abortInference() reports no turn to stop while the hold parks it');
+      // The hold keeps the failed turn for its retry: the stop ends that turn
+      // (its retry dropped), and the message sent after it still gets its own.
+      assert.equal(framework.abortInference('prime', 'user'), true, 'abortInference() stops the turn the hold parks');
       agent.cancelStream();
       framework.pushEvent({ type: 'external-message', source: 'test', content: 'a message sent after the stop', metadata: {}, triggerInference: true } as unknown as ProcessEvent);
       await waitFor('the message sent after the stop to be answered',

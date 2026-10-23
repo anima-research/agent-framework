@@ -1782,6 +1782,52 @@ test('a wake parked on provider admission does not start after quiesce; it runs 
   });
 });
 
+test("a failed turn's retry parked on provider admission when a quiesce begins starts once the auxiliary ends: its turn is in flight", async () => {
+  const membrane = new MockMembrane();
+  membrane.pushResponse(createMockResponse([{ type: 'text', text: 'the retry' }]));
+  await withFramework(membrane, async (framework) => {
+    framework.start();
+    const internals = framework as unknown as {
+      withAuxiliaryAdmission<T>(agentName: string, run: () => Promise<T>): Promise<T>;
+      processInferenceRequests(): Promise<void>;
+      providerGates: Map<string, { primaryDepth: number; auxiliaryInFlight: number }>;
+      activeTurnTokens: Map<string, number>;
+      pendingRequests: object[];
+      failedTurnRetries: WeakSet<object>;
+    };
+    let releaseAux!: () => void;
+    const auxDone = internals.withAuxiliaryAdmission('agent', () =>
+      new Promise<void>((resolve) => { releaseAux = resolve; }));
+    await waitFor('auxiliary in flight', () => (internals.providerGates.get('agent')?.auxiliaryInFlight ?? 0) === 1);
+
+    // A failed turn's retry, queued at its hold's release, parks behind the
+    // auxiliary call.
+    const retry = { agentName: 'agent', reason: 'provider-acceleration-retry', source: 'framework', timestamp: Date.now() };
+    internals.failedTurnRetries.add(retry);
+    internals.pendingRequests.push(retry);
+    await internals.processInferenceRequests();
+    assert.equal(internals.providerGates.get('agent')?.primaryDepth, 1, 'admission owned');
+    assert.equal(internals.activeTurnTokens.size, 0, 'no turn token yet');
+
+    const status = await framework.quiesce({ reason: 'surgery', timeoutMs: 1_000 });
+    assert.equal(status.drained, false, 'its turn is in flight');
+    assert.deepEqual(status.activeTurnAgents, ['agent']);
+
+    // The auxiliary ends: the retry finishes its turn under the quiesce, as
+    // a continuation does, rather than going back to the queue.
+    const errors = captureErrors();
+    try {
+      releaseAux();
+      await auxDone;
+      await waitFor('the retry to run under the quiesce', () => membrane.calls.length === 1);
+    } finally { errors.restore(); }
+    assert.ok(!errors.lines.some((line) => line.includes('host quiesced while parked')), 'started from its park, not requeued');
+    assert.equal(framework.getHostModeStatus().quiesced, true);
+    await waitFor('drained once it finished', () => framework.getHostModeStatus().drained);
+    await framework.resume();
+  });
+});
+
 test('quiesce survives a historical rollback + restart (host mode lives outside branch history)', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'host-quiesce-rollback-'));
   const storePath = join(dir, 'store');

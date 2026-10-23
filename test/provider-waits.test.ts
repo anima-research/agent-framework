@@ -979,14 +979,16 @@ test("an ephemeral run's cap includes its edge: a stated wait of exactly 600 s i
     const { fw, internal } = await framework(path, new WaitingMembrane(0, undefined));
     const runs = internal as unknown as {
       ephemeralRuns: Map<string, unknown>;
-      nonOwningProviderWait(agent: unknown, error: Error): 'held' | 'fail' | undefined;
+      nonOwningProviderWait(agent: unknown, error: Error): { held: true } | { sleepMs: number } | { ends: { error: string } } | undefined;
     };
     const name = 'zz-ephemeral-edge';
     try {
       const created = await fw.createEphemeralAgent({ name, model: 'zz-model', systemPrompt: 'Do the task.' });
       runs.ephemeralRuns.set(name, {});
       assert.equal(runs.nonOwningProviderWait(created.agent, rateLimited(600_000)), undefined, 'exactly the cap: slept by the error policy');
-      assert.equal(runs.nonOwningProviderWait(created.agent, rateLimited(600_001)), 'fail', 'past the cap: the run ends now');
+      const past = runs.nonOwningProviderWait(created.agent, rateLimited(600_001));
+      assert.match(past && 'ends' in past ? past.ends.error : '', /asked to wait 601 s; an ephemeral run doesn't sleep a stated wait longer than 600 s/,
+        'past the cap: the run ends now, saying why');
     } finally { runs.ephemeralRuns.delete(name); await fw.stop(); log.restore(); }
   });
 });
@@ -2143,7 +2145,7 @@ test("a conversation agent's turn is held, sending nothing, when its own wait is
   });
 });
 
-test("a stop made while that hold is reported finds nothing to stop: abortInference() from a listener of its inference:failed reports false", async (t) => {
+test("a stop made while that hold is reported ends the held turn: abortInference() from a listener of its inference:failed takes it, and nothing is sent", async (t) => {
   await withStoreDir(async (path) => {
     holdClock(t);
     const log = silence();
@@ -2152,8 +2154,9 @@ test("a stop made while that hold is reported finds nothing to stop: abortInfere
     const { fw, internal } = await framework(path, membrane);
     record = () => internal.providerWaits.set('resident', 'zz-model', 400, 'zz recorded while the turn compiled');
     // The compiled stream is cancelled, and the start's window closed, before
-    // the hold is reported: a host's listener of that report finds no turn
-    // it could stop, rather than a stop it takes and the hold then loses.
+    // the hold is reported: a host's listener of that report finds the turn
+    // the hold keeps for its retry, and its stop ends it there, rather than a
+    // stop the hold then loses.
     let taken: boolean | undefined;
     fw.onTrace((event) => {
       if (event.type === 'inference:failed' && (event as { agentName?: string }).agentName === 'resident' && taken === undefined) {
@@ -2162,9 +2165,9 @@ test("a stop made while that hold is reported finds nothing to stop: abortInfere
     });
     try {
       await conversationTurn(fw, internal as NonOwning, 'zz-first');
-      assert.equal(taken, false, 'abortInference took no stop');
+      assert.equal(taken, true, 'abortInference took the stop');
       assert.equal(membrane.sent, 0, 'nothing is sent into the wait');
-      assert.equal(internal.providerAccelerationCooldowns.get('resident')?.heldRequests.length, 1, 'the hold has the turn');
+      assert.equal(internal.providerAccelerationCooldowns.get('resident')?.heldRequests.length, 0, 'the stop took the turn from the hold');
     } finally { await fw.stop(); log.restore(); }
   });
 });
@@ -2318,7 +2321,7 @@ test('from another copy of membrane, a wait is stated only as a number, as the d
     const paths = internal as unknown as {
       ephemeralRuns: Map<string, unknown>;
       recordProviderWait(agentName: string, model: string, error: Error): unknown;
-      nonOwningProviderWait(agent: unknown, error: Error): 'held' | 'fail' | undefined;
+      nonOwningProviderWait(agent: unknown, error: Error): { held: true } | { sleepMs: number } | { ends: { error: string } } | undefined;
     };
     const name = 'zz-ephemeral-unstated';
     try {
@@ -2331,7 +2334,8 @@ test('from another copy of membrane, a wait is stated only as a number, as the d
       }
       assert.deepEqual(fw.providerWaitSnapshot('resident'), [], 'nothing is held, least of all until released');
       assert.ok(paths.recordProviderWait('resident', 'zz-model', foreignRateLimit(60_000)), 'a number is a stated wait');
-      assert.equal(paths.nonOwningProviderWait(created.agent, foreignRateLimit(1_200_000)), 'fail', 'and past the cap ends the run');
+      const past = paths.nonOwningProviderWait(created.agent, foreignRateLimit(1_200_000));
+      assert.match(past && 'ends' in past ? past.ends.error : '', /asked to wait 1200 s/, 'and past the cap ends the run, saying why');
     } finally { paths.ephemeralRuns.delete(name); await fw.stop(); log.restore(); }
   });
 });

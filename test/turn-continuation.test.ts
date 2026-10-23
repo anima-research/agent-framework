@@ -383,6 +383,25 @@ describe('a turn whose continuation is on its way', () => {
     }
   });
 
+  it("with an EventGate, a message arriving while the continuation is held is delivered, and is in the continuation's request", async () => {
+    const h = await restartTurn({ wait: true, gate: true });
+    try {
+      await waitFor('the continuation to be held, its frame gone', () => heldForWait(h.framework) && frameLetGo(h.framework));
+      assert.equal(gateInferring(h.framework), false, 'nothing infers while it is held');
+      // The gate buffers nothing behind the held continuation: the message is
+      // delivered and stored while it waits.
+      pushMessage(h.framework, MID);
+      await waitFor('the message to be stored while the continuation is held', () => storedTexts(h.framework).includes(MID));
+      assert.equal(heldForWait(h.framework), true, 'still held');
+      h.framework.releaseProviderWait('prime');
+      await waitFor('the continuation to run once the wait ends', () => h.membrane.calls.length >= 2);
+      assert.ok(requestTexts(h.membrane.calls[1]).includes(MID), "the continuation's request carries the message");
+      await waitFor('the turn to end', () => h.framework.getHostModeStatus().drained);
+    } finally {
+      await h.cleanup();
+    }
+  });
+
   it("is alive while a scheduler pass holds the continuation, awaiting another agent's start", async () => {
     const { h, unblock } = await passHoldingContinuation();
     try {
@@ -686,7 +705,10 @@ describe('a turn whose continuation is dropped ends there', () => {
     });
     try {
       await waitFor('the continuation to be held, its frame gone', () => heldForWait(h.framework) && frameLetGo(h.framework));
-      assert.equal(gateInferring(h.framework), true, "the restart kept the gate's window for its continuation");
+      // While it is held nothing infers, so its window is closed: held open, it
+      // would keep every agent's gate events waiting out the hold. Its start
+      // takes the window again.
+      assert.equal(gateInferring(h.framework), false, "the held continuation closed the gate's window");
       h.framework.releaseProviderWait('prime');
       await waitFor('the turn to end', () => h.framework.getHostModeStatus().activeTurns === 0 && h.endLines().length > 0);
       assert.equal(h.membrane.calls.length, 1, 'the continuation never started');

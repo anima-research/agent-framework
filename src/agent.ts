@@ -33,6 +33,12 @@ export interface ActivationRequestOptions {
   /** A request that will never be sent (a preview): compile it as a dry
    *  run (see `compileWithInjections` for what that leaves alone). */
   dryRun?: boolean;
+  /** `false` asks membrane to retry none of the stream's calls inside them.
+   *  The framework passes it for every turn it drives, whose failures its
+   *  storm hold, provider waits and error policy retry, each seeing every
+   *  failure. Left out, membrane's own retries apply, as for an Agent driven
+   *  without the framework. */
+  membraneRetries?: false;
 }
 
 export interface StartStreamResult {
@@ -1297,8 +1303,10 @@ export class Agent {
   }
 
   /**
-   * Start a yielding stream for inference.
-   * Returns the stream — the caller (framework) iterates it.
+   * Start a yielding stream for inference; the caller iterates it. Its calls
+   * keep membrane's own retries: the framework starts its turns through
+   * startStreamWithInjections with `membraneRetries: false`, since it
+   * retries their failures itself.
    */
   async startStream(
     availableTools: ToolDefinition[],
@@ -1595,6 +1603,12 @@ export class Agent {
       emitTokens: true,
       emitBlocks: false,
       emitUsage: true,
+      // A turn the framework drives has its failures retried by the framework
+      // (ActivationRequestOptions.membraneRetries): membrane retries none
+      // inside the call, which would hide each failure from the storm hold,
+      // the provider waits and the error policy. An Agent driven without the
+      // framework keeps membrane's own retries.
+      ...(options.membraneRetries === false ? { retry: false } : {}),
       // Retry a content-policy refusal at the provider seam rather than at
       // the framework level: membrane replays the SAME request immediately
       // (cache-warm), where a framework-level requeue would recompile and
@@ -1832,6 +1846,10 @@ export class Agent {
     /** Compiles the context into a request again, for the guard's retry. */
     reassemble: () => Promise<NormalizedRequest>,
   ): Promise<InferenceResult> {
+    // No error policy or storm sees Agent.runInference's calls, so they keep
+    // membrane's own retries (a turn the framework drives asks for none:
+    // ActivationRequestOptions.membraneRetries). The tool-result guard's second call below
+    // recovers withheld results; it is no failure's retry.
     let response = signal?.aborted
       ? { aborted: true as const, reason: 'user' as const }
       : await this.membrane.stream(request, { signal });
