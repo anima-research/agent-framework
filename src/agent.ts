@@ -1,9 +1,10 @@
-import type { Membrane, NormalizedMessage, NormalizedRequest, ContentBlock, YieldingStream } from '@animalabs/membrane';
+import type { Membrane, NormalizedMessage, NormalizedRequest, ContentBlock, ThinkingBindingEntry, YieldingStream } from '@animalabs/membrane';
 import { isAbortedResponse } from '@animalabs/membrane';
 import { createHash } from 'node:crypto';
 import type { CacheWireReceipt, KvUnifiedRequestHooks } from './kv-unified-wire.js';
 import { ToolResultGuard } from './tool-result-guard.js';
 import { withoutTokenEstimates } from './thinking-token-stamp.js';
+import { placeThinkingDrops, type CompiledForRequest, type PlacedDrop } from './thinking-drops.js';
 import { injectionsAsStored } from './text-as-stored.js';
 import { assertBooleanSetting, holdsSettings, kindOf } from './config-checks.js';
 import {
@@ -69,6 +70,10 @@ export interface StartStreamResult {
   continuePrompt?: RequestOnlyPrompt;
   takeKvSubmission?: () => { submissionId: string; wireReceipt: CacheWireReceipt } | undefined;
   drainKvSubmissionIds?: () => string[];
+  /** Where each block a call of this stream reports the provider dropped came from: a stored reply this
+   *  request's compile rendered, a round the stream appended, or neither (placeThinkingDrops). Optional, so a
+   *  stand-in for the stream start needn't supply it; without it, no drop can be placed. */
+  placeDrops?: (entries: readonly ThinkingBindingEntry[]) => PlacedDrop[];
 }
 import type {
   ContextManager,
@@ -1466,7 +1471,7 @@ export class Agent {
     budget?: TokenBudget,
     compressionTools: ToolDefinition[] = availableTools,
     options: ActivationRequestOptions = {},
-  ): Promise<{ request: NormalizedRequest; continuePrompt?: RequestOnlyPrompt }> {
+  ): Promise<{ request: NormalizedRequest; continuePrompt?: RequestOnlyPrompt; compiled: CompiledForRequest }> {
     // Unstored, so they leave for the request here (text-as-stored.ts), the
     // layout hash below included.
     injections = injectionsAsStored(injections);
@@ -1495,7 +1500,7 @@ export class Agent {
           system: this.buildSystemPrompt(prospectiveSystemInjections),
         })
       : undefined;
-    const compiled = await this.compileWithInjections(
+    const compiledResult = await this.compileWithInjections(
       budget,
       injections,
       immutablePrefixHash || options.dryRun
@@ -1505,10 +1510,14 @@ export class Agent {
           }
         : undefined,
     );
-    let { messages, systemInjections } = compiled;
+    let { messages } = compiledResult;
+    const { systemInjections } = compiledResult;
     // context-manager 0.20.1's field, read structurally so this compiles
     // against 0.20.0 too, whose compiles carry none.
-    const { renderStats } = compiled as typeof compiled & { renderStats?: RenderStats };
+    const { renderStats } = compiledResult as typeof compiledResult & { renderStats?: RenderStats };
+    // What the request is built from, as the compile returned it: a block the provider drops is found again in
+    // it, through the copies below, by its signature (placeThinkingDrops).
+    const compiled: CompiledForRequest = { messages: compiledResult.messages, ...(compiledResult.provenance ? { provenance: compiledResult.provenance } : {}) };
 
     // Sanitize: strip empty/whitespace text blocks and drop messages left with
     // no content. The Anthropic API rejects empty text blocks with 400
@@ -1580,7 +1589,7 @@ export class Agent {
       ...(kvUnified ? { cacheMarkers: 'cm-owned' as const } : {}),
     };
     if (options.dryRun) dryCompileStats.set(request, renderStats);
-    return { request, ...(continuePrompt ? { continuePrompt } : {}) };
+    return { request, ...(continuePrompt ? { continuePrompt } : {}), compiled };
   }
 
   /**
@@ -1715,7 +1724,7 @@ export class Agent {
     // Compiled only once each withheld stub's annotation has finished,
     // including one that began during the compile, and after a stub edit that
     // failed has been retried (see afterAnnotations).
-    const { request, continuePrompt } = await this.toolResultGuard.afterAnnotations(
+    const { request, continuePrompt, compiled } = await this.toolResultGuard.afterAnnotations(
       () => this.assembleActivationRequest(availableTools, injections, budget, compressionTools, options));
     request.messages = this.toolResultGuard.prepareRequest(request.messages, true);
 
@@ -1772,6 +1781,8 @@ export class Agent {
       stream,
       request,
       ...(continuePrompt ? { continuePrompt } : {}),
+      // Read against the messages the stream sends, which membrane's report indexes (RoundReport's coordinates).
+      placeDrops: (entries) => placeThinkingDrops(entries, request.messages, compiled),
       ...(kvEnabled
         ? {
             takeKvSubmission: () => kvQueue.shift(),
