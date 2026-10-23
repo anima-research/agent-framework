@@ -1478,6 +1478,35 @@ describe("a stop while the guard's refusal retry waits", () => {
     }
   });
 
+  it("a quiesce's abandon whose cancel of the finished stream throws still ends the turn at the guard's check, listing nothing", async () => {
+    const g = await guardRetryWaiting();
+    const lines: string[] = [];
+    const original = console.error;
+    console.error = (...args: unknown[]) => { lines.push(args.map(String).join(' ')); };
+    try {
+      const held = g.agent.state as { stream?: { cancel(): void } };
+      assert.ok(held.stream, "the agent holds the round's finished stream while the guard waits");
+      let cancels = 0;
+      held.stream.cancel = () => { cancels++; throw new Error('zz the stream refused its cancel'); };
+      const reached = abandonReached(g.framework);
+      const quiescing = g.framework.quiesce({ timeoutMs: 50, abandon: true });
+      await within('the abandon to reach the turn', reached);
+      assert.equal(cancels, 1, 'the abandon tried to cancel the finished stream');
+      g.releasePost();
+      const status = await within('the quiesce to return', quiescing);
+      assert.equal(status.quiesced, true);
+      assert.equal(status.unabandonable, undefined, 'nothing listed: the check ended the turn');
+      endedWithoutRetry(g, 'quiesce_abandoned', null);
+      assert.ok(lines.some((l) => /^\[host-mode\] abandoning in-flight turn for assistant: its stream's cancel threw, so the turn ends at its next check instead: /.test(l)),
+        lines.join('\n'));
+      assert.ok(!lines.some((l) => l.startsWith('[host-mode] cannot abandon turn for assistant')), 'and not that it cannot');
+      await g.framework.resume();
+    } finally {
+      console.error = original;
+      await g.cleanup();
+    }
+  });
+
   it('stop() ends the turn as a shutdown', async () => {
     const g = await guardRetryWaiting();
     // The store closes with stop(), so the rows are read as they are written.

@@ -5,4 +5,5 @@
   cancelled.
   A restart boundary reached while the framework is stopping emits no
   `inference:stream_restarted` and queues no continuation: the turn ends as
-  `shutdown`.
+  `shutdown` when the stream's cancel goes through, and a cancel that throws
+  leaves the turn going for a caller to stop.
