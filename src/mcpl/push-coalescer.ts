@@ -210,7 +210,16 @@ interface SubjectState<E> {
   touchedAt: number;
 }
 
-interface ReceiptEntry { result: PushEventResult; at: number; committed: boolean; firstView?: true }
+interface ReceiptEntry {
+  result: PushEventResult;
+  at: number;
+  committed: boolean;
+  firstView?: true;
+  /** Set while the receipt's record isn't written (recordReceipt failed):
+   *  what a rewrite keeps from the admission. The rest of the record is the
+   *  subject's state when it's written. */
+  unwritten?: { subject: string; born?: SubjectState<unknown>['history'] };
+}
 
 export interface CoalescingSnapshot {
   version: 1;
@@ -298,11 +307,13 @@ export interface CoalescerHost<E> {
    *  be recoverable before the RPC is issued, §3.2). Throws on failure. */
   saveNow?(snapshot: CoalescingSnapshot): void;
   /** Persist one receipt now, before the acceptance is acknowledged. Throws
-   *  on failure, which fails the acceptance (the producer retries). */
+   *  on failure, which fails that answer: the receipt is kept unwritten, and
+   *  the producer's retry writes it again rather than admitting it again. */
   recordReceipt?(record: CoalescingReceiptRecord): void;
   /** One call per ADMITTED occurrence (never for a producer retry the receipt
-   *  deduplicates), after its receipt is recorded. Observation only: a throw
-   *  is contained here and never fails the acceptance. */
+   *  deduplicates), after its effects, whether or not its receipt could be
+   *  written. Observation only: a throw is contained here and never fails the
+   *  acceptance. */
   accepted?(occurrence: CoalescedOccurrence<E>): void;
   /** Make every write so far DURABLE (an fsync; the coalescer requests each
    *  commit under its lock, so no two acceptances share one).
@@ -540,10 +551,20 @@ export class PushCoalescer<E = unknown> {
     return entry;
   }
 
-  /** Acknowledge a receipt: durable first. A receipt whose commit failed is
-   *  committed now (no effects are repeated); if that fails again, so does
-   *  the acknowledgement, and the producer retries once more. */
+  /** Acknowledge a receipt: durable first. A receipt whose record couldn't be
+   *  written is written now, and one whose commit failed is committed now (no
+   *  effects are repeated); if either fails again, so does the
+   *  acknowledgement, and the producer retries once more. */
   private async acknowledge(key: string, entry: ReceiptEntry, subject: string, eventId: string): Promise<PushEventResult> {
+    if (entry.unwritten) {
+      try {
+        this.recordReceipt(key, entry, entry.unwritten);
+      } catch (error) {
+        this.host.audit({ kind: 'persist-failed', subject, eventId, error: String(error) });
+        throw new CoalesceError('eventId', 'host could not persist the acceptance; retry', -32000);
+      }
+      delete entry.unwritten;
+    }
     if (!entry.committed) {
       try {
         await this.host.commit?.();
@@ -605,19 +626,17 @@ export class PushCoalescer<E = unknown> {
     state.touchedAt = this.now();
     const result: PushEventResult = { accepted: true, coalesce: { outcome, ...(priorEventId ? { priorEventId } : {}) } };
     const receiptKey = coalescingReceiptKey(occurrence.serverId, occurrence.binding, occurrence.eventId);
-    const entry: ReceiptEntry = { result: structuredClone(result), at: this.now(), committed: false, ...(this.deliveredFirstView ? { firstView: true as const } : {}) };
-    try {
-      this.host.recordReceipt?.({
-        key: receiptKey, result: entry.result, at: entry.at, subject, ...(born ? { born } : {}),
-        ...(state.firstViewEnded ? { firstViewEnded: true as const } : {}),
-        batch: state.batch ? structuredClone({ latest: state.batch.latest as CoalescedOccurrence<unknown>, notices: state.batch.notices, dropped: state.batch.dropped }) : null,
-      });
-    } catch (error) {
-      // Not acknowledged: the work would be lost while its receipt suppressed
-      // a retry. The producer retries within the window.
-      this.host.audit({ kind: 'persist-failed', subject, eventId: occurrence.eventId, error: String(error) });
-      throw new CoalesceError('eventId', 'host could not persist the acceptance; retry', -32000);
-    }
+    // The effects are done, so the receipt is kept whatever its record's
+    // write does: a retry is answered from it, never admitted again (RFC-006
+    // §3.1). Its record is written and made durable before an acknowledgement
+    // (acknowledge), by this answer or a retry's. While this process lives,
+    // the in-memory receipt deduplicates a retry, which writes or commits
+    // what failed; after a kill nothing of it exists and the retry is a fresh
+    // acceptance.
+    const entry: ReceiptEntry = {
+      result: structuredClone(result), at: this.now(), committed: false, unwritten: { subject, ...(born ? { born } : {}) },
+      ...(this.deliveredFirstView ? { firstView: true as const } : {}),
+    };
     this.receipts.set(receiptKey, entry);
     try {
       this.host.accepted?.(occurrence);
@@ -626,10 +645,21 @@ export class PushCoalescer<E = unknown> {
     }
     this.prune();
     this.persist();
-    // Written but not yet durable: the in-memory receipt deduplicates a retry
-    // while this process lives, and the retry commits it (acknowledge); after
-    // a kill nothing of it exists and the retry is a fresh acceptance.
     return this.acknowledge(receiptKey, entry, subject, occurrence.eventId);
+  }
+
+  /** Write a receipt's record: what the admission fixed (`fixed`), with the
+   *  subject's first-view end and pending batch as they are now. A record
+   *  written by a retry follows any written since its admission, and records
+   *  replay in order, so it carries the batch the subject has now, not the
+   *  one it had then. Throws when the host's write does. */
+  private recordReceipt(key: string, entry: ReceiptEntry, fixed: { subject: string; born?: SubjectState<unknown>['history'] }): void {
+    const state = this.subjects.get(fixed.subject);
+    this.host.recordReceipt?.({
+      key, result: entry.result, at: entry.at, subject: fixed.subject, ...(fixed.born ? { born: fixed.born } : {}),
+      ...(state?.firstViewEnded ? { firstViewEnded: true as const } : {}),
+      batch: state?.batch ? structuredClone({ latest: state.batch.latest as CoalescedOccurrence<unknown>, notices: state.batch.notices, dropped: state.batch.dropped }) : null,
+    });
   }
 
   private subjectFor(subject: string, occurrence: CoalescedOccurrence<E>): SubjectState<E> {

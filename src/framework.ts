@@ -13519,7 +13519,9 @@ export class AgentFramework {
       recordReceipt: (record) => {
         // Written now, not at the throttled flush: an acknowledged acceptance
         // must not lose its receipt, the subject's birth, or (deferred) the
-        // accepted work itself to a crash. A failure here fails the acceptance.
+        // accepted work itself to a crash. A failure here fails the answer:
+        // the coalescer keeps the receipt, and the producer's retry writes it
+        // again.
         this.coalescingRecentReceipts.push(record);
         this.store.setStateJson(COALESCING_RECENT_ID, this.coalescingRecentReceipts);
       },

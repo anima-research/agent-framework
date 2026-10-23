@@ -842,6 +842,91 @@ test('R10: a retry after a failed commit is acknowledged only once the commit su
   assert.equal(f.framework.getAgent('agent')!.getContextManager().getAllMessages().filter((m) => JSON.stringify(m.content).includes('other')).length, 1, 'plain: delivered exactly once across the failed and successful acknowledgement');
 });
 
+/** Make the host's next `times` writes of the coalescing receipt records
+ *  fail, as a full disk would; returns how many are still to fail. */
+function failReceiptWrites(f: Awaited<ReturnType<typeof fixture>>, times: number): () => number {
+  const store = (f.framework as unknown as { store: { setStateJson: (id: string, value: unknown) => void } }).store;
+  const orig = store.setStateJson.bind(store);
+  let left = times;
+  store.setStateJson = (id, value) => {
+    if (id === 'mcpl/coalescing-recent' && left > 0) { left--; throw new Error('ENOSPC simulated'); }
+    orig(id, value);
+  };
+  return () => left;
+}
+
+/** How many of the agent's messages hold `text`. */
+function copies(f: Awaited<ReturnType<typeof fixture>>, text: string): number {
+  return f.framework.getAgent('agent')!.getContextManager().getAllMessages().filter((m) => JSON.stringify(m.content).includes(text)).length;
+}
+
+/** A producer's first send and five resends of one event (discord-mcpl's
+ *  schedule, less its waits), the agent taking a turn after each, so a copy
+ *  delivered again would be read rather than replaced. Returns each answer. */
+async function sendAndResend(f: Awaited<ReturnType<typeof fixture>>, send: () => Promise<any>): Promise<any[]> {
+  const answers: any[] = [];
+  for (let attempt = 0; attempt < 6; attempt++) {
+    answers.push(await send());
+    await f.framework.runUntilIdle();
+  }
+  return answers;
+}
+
+const failedReceiptWrite = {
+  'a plain push': {
+    text: 'plain_copy', before: async () => {},
+    send: (f: Awaited<ReturnType<typeof fixture>>) => f.send('push/event', f.params('e1', 'plain_copy', { initial: true })),
+    first: { accepted: true, coalesce: { outcome: 'first' } },
+  },
+  'a coalesced channel message': {
+    text: 'chan_copy', before: async (f: Awaited<ReturnType<typeof fixture>>) => { await f.register(); },
+    send: (f: Awaited<ReturnType<typeof fixture>>) => f.send('channels/incoming', { messages: [f.channel('c1', 'chan_copy', { initial: true })] }),
+    first: { results: [{ messageId: 'm', accepted: true, coalesce: { outcome: 'first' } }] },
+  },
+  'a deferred notice': {
+    text: 'document_diff', before: async () => {},
+    send: (f: Awaited<ReturnType<typeof fixture>>) => f.send('push/event', f.params('d1', 'deferred_copy', { deferred: true, initial: true })),
+    first: { accepted: true, coalesce: { outcome: 'first' } },
+  },
+  'a deletion notice of a read message': {
+    text: 'deletion_notice',
+    before: async (f: Awaited<ReturnType<typeof fixture>>) => {
+      await f.send('push/event', f.params('r0', 'original_text', { initial: true }));
+      await f.framework.runUntilIdle();
+    },
+    send: (f: Awaited<ReturnType<typeof fixture>>) => f.send('push/event', f.params('r1', 'deletion_notice', { retract: true })),
+    first: { accepted: true, coalesce: { outcome: 'noted', priorEventId: 'r0' } },
+  },
+};
+
+for (const [what, c] of Object.entries(failedReceiptWrite)) test(`a failed receipt write keeps the receipt: ${what} resent five times reaches the agent once, and every resend answers the first result`, async (t) => {
+  const f = await fixture(); t.after(f.close);
+  f.alwaysRespond();
+  await c.before(f);
+  const left = failReceiptWrites(f, 1);
+  const [first, ...resends] = await sendAndResend(f, () => c.send(f));
+  assert.equal(left(), 0, 'the write failed once');
+  if ('results' in c.first) assert.equal(first.result?.results?.[0]?.accepted, false, "the channel lane's refusal of the first send");
+  else assert.equal(first.error?.code, -32000, 'the first send is answered -32000');
+  for (const resend of resends) assert.deepEqual(resend.result, c.first, 'a resend answers the first result');
+  assert.equal(copies(f, c.text), 1, 'one copy reached the agent');
+  if (what === 'a deferred notice') assert.equal(f.renders.length, 1, 'one render');
+});
+
+test('a receipt write that fails on the send and every resend repeats no effect, and the first resend after it works answers the first result', async (t) => {
+  const f = await fixture(); t.after(f.close);
+  f.alwaysRespond();
+  failReceiptWrites(f, 6);
+  const send = () => f.send('push/event', f.params('e1', 'plain_copy', { initial: true }));
+  const answers = await sendAndResend(f, send);
+  for (const answer of answers) assert.equal(answer.error?.code, -32000);
+  assert.equal(copies(f, 'plain_copy'), 1, 'one copy, read, though every answer failed');
+  const after = await send();
+  assert.deepEqual(after.result, { accepted: true, coalesce: { outcome: 'first' } });
+  await f.framework.runUntilIdle();
+  assert.equal(copies(f, 'plain_copy'), 1);
+});
+
 /** Hold the host's next durability commit; returns a release function once it is held. */
 function holdNextCommit(f: Awaited<ReturnType<typeof fixture>>): Promise<() => void> {
   const internals = f.framework as unknown as { commitCoalescingDurable: () => Promise<void> };
@@ -3426,4 +3511,41 @@ test('#157: a channel edit of a message the agent has read leaves context.incomi
   const edit = await f.send('channels/incoming', { messages: [{ ...f.channel('a2', 'question_fixed', {}, 'other', 'ma'), tags: ['chat:edited'] }] });
   assert.equal(edit.result.results[0].coalesce.outcome, 'appended', 'the agent had read the question');
   assert.equal(incomingAnchor(f)?.messageId, 'mb', 'the marker left the anchor at the later message');
+});
+
+test("a receipt whose write failed is written by the producer's retry with the subject's batch as it is then, so records restored after a crash don't bring back a batch already rendered", async () => {
+  const state = { shown: false, read: false };
+  const p = firstViewProbe(state, { held: [] });
+  const records: CoalescingReceiptRecord[] = [];
+  let failing = 1;
+  p.host.recordReceipt = (record) => {
+    if (failing > 0) { failing--; throw new Error('ENOSPC simulated'); }
+    records.push(structuredClone(record));
+  };
+  await assert.rejects(p.coalescer.accept(p.occurrence('n1', { deferred: true, initial: true })), (error: { code?: number }) => error.code === -32000);
+  // The accepted notice renders before the producer's retry comes.
+  await p.coalescer.assemble('agent');
+  assert.deepEqual(p.delivered, [{ eventId: 'n1', firstView: true }]);
+  const retry = await p.coalescer.accept(p.occurrence('n1', { deferred: true, initial: true }));
+  assert.deepEqual(retry, { accepted: true, coalesce: { outcome: 'first' } }, "the retry answers the admission's result");
+  assert.equal(records.length, 1, 'the retry wrote the record');
+  assert.equal(records[0].batch, null, 'with the batch the subject has now: none, since it rendered');
+  // A crash before the throttled snapshot: only the record survives.
+  const restored = new PushCoalescer<null>(p.host);
+  restored.restoreReceipts(records);
+  await restored.assemble('agent');
+  assert.equal(p.delivered.length, 1, 'the rendered notice is not delivered again');
+});
+
+test('an admission whose receipt is never written is observed once, after its effects', async () => {
+  const state = { shown: false, read: false };
+  const p = firstViewProbe(state, { held: [], stored: ['p1'] });
+  const observed: string[] = [];
+  p.host.accepted = (occurrence) => { observed.push(occurrence.eventId); };
+  p.host.recordReceipt = () => { throw new Error('ENOSPC simulated'); };
+  for (let attempt = 0; attempt < 6; attempt++) {
+    await assert.rejects(p.coalescer.accept(p.occurrence('p1', { initial: true })), (error: { code?: number }) => error.code === -32000);
+  }
+  assert.deepEqual(p.delivered, [{ eventId: 'p1' }], 'delivered once');
+  assert.deepEqual(observed, ['p1'], 'observed once, though no write landed');
 });
