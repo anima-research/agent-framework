@@ -51,6 +51,9 @@ class ScriptMembrane {
   streams: MockYieldingStream[] = [];
   retriesAtSubmission: number[] = [];
   onSubmit?: () => void;
+  /** A provider that hasn't answered the next round: a submission is taken
+   *  and the stream stays live with nothing to read, until it's cancelled. */
+  nextRoundUnanswered = false;
   constructor(readonly scripts: NormalizedResponse[][]) {}
   streamYielding(request: NormalizedRequest, options: YieldingStreamOptions = {}) {
     this.requests.push(structuredClone({ ...request, onCacheWireReceipt: undefined }));
@@ -61,7 +64,7 @@ class ScriptMembrane {
     stream.provideToolResults = (...args) => {
       this.retriesAtSubmission.push(options.refusalRetries ?? 0);
       this.onSubmit?.();
-      provide(...args);
+      if (!this.nextRoundUnanswered) provide(...args);
     };
     this.streams.push(stream);
     return stream;
@@ -2191,6 +2194,47 @@ test("stop() over a running ephemeral run settles the run's pending batch before
     await bounded(completion, 'the run settling');
   } finally { await h.framework.stop(); }
   assert.match(outcome, /^rejected: Framework shutting down/, 'the run ends through the shutdown terminal');
+  assert.equal(spills, 1, "the aborted batch's original is written out for its stub");
+  const restarted = await AgentFramework.create(h.base);
+  try {
+    const audit = restarted.getStore().getStateJson(TOOL_RESULT_GUARD_AUDIT_STATE) as Array<Record<string, unknown>>;
+    const settled = audit.filter((r) => r.agentName === 'ephemeral' && r.type === 'withheld').map((r) => r.reason);
+    assert.deepEqual(settled, ['aborted'], 'the batch is settled once, as aborted');
+  } finally { await restarted.stop(); }
+});
+
+test("a quiesce's abandon of an ephemeral run whose batch was just submitted rejects the run with the abandon and settles the batch", async () => {
+  // A host's stop-now is quiesce({ abandon: true }) and then stop(). The
+  // provider hasn't answered the round after the batch, so the stream is live
+  // when the drain gives up, and the abandon cancels it: the framework's own
+  // terminal settles the run, before the stop() that would otherwise end it.
+  const h = await harness([[calls('one'), answer()]]);
+  h.membrane.nextRoundUnanswered = true;
+  let spills = 0;
+  slowSpill(h.framework, async () => { spills++; });
+  const quiesces: Array<ReturnType<AgentFramework['quiesce']>> = [];
+  h.membrane.onSubmit = () => { queueMicrotask(() => { quiesces.push(h.framework.quiesce({ timeoutMs: 50, abandon: true })); }); };
+  const aborted: string[] = [];
+  h.framework.onTrace((event) => {
+    const { type, agentName, reason } = event as { type: string; agentName?: string; reason?: unknown };
+    if (type === 'inference:aborted' && agentName === 'ephemeral') aborted.push(String(reason));
+  });
+  let outcome = 'pending';
+  try {
+    const created = await h.framework.createEphemeralAgent({
+      name: 'ephemeral', model: 'test', systemPrompt: 'system', toolResultGuard: true,
+    });
+    created.contextManager.addMessage('user', [{ type: 'text', text: 'read' }]);
+    const completion = h.framework.runEphemeralToCompletion(created.agent, created.contextManager)
+      .then(() => { outcome = 'resolved'; }, (e) => { outcome = `rejected: ${(e as Error).message}`; });
+    h.framework.start();
+    await bounded(completion, 'the run settling');
+    assert.equal(quiesces.length, 1, 'the quiesce was called at the submission');
+    const status = await bounded(quiesces[0]!, 'the quiesce resolving');
+    assert.equal(status.drained, true, 'the abandon drained the turn');
+    assert.deepEqual(aborted, ['quiesce_abandoned'], "one aborted terminal, the abandon's");
+  } finally { await h.framework.stop(); }
+  assert.equal(outcome, 'rejected: Turn abandoned by operator quiesce', 'the run rejects with the abandon');
   assert.equal(spills, 1, "the aborted batch's original is written out for its stub");
   const restarted = await AgentFramework.create(h.base);
   try {
