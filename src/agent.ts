@@ -5,6 +5,7 @@ import type { CacheWireReceipt, KvUnifiedRequestHooks } from './kv-unified-wire.
 import { ToolResultGuard } from './tool-result-guard.js';
 import { withoutTokenEstimates } from './thinking-token-stamp.js';
 import { placeThinkingDrops, recordedAfterOf, type CompiledForRequest, type PlacedDrop } from './thinking-drops.js';
+import { carriedBlock, type SentRow } from './sent-rows.js';
 import { injectionsAsStored } from './text-as-stored.js';
 import { assertBooleanSetting, holdsSettings, kindOf } from './config-checks.js';
 import {
@@ -87,6 +88,10 @@ export interface StartStreamResult {
   /** The compile's `thinkingRecordedAfter`, when it gave one: a reply stored at or below it predates the branch's
    *  thinking-binding record, so the provider may drop its thinking with no strip having missed. */
   thinkingRecordedAfter?: number;
+  /** Tells the context manager what the stream's later rounds carried after the compiled messages, every round so
+   *  far in sent order, with this request's head (context-manager's `noteRequestSent`). Present only where the
+   *  model binds its thinking and the context manager keeps a record it can be told of. */
+  noteRequestSent?: (rows: readonly SentRow[]) => boolean;
 }
 import type {
   ContextManager,
@@ -95,6 +100,7 @@ import type {
   CompileResult,
   HotContextSettingsStatus,
   HotContextSettingsUpdate,
+  MessageId,
   MessageMetadata,
 } from '@animalabs/context-manager';
 import type {
@@ -1507,7 +1513,7 @@ export class Agent {
     budget?: TokenBudget,
     compressionTools: ToolDefinition[] = availableTools,
     options: ActivationRequestOptions = {},
-  ): Promise<{ request: NormalizedRequest; continuePrompt?: RequestOnlyPrompt; compiled: CompiledForRequest }> {
+  ): Promise<{ request: NormalizedRequest; continuePrompt?: RequestOnlyPrompt; compiled: CompiledForRequest; binding: BindingCompileOptions }> {
     // Unstored, so they leave for the request here (text-as-stored.ts), the
     // layout hash below included.
     injections = injectionsAsStored(injections);
@@ -1573,15 +1579,10 @@ export class Agent {
     // 2026-07-10 on a resident agent: one empty block muted the agent's live
     // path entirely; twin of context-manager's stripEmptyTextBlocks on the
     // compression path.)
+    // The same pass a tool boundary applies to what it notes as sent
+    // (sent-rows.ts), so the two can't drift.
     messages = messages
-      .map((m) => ({
-        ...m,
-        content: m.content.filter(
-          // typeof guard is deliberate runtime defense: history loaded from
-          // disk can carry a non-string `text` despite what the types claim.
-          (b: ContentBlock) => !(b.type === "text" && (typeof b.text !== "string" || b.text.trim() === "")),
-        ),
-      }))
+      .map((m) => ({ ...m, content: m.content.filter(carriedBlock) }))
       .filter((m) => m.content.length > 0);
     // The framework's own pricing stamp never goes out (thinking-token-stamp.ts).
     messages = withoutTokenEstimates(messages);
@@ -1632,7 +1633,7 @@ export class Agent {
       ...(kvUnified ? { cacheMarkers: 'cm-owned' as const } : {}),
     };
     if (options.dryRun) dryCompileStats.set(request, renderStats);
-    return { request, ...(continuePrompt ? { continuePrompt } : {}), compiled };
+    return { request, ...(continuePrompt ? { continuePrompt } : {}), compiled, binding };
   }
 
   /**
@@ -1686,6 +1687,18 @@ export class Agent {
    * covers the thinking config, `maxTokens` and `providerParams`, where a host puts its own thinking config
    * and `tool_choice`. Nothing without `binds`: the compile is as it was.
    */
+  /** The stream's way to tell the context manager what its later rounds sent, with the head its compile was given:
+   *  where the agent's model binds its thinking and the context manager can be told (its `noteRequestSent`, from
+   *  a release that keeps a thinking-binding record). */
+  private requestNotes(binding: BindingCompileOptions): Pick<StartStreamResult, 'noteRequestSent'> {
+    const identity = binding.identity;
+    const cm = this.contextManager as unknown as {
+      noteRequestSent?: (rows: readonly SentRow[], identity: NonNullable<BindingCompileOptions['identity']>) => boolean;
+    };
+    if (!identity || typeof cm.noteRequestSent !== 'function') return {};
+    return { noteRequestSent: (rows) => cm.noteRequestSent!(rows, identity) };
+  }
+
   private bindingCompileOptions(tools: readonly ToolDefinition[], systemInjections: ContentBlock[]): BindingCompileOptions {
     if (!this.thinkingBinds) return {};
     const { config, providerParams } = this.requestSettings();
@@ -1792,7 +1805,7 @@ export class Agent {
     // Compiled only once each withheld stub's annotation has finished,
     // including one that began during the compile, and after a stub edit that
     // failed has been retried (see afterAnnotations).
-    const { request, continuePrompt, compiled } = await this.toolResultGuard.afterAnnotations(
+    const { request, continuePrompt, compiled, binding } = await this.toolResultGuard.afterAnnotations(
       () => this.assembleActivationRequest(availableTools, injections, budget, compressionTools, options));
     request.messages = this.toolResultGuard.prepareRequest(request.messages, true);
 
@@ -1851,6 +1864,7 @@ export class Agent {
       ...(continuePrompt ? { continuePrompt } : {}),
       // Read against the messages the stream sends, which membrane's report indexes (RoundReport's coordinates).
       placeDrops: (entries) => placeThinkingDrops(entries, request.messages, compiled),
+      ...this.requestNotes(binding),
       ...(compiled.recordedAfter !== undefined ? { thinkingRecordedAfter: compiled.recordedAfter } : {}),
       ...(kvEnabled
         ? {
@@ -1905,7 +1919,7 @@ export class Agent {
    * Add an assistant response to context.
    * Called by framework when stream completes.
    */
-  addAssistantResponse(content: ContentBlock[], metadata?: MessageMetadata): void {
+  addAssistantResponse(content: ContentBlock[], metadata?: MessageMetadata): MessageId | undefined {
     // A turn whose entire output is thinking blocks produced NOTHING: no
     // speech, no tool call. That is what a refusal looks like on the wire —
     // the provider returns signed thinking (often with empty text, the
@@ -1929,9 +1943,9 @@ export class Agent {
         `message (${content.length} block(s), no text and no tool_use) — the turn produced no ` +
         `output. See the refusal/inference-failed record for why.`,
       );
-      return;
+      return undefined;
     }
-    this.contextManager.addMessage(this.name, content, metadata);
+    return this.contextManager.addMessage(this.name, content, metadata);
   }
 
   /**

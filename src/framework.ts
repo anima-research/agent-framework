@@ -1,3 +1,4 @@
+import { isDeepStrictEqual } from 'node:util';
 import { ToolPresentation, presentationTools, isPresentationTool, renderCatalogue, type PresentationSnapshot } from "./tool-presentation.js";
 import { constants as bufferConstants } from 'node:buffer';
 import { dirname, join } from 'node:path';
@@ -161,6 +162,7 @@ import { AUTO_CONTINUE_REASON, AUTO_CONTINUE_STOP_REASONS, autoContinueNotice } 
 import { cumulativeDelta } from './usage-accounting.js';
 import { stampThinkingTokenEstimates } from './thinking-token-stamp.js';
 import { splitThinkingDrops, ThinkingLossIncidents, type PlacedDrop, type StreamThinkingDrops } from './thinking-drops.js';
+import { roundRows, type RoundRow, type SentRow } from './sent-rows.js';
 import { contentAsStored, nameAsStored } from './text-as-stored.js';
 
 /** An MCPL tool call refused because its server isn't in the registry: one
@@ -3274,6 +3276,11 @@ export class AgentFramework {
   private readonly scriptCallStarts = new Map<string, { turnId?: number; readThrough: { branch: string; sequence: number } | null }>();
   /** Per agent, the unexpected thinking drops its last operator alert counted (noteThinkingLoss). */
   private readonly thinkingLossIncidents = new ThinkingLossIncidents();
+  /** Per live stream that can be noted, its rows so far after the compiled messages (noteRoundSent). */
+  private readonly streamRequestNotes = new WeakMap<YieldingStream, { note: (rows: readonly SentRow[]) => boolean; rounds: RoundRow[]; noted: SentRow[]; stopped: boolean }>();
+  /** Per agent, what membrane holds as its pending round's reply (`roundContent`, its results left out), beside
+   *  the blocks the framework stores for it; null where the round has no `roundContent` (XML or fallback). */
+  private readonly pendingRoundSent = new Map<string, ContentBlock[] | null>();
   /** Per agent, a round that called code_execution and waits for those calls'
    *  results before its prose is routed (ScriptRound). */
   private scriptRounds: Map<string, ScriptRound> = new Map();
@@ -12326,14 +12333,17 @@ export class AgentFramework {
           // Flush pending assistant blocks (tool_use + preamble text) to context
           const pendingBlocks = this.pendingAssistantBlocks.get(agent.name);
           const turnRowMetadata = this.silentTurnRowMetadata(agent.name);
+          let replyId: MessageId | undefined;
           if (pendingBlocks) {
-            agent.addAssistantResponse(pendingBlocks, turnRowMetadata);
+            replyId = agent.addAssistantResponse(pendingBlocks, turnRowMetadata);
             this.pendingAssistantBlocks.delete(agent.name);
           }
+          const replySent = this.pendingRoundSent.get(agent.name);
+          this.pendingRoundSent.delete(agent.name);
           const membraneResults = currentState.toolResults.map(tc =>
             this.toMembraneToolResult(tc.id, tc.result, maxChars, spilled.get(tc.id))
           );
-          agent.toolResultGuard.storeResults(toolResultContent, membraneResults, currentState.toolResults, turnRowMetadata, keptCap);
+          const resultsId = agent.toolResultGuard.storeResults(toolResultContent, membraneResults, currentState.toolResults, turnRowMetadata, keptCap);
 
           // Flush any messages that were deferred while this turn was in
           // flight: this agent's own entries, those addressed to it and, for
@@ -12405,7 +12415,7 @@ export class AgentFramework {
           // Everything queued for the agent waits for the turn-end flush, as
           // a held message does, rather than sitting in the window between
           // rounds the stream never showed it.
-          const midTurnInjections: Array<{ participant: string; content: ContentBlock[]; metadata?: MessageMetadata }> = [];
+          const midTurnInjections: Array<{ participant: string; content: ContentBlock[]; metadata?: MessageMetadata; id?: MessageId }> = [];
           // What this boundary stored for the agent to hear, in store order,
           // injected or left out, for a boundary that leaves it to the turn's
           // next start as arrivals: that start's compile sends it.
@@ -12450,7 +12460,7 @@ export class AgentFramework {
             if (clock) {
               const sent = rendered ? rendered[0]! : clock.content;
               if (sent !== null) {
-                midTurnInjections.push({ participant: 'user', content: sent, metadata: clock.metadata });
+                midTurnInjections.push({ participant: 'user', content: sent, metadata: clock.metadata, id: clock.id });
               } else {
                 console.error(`[clock] ${agent.name}: clock ${clock.id} left out of the live round, since the next compile won't send it among its newest`);
               }
@@ -12467,6 +12477,7 @@ export class AgentFramework {
                 participant: h.msg.participant,
                 content: sent,
                 ...(h.msg.metadata ? { metadata: h.msg.metadata } : {}),
+                id: h.id,
               });
             });
             if (leftOut.length > 0) {
@@ -12715,11 +12726,19 @@ export class AgentFramework {
             // keeps them, whether it's a heard message, rendered or not, or a
             // notice the boundary made: this is where they leave for the
             // request.
+            const submitted = agent.toolResultGuard.submissionResults(membraneResults);
+            const injectedMessages = midTurnInjections.map(({ participant, content }) => ({ participant: nameAsStored(participant), content: contentAsStored(content) }));
+            // Before the round's reply exists, so the reply that comes next is the reply to this request.
+            this.noteRoundSent(agent, currentState.stream, [
+              { kind: 'reply', id: replyId, sent: replySent ?? [] },
+              { kind: 'results', id: resultsId, sent: submitted },
+              ...midTurnInjections.map((injection, i) => ({
+                kind: 'injected' as const, id: injection.id, participant: injectedMessages[i]!.participant, sent: injectedMessages[i]!.content,
+              })),
+            ], replySent === null || replySent === undefined);
             currentState.stream.provideToolResults(
-              agent.toolResultGuard.submissionResults(membraneResults),
-              midTurnInjections.length > 0
-                ? { injectedMessages: midTurnInjections.map(({ participant, content }) => ({ participant: nameAsStored(participant), content: contentAsStored(content) })) }
-                : undefined,
+              submitted,
+              midTurnInjections.length > 0 ? { injectedMessages } : undefined,
             );
             // RFC-006 §3.3: consumption is determined at assembly, and this
             // is assembly too when the stream carries the injected messages
@@ -16633,7 +16652,7 @@ export class AgentFramework {
     routing: TurnRouting,
     channel: ChannelRef,
     cause: string,
-  ): { participant: string; content: ContentBlock[]; metadata: MessageMetadata } | undefined {
+  ): { participant: string; content: ContentBlock[]; metadata: MessageMetadata; id: MessageId } | undefined {
     if (sameChannel(routing.locus, channel)) return undefined;
     const prevPin = routing.locus ?? null;
     routing.locus = channel;
@@ -16655,7 +16674,7 @@ export class AgentFramework {
       this.lastAnnouncedLocus.set(agent.name, channel);
       this.emitTrace({ type: 'message:added', messageId: id, source: 'routing-notice' });
       console.error(`[routing] ${agent.name}: ${cause} re-pin ${prevPin ? qualifiedChannelName(prevPin) : '(none)'} -> ${qualifiedChannelName(channel)}`);
-      return { participant: 'user', content, metadata };
+      return { participant: 'user', content, metadata, id };
     } catch (err) {
       console.error('turn locus re-pin: failed to record routing notice:', err);
       return undefined;
@@ -18904,12 +18923,15 @@ export class AgentFramework {
         continuePrompt,
         placeDrops,
         thinkingRecordedAfter,
+        noteRequestSent,
       } = await agent.startStreamWithInjections(tools, injections, undefined, compressionTools, {
         silentHeartbeat: trigger?.silentHeartbeat,
         // This turn's retries are the framework's (errorPolicy below), not
         // membrane's inside each attempt.
         membraneRetries: false,
       });
+      // Each later round this stream sends is noted as it goes (noteRoundSent).
+      if (noteRequestSent) this.streamRequestNotes.set(stream, { note: noteRequestSent, rounds: [], noted: [], stopped: false });
       // The compile can wait for annotations (each batch has one spill
       // deadline), so check ownership, admission, and the lifecycle again.
       // A stop followed by start must not revive this earlier turn.
@@ -19792,6 +19814,9 @@ export class AgentFramework {
             assistantBlocks = stampThinkingTokenEstimates(assistantBlocks, outputTokensSinceStamp);
             outputTokensSinceStamp = 0;
             this.pendingAssistantBlocks.set(agent.name, assistantBlocks);
+            this.pendingRoundSent.set(agent.name, roundContent && roundContent.length > 0
+              ? roundContent.filter((b) => b.type !== 'tool_result')
+              : null);
 
             // Note: max_tokens truncation cannot produce tool-calls events here.
             // The membrane only yields 'tool-calls' when stop_reason is 'tool_use'
@@ -20133,6 +20158,8 @@ export class AgentFramework {
               agent.toolResultGuard.accept();
             }
             if (!guardRefusal) releaseGuardHeld();
+            // The last batch has settled, and the last reply isn't stored yet.
+            this.renoteStreamEnd(agent, stream);
 
             // If the agent is still waiting_for_tools when 'complete' fires
             // (shouldn't happen after incomplete-tool-call fix, but guard anyway),
@@ -23875,7 +23902,7 @@ export class AgentFramework {
   private recordLeftOutNotice(
     agent: Agent,
     leftOut: ReadonlyArray<{ msg: { participant: string }; id: MessageId; content: ContentBlock[]; parts: number }>,
-  ): { participant: string; content: ContentBlock[]; metadata: MessageMetadata } | undefined {
+  ): { participant: string; content: ContentBlock[]; metadata: MessageMetadata; id: MessageId } | undefined {
     const canExtract = this.advertisedToolsForAgent(agent.name).some((t) => t.name === 'history--extract');
     const one = leftOut.length === 1;
     const lines = leftOut.map(({ msg, id, content, parts }) => {
@@ -23900,7 +23927,7 @@ export class AgentFramework {
     try {
       const id = agent.getContextManager().addMessage('user', content, metadata);
       this.emitTrace({ type: 'message:added', messageId: id, source: 'left-out-notice' });
-      return { participant: 'user', content, metadata };
+      return { participant: 'user', content, metadata, id };
     } catch (err) {
       console.error(`[injection] ${agent.name}: couldn't store the notice of messages left out of the live round:`, err);
       return undefined;
@@ -25306,6 +25333,57 @@ export class AgentFramework {
     data?: Record<string, unknown>,
   ): void {
     this.opsAlert(kind, agentName, message, { data });
+  }
+
+  /**
+   * Tells the context manager what a stream's later round carries after its compiled messages: every round so far,
+   * in sent order, with the round's own rows appended (roundRows): each stored row's id where the next request will
+   * carry it as the stream sent it, the marker where it won't. A request-only row (a heartbeat tick, a `[Continue]`)
+   * isn't a row here: the next request puts it back in the same place (renderRequestOnlyRows), and no compile holds
+   * it. A round with no `roundContent` (membrane's XML or fallback path, where the stored reply is the framework's
+   * rebuild) can't be vouched for, so nothing more of the stream is noted, and its later rounds' thinking is left
+   * out at the next compile rather than refused. So is a stream whose note threw.
+   */
+  private noteRoundSent(agent: Agent, stream: YieldingStream, rows: RoundRow[], unvouched: boolean): void {
+    const notes = this.streamRequestNotes.get(stream);
+    if (!notes || notes.stopped) return;
+    if (unvouched) { notes.stopped = true; return; }
+    notes.rounds.push(...rows);
+    this.noteStreamRows(agent, notes, true);
+  }
+
+  /**
+   * At the stream's end, before its last reply is stored: the rows of the last request noted, judged again, since
+   * the store can have changed under them since, as when the tool-result guard's last batch settles to the
+   * originals the stream was sent. Noted again only where a verdict changed, so the last reply keeps what the
+   * request it answers can now be vouched for.
+   */
+  private renoteStreamEnd(agent: Agent, stream: YieldingStream): void {
+    const notes = this.streamRequestNotes.get(stream);
+    if (!notes || notes.stopped || notes.rounds.length === 0) return;
+    this.noteStreamRows(agent, notes, false);
+  }
+
+  /** Each round's rows judged as of now (roundRows), and noted where `always` says or a verdict changed. */
+  private noteStreamRows(agent: Agent, notes: { note: (rows: readonly SentRow[]) => boolean; rounds: RoundRow[]; noted: SentRow[]; stopped: boolean }, always: boolean): void {
+    const cm = agent.getContextManager();
+    try {
+      const ids = notes.rounds.flatMap((row) => row.id === undefined ? [] : [row.id]);
+      const rendered = cm.renderAsNewest(ids);
+      const carried = new Map<MessageId, { participant: string; content: ContentBlock[] } | null>();
+      ids.forEach((id, i) => {
+        const stored = cm.getMessage(id);
+        const content = rendered ? rendered[i]! : stored?.content ?? null;
+        carried.set(id, stored && content ? { participant: stored.participant, content } : null);
+      });
+      const rows = roundRows(notes.rounds, (id) => carried.get(id) ?? null);
+      if (!always && isDeepStrictEqual(rows, notes.noted)) return;
+      notes.note(rows);
+      notes.noted = rows;
+    } catch (error) {
+      notes.stopped = true;
+      console.error(`[thinking-binding] ${agent.name}: couldn't note the rounds this stream sent, so its later rounds' thinking is left out at the next compile:`, error);
+    }
   }
 
   /**
