@@ -3800,11 +3800,11 @@ test('a framework compile from before stop cannot drive after restart', async ()
   } finally { compile.open(); await starting; await framework.stop(); store.close(); }
 });
 
-test("a dropped turn's cancel record is not read by the next turn's stream: its own error stays a failure", async () => {
-  // The dropped turn calls agent.cancelStream() on a stream no driver iterates,
-  // so the cancel record it leaves is never collected. The next stream's start
-  // clears it; were it left, that stream's genuine error would read it and end
-  // as a deliberate stop instead of a failure.
+test("a dropped turn leaves nothing the next turn's stream reads as a stop: its own error stays a failure", async () => {
+  // The dropped turn's stream is never iterated, so no driver collects
+  // anything it leaves. It lets go of the stream without a cancel record
+  // (agent.reset()); were one left, the next stream's genuine error would
+  // read it and end as a deliberate stop instead of a failure.
   const dir = mkdtempSync(join(tmpdir(), 'guard-dropped-record-')); dirs.push(dir);
   const store = JsStore.openOrCreate({ path: join(dir, 'store') });
   // The dropped turn's answer, then the next turn's (made to error), then a retry's.
@@ -3850,6 +3850,45 @@ test("a dropped turn's cancel record is not read by the next turn's stream: its 
     assert.ok(events.includes('inference:failed'), `its error takes the failure path: ${JSON.stringify(events)}`);
     assert.ok(!events.includes('inference:aborted'), `not a deliberate stop: ${JSON.stringify(events)}`);
   } finally { compile.open(); await starting; await framework.stop(); store.close(); }
+});
+
+test("a cancel record no driver collects is cleared by the next stream's start: that stream's own error stays a failure", async () => {
+  // agent.cancelStream() of a stream nobody iterates leaves a record no
+  // driver collects. The next stream's start clears it; were it left, that
+  // stream's genuine error would read it and end as a deliberate stop.
+  const dir = mkdtempSync(join(tmpdir(), 'guard-uncollected-record-')); dirs.push(dir);
+  const store = JsStore.openOrCreate({ path: join(dir, 'store') });
+  // The stream nobody iterates, then the next turn's (made to error), then a retry's.
+  const membrane = new ScriptMembrane([[answer()], [answer()], [answer()]]);
+  const framework = await AgentFramework.create({ store, membrane: membrane.asMembrane(),
+    agents: [{ name: 'assistant', model: 'test', systemPrompt: 'system' }],
+    modules: [], syncIntervalMs: 0, maintenanceIntervalMs: 0 });
+  const agent = framework.getAgent('assistant')!;
+  const stream = membrane.streamYielding.bind(membrane);
+  membrane.streamYielding = (...args) => {
+    const result = stream(...args);
+    if (membrane.streams.length === 2) {
+      (result as unknown as { events: unknown[] }).events.unshift({ type: 'error', error: new Error('provider failed') });
+    }
+    return result;
+  };
+  try {
+    framework.start();
+    await agent.startStreamWithInjections([]);
+    agent.cancelStream();
+    const events: string[] = [];
+    framework.onTrace((event) => {
+      if (event.type.startsWith('inference:') && (event as { agentName?: string }).agentName === 'assistant') events.push(event.type);
+    });
+    const error = console.error;
+    console.error = () => {};
+    try {
+      await (framework as unknown as { startAgentStream(a: typeof agent): Promise<void> }).startAgentStream(agent);
+      await until(() => events.includes('inference:failed') || events.includes('inference:aborted'), "the next turn's stream ends");
+    } finally { console.error = error; }
+    assert.ok(events.includes('inference:failed'), `its error takes the failure path: ${JSON.stringify(events)}`);
+    assert.ok(!events.includes('inference:aborted'), `not a deliberate stop: ${JSON.stringify(events)}`);
+  } finally { await framework.stop(); store.close(); }
 });
 
 // A turn dropped before it sends anything, at either check: before its

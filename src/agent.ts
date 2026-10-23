@@ -1546,10 +1546,10 @@ export class Agent {
     // ran. The stream driver collects it on that stream's terminal event, or
     // at the loop's end when the iterator closed without one, while the
     // stream still owns the agent. This clear is for the records no driver
-    // collects: a dropped turn's, whose stream no driver iterates; one whose
-    // stream's terminal came after another stream took the agent; or a
-    // cancel after the stream's complete event. A fresh stream must not
-    // inherit one and read its own later error as a deliberate stop.
+    // collects: a cancel of a stream no driver iterates; one whose stream's
+    // terminal came after another stream took the agent; or a cancel after
+    // the stream's complete event. A fresh stream must not inherit one and
+    // read its own later error as a deliberate stop.
     this._pendingCancel = undefined;
     this._inferenceStartedAt = Date.now();
     this.lastStreamInputTokens = 0;
@@ -1739,12 +1739,24 @@ export class Agent {
    * one is still ahead; otherwise the next start drops it. `reason` is
    * provenance for the framework's inference:aborted trace and marker
    * metadata (e.g. 'zombie_reclaim', 'subagent_cancel'); it never reaches
-   * the provider.
+   * the provider. When the stream's cancel() throws, the throw goes on to
+   * the caller, and the agent still holds the stream, its cancel record as
+   * it was before the call.
    */
   cancelStream(reason?: string): void {
     if ('stream' in this._state && this._state.stream) {
+      // A cancel that throws leaves the stream going and the agent holding
+      // it, so this call's record is taken back, leaving any earlier one: a
+      // later end of that stream, an `error` the provider reports included,
+      // is not read as this stop's.
+      const earlier = this._pendingCancel;
       this._pendingCancel = { reason };
-      this._state.stream.cancel();
+      try {
+        this._state.stream.cancel();
+      } catch (error) {
+        this._pendingCancel = earlier;
+        throw error;
+      }
     } else {
       this._stopWithoutStream = { reason };
     }
