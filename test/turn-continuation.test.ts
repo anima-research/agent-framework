@@ -561,6 +561,7 @@ describe('a turn whose continuation is dropped ends there', () => {
     try {
       await waitFor('the restarted frame to end', () => h.framework.getHostModeStatus().activeTurns === 0);
       assert.ok(!internals(h.framework).pendingRequests.some((r) => r.reason === 'context_budget_restart'), 'nothing was queued');
+      assert.ok(!h.traces.some((t) => t.type === 'inference:stream_restarted'), 'and no restart was announced');
       assert.equal(abortReasons(h.traces).filter((r) => r === 'shutdown').length, 1, "one inference:aborted, the stop's");
       assert.equal(h.membrane.calls.length, 1, 'the stopping framework started no continuation');
     } finally {

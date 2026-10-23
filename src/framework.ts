@@ -2832,9 +2832,9 @@ export class AgentFramework {
   // the inputs its start writes (flushForStart).
   private activeTurnTokens: Map<string, number> = new Map();
   /** Each running scheduler pass's requests, which it took from
-   *  pendingRequests: it holds them while it awaits each agent's start in
-   *  turn, so a continuation among them is still on its way
-   *  (pendingContinuationAgents). */
+   *  pendingRequests: it holds those of the agents it hasn't taken up yet
+   *  while it awaits an earlier agent's start, so a continuation among them
+   *  is still on its way (pendingContinuationAgents). */
   private passRequests: Set<Map<string, InferenceRequest[]>> = new Set();
   /** Continuations whose start waits on provider admission behind an
    *  auxiliary call, in no queue meanwhile. A drop takes one out and gives
@@ -6500,8 +6500,11 @@ export class AgentFramework {
    * provider hold (a retry too, when a wait holds it), a park on admission
    * or a scheduler pass's hands. Its turn is alive meanwhile. These are the
    * agents with one on its way. A
-   * `tool_results_ready` continuation comes only from the direct Agent API,
-   * whose caller owns its turn's timing, so it isn't counted.
+   * `tool_results_ready` continuation follows a tool round left waiting with
+   * no stream, which only the direct Agent API makes (Agent's
+   * runInferenceWithInjections; the framework's own rounds wait with their
+   * stream, enterWaitingForTools). Its caller owns that turn's timing, so it
+   * isn't counted.
    */
   private pendingContinuationAgents(): Set<string> {
     const agents = new Set<string>();
@@ -12232,10 +12235,13 @@ export class AgentFramework {
             // and emitting a spurious inference:exhausted (same race shape as
             // endTurn above).
             if (currentState.stream) this.frameworkCancelledStreams.set(`${agent.name}:${agent.streamId}`, 'budget_restart');
-            agent.cancelStream();
-            // Its rounds were billed; the restart opens a fresh stream with
-            // its own usage.
-            if (currentState.stream) this.streamBoundaryEnds.get(currentState.stream)?.(overBudget ? 'context_budget' : 'physical_window');
+            try {
+              agent.cancelStream();
+            } finally {
+              // Its rounds were billed, even when the cancel throws; the
+              // restart opens a fresh stream with its own usage.
+              if (currentState.stream) this.streamBoundaryEnds.get(currentState.stream)?.(overBudget ? 'context_budget' : 'physical_window');
+            }
             this.emitTrace({
               type: 'inference:stream_restarted',
               agentName: agent.name,
@@ -14363,8 +14369,8 @@ export class AgentFramework {
     return undefined;
   }
 
-  /** One scheduler pass, whose requests stay visible as on their way while
-   *  it runs (passRequests). */
+  /** One scheduler pass, whose requests stay visible as on their way until
+   *  it takes their agent up (passRequests). */
   private async processInferenceRequests(): Promise<void> {
     if (this.pendingRequests.length === 0) {
       return;
@@ -18119,8 +18125,8 @@ export class AgentFramework {
       if (turnEnded) this.recordProviderAccelerationRecovery(agent, compiledRequest, end);
       // The accounting writes to the store, and a write that fails must not
       // skip what the boundary does after this call: the rest of a turn's
-      // end, or a restart's cancel and its request, and then the event's
-      // dispatch to modules.
+      // end, or a restart's trace (its cancel and its request come before
+      // this call), and then the event's dispatch to modules.
       try {
         if (turnEnded) {
           completeTurn(latestUsage, durationMs);

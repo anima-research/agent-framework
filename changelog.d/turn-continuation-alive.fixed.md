@@ -14,4 +14,6 @@
   it held for the continuation, closes its logical turn and stops its
   typing, and the tool-result guard's pending batch is withheld from later
   requests, as for a turn that ends before it sends anything. A provider
-  hold left empty by the drop releases without queueing a retry turn.
+  hold left empty by the drop releases without queueing a retry turn. An
+  ephemeral run that ends takes such a continuation with it, its own end
+  having ended the turn.
