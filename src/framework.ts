@@ -1625,7 +1625,8 @@ export interface HostModeStatus {
   /** Wakes that own provider admission while waiting for an in-flight
    * auxiliary call — no turn token yet, but a turn is one settle away. The
    * admission continuation rechecks quiesce and requeues them; `drained`
-   * is false until it has. */
+   * is false until it has. A parked continuation of a turn is counted here
+   * and, as a turn alive, in `activeTurns` and `activeTurnAgents`. */
   parkedAdmissions: number;
   /** Inference requests parked by the quiesce wake gate (while quiesced), or
    * simply queued (while serving — non-zero right after a resume until the
@@ -12219,14 +12220,15 @@ export class AgentFramework {
             // boundary's usage report and the restart's trace, so a listener
             // that stops or quiesces the host on either finds the turn waiting
             // for its continuation, with nothing left of the stream to end.
-            this.pendingRequests.push({
+            const continuation: InferenceRequest = {
               agentName: agent.name,
               reason: 'context_budget_restart',
               source: 'framework',
               timestamp: Date.now(),
               suppressProse: this.activeTurnTriggers.get(agent.name)?.suppressProse,
               silentHeartbeat: this.activeTurnTriggers.get(agent.name)?.silentHeartbeat,
-            });
+            };
+            this.pendingRequests.push(continuation);
             // Context budget exceeded: break the stream, let compile() compress.
             // Mark the cancel as framework-initiated BEFORE cancelling: the
             // membrane delivers `aborted` before the restart bumps streamId,
@@ -12237,6 +12239,11 @@ export class AgentFramework {
             if (currentState.stream) this.frameworkCancelledStreams.set(`${agent.name}:${agent.streamId}`, 'budget_restart');
             try {
               agent.cancelStream();
+            } catch (error) {
+              // The cancel failed and the stream is still live, so the turn
+              // has no continuation: take it back out of the queue.
+              this.pendingRequests = this.pendingRequests.filter((r) => r !== continuation);
+              throw error;
             } finally {
               // Its rounds were billed, even when the cancel throws; the
               // restart opens a fresh stream with its own usage.

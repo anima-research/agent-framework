@@ -73,6 +73,18 @@ class TeardownHeldStream extends MockYieldingStream {
   }
 }
 
+/** A stream whose first cancel() throws, as a host's stream can. */
+class CancelThrowsOnceStream extends MockYieldingStream {
+  private threw = false;
+  override cancel(): void {
+    if (!this.threw) {
+      this.threw = true;
+      throw new Error('the stream refused its cancel');
+    }
+    super.cancel();
+  }
+}
+
 /** Responses in order, one per stream unless `perStream` gives a stream
  *  more (a stream with a tool round answers each round with the next).
  *  `make` can build a stream of its own for a stream's index. */
@@ -147,6 +159,8 @@ async function restartTurn(opts: {
   inferencePolicy?: { shouldInfer(agentName: string, requests: InferenceRequest[]): boolean };
   /** The restarted stream's teardown waits for this. */
   holdTeardown?: Promise<void>;
+  /** The restarted stream's first cancel() throws. */
+  cancelThrows?: boolean;
   closeAdmissionDuringRestart?: boolean;
   /** Called with each trace, as a host's listener is. */
   onTrace?: (framework: AgentFramework, event: TraceEvent) => void;
@@ -162,8 +176,11 @@ async function restartTurn(opts: {
   extraModules?: Module[];
 }) {
   const tempDir = mkdtempSync(join(tmpdir(), 'turn-continuation-'));
-  const membrane = new SequentialStreamMembrane([], (index, responses) =>
-    (index === 0 && opts.holdTeardown ? new TeardownHeldStream(opts.holdTeardown, responses) : undefined));
+  const membrane = new SequentialStreamMembrane([], (index, responses) => {
+    if (index !== 0) return undefined;
+    if (opts.holdTeardown) return new TeardownHeldStream(opts.holdTeardown, responses);
+    return opts.cancelThrows ? new CancelThrowsOnceStream(responses) : undefined;
+  });
   membrane.pushResponse(nearCapToolResponse());
   membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Recovered.' }]));
   membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Read it.' }]));
@@ -463,6 +480,69 @@ describe('a turn whose continuation is on its way', () => {
     }
   });
 
+  it("a tool-result guard's retry that a provider wait holds keeps its turn alive, and an abandon ends it", async () => {
+    const tempDir = mkdtempSync(join(tmpdir(), 'turn-continuation-'));
+    // One stream: a tool round, then a refusal once its result is submitted.
+    const membrane = new SequentialStreamMembrane([2]);
+    membrane.pushResponse(createMockResponse([{ type: 'tool_use', id: 'call_1', name: 'guarded--read', input: {} }], 'tool_use'));
+    membrane.pushResponse({
+      ...createMockResponse([{ type: 'text', text: 'partial' }], 'refusal'),
+      raw: { request: {}, response: { stop_details: { category: 'test-category' } } },
+    } as NormalizedResponse);
+    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Recovered.' }]));
+    let framework!: AgentFramework;
+    const module = {
+      name: 'guarded',
+      async start() {},
+      async stop() {},
+      getTools: () => [{ name: 'read', description: 'read', inputSchema: { type: 'object', properties: {} } }],
+      async handleToolCall() {
+        internals(framework).providerWaits.set('prime', 'test-model', WAIT_MS, 'stated while the tool ran');
+        return { success: true, data: 'payload' };
+      },
+      async onProcess(event: ProcessEvent) {
+        return event.type === 'external-message'
+          ? { addMessages: [{ participant: 'User', content: [{ type: 'text', text: 'read it' }] }], requestInference: ['prime'] }
+          : {};
+      },
+    } as unknown as Module;
+    framework = await AgentFramework.create({
+      storePath: join(tempDir, 'store'),
+      membrane: membrane.asMembrane(),
+      agents: [{
+        name: 'prime', model: 'test-model', systemPrompt: 'You are prime.', allowedTools: 'all',
+        toolResultGuard: true, refusalHandling: { retries: 3 },
+      } as never],
+      modules: [module],
+      syncIntervalMs: 0,
+    });
+    const traces: TraceEvent[] = [];
+    framework.onTrace((e) => { traces.push(e); });
+    const logged: string[] = [];
+    const origError = console.error;
+    console.error = (...args: unknown[]) => { logged.push(args.map(String).join(' ')); origError(...args); };
+    try {
+      framework.start();
+      framework.pushEvent({ type: 'external-message', source: 'test', content: [{ type: 'text', text: 'read it' }], metadata: {}, triggerInference: true } as unknown as ProcessEvent);
+      await waitFor('the guard retry to be held, its frame gone', () =>
+        (internals(framework).providerAccelerationCooldowns.get('prime')?.heldRequests.some((r) => r.reason === 'tool_result_guard_retry') ?? false)
+        && frameLetGo(framework));
+      assert.deepEqual(framework.getHostModeStatus().activeTurnAgents, ['prime'], "the retry's turn is listed");
+      assert.equal(framework.getHostModeStatus().drained, false);
+      const status = await framework.quiesce({ timeoutMs: QUIESCE_MS, abandon: true });
+      assert.equal(status.drained, true, 'the abandon ended the turn');
+      assert.equal(abortReasons(traces).filter((r) => r === 'quiesce_abandoned').length, 1, "one inference:aborted, the abandon's");
+      framework.releaseProviderWait('prime');
+      await framework.resume();
+      await aPass({ framework, logged }, 'a pass after the resume');
+      assert.equal(membrane.calls.length, 1, 'the dropped retry never started');
+    } finally {
+      console.error = origError;
+      await framework.stop();
+      rmSync(tempDir, { recursive: true, force: true });
+    }
+  });
+
   it('an operator call that needs the agent idle is refused then, as during any live turn', async () => {
     const h = await restartTurn({ wait: true });
     try {
@@ -559,6 +639,22 @@ describe('a turn whose continuation is dropped ends there', () => {
       assert.equal(abortReasons(h.traces).filter((r) => r === 'shutdown').length, 1, "one inference:aborted, the stop's");
       assert.equal(h.framework.getHostModeStatus().activeTurns, 0);
       assert.equal(h.membrane.calls.length, 1, 'no continuation started');
+    } finally {
+      await h.cleanup();
+    }
+  });
+
+  it("a restart whose stream's cancel throws leaves no continuation queued beside the live stream", async () => {
+    const h = await restartTurn({
+      wait: false,
+      cancelThrows: true,
+      until: (traces) => traces.some((t) => t.type === 'usage:updated'),
+    });
+    try {
+      await waitFor("the boundary's error to reach the loop", () => h.logged.some((l) => l.includes('Error in event loop')));
+      assert.ok(!internals(h.framework).pendingRequests.some((r) => r.reason === 'context_budget_restart'), 'no continuation is queued');
+      await aPass(h, 'a pass after the failed cancel');
+      assert.equal(h.membrane.calls.length, 1, 'no second stream started beside the one the cancel left live');
     } finally {
       await h.cleanup();
     }
@@ -666,6 +762,7 @@ describe('a turn whose continuation is dropped ends there', () => {
     try {
       await waitFor('the continuation to park, its frame gone', () => gate.idleWaiters.length > 0 && frameLetGo(h.framework));
       assert.deepEqual(h.framework.getHostModeStatus().activeTurnAgents, ['prime'], 'the parked continuation keeps the turn alive');
+      assert.equal(h.framework.getHostModeStatus().parkedAdmissions, 1, 'and it counts as a parked admission too');
       gate.auxiliaryInFlight = 0;
       for (const resolve of gate.idleWaiters.splice(0)) resolve();
       await waitFor('the continuation to run', () => h.membrane.calls.length === 2);
