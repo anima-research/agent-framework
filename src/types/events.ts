@@ -285,7 +285,9 @@ export interface ToolCall {
    * text answer's envelope, over six: 7,456,527 at the default 128 MiB. On
    * Node, past about 1.5 GiB, the host's longest string bounds it instead.
    * A result with a `structured` value reaches a script as its content's
-   * blocks as they are, beside that value as JSON, and the figure counts
+   * blocks, a module's or an MCPL peer's with RFC-005's treatment of what it
+   * governs (a reference as its stub's facts) and a standard peer's as sent,
+   * beside that value as JSON, and the figure counts
    * neither the value nor what the blocks carry past their text, such as each
    * further block's keys or an image's data, so a tool that returns one
    * leaves room for them; and a result nested past 2,000 levels, or whose parse
