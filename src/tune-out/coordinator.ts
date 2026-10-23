@@ -18,7 +18,7 @@
 import { randomUUID } from 'node:crypto';
 import type { ContentBlock } from '@animalabs/membrane';
 import type { StoredMessage } from '@animalabs/context-manager';
-import type { ChannelRegistry, TuneOutParams } from '../mcpl/channel-registry.js';
+import type { ChannelRef, ChannelRegistry, TuneOutParams } from '../mcpl/channel-registry.js';
 import type { McplServerRegistry } from '../mcpl/server-registry.js';
 import { CapabilityGrant } from '../mcpl/capability-grant.js';
 import { armAfter, armAt } from '../deadline-timer.js';
@@ -45,7 +45,7 @@ const CUT_MARK = " [cut to fit; the whole message is in the channel's history]";
  * its transport is now where the repeat tried to open it again (`transport`,
  * from the framework's dispatch), then how to change the settings.
  */
-export function alreadyTunedOutText(channelId: string, p: TuneOutParams, transport?: string): string {
+export function alreadyTunedOutText(shown: string, p: TuneOutParams, transport?: string): string {
   // A duration so long its end is past what a Date can hold has no time to show.
   const expires = p.expiresAtMs !== undefined ? new Date(p.expiresAtMs) : undefined;
   const until = expires && Number.isFinite(expires.getTime())
@@ -53,7 +53,7 @@ export function alreadyTunedOutText(channelId: string, p: TuneOutParams, transpo
     : '';
   // A thrown error's words may end without a stop.
   const now = transport === undefined ? '' : /[.!?]$/.test(transport) ? `${transport} ` : `${transport}. `;
-  return `Nothing changed${transport !== undefined ? ' in the tune-out' : ''}: ${JSON.stringify(channelId)} is already `
+  return `Nothing changed${transport !== undefined ? ' in the tune-out' : ''}: ${JSON.stringify(shown)} is already `
     + `tuned out, with cadenceSeconds ${p.cadenceSeconds}, backlogCap ${p.backlogCap} and maxWakes ${p.maxWakes}${until}. `
     + now
     + 'To change those, cancel it first with tune_out mode "cancel", which delivers its backlog to you now, then call '
@@ -113,7 +113,7 @@ export interface TuneOutFrameworkHooks {
   /** Move the subconscious window anchor (never forward past active epochs). */
   setSubconsciousAnchor: (sequence: number) => void;
   /** True when a channel is bound to a conversation-fork agent. */
-  isForkBound: (channelId: string) => boolean;
+  isForkBound: (channel: ChannelRef) => boolean;
   /** Gate privileged-users list (#77: privileged authors wake, like mentions). */
   isPrivilegedAuthor: (authorId: string | null | undefined) => boolean;
   /** speak_in_channel master switch (recipe-side, canary-gated). */
@@ -142,6 +142,15 @@ export class TuneOutCoordinator {
 
   private key(serverId: string, channelId: string): string {
     return `${serverId}\0${channelId}`;
+  }
+
+  /** A channel as the resident and the subconscious are shown it
+   *  (ChannelRegistry.nameShown): its id, or, where another server registers
+   *  the same id, its server-qualified name, which tune_out and
+   *  cancel_tuneout take back; or, for a channel no string picks alone, its
+   *  id and its server. */
+  private shown(serverId: string, channelId: string): string {
+    return this.channelRegistry.nameShown({ serverId, channelId });
   }
 
   /** Restart cadence + expiry timers and re-anchor after a process restart. */
@@ -232,17 +241,17 @@ export class TuneOutCoordinator {
           + 'whoever runs this host.',
       };
     }
-    if (this.hooks.isForkBound(channelId)) {
+    if (this.hooks.isForkBound({ serverId, channelId })) {
       return {
         ok: false,
-        error: `Nothing changed: a conversation is bound to ${JSON.stringify(channelId)}, so its messages go to that `
+        error: `Nothing changed: a conversation is bound to ${JSON.stringify(this.shown(serverId, channelId))}, so its messages go to that `
           + "conversation, and tune_out won't divert a channel while one is. Calling tune_out on it again won't change "
           + 'that until the conversation ends, which happens only once the channel has been quiet for a while. Tune '
           + 'out a different channel, or ask whoever runs this host if this one should be diverted.',
       };
     }
     const current = this.channelRegistry.getTuneOutState(serverId, channelId);
-    if (current) return { ok: false, error: alreadyTunedOutText(channelId, current.params), alreadyTunedOut: true };
+    if (current) return { ok: false, error: alreadyTunedOutText(this.shown(serverId, channelId), current.params), alreadyTunedOut: true };
     // A tool's input reaches here as the model wrote it, and the store can't
     // keep a NaN or an Infinity: its append would throw after the registry
     // had marked the channel tuned out. So each option is read as a number
@@ -328,7 +337,7 @@ export class TuneOutCoordinator {
     const ended = this.channelRegistry.cancelTuneOut(serverId, channelId, 'open', source);
     if (!ended) {
       // Its reader is the resident's tune_out: cancel_tuneout finds the channel first.
-      return { ok: false, error: this.notTunedOut(channelId, 'you') };
+      return { ok: false, error: this.notTunedOut(this.shown(serverId, channelId), 'you') };
     }
     this.clearTimers(serverId, channelId);
     this.divertedSinceInvocation.delete(this.key(serverId, channelId));
@@ -359,10 +368,12 @@ export class TuneOutCoordinator {
         .join('\n');
       return `${authorOf(m)}: ${text}`;
     };
-    const lifecycle = `[Tune-out: ${channelId} cancelled — ${reason}, ${ended.wakeCount} wake${ended.wakeCount === 1 ? '' : 's'}]`;
+    // The channel as the resident and the subconscious are shown it.
+    const name = this.shown(serverId, channelId);
+    const lifecycle = `[Tune-out: ${name} cancelled — ${reason}, ${ended.wakeCount} wake${ended.wakeCount === 1 ? '' : 's'}]`;
     const render = (lines: string[], truncated: number): string => {
       const attrs = [
-        `channel="${channelId}"`,
+        `channel="${name}"`,
         `messages=${backlog.length}`,
         ...(truncated > 0 ? [`truncated=${truncated} (oldest; fetch_history covers the rest)`] : []),
       ];
@@ -441,7 +452,9 @@ export class TuneOutCoordinator {
       this.hooks.addMessage(
         subName,
         [{ type: 'text', text: subconsciousNote }],
-        { kind: 'subconscious-note', channelId, epochId },
+        // With its server: a conversational row whose channel the framework
+        // reads (repinChannel), where another server's channel can share the id.
+        { kind: 'subconscious-note', channelId, serverId, epochId },
       );
     }
     const primary = this.hooks.primaryName();
@@ -467,7 +480,7 @@ export class TuneOutCoordinator {
         : '';
       this.hooks.addMessage(
         'user',
-        [{ type: 'text', text: `[Tune-out cancelled: ${channelId} — ${reason}.${truncNote}${heldNote}]` }],
+        [{ type: 'text', text: `[Tune-out cancelled: ${this.shown(serverId, channelId)} — ${reason}.${truncNote}${heldNote}]` }],
         { system: true, kind: 'tune-out-cancel-report', channelId },
         subName,
       );
@@ -481,7 +494,7 @@ export class TuneOutCoordinator {
           subName,
         );
       }
-      this.hooks.requestInference(subName, `tune-out cancelled: ${channelId}`, 'tune-out');
+      this.hooks.requestInference(subName, `tune-out cancelled: ${name}`, 'tune-out');
     }
     this.hooks.emitTrace({ type: 'tune-out:cancelled', serverId, channelId, epochId, reason, wakeCount: ended.wakeCount });
     return { ok: true };
@@ -649,16 +662,17 @@ export class TuneOutCoordinator {
     if (!subName) return;
     const key = this.key(serverId, channelId);
 
+    const shown = this.shown(serverId, channelId);
     const notice = trigger === 'wake'
-      ? `[Tune-out wake: ${channelId} — ${count} addressed message${count === 1 ? '' : 's'}]`
-      : `[Tune-out cadence: ${channelId} — ${count} diverted message${count === 1 ? '' : 's'} since your last look]`;
+      ? `[Tune-out wake: ${shown} — ${count} addressed message${count === 1 ? '' : 's'}]`
+      : `[Tune-out cadence: ${shown} — ${count} diverted message${count === 1 ? '' : 's'} since your last look]`;
     this.hooks.addMessage(
       'user',
       [{ type: 'text', text: notice }],
       { system: true, kind: `tune-out-${trigger}`, channelId },
       subName,
     );
-    this.hooks.requestInference(subName, `tune-out ${trigger}: ${channelId}`, 'tune-out');
+    this.hooks.requestInference(subName, `tune-out ${trigger}: ${shown}`, 'tune-out');
     // Counted from here only once the turn has been asked for, so a turn that
     // throws leaves its messages for the next period's turn.
     this.divertedSinceInvocation.set(key, 0);
@@ -740,6 +754,8 @@ export class TuneOutCoordinator {
   async handleSubconsciousTool(
     name: string,
     input: Record<string, unknown>,
+    /** The calling turn's own channels, for a call made inside it (the framework's callOwnChannels). */
+    own: readonly ChannelRef[] = [],
   ): Promise<{ success: boolean; data?: unknown; error?: string; isError?: boolean }> {
     switch (name) {
       case 'deliver_summary': {
@@ -755,19 +771,48 @@ export class TuneOutCoordinator {
         }
         const subName = this.hooks.subconsciousName();
         if (!subName) return { success: false, error: 'subconscious not configured', isError: true };
-        // Verbatim, under its own participant name, into the resident's window.
+        // Verbatim, under its own participant name, into the resident's window,
+        // tagged with the channel the name means and its server, since the
+        // framework reads a conversational row's channel (repinChannel). The
+        // name means what it means to every channel tool: inside the calling
+        // turn, the id of one of the turn's own channels means that channel,
+        // refused where its server no longer registers it or the turn has
+        // channels with that id on two servers (ownChannelFor); otherwise a
+        // name several registered channels answer to is refused with them
+        // (sharedNameRefusalFor). So no row is left for a re-pin to read as
+        // another server's channel. A name no registered channel answers to
+        // is kept as given, with no server, which a re-pin reads by name when
+        // it weighs the row, as it reads any message without its server.
+        const mine = this.channelRegistry.ownChannelFor(channelId, own, 'deliver');
+        if (mine && 'error' in mine) return { success: false, error: mine.error, isError: true };
+        const shared = mine ? undefined : this.channelRegistry.sharedNameRefusalFor(channelId, 'nothing was delivered');
+        if (shared) return { success: false, error: shared, isError: true };
+        const [named] = mine ? [mine.channel] : this.channelRegistry.channelsNamed(channelId);
         this.hooks.addMessage(subName, [{ type: 'text', text }], {
           kind: 'subconscious-summary',
-          channelId,
+          ...(named ? { channelId: named.channelId, serverId: named.serverId } : { channelId }),
         });
         return { success: true, data: { delivered: true } };
       }
       case 'cancel_tuneout': {
-        const channelId = String(input.channelId ?? '');
-        const located = this.findByChannel(channelId);
-        if (!located) return { success: false, error: this.notTunedOut(channelId, 'the resident'), isError: true };
+        const name = String(input.channelId ?? '');
+        // The name means what it means to every channel tool, the
+        // resident's tune_out included: inside the calling turn, the id of
+        // one of the turn's own channels means that channel (ownChannelFor);
+        // otherwise a name several registered channels answer to is refused
+        // (channelsNamed), whichever of them is tuned out, never taken to be
+        // the tuned-out one.
+        const mine = this.channelRegistry.ownChannelFor(name, own);
+        if (mine && 'error' in mine) return { success: false, error: mine.error, isError: true };
+        const named = mine ? [mine.channel] : this.channelRegistry.channelsNamed(name);
+        const shared = mine ? undefined : this.channelRegistry.sharedNameRefusalFor(name);
+        if (shared) return { success: false, error: shared, isError: true };
+        const channel = named[0];
+        if (!channel || !this.channelRegistry.getTuneOutState(channel.serverId, channel.channelId)) {
+          return { success: false, error: this.notTunedOut(name, 'the resident'), isError: true };
+        }
         const note = typeof input.text === 'string' && input.text.trim() ? input.text.trim() : undefined;
-        const result = this.cancel(located.serverId, channelId, 'subconscious', 'subconscious judgment', note);
+        const result = this.cancel(channel.serverId, channel.channelId, 'subconscious', 'subconscious judgment', note);
         return result.ok
           ? { success: true, data: { cancelled: true } }
           : { success: false, error: result.error, isError: true };
@@ -817,7 +862,11 @@ export class TuneOutCoordinator {
         if (!text) {
           return { success: false, error: 'Nothing was posted: speak_in_channel needs the message in "text".', isError: true };
         }
-        return this.channelRegistry.publishForAgent(channelId, text, this.hooks.subconsciousName() ?? 'Subconscious');
+        // Inside the calling turn, the id of one of the turn's own channels
+        // means that channel, as for every channel tool (ownChannelFor).
+        const mine = this.channelRegistry.ownChannelFor(channelId, own, 'publish');
+        if (mine && 'error' in mine) return { success: false, error: mine.error, isError: true };
+        return this.channelRegistry.publishForAgent(mine ? mine.channel : channelId, text, this.hooks.subconsciousName() ?? 'Subconscious');
       }
       default:
         return { success: false, error: `unknown subconscious tool: ${name}`, isError: true };
@@ -825,30 +874,24 @@ export class TuneOutCoordinator {
   }
 
   /**
-   * A cancel of a channel that isn't tuned out: which channels are, so the
-   * next call can name one, and how a tune-out ends without one. `backlogTo`
+   * A cancel of a channel that isn't tuned out, by the name the caller gave
+   * or knows it by: which channels are, so the next call can name one, and
+   * how a tune-out ends without one. `backlogTo`
    * names the resident as the message's reader knows it: "you" to the
    * resident, "the resident" to the subconscious. It speaks of connected
    * channels because listActive reads the registered ones: removing a server
    * drops its channels and keeps their tune-outs, so a tune-out there is in
-   * neither this list nor findByChannel's lookup, and the text claims nothing
-   * about it.
+   * neither this list nor the name's lookup (channelsNamed, which reads the
+   * registered channels too), and the text claims nothing about it.
    */
-  private notTunedOut(channelId: string, backlogTo: 'you' | 'the resident'): string {
-    const active = this.listActive().map((e) => JSON.stringify(e.channelId));
+  private notTunedOut(name: string, backlogTo: 'you' | 'the resident'): string {
+    const active = this.listActive().map((e) => JSON.stringify(this.shown(e.serverId, e.channelId)));
     const opening = active.length === 0
       ? 'no connected channel is tuned out now.'
-      : `no connected channel ${JSON.stringify(channelId)} is tuned out. Connected channels tuned out now: `
+      : `no connected channel ${JSON.stringify(name)} is tuned out. Connected channels tuned out now: `
         + `${active.join(', ')}.`;
     return `Nothing was cancelled: ${opening} A tune-out also ends by itself when its duration runs out, or at the `
       + `first wake past its wake budget, and its backlog goes to ${backlogTo} then.`;
-  }
-
-  private findByChannel(channelId: string): { serverId: string } | null {
-    for (const entry of this.listActive()) {
-      if (entry.channelId === channelId) return { serverId: entry.serverId };
-    }
-    return null;
   }
 
   /** Stop all timers (framework shutdown). */

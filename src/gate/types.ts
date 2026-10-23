@@ -231,6 +231,18 @@ export interface GateEventInfo {
   tags?: string[];
 }
 
+/** An MCPL event whose content the framework stored at arrival, as a
+ *  batched wake names it to the framework (EventGate's `isNewestEntry`):
+ *  a channel message by its server, channel and message id, a push event by
+ *  its server and event id. */
+export interface GateEntryRef {
+  eventType: string;
+  serverId?: string;
+  channelId?: string;
+  messageId?: string;
+  eventId?: string;
+}
+
 /** Per-policy runtime statistics (for gate:status). */
 export interface GatePolicyStats {
   name: string;

@@ -147,6 +147,28 @@ test('model path: a payload the host cannot retain is reported as an incomplete 
   });
 });
 
+test("model path: where the only writable mount is direct, a payload's stub says no mount that keeps its files in the store can save it", async () => {
+  const code = mkdtempSync(join(tmpdir(), 'modern-direct-'));
+  const workspace = new WorkspaceModule({ mounts: [{ name: 'code', path: code, mode: 'read-write', backend: 'direct' }] });
+  try {
+    await withModern(async ({ framework, membrane }) => {
+      workspace.initStore(framework.getStore());
+      framework.start();
+      membrane.pushResponse(createMockResponse([
+        { type: 'tool_use', id: 'toolu_01MODERNMEDIA00000000001', name: 'mcpl--modern--media', input: {} },
+      ] as never, 'tool_use'));
+      membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Done.' }]));
+      framework.pushEvent({ type: 'external-message', source: 'test', content: 'go', metadata: {} } as never);
+      await waitFor('the tool round', () => (membrane.lastStream?.receivedToolResults.length ?? 0) >= 1);
+      const [delivered] = membrane.lastStream!.receivedToolResults[0] as Array<{ content: unknown; isError: boolean }>;
+      const text = JSON.stringify(delivered!.content);
+      assert.match(text, /\[image: image\/png, 8 B\. Not retained: a failed result is read as its text alone, and no workspace mount that keeps its files in the store can save it\]/);
+    }, [], [workspace]);
+  } finally {
+    rmSync(code, { recursive: true, force: true });
+  }
+});
+
 test('model path: the result reaches the model, structured-only as JSON', async () => {
   await withModern(async ({ framework, membrane }) => {
     framework.start();

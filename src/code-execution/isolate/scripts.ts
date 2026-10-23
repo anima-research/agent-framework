@@ -46,6 +46,8 @@ export interface ScriptCallContext {
   watch?: ScriptWatch;
   /** The call watching the script now, if one is: a result that ends the turn ends it at that call's return. Without it, `watch`. */
   watching?(): ScriptWatch | undefined;
+  /** The turn the script's run call was made in, when one was: the turn its words were written in, which a later turn's wait doesn't change. */
+  startTurnId?: number;
 }
 
 export interface ScriptsHost {
@@ -231,6 +233,7 @@ export class AgentScripts {
           ...script.context,
           ...(script.watch ? { watch: script.watch } : {}),
           watching: () => script.watch ?? undefined,
+          ...(script.turnId !== undefined ? { startTurnId: script.turnId } : {}),
         }),
       onWake: (payload, n) => this.wake(script, payload, n),
       onEnd: (ending) => this.ended(script, ending),

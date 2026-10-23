@@ -153,7 +153,7 @@ test('a channel_close whose record fails to append answers that nothing changed 
   assert.equal(closeCalls.length, closesBefore, 'nothing went to the server');
 
   const retried = await registry.handleChannelToolCall('channel_close', { channelId: 'c1' });
-  assert.deepEqual(retried.data, { channelId: 'c1', status: 'closed' });
+  assert.deepEqual(retried.data, { channelId: 'c1', serverId: 'discord', status: 'closed' });
   assert.deepEqual(decision(registry, 'c1'), { state: 'closed', source: 'agent-tool' });
 
   const restarted = makeRegistry(store).registry;
@@ -214,7 +214,7 @@ test('speech whose open fails to append its decision says nothing changed, and w
   // A store's words that end in a period lose it where the reason composes
   // them.
   failNext(decisionWrite, 'The disk is full.');
-  const outcome = await registry.deliverSpeech('agent', 'hello', 'c1');
+  const outcome = await registry.deliverSpeech('agent', 'hello', { serverId: 'discord', channelId: 'c1' });
   assert.equal(outcome.status, 'failed');
   assert.equal(outcome.reason, "opening the channel for these words didn't complete: this host couldn't record the decision: " +
     'The disk is full, so try again; if it fails the same way, ask whoever runs this host');

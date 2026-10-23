@@ -2,7 +2,7 @@
 export * from './types/index.js';
 
 // Core classes
-export { AgentFramework, BudgetPreflightError, ProviderWaitNotSleptError, QuiesceBlockedError, ResumeBlockedError } from './framework.js';
+export { AgentFramework, BudgetPreflightError, DefaultErrorPolicy, ProviderWaitNotSleptError, QuiesceBlockedError, ResumeBlockedError } from './framework.js';
 export type { RuntimeSettingsPreview, HostModeStatus } from './framework.js';
 export { Agent } from './agent.js';
 export type { StartStreamResult } from './agent.js';
@@ -72,7 +72,7 @@ export type { GateConfig, GateOptions, GatePolicy, GatePolicyMatch, GateBehavior
 
 // MCPL channel registry (exposed for modules that need channel-level operations)
 export { ChannelRegistry } from './mcpl/index.js';
-export type { PublishRefusalReason } from './mcpl/index.js';
+export type { ChannelRef, PublishRefusalReason } from './mcpl/index.js';
 
 // Where each accepted inbound item came from (`metadata.inboundSource`), and
 // the digest its delivered and stored bodies are stamped with

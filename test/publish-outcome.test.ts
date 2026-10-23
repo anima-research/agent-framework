@@ -15,7 +15,7 @@ import { tmpdir } from 'node:os';
 import { mkdtempSync, rmSync, writeFileSync, appendFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { CapabilityGrant, ALL_CAPABILITY_PATHS } from '../src/mcpl/capability-grant.js';
-import { ChannelRegistry } from '../src/mcpl/channel-registry.js';
+import { ChannelRegistry, destinationKey } from '../src/mcpl/channel-registry.js';
 import { McplRequestError } from '../src/mcpl/server-connection.js';
 import type { McplServerRegistry } from '../src/mcpl/server-registry.js';
 import type { FeatureSetManager } from '../src/mcpl/feature-set-manager.js';
@@ -59,7 +59,7 @@ function registryWith(
     channels: Map<string, { serverId: string; descriptor: { id: string; type: string; label: string }; open: boolean }>;
   }).channels;
   const seed = (serverId: string, id: string, label: string, open = true) =>
-    channels.set(`${serverId}:${id}`, { serverId, descriptor: { id, type: 'discord', label }, open });
+    channels.set(destinationKey({ serverId, channelId: id }), { serverId, descriptor: { id, type: 'discord', label }, open });
   return { registry, published, opened, seed };
 }
 
@@ -221,7 +221,7 @@ describe('ChannelRegistry.publish outcomes', () => {
       discord: { publish: async () => { throw new McplRequestError('part 2 failed', 'error-response', data); } },
     }, failures, traces);
     seed('discord', 'c', '#c');
-    const outcome = await registry.deliverSpeech('agent', 'words', 'c');
+    const outcome = await registry.deliverSpeech('agent', 'words', { serverId: 'discord', channelId: 'c' });
     assert.equal(outcome.status, 'unknown');
     assert.deepEqual(outcome.detail, data, 'the outcome still carries the complete structured data');
     const info = failures[0] as { detail?: string };
@@ -239,7 +239,7 @@ describe('ChannelRegistry.publish outcomes', () => {
       discord: { publish: async () => { throw new McplRequestError('part 2 failed', 'error-response', data); } },
     }, failures);
     seed('discord', 'c', '#c');
-    const outcome = await registry.deliverSpeech('agent', 'words', 'c');
+    const outcome = await registry.deliverSpeech('agent', 'words', { serverId: 'discord', channelId: 'c' });
     assert.equal(outcome.status, 'unknown');
     assert.equal(outcome.detail, data, 'the formatter does not change the source value');
     assert.equal((failures[0] as { detail?: string }).detail, '[unserializable connector value]');
@@ -277,8 +277,8 @@ describe('ChannelRegistry.publish outcomes', () => {
     seed('beta', 'discord:g1:room', '#room (Beta)');
     const shared = await registry.publish('agent', 'x', { channelId: 'discord:g1:room' });
     assert.equal(shared.status, 'failed');
-    assert.equal(shared.reason, 'channel id "discord:g1:room" is on more than one server, and no server was named for these ' +
-      'words; if you need them there, ask whoever runs this host');
+    assert.equal(shared.reason, 'channel id "discord:g1:room" is on more than one server ("alpha:discord:g1:room", ' +
+      '"beta:discord:g1:room"), and the destination named no server');
     assert.equal(published.length, 0, 'never routed through whichever server came first');
     const exact = await registry.publish('agent', 'x', { serverId: 'beta', channelId: 'discord:g1:room' });
     assert.equal(exact.status, 'delivered');
@@ -299,8 +299,8 @@ describe('ChannelRegistry.publish outcomes', () => {
     const { registry, seed } = registryWith({ discord: { publish: async () => ({}) }, other: { publish: async () => ({ delivered: false }) } }, failures);
     seed('discord', 'c', '#c');
     seed('other', 'd', '#d');
-    assert.equal(await registry.routeSpeech('agent', 'x', 'c'), null);
-    assert.equal(await registry.routeSpeech('agent', 'x', 'd'), null);
+    assert.equal(await registry.routeSpeech('agent', 'x', { serverId: 'discord', channelId: 'c' }), null);
+    assert.equal(await registry.routeSpeech('agent', 'x', { serverId: 'other', channelId: 'd' }), null);
     assert.deepEqual(failures.map((f) => f.outcome), ['unknown', 'failed']);
   });
 });

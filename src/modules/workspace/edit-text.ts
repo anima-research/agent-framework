@@ -190,8 +190,13 @@ function label(problem: EditProblem): string {
  */
 const FIRST_LINE_MAX = 400;
 
-/** What an answer is: a refusal, whose problems the agent answers and sends again, or the answer to edits stored, which mustn't be sent again. */
-export type AnswerKind = 'refusal' | 'stored';
+/**
+ * What an answer is: a refusal, whose problems the agent answers and sends
+ * again; the answer to edits stored, which mustn't be sent again; or, on a
+ * direct mount, the answer to an edit_many call written partway, whose parts
+ * are each file's outcome.
+ */
+export type AnswerKind = 'refusal' | 'stored' | 'written';
 
 /** A line cut to FIRST_LINE_MAX, as a part's first line is, and as a thrown message is in an answer's head. */
 export function cutLine(line: string): string {
@@ -205,18 +210,25 @@ export function cutLine(line: string): string {
  * shown and send the call again to see the rest: once those are answered,
  * their room can show the rest, details included. For edits stored, the
  * problems are the files disk refused, and a last line that leaves some out
- * points to ls.
+ * points to ls. For edits written partway, they're each file's outcome, and
+ * one that leaves some out points to read.
  */
 function tailText(kind: AnswerKind, maxChars: number, cut: number, problems: number, notes: number, anyShown: boolean): string {
   const items = [
     ...(cut ? [`the details of ${cut} of these`] : []),
-    ...(problems ? [kind === 'refusal' ? `${problems} more ${plural(problems, 'problem')}` : `${problems} more ${plural(problems, 'file')} disk refused`] : []),
+    ...(problems
+      ? [kind === 'refusal'
+        ? `${problems} more ${plural(problems, 'problem')}`
+        : kind === 'stored' ? `${problems} more ${plural(problems, 'file')} disk refused` : `the outcomes of ${problems} more ${plural(problems, 'file')}`]
+      : []),
     ...(notes ? [`${notes} ${plural(notes, 'note')} on the files' copies on disk`] : []),
   ];
   if (!items.length) return '';
   const next = kind === 'stored'
     ? problems ? " ls shows each path's state." : ''
-    : problems && anyShown ? ' Answer the problems shown and send the call again to see the rest.' : '';
+    : kind === 'written'
+      ? problems ? ' Reading a file shows it as disk has it now.' : ''
+      : problems && anyShown ? ' Answer the problems shown and send the call again to see the rest.' : '';
   const list = items.length < 2 ? items[0] : `${items.slice(0, -1).join(', ')} and ${items.at(-1)}`;
   return `[To keep this answer within ${maxChars.toLocaleString('en-US')} characters, it leaves out ${list}.${next}]`;
 }
@@ -271,9 +283,10 @@ export function fitted(head: string, problems: string[], notes: string[], maxCha
  * counts its problems and names each, in edit order, labelled with its edits.
  * `notes` follow the problems: which copy of a file the edits looked in, and
  * a conflict with disk, which the agent needs whether or not the call stored
- * anything.
+ * anything. On a direct mount, whose edits go to disk with no store between
+ * (`verb` 'wrote'), edit_many says it wrote none.
  */
-export function refusalText(tool: EditTool, problems: EditProblem[], notes: string[], maxChars: number): string {
+export function refusalText(tool: EditTool, problems: EditProblem[], notes: string[], maxChars: number, verb: 'stored' | 'wrote' = 'stored'): string {
   const sorted = [...problems].sort((a, b) => firstEdit(a) - firstEdit(b));
   if (tool === 'edit') {
     const [problem] = sorted;
@@ -281,7 +294,7 @@ export function refusalText(tool: EditTool, problems: EditProblem[], notes: stri
     const whole = problem!.kind === 'file' && problem!.whole ? text : `The edit did nothing: ${text}`;
     return fitted('', [whole], notes, maxChars, 'refusal');
   }
-  const head = `The edit_many call stored none of its edits: ${sorted.length} ${plural(sorted.length, 'problem')}.`;
+  const head = `The edit_many call ${verb} none of its edits: ${sorted.length} ${plural(sorted.length, 'problem')}.`;
   return fitted(head, sorted.map((problem) => `${label(problem)}${problemText(problem, tool)}`), notes, maxChars, 'refusal');
 }
 

@@ -19,6 +19,7 @@ import {
   // The package's public digest: consumers import it from the root.
   sourceBodyDigest,
   PassthroughStrategy,
+  type ChannelRef,
   type InboundSource,
   type Module,
   type ModuleContext,
@@ -205,7 +206,7 @@ describe('inbound source envelope', () => {
     // appended after ingestion stamped the delivered digest, at storage
     // time, when the channel has closed in between.
     const registry = (framework as unknown as {
-      channelRegistry: { handleChannelToolCall(name: string, input: unknown, caller: unknown): Promise<unknown>; isChannelOpen(id: string): boolean };
+      channelRegistry: { handleChannelToolCall(name: string, input: unknown, caller: unknown): Promise<unknown>; isChannelOpen(channel: ChannelRef): boolean };
     }).channelRegistry;
     const fw = framework as unknown as { pushEvent(e: { type: string }): void };
     const held: Array<{ type: string }> = [];
@@ -214,7 +215,7 @@ describe('inbound source envelope', () => {
     command({ op: 'incoming', channelId: ROOM, messageId: 'm-closed', mode: 'addressed', text: 'hello while open' });
     await waitFor(() => held.length > 0, 'incoming accepted and held');
     await registry.handleChannelToolCall('channel_close', { channelId: ROOM }, { kind: 'agent', agentName: 'scout' });
-    assert.equal(registry.isChannelOpen(ROOM), false);
+    assert.equal(registry.isChannelOpen({ serverId: 'discord', channelId: ROOM }), false);
     fw.pushEvent = push;
     for (const e of held) push(e);
     await waitFor(() => !!storedWith((m) => m.messageId === 'm-closed'), 'message stored');
@@ -605,7 +606,8 @@ describe('inbound source envelope under RFC-006 coalescing', () => {
     const f = await fixture({ framework: { conversations: { templateAgent: 'agent', bind: { channel: 'always' }, trigger: { channel: 'always' } } } as never }); t.after(f.close);
     await f.register();
     const forged = { sourceBodyDigest: 'adapter-value', storedBodyDigest: 'adapter-value' };
-    const router = (f.framework as unknown as { conversationRouter: { getBinding(id: string): { agentName: string } | undefined; unbind(id: string): void } }).conversationRouter;
+    const router = (f.framework as unknown as { conversationRouter: { getBinding(channel: ChannelRef): { agentName: string } | undefined; unbind(channel: ChannelRef): void } }).conversationRouter;
+    const chat: ChannelRef = { serverId: 'editor', channelId: 'chat' };
     const check = (text: string, fork: string) => {
       const copy = f.framework.getAgent(fork)!.getContextManager().getAllMessages().find((m) => JSON.stringify(m.content).includes(text));
       assert.ok(copy, `${text} stored in ${fork}`);
@@ -615,13 +617,13 @@ describe('inbound source envelope under RFC-006 coalescing', () => {
     };
     // Routed into a fresh fork by the conversation router.
     await f.send('channels/incoming', { messages: [{ ...f.channel('c1', 'routed_original', { initial: true }), metadata: forged }] });
-    const fork = router.getBinding('chat')!.agentName;
+    const fork = router.getBinding(chat)!.agentName;
     check('routed_original', fork);
     // A correction follows the prior delivery into that fork, though the
     // channel is no longer bound to it.
-    router.unbind('chat');
+    router.unbind(chat);
     await f.send('channels/incoming', { messages: [{ ...f.channel('c2', 'fork_correction'), metadata: forged }] });
-    assert.equal(router.getBinding('chat'), undefined, 'no fresh fork was spawned for the correction');
+    assert.equal(router.getBinding(chat), undefined, 'no fresh fork was spawned for the correction');
     check('fork_correction', fork);
   });
 

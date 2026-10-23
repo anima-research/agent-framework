@@ -500,7 +500,7 @@ export class ToolResultGuard {
   /**
    * Turn a withheld batch's notices into stubs that say where each original
    * is (agent-framework #277): written to the workspace when it has a
-   * writable mount without an include to take it, else kept in the audit
+   * writable mount without an include, not configured direct, to take it, else kept in the audit
    * record. A stub also keeps the file
    * lists its tool marked. Its own unedited placeholder is
    * the only thing it edits: an operator's later edit, removal or rollback
@@ -599,8 +599,8 @@ export class ToolResultGuard {
               if (block.type !== 'tool_result') return [];
               if (thrown.has(index)) return [{ toolUseId: block.toolUseId, error: thrown.get(index)! }];
               const spill = spills.get(index) ?? null;
-              // No file was written: no writable mount without an include,
-              // or the framework was stopping.
+              // No file was written: no writable mount without an include
+              // that isn't configured direct, or the framework was stopping.
               if (spill === null) return [{ toolUseId: block.toolUseId, skipped: 'no_workspace_file' }];
               if ('skipped' in spill) return [{ toolUseId: block.toolUseId, skipped: spill.skipped }];
               return [{ toolUseId: block.toolUseId, path: spill.path,

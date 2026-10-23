@@ -966,6 +966,37 @@ test('a concurrent resume() supersedes a draining quiesce: no abandon, no stale 
   });
 });
 
+test('the status lists the agents holding a turn, sorted, the set activeTurns counts', async () => {
+  const membrane = new HangingMembrane();
+  const dir = mkdtempSync(join(tmpdir(), 'host-quiesce-'));
+  const framework = await AgentFramework.create({
+    storePath: join(dir, 'store'),
+    membrane: membrane.asMembrane(),
+    agents: [
+      { name: 'zed', model: 'test-model', systemPrompt: 'test' },
+      { name: 'amy', model: 'test-model', systemPrompt: 'test' },
+    ],
+    modules: [],
+  });
+  try {
+    assert.deepEqual(framework.getHostModeStatus().activeTurnAgents, [], 'no turn is held while idle');
+    framework.start();
+    framework.nudgeAgent('zed', 'operator');
+    framework.nudgeAgent('amy', 'operator');
+    await waitFor('both turns to start', () => membrane.calls.length === 2);
+    const serving = framework.getHostModeStatus();
+    assert.deepEqual(serving.activeTurnAgents, ['amy', 'zed'], 'both streams are running, listed in order');
+    assert.equal(serving.activeTurns, 2, 'the list is the set activeTurns counts');
+
+    const status = await framework.quiesce({ timeoutMs: 1_000, abandon: true });
+    assert.equal(status.drained, true);
+    assert.deepEqual(status.activeTurnAgents, [], 'the abandon ended both');
+  } finally {
+    await framework.stop();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test('abandon reports turns it cannot cancel (token held, no stream)', async () => {
   const membrane = new MockMembrane();
   await withFramework(membrane, async (framework) => {
@@ -978,6 +1009,7 @@ test('abandon reports turns it cannot cancel (token held, no stream)', async () 
       const status = await framework.quiesce({ timeoutMs: 1_000, abandon: true });
       assert.equal(status.drained, false);
       assert.deepEqual(status.unabandonable, ['agent']);
+      assert.deepEqual(status.activeTurnAgents, ['agent'], 'the turn it cannot cancel still holds its turn');
       const trace = traces.find((t) => t.type === 'host:quiesce') as { unabandonable?: string[] } | undefined;
       assert.deepEqual(trace?.unabandonable, ['agent']);
       assert.equal(membrane.calls.length, 0, 'nothing was cancelled or started');
@@ -1154,8 +1186,10 @@ test('abandon can escalate an already-quiesced, undrained host', async () => {
 
     // Old behavior: `if (this.quiesced) return status` made this a no-op and
     // the only way out was resume()+re-quiesce, reopening planes mid-surgery.
+    assert.deepEqual(first.activeTurnAgents, ['agent'], 'the first window lists the turn still held');
     const second = await framework.quiesce({ abandon: true });
     assert.equal(second.drained, true, 'second quiesce escalates to abandon');
+    assert.deepEqual(second.activeTurnAgents, [], 'and the turn it ended holds none');
   });
 });
 

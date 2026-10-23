@@ -419,6 +419,17 @@ export interface InferenceRequest {
    */
   channelId?: string;
   /**
+   * The server of `channelId`'s channel. MCPL requires a channel id to be
+   * unique only within one server's connection (§14.2), so where two
+   * servers register the same id only the pair names one channel. The
+   * framework's own wakes set it beside `channelId`. A host's request that
+   * gives `channelId` alone names the one channel that id, or its
+   * server-qualified name (`serverId:channelId`), means; one that two
+   * servers' channels answer to names none, and the turn's speech has no
+   * channel of its own.
+   */
+  channelServerId?: string;
+  /**
    * True when the triggering message explicitly addressed the agent (mention,
    * reply-to-bot, DM — `chat:addressed` in MCPL RFC-001 terms). When a wake
    * batch spans several channels, an addressed channel outranks ambient

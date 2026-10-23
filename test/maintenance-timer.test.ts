@@ -1416,7 +1416,7 @@ describe('queued context maintenance timer', () => {
           ...(conversational ? { conversations: { templateAgent: 'agent', strategyFactory: () => tick } } : {}),
         });
         const internals = framework as unknown as {
-          createConversationAgent(name: string, channelId: string): Promise<unknown>;
+          createConversationAgent(name: string, home: { serverId: string; channelId: string }): Promise<unknown>;
           reserveStoreForSurgery(verb: string, agentName: string): () => void;
           recordProviderWait(agentName: string, model: string, error: Error): unknown;
         };
@@ -1426,7 +1426,7 @@ describe('queued context maintenance timer', () => {
         const quiet = console.error;
         console.error = () => {};
         try {
-          if (conversational) await internals.createConversationAgent(name, 'chan-1');
+          if (conversational) await internals.createConversationAgent(name, { serverId: 'stub', channelId: 'chan-1' });
           if (held) internals.recordProviderWait(name, 'test-model', heldFor(60_000));
           framework.start();
           await waitFor(() => tick.entered);
@@ -1646,7 +1646,7 @@ describe('queued context maintenance timer', () => {
         ...(conversational ? { conversations: { templateAgent: 'agent', strategyFactory: () => tick } } : {}),
       });
       const internals = framework as unknown as {
-        createConversationAgent(name: string, channelId: string): Promise<unknown>;
+        createConversationAgent(name: string, home: { serverId: string; channelId: string }): Promise<unknown>;
         recordProviderWait(agentName: string, model: string, error: Error): unknown;
       };
       const name = conversational ? 'agent-conv-1' : 'agent';
@@ -1657,7 +1657,7 @@ describe('queued context maintenance timer', () => {
       console.error = (...args: unknown[]) => { logged.push(args.map(String).join(' ')); };
       let stopping: Promise<void> | undefined;
       try {
-        if (conversational) await internals.createConversationAgent(name, 'chan-1');
+        if (conversational) await internals.createConversationAgent(name, { serverId: 'stub', channelId: 'chan-1' });
         if (held) internals.recordProviderWait(name, 'test-model', heldFor(60_000));
         framework.start();
         await waitFor(() => tick.entered);
@@ -1995,7 +1995,7 @@ describe('queued context maintenance timer', () => {
       },
     });
     const internals = framework as unknown as {
-      createConversationAgent(name: string, channelId: string): Promise<unknown>;
+      createConversationAgent(name: string, home: { serverId: string; channelId: string }): Promise<unknown>;
       disposeConversationAgent(name: string): void;
       noteInferenceExhausted(agentName: string, reason: string, retryable?: boolean, errorType?: string): void;
       overBudgetDrains: Set<Promise<void>>;
@@ -2008,7 +2008,7 @@ describe('queued context maintenance timer', () => {
     try {
       // The kick's body runs a microtask later, so each fork is disposed
       // before the drain's first check.
-      await internals.createConversationAgent('trunk-chan-g1', 'world:chan');
+      await internals.createConversationAgent('trunk-chan-g1', { serverId: 'stub', channelId: 'world:chan' });
       internals.noteInferenceExhausted('trunk-chan-g1', 'compile refused', false, 'over_budget');
       assert.equal(internals.overBudgetDrains.size, 1, 'a kick was started');
       internals.disposeConversationAgent('trunk-chan-g1');
@@ -2022,7 +2022,7 @@ describe('queued context maintenance timer', () => {
       );
       // A surgery for another agent holding the store as well: the log names
       // the disposal, the agent's own reason.
-      await internals.createConversationAgent('trunk-chan-g2', 'world:chan');
+      await internals.createConversationAgent('trunk-chan-g2', { serverId: 'stub', channelId: 'world:chan' });
       internals.noteInferenceExhausted('trunk-chan-g2', 'compile refused', false, 'over_budget');
       internals.disposeConversationAgent('trunk-chan-g2');
       internals.surgeryHold = { verb: 'rollback', agentName: 'trunk', since: Date.now() };
@@ -2055,13 +2055,13 @@ describe('queued context maintenance timer', () => {
       conversations: { templateAgent: 'trunk', bind: { channel: 'mention' }, strategyFactory: () => fork },
     });
     const internals = framework as unknown as {
-      createConversationAgent(name: string, channelId: string): Promise<unknown>;
+      createConversationAgent(name: string, home: { serverId: string; channelId: string }): Promise<unknown>;
       disposeConversationAgent(name: string): void;
     };
     const quiet = console.error;
     console.error = () => {};
     try {
-      await internals.createConversationAgent('trunk-chan-g1', 'world:chan');
+      await internals.createConversationAgent('trunk-chan-g1', { serverId: 'stub', channelId: 'world:chan' });
       framework.start();
       const maintaining = framework.maintenanceTick();
       await waitFor(() => fork.ticks === 1);

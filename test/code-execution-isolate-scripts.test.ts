@@ -284,8 +284,8 @@ test("each call carries the script's origin, and the watching call's turn only w
   assert.deepEqual(
     contexts.map((c) => { const { watching: _, ...rest } = c as { watching?: unknown }; return rest; }),
     [
-      { name: 'echo', origin: 'origin-1', watch },
-      { name: 'slow', origin: 'origin-1', watch },
+      { name: 'echo', origin: 'origin-1', watch, startTurnId: 7 },
+      { name: 'slow', origin: 'origin-1', watch, startTurnId: 7 },
     ],
   );
   assert.equal((contexts[1] as { watching(): unknown }).watching(), watch);
@@ -294,6 +294,32 @@ test("each call carries the script's origin, and the watching call's turn only w
   const r = await running;
   assert.deepEqual(r.ending, { how: 'finished' });
   assert.equal((contexts[1] as { watching(): unknown }).watching(), undefined);
+  await scripts.dispose();
+});
+
+test("a script's calls carry the turn its run was made in, under a later turn's wait too", async () => {
+  const contexts: Array<{ name: string; watch?: { turnId?: number }; startTurnId?: number }> = [];
+  const gates: Array<() => void> = [];
+  const { scripts } = setup({
+    config: { yieldMs: 30_000 },
+    host: {
+      dispatch: async (_agent, name, args, context) => {
+        contexts.push({ name, ...context });
+        if (name === 'slow') await new Promise<void>((resolve) => gates.push(resolve));
+        return result(`${name} ${args}`);
+      },
+    },
+  });
+  // The run returns at once, and the script goes on; a later turn waits on it.
+  const run = await scripts.run('alice', `await tools.slow({}); await tools.echo({});`, 0, { watch: { turnId: 7, endTurn: false } });
+  for (let i = 0; i < 2_000 && gates.length === 0; i++) await new Promise((r) => setTimeout(r, 10));
+  const waiting = scripts.wait('alice', run.scriptId, 30_000, { turnId: 9, endTurn: false });
+  gates[0]!();
+  const r = await waiting;
+  assert.deepEqual(r.ending, { how: 'finished' });
+  const echo = contexts.find((c) => c.name === 'echo');
+  assert.equal(echo?.watch?.turnId, 9, 'the call carries the turn watching it');
+  assert.equal(echo?.startTurnId, 7, 'and the turn its script was started in');
   await scripts.dispose();
 });
 

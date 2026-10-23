@@ -1236,19 +1236,20 @@ describe('a round whose run or wait call watches a script that can change its ro
     // What each `>>` label names; a test can rename one while a script runs.
     const directory: Record<string, string> = { '#alpha': 'chan-alpha' };
     (framework as unknown as { channelRegistry: unknown }).channelRegistry = new Proxy({
-      resolveLocus: () => 'world:test',
-      resolveProseTarget: (spec: string) => (directory[spec] ? { channelId: directory[spec] } : { error: `no channel ${spec}` }),
-      routeSpeech: async (_agent: string, text: string, channelId: string | null) => {
-        if (!channelId) return null;
-        log.push(`publish:${text}@${channelId}`);
-        return { delivered: true, serverId: 'stub', channelId };
+      // Every channel is the stub's server's: the framework names each with it.
+      resolveLocus: () => ({ serverId: 'stub', channelId: 'world:test' }),
+      resolveProseTarget: (spec: string) => (directory[spec] ? { serverId: 'stub', channelId: directory[spec] } : { error: `no channel ${spec}` }),
+      routeSpeech: async (_agent: string, text: string, to: { channelId: string } | null) => {
+        if (!to) return null;
+        log.push(`publish:${text}@${to.channelId}`);
+        return { delivered: true, serverId: 'stub', channelId: to.channelId };
       },
       // A named or sticky destination posts through deliverSpeech, as with
       // the real registry, which reports the post's outcome.
-      deliverSpeech: async (_agent: string, text: string, channelId: string | null) => {
-        if (!channelId) return { status: 'failed', reason: 'no channel', at: Date.now() };
-        log.push(`publish:${text}@${channelId}`);
-        return { status: 'delivered', destination: { serverId: 'stub', channelId }, at: Date.now() };
+      deliverSpeech: async (_agent: string, text: string, to: { channelId: string } | null) => {
+        if (!to) return { status: 'failed', reason: 'no channel', at: Date.now() };
+        log.push(`publish:${text}@${to.channelId}`);
+        return { status: 'delivered', destination: { serverId: 'stub', channelId: to.channelId }, at: Date.now() };
       },
       resolveDestination: ({ channelId }: { channelId: string }) => ({ destination: { serverId: 'stub', channelId } }),
       // Each delivery hands its stream the destination its publish went to,
@@ -1261,7 +1262,7 @@ describe('a round whose run or wait call watches a script that can change its ro
         log.push(`tool:${name}`);
         if (name === 'skip_reply') return { success: true, endTurn: true, data: { skipped: true, note: 'Turn ended; nothing sent.' } };
         // A successful channel_open moves the turn's locus, as the real one does.
-        if (name === 'channel_open') return { success: true, data: { channelId: input?.channelId } };
+        if (name === 'channel_open') return { success: true, data: { channelId: input?.channelId, serverId: 'stub' } };
         return { success: true, data: {} };
       },
       getChannelTools: () => CHANNEL_TOOLS,

@@ -7,7 +7,7 @@
 
 import test, { type TestContext } from 'node:test';
 import assert from 'node:assert/strict';
-import { appendFileSync, chmodSync, existsSync, mkdirSync, mkdtempSync, realpathSync, renameSync, rmSync, statSync, symlinkSync, truncateSync, unlinkSync, writeFileSync } from 'node:fs';
+import { appendFileSync, chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, renameSync, rmSync, statSync, symlinkSync, truncateSync, unlinkSync, writeFileSync } from 'node:fs';
 import { createRequire, syncBuiltinESMExports } from 'node:module';
 import { tmpdir } from 'node:os';
 import { basename, dirname, join } from 'node:path';
@@ -1830,8 +1830,6 @@ test('a direct mount whose config sets what would never act there is refused, na
     assert.fail(`accepted ${JSON.stringify(mount)}`);
   };
   const lead = '[workspace] Mount "ref" is direct, which reads disk as it is with no store, watcher or push: ';
-  assert.equal(refused({ mode: 'read-write' }), `${lead}mode must be 'read-only', not "read-write"`);
-  assert.equal(refused({ mode: undefined }), `${lead}mode must be 'read-only' (left out, it's 'read-write')`);
   assert.equal(refused({ watch: 'always' }), `${lead}watch "always" would watch nothing (leave it out, or set 'never')`);
   assert.equal(refused({ watch: 'on-agent-action' }), `${lead}watch "on-agent-action" would watch nothing (leave it out, or set 'never')`);
   assert.equal(refused({ watchDebounceMs: 100 }), `${lead}watchDebounceMs would tune no watcher (leave it out)`);
@@ -1840,11 +1838,12 @@ test('a direct mount whose config sets what would never act there is refused, na
   assert.equal(refused({ wakeOnChange: ['created'] }), `${lead}wakeOnChange would never wake (leave it out)`);
   assert.equal(refused({ autoMaterialize: true }), `${lead}autoMaterialize would never push (leave it out)`);
   assert.equal(
-    refused({ mode: 'read-write', autoMaterialize: true }),
-    `${lead}mode must be 'read-only', not "read-write"; autoMaterialize would never push (leave it out)`,
+    refused({ mode: 'read-write', watch: 'always', autoMaterialize: true }),
+    `${lead}watch "always" would watch nothing (leave it out, or set 'never'); autoMaterialize would never push (leave it out)`,
   );
-  for (const accepted of [{}, { watch: 'never' as const }, { wakeOnChange: false }, { wakeOnChange: [] }, { autoMaterialize: false }]) {
-    new WorkspaceModule({ mounts: [{ ...base, ...accepted }] });
+  // Either mode is a direct mount's own, and one that names none writes, as any mount does.
+  for (const accepted of [{}, { mode: 'read-write' as const }, { mode: undefined }, { watch: 'never' as const }, { wakeOnChange: false }, { wakeOnChange: [] }, { autoMaterialize: false }]) {
+    new WorkspaceModule({ mounts: [{ ...base, ...accepted } as MountConfig] });
   }
   assert.throws(
     () => new WorkspaceModule({ mounts: [{ ...base, backend: 'disk' as MountConfig['backend'] }] }),
@@ -1893,8 +1892,8 @@ test("a mount the store holds changes on that disk lacks runs as 'chronicle', sa
   const held = await env.open({ walkCap: 1 });
   warned.mock.restore();
   const message = "A mount configured direct runs as 'chronicle' this session. To start it direct, settle each held change, then "
-    + "start it again: sync its path to take disk's copy, or configure the mount 'chronicle' and read-write, materialize it, "
-    + "follow the answer, and restore its direct config. "
+    + "start it again: sync its path to take disk's copy, or materialize it by name, a read-only one configured read-write "
+    + "first, and follow the answer. Meanwhile it takes no writes. "
     + 'Mount "ref" holds 4 changes that disk lacks: "ref/both.ts" (in conflict), "ref/deleted.ts" (deleted in the workspace), '
     + '"ref/dot.img" (in conflict), "ref/drafted.ts" (changed in the workspace).';
   assert.deepEqual(env.alerts, [{ kind: 'workspace-mount-not-direct', agent: 'framework', message, data: { held: { ref: 4 } } }]);
@@ -1960,7 +1959,7 @@ test("the ways out say to sync the path of an intent it can't read, where one is
   const chronicle = await env.openChronicle();
   for (let i = 0; i < 11; i++) await data(chronicle, 'write', { path: `ref/d${String(i).padStart(2, '0')}.ts`, content: `${i}\n` });
   await env.close(chronicle);
-  const sentence = "and restore its direct config. Sync the path of an intent it can't read. Mount \"ref\" holds";
+  const sentence = "Meanwhile it takes no writes. Sync the path of an intent it can't read. Mount \"ref\" holds";
 
   await env.close(await env.open());
   assert.ok(!env.alerts[0]!.message.includes('Sync the path'), env.alerts[0]!.message);
@@ -2075,8 +2074,8 @@ test('mounts configured direct that the store holds changes on are named in one 
   const both = await env.open({}, [{ name: 'other', path: other, mode: 'read-only', backend: 'direct' }]);
   assert.equal(env.alerts.length, 1);
   assert.equal(env.alerts[0]!.message, "Mounts configured direct run as 'chronicle' this session. To start a mount direct, settle each change "
-    + "held at it, then start it again: sync its path to take disk's copy, or configure the mount 'chronicle' and read-write, "
-    + "materialize it, follow the answer, and restore its direct config. "
+    + "held at it, then start it again: sync its path to take disk's copy, or materialize it by name, a read-only one "
+    + "configured read-write first, and follow the answer. Meanwhile it takes no writes. "
     + 'Mounts "ref" (1 change that disk lacks) and "other" (2 changes that disk lacks) hold: "ref/a.ts" (changed in the workspace), '
     + '"other/b.ts" (changed in the workspace), "other/c.ts" (changed in the workspace).');
   assert.deepEqual(env.alerts[0]!.data, { held: { ref: 1, other: 2 } });
@@ -2273,6 +2272,69 @@ test("a mount configured direct with no ignore list walks by the direct kind's d
   const listed = (await data<{ entries: Array<{ path: string }> }>(held, 'ls', { path: 'ref', recursive: true })).entries.map((e) => e.path);
   assert.deepEqual(listed.filter((path) => !['drafted.ts', 'src/a.ts'].includes(path)), []);
   assert.deepEqual(env.store.treeList('workspace/ref/tree').map((e) => e.path).sort(), ['drafted.ts', 'src/a.ts']);
+});
+
+test("a mount configured direct that runs as 'chronicle' is still direct to getMounts, and its agents' saved positions still give the notice", async (t) => {
+  const env = new Env(t);
+  // A direct session's scout position, saved at its stop, on a branch gone since.
+  const direct = await env.open({ mode: 'read-write' });
+  (direct as unknown as { directHeads: Map<string, Map<string, unknown>> }).directHeads.set('ref', new Map([['scout', { branchId: 'zz-a-branch-gone-since', after: 1, notice: null }]]));
+  await env.close(direct);
+  const chronicle = await env.openChronicle();
+  await data(chronicle, 'write', { path: 'ref/drafted.ts', content: 'draft\n' });
+  await env.close(chronicle);
+  // Naming no mode, so it's writable.
+  const m = await env.open({ mode: undefined });
+  assert.equal(env.alerts.length, 1, "it runs as 'chronicle'");
+  // Its directory is a checkout either way, so the framework's files pass over it.
+  assert.equal(m.getMounts()[0]?.backend, 'direct');
+  // And status gives its mode as writable, as when it runs direct.
+  const status = (await data<Record<string, Record<string, unknown>>>(m, 'status')).ref!;
+  assert.deepEqual([status.mode, status.backend], ['read-write', 'chronicle']);
+  // And the writes the scout made while it ran direct are on disk.
+  assert.deepEqual(m.headMoveNotice('scout')?.mounts, ['ref']);
+  await env.close(m);
+  // A mode it names is given as named, and a store-backed mount naming none shows none, as on main.
+  const named = await env.open({ mode: 'read-only' });
+  const namedStatus = (await data<Record<string, Record<string, unknown>>>(named, 'status')).ref!;
+  assert.deepEqual([namedStatus.mode, namedStatus.backend], ['read-only', 'chronicle']);
+  await env.close(named);
+  const plain = await env.open({ backend: 'chronicle', mode: undefined, watch: 'never' });
+  assert.equal((await data<Record<string, Record<string, unknown>>>(plain, 'status')).ref!.mode, undefined);
+});
+
+test("a writable mount configured direct that runs as 'chronicle' takes no writes, edits or deletions until what's held is settled, and a materialize naming it settles it", async (t) => {
+  const env = new Env(t);
+  env.file('kept.ts', 'disk\n');
+  const chronicle = await env.openChronicle();
+  await data(chronicle, 'write', { path: 'ref/drafted.ts', content: 'draft\n' });
+  await env.close(chronicle);
+  const m = await env.open({ mode: undefined });
+  assert.equal(env.alerts.length, 1, "it runs as 'chronicle'");
+  const why = 'Mount "ref" is configured direct, and runs as \'chronicle\' this session because its start found the store holding changes there that disk lacks, '
+    + 'so it takes no writes this session, and calling again is refused the same way. To run it direct again, settle what\'s held '
+    + '(sync each held path to take disk\'s copy, or materialize mount "ref" by name to write the store\'s copies to disk), and the host\'s next start runs it direct';
+  // And getMounts gives it as read-only this session, so a caller choosing where to save passes over it.
+  assert.deepEqual(m.getMounts().map(({ name, mode, backend }) => ({ name, mode, backend })), [{ name: 'ref', mode: 'read-only', backend: 'direct' }]);
+  const pending = async () => (await data<Record<string, { pendingChanges: number }>>(m, 'status')).ref!.pendingChanges;
+  assert.equal(await pending(), 1);
+  assert.equal(await failure(m, 'write', { path: 'ref/new.ts', content: 'x\n' }), why);
+  assert.match(await failure(m, 'edit', { path: 'ref/kept.ts', oldString: 'disk', newString: 'edited' }), new RegExp(`${why.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}`));
+  assert.match(await failure(m, 'edit_many', { edits: [{ path: 'ref/kept.ts', oldString: 'disk', newString: 'edited' }] }), new RegExp(`${why.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}`));
+  assert.equal(await failure(m, 'delete', { path: 'ref/kept.ts' }), why);
+  assert.deepEqual(await m.writeBinary('ref/dot.img', Buffer.from('img'), 'image/png'), { success: false, isError: true, error: why });
+  // Nothing reached disk or the store, so what's held is as it was.
+  assert.equal(readFileSync(join(env.ref, 'kept.ts'), 'utf8'), 'disk\n');
+  assert.equal(existsSync(join(env.ref, 'new.ts')), false);
+  assert.equal(await pending(), 1);
+  // A materialize naming it writes the store's copy to disk, and the next start runs it direct.
+  await data(m, 'materialize', { mount: 'ref' });
+  assert.equal(readFileSync(join(env.ref, 'drafted.ts'), 'utf8'), 'draft\n');
+  await env.close(m);
+  const direct = await env.open({ mode: undefined });
+  assert.equal(env.alerts.length, 1, 'no new alert: it runs direct');
+  await data(direct, 'write', { path: 'ref/new.ts', content: 'x\n' });
+  assert.equal(readFileSync(join(env.ref, 'new.ts'), 'utf8'), 'x\n');
 });
 
 test("a mount that ran direct takes in what disk changed meanwhile when it runs as 'chronicle' again", async (t) => {

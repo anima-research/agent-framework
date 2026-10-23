@@ -17,9 +17,27 @@ A prose segment's FIRST line may carry a routing prefix:
 ```
 >>#channel-name          send to the channel with this label
 >>@person                send to the DM with this person
->>discord:guild:id       send by exact channel id (always unambiguous)
+>>discord:guild:id       send by exact channel id
+>>srv:discord:guild:id   the same channel id on the MCPL server `srv`, where more than one server registers it
 >>skip_reply             do not send; text stays in context only (mirrors the skip_reply tool)
 ```
+
+A channel id is unique only within one MCPL server's connection, so two
+servers can register the same one. A target that more than one channel
+answers to is refused, with its candidates named so each can be told apart:
+by its id, or, where its id is shared, in the server-qualified form, or, where
+that is shared too (ids hold colons), by its id and server, which no target
+takes. The server-qualified form is looked up among the registered pairs,
+never split at a colon. Within a turn, an id that one of the turn's own
+channels has, a channel the turn has been in (the channel of the message it
+answers, and any a mid-turn message or channel_open moved it to), means that
+channel, on its server, even where another server registers the id, and is
+refused once that server no longer registers it: the words go only where the
+message came from, never through another server that has the id. Where two of
+the turn's channels have that id, on two servers, it means neither, and is
+refused with each named. The channel tools, tune_out and the subconscious's
+cancel_tuneout, speak_in_channel and deliver_summary read a name the turn gives
+them the same way.
 
 - Body may start on the same line (`>>#ops deploy done`) or the next.
 - **Sticky within the turn:** the latest resolved target applies to later

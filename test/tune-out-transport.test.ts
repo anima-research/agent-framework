@@ -22,7 +22,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 import { AgentFramework } from '../src/index.js';
-import { ChannelRegistry } from '../src/mcpl/channel-registry.js';
+import { ChannelRegistry, destinationKey } from '../src/mcpl/channel-registry.js';
 import type { TuneOutParams } from '../src/mcpl/channel-registry.js';
 import { CapabilityGrant, ALL_CAPABILITY_PATHS } from '../src/mcpl/capability-grant.js';
 import { McplRequestError } from '../src/mcpl/server-connection.js';
@@ -88,7 +88,7 @@ async function closedChannel() {
   const closed = await registry.handleChannelToolCall('channel_close', { channelId: 'y' });
   assert.equal((closed.data as { status?: string } | undefined)?.status, 'already closed');
   server.sent.length = 0;
-  const isOpen = () => (registry as unknown as { channels: Map<string, { open: boolean }> }).channels.get('a:y')?.open;
+  const isOpen = () => (registry as unknown as { channels: Map<string, { open: boolean }> }).channels.get(destinationKey({ serverId: 'a', channelId: 'y' }))?.open;
   assert.equal(isOpen(), false);
   return { registry, servers, server, isOpen, host };
 }
@@ -200,7 +200,7 @@ test('a tune-out on a server whose channels this host can\'t open says its messa
   assert.deepEqual(without.sent, []);
   assert.equal(f.registry.getDesiredState('a', 'y'), 'tuned-out');
   // A channel that server has open needs nothing from this host.
-  (f.registry as unknown as { channels: Map<string, { open: boolean }> }).channels.get('a:y')!.open = true;
+  (f.registry as unknown as { channels: Map<string, { open: boolean }> }).channels.get(destinationKey({ serverId: 'a', channelId: 'y' }))!.open = true;
   assert.equal(await f.registry.openForTuneOut('a', 'y'), undefined, 'open there');
   assert.deepEqual(without.sent, []);
 });
@@ -679,7 +679,7 @@ test('a tune-out made while a decline\'s acknowledgment is out opens the channel
   for (let i = 0; i < 5; i++) await tick();
   assert.deepEqual(server.sent, ['open y'], 'one open, the tune-out\'s');
   assert.equal((declined.data as { status?: string } | undefined)?.status, 'replaced');
-  assert.equal((registry as unknown as { channels: Map<string, { open: boolean }> }).channels.get('a:y')?.open, true);
+  assert.equal((registry as unknown as { channels: Map<string, { open: boolean }> }).channels.get(destinationKey({ serverId: 'a', channelId: 'y' }))?.open, true);
 });
 
 test('a decline of a tuned-out channel is refused, open or not, and changes nothing', async () => {
@@ -691,7 +691,7 @@ test('a decline of a tuned-out channel is refused, open or not, and changes noth
     error: 'Channel "y" is tuned out: its messages go to the subconscious, and channel_decline doesn\'t change that. Call ' +
       'tune_out with channelId "y" and mode "cancel" for it to resume normal attention; cancelling delivers the diverted ' +
       'backlog.',
-    data: { refusal: 'tuned-out', channelId: 'y' },
+    data: { refusal: 'tuned-out', channelId: 'y', serverId: 'a' },
   };
   assert.equal(f.isOpen(), false, 'its transport isn\'t open');
   assert.deepEqual(await f.registry.handleChannelToolCall('channel_decline', { channelId: 'y', messageId: 'm1', acknowledge: '👀' }), refusal);
@@ -713,7 +713,7 @@ test('a close of a tuned-out channel is refused, open or not, and changes nothin
     error: 'Channel "y" is tuned out: its messages go to the subconscious, and channel_close doesn\'t change that. Call ' +
       'tune_out with channelId "y" and mode "cancel" for it to resume normal attention; cancelling delivers the diverted ' +
       'backlog, and channel_close closes it after that.',
-    data: { refusal: 'tuned-out', channelId: 'y' },
+    data: { refusal: 'tuned-out', channelId: 'y', serverId: 'a' },
   };
   const agent = { kind: 'agent' as const, agentName: 'scout' };
   assert.equal(f.isOpen(), false, 'its transport isn\'t open');
@@ -744,7 +744,7 @@ test('a close of a tuned-out channel while the tune-out\'s own open is out is re
   // the channel's queue first would never answer here.
   const closed = await f.registry.handleChannelToolCall('channel_close', { channelId: 'y' }, { kind: 'agent', agentName: 'scout' });
   assert.equal(closed.isError, true);
-  assert.deepEqual(closed.data, { refusal: 'tuned-out', channelId: 'y' });
+  assert.deepEqual(closed.data, { refusal: 'tuned-out', channelId: 'y', serverId: 'a' });
   assert.equal(f.registry.getDesiredState('a', 'y'), 'tuned-out');
   release();
   assert.equal(await opening, undefined, 'the tune-out stands, and its open answers success');
@@ -767,7 +767,7 @@ test('a module\'s close of a tuned-out channel that certifies an idle lease is r
       error: 'Channel "y" is tuned out: its messages go to the subconscious, and channel_close doesn\'t change that. Call ' +
         'tune_out with channelId "y" and mode "cancel" for it to resume normal attention; cancelling delivers the diverted ' +
         'backlog, and channel_close closes it after that.',
-      data: { refusal: 'tuned-out', channelId: 'y' },
+      data: { refusal: 'tuned-out', channelId: 'y', serverId: 'a' },
     },
   );
   assert.deepEqual(f.server.sent, [], 'nothing for the transport');
@@ -776,7 +776,7 @@ test('a module\'s close of a tuned-out channel that certifies an idle lease is r
   // Without the lease, the housekeeping guard refuses it first, as before.
   const unleased = await f.registry.handleChannelToolCall('channel_close', { channelId: 'y', source: 'subscription-gc' }, module);
   assert.equal(unleased.isError, false);
-  assert.deepEqual(unleased.data, { refusal: 'explicit-open', channelId: 'y' });
+  assert.deepEqual(unleased.data, { refusal: 'explicit-open', channelId: 'y', serverId: 'a' });
   assert.deepEqual(f.server.sent, []);
   assert.equal(f.registry.getTuneOutState('a', 'y')?.params.epochId, 'e1');
 });
@@ -1345,7 +1345,7 @@ test('an agent\'s close of a tuned-out channel is refused, and after the cancel 
   const text = dumped()!.content.map((b) => b.text ?? '').join('');
   assert.ok(text.includes('backlog one') && text.includes('backlog two'), text);
   assert.deepEqual(await f.script('channel_close', { channelId: CHANNEL }),
-    { text: JSON.stringify({ channelId: CHANNEL, status: 'closed' }), isError: false, refused: false });
+    { text: JSON.stringify({ channelId: CHANNEL, serverId: 'disc', status: 'closed' }), isError: false, refused: false });
   assert.equal(f.i.channelRegistry.getDesiredState('disc', CHANNEL), 'closed');
 });
 
@@ -1463,7 +1463,7 @@ test('a tune-out on record when a start without servers connects one later ends 
   // The agent tuned it out, so the record stays the agent's: a housekeeping
   // close with no lease is still refused as an explicit open.
   const unleased = await registry.handleChannelToolCall('channel_close', { channelId: CHANNEL, source: 'subscription-gc' }, { kind: 'module' });
-  assert.deepEqual(unleased.data, { refusal: 'explicit-open', channelId: CHANNEL });
+  assert.deepEqual(unleased.data, { refusal: 'explicit-open', channelId: CHANNEL, serverId: 'disc' });
 });
 
 test('a tune-out whose ending fails at a start with no subconscious stays recorded, and the log says so', async (t) => {
@@ -1497,7 +1497,7 @@ test('a decline of a tuned-out channel whose transport isn\'t open is refused, a
   }
   // A transport that isn't confirmed open, as a failed open, a retarget or a
   // dropped connection leaves it, while the tune-out stands.
-  (f.i.channelRegistry as unknown as { channels: Map<string, { open: boolean }> }).channels.get(`disc:${CHANNEL}`)!.open = false;
+  (f.i.channelRegistry as unknown as { channels: Map<string, { open: boolean }> }).channels.get(destinationKey({ serverId: 'disc', channelId: CHANNEL }))!.open = false;
   const declined = await f.script('channel_decline', { channelId: CHANNEL, messageId: 'backlog-one' });
   assert.equal(declined.isError, true);
   assert.equal(declined.refused, false);

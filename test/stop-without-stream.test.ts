@@ -364,6 +364,25 @@ describe('a stop before the turn has a stream', () => {
     }
   });
 
+  it("the status lists a turn in its compile as holding a turn, until an abandon ends it at its check", async () => {
+    const h = await aliveWithoutStream({ holdCompile: true });
+    try {
+      const during = h.framework.getHostModeStatus();
+      assert.deepEqual(during.activeTurnAgents, ['prime'], 'the turn in its compile holds a turn');
+      assert.equal(during.activeTurnAgents.length, during.activeTurns, 'the list is the set activeTurns counts');
+      const reached = abandonReached(h.framework);
+      const quiescing = h.framework.quiesce({ timeoutMs: 50, abandon: true });
+      await within('the abandon to reach the turn', reached);
+      h.release();
+      const status = await within('the quiesce to return', quiescing);
+      assert.deepEqual(status.activeTurnAgents, [], 'the abandon ended it, and it holds no turn now');
+      assert.equal(status.activeTurns, 0);
+      await h.framework.resume();
+    } finally {
+      await h.cleanup();
+    }
+  });
+
   it("a caller's stop and a quiesce's abandon at the same start end it as the framework's stop", async () => {
     const h = await aliveWithoutStream();
     try {
@@ -411,6 +430,7 @@ describe('a stop before the turn has a stream', () => {
       // The abandon waits up to 10 s for the turns it reached to end.
       const status = await within('the quiesce to return', quiescing, 15_000);
       assert.deepEqual(status.unabandonable, ['prime'], 'the turn still in its hooks is listed');
+      assert.deepEqual(status.activeTurnAgents, ['prime'], 'it still holds its turn');
       const quiesce = h.traces.find((t) => t.type === 'host:quiesce') as { unabandonable?: string[] } | undefined;
       assert.deepEqual(quiesce?.unabandonable, ['prime'], 'and so is its trace');
       h.release();
@@ -1332,17 +1352,18 @@ class ScriptMembrane {
 function firstPostHeld(posted: string[], released: Promise<void>): unknown {
   // Speech reaches the registry through deliverSpeech, or through
   // routeSpeech, which reduces its outcome to the confirmed delivery.
-  const deliverSpeech = async (_agent: string, text: string, channelId: string | null) => {
+  type Channel = { serverId: string; channelId: string };
+  const deliverSpeech = async (_agent: string, text: string, to: Channel | null) => {
     posted.push(text.trim());
     if (posted.length === 1) await released;
-    return { status: 'delivered' as const, destination: { serverId: 'stub', channelId: channelId ?? '' }, at: Date.now() };
+    return { status: 'delivered' as const, destination: { serverId: to?.serverId ?? 'stub', channelId: to?.channelId ?? '' }, at: Date.now() };
   };
   return new Proxy({
-    resolveProseTarget: (spec: string) => spec === '#cafe' ? { channelId: 'chan-cafe' } : { error: `no channel ${spec}` },
+    resolveProseTarget: (spec: string) => spec === '#cafe' ? { serverId: 'stub', channelId: 'chan-cafe' } : { error: `no channel ${spec}` },
     deliverSpeech,
-    routeSpeech: async (agent: string, text: string, channelId: string) => {
-      const outcome = await deliverSpeech(agent, text, channelId);
-      return { delivered: true, channelId: outcome.destination.channelId };
+    routeSpeech: async (agent: string, text: string, to: Channel | null) => {
+      const outcome = await deliverSpeech(agent, text, to);
+      return { delivered: true, serverId: outcome.destination.serverId, channelId: outcome.destination.channelId };
     },
     getDefaultPublishChannel: () => null,
     isChannelOpen: () => true,
@@ -1654,6 +1675,20 @@ async function finishingTurn() {
 }
 
 describe('a turn finishing its last delivery, with no check ahead', () => {
+  it('the status lists the turn as holding a turn until its delivery is done', async () => {
+    const f = await finishingTurn();
+    try {
+      const during = f.framework.getHostModeStatus();
+      assert.deepEqual(during.activeTurnAgents, ['assistant'], 'the turn finishing its delivery still holds its turn');
+      assert.equal(during.activeTurnAgents.length, during.activeTurns, 'the list is the set activeTurns counts');
+      f.release();
+      await waitFor('the turn to complete', () => f.completed() === 1 && f.framework.getHostModeStatus().activeTurns === 0);
+      assert.deepEqual(f.framework.getHostModeStatus().activeTurnAgents, [], 'and no turn is held once it settles');
+    } finally {
+      await f.cleanup();
+    }
+  });
+
   it("a quiesce's abandon leaves nothing to end a later turn: the turn completes, and the agent's next turn runs", async () => {
     const f = await finishingTurn();
     try {

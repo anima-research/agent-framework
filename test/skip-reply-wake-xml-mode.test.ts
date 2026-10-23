@@ -152,8 +152,8 @@ async function xmlTurn(rounds: Round[], finalText: string, thinking = false, opt
     ? [{ name: 'skip_reply', description: 'End your turn without sending anything.', inputSchema: { type: 'object' as const, properties: {} } }]
     : [];
   (framework as unknown as { channelRegistry: unknown }).channelRegistry = new Proxy({
-    getChannelTools: () => channelTools, resolveLocus: () => 'channel:test',
-    routeSpeech: async (_agent: string, text: string) => { routed.push(text); return { delivered: true, channelId: 'channel:test' }; },
+    getChannelTools: () => channelTools, resolveLocus: () => ({ serverId: 'stub', channelId: 'channel:test' }),
+    routeSpeech: async (_agent: string, text: string) => { routed.push(text); return { delivered: true, serverId: 'stub', channelId: 'channel:test' }; },
     handleChannelToolCall: async (name: string) => {
       registrySaw.push(name);
       return { success: true, endTurn: true, data: { skipped: true, note: 'Turn ended; nothing sent.' } };

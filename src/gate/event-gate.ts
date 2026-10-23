@@ -24,6 +24,7 @@ import type {
   GatePolicyMatch,
   GateBehavior,
   GateDecision,
+  GateEntryRef,
   GateEventInfo,
   GatePolicyStats,
   GateStatus,
@@ -32,7 +33,7 @@ import type {
 } from './types.js';
 
 // Re-export types consumers need
-export type { GateConfig, GateOptions, GateDecision, GateEventInfo } from './types.js';
+export type { GateConfig, GateOptions, GateDecision, GateEntryRef, GateEventInfo } from './types.js';
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -104,6 +105,10 @@ interface PendingEvent {
    *  whose `channelId` is the adapter's raw id (a bare Discord snowflake for a
    *  DM) — unroutable. Absent when the host could not resolve one. */
   routeChannelId?: string;
+  /** The event's own identity among what the framework stored at arrival:
+   *  a channel message's id, a push event's event id (isNewestEntry). */
+  messageId?: string;
+  eventId?: string;
 }
 
 /**
@@ -131,6 +136,10 @@ export interface WakeProvenance {
    *  (2026-09-30: a DM reply published into a guild channel). Ambient-only
    *  batches still set nothing and keep the legacy fallback. */
   routeChannelId?: string;
+  /** The server of `routeChannelId`'s channel, beside it whenever the chosen
+   *  event named its server: channel ids are unique only within one
+   *  server's connection (MCPL §14.2). */
+  routeServerId?: string;
   /** Timestamp (ms) of the chosen event, so a consumer coalescing several
    *  requests can order by event recency, not by flush order. */
   at?: number;
@@ -236,7 +245,9 @@ export function wakeProvenance(events: PendingEvent[]): WakeProvenance | undefin
     ...(channelId ? { channelId } : {}),
     ...(pick.authorId ? { counterparty: `${ns}:user:${pick.authorId}` } : {}),
     ...(pick.addressed ? { addressed: true } : {}),
-    ...(pick.addressed && pick.routeChannelId ? { routeChannelId: pick.routeChannelId } : {}),
+    ...(pick.addressed && pick.routeChannelId
+      ? { routeChannelId: pick.routeChannelId, ...(pick.serverId ? { routeServerId: pick.serverId } : {}) }
+      : {}),
     at: pick.timestamp,
   };
 }
@@ -633,6 +644,8 @@ export class EventGate {
   private requestInferenceFn: (agentName: string, reason: string, source: string, provenance?: WakeProvenance) => void;
   private getAgentNamesFn: () => string[];
   private resolveRouteChannelFn: (info: GateEventInfo) => string | undefined;
+  private channelShownFn?: (channel: { serverId: string; channelId: string }) => string;
+  private isNewestEntryFn?: (entry: GateEntryRef) => boolean;
   /** Clock injection — keeps the new rate_limit / passive_sample paths
    *  testable without monkey-patching Date.now globally. */
   private now: () => number;
@@ -658,6 +671,17 @@ export class EventGate {
      *  how push-event origins compose into channel ids). Default: a
      *  channel-incoming event's own channel id; nothing for push events. */
     resolveRouteChannel?: (info: GateEventInfo) => string | undefined;
+    /** How the agent is shown a channel, its server's and its id (the
+     *  framework's ChannelRegistry.nameShown): a batched wake's summary names
+     *  each channel so, since two servers' channels can share an id. Default:
+     *  the id. */
+    channelShown?: (channel: { serverId: string; channelId: string }) => string;
+    /** Whether an MCPL event's own context entry is still the newest entry in
+     *  the window a batched wake's line would be written to, with nothing
+     *  waiting to be written there. A batched wake for that one message
+     *  writes no line: the message, right above, is its whole cause. Absent:
+     *  every batched wake writes its line, as before. */
+    isNewestEntry?: (entry: GateEntryRef) => boolean;
   }) {
     this.configPath = opts.configPath;
     this.privilegedUsersPath = opts.privilegedUsersPath;
@@ -666,6 +690,8 @@ export class EventGate {
     this.requestInferenceFn = opts.requestInference;
     this.getAgentNamesFn = opts.getAgentNames;
     this.resolveRouteChannelFn = opts.resolveRouteChannel ?? defaultRouteChannel;
+    this.channelShownFn = opts.channelShown;
+    this.isNewestEntryFn = opts.isNewestEntry;
     this.now = opts.now ?? (() => Date.now());
     this.loadPrivileged();
 
@@ -1514,6 +1540,8 @@ export class EventGate {
       serverId: info.serverId || undefined,
       addressed: Array.isArray(info.tags) && info.tags.includes('chat:addressed'),
       routeChannelId: this.routeChannelFor(info),
+      ...(typeof info.metadata?.messageId === 'string' ? { messageId: info.metadata.messageId } : {}),
+      ...(typeof info.metadata?.eventId === 'string' ? { eventId: info.metadata.eventId } : {}),
     };
 
     const existing = this.debounceTimers.get(policy.name);
@@ -1575,24 +1603,35 @@ export class EventGate {
 
     const lines: string[] = quoted.map(e => `- [${e.policyName}] (${e.eventType}): ${e.content}`);
     if (referenced.length > 0) {
-      const byChannel = new Map<string, { count: number; oldest: number; label?: string }>();
+      // By channel, its server and its id: two servers' channels can share
+      // an id.
+      const byChannel = new Map<string, { name: string; count: number; oldest: number; label?: string }>();
       for (const e of referenced) {
         // The registered id when known, so this line names the channel the
         // same way routing notices and send tools do (a push event's own
-        // channelId is the adapter's raw id).
-        const key = e.routeChannelId ?? e.channelId ?? '(unknown channel)';
-        const entry = byChannel.get(key) ?? { count: 0, oldest: e.timestamp, label: e.channelLabel };
+        // channelId is the adapter's raw id), shown as the agent names it
+        // back where the event names its server.
+        // Only a registered id is a channel name; an adapter's raw id is
+        // shown as it is.
+        const id = e.routeChannelId ?? e.channelId;
+        const name = id === undefined
+          ? '(unknown channel)'
+          : e.routeChannelId !== undefined && e.serverId !== undefined && this.channelShownFn
+            ? this.channelShownFn({ serverId: e.serverId, channelId: e.routeChannelId })
+            : id;
+        const key = JSON.stringify([e.serverId ?? null, id ?? null]);
+        const entry = byChannel.get(key) ?? { name, count: 0, oldest: e.timestamp, label: e.channelLabel };
         entry.count += 1;
         entry.oldest = Math.min(entry.oldest, e.timestamp);
         entry.label = entry.label ?? e.channelLabel;
         byChannel.set(key, entry);
       }
-      for (const [channelId, { count, oldest, label }] of byChannel) {
+      for (const { name, count, oldest, label } of byChannel.values()) {
         // Prefer the human-readable name; keep the id parenthesized so the
         // agent can still address tools that want the composite id. A name
         // may carry its own `#`, so one is added only where the name lacks
         // it, as at the other places that add a `#`.
-        const channel = label ? `${label.startsWith('#') ? label : `#${label}`} (${channelId})` : channelId;
+        const channel = label ? `${label.startsWith('#') ? label : `#${label}`} (${name})` : name;
         const age = Math.round((Date.now() - oldest) / 1000);
         lines.push(
           `- ${count} message${count > 1 ? 's' : ''} in ${channel} ` +
@@ -1602,12 +1641,28 @@ export class EventGate {
       }
     }
 
-    const text = `[Gate: ${events.length} event${events.length > 1 ? 's' : ''} matched]\n\n${lines.join('\n')}`;
-
-    this.addMessageFn('user', [{ type: 'text', text }], {
-      source: 'gate:debounce',
-      policies: policyNames,
-    });
+    // The line says which messages a wake is for. For one message that is
+    // still the newest thing in the window it would be written to, it says
+    // nothing the message right above doesn't: the wake runs without it, its
+    // provenance (and the reply's channel) unchanged. Several messages, one
+    // with anything after it, or content the line quotes, keep the line.
+    const only = events.length === 1 && events[0].inContext ? events[0] : undefined;
+    if (only && this.newestEntry(only)) {
+      const shownChannel = only.routeChannelId ?? only.channelId;
+      this.emitTrace({
+        type: 'gate:wake-line-omitted',
+        policyNames,
+        eventType: only.eventType,
+        ...(shownChannel !== undefined ? { channelId: shownChannel } : {}),
+        timestamp: Date.now(),
+      });
+    } else {
+      const text = `[Gate: ${events.length} event${events.length > 1 ? 's' : ''} matched]\n\n${lines.join('\n')}`;
+      this.addMessageFn('user', [{ type: 'text', text }], {
+        source: 'gate:debounce',
+        policies: policyNames,
+      });
+    }
 
     // Provenance of the batched wake (who/where woke the agent): the newest
     // ADDRESSED event first, else the newest event naming a channel or an
@@ -1619,6 +1674,22 @@ export class EventGate {
     const provenance = wakeProvenance(events);
     for (const agentName of this.getAgentNamesFn()) {
       this.requestInferenceFn(agentName, 'gate:debounce', 'gate', provenance);
+    }
+  }
+
+  /** isNewestEntry for one event; a callback fault keeps the line. */
+  private newestEntry(event: PendingEvent): boolean {
+    if (!this.isNewestEntryFn) return false;
+    try {
+      return this.isNewestEntryFn({
+        eventType: event.eventType,
+        ...(event.serverId !== undefined ? { serverId: event.serverId } : {}),
+        ...(event.channelId !== undefined ? { channelId: event.channelId } : {}),
+        ...(event.messageId !== undefined ? { messageId: event.messageId } : {}),
+        ...(event.eventId !== undefined ? { eventId: event.eventId } : {}),
+      }) === true;
+    } catch {
+      return false;
     }
   }
 

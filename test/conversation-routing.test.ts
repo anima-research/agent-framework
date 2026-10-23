@@ -24,6 +24,7 @@ const forkName = (channelId: string, generation: number) => forkAgentName('conve
 
 function incomingEvent(overrides: {
   channelId: string;
+  serverId?: string;
   text: string;
   mentioned?: boolean;
   channelType?: string;
@@ -31,7 +32,7 @@ function incomingEvent(overrides: {
 }): ProcessEvent {
   return {
     type: 'mcpl:channel-incoming',
-    serverId: 'srv',
+    serverId: overrides.serverId ?? 'srv',
     channelId: overrides.channelId,
     messageId: overrides.messageId ?? `m-${Math.random().toString(36).slice(2)}`,
     author: { id: 'U1', name: 'alice' },
@@ -86,7 +87,7 @@ describe('Conversation routing', () => {
   /** Make a binding look idle past the TTL and re-arm the sweep throttle —
    * deterministic expiry instead of racing a 1ms TTL against the wall clock. */
   function forceExpiry(framework: AgentFramework, channelId: string, idleTtlMs: number) {
-    const binding = framework.getConversationRouter()!.getBinding(channelId);
+    const binding = framework.getConversationRouter()!.getBinding({ serverId: 'srv', channelId });
     assert.ok(binding, `binding for ${channelId} should exist before forcing expiry`);
     binding!.lastActivity = Date.now() - idleTtlMs - 1_000;
     (framework as unknown as { lastConversationSweep: number }).lastConversationSweep = 0;
@@ -192,19 +193,64 @@ describe('Conversation routing', () => {
 
     // Binding is live.
     const router = framework.getConversationRouter()!;
-    assert.equal(router.getBinding('slack:D1')?.agentName, forkName('slack:D1', 1));
+    assert.equal(router.getBinding({ serverId: 'srv', channelId: 'slack:D1' })?.agentName, forkName('slack:D1', 1));
 
+    await framework.stop();
+  });
+
+  it("two servers' channels with one id each get a fork of their own", async () => {
+    // Channel ids are unique only within one MCPL server's connection. The
+    // mock hands every queued response to the next stream, so each wake gets
+    // its own response, queued just before it.
+    const framework = await makeFramework();
+    const spawned: Array<{ serverId?: string; channelId?: string }> = [];
+    framework.onTrace((e) => {
+      const t = e as { type: string; serverId?: string; channelId?: string };
+      if (t.type === 'mcpl:conversation-spawned') spawned.push({ serverId: t.serverId, channelId: t.channelId });
+    });
+    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'one' }]));
+    framework.pushEvent(incomingEvent({ channelId: 'slack:D1', text: 'from srv', channelType: 'im' }));
+    await framework.runUntilIdle();
+    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'two' }]));
+    framework.pushEvent(incomingEvent({ serverId: 'other', channelId: 'slack:D1', text: 'from other', channelType: 'im' }));
+    await framework.runUntilIdle();
+
+    const router = framework.getConversationRouter()!;
+    // The counter is kept per id, so the second server's fork takes the next generation.
+    assert.equal(router.getBinding({ serverId: 'srv', channelId: 'slack:D1' })?.agentName, forkName('slack:D1', 1));
+    assert.equal(
+      router.getBinding({ serverId: 'other', channelId: 'slack:D1' })?.agentName,
+      forkAgentName('conversation', 'other', 'slack:D1', 2),
+    );
+    assert.deepEqual(router.channelForAgent(forkName('slack:D1', 1)), { serverId: 'srv', channelId: 'slack:D1' });
+    const otherFork = framework.getAgent(forkAgentName('conversation', 'other', 'slack:D1', 2))!;
+    const { messages } = await otherFork.getContextManager().compile();
+    assert.ok(messages.some((m) => JSON.stringify(m.content).includes('from other')), "the other server's message reaches its own fork");
+    assert.ok(!messages.some((m) => JSON.stringify(m.content).includes('from srv')), "and not srv's");
+    // Each spawned fork's home keeps its server, which its channel tools and
+    // speech go to (shared-channel-id's fork tests, over recording servers).
+    const homes = (framework as unknown as { conversationAgentHomes: Map<string, unknown> }).conversationAgentHomes;
+    assert.deepEqual(homes.get(forkName('slack:D1', 1)), { serverId: 'srv', channelId: 'slack:D1' });
+    assert.deepEqual(homes.get(otherFork.name), { serverId: 'other', channelId: 'slack:D1' });
+    assert.deepEqual(spawned, [{ serverId: 'srv', channelId: 'slack:D1' }, { serverId: 'other', channelId: 'slack:D1' }],
+      'each spawn is traced with its server');
     await framework.stop();
   });
 
   it('channel message without mention is dropped; mention spawns', async () => {
     membrane.pushResponse(createMockResponse([{ type: 'text', text: 'On it.' }]));
     const framework = await makeFramework();
+    const unrouted: Array<string | undefined> = [];
+    framework.onTrace((e) => {
+      const t = e as { type: string; serverId?: string };
+      if (t.type === 'mcpl:conversation-unrouted') unrouted.push(t.serverId);
+    });
 
     framework.pushEvent(incomingEvent({ channelId: 'slack:C1', text: 'just chatting' }));
     await framework.runUntilIdle();
     assert.equal(framework.getAgent(forkName('slack:C1', 1)), null, 'no fork without mention');
     assert.equal(membrane.calls.length, 0, 'no inference for unrouted messages');
+    assert.deepEqual(unrouted, ['srv'], "the unrouted trace names the message's server");
 
     framework.pushEvent(incomingEvent({ channelId: 'slack:C1', text: 'bot, help', mentioned: true }));
     await framework.runUntilIdle();
@@ -612,7 +658,7 @@ describe('Conversation routing', () => {
     try {
       await deliver(framework, 'slack:C1', 'first');
       const router = framework.getConversationRouter()!;
-      const binding = router.getBinding('slack:C1')!;
+      const binding = router.getBinding({ serverId: 'srv', channelId: 'slack:C1' })!;
       binding.lastActivity = 1;
       const before = Date.now();
       framework.pushEvent({
@@ -634,7 +680,7 @@ describe('Conversation routing', () => {
     try {
       await deliver(framework, 'slack:C1', 'first');
       const router = framework.getConversationRouter()!;
-      const binding = router.getBinding('slack:C1')!;
+      const binding = router.getBinding({ serverId: 'srv', channelId: 'slack:C1' })!;
       binding.lastActivity = 1;
       const context = framework.getAgent(binding.agentName)!.getContextManager();
       const addMessage = context.addMessage;
@@ -655,7 +701,7 @@ describe('Conversation routing', () => {
     try {
       await deliver(framework, 'slack:C1', 'first');
       const router = framework.getConversationRouter()!;
-      const binding = router.getBinding('slack:C1')!;
+      const binding = router.getBinding({ serverId: 'srv', channelId: 'slack:C1' })!;
       binding.lastActivity = 1;
       const before = Date.now();
       await deliver(framework, 'slack:C1', 'updated detail', binding.agentName);
@@ -672,10 +718,10 @@ describe('Conversation routing', () => {
     try {
       await deliver(framework, 'slack:C1', 'first');
       const router = framework.getConversationRouter()!;
-      const oldName = router.getBinding('slack:C1')!.agentName;
-      router.unbind('slack:C1');
+      const oldName = router.getBinding({ serverId: 'srv', channelId: 'slack:C1' })!.agentName;
+      router.unbind({ serverId: 'srv', channelId: 'slack:C1' });
       await deliver(framework, 'slack:C1', 'new engagement');
-      const binding = router.getBinding('slack:C1')!;
+      const binding = router.getBinding({ serverId: 'srv', channelId: 'slack:C1' })!;
       binding.lastActivity = 1;
       await deliver(framework, 'slack:C1', 'old engagement correction', oldName);
 
@@ -691,11 +737,17 @@ describe('Conversation routing', () => {
     const IDLE_TTL_MS = 60_000;
     membrane.pushResponse(createMockResponse([{ type: 'text', text: 'hello!' }]));
     const framework = await makeFramework({ idleTtlMs: IDLE_TTL_MS });
+    // The lifecycle traces name the channel's server, as the spawn's does.
+    const lifecycle: Array<[string, string | undefined]> = [];
+    framework.onTrace((e) => {
+      const t = e as { type: string; serverId?: string };
+      if (t.type === 'mcpl:conversation-closed' || t.type === 'mcpl:conversation-disposed') lifecycle.push([t.type, t.serverId]);
+    });
 
     framework.pushEvent(incomingEvent({ channelId: 'slack:D3', text: 'hi', channelType: 'im' }));
     await framework.runUntilIdle();
     const router = framework.getConversationRouter()!;
-    assert.ok(router.getBinding('slack:D3'), 'spawn should leave a live binding');
+    assert.ok(router.getBinding({ serverId: 'srv', channelId: 'slack:D3' }), 'spawn should leave a live binding');
     const g1 = framework.getAgent(forkName('slack:D3', 1));
     assert.ok(g1, 'g1 fork should exist after spawn');
 
@@ -707,12 +759,13 @@ describe('Conversation routing', () => {
     framework.pushEvent({ type: 'external-message', source: 'test', content: 'tick', metadata: {} } as unknown as ProcessEvent);
     await framework.runUntilIdle();
 
-    assert.equal(router.getBinding('slack:D3'), undefined, 'binding should be gone after TTL');
+    assert.equal(router.getBinding({ serverId: 'srv', channelId: 'slack:D3' }), undefined, 'binding should be gone after TTL');
     const { messages } = await g1!.getContextManager().compile();
     assert.ok(
       messages.some((m) => JSON.stringify(m.content).includes('engagement is closing')),
       'closure prompt should be in the fork context',
     );
+    assert.deepEqual(lifecycle, [['mcpl:conversation-closed', 'srv'], ['mcpl:conversation-disposed', 'srv']]);
     assert.equal(
       framework.getAgent(forkName('slack:D3', 1)), null,
       'closed fork should be disposed once its closure turn finished',
@@ -743,19 +796,19 @@ describe('Conversation routing', () => {
   it("a disposed conversation agent's name is refused for a new agent", async () => {
     const framework = await makeFramework();
     const internals = framework as unknown as {
-      createConversationAgent(name: string, channelId: string): Promise<unknown>;
+      createConversationAgent(name: string, home: { serverId: string; channelId: string }): Promise<unknown>;
       disposeConversationAgent(name: string): void;
     };
     const name = forkName('slack:D9', 1);
     try {
-      await internals.createConversationAgent(name, 'slack:D9');
+      await internals.createConversationAgent(name, { serverId: 'srv', channelId: 'slack:D9' });
       assert.ok(framework.getAgent(name), 'the first agent is registered under the name');
       internals.disposeConversationAgent(name);
       assert.equal(framework.getAgent(name), null, 'the agent is gone, so only its name is held');
       // Twice: a refusal that released the name would let the second through.
       for (const attempt of [1, 2]) {
         await assert.rejects(
-          internals.createConversationAgent(name, 'slack:D9'),
+          internals.createConversationAgent(name, { serverId: 'srv', channelId: 'slack:D9' }),
           new RegExp(`Conversation agent name "${name}" is already registered or reserved`),
           `attempt ${attempt}`,
         );
@@ -1134,8 +1187,8 @@ describe('Conversation routing', () => {
       // Both closed, with no closure inference left to run (the case the
       // reaper is for), and the one whose removal fails comes first.
       const router = framework.getConversationRouter()!;
-      router.unbind('slack:D10');
-      router.unbind('slack:D11');
+      router.unbind({ serverId: 'srv', channelId: 'slack:D10' });
+      router.unbind({ serverId: 'srv', channelId: 'slack:D11' });
       const internals = framework as unknown as { closingConversationAgents: Set<string>; lastConversationSweep: number };
       internals.closingConversationAgents.add(failing);
       internals.closingConversationAgents.add(next);
@@ -1214,8 +1267,8 @@ describe('Conversation routing', () => {
 
     assert.deepEqual(failed, [], 'neither spawn fails');
     const router = framework.getConversationRouter()!;
-    const spaced = router.getBinding('foo bar')?.agentName;
-    const dashed = router.getBinding('foo-bar')?.agentName;
+    const spaced = router.getBinding({ serverId: 'srv', channelId: 'foo bar' })?.agentName;
+    const dashed = router.getBinding({ serverId: 'srv', channelId: 'foo-bar' })?.agentName;
     assert.ok(spaced && dashed, 'each channel is bound to a fork');
     assert.notEqual(spaced, dashed, 'to forks of its own');
     const held = (name: string) => framework.getAgent(name)!.getContextManager().getAllMessages()
@@ -1233,7 +1286,7 @@ describe('Conversation routing', () => {
     ]);
     fw1.pushEvent(incomingEvent({ channelId: 'foo bar', text: 'PRIVATE to foo bar', channelType: 'im' }));
     await fw1.runUntilIdle();
-    const first = fw1.getConversationRouter()!.getBinding('foo bar')?.agentName;
+    const first = fw1.getConversationRouter()!.getBinding({ serverId: 'srv', channelId: 'foo bar' })?.agentName;
     assert.ok(first, 'the first channel spawns its fork');
     await fw1.stop();
 
@@ -1242,7 +1295,7 @@ describe('Conversation routing', () => {
     fw2.pushEvent(incomingEvent({ channelId: 'foo-bar', text: 'hello from foo-bar', channelType: 'im' }));
     await fw2.runUntilIdle();
 
-    const name = fw2.getConversationRouter()!.getBinding('foo-bar')?.agentName;
+    const name = fw2.getConversationRouter()!.getBinding({ serverId: 'srv', channelId: 'foo-bar' })?.agentName;
     assert.ok(name, 'the second channel spawns its fork');
     assert.notEqual(name, first, "under a name, and so in a namespace, other than the first channel's");
     const contents = fw2.getAgent(name!)!.getContextManager().getAllMessages().map((m) => JSON.stringify(m.content));
@@ -1274,7 +1327,7 @@ describe('Conversation routing', () => {
 
     assert.equal(failures.length, 2, 'both foreign channel operations should be rejected');
     assert.ok(failures[0]!.error.includes("so it can't open other channels, and nothing was opened"), 'channel_open is rejected outright');
-    assert.ok(failures[1]!.error.includes('closing slack:C8 is not allowed'), 'foreign channel_close is rejected');
+    assert.ok(failures[1]!.error.includes('closing "slack:C8" is not allowed'), 'foreign channel_close is rejected');
 
     await framework.stop();
   });
@@ -1310,7 +1363,15 @@ describe('Conversation routing', () => {
     // channel_* tools). Stub the downstream boundary — the unit under test is
     // the fence ABOVE it, and a home-defaulted publish must get past the fence
     // to be observable at tool:started.
-    fw.channelRegistry = { handleChannelToolCall: async () => ({ success: true }), stopAll: () => {} };
+    fw.channelRegistry = {
+      handleChannelToolCall: async () => ({ success: true }),
+      stopAll: () => {},
+      // The fence names the home channel as the agent would see it, and
+      // reads whether its server still registers it.
+      nameShown: (channel: { channelId: string }) => channel.channelId,
+      quotedShown: (channel: { channelId: string }) => JSON.stringify(channel.channelId),
+      getDescriptor: () => ({}),
+    } as typeof fw.channelRegistry;
 
     // (a) omitted channelId → rewritten to the home channel, passes the fence
     fw.dispatchChannelToolCall(fork, { id: 'p1', name: 'channel_publish', input: { content: 'hello home' } });
@@ -1326,7 +1387,7 @@ describe('Conversation routing', () => {
     fw.dispatchChannelToolCall(fork, { id: 'p2', name: 'channel_publish', input: { channelId: 'slack:C8', content: 'sneaky' } });
     const rejection = failures.find((f) => f.callId === 'p2');
     assert.ok(rejection, 'foreign publish should be rejected');
-    assert.ok(rejection!.error.includes('publishing to slack:C8 is not allowed'), 'rejection names the foreign channel');
+    assert.ok(rejection!.error.includes('publishing to "slack:C8" is not allowed'), 'rejection names the foreign channel');
     assert.equal(
       started.filter((t) => t.tool === 'channel_publish').length, 1,
       'foreign publish never reaches tool:started',

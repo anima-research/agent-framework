@@ -70,6 +70,8 @@ function harness(
   /** The reason of each inference requested, the subconscious's turns among them. */
   const inferences: string[] = [];
   const registry = {
+    // Each channel's id is unique here, so it's shown by its id.
+    nameShown: (channel: { channelId: string }) => channel.channelId,
     listChannelsRaw: () => (state ? [{ serverId: 'disc', descriptor: { id: '#a' } }] : []),
     getTuneOutState: () => state,
     enterTuneOut: (_s: string, _c: string, params: TuneOutParams) => {

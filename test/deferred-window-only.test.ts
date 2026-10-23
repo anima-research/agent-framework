@@ -45,10 +45,14 @@ import type {
   ToolResult,
 } from '../src/index.js';
 import { AgentFramework } from '../src/index.js';
+import { destinationKey, type ChannelRef } from '../src/mcpl/channel-registry.js';
 import { heldHandle } from '../src/held-writes.js';
 import { AutobiographicalStrategy, MalformedContentError } from '@animalabs/context-manager';
 import { MockMembrane, createMockResponse } from './helpers/mock-membrane.js';
 import type { ContentBlock } from '@animalabs/membrane';
+
+/** A channel on the server these tests' channel messages come from, as each channel message's metadata names it. */
+const srv = (channelId: string): ChannelRef => ({ serverId: 'srv', channelId });
 
 interface Interjection {
   participant: string;
@@ -1491,7 +1495,7 @@ describe('mid-turn deliveries keep the window what the stream carried', () => {
     // A logical turn still open between its streams, engaged with chan-beta:
     // no turn is alive, so no tool boundary weighs what is stored now, and
     // it's noted as one of the turn's arrivals.
-    const open = { engaged: new Set(['chan-beta']), arrivals: [] as Array<{ messageId: string; channelId: string }> };
+    const open = { engaged: new Set([destinationKey(srv('chan-beta'))]), wasIn: [] as ChannelRef[], arrivals: [] as Array<{ messageId: string; channel: ChannelRef }> };
     internals.openLogical.set('assistant', open);
     const errors: string[] = [];
     const error = console.error;
@@ -1499,7 +1503,7 @@ describe('mid-turn deliveries keep the window what the stream carried', () => {
     let written: unknown[];
     try {
       written = internals.readdDrained(
-        [{ id: 'w1', seq: 1, participant: 'Antra', content: text('from beta'), metadata: { channelId: 'chan-beta' } }],
+        [{ id: 'w1', seq: 1, participant: 'Antra', content: text('from beta'), metadata: { channelId: 'chan-beta', serverId: 'srv' } }],
         'test flush',
       );
     } finally { console.error = error; }
@@ -1510,7 +1514,7 @@ describe('mid-turn deliveries keep the window what the stream carried', () => {
     const copies = framework.getAgent('assistant')!.getContextManager().getAllMessages()
       .filter((m) => (m.metadata as { deferredWriteId?: string } | undefined)?.deferredWriteId === 'w1');
     assert.equal(copies.length, 1, 'stored once');
-    assert.deepEqual(open.arrivals, [{ messageId: copies[0]!.id, channelId: 'chan-beta' }], 'and noted as one of the open turn\'s arrivals');
+    assert.deepEqual(open.arrivals, [{ messageId: copies[0]!.id, channel: srv('chan-beta') }], 'and noted as one of the open turn\'s arrivals');
     await framework.stop();
   });
 
@@ -1521,29 +1525,29 @@ describe('mid-turn deliveries keep the window what the stream carried', () => {
     const internals = framework as unknown as {
       openLogical: Map<string, unknown>;
       readdDrained(entries: Array<{ id: string; seq: number; participant: string; content: ContentBlock[]; metadata?: Record<string, unknown> }>, where: string): unknown[];
-      remainingArrival(agent: unknown, routing: unknown): string | undefined;
+      remainingArrival(agent: unknown, routing: unknown): ChannelRef | undefined;
     };
     // An open turn engaged with both channels, between its streams: the
     // earlier write throws after it's stored, and the later one lands.
-    const open = { engaged: new Set(['chan-alpha', 'chan-beta']), arrivals: [] as Array<{ messageId: string; channelId: string }> };
+    const open = { engaged: new Set([destinationKey(srv('chan-alpha')), destinationKey(srv('chan-beta'))]), wasIn: [] as ChannelRef[], arrivals: [] as Array<{ messageId: string; channel: ChannelRef }> };
     internals.openLogical.set('assistant', open);
     const errors: string[] = [];
     const error = console.error;
     console.error = (...args: unknown[]) => { errors.push(args.map(String).join(' ')); };
     try {
       internals.readdDrained([
-        { id: 'w1', seq: 1, participant: 'Antra', content: text('from alpha'), metadata: { channelId: 'chan-alpha' } },
-        { id: 'w2', seq: 2, participant: 'Antra', content: text('from beta'), metadata: { channelId: 'chan-beta' } },
+        { id: 'w1', seq: 1, participant: 'Antra', content: text('from alpha'), metadata: { channelId: 'chan-alpha', serverId: 'srv' } },
+        { id: 'w2', seq: 2, participant: 'Antra', content: text('from beta'), metadata: { channelId: 'chan-beta', serverId: 'srv' } },
       ], 'test flush');
     } finally { console.error = error; }
     assert.equal(errors.filter((e) => e.includes('threw after it was stored')).length, 1, errors.join('\n'));
     const idOf = (writeId: string) => agent.getContextManager().getAllMessages()
       .find((m) => (m.metadata as { deferredWriteId?: string } | undefined)?.deferredWriteId === writeId)!.id;
     assert.deepEqual(open.arrivals, [
-      { messageId: idOf('w1'), channelId: 'chan-alpha' },
-      { messageId: idOf('w2'), channelId: 'chan-beta' },
+      { messageId: idOf('w1'), channel: srv('chan-alpha') },
+      { messageId: idOf('w2'), channel: srv('chan-beta') },
     ]);
-    assert.equal(internals.remainingArrival(agent, open), 'chan-beta', "the turn's newest arrival is the later write's");
+    assert.deepEqual(internals.remainingArrival(agent, open), srv('chan-beta'), "the turn's newest arrival is the later write's");
     await framework.stop();
   });
 
