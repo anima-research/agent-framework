@@ -1338,3 +1338,30 @@ describe("an ephemeral run whose turn's continuation is dropped", () => {
     });
   }
 });
+
+describe("stop() and the turns whose continuations are on their way", () => {
+  it("ends each agent's turn even when ending another's throws", async () => {
+    const h = await restartTurn({ wait: true });
+    try {
+      await waitFor('the continuation to be held, its frame gone', () => heldForWait(h.framework) && frameLetGo(h.framework));
+      // A second agent's continuation waits in a scheduler pass's hands, as
+      // while the pass awaits another agent's start: after prime's, in the
+      // order stop() ends them.
+      const pass = new Map([['alpha', [{ agentName: 'alpha', reason: 'context_budget_restart', source: 'framework', timestamp: Date.now() }]]]);
+      (h.framework as unknown as { passRequests: Set<Map<string, InferenceRequest[]>> }).passRequests.add(pass);
+      // Ending prime's turn throws.
+      const fw = h.framework as unknown as { dropContinuations(name: string, drop: unknown): void };
+      const drop = fw.dropContinuations.bind(fw);
+      fw.dropContinuations = (name, how) => {
+        if (name === 'prime') throw new Error('zz ending prime threw');
+        drop(name, how);
+      };
+      await assert.rejects(h.framework.stop(), /zz ending prime threw/);
+      assert.deepEqual(pass.get('alpha'), [], "alpha's continuation is taken out of the pass");
+      assert.ok(h.endLines().some((l) => l.startsWith('[turn-continuation] alpha: its turn ends without its continuation: the framework is stopping')),
+        `alpha's turn ends: ${JSON.stringify(h.endLines())}`);
+    } finally {
+      await h.cleanup().catch(() => {});
+    }
+  });
+});

@@ -4120,10 +4120,12 @@ export class AgentFramework {
     // a turn's start a stop reaches does: the continuation would start only
     // after a start(), in a lifecycle where its logical turn is gone
     // (openLogical, below). Before the holds and the parks go, so the
-    // continuation leaves them with its turn.
+    // continuation leaves them with its turn. Each drop is a step of its
+    // own, so one that throws leaves the next agent's turn to end all the
+    // same, as stop()'s other loops do.
     step(() => {
       for (const agentName of this.pendingContinuationAgents()) {
-        this.dropContinuations(agentName, { kind: 'shutdown', why: 'the framework is stopping' });
+        step(() => this.dropContinuations(agentName, { kind: 'shutdown', why: 'the framework is stopping' }));
       }
     });
     // A stopped host must never hang behind its own cooldown.
