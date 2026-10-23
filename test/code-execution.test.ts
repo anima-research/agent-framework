@@ -580,14 +580,14 @@ describe('code_execution through the framework', () => {
     await withFramework('ce-longest-timeout-', {}, async (framework) => {
       const fw = framework as unknown as {
         codeExecution: { settings: { toolCallTimeoutMs: number } };
-        scriptToolWaiters: Map<string, (result: ToolResult) => void>;
+        scriptToolWaiters: Map<string, { resolve: (result: ToolResult) => void }>;
         dispatchToolCall(agent: string, call: { id: string }, turnId?: number): void;
         scriptToolCall(agent: string, tool: string, args: string, context: Record<string, unknown>): Promise<{ held?: boolean; json: string }>;
       };
       fw.codeExecution.settings.toolCallTimeoutMs = 2_147_483_647;
       // The tool answers after 50 ms: a timer that overflowed would have answered for it within 1 ms.
       fw.dispatchToolCall = (_agent, call) => {
-        setTimeout(() => fw.scriptToolWaiters.get(call.id)?.({ success: true, data: { echoed: true } }), 50);
+        setTimeout(() => fw.scriptToolWaiters.get(call.id)?.resolve({ success: true, data: { echoed: true } }), 50);
       };
       const answer = await fw.scriptToolCall('agent', 'test--echo', '{}', {});
       assert.equal(answer.held, undefined);
