@@ -2672,7 +2672,7 @@ test('the opened notice names channel_close only where the agent it\'s addressed
     // Residents, and the subconscious through its merged view, read one shared
     // slot; a fork's store, or a run's, is its own.
     framework.sharedSlotAgents = new Set([...framework.agents.values()]
-      .filter((a: { name: string }) => !framework.registry.homeChannel(a.name) !== undefined && !(c.isolated ?? []).includes(a.name)));
+      .filter((a: { name: string }) => framework.registry.homeChannel(a.name) === undefined && !(c.isolated ?? []).includes(a.name)));
     const labels = new Map(c.labels ?? []);
     framework.channelRegistry = { getDescriptor: (id: string) => (labels.has(id) ? { id, label: labels.get(id) } : undefined) };
     framework.addMessage = (_participant: string, content: Array<{ text: string }>, metadata: unknown, routed?: { forAgent?: string }) => {

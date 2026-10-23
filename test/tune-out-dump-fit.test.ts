@@ -348,8 +348,8 @@ function dumpIn(messages: Array<{ content: ContentBlock[] }>, whose: string): st
 function assertNewestThreeWhole(dump: string, whose: string): void {
   for (const mk of ['P-MSG-4', 'P-MSG-5', 'P-MSG-6']) assert.ok(dump.includes(`${lineFor(mk)}\n`), `${whose} shows ${mk} whole`);
   for (const mk of ['P-MSG-1', 'P-MSG-2', 'P-MSG-3']) assert.ok(!dump.includes(mk), `${whose} leaves out ${mk}`);
-  // The note names the history tool the resident has (#232 gap 11); this rig's server offers none.
-  assert.match(dump, /messages=6 truncated=3 \(oldest; (fetch_history covers the rest|not delivered)\)>/, `${whose} counts the three as left out`);
+  // The note names the history tool the resident has (#232 gap 11); this rig's server offers none, so it says so.
+  assert.ok(dump.includes('messages=6 truncated=3 (oldest; not delivered)>'), `${whose} counts the three as left out`);
   assert.ok(dump.endsWith('</tuned-out-backlog>') && !dump.includes('[truncated'), `${whose} gets it with no cut by the strategy`);
 }
 
