@@ -19,14 +19,15 @@ afterEach(() => { while (dirs.length) rmSync(dirs.pop()!, { recursive: true, for
 async function withSubconscious(resident: Partial<AgentConfig>, subconscious: Partial<SubconsciousConfig>) {
   const dir = mkdtempSync(join(tmpdir(), 'subconscious-model-fields-'));
   dirs.push(dir);
+  const residentConfig: AgentConfig = { name: 'assistant', model: 'model-a', systemPrompt: 'test', maxTokens: 4_000, ...resident };
   const framework = await AgentFramework.create({
     storePath: join(dir, 'store'),
     membrane: new MockMembrane().asMembrane(),
-    agents: [{ name: 'assistant', model: 'model-a', systemPrompt: 'test', maxTokens: 4_000, ...resident }],
+    agents: [residentConfig],
     modules: [],
     subconscious: { enabled: true, systemPrompt: 'notice', ...subconscious },
   });
-  return framework;
+  return { framework, residentConfig };
 }
 
 /** What an agent was built with, for the two fields: the window is public, and
@@ -36,32 +37,77 @@ function fieldsOf(framework: AgentFramework, name: string) {
   return { model: agent.model, physicalWindowTokens: agent.physicalWindowTokens, thinkingDropBlock: agent.thinkingDropBlock };
 }
 
+/** The resident's config as the framework keeps it, which the subconscious's
+ *  copy and conversation forks are made from. */
+function storedConfig(framework: AgentFramework, name: string): AgentConfig | undefined {
+  return (framework as unknown as { agentConfigs: Map<string, AgentConfig> }).agentConfigs.get(name);
+}
+
 describe('the subconscious and the resident\'s model fields', () => {
   const resident: Partial<AgentConfig> = { physicalWindowTokens: 1_000_000, thinkingBinding: { dropBlock: true } };
 
-  it('on another model, it carries neither the resident\'s window nor its binding', async () => {
-    const framework = await withSubconscious(resident, { model: 'model-b' });
+  it('on another model, it carries neither the resident\'s window nor its binding, and the resident\'s config keeps both', async () => {
+    const { framework, residentConfig } = await withSubconscious(resident, { model: 'model-b' });
     try {
       assert.deepEqual(fieldsOf(framework, 'assistant'), { model: 'model-a', physicalWindowTokens: 1_000_000, thinkingDropBlock: true });
       assert.deepEqual(fieldsOf(framework, 'Subconscious'), { model: 'model-b', physicalWindowTokens: undefined, thinkingDropBlock: false });
-      // The resident's own config is left as it was.
-      assert.equal(framework.getAgent('assistant')!.physicalWindowTokens, 1_000_000);
+      // The copy is the subconscious's own: the config the framework keeps
+      // for the resident, and the one its host passed, still hold both.
+      for (const config of [storedConfig(framework, 'assistant'), residentConfig]) {
+        assert.equal(config?.physicalWindowTokens, 1_000_000);
+        assert.deepEqual(config?.thinkingBinding, { dropBlock: true });
+      }
     } finally { await framework.stop(); }
   });
 
-  it('on the resident\'s model, named or by default, it carries both, as every other inference setting', async () => {
+  it('on the resident\'s model, named or by default, it carries both', async () => {
     for (const subconscious of [{}, { model: 'model-a' }]) {
-      const framework = await withSubconscious(resident, subconscious);
+      const { framework } = await withSubconscious(resident, subconscious);
       try {
         assert.deepEqual(fieldsOf(framework, 'Subconscious'), { model: 'model-a', physicalWindowTokens: 1_000_000, thinkingDropBlock: true });
       } finally { await framework.stop(); }
     }
   });
 
-  it('on another model, it still carries the inference settings that aren\'t the model\'s', async () => {
-    const framework = await withSubconscious({ ...resident, maxTokens: 1_234 }, { model: 'model-b' });
+  it('on another model, it still carries every other field of the resident\'s config that the copy doesn\'t override', async () => {
+    const settings = {
+      thinking: { enabled: true, budgetTokens: 2_048 },
+      maxTokens: 1_234,
+      temperature: 0.3,
+      contextBudgetTokens: 90_000,
+      maxStreamTokens: 123_000,
+      promptCaching: false,
+      cacheTtl: '1h',
+      providerParams: { thinking: { type: 'adaptive', block_binding: { prefix_mismatch_behavior: 'drop_block' } } },
+      toolResultGuard: true,
+    } satisfies Partial<AgentConfig>;
+    const { framework } = await withSubconscious({ ...resident, ...settings }, { model: 'model-b' });
     try {
-      assert.equal(framework.getAgent('Subconscious')!.maxTokens, 1_234);
+      const agent = framework.getAgent('Subconscious')!;
+      assert.deepEqual(
+        {
+          thinking: agent.thinking,
+          maxTokens: agent.maxTokens,
+          contextBudgetTokens: agent.contextBudgetTokens,
+          maxStreamTokens: agent.maxStreamTokens,
+          promptCaching: agent.promptCaching,
+        },
+        {
+          thinking: settings.thinking,
+          maxTokens: settings.maxTokens,
+          contextBudgetTokens: settings.contextBudgetTokens,
+          maxStreamTokens: settings.maxStreamTokens,
+          promptCaching: settings.promptCaching,
+        },
+      );
+      // Every field, as the configs are kept: the subconscious's is the
+      // resident's less the two model fields and what the copy sets itself.
+      const own = ['physicalWindowTokens', 'thinkingBinding', 'name', 'model', 'systemPrompt', 'strategy', 'proseRouting', 'allowedTools', 'clock'];
+      const rest = (config: AgentConfig | undefined) =>
+        Object.fromEntries(Object.entries(config ?? {}).filter(([key]) => !own.includes(key)));
+      const inherited = rest(storedConfig(framework, 'Subconscious'));
+      assert.deepEqual(inherited, rest(storedConfig(framework, 'assistant')));
+      for (const key of Object.keys(settings)) assert.ok(key in inherited, key);
     } finally { await framework.stop(); }
   });
 });
