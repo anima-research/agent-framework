@@ -773,6 +773,41 @@ describe('a turn whose continuation is dropped ends there', () => {
     }
   });
 
+  it("abortInference() while a provider wait holds the continuation ends the turn: the continuation is dropped, with one inference:aborted carrying the stop's reason", async () => {
+    const h = await restartTurn({ wait: true });
+    try {
+      await waitFor('the continuation to be held, its frame gone', () => heldForWait(h.framework) && frameLetGo(h.framework));
+      assert.equal(h.framework.abortInference('prime', 'zz-operator stop'), true, 'abortInference reports the stop');
+      assert.deepEqual(h.framework.getHostModeStatus().activeTurnAgents, [], 'the turn ended');
+      assert.equal(abortReasons(h.traces).filter((r) => r === 'zz-operator stop').length, 1, "one inference:aborted, with the stop's reason");
+      // The wait's hold, emptied by the stop, releases with nothing to run.
+      h.framework.releaseProviderWait('prime');
+      await aPass(h, 'a pass after the release');
+      assert.equal(h.membrane.calls.length, 1, 'the continuation never started');
+    } finally {
+      await h.cleanup();
+    }
+  });
+
+  it("abortInference() while the continuation's start is parked behind an auxiliary call ends the turn and gives its admission back", async () => {
+    const h = await restartTurn({ wait: false, auxiliaryDuringRestart: true });
+    const gate = internals(h.framework).providerGate('prime');
+    try {
+      await waitFor('the continuation to park, its frame gone', () => gate.idleWaiters.length > 0 && frameLetGo(h.framework));
+      assert.equal(h.framework.abortInference('prime', 'zz-operator stop'), true, 'abortInference reports the stop');
+      assert.deepEqual(h.framework.getHostModeStatus().activeTurnAgents, [], 'the turn ended');
+      assert.equal(gate.primaryDepth, 0, "the park's admission given back");
+      assert.equal(abortReasons(h.traces).filter((r) => r === 'zz-operator stop').length, 1, "one inference:aborted, with the stop's reason");
+      gate.auxiliaryInFlight = 0;
+      for (const resolve of gate.idleWaiters.splice(0)) resolve();
+      await aPass(h, 'a pass after the auxiliary call');
+      assert.equal(h.membrane.calls.length, 1, 'the continuation never started');
+      assert.equal(gate.primaryDepth, 0, 'the woken park gave nothing back twice');
+    } finally {
+      await h.cleanup();
+    }
+  });
+
   it('an abandon while the start is parked ends the turn and gives its admission back once', async () => {
     const h = await restartTurn({ wait: false, auxiliaryDuringRestart: true });
     const gate = internals(h.framework).providerGate('prime');
