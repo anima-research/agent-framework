@@ -32,6 +32,7 @@ import type { ContextManager, StoredMessage } from '@animalabs/context-manager';
 import type { ContentBlock } from '@animalabs/membrane';
 import { safeSlice } from '../../safe-slice.js';
 import { SEND_TOOLS, bareToolName } from '../../send-tools.js';
+import { storedInjectionMarkOf } from '../../stored-injections.js';
 
 export interface SemanticIndexConfig {
   /** Base URL of the embed-service, e.g. `http://100.90.161.34:8804`. */
@@ -307,6 +308,10 @@ function authorOf(msg: StoredMessage): string | null {
 }
 
 export function messageToItem(msg: StoredMessage, cfg: { includePrivateTools?: boolean; maxChars?: number }): IndexItem | null {
+  // A stored context injection (stored-injections.ts) is a source's context,
+  // such as retrieval's lessons, not something that happened: indexed, it
+  // would come back to a search as history.
+  if (storedInjectionMarkOf(msg.metadata)) return null;
   const text = messageIndexText(msg, cfg.includePrivateTools ?? true);
   if (!text) return null;
   const tsMs = msg.timestamp.getTime();

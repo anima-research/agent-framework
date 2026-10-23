@@ -21,6 +21,7 @@ import type {
   ProcessEvent,
   TraceEventListener,
   ModuleMessage,
+  ModuleContextInjection,
   MessageQueryResult,
 } from './types/index.js';
 import { heldWriteId } from './held-writes.js';
@@ -110,11 +111,11 @@ export class ModuleRegistry {
   private store: JsStore;
   private queue: ModuleQueue;
   private getAgents: () => Agent[];
-  private addMessageFn: (participant: string, content: ContentBlock[], metadata?: MessageMetadata) => MessageId;
+  private addMessageFn: (participant: string, content: ContentBlock[], metadata?: MessageMetadata, opts?: { forAgent?: string }) => MessageId;
   private editMessageFn: (id: MessageId, content: ContentBlock[]) => void;
   private removeMessageFn: (id: MessageId) => void;
   private getMessageFn: (id: MessageId) => ModuleMessage | null;
-  private queryMessagesFn: (filter: MessageQuery) => MessageQueryResult;
+  private queryMessagesFn: (filter: MessageQuery, opts?: { forAgent?: string }) => MessageQueryResult;
 
   private pushEventFn: (event: ProcessEvent, moduleName?: string) => void;
   private onTraceFn: (listener: TraceEventListener) => () => void;
@@ -134,11 +135,11 @@ export class ModuleRegistry {
     queue: ModuleQueue,
     options: {
       getAgents: () => Agent[];
-      addMessage: (participant: string, content: ContentBlock[], metadata?: MessageMetadata) => MessageId;
+      addMessage: (participant: string, content: ContentBlock[], metadata?: MessageMetadata, opts?: { forAgent?: string }) => MessageId;
       editMessage: (id: MessageId, content: ContentBlock[]) => void;
       removeMessage: (id: MessageId) => void;
       getMessage: (id: MessageId) => ModuleMessage | null;
-      queryMessages: (filter: MessageQuery) => MessageQueryResult;
+      queryMessages: (filter: MessageQuery, opts?: { forAgent?: string }) => MessageQueryResult;
       /** Called with the pushing module's name. */
       pushEvent: (event: ProcessEvent, moduleName?: string) => void;
       onTrace: (listener: TraceEventListener) => () => void;
@@ -451,8 +452,8 @@ export class ModuleRegistry {
    * to MAX_CONTEXT_TIMEOUT_MS so no single module can hold every turn hostage.
    * Adapted from Anarchid/agent-framework@mcpl-module-proto.
    */
-  async gatherContext(agentName: string, timeoutMs = 15_000): Promise<ContextInjection[]> {
-    const injections: ContextInjection[] = [];
+  async gatherContext(agentName: string, timeoutMs = 15_000): Promise<ModuleContextInjection[]> {
+    const injections: ModuleContextInjection[] = [];
     const promises: Promise<void>[] = [];
 
     for (const module of this.modules.values()) {
@@ -608,11 +609,11 @@ class ModuleContextImpl implements ModuleContext {
   private registry: ModuleRegistry;
   readonly isRestart: boolean;
   private getAgentsFn: () => Agent[];
-  private addMessageFn: (participant: string, content: ContentBlock[], metadata?: MessageMetadata) => MessageId;
+  private addMessageFn: (participant: string, content: ContentBlock[], metadata?: MessageMetadata, opts?: { forAgent?: string }) => MessageId;
   private editMessageFn: (id: MessageId, content: ContentBlock[]) => void;
   private removeMessageFn: (id: MessageId) => void;
   private getMessageFn: (id: MessageId) => ModuleMessage | null;
-  private queryMessagesFn: (filter: MessageQuery) => MessageQueryResult;
+  private queryMessagesFn: (filter: MessageQuery, opts?: { forAgent?: string }) => MessageQueryResult;
   private pushEventFn: (event: ProcessEvent, moduleName?: string) => void;
   private onTraceFn: (listener: TraceEventListener) => () => void;
   private callToolFn: (call: ToolCall) => Promise<ToolResult>;
@@ -628,11 +629,11 @@ class ModuleContextImpl implements ModuleContext {
     registry: ModuleRegistry,
     isRestart: boolean,
     getAgents: () => Agent[],
-    addMessage: (participant: string, content: ContentBlock[], metadata?: MessageMetadata) => MessageId,
+    addMessage: (participant: string, content: ContentBlock[], metadata?: MessageMetadata, opts?: { forAgent?: string }) => MessageId,
     editMessage: (id: MessageId, content: ContentBlock[]) => void,
     removeMessage: (id: MessageId) => void,
     getMessage: (id: MessageId) => ModuleMessage | null,
-    queryMessages: (filter: MessageQuery) => MessageQueryResult,
+    queryMessages: (filter: MessageQuery, opts?: { forAgent?: string }) => MessageQueryResult,
     pushEvent: (event: ProcessEvent, moduleName?: string) => void,
     onTrace: (listener: TraceEventListener) => () => void,
     callTool: (call: ToolCall) => Promise<ToolResult>
@@ -754,9 +755,17 @@ class ModuleContextImpl implements ModuleContext {
   addMessage(
     participant: string,
     content: ContentBlock[],
-    metadata?: MessageMetadata & { external?: ExternalIdRef }
+    metadata?: MessageMetadata & { external?: ExternalIdRef },
+    opts?: { forAgent?: string },
   ): MessageId {
-    const id = this.addMessageFn(participant, content, metadata);
+    // The external id map is read in the primary's store
+    // (findMessageByExternalId), so a mapping into another window would
+    // answer wrong.
+    if (metadata?.external && opts?.forAgent !== undefined) {
+      throw new Error(`A message for agent ${JSON.stringify(opts.forAgent)} can't carry metadata.external: `
+        + "its external id would be looked up in the primary's window. Leave forAgent out, or the external id.");
+    }
+    const id = this.addMessageFn(participant, content, metadata, opts);
 
     // Track external ID if provided. A write the framework holds keeps '',
     // as it did before held writes had handles: the map is module state an
@@ -820,8 +829,8 @@ class ModuleContextImpl implements ModuleContext {
     return this.getMessageFn(id);
   }
 
-  queryMessages(filter: MessageQuery): MessageQueryResult {
-    return this.queryMessagesFn(filter);
+  queryMessages(filter: MessageQuery, opts?: { forAgent?: string }): MessageQueryResult {
+    return this.queryMessagesFn(filter, opts);
   }
 
   getAgents(): AgentInfo[] {
