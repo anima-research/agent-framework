@@ -206,3 +206,38 @@ test("a policy that drops a batch's restart leaves a provider hold's pending pri
   assert.equal(gate.primaryPending, true, 'so the primary the hold left pending stays pending');
   assert.ok(framework.providerAccelerationRecoveries.has('Sol'));
 });
+
+test("a policy that drops a batch's restart, with nothing else of the agent's queued, ends a provider hold's pending primary, whatever other agents have queued", async () => {
+  const framework = busyAgentHarness() as FrameworkHarness & {
+    providerGates: Map<string, { primaryPending: boolean }>;
+    providerAccelerationRecoveries: Map<string, unknown>;
+    endContinuedTurn(): void;
+    flushAuxiliaryAdmission(): void;
+  };
+  const now = Date.now();
+  framework.pendingRequests = [
+    // Another agent's wake, which its own turn holds back: the pass puts it
+    // back in the queue before it reaches Sol's batch.
+    { agentName: 'Luna', reason: 'mcpl:channel-incoming', source: 'discord', timestamp: now },
+    { agentName: 'Sol', reason: 'context_budget_restart', source: 'framework', timestamp: now },
+  ];
+  framework.agents = new Map([['Sol', { state: { status: 'idle' } }], ['Luna', { state: { status: 'idle' } }]]);
+  framework.activeTurnTokens.set('Sol', 1);
+  framework.activeTurnTokens.set('Luna', 2);
+  const gate = { primaryPending: true };
+  framework.providerGates = new Map([['Sol', gate]]);
+  framework.providerAccelerationRecoveries = new Map([['Sol', {}]]);
+  framework.endContinuedTurn = () => {};
+  framework.flushAuxiliaryAdmission = () => {};
+  framework.inferencePolicy = {
+    shouldInfer: ((_agent: string, requests: Array<{ reason: string }>) =>
+      !requests.some((r) => r.reason === 'context_budget_restart')) as () => boolean,
+  };
+  framework.startAgentStream = async () => {};
+
+  await framework.processInferenceRequests();
+
+  assert.deepEqual(framework.pendingRequests.map((r) => r.agentName), ['Luna'], "Luna's wake waits for Luna's turn");
+  assert.equal(gate.primaryPending, false, "Sol's pending primary ends: nothing of Sol's waits to run");
+  assert.equal(framework.providerAccelerationRecoveries.has('Sol'), false);
+});
