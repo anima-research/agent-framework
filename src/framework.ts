@@ -2789,6 +2789,26 @@ interface StreamRequestNotes {
   stopped: boolean;
 }
 
+/**
+ * The fields of an agent's config that describe its model, which a
+ * subconscious on another model doesn't carry over from the resident
+ * (createSubconsciousAgent). Its copy inherits the resident's inference
+ * settings so that a same-model side-process runs under the resident's own
+ * conditions. A field is listed here only where inheriting it would be
+ * silently wrong for another model: `physicalWindowTokens` is the model's
+ * window, and a value above another model's lets a stream walk past that
+ * model's window (#92); `thinkingBinding` says whether the model's thinking
+ * binds and takes the drop control. Without them it runs as an agent that
+ * sets neither, so only the `maxStreamTokens` restart bounds its streams.
+ *
+ * Every other inference setting stays inherited, since a model that refuses
+ * one says so: a subconscious on another model takes the resident's thinking
+ * config, output ceiling (`maxTokens`), budgets (`contextBudgetTokens`,
+ * `maxStreamTokens`) and caching setting (`promptCaching`), so that model
+ * must accept them or its calls are refused.
+ */
+const SUBCONSCIOUS_MODEL_FIELDS = ['physicalWindowTokens', 'thinkingBinding'] as const satisfies ReadonlyArray<keyof AgentConfig>;
+
 export class AgentFramework {
   private toolPresentations = new Map<string, ToolPresentation>();
   private presentationPreviews = new WeakMap<object, PresentationSnapshot>();
@@ -12426,11 +12446,17 @@ export class AgentFramework {
     // caching, refusal handling, timezone — a same-model side-process must
     // not silently run under different inference conditions than the
     // resident it serves. Only identity- and surface-defining fields are
-    // overridden below.
+    // overridden below. On another model, what describes the principal's
+    // model isn't the subconscious's to carry (SUBCONSCIOUS_MODEL_FIELDS).
+    const model = cfg.model ?? primaryConfig.model;
+    const inherited: AgentConfig = { ...primaryConfig };
+    if (model !== primaryConfig.model) {
+      for (const field of SUBCONSCIOUS_MODEL_FIELDS) delete inherited[field];
+    }
     const agentConfig: AgentConfig = {
-      ...primaryConfig,
+      ...inherited,
       name,
-      model: cfg.model ?? primaryConfig.model,
+      model,
       systemPrompt: cfg.systemPrompt,
       strategy: undefined, // its CM owns the windowed strategy instance
       // Prose is never auto-routed: a cadence-triggered turn carries no
