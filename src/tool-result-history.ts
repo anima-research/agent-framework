@@ -19,7 +19,7 @@
  * is withheld.
  */
 
-import { INLINE_WITHHELD_TEXT, isInlineContradiction, referenceStubOrNull } from './mcpl/references.js';
+import { INLINE_WITHHELD_TEXT, isInlineContradiction, referenceBlockForScript, referenceStubOrNull } from './mcpl/references.js';
 import { NON_STRING_TEXT_PLACEHOLDER } from './mcpl/visible-content.js';
 import { formatToolImagePlaceholder, toolResultCutAt } from './tool-image-ledger.js';
 
@@ -235,6 +235,27 @@ function shownInHistory(value: unknown): unknown {
     return hasUri(b.uri) || b.disposition !== undefined ? INLINE_WITHHELD_TEXT : value;
   }
   return referenceStubOrNull(b, 'from tool result') ?? value;
+}
+
+/**
+ * A value of a tool result's data as a script reads it, by history's rules
+ * (shownInHistory), as a JSON replacer applies them at every depth: what
+ * RFC-005 governs is shown as the script lane shows it, a reference as its
+ * stub's facts without its uri and an invalid one as the notice
+ * (referenceBlockForScript), and inline data that also claims a uri of any
+ * value or a disposition as the withheld notice, each as a text block. Any
+ * other value is itself. What it gives is either a stub or a notice, which
+ * RFC-005 doesn't govern, or the value itself, which it gives again, so
+ * applying it twice gives what applying it once gave.
+ */
+export function shownToScript(value: unknown): unknown {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return value;
+  const b = value as Record<string, unknown>;
+  if (!governedByRfc005(b)) return value;
+  if ((b.type === 'image' || b.type === 'audio') && typeof b.data === 'string') {
+    return hasUri(b.uri) || b.disposition !== undefined ? { type: 'text', text: INLINE_WITHHELD_TEXT } : value;
+  }
+  return referenceBlockForScript(b);
 }
 
 /**
