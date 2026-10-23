@@ -12,6 +12,98 @@ Releases up to and including 0.7.3 predate this file; for their contents see
 
 ## Unreleased
 
+## 0.26.1 — 2026-10-23
+
+### Added
+
+- `HostModeStatus.activeTurnAgents` lists, sorted, the agents with a turn
+  alive, the ones `activeTurns` counts: each from its turn's dequeue to its
+  settled teardown, so a turn in its hooks or compile, one finishing its
+  deliveries, or one whose continuation is on its way to its start, is
+  listed. So a host can record which agents are mid-turn before it abandons
+  their turns or stops.
+
+### Changed
+
+- `stop()` ends a turn whose continuation hasn't started, as `shutdown`,
+  with the continuation dropped.
+- A budget restart's `inference:stream_restarted`, and its boundary's usage
+  report, now come after its continuation is queued and its stream
+  cancelled.
+  A restart boundary reached while the framework is stopping emits no
+  `inference:stream_restarted` and queues no continuation: the turn ends as
+  `shutdown`.
+
+### Fixed
+
+- A coalesced `push/event` or `channels/incoming` message whose receipt the
+  host couldn't write is no longer admitted again when the producer retries.
+  The failed write was answered "host could not persist the acceptance; retry"
+  after the occurrence's effects were in, and no receipt was kept. So each
+  retry was a fresh admission: a copy the agent had read arrived again, a
+  deferred notice rendered again, a deletion notice was appended again, and the
+  answer named the occurrence's own eventId as `priorEventId`. Now the receipt
+  is kept. A retry writes it again and makes it durable, then answers the first
+  result without repeating an effect, as RFC-006 §3.1 has a coalescing host
+  do. While the write keeps failing, each retry gets the same answer and
+  repeats nothing. A host killed before a later save and commit carried the
+  receipt still admits the retry as a new occurrence.
+- On `channels/incoming`, a coalesced message admitted whose receipt couldn't
+  be written or made durable was answered `accepted: false`, which says it
+  wasn't admitted, so a producer could hold it as never delivered. The request
+  is now answered with a -32000 error carrying the same message, since a
+  per-message result can only say a message was taken or wasn't, and the
+  messages after it in the request aren't admitted until they're sent again.
+  An uncoalesced message before it in the same request is admitted again when
+  the request is sent again. A retry of an admitted message while the host is
+  stopping fails the request the same way. A failure before any effect, such
+  as "host is stopping" for a new message, is still a per-message refusal.
+- A save of the coalescing state that fails is kept for the next save or the
+  host's stop, instead of being dropped until the state next changes.
+
+- A module's blocks in a script's `content` now get the treatment the
+  model's lanes give a module's result, as an MCPL peer's already did,
+  since what a script prints comes back to the model. Such blocks include
+  an MCPL peer's result that a module got through `ctx.callTool` and
+  returns whole. An RFC-005 reference anywhere in them, a `disposition:
+  "never"` one included, arrives without its URI, as the stub's facts an
+  MCPL peer's reference arrives as (`refId`, the labels the block gave,
+  `savedTo`). Inline data that also claims a URI, of any type, or a
+  disposition arrives as the withheld notice; a null or absent URI is
+  none, and in a module's result so is an empty one, as the model's
+  history reads it. A reference the classifier
+  rejects arrives as its notice; that includes an MCP-form embedded
+  resource, whose URI sits under `resource`, which the model's history
+  shows the same way, so a script no longer gets its text. Anything else
+  arrives as the module returned it. Before, a module's structured result
+  reached a script with its blocks as the module returned them,
+  references' URIs included. Which results are a module's is decided by
+  where the dispatch sent the call, not by the tool's name. An MCPL
+  peer's inline data beside a URI that isn't a string, such as an object,
+  now also reaches a script as the withheld notice. `structuredContent`
+  still reaches a script whole, from every tool, and so do fields a server
+  puts outside its content blocks' reference positions.
+
+- A turn whose continuation (a budget restart's, or a tool-result guard's
+  retry) is waiting to start now counts as alive. Between the turn's stream
+  ending and the continuation's start, a stretch that a provider wait stated
+  meanwhile makes as long as the wait, the host used to report `drained`, a
+  `quiesce()` returned drained and the continuation then started while the
+  host was quiesced, and `quiesce({ abandon: true })` found nothing to end.
+  Now `activeTurnAgents` lists the agent, a `quiesce()` waits for the
+  continuation's turn, and an abandon ends the turn with the continuation
+  dropped. A puppet tool call and a branch switch are refused in that
+  stretch, as during any live turn.
+- A turn whose continuation is dropped by an abandon, `stop()`, the
+  inference policy, the agent's removal or a conversation agent's disposal
+  now ends, with one `inference:aborted`. A drop other than an abandon or a
+  stop also releases the EventGate window held for the continuation,
+  closes the turn's logical turn and withholds the tool-result guard's
+  pending batch from later requests, as for a turn that ends before it
+  sends anything. A provider hold left empty by the drop releases without
+  queueing a retry turn. An ephemeral run that ends takes such a
+  continuation with it, its own end having ended the turn.
+
 ## 0.26.0 — 2026-10-23
 
 ### Breaking
