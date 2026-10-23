@@ -223,9 +223,10 @@ export class McpServer {
         // This server sends its client no requests, so a response can't be
         // matched to one, and it's never answered. A client that couldn't
         // read a line this server sent, whatever it was, may answer it with
-        // id null, or under MCP with no id. The id and the error member, if
-        // it has one, are printed as sent, through logValue, since they're
-        // the client's text.
+        // id null, or under MCP with no id. The error member, if it has one,
+        // is printed through logValue, which escapes and bounds the client's
+        // text, and so is the id when it's a string or a number; any other
+        // id is named by its kind.
         const { id, error } = message as { id?: unknown; error?: unknown };
         const which = !Object.hasOwn(message as object, 'id') ? 'with no id'
           : `whose id is ${typeof id === 'string' || typeof id === 'number' ? logValue(id) : jsonKind(id)}`;

@@ -5,16 +5,17 @@
  * the transport it came on, an invalid one included; a message with an id
  * and no method is a response, whatever the id's value, and so is a
  * JSON-RPC 2.0 error with no id, as MCP allows; a response is never
- * answered, and one whose id can't be matched is logged, its error
- * redacted, during the handshake too, except that an error with id null or
- * none then answers initialize, and the connect fails at once; any other
- * object with neither a method nor an id isn't JSON-RPC, so it's ignored,
- * as a JSON value that isn't an object is, a batch included. A message
- * whose id isn't a string, a number or null, or whose method isn't a
- * string, with or without an id, is answered once with -32600, carrying its
- * id where that's a string or a number and null otherwise, and isn't
- * dispatched. Real connection routing and response encoding, and stdio
- * servers for the handshake.
+ * answered, and one whose id is neither a string nor a number, or that has
+ * none, can't be matched, so it's logged, its error redacted, during the
+ * handshake too, except that a JSON-RPC 2.0 error with id null or none then
+ * answers initialize, and the connect fails at once; any other object with
+ * neither a method nor an id isn't JSON-RPC, so it's ignored, as a JSON
+ * value that isn't an object is, a batch included. A message whose id isn't
+ * a string, a number or null, or whose method isn't a string, with or
+ * without an id, is answered once with -32600, carrying its id where that's
+ * a string or a number and null otherwise, and isn't dispatched. Real
+ * connection routing and response encoding, and stdio servers for the
+ * handshake.
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
@@ -231,6 +232,21 @@ test("an error that can't be matched is logged with a credential its server's co
   ]);
 });
 
+test("responses that can't be matched read their connection's configuration once for its redaction, and keep it (#540's review, R1-2)", (t) => {
+  const { connection, send, logged } = wire(t);
+  const token = 'tok-0123456789abcdef';
+  // A framework-launched server's env is a getter that reads the awareness
+  // ledger each time.
+  let reads = 0;
+  const config = { id: 'srv', command: 'server' } as McplServerConfig;
+  Object.defineProperty(config, 'env', { enumerable: true, get: () => { reads++; return { API_TOKEN: token }; } });
+  (connection as unknown as { config: McplServerConfig }).config = config;
+  for (let i = 0; i < 3; i++) send({ jsonrpc: '2.0', id: null, error: { code: -32000, message: `bad token ${token}` } });
+  assert.equal(reads, 1, 'read for the first of these responses only');
+  assert.equal(logged.length, 3);
+  for (const line of logged) assert.ok(line.includes(String.raw`bad\u0020token\u0020redacted`) && !line.includes(token), line);
+});
+
 test("a null-id error while a request of the host's is pending leaves that request pending, and its own answer settles it", async (t) => {
   const { connection, transport, send, logged } = wire(t);
   const orphans: unknown[] = [];
@@ -278,7 +294,7 @@ for (const [form, answer] of [
   ['with id null', { jsonrpc: '2.0', id: null, error: { code: -32700, message: 'Parse error' } }],
   ['with no id, as MCP allows', { jsonrpc: '2.0', error: { code: -32700, message: 'Parse error' } }],
 ] as const) {
-  test(`during the handshake an error ${form} answers initialize, the one request out: the connect fails at once, in the server's words`, async () => {
+  test(`during the handshake an error ${form} answers initialize, the one request out: the connect fails at once, with the error's message`, async () => {
     // A server that couldn't read initialize, and so answers it naming no
     // request. Its error is the handshake's, rather than a timeout 30 s later.
     const server = initializeAnswers(JSON.stringify(answer));
@@ -289,7 +305,7 @@ for (const [form, answer] of [
   });
 }
 
-test("during the handshake any other response that can't be matched is logged, one with another number is ignored, and the handshake goes on", async (t) => {
+test("during the handshake a response whose id isn't a string or a number, and that doesn't answer initialize, is logged, one with another number is ignored, and the handshake goes on", async (t) => {
   const logged: string[] = [];
   t.mock.method(console, 'error', (...args: unknown[]) => { logged.push(args.map(String).join(' ')); });
   // Answers initialize first with a number that isn't initialize's, then with

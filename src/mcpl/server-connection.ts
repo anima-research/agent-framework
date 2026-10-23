@@ -321,11 +321,11 @@ interface HeldItem {
  *  no id, when it couldn't read a request (JSON-RPC 2.0 §5), so once
  *  connected it may be the answer to a request of ours, which gets nothing
  *  from it and ends as any unanswered request does, by its timeout where it
- *  has one. (During the handshake such an error answers initialize.) Its
- *  error member, if it has one, is the server's text, whatever JSON value
- *  it is, so it's printed redacted with `redact`, the server's redaction
- *  (logValueRedacted), as handleResponse prints a matched error's code and
- *  message. */
+ *  has one. (During the handshake such an error answers initialize, when
+ *  its jsonrpc is "2.0".) Its error member, if it has one, is the server's
+ *  text, whatever JSON value it is, so it's printed redacted with `redact`,
+ *  the server's redaction (logValueRedacted), as handleResponse prints a
+ *  matched error's code and message. */
 function unmatchedResponse(
   serverId: string,
   response: { id?: unknown; error?: unknown },
@@ -614,13 +614,13 @@ export class McplServerConnection extends EventEmitter {
   private config: McplServerConfig | null = null;
   /** The redactor of the server's text for `config`, made at its first error
    *  answer or response it can't match (handleResponse), by when `config`
-   *  is set, and kept: a framework-launched child's
-   *  `env` is a getter that reads the awareness ledger, so a redactor built
-   *  per answer would read it per answer (#540's review, R1-2). An answer
-   *  takes one build of it for its words, data and log line (`now()`), so
-   *  it reads the ledger at most once. It builds again only after a build
-   *  that failed, which withholds that answer's text, or once a dial notes
-   *  something new (serverTextRedactor). */
+   *  is set, and kept: a framework-launched child's `env` is a getter that
+   *  reads the awareness ledger, so a redactor built per answer would read
+   *  it per answer (#540's review, R1-2). An answer takes one build of it
+   *  for its words, data and log line (`now()`), so it reads the ledger at
+   *  most once. It builds again only after a build that failed, which
+   *  withholds that answer's text, or once a dial notes something new
+   *  (serverTextRedactor). */
   private redactor: ServerTextRedactor | null = null;
   private hostCapabilities: McplHostCapabilities | null = null;
   private reconnectEnabled = false;
@@ -1270,10 +1270,13 @@ export class McplServerConnection extends EventEmitter {
           // that way (JSON-RPC 2.0 §5; MCP 2025-11-25, Basic), initialize is
           // the only request this host has out, and a peer never answers a
           // response. Such an error means the server can't read this host's
-          // messages, so the handshake fails at once, in the server's words.
-          // `"jsonrpc": "2.0"` keeps a server's own JSON log line, which can
-          // carry an id and an error key, from failing it. Any other response
-          // whose id can't be matched is logged, as on a connected transport.
+          // messages, so the handshake fails at once, with the error's message.
+          // `"jsonrpc": "2.0"` keeps a server's own JSON log line with an
+          // error key and id null, or no id, from failing it; one with
+          // initialize's id is taken for the answer, whatever its jsonrpc. Of
+          // the other responses, one whose id is neither a string nor a number,
+          // or that has none, is logged, as on a connected transport, and one
+          // with another string or number id is ignored.
           const envelope = readEnvelope(msg as unknown as Record<string, unknown>);
           if (envelope.kind === 'request' && envelope.method === 'ping') {
             transport.writeLine(JSON.stringify({ jsonrpc: '2.0', id: envelope.id, result: {} }));
