@@ -398,7 +398,12 @@ describe('a turn whose continuation is on its way', () => {
 
   it("an abandon takes the continuation from a scheduler pass's hands, and it never starts", async () => {
     const { h, unblock } = await passHoldingContinuation();
+    const internal = internals(h.framework);
     try {
+      // As an acceleration hold that released the continuation leaves it: a
+      // primary pending, its recovery recorded.
+      internal.providerGate('prime').primaryPending = true;
+      internal.providerAccelerationRecoveries.set('prime', { startedAt: Date.now(), failures: 1, heldRequests: 1, reason: 'a test' });
       const quiesced = h.framework.quiesce({ timeoutMs: QUIESCE_MS, abandon: true });
       await waitFor("the abandon to mark alpha's start", () => h.logged.some((l) => l.includes('abandoning in-flight turn for alpha')));
       unblock();
@@ -408,6 +413,7 @@ describe('a turn whose continuation is on its way', () => {
       await aPass(h, 'a pass after the abandon');
       assert.equal(h.membrane.calls.length, 1, "prime's continuation never started, and alpha's abandoned start sent nothing");
       assert.equal(abortReasons(h.traces).filter((r) => r === 'quiesce_abandoned').length, 2, "one inference:aborted for each abandoned turn");
+      assert.equal(internal.providerGate('prime').primaryPending, false, 'no primary is left pending for the dropped continuation');
     } finally {
       unblock();
       await h.cleanup();
@@ -703,6 +709,32 @@ describe('a turn whose continuation is dropped ends there', () => {
       assert.equal(abortReasons(h.traces).filter((r) => r === 'quiesce_abandoned').length, 1, "one inference:aborted, the abandon's");
       await h.framework.resume();
       await waitFor('the deferred message to land', () => storedTexts(h.framework).includes(MID));
+    } finally {
+      release();
+      await h.cleanup();
+    }
+  });
+
+  it('a drop while the restarted frame still holds its token lands what was deferred as that frame ends', async () => {
+    let release!: () => void;
+    const h = await restartTurn({
+      wait: true,
+      holdTeardown: new Promise<void>((r) => { release = r; }),
+      inferencePolicy: { shouldInfer: (_agent, requests) => !requests.some((r) => r.reason === 'context_budget_restart') },
+    });
+    try {
+      await waitFor('the continuation to be held', () => {
+        const hold = internals(h.framework).providerAccelerationCooldowns.get('prime');
+        return hold?.heldRequests.some((r) => r.reason === 'context_budget_restart') ?? false;
+      });
+      assert.equal(frameLetGo(h.framework), false, 'its frame still holds the token');
+      pushMessage(h.framework, MID);
+      await waitFor('the message to defer behind the token', () => internals(h.framework).deferredMessages.length > 0);
+      h.framework.releaseProviderWait('prime');
+      await waitFor('the policy to drop the continuation', () => h.endLines().some((l) => l.includes('the inference policy dropped its continuation')));
+      assert.ok(!storedTexts(h.framework).includes(MID), 'the message waits while the frame holds the token');
+      release();
+      await waitFor('the deferred message to land as the frame ends', () => storedTexts(h.framework).includes(MID));
     } finally {
       release();
       await h.cleanup();
