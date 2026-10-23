@@ -4078,10 +4078,10 @@ export class AgentFramework {
     // stop() then fails with it among the others, and an owned store stays
     // open for another stop(), as after a failed module stop. A step added
     // here goes through step(), or catches into shutdownErrors as the waits
-    // below do. step() says whether its step ran without throwing.
+    // below do.
     const shutdownErrors: unknown[] = [];
-    const step = (run: () => void): boolean => {
-      try { run(); return true; } catch (error) { shutdownErrors.push(error); return false; }
+    const step = (run: () => void): void => {
+      try { run(); } catch (error) { shutdownErrors.push(error); }
     };
     // No MCP server is admitted from here on (stopHasBegun): none is launched
     // or dialed while the rest are being closed, so none outlives the
@@ -4150,10 +4150,13 @@ export class AgentFramework {
     const uncancelled = new Set<string>();
     for (const agent of this.agents.values()) {
       if ('stream' in agent.state && agent.state.stream) {
-        if (!step(() => this.cancelUnderMark(agent, 'shutdown', () => agent.cancelStream()))) {
+        try {
+          this.cancelUnderMark(agent, 'shutdown', () => agent.cancelStream());
+        } catch (error) {
+          shutdownErrors.push(error);
           uncancelled.add(agent.name);
           console.error(`[turn] ${agent.name}: the stream's cancel threw at stop(), and stop() rejects with that error, ` +
-            `in an AggregateError if other steps failed too: ${describeFailureWithFrames(shutdownErrors[shutdownErrors.length - 1])}`);
+            `in an AggregateError if other steps failed too: ${describeFailureWithFrames(error)}`);
         }
       }
     }

@@ -56,6 +56,8 @@ interface Internals {
   providerGate(name: string): { auxiliaryInFlight: number; idleWaiters: Array<() => void>; primaryDepth: number; primaryPending: boolean };
   providerHoldHook: ((error: Error, agentName: string) => { holdMs: number; reason: string } | undefined) | undefined;
   holdProviderAcceleration(agent: unknown, error: Error, trigger?: InferenceRequest, auxiliary?: boolean): boolean;
+  pushCoalescer: unknown;
+  lifecycleGeneration: number;
 }
 const internals = (framework: AgentFramework) => framework as unknown as Internals;
 
@@ -337,8 +339,6 @@ function pushMessage(framework: AgentFramework, text: string): void {
 }
 
 
-/** prime's turn token has gone with its restarted frame: the turn waits for
- *  its continuation with no token held. */
 /** Each turn-ending trace of prime's, with its reason if it has one. */
 const terminalsOf = (h: { traces: TraceEvent[] }): string[] => h.traces
   .filter((t) => ['inference:aborted', 'inference:completed', 'inference:failed', 'inference:exhausted', 'inference:turn_ended'].includes(t.type))
@@ -363,6 +363,8 @@ async function aPass(h: { framework: AgentFramework; logged: string[] }, label: 
   internals(h.framework).pendingRequests.push({ agentName: 'nobody', reason: 'operator', source: 'test', timestamp: Date.now() });
   await waitFor(label, () => h.logged.filter((l) => l.includes('agent=nobody reason=agent_not_found')).length > before);
 }
+/** prime's turn token has gone with its restarted frame: the turn waits for
+ *  its continuation with no token held. */
 
 /**
  * prime's continuation in a scheduler pass's hands: the pass took it from
@@ -1165,25 +1167,36 @@ describe('a framework cancel that throws', () => {
     }
   });
 
-  it('a start compiled while the framework stops, whose cancel throws, is dropped as one whose cancel worked', async () => {
-    let fw: AgentFramework | null = null;
-    const h = await restartTurn({
-      wait: false, cancelThrowsAt: 1, gate: true, until: () => true,
-      // The framework starts stopping as the continuation's compile makes its stream.
-      onStreamMade: (index) => { if (index === 1 && fw) internals(fw).providerAdmissionClosed = true; },
-      beforeStart: (framework) => { fw = framework; },
+  for (const how of ['stopping', 'replaced', 'restarted'] as const) {
+    const why = how === 'stopping' ? 'the framework was stopping'
+      : how === 'replaced' ? 'the agent was replaced or removed' : 'the framework was stopped and started again';
+    it(`a start compiled while ${why}, whose cancel throws, is dropped as one whose cancel worked`, async () => {
+      let fw: AgentFramework | null = null;
+      const h = await restartTurn({
+        wait: false, cancelThrowsAt: 1, gate: true, until: () => true,
+        // As the continuation's compile makes its stream: the framework
+        // starts stopping, the agent is replaced under its name, or a stop()
+        // and a start() advance the lifecycle, admission open again.
+        onStreamMade: (index) => {
+          if (index !== 1 || !fw) return;
+          if (how === 'stopping') internals(fw).providerAdmissionClosed = true;
+          else if (how === 'replaced') internals(fw).agents.set('prime', Object.create(fw.getAgent('prime')!));
+          else internals(fw).lifecycleGeneration += 2;
+        },
+        beforeStart: (framework) => { fw = framework; },
+      });
+      try {
+        await waitFor('the start to end', () => terminalsOf(h).length > 0);
+        assert.deepEqual(terminalsOf(h), [`inference:aborted:a turn compiled while ${why} is dropped before it sends anything`]);
+        assert.ok(h.logged.some((l) => l.startsWith(`[turn] prime: the cancel of a turn's stream compiled while ${why} threw; it was never iterated, so it sent nothing, and the start ends as if the cancel had worked: `)));
+        assert.equal((h.membrane.streams[1] as CancelThrowsOnceStream).cancels, 1, 'the agent lets go of the stream without cancelling it again');
+        assertTurnEnded(h);
+      } finally {
+        internals(h.framework).providerAdmissionClosed = false;
+        await h.cleanup();
+      }
     });
-    try {
-      await waitFor('the start to end', () => terminalsOf(h).length > 0);
-      assert.deepEqual(terminalsOf(h), ['inference:aborted:a turn compiled while the framework was stopping is dropped before it sends anything']);
-      assert.ok(h.logged.some((l) => /^\[turn\] prime: the cancel of a turn's stream compiled while the framework was stopping threw; it was never iterated, so it sent nothing, and the start ends as if the cancel had worked: /.test(l)));
-      assert.equal((h.membrane.streams[1] as CancelThrowsOnceStream).cancels, 1, 'the agent lets go of the stream without cancelling it again');
-      assertTurnEnded(h);
-    } finally {
-      internals(h.framework).providerAdmissionClosed = false;
-      await h.cleanup();
-    }
-  });
+  }
 
   it("a start a caller stops during its compile, whose stream's cancel throws, ends as the caller's stop", async () => {
     let fw: AgentFramework | null = null;
