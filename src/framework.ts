@@ -13519,9 +13519,18 @@ export class AgentFramework {
       recordReceipt: (record) => {
         // Written now, not at the throttled flush: an acknowledged acceptance
         // must not lose its receipt, the subject's birth, or (deferred) the
-        // accepted work itself to a crash. A failure here fails the acceptance.
+        // accepted work itself to a crash. A failure here fails the answer:
+        // the coalescer keeps the receipt, and the producer's retry writes it
+        // again, with the subject's state as it is then. So a record whose
+        // write failed leaves the list: a later write would carry it after
+        // the batch it holds had moved on.
         this.coalescingRecentReceipts.push(record);
-        this.store.setStateJson(COALESCING_RECENT_ID, this.coalescingRecentReceipts);
+        try {
+          this.store.setStateJson(COALESCING_RECENT_ID, this.coalescingRecentReceipts);
+        } catch (error) {
+          this.coalescingRecentReceipts.pop();
+          throw error;
+        }
       },
       // The acceptance of coalesced work (deferred included) is observed
       // here, once; its later delivery reuses the frozen envelope.
@@ -13628,6 +13637,9 @@ export class AgentFramework {
       this.store.setStateJson(COALESCING_RECENT_ID, []);
     } catch (err) {
       console.error('[coalescing] could not persist coalescing state:', err);
+      // Still unsaved: the next persist, or the stop's flush, writes it. No
+      // timer of its own, so a store that keeps failing isn't retried here.
+      this.coalescingSnapshotDirty ??= snapshot;
     }
   }
 

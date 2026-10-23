@@ -842,6 +842,189 @@ test('R10: a retry after a failed commit is acknowledged only once the commit su
   assert.equal(f.framework.getAgent('agent')!.getContextManager().getAllMessages().filter((m) => JSON.stringify(m.content).includes('other')).length, 1, 'plain: delivered exactly once across the failed and successful acknowledgement');
 });
 
+/** Make the host's next `times` writes of a coalescing receipt record fail,
+ *  as a full disk would; returns how many are still to fail. A write that
+ *  only empties the list, as the snapshot flush's does, isn't counted. */
+function failReceiptWrites(f: Awaited<ReturnType<typeof fixture>>, times: number): () => number {
+  const store = (f.framework as unknown as { store: { setStateJson: (id: string, value: unknown) => void } }).store;
+  const orig = store.setStateJson.bind(store);
+  let left = times;
+  store.setStateJson = (id, value) => {
+    if (id === 'mcpl/coalescing-recent' && Array.isArray(value) && value.length > 0 && left > 0) { left--; throw new Error('ENOSPC simulated'); }
+    orig(id, value);
+  };
+  return () => left;
+}
+
+/** How many of the agent's messages hold `text`. */
+function copies(f: Awaited<ReturnType<typeof fixture>>, text: string): number {
+  return f.framework.getAgent('agent')!.getContextManager().getAllMessages().filter((m) => JSON.stringify(m.content).includes(text)).length;
+}
+
+/** A producer's first send and five resends of one event (discord-mcpl's
+ *  schedule, less its waits), the agent taking a turn after each, so a copy
+ *  delivered again would be read rather than replaced. Returns each answer. */
+async function sendAndResend(f: Awaited<ReturnType<typeof fixture>>, send: () => Promise<any>): Promise<any[]> {
+  const answers: any[] = [];
+  for (let attempt = 0; attempt < 6; attempt++) {
+    answers.push(await send());
+    await f.framework.runUntilIdle();
+  }
+  return answers;
+}
+
+const failedReceiptWrite = {
+  'a plain push': {
+    text: 'plain_copy', before: async () => {},
+    send: (f: Awaited<ReturnType<typeof fixture>>) => f.send('push/event', f.params('e1', 'plain_copy', { initial: true })),
+    first: { accepted: true, coalesce: { outcome: 'first' } },
+  },
+  'a coalesced channel message': {
+    text: 'chan_copy', before: async (f: Awaited<ReturnType<typeof fixture>>) => { await f.register(); },
+    send: (f: Awaited<ReturnType<typeof fixture>>) => f.send('channels/incoming', { messages: [f.channel('c1', 'chan_copy', { initial: true })] }),
+    first: { results: [{ messageId: 'm', accepted: true, coalesce: { outcome: 'first' } }] },
+  },
+  'a deferred notice': {
+    text: 'document_diff', before: async () => {},
+    send: (f: Awaited<ReturnType<typeof fixture>>) => f.send('push/event', f.params('d1', 'deferred_copy', { deferred: true, initial: true })),
+    first: { accepted: true, coalesce: { outcome: 'first' } },
+  },
+  'a deletion notice of a read message': {
+    text: 'deletion_notice',
+    before: async (f: Awaited<ReturnType<typeof fixture>>) => {
+      await f.send('push/event', f.params('r0', 'original_text', { initial: true }));
+      await f.framework.runUntilIdle();
+    },
+    send: (f: Awaited<ReturnType<typeof fixture>>) => f.send('push/event', f.params('r1', 'deletion_notice', { retract: true })),
+    first: { accepted: true, coalesce: { outcome: 'noted', priorEventId: 'r0' } },
+  },
+};
+
+for (const [what, c] of Object.entries(failedReceiptWrite)) test(`a failed receipt write keeps the receipt: ${what} resent five times reaches the agent once, and every resend answers the first result`, async (t) => {
+  const f = await fixture(); t.after(f.close);
+  f.alwaysRespond();
+  await c.before(f);
+  const left = failReceiptWrites(f, 1);
+  const [first, ...resends] = await sendAndResend(f, () => c.send(f));
+  assert.equal(left(), 0, 'the write failed once');
+  // The channel lane too answers the request -32000: a per-message
+  // `accepted: false` would say the message wasn't admitted.
+  assert.equal(first.error?.code, -32000, 'the first send is answered -32000');
+  assert.equal(first.error?.message, 'host could not persist the acceptance; retry');
+  for (const resend of resends) assert.deepEqual(resend.result, c.first, 'a resend answers the first result');
+  assert.equal(copies(f, c.text), 1, 'one copy reached the agent');
+  if (what === 'a deferred notice') assert.equal(f.renders.length, 1, 'one render');
+});
+
+test('a channels/incoming request stops at a message admitted without its receipt: the request is answered -32000, nothing after it is admitted, and the resend answers both', async (t) => {
+  const f = await fixture(); t.after(f.close);
+  f.alwaysRespond();
+  await f.register();
+  failReceiptWrites(f, 1);
+  const request = { messages: [f.channel('a1', 'first_message', { initial: true }, 'chat', 'ma'), f.channel('b1', 'second_message', { initial: true }, 'chat', 'mb')] };
+  const first = await f.send('channels/incoming', request);
+  assert.equal(first.error?.code, -32000);
+  await f.framework.runUntilIdle();
+  assert.equal(copies(f, 'first_message'), 1, 'the first message was admitted');
+  assert.equal(copies(f, 'second_message'), 0, 'nothing after it was');
+  const resend = await f.send('channels/incoming', request);
+  assert.deepEqual(resend.result, { results: [
+    { messageId: 'ma', accepted: true, coalesce: { outcome: 'first' } },
+    { messageId: 'mb', accepted: true, coalesce: { outcome: 'first' } },
+  ] });
+  await f.framework.runUntilIdle();
+  assert.equal(copies(f, 'first_message'), 1);
+  assert.equal(copies(f, 'second_message'), 1);
+});
+
+test('a channels/incoming request whose coalesced message is admitted without its receipt, after an uncoalesced one, fails; the resend admits the uncoalesced message again and answers the coalesced one from its receipt', async (t) => {
+  const f = await fixture(); t.after(f.close);
+  f.alwaysRespond();
+  await f.register();
+  failReceiptWrites(f, 1);
+  const { coalesce: _none, ...uncoalesced } = f.channel('u1', 'loose_copy', {}, 'chat', 'mu');
+  const request = { messages: [uncoalesced, f.channel('c1', 'coalesced_copy', { initial: true }, 'chat', 'mc')] };
+  const first = await f.send('channels/incoming', request);
+  assert.deepEqual(first.error && { code: first.error.code, data: first.error.data }, { code: -32000, data: { field: 'eventId' } });
+  await f.framework.runUntilIdle();
+  const resend = await f.send('channels/incoming', request);
+  assert.deepEqual(resend.result, { results: [
+    { messageId: 'mu', accepted: true },
+    { messageId: 'mc', accepted: true, coalesce: { outcome: 'first' } },
+  ] });
+  await f.framework.runUntilIdle();
+  // The cost named in the change: the uncoalesced message has no receipt.
+  assert.equal(copies(f, 'loose_copy'), 2);
+  assert.equal(copies(f, 'coalesced_copy'), 1);
+});
+
+test("a receipt record whose write failed doesn't stay on the host's list of records to write", async (t) => {
+  const f = await fixture(); t.after(f.close);
+  failReceiptWrites(f, 1);
+  const answer = await f.send('push/event', f.params('e1', 'plain_copy', { initial: true }));
+  assert.equal(answer.error?.code, -32000);
+  const list = (f.framework as unknown as { coalescingRecentReceipts: Array<{ key: string }> }).coalescingRecentReceipts;
+  assert.equal(list.some((r) => r.key.includes('"e1"')), false, 'not left to be written later with the batch it held');
+});
+
+test('a coalescer failure before any effect stays a per-message refusal on the channel lane', async (t) => {
+  const f = await fixture(); t.after(f.close);
+  await f.register();
+  (f.framework as unknown as { pushCoalescer: PushCoalescer<unknown> }).pushCoalescer.suspend();
+  const answer = await f.send('channels/incoming', { messages: [f.channel('s1', 'stopping_message', { initial: true })] });
+  assert.deepEqual(answer.result, { results: [{ messageId: 'm', accepted: false, reason: 'host is stopping' }] });
+  assert.equal(copies(f, 'stopping_message'), 0);
+});
+
+test('a retry of an admitted message while the host is stopping fails the request on the channel lane, not the message', async (t) => {
+  const f = await fixture(); t.after(f.close);
+  await f.register();
+  failReceiptWrites(f, 1);
+  const send = () => f.send('channels/incoming', { messages: [f.channel('s1', 'stop_copy', { initial: true })] });
+  assert.equal((await send()).error?.code, -32000);
+  (f.framework as unknown as { pushCoalescer: PushCoalescer<unknown> }).pushCoalescer.suspend();
+  const retry = await send();
+  assert.deepEqual(retry.error && { code: retry.error.code, message: retry.error.message }, { code: -32000, message: 'host is stopping' });
+});
+
+test('a coalescing save that fails stays unsaved, so the stop saves it and a retry after the restart is answered from the receipt it carries', async (t) => {
+  const f = await fixture(); t.after(f.close);
+  f.alwaysRespond();
+  failReceiptWrites(f, 1);
+  const store = (f.framework as unknown as { store: { setStateJson: (id: string, value: unknown) => void } }).store;
+  const write = store.setStateJson.bind(store);
+  let failSnapshot = 1;
+  store.setStateJson = (id, value) => {
+    if (id === 'mcpl/coalescing' && failSnapshot > 0) { failSnapshot--; throw new Error('ENOSPC simulated'); }
+    write(id, value);
+  };
+  const send = () => f.send('push/event', f.params('e1', 'plain_copy', { initial: true }));
+  assert.equal((await send()).error?.code, -32000, "the receipt's record wasn't written");
+  // The throttled save fails too: only the receipt in memory holds the admission.
+  (f.framework as unknown as { flushCoalescingSnapshot: () => void }).flushCoalescingSnapshot();
+  assert.equal(failSnapshot, 0, 'the save failed');
+  await f.framework.runUntilIdle();
+  await f.framework.stop(); await f.create();
+  const retry = await send();
+  assert.deepEqual(retry.result, { accepted: true, coalesce: { outcome: 'first' } }, 'answered from the receipt the stop saved');
+  await f.framework.runUntilIdle();
+  assert.equal(copies(f, 'plain_copy'), 1);
+});
+
+test('a receipt write that fails on the send and every resend repeats no effect, and the first resend after it works answers the first result', async (t) => {
+  const f = await fixture(); t.after(f.close);
+  f.alwaysRespond();
+  failReceiptWrites(f, 6);
+  const send = () => f.send('push/event', f.params('e1', 'plain_copy', { initial: true }));
+  const answers = await sendAndResend(f, send);
+  for (const answer of answers) assert.equal(answer.error?.code, -32000);
+  assert.equal(copies(f, 'plain_copy'), 1, 'one copy, read, though every answer failed');
+  const after = await send();
+  assert.deepEqual(after.result, { accepted: true, coalesce: { outcome: 'first' } });
+  await f.framework.runUntilIdle();
+  assert.equal(copies(f, 'plain_copy'), 1);
+});
+
 /** Hold the host's next durability commit; returns a release function once it is held. */
 function holdNextCommit(f: Awaited<ReturnType<typeof fixture>>): Promise<() => void> {
   const internals = f.framework as unknown as { commitCoalescingDurable: () => Promise<void> };
@@ -3389,7 +3572,8 @@ test("#157: a channel edit that is the agent's first view moves context.incoming
   internals.commitCoalescingDurable = () => { internals.commitCoalescingDurable = commit; return Promise.reject(new Error('EIO simulated')); };
   const message = { ...f.channel('a2', 'question_fixed', {}, 'other', 'ma'), tags: ['chat:edited'] };
   const first = await f.send('channels/incoming', { messages: [message] });
-  assert.equal(first.result.results[0].accepted, false, 'the failed commit leaves the edit unacknowledged');
+  // Admitted, so not refused: the request fails, which leaves it unacknowledged.
+  assert.equal(first.error?.code, -32000, 'the failed commit leaves the edit unacknowledged');
   const delivered = storedWith(f, 'question_fixed');
   assert(isMarked(delivered), "the edit was delivered as the agent's first view");
   assert.equal(incomingAnchor(f)?.messageId, 'mb', 'an unacknowledged acceptance moves no anchor');
@@ -3426,4 +3610,111 @@ test('#157: a channel edit of a message the agent has read leaves context.incomi
   const edit = await f.send('channels/incoming', { messages: [{ ...f.channel('a2', 'question_fixed', {}, 'other', 'ma'), tags: ['chat:edited'] }] });
   assert.equal(edit.result.results[0].coalesce.outcome, 'appended', 'the agent had read the question');
   assert.equal(incomingAnchor(f)?.messageId, 'mb', 'the marker left the anchor at the later message');
+});
+
+test("a receipt whose write failed is written by the producer's retry with the subject's batch as it is then, so records restored after a crash don't bring back a batch already rendered", async () => {
+  const state = { shown: false, read: false };
+  const p = firstViewProbe(state, { held: [] });
+  const records: CoalescingReceiptRecord[] = [];
+  let failing = 1;
+  p.host.recordReceipt = (record) => {
+    if (failing > 0) { failing--; throw new Error('ENOSPC simulated'); }
+    records.push(structuredClone(record));
+  };
+  await assert.rejects(p.coalescer.accept(p.occurrence('n1', { deferred: true, initial: true })), (error: { code?: number }) => error.code === -32000);
+  // The accepted notice renders before the producer's retry comes.
+  await p.coalescer.assemble('agent');
+  assert.deepEqual(p.delivered, [{ eventId: 'n1', firstView: true }]);
+  const retry = await p.coalescer.accept(p.occurrence('n1', { deferred: true, initial: true }));
+  assert.deepEqual(retry, { accepted: true, coalesce: { outcome: 'first' } }, "the retry answers the admission's result");
+  assert.equal(records.length, 1, 'the retry wrote the record');
+  assert.equal(records[0].batch, null, 'with the batch the subject has now: none, since it rendered');
+  await p.coalescer.accept(p.occurrence('n1', { deferred: true, initial: true }));
+  assert.equal(records.length, 1, 'once written, a later retry writes it no more');
+  // A crash before the throttled snapshot: only the record survives.
+  const restored = new PushCoalescer<null>(p.host);
+  restored.restoreReceipts(records);
+  await restored.assemble('agent');
+  assert.equal(p.delivered.length, 1, 'the rendered notice is not delivered again');
+});
+
+test("a receipt a retry writes while its batch renders records that batch, so a crash before the render's content is stored brings it back for its fallback", async () => {
+  const state = { shown: false, read: false };
+  const p = firstViewProbe(state, { held: ['n1'] });
+  const records: CoalescingReceiptRecord[] = [];
+  let failing = 1;
+  p.host.recordReceipt = (record) => {
+    if (failing > 0) { failing--; throw new Error('ENOSPC simulated'); }
+    records.push(structuredClone(record));
+  };
+  await assert.rejects(p.coalescer.accept(p.occurrence('n1', { deferred: true, initial: true })), (error: { code?: number }) => error.code === -32000);
+  const assembling = p.coalescer.assemble('agent');
+  await p.renderStarted('n1');
+  // The render-start snapshot, then the producer's retry while the render runs.
+  const snapshot = p.coalescer.snapshot();
+  const retry = await p.coalescer.accept(p.occurrence('n1', { deferred: true, initial: true }));
+  assert.deepEqual(retry, { accepted: true, coalesce: { outcome: 'first' } });
+  assert.equal(records.length, 1, 'the retry wrote the record');
+  assert.equal(records[0].batch?.latest.eventId, 'n1', 'with the rendering batch as pending');
+  // A crash before the render's content is stored: the snapshot and the record survive.
+  const restored = new PushCoalescer<null>(p.host);
+  restored.restore(snapshot);
+  restored.restoreReceipts(records);
+  assert.deepEqual(restored.pendingBatchOccurrences().map((o) => o.eventId), ['n1'], 'the accepted notice comes back');
+  await restored.assemble('agent');
+  assert.deepEqual(p.delivered.map((d) => d.eventId), ['n1'], 'and its fallback is delivered');
+  p.release('n1');
+  await assembling;
+});
+
+test('a snapshot carries a receipt whose record was never written, so a coalescer restored from it answers the retry from that receipt', async () => {
+  const state = { shown: false, read: false };
+  const p = firstViewProbe(state, { held: [], stored: ['p1'] });
+  p.host.recordReceipt = () => { throw new Error('ENOSPC simulated'); };
+  await assert.rejects(p.coalescer.accept(p.occurrence('p1', { initial: true })), (error: { code?: number }) => error.code === -32000);
+  const snapshot = p.coalescer.snapshot();
+  const restored = new PushCoalescer<null>({ ...p.host, recordReceipt: () => {} });
+  restored.restore(snapshot);
+  const retry = await restored.accept(p.occurrence('p1', { initial: true }));
+  assert.deepEqual(retry, { accepted: true, coalesce: { outcome: 'first' } });
+  assert.deepEqual(p.delivered, [{ eventId: 'p1' }], 'delivered once');
+});
+
+test("a retry's record for a subject evicted since its admission says nothing of the subject's birth", async () => {
+  const state = { shown: false, read: false };
+  const p = firstViewProbe(state, { held: [], stored: ['p1', 'q1'] });
+  const records: CoalescingReceiptRecord[] = [];
+  let failing = 1;
+  p.host.recordReceipt = (record) => {
+    if (failing > 0) { failing--; throw new Error('ENOSPC simulated'); }
+    records.push(structuredClone(record));
+  };
+  const coalescer = new PushCoalescer<null>(p.host, { maxSubjects: 1 });
+  await assert.rejects(coalescer.accept(p.occurrence('p1', { initial: true })), (error: { code?: number }) => error.code === -32000);
+  // Read, then withdrawn with nothing to say: the subject is idle.
+  state.read = true;
+  assert.equal((await coalescer.accept(p.occurrence('r1', { retract: true, content: [] }))).coalesce?.outcome, 'consumed');
+  state.read = false;
+  // A second subject evicts it.
+  await coalescer.accept({ ...p.occurrence('q1', { initial: true }), key: 'other' });
+  const retry = await coalescer.accept(p.occurrence('p1', { initial: true }));
+  assert.deepEqual(retry, { accepted: true, coalesce: { outcome: 'first' } });
+  const rewritten = records.find((r) => r.key.includes('"p1"'));
+  assert.ok(rewritten, 'the retry wrote the record');
+  assert.equal(rewritten.born, undefined, 'no birth: the subject is untracked now');
+});
+
+test('an admission whose receipt is never written is observed once, after its effects', async () => {
+  const state = { shown: false, read: false };
+  const p = firstViewProbe(state, { held: [], stored: ['p1'] });
+  const observed: string[] = [];
+  const deliveredWhenObserved: number[] = [];
+  p.host.accepted = (occurrence) => { observed.push(occurrence.eventId); deliveredWhenObserved.push(p.delivered.length); };
+  p.host.recordReceipt = () => { throw new Error('ENOSPC simulated'); };
+  for (let attempt = 0; attempt < 6; attempt++) {
+    await assert.rejects(p.coalescer.accept(p.occurrence('p1', { initial: true })), (error: { code?: number }) => error.code === -32000);
+  }
+  assert.deepEqual(p.delivered, [{ eventId: 'p1' }], 'delivered once');
+  assert.deepEqual(observed, ['p1'], 'observed once, though no write landed');
+  assert.deepEqual(deliveredWhenObserved, [1], 'after its delivery');
 });
