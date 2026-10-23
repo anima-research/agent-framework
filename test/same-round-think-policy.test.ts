@@ -122,7 +122,7 @@ function makeChannelRegistry(framework: AgentFramework) {
       }
       return { success: false, error: `Unknown channel tool: ${toolName}`, isError: true };
     },
-    resolveLocus: () => 'chan-test',
+    resolveLocus: () => ({ serverId: 'stub', channelId: 'chan-test' }),
     routeSpeech: async (_agent: string, text: string) => {
       routed.push(text);
     },

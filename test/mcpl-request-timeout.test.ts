@@ -29,7 +29,7 @@ process.stdin.on('data', (c) => {
     if (!line.trim()) continue;
     let m; try { m = JSON.parse(line); } catch { continue; }
     const reply = (result, id = m.id) => process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id, result }) + '\\n');
-    if (m.method === 'initialize') reply({ capabilities: {} });
+    if (m.method === 'initialize') reply({ protocolVersion: '2024-11-05', capabilities: {} });
     else if (m.method === 'tools/list') {
       const released = held !== null;
       if (held) { reply(held.result, held.id); held = null; }

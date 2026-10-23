@@ -211,6 +211,11 @@ export class MockMembrane {
     return this.responses[this.responseIndex++];
   }
 
+  /** The direct Agent API's call, recorded and answered as complete is. */
+  async stream(request: NormalizedRequest, _options?: unknown): Promise<NormalizedResponse> {
+    return this.complete(request);
+  }
+
   streamYielding(request: NormalizedRequest, _options?: unknown): YieldingStream {
     this.calls.push(request);
     const remaining = this.responses.slice(this.responseIndex);

@@ -213,15 +213,22 @@ export interface McplChannelCapabilities {
 /**
  * Configuration for connecting to a single MCPL server.
  * Provided in FrameworkConfig.mcplServers[].
+ *
+ * Treat a submitted configuration and its nested values as immutable for as
+ * long as the server uses them. Apply changed settings with
+ * `restartMcplServer(id, newConfig)`; use `accessProvider` for a network
+ * server's rotating credentials (a stdio server's changed `env` goes through
+ * a restart with the new configuration).
  */
 export interface McplServerConfig {
   /** Unique server identifier */
   id: string;
 
   /**
-   * Command to spawn the server process (stdio transport). Mutually exclusive
-   * with `url`. Required for the stdio transport; omit it (and set `url`) for
-   * the WebSocket transport.
+   * Command to spawn the server process (stdio transport). Required for the
+   * stdio transport; omit it (and set `url`) for a network server, over
+   * WebSocket or HTTP. A configuration with both needs `transport` to say
+   * which one is used, and is refused without it.
    */
   command?: string;
 
@@ -248,24 +255,59 @@ export interface McplServerConfig {
   inheritEnv?: boolean;
 
   /**
-   * WebSocket URL for the network transport (`ws://` or `wss://`). Mutually
-   * exclusive with `command`. When set (or `transport: 'websocket'`), the host
-   * dials this endpoint instead of spawning a process — newline-delimited
-   * JSON-RPC MCPL runs over the socket identically to stdio.
+   * URL for a network server, used instead of `command`. A configuration
+   * with both needs `transport` to say which one is used, and is refused
+   * without it. Its scheme decides the protocol family:
+   * - `ws://` or `wss://` is a legacy MCPL server over MCPL's WebSocket
+   *   binding. The host dials it and runs the same newline-delimited JSON-RPC
+   *   as over stdio.
+   * - `http://` or `https://` is a modern MCP (2026-07-28) server over
+   *   Streamable HTTP.
    */
   url?: string;
 
   /**
-   * Transport selector. Defaults to `'websocket'` when a bare `url` is given
-   * (no `command`), `'stdio'` otherwise. Set explicitly to disambiguate.
+   * Transport selector. When it is absent, a `command` means stdio and a
+   * `url` means the transport its scheme names; with both, it is required.
+   * When it is set, it decides which of the two is used and must agree with
+   * it: `'stdio'` needs a `command`, `'websocket'` a ws(s):// url and
+   * `'http'` an http(s):// url.
    */
-  transport?: 'stdio' | 'websocket';
+  transport?: 'stdio' | 'websocket' | 'http';
 
   /**
-   * Bearer token for WebSocket auth. Appended to `url` as a `token` query
-   * parameter (`?token=…`) on connect. Ignored by the stdio transport.
+   * Protocol family for a stdio (`command`) server. Defaults to `'legacy'`,
+   * which is MCP 2024-11-05 + MCPL and today's behavior. `'modern'` speaks
+   * MCP 2026-07-28 through the SDK-backed modern engine. A network server's
+   * family comes from its url's scheme, so setting this on one is a
+   * configuration error. There is no probing between families.
+   */
+  protocol?: 'legacy' | 'modern';
+
+  /**
+   * Bearer token for a network server. Where it travels depends on the
+   * transport: on a ws(s):// url it is appended as a `token` query parameter
+   * (`?token=…`) on connect, unless `tokenTransport` is `'header'`; to an
+   * http(s):// server it is sent as an `Authorization: Bearer` header and
+   * never put in the url. A legacy stdio server ignores it, and a modern
+   * stdio server refuses it.
    */
   token?: string;
+
+  /**
+   * How a ws(s):// server's credential, `token` or what `accessProvider`
+   * returns for the dial, is sent on the WebSocket upgrade. `'query'`, the
+   * default: as a `token` query parameter (`?token=…`). `'header'`: as an
+   * `Authorization: Bearer …` header, with no query parameter, so the
+   * credential stays out of the url and of the access logs that record it.
+   * A header carries a credential as configured only if it is printable
+   * ASCII (U+0020 to U+007E) with no space at either end, so header mode
+   * refuses any other: a static `token` when the server is added, an access
+   * provider's at the dial. Set only on a WebSocket server; an http(s)://
+   * server always sends the header, and a stdio server sends no credential.
+   * `null` counts as not set.
+   */
+  tokenTransport?: 'query' | 'header';
 
   /**
    * Lazily resolves the connection credential at EVERY dial — first connect
@@ -386,12 +428,21 @@ export interface McplServerConfig {
    * descriptive error, which the framework surfaces as a normal isError
    * tool_result. Request timeouts are the only bound for a stdio server that
    * stops reading its stdin without closing it: the host's writes are
-   * buffered, no error is raised, and the connection stays up. This is the
-   * timeout of every request that names none; the handshake's initialize has
-   * its own. Set 0 to disable, except for channels/publish and the
-   * channels/open a delivery may send first, which keep the 60 s default: a
-   * publish's outcome is reported to the resident and recorded for its
-   * draft, so it must end. Default: 60000 (60 seconds).
+   * buffered, no error is raised, and the connection stays up. Under Bun they
+   * are also the only bound for one that closes its stdin, since Bun emits no
+   * 'error' event for the writes to it. requestTimeoutMs is the timeout of
+   * every request that names none; the handshake's initialize has its own.
+   * Set 0 to disable, except for channels/publish, channels/open and
+   * channels/close, which keep the 60 s default: a publish's outcome is
+   * reported to the resident and recorded for its draft, so it must end, and
+   * a delivery waits for a channel's queued opens and closes.
+   * Default: 60000 (60 seconds). A value above 2^31−1 is refused: Node runs a
+   * longer timer after about 1 ms, so every request would time out at once.
+   *
+   * For a modern server it is one deadline per tool call, across every leg
+   * of the call, and must be an integer from 1 to 2^31−1. It can't be
+   * disabled: the SDK reads 0 as "time out now". At the deadline
+   * cancellation is requested and the outcome is unknown.
    */
   requestTimeoutMs?: number;
 
@@ -1080,7 +1131,15 @@ export interface ChannelsListResult {
  * Spec Section 14.3.
  */
 export interface ChannelsOpenParams {
-  /** Exact registered id. Preferred over type/address matching. */
+  /**
+   * The exact registered id to open. Without it, a server matches by `type`
+   * and `address`, as before. A server that doesn't know the id should
+   * refuse rather than open another channel: the host fails an open whose
+   * answer names a different channel id, by its `channel.id` or a history
+   * item's `channelId`, compared exactly, as the server's traffic is. When
+   * that other channel is registered and decided closed, the host closes it
+   * again.
+   */
   channelId?: string;
   type: string;
   address?: Record<string, unknown>;
@@ -1242,7 +1301,8 @@ export interface ChannelIncomingMessageResult {
  * Non-normative; host-defined. See Spec Section 11.5.
  */
 export interface InferenceRoutingPolicy {
-  /** Default model for all inference requests */
+  /** Model for a request no override, byFeature or wildcards entry names a
+   *  model for. Left empty, such a request is refused with -32603. */
   default: string;
 
   /** Model override per feature set name */
@@ -1335,6 +1395,8 @@ export interface McpToolDefinition {
   name: string;
   description?: string;
   inputSchema: Record<string, unknown>;
+  /** Server metadata for the tool (e.g. RFC-008 `mcpl/class` hints). */
+  _meta?: Record<string, unknown>;
 }
 
 /**

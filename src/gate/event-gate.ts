@@ -14,6 +14,7 @@
 import { existsSync, readFileSync, statSync, writeFileSync, mkdirSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { GateScript } from './gate-script.js';
+import { MAX_TIMER_MS } from '../deadline-timer.js';
 import { safeSlice } from '../safe-slice.js';
 
 import type { ToolDefinition } from '../types/events.js';
@@ -23,6 +24,8 @@ import type {
   GatePolicyMatch,
   GateBehavior,
   GateDecision,
+  GateEntryRef,
+  WakeLine,
   GateEventInfo,
   GatePolicyStats,
   GateStatus,
@@ -31,7 +34,7 @@ import type {
 } from './types.js';
 
 // Re-export types consumers need
-export type { GateConfig, GateOptions, GateDecision, GateEventInfo } from './types.js';
+export type { GateConfig, GateOptions, GateDecision, GateEntryRef, GateEventInfo, WakeLine } from './types.js';
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -45,6 +48,15 @@ const MAX_TRACE_SNIPPET = 80;
 const MAX_INFERENCE_BUFFER = 100;
 /** Minimum interval between filesystem checks for config changes (ms). */
 const RELOAD_THROTTLE_MS = 1000;
+
+/**
+ * Parse a gate file's text as JSON. Some Windows editors save UTF-8 with a
+ * leading U+FEFF (BOM), which `readFileSync(…, 'utf-8')` keeps and
+ * `JSON.parse` rejects; drop exactly one before parsing (#395).
+ */
+function parseGateJson(text: string): unknown {
+  return JSON.parse(text.charCodeAt(0) === 0xfeff ? text.slice(1) : text);
+}
 /** Minimum debounce value (ms). */
 const MIN_DEBOUNCE_MS = 100;
 /** Maximum debounce value (ms). */
@@ -94,12 +106,17 @@ interface PendingEvent {
    *  whose `channelId` is the adapter's raw id (a bare Discord snowflake for a
    *  DM) — unroutable. Absent when the host could not resolve one. */
   routeChannelId?: string;
+  /** The event's own identity among what the framework stored at arrival:
+   *  a channel message's id, a push event's event id (isNewestEntry). */
+  messageId?: string;
+  eventId?: string;
 }
 
 /**
  * Where a gate-requested wake came from, handed to the framework alongside the
  * reason so the turn's InferenceRequest can carry it (host telemetry stamps
- * "who woke the agent" from it). Ids only, never content or display names.
+ * "who woke the agent" from it). Ids only, never content or display names,
+ * except `line`, which is the batch's own text for the agent's window.
  */
 export interface WakeProvenance {
   /** Composite channel id of the chosen event — telemetry only, never a
@@ -121,9 +138,20 @@ export interface WakeProvenance {
    *  (2026-09-30: a DM reply published into a guild channel). Ambient-only
    *  batches still set nothing and keep the legacy fallback. */
   routeChannelId?: string;
+  /** The server of `routeChannelId`'s channel, beside it whenever the chosen
+   *  event named its server: channel ids are unique only within one
+   *  server's connection (MCPL §14.2). */
+  routeServerId?: string;
   /** Timestamp (ms) of the chosen event, so a consumer coalescing several
    *  requests can order by event recency, not by flush order. */
   at?: number;
+  /** The batch's `[Gate: …]` line, when the gate handed it to the wake rather
+   *  than wrote it: a WakeLine, the parts its text is rendered from when it's
+   *  written (wakeLineText), decided by a fresh start of the wake's turn as
+   *  WakeLine says. Unlike the fields above, this is content for the agent's
+   *  window, not telemetry: it carries the channel's name as the agent is
+   *  shown it. */
+  line?: WakeLine;
 }
 
 interface DebounceState {
@@ -226,8 +254,36 @@ export function wakeProvenance(events: PendingEvent[]): WakeProvenance | undefin
     ...(channelId ? { channelId } : {}),
     ...(pick.authorId ? { counterparty: `${ns}:user:${pick.authorId}` } : {}),
     ...(pick.addressed ? { addressed: true } : {}),
-    ...(pick.addressed && pick.routeChannelId ? { routeChannelId: pick.routeChannelId } : {}),
+    ...(pick.addressed && pick.routeChannelId
+      ? { routeChannelId: pick.routeChannelId, ...(pick.serverId ? { routeServerId: pick.serverId } : {}) }
+      : {}),
     at: pick.timestamp,
+  };
+}
+
+/** A `[Gate: …]` line's reference to messages already in the window: how
+ *  many, in which channel, and how long ago the oldest arrived, as of `now`. */
+function referenceLine(count: number, channel: string, oldest: number, now: number): string {
+  const age = Math.round((now - oldest) / 1000);
+  return `- ${count} message${count > 1 ? 's' : ''} in ${channel} ` +
+    `(oldest ~${age}s ago) — already shown above at arrival; this is a ` +
+    `batched wake, not new content`;
+}
+
+/** A handed batched-wake line's text (WakeLine), as it reads when written at
+ *  `now`: the gate's words, its message's age counted to then. */
+export function wakeLineText(line: WakeLine, now: number): string {
+  return `[Gate: 1 event matched]\n\n${referenceLine(1, line.shown, line.at, now)}`;
+}
+
+/** The event's own stored entry, as the framework is asked about it. */
+function entryRef(event: PendingEvent): GateEntryRef {
+  return {
+    eventType: event.eventType,
+    ...(event.serverId !== undefined ? { serverId: event.serverId } : {}),
+    ...(event.channelId !== undefined ? { channelId: event.channelId } : {}),
+    ...(event.messageId !== undefined ? { messageId: event.messageId } : {}),
+    ...(event.eventId !== undefined ? { eventId: event.eventId } : {}),
   };
 }
 
@@ -593,6 +649,9 @@ export class EventGate {
   private sleepSuppressed = 0;
   private sleepTimer: ReturnType<typeof setTimeout> | null = null;
   private sleepAgent: string | undefined;
+  // From dispose() to the next resumeSleep(): no sleep or self-wake timer is
+  // armed, though a turn a failed stop() left running can still ask for one.
+  private disposed = false;
 
   // Self-wake timers per agent (skip_reply's wake_in_seconds). Unlike sleep,
   // a self-wake suppresses NOTHING — it means "if nothing else wakes me by
@@ -620,6 +679,8 @@ export class EventGate {
   private requestInferenceFn: (agentName: string, reason: string, source: string, provenance?: WakeProvenance) => void;
   private getAgentNamesFn: () => string[];
   private resolveRouteChannelFn: (info: GateEventInfo) => string | undefined;
+  private channelShownFn?: (channel: { serverId: string; channelId: string }) => string;
+  private isNewestEntryFn?: (entry: GateEntryRef) => boolean;
   /** Clock injection — keeps the new rate_limit / passive_sample paths
    *  testable without monkey-patching Date.now globally. */
   private now: () => number;
@@ -645,6 +706,18 @@ export class EventGate {
      *  how push-event origins compose into channel ids). Default: a
      *  channel-incoming event's own channel id; nothing for push events. */
     resolveRouteChannel?: (info: GateEventInfo) => string | undefined;
+    /** How the agent is shown a channel, its server's and its id (the
+     *  framework's ChannelRegistry.nameShown): a batched wake's summary names
+     *  each channel so, since two servers' channels can share an id. Default:
+     *  the id. */
+    channelShown?: (channel: { serverId: string; channelId: string }) => string;
+    /** Whether an MCPL event's own context entry is still the newest entry in
+     *  the window a batched wake's line would be written to, with nothing
+     *  waiting to be written there. A batched wake for that one message
+     *  doesn't write its line when it fires: it hands the line to the wake
+     *  (WakeProvenance.line), for a fresh start of the wake's turn to decide
+     *  (WakeLine). Absent: every batched wake writes its line, as before. */
+    isNewestEntry?: (entry: GateEntryRef) => boolean;
   }) {
     this.configPath = opts.configPath;
     this.privilegedUsersPath = opts.privilegedUsersPath;
@@ -653,6 +726,8 @@ export class EventGate {
     this.requestInferenceFn = opts.requestInference;
     this.getAgentNamesFn = opts.getAgentNames;
     this.resolveRouteChannelFn = opts.resolveRouteChannel ?? defaultRouteChannel;
+    this.channelShownFn = opts.channelShown;
+    this.isNewestEntryFn = opts.isNewestEntry;
     this.now = opts.now ?? (() => Date.now());
     this.loadPrivileged();
 
@@ -723,7 +798,7 @@ export class EventGate {
       const raw = readFileSync(this.configPath, 'utf-8');
       const stat = statSync(this.configPath);
       this.configMtime = stat.mtimeMs;
-      const config = validateConfig(JSON.parse(raw));
+      const config = validateConfig(parseGateJson(raw));
       this.configSource = 'file';
       this.configErrors = [];
       return config;
@@ -1039,11 +1114,13 @@ export class EventGate {
     // rouse the agent — its own heartbeat (an internal clock, not an outside
     // interruption: each tick lets the agent reconsider and optionally `wake`)
     // and a privileged user's ping. The event always enters context regardless
-    // (the gate only governs inference triggering).
+    // (the gate only governs inference triggering). The heartbeat is the
+    // server the host knows as `heartbeat`, the server id the silent-heartbeat
+    // marker requires too: a `source` in an event's metadata is the server's
+    // own word, which any server can give.
     if (this.sleepUntil > this.now()) {
       this.reloadPrivilegedIfChanged();
-      const isHeartbeat =
-        info.metadata?.source === 'heartbeat' || info.serverId === 'heartbeat';
+      const isHeartbeat = info.serverId === 'heartbeat';
       const authorId = this.extractAuthorId(info.metadata);
       const privileged = authorId !== null && this.privilegedUserIds.has(authorId);
       if (!isHeartbeat && !privileged) {
@@ -1499,6 +1576,8 @@ export class EventGate {
       serverId: info.serverId || undefined,
       addressed: Array.isArray(info.tags) && info.tags.includes('chat:addressed'),
       routeChannelId: this.routeChannelFor(info),
+      ...(typeof info.metadata?.messageId === 'string' ? { messageId: info.metadata.messageId } : {}),
+      ...(typeof info.metadata?.eventId === 'string' ? { eventId: info.metadata.eventId } : {}),
     };
 
     const existing = this.debounceTimers.get(policy.name);
@@ -1559,40 +1638,68 @@ export class EventGate {
     const referenced = events.filter(e => e.inContext);
 
     const lines: string[] = quoted.map(e => `- [${e.policyName}] (${e.eventType}): ${e.content}`);
+    // How each referenced channel is named in the line, in order.
+    const shown: string[] = [];
     if (referenced.length > 0) {
-      const byChannel = new Map<string, { count: number; oldest: number; label?: string }>();
+      // By channel, its server and its id: two servers' channels can share
+      // an id.
+      const byChannel = new Map<string, { name: string; count: number; oldest: number; label?: string }>();
       for (const e of referenced) {
         // The registered id when known, so this line names the channel the
         // same way routing notices and send tools do (a push event's own
-        // channelId is the adapter's raw id).
-        const key = e.routeChannelId ?? e.channelId ?? '(unknown channel)';
-        const entry = byChannel.get(key) ?? { count: 0, oldest: e.timestamp, label: e.channelLabel };
+        // channelId is the adapter's raw id), shown as the agent names it
+        // back where the event names its server.
+        // Only a registered id is a channel name; an adapter's raw id is
+        // shown as it is.
+        const id = e.routeChannelId ?? e.channelId;
+        const name = id === undefined
+          ? '(unknown channel)'
+          : e.routeChannelId !== undefined && e.serverId !== undefined && this.channelShownFn
+            ? this.channelShownFn({ serverId: e.serverId, channelId: e.routeChannelId })
+            : id;
+        const key = JSON.stringify([e.serverId ?? null, id ?? null]);
+        const entry = byChannel.get(key) ?? { name, count: 0, oldest: e.timestamp, label: e.channelLabel };
         entry.count += 1;
         entry.oldest = Math.min(entry.oldest, e.timestamp);
         entry.label = entry.label ?? e.channelLabel;
         byChannel.set(key, entry);
       }
-      for (const [channelId, { count, oldest, label }] of byChannel) {
+      for (const { name, count, oldest, label } of byChannel.values()) {
         // Prefer the human-readable name; keep the id parenthesized so the
         // agent can still address tools that want the composite id. A name
         // may carry its own `#`, so one is added only where the name lacks
         // it, as at the other places that add a `#`.
-        const channel = label ? `${label.startsWith('#') ? label : `#${label}`} (${channelId})` : channelId;
-        const age = Math.round((Date.now() - oldest) / 1000);
-        lines.push(
-          `- ${count} message${count > 1 ? 's' : ''} in ${channel} ` +
-          `(oldest ~${age}s ago) — already shown above at arrival; this is a ` +
-          `batched wake, not new content`,
-        );
+        const channel = label ? `${label.startsWith('#') ? label : `#${label}`} (${name})` : name;
+        shown.push(channel);
+        lines.push(referenceLine(count, channel, oldest, Date.now()));
       }
     }
 
+    // The line says which messages a wake is for. For one message that is
+    // still the newest thing in the window it would be written to, it says
+    // nothing the message right above doesn't. But the turn compiles later,
+    // and what lands in between puts the message above other entries, so the
+    // gate hands the line to the wake (WakeProvenance.line) and a fresh start
+    // of the wake's turn decides it (WakeLine). Several messages, one with
+    // anything after it, or content the line quotes, keep the line now.
     const text = `[Gate: ${events.length} event${events.length > 1 ? 's' : ''} matched]\n\n${lines.join('\n')}`;
-
-    this.addMessageFn('user', [{ type: 'text', text }], {
-      source: 'gate:debounce',
-      policies: policyNames,
-    });
+    const only = events.length === 1 && events[0].inContext ? events[0] : undefined;
+    let line: WakeLine | undefined;
+    if (only && this.newestEntry(only)) {
+      const shownChannel = only.routeChannelId ?? only.channelId;
+      line = {
+        entry: entryRef(only),
+        policyNames,
+        shown: shown[0],
+        at: only.timestamp,
+        ...(shownChannel !== undefined ? { channelId: shownChannel } : {}),
+      };
+    } else {
+      this.addMessageFn('user', [{ type: 'text', text }], {
+        source: 'gate:debounce',
+        policies: policyNames,
+      });
+    }
 
     // Provenance of the batched wake (who/where woke the agent): the newest
     // ADDRESSED event first, else the newest event naming a channel or an
@@ -1600,10 +1707,23 @@ export class EventGate {
     // event addressed the agent and its registered channel is known,
     // `routeChannelId` names the turn's speech locus too — the reply goes
     // back to whoever addressed the agent, not to whichever channel last saw
-    // any traffic. Ambient-only batches carry telemetry only.
-    const provenance = wakeProvenance(events);
+    // any traffic. Ambient-only batches set no locus. A batch whose line the
+    // gate left to the turn's start carries it too (`line`), one object
+    // shared by every agent the batch wakes, so it is written once.
+    const chosen = wakeProvenance(events);
+    const provenance = line ? { ...chosen, line } : chosen;
     for (const agentName of this.getAgentNamesFn()) {
       this.requestInferenceFn(agentName, 'gate:debounce', 'gate', provenance);
+    }
+  }
+
+  /** isNewestEntry for one event; a callback fault keeps the line. */
+  private newestEntry(event: PendingEvent): boolean {
+    if (!this.isNewestEntryFn) return false;
+    try {
+      return this.isNewestEntryFn(entryRef(event)) === true;
+    } catch {
+      return false;
     }
   }
 
@@ -1724,9 +1844,9 @@ export class EventGate {
     this.sleepSuppressed = 0;
     // Arm the self-wake: when the window elapses, clear sleep and request an
     // inference so the agent resumes on its own (not dependent on a heartbeat
-    // tick or an incoming message). Cancelled by clearSleep()/`wake`.
-    if (this.sleepTimer) clearTimeout(this.sleepTimer);
-    this.sleepTimer = setTimeout(() => this.wakeFromSleep('sleep-expired'), ms);
+    // tick or an incoming message). Cancelled by clearSleep()/`wake`, and by
+    // dispose(), after which start() arms it again (resumeSleep).
+    this.armSleepWake();
     this.reloadPrivilegedIfChanged();
     this.emitTrace({
       type: 'gate:decision',
@@ -1737,6 +1857,48 @@ export class EventGate {
       timestamp: this.now(),
     });
     return { until: this.sleepUntil };
+  }
+
+  /**
+   * Arm timers again for a lifecycle that starts after a stop(), and the
+   * sleep's wake first: dispose() clears its timer and keeps the sleep. A
+   * sleep still ahead wakes the agent at its end; one that ended while
+   * stopped wakes it now, since that wake is what the agent asked for. With
+   * no sleep, wakeFromSleep does nothing.
+   */
+  resumeSleep(): void {
+    this.disposed = false;
+    if (this.sleepUntil > this.now()) this.armSleepWake();
+    else this.wakeFromSleep('sleep-expired');
+  }
+
+  /**
+   * Arm the sleep's wake for its end by the gate's own clock. One timer holds
+   * at most MAX_TIMER_MS, about 24.8 days, so a longer sleep waits in steps,
+   * and wakeFromSleep reads the clock as each one fires. Nothing is armed
+   * while the gate is disposed: resumeSleep() arms it at the next start().
+   */
+  private armSleepWake(): void {
+    if (this.sleepTimer) { clearTimeout(this.sleepTimer); this.sleepTimer = null; }
+    if (this.disposed) return;
+    const remaining = Math.max(0, this.sleepUntil - this.now());
+    this.sleepTimer = setTimeout(() => this.wakeFromSleep('sleep-expired'), Math.min(remaining, MAX_TIMER_MS));
+  }
+
+  /**
+   * `agentName` is gone, as a conversation fork's end or an ephemeral run's
+   * removes one: its pending self-wake is cancelled, and a sleep it set ends.
+   * The gate's sleep holds back every agent's wakes, so nobody is asleep once
+   * its agent is gone, and neither wake would reach a name that no longer
+   * exists. A sleep another agent set, or one set with no agent, stays.
+   */
+  agentGone(agentName: string): void {
+    const selfWake = this.selfWakeTimers.get(agentName);
+    if (selfWake) {
+      clearTimeout(selfWake);
+      this.selfWakeTimers.delete(agentName);
+    }
+    if (this.sleepUntil !== 0 && this.sleepAgent === agentName) this.clearSleep();
   }
 
   // =========================================================================
@@ -1750,8 +1912,11 @@ export class EventGate {
    * Cancelled by the agent's next turn start (see onInferenceStarted):
    * the semantics are "if nothing else wakes me by then, wake me".
    */
-  armSelfWake(agentName: string, seconds: number, source = 'skip_reply'): { inMs: number } {
+  armSelfWake(agentName: string, seconds: number, source = 'skip_reply'): { inMs: number; armed: boolean } {
     const ms = Math.max(1_000, Math.min(3_600_000, Math.floor(seconds * 1000)));
+    // A stopped framework's late turn arms no timer (disposed). A self-wake
+    // doesn't outlive a stop, as dispose() clearing the pending ones says.
+    if (this.disposed) return { inMs: ms, armed: false };
     const prev = this.selfWakeTimers.get(agentName);
     if (prev) clearTimeout(prev);
     const timer = setTimeout(() => {
@@ -1792,7 +1957,7 @@ export class EventGate {
       behavior: 'skip',
       timestamp: this.now(),
     });
-    return { inMs: ms };
+    return { inMs: ms, armed: true };
   }
 
   /** End sleep immediately. Returns true if the agent was asleep. */
@@ -1810,11 +1975,20 @@ export class EventGate {
    * Clears the sleep state and requests an inference so the agent wakes on its
    * own — this is what makes `sleep(N)` a real "wake me in N seconds" rather
    * than just a suppression window. No-op if sleep was already cleared (via
-   * `wake`) or re-armed to a later time by a fresh `sleep` call.
+   * `wake`). A timer that fires before the sleep's end by the gate's clock
+   * arms the rest: a step of a sleep longer than one timer holds, a timer that
+   * fires early (Node's can, by a millisecond), or a clock set back.
    */
   private wakeFromSleep(reason: string): void {
-    this.sleepTimer = null;
-    if (this.sleepUntil === 0 || this.sleepUntil > this.now()) return;
+    // The timer that called it has fired; from resumeSleep(), for a sleep
+    // already over, one may still be armed, and it goes, so no stale step of
+    // it can fire later.
+    if (this.sleepTimer) { clearTimeout(this.sleepTimer); this.sleepTimer = null; }
+    if (this.sleepUntil === 0) return;
+    if (this.sleepUntil > this.now()) {
+      this.armSleepWake();
+      return;
+    }
     const note = this.sleepNote;
     const agent = this.sleepAgent;
     this.sleepUntil = 0;
@@ -1870,7 +2044,7 @@ export class EventGate {
         return;
       }
       this.privilegedMtime = statSync(this.privilegedUsersPath).mtimeMs;
-      const raw = JSON.parse(readFileSync(this.privilegedUsersPath, 'utf8'));
+      const raw: any = parseGateJson(readFileSync(this.privilegedUsersPath, 'utf8'));
       const ids = Array.isArray(raw) ? raw : Array.isArray(raw?.userIds) ? raw.userIds : [];
       this.privilegedUserIds = new Set(ids.map((x: unknown) => String(x)));
     } catch (err) {
@@ -1992,6 +2166,13 @@ export class EventGate {
       clearTimeout(timer);
     }
     this.selfWakeTimers.clear();
+    // The sleep stays, with its note and agent, and its timer goes: fired
+    // after a stop(), its wake reached a framework that had stopped, and the
+    // timer held the process until the sleep's end. The next start() arms it
+    // again (resumeSleep). Until then nothing arms one, nor a self-wake: a
+    // turn a failed stop() left running can still call sleep or skip_reply.
+    if (this.sleepTimer) { clearTimeout(this.sleepTimer); this.sleepTimer = null; }
+    this.disposed = true;
     this.rateLimitBuckets.clear();
     this.passiveSampleCounters.clear();
     this.rateLimitDenied.clear();
@@ -2003,10 +2184,9 @@ export class EventGate {
     // a turn whose exit didn't end it (a retry stop() cancelled, a successor
     // stop() refused) would make every debounced batch buffer until that
     // agent's next turn ended. A turn that continues after the start() takes
-    // its entry again (onInferenceResumed). A turn that a start() during the
-    // stop() began before this ran loses its entry too, and runs on without
-    // it, so debounced batches are delivered while it runs: nothing refuses
-    // a start() during a stop() yet.
+    // its entry again (onInferenceResumed). A start() made during the stop()
+    // is refused, so no turn of a new lifecycle can have begun before this
+    // runs.
     this.inferring.clear();
   }
 }

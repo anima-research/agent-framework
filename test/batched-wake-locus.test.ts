@@ -10,6 +10,9 @@
  *   - ambient BEFORE the DM: the DM never displaced it.
  * Now a batch containing an addressed message routes to that message's
  * registered channel; an ambient-only batch keeps the legacy fallback.
+ *
+ * The tests hold the gate's batch until both events are in it (holdBatches),
+ * so they don't depend on the second reaching the gate inside the window.
  */
 import { describe, it, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
@@ -84,46 +87,79 @@ describe('batched wake routing', () => {
   const dm = (text: string): void => command(`dm ev-${++n} 134 ${RAW_DM} ${text}`);
   const incoming = (channelId: string, mode: 'ambient' | 'addressed', text: string): void =>
     command(`incoming ${channelId} m-${++n} ${mode} ${text}`);
-  const sent = (event: string): number => !existsSync(statusPath) ? 0
-    : readFileSync(statusPath, 'utf8').split('\n').filter(Boolean)
-      .filter((l) => (JSON.parse(l) as { event: string }).event === event).length;
   const publishes = (): string[] => !existsSync(statusPath) ? []
     : readFileSync(statusPath, 'utf8').split('\n').filter(Boolean)
       .map((l) => JSON.parse(l) as { event: string; channelId?: string })
       .filter((e) => e.event === 'publish')
       .map((e) => e.channelId!);
 
-  it('a DM followed one beat later by ambient chatter elsewhere: the reply goes to the DM', async () => {
+  /**
+   * Holds the gate's batches: when a batch's timer fires with fewer than two
+   * events in it, the batch stays pending, and the returned function counts
+   * those held fires. A test that pairs two sends calls this, sends its first
+   * event, waits until that event's batch has been held past its 400 ms
+   * window, and then sends the second, which joins the same batch. That batch
+   * fires on the timer the second event starts, with both events in it,
+   * however long the second took to arrive. Without the hold, whether the
+   * two share a batch depends on the second reaching the gate within 400 ms
+   * of the first, which a loaded runner can miss.
+   *
+   * The hold lasts for the rest of the test, since each test builds its own
+   * framework. It reaches three private members, each checked here, so a
+   * rename fails at this helper. A batch that fires without passing through
+   * the hold never counts a held fire, so its test times out waiting for one.
+   */
+  const holdBatches = (): (() => number) => {
+    const gate = (framework as unknown as {
+      eventGate: { debounceTimers: Map<string, { events: unknown[] }>; fireDebounce(policyName: string): void } | null;
+    }).eventGate;
+    assert.ok(gate, 'premise: the framework has a gate');
+    assert.ok(gate.debounceTimers instanceof Map, 'premise: the gate keeps its pending batches in debounceTimers');
+    assert.equal(typeof gate.fireDebounce, 'function', 'premise: the gate fires a batch through fireDebounce');
+    const fire = gate.fireDebounce.bind(gate);
+    let held = 0;
+    gate.fireDebounce = (policyName) => {
+      if ((gate.debounceTimers.get(policyName)?.events.length ?? 0) >= 2) fire(policyName);
+      else held++;
+    };
+    return () => held;
+  };
+
+  it('a DM followed one beat later by ambient chatter elsewhere, in one batch: the reply goes to the DM', async () => {
+    const held = holdBatches();
     membrane.pushResponse(createMockResponse([{ type: 'text', text: 'answering the DM' }]));
     dm('are you there?');
-    await waitFor(() => sent('dm-sent') === 1, 'dm sent');
+    await waitFor(() => held() >= 1, "the DM's batch held past its window");
     incoming(GENERAL, 'ambient', 'unrelated chatter');
     await waitFor(() => publishes().length >= 1, 'reply published');
     assert.deepEqual(publishes(), [DM]);
   });
 
-  it('ambient chatter followed by a DM in the same window: the reply goes to the DM', async () => {
+  it('ambient chatter followed by a DM in one batch: the reply goes to the DM', async () => {
+    const held = holdBatches();
     membrane.pushResponse(createMockResponse([{ type: 'text', text: 'answering the DM' }]));
     incoming(GENERAL, 'ambient', 'unrelated chatter');
-    await waitFor(() => sent('incoming-sent') === 1, 'ambient sent');
+    await waitFor(() => held() >= 1, "the ambient message's batch held past its window");
     dm('quick question');
     await waitFor(() => publishes().length >= 1, 'reply published');
     assert.deepEqual(publishes(), [DM]);
   });
 
-  it('a mention in one channel then ambient chatter in another: the reply goes to the mention', async () => {
+  it('a mention in one channel then ambient chatter in another, in one batch: the reply goes to the mention', async () => {
+    const held = holdBatches();
     membrane.pushResponse(createMockResponse([{ type: 'text', text: 'answering the mention' }]));
     incoming(ROOM, 'addressed', '@scout hello');
-    await waitFor(() => sent('incoming-sent') === 1, 'mention sent');
+    await waitFor(() => held() >= 1, "the mention's batch held past its window");
     incoming(GENERAL, 'ambient', 'unrelated chatter');
     await waitFor(() => publishes().length >= 1, 'reply published');
     assert.deepEqual(publishes(), [ROOM]);
   });
 
   it('an ambient-only batch keeps the legacy fallback (most recent inbound)', async () => {
+    const held = holdBatches();
     membrane.pushResponse(createMockResponse([{ type: 'text', text: 'joining in' }]));
     incoming(ROOM, 'ambient', 'first');
-    await waitFor(() => sent('incoming-sent') === 1, 'first sent');
+    await waitFor(() => held() >= 1, "the first message's batch held past its window");
     incoming(GENERAL, 'ambient', 'second');
     await waitFor(() => publishes().length >= 1, 'reply published');
     assert.deepEqual(publishes(), [GENERAL]);
@@ -161,12 +197,12 @@ describe('batched wake routing with conversation forks', () => {
 
   it('the addressed route applies only to the fork homed there; other forks and the trunk get none', async () => {
     const internals = framework as unknown as {
-      conversationAgentHomes: Map<string, string>;
-      pendingRequests: Array<{ agentName: string; channelId?: string; addressed?: boolean; counterparty?: string }>;
+      conversationAgentHomes: Map<string, { serverId: string; channelId: string }>;
+      pendingRequests: Array<{ agentName: string; channelId?: string; channelServerId?: string; addressed?: boolean; counterparty?: string }>;
       eventGate: { evaluate(info: unknown): unknown };
     };
-    internals.conversationAgentHomes.set('fork-room', ROOM);
-    internals.conversationAgentHomes.set('fork-other', GENERAL);
+    internals.conversationAgentHomes.set('fork-room', { serverId: 'discord', channelId: ROOM });
+    internals.conversationAgentHomes.set('fork-other', { serverId: 'discord', channelId: GENERAL });
     internals.eventGate.evaluate({
       content: '@agent hi', eventType: 'mcpl:channel-incoming', serverId: 'discord', channelId: ROOM,
       tags: ['chat:addressed'], metadata: { authorId: '5' },
@@ -174,8 +210,10 @@ describe('batched wake routing with conversation forks', () => {
     await waitFor(() => internals.pendingRequests.some((r) => r.agentName === 'fork-other'), 'gate wake broadcast');
     const byAgent = new Map(internals.pendingRequests.map((r) => [r.agentName, r]));
     assert.equal(byAgent.get('fork-room')?.channelId, ROOM, 'the fork that owns the channel takes the route');
+    assert.equal(byAgent.get('fork-room')?.channelServerId, 'discord', "with the route's server");
     assert.equal(byAgent.get('fork-room')?.addressed, true);
     assert.equal(byAgent.get('fork-other')?.channelId, undefined, 'a fork bound elsewhere gets no locus');
+    assert.ok(byAgent.has('trunk'), 'premise: the wake reached the trunk too');
     assert.equal(byAgent.get('trunk')?.channelId, undefined, 'the trunk never takes a fork-bound channel');
     // Telemetry provenance still reaches every agent.
     assert.equal(byAgent.get('fork-other')?.counterparty, 'discord:user:5');

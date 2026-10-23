@@ -38,7 +38,7 @@ async function timedOutRender(t: TestContext, params: PushRenderParams = RENDER)
   const framework = Object.create(AgentFramework.prototype) as any;
   framework.traceListeners = [];
   framework.onTrace((event: never) => traces.push(event));
-  framework.wireMcplEvents(connection);
+  framework.wireMcplEvents(connection, { id: 'srv' });
   const orphans: unknown[] = [];
   connection.on('orphaned-response', (info: unknown) => orphans.push(info));
   connection.ready();
@@ -129,7 +129,7 @@ test('a late answer carrying both a result and an error, which JSON-RPC forbids,
 
 test('while the data plane is paused, a late push/render answer is recorded at once and takes no slot', async (t) => {
   const { connection, answerLate, recorded } = await timedOutRender(t);
-  // A quiesce or an awareness drain: control traffic flows, data is held.
+  // A quiesce: control traffic flows, data is held.
   connection.pauseDataPlane();
   answerLate();
   assert.equal((connection as any).bufferedEvents.length, 0);

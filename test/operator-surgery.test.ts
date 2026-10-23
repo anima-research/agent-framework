@@ -89,7 +89,8 @@ describe('live operator surgery', () => {
     assert.equal(entry.agent, 'scout');
     assert.deepEqual(entry.requester, { via: 'webui', name: 'antra' });
     assert.equal(entry.note, 'bad turn');
-    assert.deepEqual(entry.params, { messageId: ids[2] });
+    // The marks choice is recorded with the operator's other parameters.
+    assert.deepEqual(entry.params, { messageId: ids[2], marks: 'none' });
     assert.equal(entry.result?.messagesRemoved, 2);
     assert.equal(entry.result?.targetBranch, r.targetBranch);
     assert.ok(typeof entry.at === 'string' && !Number.isNaN(Date.parse(entry.at)));
@@ -396,7 +397,7 @@ describe('live operator surgery', () => {
 
     const entry = readLog(framework.getOperatorLogPath()!).find((e) => e.kind === 'suppress');
     assert.ok(entry);
-    assert.deepEqual(entry.params, { messageIds: [ids[1], ids[3]] });
+    assert.deepEqual(entry.params, { messageIds: [ids[1], ids[3]], marks: 'none' });
     assert.deepEqual(new Set(entry.result?.removedIds as string[]), new Set([ids[1], ids[3]]));
   });
 
@@ -666,7 +667,7 @@ describe('live operator surgery', () => {
   it('a rewind whose newest message is the last shard of a body takes the whole body', async () => {
     const [s0, s1, s2] = appendShards('g-doc', ['d0', 'd1', 'd2']);
     const internals = framework as unknown as {
-      shedNewestTurn(agent: unknown): { kind: string; removedIds: string[] } | null;
+      shedNewestTurn(agent: unknown): { descriptor: string; removedIds: string[] } | null;
     };
     const record = internals.shedNewestTurn(framework.getAgent('scout'));
     assert.ok(record);
@@ -692,11 +693,11 @@ describe('live operator surgery', () => {
     c.removeMessages = (a: string, b: string) => { ranges.push([a, b]); original(a, b); };
     try {
       const internals = framework as unknown as {
-        shedNewestTurn(agent: unknown): { kind: string; removedIds: string[] } | null;
+        shedNewestTurn(agent: unknown): { descriptor: string; removedIds: string[] } | null;
       };
       const record = internals.shedNewestTurn(framework.getAgent('scout'));
       assert.ok(record);
-      assert.equal(record.kind, 'tool');
+      assert.equal(record.descriptor, 'a tool exchange (~1KB)');
       assert.deepEqual(record.removedIds, [result[1], result[0], turn[1], turn[0]]);
       assert.deepEqual(ranges, [[turn[0], result[1]]], "one removal, from the turn's first shard to the result's last");
     } finally {
@@ -717,7 +718,8 @@ describe('live operator surgery', () => {
       await assert.rejects(
         framework.suppressMessages('scout', { messageIds: [s0] }),
         (e: unknown) => e instanceof OperatorActionError && e.code === 'failed'
-          && /active branch restored to main/.test(e.message) && /injected/.test(e.message),
+          && /^Suppression failed on suppress\/\S+, which is kept for diagnosis: it may be partly suppressed, so don't serve from it, and delete it once it has been looked at; active branch restored to main/.test(e.message)
+          && /injected/.test(e.message),
       );
     } finally {
       c.removeMessages = original;
@@ -731,8 +733,9 @@ describe('live operator surgery', () => {
 
     // The reproduction from review: open the failed fork, restart the host.
     // Before the fix, the orphaned prepared batch re-ran the failed removal
-    // at boot and AgentFramework.create() threw.
-    await cm().switchBranch(fork!.name);
+    // at boot and AgentFramework.create() threw. Nothing refuses the switch,
+    // as the error says: the batch was retired once the source came back.
+    await framework.switchBranch(fork!.name);
     await framework.stop();
     framework = await AgentFramework.create({
       storePath,

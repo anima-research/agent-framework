@@ -17,7 +17,7 @@ process.stdin.on('data', (chunk) => {
       if (process.argv[1] === 'handshake') {
         for (const value of values) process.stdout.write(value + '\n');
       }
-      send({jsonrpc:'2.0', id:request.id, result:{capabilities:{}}});
+      send({jsonrpc:'2.0', id:request.id, result:{protocolVersion:'2024-11-05', capabilities:{}}});
     } else if (request.method === 'tools/list') {
       if (process.argv[1] === 'connected') {
         for (const value of values) process.stdout.write(value + '\n');

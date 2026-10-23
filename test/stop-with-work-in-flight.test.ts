@@ -996,7 +996,7 @@ describe('stop() with work still in flight', () => {
         modules: [],
       });
       const connection = Object.assign(new EventEmitter(), { id: 'srv' });
-      (framework as unknown as { wireMcplEvents(c: unknown): void }).wireMcplEvents(connection);
+      (framework as unknown as { wireMcplEvents(c: unknown, config: unknown): void }).wireMcplEvents(connection, { id: 'srv', url: 'wss://h/mcp?token=wireToken0123456789' });
       return { framework, connection };
     }
 
@@ -1085,34 +1085,6 @@ describe('stop() with work still in flight', () => {
       for (const r of [push, incoming, register, changed, inference, command]) assert.deepEqual(r.answers, [stopping]);
       assert.deepEqual(rejections, []);
     });
-
-    for (const [event, method, params] of [
-      ['push-event', 'push/event', { featureSet: 'chat', eventId: 'e2', payload: { content: [{ type: 'text', text: 'waiting' }] } }],
-      ['channels-incoming', 'channels/incoming', { messages: [{ channelId: 'c', messageId: 'm2', content: [] }] }],
-      ['inference-request', 'inference/request', { messages: [] }],
-      ['host-command', 'host/command', { command: 'undo' }],
-    ] as const) {
-      it(`a ${method} held at the awareness barrier while the host stops is refused once the barrier lifts`, async () => {
-        const { framework, connection } = await wiredFramework();
-        let lift!: () => void;
-        (framework as unknown as { discordAwarenessBarrier: unknown }).discordAwarenessBarrier = {
-          promise: new Promise<void>((r) => { lift = r; }),
-        };
-        let handled = 0;
-        standIns(framework, async () => { handled++; return {}; });
-
-        const r = responder();
-        connection.emit(event, params, r);
-        await framework.stop();
-        lift();
-        await answered(r);
-
-        assert.equal(handled, 0);
-        assert.deepEqual(r.answers, [stopping]);
-        assert.ok(logged.some((line) => line.includes(`${method} from srv refused: the host is stopping`)), logged.join('\n'));
-        assert.deepEqual(rejections, []);
-      });
-    }
 
     it('a handler running when the host stops, and then failing, is answered -32000 with the stop wording alone', async () => {
       const { framework, connection } = await wiredFramework();
@@ -1214,6 +1186,32 @@ describe('stop() with work still in flight', () => {
         const line = logged.find((l) => l.includes('push-event handler failed')) ?? '';
         assert.ok(line.length < 600, `logged ${line.length} characters`);
         assert.ok(line.endsWith('…(5000)'), line.slice(-40));
+      } finally {
+        await framework.stop();
+      }
+    });
+
+    it("a handler's error quoting the server's configured credential is recorded and answered without it, also across the cut", async () => {
+      const { framework, connection } = await wiredFramework();
+      try {
+        // The credential starts just before the 500-character cut, so a cut
+        // made before redacting would keep its first characters.
+        // Once whole, and once with the credential across the 500-character
+        // cut, where a cut made before redacting keeps its first nine.
+        const errors = ['refused wireToken0123456789', `${'x'.repeat(490)} wireToken0123456789 and more`];
+        for (const [i, error] of errors.entries()) {
+          (framework as unknown as { pushHandler: unknown }).pushHandler = {
+            handlePushEvent: async () => { throw new Error(error); },
+          };
+          const push = responder();
+          connection.emit('push-event', { featureSet: 'chat', eventId: `e-cred-${i}`, payload: { content: [{ type: 'text', text: 'x' }] } }, push);
+          await answered(push);
+          const message = push.answers[0]!.error!.message;
+          await until(() => logged.filter((line) => line.includes('srv push-event handler failed')).length > i, 'the log line');
+          for (const text of [message, ...logged]) {
+            assert.ok(!text.includes('wireToken'), text.slice(-120));
+          }
+        }
       } finally {
         await framework.stop();
       }

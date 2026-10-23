@@ -27,7 +27,7 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
         with:
-          node-version: 20
+          node-version: '22.12.0'
 
       # The same check `npm version` runs first (see CONTRIBUTING.md): an
       # open issue labelled release-hold stops the release. Both jobs that
@@ -49,8 +49,15 @@ jobs:
       - name: Build
         run: npm run build
 
+      # As many test files at once as the runner has cores, as ci.yml's
+      # Build & Test runs them, so a release's gate runs the suite as a pull
+      # request's did.
       - name: Test
-        run: npm test
+        run: |
+          AF_TEST_CONCURRENCY=$(node -p "require('node:os').cpus().length")
+          echo "cores: $AF_TEST_CONCURRENCY (Node's availableParallelism: $(node -p "require('node:os').availableParallelism()")); test files at once: $AF_TEST_CONCURRENCY"
+          export AF_TEST_CONCURRENCY
+          npm test
 
   # The tarball npm publish makes from this tree, installed alone into an
   # empty directory with its dependencies from npm (linked, so each package
@@ -64,11 +71,18 @@ jobs:
   # 6 hours: above the check's own limits (10 minutes each for npm pack and
   # npm install, a minute for each load), so the check names what hung.
   pack-check:
-    name: Packed release installs on its own
+    name: Packed release installs on its own (node ${{ matrix.node }})
     runs-on: ubuntu-latest
     timeout-minutes: 40
     permissions:
       contents: read
+    # The engines floor and current LTS: the check's load hook goes in through
+    # register below Node 22.15 and through registerHooks from there, so each
+    # branch a host takes runs before a release.
+    strategy:
+      fail-fast: false
+      matrix:
+        node: ['22.12.0', 24]
 
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
@@ -78,7 +92,7 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
         with:
-          node-version: 24
+          node-version: ${{ matrix.node }}
 
       # As publish installs, so a build that came to need a dependency's
       # install script fails here rather than in publish.
@@ -193,21 +207,17 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
 
+      # The notes are the tag's CHANGELOG.md section. GitHub refuses a
+      # release body over 125,000 characters, as it refused v0.22.3's (run
+      # 39167578309, HTTP 422), so the script cuts a section longer than
+      # 120,000 characters at an entry's start and closes with a link to the
+      # whole section at the tag. It fails the step for a tag with no
+      # section.
       - name: Mirror changelog section into release notes
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          ver="${GITHUB_REF_NAME#v}"
-          # Section header is '## X.Y.Z — YYYY-MM-DD'; match the version
-          # field exactly (string compare, no regex escaping needed).
-          awk -v ver="$ver" '
-            /^## / { if (in_section) exit; if ($2 == ver) { in_section = 1; next } }
-            in_section { print }
-          ' CHANGELOG.md | sed '/./,$!d' > notes.md
-          if ! [ -s notes.md ]; then
-            echo "::error::No CHANGELOG.md section found for ${ver}."
-            exit 1
-          fi
+          node scripts/release-notes.mjs "$GITHUB_REF_NAME" notes.md
           if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
             gh release edit "$GITHUB_REF_NAME" --notes-file notes.md
           else

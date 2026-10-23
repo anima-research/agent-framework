@@ -6,7 +6,7 @@ import type { McplServerConfig } from '../src/mcpl/types.js';
 import { REFUSAL_REACTION_BASELINE } from '../src/refusal-reactions.js';
 
 const KEY = 'DISCORD_SUPPRESSED_REACTIONS_BASELINE';
-/** The framework's protective default for the stub below (awareness emoji 🔕, no ledger). */
+/** The framework's protective default for the stub below (awareness emoji 🔕, an empty journal). */
 const DEFAULT = [...REFUSAL_REACTION_BASELINE, '💤', '🔕'].join(',');
 
 /** Exercise the real default-injection boundary, intercepting immediately
@@ -25,11 +25,11 @@ async function connectionEnv(
     mcplHostCapabilities: {},
     mcplPrefixMap: new Map(),
     mcplServerConfigs: new Map(),
-    mcplConnecting: new Set(),
     channelRegistry: null,
-    discordAwarenessOutbox: null,
+    discordAwarenessOutbox: { batches: () => [] },
     discordAwarenessEmoji: '🔕',
     mcplServerRegistry: {
+      getServer: () => undefined,
       async addServer(config: McplServerConfig) {
         captured = config;
         throw stopBeforeSpawn;

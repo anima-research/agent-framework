@@ -19,7 +19,7 @@ function harness(connection = Object.assign(new EventEmitter(), { id: 'srv' })) 
   // Main's trace listeners are registrations (#318), which onTrace makes.
   framework.traceListeners = [];
   framework.onTrace((event: unknown) => traces.push(event));
-  framework.wireMcplEvents(connection);
+  framework.wireMcplEvents(connection, { id: connection.id });
   return { framework, connection, traces };
 }
 
@@ -159,16 +159,19 @@ test('a failed error response is traced without an escaping rejection', async ()
   assert.match(failures[0].responseError, /error response transport failed/);
 });
 
-test('inference responders retain request IDs and successful handling stays synchronous', async () => {
+test('inference responders retain request IDs and their transport\'s chunk sender, and successful handling stays synchronous', async () => {
   const { framework, connection, traces } = harness();
   framework.inferenceRouter = {
     handleInferenceRequest(_server: string, _params: unknown, reply: any) {
       assert.equal(reply.requestId, 17);
+      reply.sendChunk({ requestId: 17, index: 0, delta: 'a' });
       reply.respond({ accepted: true });
     },
   };
-  const reply = responder();
+  const chunks: unknown[] = [];
+  const reply = { ...responder(), sendChunk: (chunk: unknown) => { chunks.push(chunk); } };
   connection.emit('inference-request', {}, reply);
+  assert.deepEqual(chunks, [{ requestId: 17, index: 0, delta: 'a' }], 'chunks go out through the request\'s own sender');
   assert.deepEqual(reply.results, [{ accepted: true }]);
   await settle();
   assert.equal(reply.errors.length, 0);
@@ -183,7 +186,7 @@ test('a real inference handler whose result write throws answers with its own er
     { async complete() { return createMockResponse([{ type: 'text', text: 'done' }]); } } as never,
     { isInHook: false } as never,
     { validateInbound() {} } as never,
-    null,
+    { default: 'test-model' },
     (event) => traces.push(event),
   );
   const reply = responder();
@@ -210,7 +213,7 @@ test('a real inference handler whose inference fails answers -32603 with the fai
     { async complete() { throw new Error('the provider refused the request'); } } as never,
     { isInHook: false } as never,
     { validateInbound() {} } as never,
-    null,
+    { default: 'test-model' },
     (event) => traces.push(event),
   );
   const reply = responder();
@@ -677,8 +680,17 @@ test('a manifest refresh deferred by the fetch floor reports a failure other tha
   const lines: string[] = [];
   t.mock.method(console, 'error', (...args: unknown[]) => { lines.push(args.map(String).join(' ')); });
   // The last refresh completed just now, so this announcement waits out the floor.
-  framework.manifestRefreshState = new Map([['srv', { inFlight: false, queued: false, lastCompletedAt: 100_000 }]]);
-  framework.mcplServerConfigs = { get() { throw new Error('the deferred refresh failed before its fetch'); } };
+  framework.manifestRefreshState = new Map([[connection, { inFlight: false, queued: false, lastCompletedAt: 100_000 }]]);
+  // Each run reads the server's configuration before anything else: the
+  // announcement's own run finds it, and the deferred run fails there.
+  let lookups = 0;
+  framework.mcplServerConfigs = {
+    get() {
+      lookups++;
+      if (lookups > 1) throw new Error('the deferred refresh failed before its fetch');
+      return { id: 'srv' };
+    },
+  };
   connection.emit('manifest-changed', { revision: 'r2' });
   await settle();
   assert.deepEqual(failureTraces(traces), [], 'nothing has run yet');
@@ -698,11 +710,13 @@ test('a manifest refresh queued behind a fetch in flight reports a failure other
   const lines: string[] = [];
   t.mock.method(console, 'error', (...args: unknown[]) => { lines.push(args.map(String).join(' ')); });
   framework.manifestRefreshState = new Map();
+  // Each run reads the server's configuration before anything else: both
+  // announcements' own runs find it, and the queued re-run fails there.
   let lookups = 0;
   framework.mcplServerConfigs = {
     get() {
       lookups++;
-      if (lookups > 1) throw new Error('the queued refresh failed before its fetch');
+      if (lookups > 2) throw new Error('the queued refresh failed before its fetch');
       return { id: 'srv' };
     },
   };
@@ -721,7 +735,7 @@ test('a manifest refresh queued behind a fetch in flight reports a failure other
   assert.equal(failures.length, 1);
   assert.equal(failures[0].event, 'manifest-changed');
   assert.match(failures[0].error, /the queued refresh failed before its fetch/);
-  assert.equal(lookups, 2);
+  assert.equal(lookups, 3);
   assert.ok(lines.includes('[mcpl] srv manifest-changed handler failed: "the queued refresh failed before its fetch"'), lines.join('\n'));
 });
 
@@ -745,7 +759,7 @@ test('a server\'s error answer that no template can convert settles the host\'s 
     '[mcpl] srv: mcpl/manifest fetch failed — previous manifest stands (§17.5): The "srv" server answered with an error without saying what went wrong, so whether the request took effect is unknown. Check its effect before trying again.',
   ]);
   assert.deepEqual(traces.filter((e) => e.type === 'mcpl:server-error' || e.type === 'mcpl:request-handler-error'), []);
-  assert.equal(framework.manifestRefreshState.get('srv').inFlight, false);
+  assert.equal(framework.manifestRefreshState.get(connection).inFlight, false);
 });
 
 test('a server\'s error message in the error a host request rejects with is bounded: control, format and line characters replaced, and cut after 200 code points; its code goes to the log line instead, as logValue prints it', async (t) => {
@@ -785,40 +799,6 @@ test('a throw from the wired tools/list_changed handler is contained, traced and
   assert.equal(failures[0].requestId, undefined);
   assert.equal(failures[0].error, 'the tool list refresh failed');
   assert.deepEqual(lines, ['[mcpl] srv tools-list-changed handler failed: "the tool list refresh failed"']);
-});
-
-test('after a throw from the wired tools/list_changed handler, its data-plane gate is still completed when its barrier settles, or failed with it', async (t) => {
-  const { framework, connection } = harness();
-  t.mock.method(console, 'error', () => {});
-  const unhandled: unknown[] = [];
-  const onUnhandled = (reason: unknown) => { unhandled.push(reason); };
-  process.on('unhandledRejection', onUnhandled);
-  try {
-    framework.handleToolsListChanged = () => { throw new Error('the tool list refresh failed'); };
-    const failed: unknown[][] = [];
-    framework.failMcplDataPlaneGate = async (barrier: unknown, what: string, error: unknown) => { failed.push([barrier, what, error]); };
-    // A barrier the data planes wait for, which settles: the gate completes.
-    framework.beginDiscordAwarenessBarrier = () => ({
-      requiresBarrier: true,
-      promise: Promise.resolve({ status: 'delivered', delivered: 0, failed: 0 }),
-    });
-    connection.emit('tools-list-changed');
-    const settling = framework.discordAwarenessBarrier;
-    assert.ok(settling, 'the gate is installed until its barrier settles');
-    await settle();
-    assert.equal(framework.discordAwarenessBarrier, null, 'the gate completed');
-    // One that fails: the gate is failed with it, and its rejection is handled.
-    const accounting = new Error('the awareness accounting failed');
-    framework.beginDiscordAwarenessBarrier = () => ({ requiresBarrier: true, promise: Promise.reject(accounting) });
-    connection.emit('tools-list-changed');
-    const failing = framework.discordAwarenessBarrier;
-    await settle();
-    await settle();
-    assert.deepEqual(failed, [[failing, 'tools-list reconciliation', accounting]]);
-    assert.deepEqual(unhandled, []);
-  } finally {
-    process.off('unhandledRejection', onUnhandled);
-  }
 });
 
 test('mcpl/manifestChanged and tools/list_changed sent as requests are answered with an empty result as they are admitted, whatever their handlers do', async (t) => {

@@ -143,12 +143,12 @@ test('dynamic conversation forks are excluded from provider cooldown ownership',
     modules: [], syncIntervalMs: 0, maintenanceIntervalMs: 0,
   });
   const internal = framework as unknown as {
-    conversationAgentHomes: Map<string, string>;
+    conversationAgentHomes: Map<string, { serverId: string; channelId: string }>;
     providerAccelerationCooldowns: Map<string, unknown>;
     providerGates: Map<string, unknown>;
     holdProviderAcceleration(agent: unknown, error: Error, trigger?: unknown): boolean;
   };
-  internal.conversationAgentHomes.set('resident', 'world:test');
+  internal.conversationAgentHomes.set('resident', { serverId: 'stub', channelId: 'world:test' });
   try {
     const error = new MembraneError({
       type: 'rate_limit', retryable: true, httpStatus: 429,

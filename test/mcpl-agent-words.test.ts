@@ -25,6 +25,9 @@ import {
 import { convertBlock } from '../src/mcpl/convert-block.js';
 import { toolResultDataToHistoryString } from '../src/tool-result-history.js';
 import { McplServerConnection } from '../src/mcpl/server-connection.js';
+import { McplTransport } from '../src/mcpl/transport.js';
+import { WITHHELD_TEXT } from '../src/mcpl/protocol-family.js';
+import { logValue } from '../src/mcpl/log-value.js';
 import type { McplHostCapabilities, McplServerConfig } from '../src/mcpl/types.js';
 
 // ---------------------------------------------------------------------------
@@ -74,7 +77,9 @@ test("a reference block that can't be read says which part is missing, and what 
 
 // Stdio server: answers initialize and tools/list; tools/call "refuse" gets a
 // JSON-RPC error, "mute" one with a blank message, "odd" one whose message
-// isn't a string, "exit" ends the process with the call pending,
+// isn't a string, "echo-token" one whose message echoes its API_TOKEN,
+// "echo-token-object" one whose message is an object holding it, "exit"
+// ends the process with the call pending,
 // "answer-then-exit" answers and then ends it, and "hang" is never answered.
 const SERVER = `
 let buf = '';
@@ -86,11 +91,13 @@ process.stdin.on('data', (c) => {
     if (!line.trim()) continue;
     let m; try { m = JSON.parse(line); } catch { continue; }
     const send = (o) => process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: m.id, ...o }) + '\\n');
-    if (m.method === 'initialize') send({ result: { capabilities: {} } });
+    if (m.method === 'initialize') send({ result: { protocolVersion: '2024-11-05', capabilities: {} } });
     else if (m.method === 'tools/list') send({ result: { tools: [] } });
     else if (m.method === 'tools/call' && m.params.name === 'refuse') send({ error: { code: -32000, message: 'Missing Access' } });
     else if (m.method === 'tools/call' && m.params.name === 'mute') send({ error: { code: -32000, message: '  ' } });
     else if (m.method === 'tools/call' && m.params.name === 'odd') send({ error: { code: -32000, message: 42 } });
+    else if (m.method === 'tools/call' && m.params.name === 'echo-token') send({ error: { code: -32000, message: 'bad token ' + process.env.API_TOKEN } });
+    else if (m.method === 'tools/call' && m.params.name === 'echo-token-object') send({ error: { code: -32000, message: { said: 'bad token ' + process.env.API_TOKEN } } });
     else if (m.method === 'tools/call' && m.params.name === 'answer-then-exit') { send({ result: { content: [] } }); setTimeout(() => process.exit(0), 50); }
     else if (m.method === 'tools/call' && m.params.name === 'exit') process.exit(3);
   }
@@ -132,6 +139,140 @@ test("a server's error answer is shown as the server's, and its method, id and c
   await assert.rejects(connection.sendToolsCall('odd', {}),
     { message: NO_WORDS });
   assert.ok(logged(errors.mock.calls, /^MCPL server "words" answered tools\/call \(id=\d+\) with error -32000: 42$/), 'the log has the number');
+});
+
+test("a server's error answer that echoes a credential reaches the caller and the log redacted", async (t) => {
+  const errors = t.mock.method(console, 'error', () => {});
+  const token = 'tok-0123456789abcdef';
+  const connection = await McplServerConnection.connect(config({ env: { API_TOKEN: token } }), HOST_CAPS);
+  t.after(() => connection.close());
+  connection.ready();
+  // The server's words are in an error the caller gets, so a credential
+  // its configuration holds leaves them (redactServerText's scope).
+  await assert.rejects(connection.sendToolsCall('echo-token', {}),
+    { message: 'The "words" server answered with an error: bad token redacted' });
+  // The log is a record of the server's text, so the credential leaves it,
+  // in a message of any JSON value.
+  await assert.rejects(connection.sendToolsCall('echo-token-object', {}), { message: NO_WORDS });
+  const lines = errors.mock.calls.map((call) => String(call.arguments[0]));
+  assert.ok(logged(errors.mock.calls, /^MCPL server "words" answered tools\/call \(id=\d+\) with error -32000: "bad\\u0020token\\u0020redacted"$/), lines.join('\n'));
+  assert.ok(lines.some((line) => line.endsWith('with error -32000: "{\\"said\\":\\"bad\\u0020token\\u0020redacted\\"}"')), lines.join('\n'));
+  assert.ok(!lines.some((line) => line.includes(token)), 'no log line has the token');
+});
+
+test("an error answer whose configuration can't be read settles its call, and its error and its log line withhold the server's text", async (t) => {
+  const errors = t.mock.method(console, 'error', () => {});
+  // A stdio server's env, as the framework gives it, is a getter, which
+  // throws once the reaction baseline's ledger can't be read.
+  let unreadable = false;
+  const withGetter = config();
+  Object.defineProperty(withGetter, 'env', {
+    enumerable: true,
+    get: () => { if (unreadable) throw new Error('reaction-baseline ledger unreadable'); return {}; },
+  });
+  const connection = await McplServerConnection.connect(withGetter, HOST_CAPS);
+  t.after(() => { unreadable = false; return connection.close(); });
+  connection.ready();
+  unreadable = true;
+  await within(assert.rejects(connection.sendToolsCall('refuse', {}),
+    { message: `The "words" server answered with an error: ${WITHHELD_TEXT}` }), 'settled call');
+  const lines = errors.mock.calls.map((call) => String(call.arguments[0]));
+  assert.ok(!lines.some((line) => line.includes('Missing')), lines.join('\n'));
+  assert.ok(lines.some((line) => /^MCPL server "words" answered tools\/call \(id=\d+\) with error -32000: /.test(line) && line.endsWith(logValue(WITHHELD_TEXT))), lines.join('\n'));
+});
+
+test("a request JSON can't write is refused before anything is kept for it: not sent, in the modern engine's words (#556)", async (t) => {
+  const errors = t.mock.method(console, 'error', () => {});
+  const connection = await McplServerConnection.connect(config(), HOST_CAPS);
+  t.after(() => connection.close());
+  connection.ready();
+  const cyclic: Record<string, unknown> = {};
+  cyclic.self = cyclic;
+  for (const args of [{ n: 1n }, cyclic]) {
+    await assert.rejects(connection.sendToolsCall('refuse', args), {
+      outcome: 'not-sent',
+      message: 'The request wasn\'t sent: this host couldn\'t send it to the "words" server, so nothing ran. If calling it again fails, ask whoever runs this host.',
+    });
+  }
+  assert.equal((connection as unknown as { pendingRequests: Map<unknown, unknown> }).pendingRequests.size, 0, 'nothing kept pending');
+  assert.ok(logged(errors.mock.calls, /^MCPL server "words": tools\/call \(id=\d+\) not sent, since it can't be written as JSON: "Do not know how to serialize a BigInt"$/),
+    errors.mock.calls.map((call) => String(call.arguments[0])).join('\n'));
+});
+
+test("a request refused as not sent is refused through its promise when the host's logger throws (#556)", async (t) => {
+  t.mock.method(console, 'error', () => { throw new Error('the logger is down'); });
+  class PipeTransport extends McplTransport {
+    constructor() { super(); }
+    readonly kind = 'stdio' as const;
+    failed: Error | undefined;
+    writeFails: Error | undefined;
+    override get pipeFailure(): Error | undefined { return this.failed; }
+    writeLine(): void { if (this.writeFails) throw this.writeFails; }
+    async close(): Promise<void> {}
+  }
+  const transport = new PipeTransport();
+  const connection = new (McplServerConnection as any)('words', null, transport) as McplServerConnection;
+  let refused: Promise<unknown> | undefined;
+  // Arguments JSON can't write.
+  assert.doesNotThrow(() => { refused = connection.sendToolsCall('refuse', { n: 1n }); });
+  await assert.rejects(refused!, { outcome: 'not-sent' });
+  // A write the transport refuses at once.
+  transport.writeFails = new Error('the stream is destroyed');
+  assert.doesNotThrow(() => { refused = connection.sendToolsCall('refuse', {}); });
+  await assert.rejects(refused!, { outcome: 'not-sent' });
+  // A stdio pipe that has failed, with nothing else to refuse the write.
+  transport.writeFails = undefined;
+  transport.failed = new Error('write EPIPE');
+  assert.doesNotThrow(() => { refused = connection.sendToolsCall('refuse', {}); });
+  await assert.rejects(refused!, { outcome: 'not-sent' });
+});
+
+test("error answers read their connection's configuration once each until a read succeeds, and not after (#540's review, R1-2)", async (t) => {
+  const errors = t.mock.method(console, 'error', () => {});
+  // A stdio server's env, as the framework gives it, is a getter, which reads
+  // the reaction baseline's ledger from disk each time, and throws while the
+  // ledger can't be read.
+  let reads = 0;
+  let unreadable = false;
+  const counted = config();
+  Object.defineProperty(counted, 'env', {
+    enumerable: true,
+    get: () => { reads++; if (unreadable) throw new Error('reaction-baseline ledger unreadable'); return {}; },
+  });
+  const connection = await McplServerConnection.connect(counted, HOST_CAPS);
+  t.after(() => { unreadable = false; return connection.close(); });
+  connection.ready();
+  const refused = (words = 'Missing Access') => assert.rejects(connection.sendToolsCall('refuse', {}), { message: `The "words" server answered with an error: ${words}` });
+  const answerLines = () => errors.mock.calls.map((call) => String(call.arguments[0])).filter((line) => / answered tools\/call /.test(line));
+  // While the ledger can't be read, each answer's words and line are
+  // withheld, each answer reads it once, and the next answer reads it again.
+  unreadable = true;
+  let before = reads;
+  await refused(WITHHELD_TEXT);
+  await refused(WITHHELD_TEXT);
+  assert.equal(reads - before, 2);
+  assert.ok(answerLines().every((line) => line.endsWith(logValue(WITHHELD_TEXT))), answerLines().join('\n'));
+  // Once a read succeeds, the redaction it built is kept.
+  unreadable = false;
+  before = reads;
+  for (let i = 0; i < 3; i++) await refused();
+  assert.equal(reads - before, 1, 'read for the first of these answers only');
+  assert.ok(answerLines().at(-1)!.includes('Missing'), answerLines().join('\n'));
+});
+
+test("an error answer settles its call when writing its log line throws", async (t) => {
+  // A host's logger can throw. The call's entry and timer are gone by the
+  // time the line is written, so nothing else would settle it.
+  const errors = t.mock.method(console, 'error', (line: unknown) => {
+    if (String(line).includes(' answered tools/call ')) throw new Error('the logger is down');
+  });
+  const connection = await McplServerConnection.connect(config(), HOST_CAPS);
+  t.after(() => connection.close());
+  connection.ready();
+  await within(assert.rejects(connection.sendToolsCall('refuse', {}),
+    { message: 'The "words" server answered with an error: Missing Access' }), 'settled call');
+  const lines = errors.mock.calls.map((call) => String(call.arguments[0]));
+  assert.ok(lines.some((line) => /inbound dispatch failed .*the logger is down/.test(line)), lines.join('\n'));
 });
 
 test("a server that drops with a call pending says the outcome is unknown, and whether it's coming back", async (t) => {
@@ -241,7 +382,6 @@ function frameworkWith(server: unknown, config: Record<string, unknown> = {}) {
   };
   framework.mcplServerRegistry = { getServer: () => server };
   framework.mcplServerConfigs = new Map([['words', { id: 'words', ...config }]]);
-  framework.mcplConnecting = new Set();
   framework.emitTrace = () => {};
   framework.pushEvent = (event: ToolResultEvent) => { events.push(event); if (event.type === 'tool-result') resolve(); };
   return { framework, events, delivered };
@@ -289,6 +429,7 @@ test("a call while this host connects to the tool's server says so, and after a 
     channelRegistry: null,
     discordAwarenessOutbox: null,
     discordAwarenessEmoji: '🔕',
+    mcplPolicyExchanges: new WeakMap(),
     wireMcplEvents: () => {},
     registerMcplServerFeatures: async () => {},
   });
@@ -329,18 +470,51 @@ test("a call while this host connects to the tool's server says so, and after a 
   assert.equal((await framework.executeMcplToolCall(call('c6'), 'words', 'words')).error, goneText, "a script's call reads the same");
 });
 
-test('a second connect, a restart or a disconnect of a server whose connect is in flight is refused before it writes anything', async () => {
-  // The registry takes the server once its handshake is done, so until then
-  // only the connecting mark says the id is taken. Each handshake here waits for the test.
+test('a call while a modern connect is under way reads the connecting text on both paths; once its session is up, the call goes to it', async () => {
+  // A modern connect registers its connection before it starts, so the
+  // connection is there while the connect holds the id.
+  const { framework, events } = frameworkWith(null);
+  const reached: string[] = [];
+  const modern = {
+    id: 'words',
+    isConnected: false,
+    callTool: async (name: string) => { reached.push(name); return { content: [{ type: 'text', text: 'ran' }] }; },
+  };
+  Object.assign(framework, {
+    modernMcpConnections: new Map([['words', modern]]),
+    mcpServerOps: new Map([['words', { kind: 'connect', settled: new Promise<void>(() => {}) }]]),
+  });
+  const call = (id: string) => ({ id, name: 'words--lookup', input: {} });
+  const connectingText = 'This host is connecting to the "words" server that provides words--lookup, so the call didn\'t run. Try again in a moment.';
+  framework.dispatchMcplToolCall('agent', call('m1'), 'words', 'words');
+  assert.equal(events[0]?.result?.error, connectingText);
+  assert.equal((await framework.executeMcplToolCall(call('m2'), 'words', 'words')).error, connectingText, "a script's call reads the same");
+  assert.deepEqual(reached, [], 'neither reached the connection');
+  // Its first session is up while the connect still lists its tools: a call goes to it.
+  modern.isConnected = true;
+  const ran = await framework.executeMcplToolCall(call('m3'), 'words', 'words') as { success?: boolean };
+  assert.equal(ran.success, true);
+  assert.deepEqual(reached, ['lookup']);
+});
+
+test('a second connect, or a restart into the id, of a server whose connect is in flight is refused in these words before it writes anything', async () => {
+  // The connect's hold on the id (mcpServerIdTaken) says the id is taken in
+  // these words for as long as the connect runs: through its handshake, and
+  // after the registry has taken the server, while the connect sets it up.
+  // Each handshake, and the setup after it, waits for the test. A disconnect
+  // isn't refused: it ends the connect, as mcp-server-ownership's tests of a
+  // disconnect during a legacy handshake and during a modern connect pin.
   const servers = new Map<string, unknown>();
   const handshakes: Array<() => void> = [];
+  let setUp!: () => void;
+  const settingUp = new Promise<void>((r) => { setUp = r; });
   const { framework } = frameworkWith(null);
   Object.assign(framework, {
     mcplServerRegistry: {
       getServer: (id: string) => servers.get(id) ?? null,
       addServer: (cfg: { id: string }) => new Promise((resolve) => {
         handshakes.push(() => {
-          const connection = { on: () => {} };
+          const connection = { on: () => {}, isConnected: true, willReconnect: false };
           servers.set(cfg.id, connection);
           resolve(connection);
         });
@@ -353,34 +527,31 @@ test('a second connect, a restart or a disconnect of a server whose connect is i
     channelRegistry: null,
     discordAwarenessOutbox: null,
     discordAwarenessEmoji: '🔕',
+    mcplPolicyExchanges: new WeakMap(),
     wireMcplEvents: () => {},
-    registerMcplServerFeatures: async () => {},
+    registerMcplServerFeatures: () => settingUp,
   });
   const fw = framework as unknown as {
-    connectMcplServerInternal(config: McplServerConfig, deferAwareness?: boolean): Promise<void>;
-    refuseMcplConnect(config: McplServerConfig, replacing?: string): void;
-    runDisconnectMcplServer(id: string): Promise<void>;
+    connectMcplServerInternal(config: McplServerConfig, deferAwareness?: boolean): Promise<unknown>;
+    mcpServerIdTaken(id: string, claim?: unknown, restarting?: string): string | null;
   };
   const words = { id: 'words', url: 'ws://127.0.0.1:9', toolPrefix: 'words' } as McplServerConfig;
-  const other = { id: 'other', url: 'ws://127.0.0.1:9', toolPrefix: 'other' } as McplServerConfig;
   const connecting = fw.connectMcplServerInternal(words, true);
   await new Promise<void>((r) => setImmediate(r));
   assert.equal(handshakes.length, 1, 'the handshake has begun');
-  const inFlight = { message: 'MCPL server "words" has a connect in flight; try again once it settles' };
-  assert.throws(() => fw.refuseMcplConnect(words), inFlight, 'a second connect of it');
-  // A restart's disconnect can't stop the connect in flight, which would register the server after it.
-  assert.throws(() => fw.refuseMcplConnect(words, 'words'), inFlight, 'a restart of it');
-  assert.throws(() => fw.refuseMcplConnect(other, 'words'), inFlight, 'a restart of it into another id');
-  assert.throws(() => fw.refuseMcplConnect(words, 'other'), inFlight, 'a restart of another server into its id');
-  // A disconnect can't stop it either: the server would register after it, its config and prefix gone.
-  await assert.rejects(fw.runDisconnectMcplServer('words'), inFlight, 'a disconnect of it');
-  assert.equal((framework.mcplPrefixMap as Map<string, string>).get('words'), 'words', 'the refused disconnect left its prefix');
+  const inFlight = 'MCPL server "words" has a connect in flight; try again once it settles';
+  await assert.rejects(fw.connectMcplServerInternal(words, true), { message: inFlight }, 'a second connect of it');
+  assert.equal(handshakes.length, 1, 'the refused connect began no handshake');
+  assert.equal(fw.mcpServerIdTaken('words', undefined, 'other'), `MCP server "other" was not restarted: ${inFlight}`,
+    'a restart of another server into its id');
   handshakes[0]!();
+  await new Promise<void>((r) => setImmediate(r));
+  assert.ok(servers.has('words'), 'the registry has taken the server');
+  await assert.rejects(fw.connectMcplServerInternal(words, true), { message: inFlight }, 'a second connect while the first sets the server up');
+  setUp();
   await connecting;
-  // Once the connect settles, the mark is gone: the registry's check refuses a
-  // second connect, and a restart, which disconnects the server first, may go ahead.
-  assert.throws(() => fw.refuseMcplConnect(words), { message: 'MCPL server "words" is already registered' });
-  assert.doesNotThrow(() => fw.refuseMcplConnect(words, 'words'));
+  // Once the connect settles, the registered server holds the id.
+  assert.equal(fw.mcpServerIdTaken('words'), 'MCPL server "words" is already registered');
 });
 
 test("an MCPL tool's error result with no words says so, and that its effect is unknown", async () => {
@@ -395,7 +566,7 @@ test("an MCPL tool's error result with no words says so, and that its effect is 
 
 test("a conversation bound to its channel is told it can't open another, and where to reply", () => {
   const { framework, events } = frameworkWith(null);
-  framework.conversationAgentHomes = new Map([['fork', 'home-1']]);
+  framework.conversationAgentHomes = new Map([['fork', { serverId: 'srv', channelId: 'home-1' }]]);
   framework.toolLifecycleEmitter = undefined;
   framework.dispatchChannelToolCall('fork', { id: 'c1', name: 'channel_open', input: { channelId: 'elsewhere' } });
   assert.equal(events[0]?.result?.error,

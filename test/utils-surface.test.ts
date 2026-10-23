@@ -151,18 +151,25 @@ describe('utils surface', () => {
 
       const missing = await call({ action: 'run', name: 'stub--rare_op', args: {} });
       assert.ok(!missing.success && missing.isError);
-      assert.match(missing.error!, /missing required "mode"/);
+      assert.match(missing.error!, /^Nothing was done: stub--rare_op needs "mode" \(a string\), and this call gave none\./);
       assert.match(missing.error!, /"enum":\["soft","hard"\]/, 'schema included for the retry');
 
       const badEnum = await call({ action: 'run', name: 'stub--rare_op', args: { mode: 'loud' } });
-      assert.match(badEnum.error!, /"mode" must be one of \["soft","hard"\]/);
+      assert.match(badEnum.error!, /"mode" must be one of "soft" or "hard", and this call gave "loud"/);
 
       const badType = await call({ action: 'run', name: 'stub--rare_op', args: { mode: 'soft', count: 'three' } });
-      assert.match(badType.error!, /"count" must be number, got string/);
+      assert.match(badType.error!, /"count" must be a number, and this call gave a string/);
+
+      // The utility's input is the run's `args`, so the refusal names them.
+      const notObject = await call({ action: 'run', name: 'stub--rare_op', args: 'soft' });
+      assert.match(notObject.error!, /^Nothing was done: stub--rare_op its args must be an object, and this call gave a string\./);
+      // Checks made after the call opened are failures, not the dispatcher's refusals.
+      assert.equal(notObject.refused, undefined);
       assert.equal(stub.calls.length, 0, 'handler never reached on a validation miss');
 
       const unknown = await call({ action: 'run', name: 'stub--nope', args: {} });
-      assert.match(unknown.error!, /No utility "stub--nope"\. Available: stub--rare_op, stub--other_op/);
+      assert.match(unknown.error!, /No utility "stub--nope", so nothing was done\. Available: stub--rare_op, stub--other_op/);
+      assert.equal(unknown.refused, undefined);
 
       const badAction = await call({ action: 'zap' });
       assert.match(badAction.error!, /action must be "list", "describe", or "run"/);

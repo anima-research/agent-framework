@@ -2,12 +2,31 @@ import type { ContentBlock, YieldingStream } from '@animalabs/membrane';
 import type { ContextStrategy } from '@animalabs/context-manager';
 import type { ToolCallId, ToolResult, ToolCall } from './events.js';
 import type { SilentHeartbeatTick } from '../silent-heartbeat.js';
+import type { WakeLine } from '../gate/types.js';
 
 export type SameRoundThinkTextPolicy = 'public' | 'private';
 export type SameRoundThinkTextPolicySource =
   | 'runtime_override'
   | 'recipe'
   | 'compatibility_default';
+
+/** What a continuation's `[continue]` row says (InferenceRequest.autoContinueRun). */
+export interface AutoContinueRun {
+  /** How the agent stops, as the row puts it ("call skip_reply"). */
+  stop: string;
+  /** The turn before ended in words that were held, not sent, because it
+   *  had already sent with a send tool. */
+  heldAfterSend?: boolean;
+  /** Set by the scheduler: the continuation is the turn's only cause. */
+  sole?: boolean;
+}
+
+/** `AgentConfig.autoContinue` as an object (`true` means `{}`). */
+export interface AutoContinueConfig {
+  /** Continuations in a row before the agent waits for the next event:
+   *  a whole number, 1 to 20. Default 3. */
+  maxConsecutive?: number;
+}
 
 /**
  * Configuration for an agent.
@@ -187,12 +206,6 @@ export interface AgentConfig {
     autoRewind?: boolean;
     /** Max consecutive rewinds before giving up a turn. Default 3. */
     maxRewinds?: number;
-    /**
-     * When the rewound turn is a *human* message (not a machine tool result),
-     * announce the withholding on the conversational surface (Discord) rather
-     * than dropping it silently. Default true.
-     */
-    announceHumanTurns?: boolean;
   };
 
   /** Opt-in tool-output admission and one guarded retry after a provider
@@ -212,7 +225,8 @@ export interface AgentConfig {
    *   that publication envelope through the same authorized resolver.
    *   See docs/hybrid-prose-routing.md.
    * - 'disabled': generated prose is never published. Only explicit tools may
-   *   send externally; prose remains in Chronicle with a private suppression receipt.
+   *   send externally; prose remains in Chronicle, and a turn that wrote plain
+   *   speech ends with a private `[delivered] plain speech → no channel` receipt.
    */
   proseRouting?: 'locus' | 'explicit' | 'hybrid' | 'disabled';
 
@@ -223,6 +237,62 @@ export interface AgentConfig {
    * content-free system receipt is stored instead. Default false.
    */
   toolWrapperProseGuard?: boolean;
+
+  /**
+   * Continue on the agent's own turn ending (off when left out): a turn the
+   * model ends itself (stop reason `end_turn` or `stop_sequence`), whether
+   * its last response is prose or empty, is followed by another turn,
+   * instead of a pause until the next event. A turn ended through
+   * `skip_reply` (or another tool that ends the turn, such as `sleep`), or
+   * whose last prose envelope is `>>skip_reply` (explicit) or `>>>skip_reply`
+   * (hybrid), pauses as usual. So does one whose closing prose bounced (the
+   * bounce and its cap answer it), and an agent offered no way to stop
+   * (locus or disabled mode without an offered `skip_reply`).
+   *
+   * As the next turn starts, a short `[continue]` system row naming the agent
+   * joins the window: another turn starts, how to stop, and that unmarked
+   * words are sent as usual; on the last continuation of a run, that the
+   * agent waits for the next event after it. It's written only when the
+   * continuation is that turn's whole cause: a message batched with it makes
+   * it that message's turn, with no row, in the message's channel. Otherwise
+   * the next turn keeps the turn's locus (locus and hybrid modes). At most
+   * `maxConsecutive` (default 3) continuations run in a row: the count
+   * starts again when a turn starts with a cause of its own (a message, a
+   * timer, a heartbeat that isn't a silent tick) or a tool ends one. Silent
+   * heartbeat ticks, refusals, `max_tokens` cut-offs, the stall guard's
+   * ends, ephemeral runs, conversation forks and a quiesce never continue. A
+   * ` !` continuation the turn asked for runs instead, and counts toward
+   * nothing. See docs/auto-continue.md.
+   */
+  autoContinue?: boolean | AutoContinueConfig;
+
+  /**
+   * Clock rows (off when left out): when a boundary of this interval on the
+   * agent's local wall clock (counted from local midnight, in the
+   * framework's `timeZone`) has passed since the last clock row, the window
+   * takes one more — `Clock: 10:50 Europe/Berlin (UTC+02:00)`, with the date
+   * when the day has changed — before the next thing it takes: an incoming
+   * event, a turn's start, or, mid-turn, after a tool round's results, where
+   * it also joins the live stream. Only the latest boundary is written, and
+   * a window that holds no clock row yet takes one at the next of these. A
+   * clock reads the boundary's time where its tick would have stood, else
+   * the time it is written (after a tool's results, say), so it never
+   * reads earlier than a row before it. A clock wakes no one. See
+   * src/clock-rows.ts.
+   *
+   * - A stream that can't carry injected messages (membrane's XML prefill
+   *   path) takes no mid-turn clock: the next event or turn start writes it.
+   * - On some models a clock after a tool's results drops the loop's
+   *   earlier thinking from the request, as any message heard while acting
+   *   does there: at most once an interval.
+   * - Residents share one window, so every resident reads the clock rows any
+   *   of them writes, a resident with no `clock` of its own included. Each
+   *   writes one when a boundary of its own interval has passed since the
+   *   window's last clock, whichever resident wrote that. The subconscious
+   *   takes none of its own: it reads the residents' through its merged
+   *   view.
+   */
+  clock?: import('../clock-rows.js').ClockConfig;
 }
 
 /** The intentionally small set of agent settings that may change in-process. */
@@ -376,6 +446,10 @@ export interface InferenceRequest {
    *  all of them without materializing content, the turn has no cause left
    *  and does not run. */
   coalescingBatchSubjects?: string[];
+  /** Host-owned: this wake's sole cause is reading this deferred write, a
+   *  coalesced render placed in its agent's queue (wakeToRead). Once the
+   *  agent has read the write, or it was removed, the wake starts no turn. */
+  readsDeferredWrite?: string;
   agentName: string;
   reason: string;
   source: string;
@@ -387,9 +461,29 @@ export interface InferenceRequest {
    * replies in the channel it is answering — not the process-global most-recent-
    * inbound locus, which a concurrent message elsewhere can hijack (item-3
    * redux). Undefined for non-channel wakes (heartbeat, timers, module events),
-   * which correctly fall back to the global default channel.
+   * which correctly fall back to the global default channel, except an
+   * ephemeral run's (a subagent's), which takes no global fallback.
    */
   channelId?: string;
+  /**
+   * The server of `channelId`'s channel. MCPL requires a channel id to be
+   * unique only within one server's connection (§14.2), so where two
+   * servers register the same id only the pair names one channel. The
+   * framework's own wakes set it beside `channelId`. A host's request that
+   * gives `channelId` alone names the one channel that id, or its
+   * server-qualified name (`serverId:channelId`), means; one that two
+   * servers' channels answer to names none, and the turn's speech has no
+   * channel of its own.
+   */
+  channelServerId?: string;
+  /**
+   * Framework-set: this wake carries an autoContinue continuation
+   * (AgentConfig.autoContinue), with what its `[continue]` row says. The
+   * scheduler keeps the mark on the turn's trigger only when the
+   * continuation is that turn's whole cause, and the turn writes the row as
+   * it starts. Hosts don't set it.
+   */
+  autoContinueRun?: AutoContinueRun;
   /**
    * True when the triggering message explicitly addressed the agent (mention,
    * reply-to-bot, DM — `chat:addressed` in MCPL RFC-001 terms). When a wake
@@ -418,6 +512,12 @@ export interface InferenceRequest {
   wakeChannelId?: string;
   /** Timestamp of the event the wake provenance was taken from (ms). */
   wakeAt?: number;
+  /** Batched-wake lines the gate handed to this wake rather than wrote
+   *  (WakeLine), decided by a fresh start of its turn as WakeLine says: each
+   *  written once into the window it names, or left for a later fresh start
+   *  of the same wake. A retry, or a start that resumes a logical turn,
+   *  decides none. */
+  wakeLines?: WakeLine[];
   /** Suppress every automatic plain-prose delivery for this logical turn.
    * Explicit tool calls remain available. Used by authenticated silent wakes. */
   suppressProse?: boolean;

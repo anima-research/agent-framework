@@ -64,10 +64,11 @@ wire cost (chars/4 plus a flat per-image cost) in `reserveForResponse`, so
 substituting them for the placeholders cannot push a restart's request past
 its budget.
 
-While a submitted batch is pending (or a recovery is running), streamed text
-and its `inference:tokens` trace events are held at one publication
+While a submitted batch is pending (or a recovery is running), the
+round's `inference:tokens` trace events are held at one publication
 boundary; they are released in order on a clean round and discarded on a
-guard refusal.
+guard refusal. The outgoing stream needs no hold: it carries only what
+delivery publishes, and a refused attempt publishes nothing.
 
 Normal successful rounds admit the preceding results to memory. This works
 for framework yielding streams (including ephemeral agents and context-budget
@@ -157,8 +158,10 @@ exchange, its unsubmitted payload is not admitted to memory.
 
 Each withheld result's original is written, as the result was stored (its
 text; for a result over the inline cap, its capped text, whose own note names
-the file with the whole output), to a file under the first writable mount's
-`tool-results/` directory, named
+the file with the whole output), to a file under the `tool-results/`
+directory of the first writable mount without an include that isn't
+configured direct (a direct mount's directory is a checkout, whether it runs
+direct or as 'chronicle'), named
 `<date>-withheld-<batch>-<index>-<toolUseId>.txt` with any character outside
 `A-Za-z0-9._-` replaced and the name cut to 80 characters. Its stub names it:
 
@@ -167,9 +170,9 @@ the file with the whole output), to a file under the first writable mount's
 
 Otherwise the stub names the guard's audit record, for an operator:
 
-- with no writable workspace, or once the framework is stopping: "Its result is
-  kept in the guard's audit record (framework/tool-result-guard), for an
-  operator.";
+- with no writable mount without an include that isn't configured direct, or once the framework is
+  stopping: "Its result is kept in the guard's audit record
+  (framework/tool-result-guard), for an operator.";
 - when the write failed: "Writing its result to workspace file … failed, so it
   is kept only in the guard's audit record …". The error itself stays in the
   audit record and the logs;
@@ -223,8 +226,8 @@ Two audit records describe it, each with `batchId`, `messageId` and
   `{ toolUseId, path }` is a written file; with `error`, a failed write; with
   `unfinished: true`, a write still under way at the deadline. `{ toolUseId,
   error }` is a write that threw. `{ toolUseId, skipped }` is no write:
-  `no_workspace_file` (no writable workspace, or the framework was stopping),
-  `workspace_unanswered` (an earlier write was still under way past its
+  `no_workspace_file` (no writable mount without an include that isn't configured direct, or the framework
+  was stopping), `workspace_unanswered` (an earlier write was still under way past its
   deadline), `batch_deadline` (the batch had no time left to start another write), or `branch_changed` (the workspace declined the write before its tree entry was set).
 
 The `annotated` record describes what each spill reported when the batch's annotation finished. An `unfinished` entry is not updated when the underlying write later settles.
@@ -242,7 +245,7 @@ Requests sent by the framework or the direct Agent inference API are compiled af
 
 Concurrent starts on one Agent, a direct inference call beside a framework-driven turn, are not made safe here: an Agent compiles its request while its status still reads idle (or ready), as before this change, and the wait for annotations lengthens that window, by up to the batch's deadline. `abortInference()` returns false during a direct call's initial assembly; a caller's own abort signal is checked before the request is sent, and again after the refusal retry's annotation wait. The direct API reads its unguarded tool results once, after the first compile, and sends the same ones with the refusal retry.
 
-At stop, the framework lets running annotations finish while the workspace is up. An annotation that starts after that drain writes no file and is saved before the store closes. A framework-driven turn that compiled across stop is discarded before its stream is driven, even if the same framework has since restarted. A `start()` after a finished `stop()` starts a new lifecycle, with the spill gate open again; a `start()` made while a `stop()` is still draining isn't a supported order. These lifecycle gates cover framework-driven turns; direct Agent calls use their caller's abort signal.
+At stop, the framework lets running annotations finish while the workspace is up. An annotation that starts after that drain writes no file and is saved before the store closes. A framework-driven turn that compiled across stop is discarded before its stream is driven, even if the same framework has since restarted. A `start()` after a finished `stop()` starts a new lifecycle, with the spill gate open again; a `start()` made while a `stop()` is still running is refused. These lifecycle gates cover framework-driven turns; direct Agent calls use their caller's abort signal.
 
 For example, an operator can inspect records without changing the agent's
 view:
@@ -271,9 +274,9 @@ retroactive and does not rewrite results already accepted into memory.
 - **Token stats.** The context manager's token-stats cache is not
   write-through on edit, so a stats read taken while a batch was pending can
   keep pricing that message as the placeholder.
-- **Held stream text on abort.** Text held while a submitted batch is
-  pending is dropped (not previewed) if the stream aborts or errors before
-  the round settles.
+- **Held token traces on abort.** `inference:tokens` traces held while a
+  submitted batch is pending are dropped (not previewed) if the stream
+  aborts or errors before the round settles.
 - **Withheld originals in the workspace.** Every reader of the mount can read
   a withheld original's file, and nothing removes it; delete it as any
   workspace file.

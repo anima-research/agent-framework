@@ -557,7 +557,7 @@ describe('held prose drafts, end to end', () => {
         createMockResponse([text('More of it.')]),
       ]);
       assert.deepEqual(h.drafts(), []);
-      assert.ok(h.texts().some((t) => t.startsWith('[delivered] nothing — 2 plain-speech segment(s) suppressed (proseRouting=disabled')));
+      assert.ok(h.texts().some((t) => t.startsWith('[delivered] plain speech → no channel — 2 plain-speech segment(s) kept in the transcript (proseRouting=disabled')));
     } finally {
       await h.close();
     }
@@ -1443,11 +1443,11 @@ describe('drafts resend ownership', () => {
         resolve: (o) => resolve({ destination: { serverId: 'discord', channelId }, at: Date.now(), ...(o as object) }),
       }));
     const stub: Record<string, unknown> = {
-      resolveProseTarget: (spec: string) => ({ channelId: spec }),
+      resolveProseTarget: (spec: string) => ({ serverId: 'discord', channelId: spec }),
       resolveDestination: ({ channelId }: { channelId: string }) => ({ destination: { serverId: 'discord', channelId } }),
       publish: (_agent: string, text: string, target: { channelId: string }) => held(text, target.channelId),
-      // An envelope's delivery, `{{unsent}}` included.
-      deliverSpeech: (_agent: string, text: string, channelId: string) => held(text, channelId),
+      // An envelope's delivery, `{{unsent}}` included, to the channel with its server.
+      deliverSpeech: (_agent: string, text: string, to: { channelId: string }) => held(text, to.channelId),
       getChannelTools: () => [],
     };
     (framework as unknown as { channelRegistry: unknown }).channelRegistry = new Proxy(stub, {
@@ -2022,8 +2022,8 @@ describe('held drafts: exact runs, hybrid envelopes beside a send, and turn-end 
         ['words for the room', `written for >>>${ROOM}`],
         ['more for the room', undefined],
       ]);
-      assert.equal((h.framework as unknown as { turnRouting: Map<string, { pin?: string }> }).turnRouting.get('scout')?.pin, ROOM,
-        'the named destination is the sticky target again, as live routing would leave it');
+      assert.deepEqual((h.framework as unknown as { turnRouting: Map<string, { pin?: unknown }> }).turnRouting.get('scout')?.pin,
+        { serverId: 'discord', channelId: ROOM }, 'the named destination, on its server, is the sticky target again, as live routing would leave it');
       assert.match(h.texts().find((t) => t.startsWith('[delivered]'))!, / · 3 plain-speech segment\(s\) kept private \(skip_reply or a private think\)$/);
 
       // A live `>>>skip_reply` in an earlier round binds a later silenced one.
@@ -2073,6 +2073,20 @@ describe('held drafts: exact runs, hybrid envelopes beside a send, and turn-end 
       assert.ok(h.drafts().every((d) => !d.text.includes('{{unsent}}')), 'no draft holds the literal token');
       assert.deepEqual(h.publishes().map((p) => p.text).filter((t) => t !== 'an explicit note elsewhere'), ['lost words'],
         'only the live {{unsent}} went out');
+    } finally {
+      await h.close();
+    }
+  });
+
+  it("hybrid: a draft a bare {{unsent}} delivers in its own turn is listed once in the receipt, as the plain speech it went out as", async () => {
+    const h = await harness({ agents: [{ name: 'scout', proseRouting: 'hybrid' }] });
+    try {
+      fixIds(h, ['d-unsent1']);
+      // Bounced, then sent by a bare {{unsent}} in the turn's next round.
+      await h.turn(rounds([text('>>>#nowhere lost words'), call('l1', 'channel_list', {})], [text(`>>>${ROOM} {{unsent}}`), call('l2', 'channel_list', {})]));
+      assert.deepEqual(h.publishes().map((p) => p.text), ['lost words']);
+      assert.equal(h.texts().filter((t) => t.startsWith('[delivered]')).at(-1),
+        `[delivered] plain speech → #room (Guild One) (${ROOM}) · draft d-unsent1 delivered by your {{unsent}}`);
     } finally {
       await h.close();
     }

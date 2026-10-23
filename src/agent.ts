@@ -3,7 +3,9 @@ import { isAbortedResponse } from '@animalabs/membrane';
 import { createHash } from 'node:crypto';
 import type { CacheWireReceipt, KvUnifiedRequestHooks } from './kv-unified-wire.js';
 import { ToolResultGuard } from './tool-result-guard.js';
-import { assertBooleanSetting, holdsSettings } from './config-checks.js';
+import { withoutTokenEstimates } from './thinking-token-stamp.js';
+import { injectionsAsStored } from './text-as-stored.js';
+import { assertBooleanSetting, holdsSettings, kindOf } from './config-checks.js';
 import {
   CONTINUE_ROW,
   continueTurn,
@@ -18,6 +20,7 @@ import {
   type StoredRowLike,
 } from './silent-heartbeat.js';
 import { randomUUID } from 'node:crypto';
+import { resolveClockConfig, type ResolvedClockConfig } from './clock-rows.js';
 import {
   nonErrorResultText,
   truncateForHistory,
@@ -30,6 +33,11 @@ export interface ActivationRequestOptions {
   /** A request that will never be sent (a preview): compile it as a dry
    *  run (see `compileWithInjections` for what that leaves alone). */
   dryRun?: boolean;
+  /** `false`: the caller retries this stream's failures itself, so membrane
+   *  sends a failed round once and hands the error up. The framework's turns
+   *  pass it (its errorPolicy is their retry layer); a direct caller of
+   *  startStream keeps membrane's retries. */
+  membraneRetries?: boolean;
 }
 
 export interface StartStreamResult {
@@ -56,6 +64,7 @@ import type {
 } from '@animalabs/context-manager';
 import type {
   AgentConfig,
+  AutoContinueConfig,
   AgentState,
   SameRoundThinkTextPolicy,
   SameRoundThinkTextPolicySource,
@@ -94,7 +103,8 @@ const DEFAULT_SAME_ROUND_THINK_TEXT_POLICY: SameRoundThinkTextPolicy = 'public';
  * `toolWrapperProseGuard`, `thinking.enabled` or `refusalHandling.autoRewind`
  * holds anything but true or false (assertBooleanSetting), or whose `thinking`
  * or `refusalHandling` is anything but an object, null or false
- * (holdsSettings). The constructor runs it first, so the rule holds wherever
+ * (holdsSettings), or whose `autoContinue` resolveAutoContinue refuses.
+ * The constructor runs it first, so the rule holds wherever
  * an Agent is built. `create()` also runs it for each of its agents before
  * anything opens, and `createEphemeralAgent` before it reserves the name, so a
  * refusal there leaves nothing behind. Membrane reads `thinking.enabled`, and
@@ -134,6 +144,45 @@ export function assertAgentSwitches(config: AgentConfig): void {
     'true keeps a response whose whole prose is a tool-call-shaped wrapper from running or entering the agent\'s history, ' +
       'and false or leaving it out doesn\'t',
   );
+  resolveAutoContinue(config);
+}
+
+/** `AutoContinueConfig.maxConsecutive` when left out. */
+export const DEFAULT_AUTO_CONTINUE_MAX = 3;
+/** The most continuations in a row a config may ask for. */
+const MAX_AUTO_CONTINUE_MAX = 20;
+
+/**
+ * `AgentConfig.autoContinue` resolved: undefined when off (left out, null or
+ * false), else its cap. `true` takes the default cap; an object takes
+ * `maxConsecutive`, a whole number from 1 to 20 (the default when left out).
+ * Any other value is refused.
+ */
+export function resolveAutoContinue(config: AgentConfig): { maxConsecutive: number } | undefined {
+  const setting = `Agent "${config.name}" autoContinue`;
+  const value: unknown = config.autoContinue;
+  if (value === true) return { maxConsecutive: DEFAULT_AUTO_CONTINUE_MAX };
+  if (value !== undefined && value !== null && value !== false && (typeof value !== 'object' || Array.isArray(value))) {
+    throw new Error(
+      `${setting} must be true, false or an object such as { maxConsecutive: 3 }, not ${kindOf(value)}` +
+        (typeof value === 'string' ? ' (true and false go unquoted)' : ''),
+    );
+  }
+  if (!holdsSettings(setting, value as AgentConfig['autoContinue'], '{ maxConsecutive: 3 }')) return undefined;
+  const max = (value as AutoContinueConfig).maxConsecutive;
+  if (max === undefined) return { maxConsecutive: DEFAULT_AUTO_CONTINUE_MAX };
+  if (typeof max !== 'number' || !Number.isInteger(max) || max < 1 || max > MAX_AUTO_CONTINUE_MAX) {
+    // The value's kind, never the value (config-checks): a `${VAR}` that
+    // lands here could be a credential.
+    const kind = typeof max !== 'number' ? kindOf(max)
+      : !Number.isInteger(max) ? 'a number that isn\'t whole'
+        : max < 1 ? 'a number below 1' : `a number above ${MAX_AUTO_CONTINUE_MAX}`;
+    throw new Error(
+      `${setting}.maxConsecutive must be a whole number from 1 to ${MAX_AUTO_CONTINUE_MAX}, not ${kind}: ` +
+        'the most turns in a row that continue without skip_reply before the agent waits for the next event',
+    );
+  }
+  return { maxConsecutive: max };
 }
 
 /**
@@ -166,6 +215,13 @@ export class Agent {
   readonly proseRouting: 'locus' | 'explicit' | 'hybrid' | 'disabled';
   /** Exact whole-response known-tool wrapper containment (default off). */
   readonly toolWrapperProseGuard: boolean;
+  /** Continuation after a turn the model ends itself (see
+   *  AgentConfig.autoContinue); undefined when off. */
+  readonly autoContinue: { maxConsecutive: number } | undefined;
+  /** Clock rows' interval and precision (see AgentConfig.clock); undefined
+   *  when the agent writes none of its own (a resident still reads those
+   *  another resident writes into the shared slot). */
+  readonly clock: ResolvedClockConfig | undefined;
   /** Prompt-cache TTL forwarded to the provider (see AgentConfig.cacheTtl). */
   readonly cacheTtl: NonNullable<AgentConfig['cacheTtl']>;
   /** Emit prompt-cache markers on requests (see AgentConfig.promptCaching). */
@@ -295,6 +351,8 @@ export class Agent {
     this.toolResultGuard = new ToolResultGuard(config.name, contextManager, config.toolResultGuard === true);
     this.proseRouting = config.proseRouting ?? 'locus';
     this.toolWrapperProseGuard = config.toolWrapperProseGuard === true;
+    this.autoContinue = resolveAutoContinue(config);
+    this.clock = resolveClockConfig(config.name, config.clock);
     this.cacheTtl = config.cacheTtl ?? '1h';
     this.promptCaching = config.promptCaching !== false;
     this.prefillUserMessage = config.prefillUserMessage;
@@ -923,28 +981,89 @@ export class Agent {
   }
 
   /**
-   * RFC-006 consumed watermark: the newest stored message at the last compile
-   * of a model request, or at the last tool boundary that injected messages
-   * into a live one, per branch. Everything above it has never been in a
-   * request and may still be replaced or withdrawn in place by its sender.
+   * RFC-006 consumed watermark, per branch: the newest stored message as of
+   * the latest of the agent's creation, a committing compile that returns,
+   * and a tool boundary that injected messages into a live stream declaring
+   * it carries them (`supportsInjectedMessages` true: membrane's native
+   * path, from membrane 0.6.0). A compile counts from when it takes its
+   * value, before it awaits, so one that began before a boundary's mark
+   * doesn't roll the mark back (applyCompileWatermark), and a dry run, such
+   * as previewActivation's, doesn't move it. Each move takes the store's
+   * head, a scalar, so it also covers stored messages the agent wasn't
+   * given, such as another slot's.
+   *
+   * A message above it may still be replaced or withdrawn in place by its
+   * sender, though it may already have been in one of the agent's requests.
+   * A live stream carries each round's own content and results, which it
+   * stores at its tool boundaries, into its next request. It can also carry
+   * the messages injected at a boundary whose stream didn't say whether it
+   * carries injections, as no membrane 0.5.x stream does: its native path
+   * carries them and its XML path drops them, and either way they stay
+   * above it.
    */
   private consumedWatermark: { branch: string; sequence: number } | null = null;
-  /** Counts marks: a compile writes its watermark back only if no mark was
-   *  made while it ran (a tool boundary's, or another compile's). */
+  /** Counts marks (markContextConsumed's and applyCompileWatermark's), so a
+   *  compile that finishes can tell whether one was made while it ran. */
   private watermarkMarks = 0;
+  /**
+   * The newest stored message a compile or a tool boundary may have put in
+   * front of the agent, per branch. It moves where the consumed watermark
+   * does, and sooner: when a committing compile takes its value, before it
+   * awaits, and at every tool boundary that injects, whether or not the
+   * stream says it carries injected messages. A message above it may still
+   * have been shown, though: for one, a live stream carries each round's own
+   * content and results, stored at a boundary that injected nothing, into its
+   * next request. A compile that throws assembled nothing, and gives its move
+   * back where it can (unshowFailedCompile). A scalar counts a prefix, so a
+   * message stored below it without having been shown counts as shown, which
+   * errs toward a marker.
+   */
+  private shownWatermark: { branch: string; sequence: number } | null = null;
 
   getConsumedWatermark(): { branch: string; sequence: number } | null {
     return this.consumedWatermark;
   }
 
+  getShownWatermark(): { branch: string; sequence: number } | null {
+    return this.shownWatermark;
+  }
+
   /** Mark everything currently stored as consumed (the agent's creation, at
-   *  boot or later, and a tool boundary that injected messages into the live
-   *  stream). */
+   *  boot or later, and a tool boundary that injected messages into a live
+   *  stream declaring it carries them; see consumedWatermark). */
   markContextConsumed(): void {
     // Tolerates partial context-manager doubles (tests build Agents over
-    // stubs): without a watermark nothing is ever treated as unread.
+    // stubs). Without a watermark, a reader that looks for one takes its own
+    // side: the coalescer counts the message as read, and the framework's
+    // deferredWriteReadOrGone and unreadNoticesForPrimary count it as unread.
     this.consumedWatermark = this.pendingWatermark();
     this.watermarkMarks++;
+    this.shownWatermark = this.consumedWatermark;
+  }
+
+  /** Mark everything currently stored as possibly shown (a tool boundary
+   *  that injected messages, whatever its stream says it carries). Without
+   *  a watermark the coalescer counts a message as shown, as it counts one
+   *  read without a consumed watermark. */
+  markContextShown(): void {
+    this.shownWatermark = this.pendingWatermark();
+  }
+
+  /** A committing compile that threw assembled nothing, so its own move of
+   *  the shown watermark goes back, unless a boundary or another compile has
+   *  moved the watermark since. It goes back to the watermark as the compile
+   *  found it, which can be another compile's claim that has failed as well.
+   *  Of two overlapping committing compiles, if the first to start throws
+   *  first, it gives nothing back (the second's claim is current), and if
+   *  the second then throws, it restores the first's failed claim. Messages
+   *  up to that claim then count as shown, although no request held those
+   *  above the watermark the first compile found, which errs toward a marker
+   *  until the next compile or boundary moves the watermark. */
+  private unshowFailedCompile(
+    watermark: { branch: string; sequence: number } | null,
+    before: { branch: string; sequence: number } | null,
+  ): void {
+    if (watermark && this.shownWatermark === watermark) this.shownWatermark = before;
   }
 
   /**
@@ -952,7 +1071,9 @@ export class Agent {
    * the watermark only advances: if a mark was made while the compile ran,
    * the compile's (older) one is applied only where it is later on that
    * mark's branch, so a boundary's mark is never rolled back by a compile
-   * that started before it (a preview during a live turn).
+   * that started before it (a committing compile, such as compileContext's,
+   * run during a live turn; a dry run, such as previewActivation's, never
+   * reaches here).
    */
   private applyCompileWatermark(watermark: { branch: string; sequence: number }, marksBefore: number): void {
     const current = this.consumedWatermark;
@@ -992,8 +1113,16 @@ export class Agent {
     // fails assembled nothing, so the watermark moves only on success.
     const watermark = this.pendingWatermark();
     const marksBefore = this.watermarkMarks;
+    const shownBefore = this.shownWatermark;
+    if (watermark) this.shownWatermark = watermark;
     const compile = () => this.contextManager.compile(this.compileBudget(budget));
-    const result = budget ? await compile() : await this.compileAtLiveBudget(compile);
+    let result: CompileResult;
+    try {
+      result = budget ? await compile() : await this.compileAtLiveBudget(compile);
+    } catch (error) {
+      this.unshowFailedCompile(watermark, shownBefore);
+      throw error;
+    }
     if (watermark) this.applyCompileWatermark(watermark, marksBefore);
     return result;
   }
@@ -1034,8 +1163,18 @@ export class Agent {
     // any compile before it selects.
     const watermark = opts?.dryRun ? null : this.pendingWatermark();
     const marksBefore = this.watermarkMarks;
+    // Shown from the compile's start: what it assembles is in front of the
+    // agent before the consumed watermark moves, once it returns.
+    const shownBefore = this.shownWatermark;
+    if (watermark) this.shownWatermark = watermark;
     const compile = () => this.contextManager.compile(this.compileBudget(budget), injections, opts as never);
-    const result = budget || opts?.dryRun ? await compile() : await this.compileAtLiveBudget(compile);
+    let result: CompileResult;
+    try {
+      result = budget || opts?.dryRun ? await compile() : await this.compileAtLiveBudget(compile);
+    } catch (error) {
+      this.unshowFailedCompile(watermark, shownBefore);
+      throw error;
+    }
     if (watermark) this.applyCompileWatermark(watermark, marksBefore);
     return result;
   }
@@ -1069,6 +1208,8 @@ export class Agent {
     if (this._state.status === 'inferring') {
       throw new Error(`Agent ${this.name} is already inferring`);
     }
+    // Unstored, so they leave for the request here (text-as-stored.ts).
+    injections = injectionsAsStored(injections);
 
     if (this._state.status === 'waiting_for_tools') {
       throw new Error(`Agent ${this.name} is waiting for tool results`);
@@ -1101,8 +1242,11 @@ export class Agent {
     // notice.
     let unguardedResults: ReturnType<Agent['buildToolResultMessages']> | undefined;
     const assemble = async (): Promise<NormalizedRequest> => {
-      const { messages, systemInjections } = await this.toolResultGuard.afterAnnotations(
+      const compiled = await this.toolResultGuard.afterAnnotations(
         () => this.compileWithInjections(budget, injections));
+      const { systemInjections } = compiled;
+      // The framework's own pricing stamp never goes out (thinking-token-stamp.ts).
+      const messages = withoutTokenEstimates(compiled.messages);
       // Read once, after the first compile, since results may have become
       // ready while it ran; the refusal retry, assembled while the agent is
       // inferring, sends the same ones.
@@ -1241,6 +1385,9 @@ export class Agent {
     compressionTools: ToolDefinition[] = availableTools,
     options: ActivationRequestOptions = {},
   ): Promise<{ request: NormalizedRequest; continuePrompt?: RequestOnlyPrompt }> {
+    // Unstored, so they leave for the request here (text-as-stored.ts), the
+    // layout hash below included.
+    injections = injectionsAsStored(injections);
     // Compression may revisit hidden tools in recorded history. Keep its full
     // definition set separate from the resident's advertised tools: the
     // autobiographical strategy must declare the same tools on its
@@ -1298,6 +1445,8 @@ export class Agent {
         ),
       }))
       .filter((m) => m.content.length > 0);
+    // The framework's own pricing stamp never goes out (thinking-token-stamp.ts).
+    messages = withoutTokenEstimates(messages);
 
     // Silent heartbeat ticks and replies to a [Continue] turn store no
     // prompt row. Render each request-only turn before its response's first
@@ -1496,6 +1645,12 @@ export class Agent {
       emitTokens: true,
       emitBlocks: false,
       emitUsage: true,
+      // A caller that retries itself (the framework's turns: errorPolicy,
+      // provider holds, stated waits, each attempt a fresh compile a stop can
+      // cancel) has membrane send a failed round once and hand the error up:
+      // since membrane 0.7 its own schedules, ten minutes at a 529, would
+      // otherwise run inside each of the caller's attempts, out of its sight.
+      ...(options.membraneRetries === false ? { retry: false } : {}),
       // Retry a content-policy refusal at the provider seam rather than at
       // the framework level: membrane replays the SAME request immediately
       // (cache-warm), where a framework-level requeue would recompile and
@@ -1613,19 +1768,40 @@ export class Agent {
    *  the only provenance a host-side cancel has. */
   private _pendingCancel: { reason?: string } | undefined;
 
+  /** The most recent cancelStream() made while this agent held no stream:
+   *  during a turn's hooks or compile, while it waits to retry, or while no
+   *  check of a turn is ahead at all. The framework collects it at the check
+   *  ahead of it, which ends the turn, and the next start drops one no check
+   *  collected, so a stop made while none was ahead, such as a host's
+   *  interrupt of every agent, ends nothing. */
+  private _stopWithoutStream: { reason?: string } | undefined;
+
   /**
    * Cancel the stream this agent's state holds (streaming, waiting on its
    * tools, or ready at a tool boundary with every result in), and reset to
-   * idle. `reason` is provenance for the framework's inference:aborted trace
-   * and marker metadata (e.g. 'zombie_reclaim', 'subagent_cancel'); it never
-   * reaches the provider.
+   * idle. With no stream, the stop is kept for the turn in progress, which
+   * the framework ends at its next check, before it sends anything more, if
+   * one is still ahead; otherwise the next start drops it. `reason` is
+   * provenance for the framework's inference:aborted trace and marker
+   * metadata (e.g. 'zombie_reclaim', 'subagent_cancel'); it never reaches
+   * the provider.
    */
   cancelStream(reason?: string): void {
     if ('stream' in this._state && this._state.stream) {
       this._pendingCancel = { reason };
       this._state.stream.cancel();
+    } else {
+      this._stopWithoutStream = { reason };
     }
     this._state = { status: 'idle' };
+  }
+
+  /** Collect (and clear) the cancelStream() made while this agent held no
+   *  stream, if one was made since the last collection. */
+  takeStopWithoutStream(): { reason?: string } | undefined {
+    const s = this._stopWithoutStream;
+    this._stopWithoutStream = undefined;
+    return s;
   }
 
   /** Collect (and clear) the cancel that ended the current stream, if this
@@ -1807,14 +1983,21 @@ export class Agent {
     // via buildStoredToolResultContent, with workspace spill). No workspace
     // is reachable from here, so the house default cap applies as plain
     // truncation — bounded beats unbounded, for errors too.
-    const content = results.map((r) => ({
-      type: 'tool_result' as const,
-      toolUseId: r.id,
-      content: r.result.isError
-        ? truncateForHistory(r.result.error ?? 'Unknown error', DEFAULT_TOOL_RESULT_INLINE_MAX_CHARS)
-        : nonErrorResultText(r.result, DEFAULT_TOOL_RESULT_INLINE_MAX_CHARS),
-      isError: r.result.isError,
-    }));
+    const content = results.map((r) => {
+      // This API's results are unchecked (nonErrorResultText), so each field
+      // is read once, and only an error that is a string is made well formed;
+      // any other error value is passed on as it was before.
+      const isError = r.result.isError;
+      const error: unknown = isError ? r.result.error ?? 'Unknown error' : undefined;
+      return {
+        type: 'tool_result' as const,
+        toolUseId: r.id,
+        content: isError
+          ? truncateForHistory(typeof error === 'string' ? error.toWellFormed() : error as string, DEFAULT_TOOL_RESULT_INLINE_MAX_CHARS)
+          : nonErrorResultText(r.result, DEFAULT_TOOL_RESULT_INLINE_MAX_CHARS),
+        isError,
+      };
+    });
 
     return [{
       participant: 'user',

@@ -27,6 +27,7 @@ import { heldWriteId } from './held-writes.js';
 import type { Agent } from './agent.js';
 import { DEFAULT_SHUTDOWN_TIMEOUT_MS, validateShutdownTimeout, waitForShutdown } from './shutdown.js';
 import { logValue } from './mcpl/log-value.js';
+import { toolArgsProblems } from './tool-args.js';
 
 /** How the registry queues a module's event: its push names the module. A
  * `ProcessQueue` serves too, ignoring the name. */
@@ -301,23 +302,30 @@ export class ModuleRegistry {
    * model. The result is checked and read once, in its JSON form
    * ({@link storableToolResult}).
    */
-  async storableToolCall(call: ToolCall): Promise<ToolResult> {
-    return storableToolResult(call, await this.handleToolCall(call));
+  async storableToolCall(call: ToolCall, options: { definition?: ToolDefinition } = {}): Promise<ToolResult> {
+    return storableToolResult(call, await this.handleToolCall(call, options));
   }
 
   /**
    * Handle a tool call by routing to the appropriate module: the module's own
    * result, unchecked, as it returned it, for a caller that uses the result
    * in process (`ModuleContext.callTool`, `executeToolCall`, or a host
-   * calling the registry). A module's throw is answered as an error result.
+   * calling the registry), less a refusal it claims (withoutRefusal). A
+   * module's throw is answered as an error result.
+   * A call whose input isn't an object, or lacks a key the tool's schema
+   * requires, is answered before the module runs, with an error result that
+   * opens "Nothing was done:" and names what to send (toolArgsProblems).
+   * A caller that has already resolved the tool's definition, as the `utils`
+   * tool has a utility's, passes it as `definition`, and it's checked against
+   * that one.
    */
-  async handleToolCall(call: ToolCall): Promise<ToolResult> {
+  async handleToolCall(call: ToolCall, options: { definition?: ToolDefinition } = {}): Promise<ToolResult> {
     // Parse module--tool name
     const sepIndex = call.name.indexOf('--');
     if (sepIndex === -1) {
       return {
         success: false,
-        error: `Invalid tool name format: ${call.name}`,
+        error: `Invalid tool name format: ${call.name}, so nothing was done`,
         isError: true,
       };
     }
@@ -329,22 +337,40 @@ export class ModuleRegistry {
     if (!module) {
       return {
         success: false,
-        error: `Module not found: ${moduleName}`,
+        error: `Module not found: ${moduleName}, so nothing was done`,
         isError: true,
       };
     }
 
-    // Create a call with the un-prefixed name (preserving caller identity and turn)
-    const moduleCall: ToolCall = {
-      id: call.id,
-      name: toolName,
-      input: call.input,
-      callerAgentName: call.callerAgentName,
-      ...(call.callerTurnId !== undefined ? { callerTurnId: call.callerTurnId } : {}),
-    };
+    // The call as it came, with the un-prefixed name: the caller's identity
+    // and everything else the dispatch set on it reach the module.
+    const moduleCall: ToolCall = { ...call, name: toolName };
 
     try {
-      return await module.handleToolCall(moduleCall);
+      // The call against the tool's declared schema, before the module runs:
+      // a missing required argument is refused with what to send, where the
+      // handler would otherwise fail deep inside, or run without it. Values
+      // aren't checked here, since a handler may take more than its schema
+      // can say (toolArgsProblems). The module's own listing runs inside the
+      // try, so its throw is answered like any other. Utilities are listed
+      // only for a name the tools don't have, so a utility listing that
+      // throws or is slow reaches only calls to such names: a utility called
+      // by its own name, and a name the module answers without declaring it.
+      // A caller that passes `definition` lists nothing.
+      const definition = options.definition
+        ?? module.getTools().find((tool) => tool.name === toolName)
+        ?? module.getUtilities?.()?.find((tool) => tool.name === toolName);
+      const problems = toolArgsProblems(call.input, definition?.inputSchema);
+      if (problems.length > 0) {
+        return {
+          success: false,
+          error: `Nothing was done: ${call.name} ${problems.join('; ')}.`,
+          isError: true,
+        };
+      }
+      // A refusal is the dispatcher's to say (RFC-007), so a module's result
+      // can't claim one on this route either.
+      return withoutRefusal(call, await module.handleToolCall(moduleCall));
     } catch (error) {
       return thrownResult(error);
     }
@@ -872,6 +898,83 @@ class ProcessStateImpl implements ProcessState {
   }
 }
 
+/** The fields ToolResult declares, read by name, so a result class's getters count: endTurn first and the error next, so a failure keeps them. */
+const TOOL_RESULT_FIELDS = ['endTurn', 'error', 'success', 'isError', 'data', 'structured', 'keepWhenWithheld'] as const;
+
+/**
+ * A module's result for an in-process caller: the module's own object, unless
+ * it claims a refusal, which is the dispatcher's to say (RFC-007). Then it's a
+ * copy, less the claim: a plain object of every field ToolResult declares,
+ * read by name, so a result class's getters count, each read once, and every
+ * other own enumerable field, string or symbol, as a spread takes them, so
+ * non-enumerable own fields and inherited undeclared ones are left out. A
+ * result that can't be read, its claim included, is a failure saying so, as
+ * on the stored route (checkedToolResult),
+ * keeping the turn's end and the module's error if those could be read: the
+ * module's call completed, and the claim never reaches the caller.
+ */
+function withoutRefusal(call: ToolCall, result: ToolResult): ToolResult {
+  // Not an object: nothing to claim, and the caller gets it as it came.
+  if (!result || (typeof result !== 'object' && typeof result !== 'function')) return result;
+  const source = result as unknown as Record<PropertyKey, unknown>;
+  const copy: Record<PropertyKey, unknown> = {};
+  // Each field is read once: one whose getter threw isn't asked again.
+  const read = new Set<PropertyKey>();
+  // Defined, not assigned, so a field named __proto__ is a field.
+  const keep = (key: PropertyKey): void => {
+    read.add(key);
+    Object.defineProperty(copy, key, { value: source[key], enumerable: true, writable: true, configurable: true });
+  };
+  const once = (key: string): unknown => {
+    if (key in copy) return copy[key];
+    if (read.has(key)) return undefined;
+    return source[key];
+  };
+  // A failure keeps what could be read of the turn's end and the module's
+  // error, each read on its own, whatever else couldn't be.
+  const unreadable = (error: unknown): ToolResult => {
+    let endTurn: unknown;
+    let own: string | undefined;
+    try {
+      endTurn = once('endTurn');
+    } catch {
+      // Not readable: the failure doesn't end the turn.
+    }
+    try {
+      own = errorText(once('error'));
+    } catch {
+      // An error whose own text can't be read: the failure says only why.
+    }
+    return {
+      success: false,
+      isError: true,
+      error: `Tool '${call.name}' returned a result that couldn't be read (${thrownText(error).split('\n')[0] || 'no reason given'}). ` +
+        `The call itself completed${own ? `, with this error: ${own}` : '.'}`,
+      ...(endTurn ? { endTurn: true } : {}),
+    };
+  };
+  let claim: unknown;
+  try {
+    claim = source.refused;
+  } catch (error) {
+    return unreadable(error);
+  }
+  if (!claim) return result;
+  try {
+    const copied = new Set<PropertyKey>(['refused']);
+    for (const key of TOOL_RESULT_FIELDS) {
+      copied.add(key);
+      if (key in source) keep(key);
+    }
+    for (const key of Reflect.ownKeys(source)) {
+      if (!copied.has(key) && Object.prototype.propertyIsEnumerable.call(source, key)) keep(key);
+    }
+    return copy as unknown as ToolResult;
+  } catch (error) {
+    return unreadable(error);
+  }
+}
+
 /** A result's flags, which consumers read for their truth: booleans here. */
 const RESULT_FLAGS = ['success', 'isError', 'endTurn'] as const;
 
@@ -893,7 +996,8 @@ const RESULT_FLAGS = ['success', 'isError', 'endTurn'] as const;
  * runs again. It's taken where the framework stores or sends a result
  * ({@link ModuleRegistry.storableToolCall}). A caller that uses the result
  * in process (`ModuleContext.callTool`, `executeToolCall`) gets the module's
- * own result, as the module returned it ({@link ModuleRegistry.handleToolCall}).
+ * own result, as the module returned it, less a refusal it claims
+ * ({@link ModuleRegistry.handleToolCall}).
  * The flags are booleans, read for their truth as consumers read them.
  * `error` is its text form, which is all a consumer reads of it, so an error
  * value JSON can't hold costs nothing. An error that says nothing (null,
@@ -949,6 +1053,9 @@ export function checkedToolResult(call: ToolCall, result: unknown): { result: To
     }
     // The error is kept as its text, which consumers read; its value isn't.
     delete fields.error;
+    // A refusal is the dispatcher's to say, before the call opens (RFC-007):
+    // a module answers after that, so its result can't claim one.
+    delete fields.refused;
     // The flags are kept as their truth, which is all consumers read of them,
     // before anything is serialized, so a flag's own value (a BigInt, a
     // function, an object with a toJSON) neither breaks nor runs anything.

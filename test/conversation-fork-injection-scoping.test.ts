@@ -14,14 +14,15 @@ import type {
   ToolDefinition,
   ToolResult,
 } from '../src/index.js';
-import { ChannelRegistry } from '../src/mcpl/channel-registry.js';
+import { ChannelRegistry, destinationKey, type ChannelRef } from '../src/mcpl/channel-registry.js';
+import { CapabilityGrant, ALL_CAPABILITY_PATHS } from '../src/mcpl/capability-grant.js';
 import { MockMembrane, createMockResponse } from './helpers/mock-membrane.js';
 
 const FORK_AGENT = 'conversation-chanA-g1';
 
 type FrameworkInternals = {
   channelRegistry: ChannelRegistry | null;
-  conversationAgentHomes: Map<string, string>;
+  conversationAgentHomes: Map<string, ChannelRef>;
   hookOrchestrator: {
     beforeInference(params: unknown): Promise<ContextInjection[]>;
     emitLifecycle(params: unknown): void;
@@ -77,10 +78,11 @@ function frameworkInternals(framework: AgentFramework): FrameworkInternals {
 function installChannelRegistry(
   framework: AgentFramework,
   channelIds: string[] = ['chanA', 'chanB'],
-): void {
+  servers: Record<string, unknown> = {},
+): ChannelRegistry {
   const internals = frameworkInternals(framework);
   const registry = new ChannelRegistry(
-    { getServer: () => null } as never,
+    { getServer: (id: string) => servers[id] ?? null } as never,
     {} as never,
     () => {},
     () => {},
@@ -91,7 +93,7 @@ function installChannelRegistry(
   for (const channelId of channelIds) {
     // §14.5: register first (a conforming server's channels/register),
     // then the incoming message marks the registered channel open.
-    (registry as unknown as { channels: Map<string, unknown> }).channels.set(`srv:${channelId}`, {
+    (registry as unknown as { channels: Map<string, unknown> }).channels.set(destinationKey({ serverId: 'srv', channelId }), {
       serverId: 'srv', descriptor: { id: channelId, type: 'srv', label: channelId }, open: false,
     });
     registry.handleIncoming('srv', {
@@ -105,10 +107,11 @@ function installChannelRegistry(
     });
   }
   internals.channelRegistry = registry;
+  return registry;
 }
 
 function bindForkHome(framework: AgentFramework, agentName = FORK_AGENT, channelId = 'chanA'): void {
-  frameworkInternals(framework).conversationAgentHomes.set(agentName, channelId);
+  frameworkInternals(framework).conversationAgentHomes.set(agentName, { serverId: 'srv', channelId });
 }
 
 function installHookInjections(framework: AgentFramework, injections: ContextInjection[]): void {
@@ -173,6 +176,9 @@ describe('conversation fork injection scoping', () => {
       systemInjection('module chanB context', 'chanB'),
       systemInjection('module retrieval context', 'retrieval'),
       systemInjection('module unnamespaced context'),
+      // A namespace that is a registered channel's server-qualified name, not
+      // its id: channel context is namespaced by id, so it's kept.
+      systemInjection('module qualified-name context', 'srv:chanB'),
     ], [FORK_AGENT]);
     installChannelRegistry(framework);
     bindForkHome(framework);
@@ -191,9 +197,34 @@ describe('conversation fork injection scoping', () => {
     assertOmits(system, 'module chanB context');
     assertContains(system, 'module retrieval context');
     assertContains(system, 'module unnamespaced context');
+    assertContains(system, 'module qualified-name context');
     assertContains(system, 'hook chanA context');
     assertOmits(system, 'hook chanB context');
     assertContains(system, 'hook retrieval context');
+  });
+
+  it('scopes by a namespace as given, so one holding a lone surrogate that names another channel stays out of the fork', async () => {
+    // The namespace is made well formed for the request only after scoping:
+    // channel ids are compared as given, and well formed first it would name
+    // no channel and reach every agent.
+    membrane.pushResponse(createMockResponse([]));
+    const other = 'chanB \ud83d';
+    const framework = await makeFramework([
+      systemInjection('module other context', other),
+      systemInjection('module home context', 'chanA'),
+    ], [FORK_AGENT]);
+    installChannelRegistry(framework, ['chanA', other]);
+    bindForkHome(framework);
+    installHookInjections(framework, [systemInjection('hook other context', other)]);
+
+    framework.pushEvent(triggerEvent());
+    await framework.runUntilIdle();
+
+    assert.equal(membrane.calls.length, 1);
+    const system = membrane.calls[0]!.system;
+    assertOmits(system, 'module other context');
+    assertOmits(system, 'hook other context');
+    assertContains(system, 'module home context');
   });
 
   it('passes module injections through for non-conversation agents', async () => {
@@ -232,6 +263,62 @@ describe('conversation fork injection scoping', () => {
     assertContains(request.system, 'preview hook chanA context');
     assertOmits(request.system, 'preview hook chanB context');
     assert.equal(membrane.calls.length, 0, 'previewActivation must not call the membrane');
+  });
+
+  it("scopes a channel known only from a push, on a server whose lifecycle this host directs, once its traffic shows it open", async () => {
+    const framework = await makeFramework([
+      systemInjection('preview module chanA context', 'chanA'),
+      systemInjection('preview module dm context', 'dm'),
+    ], []);
+    // The "dms" server's grant includes channels.lifecycle, so this host
+    // directs its channels' lifecycle.
+    const registry = installChannelRegistry(framework, ['chanA'], {
+      dms: { grant: new CapabilityGrant(new Set(ALL_CAPABILITY_PATHS), []) },
+    });
+    bindForkHome(framework);
+    registry.ensureChannelRegistered('dms', 'dm', 'DM with someone');
+    registry.enterTuneOut('dms', 'dm', {
+      epochId: 'e1', cadenceSeconds: 60, backlogCap: 20, maxWakes: 3, startedAtSequence: 1,
+    }, 'agent-tool');
+    await registry.handleIncoming('dms', {
+      messages: [{
+        channelId: 'dm',
+        messageId: 'dm-1',
+        author: { id: 'someone', name: 'someone' },
+        timestamp: new Date().toISOString(),
+        content: [{ type: 'text', text: 'hello' }],
+      }],
+    });
+
+    const request = await framework.previewActivation(FORK_AGENT, { injections: true });
+
+    assertContains(request.system, 'preview module chanA context');
+    assertOmits(request.system, 'preview module dm context');
+  });
+
+  it("keeps a closed or unconfirmed channel's injections with its own fork: a channel never opened, and channels whose server's transport closed", async () => {
+    const framework = await makeFramework([
+      systemInjection('preview module chanA context', 'chanA'),
+      systemInjection('preview module chanB context', 'chanB'),
+      systemInjection('preview module chanC context', 'chanC'),
+      systemInjection('preview module retrieval context', 'retrieval'),
+    ], []);
+    const registry = installChannelRegistry(framework);
+    // chanC is registered and was never opened.
+    (registry as unknown as { channels: Map<string, unknown> }).channels.set(destinationKey({ serverId: 'srv', channelId: 'chanC' }), {
+      serverId: 'srv', descriptor: { id: 'chanC', type: 'srv', label: 'chanC' }, open: false,
+    });
+    // The server's transport closes: chanA and chanB are unconfirmed now.
+    registry.transportClosed('srv');
+    assert.deepEqual(registry.getOpenChannels(), []);
+    bindForkHome(framework);
+
+    const request = await framework.previewActivation(FORK_AGENT, { injections: true });
+
+    assertContains(request.system, 'preview module chanA context');
+    assertOmits(request.system, 'preview module chanB context');
+    assertOmits(request.system, 'preview module chanC context');
+    assertContains(request.system, 'preview module retrieval context');
   });
 
   it('fails open when the channel registry is absent', async () => {

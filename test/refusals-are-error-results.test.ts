@@ -7,8 +7,10 @@
  * others as a tool that ran and answered (in XML tool mode, as the tool's
  * stdout), and channel_open's refusal showed it only its data, never the
  * sentence that says how to cancel the tune-out. A script's call gets each
- * refusal as "Error: <text>", and a module calling in process gets the
- * result flagged, with the tuned-out refusal's data kept.
+ * tool's refusal as a result with isError and the refusal's text, and a call
+ * the dispatcher refused before it opened as an Error (ToolResult.refused); a module
+ * calling in process gets the result flagged, with the tuned-out refusal's
+ * data kept.
  */
 import { test, type TestContext } from 'node:test';
 import assert from 'node:assert/strict';
@@ -18,6 +20,7 @@ import { join } from 'node:path';
 
 import { AgentFramework, ApiModule } from '../src/index.js';
 import type { Module, ModuleContext, ToolDefinition, ToolResult } from '../src/index.js';
+import { scriptCall } from './helpers/script-call.js';
 import { TUNE_OUT_DEFAULTS } from '../src/tune-out/coordinator.js';
 import { MockMembrane, createMockResponse } from './helpers/mock-membrane.js';
 
@@ -25,8 +28,9 @@ const FIXTURE = join(import.meta.dirname, 'fixtures/tune-out-mcpl-server.mjs');
 const CHANNEL = 'disc:guild:noisy';
 /** The api module's answer for a tool it doesn't have: it has none. */
 const API_UNKNOWN = 'There\'s no tool "api--lookup", so nothing ran. The api module has no tools of its own: every tool you can call is in your tool list.';
-const TUNED_OUT = `Channel ${CHANNEL} is tuned out. Cancel the tune-out (tune_out with mode: 'cancel') ` +
-  'to resume normal attention — cancelling delivers the diverted backlog.';
+const TUNED_OUT = `Channel "${CHANNEL}" is tuned out: its messages go to the subconscious, and channel_open doesn't change ` +
+  `that. Call tune_out with channelId "${CHANNEL}" and mode "cancel" for it to resume normal attention; cancelling ` +
+  'delivers the diverted backlog.';
 
 type SentResult = { toolUseId: string; content: unknown; isError: boolean };
 
@@ -188,25 +192,32 @@ test('a script, and a module calling in process, get the refusals as errors too'
   const { framework } = await setUp(t, false, [keeper]);
   // A script's call is answered through the event loop, so it has to run.
   framework.start();
-  const script = (tool: string, input: Record<string, unknown>) => (framework as unknown as {
-    handleScriptToolCall(agent: string, tool: string, args: Record<string, unknown>): Promise<string>;
-  }).handleScriptToolCall('scout', tool, input);
-  assert.equal(await script('tune_out', { channelId: 'disc:guild:none' }), 'Error: unknown channel: disc:guild:none');
-  assert.equal(await script('api--lookup', {}), `Error: ${API_UNKNOWN}`);
+  const script = (tool: string, input: Record<string, unknown>) => scriptCall(framework, 'scout', tool, input);
+  const failed = (text: string) => ({ refused: false, content: [{ type: 'text', text }], structuredContent: null, isError: true });
+  // A tool's own refusal reaches the script as a result flagged as an error.
+  assert.deepEqual(await script('tune_out', { channelId: 'disc:guild:none' }), failed('unknown channel: disc:guild:none'));
+  // A module's answer for a tool it doesn't have comes once the call has opened:
+  // a failure whose text says nothing ran, not a refusal.
+  assert.deepEqual(await script('api--lookup', {}), failed(API_UNKNOWN));
   // A control: the same tool's success still reads as one.
   const { cadenceSeconds, backlogCap, maxWakes } = TUNE_OUT_DEFAULTS;
-  assert.equal(
+  assert.deepEqual(
     await script('tune_out', { channelId: CHANNEL }),
-    JSON.stringify({ tunedOut: CHANNEL, cadenceSeconds, backlogCap, maxWakes }),
+    { refused: false, content: [{ type: 'text', text: JSON.stringify({ tunedOut: CHANNEL, cadenceSeconds, backlogCap, maxWakes }) }], structuredContent: null, isError: false },
   );
-  assert.equal(await script('channel_open', { channelId: CHANNEL }), `Error: ${TUNED_OUT}`);
+  assert.deepEqual(await script('channel_open', { channelId: CHANNEL }), failed(TUNED_OUT));
+  // A script can't start a script: refused before any dispatch.
+  assert.deepEqual(
+    await script('code_execution', { code: 'return 1;' }),
+    { refused: true, name: 'ToolRefused', message: 'code_execution cannot be called from within a script; nothing was done', tool: 'code_execution' },
+  );
   // A module gets the result as the registry returns it: flagged, with the
   // refusal's data kept, so it can still read why.
   assert.deepEqual(await keeper.ctx!.callTool({ id: 'ctx-open', name: 'channel_open', input: { channelId: CHANNEL } }), {
     success: false,
     isError: true,
     error: TUNED_OUT,
-    data: { refusal: 'tuned-out', channelId: CHANNEL },
+    data: { refusal: 'tuned-out', channelId: CHANNEL, serverId: 'disc' },
   });
   assert.deepEqual(
     await keeper.ctx!.callTool({ id: 'ctx-api', name: 'api--lookup', input: {} }),

@@ -223,12 +223,13 @@ export const EXPIRY_REASON = {
 export const UNBOUND_REASON = "not tied to any server, so there's nowhere to fetch it from";
 
 /** The fetcher's refusal for a server it has no address to dial, one the
- *  host doesn't connect to over a network, such as a stdio server; the
- *  fetcher dials only through a server's address. save_recent_image gives it
- *  too. A stub can't know it, since only the framework holds its servers'
+ *  host doesn't connect to over a network, such as a stdio server, as a
+ *  clause that completes "couldn't fetch <ref>: " and says so of the server;
+ *  the fetcher dials only through a server's address. save_recent_image gives
+ *  it too. A stub can't know it, since only the framework holds its servers'
  *  configs. */
 export function noAddressReason(serverId: string): string {
-  return `no address: this host doesn't connect to server ${serverId} over a network, so there's nowhere to fetch it from`;
+  return `this host doesn't connect to the "${serverId}" server over a network, so there's nowhere to fetch it from`;
 }
 
 /** Strip control characters (C0, DEL, C1) and every bidi control (marks,
@@ -433,7 +434,10 @@ export function unfetchableReason(record: ReferenceRecord, nowMs = Date.now()): 
 /**
  * RFC-005 treatment for one MCPL wire block, for the model-visible text
  * lanes. Returns a replacement string, or null when the block should keep
- * its existing (inline/text) handling.
+ * its existing (inline/text) handling. A reference's stub carries text taken
+ * from the block's own fields, so it's made well formed (a lone UTF-16
+ * surrogate becomes U+FFFD), as the context store would make it: a tool
+ * result's copies then carry the same text (#695).
  */
 export function referenceStubOrNull(block: unknown, provenance?: string, serverId?: string): string | null {
   const c = classifyBlock(block);
@@ -441,7 +445,67 @@ export function referenceStubOrNull(block: unknown, provenance?: string, serverI
     case 'text': return null;
     case 'inline':
       return c.contradiction ? INLINE_WITHHELD_TEXT : null;
-    case 'reference': return buildReferenceStub(c.testimony, provenance, serverId);
+    case 'reference': return buildReferenceStub(c.testimony, provenance, serverId).toWellFormed();
     case 'invalid': return c.shown;
+  }
+}
+
+/**
+ * RFC-005 treatment for one MCPL wire block, for a script's structured
+ * result, which carries blocks rather than text. It makes the decision
+ * referenceStubOrNull makes for the model's lanes, since what a script prints
+ * comes back to the model, except that a script reads every field, so inline
+ * data beside a uri of any type but null or absent is withheld, where the
+ * model's lanes, which show no uri, withhold it beside a string one. A reference becomes the stub's facts as data,
+ * without its URI: the host's reference id, what the server said about it in
+ * this block (its labels stripped and bounded as in the stub), and `savedTo`,
+ * the workspace path its payload was fetched to, or null when it wasn't
+ * (`fetch_reference` takes the id as `ref_id`). An unsaved reference that
+ * counts as expired also carries `expired`, the reason the stub gives in
+ * place of advising fetch_reference. The reference is registered bound to
+ * `serverId`, the server whose tool returned it, as the model's lanes bind
+ * a tool result's references, so the fetch its id offers can be made. With
+ * no `serverId`, as for a module's result, it's registered as the model's
+ * history registers a module's: the record its uri already has, bound where
+ * it arrived (a module's ctx.callTool registers an MCPL peer's references),
+ * or a new one bound to no server. A block the classifier
+ * rejects becomes the notice the model's lanes show, and inline data that
+ * also claims a bulk disposition, or a uri of any type but null or absent
+ * (an empty string included), the withheld notice, each as a text block.
+ * A text block, or inline data that claims nothing, is returned as sent.
+ */
+export function referenceBlockForScript(block: unknown, serverId?: string): unknown {
+  const c = classifyBlock(block);
+  switch (c.kind) {
+    case 'text': return block;
+    case 'inline': {
+      // A script reads every field, as history's JSON writes it, so inline
+      // data beside a uri of any type is withheld here, not only beside a
+      // string one as in the model's lanes, which show no uri: an object can
+      // carry a credential. An absent or null uri carries none; a string one,
+      // an empty one included, is already the classifier's contradiction.
+      const uri = (block as { uri?: unknown }).uri;
+      return c.contradiction || (uri !== undefined && uri !== null)
+        ? { type: 'text', text: INLINE_WITHHELD_TEXT }
+        : block;
+    }
+    case 'invalid': return { type: 'text', text: c.shown };
+    case 'reference': {
+      const t = c.testimony;
+      const record = referenceRegistry.register(t, serverId);
+      // As the stub judges it: a saved copy is still served.
+      const expiry = record.fetchedPath ? null : referenceExpiry(record.testimony);
+      return {
+        type: (block as { type: string }).type,
+        refId: record.refId,
+        ...(t.name !== undefined ? { name: sanitizeLabel(t.name, STUB_FIELD_CHARS) } : {}),
+        ...(t.mimeType !== undefined ? { mimeType: sanitizeLabel(t.mimeType, STUB_FIELD_CHARS) } : {}),
+        ...(t.sizeBytes !== undefined ? { sizeBytes: t.sizeBytes } : {}),
+        ...(t.digest !== undefined ? { digest: t.digest } : {}),
+        ...(t.expiresAt !== undefined ? { expiresAt: sanitizeLabel(t.expiresAt, STUB_FIELD_CHARS) } : {}),
+        savedTo: record.fetchedPath ?? null,
+        ...(expiry ? { expired: EXPIRY_REASON[expiry] } : {}),
+      };
+    }
   }
 }

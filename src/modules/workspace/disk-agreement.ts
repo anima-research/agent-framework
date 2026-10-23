@@ -181,6 +181,12 @@ export class DiskAgreement {
    * place owes none (recordWalk).
    */
   private unsynced = false;
+  /**
+   * Whether memory holds a whole state: false until a rebuild first runs to
+   * its end. A rebuild fills a new map and swaps it in only at its end, so
+   * one that throws partway leaves whatever whole state came before it.
+   */
+  private whole = false;
   /** Whether this host observes file modes (not on Windows): where it doesn't, no record it writes claims one. */
   private readonly modesObserved: () => boolean;
 
@@ -206,14 +212,22 @@ export class DiskAgreement {
    * recorded (the store may hold it where this process can't read it back),
    * and a decision from stale P can record what reopening contradicts, such
    * as a conflict that stays after the right evidence is back. So until the
-   * store is reopened, no evidence is read, written or checkpointed, and
-   * every pass and tool call that needs it fails.
+   * store is reopened, no evidence is read (but for rootIdentityForRead's
+   * one exception), written or checkpointed, and every pass and tool call
+   * that needs it fails. The same holds, the exception included, when the
+   * open's rebuild threw: there is no whole evidence to read.
    */
   ensureReconciled(): void {
     if (this.journal.needsReopen) {
       throw new Error(
         'Disk-agreement evidence is unavailable until the store is reopened, as at the next start: ' +
         'an append to its journal failed inside the store, and the evidence may lack what it recorded',
+      );
+    }
+    if (!this.whole) {
+      throw new Error(
+        'Disk-agreement evidence is unavailable until the store is reopened, as at the next start: ' +
+        'reading it back from the store failed',
       );
     }
     if (this.journal.needsReconcile) this.rebuild();
@@ -253,21 +267,48 @@ export class DiskAgreement {
       const mount = replayed.get(entry.mount);
       if (mount) apply(mount, entry);
     }
-    this.mounts.clear();
+    // Filled apart and swapped in at the end, so an append that throws here
+    // leaves memory as it was, whole, rather than with the mounts after it
+    // missing. Nothing reaches that today: only an open with a moved mount
+    // appends here, the workspace opens each agreement once, and after the
+    // open a rebuild finds every mount's record and appends none.
+    const rebuilt = new Map<string, MountEvidence>();
     for (const { name, root } of this.configured) {
       const found = replayed.get(name);
       if (found && sameRootPath(found.root, root)) {
-        this.mounts.set(name, found);
+        rebuilt.set(name, found);
       } else {
-        this.mounts.set(name, { root, paths: new Map(), walks: new Map() });
+        rebuilt.set(name, { root, paths: new Map(), walks: new Map() });
         this.journal.append({ t: 'mount', mount: name, root });
       }
     }
+    this.mounts.clear();
+    for (const [name, mount] of rebuilt) this.mounts.set(name, mount);
+    this.whole = true;
   }
 
   /** The identity of the root this mount's evidence was gathered under, once any was. */
   rootIdentity(mount: string): RootIdentity | undefined {
     this.ensureReconciled();
+    return this.mounts.get(mount)?.identity;
+  }
+
+  /**
+   * The identity a disk read checks the mount's root against: the one in
+   * memory once memory is whole, in every state of the journal, and an error
+   * until then. It is the last identity whose append succeeded, since write()
+   * appends before it applies, and no reconcile can change it, since root
+   * entries are written without a sync; were one made durable, its failed
+   * sync would leave the identity from before it: an old one, which refuses
+   * the new root, or none, as for a mount with no recorded identity. This
+   * is the one exception to ensureReconciled's "no evidence is read": the
+   * layer stops reading so that a decision from stale evidence can't record
+   * what reopening contradicts, and a read records nothing. Refusing reads
+   * instead would stop every host read of the workspace's disk until a
+   * restart.
+   */
+  rootIdentityForRead(mount: string): RootIdentity | undefined {
+    if (!this.whole) this.ensureReconciled(); // throws: there's no whole state to read
     return this.mounts.get(mount)?.identity;
   }
 

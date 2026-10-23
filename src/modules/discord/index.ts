@@ -8,7 +8,7 @@
  */
 
 import type { ContentBlock } from '@animalabs/membrane';
-import type { StoredMessage } from '@animalabs/context-manager';
+import { continuesBody, type StoredMessage } from '@animalabs/context-manager';
 import type {
   Module,
   ModuleContext,
@@ -322,19 +322,14 @@ function withoutGoneAttachments(content: ContentBlock[], attachments: readonly D
   return textFirst(first.text, kept);
 }
 
-/** The ids to remove for a message's rows: each row once, and a body stored
- *  in shards once, since removing one shard takes out its whole body. */
+/** The ids to remove for a message's rows, in store order: each row once,
+ *  and a body stored in shards once, by its first shard, since removing one
+ *  shard takes out its whole body. Which rows make up a body is
+ *  context-manager's rule (continuesBody), read pairwise: a group id names
+ *  the text, so a message stored twice in shards is two bodies under one id,
+ *  and each is removed. */
 function oncePerBody(rows: readonly StoredMessage[]): string[] {
-  const bodies = new Set<string>();
-  const ids: string[] = [];
-  for (const row of rows) {
-    if (row.bodyGroupId) {
-      if (bodies.has(row.bodyGroupId)) continue;
-      bodies.add(row.bodyGroupId);
-    }
-    ids.push(row.id);
-  }
-  return ids;
+  return rows.filter((row, i) => !continuesBody(rows[i - 1], row)).map((row) => row.id);
 }
 
 /** A live create on its way to the store (DiscordModule.creating). */
@@ -736,7 +731,8 @@ export class DiscordModule implements Module {
         case 'set_reply_context':
           return await this.handleSetReplyContext(call.input as SetReplyContextInput);
         case 'activate':
-          return await this.handleActivate(call.input as { additive?: boolean });
+          // A call with no input at all activates with the defaults.
+          return await this.handleActivate((call.input ?? {}) as { additive?: boolean });
         case 'deactivate':
           return await this.handleDeactivate();
         case 'list_guilds':

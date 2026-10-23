@@ -148,10 +148,10 @@ export async function eventually(predicate: () => boolean, what = 'condition'): 
 
 /**
  * Awaits `work`, failing with `what` if it hasn't settled within
- * REPLY_DEADLINE_MS. CI runs without a test timeout, so a wait that never
- * ends would hold the whole run, and this turns it into a failure that names
- * what was awaited. When it fires, the work it waited on keeps running, and
- * the test's close then runs under it.
+ * REPLY_DEADLINE_MS. Without it, a wait that never ends would run until a
+ * test timeout cut it off, which names nothing it waited on; this turns it
+ * into a failure that names what was awaited. When it fires, the work it
+ * waited on keeps running, and the test's close then runs under it.
  */
 export async function settles<T>(work: Promise<T>, what: string): Promise<T> {
   let timer: ReturnType<typeof setTimeout> | undefined;

@@ -1,18 +1,20 @@
 /**
  * An inbound message's envelope (#475): a request is a message with an id
  * member, whatever its value, so `"id": null` is a request and is answered
- * with id null, held and flushed or refused as any request is; a message
- * with an id and no method is a response, whatever the id's value, and so
- * is a JSON-RPC 2.0 error with no id, as MCP allows; a response is never
- * answered, and one whose id can't be matched is logged, during the
- * handshake too, except that an error with id null or none then answers
- * initialize, and the connect fails at once; any other object with neither
- * a method nor an id isn't JSON-RPC, so it's ignored, as a JSON value that
- * isn't an object is, a batch included. A message whose id isn't a string,
- * a number or null, or whose method isn't a string, with or without an id,
- * is answered once with -32600, carrying its id where that's a string or a
- * number and null otherwise, and isn't dispatched. Real connection routing
- * and response encoding, and stdio servers for the handshake.
+ * with id null, held and flushed or refused as any request is, and only on
+ * the transport it came on, an invalid one included; a message with an id
+ * and no method is a response, whatever the id's value, and so is a
+ * JSON-RPC 2.0 error with no id, as MCP allows; a response is never
+ * answered, and one whose id can't be matched is logged, its error
+ * redacted, during the handshake too, except that an error with id null or
+ * none then answers initialize, and the connect fails at once; any other
+ * object with neither a method nor an id isn't JSON-RPC, so it's ignored,
+ * as a JSON value that isn't an object is, a batch included. A message
+ * whose id isn't a string, a number or null, or whose method isn't a
+ * string, with or without an id, is answered once with -32600, carrying its
+ * id where that's a string or a number and null otherwise, and isn't
+ * dispatched. Real connection routing and response encoding, and stdio
+ * servers for the handshake.
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
@@ -20,6 +22,7 @@ import assert from 'node:assert/strict';
 import { McplServerConnection } from '../src/mcpl/server-connection.js';
 import { McplTransport } from '../src/mcpl/transport.js';
 import { CapabilityGrant, ALL_CAPABILITY_PATHS } from '../src/mcpl/capability-grant.js';
+import type { McplServerConfig } from '../src/mcpl/types.js';
 
 class ResponseTransport extends McplTransport {
   constructor() { super(); }
@@ -76,6 +79,40 @@ test('a request with id null held while the planes are paused is answered with i
   connection.ready();
   await new Promise((resolve) => setImmediate(resolve));
   assert.deepEqual(transport.lines.map((line) => JSON.parse(line)), [{ jsonrpc: '2.0', id: null, result: { channels: [] } }]);
+});
+
+test('a request with id null, or an invalid one, is answered only on the transport it came on', (t) => {
+  const { connection, transport, send, logged } = wire(t);
+  const incoming: Array<{ id: unknown; respond: (r: unknown) => void }> = [];
+  connection.on('channels-incoming', (_params: unknown, responder: { id: unknown; respond: (r: unknown) => void }) => {
+    incoming.push(responder);
+  });
+  // One the handler answers only after the transport it came on has closed.
+  send({ jsonrpc: '2.0', id: null, method: 'channels/incoming', params: { messages: [{ id: 'live-1' }] } });
+  assert.equal(incoming.length, 1);
+  // The transport's boundary passes, and the next transport serves.
+  (connection as unknown as { resetPolicyForTransportBoundary(): void }).resetPolicyForTransportBoundary();
+  const next = new ResponseTransport();
+  (connection as unknown as { transport: McplTransport }).transport = next;
+  incoming[0]!.respond({ ok: true });
+  // What the closed transport still sends: a world message, kept for the next
+  // grant, a request about its own process, dropped, and an invalid request.
+  send({ jsonrpc: '2.0', id: null, method: 'channels/incoming', params: { messages: [{ id: 'kept-1' }] } });
+  send({ jsonrpc: '2.0', id: null, method: 'channels/list', params: {} });
+  send({ jsonrpc: '2.0', id: {}, method: 'channels/list' });
+  connection.establishGrant(new CapabilityGrant(new Set(ALL_CAPABILITY_PATHS), []));
+  connection.ready();
+  assert.equal(incoming.length, 2, 'the kept message is admitted under the next grant');
+  assert.equal(incoming[1]!.id, null);
+  incoming[1]!.respond({ ok: true });
+  assert.deepEqual(next.lines, [], 'nothing is answered on the next transport');
+  assert.deepEqual(transport.lines, [], 'nor on the closed one');
+  assert.deepEqual(logged, [
+    '[mcpl] srv: not answering request null: the transport it came on has closed',
+    '[mcpl] srv: dropped a message read after its transport closed: method channels/list',
+    '[mcpl] srv: not answering request null: the transport it came on has closed, with error -32600 "Invalid Request: the id must be a string, a number or null, not an object"',
+    '[mcpl] srv: not answering request null: the transport it came on has closed',
+  ]);
 });
 
 test('a request with id null for an event the grant refuses gets the refusal, with id null', (t) => {
@@ -182,6 +219,18 @@ test('a message without a method is a response, whatever its id, and is never an
   assert.deepEqual(replies(), []);
 });
 
+test("an error that can't be matched is logged with a credential its server's configuration holds redacted", (t) => {
+  const { connection, send, logged } = wire(t);
+  const token = 'tok-0123456789abcdef';
+  (connection as unknown as { config: McplServerConfig }).config = { id: 'srv', command: 'server', env: { API_TOKEN: token } };
+  send({ jsonrpc: '2.0', id: null, error: { code: -32000, message: `bad token ${token}` } });
+  send({ jsonrpc: '2.0', error: `bad token ${token}` });
+  assert.deepEqual(logged, [
+    String.raw`[mcpl] srv: ignored a response whose id is null, which can't be matched to a request of ours; its error: "{\"code\":-32000,\"message\":\"bad\u0020token\u0020redacted\"}"`,
+    String.raw`[mcpl] srv: ignored a response with no id, which can't be matched to a request of ours; its error: "bad\u0020token\u0020redacted"`,
+  ]);
+});
+
 test("a null-id error while a request of the host's is pending leaves that request pending, and its own answer settles it", async (t) => {
   const { connection, transport, send, logged } = wire(t);
   const orphans: unknown[] = [];
@@ -269,6 +318,29 @@ test("during the handshake any other response that can't be matched is logged, o
       String.raw`[mcpl] unmatched: ignored a response whose id is null, which can't be matched to a request of ours; its error: "{\"code\":-32700,\"message\":\"Parse\u0020error\"}"`,
       String.raw`[mcpl] unmatched: ignored a response whose id is null, which can't be matched to a request of ours; its error: "db\u0020unavailable"`,
       "[mcpl] unmatched: ignored a response whose id is an object, which can't be matched to a request of ours; its error: boom",
+    ]);
+  } finally {
+    await connection.close();
+  }
+});
+
+test("during the handshake an error that can't be matched is logged with a credential its server's configuration holds redacted", async (t) => {
+  const logged: string[] = [];
+  t.mock.method(console, 'error', (...args: unknown[]) => { logged.push(args.map(String).join(' ')); });
+  const token = 'tok-0123456789abcdef';
+  // A log line of the server's own, with id null and an error, that doesn't
+  // say it's JSON-RPC, so it doesn't answer initialize; then the answer.
+  const server = initializeAnswers(
+    JSON.stringify({ level: 'error', id: null, error: `bad token ${token}` }),
+    JSON.stringify({ jsonrpc: '2.0', id: 'INIT', result: { protocolVersion: '2024-11-05', capabilities: { experimental: { mcpl: { version: '0.5' } } } } }),
+  );
+  const connection = await McplServerConnection.connect(
+    { id: 'unmatched', command: process.execPath, args: ['-e', server], requestTimeoutMs: 5_000, env: { API_TOKEN: token } },
+    { version: '0.5' },
+  );
+  try {
+    assert.deepEqual(logged.filter((entry) => entry.startsWith('[mcpl] unmatched: ignored a response')), [
+      String.raw`[mcpl] unmatched: ignored a response whose id is null, which can't be matched to a request of ours; its error: "bad\u0020token\u0020redacted"`,
     ]);
   } finally {
     await connection.close();

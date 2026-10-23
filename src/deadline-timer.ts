@@ -1,6 +1,6 @@
 /** The longest delay one setTimeout holds (2^31 - 1 ms, about 24.8 days).
  *  Node fires a longer one almost at once, with a TimeoutOverflowWarning. */
-const MAX_TIMER_MS = 2_147_483_647;
+export const MAX_TIMER_MS = 2_147_483_647;
 
 type Hold = (timer: ReturnType<typeof setTimeout>) => void;
 

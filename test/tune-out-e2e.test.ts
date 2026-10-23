@@ -211,4 +211,22 @@ describe('tune-out end to end', () => {
       'raw stamped originals stay view-excluded permanently',
     );
   });
+
+  it("a conversation is bound to a channel only on its own server, not another server's channel with the same id", () => {
+    // Channel ids are unique only within one MCPL server's connection.
+    const i = internals(framework);
+    const hooks = (i.tuneOutCoordinator as unknown as {
+      hooks: { isForkBound(channel: { serverId: string; channelId: string }): boolean };
+    }).hooks;
+    const homes = (framework as unknown as {
+      conversationAgentHomes: Map<string, { serverId: string; channelId: string }>;
+    }).conversationAgentHomes;
+    homes.set('fork-elsewhere', { serverId: 'other', channelId: CHANNEL });
+    try {
+      assert.equal(hooks.isForkBound({ serverId: 'disc', channelId: CHANNEL }), false, "disc's channel isn't the fork's");
+      assert.equal(hooks.isForkBound({ serverId: 'other', channelId: CHANNEL }), true);
+    } finally {
+      homes.delete('fork-elsewhere');
+    }
+  });
 });

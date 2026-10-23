@@ -1,9 +1,10 @@
 /**
  * A tool result's data never reaches the agent, or its history, with an
  * RFC-005 reference's uri, wherever in the data it sits: data that isn't a
- * content array of blocks the serializer recognizes is written as JSON with
- * each reference as its stub and inline data claiming a uri or a disposition
- * withheld. Everything else in it is written as JSON writes it, as before.
+ * string or a content array of blocks the serializer recognizes is written
+ * as JSON with each reference as its stub and inline data claiming a uri or
+ * a disposition withheld. Everything else in it is written as JSON writes
+ * it, as before.
  */
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
@@ -11,6 +12,7 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { AgentFramework } from '../src/index.js';
+import { answerText, scriptCall } from './helpers/script-call.js';
 import type { Module, ModuleContext, ToolCall, ToolResult, ToolDefinition } from '../src/types/index.js';
 import { nonErrorResultText, toolResultDataToHistoryString } from '../src/tool-result-history.js';
 import { parseImagePlaceholders } from '../src/tool-image-ledger.js';
@@ -306,16 +308,14 @@ describe('a model\'s call answered with such data', () => {
 });
 
 describe('a script given such data', () => {
-  type ScriptFramework = {
-    dispatchScriptToolCall: (...args: unknown[]) => Promise<ToolResult>;
-    handleScriptToolCall(agentName: string, toolName: string, args: Record<string, unknown>): Promise<string>;
-  };
+  type ScriptFramework = { dispatchScriptToolCall: (...args: unknown[]) => Promise<ToolResult> };
+  const script = async (fw: ScriptFramework) => answerText(await scriptCall(fw as unknown as AgentFramework, 'zz-agent', 'zz_tool', {}));
 
   it('gets the text history stores, with each reference as its stub and the rest as JSON writes it', async () => {
     const fw = Object.create(AgentFramework.prototype) as ScriptFramework;
     const shot = { type: 'image', data: BASE64, mimeType: 'image/png' };
     fw.dispatchScriptToolCall = async () => ({ success: true, data: { file: RESOURCE, shot, page: 2 } });
-    const text = await fw.handleScriptToolCall('zz-agent', 'zz_tool', {});
+    const text = await script(fw);
     assert.ok(!text.includes(SIGNATURE), text);
     const result = parsed(text) as { file: string; shot: unknown; page: number };
     assert.match(result.file, STUB);
@@ -331,12 +331,26 @@ describe('a script given such data', () => {
     console.error = (...args: unknown[]) => { logged.push(args.map(String).join(' ')); };
     let text: string;
     try {
-      text = await fw.handleScriptToolCall('zz-agent', 'zz_tool', {});
+      text = await script(fw);
     } finally {
       console.error = error;
     }
     assert.ok(!text.includes(SIGNATURE), text);
     assert.match(text, /^zz-text\n\[ref_[^\]]+\] zz\.pdf — application\/pdf — from tool result/);
-    assert.ok(logged.some((line) => /\[rfc005\] script-demand fetch of ref_\S+ failed: reference not tied to any server, so there's nowhere to fetch it from/.test(line)), logged.join('\n'));
+    assert.ok(logged.some((line) => /\[rfc005\] script-demand fetch of ref_\S+ failed: it's not tied to any server, so there's nowhere to fetch it from$/.test(line)), logged.join('\n'));
+  });
+
+  it("tries the fetch for a structured failure's references too, since the script reads its blocks", async () => {
+    const fw = Object.create(AgentFramework.prototype) as ScriptFramework;
+    fw.dispatchScriptToolCall = async () => ({ success: false, isError: true, error: 'partly failed', data: [{ type: 'text', text: 'zz-text' }, RESOURCE], structured: { partial: true } });
+    const logged: string[] = [];
+    const error = console.error;
+    console.error = (...args: unknown[]) => { logged.push(args.map(String).join(' ')); };
+    try {
+      await script(fw);
+    } finally {
+      console.error = error;
+    }
+    assert.ok(logged.some((line) => /\[rfc005\] script-demand fetch of ref_\S+ failed/.test(line)), logged.join('\n'));
   });
 });

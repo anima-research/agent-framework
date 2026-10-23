@@ -5,7 +5,10 @@
 // (`ambient <id> <text>` / `addressed <id> <text>`), the fixture polls the
 // file and sends a channels/incoming Request per line. Host-side
 // channels/acknowledge calls are recorded to STATUS_PATH as JSONL — the
-// test asserts the deterministic suppressed-mention reaction there.
+// test asserts the deterministic suppressed-mention reaction there. It keeps
+// its channel's lifecycle as a server does: channels/open and channels/close
+// are recorded there too, and while the host has the channel closed, a
+// commanded message isn't sent (recorded as withheld).
 import { appendFileSync, existsSync, readFileSync } from 'node:fs';
 import { createInterface } from 'node:readline';
 
@@ -22,6 +25,8 @@ const reply = (id, result) => send({ jsonrpc: '2.0', id, result });
 const CHANNEL_ID = 'disc:guild:noisy';
 let nextId = 500;
 let processedCommands = 0;
+// Registered initiallyOpen, so open until the host closes it.
+let open = true;
 
 function pollCommands() {
   if (!commandPath || !existsSync(commandPath)) return;
@@ -33,6 +38,10 @@ function pollCommands() {
     const tags = kind === 'addressed'
       ? ['chat:mention', 'chat:from-human']
       : ['chat:ambient', 'chat:from-human'];
+    if (!open) {
+      log('incoming-withheld', { kind, messageId });
+      continue;
+    }
     log('incoming-sent', { kind, messageId });
     send({
       jsonrpc: '2.0',
@@ -116,10 +125,13 @@ rl.on('line', (line) => {
   }
   if (msg.method === 'channels/open') {
     log('channel-opened', { channelId: msg.params?.channelId });
+    open = true;
     reply(msg.id, { opened: true });
     return;
   }
   if (msg.method === 'channels/close') {
+    log('channel-closed', { channelId: msg.params?.channelId });
+    open = false;
     reply(msg.id, { closed: true });
     return;
   }
