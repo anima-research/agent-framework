@@ -8,9 +8,10 @@
   continuation's turn, and an abandon ends the turn with the continuation
   dropped. A puppet tool call and a branch switch are refused in that
   stretch, as during any live turn.
-- A turn whose continuation is dropped now ends: by an abandon, `stop()`, the
-  inference policy, the agent's removal or a conversation agent's disposal.
-  It writes one `inference:aborted`, releases the EventGate window it held
-  for the continuation, closes its logical turn and stops its typing. A
-  provider hold left empty by the drop releases without queueing a retry
-  turn.
+- A turn whose continuation is dropped by an abandon, `stop()`, the
+  inference policy, the agent's removal or a conversation agent's disposal
+  now ends. It writes one `inference:aborted`, releases the EventGate window
+  it held for the continuation, closes its logical turn and stops its
+  typing, and the tool-result guard's pending batch is withheld from later
+  requests, as for a turn that ends before it sends anything. A provider
+  hold left empty by the drop releases without queueing a retry turn.

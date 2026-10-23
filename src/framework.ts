@@ -6493,20 +6493,22 @@ export class AgentFramework {
   }
 
   /**
-   * A continuation the framework queues for a turn (a budget restart, or a
-   * tool-result guard's retry) holds no turn token until its start takes one:
-   * its turn's stream has ended, and its start can wait in the queue, a
-   * provider hold, a park on admission or a scheduler pass's hands. Its turn
-   * is alive meanwhile. These are the agents with one on its way. A
+   * A continuation the framework makes for a turn (a budget restart's, which
+   * it queues, or a tool-result guard's retry, which its frame starts at
+   * once) holds no turn token until its start takes one. Once its turn's
+   * frame has let go of its token, its start can wait in the queue, a
+   * provider hold (a retry too, when a wait holds it), a park on admission
+   * or a scheduler pass's hands. Its turn is alive meanwhile. These are the
+   * agents with one on its way. A
    * `tool_results_ready` continuation comes only from the direct Agent API,
    * whose caller owns its turn's timing, so it isn't counted.
    */
-  private pendingContinuationAgents(except?: readonly InferenceRequest[]): Set<string> {
+  private pendingContinuationAgents(): Set<string> {
     const agents = new Set<string>();
-    const add = (r: InferenceRequest): void => {
-      if (resumesLogicalTurn(r.reason) && !except?.includes(r)) agents.add(r.agentName);
-    };
-    for (const r of this.pendingRequests) add(r);
+    const add = (r: InferenceRequest): void => { if (resumesLogicalTurn(r.reason)) agents.add(r.agentName); };
+    // Read defensively: a framework built from the prototype, as the
+    // operator tests build one, sets none of these.
+    for (const r of this.pendingRequests ?? []) add(r);
     for (const cooldown of this.providerAccelerationCooldowns?.values() ?? []) for (const r of cooldown.heldRequests) add(r);
     for (const r of this.parkedContinuations ?? []) add(r);
     for (const pass of this.passRequests ?? []) for (const requests of pass.values()) for (const r of requests) add(r);
@@ -6553,8 +6555,9 @@ export class AgentFramework {
   /**
    * Enter quiesce mode: write the deferred-write queue, persist the flag,
    * suppress gate deliveries, pause all MCPL data planes, and wait for
-   * in-flight turns to settle (turn-alive is `activeTurnTokens`, which spans
-   * dequeue → settled teardown). Idempotent, but for the queue's write, which
+   * in-flight turns to settle (turn-alive is a turn token, which spans
+   * dequeue → settled teardown, or a continuation of the turn on its way to
+   * its start: turnHolders). Idempotent, but for the queue's write, which
    * every call makes first: when the queue can't reach disk, because its
    * write fails or it's over the cap, the call rejects with a
    * QuiesceBlockedError and the host's mode as it was, unless it has
@@ -8793,6 +8796,9 @@ export class AgentFramework {
       this.activeTurnTokens.delete(agent.name);
       this.activeTurnTriggers.delete(agent.name);
       this.logicalTurnToolCalls.delete(agent);
+      // A continuation of its turn still on its way goes too: the run, and
+      // with it the turn, has ended above.
+      this.dropContinuations(agent.name, null);
     }
   }
 
@@ -12206,9 +12212,10 @@ export class AgentFramework {
             if (currentState.stream) this.frameworkCancelledStreams.set(`${agent.name}:${agent.streamId}`, 'shutdown');
             agent.cancelStream();
           } else if (overBudget || overPhysical) {
-            // The continuation is queued first, before the boundary's usage
-            // report and the restart's trace, so a listener that stops or
-            // quiesces the host on either finds the turn waiting for it.
+            // The continuation is queued, and the stream cancelled, before the
+            // boundary's usage report and the restart's trace, so a listener
+            // that stops or quiesces the host on either finds the turn waiting
+            // for its continuation, with nothing left of the stream to end.
             this.pendingRequests.push({
               agentName: agent.name,
               reason: 'context_budget_restart',
@@ -12224,13 +12231,11 @@ export class AgentFramework {
             // a terminal failure — rejecting an ephemeral's promise mid-run
             // and emitting a spurious inference:exhausted (same race shape as
             // endTurn above).
-            if (currentState.stream) {
-              this.frameworkCancelledStreams.set(`${agent.name}:${agent.streamId}`, 'budget_restart');
-              // Its rounds were billed; the restart opens a fresh stream
-              // with its own usage.
-              this.streamBoundaryEnds.get(currentState.stream)?.(overBudget ? 'context_budget' : 'physical_window');
-            }
+            if (currentState.stream) this.frameworkCancelledStreams.set(`${agent.name}:${agent.streamId}`, 'budget_restart');
             agent.cancelStream();
+            // Its rounds were billed; the restart opens a fresh stream with
+            // its own usage.
+            if (currentState.stream) this.streamBoundaryEnds.get(currentState.stream)?.(overBudget ? 'context_budget' : 'physical_window');
             this.emitTrace({
               type: 'inference:stream_restarted',
               agentName: agent.name,
@@ -14392,6 +14397,10 @@ export class AgentFramework {
     // Check each agent
     for (const [agentName, groupedRequests] of requestsByAgent) {
       let requests = groupedRequests;
+      // Taken up now: from here to its start's turn token (or its hold or
+      // park) nothing awaits, so the requests leave the pass's map, which
+      // shows only what the pass still holds while it awaits a start.
+      requestsByAgent.delete(agentName);
       // A drop while this pass awaited an earlier agent's start can have
       // taken every request of this agent's (dropContinuations).
       if (requests.length === 0) continue;
@@ -14501,10 +14510,9 @@ export class AgentFramework {
       }
 
       // Turn-alive includes a continuation of the agent's turn still on its
-      // way elsewhere (a park, another pass's hands), not among these
-      // requests: a fresh wake waits for it, as for a turn holding its token.
-      const turnAlive = !budgetRestart &&
-        (this.activeTurnTokens.has(agentName) || this.pendingContinuationAgents(requests).has(agentName));
+      // way elsewhere (a park, another pass's hands): a fresh wake waits for
+      // it, as for a turn holding its token.
+      const turnAlive = !budgetRestart && this.hasTurn(agentName);
       const providerGate = this.providerGates?.get(agentName);
       // A primary can own provider admission while yielding to an already in-flight
       // auxiliary call. Keep this agent's later wakes queued, but do not block the
@@ -17212,9 +17220,10 @@ export class AgentFramework {
    * it waits: the queue, a provider hold (which, left empty, then releases
    * with nothing to run), a park on admission (whose admission it gives
    * back), or a scheduler pass's hands (which then never reach it). If one
-   * was there, the turn ends (endContinuedTurn).
+   * was there, the turn ends (endContinuedTurn), unless `drop` is null: the
+   * caller has ended the turn already.
    */
-  private dropContinuations(agentName: string, drop: ContinuationDrop): void {
+  private dropContinuations(agentName: string, drop: ContinuationDrop | null): void {
     const isContinuation = (r: InferenceRequest): boolean => r.agentName === agentName && resumesLogicalTurn(r.reason);
     let dropped = false;
     const take = (requests: InferenceRequest[]): InferenceRequest[] => {
@@ -17242,7 +17251,7 @@ export class AgentFramework {
       requests.length = 0;
       requests.push(...left);
     }
-    if (!dropped) return;
+    if (!dropped || !drop) return;
     // A primary a provider hold left pending for what it released won't run
     // now, when nothing else of the agent's waits (endPendingPrimary).
     if (!this.pendingRequests.some((r) => r.agentName === agentName) && !this.providerAccelerationCooldowns.get(agentName)?.heldRequests.length) {

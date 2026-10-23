@@ -6,7 +6,9 @@
  * operator call that needs the agent idle wait for it, and an abandon or a
  * stop ends it with the continuation dropped. A provider wait stated while
  * the round's tool runs holds the continuation, which is what makes that
- * stretch long. Every path that drops the continuation ends the turn.
+ * stretch long. An abandon, stop(), the inference policy, the agent's
+ * removal and a conversation agent's disposal each drop the continuation and
+ * end the turn.
  */
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
@@ -38,7 +40,7 @@ interface Internals {
   providerWaits: { set(agent: string, model: string, ms: number, reason: string): unknown };
   providerAccelerationCooldowns: Map<string, { heldRequests: InferenceRequest[]; emptiedByDrop?: boolean }>;
   deferredMessages: unknown[];
-  passRequests: Set<Map<string, InferenceRequest[]>>;
+  processInferenceRequests(): Promise<void>;
   activeTurnTokens: Map<string, number>;
   providerAccelerationRecoveries: Map<string, unknown>;
   openLogical: Map<string, unknown>;
@@ -124,7 +126,7 @@ class RestartToolModule implements Module {
     if (event.type !== 'external-message') return {};
     return {
       addMessages: [{ participant: 'User', content: (event as { content: unknown }).content as never }],
-      requestInference: true,
+      requestInference: ['prime'],
     };
   }
 }
@@ -155,6 +157,9 @@ async function restartTurn(opts: {
   /** What to wait for before handing the framework to the test: the
    *  restart's trace unless given. */
   until?: (traces: TraceEvent[]) => boolean;
+  /** More agents and modules beside prime and its tool. */
+  extraAgents?: Array<{ name: string; model: string; systemPrompt: string }>;
+  extraModules?: Module[];
 }) {
   const tempDir = mkdtempSync(join(tmpdir(), 'turn-continuation-'));
   const membrane = new SequentialStreamMembrane([], (index, responses) =>
@@ -171,8 +176,8 @@ async function restartTurn(opts: {
     agents: [{
       name: 'prime', model: 'test-model', systemPrompt: 'You are prime.', allowedTools: 'all',
       maxTokens: 4_000, physicalWindowTokens: 200_000, ...(opts.toolResultGuard ? { toolResultGuard: true } : {}),
-    }],
-    modules: [module],
+    }, ...(opts.extraAgents ?? [])],
+    modules: [module, ...(opts.extraModules ?? [])],
     syncIntervalMs: 0,
     ...(opts.inferencePolicy ? { inferencePolicy: opts.inferencePolicy as never } : {}),
     ...(opts.gate ? { gate: { config: { policies: [], default: 'always' } } } : {}),
@@ -190,7 +195,15 @@ async function restartTurn(opts: {
   framework.pushEvent({
     type: 'external-message', source: 'test', content: [{ type: 'text', text: 'fetch it' }], metadata: {}, triggerInference: true,
   } as unknown as ProcessEvent);
-  await waitFor('the budget restart', () => (opts.until ?? ((t) => t.some((e) => e.type === 'inference:stream_restarted')))(traces));
+  try {
+    await waitFor('the budget restart', () => (opts.until ?? ((t) => t.some((e) => e.type === 'inference:stream_restarted')))(traces));
+  } catch (error) {
+    // A running framework would hold the file open past every test.
+    console.error = origError;
+    await framework.stop();
+    rmSync(tempDir, { recursive: true, force: true });
+    throw error;
+  }
   return {
     framework, membrane, traces, logged,
     endLines: () => logged.filter((l) => l.includes('[turn-continuation]')),
@@ -245,6 +258,44 @@ async function aPass(h: { framework: AgentFramework; logged: string[] }, label: 
   await waitFor(label, () => h.logged.filter((l) => l.includes('agent=nobody reason=agent_not_found')).length > before);
 }
 
+/**
+ * prime's continuation in a scheduler pass's hands: the pass took it from
+ * the queue behind alpha's wake, and awaits alpha's start, which waits in
+ * its context hook until `unblock`.
+ */
+async function passHoldingContinuation() {
+  let unblock!: () => void;
+  const blocked = new Promise<void>((r) => { unblock = r; });
+  let alphaWaiting = false;
+  const hook = {
+    name: 'hook',
+    async start() {},
+    async stop() {},
+    getTools: () => [],
+    async onProcess() { return {}; },
+    async gatherContext(agentName: string) {
+      if (agentName === 'alpha') { alphaWaiting = true; await blocked; }
+      return [];
+    },
+  } as unknown as Module;
+  const h = await restartTurn({
+    wait: true,
+    extraAgents: [{ name: 'alpha', model: 'test-model', systemPrompt: 'You are alpha.' }],
+    extraModules: [hook],
+  });
+  try {
+    await waitFor('the continuation to be held, its frame gone', () => heldForWait(h.framework) && frameLetGo(h.framework));
+    internals(h.framework).pendingRequests.push({ agentName: 'alpha', reason: 'timer', source: 'test', timestamp: Date.now() });
+    h.framework.releaseProviderWait('prime');
+    await waitFor("alpha's start to wait in its hook", () => alphaWaiting);
+  } catch (error) {
+    unblock();
+    await h.cleanup();
+    throw error;
+  }
+  return { h, unblock };
+}
+
 describe('a turn whose continuation is on its way', () => {
   it('is alive while a provider wait holds the continuation: listed, not drained, and a quiesce waits for it', async () => {
     const h = await restartTurn({ wait: true });
@@ -254,7 +305,10 @@ describe('a turn whose continuation is on its way', () => {
       assert.deepEqual(status.activeTurnAgents, ['prime'], 'the turn waiting for its continuation is listed');
       assert.equal(status.activeTurns, 1);
       assert.equal(status.drained, false, 'so the host is not drained');
+      const began = Date.now();
       const quiesced = await h.framework.quiesce({ timeoutMs: QUIESCE_MS });
+      // Its timeout, at the one-second floor (QUIESCE_TIMEOUT_MIN_MS).
+      assert.ok(Date.now() - began >= 950, `the drain waited for the continuation's turn until its timeout, not ${Date.now() - began} ms`);
       assert.equal(quiesced.drained, false, 'the drain waits for the continuation');
       assert.deepEqual(quiesced.activeTurnAgents, ['prime']);
       h.framework.releaseProviderWait('prime');
@@ -306,28 +360,93 @@ describe('a turn whose continuation is on its way', () => {
     }
   });
 
+  it("is alive while a scheduler pass holds the continuation, awaiting another agent's start", async () => {
+    const { h, unblock } = await passHoldingContinuation();
+    try {
+      assert.ok(frameLetGo(h.framework), 'prime holds no token');
+      assert.ok(!internals(h.framework).pendingRequests.some((r) => r.agentName === 'prime'), "prime's continuation is out of the queue, in the pass's hands");
+      assert.deepEqual(h.framework.getHostModeStatus().activeTurnAgents, ['alpha', 'prime'], "prime's turn is alive while the pass holds its continuation");
+      assert.equal(h.framework.getHostModeStatus().drained, false);
+      unblock();
+      await waitFor('both turns to end', () => h.framework.getHostModeStatus().drained);
+      assert.equal(h.membrane.calls.length, 3, "alpha's turn and prime's continuation each sent one request");
+    } finally {
+      unblock();
+      await h.cleanup();
+    }
+  });
+
   it("a fresh wake waits while the continuation is in another scheduler pass's hands", async () => {
-    const h = await restartTurn({ wait: true });
+    const { h, unblock } = await passHoldingContinuation();
     const internal = internals(h.framework);
-    const pass = new Map<string, InferenceRequest[]>();
+    try {
+      h.membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Woke.' }]));
+      internal.pendingRequests.push({ agentName: 'prime', reason: 'timer', source: 'test', timestamp: Date.now() });
+      // A second pass beside the first, as runUntilIdle() beside a started
+      // loop runs one.
+      await internal.processInferenceRequests();
+      assert.equal(h.membrane.calls.length, 1, 'the wake started no turn ahead of the continuation');
+      assert.ok(internal.pendingRequests.some((r) => r.agentName === 'prime' && r.reason === 'timer'), 'it waits in the queue');
+      unblock();
+      await waitFor('every turn to end', () => h.framework.getHostModeStatus().drained && !internal.pendingRequests.length);
+      assert.equal(h.membrane.calls.length, 4, "the wake's own turn followed the continuation's");
+    } finally {
+      unblock();
+      await h.cleanup();
+    }
+  });
+
+  it("an abandon takes the continuation from a scheduler pass's hands, and it never starts", async () => {
+    const { h, unblock } = await passHoldingContinuation();
+    try {
+      const quiesced = h.framework.quiesce({ timeoutMs: QUIESCE_MS, abandon: true });
+      await waitFor("the abandon to mark alpha's start", () => h.logged.some((l) => l.includes('abandoning in-flight turn for alpha')));
+      unblock();
+      const status = await quiesced;
+      assert.equal(status.drained, true);
+      await waitFor('every turn to end', () => h.framework.getHostModeStatus().activeTurns === 0);
+      await aPass(h, 'a pass after the abandon');
+      assert.equal(h.membrane.calls.length, 1, "prime's continuation never started, and alpha's abandoned start sent nothing");
+      assert.equal(abortReasons(h.traces).filter((r) => r === 'quiesce_abandoned').length, 2, "one inference:aborted for each abandoned turn");
+    } finally {
+      unblock();
+      await h.cleanup();
+    }
+  });
+
+  it("an abandon while the continuation's own start waits in a hook ends it at its check, and it sends nothing", async () => {
+    let unblock!: () => void;
+    const blocked = new Promise<void>((r) => { unblock = r; });
+    let armed = false;
+    let primeWaiting = false;
+    const hook = {
+      name: 'hook',
+      async start() {},
+      async stop() {},
+      getTools: () => [],
+      async onProcess() { return {}; },
+      async gatherContext(agentName: string) {
+        if (agentName === 'prime' && armed) { primeWaiting = true; await blocked; }
+        return [];
+      },
+    } as unknown as Module;
+    const h = await restartTurn({ wait: true, extraModules: [hook] });
     try {
       await waitFor('the continuation to be held, its frame gone', () => heldForWait(h.framework) && frameLetGo(h.framework));
-      // As a pass holds it while it awaits an earlier agent's start: out of
-      // the queue and every hold.
-      const hold = internal.providerAccelerationCooldowns.get('prime')!;
-      const continuation = hold.heldRequests.find((r) => r.reason === 'context_budget_restart')!;
-      hold.heldRequests = [];
-      hold.emptiedByDrop = true;
-      pass.set('prime', [continuation]);
-      internal.passRequests.add(pass);
+      armed = true;
       h.framework.releaseProviderWait('prime');
-      assert.deepEqual(h.framework.getHostModeStatus().activeTurnAgents, ['prime'], 'the continuation in hand keeps the turn alive');
-      internal.pendingRequests.push({ agentName: 'prime', reason: 'timer', source: 'test', timestamp: Date.now() });
-      await aPass(h, 'a pass with the wake');
-      assert.equal(h.membrane.calls.length, 1, 'the wake started no turn ahead of the continuation');
-      assert.ok(internal.pendingRequests.some((r) => r.reason === 'timer'), 'it waits in the queue');
+      await waitFor("the continuation's start to wait in its hook", () => primeWaiting);
+      assert.ok(!frameLetGo(h.framework), "the continuation's start holds the turn's token");
+      const quiesced = h.framework.quiesce({ timeoutMs: QUIESCE_MS, abandon: true });
+      await waitFor('the abandon to reach the turn', () => h.logged.some((l) => l.includes('[host-mode] abandoning') && l.includes('prime')));
+      unblock();
+      await quiesced;
+      await waitFor('the turn to end', () => h.framework.getHostModeStatus().activeTurns === 0);
+      await aPass(h, 'a pass after the abandon');
+      assert.equal(h.membrane.calls.length, 1, "the continuation's start sent nothing once abandoned");
+      assert.equal(abortReasons(h.traces).filter((r) => r === 'quiesce_abandoned').length, 1, "one inference:aborted, the abandon's");
     } finally {
-      internal.passRequests.delete(pass);
+      unblock();
       await h.cleanup();
     }
   });
@@ -403,6 +522,28 @@ describe('a turn whose continuation is dropped ends there', () => {
     try {
       await stopping;
       assert.ok(!internals(h.framework).pendingRequests.some((r) => r.reason === 'context_budget_restart'), 'the stop took the continuation out of the queue');
+      assert.equal(abortReasons(h.traces).filter((r) => r === 'shutdown').length, 1, "one inference:aborted, the stop's");
+      assert.equal(h.framework.getHostModeStatus().activeTurns, 0);
+      assert.equal(h.membrane.calls.length, 1, 'no continuation started');
+    } finally {
+      await h.cleanup();
+    }
+  });
+
+  it("a stop from a listener of the restart boundary's usage report ends the turn as shutdown, its stream cancelled", async () => {
+    let stopping: Promise<void> | undefined;
+    const h = await restartTurn({
+      wait: false,
+      onTrace: (framework, e) => {
+        if (e.type !== 'usage:updated' || stopping) return;
+        // The boundary's report, once the continuation is queued.
+        if (internals(framework).pendingRequests.some((r) => r.reason === 'context_budget_restart')) stopping = framework.stop();
+      },
+      until: () => stopping !== undefined,
+    });
+    try {
+      const stopped = await Promise.race([stopping!.then(() => true), sleep(10_000).then(() => false)]);
+      assert.equal(stopped, true, 'the stop finished: no stream was left running');
       assert.equal(abortReasons(h.traces).filter((r) => r === 'shutdown').length, 1, "one inference:aborted, the stop's");
       assert.equal(h.framework.getHostModeStatus().activeTurns, 0);
       assert.equal(h.membrane.calls.length, 1, 'no continuation started');
@@ -538,28 +679,6 @@ describe('a turn whose continuation is dropped ends there', () => {
       assert.equal(h.membrane.calls.length, 1, 'the continuation never started');
       assert.equal(gate.primaryDepth, 0, 'the woken park gave nothing back twice');
     } finally {
-      await h.cleanup();
-    }
-  });
-
-  it("an abandon of a continuation in a scheduler pass's hands takes it from them", async () => {
-    const h = await restartTurn({ wait: true });
-    const internal = internals(h.framework);
-    const pass = new Map<string, InferenceRequest[]>();
-    try {
-      await waitFor('the continuation to be held, its frame gone', () => heldForWait(h.framework) && frameLetGo(h.framework));
-      const hold = internal.providerAccelerationCooldowns.get('prime')!;
-      const continuation = hold.heldRequests.find((r) => r.reason === 'context_budget_restart')!;
-      hold.heldRequests = [];
-      hold.emptiedByDrop = true;
-      pass.set('prime', [continuation]);
-      internal.passRequests.add(pass);
-      const status = await h.framework.quiesce({ timeoutMs: QUIESCE_MS, abandon: true });
-      assert.equal(status.drained, true);
-      assert.deepEqual(pass.get('prime'), [], 'the pass will not reach it');
-      assert.equal(abortReasons(h.traces).filter((r) => r === 'quiesce_abandoned').length, 1, "one inference:aborted, the abandon's");
-    } finally {
-      internal.passRequests.delete(pass);
       await h.cleanup();
     }
   });
