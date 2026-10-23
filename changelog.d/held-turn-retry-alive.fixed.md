@@ -36,13 +36,23 @@
     tool-result guard's retry waits held or parked, where it reported
     nothing to stop and the turn ran once the hold ended: one
     `inference:aborted` with the stop's reason, and it returns `true`. Wakes
-    the hold keeps beside the retry still run, and a hold of such wakes
-    alone still has nothing to stop. From a listener of a failed stream's
+    that arrived meanwhile still run: those the hold keeps beside the retry,
+    and those merged into the retry's or the continuation's start before it
+    began, which the stop puts back in the queue. A hold of such wakes alone
+    still has nothing to stop. From a listener of a failed stream's
     `inference:failed` it reports `false`, as before (a turn's start that
     fails still takes a listener's stop at its own check): every failure
     site now reports `inference:failed` before a hold takes the turn's
     retry, where a stream that throws, and the hold a conversation agent's
-    compile meets, used to hold it first.
+    compile meets, used to hold it first;
+  - a quiesce with `abandon: true` puts back the wakes merged into a held
+    retry's or a continuation's start that hadn't begun, as a caller's stop
+    through `abortInference()` does: they park under the quiesce and run at
+    resume. Under a quiesce, a held retry starts alone, and the wakes merged
+    into its start before the quiesce park until resume. An abandon of a budget
+    restart's start merged with other wakes used to drop those wakes with
+    it, so their messages went unanswered until something else woke the
+    agent.
 
   A wake a hold keeps at admission, with no turn of its own begun, keeps no
   turn alive, as before.

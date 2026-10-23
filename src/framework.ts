@@ -1003,7 +1003,31 @@ function resumesLogicalTurn(reason: string | undefined): boolean {
  * copy it, as every copy of a request the scheduler makes is one.
  */
 const TURN_RETRY: unique symbol = Symbol('turn-retry');
-type MarkedRequest = InferenceRequest & { [TURN_RETRY]?: true };
+/**
+ * The batch a start that carries a turn on (continuesTurn) was merged from,
+ * when the scheduler merged wakes that aren't the turn's into it: every
+ * request it took in, as each was. Until the start takes its turn token it
+ * stands for them all. A scheduler pass that takes it back puts the batch in
+ * its place, each request with its own identity and flags; a quiesce at the
+ * auxiliary park sends the batch back to the scheduler; and a caller's stop
+ * or an abandon that drops the start puts back the batch's wakes, the
+ * requests that don't carry the turn on (dropContinuations), where they run
+ * as a turn of their own, as wakes queued while a turn streams do. Once the
+ * start takes its token the turn reads them, and beginAgentTurn drops the
+ * record. A symbol, as TURN_RETRY is, so spreads and rests copy it.
+ */
+const MERGED_BATCH: unique symbol = Symbol('merged-batch');
+type MarkedRequest = InferenceRequest & { [TURN_RETRY]?: true; [MERGED_BATCH]?: InferenceRequest[] };
+
+function mergedBatch(request: InferenceRequest): InferenceRequest[] | undefined {
+  return (request as MarkedRequest)[MERGED_BATCH];
+}
+
+/** The wakes of a merged start's batch (MERGED_BATCH): its requests that
+ *  don't carry the turn on. */
+function mergedWakes(request: InferenceRequest): InferenceRequest[] {
+  return (mergedBatch(request) ?? []).filter((r) => !continuesTurn(r));
+}
 
 function isTurnRetry(request: InferenceRequest): boolean {
   return (request as MarkedRequest)[TURN_RETRY] === true;
@@ -4728,8 +4752,15 @@ export class AgentFramework {
    *  already held marks that one, so the hold still keeps the turn alive. */
   private holdRequest(held: InferenceRequest[], request: InferenceRequest): void {
     const same = held.find((r) => this.sameInferenceRequest(r, request));
-    if (!same) held.push(request);
-    else if (isTurnRetry(request)) (same as MarkedRequest)[TURN_RETRY] = true;
+    if (!same) {
+      held.push(request);
+      return;
+    }
+    if (isTurnRetry(request)) (same as MarkedRequest)[TURN_RETRY] = true;
+    // A merged start's batch (MERGED_BATCH) stays recorded on the request
+    // kept in its place, which then stands for it, as the start did.
+    const batch = mergedBatch(request);
+    if (batch) (same as MarkedRequest)[MERGED_BATCH] = [...new Set([...(mergedBatch(same) ?? []), ...batch])];
   }
   private consultProviderHold(error: Error, agentName: string): { holdMs: number; reason: string } | undefined {
     if (!this.providerHoldHook) return undefined;
@@ -14231,6 +14262,19 @@ export class AgentFramework {
     for (const cooldown of this.providerAccelerationCooldowns.values()) {
       cooldown.heldRequests = cooldown.heldRequests.filter((r) => r.coalescingSubject !== subject);
     }
+    // A wake of the subject's merged into a start that carries a turn on
+    // (MERGED_BATCH) is withdrawn from the start's batch, so no stop puts
+    // it back and no pass unpacks it.
+    const unrecord = (r: InferenceRequest): void => {
+      const batch = mergedBatch(r);
+      if (batch?.some((w) => w.coalescingSubject === subject)) {
+        (r as MarkedRequest)[MERGED_BATCH] = batch.filter((w) => w.coalescingSubject !== subject);
+      }
+    };
+    for (const r of this.pendingRequests) unrecord(r);
+    for (const cooldown of this.providerAccelerationCooldowns.values()) cooldown.heldRequests.forEach(unrecord);
+    for (const r of this.parkedContinuations ?? []) unrecord(r);
+    for (const pass of this.passRequests ?? []) for (const requests of pass.values()) requests.forEach(unrecord);
   }
 
   /**
@@ -14637,6 +14681,17 @@ export class AgentFramework {
         if (recovery) recovery.releasedAt = now;
         requests = [...providerCooldown.heldRequests, ...requests];
       }
+      // A start that carries a turn on and came back before it took its
+      // token stands for the batch it was merged from (MERGED_BATCH),
+      // including one a hold released just now. The batch takes its place,
+      // each request as it was, judged one by one from here: a wait holds
+      // them apart, a quiesce parks the wakes while the turn's request
+      // passes, and the read check and the policy decide on them all; the
+      // merge below records the batch anew.
+      if (requests.some((r) => mergedBatch(r) !== undefined)) {
+        requests = requests.flatMap((r) => mergedBatch(r) ?? [r]);
+      }
+
       // A provider's stated wait on this agent's primary model, including one
       // recorded before a restart, holds the turn until it passes. An
       // ephemeral run records nothing, its name being single-use, so no wait,
@@ -14894,7 +14949,13 @@ export class AgentFramework {
       // A held turn's retry merged with other wakes leaves the start its
       // turn's retry (TURN_RETRY), whichever request leads the merge: held
       // again before it takes a token, it keeps the turn alive as before.
-      await this.startAgentStream(agent, requests.some(isTurnRetry) ? asTurnRetry(merged) : merged);
+      const start: MarkedRequest = requests.some(isTurnRetry) ? asTurnRetry(merged) : merged;
+      // A start that carries a turn on and took in wakes that don't records
+      // the batch it was merged from (MERGED_BATCH): until it takes its
+      // token it stands for them all.
+      if (continuesTurn(start) && requests.some((r) => !continuesTurn(r))) start[MERGED_BATCH] = [...requests];
+      else delete start[MERGED_BATCH];
+      await this.startAgentStream(agent, start);
     }
   }
 
@@ -17287,6 +17348,16 @@ export class AgentFramework {
             console.error(`[provider-admission] ${agent.name}: host quiesced while parked — wake requeued, not started`);
             return;
           }
+          // A start that stands for a merged batch (MERGED_BATCH) goes back
+          // to the scheduler as that batch: its gate lets the turn's request
+          // through alone and parks the wakes until resume.
+          const batch = trigger && mergedBatch(trigger);
+          if (this.quiesced && batch) {
+            this.releasePrimaryProviderGate(agent.name);
+            this.pendingRequests.push(...batch);
+            console.error(`[provider-admission] ${agent.name}: host quiesced while parked — the merged start goes back as its ${batch.length} requests`);
+            return;
+          }
           await this.startAgentStream(agent, trigger, attempt, true);
         }).catch((error) => {
           this.releasePrimaryProviderGate(agent.name);
@@ -17421,10 +17492,22 @@ export class AgentFramework {
    */
   private dropContinuations(agentName: string, drop: ContinuationDrop | null): void {
     const isContinuation = (r: InferenceRequest): boolean => r.agentName === agentName && continuesTurn(r);
+    // A caller's stop and an abandon end the turn, not the wakes merged into
+    // a start of it that hasn't taken its token (MERGED_BATCH): they go back
+    // in the queue. A stop() or a disposal ends the agent's work, and puts
+    // nothing back.
+    const putsBack = drop?.kind === 'caller' || drop?.kind === 'quiesce_abandoned';
+    const back: InferenceRequest[] = [];
     let dropped = false;
     const take = (requests: InferenceRequest[]): InferenceRequest[] => {
-      const left = requests.filter((r) => !isContinuation(r));
-      if (left.length < requests.length) dropped = true;
+      const left: InferenceRequest[] = [];
+      for (const r of requests) {
+        if (!isContinuation(r)) left.push(r);
+        else {
+          dropped = true;
+          if (putsBack) back.push(...mergedWakes(r));
+        }
+      }
       return left;
     };
     this.pendingRequests = take(this.pendingRequests);
@@ -17439,6 +17522,7 @@ export class AgentFramework {
       this.parkedContinuations.delete(parked);
       this.releasePrimaryProviderGate(agentName);
       dropped = true;
+      if (putsBack) back.push(...mergedWakes(parked));
     }
     for (const pass of this.passRequests) {
       const requests = pass.get(agentName);
@@ -17447,6 +17531,7 @@ export class AgentFramework {
       requests.length = 0;
       requests.push(...left);
     }
+    this.pendingRequests.push(...back);
     if (!dropped || !drop) return;
     // A primary a provider hold left pending for what it released won't run
     // now, when nothing else of the agent's waits (endPendingPrimary).
@@ -17758,6 +17843,12 @@ export class AgentFramework {
     if (trigger?.coalescingSubject !== undefined || trigger?.coalescingBatch || trigger?.readsDeferredWrite !== undefined) {
       const { coalescingSubject: _subject, coalescingBatch: _batch, coalescingBatchSubjects: _subjects, readsDeferredWrite: _read, ...retry } = trigger;
       trigger = retry;
+    }
+    // The wakes merged into this start are the turn's now: it reads them,
+    // so a later drop of its retry puts none of them back (MERGED_BATCH).
+    if (trigger && mergedBatch(trigger)) {
+      const { [MERGED_BATCH]: _batch, ...own } = trigger as MarkedRequest;
+      trigger = own;
     }
 
     // Record turn checkpoint before inference (only on first attempt, not retries)
@@ -18206,7 +18297,11 @@ export class AgentFramework {
         // The retry is its turn's (TURN_RETRY): this frame has begun the turn,
         // and once the retry's start is held at the last admission boundary
         // (a conversation agent's own compression can record a wait during
-        // the policy's delay), this frame lets go of its token.
+        // the policy's delay), this frame lets go of its token. No check of
+        // this start is ahead now, so its window closes first: a stop made
+        // once the retry is held finds the held retry (abortInference's
+        // drop), not a window nothing will collect.
+        if (this.checkAhead.get(agent) === checkWindow) this.checkAhead.delete(agent);
         await this.startAgentStream(agent, trigger && asTurnRetry(trigger), attempt + 1);
       } else {
         // Terminal failure with no driveStream: this frame owns teardown.

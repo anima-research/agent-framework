@@ -77,7 +77,7 @@ class ScriptedMembrane extends MockMembrane {
   }
 }
 
-type Request = { agentName: string; reason: string; source: string; timestamp: number };
+type Request = { agentName: string; reason: string; source: string; timestamp: number; coalescingSubject?: string; suppressProse?: boolean };
 type Internal = {
   withAuxiliaryAdmission<T>(agentName: string, run: () => Promise<T>, model?: string): Promise<T>;
   parkedContinuations: Set<unknown>;
@@ -397,7 +397,7 @@ test("a quiesced host's scheduler lets a released retry through, counts only the
   });
 });
 
-test("a held turn's retry merged behind another wake keeps its turn alive while it parks behind an auxiliary call, through a quiesce, and when a wait recorded meanwhile holds it again", async (t) => {
+test("a held turn's retry merged behind another wake keeps its turn alive while it parks behind an auxiliary call, through a quiesce, which sends it back as its batch, and when a wait recorded meanwhile holds them again", async (t) => {
   await withStoreDir(async (path) => {
     const clock = holdClock(t);
     const wait = 400;
@@ -426,8 +426,11 @@ test("a held turn's retry merged behind another wake keeps its turn alive while 
       internal.providerWaits.set('resident', 'zz-model', 60_000, 'zz later wait');
       gate.auxiliaryInFlight = 0;
       for (const resolve of gate.idleWaiters.splice(0)) resolve();
-      await waitFor(fw, () => internal.providerAccelerationCooldowns.has('resident'), 'held again at the last boundary');
-      assert.ok(!log.lines.some((line) => line.includes('host quiesced while parked')), 'the retry passed the quiesce at its park');
+      await waitFor(fw, () => internal.providerAccelerationCooldowns.has('resident'), 'held again');
+      // The quiesce sent the merged start back to the scheduler as its batch,
+      // and the wait recorded meanwhile holds the two apart.
+      assert.ok(log.lines.some((line) => line.includes('the merged start goes back as its 2 requests')), 'the merged start went back as its batch');
+      assert.equal(internal.providerAccelerationCooldowns.get('resident')?.heldRequests.length, 2, 'the retry and the wake held apart');
       assert.equal(membrane.primary, 2);
       assert.deepEqual(fw.getHostModeStatus().activeTurnAgents, ['resident'], 'alive while held again');
     } finally { await fw.stop(); log.restore(); }
@@ -985,6 +988,372 @@ test("a wait released by a listener of the inference:failed a conversation agent
       void internal.startAgentStream(agent, { agentName: 'resident', reason: 'conversation', source: 'test', timestamp: Date.now() });
       await waitFor(fw, () => membrane.primary >= 2, 'the retry, sent at once');
       assert.equal(internal.providerAccelerationCooldowns.has('resident'), false, 'nothing held');
+    } finally { await fw.stop(); log.restore(); }
+  });
+});
+
+/** A held turn with a wake beside its retry, released so the two merge into
+ *  one start, which parks behind an auxiliary call or is held again at the
+ *  last admission boundary by a wait recorded meanwhile. */
+async function mergedStartWaiting(fw: AgentFramework, internal: Internal, membrane: ScriptedMembrane, clock: { advance(ms: number): void; pass(ms: number): void }, wait: number, how: 'parked' | 'held again') {
+  await heldTurn(fw, internal, membrane);
+  clock.advance(1);
+  fw.pushEvent({ type: 'external-message', source: 'test', content: 'zz-during the hold', metadata: {} });
+  await fw.runUntilIdle();
+  assert.equal(internal.providerAccelerationCooldowns.get('resident')?.heldRequests.length, 2, 'the hold keeps the retry and the wake');
+  const gate = internal.providerGate('resident');
+  gate.auxiliaryInFlight = 1;
+  clock.pass(wait);
+  internal.releaseProviderAccelerationCooldown('resident');
+  await fw.runUntilIdle();
+  assert.equal(membrane.primary, 2, 'nothing sent');
+  assert.equal(internal.parkedContinuations.size, 1, 'the merged start parks');
+  if (how === 'held again') {
+    // A wait recorded while it parks holds it at the last admission
+    // boundary once the park ends. (One recorded before the release would
+    // hold the retry and the wake apart, at admission, unmerged.)
+    internal.providerWaits.set('resident', 'zz-model', 60_000, 'zz later wait');
+    gate.auxiliaryInFlight = 0;
+    for (const resolve of gate.idleWaiters.splice(0)) resolve();
+    await waitFor(fw, () => internal.providerAccelerationCooldowns.get('resident')?.heldRequests.length === 1, 'the merged start held again');
+    assert.equal(membrane.primary, 2);
+  }
+  return () => {
+    if (how === 'parked') {
+      gate.auxiliaryInFlight = 0;
+      for (const resolve of gate.idleWaiters.splice(0)) resolve();
+    } else fw.releaseProviderWait('resident');
+  };
+}
+
+for (const how of ['parked', 'held again'] as const) test(`a wake merged into a held turn's released retry still runs after abortInference() ends the turn while the merged start is ${how}`, async (t) => {
+  await withStoreDir(async (path) => {
+    const clock = holdClock(t);
+    const wait = 400;
+    const log = silence();
+    const membrane = new ScriptedMembrane(new Set([2]), (request) => rateLimited(wait, request));
+    const { fw, internal } = await framework(path, membrane);
+    const aborted: Array<string | undefined> = [];
+    fw.onTrace((event) => { if (event.type === 'inference:aborted' && event.agentName === 'resident') aborted.push(event.reason); });
+    try {
+      const go = await mergedStartWaiting(fw, internal, membrane, clock, wait, how);
+      assert.equal(fw.abortInference('resident', 'zz-operator stop'), true);
+      assert.deepEqual(aborted, ['zz-operator stop'], 'the turn ends once');
+      assert.deepEqual(fw.getHostModeStatus().activeTurnAgents, [], 'the wake put back keeps no turn alive');
+      go();
+      await waitFor(fw, () => membrane.primary >= 3, 'the wake, as a turn of its own');
+      assert.match(texts(membrane.calls[2]), /zz-during the hold/);
+      assert.deepEqual(aborted, ['zz-operator stop']);
+    } finally { await fw.stop(); log.restore(); }
+  });
+});
+
+test("a quiesce with abandon puts back the wakes merged into a held turn's parked retry: they park under the quiesce and run at resume", async (t) => {
+  await withStoreDir(async (path) => {
+    const clock = holdClock(t);
+    const wait = 400;
+    const log = silence();
+    const membrane = new ScriptedMembrane(new Set([2]), (request) => rateLimited(wait, request));
+    const { fw, internal } = await framework(path, membrane);
+    const aborted: Array<string | undefined> = [];
+    fw.onTrace((event) => { if (event.type === 'inference:aborted' && event.agentName === 'resident') aborted.push(event.reason); });
+    try {
+      const go = await mergedStartWaiting(fw, internal, membrane, clock, wait, 'parked');
+      // Under the held clock a drain wait never runs out: the abandon comes
+      // from a second quiesce, on a host already quiesced.
+      const first = fw.quiesce({ timeoutMs: 50 });
+      await waitFor(fw, () => fw.getHostModeStatus().quiesced, 'the quiesce');
+      const second = await fw.quiesce({ abandon: true });
+      assert.equal(second.drained, true);
+      assert.deepEqual(aborted, ['quiesce_abandoned'], 'the turn ends once');
+      assert.equal((await first).drained, true);
+      go();
+      await fw.runUntilIdle();
+      assert.equal(membrane.primary, 2, 'the wake parks under the quiesce');
+      assert.equal(fw.getHostModeStatus().gatedRequests, 1, 'counted as parked');
+      await fw.resume();
+      await waitFor(fw, () => membrane.primary >= 3, 'the wake at resume');
+      assert.match(texts(membrane.calls[2]), /zz-during the hold/);
+    } finally { await fw.stop(); log.restore(); }
+  });
+});
+
+test("a merged start merged again keeps every wake merged into it: abortInference() puts both back", async (t) => {
+  await withStoreDir(async (path) => {
+    const clock = holdClock(t);
+    const wait = 400;
+    const log = silence();
+    const membrane = new ScriptedMembrane(new Set([2]), (request) => rateLimited(wait, request));
+    const { fw, internal } = await framework(path, membrane);
+    try {
+      await mergedStartWaiting(fw, internal, membrane, clock, wait, 'held again');
+      // A second wake joins the held merged start; lifting the wait releases
+      // both, and the pass merges them again into a start that parks.
+      clock.advance(1);
+      fw.pushEvent({ type: 'external-message', source: 'test', content: 'zz-later', metadata: {} });
+      await fw.runUntilIdle();
+      assert.equal(internal.providerAccelerationCooldowns.get('resident')?.heldRequests.length, 2);
+      const gate = internal.providerGate('resident');
+      gate.auxiliaryInFlight = 1;
+      fw.releaseProviderWait('resident');
+      await waitFor(fw, () => internal.parkedContinuations.size === 1, 'merged again, parked');
+      assert.equal(fw.abortInference('resident', 'zz-operator stop'), true);
+      assert.equal(internal.pendingRequests.filter((r) => r.agentName === 'resident').length, 2, 'both wakes put back');
+      gate.auxiliaryInFlight = 0;
+      for (const resolve of gate.idleWaiters.splice(0)) resolve();
+      await waitFor(fw, () => membrane.primary >= 3, 'the wakes, as a turn of their own');
+    } finally { await fw.stop(); log.restore(); }
+  });
+});
+
+test("the inference policy judges the wakes a merged start that came back before its token carries: they are in the batch it decides on", async (t) => {
+  await withStoreDir(async (path) => {
+    const clock = holdClock(t);
+    const wait = 400;
+    const log = silence();
+    let refuse = false;
+    const seen: number[] = [];
+    const membrane = new ScriptedMembrane(new Set([2]), (request) => rateLimited(wait, request));
+    const { fw, internal } = await framework(path, membrane, {
+      inferencePolicy: { shouldInfer: (_agent: string, requests: unknown[]) => { if (refuse) seen.push(requests.length); return !refuse; } },
+    });
+    try {
+      const go = await mergedStartWaiting(fw, internal, membrane, clock, wait, 'held again');
+      refuse = true;
+      go();
+      await waitFor(fw, () => seen.length > 0, 'the policy, deciding on the start that came back');
+      assert.deepEqual(seen, [2], 'the retry and the wake merged into its start');
+      assert.deepEqual(fw.getHostModeStatus().activeTurnAgents, [], 'the policy dropped them with the turn');
+    } finally { await fw.stop(); log.restore(); }
+  });
+});
+
+for (const how of ['parked', 'held again'] as const) test(`under a quiesce, a held turn's merged start ${how === 'parked' ? 'that parked' : 'held again'} goes on alone: the wakes merged into it park, and run at resume`, async (t) => {
+  await withStoreDir(async (path) => {
+    const clock = holdClock(t);
+    const wait = 400;
+    const log = silence();
+    const membrane = new ScriptedMembrane(new Set([2]), (request) => rateLimited(wait, request));
+    const { fw, internal } = await framework(path, membrane);
+    try {
+      const go = await mergedStartWaiting(fw, internal, membrane, clock, wait, how);
+      const quiesce = fw.quiesce({ timeoutMs: 1_000 });
+      await waitFor(fw, () => fw.getHostModeStatus().quiesced, 'the quiesce');
+      go();
+      await waitFor(fw, () => membrane.primary >= 3, 'the retry, through the quiesce');
+      assert.equal((await quiesce).drained, true, 'the retry finished its turn');
+      await fw.runUntilIdle();
+      assert.equal(fw.getHostModeStatus().gatedRequests, 1, 'the wake merged into it parks');
+      assert.equal(membrane.primary, 3);
+      await fw.resume();
+      await waitFor(fw, () => membrane.primary >= 4, 'the wake at resume');
+    } finally { await fw.stop(); log.restore(); }
+  });
+});
+
+test("stop() ends a turn whose merged start is parked, and puts none of the wakes merged into it back", async (t) => {
+  await withStoreDir(async (path) => {
+    const clock = holdClock(t);
+    const wait = 400;
+    const log = silence();
+    const membrane = new ScriptedMembrane(new Set([2]), (request) => rateLimited(wait, request));
+    const { fw, internal } = await framework(path, membrane);
+    let stopped = false;
+    try {
+      await mergedStartWaiting(fw, internal, membrane, clock, wait, 'parked');
+      await fw.stop();
+      stopped = true;
+      assert.deepEqual(internal.pendingRequests.filter((r) => r.agentName === 'resident'), [], 'nothing queued for a later start()');
+    } finally { if (!stopped) await fw.stop(); log.restore(); }
+  });
+});
+
+for (const how of ['parked', 'held again'] as const) test(`a coalesced wake merged into a held turn's start ${how} is withdrawn from the start's record with its subject: a stop then puts nothing back`, async (t) => {
+  await withStoreDir(async (path) => {
+    const clock = holdClock(t);
+    const wait = 400;
+    const log = silence();
+    const membrane = new ScriptedMembrane(new Set([2]), (request) => rateLimited(wait, request));
+    const { fw, internal } = await framework(path, membrane);
+    try {
+      await heldTurn(fw, internal, membrane);
+      clock.advance(1);
+      internal.pendingRequests.push({ agentName: 'resident', reason: 'zz-coalesced', source: 'zz-server', timestamp: Date.now(), coalescingSubject: 'zz-subject' });
+      await fw.runUntilIdle();
+      assert.equal(internal.providerAccelerationCooldowns.get('resident')?.heldRequests.length, 2, 'the hold keeps the retry and the coalesced wake');
+      const gate = internal.providerGate('resident');
+      gate.auxiliaryInFlight = 1;
+      clock.pass(wait);
+      internal.releaseProviderAccelerationCooldown('resident');
+      await fw.runUntilIdle();
+      assert.equal(internal.parkedContinuations.size, 1, 'the merged start parks');
+      if (how === 'held again') {
+        internal.providerWaits.set('resident', 'zz-model', 60_000, 'zz later wait');
+        gate.auxiliaryInFlight = 0;
+        for (const resolve of gate.idleWaiters.splice(0)) resolve();
+        await waitFor(fw, () => internal.providerAccelerationCooldowns.get('resident')?.heldRequests.length === 1, 'the merged start held again');
+      }
+      internal.cancelCoalescedWakes('zz-subject');
+      assert.equal(fw.abortInference('resident', 'zz-operator stop'), true);
+      assert.deepEqual(internal.pendingRequests.filter((r) => r.agentName === 'resident'), [], 'the withdrawn wake stays withdrawn');
+    } finally { await fw.stop(); log.restore(); }
+  });
+});
+
+test("a merged start held where an equal request is already held keeps its wakes recorded on the request kept: a stop puts them back", async (t) => {
+  await withStoreDir(async (path) => {
+    const clock = holdClock(t);
+    const wait = 400;
+    const log = silence();
+    const membrane = new ScriptedMembrane(new Set([2]), (request) => rateLimited(wait, request));
+    const { fw, internal } = await framework(path, membrane);
+    try {
+      await mergedStartWaiting(fw, internal, membrane, clock, wait, 'parked');
+      // A wait is recorded, and an unmarked request equal to the parked start
+      // (a JSON copy drops its symbols) is held at admission by it.
+      internal.providerWaits.set('resident', 'zz-model', 60_000, 'zz later wait');
+      const parked = [...internal.parkedContinuations][0];
+      internal.pendingRequests.push(JSON.parse(JSON.stringify(parked)));
+      await fw.runUntilIdle();
+      assert.equal(internal.providerAccelerationCooldowns.get('resident')?.heldRequests.length, 1, 'the equal request is held');
+      // The park ends: the merged start is held where its equal is.
+      const gate = internal.providerGate('resident');
+      gate.auxiliaryInFlight = 0;
+      for (const resolve of gate.idleWaiters.splice(0)) resolve();
+      await waitFor(fw, () => internal.parkedContinuations.size === 0, "the park's end");
+      await fw.runUntilIdle();
+      assert.equal(internal.providerAccelerationCooldowns.get('resident')?.heldRequests.length, 1, 'one request kept, the two equal');
+      assert.equal(fw.abortInference('resident', 'zz-operator stop'), true);
+      const back = internal.pendingRequests.filter((r) => r.agentName === 'resident');
+      assert.equal(back.length, 1, 'the wake merged into the start is put back');
+    } finally { await fw.stop(); log.restore(); }
+  });
+});
+
+test("a budget restart's start merged with a fresh wake and parked: abortInference() puts the wake back, and it runs", async () => {
+  await withStoreDir(async (path) => {
+    const log = silence();
+    const membrane = new ScriptedMembrane(new Set(), () => new Error('unused'));
+    const { fw, internal } = await framework(path, membrane);
+    try {
+      fw.getAgent('resident')!.getContextManager().addMessage('User', [{ type: 'text', text: 'zz-message' }]);
+      const gate = internal.providerGate('resident');
+      gate.auxiliaryInFlight = 1;
+      internal.pendingRequests.push(
+        { agentName: 'resident', reason: 'zz-wake', source: 'test', timestamp: Date.now() },
+        { agentName: 'resident', reason: 'context_budget_restart', source: 'framework', timestamp: Date.now() },
+      );
+      await fw.runUntilIdle();
+      assert.equal(internal.parkedContinuations.size, 1, 'the merged start parks');
+      assert.equal(fw.abortInference('resident', 'zz-operator stop'), true);
+      assert.equal(internal.pendingRequests.filter((r) => r.agentName === 'resident' && r.reason === 'zz-wake').length, 1, 'the wake is put back');
+      gate.auxiliaryInFlight = 0;
+      for (const resolve of gate.idleWaiters.splice(0)) resolve();
+      await waitFor(fw, () => membrane.primary >= 1, 'the wake, as a turn of its own');
+    } finally { await fw.stop(); log.restore(); }
+  });
+});
+
+test("a stop made as an error policy's retry of a failed start is held at the last admission boundary ends the held turn", async () => {
+  await withStoreDir(async (path) => {
+    const log = silence();
+    const membrane = new ScriptedMembrane(new Set([1]), (request) => new MembraneError({
+      type: 'server', retryable: true, httpStatus: 500, message: 'zz internal error', rawError: { status: 500 }, rawRequest: request,
+    }), 'setup');
+    const { fw, internal } = await framework(path, membrane);
+    try {
+      internal.conversationAgentHomes.set('resident', { serverId: 'stub', channelId: 'world:zz' });
+      const agent = fw.getAgent('resident')!;
+      agent.getContextManager().addMessage('User', [{ type: 'text', text: 'zz-direct' }]);
+      // A stop on the microtask after the retry's hold is installed, while
+      // the failed start's frame is still on its way out.
+      const holds = internal.providerAccelerationCooldowns;
+      const set = holds.set.bind(holds);
+      let stopped: boolean | undefined;
+      holds.set = (key: string, value: { until: number; heldRequests: Request[] }) => {
+        const made = set(key, value);
+        if (key === 'resident' && stopped === undefined) queueMicrotask(() => { stopped = fw.abortInference('resident', 'zz-stop'); });
+        return made;
+      };
+      void internal.startAgentStream(agent, { agentName: 'resident', reason: 'conversation', source: 'test', timestamp: Date.now() });
+      await waitFor(fw, () => membrane.primary >= 1, 'the failed call');
+      internal.providerWaits.set('resident', 'zz-model', 60_000, 'zz wait its compression recorded');
+      await waitFor(fw, () => stopped !== undefined, 'the stop');
+      await waitFor(fw, () => !internal.activeTurnTokens.has('resident'), "the failed frame's end");
+      assert.equal(stopped, true);
+      assert.deepEqual(fw.getHostModeStatus().activeTurnAgents, [], 'the held turn ended');
+      fw.releaseProviderWait('resident');
+      await fw.runUntilIdle();
+      assert.equal(membrane.primary, 1, 'nothing sent after the stop');
+    } finally { await fw.stop(); log.restore(); }
+  });
+});
+
+test("under a quiesce, a silent turn's retry merged with a speaking wake goes back as its batch from the park: the retry starts alone, still silent", async (t) => {
+  await withStoreDir(async (path) => {
+    const clock = holdClock(t);
+    const wait = 400;
+    const log = silence();
+    const membrane = new ScriptedMembrane(new Set([2]), (request) => rateLimited(wait, request));
+    const { fw, internal } = await framework(path, membrane);
+    const starts: Array<{ suppressProse?: boolean } | undefined> = [];
+    const spied = internal as unknown as { startAgentStream: (...args: unknown[]) => Promise<void> };
+    const start = spied.startAgentStream.bind(internal);
+    spied.startAgentStream = (...args: unknown[]) => {
+      starts.push(args[1] as { suppressProse?: boolean } | undefined);
+      return start(...args);
+    };
+    try {
+      fw.pushEvent({ type: 'external-message', source: 'test', content: 'zz-first', metadata: {} });
+      await waitFor(fw, () => membrane.primary >= 1, 'the first turn');
+      await fw.runUntilIdle();
+      // A silent tick's turn fails into the hold.
+      internal.pendingRequests.push({ agentName: 'resident', reason: 'zz-tick', source: 'zz-heartbeat', timestamp: Date.now(), suppressProse: true });
+      await waitFor(fw, () => internal.providerAccelerationCooldowns.has('resident'), 'the silent turn held');
+      clock.advance(1);
+      fw.pushEvent({ type: 'external-message', source: 'test', content: 'zz-during the hold', metadata: {} });
+      await fw.runUntilIdle();
+      const gate = internal.providerGate('resident');
+      gate.auxiliaryInFlight = 1;
+      clock.pass(wait);
+      internal.releaseProviderAccelerationCooldown('resident');
+      await fw.runUntilIdle();
+      assert.equal(internal.parkedContinuations.size, 1, 'the merged start parks');
+      assert.equal(starts.at(-1)?.suppressProse, undefined, 'the merged start speaks, for its speaking wake');
+      const quiesce = fw.quiesce({ timeoutMs: 1_000 });
+      await waitFor(fw, () => fw.getHostModeStatus().quiesced, 'the quiesce');
+      gate.auxiliaryInFlight = 0;
+      for (const resolve of gate.idleWaiters.splice(0)) resolve();
+      await waitFor(fw, () => membrane.primary >= 3, 'the retry, through the quiesce');
+      assert.equal(starts.at(-1)?.suppressProse, true, 'the retry starts alone, silent as its turn was');
+      assert.equal((await quiesce).drained, true);
+      await fw.runUntilIdle();
+      assert.equal(fw.getHostModeStatus().gatedRequests, 1, 'the speaking wake parks');
+    } finally { await fw.stop(); log.restore(); }
+  });
+});
+
+test("a merged start that took its token read its wakes: when it fails into a hold again, abortInference() puts none of them back", async (t) => {
+  await withStoreDir(async (path) => {
+    const clock = holdClock(t);
+    const wait = 400;
+    const log = silence();
+    const membrane = new ScriptedMembrane(new Set([2, 3]), (request) => rateLimited(wait, request));
+    const { fw, internal } = await framework(path, membrane);
+    try {
+      await heldTurn(fw, internal, membrane);
+      clock.advance(1);
+      fw.pushEvent({ type: 'external-message', source: 'test', content: 'zz-during the hold', metadata: {} });
+      await fw.runUntilIdle();
+      clock.pass(wait);
+      internal.releaseProviderAccelerationCooldown('resident');
+      await waitFor(fw, () => membrane.primary >= 3 && internal.providerAccelerationCooldowns.has('resident'), 'the merged start sent, and held again');
+      assert.match(texts(membrane.calls[2]), /zz-during the hold/, 'the turn read the wake');
+      assert.equal(fw.abortInference('resident', 'zz-operator stop'), true);
+      clock.pass(wait);
+      await waitFor(fw, () => !internal.providerAccelerationCooldowns.has('resident'), "the hold's end");
+      await fw.runUntilIdle();
+      assert.equal(membrane.primary, 3, 'nothing put back');
     } finally { await fw.stop(); log.restore(); }
   });
 });
