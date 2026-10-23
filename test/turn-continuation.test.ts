@@ -223,6 +223,11 @@ function heldForWait(framework: AgentFramework): boolean {
     && (hold?.heldRequests.some((r) => r.reason === 'context_budget_restart') ?? false);
 }
 
+/** The inference log's rows for prime that a framework stop of the kind
+ *  writes. */
+const stopRows = (framework: AgentFramework, kind: string): number =>
+  framework.queryInferenceLogs({ agentName: 'prime' }).entries.filter((e) => e.entry.error === `Stream aborted: ${kind}`).length;
+
 const abortReasons = (traces: TraceEvent[]) =>
   traces.filter((t) => t.type === 'inference:aborted').map((t) => (t as { reason?: string }).reason);
 
@@ -330,6 +335,7 @@ describe('a turn whose continuation is on its way', () => {
       assert.deepEqual(status.activeTurnAgents, []);
       assert.equal(status.unabandonable, undefined, 'it was not left unabandonable');
       assert.equal(abortReasons(h.traces).filter((r) => r === 'quiesce_abandoned').length, 1, "one inference:aborted, the abandon's");
+      assert.equal(stopRows(h.framework, 'quiesce_abandoned'), 1, "the inference log has the abandon's row, as for a turn's start an abandon reaches");
       // The wait's hold, emptied by the abandon, releases with nothing to
       // run: no retry wake takes the dropped continuation's place.
       h.framework.releaseProviderWait('prime');
