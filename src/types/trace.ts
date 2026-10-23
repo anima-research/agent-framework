@@ -105,6 +105,41 @@ export type TraceEvent =
       /** Bounded like `error`. */
       stack?: string;
     })
+  // An agent's head under toolDeclarations 'entries' (system-changes.ts)
+  | (TraceEventBase & {
+      type: 'head:declared';
+      agentName: string;
+      /** Tools the change withdrew and offered, by name. */
+      removed: string[];
+      defined: string[];
+      /** Blocks of system text it added. */
+      addedSystem: number;
+    })
+  | (TraceEventBase & {
+      type: 'head:moved';
+      agentName: string;
+      /** What moved the head to what's current: the first request under
+       *  'entries', a replacement of system text, a consolidation, or a
+       *  request on the head that found changes left from an earlier period. */
+      why: 'adopted' | 'replaced' | 'consolidated' | 'on-head';
+      /** The change rows removed, since the head now holds them. */
+      changesRemoved: number;
+      /** For a consolidation: the changes' tokens, priced from their JSON, and the input they reached a share of. */
+      changeTokens?: number;
+      inputTokens?: number;
+      /** A consolidation no compile made free: past a fifth of the input
+       *  ('share'), or at a compile refused over budget with changes kept
+       *  ('budget'). A whole write, and on a binding model the request's
+       *  thinking set aside. */
+      forced?: 'share' | 'budget';
+    })
+  | (TraceEventBase & {
+      /** A request whose system change was refused goes again on the head. */
+      type: 'head:resend';
+      agentName: string;
+      /** The refusal's message, bounded as every trace event's `error` is (2,000 characters). */
+      error: string;
+    })
   | (TraceEventBase & {
       type: 'inference:exhausted';
       agentName: string;

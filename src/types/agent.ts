@@ -100,6 +100,52 @@ export interface AgentConfig {
   cacheTtl?: '5m' | '1h';
 
   /**
+   * How a request declares the agent's tools and system text.
+   *
+   * - `'head'` (default): every request carries the current tools and system
+   *   text, as before. A change to either rewrites the provider's cache from
+   *   the head.
+   * - `'entries'`: a request carries a fixed head, recorded once, and each
+   *   later change to the tools, or addition to the system text, goes into
+   *   the context as a system change at the point it took effect, which the
+   *   provider reads without rewriting what came before. A replacement of
+   *   system text, and consolidation once changes reach a tenth of the input,
+   *   move the head to what's current, with one write. Only for models that
+   *   take mid-conversation system messages on the native formatter: the
+   *   host's model records say which. Membrane refuses a system change any
+   *   other way.
+   *
+   * What the framework adds: it keeps each agent's recorded head in its
+   * store, so a restart keeps the head; and when a request carrying a change
+   * ends with a 400 or a refusal membrane recognises, whether or not the
+   * change caused it, the request goes again on the agent's head, which it
+   * keeps to until it's built again. An Agent used without the framework
+   * keeps its head in memory and has no such resend. The direct API
+   * (runInference) declares nothing: it sends the tools its caller passes
+   * and the current system text, and leaves the context's changes out.
+   *
+   * Turning it on is a choice from those records, not a runtime toggle, so
+   * it isn't one of the agent's runtime settings.
+   */
+  toolDeclarations?: 'head' | 'entries';
+
+  /**
+   * How the provider treats this agent's model's thinking. `binds` (default
+   * true) says the model's thinking is bound to everything before it, so a
+   * change to earlier bytes sets it aside. Under `toolDeclarations:
+   * 'entries'` a binding model consolidates for free only where no thinking
+   * sits before the compile's `firstChanged` (the first message that compile
+   * renders differently from the last one; thinking from there on is set
+   * aside by the compile's own change). Past a fifth of the input, or when
+   * a compile is refused over budget with changes kept, it consolidates
+   * anyway, setting that thinking aside. The host's model records carry it,
+   * beside "takes entries".
+   */
+  thinkingBinding?: {
+    binds?: boolean;
+  };
+
+  /**
    * Whether to emit prompt-cache markers (cache_control) on requests.
    * Default true (Anthropic API). Set false for transports that reject
    * cache_control — e.g. Bedrock legacy Claude models, which fail with

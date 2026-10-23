@@ -1,11 +1,27 @@
-import type { Membrane, NormalizedMessage, NormalizedRequest, ContentBlock, YieldingStream } from '@animalabs/membrane';
-import { isAbortedResponse } from '@animalabs/membrane';
+import type { Membrane, NormalizedMessage, NormalizedRequest, ContentBlock, SystemChangeContent, YieldingStream } from '@animalabs/membrane';
+import { isAbortedResponse, isSystemChangeContent } from '@animalabs/membrane';
 import { createHash } from 'node:crypto';
 import type { CacheWireReceipt, KvUnifiedRequestHooks } from './kv-unified-wire.js';
 import { ToolResultGuard } from './tool-result-guard.js';
 import { withoutTokenEstimates } from './thinking-token-stamp.js';
 import { injectionsAsStored } from './text-as-stored.js';
-import { assertBooleanSetting, holdsSettings } from './config-checks.js';
+import { assertBooleanSetting, assertOneOfSetting, holdsSettings } from './config-checks.js';
+import {
+  SYSTEM_CHANGE_PARTICIPANT,
+  declarationDifference,
+  effectiveDeclaration,
+  endsOnUnansweredCalls,
+  endsOnToolCall,
+  isSystemChangeMessage,
+  lastConversational,
+  memoryHeadDeclarations,
+  systemChangeMetadata,
+  systemTextOf,
+  copyHead,
+  type HeadDeclaration,
+  type HeadDeclarationStore,
+  type HeadEvent,
+} from './system-changes.js';
 import {
   CONTINUE_ROW,
   continueTurn,
@@ -88,16 +104,23 @@ function stableHash(value: unknown): string {
   return createHash('sha256').update(encode(value)).digest('hex');
 }
 
+/** kv-unified's hash of a request's immutable prefix: its head's tools and system text. */
+function headHash(head: HeadDeclaration): string {
+  return stableHash({ tools: head.tools.length > 0 ? head.tools : undefined, system: systemTextOf(head.system) });
+}
+
 const DEFAULT_CONTEXT_BUDGET_TOKENS = 100_000;
 const DEFAULT_TRANSITION_PACE_TOKENS = 16_000;
 const DEFAULT_SAME_ROUND_THINK_TEXT_POLICY: SameRoundThinkTextPolicy = 'public';
 
 /**
  * Refuse an agent config whose `promptCaching`, `toolResultGuard`,
- * `toolWrapperProseGuard`, `thinking.enabled` or `refusalHandling.autoRewind`
- * holds anything but true or false (assertBooleanSetting), or whose `thinking`
- * or `refusalHandling` is anything but an object, null or false
- * (holdsSettings). The constructor runs it first, so the rule holds wherever
+ * `toolWrapperProseGuard`, `thinking.enabled`, `refusalHandling.autoRewind`
+ * or `thinkingBinding.binds` holds anything but true or false
+ * (assertBooleanSetting), whose `thinking`, `refusalHandling` or
+ * `thinkingBinding` is anything but an object, null or false (holdsSettings),
+ * or whose `toolDeclarations` is anything but 'head' or 'entries'
+ * (assertOneOfSetting). The constructor runs it first, so the rule holds wherever
  * an Agent is built. `create()` also runs it for each of its agents before
  * anything opens, and `createEphemeralAgent` before it reserves the name, so a
  * refusal there leaves nothing behind. Membrane reads `thinking.enabled`, and
@@ -137,6 +160,20 @@ export function assertAgentSwitches(config: AgentConfig): void {
     'true keeps a response whose whole prose is a tool-call-shaped wrapper from running or entering the agent\'s history, ' +
       'and false or leaving it out doesn\'t',
   );
+  assertOneOfSetting(
+    `${agent} toolDeclarations`,
+    config.toolDeclarations,
+    ['head', 'entries'],
+    '\'head\' or leaving it out sends the current tools and system text with every request, and \'entries\' keeps ' +
+      'a recorded head and declares later changes in the context, for models that take them',
+  );
+  if (holdsSettings(`${agent} thinkingBinding`, config.thinkingBinding, '{ binds: false }')) {
+    assertBooleanSetting(
+      `${agent} thinkingBinding.binds`,
+      config.thinkingBinding.binds,
+      'true or leaving it out says the model binds its thinking to everything before it, and false says it doesn\'t',
+    );
+  }
 }
 
 /**
@@ -177,6 +214,21 @@ export class Agent {
   readonly cacheTtl: NonNullable<AgentConfig['cacheTtl']>;
   /** Emit prompt-cache markers on requests (see AgentConfig.promptCaching). */
   readonly promptCaching: boolean;
+  /** How requests declare tools and system text (see AgentConfig.toolDeclarations). */
+  readonly toolDeclarations: NonNullable<AgentConfig['toolDeclarations']>;
+  /** Whether the model binds its thinking to everything before it (AgentConfig.thinkingBinding). */
+  readonly bindsThinking: boolean;
+  /** Set by the framework's fail-safe once the provider refused a system
+   *  change: this agent then declares on its head until it's built again. */
+  private headUntilRestart = false;
+  /** Where the recorded head is kept (system-changes.ts). The framework
+   *  gives its store's state; an agent built alone keeps it in memory. */
+  private headDeclarations: HeadDeclarationStore = memoryHeadDeclarations();
+  private onHeadEvent: ((event: HeadEvent) => void) | undefined;
+  /** The last response's reported input: its fresh tokens and its cache's
+   *  reads and writes, which consolidation measures the changes against.
+   *  Unknown until a response after this agent was built. */
+  private lastResponseInputTokens: number | undefined;
   /** Prefill scaffold user message (see AgentConfig.prefillUserMessage). */
   readonly prefillUserMessage?: string;
   /** Provider-specific request parameters forwarded unchanged by Membrane. */
@@ -305,6 +357,8 @@ export class Agent {
     this.clock = resolveClockConfig(config.name, config.clock);
     this.cacheTtl = config.cacheTtl ?? '1h';
     this.promptCaching = config.promptCaching !== false;
+    this.toolDeclarations = config.toolDeclarations ?? 'head';
+    this.bindsThinking = (config.thinkingBinding || undefined)?.binds !== false;
     this.prefillUserMessage = config.prefillUserMessage;
     this.providerParams = config.providerParams;
     this.sameRoundThinkTextPolicy = config.sameRoundThinkTextPolicy;
@@ -1196,7 +1250,9 @@ export class Agent {
         () => this.compileWithInjections(budget, injections));
       const { systemInjections } = compiled;
       // The framework's own pricing stamp never goes out (thinking-token-stamp.ts).
-      const messages = withoutTokenEstimates(compiled.messages);
+      // The direct API declares on the head, with the caller's tools, so the
+      // context's system changes stay out of its request.
+      const messages = withoutTokenEstimates(compiled.messages).filter((m) => !isSystemChangeMessage(m));
       // Read once, after the first compile, since results may have become
       // ready while it ran; the refusal retry, assembled while the agent is
       // inferring, sends the same ones.
@@ -1357,22 +1413,53 @@ export class Agent {
     const prospectiveSystemInjections = (injections ?? [])
       .filter((injection) => injection.position === 'system')
       .flatMap((injection) => injection.content);
-    const immutablePrefixHash = kvUnified
-      ? stableHash({
-          tools: availableTools.length > 0 ? availableTools : undefined,
-          system: this.buildSystemPrompt(prospectiveSystemInjections),
-        })
-      : undefined;
-    let { messages, systemInjections } = await this.compileWithInjections(
-      budget,
-      injections,
-      immutablePrefixHash || options.dryRun
-        ? {
-            ...(immutablePrefixHash ? { kvUnifiedImmutablePrefixHash: immutablePrefixHash } : {}),
-            ...(options.dryRun ? { dryRun: true } : {}),
-          }
-        : undefined,
+    // The head that goes out: under 'entries' the recorded one, and what's
+    // current otherwise or before one is recorded (system-changes.ts).
+    const entries = this.declaresEntries();
+    let recorded = entries ? this.headDeclarations.read(this.name) : null;
+    const compile = (head: HeadDeclaration) => {
+      const immutablePrefixHash = kvUnified ? headHash(head) : undefined;
+      return this.compileWithInjections(
+        budget,
+        injections,
+        immutablePrefixHash || options.dryRun
+          ? {
+              ...(immutablePrefixHash ? { kvUnifiedImmutablePrefixHash: immutablePrefixHash } : {}),
+              ...(options.dryRun ? { dryRun: true } : {}),
+            }
+          : undefined,
+      );
+    };
+    let compiledWith = recorded ?? this.currentHead(availableTools, prospectiveSystemInjections);
+    let first: CompileResult;
+    try {
+      first = await compile(compiledWith);
+    } catch (error) {
+      // The changes this agent keeps may be what no longer fits: a compile
+      // refused over budget with change rows kept moves the head to what's
+      // current, taking them, and compiles once more (a forced move by the
+      // budget). If that compile is refused too, the changes weren't the
+      // cause, and the error goes on as before. Never in a dry run.
+      if (!entries || options.dryRun || recorded === null || (error as { name?: unknown } | null)?.name !== 'OverBudgetError') throw error;
+      const current = this.currentHead(availableTools, prospectiveSystemInjections);
+      const removed = this.removeOwnChanges();
+      if (removed === 0) throw error;
+      this.headDeclarations.write(this.name, copyHead(current));
+      this.onHeadEvent?.({ type: 'head:moved', why: 'consolidated', changesRemoved: removed, forced: 'budget' });
+      recorded = current;
+      compiledWith = current;
+      first = await compile(current);
+    }
+    const settled = await this.settleHead(
+      first,
+      kvUnified ? compiledWith : null,
+      availableTools,
+      recorded,
+      entries,
+      options.dryRun === true,
+      compile,
     );
+    let { messages } = settled.compiled;
 
     // Sanitize: strip empty/whitespace text blocks and drop messages left with
     // no content. The Anthropic API rejects empty text blocks with 400
@@ -1397,6 +1484,11 @@ export class Agent {
       .filter((m) => m.content.length > 0);
     // The framework's own pricing stamp never goes out (thinking-token-stamp.ts).
     messages = withoutTokenEstimates(messages);
+    // On the head, the context's system changes stay out of the request, since
+    // its tools and system text are already current. Under 'entries', the
+    // change this assembly declares follows the compiled ones.
+    if (!entries) messages = messages.filter((m) => !isSystemChangeMessage(m));
+    if (settled.declared) messages = [...messages, settled.declared];
 
     // Silent heartbeat ticks and replies to a [Continue] turn store no
     // prompt row. Render each request-only turn before its response's first
@@ -1423,23 +1515,27 @@ export class Agent {
     // whose tool loop this reply continues; else none. A request that ends
     // on anything else (a message that arrived during a cooldown, say) gets
     // a reply that follows that message and carries no prompt.
+    // A system change isn't a turn: the request ends on what came before it,
+    // and membrane places the change after the next user turn, which is the
+    // [Continue] row when the agent's own turn is last.
     let continuePrompt: RequestOnlyPrompt | undefined;
+    const last = lastConversational(messages);
     if (openingTick) {
       messages = [...messages, silentHeartbeatSeparatorTurn()];
-    } else if (messages.length > 0 && messages[messages.length - 1]!.participant === this.name) {
+    } else if (last?.participant === this.name) {
       // Safety: ensure messages don't end with an assistant message.
       // Some models reject trailing assistant messages ("prefill not supported"),
       // and after context compression a stale assistant turn can end up last.
       messages = [...messages, continueTurn()];
       continuePrompt = { turn: randomUUID(), text: CONTINUE_ROW };
     } else {
-      continuePrompt = toolLoopPrompt(messages.at(-1), index);
+      continuePrompt = toolLoopPrompt(last, index);
     }
 
     const request: NormalizedRequest = {
       messages: this.toolResultGuard.prepareRequest(messages),
-      system: this.buildSystemPrompt(systemInjections),
-      tools: availableTools.length > 0 ? availableTools : undefined,
+      system: systemTextOf(settled.head.system),
+      tools: settled.head.tools.length > 0 ? settled.head.tools : undefined,
       ...this.requestSettings(),
       ...(kvUnified ? { cacheMarkers: 'cm-owned' as const } : {}),
     };
@@ -1487,6 +1583,15 @@ export class Agent {
    * cached message array (ContextManager returns the same array until the
    * store changes). */
   private requestOnlyIndex: { source: readonly unknown[]; index: RequestOnlyRowIndex } | null = null;
+
+  /** Whether the store, every agent's rows included, ends on a tool call: a
+   * change appended now would stand between the call and its result
+   * (endsOnToolCall), so it waits for the result. */
+  private storeEndsOnToolCall(): boolean {
+    const cm = this.contextManager as Partial<ContextManager>;
+    if (typeof cm.getAllMessages !== 'function') return false;
+    return endsOnToolCall(cm.getAllMessages() as unknown as readonly { content: readonly ContentBlock[] }[]);
+  }
 
   private indexRequestOnlyRows(): RequestOnlyRowIndex {
     const empty: RequestOnlyRowIndex = { ticks: new Map(), prompts: new Map() };
@@ -1800,14 +1905,181 @@ export class Agent {
    * and the module registry tells a module's once per module and namespace.
    */
   private buildSystemPrompt(systemInjections: ContentBlock[]): string {
-    if (systemInjections.length === 0) {
-      return this.systemPrompt;
+    return systemTextOf(this.systemBlocks(systemInjections));
+  }
+
+  /** The system text as blocks: the prompt, then each injected block (see buildSystemPrompt). */
+  private systemBlocks(systemInjections: ContentBlock[]): string[] {
+    return [
+      this.systemPrompt,
+      ...systemInjections.map((block) =>
+        block.type === 'text' ? block.text : `[${block.type} block not shown: the system prompt carries text only.]`),
+    ];
+  }
+
+  /** What the agent advertises now, as a head would declare it. */
+  private currentHead(tools: ToolDefinition[], systemInjections: ContentBlock[]): HeadDeclaration {
+    return { tools, system: this.systemBlocks(systemInjections) };
+  }
+
+  /** Whether this agent's requests declare later changes in its context. */
+  declaresEntries(): boolean {
+    return this.toolDeclarations === 'entries' && !this.headUntilRestart;
+  }
+
+  /** The framework's record of heads, and its traces of what moved them. */
+  attachHeadDeclarations(store: HeadDeclarationStore, onEvent?: (event: HeadEvent) => void): void {
+    this.headDeclarations = store;
+    this.onHeadEvent = onEvent;
+  }
+
+  /** A response's reported input, from the framework's usage handler. */
+  noteResponseInput(tokens: number): void {
+    if (tokens > 0) this.lastResponseInputTokens = tokens;
+  }
+
+  /** The fail-safe: declare on the head until this agent is built again. */
+  keepToHeadUntilRestart(): void {
+    this.headUntilRestart = true;
+  }
+
+  /**
+   * The head this request declares, and the change it adds, after the
+   * committing compile (system-changes.ts). On the head, what's current goes
+   * out, and a record or changes left from an earlier 'entries' period go.
+   * Under 'entries': with no record, the current head is adopted; a
+   * replacement of system text moves the head to what's current; a
+   * difference a change can say is declared at the end, unless the context
+   * ends on calls still waiting for their results, which a change mustn't
+   * separate from them; then it waits for the next assembly. A dry run
+   * computes the same and stores nothing.
+   */
+  private async settleHead(
+    compiled: CompileResult,
+    compiledWith: HeadDeclaration | null,
+    availableTools: ToolDefinition[],
+    recorded: HeadDeclaration | null,
+    entries: boolean,
+    dryRun: boolean,
+    compile: (head: HeadDeclaration) => Promise<CompileResult>,
+  ): Promise<{ compiled: CompileResult; head: HeadDeclaration; declared?: NormalizedMessage }> {
+    const current = this.currentHead(availableTools, compiled.systemInjections);
+    const changes = compiled.messages.filter(isSystemChangeMessage);
+    if (!entries) {
+      // A record left from an earlier 'entries' period goes, on whichever
+      // branch is current: a switch can bring one back. The store deletes
+      // only a record it holds, so this costs a lookup otherwise.
+      if (!dryRun) this.headDeclarations.delete(this.name);
+      // The request leaves them out, so this compile needn't run again.
+      if (!dryRun && changes.length > 0) {
+        const changesRemoved = this.removeOwnChanges();
+        this.onHeadEvent?.({ type: 'head:moved', why: 'on-head', changesRemoved });
+      }
+      return { compiled, head: current };
     }
+    if (!recorded) return this.moveHead(compiled, compiledWith, current, 'adopted', dryRun, compile);
+    const blocks = changes.flatMap((message) => message.content.filter(isSystemChangeContent));
+    const difference = declarationDifference(effectiveDeclaration(recorded, blocks), current);
+    if (difference.kind === 'replace') return this.moveHead(compiled, compiledWith, current, 'replaced', dryRun, compile);
+    const consolidation = this.consolidation(compiled, blocks);
+    if (consolidation) return this.moveHead(compiled, compiledWith, current, 'consolidated', dryRun, compile, consolidation);
+    if (difference.kind === 'none' || endsOnUnansweredCalls(compiled.messages, this.name) || this.storeEndsOnToolCall()) {
+      return { compiled, head: recorded };
+    }
+    const declared: NormalizedMessage = { participant: SYSTEM_CHANGE_PARTICIPANT, content: [difference.block] };
+    if (!dryRun) {
+      this.contextManager.addMessage(declared.participant, declared.content, systemChangeMetadata(this.name) as never);
+      this.onHeadEvent?.({
+        type: 'head:declared',
+        removed: difference.block.removeTools ?? [],
+        defined: (difference.block.defineTools ?? []).map((tool) => tool.name),
+        addedSystem: difference.block.addSystem?.length ?? 0,
+      });
+    }
+    return { compiled, head: recorded, declared };
+  }
 
-    const injectedText = systemInjections.map((block) =>
-      block.type === 'text' ? block.text : `[${block.type} block not shown: the system prompt carries text only.]`);
+  /**
+   * Move the head to what's current: remove the changes it now holds, then
+   * record a copy of it, in that order, so a stop between the two leaves the
+   * old head and no changes. The next assembly then declares the difference
+   * as one change, or moves the head again for a replacement; never the old
+   * changes beside a head that already holds them. The compile runs again
+   * when what it read changed, or when kv-unified hashed another head
+   * (`compiledWith`, null when the compile hashed none). A dry run shows the
+   * same, compiling again (dry) for another hashed head, and changes nothing.
+   */
+  private async moveHead(
+    compiled: CompileResult,
+    compiledWith: HeadDeclaration | null,
+    current: HeadDeclaration,
+    why: 'adopted' | 'replaced' | 'consolidated',
+    dryRun: boolean,
+    compile: (head: HeadDeclaration) => Promise<CompileResult>,
+    sizes?: { changeTokens: number; inputTokens: number; forced?: 'share' },
+  ): Promise<{ compiled: CompileResult; head: HeadDeclaration }> {
+    if (dryRun) {
+      const shown = compiledWith !== null && headHash(compiledWith) !== headHash(current) ? await compile(current) : compiled;
+      return { compiled: { ...shown, messages: shown.messages.filter((m) => !isSystemChangeMessage(m)) }, head: current };
+    }
+    const removed = this.removeOwnChanges();
+    this.headDeclarations.write(this.name, copyHead(current));
+    this.onHeadEvent?.({ type: 'head:moved', why, changesRemoved: removed, ...sizes });
+    const again = removed > 0 || (compiledWith !== null && headHash(compiledWith) !== headHash(current));
+    return { compiled: again ? await compile(current) : compiled, head: current };
+  }
 
-    return this.systemPrompt + '\n' + injectedText.join('\n');
+  /**
+   * Whether this compile is where the changes go into the head, and if so,
+   * their price and the input they reached a share of. Once the changes, priced
+   * from their JSON as context-manager prices them, reach a tenth of the last
+   * response's reported input, at the first committing compile whose
+   * `firstChanged` (context-manager's: the first compiled message whose bytes
+   * differ from the previous committing compile's) is at or before the first
+   * change. That compile already rewrites every change, so moving the head
+   * adds the head and any messages before `firstChanged`, never more than
+   * the whole prompt. On a binding model, also only where no thinking sits
+   * before `firstChanged`: moving the head sets aside every thinking block
+   * in the request, and the thinking the compile kept before `firstChanged`
+   * would go by our choice. A strategy that keeps changes ahead of its
+   * window (the passthrough strategies, once over budget) re-renders from
+   * the first change only at the compile where its window first passes it:
+   * after that the change stays first and unchanged, and `firstChanged`
+   * falls after it. `firstChanged` is null after a start, before the
+   * manager's first committing compile, when nothing says what the provider
+   * still holds, and nothing consolidates for free then.
+   *
+   * Such a compile may never come: a binding model's head window keeps its
+   * first replies' thinking, and a passthrough window passes the first
+   * change before the changes reach a tenth. So past a fifth of the input,
+   * with no free compile having taken them, the head moves at this compile
+   * anyway (`forced: 'share'`): one whole write, and on a binding model the
+   * thinking the request held. That bounds what every request carries, once
+   * per crossing, since the move takes every change. (A compile refused over
+   * budget with changes kept moves the head too, at the assembly: `forced:
+   * 'budget'`.)
+   */
+  private consolidation(compiled: CompileResult, blocks: SystemChangeContent[]): { changeTokens: number; inputTokens: number; forced?: 'share' } | undefined {
+    const firstChange = compiled.messages.findIndex(isSystemChangeMessage);
+    const inputTokens = this.lastResponseInputTokens;
+    if (firstChange < 0 || inputTokens === undefined) return undefined;
+    const changeTokens = blocks.reduce((sum, block) => sum + Math.ceil(JSON.stringify(block).length / 4), 0);
+    if (changeTokens * 10 < inputTokens) return undefined;
+    // Read only once consolidation is in question: context-manager compares
+    // it when it's read.
+    const firstChanged = (compiled as { firstChanged?: number | null }).firstChanged;
+    const free = firstChanged != null && firstChanged <= firstChange && !(this.bindsThinking && compiled.messages.slice(0, firstChanged)
+      .some((message) => message.content.some((block) => block.type === 'thinking' || block.type === 'redacted_thinking')));
+    if (free) return { changeTokens, inputTokens };
+    return changeTokens * 5 >= inputTokens ? { changeTokens, inputTokens, forced: 'share' } : undefined;
+  }
+
+  /** Remove this agent's change rows from its context: by their metadata,
+   *  which in the residents' shared slot names the agent they declare for. */
+  private removeOwnChanges(): number {
+    const rows = this.contextManager.queryMessages({ metadata: { kind: 'system-change', agent: this.name } }).messages;
+    for (const row of rows) this.contextManager.removeMessage(row.id);
+    return rows.length;
   }
 
   abortInference(reason?: string): { aborted: true; durationMs: number } | false {

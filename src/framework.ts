@@ -77,6 +77,18 @@ import { ProcessQueueImpl } from './queue.js';
 import { DEFAULT_SHUTDOWN_TIMEOUT_MS, validateShutdownTimeout, shutdownErrorMessage, waitForShutdown, ShutdownTimeoutError } from './shutdown.js';
 import { REFUSAL_REACTIONS, REFUSAL_REACTION_FALLBACK, REFUSAL_REACTION_BASELINE } from './refusal-reactions.js';
 import { Agent, assertAgentSwitches } from './agent.js';
+import {
+  copyHead,
+  isHeadDeclaration,
+  isOthersSystemChange,
+  isSystemChangeMessage,
+  lastConversational,
+  memoryHeadDeclarations,
+  systemChangeMetadata,
+  type HeadDeclaration,
+  type HeadDeclarationStore,
+  type HeadEvent,
+} from './system-changes.js';
 import { assertBooleanSetting, holdsSettings } from './config-checks.js';
 import { ModuleRegistry, checkedToolResult, ensureStateRegistered, storableToolResult, thrownResult } from './module-registry.js';
 import { McplServerRegistry } from './mcpl/server-registry.js';
@@ -738,6 +750,9 @@ import {
 } from './operator-log.js';
 
 const FRAMEWORK_STATE_ID = 'framework/state';
+/** Each agent's recorded head under `toolDeclarations: 'entries'`, by name
+ *  (system-changes.ts). */
+const HEAD_DECLARATIONS_ID = 'framework/head-declarations';
 /** Snapshot slot mirroring context writes deferred while quiesced (#122). */
 const DEFERRED_WRITES_ID = 'framework/deferred-writes';
 /** What a write of the deferred-write queue did: wrote the record (the
@@ -922,6 +937,25 @@ function describeDeferredWrite(msg: { id: string; participant: string; content: 
     return typeof type === 'string' ? type : 'untyped';
   };
   return `${msg.id} (${msg.participant}: ${[...new Set(msg.content.map(kind))].join('+') || 'empty'})`;
+}
+
+/** The index of the stored row just before the last `n` messages of the
+ *  conversation, counting back from the tail past system changes, which
+ *  aren't messages anyone sent. Where fewer than `n + 1` messages are stored,
+ *  -(their count) - 1 instead, so the caller can say how many there are. */
+function indexBeforeLastMessages(cm: Pick<ContextManager, 'getMessageCount' | 'getMessageWindow'>, n: number): number {
+  const WINDOW = 200;
+  let counted = 0;
+  for (let end = cm.getMessageCount(); end > 0; end -= WINDOW) {
+    const start = Math.max(0, end - WINDOW);
+    const rows = cm.getMessageWindow(start, end - start, { resolveBlobs: false }).messages;
+    for (let i = rows.length - 1; i >= 0; i--) {
+      if (isSystemChangeMessage(rows[i]!)) continue;
+      if (counted === n) return start + i;
+      counted++;
+    }
+  }
+  return -counted - 1;
 }
 
 /** Whether a deferred message can join a live stream at a tool boundary:
@@ -3237,6 +3271,7 @@ export class AgentFramework {
   ): Promise<AgentFramework> {
     // Register framework states
     ensureStateRegistered(store, { id: FRAMEWORK_STATE_ID, strategy: 'snapshot' });
+    ensureStateRegistered(store, { id: HEAD_DECLARATIONS_ID, strategy: 'snapshot' });
     ensureStateRegistered(store, { id: DEFERRED_WRITES_ID, strategy: 'snapshot' });
     for (const id of [COALESCING_STATE_ID, COALESCING_RECENT_ID]) {
       ensureStateRegistered(store, { id, strategy: 'snapshot' });
@@ -8314,6 +8349,18 @@ export class AgentFramework {
   /**
    * Create an ephemeral agent that is NOT registered in the main event loop.
    *
+   * `headFrom` names a running agent whose recorded head (toolDeclarations
+   * 'entries') the new agent starts with, as a copy: a host that seeds the
+   * agent with that agent's messages, its system changes stamped with
+   * `systemChangeMetadata(config.name)`, then sends the same prefix, so the
+   * new agent reads that agent's cache and declares only its own difference.
+   * That holds for a fork of the same self: system text that is the named
+   * agent's head's blocks, plus additions. A new agent with its own system
+   * prompt, or other system injections, meets a replacement at its first
+   * request and moves to its own head, as an agent without it would. A named
+   * agent on its head, or with nothing recorded, gives nothing: the new agent
+   * adopts at its first request, as without it.
+   *
    * Used by SubagentModule (and similar) to prepare short-lived agents.
    * Call runEphemeralToCompletion(agent, contextManager) to register and run
    * the returned agent. Framework-created identities have tool authority only
@@ -8325,7 +8372,7 @@ export class AgentFramework {
    * Data persists after cleanup for investigation and cross-revert.
    * Call cleanup() when done to release the ContextManager.
    */
-  async createEphemeralAgent(config: AgentConfig): Promise<{
+  async createEphemeralAgent(config: AgentConfig, options: { headFrom?: string } = {}): Promise<{
     agent: Agent;
     contextManager: ContextManager;
     cleanup: () => void;
@@ -8334,6 +8381,12 @@ export class AgentFramework {
     // after the name is reserved and ContextManager.open has registered the
     // agent's message and context states in the store.
     assertAgentSwitches(config);
+    let seedHead: HeadDeclaration | null = null;
+    if (options.headFrom !== undefined) {
+      const parent = this.agents.get(options.headFrom);
+      if (!parent) throw new Error(`createEphemeralAgent: headFrom names no running agent: "${options.headFrom}"`);
+      seedHead = parent.declaresEntries() ? (this.headStores.get(parent)?.read(parent.name) ?? null) : null;
+    }
     // Names are Chronicle namespaces and generation identities. Reserve before
     // opening the namespace so a second creation cannot append to an earlier
     // generation before runEphemeralToCompletion has a chance to reject it.
@@ -8354,6 +8407,9 @@ export class AgentFramework {
       });
 
       const agent = new Agent(config, contextManager, this.membrane);
+      const heads = memoryHeadDeclarations();
+      if (seedHead) heads.write(config.name, copyHead(seedHead));
+      this.attachHeads(agent, heads);
       this.adoptToolResultGuard(agent);
       agent.markContextConsumed(); // RFC-006: nothing stored before now is replaceable
       this.ephemeralCandidates.set(agent, contextManager);
@@ -9873,14 +9929,20 @@ export class AgentFramework {
       }
       const n = Math.max(1, Math.min(50, Math.floor(params.messages)));
       const cm = agent.getContextManager();
-      const total = cm.getMessageCount();
-      if (n >= total) {
+      // The n are messages of the conversation: a system change isn't one an
+      // operator counts, and one among them goes with them.
+      const targetIndex = indexBeforeLastMessages(cm, n);
+      if (targetIndex < 0) {
         return {
           ok: false,
-          error: `Cannot remove ${n} message(s) — history has ${total}; at least one must remain.`,
+          error: `Cannot remove ${n} message(s) — history has ${-targetIndex - 1}; at least one must remain.`,
         };
       }
-      const target = cm.getMessageWindow(total - 1 - n, 1, { resolveBlobs: false }).messages[0];
+      const target = cm.getMessageWindow(targetIndex, 1, { resolveBlobs: false }).messages[0];
+      // The reply counts the conversation's messages, as n does: the system
+      // changes among them go with them uncounted.
+      const after = cm.getMessageCount() - targetIndex - 1;
+      const changesAmong = cm.getMessageWindow(targetIndex + 1, after, { resolveBlobs: false }).messages.filter(isSystemChangeMessage).length;
       try {
         const r = await this.rollbackToMessage(agentName, {
           messageId: String(target.id),
@@ -9894,7 +9956,7 @@ export class AgentFramework {
         });
         return {
           ok: true,
-          messagesRemoved: r.messagesRemoved,
+          messagesRemoved: r.messagesRemoved - changesAmong,
           removedRefs: r.removedRefs,
           markers: r.markers,
           lastVisible: r.lastVisible,
@@ -9946,8 +10008,10 @@ export class AgentFramework {
   ): Promise<{ participant?: string; role?: string; preview?: string } | null> {
     try {
       const preview = await this.previewActivation(agentName);
-      const messages = (preview as { messages?: unknown[] }).messages ?? [];
-      const last = messages[messages.length - 1] as
+      const messages = ((preview as { messages?: unknown[] }).messages ?? []) as { content: ContentBlock[] }[];
+      // A system change isn't a turn: the last message the agent sees is the
+      // last conversational one.
+      const last = lastConversational(messages) as
         | { role?: string; participant?: string; content?: unknown }
         | undefined;
       if (!last) return null;
@@ -11457,6 +11521,122 @@ export class AgentFramework {
     }
   }
 
+  /** Each agent's recorded head (system-changes.ts), kept in the store's
+   *  state and in memory after the first read on a branch, since the
+   *  framework is its only writer. The state is the branch's, so a switch
+   *  (undo, redo, a rollback, a fork) reads it again: kept across one, it
+   *  answered with the other branch's heads and its next write stored them
+   *  over this branch's. Null until read; unreadable leaves it unread, and
+   *  then no write goes, so one agent's adoption never stores over the
+   *  others'. */
+  private headDeclarationMap: { branch: string; heads: Map<string, HeadDeclaration> } | null = null;
+  /** The branch whose recorded heads couldn't be read, so that's said once
+   *  a branch, though every request on the head asks. */
+  private headDeclarationsUnreadableOn: string | null = null;
+
+  private readonly headDeclarations: HeadDeclarationStore = {
+    read: (agentName) => this.readHeadDeclarations()?.get(agentName) ?? null,
+    write: (agentName, head) => this.storeHeadDeclarations((map) => { map.set(agentName, head); }),
+    delete: (agentName) => {
+      if (this.readHeadDeclarations()?.has(agentName)) this.storeHeadDeclarations((map) => { map.delete(agentName); });
+    },
+  };
+
+  private readHeadDeclarations(): Map<string, HeadDeclaration> | null {
+    const branch = this.store.currentBranch().name;
+    if (this.headDeclarationMap?.branch === branch) return this.headDeclarationMap.heads;
+    try {
+      const stored = this.store.getStateJson(HEAD_DECLARATIONS_ID);
+      const map = new Map<string, HeadDeclaration>();
+      const dropped: string[] = [];
+      if (stored && typeof stored === 'object' && !Array.isArray(stored)) {
+        for (const [name, head] of Object.entries(stored as Record<string, unknown>)) {
+          if (isHeadDeclaration(head)) map.set(name, head);
+          else dropped.push(name);
+        }
+      } else if (stored != null) {
+        dropped.push('(the whole record, not a map)');
+      }
+      // What can't be used is set aside, and its agents adopt again: one
+      // write each. The next write stores the map without it.
+      if (dropped.length > 0) console.error(`[head-declarations] recorded heads that can't be used were set aside: ${dropped.join(', ')}`);
+      this.headDeclarationMap = { branch, heads: map };
+      this.headDeclarationsUnreadableOn = null;
+      return map;
+    } catch (error) {
+      // Each agent then sends its current head, as on 'head', until a read works.
+      if (this.headDeclarationsUnreadableOn !== branch) console.error('[head-declarations] the recorded heads could not be read:', error);
+      this.headDeclarationsUnreadableOn = branch;
+      return null;
+    }
+  }
+
+  /** A record that can't be stored is logged, not thrown: the request in hand
+   *  is right either way. The map keeps the head that request went with, so
+   *  the process stays consistent; the store keeps the old one until a later
+   *  write lands, and a restart or a branch switch, which read the store
+   *  again, then declares the difference once. */
+  private storeHeadDeclarations(change: (map: Map<string, HeadDeclaration>) => void): void {
+    const map = this.readHeadDeclarations();
+    if (!map) return;
+    change(map);
+    try {
+      this.store.setStateJson(HEAD_DECLARATIONS_ID, Object.fromEntries(map));
+    } catch (error) {
+      console.error('[head-declarations] the recorded heads could not be stored:', error);
+    }
+  }
+
+  /**
+   * The fail-safe's trigger (system-changes.ts): a request that carried a
+   * system change, refused with membrane's `systemChangeRefused` (its
+   * recognised wordings, or its own refusal before sending) or with any
+   * other 400. A refusal in wording membrane doesn't know left the change
+   * stored, and every later request carrying it failed the same way, so a
+   * binding model resends too: moving its head sets its thinking aside, the
+   * cost a replacement or a consolidation already has, once per change,
+   * since the resend carries none. That case raises an operator line with
+   * the 400's text, so the cost shows and membrane can learn the wording. True when
+   * the agent now keeps to its head until it's built again; the caller then
+   * retries the turn at once (attempt + 1, so it continues the same turn:
+   * no second undo checkpoint, the turn's tool-call count kept).
+   */
+  private keepToHeadAfterRefusal(agent: Agent, error: Error, request: NormalizedRequest | undefined): boolean {
+    if (!agent.declaresEntries() || !request?.messages.some(isSystemChangeMessage)) return false;
+    const recognised = isMembraneError(error) && error.systemChangeRefused === true;
+    const refused = isMembraneError(error) && error.httpStatus === 400;
+    if (!recognised && !refused) return false;
+    agent.keepToHeadUntilRestart();
+    console.error(`[head-declarations] ${agent.name}: a request carrying a system change was refused, so it declares on its head until a restart: ${error.message}`);
+    if (!recognised) {
+      this.opsAlert('head-resend', agent.name,
+        `a 400 membrane doesn't recognise as a refused system change ended a request that carried one, so it goes again on the agent's head${agent.bindsThinking ? ', which sets aside the thinking the request held' : ''}. The 400 may not be about the change. The agent keeps to its head until a restart, so until then each change to its tools or system text rewrites its cache: ${error.message}`,
+        { data: { httpStatus: 400 } });
+    }
+    this.emitTrace({ type: 'head:resend', agentName: agent.name, error: error.message });
+    return true;
+  }
+
+  /** Each agent's head store, for an ephemeral agent's `headFrom`. */
+  private readonly headStores = new WeakMap<Agent, HeadDeclarationStore>();
+
+  /** Give an agent the recorded heads, and trace what moves its head. An
+   *  ephemeral agent keeps its own in memory: it doesn't outlive its run. */
+  private attachHeads(agent: Agent, store: HeadDeclarationStore = this.headDeclarations): void {
+    this.headStores.set(agent, store);
+    agent.attachHeadDeclarations(store, (event: HeadEvent) => {
+      this.emitTrace({ ...event, agentName: agent.name });
+      if (event.type === 'head:moved' && event.forced) {
+        const why = event.forced === 'budget'
+          ? `a compile was refused over budget with ${event.changesRemoved} system changes kept, so the head took them and the compile ran again`
+          : `the system changes reached ${event.changeTokens} tokens, a fifth of the last response's ${event.inputTokens}, with no compile that rewrote them already, so the head took them`;
+        this.opsAlert('head-consolidated', agent.name,
+          `${why}: one whole write${agent.bindsThinking ? ', and the thinking the request held set aside' : ''}`,
+          { data: { forced: event.forced, changesRemoved: event.changesRemoved, ...(event.forced === 'share' ? { changeTokens: event.changeTokens, inputTokens: event.inputTokens } : {}) } });
+      }
+    });
+  }
+
   private async createAgent(config: AgentConfig): Promise<Agent> {
     // Create context manager for this agent
     const contextManager = await ContextManager.open({
@@ -11475,10 +11655,14 @@ export class AgentFramework {
       // the timeline (KV-prefix-stable delivery). The stored originals
       // remain in the shared slot for the subconscious's merged view,
       // fetch_history, and audit.
-      viewFilter: (message) => !(message.metadata as { tuneOut?: unknown } | undefined)?.tuneOut,
+      // Residents share one message slot, so each sees only its own system
+      // changes: another resident's declare another's tools.
+      viewFilter: (message) =>
+        !(message.metadata as { tuneOut?: unknown } | undefined)?.tuneOut && !isOthersSystemChange(message, config.name),
     });
 
     const agent = new Agent(config, contextManager, this.membrane);
+    this.attachHeads(agent);
     this.adoptToolResultGuard(agent);
     agent.markContextConsumed(); // RFC-006: nothing stored before now is replaceable
     this.sharedSlotAgents.add(agent);
@@ -11548,9 +11732,11 @@ export class AgentFramework {
       store: this.store,
       namespace: `subconscious/${primaryName}`,
       isolate: true,
-      // The residents' shared un-namespaced slot, merged read-only and
-      // UNfiltered (no viewFilter here — stamped messages included).
+      // The residents' shared un-namespaced slot, merged read-only, with
+      // tune-out's stamped messages included. Only the residents' system
+      // changes are left out: they declare the residents' tools, not its own.
       auxiliaryMessageViews: [{}],
+      viewFilter: (message) => !isOthersSystemChange(message, name),
       strategy,
       membrane: this.membrane,
       debugLogContext: !!process.env.DEBUG_CONTEXT,
@@ -11566,6 +11752,9 @@ export class AgentFramework {
       ...primaryConfig,
       name,
       model: cfg.model ?? primaryConfig.model,
+      // The host's "takes entries" was said of the principal's model: on
+      // another, the subconscious declares on its head.
+      ...(cfg.model && cfg.model !== primaryConfig.model ? { toolDeclarations: 'head' as const } : {}),
       systemPrompt: cfg.systemPrompt,
       strategy: undefined, // its CM owns the windowed strategy instance
       // Prose is never auto-routed: a cadence-triggered turn carries no
@@ -11579,6 +11768,7 @@ export class AgentFramework {
       clock: undefined,
     };
     const agent = new Agent(agentConfig, contextManager, this.membrane);
+    this.attachHeads(agent);
     this.adoptToolResultGuard(agent);
     agent.markContextConsumed(); // RFC-006: nothing stored before now is replaceable
     this.sharedSlotAgents.add(agent); // reads the shared slot through its merged view
@@ -12839,12 +13029,20 @@ export class AgentFramework {
         logSeedOmissions(name, template.name, compiled, withoutReasoning, withoutNotices, seed);
         for (const msg of seed) {
           const participant = msg.participant === template.name ? name : msg.participant;
-          contextManager.addMessage(participant, msg.content);
+          // The template's system changes, as its compile shows them, become
+          // the fork's, with the template's head beside them, so the fork's
+          // head matches its template's and its first start declares only its
+          // own difference.
+          if (isSystemChangeMessage(msg)) contextManager.addMessage(participant, msg.content, systemChangeMetadata(name) as never);
+          else contextManager.addMessage(participant, msg.content);
         }
+        const templateHead = this.headDeclarations.read(template.name);
+        if (templateHead) this.headDeclarations.write(name, templateHead);
       }
 
       const config: AgentConfig = { ...templateConfig, name, strategy: undefined };
       const agent = new Agent(config, contextManager, this.membrane);
+      this.attachHeads(agent);
       this.adoptToolResultGuard(agent);
       agent.markContextConsumed(); // RFC-006: nothing stored before now is replaceable
       this.agents.set(name, agent);
@@ -13018,6 +13216,9 @@ export class AgentFramework {
     this.agentConfigs.delete(agentName);
     this.conversationAgentHomes.delete(agentName);
     this.evictTurnCheckpoints(agentName);
+    // Its recorded head goes too: the name is never used again, and the
+    // map is written whole at every head write.
+    this.headDeclarations.delete(agentName);
     if (agent) this.logicalTurnToolCalls.delete(agent);
     // Its scripts go with it, and leave the map once they've ended: no later
     // run of a fork's name trims them.
@@ -19313,17 +19514,24 @@ export class AgentFramework {
 
             this.abandonAgentScripts(agent.name, 'stream error', streamRouting);
 
-            if (ownsProviderGate && this.holdProviderAcceleration(agent, err, trigger)) {
+            // The fail-safe (system-changes.ts): a request whose system
+            // change was refused goes again at once, on the agent's head,
+            // which it keeps to until it's built again. The refusal never
+            // reaches the error policy (a 400 is terminal there); the resend
+            // is a retry of the same turn. Bounded: it carries no change.
+            const onHead = this.keepToHeadAfterRefusal(agent, err, compiledRequest);
+            if (!onHead && ownsProviderGate && this.holdProviderAcceleration(agent, err, trigger)) {
               if (this.agents.get(agent.name) === agent && agent.streamId === myStreamId) this.eventGate?.onInferenceEnded(agent.name);
               break;
             }
-            const statedWait = ownsProviderGate ? undefined : this.nonOwningProviderWait(agent, err, trigger);
+            const statedWait = onHead || ownsProviderGate ? undefined : this.nonOwningProviderWait(agent, err, trigger);
             if (statedWait === 'held') {
               if (this.agents.get(agent.name) === agent && agent.streamId === myStreamId) this.eventGate?.onInferenceEnded(agent.name);
               break;
             }
 
-            const action: ErrorAction = statedWait === 'fail' ? { retry: false } : this.errorPolicy.onInferenceError(err, agent.name, attempt);
+            const action: ErrorAction = onHead ? { retry: true, delayMs: 0 }
+              : statedWait === 'fail' ? { retry: false } : this.errorPolicy.onInferenceError(err, agent.name, attempt);
             if (action.retry) {
               // A stop made during the wait reaches no stream: the check after
               // the wait ends the turn, as the guard's check after its wait
@@ -19542,6 +19750,7 @@ export class AgentFramework {
               : agent.maxTokens;
             if (realTotal > 0) {
               agent.lastStreamRealInputTokens = realTotal;
+              agent.noteResponseInput(realTotal);
               agent.lastStreamOutputTokens = callOutputTokens;
               agent.lastStreamUnreportedTokens = 0;
             } else {
