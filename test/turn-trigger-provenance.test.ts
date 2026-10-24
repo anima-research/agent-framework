@@ -1156,6 +1156,212 @@ describe('private wins, one way', () => {
     });
   }
 
+  // A private turn's channel messages (noticeChannelMessages).
+  const HOLDS_ROOM = `[routing] This private turn also holds a message from ${ROOM}, and your plain speech won't reach it.`;
+  /** The stored row of each `[routing]` notice of a private turn's channel messages, in order. */
+  const channelNotices = (rig: { texts(): string[] }) => rig.texts().filter((t) => t.startsWith('[routing] This private turn also holds'));
+  /** Where in the store the notice sits, against the turn's first reply. */
+  const noticeBeforeReply = (rig: { texts(): string[] }) => {
+    const all = rig.texts();
+    const notice = all.findIndex((t) => t.startsWith('[routing] This private turn also holds'));
+    return notice >= 0 && notice < all.indexOf('reply 1');
+  };
+
+  for (const order of ['room first', 'private first'] as const) {
+    it(`a private start that takes in a room's message names the room before the reply, ${order}`, async () => {
+      const rig = await surfaceRig();
+      try {
+        rig.i.pendingRequests.push(...(order === 'room first' ? [roomWake(), tuiWake()] : [tuiWake(), roomWake()]));
+        await rig.until(() => rig.starts.length >= 1 && rig.framework.getAgent('scout')!.state.status === 'idle', 'the turn');
+        assert.ok(privateStart(rig.starts[0]!), JSON.stringify(rig.starts[0]));
+        assert.deepEqual(channelNotices(rig), [`${HOLDS_ROOM} If one needs an answer there, use an explicit send tool.`]);
+        assert.ok(noticeBeforeReply(rig), JSON.stringify(rig.texts()));
+        assert.deepEqual(rig.routed, []);
+      } finally {
+        await rig.close();
+      }
+    });
+  }
+
+  it("a room's turn made private by a stored operator message names the room it was woken for", async () => {
+    const rig = await surfaceRig();
+    try {
+      storeOperatorMessage(rig.framework);
+      rig.i.pendingRequests.push(roomWake());
+      await rig.until(() => rig.starts.length >= 1 && rig.framework.getAgent('scout')!.state.status === 'idle', 'the turn');
+      assert.equal(rig.routings[0]!.nonChannelOrigin, true, 'control: the stored message made the turn private');
+      assert.equal(channelNotices(rig).length, 1, JSON.stringify(rig.texts()));
+      assert.ok(noticeBeforeReply(rig), JSON.stringify(rig.texts()));
+    } finally {
+      await rig.close();
+    }
+  });
+
+  it("a room's wake that continues an open private turn names the room", async () => {
+    const rig = await surfaceRig();
+    try {
+      const routing = routingOf(rig.framework);
+      routing.nonChannelOrigin = true;
+      rig.state.openLogical.set('scout', routing);
+      rig.i.pendingRequests.push(roomWake());
+      await rig.until(() => rig.starts.length >= 1 && rig.framework.getAgent('scout')!.state.status === 'idle', "the room's wake");
+      assert.equal(rig.routings[0], routing, "control: the room's wake continued the private turn");
+      assert.deepEqual(channelNotices(rig), [`${HOLDS_ROOM} If one needs an answer there, use an explicit send tool.`]);
+      assert.deepEqual(rig.routed, []);
+    } finally {
+      rig.state.openLogical.delete('scout');
+      await rig.close();
+    }
+  });
+
+  it("a start gathers its channel wakes' channels, and not an auto-continuation's, which is its turn's locus", async () => {
+    const rig = await surfaceRig();
+    try {
+      const started: InferenceRequest[] = [];
+      rig.i.startAgentStream = async (_agent, trigger) => { if (trigger) started.push(trigger); };
+      const now = Date.now();
+      rig.i.pendingRequests.push(
+        { agentName: 'scout', reason: 'auto-continue', source: 'framework', timestamp: now, channelId: 'discord:g:third', channelServerId: 'discord' },
+        roomWake(),
+      );
+      await rig.i.processInferenceRequests();
+      assert.equal(started.length, 1, JSON.stringify(started));
+      const symbol = Object.getOwnPropertySymbols(started[0]!).find((k) => k.description === 'wake-channels');
+      assert.ok(symbol, 'the start carries its channels');
+      assert.deepEqual((started[0] as unknown as Record<symbol, unknown>)[symbol!], [{ channelId: ROOM }]);
+    } finally {
+      rig.i.pendingRequests.length = 0;
+      await rig.close();
+    }
+  });
+
+  it("a channel's message is named once in a private turn, and a second channel is named on its own", async () => {
+    const rig = await surfaceRig();
+    try {
+      const internalsOf = rig.framework as unknown as {
+        noticeChannelMessages(agent: unknown, routing: Routing, channels: Array<{ channelId: string; serverId?: string }>): unknown;
+      };
+      const routing = routingOf(rig.framework);
+      routing.nonChannelOrigin = true;
+      const agent = rig.framework.getAgent('scout');
+      assert.ok(internalsOf.noticeChannelMessages(agent, routing, [{ channelId: ROOM, serverId: 'discord' }]));
+      assert.equal(internalsOf.noticeChannelMessages(agent, routing, [{ channelId: ROOM, serverId: 'discord' }]), undefined, 'named already');
+      assert.ok(internalsOf.noticeChannelMessages(agent, routing, [{ channelId: ROOM, serverId: 'discord' }, { channelId: LOUNGE, serverId: 'discord' }]));
+      assert.deepEqual(channelNotices(rig), [
+        `${HOLDS_ROOM} If one needs an answer there, use an explicit send tool.`,
+        `[routing] This private turn also holds a message from ${LOUNGE}, and your plain speech won't reach it. If one needs an answer there, use an explicit send tool.`,
+      ]);
+      // Two at once are listed together, and a notice that can't be stored
+      // leaves its channels to be named later.
+      const fresh: Routing = { nonChannelOrigin: true };
+      const cm = agent!.getContextManager() as unknown as { addMessage: (...a: unknown[]) => unknown };
+      const addMessage = cm.addMessage;
+      cm.addMessage = () => { throw new Error('the store is full'); };
+      try {
+        assert.equal(internalsOf.noticeChannelMessages(agent, fresh, [{ channelId: 'discord:g:a' }, { channelId: 'discord:g:b' }]), undefined);
+      } finally {
+        cm.addMessage = addMessage;
+      }
+      assert.ok(internalsOf.noticeChannelMessages(agent, fresh, [{ channelId: 'discord:g:a' }, { channelId: 'discord:g:b' }]));
+      assert.equal(channelNotices(rig).at(-1),
+        "[routing] This private turn also holds a message from discord:g:a and discord:g:b, and your plain speech won't reach them. If one needs an answer there, use an explicit send tool.");
+    } finally {
+      await rig.close();
+    }
+  });
+
+  it("a private turn's boundary that injects a room's addressed message names the room with the injections, and moves nothing", async () => {
+    let framework: AgentFramework | undefined;
+    const tool = robot(() => {
+      (framework as unknown as { addMessage(participant: string, content: unknown, metadata: unknown): unknown }).addMessage(
+        'someone', [{ type: 'text', text: 'over here' }], { channelId: ROOM, serverId: 'discord', tags: ['chat:addressed'] });
+    });
+    const rig = await surfaceRig({ modules: [tool] });
+    framework = rig.framework;
+    try {
+      rig.membrane.pushResponse(createMockResponse([
+        { type: 'text', text: 'looking' },
+        { type: 'tool_use', id: 'm1', name: 'robot--move', input: {} },
+      ] as never, 'tool_use'));
+      rig.membrane.pushResponse(createMockResponse([{ type: 'text', text: 'done' }]));
+      rig.framework.pushEvent(tuiMessage());
+      await rig.until(() => rig.starts.length >= 1 && rig.framework.getAgent('scout')!.state.status === 'idle', 'the turn');
+      const wired = rig.streams[0]!.receivedToolResultOptions
+        .flatMap((o) => o?.injectedMessages ?? []).map((m) => JSON.stringify(m.content));
+      assert.ok(wired.some((w) => w.includes('over here')), `control: the room's message was injected: ${JSON.stringify(wired)}`);
+      assert.ok(wired.some((w) => w.includes(HOLDS_ROOM)), `the notice rode the injections: ${JSON.stringify(wired)}`);
+      assert.equal(channelNotices(rig).length, 1, JSON.stringify(rig.texts()));
+      assert.equal(rig.routings[0]!.locus, undefined, 'the private turn has no locus still');
+      assert.deepEqual(rig.routed, []);
+    } finally {
+      await rig.close();
+    }
+  });
+
+  for (const privateTurn of [true, false]) {
+    it(`a ${privateTurn ? 'private' : "room's"} turn's boundary over budget ${privateTurn ? 'names an addressed message it took in, for the restart to read' : 'leaves an addressed message to move the restart, naming nothing'}`, async () => {
+      // The tool round reports 10 input tokens, over the agent's budget of 5, so
+      // its boundary can't inject what it stored and leaves it to the restart.
+      const OTHER = 'discord:g:other';
+      let framework: AgentFramework | undefined;
+      const tool = robot(() => {
+        (framework as unknown as { addMessage(participant: string, content: unknown, metadata: unknown): unknown }).addMessage(
+          'someone', [{ type: 'text', text: 'over here' }], { channelId: OTHER, serverId: 'discord', tags: ['chat:addressed'] });
+      });
+      const rig = await surfaceRig({ maxStreamTokens: 5, modules: [tool] });
+      framework = rig.framework;
+      try {
+        rig.membrane.pushResponse(createMockResponse([{ type: 'tool_use', id: 'm1', name: 'robot--move', input: {} }] as never, 'tool_use'));
+        if (privateTurn) rig.framework.pushEvent(tuiMessage());
+        else rig.i.pendingRequests.push(roomWake());
+        await rig.until(() => rig.starts.length >= 2 && rig.framework.getAgent('scout')!.state.status === 'idle', 'the turn and its restart');
+        assert.deepEqual(rig.starts.map((r) => r.reason)[1], 'context_budget_restart', JSON.stringify(rig.starts));
+        const wired = rig.streams[0]!.receivedToolResultOptions
+          .flatMap((o) => o?.injectedMessages ?? []).map((m) => JSON.stringify(m.content));
+        assert.ok(!wired.some((w) => w.includes('over here')), `control: the boundary injected nothing: ${JSON.stringify(wired)}`);
+        if (privateTurn) {
+          assert.deepEqual(channelNotices(rig), [
+            `[routing] This private turn also holds a message from ${OTHER}, and your plain speech won't reach it. If one needs an answer there, use an explicit send tool.`,
+          ]);
+          const all = rig.texts();
+          assert.ok(all.findIndex((t) => t.startsWith('[routing] This private turn also holds')) < all.indexOf('reply 1'),
+            `the notice is in the window before the restart's reply: ${JSON.stringify(all)}`);
+          assert.deepEqual(rig.routed, []);
+        } else {
+          assert.deepEqual(channelNotices(rig), [], "a room's turn names nothing");
+          assert.deepEqual(rig.routed, [{ text: 'reply 1', locus: OTHER }], 'the message moved the restart to its channel');
+        }
+      } finally {
+        await rig.close();
+      }
+    });
+  }
+
+  it("a gate wake names its window's channel messages, and a private turn that takes it names them", async () => {
+    const gate = { config: { policies: [{ name: 'both', match: { scope: ['external-message', 'mcpl:channel-incoming'] }, behavior: { debounce: 100 } }], default: 'skip' } };
+    const rig = await surfaceRig({ gate });
+    try {
+      const eventGate = (rig.framework as unknown as { eventGate: { evaluate(info: Record<string, unknown>): unknown } }).eventGate;
+      rig.framework.pushEvent(tuiMessage());
+      eventGate.evaluate({
+        content: 'over here', eventType: 'mcpl:channel-incoming', serverId: 'discord', channelId: ROOM,
+        metadata: { author: { id: 'u1' } }, tags: ['chat:addressed'],
+      });
+      eventGate.evaluate({
+        content: 'and here', eventType: 'mcpl:channel-incoming', serverId: 'discord', channelId: LOUNGE,
+        metadata: { author: { id: 'u2' } }, tags: ['chat:ambient'],
+      });
+      await rig.until(() => rig.starts.length >= 1 && rig.framework.getAgent('scout')!.state.status === 'idle', 'the turn');
+      assert.ok(privateStart(rig.starts[0]!), JSON.stringify(rig.starts[0]));
+      assert.deepEqual(channelNotices(rig), [
+        `[routing] This private turn also holds a message from ${ROOM} and ${LOUNGE}, and your plain speech won't reach them. If one needs an answer there, use an explicit send tool.`,
+      ]);
+      assert.ok(noticeBeforeReply(rig), JSON.stringify(rig.texts()));
+    } finally {
+      await rig.close();
+    }
+  });
+
   it("a request that continues a turn's work is private exactly when that turn is, as it stands when the request comes", async () => {
     const asker = {
       name: 'asker', async start() {}, async stop() {}, getTools: () => [], async handleToolCall() { return { success: false, error: 'none' }; },

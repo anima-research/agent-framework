@@ -177,6 +177,11 @@ export interface WakeProvenance {
    *  private message when that is later, so a consumer coalescing several
    *  requests can order by event recency, not by flush order. */
   at?: number;
+  /** The registered channel of each of the window's channel messages, each
+   *  once, with its server: what a private turn that takes the wake names,
+   *  since its plain speech reaches none of them (the framework's notice of
+   *  a private turn's channel messages). Telemetry, like the fields above. */
+  channels?: Array<{ channelId: string; serverId?: string }>;
   /** The batch's `[Gate: …]` line, when the gate handed it to the wake rather
    *  than wrote it: a WakeLine, the parts its text is rendered from when it's
    *  written (wakeLineText), decided by a fresh start of the wake's turn as
@@ -268,14 +273,20 @@ function isMetadataTruthy(value: unknown): boolean {
  * it holds: its one wake is a private turn's, which answers in no channel,
  * and it names no route, so the operator's words never start a turn whose
  * reply is published (private wins, one way). Its channel, author and
- * addressed still say who woke it, as telemetry.
+ * addressed still say who woke it, as telemetry. So does the list of every
+ * channel the window's messages came from (channels), which such a private
+ * turn names to its resident.
  */
 export function wakeProvenance(events: PendingEvent[]): WakeProvenance | undefined {
   let newest: PendingEvent | undefined;
   let newestAddressed: PendingEvent | undefined;
   let newestPrivate: PendingEvent | undefined;
+  const channels: Array<{ channelId: string; serverId?: string }> = [];
   for (const e of events) {
     if (e.nonChannelOrigin === true && (!newestPrivate || e.timestamp >= newestPrivate.timestamp)) newestPrivate = e;
+    if (e.routeChannelId && !channels.some((c) => c.channelId === e.routeChannelId && c.serverId === e.serverId)) {
+      channels.push({ channelId: e.routeChannelId, ...(e.serverId ? { serverId: e.serverId } : {}) });
+    }
     // A resolved route counts as naming a channel only for an ADDRESSED
     // event: a push whose origin declares only `mcplChannelId` (no raw
     // channel id, no author) is still a routable addressed message, and
@@ -302,6 +313,7 @@ export function wakeProvenance(events: PendingEvent[]): WakeProvenance | undefin
       ? { routeChannelId: pick.routeChannelId, ...(pick.serverId ? { routeServerId: pick.serverId } : {}) }
       : {}),
     ...(privateSurface ? { nonChannelOrigin: true } : {}),
+    ...(channels.length > 0 ? { channels } : {}),
     // A private window's wake is as recent as its newest private message.
     at: newestPrivate && newestPrivate.timestamp > pick.timestamp ? newestPrivate.timestamp : pick.timestamp,
   };

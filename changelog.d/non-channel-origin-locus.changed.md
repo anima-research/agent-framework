@@ -9,8 +9,7 @@
   window, after a quiesce or a provider hold. So is a start that is the first
   to read a private surface's message stored before it, though the message's
   own wake may still wait in a gate window, or the message woke nothing. A
-  channel message whose start is private this way gets no inferred reply in
-  its channel. A turn that takes in private input stays private for the rest
+  turn that takes in private input stays private for the rest
   of it: a start that continues it with a private wake or stored private
   input, or a tool boundary that injects a private surface's message, removes
   its locus, its trigger channel and its sticky `>>` or `>>>` destination, and
@@ -23,6 +22,14 @@
   a script left running reporting its end). A script's wakes go by the turn
   that started it as that turn stands when the wake comes, so a turn that
   took in private input after starting the script counts.
+
+  A private turn that holds a channel's message tells its resident which
+  channels' messages it holds and that its plain speech reaches none of
+  them, in a `[routing]` notice before it replies, naming each channel once
+  in the turn. That covers a channel wake its start takes in, a gate debounce
+  window's channel messages, and a message one of its tool boundaries takes
+  in that would have moved a channel turn's locus, whether the boundary
+  injects it or leaves it to the turn's next start.
 
   In locus and hybrid modes, a private turn's plain speech is counted in its
   `[delivered]` receipt as kept private, rather than reported as a failed send.

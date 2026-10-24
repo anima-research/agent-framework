@@ -1025,7 +1025,21 @@ const TURN_RETRY: unique symbol = Symbol('turn-retry');
  * record. A symbol, as TURN_RETRY is, so spreads and rests copy it.
  */
 const MERGED_BATCH: unique symbol = Symbol('merged-batch');
-type MarkedRequest = InferenceRequest & { [TURN_RETRY]?: true; [MERGED_BATCH]?: InferenceRequest[] };
+/**
+ * The channels of the channel messages a wake brings in, each with its
+ * server where known: a gate window's (WakeProvenance.channels), and a
+ * start's, gathered from its batch (processInferenceRequests). A private
+ * turn that takes them in names them to its resident, since its plain
+ * speech reaches none of them (noticeChannelMessages). A symbol, as
+ * TURN_RETRY is, so spreads copy it.
+ */
+const WAKE_CHANNELS: unique symbol = Symbol('wake-channels');
+type WakeChannel = { channelId: string; serverId?: string };
+type MarkedRequest = InferenceRequest & {
+  [TURN_RETRY]?: true;
+  [MERGED_BATCH]?: InferenceRequest[];
+  [WAKE_CHANNELS]?: WakeChannel[];
+};
 
 function mergedBatch(request: InferenceRequest): InferenceRequest[] | undefined {
   return (request as MarkedRequest)[MERGED_BATCH];
@@ -1208,6 +1222,8 @@ interface TurnRouting {
   nonChannelOrigin: boolean;
   /** Plain-speech segments a private turn kept on its surface (suppressPrivateTurnProse), reported by its receipt apart from suppressed and keptPrivate. */
   privateSuppressed: number;
+  /** The channels whose messages a private turn has named to its resident (noticeChannelMessages), by destination key, so each is named once in the turn. */
+  channelsNamed?: Set<string>;
   /**
    * Drafts held during the turn (src/prose-drafts.ts), which its receipt
    * names by their state at its end, and which settleTurnDrafts records as
@@ -1418,6 +1434,14 @@ export function isNonChannelSurfaceEvent(event: ProcessEvent): boolean {
 
 /** How many private turns' ids the framework keeps (privateTurnIds). */
 const PRIVATE_TURNS_KEPT = 4096;
+
+/** How a private turn's resident reaches a channel, in its prose mode: what
+ *  its routing notices name. */
+function privateTurnReach(agent: Agent): string {
+  return agent.proseRouting === 'hybrid'
+    ? 'an explicit send tool or a >>> envelope'
+    : agent.proseRouting === 'explicit' ? 'a >> prefix or an explicit send tool' : 'an explicit send tool';
+}
 
 /** A request a quiesce lets through, so a turn already alive can finish:
  *  a continuation of the turn, or a held turn's retry (TURN_RETRY). */
@@ -3785,6 +3809,9 @@ export class AgentFramework {
             // private turn, which names no route (wakeProvenance); the
             // telemetry above still says who and where woke it.
             ...(provenance?.nonChannelOrigin ? { nonChannelOrigin: true } : {}),
+            // The window's channel messages, which a private turn that takes
+            // this wake names (WAKE_CHANNELS).
+            ...(provenance?.channels ? { [WAKE_CHANNELS]: provenance.channels } : {}),
             // The batch's line, when the gate left it to the turn's start
             // (beginAgentTurn decides it: placeWakeLines).
             ...(provenance?.line ? { wakeLines: [provenance.line] } : {}),
@@ -12666,12 +12693,22 @@ export class AgentFramework {
             // The last injection that qualifies wins (repinChannel).
             const routing = this.routingOf(agent.name);
             let newLocus: ChannelRef | undefined;
-            for (const inj of midTurnInjections) newLocus = this.repinChannel(inj.metadata, routing) ?? newLocus;
+            // A private turn moves no locus: it names each channel a message
+            // would have moved it to instead, riding the injections.
+            const unmoved: WakeChannel[] = [];
+            for (const inj of midTurnInjections) {
+              const channel = this.repinChannel(inj.metadata, routing);
+              if (channel) unmoved.push(channel);
+              newLocus = channel ?? newLocus;
+            }
             if (newLocus && !routing.nonChannelOrigin) {
               // What this boundary just stored is newer than any arrival the
               // turn holds, so the arrivals can't move the locus back.
               routing.arrivals = [];
               const notice = this.repinTurnLocus(agent, routing, newLocus, 'mid-turn addressed');
+              if (notice) midTurnInjections.push(notice);
+            } else if (routing.nonChannelOrigin && unmoved.length > 0) {
+              const notice = this.noticeChannelMessages(agent, routing, unmoved);
               if (notice) midTurnInjections.push(notice);
             }
           } else if (routesLocus && !shouldEndTurn) {
@@ -12680,6 +12717,17 @@ export class AgentFramework {
             // turn's next start, as arrivals: a budget restart, or a
             // re-inference on these tool results.
             for (const { msg, id } of heard) this.noteArrival(agent.name, msg.metadata, id);
+            // A private turn notes no arrival. It names now, in the window
+            // that start compiles, each channel such a message would have
+            // moved a channel turn's locus to.
+            const routing = this.turnRouting.get(agent.name);
+            if (routing?.nonChannelOrigin) {
+              const unmoved = heard.flatMap(({ msg }) => {
+                const channel = this.repinChannel(msg.metadata, routing);
+                return channel ? [channel] : [];
+              });
+              if (unmoved.length > 0) this.noticeChannelMessages(agent, routing, unmoved);
+            }
           }
 
           if (shouldEndTurn) {
@@ -15448,6 +15496,23 @@ export class AgentFramework {
       // token it stands for them all.
       if (continuesTurn(start) && requests.some((r) => !continuesTurn(r))) start[MERGED_BATCH] = [...requests];
       else delete start[MERGED_BATCH];
+      // The channels of the batch's channel messages, for a private turn's
+      // notice (WAKE_CHANNELS): each channel wake's own, a held turn's retry
+      // naming the message its turn was for, and what each request carries,
+      // a gate window's or a requeued start's. An auto-continuation's
+      // channel is its turn's locus, no message's.
+      const channels: WakeChannel[] = [];
+      const take = (c: WakeChannel) => {
+        if (!channels.some((k) => k.channelId === c.channelId && k.serverId === c.serverId)) channels.push(c);
+      };
+      for (const r of requests) {
+        if (r.channelId && r.reason !== AUTO_CONTINUE_REASON) {
+          take({ channelId: r.channelId, ...(r.channelServerId ? { serverId: r.channelServerId } : {}) });
+        }
+        for (const c of (r as MarkedRequest)[WAKE_CHANNELS] ?? []) take(c);
+      }
+      if (channels.length > 0) start[WAKE_CHANNELS] = channels;
+      else delete start[WAKE_CHANNELS];
       await this.startAgentStream(agent, start);
     }
   }
@@ -16833,6 +16898,55 @@ export class AgentFramework {
   }
 
   /**
+   * The durable `[routing]` notice that a private turn holds messages from
+   * these channels, and that its plain speech reaches none of them: at a
+   * start that took them in (beginAgentTurn), and at a boundary that took
+   * in messages that would have moved a channel turn's locus to them, live
+   * or left to the turn's next start. The resident decides, in the turn that
+   * holds both, whether to answer there. Each channel is named once in the
+   * turn (TurnRouting.channelsNamed). Returns the notice as stored, for a
+   * live stream to inject with its boundary's other messages, or undefined
+   * when every channel was named already or it couldn't be stored. One that
+   * couldn't is logged, and its channels stay unnamed, so a later start or
+   * boundary that takes in their messages names them.
+   */
+  private noticeChannelMessages(
+    agent: Agent,
+    routing: TurnRouting,
+    channels: readonly WakeChannel[],
+  ): { participant: string; content: ContentBlock[]; metadata: MessageMetadata } | undefined {
+    const named = routing.channelsNamed ?? new Set<string>();
+    const fresh: Array<{ key: string; shown: string }> = [];
+    for (const c of channels) {
+      // Named as the agent is shown it where it's registered, else by the id
+      // the wake gave.
+      const ref = this.channelNamed(c.channelId, c.serverId);
+      const key = ref ? destinationKey(ref) : JSON.stringify([c.serverId ?? null, c.channelId]);
+      if (named.has(key) || fresh.some((f) => f.key === key)) continue;
+      fresh.push({ key, shown: ref ? this.channelShown(ref) : c.channelId });
+    }
+    if (fresh.length === 0) return undefined;
+    const shown = fresh.map((f) => f.shown);
+    const list = shown.length === 1 ? shown[0]! : `${shown.slice(0, -1).join(', ')} and ${shown[shown.length - 1]!}`;
+    const content: ContentBlock[] = [{
+      type: 'text',
+      text: `[routing] This private turn also holds a message from ${list}, and your plain speech won't reach ` +
+        `${shown.length === 1 ? 'it' : 'them'}. If one needs an answer there, use ${privateTurnReach(agent)}.`,
+    }];
+    const metadata = { system: true, kind: 'routing-notice' } as MessageMetadata;
+    try {
+      const id = agent.getContextManager().addMessage('user', content, metadata);
+      for (const f of fresh) named.add(f.key);
+      routing.channelsNamed = named;
+      this.emitTrace({ type: 'message:added', messageId: id, source: 'routing-notice' });
+      return { participant: 'user', content, metadata };
+    } catch (err) {
+      console.error(`[routing] ${agent.name}: couldn't store the notice of a private turn's channel messages:`, err);
+      return undefined;
+    }
+  }
+
+  /**
    * The durable `[routing]` notice that a private surface's message came into
    * the turn, so its plain speech goes to no channel: for a turn that turns
    * private with a destination (makeTurnPrivate), and for one a stored
@@ -16844,9 +16958,7 @@ export class AgentFramework {
   private storePrivateTurnNotice(
     agent: Agent,
   ): { participant: string; content: ContentBlock[]; metadata: MessageMetadata } | undefined {
-    const reach = agent.proseRouting === 'hybrid'
-      ? 'an explicit send tool or a >>> envelope'
-      : agent.proseRouting === 'explicit' ? 'a >> prefix or an explicit send tool' : 'an explicit send tool';
+    const reach = privateTurnReach(agent);
     const content: ContentBlock[] = [{
       type: 'text',
       text: '[routing] A message from a private surface came into this turn, so for the rest of it your plain ' +
@@ -19008,6 +19120,12 @@ export class AgentFramework {
       routing.arrivals = [];
       if (arrival) this.repinTurnLocus(agent, routing, arrival, 'arrival');
     }
+    // A private turn whose start took in a channel's message says so before
+    // it compiles: its plain speech won't reach that channel, and the
+    // resident chooses whether to answer there. A retry of the start names
+    // nothing the first attempt named (TurnRouting.channelsNamed).
+    const wakeChannels = (trigger as MarkedRequest | undefined)?.[WAKE_CHANNELS];
+    if (routing.nonChannelOrigin && wakeChannels) this.noticeChannelMessages(agent, routing, wakeChannels);
     // A private turn's start routes to no channel and is addressed in none,
     // whatever requests it took in, so neither its typing nor what its speech
     // handlers read points at the channel of a wake that joined it. Its
