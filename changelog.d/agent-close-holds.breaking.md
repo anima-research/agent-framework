@@ -8,11 +8,12 @@
   where speech used to reopen the channel. Words that wait on a channel's lifecycle work, or on an
   open they started, go into the channel as it stands once the agent closes or declines it
   meanwhile, or a module closes it, where they were refused with "a decision to close the channel
-  came before these words went out". They're still refused where the failure leaves in doubt which
-  channel the server reaches by that id: an open answered for another channel, or a channel whose
-  address kept changing until the tries ran out. Speech into any other closed channel, one nobody
-  decided about (such as a DM that woke the agent) or one a machine closed, opens it as before,
-  with that notice, and a close a machine decides while words wait still refuses them.
+  came before these words went out". They're still refused where the channel's address kept
+  changing until the tries ran out, and a channel whose last open the server answered for another
+  channel takes no words as it stands until an open of it is answered for this channel, since a
+  publish by its id may not reach it. Speech into any other closed channel, one nobody decided
+  about (such as a DM that woke the agent) or one a machine closed, opens it as before, with that
+  notice, and a close a machine decides while words wait still refuses them.
   - **Who needs to act:** an agent that closed a channel and wants its ongoing traffic again opens
     it with `channel_open`; speaking there no longer does. Messages that address the agent still
     arrive while a channel is closed.
@@ -53,23 +54,23 @@
     server's to say (#406): on discord-mcpl, the channel's later messages that don't address the
     agent don't arrive as they're posted, and anima-research/discord-mcpl#97 has discord-mcpl say
     so on its push.
-  - **What residents notice:** on discord-mcpl, opening a channel also turns on its reaction
-    forwarding, and closing it turns that off. A reply in a guild channel the agent closed used to
-    reopen it, and so turn its reactions on. Now reactions to that reply arrive only where the
-    agent opens the channel or turns them on with `set_reaction_visibility`. DMs are unaffected:
-    discord-mcpl requests no DM reaction events. discord-mcpl's `channels/open` also lifts a mute
-    set with `mute_channel`, so a reply that opens a muted channel nobody decided about, or one a
-    machine closed, unmutes it, as before; a channel the agent closed keeps its mute. On zulip_mcp,
-    an answer's topic comes from the last message delivered as `channels/incoming`, and a closed
-    stream's mentions are pushed instead, so in a stream the agent closed, every answer goes to the
-    topic of the stream's last message from before the close, where a reply used to reopen the
-    stream.
-  - **What hosts notice:** on discord-mcpl, a channel the agent closed keeps delivering the
-    messages that address the agent as push events, as any closed channel's are, where a reply used
-    to reopen it and switch them to `channels/incoming`. Host code that acts on
-    `channels/incoming`, such as connectome-host's outage reply, doesn't see them there. Nor does a
-    turn with no trigger, such as a heartbeat, come to speak there: where it speaks moves only with
-    `channels/incoming` messages.
+  - **What residents notice,** by our reading of discord-mcpl's and zulip_mcp's code: on
+    discord-mcpl, opening a channel also turns on its reaction forwarding, and closing it turns
+    that off. A reply in a guild channel the agent closed used to reopen it, and so turn its
+    reactions on. Now reactions to that reply arrive only where the agent opens the channel or
+    turns them on with `set_reaction_visibility`. DMs are unaffected: discord-mcpl requests no DM
+    reaction events. discord-mcpl's `channels/open` also lifts a mute set with `mute_channel`, so a
+    reply that opens a muted channel nobody decided about, or one a machine closed, unmutes it, as
+    before; a channel the agent closed keeps its mute. On zulip_mcp, an answer's topic comes from
+    the last message delivered as `channels/incoming`, and a closed stream's mentions are pushed
+    instead, so in a stream the agent closed, every answer goes to the topic of the stream's last
+    message from before the close, where a reply used to reopen the stream.
+  - **What hosts notice,** by our reading of discord-mcpl's and connectome-host's code: on
+    discord-mcpl, a channel the agent closed keeps delivering the messages that address the agent
+    as push events, as any closed channel's are, where a reply used to reopen it and switch them to
+    `channels/incoming`. Host code that acts on `channels/incoming`, such as connectome-host's
+    outage reply, doesn't see them there. Nor does a turn with no trigger, such as a heartbeat,
+    come to speak there: where it speaks moves only with `channels/incoming` messages.
 - **Hosts with modules that close channels:** a module's `channel_close` through its own tool call
   (`ctx.callTool`) without a machine source is now recorded with the source `module-tool`, where it
   was `agent-tool`. Speech leaves such a channel closed, as it does one the agent closed, but gives

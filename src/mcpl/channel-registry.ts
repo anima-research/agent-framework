@@ -136,14 +136,15 @@ class ChannelLifecycleError extends Error {
 }
 
 /** Whether a lifecycle failure, or one it wraps (an overtaken open's
- *  `cause`), leaves in doubt which channel the server reaches by this id:
- *  convergence that never established the channel's target, or an answer
- *  for another channel. Words don't go into such a channel on the strength
- *  of a close the agent decided meanwhile (refusalGivesWay), since the
- *  server may not resolve their publish to it either. */
-function targetInDoubt(err: unknown): boolean {
+ *  `cause`), is convergence that never established the channel's target.
+ *  Words don't go into such a channel on the strength of a close the agent
+ *  decided meanwhile (refusalGivesWay): the address they'd go to is the one
+ *  that kept changing. A later operation that settles on the current target
+ *  establishes it, so this is the failure's, not the channel's (compare
+ *  answeredElsewhere). */
+function convergeFailure(err: unknown): boolean {
   for (let e: unknown = err; e instanceof Error; e = e.cause) {
-    if (e instanceof ChannelLifecycleError && (e.kind === 'converge' || e.kind === 'substituted')) return true;
+    if (e instanceof ChannelLifecycleError && e.kind === 'converge') return true;
   }
   return false;
 }
@@ -1259,6 +1260,16 @@ export class ChannelRegistry {
   // Losing an open receipt does not confirm closure. Keep that distinction
   // private while preserving the public open:boolean availability projection.
   private unconfirmedChannelTargets = new WeakSet<ChannelEntry>();
+  // Registrations whose last open the server answered for another channel,
+  // until an open is answered for this one, or the server registers the
+  // channel again, which makes a new registration: a server that doesn't
+  // resolve this id may not resolve a publish by it either. A close's answer
+  // names no channel, so it doesn't clear the mark, and a retarget keeps the
+  // registration and its mark. Read where speech would put words into such a
+  // channel without an open (publish). Where the grant loses
+  // channels.lifecycle while the connection stays (§6.7), no open can clear
+  // the mark until the server reconnects and registers the channel again.
+  private answeredElsewhere = new WeakSet<ChannelEntry>();
   // Marked entries a close failed for since a receipt or traffic last
   // confirmed them, cleared where the mark is: a failed request's outcome is
   // unknown, so such a close may have closed the channel, where an open,
@@ -3616,6 +3627,7 @@ export class ChannelRegistry {
         // its sends either.
         if (substitute !== undefined) {
           this.invalidateTransportConfirmation(entry);
+          this.answeredElsewhere.add(entry);
           throw new ChannelLifecycleError(
             `the "${serverId}" server answered for ` +
             (substitute.kind === 'other' ? 'a different channel' : 'a channel whose id isn\'t a string') +
@@ -3625,6 +3637,7 @@ export class ChannelRegistry {
         }
         if (open) this.applyOpenDeclaration(entry, result);
         entry.open = open;
+        if (open) this.answeredElsewhere.delete(entry);
         this.unconfirmedChannelTargets.delete(entry);
         this.failedCloseTargets.delete(entry);
         const now = this.getDesiredState(serverId, channelId);
@@ -4739,11 +4752,12 @@ export class ChannelRegistry {
   /** Whether words a wait or an open refused go into the channel after all:
    *  its registration `now` is one speech leaves as it stands
    *  (speechLeavesAsItStands), such as one the agent closed or declined
-   *  while the words waited, and the failure doesn't leave in doubt which
-   *  channel the server reaches by its id (targetInDoubt). A registration
-   *  that went still fails them. */
+   *  while the words waited, and the failure isn't convergence that never
+   *  established its target (convergeFailure). A registration that went
+   *  still fails them, and publish() refuses one the server last answered
+   *  for another channel (answeredElsewhere), whenever that happened. */
   private refusalGivesWay(err: unknown, now: ChannelEntry | undefined): now is ChannelEntry {
-    return this.speechLeavesAsItStands(now) && !targetInDoubt(err);
+    return this.speechLeavesAsItStands(now) && !convergeFailure(err);
   }
 
   /** Whether this host doesn't direct the server's channel lifecycle: the
@@ -4877,8 +4891,8 @@ export class ChannelRegistry {
     } catch (err) {
       // A channel the send now leaves as it stands, such as one the agent
       // closed or declined while queued work or the open was out, answers as
-      // one it found so: nothing failed that the send would have done. A
-      // failure that leaves its target in doubt is still reported
+      // one it found so: nothing failed that the send would have done.
+      // Convergence that never established its target is still reported
       // (refusalGivesWay).
       const now = this.entryAt({ serverId: entry.serverId, channelId: entry.descriptor.id });
       if (this.refusalGivesWay(err, now)) return this.sendLeavesChannel(now);
@@ -5756,8 +5770,9 @@ export class ChannelRegistry {
     // (speechOpens), and if it doesn't open, nothing goes out. A wait or an
     // open that fails is read against the channel as it is then, so a close
     // the agent decides while the words wait lets them go into the channel
-    // as that close leaves it, unless the failure leaves in doubt which
-    // channel the server reaches by its id (refusalGivesWay).
+    // as that close leaves it, unless the failure is convergence that never
+    // established its target (refusalGivesWay). A channel the server last
+    // answered for another one takes nothing as it stands (answeredElsewhere).
 
     // Lifecycle work already queued for the channel settles first: words go
     // out only into the channel it leaves, and fail visibly if it leaves
@@ -5845,6 +5860,17 @@ export class ChannelRegistry {
     if (!current) return { status: 'failed', destination, reason: CHANNEL_REMOVED_CLAUSE, at: at() };
     if (isInboundOnly(current)) {
       return { status: 'failed', destination, reason: inboundOnlyReason(current), at: at() };
+    }
+    // A channel the words go into as it stands, with no open to check what
+    // the server reaches by its id, takes nothing where the server answered
+    // its last open for another channel, whenever that was (answeredElsewhere):
+    // the words could reach that other channel.
+    if ((!current.open || this.closeStands(current)) && this.answeredElsewhere.has(current)) {
+      return {
+        status: 'failed', destination, at: at(),
+        reason: `the "${current.serverId}" server answered this channel's last open for a different channel, so words ` +
+          "sent by its id may not reach it; once an open of it is answered for this channel, they go into it again",
+      };
     }
     // A grant reduced during any of the waits holds at once (§6.7): the
     // words already on their way take it too. Its refusal is worded for the
