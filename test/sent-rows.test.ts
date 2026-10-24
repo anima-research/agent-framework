@@ -13,7 +13,7 @@ import type { ContentBlock, NormalizedRequest, NormalizedResponse, YieldingStrea
 
 import { AgentFramework } from '../src/index.js';
 import type { Module, ToolCall } from '../src/index.js';
-import { asNextRequestCarries, roundRows, type SentRow } from '../src/sent-rows.js';
+import { asNextRequestCarries, roundRows, sameData, type SentRow } from '../src/sent-rows.js';
 import { createMockResponse, MockMembrane, MockYieldingStream } from './helpers/mock-membrane.js';
 
 const UNSTORED = { unstored: true };
@@ -24,6 +24,42 @@ const toolUse = (id: string) => ({ type: 'tool_use', id, name: 'test--echo', inp
 const image = { type: 'image', source: { type: 'base64', mediaType: 'image/png', data: 'iVBORw0KGgo=' } } as ContentBlock;
 const result = (toolUseId: string, content: string, isError?: boolean) =>
   ({ type: 'tool_result', toolUseId, content, ...(isError !== undefined ? { isError } : {}) }) as ContentBlock;
+
+describe('sameData', () => {
+  it('is equal where JSON writes the two alike, key order aside', () => {
+    const equal: Array<[unknown, unknown, string]> = [
+      [{ type: 'text', text: 'Hi.' }, { text: 'Hi.', type: 'text' }, 'key order'],
+      [{ a: 1, b: undefined }, { a: 1 }, 'an undefined field'],
+      [{ a: 1, f: () => 1 }, { a: 1 }, 'a function field'],
+      [[undefined, 1], [null, 1], 'an undefined element'],
+      // eslint-disable-next-line no-sparse-arrays
+      [[, 1], [null, 1], 'a hole'],
+      [{ n: Infinity }, { n: null }, 'a non-finite number'],
+      [[NaN], [null], 'NaN'],
+      [{ at: new Date(0) }, { at: '1970-01-01T00:00:00.000Z' }, 'a Date, by its toJSON'],
+      [{ nested: { list: [{ a: 1 }, 'x'] } }, { nested: { list: [{ a: 1 }, 'x'] } }, 'nested'],
+    ];
+    for (const [a, b, label] of equal) {
+      assert.equal(sameData(a, b), true, label);
+      assert.equal(sameData(b, a), true, `${label}, the other way`);
+    }
+    const unequal: Array<[unknown, unknown, string]> = [
+      [{ a: { b: null } }, { a: { b: {} } }, 'null against an object, nested'],
+      [{ a: null }, { a: 0 }, 'null against 0'],
+      [[1, 2], { 0: 1, 1: 2, length: 2 }, 'an array against an object with its keys'],
+      [{}, { extra: 1 }, 'a field more'],
+      [{ a: 1 }, { b: 1 }, 'another field'],
+      [[1, 2], [2, 1], 'element order'],
+      [[1], [1, null], 'length'],
+      [{ at: new Date(0) }, { at: new Date(1) }, 'two Dates'],
+      [{ a: '1' }, { a: 1 }, 'a string against a number'],
+    ];
+    for (const [a, b, label] of unequal) {
+      assert.equal(sameData(a, b), false, label);
+      assert.equal(sameData(b, a), false, `${label}, the other way`);
+    }
+  });
+});
 
 describe('asNextRequestCarries', () => {
   it('leaves out what the sanitize pass does and the framework\'s stamp, and is null where nothing is left', () => {
@@ -50,6 +86,7 @@ describe('roundRows', () => {
     // A stored block with a stale cache marker, which the binding doesn't count.
     ['note-marked', { participant: 'user', content: [{ ...text('A note.'), cache_control: { type: 'ephemeral' } } as ContentBlock] }],
     ['results-error', { participant: 'user', content: [result('c1', 'ok', true)] }],
+    ['note-undefined', { participant: 'user', content: [{ ...text('A note.'), citations: undefined } as never] }],
     ['gone', null],
   ]);
   const carried = (id: MessageId) => store.get(id) ?? null;
@@ -65,7 +102,10 @@ describe('roundRows', () => {
       { kind: 'injected', id: 'note-marked', participant: 'user', sent: [text('A note.')] },
       // A marker on what was sent, in its camelCase form.
       { kind: 'injected', id: 'note', participant: 'user', sent: [{ ...text('A note.'), cacheControl: { type: 'ephemeral' } } as never] },
-    ], carried), ['reply', 'reply-empty', 'results', 'note', 'results-image', 'note-marked', 'note'] as SentRow[]);
+      // A field whose value is undefined, on either side, is absent, as JSON leaves it out.
+      { kind: 'injected', id: 'note', participant: 'user', sent: [{ ...text('A note.'), citations: undefined } as never] },
+      { kind: 'injected', id: 'note-undefined', participant: 'user', sent: [text('A note.')] },
+    ], carried), ['reply', 'reply-empty', 'results', 'note', 'results-image', 'note-marked', 'note', 'note', 'note-undefined'] as SentRow[]);
   });
 
   it('marks a row the next request carries otherwise, or doesn\'t carry, or the store doesn\'t hold', () => {
@@ -83,10 +123,12 @@ describe('roundRows', () => {
       { kind: 'injected', id: 'note-spaced', participant: 'Bob', sent: [text(' \n'), text('A note.')] },
       // membrane sent the carrier's item; the next request leaves the carrier out.
       { kind: 'reply', id: 'reply-carrier', sent: [signed('s'), { type: 'text', text: '', rawItem: { type: 'web_search_tool_result' } } as ContentBlock, text('Found.')] },
+      // A difference inside a nested field: the image's data.
+      { kind: 'results', id: 'results-image', sent: [{ toolUseId: 'c1', content: [text('A chart.'), { ...image, source: { ...(image as { source: object }).source, data: 'other' } }] as never, isError: false }] },
       // Results for another call, and an error flag that differs.
       { kind: 'results', id: 'results', sent: [{ toolUseId: 'c2', content: 'ok', isError: false }] },
       { kind: 'results', id: 'results-error', sent: [{ toolUseId: 'c1', content: 'ok', isError: false }] },
-    ], carried), Array(10).fill(UNSTORED) as SentRow[]);
+    ], carried), Array(11).fill(UNSTORED) as SentRow[]);
   });
 });
 
@@ -242,14 +284,25 @@ describe('a stream\'s rounds, noted at each tool boundary and at its end', () =>
     assert.deepEqual(notes.map((n) => n.rows), [replies(stored)]);
   });
 
+  it('notes the marker for a reply the wrapper-prose guard contains, since a system row stands where it would be', async () => {
+    const { notes, stored } = await turn({ agent: { toolWrapperProseGuard: true }, scripts: [[final([signed('sig-1'), text('<test--echo/>')])]] });
+    assert.ok(stored.some((m) => m.metadata?.kind === 'tool-wrapper-prose-contained'), 'the guard contained the reply');
+    assert.deepEqual(notes.map((n) => n.rows), [[UNSTORED]]);
+  });
+
   it('notes a stream a result ends at that boundary, with the round\'s reply and not its results', async () => {
     const { notes, stored } = await turn({ scripts: [[round('c1', [signed('sig-1'), text('Ending.')], 'end')]] });
     assert.deepEqual(notes.map((n) => n.rows), [replies(stored)]);
   });
 
-  it('notes a stream a budget restart ends before the restart\'s compile, and the restart\'s own stream after it', async () => {
+  for (const [restart, agent] of [
+    ['a budget restart', { maxStreamTokens: 50 }],
+    // The budget is never passed, so only the window can restart the stream: the first call's prompt (100), its
+    // output (10) and the reserve for the next response (100) pass a window of 150, and without the prompt wouldn't.
+    ['a window restart', { maxStreamTokens: 1_000_000, maxTokens: 100, physicalWindowTokens: 150 }],
+  ] as const) it(`notes a stream ${restart} ends before the restart's compile, and the restart's own stream after it`, async () => {
     const { log, notes, stored, streams } = await turn({
-      agent: { maxStreamTokens: 50 }, scripts: [[round('c1', [signed('sig-1'), text('Calling.')]), final()], [final()]],
+      agent, scripts: [[round('c1', [signed('sig-1'), text('Calling.')]), final()], [final()]],
     });
     assert.equal(streams, 2, 'the restart opened a second stream');
     const [reply1, reply2] = replies(stored);

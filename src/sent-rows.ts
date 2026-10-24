@@ -55,9 +55,48 @@ function withoutCacheMarker(block: ContentBlock): unknown {
   return rest;
 }
 
-/** Blocks equal as JSON data: as the store keeps them and a request sends them, `undefined` fields left out. */
-function sameData(a: unknown, b: unknown): boolean {
-  return isDeepStrictEqual(JSON.parse(JSON.stringify(a)), JSON.parse(JSON.stringify(b)));
+/** A value as JSON writes it: a non-finite number as null, and undefined, a function or a symbol as nothing
+ *  (undefined here), which an object leaves out and an array writes as null. */
+function asJson(value: unknown): unknown {
+  if (typeof value === 'number') return Number.isFinite(value) ? value : null;
+  return value === undefined || typeof value === 'function' || typeof value === 'symbol' ? undefined : value;
+}
+
+/** Whether JSON writes an object by walking it: an array, or a plain object without its own `toJSON`. */
+function walkable(value: object): boolean {
+  if (Array.isArray(value)) return true;
+  const proto = Object.getPrototypeOf(value);
+  return (proto === Object.prototype || proto === null) && typeof (value as { toJSON?: unknown }).toJSON !== 'function';
+}
+
+/**
+ * Blocks equal as JSON data, as the store keeps them and a request sends them: equal where `JSON.stringify` writes
+ * them alike, key order aside. So a non-finite number is null; a field whose value is undefined, a function or a
+ * symbol is absent; such an array element, or a hole, is null; and anything else an object can be (a Date, a Buffer)
+ * is compared as JSON writes it. It walks plain objects and arrays rather than serializing them, since a note compares
+ * every row of the stream so far, base64 images and long tool results included, at each boundary.
+ */
+export function sameData(a: unknown, b: unknown): boolean {
+  const left = asJson(a);
+  const right = asJson(b);
+  if (left === right) return true;
+  const unwalked = (value: unknown) => typeof value === 'object' && value !== null && !walkable(value);
+  if (unwalked(left) || unwalked(right)) {
+    return isDeepStrictEqual(JSON.parse(JSON.stringify(left) ?? 'null'), JSON.parse(JSON.stringify(right) ?? 'null'));
+  }
+  if (typeof left !== 'object' || typeof right !== 'object' || left === null || right === null) return false;
+  if (Array.isArray(left) || Array.isArray(right)) {
+    if (!Array.isArray(left) || !Array.isArray(right) || left.length !== right.length) return false;
+    for (let i = 0; i < left.length; i++) {
+      if (!sameData(asJson(left[i]) ?? null, asJson(right[i]) ?? null)) return false;
+    }
+    return true;
+  }
+  const l = left as Record<string, unknown>;
+  const r = right as Record<string, unknown>;
+  const keys = Object.keys(l).filter((key) => asJson(l[key]) !== undefined);
+  return keys.length === Object.keys(r).filter((key) => asJson(r[key]) !== undefined).length
+    && keys.every((key) => Object.hasOwn(r, key) && asJson(r[key]) !== undefined && sameData(l[key], r[key]));
 }
 
 /** What membrane builds a round's results message from: each submitted result as a `tool_result` block. */
