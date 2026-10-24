@@ -374,6 +374,32 @@ describe('clock rows in the framework', () => {
     } finally { await x.framework.stop(); }
   });
 
+  it('a binding agent\'s note at that boundary names the clock it injects, by the id it was stored under', async () => {
+    const x = await make({ clock: { intervalMinutes: 10 }, thinkingBinding: { binds: true } } as Partial<AgentConfig>);
+    x.membrane.supportsInjectedMessages = true; // as membrane's native path declares
+    const notes: string[][] = [];
+    const cm = x.framework.getAgent('assistant')!.getContextManager() as unknown as { noteRequestSent: unknown };
+    cm.noteRequestSent = (rows: unknown[]) => { notes.push(rows.map((row) => typeof row === 'string' ? row : 'marker')); return true; };
+    try {
+      setClock('2026-10-21T10:41:10Z');
+      await wake(x, event('warm up'), [{ type: 'text', text: 'ok' }]);
+      setClock('2026-10-21T10:48:10Z');
+      x.mod.during = () => setClock('2026-10-21T10:52:10Z');
+      await wake(
+        x, event('go'),
+        [{ type: 'tool_use', id: 't1', name: 'tools--ping', input: {} } as ContentBlock],
+        [{ type: 'text', text: 'done' }],
+      );
+      const all = x.framework.getAgent('assistant')!.getContextManager().getAllMessages();
+      const results = all.findIndex((r) => r.content.some((b) => b.type === 'tool_result'));
+      const clock = all[results + 1]!;
+      assert.ok(isClock(clock as unknown as Row), 'the clock follows the tool results');
+      const boundary = notes.find((rows) => rows.includes(all[results]!.id));
+      assert.ok(boundary, JSON.stringify(notes));
+      assert.deepEqual(boundary!.slice(-2), [all[results]!.id, clock.id], 'the results, then the clock, each by its stored id');
+    } finally { await x.framework.stop(); }
+  });
+
   it('after a tool round that spans a boundary: the time it is written, after the results, in the live stream too', async () => {
     const x = await make();
     x.membrane.supportsInjectedMessages = true; // as membrane's native path declares

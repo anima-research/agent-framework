@@ -160,6 +160,8 @@ import { splitProseRuns, withoutRoundsProse } from './prose-segments.js';
 import { AUTO_CONTINUE_REASON, AUTO_CONTINUE_STOP_REASONS, autoContinueNotice } from './auto-continue.js';
 import { cumulativeDelta } from './usage-accounting.js';
 import { stampThinkingTokenEstimates } from './thinking-token-stamp.js';
+import { splitThinkingDrops, ThinkingLossIncidents, type PlacedDrop, type StreamThinkingDrops } from './thinking-drops.js';
+import { roundRows, type RoundRow, type SentRow } from './sent-rows.js';
 import { contentAsStored, nameAsStored } from './text-as-stored.js';
 
 /** An MCPL tool call refused because its server isn't in the registry: one
@@ -2695,6 +2697,14 @@ function wakeLineKey(line: WakeLine): string {
   return JSON.stringify([eventType, serverId ?? null, channelId ?? null, messageId ?? null, eventId ?? null]);
 }
 
+/** A stream's notes to the context manager: how to note (the stream start's `noteRequestSent`), its rows so far after
+ *  the compiled messages, and whether it has stopped noting. */
+interface StreamRequestNotes {
+  note: (rows: readonly SentRow[]) => boolean;
+  rounds: RoundRow[];
+  stopped: boolean;
+}
+
 export class AgentFramework {
   private toolPresentations = new Map<string, ToolPresentation>();
   private presentationPreviews = new WeakMap<object, PresentationSnapshot>();
@@ -3252,6 +3262,14 @@ export class AgentFramework {
    *  publish the call makes is credited with (publishReadThrough). Kept only
    *  while the dispatch runs (dispatchScriptToolCall). */
   private readonly scriptCallStarts = new Map<string, { turnId?: number; readThrough: { branch: string; sequence: number } | null }>();
+  /** Per agent, the unexpected thinking drops its last operator alert counted (noteThinkingLoss). */
+  private readonly thinkingLossIncidents = new ThinkingLossIncidents();
+  /** Per live stream that can be noted, its rows so far after the compiled messages (noteRoundSent). */
+  private readonly streamRequestNotes = new WeakMap<YieldingStream, StreamRequestNotes>();
+  /** Per pending round's blocks (pendingAssistantBlocks' value), what membrane held as that round's reply
+   *  (`roundContent`, its results left out); null where the round has no `roundContent` (XML or fallback). Keyed by
+   *  the blocks themselves, so it goes wherever they go. */
+  private readonly pendingRoundSent = new WeakMap<ContentBlock[], ContentBlock[] | null>();
   /** Per agent, a round that called code_execution and waits for those calls'
    *  results before its prose is routed (ScriptRound). */
   private scriptRounds: Map<string, ScriptRound> = new Map();
@@ -8022,10 +8040,9 @@ export class AgentFramework {
    * delegates to `Agent.buildActivationRequest`. No tokens are spent, no
    * external MCPL server is contacted, no fold resolution is persisted and
    * none of the compression its fold plan calls for is queued; the consumed
-   * watermark and any prepared budget change are left alone; and once
-   * context-manager's thinking binding (context-manager#160, not yet
-   * released) ships, no stamps are committed and no compile awaits
-   * acceptance. In context-manager 0.14 its dry run leaves nothing else
+   * watermark and any prepared budget change are left alone; and with the
+   * thinking binding (`thinkingBinding.binds`), no binding record is
+   * written. In context-manager 0.14 its dry run leaves nothing else
    * behind but the release of an expired compression hold, as any compile
    * does (see `Agent.compileWithInjections`). The preview keeps in-memory
    * bookkeeping of its own, such as handing the context manager the
@@ -8156,10 +8173,13 @@ export class AgentFramework {
       previewContext?: (
         budget: TokenBudget,
         overrides?: Record<string, unknown>,
-        opts?: { render?: boolean },
+        opts?: { render?: boolean; thinkingBinding?: unknown },
       ) => unknown;
     };
     if (typeof cm.previewContext !== 'function') return null;
+    // A preview prices what the agent's compile would send, so it's told the binding a compile is (a context
+    // manager that keeps a thinking-binding record prices a summary's carriers by it).
+    const thinkingBinding = agent.thinkingBindingOption();
     // reserveForResponse mirrors the live compile so the previewed middle is
     // comparable to what the agent actually gets. `opts.render` additionally
     // returns the rendered entries — opt-in, since they are megabytes on a
@@ -8167,7 +8187,7 @@ export class AgentFramework {
     return cm.previewContext(
       { maxTokens: budgetTokens, reserveForResponse: agent.maxTokens },
       overrides,
-      opts,
+      thinkingBinding ? { ...opts, thinkingBinding } : opts,
     );
   }
 
@@ -9165,6 +9185,7 @@ export class AgentFramework {
         // deregistered, so disposal must release EventGate liveness itself.
         this.eventGate?.onInferenceEnded(agent.name);
         this.agents.delete(agent.name);
+        this.thinkingLossIncidents.forget(agent.name);
         // Its sleep and self-wake end with it, as a fork's do.
         this.eventGate?.agentGone(agent.name);
         this.releaseWindowNowOrAfterResume(agent);
@@ -12304,14 +12325,16 @@ export class AgentFramework {
           // Flush pending assistant blocks (tool_use + preamble text) to context
           const pendingBlocks = this.pendingAssistantBlocks.get(agent.name);
           const turnRowMetadata = this.silentTurnRowMetadata(agent.name);
+          let replyId: MessageId | undefined;
           if (pendingBlocks) {
-            agent.addAssistantResponse(pendingBlocks, turnRowMetadata);
+            replyId = agent.addAssistantResponse(pendingBlocks, turnRowMetadata);
             this.pendingAssistantBlocks.delete(agent.name);
           }
+          const replySent = pendingBlocks ? this.pendingRoundSent.get(pendingBlocks) : undefined;
           const membraneResults = currentState.toolResults.map(tc =>
             this.toMembraneToolResult(tc.id, tc.result, maxChars, spilled.get(tc.id))
           );
-          agent.toolResultGuard.storeResults(toolResultContent, membraneResults, currentState.toolResults, turnRowMetadata, keptCap);
+          const resultsId = agent.toolResultGuard.storeResults(toolResultContent, membraneResults, currentState.toolResults, turnRowMetadata, keptCap);
 
           // Flush any messages that were deferred while this turn was in
           // flight: this agent's own entries, those addressed to it and, for
@@ -12382,7 +12405,7 @@ export class AgentFramework {
           // Everything queued for the agent waits for the turn-end flush, as
           // a held message does, rather than sitting in the window between
           // rounds the stream never showed it.
-          const midTurnInjections: Array<{ participant: string; content: ContentBlock[]; metadata?: MessageMetadata }> = [];
+          const midTurnInjections: Array<{ participant: string; content: ContentBlock[]; metadata?: MessageMetadata; id?: MessageId }> = [];
           // What this boundary stored for the agent to hear, in store order,
           // for a boundary that leaves it to the turn's next start as
           // arrivals: that start's compile sends it.
@@ -12452,12 +12475,13 @@ export class AgentFramework {
             // stand in for it, or the anchor be past it, and then it goes in
             // where the next compile doesn't send it.
             const asSent = (i: number, content: ContentBlock[]): ContentBlock[] => rendered?.[i] ?? content;
-            if (clock) midTurnInjections.push({ participant: 'user', content: asSent(0, clock.content), metadata: clock.metadata });
+            if (clock) midTurnInjections.push({ participant: 'user', content: asSent(0, clock.content), metadata: clock.metadata, id: clock.id });
             heard.forEach((h, i) => {
               midTurnInjections.push({
                 participant: h.msg.participant,
                 content: asSent(i + first, h.content),
                 ...(h.msg.metadata ? { metadata: h.msg.metadata } : {}),
+                id: h.id,
               });
             });
           }
@@ -12498,8 +12522,13 @@ export class AgentFramework {
           // Check if any tool result requested endTurn
           const shouldEndTurn = currentState.toolResults.some(tc => tc.result.endTurn);
 
-          // Check if accumulated input tokens exceed the agent's budget
+          // Check if accumulated input tokens exceed the agent's budget. Not for an agent whose model binds its
+          // thinking with its window size set (thinkingBinding.binds, physicalWindowTokens): a new stream mid-turn
+          // compiles afresh, and what that compile changes ahead of the turn's own earlier rounds takes their
+          // reasoning out of the request mid-step. The window projection below still breaks the stream before a
+          // request the window can't hold (issue #92).
           const overBudget = currentState.stream
+            && !(agent.thinkingBindingOption() !== undefined && agent.physicalWindowTokens !== undefined)
             && agent.lastStreamInputTokens > 0
             && agent.lastStreamInputTokens > agent.maxStreamTokens;
 
@@ -12602,6 +12631,11 @@ export class AgentFramework {
             for (const { msg, id } of heard) this.noteArrival(agent.name, msg.metadata, id);
           }
 
+          // A boundary that ends the stream (a result that ends the turn, a restart, a stopping framework) has
+          // stored the stream's last reply above: its final row. Its results go nowhere this stream sends.
+          if (currentState.stream && (shouldEndTurn || overBudget || overPhysical)) {
+            this.noteStreamEnd(agent, currentState.stream, { kind: 'reply', id: replyId, sent: replySent ?? [] }, replySent == null);
+          }
           if (shouldEndTurn) {
             // endTurn: what this boundary stored stays; cancel stream, reset to idle.
             // The batch is never submitted, so nothing can refuse it: admit
@@ -12692,11 +12726,19 @@ export class AgentFramework {
             // keeps them, whether it's a heard message, rendered or not, or a
             // notice the boundary made: this is where they leave for the
             // request.
+            const submitted = agent.toolResultGuard.submissionResults(membraneResults);
+            const injectedMessages = midTurnInjections.map(({ participant, content }) => ({ participant: nameAsStored(participant), content: contentAsStored(content) }));
+            // Before the round's reply exists, so the reply that comes next is the reply to this request.
+            this.noteRoundSent(agent, currentState.stream, [
+              { kind: 'reply', id: replyId, sent: replySent ?? [] },
+              { kind: 'results', id: resultsId, sent: submitted },
+              ...midTurnInjections.map((injection, i) => ({
+                kind: 'injected' as const, id: injection.id, participant: injectedMessages[i]!.participant, sent: injectedMessages[i]!.content,
+              })),
+            ], replySent === null || replySent === undefined);
             currentState.stream.provideToolResults(
-              agent.toolResultGuard.submissionResults(membraneResults),
-              midTurnInjections.length > 0
-                ? { injectedMessages: midTurnInjections.map(({ participant, content }) => ({ participant: nameAsStored(participant), content: contentAsStored(content) })) }
-                : undefined,
+              submitted,
+              midTurnInjections.length > 0 ? { injectedMessages } : undefined,
             );
             // RFC-006 §3.3: consumption is determined at assembly, and this
             // is assembly too when the stream carries the injected messages
@@ -12718,9 +12760,11 @@ export class AgentFramework {
             // carried, such as another slot's messages, and a write that
             // bypassed deferral into this slot (a fresh tool_result, a
             // routed channel message). That over-cover can't be left out.
-            // Under context-manager#160 such a write already gives the
-            // replies stored after it stamps their requests didn't carry,
-            // whatever the mark says; deferring those writers is the fix.
+            // Under a context manager's thinking-binding record
+            // (`thinkingBinding.binds`), such a write sits in the next
+            // compile where the stream's notes named other rows, so the
+            // replies after it go without their thinking, whatever the mark
+            // says; deferring those writers is the fix.
             if (midTurnInjections.length > 0) {
               // Possibly shown, whatever the stream declares: the first-view
               // mark (CoalescerHost.isUnshown) counts a doubt as shown.
@@ -13351,8 +13395,8 @@ export class AgentFramework {
       // Both compiles are dry runs: neither is sent, and the template's runs
       // while the template may be mid-stream, where a committing compile
       // would commit fold resolutions and queue the compression its fold plan
-      // calls for (and, once context-manager's thinking binding ships, fence
-      // its stream's replies). In context-manager 0.14 a dry run leaves
+      // calls for. These compiles carry no thinking binding, so they'd write
+      // no binding record either way. In context-manager 0.14 a dry run leaves
       // nothing else behind but the release of an expired compression hold
       // (see Agent.compileWithInjections), so the template's request in
       // flight keeps its calibration estimate.
@@ -13580,6 +13624,7 @@ export class AgentFramework {
     this.activeStreams.delete(agentName);
     this.pendingAssistantBlocks.delete(agentName);
     this.agents.delete(agentName);
+    this.thinkingLossIncidents.forget(agentName);
     // Its sleep and self-wake end with it (the gate's sleep holds back every
     // agent's wakes), and neither wake goes to a name that's gone.
     this.eventGate?.agentGone(agentName);
@@ -16595,7 +16640,7 @@ export class AgentFramework {
     routing: TurnRouting,
     channel: ChannelRef,
     cause: string,
-  ): { participant: string; content: ContentBlock[]; metadata: MessageMetadata } | undefined {
+  ): { participant: string; content: ContentBlock[]; metadata: MessageMetadata; id: MessageId } | undefined {
     if (sameChannel(routing.locus, channel)) return undefined;
     const prevPin = routing.locus ?? null;
     routing.locus = channel;
@@ -16617,7 +16662,7 @@ export class AgentFramework {
       this.lastAnnouncedLocus.set(agent.name, channel);
       this.emitTrace({ type: 'message:added', messageId: id, source: 'routing-notice' });
       console.error(`[routing] ${agent.name}: ${cause} re-pin ${prevPin ? qualifiedChannelName(prevPin) : '(none)'} -> ${qualifiedChannelName(channel)}`);
-      return { participant: 'user', content, metadata };
+      return { participant: 'user', content, metadata, id };
     } catch (err) {
       console.error('turn locus re-pin: failed to record routing notice:', err);
       return undefined;
@@ -18864,12 +18909,17 @@ export class AgentFramework {
         takeKvSubmission,
         drainKvSubmissionIds,
         continuePrompt,
+        placeDrops,
+        thinkingRecordedAfter,
+        noteRequestSent,
       } = await agent.startStreamWithInjections(tools, injections, undefined, compressionTools, {
         silentHeartbeat: trigger?.silentHeartbeat,
         // This turn's retries are the framework's (errorPolicy below), not
         // membrane's inside each attempt.
         membraneRetries: false,
       });
+      // Each later round this stream sends is noted as it goes (noteRoundSent).
+      if (noteRequestSent) this.streamRequestNotes.set(stream, { note: noteRequestSent, rounds: [], stopped: false });
       // The compile can wait for annotations (each batch has one spill
       // deadline), so check ownership, admission, and the lifecycle again.
       // A stop followed by start must not revive this earlier turn.
@@ -18973,6 +19023,7 @@ export class AgentFramework {
         takeKvSubmission,
         drainKvSubmissionIds,
         new Set(tools.map((tool) => tool.name)),
+        placeDrops ? { place: placeDrops, ...(thinkingRecordedAfter !== undefined ? { recordedAfter: thinkingRecordedAfter } : {}) } : undefined,
       );
       this.activeStreams.set(agent.name, handle);
       // Handoff: driveStream captured the token in its synchronous prefix;
@@ -19133,6 +19184,9 @@ export class AgentFramework {
     takeKvSubmission?: () => { submissionId: string; wireReceipt: CacheWireReceipt } | undefined,
     drainKvSubmissionIds?: () => string[],
     knownToolNames: ReadonlySet<string> = new Set(),
+    /** Where each block a call reports the provider dropped came from, and the compile's thinking-binding
+     *  record start (StartStreamResult's `placeDrops` and `thinkingRecordedAfter`). */
+    thinkingDrops?: StreamThinkingDrops,
   ): Promise<void> {
     const turnProseRouting = trigger?.suppressProse ? 'disabled' : agent.proseRouting;
     const startTime = Date.now();
@@ -19748,6 +19802,9 @@ export class AgentFramework {
             assistantBlocks = stampThinkingTokenEstimates(assistantBlocks, outputTokensSinceStamp);
             outputTokensSinceStamp = 0;
             this.pendingAssistantBlocks.set(agent.name, assistantBlocks);
+            this.pendingRoundSent.set(assistantBlocks, roundContent && roundContent.length > 0
+              ? roundContent.filter((b) => b.type !== 'tool_result')
+              : null);
 
             // Note: max_tokens truncation cannot produce tool-calls events here.
             // The membrane only yields 'tool-calls' when stop_reason is 'tool_use'
@@ -20109,8 +20166,11 @@ export class AgentFramework {
               // Flush pending assistant blocks
               const pending = this.pendingAssistantBlocks.get(agent.name);
               if (pending) {
-                agent.addAssistantResponse(pending, this.silentTurnRowMetadata(agent.name));
+                const pendingId = agent.addAssistantResponse(pending, this.silentTurnRowMetadata(agent.name));
                 this.pendingAssistantBlocks.delete(agent.name);
+                const pendingSent = this.pendingRoundSent.get(pending);
+                // The stream's last reply, stored: its final row.
+                this.noteStreamEnd(agent, stream, { kind: 'reply', id: pendingId, sent: pendingSent ?? [] }, pendingSent == null);
               }
               // Store tool results — same bounded spill policy as the
               // ordinary path (issue #89: this guard path must not become the
@@ -20146,10 +20206,9 @@ export class AgentFramework {
                 b.type === 'tool_use' || b.type === 'tool_result' ? i : last,
               -1
             );
-            const terminalContent = stampThinkingTokenEstimates(
-              lastToolIdx >= 0 ? response.content.slice(lastToolIdx + 1) : response.content,
-              outputTokensSinceStamp,
-            );
+            // What membrane returned of the last reply, beside the stamped copy the store keeps.
+            const terminalSent = lastToolIdx >= 0 ? response.content.slice(lastToolIdx + 1) : response.content;
+            const terminalContent = stampThinkingTokenEstimates(terminalSent, outputTokensSinceStamp);
             outputTokensSinceStamp = 0;
             // This is a whole-response boundary, not a trailing-prose
             // classifier. If the turn executed any genuine structured tool
@@ -20175,12 +20234,19 @@ export class AgentFramework {
               console.error(
                 `[tool-boundary] ${agent.name}: contained whole-response prose wrapper for registered tool ${guardedWrapperTool}; no tool called`,
               );
+              // A system row stands where the reply would be: the stream's reply isn't stored as returned.
+              this.noteStreamEnd(agent, stream, { kind: 'reply', id: undefined, sent: terminalSent }, false);
             } else if (lastToolIdx >= 0) {
               if (terminalContent.length > 0) {
-                agent.addAssistantResponse(terminalContent, this.silentTurnRowMetadata(agent.name));
+                const terminalId = agent.addAssistantResponse(terminalContent, this.silentTurnRowMetadata(agent.name));
+                this.noteStreamEnd(agent, stream, { kind: 'reply', id: terminalId, sent: terminalSent }, false);
+              } else {
+                // Nothing after the last results: the rows are judged as of now, the last batch settled.
+                this.noteStreamEnd(agent, stream, undefined, false);
               }
             } else {
-              agent.addAssistantResponse(terminalContent, this.silentTurnRowMetadata(agent.name));
+              const terminalId = agent.addAssistantResponse(terminalContent, this.silentTurnRowMetadata(agent.name));
+              this.noteStreamEnd(agent, stream, { kind: 'reply', id: terminalId, sent: terminalSent }, false);
             }
 
             // Bind the cooldown receipt to this fresh, successful request —
@@ -20972,6 +21038,11 @@ export class AgentFramework {
             const thinkingReport = event.round?.thinking;
             const thinkingDropped = (thinkingReport?.dropped.length ?? 0) > 0;
             if (thinkingDropped) thinkingDroppedInStream = true;
+            // Against the branch's binding record, when the context manager keeps one: a drop it can't account
+            // for tells the operators (noteThinkingLoss), and a call with no report shows no such drop.
+            if (thinkingDrops?.recordedAfter !== undefined) {
+              this.noteThinkingLoss(agent.name, thinkingReport ? thinkingDrops.place(thinkingReport.dropped) : [], thinkingDrops.recordedAfter);
+            }
             try {
               if (!thinkingDroppedInStream) {
                 strat?.reportRealInputTokens?.(
@@ -25210,6 +25281,101 @@ export class AgentFramework {
     data?: Record<string, unknown>,
   ): void {
     this.opsAlert(kind, agentName, message, { data });
+  }
+
+  /**
+   * Tells the context manager what a stream's later round carries after its compiled messages: every round so far,
+   * in sent order, with the round's own rows appended (roundRows): each stored row's id where the next request will
+   * carry it as the stream sent it, the marker where it won't. A request-only row (a heartbeat tick, a `[Continue]`)
+   * isn't a row here: the next request puts it back in the same place (renderRequestOnlyRows), and no compile holds
+   * it. A round with no `roundContent` (membrane's XML or fallback path, where the stored reply is the framework's
+   * rebuild) can't be vouched for, so nothing more of the stream is noted, and its later rounds' thinking is left
+   * out at the next compile rather than refused. So is a stream whose note threw or wrote nothing (noteStreamRows).
+   */
+  private noteRoundSent(agent: Agent, stream: YieldingStream, rows: RoundRow[], unvouched: boolean): void {
+    const notes = this.streamRequestNotes.get(stream);
+    if (!notes || notes.stopped) return;
+    if (unvouched) { notes.stopped = true; return; }
+    notes.rounds.push(...rows);
+    this.noteStreamRows(agent, notes);
+  }
+
+  /**
+   * At the stream's end, after its last reply is stored: every row so far, judged as of now, with that reply as the
+   * final row (or none, where the stream's last request had no reply after it). Past the record's end nothing
+   * keeps its thinking, so the last reply keeps its own only by being noted here. Judged as of now, a batch the
+   * tool-result guard held at its boundary and has since settled to the originals is named. A reply with no
+   * `roundContent` to vouch for ends noting instead, as a round's does.
+   */
+  private noteStreamEnd(agent: Agent, stream: YieldingStream, reply: RoundRow | undefined, unvouched: boolean): void {
+    const notes = this.streamRequestNotes.get(stream);
+    if (!notes || notes.stopped) return;
+    if (unvouched) { notes.stopped = true; return; }
+    if (reply) notes.rounds.push(reply);
+    notes.stopped = true;
+    this.noteStreamRows(agent, notes);
+  }
+
+  /**
+   * Every row so far, judged as of now (roundRows), noted. A note the context manager writes nothing for (false)
+   * ends the stream's notes, with a line saying so: where the stream's compile no longer wrote the branch's record, or
+   * the branch has none, no later note could write either; where its store failed, a later one might, and stopping
+   * gives that up for this stream's later rounds, whose thinking then goes at the next compile, as it would have
+   * after the failed write. A note that throws is a fault, and ends them too.
+   */
+  private noteStreamRows(agent: Agent, notes: StreamRequestNotes): void {
+    const cm = agent.getContextManager();
+    try {
+      const ids = notes.rounds.flatMap((row) => row.id === undefined ? [] : [row.id]);
+      const rendered = cm.renderAsNewest(ids);
+      const carried = new Map<MessageId, { participant: string; content: ContentBlock[] } | null>();
+      ids.forEach((id, i) => {
+        const stored = cm.getMessage(id);
+        const content = rendered ? rendered[i]! : stored?.content ?? null;
+        carried.set(id, stored && content ? { participant: stored.participant, content } : null);
+      });
+      const rows = roundRows(notes.rounds, (id) => carried.get(id) ?? null);
+      if (!notes.note(rows)) {
+        notes.stopped = true;
+        console.error(`[thinking-binding] ${agent.name}: the context manager wrote nothing for this stream's note (its compile no longer wrote the branch's binding record, the branch has none, or the store failed), so this stream notes nothing more, and the thinking of its rounds from here is left out at the next compile`);
+      }
+    } catch (error) {
+      notes.stopped = true;
+      console.error(`[thinking-binding] ${agent.name}: couldn't note the rounds this stream sent, so its later rounds' thinking is left out at the next compile:`, error);
+    }
+  }
+
+  /**
+   * A call's dropped blocks, placed, against the branch's binding-record start (splitThinkingDrops). Replies stored at
+   * or below it may lose their thinking with no strip having missed, since the context manager recorded nothing they
+   * were sent under, and so may any block for a binding the record doesn't track (the account's). Any other drop is
+   * one the record doesn't account for: a change ahead of it that the record didn't see. The operators hear of it
+   * once per incident, again only if a call shows more, and the incident ends at a call that shows no unexpected drop
+   * (ThinkingLossIncidents).
+   */
+  private noteThinkingLoss(agentName: string, placed: readonly PlacedDrop[], recordedAfter: number): void {
+    const { unexpected } = splitThinkingDrops(placed, recordedAfter);
+    const count = this.thinkingLossIncidents.observe(agentName, unexpected.length);
+    if (count === undefined) return;
+    const replies = unexpected.filter((drop) => drop.kind === 'reply');
+    const rounds = unexpected.filter((drop) => drop.kind === 'round');
+    const unplaced = unexpected.filter((drop) => drop.kind === 'unplaced');
+    this.opsAlert('thinking-binding-loss', agentName,
+      `the provider dropped ${count} signed thinking block${count === 1 ? '' : 's'} that the context manager's ` +
+      `binding record doesn't account for (${replies.length} in stored replies after the record began at sequence ` +
+      `${recordedAfter}, ${rounds.length} from the stream's own rounds, ${unplaced.length} that couldn't be placed). ` +
+      'The agent loses that reasoning, and without ' +
+      'thinkingBinding.dropBlock an account that enforces the binding would have refused the request. It clears at a ' +
+      'call that drops none of those. If it recurs, look for what changes this agent\'s requests after the compile, such as a ' +
+      'membrane request hook',
+      { data: {
+        blocks: count,
+        recordedAfter,
+        replies: replies.flatMap((drop) => drop.bodies.map((body) => body.messageId)),
+        rounds: rounds.map((drop) => drop.round),
+        unplaced: unplaced.length,
+        reasons: [...new Set(unexpected.map((drop) => drop.entry.reason))],
+      } });
   }
 
   private opsAlert(
