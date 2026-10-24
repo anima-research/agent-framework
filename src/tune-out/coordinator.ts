@@ -1572,9 +1572,12 @@ export class TuneOutCoordinator {
           this.hooks.addMessage(subName, [{ type: 'text', text }], metadata);
           return { success: true, data: { delivered: true } };
         }
-        // A reader fork's report: attributed mail under its own name.
-        this.readerReports.add(caller!);
+        // A reader fork's report: attributed mail under its own name. The fork
+        // counts as having reported only once the mail is held: a delivery
+        // that throws is an error result to the fork, and its prose is then
+        // still delivered as its report when it ends (#546, probe R14).
         this.hooks.deliverFromReader!(caller!, [{ type: 'text', text }], metadata);
+        this.readerReports.add(caller!);
         return { success: true, data: { delivered: true } };
       }
       case 'cancel_tuneout': {
