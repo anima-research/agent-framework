@@ -36,8 +36,8 @@
   takes in, a gate debounce window's channel messages, and a message one of
   its tool boundaries takes in that would have moved a channel turn's locus,
   whether the boundary injects it or leaves it to the turn's next start. In
-  explicit and disabled mode plain speech reaches no channel in any turn, so
-  no channel is named.
+  explicit and disabled mode no channel's message moves where plain speech
+  goes, in any turn, so no channel is named.
 
   A private turn's plain speech is kept private in every mode. In locus and
   hybrid modes its `[delivered]` receipt counts it and says the plain speech

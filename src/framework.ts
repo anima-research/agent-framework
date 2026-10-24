@@ -367,8 +367,18 @@ const HOST_METADATA_KEYS = [
 /**
  * Metadata key on a script's wake message: the script's start turn. The
  * message is private input while that turn is private (isPrivateInput).
+ * Only the framework writes it: a module's copy is dropped
+ * (withoutCallerTurn), and a server's (HOST_METADATA_KEYS).
  */
 const CALLER_TURN_KEY = 'callerTurnId';
+
+/** A module's message metadata without CALLER_TURN_KEY, which only the
+ *  framework writes. */
+function withoutCallerTurn<M extends object>(metadata: M | undefined): M | undefined {
+  if (!metadata || !(CALLER_TURN_KEY in metadata)) return metadata;
+  const { [CALLER_TURN_KEY]: _dropped, ...rest } = metadata as M & { [CALLER_TURN_KEY]?: unknown };
+  return rest as M;
+}
 
 /**
  * True when an injected message is real conversational input — something the
@@ -13259,7 +13269,7 @@ export class AgentFramework {
     if (response.addMessages) {
       for (const [i, msg] of response.addMessages.entries()) {
         step.at = `adding message ${i + 1} of ${response.addMessages.length}`;
-        let metadata = msg.metadata;
+        let metadata = withoutCallerTurn(msg.metadata);
         if (metadata && INBOUND_SOURCE_KEY in metadata) {
           const { [INBOUND_SOURCE_KEY]: _dropped, ...rest } = metadata;
           metadata = rest;
@@ -19430,8 +19440,8 @@ export class AgentFramework {
       }
     }
     // A private turn names the channels whose messages its start took in,
-    // before it compiles: in locus and hybrid mode, where privacy is what
-    // keeps its plain speech from them, as at a boundary and its arrivals.
+    // before it compiles: in locus and hybrid mode, where a channel's message
+    // can move where plain speech goes, as at a boundary and its arrivals.
     const wakeChannels = (trigger as MarkedRequest | undefined)?.[WAKE_CHANNELS];
     if (routing.nonChannelOrigin && wakeChannels && (turnProseRouting === 'locus' || turnProseRouting === 'hybrid')) {
       this.noticeChannelMessages(agent, routing, wakeChannels);
@@ -24499,7 +24509,8 @@ export class AgentFramework {
 
   /**
    * Mark the agent when private input is stored outside a tool boundary: its
-   * next start reads it, so that start is private (beginAgentTurn).
+   * next start reads it, so that start is private (beginAgentTurn). Another
+   * resident reading the same message slot isn't marked (R1-1d).
    */
   private notePrivateInput(agentName: string, metadata: MessageMetadata | undefined): void {
     if (this.isPrivateInput(metadata)) this.privateInputStored.add(agentName);
@@ -25495,7 +25506,7 @@ export class AgentFramework {
    */
   private addModuleMessage(participant: string, content: ContentBlock[], metadata?: MessageMetadata): MessageId {
     const placement: { deferredId?: string } = {};
-    const id = this.addMessage(participant, content, metadata, { placement });
+    const id = this.addMessage(participant, content, withoutCallerTurn(metadata), { placement });
     return placement.deferredId === undefined ? id : heldHandle(placement.deferredId);
   }
 

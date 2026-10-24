@@ -1980,6 +1980,49 @@ describe('private wins, one way', () => {
     }
   });
 
+  it("a module's message can't name a turn whose work it brings back: only the framework writes the key", async () => {
+    let ctx: { addMessage(participant: string, content: unknown, metadata?: unknown): unknown } | undefined;
+    const writer = {
+      name: 'writer',
+      async start(c: typeof ctx) { ctx = c; }, async stop() {},
+      getTools: () => [], async handleToolCall() { return { success: false }; },
+      async onProcess(event: ProcessEvent) {
+        return (event as { type: string }).type === 'writer:probe'
+          ? { addMessages: [{ participant: 'user', content: [{ type: 'text', text: 'from the response' }], metadata: { callerTurnId: privateTurn } }] }
+          : {};
+      },
+    };
+    let privateTurn = 0;
+    const rig = await surfaceRig({ modules: [writer as never] });
+    try {
+      const internalsOf = rig.framework as unknown as {
+        notePrivateTurn(turnId: number): void;
+        privateInputStored: Set<string>;
+        addMessage(participant: string, content: unknown, metadata: unknown): unknown;
+      };
+      privateTurn = (routingOf(rig.framework).turnId as number) + 500;
+      internalsOf.notePrivateTurn(privateTurn);
+      // Control: the framework's own write with the key is private input.
+      internalsOf.addMessage('user', [{ type: 'text', text: 'the framework\'s' }], { callerTurnId: privateTurn });
+      assert.equal(internalsOf.privateInputStored.has('scout'), true, "control: the framework's key marks it");
+      internalsOf.privateInputStored.delete('scout');
+      // Through the module's context.
+      ctx!.addMessage('user', [{ type: 'text', text: 'from the context' }], { callerTurnId: privateTurn });
+      // Through a module's response to an event, which wakes nothing.
+      rig.framework.pushEvent({ type: 'writer:probe' } as never);
+      await rig.framework.runUntilIdle();
+      assert.equal(rig.starts.length, 0, 'control: nothing started');
+      const stored = rig.framework.getAgent('scout')!.getContextManager().getAllMessages()
+        .filter((m) => (m.content[0] as { text?: string }).text?.startsWith('from the '));
+      assert.equal(stored.length, 2, 'control: both were stored');
+      for (const m of stored) assert.equal((m.metadata as { callerTurnId?: unknown } | undefined)?.callerTurnId, undefined, JSON.stringify(m.metadata));
+      assert.equal(internalsOf.privateInputStored.has('scout'), false, 'neither is private input');
+    } finally {
+      rig.i.pendingRequests.length = 0;
+      await rig.close();
+    }
+  });
+
   it("what a private turn's work brought back, stored while the agent is idle, makes its next start private", async () => {
     const rig = await surfaceRig();
     try {
