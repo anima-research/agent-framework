@@ -859,11 +859,8 @@ test("a sleep announced into a channel the agent or a module closed says the age
   assert.deepEqual(published.splice(0), [{ channelId: 'discord:g1:343434', text: quiet }]);
   routing.locus = ref(channelId);
 
-  // A conversation agent's announcement reads the same: the words follow the channel.
-  framework.conversationAgentHomes.set('sol', channelId);
-  slept = await sleep({ seconds: 600 });
-  framework.conversationAgentHomes.delete('sol');
-  assert.deepEqual(published.splice(0), [{ channelId, text: addressed }]);
+  // A conversation agent announces nothing: its sleep is refused before the
+  // announcement (dispatchSleepToolCall; event-gate-sleep.test.ts).
 
   // Hybrid routing announces to the locus as locus mode does.
   framework.agents.set('sol', agentStub({ proseRouting: 'hybrid' }));
