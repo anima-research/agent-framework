@@ -209,6 +209,42 @@ describe('reconcileWithRecipe: a start against the recipe last applied', () => {
     assert.strictEqual(sameDefault.changes.defaultDiffers, undefined);
   });
 
+  it('keeps a rule with no name where gate.json holds it, and never merges a recipe rule with no name', () => {
+    const nameless = { match: { scope: ['external-message'] }, behavior: 'skip' } as unknown as GatePolicy;
+    const live = config([rule('dm', 'dm'), nameless, rule('zoo', 'zoo'), catchAll]);
+    const merged = reconcileWithRecipe(
+      { rules: live.policies, default: live.default },
+      { rules: [rule('dm', 'dm-v2'), nameless, catchAll], default: 'skip' },
+      { rules: recipe1.policies, default: 'skip' },
+    );
+    // "zoo" goes and "dm" is redefined; the nameless rule stays second, and the recipe's isn't added.
+    assert.deepStrictEqual(merged.rules, [rule('dm', 'dm-v2'), nameless, catchAll]);
+    assert.deepStrictEqual(merged.changes.removed, ['zoo']);
+    assert.deepStrictEqual(merged.changes.updated, ['dm']);
+    assert.deepStrictEqual(merged.changes.added, []);
+    // Without a last recipe, the nameless rule isn't named as outside the recipe.
+    const first = reconcileWithRecipe({ rules: live.policies, default: live.default }, { rules: [nameless], default: 'skip' }, null);
+    assert.deepStrictEqual(first.changes.outsideRecipe, ['dm', 'zoo', 'catch-all']);
+    assert.strictEqual(first.rules.length, 4);
+  });
+
+  it('reads a default left out, null or "" as "always", so none of them reads as an edit of the others', () => {
+    const at = (value: unknown) => ({ rules: recipe1.policies, default: value });
+    for (const live of [undefined, null, '']) {
+      const merged = reconcileWithRecipe(at(live), at('skip'), at('always'));
+      assert.strictEqual(merged.default, 'skip', `live default ${JSON.stringify(live)}`);
+      assert.deepStrictEqual(merged.changes.defaultChange, { from: 'always', to: 'skip' });
+    }
+  });
+
+  it("compares a rule with an own \"__proto__\" field as written, that field included", () => {
+    const withField = (value: number) => JSON.parse(`{"name": "odd", "behavior": ["skip"], "__proto__": {"n": ${value}}}`) as GatePolicy;
+    const merged = reconcileWithRecipe(
+      { rules: [withField(2)], default: 'skip' }, { rules: [rule('odd', 'odd')], default: 'skip' }, { rules: [withField(1)], default: 'skip' },
+    );
+    assert.deepStrictEqual(merged.changes.keptEdited, ['odd']);
+  });
+
   it('refuses gate.json or a recipe that names a rule twice, since it keys rules by name', () => {
     const twice = config([rule('dm', 'dm'), rule('dm', 'dm-again'), catchAll]);
     assert.throws(() => reconcile(twice, recipe1, recipe1), /^Error: gate\.json names the rule "dm" twice$/);
@@ -265,9 +301,11 @@ describe("EventGate's starts, through gate.json and the recipe kept beside it", 
   const start = (initialConfig: GateConfig) => {
     const traces: Array<{ type: string; [key: string]: unknown }> = [];
     const logged: string[] = [];
+    // What went to stdout, apart: the gate's lines go to stderr.
+    const stdout: string[] = [];
     const log = console.log;
     const error = console.error;
-    console.log = (...args: unknown[]) => { logged.push(args.join(' ')); };
+    console.log = (...args: unknown[]) => { logged.push(args.join(' ')); stdout.push(args.join(' ')); };
     console.error = (...args: unknown[]) => { logged.push(args.join(' ')); };
     try {
       const gate = new EventGate({
@@ -278,7 +316,7 @@ describe("EventGate's starts, through gate.json and the recipe kept beside it", 
         requestInference: () => {},
         getAgentNames: () => ['agent'],
       });
-      return { gate, traces, logged };
+      return { gate, traces, logged, stdout };
     } finally {
       console.log = log;
       console.error = error;
@@ -295,9 +333,10 @@ describe("EventGate's starts, through gate.json and the recipe kept beside it", 
     assert.strictEqual(lastRecipePath(configPath), join(dir, '_config', 'gate.recipe.json'));
     assert.deepStrictEqual(recorded(), recipe1);
 
-    const { gate, traces, logged } = start(recipe2);
+    const { gate, traces, logged, stdout } = start(recipe2);
     try {
       assert.deepStrictEqual(logged, ['[gate] the recipe was applied to gate.json: added agents; removed zoo, sync; updated dm']);
+      assert.deepStrictEqual(stdout, [], 'the line goes to stderr');
       assert.deepStrictEqual(names(onDisk()), ['dm', 'agents', 'catch-all']);
       assert.deepStrictEqual(onDisk().policies[0], rule('dm', 'dm-v2', 'defer'));
       assert.strictEqual(gate.evaluate(ext('zoo')).policyName, 'catch-all');
@@ -392,7 +431,7 @@ describe("EventGate's starts, through gate.json and the recipe kept beside it", 
     assert.ok(traces.some((t) => t.type === 'gate:config-reconciled'));
     const errors = gate.getStatus().errors;
     assert.strictEqual(errors.length, 1);
-    assert.match(errors[0], /^At start, recording the recipe in gate\.recipe\.json failed \(.*EISDIR.*\), so the next start merges against the record as this write left it\.$/);
+    assert.match(errors[0], /^At start, gate\.json holds the recipe merged into it, and the gate runs it, but recording the recipe in gate\.recipe\.json failed \(.*EISDIR.*\), so the next start merges against the record as this write left it\. Whoever runs this host can fix what kept it from being written\.$/);
     assert.ok(logged.includes(`[gate] ${errors[0]}`), JSON.stringify(logged));
   });
 
@@ -404,7 +443,7 @@ describe("EventGate's starts, through gate.json and the recipe kept beside it", 
     const { gate } = start(recipe2);
     gate.dispose();
     assert.strictEqual(readFileSync(configPath, 'utf-8'), before);
-    assert.match(gate.getStatus().errors[0], /^At start, recording the recipe in gate\.recipe\.json failed /);
+    assert.match(gate.getStatus().errors[0], /^At start, gate\.json already agreed with the recipe, and the gate runs it, but recording the recipe in gate\.recipe\.json failed /);
   });
 
   it('says gate.json was seeded when recording the recipe then fails at the first start', () => {
@@ -413,7 +452,7 @@ describe("EventGate's starts, through gate.json and the recipe kept beside it", 
     const { gate } = start(recipe1);
     gate.dispose();
     assert.deepStrictEqual(onDisk(), recipe1);
-    assert.match(gate.getStatus().errors[0], /^At start, recording the recipe in gate\.recipe\.json failed /);
+    assert.match(gate.getStatus().errors[0], /^At start, gate\.json was seeded with the recipe, and the gate runs it, but recording the recipe in gate\.recipe\.json failed /);
   });
 
   it('says when the record does not read, and then removes and redefines nothing', () => {
@@ -434,13 +473,23 @@ describe("EventGate's starts, through gate.json and the recipe kept beside it", 
     assert.match(logged.join('\n'), /the recorded recipe couldn't be read \(it isn't read as the starting rules are\)/);
   });
 
-  it('reads a record with no list of policies as one that does not read', () => {
+  it('reads back a recipe recorded with no list of policies, so its default follows the next recipe', () => {
+    // A recipe of a default alone is read with no rules, recorded as given, and read back the same way.
+    start({ default: 'skip' } as unknown as GateConfig).gate.dispose();
+    assert.deepStrictEqual(recorded(), { default: 'skip' });
+    const { gate, logged } = start({ default: 'always' } as unknown as GateConfig);
+    gate.dispose();
+    assert.strictEqual(onDisk().default, 'always');
+    assert.deepStrictEqual(logged, ['[gate] the recipe was applied to gate.json: default skip → always']);
+  });
+
+  it('reads a record of JSON null as one that does not read', () => {
     start(recipe1).gate.dispose();
-    writeFileSync(lastRecipePath(configPath), JSON.stringify({ default: 'skip' }));
+    writeFileSync(lastRecipePath(configPath), 'null');
     const { gate, logged } = start(recipe2);
     gate.dispose();
-    assert.match(logged.join('\n'), /the recorded recipe couldn't be read \(it holds no list of policies\)/);
-    assert.match(logged.join('\n'), /kept, not in the recipe: zoo, sync/);
+    assert.deepStrictEqual(names(onDisk()), ['dm', 'zoo', 'sync', 'agents', 'catch-all']);
+    assert.match(logged.join('\n'), /the recorded recipe couldn't be read \(it isn't read as the starting rules are\)/);
   });
 
   it('reads a record that names a rule twice as one that does not read', () => {
@@ -463,7 +512,8 @@ describe("EventGate's starts, through gate.json and the recipe kept beside it", 
     assert.deepStrictEqual(onDisk().policies, [...twice.policies, rule('agents', 'sync')]);
     assert.strictEqual(readFileSync(lastRecipePath(configPath), 'utf-8'), recorded1);
     const said = 'At start, gate.json names the rule "dm" twice, and the merge with the recipe needs one rule per name, so it didn\'t '
-      + 'run: the start only adds the rules gate.json lacks ("agents"), after its own, and removes, redefines and records nothing.';
+      + 'run: the start added the rules gate.json lacked ("agents"), after its own, and removed, redefined and recorded nothing. '
+      + 'Once gate.json and the recipe name each rule once, a start merges the recipe.';
     assert.ok(gate.getStatus().errors.includes(said), JSON.stringify(gate.getStatus().errors));
     assert.ok(logged.includes(`[gate] ${said}`), JSON.stringify(logged));
     assert.ok(!logged.some((line) => line.startsWith('[gate] the recipe was applied')), JSON.stringify(logged));
@@ -482,7 +532,7 @@ describe("EventGate's starts, through gate.json and the recipe kept beside it", 
     assert.strictEqual(readFileSync(configPath, 'utf-8'), twice);
     assert.ok(gate.getStatus().errors.includes(
       'At start, gate.json names the rule "dm" twice, and the merge with the recipe needs one rule per name, so it didn\'t run: '
-        + 'gate.json is as it was, and nothing was recorded.',
+        + 'gate.json is as it was, and nothing was recorded. Once gate.json and the recipe name each rule once, a start merges the recipe.',
     ), JSON.stringify(gate.getStatus().errors));
   });
 
@@ -494,7 +544,7 @@ describe("EventGate's starts, through gate.json and the recipe kept beside it", 
     // "zoo" and "sync" stay and "dm" keeps its definition: only "new" is added, after gate.json's own.
     assert.deepStrictEqual(onDisk().policies, [...recipe1.policies, rule('new', 'new')]);
     assert.strictEqual(readFileSync(lastRecipePath(configPath), 'utf-8'), recorded1);
-    assert.match(gate.getStatus().errors.join('\n'), /At start, the recipe names the rule "dm" twice, and the merge with the recipe needs one rule per name, so it didn't run: the start only adds the rules gate\.json lacks \("new"\)/);
+    assert.match(gate.getStatus().errors.join('\n'), /At start, the recipe names the rule "dm" twice, and the merge with the recipe needs one rule per name, so it didn't run: the start added the rules gate\.json lacked \("new"\)/);
   });
 
   it('compares rules by meaning, so a recipe rule wake_add_rule wrote back as the gate reads it still follows the recipe', () => {
@@ -556,7 +606,7 @@ describe("EventGate's starts, through gate.json and the recipe kept beside it", 
     assert.deepStrictEqual(recorded(), recipe1, 'nothing recorded');
     const errors = gate.getStatus().errors.join('\n');
     assert.match(errors, /At start, the host's starting rules "agents" couldn't be added to gate\.json \(EACCES: permission denied, open\)/);
-    assert.match(errors, /At start, the recipe's changes to gate\.json \("zoo", "sync" and "dm"\) weren't saved \(EACCES: permission denied, open\), so gate\.json's rules are in force as they were\. Whoever runs this host can fix what kept them from being written\./);
+    assert.match(errors, /At start, the recipe's changes to gate\.json \("zoo", "sync" and "dm"\) weren't saved \(EACCES: permission denied, open\), so the gate started with gate\.json's rules as they were\. Whoever runs this host can fix what kept them from being written\./);
   });
 
   it("names a default change that a write failing at its open didn't save", (t) => {
@@ -590,6 +640,54 @@ describe("EventGate's starts, through gate.json and the recipe kept beside it", 
     gate.dispose();
     assert.deepStrictEqual(onDisk().policies.find((p) => p.name === 'odd'), odd('skip'));
     assert.match(logged.join('\n'), /kept as edited, though the recipe changed or dropped it: odd/);
+  });
+
+  it('names the changes a merge write may not all have saved, when it fails after leaving gate.json loading', (t) => {
+    start(recipe1).gate.dispose();
+    const original = fs.writeFileSync;
+    const write = t.mock.method(fs, 'writeFileSync', (path: fs.PathOrFileDescriptor, data: string | NodeJS.ArrayBufferView, ...rest: unknown[]) => {
+      original(path, data, ...(rest as []));
+      if (path === configPath) throw Object.assign(new Error('EIO: i/o error, close'), { code: 'EIO', syscall: 'close' });
+    });
+    syncBuiltinESMExports();
+    let started: ReturnType<typeof start>;
+    try {
+      started = start(recipe2);
+    } finally {
+      write.mock.restore();
+      syncBuiltinESMExports();
+    }
+    started.gate.dispose();
+    assert.deepStrictEqual(names(onDisk()), ['dm', 'agents', 'catch-all']);
+    assert.deepStrictEqual(recorded(), recipe1, 'nothing recorded');
+    assert.match(started.gate.getStatus().errors.join('\n'), /At start, the recipe's changes to gate\.json \("zoo", "sync" and "dm"\) may not all have been saved \(EIO: i\/o error, close\): the gate started with gate\.json as the write left it\. Whoever runs this host can fix what kept them from being written\./);
+  });
+
+  it("leaves the record as it was at a start that can't add to gate.json or doesn't use it", () => {
+    start(recipe1).gate.dispose();
+    const recorded1 = readFileSync(lastRecipePath(configPath), 'utf-8');
+    // No list of rules to add to.
+    writeFileSync(configPath, JSON.stringify({ policies: 'later', default: 'always' }));
+    start(recipe2).gate.dispose();
+    assert.strictEqual(readFileSync(lastRecipePath(configPath), 'utf-8'), recorded1);
+    // No rules the gate reads, under a default that holds events back, and leaving out a rule that could wake
+    // the agent: gate.json isn't used at this start.
+    writeFileSync(configPath, JSON.stringify({ policies: [{ name: 'agents', behavior: ['always'] }], default: 'skip' }));
+    start(recipe2).gate.dispose();
+    assert.strictEqual(readFileSync(lastRecipePath(configPath), 'utf-8'), recorded1);
+  });
+
+  it('names the default a refused merge would have written, not the one gate.json holds', () => {
+    const recipeA = config([rule('dm', 'dm'), catchAll], 'always');
+    start(recipeA).gate.dispose();
+    // A rule the gate leaves out, which could wake the agent: harmless under "always", refused under "skip".
+    const odd = { name: 'odd', behavior: ['always'] } as unknown as GatePolicy;
+    writeFileSync(configPath, JSON.stringify({ ...recipeA, policies: [...recipeA.policies, odd] }, null, 2));
+    const before = readFileSync(configPath, 'utf-8');
+    const { gate } = start(config([rule('dm', 'dm'), catchAll], 'skip'));
+    gate.dispose();
+    assert.strictEqual(readFileSync(configPath, 'utf-8'), before);
+    assert.match(gate.getStatus().errors.join('\n'), /At start, the recipe's changes to gate\.json \("default"\) weren't saved \(with them, gate\.json would leave out a rule that could wake the agent, and under its default, "skip", it wouldn't be used\), so the gate started with gate\.json's rules as they were\. A start applies them once what kept them out is fixed\./);
   });
 
   it('runs what a merge write that fails partway held, and names the changes it was writing', (t) => {
@@ -627,8 +725,8 @@ describe("EventGate's starts, through gate.json and the recipe kept beside it", 
     assert.deepStrictEqual(onDisk(), twice);
     assert.strictEqual(existsSync(lastRecipePath(configPath)), false);
     assert.ok(gate.getStatus().errors.includes(
-      'At start, the recipe names the rule "dm" twice, so it wasn\'t recorded as the recipe last applied: a later start merges the '
-        + 'recipe by name, and applies one that names each rule once.',
+      'At start, the recipe names the rule "dm" twice, so gate.json was seeded with it as given and it wasn\'t recorded as the '
+        + 'recipe last applied: a later start merges the recipe by name, once gate.json and the recipe name each rule once.',
     ), JSON.stringify(gate.getStatus().errors));
   });
 

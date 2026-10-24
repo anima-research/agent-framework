@@ -1434,11 +1434,12 @@ function readStartingRules(raw: unknown): StartingRules {
 
 /**
  * The recipe the gate last applied (lastRecipePath), as written, or null when
- * it has none on record. A record that exists and isn't one the gate wrote (it
- * can't be read, isn't JSON, holds no list of rules, is refused as the
- * starting rules are, or names a rule twice) gives null with the reason, which
- * quotes nothing from the file but a rule's name: a start then removes and
- * redefines nothing, as the first does, and says why.
+ * it has none on record. It's read as the host's starting rules are, so a
+ * recipe recorded as given reads back as the start read it. A record that
+ * exists and isn't one the gate wrote (it can't be read, isn't JSON, is
+ * refused as the starting rules are, or names a rule twice) gives null with
+ * the reason, which quotes nothing from the file but a rule's name: a start
+ * then removes and redefines nothing, as the first does, and says why.
  */
 function readLastRecipe(path: string): { recipe: WrittenConfig | null; problem?: string } {
   if (!existsSync(path)) return { recipe: null };
@@ -1449,11 +1450,12 @@ function readLastRecipe(path: string): { recipe: WrittenConfig | null; problem?:
     const code = (err as NodeJS.ErrnoException).code;
     return { recipe: null, problem: code ? `reading it failed with ${code}` : "it isn't JSON" };
   }
-  if (!isPlainObject(raw) || !Array.isArray(raw.policies)) return { recipe: null, problem: 'it holds no list of policies' };
-  if ('refused' in readConfig(raw, 'the starting config')) return { recipe: null, problem: "it isn't read as the starting rules are" };
-  const twice = duplicateName(raw.policies);
+  const read = readStartingRules(raw);
+  if (read.refusedWhole !== undefined) return { recipe: null, problem: "it isn't read as the starting rules are" };
+  const rules = read.rules.map((rule) => rule.raw);
+  const twice = duplicateName(rules);
   if (twice !== undefined) return { recipe: null, problem: `it names the rule "${twice}" twice` };
-  return { recipe: { rules: raw.policies, default: raw.default } };
+  return { recipe: { rules, default: isPlainObject(raw) ? raw.default : undefined } };
 }
 
 /**
@@ -1537,8 +1539,8 @@ function describeStart(starting: StartingRules, write: StartWrite, held: Readonl
       parts.push(
         `At start, the recipe's changes to gate.json (${quotedList(write.changing)}) `
         + (write.atOpen
-          ? `weren't saved (${write.error}), so gate.json's rules are in force as they were. `
-          : `may not all have been saved (${write.error}): the gate runs gate.json as the write left it. `)
+          ? `weren't saved (${write.error}), so the gate started with gate.json's rules as they were. `
+          : `may not all have been saved (${write.error}): the gate started with gate.json as the write left it. `)
         + (write.text !== undefined
           ? 'Whoever runs this host can fix what kept them from being written.'
           : 'A start applies them once what kept them out is fixed.'),
@@ -2093,10 +2095,11 @@ export class EventGate {
       }
       const twice = duplicateName(starting.rules.map((rule) => rule.raw));
       if (twice !== undefined) {
-        this.startMergeNote = `At start, the recipe names the rule "${twice}" twice, so it wasn't recorded as the recipe last `
-          + 'applied: a later start merges the recipe by name, and applies one that names each rule once.';
+        this.startMergeNote = `At start, the recipe names the rule "${twice}" twice, so gate.json was seeded with it as given and it `
+          + "wasn't recorded as the recipe last applied: a later start merges the recipe by name, once gate.json and the recipe "
+          + 'name each rule once.';
       } else {
-        this.recordRecipe(lastRecipePath(this.configPath), starting.given);
+        this.recordRecipe(lastRecipePath(this.configPath), starting.given, 'gate.json was seeded with the recipe');
       }
       return { kind: 'none' };
     }
@@ -2155,6 +2158,7 @@ export class EventGate {
     const given = isPlainObject(starting.given) ? starting.given : {};
     let merged: ReturnType<typeof reconcileWithRecipe>;
     let appended = false;
+    let appendedNote = '';
     try {
       merged = reconcileWithRecipe(
         { rules: read.listed.rules, default: read.listed.top.default },
@@ -2167,12 +2171,18 @@ export class EventGate {
       // So the start adds the rules gate.json lacks, after its own, as
       // earlier releases did, and removes, redefines and records nothing.
       const missing = starting.rules.filter((rule): rule is StartingRule & { name: string } => rule.name !== undefined && !held.has(rule.name));
+      const lacked = [...new Set(missing.map((rule) => rule.name))];
       appended = true;
-      this.startMergeNote = `At start, ${errorText(err)}, and the merge with the recipe needs one rule per name, so it didn't run: `
-        + (missing.length > 0
-          ? `the start only adds the rules gate.json lacks (${quotedList(missing.map((rule) => rule.name))}), after its own, and `
-            + 'removes, redefines and records nothing.'
-          : 'gate.json is as it was, and nothing was recorded.');
+      // What it did is said once its write is made (appendedNote), and a
+      // write that fails is said as any start's is.
+      const why = `At start, ${errorText(err)}, and the merge with the recipe needs one rule per name, so it didn't run`;
+      const remedy = 'Once gate.json and the recipe name each rule once, a start merges the recipe.';
+      this.startMergeNote = `${why}. ${remedy}`;
+      appendedNote = `${why}: `
+        + (lacked.length > 0
+          ? `the start added the rules gate.json lacked (${quotedList(lacked)}), after its own, and removed, redefined and recorded nothing. `
+          : 'gate.json is as it was, and nothing was recorded. ')
+        + remedy;
       merged = {
         rules: [...read.listed.rules, ...missing.map((rule) => rule.raw)],
         default: read.listed.top.default,
@@ -2190,7 +2200,8 @@ export class EventGate {
     const reconciled = { ...top, policies: merged.rules };
     const names = [...changes.added, ...changes.restored];
     const changing = [...changes.removed, ...changes.updated, ...changes.moved, ...(changes.defaultChange ? ['default'] : [])];
-    if (canonical(reconciled) !== canonical({ ...read.listed.top, policies: read.listed.rules })) {
+    const written = canonical(reconciled) !== canonical({ ...read.listed.top, policies: read.listed.rules });
+    if (written) {
       // What the write holds, as a load reads it, for a write that fails partway.
       const holds = readConfig(reconciled, 'gate.json');
       if ('refused' in holds) {
@@ -2198,7 +2209,7 @@ export class EventGate {
         // nothing is written or recorded, so it loads as it did. (With no
         // rules of its own, gate.json isn't used at this start, above.)
         const error = 'with them, gate.json would leave out a rule that could wake the agent, and under its default, '
-          + `"${read.config.default ?? 'always'}", it wouldn't be used`;
+          + `"${changes.defaultChange?.to ?? read.config.default ?? 'always'}", it wouldn't be used`;
         return { kind: 'reconcile-failed', names, changing, atOpen: true, config: read.config, error };
       }
       const text = JSON.stringify(reconciled, null, 2) + '\n';
@@ -2218,6 +2229,7 @@ export class EventGate {
         };
       }
     }
+    if (appended) this.startMergeNote = appendedNote;
     // Said before the record is written, so a failed record write still
     // leaves what the start did to gate.json named. A start that only added
     // rules, since the merge couldn't run, is said in startNotice instead.
@@ -2234,22 +2246,24 @@ export class EventGate {
       });
     }
     if (!appended && (!last.recipe || canonical({ rules: last.recipe.rules, default: last.recipe.default }) !== canonical({ rules: starting.rules.map((rule) => rule.raw), default: given.default }))) {
-      this.recordRecipe(recordPath, starting.given);
+      this.recordRecipe(recordPath, starting.given, written ? 'gate.json holds the recipe merged into it' : 'gate.json already agreed with the recipe');
     }
     return { kind: 'none' };
   }
 
   /**
    * Record the starting config, as given, as the recipe last applied, after
-   * gate.json holds what the start merged. A write that fails is said with the
-   * start: the next start merges against the record as the write left it.
+   * gate.json holds what the start merged (`holds` says what that is). A
+   * write that fails is said with the start: the next start merges against
+   * the record as the write left it.
    */
-  private recordRecipe(recordPath: string, given: unknown): void {
+  private recordRecipe(recordPath: string, given: unknown, holds: string): void {
     try {
       writeFileSync(recordPath, JSON.stringify(given, null, 2) + '\n');
     } catch (err) {
-      this.startMergeNote = `At start, recording the recipe in ${basename(recordPath)} failed (${errorText(err)}), `
-        + 'so the next start merges against the record as this write left it.';
+      this.startMergeNote = `At start, ${holds}, and the gate runs it, but recording the recipe in ${basename(recordPath)} failed `
+        + `(${errorText(err)}), so the next start merges against the record as this write left it. Whoever runs this host can `
+        + 'fix what kept it from being written.';
     }
   }
 

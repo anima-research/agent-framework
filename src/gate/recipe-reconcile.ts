@@ -33,7 +33,8 @@
  * when the gate reads them the same, so a rule `wake_add_rule` wrote as the
  * gate reads it agrees with the recipe's rule as written, and a change to a
  * field the gate doesn't read alone isn't an edit; the caller gives the
- * meaning (`meaningOf`). A rule that agrees with the recipe stays as gate.json
+ * meaning (`meaningOf`). A rule the gate leaves out has no reading, so it is
+ * compared as written, a change to any of its fields an edit. A rule that agrees with the recipe stays as gate.json
  * holds it, and one that follows the recipe takes the recipe's rule as
  * written. A rule with no name stays where gate.json holds it, and a recipe's
  * rule with no name is never merged: the merge keys rules by name.
@@ -71,7 +72,9 @@ export function lastRecipePath(configPath: string): string {
 function sortKeys(value: unknown): unknown {
   if (Array.isArray(value)) return value.map(sortKeys);
   if (value && typeof value === 'object') {
-    const out: Record<string, unknown> = {};
+    // No prototype, so a key such as "__proto__", which JSON.parse gives as an
+    // own field, is copied as one rather than setting the prototype.
+    const out: Record<string, unknown> = Object.create(null);
     for (const key of Object.keys(value as Record<string, unknown>).sort()) {
       out[key] = sortKeys((value as Record<string, unknown>)[key]);
     }
