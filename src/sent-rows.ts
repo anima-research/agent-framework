@@ -32,6 +32,27 @@ export function asNextRequestCarries(content: readonly ContentBlock[]): ContentB
   return withoutTokenEstimates([{ content: kept }])[0]!.content;
 }
 
+/**
+ * Whether membrane's native formatter sends a block of what a stream sent: it leaves out an exactly empty text block,
+ * which the API refuses, unless the block carries a provider-native item (`rawItem`), which goes as that item. It
+ * sends whitespace text, behind the participant's name where a multiuser conversation shows names, so a whitespace
+ * block the next request's sanitize pass leaves out counts as a difference. Where the adapter's cleanup leaves it out
+ * of both, as in an assistant turn, that's a needless strip rather than a row named for bytes the provider didn't see.
+ */
+function sentBlock(block: ContentBlock): boolean {
+  if (block.type !== 'text' || block.text !== '') return true;
+  const raw = (block as { rawItem?: unknown }).rawItem;
+  return raw !== null && typeof raw === 'object';
+}
+
+/** A block's own cache marker left out: the provider's thinking binding doesn't count it, nor does the context
+ *  manager's record, and stored history can carry a stale one. */
+function withoutCacheMarker(block: ContentBlock): unknown {
+  if (!('cache_control' in block) && !('cacheControl' in block)) return block;
+  const { cache_control: _snake, cacheControl: _camel, ...rest } = block as ContentBlock & { cache_control?: unknown; cacheControl?: unknown };
+  return rest;
+}
+
 /** Blocks equal as JSON data: as the store keeps them and a request sends them, `undefined` fields left out. */
 function sameData(a: unknown, b: unknown): boolean {
   return isDeepStrictEqual(JSON.parse(JSON.stringify(a)), JSON.parse(JSON.stringify(b)));
@@ -72,13 +93,13 @@ export function roundRows(
     const body = carried(row.id);
     const content = body ? asNextRequestCarries(body.content) : null;
     if (!body || !content) return UNSTORED;
-    // An empty or whitespace text block never reached the provider in the stream either: the API refuses one, and
-    // membrane's native formatter leaves it out, so it's left out of what was sent as of what the next request carries.
-    const sent = row.kind === 'results' ? submittedBlocks(row.sent) : row.sent.filter(carriedBlock);
+    // What the stream sent, as membrane's native formatter sends it (sentBlock): an exactly empty text block is in
+    // neither request.
+    const sent = row.kind === 'results' ? submittedBlocks(row.sent) : row.sent.filter(sentBlock);
     const sameParticipant = row.kind !== 'injected' || body.participant === row.participant;
     const sameContent = row.kind === 'results'
       ? sameData(content.map(normalizedResult), sent.map(normalizedResult))
-      : sameData(content, sent);
+      : sameData(content.map(withoutCacheMarker), sent.map(withoutCacheMarker));
     return sameParticipant && sameContent ? row.id : UNSTORED;
   });
 }

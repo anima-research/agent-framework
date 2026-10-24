@@ -43,6 +43,13 @@ describe('roundRows', () => {
     // A result with an image, as stored and as the next compile renders it after an image limit took the image out.
     ['results-image', { participant: 'user', content: [{ type: 'tool_result', toolUseId: 'c1', content: [text('A chart.'), image] } as ContentBlock] }],
     ['results-image-limited', { participant: 'user', content: [{ type: 'tool_result', toolUseId: 'c1', content: [text('A chart.')] } as ContentBlock] }],
+    // An injected message whose first text block is whitespace, which the next request's sanitize pass leaves out.
+    ['note-spaced', { participant: 'Bob', content: [text(' \n'), text('A note.')] }],
+    // A reply holding a provider-native item on an empty text carrier, which the sanitize pass leaves out.
+    ['reply-carrier', { participant: 'agent', content: [signed('s'), { type: 'text', text: '', rawItem: { type: 'web_search_tool_result' } } as ContentBlock, text('Found.')] }],
+    // A stored block with a stale cache marker, which the binding doesn't count.
+    ['note-marked', { participant: 'user', content: [{ ...text('A note.'), cache_control: { type: 'ephemeral' } } as ContentBlock] }],
+    ['results-error', { participant: 'user', content: [result('c1', 'ok', true)] }],
     ['gone', null],
   ]);
   const carried = (id: MessageId) => store.get(id) ?? null;
@@ -55,7 +62,8 @@ describe('roundRows', () => {
       { kind: 'results', id: 'results', sent: [{ toolUseId: 'c1', content: 'ok', isError: false }] },
       { kind: 'injected', id: 'note', participant: 'user', sent: [text('A note.')] },
       { kind: 'results', id: 'results-image', sent: [{ toolUseId: 'c1', content: [text('A chart.'), image] as never, isError: false }] },
-    ], carried), ['reply', 'reply-empty', 'results', 'note', 'results-image'] as SentRow[]);
+      { kind: 'injected', id: 'note-marked', participant: 'user', sent: [text('A note.')] },
+    ], carried), ['reply', 'reply-empty', 'results', 'note', 'results-image', 'note-marked'] as SentRow[]);
   });
 
   it('marks a row the next request carries otherwise, or doesn\'t carry, or the store doesn\'t hold', () => {
@@ -69,7 +77,14 @@ describe('roundRows', () => {
       { kind: 'reply', id: undefined, sent: [text('Unstored.')] },
       // The stream was sent the image, and the next compile renders the result without it.
       { kind: 'results', id: 'results-image-limited', sent: [{ toolUseId: 'c1', content: [text('A chart.'), image] as never, isError: false }] },
-    ], carried), [UNSTORED, UNSTORED, UNSTORED, UNSTORED, UNSTORED, UNSTORED] as SentRow[]);
+      // membrane sent the whitespace block, behind Bob's name; the next request leaves it out.
+      { kind: 'injected', id: 'note-spaced', participant: 'Bob', sent: [text(' \n'), text('A note.')] },
+      // membrane sent the carrier's item; the next request leaves the carrier out.
+      { kind: 'reply', id: 'reply-carrier', sent: [signed('s'), { type: 'text', text: '', rawItem: { type: 'web_search_tool_result' } } as ContentBlock, text('Found.')] },
+      // Results for another call, and an error flag that differs.
+      { kind: 'results', id: 'results', sent: [{ toolUseId: 'c2', content: 'ok', isError: false }] },
+      { kind: 'results', id: 'results-error', sent: [{ toolUseId: 'c1', content: 'ok', isError: false }] },
+    ], carried), Array(10).fill(UNSTORED) as SentRow[]);
   });
 });
 
