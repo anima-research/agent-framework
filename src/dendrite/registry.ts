@@ -141,7 +141,7 @@ export class AgentRegistry {
       ...(spec.inherit ? { inherit: clone(spec.inherit) } : {}),
       ...(spec.selfParticipants?.length ? { selfParticipants: [...spec.selfParticipants] } : {}),
       ...(spec.presentAs ? { presentAs: spec.presentAs } : {}),
-      ...(spec.homeChannel ? { homeChannel: spec.homeChannel } : {}),
+      ...(spec.homeChannel ? { homeChannel: { serverId: spec.homeChannel.serverId, channelId: spec.homeChannel.channelId } } : {}),
       readsSharedSlot: spec.readsSharedSlot ?? false,
       ...(spec.namespace ? { namespace: spec.namespace } : {}),
       ...(spec.metadata ? { metadata: clone(spec.metadata) } : {}),
@@ -264,7 +264,7 @@ export class AgentRegistry {
   }
 
   /** The channel an agent is bound to, if it has one. */
-  homeChannel(name: AgentName): string | undefined {
+  homeChannel(name: AgentName): AgentRecord['homeChannel'] {
     return this.live.get(name)?.homeChannel;
   }
 

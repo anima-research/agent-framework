@@ -1,6 +1,6 @@
 /**
  * Test helper: make an already-registered agent look like a conversation
- * fork bound to `channelId`, the way `createConversationAgent` registers
+ * fork bound to `home`, the way `createConversationAgent` registers
  * one — a home channel, not a broadcast recipient, no provider-scheduling
  * ownership. Returns an undo.
  *
@@ -28,12 +28,12 @@ type RegistryInternals = { registry: { get(name: string): AgentRecord | undefine
 export function bindAsConversationFork(
   framework: AgentFramework,
   agentName: string,
-  channelId: string,
+  home: { serverId: string; channelId: string },
 ): () => void {
   const record = (framework as unknown as RegistryInternals).registry.get(agentName);
   if (!record) throw new Error(`bindAsConversationFork: "${agentName}" is not a registered agent`);
   const prior = { homeChannel: record.homeChannel, roles: { ...record.roles } };
-  record.homeChannel = channelId;
+  record.homeChannel = { ...home };
   record.roles = { ...record.roles, receivesUntargeted: false, ownsProviderScheduling: false };
   return () => {
     if (prior.homeChannel === undefined) delete record.homeChannel;
@@ -43,7 +43,7 @@ export function bindAsConversationFork(
 }
 
 /** The registry's home channel for an agent (what channel routing resolves). */
-export function homeChannelOf(framework: AgentFramework, agentName: string): string | undefined {
+export function homeChannelOf(framework: AgentFramework, agentName: string): AgentRecord['homeChannel'] {
   return (framework as unknown as RegistryInternals).registry.get(agentName)?.homeChannel;
 }
 

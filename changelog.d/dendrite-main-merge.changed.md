@@ -87,3 +87,10 @@
   of its turn that is on its way (#722), and a conversation agent stopped by
   a listener of the failure its hold after the compile reports is held by
   nothing.
+  `AgentSpec.homeChannel` and the registry record's `homeChannel` are a
+  channel with its server, `{ serverId, channelId }`, and
+  `conversationForkSpec` takes it as `homeChannel` in place of `channelId`.
+  A record that keeps a bare id, as one written before does, is read as a
+  wake that names its channel without its server is: the one registered
+  channel with that id, or, where none or several are, a home on no
+  server.

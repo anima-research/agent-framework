@@ -1017,7 +1017,7 @@ test('stop() cancels a retry wait on the path that does not own provider admissi
     };
     let stopped = false;
     try {
-      asConversationAgent(internal, 'resident', 'world:zz');
+      asConversationAgent(internal, 'resident', { serverId: 'stub', channelId: 'world:zz' });
       fw.getAgent('resident')!.getContextManager().addMessage('User', [{ type: 'text', text: 'zz-direct' }]);
       const run = internal.startAgentStream(fw.getAgent('resident'), { agentName: 'resident', reason: 'conversation', source: 'test', timestamp: Date.now() });
       for (let i = 0; i < 300 && internal.retryWaitWakers.size === 0; i++) await sleep(10);
@@ -1632,15 +1632,15 @@ class FailingAt extends WaitingMembrane {
 
 /** The registry records the framework consults for an agent's roles and home. */
 type AgentRegistryRecords = {
-  get(name: string): { homeChannel?: string; roles: { ownsProviderScheduling: boolean } } | undefined;
+  get(name: string): { homeChannel?: { serverId: string; channelId: string } | string; roles: { ownsProviderScheduling: boolean } } | undefined;
 };
 
 /** Make a registered resident a conversation agent: homed in `channelId`,
  *  not owning provider admission — what the registry says of a fork. */
-function asConversationAgent(internal: { registry: AgentRegistryRecords }, name: string, channelId: string): void {
+function asConversationAgent(internal: { registry: AgentRegistryRecords }, name: string, home: { serverId: string; channelId: string }): void {
   const record = internal.registry.get(name);
   if (!record) throw new Error(`no registry record for ${name}`);
-  record.homeChannel = channelId;
+  record.homeChannel = { ...home };
   record.roles.ownsProviderScheduling = false;
 }
 
@@ -1681,7 +1681,7 @@ async function waitFor(fw: AgentFramework, done: () => boolean, what: string, bo
 }
 
 async function conversationTurn(fw: AgentFramework, internal: NonOwning, text: string): Promise<void> {
-  asConversationAgent(internal, 'resident', 'world:zz');
+  asConversationAgent(internal, 'resident', { serverId: 'stub', channelId: 'world:zz' });
   fw.getAgent('resident')!.getContextManager().addMessage('User', [{ type: 'text', text }]);
   await internal.startAgentStream(fw.getAgent('resident'), { agentName: 'resident', reason: 'conversation', source: 'test', timestamp: Date.now() });
 }
@@ -2236,7 +2236,7 @@ test("the last boundary holds no agent the framework no longer has: a disposed f
     const nonOwning = internal as NonOwning;
     try {
       const agent = fw.getAgent('resident')!;
-      asConversationAgent(nonOwning, 'resident', 'world:zz');
+      asConversationAgent(nonOwning, 'resident', { serverId: 'stub', channelId: 'world:zz' });
       internal.providerWaits.set('resident', 'zz-model', 60_000, 'zz recorded for the fork');
       nonOwning.disposeConversationAgent('resident');
       // Its retry wakes after the disposal and reaches the boundary.

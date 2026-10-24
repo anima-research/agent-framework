@@ -10054,9 +10054,10 @@ export class AgentFramework {
       ? 'reading your context up to this point'
       : 'with a copy of your context';
     const route = record.relationships.resultTo;
+    const home = this.channelOfHome(record.homeChannel);
     const result = !route
-      ? record.homeChannel
-        ? `it speaks for itself in ${record.homeChannel}`
+      ? home
+        ? `it speaks for itself in ${this.channelShown(home)}`
         : 'it returns nothing to you'
       : route.to === from
         ? `its result returns to you as ${route.as === 'message' ? 'a message' : 'a tool result'}`
@@ -15266,7 +15267,7 @@ export class AgentFramework {
       this.announceAgentCreated(this.registry.register({
         ...conversationForkSpec(name, {
           template: router.templateAgent,
-          channelId: home.channelId,
+          homeChannel: home,
           idleTtlMs: router.idleTtlMs,
         }),
         model: config.model,
@@ -15450,7 +15451,7 @@ export class AgentFramework {
     agentName: string,
     injections: ContextInjection[],
   ): ContextInjection[] {
-    const home = this.registry.homeChannel(agentName);
+    const home = this.homeOf(agentName);
     const registry = this.channelRegistry;
     if (!home || !registry || injections.length === 0) {
       return injections;
@@ -15461,7 +15462,7 @@ export class AgentFramework {
     const ids = new Set(registry.listChannelsRaw().map((e) => e.descriptor.id));
     return injections.filter((inj) => {
       const ns = inj.namespace;
-      if (!ns || ns === home) return true;
+      if (!ns || ns === home.channelId) return true;
       return !ids.has(ns);
     });
   }
@@ -16727,22 +16728,22 @@ export class AgentFramework {
   }
 
   /**
-   * The channel a registry record's `homeChannel` names. The record keeps a
-   * bare channel id, so it is read as a wake that names its channel without
-   * its server is (channelNamed): the one registered channel it names, read
-   * when it's used, since the servers registered at that moment are what it
-   * can mean: where the fork's own server withdraws the channel and one other
-   * server registers the id, it names that server's channel. An id that
-   * names no one registered channel, as one no server registers now or two
-   * servers do, is the home on no server (an empty serverId, which
-   * channelNamed reads as none given), so the fork keeps a home. A path
-   * that reads the pair finds no server registering it, and refuses it; one
-   * that reads the name reads what the name means then: none or two
-   * channels, which it refuses, or, once one server alone registers the id,
-   * that server's channel.
+   * The channel a registry record's `homeChannel` names: the channel on its
+   * server. A bare channel id, as a record written before homes carried
+   * their server keeps, is read as a wake that names its channel without its
+   * server is (channelNamed): the one registered channel it names, read when
+   * it's used, since the servers registered at that moment are what it can
+   * mean. An id that names no one registered channel, as one no server
+   * registers now or two servers do, is the home on no server (an empty
+   * serverId, which channelNamed reads as none given), so the agent keeps a
+   * home. A path that reads the pair finds no server registering it, and
+   * refuses it; one that reads the name reads what the name means then: none
+   * or two channels, which it refuses, or, once one server alone registers
+   * the id, that server's channel.
    */
-  private channelOfHome(home: string | undefined): ChannelRef | undefined {
+  private channelOfHome(home: AgentRecord['homeChannel']): ChannelRef | undefined {
     if (home === undefined) return undefined;
+    if (typeof home !== 'string') return home;
     return this.channelNamed(home) ?? { serverId: '', channelId: home };
   }
 

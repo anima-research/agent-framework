@@ -508,7 +508,7 @@ describe('autoContinue', () => {
       internals.ephemeralRuns.delete('assistant');
       assert.equal(queued().length, 0, 'an ephemeral run ends with its result');
 
-      const unbind = bindAsConversationFork(framework, 'assistant', 'chan-alpha');
+      const unbind = bindAsConversationFork(framework, 'assistant', { serverId: 'stub', channelId: 'chan-alpha' });
       internals.autoContinueAfterTurn(agent, {}, undefined, 'end_turn');
       unbind();
       assert.equal(queued().length, 0, 'a conversation fork answers its home');

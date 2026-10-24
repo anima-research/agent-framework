@@ -910,16 +910,15 @@ describe("with conversation routing, each server's channel is its own conversati
 describe("a gate wake's route, with two forks on one channel id", () => {
   type Gate = {
     conversationRouter: ConversationRouter;
-    registry: { homeChannel(name: string): string | undefined; list(): Array<{ name: string; homeChannel: string }> };
+    registry: { homeChannel(name: string): ChannelRef | undefined; list(): Array<{ name: string; homeChannel: ChannelRef }> };
     mayTakeGateRoute(a: string, r: ChannelRef): boolean;
   };
   const d = { serverId: 'discord', channelId: 'room' };
   const s = { serverId: 'slack', channelId: 'room' };
-  // The agent registry's records of the forks and their homes, which keep
-  // a home's id alone.
+  // The agent registry's records of the forks and their homes.
   const homes = (forks: Array<[string, ChannelRef]>): Gate['registry'] => {
-    const byName = new Map(forks.map(([name, home]) => [name, home.channelId]));
-    return { homeChannel: (name) => byName.get(name), list: () => forks.map(([name, home]) => ({ name, homeChannel: home.channelId })) };
+    const byName = new Map(forks);
+    return { homeChannel: (name) => byName.get(name), list: () => forks.map(([name, homeChannel]) => ({ name, homeChannel })) };
   };
 
   it("is taken only by the fork whose home is the route's server and channel", () => {

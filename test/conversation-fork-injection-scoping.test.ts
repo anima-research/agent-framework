@@ -87,11 +87,9 @@ function installChannelRegistry(
     () => {},
     () => {},
     {
-      // A fork's home is on the channels' server, as the framework reads it
-      // where one server registers the id.
       homeChannelResolver: (agentName) => {
         const home = homeChannelOf(framework, agentName);
-        return home === undefined ? undefined : { serverId: 'srv', channelId: home };
+        return typeof home === 'string' ? undefined : home;
       },
     },
   );
@@ -116,7 +114,7 @@ function installChannelRegistry(
 }
 
 function bindForkHome(framework: AgentFramework, agentName = FORK_AGENT, channelId = 'chanA'): void {
-  bindAsConversationFork(framework, agentName, channelId);
+  bindAsConversationFork(framework, agentName, { serverId: 'srv', channelId });
 }
 
 function installHookInjections(framework: AgentFramework, injections: ContextInjection[]): void {

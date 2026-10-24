@@ -374,7 +374,7 @@ test("a fork's qualified-name refusal quotes its home's name as an id is quoted,
   (f.i.channelRegistry as unknown as { channels: Map<string, unknown> }).channels.set(destinationKey(odd), {
     serverId: 'b', descriptor: { id: 'q"x', type: 'chat', label: 'q"x' }, open: true,
   });
-  t.after(bindAsConversationFork(f.framework, 'scout', odd.channelId));
+  t.after(bindAsConversationFork(f.framework, 'scout', odd));
   const results = toolResults(t, f.framework);
   const dispatch = (f.framework as unknown as { dispatchChannelToolCall: Dispatcher }).dispatchChannelToolCall.bind(f.framework);
   dispatch('scout', { id: 'q', name: 'channel_publish', input: { channelId: 'b:q"x', serverId: 'b', content: 'x' } });
@@ -995,14 +995,15 @@ test("a fork's turn whose wake names no channel still has its home, so it's repl
   assert.deepEqual(f.registry.incomingFor('fork'), { channel: a, messageId: 'm-latest', threadId: undefined });
 });
 
-test("a fork's home kept as a bare id is read as a wake without its server is: the one registered channel with that id, or the home on no server", async (t) => {
+test("a fork's home is its channel on its server, and one kept as a bare id is read as a wake without its server is: the one registered channel with that id, or the home on no server", async (t) => {
   const { i } = await frameworkWith(t, ['slack', 'discord']);
   const map = (i.channelRegistry as unknown as { channels: Map<string, unknown> }).channels;
   map.set(destinationKey({ serverId: 'slack', channelId: 'lobby' }), {
     serverId: 'slack', descriptor: { id: 'lobby', type: 'chat', label: '#lobby' }, open: true,
   });
-  const home = (stored: string | undefined) =>
-    (i as unknown as { channelOfHome(home: string | undefined): ChannelRef | undefined }).channelOfHome(stored);
+  const home = (stored: ChannelRef | string | undefined) =>
+    (i as unknown as { channelOfHome(home: ChannelRef | string | undefined): ChannelRef | undefined }).channelOfHome(stored);
+  assert.deepEqual(home({ serverId: 'discord', channelId: 'general' }), { serverId: 'discord', channelId: 'general' }, 'a home with its server is that channel');
   assert.deepEqual(home('lobby'), { serverId: 'slack', channelId: 'lobby' }, 'one server registers the id: its channel');
   assert.deepEqual(home('general'), { serverId: '', channelId: 'general' }, 'two servers do: the home on no server');
   assert.deepEqual(home('gone'), { serverId: '', channelId: 'gone' }, 'no server does: the home on no server');
@@ -1441,7 +1442,7 @@ test("a gate wake's route goes to a fork only where it's the fork's own home, on
     registry: { register(spec: ReturnType<typeof conversationForkSpec>): unknown };
     mayTakeGateRoute(agentName: string, route: ChannelRef): boolean;
   };
-  fw.registry.register(conversationForkSpec('fork-a', { template: 'scout', channelId: a.channelId, idleTtlMs: 60_000 }));
+  fw.registry.register(conversationForkSpec('fork-a', { template: 'scout', homeChannel: a, idleTtlMs: 60_000 }));
   assert.equal(fw.mayTakeGateRoute('fork-a', a), true, "the fork's home");
   assert.equal(fw.mayTakeGateRoute('fork-a', b), false, "b's general is another channel, though it shares the id");
   assert.equal(fw.mayTakeGateRoute('scout', a), false, "a's general is the fork's conversation");
@@ -1457,7 +1458,7 @@ test("what an agent is told of a destination or a channel names it apart where i
   assert.equal(fw.destinationText({ ...b, label: '#general' }), '#general (b:general)');
   // A fork's channel_close is refused for any channel but its home: a
   // notice offers it only for that one, on its server.
-  t.after(bindAsConversationFork(f.framework, 'scout', a.channelId));
+  t.after(bindAsConversationFork(f.framework, 'scout', a));
   fw.recordReplyOpenFailedNotice('scout', b.serverId, { channelId: b.channelId, label: '#general' }, 'subscription-policy');
   fw.recordReplyOpenFailedNotice('scout', a.serverId, { channelId: a.channelId, label: '#general' }, 'subscription-policy');
   const notices = f.framework.getAgent('scout')!.getContextManager().queryMessages({}).messages
@@ -1494,7 +1495,7 @@ test("a fork's resend goes home on its server, and another server's channel with
     proseDrafts: { hold(agent: string, segments: Array<{ text: string }>, reason: 'bounced'): { held: Array<{ id: string }> } };
     handleDraftsTool(agent: string, input: unknown): Promise<unknown>;
   };
-  t.after(bindAsConversationFork(f.framework, 'scout', b.channelId));
+  t.after(bindAsConversationFork(f.framework, 'scout', b));
   const [draft] = fw.proseDrafts.hold('scout', [{ text: 'held words' }], 'bounced').held;
   const refused = ((await fw.handleDraftsTool('scout', { action: 'resend', draftIds: [draft!.id], destination: 'a:general' })) as
     { error?: string }).error ?? '';
@@ -1563,7 +1564,7 @@ for (const order of orders) {
 
   test(`a fork homed on b's general publishes there by the bare id, and a's channel is foreign to it (${registered})`, async (t) => {
     const f = await frameworkWith(t, order);
-    bindAsConversationFork(f.framework, 'scout', b.channelId);
+    bindAsConversationFork(f.framework, 'scout', b);
     const results = toolResults(t, f.framework);
     const dispatch = (f.framework as unknown as { dispatchChannelToolCall: Dispatcher }).dispatchChannelToolCall.bind(f.framework);
 
@@ -1798,7 +1799,7 @@ for (const order of orders) {
 
 test("a fork whose home its server no longer registers is told so, and not offered another server's channel", async (t) => {
   const f = await frameworkWith(t, ['a', 'b']);
-  bindAsConversationFork(f.framework, 'scout', b.channelId);
+  bindAsConversationFork(f.framework, 'scout', b);
   const results = toolResults(t, f.framework);
   const dispatch = (f.framework as unknown as { dispatchChannelToolCall: Dispatcher }).dispatchChannelToolCall.bind(f.framework);
   // b's general goes; a's general keeps the id.

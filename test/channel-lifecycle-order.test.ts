@@ -2329,7 +2329,8 @@ async function replyOpenFailedNotices(opts: {
   framework.openLogical = new Map();
   framework.agents = new Map((opts.live ?? [agentName]).map((name) => [name, { canUseTool: (tool: string) => !(opts.denied ?? []).includes(tool) }]));
   framework.usedEphemeralAgentNames = new Set();
-  framework.registry = { homeChannel: (name: string) => new Map(opts.homes ?? []).get(name), readsSharedSlot: (name: string) => [...(framework.sharedSlotAgents ?? [])].some((a: { name: string }) => a.name === name) };
+  // A fork's home is a channel on the send's server.
+  framework.registry = { homeChannel: (name: string) => new Map((opts.homes ?? []).map(([n, id]) => [n, { serverId: 'chat-server', channelId: id }])).get(name), readsSharedSlot: (name: string) => [...(framework.sharedSlotAgents ?? [])].some((a: { name: string }) => a.name === name) };
   framework.sharedSlotAgents = new Set();
   framework.primaryAgentName = opts.primary;
   framework.emitTrace = () => {};
@@ -2565,7 +2566,7 @@ test("where a reply's reader can't close a channel selected for opening, the pri
     framework.agents = new Map(c.agents.map(([name, denied]) => [name, { name, canUseTool: (tool: string) => !denied.includes(tool) }]));
     framework.primaryAgentName = c.primary;
     framework.usedEphemeralAgentNames = new Set();
-    framework.registry = { homeChannel: (name: string) => new Map(c.homes ?? []).get(name), readsSharedSlot: (name: string) => [...(framework.sharedSlotAgents ?? [])].some((a: { name: string }) => a.name === name) };
+    framework.registry = { homeChannel: (name: string) => new Map((c.homes ?? []).map(([n, id]) => [n, { serverId: 'srv', channelId: id }])).get(name), readsSharedSlot: (name: string) => [...(framework.sharedSlotAgents ?? [])].some((a: { name: string }) => a.name === name) };
     framework.sharedSlotAgents = new Set();
     // Forks are made where conversations are routed, here from the primary.
     framework.conversationRouter = c.homes ? { templateAgent: 'primary' } : undefined;
@@ -2691,7 +2692,7 @@ test('the opened notice names channel_close only where the agent it\'s addressed
     framework.agents = new Map(c.agents.map(([name, denied]) => [name, { name, canUseTool: (tool: string) => !denied.includes(tool) }]));
     framework.primaryAgentName = c.primary;
     framework.usedEphemeralAgentNames = new Set();
-    framework.registry = { homeChannel: (name: string) => new Map(c.homes ?? []).get(name), readsSharedSlot: (name: string) => [...(framework.sharedSlotAgents ?? [])].some((a: { name: string }) => a.name === name) };
+    framework.registry = { homeChannel: (name: string) => new Map((c.homes ?? []).map(([n, id]) => [n, { serverId: 'srv', channelId: id }])).get(name), readsSharedSlot: (name: string) => [...(framework.sharedSlotAgents ?? [])].some((a: { name: string }) => a.name === name) };
     framework.sharedSlotAgents = new Set();
     // Each fork is bound to its home, unless the sweep has ended its binding;
     // of two forks with one home, the router binds the later.
@@ -2739,7 +2740,7 @@ test("each channel notice is written on its own, and the reader's says the prima
       framework.agents = new Map([['fork', { name: 'fork', canUseTool: () => true }], ['primary', { name: 'primary', canUseTool: () => true }]]);
       framework.primaryAgentName = 'primary';
       framework.usedEphemeralAgentNames = new Set();
-      framework.registry = { homeChannel: (name: string) => new Map([['fork', 'y']]).get(name), readsSharedSlot: (name: string) => [...(framework.sharedSlotAgents ?? [])].some((a: { name: string }) => a.name === name) };
+      framework.registry = { homeChannel: (name: string) => new Map([['fork', { serverId: 'srv', channelId: 'y' }]]).get(name), readsSharedSlot: (name: string) => [...(framework.sharedSlotAgents ?? [])].some((a: { name: string }) => a.name === name) };
       framework.sharedSlotAgents = new Set();
       framework.conversationRouter = { templateAgent: 'primary' };
       framework.addMessage = (_participant: string, content: Array<{ text: string }>, _metadata: unknown, routed?: { forAgent?: string }) => {

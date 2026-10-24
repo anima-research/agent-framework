@@ -44,7 +44,7 @@ describe('AgentRegistry roles', () => {
     registry.register(residentSpec('mira', { primary: true }));
     registry.register(residentSpec('oren', { primary: false }));
     registry.register(subconsciousSpec('Subconscious', 'mira'));
-    registry.register(conversationForkSpec('mira-chan-1', { template: 'mira', channelId: 'c1', idleTtlMs: 60_000 }));
+    registry.register(conversationForkSpec('mira-chan-1', { template: 'mira', homeChannel: { serverId: 's1', channelId: 'c1' }, idleTtlMs: 60_000 }));
     registry.register(workerSpec('worker-1', { spawnedBy: 'mira' }));
 
     assert.equal(registry.primary(), 'mira');
@@ -58,7 +58,7 @@ describe('AgentRegistry roles', () => {
     assert.equal(registry.ownsProviderScheduling('mira-chan-1'), false);
     assert.equal(registry.ownsProviderScheduling('worker-1'), false);
     assert.equal(registry.ownsProviderScheduling('nobody'), false);
-    assert.equal(registry.homeChannel('mira-chan-1'), 'c1');
+    assert.deepEqual(registry.homeChannel('mira-chan-1'), { serverId: 's1', channelId: 'c1' });
     assert.equal(registry.homeChannel('mira'), undefined);
   });
 
@@ -107,7 +107,7 @@ describe('AgentRegistry spec validation', () => {
   it('refuses an idle lifetime with no TTL', () => {
     const registry = base();
     assert.throws(
-      () => registry.register(conversationForkSpec('f', { template: 'mira', channelId: 'c', idleTtlMs: 0 })),
+      () => registry.register(conversationForkSpec('f', { template: 'mira', homeChannel: { serverId: 's1', channelId: 'c' }, idleTtlMs: 0 })),
       /positive idleTtlMs/,
     );
   });
@@ -238,7 +238,7 @@ describe('AgentRegistry restart behaviour follows lifetime', () => {
     first.register(residentSpec('mira', { primary: true }));
     first.register(subconsciousSpec('Subconscious', 'mira'));
     first.register(workerSpec('job', { spawnedBy: 'mira', resultTo: { to: 'mira', as: 'message' } }));
-    first.register(conversationForkSpec('mira-c1', { template: 'mira', channelId: 'c1', idleTtlMs: 1_000 }));
+    first.register(conversationForkSpec('mira-c1', { template: 'mira', homeChannel: { serverId: 's1', channelId: 'c1' }, idleTtlMs: 1_000 }));
     const held = first.holdMail({
       kind: 'result',
       from: first.ref('job'),
@@ -266,6 +266,22 @@ describe('AgentRegistry restart behaviour follows lifetime', () => {
       [held.id, 'job', 1, 'mira'],
     ]);
     assert.deepEqual(state.ended.map((r) => r.name).sort(), ['job', 'mira-c1']);
+  });
+
+  it('restores a snapshot whose fork keeps its home as a bare id, as one written before homes carried their server', () => {
+    const { state, make } = persisted();
+    const first = make();
+    first.register(residentSpec('mira', { primary: true }));
+    first.register(conversationForkSpec('mira-c1', { template: 'mira', homeChannel: { serverId: 's1', channelId: 'c1' }, idleTtlMs: 1_000 }));
+    // The record as the code before this one wrote it: the id alone.
+    const snapshot = JSON.parse(JSON.stringify(state.snapshot)) as { records: Array<{ name: string; homeChannel?: unknown }> };
+    snapshot.records.find((r) => r.name === 'mira-c1')!.homeChannel = 'c1';
+
+    const second = make();
+    const { interrupted } = second.restore(snapshot as never, state.ended);
+    assert.deepEqual(interrupted.map((r) => [r.name, r.ended?.reason, r.homeChannel]), [['mira-c1', 'host-restart', 'c1']],
+      'the fork ends at the restart, as every fork does, its home as it was written');
+    assert.equal(second.homeChannel('mira-c1'), undefined, 'and no live agent has that home');
   });
 
   it('ends a persistent agent the new configuration no longer declares', () => {

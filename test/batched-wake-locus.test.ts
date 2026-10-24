@@ -255,8 +255,8 @@ describe('batched wake routing with conversation forks', () => {
     };
     // A conversation fork's home is its registry record (Dendrite); the gate
     // fans out to every agent that receives gate wakes, forks included.
-    internals.registry.register(conversationForkSpec('fork-room', { template: 'trunk', channelId: ROOM, idleTtlMs: 60_000 }));
-    internals.registry.register(conversationForkSpec('fork-other', { template: 'trunk', channelId: GENERAL, idleTtlMs: 60_000 }));
+    internals.registry.register(conversationForkSpec('fork-room', { template: 'trunk', homeChannel: { serverId: 'discord', channelId: ROOM }, idleTtlMs: 60_000 }));
+    internals.registry.register(conversationForkSpec('fork-other', { template: 'trunk', homeChannel: { serverId: 'discord', channelId: GENERAL }, idleTtlMs: 60_000 }));
     internals.eventGate.evaluate({
       content: '@agent hi', eventType: 'mcpl:channel-incoming', serverId: 'discord', channelId: ROOM,
       tags: ['chat:addressed'], metadata: { authorId: '5' },

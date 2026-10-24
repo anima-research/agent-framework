@@ -321,7 +321,7 @@ test("a conversation agent's turn a stated wait holds for its retry is alive too
     const membrane = new ScriptedMembrane(new Set([1]), (request) => rateLimited(60_000, request));
     const { fw, internal } = await framework(path, membrane);
     try {
-      bindAsConversationFork(fw, 'resident', 'world:zz');
+      bindAsConversationFork(fw, 'resident', { serverId: 'stub', channelId: 'world:zz' });
       fw.getAgent('resident')!.getContextManager().addMessage('User', [{ type: 'text', text: 'zz-direct' }]);
       await internal.startAgentStream(fw.getAgent('resident'), { agentName: 'resident', reason: 'conversation', source: 'test', timestamp: Date.now() });
       await waitFor(fw, () => internal.providerAccelerationCooldowns.has('resident'), 'held');
@@ -468,7 +468,7 @@ test("a conversation agent's turn a wait recorded during its compile holds is al
     const membrane = new ScriptedMembrane(new Set(), () => new Error('unused'));
     const { fw, internal } = await framework(path, membrane);
     try {
-      bindAsConversationFork(fw, 'resident', 'world:zz');
+      bindAsConversationFork(fw, 'resident', { serverId: 'stub', channelId: 'world:zz' });
       const agent = fw.getAgent('resident')!;
       agent.getContextManager().addMessage('User', [{ type: 'text', text: 'zz-direct' }]);
       // Its own compression records a wait while the turn compiles.
@@ -526,7 +526,7 @@ test("a stated wait with no end holds the turn until released, and surgery's ref
 
 /** A conversation agent's turn, held for its retry by a stated wait. */
 async function heldConversationTurn(fw: AgentFramework, internal: Internal) {
-  bindAsConversationFork(fw, 'resident', 'world:zz');
+  bindAsConversationFork(fw, 'resident', { serverId: 'stub', channelId: 'world:zz' });
   fw.getAgent('resident')!.getContextManager().addMessage('User', [{ type: 'text', text: 'zz-direct' }]);
   await internal.startAgentStream(fw.getAgent('resident'), { agentName: 'resident', reason: 'conversation', source: 'test', timestamp: Date.now() });
   await waitFor(fw, () => internal.providerAccelerationCooldowns.has('resident'), 'held');
@@ -572,7 +572,7 @@ for (const site of ['after-compile', 'throw'] as const) test(`an agent that a li
       const agent = fw.getAgent('resident')!;
       agent.getContextManager().addMessage('User', [{ type: 'text', text: 'zz-direct' }]);
       if (site === 'after-compile') {
-        bindAsConversationFork(fw, 'resident', 'world:zz');
+        bindAsConversationFork(fw, 'resident', { serverId: 'stub', channelId: 'world:zz' });
         // Its own compression records a wait while the turn compiles.
         const compile = agent.startStreamWithInjections.bind(agent);
         agent.startStreamWithInjections = (async (...args: Parameters<typeof compile>) => {
@@ -624,7 +624,7 @@ for (const failsAt of ['event', 'setup'] as const) test(`an error policy's retry
     }), failsAt);
     const { fw, internal } = await framework(path, membrane);
     try {
-      bindAsConversationFork(fw, 'resident', 'world:zz');
+      bindAsConversationFork(fw, 'resident', { serverId: 'stub', channelId: 'world:zz' });
       const agent = fw.getAgent('resident')!;
       agent.getContextManager().addMessage('User', [{ type: 'text', text: 'zz-direct' }]);
       void internal.startAgentStream(agent, { agentName: 'resident', reason: 'conversation', source: 'test', timestamp: Date.now() });
@@ -700,7 +700,7 @@ for (const [label, site, host] of [
     });
     try {
       if (conversation) {
-        bindAsConversationFork(fw, 'resident', 'world:zz');
+        bindAsConversationFork(fw, 'resident', { serverId: 'stub', channelId: 'world:zz' });
         const agent = fw.getAgent('resident')!;
         agent.getContextManager().addMessage('User', [{ type: 'text', text: 'zz-direct' }]);
         if (site === 'after-compile') {
@@ -884,7 +884,7 @@ type FailureSite = 'event' | 'throw' | 'setup' | 'conversation-event' | 'convers
 async function failIntoHold(site: FailureSite, fw: AgentFramework, internal: Internal, membrane: ScriptedMembrane) {
   if (site === 'event' || site === 'throw' || site === 'setup') return heldTurn(fw, internal, membrane);
   if (site !== 'after-compile') return heldConversationTurn(fw, internal);
-  bindAsConversationFork(fw, 'resident', 'world:zz');
+  bindAsConversationFork(fw, 'resident', { serverId: 'stub', channelId: 'world:zz' });
   const agent = fw.getAgent('resident')!;
   agent.getContextManager().addMessage('User', [{ type: 'text', text: 'zz-direct' }]);
   const compile = agent.startStreamWithInjections.bind(agent);
@@ -1019,7 +1019,7 @@ test("a wait released by a listener of the inference:failed a conversation agent
       if (event.type === 'inference:failed' && event.agentName === 'resident') fw.releaseProviderWait('resident');
     });
     try {
-      bindAsConversationFork(fw, 'resident', 'world:zz');
+      bindAsConversationFork(fw, 'resident', { serverId: 'stub', channelId: 'world:zz' });
       const agent = fw.getAgent('resident')!;
       agent.getContextManager().addMessage('User', [{ type: 'text', text: 'zz-direct' }]);
       let recorded = false;
@@ -1306,7 +1306,7 @@ test("a stop made as an error policy's retry of a failed start is held at the la
     }), 'setup');
     const { fw, internal } = await framework(path, membrane);
     try {
-      bindAsConversationFork(fw, 'resident', 'world:zz');
+      bindAsConversationFork(fw, 'resident', { serverId: 'stub', channelId: 'world:zz' });
       const agent = fw.getAgent('resident')!;
       agent.getContextManager().addMessage('User', [{ type: 'text', text: 'zz-direct' }]);
       // A stop on the microtask after the retry's hold is installed, while

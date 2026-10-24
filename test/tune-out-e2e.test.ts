@@ -226,8 +226,7 @@ describe('tune-out end to end', () => {
     const registry = (framework as unknown as {
       registry: { register(spec: ReturnType<typeof conversationForkSpec>): unknown; end(name: string, reason: string): unknown };
     }).registry;
-    // The fork's home is server other's channel, which a bare id can't say.
-    registry.register(conversationForkSpec('fork-elsewhere', { template: 'scout', channelId: CHANNEL, idleTtlMs: 60_000 }));
+    registry.register(conversationForkSpec('fork-elsewhere', { template: 'scout', homeChannel: { serverId: 'other', channelId: CHANNEL }, idleTtlMs: 60_000 }));
     try {
       assert.equal(hooks.isForkBound({ serverId: 'disc', channelId: CHANNEL }), false, "disc's channel isn't the fork's");
       assert.equal(hooks.isForkBound({ serverId: 'other', channelId: CHANNEL }), true);
