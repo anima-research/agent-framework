@@ -789,9 +789,11 @@ export async function ownCaseFolding(dir: string, name?: string): Promise<boolea
   // folding. A name gone and back with the same inode number and change time
   // still passes, as a rename away and back, or a remake under the freed
   // inode number, within one tick of a coarse clock right after its last
-  // change can leave it; that race is outside the nested-mount guarantee
-  // (MountConfig.include), and the third spelling's own answer is gated on
-  // trusted change times below.
+  // change can leave it, or any such absence where change times aren't
+  // trusted; that race is outside the nested-mount guarantee
+  // (MountConfig.include). The third spelling's nothing is gated on trusted
+  // change times below; the flipped spelling's isn't, since that would make
+  // every level on a filesystem outside the list a guess.
   const unchanged = (a: BigIntStats, b: BigIntStats) => sameFile(a, b) && a.ctimeNs === b.ctimeNs;
   const told = async (unpaired: string): Promise<boolean | null> => {
     const before = await look(join(dir, unpaired));
@@ -967,9 +969,10 @@ function shownByCodePoints(name: string): string {
  * the nested mount's directory is named (`dir`), each from the mount's name;
  * the directories holding the levels it guessed at only by a case difference
  * where their own entries told nothing at start, as start read them (`untold`),
- * which a start once the nested mount's directory is made would settle, since
- * each then holds that directory's own name; and whether
- * it guessed at any level by the names themselves (`byName`), which a rename
+ * which a start once the nested mount's directory is made settles where a
+ * level lacked only that directory's own name, and a rename settles where a
+ * twin in case kept it telling nothing with the name there; and whether it
+ * guessed at any level by the names themselves (`byName`), which a rename
  * settles, whatever those levels read. Where start placed the nested mount
  * there only by a guess, comparing the real roots, the directory as the path
  * names it (`placed`), or, where the path guessed at it too, both spellings as
@@ -1073,7 +1076,7 @@ export function nestedStep(holder: { name: string; use: string; guess?: NestedGu
   const since = untold.length === 0 ? '' : `, since nothing in ${quotedList(untold)} showed at start how ${one ? 'it compares' : 'they compare'} names`;
   const rename = `rename one of "${guess.given}" and "${guess.dir}"`;
   const remedy = untold.length === 0 ? rename
-    : `start it again once mount "${holder.name}"'s directory is made, and, if this answer comes again after a start that found it there, to ${rename}`;
+    : `start it again once mount "${holder.name}"'s directory is made, and, if this answer comes again after a start that found that directory there, to ${rename}`;
   const own = opts.named
     ? `If you meant one of this mount's own, for a new file use a path outside "${guess.given}" and "${guess.dir}", and for one already there ask whoever runs this workspace to ${remedy}`
     : `If not, ask whoever runs this workspace to ${remedy}`;

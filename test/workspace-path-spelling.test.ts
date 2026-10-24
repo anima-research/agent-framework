@@ -56,7 +56,7 @@ const LONG_S_FOLDING_ONLY = folds.longS ? false
 const FINAL_SIGMA_FOLDING_ONLY = folds.finalSigma ? false
   : 'the temp directory keeps \u03c2 apart from \u03c3, so \u039f\u0394\u039f\u03a3 reaches nothing where disk has \u03bf\u03b4\u03bf\u03c2';
 // The step a guess resting on levels that told nothing gives after its restart.
-const AGAIN = ', and, if this answer comes again after a start that found it there, to rename one of ';
+const AGAIN = ', and, if this answer comes again after a start that found that directory there, to rename one of ';
 // statfs f_types, for withStatfsType: one whose change times are trusted, and one whose aren't.
 const EXT4 = 0xef53;
 const FUSE = 0x65735546;
@@ -1078,8 +1078,9 @@ test('a name re-created or renamed back under the same inode between its first a
   writeFileSync(join(root, 'other'), '');
   const nothing = () => Promise.reject(Object.assign(new Error('ENOENT: no such file or directory'), { code: 'ENOENT' }));
   // A filesystem whose change times are trusted, so on Linux the change
-  // time, not the trust gate, is what keeps each answer from telling case
-  // apart; off Linux none is trusted, and the gate alone keeps it.
+  // time alone keeps each answer from telling case apart: with its check
+  // taken out, the trust gate doesn't, and the Ab.txt case fails here. Off
+  // Linux none is trusted, so there the gate would hide that removal.
   for (const gone of ['AB.TXT', 'Ab.txt', 'nothing']) {
     let named = 0;
     const answer = await withStatfsType(EXT4, () => withLstat((original) => (async (path: fs.PathLike, ...rest: unknown[]) => {
@@ -1165,7 +1166,7 @@ test('a path lies surely in a nested mount\'s directory where each level is exac
   assert.equal(nestedStep(inner(shown('outer/caf\\u00e9', 'outer/cafe\\u0301')), { named: true }),
     'this workspace can\'t tell "outer/caf\\u00e9" from "outer/cafe\\u0301", mount "inner"\'s directory. If you meant that mount\'s directory, use "inner/x.txt". ' +
     'If you meant one of this mount\'s own, for a new file use a path outside "outer/caf\\u00e9" and "outer/cafe\\u0301", and for one already there ask whoever runs this workspace to rename one of "outer/caf\\u00e9" and "outer/cafe\\u0301"');
-  const restart = (given: string, dir: string) => `start it again once mount "inner"'s directory is made, and, if this answer comes again after a start that found it there, to rename one of "${given}" and "${dir}"`;
+  const restart = (given: string, dir: string) => `start it again once mount "inner"'s directory is made${AGAIN}"${given}" and "${dir}"`;
   assert.equal(nestedStep(inner({ ...shown('outer/sub/INNER', 'outer/sub/inner', ['outer/sub']), leads: 'outer/sub/INNER/x.txt' }), { after: ' in its place' }),
     'it leads to "outer/sub/INNER/x.txt", and this workspace can\'t tell "outer/sub/INNER" from "outer/sub/inner", mount "inner"\'s directory, since nothing in "outer/sub" ' +
     `showed at start how it compares names. If you meant that mount's directory, use "inner/x.txt" in its place. If not, ask whoever runs this workspace to ${restart('outer/sub/INNER', 'outer/sub/inner')}`);
@@ -1300,7 +1301,7 @@ test('on a disk that tells case apart, a guess resting on a level above every ro
   const write = () => tool('write', { path: 'outer/up/SUB/inner/new.md', content: 'x\n' });
   const guessed = (await write()).error;
   assert.match(String(guessed), /can't tell "outer\/up\/SUB\/inner" from "outer\/up\/sub\/inner", mount "inner"'s directory, since nothing in "outer\/up" showed at start how it compares names/);
-  assert.match(String(guessed), /start it again once mount "inner"'s directory is made, and, if this answer comes again after a start that found it there, to rename one of "outer\/up\/SUB\/inner" and "outer\/up\/sub\/inner"\.$/);
+  assert.ok(String(guessed).endsWith(`start it again once mount "inner"'s directory is made${AGAIN}"outer/up/SUB/inner" and "outer/up/sub/inner".`), String(guessed));
   // Another lettered name there doesn't tell, since only sub's is read.
   writeFileSync(join(dirname(dir), 'notes.txt'), 'n\n');
   await restart();
@@ -1498,12 +1499,19 @@ test('on a disk that tells case apart, a level holding a nested mount\'s directo
   };
   const read = (rig: Awaited<ReturnType<typeof nestedRig>>) => rig.tool('read', { path: 'outer/INNER/x.txt', offsetChars: 0, limitChars: 100 });
   const trusted = await read(await withStatfsType(EXT4, () => nestedRig(t, 'inner', { before: layout })));
+  const rig = await withStatfsType(FUSE, () => nestedRig(t, 'inner', { before: layout }));
+  const untrusted = await read(rig);
   if (process.platform === 'linux') assert.equal((trusted.structured as { content: string } | undefined)?.content, "the outer mount's\n", String(trusted.error));
-  const untrusted = await read(await withStatfsType(FUSE, () => nestedRig(t, 'inner', { before: layout })));
+  else assert.equal(trusted.error, untrusted.error, 'off Linux no filesystem is trusted, whatever statfs says');
   assert.equal(untrusted.error, '"outer/INNER/x.txt" may lie in mount "inner", nested in mount "outer", which neither reads nor writes it: this workspace can\'t tell ' +
     '"outer/INNER" from "outer/inner", mount "inner"\'s directory, since nothing in "outer" showed at start how it compares names. If you meant that mount\'s ' +
     'directory, use "inner/x.txt". If you meant one of this mount\'s own, for a new file use a path outside "outer/INNER" and "outer/inner", and for one already ' +
     'there ask whoever runs this workspace to start it again once mount "inner"\'s directory is made' + AGAIN + '"outer/INNER" and "outer/inner".');
+  // A start that finds inner/ there reads the twins as telling nothing
+  // again, which is why the answer goes on to a rename.
+  await rig.workspace.stop();
+  await withStatfsType(FUSE, () => rig.workspace.start({ isRestart: true, getState: () => null, setState: () => {}, pushEvent: () => {} } as unknown as ModuleContext));
+  assert.equal((await read(rig)).error, untrusted.error, 'the same answer after a start that found inner/ there');
 });
 
 test('where disk folds case and keeps \u00df apart from ss, a directory spelled with ss beside a nested mount at \u00df is that mount\'s, erring toward it', { skip: CASE_NOT_SHARP_S_ONLY }, async (t) => {

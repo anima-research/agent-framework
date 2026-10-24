@@ -58,7 +58,7 @@ export interface MountConfig {
    *   link is read and written where it leads now. Where that root now lies
    *   elsewhere than the last start placed it, each call nests in it, as a
    *   start would now, every mount
-   *   configured beneath its path, where that path leads beneath its root,
+   *   configured on or beneath its path, where that path leads beneath its root,
    *   and every other mount whose root, as that start placed it, lies
    *   beneath where its root lies now, or whose configured path lies
    *   beneath a directory that start found there. A mount configured
@@ -236,10 +236,13 @@ export interface MountConfig {
    * meant: that mount's path to use; for a new file of this mount's, a path
    * outside both spellings; and for one already there, whoever runs the
    * workspace renaming one of the two spellings, or, where the guess rests on
-   * a case difference beneath directories that told nothing at start,
+   * letters a-z or A-Z differing in case alone beneath directories that told
+   * nothing at start,
    * starting it again once the nested mount's directory is made, and renaming
-   * one of the two if the answer comes again after a start that found it
-   * there, since such a level can tell nothing with that directory in it too. Where start placed the nested mount only by a guess,
+   * one of the two if the answer comes again after a start that found that
+   * directory there, since a level can tell nothing with the directory in it
+   * too, as where its every lettered name has a twin in case that tells
+   * nothing. Where start placed the nested mount only by a guess,
    * comparing the real roots, as for two mounts' roots configured in spellings
    * it can't tell apart, a path there is a guess too, however exactly it
    * matches, and the answer names that directory as the path spells it, with
@@ -262,8 +265,8 @@ export interface MountConfig {
    * it where it lies; a name a start reads a level's folding by, gone for a
    * moment and back under the same inode number and change time, as a rename
    * away and back, or a remake under the freed inode number, within one tick
-   * of a coarse clock right after its last change can leave it, or a remake
-   * on a filesystem whose change times this module doesn't trust
+   * of a coarse clock right after its last change can leave it, or any such
+   * absence on a filesystem whose change times this module doesn't trust
    * (filesystemTrustsCtime), can make a level that folds
    * case read as one that tells it apart, when another spelling of it is
    * looked up while it's gone; and where a direct mount's root is repointed

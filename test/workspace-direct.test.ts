@@ -1478,7 +1478,7 @@ test("a direct mount whose root moves between a read's parse and its open names 
   assert.match(err.message, /lies in mount "work", nested in mount "ref"/);
 });
 
-test("a direct mount whose root has moved resolves no other mount's root but those configured beneath its path", async (t) => {
+test("a direct mount whose root has moved resolves no other mount's root but those configured on or beneath its path", async (t) => {
   const env = new Env(t);
   // `ref` reaches `a` through `link`, and `x` is configured through a link
   // of its own, elsewhere.
