@@ -122,6 +122,11 @@ interface PendingEvent {
    *  whose `channelId` is the adapter's raw id (a bare Discord snowflake for a
    *  DM) — unroutable. Absent when the host could not resolve one. */
   routeChannelId?: string;
+  /** The event is a private surface's message (the framework's
+   *  isNonChannelSurfaceEvent), which makes its window's wake private. */
+  nonChannelOrigin?: boolean;
+  /** The turn whose work the event continues (GateEventInfo.callerTurnId). */
+  callerTurnId?: number;
   /** The event's own identity among what the framework stored at arrival:
    *  a channel message's id, a push event's event id (isNewestEntry). */
   messageId?: string;
@@ -162,13 +167,29 @@ export interface WakeProvenance {
    *  (2026-09-30: a DM reply published into a guild channel). Ambient-only
    *  batches still set nothing and keep the legacy fallback. */
   routeChannelId?: string;
+  /** The window held a private surface's message: its wake is private, and
+   *  names no route (the framework's processInferenceRequests). */
+  nonChannelOrigin?: boolean;
   /** The server of `routeChannelId`'s channel, beside it whenever the chosen
    *  event named its server: channel ids are unique only within one
    *  server's connection (MCPL §14.2). */
   routeServerId?: string;
-  /** Timestamp (ms) of the chosen event, so a consumer coalescing several
+  /** Timestamp (ms) of the chosen event, or of a private window's newest
+   *  private message when that is later, so a consumer coalescing several
    *  requests can order by event recency, not by flush order. */
   at?: number;
+  /** The registered channel of each of the window's channel messages, each
+   *  once, with its server: what a private turn that takes the wake names,
+   *  since its plain speech reaches none of them (the framework's notice of
+   *  a private turn's channel messages). Not telemetry: it decides what that
+   *  notice names, and a window with no pick for the fields above still
+   *  gives it. */
+  channels?: Array<{ channelId: string; serverId?: string }>;
+  /** The turns whose work the wake continues, each once: a window's module
+   *  requests' (PendingEvent.callerTurnId), or the turn that armed a
+   *  self-wake or a sleep. The framework wakes a private turn when any of
+   *  them is private as it stands at the start that takes the wake. */
+  callerTurnIds?: number[];
   /** The batch's `[Gate: …]` line, when the gate handed it to the wake rather
    *  than wrote it: a WakeLine, the parts its text is rendered from when it's
    *  written (wakeLineText), decided by a fresh start of the wake's turn as
@@ -250,13 +271,32 @@ function isMetadataTruthy(value: unknown): boolean {
 /**
  * Provenance of a batched wake: the newest ADDRESSED channel-bearing event
  * wins (mention / reply / DM outranks newer ambient chatter — the framework's
- * own locus rule); else the newest channel-bearing event. Channel, author and
+ * own locus rule); else the newest channel-bearing event (a private message
+ * that names its author counts as one); else, in a window that holds only
+ * private surface messages naming no author, the newest of those. A private
+ * window's wake is as recent as its newest private message. Channel, author and
  * addressed all come from that one event, so they can never disagree.
+ *
+ * A window that holds a private surface's message is private, whatever else
+ * it holds: its one wake is a private turn's, which answers in no channel,
+ * and it names no route, so the operator's words never start a turn whose
+ * reply is published (private wins, one way). Its channel, author and
+ * addressed still say who woke it, as telemetry. So does the list of every
+ * channel the window's messages came from (channels), which such a private
+ * turn names to its resident.
  */
 export function wakeProvenance(events: PendingEvent[]): WakeProvenance | undefined {
   let newest: PendingEvent | undefined;
   let newestAddressed: PendingEvent | undefined;
+  let newestPrivate: PendingEvent | undefined;
+  const channels: Array<{ channelId: string; serverId?: string }> = [];
+  const callerTurnIds: number[] = [];
   for (const e of events) {
+    if (e.callerTurnId !== undefined && !callerTurnIds.includes(e.callerTurnId)) callerTurnIds.push(e.callerTurnId);
+    if (e.nonChannelOrigin === true && (!newestPrivate || e.timestamp >= newestPrivate.timestamp)) newestPrivate = e;
+    if (e.routeChannelId && !channels.some((c) => c.channelId === e.routeChannelId && c.serverId === e.serverId)) {
+      channels.push({ channelId: e.routeChannelId, ...(e.serverId ? { serverId: e.serverId } : {}) });
+    }
     // A resolved route counts as naming a channel only for an ADDRESSED
     // event: a push whose origin declares only `mcplChannelId` (no raw
     // channel id, no author) is still a routable addressed message, and
@@ -268,8 +308,13 @@ export function wakeProvenance(events: PendingEvent[]): WakeProvenance | undefin
     if (!newest || e.timestamp >= newest.timestamp) newest = e;
     if (e.addressed && (!newestAddressed || e.timestamp >= newestAddressed.timestamp)) newestAddressed = e;
   }
-  const pick = newestAddressed ?? newest;
-  if (!pick) return undefined;
+  const privateSurface = newestPrivate !== undefined;
+  const pick = newestAddressed ?? newest ?? newestPrivate;
+  const carried = {
+    ...(channels.length > 0 ? { channels } : {}),
+    ...(callerTurnIds.length > 0 ? { callerTurnIds } : {}),
+  };
+  if (!pick) return Object.keys(carried).length > 0 ? carried : undefined;
   // push-event channel ids are the adapter's raw ids (a Discord snowflake):
   // not a composite channel id, so not reported as one
   const channelId = pick.channelId && pick.eventType !== 'mcpl:push-event' ? pick.channelId : undefined;
@@ -278,10 +323,13 @@ export function wakeProvenance(events: PendingEvent[]): WakeProvenance | undefin
     ...(channelId ? { channelId } : {}),
     ...(pick.authorId ? { counterparty: `${ns}:user:${pick.authorId}` } : {}),
     ...(pick.addressed ? { addressed: true } : {}),
-    ...(pick.addressed && pick.routeChannelId
+    ...(pick.addressed && pick.routeChannelId && !privateSurface
       ? { routeChannelId: pick.routeChannelId, ...(pick.serverId ? { routeServerId: pick.serverId } : {}) }
       : {}),
-    at: pick.timestamp,
+    ...(privateSurface ? { nonChannelOrigin: true } : {}),
+    ...carried,
+    // A private window's wake is as recent as its newest private message.
+    at: newestPrivate && newestPrivate.timestamp > pick.timestamp ? newestPrivate.timestamp : pick.timestamp,
   };
 }
 
@@ -1820,6 +1868,9 @@ export class EventGate {
   private sleepSuppressed = 0;
   private sleepTimer: ReturnType<typeof setTimeout> | null = null;
   private sleepAgent: string | undefined;
+  /** The turn that set the sleep, which the sleep's wake carries
+   *  (WakeProvenance.callerTurnIds). In memory with the sleep. */
+  private sleepTurnId: number | undefined;
   // From dispose() to the next resumeSleep(): no sleep or self-wake timer is
   // armed, though a turn a failed stop() left running can still ask for one.
   private disposed = false;
@@ -3152,6 +3203,8 @@ export class EventGate {
       serverId: info.serverId || undefined,
       addressed: Array.isArray(info.tags) && info.tags.includes('chat:addressed'),
       routeChannelId: this.routeChannelFor(info),
+      ...(info.nonChannelOrigin ? { nonChannelOrigin: true } : {}),
+      ...(info.callerTurnId !== undefined ? { callerTurnId: info.callerTurnId } : {}),
       ...(typeof info.metadata?.messageId === 'string' ? { messageId: info.metadata.messageId } : {}),
       ...(typeof info.metadata?.eventId === 'string' ? { eventId: info.metadata.eventId } : {}),
     };
@@ -3296,9 +3349,10 @@ export class EventGate {
     // event addressed the agent and its registered channel is known,
     // `routeChannelId` names the turn's speech locus too — the reply goes
     // back to whoever addressed the agent, not to whichever channel last saw
-    // any traffic. Ambient-only batches set no locus. A batch whose line the
-    // gate left to the turn's start carries it too (`line`), one object
-    // shared by every agent the batch wakes, so it is written once.
+    // any traffic. Ambient-only batches set no locus. A window that holds a
+    // private surface's message wakes a private turn, with no route. A batch
+    // whose line the gate left to the turn's start carries it too (`line`),
+    // one object shared by every agent the batch wakes, so it is written once.
     const chosen = wakeProvenance(events);
     const provenance = line ? { ...chosen, line } : chosen;
     for (const agentName of this.getAgentNamesFn()) {
@@ -3436,12 +3490,15 @@ export class EventGate {
   // Sleep
   // =========================================================================
 
-  /** Begin (or extend) a sleep window of `seconds`. Returns the wake time. */
-  setSleep(seconds: number, note?: string, agentName?: string): { until: number } {
+  /** Begin (or extend) a sleep window of `seconds`. Returns the wake time.
+   *  `callerTurnId` is the turn that set it, which its wake carries: the
+   *  framework wakes a private turn when that one is private by then. */
+  setSleep(seconds: number, note?: string, agentName?: string, callerTurnId?: number): { until: number } {
     const ms = Math.max(0, Math.floor(seconds * 1000));
     this.sleepUntil = this.now() + ms;
     this.sleepNote = note;
     this.sleepAgent = agentName;
+    this.sleepTurnId = callerTurnId;
     this.sleepSuppressed = 0;
     // Arm the self-wake: when the window elapses, clear sleep and request an
     // inference so the agent resumes on its own (not dependent on a heartbeat
@@ -3512,8 +3569,11 @@ export class EventGate {
    * suppression window, unlike sleep. Re-arming replaces the pending timer.
    * Cancelled by the agent's next turn start (see onInferenceStarted):
    * the semantics are "if nothing else wakes me by then, wake me".
+   * `callerTurnId` is the turn that armed it, which its wake carries
+   * (WakeProvenance.callerTurnIds): the framework wakes a private turn when
+   * that one is private by then.
    */
-  armSelfWake(agentName: string, seconds: number, source = 'skip_reply'): { inMs: number; armed: boolean } {
+  armSelfWake(agentName: string, seconds: number, source = 'skip_reply', callerTurnId?: number): { inMs: number; armed: boolean } {
     const ms = Math.max(1_000, Math.min(3_600_000, Math.floor(seconds * 1000)));
     // A stopped framework's late turn arms no timer (disposed). A self-wake
     // doesn't outlive a stop, as dispose() clearing the pending ones says.
@@ -3551,7 +3611,7 @@ export class EventGate {
         agentName,
         `self-scheduled wake (${source}, ${Math.round(ms / 1000)}s)`,
         'self-wake',
-        undefined,
+        callerTurnId !== undefined ? { callerTurnIds: [callerTurnId] } : undefined,
         placement,
       );
     }, ms);
@@ -3573,6 +3633,7 @@ export class EventGate {
     this.sleepUntil = 0;
     this.sleepNote = undefined;
     this.sleepAgent = undefined;
+    this.sleepTurnId = undefined;
     if (this.sleepTimer) { clearTimeout(this.sleepTimer); this.sleepTimer = null; }
     return wasAsleep;
   }
@@ -3598,9 +3659,11 @@ export class EventGate {
     }
     const note = this.sleepNote;
     const agent = this.sleepAgent;
+    const turnId = this.sleepTurnId;
     this.sleepUntil = 0;
     this.sleepNote = undefined;
     this.sleepAgent = undefined;
+    this.sleepTurnId = undefined;
     this.emitTrace({
       type: 'gate:decision',
       eventType: 'sleep:expired',
@@ -3611,7 +3674,7 @@ export class EventGate {
     });
     const detail = note ? `${reason}: ${note}` : reason;
     const targets = agent ? [agent] : this.getAgentNamesFn();
-    for (const a of targets) this.requestInferenceFn(a, detail, 'sleep');
+    for (const a of targets) this.requestInferenceFn(a, detail, 'sleep', turnId !== undefined ? { callerTurnIds: [turnId] } : undefined);
   }
 
   /** Current sleep state, or null if awake. */

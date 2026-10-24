@@ -46,7 +46,10 @@ them the same way.
   provider-capacity hold defers the turn to. A round kept private (one that
   calls `skip_reply`, or has a same-round private think) sets no target. A
   target its server declared inbound-only is refused and clears the turn's
-  target, so later unprefixed segments bounce until a new `>>` target.
+  target, so later unprefixed segments bounce until a new `>>` target. So
+  does private-surface input that makes the turn private (a TUI or WebUI
+  message it takes in): its target is dropped, and while the turn is
+  private a `>>` envelope posts its own body but sets no target.
   Cross-turn, nothing is implicit.
 - **Continuation modifier:** ` !` immediately after the target
   (`>>#ops !` / `>>skip_reply !`) requests an immediate re-wake after this turn

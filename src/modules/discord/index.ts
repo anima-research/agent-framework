@@ -909,6 +909,9 @@ export class DiscordModule implements Module {
     content: ContentBlock[],
     context: SpeechContext
   ): Promise<void> {
+    // A private turn: its speech and thoughts stay on its surface, so
+    // nothing is posted, and no message the turn sent gets its thoughts.
+    if (context.nonChannelOrigin) return;
     // If thoughts are present and this agent posted a message in the turn
     // they end (lastPosts), edit it to prepend the thoughts as spoiler text.
     const post = this.lastPosts.get(agentName);

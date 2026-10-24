@@ -234,6 +234,14 @@ export interface GateEventInfo {
   serverId: string;
   channelId: string;
   metadata?: Record<string, unknown>;
+  /** A private surface's message: the window it joins wakes a private turn
+   *  (wakeProvenance). */
+  nonChannelOrigin?: boolean;
+  /** The turn whose work the event continues, a module's inference-request
+   *  that names one (InferenceRequestEvent.callerTurnId): the window's wake
+   *  carries it (WakeProvenance.callerTurnIds), so the framework judges
+   *  that turn's privacy at the start that takes the wake. */
+  callerTurnId?: number;
   /** Workspace mount name (for workspace:* events). */
   mount?: string;
   /** Mount-prefixed paths touched (for workspace:* events). */

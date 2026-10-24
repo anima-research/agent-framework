@@ -522,7 +522,8 @@ export interface InferenceRequest {
    * inbound locus, which a concurrent message elsewhere can hijack (item-3
    * redux). Undefined for non-channel wakes (heartbeat, timers, module events),
    * which correctly fall back to the global default channel, except an
-   * ephemeral run's (a subagent's), which takes no global fallback.
+   * ephemeral run's (a subagent's), which takes no global fallback, and a
+   * private one's (nonChannelOrigin), whose turn takes no channel at all.
    */
   channelId?: string;
   /**
@@ -597,4 +598,11 @@ export interface InferenceRequest {
    * request-only separator carrying the tick's instruction before the tick's
    * first surviving row (`SILENT_HEARTBEAT_SEPARATOR`). */
   silentHeartbeat?: SilentHeartbeatTick;
+  /** True when this request is a private surface's (a console, a WebUI, an
+   *  API message naming no channel), or is a start the framework judged
+   *  private: one whose batch held such a request, or continued the work of
+   *  a turn private by then (its restart, a ` !` continuation, a bounce, a
+   *  rewind's retry, a script's wake, a module's request naming the turn).
+   *  A start that takes it in is private, and so is its turn from then on. */
+  nonChannelOrigin?: boolean;
 }

@@ -304,6 +304,14 @@ export interface ModuleContext {
    * (ModuleMessage.held). The writes a process held, and keeps across a
    * restart, show to the next process's modules once create() has restored
    * them, which is after every module's start().
+   *
+   * A message that brings back work a call started, such as a subagent's
+   * result, can carry that call's `ToolCall.callerTurnId` as the metadata
+   * key `callerTurnId`, as its `inference-request` does. If that turn is
+   * private when the message is stored, or when a tool boundary injects it,
+   * the message is private input: a turn that reads it is private, as one
+   * that reads a private surface's message is. An id from before this
+   * framework was made counts as private.
    */
   addMessage(
     participant: string,
@@ -617,6 +625,15 @@ export interface SpeechContext {
    * of the process.
    */
   turnId?: number;
+
+  /**
+   * True when the turn this speech ends is private: a private surface's
+   * input took part in it (an operator's console, a WebUI, an API message
+   * naming no channel). Its plain speech stays on that surface: a handler
+   * that would publish speech, or the turn's thoughts, to a channel leaves
+   * it alone.
+   */
+  nonChannelOrigin?: boolean;
 }
 
 /**

@@ -197,7 +197,10 @@ const heardIn = (stream: MockYieldingStream | undefined) => JSON.stringify(strea
 const text = (t: string) => ({ type: 'text', text: t }) as ContentBlock;
 const call = (id: string, name: string, input: Record<string, unknown> = {}) =>
   ({ type: 'tool_use', id, name, input }) as ContentBlock;
-const go = () => ({ type: 'external-message', source: 'test', content: 'go' }) as unknown as ProcessEvent;
+// A channel turn's start: an external message that names no channel would
+// open a private turn, whose speech no channel hears, so its event names one,
+// though the message it stores carries no channel.
+const go = () => ({ type: 'external-message', source: 'test', content: 'go', metadata: { channelId: ROOM }, messageMetadata: {} }) as unknown as ProcessEvent;
 const channelMessage = (channelId: string, messageId: string, body: string, addressed = true) => ({
   type: 'mcpl:channel-incoming',
   serverId: 'chat',

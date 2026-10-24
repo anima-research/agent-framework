@@ -57,8 +57,8 @@ export interface ScriptsHost {
   tools(agentName: string): PreludeTool[];
   /** The bridge: dispatch one of the script's calls as its agent's, through the ordinary dispatcher. Never rejects. */
   dispatch(agentName: string, toolName: string, argsJson: string, context: ScriptCallContext): Promise<ToolAnswer>;
-  /** Wake the agent with this text: a script's wake_agent() payload, or a left script's ending. `label` names this wake, for a spilled copy. */
-  wake(agentName: string, scriptId: string, text: string, label: string): Promise<void>;
+  /** Wake the agent with this text: a script's wake_agent() payload, or a left script's ending. `label` names this wake, for a spilled copy. `startTurnId` is the turn the script's run call was made in, when one was (ScriptCallContext.startTurnId). */
+  wake(agentName: string, scriptId: string, text: string, label: string, startTurnId: number | undefined): Promise<void>;
   /** Whether this agent's scripts may outlive its turn. */
   outlivesTurn(agentName: string): boolean;
 }
@@ -426,7 +426,7 @@ export class AgentScripts {
     const send = (): void => {
       // A wait or stop that took the ending while the notice waited has already given it.
       if (script.endingReturned) return;
-      void this.host.wake(script.agentName, script.id, leftEndingText(script.id, ending), `${script.id}-ended`).catch(() => {});
+      void this.host.wake(script.agentName, script.id, leftEndingText(script.id, ending), `${script.id}-ended`, script.turnId).catch(() => {});
     };
     if (script.delivering) void script.delivering.then(send);
     else send();
@@ -441,6 +441,7 @@ export class AgentScripts {
         script.id,
         wakeText(script.id, payloadJson, n, this.config.maxWakesPerScript, Date.now() - script.startedAt),
         `${script.id}-wake${n}`,
+        script.turnId,
       ));
     } catch (err) {
       delivery = Promise.reject(err);

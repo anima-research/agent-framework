@@ -12,7 +12,7 @@ import assert from 'node:assert';
 import { existsSync, mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import type { ErrorAction, ErrorPolicy, EventResponse, Module, ModuleContext, ProcessEvent, ProcessState, ToolCall, ToolDefinition, ToolResult } from '../src/index.js';
+import type { ErrorAction, ErrorPolicy, EventResponse, InferenceRequest, Module, ModuleContext, ProcessEvent, ProcessState, ToolCall, ToolDefinition, ToolResult } from '../src/index.js';
 import { AgentFramework } from '../src/index.js';
 import { storableToolResult } from '../src/module-registry.js';
 import { createMockResponse, MockMembrane, MockYieldingStream } from './helpers/mock-membrane.js';
@@ -902,6 +902,52 @@ describe('code_execution through the framework', () => {
     });
   });
 
+  for (const privateTurn of [true, false]) {
+    it(`a left script's wake_agent() and its failure wake ${privateTurn ? 'a private turn when the turn that started it was private' : 'a channel turn when the turn that started it was one'}`, async () => {
+      const membrane = new MockMembrane();
+      const module = new ScriptToolModule();
+      const code = [
+        'await tools["test--slow"]({});',
+        'await wake_agent({ found: "signal" });',
+        'await tools["test--slow"]({});',
+        'throw new Error("watcher broke");',
+      ].join('\n');
+      membrane.pushResponse(createMockResponse([
+        { type: 'text', text: 'Arming watcher.' },
+        { type: 'tool_use', id: 'call_bg1', name: 'code_execution', input: { code, yield_time_ms: 100 } },
+      ], 'tool_use'));
+      membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Watcher armed; resting.' }]));
+      await withFramework('ce-wake-private-', { membrane, module, resident: true, codeExecution: { wakeMinIntervalMs: 0 } }, async (framework) => {
+        // Each start's request, as the scheduler hands it over.
+        const starts: InferenceRequest[] = [];
+        const inner = framework as unknown as { startAgentStream(agent: unknown, trigger?: InferenceRequest, ...rest: unknown[]): Promise<void> };
+        const original = inner.startAgentStream.bind(framework);
+        inner.startAgentStream = async (agent, trigger, ...rest) => {
+          if (trigger) starts.push(trigger);
+          return original(agent, trigger, ...rest);
+        };
+        framework.start();
+        framework.pushEvent({
+          type: 'external-message', source: 'test', content: [{ type: 'text', text: 'arm a watcher' }],
+          metadata: privateTurn ? {} : { channelId: 'world:test' }, triggerInference: true,
+        } as unknown as ProcessEvent);
+        const wakes = () => starts.filter((r) => r.reason === 'script:wake');
+        await until(() => module.waiting === 1, 'the first slow call');
+        assert.equal(starts[0]?.nonChannelOrigin === true, privateTurn, `control: the arming turn: ${JSON.stringify(starts[0])}`);
+        // The arming turn ends with the script still running: the script is left.
+        await until(() => framework.getHostModeStatus().backgroundScripts === 1, 'the script to be left running');
+        membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Woke and handled.' }]));
+        module.release();
+        await until(() => wakes().length === 1, 'the wake_agent() wake');
+        await until(() => module.waiting === 1, 'the second slow call');
+        membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Saw the failure.' }]));
+        module.release();
+        await until(() => wakes().length === 2, 'the failure wake');
+        assert.deepEqual(wakes().map((r) => r.nonChannelOrigin === true), [privateTurn, privateTurn], JSON.stringify(wakes()));
+      });
+    });
+  }
+
   it('stop() stops every script still running, quietly', async () => {
     const module = new ScriptToolModule();
     const { tempDir, storePath } = tempStorePath('ce-stop-');
@@ -1173,6 +1219,9 @@ describe('a round whose run or wait call watches a script that can change its ro
     async handleToolCall(call: ToolCall): Promise<ToolResult> {
       const name = call.name.includes('--') ? call.name.slice(call.name.lastIndexOf('--') + 2) : call.name;
       this.log.push(`tool:${name}`);
+      // A script passes what it saw to echo as a note, for a test to read.
+      const note = (call.input as { note?: unknown } | undefined)?.note;
+      if (name === 'echo' && typeof note === 'string') this.log.push(`note:${note}`);
       if (name === 'slow') {
         await this.slowReleased;
         this.log.push('slow:returned');
@@ -1201,7 +1250,7 @@ describe('a round whose run or wait call watches a script that can change its ro
   ];
 
   async function scriptRound(mode: 'locus' | 'hybrid' | 'explicit' | 'disabled', responses: ReturnType<typeof createMockResponse>[],
-    config: { sameRoundThinkTextPolicy?: 'private'; allowedTools?: string[] } = {}, options: { codeExecution?: boolean; toolCallTimeoutMs?: number } = {}) {
+    config: { sameRoundThinkTextPolicy?: 'private'; allowedTools?: string[] } = {}, options: { codeExecution?: boolean; channelPublish?: boolean; toolCallTimeoutMs?: number } = {}) {
     const { tempDir, storePath } = tempStorePath('ce-round-');
     const membrane = new MockMembrane();
     for (const response of responses) membrane.pushResponse(response);
@@ -1253,11 +1302,13 @@ describe('a round whose run or wait call watches a script that can change its ro
         if (name === 'channel_open') return { success: true, data: { channelId: input?.channelId, serverId: 'stub' } };
         return { success: true, data: {} };
       },
-      getChannelTools: () => CHANNEL_TOOLS,
+      getChannelTools: () => options.channelPublish
+        ? [...CHANNEL_TOOLS, { name: 'channel_publish', description: 'Publish.', inputSchema: { type: 'object' as const, properties: { channelId: { type: 'string' }, content: { type: 'string' } } } }]
+        : CHANNEL_TOOLS,
       getDefaultPublishChannel: () => null, isChannelOpen: () => true, getDescriptor: () => undefined,
     }, { get: (target, key: string) => (key in target ? (target as Record<string, unknown>)[key] : () => undefined) });
     const run = async () => {
-      framework.pushEvent({ type: 'external-message', source: 'test', content: 'go', metadata: {} } as unknown as ProcessEvent);
+      framework.pushEvent({ type: 'external-message', source: 'test', content: 'go', metadata: { channelId: 'world:test' } } as unknown as ProcessEvent);
       await framework.runUntilIdle();
     };
     const done = async () => {
@@ -1267,7 +1318,7 @@ describe('a round whose run or wait call watches a script that can change its ro
       await framework.stop();
       rmSync(tempDir, { recursive: true, force: true });
     };
-    return { framework, module, log, run, done, directory };
+    return { framework, module, log, run, done, directory, membrane };
   }
 
   const scriptCall = (input: Record<string, unknown>, id = 'ce1') =>
@@ -2343,6 +2394,126 @@ describe('a round whose run or wait call watches a script that can change its ro
     }
   });
 
+  // A surface message names a channel, or names none and opens a private turn.
+  const surface = (channelId?: string) => ({
+    type: 'external-message', source: channelId ? 'bridge' : 'tui', content: 'go', metadata: channelId ? { channelId } : {},
+  }) as unknown as ProcessEvent;
+  // The refusal of a channel_publish that names no channel, from a script
+  // whose start turn is private.
+  const REFUSED = "this script's turn is private and has no default channel, so channel_publish requires an explicit channelId";
+  type ScriptHarness = Awaited<ReturnType<typeof scriptRound>>;
+  /** What the script's publish answered, as it passed it to echo. */
+  const scriptNote = (h: ScriptHarness): string => {
+    const note = h.log.find((entry) => entry.startsWith('note:'));
+    assert.ok(note !== undefined, `control: the script ran to its end: ${JSON.stringify(h.log)}`);
+    return note!;
+  };
+  /** A script that publishes with these arguments and passes what the
+   *  publish answered, or the refusal it threw, to echo as its note. */
+  const publishing = (args: string, before = '') =>
+    `${before}let note; try { await tools.channel_publish(${args}); note = "posted"; } catch (e) { note = String(e && e.message); } await tools["test--echo"]({ note });`;
+  /** Runs the framework in steps until `cond` holds or a bound passes: a
+   *  script's later calls are dispatched as events, which only a running
+   *  framework processes. */
+  const driven = async (h: ScriptHarness, cond: () => boolean) => {
+    const deadline = Date.now() + 15_000;
+    while (!cond() && Date.now() < deadline) {
+      await h.framework.runUntilIdle();
+      await new Promise((r) => setTimeout(r, 10));
+    }
+  };
+
+  for (const privateTurn of [true, false]) {
+    it(`a script's channel_publish that names no channel is ${privateTurn ? 'refused in a private turn, and posts nothing' : "a channel turn's, which publishes as main does"}`, async () => {
+      const h = await scriptRound('locus', [
+        createMockResponse([scriptCall({ code: publishing('{ content: "from the script" }'), yield_time_ms: 30_000 })] as ContentBlock[], 'tool_use'),
+        createMockResponse([{ type: 'text', text: 'done' }] as ContentBlock[]),
+      ], {}, { channelPublish: true });
+      try {
+        h.framework.pushEvent(surface(privateTurn ? undefined : 'world:test'));
+        await h.framework.runUntilIdle();
+        if (privateTurn) {
+          assert.ok(scriptNote(h).includes(REFUSED), scriptNote(h));
+          // Where to find a channel id, for an agent that may list them.
+          assert.ok(scriptNote(h).includes('; channel_list shows the channel ids; nothing was posted'), scriptNote(h));
+          assert.ok(!h.log.includes('tool:channel_publish'), JSON.stringify(h.log));
+        } else {
+          assert.equal(scriptNote(h), 'note:posted');
+          assert.ok(h.log.includes('tool:channel_publish'), JSON.stringify(h.log));
+        }
+      } finally {
+        await h.done();
+      }
+    });
+  }
+
+  it("a script's channel_publish that names its channel goes there, in a private turn too", async () => {
+    const h = await scriptRound('locus', [
+      createMockResponse([scriptCall({ code: publishing('{ channelId: "world:test", content: "from the script" }'), yield_time_ms: 30_000 })] as ContentBlock[], 'tool_use'),
+      createMockResponse([{ type: 'text', text: 'done' }] as ContentBlock[]),
+    ], {}, { channelPublish: true });
+    try {
+      h.framework.pushEvent(surface());
+      await h.framework.runUntilIdle();
+      assert.equal(scriptNote(h), 'note:posted');
+      assert.ok(h.log.includes('tool:channel_publish'), JSON.stringify(h.log));
+    } finally {
+      await h.done();
+    }
+  });
+
+  for (const privateTurn of [true, false]) {
+    it(`a script left running past a ${privateTurn ? 'private' : 'channel'} turn's end ${privateTurn ? 'is refused a channel_publish that names no channel' : 'publishes one as main does'}`, async () => {
+      const h = await scriptRound('locus', [
+        createMockResponse([scriptCall({
+          code: publishing('{ content: "from the watcher" }', 'await tools["test--slow"]({}); '), yield_time_ms: 100,
+        })] as ContentBlock[], 'tool_use'),
+        createMockResponse([{ type: 'text', text: 'watching' }] as ContentBlock[]),
+      ], {}, { channelPublish: true });
+      try {
+        h.framework.pushEvent(surface(privateTurn ? undefined : 'world:test'));
+        await h.framework.runUntilIdle();
+        assert.equal(h.framework.getHostModeStatus().backgroundScripts, 1, 'control: the script was left running');
+        h.module.releaseSlow();
+        await driven(h, () => h.log.some((e) => e.startsWith('note:')));
+        if (privateTurn) {
+          assert.ok(scriptNote(h).includes(REFUSED), scriptNote(h));
+          assert.ok(!h.log.includes('tool:channel_publish'), JSON.stringify(h.log));
+        } else {
+          assert.equal(scriptNote(h), 'note:posted');
+          assert.ok(h.log.includes('tool:channel_publish'), JSON.stringify(h.log));
+        }
+      } finally {
+        await h.done();
+      }
+    });
+  }
+
+  for (const named of [undefined, ''] as const) {
+    it(`a conversation fork's script in a private turn that publishes ${named === undefined ? 'naming no channel' : 'with an empty channelId'} is told its conversation's channel`, async () => {
+      const args = named === undefined ? '{ content: "from the script" }' : '{ channelId: "", content: "from the script" }';
+      const h = await scriptRound('locus', [
+        createMockResponse([scriptCall({ code: publishing(args), yield_time_ms: 30_000 })] as ContentBlock[], 'tool_use'),
+        createMockResponse([{ type: 'text', text: 'done' }] as ContentBlock[]),
+      ], {}, { channelPublish: true });
+      try {
+        // The agent stands for a fork bound to its home channel, which a
+        // broadcast wake doesn't reach, so its turn comes from its own wake,
+        // a private one.
+        const internals = h.framework as unknown as { conversationAgentHomes: Map<string, { serverId: string; channelId: string }>; pendingRequests: unknown[] };
+        // A home is a channel with its server, as main keeps it.
+        internals.conversationAgentHomes.set('assistant', { serverId: 'stub', channelId: 'world:home' });
+        internals.pendingRequests.push({ agentName: 'assistant', reason: 'test', source: 'test', timestamp: Date.now(), channelId: 'world:home', nonChannelOrigin: true });
+        await h.framework.runUntilIdle();
+        assert.ok(scriptNote(h).includes(REFUSED), scriptNote(h));
+        assert.ok(scriptNote(h).includes('(to publish in this conversation\'s channel, name "world:home")'), scriptNote(h));
+        assert.ok(!h.log.includes('tool:channel_publish'), JSON.stringify(h.log));
+      } finally {
+        await h.done();
+      }
+    });
+  }
+
   it("locus: a script round's prose goes to the locus it was written for, though the script opens another channel", async () => {
     const h = await scriptRound('locus', [
       createMockResponse([
@@ -2426,7 +2597,7 @@ describe('a round whose run or wait call watches a script that can change its ro
     let stream: { cancel(): void } | undefined;
     let agent: { state: { stream?: { cancel(): void } }; reset(): void } | undefined;
     try {
-      h.framework.pushEvent({ type: 'external-message', source: 'test', content: 'go', metadata: {} } as unknown as ProcessEvent);
+      h.framework.pushEvent({ type: 'external-message', source: 'test', content: 'go', metadata: { channelId: 'world:test' } } as unknown as ProcessEvent);
       void h.framework.runUntilIdle().catch(() => {});
       await soon(() => h.log.includes('tool:slow'));
       assert.ok(h.log.includes('tool:slow'), 'the script reached its slow call');
@@ -2474,7 +2645,7 @@ describe('a round whose run or wait call watches a script that can change its ro
     const error = console.error;
     console.error = (...args: unknown[]) => { lines.push(args.map(String).join(' ')); error(...args); };
     try {
-      h.framework.pushEvent({ type: 'external-message', source: 'test', content: 'go', metadata: {} } as unknown as ProcessEvent);
+      h.framework.pushEvent({ type: 'external-message', source: 'test', content: 'go', metadata: { channelId: 'world:test' } } as unknown as ProcessEvent);
       void h.framework.runUntilIdle().catch(() => {});
       // The script is running, held in its slow call.
       await soon(() => h.log.includes('tool:slow'));

@@ -2,7 +2,7 @@ import { describe, it, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert';
 import { existsSync, mkdirSync, writeFileSync, rmSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { EventGate, wakeLineText } from '../src/gate/event-gate.js';
+import { EventGate, wakeLineText, wakeProvenance } from '../src/gate/event-gate.js';
 import type { GateConfig, GateEntryRef, GateEventInfo, WakeLine } from '../src/gate/types.js';
 
 // ---------------------------------------------------------------------------
@@ -37,7 +37,7 @@ function makeGate(configPath: string, opts?: {
 }) {
   const traces: TraceEntry[] = [];
   const messages: Array<{ participant: string; content: unknown; metadata?: unknown }> = [];
-  const inferenceRequests: Array<{ agentName: string; reason: string; source: string; channelId?: string; counterparty?: string; addressed?: boolean; at?: number; routeChannelId?: string; routeServerId?: string; line?: WakeLine }> = [];
+  const inferenceRequests: Array<{ agentName: string; reason: string; source: string; channelId?: string; counterparty?: string; addressed?: boolean; at?: number; routeChannelId?: string; routeServerId?: string; nonChannelOrigin?: boolean; line?: WakeLine }> = [];
 
   const gate = new EventGate({
     configPath,
@@ -352,6 +352,23 @@ describe('debounce', () => {
     const d = gate.evaluate(event());
     assert.strictEqual(d.trigger, false);
     assert.deepStrictEqual(d.behavior, { debounce: 100 });
+  });
+
+  it("a private surface's message makes its debounce window's wake private", async () => {
+    const path = writeConfig('debounce-private-surface.json', {
+      policies: [{ name: 'surface', match: { scope: ['external-message'] }, behavior: { debounce: 100 } }],
+      default: 'skip',
+    });
+    const { gate, inferenceRequests } = makeGate(path);
+    gate.evaluate({ content: 'private', eventType: 'external-message', serverId: 'tui', channelId: '', nonChannelOrigin: true });
+    // Waits for the flush itself, not a fixed time a loaded runner can overrun.
+    for (const deadline = Date.now() + 5_000; inferenceRequests.length === 0 && Date.now() < deadline;) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    assert.equal(inferenceRequests.length, 1);
+    assert.equal(inferenceRequests[0]?.nonChannelOrigin, true);
+    assert.equal(inferenceRequests[0]?.channelId, undefined);
+    gate.dispose();
   });
 
   it('batches events and fires after delay', async () => {
@@ -1199,6 +1216,53 @@ describe('quiesce suppression', () => {
   });
 });
 
+describe("a window that holds a private surface's message", () => {
+  afterEach(() => rmSync(TMP_DIR, { recursive: true, force: true }));
+  type Pending = { policyName: string; content: string; eventType: string; timestamp: number; inContext: boolean;
+    channelId?: string; serverId?: string; authorId?: string; nonChannelOrigin?: boolean; addressed?: boolean; routeChannelId?: string };
+  const tui = (timestamp: number): Pending => ({ policyName: 'p', content: 'operator', eventType: 'external-message', timestamp, inContext: false, serverId: 'tui', nonChannelOrigin: true });
+  const room = (timestamp: number): Pending => ({
+    policyName: 'p', content: 'room', eventType: 'mcpl:channel-incoming', timestamp, inContext: true,
+    channelId: 'discord:g:room', serverId: 'discord', authorId: 'u1', addressed: true, routeChannelId: 'discord:g:room',
+  });
+  /** Flushes a window set in the gate's shared buffer, and returns its wakes. */
+  async function flush(buffer: Pending[]) {
+    const { gate, inferenceRequests } = makeGate(writeConfig('window.json', { policies: [], default: 'skip' }));
+    const internals = gate as unknown as { inferenceBuffer: Pending[] };
+    gate.onInferenceStarted('elsewhere');
+    internals.inferenceBuffer.push(...buffer);
+    gate.onInferenceEnded('elsewhere');
+    // The flush delivers in a microtask.
+    await new Promise((resolve) => setImmediate(resolve));
+    return inferenceRequests;
+  }
+
+  it('wakes one private turn with no route, though an addressed channel message shares it, in either order', async () => {
+    for (const window of [[room(20), tui(10)], [tui(10), room(20)]]) {
+      const wakes = await flush(window);
+      assert.equal(wakes.length, 1, 'one wake for the window');
+      assert.equal(wakes[0]?.nonChannelOrigin, true);
+      assert.equal(wakes[0]?.routeChannelId, undefined, 'the private turn answers in no channel');
+      assert.equal(wakes[0]?.addressed, true, "the provenance still says who woke it, as telemetry");
+    }
+    // Control: the room's message alone routes its reply.
+    const alone = await flush([room(20)]);
+    assert.equal(alone[0]?.routeChannelId, 'discord:g:room');
+    assert.equal(alone[0]?.nonChannelOrigin, undefined);
+  });
+
+  it("is private though nothing in it names a channel or an author, and takes its time from its newest message", () => {
+    assert.deepStrictEqual(wakeProvenance([tui(10)] as never), { nonChannelOrigin: true, at: 10 });
+    for (const window of [[tui(10), tui(30)], [tui(30), tui(10)]]) {
+      assert.deepStrictEqual(wakeProvenance(window as never), { nonChannelOrigin: true, at: 30 }, 'the newest, in whatever order they sit');
+    }
+    // An older one that names its author is the pick, but the wake is as
+    // recent as the newest.
+    assert.equal(wakeProvenance([{ ...tui(10), authorId: 'op' }, tui(30)] as never)?.at, 30);
+    assert.equal(wakeProvenance([{ ...tui(10), nonChannelOrigin: undefined }] as never), undefined, 'control: an unmarked one has no provenance');
+  });
+});
+
 describe('sleep', () => {
   // While asleep, only the agent's own heartbeat and a privileged author
   // rouse it. The heartbeat is the server the host knows as `heartbeat`: a
@@ -1387,5 +1451,17 @@ describe('a batched wake writes its line only when it says something', () => {
     plain.gate.evaluate(event({ eventType: 'mcpl:channel-incoming', serverId: 'discord', channelId: 'discord:g:room', content: 'hi', metadata: { messageId: 'm1' } }));
     fire(plain.gate, 'chat');
     assert.strictEqual(plain.messages.length, 1);
+  });
+});
+
+describe('wakeProvenance: what a window carries without a pick', () => {
+  it("keeps a window's channels and turn ids though no event in it names a channel or an author for the pick", () => {
+    // An ambient push that names only its resolved route, and a module's
+    // request for a turn's work: neither is a pick.
+    const provenance = wakeProvenance([
+      { policyName: 'p', content: 'x', eventType: 'mcpl:push-event', timestamp: 1, inContext: true, addressed: false, routeChannelId: 'disc:guild:room', serverId: 'disc' },
+      { policyName: 'p', content: 'y', eventType: 'inference-request', timestamp: 2, inContext: false, addressed: false, callerTurnId: 7 },
+    ] as never);
+    assert.deepEqual(provenance, { channels: [{ channelId: 'disc:guild:room', serverId: 'disc' }], callerTurnIds: [7] });
   });
 });

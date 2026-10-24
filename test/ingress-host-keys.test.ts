@@ -28,6 +28,9 @@ const HOST_KEYS: Record<string, unknown> = {
   deferredWriteId: 'a-queued-write',
   external: { source: 'discord', id: '1548000000000000002' },
   openaiResponsesItems: [],
+  // A turn whose work the message would claim to bring back, which would
+  // make the turn that reads it private while that turn is.
+  callerTurnId: 1,
 };
 
 async function waitFor(cond: () => boolean, what: string, timeoutMs = 15_000): Promise<void> {

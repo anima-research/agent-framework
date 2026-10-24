@@ -341,17 +341,20 @@ async function harness(opts: {
       : [],
     /** One addressed message in #room starts a turn (or, with `request`, a
      *  direct inference request for just that resident); resolves when it settles. */
-    turn: async (responses: Array<ReturnType<typeof createMockResponse>>, agentName = 'scout', via: 'incoming' | 'request' | 'silent' = 'incoming') => {
+    turn: async (responses: Array<ReturnType<typeof createMockResponse>>, agentName = 'scout', via: 'incoming' | 'request' | 'silent' | 'private' = 'incoming') => {
       for (const r of responses) membrane.pushResponse(r);
       const before = membrane.calls.length;
       if (via === 'incoming') {
         h.command({ op: 'incoming', channelId: ROOM, messageId: `in-${++incoming}`, mode: 'addressed', text: `message ${incoming}` });
       } else {
         // 'silent': a control-plane wake whose plain prose stays private, as
-        // a silent heartbeat's does.
+        // a silent heartbeat's does. 'private': see below.
         (framework as unknown as { pendingRequests: unknown[] }).pendingRequests.push({
           agentName, reason: 'test', source: 'test', timestamp: Date.now(),
           ...(via === 'silent' ? { suppressProse: true } : {}),
+          // 'private': a private turn, as an operator's console message
+          // opens one.
+          ...(via === 'private' ? { nonChannelOrigin: true } : {}),
         });
       }
       await until(() => membrane.calls.length > before, 'turn start');
@@ -561,6 +564,27 @@ describe('held prose drafts, end to end', () => {
         'the refused round and the round after it stay private');
     } finally {
       await h.close();
+    }
+  });
+
+  it("a private turn's words beside an explicit send, and after it, are held as drafts, as any turn's are", async () => {
+    // A private turn's own speech goes to no channel, but words a send
+    // silenced are drafted as in any turn: resending them takes a
+    // destination the resident names.
+    for (const proseRouting of ['locus', 'hybrid'] as const) {
+      const h = await harness({ agents: [{ name: 'scout', proseRouting }] });
+      try {
+        await h.turn([
+          createMockResponse([text('Beside the send.'), explicitSend('s1')], 'tool_use'),
+          createMockResponse([text('And one after the send.')]),
+        ], 'scout', 'private');
+        assert.deepEqual(h.publishes().map((p) => p.text), ['an explicit note elsewhere'], `${proseRouting}: only the explicit send went out`);
+        assert.deepEqual(h.drafts().map((d) => d.text).sort(), ['And one after the send.', 'Beside the send.'], `${proseRouting}: both are held`);
+        const receipt = h.texts().find((t) => t.startsWith('[delivered]')) ?? '';
+        assert.doesNotMatch(receipt, /private turn/, `${proseRouting}: ${receipt}`);
+      } finally {
+        await h.close();
+      }
     }
   });
 
@@ -2325,6 +2349,24 @@ describe('held drafts: exact runs, hybrid envelopes beside a send, and turn-end 
         createMockResponse([]),
       ]);
       assert.deepEqual(h.publishes().slice(-2).map((p) => p.text), [before, after]);
+    } finally {
+      await h.close();
+    }
+  });
+
+  it("XML tool mode: a private turn's refused channel_publish silences nothing, so its round's envelope is delivered", async () => {
+    const h = await harness({ xml: true, agents: [{ name: 'scout', proseRouting: 'hybrid' }] });
+    try {
+      // The publish names no channel, which a private turn refuses
+      // (privatePublishRefusal): it posted nothing, so it's no send.
+      const round = [text(`>>>${GENERAL} the envelope's words`), call('p1', 'channel_publish', { content: 'no channel named' })];
+      await h.turn([
+        createMockResponse(round, 'tool_use'),
+        { ...createMockResponse(round), toolCalls: [] },
+      ], 'scout', 'private');
+      assert.ok(h.toolResults().some((r) => r.includes('channel_publish requires an explicit channelId')), `control: the publish was refused: ${JSON.stringify(h.toolResults())}`);
+      assert.deepEqual(h.drafts().map((d) => d.text), [], 'nothing is held');
+      assert.deepEqual(h.publishes().map((p) => p.text), ["the envelope's words"]);
     } finally {
       await h.close();
     }

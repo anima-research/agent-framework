@@ -210,6 +210,58 @@ test("a resident whose turn a stated wait holds for its retry is mid-turn: not d
   });
 });
 
+test("a held turn that a stored private message made private is retried privately: the retry's copy of its wake carries the mark, and continues the turn", async (t) => {
+  await withStoreDir(async (path) => {
+    const clock = holdClock(t);
+    const wait = 400;
+    const log = silence();
+    const membrane = new ScriptedMembrane(new Set([2]), (request) => rateLimited(wait, request));
+    const { fw, internal } = await framework(path, membrane);
+    const turns = fw as unknown as {
+      turnRouting: Map<string, { turnId: number; nonChannelOrigin: boolean }>;
+      addMessage(participant: string, content: unknown, metadata: unknown): unknown;
+      startAgentStream(agent: unknown, trigger?: { nonChannelOrigin?: boolean }, ...rest: unknown[]): Promise<void>;
+    };
+    // Each start's request and the routing it ran on, as its stream begins.
+    const starts: Array<{ trigger?: { nonChannelOrigin?: boolean }; routing?: unknown }> = [];
+    const start = turns.startAgentStream.bind(fw);
+    turns.startAgentStream = async (agent, trigger, ...rest) => {
+      const entry: { trigger?: { nonChannelOrigin?: boolean }; routing?: unknown } = { trigger };
+      starts.push(entry);
+      try {
+        return await start(agent, trigger, ...rest);
+      } finally {
+        entry.routing = turns.turnRouting.get('resident');
+      }
+    };
+    try {
+      // A channel's turn, then an operator's message stored as a private
+      // surface's, then the channel's next message: its turn is private by
+      // the stored message, not by its wake, and its call is held.
+      const inChannel = (content: string) => ({ type: 'external-message', source: 'test', content, metadata: { channelId: 'zz:room' } }) as ProcessEvent;
+      fw.pushEvent(inChannel('zz-first'));
+      await waitFor(fw, () => membrane.primary >= 1, 'the first turn');
+      await fw.runUntilIdle();
+      turns.addMessage('user', [{ type: 'text', text: 'zz-operator' }], { inboundSource: { kind: 'surface', surface: 'tui', acceptedAt: Date.now() } });
+      fw.pushEvent(inChannel('zz-second'));
+      await waitFor(fw, () => internal.providerAccelerationCooldowns.has('resident'), 'the second turn held');
+      const held = turns.turnRouting.get('resident')!;
+      assert.equal(held.nonChannelOrigin, true, 'control: the stored message made the held turn private');
+      await clock.outlast(wait);
+      clock.pass(wait);
+      await waitFor(fw, () => membrane.primary >= 3, 'the retry after the wait');
+      await fw.runUntilIdle();
+      const retry = starts.at(-1)!;
+      assert.ok(Object.getOwnPropertySymbols(retry.trigger!).some((k) => k.description === 'turn-retry'), "control: this start is the held turn's retry");
+      // The start that made the turn private marked its own wake so, and the
+      // hold kept a copy of that wake.
+      assert.equal(retry.trigger!.nonChannelOrigin, true, "the retry's copy of the turn's wake carries the mark");
+      assert.equal(retry.routing, held, 'the retry continues the held turn');
+      assert.equal(held.nonChannelOrigin, true, 'which is private still');
+    } finally { await fw.stop(); log.restore(); }
+  });
+});
+
 test('a quiesce waits for a held turn, and lets its retry start when the hold ends and finish; a wake that arrives meanwhile parks', async () => {
   await withStoreDir(async (path) => {
     // Real time: a quiesce's drain deadline reads the clock. The hold stands

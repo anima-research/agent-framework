@@ -67,7 +67,7 @@ async function harness(config: Partial<AgentConfig>, probeHandler?: (call: ToolC
         type: 'tool_use', id: call.id, name: call.name, input: call.input as Record<string, unknown>,
       })), 'tool_use'));
       membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Done' }]));
-      framework.pushEvent({ type: 'external-message', source: 'probe', content: 'Run probe', metadata: {} });
+      framework.pushEvent({ type: 'external-message', source: 'probe', content: 'Run probe', metadata: { channelId: 'world:commons' } });
       await framework.runUntilIdle();
       return membrane.lastStream!.receivedToolResults[0] as Array<{ toolUseId: string; content: string; isError?: boolean }>;
     },
@@ -313,7 +313,7 @@ for (const fallback of [false, true]) {
           if (fallback) asXmlTurn(h.membrane, call);
           h.membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Public round prose' }, call], 'tool_use'));
           h.membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Public trailing prose' }]));
-          h.framework.pushEvent({ type: 'external-message', source: 'probe', content: 'Run probe', metadata: {} });
+          h.framework.pushEvent({ type: 'external-message', source: 'probe', content: 'Run probe', metadata: { channelId: 'world:commons' } });
           await h.framework.runUntilIdle();
           const results = h.membrane.lastStream!.receivedToolResults[0] as Array<{ isError?: boolean; content: string }>;
           if (!permitted) {
@@ -353,7 +353,7 @@ for (const fallback of [false, true]) {
       if (fallback) asXmlTurn(h.membrane, call);
       h.membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Public round prose' }, call], 'tool_use'));
       h.membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Public trailing prose' }]));
-      h.framework.pushEvent({ type: 'external-message', source: 'probe', content: 'Run probe', metadata: {} });
+      h.framework.pushEvent({ type: 'external-message', source: 'probe', content: 'Run probe', metadata: { channelId: 'world:commons' } });
       await h.framework.runUntilIdle();
       const results = h.membrane.lastStream!.receivedToolResults[0] as Array<{ isError?: boolean; content: string }>;
       assert.equal(results[0].isError, true);
@@ -375,7 +375,7 @@ test("XML tool mode: a refused think's round goes as a permitted think's does", 
       asXmlTurn(h.membrane, call);
       h.membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Public round prose' }, call], 'tool_use'));
       h.membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Public trailing prose' }]));
-      h.framework.pushEvent({ type: 'external-message', source: 'probe', content: 'Run probe', metadata: {} });
+      h.framework.pushEvent({ type: 'external-message', source: 'probe', content: 'Run probe', metadata: { channelId: 'world:commons' } });
       await h.framework.runUntilIdle();
       const results = h.membrane.lastStream!.receivedToolResults[0] as Array<{ isError?: boolean }>;
       assert.equal(results[0].isError === true, !permitted);
@@ -414,7 +414,7 @@ for (const skipName of ['skip_reply', 'probe--skip_reply']) test(`explicit prose
       if (firstTurn.length === 0) firstTurn.push(h.membrane.lastStream!);
       return stream;
     };
-    h.framework.pushEvent({ type: 'external-message', source: 'probe', content: 'Run probe', metadata: {} });
+    h.framework.pushEvent({ type: 'external-message', source: 'probe', content: 'Run probe', metadata: { channelId: 'world:commons' } });
     await h.framework.runUntilIdle();
     const results = firstTurn[0]!.receivedToolResults[0] as Array<{ isError?: boolean }>;
     assert.equal(results[0].isError, true);
@@ -433,7 +433,7 @@ test("a refused skip_reply beside a refused send keeps its round private, and ne
       { type: 'tool_use', id: 'send', name: 'channel_publish', input: { content: 'never posted' } },
     ], 'tool_use'));
     h.membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Public trailing prose' }]));
-    h.framework.pushEvent({ type: 'external-message', source: 'probe', content: 'Run probe', metadata: {} });
+    h.framework.pushEvent({ type: 'external-message', source: 'probe', content: 'Run probe', metadata: { channelId: 'world:commons' } });
     await h.framework.runUntilIdle();
     const results = h.membrane.lastStream!.receivedToolResults[0] as Array<{ isError?: boolean }>;
     assert.deepEqual(results.map((r) => r.isError), [true, true]);
@@ -452,7 +452,7 @@ for (const fallback of [false, true]) {
       if (fallback) asXmlTurn(h.membrane, call);
       h.membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Public round prose' }, call], 'tool_use'));
       h.membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Public trailing prose' }]));
-      h.framework.pushEvent({ type: 'external-message', source: 'probe', content: 'Run probe', metadata: {} });
+      h.framework.pushEvent({ type: 'external-message', source: 'probe', content: 'Run probe', metadata: { channelId: 'world:commons' } });
       await h.framework.runUntilIdle();
       const results = h.membrane.lastStream!.receivedToolResults[0] as Array<{ isError?: boolean; content: string }>;
       assert.equal(results[0].isError, true);
@@ -567,7 +567,7 @@ for (const name of ['skip_reply', 'think'] as const) {
         { type: 'tool_use', id: 'denied', name: generic.name, input: {} },
         { type: 'tool_use', id: 'allowed', name, input: { reason: 'test' } }], 'tool_use'));
       h.membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Trailing prose' }]));
-      h.framework.pushEvent({ type: 'external-message', source: 'probe', content: 'Run', metadata: {} }); await h.framework.runUntilIdle();
+      h.framework.pushEvent({ type: 'external-message', source: 'probe', content: 'Run', metadata: { channelId: 'world:commons' } }); await h.framework.runUntilIdle();
       const results = h.membrane.lastStream!.receivedToolResults[0] as Array<{ toolUseId: string; isError?: boolean }>;
       assert.equal(results.length, 2); assert.equal(results.find(r => r.toolUseId === 'denied')!.isError, true);
       assert.ok(!results.find(r => r.toolUseId === 'allowed')!.isError); assert.deepEqual(h.effects, []);

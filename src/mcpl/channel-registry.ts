@@ -564,11 +564,11 @@ const CHANNEL_TOOL_DEFINITIONS: ToolDefinition[] = [
   },
   {
     name: 'channel_publish',
-    description: "Publish a message to a channel. If channelId is omitted, publishes to your conversation's channel if you are bound to one; otherwise to the channel of the most recent incoming message this host received on any channel, whether or not you've been shown it. Reactions, reaction removals, deletions and edits don't set it, though an edit of a message you hadn't been shown can count as that message. A message pushed to you rather than posted on a channel never sets it. A subagent has neither default, so it must name a channel.",
+    description: "Publish a message to a channel. If channelId is omitted, publishes to your conversation's channel if you are bound to one; otherwise to the channel of the most recent incoming message this host received on any channel, whether or not you've been shown it. Reactions, reaction removals, deletions and edits don't set it, though an edit of a message you hadn't been shown can count as that message. A message pushed to you rather than posted on a channel never sets it. A subagent has neither default, so it must name a channel, and so must a turn that has taken in private input, such as a console or WebUI message, and a script such a turn started.",
     inputSchema: {
       type: 'object' as const,
       properties: {
-        channelId: { type: 'string', description: "ID of the channel to publish to (defaults to your conversation's channel if you are bound to one; otherwise the channel of the most recent incoming message this host received on any channel, whether or not you've been shown it, other than a reaction, reaction removal, deletion or edit, though an edit of a message you hadn't been shown can count; a message pushed to you rather than posted on a channel never sets it; required of a subagent)" },
+        channelId: { type: 'string', description: "ID of the channel to publish to (defaults to your conversation's channel if you are bound to one; otherwise the channel of the most recent incoming message this host received on any channel, whether or not you've been shown it, other than a reaction, reaction removal, deletion or edit, though an edit of a message you hadn't been shown can count; a message pushed to you rather than posted on a channel never sets it; required of a subagent, of a turn that has taken in private input, and of a script such a turn started)" },
         content: { type: 'string', description: 'Text content to publish' },
         text: { type: 'string', description: 'Alias for content' },
       },
@@ -5971,8 +5971,8 @@ export class ChannelRegistry {
         return { status: 'failed', reason: "an ephemeral run's plain speech with no channel of its own is its caller's result", at: Date.now() };
       }
       // The turn froze with no locus (no home, no triggering channel, no
-      // global inbound ever seen) — the agent was told its prose stays in
-      // the archive; honor that.
+      // global inbound ever seen) — the agent was told its prose stays on the
+      // surface it was addressed from, if any; honor that.
       // The locus froze at the turn's start, so this says what the turn had.
       const reason = 'this turn came from no channel, and it had no home or recent channel to reply in; if it should have ' +
         'had one, ask whoever runs this host';

@@ -30,7 +30,9 @@ names a destination that resolves; if that envelope's body then isn't
 delivered, the hold returns. The sticky destination and this hold last for
 the whole logical turn, across its later streams, such as a framework
 retry's, a budget restart's or the compile a provider-capacity hold defers
-the turn to. They govern publication, and with it the outgoing stream, which
+the turn to. Private-surface input that makes the turn private (a TUI or
+WebUI message it takes in) drops the sticky destination, and while the
+turn is private a `>>>` envelope posts its own body but sets none. They govern publication, and with it the outgoing stream, which
 carries only what delivery publishes, where delivery publishes it.
 
 This is publication routing only. It creates no privacy meaning for `<think>`

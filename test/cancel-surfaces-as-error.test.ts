@@ -534,7 +534,7 @@ async function toolTurn(tool: 'end' | 'fetch', reports: CancelReport) {
       type: 'external-message',
       source: 'test',
       content: [{ type: 'text', text: 'go' }],
-      metadata: {},
+      metadata: { channelId: 'chan-live' },
       triggerInference: true,
     } as unknown as ProcessEvent);
   } catch (error) {
