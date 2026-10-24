@@ -490,6 +490,15 @@ describe('physical-window mid-turn restart (issue #92)', () => {
     const besideImage = await projected([image, ...markers]);
     const alone = await projected(markers);
     assert.ok(Math.abs(besideImage - alone) < 100, `${besideImage} beside the image, ${alone} alone`);
+    // Beside an image the live copy goes natively, each text block cut at
+    // the cap on its own, so each embedded text counts as the text sent, not
+    // as the stored copy, which is cut at the cap once (Ada-1017, room-203
+    // #207161): a second 30,000-character text adds about the cap's 6,000
+    // tokens more.
+    const text = { type: 'resource', resource: { uri: 'file:///zz/notes.txt', mimeType: 'text/plain', text: 'z'.repeat(30_000) } };
+    const one = await projected([image, text]);
+    const two = await projected([image, text, text]);
+    assert.ok(two - one > 5_000, `${two} with two texts, ${one} with one`);
   });
 
   it('counts a cache-write prompt term toward a restart', async () => {

@@ -47,6 +47,7 @@ import { convertBlock } from '../src/mcpl/convert-block.js';
 import { CoalesceError, validateCoalescedContent } from '../src/mcpl/push-coalescer.js';
 import { ReferenceFetcher } from '../src/mcpl/reference-fetcher.js';
 import { checkedToolResult } from '../src/module-registry.js';
+import { isVisiblyEmptyContent } from '../src/mcpl/visible-content.js';
 import { parseImagePlaceholders } from '../src/tool-image-ledger.js';
 import { UNCHECKED_RESULT_TEXT, nonErrorResultText, scriptViewClaims, shownToScript, toolResultDataToHistoryString, truncateForHistory } from '../src/tool-result-history.js';
 import { MockMembrane, createMockResponse } from './helpers/mock-membrane.js';
@@ -882,6 +883,19 @@ describe("MCP's embedded resource, an ordinary inline block (RFC-005 §8.1)", ()
     for (const resource of [{ text: 'zz' }, { uri: 7, text: 'zz' }, 'zz']) {
       assert.deepEqual(classifyBlock({ type: 'resource', resource }), { kind: 'invalid', shown: REFERENCE_NO_LINK_TEXT });
     }
+    // A top-level uri that's null or empty is none of its own.
+    for (const uri of [null, '']) {
+      assert.deepEqual(classifyBlock({ ...TEXT_FILE, uri }), classifyBlock(TEXT_FILE), String(uri));
+    }
+    // Any disposition withholds it, a falsy one included, as for inline data.
+    for (const disposition of [null, false, 0, '']) {
+      assert.deepEqual(classifyBlock({ ...TEXT_FILE, disposition }), { kind: 'embedded', contents: { kind: 'withheld' } }, String(disposition));
+    }
+    // A media type's family is read whatever its case, and kept as sent.
+    assert.deepEqual(classifyBlock(embedded({ mimeType: 'Image/PNG', blob: PNG })),
+      { kind: 'embedded', contents: { kind: 'block', block: { type: 'image', data: PNG, mimeType: 'Image/PNG' } } });
+    assert.deepEqual(classifyBlock(embedded({ mimeType: 'AUDIO/WAV', blob: BASE64 })),
+      { kind: 'embedded', contents: { kind: 'block', block: { type: 'audio', data: BASE64, mimeType: 'AUDIO/WAV' } } });
   });
 
   it('shows its text as text in both copies of a tool result, on the push lane and at any depth, never its uri', () => {
@@ -973,16 +987,20 @@ describe("MCP's embedded resource, an ordinary inline block (RFC-005 §8.1)", ()
     for (const [what, block, line] of UNSHOWN) {
       const expected = what === 'an empty image blob'
         // Inline data that claims nothing reaches a script as sent, an
-        // empty image's among it.
-        ? referenceBlockForScript({ type: 'image', data: '', mimeType: 'image/png' })
+        // empty image's among it, where the model's lanes show its marker.
+        ? { type: 'image', data: '', mimeType: 'image/png' }
         : { type: 'text', text: line };
       assert.deepEqual(referenceBlockForScript(block), expected, what);
     }
     // At any depth, as history's rules apply there, and given again, each is
     // as it was.
-    const view = JSON.parse(JSON.stringify({ found: [TEXT_FILE, IMAGE_FILE, ...UNSHOWN.map(([, block]) => block)] },
+    const view = JSON.parse(JSON.stringify({ found: [TEXT_FILE, IMAGE_FILE, AUDIO_FILE, ...UNSHOWN.map(([, block]) => block)] },
       (_key, value: unknown) => shownToScript(value))) as { found: unknown[] };
-    assert.deepEqual(view.found.slice(0, 2), [{ type: 'text', text: 'zz-embedded-text' }, { type: 'image', data: PNG, mimeType: 'image/png' }]);
+    assert.deepEqual(view.found.slice(0, 3), [
+      { type: 'text', text: 'zz-embedded-text' },
+      { type: 'image', data: PNG, mimeType: 'image/png' },
+      { type: 'audio', data: BASE64, mimeType: 'audio/wav' },
+    ]);
     assert.deepEqual(JSON.parse(JSON.stringify(view, (_key, value: unknown) => shownToScript(value))), view);
     assert.ok(!JSON.stringify(view).includes(SECRET) && !JSON.stringify(view).includes('embedded.txt'), JSON.stringify(view));
   });
@@ -1019,6 +1037,48 @@ describe("MCP's embedded resource, an ordinary inline block (RFC-005 §8.1)", ()
     assert.equal(pushed.type, 'text');
     assert.ok(pushed.text.startsWith('[Resource not shown') && pushed.text.isWellFormed(), JSON.stringify(pushed.text));
     assert.ok(copies({ success: true, data: [TEXT, odd], dataIsContent: true }).stored.isWellFormed());
+    // Where it's made, so a script's view and the whole text of one alone
+    // carry the same well-formed marker.
+    const scripted = referenceBlockForScript(odd) as { type: string; text: string };
+    assert.deepEqual(scripted, { type: 'text', text: pushed.text });
+    assert.equal(toolResultDataToHistoryString(odd), pushed.text);
+  });
+
+  it('makes its text well formed as the whole result, as a content array makes its texts', () => {
+    const lone = embedded({ mimeType: 'text/plain', text: 'zz-\uD800-text' });
+    const { stored, live } = copies({ success: true, data: lone });
+    assert.equal(stored, 'zz-\uFFFD-text');
+    assert.deepEqual(live, stored);
+    assert.equal(toolResultDataToHistoryString(lone), 'zz-\uFFFD-text');
+  });
+
+  it("is read by history's walk as the text it shows, never through its fields", () => {
+    // A never in its _meta, which nothing shows, doesn't count: the link
+    // beside it keeps its line, at depth and in a script's view.
+    const URI = 'https://zz-docs.example/beside.txt';
+    const link = { ...PLAIN_LINK, uri: URI };
+    const meta = { ...TEXT_FILE, _meta: { note: { type: 'resource', uri: URI, name: 'beside.txt', disposition: 'never' } } };
+    const shown = toolResultDataToHistoryString({ a: meta, b: link });
+    assert.equal(shown, JSON.stringify({ a: 'zz-embedded-text', b: `[resource link "report.csv": ${URI}, text/csv; not fetched]` }));
+    assert.equal(scriptViewClaims([{ type: 'text', text: 'zz', nested: meta }], false).has(URI), false);
+  });
+
+  it('keeps nothing when withheld, where it is the whole of the data', () => {
+    // Ada-1017, room-203 #207161: its text is the withheld body, and a field
+    // picked out of it is data that shows its uri.
+    assert.equal(keptWhenWithheld({ success: true, data: TEXT_FILE, keepWhenWithheld: ['resource', 'type'] }, undefined), undefined);
+    // A record that isn't one keeps its fields, as before.
+    assert.equal(keptWhenWithheld({ success: true, data: { type: 'note', name: 'zz-kept' }, keepWhenWithheld: ['name'] }, undefined), '{"name":"zz-kept"}');
+  });
+
+  it('counts as nothing to see where its contents are blank text, and as something where they are anything else', () => {
+    // Ada-1017, room-203 #207161: the coalescer's render, a push and a
+    // channel message judge it as the block its contents make.
+    assert.equal(isVisiblyEmptyContent([embedded({ mimeType: 'text/plain', text: ' \n ' })]), true);
+    assert.equal(isVisiblyEmptyContent([embedded({ mimeType: 'text/plain', text: 'zz' })]), false);
+    for (const block of [IMAGE_FILE, AUDIO_FILE, ...UNSHOWN.map(([, b]) => b)]) {
+      assert.equal(isVisiblyEmptyContent([block]), false, JSON.stringify(block).slice(0, 80));
+    }
   });
 });
 

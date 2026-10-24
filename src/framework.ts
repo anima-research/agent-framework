@@ -417,11 +417,10 @@ function malformedResponseContent(response: EventResponse): { where: string; pla
 
 /**
  * Rough token estimate for the blocks a continuation round is about to
- * append to the live wire (issue #92 physical-window projection): the
- * spilled tool-result strings at chars/4, a flat per-image cost for the
- * native image blocks each tool result's live copy sends (provider vision
- * tokens are resolution-dependent; 1600 ≈ one image at Anthropic's largest
- * size), a
+ * append to the live wire (issue #92 physical-window projection): each tool
+ * result's live copy as the request carries it, its text at chars/4 and a
+ * flat per-image cost for its native image blocks (provider vision tokens
+ * are resolution-dependent; 1600 ≈ one image at Anthropic's largest size), a
  * mid-turn message's text at chars/4 and its other blocks about as
  * context-manager's store prices them (injectedBlockTokens), and a small
  * per-block envelope allowance. On membrane's native tool path a mid-turn
@@ -437,21 +436,28 @@ function malformedResponseContent(response: EventResponse): { where: string; pla
  */
 function estimateAppendedRoundTokens(
   toolResults: MembraneToolResult[],
-  spilled: Map<string, { text: string; filePath: string | null }>,
   injections: Array<{ content: ContentBlock[] }>,
 ): number {
   let chars = 0;
   let images = 0;
   for (const result of toolResults) {
-    chars += spilled.get(result.toolUseId)?.text.length ?? 0;
-    // The images each result's live copy sends natively, an embedded
-    // resource's among them, read from the copies the round already built
-    // (toMembraneToolResult), so nothing is classified again: a result whose
-    // links and markers pass the cap goes as its stored text (goesNative),
-    // and its images count as nothing more. These are the copies before the
-    // tool-result guard's, so a result the guard withholds from the request
-    // still counts its images, an overestimate, as this projection means to.
-    if (Array.isArray(result.content)) images += result.content.filter((block) => block.type === 'image').length;
+    // Each result's live copy, read from the copies the round already built
+    // (toMembraneToolResult), so nothing is classified again: its stored
+    // text, where it goes as that, or else its native blocks, each text block
+    // cut at the cap on its own, an embedded resource's among them, and each
+    // image. A result whose links and markers pass the cap goes as its
+    // stored text (goesNative), and its images count as nothing more. These
+    // are the copies before the tool-result guard's, so a result the guard
+    // withholds from the request still counts, an overestimate, as this
+    // projection means to.
+    if (typeof result.content === 'string') {
+      chars += result.content.length;
+      continue;
+    }
+    for (const block of result.content) {
+      if (block.type === 'text') chars += block.text.length;
+      else if (block.type === 'image') images += 1;
+    }
   }
   let injectedTokens = 0;
   for (const inj of injections) {
@@ -12796,7 +12802,7 @@ export class AgentFramework {
             ? agent.lastStreamRealInputTokens
               + agent.lastStreamOutputTokens
               + agent.lastStreamUnreportedTokens
-              + estimateAppendedRoundTokens(membraneResults, spilled, midTurnInjections)
+              + estimateAppendedRoundTokens(membraneResults, midTurnInjections)
               + agent.maxTokens
             : 0;
           const overPhysical = projectedRealTokens > (agent.physicalWindowTokens ?? Infinity);
@@ -12947,7 +12953,7 @@ export class AgentFramework {
             // call reports no prompt, the next boundary projects it from the
             // growth since the last call that did.
             if (agent.physicalWindowTokens !== undefined) {
-              agent.lastStreamUnreportedTokens += estimateAppendedRoundTokens(membraneResults, spilled, midTurnInjections);
+              agent.lastStreamUnreportedTokens += estimateAppendedRoundTokens(membraneResults, midTurnInjections);
             }
             // Streaming path: convert results and resume the stream.
             // Mid-turn messages collected above ride along as injected user
@@ -30781,9 +30787,11 @@ export class AgentFramework {
           if (candidate.ref === null) {
             throw new Error(
               `save_recent_image: image at index ${position} is a tool-result image from ${describeTool(candidate)} ` +
-              'recorded without a retention ref (written before tool-image retention existed, or inside a ' +
-              'script run, where tool images are not retained) — its bytes are not available. Nothing written. ' +
-              'Re-run the tool for a fresh image rather than saving an older one.',
+              'recorded without a retention ref (written before tool-image retention existed, inside a ' +
+              'script run, where tool images are not retained, or nested in the tool\'s data rather than its ' +
+              'content, where an image is kept only as its placeholder) — its bytes are not available. Nothing written. ' +
+              'Re-run the tool for a fresh image rather than saving an older one, unless the image came nested in ' +
+              'its data, which a re-run records the same way.',
             );
           }
           const lookup = ledger.lookup(candidate.ref);

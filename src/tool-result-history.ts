@@ -462,7 +462,9 @@ function shownInHistory(value: unknown, claims?: ResultClaims): unknown {
   return walkedInHistory(value, (b) => {
     // MCP's embedded resource is the text its stored copy shows: its text,
     // an image's placeholder or its marker. As JSON it would carry its uri.
-    if (classifyBlock(b).kind === 'embedded') return storedText(toolResultBlock(b, claims ?? resultClaims([])));
+    // Made well formed, as a content array's texts are (toolResultBlocks),
+    // since at the root this text is the result's whole text, as it's sent.
+    if (classifyBlock(b).kind === 'embedded') return storedText(toolResultBlock(b, claims ?? resultClaims([]))).toWellFormed();
     return referenceStubOrNull(b, 'from tool result', undefined, { unfetchedLinkUri: true, claims });
   });
 }
@@ -530,8 +532,9 @@ function claimsInHistoryOrThrow(data: unknown): ResultClaims {
     if (c.kind === 'reference') testimonies.push(c.testimony);
     const never = inlineNeverUri(b, c);
     if (never !== null) nevers.push(never);
-    // Text where showing gives text (shownInHistory), an embedded
-    // resource's among it, so the walk descends where showing descends.
+    // Text ('') wherever showing gives text (shownInHistory), an embedded
+    // resource included, so the walk stops where showing stops, never
+    // reading such a value's fields, and descends only where showing does.
     // Inline data never reaches here: walkedInHistory decides it first.
     return c.kind === 'text' ? null : '';
   };

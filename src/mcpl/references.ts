@@ -27,8 +27,6 @@
  * code-execution materialization hook possible.
  */
 
-import { NON_STRING_TEXT_PLACEHOLDER } from './visible-content.js';
-
 export const REFERENCE_LIMITS = { uri: 4096, mimeType: 255, name: 255, expiresAt: 64 } as const;
 export const DIGEST_PATTERN = /^sha256:[A-Za-z0-9_-]{43}$/;
 const MAX_SAFE = 9007199254740991; // 2^53 - 1
@@ -140,11 +138,12 @@ export function classifyBlock(block: unknown): BlockClassification {
 
 /**
  * MCP's EmbeddedResource: a `resource` block with no uri of its own whose
- * `resource` is a record with a string `uri` and exactly one of a string
- * `text` or a string `blob` (base64). RFC-005 §8.1 reads it as "an ordinary
- * inline block, nothing new", so its contents show as the block they make:
- * its text as text, and its blob as the inline image or audio its media type
- * makes it, or as a marker for any other type. Its uri is never shown, since
+ * `resource` is a record with a string `uri`. RFC-005 §8.1 reads it as "an
+ * ordinary inline block, nothing new", so its contents show as the block
+ * they make: with exactly one of a string `text` or a string `blob`
+ * (base64), its text as text, and its blob as the inline image or audio its
+ * media type makes it, or as a marker for any other type; with both or
+ * neither, the marker saying its contents can't be read. Its uri is never shown, since
  * no lane RFC-005 governs showed it before and nothing here can tell a
  * capability in a uri from a location. A disposition on it is inline
  * content claiming bulk disposition (RFC-005 vector 2), so it's withheld.
@@ -236,11 +235,22 @@ export const EMBEDDED_RESOURCE_UNREADABLE_TEXT = '[Resource not shown: its conte
 export const EMBEDDED_RESOURCE_NO_MEDIA_TYPE_TEXT = '[Resource not shown: its data arrived without a media type.]';
 
 /** MCP's embedded resource whose blob is of a type no lane can show: what
- *  it was, by its type and size. */
+ *  it was, by its type and size. Made well formed (a lone UTF-16 surrogate
+ *  becomes U+FFFD), as a stub is (#695), since it names the block's media
+ *  type, which sanitizeLabel leaves as it is: every lane then shows the same
+ *  text. */
 export function embeddedBinaryText(mimeType: string, blob: string): string {
   const what = [referenceTypeLabel(mimeType), formatSizeBytes(Math.floor(blob.length * 3 / 4))].filter(Boolean).join(', ');
-  return `[Resource not shown: this host can't display its data (${what}).]`;
+  return `[Resource not shown: this host can't display its data (${what}).]`.toWellFormed();
 }
+/**
+ * What the converter (convertBlock, on every lane) shows for a text
+ * block whose text isn't a string, which only a nonconformant sender writes,
+ * so the agent learns that a block was there. It is the host's word, not the
+ * sender's, so it never makes content visible (isVisiblyEmptyConversion in
+ * visible-content.ts, which re-exports it).
+ */
+export const NON_STRING_TEXT_PLACEHOLDER = '[Text not shown: a text part arrived without readable text.]';
 export const REFERENCE_NO_LINK_TEXT = '[Reference not shown: it arrived without a link.]';
 export const REFERENCE_LINK_TOO_LONG_TEXT = '[Reference not shown: its link is longer than this host accepts.]';
 const UNREADABLE_BLOCK_TEXT = "[Content not shown: a part arrived in a form this host can't read.]";
@@ -1146,9 +1156,9 @@ export function unfetchableReason(record: ReferenceRecord, nowMs = Date.now(), c
  * from the block's own fields, so it's made well formed (a lone UTF-16
  * surrogate becomes U+FFFD), as the context store would make it: a tool
  * result's copies then carry the same text (#695). For MCP's embedded
- * resource, it's the text for contents that can't be shown, made well formed
- * too, since a marker names the block's media type, and null where they can:
- * the caller shows the block they make (classifyBlock's `embedded`).
+ * resource, it's the text for contents that can't be shown (its marker is
+ * well formed where it's made), and null where they can: the caller shows the
+ * block they make (classifyBlock's `embedded`).
  */
 export function referenceStubOrNull(block: unknown, provenance?: string, serverId?: string, options?: StubOptions): string | null {
   const c = classifyBlock(block);
@@ -1158,7 +1168,7 @@ export function referenceStubOrNull(block: unknown, provenance?: string, serverI
       return c.contradiction ? INLINE_WITHHELD_TEXT : null;
     case 'reference': return buildReferenceStub(c.testimony, provenance, serverId, options).toWellFormed();
     case 'embedded':
-      return c.contents.kind === 'withheld' ? INLINE_WITHHELD_TEXT : c.contents.kind === 'marker' ? c.contents.text.toWellFormed() : null;
+      return c.contents.kind === 'withheld' ? INLINE_WITHHELD_TEXT : c.contents.kind === 'marker' ? c.contents.text : null;
     case 'invalid': return c.shown;
   }
 }
