@@ -1,7 +1,8 @@
 /**
- * Context injection is deprecated (#171). Behavior must be unchanged —
- * injections still apply — but every injecting source is named exactly once
- * on stderr, and sources that inject nothing stay silent.
+ * Context injection is deprecated (#171). The deprecation changes nothing
+ * about how injections are applied. Every module that returns injections,
+ * and every MCPL server with an injection that passes the feature-set and
+ * grant checks, is named once on stderr; a source with none isn't.
  */
 import { test, beforeEach } from 'node:test';
 import assert from 'node:assert/strict';
@@ -53,8 +54,16 @@ test('a module that injects is still applied and is named once across turns', as
   });
   assert.equal(first.length, 1, 'injection still applied');
   assert.equal(warnings.length, 1, `one warning for three turns, got ${JSON.stringify(warnings)}`);
-  assert.match(warnings[0], /module "hud" injected context/);
-  assert.match(warnings[0], /#171/);
+  assert.equal(
+    warnings[0],
+    '[deprecated] module "hud" returns context injections, and this line changes nothing about how they\'re applied. ' +
+      'Context injection is deprecated (anima-research/agent-framework#171). Moving changing state into conversation ' +
+      'content (push events, tool results) is for whoever maintains the module or server named at the start of this ' +
+      "line. Durable system text belongs in the agent's configured system prompt, which whoever configures this host " +
+      'sets; system text that changes at runtime has no replacement. Turning that module or server off removes ' +
+      'its injections along with whatever else it does.',
+    'the whole line an operator reads',
+  );
 });
 
 test('a module whose gatherContext returns nothing is not warned about', async () => {
@@ -89,7 +98,7 @@ test('an MCPL server injection within its grant is still applied and named once'
   });
   assert.equal(applied.length, 1, 'injection still applied');
   assert.equal(warnings.length, 1);
-  assert.match(warnings[0], /MCPL server "recap-server" injected context \(position "beforeUser"\)/);
+  assert.match(warnings[0], /MCPL server "recap-server" returns context injections, and this line changes nothing about how they're applied\./);
 });
 
 test('an injection outside the grant is dropped as before and does not warn', async () => {

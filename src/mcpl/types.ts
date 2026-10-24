@@ -830,10 +830,21 @@ export interface BeforeInferenceResult {
    * Context injections to apply.
    *
    * @deprecated Context injection is deprecated (agent-framework#171):
-   * injections are never stored and are re-anchored on every compile, which
-   * breaks prompt-cache prefixes. Servers should return an empty array and
-   * deliver state as push events or tool results instead. Hosts still apply
-   * injections for now and log a `[deprecated]` line per injecting server.
+   * injections are never stored in the conversation. A `beforeUser` or
+   * `afterUser` injection is placed beside the latest user-participant
+   * message, tool results included, on every compile, so it moves each time
+   * a newer one takes its place, which breaks prompt-cache prefixes at its old
+   * slot, and a `beforeUser` injection placed beside a tool result lands
+   * between the tool call and its result in the compiled messages; with no
+   * user-participant message, context-manager 0.16 and later put both at the
+   * end, and earlier versions drop a `beforeUser` injection. A `system`
+   * injection's text is appended to the system prompt, which comes before
+   * every message, so with a prefix cache each new text of it misses the
+   * cache for everything after it. Servers should return an empty array and
+   * deliver state as push events or tool results instead; `system` text that
+   * changes at runtime has no replacement. The deprecation changes nothing
+   * about how hosts apply injections; they log a `[deprecated]` line per
+   * server with an injection that passes the feature-set and grant checks.
    */
   contextInjections: McplContextInjection[];
 }

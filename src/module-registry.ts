@@ -381,8 +381,9 @@ export class ModuleRegistry {
       let timer: ReturnType<typeof setTimeout> | undefined;
       const promise = Promise.race([
         module.gatherContext(agentName).then(r => {
-          // Deprecated mechanism (agent-framework#171): still applied, but
-          // every injecting module is named once on stderr.
+          // Deprecated mechanism (agent-framework#171): still collected as
+          // before, and a module is named once on stderr the first time it
+          // returns injections.
           if (r.length > 0) warnContextInjectionDeprecated('module', module.name);
           injections.push(...r);
         }),

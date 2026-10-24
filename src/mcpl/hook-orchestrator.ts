@@ -276,9 +276,10 @@ export class HookOrchestrator {
             );
             continue;
           }
-          // Deprecated mechanism (agent-framework#171): still applied, but
-          // every injecting server is named once on stderr.
-          warnContextInjectionDeprecated('mcpl-server', server.id, `position "${mcplInj.position}"`);
+          // Deprecated mechanism (agent-framework#171): still collected as
+          // before, and a server is named once on stderr at its first
+          // injection that passes the checks above, before it's converted.
+          warnContextInjectionDeprecated('mcpl-server', server.id);
           injections.push(convertMcplInjection(mcplInj));
         }
       }

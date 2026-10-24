@@ -4,31 +4,58 @@
  *   - module `gatherContext()` (see `Module.gatherContext`), and
  *   - MCPL `context/beforeInference` `contextInjections` (spec §10.2).
  *
- * Injected blocks are per-compile overlays: never stored, and re-anchored to
- * the latest user-participant message on every compile. On the next
- * activation the old block vanishes from its slot and reappears at the new
- * tail, so the request diverges from every earlier one at that point. On
- * providers whose prompt cache only hits boundaries an earlier request
- * wrote (OpenAI Responses / Codex), the first call of every activation falls
- * back to a head-only hit; on Anthropic the loss is bounded but real. A
- * mid-activation recompile (e.g. a stream retry) can also anchor the block
- * between a tool call and its result. See anima-research/agent-framework#171.
+ * Injected blocks are per-compile overlays, never stored in the
+ * conversation, so its record doesn't hold what the model saw. What else
+ * they cost depends on the position:
  *
- * Behavior is unchanged for now — injections are still applied. Hosts log
- * one `[deprecated]` line per injecting module / server so remaining uses
- * are visible before the mechanism is removed.
+ *   - `beforeUser` / `afterUser`: placed beside the latest message whose
+ *     participant is `user` in any letter case, as tool results are stored,
+ *     wherever that message is in the history, again on every compile. When
+ *     a later message takes its place, the old block vanishes from its slot
+ *     and reappears beside the new one, so the request diverges from every
+ *     earlier one at the old slot. On providers whose prompt cache only hits
+ *     boundaries an earlier request wrote (OpenAI Responses / Codex), the
+ *     first call after such a move falls back to a head-only hit; on
+ *     Anthropic the loss is bounded but real. A `beforeUser` block placed
+ *     beside a tool result lands between the tool call and its result in
+ *     the compiled messages; membrane's native formatter then moves the
+ *     result ahead of it, into the same message, and its OpenAI Responses
+ *     formatter sends it between the call and its output. An `afterUser`
+ *     block lands after the result. With no `user` message, context-manager
+ *     0.16 and later put both blocks at the end, `beforeUser` first, and
+ *     earlier versions drop a `beforeUser` block and put an `afterUser` one
+ *     at the end.
+ *   - `system`: its text is appended to the system prompt on every request,
+ *     never re-anchored, so it can't split a tool call from its result.
+ *     Blocks that aren't text can't be carried there. The system prompt
+ *     comes before every message, so with a prefix cache each new text of
+ *     that block misses the cache for everything after it in the request.
  *
- * Instead: put durable instructions in the system prompt; deliver
- * time-varying state as conversation content (push events, tool results)
- * so it is stored once at its own position and stays cache-stable.
+ * See anima-research/agent-framework#171.
+ *
+ * Nothing is removed yet, and the deprecation changes nothing about how
+ * injections are applied. Hosts log one `[deprecated]` line per module that
+ * returns injections, and per MCPL server with an injection that passes the
+ * feature-set and grant checks, so remaining uses are visible before the
+ * mechanism is removed. The framework's own `system` injections are added
+ * after both and aren't logged: a silent heartbeat's `ephemeralSystemPrompt`,
+ * and the subconscious's standing dispositions.
+ *
+ * Instead: deliver changing state as conversation content (push events,
+ * tool results), so it is stored once at its own position and stays
+ * cache-stable. Durable instructions belong in the agent's configured system
+ * prompt, which the host's configuration sets. That prompt is fixed once the
+ * agent is made, so `system` text that changes at runtime has no
+ * replacement.
  */
 
 export const CONTEXT_INJECTION_DEPRECATION_NOTICE =
-  'Context injection is deprecated: injected blocks are per-compile overlays that are never ' +
-  'stored and are re-anchored on every activation, which breaks prompt-cache prefixes ' +
-  '(head-only hits on OpenAI lanes) and can land between a tool call and its result. ' +
-  'Put durable content in the system prompt and deliver changing state as conversation ' +
-  'content (push events, tool results) instead. See anima-research/agent-framework#171.';
+  'Context injection is deprecated (anima-research/agent-framework#171). Moving changing state ' +
+  'into conversation content (push events, tool results) is for whoever maintains the module or ' +
+  "server named at the start of this line. Durable system text belongs in the agent's configured " +
+  'system prompt, which whoever configures this host sets; system text that changes at runtime ' +
+  'has no replacement. Turning that module or server off removes its injections along with ' +
+  'whatever else it does.';
 
 const warned = new Set<string>();
 
@@ -39,14 +66,14 @@ const warned = new Set<string>();
 export function warnContextInjectionDeprecated(
   kind: 'module' | 'mcpl-server',
   id: string,
-  detail?: string,
 ): void {
   const key = `${kind}:${id}`;
   if (warned.has(key)) return;
   warned.add(key);
   const who = kind === 'module' ? `module "${id}"` : `MCPL server "${id}"`;
   console.warn(
-    `[deprecated] ${who} injected context${detail ? ` (${detail})` : ''}. ` +
+    `[deprecated] ${who} returns context injections, and this line changes nothing about how ` +
+      "they're applied. " +
       CONTEXT_INJECTION_DEPRECATION_NOTICE,
   );
 }
