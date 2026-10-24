@@ -79,7 +79,7 @@ export type RoundRow =
 /**
  * A round's rows as noted: each stored row's id where the next request carries it as the stream sent it, the
  * marker where it doesn't. `carried` gives each id's stored body as the next compile renders it (participant and
- * content, or null where that compile won't send it), so the comparison is the one the context manager's record
+ * content, or null where no compile can send it), so the comparison is the one the context manager's record
  * makes, after the agent's own request passes (asNextRequestCarries). A row the store doesn't hold (no id), a reply
  * that differs from the round's content as membrane held it, results that differ from those submitted (as while the
  * tool-result guard holds a batch, storing placeholders and submitting the originals), or an injected message sent
