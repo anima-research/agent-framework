@@ -3,8 +3,8 @@
  * part 5; src/stored-injections.ts). At a start, an `afterUser` injection is
  * stored in the agent's window, appended as the message compile() would have
  * placed, so it stays where the agent saw it: one the agent's last request
- * held with the same content isn't stored again, and a changed one is
- * appended then. While the window is held (quiesced, or another reader of
+ * held with the same content (or a newer copy a start whose compile threw
+ * stored) isn't stored again, and a changed one is appended then. While the window is held (quiesced, or another reader of
  * the shared slot mid-turn), compile() places it instead. A module's
  * injection can opt out (placedEachCompile) and is placed as before; an MCPL
  * server's can't. A stored row is marked with its agent and namespace, and
@@ -15,7 +15,7 @@ import assert from 'node:assert/strict';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { WindowedPassthroughStrategy, type ContextInjection } from '@animalabs/context-manager';
+import { AutobiographicalStrategy, WindowedPassthroughStrategy, type ContextInjection } from '@animalabs/context-manager';
 import type { ContentBlock } from '@animalabs/membrane';
 import { AgentFramework, type Agent, type Module, type ModuleContext, type ModuleContextInjection, type ProcessEvent } from '../src/index.js';
 import { MockMembrane, createMockResponse } from './helpers/mock-membrane.js';
@@ -63,7 +63,7 @@ type Internals = {
 };
 const internals = (f: AgentFramework) => f as unknown as Internals;
 
-async function make(opts: { modules?: Module[]; agents?: string[]; subconscious?: boolean; dir?: string; strategy?: unknown } = {}) {
+async function make(opts: { modules?: Module[]; agents?: string[]; subconscious?: boolean; dir?: string; strategy?: unknown; errorPolicy?: unknown } = {}) {
   const dir = opts.dir ?? mkdtempSync(join(tmpdir(), 'af-stored-injections-'));
   if (!opts.dir) dirs.push(dir);
   const membrane = new MockMembrane();
@@ -74,6 +74,7 @@ async function make(opts: { modules?: Module[]; agents?: string[]; subconscious?
     modules: opts.modules ?? [],
     syncIntervalMs: 0,
     ...(opts.subconscious ? { subconscious: { enabled: true, systemPrompt: 'notice' } } : {}),
+    ...(opts.errorPolicy ? { errorPolicy: opts.errorPolicy as never } : {}),
   });
   frameworks.push(framework);
   await framework.start();
@@ -467,7 +468,8 @@ test("storedInjectionMarkOf reads a row's whole mark, and nothing from a row wit
   assert.deepEqual(storedInjectionMarkOf({ contextInjection: { ...mark, extra: 1 } }), mark, 'its five fields');
   for (const metadata of [undefined, {}, { contextInjection: null }, { contextInjection: 'prime' },
     { contextInjection: { namespace: 'lessons' } }, { contextInjection: { agent: 'prime', namespace: 'lessons', contentHash: 'h' } },
-    { contextInjection: { ...mark, agent: 5 } }, { contextInjection: { ...mark, part: 2 } }, { contextInjection: { ...mark, part: -1 } },
+    { contextInjection: { ...mark, agent: 5 } }, { contextInjection: { ...mark, namespace: 5 } }, { contextInjection: { ...mark, contentHash: null } },
+    { contextInjection: { ...mark, part: 2 } }, { contextInjection: { ...mark, part: -1 } },
     { contextInjection: { ...mark, part: 0.5 } }, { contextInjection: { ...mark, parts: '2' } }]) {
     assert.equal(storedInjectionMarkOf(metadata), undefined, JSON.stringify(metadata));
   }
@@ -950,8 +952,10 @@ test("the direct API's inference records what its compile held, so the next star
   agent.getContextManager().addMessage('user', [text('hello')]);
   internals(x.framework).storeInjections(agent, [injection()]);
   x.membrane.pushResponse(createMockResponse([text('direct reply')]));
+  assert.equal(agent.renderedInjection('lessons'), undefined, 'the premise: no compile has recorded yet');
   await agent.runInferenceWithInjections([], undefined);
   assert.equal(x.membrane.calls.length, 1, 'the premise: the direct API sent a request');
+  assert.equal(agent.renderedInjection('lessons')?.whole, true, 'its own record says the direct request held it');
   assert.equal(internals(x.framework).storeInjections(agent, [injection()]), undefined);
   assert.equal(storedInjections(agent).length, 1, 'held by the direct request: skipped');
 });
@@ -987,4 +991,591 @@ test("in a held window with no user message, a changed injection compile() place
   } finally {
     internals(x.framework).quiesced = false;
   }
+});
+
+test("a start whose compile throws, retried by the error policy, stores a changed injection once: the failed attempt's copy hasn't been in a request yet", async () => {
+  const lessons = new Lessons();
+  lessons.lesson = 'FIRST';
+  const x = await make({
+    modules: [lessons],
+    errorPolicy: { maxRetries: 3, onInferenceError: (_e: Error, _a: string, attempt: number) => (attempt < 3 ? { retry: true, delayMs: 0 } : { retry: false }) },
+  });
+  const agent = x.framework.getAgent('prime')!;
+  await turn(x, 'hello');
+  assert.deepEqual(storedInjections(agent).map(textOf), ['FIRST'], 'the premise: stored and sent');
+  lessons.lesson = 'SECOND';
+  const cm = agent.getContextManager();
+  const compile = cm.compile.bind(cm);
+  let failures = 2;
+  cm.compile = (async (...args: Parameters<typeof compile>) => {
+    if (failures-- > 0) throw new Error('the compile failed');
+    return compile(...args);
+  }) as typeof cm.compile;
+  await turn(x, 'again');
+  assert.equal(failures, -1, 'the premise: two attempts failed and the third compiled');
+  assert.deepEqual(storedInjections(agent).map(textOf), ['FIRST', 'SECOND'], 'one copy of the changed content');
+  const request = x.membrane.calls.at(-1)!.messages.map(textOf);
+  assert.ok(request.includes('SECOND'), 'and the retry that compiled carried it');
+});
+
+test("with no request sent since it started, a start's retry still finds the copy its failed attempt stored", async () => {
+  const lessons = new Lessons();
+  const x = await make({
+    modules: [lessons],
+    errorPolicy: { maxRetries: 2, onInferenceError: (_e: Error, _a: string, attempt: number) => (attempt < 2 ? { retry: true, delayMs: 0 } : { retry: false }) },
+  });
+  const agent = x.framework.getAgent('prime')!;
+  const cm = agent.getContextManager();
+  const compile = cm.compile.bind(cm);
+  let failures = 1;
+  cm.compile = (async (...args: Parameters<typeof compile>) => {
+    if (failures-- > 0) throw new Error('the compile failed');
+    return compile(...args);
+  }) as typeof cm.compile;
+  await turn(x, 'hello');
+  assert.equal(failures, -1, 'the premise: the first attempt failed');
+  assert.deepEqual(storedInjections(agent).map(textOf), ['LESSON one']);
+});
+
+/** The framework's module registry, whose gather the tests below call. */
+const registryOf = (x: { framework: AgentFramework }) =>
+  (x.framework as unknown as { moduleRegistry: { gatherContext(agent: string): Promise<ModuleContextInjection[]> } }).moduleRegistry;
+
+/** A module that gathers one `afterUser` injection under `namespace` after
+ *  `delayMs`, as a slower source finishes later. */
+class Timed implements Module {
+  readonly name: string;
+  delayMs = 0;
+  contextTimeoutMs?: number;
+  /** Where it notes its name when its gather finishes, if given. */
+  finished?: string[];
+  /** What it waits for before it finishes, in place of its delay, if given. */
+  waitFor?: () => Promise<unknown>;
+  private readonly onFinish = new Set<() => void>();
+  /** Resolves when its next gather finishes. */
+  whenFinished(): Promise<void> { return new Promise((resolve) => this.onFinish.add(resolve)); }
+  constructor(name: string, private readonly says: string, private readonly namespace = 'shared') { this.name = name; }
+  async start() {}
+  async stop() {}
+  getTools() { return []; }
+  async handleToolCall() { return { success: false, isError: true, error: 'no tools' }; }
+  async onProcess() { return {}; }
+  async gatherContext(): Promise<ModuleContextInjection[]> {
+    await (this.waitFor ? this.waitFor() : new Promise((resolve) => setTimeout(resolve, this.delayMs)));
+    this.finished?.push(this.name);
+    for (const resolve of this.onFinish) resolve();
+    this.onFinish.clear();
+    return [{ namespace: this.namespace, position: 'afterUser', content: [text(this.says)] }];
+  }
+}
+
+test("injections come in the modules' registration order, whatever order they finish in, so an unchanged unit isn't stored again when the order they finish in changes", async () => {
+  const first = new Timed('first-source', 'FROM FIRST');
+  const second = new Timed('second-source', 'FROM SECOND');
+  const lessons = new Lessons();
+  const finished: string[] = [];
+  first.finished = finished;
+  second.finished = finished;
+  const x = await make({ modules: [lessons, first, second] });
+  const agent = x.framework.getAgent('prime')!;
+  first.waitFor = () => second.whenFinished();
+  await turn(x, 'hello');
+  assert.deepEqual(finished, ['second-source', 'first-source'], 'the premise: the first finished last');
+  const shared = () => storedInjections(agent).map(textOf).filter((t) => t.startsWith('FROM'));
+  assert.deepEqual(shared(), ['FROM FIRST', 'FROM SECOND'], 'registration order, though the first finished last');
+  first.waitFor = undefined;
+  second.waitFor = () => first.whenFinished();
+  finished.length = 0;
+  await turn(x, 'again');
+  assert.deepEqual(finished, ['first-source', 'second-source'], 'the premise: now the second finished last');
+  assert.deepEqual(shared(), ['FROM FIRST', 'FROM SECOND'], 'the same unit, not stored again');
+});
+
+test("a module that answers after its timeout, while another module is still gathering, adds nothing to what is gathered", async () => {
+  const finished: string[] = [];
+  const late = new Timed('late-source', 'TOO LATE', 'late');
+  late.delayMs = 200;
+  late.contextTimeoutMs = 10;
+  late.finished = finished;
+  const slow = new Timed('slow-source', 'IN TIME', 'slow');
+  slow.delayMs = 400;
+  slow.finished = finished;
+  slow.contextTimeoutMs = 5_000;
+  const x = await make({ modules: [late, slow] });
+  const errors: string[] = [];
+  const original = console.error;
+  console.error = (...args: unknown[]) => { errors.push(args.map(String).join(' ')); };
+  let gathered: ModuleContextInjection[];
+  try {
+    gathered = await registryOf(x).gatherContext('prime');
+  } finally {
+    console.error = original;
+  }
+  assert.ok(errors.some((e) => e.includes('late-source') && e.includes('timed out')), errors.join('\n'));
+  assert.deepEqual(finished, ['late-source', 'slow-source'], 'the premise: the late module answered while the slow one was still gathering');
+  assert.deepEqual(gathered.map((i) => i.namespace), ['slow'], 'the late answer added nothing');
+});
+
+test("a module whose gatherContext throws, answers with something that isn't an array, or holds an entry that can't be read, is skipped, and the others' injections are kept", async () => {
+  const one = { namespace: 'object', position: 'afterUser', content: [text('NOT AN ARRAY')] };
+  const answers: Array<[string, () => unknown]> = [
+    ['throws-source', () => { throw new Error('thrown before any promise'); }],
+    ['rejects-source', async () => { throw new Error('rejected'); }],
+    ['sync-undefined-source', () => undefined],
+    ['undefined-source', async () => undefined],
+    ['null-source', async () => null],
+    ['object-source', async () => one],
+    ['string-source', async () => 'oops'],
+    ['set-source', async () => new Set([one])],
+    ['null-entry-source', async () => [one, null]],
+    ['string-entry-source', async () => [one, 'x']],
+    ['contentless-system-source', async () => [one, { namespace: 'sys', position: 'system' }]],
+  ];
+  const modules: Module[] = answers.map(([name, gather]) => ({
+    name, async start() {}, async stop() {}, getTools: () => [],
+    async handleToolCall() { return { success: false, isError: true, error: 'no tools' }; },
+    async onProcess() { return {}; },
+    gatherContext: gather as Module['gatherContext'],
+  }));
+  const x = await make({ modules: [...modules, new Timed('kept-source', 'KEPT', 'kept')] });
+  const errors: string[] = [];
+  const original = console.error;
+  console.error = (...args: unknown[]) => { errors.push(args.map(String).join(' ')); };
+  let gathered: ModuleContextInjection[];
+  try {
+    gathered = await registryOf(x).gatherContext('prime');
+  } finally {
+    console.error = original;
+  }
+  assert.deepEqual(gathered.map((i) => i.namespace), ['kept']);
+  for (const [name] of answers) assert.ok(errors.some((e) => e.includes(name)), `${name} is logged: ${errors.join('\n')}`);
+});
+
+test("a window that can't be read when a start sets its point is stored into, with nothing recorded to skip it, and the start goes on", async () => {
+  const x = await make();
+  const agent = x.framework.getAgent('prime')!;
+  agent.getContextManager().addMessage('user', [text('hello')]);
+  await sent(agent);
+  const cm = agent.getContextManager();
+  const getMessageWindow = cm.getMessageWindow.bind(cm);
+  const errors: string[] = [];
+  const original = console.error;
+  console.error = (...args: unknown[]) => { errors.push(args.map(String).join(' ')); };
+  cm.getMessageWindow = (() => { throw new Error('unreadable'); }) as typeof cm.getMessageWindow;
+  try {
+    assert.equal(internals(x.framework).storeInjections(agent, [injection('CHANGED')]), undefined, 'stored, not placed');
+  } finally {
+    cm.getMessageWindow = getMessageWindow;
+    console.error = original;
+  }
+  assert.deepEqual(storedInjections(agent).map(textOf), ['CHANGED']);
+  assert.ok(errors.some((e) => e.includes('could not read its window for copies stored since its last request')), errors.join('\n'));
+});
+
+test("a window that can't be read leaves the last request's record to decide: the same content it held whole isn't stored again", async () => {
+  const x = await make();
+  const agent = x.framework.getAgent('prime')!;
+  const cm = agent.getContextManager();
+  cm.addMessage('user', [text('hello')]);
+  assert.equal(internals(x.framework).storeInjections(agent, [injection('HELD')]), undefined);
+  await sent(agent);
+  const getMessageWindow = cm.getMessageWindow.bind(cm);
+  const original = console.error;
+  console.error = () => {};
+  cm.getMessageWindow = (() => { throw new Error('unreadable'); }) as typeof cm.getMessageWindow;
+  try {
+    assert.equal(internals(x.framework).storeInjections(agent, [injection('HELD')]), undefined);
+  } finally {
+    cm.getMessageWindow = getMessageWindow;
+    console.error = original;
+  }
+  assert.deepEqual(storedInjections(agent).map(textOf), ['HELD'], 'the record says it was held whole');
+});
+
+test("a read that fails partway leaves the newest copy it found to decide", async () => {
+  const x = await make();
+  const agent = x.framework.getAgent('prime')!;
+  const cm = agent.getContextManager();
+  cm.addMessage('user', [text('hello')]);
+  assert.equal(internals(x.framework).storeInjections(agent, [injection('A')]), undefined);
+  await sent(agent);
+  assert.equal(internals(x.framework).storeInjections(agent, [injection('C')]), undefined);
+  for (let i = 0; i < 100; i++) cm.addMessage('user', [text(`row ${i}`)]);
+  assert.equal(internals(x.framework).storeInjections(agent, [injection('D')]), undefined);
+  assert.deepEqual(storedInjections(agent).map(textOf), ['A', 'C', 'D'], 'the premise: C and D stored, neither sent, 100 rows apart');
+  const getMessageWindow = cm.getMessageWindow.bind(cm);
+  let reads = 0;
+  const errors: string[] = [];
+  const original = console.error;
+  console.error = (...args: unknown[]) => { errors.push(args.map(String).join(' ')); };
+  cm.getMessageWindow = ((...args: Parameters<typeof getMessageWindow>) => {
+    if (++reads === 2) throw new Error('unreadable');
+    return getMessageWindow(...args);
+  }) as typeof cm.getMessageWindow;
+  try {
+    assert.equal(internals(x.framework).storeInjections(agent, [injection('A')]), undefined);
+  } finally {
+    cm.getMessageWindow = getMessageWindow;
+    console.error = original;
+  }
+  assert.equal(reads, 2, 'the premise: the first read of 64 rows held D, and the second failed');
+  assert.deepEqual(storedInjections(agent).map(textOf), ['A', 'C', 'D', 'A'], "D, not the record's A, is newest, so A is stored again");
+  assert.ok(errors.some((e) => e.includes('the rows it read decide')), errors.join('\n'));
+});
+
+test("content that changed back while a start's compile failed is stored again: the copy that failed is newer than what the last request held", async () => {
+  const lessons = new Lessons();
+  lessons.lesson = 'FIRST';
+  const x = await make({ modules: [lessons], errorPolicy: { maxRetries: 0, onInferenceError: () => ({ retry: false }) } });
+  const agent = x.framework.getAgent('prime')!;
+  await turn(x, 'hello');
+  lessons.lesson = 'SECOND';
+  const cm = agent.getContextManager();
+  const compile = cm.compile.bind(cm);
+  let failures = 1;
+  cm.compile = (async (...args: Parameters<typeof compile>) => {
+    if (failures-- > 0) throw new Error('the compile failed');
+    return compile(...args);
+  }) as typeof cm.compile;
+  const errors: string[] = [];
+  const original = console.error;
+  console.error = (...args: unknown[]) => { errors.push(args.map(String).join(' ')); };
+  try {
+    internals(x.framework).pendingRequests.push({ agentName: 'prime', reason: 'timer', source: 'framework', timestamp: Date.now() });
+    await x.framework.runUntilIdle();
+  } finally {
+    console.error = original;
+  }
+  assert.equal(failures, 0, 'the premise: that start failed, with no retry');
+  assert.deepEqual(storedInjections(agent).map(textOf), ['FIRST', 'SECOND'], 'the premise: its copy is stored');
+  lessons.lesson = 'FIRST';
+  await turn(x, 'again');
+  assert.deepEqual(storedInjections(agent).map(textOf), ['FIRST', 'SECOND', 'FIRST'], 'the content the agent has now is newest');
+  const request = x.membrane.calls.at(-1)!.messages.map(textOf);
+  assert.ok(request.lastIndexOf('FIRST') > request.lastIndexOf('SECOND'), request.join(' | '));
+});
+
+test("a restart between a start whose compile threw and the next sent compile stores the source's content once more, newest, as after any restart", async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'af-stored-injections-')); dirs.push(dir);
+  const lessons = new Lessons();
+  lessons.lesson = 'FIRST';
+  const first = await make({ modules: [lessons], dir, errorPolicy: { maxRetries: 0, onInferenceError: () => ({ retry: false }) } });
+  await turn(first, 'one');
+  lessons.lesson = 'SECOND';
+  const cm = first.framework.getAgent('prime')!.getContextManager();
+  cm.compile = (async () => { throw new Error('the compile failed'); }) as typeof cm.compile;
+  const original = console.error;
+  console.error = () => {};
+  try {
+    internals(first.framework).pendingRequests.push({ agentName: 'prime', reason: 'timer', source: 'framework', timestamp: Date.now() });
+    await first.framework.runUntilIdle();
+  } finally {
+    console.error = original;
+  }
+  assert.deepEqual(storedInjections(first.framework.getAgent('prime')!).map(textOf), ['FIRST', 'SECOND'], 'the premise: the failed start stored its copy');
+  await first.framework.stop();
+  frameworks.splice(frameworks.indexOf(first.framework), 1);
+  const back = new Lessons();
+  back.lesson = 'FIRST';
+  const second = await make({ modules: [back], dir });
+  await turn(second, 'two');
+  const agent = second.framework.getAgent('prime')!;
+  assert.deepEqual(storedInjections(agent).map(textOf), ['FIRST', 'SECOND', 'FIRST'], 'stored once more after the restart');
+  const request = second.membrane.calls.at(-1)!.messages.map(textOf);
+  assert.ok(request.lastIndexOf('FIRST') > request.lastIndexOf('SECOND'), request.join(' | '));
+});
+
+test("a retry stores again a unit whose failed attempt stored only some of its parts", async () => {
+  const x = await make();
+  const agent = x.framework.getAgent('prime')!;
+  const cm = agent.getContextManager();
+  cm.addMessage('user', [text('hello')]);
+  await sent(agent);
+  const unit = (): ContextInjection[] => [injection('PART A'), injection('PART B')];
+  const original = cm.addMessage.bind(cm);
+  let writes = 0;
+  const consoleError = console.error;
+  console.error = () => {};
+  try {
+    (cm as unknown as { addMessage: unknown }).addMessage = (...args: Parameters<typeof original>) => {
+      if (++writes === 2) throw new Error('refused before landing');
+      return original(...args);
+    };
+    internals(x.framework).storeInjections(agent, unit());
+  } finally {
+    (cm as unknown as { addMessage: unknown }).addMessage = original;
+    console.error = consoleError;
+  }
+  assert.deepEqual(storedInjections(agent).map(textOf), ['PART A'], 'the premise: the attempt stored one part, and no compile followed');
+  assert.equal(internals(x.framework).storeInjections(agent, unit()), undefined);
+  assert.deepEqual(storedInjections(agent).map(textOf), ['PART A', 'PART A', 'PART B'], 'stored whole');
+});
+
+test("a failed attempt's copy decides only for its own namespace and its own agent", async () => {
+  const x = await make({ agents: ['prime', 'other'] });
+  const prime = x.framework.getAgent('prime')!;
+  const other = x.framework.getAgent('other')!;
+  prime.getContextManager().addMessage('user', [text('hello')]);
+  await sent(prime);
+  await sent(other);
+  const both = () => [injection('X', 'lessons'), injection('Y', 'notes')];
+  assert.equal(internals(x.framework).storeInjections(prime, both()), undefined);
+  assert.equal(internals(x.framework).storeInjections(other, [injection('Z', 'lessons')]), undefined);
+  assert.deepEqual(storedInjections(prime).map(textOf), ['X', 'Y', 'Z'], "the premise: stored in the residents' one slot, with no compile after");
+  assert.equal(internals(x.framework).storeInjections(prime, both()), undefined);
+  assert.deepEqual(storedInjections(prime).map(textOf), ['X', 'Y', 'Z'], "prime's retry finds its own copies, past the other namespace's and the other resident's newer ones");
+});
+
+test("a failed attempt's copy doesn't decide on another branch: the store there is one more row, as any branch change is", async () => {
+  const x = await make();
+  const agent = x.framework.getAgent('prime')!;
+  agent.getContextManager().addMessage('user', [text('hello')]);
+  await sent(agent);
+  assert.equal(internals(x.framework).storeInjections(agent, [injection()]), undefined);
+  assert.equal(storedInjections(agent).length, 1, 'the premise: stored, with no compile after');
+  await agent.getContextManager().fork('elsewhere');
+  assert.equal(internals(x.framework).storeInjections(agent, [injection()]), undefined);
+  assert.equal(storedInjections(agent).length, 2, 'once more on the new branch');
+  assert.equal(internals(x.framework).storeInjections(agent, [injection()]), undefined);
+  assert.equal(storedInjections(agent).length, 2, "then its retry finds that branch's copy");
+});
+
+test("a failed attempt's copy is found however many rows came after it", async () => {
+  const x = await make();
+  const agent = x.framework.getAgent('prime')!;
+  const cm = agent.getContextManager();
+  cm.addMessage('user', [text('hello')]);
+  await sent(agent);
+  assert.equal(internals(x.framework).storeInjections(agent, [injection()]), undefined);
+  for (let i = 0; i < 150; i++) cm.addMessage('user', [text(`row ${i}`)]);
+  assert.equal(internals(x.framework).storeInjections(agent, [injection()]), undefined);
+  assert.equal(storedInjections(agent).length, 1, 'found 150 rows back, past two reads of 64');
+});
+
+test("rows from before the last sent request don't count as unsent: a copy that request didn't hold whole is stored again, though another namespace's plan set the point first", async () => {
+  const x = await make();
+  const agent = x.framework.getAgent('prime')!;
+  agent.getContextManager().addMessage('user', [text('hello')]);
+  assert.equal(internals(x.framework).storeInjections(agent, [injection('X')]), undefined);
+  const [row] = storedInjections(agent);
+  noteHeld(agent, [[{ id: row!.id, sequence: row!.sequence }, { complete: false, missing: ['shards'] }]]);
+  assert.equal(internals(x.framework).storeInjections(agent, [injection('Y', 'notes'), injection('X')]), undefined);
+  assert.deepEqual(storedInjections(agent).map(textOf), ['X', 'Y', 'X'], 'the copy the request held in part is stored again');
+});
+
+test("the newest of several failed attempts' contents decides, and only its own parts are pooled", async () => {
+  const x = await make();
+  const agent = x.framework.getAgent('prime')!;
+  const cm = agent.getContextManager();
+  cm.addMessage('user', [text('hello')]);
+  await sent(agent);
+  const unit = (t: string): ContextInjection[] => [injection(`${t}1`), injection(`${t}2`)];
+  assert.equal(internals(x.framework).storeInjections(agent, unit('B')), undefined);
+  const original = cm.addMessage.bind(cm);
+  let writes = 0;
+  const consoleError = console.error;
+  console.error = () => {};
+  try {
+    (cm as unknown as { addMessage: unknown }).addMessage = (...args: Parameters<typeof original>) => {
+      if (++writes === 2) throw new Error('refused before landing');
+      return original(...args);
+    };
+    internals(x.framework).storeInjections(agent, unit('C'));
+  } finally {
+    (cm as unknown as { addMessage: unknown }).addMessage = original;
+    console.error = consoleError;
+  }
+  assert.deepEqual(storedInjections(agent).map(textOf), ['B1', 'B2', 'C1'], "the premise: B whole, then C's first part alone");
+  assert.equal(internals(x.framework).storeInjections(agent, unit('C')), undefined);
+  assert.deepEqual(storedInjections(agent).map(textOf), ['B1', 'B2', 'C1', 'C1', 'C2'], "C is stored whole: B's parts don't make it whole");
+  assert.equal(internals(x.framework).storeInjections(agent, unit('B')), undefined);
+  assert.deepEqual(storedInjections(agent).map(textOf), ['B1', 'B2', 'C1', 'C1', 'C2', 'B1', 'B2'], 'the newest unsent content is C, so B is stored again');
+});
+
+test("a start or preview on another branch doesn't move this branch's point past a copy no request has had", async () => {
+  const x = await make();
+  const agent = x.framework.getAgent('prime')!;
+  const cm = agent.getContextManager();
+  cm.addMessage('user', [text('hello')]);
+  assert.equal(internals(x.framework).storeInjections(agent, [injection('A')]), undefined);
+  await sent(agent);
+  assert.equal(internals(x.framework).storeInjections(agent, [injection('B')]), undefined);
+  const home = cm.currentBranch().name;
+  await cm.fork('elsewhere');
+  internals(x.framework).planInjectionStores(agent, [injection('C')]);
+  await cm.switchBranch(home);
+  assert.deepEqual(storedInjections(agent).map(textOf), ['A', 'B'], 'the premise: back home, B stored and never sent');
+  assert.equal(internals(x.framework).storeInjections(agent, [injection('A')]), undefined);
+  assert.deepEqual(storedInjections(agent).map(textOf), ['A', 'B', 'A'], "the source's A is newest again");
+});
+
+test("a start that stored a whole unit of several parts and recorded no compile, as when its compile throws, has it found whole by the next plan", async () => {
+  const x = await make();
+  const agent = x.framework.getAgent('prime')!;
+  agent.getContextManager().addMessage('user', [text('hello')]);
+  await sent(agent);
+  const unit = (): ContextInjection[] => [injection('PART A'), injection('PART B')];
+  assert.equal(internals(x.framework).storeInjections(agent, unit()), undefined);
+  assert.equal(internals(x.framework).storeInjections(agent, unit()), undefined);
+  assert.deepEqual(storedInjections(agent).map(textOf), ['PART A', 'PART B'], 'found whole, not stored again');
+});
+
+test("a sent compile on another branch leaves this branch's point, so its unsent copy still counts on return", async () => {
+  const x = await make();
+  const agent = x.framework.getAgent('prime')!;
+  const cm = agent.getContextManager();
+  cm.addMessage('user', [text('hello')]);
+  assert.equal(internals(x.framework).storeInjections(agent, [injection('A')]), undefined);
+  await sent(agent);
+  assert.equal(internals(x.framework).storeInjections(agent, [injection('B')]), undefined);
+  const home = cm.currentBranch().name;
+  await cm.fork('elsewhere');
+  await sent(agent);
+  await cm.switchBranch(home);
+  assert.equal(internals(x.framework).storeInjections(agent, [injection('B')]), undefined);
+  assert.deepEqual(storedInjections(agent).map(textOf), ['A', 'B'], "home's unsent B still counts: not stored again");
+});
+
+test("a compile with no provenance unsets every branch's point, since its branch isn't known", async () => {
+  const x = await make();
+  const agent = x.framework.getAgent('prime')!;
+  const cm = agent.getContextManager();
+  cm.addMessage('user', [text('hello')]);
+  await sent(agent);
+  assert.equal(internals(x.framework).storeInjections(agent, [injection('B')]), undefined);
+  const home = cm.currentBranch().name;
+  await cm.fork('elsewhere');
+  assert.equal(internals(x.framework).storeInjections(agent, [injection('C')]), undefined);
+  (agent as unknown as { noteRenderedInjections(result: unknown): void }).noteRenderedInjections({ messages: [] });
+  assert.equal(internals(x.framework).storeInjections(agent, [injection('C')]), undefined);
+  assert.deepEqual(storedInjections(agent).map(textOf), ['B', 'C', 'C'], 'here, its rows count as sent, and with no record, C is stored once more');
+  await cm.switchBranch(home);
+  assert.equal(internals(x.framework).storeInjections(agent, [injection('B')]), undefined);
+  assert.deepEqual(storedInjections(agent).map(textOf), ['B', 'B'], 'and back home, so is B');
+});
+
+test("a sent compile unsets the point of the branch it read, not the one current when it's recorded", async () => {
+  const x = await make();
+  const agent = x.framework.getAgent('prime')!;
+  const cm = agent.getContextManager();
+  cm.addMessage('user', [text('hello')]);
+  await sent(agent);
+  const homeRef = cm.currentBranchRef();
+  assert.equal(internals(x.framework).storeInjections(agent, [injection('B')]), undefined);
+  await cm.fork('elsewhere');
+  assert.equal(internals(x.framework).storeInjections(agent, [injection('C')]), undefined);
+  (agent as unknown as { noteRenderedInjections(result: unknown): void }).noteRenderedInjections({
+    messages: [], provenance: { messages: [], branch: homeRef },
+  });
+  assert.equal(internals(x.framework).storeInjections(agent, [injection('C')]), undefined);
+  assert.deepEqual(storedInjections(agent).map(textOf), ['B', 'C'], "this branch's unsent C still counts");
+  await cm.switchBranch(homeRef.name);
+  assert.equal(internals(x.framework).storeInjections(agent, [injection('B')]), undefined);
+  assert.deepEqual(storedInjections(agent).map(textOf), ['B', 'B'], "and home's point went, so its B counts as sent, and with nothing recorded as held, B is stored once more");
+});
+
+test("an answer the module changes after giving it, while another module is still gathering, is gathered as it was given", async () => {
+  const given: ModuleContextInjection[] = [{ namespace: 'given', position: 'afterUser', content: [text('AS GIVEN')] }];
+  const changes: Module = {
+    name: 'changes-source', async start() {}, async stop() {}, getTools: () => [],
+    async handleToolCall() { return { success: false, isError: true, error: 'no tools' }; },
+    async onProcess() { return {}; },
+    async gatherContext() {
+      setTimeout(() => given.push({ namespace: 'added', position: 'afterUser', content: [text('ADDED LATER')] }), 10);
+      return given;
+    },
+  };
+  const slow = new Timed('slow-source', 'SLOW', 'slow');
+  slow.delayMs = 60;
+  const x = await make({ modules: [changes, slow] });
+  const gathered = await registryOf(x).gatherContext('prime');
+  assert.equal(given.length, 2, 'the premise: the module changed its answer before the gather returned');
+  assert.deepEqual(gathered.map((i) => i.namespace), ['given', 'slow']);
+});
+
+test("each module's budget starts once its call returns, after its own synchronous work and earlier modules'", async () => {
+  const busy: Module = {
+    name: 'busy-source', async start() {}, async stop() {}, getTools: () => [],
+    async handleToolCall() { return { success: false, isError: true, error: 'no tools' }; },
+    async onProcess() { return {}; },
+    contextTimeoutMs: 200,
+    gatherContext() {
+      const until = Date.now() + 400;
+      while (Date.now() < until) { /* synchronous work */ }
+      return new Promise((resolve) => setTimeout(() => resolve([{ namespace: 'busy', position: 'afterUser', content: [text('BUSY')] } as ModuleContextInjection]), 1));
+    },
+  };
+  const quick = new Timed('quick-source', 'QUICK', 'quick');
+  quick.delayMs = 1;
+  quick.contextTimeoutMs = 200;
+  const x = await make({ modules: [busy, quick] });
+  const gathered = await registryOf(x).gatherContext('prime');
+  assert.deepEqual(gathered.map((i) => i.namespace), ['busy', 'quick'], "the busy module's 400 ms spent neither its own 200 ms nor the quick one's");
+});
+
+test("a sharded copy a failed start stored is found whole by the next plan", async () => {
+  const x = await make({ strategy: new AutobiographicalStrategy({ adaptiveResolution: true, targetChunkTokens: 50 }) });
+  const agent = x.framework.getAgent('prime')!;
+  agent.getContextManager().addMessage('user', [text('hello')]);
+  await sent(agent);
+  const long = Array.from({ length: 400 }, (_, i) => `word${i}`).join(' ');
+  assert.equal(internals(x.framework).storeInjections(agent, [injection(long)]), undefined);
+  const rows = agent.getContextManager().getAllMessages().filter((m) => (m.metadata as { contextInjection?: unknown } | undefined)?.contextInjection !== undefined);
+  assert.ok(rows.length > 1, `the premise: stored as ${rows.length} shards`);
+  assert.equal(internals(x.framework).storeInjections(agent, [injection(long)]), undefined);
+  assert.equal(storedInjections(agent).length, rows.length, 'found whole, not stored again');
+});
+
+test("in a window with no rows, a failed start's copy is found by the next plan", async () => {
+  const x = await make();
+  const agent = x.framework.getAgent('prime')!;
+  assert.equal(agent.getContextManager().getMessageCount(), 0, 'the premise: an empty window');
+  assert.equal(internals(x.framework).storeInjections(agent, [injection()]), undefined);
+  assert.equal(internals(x.framework).storeInjections(agent, [injection()]), undefined);
+  assert.equal(storedInjections(agent).length, 1, 'found, not stored again');
+});
+
+test("a read that fails before it finds any copy leaves the last request's record to decide", async () => {
+  const x = await make();
+  const agent = x.framework.getAgent('prime')!;
+  const cm = agent.getContextManager();
+  cm.addMessage('user', [text('hello')]);
+  assert.equal(internals(x.framework).storeInjections(agent, [injection('HELD', 'notes')]), undefined);
+  await sent(agent);
+  assert.equal(internals(x.framework).storeInjections(agent, [injection('X')]), undefined);
+  const getMessageWindow = cm.getMessageWindow.bind(cm);
+  const errors: string[] = [];
+  const original = console.error;
+  console.error = (...args: unknown[]) => { errors.push(args.map(String).join(' ')); };
+  cm.getMessageWindow = (() => { throw new Error('unreadable'); }) as typeof cm.getMessageWindow;
+  try {
+    assert.equal(internals(x.framework).storeInjections(agent, [injection('HELD', 'notes')]), undefined);
+  } finally {
+    cm.getMessageWindow = getMessageWindow;
+    console.error = original;
+  }
+  assert.deepEqual(storedInjections(agent).map(textOf), ['HELD', 'X'], 'the record says HELD was held whole');
+  assert.ok(errors.some((e) => e.includes("that request's record decides")), errors.join('\n'));
+});
+
+test("a module skipped between two that finish out of order leaves the others in registration order", async () => {
+  const first = new Timed('first-source', 'FIRST', 'first');
+  const last = new Timed('last-source', 'LAST', 'last');
+  first.waitFor = () => last.whenFinished();
+  const skipped: Module = {
+    name: 'skipped-source', async start() {}, async stop() {}, getTools: () => [],
+    async handleToolCall() { return { success: false, isError: true, error: 'no tools' }; },
+    async onProcess() { return {}; },
+    async gatherContext() { throw new Error('rejected'); },
+  };
+  const x = await make({ modules: [first, skipped, last] });
+  const original = console.error;
+  console.error = () => {};
+  let gathered: ModuleContextInjection[];
+  try {
+    gathered = await registryOf(x).gatherContext('prime');
+  } finally {
+    console.error = original;
+  }
+  assert.deepEqual(gathered.map((i) => i.namespace), ['first', 'last']);
 });

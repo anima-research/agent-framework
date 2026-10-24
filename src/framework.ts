@@ -16435,14 +16435,20 @@ export class AgentFramework {
    * Which of `injections` a start stores in `agent`'s window, and which it
    * leaves for `compile()`. Each source's stored kind (isStoredKind), by
    * namespace, is one unit. A unit is skipped, neither stored nor placed,
-   * when the last request this agent compiled to send held every part of the
-   * newest stored unit of that namespace in it, with the same content
-   * (Agent.renderedInjection): it's in view where the agent saw it, and
-   * placing it again would move it. A part the strategy cut at its
+   * when the copy the agent will read as that namespace's current one has
+   * every part of it with the same content: the newest copy this agent
+   * stored since its last request compiled to send, where a start stored one
+   * and its compile then didn't record, as when it threw
+   * (Agent.unsentInjection), and otherwise the
+   * newest stored unit of that namespace the last request held
+   * (Agent.renderedInjection). It's where the agent saw it, or will see it
+   * at this compile, and placing it again would move it; a fold or scroll-out
+   * since costs one request, as below. A part the strategy cut at its
    * per-message cap, or stripped an image from, counts as held, since a new
    * copy would meet the same. One a fold has summarized, a strategy's window
    * has scrolled past, a throwing write left part-stored, or that no request
-   * since this agent started has held, is stored again at the next start,
+   * since this agent started has held (and no failed start since has
+   * stored), is stored again at the next start,
    * so the agent has the current copy at the cost of one more row: a fold
    * between two starts leaves the request after it with the summary's word,
    * and the start after that stores it again. The rows to store come in the order gathered,
@@ -16471,8 +16477,14 @@ export class AgentFramework {
     const marks = new Map<number, StoredInjectionMark>();
     for (const [namespace, unit] of units) {
       const contentHash = unitHash(unit);
-      const shown = agent.renderedInjection(namespace);
-      if (shown?.whole && shown.contentHash === contentHash) continue;
+      // A copy a start stored whose compile then didn't record (it threw, or
+      // the start failed before it) is newer than what the last request
+      // held, and no request has sent it yet, so it decides: a retry of that
+      // start (an error policy's) doesn't store it again, one more copy at
+      // each attempt, and content that changed back while a compile failed
+      // is stored again rather than left older than it.
+      const newest = agent.unsentInjection(namespace) ?? agent.renderedInjection(namespace);
+      if (newest?.whole && newest.contentHash === contentHash) continue;
       unit.forEach((row, part) => marks.set(row.at, { agent: agent.name, namespace, contentHash, part, parts: unit.length }));
     }
     return {
@@ -18813,11 +18825,12 @@ export class AgentFramework {
         }
       }
 
-      // Each afterUser injection the agent's last request didn't hold is
-      // appended to its window, so it stays where it's first seen
-      // (stored-injections.ts); one the last request held is left out, and
-      // the rest go to compile(), as do those it would store while the
-      // window is held.
+      // Each afterUser injection is appended to the agent's window, so it
+      // stays where it's first seen (stored-injections.ts), unless the copy
+      // the agent will read as current already has its content whole (what its
+      // last request held, or a newer copy a start stored whose compile then
+      // didn't record), when it's left out; the rest go to compile(), as do those
+      // it would store while the window is held.
       injections = this.storeInjections(agent, injections);
 
       const {

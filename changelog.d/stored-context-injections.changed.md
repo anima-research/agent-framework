@@ -12,15 +12,22 @@
   injection once, so that request's cached prefix ends where the injection
   used to be placed.
   - **What's stored again:** a source's unchanged content isn't stored again
-    while the agent's last request held it whole. An injection that would
+    while the copy the agent will read as current has it whole: the one its
+    last request held, or a newer one a start stored whose compile then
+    didn't record (it threw, or the start failed before it). An injection that would
     leave nothing in a request (no block but blank text) isn't stored, and
     is placed as before. Changed content is appended then (see where it
     lands, below), and the earlier copy stays, so each change adds a row
-    until a fold summarizes it. A copy a fold has
-    summarized, or a strategy's window has passed, is stored again, as one
-    more row, at the start after the first request that no longer holds
-    it, so that one request has the summary's word for it. So is one after
-    the host restarts or the window changes branch. A copy the strategy cut
+    until a fold summarizes it. A copy a fold has summarized, or a
+    strategy's window has passed, is stored again, as one more row, at the
+    start after the first request that no longer holds it, so that one
+    request has the summary's word for it, or, past the window, goes
+    without it. So is one after the host restarts or the window changes
+    branch. A copy a start stored whose compile then threw isn't stored
+    again by an error policy's retry of that start, since no request has
+    had it yet, and content that changed back while a compile failed is
+    stored again (where the window can't be read then, one request later).
+    A copy the strategy cut
     at its per-message cap counts as held, since a new one would be cut the
     same. A copy whose source stops giving it stays in the window until a
     fold, where before it was gone at once.

@@ -9,8 +9,11 @@
  * it, every reply after the old place loses its thinking. A moved injection
  * also rewrites the previous turn's cached prefix. So at each start that
  * sends, the framework appends each `afterUser` injection to the agent's own
- * window, as the message `compile()` would have placed, unless the agent's
- * last request held it with the same content, and the compile then renders
+ * window, as the message `compile()` would have placed, unless the copy the
+ * agent will read as current (the one its last request held, or a newer one
+ * a start stored whose compile then didn't record) has the same content,
+ * every part of it, and the compile
+ * then renders
  * it from the store like any message, where it stays. While the window is
  * held (AgentFramework's slotHeldFrom), `compile()` places it instead. Being a
  * message, it's history to the strategy: capped by its per-message bound,

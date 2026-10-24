@@ -32,9 +32,11 @@ export interface MessageQuery {
  * `compile()` would have placed after the last user message, where it then
  * stays: so the replies after it keep their thinking, and the cache keeps the
  * turns before it. The same source's unchanged content isn't stored again
- * while the agent's last request held it whole; once a fold has summarized
- * it or a strategy's window has scrolled past it, it's stored again, as one
- * more row. (See stored-injections.ts.)
+ * while the copy the agent will read as current has it whole: the one its
+ * last request held, or a newer one a start stored whose compile then
+ * didn't record. Once a fold has summarized it or a strategy's window has
+ * scrolled past it, it's stored again, as one more row. (See
+ * stored-injections.ts.)
  *
  * `placedEachCompile: true` opts out: `compile()` places the injection after
  * the last user message at each start, near the end, as before it was
@@ -181,8 +183,10 @@ export interface Module {
    * that should be injected into the compiled context.
    * Complementary to MCPL push-based hooks — modules pull via gatherContext.
    * An `afterUser` injection is appended to the agent's window, where it
-   * then stays, unless the agent's last request held it with the same
-   * content or it opts out (ModuleContextInjection.placedEachCompile). At a
+   * then stays, unless the copy the agent will read as current has the same
+   * content, every part of it (the one its last request held, or a newer
+   * one a start stored whose compile then didn't record), or it opts out
+   * (ModuleContextInjection.placedEachCompile). At a
    * turn's start or a restart after tool results, that's where `compile()`
    * would have placed it.
    * Adapted from Anarchid/agent-framework@mcpl-module-proto.

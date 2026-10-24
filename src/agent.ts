@@ -221,6 +221,11 @@ export function resolveAutoContinue(config: AgentConfig): { maxConsecutive: numb
   return { maxConsecutive: max };
 }
 
+/** A branch's key in Agent.unsentSince: its id and when it was created. */
+function branchKey(branch: { readonly id: string; readonly created: number }): string {
+  return `${branch.id}\u0000${branch.created}`;
+}
+
 /**
  * An agent wraps a context manager and manages inference state.
  */
@@ -1235,6 +1240,75 @@ export class Agent {
     byNamespace: Map<string, Map<string, { parts: number; held: Set<number>; sequence: number }>>;
   };
 
+  /**
+   * Per branch (by id and created), the point a stored injection on it has
+   * to come after to have been in no request yet (unsentInjection): the
+   * newest row of this agent's window on that branch when the first plan
+   * there since its last compile built to send (a start's, or a preview's,
+   * which stores nothing) asked about a unit, before that plan's start
+   * stored anything. Each compile built to send that records what it
+   * held unsets its branch's, a restart unsets them all, and a plan asks
+   * here before it stores a unit, so every one of this agent's stored
+   * injections on a branch after its point was stored since that compile.
+   * Kept per branch, so a start or preview on another branch doesn't move
+   * this one's past a copy no request has had.
+   */
+  private readonly unsentSince = new Map<string, number>();
+
+  /**
+   * The newest content of `namespace` among this agent's rows stored since
+   * its last compile built to send (unsentSince), and whether every part of
+   * it is among them: rows a start stored whose compile then didn't record
+   * (it threw, or the start failed before it), which no request has had
+   * yet, and which are newer than anything renderedInjection knows. Undefined when there are none, as at every
+   * start whose last compile was built and recorded. A fold between that
+   * start and the next (a host's own committing compile, or the compression
+   * an over-budget retry waits for) can summarize them all the same: the
+   * next request then has the summary's word for them, and the start after
+   * it stores them again, as after any fold. The window is read back 64
+   * rows at a time from the newest, stopping at that point.
+   */
+  unsentInjection(namespace: string): { contentHash: string; whole: boolean } | undefined {
+    let newest: { contentHash: string; parts: number; held: Set<number> } | undefined;
+    try {
+      const branch = branchKey(this.contextManager.currentBranchRef());
+      const since = this.unsentSince.get(branch);
+      if (since === undefined) {
+        const count = this.contextManager.getMessageCount();
+        const top = count > 0 ? this.contextManager.getMessageWindow(count - 1, 1, { resolveBlobs: false }).messages[0]?.sequence ?? 0 : 0;
+        this.unsentSince.set(branch, top);
+        return undefined;
+      }
+      scan: for (let end = this.contextManager.getMessageCount(); end > 0;) {
+        const span = Math.min(end, 64);
+        const { messages } = this.contextManager.getMessageWindow(end - span, span, { resolveBlobs: false });
+        for (let i = messages.length - 1; i >= 0; i--) {
+          const row = messages[i]!;
+          if (row.sequence <= since) break scan;
+          const mark = storedInjectionMarkOf(row.metadata);
+          if (mark?.agent !== this.name || mark.namespace !== namespace) continue;
+          // Read from the newest back, the first copy met is the newest
+          // content; its other parts pool with it.
+          newest ??= { contentHash: mark.contentHash, parts: mark.parts, held: new Set() };
+          if (mark.contentHash === newest.contentHash) newest.held.add(mark.part);
+        }
+        end -= span;
+      }
+    } catch (err) {
+      // Where the rows read before the failure held a copy, the newest of
+      // them is still the newest content (any unread row is older), and a
+      // part it lacks may be unread, so it's stored again at worst. Where
+      // they held none, the last request's record decides, as it did before
+      // this check: a copy a failed start stored is then stored again, or,
+      // where the source has changed back to what that request held, left
+      // newest for one more request. Either way the start goes on, where
+      // failing here would lose its turn.
+      console.error(`[injection] ${this.name}: could not read its window for copies stored since its last request, so ${newest ? 'the rows it read decide' : "that request's record decides"}:`, err);
+      if (!newest) return undefined;
+    }
+    return newest && { contentHash: newest.contentHash, whole: newest.held.size === newest.parts };
+  }
+
   /** Record which of this agent's stored injections a compile built to send
    *  rendered. Another agent's stored rows never reach this agent's compile,
    *  since every compile of a shared store leaves them out by its view
@@ -1242,6 +1316,15 @@ export class Agent {
    *  that filter would mix them in here. */
   private noteRenderedInjections(result: CompileResult): void {
     const provenance = result.provenance;
+    // The rows stored before this compile on its branch have been compiled
+    // to send, whether the request held them or a fold or the strategy's
+    // window took them (the record below says which): the first plan there
+    // after it, a start's or a preview's, sets the point again
+    // (unsentInjection). Without provenance, which branch isn't known, so
+    // every branch's point goes, rather than one surviving a compile that
+    // held its rows.
+    if (provenance) this.unsentSince.delete(branchKey(provenance.branch));
+    else this.unsentSince.clear();
     if (!provenance) {
       this.renderedInjections = undefined;
       return;

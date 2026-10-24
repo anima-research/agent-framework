@@ -78,9 +78,13 @@ export interface SilentHeartbeatTick {
   serverId: string;
 }
 
-/** `metadata.silentHeartbeat` on every row a tick's turn writes. Residents
- * share one message slot, so the stamp names the agent whose turn wrote it
- * (tool_result rows are stored as `user`). */
+/** `metadata.silentHeartbeat` on the rows of a tick's own turn (its reply,
+ * tool results and their wrappers). What the framework stores of its own
+ * accord is left unstamped, a clock row (at the turn's start or a tool
+ * boundary) or a context injection, so a retention policy that drops a
+ * tick's rows keeps it. Residents share one message
+ * slot, so the stamp names the agent whose turn wrote it (tool_result rows
+ * are stored as `user`). */
 export interface SilentHeartbeatStamp extends SilentHeartbeatTick {
   agentName: string;
   /** The separator text the tick's request rendered, which later compiles
