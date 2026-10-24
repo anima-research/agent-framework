@@ -299,7 +299,7 @@ export function nonErrorResultText(
   let blocks: [HistoryBlockSpan[], ToolResultBlock[]] | undefined;
   const onBlocks = options?.onBlocks;
   try {
-    // Read inside the catch too: the direct Agent API's result is its
+    // Read inside the try too: the direct Agent API's result is its
     // caller's own object, whose `data` can be a getter.
     const data = result.data;
     if (data === undefined || data === null) {
