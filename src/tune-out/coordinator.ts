@@ -62,9 +62,27 @@ export interface ReaderInvocation {
   notice: string;
   /** Held messages not yet handed to any reader fork, oldest first. */
   backlog: StoredMessage[];
+  /**
+   * Held messages not yet handed to any reader fork that are still queued
+   * behind the resident's turn (admitted, not yet stored), oldest first.
+   * They come after `backlog` in arrival order. A reader is most useful
+   * while the resident is busy, which is exactly when its traffic is here
+   * rather than in the store.
+   */
+  queued: QueuedHeldMessage[];
   /** Standing dispositions, as text, or null when there are none. */
   dispositions: string | null;
 }
+
+/**
+ * A held message admitted for the resident but not yet in its store: it was
+ * deferred while a turn was alive. `writeId` is the deferred write's durable
+ * id, which the stored row carries as `metadata.deferredWriteId` once it
+ * lands.
+ */
+export type QueuedHeldMessage = Pick<StoredMessage, 'participant' | 'content' | 'metadata'> & {
+  writeId: string;
+};
 
 /**
  * The all-except scope (issue #232 §3.2; focus folded into tune-out): a
@@ -177,7 +195,7 @@ export interface TuneOutFrameworkHooks {
    * while a turn was alive), oldest first. A cancel reads them too, so a
    * message held mid-turn is in the backlog it belongs to (#232 gap 7).
    */
-  getDeferredMessages?: () => Array<Pick<StoredMessage, 'participant' | 'content' | 'metadata'>>;
+  getDeferredMessages?: () => Array<Pick<StoredMessage, 'participant' | 'content' | 'metadata'> & { writeId?: string }>;
   /**
    * Make what was just delivered durable, including anything the delivery
    * left in the deferred queue: a release flips durable epoch state, so its
@@ -244,6 +262,13 @@ export class TuneOutCoordinator {
    * the right side to err on.
    */
   private readerCursor = new Map<string, number>();
+  /**
+   * `reader: 'forks'`: the deferred writes handed to a reader fork while
+   * still queued, per channel key. Each lands in the store later as a row
+   * stamped with the same id (`metadata.deferredWriteId`), past the cursor;
+   * that row is not handed again. Cleared with the cursor.
+   */
+  private readerHandedWrites = new Map<string, Set<string>>();
   /** The all-except scope's durable record, cached (undefined = not read yet). */
   private scopeCache: AllExceptState | null | undefined;
   /** Timer key for the scope's cadence and expiry. */
@@ -678,21 +703,30 @@ export class TuneOutCoordinator {
         );
       }
       this.hooks.requestInference(subName, `tune-out cancelled: ${name}`, 'tune-out');
-    } else if (!subName && this.forkReader && !selfCancel) {
-      // Forks are the reader: one last fork for the epoch — whatever was held
-      // since the last look, plus the cancel notice; its report follows the
-      // dump. The fork is handed stored messages only: a deferred one has no
-      // sequence yet and will reach the store (view-filtered) on its own, so
-      // the notice counts what the dump left out and what was still held.
-      const truncNote = truncated > 0
-        ? ` ${truncated} of ${backlog.length} diverted messages, the oldest, weren't delivered raw to the resident.`
-        : '';
-      const heldNote = heldForReport.length > 0
-        ? ` ${heldForReport.length} message${heldForReport.length === 1 ? ' was' : 's were'} still held at the cancel and may not be in what you see.`
-        : '';
-      this.invokeReaderFork(serverId, channelId, epochId, 'cancel', `[Tune-out cancelled: ${name} — ${reason}.${truncNote}${heldNote}]`, this.hooks.getStoredMessages().filter(ofEpoch));
+    } else if (!subName && this.forkReader) {
+      // Forks are the reader: one last fork for the epoch, handed what no
+      // fork has been handed yet, stored or still queued behind the
+      // resident's turn, plus the cancel notice; its report follows the dump.
+      // Once the epoch ends, a message still queued lands in the store
+      // view-filtered, where nothing else reads it, so it goes to this fork
+      // now. On a reader's own cancel, the reader has read what it was
+      // handed, so a fork follows only when messages arrived after that.
+      const stored = this.hooks.getStoredMessages().filter(ofEpoch);
+      const queued = this.queuedHeld(ofEpoch);
+      const rest = this.unhandedBacklog(this.key(serverId, channelId), stored, queued);
+      const unread = rest.backlog.length + rest.queued.length;
+      if (!selfCancel || unread > 0) {
+        const truncNote = truncated > 0
+          ? ` ${truncated} of ${backlog.length} diverted messages, the oldest, weren't delivered raw to the resident.`
+          : '';
+        const lateNote = selfCancel
+          ? ` ${unread === 1 ? 'This message' : `These ${unread} messages`} arrived after the reader that cancelled was handed its own.`
+          : '';
+        this.invokeReaderFork(serverId, channelId, epochId, 'cancel', `[Tune-out cancelled: ${name} — ${reason}.${truncNote}${lateNote}]`, stored, queued);
+      }
     }
     this.readerCursor.delete(this.key(serverId, channelId));
+    this.readerHandedWrites.delete(this.key(serverId, channelId));
     this.hooks.emitTrace({ type: 'tune-out:cancelled', serverId, channelId, epochId, reason, wakeCount: ended.wakeCount });
     return { ok: true };
   }
@@ -958,28 +992,33 @@ export class TuneOutCoordinator {
     }
     const primary = this.hooks.primaryName();
     if (primary) this.hooks.requestInference(primary, `tune-out cancelled (${reason})`, 'tune-out');
-    if (source !== 'subconscious' && this.readerAvailable()) {
-      const notice = `[Tune-out cancelled: all channels except ${except.channelId} — ${reason}.]`;
-      if (subName) {
-        this.hooks.addMessage('user', [{ type: 'text', text: notice }], { system: true, kind: 'tune-out-cancel-report', scope: 'all-except' }, subName);
-        this.hooks.requestInference(subName, 'tune-out cancelled: all-except', 'tune-out');
-      } else if (this.forkReader) {
-        // One last look per channel the forks had not fully seen.
-        for (const [channelId, backlog] of byChannel) {
-          const serverId = (backlog[0]?.metadata as { serverId?: string } | undefined)?.serverId ?? '';
-          const stored = this.hooks.getStoredMessages().filter((m) => ofEpoch(m) && (m.metadata as { channelId?: string } | undefined)?.channelId === channelId);
-          const cursor = this.readerCursor.get(this.key(serverId, channelId)) ?? -1;
-          if (stored.some((m) => m.sequence > cursor)) {
-            this.invokeReaderFork(serverId, channelId, epochId, 'cancel', notice, stored);
-          }
+    const notice = `[Tune-out cancelled: all channels except ${except.channelId} — ${reason}.]`;
+    if (source !== 'subconscious' && subName) {
+      this.hooks.addMessage('user', [{ type: 'text', text: notice }], { system: true, kind: 'tune-out-cancel-report', scope: 'all-except' }, subName);
+      this.hooks.requestInference(subName, 'tune-out cancelled: all-except', 'tune-out');
+    } else if (!subName && this.forkReader) {
+      // One last look per channel with messages no fork was handed, stored or
+      // still queued behind the resident's turn. That holds for a reader's
+      // own release too: the reader that released read one channel's
+      // messages, and every other channel's would otherwise reach no reader.
+      for (const [channelId, backlog] of byChannel) {
+        const serverId = (backlog[0]?.metadata as { serverId?: string } | undefined)?.serverId ?? '';
+        const inChannel = (m: Pick<StoredMessage, 'metadata'>): boolean =>
+          ofEpoch(m) && (m.metadata as { channelId?: string } | undefined)?.channelId === channelId;
+        const stored = this.hooks.getStoredMessages().filter(inChannel);
+        const queued = this.queuedHeld(inChannel);
+        const rest = this.unhandedBacklog(this.key(serverId, channelId), stored, queued);
+        if (rest.backlog.length + rest.queued.length > 0) {
+          this.invokeReaderFork(serverId, channelId, epochId, 'cancel', notice, stored, queued);
         }
       }
     }
-    for (const key of [...this.divertedSinceInvocation.keys()]) {
+    for (const key of [...this.divertedSinceInvocation.keys(), ...this.readerCursor.keys(), ...this.readerHandedWrites.keys()]) {
       const [serverId, channelId] = key.split('\0') as [string, string];
       if (!this.channelRegistry.getTuneOutState(serverId, channelId)) {
         this.divertedSinceInvocation.delete(key);
         this.readerCursor.delete(key);
+        this.readerHandedWrites.delete(key);
       }
     }
     this.hooks.emitTrace({ type: 'tune-out:cancelled', serverId: except.serverId, channelId: except.channelId, epochId, scope: 'all-except', reason, wakeCount: scope.wakeCount });
@@ -1223,17 +1262,26 @@ export class TuneOutCoordinator {
     if (!subName) {
       const hold = this.holdFor(serverId, channelId);
       if (!hold) return;
+      const inChannel = (m: Pick<StoredMessage, 'metadata'>): boolean =>
+        (m.metadata as { tuneOut?: { epochId?: string }; channelId?: string } | undefined)?.tuneOut?.epochId === hold.epochId
+          && ((m.metadata as { channelId?: string } | undefined)?.channelId ?? channelId) === channelId;
+      // Stored and still-queued alike: while the resident's turn runs, what
+      // arrives waits in the deferred queue, and that is the traffic a reader
+      // is there for.
       this.invokeReaderFork(
         serverId,
         channelId,
         hold.epochId,
         trigger,
         notice,
-        this.hooks.getStoredMessages().filter(
-          (m) => (m.metadata as { tuneOut?: { epochId?: string }; channelId?: string } | undefined)?.tuneOut?.epochId === hold.epochId
-            && ((m.metadata as { channelId?: string } | undefined)?.channelId ?? channelId) === channelId,
-        ),
+        this.hooks.getStoredMessages().filter(inChannel),
+        this.queuedHeld(inChannel),
       );
+      // The count restarts once the fork has been handed what was held, as it
+      // does below once the subconscious's turn has been asked for. Otherwise
+      // every later cadence period still sees this one's count and derives a
+      // fork with nothing new to read.
+      this.divertedSinceInvocation.set(key, 0);
       return;
     }
     this.hooks.addMessage(
@@ -1251,7 +1299,9 @@ export class TuneOutCoordinator {
   /**
    * `reader: 'forks'`: hand the framework one invocation. The backlog is
    * the epoch's held messages not yet handed to any fork — each is
-   * delivered to exactly one reader — plus the standing dispositions.
+   * delivered to exactly one reader — stored ones first, then those still
+   * queued behind the resident's turn, plus the standing dispositions. A
+   * cadence look with nothing new is skipped. True when a fork was asked for.
    */
   private invokeReaderFork(
     serverId: string,
@@ -1260,12 +1310,18 @@ export class TuneOutCoordinator {
     trigger: ReaderInvocation['trigger'],
     notice: string,
     epochBacklog: StoredMessage[],
-  ): void {
-    if (!this.hooks.invokeReader) return;
+    epochQueued: QueuedHeldMessage[] = [],
+  ): boolean {
+    if (!this.hooks.invokeReader) return false;
     const key = this.key(serverId, channelId);
-    const cursor = this.readerCursor.get(key) ?? -1;
-    const backlog = epochBacklog.filter((m) => m.sequence > cursor).sort((a, b) => a.sequence - b.sequence);
+    const { backlog, queued } = this.unhandedBacklog(key, epochBacklog, epochQueued);
+    if (trigger === 'cadence' && backlog.length === 0 && queued.length === 0) return false;
     if (backlog.length > 0) this.readerCursor.set(key, backlog[backlog.length - 1]!.sequence);
+    if (queued.length > 0) {
+      const handed = this.readerHandedWrites.get(key) ?? new Set<string>();
+      for (const m of queued) handed.add(m.writeId);
+      this.readerHandedWrites.set(key, handed);
+    }
     const entries = Object.entries(this.readDispositions());
     this.hooks.invokeReader({
       serverId,
@@ -1274,8 +1330,44 @@ export class TuneOutCoordinator {
       trigger,
       notice,
       backlog,
+      queued,
       dispositions: entries.length > 0 ? entries.map(([k, v]) => `- ${k}: ${v}`).join('\n') : null,
     });
+    return true;
+  }
+
+  /**
+   * What no reader fork has been handed yet, of the given held messages: the
+   * stored ones past the channel's cursor, less those a fork was handed while
+   * they were still queued, oldest first; then the queued ones no fork was
+   * handed.
+   */
+  private unhandedBacklog(
+    key: string,
+    stored: StoredMessage[],
+    queued: QueuedHeldMessage[],
+  ): { backlog: StoredMessage[]; queued: QueuedHeldMessage[] } {
+    const cursor = this.readerCursor.get(key) ?? -1;
+    const handed = this.readerHandedWrites.get(key);
+    const handedWhileQueued = (m: StoredMessage): boolean => {
+      const writeId = (m.metadata as { deferredWriteId?: unknown } | undefined)?.deferredWriteId;
+      return handed !== undefined && typeof writeId === 'string' && handed.has(writeId);
+    };
+    return {
+      backlog: stored.filter((m) => m.sequence > cursor && !handedWhileQueued(m)).sort((a, b) => a.sequence - b.sequence),
+      queued: handed ? queued.filter((m) => !handed.has(m.writeId)) : queued,
+    };
+  }
+
+  /**
+   * The held messages still queued behind the resident's turn that `keep`
+   * keeps, oldest first, with their write ids. One the host gives no id for
+   * is left to reach a reader once it is stored: without the id, its stored
+   * row couldn't be told from a message no reader has had.
+   */
+  private queuedHeld(keep: (m: Pick<StoredMessage, 'metadata'>) => boolean): QueuedHeldMessage[] {
+    return (this.hooks.getDeferredMessages?.() ?? [])
+      .filter((m): m is QueuedHeldMessage => typeof m.writeId === 'string' && keep(m));
   }
 
   // ==========================================================================

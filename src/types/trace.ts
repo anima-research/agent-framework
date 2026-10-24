@@ -879,7 +879,10 @@ export type TraceEvent =
       channelId: string;
       epochId: string;
       trigger: 'cadence' | 'wake' | 'cancel';
+      /** Held messages the fork was handed, stored and queued. */
       held: number;
+      /** Of those, the ones still queued behind the resident's turn. */
+      queued: number;
     })
 
   // Dendrite: agent registry and lifecycle.

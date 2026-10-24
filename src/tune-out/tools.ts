@@ -1,6 +1,7 @@
 import type { ContentBlock } from '@animalabs/membrane';
 import { authorLine } from '../author-presentation.js';
 import type { StoredMessage } from '@animalabs/context-manager';
+import type { QueuedHeldMessage } from './coordinator.js';
 /**
  * The subconscious's tool surface (issue #77).
  *
@@ -215,6 +216,12 @@ export interface ReaderFramingContext {
   dispositions: string | null;
   /** The traffic held since the last look, oldest first; empty when nothing arrived. */
   backlog: StoredMessage[];
+  /**
+   * Traffic held since the last look that is still queued behind the
+   * resident's turn (not yet stored), oldest first; it follows `backlog`.
+   * Absent is none.
+   */
+  queued?: QueuedHeldMessage[];
 }
 
 /**
@@ -229,16 +236,23 @@ export function defaultReaderFraming(ctx: ReaderFramingContext): ContentBlock[] 
     `${ctx.notice}\n\n${ctx.voice}` +
     (ctx.dispositions ? `\n\n[Standing dispositions]\n${ctx.dispositions}` : '');
   const content: ContentBlock[] = [{ type: 'text', text: header }];
-  if (ctx.backlog.length === 0) {
+  const queued = ctx.queued ?? [];
+  if (ctx.backlog.length === 0 && queued.length === 0) {
     content.push({ type: 'text', text: '\n[Nothing new has been held since your last look.]' });
     return content;
   }
-  const n = ctx.backlog.length;
+  const n = ctx.backlog.length + queued.length;
   const lines: string[] = [`\n[Held in ${ctx.channelId} since your last look: ${n} message${n === 1 ? '' : 's'}]`];
   const flush = () => {
     if (lines.length > 0) content.push({ type: 'text', text: lines.splice(0).join('\n') });
   };
-  for (const message of ctx.backlog) {
+  const queuedNote = (): string => {
+    const q = queued.length;
+    const which = q === n ? (q === 1 ? 'It' : 'They') : (q === 1 ? 'The last one' : `The last ${q}`);
+    return `[${which} arrived while ${ctx.resident}'s turn was running, so ${q === 1 ? 'it is' : 'they are'} still queued, not yet stored.]`;
+  };
+  for (const [i, message] of [...ctx.backlog, ...queued].entries()) {
+    if (i === ctx.backlog.length) lines.push(queuedNote());
     const author = (message.metadata as { author?: { name?: string } } | undefined)?.author?.name ?? message.participant;
     const text = message.content
       .filter((b): b is Extract<ContentBlock, { type: 'text' }> => b.type === 'text')

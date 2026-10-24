@@ -4234,7 +4234,7 @@ export class AgentFramework {
             framework.settleUnknownLandings(forPrimary);
             return framework.deferredMessages.filter(forPrimary)
               .sort(bySeq)
-              .map((m) => ({ participant: m.participant, content: m.content, metadata: m.metadata as Record<string, unknown> | undefined }));
+              .map((m) => ({ participant: m.participant, content: m.content, metadata: m.metadata as Record<string, unknown> | undefined, writeId: m.id }));
           },
           // Every reader of the shared slot compiles the dump with its own
           // strategy, so the dump fits the smallest of their bounds.
@@ -13735,6 +13735,7 @@ export class AgentFramework {
       notice: invocation.notice,
       dispositions: invocation.dispositions,
       backlog: invocation.backlog,
+      queued: invocation.queued,
     });
     void (async () => {
       try {
@@ -13769,7 +13770,9 @@ export class AgentFramework {
               channelId: invocation.channelId,
               epochId: invocation.epochId,
               trigger: invocation.trigger,
-              heldMessageIds: invocation.backlog.map((m) => m.id),
+              // A queued message is named by its held handle, as module rows
+              // name it until it lands (heldRows).
+              heldMessageIds: [...invocation.backlog.map((m) => m.id), ...invocation.queued.map((m) => heldHandle(m.writeId))],
             } as MessageMetadata,
           }],
           metadata: { epochId: invocation.epochId, channelId: invocation.channelId, trigger: invocation.trigger },
@@ -13781,7 +13784,8 @@ export class AgentFramework {
           channelId: invocation.channelId,
           epochId: invocation.epochId,
           trigger: invocation.trigger,
-          held: invocation.backlog.length,
+          held: invocation.backlog.length + invocation.queued.length,
+          queued: invocation.queued.length,
         });
         const outcome = await this.runEphemeralToCompletion(fork.agent, fork.contextManager);
         // The report is the fork's whole job. A reader that ends in prose
