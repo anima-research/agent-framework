@@ -163,13 +163,15 @@ class FlakyMembrane extends OptionsMembrane {
   }
 }
 
-async function makeFramework(t: TestContext, membrane: MockMembrane) {
+/** A framework with one resident, `errorPolicy` (the default when left out) and any other options. */
+async function makeFramework(t: TestContext, membrane: MockMembrane, errorPolicy?: unknown, extra: Record<string, unknown> = {}) {
   const dir = mkdtempSync(join(tmpdir(), 'af-retry-'));
   t.after(() => rmSync(dir, { recursive: true, force: true }));
   const fw = await AgentFramework.create({
     storePath: join(dir, 'store'), membrane: membrane.asMembrane(),
     agents: [{ name: 'resident', model: 'zz-model', systemPrompt: 'system' }],
     modules: [new InputModule()], syncIntervalMs: 0, maintenanceIntervalMs: 0,
+    ...(errorPolicy !== undefined ? { errorPolicy: errorPolicy as never } : {}), ...extra,
   });
   t.after(() => fw.stop().catch(() => {}));
   return fw;
@@ -230,19 +232,6 @@ const scaled = (firstDelayMs: number): RetrySettings => {
   return { ...s, overloaded: { ...s.overloaded!, firstDelayMs, maxDelayMs: firstDelayMs * 30 } } as RetrySettings;
 };
 
-async function frameworkWith(t: TestContext, membrane: MockMembrane, errorPolicy: unknown, extra: Record<string, unknown> = {}) {
-  const dir = mkdtempSync(join(tmpdir(), 'af-retry-'));
-  t.after(() => rmSync(dir, { recursive: true, force: true }));
-  const fw = await AgentFramework.create({
-    storePath: join(dir, 'store'), membrane: membrane.asMembrane(),
-    agents: [{ name: 'resident', model: 'zz-model', systemPrompt: 'system' }],
-    modules: [new InputModule()], syncIntervalMs: 0, maintenanceIntervalMs: 0,
-    errorPolicy: errorPolicy as never, ...extra,
-  });
-  t.after(() => fw.stop().catch(() => {}));
-  return fw;
-}
-
 const traceOf = (fw: AgentFramework, agentName = 'resident') => {
   const events: Array<{ at: number; type: string; until?: number }> = [];
   fw.onTrace((e) => {
@@ -255,7 +244,7 @@ const traceOf = (fw: AgentFramework, agentName = 'resident') => {
 test("a turn waiting out the policy's delay says so as the wait begins, with its end, and at each cadence point; nothing once it ends", async (t: TestContext) => {
   const membrane = new FlakyMembrane(1);
   membrane.pushResponse(createMockResponse([{ type: 'text', text: 'zz-after-retry' }]));
-  const fw = await frameworkWith(t, membrane, {
+  const fw = await makeFramework(t, membrane, {
     maxRetries: 1,
     onInferenceError: (_e: Error, _a: string, attempt: number) => (attempt < 1 ? { retry: true, delayMs: 1_000 } : { retry: false }),
   });
@@ -271,17 +260,47 @@ test("a turn waiting out the policy's delay says so as the wait begins, with its
   assert.equal(events[failed + 1]!.type, 'inference:waiting', 'said as the wait begins, right after the failure');
   const first = events[failed + 1]!;
   assert.ok(first.until !== undefined && first.until >= first.at + 900 && first.until <= first.at + 1_100, `its end is the delay away: ${first.until! - first.at} ms`);
-  // About ten at a 100 ms cadence over a 1 s wait. The wait counts down by
-  // its timers, so late timers lengthen it rather than cut its cadence
-  // points; a cadence twice as long would give five.
-  assert.ok(waiting.length >= 8, `said again at the cadence while the wait lasted (${waiting.length} in all)`);
+  // About ten at a 100 ms cadence over a 1 s wait. The wait and its cadence
+  // count down by its timers, so late timers lengthen it rather than change
+  // how many cadence points it has; a cadence twice as long would give five,
+  // and one half as long twenty.
+  assert.ok(waiting.length >= 8 && waiting.length <= 12, `said at each cadence point while the wait lasted, and no more often (${waiting.length} in all)`);
   assert.ok(waiting.every((e) => events.indexOf(e) < restarted), 'nothing once the wait has ended');
   assert.ok(waiting.every((e) => e.until === first.until), 'each names the same end');
 });
 
+test("a wall clock stepping back during the wait doesn't stretch its cadence: it is counted by the wait's own timers", async (t: TestContext) => {
+  const membrane = new FlakyMembrane(1);
+  membrane.pushResponse(createMockResponse([{ type: 'text', text: 'zz-after-retry' }]));
+  const fw = await makeFramework(t, membrane, {
+    maxRetries: 1,
+    onInferenceError: (_e: Error, _a: string, attempt: number) => (attempt < 1 ? { retry: true, delayMs: 1_000 } : { retry: false }),
+  });
+  (fw as unknown as { waitingTraceEveryMs: number }).waitingTraceEveryMs = 100;
+  // As the wait first says so, the wall clock steps back two minutes, as an
+  // NTP correction or a hand-set clock can.
+  const realNow = Date.now;
+  t.after(() => { Date.now = realNow; });
+  let stepped = false;
+  fw.onTrace((e) => {
+    if (e.type !== 'inference:waiting' || stepped) return;
+    stepped = true;
+    Date.now = () => realNow() - 120_000;
+  });
+  const waiting: number[] = [];
+  fw.onTrace((e) => { if (e.type === 'inference:waiting') waiting.push(realNow()); });
+  fw.pushEvent({ type: 'external-message', source: 'test', content: 'zz-hello', metadata: {} });
+  await idle(fw);
+  Date.now = realNow;
+  assert.ok(stepped, 'the clock stepped back');
+  // About ten, as with a steady clock; a cadence read from the wall clock
+  // would say nothing more for two minutes, past the end of this wait.
+  assert.ok(waiting.length >= 8 && waiting.length <= 12, `said at the cadence after the clock stepped back (${waiting.length} in all)`);
+});
+
 test('a listener of inference:waiting that stops the framework ends the wait, and nothing more is said', async (t: TestContext) => {
   const membrane = new FlakyMembrane(1);
-  const fw = await frameworkWith(t, membrane, {
+  const fw = await makeFramework(t, membrane, {
     maxRetries: 1,
     // Long enough that only the stop ends it.
     onInferenceError: () => ({ retry: true, delayMs: 60_000 }),
@@ -306,7 +325,7 @@ test('a listener of inference:waiting that stops the framework ends the wait, an
 
 test('a wait too long for a date says it is waiting, with no until', async (t: TestContext) => {
   const membrane = new FlakyMembrane(1);
-  const fw = await frameworkWith(t, membrane, { maxRetries: 1, onInferenceError: () => ({ retry: true, delayMs: Number.POSITIVE_INFINITY }) });
+  const fw = await makeFramework(t, membrane, { maxRetries: 1, onInferenceError: () => ({ retry: true, delayMs: Number.POSITIVE_INFINITY }) });
   const events = traceOf(fw);
   let said!: () => void;
   const saidOnce = new Promise<void>((r) => { said = r; });
@@ -356,14 +375,19 @@ test('a retryable 529 a stream of another make throws from its iterator is retri
   const run = async (membrane: OptionsMembrane) => {
     membrane.pushResponse(createMockResponse([{ type: 'text', text: 'zz-after-retry' }]));
     const policy = recordingPolicy();
-    const fw = await frameworkWith(t, membrane, policy);
+    const fw = await makeFramework(t, membrane, policy);
     const events = traceOf(fw);
-    fw.pushEvent({ type: 'external-message', source: 'test', content: 'zz-hello', metadata: {} });
-    await idle(fw);
-    return { types: events.map((e) => e.type), asked: policy.asked, sends: membrane.streamOptions.length };
+    const { lines } = await laterEventLines(t, async () => {
+      fw.pushEvent({ type: 'external-message', source: 'test', content: 'zz-hello', metadata: {} });
+      await idle(fw);
+    }, 'taken as its error event');
+    return { result: { types: events.map((e) => e.type), asked: policy.asked, sends: membrane.streamOptions.length }, lines };
   };
-  const thrown = await run(new ThrowOnceMembrane(overloaded()));
-  const sent = await run(new EventOnceMembrane(overloaded()));
+  const { result: thrown, lines: thrownLines } = await run(new ThrowOnceMembrane(overloaded()));
+  const { result: sent, lines: sentLines } = await run(new EventOnceMembrane(overloaded()));
+  assert.equal(thrownLines.length, 1, 'one line names the thrown failure, which the error path itself does not log');
+  assert.match(thrownLines[0]!, /^\[stream\] resident: the stream threw a retryable failure from its iterator, taken as its error event: .*overloaded_error/);
+  assert.equal(sentLines.length, 0);
   assert.equal(thrown.sends, 2, 'the throw, then the retry');
   assert.ok(thrown.types.includes('inference:completed'), 'the retry answered');
   assert.deepEqual(thrown.asked, [{ type: 'server', httpStatus: 529, attempt: 0, retry: true }], 'the policy was asked about the 529 and retried it');
@@ -379,7 +403,7 @@ for (const [what, thrown] of [
     membrane.pushResponse(createMockResponse([{ type: 'text', text: 'zz-never' }]));
     // A policy that would retry anything it's asked about once: the throw's path doesn't ask it.
     let asked = 0;
-    const fw = await frameworkWith(t, membrane, {
+    const fw = await makeFramework(t, membrane, {
       maxRetries: 1,
       onInferenceError: (_e: Error, _a: string, attempt: number) => { asked++; return attempt < 1 ? { retry: true, delayMs: 10 } : { retry: false }; },
     });
@@ -395,7 +419,7 @@ for (const [what, thrown] of [
 test("a retryable failure on the start path, before any stream, is retried by the default policy (#734)", async (t: TestContext) => {
   const membrane = new OptionsMembrane();
   membrane.pushResponse(createMockResponse([{ type: 'text', text: 'zz-after-start-retry' }]));
-  const fw = await frameworkWith(t, membrane, new DefaultErrorPolicy(scaled(20)));
+  const fw = await makeFramework(t, membrane, new DefaultErrorPolicy(scaled(20)));
   const agent = fw.getAllAgents()[0]!;
   const compile = agent.startStreamWithInjections.bind(agent);
   let compiles = 0;
@@ -423,7 +447,7 @@ class CompleteOptionsMembrane extends MockMembrane {
 
 test("a resident's, a conversation agent's and an ephemeral run's context managers ask membrane for no retries, over a caller's own options; ephemeral runs share one membrane", async (t: TestContext) => {
   const membrane = new CompleteOptionsMembrane();
-  const fw = await frameworkWith(t, membrane, new DefaultErrorPolicy());
+  const fw = await makeFramework(t, membrane, new DefaultErrorPolicy());
   const request = { messages: [{ participant: 'User', content: [{ type: 'text', text: 'zz-compress' }] }], config: { model: 'zz-model', maxTokens: 10 } } as unknown as NormalizedRequest;
   const membraneOf = (cm: unknown) => (cm as { membrane: { complete(r: NormalizedRequest, o?: unknown): Promise<unknown> } }).membrane;
   const internal = fw as unknown as { conversationAuxiliaryMembraneFor(name: string): { complete(r: NormalizedRequest, o?: unknown): Promise<unknown> } };
@@ -450,7 +474,7 @@ test("a resident's, a conversation agent's and an ephemeral run's context manage
 test("an ephemeral run, as a host's subagent is, says it is waiting out its retry, with its end", async (t: TestContext) => {
   const membrane = new FlakyMembrane(1);
   membrane.pushResponse(createMockResponse([{ type: 'text', text: 'zz-after-retry' }]));
-  const fw = await frameworkWith(t, membrane, {
+  const fw = await makeFramework(t, membrane, {
     maxRetries: 1,
     onInferenceError: (_e: Error, _a: string, attempt: number) => (attempt < 1 ? { retry: true, delayMs: 500 } : { retry: false }),
   });
@@ -470,7 +494,7 @@ test("an ephemeral run, as a host's subagent is, says it is waiting out its retr
 
 test('a listener of inference:waiting that calls abortInference ends the wait and the turn, with no retry', async (t: TestContext) => {
   const membrane = new FlakyMembrane(1);
-  const fw = await frameworkWith(t, membrane, { maxRetries: 1, onInferenceError: () => ({ retry: true, delayMs: 60_000 }) });
+  const fw = await makeFramework(t, membrane, { maxRetries: 1, onInferenceError: () => ({ retry: true, delayMs: 60_000 }) });
   const events = traceOf(fw);
   let aborted: boolean | undefined;
   fw.onTrace((e) => { if (e.type === 'inference:waiting' && aborted === undefined) aborted = fw.abortInference('resident', 'zz-stop'); });
@@ -487,7 +511,7 @@ test('a listener of inference:waiting that calls abortInference ends the wait an
 test('the wait says nothing while its agent is not the one registered under its name', async (t: TestContext) => {
   const membrane = new FlakyMembrane(1);
   membrane.pushResponse(createMockResponse([{ type: 'text', text: 'zz-after-retry' }]));
-  const fw = await frameworkWith(t, membrane, { maxRetries: 1, onInferenceError: (_e: Error, _a: string, attempt: number) => (attempt < 1 ? { retry: true, delayMs: 1_000 } : { retry: false }) });
+  const fw = await makeFramework(t, membrane, { maxRetries: 1, onInferenceError: (_e: Error, _a: string, attempt: number) => (attempt < 1 ? { retry: true, delayMs: 1_000 } : { retry: false }) });
   (fw as unknown as { waitingTraceEveryMs: number }).waitingTraceEveryMs = 100;
   const agents = (fw as unknown as { agents: Map<string, unknown> }).agents;
   const events = traceOf(fw);
@@ -544,13 +568,13 @@ function afterTurn(fw: AgentFramework, events: Array<{ type: string }>) {
   };
 }
 
-/** console.error's lines while `run` runs, that name the stream's later events. */
-async function laterEventLines<T>(t: TestContext, run: () => Promise<T>): Promise<{ result: T; lines: string[] }> {
+/** console.error's lines while `run` runs that name what a stream did: by default, what it sent or threw after its terminal event. */
+async function laterEventLines<T>(t: TestContext, run: () => Promise<T>, naming = 'which decided its turn'): Promise<{ result: T; lines: string[] }> {
   const lines: string[] = [];
   const original = console.error;
   console.error = (...args: unknown[]) => {
     const line = args.map(String).join(' ');
-    if (line.startsWith('[stream] ') && line.includes('which decided its turn')) lines.push(line);
+    if (line.startsWith('[stream] ') && line.includes(naming)) lines.push(line);
     else original(...args);
   };
   t.after(() => { console.error = original; });
@@ -563,7 +587,7 @@ for (const [what, thrown] of [
 ] as const) {
   test(`${what} a stream throws after its answer decides nothing: no failure, no [inference-failed] line, no failed log row, no retry; one line names it`, async (t: TestContext) => {
     const membrane = new SendThenThrowMembrane([{ events: [answer('zz-answered')], thrown: thrown() }]);
-    const fw = await frameworkWith(t, membrane, new DefaultErrorPolicy(scaled(20)));
+    const fw = await makeFramework(t, membrane, new DefaultErrorPolicy(scaled(20)));
     const events = traceOf(fw);
     const { lines } = await laterEventLines(t, async () => {
       fw.pushEvent({ type: 'external-message', source: 'test', content: 'zz-hello', metadata: {} });
@@ -589,7 +613,7 @@ for (const [what, type, later] of [
   test(`${what} a stream sends after its answer decides nothing: the turn ends as the answer alone ends it, and one line names it`, async (t: TestContext) => {
     const run = async (events: StreamEvent[]) => {
       const membrane = new SendThenThrowMembrane([{ events, thrown: null }]);
-      const fw = await frameworkWith(t, membrane, new DefaultErrorPolicy(scaled(20)));
+      const fw = await makeFramework(t, membrane, new DefaultErrorPolicy(scaled(20)));
       const trace = traceOf(fw);
       const { lines } = await laterEventLines(t, async () => {
         fw.pushEvent({ type: 'external-message', source: 'test', content: 'zz-hello', metadata: {} });
@@ -628,7 +652,7 @@ test("tool calls a stream sends after its answer, holding its iterator for their
     }
   }
   const membrane = new AnswerThenToolCalls();
-  const fw = await frameworkWith(t, membrane, new DefaultErrorPolicy(scaled(20)));
+  const fw = await makeFramework(t, membrane, new DefaultErrorPolicy(scaled(20)));
   const events = traceOf(fw);
   const { lines } = await laterEventLines(t, async () => {
     fw.pushEvent({ type: 'external-message', source: 'test', content: 'zz-hello', metadata: {} });
@@ -642,7 +666,7 @@ test("tool calls a stream sends after its answer, holding its iterator for their
 
 test('an acceleration 429 a stream throws after its answer installs no hold', async (t: TestContext) => {
   const membrane = new SendThenThrowMembrane([{ events: [answer('zz-answered')], thrown: accelerationLimit() }]);
-  const fw = await frameworkWith(t, membrane, new DefaultErrorPolicy(scaled(20)));
+  const fw = await makeFramework(t, membrane, new DefaultErrorPolicy(scaled(20)));
   const events = traceOf(fw);
   fw.pushEvent({ type: 'external-message', source: 'test', content: 'zz-hello', metadata: {} });
   await idle(fw);
@@ -661,7 +685,7 @@ test("a throw after a retryable error event gives that error's one retry, not a 
   membrane.pushResponse(createMockResponse([{ type: 'text', text: 'zz-after-retry' }]));
   membrane.pushResponse(createMockResponse([{ type: 'text', text: 'zz-a-second-retry' }]));
   const policy = recordingPolicy();
-  const fw = await frameworkWith(t, membrane, policy);
+  const fw = await makeFramework(t, membrane, policy);
   const events = traceOf(fw);
   fw.pushEvent({ type: 'external-message', source: 'test', content: 'zz-hello', metadata: {} });
   await idle(fw);
@@ -677,7 +701,7 @@ for (const [what, type, terminal] of [
   test(`after ${what}, a throw or a later event decides nothing more: the turn ends as that event alone ends it`, async (t: TestContext) => {
     const run = async (script: { events: StreamEvent[]; thrown: Error | null }) => {
       const membrane = new SendThenThrowMembrane([script]);
-      const fw = await frameworkWith(t, membrane, new DefaultErrorPolicy(scaled(20)));
+      const fw = await makeFramework(t, membrane, new DefaultErrorPolicy(scaled(20)));
       const events = traceOf(fw);
       const { lines } = await laterEventLines(t, async () => {
         fw.pushEvent({ type: 'external-message', source: 'test', content: 'zz-hello', metadata: {} });
@@ -718,12 +742,18 @@ test('a retryable 529 thrown after a stop cancelled the stream ends the turn as 
     }
   }
   const membrane = new CancelThenThrow();
-  const fw = await frameworkWith(t, membrane, new DefaultErrorPolicy(scaled(20)));
+  const fw = await makeFramework(t, membrane, new DefaultErrorPolicy(scaled(20)));
   const events = traceOf(fw);
   fw.onTrace((e) => { if (e.type === 'inference:started') setTimeout(() => fw.abortInference('resident', 'zz-stop'), 50); });
-  fw.pushEvent({ type: 'external-message', source: 'test', content: 'zz-hello', metadata: {} });
-  await idle(fw);
+  const { lines } = await laterEventLines(t, async () => {
+    fw.pushEvent({ type: 'external-message', source: 'test', content: 'zz-hello', metadata: {} });
+    await idle(fw);
+  }, 'taken as its error event');
   assert.equal(membrane.streamOptions.length, 1, 'no retry');
   assert.ok(events.some((e) => e.type === 'inference:aborted'), 'it ended as the stop');
+  // The stop settles the turn without logging the failure, so the line is
+  // where the throw is seen.
+  assert.equal(lines.length, 1, 'one line names the thrown failure');
+  assert.match(lines[0]!, /overloaded_error after the cancel/);
   assert.deepEqual(events.filter((e) => ['inference:waiting', 'inference:exhausted', 'inference:failed'].includes(e.type)).map((e) => e.type), []);
 });

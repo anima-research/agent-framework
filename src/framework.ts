@@ -2141,12 +2141,16 @@ function isMembraneError(error: unknown): error is MembraneError {
  *   each with a line naming it, where driveStream would act on the turn a
  *   second time: a later failure ended an answered turn as failed, with an
  *   `[inference-failed]` line after its answer, or held it to send it again,
- *   and a later event ran its case for a turn already decided. Ending them,
- *   rather than pulling on, closes the stream (its iterator's return()), so
- *   a stream that holds its iterator for something that will never come,
- *   such as a later tool-calls event's results, can't keep the turn from
- *   finishing. Membrane's own streams send their terminal event last; only a
- *   stream of another make sends or throws anything after it.
+ *   and a later event ran its case for a turn already decided. Ending them
+ *   at that event, rather than pulling on past it, closes the stream (its
+ *   iterator's return()), so a stream that sends a later event and then
+ *   holds its iterator for something that will never come, such as that
+ *   event's tool results, can't keep the turn from finishing. One pull past
+ *   the terminal event is still made, to see what follows: a stream that
+ *   holds its iterator there without sending anything keeps the turn
+ *   waiting, as on main. Membrane's own streams send their terminal event
+ *   last and then end; only a stream of another make sends or throws
+ *   anything after it.
  */
 async function* turnStreamEvents(stream: AsyncIterable<StreamEvent>, agentName: string): AsyncGenerator<StreamEvent> {
   let decidedBy: StreamEvent['type'] | undefined;
@@ -2165,6 +2169,9 @@ async function* turnStreamEvents(stream: AsyncIterable<StreamEvent>, agentName: 
       return;
     }
     if (!(isMembraneError(error) && error.retryable === true)) throw error;
+    // Said here, since the error event's path doesn't log a failure that a
+    // stop or the framework's cancel then settles, as the throw's did.
+    console.error(`[stream] ${agentName}: the stream threw a retryable failure from its iterator, taken as its error event: ${describeFailureWithFrames(error)}`);
     yield { type: 'error', error } as StreamEvent;
   }
 }
@@ -5260,12 +5267,14 @@ export class AgentFramework {
     checkWindow.wake = () => { ended = true; wake(); };
     const over = (): boolean => !(remaining > 0) || ended || this.providerAdmissionClosed;
     const every = this.waitingTraceEveryMs;
-    let saidAt: number | undefined;
+    // How long since the wait last said so, counted by its timers as the
+    // wait itself is, so a step of the wall clock can't stretch the cadence.
+    let sinceSaid = Number.POSITIVE_INFINITY;
     try {
       for (;;) {
         if (over()) return;
-        if (saidAt === undefined || Date.now() - saidAt >= every) {
-          saidAt = Date.now();
+        if (sinceSaid >= every) {
+          sinceSaid = 0;
           // Said only for the agent still registered under its name: a wait
           // whose agent was removed or replaced runs on as before, unseen,
           // since its name now stands for another agent or for none. A wait
@@ -5276,7 +5285,7 @@ export class AgentFramework {
           // Its listeners can end the wait.
           if (over()) return;
         }
-        const step = Math.min(remaining, MAX_TIMER_DELAY_MS, Math.max(1, saidAt! + every - Date.now()));
+        const step = Math.min(remaining, MAX_TIMER_DELAY_MS, Math.max(1, every - sinceSaid));
         await new Promise<void>((resolve) => {
           const timer = setTimeout(resolve, step);
           wakeStep = () => { clearTimeout(timer); resolve(); };
@@ -5286,6 +5295,7 @@ export class AgentFramework {
         // an abort woke early ends the wait anyway, and a late timer makes
         // the wait end later than its `until`, never sooner.
         remaining -= step;
+        sinceSaid += step;
       }
     } finally {
       wakers.delete(wake);
