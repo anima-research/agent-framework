@@ -1937,6 +1937,8 @@ describe('present while acting', () => {
     framework.checkpointManager = null;
     framework.channelRegistry = {
       openIfClosedForSend: () => new Promise((resolve) => { resolveOpen = resolve; }),
+      // The send's own channel, which nobody closed, so its answer carries no note.
+      resolveSendTarget: () => undefined,
       directsLifecycle: () => true,
     };
     framework.turnRouting = new Map([['assistant', sending]]);
@@ -1998,6 +2000,8 @@ describe('present while acting', () => {
       framework.checkpointManager = null;
       framework.channelRegistry = {
         openIfClosedForSend: () => new Promise((resolve) => { resolveOpen = resolve; }),
+        // The send's own channel, which nobody closed, so its answer carries no note.
+        resolveSendTarget: () => undefined,
         directsLifecycle: () => true,
       };
       const engaged = new Set<string>();
@@ -2178,6 +2182,8 @@ describe('present while acting', () => {
     framework.checkpointManager = null;
     framework.channelRegistry = {
       openIfClosedForSend: () => new Promise((resolve) => { resolveOpen = resolve; }),
+      // The send's own channel, which nobody closed, so its answer carries no note.
+      resolveSendTarget: () => undefined,
       directsLifecycle: () => true,
     };
     framework.turnRouting = new Map([['assistant', sending]]);
