@@ -512,7 +512,15 @@ export interface AgentInfo {
 export type AgentStatus = 'idle' | 'inferring' | 'streaming' | 'waiting_for_tools' | 'ready';
 
 /**
- * Response from a module's event handler.
+ * Response from a module's event handler. The framework applies it in this
+ * order: its messages added, edited and removed, then its stateUpdate, then
+ * its inference request. When one of these throws, such as an edit of a
+ * message the store doesn't hold, what came before it stays applied, the
+ * operation that threw may have taken effect in part or whole (a store can
+ * throw after it wrote), the rest of the response isn't, and a line names
+ * the module and where it threw; the event's other responses, a tool call's dispatch and its trace
+ * go on. Content the framework finds malformed refuses the whole response
+ * before any of it applies.
  */
 export interface EventResponse {
   /**
@@ -546,9 +554,9 @@ export interface EventResponse {
   toolsChanged?: boolean;
 
   /**
-   * Module state update. Applied atomically with message operations.
-   * The framework will call setState() with this value after applying
-   * message changes, ensuring consistent state.
+   * Module state update. The framework calls setState() with this value
+   * after applying the response's message changes, and not when one of
+   * them threw.
    */
   stateUpdate?: unknown;
 }

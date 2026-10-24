@@ -52,14 +52,14 @@ test('spawn decision does not create the binding until bind() is called', () => 
   const router = makeRouter();
   const d1 = router.route({ channelId: 'slack:C1', mentioned: true, kind: 'channel' });
   assert.equal(d1.kind, 'spawn');
-  assert.equal(router.getBinding('slack:C1'), undefined);
+  assert.equal(router.getBinding({ serverId: '', channelId: 'slack:C1' }), undefined);
 
   // Framework failed to spawn → next mention proposes the same generation.
   const d2 = router.route({ channelId: 'slack:C1', mentioned: true, kind: 'channel' });
   assert.equal(d2.kind, 'spawn');
   if (d2.kind === 'spawn') assert.equal(d2.generation, 1);
 
-  if (d2.kind === 'spawn') router.bind('slack:C1', d2.agentName, d2.generation, T0 + 1);
+  if (d2.kind === 'spawn') router.bind({ serverId: '', channelId: 'slack:C1' }, d2.agentName, d2.generation, T0 + 1);
   const d3 = router.route({ channelId: 'slack:C1', mentioned: false, kind: 'channel' });
   assert.equal(d3.kind, 'existing');
 });
@@ -70,7 +70,7 @@ test('spawn decision does not create the binding until bind() is called', () => 
 
 test('bound channel: non-mentions land without triggering, mentions trigger', () => {
   const router = makeRouter();
-  router.bind('slack:C1', 'conversation-slack-C1-g1', 1, T0);
+  router.bind({ serverId: '', channelId: 'slack:C1' }, 'conversation-slack-C1-g1', 1, T0);
 
   const ambient = router.route({ channelId: 'slack:C1', mentioned: false, kind: 'channel' });
   assert.equal(ambient.kind, 'existing');
@@ -83,7 +83,7 @@ test('bound channel: non-mentions land without triggering, mentions trigger', ()
 
 test('bound DM: every message triggers', () => {
   const router = makeRouter();
-  router.bind('slack:D1', 'conversation-slack-D1-g1', 1, T0);
+  router.bind({ serverId: '', channelId: 'slack:D1' }, 'conversation-slack-D1-g1', 1, T0);
   const decision = router.route({ channelId: 'slack:D1', mentioned: false, kind: 'dm' });
   assert.equal(decision.kind, 'existing');
   if (decision.kind === 'existing') assert.equal(decision.trigger, true);
@@ -95,25 +95,25 @@ test('bound DM: every message triggers', () => {
 
 test('routing queries leave the binding and its expiry clock unchanged', () => {
   const router = makeRouter({ idleTtlMs: 1000 });
-  router.bind('slack:C1', 'fork-a', 3, T0);
-  const before = { ...router.getBinding('slack:C1')! };
+  router.bind({ serverId: '', channelId: 'slack:C1' }, 'fork-a', 3, T0);
+  const before = { ...router.getBinding({ serverId: '', channelId: 'slack:C1' })! };
   const generations = router.exportGenerations();
 
   assert.equal(router.route({ channelId: 'slack:C1', mentioned: false, kind: 'channel' }).kind, 'existing');
   assert.equal(router.route({ channelId: 'slack:C1', mentioned: true, kind: 'channel' }).kind, 'existing');
-  assert.deepEqual(router.getBinding('slack:C1'), before, 'previewing a route must not prolong an engagement');
+  assert.deepEqual(router.getBinding({ serverId: '', channelId: 'slack:C1' }), before, 'previewing a route must not prolong an engagement');
   assert.deepEqual(router.exportGenerations(), generations);
   assert.equal(router.expired(T0 + 1001).length, 1);
 });
 
 test('touch() refreshes expiry explicitly and leaves unbound channels alone', () => {
   const router = makeRouter({ idleTtlMs: 1000 });
-  router.bind('slack:C1', 'conversation-slack-C1-g1', 1, T0);
+  router.bind({ serverId: '', channelId: 'slack:C1' }, 'conversation-slack-C1-g1', 1, T0);
 
   // Delivery records activity independently of the routing query.
-  router.touch('slack:C1', T0 + 900);
-  router.touch('slack:unknown', T0 + 900);
-  assert.equal(router.getBinding('slack:unknown'), undefined);
+  router.touch({ serverId: '', channelId: 'slack:C1' }, T0 + 900);
+  router.touch({ serverId: '', channelId: 'slack:unknown' }, T0 + 900);
+  assert.equal(router.getBinding({ serverId: '', channelId: 'slack:unknown' }), undefined);
   assert.deepEqual(router.exportGenerations(), { 'slack:C1': 1 });
   assert.deepEqual(router.expired(T0 + 1500), []);
   assert.equal(router.expired(T0 + 1901).length, 1);
@@ -123,9 +123,9 @@ test('rebind after expiry gets a fresh generation and agent name', () => {
   const router = makeRouter({ idleTtlMs: 1000 });
   const d1 = router.route({ channelId: 'slack:C1', mentioned: true, kind: 'channel' });
   if (d1.kind !== 'spawn') assert.fail('expected spawn');
-  router.bind('slack:C1', d1.agentName, d1.generation, T0);
+  router.bind({ serverId: '', channelId: 'slack:C1' }, d1.agentName, d1.generation, T0);
 
-  router.unbind('slack:C1'); // the framework does this as the closure turn begins, just before starting it (sweepExpiredConversations)
+  router.unbind({ serverId: '', channelId: 'slack:C1' }); // the framework does this as the closure turn begins, just before starting it (sweepExpiredConversations)
 
   const d2 = router.route({ channelId: 'slack:C1', mentioned: true, kind: 'channel' });
   assert.equal(d2.kind, 'spawn');
@@ -179,8 +179,8 @@ test('a fork name starts with the configured agentPrefix', () => {
 
 test('channelForAgent reverse lookup', () => {
   const router = makeRouter();
-  router.bind('slack:C1', 'fork-a', 1, T0);
-  assert.equal(router.channelForAgent('fork-a'), 'slack:C1');
+  router.bind({ serverId: '', channelId: 'slack:C1' }, 'fork-a', 1, T0);
+  assert.deepEqual(router.channelForAgent('fork-a'), { serverId: '', channelId: 'slack:C1' });
   assert.equal(router.channelForAgent('fork-b'), undefined);
 });
 
@@ -223,8 +223,8 @@ test('group DMs bind on any message but trigger only on mention by default', () 
 
 test('generation counters export/hydrate round-trips and never regresses', () => {
   const router = new ConversationRouter({ templateAgent: 'main' });
-  router.bind('slack:C1', 'conversation-slack-C1-g3', 3, T0);
-  router.bind('slack:D1', 'conversation-slack-D1-g1', 1, T0);
+  router.bind({ serverId: '', channelId: 'slack:C1' }, 'conversation-slack-C1-g3', 3, T0);
+  router.bind({ serverId: '', channelId: 'slack:D1' }, 'conversation-slack-D1-g1', 1, T0);
   const exported = router.exportGenerations();
   assert.deepEqual(exported, { 'slack:C1': 3, 'slack:D1': 1 });
 
@@ -235,9 +235,44 @@ test('generation counters export/hydrate round-trips and never regresses', () =>
   assert.equal((decision as { generation: number }).generation, 4, 'restart must not reuse generation names');
 
   // Hydration never regresses a counter that advanced in the meantime.
-  restored.bind('slack:D1', 'conversation-slack-D1-g5', 5, T0);
+  restored.bind({ serverId: '', channelId: 'slack:D1' }, 'conversation-slack-D1-g5', 5, T0);
   restored.hydrateGenerations(exported);
   const d1 = restored.route({ channelId: 'slack:D2', mentioned: false, kind: 'dm' });
   assert.equal(d1.kind, 'spawn', 'sanity');
   assert.equal(restored.exportGenerations()['slack:D1'], 5);
+});
+
+test('bindings are per server: two servers that share a channel id bind a fork each', () => {
+  // Channel ids are unique only within one MCPL server's connection.
+  const router = makeRouter();
+  router.bind({ serverId: 'a', channelId: 'general' }, 'fork-a', 1, T0);
+  assert.equal(router.route({ channelId: 'general', serverId: 'a', mentioned: false, kind: 'channel' }).kind, 'existing');
+  assert.equal(router.route({ channelId: 'general', serverId: 'b', mentioned: true, kind: 'channel' }).kind, 'spawn',
+    "b's channel isn't a's binding");
+  router.bind({ serverId: 'b', channelId: 'general' }, 'fork-b', 2, T0);
+  assert.deepEqual(router.channelForAgent('fork-b'), { serverId: 'b', channelId: 'general' });
+  assert.equal(router.getBinding({ serverId: 'b', channelId: 'general' })?.serverId, 'b');
+  router.unbind({ serverId: 'a', channelId: 'general' });
+  assert.equal(router.getBinding({ serverId: 'a', channelId: 'general' }), undefined);
+  assert.equal(router.getBinding({ serverId: 'b', channelId: 'general' })?.agentName, 'fork-b', "unbinding a's leaves b's");
+});
+
+test("a shared id's fork generation never goes back down when one server's spawn binds after another's", () => {
+  // The counter is per bare id, and two servers' spawns run beside each
+  // other: `a`'s spawn of generation 3 binds after `b` has bound 4.
+  const router = makeRouter();
+  router.bind({ serverId: 'b', channelId: 'general' }, 'fork-b4', 4, T0);
+  router.bind({ serverId: 'a', channelId: 'general' }, 'fork-a3', 3, T0);
+  assert.deepEqual(router.exportGenerations(), { general: 4 });
+  const next = router.route({ channelId: 'general', serverId: 'c', mentioned: true, kind: 'channel' });
+  assert.equal((next as { generation?: number }).generation, 5, "a later spawn doesn't reuse generation 4's name");
+});
+
+test("touch() refreshes one server's binding of a shared id, not the other's", () => {
+  const router = makeRouter({ idleTtlMs: 1000 });
+  router.bind({ serverId: 'a', channelId: 'general' }, 'fork-a', 1, T0);
+  router.bind({ serverId: 'b', channelId: 'general' }, 'fork-b', 2, T0);
+  router.touch({ serverId: 'b', channelId: 'general' }, T0 + 900);
+  assert.deepEqual(router.expired(T0 + 1500).map((b) => b.agentName), ['fork-a'], "a's binding idles out on its own clock");
+  assert.deepEqual(router.expired(T0 + 1901).map((b) => b.agentName).sort(), ['fork-a', 'fork-b']);
 });

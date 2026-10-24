@@ -344,7 +344,7 @@ describe('tool-result spill completion (issue #89)', () => {
             id: `page-${pages}`, name: 'workspace--read', input, callerAgentName: 'prime',
           });
           assert.strictEqual(result.success, true, result.error);
-          const page = result.data as { content: string; offsetChars: number; nextOffsetChars: number | null };
+          const page = result.structured as { content: string; offsetChars: number; nextOffsetChars: number | null };
           assert.strictEqual(page.offsetChars, recovered.length);
           assert.ok(page.content.length > 0);
           // Exercise the actual stored/live spill policy on each read result.
@@ -358,7 +358,11 @@ describe('tool-result spill completion (issue #89)', () => {
           const outcome = storage.spilled.get(`page-${pages}`)!;
           assert.strictEqual(outcome.filePath, null, 'read-back must not spill again');
           assert.ok(outcome.text.length <= cap);
-          assert.strictEqual(JSON.parse(outcome.text).content, page.content);
+          // And it uses its room: the advised page is sized to the cap, up to
+          // the 2,000 characters a page is advised at the most.
+          if (page.nextOffsetChars !== null) assert.ok(outcome.text.length > Math.min(cap / 2, 2_000), `a page of ${outcome.text.length} at a cap of ${cap}`);
+          assert.strictEqual(outcome.text, (result.data as Array<{ text: string }>)[0]!.text, 'the page is stored as its text');
+          assert.ok(outcome.text.endsWith(`\n--- content ---\n${page.content}`), 'which ends with its content');
           recovered += page.content;
           pages++;
           if (page.nextOffsetChars === null) break;
@@ -395,7 +399,7 @@ describe('tool-result spill completion (issue #89)', () => {
         id: 'tail', name: 'read', input: { path: ref[1], offsetChars: expected.length - 100, limitChars: 100 },
       });
       assert.strictEqual(lastPage.success, true);
-      assert.deepStrictEqual((lastPage.data as { content: string }).content, expected.toString().slice(-100));
+      assert.deepStrictEqual((lastPage.structured as { content: string }).content, expected.toString().slice(-100));
     } finally {
       await h.framework.stop();
       rmSync(h.tempDir, { recursive: true, force: true });
@@ -455,7 +459,7 @@ describe('tool-result spill completion (issue #89)', () => {
         id: 'grep', name: 'grep', input: { pattern: 'repo#2999 ', path: refMatch[1] },
       });
       assert.strictEqual(grep.success, true, grep.error);
-      const matches = (grep.data as { results: Array<{ matches: Array<{ line: number; text: string }> }> })
+      const matches = (grep.structured as { results: Array<{ matches: Array<{ line: number; text: string }> }> })
         .results.flatMap((r) => r.matches);
       assert.deepStrictEqual(matches.map((m) => [m.line, m.text]), [[3000, body.split('\n')[2999]]]);
     } finally {

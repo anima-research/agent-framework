@@ -217,7 +217,7 @@ test('a script, and a module calling in process, get the refusals as errors too'
     success: false,
     isError: true,
     error: TUNED_OUT,
-    data: { refusal: 'tuned-out', channelId: CHANNEL },
+    data: { refusal: 'tuned-out', channelId: CHANNEL, serverId: 'disc' },
   });
   assert.deepEqual(
     await keeper.ctx!.callTool({ id: 'ctx-api', name: 'api--lookup', input: {} }),

@@ -94,7 +94,11 @@ export class MockYieldingStream implements YieldingStream {
     }
 
     if (response.usage) {
-      this.events.push({ type: 'usage', usage: response.usage } as StreamEvent);
+      // A response may carry the round report its usage event closes
+      // (`round`, a test-only field), as membrane 0.6.0's yielding streams
+      // send it.
+      const round = (response as { round?: unknown }).round;
+      this.events.push({ type: 'usage', usage: response.usage, ...(round ? { round } : {}) } as StreamEvent);
     }
 
     if (response.toolCalls.length > 0) {

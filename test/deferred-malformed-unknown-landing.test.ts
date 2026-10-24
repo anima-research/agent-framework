@@ -17,6 +17,7 @@ function harness() {
   const queued: any[] = [];
   const outcomes: any[] = [];
   f.primaryAgentName = 'a';
+  f.stillUnknownSaid = new Set();
   f.deliveryAgent = () => agent;
   f.storedCountOf = () => count;
   f.storedCopiesOf = () => readback;

@@ -9,6 +9,7 @@ import { MembraneError, Membrane as RealMembrane, NativeFormatter, type Provider
   type ProviderResponse, type StreamCallbacks } from '@animalabs/membrane';
 import { AgentFramework, type AgentConfig, type AgentSettingsExtension, type Module, type ModuleContext,
   type ToolCall, type ToolResult, type ProcessEvent, type ProcessState } from '../src/index.js';
+import { destinationKey } from '../src/mcpl/channel-registry.js';
 import { TOOL_RESULT_GUARD_AUDIT_STATE, TOOL_RESULT_GUARD_NOTICE, keptWhenWithheld, withheldResultNotice } from '../src/tool-result-guard.js';
 import { MockYieldingStream, createMockResponse } from './helpers/mock-membrane.js';
 import { UNREACHED_WATCHDOG, silenceRun } from './helpers/run-watchdog.js';
@@ -133,15 +134,37 @@ function toolResults(framework: AgentFramework) {
  * deliverSpeech that explicit and hybrid delivery post through.
  */
 function withDeliverSpeech<T extends Record<string, unknown>>(stub: T): T {
+  // The framework names a channel with its server. These stubs work by
+  // channel id, and every channel is the stub server's, so this adapts
+  // between the two: a locus or target gets the stub's server, and delivery
+  // hands each stub the channel's id.
+  type Channel = { serverId: string; channelId: string };
+  const idOf = (channel: Channel | string | null) => (channel !== null && typeof channel === 'object' ? channel.channelId : channel) as string;
   const route = stub.routeSpeech as (agent: string, text: string, channelId: string) => Promise<{ delivered?: boolean; channelId?: string } | undefined>;
+  const locus = stub.resolveLocus as ((agent: string) => string | null) | undefined;
+  const target = stub.resolveProseTarget as ((spec: string, opts?: unknown) => Record<string, unknown>) | undefined;
   return Object.assign(stub, {
-    deliverSpeech: async (agent: string, text: string, channelId: string) => {
+    routeSpeech: async (agent: string, text: string, channel: Channel | null) => {
+      const result = await route(agent, text, idOf(channel));
+      return result?.delivered ? { ...result, serverId: 'stub' } : result;
+    },
+    deliverSpeech: async (agent: string, text: string, channel: Channel | null) => {
+      const channelId = idOf(channel);
       const result = await route(agent, text, channelId);
       return result?.delivered
         ? { status: 'delivered', destination: { serverId: 'stub', channelId: result.channelId ?? channelId }, at: Date.now() }
         : { status: 'failed', destination: { serverId: 'stub', channelId }, reason: 'the stub reported delivered: false', at: Date.now() };
     },
     resolveDestination: ({ channelId }: { channelId: string }) => ({ destination: { serverId: 'stub', channelId } }),
+    ...(locus ? { resolveLocus: (agent: string) => { const id = locus(agent); return id ? { serverId: 'stub', channelId: id } : null; } } : {}),
+    ...(target ? {
+      resolveProseTarget: (spec: string, opts?: unknown) => {
+        const resolved = target(spec, opts);
+        return 'channelId' in resolved ? { serverId: 'stub', ...resolved } : resolved;
+      },
+    } : {}),
+    channelsNamed: (name: string) => [{ serverId: 'stub', channelId: name }],
+    nameShown: (channel: Channel) => channel.channelId,
   });
 }
 
@@ -1047,13 +1070,15 @@ test("hybrid: a restarted turn whose last response is empty writes its receipt a
 test("a fresh turn starts new routing state in every mode, and leaves the earlier turn's as it was", async () => {
   for (const mode of ['explicit', 'hybrid', 'locus'] as const) {
     const h = await harness([[answer()]], { proseRouting: mode });
-    type Routing = { pin?: string; hybridHold?: 'private' | 'failed';
-      continuation: boolean; deliveries: string[]; suppressed: number; drafts: unknown[]; keptPrivate: number;
-      triggerChannel?: string; locus?: string; engaged: Set<string>; arrivals: Array<{ messageId: string; channelId: string }> };
+    type Channel = { serverId: string; channelId: string };
+    type Routing = { pin?: Channel; hybridHold?: 'private' | 'failed';
+      continuation: boolean; deliveries: Channel[]; suppressed: number; drafts: unknown[]; keptPrivate: number;
+      triggerChannel?: Channel; locus?: Channel; engaged: Set<string>; wasIn: Channel[]; arrivals: Array<{ messageId: string; channel: Channel }> };
     const internals = h.framework as unknown as { turnRouting: Map<string, Routing> };
-    const earlierFields = (): Routing => ({ pin: 'chan-earlier', hybridHold: 'failed',
-      continuation: true, deliveries: ['chan-earlier'], suppressed: 2, drafts: [{ id: 'd-earlier' }], keptPrivate: 1,
-      triggerChannel: 'chan-earlier', locus: 'chan-earlier', engaged: new Set(['chan-earlier']), arrivals: [{ messageId: 'earlier-message', channelId: 'chan-earlier' }] });
+    const earlierChannel = { serverId: 'stub', channelId: 'chan-earlier' };
+    const earlierFields = (): Routing => ({ pin: earlierChannel, hybridHold: 'failed',
+      continuation: true, deliveries: [earlierChannel], suppressed: 2, drafts: [{ id: 'd-earlier' }], keptPrivate: 1,
+      triggerChannel: earlierChannel, locus: earlierChannel, engaged: new Set([destinationKey(earlierChannel)]), wasIn: [earlierChannel], arrivals: [{ messageId: 'earlier-message', channel: earlierChannel }] });
     const earlier = earlierFields();
     internals.turnRouting.set('assistant', earlier);
     try {
@@ -3121,9 +3146,9 @@ test("#281: a conversation fork seeded while its template's stub is written copi
     await framework.runUntilIdle().catch(() => {});
     await until(() => spills === 1, "the template's aborted batch is being annotated");
     const compiles = watchCompiles(framework);
-    const internals = framework as unknown as { createConversationAgent(name: string, channelId: string): Promise<{
+    const internals = framework as unknown as { createConversationAgent(name: string, home: { serverId: string; channelId: string }): Promise<{
       getContextManager(): { getAllMessages(): Array<{ content: ContentBlock[] }> } }> };
-    const forking = internals.createConversationAgent('assistant-chan-g1', 'world:chan');
+    const forking = internals.createConversationAgent('assistant-chan-g1', { serverId: 'stub', channelId: 'world:chan' });
     await until(() => compiles.calls > 0, "the fork's seed waits for the template's stub");
     write.open();
     const fork = await forking;

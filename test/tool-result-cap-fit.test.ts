@@ -129,6 +129,23 @@ async function withResidents(
   }
 }
 
+/** Records each spill file's label as the framework writes it. */
+const countWrites = (writes: string[]) => (framework: AgentFramework) => {
+  const internals = framework as unknown as { writeToolResultFile(label: string, content: string): Promise<unknown> };
+  const write = internals.writeToolResultFile.bind(framework);
+  internals.writeToolResultFile = (label, content) => { writes.push(label); return write(label, content); };
+};
+
+/** A page the notice advises comes back within the inline cap of 4,000 when
+ *  read alone in its own turn (each read-back code unit takes one character
+ *  of the page's text, beside its fields), and is sized to that cap, not to
+ *  the `share` of the turn that cut the result. */
+const assertPageForLaterRead = (limit: number, quotedPath: string, share: number) => {
+  const overhead = (JSON.parse(quotedPath) as string).length + 256;
+  assert.ok(limit + overhead <= 4000, `a page of ${limit} comes back within the cap`);
+  assert.ok(limit + overhead > share, `a page of ${limit} is sized to the cap, not to the share of ${share}`);
+};
+
 /** agent_settings get's view of an agent's inline cap. */
 const capProvenance = (framework: AgentFramework, name: string) =>
   (framework as unknown as { collectAgentSettingsExtensions(): Map<string, { get(agentName: string): Record<string, unknown> }> })
@@ -166,12 +183,7 @@ test("a turn's results that pass one message's bound together each take a share 
   // Two 6,000-character results in one turn, at a bound of 4,000: the strategy
   // budgets the message, not each result, spending its 4,000 in block order.
   const writes: string[] = [];
-  const countWrites = (framework: AgentFramework) => {
-    const internals = framework as unknown as { writeToolResultFile(label: string, content: string): Promise<unknown> };
-    const write = internals.writeToolResultFile.bind(framework);
-    internals.writeToolResultFile = (label, content) => { writes.push(label); return write(label, content); };
-  };
-  await withResidents({ agents: [{ name: 'solo', maxMessageTokens: 1000 }], mount: 'files', payloads: [PAYLOAD, PAYLOAD], beforeStart: countWrites }, async ({ storedAll, shownAllTo }) => {
+  await withResidents({ agents: [{ name: 'solo', maxMessageTokens: 1000 }], mount: 'files', payloads: [PAYLOAD, PAYLOAD], beforeStart: countWrites(writes) }, async ({ storedAll, shownAllTo }) => {
     // Each result's file is written once: its cut by share reuses the first cut's.
     assert.equal(writes.length, 2, JSON.stringify(writes));
     assert.equal(storedAll.length, 2);
@@ -307,5 +319,124 @@ test("a result between the cap and the bound is offered a higher cap, which woul
   await withResidents({ agents: [{ name: 'solo', maxMessageTokens: 1000 }], mount: 'files', inlineMaxChars: 3800, payload: 'y'.repeat(3900) }, async ({ stored }) => {
     assert.match(stored, /\[truncated — showing \d+ of 3900 chars; full content: workspace file files\/tool-results\/\S+\. /);
     assert.match(stored, /raise the inline cap/);
+  });
+});
+
+test("a turn that fits its bound with each result at its least keeps every notice whole", async () => {
+  // Sixteen results at 4,000: a share of 250. Thirteen of 252 characters are
+  // each shorter than the notice that would replace them, so each is stored
+  // whole; with two of 10 and the long result's notice alone the turn is
+  // about 3,600, and the reader's cut reaches nothing. Stored as
+  // notices instead, the thirteen passed the bound and the long result's
+  // notice was cut.
+  const payloads = [...Array.from({ length: 13 }, () => 'b'.repeat(252)), 'c'.repeat(10), 'd'.repeat(10), PAYLOAD];
+  await withResidents({ agents: [{ name: 'solo', maxMessageTokens: 1000 }], mount: 'f', payloads }, async ({ storedAll, shownAllTo }) => {
+    assert.deepEqual(storedAll.slice(0, 15), payloads.slice(0, 15), 'each short result is stored whole');
+    const total = storedAll.reduce((sum, text) => sum + text.length, 0);
+    assert.ok(total <= 4000, `the turn's results are ${total} characters together`);
+    assert.match(storedAll[15]!, /^\n\n\[truncated — showing 0 of \d+ chars; full content: workspace file f\/tool-results\/\S+\.txt\. Page with workspace--read \{.*\}; use nextOffsetChars as offsetChars until null, keeping limitChars\.\]$/);
+    // Under a share below the notice's room, the page is still sized to the cap.
+    const page = /"path":("[^"]+"),"offsetChars":0,"limitChars":(\d+)\}/.exec(storedAll[15]!)!;
+    assertPageForLaterRead(Number(page[2]), page[1]!, 250);
+    assert.deepEqual(await shownAllTo('solo'), storedAll, 'every result is shown as stored, the notice whole');
+  });
+});
+
+test('a result no longer than the notice that would replace it is stored whole, and no file is written for it', async () => {
+  // Twenty results at 4,000, which the long one's 6,000 pass together: a
+  // share of 200. Each of 202 characters is past its share, and its notice
+  // alone would be longer than it. Each of 400 is longer than its notice,
+  // though within the notice's room, and is cut to it.
+  const writes: string[] = [];
+  const payloads = [...Array.from({ length: 10 }, () => 'a'.repeat(202)), 'h'.repeat(400), 'i'.repeat(400), ...Array.from({ length: 7 }, () => 'e'.repeat(5)), PAYLOAD];
+  await withResidents({ agents: [{ name: 'solo', maxMessageTokens: 1000 }], mount: 'f', payloads, beforeStart: countWrites(writes) }, async ({ storedAll, shownAllTo }) => {
+    assert.equal(storedAll.length, 20);
+    assert.deepEqual(storedAll.slice(0, 10), payloads.slice(0, 10));
+    assert.deepEqual(storedAll.slice(12, 19), payloads.slice(12, 19));
+    for (const text of storedAll.slice(10, 12)) {
+      assert.match(text, /^\n\n\[truncated — showing 0 of 400 chars; full content: workspace file f\/tool-results\/\S+\.txt\. /);
+      assert.ok(text.length < 400, `stored as its notice, ${text.length} characters`);
+    }
+    assert.deepEqual(writes.map((label) => label.replace(/^.*-call_/, 'call_')), ['call_fetch_20', 'call_fetch_11', 'call_fetch_12'],
+      'files for the long result, cut alone first, and the two of 400 only');
+    assert.deepEqual(await shownAllTo('solo'), storedAll);
+  });
+});
+
+test('without a writable workspace, a result no longer than the notice saying nothing kept the rest is stored whole', async () => {
+  // Forty results at 4,000, which the long one passes: a share of 100. A
+  // result of 110 characters is shorter than the notice that says nothing
+  // kept the rest, one of 113 is as long as it, and one of 130 is longer.
+  const payloads = [...Array.from({ length: 19 }, () => 'a'.repeat(110)), 'l'.repeat(113), 'j'.repeat(130), 'k'.repeat(130), ...Array.from({ length: 17 }, () => 'e'.repeat(5)), PAYLOAD];
+  await withResidents({ agents: [{ name: 'solo', maxMessageTokens: 1000 }], payloads }, async ({ storedAll, shownAllTo }) => {
+    assert.equal(storedAll.length, 40);
+    assert.equal('\n\n[truncated — original was 113 chars; no writable workspace mount without an include, full content not retained]'.length, 113);
+    assert.deepEqual(storedAll.slice(0, 20), payloads.slice(0, 20));
+    for (const text of storedAll.slice(20, 22)) {
+      assert.equal(text, '\n\n[truncated — original was 130 chars; no writable workspace mount without an include, full content not retained]');
+    }
+    assert.deepEqual(await shownAllTo('solo'), storedAll);
+  });
+});
+
+test("a notice's paging advice is sized to the cap a later read of the file gets, not to this turn's share", async () => {
+  // Four results at 4,000: a share of 1,000, which keeps a head. A read of
+  // the file later comes back alone in its own turn, under the cap of 4,000.
+  await withResidents({ agents: [{ name: 'solo', maxMessageTokens: 1000 }], mount: 'files', payloads: [PAYLOAD, PAYLOAD, PAYLOAD, PAYLOAD] }, async ({ storedAll }) => {
+    for (const text of storedAll) {
+      const m = /Page with workspace--read (\{"path":("[^"]+"),"offsetChars":0,"limitChars":(\d+)\})/.exec(text);
+      assert.ok(m, text.slice(-300));
+      assertPageForLaterRead(Number(m[3]), m[2]!, 1000);
+    }
+  });
+});
+
+test('a result whose spill write fails, with a notice no shorter than the result, is stored whole', async () => {
+  // Twenty results at 4,000, which the long one passes: a share of 200. Each
+  // of 320 characters is longer than the notice its cut was measured with,
+  // but its write fails, and the notice naming the failure is longer still.
+  const failWrites = (framework: AgentFramework) => {
+    (framework as unknown as { writeToolResultFile(label: string): Promise<unknown> }).writeToolResultFile =
+      async (label) => ({ path: `f/tool-results/${label}.txt`, error: 'e'.repeat(200) });
+  };
+  const payloads = [...Array.from({ length: 10 }, () => 'g'.repeat(320)), ...Array.from({ length: 9 }, () => 'e'.repeat(5)), PAYLOAD];
+  await withResidents({ agents: [{ name: 'solo', maxMessageTokens: 1000 }], mount: 'f', payloads, beforeStart: failWrites }, async ({ storedAll }) => {
+    assert.deepEqual(storedAll.slice(0, 19), payloads.slice(0, 19));
+    assert.match(storedAll[19]!, /FAILED \(e+\); content over the cap was not retained\]$/);
+  });
+});
+
+test('a result alone in its turn past a bound smaller than its notice is still spilled to a file', async () => {
+  // A bound of 200: the result of 250 characters is shorter than the notice
+  // that replaces it, but a reader cuts anything past 200, so only the file
+  // keeps the rest. Keeping a result no longer than its notice whole is for a
+  // share of a turn's bound, not a reader's own.
+  const writes: string[] = [];
+  await withResidents({ agents: [{ name: 'solo', maxMessageTokens: 50 }], mount: 'f', payload: 'm'.repeat(250), beforeStart: countWrites(writes) }, async ({ stored }) => {
+    assert.match(stored, /^\n\n\[truncated — showing 0 of 250 chars; full content: workspace file f\/tool-results\/\S+\.txt\. /);
+    assert.equal(writes.length, 1);
+  });
+});
+
+test('under a share, a text holding an image slot whose write fails is stored cut, as its count before the write took it', async () => {
+  // The count takes a result's cut before its write, measuring the notice a
+  // written file gives. A text with a slot, longer than that notice but no
+  // longer than the one naming a failed write, stays cut after the failure,
+  // so the slots the count found are the ones stored.
+  await withResidents({ agents: [{ name: 'solo', maxMessageTokens: 1000 }], mount: 'f', payload: 'x' }, async ({ framework }) => {
+    const internals = framework as unknown as {
+      spillNoticeLength(label: string, content: string, shown: null, bound: number, readCap: number): number;
+      writeToolResultFile(label: string): Promise<unknown>;
+      spillOrTruncate(content: string, cap: number, label: string, shown: null, bound: number, written: undefined, share: { readCap: number }): Promise<{ text: string }>;
+    };
+    const slot = '\n[image: image/png, 68B]';
+    const probe = 'p'.repeat(250) + slot;
+    const measured = internals.spillNoticeLength('zz-slot', probe, null, 200, 4000);
+    const content = 'p'.repeat(measured + 1 - slot.length) + slot;
+    internals.writeToolResultFile = async (label) => ({ path: `f/tool-results/${label}.txt`, error: 'e'.repeat(200) });
+    const stored = await internals.spillOrTruncate(content, 200, 'zz-slot', null, 200, undefined, { readCap: 4000 });
+    assert.ok(stored.text.length >= content.length, `the failure's notice (${stored.text.length}) is no shorter than the text (${content.length})`);
+    assert.match(stored.text, /FAILED/);
+    assert.notEqual(stored.text, content);
   });
 });

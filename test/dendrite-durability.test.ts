@@ -374,7 +374,7 @@ describe('5: stopAgent releases the window as the idle reap does', () => {
       timestamp: new Date().toISOString(), metadata: { channel_type: 'im' }, triggerInference: true,
     } as unknown as ProcessEvent);
     await framework.runUntilIdle();
-    const binding = framework.getConversationRouter()!.getBinding('missing-channel');
+    const binding = framework.getConversationRouter()!.getBinding({ serverId: 'srv', channelId: 'missing-channel' });
     assert.ok(binding, 'the incoming DM spawns a conversation fork');
     return framework.getAgent(binding.agentName)!;
   }

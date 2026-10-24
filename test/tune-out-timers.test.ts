@@ -72,6 +72,8 @@ function harness(
   /** The coordinator's own durable state: the all-except hold lives here. */
   const coordinatorState = new Map<string, unknown>();
   const registry = {
+    // Each channel's id is unique here, so it's shown by its id.
+    nameShown: (channel: { channelId: string }) => channel.channelId,
     listChannelsRaw: () => (state ? [{ serverId: 'disc', descriptor: { id: '#a' } }] : []),
     readCoordinatorState: (id: string) => coordinatorState.get(id) ?? null,
     writeCoordinatorState: (id: string, value: unknown) => { if (value === null) coordinatorState.delete(id); else coordinatorState.set(id, value); },
