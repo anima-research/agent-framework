@@ -126,6 +126,7 @@ type Logged = { kind: 'note'; rows: SentRow[]; identity: unknown; compileId: unk
 async function turn(opts: {
   scripts?: NormalizedResponse[][]; first?: ContentBlock[]; alter?: (s: YieldingStream) => YieldingStream;
   guard?: boolean; binds?: boolean; agent?: Record<string, unknown>; noProvenance?: boolean;
+  render?: (rendered: Array<ContentBlock[] | null> | undefined) => Array<ContentBlock[] | null> | undefined;
 } = {}) {
   const dir = mkdtempSync(join(tmpdir(), 'af-sent-rows-'));
   const membrane = new Scripted(opts.scripts ?? [twoRounds(opts.first ?? [signed('sig-1'), text('Calling.')])], opts.alter);
@@ -143,6 +144,12 @@ async function turn(opts: {
       log.push({ kind: 'note', rows: [...rows], identity, compileId, storedIds: contextManager.getAllMessages().map((m) => m.id) });
       return true;
     };
+    if (opts.render) {
+      // A render, as a strategy with renderAsNewest gives one, from the stored bodies: the default strategy here
+      // (PassthroughStrategy) has none, so the framework would compare the stored bodies themselves.
+      const cm = contextManager as unknown as { renderAsNewest: (ids: string[]) => Array<ContentBlock[] | null> | undefined };
+      cm.renderAsNewest = (ids) => opts.render!(ids.map((id) => contextManager.getMessage(id)?.content ?? null));
+    }
     const compile = contextManager.compile.bind(contextManager);
     contextManager.compile = (async (budget, injections, o) => {
       const result = await compile(budget, injections, o);
@@ -211,6 +218,17 @@ describe('a stream\'s rounds, noted at each tool boundary and at its end', () =>
     assert.ok(committing.length >= 2, 'the restart compiled');
     assert.ok(firstNote < committing[1]!, 'the end note lands before the restart\'s compile');
     assert.deepEqual(notes.at(-1)!.rows, [reply2], 'the restart\'s stream notes its own reply after its compile');
+  });
+
+  it('compares each stored row as the next compile renders it, so results the render cuts are marked', async () => {
+    // As a per-message cap or an image limit would: the next compile renders each results row otherwise than the
+    // stream was submitted it.
+    const cut = (rendered: Array<ContentBlock[] | null> | undefined) => rendered?.map((content) => content?.map((block) =>
+      block.type === 'tool_result' ? { ...block, content: '[cut]' } as ContentBlock : block) ?? null);
+    const { notes } = await turn({ render: cut });
+    assert.equal(notes.length, 3);
+    assert.deepEqual(notes[2]!.rows.map((row) => typeof row === 'string' ? 'id' : row),
+      ['id', UNSTORED, 'id', UNSTORED, 'id'], 'the replies render as stored; the results don\'t');
   });
 
   it('takes no empty text block in a reply as a difference, since neither request carries one', async () => {
