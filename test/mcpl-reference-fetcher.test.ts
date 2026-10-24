@@ -145,11 +145,13 @@ test("a registry journal keeps each record as it stood when it opened, through a
   reg.register(t(x), 'first');
   const three = reg.openJournal();
   const four = reg.openJournal();
+  assert.equal(reg.journalCount, 2);
   reg.register(t(x), 'second');
   assert.notEqual(three.before(x), four.before(x));
   assert.deepEqual(three.before(x)?.serverIds, ['first']);
   assert.notEqual(three.before(x)?.serverIds, four.before(x)?.serverIds);
   three.close();
+  assert.equal(reg.journalCount, 1);
   four.close();
   assert.equal(reg.journalCount, 0);
 });

@@ -121,7 +121,7 @@ export function toolResultBlocks(data: unknown, dataIsContent?: boolean, claims?
 
 /** Whether a tool result's data is a content array, which toolResultBlocks
  *  shows block by block. */
-function isContentArray(data: unknown, dataIsContent?: boolean): data is unknown[] {
+export function isContentArray(data: unknown, dataIsContent?: boolean): data is unknown[] {
   return Array.isArray(data)
     && (dataIsContent === true || data.every((element) => isPlainRecord(element) && MCP_BLOCK_TYPES.has(element.type as string)));
 }

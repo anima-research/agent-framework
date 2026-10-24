@@ -118,6 +118,7 @@ import {
   goesNative,
   nonErrorResultText,
   nonErrorResultTextOrThrow,
+  isContentArray,
   resultClaimsOrThrow,
   scriptViewClaims,
   shownToScript,
@@ -22597,10 +22598,10 @@ export class AgentFramework {
     // them, which decide where a link's object shows its uri
     // (referenceBlockForScript's line). Its records are the registry's as
     // the model's line leaves it, before the lane's own registrations
-    // (openJournal): the demand loop below registers the result's top-level
-    // blocks in its order, as the line's render does, and the treatment then
-    // registers, rebinds and evicts as it goes, which the line never sees
-    // (Ada-1017, room-203 #202683, #203011).
+    // (openJournal): where the line renders the result's blocks, the demand
+    // loop below registers them in their order, as the line's render does;
+    // the treatment then registers, rebinds and evicts as it goes, which the
+    // line never sees (Ada-1017, room-203 #202683, #203011, #203172).
     let line: ScriptLine | undefined;
     let journal: RegistryJournal | undefined;
     try {
@@ -22612,22 +22613,34 @@ export class AgentFramework {
         } catch (err) {
           return failed(err);
         }
+        // The loop's registrations are the line's own only where the line
+        // renders these blocks: a content array's, block by block at the top
+        // level, and not a failure's, whose line is its error. There the loop
+        // registers links too, in the result's order, and the journal opens
+        // after it. Elsewhere the line walks at depth, or registers nothing,
+        // so the journal opens before the loop, which leaves links to the
+        // treatment (Ada-1017, room-203 #203172).
+        const blocksAreLines = !isError && isContentArray(result.data, result.dataIsContent);
+        if (showsBlocks && !blocksAreLines) {
+          journal = referenceRegistry.openJournal();
+          line = { claims: lineClaims, recordBefore: journal.before };
+        }
         const fetcher = this.getReferenceFetcher();
         for (const block of result.data) {
           const c = classifyBlock(block);
-          if (c.kind !== 'reference') continue;
+          if (c.kind !== 'reference' || (c.testimony.fromLink && !blocksAreLines)) continue;
           // Registered, not only found, so a re-issued reference's claims
           // replace a link's, or a stale reference's, before the fetch reads
           // them, as on any other path, while the record isn't fetched yet. A
           // record its uri already has keeps the server it's bound to.
           const record = referenceRegistry.register(c.testimony);
-          // A link is registered too, in the result's order, and not fetched:
-          // the registry then holds its records in the order the model's own
-          // render makes, so a registration here evicts what that render's
-          // would, short of more references in one result than the registry
-          // holds, and the text route, which reads the live registry, decides
-          // each link's uri as the model's line does (Ada-1017, room-203
-          // #203000).
+          // A link of blocks the line renders is registered too, in the
+          // result's order, and not fetched: the registry then holds its
+          // records in the order the model's own render makes, so a
+          // registration here evicts what that render's would, short of more
+          // references in one result than the registry holds, and the text
+          // route, which reads the live registry, decides each link's uri as
+          // the model's line does (Ada-1017, room-203 #203000).
           if (c.testimony.fromLink) continue;
           // A uri any of the result's references gives an expiry that counts
           // isn't fetched, as autoFetchReferences passes over one that any block
@@ -22640,10 +22653,10 @@ export class AgentFramework {
           const outcome = await fetcher.fetch(record);
           if (!outcome.ok) console.error(`[rfc005] script-demand fetch of ${record.refId} failed: ${outcome.error}`);
         }
-        // The loop's registrations are the ones the model's line makes; the
-        // treatment's, below, are the script lane's own, which the journal
-        // keeps the line's records from (Ada-1017, room-203 #203011).
-        if (showsBlocks) {
+        // Where the loop's registrations are the ones the model's line makes,
+        // the treatment's, below, are the script lane's own, which the
+        // journal keeps the line's records from (Ada-1017, room-203 #203011).
+        if (showsBlocks && blocksAreLines) {
           journal = referenceRegistry.openJournal();
           line = { claims: lineClaims, recordBefore: journal.before };
         }

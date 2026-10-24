@@ -830,6 +830,10 @@ test("a module's result a script reads as text registers its links in the result
     ];
     const out = await exit({ success: true, data }, 'fwd--whole', false);
     assert.ok(!out.includes('text-order/report.csv'), out);
+    const reply = JSON.parse(out) as { content: [{ text: string }]; isError: boolean };
+    assert.equal(reply.isError, false, out);
+    // The link's line rendered, as the withheld stub that names it.
+    assert.match(reply.content[0].text, /^\[ref_\w+\] report\.csv/m, out);
     assert.equal(referenceRegistry.findByUri(uri)?.testimony.disposition, 'never');
   });
 });
@@ -862,7 +866,54 @@ test("a module's view reads the registry as the model's line leaves it: where th
   });
 });
 
-test("a link's record read through an eviction keeps its server binding, so a link the host can fetch shows a script no uri", { timeout: 60_000 }, async () => {
+test("a module's array the model's line walks at depth keeps its never on a nested link the walk reaches before a later top-level one, as a script reads it", { timeout: 90_000 }, async () => {
+  await withPeers(async ({ answer, script, exit }) => {
+    // Not a content array, so the model's line walks it depth-first: it
+    // reaches the nested link first, which keeps its record, and then the
+    // later top-level link, whose registration evicts another.
+    const uri = 'https://elsewhere.example.invalid/walk-order/report.csv';
+    const data = () => [
+      { wrap: { type: 'resource_link', uri, name: 'report.csv' } },
+      { type: 'resource_link', uri: 'https://files.example.invalid/walk-order/new.csv', name: 'new.csv' },
+    ];
+    const seed = async (tag: string): Promise<void> => {
+      answer({ content: [{ type: 'resource', uri, name: 'report.csv', disposition: 'never' }], structuredContent: {} });
+      await script('mcpl--files--attach');
+      fillAfter(`walk-order-${tag}`);
+    };
+    await seed('line');
+    const line = nonErrorResultText({ data: data() });
+    assert.ok(!line.includes('walk-order/report.csv'), line);
+    for (const structured of [true, false]) {
+      await seed(structured ? 'view' : 'text');
+      const out = await exit({ success: true, data: data(), ...(structured ? { structured: {} } : {}) }, 'fwd--whole', false);
+      assert.ok(!out.includes('walk-order/report.csv'), `${structured ? 'view' : 'text'}: ${out}`);
+      assert.equal((JSON.parse(out) as { isError: boolean }).isError, false, out);
+    }
+    assert.equal(referenceRegistry.journalCount, 0);
+  });
+});
+
+test("a module's failed result, whose model's line is its error and registers nothing, keeps a never its blocks' registrations would evict, as a script reads it", { timeout: 60_000 }, async () => {
+  await withPeers(async ({ answer, script, exit }) => {
+    const uri = 'https://elsewhere.example.invalid/error-order/report.csv';
+    answer({ content: [{ type: 'resource', uri, name: 'report.csv', disposition: 'never' }], structuredContent: {} });
+    await script('mcpl--files--attach');
+    fillAfter('error-order');
+    const data = [
+      { type: 'resource', uri: 'https://files.example.invalid/error-order/new.csv', name: 'new.csv' },
+      { type: 'resource_link', uri, name: 'report.csv' },
+    ];
+    const out = await exit({ success: false, isError: true, error: 'the attach failed', data, structured: {} } as unknown as ToolResult, 'fwd--whole', false);
+    const view = JSON.parse(out) as { content: Array<Record<string, unknown>>; isError: boolean };
+    assert.equal(view.isError, true, out);
+    assert.ok(!out.includes('error-order/report.csv'), out);
+    assert.equal(typeof view.content[1]!.refId, 'string', out);
+    assert.equal(referenceRegistry.journalCount, 0);
+  });
+});
+
+test("a link's line reads its record's server binding as it stood before an eviction the treatment makes, so a link the host could fetch shows a script no uri", { timeout: 60_000 }, async () => {
   await withPeers(async ({ answer, script, exit }) => {
     // Bound to the files server, on its origin, by the peer's dispatch.
     const uri = 'https://files.example.invalid/bound-evicted/report.csv';
@@ -1030,9 +1081,12 @@ test("where the treatment fails after the claims walk read the view, a peer's re
       const fromPeer = JSON.parse(await script('mcpl--files--attach')) as { content: [{ text: string }]; isError: boolean };
       assert.equal(fromPeer.isError, true);
       assert.match(fromPeer.content[0].text, /^tool 'mcpl--files--attach' returned a result that can't be converted to JSON/);
+      // Each route closed its journal on the way out of the failure too.
+      assert.equal(referenceRegistry.journalCount, 0, 'peer');
       const fromModule = JSON.parse(await exit({ success: true, data: content(), structured: {} }, 'fwd--whole', false)) as { content: [{ text: string }]; isError: boolean };
       assert.equal(fromModule.isError, true);
       assert.match(fromModule.content[0].text, /^tool 'fwd--whole' returned a result that can't be converted to JSON/);
+      assert.equal(referenceRegistry.journalCount, 0, 'module');
     } finally {
       referenceRegistry.register = real;
     }

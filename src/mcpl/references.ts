@@ -591,12 +591,13 @@ export class ReferenceRegistry {
    * or evicts its record, or null where the uri had none then. `before(uri)`
    * gives that copy, or, where no registration has named the uri since, the
    * record as it is, which is the same. A fetch that saves a copy while it's
-   * open sets its record's saved path without registering, so a record no
-   * registration has named since is read saved, and one a registration
-   * named first is read as it stood, unsaved. A fetch saves only what passed
-   * the checks a link's line reads too, so either reads as a record the host
-   * can fetch. Each open has its own copies, so lanes that overlap keep
-   * theirs apart, and closing one lets its copies go.
+   * open sets its record's saved path without registering: a record no
+   * registration has named since is read with it, and one a registration
+   * named first is read as it stood then, saved or not. For a record a fetch
+   * saved meanwhile, both readings are of one the host can fetch, since a
+   * fetch saves only what passed the checks a link's line reads too. Each
+   * open has its own copies, so lanes that overlap keep theirs apart, and
+   * closing one lets its copies go.
    */
   openJournal(): RegistryJournal {
     const copies = new Map<string, ReferenceRecord | null>();
