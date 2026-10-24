@@ -57,6 +57,10 @@
   refused in main's words. Under the author rule a placeholder for content
   the host can't read is stored under its author too, `User: [Content not
   shown: …]`, which main's parity test now counts as such.
+- Merged `main` at `8ec1de5a` (0.26.2's changelog and #720). At a tool
+  boundary the branch still releases each stored message's landed mail and
+  skips one held from the residents, and what it injects is then #720's: a
+  message the render gives null goes in as stored.
 - Merged `main` at `a4a74b48` (0.26.0 and after), where #710's
   server-qualified channels meet the branch. A conversation fork's home
   stays the agent registry's `homeChannel`, which the framework reads

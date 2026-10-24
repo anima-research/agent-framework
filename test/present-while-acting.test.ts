@@ -1491,19 +1491,18 @@ describe('present while acting', () => {
     await framework.stop();
   });
 
-  it("an addressed message a boundary leaves out of the injection doesn't re-pin the turn: the live stream heard only the notice of it", async () => {
-    // The control is the test above that re-pins: the same DM, injected,
-    // moves the trailing prose to the DM. The notice is a system line, which
-    // moves no locus.
+  it("an addressed message the render gives null goes in as stored, and re-pins the turn", async () => {
+    // As the test above, with the render placing the DM before its window:
+    // the live stream hears it as stored, so the trailing prose follows it.
     membrane.pushResponse(createMockResponse([
       { type: 'text', text: 'Station four, proceeding.' },
       { type: 'tool_use', id: 'c1', name: 'robot--move', input: { dir: 'north' } },
     ] as ContentBlock[], 'tool_use'));
     membrane.pushResponse(createMockResponse([
-      { type: 'text', text: 'Carrying on where I was.' },
+      { type: 'text', text: 'Answering the person who addressed me.' },
     ] as ContentBlock[]));
 
-    const framework = await createFramework();
+    const framework = await createFramework({ speech: { locus: 'latest-inbound' } }); // the re-pin is the legacy rule
     const routed = stubChannelRegistry(framework);
     const cm = framework.getAgent('assistant')!.getContextManager();
     let rendered = 0;
@@ -1515,22 +1514,21 @@ describe('present while acting', () => {
     trigger(framework);
     await framework.runUntilIdle();
 
-    assert.equal(rendered, 1, 'the premise: the boundary rendered the DM, and left it out');
+    assert.equal(rendered, 1, 'the premise: the boundary rendered the DM');
     const injected = membrane.lastStream!.receivedToolResultOptions[0]?.injectedMessages ?? [];
-    assert.equal(injected.length, 1, 'only the notice of what was left out is injected');
-    assert.ok(JSON.stringify(injected[0]!.content).startsWith('[{"type":"text","text":"[not shown]'), JSON.stringify(injected[0]));
+    assert.deepEqual(injected[0], { participant: 'Antra', content: [{ type: 'text', text: 'hey, quick question over here?' }] }, 'the DM, as stored');
     assert.deepEqual(routed, [
       { text: 'Station four, proceeding.', locus: 'chan-live-1' },
-      { text: 'Carrying on where I was.', locus: 'chan-live-1' },
+      { text: 'Answering the person who addressed me.', locus: 'discord:dm:antra' },
     ]);
 
     await framework.stop();
   });
 
-  it("a budget restart takes as an arrival an addressed message its boundary stored and left out of the injection", async () => {
-    // The boundary renders the DM as null, as for one the next compile won't
-    // send among its newest, so the live stream never hears it. The restart
-    // compiles anew, and the DM is still an arrival of the turn it continues.
+  it("a budget restart takes as an arrival an addressed message its boundary stored, though the render gave it null", async () => {
+    // The boundary renders the DM as null, and the stream is over its budget,
+    // so no live stream hears it. The restart compiles anew, and the DM is
+    // still an arrival of the turn it continues.
     const overBudget = createMockResponse([
       { type: 'tool_use', id: 'c1', name: 'robot--move', input: { dir: 'north' } },
     ] as ContentBlock[], 'tool_use');
@@ -1551,7 +1549,7 @@ describe('present while acting', () => {
     await framework.runUntilIdle();
 
     assert.equal(membrane.calls.length, 2, 'control: the turn restarted for its budget');
-    assert.equal(rendered, 1, 'the premise: the boundary rendered the DM, and left it out');
+    assert.equal(rendered, 1, 'the premise: the boundary rendered the DM');
     assert.deepEqual(routed, [{ text: 'After the restart.', locus: 'discord:dm:antra' }], 'the restart re-pinned to the DM');
 
     await framework.stop();
