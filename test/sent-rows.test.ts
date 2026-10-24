@@ -195,8 +195,8 @@ async function turn(opts: {
   scripts?: NormalizedResponse[][]; first?: ContentBlock[]; alter?: (s: YieldingStream) => YieldingStream;
   guard?: boolean; binds?: boolean; agent?: Record<string, unknown>; noProvenance?: boolean;
   render?: (rendered: Array<ContentBlock[] | null> | undefined) => Array<ContentBlock[] | null> | undefined;
-  /** What the context manager's noteRequestSent does: returns true (the default) or false, throws, or is absent. */
-  noteAs?: boolean | 'throw' | 'absent';
+  /** What the context manager's noteRequestSent does: returns true (the default) or false, or throws. */
+  noteAs?: boolean | 'throw';
   last?: ContentBlock[];
 } = {}) {
   const dir = mkdtempSync(join(tmpdir(), 'af-sent-rows-'));
@@ -211,12 +211,11 @@ async function turn(opts: {
       thinkingBinding: { binds: opts.binds ?? true }, ...(opts.guard ? { toolResultGuard: true } : {}), ...opts.agent,
     } as never);
     const log: Logged[] = [];
-    (contextManager as unknown as { noteRequestSent: unknown }).noteRequestSent = opts.noteAs === 'absent' ? undefined
-      : (rows: SentRow[], identity: unknown, compileId: unknown) => {
-        log.push({ kind: 'note', rows: [...rows], identity, compileId, storedIds: contextManager.getAllMessages().map((m) => m.id) });
-        if (opts.noteAs === 'throw') throw new Error('the store is gone');
-        return opts.noteAs ?? true;
-      };
+    contextManager.noteRequestSent = (rows, identity, compileId) => {
+      log.push({ kind: 'note', rows: [...rows], identity, compileId, storedIds: contextManager.getAllMessages().map((m) => m.id) });
+      if (opts.noteAs === 'throw') throw new Error('the store is gone');
+      return opts.noteAs ?? true;
+    };
     let renders = 0;
     const renderAsNewest = contextManager.renderAsNewest.bind(contextManager);
     contextManager.renderAsNewest = ((ids: string[]) => { renders++; return renderAsNewest(ids); }) as typeof renderAsNewest;
@@ -371,11 +370,4 @@ describe('a stream\'s rounds, noted at each tool boundary and at its end', () =>
     assert.match(errors[0]!, /couldn't note the rounds this stream sent/);
   });
 
-  it('notes nothing, and renders nothing to note, with a context manager that has no noteRequestSent', async () => {
-    const { notes, renders, stored, errors } = await turn({ noteAs: 'absent' });
-    assert.equal(notes.length, 0);
-    assert.equal(renders, 0);
-    assert.equal(replies(stored).length, 3, 'the turn ran');
-    assert.deepEqual(errors, []);
-  });
 });

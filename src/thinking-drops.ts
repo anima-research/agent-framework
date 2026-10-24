@@ -35,12 +35,6 @@ export interface StreamThinkingDrops {
   recordedAfter?: number;
 }
 
-/** A compile's `thinkingRecordedAfter`, read where context-manager gives it: a sequence, or nothing. */
-export function recordedAfterOf(result: unknown): number | undefined {
-  const v = (result as { thinkingRecordedAfter?: unknown } | null | undefined)?.thinkingRecordedAfter;
-  return typeof v === 'number' && Number.isSafeInteger(v) && v >= 0 ? v : undefined;
-}
-
 /** A signed block's identity on the wire: a thinking block's signature, a redacted block's data. */
 function bindingKey(block: ContentBlock | undefined): string | undefined {
   const b = block as { type?: unknown; signature?: unknown; data?: unknown } | undefined;

@@ -115,8 +115,8 @@ describe('the stream start\'s placeDrops', () => {
     agent.cancelStream();
   });
 
-  it('carries the compile\'s thinkingRecordedAfter when it gives a sequence, and nothing otherwise', async () => {
-    const start = async (thinkingRecordedAfter: unknown) => {
+  it('carries the compile\'s thinkingRecordedAfter when it gives one, and nothing otherwise', async () => {
+    const start = async (thinkingRecordedAfter: number | undefined) => {
       const contextManager = {
         compile: async () => ({ messages: compiledMessages, systemInjections: [], provenance: compiled.provenance, thinkingRecordedAfter }),
       } as unknown as ContextManager;
@@ -127,8 +127,6 @@ describe('the stream start\'s placeDrops', () => {
     };
     assert.equal((await start(6)).thinkingRecordedAfter, 6);
     assert.equal((await start(0)).thinkingRecordedAfter, 0, 'a sequence of 0 is one');
-    for (const none of [undefined, null, -1, 1.5, '6', Number.NaN]) {
-      assert.equal('thinkingRecordedAfter' in (await start(none)), false, String(none));
-    }
+    assert.equal('thinkingRecordedAfter' in (await start(undefined)), false);
   });
 });

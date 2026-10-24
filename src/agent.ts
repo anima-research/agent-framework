@@ -4,7 +4,7 @@ import { createHash } from 'node:crypto';
 import type { CacheWireReceipt, KvUnifiedRequestHooks } from './kv-unified-wire.js';
 import { ToolResultGuard } from './tool-result-guard.js';
 import { withoutTokenEstimates } from './thinking-token-stamp.js';
-import { placeThinkingDrops, recordedAfterOf, type CompiledForRequest, type PlacedDrop } from './thinking-drops.js';
+import { placeThinkingDrops, type CompiledForRequest, type PlacedDrop } from './thinking-drops.js';
 import { carriedBlock, type SentRow } from './sent-rows.js';
 import { injectionsAsStored } from './text-as-stored.js';
 import { assertBooleanSetting, holdsSettings, kindOf } from './config-checks.js';
@@ -43,8 +43,8 @@ export interface ActivationRequestOptions {
 }
 
 /** A compile's render stats, as context-manager's `getRenderStats()` types
- *  them; context-manager 0.20.1 gives each compile its own, where the
- *  strategy records them, in `CompileResult.renderStats`. */
+ *  them; each compile carries its own, where the strategy records them, in
+ *  `CompileResult.renderStats`. */
 export type RenderStats = NonNullable<ReturnType<ContextManager['getRenderStats']>>;
 
 /** The render stats of the dry compile behind each request a dry run
@@ -66,7 +66,7 @@ export function dryCompileStatsOf(request: object): RenderStats | null {
  */
 export interface BindingCompileOptions {
   thinkingBinding?: { binds: boolean; dropBlock: boolean; participant: string };
-  identity?: { system: string; tools: string; model: string; request: string };
+  identity?: RequestIdentity;
 }
 
 export interface StartStreamResult {
@@ -102,6 +102,7 @@ import type {
   HotContextSettingsUpdate,
   MessageId,
   MessageMetadata,
+  RequestIdentity,
 } from '@animalabs/context-manager';
 import type {
   AgentConfig,
@@ -1570,12 +1571,10 @@ export class Agent {
     );
     let { messages } = compiledResult;
     const { systemInjections } = compiledResult;
-    // context-manager 0.20.1's field, read structurally so this compiles
-    // against 0.20.0 too, whose compiles carry none.
-    const { renderStats } = compiledResult as typeof compiledResult & { renderStats?: RenderStats };
+    const { renderStats } = compiledResult;
     // What the request is built from, as the compile returned it: a block the provider drops is found again in
     // it, through the copies below, by its signature (placeThinkingDrops).
-    const recordedAfter = recordedAfterOf(compiledResult);
+    const recordedAfter = compiledResult.thinkingRecordedAfter;
     const compiled: CompiledForRequest = {
       messages: compiledResult.messages,
       ...(compiledResult.provenance ? { provenance: compiledResult.provenance } : {}),
@@ -1691,19 +1690,16 @@ export class Agent {
   }
 
   /** The stream's way to tell the context manager what its later rounds sent, with the head its compile was given:
-   *  where the agent's model binds its thinking and the context manager can be told (its `noteRequestSent`, from
-   *  a release that keeps a thinking-binding record). */
+   *  where the agent's model binds its thinking (context-manager's `noteRequestSent`). */
   private requestNotes(binding: BindingCompileOptions, compiled: CompiledForRequest): Pick<StartStreamResult, 'noteRequestSent'> {
     const identity = binding.identity;
     // Each note names the compile the stream was built from, so a note can't vouch for this stream under a record a
     // later committing compile with binds wrote. A compile that reports no provenance gives the stream nothing to name, and the
     // stream notes nothing: its replies go without their thinking at the next compile, never refused.
     const compileId = compiled.provenance?.compileId;
-    const cm = this.contextManager as unknown as {
-      noteRequestSent?: (rows: readonly SentRow[], identity: NonNullable<BindingCompileOptions['identity']>, compileId: string) => boolean;
-    };
-    if (!identity || typeof compileId !== 'string' || typeof cm.noteRequestSent !== 'function') return {};
-    return { noteRequestSent: (rows) => cm.noteRequestSent!(rows, identity, compileId) };
+    if (!identity || compileId === undefined) return {};
+    const cm = this.contextManager;
+    return { noteRequestSent: (rows) => cm.noteRequestSent(rows, identity, compileId) };
   }
 
   /**

@@ -255,9 +255,7 @@ export interface AgentConfig {
      *   `thinking-binding-loss` ops alert, once per incident and again if a
      *   call drops more. The provider reports drops only on a request that
      *   carries the drop control; without it, such a block is refused.
-     * A context manager without such a record ignores the compile options
-     * and has no `noteRequestSent`, so nothing is noted and nothing alerts;
-     * the budget rule above holds either way. The record and the notes
+     * The record and the notes
      * vouch for requests as agent-framework hands them to membrane, so a
      * membrane `beforeRequest` hook that changes a request must change every
      * request alike. Default false: compiles and streams are as they were.

@@ -120,7 +120,8 @@ async function turn(
     const compile = contextManager.compile.bind(contextManager);
     contextManager.compile = (async (...args: Parameters<typeof compile>) => {
       const result = await compile(...args);
-      if (relative === undefined) return result;
+      // No record start: a compile that gives none, as before a branch's record is written.
+      if (relative === undefined) return { ...result, thinkingRecordedAfter: undefined };
       const at = result.messages.findIndex((m) => m.content.some((b) => (b as { signature?: unknown }).signature === SIG));
       const source = result.provenance?.messages[at];
       assert.ok(source?.kind === 'raw', 'the compile names the stored reply');
@@ -213,6 +214,6 @@ describe('the operators\' alert on a framework turn', () => {
 
   it('stays quiet for a reply at the record\'s start, and where the compile gives no record start', async () => {
     assert.equal((await turn(0, (at) => [[dropped(at)], [dropped(at)], []])).length, 0, 'minted before the record began');
-    assert.equal((await turn(undefined, (at) => [[dropped(at)], [dropped(at)], []])).length, 0, 'a context manager without a record');
+    assert.equal((await turn(undefined, (at) => [[dropped(at)], [dropped(at)], []])).length, 0, 'a compile that gives no record start');
   });
 });

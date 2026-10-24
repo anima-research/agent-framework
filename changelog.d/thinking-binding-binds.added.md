@@ -1,7 +1,7 @@
 - `thinkingBinding.binds` in an agent's config says the agent's model binds
-  its signed thinking to the conversation before it. With a context manager
-  that keeps a record of what each branch sent
-  (anima-research/context-manager#155), that thinking can then be left out
+  its signed thinking to the conversation before it. context-manager 0.22.0
+  keeps a record of what each branch sent
+  (anima-research/context-manager#155), so that thinking can then be left out
   once its earlier conversation changes, rather than sent and refused or
   dropped. It's off by default.
   - **What compiles are told:** each compile the agent sends, a framework
@@ -9,15 +9,13 @@
     `thinkingBinding` (`binds`, `dropBlock`, and the agent's name as
     `participant`) and `identity`, digests of the request's system text,
     tools, model and the rest of what it carries ahead of its messages.
-    `previewContextSettings` passes the binding too. A context manager
-    without the record ignores both.
+    `previewContextSettings` passes the binding too.
   - **What streams note:** at each tool boundary and at its end, a framework
     stream tells the context manager which stored rows its requests carried
     as stored (`noteRequestSent`), naming the compile it was built from, so
-    their thinking is kept at the next compile. A context manager without
-    `noteRequestSent` is told nothing. The direct API (`runInference`) notes
-    nothing, so with `binds` set, each direct-API reply's thinking is left
-    out at the compile after it's stored.
+    their thinking is kept at the next compile. The direct API
+    (`runInference`) notes nothing, so with `binds` set, each direct-API
+    reply's thinking is left out at the compile after it's stored.
   - **No budget restart mid-turn:** with `physicalWindowTokens` set as well,
     `maxStreamTokens` no longer starts a new stream at a tool boundary, since
     the new stream's compile can take the turn's earlier reasoning out of the

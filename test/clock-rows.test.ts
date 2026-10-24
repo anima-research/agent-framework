@@ -378,8 +378,8 @@ describe('clock rows in the framework', () => {
     const x = await make({ clock: { intervalMinutes: 10 }, thinkingBinding: { binds: true } } as Partial<AgentConfig>);
     x.membrane.supportsInjectedMessages = true; // as membrane's native path declares
     const notes: string[][] = [];
-    const cm = x.framework.getAgent('assistant')!.getContextManager() as unknown as { noteRequestSent: unknown };
-    cm.noteRequestSent = (rows: unknown[]) => { notes.push(rows.map((row) => typeof row === 'string' ? row : 'marker')); return true; };
+    const cm = x.framework.getAgent('assistant')!.getContextManager();
+    cm.noteRequestSent = (rows) => { notes.push(rows.map((row) => typeof row === 'string' ? row : 'marker')); return true; };
     try {
       setClock('2026-10-21T10:41:10Z');
       await wake(x, event('warm up'), [{ type: 'text', text: 'ok' }]);
