@@ -301,14 +301,20 @@ function credentialName(name: string): string {
  * `name=value&…` as a query is. A name with no value carries nothing, as an
  * anchor (`#token`) or `?token=` doesn't. A `?` or `;` inside either may
  * separate parameters too, as in a route kept in a fragment
- * (`#/reset?token=…`), so the parameters are read both with and without
- * them as separators, and one with a value in either reading counts. A
- * parameter's value that is itself an absolute uri, as an image proxy's
- * `?url=<a percent-encoded signed URL>` is once decoded, is read the same
- * way, nested up to CREDENTIAL_NESTING deep, and a uri nested deeper may
- * carry one, since a bound that let the next level through would be the
- * same gap one level down. A uri that doesn't parse, even as a relative
- * reference, may, since its parts can't be read.
+ * (`#/reset?token=…`), so the parameters are read both with and without them
+ * as separators, and one with a value in either reading counts. A
+ * parameter's value that is itself a uri is read the same way
+ * (nestedMayCarry): an absolute one, as an image proxy's `?url=<a
+ * percent-encoded signed URL>` is once decoded; a protocol-relative one, or
+ * a relative one with a query or fragment, as a login's
+ * `?next=%2Freset%3Ftoken%3D…` is; and one encoded again inside the value,
+ * as a redirector that encodes an already encoded url leaves it, each read
+ * and each decode a level of its own. That goes up to CREDENTIAL_NESTING
+ * levels deep, and a uri reached deeper may carry one, since a bound that
+ * let the next level through would be the same gap one level down. A uri
+ * carried in another encoding, such as base64, isn't read. A uri that
+ * doesn't parse, even as a relative reference, may, since its parts can't be
+ * read.
  */
 export function uriMayCarryCredential(uri: string): boolean {
   let u: URL;
@@ -337,21 +343,44 @@ function urlMayCarryCredential(u: URL, depth: number): boolean {
   // a value that opens with one (`token=;…`) still counts in the first.
   const named = (params: string) => [params, params.replace(/[?;]/g, '&')].some((read) =>
     [...new URLSearchParams(read).entries()].some(([name, value]) => value !== ''
-      && (CREDENTIAL_PARAMETERS.has(credentialName(name)) || nestedMayCarry(value, depth))));
+      && (CREDENTIAL_PARAMETERS.has(credentialName(name)) || nestedMayCarry(value, u, depth))));
   return named(u.search) || named(u.hash.slice(1));
 }
 
-/** Whether a parameter's value, decoded, is an absolute uri that may carry
- *  a credential. Only an absolute one is read, so an ordinary value never
- *  meets the relative reading's fail-closed answer. */
-function nestedMayCarry(value: string, depth: number): boolean {
-  let inner: URL;
+/** Whether a parameter's value is a uri that may carry a credential, read in
+ *  this order: as an absolute uri; else, where its form is a relative
+ *  reference's (it starts with `/`, or holds `?` or `#`), resolved against
+ *  the uri it sits in, less that uri's query and fragment, since a value of
+ *  a fragment alone, such as a colour's `#ff0000`, would otherwise bring
+ *  back the query it sits in and be read again at each level; else, where
+ *  decoding it once more changes it, decoded and read again from the start.
+ *  Each read or decode is a level. A value that is none of these, such as a
+ *  word, or a malformed `%`, answers false, so an ordinary value never meets
+ *  the relative reading's fail-closed answer. */
+function nestedMayCarry(value: string, outer: URL, depth: number): boolean {
+  let inner: URL | null = null;
   try {
     inner = new URL(value);
   } catch {
+    if (/^\/|[?#]/.test(value)) {
+      try {
+        const base = new URL(outer.href);
+        base.search = '';
+        base.hash = '';
+        inner = new URL(value, base);
+      } catch {
+        inner = null;
+      }
+    }
+  }
+  if (inner !== null) return depth >= CREDENTIAL_NESTING || urlMayCarryCredential(inner, depth + 1);
+  let decoded: string;
+  try {
+    decoded = decodeURIComponent(value);
+  } catch {
     return false;
   }
-  return depth >= CREDENTIAL_NESTING || urlMayCarryCredential(inner, depth + 1);
+  return decoded !== value && nestedMayCarry(decoded, outer, depth + 1);
 }
 
 /** How the host reaches a server, as far as fetching its references goes:

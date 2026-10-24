@@ -384,6 +384,41 @@ describe("MCP's resource_link, a reference (RFC-005 §8.1)", () => {
     assert.equal(line(plain), `[resource link "report.csv": ${plain}; not fetched]`);
   });
 
+  it("reads a relative uri in a parameter's value, and one encoded again inside it, each read and decode a level", () => {
+    const presigned = `https://zz-bucket.s3.amazonaws.com/k.png?X-Amz-Signature=${SECRET}`;
+    const line = (uri: string) => toolResultDataToHistoryString([TEXT, { type: 'resource_link', uri, name: 'report.csv' }]).split('\n')[1]!;
+    const stub = /^\[ref_[^\]]+\] report\.csv — from tool result — it's not tied to any server, so there's nowhere to fetch it from$/;
+    const twice = (value: string) => encodeURIComponent(encodeURIComponent(value));
+    for (const uri of [
+      // A relative one with a query, and a protocol-relative one with userinfo.
+      `https://zz-app.example/login?next=${encodeURIComponent(`/reset?token=${SECRET}`)}`,
+      `https://zz-proxy.example/img?url=${encodeURIComponent('//zz-user:zz-pass@zz-bucket.example/k')}`,
+      // Encoded twice inside one parameter, as a redirector leaves it: an
+      // absolute one, and a protocol-relative one read once decoded.
+      `https://zz-r.example/go?u=${twice(presigned)}`,
+      `https://zz-r.example/go?u=${twice('//zz-user:zz-pass@zz-bucket.example/k')}`,
+    ]) assert.match(line(uri), stub, uri);
+    // A decode is a level: three nestings below one value encoded twice put
+    // the fourth at level five, past the bound, where encoded once it's read.
+    const nest = (levels: number) => {
+      let uri = 'https://zz-files.example/page?v=1';
+      for (let i = 0; i < levels; i += 1) uri = `https://zz-site${i}.example/r?next=${encodeURIComponent(uri)}`;
+      return uri;
+    };
+    const once = `https://zz-r.example/go?u=${encodeURIComponent(nest(3))}`;
+    assert.equal(line(once), `[resource link "report.csv": ${once}; not fetched]`);
+    assert.match(line(`https://zz-r.example/go?u=${twice(nest(3))}`), stub);
+    // Ordinary values still show: a path, values with a colon, a value with
+    // a space, and a colour, whose fragment alone resolves against the uri
+    // less its query, so it isn't read again at each level.
+    for (const uri of [
+      'https://zz-files.example/x?next=/home',
+      'https://zz-files.example/x?lang=en:US&tag=type:image',
+      'https://zz-files.example/x?q=zz%20elsewhere%20report',
+      'https://zz-files.example/badge?color=%23ff0000&label=%23zz',
+    ]) assert.equal(line(uri), `[resource link "report.csv": ${uri}; not fetched]`, uri);
+  });
+
   it("never shows a data: link's uri, which holds its content rather than naming where it lies", () => {
     const payload = 'iVBORw0KGgo'.repeat(40);
     for (const uri of [`data:image/png;base64,${payload}`, `DATA:text/plain,${payload}`]) {
