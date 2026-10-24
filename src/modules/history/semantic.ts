@@ -491,7 +491,7 @@ export class SemanticIndexer {
    * another namespace, as before the host's index setting changed, are none
    * here.
    */
-  syncCursors(): { summaries: number | null; messages: number | null } {
+  private syncCursors(): { summaries: number | null; messages: number | null } {
     const c = this.cursorStore ? this.cursorStore.read() : this.ownCursors.get(this.branchId()) ?? null;
     return c && c.namespace === this.cfg.namespace ? c : { summaries: null, messages: null };
   }
