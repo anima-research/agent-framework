@@ -1301,18 +1301,21 @@ describe('held prose drafts, end to end', () => {
           drafts('i', { action: 'read', draftIds: [draft!.id], offset: 1 }),
           drafts('j', { action: 'list', offset: ' 1 ' }),
           drafts('k', { action: 'list', offset: -1 }),
+          // Past the integers a number holds exactly, digits would read as another number.
+          drafts('m', { action: 'list', offset: '9007199254740993' }),
           // false is "don't confirm", what list already does: it lists.
           drafts('l', { action: 'list', confirmDuplicate: false }),
         ], 'tool_use'),
         createMockResponse([]),
       ]);
-      const [noIds, destUsed, confirmUsed, offsetUsed, pastOne, negative, confirmFalse] = h.toolResults();
+      const [noIds, destUsed, confirmUsed, offsetUsed, pastOne, negative, unsafe, confirmFalse] = h.toolResults();
       assert.match(noIds!, /action "read" needs draftIds/);
       assert.match(destUsed!, /destination is not used by action "list"/);
       assert.match(confirmUsed!, /confirmDuplicate is not used by action "list"/);
       assert.match(offsetUsed!, /offset is not used by action "read"/);
       assert.match(pastOne!, /^1 open draft, newest first \(showing 0 from #2\):/, 'a padded offset of 1 skips the one draft');
       assert.match(negative!, /offset must be a whole number of drafts to skip/);
+      assert.match(unsafe!, /offset must be a whole number of drafts to skip/);
       assert.equal(confirmFalse, listed, 'confirmDuplicate: false lists, as an omitted one does');
 
       // resend: an empty destination is unused (and this resident has no home to
