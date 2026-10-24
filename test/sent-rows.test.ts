@@ -106,7 +106,16 @@ const final = (content: ContentBlock[] = [signed('sig-3'), text('Done.')]): Norm
   response.details!.usage = usage;
   return response;
 };
-const twoRounds = (first: ContentBlock[]) => [round('c1', first), round('c2', [signed('sig-2'), text('Again.')]), final()];
+/** The stream's complete, as membrane gives it: every round's blocks, each round's results after its calls, then the
+ *  last reply's (`last`, none for a stream that ends on its last results). */
+const cumulative = (first: ContentBlock[], last: ContentBlock[] = [signed('sig-3'), text('Done.')]): NormalizedResponse => {
+  const toolResult = (id: string) => ({ type: 'tool_result', toolUseId: id, content: '{"echoed":true}' }) as ContentBlock;
+  const response = final([...first, toolUse('c1'), toolResult('c1'), signed('sig-2'), text('Again.'), toolUse('c2'), toolResult('c2'), ...last]);
+  response.toolCalls = [];
+  return response;
+};
+const twoRounds = (first: ContentBlock[], last?: ContentBlock[]) =>
+  [round('c1', first), round('c2', [signed('sig-2'), text('Again.')]), cumulative(first, last)];
 
 /** Each stream takes the next script, its tool-calls events passed through `alter`. */
 class Scripted extends MockMembrane {
@@ -142,9 +151,12 @@ async function turn(opts: {
   scripts?: NormalizedResponse[][]; first?: ContentBlock[]; alter?: (s: YieldingStream) => YieldingStream;
   guard?: boolean; binds?: boolean; agent?: Record<string, unknown>; noProvenance?: boolean;
   render?: (rendered: Array<ContentBlock[] | null> | undefined) => Array<ContentBlock[] | null> | undefined;
+  /** What the context manager's noteRequestSent does: returns true (the default) or false, throws, or is absent. */
+  noteAs?: boolean | 'throw' | 'absent';
+  last?: ContentBlock[];
 } = {}) {
   const dir = mkdtempSync(join(tmpdir(), 'af-sent-rows-'));
-  const membrane = new Scripted(opts.scripts ?? [twoRounds(opts.first ?? [signed('sig-1'), text('Calling.')])], opts.alter);
+  const membrane = new Scripted(opts.scripts ?? [twoRounds(opts.first ?? [signed('sig-1'), text('Calling.')], opts.last)], opts.alter);
   const framework = await AgentFramework.create({
     storePath: join(dir, 'store.chronicle'), membrane: membrane.asMembrane(), agents: [], modules: [new Tools()], syncIntervalMs: 0,
   });
@@ -155,10 +167,18 @@ async function turn(opts: {
       thinkingBinding: { binds: opts.binds ?? true }, ...(opts.guard ? { toolResultGuard: true } : {}), ...opts.agent,
     } as never);
     const log: Logged[] = [];
-    (contextManager as unknown as { noteRequestSent: unknown }).noteRequestSent = (rows: SentRow[], identity: unknown, compileId: unknown) => {
-      log.push({ kind: 'note', rows: [...rows], identity, compileId, storedIds: contextManager.getAllMessages().map((m) => m.id) });
-      return true;
-    };
+    (contextManager as unknown as { noteRequestSent: unknown }).noteRequestSent = opts.noteAs === 'absent' ? undefined
+      : (rows: SentRow[], identity: unknown, compileId: unknown) => {
+        log.push({ kind: 'note', rows: [...rows], identity, compileId, storedIds: contextManager.getAllMessages().map((m) => m.id) });
+        if (opts.noteAs === 'throw') throw new Error('the store is gone');
+        return opts.noteAs ?? true;
+      };
+    let renders = 0;
+    const renderAsNewest = contextManager.renderAsNewest.bind(contextManager);
+    contextManager.renderAsNewest = ((ids: string[]) => { renders++; return renderAsNewest(ids); }) as typeof renderAsNewest;
+    const errors: string[] = [];
+    const consoleError = console.error;
+    console.error = (...args: unknown[]) => { errors.push(args.map(String).join(' ')); };
     if (opts.render) {
       // A render, as a strategy with renderAsNewest gives one, from the stored bodies: the default strategy here
       // (PassthroughStrategy) has none, so the framework would compare the stored bodies themselves.
@@ -174,11 +194,15 @@ async function turn(opts: {
       return result;
     }) as typeof compile;
     contextManager.addMessage('user', [{ type: 'text', text: 'Run twice.' }]);
-    await framework.runEphemeralToCompletion(agent, contextManager);
+    try {
+      await framework.runEphemeralToCompletion(agent, contextManager);
+    } finally {
+      console.error = consoleError;
+    }
     const stored = contextManager.getAllMessages();
     const notes = log.filter((e): e is Extract<Logged, { kind: 'note' }> => e.kind === 'note');
     const compiledIdentity = log.filter((e) => e.kind === 'compile').map((e) => e.identity);
-    return { log, notes, compiledIdentity, stored, streams: membrane.calls.length };
+    return { log, notes, compiledIdentity, stored, streams: membrane.calls.length, renders, errors: errors.filter((e) => e.includes('[thinking-binding]')) };
   } finally {
     await framework.stop();
     rmSync(dir, { recursive: true, force: true });
@@ -266,5 +290,37 @@ describe('a stream\'s rounds, noted at each tool boundary and at its end', () =>
   it('notes nothing of a stream whose rounds have no roundContent, nor for an agent whose model doesn\'t bind', async () => {
     assert.equal((await turn({ alter: withoutRoundContent })).notes.length, 0);
     assert.equal((await turn({ binds: false })).notes.length, 0);
+  });
+
+  it('notes a stream that ends on its last results with the rows so far, and no reply after them', async () => {
+    const { notes, stored } = await turn({ last: [] });
+    const [reply1, reply2, ...more] = replies(stored);
+    assert.equal(more.length, 0, 'no reply after the last results');
+    const results = resultRows(stored);
+    assert.deepEqual(notes.map((n) => n.rows), [
+      [reply1, results[0]], [reply1, results[0], reply2, results[1]], [reply1, results[0], reply2, results[1]],
+    ]);
+  });
+
+  it('stops noting, and says so, once the context manager writes nothing for a note', async () => {
+    const { notes, errors } = await turn({ noteAs: false });
+    assert.equal(notes.length, 1, 'the first boundary\'s note, and none after it');
+    assert.equal(errors.length, 1);
+    assert.match(errors[0]!, /wrote nothing for this stream's note/);
+  });
+
+  it('stops noting, and says so, once a note throws', async () => {
+    const { notes, errors } = await turn({ noteAs: 'throw' });
+    assert.equal(notes.length, 1);
+    assert.equal(errors.length, 1);
+    assert.match(errors[0]!, /couldn't note the rounds this stream sent/);
+  });
+
+  it('notes nothing, and renders nothing to note, with a context manager that has no noteRequestSent', async () => {
+    const { notes, renders, stored, errors } = await turn({ noteAs: 'absent' });
+    assert.equal(notes.length, 0);
+    assert.equal(renders, 0);
+    assert.equal(replies(stored).length, 3, 'the turn ran');
+    assert.deepEqual(errors, []);
   });
 });

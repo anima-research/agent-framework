@@ -1,4 +1,3 @@
-import { isDeepStrictEqual } from 'node:util';
 import { ToolPresentation, presentationTools, isPresentationTool, renderCatalogue, type PresentationSnapshot } from "./tool-presentation.js";
 import { constants as bufferConstants } from 'node:buffer';
 import { dirname, join } from 'node:path';
@@ -2717,6 +2716,14 @@ function wakeLineKey(line: WakeLine): string {
   return JSON.stringify([eventType, serverId ?? null, channelId ?? null, messageId ?? null, eventId ?? null]);
 }
 
+/** A stream's notes to the context manager: how to note (the stream start's `noteRequestSent`), its rows so far after
+ *  the compiled messages, and whether it has stopped noting. */
+interface StreamRequestNotes {
+  note: (rows: readonly SentRow[]) => boolean;
+  rounds: RoundRow[];
+  stopped: boolean;
+}
+
 export class AgentFramework {
   private toolPresentations = new Map<string, ToolPresentation>();
   private presentationPreviews = new WeakMap<object, PresentationSnapshot>();
@@ -3277,10 +3284,11 @@ export class AgentFramework {
   /** Per agent, the unexpected thinking drops its last operator alert counted (noteThinkingLoss). */
   private readonly thinkingLossIncidents = new ThinkingLossIncidents();
   /** Per live stream that can be noted, its rows so far after the compiled messages (noteRoundSent). */
-  private readonly streamRequestNotes = new WeakMap<YieldingStream, { note: (rows: readonly SentRow[]) => boolean; rounds: RoundRow[]; noted: SentRow[]; stopped: boolean }>();
-  /** Per agent, what membrane holds as its pending round's reply (`roundContent`, its results left out), beside
-   *  the blocks the framework stores for it; null where the round has no `roundContent` (XML or fallback). */
-  private readonly pendingRoundSent = new Map<string, ContentBlock[] | null>();
+  private readonly streamRequestNotes = new WeakMap<YieldingStream, StreamRequestNotes>();
+  /** Per pending round's blocks (pendingAssistantBlocks' value), what membrane held as that round's reply
+   *  (`roundContent`, its results left out); null where the round has no `roundContent` (XML or fallback). Keyed by
+   *  the blocks themselves, so it goes wherever they go. */
+  private readonly pendingRoundSent = new WeakMap<ContentBlock[], ContentBlock[] | null>();
   /** Per agent, a round that called code_execution and waits for those calls'
    *  results before its prose is routed (ScriptRound). */
   private scriptRounds: Map<string, ScriptRound> = new Map();
@@ -12341,8 +12349,7 @@ export class AgentFramework {
             replyId = agent.addAssistantResponse(pendingBlocks, turnRowMetadata);
             this.pendingAssistantBlocks.delete(agent.name);
           }
-          const replySent = this.pendingRoundSent.get(agent.name);
-          this.pendingRoundSent.delete(agent.name);
+          const replySent = pendingBlocks ? this.pendingRoundSent.get(pendingBlocks) : undefined;
           const membraneResults = currentState.toolResults.map(tc =>
             this.toMembraneToolResult(tc.id, tc.result, maxChars, spilled.get(tc.id))
           );
@@ -18939,7 +18946,7 @@ export class AgentFramework {
         membraneRetries: false,
       });
       // Each later round this stream sends is noted as it goes (noteRoundSent).
-      if (noteRequestSent) this.streamRequestNotes.set(stream, { note: noteRequestSent, rounds: [], noted: [], stopped: false });
+      if (noteRequestSent) this.streamRequestNotes.set(stream, { note: noteRequestSent, rounds: [], stopped: false });
       // The compile can wait for annotations (each batch has one spill
       // deadline), so check ownership, admission, and the lifecycle again.
       // A stop followed by start must not revive this earlier turn.
@@ -19822,7 +19829,7 @@ export class AgentFramework {
             assistantBlocks = stampThinkingTokenEstimates(assistantBlocks, outputTokensSinceStamp);
             outputTokensSinceStamp = 0;
             this.pendingAssistantBlocks.set(agent.name, assistantBlocks);
-            this.pendingRoundSent.set(agent.name, roundContent && roundContent.length > 0
+            this.pendingRoundSent.set(assistantBlocks, roundContent && roundContent.length > 0
               ? roundContent.filter((b) => b.type !== 'tool_result')
               : null);
 
@@ -20188,8 +20195,7 @@ export class AgentFramework {
               if (pending) {
                 const pendingId = agent.addAssistantResponse(pending, this.silentTurnRowMetadata(agent.name));
                 this.pendingAssistantBlocks.delete(agent.name);
-                const pendingSent = this.pendingRoundSent.get(agent.name);
-                this.pendingRoundSent.delete(agent.name);
+                const pendingSent = this.pendingRoundSent.get(pending);
                 // The stream's last reply, stored: its final row.
                 this.noteStreamEnd(agent, stream, { kind: 'reply', id: pendingId, sent: pendingSent ?? [] }, pendingSent == null);
               }
@@ -25358,14 +25364,14 @@ export class AgentFramework {
    * isn't a row here: the next request puts it back in the same place (renderRequestOnlyRows), and no compile holds
    * it. A round with no `roundContent` (membrane's XML or fallback path, where the stored reply is the framework's
    * rebuild) can't be vouched for, so nothing more of the stream is noted, and its later rounds' thinking is left
-   * out at the next compile rather than refused. So is a stream whose note threw.
+   * out at the next compile rather than refused. So is a stream whose note threw or wrote nothing (noteStreamRows).
    */
   private noteRoundSent(agent: Agent, stream: YieldingStream, rows: RoundRow[], unvouched: boolean): void {
     const notes = this.streamRequestNotes.get(stream);
     if (!notes || notes.stopped) return;
     if (unvouched) { notes.stopped = true; return; }
     notes.rounds.push(...rows);
-    this.noteStreamRows(agent, notes, true);
+    this.noteStreamRows(agent, notes);
   }
 
   /**
@@ -25381,11 +25387,16 @@ export class AgentFramework {
     if (unvouched) { notes.stopped = true; return; }
     if (reply) notes.rounds.push(reply);
     notes.stopped = true;
-    this.noteStreamRows(agent, notes, true);
+    this.noteStreamRows(agent, notes);
   }
 
-  /** Each round's rows judged as of now (roundRows), and noted where `always` says or a verdict changed. */
-  private noteStreamRows(agent: Agent, notes: { note: (rows: readonly SentRow[]) => boolean; rounds: RoundRow[]; noted: SentRow[]; stopped: boolean }, always: boolean): void {
+  /**
+   * Every row so far, judged as of now (roundRows), noted. A note the context manager writes nothing for (false: the
+   * stream's compile no longer wrote the branch's record, the branch has none, or its store failed) would write
+   * nothing at any later boundary either, and one that throws is a fault, so either ends the stream's notes, with a
+   * line saying so.
+   */
+  private noteStreamRows(agent: Agent, notes: StreamRequestNotes): void {
     const cm = agent.getContextManager();
     try {
       const ids = notes.rounds.flatMap((row) => row.id === undefined ? [] : [row.id]);
@@ -25397,9 +25408,10 @@ export class AgentFramework {
         carried.set(id, stored && content ? { participant: stored.participant, content } : null);
       });
       const rows = roundRows(notes.rounds, (id) => carried.get(id) ?? null);
-      if (!always && isDeepStrictEqual(rows, notes.noted)) return;
-      notes.note(rows);
-      notes.noted = rows;
+      if (!notes.note(rows)) {
+        notes.stopped = true;
+        console.error(`[thinking-binding] ${agent.name}: the context manager wrote nothing for this stream's note (its compile no longer wrote the branch's binding record, the branch has none, or the store failed), so this stream notes nothing more and its later rounds' thinking is left out at the next compile`);
+      }
     } catch (error) {
       notes.stopped = true;
       console.error(`[thinking-binding] ${agent.name}: couldn't note the rounds this stream sent, so its later rounds' thinking is left out at the next compile:`, error);
