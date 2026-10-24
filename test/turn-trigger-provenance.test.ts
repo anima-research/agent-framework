@@ -431,7 +431,7 @@ const robot = (during: () => void = () => {}, result: { endTurn?: boolean } = {}
   },
   async onProcess() { return {}; },
 }) as unknown as Module;
-const PRIVATE_FROM_HERE = '[routing] A message from a private surface came into this turn';
+const PRIVATE_FROM_HERE = '[routing] Private input came into this turn';
 /** An operator's message stored with a private surface's stamp, as the
  *  framework stamps one (surfaceSourceFor), its wake still to come. */
 const storeOperatorMessage = (framework: AgentFramework) =>
@@ -798,15 +798,42 @@ describe('private wins, one way', () => {
     }
   });
 
-  it("an explicit-mode room start that a stored operator message makes private is told why", async () => {
-    const rig = await surfaceRig({ agent: { proseRouting: 'explicit' } });
+  for (const mode of ['explicit', 'disabled'] as const) {
+    it(`a ${mode}-mode room start that a stored operator message makes private is told why, and names no channel`, async () => {
+      const rig = await surfaceRig({ agent: { proseRouting: mode } });
+      try {
+        storeOperatorMessage(rig.framework);
+        rig.membrane.pushResponse(createMockResponse([{ type: 'text', text: '>>skip_reply' }]));
+        rig.i.pendingRequests.push(roomWake());
+        await rig.until(() => rig.starts.length >= 1 && rig.framework.getAgent('scout')!.state.status === 'idle', "the room's start");
+        assert.equal(rig.routings[0]!.nonChannelOrigin, true, 'control: the start is private');
+        const told = rig.texts().filter((t) => t.startsWith(PRIVATE_FROM_HERE));
+        assert.equal(told.length, 1, JSON.stringify(rig.texts()));
+        assert.ok(told[0]!.endsWith(`Use ${mode === 'explicit' ? 'a >> prefix or an explicit send tool' : 'an explicit send tool'} to reach a channel.`), told[0]);
+        // Plain speech reaches no channel in this mode in any turn, so the
+        // room's channel isn't named.
+        assert.deepEqual(rig.texts().filter((t) => t.startsWith('[routing] This private turn also holds')), []);
+      } finally {
+        await rig.close();
+      }
+    });
+  }
+
+  it("a disabled-mode turn is told once that it's private when private input comes in at a boundary", async () => {
+    let framework: AgentFramework | undefined;
+    const tool = robot(() => framework!.pushEvent(tuiMessage('for your eyes only')));
+    const rig = await surfaceRig({ modules: [tool], agent: { proseRouting: 'disabled' } });
+    framework = rig.framework;
     try {
-      storeOperatorMessage(rig.framework);
-      rig.membrane.pushResponse(createMockResponse([{ type: 'text', text: '>>skip_reply' }]));
+      rig.membrane.pushResponse(createMockResponse([{ type: 'tool_use', id: 'm1', name: 'robot--move', input: {} }] as never, 'tool_use'));
+      rig.membrane.pushResponse(createMockResponse([{ type: 'text', text: 'noted' }]));
       rig.i.pendingRequests.push(roomWake());
-      await rig.until(() => rig.starts.length >= 1 && rig.framework.getAgent('scout')!.state.status === 'idle', "the room's start");
-      assert.equal(rig.routings[0]!.nonChannelOrigin, true, 'control: the start is private');
-      assert.equal(rig.texts().filter((t) => t.startsWith(PRIVATE_FROM_HERE)).length, 1, JSON.stringify(rig.texts()));
+      await rig.until(() => rig.starts.length >= 1 && rig.framework.getAgent('scout')!.state.status === 'idle', 'the turn');
+      await rig.framework.runUntilIdle();
+      assert.equal(rig.routings[0]!.nonChannelOrigin, true, 'control: the turn turned private');
+      const told = rig.texts().filter((t) => t.startsWith(PRIVATE_FROM_HERE));
+      assert.equal(told.length, 1, JSON.stringify(rig.texts()));
+      assert.ok(told[0]!.endsWith('Use an explicit send tool to reach a channel.'), told[0]);
     } finally {
       await rig.close();
     }
@@ -1065,6 +1092,28 @@ describe('private wins, one way', () => {
     assert.match(channelId.description, /required of a subagent, of a turn that has taken in private input, and of a script such a turn started\)/);
   });
 
+  it("a refusal names a fork's home in a form the fork takes as its home", async () => {
+    const rig = await surfaceRig();
+    try {
+      const internalsOf = rig.framework as unknown as {
+        conversationAgentHomes: Map<string, Ref>;
+        channelRegistry: { nameShown(r: Ref): string };
+        forkHomeShown(agentName: string): string | undefined;
+      };
+      internalsOf.conversationAgentHomes.set('scout', ref(ROOM));
+      const shownAs = (shown: string): string | undefined => {
+        internalsOf.channelRegistry.nameShown = () => shown;
+        return internalsOf.forkHomeShown('scout');
+      };
+      assert.equal(shownAs(ROOM), ROOM, 'its id');
+      assert.equal(shownAs(`discord:${ROOM}`), `discord:${ROOM}`, 'its server-qualified name');
+      assert.equal(shownAs(`"${ROOM}" on server "discord"`), ROOM, 'not a sentence no selector takes: its id, which the fork takes as its home');
+      assert.equal(internalsOf.forkHomeShown('nobody'), undefined, 'none for an agent with no home');
+    } finally {
+      await rig.close();
+    }
+  });
+
   it("a private turn's channel_publish names where it goes, a fork's home included", async () => {
     const rig = await surfaceRig();
     try {
@@ -1284,7 +1333,7 @@ describe('private wins, one way', () => {
   });
 
   it("a turn that turns private at a boundary shows its speech handlers no channel of the wake that opened it", async () => {
-    const heard: Array<{ nonChannelOrigin?: boolean; trigger?: { channelId?: string; addressed?: boolean } }> = [];
+    const heard: Array<{ nonChannelOrigin?: boolean; trigger?: { channelId?: string; channelServerId?: string; addressed?: boolean } }> = [];
     let framework: AgentFramework | undefined;
     const listener = {
       name: 'listener',
@@ -1304,11 +1353,13 @@ describe('private wins, one way', () => {
         { type: 'tool_use', id: 'm1', name: 'robot--move', input: {} },
       ] as never, 'tool_use'));
       rig.membrane.pushResponse(createMockResponse([{ type: 'text', text: 'about what you asked' }]));
-      rig.i.pendingRequests.push(roomWake());
+      rig.i.pendingRequests.push({ ...roomWake(), channelServerId: 'discord' });
       await rig.until(() => heard.length >= 1, "the room's turn's speech");
       assert.ok(roomStart(rig.starts[0]!), JSON.stringify(rig.starts[0]));
+      assert.equal(rig.starts[0]!.channelServerId, 'discord', "control: the room's wake named its server");
       assert.equal(heard[0]!.nonChannelOrigin, true, 'control: the turn turned private');
       assert.equal(heard[0]!.trigger?.channelId, undefined, JSON.stringify(heard[0]!.trigger));
+      assert.equal(heard[0]!.trigger?.channelServerId, undefined, JSON.stringify(heard[0]!.trigger));
       assert.equal(heard[0]!.trigger?.addressed, false);
     } finally {
       await rig.close();
@@ -1660,9 +1711,15 @@ describe('private wins, one way', () => {
       internalsOf.conversationAgentHomes.set('scout', ref(LOUNGE));
       internalsOf.eventGate.requestInferenceFn('scout', 'gate:debounce', 'gate', window);
       const fork = rig.i.pendingRequests.at(-1)!;
+      // And a trunk agent holds none from the fork's channel once it's bound.
+      internalsOf.eventGate.requestInferenceFn('trunk', 'gate:debounce', 'gate', window);
+      const trunkBeside = rig.i.pendingRequests.at(-1)!;
       const mark = wakeChannelsMark(trunk)!;
       assert.deepEqual((trunk as unknown as Record<symbol, unknown>)[mark], window.channels, 'the trunk agent holds both');
       assert.deepEqual((fork as unknown as Record<symbol, unknown>)[mark], [{ channelId: LOUNGE, serverId: 'discord' }], 'the fork holds its own');
+      assert.equal(trunkBeside.agentName, 'trunk', 'control');
+      assert.deepEqual((trunkBeside as unknown as Record<symbol, unknown>)[mark], [{ channelId: ROOM, serverId: 'discord' }],
+        "a trunk agent beside the fork holds the room's, not the fork's");
     } finally {
       (rig.framework as unknown as { conversationAgentHomes: Map<string, Ref> }).conversationAgentHomes.clear();
       rig.i.pendingRequests.length = 0;
@@ -1687,6 +1744,48 @@ describe('private wins, one way', () => {
       // turn's privacy kept them, both rounds', and no send held one as a draft.
       assert.ok(rig.texts().some((t) => t.startsWith('[delivered]') && t.includes('2 plain-speech segment(s) kept private (private turn')),
         JSON.stringify(rig.texts()));
+      assert.deepEqual(rig.routed, []);
+    } finally {
+      await rig.close();
+    }
+  });
+
+  it("a private turn's refused channel_publish is no send on the fallback path either, where no round is routed live", async () => {
+    const rig = await surfaceRig();
+    try {
+      const internalsOf = rig.framework as unknown as { channelRegistry: Record<string, unknown> };
+      internalsOf.channelRegistry.getChannelTools = () => [{ name: 'channel_publish', description: 'Publish.', inputSchema: { type: 'object', properties: {} } }];
+      internalsOf.channelRegistry.handleChannelToolCall = async () => ({ success: true, data: {} });
+      // XML tool mode, as an older membrane streams it: no round carries its
+      // roundContent, and the completion holds the tool round before the
+      // final text (agent-allowed-tools' asXmlTurn).
+      const call = { type: 'tool_use' as const, id: 'p1', name: 'channel_publish', input: { content: 'to wherever' } };
+      const streamYielding = rig.membrane.streamYielding.bind(rig.membrane);
+      rig.membrane.streamYielding = (request, options) => {
+        const stream = streamYielding(request, options);
+        const iterate = stream[Symbol.asyncIterator].bind(stream);
+        stream[Symbol.asyncIterator] = async function* () {
+          for await (const event of { [Symbol.asyncIterator]: iterate }) {
+            if (event.type === 'tool-calls') {
+              yield { ...event, context: { ...event.context, roundContent: undefined } };
+            } else if (event.type === 'complete') {
+              const round = [{ type: 'text' as const, text: 'here is the answer' }, call, { type: 'tool_result' as const, toolUseId: call.id, content: 'refused' }];
+              yield { ...event, response: { ...event.response, content: [...round, ...event.response.content] } };
+            } else yield event;
+          }
+        };
+        return stream;
+      };
+      rig.membrane.pushResponse(createMockResponse([{ type: 'text', text: 'here is the answer' }, call] as never, 'tool_use'));
+      rig.membrane.pushResponse(createMockResponse([{ type: 'text', text: 'done' }]));
+      rig.framework.pushEvent(tuiMessage());
+      await rig.until(() => rig.starts.length >= 1 && rig.framework.getAgent('scout')!.state.status === 'idle', 'the turn');
+      await rig.framework.runUntilIdle();
+      const receipt = rig.texts().find((t) => t.startsWith('[delivered]')) ?? '';
+      assert.ok(receipt.includes('kept private (private turn'), `the turn's privacy kept its words: ${JSON.stringify(rig.texts())}`);
+      assert.ok(!receipt.includes('held as draft'), `no send held them as drafts to resend: ${receipt}`);
+      const drafts = (rig.framework as unknown as { proseDrafts: { open(agent: string): unknown[] } }).proseDrafts.open('scout');
+      assert.deepEqual(drafts, []);
       assert.deepEqual(rig.routed, []);
     } finally {
       await rig.close();
@@ -1942,6 +2041,29 @@ describe('private wins, one way', () => {
     });
   }
 
+  it("a script's call does its work for the script's start turn; any other call for the turn it was made in", async () => {
+    const rig = await surfaceRig();
+    try {
+      const internalsOf = rig.framework as unknown as {
+        scriptCallStarts: Map<string, { turnId?: number; readThrough: null }>;
+        workTurnOf(call: { id: string; name: string; input: unknown; callerTurnId?: number }): number | undefined;
+      };
+      internalsOf.scriptCallStarts.set('from-script', { turnId: 7, readThrough: null });
+      internalsOf.scriptCallStarts.set('left-running', { readThrough: null });
+      try {
+        // The watching turn's id isn't the script's start turn's.
+        assert.equal(internalsOf.workTurnOf({ id: 'from-script', name: 'sleep', input: {}, callerTurnId: 9 }), 7);
+        assert.equal(internalsOf.workTurnOf({ id: 'left-running', name: 'sleep', input: {} }), undefined,
+          'a script started outside a turn does its work for none');
+        assert.equal(internalsOf.workTurnOf({ id: 'model', name: 'sleep', input: {}, callerTurnId: 9 }), 9);
+      } finally {
+        internalsOf.scriptCallStarts.clear();
+      }
+    } finally {
+      await rig.close();
+    }
+  });
+
   it("a tune-out cancel asked for in a turn hands the resident's wake that turn", async () => {
     const rig = await surfaceRig();
     try {
@@ -1998,6 +2120,16 @@ describe('private wins, one way', () => {
       internalsOf.notePrivateTurn(base + 4);
       assert.equal(internalsOf.privateTurnIds.size, 4096);
       assert.equal(internalsOf.isPrivateTurn(base + 5), true, 'the floor stays at the highest evicted');
+      // The usual overflow: a newer private turn at a full record is kept,
+      // and the lowest recorded, the first noted, goes, raising the floor to it.
+      const newest = base + 10_000;
+      internalsOf.notePrivateTurn(newest);
+      assert.equal(internalsOf.privateTurnIds.size, 4096);
+      assert.equal(internalsOf.privateTurnIds.has(newest), true, 'the newcomer is kept');
+      assert.equal(internalsOf.privateTurnIds.has(base + 100), false, 'the lowest recorded goes');
+      assert.equal(internalsOf.isPrivateTurn(base + 100), true, 'the floor rose to it: evicted, so private');
+      assert.equal(internalsOf.isPrivateTurn(base + 150), false, 'above the new floor and never private');
+      assert.equal(internalsOf.isPrivateTurn(newest - 1), false, 'an unnoted id above the floor stays public');
     } finally {
       await rig.close();
     }
@@ -2141,4 +2273,31 @@ describe('private wins, one way', () => {
       }
     });
   }
+
+  it("an arrival removed before the private turn's next start isn't named", async () => {
+    const OTHER = 'discord:g:other';
+    const rig = await surfaceRig();
+    try {
+      const internalsOf = rig.framework as unknown as {
+        addMessage(participant: string, content: unknown, metadata: unknown): string;
+        removeMessage(id: string): void;
+      };
+      const routing = routingOf(rig.framework);
+      routing.arrivals = [];
+      routing.nonChannelOrigin = true;
+      rig.state.openLogical.set('scout', routing);
+      const id = internalsOf.addMessage('someone', [{ type: 'text', text: 'over here' }], { channelId: OTHER, serverId: 'discord', tags: ['chat:addressed'] });
+      assert.equal((routing.arrivals as unknown[]).length, 1, 'control: noted');
+      // Its server retracted it, as an unread coalesced message can be.
+      internalsOf.removeMessage(id);
+      rig.i.pendingRequests.push(tuiWake());
+      await rig.until(() => rig.starts.length >= 1 && rig.framework.getAgent('scout')!.state.status === 'idle', 'the start');
+      assert.equal(rig.routings[0], routing, 'control: the start continued the turn');
+      assert.deepEqual(channelNotices(rig), [], "the turn doesn't hold it, so it isn't named");
+      assert.deepEqual(routing.arrivals, []);
+    } finally {
+      rig.state.openLogical.delete('scout');
+      await rig.close();
+    }
+  });
 });

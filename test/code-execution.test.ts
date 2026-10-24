@@ -2447,6 +2447,24 @@ describe('a round whose run or wait call watches a script that can change its ro
     });
   }
 
+  it("a script's refusal in a private turn points to channel_list only for an agent that may call it", async () => {
+    const h = await scriptRound('locus', [
+      createMockResponse([scriptCall({ code: publishing('{ content: "from the script" }'), yield_time_ms: 30_000 })] as ContentBlock[], 'tool_use'),
+      createMockResponse([{ type: 'text', text: 'done' }] as ContentBlock[]),
+    ], {}, { channelPublish: true });
+    try {
+      const fw = h.framework as unknown as { canAgentUseTool(agentName: string, tool: string): boolean };
+      const canUse = fw.canAgentUseTool.bind(h.framework);
+      fw.canAgentUseTool = (agentName, tool) => tool !== 'channel_list' && canUse(agentName, tool);
+      h.framework.pushEvent(surface());
+      await h.framework.runUntilIdle();
+      assert.ok(scriptNote(h).includes(REFUSED), `control: refused: ${scriptNote(h)}`);
+      assert.ok(!scriptNote(h).includes('channel_list'), scriptNote(h));
+    } finally {
+      await h.done();
+    }
+  });
+
   it("a script's channel_publish that names its channel goes there, in a private turn too", async () => {
     const h = await scriptRound('locus', [
       createMockResponse([scriptCall({ code: publishing('{ channelId: "world:test", content: "from the script" }'), yield_time_ms: 30_000 })] as ContentBlock[], 'tool_use'),

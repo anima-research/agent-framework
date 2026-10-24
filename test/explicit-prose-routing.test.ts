@@ -2161,7 +2161,8 @@ describe('explicit prose routing', () => {
     });
     const help = decoded.join(' ').replace(/\s+/g, ' ');
     for (const clause of [
-      "A destination applies to the rest of that turn, until another is named, except in a private turn (one a private surface's message took part in): there each envelope delivers only its own body.",
+      "A destination applies to the rest of that turn, until another is named, except in a private turn (one that took in private input, such as an operator's message from a private surface): there each envelope delivers only its own body.",
+      'In a private turn, text without a destination is kept private instead, with no draft.',
       'A name that matches no channel, or several, bounces and leaves it as it was.',
       'A channel its server declared inbound-only is refused, and clears it.',
       'Where two servers register one channel id, the server goes first: >>server:service:guild:id … (a bounce lists each such name).',

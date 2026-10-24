@@ -646,8 +646,9 @@ const PROSE_ROUTING_HELP =
   '  One message may hold several sections: each line starting with ">>" begins\n' +
   '  a new envelope, routed to its own destination independently.\n' +
   '  A destination applies to the rest of that turn, until another is named,\n' +
-  '  except in a private turn (one a private surface\'s message took part in):\n' +
-  '  there each envelope delivers only its own body.\n' +
+  '  except in a private turn (one that took in private input, such as an\n' +
+  '  operator\'s message from a private surface): there each envelope delivers\n' +
+  '  only its own body.\n' +
   '  A name that matches no channel, or several, bounces and leaves it as it\n' +
   '  was. A channel its server declared inbound-only is refused, and clears it.\n' +
   '  Append " !" after the destination (e.g. ">>#ops !") to start your next turn\n' +
@@ -656,8 +657,9 @@ const PROSE_ROUTING_HELP =
   'Text without a destination is not delivered: it is held as a draft, and a notice\n' +
   'names it — reply e.g. ">>#channel {{unsent}}" to deliver your latest bounce draft\n' +
   'unchanged, or use the drafts tool to list, resend or dismiss any draft by id.\n' +
-  '">>skip_reply {{unsent}}" sets the latest bounce aside. Send tools (send_message,\n' +
-  'send_dm, …) are unaffected.';
+  '">>skip_reply {{unsent}}" sets the latest bounce aside. In a private turn, text\n' +
+  'without a destination is kept private instead, with no draft. Send tools\n' +
+  '(send_message, send_dm, …) are unaffected.';
 
 const PROSE_HELP_TOOL: import('./types/index.js').ToolDefinition = {
   name: 'prose_help',
@@ -17231,8 +17233,9 @@ export class AgentFramework {
     const reach = privateTurnReach(agent);
     const content: ContentBlock[] = [{
       type: 'text',
-      text: '[routing] A message from a private surface came into this turn, so for the rest of it your plain ' +
-        `speech goes to no channel and stays on that surface. Use ${reach} to reach a channel.`,
+      text: '[routing] Private input came into this turn: an operator\'s message from a private surface, or what a ' +
+        `private turn's work brought back. For the rest of this turn your plain speech goes to no channel. Use ${reach} ` +
+        'to reach a channel.',
     }];
     const metadata = { system: true, kind: 'routing-notice' } as MessageMetadata;
     try {
@@ -19427,9 +19430,12 @@ export class AgentFramework {
       }
     }
     // A private turn names the channels whose messages its start took in,
-    // before it compiles.
+    // before it compiles: in locus and hybrid mode, where privacy is what
+    // keeps its plain speech from them, as at a boundary and its arrivals.
     const wakeChannels = (trigger as MarkedRequest | undefined)?.[WAKE_CHANNELS];
-    if (routing.nonChannelOrigin && wakeChannels) this.noticeChannelMessages(agent, routing, wakeChannels);
+    if (routing.nonChannelOrigin && wakeChannels && (turnProseRouting === 'locus' || turnProseRouting === 'hybrid')) {
+      this.noticeChannelMessages(agent, routing, wakeChannels);
+    }
     // A private turn's start routes to no channel and is addressed in none, so
     // neither its typing nor its speech handlers point at a wake's channel.
     if (trigger && routing.nonChannelOrigin && (trigger.channelId !== undefined || trigger.addressed || trigger.nonChannelOrigin !== true)) {
@@ -30071,11 +30077,14 @@ export class AgentFramework {
       + (this.canAgentUseTool(agentName, 'channel_list') ? ' channel_list shows the channel ids.' : '');
   }
 
-  /** A conversation fork's home channel as the agent is shown it, for a
-   *  refusal to name. */
+  /** A conversation fork's home channel for a refusal to name: as the agent
+   *  is shown it where that is a name the fork's guard takes as its home, its
+   *  id or server-qualified name, and its id otherwise. */
   private forkHomeShown(agentName: string): string | undefined {
     const home = this.conversationAgentHomes.get(agentName);
-    return home && (this.channelRegistry?.nameShown(home) ?? home.channelId);
+    if (!home) return undefined;
+    const shown = this.channelRegistry?.nameShown(home);
+    return shown === qualifiedChannelName(home) ? shown : home.channelId;
   }
 
   /**

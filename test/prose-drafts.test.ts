@@ -1417,6 +1417,32 @@ describe('draft notices and turn-end settlement', () => {
     }
   });
 
+  it("a private turn whose draft may already have been posted says nothing is confirmed, not that its speech reached no channel", async () => {
+    const h = await catchUpFixture();
+    const f = h.framework as unknown as {
+      proseDrafts: ProseDraftStore;
+      holdProseDrafts(agent: unknown, texts: Array<{ text: string }>, reason: string, options: unknown): Array<{ id: string }>;
+      appendProseDeliveryReceipt(agent: unknown, routing: unknown): void;
+    };
+    const routing = h.internals.routingOf('scout') as unknown as { nonChannelOrigin: boolean; privateSuppressed: number };
+    try {
+      const d = f.holdProseDrafts(h.agent, [{ text: 'earlier words' }], 'explicit-send', { routing, notice: 'later' })[0]!;
+      const attempt = f.proseDrafts.beginAttempt('scout', d.id, dest(), 'resend', false);
+      f.proseDrafts.recordOutcome('scout', d.id, attempt, { status: 'unknown', reason: 'connection lost', at: Date.now(), destination: dest() });
+      // The turn then took in private input, and kept its later speech private.
+      routing.nonChannelOrigin = true;
+      routing.privateSuppressed = 1;
+      f.appendProseDeliveryReceipt(h.agent, routing);
+      const receipt = h.cm.getAllMessages().flatMap((m) => m.content)
+        .filter((b) => b.type === 'text').map((b) => (b as { text: string }).text)
+        .find((text) => text.startsWith('[delivered]'))!;
+      assert.ok(receipt.includes('kept private (private turn'), `control: the private speech is counted: ${receipt}`);
+      assert.ok(receipt.startsWith('[delivered] nothing confirmed —'), receipt);
+    } finally {
+      await h.close();
+    }
+  });
+
   // Arthur-2378's probe: with retention shortened, the journal lets the
   // turn's older draft go before the receipt is written.
   it('the receipt reports a draft that retention let go during the turn as let go, not as held', async (t) => {

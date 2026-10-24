@@ -2899,7 +2899,7 @@ describe('present while acting', () => {
       .map((b) => b.text)
       .join('\n');
     assert.equal(text, 'look left!');
-    assert.match(JSON.stringify(options!.injectedMessages![1]!.content), /\[routing\] A message from a private surface came into this turn/);
+    assert.match(JSON.stringify(options!.injectedMessages![1]!.content), /\[routing\] Private input came into this turn/);
 
     await framework.stop();
   });

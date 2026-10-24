@@ -29,13 +29,15 @@
   injected: a turn that reads it is private, and a tool boundary that injects
   it makes its turn private from there.
 
-  A private turn that holds a channel's message tells its resident which
-  channels' messages it holds and that its plain speech reaches none of
-  them, in a `[routing]` notice before it replies, naming each channel once
-  in the turn. That covers a channel wake its start takes in, a gate debounce
-  window's channel messages, and a message one of its tool boundaries takes
-  in that would have moved a channel turn's locus, whether the boundary
-  injects it or leaves it to the turn's next start.
+  In locus and hybrid mode, a private turn that holds a channel's message
+  tells its resident which channels' messages it holds and that its plain
+  speech reaches none of them, in a `[routing]` notice before it replies,
+  naming each channel once in the turn. That covers a channel wake its start
+  takes in, a gate debounce window's channel messages, and a message one of
+  its tool boundaries takes in that would have moved a channel turn's locus,
+  whether the boundary injects it or leaves it to the turn's next start. In
+  explicit and disabled mode plain speech reaches no channel in any turn, so
+  no channel is named.
 
   A private turn's plain speech is kept private in every mode. In locus and
   hybrid modes its `[delivered]` receipt counts it and says the plain speech

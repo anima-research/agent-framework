@@ -66,6 +66,10 @@ Unprefixed prose with no sticky target is **never delivered**. It is held as a
 draft (src/prose-drafts.ts) — never published except by the agent's own
 resend — and a system notice naming the draft tells
 the agent how to resend: `>>#channel {{unsent}}`, or the `drafts` tool by id.
+A private turn (one that took in private input, such as an operator's message
+from a private surface) has no sticky target, and its unprefixed prose isn't
+bounced: it is kept private, with no draft and no wake, and a notice says so
+and how to publish.
 The notice requests inference so the resend can happen immediately — capped at
 2 consecutive bounce-wakes per agent (then notices append without waking,
 breaking any loop).
