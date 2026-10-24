@@ -34,6 +34,8 @@ function cancelWith(opts: { backlogCap: number; source: string; stored: Row[]; h
   const added: Added[] = [];
   const inferences: string[] = [];
   const registry = {
+    // Each channel's id is unique here, so it's shown by its id.
+    nameShown: (channel: { channelId: string }) => channel.channelId,
     cancelTuneOut: () => ({
       params: { epochId: 'eA', cadenceSeconds: 300, backlogCap: opts.backlogCap, maxWakes: 3, startedAtSequence: 0 },
       wakeCount: 0,

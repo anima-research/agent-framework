@@ -19,6 +19,7 @@ import {
   // The package's public digest: consumers import it from the root.
   sourceBodyDigest,
   PassthroughStrategy,
+  type ChannelRef,
   type InboundSource,
   type Module,
   type ModuleContext,
@@ -29,7 +30,7 @@ import {
   type ToolCall,
   type ToolResult,
 } from '../src/index.js';
-import { ContextManager } from '@animalabs/context-manager';
+import { ContextManager, MalformedContentError } from '@animalabs/context-manager';
 import type { ContentBlock } from '@animalabs/membrane';
 import { MockMembrane } from './helpers/mock-membrane.js';
 import { canonicalJson } from '../src/mcpl/inbound-source.js';
@@ -205,7 +206,7 @@ describe('inbound source envelope', () => {
     // appended after ingestion stamped the delivered digest, at storage
     // time, when the channel has closed in between.
     const registry = (framework as unknown as {
-      channelRegistry: { handleChannelToolCall(name: string, input: unknown, caller: unknown): Promise<unknown>; isChannelOpen(id: string): boolean };
+      channelRegistry: { handleChannelToolCall(name: string, input: unknown, caller: unknown): Promise<unknown>; isChannelOpen(channel: ChannelRef): boolean };
     }).channelRegistry;
     const fw = framework as unknown as { pushEvent(e: { type: string }): void };
     const held: Array<{ type: string }> = [];
@@ -214,7 +215,7 @@ describe('inbound source envelope', () => {
     command({ op: 'incoming', channelId: ROOM, messageId: 'm-closed', mode: 'addressed', text: 'hello while open' });
     await waitFor(() => held.length > 0, 'incoming accepted and held');
     await registry.handleChannelToolCall('channel_close', { channelId: ROOM }, { kind: 'agent', agentName: 'scout' });
-    assert.equal(registry.isChannelOpen(ROOM), false);
+    assert.equal(registry.isChannelOpen({ serverId: 'discord', channelId: ROOM }), false);
     fw.pushEvent = push;
     for (const e of held) push(e);
     await waitFor(() => !!storedWith((m) => m.messageId === 'm-closed'), 'message stored');
@@ -605,7 +606,8 @@ describe('inbound source envelope under RFC-006 coalescing', () => {
     const f = await fixture({ framework: { conversations: { templateAgent: 'agent', bind: { channel: 'always' }, trigger: { channel: 'always' } } } as never }); t.after(f.close);
     await f.register();
     const forged = { sourceBodyDigest: 'adapter-value', storedBodyDigest: 'adapter-value' };
-    const router = (f.framework as unknown as { conversationRouter: { getBinding(id: string): { agentName: string } | undefined; unbind(id: string): void } }).conversationRouter;
+    const router = (f.framework as unknown as { conversationRouter: { getBinding(channel: ChannelRef): { agentName: string } | undefined; unbind(channel: ChannelRef): void } }).conversationRouter;
+    const chat: ChannelRef = { serverId: 'editor', channelId: 'chat' };
     const check = (text: string, fork: string) => {
       const copy = f.framework.getAgent(fork)!.getContextManager().getAllMessages().find((m) => JSON.stringify(m.content).includes(text));
       assert.ok(copy, `${text} stored in ${fork}`);
@@ -615,13 +617,13 @@ describe('inbound source envelope under RFC-006 coalescing', () => {
     };
     // Routed into a fresh fork by the conversation router.
     await f.send('channels/incoming', { messages: [{ ...f.channel('c1', 'routed_original', { initial: true }), metadata: forged }] });
-    const fork = router.getBinding('chat')!.agentName;
+    const fork = router.getBinding(chat)!.agentName;
     check('routed_original', fork);
     // A correction follows the prior delivery into that fork, though the
     // channel is no longer bound to it.
-    router.unbind('chat');
+    router.unbind(chat);
     await f.send('channels/incoming', { messages: [{ ...f.channel('c2', 'fork_correction'), metadata: forged }] });
-    assert.equal(router.getBinding('chat'), undefined, 'no fresh fork was spawned for the correction');
+    assert.equal(router.getBinding(chat), undefined, 'no fresh fork was spawned for the correction');
     check('fork_correction', fork);
   });
 
@@ -729,7 +731,7 @@ describe('sourceBodyDigest hashes a body as the store keeps it', () => {
     }
   });
 
-  it('a block the store refuses is refused at write, and a blob_ref is digested as given, which its copy read back does not match', async () => {
+  it('refused content and caller-supplied blob_ref cannot be written; unresolved and resolved reads have distinct digests', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'stored-digest-refused-'));
     try {
       const cm = await ContextManager.open({ path: join(dir, 'store.chronicle'), strategy: new PassthroughStrategy() });
@@ -743,17 +745,19 @@ describe('sourceBodyDigest hashes a body as the store keeps it', () => {
         ] as const) {
           assert.throws(() => cm.addMessage('user', [block] as never), Error, `${what}: refused at write`);
         }
-        // A blob_ref names media the store already holds; it is resolved to
-        // inline media on read, so the copy read back hashes differently.
+        // Only the store may write blob_ref. An unresolved read can expose
+        // one, but callers must resolve it before attempting a new write.
         const held = cm.addMessage('user', [image(png)] as never);
         const ref = cm.getMessageWindow(0, cm.getMessageCount(), { resolveBlobs: false }).messages
           .find((m) => m.id === held)!.content[0] as { type: string };
         assert.equal(ref.type, 'blob_ref');
         const given = [ref];
-        const id = cm.addMessage('user', given as never, { storedBodyDigest: sourceBodyDigest(given) });
-        const back = cm.getMessage(id)!;
+        const before = cm.getMessageCount();
+        assert.throws(() => cm.addMessage('user', given as never), MalformedContentError, 'a raw blob_ref is store-only');
+        assert.equal(cm.getMessageCount(), before, 'refused write adds no record');
+        const back = cm.getMessage(held)!;
         assert.deepEqual(back.content, [image(png)], 'resolved on read');
-        assert.notEqual(sourceBodyDigest(back.content), (back.metadata as Record<string, unknown>).storedBodyDigest, 'the documented mismatch');
+        assert.notEqual(sourceBodyDigest(given), sourceBodyDigest(back.content), 'unresolved refs are not inline content');
       } finally {
         cm.close();
       }

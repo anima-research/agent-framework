@@ -421,8 +421,10 @@ describe("the conversation router's generation counters", () => {
       f.alwaysRespond();
       await f.framework.runUntilIdle();
       assert.ok(failedWrites.count > 0, "the batch reached its fork's spawn and tried to store the counter");
-      const router = (f.framework as unknown as { conversationRouter: { getBinding(id: string): unknown } }).conversationRouter;
-      assert.equal(router.getBinding('chat'), undefined, 'no fork was bound');
+      const router = (f.framework as unknown as {
+        conversationRouter: { getBinding(channel: { serverId: string; channelId: string }): unknown };
+      }).conversationRouter;
+      assert.equal(router.getBinding({ serverId: 'editor', channelId: 'chat' }), undefined, 'no fork was bound');
       assert.equal(f.framework.getAgent(forkAgentName('conversation', 'editor', 'chat', 1)), null);
       assert.equal(store.getStateJson(ROUTER), null);
     } finally {

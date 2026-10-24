@@ -10,7 +10,7 @@
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, readFileSync, existsSync, rmSync } from 'node:fs';
+import { mkdtempSync, readFileSync, existsSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -19,6 +19,7 @@ import { AgentFramework, WorkspaceModule } from '../src/index.js';
 import type { EventResponse, Module, ModuleContext, ProcessEvent, ProcessState, ToolDefinition, ToolResult } from '../src/index.js';
 import { MockMembrane, createMockResponse } from './helpers/mock-membrane.js';
 import { answerText, scriptCall } from './helpers/script-call.js';
+import { schedulerPasses } from './helpers/scheduler-passes.js';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const MODERN = join(here, 'fixtures', 'modern-mcp-server.mjs');
@@ -146,6 +147,28 @@ test('model path: a payload the host cannot retain is reported as an incomplete 
   });
 });
 
+test("model path: where the only writable mount is direct, a payload's stub says no mount that keeps its files in the store can save it", async () => {
+  const code = mkdtempSync(join(tmpdir(), 'modern-direct-'));
+  const workspace = new WorkspaceModule({ mounts: [{ name: 'code', path: code, mode: 'read-write', backend: 'direct' }] });
+  try {
+    await withModern(async ({ framework, membrane }) => {
+      workspace.initStore(framework.getStore());
+      framework.start();
+      membrane.pushResponse(createMockResponse([
+        { type: 'tool_use', id: 'toolu_01MODERNMEDIA00000000001', name: 'mcpl--modern--media', input: {} },
+      ] as never, 'tool_use'));
+      membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Done.' }]));
+      framework.pushEvent({ type: 'external-message', source: 'test', content: 'go', metadata: {} } as never);
+      await waitFor('the tool round', () => (membrane.lastStream?.receivedToolResults.length ?? 0) >= 1);
+      const [delivered] = membrane.lastStream!.receivedToolResults[0] as Array<{ content: unknown; isError: boolean }>;
+      const text = JSON.stringify(delivered!.content);
+      assert.match(text, /\[image: image\/png, 8 B\. Not retained: a failed result is read as its text alone, and no workspace mount that keeps its files in the store can save it\]/);
+    }, [], [workspace]);
+  } finally {
+    rmSync(code, { recursive: true, force: true });
+  }
+});
+
 test('model path: the result reaches the model, structured-only as JSON', async () => {
   await withModern(async ({ framework, membrane }) => {
     framework.start();
@@ -155,10 +178,10 @@ test('model path: the result reaches the model, structured-only as JSON', async 
     membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Done.' }]));
     framework.pushEvent({ type: 'external-message', source: 'test', content: 'go', metadata: {} } as never);
     await waitFor('the tool round', () => (membrane.lastStream?.receivedToolResults.length ?? 0) >= 1);
-    // The framework renders string data JSON-encoded, as it does for every
-    // string tool result; decoded, it is the structured value's JSON.
+    // The result's data is the structured value's JSON, a string, which
+    // reaches the model as that text.
     const [delivered] = membrane.lastStream!.receivedToolResults[0] as Array<{ content: string }>;
-    assert.deepEqual(JSON.parse(JSON.parse(delivered!.content)), { answer: 42, ok: false, nothing: null });
+    assert.deepEqual(JSON.parse(delivered!.content), { answer: 42, ok: false, nothing: null });
   });
 });
 
@@ -223,11 +246,11 @@ test('scripts get every result in one shape, structured results whole', async ()
       isError: false,
     });
     // Without structured content, content is the model's text: the history
-    // rendering, which JSON-encodes a text result. structuredContent is null.
+    // rendering, which for a text result is that text. structuredContent is null.
     assert.deepEqual(await handle('agent', 'mcpl--modern--echo', { text: 'x' }), {
       ok: true,
       isError: false,
-      value: { content: [{ type: 'text', text: JSON.stringify('echo:x') }], structuredContent: null, isError: false },
+      value: { content: [{ type: 'text', text: 'echo:x' }], structuredContent: null, isError: false },
     });
   });
 });
@@ -403,7 +426,7 @@ process.stdin.on('data', (c) => {
     const [delivered] = membrane.lastStream!.receivedToolResults[0] as Array<{ content: string; isError: boolean }>;
     assert.equal(delivered!.isError, false);
     // No server text block: the structured value is shown beside the stubs.
-    assert.equal(JSON.parse(delivered!.content),
+    assert.equal(delivered!.content,
       '[resource link "a.md": https://example.invalid/a.md; not fetched]\n[resource memo://n, text/plain]\nnote body\n{"count":2}');
     const status = framework.listMcplServers().find((s) => s.id === 'plain')!;
     assert.equal(status.family, 'legacy');
@@ -414,23 +437,30 @@ process.stdin.on('data', (c) => {
 test('quiesce: a modern call already in flight completes, and its result reaches the turn', async () => {
   await withModern(async ({ framework, membrane, dir }) => {
     framework.start();
+    // The call is held server-side until the test writes this file.
+    const release = join(dir, 'release-slow');
     membrane.pushResponse(createMockResponse([
-      { type: 'tool_use', id: 'toolu_01MODERNSLOW0000000000000', name: 'mcpl--modern--slow', input: { ms: 1500 } },
+      { type: 'tool_use', id: 'toolu_01MODERNSLOW0000000000000', name: 'mcpl--modern--slow', input: { release } },
     ] as never, 'tool_use'));
     membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Done.' }]));
     framework.pushEvent({ type: 'external-message', source: 'test', content: 'go', metadata: {} } as never);
     await waitFor('the slow call to start server-side', () => lines(join(dir, 'events.log')).includes('slow-start'));
 
-    // Quiesce begins while the call is provably still running server-side,
-    // so its resolving after 'slow-finished' shows it waited for the call.
-    const quiescing = framework.quiesce({ reason: 'maintenance', timeoutMs: 10_000 });
+    // Quiesce begins while the call is still running server-side, held there
+    // until it's released, so its resolving after 'slow-finished' shows it
+    // waited for the call. Its window is sized for a hang, not for the call.
+    let settled = false;
+    const quiescing = framework.quiesce({ reason: 'maintenance', timeoutMs: 60_000 }).finally(() => { settled = true; });
+    await waitFor('quiesce to begin', () => framework.getHostModeStatus().quiesced);
     assert.ok(!lines(join(dir, 'events.log')).includes('slow-finished'), 'the call is still in flight as quiesce begins');
+    assert.equal(settled, false, 'quiesce waits for the call in flight');
+    writeFileSync(release, '');
     const status = await quiescing;
     assert.equal(status.quiesced, true);
     assert.equal(status.drained, true, 'the turn drained: its modern call completed');
     assert.ok(lines(join(dir, 'events.log')).includes('slow-finished'));
     assert.ok(!lines(join(dir, 'events.log')).includes('slow-aborted'), 'quiesce did not cancel it');
-    assert.match(JSON.stringify(membrane.lastStream!.receivedToolResults[0]), /slept 1500/);
+    assert.match(JSON.stringify(membrane.lastStream!.receivedToolResults[0]), /released/);
     await framework.resume();
   });
 });
@@ -439,13 +469,15 @@ test('quiesce: a list change refreshes the inventory, and its wake parks until r
   await withModern(async ({ framework, membrane }) => {
     framework.start();
     await framework.quiesce({ reason: 'maintenance' });
+    const nextPass = schedulerPasses(framework, waitFor);
     const callsBefore = membrane.calls.length;
     const gatedBefore = framework.getHostModeStatus().gatedRequests;
 
     await framework.executeToolCall(call('mcpl--modern--add_tool'));
     await waitFor('the refreshed inventory', () => framework.getAllTools().some((t) => t.name === 'mcpl--modern--added_1'));
     await waitFor('the wake to park', () => framework.getHostModeStatus().gatedRequests > gatedBefore);
-    await new Promise((r) => setTimeout(r, 200));
+    // A pass over the parked wake, which would have started its turn.
+    await nextPass();
     assert.equal(membrane.calls.length, callsBefore, 'no inference while quiesced');
 
     await framework.resume();
@@ -457,14 +489,28 @@ test('quiesce: a lost modern child reconnects and relists without starting a tur
   await withModern(async ({ framework, membrane, dir }) => {
     framework.start();
     await framework.quiesce({ reason: 'maintenance' });
+    const nextPass = schedulerPasses(framework, waitFor);
     const callsBefore = membrane.calls.length;
     const gatedBefore = framework.getHostModeStatus().gatedRequests;
+    const internals = framework as unknown as {
+      mcplToolsRefreshStarted: number;
+      mcplToolRefreshInFlight: boolean;
+      queue: { depth: number };
+    };
+    const refreshesBefore = internals.mcplToolsRefreshStarted;
 
     await framework.executeToolCall(call('mcpl--modern--die'));
     await waitFor('a second launch', () => lines(join(dir, 'starts.log')).length === 2);
     await waitFor('reconnected', () => framework.listMcplServers()[0]!.connected);
-    await waitFor('the relisted inventory', () => framework.getAllTools().some((t) => t.name === 'mcpl--modern--echo'));
-    await new Promise((r) => setTimeout(r, 200));
+    // The reconnect starts a relist. Once one started after the child died
+    // has settled, any wake it queued is in the event queue; once the queue
+    // is empty, the loop has taken that event, and the next pass sees its
+    // request.
+    await waitFor('the reconnect\'s relist to settle', () =>
+      internals.mcplToolsRefreshStarted > refreshesBefore && !internals.mcplToolRefreshInFlight);
+    await waitFor('the event queue to drain', () => internals.queue.depth === 0);
+    await nextPass();
+    assert.ok(framework.getAllTools().some((t) => t.name === 'mcpl--modern--echo'), 'the relisted inventory');
 
     assert.equal(membrane.calls.length, callsBefore, 'no turn started');
     assert.equal(framework.getHostModeStatus().gatedRequests, gatedBefore, 'no wake parked: the inventory is unchanged');
@@ -494,13 +540,12 @@ test("the framework owns a modern connect in flight: a second connect is refused
     assert.equal(during.error, 'This host is connecting to the "hang" server that provides mcpl--hang--echo, so the call didn\'t run. Try again in a moment.');
     assert.equal(lines(log).filter((l) => l.includes('tools/call')).length, 0, 'nothing reached the server');
     const pid = (JSON.parse(lines(log)[0]!) as { pid: number }).pid;
-    // stop() ends the connect in flight rather than waiting for its handshake.
-    const stopping = Date.now();
+    // stop() ends the connect in flight rather than waiting for its handshake:
+    // the connect fails in the stop's words, not its handshake's timeout's.
     await framework.stop();
-    assert.ok(Date.now() - stopping < 10_000, `stop() took ${Date.now() - stopping} ms, as if it waited out the connect`);
+    await assert.rejects(pending, /^Error: MCP server "hang" was not connected: the framework stopped while it was connecting$/);
     const alive = (p: number) => { try { process.kill(p, 0); return true; } catch { return false; } };
     assert.equal(alive(pid), false, 'the launch in flight was reaped by stop()');
-    await pending.catch(() => {});
     assert.ok(!framework.listMcplServers().some((s) => s.id === 'hang' && s.connected), 'nothing installed after stop');
     // A connect that arrives after stop() is refused before anything spawns.
     const before = lines(log).length;

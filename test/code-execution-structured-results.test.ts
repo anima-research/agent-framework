@@ -116,9 +116,9 @@ test("a script reads a structured result whole, the model's calls and history ke
       'const only = await tools["fixture--inspect"]({ variant: "only" });',
       'check(same(only, { content: [], structuredContent: ENVELOPE, isError: false }), "only", only);',
       // Without structured content, a result is one text block of the
-      // model's text, which JSON-encodes a text result, and no structured view.
+      // model's text, which for a text result is that text, and no structured view.
       'const plain = await tools["fixture--inspect"]({ variant: "plain" });',
-      'check(same(plain, { content: [{ type: "text", text: JSON.stringify("plain text") }], structuredContent: null, isError: false }), "plain", plain);',
+      'check(same(plain, { content: [{ type: "text", text: "plain text" }], structuredContent: null, isError: false }), "plain", plain);',
       'const absent = await tools["fixture--inspect"]({ variant: "absent" });',
       'check(same(absent, { content: [{ type: "text", text: "" }], structuredContent: null, isError: false }), "absent", absent);',
       'const error = await tools["fixture--inspect"]({ variant: "error" });',
@@ -160,8 +160,8 @@ test("a script reads a structured result whole, the model's calls and history ke
     const resultOf = (id: string) => results.find((r) => r.toolUseId === id)!.content;
     // The model reads the content: the text when there is some, and the
     // structured JSON only when the content has none.
-    assert.equal(resultOf('model-direct'), JSON.stringify(transcript));
-    assert.match(resultOf('model-only'), /\\"runId\\":\\"r41\\"/);
+    assert.equal(resultOf('model-direct'), transcript);
+    assert.match(resultOf('model-only'), /"runId":"r41"/);
     const script = resultOf('model-script');
     assert.match(script, /^Script s\d+-[0-9a-z]{4} finished\./, script);
     assert.ok(script.endsWith('Its output:\nr41 running café 🌱\n'), script);

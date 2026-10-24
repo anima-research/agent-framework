@@ -487,10 +487,11 @@ test('the buffered-event cap counts the drops of each pause: a later pause repor
   assert.deepEqual(dropLogs.map((line) => /dropped (\d+) responder-less/.exec(line)?.[1]), ['1', '101', '1']);
 });
 
-// Bun's ws quotes the url as dialed in a failed dial's message: under Bun
+// Bun's ws quoted the url as dialed in a failed dial's message: under Bun
 // 1.3.13 (and 1.4.3, by review of connectome-host#343) a dial to a closed
 // port rejected with these, the url's user, password, path and query, and
-// the token, static or a provider's, all in them.
+// the token, static or a provider's, all in them. Bun 1.4.4 words a
+// refused dial as Node's ws does, with no url.
 const SECRETS = /alice|pw-sekret|sekret4kQ9xW2vLm8pRs|sekret-q|tok-sekret|provided-sekret/;
 
 test("a WebSocket client's error is carried on with the url and the credentials the dial sent masked", () => {
@@ -584,9 +585,9 @@ test("a WebSocket client's error after the socket opened reaches the connection'
   }
 });
 
-test("a failed dial's error is masked when the client quotes the url as dialed, as Bun's does, under Node too", async (t) => {
+test("a failed dial's error is masked when the client quotes the url as dialed, as Bun 1.3.14's and 1.4.3's do, under Node too", async (t) => {
   // Node's ws names only the address in a failed dial's error, so here it
-  // raises Bun's words instead: the masking at the dial is then checked
+  // raises those Bun words instead: the masking at the dial is then checked
   // wherever the suite runs, with or without bun.
   const emit = WebSocket.prototype.emit;
   t.mock.method(WebSocket.prototype, 'emit', function (this: WebSocket, event: string | symbol, ...args: unknown[]) {
@@ -640,7 +641,7 @@ test("a url the client quotes in another spelling than the one dialed is masked 
 test("under Bun, a failed dial's error leaves no credential in its message, cause or stack", (t) => {
   const probe = spawnSync('bun', ['--version'], { encoding: 'utf8' });
   if (probe.error || probe.status !== 0) {
-    // CI's Bun job sets AF_TEST_REQUIRE_BUN, so there it fails rather than skips.
+    // CI's pack-check job sets AF_TEST_REQUIRE_BUN, so there it fails rather than skips.
     assert.ok(!process.env.AF_TEST_REQUIRE_BUN, 'AF_TEST_REQUIRE_BUN is set, but bun is not on PATH');
     t.skip('bun is not on PATH');
     return;
@@ -665,14 +666,31 @@ test("under Bun, a failed dial's error leaves no credential in its message, caus
   assert.equal(run.status, 0, run.stderr);
   const results = JSON.parse(run.stdout) as Array<{ id: string; message?: string; cause?: string; stack?: string; inspected?: string }>;
   assert.equal(results.length, 2);
+  // Each configuration's url as the transport masks it.
+  const masked: Record<string, string> = {
+    static: 'ws://127.0.0.1:1/mcpl/s/redacted/x?api_key=redacted&v=redacted',
+    provider: 'ws://127.0.0.1:1/mcpl',
+  };
+  // Every result's masking first, so a wording the test doesn't know still
+  // has each one's checked.
   for (const result of results) {
-    // A refused dial, carrying the client's own text (which quotes the url),
-    // masked: not the open timeout, whose text the transport writes itself.
-    assert.match(result.message ?? '', /WebSocket connect failed: WebSocket connection to 'ws:\/\/127\.0\.0\.1:1\/mcpl[^']*' failed/, JSON.stringify(result));
     assert.equal(result.cause, 'undefined');
     for (const text of [result.message, result.stack, result.inspected]) {
       assert.ok(text && !SECRETS.test(text), `${result.id}: ${text}`);
     }
+  }
+  for (const result of results) {
+    // A refused dial, in the client's words, then the url the transport
+    // adds, masked: not the open timeout, whose text the transport writes
+    // itself. Bun 1.3.14 and 1.4.3 word a refused dial as their WebSocket
+    // does, quoting the url as dialed, which the transport masks; 1.4.4
+    // words it as Node's `ws` does, with no url.
+    const url = masked[result.id]!;
+    const refused = [`WebSocket connection to '${url}' failed: Failed to connect`, 'connect ECONNREFUSED 127.0.0.1:1'];
+    assert.ok(
+      refused.some((words) => result.message === `MCPL server "${result.id}" WebSocket connect failed: ${words} (${url})`),
+      JSON.stringify(result),
+    );
   }
 });
 
