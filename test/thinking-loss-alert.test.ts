@@ -1,8 +1,9 @@
 /**
- * The operators' alert for thinking the provider dropped that the context manager's binding record says the
- * request carried intact. A reply stored at or below the record's start (`thinkingRecordedAfter`) may lose its
- * thinking with no strip having missed; any other drop alerts, once per incident, again only when a call shows
- * more, and the incident ends at a report that shows none. Without a record start, nothing alerts.
+ * The operators' alert for thinking the provider dropped that the context manager's binding record doesn't account
+ * for. A reply stored at or below the record's start (`thinkingRecordedAfter`) may lose its thinking with no strip
+ * having missed, and so may a block for a binding the record doesn't track (the account's); any other drop alerts,
+ * once per incident, again only when a call shows more, and the incident ends at a call that shows none, its report
+ * empty or absent. Without a record start, nothing alerts.
  */
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
@@ -27,7 +28,16 @@ describe('splitThinkingDrops', () => {
     const unplaced: PlacedDrop = { kind: 'unplaced', entry: entry() };
     const { expected, unexpected } = splitThinkingDrops([reply(3), reply(5), reply(6), reply(5, 6), round, unplaced], 5);
     assert.deepEqual(expected, [reply(3), reply(5)], 'below, and at, the start');
-    assert.deepEqual(unexpected, [reply(6), reply(5, 6), round, unplaced], 'above it, a reply one of whose shards is above it, a round, and unplaced');
+    assert.deepEqual(unexpected, [reply(6), reply(5, 6), round, unplaced], 'above it, a reply one of whose bodies is above it, a round, and unplaced');
+  });
+
+  it('expects a drop for a binding the record doesn\'t track, the account\'s, wherever it sits', () => {
+    const org: PlacedDrop = { kind: 'reply', bodies: [{ messageId: 'm9', sequence: 9 }], entry: entry({ reason: 'organization_binding_mismatch' }) };
+    const user: PlacedDrop = { kind: 'unplaced', entry: entry({ reason: 'end_user_binding_mismatch' }) };
+    const model: PlacedDrop = { kind: 'reply', bodies: [{ messageId: 'm9', sequence: 9 }], entry: entry({ reason: 'model_binding_mismatch' }) };
+    const { expected, unexpected } = splitThinkingDrops([org, user, model], 5);
+    assert.deepEqual(expected, [org, user]);
+    assert.deepEqual(unexpected, [model], 'a model mismatch the record\'s model digest didn\'t show');
   });
 });
 
@@ -38,6 +48,8 @@ describe('ThinkingLossIncidents', () => {
       [2, undefined, undefined, 3, undefined, undefined, undefined, 1]);
     assert.equal(incidents.observe('b', 3), 3, 'each agent\'s incidents are its own');
     assert.equal(incidents.observe('a', 1), undefined, 'a\'s incident still open');
+    incidents.forget('a');
+    assert.equal(incidents.observe('a', 1), 1, 'a removed agent\'s incident ends with it');
   });
 });
 
@@ -68,11 +80,12 @@ class Tools implements Module {
   getTools() { return [{ name: 'echo', description: 'echo', inputSchema: { type: 'object' as const, properties: {} } }]; }
   async handleToolCall(_call: ToolCall) { return { success: true, data: {} }; }
 }
-const withThinking = (response: NormalizedResponse, input: number, dropped: ThinkingBindingEntry[]): NormalizedResponse =>
-  Object.assign(response, { usage: usage(input), round: { thinking: { dropped, mismatchAllowed: [] } } });
-const toolRound = (input: number, dropped: ThinkingBindingEntry[], id: string) =>
+/** A call's response, with a thinking report of `dropped`, or none where it's null. */
+const withThinking = (response: NormalizedResponse, input: number, dropped: ThinkingBindingEntry[] | null): NormalizedResponse =>
+  Object.assign(response, { usage: usage(input), ...(dropped ? { round: { thinking: { dropped, mismatchAllowed: [] } } } : {}) });
+const toolRound = (input: number, dropped: ThinkingBindingEntry[] | null, id: string) =>
   withThinking(createMockResponse([{ type: 'tool_use', name: 'test--echo', id, input: {} }], 'tool_use'), input, dropped);
-const final = (input: number, dropped: ThinkingBindingEntry[]) => {
+const final = (input: number, dropped: ThinkingBindingEntry[] | null) => {
   const response = withThinking(createMockResponse([{ type: 'text', text: 'Done.' }]), input, dropped);
   response.details!.usage = response.usage;
   return response;
@@ -80,7 +93,7 @@ const final = (input: number, dropped: ThinkingBindingEntry[]) => {
 
 /** One turn of an agent whose stored earlier reply carries a signed block, with the compile's record start set
  *  `relative` to that reply's sequence (or left out), and the stream's calls dropping it as `drops` says. */
-async function turn(relative: number | undefined, drops: (at: { message: number; block: number }) => ThinkingBindingEntry[][]) {
+async function turn(relative: number | undefined, drops: (at: { message: number; block: number }) => Array<ThinkingBindingEntry[] | null>) {
   const dir = mkdtempSync(join(tmpdir(), 'af-thinking-loss-'));
   const membrane = new ScriptedMembrane((at) => {
     const [first = [], second = [], third = []] = drops(at);
@@ -124,12 +137,18 @@ describe('the operators\' alert on a framework turn', () => {
   it('alerts once for a reply above the record\'s start that every call of the stream drops', async () => {
     const alerts = await turn(-1, (at) => [[dropped(at)], [dropped(at)], [dropped(at)]]);
     assert.equal(alerts.length, 1, 'the same count again isn\'t news');
-    assert.match(alerts[0]!.message, /dropped 1 signed thinking block that the context manager's binding record says the request carried intact/);
+    assert.match(alerts[0]!.message, /dropped 1 signed thinking block that the context manager's binding record doesn't account for/);
+    assert.match(alerts[0]!.message, /It clears at a call that drops none/);
     assert.equal(alerts[0]!.data?.blocks, 1);
   });
 
   it('alerts afresh after a call whose report shows none', async () => {
     const alerts = await turn(-1, (at) => [[dropped(at)], [], [dropped(at)]]);
+    assert.equal(alerts.length, 2);
+  });
+
+  it('alerts afresh after a call with no report at all', async () => {
+    const alerts = await turn(-1, (at) => [[dropped(at)], null, [dropped(at)]]);
     assert.equal(alerts.length, 2);
   });
 

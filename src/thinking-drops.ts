@@ -4,9 +4,10 @@ import type { CompileProvenance, MessageId } from '@animalabs/context-manager';
 /**
  * Where a block the provider dropped (membrane's `RoundReport.thinking.dropped`) came from.
  *
- * - `reply`: a block of a stored reply the compile rendered. `bodies` are the stored messages that compiled
- *   message was rendered from (`CompileProvenance`'s raw bodies), each with its id and sequence: usually one,
- *   and more where the store keeps a reply in shards, which can't be told apart by the block alone.
+ * - `reply`: a block of a stored reply the compile rendered. `bodies` are the stored bodies that compiled message
+ *   was rendered from (`CompileProvenance`'s raw bodies), each by the id `addMessage` returned for it and its
+ *   sequence (a body kept in shards is one, by its first shard): usually one. Where the block's signature is in
+ *   more than one compiled message, it's every one of theirs, since the block alone can't tell them apart.
  * - `round`: a block of a round this stream appended itself (the entry's `round`), which no compile holds.
  * - `unplaced`: membrane couldn't place it, or it names a block this request didn't send from a stored reply:
  *   an injected message's, one whose compiled message has no raw body (a summary), or one whose signature no
@@ -60,36 +61,46 @@ export function placeThinkingDrops(
   sent: readonly NormalizedMessage[],
   compiled: CompiledForRequest,
 ): PlacedDrop[] {
-  let byKey: Map<string, number> | undefined;
-  const compiledIndex = (key: string): number | undefined => {
+  let byKey: Map<string, number[]> | undefined;
+  const compiledIndexes = (key: string): number[] => {
     if (!byKey) {
       byKey = new Map();
       compiled.messages.forEach((message, i) => {
         for (const block of message.content) {
           const k = bindingKey(block);
-          if (k !== undefined && !byKey!.has(k)) byKey!.set(k, i);
+          if (k === undefined) continue;
+          const at = byKey!.get(k);
+          if (!at) byKey!.set(k, [i]);
+          else if (at.at(-1) !== i) at.push(i);
         }
       });
     }
-    return byKey.get(key);
+    return byKey.get(key) ?? [];
   };
   return entries.map((entry): PlacedDrop => {
     if (entry.round !== undefined) return { kind: 'round', round: entry.round, entry };
     if (entry.message === undefined || entry.block === undefined) return { kind: 'unplaced', entry };
     const key = bindingKey(sent[entry.message]?.content[entry.block]);
-    const at = key === undefined ? undefined : compiledIndex(key);
-    const source = at === undefined ? undefined : compiled.provenance?.messages[at];
-    if (source?.kind !== 'raw' || source.bodies.length === 0) return { kind: 'unplaced', entry };
-    return { kind: 'reply', bodies: source.bodies.map((b) => ({ messageId: b.messageId, sequence: b.sequence })), entry };
+    const bodies: Array<{ messageId: MessageId; sequence: number }> = [];
+    for (const at of key === undefined ? [] : compiledIndexes(key)) {
+      const source = compiled.provenance?.messages[at];
+      // A candidate with no stored body (a summary's) can't be placed, so neither can the block.
+      if (source?.kind !== 'raw' || source.bodies.length === 0) return { kind: 'unplaced', entry };
+      for (const body of source.bodies) bodies.push({ messageId: body.messageId, sequence: body.sequence });
+    }
+    if (bodies.length === 0) return { kind: 'unplaced', entry };
+    return { kind: 'reply', bodies, entry };
   });
 }
 
 /**
  * A call's placed drops against the branch's binding-record start (`thinkingRecordedAfter`). Expected: a block of a
  * stored reply whose every body sits at or below it, minted before the context manager recorded what the branch
- * sent, so the provider may drop its thinking with no strip having missed. Unexpected: everything else, a reply
- * above it, a block of the stream's own rounds, or one that couldn't be placed, which the record says the request
- * carried intact.
+ * sent, so the provider may drop its thinking with no strip having missed; and a drop for a binding the record
+ * doesn't track, the account's organization or end user (`organization_binding_mismatch`,
+ * `end_user_binding_mismatch`). Unexpected: everything else, which the record doesn't account for: a reply above
+ * the start, a block of the stream's own rounds, or one that couldn't be placed, for a conversation or model
+ * mismatch or a reason not known here.
  */
 export function splitThinkingDrops(
   placed: readonly PlacedDrop[],
@@ -99,16 +110,20 @@ export function splitThinkingDrops(
   const unexpected: PlacedDrop[] = [];
   for (const drop of placed) {
     const before = drop.kind === 'reply' && drop.bodies.every((body) => body.sequence <= recordedAfter);
-    (before ? expected : unexpected).push(drop);
+    (before || UNTRACKED_REASONS.has(drop.entry.reason) ? expected : unexpected).push(drop);
   }
   return { expected, unexpected };
 }
 
+/** Binding failures the context manager's record doesn't track: the account's, not the conversation's. */
+const UNTRACKED_REASONS = new Set(['organization_binding_mismatch', 'end_user_binding_mismatch']);
+
 /**
  * When an agent's unexpected drops call for an operator alert: at the first call that shows any, and again only
  * when a call shows more than the alert last counted. Each call of a stream, and each stream until a strip takes
- * them out, drops the same blocks again, so an unchanged count isn't news. A call whose report shows none ends the
- * incident, and the next one alerts afresh.
+ * them out, drops the same blocks again, so an unchanged count isn't news. A call that shows none, whether its
+ * report is empty or absent, ends the incident, and the next one alerts afresh. It's held in memory, so a restart mid-incident alerts once more, and an
+ * agent's removal ends its incident (`forget`).
  */
 export class ThinkingLossIncidents {
   private readonly alerted = new Map<string, number>();
@@ -122,5 +137,10 @@ export class ThinkingLossIncidents {
     if (unexpected <= (this.alerted.get(agent) ?? 0)) return undefined;
     this.alerted.set(agent, unexpected);
     return unexpected;
+  }
+
+  /** The agent is gone: its incident, if one is open, ends with it. */
+  forget(agent: string): void {
+    this.alerted.delete(agent);
   }
 }

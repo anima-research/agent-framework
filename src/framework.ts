@@ -9205,6 +9205,7 @@ export class AgentFramework {
         // deregistered, so disposal must release EventGate liveness itself.
         this.eventGate?.onInferenceEnded(agent.name);
         this.agents.delete(agent.name);
+        this.thinkingLossIncidents.forget(agent.name);
         // Its sleep and self-wake end with it, as a fork's do.
         this.eventGate?.agentGone(agent.name);
         this.releaseWindowNowOrAfterResume(agent);
@@ -13652,6 +13653,7 @@ export class AgentFramework {
     this.activeStreams.delete(agentName);
     this.pendingAssistantBlocks.delete(agentName);
     this.agents.delete(agentName);
+    this.thinkingLossIncidents.forget(agentName);
     // Its sleep and self-wake end with it (the gate's sleep holds back every
     // agent's wakes), and neither wake goes to a name that's gone.
     this.eventGate?.agentGone(agentName);
@@ -21066,9 +21068,9 @@ export class AgentFramework {
             const thinkingDropped = (thinkingReport?.dropped.length ?? 0) > 0;
             if (thinkingDropped) thinkingDroppedInStream = true;
             // Against the branch's binding record, when the context manager keeps one: a drop it can't account
-            // for tells the operators (noteThinkingLoss).
-            if (thinkingReport && thinkingDrops?.recordedAfter !== undefined) {
-              this.noteThinkingLoss(agent.name, thinkingDrops.place(thinkingReport.dropped), thinkingDrops.recordedAfter);
+            // for tells the operators (noteThinkingLoss), and a call with no report shows none.
+            if (thinkingDrops?.recordedAfter !== undefined) {
+              this.noteThinkingLoss(agent.name, thinkingReport ? thinkingDrops.place(thinkingReport.dropped) : [], thinkingDrops.recordedAfter);
             }
             try {
               if (!thinkingDroppedInStream) {
@@ -25419,11 +25421,12 @@ export class AgentFramework {
   }
 
   /**
-   * A call's dropped blocks, placed, against the branch's binding-record start. Replies stored at or below it may
-   * lose their thinking with no strip having missed, since the context manager recorded nothing they were sent
-   * under. Any other drop is one the record says the request carried intact, which means a thinking strip missed
-   * a change ahead of it: the operators hear of it once per incident, again only if a call shows more, and the
-   * incident ends at a report that shows none (ThinkingLossIncidents).
+   * A call's dropped blocks, placed, against the branch's binding-record start (splitThinkingDrops). Replies stored at
+   * or below it may lose their thinking with no strip having missed, since the context manager recorded nothing they
+   * were sent under, and so may any block for a binding the record doesn't track (the account's). Any other drop is
+   * one the record doesn't account for: a change ahead of it that the record didn't see. The operators hear of it
+   * once per incident, again only if a call shows more, and the incident ends at a call that shows none
+   * (ThinkingLossIncidents).
    */
   private noteThinkingLoss(agentName: string, placed: readonly PlacedDrop[], recordedAfter: number): void {
     const { unexpected } = splitThinkingDrops(placed, recordedAfter);
@@ -25434,9 +25437,12 @@ export class AgentFramework {
     const unplaced = unexpected.filter((drop) => drop.kind === 'unplaced');
     this.opsAlert('thinking-binding-loss', agentName,
       `the provider dropped ${count} signed thinking block${count === 1 ? '' : 's'} that the context manager's ` +
-      `binding record says the request carried intact (${replies.length} in stored replies after the record ` +
-      `began at sequence ${recordedAfter}, ${rounds.length} from the stream's own rounds, ${unplaced.length} not ` +
-      'placed): a thinking strip may have missed a change ahead of them, and the agent loses that reasoning',
+      `binding record doesn't account for (${replies.length} in stored replies after the record began at sequence ` +
+      `${recordedAfter}, ${rounds.length} from the stream's own rounds, ${unplaced.length} that couldn't be placed). ` +
+      'Something ahead of them changed that the record didn\'t see, so the agent loses that reasoning, and without ' +
+      'thinkingBinding.dropBlock an account that enforces the binding would have refused the request. It clears at a ' +
+      'call that drops none. If it recurs, look for what changes this agent\'s requests after the compile, such as a ' +
+      'membrane request hook',
       { data: {
         blocks: count,
         recordedAfter,

@@ -25,8 +25,8 @@ const dropped = (fields: Partial<ThinkingBindingEntry>): ThinkingBindingEntry =>
 const provenance = (messages: CompileProvenance['messages']): CompileProvenance =>
   ({ compileId: 'c1', namespace: 'agent', branch: {} as never, messages, layout: null, strategy: 'test' }) as CompileProvenance;
 
-/** A compile of four messages: a user turn, a reply from two stored shards, a summary holding a signed block of its
- *  own, and a reply with a redacted block. */
+/** A compile of four messages: a user turn, a reply rendered from two stored bodies, a summary holding a signed
+ *  block of its own, and a reply with a redacted block. */
 const compiledMessages = [
   msg('user', [text('Hello.')]),
   msg('agent', [signed(SIG_A, 900), text('Hi.')]),
@@ -57,8 +57,24 @@ describe('placeThinkingDrops', () => {
     assert.equal((sent[2]!.content[0] as { tokenEstimate?: unknown }).tokenEstimate, undefined, 'the sent block is a copy without the stamp');
     const [reply, redacted] = placeThinkingDrops([dropped({ message: 2, block: 0 }), dropped({ message: 4, block: 0 })], sent, compiled);
     assert.deepEqual(reply, { kind: 'reply', bodies: [{ messageId: 'r1', sequence: 4 }, { messageId: 'r1b', sequence: 5 }], entry: dropped({ message: 2, block: 0 }) },
-      'both stored shards of the reply, since the block alone can\'t tell them apart');
+      'both stored bodies of the reply, since the block alone can\'t tell them apart');
     assert.deepEqual(redacted, { kind: 'reply', bodies: [{ messageId: 'r2', sequence: 9 }], entry: dropped({ message: 4, block: 0 }) }, 'a redacted block by its data');
+  });
+
+  it('places a block whose signature is in two compiled messages as every one of their bodies, and as unplaced where one has none', () => {
+    const twice = {
+      messages: [msg('agent', [signed(SIG_A), text('Hi.')]), msg('agent', [signed(SIG_A), text('Again.')]), msg('agent', [signed(SIG_B), text('Summary.')]), msg('agent', [signed(SIG_B), text('Again.')])],
+      provenance: provenance([
+        { kind: 'raw', bodies: [{ messageId: 'r1', sequence: 4 } as never] },
+        { kind: 'raw', bodies: [{ messageId: 'r3', sequence: 12 } as never] },
+        { kind: 'summary', summaries: [{ id: 's1', level: 1 }] },
+        { kind: 'raw', bodies: [{ messageId: 'r4', sequence: 13 } as never] },
+      ]),
+    };
+    const [a, b] = placeThinkingDrops([dropped({ message: 1, block: 0 }), dropped({ message: 3, block: 0 })], twice.messages, twice);
+    assert.deepEqual(a, { kind: 'reply', bodies: [{ messageId: 'r1', sequence: 4 }, { messageId: 'r3', sequence: 12 }], entry: dropped({ message: 1, block: 0 }) },
+      'whichever copy the request carried');
+    assert.equal(b!.kind, 'unplaced', 'one candidate is a summary\'s');
   });
 
   it('gives a block of a round the stream appended as that round, and leaves unplaced what names no stored reply of the compile', () => {
