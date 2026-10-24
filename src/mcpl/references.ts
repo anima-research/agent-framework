@@ -582,8 +582,38 @@ export class ReferenceRegistry {
    *  its own origin, for a uri it delivered. */
   private byKey = new Map<string, string>();
   private counter = 0;
+  /** Each open journal's copies (openJournal), by uri. */
+  private journals = new Set<Map<string, ReferenceRecord | null>>();
+
+  /**
+   * Keep, until `close`, each record as it stood when this opened: a copy
+   * taken the first time a registration changes, creates or evicts it, or
+   * null where the uri had none. `before(uri)` gives that record, or the
+   * record as it is where nothing registered has touched it since, which is
+   * the same. A fetch that saves a copy in the meantime sets its record's
+   * saved path without registering, so that is read as it is; a fetch only
+   * saves what its checks passed. Each open has its own copies, so lanes
+   * that overlap keep theirs apart, and closing one lets its copies go.
+   */
+  openJournal(): RegistryJournal {
+    const copies = new Map<string, ReferenceRecord | null>();
+    this.journals.add(copies);
+    return {
+      before: (uri) => (copies.has(uri) ? copies.get(uri) ?? undefined : this.findByUri(uri)),
+      close: () => { this.journals.delete(copies); },
+    };
+  }
+
+  /** Copy a uri's record into each open journal that has none for it yet. */
+  private keepFirst(uri: string): void {
+    if (this.journals.size === 0) return;
+    const record = this.findByUri(uri);
+    const copy = record ? { ...record, serverIds: [...record.serverIds] } : null;
+    for (const copies of this.journals) if (!copies.has(uri)) copies.set(uri, copy);
+  }
 
   register(testimony: ReferenceTestimony, serverId?: string): ReferenceRecord {
+    this.keepFirst(testimony.uri);
     const existingId = this.byKey.get(testimony.uri);
     if (existingId !== undefined) {
       const existing = this.records.get(existingId);
@@ -611,6 +641,7 @@ export class ReferenceRegistry {
       const oldest = this.records.keys().next().value;
       if (oldest !== undefined) {
         const old = this.records.get(oldest);
+        if (old) this.keepFirst(old.testimony.uri);
         this.records.delete(oldest);
         if (old) this.byKey.delete(old.testimony.uri);
       }
@@ -662,6 +693,23 @@ export class ReferenceRegistry {
 }
 
 export const referenceRegistry = new ReferenceRegistry();
+
+/** A registry's records as they stood when it opened (openJournal). */
+export interface RegistryJournal {
+  before(uri: string): ReferenceRecord | undefined;
+  close(): void;
+}
+
+/**
+ * The model's line for a result as a script's link object reads it: the
+ * claims that line reads, and each record as it stood when the script lane
+ * began to treat the result (a journal's `before`), whatever the treatment
+ * has registered, rebound or evicted since, which the line never sees.
+ */
+export interface ScriptLine {
+  claims: ResultClaims;
+  recordBefore(uri: string): ReferenceRecord | undefined;
+}
 
 // ============================================================================
 // Stub building (§5)
@@ -728,7 +776,9 @@ export interface StubOptions {
 export type ResultClaims = ReadonlyMap<string, UriClaims>;
 
 /**
- * A uri as a link shows it, cut of what sanitizeLabel cuts. A `never` is
+ * A uri as a link shows it: cut of what sanitizeLabel cuts (controls and bidi
+ * marks, surrounding space, past REFERENCE_LIMITS.uri), and well formed, as
+ * every copy is before it's shown, a lone surrogate showing as U+FFFD. A `never` is
  * about what a link shows, so it's found by this text (neverShown): a claim
  * of `never` on a uri withholds every link that shows the same text, two
  * uris that cut alike sharing it. Every other claim is about the record,
@@ -736,7 +786,7 @@ export type ResultClaims = ReadonlyMap<string, UriClaims>;
  * room-203 #202239).
  */
 export function shownUri(uri: string): string {
-  return sanitizeLabel(uri, REFERENCE_LIMITS.uri);
+  return sanitizeLabel(uri, REFERENCE_LIMITS.uri).toWellFormed();
 }
 
 const NEVER_SHOWN = new WeakMap<ResultClaims, ReadonlySet<string>>();
@@ -816,28 +866,6 @@ export function inlineNeverUri(block: unknown, c: BlockClassification = classify
   if (c.kind !== 'inline' || !c.contradiction) return null;
   const b = block as { uri?: unknown; disposition?: unknown };
   return b.disposition === 'never' && typeof b.uri === 'string' && b.uri !== '' ? b.uri : null;
-}
-
-/**
- * The claims the model's line for a result reads (`line`), for a script's
- * link objects to judge their uri by (referenceBlockForScript's lineClaims),
- * with, for each uri the script's view claims (`view`) and the line doesn't,
- * that uri's record's own claims as they stand now, before the treatment:
- * the line falls back to the record there, and the treatment registers what
- * it shows as it goes, so a reference nested before a link would otherwise
- * change what the link reads (an expiry, or a plain reference that clears an
- * earlier result's never), and the link's uri would turn on the order of
- * the blocks.
- */
-export function lineClaimsBeforeTreatment(line: ResultClaims, view: ResultClaims): ResultClaims {
-  const frozen = new Map(line);
-  for (const uri of view.keys()) {
-    if (frozen.has(uri)) continue;
-    const record = referenceRegistry.findByUri(uri);
-    frozen.set(uri, (record ? resultClaims([record.testimony]).get(uri) : undefined)
-      ?? { never: false, rejected: false, unparseable: false, earliestMs: null });
-  }
-  return frozen;
 }
 
 /** The claims a decision about a record reads: its result's for its uri,
@@ -1014,7 +1042,7 @@ export function referenceStubOrNull(block: unknown, provenance?: string, serverI
  * empty, the withheld notice, each as a text block.
  * A text block, or inline data that claims nothing, is returned as sent.
  */
-export function referenceBlockForScript(block: unknown, serverId?: string, claims?: ResultClaims, lineClaims?: ResultClaims): unknown {
+export function referenceBlockForScript(block: unknown, serverId?: string, claims?: ResultClaims, line?: ScriptLine): unknown {
   const c = classifyBlock(block);
   switch (c.kind) {
     case 'text': return block;
@@ -1039,14 +1067,22 @@ export function referenceBlockForScript(block: unknown, serverId?: string, claim
       // with each other across an expiry.
       const nowMs = Date.now();
       // A link's uri where the model's line for the result shows it, by the
-      // claims the line reads (lineClaims, where they differ from the view's),
-      // and never where the view's claims withhold it: reading more claims
-      // can loosen as well as tighten, since an expiry makes a link one the
-      // host can't fetch, whose uri the line shows (Ada-1017, room-203
-      // #201013). A script never sees a uri the model's line withholds,
-      // through its blocks; structured content goes as sent, as on main.
-      const lineShows = shownLinkUri(t, record, nowMs, lineClaims ?? claims);
-      const uri = lineShows !== null && lineClaims !== undefined && claimedNever(record, claims) ? null : lineShows;
+      // claims the line reads and its record as the line reads it (`line`,
+      // where they differ from the view's), and never where the view's
+      // claims withhold it: reading more claims can loosen as well as
+      // tighten, since an expiry makes a link one the host can't fetch, whose
+      // uri the line shows (Ada-1017, room-203 #201013). The line's record is
+      // the one before the script lane registered anything (#202683), since
+      // the treatment registers, rebinds and evicts as it goes, which the
+      // line never sees; where there was none, it's the one the link's own
+      // registration makes. A script never sees a uri the model's line
+      // withholds, through its blocks; structured content goes as sent, as
+      // on main.
+      const lineRecord = line
+        ? line.recordBefore(t.uri) ?? { refId: record.refId, serverIds: serverId === undefined ? [] : [serverId], testimony: t, receivedAt: record.receivedAt }
+        : record;
+      const lineShows = shownLinkUri(t, lineRecord, nowMs, line ? line.claims : claims);
+      const uri = lineShows !== null && line !== undefined && claimedNever(record, claims) ? null : lineShows;
       // Why a fetch_reference with this object's refId would be refused, in
       // the words a stub gives, whether or not the model's line for it is a
       // stub: the line has no id to fetch with, and the object does. As the

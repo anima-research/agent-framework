@@ -727,7 +727,7 @@ test("an MCPL peer's script-demand fetch reads the view's claims: a nested expir
 });
 
 test("a nested link's uri doesn't turn on the order of the blocks: a reference nested before it doesn't change what its line reads", { timeout: 30_000 }, async () => {
-  await withPeers(async ({ answer, script }) => {
+  await withPeers(async ({ answer, script, exit }) => {
     // Fetchable, so the line, reading no claim of this result for the uri,
     // shows no uri. A nested expired reference registered before the link,
     // as the treatment's own pass registers what it shows, would make the
@@ -744,6 +744,8 @@ test("a nested link's uri doesn't turn on the order of the blocks: a reference n
       answer({ content, structuredContent: {} });
       const fromPeer = await script('mcpl--files--attach');
       assert.ok(!fromPeer.includes(`block-order-${i}`), `${order.join(' then ')}: ${fromPeer}`);
+      const view = JSON.parse(fromPeer) as { content: Array<Record<string, Record<string, unknown>>>; isError: boolean };
+      assert.deepEqual([view.isError, typeof view.content[0]!.link!.refId, 'uri' in view.content[0]!.link!], [false, 'string', false], fromPeer);
     }
     // An earlier result's never, which a later result's plain reference,
     // nested before the link, would clear on the record.
@@ -757,10 +759,73 @@ test("a nested link's uri doesn't turn on the order of the blocks: a reference n
     // never no longer holds there; the line, which shows neither, reads the
     // record as it stood, and withholds the uri; so does the script.
     assert.ok(!out.includes('order-never'), out);
+    const view = JSON.parse(out) as { content: Array<Record<string, Record<string, unknown>>>; isError: boolean };
+    assert.deepEqual([view.isError, typeof view.content[0]!.link!.refId], [false, 'string'], out);
+    // A module's result the same way, for a uri of its own, in both orders.
+    for (const [i, nestedFirst] of [true, false].entries()) {
+      const moduleUri = `https://elsewhere.example.invalid/order-never-module-${i}/report.csv`;
+      answer({ content: [{ type: 'resource', uri: moduleUri, name: 'report.csv', disposition: 'never' }], structuredContent: {} });
+      await script('mcpl--files--attach');
+      const plain = { type: 'resource', uri: moduleUri, name: 'report.csv' };
+      const link = { type: 'resource_link', uri: moduleUri, name: 'report.csv' };
+      const block = nestedFirst ? { type: 'text', text: 'again', plain, link } : { type: 'text', text: 'again', link, plain };
+      const fromModule = await exit({ success: true, data: [block], structured: {} }, 'fwd--whole', false);
+      assert.ok(!fromModule.includes(`order-never-module-${i}`), fromModule);
+      const moduleView = JSON.parse(fromModule) as { content: Array<Record<string, Record<string, unknown>>>; isError: boolean };
+      assert.deepEqual([moduleView.isError, typeof moduleView.content[0]!.link!.refId], [false, 'string'], fromModule);
+    }
   });
 });
 
-test("an MCPL peer's result a script reads as text has its demand fetch read each block, as the text does, not a view it never gets", async () => {
+test("a link's uri reads its record as it stood before the script lane registered anything, through an eviction the treatment's own registrations make", { timeout: 60_000 }, async () => {
+  await withPeers(async ({ answer, script, exit }) => {
+    for (const route of ['peer', 'module'] as const) {
+      // An earlier result marks the uri never; off the server's origin, so a
+      // link to it with no such claim shows its uri.
+      const uri = `https://elsewhere.example.invalid/evicted-${route}/report.csv`;
+      answer({ content: [{ type: 'resource', uri, name: 'report.csv', disposition: 'never' }], structuredContent: {} });
+      await script('mcpl--files--attach');
+      // More references nested before the link than the registry holds, so
+      // the treatment evicts the uri's record before it reaches the link.
+      const many = Array.from({ length: 2001 }, (_, i) => ({ type: 'resource', uri: `https://files.example.invalid/many-${route}/${i}.csv`, name: `${i}.csv` }));
+      const content = [{ type: 'text', text: 'many attachments', many, link: { type: 'resource_link', uri, name: 'report.csv' } }];
+      let out: string;
+      if (route === 'peer') {
+        answer({ content, structuredContent: {} });
+        out = await script('mcpl--files--attach');
+      } else {
+        out = await exit({ success: true, data: content, structured: {} }, 'fwd--whole', false);
+      }
+      assert.ok(!out.includes(`evicted-${route}/report.csv`), `${route}: ${out.slice(-600)}`);
+      const view = JSON.parse(out) as { content: Array<Record<string, Record<string, unknown>>>; isError: boolean };
+      assert.deepEqual([view.isError, typeof view.content[0]!.link!.refId], [false, 'string'], route);
+    }
+  });
+});
+
+test("an earlier result's never on one uri doesn't withhold, from a script, a link to another that shows as the same text, where the model's line shows it", { timeout: 30_000 }, async () => {
+  await withPeers(async ({ answer, script, modelCall }) => {
+    // Each record speaks for its own uri: the earlier never is the marked
+    // uri's, and the link names the clean one, whose record has none.
+    const marked = 'https://elsewhere.example.invalid/cut-history/\u200Freport.csv';
+    const clean = 'https://elsewhere.example.invalid/cut-history/report.csv';
+    answer({ content: [{ type: 'resource', uri: marked, name: 'report.csv', disposition: 'never' }], structuredContent: {} });
+    await script('mcpl--files--attach');
+    const content = () => [
+      { type: 'text', text: 'again', attachment: { type: 'resource', uri: marked, name: 'report.csv' } },
+      { type: 'resource_link', uri: clean, name: 'report.csv' },
+    ];
+    answer({ content: content(), structuredContent: {} });
+    const line = nonErrorResultText(await modelCall('attach'));
+    assert.ok(line.includes('cut-history/report.csv'), line);
+    answer({ content: content(), structuredContent: {} });
+    const out = await script('mcpl--files--attach');
+    const link = (JSON.parse(out) as { content: Array<Record<string, unknown>> }).content[1]!;
+    assert.equal(link.uri, clean, out);
+  });
+});
+
+test("an MCPL peer's result a script reads as text has its demand fetch read each top-level block's own expiry, as a model's call does, not a view it never gets", async () => {
   await withPeers(async ({ answer, script, fetched }) => {
     // No structured content: the script reads the model lane's text, whose
     // stubs read the top-level blocks' claims, so a reference nested in a
@@ -787,6 +852,8 @@ test("an MCPL peer's view reads the claims its dispatch read for the demand fetc
     const out = await script('mcpl--files--attach');
     assert.equal(fetched.length, 1, 'the demand fetch ran between the two readings');
     assert.ok(!out.includes('read-once/report.csv'), out);
+    const view = JSON.parse(out) as { content: Array<Record<string, unknown>>; isError: boolean };
+    assert.deepEqual([view.isError, view.content.length, typeof view.content[2]!.refId], [false, 3, 'string'], out);
   });
 });
 
@@ -806,6 +873,29 @@ test("inline data's expiry claims nothing for a link to its uri, which the host 
     answer({ content: content(), structuredContent: {} });
     const out = await script('mcpl--files--attach');
     assert.ok(!out.includes('inline-expiry'), out);
+    const view = JSON.parse(out) as { content: Array<Record<string, unknown>>; isError: boolean };
+    assert.deepEqual([view.isError, typeof view.content[1]!.refId], [false, 'string'], out);
+  });
+});
+
+test("a never nested where only the script's view reads it withholds a link whose uri shows as the same text", { timeout: 30_000 }, async () => {
+  await withPeers(async ({ answer, script, modelCall }) => {
+    // Off the server's origin, so the line, which reads the top-level blocks
+    // alone, shows the link's uri; the view reads the nested never, found by
+    // the text the link shows.
+    const uri = 'https://elsewhere.example.invalid/view-cut/report.csv';
+    const content = () => [
+      { type: 'text', text: 'sealed', attachment: { type: 'resource', uri, name: 'report.csv', disposition: 'never' } },
+      { type: 'resource_link', uri: 'https://elsewhere.example.invalid/view-cut/\u200Freport.csv', name: 'report.csv' },
+    ];
+    answer({ content: content(), structuredContent: {} });
+    const line = nonErrorResultText(await modelCall('attach'));
+    assert.ok(line.includes('view-cut/report.csv'), line);
+    answer({ content: content(), structuredContent: {} });
+    const out = await script('mcpl--files--attach');
+    assert.ok(!out.includes('view-cut'), out);
+    const link = (JSON.parse(out) as { content: Array<Record<string, unknown>> }).content[1]!;
+    assert.deepEqual(['uri' in link, typeof link.refId], [false, 'string'], out);
   });
 });
 

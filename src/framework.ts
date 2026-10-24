@@ -1,7 +1,7 @@
 import { ToolPresentation, presentationTools, isPresentationTool, renderCatalogue, type PresentationSnapshot } from "./tool-presentation.js";
 import { constants as bufferConstants } from 'node:buffer';
 import { dirname, join } from 'node:path';
-import { EXPIRY_REASON, REFERENCE_LIMITS, claimedExpiry, classifyBlock, isReferenceExpired, lineClaimsBeforeTreatment, referenceBlockForScript, referenceRegistry, sanitizeLabel, type ResultClaims, type ServerAddress } from './mcpl/references.js';
+import { EXPIRY_REASON, REFERENCE_LIMITS, claimedExpiry, classifyBlock, isReferenceExpired, referenceBlockForScript, referenceRegistry, sanitizeLabel, type RegistryJournal, type ResultClaims, type ScriptLine, type ServerAddress } from './mcpl/references.js';
 import { ReferenceFetcher, DEFAULT_FETCH_MAX_BYTES, EAGER_FETCH_TIMEOUT_MS } from './mcpl/reference-fetcher.js';
 import {
   appendFileSync, closeSync, existsSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, unlinkSync,
@@ -22590,93 +22590,105 @@ export class AgentFramework {
     // Where the walk stops, the script's answer is a
     // failure naming the tool, before any fetch or treatment, so neither runs
     // without them (Ada-1017, room-203 #200250, #200374): on both of a
-    // script's routes, `is_error` says nothing could be shown, where the
+    // script's routes, `isError` says nothing could be shown, where the
     // model's lane shows UNCHECKED_RESULT_TEXT.
     let claims: ResultClaims | undefined;
-    // The claims the model's line for the result reads, which decide where a
-    // link's object shows its uri (referenceBlockForScript's lineClaims).
-    let lineClaims: ResultClaims | undefined;
-    if ((!isError || structured) && Array.isArray(result.data) && fromModule) {
-      try {
-        lineClaims = resultClaimsOrThrow(result.data, result.dataIsContent);
-        claims = showsBlocks ? scriptViewClaims(result.data, false) : lineClaims;
-        if (showsBlocks) lineClaims = lineClaimsBeforeTreatment(lineClaims, claims);
-      } catch (err) {
-        return failed(err);
-      }
-      const fetcher = this.getReferenceFetcher();
-      for (const block of result.data) {
-        const c = classifyBlock(block);
-        if (c.kind !== 'reference' || c.testimony.fromLink) continue;
-        // Registered, not only found, so a re-issued reference's claims
-        // replace a link's, or a stale reference's, before the fetch reads
-        // them, as on any other path, while the record isn't fetched yet. A
-        // record its uri already has keeps the server it's bound to.
-        const record = referenceRegistry.register(c.testimony);
-        // A uri any of the result's references gives an expiry that counts
-        // isn't fetched, as autoFetchReferences passes over one that any block
-        // of an MCPL result marks expired.
-        const expired = record.fetchedPath ? null : claimedExpiry(record, claims, Date.now());
-        if (expired !== null) {
-          console.error(`[rfc005] script-demand fetch of ${record.refId} not made: by the result's claims, the reference is ${EXPIRY_REASON[expired]}`);
-          continue;
-        }
-        const outcome = await fetcher.fetch(record);
-        if (!outcome.ok) console.error(`[rfc005] script-demand fetch of ${record.refId} failed: ${outcome.error}`);
-      }
-    }
-    // An MCPL peer's result whose blocks JSON couldn't hold, so that RFC-005's
-    // treatment couldn't be given them at dispatch.
-    if (SCRIPT_RESULT_UNCONVERTIBLE.has(result)) return failed(SCRIPT_RESULT_UNCONVERTIBLE.get(result));
-    let content: unknown[];
-    let text: string | undefined;
-    if (showsBlocks) {
-      content = Array.isArray(result.data) ? result.data : [];
-      // A module's blocks, such as an MCPL peer's it got from ctx.callTool
-      // and returns whole, are read as history reads a module's data: what
-      // RFC-005 governs, at any depth, as the script lane shows it, and
-      // anything else as sent. What a script prints comes back to the model,
-      // so no uri the model's lanes withhold reaches it through the blocks
-      // (structured content goes as sent, as on main). What this gives is
-      // a stub, a notice or the value itself, so a module that returns
-      // blocks it already gave has them left as they are.
-      if (fromModule) {
+    // The model's line for the result, its claims and its records as it reads
+    // them, which decide where a link's object shows its uri
+    // (referenceBlockForScript's line). Its records are the registry's as
+    // they stood before this lane registered anything (openJournal): the
+    // demand fetch below and the treatment register as they go, which the
+    // line never sees (Ada-1017, room-203 #202683).
+    let line: ScriptLine | undefined;
+    let journal: RegistryJournal | undefined;
+    try {
+      if ((!isError || structured) && Array.isArray(result.data) && fromModule) {
         try {
-          content = JSON.parse(JSON.stringify(content, (_key, value: unknown) => shownToScript(value, claims, lineClaims))) as unknown[];
+          const lineClaims = resultClaimsOrThrow(result.data, result.dataIsContent);
+          claims = showsBlocks ? scriptViewClaims(result.data, false) : lineClaims;
+          if (showsBlocks) {
+            journal = referenceRegistry.openJournal();
+            line = { claims: lineClaims, recordBefore: journal.before };
+          }
         } catch (err) {
           return failed(err);
         }
+        const fetcher = this.getReferenceFetcher();
+        for (const block of result.data) {
+          const c = classifyBlock(block);
+          if (c.kind !== 'reference' || c.testimony.fromLink) continue;
+          // Registered, not only found, so a re-issued reference's claims
+          // replace a link's, or a stale reference's, before the fetch reads
+          // them, as on any other path, while the record isn't fetched yet. A
+          // record its uri already has keeps the server it's bound to.
+          const record = referenceRegistry.register(c.testimony);
+          // A uri any of the result's references gives an expiry that counts
+          // isn't fetched, as autoFetchReferences passes over one that any block
+          // of an MCPL result marks expired.
+          const expired = record.fetchedPath ? null : claimedExpiry(record, claims, Date.now());
+          if (expired !== null) {
+            console.error(`[rfc005] script-demand fetch of ${record.refId} not made: by the result's claims, the reference is ${EXPIRY_REASON[expired]}`);
+            continue;
+          }
+          const outcome = await fetcher.fetch(record);
+          if (!outcome.ok) console.error(`[rfc005] script-demand fetch of ${record.refId} failed: ${outcome.error}`);
+        }
       }
-    } else {
-      // As in history, a reference is its stub at any depth and inline data
-      // claiming a uri or a disposition is withheld (RFC-005), by the claims
-      // the fetches read, or else the serializer's own reading of them,
-      // whose walk throws where it stops, failing as a stopped render does.
+      // An MCPL peer's result whose blocks JSON couldn't hold, so that RFC-005's
+      // treatment couldn't be given them at dispatch.
+      if (SCRIPT_RESULT_UNCONVERTIBLE.has(result)) return failed(SCRIPT_RESULT_UNCONVERTIBLE.get(result));
+      let content: unknown[];
+      let text: string | undefined;
+      if (showsBlocks) {
+        content = Array.isArray(result.data) ? result.data : [];
+        // A module's blocks, such as an MCPL peer's it got from ctx.callTool
+        // and returns whole, are read as history reads a module's data: what
+        // RFC-005 governs, at any depth, as the script lane shows it, and
+        // anything else as sent. What a script prints comes back to the model,
+        // so no uri the model's lanes withhold reaches it through the blocks
+        // (structured content goes as sent, as on main). What this gives is
+        // a stub, a notice or the value itself, so a module that returns
+        // blocks it already gave has them left as they are.
+        if (fromModule) {
+          try {
+            content = JSON.parse(JSON.stringify(content, (_key, value: unknown) => shownToScript(value, claims, line))) as unknown[];
+          } catch (err) {
+            return failed(err);
+          }
+        }
+      } else {
+        // As in history, a reference is its stub at any depth and inline data
+        // claiming a uri or a disposition is withheld (RFC-005), by the claims
+        // the fetches read, or else the serializer's own reading of them,
+        // whose walk throws where it stops, failing as a stopped render does.
+        try {
+          text = isError
+            ? result.error ?? 'tool call failed'
+            : result.data === undefined || result.data === null
+              ? nonErrorResultTextOrThrow(result)
+              : toolResultDataToHistoryString(result.data, undefined, {
+                dataIsContent: Boolean(result.dataIsContent),
+                ...(claims ? { claims } : {}),
+              });
+        } catch (err) {
+          return failed(err);
+        }
+        content = [{ type: 'text', text }];
+      }
+      let json: string;
       try {
-        text = isError
-          ? result.error ?? 'tool call failed'
-          : result.data === undefined || result.data === null
-            ? nonErrorResultTextOrThrow(result)
-            : toolResultDataToHistoryString(result.data, undefined, {
-              dataIsContent: Boolean(result.dataIsContent),
-              ...(claims ? { claims } : {}),
-            });
+        json = JSON.stringify({
+          content,
+          structuredContent: structured && result.structured !== undefined ? result.structured : null,
+          isError,
+        });
       } catch (err) {
         return failed(err);
       }
-      content = [{ type: 'text', text }];
+      return { ok: true, json, isError, brief: text ?? scriptResultBrief(content) };
+    } finally {
+      journal?.close();
     }
-    let json: string;
-    try {
-      json = JSON.stringify({
-        content,
-        structuredContent: structured && result.structured !== undefined ? result.structured : null,
-        isError,
-      });
-    } catch (err) {
-      return failed(err);
-    }
-    return { ok: true, json, isError, brief: text ?? scriptResultBrief(content) };
   }
 
   /**
@@ -29094,29 +29106,35 @@ export class AgentFramework {
         };
         let claims: ResultClaims;
         // The model's line for a peer's content reads its blocks' claims
-        // alone, which decide where a link's object shows its uri.
+        // alone, and each record as it stood before the treatment registered
+        // anything (openJournal), which decide where a link's object shows
+        // its uri (Ada-1017, room-203 #202683).
         let lineClaims: ResultClaims;
         try {
           // As the dispatch read them for its demand fetch, where it did.
           const read = SCRIPT_VIEW_CLAIMS.get(direct.data);
           if (read && 'error' in read) throw read.error;
           claims = read ? read.claims : scriptViewClaims(direct.data, true);
-          lineClaims = lineClaimsBeforeTreatment(resultClaimsOrThrow(direct.data, true), claims);
+          lineClaims = resultClaimsOrThrow(direct.data, true);
         } catch (err) {
           return unconvertible(err);
         }
-        const blocks = direct.data.map((block: unknown) => referenceBlockForScript(block, serverId, claims, lineClaims));
+        const journal = referenceRegistry.openJournal();
         try {
+          const line: ScriptLine = { claims: lineClaims, recordBefore: journal.before };
+          const blocks = direct.data.map((block: unknown) => referenceBlockForScript(block, serverId, claims, line));
           // The top-level blocks were treated just above; the pass treats
           // what's nested in them. Reading a treated block again would take
           // a link object's uri, as sanitizeLabel cut it, for a new link,
           // registered apart from the one the result named.
           const nested = function (this: unknown, _key: string, value: unknown): unknown {
-            return this === blocks ? value : shownToScriptFromServer(value, serverId, claims, lineClaims);
+            return this === blocks ? value : shownToScriptFromServer(value, serverId, claims, line);
           };
           return { ...direct, data: JSON.parse(JSON.stringify(blocks, nested)) as unknown[] };
         } catch (err) {
           return unconvertible(err);
+        } finally {
+          journal.close();
         }
       }
       // A standard peer's content that isn't a list of blocks is a malformed
@@ -29210,7 +29228,8 @@ export class AgentFramework {
           let claims: ResultClaims | undefined;
           // Only where the script reads a view of the blocks (reading()'s own
           // condition): without structured content it reads the model lane's
-          // text, whose fetch reads each block's own claims, as the text does.
+          // text, and its fetch passes over what each top-level block's own
+          // expiry marks, as a model's call does. No fetch reads a `never`.
           if (scriptReads && Object.prototype.hasOwnProperty.call(result, 'structuredContent') && Array.isArray(result.content)) {
             try {
               claims = scriptViewClaims(result.content, true);

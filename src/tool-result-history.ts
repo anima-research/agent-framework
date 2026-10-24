@@ -38,6 +38,7 @@ import {
   resultClaims,
   type ReferenceTestimony,
   type ResultClaims,
+  type ScriptLine,
 } from './mcpl/references.js';
 import { formatToolImagePlaceholder, toolResultCutAt } from './tool-image-ledger.js';
 
@@ -538,19 +539,20 @@ function claimsInHistoryOrThrow(data: unknown): ResultClaims {
  * withheld notice, each as a text block. A null, absent or empty uri claims
  * none (hasUri), so inline data beside one is itself. Any other value is
  * itself. `claims` are those of everything the script's view shows
- * (scriptViewClaims), and `lineClaims` those the model's line for the
- * result reads, which decide where a link's uri is shown. What it gives is either a stub or a notice, which
+ * (scriptViewClaims), and `line` the model's line for the result, its claims
+ * and its records as it reads them (ScriptLine), which decide where a link's
+ * uri is shown. What it gives is either a stub or a notice, which
  * RFC-005 doesn't govern, or the value itself, which it gives again, so
  * applying it twice gives what applying it once gave.
  */
-export function shownToScript(value: unknown, claims?: ResultClaims, lineClaims?: ResultClaims): unknown {
+export function shownToScript(value: unknown, claims?: ResultClaims, line?: ScriptLine): unknown {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return value;
   const b = value as Record<string, unknown>;
   if (!governedByRfc005(b)) return value;
   if ((b.type === 'image' || b.type === 'audio') && typeof b.data === 'string') {
     return hasUri(b.uri) || b.disposition !== undefined ? { type: 'text', text: INLINE_WITHHELD_TEXT } : value;
   }
-  return referenceBlockForScript(b, undefined, claims, lineClaims);
+  return referenceBlockForScript(b, undefined, claims, line);
 }
 
 /**
@@ -562,7 +564,7 @@ export function shownToScript(value: unknown, claims?: ResultClaims, lineClaims?
  * shown only where the model's line shows it, by the claims the line reads
  * (contentClaims, which reads a block and not its fields): reading more
  * claims can loosen as well as tighten, since an expiry makes a link one the
- * host can't fetch (referenceBlockForScript's `lineClaims`). An MCPL peer's
+ * host can't fetch (referenceBlockForScript's `line`). An MCPL peer's
  * top-level block the classifier rejects is
  * its notice, its fields unshown, so they don't count (`fromServer`). It
  * throws what stops the walk, such as a value too deep to convert or a
@@ -586,10 +588,10 @@ export function scriptViewClaims(content: readonly unknown[], fromServer: boolea
  * governed, so a block the top-level pass already treated is left as it is.
  * `claims` are those of the script's whole view (scriptViewClaims).
  */
-export function shownToScriptFromServer(value: unknown, serverId: string, claims?: ResultClaims, lineClaims?: ResultClaims): unknown {
+export function shownToScriptFromServer(value: unknown, serverId: string, claims?: ResultClaims, line?: ScriptLine): unknown {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return value;
   const b = value as Record<string, unknown>;
-  return governedByRfc005(b) ? referenceBlockForScript(b, serverId, claims, lineClaims) : value;
+  return governedByRfc005(b) ? referenceBlockForScript(b, serverId, claims, line) : value;
 }
 
 /**
@@ -616,8 +618,10 @@ export function rfc005TextOf(value: unknown): string | null {
  * run); so does a render that stops after the walk, or a getter that throws
  * (Ada-1017, room-203 #200344, #201013). The round completes, as a withheld
  * result's kept fields keep nothing then (keptWhenWithheld). A script never
- * gets it: its routes read the claims first and call the serializer, or
- * nonErrorResultTextOrThrow, directly, and fail naming the tool (#200374).
+ * gets it: its routes call the serializer, or nonErrorResultTextOrThrow,
+ * directly, whose walk throws where it stops, and fail naming the tool
+ * (#200374). An error result's own error field is read as before, and so
+ * are the fields the tool-result guard keeps of a result it withholds.
  */
 export const UNCHECKED_RESULT_TEXT =
   "[Result not shown: the tool ran, but its result couldn't be read through, checked for references and shown, so this host withheld it.]";

@@ -1433,20 +1433,45 @@ describe('one answer for every block of a result', () => {
     assert.ok(toolResultDataToHistoryString([dated, link], undefined, { dataIsContent: true }).includes('inline-never'));
   });
 
+  it("withholds a never uri from a link whose uri shows as the same text once well formed, a lone surrogate showing as U+FFFD", () => {
+    // Each side as the other shows it: a never with the replacement character
+    // and a link with a lone surrogate, and the other way round.
+    // Each pair at a path of its own, since the registry keeps each never.
+    for (const [i, [sealedEnd, linkEnd]] of [['\uFFFD', '\uD800'], ['\uD800', '\uFFFD']].entries()) {
+      const at = `https://zz-elsewhere.example/sur-never-${i}/`;
+      const sealed = { type: 'resource', uri: `${at}${sealedEnd}.csv`, name: 'report.csv', disposition: 'never' };
+      const link = { type: 'resource_link', uri: `${at}${linkEnd}.csv`, name: 'report.csv' };
+      const control = toolResultDataToHistoryString([link], undefined, { dataIsContent: true });
+      assert.ok(control.includes(`sur-never-${i}`), control);
+      for (const shown of [
+        toolResultDataToHistoryString([sealed, link], undefined, { dataIsContent: true }),
+        toolResultDataToHistoryString({ sealed, link }),
+        JSON.stringify(shownToScript(link, scriptViewClaims([sealed, link], false))),
+      ]) {
+        assert.ok(!shown.includes(`sur-never-${i}`), shown);
+      }
+    }
+  });
+
   it("withholds a never uri from a link whose uri shows as the same text, its bidi control cut", () => {
-    const uri = 'https://zz-elsewhere.example/cut-never/report.csv';
-    const sealed = { type: 'resource', uri, name: 'report.csv', disposition: 'never' };
     // The same uri with a right-to-left mark, which sanitizeLabel cuts, so
-    // the link would show exactly the text the never withholds.
-    const link = { type: 'resource_link', uri: 'https://zz-elsewhere.example/cut-never/\u200Freport.csv', name: 'report.csv' };
-    const control = toolResultDataToHistoryString([link], undefined, { dataIsContent: true });
-    assert.ok(control.includes('cut-never/report.csv'), control);
-    for (const shown of [
-      toolResultDataToHistoryString([sealed, link], undefined, { dataIsContent: true }),
-      toolResultDataToHistoryString({ sealed, link }),
-      JSON.stringify(shownToScript(link, scriptViewClaims([sealed, link], false))),
-    ]) {
-      assert.ok(!shown.includes('cut-never'), shown);
+    // the link would show exactly the text the never withholds: the mark on
+    // the link's side, and on the never's, each pair at a path of its own,
+    // since the registry keeps each never.
+    for (const [i, markOnLink] of [true, false].entries()) {
+      const clean = `https://zz-elsewhere.example/cut-never-${i}/report.csv`;
+      const marked = `https://zz-elsewhere.example/cut-never-${i}/\u200Freport.csv`;
+      const sealed = { type: 'resource', uri: markOnLink ? clean : marked, name: 'report.csv', disposition: 'never' };
+      const link = { type: 'resource_link', uri: markOnLink ? marked : clean, name: 'report.csv' };
+      const control = toolResultDataToHistoryString([link], undefined, { dataIsContent: true });
+      assert.ok(control.includes(`cut-never-${i}/report.csv`), control);
+      for (const shown of [
+        toolResultDataToHistoryString([sealed, link], undefined, { dataIsContent: true }),
+        toolResultDataToHistoryString({ sealed, link }),
+        JSON.stringify(shownToScript(link, scriptViewClaims([sealed, link], false))),
+      ]) {
+        assert.ok(!shown.includes(`cut-never-${i}`), shown);
+      }
     }
   });
 
@@ -1473,6 +1498,8 @@ describe('one answer for every block of a result', () => {
       // What's thrown can be a value String() can't read itself; the line
       // still goes out, saying so.
       const unprintable = { get data(): unknown { throw Object.create(null); } };
+      // The words themselves, which the agent reads, pinned here once.
+      assert.equal(UNCHECKED_RESULT_TEXT, "[Result not shown: the tool ran, but its result couldn't be read through, checked for references and shown, so this host withheld it.]");
       assert.equal(nonErrorResultText(unprintable, undefined, { toolName: 'zz_unprintable' }), UNCHECKED_RESULT_TEXT);
       // A render that stops where the claims walk got through: the render
       // registers what it shows, and the claims walk registers nothing.

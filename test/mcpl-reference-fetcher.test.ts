@@ -9,7 +9,7 @@ import assert from 'node:assert/strict';
 import { createServer } from 'node:http';
 import { createHash } from 'node:crypto';
 import { DEFAULT_FETCH_MAX_BYTES, ReferenceFetcher, normalizedOrigin, type ServerResolution } from '../src/mcpl/reference-fetcher.js';
-import { EXPIRY_REASON, noAddressReason, ReferenceRegistry, UNBOUND_REASON, classifyBlock, referenceExpiry, referenceRegistry, shownServerId } from '../src/mcpl/references.js';
+import { EXPIRY_REASON, noAddressReason, ReferenceRegistry, UNBOUND_REASON, classifyBlock, referenceExpiry, referenceRegistry, shownServerId, type ReferenceTestimony } from '../src/mcpl/references.js';
 import { AgentFramework } from '../src/framework.js';
 
 const PAYLOAD = Buffer.from('RIFF-not-really-a-wav-'.repeat(100));
@@ -101,6 +101,44 @@ test('happy path: origin-bound fetch, bearer auth applied host-side, digest veri
   // idempotent: second fetch returns the cached materialization
   const again = await f.fetch(rec);
   assert.equal(again.path, out.path);
+});
+
+test("a registry journal keeps each record as it stood when it opened, through a change, a rebinding and an eviction, each open its own copies", () => {
+  const reg = new ReferenceRegistry();
+  const t = (uri: string, extra: Record<string, unknown> = {}): ReferenceTestimony => {
+    const c = classifyBlock({ type: 'resource', uri, name: 'x.csv', ...extra });
+    assert.equal(c.kind, 'reference');
+    return (c as { testimony: ReferenceTestimony }).testimony;
+  };
+  const u = 'https://zz-journal.example/u.csv';
+  const w = 'https://zz-journal.example/w.csv';
+  reg.register(t(u, { disposition: 'never' }), 'first');
+  reg.register(t(w));
+  const one = reg.openJournal();
+  // A later testimony and a second server, then a second journal, which
+  // takes the record as it stands then, and a third change neither sees.
+  reg.register(t(u), 'second');
+  const two = reg.openJournal();
+  reg.register(t(u, { expiresAt: '2000-01-01T00:00:00Z' }), 'third');
+  assert.deepEqual([one.before(u)?.testimony.disposition, one.before(u)?.serverIds], ['never', ['first']]);
+  assert.deepEqual([two.before(u)?.testimony.disposition, two.before(u)?.testimony.expiresAt, two.before(u)?.serverIds], [undefined, undefined, ['first', 'second']]);
+  assert.deepEqual(reg.findByUri(u)?.serverIds, ['first', 'second', 'third']);
+  // A uri with no record when a journal opened has none before; one nothing
+  // has touched since reads as it is.
+  const v = 'https://zz-journal.example/v.csv';
+  reg.register(t(v));
+  assert.equal(one.before(v), undefined);
+  assert.equal(one.before(w), reg.findByUri(w));
+  // A closed journal copies nothing more.
+  one.close();
+  reg.register(t(w, { expiresAt: '2000-01-01T00:00:00Z' }));
+  assert.equal(one.before(w)?.testimony.expiresAt, '2000-01-01T00:00:00Z');
+  // An eviction: the registry holds 2,000 records, so 2,001 more take u's,
+  // which the open journal still has as it stood.
+  for (let i = 0; i < 2001; i++) reg.register(t(`https://zz-journal.example/many/${i}.csv`));
+  assert.equal(reg.findByUri(u), undefined);
+  assert.deepEqual([two.before(u)?.testimony.disposition, two.before(u)?.serverIds], [undefined, ['first', 'second']]);
+  two.close();
 });
 
 test('vector 5: digest mismatch is never presented', async () => {
