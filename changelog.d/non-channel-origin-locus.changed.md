@@ -23,12 +23,11 @@
   and the wakes of a script it started (`wake_agent()`, and a script left
   running reporting its end). Such a wake goes by the turn that armed it as
   that turn stands when the wake's start reads it, so a turn that took in
-  private input after arming it counts, even after the wake was queued. What
-  its work brings back can be private input, as a private surface's message
-  is: a script's wake message, and a module's message that names the turn (see
-  Added). If that turn is private when the message is stored or injected, a
-  turn that reads it is private, and a tool boundary that injects it makes its
-  turn private from there.
+  private input after arming it counts, even after the wake was queued. A
+  script's wake message is private input, as a private surface's message is,
+  when the script's start turn is private as the message is stored or
+  injected: a turn that reads it is private, and a tool boundary that injects
+  it makes its turn private from there.
 
   A private turn that holds a channel's message tells its resident which
   channels' messages it holds and that its plain speech reaches none of
@@ -69,4 +68,7 @@
   the clock (milliseconds since the epoch, times 1,000) instead of 1, so an
   id an earlier run of the process gave out is smaller than any a later run
   gives, as long as the clock hasn't gone back between them. They still
-  only increase.
+  only increase. A script's wake message deferred across a restart, such as
+  an update's, names its script's start turn from the earlier run, and the
+  next run counts that turn as private, failing closed: a public turn's
+  report deferred that way makes the start that reads it private too.

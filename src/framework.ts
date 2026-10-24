@@ -365,12 +365,10 @@ const HOST_METADATA_KEYS = [
 ] as const;
 
 /**
- * Metadata key a stored message may carry: the turn whose work it brings
- * back. A script's wake carries the script's start turn (scriptWake), and a
- * module echoes the ToolCall.callerTurnId of the call that started the work.
- * A message whose turn is private when it's stored, or when a tool boundary
- * injects it, is private input, as a private surface's message is
- * (isPrivateInput). A server's copy of it is dropped (HOST_METADATA_KEYS).
+ * Metadata key on a script's wake message: the script's start turn
+ * (scriptWake). The message is private input when that turn is private as
+ * the message is stored or injected (isPrivateInput). A server's copy of the
+ * key is dropped (HOST_METADATA_KEYS).
  */
 const CALLER_TURN_KEY = 'callerTurnId';
 
@@ -1052,8 +1050,7 @@ const WAKE_CHANNELS: unique symbol = Symbol('wake-channels');
 /**
  * The turns whose work a request continues, each once: the turn that caused
  * a derived request (derivedTurnRequest, a budget restart, a re-inference),
- * the start turn of a script that wakes, the turn a module's request names
- * (InferenceRequestEvent.callerTurnId), and the turn that armed a self-wake,
+ * the start turn of a script that wakes, and the turn that armed a self-wake,
  * a sleep or a tune-out cancel. The start that reads the work judges them,
  * as each stands then (processInferenceRequests): one that is private makes
  * the start private, so a turn that turned private after the request was
@@ -13352,11 +13349,7 @@ export class AgentFramework {
           serverId: source,
           channelId: '',
           // A private surface's message makes the window it joins private.
-          // A request that continues a turn's work carries the turn, whose
-          // privacy the window's wake is judged by when it comes
-          // (WakeProvenance.callerTurnIds).
           ...(isNonChannelSurfaceEvent(event) ? { nonChannelOrigin: true } : {}),
-          ...(event.type === 'inference-request' && event.callerTurnId !== undefined ? { callerTurnId: event.callerTurnId } : {}),
         });
         if (!decision.trigger) return;
       }
@@ -13377,11 +13370,8 @@ export class AgentFramework {
             reason: event.type,
             source,
             timestamp: Date.now(),
-            // A private surface's message wakes a private turn, and so does
-            // a request that continues the work of a turn private by the
-            // time its start reads it (CALLER_TURNS).
+            // A private surface's message wakes a private turn.
             nonChannelOrigin: isNonChannelSurfaceEvent(event),
-            ...continuesTurns(event.type === 'inference-request' ? event.callerTurnId : undefined),
             ...this.readsDeferredFor(added, agentName),
           });
         }
@@ -17225,8 +17215,8 @@ export class AgentFramework {
   /**
    * Whether the turn with this id is private as it stands now, for a wake
    * that continues its work: a script's (scriptWake), a script's
-   * channel_publish (scriptToolCall), or a host's `inference-request` that
-   * names it (InferenceRequestEvent.callerTurnId). A turn turns private one
+   * channel_publish (scriptToolCall), or a self-wake, sleep or tune-out
+   * cancel it armed. A turn turns private one
    * way, so a turn that took private input after the work began counts. An
    * id the record no longer knows, at or below its floor, counts as private:
    * it fails closed.

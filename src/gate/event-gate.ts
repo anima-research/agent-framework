@@ -125,8 +125,6 @@ interface PendingEvent {
   /** The event is a private surface's message (the framework's
    *  isNonChannelSurfaceEvent), which makes its window's wake private. */
   nonChannelOrigin?: boolean;
-  /** The turn whose work the event continues (GateEventInfo.callerTurnId). */
-  callerTurnId?: number;
   /** The event's own identity among what the framework stored at arrival:
    *  a channel message's id, a push event's event id (isNewestEntry). */
   messageId?: string;
@@ -185,10 +183,9 @@ export interface WakeProvenance {
    *  notice names, and a window with no pick for the fields above still
    *  gives it. */
   channels?: Array<{ channelId: string; serverId?: string }>;
-  /** The turns whose work the wake continues, each once: a window's module
-   *  requests' (PendingEvent.callerTurnId), or the turn that armed a
-   *  self-wake or a sleep. The framework wakes a private turn when any of
-   *  them is private as it stands at the start that takes the wake. */
+  /** The turn that armed a self-wake or a sleep, whose work the wake
+   *  continues. The framework wakes a private turn when it is private as it
+   *  stands at the start that takes the wake. */
   callerTurnIds?: number[];
   /** The batch's `[Gate: …]` line, when the gate handed it to the wake rather
    *  than wrote it: a WakeLine, the parts its text is rendered from when it's
@@ -290,9 +287,7 @@ export function wakeProvenance(events: PendingEvent[]): WakeProvenance | undefin
   let newestAddressed: PendingEvent | undefined;
   let newestPrivate: PendingEvent | undefined;
   const channels: Array<{ channelId: string; serverId?: string }> = [];
-  const callerTurnIds: number[] = [];
   for (const e of events) {
-    if (e.callerTurnId !== undefined && !callerTurnIds.includes(e.callerTurnId)) callerTurnIds.push(e.callerTurnId);
     if (e.nonChannelOrigin === true && (!newestPrivate || e.timestamp >= newestPrivate.timestamp)) newestPrivate = e;
     if (e.routeChannelId && !channels.some((c) => c.channelId === e.routeChannelId && c.serverId === e.serverId)) {
       channels.push({ channelId: e.routeChannelId, ...(e.serverId ? { serverId: e.serverId } : {}) });
@@ -310,11 +305,7 @@ export function wakeProvenance(events: PendingEvent[]): WakeProvenance | undefin
   }
   const privateSurface = newestPrivate !== undefined;
   const pick = newestAddressed ?? newest ?? newestPrivate;
-  const carried = {
-    ...(channels.length > 0 ? { channels } : {}),
-    ...(callerTurnIds.length > 0 ? { callerTurnIds } : {}),
-  };
-  if (!pick) return Object.keys(carried).length > 0 ? carried : undefined;
+  if (!pick) return channels.length > 0 ? { channels } : undefined;
   // push-event channel ids are the adapter's raw ids (a Discord snowflake):
   // not a composite channel id, so not reported as one
   const channelId = pick.channelId && pick.eventType !== 'mcpl:push-event' ? pick.channelId : undefined;
@@ -327,7 +318,7 @@ export function wakeProvenance(events: PendingEvent[]): WakeProvenance | undefin
       ? { routeChannelId: pick.routeChannelId, ...(pick.serverId ? { routeServerId: pick.serverId } : {}) }
       : {}),
     ...(privateSurface ? { nonChannelOrigin: true } : {}),
-    ...carried,
+    ...(channels.length > 0 ? { channels } : {}),
     // A private window's wake is as recent as its newest private message.
     at: newestPrivate && newestPrivate.timestamp > pick.timestamp ? newestPrivate.timestamp : pick.timestamp,
   };
@@ -3204,7 +3195,6 @@ export class EventGate {
       addressed: Array.isArray(info.tags) && info.tags.includes('chat:addressed'),
       routeChannelId: this.routeChannelFor(info),
       ...(info.nonChannelOrigin ? { nonChannelOrigin: true } : {}),
-      ...(info.callerTurnId !== undefined ? { callerTurnId: info.callerTurnId } : {}),
       ...(typeof info.metadata?.messageId === 'string' ? { messageId: info.metadata.messageId } : {}),
       ...(typeof info.metadata?.eventId === 'string' ? { eventId: info.metadata.eventId } : {}),
     };

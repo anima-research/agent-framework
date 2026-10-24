@@ -10,6 +10,8 @@ import { describe, it, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
 import { tmpdir } from 'node:os';
 import { mkdtempSync, rmSync } from 'node:fs';
+import { spawnSync } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
 import { join } from 'node:path';
 import { AgentFramework, readInboundSource } from '../src/index.js';
 import { isNonChannelSurfaceEvent } from '../src/framework.js';
@@ -409,6 +411,7 @@ const callerTurns = (r: InferenceRequest | undefined): number[] => {
 };
 const roomStart = (r: InferenceRequest) => r.channelId === ROOM && r.nonChannelOrigin !== true;
 type Routing = Record<string, unknown>;
+const RESTART_CHILD = fileURLToPath(new URL('./helpers/private-turn-restart-child.js', import.meta.url));
 const routingOf = (framework: AgentFramework): Routing =>
   (framework as unknown as { routingOf(name: string): Routing }).routingOf('scout');
 const tuiWake = (): InferenceRequest => ({ agentName: 'scout', reason: 'external-message', source: 'tui', timestamp: Date.now(), nonChannelOrigin: true });
@@ -1784,36 +1787,6 @@ describe('private wins, one way', () => {
     }
   });
 
-  it("a request that continues a turn's work is private exactly when that turn is, as it stands when the request comes", async () => {
-    const asker = {
-      name: 'asker', async start() {}, async stop() {}, getTools: () => [], async handleToolCall() { return { success: false, error: 'none' }; },
-      async onProcess(event: ProcessEvent) {
-        return event.type === 'inference-request' ? { requestInference: [(event as { agentName: string }).agentName] } : {};
-      },
-    };
-    const rig = await surfaceRig({ modules: [asker as never] });
-    try {
-      const internalsOf = rig.framework as unknown as { notePrivateTurn(turnId: number): void };
-      const routing = routingOf(rig.framework);
-      const ask = (callerTurnId?: number) => rig.framework.pushEvent({
-        type: 'inference-request', agentName: 'scout', reason: 'subagent done', source: 'subagent',
-        ...(callerTurnId !== undefined ? { callerTurnId } : {}),
-      } as never);
-      ask(routing.turnId as number);
-      ask();
-      await rig.until(() => rig.starts.length >= 1 && rig.framework.getAgent('scout')!.state.status === 'idle', 'the public asks');
-      assert.ok(rig.starts.every((r) => r.nonChannelOrigin !== true), `a public turn's, and one that names none, are public: ${JSON.stringify(rig.starts)}`);
-      // The turn took private input after its work began.
-      internalsOf.notePrivateTurn(routing.turnId as number);
-      const before = rig.starts.length;
-      ask(routing.turnId as number);
-      await rig.until(() => rig.starts.length > before && rig.framework.getAgent('scout')!.state.status === 'idle', 'the private ask');
-      assert.ok(privateStart(rig.starts.at(-1)!), JSON.stringify(rig.starts.at(-1)));
-    } finally {
-      await rig.close();
-    }
-  });
-
   it("a turn is recorded private where it turns private: at its open, and when it takes in private input later", async () => {
     const rig = await surfaceRig();
     try {
@@ -1835,39 +1808,11 @@ describe('private wins, one way', () => {
     }
   });
 
-  it("a gate window that holds a request continuing a private turn's work wakes one private turn", async () => {
-    const asker = {
-      name: 'asker', async start() {}, async stop() {}, getTools: () => [], async handleToolCall() { return { success: false, error: 'none' }; },
-      async onProcess(event: ProcessEvent) {
-        return event.type === 'inference-request' ? { requestInference: [(event as { agentName: string }).agentName] } : {};
-      },
-    };
-    const gate = { config: { policies: [{ name: 'both', match: { scope: ['inference-request', 'mcpl:channel-incoming'] }, behavior: { debounce: 100 } }], default: 'skip' } };
-    const rig = await surfaceRig({ gate, modules: [asker as never] });
-    try {
-      const internalsOf = rig.framework as unknown as { notePrivateTurn(turnId: number): void };
-      const routing = routingOf(rig.framework);
-      internalsOf.notePrivateTurn(routing.turnId as number);
-      const eventGate = (rig.framework as unknown as { eventGate: { evaluate(info: Record<string, unknown>): unknown } }).eventGate;
-      rig.framework.pushEvent({ type: 'inference-request', agentName: 'scout', reason: 'subagent done', source: 'subagent', callerTurnId: routing.turnId } as never);
-      eventGate.evaluate({
-        content: 'over here', eventType: 'mcpl:channel-incoming', serverId: 'discord', channelId: ROOM,
-        metadata: { author: { id: 'u1' } }, tags: ['chat:addressed'],
-      });
-      await rig.until(() => rig.starts.length >= 1 && rig.framework.getAgent('scout')!.state.status === 'idle', 'the turn');
-      assert.equal(rig.starts.length, 1, JSON.stringify(rig.starts));
-      assert.ok(privateStart(rig.starts[0]!), JSON.stringify(rig.starts[0]));
-      assert.deepEqual(rig.routed, []);
-    } finally {
-      await rig.close();
-    }
-  });
-
   for (const privateWork of [true, false]) {
     it(`a room's turn whose boundary injects what ${privateWork ? 'a private' : 'a channel'} turn's work brought back ${privateWork ? 'is private from there' : 'stays the room\'s'}`, async () => {
       let framework: AgentFramework | undefined;
       let workTurn = 0;
-      // As a script's wake or a module's result is stored: with the turn whose work it brings back.
+      // As a script's wake message is stored: with the turn whose work it brings back.
       const tool = robot(() => {
         (framework as unknown as { addMessage(participant: string, content: unknown, metadata: unknown): unknown }).addMessage(
           'user', [{ type: 'text', text: 'the report you asked for' }], { callerTurnId: workTurn });
@@ -1899,6 +1844,42 @@ describe('private wins, one way', () => {
       }
     });
   }
+
+  it("a private turn's script report deferred across a restart is private input in the next run", async () => {
+    // A host update quiesces, a private turn's background script reports, and
+    // the host restarts. The next run, with a turn-id counter of its own,
+    // stores the report at its resume and judges the earlier run's turn id.
+    const dir = mkdtempSync(join(tmpdir(), 'private-turn-restart-'));
+    const storePath = join(dir, 'store');
+    try {
+      const framework = await AgentFramework.create({
+        storePath, membrane: new MockMembrane().asMembrane(),
+        agents: [{ name: 'scout', model: 'test-model', systemPrompt: 'scout' }], modules: [],
+      } as never);
+      try {
+        const internalsOf = framework as unknown as {
+          notePrivateTurn(turnId: number): void;
+          addMessage(participant: string, content: unknown, metadata: unknown): unknown;
+        };
+        const turnId = routingOf(framework).turnId as number;
+        internalsOf.notePrivateTurn(turnId);
+        await framework.quiesce({ reason: 'update' });
+        internalsOf.addMessage('user', [{ type: 'text', text: 'the build finished' }],
+          { source: 'code-execution-script', tags: ['script:wake'], callerTurnId: turnId });
+        assert.equal(framework.getHostModeStatus().deferredWrites, 1, 'control: the report is deferred, and persisted');
+      } finally {
+        await framework.stop();
+      }
+      const child = spawnSync(process.execPath, [RESTART_CHILD, storePath], { encoding: 'utf8', timeout: 60_000 });
+      assert.equal(child.status, 0, `the next run (stderr: ${child.stderr.slice(-800)})`);
+      const next = JSON.parse(child.stdout.trim().split('\n').at(-1)!) as { bootedQuiesced: boolean; landed: boolean; privateInput: boolean };
+      assert.equal(next.bootedQuiesced, true, 'control: the next run boots quiesced');
+      assert.equal(next.landed, true, 'control: its resume stores the report');
+      assert.equal(next.privateInput, true, "the earlier run's private turn reads as private, so the next start is");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
 
   it("what a private turn's work brought back, stored while the agent is idle, makes its next start private", async () => {
     const rig = await surfaceRig();
