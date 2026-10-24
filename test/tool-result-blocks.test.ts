@@ -47,7 +47,7 @@ import { CoalesceError, validateCoalescedContent } from '../src/mcpl/push-coales
 import { ReferenceFetcher } from '../src/mcpl/reference-fetcher.js';
 import { checkedToolResult } from '../src/module-registry.js';
 import { parseImagePlaceholders } from '../src/tool-image-ledger.js';
-import { nonErrorResultText, shownToScript, toolResultDataToHistoryString } from '../src/tool-result-history.js';
+import { UNCHECKED_RESULT_TEXT, nonErrorResultText, shownToScript, toolResultDataToHistoryString } from '../src/tool-result-history.js';
 import { MockMembrane, createMockResponse } from './helpers/mock-membrane.js';
 import { fixture } from './helpers/coalescing-fixture.js';
 
@@ -1390,6 +1390,28 @@ describe('one answer for every block of a result', () => {
     } finally {
       servingFiles();
     }
+  });
+
+  it('shows data whose claims walk stops as the unchecked notice, never with no claims, and a round with it completes, both copies alike', async () => {
+    // A value that stops the claims walk and not the render's: its type
+    // throws a RangeError the first time it's read, as a stack can run out
+    // one frame sooner in one walk than in the other, and then reads as data.
+    const once = () => {
+      let read = false;
+      return { get type(): string { if (!read) { read = true; throw new RangeError('Maximum call stack size exceeded'); } return 'note'; } };
+    };
+    // A link beside a never to its uri, which a render with no claims would show.
+    const data = () => ({ link: { type: 'resource_link', uri: PLAIN_URI, name: 'report.csv' }, sealed: { type: 'resource', uri: PLAIN_URI, disposition: 'never' }, deep: once() });
+    assert.equal(toolResultDataToHistoryString(data()), UNCHECKED_RESULT_TEXT);
+    const fw = Object.create(AgentFramework.prototype) as {
+      buildStoredToolResultContent(agent: string, calls: unknown[], maxChars: number | undefined): Promise<{ blocks: Array<{ content: unknown }>; spilled: Map<string, unknown> }>;
+      toMembraneToolResult(callId: string, result: ToolResult, maxChars: number | undefined, precomputed: unknown): Live;
+    };
+    Object.assign(fw, { toolImageLedgers: new Map(), writeToolResultFile: async () => null, moduleRegistry: { getAllModules: () => [] } });
+    const call = { id: 'zz-unchecked', name: 'zz_tool', input: {}, result: { success: true, data: data() } };
+    const { blocks, spilled } = await fw.buildStoredToolResultContent('zz-agent', [call], 24_000);
+    assert.deepEqual(blocks.map((block) => block.content), [UNCHECKED_RESULT_TEXT]);
+    assert.equal(fw.toMembraneToolResult(call.id, call.result, 24_000, spilled.get(call.id)).content, UNCHECKED_RESULT_TEXT);
   });
 
   it("keeps a result's native live copy when its turn's results are stored by their shares of the readers' bound", async () => {

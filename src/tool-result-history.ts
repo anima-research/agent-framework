@@ -519,17 +519,30 @@ export function rfc005TextOf(value: unknown): string | null {
   return shown !== value && typeof shown === 'string' ? shown : null;
 }
 
-/** The claims of data that claims nothing. */
-const NO_CLAIMS: ResultClaims = new Map();
+/**
+ * What a tool result's data shows as where the walk of its claims stops
+ * (claimsInHistory), so RFC-005's rules can't be read through it: the tool
+ * ran, and its result isn't shown, rather than shown with no claims, where a
+ * link could show a uri a reference in the result withholds. The round
+ * completes, as a withheld result's kept fields keep nothing then
+ * (keptWhenWithheld). Ada-1017, room-203 #200344.
+ */
+export const UNCHECKED_RESULT_TEXT =
+  "[Result not shown: the tool ran, but its result couldn't be read through to check it for references, so this host withheld it.]";
 
 /**
  * JSON of a tool result's data with each value in it shown as history shows
- * it (shownInHistory), at any depth. Data that is itself shown as text, such
- * as a bare reference, is that text.
+ * it (shownInHistory), at any depth, by the claims `given` or else its own
+ * (claimsInHistory). Data that is itself shown as text, such as a bare
+ * reference, is that text, and data whose claims can't be read is
+ * UNCHECKED_RESULT_TEXT.
  */
 function historyJson(data: unknown, given?: ResultClaims): string | undefined {
-  // A walk that stopped claims nothing: showing stops at the same value.
-  const claims = given ?? claimsInHistory(data) ?? NO_CLAIMS;
+  // A walk that stopped can't say what the data claims, and showing it with
+  // no claims would let a link show a uri a reference withholds, should the
+  // render's own walk, with other replacers, get past the same value.
+  const claims = given ?? claimsInHistory(data);
+  if (claims === null) return UNCHECKED_RESULT_TEXT;
   const root = shownInHistory(data, claims);
   if (root !== data && typeof root === 'string') return root;
   return JSON.stringify(data, (_key, value: unknown) => shownInHistory(value, claims)) as string | undefined;
