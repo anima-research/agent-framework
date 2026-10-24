@@ -22608,7 +22608,9 @@ export class AgentFramework {
       if ((!isError || structured) && Array.isArray(result.data) && fromModule) {
         let lineClaims: ResultClaims;
         try {
-          lineClaims = resultClaimsOrThrow(result.data, result.dataIsContent);
+          // The flag as the render reads it, so a value other than a
+          // boolean decides the same way here (isContentArray reads `true`).
+          lineClaims = resultClaimsOrThrow(result.data, Boolean(result.dataIsContent));
           claims = showsBlocks ? scriptViewClaims(result.data, false) : lineClaims;
         } catch (err) {
           return failed(err);
@@ -22617,10 +22619,15 @@ export class AgentFramework {
         // renders these blocks: a content array's, block by block at the top
         // level, and not a failure's, whose line is its error. There the loop
         // registers links too, in the result's order, and the journal opens
-        // after it. Elsewhere the line walks at depth, or registers nothing,
-        // so the journal opens before the loop, which leaves links to the
-        // treatment (Ada-1017, room-203 #203172).
-        const blocksAreLines = !isError && isContentArray(result.data, result.dataIsContent);
+        // after it. Elsewhere the line registers nothing (a failure) or
+        // registers in its own walk's order (data at depth), which the loop
+        // can't follow, so the journal opens before the loop, which leaves
+        // links to the treatment: the line's records are then the registry
+        // before the line's own walk, which can only be stricter, by an
+        // eviction (Ada-1017, room-203 #203172). Past 2,000 references in one
+        // result, a content array's loop can evict an earlier never before
+        // the line, rendering in order, would have (#203184).
+        const blocksAreLines = !isError && isContentArray(result.data, Boolean(result.dataIsContent));
         if (showsBlocks && !blocksAreLines) {
           journal = referenceRegistry.openJournal();
           line = { claims: lineClaims, recordBefore: journal.before };

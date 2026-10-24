@@ -888,9 +888,56 @@ test("a module's array the model's line walks at depth keeps its never on a nest
       await seed(structured ? 'view' : 'text');
       const out = await exit({ success: true, data: data(), ...(structured ? { structured: {} } : {}) }, 'fwd--whole', false);
       assert.ok(!out.includes('walk-order/report.csv'), `${structured ? 'view' : 'text'}: ${out}`);
-      assert.equal((JSON.parse(out) as { isError: boolean }).isError, false, out);
+      const reply = JSON.parse(out) as { content: Array<Record<string, Record<string, unknown>> & { text?: string }>; isError: boolean };
+      assert.equal(reply.isError, false, out);
+      // The nested link was shown, as its object or its stub, not dropped.
+      if (structured) assert.equal(typeof reply.content[0]!.wrap!.refId, 'string', out);
+      else assert.match(String(reply.content[0]!.text), /\[ref_\w+\] report\.csv/, out);
     }
     assert.equal(referenceRegistry.journalCount, 0);
+  });
+});
+
+test("a module's array the model's line walks at depth reads its records from before the demand loop, so the loop's own reference can't evict a never the view's nested link keeps", { timeout: 60_000 }, async () => {
+  await withPeers(async ({ answer, script, exit }) => {
+    // The later top-level element is a reference, which the loop registers,
+    // in a full registry evicting the never record; the journal, open before
+    // the loop for data the line walks at depth, keeps it.
+    const uri = 'https://elsewhere.example.invalid/walk-resource/report.csv';
+    answer({ content: [{ type: 'resource', uri, name: 'report.csv', disposition: 'never' }], structuredContent: {} });
+    await script('mcpl--files--attach');
+    fillAfter('walk-resource');
+    const data = [
+      { wrap: { type: 'resource_link', uri, name: 'report.csv' } },
+      { type: 'resource', uri: 'https://files.example.invalid/walk-resource/new.csv', name: 'new.csv' },
+    ];
+    const out = await exit({ success: true, data, structured: {} }, 'fwd--whole', false);
+    assert.ok(!out.includes('walk-resource/report.csv'), out);
+    const view = JSON.parse(out) as { content: Array<Record<string, Record<string, unknown>>>; isError: boolean };
+    assert.deepEqual([view.isError, typeof view.content[0]!.wrap!.refId], [false, 'string'], out);
+    assert.equal(referenceRegistry.findByUri(uri)?.testimony.fromLink, true, 'the loop evicted the never record');
+    assert.equal(referenceRegistry.journalCount, 0);
+  });
+});
+
+test("a module's array its result says is content has its links registered in order, an unknown block among them", { timeout: 60_000 }, async () => {
+  await withPeers(async ({ answer, script, exit }) => {
+    // Content by the result's own flag, though one element is of no MCP
+    // type: the model's render shows it block by block, so the loop
+    // registers the link first, as the render does, keeping its record.
+    const uri = 'https://elsewhere.example.invalid/flag-order/report.csv';
+    answer({ content: [{ type: 'resource', uri, name: 'report.csv', disposition: 'never' }], structuredContent: {} });
+    await script('mcpl--files--attach');
+    fillAfter('flag-order');
+    const data = [
+      { type: 'resource_link', uri, name: 'report.csv' },
+      { type: 'resource', uri: 'https://files.example.invalid/flag-order/new.csv', name: 'new.csv' },
+      { type: 'zz-unknown', value: 1 },
+    ];
+    const out = await exit({ success: true, data, dataIsContent: true } as ToolResult, 'fwd--whole', false);
+    assert.ok(!out.includes('flag-order/report.csv'), out);
+    assert.equal((JSON.parse(out) as { isError: boolean }).isError, false, out);
+    assert.equal(referenceRegistry.findByUri(uri)?.testimony.disposition, 'never');
   });
 });
 

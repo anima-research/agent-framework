@@ -595,7 +595,9 @@ export class ReferenceRegistry {
    * registration has named since is read with it, and one a registration
    * named first is read as it stood then, saved or not. For a record a fetch
    * saved meanwhile, both readings are of one the host can fetch, since a
-   * fetch saves only what passed the checks a link's line reads too. Each
+   * fetch saves only what passed the checks a link's line reads too, except
+   * where two frameworks configure one server id differently, which a stub's
+   * words can't tell apart either (setServerAddress). Each
    * open has its own copies, so lanes that overlap keep theirs apart, and
    * closing one lets its copies go.
    */
@@ -787,13 +789,13 @@ export interface StubOptions {
 export type ResultClaims = ReadonlyMap<string, UriClaims>;
 
 /**
- * A uri as a link shows it: cut of what sanitizeLabel cuts (controls and bidi
- * marks, surrounding space; a uri past REFERENCE_LIMITS.uri is no reference,
- * so none is shortened), and well formed, as every copy is before it's
- * shown, a lone surrogate showing as U+FFFD. A `never` is
- * about what a link shows, so it's found by this text (neverShown): a claim
- * of `never` on a uri withholds every link that shows the same text, two
- * uris that cut alike sharing it. Every other claim is about the record,
+ * A uri as a link shows it: cleaned as sanitizeLabel cleans a label (controls
+ * and bidi marks dropped, surrounding space trimmed; a uri past
+ * REFERENCE_LIMITS.uri is no reference, so none is shortened), and well
+ * formed, as every copy is before it's shown, a lone surrogate showing as
+ * U+FFFD. A `never` is about what a link shows, so it's found by this text
+ * (neverShown): a claim of `never` on a uri withholds every link that shows
+ * the same text, two uris that clean alike sharing it. Every other claim is about the record,
  * which the fetch reads by its raw uri, so it's kept by the raw uri (Ada-1017,
  * room-203 #202239).
  */
