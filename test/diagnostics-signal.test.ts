@@ -12,6 +12,13 @@ import { pathToFileURL } from 'node:url';
 import { AgentFramework, type Module } from '../src/index.js';
 import { MockMembrane } from './helpers/mock-membrane.js';
 
+// Node's test runner arms `--report-signal=SIGUSR2` with report-on-signal ON
+// (measured on Node 25.9; plain node has it off), so this file's real SIGUSR2
+// would write Node diagnostic reports — the full environment, values included —
+// into the cwd on every run under `npm test`. This file's signals are its own
+// to observe, not Node's to report.
+if (process.report) process.report.reportOnSignal = false;
+
 function tempDir(t: import('node:test').TestContext): string {
   const dir = mkdtempSync(join(tmpdir(), 'diagnostics-signal-'));
   t.after(() => rmSync(dir, { recursive: true, force: true }));
