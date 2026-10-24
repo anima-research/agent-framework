@@ -2181,7 +2181,7 @@ export class EventGate {
       };
     }
     const { changes } = merged;
-    if (last.problem !== undefined && !appended) changes.recordUnreadable = last.problem;
+    if (last.problem !== undefined) changes.recordUnreadable = last.problem;
     const top = { ...read.listed.top };
     if (merged.defaultChanged) {
       if (merged.default === undefined) delete top.default;

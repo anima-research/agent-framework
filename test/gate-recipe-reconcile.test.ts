@@ -559,6 +559,39 @@ describe("EventGate's starts, through gate.json and the recipe kept beside it", 
     assert.match(errors, /At start, the recipe's changes to gate\.json \("zoo", "sync" and "dm"\) weren't saved \(EACCES: permission denied, open\), so gate\.json's rules are in force as they were\. Whoever runs this host can fix what kept them from being written\./);
   });
 
+  it("names a default change that a write failing at its open didn't save", (t) => {
+    start(recipe1).gate.dispose();
+    const original = fs.writeFileSync;
+    const write = t.mock.method(fs, 'writeFileSync', (path: fs.PathOrFileDescriptor, data: string | NodeJS.ArrayBufferView, ...rest: unknown[]) => {
+      if (path !== configPath) return original(path, data, ...(rest as []));
+      throw Object.assign(new Error('EACCES: permission denied, open'), { code: 'EACCES', syscall: 'open' });
+    });
+    syncBuiltinESMExports();
+    let started: ReturnType<typeof start>;
+    try {
+      started = start(config(recipe1.policies, 'always'));
+    } finally {
+      write.mock.restore();
+      syncBuiltinESMExports();
+    }
+    started.gate.dispose();
+    assert.strictEqual(onDisk().default, 'skip');
+    assert.match(started.gate.getStatus().errors.join('\n'), /At start, the recipe's changes to gate\.json \("default"\) weren't saved \(EACCES: permission denied, open\)/);
+  });
+
+  it('compares a rule the gate leaves out as written, so a hand edit to it is kept', () => {
+    // A behavior given as a list isn't read, so the gate leaves the rule out, and the merge compares it as written.
+    const odd = (behavior: string) => ({ name: 'odd', match: { scope: ['external-message'] }, behavior: [behavior] }) as unknown as GatePolicy;
+    const policies = recipe1.policies.slice(0, 3);
+    start(config([...policies, odd('defer'), catchAll], 'always')).gate.dispose();
+    const edited = { ...onDisk(), policies: onDisk().policies.map((p) => (p.name === 'odd' ? odd('skip') : p)) };
+    writeFileSync(configPath, JSON.stringify(edited, null, 2));
+    const { gate, logged } = start(config([...policies, rule('odd', 'odd'), catchAll], 'always'));
+    gate.dispose();
+    assert.deepStrictEqual(onDisk().policies.find((p) => p.name === 'odd'), odd('skip'));
+    assert.match(logged.join('\n'), /kept as edited, though the recipe changed or dropped it: odd/);
+  });
+
   it('runs what a merge write that fails partway held, and names the changes it was writing', (t) => {
     start(recipe1).gate.dispose();
     const original = fs.writeFileSync;
@@ -624,6 +657,11 @@ describe("EventGate's starts, through gate.json and the recipe kept beside it", 
     assert.strictEqual('default' in recorded(), false);
     start(config(recipe1.policies, 'skip')).gate.dispose();
     assert.strictEqual(onDisk().default, 'skip');
+    // A recipe that drops its default takes gate.json's unedited one with it, so the gate reads "always".
+    const dropped = start({ policies: recipe1.policies } as GateConfig);
+    dropped.gate.dispose();
+    assert.strictEqual('default' in onDisk(), false);
+    assert.match(dropped.logged.join('\n'), /default skip → always/);
   });
 
   it('runs a rule edited at run time, kept through a restart that writes nothing', () => {
