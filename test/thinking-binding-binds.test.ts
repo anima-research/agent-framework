@@ -50,8 +50,9 @@ async function turnOptions(settings: Partial<AgentConfig>, tools: ToolDefinition
   return seen[0];
 }
 
-/** A digest as the agent takes one: SHA-256 over JSON with each object's keys sorted. */
-function digest(value: unknown): string {
+/** A digest as the agent takes one: SHA-256 over the value as JSON carries it, each object's keys sorted. */
+function digest(wire: unknown): string {
+  const value = JSON.parse(JSON.stringify(wire) ?? 'null');
   const encode = (item: unknown): string => {
     if (Array.isArray(item)) return `[${item.map(encode).join(',')}]`;
     if (item && typeof item === 'object') {
@@ -110,6 +111,12 @@ describe('thinkingBinding.binds', () => {
     assert.deepEqual(changed(await id({}, [tool('a'), tool('b')], [systemNote('two')])), ['system'], 'a system-position injection');
     assert.deepEqual(changed(await id({ systemPrompt: 'You are another agent.' }, [tool('a'), tool('b')], [systemNote('one')])), ['system'], 'the system prompt');
     assert.deepEqual(changed(await id({ model: 'claude-sonnet-5-5' }, [tool('a'), tool('b')], [systemNote('one')])), ['model'], 'the model');
+    const schema = (dflt: unknown): ToolDefinition => ({ ...tool('a'), inputSchema: { type: 'object', properties: { n: { type: 'number', default: dflt } } } }) as ToolDefinition;
+    const left = await id({}, [schema(undefined)]);
+    // On the wire, an undefined field is left out and a null one isn't.
+    assert.notEqual((await id({}, [schema(null)])).tools, left.tools, 'a field from undefined to null');
+    assert.equal((await id({}, [{ ...tool('a'), inputSchema: { type: 'object', properties: { n: { type: 'number' } } } } as ToolDefinition])).tools, left.tools,
+      'an undefined field is the field left out');
     for (const settings of [{ maxTokens: 999 }, { thinking: { enabled: true, budgetTokens: 2048 } }, { providerParams: { tool_choice: { type: 'any' } } }, { thinkingBinding: { binds: true, dropBlock: true } }, { prefillUserMessage: '<cmd>cat untitled.txt</cmd>' }] as Array<Partial<AgentConfig>>) {
       assert.deepEqual(changed(await id(settings, [tool('a'), tool('b')], [systemNote('one')])), ['request'], JSON.stringify(settings));
     }

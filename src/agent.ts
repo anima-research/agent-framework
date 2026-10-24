@@ -135,6 +135,12 @@ function stableHash(value: unknown): string {
   return createHash('sha256').update(encode(value)).digest('hex');
 }
 
+/** A digest of a value as a request's JSON carries it (a field whose value is undefined left out, as the wire leaves
+ *  it out), key order aside: the head digests the thinking binding compares, so a change on the wire changes one. */
+function wireDigest(value: unknown): string {
+  return stableHash(JSON.parse(JSON.stringify(value) ?? 'null'));
+}
+
 const DEFAULT_CONTEXT_BUDGET_TOKENS = 100_000;
 const DEFAULT_TRANSITION_PACE_TOKENS = 16_000;
 const DEFAULT_SAME_ROUND_THINK_TEXT_POLICY: SameRoundThinkTextPolicy = 'public';
@@ -1727,10 +1733,10 @@ export class Agent {
     return {
       thinkingBinding,
       identity: {
-        system: stableHash(this.buildSystemPrompt(systemInjections)),
-        tools: stableHash(tools),
-        model: stableHash(this.model),
-        request: stableHash({
+        system: wireDigest(this.buildSystemPrompt(systemInjections)),
+        tools: wireDigest(tools),
+        model: wireDigest(this.model),
+        request: wireDigest({
           thinking: config.thinking ?? null, maxTokens: config.maxTokens, providerParams: providerParams ?? null,
           prefillUserMessage: prefillUserMessage ?? null,
         }),
