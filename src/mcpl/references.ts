@@ -356,7 +356,8 @@ function urlMayCarryCredential(u: URL, depth: number): boolean {
  *  decoding it once more changes it, decoded and read again from the start.
  *  Each read or decode is a level. A value that is none of these, such as a
  *  word, or a malformed `%`, answers false, so an ordinary value never meets
- *  the relative reading's fail-closed answer. */
+ *  the relative reading's fail-closed answer; within the bound a decode
+ *  alone never withholds, and past it a value that would still decode does. */
 function nestedMayCarry(value: string, outer: URL, depth: number): boolean {
   let inner: URL | null = null;
   try {
@@ -380,7 +381,10 @@ function nestedMayCarry(value: string, outer: URL, depth: number): boolean {
   } catch {
     return false;
   }
-  return decoded !== value && nestedMayCarry(decoded, outer, depth + 1);
+  if (decoded === value) return false;
+  // Past the bound, a value that would still decode is withheld: the check's
+  // work stops where its reading does, and a uri found deeper would be.
+  return depth >= CREDENTIAL_NESTING || nestedMayCarry(decoded, outer, depth + 1);
 }
 
 /** How the host reaches a server, as far as fetching its references goes:

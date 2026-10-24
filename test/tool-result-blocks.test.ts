@@ -408,6 +408,13 @@ describe("MCP's resource_link, a reference (RFC-005 §8.1)", () => {
     const once = `https://zz-r.example/go?u=${encodeURIComponent(nest(3))}`;
     assert.equal(line(once), `[resource link "report.csv": ${once}; not fetched]`);
     assert.match(line(`https://zz-r.example/go?u=${twice(nest(3))}`), stub);
+    // A value percent-encoded past the bound is withheld, uri or not, so the
+    // check's work stops where its reading does; one level less shows.
+    let encoded = 'zz plain words';
+    for (let i = 0; i < 5; i += 1) encoded = encodeURIComponent(encoded);
+    const four = `https://zz-files.example/x?q=${encoded}`;
+    assert.equal(line(four), `[resource link "report.csv": ${four}; not fetched]`);
+    assert.match(line(`https://zz-files.example/x?q=${encodeURIComponent(encoded)}`), stub);
     // Ordinary values still show: a path, values with a colon, a value with
     // a space, and a colour, whose fragment alone resolves against the uri
     // less its query, so it isn't read again at each level.
