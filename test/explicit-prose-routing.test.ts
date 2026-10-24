@@ -732,7 +732,7 @@ describe('explicit prose routing', () => {
 
 
   type RoutingState = {
-    pin?: ChannelRef; hybridHold?: 'private' | 'failed';
+    pin?: ChannelRef; nonChannelOrigin?: boolean; hybridHold?: 'private' | 'failed';
     continuation: boolean; deliveries: ChannelRef[]; suppressed: number; drafts: Array<{ id: string; text: string }>; keptPrivate: number; privateSuppressed: number;
     triggerChannel?: ChannelRef; locus?: ChannelRef; engaged: Set<string>; wasIn: ChannelRef[]; arrivals: Array<{ messageId: string; channel: ChannelRef }>;
   };
@@ -1881,6 +1881,27 @@ describe('explicit prose routing', () => {
     }
   });
 
+  for (const privateTurn of [true, false]) {
+    it(`hybrid: a hold beside a send in a ${privateTurn ? 'private turn resolves its >>> target and sets no destination' : 'channel turn sets the >>> target it resolves, as a control'}`, async () => {
+      const framework = await createFramework('hybrid');
+      stubRegistry(framework);
+      const gateway = framework as unknown as {
+        holdSilencedProse(agent: unknown, segments: string[], cause: 'send', privateThink: boolean, round: { routing: RoutingState; notice: 'later' }): void;
+      };
+      const agent = framework.getAgent('assistant')!;
+      try {
+        const routing: RoutingState = routingState(privateTurn ? { nonChannelOrigin: true } : {});
+        gateway.holdSilencedProse(agent, ['>>>#alpha held words', 'after it'], 'send', false, { routing, notice: 'later' });
+        assert.equal(routing.hybridHold, undefined, 'control: the target resolved');
+        if (privateTurn) assert.equal(routing.pin, undefined, 'no envelope sets a destination while a turn is private');
+        else assert.deepEqual(routing.pin, { serverId: 'stub', channelId: 'chan-alpha' });
+        assert.deepEqual(routing.drafts.map((d) => d.text), ['held words', 'after it'], 'and the words are held as drafts');
+      } finally {
+        await framework.stop();
+      }
+    });
+  }
+
   it('hybrid: a hold beside a send refuses a >>> target its server declared inbound-only, as delivery does, and drops the pin before it', async () => {
     const framework = await createFramework('hybrid');
     stubRegistry(framework);
@@ -2132,7 +2153,7 @@ describe('explicit prose routing', () => {
     });
     const help = decoded.join(' ').replace(/\s+/g, ' ');
     for (const clause of [
-      'A destination applies to the rest of that turn, until another is named.',
+      "A destination applies to the rest of that turn, until another is named, except in a private turn (one a private surface's message took part in): there each envelope delivers only its own body.",
       'A name that matches no channel, or several, bounces and leaves it as it was.',
       'A channel its server declared inbound-only is refused, and clears it.',
       'Where two servers register one channel id, the server goes first: >>server:service:guild:id … (a bounce lists each such name).',

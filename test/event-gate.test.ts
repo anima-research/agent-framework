@@ -1453,3 +1453,15 @@ describe('a batched wake writes its line only when it says something', () => {
     assert.strictEqual(plain.messages.length, 1);
   });
 });
+
+describe('wakeProvenance: what a window carries without a pick', () => {
+  it("keeps a window's channels and turn ids though no event in it names a channel or an author for the pick", () => {
+    // An ambient push that names only its resolved route, and a module's
+    // request for a turn's work: neither is a pick.
+    const provenance = wakeProvenance([
+      { policyName: 'p', content: 'x', eventType: 'mcpl:push-event', timestamp: 1, inContext: true, addressed: false, routeChannelId: 'disc:guild:room', serverId: 'disc' },
+      { policyName: 'p', content: 'y', eventType: 'inference-request', timestamp: 2, inContext: false, addressed: false, callerTurnId: 7 },
+    ] as never);
+    assert.deepEqual(provenance, { channels: [{ channelId: 'disc:guild:room', serverId: 'disc' }], callerTurnIds: [7] });
+  });
+});

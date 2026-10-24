@@ -86,8 +86,10 @@ export interface TuneOutFrameworkHooks {
     metadata?: Record<string, unknown>,
     forAgent?: string,
   ) => string;
-  /** Queue an inference request for an agent. */
-  requestInference: (agentName: string, reason: string, source: string) => void;
+  /** Queue an inference request for an agent. `callerTurnId` is the turn
+   *  whose work it continues, as a cancel the resident made names it: the
+   *  framework wakes a private turn when that one is private by then. */
+  requestInference: (agentName: string, reason: string, source: string, callerTurnId?: number) => void;
   /** The subconscious's registry/participant name. */
   subconsciousName: () => string | null;
   /** The primary resident's registry name. */
@@ -325,7 +327,8 @@ export class TuneOutCoordinator {
    * resident's window (capped), lifecycle notice, one wake for the
    * resident. `subconsciousNote` is the subconscious's own text (from its
    * cancel_tuneout call) — delivered verbatim under its name, never
-   * synthesized here.
+   * synthesized here. `callerTurnId` is the turn of the call that asked for
+   * the cancel, which the resident's wake carries.
    */
   cancel(
     serverId: string,
@@ -333,6 +336,7 @@ export class TuneOutCoordinator {
     source: string,
     reason: string,
     subconsciousNote?: string,
+    callerTurnId?: number,
   ): { ok: true } | { ok: false; error: string } {
     const ended = this.channelRegistry.cancelTuneOut(serverId, channelId, 'open', source);
     if (!ended) {
@@ -459,7 +463,7 @@ export class TuneOutCoordinator {
     }
     const primary = this.hooks.primaryName();
     if (primary) {
-      this.hooks.requestInference(primary, `tune-out cancelled (${reason})`, 'tune-out');
+      this.hooks.requestInference(primary, `tune-out cancelled (${reason})`, 'tune-out', callerTurnId);
     }
     // The subconscious gets one cancel turn of its own: the issue's cancel
     // shape is dump + a report from the subconscious, and when the dump left

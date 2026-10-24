@@ -122,10 +122,11 @@ interface PendingEvent {
    *  whose `channelId` is the adapter's raw id (a bare Discord snowflake for a
    *  DM) — unroutable. Absent when the host could not resolve one. */
   routeChannelId?: string;
-  /** The event is a private surface's message, or a request that continues
-   *  a private turn's work (the framework's wakesPrivately), which makes its
-   *  window's wake private. */
+  /** The event is a private surface's message (the framework's
+   *  isNonChannelSurfaceEvent), which makes its window's wake private. */
   nonChannelOrigin?: boolean;
+  /** The turn whose work the event continues (GateEventInfo.callerTurnId). */
+  callerTurnId?: number;
   /** The event's own identity among what the framework stored at arrival:
    *  a channel message's id, a push event's event id (isNewestEntry). */
   messageId?: string;
@@ -180,8 +181,15 @@ export interface WakeProvenance {
   /** The registered channel of each of the window's channel messages, each
    *  once, with its server: what a private turn that takes the wake names,
    *  since its plain speech reaches none of them (the framework's notice of
-   *  a private turn's channel messages). Telemetry, like the fields above. */
+   *  a private turn's channel messages). Not telemetry: it decides what that
+   *  notice names, and a window with no pick for the fields above still
+   *  gives it. */
   channels?: Array<{ channelId: string; serverId?: string }>;
+  /** The turns whose work the wake continues, each once: a window's module
+   *  requests' (PendingEvent.callerTurnId), or the turn that armed a
+   *  self-wake or a sleep. The framework wakes a private turn when any of
+   *  them is private as it stands when the wake comes. */
+  callerTurnIds?: number[];
   /** The batch's `[Gate: …]` line, when the gate handed it to the wake rather
    *  than wrote it: a WakeLine, the parts its text is rendered from when it's
    *  written (wakeLineText), decided by a fresh start of the wake's turn as
@@ -282,7 +290,9 @@ export function wakeProvenance(events: PendingEvent[]): WakeProvenance | undefin
   let newestAddressed: PendingEvent | undefined;
   let newestPrivate: PendingEvent | undefined;
   const channels: Array<{ channelId: string; serverId?: string }> = [];
+  const callerTurnIds: number[] = [];
   for (const e of events) {
+    if (e.callerTurnId !== undefined && !callerTurnIds.includes(e.callerTurnId)) callerTurnIds.push(e.callerTurnId);
     if (e.nonChannelOrigin === true && (!newestPrivate || e.timestamp >= newestPrivate.timestamp)) newestPrivate = e;
     if (e.routeChannelId && !channels.some((c) => c.channelId === e.routeChannelId && c.serverId === e.serverId)) {
       channels.push({ channelId: e.routeChannelId, ...(e.serverId ? { serverId: e.serverId } : {}) });
@@ -300,7 +310,11 @@ export function wakeProvenance(events: PendingEvent[]): WakeProvenance | undefin
   }
   const privateSurface = newestPrivate !== undefined;
   const pick = newestAddressed ?? newest ?? newestPrivate;
-  if (!pick) return undefined;
+  const carried = {
+    ...(channels.length > 0 ? { channels } : {}),
+    ...(callerTurnIds.length > 0 ? { callerTurnIds } : {}),
+  };
+  if (!pick) return Object.keys(carried).length > 0 ? carried : undefined;
   // push-event channel ids are the adapter's raw ids (a Discord snowflake):
   // not a composite channel id, so not reported as one
   const channelId = pick.channelId && pick.eventType !== 'mcpl:push-event' ? pick.channelId : undefined;
@@ -313,7 +327,7 @@ export function wakeProvenance(events: PendingEvent[]): WakeProvenance | undefin
       ? { routeChannelId: pick.routeChannelId, ...(pick.serverId ? { routeServerId: pick.serverId } : {}) }
       : {}),
     ...(privateSurface ? { nonChannelOrigin: true } : {}),
-    ...(channels.length > 0 ? { channels } : {}),
+    ...carried,
     // A private window's wake is as recent as its newest private message.
     at: newestPrivate && newestPrivate.timestamp > pick.timestamp ? newestPrivate.timestamp : pick.timestamp,
   };
@@ -1854,6 +1868,9 @@ export class EventGate {
   private sleepSuppressed = 0;
   private sleepTimer: ReturnType<typeof setTimeout> | null = null;
   private sleepAgent: string | undefined;
+  /** The turn that set the sleep, which the sleep's wake carries
+   *  (WakeProvenance.callerTurnIds). In memory with the sleep. */
+  private sleepTurnId: number | undefined;
   // From dispose() to the next resumeSleep(): no sleep or self-wake timer is
   // armed, though a turn a failed stop() left running can still ask for one.
   private disposed = false;
@@ -3187,6 +3204,7 @@ export class EventGate {
       addressed: Array.isArray(info.tags) && info.tags.includes('chat:addressed'),
       routeChannelId: this.routeChannelFor(info),
       ...(info.nonChannelOrigin ? { nonChannelOrigin: true } : {}),
+      ...(info.callerTurnId !== undefined ? { callerTurnId: info.callerTurnId } : {}),
       ...(typeof info.metadata?.messageId === 'string' ? { messageId: info.metadata.messageId } : {}),
       ...(typeof info.metadata?.eventId === 'string' ? { eventId: info.metadata.eventId } : {}),
     };
@@ -3472,12 +3490,15 @@ export class EventGate {
   // Sleep
   // =========================================================================
 
-  /** Begin (or extend) a sleep window of `seconds`. Returns the wake time. */
-  setSleep(seconds: number, note?: string, agentName?: string): { until: number } {
+  /** Begin (or extend) a sleep window of `seconds`. Returns the wake time.
+   *  `callerTurnId` is the turn that set it, which its wake carries: the
+   *  framework wakes a private turn when that one is private by then. */
+  setSleep(seconds: number, note?: string, agentName?: string, callerTurnId?: number): { until: number } {
     const ms = Math.max(0, Math.floor(seconds * 1000));
     this.sleepUntil = this.now() + ms;
     this.sleepNote = note;
     this.sleepAgent = agentName;
+    this.sleepTurnId = callerTurnId;
     this.sleepSuppressed = 0;
     // Arm the self-wake: when the window elapses, clear sleep and request an
     // inference so the agent resumes on its own (not dependent on a heartbeat
@@ -3548,8 +3569,11 @@ export class EventGate {
    * suppression window, unlike sleep. Re-arming replaces the pending timer.
    * Cancelled by the agent's next turn start (see onInferenceStarted):
    * the semantics are "if nothing else wakes me by then, wake me".
+   * `callerTurnId` is the turn that armed it, which its wake carries
+   * (WakeProvenance.callerTurnIds): the framework wakes a private turn when
+   * that one is private by then.
    */
-  armSelfWake(agentName: string, seconds: number, source = 'skip_reply'): { inMs: number; armed: boolean } {
+  armSelfWake(agentName: string, seconds: number, source = 'skip_reply', callerTurnId?: number): { inMs: number; armed: boolean } {
     const ms = Math.max(1_000, Math.min(3_600_000, Math.floor(seconds * 1000)));
     // A stopped framework's late turn arms no timer (disposed). A self-wake
     // doesn't outlive a stop, as dispose() clearing the pending ones says.
@@ -3587,7 +3611,7 @@ export class EventGate {
         agentName,
         `self-scheduled wake (${source}, ${Math.round(ms / 1000)}s)`,
         'self-wake',
-        undefined,
+        callerTurnId !== undefined ? { callerTurnIds: [callerTurnId] } : undefined,
         placement,
       );
     }, ms);
@@ -3609,6 +3633,7 @@ export class EventGate {
     this.sleepUntil = 0;
     this.sleepNote = undefined;
     this.sleepAgent = undefined;
+    this.sleepTurnId = undefined;
     if (this.sleepTimer) { clearTimeout(this.sleepTimer); this.sleepTimer = null; }
     return wasAsleep;
   }
@@ -3634,9 +3659,11 @@ export class EventGate {
     }
     const note = this.sleepNote;
     const agent = this.sleepAgent;
+    const turnId = this.sleepTurnId;
     this.sleepUntil = 0;
     this.sleepNote = undefined;
     this.sleepAgent = undefined;
+    this.sleepTurnId = undefined;
     this.emitTrace({
       type: 'gate:decision',
       eventType: 'sleep:expired',
@@ -3647,7 +3674,7 @@ export class EventGate {
     });
     const detail = note ? `${reason}: ${note}` : reason;
     const targets = agent ? [agent] : this.getAgentNamesFn();
-    for (const a of targets) this.requestInferenceFn(a, detail, 'sleep');
+    for (const a of targets) this.requestInferenceFn(a, detail, 'sleep', turnId !== undefined ? { callerTurnIds: [turnId] } : undefined);
   }
 
   /** Current sleep state, or null if awake. */

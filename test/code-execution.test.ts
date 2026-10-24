@@ -934,6 +934,8 @@ describe('code_execution through the framework', () => {
         const wakes = () => starts.filter((r) => r.reason === 'script:wake');
         await until(() => module.waiting === 1, 'the first slow call');
         assert.equal(starts[0]?.nonChannelOrigin === true, privateTurn, `control: the arming turn: ${JSON.stringify(starts[0])}`);
+        // The arming turn ends with the script still running: the script is left.
+        await until(() => framework.getHostModeStatus().backgroundScripts === 1, 'the script to be left running');
         membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Woke and handled.' }]));
         module.release();
         await until(() => wakes().length === 1, 'the wake_agent() wake');
@@ -2496,8 +2498,9 @@ describe('a round whose run or wait call watches a script that can change its ro
         // The agent stands for a fork bound to its home channel, which a
         // broadcast wake doesn't reach, so its turn comes from its own wake,
         // a private one.
-        const internals = h.framework as unknown as { conversationAgentHomes: Map<string, string>; pendingRequests: unknown[] };
-        internals.conversationAgentHomes.set('assistant', 'world:home');
+        const internals = h.framework as unknown as { conversationAgentHomes: Map<string, { serverId: string; channelId: string }>; pendingRequests: unknown[] };
+        // A home is a channel with its server, as main keeps it.
+        internals.conversationAgentHomes.set('assistant', { serverId: 'stub', channelId: 'world:home' });
         internals.pendingRequests.push({ agentName: 'assistant', reason: 'test', source: 'test', timestamp: Date.now(), channelId: 'world:home', nonChannelOrigin: true });
         await h.framework.runUntilIdle();
         assert.ok(scriptNote(h).includes(REFUSED), scriptNote(h));

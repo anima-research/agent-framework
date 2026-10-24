@@ -18,10 +18,15 @@
   turn's later speech. What a private turn causes
   is private too: its budget restart, its tool results' re-inference, a ` !`
   continuation, its auto-continuation (`autoContinue`), a bounce's wake, a
-  rewind's retry, and the wakes of a script it started (`wake_agent()`, and
-  a script left running reporting its end). A script's wakes go by the turn
-  that started it as that turn stands when the wake comes, so a turn that
-  took in private input after starting the script counts.
+  rewind's retry, a self-wake it arms with `skip_reply`'s `wake_in_seconds`,
+  a `sleep`'s wake, the resident's turn after a tune-out cancel it asked
+  for, and the wakes of a script it started (`wake_agent()`, and a script
+  left running reporting its end). Such a wake goes by the turn that armed
+  it as that turn stands when the wake comes, so a turn that took in private
+  input after arming it counts. What its work brings back is private input,
+  as a private surface's message is: a script's wake message, and a module's
+  message that names the turn (see Added). A turn that reads it is private,
+  and a tool boundary that injects it makes its turn private from there.
 
   A private turn that holds a channel's message tells its resident which
   channels' messages it holds and that its plain speech reaches none of
@@ -54,3 +59,9 @@
 - **Hosts reading `inboundSource`:** a message whose event's
   `metadata.channelId` is only whitespace is now stamped as a surface's
   (`kind: 'surface'`). Before, it got no source stamp.
+
+- **Turn ids** (`ToolCall.callerTurnId`, `SpeechContext.turnId`) start from
+  the clock (milliseconds since the epoch, times 1,000) instead of 1, so an
+  id an earlier run of the process gave out is smaller than any a later run
+  gives, as long as the clock hasn't gone back between them. They still
+  only increase.

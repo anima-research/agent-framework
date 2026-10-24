@@ -1826,6 +1826,9 @@ describe('present while acting', () => {
     framework.openLogical = new Map();
     framework.scriptCallStarts = new Map();
     framework.agents = new Map();
+    // The record of private turns: none yet, and every id known.
+    framework.privateTurnIds = new Set();
+    framework.privateTurnsFloor = 0;
     return framework;
   }
   const until = async (done: () => boolean, label: string): Promise<void> => {
