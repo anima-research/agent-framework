@@ -17241,10 +17241,12 @@ export class AgentFramework {
    * ephemeral run or a conversation fork. The wake names
    * the turn's locus, or the unresolved channel of a turn that had none, so
    * the next turn speaks, or doesn't, where this one did; a batched message's
-   * channel outranks it. Its mark (InferenceRequest.autoContinueRun) holds
-   * what the `[continue]` row says, written as the turn starts
-   * (startAgentStream). A run is capped at maxConsecutive; the last allowed
-   * row says so, and the cap holds until a turn starts with a cause of its own.
+   * channel outranks it. A private turn's wake is private and names no
+   * channel (derivedTurnRequest), so the next turn is private too. Its mark
+   * (InferenceRequest.autoContinueRun) holds what the `[continue]` row says,
+   * written as the turn starts (startAgentStream). A run is capped at
+   * maxConsecutive; the last allowed row says so, and the cap holds until a
+   * turn starts with a cause of its own.
    */
   private autoContinueAfterTurn(
     agent: Agent,
@@ -17300,17 +17302,15 @@ export class AgentFramework {
     // locus's server and id, as the framework's own wakes name a channel. A
     // turn that had no channel (noChannel: its wake named one that resolves
     // to none) passes its wake's channel on, so the next has none either,
-    // rather than taking the global fallback this one refused.
+    // rather than taking the global fallback this one refused. A private
+    // turn has neither, and its wake carries its privacy instead.
     const channel = routing.locus
       ? { channelId: routing.locus.channelId, channelServerId: routing.locus.serverId }
       : routing.noChannel && trigger?.channelId
         ? { channelId: trigger.channelId, ...(trigger.channelServerId ? { channelServerId: trigger.channelServerId } : {}) }
         : {};
     this.pendingRequests.push({
-      agentName: name,
-      reason: AUTO_CONTINUE_REASON,
-      source: 'framework',
-      timestamp: Date.now(),
+      ...this.derivedTurnRequest(name, AUTO_CONTINUE_REASON, routing),
       ...channel,
       autoContinueRun: { stop, ...(opts.heldAfterSend ? { heldAfterSend: true } : {}) },
     });

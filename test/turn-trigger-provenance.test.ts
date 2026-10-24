@@ -1130,6 +1130,32 @@ describe('private wins, one way', () => {
     }
   });
 
+  for (const privateTurn of [true, false]) {
+    it(`a ${privateTurn ? 'private' : "room's"} turn's auto-continuation is ${privateTurn ? 'private, and publishes nothing' : "the room's, and speaks there"}`, async () => {
+      const rig = await surfaceRig({ agent: { autoContinue: { maxConsecutive: 1 } } });
+      try {
+        if (privateTurn) rig.framework.pushEvent(tuiMessage());
+        else rig.i.pendingRequests.push(roomWake());
+        await rig.until(() => rig.starts.length >= 2 && rig.framework.getAgent('scout')!.state.status === 'idle', 'the turn and its continuation');
+        assert.equal(rig.starts.length, 2, JSON.stringify(rig.starts));
+        assert.equal(rig.starts[1]!.reason, 'auto-continue');
+        assert.equal(rig.routings[1]!.nonChannelOrigin === true, privateTurn, 'the continuation is private exactly when its turn was');
+        if (privateTurn) {
+          assert.ok(privateStart(rig.starts[1]!), JSON.stringify(rig.starts[1]));
+          assert.deepEqual(rig.routed, [], 'neither turn published');
+          // Speech kept private counts as no publish anywhere, so no wake is
+          // taken as answered by it (Agent.publishedAfterReading).
+          const published = (rig.framework.getAgent('scout') as unknown as { publishedThrough: Map<string, unknown> }).publishedThrough;
+          assert.equal(published.size, 0, JSON.stringify([...published.keys()]));
+        } else {
+          assert.deepEqual(rig.routed, [{ text: 'reply 1', locus: ROOM }, { text: 'reply 2', locus: ROOM }]);
+        }
+      } finally {
+        await rig.close();
+      }
+    });
+  }
+
   it("a private turn's same-round private think keeps its words as the resident's own choice", async () => {
     const rig = await surfaceRig({ modules: [robot()], agent: { sameRoundThinkTextPolicy: 'private' } });
     try {

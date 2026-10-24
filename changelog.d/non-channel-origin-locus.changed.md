@@ -18,7 +18,8 @@
   envelope posts its own body where it names but sets no destination for the
   turn's later speech. What a private turn causes
   is private too: its budget restart, its tool results' re-inference, a ` !`
-  continuation, a bounce's wake and a rewind's retry.
+  continuation, its auto-continuation (`autoContinue`), a bounce's wake and a
+  rewind's retry.
 
   In locus and hybrid modes, a private turn's plain speech is counted in its
   `[delivered]` receipt as kept private, rather than reported as a failed send.
