@@ -1085,11 +1085,14 @@ describe('one answer for every block of a result', () => {
     assert.equal(reads, 0);
   });
 
-  it("registers nothing a result's serialization never reaches, such as what lies past a cycle", () => {
+  it("registers nothing a result's serialization never reaches, such as what lies past a cycle, which shows as the unchecked notice", () => {
     const uri = 'https://zz-elsewhere.example/past-cycle.csv';
     const loop: Record<string, unknown> = {};
     loop.self = loop;
-    assert.throws(() => toolResultDataToHistoryString({ loop, later: { type: 'resource', uri, name: 'past.csv', disposition: 'never' } }));
+    // The claims walk meets the cycle before the render does, so the result
+    // is the notice where main's serializer threw (Ada-1017, room-203
+    // #200374), and nothing past the cycle is registered either way.
+    assert.equal(toolResultDataToHistoryString({ loop, later: { type: 'resource', uri, name: 'past.csv', disposition: 'never' } }), UNCHECKED_RESULT_TEXT);
     assert.equal(referenceRegistry.findByUri(uri), undefined);
   });
 
