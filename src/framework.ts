@@ -9362,7 +9362,7 @@ export class AgentFramework {
         // deregistered, so disposal must release EventGate liveness itself.
         this.eventGate?.onInferenceEnded(agent.name);
         this.agents.delete(agent.name);
-        // Its sleep and self-wake end with it, as a fork's do.
+        // Its pending self-wake ends with it, as a fork's does.
         this.eventGate?.agentGone(agent.name);
         this.releaseWindowNowOrAfterResume(agent);
       }
@@ -13777,8 +13777,7 @@ export class AgentFramework {
     this.activeStreams.delete(agentName);
     this.pendingAssistantBlocks.delete(agentName);
     this.agents.delete(agentName);
-    // Its sleep and self-wake end with it (the gate's sleep holds back every
-    // agent's wakes), and neither wake goes to a name that's gone.
+    // Its pending self-wake ends with it, rather than wake a name that's gone.
     this.eventGate?.agentGone(agentName);
     if (agent) this.releaseWindowNowOrAfterResume(agent);
     this.turnRouting.delete(agentName);
@@ -30128,6 +30127,27 @@ export class AgentFramework {
   }
 
   private dispatchSleepToolCall(agentName: string, call: ToolCall): void {
+    // The gate's sleep quiets the whole agent, every conversation of it, so a
+    // conversation fork or an ephemeral run neither sets one nor ends the
+    // agent's own. Refused before the tool runs, as a fork's channel_open is.
+    const fork = this.conversationAgentHomes.has(agentName);
+    if (fork || this.ephemeralRuns.has(agentName)) {
+      const one = fork ? 'conversation' : 'run';
+      // Only where the fork can follow it: skip_reply needs the channel
+      // registry, which a fork made from an event pushed straight to the
+      // framework (pushEvent, with no MCPL server) doesn't have, and a
+      // closing fork's wake ends with it.
+      const comeBack = fork && this.channelRegistry && this.canAgentUseTool(agentName, 'skip_reply')
+        && !this.closingConversationAgents.has(agentName)
+        ? ' To come back to this conversation later, call skip_reply with wake_in_seconds.'
+        : '';
+      const error = call.name === 'sleep'
+        ? `Nothing was set: a sleep quiets the whole agent, not one ${one}.${comeBack}`
+        : `Nothing was changed: a sleep is the agent's, so this ${one} can't end one.`;
+      this.emitTrace({ type: 'tool:failed', module: 'gate', tool: call.name, callId: call.id, error: `${agentName}: ${error}` });
+      this.pushEvent({ type: 'tool-result', callId: call.id, toolName: call.name, agentName, moduleName: 'gate', result: this.refusedResult(agentName, call.id, error) });
+      return;
+    }
     this.emitTrace({ type: 'tool:started', module: 'gate', tool: call.name, callId: call.id, input: call.input });
     const gate = this.eventGate!;
     const input = (call.input ?? {}) as { seconds?: number; announce?: boolean; message?: string };
