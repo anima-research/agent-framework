@@ -17,4 +17,5 @@
     message with an explicit send, as the notice says.
   - **Unchanged:** a start that holds no private input replies in its
     channel as before, and so does a channel's later turn after a private
-    one.
+    one. What's private is the turn, not the operator's words: that later
+    turn's context still holds them.
