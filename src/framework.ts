@@ -1,7 +1,7 @@
 import { ToolPresentation, presentationTools, isPresentationTool, renderCatalogue, type PresentationSnapshot } from "./tool-presentation.js";
 import { constants as bufferConstants } from 'node:buffer';
 import { dirname, join } from 'node:path';
-import { EXPIRY_REASON, REFERENCE_LIMITS, claimedExpiry, classifyBlock, contentClaims, isReferenceExpired, referenceBlockForScript, referenceRegistry, sanitizeLabel, type ResultClaims, type ServerAddress } from './mcpl/references.js';
+import { EXPIRY_REASON, REFERENCE_LIMITS, claimedExpiry, classifyBlock, isReferenceExpired, referenceBlockForScript, referenceRegistry, sanitizeLabel, type ResultClaims, type ServerAddress } from './mcpl/references.js';
 import { ReferenceFetcher, DEFAULT_FETCH_MAX_BYTES, EAGER_FETCH_TIMEOUT_MS } from './mcpl/reference-fetcher.js';
 import {
   appendFileSync, closeSync, existsSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, unlinkSync,
