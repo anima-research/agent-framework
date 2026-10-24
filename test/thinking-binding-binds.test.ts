@@ -129,7 +129,7 @@ describe('thinkingBinding.binds', () => {
     }
   });
 
-  it('refuses a binds that is not true or false', () => {
+  it('refuses a binds that is not true or false, null counting as left out', () => {
     for (const binds of ['true', 1, {}]) {
       assert.throws(() => new Agent(config({ thinkingBinding: { binds } as never }), recording().contextManager, {} as Membrane),
         /thinkingBinding\.binds/, JSON.stringify(binds));

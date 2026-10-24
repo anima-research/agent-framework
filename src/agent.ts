@@ -143,7 +143,7 @@ const DEFAULT_SAME_ROUND_THINK_TEXT_POLICY: SameRoundThinkTextPolicy = 'public';
  * Refuse an agent config whose `promptCaching`, `toolResultGuard`,
  * `toolWrapperProseGuard`, `thinking.enabled`, `thinkingBinding.dropBlock`,
  * `thinkingBinding.binds` or `refusalHandling.autoRewind` holds anything but true or false
- * (assertBooleanSetting), or whose `thinking`, `thinkingBinding` or
+ * (assertBooleanSetting, where null counts as left out), or whose `thinking`, `thinkingBinding` or
  * `refusalHandling` is anything but an object, null or false (holdsSettings),
  * or whose `autoContinue` resolveAutoContinue refuses. The constructor runs it
  * first, so the rule holds wherever an Agent is built. `create()` also runs it
@@ -166,7 +166,7 @@ export function assertAgentSwitches(config: AgentConfig): void {
       'true asks the provider for extended thinking, and false or leaving it out doesn\'t',
     );
   }
-  if (holdsSettings(`${agent} thinkingBinding`, config.thinkingBinding, '{ dropBlock: true }')) {
+  if (holdsSettings(`${agent} thinkingBinding`, config.thinkingBinding, '{ binds: true, dropBlock: true }')) {
     assertBooleanSetting(
       `${agent} thinkingBinding.dropBlock`,
       config.thinkingBinding.dropBlock,
@@ -1263,9 +1263,8 @@ export class Agent {
   ): Promise<CompileResult> {
     // A dry run is a compile that will never be sent. The context manager
     // persists no fold resolutions for it and queues none of the compression
-    // or merge work its fold plan calls for. Its thinking binding
-    // (context-manager#160, not yet released) will commit stamps and add a
-    // compile awaiting acceptance for a committing compile only. Here nothing
+    // or merge work its fold plan calls for, and, with the thinking binding
+    // (`thinkingBinding.binds`), writes no binding record. Here nothing
     // moves either: the agent never read what a dry run assembled, so the
     // consumed watermark stays. A dry run proves nothing about the budget
     // either, so it goes straight to the compile, around
@@ -1504,7 +1503,10 @@ export class Agent {
    * watermark); a preview passes `options.dryRun`, so its compile commits
    * none of that (see `compileWithInjections` for what a dry run still
    * leaves). Either way the context manager is handed the compression tool
-   * definitions. Safe to call regardless of the agent's current status.
+   * definitions. Safe to call regardless of the agent's current status,
+   * except that with `thinkingBinding.binds` a compile that isn't a dry run
+   * writes the context manager's binding record, so while one of the
+   * agent's requests streams, a call to look passes `options.dryRun`.
    * It doesn't wait for the tool-result guard's annotations, so a preview
    * never waits on a workspace write (rollback, undo and redo report one), and
    * may show a withheld stub before its place is added; the activation waits
@@ -1685,7 +1687,7 @@ export class Agent {
   private requestNotes(binding: BindingCompileOptions, compiled: CompiledForRequest): Pick<StartStreamResult, 'noteRequestSent'> {
     const identity = binding.identity;
     // Each note names the compile the stream was built from, so a note can't vouch for this stream under a record a
-    // later committing compile wrote. A compile that reports no provenance gives the stream nothing to name, and the
+    // later committing compile with binds wrote. A compile that reports no provenance gives the stream nothing to name, and the
     // stream notes nothing: its replies go without their thinking at the next compile, never refused.
     const compileId = compiled.provenance?.compileId;
     const cm = this.contextManager as unknown as {

@@ -248,13 +248,15 @@ export interface AgentConfig {
      *   starts a new stream mid-turn, since the new stream's compile can take
      *   the turn's earlier reasoning out of the request;
      * - where a compile reports where the branch's record began
-     *   (`thinkingRecordedAfter`), a block the provider drops though the
-     *   record says it was sent intact raises the `thinking-binding-loss`
-     *   ops alert, once per incident.
+     *   (`thinkingRecordedAfter`), a block the provider drops that the
+     *   record doesn't account for raises the `thinking-binding-loss` ops
+     *   alert, once per incident and again if a call drops more.
      * A context manager without such a record ignores the compile options
      * and has no `noteRequestSent`, so nothing is noted and nothing alerts;
-     * the budget rule above holds either way. Default false: compiles and
-     * streams are as they were.
+     * the budget rule above holds either way. The record and the notes
+     * vouch for requests as agent-framework hands them to membrane, so a
+     * membrane `beforeRequest` hook that changes a request must change every
+     * request alike. Default false: compiles and streams are as they were.
      */
     binds?: boolean;
   };

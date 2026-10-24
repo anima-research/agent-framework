@@ -23,9 +23,11 @@
     the new stream's compile can take the turn's earlier reasoning out of the
     request. The window check still does, whatever the context manager.
   - **An ops alert:** where a compile reports where the branch's record began
-    (`thinkingRecordedAfter`), a block the provider drops though the record
-    says it was sent intact raises `thinking-binding-loss`, once per agent per
-    incident.
+    (`thinkingRecordedAfter`), a block the provider drops that the record
+    doesn't account for raises `thinking-binding-loss`, once per agent per
+    incident and again if a call drops more. A reply stored before the record
+    began, or a drop for the account's binding (its organization or end user),
+    doesn't count.
 - `Agent.addAssistantResponse` returns the stored message's id.
   `runInference()`'s doc says that with `binds` set, its compile writes the
   context manager's record, so it's for a time when none of the agent's
