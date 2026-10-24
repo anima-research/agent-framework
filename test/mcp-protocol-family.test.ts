@@ -22,6 +22,7 @@ import {
   mcplPolicyGrants,
   MAX_TIMER_MS,
 } from '../src/mcpl/protocol-family.js';
+import { logValueRedacted } from '../src/mcpl/log-value.js';
 import { getEventListeners } from 'node:events';
 import { DEFAULT_EAGER_FETCH_MAX_BYTES, DEFAULT_MAX_TOTAL_BYTES } from '../src/mcpl/reference-fetcher.js';
 import { DEFAULT_MAX_INPUT_BYTES } from '../src/mcpl/tool-lifecycle.js';
@@ -132,6 +133,18 @@ test('a modern server needs a real deadline', () => {
   }
   for (const good of [undefined, 1, 60_000, MAX_TIMER_MS]) {
     assert.deepEqual(serverConfigProblems(cfg({ url: 'https://x/mcp', requestTimeoutMs: good })), [], String(good));
+  }
+});
+
+test("a deadline that can't be printed is refused with a placeholder for it, not thrown", () => {
+  // JSON can hold it, and String() throws on it: its toString isn't callable.
+  const unprintable = JSON.parse('{"toString": 1}') as unknown as number;
+  assert.throws(() => String(unprintable), TypeError);
+  for (const c of [cfg({ url: 'https://x/mcp', requestTimeoutMs: unprintable }), cfg({ command: 'srv', protocol: 'modern', requestTimeoutMs: unprintable })]) {
+    assert.match(
+      serverConfigProblems(c).join(),
+      /requestTimeoutMs must be an integer from 1 to 2147483647 for a modern server \(got \[a value that cannot be printed\]\)/,
+    );
   }
 });
 
@@ -552,6 +565,47 @@ test('recorded server text: a credential as JSON.stringify writes it, its quotes
       assert.equal(redactServerText(`config {"secret":"${form}"} refused`, config), 'config {"secret":"redacted"} refused', form);
     }
   }
+});
+
+test("recorded server text: a url's credentials, pairs and userinfo as JSON.stringify writes them, as a token's are", () => {
+  // Decoded, each holds a quote and a backslash, or a slash: a path segment,
+  // a credential-named query value, a pair whose value is too short to go on
+  // its own, a ws:// password, and a userinfo unit too short to go on its own.
+  const config = cfg({ url: 'wss://bot:pa%22ss%5Cw0rd@h/mcpl/s3cr%22et%5C0123456789?password=sec%2Fret%22key123&region=e%22u' });
+  for (const decoded of ['s3cr"et\\0123456789', 'sec/ret"key123', 'pa"ss\\w0rd']) {
+    const json = JSON.stringify(decoded).slice(1, -1);
+    for (const form of [decoded, json, json.replace(/\//g, '\\/')]) {
+      assert.equal(redactServerText(`config {"secret":"${form}"} refused`, config), 'config {"secret":"redacted"} refused', form);
+    }
+  }
+  assert.equal(redactServerText('config {"q":"region=e\\"u"} refused', config), 'config {"q":"redacted"} refused');
+  const short = cfg({ url: 'wss://b%22t:p%22w@h/mcp' });
+  assert.equal(redactServerText('dial {"url":"wss://b\\"t:p\\"w@h/mcp"} failed', short), 'dial {"url":"wss://redacted@h/mcp"} failed');
+});
+
+test('recorded server text: a pair or userinfo unit after a JSON escape goes, as after the control character it stands for', () => {
+  const config = cfg({ url: 'wss://bot:pw@h/mcpl?key=abc' });
+  for (const escape of ['\\n', '\\t', '\\r', '\\b', '\\f', '\\u000b']) {
+    assert.equal(redactServerText(`{"said":"bad${escape}key=abc"}`, config), `{"said":"bad${escape}redacted"}`, escape);
+    assert.equal(redactServerText(`{"said":"dial${escape}bot:pw@h"}`, config), `{"said":"dial${escape}redacted@h"}`, escape);
+  }
+  // A letter or digit that's text, not an escape's end, still adjoins it.
+  assert.equal(redactServerText('monkey=abc', config), 'monkey=abc');
+  assert.equal(redactServerText('robot:pw@h', config), 'robot:pw@h');
+  // The case a JSON value's text makes: a string with a newline before the pair.
+  assert.equal(logValueRedacted({ said: 'bad\nkey=abc' }, (text) => redactServerText(text, config)), '"{\\"said\\":\\"bad\\\\nredacted\\"}"');
+});
+
+test('recorded server text: the floor applies to each form, so a seven-character token goes in its eight-character JSON form', () => {
+  const config = cfg({ token: 'ab"cdef' });
+  assert.equal(redactServerText('refused: ab"cdef', config), 'refused: ab"cdef');
+  assert.equal(redactServerText('refused: ab\\"cdef', config), 'refused: redacted');
+});
+
+test("a JSON value logged through logValueRedacted keeps no url credential, though its JSON text escapes the credential's quote", () => {
+  const config = cfg({ url: 'wss://h/mcpl?password=secret%22key123' });
+  const line = logValueRedacted({ said: 'secret"key123' }, (text) => redactServerText(text, config));
+  assert.equal(line, '"{\\"said\\":\\"redacted\\"}"');
 });
 
 test("one redactor over several configurations' strings takes the longest secret among them all", () => {

@@ -6,7 +6,9 @@
  *
  *  - tombstone: the workspace deleted the path while disk kept a copy (no
  *    autoMaterialize, or a refused unlink). The hash is the deleted entry's,
- *    so even a legacy entry with no disk evidence keeps a durable intent.
+ *    so even a legacy entry with no disk evidence keeps a durable intent. A
+ *    tombstone beside an entry that's still there, left by a change that
+ *    stopped partway (commitToolChanges), is no deletion, and guards nothing.
  *  - origin 'store': the entry was created through workspace tools and disk
  *    has never agreed with it.
  *  - conflict: disk and workspace diverged in a way no rule may resolve

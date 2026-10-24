@@ -36,7 +36,8 @@ export const MALFORMED_CONTENT_NOTICE =
   '[malformed result: its content is not a list of blocks; the tool may already have completed]';
 
 /** Saves a payload under a host-chosen name; resolves to its workspace path,
- *  or null when there is nowhere writable to put it. */
+ *  or null when there is no writable workspace mount without an include to
+ *  put it in. */
 export type SaveToolPayload = (fileName: string, bytes: Buffer, mimeType: string) => Promise<string | null>;
 
 /** Stub fields are bounded independently of anything the server sends. */
@@ -135,13 +136,17 @@ export interface StandardToolResult {
  * Content that is present but isn't a list of blocks makes it a malformed
  * result, never an empty success. A tool's error result with no words, or
  * only whitespace, reads as `noWords`, which the framework words for its
- * server and tool.
+ * server and tool. A payload stub with no `save` says why nothing could
+ * keep it in `noSave`: no workspace mounted unless the caller words it
+ * otherwise, as the framework does for a host whose only writable mount
+ * is direct.
  */
 export async function normalizeStandardToolResult(
   result: StandardToolResult,
   label: string,
   save: SaveToolPayload | null,
   noWords = 'Tool call failed',
+  noSave = 'no workspace is mounted to save it',
 ): Promise<ToolResult> {
   const malformed = result.content !== undefined && !Array.isArray(result.content);
   const raw: unknown[] = Array.isArray(result.content) ? result.content : [];
@@ -161,7 +166,7 @@ export async function normalizeStandardToolResult(
     const what = `[${kind}${opts.origin ? ` ${bounded(opts.origin, URI_POINTS)}` : ''}: ${bounded(mimeType)}, ${size}`;
     if (!save) {
       lost++;
-      return `${what}. Not retained: ${why}, and no workspace is mounted to save it]`;
+      return `${what}. Not retained: ${why}, and ${noSave}]`;
     }
     const fileName = `${label}-${++saved}.${extensionFor(mimeType)}`;
     const path = await save(fileName, Buffer.from(base64, 'base64'), mimeType).catch((error: unknown) => {

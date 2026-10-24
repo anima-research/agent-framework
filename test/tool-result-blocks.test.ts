@@ -22,7 +22,6 @@ import { JsStore } from '@animalabs/chronicle';
 import { AgentFramework } from '../src/index.js';
 import * as referencesModule from '../src/mcpl/references.js';
 import { keptWhenWithheld } from '../src/tool-result-guard.js';
-import type { ScriptToolResult } from '../src/index.js';
 import type { Module, ModuleContext, ToolCall, ToolResult, ToolDefinition } from '../src/types/index.js';
 import {
   AUDIO_NO_DATA_TEXT,
@@ -48,9 +47,15 @@ import { CoalesceError, validateCoalescedContent } from '../src/mcpl/push-coales
 import { ReferenceFetcher } from '../src/mcpl/reference-fetcher.js';
 import { checkedToolResult } from '../src/module-registry.js';
 import { parseImagePlaceholders } from '../src/tool-image-ledger.js';
-import { nonErrorResultText, toolResultDataToHistoryString } from '../src/tool-result-history.js';
+import { nonErrorResultText, shownToScript, toolResultDataToHistoryString } from '../src/tool-result-history.js';
 import { MockMembrane, createMockResponse } from './helpers/mock-membrane.js';
 import { fixture } from './helpers/coalescing-fixture.js';
+
+/** What a script's call answers (ToolAnswer, the isolate runner's), as these tests read it. */
+interface ScriptAnswer { ok: boolean; json: string; isError?: boolean }
+
+/** The text a script reads for a result with no structured content: its one text block. */
+const answerText = (answer: ScriptAnswer): string => (JSON.parse(answer.json) as { content: Array<{ text: string }> }).content[0]!.text;
 
 const SECRET = 'zz-secret-signature';
 /** 3,000 bytes of audio or image data, base64. */
@@ -486,9 +491,8 @@ describe("MCP's resource_link, a reference (RFC-005 §8.1)", () => {
 
   it("isn't fetched for a script on demand, where a reference is", async () => {
     const fw = Object.create(AgentFramework.prototype) as {
-      dispatchScriptToolCall: (...args: unknown[]) => Promise<ToolResult>;
       getReferenceFetcher(): unknown;
-      handleScriptToolCall(agentName: string, toolName: string, args: Record<string, unknown>): Promise<ScriptToolResult>;
+      scriptResultAnswer(result: ToolResult, toolName: string, toServer: boolean): Promise<ScriptAnswer>;
     };
     const reference = {
       type: 'resource', uri: `https://zz-files.example/wanted.pdf?sig=${SECRET}`, name: 'wanted.pdf',
@@ -497,7 +501,6 @@ describe("MCP's resource_link, a reference (RFC-005 §8.1)", () => {
     // A link to the same uri came first, so its record holds the link's
     // claims until the reference's replace them.
     referenceRegistry.register(testimonyOf({ type: 'resource_link', uri: reference.uri, name: 'linked.pdf' }), 'zz-files');
-    fw.dispatchScriptToolCall = async () => ({ success: true, data: [TEXT, LINK, reference, VIDEO], dataIsContent: true });
     const fetched: string[] = [];
     const claims: unknown[] = [];
     fw.getReferenceFetcher = () => ({
@@ -509,14 +512,15 @@ describe("MCP's resource_link, a reference (RFC-005 §8.1)", () => {
     });
     const error = console.error;
     console.error = () => {};
-    let result: ScriptToolResult;
+    let result: ScriptAnswer;
     try {
-      result = await fw.handleScriptToolCall('zz-agent', 'zz_tool', {});
+      // A module's result: no dispatch sent the call to a server.
+      result = await fw.scriptResultAnswer({ success: true, data: [TEXT, LINK, reference, VIDEO], dataIsContent: true }, 'zz_tool', false);
     } finally {
       console.error = error;
     }
     assert.equal(result.isError, false);
-    const { text } = result;
+    const text = answerText(result);
     assert.deepEqual(fetched, [reference.uri]);
     assert.deepEqual(claims, [['wanted.pdf', reference.digest, reference.expiresAt]]);
     // The script reads the text history stores for a protocol result's
@@ -1131,19 +1135,17 @@ describe('one answer for every block of a result', () => {
    *  tried, what it logged, and what the script got. */
   const demandFetch = async (data: unknown[], dataIsContent?: boolean) => {
     const fw = Object.create(AgentFramework.prototype) as {
-      dispatchScriptToolCall: (...args: unknown[]) => Promise<ToolResult>;
       getReferenceFetcher(): unknown;
-      handleScriptToolCall(agentName: string, toolName: string, args: Record<string, unknown>): Promise<ScriptToolResult>;
+      scriptResultAnswer(result: ToolResult, toolName: string, toServer: boolean): Promise<ScriptAnswer>;
     };
-    fw.dispatchScriptToolCall = async () => ({ success: true, data, ...(dataIsContent ? { dataIsContent } : {}) });
     const fetched: string[] = [];
     fw.getReferenceFetcher = () => ({ fetch: async (record: { testimony: { uri: string } }) => { fetched.push(record.testimony.uri); return { ok: false, error: 'zz-refused' }; } });
     const logged: string[] = [];
     const error = console.error;
     console.error = (line: string) => { logged.push(line); };
     try {
-      const result = await fw.handleScriptToolCall('zz-agent', 'zz_tool', {});
-      return { fetched, logged, result };
+      const answer = await fw.scriptResultAnswer({ success: true, data, ...(dataIsContent ? { dataIsContent } : {}) }, 'zz_tool', false);
+      return { fetched, logged, result: { isError: answer.isError === true, text: answerText(answer) } };
     } finally {
       console.error = error;
     }
@@ -1191,6 +1193,20 @@ describe('one answer for every block of a result', () => {
     assert.deepEqual(fetched, []);
     // The fetch not made is logged, as a refused one is.
     assert.ok(logged.some((line) => NOT_MADE_EXPIRED.test(line)), logged.join('\n'));
+  });
+
+  it('shows a link that names no uri at depth as its fields, which hold none, and the script lane leaves its own link object as it is', () => {
+    // No uri to withhold, as for a reference's stub.
+    const named = { type: 'resource_link', name: 'zz-no-uri', size: 10 };
+    assert.deepEqual(JSON.parse(toolResultDataToHistoryString({ found: [named] })), { found: [named] });
+    // The object a script gets for a link, given to the script lane again,
+    // reads the same, its uri left out or shown, and its size kept.
+    for (const uri of [LINK_URI, PLAIN_URI]) {
+      const object = referenceBlockForScript({ type: 'resource_link', uri, name: 'report.csv', mimeType: 'text/csv', size: 1024 }) as Record<string, unknown>;
+      assert.equal(object.sizeBytes, 1024, uri);
+      const again = JSON.parse(JSON.stringify([object], (_key, value: unknown) => shownToScript(value))) as unknown[];
+      assert.deepEqual(again, [object], uri);
+    }
   });
 
   it('shows a link with no usable uri at any depth as its marker, never its fields', () => {
@@ -1381,7 +1397,9 @@ describe('one answer for every block of a result', () => {
       buildStoredToolResultContent(agent: string, calls: unknown[], maxChars: number | undefined): Promise<{ spilled: Map<string, unknown> }>;
       toMembraneToolResult(callId: string, result: ToolResult, maxChars: number | undefined, precomputed: unknown): Live;
     };
-    Object.assign(fw, { toolImageLedgers: new Map(), writeToolResultFile: async () => null });
+    // A spill that can't be written names where the agent would read it, so
+    // the notice asks the module registry for a workspace: there's none.
+    Object.assign(fw, { toolImageLedgers: new Map(), writeToolResultFile: async () => null, moduleRegistry: { getAllModules: () => [] } });
     const result: ToolResult = { success: true, data: [IMAGE, AUDIO, AUDIO], dataIsContent: true };
     const cap = AUDIO_TEXT.length * 2;
     for (const [maxChars, native] of [[cap, true], [cap - 1, false]] as const) {

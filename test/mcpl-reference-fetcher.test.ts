@@ -1074,13 +1074,13 @@ test("a save that throws is the workspace's failure, logged for whoever runs the
   assert.equal(rec.fetchedPath, undefined);
 });
 
-test("a payload fetched but not stored says so, and the host's log says why: no workspace, no writable mount, or the write's error", async (t) => {
+test("a payload fetched but not stored says so, and the host's log says why: no workspace, no writable mount without an include, or the write's error", async (t) => {
   const errors = t.mock.method(console, 'error', () => {});
   type Answer = { result: { success: boolean; error?: string } };
   const cases: Array<[string, Record<string, unknown>, (file: string) => string]> = [
     ['no workspace', { getWorkspaceModule: () => undefined }, (file) => `[refs] couldn't store ${file}: this host has no workspace`],
-    ['no writable mount', { getWorkspaceModule: () => ({}), firstWritableMountName: () => null },
-      (file) => `[refs] couldn't store ${file}: no workspace mount is writable`],
+    ['no writable mount without an include', { getWorkspaceModule: () => ({}), firstWritableMountName: () => null },
+      (file) => `[refs] couldn't store ${file}: no writable workspace mount without an include`],
     ['a failed write', {
       getWorkspaceModule: () => ({ writeBinary: async () => ({ success: false, error: 'EROFS: read-only file system' }) }),
       firstWritableMountName: () => 'scratch',

@@ -162,8 +162,8 @@ async function make(opts: {
     modules: [mod],
   });
   (framework as any).channelRegistry = new Proxy({
-    resolveLocus: () => 'world:commons', getDefaultPublishChannel: () => 'world:commons',
-    routeSpeech: async () => ({ delivered: opts.deliver ?? true, channelId: 'world:commons' }),
+    resolveLocus: () => ({ serverId: 'stub', channelId: 'world:commons' }), getDefaultPublishChannel: () => ({ serverId: 'stub', channelId: 'world:commons' }),
+    routeSpeech: async () => ({ delivered: opts.deliver ?? true, serverId: 'stub', channelId: 'world:commons' }),
     startTyping: () => {}, stopTyping: () => {},
     getChannelTools: () => [], getDescriptor: () => undefined,
   }, { get: (t, p: string) => p in t ? (t as any)[p] : () => undefined });
@@ -604,6 +604,23 @@ describe('replies to a [Continue] turn', () => {
       for (const row of rows.filter((m) => m !== reply)) assert.equal(row.metadata?.promptedBy, undefined);
       assert.ok(!rows.some((m) => m.content.some((b) => (b as { text?: string }).text === '[Continue]')),
         'the [Continue] turn is never stored');
+    } finally { await x.framework.stop(); rmSync(x.dir, { recursive: true, force: true }); }
+  });
+
+  it("stamps the reply of a [Continue] turn that a wake to read a render started, whose trigger the turn copies without the wake's mark", async () => {
+    const x = await make({ deliver: false });
+    try {
+      await wake(x, ordinaryEvent('hello'), signed('sig-1', 'first reply'));
+      // A render still queued (for another resident) keeps its wake to read
+      // it, which starts a turn with nothing new for this agent: [Continue].
+      const internals = x.framework as any;
+      internals.deferredMessages.push({ id: 'render-x', seq: 1, participant: 'editor', forAgent: 'ghost', content: [{ type: 'text', text: 'elsewhere' }], heldAt: Date.now() });
+      x.membrane.pushResponse(createMockResponse(signed('sig-c', 'continued reply'), 'end_turn'));
+      internals.pendingRequests.push({ agentName: 'assistant', reason: 'mcpl:push-event', source: 'editor', timestamp: Date.now(), readsDeferredWrite: 'render-x' });
+      await x.framework.runUntilIdle();
+      internals.deferredMessages.splice(0);
+      assert.equal(textOf(x.membrane.calls[1]!.messages.at(-1)!), '[Continue]');
+      assert.equal(rowWith(x.framework, 'continued reply').metadata?.promptedBy?.text, '[Continue]', 'the reply carries the prompt it followed');
     } finally { await x.framework.stop(); rmSync(x.dir, { recursive: true, force: true }); }
   });
 

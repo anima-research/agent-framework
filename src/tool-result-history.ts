@@ -10,7 +10,8 @@
  * hallucination this feature exists to kill.
  *
  * A content array (toolResultBlocks) is shown block by block, each block as
- * both copies show it: text verbatim, an image as a short
+ * both copies show it: text verbatim, apart from a lone UTF-16 surrogate,
+ * which becomes U+FFFD (#695), an image as a short
  * `[image: mimeType, ~NKB]` placeholder, a reference as its stub, and any
  * other block as a marker saying what it was and why it isn't shown. Anything
  * else falls back to JSON, written by RFC-005's rules at every depth
@@ -18,7 +19,7 @@
  * data, so its uri reaches history only as a link's line shows it where the
  * host can't fetch the link and its uri can't carry a credential
  * (shownLinkUri), and inline data that claims a uri or a disposition is
- * withheld.
+ * withheld. A string is already text and is kept as it is.
  */
 
 import {
@@ -30,6 +31,7 @@ import {
   buildReferenceStub,
   classifyBlock,
   contentClaims,
+  referenceBlockForScript,
   referenceStubOrNull,
   referenceTypeLabel,
   resultClaims,
@@ -106,7 +108,13 @@ export function toolResultBlocks(data: unknown, dataIsContent?: boolean, claims?
   // references says of a uri (a `disposition: never`, an expiry) holds for
   // each block that names it, whatever their order.
   const read = claims ?? contentClaims(data);
-  return data.map((raw) => toolResultBlock(raw, read));
+  // Each text well formed, as the context store makes it when it writes, so
+  // the copy sent and the copy stored carry the same text (#695): a stub's
+  // labels and a link's uri come from the block too.
+  return data.map((raw) => {
+    const block = toolResultBlock(raw, read);
+    return 'text' in block ? { ...block, text: block.text.toWellFormed() } : block;
+  });
 }
 
 /** Whether a tool result's data is a content array, which toolResultBlocks
@@ -206,7 +214,7 @@ export interface HistorySerializeOptions {
 
 /**
  * House-safe default inline cap (chars) for tool results, error results, and
- * background-script wake payloads (issue #89: a resident should never eat a
+ * script wake payloads (issue #89: a resident should never eat a
  * 42k blob they didn't ask for). Durable per-residence value comes from
  * `FrameworkConfig.toolResultInlineMaxChars`; a per-agent value from
  * agent_settings `tool_result_inline_max_chars`.
@@ -229,9 +237,19 @@ export function toolResultDataToHistoryString(
   options?: HistorySerializeOptions,
 ): string {
   const fromArray = tryHistoryStringFromContentArray(data, options);
+  // A string is the text the tool means to say, kept as it is: JSON would
+  // quote it and escape every newline, so a multi-line result would reach
+  // the model, a script and its spill file as one escaped line. Kept well
+  // formed: a lone UTF-16 surrogate, which JSON escaped, isn't text, a
+  // provider can refuse a request that carries one, and UTF-8 can't store
+  // it in a spill file, so it reads as U+FFFD.
   // JSON leaves out undefined, a function and a symbol: a result with no data
   // is stored as no text, as an empty content array is.
-  const str = fromArray ?? historyJson(data, options?.claims) ?? '';
+  // RFC-005 shows only objects otherwise (shownInHistory), so a string has
+  // nothing for historyJson to stub or withhold.
+  const str = fromArray
+    ?? (typeof data === 'string' ? data.toWellFormed() : historyJson(data, options?.claims))
+    ?? '';
   return maxChars ? truncateForHistory(str, maxChars) : str;
 }
 
@@ -245,6 +263,14 @@ export function toolResultDataToHistoryString(
  * result here, unchecked, and a getter needn't answer the same way twice.
  * Whether an array is content is the result's own `dataIsContent`, read for
  * its truth as a result's flags are, whatever `options` says.
+ *
+ * Each text a tool result's copies carry is made well formed where it's
+ * taken from the result: a lone UTF-16 surrogate becomes U+FFFD, as the
+ * context store makes it when it writes, so the copy sent to membrane and the
+ * copy stored carry the same text (#695). Other data goes through JSON,
+ * which escapes a lone half. toWellFormed() keeps the length,
+ * so the cut, the spans and the slots are computed from the well-formed text
+ * as before; a cut at a lone high half no longer steps back over it.
  */
 export function nonErrorResultText(
   result: { data?: unknown; error?: string; dataIsContent?: boolean },
@@ -254,13 +280,17 @@ export function nonErrorResultText(
   const data = result.data;
   if (data === undefined || data === null) {
     const error = result.error;
-    if (typeof error === 'string' && error) return maxChars ? truncateForHistory(error, maxChars) : error;
+    if (typeof error === 'string' && error) {
+      const text = error.toWellFormed();
+      return maxChars ? truncateForHistory(text, maxChars) : text;
+    }
   }
   return toolResultDataToHistoryString(data, maxChars, { ...options, dataIsContent: Boolean(result.dataIsContent) });
 }
 
 /** Bounded copy of an arbitrary string with the standard truncation notice,
- *  cut at the cap as a tool result's stored copy is (toolResultCutAt), so it
+ *  cut at the cap where a tool result's stored copy is cut at that cap
+ *  (toolResultCutAt), so it
  *  never ends in part of a slot. Each of its callers' readers sees this
  *  very text, never the images behind a placeholder, so nothing past the cut
  *  is kept for save_recent_image's index (#403). The framework stores a tool
@@ -311,9 +341,13 @@ function tryHistoryStringFromContentArray(data: unknown, options?: HistorySerial
  */
 function governedByRfc005(b: Record<string, unknown>): boolean {
   if (b.type === 'resource') return hasUri(b.uri) || (isPlainRecord(b.resource) && hasUri(b.resource.uri));
-  // A link is governed whatever its uri, so one without a usable uri is its
-  // marker here, as on the content lanes, never its fields.
-  if (b.type === 'resource_link') return true;
+  // A link that names a uri is governed whatever its value, so one without
+  // a usable uri (empty, null, not a string) is its marker here, as on the
+  // content lanes, never its fields. One that names none carries no uri to
+  // withhold, as the object the script lane makes of a link whose uri it
+  // leaves out (referenceBlockForScript), which a script's view, given it
+  // again, leaves as it is, as it leaves a reference's stub.
+  if (b.type === 'resource_link') return b.uri !== undefined;
   if (b.type === 'image' || b.type === 'audio') return typeof b.data === 'string' || hasUri(b.uri);
   return false;
 }
@@ -356,9 +390,10 @@ function walkedInHistory(value: unknown, asText: (b: Record<string, unknown>) =>
   const b = value as Record<string, unknown>;
   if (!governedByRfc005(b)) return value;
   if ((b.type === 'image' || b.type === 'audio') && typeof b.data === 'string') {
-    // JSON writes every field, so here inline data beside a uri of any value
+    // JSON writes every field, so here inline data beside a uri of any type
     // is withheld, not only beside a string one as in the lanes, which show
-    // no uri: an object can carry a credential. An empty uri carries none.
+    // no uri: an object can carry a credential. A null, absent or empty uri
+    // carries none (hasUri).
     return hasUri(b.uri) || b.disposition !== undefined ? INLINE_WITHHELD_TEXT : value;
   }
   return asText(b) ?? value;
@@ -404,6 +439,62 @@ function claimsInHistory(data: unknown): ResultClaims | null {
     return null;
   }
   return resultClaims(testimonies);
+}
+
+/**
+ * A value of a tool result's data as a script reads it, by history's rules
+ * (shownInHistory), as a JSON replacer applies them at every depth: what
+ * RFC-005 governs is shown as the script lane shows it, a reference as its
+ * stub's facts, a link's uri among them only where the model's line for it
+ * would show it, and an invalid one as the notice (referenceBlockForScript),
+ * and inline data that also claims a uri of any type or a disposition as the
+ * withheld notice, each as a text block. A null, absent or empty uri claims
+ * none (hasUri), so inline data beside one is itself. Any other value is
+ * itself. `claims` are those of everything the script's view shows
+ * (scriptViewClaims). What it gives is either a stub or a notice, which
+ * RFC-005 doesn't govern, or the value itself, which it gives again, so
+ * applying it twice gives what applying it once gave.
+ */
+export function shownToScript(value: unknown, claims?: ResultClaims): unknown {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return value;
+  const b = value as Record<string, unknown>;
+  if (!governedByRfc005(b)) return value;
+  if ((b.type === 'image' || b.type === 'audio') && typeof b.data === 'string') {
+    return hasUri(b.uri) || b.disposition !== undefined ? { type: 'text', text: INLINE_WITHHELD_TEXT } : value;
+  }
+  return referenceBlockForScript(b, undefined, claims);
+}
+
+/**
+ * The claims (ResultClaims) of everything a script's view of a content array
+ * shows, nested fields included (Ada-1017, room-203 #200094), by the walk
+ * history's JSON takes (claimsInHistory): a script is shown the references
+ * nested in a block's fields, each as its stub, so a `never` among them
+ * withholds that uri from every block in the view. Stricter than the
+ * model's line, which shows a block and not its fields (contentClaims), and
+ * never looser. An MCPL peer's top-level block the classifier rejects is
+ * its notice, its fields unshown, so they don't count (`fromServer`). Null
+ * where a value stops the walk, which stops the view at the same value.
+ */
+export function scriptViewClaims(content: readonly unknown[], fromServer: boolean): ResultClaims | null {
+  return claimsInHistory(fromServer ? content.filter((block) => classifyBlock(block).kind !== 'invalid') : content);
+}
+
+/**
+ * A value nested in an MCPL peer's content block as a script reads it, as a
+ * JSON replacer applies it inside the blocks: what RFC-005 governs
+ * (governedByRfc005, history's guard, since the classifier would make a
+ * notice of an object that isn't a content block, such as a peer's own
+ * nested data) gets the treatment the script lane gives a
+ * peer's block (referenceBlockForScript), its reference bound to the server
+ * that sent it, and any other value is itself. A stub or a notice isn't
+ * governed, so a block the top-level pass already treated is left as it is.
+ * `claims` are those of the script's whole view (scriptViewClaims).
+ */
+export function shownToScriptFromServer(value: unknown, serverId: string, claims?: ResultClaims): unknown {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return value;
+  const b = value as Record<string, unknown>;
+  return governedByRfc005(b) ? referenceBlockForScript(b, serverId, claims) : value;
 }
 
 /**

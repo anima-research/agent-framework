@@ -24,7 +24,7 @@
 
 import { describe, it } from 'node:test';
 import assert from 'node:assert';
-import { AnthropicXmlFormatter, Membrane, NativeFormatter, TimeoutAbortError } from '@animalabs/membrane';
+import { AnthropicAdapter, AnthropicXmlFormatter, Membrane, NativeFormatter, TimeoutAbortError } from '@animalabs/membrane';
 import type {
   NormalizedRequest,
   NormalizedResponse,
@@ -115,7 +115,7 @@ interface Answer {
 /** Ask the router for one inference, played by `script` on a real Membrane. */
 async function ask(
   script: Script,
-  opts: { stream: boolean; mode: Mode; policy?: InferenceRoutingPolicy },
+  opts: { stream: boolean; mode: Mode; policy?: InferenceRoutingPolicy; noChunkSender?: boolean },
 ): Promise<Answer> {
   const membrane = new Membrane(new ScriptedAdapter(script), {
     formatter: opts.mode === 'xml' ? new AnthropicXmlFormatter({ toolMode: 'xml' }) : new NativeFormatter(),
@@ -126,28 +126,24 @@ async function ask(
     answer.stream = streamYielding(request);
     return answer.stream;
   };
-  return askWith(membrane, opts.stream, answer, opts.policy);
+  return askWith(membrane, opts.stream, answer, opts.policy, opts.noChunkSender);
 }
 
-/** Ask a router built on `membrane`, routing by `policy` (none: `default`), for one inference. */
+/** Ask a router built on `membrane`, routing by `policy` (none given: a policy
+ *  whose default is `default`), for one inference. */
 async function askWith(
   membrane: Membrane,
   stream: boolean,
   answer: Answer = { chunks: [], sent: [], traces: [] },
   policy?: InferenceRoutingPolicy,
+  noChunkSender = false,
 ): Promise<Answer> {
   const router = new InferenceRouter(
     membrane,
     { isInHook: false } as unknown as HookOrchestrator,
     { validateInbound: () => {} } as unknown as FeatureSetManager,
-    policy ?? null,
+    policy ?? { default: 'default' },
     (event) => { answer.traces.push(event); },
-    (_serverId, params) => {
-      answer.chunks.push(params);
-      const last = answer.sent.length - 1;
-      if (answer.sent[last]?.startsWith('chunk:')) answer.sent[last] += params.delta;
-      else answer.sent.push(`chunk:${params.delta}`);
-    },
   );
 
   await router.handleInferenceRequest('scripted-server', {
@@ -164,6 +160,14 @@ async function askWith(
       answer.error = { code, message };
       answer.sent.push(`error:${message}`);
     },
+    ...(noChunkSender ? {} : {
+      sendChunk: (params: InferenceChunkParams) => {
+        answer.chunks.push(params);
+        const last = answer.sent.length - 1;
+        if (answer.sent[last]?.startsWith('chunk:')) answer.sent[last] += params.delta;
+        else answer.sent.push(`chunk:${params.delta}`);
+      },
+    }),
   });
 
   // Every answer is traced: an error by mcpl:inference_fail with its message,
@@ -195,7 +199,7 @@ const PROVIDER_FAILED_PARTWAY: Script = { chunks: ['A summ'], stopReason: 'error
 
 /**
  * The success trace for a completion played with USAGE: the routed model,
- * `default` with no routing policy, and the one the provider served.
+ * `default` from askWith's own policy, and the one the provider served.
  */
 const completeTrace = (streamed: boolean) => ({
   type: 'mcpl:inference_complete', serverId: 'scripted-server', model: 'default', actualModel: 'scripted-model', ...USAGE, streamed,
@@ -239,6 +243,13 @@ const TAG_IN_PROSE: Script = {
 
 for (const mode of ['native', 'xml'] as const) {
   describe(`MCPL inference router, ${mode} mode: a streamed request`, () => {
+    it('answers a streamed request whole when its responder carries no chunk sender', async () => {
+      const answer = await ask({ chunks: ['Hello ', 'world'], stopReason: 'end_turn' }, { stream: true, mode, noChunkSender: true });
+      assert.strictEqual(answer.error, undefined);
+      assert.deepStrictEqual(answer.sent, ['result:Hello world']);
+      assert.deepStrictEqual(answer.chunks, []);
+    });
+
     it('answers a completed stream with its text, after chunks that join up to it (control)', async () => {
       const answer = await ask({ chunks: ['Hello ', 'world'], stopReason: 'end_turn' }, { stream: true, mode });
 
@@ -329,8 +340,8 @@ for (const mode of ['native', 'xml'] as const) {
     });
 
     it('answers with the routed model when membrane names none, and traces no actualModel (control)', async () => {
-      // A policy, so the routed model is one the policy chose rather than
-      // the `default` a router without one sends.
+      // A policy of the test's own, so the routed model is visibly the one it
+      // chose rather than askWith's `default`.
       const answer = await ask(
         { chunks: ['Hello world'], stopReason: 'end_turn', servedModel: '' },
         { stream: false, mode, policy: { default: 'house-summarizer' } },
@@ -502,5 +513,256 @@ describe('MCPL inference router: a stream that ends with no terminal event', () 
     assert.strictEqual(answer.result, undefined);
     assert.deepStrictEqual(answer.error, { code: -32603, message: 'The inference stream ended without a result' });
     assert.deepStrictEqual(answer.sent, ['chunk:Hel', 'error:The inference stream ended without a result']);
+  });
+});
+
+describe('MCPL inference router: a request the routing policy names no model for', () => {
+  /** A router with `policy`, and a membrane that records what reaches it. */
+  function refusingRouter(policy: InferenceRoutingPolicy | null) {
+    const reached: NormalizedRequest[] = [];
+    const traces: Array<{ type: string; [key: string]: unknown }> = [];
+    const membrane = {
+      complete: async (request: NormalizedRequest): Promise<NormalizedResponse> => {
+        reached.push(request);
+        return {
+          content: [{ type: 'text', text: 'done' }],
+          toolCalls: [],
+          stopReason: 'end_turn',
+          usage: { ...USAGE },
+          details: {
+            stop: { reason: 'end_turn', wasTruncated: false },
+            model: { requested: request.config.model, actual: request.config.model, provider: 'scripted' },
+          },
+        } as unknown as NormalizedResponse;
+      },
+      streamYielding: (request: NormalizedRequest) => {
+        reached.push(request);
+        throw new Error('not reached in these tests');
+      },
+    } as unknown as Membrane;
+    const router = new InferenceRouter(
+      membrane,
+      { isInHook: false } as unknown as HookOrchestrator,
+      { validateInbound: () => {} } as unknown as FeatureSetManager,
+      policy,
+      (event) => { traces.push(event); },
+    );
+    const ask = async (serverId: string, featureSet: string, stream = false, conversationId?: string, noChunks = false) => {
+      const answers: Array<{ result?: McplInferenceRequestResult; error?: { code: number; message: string; data?: unknown } }> = [];
+      await router.handleInferenceRequest(serverId, {
+        featureSet,
+        stream,
+        ...(conversationId === undefined ? {} : { conversationId }),
+        messages: [{ role: 'user', content: 'Summarize these memories.' }],
+      }, {
+        requestId: 7,
+        respond: (result) => { answers.push({ result }); },
+        respondError: (code, message, data) => { answers.push({ error: { code, message, data } }); },
+        ...(noChunks ? {} : { sendChunk: () => { throw new Error('a refused request sends no chunk'); } }),
+      });
+      return answers;
+    };
+    return { ask, reached, traces };
+  }
+
+  /** console.error's lines while `run` runs. */
+  async function logged(run: () => Promise<void>): Promise<string[]> {
+    const lines: string[] = [];
+    const original = console.error;
+    console.error = (...args: unknown[]) => { lines.push(args.map(String).join(' ')); };
+    try {
+      await run();
+    } finally {
+      console.error = original;
+    }
+    return lines;
+  }
+
+  const NO_POLICY = "inference/request refused: the host sets no inference routing policy (inferenceRouting), so the host has no model to run it on; it stays refused until the host's operator configures one";
+  const noModelFor = (featureSet: string) =>
+    `inference/request refused: the inference routing policy (inferenceRouting) names no model for feature set ${JSON.stringify(featureSet)}, so the host has no model to run it on; it stays refused until the host's operator configures one`;
+
+  for (const stream of [false, true]) {
+    it(`refuses with -32603 naming inferenceRouting when the host sets no policy, and nothing reaches membrane (${stream ? 'streamed' : 'not streamed'})`, async () => {
+      const { ask, reached, traces } = refusingRouter(null);
+      let answers: Awaited<ReturnType<typeof ask>> = [];
+      await logged(async () => { answers = await ask('srv', 'memory.consolidation', stream); });
+
+      // -32603, as the request was answered when it reached the provider
+      // with the model `default`; the server's grant can still list
+      // inferenceRequest, so not -32002.
+      assert.deepStrictEqual(answers, [{ error: { code: -32603, message: NO_POLICY, data: undefined } }]);
+      assert.deepStrictEqual(reached, []);
+      // The failure a trace watcher saw when this failed at the provider,
+      // with no inference_start, since none started.
+      assert.deepStrictEqual(traces, [{ type: 'mcpl:inference_fail', serverId: 'srv', model: null, error: NO_POLICY, streamed: stream }]);
+    });
+  }
+
+  it('logs the refusal once per server, while answering every request', async () => {
+    const { ask } = refusingRouter(null);
+    const answered: number[] = [];
+    const lines = await logged(async () => {
+      answered.push((await ask('srv-a', 'memory.consolidation')).length);
+      answered.push((await ask('srv-a', 'memory.consolidation')).length);
+      answered.push((await ask('srv-a', 'drafts')).length);
+      answered.push((await ask('srv-b', 'memory.consolidation')).length);
+    });
+
+    assert.deepStrictEqual(answered, [1, 1, 1, 1]);
+    assert.deepStrictEqual(lines, [
+      '[mcpl] srv-a: inference/request refused: the host sets no inference routing policy (inferenceRouting); set inferenceRouting in the framework config to choose the model server-initiated inference runs on. This line prints once per server; later refusals are answered and traced but not logged.',
+      '[mcpl] srv-b: inference/request refused: the host sets no inference routing policy (inferenceRouting); set inferenceRouting in the framework config to choose the model server-initiated inference runs on. This line prints once per server; later refusals are answered and traced but not logged.',
+    ]);
+  });
+
+  it('traces a refused request that asked to stream but has no way to send chunks as not streamed', async () => {
+    const { ask, traces } = refusingRouter(null);
+    await logged(async () => { await ask('srv', 'notes', true, undefined, true); });
+
+    assert.deepStrictEqual(traces, [{ type: 'mcpl:inference_fail', serverId: 'srv', model: null, error: NO_POLICY, streamed: false }]);
+  });
+
+  it('logs once per server and feature set with a policy, naming what to give it, and the server and feature set as given', async () => {
+    const { ask, traces } = refusingRouter({ default: '' });
+    const odd = 'notes\u200b=x';
+    const server = 'srv\n[mcpl] other: forged';
+    const answered: Array<Awaited<ReturnType<typeof ask>>> = [];
+    const lines = await logged(async () => {
+      answered.push(await ask(server, odd));
+      answered.push(await ask(server, odd));
+      answered.push(await ask(server, 'drafts'));
+      answered.push(await ask('srv-2', odd));
+    });
+
+    assert.deepStrictEqual(answered.map((a) => a[0]?.error?.code), [-32603, -32603, -32603, -32603]);
+    assert.strictEqual(traces.length, 4, 'every refusal is traced');
+    assert.deepStrictEqual(traces[0], { type: 'mcpl:inference_fail', serverId: server, model: null, error: noModelFor(odd), streamed: false });
+    assert.strictEqual(lines.length, 3, lines.join('\n'));
+    assert.match(lines[2]!, /^\[mcpl\] srv-2: /);
+    assert.ok(lines[0]!.includes('; give it a default, or a byFeature or wildcards entry for that feature set. This line prints once per server and feature set; later refusals are answered and traced but not logged.'), lines[0]);
+    assert.ok(lines[1]!.includes('names no model for feature set drafts;'), lines[1]);
+    assert.ok(!lines[0]!.includes('\u200b'), 'the invisible character is shown escaped');
+    const shown = /feature set ("[^"]*")/.exec(lines[0]!)![1]!;
+    assert.strictEqual(JSON.parse(shown), odd, 'the operator can read back exactly the name the server sent');
+    assert.ok(!lines[0]!.includes('\n'), 'one line, whatever the server id holds');
+    const shownServer = /^\[mcpl\] ("[^"]*"): /.exec(lines[0]!)![1]!;
+    assert.strictEqual(JSON.parse(shownServer), server);
+  });
+
+  it('takes a conversation override over byFeature, byFeature over wildcards, and the first matching wildcard over a later one', async () => {
+    const { ask, reached } = refusingRouter({
+      default: 'by-default',
+      overrides: { 'conv-1': 'by-override', '': 'by-empty-id' },
+      byFeature: { 'memory.summary': 'by-feature' },
+      wildcards: { 'memory.*': 'first-wildcard', '*.digest': 'second-wildcard' },
+    });
+    await logged(async () => {
+      await ask('srv', 'memory.summary', false, 'conv-1');
+      await ask('srv', 'memory.summary');
+      await ask('srv', 'memory.digest');
+      await ask('srv', 'notes');
+      await ask('srv', 'notes', false, '');
+    });
+
+    assert.deepStrictEqual(reached.map((r) => r.config.model), ['by-override', 'by-feature', 'first-wildcard', 'by-default', 'by-default']);
+  });
+
+  it('refuses a feature set a policy with no default names no model for, and runs one it names', async () => {
+    const { ask, reached } = refusingRouter({ default: '', byFeature: { 'memory.consolidation': 'house-summarizer' } });
+    let unnamed: Awaited<ReturnType<typeof ask>> = [];
+    let named: Awaited<ReturnType<typeof ask>> = [];
+    const lines = await logged(async () => {
+      unnamed = await ask('srv', 'notes');
+      named = await ask('srv', 'memory.consolidation');
+    });
+
+    assert.deepStrictEqual(unnamed, [{ error: { code: -32603, message: noModelFor('notes'), data: undefined } }]);
+    assert.strictEqual(lines.length, 1);
+    assert.deepStrictEqual(reached.map((r) => r.config.model), ['house-summarizer']);
+    assert.strictEqual(named[0]?.result?.model, 'house-summarizer');
+  });
+
+  it('routes by the first wildcard that names a model, passing over empty and non-string entries as a missing one is', async () => {
+    const { ask, reached } = refusingRouter({
+      default: 'house-default',
+      overrides: { 'conv-1': '', 'conv-2': {} as unknown as string },
+      byFeature: { notes: '', drafts: 5 as unknown as string },
+      wildcards: { 'memory.*': 7 as unknown as string, '*.consolidation': 'wild-model' },
+    });
+    await logged(async () => {
+      await ask('srv', 'memory.consolidation');
+      await ask('srv', 'notes', false, 'conv-1');
+      await ask('srv', 'drafts', false, 'conv-2');
+    });
+
+    assert.deepStrictEqual(reached.map((r) => r.config.model), ['wild-model', 'house-default', 'house-default']);
+  });
+
+  it('refuses a default that is not a string, and nothing reaches membrane', async () => {
+    const { ask, reached } = refusingRouter({ default: 5 as unknown as string });
+    let answers: Awaited<ReturnType<typeof ask>> = [];
+    await logged(async () => { answers = await ask('srv', 'notes'); });
+
+    assert.deepStrictEqual(answers, [{ error: { code: -32603, message: noModelFor('notes'), data: undefined } }]);
+    assert.deepStrictEqual(reached, []);
+  });
+
+  it('refuses when the only matching wildcard is empty and the default is empty, and nothing reaches membrane', async () => {
+    const { ask, reached } = refusingRouter({ default: '', wildcards: { 'memory.*': '' } });
+    let answers: Awaited<ReturnType<typeof ask>> = [];
+    await logged(async () => { answers = await ask('srv', 'memory.consolidation'); });
+
+    assert.deepStrictEqual(answers, [{ error: { code: -32603, message: noModelFor('memory.consolidation'), data: undefined } }]);
+    assert.deepStrictEqual(reached, []);
+  });
+
+  it("never reads a model from Object.prototype for a server's conversation id or feature set", async () => {
+    for (const key of ['constructor', '__proto__', 'toString', 'hasOwnProperty']) {
+      const empty = refusingRouter({ default: '', overrides: {}, byFeature: {} });
+      let answers: Awaited<ReturnType<typeof empty.ask>> = [];
+      await logged(async () => { answers = await empty.ask('srv', key, false, key); });
+      assert.deepStrictEqual(answers, [{ error: { code: -32603, message: noModelFor(key), data: undefined } }], key);
+      assert.deepStrictEqual(empty.reached, [], key);
+
+      const routed = refusingRouter({ default: 'house-default', overrides: {}, byFeature: {} });
+      await logged(async () => { await routed.ask('srv', key, false, key); });
+      assert.deepStrictEqual(routed.reached.map((r) => r.config.model), ['house-default'], key);
+    }
+  });
+
+  it("sends nothing to the provider for a host with no policy, where it sent the model 'default' (the reported 404)", async () => {
+    // As reported: a real Membrane on its Anthropic adapter, the client
+    // replaced so a sent request is recorded rather than answered 404.
+    const sent: Array<{ model?: unknown }> = [];
+    const adapter = new AnthropicAdapter({ apiKey: 'test' } as never);
+    (adapter as unknown as { client: unknown }).client = {
+      messages: {
+        create: async (request: { model?: unknown }) => {
+          sent.push(request);
+          return {
+            id: 'm', type: 'message', role: 'assistant', content: [{ type: 'text', text: 'ok' }],
+            stop_reason: 'end_turn', stop_sequence: null, model: request.model, usage: { input_tokens: 1, output_tokens: 1 },
+          };
+        },
+      },
+    };
+    const router = new InferenceRouter(
+      new Membrane(adapter as never, {} as never),
+      { isInHook: false } as unknown as HookOrchestrator,
+      { validateInbound: () => {} } as unknown as FeatureSetManager,
+      null,
+      () => {},
+    );
+    const answers: unknown[] = [];
+    await logged(async () => {
+      await router.handleInferenceRequest('srv', { featureSet: 'notes', messages: [{ role: 'user', content: 'hi' }] }, {
+        respond: (result) => { answers.push({ result }); },
+        respondError: (code, message) => { answers.push({ code, message }); },
+      });
+    });
+
+    assert.deepStrictEqual(sent.map((r) => r.model), []);
+    assert.deepStrictEqual(answers, [{ code: -32603, message: NO_POLICY }]);
   });
 });

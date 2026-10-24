@@ -592,15 +592,15 @@ for (const queuedBehind of ['the fetch floor', 'a run in flight'] as const) {
         // The last refresh finished just inside the floor, so this one is
         // queued, and runs on its own a few milliseconds later.
         const floor = (AgentFramework as unknown as { MANIFEST_FETCH_FLOOR_MS: number }).MANIFEST_FETCH_FLOOR_MS;
-        h.fw.manifestRefreshState.set('srv', { inFlight: false, queued: false, lastCompletedAt: Date.now() - floor + 20 });
+        h.fw.manifestRefreshState.set(h.connection, { inFlight: false, queued: false, lastCompletedAt: Date.now() - floor + 20 });
         await h.fw.handleManifestChanged(h.connection, announce);
-        assert.equal(h.fw.manifestRefreshState.get('srv').queued, true, 'queued, not run yet');
+        assert.equal(h.fw.manifestRefreshState.get(h.connection).queued, true, 'queued, not run yet');
       } else {
         // The second announcement comes while the first run is in flight, so
         // it's queued, and runs once the fetch floor has passed after it.
         const first = h.fw.handleManifestChanged(h.connection, announce).then(() => null, (error: unknown) => error);
         await h.fw.handleManifestChanged(h.connection, announce);
-        assert.equal(h.fw.manifestRefreshState.get('srv').queued, true, 'queued behind the first');
+        assert.equal(h.fw.manifestRefreshState.get(h.connection).queued, true, 'queued behind the first');
         assert.match(String(await first), /it could not be reaped$/, 'the first run rejects with its failed close');
       }
       await waitFor(

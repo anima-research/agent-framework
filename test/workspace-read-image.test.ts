@@ -444,7 +444,7 @@ test('lexical traversal and symlink escape fail without leaking absolute paths',
   const traversal = await callReadImage(workspace, 'work/../outside/outside.png');
   assert.equal(traversal.success, false);
   assert.equal(traversal.isError, true);
-  assert.equal(traversal.error, 'Path traversal detected: "work/../outside/outside.png" resolves outside mount "work"');
+  assert.equal(traversal.error, 'Path traversal detected: "work/../outside/outside.png" climbs above the root of mount "work".');
   assert.ok(!traversal.error?.includes(root));
 
   const escape = await callReadImage(workspace, 'work/escape.png');

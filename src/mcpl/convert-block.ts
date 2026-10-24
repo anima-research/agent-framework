@@ -43,9 +43,12 @@ export function convertBlock(block: McplContentBlock, provenance: string, server
         // closed, withhold the data (checked BEFORE the data branch).
         return { type: 'text', text: INLINE_WITHHELD_TEXT };
       }
-      if (isFilledString(block.uri) && block.disposition) {
+      if (isFilledString(block.uri) && block.disposition !== undefined) {
         // RFC-005 uri-form media with a disposition claim: stub, do not
-        // hand the URI to the provider or inline it.
+        // hand the URI to the provider or inline it. Any disposition given
+        // is a claim, one the reference rejects included, as classifyBlock
+        // and isInlineContradiction read it: a falsy one such as 0, false
+        // or '' stubs too, rather than sending the URI as the image's source.
         return { type: 'text', text: referenceStubOrNull(block, provenance, serverId) ?? '[reference]' };
       }
       if (isFilledString(block.data) && isFilledString(block.mimeType)) {
@@ -68,9 +71,10 @@ export function convertBlock(block: McplContentBlock, provenance: string, server
         // closed, withhold the data (checked BEFORE the data branch).
         return { type: 'text', text: INLINE_WITHHELD_TEXT };
       }
-      if (isFilledString(block.uri) && block.disposition) {
-        // RFC-005 uri-form media with a disposition claim: stub, do not
-        // hand the URI to the provider or inline it.
+      if (isFilledString(block.uri) && block.disposition !== undefined) {
+        // RFC-005 uri-form media with a disposition claim, a falsy one
+        // included, as for an image (above): stub, do not hand the URI to
+        // the provider or inline it.
         return { type: 'text', text: referenceStubOrNull(block, provenance, serverId) ?? '[reference]' };
       }
       if (isFilledString(block.data) && isFilledString(block.mimeType)) {

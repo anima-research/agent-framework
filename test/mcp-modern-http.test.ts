@@ -123,12 +123,57 @@ test('HTTP: a deadline aborts the request stream, and the server sees the cancel
   await assert.rejects(connection.callTool('slow', { ms: 1500 }), (err: unknown) => {
     assert.ok(err instanceof McplRequestError);
     assert.equal(err.outcome, 'no-response');
-    assert.match(err.message, /Cancellation was requested/);
+    assert.match(err.message, /this host asked it to cancel/);
     return true;
   });
   const deadline = Date.now() + 3000;
   while (!events.includes('slow-aborted') && Date.now() < deadline) await new Promise((r) => setTimeout(r, 20));
   assert.ok(events.includes('slow-aborted'), `server events: ${events.join(', ')}`);
+});
+
+test('HTTP: an argument JSON cannot write is refused before the wire, and raises no connection error (#556)', async (t) => {
+  t.mock.method(console, 'error', () => {});
+  const { url, seen, server } = await startServer(() => true);
+  cleanups.push(() => new Promise<void>((resolve) => { server.closeAllConnections?.(); server.close(() => resolve()); }));
+  const connection = await ModernMcpConnection.connect({ id: 'remote', url, token: 't' });
+  cleanups.push(() => connection.close());
+  const errors: string[] = [];
+  connection.on('error', (error: Error) => errors.push(error.message));
+  const toolCalls = () => seen.filter((s) => s.method === 'POST' && s.mcpMethod === 'tools/call').length;
+  const before = toolCalls();
+  await assert.rejects(connection.callTool('echo', { text: 'x', n: 1n }), (err: unknown) => {
+    assert.ok(err instanceof McplRequestError, String(err));
+    assert.equal(err.outcome, 'not-sent');
+    return true;
+  });
+  assert.equal(toolCalls(), before, 'no tools/call reached the server');
+  assert.deepEqual(errors, []);
+});
+
+test('HTTP: a request the server answers with HTTP 500 is reported once, to its caller and in one log line, not as a connection error (#556)', async (t) => {
+  const lines: string[] = [];
+  t.mock.method(console, 'error', (...args: unknown[]) => lines.push(args.map(String).join(' ')));
+  const { url, server } = await startServer(() => true, (message, res) => {
+    if (message.method !== 'tools/call') return false;
+    res.writeHead(500, { 'content-type': 'text/plain' }).end('boom');
+    return true;
+  });
+  cleanups.push(() => new Promise<void>((resolve) => { server.closeAllConnections?.(); server.close(() => resolve()); }));
+  const connection = await ModernMcpConnection.connect({ id: 'remote', url, token: 't' });
+  cleanups.push(() => connection.close());
+  const failed = (err: unknown) => {
+    assert.ok(err instanceof McplRequestError, String(err));
+    assert.equal(err.outcome, 'no-response');
+    return true;
+  };
+  // With no listener of the host's, the connection logs an 'error' itself,
+  // so a second report would be a second line.
+  await assert.rejects(connection.callTool('echo', { text: 'x' }), failed);
+  assert.deepEqual(lines.filter((line) => line.includes('boom')), ['MCP server "remote" tools/call echo failed with HTTP 500: "Error POSTing to endpoint: boom"']);
+  const errors: string[] = [];
+  connection.on('error', (error: Error) => errors.push(error.message));
+  await assert.rejects(connection.callTool('echo', { text: 'x' }), failed);
+  assert.deepEqual(errors, []);
 });
 
 test('HTTP: a credential the server keeps refusing fails the connect, naming 401', async () => {
@@ -153,7 +198,32 @@ test('HTTP: an auth wall on a call is an error-response with the status in data'
   });
 });
 
-test('HTTP: an auth wall on a later round of a call is a no-response, since the first round may have acted', async () => {
+test("HTTP: an auth wall's status stays this host's number when the server's configuration can't be read", async (t) => {
+  t.mock.method(console, 'error', () => {});
+  let allow = true;
+  let unreadable = false;
+  const { url, server } = await startServer(() => allow);
+  cleanups.push(() => new Promise<void>((resolve) => { server.closeAllConnections?.(); server.close(() => resolve()); }));
+  // An `env` getter that throws, as the framework's own can, makes the
+  // server's text withheld; the status is this host's, not the server's.
+  const config = { id: 'remote', url, token: 't' };
+  Object.defineProperty(config, 'env', { enumerable: true, get: () => { if (unreadable) throw new Error('unreadable'); return undefined; } });
+  const connection = await ModernMcpConnection.connect(config);
+  cleanups.push(() => { unreadable = false; return connection.close(); });
+  allow = false;
+  unreadable = true;
+  await assert.rejects(connection.callTool('echo', { text: 'x' }), (err: unknown) => {
+    assert.ok(err instanceof McplRequestError);
+    assert.equal(err.outcome, 'error-response');
+    // The server's own data is withheld, and the status stays.
+    assert.deepEqual(err.data, { httpStatus: 401 });
+    return true;
+  });
+});
+
+test('HTTP: an auth wall on a later round of a call is a no-response, since the first round may have acted', async (t) => {
+  const consoleLines: string[] = [];
+  t.mock.method(console, 'error', (...args: unknown[]) => consoleLines.push(args.map(String).join(' ')));
   // The SDK server can't be made to ask for another round, so `cont`, which
   // it doesn't list, is answered here: a state-only input_required for the
   // first round, then 401 for every later one.
@@ -179,14 +249,16 @@ test('HTTP: an auth wall on a later round of a call is a no-response, since the 
     // Not the error-response a refused first round gets: the server took
     // the first round, and may have acted on it.
     assert.equal(err.outcome, 'no-response');
-    assert.match(err.message, /asked for another round \(input_required\), and the server refused a later one: HTTP 401/);
+    assert.equal(err.message, 'The "remote" server refused this host access partway through the request, after asking for more, ' +
+      'so whether it took effect is unknown. Check its effect before trying again; if calling it again fails, ask whoever runs this host.');
     return true;
   });
+  assert.ok(consoleLines.some((line) => /^MCP server "remote" refused a later round of tools\/call cont: HTTP 401 \(/.test(line)), consoleLines.join('\n'));
   assert.equal(states[0], undefined, 'the first round carried no state');
   assert.ok(states.length >= 2 && states.slice(1).every((s) => s === 'state-1'), `each later round carried it: ${JSON.stringify(states)}`);
 });
 
-test('HTTP: an echoed path in a tool transport failure is redacted, but a JSON-RPC error is the server answer', async (t) => {
+test("HTTP: an echoed path in a tool transport failure or a JSON-RPC error is redacted in the log and kept from the caller's and the agent's text", async (t) => {
   const consoleLines: string[] = [];
   t.mock.method(console, 'error', (...args: unknown[]) => consoleLines.push(args.map(String).join(' ')));
   const secret = 'pathSecret0123456789';
@@ -194,7 +266,7 @@ test('HTTP: an echoed path in a tool transport failure is redacted, but a JSON-R
   const { url, server } = await startServer(() => true, (message, res) => {
     if (message.method !== 'tools/call') return false;
     if (rpc) {
-      res.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify({ jsonrpc: '2.0', id: message.id, error: { code: -32603, message: secret } }));
+      res.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify({ jsonrpc: '2.0', id: message.id, error: { code: -32603, message: secret, data: { echoed: secret } } }));
     } else {
       res.writeHead(500, { 'content-type': 'text/plain' }).end(`Cannot POST /api/mcp/s/${secret}/mcp`);
     }
@@ -205,19 +277,26 @@ test('HTTP: an echoed path in a tool transport failure is redacted, but a JSON-R
   cleanups.push(() => connection.close());
   await assert.rejects(connection.callTool('echo', {}), (error: unknown) => {
     assert.ok(error instanceof McplRequestError);
-    assert.match(error.message, new RegExp(secret));
+    // The server's words and data reach the caller with the url's
+    // credential redacted, as an error the framework hands a host does.
+    assert.equal(error.message, 'The "remote" server answered with an error: redacted');
+    assert.deepEqual(error.data, { echoed: 'redacted' });
     assert.equal(error.outcome, 'error-response');
     return true;
   });
   rpc = false;
   await assert.rejects(connection.callTool('echo', {}), (error: unknown) => {
     assert.ok(error instanceof McplRequestError);
-    assert.match(error.message, /Cannot POST \/api\/mcp\/s\/redacted\/mcp/);
-    assert.ok(!error.message.includes(secret));
+    // The transport's words are the operator's: the log has them, redacted.
+    assert.equal(error.message, 'The request to the "remote" server failed before an answer came back, so whether it took effect is unknown. ' +
+      'Check its effect before trying again.');
     assert.equal(error.outcome, 'no-response');
     return true;
   });
-  assert.ok(consoleLines.some(line => line.includes('Cannot POST /api/mcp/s/redacted/mcp')));
+  // The status is only in the SDK's error, so the log names it.
+  assert.ok(consoleLines.some(line => /^MCP server "remote" tools\/call echo failed with HTTP 500: .*Cannot POST \/api\/mcp\/s\/redacted\/mcp/.test(line)), consoleLines.join('\n'));
+  // The answer's log line is a record of the server's text, so it's redacted.
+  assert.ok(consoleLines.includes('MCP server "remote" answered tools/call echo with error -32603: redacted'), consoleLines.join('\n'));
   assert.ok(!consoleLines.join('\n').includes(secret));
   const dir = mkdtempSync(join(tmpdir(), 'mcp-tool-transport-'));
   const framework = await AgentFramework.create({
@@ -229,7 +308,7 @@ test('HTTP: an echoed path in a tool transport failure is redacted, but a JSON-R
   try {
     const result = await framework.executeToolCall({ id: 'echo-failed', name: 'mcpl--remote--echo', input: {} });
     assert.equal(result.success, false);
-    assert.match(result.error!, /Cannot POST \/api\/mcp\/s\/redacted\/mcp/);
+    assert.match(result.error!, /^The request to the "remote" server failed before an answer came back/);
     assert.ok(!JSON.stringify(result).includes(secret), 'the model-facing tool result contains no path credential');
   } finally {
     await framework.stop();
@@ -248,7 +327,7 @@ test("HTTP: a 403 refusal's response body, which can echo the url, stays out of 
   connection.id = 'remote';
   connection.config = { id: 'remote', url: 'https://h/api/mcp/s/pathSecret0123456789/mcp' };
   const refusal = new SdkHttpError(SdkErrorCode.ClientHttpForbidden, 'Server returned 403 insufficient_scope', {
-    status: 403, statusText: 'Forbidden', text: 'denied for /api/mcp/s/pathSecret0123456789/mcp',
+    status: 403, statusText: 'Forbidden for /api/mcp/s/pathSecret0123456789/mcp', text: 'denied for /api/mcp/s/pathSecret0123456789/mcp',
   });
   const err = connection.requestFailure('tools/call "echo"', { method: 'tools/call', handedOff: true, answer: 'none' }, refusal);
   assert.ok(err instanceof McplRequestError);

@@ -25,6 +25,7 @@ import { WorkspaceModule, WorkspaceReadError } from '../src/modules/workspace/in
 import { checkDir, readPath, type MountView } from '../src/modules/workspace/observe.js';
 import { EffectFailed, unlinkContained, writeContained } from '../src/modules/workspace/effects.js';
 import { MountWatcher, type FsChange } from '../src/modules/workspace/watcher.js';
+import { changesFlow, isProbe } from './helpers/watcher-flow.js';
 import type { MountConfig } from '../src/modules/workspace/types.js';
 import type { ModuleContext } from '../src/types/module.js';
 
@@ -67,8 +68,8 @@ function mount(name: string, path: string, extra: Partial<MountConfig> = {}): Mo
   return { name, path, mode: 'read-write', watch: 'never', autoMaterialize: false, ...extra };
 }
 
-async function call(m: WorkspaceModule, name: string, input: Record<string, unknown>): Promise<{ success: boolean; error?: string; data?: any }> {
-  return m.handleToolCall({ id: 't', name, input }) as Promise<{ success: boolean; error?: string; data?: any }>;
+async function call(m: WorkspaceModule, name: string, input: Record<string, unknown>): Promise<{ success: boolean; error?: string; data?: any; structured?: any }> {
+  return m.handleToolCall({ id: 't', name, input }) as Promise<{ success: boolean; error?: string; data?: any; structured?: any }>;
 }
 
 /** The refusal a file tool gives a path that reaches a nested mount's directory through a link the mount follows. */
@@ -80,7 +81,7 @@ function leadsInto(path: string, outer: string, inner: string, use: string): str
 async function readsBack(m: WorkspaceModule, path: string, text: string): Promise<void> {
   const read = await call(m, 'read', { path });
   assert.equal(read.success, true, `${path}: ${read.error}`);
-  assert.match(read.data.content, new RegExp(text), path);
+  assert.match(read.structured.content, new RegExp(text), path);
 }
 
 /** The skipped reason for a path in a materialize's or a sync's result. */
@@ -340,7 +341,7 @@ describe('a link into a nested mount\'s directory, on a mount that follows symli
     await readsBack(m, 'inner/x.txt', 'inner file');
     const top = await call(m, 'read', { path: 'work/l/top.txt' });
     assert.equal(top.success, true, top.error);
-    assert.match(top.data.content, /outer file under a/);
+    assert.match(top.structured.content, /outer file under a/);
     for (const [path, use] of [['work/l/b/new.txt', 'inner/new.txt'], ['work/l/b/deep/new.txt', 'inner/deep/new.txt']] as const) {
       const write = await call(m, 'write', { path, content: 'via work\n' });
       assert.equal(write.error, leadsInto(path, 'work', 'inner', use));
@@ -419,8 +420,8 @@ describe('a link into a nested mount\'s directory, on a mount that follows symli
     assert.equal(read.error, leadsInto('outer/flink.txt', 'outer', 'inner', 'inner/x.txt'));
     for (const path of ['outer', 'outer/flink.txt']) {
       const grep = await call(m, 'grep', { pattern: 'copy', path });
-      assert.deepEqual(grep.data.results, [], `grep of ${path} searched none of the copy held from before`);
-      assert.deepEqual(grep.data.skipped, [{ file: 'outer/flink.txt', reason: leadsInto('outer/flink.txt', 'outer', 'inner', 'inner/x.txt') }], path);
+      assert.deepEqual(grep.structured.results, [], `grep of ${path} searched none of the copy held from before`);
+      assert.deepEqual(grep.structured.skipped, [{ file: 'outer/flink.txt', reason: leadsInto('outer/flink.txt', 'outer', 'inner', 'inner/x.txt') }], path);
     }
     // A write made now, with the link in place, is refused at the tool
     // (anima-research/agent-framework#530's third case).
@@ -459,8 +460,8 @@ describe('a link into a nested mount\'s directory, on a mount that follows symli
     }, () => call(m, 'grep', { pattern: 'main|OTHER', path: 'work' }));
     assert.ok(switched, 'a branch was selected while grep asked');
     const settled = await call(m, 'grep', { pattern: 'main|OTHER', path: 'work' });
-    assert.notEqual(settled.data.results[0]?.state, 'synced', "z.txt's state on the other branch isn't main's");
-    assert.deepEqual(grep.data.results, settled.data.results, "grep gave the other branch's text with that branch's states");
+    assert.notEqual(settled.structured.results[0]?.state, 'synced', "z.txt's state on the other branch isn't main's");
+    assert.deepEqual(grep.structured.results, settled.structured.results, "grep gave the other branch's text with that branch's states");
   });
 
   for (const autoMaterialize of [false, true]) test(`a draft made before a file link into it took the path's place gets the path to use from a push, unforced and forced (autoMaterialize ${autoMaterialize})`, async (t) => {
@@ -558,6 +559,8 @@ describe('a link into a nested mount\'s directory, on a mount that follows symli
       const res = await call(m, name, input);
       assert.equal(res.error, leadsInto(String(input.path), 'outer', 'inner', `inner/${String(input.path).slice('outer/alias/'.length)}`), name);
     }
+    const many = await call(m, 'edit_many', { edits: [{ path: 'outer/alias/x.txt', oldString: 'old', newString: 'outer-edited' }] });
+    assert.equal(many.error, `The edit_many call stored none of its edits: 1 problem.\n\nedit 1: ${leadsInto('outer/alias/x.txt', 'outer', 'inner', 'inner/x.txt')}`);
     assert.equal(existsSync(env.at('outer/a/b/y.txt')), false);
     assert.equal(readFileSync(env.at('outer/a/b/x.txt'), 'utf8'), 'inner v2\n');
   });
@@ -741,15 +744,19 @@ describe('a watcher of a mount configured as a relative path', () => {
     const env = new Env(t);
     mkdirSync(env.at('m'));
     const path = `./${relative(process.cwd(), env.at('m'))}`;
-    const changes: FsChange[] = [];
+    const batches: FsChange[][] = [];
     let ready = false;
-    const watcher = new MountWatcher({ name: 'm', path, mode: 'read-write', watch: 'always', watchDebounceMs: 50 }, (batch) => changes.push(...batch), { onReady: () => { ready = true; } });
+    const watcher = new MountWatcher({ name: 'm', path, mode: 'read-write', watch: 'always', watchDebounceMs: 50 }, (batch) => batches.push(batch), { onReady: () => { ready = true; } });
     watcher.start();
     t.after(() => watcher.stop());
     for (let i = 0; i < 400 && !ready; i++) await new Promise((r) => setTimeout(r, 25));
     assert.equal(ready, true, 'the watcher is ready');
+    // On macOS a write right after onReady can come before the platform
+    // delivers events, and goes unreported, so the test waits until they flow.
+    await changesFlow(env.at('m'), batches, []);
     writeFileSync(env.at('m/x.txt'), 'x\n');
-    for (let i = 0; i < 400 && !changes.some((c) => c.path === 'x.txt'); i++) await new Promise((r) => setTimeout(r, 25));
-    assert.ok(changes.some((c) => c.path === 'x.txt'), `heard: ${JSON.stringify(changes)}`);
+    const heard = () => batches.flat().some((c) => c.path === 'x.txt');
+    for (let i = 0; i < 400 && !heard(); i++) await new Promise((r) => setTimeout(r, 25));
+    assert.ok(heard(), `heard: ${JSON.stringify(batches.flat().filter((c) => !isProbe(c.path)))}`);
   });
 });

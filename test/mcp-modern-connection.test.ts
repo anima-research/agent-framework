@@ -113,8 +113,7 @@ test('a deadline requests cancellation and reports no-response, outcome unknown'
   await assert.rejects(connection.callTool('slow', { ms: 20_000 }), (err: unknown) => {
     assert.ok(err instanceof McplRequestError);
     assert.equal(err.outcome, 'no-response');
-    assert.match(err.message, /did not answer tools\/call "slow" within 300ms/);
-    assert.match(err.message, /Cancellation was requested; the outcome is unknown/);
+    assert.match(err.message, /^The "modern" server didn't answer within 0\.3 seconds, so whether the request took effect is unknown: this host asked it to cancel/);
     return true;
   });
   assert.ok(!lines(join(dir, 'events.log')).includes('slow-finished'), 'rejected at the deadline, not at the tool\'s end');
@@ -200,6 +199,8 @@ test('configuration mistakes throw before anything is launched', async () => {
   const dir = scratch();
   const refused: Array<[Partial<McplServerConfig>, RegExp]> = [
     [{ requestTimeoutMs: 0 }, /requestTimeoutMs must be an integer/],
+    // A deadline JSON can hold and String() can't print is refused like any other.
+    [{ requestTimeoutMs: JSON.parse('{"toString": 1}') }, /requestTimeoutMs must be an integer from 1 to 2147483647 for a modern server \(got \[a value that cannot be printed\]\)/],
     [{ protocol: undefined }, /not configured for modern MCP/],
     [{ token: 't' }, /"token" applies only to a network \(url\) server/],
     [{ url: 'https://x.invalid/mcp' }, /"command" and "url" are both set/],

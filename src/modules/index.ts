@@ -21,6 +21,7 @@ export type {
   ReadInput,
   WriteInput,
   EditInput,
+  EditManyInput,
   DeleteInput,
   LsInput,
   GlobInput,

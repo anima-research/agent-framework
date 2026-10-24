@@ -40,11 +40,19 @@ export class McplServerRegistry {
    * confirmed exited stays registered all the same, as the closed connection
    * that owns it ({@link McplUnreapedLaunchError}), so the id stays held
    * and removeServer can retry the reap.
+   *
+   * `onRegister` runs with the connection the connect resolved with, a
+   * reconnecting stub's included, synchronously just before it is
+   * registered, so what it records about the connection is in place before
+   * anything that reads the registry can see it. A failed launch registered
+   * as its child's owner doesn't run it. It must not throw: it runs before
+   * the registry owns the connection, so nothing would close it.
    */
   async addServer(
     config: McplServerConfig,
     hostCapabilities: McplHostCapabilities,
     signal?: AbortSignal,
+    onRegister?: (connection: McplServerConnection) => void,
   ): Promise<McplServerConnection> {
     if (this.servers.has(config.id) || this.adding.has(config.id)) {
       throw new Error(`MCPL server "${config.id}" is already registered`);
@@ -62,6 +70,7 @@ export class McplServerRegistry {
     } finally {
       this.adding.delete(config.id);
     }
+    onRegister?.(connection);
     this.register(config, connection);
     return connection;
   }

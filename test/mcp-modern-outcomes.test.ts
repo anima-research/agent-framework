@@ -6,7 +6,8 @@
  * - an SDK-local rejection before dispatch is `not-sent` (0 calls on the wire);
  * - a result that fails validation is an answer that can't be used (1 call,
  *   answered), never a claimed server error;
- * - a JSON-RPC error on the wire is `error-response` with its code and data;
+ * - a JSON-RPC error on the wire is `error-response` with its data, and its
+ *   code goes to the log line;
  * - a call that ends after an `input_required` answer, before a final one, is
  *   `no-response`: at the deadline (with nothing in flight to cancel), with
  *   the connection gone, or when this client can't go on (PR #262 review);
@@ -22,7 +23,7 @@ import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import { SdkError, SdkErrorCode, SdkHttpError, UnsupportedProtocolVersionError } from '@modelcontextprotocol/client';
+import { Client, SdkError, SdkErrorCode, SdkHttpError, UnsupportedProtocolVersionError } from '@modelcontextprotocol/client';
 import { ModernMcpConnection } from '../src/mcpl/modern-connection.js';
 import { StdioTransport } from '../src/mcpl/transport.js';
 import { McplProtocolVersionError, McplRequestError } from '../src/mcpl/server-connection.js';
@@ -39,6 +40,24 @@ afterEach(async () => {
   while (cleanups.length) await cleanups.pop()!();
 });
 
+/** The host's log lines (console.error) from here to the test's end. Call
+ *  it before connecting, so it's restored after the connection closes. */
+function hostLog(): string[] {
+  const lines: string[] = [];
+  const original = console.error;
+  console.error = (...args: unknown[]) => { lines.push(args.map(String).join(' ')); };
+  cleanups.push(() => { console.error = original; });
+  return lines;
+}
+
+/** Whether one of `lines` matches `pattern`, for an assertion's message too. */
+const loggedLine = (lines: string[], pattern: RegExp) => assert.ok(lines.some((line) => pattern.test(line)), `${pattern} in:\n${lines.join('\n')}`);
+
+/** A live connection's transport under the observed boundary, to stand in
+ *  for its sends and its reports. */
+const innerOf = (connection: ModernMcpConnection) =>
+  (connection as unknown as { session: { wire: { inner: { onerror: (error: Error) => void; send: (...args: unknown[]) => Promise<void> } } } }).session.wire.inner;
+
 function scratchLog(): string {
   const dir = mkdtempSync(join(tmpdir(), 'modern-raw-'));
   cleanups.push(() => rmSync(dir, { recursive: true, force: true }));
@@ -49,9 +68,23 @@ const wire = (log: string): LogEntry[] =>
   existsSync(log) ? readFileSync(log, 'utf8').split('\n').filter(Boolean).map((l) => JSON.parse(l) as LogEntry) : [];
 const calls = (log: string, tool: string) => wire(log).filter((e) => e.method === 'tools/call' && e.tool === tool).length;
 
-async function until(cond: () => boolean, what: string, ms = 5000): Promise<void> {
-  const deadline = Date.now() + ms;
-  while (!cond() && Date.now() < deadline) await new Promise((r) => setTimeout(r, 20));
+/**
+ * How long an `until` gives its event before it fails, naming what it
+ * awaited. It's sized for a hang, not for speed: no `until` here asserts how
+ * fast something happens, and the tests that do measure it themselves. A
+ * bound a few seconds above a designed duration (a launch's start and
+ * handshake, the transport's 2 s grace after SIGTERM and again after
+ * SIGKILL) can fail a correct run on a loaded machine; this one fails it
+ * only if the event is held back a whole minute. As the coalescing fixture's
+ * REPLY_DEADLINE_MS does, it turns a wait that never ends into a failure
+ * that names it, well inside the suite's own test timeout.
+ */
+const WAIT_MS = 60_000;
+
+async function until(cond: () => boolean, what: string): Promise<void> {
+  // The monotonic clock: a wall-clock step must not fail a wait that's on schedule.
+  const deadline = performance.now() + WAIT_MS;
+  while (!cond() && performance.now() < deadline) await new Promise((r) => setTimeout(r, 20));
   assert.ok(cond(), `in time: ${what}`);
 }
 
@@ -68,31 +101,227 @@ async function connect(flags: string, log: string, extra: Partial<McplServerConf
 }
 
 test('an outputSchema the SDK cannot compile rejects before dispatch: not-sent, nothing on the wire', async () => {
+  const logged = hostLog();
   const log = scratchLog();
   const connection = await connect('invalid-schema', log);
   await connection.listTools();
   await assert.rejects(connection.callTool('op', {}), (err: unknown) => {
     assert.ok(err instanceof McplRequestError, String(err));
     assert.equal(err.outcome, 'not-sent');
-    assert.match(err.message, /tools\/call "op" was not sent: .*invalid outputSchema/);
+    assert.equal(err.message, 'The request wasn\'t sent: this host couldn\'t send it to the "raw" server, so nothing ran. ' +
+      'If calling it again fails, ask whoever runs this host.');
     return true;
   });
+  loggedLine(logged, /^MCP server "raw" tools\/call op not sent: .*invalid outputSchema/);
   assert.equal(calls(log, 'op'), 0);
 });
 
+test('an argument JSON cannot write is refused before the wire: not-sent, nothing on the wire (#556)', async () => {
+  const logged = hostLog();
+  const log = scratchLog();
+  const connection = await connect('', log);
+  await connection.listTools();
+  const cyclic: Record<string, unknown> = {};
+  cyclic.self = cyclic;
+  for (const [args, why] of [[{ n: 1n }, /serialize a BigInt/], [cyclic, /circular structure/]] as const) {
+    await assert.rejects(connection.callTool('op', args), (err: unknown) => {
+      assert.ok(err instanceof McplRequestError, String(err));
+      assert.equal(err.outcome, 'not-sent');
+      assert.equal(err.message, 'The request wasn\'t sent: this host couldn\'t send it to the "raw" server, so nothing ran. ' +
+        'If calling it again fails, ask whoever runs this host.');
+      return true;
+    });
+    loggedLine(logged, new RegExp(`^MCP server "raw" tools/call op not sent: .*${why.source}`));
+  }
+  assert.equal(calls(log, 'op'), 0);
+});
+
+test("a send's own failure is its call's to report, and anything else its transport reports still reaches 'error' (#556)", async () => {
+  hostLog();
+  const log = scratchLog();
+  const connection = await connect('', log);
+  const errors: string[] = [];
+  connection.on('error', (error: Error) => errors.push(error.message));
+  const inner = innerOf(connection);
+  const realSend = inner.send.bind(inner);
+  // Out of band, with no send in flight: reported at once.
+  inner.onerror(new Error('out of band'));
+  assert.deepEqual(errors, ['out of band']);
+  // As the SDK's HTTP send does: the failure reported, then thrown. The call
+  // reports what its send threw; whatever else came meanwhile is reported
+  // once the send has settled, and what comes later, as from a stream the
+  // send opened, at once.
+  const thrown = new Error('the send failed');
+  inner.send = async () => {
+    setTimeout(() => inner.onerror(new Error('after the send')), 20);
+    inner.onerror(new Error('beside the send'));
+    inner.onerror(thrown);
+    throw thrown;
+  };
+  await assert.rejects(connection.callTool('plain', {}), (err: unknown) => {
+    assert.ok(err instanceof McplRequestError, String(err));
+    assert.equal(err.outcome, 'no-response');
+    return true;
+  });
+  assert.deepEqual(errors, ['out of band', 'beside the send']);
+  await until(() => errors.length === 3, 'the later report');
+  assert.deepEqual(errors, ['out of band', 'beside the send', 'after the send']);
+  // A send that goes out: what its transport reported meanwhile is reported
+  // once it has.
+  inner.send = async (...args: unknown[]) => {
+    inner.onerror(new Error('beside a send that went out'));
+    return realSend(...args);
+  };
+  assert.deepEqual((await connection.callTool('plain', {})).content, [{ type: 'text', text: 'plain' }]);
+  assert.deepEqual(errors.slice(3), ['beside a send that went out']);
+});
+
+/** A live connection's observed boundary, to send through it directly. */
+const observedOf = (connection: ModernMcpConnection) =>
+  (connection as unknown as { session: { wire: { send: (message: unknown) => Promise<void> } } }).session.wire;
+
+test("a request or a response that isn't a call's leaves what its send threw to its sender too, as the connect and the SDK report it themselves (#556)", async () => {
+  hostLog();
+  const connection = await connect('', scratchLog());
+  const errors: string[] = [];
+  connection.on('error', (error: Error) => errors.push(error.message));
+  const inner = innerOf(connection);
+  // As the SDK's HTTP send does: the failure reported, then thrown.
+  inner.send = async (message: unknown) => {
+    const what = (message as { method?: string }).method ?? 'the response';
+    inner.onerror(new Error(`beside ${what}`));
+    const failed = new Error(`${what} failed`);
+    inner.onerror(failed);
+    throw failed;
+  };
+  await assert.rejects(observedOf(connection).send({ jsonrpc: '2.0', id: 'd1', method: 'server/discover', params: {} }), /^Error: server\/discover failed$/);
+  await assert.rejects(observedOf(connection).send({ jsonrpc: '2.0', id: 7, result: {} }), /^Error: the response failed$/);
+  assert.deepEqual(errors, ['beside server/discover', 'beside the response']);
+});
+
+test("a notification's send keeps what its transport reports, its own failure included, at once even during a call's send, since its sender can swallow what it throws (#556)", async () => {
+  hostLog();
+  const connection = await connect('', scratchLog());
+  const errors: string[] = [];
+  connection.on('error', (error: Error) => errors.push(error.message));
+  const observed = observedOf(connection);
+  const inner = innerOf(connection);
+  const cancel = { jsonrpc: '2.0', method: 'notifications/cancelled', params: { requestId: 1 } };
+  let notifications = 0;
+  let whileInFlight: string[] | undefined;
+  inner.send = async (message: unknown) => {
+    if ((message as { id?: unknown }).id === undefined) {
+      // As the SDK's HTTP send does: the failure reported, then thrown, and
+      // later a report from work the send started, as from a stream.
+      const n = ++notifications;
+      setTimeout(() => inner.onerror(new Error(`after notification ${n}`)), 20);
+      const failed = new Error(`notification ${n} failed`);
+      inner.onerror(failed);
+      throw failed;
+    }
+    // A call's send, during which a notification fails, its sender
+    // swallowing what it throws, as the SDK's listen teardown does.
+    await observed.send(cancel).catch(() => {});
+    await until(() => errors.includes('after notification 2'), "the later report of the call's notification");
+    whileInFlight = [...errors];
+    throw new Error("the call's send failed");
+  };
+  await assert.rejects(observed.send(cancel), /^Error: notification 1 failed$/);
+  await until(() => errors.includes('after notification 1'), "the notification's later report");
+  assert.deepEqual(errors, ['notification 1 failed', 'after notification 1']);
+  await assert.rejects(connection.callTool('plain', {}), (err: unknown) => err instanceof McplRequestError && err.outcome === 'no-response');
+  const all = ['notification 1 failed', 'after notification 1', 'notification 2 failed', 'after notification 2'];
+  assert.deepEqual(whileInFlight, all, "reported while the call's send was still in flight");
+  assert.deepEqual(errors, all);
+});
+
+test('a call\'s arguments go out as the caller wrote them, JSON.rawJSON numbers included (#556)', { skip: typeof (JSON as unknown as { rawJSON?: unknown }).rawJSON !== 'function' && 'JSON.rawJSON needs Node 21 or later' }, async () => {
+  hostLog();
+  const connection = await connect('', scratchLog());
+  const inner = innerOf(connection);
+  const realSend = inner.send.bind(inner);
+  const written: string[] = [];
+  inner.send = async (...args: unknown[]) => {
+    written.push(JSON.stringify(args[0]));
+    return realSend(...args);
+  };
+  const rawJSON = (JSON as unknown as { rawJSON: (text: string) => unknown }).rawJSON;
+  assert.deepEqual((await connection.callTool('plain', { id: rawJSON('9007199254740993'), huge: rawJSON('1e400') })).content, [{ type: 'text', text: 'plain' }]);
+  const call = written.find((line) => line.includes('"tools/call"'));
+  assert.ok(call?.includes('"arguments":{"id":9007199254740993,"huge":1e400}'), String(call));
+});
+
+test("another connection's report, made during this connection's send, is that connection's, at once (#556)", async () => {
+  hostLog();
+  const a = await connect('', scratchLog());
+  const b = await connect('', scratchLog());
+  const aErrors: string[] = [];
+  const bErrors: string[] = [];
+  a.on('error', (error: Error) => aErrors.push(error.message));
+  b.on('error', (error: Error) => bErrors.push(error.message));
+  const aInner = innerOf(a);
+  const bInner = innerOf(b);
+  let whileInFlight: string[] | undefined;
+  aInner.send = async () => {
+    bInner.onerror(new Error("b's report"));
+    whileInFlight = [...bErrors];
+    throw new Error("a's send failed");
+  };
+  await assert.rejects(a.callTool('plain', {}));
+  assert.deepEqual(whileInFlight, ["b's report"], "reported while a's send was still in flight");
+  assert.deepEqual(bErrors, ["b's report"]);
+  assert.deepEqual(aErrors, []);
+});
+
+test('each send holds only what its own transport reported during it, so overlapping sends each leave their own failure to their call (#556)', async () => {
+  hostLog();
+  const connection = await connect('', scratchLog());
+  const errors: string[] = [];
+  connection.on('error', (error: Error) => errors.push(error.message));
+  const inner = innerOf(connection);
+  let release!: () => void;
+  const gate = new Promise<void>((resolve) => { release = resolve; });
+  let sends = 0;
+  inner.send = async () => {
+    if (++sends === 1) {
+      inner.onerror(new Error('beside the first'));
+      await gate;
+      const first = new Error('the first send failed');
+      inner.onerror(first);
+      throw first;
+    }
+    const second = new Error('the second send failed');
+    inner.onerror(second);
+    throw second;
+  };
+  const first = connection.callTool('plain', {}).then(() => 'answered', (error: unknown) => error);
+  await until(() => sends === 1, 'the first send');
+  // The second send starts and ends while the first is still in flight.
+  await assert.rejects(connection.callTool('plain', {}), (err: unknown) => err instanceof McplRequestError && err.outcome === 'no-response');
+  assert.deepEqual(errors, [], "the second's failure is its call's, and the first's report waits for the first");
+  release();
+  const ended = await first;
+  assert.ok(ended instanceof McplRequestError && ended.outcome === 'no-response', String(ended));
+  assert.deepEqual(errors, ['beside the first']);
+});
+
 test('a result that fails its outputSchema was answered: a plain error, not a server error', async () => {
+  const logged = hostLog();
   const log = scratchLog();
   const connection = await connect('', log);
   await connection.listTools();
   await assert.rejects(connection.callTool('op', {}), (err: unknown) => {
     assert.ok(!(err instanceof McplRequestError), 'no request outcome is claimed');
-    assert.match((err as Error).message, /answered tools\/call "op", but the result can't be used: .*output schema/);
+    assert.equal((err as Error).message, 'The "raw" server answered, but not in a form this host can read, so whether the request took effect ' +
+      'is unknown. Check its effect before trying again.');
     return true;
   });
+  loggedLine(logged, /^MCP server "raw" answered tools\/call op with a result this host can't use: .*output schema/);
   assert.equal(calls(log, 'op'), 1);
 });
 
-test('a JSON-RPC error on the wire is error-response with its data, and its code in the message', async () => {
+test("a JSON-RPC error on the wire is error-response with its data, the server's words in the message, and its code in the log", async () => {
+  const logged = hostLog();
   const log = scratchLog();
   const connection = await connect('', log);
   await connection.listTools();
@@ -100,9 +329,10 @@ test('a JSON-RPC error on the wire is error-response with its data, and its code
     assert.ok(err instanceof McplRequestError);
     assert.equal(err.outcome, 'error-response');
     assert.deepEqual(err.data, { why: 'on purpose' });
-    assert.match(err.message, /returned error for tools\/call "err": \[-32603\] boom/);
+    assert.equal(err.message, 'The "raw" server answered with an error: boom');
     return true;
   });
+  loggedLine(logged, /^MCP server "raw" answered tools\/call err with error -32603: boom$/);
   // The plain call on the same connection is unaffected.
   assert.deepEqual((await connection.callTool('plain', {})).content, [{ type: 'text', text: 'plain' }]);
 });
@@ -160,6 +390,115 @@ test('with reconnect, a child that exits during the connect-time subscribe is a 
 });
 
 /**
+ * The first launch from here on, as the transport its spawn yields: whether
+ * its pipe has failed, and when it reports its child unreaped. With `stuck`,
+ * no signal reaches the child, so it outlives SIGTERM and SIGKILL, and
+ * cleanup really ends it.
+ */
+function firstLaunch(stuck: boolean): { readonly pid: number; pipeFailed: () => Promise<void>; unreaped: Promise<void> } {
+  const realSpawn = StdioTransport.spawn;
+  let first: StdioTransport | null = null;
+  let markUnreaped!: () => void;
+  const unreaped = new Promise<void>((resolve) => { markUnreaped = resolve; });
+  (StdioTransport as unknown as { spawn: typeof StdioTransport.spawn }).spawn = async (config) => {
+    const transport = await realSpawn.call(StdioTransport, config);
+    if (first) return transport;
+    first = transport;
+    transport.once('unreaped', () => markUnreaped());
+    if (stuck) {
+      const child = (transport as unknown as { child: { pid: number; kill: (signal?: string) => boolean } }).child;
+      const realKill = child.kill.bind(child);
+      child.kill = () => true; // signals never arrive: the child outlives both bounds
+      cleanups.push(async () => {
+        realKill('SIGKILL');
+        await until(() => !alive(child.pid), 'the stuck child killed');
+      });
+    }
+    return transport;
+  };
+  cleanups.push(() => { (StdioTransport as unknown as { spawn: typeof StdioTransport.spawn }).spawn = realSpawn; });
+  return {
+    get pid() {
+      assert.ok(first, 'a launch');
+      return (first as unknown as { child: { pid: number } }).child.pid;
+    },
+    pipeFailed: () => until(() => first?.pipeFailure !== undefined, "the launch's pipe to fail"),
+    unreaped,
+  };
+}
+
+/**
+ * The connect-time list-change subscribe, failed once `when` settles, as a
+ * subscribe whose acknowledgement never comes fails at its timeout: the SDK
+ * reports it and resolves the connect anyway. It's still written; only its
+ * end moves, to the event a test is about.
+ */
+function failSubscribeWhen(when: Promise<unknown>): void {
+  const real = Client.prototype.listen;
+  Client.prototype.listen = function (this: Client, ...args: Parameters<Client['listen']>) {
+    const listening = real.apply(this, args);
+    listening.catch(() => { /* it ends later, at its own timeout or the client's close */ });
+    return Promise.race([listening, when.then(() => { throw new Error('no acknowledgement came'); })]);
+  };
+  cleanups.push(() => { Client.prototype.listen = real; });
+}
+
+test("a connect whose stdio pipe failed, and whose child was found unreaped before the connect resolved, fails holding the launch, rather than reading as connected", async () => {
+  const log = scratchLog();
+  const launch = firstLaunch(true);
+  // The subscribe went to a child that had closed its stdin, so it's never
+  // acknowledged. It ends once the transport has found the child unreaped,
+  // when there was no session yet to lose.
+  failSubscribeWhen(launch.unreaped);
+  const connection = ModernMcpConnection.create({ id: 'raw', command: process.execPath, args: [SERVER, 'deaf-at-discover', log], protocol: 'modern' });
+  cleanups.push(() => connection.close());
+  const errors: string[] = [];
+  connection.on('error', (error: Error) => errors.push(error.message));
+  const closes: unknown[] = [];
+  connection.on('close', (info: unknown) => closes.push(info));
+  await assert.rejects(connection.start(), /^Error: MCP server "raw" stdio pipe failed with write EPIPE while connecting$/);
+  assert.equal(connection.isConnected, false);
+  assert.equal(connection.holdsUnreapedChild, true);
+  // The hold is reported once, by the connect's own cleanup.
+  const held = errors.filter((m) => /Not starting another launch while it may still be running/.test(m));
+  assert.equal(held.length, 1, errors.join('\n'));
+  assert.match(held[0]!, /^MCP server "raw": stdio child \d+ of MCP server "raw" did not exit within 2000ms of SIGKILL; it could not be reaped\. /);
+  assert.deepEqual(closes, [], 'it never connected, so nothing closed');
+  assert.equal(wire(log).filter((e) => e.event === 'start').length, 1, 'one launch');
+  // close() retries the reap: refused while the child runs, then done.
+  await assert.rejects(connection.close(), /could not be reaped/);
+  process.kill(launch.pid, 'SIGKILL');
+  await until(() => !alive(launch.pid), 'the child to be killed');
+  await connection.close();
+  assert.equal(connection.holdsUnreapedChild, false);
+});
+
+test("a connect whose stdio pipe failed fails even when it resolves while its child is still running and unreported: the check reads the pipe", async () => {
+  const log = scratchLog();
+  const launch = firstLaunch(false);
+  // The subscribe ends as soon as the pipe has failed. The child ignores
+  // SIGTERM, so it runs until SIGKILL, 2 s on, and nothing has reported it.
+  let runningAtEnd: boolean | undefined;
+  failSubscribeWhen(launch.pipeFailed().then(() => { runningAtEnd = alive(launch.pid); }));
+  const connection = ModernMcpConnection.create({ id: 'raw', command: process.execPath, args: [SERVER, 'deaf-at-discover,ignore-sigterm', log], protocol: 'modern' });
+  cleanups.push(() => connection.close());
+  connection.on('error', () => { /* the subscribe's failure, reported by the SDK */ });
+  await assert.rejects(connection.start(), /^Error: MCP server "raw" stdio pipe failed with write EPIPE while connecting$/);
+  assert.equal(runningAtEnd, true, 'the child was still running when the subscribe ended');
+  assert.equal(connection.isConnected, false);
+  assert.equal(connection.holdsUnreapedChild, false);
+  assert.equal(alive(launch.pid), false, "gone once the connect failed: the connect's close reaped it");
+});
+
+test("a connect whose stdio pipe failed reads that way when the failure has already ended the child", async () => {
+  const log = scratchLog();
+  // The subscribe meets EPIPE, the transport ends the child with SIGTERM,
+  // and the close ends the subscribe.
+  await assert.rejects(connect('deaf-at-discover', log), /^Error: MCP server "raw" stdio pipe failed with write EPIPE while connecting$/);
+  assert.equal(wire(log).filter((e) => e.event === 'start').length, 1, 'one launch');
+});
+
+/**
  * The stdio line under a connection's live session, reached from inside, to
  * stand for a loss read from a failed pipe while the child still runs: the
  * transport closes before the child has exited (R1-1).
@@ -207,7 +546,7 @@ test('a lost transport whose child can\'t be reaped halts reconnecting (R1-1)', 
     await until(() => !alive(line.child.pid), 'the held child killed');
   });
   line.markClosed({ reason: 'stdio pipe failed' });
-  await until(() => errors.some((m) => /Not starting another launch while it may still be running/.test(m)), 'the launch held as unreaped', 8000);
+  await until(() => errors.some((m) => /Not starting another launch while it may still be running/.test(m)), 'the launch held as unreaped');
   assert.equal(connection.willReconnect, false);
   // No later attempt will come, so the halt is a permanent failure, which the
   // framework raises as an alert.
@@ -232,7 +571,7 @@ test("without reconnect, a lost transport whose child can't be reaped is a perma
     await until(() => !alive(line.child.pid), 'the held child killed');
   });
   line.markClosed({ reason: 'stdio pipe failed' });
-  await until(() => failures.length > 0, 'the permanent failure', 8000);
+  await until(() => failures.length > 0, 'the permanent failure');
   assert.equal(failures[0]!.permanent, true);
   assert.match(failures[0]!.error, /the previous launch could not be reaped/);
   assert.doesNotMatch(failures[0]!.error, /reconnecting/);
@@ -268,7 +607,7 @@ test("a 'close' listener that throws doesn't skip a lost transport's reap (R1-1)
     liveLine(connection).markClosed({ reason: 'stdio pipe failed' });
   } catch { /* the listener's own error, wherever it surfaces */ }
   // The child ignores SIGTERM, so its reap ends with SIGKILL after 2 s.
-  await until(() => !alive(first), "the lost child's reap", 8000);
+  await until(() => !alive(first), "the lost child's reap");
 });
 
 test('close() marks a connection closed at once, so a start() in the same turn launches nothing', async () => {
@@ -317,17 +656,17 @@ test('close() right after start() ends a modern stdio connect still spawning, wi
   const log = scratchLog();
   const pids = spawnedPids();
   const connection = ModernMcpConnection.create({ id: 'raw', command: process.execPath, args: [SERVER, 'hang-discover', log], protocol: 'modern' });
-  const began = Date.now();
+  const began = performance.now();
   const started = connection.start().then(() => null, (error: unknown) => error);
   await connection.close();
-  const tookMs = Date.now() - began;
+  const tookMs = performance.now() - began;
   assert.ok(tookMs < 15_000, `close() took ${tookMs} ms, not the discover probe's 30 s`);
   // The child may be ended before it can log its start, so its pid comes
   // from the spawn.
   assert.equal(pids.length, 1, 'one launch');
   assert.equal(alive(pids[0]!), false, 'the child is gone once close() resolved');
   await started;
-  const endedMs = Date.now() - began;
+  const endedMs = performance.now() - began;
   assert.ok(endedMs < 15_000, `the connect ended after ${endedMs} ms, not the discover probe's 30 s`);
   assert.equal(connection.isConnected, false);
 });
@@ -338,35 +677,54 @@ test('close() during a reconnect handshake ends the launch it was waiting on, an
   await connection.callTool('die', {});
   await until(() => wire(log).some((e) => e.launch === 2 && e.method === 'server/discover'), 'launch 2 waiting on discover');
   const second = wire(log).find((e) => e.launch === 2 && e.event === 'start')!;
+  const began = performance.now();
   await connection.close();
+  const tookMs = performance.now() - began;
+  assert.ok(tookMs < 15_000, `close() took ${tookMs} ms, not the connect's 30 s`);
   const alive = (pid: number) => { try { process.kill(pid, 0); return true; } catch { return false; } };
-  await until(() => !alive(second.pid!), 'the hanging launch has exited', 3000);
+  assert.equal(alive(second.pid!), false, 'the hanging launch is gone once close() resolved');
   await new Promise((r) => setTimeout(r, 200));
   assert.equal(wire(log).filter((e) => e.event === 'start').length, 2, 'no launch after close');
   assert.equal(connection.isConnected, false);
 });
 
 test('an input_required continuation keeps its evidence: the second leg decides the outcome', async () => {
+  const logged = hostLog();
   const log = scratchLog();
-  const connection = await connect('', log, { requestTimeoutMs: 600 });
+  const connection = await connect('', log);
   await connection.listTools();
   await assert.rejects(connection.callTool('cont', { leg2: 'error' }), (err: unknown) => {
     assert.ok(err instanceof McplRequestError, String(err));
     assert.equal(err.outcome, 'error-response');
-    assert.match(err.message, /\[-32603\]/);
+    assert.match(err.message, /^The "raw" server answered with an error: /);
     assert.deepEqual(err.data, { leg: 2, state: 'state-for-error' });
     return true;
   });
-  await assert.rejects(connection.callTool('cont', { leg2: 'hang' }), (err: unknown) => {
+  loggedLine(logged, /^MCP server "raw" answered tools\/call cont with error -32603: /);
+  // Only the call meant to time out gets a short deadline, on a connection
+  // of its own: the call above, which must be answered, keeps the default.
+  // The deadline covers the whole call, leg 1's answer included, so it gives
+  // leg 1 the 1.5 s the deadline test below does.
+  const hangLog = scratchLog();
+  const hanging = await connect('', hangLog, { requestTimeoutMs: 1500 });
+  await hanging.listTools();
+  await assert.rejects(hanging.callTool('cont', { leg2: 'hang' }), (err: unknown) => {
     assert.ok(err instanceof McplRequestError, String(err));
     assert.equal(err.outcome, 'no-response');
-    assert.match(err.message, /Cancellation was requested/);
+    assert.equal(err.message, 'The "raw" server didn\'t answer within 1.5 seconds, so whether the request took effect is unknown: ' +
+      'this host asked it to cancel, and it may still complete on the server. ' +
+      'Check its effect before trying again, since repeating something that changes state may do it twice.');
     return true;
   });
-  assert.equal(calls(log, 'cont'), 4, 'two legs each');
+  loggedLine(logged, /^MCP server "raw" didn't answer tools\/call cont within 1500ms; cancellation requested$/);
+  assert.equal(calls(log, 'cont'), 2, 'two legs');
+  // The server logs a leg as it reads it, and the deadline doesn't wait
+  // for that, so the hang leg is awaited.
+  await until(() => calls(hangLog, 'cont') === 2, 'the second leg on the wire');
 });
 
 test('a deadline between continuation rounds is no-response, and claims no cancellation', async () => {
+  const logged = hostLog();
   const log = scratchLog();
   const connection = await connect('', log, { requestTimeoutMs: 1500 });
   await connection.listTools();
@@ -390,13 +748,12 @@ test('a deadline between continuation rounds is no-response, and claims no cance
   await assert.rejects(connection.callTool('cont', { leg1: 'elicit' }), (err: unknown) => {
     assert.ok(err instanceof McplRequestError, String(err));
     assert.equal(err.outcome, 'no-response');
-    assert.match(
-      err.message,
-      /did not finish tools\/call "cont" within 1500ms: it asked for another round \(input_required\), and the deadline passed before that round was sent, so nothing was in flight to cancel\. The outcome is unknown/,
-    );
-    assert.doesNotMatch(err.message, /Cancellation was requested|answered/);
+    assert.equal(err.message, 'The "raw" server didn\'t finish the request: it asked for more from this host, and the time ran out ' +
+      'before this host sent it, so whether the request took effect is unknown. Check its effect before trying again.');
+    assert.doesNotMatch(err.message, /cancel|answered/);
     return true;
   });
+  loggedLine(logged, /^MCP server "raw" did not finish tools\/call cont within 1500ms: it asked for another round \(input_required\), and the deadline passed before that round was sent$/);
   assert.ok(held, 'the round was held');
   // The wire is ordered: once a later call has reached the server, any
   // second leg sent before it would have too.
@@ -407,22 +764,48 @@ test('a deadline between continuation rounds is no-response, and claims no cance
 });
 
 test('a connection lost between continuation rounds is no-response, not an answer', async () => {
+  const logged = hostLog();
   const log = scratchLog();
   const connection = await connect('', log);
   await connection.listTools();
-  await assert.rejects(connection.callTool('cont', { leg1: 'exit', leg2: 'ok' }), (err: unknown) => {
-    assert.ok(err instanceof McplRequestError, String(err));
-    assert.equal(err.outcome, 'no-response');
-    assert.match(
-      err.message,
-      /did not finish tools\/call "cont": it asked for another round \(input_required\), and the call ended before that round was sent: Not connected\. The outcome is unknown/,
-    );
-    return true;
-  });
-  assert.equal(calls(log, 'cont'), 1);
+  // The server stops reading before it answers leg 1, and exits once that
+  // answer is written, so leg 2 can't reach it. What this host meets first
+  // decides what it can say, and each account is the true one for what it
+  // saw:
+  // - leg 1's answer, then the exit before the SDK's pacing (250 ms) lets
+  //   leg 2 go: the call ended before this host sent leg 2;
+  // - the exit before it reads leg 1's answer (the transport closes on the
+  //   child's exit), or its own write of leg 2 into the closed pipe, if
+  //   this process is held up for the pacing between reading the answer
+  //   and the exit: to it, the connection closed before the server
+  //   answered.
+  const accounts = [
+    {
+      message: 'The "raw" server didn\'t finish the request: it asked for more from this host, and the call ended ' +
+        'before this host sent it, so whether the request took effect is unknown. Check its effect before trying again.',
+      line: /^MCP server "raw" did not finish tools\/call cont: it asked for another round \(input_required\), and the call ended before that round was sent: "Not connected\."$/,
+    },
+    {
+      message: 'The connection to the "raw" server closed before it answered, so whether the request took effect is unknown. ' +
+        'This host won\'t reconnect to it on its own. If you need it, ask whoever runs this host.',
+      line: /^MCP server "raw" tools\/call cont failed: "Connection closed"$/,
+    },
+  ];
+  const failure = await connection.callTool('cont', { leg1: 'exit', leg2: 'ok' }).then(() => null, (err: unknown) => err);
+  assert.ok(failure instanceof McplRequestError, String(failure));
+  assert.equal(failure.outcome, 'no-response');
+  const account = accounts.find((a) => a.message === failure.message);
+  assert.ok(account, `one of the two accounts, not: ${failure.message}`);
+  // The line carries the SDK's reason, which records how the call ended, so
+  // it pins the account to the order: a host that gave the generic close
+  // after reading leg 1's answer would log that with "Not connected", the
+  // reason, and fail here.
+  loggedLine(logged, account.line);
+  assert.equal(calls(log, 'cont'), 1, 'only leg 1 reached the server');
 });
 
 test('a continuation this client cannot go on with is no-response: the server may have acted', async () => {
+  const logged = hostLog();
   const log = scratchLog();
   const connection = await connect('', log);
   await connection.listTools();
@@ -430,44 +813,50 @@ test('a continuation this client cannot go on with is no-response: the server ma
   await assert.rejects(connection.callTool('cont', { leg1: 'elicit' }), (err: unknown) => {
     assert.ok(err instanceof McplRequestError, String(err));
     assert.equal(err.outcome, 'no-response');
-    assert.match(err.message, /it asked for another round \(input_required\), and the call ended before that round was sent: Cannot fulfil input request 'confirm'/);
+    assert.match(err.message, /^The "raw" server didn't finish the request: it asked for more from this host, and the call ended before this host sent it/);
     return true;
   });
+  loggedLine(logged, /it asked for another round \(input_required\), and the call ended before that round was sent: "Cannot fulfil input request 'confirm'/);
   assert.equal(calls(log, 'cont'), 1);
   // A server that sheds load on every round meets the rounds cap: the first
   // leg and ten retries.
   await assert.rejects(connection.callTool('cont', { leg2: 'again' }), (err: unknown) => {
     assert.ok(err instanceof McplRequestError, String(err));
     assert.equal(err.outcome, 'no-response');
-    assert.match(err.message, /the call ended before that round was sent: Multi-round-trip request 'tools\/call' still required input after 10 rounds/);
+    assert.match(err.message, /and the call ended before this host sent it, so whether the request took effect is unknown/);
     return true;
   });
+  loggedLine(logged, /the call ended before that round was sent: "Multi-round-trip request 'tools\/call' still required input after 10 rounds/);
   assert.equal(calls(log, 'cont'), 1 + 11);
 });
 
 test('a result type this revision does not define, or none, is not a final answer: no-response', async () => {
+  const logged = hostLog();
   const log = scratchLog();
   const connection = await connect('', log);
   await connection.listTools();
   await assert.rejects(connection.callTool('task', {}), (err: unknown) => {
     assert.ok(err instanceof McplRequestError, String(err));
     assert.equal(err.outcome, 'no-response');
-    assert.match(err.message, /did not finish tools\/call "task": its answer was not a complete result: Unsupported result type 'task'.*The outcome is unknown/);
+    assert.equal(err.message, 'The "raw" server\'s answer wasn\'t a complete result, so whether the request took effect is unknown. ' +
+      'Check its effect before trying again.');
     return true;
   });
+  loggedLine(logged, /^MCP server "raw" did not finish tools\/call task: its answer was not a complete result: "Unsupported result type 'task'/);
   await assert.rejects(connection.callTool('bare', {}), (err: unknown) => {
     assert.ok(err instanceof McplRequestError, String(err));
     assert.equal(err.outcome, 'no-response');
-    assert.match(err.message, /did not finish tools\/call "bare": its answer was not a complete result: .*missing required resultType.*The outcome is unknown/);
+    assert.match(err.message, /^The "raw" server's answer wasn't a complete result, so whether the request took effect is unknown/);
     return true;
   });
+  loggedLine(logged, /^MCP server "raw" did not finish tools\/call bare: its answer was not a complete result: .*missing required resultType/);
   assert.equal(calls(log, 'task'), 1);
   assert.equal(calls(log, 'bare'), 1);
 });
 
 test('concurrent continuations never cross their evidence', async () => {
   const log = scratchLog();
-  const connection = await connect('', log, { requestTimeoutMs: 2000 });
+  const connection = await connect('', log);
   await connection.listTools();
   const [failing, passing, failingToo] = await Promise.allSettled([
     connection.callTool('cont', { leg2: 'error' }),
@@ -544,7 +933,7 @@ test('a failed launch that cannot be reaped halts reconnecting; close() settles 
   connection.on('reconnect-failed', (f) => failures.push(f));
   connection.on('error', () => {});
   await connection.callTool('die', {});
-  await until(() => failures.some((f) => f.permanent), 'a permanent reconnect failure', 9000);
+  await until(() => failures.some((f) => f.permanent), 'a permanent reconnect failure');
   const halted = failures.find((f) => f.permanent)!;
   assert.match(halted.error, /the previous launch could not be reaped .*reconnecting is halted/);
   assert.equal(connection.willReconnect, false);
@@ -607,6 +996,7 @@ test('start() runs once: a second call shares the first connect, and no second s
 });
 
 test('a send the stdio line refused before writing anything is not-sent', async () => {
+  const logged = hostLog();
   const log = scratchLog();
   const connection = await connect('', log);
   await connection.listTools();
@@ -618,9 +1008,11 @@ test('a send the stdio line refused before writing anything is not-sent', async 
     await assert.rejects(connection.callTool('plain', {}), (err: unknown) => {
       assert.ok(err instanceof McplRequestError, String(err));
       assert.equal(err.outcome, 'not-sent');
-      assert.match(err.message, /tools\/call "plain" was not sent: .*stdio transport is closed/);
+      assert.equal(err.message, 'The request wasn\'t sent: this host couldn\'t send it to the "raw" server, so nothing ran. ' +
+        'If calling it again fails, ask whoever runs this host.');
       return true;
     });
+    loggedLine(logged, /^MCP server "raw" tools\/call plain not sent: .*stdio transport is closed/);
   } finally {
     line._closed = false;
   }
@@ -628,6 +1020,7 @@ test('a send the stdio line refused before writing anything is not-sent', async 
 });
 
 test('a plain call whose child dies before answering is no-response', async () => {
+  const logged = hostLog();
   const log = scratchLog();
   const connection = await connect('', log);
   connection.on('error', () => {});
@@ -635,18 +1028,69 @@ test('a plain call whose child dies before answering is no-response', async () =
   await assert.rejects(connection.callTool('vanish', {}), (err: unknown) => {
     assert.ok(err instanceof McplRequestError, String(err));
     assert.equal(err.outcome, 'no-response');
-    assert.match(err.message, /MCP server "raw" tools\/call "vanish" failed: /);
+    // The connection closed under it: the legacy engine's words, and this
+    // connection doesn't reconnect.
+    assert.equal(err.message, 'The connection to the "raw" server closed before it answered, so whether the request took effect is unknown. ' +
+      "This host won't reconnect to it on its own. If you need it, ask whoever runs this host.");
     return true;
   });
+  loggedLine(logged, /^MCP server "raw" tools\/call vanish failed: /);
   assert.equal(calls(log, 'vanish'), 1, 'the call reached the server');
 });
 
+test("a request this host's close cuts off reads as the legacy engine's: the server didn't answer before this host closed its connection", async () => {
+  const logged = hostLog();
+  const log = scratchLog();
+  const connection = await connect('', log);
+  await connection.listTools();
+  // The second leg is never answered, so only the close ends the call.
+  const pending = connection.callTool('cont', { leg2: 'hang' });
+  const failure = pending.then(() => null, (error: unknown) => error);
+  await until(() => calls(log, 'cont') === 2, 'the second leg on the wire');
+  await connection.close();
+  const err = await failure;
+  assert.ok(err instanceof McplRequestError, String(err));
+  assert.equal(err.outcome, 'no-response');
+  assert.equal(err.message, 'The "raw" server didn\'t answer before this host closed its connection, so whether the request took effect is unknown. ' +
+    'Check its effect before trying again.');
+  loggedLine(logged, /^MCP server "raw" tools\/call cont failed: /);
+});
+
+for (const reconnect of [true, false]) {
+test(`a call with no session to send it on is not-sent: after a loss, whether this host is reconnecting${reconnect ? '' : ' (it is not)'}; after this host's close, only that`, async () => {
+  const log = scratchLog();
+  // A reconnect a minute away, so the connection stays lost while it's asked.
+  const connection = await connect('', log, reconnect ? { reconnect: true, reconnectIntervalMs: 60_000, reconnectMaxIntervalMs: 60_000 } : {});
+  connection.on('error', () => { /* the loss */ });
+  await connection.listTools();
+  await assert.rejects(connection.callTool('vanish', {}), {
+    message: 'The connection to the "raw" server closed before it answered, so whether the request took effect is unknown. ' +
+      (reconnect ? 'Check its effect before trying again; this host is reconnecting to it.' : "This host won't reconnect to it on its own. If you need it, ask whoever runs this host."),
+  });
+  await until(() => !connection.isConnected, 'the connection lost');
+  const refused = async (message: string) => assert.rejects(connection.callTool('plain', {}), (err: unknown) => {
+    assert.ok(err instanceof McplRequestError, String(err));
+    assert.equal(err.outcome, 'not-sent');
+    assert.equal(err.message, message);
+    return true;
+  });
+  await refused('The request wasn\'t sent: the connection to the "raw" server is closed, so nothing ran. ' +
+    (reconnect ? 'This host is reconnecting to it; try again later.' : "This host won't reconnect to it on its own. If you need it, ask whoever runs this host."));
+  await connection.close();
+  await refused('The request wasn\'t sent: this host closed its connection to the "raw" server, so nothing ran. ' +
+    'If calling it again fails, ask whoever runs this host.');
+  assert.equal(calls(log, 'plain'), 0, 'nothing reached a server');
+});
+}
+
 test('failures are classified in order: nothing sent first, then the answers, then an HTTP refusal', () => {
-  const connection = ModernMcpConnection.create({ id: 'raw', command: process.execPath, args: [SERVER, '', scratchLog()], protocol: 'modern' });
-  const classify = (record: Record<string, unknown>, error: unknown, method = 'tools/call') =>
+  const logged = hostLog();
+  const token = 'tok-0123456789abcdef';
+  const connection = ModernMcpConnection.create({ id: 'raw', command: process.execPath, args: [SERVER, '', scratchLog()], protocol: 'modern', env: { API_TOKEN: token } });
+  const classify = (record: Record<string, unknown>, error: unknown, method = 'tools/call', lost = false) =>
     (connection as unknown as {
-      requestFailure: (what: string, record: unknown, error: unknown, timeoutMs?: number) => Error;
-    }).requestFailure(method === 'tools/list' ? 'tools/list' : 'tools/call "op"', { method, handedOff: true, answer: 'none', continued: false, ...record }, error, 1000);
+      requestFailure: (what: string, record: unknown, error: unknown, timeoutMs?: number, lost?: boolean) => Error;
+    }).requestFailure(method === 'tools/list' ? 'tools/list' : 'tools/call op', { method, handedOff: true, answer: 'none', continued: false, ...record }, error, 1000, lost);
   const refused = () => new SdkHttpError(SdkErrorCode.ClientHttpAuthentication, 'Unauthorized', { status: 401 } as never);
   const outcome = (error: Error) => (error instanceof McplRequestError ? error.outcome : 'plain');
 
@@ -656,15 +1100,61 @@ test('failures are classified in order: nothing sent first, then the answers, th
   const first = classify({}, refused());
   assert.equal(outcome(first), 'error-response');
   assert.equal(((first as McplRequestError).data as { httpStatus?: number }).httpStatus, 401);
+  assert.equal(first.message, 'The "raw" server refused this host access, so the request didn\'t run. If you need it, ask whoever runs this host.');
+  loggedLine(logged, /^MCP server "raw" refused tools\/call op: HTTP 401 \(/);
 
   const later = classify({ continued: true }, refused());
   assert.equal(outcome(later), 'no-response', 'after an earlier leg asked for another round');
-  assert.match(later.message, /asked for another round \(input_required\), and the server refused a later one: HTTP 401/);
+  assert.equal(later.message, 'The "raw" server refused this host access partway through the request, after asking for more, so whether it ' +
+    'took effect is unknown. Check its effect before trying again; if calling it again fails, ask whoever runs this host.');
+  loggedLine(logged, /^MCP server "raw" refused a later round of tools\/call op: HTTP 401 \(/);
+  assert.equal(classify({ continued: true }, refused(), 'tools/list').message, 'The "raw" server refused this host access partway through ' +
+    'the request, after asking for more. Listing changes nothing on the server, so it\'s safe to try again.');
+
+  const silent = classify({ answer: 'error', error: { code: -32603, message: '  ' } }, new Error('the SDK\'s words'));
+  assert.equal(outcome(silent), 'error-response');
+  assert.equal(silent.message, 'The "raw" server answered with an error without saying what went wrong, so whether the request took effect ' +
+    'is unknown. Check its effect before trying again.');
+  loggedLine(logged, /^MCP server "raw" answered tools\/call op with error -32603: "\\u0020\\u0020"$/);
+
+  // The server's words reach the caller and the log redacted, whatever
+  // JSON value they are.
+  const echoed = classify({ answer: 'error', error: { code: -32603, message: `bad token ${token}` } }, new Error('the SDK\'s words'));
+  assert.equal(echoed.message, 'The "raw" server answered with an error: bad token redacted');
+  loggedLine(logged, /^MCP server "raw" answered tools\/call op with error -32603: "bad\\u0020token\\u0020redacted"$/);
+  classify({ answer: 'error', error: { code: -32603, message: { said: `bad token ${token}` } } }, new Error('the SDK\'s words'));
+  assert.ok(logged.some((line) => line.endsWith('with error -32603: "{\\"said\\":\\"bad\\u0020token\\u0020redacted\\"}"')), logged.join('\n'));
+  assert.ok(!logged.some((line) => line.includes(token)), 'no log line has the token');
+
+  const unusableListing = classify({ answer: 'complete' }, new Error('the list failed its schema'), 'tools/list');
+  assert.equal(outcome(unusableListing), 'plain');
+  assert.equal(unusableListing.message, 'The "raw" server answered, but not in a form this host can read. ' +
+    'Listing changes nothing on the server, so it\'s safe to try again.');
+
+  const droppedListing = classify({}, new Error('socket hang up'), 'tools/list');
+  assert.equal(outcome(droppedListing), 'no-response');
+  assert.equal(droppedListing.message, 'The request to the "raw" server failed before an answer came back. ' +
+    'Listing changes nothing on the server, so it\'s safe to try again.');
+  loggedLine(logged, /^MCP server "raw" tools\/list failed: "socket hang up"$/);
 
   const listing = classify({}, new SdkError(SdkErrorCode.RequestTimeout, 'Request timed out'), 'tools/list');
   assert.equal(outcome(listing), 'no-response');
-  assert.match(listing.message, /did not answer tools\/list within 1000ms\. Cancellation was requested; the list did not arrive in time\. Listing changes nothing on the server, so it is safe to retry\./);
-  assert.doesNotMatch(listing.message, /side-effecting/);
+  assert.equal(listing.message, 'The "raw" server didn\'t answer within 1 second, and this host asked it to cancel. ' +
+    'Listing changes nothing on the server, so it\'s safe to try again.');
+  assert.doesNotMatch(listing.message, /took effect|Check its effect/);
+  loggedLine(logged, /^MCP server "raw" didn't answer tools\/list within 1000ms; cancellation requested$/);
+
+  // A listing whose connection closed under it, and one this host's close
+  // cut off: the effect clause is the listing's.
+  const lostListing = classify({}, new Error('Connection closed'), 'tools/list', true);
+  assert.equal(outcome(lostListing), 'no-response');
+  assert.equal(lostListing.message, 'The connection to the "raw" server closed before it answered. ' +
+    'Listing changes nothing on the server, so it\'s safe to try again.');
+  (connection as unknown as { closedByHost: boolean }).closedByHost = true;
+  const closedListing = classify({}, new Error('Connection closed'), 'tools/list', true);
+  assert.equal(outcome(closedListing), 'no-response');
+  assert.equal(closedListing.message, 'The "raw" server didn\'t answer before this host closed its connection. ' +
+    'Listing changes nothing on the server, so it\'s safe to try again.');
 });
 
 test('a reconnect backoff never exceeds the timer limit', () => {
@@ -778,7 +1268,8 @@ test('close() during a connect waits for that connect\'s own cleanup, and report
   await connection.close();
 });
 
-test('a server that closes its stdin and ignores SIGTERM is killed and reconnected, and a call made after the failure is refused as not sent', { timeout: 40_000 }, async () => {
+test('a server that closes its stdin and ignores SIGTERM is killed and reconnected, and a call made after the failure is refused as not sent', async () => {
+  const logged = hostLog();
   const log = scratchLog();
   const connection = await connect('ignore-sigterm', log, { reconnect: true, reconnectIntervalMs: 30, reconnectMaxIntervalMs: 60, requestTimeoutMs: 30_000 });
   connection.on('error', () => { /* out-of-band SDK errors */ });
@@ -794,18 +1285,20 @@ test('a server that closes its stdin and ignores SIGTERM is killed and reconnect
   await assert.rejects(connection.callTool('plain', {}), (error: unknown) => {
     assert.ok(error instanceof McplRequestError, String(error));
     assert.equal(error.outcome, 'not-sent');
-    assert.match(error.message, /stdio pipe failed with write EPIPE/);
+    assert.equal(error.message, 'The request wasn\'t sent: this host can no longer write to the "raw" server, so nothing ran. ' +
+      'This host is reconnecting to it; try again later.');
     return true;
   });
+  loggedLine(logged, /^MCP server "raw" tools\/call plain not sent: ".*stdio pipe failed with write EPIPE"$/);
   // SIGKILL ends the child, and the connection reconnects as after any loss.
-  await until(() => wire(log).filter((e) => e.event === 'start').length === 2 && connection.isConnected, 'the next launch, connected', 15_000);
+  await until(() => wire(log).filter((e) => e.event === 'start').length === 2 && connection.isConnected, 'the next launch, connected');
   assert.equal(closes.length, 1, closes.join('; '));
   const outcome = await first;
   assert.ok(outcome instanceof McplRequestError && outcome.outcome !== 'not-sent', `the written call failed with the close: ${String(outcome)}`);
   assert.deepEqual((await connection.callTool('plain', {})).content, [{ type: 'text', text: 'plain' }], 'the next launch answers');
 });
 
-test("a server that closes its stdin and outlives SIGKILL too is held as a launch that can't be reaped: a permanent failure, no second launch, and close() retries", { timeout: 40_000 }, async () => {
+test("a server that closes its stdin and outlives SIGKILL too is held as a launch that can't be reaped: a permanent failure, no second launch, and close() retries", async () => {
   const log = scratchLog();
   const connection = await connect('', log, { reconnect: true, reconnectIntervalMs: 30, reconnectMaxIntervalMs: 60, requestTimeoutMs: 30_000 });
   connection.on('error', () => { /* the held launch, reported */ });
@@ -819,16 +1312,35 @@ test("a server that closes its stdin and outlives SIGKILL too is held as a launc
     realKill('SIGKILL');
     await until(() => !alive(line.child.pid), 'the held child killed');
   });
+  // A call made as the connection closes, in the same turn as the loss.
+  let duringClose: Promise<unknown> | undefined;
+  connection.on('close', () => { duringClose ??= connection.callTool('plain', {}).then(() => 'answered', (error: unknown) => error); });
   await connection.callTool('deafen', {});
   await until(() => wire(log).some((e) => e.event === 'deaf'), 'the server to close its stdin');
-  void connection.callTool('plain', {}).catch(() => { /* its write meets EPIPE */ });
-  await until(() => failures.length > 0, 'the permanent failure', 12_000);
+  // Its write meets EPIPE, so it's pending when the child is found unreaped.
+  const pending = connection.callTool('plain', {}).then(() => 'answered', (error: unknown) => error);
+  await until(() => failures.length > 0, 'the permanent failure');
   assert.equal(failures.length, 1);
   assert.equal(failures[0]!.permanent, true);
   assert.match(failures[0]!.error, /^its stdio pipe failed with write EPIPE; the previous launch could not be reaped \(stdio child \d+ of MCP server "raw" did not exit within 2000ms of SIGKILL; it could not be reaped\); reconnecting is halted$/);
   assert.equal(connection.isConnected, false);
   assert.equal(connection.willReconnect, false);
   assert.equal(connection.holdsUnreapedChild, true);
+  // Neither the call the loss ended nor one made as it closed is told this
+  // host is reconnecting: the launch is held before either is answered
+  // (#540's review, R1-1).
+  const ended = await pending;
+  assert.ok(ended instanceof McplRequestError, String(ended));
+  assert.equal(ended.outcome, 'no-response');
+  assert.equal(ended.message, 'The connection to the "raw" server closed before it answered, so whether the request took effect is unknown. ' +
+    "This host won't reconnect to it on its own. If you need it, ask whoever runs this host.");
+  const refused = await duringClose;
+  assert.ok(refused instanceof McplRequestError, String(refused));
+  assert.equal(refused.outcome, 'not-sent');
+  assert.equal(refused.message, 'The request wasn\'t sent: the connection to the "raw" server is closed, so nothing ran. ' +
+    "This host won't reconnect to it on its own. If you need it, ask whoever runs this host.");
+  await connection.lossReaped();
+  assert.equal(failures.length, 1, "one permanent failure, not a second from the reap's verdict");
   await new Promise((r) => setTimeout(r, 200));
   assert.equal(wire(log).filter((e) => e.event === 'start').length, 1, 'no second launch');
   // close() retries the reap: refused while the child runs, then done.
@@ -837,4 +1349,72 @@ test("a server that closes its stdin and outlives SIGKILL too is held as a launc
   await until(() => !alive(line.child.pid), 'the child to be killed');
   await connection.close();
   assert.equal(connection.holdsUnreapedChild, false);
+});
+
+/** Hand a live connection the loss of its session, as the line's 'unreaped'
+ *  does once the child outlived SIGKILL, here with a child that's well, so
+ *  the reap ends it. It throws what a listener throws, to the test. */
+const loseUnreaped = (connection: ModernMcpConnection) => {
+  const internals = connection as unknown as { session: { generation: number }; handleLost: (generation: number, reason: string, unreaped?: Error) => void };
+  internals.handleLost(internals.session.generation, 'its stdio pipe failed', new Error('it outlived SIGKILL'));
+};
+
+test("an unreaped launch's loss with a 'close' listener that throws still reaps the launch, holds it, reports the hold, and reports the permanent failure (#540's review, R1-1)", async () => {
+  hostLog();
+  const connection = await connect('', scratchLog());
+  const child = liveLine(connection).child.pid;
+  const seen: string[] = [];
+  connection.on('error', () => seen.push('error'));
+  connection.on('reconnect-failed', (failure: { permanent?: boolean }) => seen.push(failure.permanent ? 'permanent' : 'failed'));
+  const failing = () => { seen.push('close'); throw new Error('a close listener failed'); };
+  connection.on('close', failing);
+  assert.throws(() => loseUnreaped(connection), /^Error: a close listener failed$/);
+  connection.off('close', failing);
+  assert.equal(connection.holdsUnreapedChild, true, 'held before the listener threw');
+  await connection.lossReaped();
+  assert.equal(alive(child), false, 'the reap ended the child');
+  assert.deepEqual(seen, ['close', 'error', 'permanent']);
+});
+
+test("an unreaped launch's loss with an 'error' listener that throws still reaps the launch, closes the connection, and reports the permanent failure (#540's review, R1-1)", async () => {
+  hostLog();
+  const connection = await connect('', scratchLog());
+  const child = liveLine(connection).child.pid;
+  const seen: string[] = [];
+  connection.on('close', () => seen.push('close'));
+  connection.on('reconnect-failed', (failure: { permanent?: boolean }) => seen.push(failure.permanent ? 'permanent' : 'failed'));
+  const failing = () => { seen.push('error'); throw new Error('an error listener failed'); };
+  connection.on('error', failing);
+  assert.throws(() => loseUnreaped(connection), /^Error: an error listener failed$/);
+  connection.off('error', failing);
+  connection.on('error', () => { /* the rest, reported */ });
+  assert.equal(connection.holdsUnreapedChild, true);
+  await connection.lossReaped();
+  assert.equal(alive(child), false, 'the reap ended the child');
+  assert.deepEqual(seen, ['close', 'error', 'permanent']);
+});
+
+test("a host that closes the connection as an unreaped launch's loss closes it gets close()'s failure, with no permanent failure beside it (#540's review, R1-1)", async () => {
+  const log = scratchLog();
+  const connection = await connect('', log, { reconnect: true, reconnectIntervalMs: 30, reconnectMaxIntervalMs: 60, requestTimeoutMs: 30_000 });
+  connection.on('error', () => { /* the held launch, reported */ });
+  const failures: unknown[] = [];
+  connection.on('reconnect-failed', (failure: unknown) => failures.push(failure));
+  const line = liveLine(connection);
+  const realKill = line.child.kill.bind(line.child);
+  line.child.kill = () => true; // signals never arrive: the child outlives both bounds
+  // Before the connection's close(), which then reaps an exited child.
+  cleanups.push(async () => {
+    realKill('SIGKILL');
+    await until(() => !alive(line.child.pid), 'the held child killed');
+  });
+  let closing: Promise<unknown> | undefined;
+  connection.on('close', () => { closing ??= connection.close().then(() => 'closed', (error: unknown) => error); });
+  await connection.callTool('deafen', {});
+  await until(() => wire(log).some((e) => e.event === 'deaf'), 'the server to close its stdin');
+  void connection.callTool('plain', {}).catch(() => { /* its write meets EPIPE, and the loss ends it */ });
+  await until(() => closing !== undefined, 'the close made as the loss closes the connection');
+  assert.match(String(await closing), /could not be reaped/);
+  await connection.lossReaped();
+  assert.deepEqual(failures, [], "close()'s rejection is the report");
 });

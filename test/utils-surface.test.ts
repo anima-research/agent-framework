@@ -163,10 +163,13 @@ describe('utils surface', () => {
       // The utility's input is the run's `args`, so the refusal names them.
       const notObject = await call({ action: 'run', name: 'stub--rare_op', args: 'soft' });
       assert.match(notObject.error!, /^Nothing was done: stub--rare_op its args must be an object, and this call gave a string\./);
+      // Checks made after the call opened are failures, not the dispatcher's refusals.
+      assert.equal(notObject.refused, undefined);
       assert.equal(stub.calls.length, 0, 'handler never reached on a validation miss');
 
       const unknown = await call({ action: 'run', name: 'stub--nope', args: {} });
-      assert.match(unknown.error!, /No utility "stub--nope"\. Available: stub--rare_op, stub--other_op/);
+      assert.match(unknown.error!, /No utility "stub--nope", so nothing was done\. Available: stub--rare_op, stub--other_op/);
+      assert.equal(unknown.refused, undefined);
 
       const badAction = await call({ action: 'zap' });
       assert.match(badAction.error!, /action must be "list", "describe", or "run"/);
