@@ -14,7 +14,7 @@
 import { existsSync, readFileSync, writeFileSync, mkdirSync } from 'node:fs';
 import { basename, dirname, join } from 'node:path';
 import { GateScript } from './gate-script.js';
-import { canonical, duplicateName, lastRecipePath, reconcileLine, reconcileWithRecipe, ruleName, type WrittenConfig } from './recipe-reconcile.js';
+import { canonical, duplicateName, lastRecipePath, noChanges, reconcileLine, reconcileWithRecipe, ruleName, type WrittenConfig } from './recipe-reconcile.js';
 import { closestNames, isNearMiss } from '../closest-names.js';
 import { MAX_TIMER_MS } from '../deadline-timer.js';
 import { safeSlice } from '../safe-slice.js';
@@ -1456,14 +1456,29 @@ function readLastRecipe(path: string): { recipe: WrittenConfig | null; problem?:
   return { recipe: { rules: raw.policies, default: raw.default } };
 }
 
+/**
+ * A rule's meaning, for the start's merge: the rule as the gate reads it,
+ * where it reads, and as written where it doesn't. So a rule `wake_add_rule`
+ * wrote as read agrees with the same rule written more briefly.
+ */
+function ruleMeaning(rule: unknown): string {
+  const reading = readRule(rule, 'A policy');
+  return reading.policy ? `read ${canonical(reading.policy)}` : `written ${canonical(rule)}`;
+}
+
 /** What a start's write of the host's starting rules to gate.json did. */
 type StartWrite =
   | { kind: 'none' }
   /** A first start's write of the starting rules threw: at its open, or partway. */
   | { kind: 'seed-failed'; error: string; atOpen: boolean }
-  /** A later start's write of the rules it read plus the ones it was adding threw, or couldn't be made; `config` is what it was writing. */
+  /**
+   * A later start's write to gate.json threw, or couldn't be made; `config` is
+   * what it was writing: the rules it read plus the ones it was adding
+   * (`names`), with the merge's other changes (`changing`: the rules it was
+   * removing, redefining or moving, and "default").
+   */
   | {
-    kind: 'reconcile-failed'; names: string[]; error: string; atOpen: boolean; config: GateConfig;
+    kind: 'reconcile-failed'; names: string[]; changing?: string[]; error: string; atOpen: boolean; config: GateConfig;
     /** The text it was writing, whose reading is `config`, and what a load of it says, when the write itself failed. */
     text?: string;
     note?: string | null;
@@ -1515,6 +1530,18 @@ function describeStart(starting: StartingRules, write: StartWrite, held: Readonl
         + (write.text !== undefined
           ? 'Whoever runs this host can fix what kept them from being written.'
           : 'A start adds them once what kept them out is fixed.'),
+      );
+    }
+    // The merge's other changes: removals, redefinitions, moves and the default.
+    if (write.changing?.length) {
+      parts.push(
+        `At start, the recipe's changes to gate.json (${quotedList(write.changing)}) `
+        + (write.atOpen
+          ? `weren't saved (${write.error}), so gate.json's rules are in force as they were. `
+          : `may not all have been saved (${write.error}): the gate runs gate.json as the write left it. `)
+        + (write.text !== undefined
+          ? 'Whoever runs this host can fix what kept them from being written.'
+          : 'A start applies them once what kept them out is fixed.'),
       );
     }
   }
@@ -1608,15 +1635,23 @@ function describeUnsaved(starting: StartingRules, write: StartWrite, loaded: boo
         + 'from them too. Whoever runs this host can fix what kept it from being written, and gate.json.';
   }
   if (write.kind === 'reconcile-failed') {
-    const what = write.atOpen
-      ? `the host's starting rules ${quotedList(write.names)} couldn't be added to gate.json (${write.error}), and gate.json `
-        + "couldn't be loaded after that"
-      : `adding the host's starting rules ${quotedList(write.names)} to gate.json failed partway (${write.error}), so gate.json `
-        + 'may be left part-written';
+    // A write of the recipe's merge that did more than add rules, or one that only added them.
+    const merging = (write.changing?.length ?? 0) > 0;
+    const changes = quotedList([...write.names, ...(write.changing ?? [])]);
+    const what = merging
+      ? write.atOpen
+        ? `the recipe's changes to gate.json (${changes}) couldn't be written (${write.error}), and gate.json couldn't be loaded after that`
+        : `writing the recipe's changes to gate.json (${changes}) failed partway (${write.error}), so gate.json may be left part-written`
+      : write.atOpen
+        ? `the host's starting rules ${quotedList(write.names)} couldn't be added to gate.json (${write.error}), and gate.json `
+          + "couldn't be loaded after that"
+        : `adding the host's starting rules ${quotedList(write.names)} to gate.json failed partway (${write.error}), so gate.json `
+          + 'may be left part-written';
     // What those rules hold that the gate reads past or leaves out, since
     // gate.json's own entry is now its load error.
     const read = write.sentences?.length ? `, read as a load reads them: ${write.sentences.join(' ')}` : '.';
-    return `At start, ${what}. The gate runs the rules it read from gate.json and the ones it was adding, which aren't saved${read} `
+    const runs = merging ? 'the rules that write held' : "the rules it read from gate.json and the ones it was adding";
+    return `At start, ${what}. The gate runs ${runs}, which aren't saved${read} `
       + `A restart before gate.json is fixed starts from ${starting.config ? "the host's starting rules" : 'no rules'}. `
       + 'Whoever runs this host can fix what kept it from being written, and gate.json.';
   }
@@ -1803,6 +1838,8 @@ export class EventGate {
   private startUnsaved: string | null = null;
   /** What the start's merge of the recipe couldn't do (seedOrReconcile), said with startNotice until the next start. */
   private startMergeNote: string | null = null;
+  /** Whether the start's unsaved rules (startUnsaved) are a merge's that did more than add rules. */
+  private startUnsavedMerged = false;
 
   // Debounce state
   private debounceTimers = new Map<string, DebounceState>();
@@ -1960,8 +1997,8 @@ export class EventGate {
     // Load config: gate.json; without it, the starting rules as read, unless
     // none of them is used; and otherwise no rules, as a host without any has. When a
     // reconcile's own write left gate.json unable to load, the gate runs what
-    // that write held, the rules it read plus the ones it was adding, since a
-    // failed write of ours shouldn't take rules out of force. Over a gate.json
+    // that write held, the rules it read as the recipe's merge changed them,
+    // since a failed write of ours shouldn't take rules out of force. Over a gate.json
     // with no rule list to add them to, it runs gate.json's default with the
     // starting rules it lacks, as earlier releases did once they had written
     // them over it, where seedOrReconcile gives them (reconcile-unsaved). Where
@@ -2002,6 +2039,7 @@ export class EventGate {
       const described = describeStart(starting, write, read.state === 'loaded' ? heldNames(read.listed) : null);
       this.startNotice = [described, this.startMergeNote].filter((part): part is string => part !== null).join(' ') || null;
       this.startUnsaved = describeUnsaved(starting, write, read.state === 'loaded');
+      this.startUnsavedMerged = write.kind === 'reconcile-failed' && (write.changing?.length ?? 0) > 0;
     }
     for (const said of [this.startNotice, this.startUnsaved]) {
       if (said) console.error(`[gate] ${said}`);
@@ -2116,20 +2154,34 @@ export class EventGate {
     const last = readLastRecipe(recordPath);
     const given = isPlainObject(starting.given) ? starting.given : {};
     let merged: ReturnType<typeof reconcileWithRecipe>;
+    let appended = false;
     try {
       merged = reconcileWithRecipe(
         { rules: read.listed.rules, default: read.listed.top.default },
         { rules: starting.rules.map((rule) => rule.raw), default: given.default },
         last.recipe,
+        ruleMeaning,
       );
     } catch (err) {
       // A name given twice: a merge by name can't say which rule was meant.
-      this.startMergeNote = `At start, ${errorText(err)}, and the merge needs one rule per name, so the recipe wasn't applied: `
-        + 'gate.json is as it was, and nothing was recorded.';
-      return { kind: 'none' };
+      // So the start adds the rules gate.json lacks, after its own, as
+      // earlier releases did, and removes, redefines and records nothing.
+      const missing = starting.rules.filter((rule): rule is StartingRule & { name: string } => rule.name !== undefined && !held.has(rule.name));
+      appended = true;
+      this.startMergeNote = `At start, ${errorText(err)}, and the merge with the recipe needs one rule per name, so it didn't run: `
+        + (missing.length > 0
+          ? `the start only adds the rules gate.json lacks (${quotedList(missing.map((rule) => rule.name))}), after its own, and `
+            + 'removes, redefines and records nothing.'
+          : 'gate.json is as it was, and nothing was recorded.');
+      merged = {
+        rules: [...read.listed.rules, ...missing.map((rule) => rule.raw)],
+        default: read.listed.top.default,
+        defaultChanged: false,
+        changes: { ...noChanges(), added: missing.map((rule) => rule.name) },
+      };
     }
     const { changes } = merged;
-    if (last.problem !== undefined) changes.recordUnreadable = last.problem;
+    if (last.problem !== undefined && !appended) changes.recordUnreadable = last.problem;
     const top = { ...read.listed.top };
     if (merged.defaultChanged) {
       if (merged.default === undefined) delete top.default;
@@ -2138,12 +2190,6 @@ export class EventGate {
     const reconciled = { ...top, policies: merged.rules };
     const names = [...changes.added, ...changes.restored];
     const changing = [...changes.removed, ...changes.updated, ...changes.moved, ...(changes.defaultChange ? ['default'] : [])];
-    // What it couldn't change, beside the rules it couldn't add, which describeStart names.
-    const unapplied = (error: string): void => {
-      if (changing.length > 0) {
-        this.startMergeNote = `At start, the recipe's changes to gate.json (${quotedList(changing)}) weren't saved (${error}).`;
-      }
-    };
     if (canonical(reconciled) !== canonical({ ...read.listed.top, policies: read.listed.rules })) {
       // What the write holds, as a load reads it, for a write that fails partway.
       const holds = readConfig(reconciled, 'gate.json');
@@ -2153,17 +2199,16 @@ export class EventGate {
         // rules of its own, gate.json isn't used at this start, above.)
         const error = 'with them, gate.json would leave out a rule that could wake the agent, and under its default, '
           + `"${read.config.default ?? 'always'}", it wouldn't be used`;
-        unapplied(error);
-        return { kind: 'reconcile-failed', names, atOpen: true, config: read.config, error };
+        return { kind: 'reconcile-failed', names, changing, atOpen: true, config: read.config, error };
       }
       const text = JSON.stringify(reconciled, null, 2) + '\n';
       try {
         writeFileSync(this.configPath, text);
       } catch (err) {
-        unapplied(errorText(err));
         return {
           kind: 'reconcile-failed',
           names,
+          changing,
           error: errorText(err),
           atOpen: beforeWriting(err),
           config: holds.config,
@@ -2174,20 +2219,21 @@ export class EventGate {
       }
     }
     // Said before the record is written, so a failed record write still
-    // leaves what the start did to gate.json named.
-    const line = reconcileLine(changes);
-    if (line) {
-      console.log(line);
+    // leaves what the start did to gate.json named. A start that only added
+    // rules, since the merge couldn't run, is said in startNotice instead.
+    const line = appended ? null : reconcileLine(changes);
+    if (line) console.error(line);
+    if (line || names.length > 0) {
       this.emitTrace({
         type: 'gate:config-reconciled',
         configPath: this.configPath,
         ...changes,
-        // As before this merge: every name the start added to gate.json.
+        // Every name the start added to gate.json, as an append's trace gave.
         addedPolicies: names,
         timestamp: Date.now(),
       });
     }
-    if (!last.recipe || canonical({ rules: last.recipe.rules, default: last.recipe.default }) !== canonical({ rules: starting.rules.map((rule) => rule.raw), default: given.default })) {
+    if (!appended && (!last.recipe || canonical({ rules: last.recipe.rules, default: last.recipe.default }) !== canonical({ rules: starting.rules.map((rule) => rule.raw), default: given.default }))) {
       this.recordRecipe(recordPath, starting.given);
     }
     return { kind: 'none' };
@@ -2302,7 +2348,9 @@ export class EventGate {
     // holding the text in force, clears startUnsaved.
     return this.configSource === 'file'
       ? this.startUnsaved !== null
-        ? 'the rules it read from gate.json at start and the ones it was adding'
+        ? this.startUnsavedMerged
+          ? 'the rules its start was writing to gate.json'
+          : 'the rules it read from gate.json at start and the ones it was adding'
         : 'the rules of the last gate.json it used'
       : "the host's starting rules";
   }

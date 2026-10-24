@@ -29,11 +29,14 @@
  * from the recipe or aren't in it. A rule that differs can be removed, and the
  * next start restores it from the recipe.
  *
- * Rules are merged as written, not as the gate reads them, so a field the gate
- * doesn't read and a rule it leaves out are kept as gate.json holds them, as
- * the gate's own writes keep them, and a definition is the rule as written. A
- * rule with no name stays where gate.json holds it, and a recipe's rule with
- * no name is never merged: the merge keys rules by name.
+ * Rules are compared by what they mean and kept as written. Two rules agree
+ * when the gate reads them the same, so a rule `wake_add_rule` wrote as the
+ * gate reads it agrees with the recipe's rule as written, and a change to a
+ * field the gate doesn't read alone isn't an edit; the caller gives the
+ * meaning (`meaningOf`). A rule that agrees with the recipe stays as gate.json
+ * holds it, and one that follows the recipe takes the recipe's rule as
+ * written. A rule with no name stays where gate.json holds it, and a recipe's
+ * rule with no name is never merged: the merge keys rules by name.
  */
 
 /** What a start changed, by rule name, for its trace and its log line. */
@@ -83,6 +86,14 @@ export function canonical(value: unknown): string {
 }
 
 const same = (a: unknown, b: unknown): boolean => canonical(a) === canonical(b);
+
+/** Changes with nothing in them, for a start to fill. */
+export function noChanges(): RecipeChanges {
+  return {
+    added: [], removed: [], updated: [], restored: [], moved: [],
+    keptEdited: [], differsFromRecipe: [], outsideRecipe: [], orderKept: false,
+  };
+}
 
 /** A gate config as written: its rule list and its `default`, each as given. */
 export interface WrittenConfig { rules: readonly unknown[]; default: unknown }
@@ -144,15 +155,19 @@ function longestShared(a: string[], b: string[]): Set<string> {
 /**
  * Merge `recipe` into `live` against `last`, the recipe last applied (null
  * when there is none), each as written. Pure: the caller reads and writes the
- * files. Returns the rule list and `default` to write, each as written, and
- * whether `default` changed. Throws when `live` or `recipe` names a rule
- * twice, since the merge keys rules by name.
+ * files, and gives `meaningOf`, a rule's meaning as a string two rules share
+ * when they mean the same (as written, unless given). Returns the rule list
+ * and `default` to write, each as written, and whether `default` changed.
+ * Throws when `live` or `recipe` names a rule twice, since the merge keys
+ * rules by name.
  */
 export function reconcileWithRecipe(
   live: WrittenConfig,
   recipe: WrittenConfig,
   last: WrittenConfig | null,
+  meaningOf: (rule: unknown) => string = canonical,
 ): { rules: unknown[]; default: unknown; defaultChanged: boolean; changes: RecipeChanges } {
+  const agree = (a: unknown, b: unknown): boolean => meaningOf(a) === meaningOf(b);
   const liveDuplicate = duplicateName(live.rules);
   if (liveDuplicate !== undefined) {
     throw new Error(`gate.json names the rule "${liveDuplicate}" twice`);
@@ -162,10 +177,7 @@ export function reconcileWithRecipe(
     throw new Error(`the recipe names the rule "${recipeDuplicate}" twice`);
   }
 
-  const changes: RecipeChanges = {
-    added: [], removed: [], updated: [], restored: [], moved: [],
-    keptEdited: [], differsFromRecipe: [], outsideRecipe: [], orderKept: false,
-  };
+  const changes = noChanges();
   // Each rule by its name; a rule with no name by a key no name can be, so
   // it keeps its place and matches nothing.
   const keyOf = (rule: unknown, index: number): string => ruleName(rule) ?? `\u0000nameless ${index}`;
@@ -185,10 +197,10 @@ export function reconcileWithRecipe(
     const name = keyOf(rule, index);
     const declared = inRecipe.get(name);
     const before = inLast?.get(name);
-    if (declared !== undefined && same(rule, declared)) {
-      // As the recipe has it: the recipe's, whatever the record says, and
+    if (declared !== undefined && agree(rule, declared)) {
+      // As the recipe has it: kept as written, whatever the record says, and
       // nothing to change or name.
-      definitions.set(name, declared);
+      definitions.set(name, rule);
       ordered.add(name);
     } else if (ruleName(rule) === undefined) {
       definitions.set(name, rule);
@@ -196,7 +208,7 @@ export function reconcileWithRecipe(
       definitions.set(name, rule);
       (declared !== undefined ? changes.differsFromRecipe : changes.outsideRecipe).push(name);
     } else if (before !== undefined) {
-      const edited = !same(rule, before);
+      const edited = !agree(rule, before);
       if (declared === undefined) {
         if (edited) {
           definitions.set(name, rule);
@@ -209,7 +221,7 @@ export function reconcileWithRecipe(
         ordered.add(name);
         if (edited) {
           definitions.set(name, rule);
-          if (!same(declared, before)) changes.keptEdited.push(name);
+          if (!agree(declared, before)) changes.keptEdited.push(name);
         } else {
           definitions.set(name, declared);
           changes.updated.push(name);

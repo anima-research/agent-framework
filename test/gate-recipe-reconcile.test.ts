@@ -5,6 +5,8 @@
  * probe event reaches.
  */
 import { describe, it, beforeEach, afterEach } from 'node:test';
+import fs from 'node:fs';
+import { syncBuiltinESMExports } from 'node:module';
 import assert from 'node:assert';
 import {
   chmodSync, existsSync, linkSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync,
@@ -450,19 +452,139 @@ describe("EventGate's starts, through gate.json and the recipe kept beside it", 
     assert.match(logged.join('\n'), /the recorded recipe couldn't be read \(it names the rule "dm" twice\)/);
   });
 
-  it('leaves gate.json that names a rule twice as it is, records nothing new, and says why', () => {
+  it('only adds the rules gate.json lacks when it names a rule twice, records nothing new, and says why', () => {
     start(recipe1).gate.dispose();
     const recorded1 = readFileSync(lastRecipePath(configPath), 'utf-8');
-    const twice = JSON.stringify(config([rule('dm', 'dm'), rule('dm', 'dm-again'), catchAll]), null, 2);
-    writeFileSync(configPath, twice);
-    const { gate } = start(recipe2);
+    const twice = config([rule('dm', 'dm'), rule('dm', 'dm-again'), catchAll]);
+    writeFileSync(configPath, JSON.stringify(twice, null, 2));
+    const { gate, traces, logged } = start(recipe2);
     gate.dispose();
-    assert.strictEqual(readFileSync(configPath, 'utf-8'), twice);
+    // As an append did: gate.json's own rules as they were, then the recipe's that it lacked.
+    assert.deepStrictEqual(onDisk().policies, [...twice.policies, rule('agents', 'sync')]);
     assert.strictEqual(readFileSync(lastRecipePath(configPath), 'utf-8'), recorded1);
-    assert.match(gate.getStatus().errors.join('\n'), /At start, gate\.json names the rule "dm" twice, and the merge needs one rule per name, so the recipe wasn't applied: gate\.json is as it was, and nothing was recorded\./);
+    const said = 'At start, gate.json names the rule "dm" twice, and the merge with the recipe needs one rule per name, so it didn\'t '
+      + 'run: the start only adds the rules gate.json lacks ("agents"), after its own, and removes, redefines and records nothing.';
+    assert.ok(gate.getStatus().errors.includes(said), JSON.stringify(gate.getStatus().errors));
+    assert.ok(logged.includes(`[gate] ${said}`), JSON.stringify(logged));
+    assert.ok(!logged.some((line) => line.startsWith('[gate] the recipe was applied')), JSON.stringify(logged));
+    assert.deepStrictEqual(traces.filter((t) => t.type === 'gate:config-reconciled').map((t) => t.addedPolicies), [['agents']]);
     // A run-time edit loads and writes gate.json, and the start's word stays in status.
     gate.addPolicy(rule('watch', 'watch'));
-    assert.match(gate.getStatus().errors.join('\n'), /At start, gate\.json names the rule "dm" twice/);
+    assert.ok(gate.getStatus().errors.includes(said));
+  });
+
+  it('leaves gate.json that names a rule twice as it is when it lacks none of the recipe\'s rules, and says so', () => {
+    start(recipe1).gate.dispose();
+    const twice = JSON.stringify(config([rule('dm', 'dm'), rule('dm', 'dm-again'), catchAll]), null, 2);
+    writeFileSync(configPath, twice);
+    const { gate } = start(config([rule('dm', 'dm-v2'), catchAll]));
+    gate.dispose();
+    assert.strictEqual(readFileSync(configPath, 'utf-8'), twice);
+    assert.ok(gate.getStatus().errors.includes(
+      'At start, gate.json names the rule "dm" twice, and the merge with the recipe needs one rule per name, so it didn\'t run: '
+        + 'gate.json is as it was, and nothing was recorded.',
+    ), JSON.stringify(gate.getStatus().errors));
+  });
+
+  it('only adds the rules gate.json lacks at a later start whose recipe names a rule twice, and records nothing', () => {
+    start(recipe1).gate.dispose();
+    const recorded1 = readFileSync(lastRecipePath(configPath), 'utf-8');
+    const { gate } = start(config([rule('dm', 'dm-v2'), rule('dm', 'dm-again'), rule('new', 'new'), catchAll]));
+    gate.dispose();
+    // "zoo" and "sync" stay and "dm" keeps its definition: only "new" is added, after gate.json's own.
+    assert.deepStrictEqual(onDisk().policies, [...recipe1.policies, rule('new', 'new')]);
+    assert.strictEqual(readFileSync(lastRecipePath(configPath), 'utf-8'), recorded1);
+    assert.match(gate.getStatus().errors.join('\n'), /At start, the recipe names the rule "dm" twice, and the merge with the recipe needs one rule per name, so it didn't run: the start only adds the rules gate\.json lacks \("new"\)/);
+  });
+
+  it('compares rules by meaning, so a recipe rule wake_add_rule wrote back as the gate reads it still follows the recipe', () => {
+    // A recipe that leaves "behavior" out, which the gate reads as "always".
+    const brief = (name: string, pattern: string) => ({ name, match: rule(name, pattern).match }) as GatePolicy;
+    const recipeA = config([brief('dm', 'dm'), brief('zoo', 'zoo'), catchAll]);
+    const first = start(recipeA).gate;
+    // Re-issuing "dm" unchanged writes it as the gate reads it, "behavior" included.
+    first.addPolicy(brief('dm', 'dm'));
+    first.dispose();
+    assert.deepStrictEqual(onDisk().policies[0], rule('dm', 'dm'));
+    // gate.json's rule agrees with the recipe's, so a start keeps it as written and says nothing of it.
+    const again = start(recipeA);
+    again.gate.dispose();
+    assert.deepStrictEqual(onDisk().policies[0], rule('dm', 'dm'));
+    assert.deepStrictEqual(again.logged, []);
+    // A recipe that redefines it is followed, not kept as an edit nobody made.
+    const recipeB = config([rule('dm', 'dm-v2', 'defer'), brief('zoo', 'zoo'), catchAll]);
+    const { gate, logged } = start(recipeB);
+    gate.dispose();
+    assert.deepStrictEqual(onDisk().policies[0], rule('dm', 'dm-v2', 'defer'));
+    assert.deepStrictEqual(logged, ['[gate] the recipe was applied to gate.json: updated dm']);
+  });
+
+  it("doesn't count a change to a field the gate doesn't read as an edit, so a recipe change replaces it", () => {
+    start(recipe1).gate.dispose();
+    const noted = { ...rule('zoo', 'zoo'), note: 'kept by hand' };
+    writeFileSync(configPath, JSON.stringify({ ...recipe1, policies: [recipe1.policies[0], noted, ...recipe1.policies.slice(2)] }, null, 2));
+    // Unchanged, the recipe leaves the rule as written.
+    start(recipe1).gate.dispose();
+    assert.deepStrictEqual(onDisk().policies[1], noted);
+    // Changed, the recipe's rule takes its place as written.
+    const { gate, logged } = start(config([rule('dm', 'dm'), rule('zoo', 'zoo-v2'), rule('sync', 'sync'), catchAll]));
+    gate.dispose();
+    assert.deepStrictEqual(onDisk().policies[1], rule('zoo', 'zoo-v2'));
+    assert.match(logged.join('\n'), /updated zoo/);
+  });
+
+  it("names the merge's changes a write that fails at its open didn't save, with gate.json's rules in force as they were", (t) => {
+    start(recipe1).gate.dispose();
+    const before = readFileSync(configPath, 'utf-8');
+    const original = fs.writeFileSync;
+    const write = t.mock.method(fs, 'writeFileSync', (path: fs.PathOrFileDescriptor, data: string | NodeJS.ArrayBufferView, ...rest: unknown[]) => {
+      if (path !== configPath) return original(path, data, ...(rest as []));
+      throw Object.assign(new Error('EACCES: permission denied, open'), { code: 'EACCES', syscall: 'open' });
+    });
+    syncBuiltinESMExports();
+    let started: ReturnType<typeof start>;
+    try {
+      started = start(recipe2);
+    } finally {
+      write.mock.restore();
+      syncBuiltinESMExports();
+    }
+    const { gate } = started;
+    gate.dispose();
+    assert.strictEqual(readFileSync(configPath, 'utf-8'), before);
+    assert.deepStrictEqual(gate.getStatus().policies.map((p) => p.name), names(recipe1));
+    assert.deepStrictEqual(recorded(), recipe1, 'nothing recorded');
+    const errors = gate.getStatus().errors.join('\n');
+    assert.match(errors, /At start, the host's starting rules "agents" couldn't be added to gate\.json \(EACCES: permission denied, open\)/);
+    assert.match(errors, /At start, the recipe's changes to gate\.json \("zoo", "sync" and "dm"\) weren't saved \(EACCES: permission denied, open\), so gate\.json's rules are in force as they were\. Whoever runs this host can fix what kept them from being written\./);
+  });
+
+  it('runs what a merge write that fails partway held, and names the changes it was writing', (t) => {
+    start(recipe1).gate.dispose();
+    const original = fs.writeFileSync;
+    const write = t.mock.method(fs, 'writeFileSync', (path: fs.PathOrFileDescriptor, data: string | NodeJS.ArrayBufferView, ...rest: unknown[]) => {
+      if (path !== configPath) return original(path, data, ...(rest as []));
+      const text = String(data);
+      original(path, text.slice(0, Math.floor(text.length / 2)));
+      throw Object.assign(new Error('ENOSPC: no space left on device, write'), { code: 'ENOSPC', syscall: 'write' });
+    });
+    syncBuiltinESMExports();
+    let started: ReturnType<typeof start>;
+    try {
+      started = start(recipe2);
+    } finally {
+      write.mock.restore();
+      syncBuiltinESMExports();
+    }
+    const { gate } = started;
+    gate.dispose();
+    // What the write held: the merge's rules, "zoo" and "sync" removed and "dm" redefined, not gate.json's plus additions.
+    assert.deepStrictEqual(gate.getStatus().policies.map((p) => p.name), ['dm', 'agents', 'catch-all']);
+    assert.deepStrictEqual(recorded(), recipe1, 'nothing recorded');
+    const errors = gate.getStatus().errors.join('\n');
+    assert.match(errors, /At start, writing the recipe's changes to gate\.json \("agents", "zoo", "sync" and "dm"\) failed partway \(ENOSPC: no space left on device, write\), so gate\.json may be left part-written\. The gate runs the rules that write held, which aren't saved/);
+    assert.match(errors, /the gate runs the rules its start was writing to gate\.json\./);
+    assert.doesNotMatch(errors, /the ones it was adding/);
   });
 
   it('seeds gate.json at the first start with a recipe that names a rule twice, as given, and records nothing', () => {

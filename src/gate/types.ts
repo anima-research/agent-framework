@@ -172,8 +172,10 @@ export interface GateOptions {
    * which the gate keeps beside gate.json (`gate.recipe.json`): a rule the
    * recipe dropped, renamed, moved or redefined follows it, a rule edited at
    * run time or by hand stays, and so does one no recipe declared. Rules are
-   * merged as written, by name: a recipe's rule with no name is never merged,
-   * as one with no name was never added. See `recipe-reconcile.ts`.
+   * merged by name, compared by what they mean and kept as written: a
+   * recipe's rule with no name is never merged, as one with no name was never
+   * added, and where gate.json or the recipe names a rule twice, a start only
+   * adds the rules gate.json lacks. See `recipe-reconcile.ts`.
    */
   config?: GateConfig;
   /**
