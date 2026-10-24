@@ -243,8 +243,8 @@ export interface MountConfig {
    * it can't tell apart, a path there is a guess too, however exactly it
    * matches, and the answer names that directory as the path spells it, with
    * the nested directory's spelling only in the step for a new file, names no
-   * host path, and asks for the configuration to be checked. Four cases fall
-   * outside this, as for any nested mount, and a fifth on a direct one: a
+   * host path, and asks for the configuration to be checked. Five cases fall
+   * outside this, as for any nested mount, and a sixth on a direct one: a
    * level's folding is read at each start, and beneath a direct mount whose
    * root has moved since, at each call there, so one whose folding changes
    * meanwhile is judged as that read found it; on a disk whose folding goes
@@ -254,12 +254,18 @@ export interface MountConfig {
    * names and not others, a name the comparison keeps apart can reach the
    * directory; a second path to the directory that isn't a link, such as a
    * bind mount, isn't found to lead there, though a walk passes over it,
-   * knowing each nested root by which directory it is; and a nested mount
+   * knowing each nested root by which directory it is; a nested mount
    * whose root moves while running, as `acceptRoot` takes, stays placed where
-   * it was until the next start; and where a direct mount's root is repointed
-   * between a read's parse and its open, a race left to whoever writes the
-   * disk, a mount nested in it by its directories alone, since its real root
-   * holds that root, can have the read serve a path in its directory.
+   * it was until the next start; on a filesystem whose change times this
+   * module doesn't trust (filesystemTrustsCtime), a name a start reads a
+   * level's folding by, removed and made again meanwhile under the same
+   * inode number and change time, can make a level that folds case read as
+   * one that tells it apart, when its spelling in the other case is looked up
+   * while it's gone; and where a direct mount's root is repointed between a
+   * read's parse and its open, or a write's parse and its staging, a race
+   * left to whoever writes the disk, a mount nested in it by its directories
+   * alone, since its real root holds that root, can have the read serve a
+   * path in its directory, or the write land there.
    *
    * Text the host registers for a path (`registerGeneratedTextFile`) is
    * served there whatever the include says, since it isn't one of the

@@ -760,7 +760,11 @@ export async function foldsCase(dir: string): Promise<boolean> {
  * there tells nothing, since a disk that folds case but numbers a file anew
  * for each spelling it's looked up by, as a FUSE filesystem may, finds the
  * one file under every spelling. A name with no such spelling tells nothing
- * then either. Given `name`, a name `dir` holds, such as a path's own
+ * then either, and nor does nothing there on a filesystem whose change times
+ * this module doesn't trust (filesystemTrustsCtime): there the change time
+ * that tells a name replaced between the lookups can stay the same, so the
+ * name, gone for a moment, could make a disk that folds case read as one that
+ * tells it apart. Given `name`, a name `dir` holds, such as a path's own
  * segment, that name alone is looked up, in those spellings, and nothing is
  * listed, so nothing else `dir` holds is read: the flipped spelling finds the
  * same directory where `dir` folds case, and nothing, or another directory
@@ -789,7 +793,10 @@ export async function ownCaseFolding(dir: string, name?: string): Promise<boolea
     if (!before || !after || !unchanged(before, after) || flipped === undefined) return null;
     if (flipped === null) return false;
     if (sameFile(after, flipped)) return true;
-    return other !== null && third === null ? false : null;
+    // Reached only where the flipped spelling found another file, as twins
+    // in case do: nothing at the third spelling tells case apart only where
+    // the change time would have shown the name replaced meanwhile.
+    return other !== null && third === null && (await filesystemTrustsCtime(dir)) ? false : null;
   };
   if (name !== undefined) return flippedAscii(name) === name ? null : told(name);
   let listed: Set<string>;

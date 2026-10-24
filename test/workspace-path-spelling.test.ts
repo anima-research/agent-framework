@@ -868,6 +868,28 @@ async function withLstat<T>(wrap: (original: typeof fs.promises.lstat) => typeof
   }
 }
 
+/**
+ * Run `fn` with node:fs/promises' statfs answering `type` for every path, as
+ * the module under test sees it, so whether a filesystem's change times are
+ * trusted is chosen here rather than by the disk the test runs on.
+ */
+async function withStatfsType<T>(type: number, fn: () => Promise<T>): Promise<T> {
+  const original = fs.promises.statfs;
+  fs.promises.statfs = (async (path: fs.PathLike, ...rest: unknown[]) => {
+    const found = await (original as (...args: unknown[]) => Promise<fs.StatsFs>)(path, ...rest);
+    return Object.assign(Object.create(Object.getPrototypeOf(found)), found, { type });
+  }) as typeof fs.promises.statfs;
+  syncBuiltinESMExports();
+  try {
+    return await fn();
+  } finally {
+    fs.promises.statfs = original;
+    syncBuiltinESMExports();
+  }
+}
+const EXT4 = 0xef53;
+const FUSE = 0x65735546;
+
 test('a name replaced while start reads a directory\'s folding tells nothing of it', async (t) => {
   const root = mkdtempSync(join(tmpdir(), 'workspace-path-spelling-replaced-'));
   t.after(() => rmSync(root, { recursive: true, force: true }));
@@ -941,12 +963,37 @@ test('where the flipped spelling finds another file than the name does, the name
     if (['Ab.txt', 'Ab'].includes(name)) return third === 'a file' ? lookup(join(root, 'other'), ...rest) : third === 'nothing' ? nothing() : failed();
     return lookup(path, ...rest);
   }) as typeof fs.promises.lstat;
-  for (const [third, answer] of [['nothing', false], ['a file', null], ['an error', null]] as const) {
-    assert.equal(await withLstat(lookups(third), () => ownCaseFolding(join(root, 'listed'))), answer, `from a listing, with ${third} at the third spelling`);
-    assert.equal(await withLstat(lookups(third), () => ownCaseFolding(root, 'ab')), answer, `from the name alone, with ${third} at the third spelling`);
+  // Nothing at the third spelling tells case apart only on a filesystem
+  // whose change times are trusted, which off Linux none is.
+  const told = process.platform === 'linux' ? false : null;
+  for (const [third, answer] of [['nothing', told], ['a file', null], ['an error', null]] as const) {
+    assert.equal(await withStatfsType(EXT4, () => withLstat(lookups(third), () => ownCaseFolding(join(root, 'listed')))), answer, `from a listing, with ${third} at the third spelling`);
+    assert.equal(await withStatfsType(EXT4, () => withLstat(lookups(third), () => ownCaseFolding(root, 'ab'))), answer, `from the name alone, with ${third} at the third spelling`);
   }
-  assert.equal(await withLstat(lookups('nothing'), () => ownCaseFolding(join(root, 'short'))), null, 'a name of one letter has no third spelling, from a listing');
-  assert.equal(await withLstat(lookups('nothing'), () => ownCaseFolding(root, 'd')), null, 'nor from the name alone');
+  assert.equal(await withStatfsType(EXT4, () => withLstat(lookups('nothing'), () => ownCaseFolding(join(root, 'short')))), null, 'a name of one letter has no third spelling, from a listing');
+  assert.equal(await withStatfsType(EXT4, () => withLstat(lookups('nothing'), () => ownCaseFolding(root, 'd'))), null, 'nor from the name alone');
+});
+
+test('nothing at the third spelling tells nothing on a filesystem whose change times aren\'t trusted', async (t) => {
+  // There a name removed and made again between the lookups, under an inode
+  // numbered by path and in the same coarse tick, keeps its change time, so
+  // the bracket can't tell it was gone, and a disk that folds case would
+  // read as one that tells it apart (FUSE without stable inode numbers).
+  const root = mkdtempSync(join(tmpdir(), 'workspace-path-spelling-untrusted-'));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  mkdirSync(join(root, 'listed'));
+  writeFileSync(join(root, 'listed', 'ab.txt'), '');
+  mkdirSync(join(root, 'ab'));
+  writeFileSync(join(root, 'other'), '');
+  const lookups = (original: typeof fs.promises.lstat) => ((path: fs.PathLike, ...rest: unknown[]) => {
+    const name = basename(String(path));
+    const lookup = original as (...args: unknown[]) => Promise<unknown>;
+    if (['AB.TXT', 'AB'].includes(name)) return lookup(join(root, 'other'), ...rest);
+    if (['Ab.txt', 'Ab'].includes(name)) return Promise.reject(Object.assign(new Error('ENOENT: no such file or directory'), { code: 'ENOENT' }));
+    return lookup(path, ...rest);
+  }) as typeof fs.promises.lstat;
+  assert.equal(await withStatfsType(FUSE, () => withLstat(lookups, () => ownCaseFolding(join(root, 'listed')))), null, 'from a listing');
+  assert.equal(await withStatfsType(FUSE, () => withLstat(lookups, () => ownCaseFolding(root, 'ab'))), null, 'from the name alone');
 });
 
 test('a name removed while its third spelling is looked up tells nothing of its directory\'s folding', async (t) => {
@@ -2298,13 +2345,13 @@ test("history in a nested mount's directory that mount's include leaves out stil
  * on the directory just before the start, and the outer mount following
  * links where asked.
  */
-async function nestedRig(t: TestContext, innerDir: string, opts: { history?: string[]; before?: (dir: string) => void; follow?: boolean } = {}) {
+async function nestedRig(t: TestContext, innerDir: string, opts: { history?: string[]; before?: (dir: string) => void; follow?: boolean; direct?: boolean; innerMode?: 'read-only' | 'read-write' } = {}) {
   const ctx = { isRestart: false, getState: () => null, setState: () => {}, pushEvent: () => {} } as unknown as ModuleContext;
   const root = mkdtempSync(join(tmpdir(), 'workspace-path-spelling-nested-'));
   const dir = join(root, 'mount');
   mkdirSync(dir);
   const store = JsStore.openOrCreate({ path: join(root, 'store') });
-  const outer: MountConfig = { name: 'outer', path: dir, mode: 'read-write', watch: 'never', ...(opts.follow ? { followSymlinks: true } : {}) };
+  const outer: MountConfig = { name: 'outer', path: dir, mode: 'read-write', watch: 'never', ...(opts.follow ? { followSymlinks: true } : {}), ...(opts.direct ? { backend: 'direct' as const } : {}) };
   if (opts.history) {
     for (const f of opts.history) {
       mkdirSync(dirname(join(dir, f)), { recursive: true });
@@ -2320,7 +2367,7 @@ async function nestedRig(t: TestContext, innerDir: string, opts: { history?: str
   opts.before?.(dir);
   const workspace = new WorkspaceModule({ mounts: [
     outer,
-    { name: 'inner', path: join(dir, ...innerDir.split('/')), mode: 'read-write', watch: 'never' },
+    { name: 'inner', path: join(dir, ...innerDir.split('/')), mode: opts.innerMode ?? 'read-write', watch: 'never' },
   ] });
   workspace.initStore(store);
   await workspace.start(ctx);
@@ -2335,6 +2382,28 @@ function refusedAsInner(result: ToolResult, use: string, what: string): void {
   assert.equal(result.success, false, `${what}: the outer mount took it (${JSON.stringify(result.data)})`);
   assert.match(String(result.error), new RegExp(`(lies in|may lie in|leads into|may lead into) mount "inner", nested in mount "outer".*use "${use.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}"`), what);
 }
+
+test('on a disk that keeps the normalization forms apart, a direct mount\'s write into a read-only nested mount\'s directory, in either form of its name, is refused, and nothing reaches the disk', { skip: NORMALIZATION_APART_ONLY }, async (t) => {
+  // A direct mount writes to disk at once, with no materialize between, so
+  // its own check before the write is all that keeps a file out of there.
+  const { tool, dir } = await nestedRig(t, 'caf\u00e9', { direct: true, innerMode: 'read-only', before: (d) => {
+    mkdirSync(join(d, 'caf\u00e9'));
+    writeFileSync(join(d, 'caf\u00e9', 'x.txt'), 'inner\n');
+  } });
+  refusedAsInner(await tool('write', { path: 'outer/cafe\u0301/new.md', content: 'x\n' }), 'inner/new.md', 'the other form');
+  refusedAsInner(await tool('write', { path: 'outer/caf\u00e9/new.md', content: 'x\n' }), 'inner/new.md', 'the same form');
+  assert.deepEqual(readdirSync(join(dir, 'caf\u00e9')), ['x.txt']);
+  assert.equal(existsSync(join(dir, 'cafe\u0301')), false, 'nothing was made in the other form');
+});
+
+test('where disk folds case, a direct mount\'s write into a read-only nested mount\'s directory spelled in another case is refused, and nothing reaches the disk', { skip: FOLDING_ONLY }, async (t) => {
+  const { tool, dir } = await nestedRig(t, 'inner', { direct: true, innerMode: 'read-only', before: (d) => {
+    mkdirSync(join(d, 'inner'));
+    writeFileSync(join(d, 'inner', 'x.txt'), 'inner\n');
+  } });
+  for (const path of ['outer/INNER/new.md', 'outer/Inner/new.md']) refusedAsInner(await tool('write', { path, content: 'x\n' }), 'inner/new.md', path);
+  assert.deepEqual(readdirSync(join(dir, 'inner')), ['x.txt']);
+});
 
 test('a draft naming a nested mount\'s directory or its parent in another case is that mount\'s, with nothing there on disk or in history', { skip: FOLDING_ONLY }, async (t) => {
   for (const [innerDir, draft] of [['inner', 'INNER/new.md'], ['inner', 'Inner/new.md'], ['sub/inner', 'SUB/INNER/new.md'], ['sub/inner', 'Sub/inner/new.md']] as const) {
