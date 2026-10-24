@@ -25,10 +25,16 @@
  * Autofetch policy (host default, not protocol): eager only below
  * DEFAULT_EAGER_FETCH_MAX_BYTES from the connection origin — anything under
  * that threshold the server could legitimately have inlined, so eager
- * materialization is never worse than the status quo. Everything larger is
- * fetched on demand (the fetch_reference tool, or the code-execution result
- * hook, where a script receiving a result is the strongest available signal
- * that the bytes are wanted). Per-server budgets cap cumulative appetite.
+ * materialization is never worse than the status quo for a reference whose
+ * claim is true. A fetch the eager default starts reads no further than the
+ * first chunk past its server's eager limit (autofetch.maxBytes, this
+ * default when that's unset), whatever size the server claims; one it joins
+ * is its starter's, whose success answers it too. The eager default doesn't
+ * choose a reference again once its fetch of it failed. Everything larger
+ * is fetched on demand (the fetch_reference tool, or the code-execution
+ * result hook, where a script receiving a result is the strongest available
+ * signal that the bytes are wanted). Per-server budgets cap cumulative
+ * appetite.
  */
 import { createHash } from 'node:crypto';
 import type { ReferenceRecord, Refusal, ServerAddress } from './references.js';
@@ -46,7 +52,10 @@ export const DEFAULT_EAGER_FETCH_MAX_BYTES = 256 * 1024;
  *  through a server reads counts against that server's, whether or not it's
  *  kept. */
 export const DEFAULT_MAX_TOTAL_BYTES = 1024 * 1024 * 1024;
+/** How long a caller waits for a fetch, its save included, unless it asks
+ *  for another time. */
 const FETCH_TIMEOUT_MS = 60_000;
+/** How long the eager default waits for one reference. */
 const EAGER_FETCH_TIMEOUT_MS = 10_000;
 
 // What calling again can do, as each failure's remedy says it. The fetcher
@@ -106,6 +115,45 @@ export type FetchOutcome =
 
 const refused = (error: string, remedy: string): { refusal: Refusal } => ({ refusal: { error, remedy } });
 const fail = (error: string, remedy: string): FetchOutcome => ({ ok: false, error, remedy });
+/** A timeout, naming the timeout that ran out: its starter's, when the
+ *  fetch is aborted at its deadline, or a caller's own, when its wait ends
+ *  while the fetch or its save goes on. */
+function tookLonger(timeoutMs: number): FetchOutcome {
+  const seconds = timeoutMs / 1000;
+  return fail(`it took longer than ${seconds} second${seconds === 1 ? '' : 's'}`, TRY_LATER);
+}
+
+/** The two endings that name a call's own byte ceiling, as a function of it,
+ *  so a caller that joined a fetch is told its own ceiling, not its
+ *  starter's. */
+const claimOver = (claimed: number) => (ceiling: number): string =>
+  `it claims ${claimed} bytes, over the ${ceiling} bytes this call allows`;
+const readPast = (received: number) => (ceiling: number): string =>
+  `the download had reached ${received} bytes, past the ${ceiling} bytes this call allows, so it was stopped and nothing was kept`;
+
+/** How a fetch ended, with the bound of its starter's it stopped on, if any:
+ *  its byte ceiling, which a claim over it reaches before dialing too, or its
+ *  deadline. A caller that takes a ceiling ending is told its own ceiling
+ *  (atCeiling). A deadline ending names its starter's timeout, which ran out
+ *  unanswered, so it holds for every caller that takes it. */
+type Ended = FetchOutcome & { stoppedBy?: 'ceiling' | 'deadline'; atCeiling?: (ceiling: number) => string };
+
+/** A fetch in flight, under the bounds of the caller that started it: its
+ *  byte ceiling and its timeout. */
+interface Flight {
+  ended: Promise<Ended>;
+  ceiling: number;
+  timeoutMs: number;
+}
+
+/** What the promise settles to, or undefined if the deadline, on the
+ *  monotonic clock, comes first. */
+function settledBy<T>(promise: Promise<T>, deadline: number): Promise<T | undefined> {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => resolve(undefined), Math.max(0, deadline - performance.now()));
+    promise.finally(() => clearTimeout(timer)).then(resolve, reject);
+  });
+}
 
 /** What calling again can do about a server's HTTP status. A later try can
  *  work after a timeout, a conflict or lock the server's state can clear, a
@@ -183,7 +231,7 @@ export class ReferenceFetcher {
    *  fetches through one server share the total, so each checks what the
    *  others have taken. */
   private totals = new Map<string, number>();
-  private inFlight = new Map<string, Promise<FetchOutcome>>();
+  private inFlight = new Map<string, Flight>();
 
   constructor(
     /** A server's address, credential and limits, by id, from the
@@ -222,19 +270,43 @@ export class ReferenceFetcher {
     return this.chosen((addressOf) => dialServer(record, addressOf));
   }
 
-  /** Would the eager (autofetch) default fetch this record? Not one the fetch
-   *  would refuse before dialing, asked as the eager fetch asks it, with the
-   *  default ceiling, so such a record takes no eager slot; and only one whose
-   *  claimed size is within the eager limit of the server it dials. For one
-   *  whose fetch is already under way, which the eager fetch would join as
-   *  fetch() does, only the server and its eager limit enter: the expiry,
-   *  the budget and the ceiling were checked when that fetch began. */
+  /** Would the eager (autofetch) default fetch this record? Not one whose
+   *  eager fetch already failed; not one the fetch would refuse before
+   *  dialing, asked with the default ceiling, so such a record takes no eager
+   *  slot; and only one whose claimed size is within the eager limit of the
+   *  server it dials. For one whose fetch is already under way, which the
+   *  eager fetch would join as fetch() does, only the server and its eager
+   *  limit enter: the expiry, the budget and the ceiling were checked when
+   *  that fetch began. */
   isEagerEligible(record: ReferenceRecord): boolean {
-    if (record.fetchedPath) return false;
+    if (record.fetchedPath || record.eagerFailed) return false;
     const check = this.inFlight.has(record.refId) ? this.serverFor(record) : this.beforeDial(record);
     if ('refusal' in check) return false;
-    const cap = check.binding.autofetch?.maxBytes ?? DEFAULT_EAGER_FETCH_MAX_BYTES;
-    return record.testimony.sizeBytes !== undefined && record.testimony.sizeBytes <= cap;
+    return record.testimony.sizeBytes !== undefined && record.testimony.sizeBytes <= this.eagerLimit(check.binding);
+  }
+
+  /** The eager default's fetch. One it starts reads no further than the first
+   *  chunk past the server's eager limit, whatever size the reference claims;
+   *  one it joins reads under its starter's ceiling, and that fetch's success
+   *  answers it too (fetch()). It waits no longer than
+   *  EAGER_FETCH_TIMEOUT_MS. One that fails is remembered on the record, so
+   *  the eager default doesn't choose that reference again; fetch_reference
+   *  still fetches it. */
+  async fetchEager(record: ReferenceRecord): Promise<FetchOutcome> {
+    const server = this.serverFor(record);
+    const maxBytes = this.eagerLimit('refusal' in server ? undefined : server.binding);
+    const outcome = await this.fetch(record, { maxBytes, timeoutMs: EAGER_FETCH_TIMEOUT_MS });
+    if (!outcome.ok) record.eagerFailed = true;
+    return outcome;
+  }
+
+  /** This server's eager limit: its autofetch.maxBytes,
+   *  DEFAULT_EAGER_FETCH_MAX_BYTES when that's unset. Eligibility holds a
+   *  claim to it, and a fetch the eager default starts stops reading at the
+   *  first chunk past it. The host's own ceiling, which every fetch checks
+   *  first, still holds past a larger one. */
+  private eagerLimit(binding: ResolvedServerBinding | undefined): number {
+    return binding?.autofetch?.maxBytes ?? DEFAULT_EAGER_FETCH_MAX_BYTES;
   }
 
   /** Every check the fetch makes before it dials, in its order: the server
@@ -248,7 +320,8 @@ export class ReferenceFetcher {
    *  ask this, so what save_recent_image says is the reason the fetch would
    *  refuse with, and no eager slot goes to a fetch that would be refused. */
   private beforeDial(record: ReferenceRecord, opts?: { maxBytes?: number }):
-    { refusal: Refusal } | { serverId: string; binding: ResolvedServerBinding; ceiling: number; budget: number } {
+    { refusal: Refusal; byCeiling?: true; atCeiling?: (ceiling: number) => string } |
+    { serverId: string; binding: ResolvedServerBinding; ceiling: number; budget: number } {
     const server = this.chosen((addressOf) => dialCheck(record, addressOf));
     if ('refusal' in server) return server;
     const { serverId, binding } = server;
@@ -272,17 +345,23 @@ export class ReferenceFetcher {
     // that's also over what's left of the budget is told about the budget,
     // which no max_bytes lifts. A claim over what's left but within the
     // ceiling still dials, and the budget stops it at its first chunk past.
+    // Both refusals here are reached only through the call's own ceiling, so
+    // each is that ceiling's ending: a caller whose ceiling holds the claim
+    // would dial, and one that joined this call's fetch does (fetch()).
     if (t.sizeBytes !== undefined && t.sizeBytes > ceiling) {
       if (t.sizeBytes > budget - used) {
-        return refused(
-          `it claims ${t.sizeBytes} bytes, more than the ${budget - used} bytes left of this host's fetch budget for the "${shownServerId(serverId)}" server`,
-          BUDGET,
-        );
+        return {
+          ...refused(
+            `it claims ${t.sizeBytes} bytes, more than the ${budget - used} bytes left of this host's fetch budget for the "${shownServerId(serverId)}" server`,
+            BUDGET,
+          ),
+          byCeiling: true,
+        };
       }
       // Within what's left of the budget and the host's ceiling, so a
       // ceiling of the call's own is what a larger max_bytes lifts.
-      return refused(`it claims ${t.sizeBytes} bytes, over the ${ceiling} bytes this call allows`,
-        `Pass max_bytes of at least ${t.sizeBytes} to fetch it.`);
+      const atCeiling = claimOver(t.sizeBytes);
+      return { ...refused(atCeiling(ceiling), `Pass max_bytes of at least ${t.sizeBytes} to fetch it.`), byCeiling: true, atCeiling };
     }
     return { serverId, binding, ceiling, budget };
   }
@@ -298,30 +377,63 @@ export class ReferenceFetcher {
     return 'refusal' in check ? check.refusal : null;
   }
 
-  /** Fetch a reference to workspace storage. Idempotent per record; concurrent
-   *  callers share one in-flight fetch. */
-  fetch(record: ReferenceRecord, opts?: { maxBytes?: number; timeoutMs?: number }): Promise<FetchOutcome> {
-    if (record.fetchedPath) {
-      return Promise.resolve({ ok: true, path: record.fetchedPath, bytes: record.verifiedBytes,
-        mimeType: record.verifiedMimeType, digestVerified: record.digestVerified });
+  /** Fetch a reference to workspace storage. Idempotent per record. Callers
+   *  of one record share the fetch in flight, each under its own bounds: it
+   *  waits no longer than its own timeout, counted from its call and covering
+   *  the save. When the fetch it joined stopped on its starter's byte ceiling
+   *  and its own is wider, it fetches again under its own. When that fetch
+   *  stopped at its starter's deadline, it fetches again only if it has more
+   *  time left than that starter's whole timeout, since a fresh fetch with no
+   *  more time than one that ran out unanswered would likely be stopped too;
+   *  otherwise it takes that ending. (A refetch's flight had less than its
+   *  starter's timeout, so this errs toward not dialing.) A fetch that
+   *  succeeds answers every caller waiting on it, whatever its own ceiling. A
+   *  save still running when a caller stops waiting goes on, and the record
+   *  is marked fetched when it lands. */
+  async fetch(record: ReferenceRecord, opts?: { maxBytes?: number; timeoutMs?: number }): Promise<FetchOutcome> {
+    const ceiling = opts?.maxBytes ?? DEFAULT_FETCH_MAX_BYTES;
+    const timeoutMs = opts?.timeoutMs ?? FETCH_TIMEOUT_MS;
+    const deadline = performance.now() + timeoutMs;
+    for (;;) {
+      if (record.fetchedPath) {
+        return { ok: true, path: record.fetchedPath, bytes: record.verifiedBytes,
+          mimeType: record.verifiedMimeType, digestVerified: record.digestVerified };
+      }
+      const flight = this.inFlight.get(record.refId) ?? this.start(record, ceiling, deadline, timeoutMs);
+      const ended = await settledBy(flight.ended, deadline);
+      if (ended === undefined) return tookLonger(timeoutMs);
+      const { stoppedBy, atCeiling, ...outcome } = ended;
+      if (stoppedBy === 'ceiling') {
+        if (ceiling > flight.ceiling) continue;
+        return (atCeiling ? { ...outcome, error: atCeiling(ceiling) } : outcome) as FetchOutcome;
+      }
+      if (stoppedBy === 'deadline' && deadline - performance.now() > flight.timeoutMs) continue;
+      return outcome as FetchOutcome;
     }
-    const existing = this.inFlight.get(record.refId);
-    if (existing) return existing;
-    const p = this.doFetch(record, opts).finally(() => this.inFlight.delete(record.refId));
-    this.inFlight.set(record.refId, p);
-    return p;
   }
 
-  private async doFetch(record: ReferenceRecord, opts?: { maxBytes?: number; timeoutMs?: number }): Promise<FetchOutcome> {
+  private start(record: ReferenceRecord, ceiling: number, deadline: number, timeoutMs: number): Flight {
+    const flight: Flight = {
+      ceiling,
+      timeoutMs,
+      ended: this.doFetch(record, ceiling, deadline, timeoutMs).finally(() => this.inFlight.delete(record.refId)),
+    };
+    this.inFlight.set(record.refId, flight);
+    return flight;
+  }
+
+  private async doFetch(record: ReferenceRecord, ceiling: number, deadline: number, timeoutMs: number): Promise<Ended> {
     const t = record.testimony;
-    const check = this.beforeDial(record, opts);
-    if ('refusal' in check) return fail(check.refusal.error, check.refusal.remedy);
-    const { serverId, binding, ceiling, budget } = check;
+    const check = this.beforeDial(record, { maxBytes: ceiling });
+    if ('refusal' in check) {
+      const refusal = fail(check.refusal.error, check.refusal.remedy);
+      return check.byCeiling ? { ...refusal, stoppedBy: 'ceiling', atCeiling: check.atCeiling } : refusal;
+    }
+    const { serverId, binding, budget } = check;
     const server = `the "${shownServerId(serverId)}" server`;
 
-    const timeoutMs = opts?.timeoutMs ?? FETCH_TIMEOUT_MS;
     const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    const timer = setTimeout(() => controller.abort(), Math.max(0, deadline - performance.now()));
     try {
       const headers: Record<string, string> = {};
       if (binding.token) headers.authorization = `Bearer ${binding.token}`;
@@ -360,8 +472,8 @@ export class ReferenceFetcher {
         }
         if (received > ceiling) {
           controller.abort();
-          return fail(`the download had reached ${received} bytes, past the ${ceiling} bytes this call allows, ` +
-            'so it was stopped and nothing was kept', largerMaxBytes(received, budget - total, server));
+          const atCeiling = readPast(received);
+          return { ...fail(atCeiling(ceiling), largerMaxBytes(received, budget - total, server)), stoppedBy: 'ceiling', atCeiling };
         }
         const buf = Buffer.from(value);
         hash.update(buf);
@@ -416,16 +528,13 @@ export class ReferenceFetcher {
       return { ok: true, path, bytes: data.length, mimeType: observedMime, digestVerified };
     } catch (e) {
       // The timer is the only abort that throws: the budget and the ceiling
-      // abort the download and return at once.
-      if ((e as Error)?.name === 'AbortError') {
-        const seconds = timeoutMs / 1000;
-        return fail(`it took longer than ${seconds} second${seconds === 1 ? '' : 's'}`, TRY_LATER);
-      }
+      // abort the download and return at once. It fires at the starter's
+      // deadline, and a caller with more time left than the starter's whole
+      // timeout fetches again (fetch()).
+      if ((e as Error)?.name === 'AbortError') return { ...tookLonger(timeoutMs), stoppedBy: 'deadline' };
       return fail(`the request to ${server} failed: ${boundedForLog(whyFetchFailed(e))}`, REQUEST_FAILED);
     } finally {
       clearTimeout(timer);
     }
   }
 }
-
-export { EAGER_FETCH_TIMEOUT_MS };

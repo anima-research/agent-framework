@@ -8,7 +8,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createServer } from 'node:http';
 import { createHash } from 'node:crypto';
-import { DEFAULT_FETCH_MAX_BYTES, ReferenceFetcher, normalizedOrigin, type ServerResolution } from '../src/mcpl/reference-fetcher.js';
+import { DEFAULT_EAGER_FETCH_MAX_BYTES, DEFAULT_FETCH_MAX_BYTES, ReferenceFetcher, normalizedOrigin, type ServerResolution } from '../src/mcpl/reference-fetcher.js';
 import { EXPIRY_REASON, noAddressReason, ReferenceRegistry, UNBOUND_REASON, classifyBlock, referenceExpiry, referenceRegistry, shownServerId, type ReferenceTestimony } from '../src/mcpl/references.js';
 import { AgentFramework } from '../src/framework.js';
 
@@ -50,6 +50,11 @@ const server = createServer((req, res) => {
     res.on('close', () => clearTimeout(timer));
     res.writeHead(200, { 'content-type': 'application/octet-stream' });
     res.write(Buffer.alloc(first, 9));
+  } else if (url.pathname === '/hang-first') {
+    // holds the first request to each path and query open, sending nothing,
+    // until its client gives up, and answers any later one at once
+    if (hits.get(req.url ?? '/') === 1) return;
+    res.writeHead(200, { 'content-type': 'audio/wav' }); res.end(PAYLOAD);
   } else if (url.pathname === '/liar') {
     // claims small in testimony, streams big (vector 10)
     res.writeHead(200, { 'content-type': 'application/octet-stream' });
@@ -664,6 +669,220 @@ test('a claim over max_bytes, once the budget is spent, is refused for the budge
   assert.equal(out.error, usedUp(PAYLOAD.length, PAYLOAD.length));
 });
 
+test('the eager default stops reading once past the eager limit, whatever size a reference claims, and leaves one it failed to fetch_reference', async (t) => {
+  const errors = t.mock.method(console, 'error', () => {});
+  // Claims 1000 bytes and sends a million, nearly four times the eager limit.
+  const path = '/drip?first=1000000&rest=0&wait=0&eager-overrun';
+  const block = { type: 'resource', uri: `${ORIGIN}${path}`, sizeBytes: 1000 };
+  await eagerFetch([block]);
+  const record = referenceRegistry.findByUri(block.uri)!;
+  assert.equal(record.fetchedPath, undefined, 'nothing saved');
+  const line = errors.mock.calls.map((call) => String(call.arguments[0])).find((l) => l.includes(record.refId)) ?? '';
+  const read = Number(new RegExp(`: the download had reached (\\d+) bytes, past the ${DEFAULT_EAGER_FETCH_MAX_BYTES} bytes this call allows`).exec(line)?.[1]);
+  assert.ok(read > DEFAULT_EAGER_FETCH_MAX_BYTES && read < 2 * DEFAULT_EAGER_FETCH_MAX_BYTES, line);
+  // The next result that carries it doesn't dial it again.
+  await eagerFetch([block]);
+  assert.equal(hits.get(path), 1);
+  // fetch_reference still reads it, under its own ceiling.
+  const out = await makeFetcher({ srv: { url: ORIGIN } }).fetch(record);
+  assert.equal(out.ok, true, out.error);
+  assert.equal(out.bytes, 1_000_000);
+});
+
+test("the eager default doesn't dial again a reference whose eager fetch failed for any reason", async (t) => {
+  t.mock.method(console, 'error', () => {});
+  const path = '/status/404?eager-404';
+  const block = { type: 'resource', uri: `${ORIGIN}${path}`, sizeBytes: 1000 };
+  await eagerFetch([block]);
+  await eagerFetch([block]);
+  assert.equal(hits.get(path), 1);
+});
+
+test("a server's own eager limit decides both which claims the eager default takes and how far its read goes", async (t) => {
+  const errors = t.mock.method(console, 'error', () => {});
+  const fetcher = makeFetcher({ srv: { url: ORIGIN, autofetch: { maxBytes: 2000 } } });
+  const overPath = '/drip?first=1000&rest=0&wait=0&own-limit-claim';
+  const underPath = '/drip?first=5000&rest=0&wait=0&own-limit-read';
+  const under = { type: 'resource', uri: `${ORIGIN}${underPath}`, sizeBytes: 1000 };
+  await eagerFetch([{ type: 'resource', uri: `${ORIGIN}${overPath}`, sizeBytes: 3000 }, under], fetcher);
+  assert.equal(hits.get(overPath), undefined, "a claim past the server's limit takes no eager slot");
+  const record = referenceRegistry.findByUri(under.uri)!;
+  assert.equal(record.fetchedPath, undefined, 'nothing saved');
+  const line = errors.mock.calls.map((call) => String(call.arguments[0])).find((l) => l.includes(record.refId)) ?? '';
+  assert.match(line, /: the download had reached \d+ bytes, past the 2000 bytes this call allows/);
+});
+
+test('the eager default waits for a reference no longer than its ten seconds, its save included, and a save that lands later still counts', { timeout: 10_000 }, async (t) => {
+  t.mock.method(console, 'error', () => {});
+  // The body comes from a stand-in for fetch, so the clock mocked below runs
+  // the fetcher's own timers and none of the HTTP client's, which later tests
+  // in this process use.
+  t.mock.method(globalThis, 'fetch', async () => new Response(PAYLOAD, { headers: { 'content-type': 'audio/wav' } }));
+  let entered!: () => void;
+  const saving = new Promise<void>((resolve) => { entered = resolve; });
+  let land!: () => void;
+  const landed = new Promise<void>((resolve) => { land = resolve; });
+  const fetcher = new ReferenceFetcher(() => ({ url: ORIGIN }), async (name) => {
+    entered();
+    await landed;
+    return `scratch/refs/${name}`;
+  });
+  const uri = `${ORIGIN}/ok?eager-save-stall`;
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  let done = false;
+  const pass = eagerFetch([{ type: 'resource', uri, sizeBytes: PAYLOAD.length }], fetcher).then(() => { done = true; });
+  await saving;
+  t.mock.timers.tick(9_000);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(done, false, 'still within its ten seconds');
+  t.mock.timers.tick(1_000);
+  await pass;
+  t.mock.timers.reset();
+  const record = referenceRegistry.findByUri(uri)!;
+  assert.equal(record.fetchedPath, undefined, 'the stub is made before the save lands');
+  land();
+  const out = await fetcher.fetch(record);
+  assert.equal(out.ok, true, out.error);
+  assert.equal(record.fetchedPath, `scratch/refs/${record.refId}.wav`);
+});
+
+test('a fetch that joins one in flight waits no longer than its own timeout, and the one it joined goes on', async () => {
+  const reg = new ReferenceRegistry();
+  const f = makeFetcher({ srv: { url: ORIGIN } });
+  // Ten bytes at once, the rest after three seconds.
+  const path = '/drip?first=10&rest=10&wait=3000&join-shorter';
+  const rec = makeRecord(reg, `${ORIGIN}${path}`);
+  let longerEnded = false;
+  const longer = f.fetch(rec).then((out) => { longerEnded = true; return out; });
+  const shorter = await f.fetch(rec, { timeoutMs: 200 });
+  assert.equal(shorter.error, 'it took longer than 0.2 seconds');
+  assert.equal(shorter.remedy, TRY_LATER);
+  assert.equal(longerEnded, false, 'the shorter caller stopped waiting before the fetch ended');
+  assert.equal((await longer).ok, true);
+  assert.equal(hits.get(path), 1, 'one download served both');
+});
+
+test("a fetch that joins one stopped by its starter's shorter timeout fetches again under its own", async () => {
+  const reg = new ReferenceRegistry();
+  const f = makeFetcher({ srv: { url: ORIGIN } });
+  // The first request is held unanswered, so only the starter's own
+  // deadline ends it; the second is answered at once.
+  const path = '/hang-first?join-longer';
+  const rec = makeRecord(reg, `${ORIGIN}${path}`);
+  const shorter = f.fetch(rec, { timeoutMs: 1000 });
+  const longer = await f.fetch(rec, { timeoutMs: 5000 });
+  assert.equal((await shorter).error, 'it took longer than 1 second');
+  assert.equal(longer.ok, true, longer.error);
+  assert.equal(hits.get(path), 2);
+});
+
+test("a fetch that joins one stopped at its starter's deadline, with no more time left than the starter's timeout, takes that ending without dialing again", async () => {
+  const reg = new ReferenceRegistry();
+  const f = makeFetcher({ srv: { url: ORIGIN } });
+  // The first request is held unanswered, and a second would be answered
+  // at once, so a dial again would show as the joiner's success.
+  const path = '/hang-first?join-later-deadline';
+  const rec = makeRecord(reg, `${ORIGIN}${path}`);
+  // The joiner's deadline is later than the starter's, but when the starter's
+  // second runs out it has half a second left, less than the starter had.
+  const starter = f.fetch(rec, { timeoutMs: 1000 });
+  const joiner = await f.fetch(rec, { timeoutMs: 1500 });
+  assert.equal((await starter).error, 'it took longer than 1 second');
+  assert.equal(joiner.error, 'it took longer than 1 second', 'the ending of the fetch it waited on');
+  assert.equal(hits.get(path), 1);
+});
+
+test("a fetch leaves none of its timers behind once it's answered", async (t) => {
+  // A stand-in for fetch, so no timer of the HTTP client's comes or goes.
+  t.mock.method(globalThis, 'fetch', async () => new Response(PAYLOAD, { headers: { 'content-type': 'audio/wav' } }));
+  const reg = new ReferenceRegistry();
+  const f = makeFetcher({ srv: { url: ORIGIN } });
+  const timers = () => process.getActiveResourcesInfo().filter((kind) => kind === 'Timeout').length;
+  const before = timers();
+  const out = await f.fetch(makeRecord(reg, `${ORIGIN}/ok?timers-cleared`));
+  assert.equal(out.ok, true, out.error);
+  assert.ok(timers() <= before, `${timers()} timers, ${before} before the fetch`);
+});
+
+test("a fetch that joins one stopped at its starter's smaller ceiling fetches again under its own", async () => {
+  const reg = new ReferenceRegistry();
+  const f = makeFetcher({ srv: { url: ORIGIN } });
+  // Stopped on the bytes that arrived, and on a claim, before dialing.
+  for (const [path, sizeBytes] of [['/drip?first=5000&rest=0&wait=0&join-ceiling', undefined], ['/drip?first=5000&rest=0&wait=0&join-claim', 5000]] as const) {
+    const rec = makeRecord(reg, `${ORIGIN}${path}`, sizeBytes === undefined ? {} : { sizeBytes });
+    const narrow = f.fetch(rec, { maxBytes: 1000 });
+    const wide = await f.fetch(rec);
+    assert.match((await narrow).error!, sizeBytes === undefined
+      ? /^the download had reached \d+ bytes, past the 1000 bytes this call allows, so it was stopped and nothing was kept$/
+      : /^it claims 5000 bytes, over the 1000 bytes this call allows$/, path);
+    assert.equal(wide.ok, true, `${path}: ${wide.error}`);
+    assert.equal(wide.bytes, 5000, path);
+    assert.equal(hits.get(path), sizeBytes === undefined ? 2 : 1, path);
+  }
+});
+
+test("a fetch that joins one refused for the budget on a claim over its starter's ceiling dials under its own, as it would alone", async () => {
+  const reg = new ReferenceRegistry();
+  // What's left of the budget holds the body, though not what it claims.
+  const f = makeFetcher({ srv: { url: ORIGIN, autofetch: { maxTotalBytes: PAYLOAD.length + 100 } } });
+  const path = '/ok?join-claim-budget';
+  const rec = makeRecord(reg, `${ORIGIN}${path}`, { sizeBytes: 10_000_000 });
+  const narrow = f.fetch(rec, { maxBytes: 1000 });
+  const wide = await f.fetch(rec);
+  assert.match((await narrow).error!, /^it claims 10000000 bytes, more than the \d+ bytes left of this host's fetch budget for the "srv" server$/);
+  assert.equal(wide.ok, true, wide.error);
+  assert.equal(hits.get(path), 1);
+});
+
+test("a fetch that joins a wider one stopped at its ceiling takes that ending, told its own ceiling", async () => {
+  const reg = new ReferenceRegistry();
+  const f = makeFetcher({ srv: { url: ORIGIN } });
+  // Stopped on the bytes that arrived, and on a claim, before dialing.
+  for (const [path, sizeBytes] of [['/drip?first=5000&rest=0&wait=0&narrow-read', undefined], ['/drip?first=5000&rest=0&wait=0&narrow-claim', 5000]] as const) {
+    const rec = makeRecord(reg, `${ORIGIN}${path}`, sizeBytes === undefined ? {} : { sizeBytes });
+    const wide = f.fetch(rec, { maxBytes: 3000 });
+    const narrow = await f.fetch(rec, { maxBytes: 1000 });
+    const told = (ceiling: number) => sizeBytes === undefined
+      ? new RegExp(`^the download had reached \\d+ bytes, past the ${ceiling} bytes this call allows, so it was stopped and nothing was kept$`)
+      : new RegExp(`^it claims 5000 bytes, over the ${ceiling} bytes this call allows$`);
+    assert.match((await wide).error!, told(3000), path);
+    assert.match(narrow.error!, told(1000), path);
+    assert.equal(narrow.remedy, (await wide).remedy, path);
+    assert.equal(hits.get(path), sizeBytes === undefined ? 1 : undefined, path);
+  }
+});
+
+test('a fetch that joins a wider one gets its success, past its own ceiling, without dialing again', async () => {
+  const reg = new ReferenceRegistry();
+  const f = makeFetcher({ srv: { url: ORIGIN } });
+  const path = '/drip?first=5000&rest=0&wait=0&join-success';
+  const rec = makeRecord(reg, `${ORIGIN}${path}`);
+  const wide = f.fetch(rec);
+  const narrow = await f.fetch(rec, { maxBytes: 1000 });
+  assert.equal(narrow.ok, true, narrow.error);
+  assert.equal(narrow.bytes, 5000);
+  assert.equal((await wide).path, narrow.path);
+  assert.equal(hits.get(path), 1);
+});
+
+test("a fetch that joins one ending on the server's answer gets that answer, and doesn't dial again", async () => {
+  const reg = new ReferenceRegistry();
+  const f = makeFetcher({ srv: { url: ORIGIN } });
+  const path = '/status/404?join-404';
+  const rec = makeRecord(reg, `${ORIGIN}${path}`);
+  const narrow = f.fetch(rec, { maxBytes: 1000, timeoutMs: 5000 });
+  const wide = await f.fetch(rec);
+  assert.equal((await narrow).error, 'the "srv" server answered HTTP 404');
+  assert.equal(wide.error, 'the "srv" server answered HTTP 404');
+  assert.equal(hits.get(path), 1);
+});
+
+test('a fetch whose server lookup throws rejects its caller rather than timing it out', async () => {
+  const reg = new ReferenceRegistry();
+  const f = new ReferenceFetcher(() => { throw new Error('lookup failed'); }, async () => null);
+  await assert.rejects(f.fetch(makeRecord(reg, `${ORIGIN}/ok?lookup-throws`), { timeoutMs: 1000 }), /lookup failed/);
+});
+
 test('eager eligibility: small + sized + connection origin only', () => {
   const reg = new ReferenceRegistry();
   const f = makeFetcher({ srv: { url: ORIGIN } });
@@ -985,12 +1204,11 @@ test("a reference whose fetch is under way stays eager-eligible once that fetch 
   assert.equal(f.isEagerEligible(record), true, 'still joined');
   assert.equal(f.refusal(record), null);
   record.testimony = claimed;
-  // A later tool result carrying the reference: the eager pass asks fetch() for it, and gets the fetch under way.
+  // A later tool result carrying the reference: the eager pass asks fetch() for it, and joins the fetch under way.
   const asked = t.mock.method(f, 'fetch');
   const eager = eagerFetch([{ type: 'resource', uri, sizeBytes: PAYLOAD.length }], f);
   assert.equal(asked.mock.callCount(), 1, 'the eager pass asked for the reference');
   assert.equal(asked.mock.calls[0].arguments[0], record);
-  assert.equal(asked.mock.calls[0].result, fetching, 'and joined the fetch under way');
   releaseSave();
   const [out] = await Promise.all([fetching, eager]);
   assert.equal(out.ok, true, out.error);

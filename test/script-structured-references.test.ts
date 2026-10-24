@@ -166,16 +166,14 @@ async function withPeers(fn: (h: Harness) => Promise<void>, opts: { eager?: bool
   // Stands in for the host-mediated fetcher: every reference is eager or
   // none is, as the test asks, the report is saved and anything else
   // refused, and a saved record returns at once.
-  internals.getReferenceFetcher = () => ({
-    isEagerEligible: () => opts.eager === true,
-    fetch: async (record: ReferenceRecord) => {
-      if (record.fetchedPath) return { ok: true, path: record.fetchedPath };
-      fetched.push(record.testimony.uri);
-      if (!record.testimony.uri.includes('report.pdf')) return { ok: false, error: 'refused by the test' };
-      record.fetchedPath = SAVED;
-      return { ok: true, path: SAVED };
-    },
-  });
+  const fetchFake = async (record: ReferenceRecord) => {
+    if (record.fetchedPath) return { ok: true, path: record.fetchedPath };
+    fetched.push(record.testimony.uri);
+    if (!record.testimony.uri.includes('report.pdf')) return { ok: false, error: 'refused by the test' };
+    record.fetchedPath = SAVED;
+    return { ok: true, path: SAVED };
+  };
+  internals.getReferenceFetcher = () => ({ isEagerEligible: () => opts.eager === true, fetch: fetchFake, fetchEager: fetchFake });
   const modelCall = (tool: string, server: 'files' | 'plain' = 'files') => new Promise<ToolResult>((resolve) => {
     const id = `model-${randomUUID()}`;
     const push = internals.pushEvent;

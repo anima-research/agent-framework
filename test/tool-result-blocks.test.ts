@@ -592,10 +592,8 @@ describe("MCP's resource_link, a reference (RFC-005 §8.1)", () => {
       getReferenceFetcher(): unknown;
     };
     const fetched: string[] = [];
-    fw.getReferenceFetcher = () => ({
-      isEagerEligible: () => true,
-      fetch: async (record: { testimony: { uri: string } }) => { fetched.push(record.testimony.uri); return { ok: true }; },
-    });
+    const fetchFake = async (record: { testimony: { uri: string } }) => { fetched.push(record.testimony.uri); return { ok: true }; };
+    fw.getReferenceFetcher = () => ({ isEagerEligible: () => true, fetch: fetchFake, fetchEager: fetchFake });
     const u = (name: string) => `https://zz-files.example/eager/${name}`;
     await fw.autoFetchReferences([
       { type: 'resource_link', uri: u('linked') },
