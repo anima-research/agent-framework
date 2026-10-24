@@ -1104,3 +1104,13 @@ test("the index's background sync names the index in the lines it logs", async (
     JSON.stringify(lines),
   );
 });
+
+test("the semantic index leaves out a stored context injection: a source's context, not something that happened", () => {
+  const row = (metadata: Record<string, unknown>): StoredMessage => ({
+    id: 'm1', sequence: 1, timestamp: new Date(0), participant: 'system_context:lessons',
+    content: [{ type: 'text', text: 'LESSON: check the logs first.' }], metadata,
+  } as unknown as StoredMessage);
+  assert.equal(semantic.messageToItem(row({ system: true, kind: 'context-injection',
+    contextInjection: { agent: 'prime', namespace: 'lessons', contentHash: 'h', part: 0, parts: 1 } }), {}), null);
+  assert.ok(semantic.messageToItem(row({}), {}), 'the premise: the same row unmarked is indexed');
+});

@@ -298,10 +298,32 @@ describe('Conversation routing', () => {
   }
 
   /** The line a spawn logs for a seed that left something out. */
-  function seedLine(thinking: number, calls: number, results: number, notices = 0): string {
-    return `[conversation] ${forkName('slack:D3', 1)}: seeded from trunk without ${thinking} thinking block(s), ` +
+  function seedLine(thinking: number, calls: number, results: number, notices = 0, injections = 0): string {
+    return `[conversation] ${forkName('slack:D3', 1)}: seeded from trunk without ${injections} stored context injection(s), ` +
+      `${thinking} thinking block(s), ` +
       `${notices} channel or by-name notice(s), ${calls} unanswered tool call(s) and ${results} orphaned tool result(s)`;
   }
+
+  it("a fork's seed leaves out the trunk's stored context injections, as it had none before they were stored, and says so", async () => {
+    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'ok' }]));
+    const framework = await makeFramework();
+    const trunk = framework.getAgent('trunk')!;
+    trunk.getContextManager().addMessage('user', [{ type: 'text', text: 'HANDBOOK: always check the logs first.' }]);
+    // A speaker whose name looks like an injection's participant is conversation, and stays.
+    trunk.getContextManager().addMessage('system_context:visitor', [{ type: 'text', text: 'VISITOR: hello from outside.' }]);
+    const injection = { namespace: 'lessons', position: 'afterUser' as const, content: [{ type: 'text' as const, text: 'TRUNK-LESSON' }] };
+    const left = (framework as unknown as {
+      storeInjections(agent: unknown, injections: unknown[]): unknown[] | undefined;
+    }).storeInjections(trunk, [injection]);
+    assert.equal(left, undefined, 'the premise: the trunk stored it');
+    assert.ok(trunk.getContextManager().getAllMessages().some((m) => JSON.stringify(m.content).includes('TRUNK-LESSON')), 'the premise: the trunk holds it');
+
+    const { seeded, lines } = await seedOf(framework);
+    assert.ok(seeded.some((m) => JSON.stringify(m.content).includes('HANDBOOK')), 'the fork inherits the trunk\'s conversation');
+    assert.ok(!seeded.some((m) => JSON.stringify(m.content).includes('TRUNK-LESSON')), 'and not its stored injection');
+    assert.ok(seeded.some((m) => JSON.stringify(m.content).includes('VISITOR')), 'a speaker named like one is kept: the seed goes by the mark, not the name');
+    assert.deepEqual(lines, [seedLine(0, 0, 0, 0, 1)]);
+  });
 
   it('fork inherits the template context, and a seed that leaves nothing out logs nothing', async () => {
     membrane.pushResponse(createMockResponse([{ type: 'text', text: 'ok' }]));

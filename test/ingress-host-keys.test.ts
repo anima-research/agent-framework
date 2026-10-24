@@ -28,6 +28,9 @@ const HOST_KEYS: Record<string, unknown> = {
   deferredWriteId: 'a-queued-write',
   external: { source: 'discord', id: '1548000000000000002' },
   openaiResponsesItems: [],
+  // A stored context injection's mark: every other agent's view leaves such a row out.
+  contextInjection: { agent: 'scout', namespace: 'lessons', contentHash: 'h', part: 0, parts: 1 },
+  primaryIfUnread: true,
 };
 
 async function waitFor(cond: () => boolean, what: string, timeoutMs = 15_000): Promise<void> {
@@ -90,6 +93,9 @@ describe("a server's metadata, stored without the keys only the host writes", ()
     await waitFor(() => !!storedWith((m) => m.messageId === 'm-1'), 'message stored');
     const metadata = storedWith((m) => m.messageId === 'm-1')!.metadata as Record<string, unknown>;
     for (const key of Object.keys(HOST_KEYS)) assert.equal(Object.hasOwn(metadata, key), false, `${key} is dropped`);
+    // Dropped at ingress, not only by addMessage's strip of the run mark, so
+    // a channel message stored straight into a fork can't carry it either.
+    assert.ok(drops().some((line) => line.includes('dropped "primaryIfUnread"')), drops().join('\n'));
     assert.equal(metadata.replyTo, 'm-0');
     assert.equal(metadata.guildName, 'Guild One');
   });
