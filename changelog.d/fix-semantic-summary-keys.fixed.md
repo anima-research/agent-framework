@@ -6,8 +6,9 @@
   which a branch that inherits it keeps. A hit whose time isn't this branch's
   summary's is dropped as off-branch and counted in `index.droppedOffBranch`.
   Hits still show the id as `sum:<id>`. An item from before, under the id
-  alone, can hold another branch's summary, so it's never a hit and isn't
-  counted.
+  alone, can hold another branch's summary, so it's never a hit. It's
+  counted as off-branch when its id names no summary on this branch, and
+  otherwise isn't counted, since it may hold this branch's own.
 - Each branch sends its own messages and summaries to the index. The sync
   cursors are kept in the history module's state, which the store's branches
   carry, where they were the service's one watermark for every branch. So a

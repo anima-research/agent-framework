@@ -649,8 +649,8 @@ export class HistoryModule implements Module {
 
   /**
    * Background sync into the semantic index: every `syncIntervalMs` (default
-   * 60 s) write at most `maxSyncPerTick` items to the index, by the
-   * service's own count. Idempotent to call — starts
+   * 60 s) write at most `maxSyncPerTick` items to the index, counted as its
+   * doc says. Idempotent to call — starts
    * once we have both a context-manager (bind) and a config; `unref`'d so it
    * never keeps a shutting-down process alive. A first tick runs after 5 s so
    * a fresh store starts backfilling immediately rather than a minute later.
@@ -1621,10 +1621,11 @@ export class HistoryModule implements Module {
       );
     }
 
-    // Bounded catch-up so the newest messages are searchable; never block on a backlog.
+    // A catch-up bounded in what it writes, so the newest messages are
+    // searchable without waiting on a backlog. It can re-send many items the
+    // index holds unchanged, as on a branch's first pass (maxSyncPerTick's
+    // doc), which costs a request per batch and no embedding.
     let sync: SyncReport | null = null;
-    // The branch the catch-up synced, which the search may leave while it waits.
-    const syncedOn = this.indexer?.branchId();
     if (this.indexer) {
       try { sync = await this.indexer.catchUp(this.semanticCfg.maxSyncBeforeSearch ?? 256); } catch { /* reported via indexer.lastError */ }
     }
@@ -1716,14 +1717,16 @@ export class HistoryModule implements Module {
         return 'ok';
       }
       if (sum !== null) {
-        // An item from before keys carried the creation time can hold this
-        // branch's summary or another branch's under the same id, so it's
-        // never a hit, and isn't counted. Until this branch's passes send the
-        // summary under its own key, as the search's catch-up does first
-        // within its budget, a search can miss it.
-        if (sum.createdMs === null) return 'superseded';
+        // An item from before keys carried the creation time is never a hit.
+        // One whose id names no summary on this branch is another branch's,
+        // and is counted as such. One whose id this branch has can hold this
+        // branch's summary or another's under the same id, and isn't counted.
+        // Until this branch's passes send the summary under its own key, as
+        // the search's catch-up does within its budget after any queued
+        // edits, a search can miss it.
         const s = cm.getSummary(sum.id);
         if (!s) return 'offBranch';
+        if (sum.createdMs === null) return 'superseded';
         if (s.created !== sum.createdMs) return 'offBranch';
         const text = summaryIndexText(s, this.semanticCfg!);
         // An empty text here is mostly defensive: context-manager drops a
@@ -1821,7 +1824,10 @@ export class HistoryModule implements Module {
         hits,
         index: {
           indexed: res.count_indexed,
-          behind: sync && this.indexer?.branchId() === syncedOn ? sync.more : this.indexer === null ? null : true,
+          // The pass may have read another branch: one the search joined
+          // that started before a switch, or one the search left while it
+          // waited.
+          behind: this.indexer === null ? null : sync && this.indexer.passedOn(sync) === this.indexer.branchId() ? sync.more : true,
           syncedThisCall: sync ? sync.pushed : 0,
           lastError: this.indexer?.lastError ?? null,
           /** Hits the index returned for messages/summaries not on the current branch (undone, checked out past). */

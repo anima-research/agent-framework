@@ -51,14 +51,27 @@ export interface SemanticIndexConfig {
   /** Items per upsert request. Default 128, max 256 (service limit). */
   syncBatch?: number;
   /**
-   * The most items one background tick adds to or changes in the index,
-   * by the service's own count of what each upsert wrote (inserted or
-   * updated), with each queued edit counted as one. A tick still re-sends
-   * items the service already holds unchanged, such as the overlap behind
-   * the message cursor, and those cost nothing. Default 1024.
+   * The most items one background tick's pass writes to the index: what the
+   * service reports each upsert inserted or updated, with each queued edit
+   * counted as one. Deletes aren't counted: a pass sends its queued removals
+   * whatever the budget, and deletes the items its summaries had from before
+   * they were keyed by creation time as it sends them.
+   *
+   * A pass also re-sends items the service already holds unchanged, which
+   * cost nothing however many there are: the overlap behind the message
+   * cursor, the summaries since the summary cursor while a delete of their
+   * old items keeps failing, and, once on a branch with no cursor yet, as
+   * after upgrading to keys with the creation time, the summaries it shares
+   * with other branches. A tick that finds a pass already running, such as
+   * a search's catch-up, starts none of its own. Default 1024.
    */
   maxSyncPerTick?: number;
-  /** The most items a pre-search catch-up adds to or changes in the index before searching anyway, counted as for `maxSyncPerTick`. Default 256. */
+  /**
+   * The most items a pre-search catch-up writes to the index before
+   * searching anyway, counted as for `maxSyncPerTick`. A search that finds a
+   * pass already running, such as a tick's, waits for that pass instead,
+   * under that pass's own budget. Default 256.
+   */
   maxSyncBeforeSearch?: number;
   /** Re-scan window behind the message watermark, ms. Default 10 min. */
   overlapMs?: number;
@@ -250,7 +263,12 @@ export class SemanticIndexClient {
   }
 
   async upsert(items: IndexItem[]): Promise<{ inserted: number; updated: number; unchanged: number; count: number }> {
-    return this.call('POST', `/v1/index/${this.ns}/upsert`, { items }, { what: 'a JSON object', is: isObject });
+    return this.call('POST', `/v1/index/${this.ns}/upsert`, { items }, {
+      // A pass's budget spends the counts, so an answer without them isn't
+      // taken as one.
+      what: 'counts of the items inserted and updated', is: (json) => isObject(json)
+        && Number.isFinite((json as { inserted?: unknown }).inserted) && Number.isFinite((json as { updated?: unknown }).updated),
+    });
   }
 
   async delete(ids: string[]): Promise<{ deleted: number }> {
@@ -429,6 +447,8 @@ export interface SyncReport {
 
 export class SemanticIndexer {
   private inFlight: Promise<SyncReport> | null = null;
+  /** The branch each pass read, by its report, for a search that joined it. */
+  private readonly passBranch = new WeakMap<SyncReport, string>();
   private consecutiveFailures = 0;
   private backoffUntil = 0;
   lastError: string | null = null;
@@ -555,6 +575,9 @@ export class SemanticIndexer {
 
   get backingOff(): boolean { return Date.now() < this.backoffUntil; }
 
+  /** The branch the pass that gave this report read, or null if it read none. */
+  passedOn(report: SyncReport): string | null { return this.passBranch.get(report) ?? null; }
+
   /**
    * Push what the index is missing, writing at most `maxItems` items by the
    * service's own count (edits one each), and stopping where that runs out,
@@ -600,6 +623,7 @@ export class SemanticIndexer {
       // message cursor starts from the service's watermark, as before cursors
       // were kept per branch, so an upgrade doesn't walk every history again.
       const branch = this.branchId();
+      this.passBranch.set(report, branch);
       // Set when a read of the store finds it on another branch.
       let strayed = false;
       // Set when a delete of summaries' old items fails.
@@ -617,10 +641,13 @@ export class SemanticIndexer {
       // A branch's cursor is its own while the index holds what it sent, and
       // the index's when it doesn't. Every branch's items are in the one
       // index, so an index whose newest item of a kind is older than the
-      // cursor has lost what this branch sent, as a restore from an older
-      // backup leaves it, and the pass walks from the index's newest, as the
-      // service's watermark did before cursors were kept. A kind the stats
-      // don't list has no items left.
+      // cursor may have lost what this branch sent, as a restore from an
+      // older backup leaves it, and the pass walks from the index's newest,
+      // as the service's watermark did before cursors were kept. Nothing is
+      // lost when the newest the branch walked had nothing to index, such as
+      // a summary that's blank once trimmed, or was removed since, and then
+      // the pass re-sends what lies between, which the service finds
+      // unchanged. A kind the stats don't list has no items left.
       const held = (cursor: number | null, kind: string): number | null => {
         if (cursor === null || stats === null) return cursor;
         const newest = stats.by_kind[kind]?.max_cursor ?? null;
@@ -634,7 +661,8 @@ export class SemanticIndexer {
       // messages spend what the service says each upsert wrote (inserted or
       // updated), so a re-send it finds unchanged, such as the overlap's
       // behind the message cursor, costs nothing and can't freeze a pass.
-      let budget = maxItems;
+      // A budget of 1.5 writes one item.
+      let budget = Math.floor(maxItems);
       let pending: IndexItem[] = [];
       const flush = async (): Promise<void> => {
         if (pending.length === 0) return;
@@ -761,14 +789,18 @@ export class SemanticIndexer {
         }
         await flush();
         if (finished) through = at;
-        // The index's old items go once their summaries' new ones are in. On
-        // a service without /delete they stay, and search leaves them out. A
-        // failed delete leaves the cursor, so the next pass sends those
-        // summaries and deletes again.
+        // The index's old items go once their summaries' new ones are in, a
+        // batch of ids to a request. On a service without /delete they stay,
+        // and search leaves them out. A failed delete leaves the cursor, so
+        // the next pass sends those summaries again, which the service finds
+        // unchanged, and deletes again.
         let deleted = true;
         if (oldKeys.length > 0 && !noIndex && !this.deleteUnsupported) {
           try {
-            const missing = await this.deleteIds(oldKeys, stats);
+            let missing: string | null = null;
+            for (let i = 0; i < oldKeys.length && missing === null; i += batchSize) {
+              missing = await this.deleteIds(oldKeys.slice(i, i + batchSize), stats);
+            }
             if (missing !== null) {
               this.warn(
                 `/delete answered 404, so the service lacks that route; any items these ${oldKeys.length} summaries had `
@@ -800,13 +832,10 @@ export class SemanticIndexer {
       // of more than a page within one millisecond is walked, not jumped.
       let offset = 0;
       const pageSize = 256;
-      // The walk starts with the overlap's re-sends, which cost nothing but
-      // go out in chunks no bigger than the budget left: with less than a
-      // batch left, it waits for the next pass rather than re-send them a
-      // few at a time.
-      const short = budget < Math.min(batchSize, maxItems);
-      if (short) report.more = true;
-      for (let stopped = short; !stopped;) {
+      // The walk starts with the overlap's re-sends, which cost nothing, but
+      // like every chunk go out no bigger than the budget left, so a pass
+      // whose summaries left little sends them a few at a time.
+      for (let stopped = false; !stopped;) {
         if (budget <= 0) { report.more = true; break; }
         reading();
         const page = this.cm.queryMessagesByTime({ fromMs, offset, limit: pageSize });
