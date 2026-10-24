@@ -55,18 +55,19 @@ class QueuedStreamsMembrane extends MockMembrane {
   }
 }
 
-/** A tool whose one result is an image, as an MCP image block or as an
- *  embedded resource's image blob. */
+/** A tool whose result is the blocks given: an image, as an MCP image block
+ *  or as an embedded resource's image blob, and whatever a test puts beside
+ *  it. */
 class ImageToolModule implements Module {
   readonly name = 'canned';
-  constructor(private readonly block: unknown) {}
+  constructor(private readonly blocks: unknown[]) {}
   async start(): Promise<void> {}
   async stop(): Promise<void> {}
   getTools(): ToolDefinition[] {
     return [{ name: 'fetch', description: 'image', inputSchema: { type: 'object', properties: {} } }];
   }
   async handleToolCall(): Promise<ToolResult> {
-    return { success: true, data: [this.block], dataIsContent: true };
+    return { success: true, data: this.blocks, dataIsContent: true };
   }
   async onProcess(event: ProcessEvent): Promise<EventResponse> {
     if (event.type === 'external-message') {
@@ -457,14 +458,14 @@ describe('physical-window mid-turn restart (issue #92)', () => {
     // shows what the image round added: the same for an MCP image block and
     // for an embedded resource's image blob, each sent as a native image.
     const png = Buffer.from('89504e470d0a1a0a', 'hex').toString('base64');
-    const projected = async (block: unknown) => {
+    const projected = async (blocks: unknown[]) => {
       const t = await windowTurn([
         [
           round('call_1', { inputTokens: 20_000, cacheReadTokens: 150_000, outputTokens: 2_000 }),
           round(null, { inputTokens: 21_000, cacheReadTokens: 300_000, outputTokens: 2_500 }),
         ],
         afterRestart,
-      ], new ImageToolModule(block));
+      ], new ImageToolModule(blocks));
       try {
         assert.ok(t.done, 'the turn should finish');
         assert.strictEqual(t.restarts.length, 1);
@@ -473,10 +474,22 @@ describe('physical-window mid-turn restart (issue #92)', () => {
         await t.close();
       }
     };
-    const inline = await projected({ type: 'image', data: png, mimeType: 'image/png' });
-    const embedded = await projected({ type: 'resource', resource: { uri: 'file:///zz/shot.png', mimeType: 'image/png', blob: png } });
+    const image = { type: 'image', data: png, mimeType: 'image/png' };
+    const inline = await projected([image]);
+    const embedded = await projected([{ type: 'resource', resource: { uri: 'file:///zz/shot.png', mimeType: 'image/png', blob: png } }]);
     assert.ok(inline >= 170_000 + 2_000 + 32_000 + 1_600, String(inline));
     assert.strictEqual(embedded, inline);
+    // An image whose result's markers pass the cap together goes as the
+    // stored text (goesNative), so it adds nothing beyond that text: the
+    // projection counts the images the live copy sends, not the ones the
+    // data holds. 400 embedded pdfs' markers, 77 characters each, pass the
+    // default cap of 24,000; the same markers alone project within a few
+    // tokens of them beside the image, where 1,600 for the image would show.
+    const pdf = { type: 'resource', resource: { uri: 'file:///zz/doc.pdf', mimeType: 'application/pdf', blob: png } };
+    const markers = Array.from({ length: 400 }, () => pdf);
+    const besideImage = await projected([image, ...markers]);
+    const alone = await projected(markers);
+    assert.ok(Math.abs(besideImage - alone) < 100, `${besideImage} beside the image, ${alone} alone`);
   });
 
   it('counts a cache-write prompt term toward a restart', async () => {
