@@ -38,10 +38,10 @@ describe('skip_reply wake capability', () => {
     const routed: string[] = [];
     (framework as unknown as { channelRegistry: unknown }).channelRegistry = new Proxy({
       getChannelTools: () => [],
-      resolveLocus: () => 'channel:test',
+      resolveLocus: () => ({ serverId: 'stub', channelId: 'channel:test' }),
       routeSpeech: async (_agent: string, text: string) => {
         routed.push(text);
-        return { delivered: true, channelId: 'channel:test' };
+        return { delivered: true, serverId: 'stub', channelId: 'channel:test' };
       },
       handleChannelToolCall: async (_name: string, input: { wake_in_seconds?: number }) => ({
         success: true, endTurn: true,
@@ -124,8 +124,8 @@ describe('skip_reply wake capability', () => {
       agents: [{ name: 'agent', model: 'test', systemPrompt: 'test' }], modules: [],
     });
     (framework as unknown as { channelRegistry: unknown }).channelRegistry = new Proxy({
-      getChannelTools: () => [], resolveLocus: () => 'channel:test',
-      routeSpeech: async () => ({ delivered: true, channelId: 'channel:test' }),
+      getChannelTools: () => [], resolveLocus: () => ({ serverId: 'stub', channelId: 'channel:test' }),
+      routeSpeech: async () => ({ delivered: true, serverId: 'stub', channelId: 'channel:test' }),
       handleChannelToolCall: async () => ({ success: true, endTurn: true, data: { skipped: true } }),
     }, { get: (target, prop: string) => prop in target ? target[prop as keyof typeof target] : () => undefined });
     const agent = framework.getAgent('agent')!;
@@ -153,8 +153,8 @@ describe('skip_reply wake capability', () => {
     });
     const routed: string[] = [];
     (framework as unknown as { channelRegistry: unknown }).channelRegistry = new Proxy({
-      getChannelTools: () => [], resolveLocus: () => 'channel:test',
-      routeSpeech: async (_agent: string, text: string) => { routed.push(text); return { delivered: true, channelId: 'channel:test' }; },
+      getChannelTools: () => [], resolveLocus: () => ({ serverId: 'stub', channelId: 'channel:test' }),
+      routeSpeech: async (_agent: string, text: string) => { routed.push(text); return { delivered: true, serverId: 'stub', channelId: 'channel:test' }; },
       handleChannelToolCall: async () => ({ success: true, data: { delivered: true } }),
     }, { get: (target, prop: string) => prop in target ? target[prop as keyof typeof target] : () => undefined });
     const agent = framework.getAgent('agent')!;
@@ -188,8 +188,8 @@ describe('skip_reply wake capability', () => {
     });
     const routed: string[] = [];
     (framework as unknown as { channelRegistry: unknown }).channelRegistry = new Proxy({
-      getChannelTools: () => [], resolveLocus: () => 'channel:test',
-      routeSpeech: async (_agent: string, text: string) => { routed.push(text); return { delivered: true, channelId: 'channel:test' }; },
+      getChannelTools: () => [], resolveLocus: () => ({ serverId: 'stub', channelId: 'channel:test' }),
+      routeSpeech: async (_agent: string, text: string) => { routed.push(text); return { delivered: true, serverId: 'stub', channelId: 'channel:test' }; },
       handleChannelToolCall: async () => ({ success: true, data: { delivered: true } }),
     }, { get: (target, prop: string) => prop in target ? target[prop as keyof typeof target] : () => undefined });
     const agent = framework.getAgent('agent')!;
@@ -293,8 +293,8 @@ describe('refused wake: no lifecycle events; a wake_in_seconds the host can\'t s
     const routed: string[] = [];
     const handled: string[] = [];
     (framework as unknown as { channelRegistry: unknown }).channelRegistry = new Proxy({
-      getChannelTools: () => [], resolveLocus: () => 'channel:test',
-      routeSpeech: async (_agent: string, text: string) => { routed.push(text); return { delivered: true, channelId: 'channel:test' }; },
+      getChannelTools: () => [], resolveLocus: () => ({ serverId: 'stub', channelId: 'channel:test' }),
+      routeSpeech: async (_agent: string, text: string) => { routed.push(text); return { delivered: true, serverId: 'stub', channelId: 'channel:test' }; },
       // What reached the registry: a skip_reply ends the turn, and a send
       // silences the rest of it.
       handleChannelToolCall: async (toolName: string) => {

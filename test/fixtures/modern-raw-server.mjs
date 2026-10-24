@@ -23,7 +23,8 @@
 // that aren't JSON-RPC messages, then answers), cont (a state-only
 // input_required first leg; the second leg does what arguments.leg2 says:
 // 'error', 'hang', 'ok', or 'again' for another state-only round every time.
-// arguments.leg1 'exit' exits just after the first leg's answer, and
+// arguments.leg1 'exit' stops reading its input, answers the first leg and
+// exits once that answer is written, so no second leg can reach it, and
 // 'elicit' asks for elicitation input instead), task (a result type this
 // revision doesn't define), bare (a result with no resultType), die (exits),
 // vanish (exits without answering), deafen (answers, then closes its stdin and
@@ -170,8 +171,12 @@ lines.on('line', (line) => {
               },
             });
           }
-          send({ jsonrpc: '2.0', id: m.id, result: { resultType: 'input_required', requestState: `state-for-${leg2}` } });
-          if (leg1 === 'exit') setTimeout(() => process.exit(5), 10);
+          const answer = { jsonrpc: '2.0', id: m.id, result: { resultType: 'input_required', requestState: `state-for-${leg2}` } };
+          // Stopping its input first, rather than exiting on a timer, keeps a
+          // second leg out whatever the timing: the client's next round can
+          // only meet the exit or a pipe nobody reads.
+          if (leg1 === 'exit') return deafen(() => process.stdout.write(`${JSON.stringify(answer)}\n`, () => process.exit(5)));
+          send(answer);
           return;
         }
         if (leg2 === 'error') return error(m.id, -32603, 'second leg failed', { leg: 2, state: m.params.requestState });

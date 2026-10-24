@@ -424,6 +424,6 @@ test("the direct Agent API reads each field of its caller's result once", async 
   ];
   const built = (agent as unknown as { buildToolResultMessages(r: unknown[]): Array<{ content: Array<{ content: string }> }> })
     .buildToolResultMessages(results);
-  assert.deepEqual(built[0].content.map((block) => block.content), [JSON.stringify('the payload'), 'what failed']);
+  assert.deepEqual(built[0].content.map((block) => block.content), ['the payload', 'what failed']);
 });
 

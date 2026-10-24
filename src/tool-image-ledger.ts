@@ -316,7 +316,8 @@ export interface StoredCut {
   head: string;
   /** The image slots past the cut that the stored copy re-appends after its
    *  truncation notice, in text order: the newest MAX_KEPT_IMAGE_SLOTS of
-   *  those the live copy showed. */
+   *  those the live copy showed, or under a readers' bound the newest of
+   *  those that fit it, down to none (cutStoredToolResultToFit). */
   kept: string[];
   /** How many image slots past the cut the live copy showed. */
   fell: number;
@@ -326,8 +327,10 @@ export interface StoredCut {
  * Where a tool result's text longer than `cap` is cut: by its stored copy
  * (cutStoredToolResult), by history's own truncation (truncateForHistory),
  * and by its live copy, for each text block beside an image
- * (tryNativeToolResultContent, framework.ts), so the stored copy and the live
- * copy cut alike. The text's length when it isn't longer than `cap`.
+ * (tryNativeToolResultContent, framework.ts), so at one cap the stored copy
+ * and the live copy cut alike. Under a readers' bound the stored copy's cut
+ * can come earlier (cutStoredToolResultToFit). The text's length when it
+ * isn't longer than `cap`.
  *
  * The cut is made at the cap, or before it when the cap would split a
  * surrogate pair (safeSlice's rule), and that is where the moves back are
@@ -395,9 +398,13 @@ export function cutStoredToolResult(text: string, cap: number, shown: ShownRange
 /** What a stored copy re-appends after its truncation notice: the kept
  *  slots, each on its own line so a reference stub stays parseable, under a
  *  note saying how many fell past the cut, and how many of those were left
- *  out and aren't counted. Empty when none fell past the cut. */
+ *  out and aren't counted, all of them where none fit the bound
+ *  (cutStoredToolResultToFit). Empty when none fell past the cut. */
 export function formatKeptImageSlots(cut: StoredCut): string {
   if (cut.fell === 0) return '';
+  if (cut.kept.length === 0) {
+    return `\n[${cut.fell} image slot(s) fell past the cut and are left out, and save_recent_image doesn't count them.]`;
+  }
   const leftOut = cut.fell - cut.kept.length;
   const note = leftOut === 0
     ? `${cut.fell} image slot(s) fell past the cut; kept here in order so save_recent_image still counts them:`
@@ -406,14 +413,88 @@ export function formatKeptImageSlots(cut: StoredCut): string {
   return `\n[${note}]\n${cut.kept.join('\n')}`;
 }
 
+/** The most a stored copy's truncation notice takes (spillOrTruncate,
+ *  framework.ts): the spill notice names its file twice, once in its paging
+ *  advice, and fits this on a path from a mount name of up to about seventy
+ *  characters. */
+export const TOOL_RESULT_NOTICE_ROOM = 640;
+
+/**
+ * A result's cap and bound when its message holds `n` results. A reader's
+ * strategy spends its per-message bound across the message's blocks in
+ * order, so each result takes an equal share of the readers' smallest
+ * bound, fixed before any result is cut, since its siblings may still be
+ * running when save_recent_image counts it, and its cap is at most that
+ * share. `keptCap` is where a withheld stub's kept fields are cut, leaving
+ * the stub's notice its room (tool-result-guard.ts). With no bound, each
+ * keeps the cap.
+ *
+ * Each result is then stored within its share, or at its least where its
+ * notice is longer than the share: whole where it's no longer than the
+ * notice (cutStoredToolResultToFit), otherwise its notice alone. So a reader's
+ * cut reaches a notice only when the turn, each result at its least, passes
+ * the bound. One edge: notices differ in length (by a few characters for
+ * the content's digits, more where call ids differ in length), and where a
+ * share falls between two of them, a result between its own notice and the
+ * share stays whole above its least, by up to that difference.
+ * A turn that then passes the bound by those characters loses the end of
+ * its last notice to the reader's cut, under context-manager's mark (whose
+ * token count is the notice's, not the result's); the notice's path and read
+ * call come before that end.
+ */
+export function toolResultShare(cap: number, bound: number | undefined, n: number): { cap: number; bound: number | undefined; keptCap: number } {
+  if (bound === undefined) return { cap, bound, keptCap: cap };
+  const share = Math.floor(bound / Math.max(1, n));
+  return { cap: Math.min(cap, share), bound: share, keptCap: Math.min(cap, Math.max(1, share - TOOL_RESULT_NOTICE_ROOM)) };
+}
+
+/**
+ * Cut a tool result's text at `cap` as cutStoredToolResult does, unless its
+ * stored copy would then pass `bound`, the most a reader's strategy keeps of
+ * it (toolResultShare): the head, room for the notice after it, and the kept
+ * slots after that (formatKeptImageSlots). A strategy cuts a longer message
+ * from its end, and with it the notice that holds the way to the rest, so
+ * there the head moves back until the copy fits. The kept slots grow as the
+ * head moves back, so the cut is found again until head and slots fit or the
+ * head is empty. Slots that alone pass the room keep the newest that fit,
+ * the rest left out and uncounted, as past MAX_KEPT_IMAGE_SLOTS. A bound
+ * under the notice's room can't hold the notice. With no bound, or where the
+ * cut at the cap already fits, the cut is cutStoredToolResult's.
+ *
+ * `notice`, given where `bound` is a text's share of one turn's bound, is the
+ * length of the notice a cut that keeps no head would carry
+ * (spillNoticeLength). A text no longer than what that cut would store in
+ * its place, the notice and, where it keeps no slot, the note on the slots it
+ * leaves out, is kept whole: a cut would only lengthen it. Only a cut that
+ * keeps no head can meet that, since one that keeps a head is cut past the
+ * notice's room. A cut that keeps slots is measured by its notice alone, as
+ * the slots it keeps are the text's own.
+ */
+export function cutStoredToolResultToFit(text: string, cap: number, shown: ShownRanges | null, bound: number | undefined, notice?: number): StoredCut {
+  let cut = cutStoredToolResult(text, cap, shown);
+  if (bound === undefined || text.length <= cap) return cut;
+  const room = bound - TOOL_RESULT_NOTICE_ROOM;
+  while (cut.head.length > 0 && cut.head.length + formatKeptImageSlots(cut).length > room) {
+    cut = cutStoredToolResult(text, Math.max(0, room - formatKeptImageSlots(cut).length), shown);
+  }
+  while (cut.kept.length > 0 && formatKeptImageSlots(cut).length > room) cut = { ...cut, kept: cut.kept.slice(1) };
+  if (notice !== undefined && cut.head.length === 0
+    && text.length <= notice + (cut.kept.length === 0 ? formatKeptImageSlots(cut).length : 0)) {
+    return { head: text, kept: [], fell: 0 };
+  }
+  return cut;
+}
+
 /**
  * The image slots a tool result's stored copy holds: its text's, or, when the
  * text is longer than `cap`, those the cut keeps, in head and after the
- * notice (cutStoredToolResult). The notice itself holds none. For counting a
- * result before its stored copy is written, as it will count after.
+ * notice (cutStoredToolResultToFit, under the readers' `bound`). The notice
+ * itself holds none. For counting a result before its stored copy is
+ * written, as it will count after, so `notice` is the one spillOrTruncate
+ * gives the cut (spillNoticeLength).
  */
-export function storedImageSlots(text: string, cap: number, shown: ShownRanges | null): ParsedImagePlaceholder[] {
-  const cut = cutStoredToolResult(text, cap, shown);
+export function storedImageSlots(text: string, cap: number, shown: ShownRanges | null, bound: number | undefined, notice?: number): ParsedImagePlaceholder[] {
+  const cut = cutStoredToolResultToFit(text, cap, shown, bound, notice);
   return parseImagePlaceholders(cut.head + formatKeptImageSlots(cut));
 }
 

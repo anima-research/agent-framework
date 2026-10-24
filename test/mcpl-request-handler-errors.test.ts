@@ -186,7 +186,7 @@ test('a real inference handler whose result write throws answers with its own er
     { async complete() { return createMockResponse([{ type: 'text', text: 'done' }]); } } as never,
     { isInHook: false } as never,
     { validateInbound() {} } as never,
-    null,
+    { default: 'test-model' },
     (event) => traces.push(event),
   );
   const reply = responder();
@@ -213,7 +213,7 @@ test('a real inference handler whose inference fails answers -32603 with the fai
     { async complete() { throw new Error('the provider refused the request'); } } as never,
     { isInHook: false } as never,
     { validateInbound() {} } as never,
-    null,
+    { default: 'test-model' },
     (event) => traces.push(event),
   );
   const reply = responder();

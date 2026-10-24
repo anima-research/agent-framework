@@ -230,7 +230,8 @@ export class ModuleRegistry {
 
   /**
    * Set state for a module by name.
-   * Used by the framework to apply stateUpdate from EventResponse atomically.
+   * Used by the framework to apply stateUpdate from EventResponse after its
+   * message changes.
    */
   setModuleState(moduleName: string, state: unknown): void {
     const ctx = this.moduleContexts.get(moduleName);

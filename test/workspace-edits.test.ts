@@ -13,6 +13,11 @@ import { JsStore } from '@animalabs/chronicle';
 import { WorkspaceModule } from '../src/modules/workspace/index.js';
 import { decodeForEdit, planFile, type FilePlan } from '../src/modules/workspace/edit-plan.js';
 import { editReceipt, fitted, shownRegions } from '../src/modules/workspace/edit-text.js';
+
+/** A receipt's text, which the model reads and the cap measures. */
+const receiptText = (receipt: ToolResult): string => (receipt.data as Array<{ text: string }>)[0]!.text;
+/** The changed regions a receipt shows, from its fields. */
+const changedOf = (receipt: ToolResult): string => (receipt.structured as { changed: string }).changed;
 import type { ToolResult } from '../src/types/events.js';
 
 function setup(t: TestContext, opts: { autoMaterialize?: boolean; maxFileSize?: number } = {}) {
@@ -44,7 +49,7 @@ function setup(t: TestContext, opts: { autoMaterialize?: boolean; maxFileSize?: 
   const stored = async (rel: string): Promise<string> => {
     const result = await call('read', { path: `work/${rel}`, offsetChars: 0, limitChars: 1_000_000 });
     assert.equal(result.success, true, result.error);
-    return (result.data as { content: string }).content;
+    return (result.structured as { content: string }).content;
   };
   /** A file the workspace holds, as a listing takes it in. */
   const file = async (rel: string, content: string | Buffer): Promise<void> => {
@@ -60,9 +65,10 @@ const errorOf = (result: ToolResult): string => {
   return result.error ?? '';
 };
 
+/** A success's fields: a receipt's, a page's or grep's, which a script reads as structuredContent, or another tool's data. */
 const dataOf = (result: ToolResult): Record<string, unknown> => {
   assert.equal(result.success, true, result.error);
-  return result.data as Record<string, unknown>;
+  return (result.structured ?? result.data) as Record<string, unknown>;
 };
 
 /** Half of a surrogate pair without the other half. */
@@ -315,7 +321,7 @@ test("a receipt reads the stored bytes of its lines that end in a CR in one walk
       return Reflect.apply(search, this, args) as number;
     },
   });
-  const changed = editReceipt('edit', [{ path: 'work/c.txt', plan: last.plan, notes: [] }], 1, 10_000_000).changed as string;
+  const changed = changedOf(editReceipt('edit', [{ path: 'work/c.txt', plan: last.plan, notes: [] }], 1, 10_000_000));
   assert.equal((changed.match(/\ty\r\r/g) ?? []).length, 300);
   assert.ok(finds >= 300 && finds < 3_000, `${finds} searches of the bytes`);
 });
@@ -1180,18 +1186,22 @@ test("an edit matched with quotes read as equal, or read without its CR, counts 
     + 'Include more of the text around it to single out the one you mean.\nThis call counted as many occurrences as one call may, so 85 is a floor'), read);
 });
 
-test("edits of an oldString read more than one way, each found many times, each take about a pass over the file", async (t) => {
+test("edit_many's refusal of 200 edits of an oldString read more than one way names each it has room for as read that way, and counts the rest", async (t) => {
   // Lines alternate between "x" with a CR of its own and "x" alone, before
   // CRLF ends, so "x\r" reads as given on the one and without its CR on the
-  // other. Each edit's other reading stops once it has those a refusal shows.
+  // other. That each edit's other reading stops once it has those a refusal
+  // shows is pinned in the planner's tests, where its count can be read.
   const { call, file } = setup(t);
   await file('m.txt', 'x\r\r\nx\r\n'.repeat(400_000));
-  const before = process.cpuUsage();
   const error = errorOf(await call('edit_many', { edits: Array.from({ length: 200 }, (_, k) => ({ path: 'work/m.txt', oldString: 'x\r', newString: `${k}` })) }));
-  const used = process.cpuUsage(before);
   assert.match(error, /^The edit_many call stored none of its edits: 200 problems\./);
   assert.match(error, /\n\nedit 1: oldString ends in a CR, and occurs in work\/m\.txt read more than one way, so which you mean can't be told\./);
-  assert.ok((used.user + used.system) / 1000 < 4_000, `${(used.user + used.system) / 1000} ms of CPU`);
+  // The answer fits what it can of 200 problems and counts the rest: each
+  // it shows is the edit's oldString read more than one way, and those with
+  // the rest come to 200.
+  const shown = error.match(/\n\nedit \d+: [^\n]*/g) ?? [];
+  assert.ok(shown.length > 0 && shown.every((line) => line.includes("oldString ends in a CR, and occurs in work/m.txt read more than one way, so which you mean can't be told.")), shown.find((line) => !line.includes('read more than one way')));
+  assert.equal(shown.length + Number(/(\d+) more problems?\b/.exec(error)?.[1] ?? 0), 200);
 });
 
 test("a crowded edit whose count stopped short of its ask, which no crowded problem names, is named by its count as a floor", async (t) => {
@@ -1287,7 +1297,7 @@ test("a conflict says what a sync does from what disk holds now, whatever kind w
   const copy = "Sync the path to keep disk's copy and give up the workspace's, or materialize it with force to write the workspace's over disk's.";
   const one = await call('edit', { path: 'work/gone.txt', oldString: 'agent draft', newString: 'agent edit' });
   assert.equal(one.success, true, one.error);
-  assert.equal((one.data as { note?: string }).note,
+  assert.equal((one.structured as { note?: string }).note,
     `The path is in conflict with disk (deleted-on-disk): the edit is in the workspace's copy. ${deletion}`);
   // A refusal over the same file says the same.
   assert.ok(errorOf(await call('edit', { path: 'work/gone.txt', oldString: 'absent', newString: 'x' })).endsWith(deletion));
@@ -1299,7 +1309,7 @@ test("a conflict says what a sync does from what disk holds now, whatever kind w
     ],
   });
   assert.equal(many.success, true, many.error);
-  assert.deepEqual((many.data as { files: Array<{ note?: string }> }).files.map((file) => file.note), [
+  assert.deepEqual((many.structured as { files: Array<{ note?: string }> }).files.map((file) => file.note), [
     `work/changed-then-gone.txt is in conflict with disk (both-changed): edit 1 is in the workspace's copy. ${deletion}`,
     `work/gone-then-back.txt is in conflict with disk (deleted-on-disk): edit 2 is in the workspace's copy. ${copy}`,
     `work/turned-binary.txt is in conflict with disk (both-changed): edit 3 is in the workspace's copy. ${copy}`,
@@ -1311,7 +1321,7 @@ test("a conflict says what a sync does from what disk holds now, whatever kind w
   }
   assert.equal(errorOf(await call('read', { path: 'work/gone.txt' })), 'File not found: work/gone.txt');
   assert.equal(disk('gone-then-back.txt')!.toString(), 'another writer\n');
-  assert.match(JSON.stringify((await call('read', { path: 'work/gone-then-back.txt' })).data), /another writer/);
+  assert.match(JSON.stringify((await call('read', { path: 'work/gone-then-back.txt' })).structured), /another writer/);
   assert.equal(errorOf(await call('read', { path: 'work/turned-binary.txt' })),
     'work/turned-binary.txt is on disk but not stored in the workspace (binary or over the size limit).');
   assert.deepEqual([...disk('turned-binary.txt')!], binary);
@@ -1420,10 +1430,9 @@ test("a receipt keeps to the call's resultMaxChars, naming the regions past it b
   const edits = Array.from({ length: 30 }, (_, i) => ({ path: 'work/g.txt', oldString: `row ${i * 10} `, newString: `ROW ${i * 10} ` }));
   const max = 3000;
   const result = await call('edit_many', { edits }, max);
-  const receipt = dataOf(result);
-  assert.ok(JSON.stringify(receipt).length <= max, `${JSON.stringify(receipt).length} characters, within ${max}`);
-  assert.match(receipt.changed as string, /\[not shown, to keep this answer within 3,000 characters: lines \d+–\d+, /);
-  assert.match(receipt.changed as string, /^work\/g\.txt\n     1\tROW 0 /);
+  assert.ok(receiptText(result).length <= max, `${receiptText(result).length} characters, within ${max}`);
+  assert.match(changedOf(result), /\[not shown, to keep this answer within 3,000 characters: lines \d+–\d+, /);
+  assert.match(changedOf(result), /^work\/g\.txt\n     1\tROW 0 /);
 });
 
 test("edit's refusal and receipt keep to its call's resultMaxChars too", async (t) => {
@@ -1436,20 +1445,22 @@ test("edit's refusal and receipt keep to its call's resultMaxChars too", async (
   assert.match(refusal, /^The edit did nothing: oldString occurs 60 times in work\/l\.txt /);
   assert.ok(errorOf(await call('edit', { path: 'work/l.txt', oldString: 'line', newString: 'LINE' })).length > 1_000);
   // A change of eighty lines is named by its lines.
-  const receipt = dataOf(await call('edit', { path: 'work/l.txt', oldString: 'line 0 ', newString: `${`${'A'.repeat(30)}\n`.repeat(80)}line 0 ` }, 1_000));
-  assert.ok(JSON.stringify(receipt).length <= 1_000, `${JSON.stringify(receipt).length} characters, within 1,000`);
-  assert.match(receipt.changed as string, /^\[not shown, to keep this answer within 1,000 characters: lines 1–\d+\]$/);
+  const receipt = await call('edit', { path: 'work/l.txt', oldString: 'line 0 ', newString: `${`${'A'.repeat(30)}\n`.repeat(80)}line 0 ` }, 1_000);
+  assert.ok(receiptText(receipt).length <= 1_000, `${receiptText(receipt).length} characters, within 1,000`);
+  assert.match(changedOf(receipt), /^\[not shown, to keep this answer within 1,000 characters: lines 1–\d+\]$/);
 });
 
-test("a receipt's regions are measured as its JSON holds them, where a quote or a backslash takes two characters", async (t) => {
+test("a receipt's regions are measured as its text holds them, where a quote or a backslash takes one character", async (t) => {
   const { call, file } = setup(t);
   await file('q.txt', 'start\n');
-  // Eight lines of sixty characters, 120 each as JSON: counted as typed they
-  // fit what this receipt has left for its regions, and as JSON they don't.
+  // Eight lines of sixty characters, 120 each as JSON: counted as the text
+  // holds them they fit what this receipt has left for its regions, and as
+  // JSON they wouldn't.
   const quoted = Array.from({ length: 8 }, () => '"\\'.repeat(30)).join('\n');
-  const receipt = dataOf(await call('edit', { path: 'work/q.txt', oldString: 'start', newString: quoted }, 1_000));
-  assert.ok(JSON.stringify(receipt).length <= 1_000, `${JSON.stringify(receipt).length} characters, within 1,000`);
-  assert.equal(receipt.changed, '[not shown, to keep this answer within 1,000 characters: lines 1–8]');
+  const receipt = await call('edit', { path: 'work/q.txt', oldString: 'start', newString: quoted }, 1_000);
+  assert.ok(receiptText(receipt).length <= 1_000, `${receiptText(receipt).length} characters, within 1,000`);
+  assert.ok(JSON.stringify(receipt.structured).length > 1_000, 'as JSON the receipt would pass 1,000');
+  assert.equal(changedOf(receipt), quoted.split('\n').map((line, i) => `${String(i + 1).padStart(6)}\t${line}`).join('\n'));
 });
 
 test('a receipt names a region too long to show by its lines without building it whole', async () => {
@@ -1501,7 +1512,7 @@ test('a receipt keeps to its cap with the longest notes it adds after its budget
   const plan = markedPlan(lines, Array.from({ length: 25 }, (_, k) => lines - 400 + k * 15));
   const files = [0, 1].map((i) => ({ path: `work/f${i}.txt`, plan, notes: i ? [`Disk's copy of work/f${i}.txt had changed.`] : [] }));
   for (let maxChars = 700; maxChars <= 1_700; maxChars++) {
-    const length = JSON.stringify(editReceipt('edit_many', files, 50, maxChars)).length;
+    const length = receiptText(editReceipt('edit_many', files, 50, maxChars)).length;
     if (length > maxChars) assert.fail(`${length} characters at a cap of ${maxChars}`);
   }
 });
@@ -1519,9 +1530,9 @@ test("a receipt keeps aside the longest note any of its files could add, not its
   let named = 0;
   for (let maxChars = 700; maxChars <= 1_700; maxChars++) {
     const receipt = editReceipt('edit_many', files, 26, maxChars);
-    const length = JSON.stringify(receipt).length;
+    const length = receiptText(receipt).length;
     if (length > maxChars) assert.fail(`${length} characters at a cap of ${maxChars}`);
-    if (twenty.test(receipt.changed as string)) named++;
+    if (twenty.test(changedOf(receipt))) named++;
   }
   assert.ok(named > 0, "no receipt named twenty of the first file's regions");
 });
@@ -1543,9 +1554,9 @@ test("edit_many's receipt keeps to its cap with a last line that counts each of 
   let counted = 0;
   for (let maxChars = 700; maxChars <= 2_500; maxChars++) {
     const receipt = editReceipt('edit_many', files, 125, maxChars);
-    const length = JSON.stringify(receipt).length;
+    const length = receiptText(receipt).length;
     if (length > maxChars) assert.fail(`${length} characters at a cap of ${maxChars}`);
-    if (allFour.test(receipt.changed as string)) counted++;
+    if (allFour.test(changedOf(receipt))) counted++;
   }
   assert.ok(counted > 0, 'no receipt counted all four');
 });
@@ -1560,11 +1571,29 @@ test('a receipt keeps aside only what its own call can add: one edit of a file o
   assert.ok('plan' in planned);
   const files = [{ path: 'work/long.txt', plan: planned.plan, notes: [] }];
   for (const [tool, start] of [['edit', /^ {5}1\ty/], ['edit_many', /^work\/long\.txt\n {5}1\ty/]] as const) {
-    const whole = JSON.stringify(editReceipt(tool, files, 1, 1_000_000)).length;
+    const whole = receiptText(editReceipt(tool, files, 1, 1_000_000)).length;
     const receipt = editReceipt(tool, files, 1, whole + 300);
-    assert.match(receipt.changed as string, start, tool);
-    assert.ok(JSON.stringify(receipt).length <= whole + 300);
+    assert.match(changedOf(receipt), start, tool);
+    assert.ok(receiptText(receipt).length <= whole + 300);
   }
+});
+
+test("a receipt counts the line feed between each of its region's lines, so a region of many short lines keeps to its cap", () => {
+  // Three hundred lines of one character: each line feed is a third of a
+  // line's own length or more, so a region counted without them would show
+  // where its text passes the cap.
+  const bytes = Buffer.from('start\n');
+  const planned = planFile(decodeForEdit(bytes)!, bytes, [{ index: 0, oldText: 'start', newText: Array.from({ length: 300 }, () => 'x').join('\n'), expected: 1 }]);
+  assert.ok('plan' in planned);
+  const files = [{ path: 'work/s.txt', plan: planned.plan, notes: [] }];
+  let shown = 0;
+  for (let maxChars = 2_000; maxChars <= 3_500; maxChars++) {
+    const receipt = editReceipt('edit', files, 1, maxChars);
+    const length = receiptText(receipt).length;
+    if (length > maxChars) assert.fail(`${length} characters at a cap of ${maxChars}`);
+    if (!changedOf(receipt).startsWith('[not shown')) shown++;
+  }
+  assert.ok(shown > 0, 'the region shows at the larger caps');
 });
 
 test("what a receipt keeps aside doesn't grow with a line's length: twenty edits of a long line show their region with what twenty of a short one need", () => {
@@ -1578,9 +1607,9 @@ test("what a receipt keeps aside doesn't grow with a line's length: twenty edits
     const planned = planFile(decodeForEdit(bytes)!, bytes, Array.from({ length: 20 }, (_, k) => ({ index: k, oldText: `m${k}|`, newText: `M${k}|`, expected: 1 })));
     assert.ok('plan' in planned);
     const files = [{ path: 'work/line.txt', plan: planned.plan, notes: [] }];
-    const whole = JSON.stringify(editReceipt('edit_many', files, 20, 1_000_000)).length;
+    const whole = receiptText(editReceipt('edit_many', files, 20, 1_000_000)).length;
     // Whether the region shows with `spare` characters past the whole receipt.
-    return (spare: number) => /^work\/line\.txt\n {5}1\t/.test(editReceipt('edit_many', files, 20, whole + spare).changed as string);
+    return (spare: number) => /^work\/line\.txt\n {5}1\t/.test(changedOf(editReceipt('edit_many', files, 20, whole + spare)));
   };
   const short = showsAt(start);
   const long = showsAt(start + 'a'.repeat(1_000_000));
@@ -1611,19 +1640,21 @@ test('a receipt lists its files while they fit and counts the rest, and counts t
   const edits = (from: string, to: string) =>
     Array.from({ length: 30 }, (_, i) => ({ path: `work/f${i}.txt`, oldString: `${from} ${i}`, newString: `${to} ${i}` }));
 
-  const short = dataOf(await call('edit_many', { edits: edits('value', 'VALUE') }, 1500));
-  assert.ok(JSON.stringify(short).length <= 1500, `${JSON.stringify(short).length} characters`);
+  const shortAnswer = await call('edit_many', { edits: edits('value', 'VALUE') }, 1500);
+  const short = dataOf(shortAnswer);
+  assert.ok(receiptText(shortAnswer).length <= 1500, `${receiptText(shortAnswer).length} characters`);
   const listed = (short.files as unknown[]).length;
   assert.ok(listed > 0 && listed < 30);
   assert.equal(short.filesNotListed, 30 - listed);
   // Its last line counts them too.
   assert.match(short.changed as string, new RegExp(`\\[To keep this answer within 1,500 characters, it leaves out ${30 - listed} of the call's 30 files[^\\]]*\\.\\]$`));
 
-  const longer = dataOf(await call('edit_many', { edits: edits('VALUE', 'value') }, 2800));
-  assert.ok(JSON.stringify(longer).length <= 2800, `${JSON.stringify(longer).length} characters`);
+  const longerAnswer = await call('edit_many', { edits: edits('VALUE', 'value') }, 2200);
+  const longer = dataOf(longerAnswer);
+  assert.ok(receiptText(longerAnswer).length <= 2200, `${receiptText(longerAnswer).length} characters`);
   assert.equal((longer.files as unknown[]).length, 30);
   assert.match(longer.changed as string, /^work\/f0\.txt\n     1\tvalue 0\n\n/);
-  assert.match(longer.changed as string, /\[To keep this answer within 2,800 characters, it leaves out the changed regions of \d+ more files\.\]$/);
+  assert.match(longer.changed as string, /\[To keep this answer within 2,200 characters, it leaves out the changed regions of \d+ more files\.\]$/);
 });
 
 test('at the least cap a residence or an agent can set, a refusal still names its problems, however long their labels or paths', async (t) => {

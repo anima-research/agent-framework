@@ -81,7 +81,7 @@ function madeFifo(path: string): boolean {
 async function call(m: WorkspaceModule, name: string, input: Record<string, unknown>): Promise<any> {
   const res = await m.handleToolCall({ id: 't', name, input });
   assert.equal(res.success, true, `${name} ${JSON.stringify(input)} failed: ${res.error}`);
-  return res.data;
+  return res.structured ?? res.data;
 }
 
 async function refused(m: WorkspaceModule, name: string, input: Record<string, unknown>): Promise<string> {
@@ -381,7 +381,7 @@ describe('mount include', () => {
         const top = ((await call(m, 'ls', { path: 'work' })).entries as Array<{ name: string; type: string }>).map((e) => `${e.type} ${e.name}`);
         assert.deepEqual(top, ['directory x', 'file gate.json'], `${onDisk}: the listing names x`);
         const res = await m.handleToolCall({ id: 't', name: tool, input: input as Record<string, unknown> });
-        said.push(`${tool} ${res.success ? JSON.stringify(res.data) : `refused: ${res.error}`}`);
+        said.push(`${tool} ${res.success ? JSON.stringify(res.structured ?? res.data) : `refused: ${res.error}`}`);
         if (onDisk === 'a file') assert.equal(readFileSync(join(env.dir, 'x'), 'utf8'), 'a file outside the include\n', `${tool} leaves the file`);
       }
       return said;
@@ -1444,7 +1444,7 @@ describe('mount include', () => {
     for (const path of ['work/notes.md', 'work/sub/../notes.md']) {
       const read = await m.handleToolCall({ id: 't', name: 'read', input: { path }, callerAgentName: 'resident' });
       assert.equal(read.success, true, `${path}: ${read.error}`);
-      assert.match(JSON.stringify(read.data), /generated/, path);
+      assert.match(JSON.stringify(read.structured), /generated/, path);
       const write = await m.handleToolCall({ id: 't', name: 'write', input: { path, content: 'x' }, callerAgentName: 'resident' });
       assert.match(String(write.error), /Generated file is read-only/, path);
     }
@@ -1606,7 +1606,7 @@ describe('mount include', () => {
       for (const [path, use] of [['work/a/b/x.txt', 'deep/x.txt'], ['work/a/b/gate.json', 'deep/gate.json']]) {
         for (const [name, extra] of tools) {
           const res = await m.handleToolCall({ id: 't', name, input: { path, ...extra } });
-          const said = JSON.stringify(res.success ? res.data : String(res.error));
+          const said = JSON.stringify(res.success ? res.structured ?? res.data : String(res.error));
           assert.ok(said.includes(`use \\"${use}\\"`), `${name} ${path}: ${said}`);
           assert.ok(!said.includes(OUTSIDE), `${name} ${path}: ${said}`);
         }

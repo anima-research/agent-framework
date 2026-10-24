@@ -61,18 +61,8 @@ the house default; plain descriptive titles are accepted.
 - The reviewer will typically **run your branch** (typecheck, test suite,
   sometimes exercising a module against a real store) and paste transcripts.
   Claims are checked, not trusted.
-- **Greptile** reviews only PRs labelled `greptile` (`.greptile/config.json`).
-  A scheduled workflow adds that label to each open, non-draft PR whose
-  additions plus deletions pass 400 lines, unless it carries `no-greptile`,
-  and the review starts when the label lands: within about half an hour of
-  the PR opening, passing 400 lines or being marked ready, and later when
-  GitHub's scheduler is busy. A PR updated in the two minutes before a run
-  waits for a later one. A smaller PR gets a Greptile review if a maintainer
-  adds the label a minute or more after it's opened, reopened or marked
-  ready. A label added seven seconds after opening has twice started no
-  review, and Greptile's reference counts reopening and marking ready as
-  openings too. `no-greptile` skips the review. Removing `greptile` from a PR
-  past 400 lines doesn't skip it, since a later run adds the label back.
+- **Greptile** doesn't review new PRs. It reviews only PRs labelled
+  `greptile` (`.greptile/config.json`), so don't add that label to a new PR.
 - Respond by pushing fix commits and replying per finding — "Addressed in
   `<sha>`" — rather than force-pushing a rewritten branch. A re-review then
   flips the verdict.
@@ -207,7 +197,7 @@ never do.
 ```bash
 npm install
 npm run build         # tsc; tests run from dist/, so build first
-npm test              # node --test --test-force-exit --test-timeout=600000 dist/test/*.test.js, with test/helpers/force-exit-blocking-stdout loaded first
+npm test              # node --test --test-force-exit [--test-concurrency=$AF_TEST_CONCURRENCY] --test-timeout=600000 dist/test/*.test.js, with test/helpers/force-exit-blocking-stdout loaded first
 npx tsc --noEmit      # typecheck
 ```
 
@@ -215,13 +205,25 @@ npx tsc --noEmit      # typecheck
 code you no longer have — always build before testing, and after switching
 branches. The `pretest` hook copies `test/fixtures/*.mjs` into `dist/`.
 
-`--test-timeout=600000` bounds each test file as a whole under Node 20,
-and each test under Node 24, at ten minutes; the slowest file,
-`mcpl-runtime-lifecycle`, takes about three. Each job in `ci.yml` also has
-a `timeout-minutes` limit, which ends a hang the test timeout doesn't reach.
+`--test-timeout=600000` bounds each test file as a whole under Node
+22.12, as it did under Node 20, and each test under Node 24, at ten
+minutes; the slowest file, `mcpl-runtime-lifecycle`, takes about three.
+Each job in `ci.yml` also has a `timeout-minutes` limit, which ends a hang
+the test timeout doesn't reach.
+
+CI (`ci.yml`'s Build & Test, and `publish.yml`) runs as many test files at
+once as the runner has cores, by setting `AF_TEST_CONCURRENCY`; `npm test`
+passes it on as `--test-concurrency` only when it's set. Unset, as it is
+locally, Node's default of one file fewer than the cores applies. To run the
+suite as CI schedules it, for example to chase a failure that shows only
+under load, set it: `AF_TEST_CONCURRENCY=$(node -p "require('node:os').cpus().length") npm test`.
 
 Push-time CI (`ci.yml`) builds, typechecks and tests every push and PR on
-ubuntu and macos. Lockfiles are deliberately gitignored in this repo, so CI
+ubuntu and macos. macOS runners queue, so a PR runs macOS's Build & Test at
+the engines floor (Node 22.12.0) only, and code_execution's Bun macOS legs
+only when it changes source, `tsconfig.json`, `package.json`, their tests,
+the test helpers or `ci.yml` (the `changes` job decides). A push to main runs
+every leg. Lockfiles are deliberately gitignored in this repo, so CI
 installs with `npm install` rather than `npm ci`, and there is no lock to
 keep in sync. It also runs the pack check the publish workflow runs before
 publishing (`node scripts/pack-installs-alone.mjs`, on ubuntu, with bun set
@@ -231,3 +233,11 @@ supply, fails the PR.
 When working against local sibling checkouts rather than published versions,
 see the ecosystem workspace setup — `bun install` at the `rust-connectome`
 root links the four packages together.
+
+
+CI check contexts follow the workflow matrices. When a matrix changes, a
+maintainer should check that the repository's required-status list matches it;
+workflow edits do not change branch-protection settings themselves. The macOS
+legs a PR may leave out (Build & Test on Node 24 and the newest Node, the Bun
+macOS legs) report no check on that PR, so a required check must not name
+them, or such a PR waits on a check that never comes.

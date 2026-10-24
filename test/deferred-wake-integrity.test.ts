@@ -118,9 +118,9 @@ class DmModule implements Module {
 function stubChannelRegistry(framework: AgentFramework) {
   const routed: Array<{ text: string; locus: string | null }> = [];
   const explicit: Record<string, unknown> = {
-    resolveLocus: () => 'dm-antra',
-    routeSpeech: async (_agent: string, text: string, locus?: string | null) => {
-      routed.push({ text, locus: locus ?? null });
+    resolveLocus: () => ({ serverId: 'stub', channelId: 'dm-antra' }),
+    routeSpeech: async (_agent: string, text: string, locus?: { serverId: string; channelId: string } | null) => {
+      routed.push({ text, locus: locus?.channelId ?? null });
     },
     getDefaultPublishChannel: () => null,
     isChannelOpen: () => true,
