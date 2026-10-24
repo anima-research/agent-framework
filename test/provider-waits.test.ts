@@ -918,7 +918,10 @@ test('a retry wait past one timer waits in steps of at most one timer, and only 
   await withStoreDir(async (path) => {
     const log = silence();
     const { fw } = await framework(path, new WaitingMembrane(0, undefined));
-    const stepping = fw as unknown as { waitForRetry(ms: number, checkWindow: { abandoned: boolean }): Promise<void> };
+    const stepping = fw as unknown as { waitForRetry(ms: number, checkWindow: { abandoned: boolean }, agent: unknown): Promise<void>; waitingTraceEveryMs: number };
+    // Stepping alone: the wait says it is waiting as it begins, and with no
+    // cadence point due within it, it steps by whole timers.
+    stepping.waitingTraceEveryMs = Number.POSITIVE_INFINITY;
     t.mock.timers.enable({ apis: ['setTimeout'] });
     const mocked = globalThis.setTimeout;
     const delays: number[] = [];
@@ -928,7 +931,7 @@ test('a retry wait past one timer waits in steps of at most one timer, and only 
     }) as unknown as typeof setTimeout;
     try {
       let done = false;
-      const waiting = stepping.waitForRetry(ONE_TIMER_MS + 1_000, { abandoned: false }).then(() => { done = true; });
+      const waiting = stepping.waitForRetry(ONE_TIMER_MS + 1_000, { abandoned: false }, fw.getAgent('resident')).then(() => { done = true; });
       t.mock.timers.tick(ONE_TIMER_MS);
       for (let i = 0; i < 20; i++) await Promise.resolve();
       assert.equal(done, false, "still waiting after one timer's worth");
@@ -1604,8 +1607,10 @@ test('unreadable recorded waits raise an ops alert for the whole framework as th
 // before the stream exists, here thrown from streamYielding).
 // ---------------------------------------------------------------------------
 
-/** A stream whose iteration throws, instead of yielding an error event:
- *  driveStream's catch, the third failure site. */
+/** A stream whose iteration throws, instead of yielding an error event.
+ *  driveStream takes a retryable provider failure thrown there as the error
+ *  event membrane would have sent (turnStreamEvents), and anything else
+ *  through its catch, the third failure site. */
 class ThrowingStream extends ErrorStream {
   constructor(private readonly thrown: Error) { super(thrown); }
   override async *[Symbol.asyncIterator](): AsyncIterator<StreamEvent> {

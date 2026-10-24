@@ -8,7 +8,7 @@ import {
   writeFileSync,
 } from 'node:fs';
 import { JsStore } from '@animalabs/chronicle';
-import type { Membrane, ContentBlock, NormalizedRequest, NormalizedResponse, YieldingStream, DetailedUsage, ToolResult as MembraneToolResult, ToolResultContentBlock } from '@animalabs/membrane';
+import type { Membrane, ContentBlock, NormalizedRequest, NormalizedResponse, YieldingStream, DetailedUsage, ToolResult as MembraneToolResult, ToolResultContentBlock, StreamEvent } from '@animalabs/membrane';
 import { MembraneError } from '@animalabs/membrane';
 import { classifyFailure, retryDecision, MEMBRANE_RETRY_SETTINGS, type RetrySettings } from '@animalabs/membrane/retry';
 import { ContextManager, PassthroughStrategy, WindowedPassthroughStrategy, OverBudgetError, UncoveredDropError, stripUnpairedToolBlocks, continuesBody, MalformedContentError, malformedContentPlaces, CompressionWithdrawn } from '@animalabs/context-manager';
@@ -1936,25 +1936,27 @@ function hostCommandRequester(serverId: string, params: HostCommandParams): Oper
  * this policy after one send, and the framework is the one retry layer: each
  * retry is a fresh compile, a stop cancels its wait, and the wait is seen.
  * The decision is membrane's (`@animalabs/membrane/retry`), on the settings
- * given (membrane's defaults unless a host passes its own, e.g. from a
- * recipe's retry config):
+ * given: membrane's, as TURN_RETRY_SETTINGS adjusts them for the turn path,
+ * unless a host passes its own (e.g. from a recipe's retry config), which
+ * are taken as they are:
  * - not retryable (400 invalid_request, 401 auth, context_length, safety,
  *   a caller-code error): terminal on the first failure. Retrying them burns
  *   API quota without any chance of success; production traces showed clerk +
  *   reviewer wasting 4 inferences on each 400 due to blind retries.
  * - overloaded (a 529, or an overloaded error mid-stream): the overloaded
- *   schedule, jittered (by default 7 tries, 10 s doubling to 5 min, ~10 min).
+ *   schedule, jittered, 10 s doubling to 5 min (by default 13 tries, about
+ *   30 min: see TURN_RETRY_SETTINGS).
  * - rate limited (429): the base schedule with at least 5 tries.
  * - any other retryable failure, a stream deadline on a sent request
  *   included (membrane leaves those to its caller): the base schedule (by
  *   default 3 tries, 1 s then 2 s).
  * A provider's stated wait (`retryAfterMs`) is waited when it is longer than
- * the backoff, up to the framework's own cap (PROVIDER_ACCELERATION_MAX_
- * COOLDOWN_MS, ten minutes) where a schedule's ceiling is lower; past it the
- * turn ends here. (Before this policy runs, the framework holds a resident
- * for a stated wait or an acceleration 429 itself, and ends an ephemeral run
- * on a wait past that cap; see holdProviderAcceleration and
- * nonOwningProviderWait.)
+ * the backoff, up to the schedule's ceiling, which by default is at least the
+ * framework's own cap (PROVIDER_ACCELERATION_MAX_COOLDOWN_MS, ten minutes);
+ * past it the turn ends here. A host's own settings keep their ceilings.
+ * (Before this policy runs, the framework holds a resident for a stated wait
+ * or an acceleration 429 itself, and ends an ephemeral run on a wait past
+ * that cap; see holdProviderAcceleration and nonOwningProviderWait.)
  * An error that isn't a MembraneError is retried as a retryable failure, on
  * the base schedule.
  */
@@ -1963,15 +1965,8 @@ export class DefaultErrorPolicy implements ErrorPolicy {
   readonly maxRetries: number;
   private readonly settings: RetrySettings;
 
-  constructor(settings: RetrySettings = MEMBRANE_RETRY_SETTINGS as RetrySettings) {
-    // A stated wait up to the framework's own cap is slept and retried, as it
-    // was before: nonOwningProviderWait ends an ephemeral run on a longer one,
-    // and a resident's waits are held before this policy runs. Membrane's
-    // schedules alone would end the turn on one past a minute.
-    this.settings = Object.fromEntries(Object.entries(settings).map(([cls, s]) => [cls, s && {
-      ...s,
-      statedWaitCeilingMs: s.statedWaitCeilingMs === null ? null : Math.max(s.statedWaitCeilingMs, PROVIDER_ACCELERATION_MAX_COOLDOWN_MS),
-    }])) as RetrySettings;
+  constructor(settings: RetrySettings = TURN_RETRY_SETTINGS) {
+    this.settings = settings;
     this.maxRetries = Math.max(0, ...Object.values(settings).map((s) => (s?.maxAttempts ?? 1) - 1));
   }
 
@@ -2079,10 +2074,42 @@ const PROVIDER_ACCELERATION_DEFAULT_COOLDOWN_MS = 65_000;
  *  longest stated wait an ephemeral run sleeps in its turn: a longer one ends
  *  the run instead (nonOwningProviderWait). */
 const PROVIDER_ACCELERATION_MAX_COOLDOWN_MS = 10 * 60_000;
+/** How many tries the default policy gives an overloaded error (a 529).
+ *  Its 12 waits on membrane's overloaded schedule, 10 s doubling to 5 min,
+ *  come to 2,410 s nominal. 0.26.0 nested membrane's 7 sends inside each of
+ *  its policy's 4 tries: 24 such waits, 2,440 s nominal. Both are jittered
+ *  into [d/2, d), so a turn bears a capacity storm about as long as on
+ *  0.26.0, about 20 to 40 minutes. */
+const OVERLOADED_TURN_TRIES = 13;
+/**
+ * The default error policy's settings: membrane's own, with two changes for
+ * the turn path.
+ * - The overloaded class takes OVERLOADED_TURN_TRIES, where membrane's takes 7.
+ * - Every class's stated-wait ceiling is at least the framework's own cap: a
+ *   stated wait up to it is slept and retried, as it was before #728
+ *   (nonOwningProviderWait ends an ephemeral run on a longer one, and a
+ *   resident's waits are held before the policy runs). Membrane's schedules
+ *   alone would end the turn on one past a minute (five minutes for the
+ *   overloaded class).
+ * A host that passes its own settings gets them as they are.
+ */
+const TURN_RETRY_SETTINGS: RetrySettings = Object.fromEntries(
+  Object.entries(MEMBRANE_RETRY_SETTINGS as RetrySettings).map(([cls, s]) => [cls, s && {
+    ...s,
+    ...(cls === 'overloaded' ? { maxAttempts: OVERLOADED_TURN_TRIES } : {}),
+    statedWaitCeilingMs: s.statedWaitCeilingMs === null ? null : Math.max(s.statedWaitCeilingMs, PROVIDER_ACCELERATION_MAX_COOLDOWN_MS),
+  }])) as RetrySettings;
 const PROVIDER_ACCELERATION_JITTER_MS = 5_000;
 /** Longest delay one setTimeout can represent (2^31-1 ms, about 24.8 days);
  *  a longer timer fires almost at once, so longer waits re-arm in steps. */
 const MAX_TIMER_DELAY_MS = 2_147_483_647;
+/** The latest instant a Date can hold (epoch ms). */
+const MAX_DATE_MS = 8_640_000_000_000_000;
+/** How often a wait for a turn's retry says it is still waiting (the
+ *  `inference:waiting` trace). Under two minutes, which is how long
+ *  connectome-host 0.13's subagent reaper lets a subagent go silent with no
+ *  request in flight before it reclaims its slot. */
+const WAITING_TRACE_EVERY_MS = 60_000;
 /** A stated wait recorded to hold a model longer than this, or until
  *  released, raises an ops alert. It is honoured in full either way: a hold
  *  that long is a quota-scale event or a provider's mistake, and a person
@@ -2097,6 +2124,49 @@ const PROVIDER_WAIT_ALERT_MS = 60 * 60_000;
  */
 function isMembraneError(error: unknown): error is MembraneError {
   return error instanceof MembraneError || (error instanceof Error && error.name === 'MembraneError');
+}
+
+/**
+ * A turn stream's events, as driveStream reads them (agent-framework#734).
+ * - Before its terminal event, a retryable provider failure its iterator
+ *   throws is given as the `error` event membrane's own streams send for
+ *   one, so the turn meets that event's path: a provider hold, a stated
+ *   wait, or the error policy's retry. Membrane's streams throw only on a
+ *   cancellation or an internal fault, but a stream of another make can
+ *   throw such a failure. Any other throw, a cancellation's included, is
+ *   thrown on as it was.
+ * - Once a terminal event (complete, error or aborted) has decided the turn,
+ *   by its answer, its retry or hold, or its end, nothing after it decides
+ *   it again. The first later event ends the events, and so does a throw,
+ *   each with a line naming it, where driveStream would act on the turn a
+ *   second time: a later failure ended an answered turn as failed, with an
+ *   `[inference-failed]` line after its answer, or held it to send it again,
+ *   and a later event ran its case for a turn already decided. Ending them,
+ *   rather than pulling on, closes the stream (its iterator's return()), so
+ *   a stream that holds its iterator for something that will never come,
+ *   such as a later tool-calls event's results, can't keep the turn from
+ *   finishing. Membrane's own streams send their terminal event last; only a
+ *   stream of another make sends or throws anything after it.
+ */
+async function* turnStreamEvents(stream: AsyncIterable<StreamEvent>, agentName: string): AsyncGenerator<StreamEvent> {
+  let decidedBy: StreamEvent['type'] | undefined;
+  try {
+    for await (const event of stream) {
+      if (decidedBy !== undefined) {
+        console.error(`[stream] ${agentName}: the stream sent an event (${event.type}) after its ${decidedBy} event, which decided its turn; it and the rest of the stream decide nothing`);
+        return;
+      }
+      if (event.type === 'complete' || event.type === 'error' || event.type === 'aborted') decidedBy = event.type;
+      yield event;
+    }
+  } catch (error) {
+    if (decidedBy !== undefined) {
+      console.error(`[stream] ${agentName}: the stream threw after its ${decidedBy} event, which decided its turn; the throw decides nothing: ${describeFailureWithFrames(error)}`);
+      return;
+    }
+    if (!(isMembraneError(error) && error.retryable === true)) throw error;
+    yield { type: 'error', error } as StreamEvent;
+  }
 }
 
 function isOrganizationAccelerationRateLimit(error: Error): error is MembraneError {
@@ -2814,6 +2884,9 @@ export class AgentFramework {
   private providerWaits: ProviderWaits | undefined;
   /** Wakers for error-policy retry waits in progress: stop() ends them. */
   private retryWaitWakers = new Set<() => void>();
+  /** How often a retry's wait says it is waiting (WAITING_TRACE_EVERY_MS);
+   *  a field so tests can shorten it. */
+  private waitingTraceEveryMs = WAITING_TRACE_EVERY_MS;
   private providerAdmissionClosed = false;
   /** Invalidates framework turns still assembling when stop begins. */
   private lifecycleGeneration = 0;
@@ -4859,7 +4932,8 @@ export class AgentFramework {
    * as a resident's are, so they bind its auxiliary calls too: a held model
    * is refused without a call, and an auxiliary call's own stated wait is
    * recorded for it. (An ephemeral run records nothing, its name being
-   * single-use, so its context manager keeps the plain membrane.) Its
+   * single-use, so its context manager takes no admission: see
+   * ephemeralRunMembrane.) Its
    * compression is the background work a resident's is, whether a
    * maintenance tick or a drain after a message starts it, so it is withdrawn
    * as a resident's is: a call made while a surgery holds the store, or once
@@ -4877,8 +4951,26 @@ export class AgentFramework {
       }
     });
   }
-  /** The framework's membrane, with each complete() call passed through
-   *  `admit` along with the model it names. */
+  /** The membrane for every ephemeral run's context manager: no admission,
+   *  no membrane retries (membraneAdmitting), and one proxy made once for
+   *  all of them. context-manager judges a compression's failure against the
+   *  compressions that landed through the same membrane instance (its
+   *  compressionDomain), so the runs share that evidence, as they did when
+   *  each took the framework's own membrane. */
+  private ephemeralRunMembrane(): Membrane {
+    return this.ephemeralRunMembraneOnce ??= this.membraneAdmitting((run) => run());
+  }
+  private ephemeralRunMembraneOnce: Membrane | undefined;
+  /** The framework's membrane for a resident's, a conversation agent's and
+   *  an ephemeral run's context manager, with each complete() call passed
+   *  through `admit` along with the model it names, and asking membrane for
+   *  no retries (`retry: false`, over any the caller's options ask for). The
+   *  context strategy's compression lane retries its own calls, pausing
+   *  after a failure and sending the request again, so membrane's schedules
+   *  inside each call would retry them twice over (up to ten minutes at a
+   *  529 inside each of the lane's sends). (The subconscious's context
+   *  manager keeps the plain membrane: its strategy, a
+   *  WindowedPassthroughStrategy, makes no calls.) */
   private membraneAdmitting(admit: (run: () => Promise<unknown>, model: string | undefined) => Promise<unknown>): Membrane {
     const target = this.membrane as unknown as Record<PropertyKey, unknown>;
     return new Proxy(target, { get: (obj, prop, receiver) => {
@@ -4886,7 +4978,8 @@ export class AgentFramework {
       if (prop === 'complete' && typeof value === 'function') {
         return (...args: unknown[]) => {
           const model = (args[0] as { config?: { model?: unknown } } | undefined)?.config?.model;
-          return admit(() => Reflect.apply(value, this.membrane, args) as Promise<unknown>,
+          const options = { ...(args[1] as object | undefined), retry: false };
+          return admit(() => Reflect.apply(value, this.membrane, [args[0], options, ...args.slice(2)]) as Promise<unknown>,
             typeof model === 'string' ? model : undefined);
         };
       }
@@ -5142,24 +5235,60 @@ export class AgentFramework {
    * framework is never left with a wait parked for days. The frame's window
    * (checkWindow) carries a waker that ends the whole wait: a stop
    * abortInference() records, or an operator's abandon, wakes it.
+   *
+   * The wait says so (`inference:waiting`, for `agent` while it is the one
+   * registered under its name) as it begins and every waitingTraceEveryMs
+   * while it lasts, so a host's watch for agents gone quiet doesn't take a
+   * waiting one for stuck. Nothing is said once it has ended. A listener of
+   * it that calls abortInference() or stop() ends the wait too.
    */
-  private async waitForRetry(ms: number, checkWindow: CheckWindow): Promise<void> {
+  private async waitForRetry(ms: number, checkWindow: CheckWindow, agent: Agent): Promise<void> {
     // An infinite delay waits until stop(), like any wait too long to end; a
     // delay that isn't a number, or is 0 or less, waits none.
     let remaining = ms > 0 ? ms : 0;
+    if (!(remaining > 0)) return;
+    const until = Date.now() + remaining;
     // stop() wakes this step through retryWaitWakers and ends the rest by
-    // closing admission; the window's waker ends the rest itself.
+    // closing admission; the window's waker ends the rest itself. Both are in
+    // place before anything is said, so a listener of inference:waiting that
+    // stops the agent or the framework ends the wait.
     let ended = false;
-    while (remaining > 0 && !ended && !this.providerAdmissionClosed) {
-      const step = Math.min(remaining, MAX_TIMER_DELAY_MS);
-      remaining -= step;
-      await new Promise<void>((resolve) => {
-        const wakers = this.retryWaitWakers;
-        const done = (): void => { clearTimeout(timer); wakers.delete(done); resolve(); };
-        const timer = setTimeout(done, step);
-        wakers.add(done);
-        checkWindow.wake = () => { ended = true; done(); };
-      });
+    let wakeStep: (() => void) | undefined;
+    const wake = (): void => { wakeStep?.(); };
+    const wakers = this.retryWaitWakers;
+    wakers.add(wake);
+    checkWindow.wake = () => { ended = true; wake(); };
+    const over = (): boolean => !(remaining > 0) || ended || this.providerAdmissionClosed;
+    const every = this.waitingTraceEveryMs;
+    let saidAt: number | undefined;
+    try {
+      for (;;) {
+        if (over()) return;
+        if (saidAt === undefined || Date.now() - saidAt >= every) {
+          saidAt = Date.now();
+          // Said only for the agent still registered under its name: a wait
+          // whose agent was removed or replaced runs on as before, unseen,
+          // since its name now stands for another agent or for none. A wait
+          // too long for a date has no end a reader can use.
+          if (this.agents.get(agent.name) === agent) {
+            this.emitTrace({ type: 'inference:waiting', agentName: agent.name, ...(until <= MAX_DATE_MS ? { until } : {}) });
+          }
+          // Its listeners can end the wait.
+          if (over()) return;
+        }
+        const step = Math.min(remaining, MAX_TIMER_DELAY_MS, Math.max(1, saidAt! + every - Date.now()));
+        await new Promise<void>((resolve) => {
+          const timer = setTimeout(resolve, step);
+          wakeStep = () => { clearTimeout(timer); resolve(); };
+        });
+        wakeStep = undefined;
+        // Counted by its timer, not the clock, as before: a step a stop or
+        // an abort woke early ends the wait anyway, and a late timer makes
+        // the wait end later than its `until`, never sooner.
+        remaining -= step;
+      }
+    } finally {
+      wakers.delete(wake);
     }
   }
 
@@ -9032,7 +9161,7 @@ export class AgentFramework {
         namespace,
         isolate: true,
         strategy: config.strategy ?? new PassthroughStrategy(),
-        membrane: this.membrane,
+        membrane: this.ephemeralRunMembrane(),
         debugLogContext: !!process.env.DEBUG_CONTEXT,
       });
 
@@ -19312,7 +19441,7 @@ export class AgentFramework {
       const action: ErrorAction = statedWait === 'fail' ? { retry: false } : this.errorPolicy.onInferenceError(err, agent.name, attempt);
       if (action.retry) {
         // A policy's delay can be a provider's retry-after: wait all of it.
-        await this.waitForRetry(action.delayMs, checkWindow);
+        await this.waitForRetry(action.delayMs, checkWindow, agent);
         if (this.providerAdmissionClosed || lifecycle !== this.lifecycleGeneration) {
           // stop() ended the wait: that cancels the retry, it does not hasten
           // it. A stop() and a start() since this start began cancel it too,
@@ -19878,7 +20007,7 @@ export class AgentFramework {
     // finally, which sends it, and a stop() can send it sooner.
     this.pendingOutgoingCompletes.add(completeOutgoing);
     try {
-      for await (const event of stream) {
+      for await (const event of turnStreamEvents(stream, agent.name)) {
         // Ignore every late event from an Agent generation that no longer owns
         // this name (ephemeral watchdog/disposal, conversation replacement).
         if (this.agents.get(agent.name) !== agent || agent.streamId !== myStreamId) {
@@ -20998,7 +21127,7 @@ export class AgentFramework {
               const retryWindow: CheckWindow = { abandoned: false };
               this.checkAhead.set(agent, retryWindow);
               // A policy's delay can be a provider's retry-after: wait all of it.
-              await this.waitForRetry(action.delayMs, retryWindow);
+              await this.waitForRetry(action.delayMs, retryWindow, agent);
               if (this.checkAhead.get(agent) === retryWindow) this.checkAhead.delete(agent);
               // stop() ending the wait cancels the retry (this frame's finally
               // clears the token); it is never permission to retry at once.

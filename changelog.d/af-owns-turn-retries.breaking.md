@@ -5,18 +5,38 @@
   529) ran inside each of the framework's attempts, out of its sight. Each
   retry is now a fresh compile, its wait is traced, and a stop cancels it.
   The default error policy decides on membrane's schedules
-  (`@animalabs/membrane/retry`; `MEMBRANE_RETRY_SETTINGS` unless a host
-  passes `new DefaultErrorPolicy(settings)` as `errorPolicy`), where it
-  retried any retryable failure three times, 1, 2 then 4 s apart:
-  - a 529, or an overloaded error mid-stream, gets the overloaded schedule:
-    seven tries, jittered waits from 10 s doubling to five minutes;
+  (`@animalabs/membrane/retry`, with membrane's settings as adjusted below,
+  unless a host passes `new DefaultErrorPolicy(settings)` as `errorPolicy`,
+  whose settings it takes as they are), where it retried any retryable
+  failure three times, 1, 2 then 4 s apart:
+  - a 529, or an overloaded error mid-stream, gets the overloaded schedule,
+    jittered waits from 10 s doubling to five minutes, with thirteen tries
+    where membrane's settings have seven: 20 to 40 minutes, about 30 on
+    average (2,410 s nominal), as long as 0.26.0 bore a 529 with
+    membrane's seven sends inside each of its four tries (2,440 s nominal);
   - a 429 gets at least five tries on the base schedule;
   - any other retryable failure, a stream deadline included (membrane itself
     leaves a deadline to its caller), gets three tries, 1 s then 2 s, and so
     does an error that isn't a MembraneError;
   - a provider's stated wait is waited when it is longer than the backoff, up
-    to ten minutes (the framework's provider-hold cap), as before;
-  - a failure that isn't retryable ends at once, as before.
+    to ten minutes (the framework's provider-hold cap), as before; a host
+    that passes its own settings gets their ceilings instead
+    (agent-framework#734);
+  - a failure that isn't retryable ends at once, as before;
+  - a failure membrane marks retryable (a `MembraneError` with
+    `retryable: true`) that a stream of another make throws from its
+    iterator before its terminal event, where membrane's streams send it as
+    an `error` event, is held, retried and logged as that event is
+    (agent-framework#734).
+  A resident's, a conversation agent's and an ephemeral run's context
+  managers ask membrane for no retries on their compression calls too: the
+  context strategy's compression lane pauses after a failure and sends the
+  request again, so membrane's schedules ran inside each of its sends, a 529
+  seven times. A compression or merge send that fails now pauses its lane
+  (5 s, doubling) where membrane resent it within the call, and a
+  transition summary (`resetHeadWindow()` with no text) is sent once, so a
+  failure membrane would have retried goes back to its caller after that
+  one send.
   A custom `ErrorPolicy` now sees failures membrane used to retry first (a
   5xx, a 529, a dropped connection, a 429), so it decides those itself.
   **Migration:** decide with membrane's own helpers (`classifyFailure`,
@@ -25,6 +45,6 @@
   (a resident's stated waits and acceleration 429s), refusal re-issues
   (`refusalRetries`), a direct caller of `Agent.startStream` (it keeps
   membrane's retries; `ActivationRequestOptions.membraneRetries: false` is
-  what the framework passes), and calls that aren't turns (the MCPL
-  inference router, compression and other host calls keep membrane's
+  what the framework passes), and calls that aren't turns or compression
+  (the MCPL inference router and other host calls keep membrane's
   retries).
