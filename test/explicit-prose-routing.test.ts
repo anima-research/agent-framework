@@ -1624,6 +1624,47 @@ describe('explicit prose routing', () => {
     await framework.stop();
   });
 
+  it("in a drafts round, a line with no destination is kept rather than bounced, while a target is delivered and a refused one still bounces (#701)", async () => {
+    const framework = await createFramework();
+    const routed = stubRegistry(framework);
+    const internals = framework as unknown as {
+      deliverProse(agent: unknown, text: string, round?: { draftsRound?: boolean }): Promise<void>;
+      turnRouting: Map<string, { continuation: boolean; keptPrivate: number }>;
+    };
+    const agent = framework.getAgent('assistant')!;
+
+    await internals.deliverProse(agent, 'narration beside the call', { draftsRound: true });
+    assert.equal(routed.length, 0, 'nothing is delivered');
+    assert.equal(context(framework).bounces, 0, 'and nothing bounced');
+    assert.equal(internals.turnRouting.get('assistant')?.keptPrivate, 1, 'it is counted as kept');
+
+    await internals.deliverProse(agent, '>>#alpha ! a deliberate send', { draftsRound: true });
+    assert.deepEqual(routed.map((r) => [r.text, r.locus]), [['a deliberate send', 'chan-alpha']]);
+    assert.equal(internals.turnRouting.get('assistant')?.continuation, true, 'its continuation is asked for');
+
+    await internals.deliverProse(agent, '>>#nowhere a send to nowhere', { draftsRound: true });
+    assert.equal(context(framework).bounces, 1, 'a refused target still bounces');
+
+    await framework.stop();
+  });
+
+  it("in a drafts round, a deliberate send whose delivery fails still bounces into a draft (#701)", async () => {
+    const framework = await createFramework();
+    try {
+      stubRegistry(framework, ['false']);
+      const agent = framework.getAgent('assistant')!;
+      const internals = framework as unknown as {
+        deliverProse(agent: unknown, text: string, round?: { draftsRound?: boolean }): Promise<void>;
+        proseDrafts: ProseDraftStore;
+      };
+      await internals.deliverProse(agent, '>>#alpha keep these words', { draftsRound: true });
+      const held = internals.proseDrafts.open('assistant');
+      assert.deepEqual(held.map((d) => [d.text, d.reason]), [['keep these words', 'bounced']]);
+    } finally {
+      await framework.stop();
+    }
+  });
+
   it('a skip_reply round that sets the retained text aside with >>skip_reply {{unsent}} clears it', async () => {
     // Turn 1 bounces its text, which retains it and wakes turn 2.
     membrane.pushResponse(createMockResponse([{ type: 'text', text: 'An answer with nowhere to go.' }] as ContentBlock[]));

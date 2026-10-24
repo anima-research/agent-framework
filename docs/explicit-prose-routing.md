@@ -67,6 +67,25 @@ The notice requests inference so the resend can happen immediately — capped at
 2 consecutive bounce-wakes per agent (then notices append without waking,
 breaking any loop).
 
+In a round that calls `drafts`, with any action, words that would be held
+because an explicit send silenced the turn, or bounced or held for lack of a
+destination, stay in the agent's context only, and the turn's receipt counts
+them (explicit mode writes no receipt), so no draft of them is offered for
+resend. A silenced turn holds a round's envelopes too, so there a drafts
+round keeps all its words, while its envelopes still move the router. Outside
+a silenced turn, what the round would deliver is delivered, an unprefixed
+line to the turn's sticky target included, and a refused target, a malformed
+envelope or a failed delivery still bounces. Without this, an agent that
+writes a line beside each call would resend its own narration round after
+round, inside one turn, where the bounce-wake cap doesn't reach (#701). So in
+explicit mode, while the turn has no destination, an unprefixed line beside a
+`drafts` call is kept in context, with no bounce or resend offer. In XML tool
+mode, where a turn's prose is routed once at its end with no notice
+mid-turn, a drafts round is routed as any other: its unprefixed line still
+bounces, and the bounce-wake cap ends a cycle of `drafts` resends after two
+wakes, counted from the last turn with a cause of its own or the last
+delivered envelope.
+
 `{{unsent}}` means the latest bounce while that draft is open (latest-wins, as
 the clipboard it replaced was), and `>>skip_reply {{unsent}}` dismisses it.
 Earlier bounces stay in the agent's drafts, by id, until resent, dismissed or

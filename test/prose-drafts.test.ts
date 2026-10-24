@@ -487,7 +487,7 @@ describe('held prose drafts, end to end', () => {
         createMockResponse([]),
       ]);
       assert.deepEqual(h.drafts(), []);
-      assert.ok(h.texts().some((t) => t === '[delivered] nothing — 1 plain-speech segment(s) kept private (skip_reply or a private think)'));
+      assert.ok(h.texts().some((t) => t === '[delivered] nothing — 1 plain-speech segment(s) kept private (skip_reply, a drafts call or a private think)'));
       await h.turn([
         createMockResponse([text('Prose beside a private think.'), call('t1', 'think', { thought: 'hmm' }), explicitSend('s1')], 'tool_use'),
         createMockResponse([]),
@@ -495,7 +495,7 @@ describe('held prose drafts, end to end', () => {
       assert.deepEqual(h.drafts(), [], 'a same-round private think keeps its prose private, even beside a send');
       assert.deepEqual(h.publishes().map((p) => p.text), ['an explicit note elsewhere']);
       assert.equal(h.texts().filter((t) => t.startsWith('[delivered]')).at(-1),
-        '[delivered] nothing — 1 plain-speech segment(s) kept private (skip_reply or a private think)',
+        '[delivered] nothing — 1 plain-speech segment(s) kept private (skip_reply, a drafts call or a private think)',
         'the receipt counts it, and says a private think may be why');
     } finally {
       await h.close();
@@ -557,7 +557,7 @@ describe('held prose drafts, end to end', () => {
       const held = h.drafts();
       assert.deepEqual(held.map((d) => d.text), ['Beside the send.'], "only the send's own round is held");
       assert.equal(h.texts().find((t) => t.startsWith('[delivered]')),
-        `[delivered] nothing — 1 plain-speech segment(s) held as draft ${held[0]!.id} (not sent — drafts can resend them unchanged, or dismiss them) · 2 plain-speech segment(s) kept private (skip_reply or a private think)`,
+        `[delivered] nothing — 1 plain-speech segment(s) held as draft ${held[0]!.id} (not sent — drafts can resend them unchanged, or dismiss them) · 2 plain-speech segment(s) kept private (skip_reply, a drafts call or a private think)`,
         'the refused round and the round after it stay private');
     } finally {
       await h.close();
@@ -1184,7 +1184,7 @@ describe('held prose drafts, end to end', () => {
     }
   });
 
-  it('resend is an explicit send: prose beside it is held, not auto-routed', async () => {
+  it('prose beside a resend is neither posted nor held: a drafts round keeps what it would hold (#701)', async () => {
     const h = await harness();
     try {
       await h.turn([
@@ -1197,11 +1197,303 @@ describe('held prose drafts, end to end', () => {
         createMockResponse([]),
       ]);
       assert.deepEqual(h.publishes().map((p) => p.text), ['an explicit note elsewhere', 'earlier words']);
-      assert.deepEqual(h.drafts().map((d) => d.text), ['a postscript']);
+      assert.deepEqual(h.drafts().map((d) => d.text), [], 'the postscript is not held');
+      const receipt = h.texts().filter((t) => t.startsWith('[delivered]')).at(-1)!;
+      assert.ok(receipt.includes('1 plain-speech segment(s) kept private'), receipt);
     } finally {
       await h.close();
     }
   });
+
+  // #701: a resident that writes one line beside each call. Each of these
+  // rounds names the newest open draft when it runs, as a resident answering
+  // the round's notice would, and ends the turn once none is open.
+  const resendWhileOffered = (h: Awaited<ReturnType<typeof harness>>, line: string, callId: string) =>
+    whileOffered(h, (id) => [text(line), drafts(callId, { action: 'resend', draftIds: [id], destination: ROOM })]);
+  const dismissWhileOffered = (h: Awaited<ReturnType<typeof harness>>, line: string, callId: string) =>
+    whileOffered(h, (id) => [text(line), drafts(callId, { action: 'dismiss', draftIds: [id] })]);
+  function whileOffered(h: Awaited<ReturnType<typeof harness>>, blocks: (id: string) => ContentBlock[]) {
+    const now = () => {
+      const newest = h.drafts()[0];
+      return newest ? createMockResponse(blocks(newest.id), 'tool_use') : createMockResponse([]);
+    };
+    const response = {} as ReturnType<typeof createMockResponse>;
+    for (const key of Object.keys(now())) Object.defineProperty(response, key, { get: () => now()[key as keyof typeof response], enumerable: true });
+    return response;
+  }
+
+  for (const mode of ['locus', 'hybrid', 'explicit'] as const) {
+    it(`${mode} mode: a resident that narrates each resend leaves the cycle after one resend, its line kept private (#701)`, async () => {
+      const h = await harness({ agents: [{ name: 'scout', proseRouting: mode }] });
+      try {
+        const lines = [1, 2, 3, 4, 5, 6].map((i) => resendWhileOffered(h, `Resending that now (${i}).`, `r${i}`));
+        await h.turn([
+          createMockResponse([text('A paragraph for the room.'), explicitSend('s1')], 'tool_use'),
+          ...lines,
+          createMockResponse([]),
+        ]);
+        assert.deepEqual(h.publishes().map((p) => p.text), ['an explicit note elsewhere', 'A paragraph for the room.'],
+          'the paragraph is resent once, and no narration line is posted');
+        assert.deepEqual(h.drafts(), [], 'nothing is left held');
+        const draftsCalls = h.messages().flatMap((m) => m.content)
+          .filter((b) => b.type === 'tool_use' && (b as { name?: string }).name === 'drafts');
+        assert.equal(draftsCalls.length, 1, 'one resend round: nothing new was offered after it');
+        const receipt = h.texts().find((t) => t.startsWith('[delivered]'));
+        if (mode === 'explicit') {
+          // Explicit mode writes no receipt: its envelopes acknowledge
+          // themselves, and a kept round's stay in context unremarked, as a
+          // skip_reply round's do.
+          assert.equal(receipt, undefined);
+          assert.ok(h.texts().includes('Resending that now (1).'), 'the line stays in the transcript');
+        } else {
+          assert.ok(receipt?.includes('1 plain-speech segment(s) kept private (skip_reply, a drafts call or a private think)'), receipt);
+        }
+      } finally {
+        await h.close();
+      }
+    });
+  }
+
+  it('a line beside a dismiss is kept private too, not held (#701)', async () => {
+    const h = await harness();
+    try {
+      await h.turn([
+        createMockResponse([text('A paragraph for the room.'), explicitSend('s1')], 'tool_use'),
+        dismissWhileOffered(h, 'Dismissing that draft.', 'x1'),
+        createMockResponse([]),
+      ]);
+      assert.deepEqual(h.publishes().map((p) => p.text), ['an explicit note elsewhere']);
+      assert.deepEqual(h.drafts(), [], 'the line is not held');
+      const receipt = h.texts().find((t) => t.startsWith('[delivered]'))!;
+      assert.match(receipt, /^\[delivered\] nothing — draft d-\S+ dismissed by you · 1 plain-speech segment\(s\) kept private \(skip_reply, a drafts call or a private think\)$/);
+    } finally {
+      await h.close();
+    }
+  });
+
+  for (const mode of ['locus', 'hybrid'] as const) {
+    it(`${mode} mode: in a turn with no send, prose beside a drafts list is posted as on main, since it would be delivered, not held (#701)`, async () => {
+      const h = await harness({ agents: [{ name: 'scout', proseRouting: mode }] });
+      try {
+        await h.turn([
+          createMockResponse([text('Checking my drafts.'), drafts('l1', { action: 'list' })], 'tool_use'),
+          createMockResponse([text('Here is the actual reply.'), call('c1', 'channel_list', {})], 'tool_use'),
+          createMockResponse([]),
+        ]);
+        assert.deepEqual(h.publishes().map((p) => [p.channelId, p.text]), [[ROOM, 'Checking my drafts.'], [ROOM, 'Here is the actual reply.']]);
+        assert.deepEqual(h.drafts(), []);
+        assert.ok(!h.texts().some((t) => t.startsWith('[delivered]') && t.includes('kept private')), 'nothing is counted as kept');
+      } finally {
+        await h.close();
+      }
+    });
+  }
+
+  it("hybrid mode: a drafts round's >>> target is a deliberate send: its words are delivered there, and later rounds follow it (#701)", async () => {
+    const h = await harness({ agents: [{ name: 'scout', proseRouting: 'hybrid' }] });
+    try {
+      await h.turn([
+        createMockResponse([text(`>>>${GENERAL} Moving the talk to general.`), drafts('l1', { action: 'list' })], 'tool_use'),
+        createMockResponse([text('Words for general.'), call('c1', 'channel_list', {})], 'tool_use'),
+        createMockResponse([]),
+      ]);
+      assert.deepEqual(h.publishes().map((p) => [p.channelId, p.text]), [[GENERAL, 'Moving the talk to general.'], [GENERAL, 'Words for general.']]);
+      assert.deepEqual(h.drafts(), []);
+    } finally {
+      await h.close();
+    }
+  });
+
+  it("hybrid mode: after a send, a drafts round's envelopes are kept, not held, and one that only names a destination isn't counted as kept words (#701)", async () => {
+    const h = await harness({ agents: [{ name: 'scout', proseRouting: 'hybrid' }] });
+    try {
+      await h.turn([
+        createMockResponse([explicitSend('s1')], 'tool_use'),
+        createMockResponse([text(`>>>${GENERAL}\n>>>${ROOM} Kept words.`), drafts('l1', { action: 'list' })], 'tool_use'),
+        createMockResponse([]),
+      ]);
+      assert.deepEqual(h.publishes().map((p) => p.text), ['an explicit note elsewhere']);
+      assert.deepEqual(h.drafts(), [], 'nothing is held');
+      const receipt = h.texts().find((t) => t.startsWith('[delivered]'))!;
+      assert.ok(receipt.includes('1 plain-speech segment(s) kept private'), receipt);
+    } finally {
+      await h.close();
+    }
+  });
+
+  it("hybrid mode: in a drafts round, a line left with no destination by a refused target is kept, not held (#701)", async () => {
+    const h = await harness({ agents: [{ name: 'scout', proseRouting: 'hybrid' }] });
+    try {
+      await h.turn([
+        createMockResponse([text('>>>#nowhere lost words'), call('c1', 'channel_list', {})], 'tool_use'),
+        createMockResponse([text('Checking my drafts.'), drafts('l1', { action: 'list' })], 'tool_use'),
+        createMockResponse([]),
+      ]);
+      assert.deepEqual(h.publishes(), []);
+      assert.deepEqual(h.drafts().map((d) => [d.text, d.reason]), [['lost words', 'bounced']],
+        'the refused target still bounces; the line after it is kept, not held as no-destination');
+      const receipt = h.texts().find((t) => t.startsWith('[delivered]'))!;
+      assert.ok(receipt.includes('1 plain-speech segment(s) kept private'), receipt);
+    } finally {
+      await h.close();
+    }
+  });
+
+  it("hybrid mode: after a send, a drafts round's refused and malformed envelopes are kept like the rest, since the silenced turn holds them, and a bare >>> isn't counted (#701)", async () => {
+    const h = await harness({ agents: [{ name: 'scout', proseRouting: 'hybrid' }] });
+    try {
+      await h.turn([
+        createMockResponse([explicitSend('s1')], 'tool_use'),
+        createMockResponse([text('>>>#nowhere refused words\n>>>'), drafts('l1', { action: 'list' })], 'tool_use'),
+        createMockResponse([]),
+      ]);
+      assert.deepEqual(h.publishes().map((p) => p.text), ['an explicit note elsewhere']);
+      assert.deepEqual(h.drafts(), [], 'nothing is held or bounced');
+      const receipt = h.texts().find((t) => t.startsWith('[delivered]'))!;
+      assert.ok(receipt.includes('1 plain-speech segment(s) kept private'), receipt);
+    } finally {
+      await h.close();
+    }
+  });
+
+  it("hybrid mode: after a send, a drafts round's envelopes still move the router: its ' !' starts a continuation turn (#701)", async () => {
+    const h = await harness({ agents: [{ name: 'scout', proseRouting: 'hybrid' }] });
+    try {
+      const before = h.membrane.calls.length;
+      await h.turn([
+        createMockResponse([explicitSend('s1')], 'tool_use'),
+        createMockResponse([text(`>>>${GENERAL} ! Kept words.`), drafts('l1', { action: 'list' })], 'tool_use'),
+        createMockResponse([]),
+      ]);
+      await h.until(() => h.membrane.calls.length >= before + 2, 'the continuation turn');
+      assert.deepEqual(h.drafts(), []);
+    } finally {
+      await h.close();
+    }
+  });
+
+  it("hybrid mode: a round that calls skip_reply beside drafts stays wholly private: its ' !' asks for nothing (#701)", async () => {
+    const h = await harness({ agents: [{ name: 'scout', proseRouting: 'hybrid' }] });
+    try {
+      // The turn's continuation check runs once its deliveries have; record
+      // what it finds rather than wait for a turn that shouldn't come.
+      const asked: boolean[] = [];
+      const fw = h.framework as unknown as { requestProseContinuation(agent: unknown, routing: { continuation: boolean }): void };
+      const check = fw.requestProseContinuation.bind(fw);
+      fw.requestProseContinuation = (agent, routing) => { asked.push(routing.continuation); check(agent, routing); };
+      await h.turn([
+        createMockResponse([text(`>>>${GENERAL} ! Kept words.`), drafts('l1', { action: 'list' }), call('k1', 'skip_reply', {})], 'tool_use'),
+        createMockResponse([]),
+      ]);
+      await h.until(() => asked.length > 0, "the turn's continuation check");
+      assert.ok(!asked.includes(true), `no continuation is asked for: ${JSON.stringify(asked)}`);
+      assert.deepEqual(h.publishes(), []);
+      assert.deepEqual(h.drafts(), []);
+    } finally {
+      await h.close();
+    }
+  });
+
+  it("hybrid mode: in a turn with no send, a refused target beside a drafts call still bounces (#701)", async () => {
+    const h = await harness({ agents: [{ name: 'scout', proseRouting: 'hybrid' }] });
+    try {
+      await h.turn([
+        createMockResponse([text('>>>#nowhere lost words'), drafts('l1', { action: 'list' })], 'tool_use'),
+        createMockResponse([]),
+      ]);
+      assert.deepEqual(h.drafts().map((d) => [d.text, d.reason]), [['lost words', 'bounced']]);
+    } finally {
+      await h.close();
+    }
+  });
+
+  it("explicit mode: an unprefixed line beside a drafts call goes to the turn's sticky target, as on main (#701)", async () => {
+    const h = await harness({ agents: [{ name: 'scout', proseRouting: 'explicit' }] });
+    try {
+      await h.turn([
+        createMockResponse([text(`>>${GENERAL} First words.`), call('c1', 'channel_list', {})], 'tool_use'),
+        createMockResponse([text('More words.'), drafts('l1', { action: 'list' })], 'tool_use'),
+        createMockResponse([]),
+      ]);
+      assert.deepEqual(h.publishes().map((p) => [p.channelId, p.text]), [[GENERAL, 'First words.'], [GENERAL, 'More words.']]);
+      assert.deepEqual(h.drafts(), []);
+    } finally {
+      await h.close();
+    }
+  });
+
+  it('XML tool mode is unchanged: a line beside a resend is held as a draft, as on main (#701)', async () => {
+    const h = await harness({ xml: true });
+    try {
+      // XML mode completes with the turn's whole content, as membrane parses
+      // it: each round's calls and then their results.
+      const done = (id: string) => ({ type: 'tool_result', toolUseId: id, content: 'done', isError: false }) as ContentBlock;
+      await h.turn([
+        createMockResponse([text('A paragraph for the room.'), explicitSend('s1')], 'tool_use'),
+        { ...createMockResponse([text('A paragraph for the room.'), explicitSend('s1'), done('s1')]), toolCalls: [] },
+      ]);
+      const [draft] = h.drafts();
+      const resend = drafts('r1', { action: 'resend', draftIds: [draft!.id], destination: ROOM });
+      await h.turn([
+        createMockResponse([text('Resending that now.'), resend], 'tool_use'),
+        { ...createMockResponse([text('Resending that now.'), resend, done('r1')]), toolCalls: [] },
+      ]);
+      assert.deepEqual(h.drafts().map((d) => d.text), ['Resending that now.']);
+    } finally {
+      await h.close();
+    }
+  });
+
+  it('in a turn with a send, a line beside a drafts call the agent may not use is held as before: a refused call counts for nothing (#701)', async () => {
+    const h = await harness();
+    try {
+      // drafts is refused before dispatch (allowedTools), as a tool the
+      // agent wasn't given would be.
+      const agent = h.framework.getAgent('scout')!;
+      const canUse = agent.canUseTool.bind(agent);
+      (agent as unknown as { canUseTool(name: string): boolean }).canUseTool = (name: string) => name !== 'drafts' && canUse(name);
+      await h.turn([
+        createMockResponse([explicitSend('s1')], 'tool_use'),
+        createMockResponse([text('Checking my drafts.'), drafts('l1', { action: 'list' })], 'tool_use'),
+        createMockResponse([]),
+      ]);
+      assert.deepEqual(h.drafts().map((d) => [d.text, d.reason]), [['Checking my drafts.', 'explicit-send']]);
+    } finally {
+      await h.close();
+    }
+  });
+
+  it("explicit mode: a drafts round's >> target is a deliberate send, delivered as on main (#701)", async () => {
+    const h = await harness({ agents: [{ name: 'scout', proseRouting: 'explicit' }] });
+    try {
+      await h.turn([
+        createMockResponse([text(`>>${GENERAL} Moving the talk to general.`), drafts('l1', { action: 'list' })], 'tool_use'),
+        createMockResponse([text('Words for general.'), call('c1', 'channel_list', {})], 'tool_use'),
+        createMockResponse([]),
+      ]);
+      assert.deepEqual(h.publishes().map((p) => [p.channelId, p.text]), [[GENERAL, 'Moving the talk to general.'], [GENERAL, 'Words for general.']]);
+      assert.deepEqual(h.drafts(), [], 'nothing bounced');
+    } finally {
+      await h.close();
+    }
+  });
+
+  it("a later round of the turn, beside another tool, is held as before: only the drafts round keeps what it would hold (#701)", async () => {
+    const h = await harness();
+    try {
+      await h.turn([
+        createMockResponse([text('A paragraph for the room.'), explicitSend('s1')], 'tool_use'),
+        resendWhileOffered(h, 'Resending that now.', 'r1'),
+        createMockResponse([text('Something else to say.'), call('l1', 'channel_list', {})], 'tool_use'),
+        createMockResponse([]),
+      ]);
+      assert.deepEqual(h.publishes().map((p) => p.text), ['an explicit note elsewhere', 'A paragraph for the room.']);
+      assert.deepEqual(h.drafts().map((d) => [d.text, d.reason]), [['Something else to say.', 'explicit-send']]);
+    } finally {
+      await h.close();
+    }
+  });
+
 
   it('two resends of one draft in the same round: one is sent, the other is refused while it is in flight', async () => {
     const h = await harness();
@@ -2133,7 +2425,7 @@ describe('held drafts: exact runs, hybrid envelopes beside a send, and turn-end 
       ]);
       assert.deepEqual((h.framework as unknown as { turnRouting: Map<string, { pin?: unknown }> }).turnRouting.get('scout')?.pin,
         { serverId: 'discord', channelId: ROOM }, 'the named destination, on its server, is the sticky target again, as live routing would leave it');
-      assert.match(h.texts().find((t) => t.startsWith('[delivered]'))!, / · 3 plain-speech segment\(s\) kept private \(skip_reply or a private think\)$/);
+      assert.match(h.texts().find((t) => t.startsWith('[delivered]'))!, / · 3 plain-speech segment\(s\) kept private \(skip_reply, a drafts call or a private think\)$/);
 
       // A live `>>>skip_reply` in an earlier round binds a later silenced one.
       const before = h.drafts().length;
@@ -2144,7 +2436,7 @@ describe('held drafts: exact runs, hybrid envelopes beside a send, and turn-end 
       assert.equal(h.drafts().length, before, 'nothing private was drafted');
       // "still thinking" is the one kept private (live routing does not count
       // the `>>>skip_reply` envelope itself).
-      assert.equal(h.texts().filter((t) => t.startsWith('[delivered]')).at(-1), '[delivered] nothing — 1 plain-speech segment(s) kept private (skip_reply or a private think)');
+      assert.equal(h.texts().filter((t) => t.startsWith('[delivered]')).at(-1), '[delivered] nothing — 1 plain-speech segment(s) kept private (skip_reply, a drafts call or a private think)');
     } finally {
       await h.close();
     }
