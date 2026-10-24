@@ -49,7 +49,8 @@
   A private turn's `channel_publish` must name its channel: a call without
   `channelId` is refused, a conversation fork's included. So must a script's
   whose starting turn is private, as that turn stands at the call, whichever
-  turn watches the script then. A private turn's `channel_open`
+  turn watches the script then. `channel_publish`'s description says so, so
+  every agent's tool list changes once. A private turn's `channel_open`
   doesn't move the locus, and says so. Its `.sleep` announcement isn't
   posted. When the model refuses (a refusal stop), a
   private turn's refusal reacts on no message, and its failure record names no

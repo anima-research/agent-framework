@@ -5,6 +5,7 @@
  * ONE request — so a host stamping gateway telemetry never reports one
  * person's channel with another person's id.
  */
+import { ChannelRegistry } from '../src/mcpl/channel-registry.js';
 import { describe, it, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
 import { tmpdir } from 'node:os';
@@ -960,6 +961,17 @@ describe('private wins, one way', () => {
     } finally {
       await rig.close();
     }
+  });
+
+  it("channel_publish's description says a turn that has taken in private input names its channel", async () => {
+    const registry = new ChannelRegistry({ getServer: () => undefined } as never, {} as never, () => {}, () => {});
+    const publish = registry.getChannelTools().find((t) => t.name === 'channel_publish')!;
+    // The refusal a private turn's publish meets, and a script's, is in its
+    // description, so the default it offers is never one the turn refuses.
+    assert.match(publish.description,
+      /must name a channel, and so must a turn that has taken in private input, such as a console or WebUI message, and a script such a turn started\./);
+    const channelId = (publish.inputSchema as unknown as { properties: { channelId: { description: string } } }).properties.channelId;
+    assert.match(channelId.description, /required of a subagent, of a turn that has taken in private input, and of a script such a turn started\)/);
   });
 
   it("a private turn's channel_publish names where it goes, a fork's home included", async () => {
