@@ -22,7 +22,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 import { AgentFramework } from '../src/index.js';
-import { ChannelRegistry } from '../src/mcpl/channel-registry.js';
+import { ChannelRegistry, destinationKey } from '../src/mcpl/channel-registry.js';
 import type { TuneOutParams } from '../src/mcpl/channel-registry.js';
 import { CapabilityGrant, ALL_CAPABILITY_PATHS } from '../src/mcpl/capability-grant.js';
 import { McplRequestError } from '../src/mcpl/server-connection.js';
@@ -88,7 +88,7 @@ async function closedChannel() {
   const closed = await registry.handleChannelToolCall('channel_close', { channelId: 'y' });
   assert.equal((closed.data as { status?: string } | undefined)?.status, 'already closed');
   server.sent.length = 0;
-  const isOpen = () => (registry as unknown as { channels: Map<string, { open: boolean }> }).channels.get('a:y')?.open;
+  const isOpen = () => (registry as unknown as { channels: Map<string, { open: boolean }> }).channels.get(destinationKey({ serverId: 'a', channelId: 'y' }))?.open;
   assert.equal(isOpen(), false);
   return { registry, servers, server, isOpen, host };
 }
@@ -200,7 +200,7 @@ test('a tune-out on a server whose channels this host can\'t open says its messa
   assert.deepEqual(without.sent, []);
   assert.equal(f.registry.getDesiredState('a', 'y'), 'tuned-out');
   // A channel that server has open needs nothing from this host.
-  (f.registry as unknown as { channels: Map<string, { open: boolean }> }).channels.get('a:y')!.open = true;
+  (f.registry as unknown as { channels: Map<string, { open: boolean }> }).channels.get(destinationKey({ serverId: 'a', channelId: 'y' }))!.open = true;
   assert.equal(await f.registry.openForTuneOut('a', 'y'), undefined, 'open there');
   assert.deepEqual(without.sent, []);
 });
@@ -566,7 +566,7 @@ test('a tune-out whose server drops, or whose grant lapses, while its own open i
   }
 });
 
-test('a tune-out that a later decision replaced while its open was out says it isn\'t in effect any more', async () => {
+test('a tune-out cancelled, and its channel then closed, while its open was out says it isn\'t in effect any more', async () => {
   const f = await closedChannel();
   let release!: () => void;
   f.server.sendChannelsOpen = async ({ channelId }) => {
@@ -577,6 +577,9 @@ test('a tune-out that a later decision replaced while its open was out says it i
   f.registry.enterTuneOut('a', 'y', PARAMS, 'agent-tool');
   const opening = f.registry.openForTuneOut('a', 'y');
   for (let i = 0; i < 20 && !release; i++) await tick();
+  // The tune-out is cancelled and the channel closed, as a close's refusal of
+  // a tuned-out channel advises, while the open is out.
+  f.registry.cancelTuneOut('a', 'y', 'open', 'test');
   const closing = f.registry.handleChannelToolCall('channel_close', { channelId: 'y' });
   release();
   assert.equal(await opening,
@@ -585,7 +588,7 @@ test('a tune-out that a later decision replaced while its open was out says it i
   assert.equal(f.registry.getDesiredState('a', 'y'), 'closed');
 });
 
-test('a tune-out whose open fails after a later decision replaced it says it isn\'t in effect any more', async () => {
+test('a tune-out whose open fails after it was cancelled and its channel closed says it isn\'t in effect any more', async () => {
   const f = await closedChannel();
   let fail!: () => void;
   f.server.sendChannelsOpen = async ({ channelId }) => {
@@ -596,6 +599,8 @@ test('a tune-out whose open fails after a later decision replaced it says it isn
   f.registry.enterTuneOut('a', 'y', PARAMS, 'agent-tool');
   const opening = f.registry.openForTuneOut('a', 'y');
   for (let i = 0; i < 20 && !fail; i++) await tick();
+  // Cancelled and closed while the open is out, as above.
+  f.registry.cancelTuneOut('a', 'y', 'open', 'test');
   const closing = f.registry.handleChannelToolCall('channel_close', { channelId: 'y' });
   fail();
   assert.equal(await opening,
@@ -674,7 +679,7 @@ test('a tune-out made while a decline\'s acknowledgment is out opens the channel
   for (let i = 0; i < 5; i++) await tick();
   assert.deepEqual(server.sent, ['open y'], 'one open, the tune-out\'s');
   assert.equal((declined.data as { status?: string } | undefined)?.status, 'replaced');
-  assert.equal((registry as unknown as { channels: Map<string, { open: boolean }> }).channels.get('a:y')?.open, true);
+  assert.equal((registry as unknown as { channels: Map<string, { open: boolean }> }).channels.get(destinationKey({ serverId: 'a', channelId: 'y' }))?.open, true);
 });
 
 test('a decline of a tuned-out channel is refused, open or not, and changes nothing', async () => {
@@ -686,7 +691,7 @@ test('a decline of a tuned-out channel is refused, open or not, and changes noth
     error: 'Channel "y" is tuned out: its messages go to the subconscious, and channel_decline doesn\'t change that. Call ' +
       'tune_out with channelId "y" and mode "cancel" for it to resume normal attention; cancelling delivers the diverted ' +
       'backlog.',
-    data: { refusal: 'tuned-out', channelId: 'y' },
+    data: { refusal: 'tuned-out', channelId: 'y', serverId: 'a' },
   };
   assert.equal(f.isOpen(), false, 'its transport isn\'t open');
   assert.deepEqual(await f.registry.handleChannelToolCall('channel_decline', { channelId: 'y', messageId: 'm1', acknowledge: '👀' }), refusal);
@@ -697,6 +702,83 @@ test('a decline of a tuned-out channel is refused, open or not, and changes noth
   f.server.sent.length = 0;
   assert.deepEqual(await f.registry.handleChannelToolCall('channel_decline', { channelId: 'y', messageId: 'm1' }), refusal, 'open');
   assert.deepEqual(f.server.sent, []);
+});
+
+test('a close of a tuned-out channel is refused, open or not, and changes nothing', async () => {
+  const f = await closedChannel();
+  f.registry.enterTuneOut('a', 'y', PARAMS, 'agent-tool');
+  const refusal = {
+    success: false,
+    isError: true,
+    error: 'Channel "y" is tuned out: its messages go to the subconscious, and channel_close doesn\'t change that. Call ' +
+      'tune_out with channelId "y" and mode "cancel" for it to resume normal attention; cancelling delivers the diverted ' +
+      'backlog, and channel_close closes it after that.',
+    data: { refusal: 'tuned-out', channelId: 'y', serverId: 'a' },
+  };
+  const agent = { kind: 'agent' as const, agentName: 'scout' };
+  assert.equal(f.isOpen(), false, 'its transport isn\'t open');
+  assert.deepEqual(await f.registry.handleChannelToolCall('channel_close', { channelId: 'y' }, agent), refusal);
+  assert.deepEqual(f.server.sent, [], 'nothing for the transport');
+  assert.equal(f.registry.getDesiredState('a', 'y'), 'tuned-out');
+  assert.equal(f.registry.getTuneOutState('a', 'y')?.params.epochId, 'e1', 'the tune-out stands');
+  assert.equal(await f.registry.openForTuneOut('a', 'y'), undefined);
+  f.server.sent.length = 0;
+  assert.deepEqual(await f.registry.handleChannelToolCall('channel_close', { channelId: 'y' }, agent), refusal, 'open');
+  assert.deepEqual(f.server.sent, []);
+  assert.equal(f.isOpen(), true, 'its transport stays open');
+  assert.equal(f.registry.getTuneOutState('a', 'y')?.params.epochId, 'e1');
+});
+
+test('a close of a tuned-out channel while the tune-out\'s own open is out is refused at once, and the open answers for the tune-out', async () => {
+  const f = await closedChannel();
+  let release!: () => void;
+  f.server.sendChannelsOpen = async ({ channelId }) => {
+    f.server.sent.push(`open ${channelId}`);
+    await new Promise<void>((resolve) => { release = resolve; });
+    return { channel: descriptor(channelId) };
+  };
+  f.registry.enterTuneOut('a', 'y', PARAMS, 'agent-tool');
+  const opening = f.registry.openForTuneOut('a', 'y');
+  for (let i = 0; i < 20 && !release; i++) await tick();
+  // The refusal comes while the open is still held: a close that waited on
+  // the channel's queue first would never answer here.
+  const closed = await f.registry.handleChannelToolCall('channel_close', { channelId: 'y' }, { kind: 'agent', agentName: 'scout' });
+  assert.equal(closed.isError, true);
+  assert.deepEqual(closed.data, { refusal: 'tuned-out', channelId: 'y', serverId: 'a' });
+  assert.equal(f.registry.getDesiredState('a', 'y'), 'tuned-out');
+  release();
+  assert.equal(await opening, undefined, 'the tune-out stands, and its open answers success');
+  assert.deepEqual(f.server.sent, ['open y'], 'no close went out');
+  assert.equal(f.isOpen(), true);
+  assert.equal(f.registry.getTuneOutState('a', 'y')?.params.epochId, 'e1');
+});
+
+test('a module\'s close of a tuned-out channel that certifies an idle lease is refused as a stand-down, and changes nothing', async () => {
+  const f = await closedChannel();
+  f.registry.enterTuneOut('a', 'y', PARAMS, 'agent-tool');
+  assert.equal(await f.registry.openForTuneOut('a', 'y'), undefined);
+  f.server.sent.length = 0;
+  const module = { kind: 'module' as const };
+  assert.deepEqual(
+    await f.registry.handleChannelToolCall('channel_close', { channelId: 'y', source: 'subscription-gc', overrideExplicitOpen: true }, module),
+    {
+      success: false,
+      isError: false,
+      error: 'Channel "y" is tuned out: its messages go to the subconscious, and channel_close doesn\'t change that. Call ' +
+        'tune_out with channelId "y" and mode "cancel" for it to resume normal attention; cancelling delivers the diverted ' +
+        'backlog, and channel_close closes it after that.',
+      data: { refusal: 'tuned-out', channelId: 'y', serverId: 'a' },
+    },
+  );
+  assert.deepEqual(f.server.sent, [], 'nothing for the transport');
+  assert.equal(f.registry.getDesiredState('a', 'y'), 'tuned-out');
+  assert.equal(f.registry.getTuneOutState('a', 'y')?.params.epochId, 'e1', 'the tune-out stands');
+  // Without the lease, the housekeeping guard refuses it first, as before.
+  const unleased = await f.registry.handleChannelToolCall('channel_close', { channelId: 'y', source: 'subscription-gc' }, module);
+  assert.equal(unleased.isError, false);
+  assert.deepEqual(unleased.data, { refusal: 'explicit-open', channelId: 'y', serverId: 'a' });
+  assert.deepEqual(f.server.sent, []);
+  assert.equal(f.registry.getTuneOutState('a', 'y')?.params.epochId, 'e1');
 });
 
 test('a tune-out waits for a registration that came back on the same connection while the work before it ran', async () => {
@@ -1230,6 +1312,177 @@ for (const outcome of [
   });
 }
 
+test('an agent\'s close of a tuned-out channel is refused, and after the cancel delivers the backlog, the close goes through', async (t) => {
+  const f = await framework(t);
+  const scout = f.i.agents.get('scout')!.getContextManager();
+  const diverted = () => scout.getAllMessages().filter((m) => (m.metadata as { tuneOut?: unknown } | undefined)?.tuneOut).length;
+  assert.equal((await f.script('tune_out', { channelId: CHANNEL })).isError, false);
+  f.emit('backlog one');
+  f.emit('backlog two');
+  const deadline = Date.now() + 10_000;
+  while (diverted() < 2) {
+    if (Date.now() > deadline) throw new Error('timed out waiting for two diverted messages');
+    await new Promise((r) => setTimeout(r, 20));
+  }
+  const refused = await f.script('channel_close', { channelId: CHANNEL });
+  assert.equal(refused.isError, true);
+  assert.equal(refused.refused, false, 'a failure after the call ran, not a refusal before it');
+  assert.equal(refused.text,
+    `Channel "${CHANNEL}" is tuned out: its messages go to the subconscious, and channel_close doesn't change that. Call ` +
+    `tune_out with channelId "${CHANNEL}" and mode "cancel" for it to resume normal attention; cancelling delivers the ` +
+    'diverted backlog, and channel_close closes it after that.');
+  assert.equal(f.i.channelRegistry.getDesiredState('disc', CHANNEL), 'tuned-out', 'the tune-out stands');
+  // The refusal's advice: cancel, which delivers the backlog, then close.
+  f.membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Read the backlog.' }]));
+  assert.deepEqual(await f.script('tune_out', { channelId: CHANNEL, mode: 'cancel' }),
+    { text: JSON.stringify({ cancelled: CHANNEL }), isError: false, refused: false });
+  const dumped = () => scout.getAllMessages().find((m) => m.content.some((b) => (b.text ?? '').includes('<tuned-out-backlog')));
+  const until = Date.now() + 10_000;
+  while (!dumped()) {
+    if (Date.now() > until) throw new Error('timed out waiting for the backlog to reach scout');
+    await new Promise((r) => setTimeout(r, 20));
+  }
+  const text = dumped()!.content.map((b) => b.text ?? '').join('');
+  assert.ok(text.includes('backlog one') && text.includes('backlog two'), text);
+  assert.deepEqual(await f.script('channel_close', { channelId: CHANNEL }),
+    { text: JSON.stringify({ channelId: CHANNEL, serverId: 'disc', status: 'closed' }), isError: false, refused: false });
+  assert.equal(f.i.channelRegistry.getDesiredState('disc', CHANNEL), 'closed');
+});
+
+type RestartInternals = {
+  channelRegistry: ChannelRegistry;
+  agents: Map<string, { getContextManager(): { getAllMessages(): Array<{ metadata?: Record<string, unknown> }> } }>;
+};
+
+/**
+ * A store whose first start, with a subconscious, tuned the channel out and
+ * diverted `divert` messages, and stopped; `start` makes the next start of
+ * it from `options`, stopped when the test ends, and `logged` holds what
+ * console.error got while `capture` ran.
+ */
+async function tunedOutStore(t: { after(fn: () => Promise<void>): void }, divert: number) {
+  const tempDir = mkdtempSync(join(tmpdir(), 'tune-out-transport-'));
+  const statusPath = join(tempDir, 'status.jsonl');
+  const commandPath = join(tempDir, 'commands.txt');
+  writeFileSync(commandPath, '');
+  const running: AgentFramework[] = [];
+  // Each start stops before the store goes.
+  t.after(async () => {
+    for (const fw of running) await fw.stop().catch(() => undefined);
+    rmSync(tempDir, { recursive: true, force: true });
+  });
+  const server = { id: 'disc', command: process.execPath, args: [FIXTURE], env: { STATUS_PATH: statusPath, COMMAND_PATH: commandPath } };
+  const config = (subconscious: boolean, servers: boolean) => ({
+    storePath: join(tempDir, 'test.chronicle'),
+    membrane: new MockMembrane().asMembrane(),
+    agents: [{ name: 'scout', model: 'test-model', systemPrompt: 'You are scout.' }],
+    ...(subconscious ? { subconscious: { enabled: true, systemPrompt: 'You are the Subconscious.' } } : {}),
+    mcplServers: servers ? [server] : [],
+    modules: [],
+  });
+  const first = await AgentFramework.create(config(true, true));
+  running.push(first);
+  await first.start();
+  const i1 = first as unknown as RestartInternals;
+  let deadline = Date.now() + 10_000;
+  while (i1.channelRegistry.listChannelsRaw().length === 0) {
+    if (Date.now() > deadline) throw new Error('timed out waiting for registration');
+    await new Promise((r) => setTimeout(r, 20));
+  }
+  assert.equal((await scriptCall(first, 'scout', 'tune_out', { channelId: CHANNEL })).refused, false);
+  for (let n = 1; n <= divert; n++) appendFileSync(commandPath, `ambient m${n} backlog ${n}\n`);
+  const scout = i1.agents.get('scout')!.getContextManager();
+  deadline = Date.now() + 10_000;
+  while (scout.getAllMessages().filter((m) => (m.metadata as { tuneOut?: unknown } | undefined)?.tuneOut).length < divert) {
+    if (Date.now() > deadline) throw new Error(`timed out waiting for ${divert} diverted messages`);
+    await new Promise((r) => setTimeout(r, 20));
+  }
+  await first.stop();
+  running.splice(running.indexOf(first), 1);
+  const logged: string[] = [];
+  const capture = async <T>(fn: () => Promise<T>): Promise<T> => {
+    const error = console.error;
+    console.error = (...args: unknown[]) => { logged.push(args.map(String).join(' ')); };
+    try { return await fn(); } finally { console.error = error; }
+  };
+  const start = async (subconscious: boolean, servers: boolean) => {
+    const fw = await capture(() => AgentFramework.create(config(subconscious, servers)));
+    running.push(fw);
+    return fw;
+  };
+  return { start, capture, logged, server };
+}
+
+const endedLine = `"${CHANNEL}" on the "disc" server was tuned out, and nothing on this host watches or cancels tune-outs, so ` +
+  'the tune-out ends here and the channel is decided open again.';
+
+test('a tune-out on record at a start with no subconscious ends there, its channel decided open again, and the log names it and the messages it diverted', async (t) => {
+  const store = await tunedOutStore(t, 2);
+  const second = await store.start(false, true);
+  const registry = (second as unknown as RestartInternals).channelRegistry;
+  assert.equal(registry.getDesiredState('disc', CHANNEL), 'open', 'decided open again, as a cancel leaves it');
+  assert.equal(registry.getTuneOutState('disc', CHANNEL), null);
+  assert.ok(store.logged.includes(`[tune-out] ${endedLine} The 2 messages it diverted stay here, and nothing will deliver them ` +
+    'as its backlog.'), store.logged.join('\n'));
+});
+
+test('the ending counts a diverted message still queued to be written, and says so in the singular', async (t) => {
+  const store = await tunedOutStore(t, 0);
+  const second = await store.start(false, true);
+  const i = second as unknown as RestartInternals & {
+    deferredMessages: Array<{ id: string; seq: number; participant: string; content: unknown[]; metadata?: unknown; forAgent?: string; heldAt: number }>;
+    endTuneOutsWithoutCoordinator(): void;
+  };
+  // A tune-out recorded on this start, with one diverted write still held
+  // for the primary and one for another agent, which isn't the primary's
+  // backlog.
+  i.channelRegistry.enterTuneOut('disc', CHANNEL, { ...PARAMS, epochId: 'held' }, 'agent-tool');
+  const diverted = { participant: 'chatter', content: [{ type: 'text', text: 'held' }], metadata: { tuneOut: { epochId: 'held' } }, heldAt: Date.now() };
+  i.deferredMessages.push({ id: 'w1', seq: 1, ...diverted }, { id: 'w2', seq: 2, ...diverted, forAgent: 'someone-else' });
+  await store.capture(async () => { i.endTuneOutsWithoutCoordinator(); });
+  assert.ok(store.logged.includes(`[tune-out] ${endedLine} The 1 message it diverted stays here, and nothing will deliver it as ` +
+    'its backlog.'), store.logged.join('\n'));
+  i.deferredMessages.length = 0;
+});
+
+test('a tune-out on record when a start without servers connects one later ends then, keeping the agent\'s provenance', async (t) => {
+  const store = await tunedOutStore(t, 0);
+  // A start with a subconscious but no servers makes no coordinator, since
+  // the channel subsystem comes up only at the connect.
+  const second = await store.start(true, false);
+  await store.capture(() => second.connectMcplServer(store.server));
+  const registry = (second as unknown as RestartInternals).channelRegistry;
+  assert.equal(registry.getDesiredState('disc', CHANNEL), 'open');
+  assert.equal(registry.getTuneOutState('disc', CHANNEL), null);
+  assert.ok(store.logged.includes(`[tune-out] ${endedLine}`), store.logged.join('\n'));
+  const deadline = Date.now() + 10_000;
+  while (registry.listChannelsRaw().length === 0) {
+    if (Date.now() > deadline) throw new Error('timed out waiting for registration');
+    await new Promise((r) => setTimeout(r, 20));
+  }
+  // The agent tuned it out, so the record stays the agent's: a housekeeping
+  // close with no lease is still refused as an explicit open.
+  const unleased = await registry.handleChannelToolCall('channel_close', { channelId: CHANNEL, source: 'subscription-gc' }, { kind: 'module' });
+  assert.deepEqual(unleased.data, { refusal: 'explicit-open', channelId: CHANNEL, serverId: 'disc' });
+});
+
+test('a tune-out whose ending fails at a start with no subconscious stays recorded, and the log says so', async (t) => {
+  const store = await tunedOutStore(t, 0);
+  const cancel = ChannelRegistry.prototype.cancelTuneOut;
+  ChannelRegistry.prototype.cancelTuneOut = () => { throw new Error('the store refused the write'); };
+  let second: AgentFramework;
+  try {
+    second = await store.start(false, true);
+  } finally {
+    ChannelRegistry.prototype.cancelTuneOut = cancel;
+  }
+  const registry = (second as unknown as RestartInternals).channelRegistry;
+  assert.equal(registry.getDesiredState('disc', CHANNEL), 'tuned-out');
+  assert.ok(store.logged.includes(`[tune-out] "${CHANNEL}" on the "disc" server is tuned out, and nothing on this host ` +
+    'watches or cancels tune-outs, but ending this one failed, so it stays recorded until a start that can end it: the ' +
+    'store refused the write.'), store.logged.join('\n'));
+});
+
 test('a decline of a tuned-out channel whose transport isn\'t open is refused, and the backlog survives to the cancel', async (t) => {
   const f = await framework(t);
   const scout = f.i.agents.get('scout')!.getContextManager();
@@ -1244,7 +1497,7 @@ test('a decline of a tuned-out channel whose transport isn\'t open is refused, a
   }
   // A transport that isn't confirmed open, as a failed open, a retarget or a
   // dropped connection leaves it, while the tune-out stands.
-  (f.i.channelRegistry as unknown as { channels: Map<string, { open: boolean }> }).channels.get(`disc:${CHANNEL}`)!.open = false;
+  (f.i.channelRegistry as unknown as { channels: Map<string, { open: boolean }> }).channels.get(destinationKey({ serverId: 'disc', channelId: CHANNEL }))!.open = false;
   const declined = await f.script('channel_decline', { channelId: CHANNEL, messageId: 'backlog-one' });
   assert.equal(declined.isError, true);
   assert.equal(declined.refused, false);

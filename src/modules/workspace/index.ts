@@ -6,7 +6,7 @@
  */
 
 import { constants as fsConstants } from 'node:fs';
-import type { Stats } from 'node:fs';
+import type { BigIntStats, Stats } from 'node:fs';
 import { open, readdir, readlink, stat, lstat, realpath } from 'node:fs/promises';
 import { basename, dirname, isAbsolute, join, parse, resolve, relative, sep } from 'node:path';
 import type { JsStore, JsTreeEntry } from '@animalabs/chronicle';
@@ -45,6 +45,9 @@ import { TOOL_BATCH_HOOK_TIMEOUT_MS, ensureStateRegistered } from '../../module-
 import { DEFAULT_TOOL_RESULT_INLINE_MAX_CHARS } from '../../tool-result-history.js';
 import { type EditSpec, type FilePlan, countBudget, decodeForEdit, hintBudget, planFile } from './edit-plan.js';
 import { type EditProblem, type EditTool, cutLine, editList, editReceipt, fitted, refusalText } from './edit-text.js';
+import { type FileText, fileText } from './text.js';
+import { DEFAULT_READ_LINE_LIMIT, characterPage, linePage } from './read-page.js';
+import { type GrepAnswer, grepText, textAnswer } from './result-text.js';
 import {
   type MountRuntime,
   type PassOptions,
@@ -61,6 +64,23 @@ import {
   reconcilePass,
   settleAdoptionBeforeMutation,
 } from './reconcile.js';
+import { EffectFailed, unlinkContained } from './effects.js';
+import { RecordJournal } from '../../record-journal.js';
+import {
+  type FileIdentity,
+  type Staged,
+  FileChanged,
+  ROOT_MOVED,
+  WriteRefused,
+  checkUnchanged,
+  directWriteTestSeam,
+  discard,
+  identityOf,
+  placedStill,
+  renameInto,
+  sameIdentity,
+  stageContained,
+} from './direct-write.js';
 
 /** Default for how long the after-batch scan may hold the agent's next inference. */
 const AGENT_ACTION_SCAN_DEADLINE_MS = 20_000;
@@ -74,6 +94,8 @@ const AGENT_ACTION_SCAN_DEADLINE_MS = 20_000;
 const CATCH_UP_BOUND_MS = 30_000;
 /** Why a call is refused once the module has stopped. */
 const NOT_RUNNING = 'The workspace has stopped: it takes no more work until it starts again';
+/** writeBinary's refusal when the store's branch is no longer the one its file is for. */
+const BRANCH_LEFT = 'the workspace had left the branch this file is for';
 /** The workspace's own deadline must end before the framework's hook bound. */
 const AGENT_ACTION_SCAN_DEADLINE_MAX_MS = TOOL_BATCH_HOOK_TIMEOUT_MS - 1_000;
 /** A direct mount's ignore list when its config names none (MountConfig.ignore). */
@@ -88,6 +110,8 @@ const DIRECT_MOUNT_IGNORE: readonly string[] = ['node_modules', 'dist', '.git', 
 const DIRECT_READS_AT_ONCE = 16;
 /** Why sync passes over a direct mount, as its result's `skipped` says. */
 const DIRECT_SYNC_SKIPPED = "a direct mount: its tools read disk as it is, so there's nothing to take in";
+/** Why materialize passes over a writable direct mount, as its result's `skipped` says. */
+const DIRECT_MATERIALIZE_SKIPPED = "a direct mount: its writes are on disk as they're made, so there's nothing to write";
 
 export type {
   WorkspaceConfig,
@@ -983,6 +1007,28 @@ export class WorkspaceModule implements Module {
    */
   private notDirect = new Map<string, Array<{ path: string; what: string }>>();
 
+  /**
+   * Each agent's latest direct write on each mount it wrote direct, P, with
+   * the notice of its departure from it, N (DirectHead), by mount, then by
+   * agent. Saved at stop() in a global record (headsJournal), not the
+   * module's branch state: they describe disk, which doesn't rewind with a
+   * branch, so a restart on another branch, such as one an offline rollback
+   * made, still finds them.
+   */
+  private directHeads = new Map<string, Map<string, DirectHead>>();
+
+  /** Where directHeads is saved and loaded (DIRECT_HEADS_RECORD_TYPE), once initStore() has read it. */
+  private headsJournal: RecordJournal<never, DirectHeadsSnapshot> | null = null;
+
+  /** The record initStore() read, as saved text, so a stop that would save the same adds none; null where there's one to replace. */
+  private loadedHeads: string | null = null;
+
+  /** Saved entries this session doesn't take up (another root, a mount not configured direct, or none), kept for the next save. */
+  private carriedHeads: DirectHeadsEntry[] = [];
+
+  /** Whether an agent's history holds a message, as the framework hands it over (useHistory). */
+  private historyLookup: ((agentName: string, messageId: string) => boolean) | null = null;
+
   constructor(config: WorkspaceConfig) {
     for (const mount of config.mounts) {
       const cap: unknown = mount.walkCap;
@@ -1116,8 +1162,62 @@ export class WorkspaceModule implements Module {
     this.agreement.open(this.config.mounts.filter((m) => intents.has(m.name)).map((m) => ({ name: m.name, root: resolve(m.path) })));
 
     this.chooseKinds();
+    this.loadDirectHeads(store);
     this.applySavedState();
     this.ensureRunning();
+  }
+
+  /**
+   * The positions stop() last saved (directHeads), before any call can
+   * write: each saved entry is a mount's positions at one root, and a mount
+   * this session configures direct gets the entry at its own root. Every
+   * other entry, a mount configured at another root, not direct, or not at
+   * all, is kept for the next save (carriedHeads), since its writes are
+   * still on disk beneath that root; a mount removed for good, and each
+   * root a mount has moved from, leave that small entry behind. A record
+   * the store can't read is logged, and this session starts with none and
+   * saves none, so the record stands for a session that can read it. One
+   * read but not of the shape saved is logged too, and this session starts
+   * with none and its stop replaces it, so a damaged record doesn't keep
+   * every later session from saving. Either way, a move away from the
+   * writes before it goes untold, as after a crash.
+   */
+  private loadDirectHeads(store: JsStore): void {
+    const journal = new RecordJournal<never, DirectHeadsSnapshot>(store, { type: DIRECT_HEADS_RECORD_TYPE });
+    const restored = new Map<string, Map<string, DirectHead>>();
+    const carried: DirectHeadsEntry[] = [];
+    let loaded: unknown;
+    try {
+      loaded = journal.load().snapshot;
+    } catch (err) {
+      console.error('[workspace] could not read the saved direct-write positions:', err);
+      return;
+    }
+    let snapshot: DirectHeadsSnapshot;
+    let text: string | null;
+    try {
+      snapshot = checkedHeads(loaded === null || loaded === undefined ? [] : loaded);
+      text = canonicalHeads(snapshot);
+    } catch (err) {
+      console.error("[workspace] the saved direct-write positions aren't of the shape saved, so this session starts with none and its stop replaces them:", err);
+      snapshot = [];
+      text = null;
+    }
+    for (const saved of snapshot) {
+      // Only a direct mount's writes are the agent's on disk, and a
+      // store-backed one's disk follows its store.
+      const mount = this.mounts.get(saved.mount);
+      if (!mount || mount.config.backend !== 'direct' || saved.root !== resolve(mount.config.path)) {
+        carried.push(saved);
+        continue;
+      }
+      restored.set(saved.mount, new Map(Object.entries(saved.agents).map(([agent, head]) =>
+        [agent, { branchId: head.branchId, after: head.after, notice: head.notice ?? null }])));
+    }
+    this.headsJournal = journal;
+    this.loadedHeads = text;
+    this.carriedHeads = carried;
+    for (const [name, heads] of restored) this.directHeads.set(name, heads);
   }
 
   /**
@@ -1612,8 +1712,8 @@ export class WorkspaceModule implements Module {
     const message = (one
       ? "A mount configured direct runs as 'chronicle' this session. To start it direct, settle each held change, then start it again: "
       : "Mounts configured direct run as 'chronicle' this session. To start a mount direct, settle each change held at it, then start it again: ") +
-      "sync its path to take disk's copy, or configure the mount 'chronicle' and read-write, materialize it, " +
-      `follow the answer, and restore its direct config. ${intents}${which}: ${held.slice(0, 10).join(', ')}` +
+      "sync its path to take disk's copy, or materialize it by name, a read-only one configured read-write first, " +
+      `and follow the answer. Meanwhile it takes no writes. ${intents}${which}: ${held.slice(0, 10).join(', ')}` +
       `${held.length > 10 ? `, and ${held.length - 10} more` : ''}.`;
     console.warn(`[workspace] ${message}`);
     this.ctx?.notifyOps?.('workspace-mount-not-direct', 'framework', message, { held: Object.fromEntries(mounts.map(([name, paths]) => [name, paths.length])) });
@@ -1683,18 +1783,58 @@ export class WorkspaceModule implements Module {
       }
       this.ctx.setState(state);
     }
+    this.saveDirectHeads();
     this.ctx = null;
   }
 
-  /** Mount names + modes, and each mount's include where it sets one, for
-   *  peer callers (framework spill/journal paths) that need a mount for files
-   *  of their own, the first writable one without an include
-   *  (firstWritableMountName), without reaching into private state. */
-  getMounts(): Array<{ name: string; mode: 'read-write' | 'read-only'; include?: readonly string[] }> {
+  /**
+   * Save directHeads as one global record, the latest of which the next
+   * start loads (loadDirectHeads): each mount's positions with the root
+   * they were made under, and the entries this session didn't take up
+   * (carriedHeads), unchanged. Only when that differs from what the
+   * start loaded, so a session that changed nothing, or a store no direct
+   * write reached, adds no record, and always where the record read wasn't
+   * of the shape saved, which this replaces. Nothing where the store couldn't
+   * read the record, so it stands. A save that fails is logged, and the next
+   * start finds the positions of the last save that landed, as after a
+   * crash.
+   */
+  private saveDirectHeads(): void {
+    if (!this.headsJournal) return;
+    const snapshot: DirectHeadsSnapshot = [
+      ...this.carriedHeads,
+      ...[...this.directHeads].filter(([, heads]) => heads.size > 0).map(([name, heads]) => ({
+        mount: name,
+        root: resolve(this.mounts.get(name)!.config.path),
+        agents: Object.fromEntries([...heads].map(([agent, { branchId, after, notice }]) => [agent, { branchId, after, ...(notice !== null ? { notice } : {}) }])),
+      })),
+    ];
+    const text = canonicalHeads(snapshot);
+    if (text === this.loadedHeads) return;
+    try {
+      this.headsJournal.checkpoint(snapshot);
+      this.loadedHeads = text;
+    } catch (err) {
+      console.error('[workspace] could not save the direct-write positions:', err);
+    }
+  }
+
+  /** Mount names + modes, each mount's include where it sets one, and
+   *  `backend: 'direct'` for one configured direct, whether it runs direct
+   *  this session or, while the store holds work there disk lacks, as
+   *  'chronicle': either way it's a directory agents write directly when it
+   *  runs direct, whose files an undo leaves. For the
+   *  framework's tool-result spills, saved payloads and fetched references,
+   *  which need a mount for files of their own: the first writable one
+   *  without an include that isn't direct (firstWritableMountName), without
+   *  reaching into private state. */
+  getMounts(): Array<{ name: string; mode: 'read-write' | 'read-only'; include?: readonly string[]; backend?: 'direct' }> {
     return [...this.mounts.values()].map((m) => ({
       name: m.config.name,
-      mode: m.config.mode === 'read-only' ? 'read-only' : 'read-write',
+      // Read-only where this session takes no writes there (writeRefusal).
+      mode: writeRefusal(m) === null ? 'read-write' : 'read-only',
       ...(m.config.include ? { include: [...m.config.include] } : {}),
+      ...(m.config.backend === 'direct' ? { backend: 'direct' as const } : {}),
     }));
   }
 
@@ -1702,10 +1842,19 @@ export class WorkspaceModule implements Module {
   // Tool Definitions
   // ==========================================================================
 
+  /**
+   * Whether any of this host's mounts runs direct. The tools' descriptions
+   * and grep's notes mention direct mounts only on such a host, so both ask
+   * this one question.
+   */
+  private anyRunsDirect(): boolean {
+    return [...this.mounts.values()].some((m) => m.direct);
+  }
+
   getTools(): ToolDefinition[] {
     // Where a mount runs direct, four descriptions say what that changes.
     // A host with none keeps them as they were, and its residents' caches.
-    const direct = [...this.mounts.values()].some((m) => m.direct);
+    const direct = this.anyRunsDirect();
     const lsDirect = direct
       ? ' A direct mount (ls without a path says which, with its ignore list) lists disk\'s files as they are now: each with '
         + 'its size and no state, or a note where the mount doesn\'t take it. A path its ignore list covers is listed when you name it.'
@@ -1716,6 +1865,23 @@ export class WorkspaceModule implements Module {
       : '';
     const globDirect = direct ? ' On a direct mount, a match carries its size, or a note where the mount doesn\'t take it, and no state.' : '';
     const syncDirect = direct ? ' A direct mount is listed under `skipped`: its tools read disk as it is, so there\'s nothing to take in.' : '';
+    // Where a direct mount is writable, the four writing tools say what a
+    // write is there: on disk when it answers, and left there by a head move.
+    const writable = [...this.mounts.values()].some((m) => m.direct && m.config.mode !== 'read-only');
+    const writeDirect = writable
+      ? ' On a direct mount, the file is on disk, whole and with its mode kept, when the call answers, and an undo or other head move leaves it there.'
+      : '';
+    const editDirect = writable
+      ? " On a direct mount, the edit applies to disk's text as it is now and is on disk when the call answers; a change another writer makes "
+        + 'meanwhile is kept, with the edit applied again on top of it, and an undo or other head move leaves the edit on disk.'
+      : '';
+    const editManyDirect = writable
+      ? " On a direct mount, every edit is checked against disk's text before any file is written, and then the files are written one by one: "
+        + "if a write fails partway, the answer names which files were written and which weren't, and nothing puts the written ones back. "
+        + 'An undo or other head move leaves them on disk.'
+      : '';
+    const deleteDirect = writable ? ' On a direct mount, the file is removed from disk at once, and an undo or other head move doesn\'t bring it back.' : '';
+    const materializeDirect = writable ? ' A direct mount writes its files to disk as they\'re made, so materialize passes over it, under `skipped` where you name it.' : '';
     return [
       {
         name: 'read',
@@ -1749,7 +1915,7 @@ export class WorkspaceModule implements Module {
       },
       {
         name: 'write',
-        description: 'Create or overwrite a file in the workspace.',
+        description: 'Create or overwrite a file in the workspace.' + writeDirect,
         inputSchema: {
           type: 'object' as const,
           properties: {
@@ -1770,7 +1936,7 @@ export class WorkspaceModule implements Module {
           + "Only the replaced text changes, and the new text's line ends take those of the text it replaces. "
           + 'A change disk made to the file is taken in first, and the answer says so. '
           + 'The answer shows the changed region, numbered, a long line from shortly before the change on it, as its length allows. '
-          + 'For several edits at once, in one file or across files, applied all or none, use edit_many.',
+          + 'For several edits at once, in one file or across files, applied all or none, use edit_many.' + editDirect,
         inputSchema: {
           type: 'object' as const,
           properties: {
@@ -1792,7 +1958,8 @@ export class WorkspaceModule implements Module {
           + "A refusal names the problems it finds, each by its edit's number in the list (from 1). "
           + 'All or none holds in the workspace: on a mount that writes to disk, disk can still refuse a file, '
           + "and the answer then says every edit is stored and names each file disk refused, with its push's reason. "
-          + "The answer shows each edit's first changed region, numbered, a long line from shortly before each change on it, as its length allows.",
+          + "The answer shows each edit's first changed region, numbered, a long line from shortly before each change on it, as its length allows."
+          + editManyDirect,
         inputSchema: {
           type: 'object' as const,
           properties: {
@@ -1821,7 +1988,7 @@ export class WorkspaceModule implements Module {
         name: 'delete',
         description: 'Delete a file from the workspace. On a mount without autoMaterialize the disk copy stays, '
           + 'listed as workspace-deleted (no scan brings it back), until materialize with applyDeletions removes it '
-          + 'or a sync of the path restores it.',
+          + 'or a sync of the path restores it.' + deleteDirect,
         inputSchema: {
           type: 'object' as const,
           properties: {
@@ -1851,11 +2018,12 @@ export class WorkspaceModule implements Module {
       },
       {
         name: 'glob',
-        description: 'Find files matching a glob pattern, checked against disk first; each match carries its state, as ls describes.' + globDirect,
+        description: 'Find files matching a glob pattern, checked against disk first; each match carries its state, as ls describes. '
+          + 'The pattern is relative to path (or to each mount\'s root). In the mount its first segment names, it is read mount-prefixed instead, like the paths it returns, within path if one is given; in every other mount, as written.' + globDirect,
         inputSchema: {
           type: 'object' as const,
           properties: {
-            pattern: { type: 'string', description: 'Glob pattern (e.g., "**/*.ts")' },
+            pattern: { type: 'string', description: 'Glob pattern, relative (e.g., "**/*.ts") or mount-prefixed (e.g., "project/src/**/*.ts")' },
             path: { type: 'string', description: 'Directory to search in (mount-prefixed, optional)' },
           },
           required: ['pattern'],
@@ -1873,7 +2041,7 @@ export class WorkspaceModule implements Module {
           properties: {
             pattern: { type: 'string', description: 'Regular expression pattern' },
             path: { type: 'string', description: 'File or directory to search (mount-prefixed, optional)' },
-            glob: { type: 'string', description: 'Glob pattern to filter files' },
+            glob: { type: 'string', description: 'Glob pattern to filter files: one with a "/" is matched from the mount\'s root, whatever the path (e.g., "src/**/*.ts"), and in the mount its first segment names, read mount-prefixed (e.g., "project/src/**/*.ts"), in every other mount as written; one with no "/" also matches a file\'s name at any depth (e.g., "*.ts")' },
             contextBefore: { type: 'integer', description: 'Context lines before match' },
             contextAfter: { type: 'integer', description: 'Context lines after match' },
           },
@@ -1895,7 +2063,7 @@ export class WorkspaceModule implements Module {
         description: 'Write workspace files to the real filesystem. Use after writing/editing to push changes to disk. '
           + 'Never deletes disk files unless applyDeletions is given; lists workspace deletions it left on disk. '
           + 'On a mount with an include, what the include doesn\'t cover is never written, and one naming a '
-          + 'directory counts what it left beneath it under `passedOver`, by mount and reason, without naming it.',
+          + 'directory counts what it left beneath it under `passedOver`, by mount and reason, without naming it.' + materializeDirect,
         inputSchema: {
           type: 'object' as const,
           properties: {
@@ -2026,21 +2194,26 @@ export class WorkspaceModule implements Module {
         return { success: false, isError: true, error: `The ${call.name} call did nothing: ${problem}.` };
       }
       const input = call.input as Record<string, unknown>;
+      // The most of this call's result that can reach its caller whole: past
+      // it, a model's result spills into a file, and a script gets
+      // ResultTooLarge in its place. A call made in process carries none and
+      // takes the data itself, so its read pages by its line limit alone.
+      const resultMaxChars = call.resultMaxChars;
       const generated = typeof input?.path === 'string' ? this.findGeneratedTextFile(input.path) : undefined;
       if (generated) {
         if (call.name === 'read' && call.callerAgentName === generated.agentName) {
-          return await this.handleRead(input as unknown as ReadInput, generated.read());
+          return await this.handleRead(input as unknown as ReadInput, resultMaxChars, generated.read());
         }
         return { success: false, isError: true, error: this.generatedFileRefusal(generated, call.callerAgentName) };
       }
 
       switch (call.name) {
-        case 'read': return await this.handleRead(input as unknown as ReadInput);
+        case 'read': return await this.handleRead(input as unknown as ReadInput, resultMaxChars);
         case 'read_image': return await this.handleReadImage(input as unknown as ReadImageInput);
-        case 'write': return await this.handleWrite(input as unknown as WriteInput);
-        case 'edit': return await this.handleEdit(input as unknown as EditInput, call.resultMaxChars);
+        case 'write': return await this.handleWrite(input as unknown as WriteInput, call.callerAgentName);
+        case 'edit': return await this.handleEdit(input as unknown as EditInput, call.resultMaxChars, call.callerAgentName);
         case 'edit_many': return await this.handleEditMany(input as unknown as EditManyInput, call.resultMaxChars, call.callerAgentName);
-        case 'delete': return await this.handleDelete(input as unknown as DeleteInput);
+        case 'delete': return await this.handleDelete(input as unknown as DeleteInput, call.callerAgentName);
         case 'ls': return await this.handleLs(input as unknown as LsInput);
         case 'glob': return await this.handleGlob(input as unknown as GlobInput);
         case 'grep': return await this.handleGrep(input as unknown as GrepInput);
@@ -2181,6 +2354,12 @@ export class WorkspaceModule implements Module {
    * withheld original this way, for the branch its stub is on
    * (agent-framework #277).
    *
+   * On a mount running direct, the bytes go to disk as a direct `write`'s
+   * do, whole or not at all, and nothing goes into the store: `branch` is
+   * checked before the write starts and again just before its rename, and
+   * `agentName` names the agent whose write it is for the head-move notice
+   * (a write naming none tells no agent).
+   *
    * A write whose tree entry is set but that then fails returns success
    * false with `data: { inChronicle: true }`: its copy on disk was refused,
    * the store failed after recording the entry, which skips the push where
@@ -2194,7 +2373,7 @@ export class WorkspaceModule implements Module {
     mountPrefixedPath: string,
     data: Buffer,
     mimeType: string,
-    options: { branch?: string } = {},
+    options: { branch?: string; agentName?: string } = {},
   ): Promise<ToolResult> {
     if (!this.running()) return { success: false, isError: true, error: NOT_RUNNING };
     return this.underWay(this.writeBinaryUnderWay(mountPrefixedPath, data, mimeType, options));
@@ -2204,7 +2383,7 @@ export class WorkspaceModule implements Module {
     mountPrefixedPath: string,
     data: Buffer,
     mimeType: string,
-    options: { branch?: string },
+    options: { branch?: string; agentName?: string },
   ): Promise<ToolResult> {
     let mount: MountState;
     let relativePath: string;
@@ -2217,20 +2396,32 @@ export class WorkspaceModule implements Module {
         isError: true,
       };
     }
-    if (mount.config.mode === 'read-only') {
-      return { success: false, error: `Mount "${mount.config.name}" is read-only`, isError: true };
-    }
+    const refusal = writeRefusal(mount);
+    if (refusal) return { success: false, error: refusal, isError: true };
     const maxSize = mount.config.maxFileSize ?? DEFAULT_MAX_FILE_SIZE;
     if (data.byteLength > maxSize) {
       return { success: false, error: `Content exceeds max file size (${maxSize} bytes)`, isError: true };
     }
     const store = this.getStore();
+    // A direct mount's bytes go to disk, whole, or nowhere (writeDirect),
+    // as the caller's agent's write, where it names one. A branch it names
+    // is checked just before the rename, since disk is no branch's.
+    if (mount.direct) {
+      // Checked first too, so a request already for a left branch makes no
+      // directory and stages nothing.
+      if (options.branch !== undefined && store.currentBranch().name !== options.branch) {
+        return { success: false, error: BRANCH_LEFT, isError: true, data: { branchLeft: true } };
+      }
+      const written = await this.writeDirect(mount, relativePath, mountPrefixedPath, data, options.agentName, options.branch);
+      if ('error' in written) return { success: false, isError: true, error: written.error, ...(written.branchLeft ? { data: { branchLeft: true } } : {}) };
+      return { success: true, data: { path: mountPrefixedPath, size: data.byteLength, mimeType, ...(written.note ? { note: written.note } : {}) } };
+    }
     return this.withMount(mount, async () => {
       await this.settleBeforeMutation(mount, relativePath);
       // Checked inside the mount's turn, after anything the write waited on:
       // commitToolChange sets the tree entry before it first yields.
       if (options.branch !== undefined && store.currentBranch().name !== options.branch) {
-        return { success: false, error: 'the workspace had left the branch this file is for', isError: true, data: { branchLeft: true } };
+        return { success: false, error: BRANCH_LEFT, isError: true, data: { branchLeft: true } };
       }
       const blobHash = store.storeBlob(data, mimeType);
       // An overwrite keeps the file's mode, as the write tool's does.
@@ -2267,11 +2458,15 @@ export class WorkspaceModule implements Module {
   }
 
   /**
-   * Read a file's raw bytes from a mount (through the Chronicle tree, synced
-   * first like the `read` tool; on a direct mount, from disk as
-   * readBinaryFromDisk reads it, at most the mount's `maxFileSize`). Public
-   * API for the framework's synthesized `read_image` tool and other peer
-   * callers that need binary content.
+   * Read a file's raw bytes from a mount: through the Chronicle tree, a path
+   * the workspace doesn't hold observed first (ensureSynced); or, on a direct
+   * mount, from disk as readBinaryFromDisk reads it, at most the mount's
+   * `maxFileSize`. A path the workspace holds is read as the workspace holds
+   * it, not settled as the `read` tool settles it: the tree takes in no
+   * binary disk copy, so a pass over a held binary file that disk changed
+   * would drop the workspace's copy. Public API for the framework's
+   * synthesized `read_image` tool, where the workspace module doesn't serve
+   * read_image itself, and other peer callers that need binary content.
    */
   async readBinary(
     mountPrefixedPath: string,
@@ -2489,8 +2684,10 @@ export class WorkspaceModule implements Module {
    * mount nested by its directories alone, since its real root holds this
    * one, is judged by the parse's nesting, so a root repointed between a
    * read's parse and its open can have it serve a path in that mount's
-   * directory. Each mount is placed as a start places it (placementOf), from
-   * where its real root and the directories above its configured path lie on
+   * directory, and one repointed between a direct write's parse and its
+   * staging can have the write land there. Each mount is placed as a start
+   * places it (placementOf), from where its real root and the directories
+   * above its configured path lie on
    * disk. For a mount configured at this mount's own path or beneath it,
    * that's where they lie now: beneath `rootReal` where they lie beneath this
    * mount's path, and the directories above this mount's path as resolving
@@ -3680,15 +3877,19 @@ export class WorkspaceModule implements Module {
   }
 
   /**
-   * Before a read: a path the workspace doesn't hold is observed under the
-   * three-way rule, which ingests a new disk file but never brings back a
-   * workspace deletion or a file absent from this branch. The pass names the
-   * path, as a file tool names the one it acts on: a path the mount passes
-   * over by design is observed, as a sync naming it would observe it (#276),
-   * while a path in another mount's directory is refused before this, and
-   * passed over by any pass. Answers the pass's report on the path, and why
-   * the pass decided nothing where it did (undecidedOf), which leaves disk
-   * unchecked. The caller holds the mount's turn.
+   * Before a deletion, and for readBinary: a path the workspace doesn't hold
+   * is observed under the three-way rule, which ingests a new disk file but
+   * never brings back a workspace deletion or a file absent from this branch.
+   * A path it holds is left alone. For a deletion, as for a write, taking
+   * disk's change in first would let the push remove that change unseen; for
+   * readBinary, a pass would drop a held binary file that disk changed, since
+   * the tree takes in no binary disk copy. The pass names the path, as a file
+   * tool names the one it acts on: a path the mount passes over by design is
+   * observed, as a sync naming it would observe it (#276), while a path in
+   * another mount's directory is refused before this, and passed over by any
+   * pass. Answers the pass's report on the path, and why the pass decided
+   * nothing where it did (undecidedOf), which leaves disk unchecked. The
+   * caller holds the mount's turn.
    */
   private async ensureSynced(mount: MountState, relativePath: string): Promise<{ report: PathReport | undefined; undecided: string | null }> {
     const store = this.getStore();
@@ -3727,21 +3928,52 @@ export class WorkspaceModule implements Module {
   }
 
   /**
-   * A file's bytes for read, from where the mount keeps what it reads: the
-   * workspace's copy, taken in from disk first where it holds none
-   * (ensureSynced); or, on a direct mount, disk's file as it is now
-   * (bytesOnDisk). An error says why there are none to read.
+   * A file's bytes for read, and the notes that say which copy they are. On a
+   * 'chronicle' mount it's the workspace's copy, after a pass over the path
+   * takes disk's change to it in first. On a direct mount it's disk's file as
+   * it is now (bytesOnDisk), with no notes, since nothing else is kept. An
+   * error says why there are none to read.
    */
-  private async bytesOf(mount: MountState, relativePath: string, path: string): Promise<{ bytes: Buffer } | { error: string }> {
-    if (mount.direct) return this.bytesOnDisk(mount, relativePath, path);
+  private async bytesOf(mount: MountState, relativePath: string, path: string): Promise<{ bytes: Buffer; notes: string[] } | { error: string }> {
+    if (mount.direct) {
+      const read = await this.bytesOnDisk(mount, relativePath, path);
+      return 'error' in read ? read : { bytes: read.bytes, notes: [] };
+    }
     const store = this.getStore();
-    return this.withMount(mount, async () => {
-      const { report } = await this.ensureSynced(mount, relativePath);
+    return this.withMount(mount, async (): Promise<{ bytes: Buffer; notes: string[] } | { error: string }> => {
+      // A read shows the path as disk holds it now: a change on disk to a
+      // file the workspace holds is taken in first, by the rule a listing
+      // uses, as an edit's is. Where the stored copy is a draft and disk
+      // changed too, the read shows the draft and names the conflict. The
+      // pass names the path, as a file tool names the one it acts on, so a
+      // path the mount passes over by design is observed, as a sync naming
+      // it would observe it (#276).
+      const pass = await this.passUnlocked(mount, { kind: 'paths', paths: [relativePath] }, { named: true });
+      // A pass that decided nothing (undecidedOf: the selected branch kept
+      // changing) leaves no report. It's read as a copy disk couldn't be
+      // checked, with its reason, so the answer says the check didn't finish.
+      const undecided = undecidedOf(pass);
+      const report = pass.reports.get(relativePath)
+        ?? (undecided !== null ? { path: relativePath, state: 'unverified' as const, note: undecided } : undefined);
+      // A check that decided nothing may well finish on the next read, as
+      // grep's answer to the same says of grep.
+      const again = undecided !== null ? ['Read again to check it.'] : [];
+      // A mode taken in alone isn't a change to the text, so it leaves the
+      // read nothing to say, as it leaves an edit nothing.
+      const took = (op: TreeOp) => pass.ops.some((o) => o.path === relativePath && o.op === op && !o.modeOnly);
       const entry = store.treeGet(mount.treeStateId, relativePath);
-      if (!entry) return { error: this.notInWorkspace(path, report) };
+      if (!entry) {
+        // A pass also drops a copy disk made binary or too large, which
+        // the disk-only answer describes; any other drop is disk's deletion.
+        return {
+          error: took('deleted') && report?.state !== 'disk-only'
+            ? `File not found: ${path}. Disk's copy was deleted since the workspace last agreed with it, and that was taken in first.`
+            : [this.notInWorkspace(path, report), ...again].join(' '),
+        };
+      }
       const blob = store.getBlob(entry.blobHash);
       if (!blob) return { error: `Blob not found for: ${path}` };
-      return { bytes: blob };
+      return { bytes: blob, notes: [...whichCopyRead(report, took('modified'), mount.config.mode === 'read-only'), ...again] };
     });
   }
 
@@ -3764,8 +3996,7 @@ export class WorkspaceModule implements Module {
     } catch (err) {
       // A refusal that names only the path says why with its errno, as a
       // failed read below does.
-      const bare = err instanceof WorkspaceReadError && err.errno !== undefined && err.message === `Unable to read file: ${path}`;
-      return { error: bare ? `${err.message} (${err.errno})` : err instanceof Error ? err.message : String(err) };
+      return { error: containedRefusal(err, path) };
     }
     try {
       // No more than the limit is loaded, as for a file over it at its fstat.
@@ -3787,92 +4018,38 @@ export class WorkspaceModule implements Module {
   // Tool Handlers
   // ==========================================================================
 
-  private async handleRead(input: ReadInput, generatedContent?: string): Promise<ToolResult> {
+  /**
+   * A read's page, held to `maxChars`, the most of this call's result that
+   * can reach its caller whole. A call that carries none, made in process,
+   * takes the data itself: its page holds to its line limit alone, with every
+   * line whole, as it did before pages had a budget.
+   */
+  private async handleRead(input: ReadInput, maxChars: number | undefined, generatedContent?: string): Promise<ToolResult> {
     const characterPaging = input.offsetChars !== undefined || input.limitChars !== undefined;
-    const offsetChars = input.offsetChars ?? 0;
-    const limitChars = input.limitChars ?? 2000;
     // Each number is a whole number of at least its schema's minimum by now
     // (inputProblem).
     if (characterPaging && (input.offset !== undefined || input.limit !== undefined)) {
       return { success: false, isError: true, error: 'Use either offset/limit (lines) or offsetChars/limitChars (characters), not both.' };
     }
-    let content = generatedContent;
-    if (content === undefined) {
+    let file: FileText;
+    let notes: string[] = [];
+    if (generatedContent === undefined) {
       const { mount, relativePath, path } = await this.parseFilePath(input.path);
       input = { ...input, path };
       const found = await this.bytesOf(mount, relativePath, path);
       if ('error' in found) return { success: false, error: found.error, isError: true };
-      content = found.bytes.toString('utf-8');
+      file = fileText(found.bytes);
+      notes = found.notes;
+    } else {
+      file = fileText(Buffer.from(generatedContent, 'utf-8'));
     }
-    if (characterPaging) {
-      const start = Math.min(offsetChars, content.length);
-      const splitsPair = (at: number): boolean =>
-        at > 0 && at < content.length
-        && content.charCodeAt(at - 1) >= 0xd800 && content.charCodeAt(at - 1) <= 0xdbff
-        && content.charCodeAt(at) >= 0xdc00 && content.charCodeAt(at) <= 0xdfff;
-      if (splitsPair(start)) {
-        return { success: false, isError: true, error: 'offsetChars splits a surrogate pair; use nextOffsetChars from the previous page.' };
-      }
-      let end = start + Math.min(limitChars, content.length - start);
-      if (splitsPair(end)) end++;
-      return {
-        success: true,
-        data: {
-          path: input.path,
-          totalChars: content.length,
-          offsetChars: start,
-          nextOffsetChars: end < content.length ? end : null,
-          content: content.slice(start, end),
-        },
-      };
-    }
-    const lines = linesOf(content);
-
-    // Apply offset/limit. An unlimited read of a large file would inject the
-    // whole thing into the turn (a 2MB file ≈ 600k tokens → the request blows
-    // past the model context and 400s), so an omitted limit falls back to a
-    // default cap; the result reports total/from/to so the agent can page.
-    const DEFAULT_READ_LINE_LIMIT = 2000;
-    const startLine = (input.offset ?? 1) - 1; // Convert to 0-indexed
-    if (startLine >= lines.length) {
-      // Nothing to show: an empty file, or an offset past the last line. No
-      // range is claimed, and the line count says where the file ends.
-      return {
-        success: true,
-        data: {
-          path: input.path,
-          totalLines: lines.length,
-          // Reading an empty file from its start is reading it whole.
-          ...(startLine > 0
-            ? { note: `Line ${startLine + 1} is past the end: the file has ${lines.length} line${lines.length === 1 ? '' : 's'}.` }
-            : {}),
-          content: '',
-        },
-      };
-    }
-    const effectiveLimit = input.limit ?? DEFAULT_READ_LINE_LIMIT;
-    const endLine = startLine + effectiveLimit;
-    const slice = lines.slice(startLine, endLine);
-    const truncated = endLine < lines.length;
-
-    // Format with line numbers (cat -n style)
-    const formatted = slice
-      .map((line, i) => `${String(startLine + i + 1).padStart(6)}\t${line}`)
-      .join('\n');
-
-    return {
-      success: true,
-      data: {
-        path: input.path,
-        totalLines: lines.length,
-        fromLine: startLine + 1,
-        toLine: Math.min(endLine, lines.length),
-        ...(truncated
-          ? { note: `Truncated at ${effectiveLimit} lines (file has ${lines.length}). Use offset/limit to read more.` }
-          : {}),
-        content: formatted,
-      },
-    };
+    // An unlimited read of a large file would inject the whole thing into the
+    // turn (a 2MB file ≈ 600k tokens → the request blows past the model
+    // context and 400s), so an omitted limit falls back to a default, and a
+    // page stops at the call's result limit where it has one.
+    return characterPaging
+      ? characterPage(input.path, file, input.offsetChars ?? 0, input.limitChars ?? 2000, maxChars, notes)
+      : linePage(input.path, file, input.offset ?? 1, input.limit ?? DEFAULT_READ_LINE_LIMIT, maxChars, notes);
   }
 
   private async handleReadImage(input: ReadImageInput): Promise<ToolResult> {
@@ -3924,15 +4101,14 @@ export class WorkspaceModule implements Module {
     }
   }
 
-  private async handleWrite(input: WriteInput): Promise<ToolResult> {
+  private async handleWrite(input: WriteInput, callerAgentName?: string): Promise<ToolResult> {
     if (LONE_SURROGATE.test(input.content)) {
       return { success: false, isError: true, error: 'The write did nothing: "content" holds a lone UTF-16 surrogate, which UTF-8 can\'t store.' };
     }
     const { mount, relativePath, path } = await this.parseFilePath(input.path);
     input = { ...input, path };
-    if (mount.config.mode === 'read-only') {
-      return { success: false, error: `Mount "${mount.config.name}" is read-only`, isError: true };
-    }
+    const refusal = writeRefusal(mount);
+    if (refusal) return { success: false, error: refusal, isError: true };
 
     const store = this.getStore();
     const maxSize = mount.config.maxFileSize ?? DEFAULT_MAX_FILE_SIZE;
@@ -3942,6 +4118,12 @@ export class WorkspaceModule implements Module {
 
     const buffer = Buffer.from(input.content, 'utf-8');
     const receipt = { path: input.path, size: buffer.byteLength, hash: hashContent(input.content) };
+    // A direct mount's bytes go to disk, whole, or nowhere (writeDirect).
+    if (mount.direct) {
+      const written = await this.writeDirect(mount, relativePath, input.path, buffer, callerAgentName);
+      if ('error' in written) return { success: false, isError: true, error: written.error };
+      return { success: true, data: { ...receipt, ...(written.note ? { note: written.note } : {}) } };
+    }
     let committed = false;
     let refused: string | null;
     let modeKept: string | null;
@@ -3965,13 +4147,13 @@ export class WorkspaceModule implements Module {
     return { success: true, data: { ...receipt, ...(modeKept ? { modeKept } : {}) } };
   }
 
-  private async handleEdit(input: EditInput, maxChars = DEFAULT_TOOL_RESULT_INLINE_MAX_CHARS): Promise<ToolResult> {
+  private async handleEdit(input: EditInput, maxChars = DEFAULT_TOOL_RESULT_INLINE_MAX_CHARS, callerAgentName?: string): Promise<ToolResult> {
     return this.applyEdits('edit', [{
       path: input.path,
       oldString: input.oldString,
       newString: input.newString,
       expected: input.replaceAll ? 'all' : 1,
-    }], maxChars);
+    }], maxChars, callerAgentName);
   }
 
   private async handleEditMany(
@@ -4092,6 +4274,9 @@ export class WorkspaceModule implements Module {
     const [mount] = mounts.values();
     if (tool === 'edit' && problems.length) return refuse(problems);
     if (!mount || mounts.size > 1) return refuse(problems);
+    // A direct mount's edits apply to disk's text as it is now, and land on
+    // disk or don't happen (applyDirectEdits).
+    if (mount.direct) return this.applyDirectEdits(tool, mount, [...targets.values()], problems, given.length, maxChars, callerAgentName);
 
     const store = this.getStore();
     // Whether the commit set the call's entries, all of them at once.
@@ -4201,48 +4386,11 @@ export class WorkspaceModule implements Module {
             problems.push({ kind: 'file', edits: target.edits, path: target.path, text: `Blob not found for: ${target.path}`, whole: true });
             continue;
           }
-          // Decoding would turn each invalid sequence into U+FFFD, and writing
-          // the text back would change bytes the edits never named.
-          const file = decodeForEdit(blob);
-          if (!file) {
-            problems.push({
-              kind: 'file',
-              edits: target.edits,
-              path: target.path,
-              text: `${target.path} isn't valid UTF-8, so editing it would change bytes outside the text it replaces. `
-                + 'Read shows each invalid byte sequence as U+FFFD, and a write replaces the whole file as UTF-8, so writing back what read shows puts U+FFFD in their place.',
-              whole: false,
-            });
-            continue;
-          }
-          if (!target.specs.length) continue;
-          const planned = planFile(file, blob, target.specs, hints, maxSize, counts);
-          if ('problems' in planned) {
-            // One at a time: a call of many edits can have more problems
-            // than a spread passes as arguments.
-            for (const problem of planned.problems) problems.push({ ...problem, path: target.path });
-            continue;
-          }
-          // The planner refuses a file its counts take past the limit before
-          // building it, from the least its bytes can be; one it built past
-          // the limit, as its CRs or multi-byte characters can take it, is
-          // refused here.
-          if ('tooLarge' in planned || planned.plan.bytes.length > maxSize) {
-            const size = 'tooLarge' in planned ? `at least ${planned.tooLarge.toLocaleString('en-US')}` : planned.plan.bytes.length.toLocaleString('en-US');
-            problems.push({
-              kind: 'file',
-              edits: target.edits,
-              path: target.path,
-              text: `${target.path} would be ${size} bytes with ${tool === 'edit' ? 'this edit' : editList(target.edits)}, `
-                + `past the ${maxSize.toLocaleString('en-US')}-byte limit this mount sets on a file, so the workspace couldn't keep it. `
-                + "An edit that leaves the file within the limit applies. The limit is the mount's maxFileSize setting, which only whoever runs the host can change.",
-              whole: false,
-            });
-            continue;
-          }
+          const plan = planTargetEdits(tool, target, blob, hints, maxSize, counts, problems);
+          if (plan === null) continue;
           plans.push({
             target,
-            plan: planned.plan,
+            plan,
             mode: entry.mode,
             backOnDisk,
             conflictNote: pushes ? null : conflictNote(tool === 'edit' || target.edits.length === 1 ? 'is in' : 'are in'),
@@ -4257,15 +4405,12 @@ export class WorkspaceModule implements Module {
           change: { kind: 'set' as const, blobHash: store.storeBlob(plan.bytes, 'text/plain'), size: plan.bytes.length, mode },
         })), () => { committed = true; });
         if (refused.size > 0) return this.editsStoredButUnfinished(tool, [...targets.values()], applied, conflicts, { refused, modeKept }, maxChars);
-        return {
-          success: true,
-          data: editReceipt(tool, plans.map(({ target, plan, backOnDisk, conflictNote }) => ({
-            path: target.path,
-            plan,
-            notes: [applied.get(target) ?? null, backOnDisk, conflictNote].filter((note): note is string => note !== null),
-            modeKept: modeKept.get(target.relativePath) ?? null,
-          })), given.length, maxChars),
-        };
+        return editReceipt(tool, plans.map(({ target, plan, backOnDisk, conflictNote }) => ({
+          path: target.path,
+          plan,
+          notes: [applied.get(target) ?? null, backOnDisk, conflictNote].filter((note): note is string => note !== null),
+          modeKept: modeKept.get(target.relativePath) ?? null,
+        })), given.length, maxChars);
       });
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
@@ -4320,7 +4465,8 @@ export class WorkspaceModule implements Module {
       // One that names the mount's root, its bare name included, names no
       // file.
       if (where.relativePath === '') return unusable(`${path} names the root of mount "${where.mount.config.name}", which isn't a file; ls ${where.mount.config.name} lists the files in it.`);
-      if (where.mount.config.mode === 'read-only') return unusable(`Mount "${where.mount.config.name}" is read-only`);
+      const refusal = writeRefusal(where.mount);
+      if (refusal) return unusable(refusal);
       const generated = tool === 'edit_many' ? this.findGeneratedTextFile(path) : undefined;
       if (generated) return unusable(`${path}: ${this.generatedFileRefusal(generated, callerAgentName)}.`);
       return where;
@@ -4404,12 +4550,513 @@ export class WorkspaceModule implements Module {
     return { success: false, isError: true, error: fitted(head, parts, notes, maxChars, 'stored') };
   }
 
-  private async handleDelete(input: DeleteInput): Promise<ToolResult> {
+  // ==========================================================================
+  // Direct writes
+  // ==========================================================================
+
+  /**
+   * A direct mount's write of a whole file: its bytes staged beside it and
+   * renamed over it (direct-write.ts), under the mount's turn, so the
+   * module's own calls take turns. Answers a note when the file had other
+   * hard links, which keep its old text, or why nothing was written. One
+   * that lands is the caller's latest write on the mount (recordDirectWrite).
+   * With `branch`, nothing is written once the store's branch is another,
+   * checked with no turn of the event loop before the rename (writeBinary's).
+   */
+  private async writeDirect(
+    mount: MountState,
+    relativePath: string,
+    path: string,
+    bytes: Buffer,
+    agentName: string | undefined,
+    branch?: string,
+  ): Promise<{ note: string | null } | { error: string; branchLeft?: true }> {
+    return this.withMount(mount, async () => {
+      const { view, rootReal } = await this.diskView(mount);
+      let staged: Staged;
+      try {
+        staged = await stageContained(view, rootReal, relativePath, bytes, { makeDirectory: true });
+      } catch (error) {
+        return { error: `The write did nothing to ${path}: ${directReason(error)}.` };
+      }
+      try {
+        await directWriteTestSeam.afterStage?.([staged.path]);
+        await placedStill(staged);
+        // A write reads nothing first, so it replaces whatever is there.
+        checkUnchanged(staged, null);
+        if (branch !== undefined && this.getStore().currentBranch().name !== branch) {
+          await discard(staged);
+          return { error: BRANCH_LEFT, branchLeft: true };
+        }
+        renameInto(staged);
+      } catch (error) {
+        await discard(staged);
+        return { error: `The write did nothing to ${path}: ${directReason(error)}.` };
+      }
+      this.recordDirectWrite(mount, agentName);
+      return { note: linksNote(path, staged, 'write') };
+    });
+  }
+
+  /**
+   * applyEdits on a direct mount, under the mount's turn, whose edits land
+   * on disk or don't happen. Each attempt reads every file from disk as it
+   * is now (directEditText), plans every edit against those bytes as on any
+   * mount (planTargetEdits), stages every file beside itself, checks every
+   * one unchanged since its read, and then renames each over its file in
+   * turn (direct-write.ts). A file another writer changed between its read
+   * and its check has the call read and planned again against its new
+   * text, three attempts in all (DIRECT_EDIT_ATTEMPTS), so edits that no
+   * longer apply to it, a file that changed at every attempt, or a file the
+   * next read refuses as any read would (now past the size limit, say) are
+   * refused, with nothing written. A rename that fails after others leaves
+   * those written and the rest as they were, and the answer names each
+   * file's outcome; nothing puts the written ones back.
+   */
+  private async applyDirectEdits(
+    tool: EditTool,
+    mount: MountState,
+    targets: EditTarget[],
+    early: EditProblem[],
+    editCount: number,
+    maxChars: number,
+    agentName: string | undefined,
+  ): Promise<ToolResult> {
+    const changedMeanwhile = new Set<EditTarget>();
+    return this.withMount(mount, async () => {
+      for (let attempt = 1; ; attempt++) {
+        const outcome = await this.attemptDirectEdits(tool, mount, targets, early, changedMeanwhile, editCount, maxChars, agentName);
+        if (outcome !== 'changed') return outcome;
+        if (attempt === DIRECT_EDIT_ATTEMPTS) {
+          const changed = targets.filter((target) => changedMeanwhile.has(target)).map((target) => target.path);
+          // Each attempt stops at the first file it finds changed, so these are
+          // the files some attempt found changed, at most one per attempt.
+          return {
+            success: false,
+            isError: true,
+            error: tool === 'edit'
+              ? `${changed[0]} kept changing on disk while this edit was being applied (${DIRECT_EDIT_ATTEMPTS} attempts), so nothing was written. Read it again before retrying.`
+              : `Another writer kept changing this call's files on disk while it was being applied: each of its ${DIRECT_EDIT_ATTEMPTS} attempts `
+                + `found one changed since its read (${listed(changed)}), so nothing was written. Read ${changed.length === 1 ? 'it' : 'them'} again before retrying.`,
+          };
+        }
+      }
+    });
+  }
+
+  /**
+   * One attempt of applyDirectEdits: its answer, or 'changed' when another
+   * writer changed a file since its read, with nothing written. `early` are
+   * the problems found before any file was read, which a refusal names with
+   * the rest. The caller holds the mount's turn.
+   */
+  private async attemptDirectEdits(
+    tool: EditTool,
+    mount: MountState,
+    targets: EditTarget[],
+    early: EditProblem[],
+    changedMeanwhile: Set<EditTarget>,
+    editCount: number,
+    maxChars: number,
+    agentName: string | undefined,
+  ): Promise<ToolResult | 'changed'> {
+    const problems = [...early];
+    const read = new Map<EditTarget, { bytes: Buffer; identity: FileIdentity }>();
+    for (const target of targets) {
+      const got = await this.directEditText(mount, target.relativePath, target.path);
+      if ('changed' in got) {
+        changedMeanwhile.add(target);
+        return 'changed';
+      }
+      if ('error' in got) problems.push({ kind: 'file', edits: target.edits, path: target.path, text: got.error, whole: true });
+      else read.set(target, got);
+    }
+    // Two paths that reach one file, through a link this mount follows, or
+    // as two hard links (a disk that folds case has its two spellings made
+    // one path by the parse, short of a directory link on the way, past
+    // which they're refused here as one file named twice): each
+    // would be planned against the same text and renamed over the same file
+    // or split from it, so one's edits would be lost or kept apart from the
+    // other's. They're refused. One file read twice has one identity here
+    // unless a writer changed it between the reads, and the check before the
+    // renames then sees that and reads again.
+    const byIdentity = new Map<string, EditTarget>();
+    for (const [target, { identity }] of read) {
+      const key = `${identity.dev}:${identity.ino}:${identity.size}:${identity.mtimeNs}:${identity.ctimeNs}`;
+      const other = byIdentity.get(key);
+      if (!other) {
+        byIdentity.set(key, target);
+        continue;
+      }
+      problems.push({
+        kind: 'file',
+        edits: [...other.edits, ...target.edits].sort((a, b) => a - b),
+        path: other.path,
+        text: `${other.path} and ${target.path} are one file, reached through a link or as two hard links; name it one way, so its edits are matched in one text`,
+        whole: true,
+      });
+    }
+    const maxSize = mount.config.maxFileSize ?? DEFAULT_MAX_FILE_SIZE;
+    const hints = hintBudget();
+    // As much as the largest file the call names holds, at least, so the
+    // budget is the same whatever order its files are planned in.
+    let largest = maxSize;
+    for (const { bytes } of read.values()) largest = Math.max(largest, bytes.length);
+    const counts = countBudget(largest);
+    const plans: Array<{ target: EditTarget; plan: FilePlan }> = [];
+    for (const target of targets) {
+      const got = read.get(target);
+      if (!got) continue;
+      const plan = planTargetEdits(tool, target, got.bytes, hints, maxSize, counts, problems);
+      if (plan !== null) plans.push({ target, plan });
+    }
+    // A file read again for another writer's change says so, whichever way
+    // its edits went.
+    const reread = (target: EditTarget, verb: string): string | null => !changedMeanwhile.has(target) ? null
+      : `Disk's copy${tool === 'edit' ? '' : ` of ${target.path}`} changed while this call was being applied, so it was read again, `
+        + `and ${tool === 'edit' ? 'the edit' : editList(target.edits)} ${verb} its new text.`;
+    const refuse = (found: EditProblem[]): ToolResult => ({
+      success: false,
+      isError: true,
+      error: refusalText(tool, found, targets.map((target) => reread(target, 'looked in')).filter((note): note is string => note !== null), maxChars, 'wrote'),
+    });
+    if (problems.length) return refuse(problems);
+
+    const { view, rootReal } = await this.diskView(mount);
+    const staged: Array<{ target: EditTarget; staged: Staged }> = [];
+    const discardAll = async (from = 0): Promise<void> => {
+      for (const { staged: file } of staged.slice(from)) await discard(file);
+    };
+    // A refusal before any file is renamed says so where the call names several.
+    const nothingWritten = (target: EditTarget, error: unknown): ToolResult => refuse([{
+      kind: 'file',
+      edits: target.edits,
+      path: target.path,
+      text: `${target.path}: ${directReason(error)}, so ${tool === 'edit' ? 'the edit' : editList(target.edits)} changed nothing.`
+        + (tool === 'edit_many' && plans.length > 1 ? ' No file was written.' : ''),
+      whole: true,
+    }]);
+    for (const { target, plan } of plans) {
+      try {
+        staged.push({ target, staged: await stageContained(view, rootReal, target.relativePath, plan.bytes) });
+      } catch (error) {
+        await discardAll();
+        if (error instanceof FileChanged) {
+          changedMeanwhile.add(target);
+          return 'changed';
+        }
+        return nothingWritten(target, error);
+      }
+    }
+    try {
+      await directWriteTestSeam.afterStage?.(staged.map(({ staged: file }) => file.path));
+    } catch (error) {
+      await discardAll();
+      throw error;
+    }
+    for (const { target, staged: file } of staged) {
+      try {
+        await placedStill(file);
+      } catch (error) {
+        await discardAll();
+        return nothingWritten(target, error);
+      }
+    }
+    // Every file is checked, then every file renamed, with no turn of the
+    // event loop between: a change to any of them before its check is seen
+    // before any is written, and one landing between its check and the last
+    // rename isn't (checkUnchanged).
+    for (const { target, staged: file } of staged) {
+      try {
+        checkUnchanged(file, read.get(target)!);
+      } catch (error) {
+        await discardAll();
+        if (error instanceof FileChanged) {
+          changedMeanwhile.add(target);
+          return 'changed';
+        }
+        return nothingWritten(target, error);
+      }
+    }
+    for (const [i, { target, staged: file }] of staged.entries()) {
+      try {
+        renameInto(file);
+      } catch (error) {
+        if (i === 0) {
+          await discardAll();
+          return nothingWritten(target, error);
+        }
+        // Read with no turn of the event loop since the last rename.
+        this.recordDirectWrite(mount, agentName);
+        await discardAll(i);
+        return { success: false, isError: true, error: this.directEditsPartway(staged, i, error, maxChars) };
+      }
+    }
+    this.recordDirectWrite(mount, agentName);
+    return editReceipt(tool, staged.map(({ target, staged: file }) => ({
+      path: target.path,
+      plan: plans.find((p) => p.target === target)!.plan,
+      notes: [reread(target, 'applied to'), linksNote(target.path, file, tool)].filter((note): note is string => note !== null),
+      modeKept: null,
+    })), editCount, maxChars);
+  }
+
+  /**
+   * The answer to an edit_many call on a direct mount whose rename of its
+   * `failed`th file failed after the ones before it were written: what was
+   * written, the failure, and that nothing puts them back, then each file's
+   * outcome, within `maxChars`, with the hard links a written one split
+   * from, as a full answer names them (linksNote).
+   */
+  private directEditsPartway(staged: Array<{ target: EditTarget; staged: Staged }>, failed: number, error: unknown, maxChars: number): string {
+    // The failed file is named among the outcomes, so the head stays as
+    // long as its reason, whatever the paths' lengths.
+    const head = `The edit_many call wrote ${failed} of its ${staged.length} files before the next one's write failed: ${directReason(error)}. `
+      + "Nothing puts the written files back, so finish or revert them: in each written file, each of its edits replaced its oldString with its newString. Each file's outcome:";
+    const parts = staged.map(({ target }, i) => `${target.path}: ${i < failed ? 'written' : i === failed ? 'not written, as it was (its write failed)' : 'not written, as it was'}`);
+    const notes = staged.slice(0, failed).map(({ target, staged: file }) => linksNote(target.path, file, 'edit_many')).filter((note): note is string => note !== null);
+    return fitted(head, parts, notes, maxChars, 'written');
+  }
+
+  /**
+   * A direct mount's file as an edit reads it: its bytes on disk as they are
+   * now, through the mount's boundary as read reaches them
+   * (openContainedFile), with the file's identity when the read began, which
+   * the write checks it against just before its rename. A file changed while
+   * it was read is `changed`, so the call reads it again. What the
+   * workspace doesn't show as text, it doesn't edit either: a file over the
+   * mount's size limit, and a binary one.
+   */
+  private async directEditText(
+    mount: MountState,
+    relativePath: string,
+    path: string,
+  ): Promise<{ bytes: Buffer; identity: FileIdentity } | { error: string } | { changed: true }> {
+    const maxSize = mount.config.maxFileSize ?? DEFAULT_MAX_FILE_SIZE;
+    const over = `${path} is over the size limit (${maxSize} bytes), so the workspace doesn't edit it.`;
+    let opened: Awaited<ReturnType<WorkspaceModule['openContainedFile']>>;
+    try {
+      opened = await this.openContainedFile(mount, relativePath, path, (fileStat) => {
+        if (fileStat.size > maxSize) throw new Error(over);
+      });
+    } catch (err) {
+      if (err instanceof WorkspaceReadError && err.code === 'changed') return { changed: true };
+      return { error: containedRefusal(err, path) };
+    }
+    try {
+      const before = identityOf(await opened.handle.stat({ bigint: true }));
+      const { bytes, more } = await readPrefix(opened.handle, maxSize, opened.fileStat.size);
+      if (more) return { error: over };
+      if (looksBinary(bytes)) return { error: `${path} is binary, so the workspace doesn't edit it as text.` };
+      if (!sameIdentity(before, identityOf(await opened.handle.stat({ bigint: true })))) return { changed: true };
+      return { bytes, identity: before };
+    } catch (err) {
+      const errno = errnoOf(err);
+      return { error: `Unable to read file: ${path}${errno ? ` (${errno})` : ''}` };
+    } finally {
+      await opened.handle.close();
+    }
+  }
+
+  /**
+   * A direct mount's deletion: the file the read tools reach, by their
+   * refusals (openContainedFile), unlinked through the mount's boundary as
+   * a push's deletion unlinks one (unlinkContained). A followed link is the
+   * entry removed, as there. One that lands is the caller's latest write on
+   * the mount (recordDirectWrite).
+   */
+  private async deleteDirect(mount: MountState, relativePath: string, path: string, agentName: string | undefined): Promise<ToolResult> {
+    return this.withMount(mount, async (): Promise<ToolResult> => {
+      // One root for the call, by its identity as the call starts: the
+      // open's checks and the unlink's own refuse any other directory there,
+      // in ROOT_MOVED's words, so a root replaced after this stat is refused
+      // rather than taken, but in the instant between the unlink's last
+      // check and the unlink, which Node can't close (effects.ts's header).
+      // One that can't be read now is refused here.
+      const disk = await this.diskView(mount);
+      let rootStat: BigIntStats;
+      try {
+        rootStat = await stat(disk.rootReal, { bigint: true });
+      } catch (err) {
+        const code = errnoOf(err);
+        const why = code === 'ENOENT' || code === 'ENOTDIR'
+          ? `the mount root is gone (${code}), and calling again is refused the same way until whoever runs the host puts a directory back at the mount's path`
+          : code === 'EACCES' || code === 'EPERM'
+            ? `the mount root can't be read (${code}), and calling again is refused the same way until whoever runs the host makes it readable`
+            : `the mount root can't be read (${code ?? String(err)})`;
+        return { success: false, isError: true, error: `The delete did nothing to ${path}: ${why}.` };
+      }
+      const view = { ...disk.view, rootIdentity: { dev: String(rootStat.dev), ino: String(rootStat.ino) } };
+      const { rootReal } = disk;
+      try {
+        const opened = await this.openContainedFile(mount, relativePath, path);
+        await opened.handle.close();
+      } catch (err) {
+        // The open's own words for a replaced root speak of reading.
+        if (err instanceof WorkspaceReadError && err.message.endsWith(DIRECT_ROOT_REPLACED)) {
+          return { success: false, isError: true, error: `The delete did nothing to ${path}: ${ROOT_MOVED}.` };
+        }
+        return { success: false, isError: true, error: containedRefusal(err, path) };
+      }
+      // The unlink is awaited, unlike a write's rename, so where the head
+      // was just before it says whether the head moved while it ran.
+      const since = this.positionNow();
+      try {
+        await unlinkContained(view, rootReal, relativePath, { kind: 'any' });
+      } catch (error) {
+        // A failure after the unlink reached the file's entry can't say
+        // whether the file is gone, so it's taken as the agent's write too.
+        if (error instanceof EffectFailed && error.touched) {
+          this.recordDirectWrite(mount, agentName, since);
+          return { success: false, isError: true, error: `The delete of ${path} failed after it reached the file, so the file may be gone: ${directReason(error)}. ls shows whether it is.` };
+        }
+        return { success: false, isError: true, error: `The delete did nothing to ${path}: ${directReason(error)}.` };
+      }
+      this.recordDirectWrite(mount, agentName, since);
+      return { success: true, data: { path, deleted: true }, keepWhenWithheld: ['path', 'deleted'] };
+    });
+  }
+
+  /**
+   * After a direct write lands: the agent's latest write on the mount, P,
+   * moves to it, where the agent's history holds P or the notice of its
+   * departure from P, N (historyHoldsWrites), and N clears. Otherwise P
+   * stays where it is: the head moved away from it under the call's turn,
+   * and the next start's notice covers what it left (headMoveNotice). P is
+   * the branch and the store's head as it is now, read with no turn of the
+   * event loop since the write, so no record that lands after the write is
+   * taken for one before it. A deletion, whose unlink is awaited, passes
+   * where the head was just before its unlink (`since`): where the branch
+   * changed meanwhile, the head moved under the call, and P is set there,
+   * so the next start judges the deletion by the branch its turn was on,
+   * unless the history doesn't hold P already, whose notice is owed. A write no agent
+   * made tells no one. The store's reads here come after the write landed,
+   * so one that throws is logged and P stays, as for a history that can't
+   * be read, and the write still answers that it landed.
+   */
+  private recordDirectWrite(mount: MountState, agentName: string | undefined, since?: DirectPosition | null): void {
+    if (agentName === undefined) return;
+    try {
+      const store = this.getStore();
+      let heads = this.directHeads.get(mount.config.name);
+      if (!heads) this.directHeads.set(mount.config.name, (heads = new Map()));
+      const head = heads.get(agentName);
+      const branchId = store.currentBranch().id;
+      if (since && since.branchId !== branchId) {
+        if (!head || this.historyHoldsWrites(agentName, head) === true) heads.set(agentName, { ...since, notice: null });
+        return;
+      }
+      if (head && this.historyHoldsWrites(agentName, head) !== true) return;
+      heads.set(agentName, { branchId, after: store.currentSequence(), notice: null });
+    } catch (err) {
+      console.error('[workspace] could not record a direct write\'s position:', err);
+    }
+  }
+
+  /** The store's branch and head now, or null where the store can't say. */
+  private positionNow(): DirectPosition | null {
+    try {
+      const store = this.getStore();
+      return { branchId: store.currentBranch().id, after: store.currentSequence() };
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * Whether an agent's history holds its latest direct write on a mount
+   * (holdsPosition), or the notice of its departure from it, judged by the
+   * notice's own presence there, through the lookup the framework hands the
+   * module (useHistory); null where that lookup threw, which is logged. A
+   * history that can't be read decides nothing: a write takes it as not
+   * held, so its position stays and the notice stays owed, and a start
+   * gives no notice, which may not be true of a history it can't read, and
+   * leaves the next start to decide (headMoveNotice).
+   */
+  private historyHoldsWrites(agentName: string, head: DirectHead): boolean | null {
+    if (this.holdsPosition(head)) return true;
+    if (head.notice === null) return false;
+    try {
+      return this.historyLookup?.(agentName, head.notice) === true;
+    } catch (err) {
+      console.error('[workspace] history lookup for the head-move notice failed:', err);
+      return null;
+    }
+  }
+
+  /**
+   * Whether the store's current branch holds what came before a direct
+   * write: it's the write's branch, or continues it with every fork point on
+   * the way after `after`, the store's head when the write landed. A fork at
+   * exactly `after` doesn't: an undo forks at its turn's sequenceBefore,
+   * which is the head at the write when nothing was recorded in the turn
+   * before it. A missing branch or one without fork metadata holds nothing,
+   * as for the materialize guard (isLinearContinuation).
+   */
+  private holdsPosition({ branchId, after }: DirectHead): boolean {
+    const store = this.getStore();
+    const current = store.currentBranch();
+    if (current.id === branchId) return true;
+    const byId = new Map(store.listBranches().map((b) => [b.id, b]));
+    const visited = new Set<string>();
+    let cursor = byId.get(current.id);
+    while (cursor && !visited.has(cursor.id)) {
+      visited.add(cursor.id);
+      if (cursor.id === branchId) return true;
+      if (cursor.parentId === undefined || cursor.branchPoint === undefined || cursor.branchPoint <= after) return false;
+      cursor = byId.get(cursor.parentId);
+    }
+    return false;
+  }
+
+  /**
+   * The framework's check at every start of an agent's turn, opening,
+   * continuing or resuming: the notice due for each mount the agent wrote
+   * direct where its history holds neither its latest write there nor the
+   * notice of its departure from it (historyHoldsWrites), with those
+   * mounts' names; or null, as on a head that hasn't moved. The framework
+   * stores the text in the agent's history before the turn's compile and
+   * hands its message id back (headMoveNoticeStored).
+   */
+  headMoveNotice(agentName: string): { text: string; mounts: string[] } | null {
+    if (!this.store) return null;
+    const due: string[] = [];
+    // Every mount where the agent wrote direct, whether it runs direct this
+    // session or as 'chronicle': the writes are on disk either way.
+    for (const name of this.mounts.keys()) {
+      const head = this.directHeads.get(name)?.get(agentName);
+      if (!head) continue;
+      const held = this.historyHoldsWrites(agentName, head);
+      // A history that can't be read decides nothing at this start.
+      if (held === null) return null;
+      if (!held) due.push(name);
+    }
+    return due.length ? { text: headMoveText(due), mounts: due } : null;
+  }
+
+  /** The id of the message headMoveNotice's text was stored as, N, for each mount it named. */
+  headMoveNoticeStored(agentName: string, mounts: readonly string[], messageId: string): void {
+    for (const name of mounts) {
+      const head = this.directHeads.get(name)?.get(agentName);
+      if (head) head.notice = messageId;
+    }
+  }
+
+  /**
+   * How the module asks whether an agent's history holds a message, as the
+   * framework judges its own notices (`cm.getMessage(id) !== null`): handed
+   * over once, when the module is added. Without it, no notice is held.
+   */
+  useHistory(lookup: (agentName: string, messageId: string) => boolean): void {
+    this.historyLookup = lookup;
+  }
+
+  private async handleDelete(input: DeleteInput, callerAgentName?: string): Promise<ToolResult> {
     const { mount, relativePath, path } = await this.parseFilePath(input.path);
     input = { ...input, path };
-    if (mount.config.mode === 'read-only') {
-      return { success: false, error: `Mount "${mount.config.name}" is read-only`, isError: true };
-    }
+    const refusal = writeRefusal(mount);
+    if (refusal) return { success: false, error: refusal, isError: true };
+    if (mount.direct) return this.deleteDirect(mount, relativePath, input.path, callerAgentName);
 
     const store = this.getStore();
     let committed = false;
@@ -4457,7 +5104,9 @@ export class WorkspaceModule implements Module {
       const mounts = [...this.mounts.entries()].map(([name, m]) => ({
         name,
         path: m.config.path,
-        mode: m.config.mode,
+        // A mount configured direct says its mode where its config names
+        // none, so a writable one shows as writable.
+        mode: m.config.backend === 'direct' ? m.config.mode ?? 'read-write' : m.config.mode,
         ...(m.config.backend === 'direct' ? { backend: m.direct ? 'direct' : 'chronicle', ignore: this.ignoreOf(m) } : {}),
         ...(m.config.include ? { include: [...m.config.include] } : {}),
       }));
@@ -4616,11 +5265,34 @@ export class WorkspaceModule implements Module {
 
     // Every match lies beneath the pattern's literal directory, so the walk
     // starts there: past the walk's cap, a walk of the whole scope can stop
-    // before it gets there.
+    // before it gets there. In the mount a pattern's first segment names, the
+    // pattern is read mount-prefixed (prefixedGlob), from its rest's directory
+    // within `path`. A `path` that directory can't overlap leaves no file the
+    // pattern can match, so the glob is refused, as grep's is, saying how
+    // the pattern is read, rather than answered with no matches; but a path
+    // in another mount's directory is that mount's, and is said so, as grep
+    // says it. Only a `path` can do either, and it names one mount, so
+    // nothing has been searched yet.
     const patternDir = literalDirOf(input.pattern);
-    for (const { mount, relativePath } of mountsToSearch) {
-      const start = await this.walkStart(mount, relativePath, patternDir);
-      const matched = (path: string) => regex.test(relativePath ? path.slice(relativePath.length + 1) : path);
+    for (const { mount, relativePath, moved, root } of mountsToSearch) {
+      const prefixed = prefixedGlob(input.pattern, mount.config.name);
+      let start: string;
+      let matched: (path: string) => boolean;
+      if (prefixed) {
+        const dir = deeperOf(relativePath, prefixed.dir);
+        if (dir === null) {
+          if (this.holderOf(mount.config.name, relativePath, false, moved)) {
+            incomplete.push({ path: `${mount.config.name}/${relativePath}`, reason: this.otherMountNote(mount.config.name, relativePath, 'list', moved) });
+            continue;
+          }
+          return { success: false, error: await this.disjointRefusal('glob', input.path!, input.pattern, true, mount, relativePath, root), isError: true };
+        }
+        start = await this.walkStart(mount, relativePath, dir === relativePath ? '' : dir.slice(relativePath ? relativePath.length + 1 : 0));
+        matched = (path: string) => prefixed.regex.test(path);
+      } else {
+        start = await this.walkStart(mount, relativePath, patternDir);
+        matched = (path: string) => regex.test(relativePath ? path.slice(relativePath.length + 1) : path);
+      }
       const listing = await this.listingOf(mount, start, true, matched);
       for (const { path, ...view } of listing.files) matches.push({ path: `${mount.config.name}/${path}`, ...view });
       for (const region of listing.incomplete) {
@@ -4649,10 +5321,19 @@ export class WorkspaceModule implements Module {
     }
 
     const fileGlob = input.glob ? globToRegex(input.glob) : null;
-    // The filter matches mount-relative paths, so every file it lets through
-    // lies beneath its literal directory, and the walk starts at the deeper of
-    // that and `path`.
+    // The filter matches mount-relative paths, from the mount's root whatever
+    // the `path`, so every file it lets through lies beneath its literal
+    // directory, and the walk starts at the deeper of that and `path`. In the
+    // mount a filter's first segment names, its mount-prefixed reading takes
+    // the filter's place (below). One with no "/" also matches a file's name,
+    // wherever the file lies, as ripgrep's --glob does: "*.ts" lets every .ts
+    // file through, where tested against the path alone it let through only
+    // those at the mount's root. The path is still tried, so a "**" in such a
+    // filter spans directories as it did, and nothing it let through before
+    // is lost. A filter read mount-prefixed always holds a "/" after the
+    // mount's name, so it never takes the name test.
     const filterDir = input.glob ? literalDirOf(input.glob) : '';
+    const byName = fileGlob !== null && !input.glob!.includes('/');
     const contextBefore = input.contextBefore ?? 0;
     const contextAfter = input.contextAfter ?? 0;
 
@@ -4669,12 +5350,30 @@ export class WorkspaceModule implements Module {
     }
 
     type GrepMatch = { line: number; text: string; context?: string[] };
-    const results: Array<{ file: string; state?: string; version: GrepText['version']; matches: GrepMatch[] }> = [];
+    type Searched = { lineEndings?: 'CRLF' | 'mixed'; matches: GrepMatch[] };
+    const results: Array<{ file: string; state?: string; version: GrepText['version'] } & Searched> = [];
     const skipped: GrepSkip[] = [];
     const incomplete: Array<{ path: string; reason: string }> = [];
 
-    const search = (content: string): GrepMatch[] => {
-      const lines = linesOf(content);
+    // Lines as read shows them (fileText): a CRLF end's CR is left out, for
+    // matching as well as display, unless the line's own text ends in a CR, so
+    // `foo$` finds a CRLF file's line, as it does under ripgrep's --crlf, and
+    // the line copies into an edit as read's do. ripgrep's --crlf still prints
+    // the line with its CR.
+    //
+    // Whether a file has CRLF ends or a BOM is a fact about the file, not a
+    // line, so each searched file that has either is kept here by its path,
+    // for the note on a pattern that names a CR or U+FEFF to name it. A
+    // conflict's disk version is kept, for each, only where the workspace's
+    // copy of its path doesn't have it, and is named as that version, since
+    // read doesn't show it.
+    const crlfFiles = new Map<string, { ends: 'CRLF' | 'mixed'; version: GrepText['version'] }>();
+    const bomFiles = new Map<string, GrepText['version']>();
+    const search = (text: GrepText): Searched => {
+      const { lines, crlfEnds, lfEnds, bom } = fileText(text.bytes);
+      const lineEndings = crlfEnds > 0 ? (lfEnds > 0 ? 'mixed' : 'CRLF') : undefined;
+      if (lineEndings !== undefined && !crlfFiles.has(text.file)) crlfFiles.set(text.file, { ends: lineEndings, version: text.version });
+      if (bom && !bomFiles.has(text.file)) bomFiles.set(text.file, text.version);
       const found: GrepMatch[] = [];
       for (let i = 0; i < lines.length; i++) {
         if (regex.test(lines[i])) {
@@ -4687,7 +5386,7 @@ export class WorkspaceModule implements Module {
           found.push(match);
         }
       }
-      return found;
+      return { ...(lineEndings !== undefined ? { lineEndings } : {}), matches: found };
     };
 
     for (const { mount, relativePath, moved, root } of mountsToSearch) {
@@ -4699,16 +5398,28 @@ export class WorkspaceModule implements Module {
         incomplete.push({ path: `${mount.config.name}/${relativePath}`, reason: this.otherMountNote(mount.config.name, relativePath, 'list', moved) });
         continue;
       }
-      // A `path` and a filter whose directories don't overlap leave no file
-      // the filter can let through, so nothing is searched.
-      const deeper = deeperOf(relativePath, filterDir);
-      if (deeper === null) continue;
+      // In the mount a filter's first segment names, the filter is read
+      // mount-prefixed (prefixedGlob), from its rest's directory. A `path` and
+      // a filter whose directories, in the reading this mount takes, don't
+      // overlap leave no file the filter can let through, so the grep is
+      // refused, saying how the filter is read, rather than answered with no
+      // matches: written relative to the `path`, as glob's pattern is, it
+      // names nothing there. Only a `path` can do this, and it names one
+      // mount, so nothing has been searched yet.
+      const prefixed = input.glob ? prefixedGlob(input.glob, mount.config.name) : null;
+      const deeper = deeperOf(relativePath, prefixed ? prefixed.dir : filterDir);
+      if (deeper === null) {
+        return { success: false, error: await this.disjointRefusal('grep', input.path!, input.glob!, prefixed !== null, mount, relativePath, root), isError: true };
+      }
       const start = await this.walkStart(mount, relativePath, deeper === relativePath ? '' : deeper.slice(relativePath ? relativePath.length + 1 : 0));
       const searched = (text: GrepText): void => {
-        const matches = search(text.text);
-        if (matches.length > 0) results.push({ file: text.file, ...(text.state !== undefined ? { state: text.state } : {}), version: text.version, matches });
+        const hits = search(text);
+        if (hits.matches.length > 0) results.push({ file: text.file, ...(text.state !== undefined ? { state: text.state } : {}), version: text.version, ...hits });
       };
-      const kept = (path: string): boolean => fileGlob === null || fileGlob.test(path);
+      const kept = prefixed
+        ? (path: string): boolean => prefixed.regex.test(path)
+        : (path: string): boolean => fileGlob === null || fileGlob.test(path)
+          || (byName && fileGlob.test(path.slice(path.lastIndexOf('/') + 1)));
       const found = mount.direct
         ? await this.textsFromDisk(mount, relativePath, root, start, kept, searched)
         : await this.textsFromStore(mount, relativePath, start, kept, searched);
@@ -4716,16 +5427,45 @@ export class WorkspaceModule implements Module {
       incomplete.push(...found.incomplete);
     }
 
-    return {
-      success: true,
-      data: {
-        pattern: input.pattern,
-        results,
-        totalMatches: results.reduce((sum, r) => sum + r.matches.length, 0),
-        ...(skipped.length > 0 ? { skipped } : {}),
-        ...(incomplete.length > 0 ? { incomplete } : {}),
-      },
+    const answer: GrepAnswer = {
+      pattern: input.pattern,
+      results,
+      totalMatches: results.reduce((sum, r) => sum + r.matches.length, 0),
+      // A pattern written for a CR can't find a CRLF end's, nor one written
+      // for U+FEFF a BOM, which lines as read shows them leave out, so the
+      // answer says why it didn't, and names the files that have them.
+      ...leftOutNote(input.pattern, crlfFiles, bomFiles, this.anyRunsDirect()),
+      ...(skipped.length > 0 ? { skipped } : {}),
+      ...(incomplete.length > 0 ? { incomplete } : {}),
     };
+    return textAnswer(grepText(answer, contextBefore), { ...answer });
+  }
+
+  /**
+   * Why a grep or a glob whose `path` (`given`, in the mount at
+   * `relativePath`) and filter or pattern can't overlap did nothing. grep's
+   * filter is matched from the mount's root, and in the mount its first
+   * segment names, either tool's is read mount-prefixed (`prefixed`), from
+   * that mount's root; either way no file at or beneath the path can pass
+   * it. Where the path isn't a file, it names the one that reaches beneath
+   * it, the one meant if it was written relative to the path, mount-prefixed
+   * as the tools write paths: the path's own `{`, `}`, `*` and `?` stand as
+   * `?`, which matches each of them, and since the search stays beneath the
+   * path, a `?` that would match a sibling's name too takes nothing in from
+   * outside it. One with an empty, `.` or `..` segment gets no suggestion,
+   * since no path holds such a segment. Segments are read as written, so one
+   * a brace group splits around isn't told apart.
+   */
+  private async disjointRefusal(tool: 'grep' | 'glob', given: string, filter: string, prefixed: boolean, mount: MountState, relativePath: string, root: string): Promise<string> {
+    const name = mount.config.name;
+    const rest = prefixed ? filter.slice(filter.indexOf('/') + 1) : filter;
+    const read = `The ${tool} did nothing: its ${tool === 'grep' ? 'glob' : 'pattern'} ${JSON.stringify(filter)} `
+      + (prefixed ? `is read mount-prefixed, from the root of mount ${JSON.stringify(name)}` : 'is matched against paths from the mount\'s root');
+    if (await this.namesFile(mount, relativePath, root)) return `${read}, so ${JSON.stringify(given)} doesn't match it.`;
+    const within = `${read}, so no file within ${JSON.stringify(given)} matches it.`;
+    if (rest.split('/').some((segment) => segment === '' || segment === '.' || segment === '..')) return within;
+    const reaching = `${name}/${relativePath.replace(/[{}*?]/g, '?')}/${rest}`;
+    return `${within} To ${tool === 'grep' ? 'filter' : 'match'} beneath it, write ${JSON.stringify(reaching)}.`;
   }
 
   /**
@@ -4819,7 +5559,7 @@ export class WorkspaceModule implements Module {
         const entry = store.treeGet(mount.treeStateId, report.path);
         const blob = entry ? store.getBlob(entry.blobHash) : null;
         if (blob) {
-          each({ file, state: report.state, version: 'workspace', text: blob.toString('utf-8') });
+          each({ file, state: report.state, version: 'workspace', bytes: blob });
         } else if (entry) {
           skipped.push({ file, reason: 'the workspace copy is missing from the store, so it was not searched' });
         }
@@ -4833,7 +5573,7 @@ export class WorkspaceModule implements Module {
         const changed = report.conflict?.diskChangedSinceRecorded === true;
         const diskBlob = disk?.stored ? store.getBlob(disk.stored) : null;
         if (diskBlob) {
-          each({ file, state: report.state, version: changed ? 'recorded-disk' : 'conflicting-disk', text: diskBlob.toString('utf-8') });
+          each({ file, state: report.state, version: changed ? 'recorded-disk' : 'conflicting-disk', bytes: diskBlob });
         }
         if (disk?.stored && !diskBlob) {
           skipped.push({ file, reason: 'conflict: the disk version recorded with the conflict is missing from the store, so it was not searched' });
@@ -4886,7 +5626,7 @@ export class WorkspaceModule implements Module {
       const what = { size: read.size, ...(mimeType ? { mimeType } : {}) };
       if (read.bytes === null) skipped.push({ file, reason: `over the size limit (${maxSize} bytes)`, ...what });
       else if (looksBinary(read.head)) skipped.push({ file, reason: 'binary: a NUL in its first 8 KB', ...what });
-      else each({ file, version: 'disk', text: read.bytes.toString('utf-8') });
+      else each({ file, version: 'disk', bytes: read.bytes });
     });
     return { skipped, incomplete: incomplete.map((region) => ({ path: `${name}/${region.path}`, reason: region.reason })) };
   }
@@ -4903,7 +5643,7 @@ export class WorkspaceModule implements Module {
       if (mount.direct) {
         // A direct mount keeps nothing to count: its kind, and the ignore
         // list its walks go by, whose default no config shows.
-        status[name] = { path: mount.config.path, mode: mount.config.mode, backend: 'direct', ignore: this.ignoreOf(mount) };
+        status[name] = { path: mount.config.path, mode: mount.config.mode ?? 'read-write', backend: 'direct', ignore: this.ignoreOf(mount) };
         continue;
       }
       // What the workspace's history holds outside the mount's include isn't the mount's,
@@ -4918,7 +5658,7 @@ export class WorkspaceModule implements Module {
       const currentBranch = store.currentBranch();
       status[name] = {
         path: mount.config.path,
-        mode: mount.config.mode,
+        mode: mount.config.backend === 'direct' ? mount.config.mode ?? 'read-write' : mount.config.mode,
         // A mount configured direct runs as 'chronicle' this session
         // (chooseKinds), by the direct kind's ignore list where its config
         // names none.
@@ -5090,8 +5830,9 @@ export class WorkspaceModule implements Module {
       }
       mountsToMaterialize = [{ name: input.mount, mount: m }];
     } else {
+      // Not a mount running direct, whose writes are on disk already.
       mountsToMaterialize = [...this.mounts.entries()]
-        .filter(([, m]) => m.config.mode === 'read-write')
+        .filter(([, m]) => m.config.mode === 'read-write' && !m.direct)
         .map(([name, mount]) => ({ name, mount }));
     }
 
@@ -5112,6 +5853,12 @@ export class WorkspaceModule implements Module {
     let proceeded = 0;
 
     for (const { name, mount } of mountsToMaterialize) {
+      // Only a writable direct mount the caller named gets here: it keeps no
+      // tree to push. A read-only one is named as any read-only mount is.
+      if (mount.direct && mount.config.mode !== 'read-only') {
+        blocked.push({ mount: name, reason: DIRECT_MATERIALIZE_SKIPPED });
+        continue;
+      }
       if (mount.config.mode === 'read-only') {
         // Only a mount the caller named gets here read-only (a bare
         // materialize takes the read-write ones): say why nothing was written.
@@ -5224,7 +5971,8 @@ export class WorkspaceModule implements Module {
     if (!this.running()) return [];
     const store = this.getStore();
     const mount = this.mounts.get(mountName);
-    if (!mount || mount.config.mode === 'read-only') return [];
+    // A direct mount keeps no tree to push: disk is its only copy.
+    if (!mount || mount.config.mode === 'read-only' || mount.direct) return [];
 
     // Reset tracking — we're deliberately materializing on the new branch
     mount.lastMaterializedBranchId = null;
@@ -5451,9 +6199,9 @@ export class WorkspaceModule implements Module {
    * on disk (a shell command's files, a deletion) is in the workspace when the
    * agent next looks. On a mount over its walkCap, that holds for the first
    * walkCap entries in the walk's order, which every batch's scan takes; files
-   * past them come in through syncs and the listings that reach them, while a
-   * read takes in only a file the workspace doesn't hold yet. A scan that
-   * outlasts the deadline stops holding the round: the miss is recorded on
+   * past them come in through syncs, the listings that reach them, and a read
+   * of the path, which takes disk's change in first as a listing does. A scan
+   * that outlasts the deadline stops holding the round: the miss is recorded on
    * the mount's status and pushed as a `workspace:agent-action-scan-incomplete`
    * event, and the scan continues, deciding on the branch selected when it
    * applies.
@@ -5612,13 +6360,14 @@ export class WorkspaceModule implements Module {
 
 /**
  * A text grep searches (textsFromStore, textsFromDisk): its mount-prefixed
- * file, which copy it is, and on a 'chronicle' mount, the path's state.
+ * file, which copy it is, on a 'chronicle' mount the path's state, and its
+ * bytes, whose lines grep matches as read shows them (fileText).
  */
 interface GrepText {
   file: string;
   state?: string;
   version: 'workspace' | 'conflicting-disk' | 'recorded-disk' | 'disk';
-  text: string;
+  bytes: Buffer;
 }
 
 /** A file, or a copy of one, grep doesn't search, with why. */
@@ -5718,15 +6467,32 @@ function watchOf(config: MountConfig): 'always' | 'on-agent-action' | 'never' {
 }
 
 /**
+ * Why a write, edit, deletion or peer module's writeBinary to this mount is
+ * refused, or null where it may go ahead: a read-only mount, and a mount
+ * configured direct that runs as 'chronicle' this session (chooseKinds),
+ * since the store holds changes there that disk lacks. A write there would
+ * stay in the store, beside an agent told the mount is its checkout, and
+ * add to what keeps it off direct; refused, what's held only shrinks, and
+ * the next start once none is held runs it direct.
+ */
+function writeRefusal(mount: MountState): string | null {
+  const name = mount.config.name;
+  if (mount.config.mode === 'read-only') return `Mount "${name}" is read-only`;
+  if (mount.config.backend === 'direct' && !mount.direct) {
+    return `Mount "${name}" is configured direct, and runs as 'chronicle' this session because its start found the store holding changes there that disk lacks, `
+      + `so it takes no writes this session, and calling again is refused the same way. To run it direct again, settle what's held `
+      + `(sync each held path to take disk's copy, or materialize mount "${name}" by name to write the store's copies to disk), and the host's next start runs it direct`;
+  }
+  return null;
+}
+
+/**
  * What a direct mount's config sets that would never act there, each with
- * the way out (MountConfig.backend): a direct mount is read-only, and has no
- * watcher to tune, no change event to wake on and no push to make.
+ * the way out (MountConfig.backend): a direct mount has no watcher to tune,
+ * no change event to wake on and no push to make. Either mode is its own.
  */
 function directRefusals(mount: MountConfig): string[] {
   const refused: string[] = [];
-  if (mount.mode !== 'read-only') {
-    refused.push(mount.mode === undefined ? "mode must be 'read-only' (left out, it's 'read-write')" : `mode must be 'read-only', not ${shownValue(mount.mode)}`);
-  }
   if (mount.watch !== undefined && mount.watch !== 'never') refused.push(`watch ${shownValue(mount.watch)} would watch nothing (leave it out, or set 'never')`);
   for (const key of ['watchDebounceMs', 'watchRootPollMs'] as const) {
     if (mount[key] !== undefined) refused.push(`${key} would tune no watcher (leave it out)`);
@@ -5735,6 +6501,124 @@ function directRefusals(mount: MountConfig): string[] {
   if (wake === true || (Array.isArray(wake) && wake.length > 0)) refused.push('wakeOnChange would never wake (leave it out)');
   if (mount.autoMaterialize === true) refused.push('autoMaterialize would never push (leave it out)');
   return refused;
+}
+
+/**
+ * An agent's latest direct write on a mount, P: the store's branch, and its
+ * head when the write landed (`after`); and the id of the message that last
+ * told the agent its history no longer holds P, N, or null.
+ */
+interface DirectHead {
+  branchId: string;
+  after: number;
+  notice: string | null;
+}
+
+/** A store position: a branch and its head. */
+type DirectPosition = Pick<DirectHead, 'branchId' | 'after'>;
+
+/** The global record type directHeads is saved as: a checkpoint at a clean stop that changed it. */
+const DIRECT_HEADS_RECORD_TYPE = 'workspace/direct-heads';
+
+/** One mount's positions at one root (resolved, as DiskAgreement keeps a root), by agent, with N only where it's set. */
+interface DirectHeadsEntry {
+  mount: string;
+  root: string;
+  agents: Record<string, { branchId: string; after: number; notice?: string }>;
+}
+
+/** directHeads as saved: an entry per mount and root its agents wrote direct under. */
+type DirectHeadsSnapshot = DirectHeadsEntry[];
+
+/**
+ * A saved record as saveDirectHeads writes it, or a throw naming what isn't:
+ * a list of entries, each a mount's name, root and agents, and each agent's
+ * branch, head and, where set, notice. Checked whole, carried entries
+ * included, so a record of another shape is refused at load rather than
+ * carried into the next save.
+ */
+function checkedHeads(value: unknown): DirectHeadsSnapshot {
+  const isObject = (v: unknown): v is Record<string, unknown> => typeof v === 'object' && v !== null && !Array.isArray(v);
+  if (!Array.isArray(value)) throw new Error("the record isn't of the shape saved");
+  for (const saved of value as unknown[]) {
+    if (!isObject(saved) || typeof saved.mount !== 'string' || typeof saved.root !== 'string' || !isObject(saved.agents)) {
+      throw new Error(`an entry isn't of the shape saved: ${JSON.stringify(saved)?.slice(0, 200)}`);
+    }
+    for (const [agent, head] of Object.entries(saved.agents)) {
+      if (!isObject(head) || typeof head.branchId !== 'string' || typeof head.after !== 'number'
+        || (head.notice !== undefined && typeof head.notice !== 'string')) {
+        throw new Error(`agent ${JSON.stringify(agent)}'s position on mount ${JSON.stringify(saved.mount)} isn't of the shape saved`);
+      }
+    }
+  }
+  return value as DirectHeadsSnapshot;
+}
+
+/** A saved record's content, whatever order its mounts and agents were written in, to tell whether a save would change it. */
+function canonicalHeads(snapshot: DirectHeadsSnapshot): string {
+  return JSON.stringify(snapshot.map(({ mount, root, agents }) => [mount, root, Object.keys(agents).sort().map((agent) => {
+    const { branchId, after, notice } = agents[agent]!;
+    return [agent, branchId, after, notice ?? null];
+  })]).sort((a, b) => {
+    const [x, y] = [JSON.stringify(a.slice(0, 2)), JSON.stringify(b.slice(0, 2))];
+    return x < y ? -1 : x > y ? 1 : 0;
+  }));
+}
+
+/**
+ * How many times a direct edit reads and plans a file another writer keeps
+ * changing: enough to land on top of a writer that changes it now and then,
+ * such as a formatter or a build, and bounded for one that never stops.
+ */
+const DIRECT_EDIT_ATTEMPTS = 3;
+
+/** Why a direct write, edit or deletion did nothing, for its answer: a refusal's words, or any other failure's message. */
+function directReason(error: unknown): string {
+  if (error instanceof FileChanged) return 'it changed on disk while this call was being applied';
+  // A deletion's root check (unlinkContained) has a store-backed mount's
+  // words, whose remedy, a sync with acceptRoot, a direct mount has no use for.
+  if (error instanceof Error && error.message === ROOT_REPLACED) return ROOT_MOVED;
+  return error instanceof Error ? error.message : String(error);
+}
+
+/** "a", "a and b", or "a, b and c". */
+function listed(items: readonly string[]): string {
+  return items.length < 2 ? items.join('') : `${items.slice(0, -1).join(', ')} and ${items.at(-1)}`;
+}
+
+/**
+ * The note for a direct write that gave a hard-linked path a file of its
+ * own: the other links keep the old text. Null for a file with none.
+ */
+function linksNote(path: string, staged: Staged, tool: 'write' | EditTool): string | null {
+  const n = staged.otherLinks;
+  if (n <= 0) return null;
+  return `${path} had ${n === 1 ? 'another hard link' : `${n} other hard links`}, which ${n === 1 ? 'keeps' : 'keep'} its old text: `
+    + `the ${tool === 'write' ? 'write' : tool === 'edit' ? 'edit' : 'call'} gave this path a file of its own.`;
+}
+
+/**
+ * A refusal of openContainedFile's as a direct tool gives it: its message,
+ * and for one that names only the path, its errno too, as a direct read's
+ * answer gives it (bytesOnDisk).
+ */
+function containedRefusal(err: unknown, path: string): string {
+  const bare = err instanceof WorkspaceReadError && err.errno !== undefined && err.message === `Unable to read file: ${path}`;
+  return bare ? `${err.message} (${err.errno})` : err instanceof Error ? err.message : String(err);
+}
+
+/**
+ * The notice that writes an agent made direct remain on disk from
+ * turns the agent's history no longer holds. `git status` stands beside
+ * `git diff` because a departed turn's new file is untracked, which `git
+ * diff` doesn't show; and the warning says "unstaged", since `git checkout
+ * -- <file>` puts back a file's staged text, so a staged change survives it.
+ */
+function headMoveText(mounts: readonly string[]): string {
+  const one = mounts.length === 1;
+  return `[workspace] Writes to ${listed(mounts.map((name) => `\`${name}\``))} from turns the history no longer holds are still on disk. `
+    + `If ${one ? "it's a git checkout" : "they're git checkouts"}, \`git status\` and \`git diff\` show them; `
+    + 'a `git checkout` of a file drops every unstaged change in it, including the ones the history still holds.';
 }
 
 /** A change commitToolChanges makes to one path's tree entry. */
@@ -5749,6 +6633,64 @@ interface EditTarget {
   /** Every edit naming it, by index, and the specs of those fit to be matched. */
   edits: number[];
   specs: EditSpec[];
+}
+
+/**
+ * One file's edits planned against its bytes, as both kinds of mount plan
+ * them: its text decoded, every edit matched in it (edit-plan.ts), and the
+ * result held to the mount's size limit. Each problem found goes into
+ * `problems`, and then, as for a file named only by edits whose own input
+ * was refused, there's no plan (null).
+ */
+function planTargetEdits(
+  tool: EditTool,
+  target: EditTarget,
+  bytes: Buffer,
+  hints: ReturnType<typeof hintBudget>,
+  maxSize: number,
+  counts: ReturnType<typeof countBudget>,
+  problems: EditProblem[],
+): FilePlan | null {
+  // Decoding would turn each invalid sequence into U+FFFD, and writing
+  // the text back would change bytes the edits never named.
+  const file = decodeForEdit(bytes);
+  if (!file) {
+    problems.push({
+      kind: 'file',
+      edits: target.edits,
+      path: target.path,
+      text: `${target.path} isn't valid UTF-8, so editing it would change bytes outside the text it replaces. `
+        + 'Read shows each invalid byte sequence as U+FFFD, and a write replaces the whole file as UTF-8, so writing back what read shows puts U+FFFD in their place.',
+      whole: false,
+    });
+    return null;
+  }
+  if (!target.specs.length) return null;
+  const planned = planFile(file, bytes, target.specs, hints, maxSize, counts);
+  if ('problems' in planned) {
+    // One at a time: a call of many edits can have more problems
+    // than a spread passes as arguments.
+    for (const problem of planned.problems) problems.push({ ...problem, path: target.path });
+    return null;
+  }
+  // The planner refuses a file its counts take past the limit before
+  // building it, from the least its bytes can be; one it built past
+  // the limit, as its CRs or multi-byte characters can take it, is
+  // refused here.
+  if ('tooLarge' in planned || planned.plan.bytes.length > maxSize) {
+    const size = 'tooLarge' in planned ? `at least ${planned.tooLarge.toLocaleString('en-US')}` : planned.plan.bytes.length.toLocaleString('en-US');
+    problems.push({
+      kind: 'file',
+      edits: target.edits,
+      path: target.path,
+      text: `${target.path} would be ${size} bytes with ${tool === 'edit' ? 'this edit' : editList(target.edits)}, `
+        + `past the ${maxSize.toLocaleString('en-US')}-byte limit this mount sets on a file, so the workspace couldn't keep it. `
+        + "An edit that leaves the file within the limit applies. The limit is the mount's maxFileSize setting, which only whoever runs the host can change.",
+      whole: false,
+    });
+    return null;
+  }
+  return planned.plan;
 }
 
 /**
@@ -5842,14 +6784,43 @@ function storedButUnfinished(
 }
 
 /**
- * A text's lines, as read and grep number them: a final line end ends the
- * last line rather than starting an empty one, so "a\nb\n" is two lines,
- * and an empty text has none.
+ * What a read says about the copy it shows, when that isn't simply the one the
+ * workspace last agreed on with disk: disk's newer text, taken in first; the
+ * workspace's copy, because disk's couldn't be checked or disk has none that
+ * anything accounts for; or a draft in conflict with disk's change. A file
+ * the workspace didn't hold has no older copy, so taking it in needs no word.
+ * A conflict's note names the ways to settle it that work on the path's mount.
  */
-function linesOf(content: string): string[] {
-  const lines = content.split('\n');
-  if (lines.at(-1) === '') lines.pop();
-  return lines;
+function whichCopyRead(report: PathReport | undefined, tookChange: boolean, readOnly: boolean): string[] {
+  if (tookChange) {
+    return ['Disk\'s copy had changed since the workspace last agreed with it, so it was taken in first, and this read shows that text.'];
+  }
+  if (report?.state === 'unverified') {
+    return [`The path couldn't be checked against disk (${report.note ?? 'not observed'}), so this read shows the workspace's copy.`];
+  }
+  if (report?.state === 'disk-missing-provenance-unknown') {
+    return ['Disk has no copy of this file, and nothing records whether it was deleted there, so this read shows the workspace\'s copy.'];
+  }
+  if (report?.state === 'conflict') {
+    const kind = report.conflict?.kind ?? 'both-changed';
+    // A sync takes disk's state as it is now, which a recorded conflict's kind
+    // doesn't follow: where disk has no copy, the sync takes its deletion, and
+    // the workspace's copy goes with it. Where disk has one, the sync keeps it
+    // and gives up the workspace's, taking disk's in only where the workspace
+    // can hold it (not binary or too large). A read-only mount can hold a
+    // copy disk doesn't, such as one a branch switch selected, but a
+    // materialize, forced or not, writes nothing to it.
+    const sync = report.diskNow === 'absent'
+      ? 'Sync the path to take disk\'s deletion, which removes the workspace\'s copy'
+      : 'Sync the path to keep disk\'s copy and give up the workspace\'s';
+    const force = readOnly
+      ? '. The mount is read-only, so nothing writes the workspace\'s copy to disk.'
+      : report.diskNow === 'absent'
+        ? ', or materialize it with force to write the workspace\'s copy back to disk.'
+        : ', or materialize it with force to write the workspace\'s over disk\'s.';
+    return [`The path is in conflict with disk (${kind}): this read shows the workspace's copy. ${sync}${force}`];
+  }
+  return [];
 }
 
 /**
@@ -5920,6 +6891,109 @@ function inputProblem(
   return null;
 }
 
+/** How many files a grep note names before it gives the count of the rest. */
+const NOTE_FILES_MAX = 20;
+
+/**
+ * The files a grep note names, in the order grep searched them, as its
+ * results are: at most NOTE_FILES_MAX of them, then how many more and how to
+ * see them. Each is named by its mount-prefixed path, with what `detail` says
+ * of it.
+ */
+function namedFiles<T>(files: Map<string, T>, detail: (value: T) => string): string {
+  const names = [...files.keys()];
+  const shown = names.slice(0, NOTE_FILES_MAX).map((name) => `${name}${detail(files.get(name)!)}`);
+  const rest = names.length - shown.length;
+  return `${shown.join(', ')}${rest > 0 ? `, and ${rest} more; narrow with path or glob` : ''}`;
+}
+
+/** What a note says of a conflict's disk version, which read doesn't show. */
+const ofVersion = (version: GrepText['version']): string =>
+  version === 'conflicting-disk' || version === 'recorded-disk' ? ` in its ${version} version` : '';
+
+/**
+ * grep's note for a pattern that names a character its lines leave out, where
+ * a file it searched has one: it says how many files searched have it and
+ * names them, so a search for a CR or a BOM still finds the files that have
+ * them. The CR note gives each file's ends, CRLF or mixed, and either note
+ * names a conflict's disk version as that version. The note says a
+ * character read shows it in the workspace's copy, since grep also searches a
+ * conflict's disk version, which read doesn't show. A direct mount keeps no
+ * workspace copy, and its read shows disk's file, so on a host with one
+ * (`direct`) the note names that too, as the tools' descriptions mention
+ * direct mounts only on such a host.
+ */
+function leftOutNote(
+  pattern: string,
+  crlfFiles: Map<string, { ends: 'CRLF' | 'mixed'; version: GrepText['version'] }>,
+  bomFiles: Map<string, GrepText['version']>,
+  direct: boolean,
+): { note?: string } {
+  if (crlfFiles.size === 0 && bomFiles.size === 0) return {};
+  const named = namedLeftOut(pattern);
+  const onDisk = direct ? ', or in disk\'s file on a direct mount' : '';
+  const count = (n: number, one: string, many: string) => `${n} ${n === 1 ? `file searched ${one}` : `files searched ${many}`}`;
+  const notes = [
+    named.cr && crlfFiles.size > 0
+      ? `The pattern names a CR, and ${count(crlfFiles.size, 'has', 'have')} CRLF line ends: `
+        + `${namedFiles(crlfFiles, ({ ends, version }) => ` (${ends}${ofVersion(version)})`)}. Lines are matched as read shows them, `
+        + `which leaves out a CRLF end's CR unless the line's own text ends in a CR. read with offsetChars shows every CR in the workspace's copy${onDisk}.`
+      : null,
+    named.bom && bomFiles.size > 0
+      ? `The pattern names U+FEFF, and ${count(bomFiles.size, 'starts', 'start')} with a BOM: `
+        + `${namedFiles(bomFiles, (version) => (ofVersion(version) ? ` (${ofVersion(version).slice(1)})` : ''))}. Lines are matched as read shows them, `
+        + `and a BOM isn't part of the first line. read with offsetChars shows any BOM ${direct ? `in the workspace's copy${onDisk}` : 'the workspace\'s copy has'}.`
+      : null,
+  ].filter((n) => n !== null);
+  return notes.length ? { note: notes.join(' ') } : {};
+}
+
+/**
+ * Which of the characters grep's lines leave out a pattern names: a CR, as a
+ * literal one or as `\r`, `\x0d`, `\u000d`, `\cM`, `\015` or a backslash
+ * before a literal CR; and U+FEFF, as a literal one, `\uFEFF` or a backslash
+ * before a literal one. An escape counts only where its backslash isn't itself
+ * escaped. A pattern compiled without flags can match a CR other ways too,
+ * such as `\15` in a pattern of fewer than 15 groups or a class range that
+ * spans U+000D, and those go unnoticed.
+ */
+function namedLeftOut(pattern: string): { cr: boolean; bom: boolean } {
+  const named = { cr: false, bom: false };
+  for (let i = 0; i < pattern.length; i++) {
+    if (pattern[i] === '\r') named.cr = true;
+    else if (pattern[i] === '\uFEFF') named.bom = true;
+    else if (pattern[i] === '\\') {
+      const next = pattern.slice(i + 1, i + 6);
+      if (/^(?:r|\r|x0[dD]|u000[dD]|c[mM]|015)/.test(next)) named.cr = true;
+      else if (/^(?:u[fF][eE][fF][fF]|\uFEFF)/.test(next)) named.bom = true;
+      i++;
+    }
+  }
+  return named;
+}
+
+/**
+ * A glob's reading in the mount its first segment names, in place of the
+ * pattern as written there. Every path the tools take and return is
+ * mount-prefixed, so `notes/diary/*.md` is the natural way to write a
+ * pattern, and tested as written against a mount-relative path it could
+ * never match — a glob answered "no matches" for files that were there.
+ * `regex` matches the rest of the pattern against the mount-relative path,
+ * and `dir` is the rest's literal directory (literalDirOf), from the mount's
+ * root. A pattern that names another mount, or none, has no such reading
+ * (null), and is read as written, relative to the search root. So in a mount
+ * holding a directory named like itself, `work/z/*.ts` names the mount's own
+ * `z`, and `work/work/z/*.ts`, as the tools show it, names the directory's.
+ * The rest's brace groups are the pattern's, so a pattern globToRegex took
+ * doesn't throw here.
+ */
+function prefixedGlob(pattern: string, mountName: string): { regex: RegExp; dir: string } | null {
+  const slash = pattern.indexOf('/');
+  if (slash <= 0 || pattern.slice(0, slash) !== mountName) return null;
+  const rest = pattern.slice(slash + 1);
+  return { regex: globToRegex(rest), dir: literalDirOf(rest) };
+}
+
 /**
  * Convert a glob pattern to a RegExp. Throws, naming the pattern, for a brace
  * group it can't read: a "{" that never closes, a group inside another, or a
@@ -5954,9 +7028,14 @@ function globToRegex(pattern: string): RegExp {
       if (!group.includes(',')) {
         throw new Error(braceRefusal(pattern, 'has a "{" group with no ","; a group needs two or more alternatives, separated by ","'));
       }
-      const alternatives = group.split(',');
-      regex += '(?:' + alternatives.map(a => globPartToRegex(a)).join('|') + ')';
-      i = closeIdx + 1;
+      // A `/` right after the group goes into each alternative, as `{a,b}/x`
+      // and `{a/,b/}x` name the same paths, so an alternative's own `**`
+      // meets it and reads as a `**/` does, as in the group's expansion:
+      // `{src/**,lib}/*.ts` is `src/**/*.ts` or `lib/*.ts`.
+      const slash = pattern[closeIdx + 1] === '/';
+      const alternatives = group.split(',').map((alternative) => (slash ? alternative + '/' : alternative));
+      regex += '(?:' + alternatives.map(globPartToRegex).join('|') + ')';
+      i = closeIdx + (slash ? 2 : 1);
       continue;
     }
     // Accumulate non-brace characters, convert as a chunk
@@ -6002,11 +7081,19 @@ function braceRefusal(pattern: string, problem: string): string {
   return `glob pattern ${JSON.stringify(pattern)} ${problem}. To match a "{" in a name, put "?" in its place.`;
 }
 
+// What each glob token becomes. A `**/` at the start of a path segment matches
+// zero or more whole directories, so `src/**/*.ts` also matches `src/main.ts`;
+// any other `**` matches any run of characters.
+const GLOB_TOKENS: Record<string, string> = { '**/': '(?:.*/)?', '**': '.*', '*': '[^/]*', '?': '[^/]' };
+
+// One part of a pattern, between brace groups or inside one. Whether a `**/`
+// at its start starts a path segment depends on what comes before it in the
+// path, which after a brace group is whichever alternative matched: so it
+// reads as GLOB_TOKENS' `**/` where the path so far is empty or ends with a
+// `/`, as in `{src/,lib/}**/`, and otherwise as any run of characters and
+// then a directory, as in `draft{s,ing}**/`.
+const PART_START_GLOBSTAR = '(?:(?<=^|/)(?:.*/)?|(?<!^|/).*/)';
 function globPartToRegex(part: string): string {
-  return part
-    .replace(/[.+^$()|[\]\\]/g, '\\$&')
-    .replace(/\*\*/g, '__DOUBLESTAR__')
-    .replace(/\*/g, '[^/]*')
-    .replace(/__DOUBLESTAR__/g, '.*')
-    .replace(/\?/g, '[^/]');
+  return part.replace(/(?<=^|\/)\*\*\/|\*\*|[*?]|[.+^$()|[\]\\]/g, (m, offset: number) =>
+    m === '**/' && offset === 0 ? PART_START_GLOBSTAR : GLOB_TOKENS[m] ?? `\\${m}`);
 }

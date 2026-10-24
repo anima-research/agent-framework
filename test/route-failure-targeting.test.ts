@@ -10,7 +10,7 @@ import { CapabilityGrant } from '../src/mcpl/capability-grant.js';
 import type { McplServerRegistry } from '../src/mcpl/server-registry.js';
 import type { ProcessEvent, Module, ModuleContext, ToolDefinition, ToolCall, ToolResult, EventResponse } from '../src/index.js';
 import type { ContentBlock, NormalizedResponse } from '@animalabs/membrane';
-import type { ChannelRegistry } from '../src/mcpl/channel-registry.js';
+import { destinationKey, type ChannelRegistry } from '../src/mcpl/channel-registry.js';
 import { HeldStream, MockMembrane, MockYieldingStream, createMockResponse } from './helpers/mock-membrane.js';
 import { UNREACHED_WATCHDOG, silenceRun } from './helpers/run-watchdog.js';
 
@@ -75,7 +75,7 @@ class SenderModule implements Module {
   }
   async handleToolCall(call: ToolCall): Promise<ToolResult> {
     if (call.name.endsWith('post')) {
-      await internals(this.framework!).channelRegistry.routeSpeech(this.speaker, 'mid-turn reply', 'missing-channel');
+      await internals(this.framework!).channelRegistry.routeSpeech(this.speaker, 'mid-turn reply', { serverId: 'srv', channelId: 'missing-channel' });
     }
     if (this.quiesceOnCall) internals(this.framework!).quiesced = true;
     if (this.endTurnOnPost && call.name.endsWith('post')) return { success: true, data: { ok: true }, endTurn: true };
@@ -128,10 +128,10 @@ describe('notices about an agent\'s own action', () => {
   });
 
   /** An incoming DM on `channel`, which no channel the registry knows. */
-  function dm(messageId: string, text: string, channel = 'missing-channel'): ProcessEvent {
+  function dm(messageId: string, text: string, channel = 'missing-channel', server = 'srv'): ProcessEvent {
     return {
       type: 'mcpl:channel-incoming',
-      serverId: 'srv',
+      serverId: server,
       channelId: channel,
       messageId,
       author: { id: 'user-1', name: 'User' },
@@ -143,11 +143,11 @@ describe('notices about an agent\'s own action', () => {
   }
 
   /** A real conversation fork: an incoming DM binds one, and its reply fails (no such channel). */
-  async function spawnFork(reply = 'Reply from the fork.', channel = 'missing-channel') {
+  async function spawnFork(reply = 'Reply from the fork.', channel = 'missing-channel', server = 'srv') {
     membrane.pushResponse(createMockResponse([{ type: 'text', text: reply }]));
-    framework.pushEvent(dm(channel === 'missing-channel' ? 'incoming-1' : `incoming-${channel}`, 'Hello fork.', channel));
+    framework.pushEvent(dm(channel === 'missing-channel' ? 'incoming-1' : `incoming-${channel}`, 'Hello fork.', channel, server));
     await framework.runUntilIdle();
-    const binding = framework.getConversationRouter()!.getBinding(channel);
+    const binding = framework.getConversationRouter()!.getBinding({ serverId: server, channelId: channel });
     assert.ok(binding, 'the incoming DM must spawn a real conversation fork');
     return framework.getAgent(binding.agentName)!;
   }
@@ -180,7 +180,7 @@ describe('notices about an agent\'s own action', () => {
     it('addresses a secondary resident\'s notice to it, in the slot every resident reads', async (t) => {
       const primary = t.mock.method(framework.getAgent('primary')!.getContextManager(), 'addMessage');
       const secondary = t.mock.method(framework.getAgent('secondary')!.getContextManager(), 'addMessage');
-      const result = await internals(framework).channelRegistry.routeSpeech('secondary', 'hello', 'missing-channel');
+      const result = await internals(framework).channelRegistry.routeSpeech('secondary', 'hello', { serverId: 'srv', channelId: 'missing-channel' });
 
       assert.equal(result, null);
       assert.equal(primary.mock.callCount(), 0);
@@ -191,7 +191,8 @@ describe('notices about an agent\'s own action', () => {
       assert.equal(metadata?.system, true);
       assert.equal(metadata?.kind, 'discord-send-failed');
       assert.equal(metadata?.channelId, 'missing-channel');
-      assert.equal(metadata?.reason, 'no channel "missing-channel" is registered here');
+      // The turn's locus names its server, so the reason does too.
+      assert.equal(metadata?.reason, 'the "srv" server has no channel "missing-channel" registered here');
       assert.equal(metadata?.textLen, 5);
       t.mock.restoreAll();
       const { messages } = await framework.getAgent('secondary')!.getContextManager().compile();
@@ -278,13 +279,13 @@ describe('notices about an agent\'s own action', () => {
       const primary = t.mock.method(framework.getAgent('primary')!.getContextManager(), 'addMessage');
       const secondary = t.mock.method(framework.getAgent('secondary')!.getContextManager(), 'addMessage');
 
-      await internals(framework).channelRegistry.routeSpeech('released-conversation', 'hello', 'missing-channel');
+      await internals(framework).channelRegistry.routeSpeech('released-conversation', 'hello', { serverId: 'srv', channelId: 'missing-channel' });
 
       assert.equal(secondary.mock.callCount(), 0);
       assert.equal(primary.mock.callCount(), 1);
       const [, content, metadata] = primary.mock.calls[0]!.arguments;
       assert.match(JSON.stringify(content),
-        /\[discord-send-failed\] A reply by released-conversation \(5 chars\) could not be delivered to missing-channel \(no channel \\"missing-channel\\" is registered here\)\. Nothing was posted\. released-conversation has ended\./);
+        /\[discord-send-failed\] A reply by released-conversation \(5 chars\) could not be delivered to missing-channel \(the \\"srv\\" server has no channel \\"missing-channel\\" registered here\)\. Nothing was posted\. released-conversation has ended\./);
       assert.equal(metadata?.speaker, 'released-conversation');
       assert.equal(metadata?.textLen, 5);
       assert.equal(internals(framework).pendingRequests.length, 0, 'context only: the primary is not woken');
@@ -364,7 +365,7 @@ describe('notices about an agent\'s own action', () => {
       // After the run's release, its speech is routed to a channel given
       // directly, as a channel the run opened or named would be; the channel
       // isn't registered, so the delivery fails.
-      await internals(framework).channelRegistry.routeSpeech('worker', 'Worker speech for a channel that is not registered.', 'missing-channel');
+      await internals(framework).channelRegistry.routeSpeech('worker', 'Worker speech for a channel that is not registered.', { serverId: 'srv', channelId: 'missing-channel' });
 
       const { messages } = await framework.getAgent('primary')!.getContextManager().compile();
       const named = messages.filter((m) => JSON.stringify(m.content).includes(SEND_FAILED));
@@ -385,7 +386,7 @@ describe('notices about an agent\'s own action', () => {
 
       await runEphemeral('locus', 'Worker speech.');
       assert.equal(framework.getAgent('worker'), null, 'the run is released');
-      await internals(framework).channelRegistry.routeSpeech('worker', 'Worker speech for a channel that is not registered.', 'missing-channel');
+      await internals(framework).channelRegistry.routeSpeech('worker', 'Worker speech for a channel that is not registered.', { serverId: 'srv', channelId: 'missing-channel' });
 
       assert.ok(errors.some((e) => e.includes('[route-failure] failed to tell the primary that worker\'s reply to missing-channel failed')));
     });
@@ -410,7 +411,7 @@ describe('notices about an agent\'s own action', () => {
         await bare.runUntilIdle();
         // After the run's release, its speech is routed to a channel given
         // directly, as a channel of its own would be, and the delivery fails.
-        await internals(bare).channelRegistry.routeSpeech('worker', 'Worker speech with nobody to tell.', 'missing-channel');
+        await internals(bare).channelRegistry.routeSpeech('worker', 'Worker speech with nobody to tell.', { serverId: 'srv', channelId: 'missing-channel' });
 
         const archive = await ContextManager.open({
           store: bare.getStore(), namespace: 'subagent/worker', isolate: true, strategy: new PassthroughStrategy(),
@@ -621,7 +622,12 @@ describe('notices about an agent\'s own action', () => {
       const told = messages.filter((m) => JSON.stringify(m.content).includes(SEND_FAILED));
       assert.equal(told.length, 1);
       assert.match(JSON.stringify(told[0]!.content),
-        new RegExp(`A reply by ${fork.name} \\(${reply.length} chars\\) could not be delivered to missing-channel \\(no channel \\\\"missing-channel\\\\" is registered here\\)\\. Nothing was posted\\. ${fork.name} has ended\\.`));
+        new RegExp(`A reply by ${fork.name} \\(${reply.length} chars\\) could not be delivered to missing-channel \\(the \\\\"srv\\\\" server has no channel \\\\"missing-channel\\\\" registered here\\)\\. Nothing was posted\\. ${fork.name} has ended\\.`));
+      // The marker passed on names the channel's server, as the fork's did.
+      const markers = framework.getAgent('primary')!.getContextManager().queryMessages({}).messages
+        .map((m) => m.metadata as { kind?: string; channelId?: string; serverId?: string } | undefined)
+        .filter((m) => m?.kind === 'discord-send-failed');
+      assert.deepEqual(markers.map((m) => [m?.channelId, m?.serverId]), [['missing-channel', 'srv']]);
     });
 
     it('passes on only what a fork never read: a notice its later turn compiled stays its own', async () => {
@@ -672,7 +678,7 @@ describe('notices about an agent\'s own action', () => {
         triggerInference: false,
       } as unknown as ProcessEvent);
       await framework.runUntilIdle();
-      const binding = framework.getConversationRouter()!.getBinding('missing-channel');
+      const binding = framework.getConversationRouter()!.getBinding({ serverId: 'srv', channelId: 'missing-channel' });
       assert.ok(binding, 'the DM spawns a real conversation fork');
       assert.equal(membrane.calls.length, 0, 'no turn read the message');
       const row = framework.getAgent(binding.agentName)!.getContextManager().getAllMessages()
@@ -699,7 +705,7 @@ describe('notices about an agent\'s own action', () => {
     /** The registry learns a label for `channel` after the fork's reply to it failed. */
     function learnLabel(channel: string, label: string) {
       (internals(framework).channelRegistry as unknown as { channels: Map<string, unknown> }).channels
-        .set(`srv:${channel}`, { serverId: 'srv', descriptor: { id: channel, type: 'discord', label }, open: true });
+        .set(destinationKey({ serverId: 'srv', channelId: channel }), { serverId: 'srv', descriptor: { id: channel, type: 'discord', label }, open: true });
     }
 
     async function primaryNotices() {
@@ -1044,13 +1050,13 @@ describe('notices about an agent\'s own action', () => {
         // After stop() the queue refuses new events, so only one already queued can reach the router.
         framework.pushEvent(dm('incoming-2', 'LEFT QUEUED'));
         await framework.stop();
-        assert.equal(framework.getConversationRouter()!.getBinding('missing-channel'), undefined, 'the channel unbinds with its fork');
+        assert.equal(framework.getConversationRouter()!.getBinding({ serverId: 'srv', channelId: 'missing-channel' }), undefined, 'the channel unbinds with its fork');
 
         membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Reply from the next fork.' }]));
         framework.start();
         const deadline = Date.now() + 10_000;
         let next: string | undefined;
-        while (Date.now() < deadline && !(next = framework.getConversationRouter()!.getBinding('missing-channel')?.agentName)) {
+        while (Date.now() < deadline && !(next = framework.getConversationRouter()!.getBinding({ serverId: 'srv', channelId: 'missing-channel' })?.agentName)) {
           await new Promise((resolve) => setTimeout(resolve, 20));
         }
         assert.ok(next && next !== fork.name, `a new generation binds the channel (bound: ${next})`);
@@ -1087,7 +1093,7 @@ describe('notices about an agent\'s own action', () => {
       framework.pushEvent(dm('incoming-1', 'Hello fork.'));
       await framework.runUntilIdle();
       assert.ok(ended, 'the fork was created and then ended before its bind');
-      assert.equal(framework.getConversationRouter()!.getBinding('missing-channel'), undefined, 'no binding names the ended fork');
+      assert.equal(framework.getConversationRouter()!.getBinding({ serverId: 'srv', channelId: 'missing-channel' }), undefined, 'no binding names the ended fork');
       assert.equal(failed.length, 1, 'the spawn fails, as a failed spawn does');
       assert.match(failed[0]!, /ended before its channel was bound/);
 
@@ -1095,7 +1101,7 @@ describe('notices about an agent\'s own action', () => {
       membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Reply from the next fork.' }]));
       framework.pushEvent(dm('incoming-2', 'Hello again.'));
       await framework.runUntilIdle();
-      const next = framework.getConversationRouter()!.getBinding('missing-channel')?.agentName;
+      const next = framework.getConversationRouter()!.getBinding({ serverId: 'srv', channelId: 'missing-channel' })?.agentName;
       assert.ok(next && next !== ended, `the next generation binds the channel (bound: ${next}; failed: ${failed.join(' | ')})`);
     });
 
@@ -1187,7 +1193,9 @@ describe('notices about an agent\'s own action', () => {
     });
 
     it("keeps the server the registry names for an open a delivery forced, as the framework's callback writes the notice's inputs", async () => {
-      const fork = await spawnFork();
+      // The fork's home is on a server other than the fixture's own, so a
+      // notice built with any server but the callback's names the wrong one.
+      const fork = await spawnFork('Reply from the fork.', 'missing-channel', 'other-server');
       const registry = internals(framework).channelRegistry as unknown as {
         onChannelAutoOpened(info: { conversationId?: string; serverId: string; source: string; channels: Array<{ channelId: string; label?: string }> }): void;
       };
@@ -1211,7 +1219,7 @@ describe('notices about an agent\'s own action', () => {
       assert.equal(primary.mock.callCount(), 1, 'the primary is told too');
       assert.equal(JSON.stringify(primary.mock.calls[0]!.arguments[1]), JSON.stringify([{ type: 'text', text:
         `[channels] Now open: #one (c-1): a message from your fork in missing-channel, named ${fork.name}, into the closed channel opened it, and that fork can't close it. ` +
-        "If you don't want it, use channel_close: neither the subscription policy nor its server's own default opens it again." }]));
+        "If you don't want it, use channel_close: a channel you close stays closed until you open it with channel_open, and neither speaking there, the subscription policy nor its server's own default opens it again." }]));
       assert.equal((primary.mock.calls[0]!.arguments[2] as { speaker?: unknown } | undefined)?.speaker, fork.name);
 
       // The advice left out is advice the fork can't take: its channel_close
@@ -1229,7 +1237,7 @@ describe('notices about an agent\'s own action', () => {
         (framework as unknown as { pushEvent: unknown }).pushEvent = push;
       }
       assert.equal(results[0]?.success, false);
-      assert.match(results[0]?.error ?? '', /closing c-1 is not allowed/);
+      assert.match(results[0]?.error ?? '', /closing "c-1" is not allowed/);
     });
 
     it('tells the primary, by name, of a channel notice a fork could act on and never read, when the fork is released', async () => {
@@ -1246,7 +1254,7 @@ describe('notices about an agent\'s own action', () => {
       assert.equal(told.length, 1, 'the primary is told once');
       assert.equal((told[0]!.content[0] as { text: string }).text,
         `[channels] Now open: #home (missing-channel): a message from your fork in missing-channel, named ${fork.name}, into the closed channel opened it; that fork has ended. ` +
-        "If you don't want it, use channel_close: neither the subscription policy nor its server's own default opens it again.");
+        "If you don't want it, use channel_close: a channel you close stays closed until you open it with channel_open, and neither speaking there, the subscription policy nor its server's own default opens it again.");
       assert.equal((told[0]!.metadata as { speaker?: unknown } | undefined)?.speaker, fork.name);
     });
 
@@ -1288,7 +1296,7 @@ describe('notices about an agent\'s own action', () => {
       const state = internals(framework);
       const channels = (state.channelRegistry as unknown as { channels: Map<string, { open: boolean }> }).channels;
       // The channel the ended run's send opened, on a server that lets it close.
-      channels.set('srv:opened-1', { serverId: 'srv', descriptor: { id: 'opened-1', type: 'srv', label: '#opened' }, open: true } as never);
+      channels.set(destinationKey({ serverId: 'srv', channelId: 'opened-1' }), { serverId: 'srv', descriptor: { id: 'opened-1', type: 'srv', label: '#opened' }, open: true } as never);
       const closed: unknown[] = [];
       const server = {
         grant: new CapabilityGrant(new Set(['channels.publish', 'channels.lifecycle']), []),
@@ -1309,9 +1317,9 @@ describe('notices about an agent\'s own action', () => {
       // The remedy it names is the primary's to use.
       (framework as unknown as { dispatchChannelToolCall(agent: string, call: { id: string; name: string; input: Record<string, unknown> }): void })
         .dispatchChannelToolCall('primary', { id: 'close-1', name: 'channel_close', input: { channelId: 'opened-1' } });
-      for (let i = 0; i < 50 && channels.get('srv:opened-1')!.open; i++) await new Promise((resolve) => setImmediate(resolve));
+      for (let i = 0; i < 50 && channels.get(destinationKey({ serverId: 'srv', channelId: 'opened-1' }))!.open; i++) await new Promise((resolve) => setImmediate(resolve));
       assert.deepEqual(closed, [{ channelId: 'opened-1' }]);
-      assert.equal(channels.get('srv:opened-1')!.open, false, 'the channel the send opened is closed');
+      assert.equal(channels.get(destinationKey({ serverId: 'srv', channelId: 'opened-1' }))!.open, false, 'the channel the send opened is closed');
     });
 
     it('tells no one, logged, of a channel an ended agent\'s send opened when there is no primary', async (t) => {
@@ -1404,7 +1412,7 @@ describe('notices about an agent\'s own action', () => {
         .filter((m) => JSON.stringify(m.content).includes('conversation-gone'));
       assert.deepEqual(told.map((m) => (m.content[0] as { text: string }).text), [
         "[channels] Now open: #four (c-4): a message from conversation-gone into the closed channel opened it; conversation-gone has ended. " +
-          "If you don't want it, use channel_close: neither the subscription policy nor its server's own default opens it again.",
+          "If you don't want it, use channel_close: a channel you close stays closed until you open it with channel_open, and neither speaking there, the subscription policy nor its server's own default opens it again.",
         "[channels] Not open: #five (c-5). A reply from conversation-gone went out there, but opening the channel failed; conversation-gone has ended. " +
           "It's selected for opening again, because its server lists it as open by default: the host tries again, and channel_close withdraws that.",
       ]);
@@ -1426,12 +1434,12 @@ describe('notices about an agent\'s own action', () => {
       // Selected for opening, and open since.
       decide('c-9', 'open', 'server-bootstrap');
       (state.channelRegistry as unknown as { channels: Map<string, unknown> }).channels
-        .set('srv:c-9', { serverId: 'srv', descriptor: { id: 'c-9', type: 'srv', label: '#nine' }, open: true });
+        .set(destinationKey({ serverId: 'srv', channelId: 'c-9' }), { serverId: 'srv', descriptor: { id: 'c-9', type: 'srv', label: '#nine' }, open: true });
       // Selected for opening on its own server, where it isn't open, while
       // another server's channel with the same id is.
       decide('c-22', 'open', 'server-bootstrap');
       (state.channelRegistry as unknown as { channels: Map<string, unknown> }).channels
-        .set('other:c-22', { serverId: 'other', descriptor: { id: 'c-22', type: 'other', label: '#twenty-two' }, open: true });
+        .set(destinationKey({ serverId: 'other', channelId: 'c-22' }), { serverId: 'other', descriptor: { id: 'c-22', type: 'other', label: '#twenty-two' }, open: true });
       // Selected for opening, and closed since.
       decide('c-10', 'open', 'server-bootstrap');
       decide('c-10', 'closed', 'agent-tool');
@@ -1476,12 +1484,12 @@ describe('notices about an agent\'s own action', () => {
         .filter((m) => JSON.stringify(m.content).includes('conversation-gone'));
       assert.deepEqual(told.map((m) => (m.content[0] as { text: string }).text), [
         '[channels] Now open: #seven (c-7): a message from conversation-gone into the closed channel opened it; conversation-gone has ended. ' +
-          "If you don't want it, use channel_close: neither the subscription policy nor its server's own default opens it again.",
+          "If you don't want it, use channel_close: a channel you close stays closed until you open it with channel_open, and neither speaking there, the subscription policy nor its server's own default opens it again.",
         '[channels] Now open: #thirteen (c-13): a message from conversation-gone into the closed channel opened it; conversation-gone has ended. ' +
-          "If you don't want it, use channel_close: neither the subscription policy nor its server's own default opens it again.",
+          "If you don't want it, use channel_close: a channel you close stays closed until you open it with channel_open, and neither speaking there, the subscription policy nor its server's own default opens it again.",
         '[channels] Now open: #fourteen (c-14): a message from conversation-gone into the closed channel opened it; conversation-gone has ended. ' +
-          "If you don't want it, use channel_close: neither the subscription policy nor its server's own default opens it again.",
-        "[channels] Not open: #twenty-two (c-22). A reply from conversation-gone went out there, but opening the channel failed; conversation-gone has ended. " +
+          "If you don't want it, use channel_close: a channel you close stays closed until you open it with channel_open, and neither speaking there, the subscription policy nor its server's own default opens it again.",
+        "[channels] Not open: #twenty-two (srv:c-22). A reply from conversation-gone went out there, but opening the channel failed; conversation-gone has ended. " +
           "It's selected for opening again, because its server lists it as open by default: the host tries again, and channel_close withdraws that.",
       ]);
       assert.deepEqual(told.map((m) => (m.metadata as { deferredWriteId?: unknown }).deferredWriteId), ['w-7', 'w-13', 'w-14', 'w-22']);
@@ -1722,7 +1730,7 @@ describe('notices about an agent\'s own action', () => {
           },
         };
         t.mock.method(state.mcplServerRegistry, 'getServer', () => publisher as never);
-        (state.channelRegistry as unknown as { channels: Map<string, unknown> }).channels.set('srv:' + channelId, {
+        (state.channelRegistry as unknown as { channels: Map<string, unknown> }).channels.set(destinationKey({ serverId: 'srv', channelId }), {
           serverId: 'srv', descriptor: { id: channelId, type: 'srv', label: 'closure test' }, open: true,
         });
         membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Initial reply.' }]));
@@ -1735,7 +1743,7 @@ describe('notices about an agent\'s own action', () => {
           triggerInference: true,
         } as unknown as ProcessEvent);
         await framework.runUntilIdle();
-        const binding = framework.getConversationRouter()!.getBinding(channelId)!;
+        const binding = framework.getConversationRouter()!.getBinding({ serverId: 'srv', channelId })!;
         assert.ok(binding);
         const fork = framework.getAgent(binding.agentName)!;
 

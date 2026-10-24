@@ -428,6 +428,19 @@ export const TOOL_RESULT_NOTICE_ROOM = 640;
  * share. `keptCap` is where a withheld stub's kept fields are cut, leaving
  * the stub's notice its room (tool-result-guard.ts). With no bound, each
  * keeps the cap.
+ *
+ * Each result is then stored within its share, or at its least where its
+ * notice is longer than the share: whole where it's no longer than the
+ * notice (cutStoredToolResultToFit), otherwise its notice alone. So a reader's
+ * cut reaches a notice only when the turn, each result at its least, passes
+ * the bound. One edge: notices differ in length (by a few characters for
+ * the content's digits, more where call ids differ in length), and where a
+ * share falls between two of them, a result between its own notice and the
+ * share stays whole above its least, by up to that difference.
+ * A turn that then passes the bound by those characters loses the end of
+ * its last notice to the reader's cut, under context-manager's mark (whose
+ * token count is the notice's, not the result's); the notice's path and read
+ * call come before that end.
  */
 export function toolResultShare(cap: number, bound: number | undefined, n: number): { cap: number; bound: number | undefined; keptCap: number } {
   if (bound === undefined) return { cap, bound, keptCap: cap };
@@ -447,8 +460,17 @@ export function toolResultShare(cap: number, bound: number | undefined, n: numbe
  * the rest left out and uncounted, as past MAX_KEPT_IMAGE_SLOTS. A bound
  * under the notice's room can't hold the notice. With no bound, or where the
  * cut at the cap already fits, the cut is cutStoredToolResult's.
+ *
+ * `notice`, given where `bound` is a text's share of one turn's bound, is the
+ * length of the notice a cut that keeps no head would carry
+ * (spillNoticeLength). A text no longer than what that cut would store in
+ * its place, the notice and, where it keeps no slot, the note on the slots it
+ * leaves out, is kept whole: a cut would only lengthen it. Only a cut that
+ * keeps no head can meet that, since one that keeps a head is cut past the
+ * notice's room. A cut that keeps slots is measured by its notice alone, as
+ * the slots it keeps are the text's own.
  */
-export function cutStoredToolResultToFit(text: string, cap: number, shown: ShownRanges | null, bound: number | undefined): StoredCut {
+export function cutStoredToolResultToFit(text: string, cap: number, shown: ShownRanges | null, bound: number | undefined, notice?: number): StoredCut {
   let cut = cutStoredToolResult(text, cap, shown);
   if (bound === undefined || text.length <= cap) return cut;
   const room = bound - TOOL_RESULT_NOTICE_ROOM;
@@ -456,6 +478,10 @@ export function cutStoredToolResultToFit(text: string, cap: number, shown: Shown
     cut = cutStoredToolResult(text, Math.max(0, room - formatKeptImageSlots(cut).length), shown);
   }
   while (cut.kept.length > 0 && formatKeptImageSlots(cut).length > room) cut = { ...cut, kept: cut.kept.slice(1) };
+  if (notice !== undefined && cut.head.length === 0
+    && text.length <= notice + (cut.kept.length === 0 ? formatKeptImageSlots(cut).length : 0)) {
+    return { head: text, kept: [], fell: 0 };
+  }
   return cut;
 }
 
@@ -464,10 +490,11 @@ export function cutStoredToolResultToFit(text: string, cap: number, shown: Shown
  * text is longer than `cap`, those the cut keeps, in head and after the
  * notice (cutStoredToolResultToFit, under the readers' `bound`). The notice
  * itself holds none. For counting a result before its stored copy is
- * written, as it will count after.
+ * written, as it will count after, so `notice` is the one spillOrTruncate
+ * gives the cut (spillNoticeLength).
  */
-export function storedImageSlots(text: string, cap: number, shown: ShownRanges | null, bound: number | undefined): ParsedImagePlaceholder[] {
-  const cut = cutStoredToolResultToFit(text, cap, shown, bound);
+export function storedImageSlots(text: string, cap: number, shown: ShownRanges | null, bound: number | undefined, notice?: number): ParsedImagePlaceholder[] {
+  const cut = cutStoredToolResultToFit(text, cap, shown, bound, notice);
   return parseImagePlaceholders(cut.head + formatKeptImageSlots(cut));
 }
 

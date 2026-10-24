@@ -16,6 +16,13 @@ export type { TraceEvent, TraceEventListener } from './trace.js';
 export interface ModuleProcessResponse {
   moduleName: string;
   response: EventResponse;
+  /**
+   * Set when applying the response threw: the operation it threw at, such
+   * as `the edit of <id>`, and the error's message. What the response asked
+   * for before that was applied, that operation may have taken effect in
+   * part or whole, and the rest of it wasn't (EventResponse).
+   */
+  threw?: { at: string; error: string };
 }
 
 /**
@@ -117,9 +124,10 @@ export interface FrameworkConfig {
   subconscious?: import('../tune-out/tools.js').SubconsciousConfig;
 
   /**
-   * IANA zone used only when rendering wall-clock times for the agent.
-   * Stored/protocol timestamps remain epoch/UTC. Defaults to AGENT_TIMEZONE,
-   * then the process zone.
+   * IANA zone of the agent's wall clock: it renders wall-clock times for the
+   * agent, and it sets where clock rows' boundaries fall (AgentConfig.clock,
+   * counted from local midnight here). Stored/protocol timestamps remain
+   * epoch/UTC. Defaults to AGENT_TIMEZONE, then the process zone.
    */
   timeZone?: string;
 
@@ -240,8 +248,9 @@ export interface FrameworkConfig {
    * workspace file under `tool-results/` (deterministic `<date>-<callId>.txt`
    * name, overwritten on collision, retained until the workspace owner
    * deletes it — never auto-GC'd) and replaced inline by a bounded preview
-   * plus the file reference; with no writable mount without an include, the
-   * fallback is explicit plain truncation. Default 24000 (house-safe; issue #89). Must be
+   * plus the file reference; with no writable mount without an include that
+   * keeps its files in the store (not configured direct), the fallback is
+   * explicit plain truncation. Default 24000 (house-safe; issue #89). Must be
    * >= 1000. A resident's own agent_settings value
    * `tool_result_inline_max_chars` (durable, persisted in framework state)
    * takes precedence over this for that agent; the EFFECTIVE cap for every
@@ -275,7 +284,17 @@ export interface FrameworkConfig {
    */
   hostToolClasses?: Record<string, string[]>;
 
-  /** Inference routing policy for server-initiated inference (optional). */
+  /**
+   * Inference routing policy for server-initiated inference (optional): the
+   * model an MCPL server's inference/request runs on. Without one, each such
+   * request is refused with -32603 and a message naming this setting; the
+   * framework doesn't choose a model for a server. A server's effective
+   * grant can still list `inferenceRequest` then, since the grant comes from
+   * what the server advertises and `enabledCapabilities`, not from this
+   * policy. A policy that names no model for a request's feature set (no
+   * override, byFeature or wildcards entry that names one, and an empty
+   * `default`) refuses that request the same way, naming the feature set.
+   */
   inferenceRouting?: InferenceRoutingPolicy;
 
   /** EventGate config. If omitted, all events trigger inference (unchanged default). */

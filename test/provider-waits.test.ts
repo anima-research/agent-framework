@@ -1011,13 +1011,13 @@ test('stop() cancels a retry wait on the path that does not own provider admissi
       },
     });
     const internal = fw as unknown as {
-      conversationAgentHomes: Map<string, string>;
+      conversationAgentHomes: Map<string, { serverId: string; channelId: string }>;
       retryWaitWakers: Set<unknown>;
       startAgentStream(agent: unknown, trigger: unknown): Promise<void>;
     };
     let stopped = false;
     try {
-      internal.conversationAgentHomes.set('resident', 'world:zz');
+      internal.conversationAgentHomes.set('resident', { serverId: 'stub', channelId: 'world:zz' });
       fw.getAgent('resident')!.getContextManager().addMessage('User', [{ type: 'text', text: 'zz-direct' }]);
       const run = internal.startAgentStream(fw.getAgent('resident'), { agentName: 'resident', reason: 'conversation', source: 'test', timestamp: Date.now() });
       for (let i = 0; i < 300 && internal.retryWaitWakers.size === 0; i++) await sleep(10);
@@ -1631,7 +1631,7 @@ class FailingAt extends WaitingMembrane {
 }
 
 type NonOwning = Internal & {
-  conversationAgentHomes: Map<string, string>;
+  conversationAgentHomes: Map<string, { serverId: string; channelId: string }>;
   retryWaitWakers: Set<() => void>;
   pendingRequests: Array<{ agentName: string; reason: string; source: string; timestamp: number }>;
   startAgentStream(agent: unknown, trigger: unknown): Promise<void>;
@@ -1667,7 +1667,7 @@ async function waitFor(fw: AgentFramework, done: () => boolean, what: string, bo
 }
 
 async function conversationTurn(fw: AgentFramework, internal: NonOwning, text: string): Promise<void> {
-  internal.conversationAgentHomes.set('resident', 'world:zz');
+  internal.conversationAgentHomes.set('resident', { serverId: 'stub', channelId: 'world:zz' });
   fw.getAgent('resident')!.getContextManager().addMessage('User', [{ type: 'text', text }]);
   await internal.startAgentStream(fw.getAgent('resident'), { agentName: 'resident', reason: 'conversation', source: 'test', timestamp: Date.now() });
 }
@@ -2222,7 +2222,7 @@ test("the last boundary holds no agent the framework no longer has: a disposed f
     const nonOwning = internal as NonOwning;
     try {
       const agent = fw.getAgent('resident')!;
-      nonOwning.conversationAgentHomes.set('resident', 'world:zz');
+      nonOwning.conversationAgentHomes.set('resident', { serverId: 'stub', channelId: 'world:zz' });
       internal.providerWaits.set('resident', 'zz-model', 60_000, 'zz recorded for the fork');
       nonOwning.disposeConversationAgent('resident');
       // Its retry wakes after the disposal and reaches the boundary.

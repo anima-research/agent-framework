@@ -1538,7 +1538,7 @@ export class McplServerConnection extends EventEmitter {
   }
 
   /** Send `channels/open` request and await result. It keeps a deadline as
-   *  channels/publish does: a delivery opens a closed channel before it
+   *  channels/publish does: a delivery can open a closed channel before it
    *  publishes, so an open that is never answered would hold the delivery,
    *  and the turn that waits for it, for good. */
   sendChannelsOpen(params: ChannelsOpenParams): Promise<ChannelsOpenResult> {

@@ -45,9 +45,9 @@ async function make() {
   const routed: string[] = [];
   const typing: string[] = [];
   (framework as any).channelRegistry = new Proxy({
-    resolveLocus: () => 'world:commons', getDefaultPublishChannel: () => 'world:commons',
-    routeSpeech: async (_a: string, text: string) => { routed.push(text); return { delivered: true, channelId: 'world:commons' }; },
-    startTyping: (channel: string) => { typing.push(channel); },
+    resolveLocus: () => ({ serverId: 'stub', channelId: 'world:commons' }), getDefaultPublishChannel: () => ({ serverId: 'stub', channelId: 'world:commons' }),
+    routeSpeech: async (_a: string, text: string) => { routed.push(text); return { delivered: true, serverId: 'stub', channelId: 'world:commons' }; },
+    startTyping: (channel: { channelId: string }) => { typing.push(channel.channelId); },
     stopTyping: () => {},
     getChannelTools: () => [], getDescriptor: () => undefined,
   }, { get: (t, p: string) => p in t ? (t as any)[p] : () => undefined });

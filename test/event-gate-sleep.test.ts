@@ -338,7 +338,7 @@ describe("EventGate sleep: its wake, a stop and a fork's end", () => {
     try {
       await incoming('m1');
       await f.framework.runUntilIdle(); // the fork's first turn answers with the fixture's 'ok'
-      forceExpiry(f.framework, CH, IDLE_TTL_MS); // idle past the TTL, and the sweep due
+      forceExpiry(f.framework, { serverId: 'editor', channelId: CH }, IDLE_TTL_MS); // idle past the TTL, and the sweep due
       f.membrane.pushResponse(createMockResponse([{ type: 'tool_use', id: 's1', name: 'sleep', input: { seconds: 3600, announce: false } }], 'tool_use'));
       f.membrane.pushResponse(ok());
       f.framework.pushEvent({ type: 'external-message', source: 'test', content: 'tick', metadata: {} } as never);

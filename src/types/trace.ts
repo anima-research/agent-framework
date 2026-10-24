@@ -1,3 +1,4 @@
+import type { ThinkingBindingEntry } from '@animalabs/membrane';
 import type { ProcessEvent } from './events.js';
 import type { ModuleProcessResponse } from './framework.js';
 import type { SessionUsage } from '../usage/types.js';
@@ -66,6 +67,14 @@ export type TraceEvent =
        * without re-deriving routing.
        */
       channelId?: string;
+      /**
+       * The server that registers `channelId`, given with it. Two MCPL
+       * servers may register one channel id, so a tap that posts back to the
+       * turn's channel, such as a host telling it the turn failed, passes this
+       * server with the id. The streaming traces, `inference:tokens` and
+       * `inference:content_block`, carry the id alone.
+       */
+      serverId?: string;
       /** True for a control-plane wake that must not surface typing/prose. */
       silent?: boolean;
     })
@@ -146,7 +155,9 @@ export type TraceEvent =
        *  content in it or its retry after a refusal, and a tool result the
        *  boundary reports carries the channel of the round it answers. In
        *  hybrid mode a `>>>` envelope can send the text itself elsewhere.
-       *  Explicit mode: the channel the start's wake came from. */
+       *  Explicit mode: the channel its typing shows, where the start's wake
+       *  came from, or, at a start whose wake names none, such as a budget
+       *  restart, the one the turn already shows. */
       channelId?: string;
     })
   | (TraceEventBase & {
@@ -169,7 +180,9 @@ export type TraceEvent =
        *  content in it or its retry after a refusal, and a tool result the
        *  boundary reports carries the channel of the round it answers. In
        *  hybrid mode a `>>>` envelope can send the text itself elsewhere.
-       *  Explicit mode: the channel the start's wake came from. */
+       *  Explicit mode: the channel its typing shows, where the start's wake
+       *  came from, or, at a start whose wake names none, such as a budget
+       *  restart, the one the turn already shows. */
       channelId?: string;
     })
   | (TraceEventBase & {
@@ -181,6 +194,20 @@ export type TraceEvent =
       type: 'inference:usage';
       agentName: string;
       tokenUsage: { input: number; output: number; cacheCreation?: number; cacheRead?: number };
+      /**
+       * The provider's report on the signed thinking of the call this event
+       * closes (membrane's `RoundReport.thinking`): blocks it dropped before
+       * the model saw them, and blocks it showed the model anyway because the
+       * check isn't enforced. `tokenUsage` beside it is the stream's running
+       * total, not this call's. The provider reports them for a request that
+       * carried the binding control, whoever asked for it:
+       * `thinkingBinding.dropBlock`, or a thinking config the host sends
+       * itself. Present only when the report names any block.
+       */
+      thinking?: {
+        dropped: ThinkingBindingEntry[];
+        mismatchAllowed: ThinkingBindingEntry[];
+      };
     })
   | (TraceEventBase & {
       type: 'inference:stream_resumed';
@@ -446,6 +473,20 @@ export type TraceEvent =
       eventCount: number;
     })
   | (TraceEventBase & {
+      /** A batched wake's turn started without its `[Gate: …]` line (the
+       *  gate hands the line to the wake when its message is the newest at
+       *  the fire, EventGate isNewestEntry, and the turn's start decides).
+       *  `reason`: `newest`, on the delivery agent's start the message was
+       *  still the newest entry in the window; `held`, the host was quiesced
+       *  or another reader of the residents' shared slot had a turn alive,
+       *  so no line could be written then. */
+      type: 'gate:wake-line-omitted';
+      reason: 'newest' | 'held';
+      policyNames: string[];
+      eventType: string;
+      channelId?: string;
+    })
+  | (TraceEventBase & {
       type: 'gate:config-reloaded';
       configPath: string;
       policyCount: number;
@@ -508,6 +549,8 @@ export type TraceEvent =
   | (TraceEventBase & {
       type: 'mcpl:conversation-spawned';
       channelId: string;
+      /** The channel's server: a channel id is unique only within one server. */
+      serverId: string;
       agentName: string;
       generation: number;
       template: string;
@@ -515,22 +558,30 @@ export type TraceEvent =
   | (TraceEventBase & {
       type: 'mcpl:conversation-spawn-failed';
       channelId: string;
+      /** The channel's server: a channel id is unique only within one server. */
+      serverId: string;
       agentName: string;
       error: string;
     })
   | (TraceEventBase & {
       type: 'mcpl:conversation-unrouted';
       channelId: string;
+      /** The channel's server: a channel id is unique only within one server. */
+      serverId: string;
       messageId: string;
     })
   | (TraceEventBase & {
       type: 'mcpl:conversation-binding-orphaned';
       channelId: string;
+      /** The channel's server: a channel id is unique only within one server. */
+      serverId: string;
       agentName: string;
     })
   | (TraceEventBase & {
       type: 'mcpl:conversation-closed';
       channelId: string;
+      /** The channel's server: a channel id is unique only within one server. */
+      serverId: string;
       agentName: string;
       reason: 'idle-ttl';
     })
@@ -538,6 +589,8 @@ export type TraceEvent =
       type: 'mcpl:conversation-disposed';
       agentName: string;
       channelId?: string;
+      /** The home channel's server, beside its channelId. */
+      serverId?: string;
     })
 
   // Host-owned speech routing (ChannelRegistry.routeSpeech). One trace per
@@ -569,6 +622,9 @@ export type TraceEvent =
       type: 'mcpl:speech-route-failed';
       /** Agent / conversation whose speech failed to route. */
       conversationId: string;
+      /** The channel's server, where the destination, or the caller, named
+       *  one: a channel id is unique only within one server. */
+      serverId?: string;
       /** Empty string when the failure was "no locus at all". */
       channelId: string;
       reason: string;

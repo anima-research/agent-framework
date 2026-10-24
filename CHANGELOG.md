@@ -12,6 +12,462 @@ Releases up to and including 0.7.3 predate this file; for their contents see
 
 ## Unreleased
 
+## 0.26.2 — 2026-10-24
+
+### Fixed
+
+- A turn whose call failed into a provider hold (a provider's stated wait, a
+  host's `providerHold`, or an organization-acceleration cooldown), or whose
+  compile a conversation agent's recorded wait held with nothing sent, now
+  counts as alive until the hold releases its retry, and so does a turn
+  whose error-policy retry a provider wait holds at the last admission
+  boundary before it starts (a conversation agent's own compression can
+  record one during the policy's delay). The host used to report it
+  `drained`, and a rollback, suppression or branch switch went through,
+  after which the retry ran on the rewound store, answering again on history
+  rewound under it. Now:
+  - `getHostModeStatus()` lists the agent in `activeTurnAgents` and counts it
+    in `activeTurns`, and `drained` reads `false`;
+  - a rollback, suppression or branch switch refuses as `agent-busy`, naming
+    the hold, its end (or `until released`) and its reason, and how to go on
+    sooner: a quiesce with `abandon: true`, or, where a stated wait holds the
+    turn, `release-provider-wait`;
+  - a quiesce waits for the turn, up to its `timeoutMs` (at least 1 s),
+    where it used to report drained at once, and lets the retry start when
+    the hold ends and finish; wakes that arrive meanwhile park, as for any
+    turn alive;
+  - a quiesce with `abandon: true` (once its wait for the drain runs out, or
+    at once on a host already quiesced), `stop()`, the inference policy, the
+    agent's removal or a conversation agent's disposal drops the retry, and
+    the turn ends with one `inference:aborted`, as a turn whose continuation
+    is dropped does;
+  - a closing conversation agent isn't disposed while a hold keeps its
+    turn's retry, nor while a continuation of its turn (a budget restart or
+    a tool-result guard's retry) waits in a hold, a park or a scheduler pass;
+  - once `stop()` has closed admission, a failure reported then installs no
+    hold, so no retry outlives the stop, and the turn ends with an
+    `inference:aborted` after its `inference:failed`, as a retry a stop
+    cancels does;
+  - a puppet tool call is refused while the retry waits, as during any live
+    turn, naming the hold and how to go on sooner;
+  - `abortInference()` ends the turn, and a turn whose budget restart or
+    tool-result guard's retry waits held or parked, where it reported
+    nothing to stop and the turn ran once the hold ended: one
+    `inference:aborted` with the stop's reason, and it returns `true`. Wakes
+    that arrived meanwhile still run: those the hold keeps beside the retry,
+    and those merged into the retry's or the continuation's start before it
+    began, which the stop puts back in the queue. A hold of such wakes alone
+    still has nothing to stop. From a listener of a failed stream's
+    `inference:failed` it reports `false`, as before (a turn's start that
+    fails still takes a listener's stop at its own check): every failure
+    site now reports `inference:failed` before a hold takes the turn's
+    retry, where a stream that throws, and the hold a conversation agent's
+    compile meets, used to hold it first;
+  - a quiesce with `abandon: true` puts back the wakes merged into a held
+    retry's or a continuation's start that hadn't begun, as a caller's stop
+    through `abortInference()` does: they park under the quiesce and run at
+    resume. Under a quiesce, a held retry starts alone, and the wakes merged
+    into its start before the quiesce park until resume. An abandon of a budget
+    restart's start merged with other wakes used to drop those wakes with
+    it, so their messages went unanswered until something else woke the
+    agent.
+
+  A wake a hold keeps at admission, with no turn of its own begun, keeps no
+  turn alive, as before.
+
+- What an MCPL peer's content block carries in its other fields now
+  reaches a script with RFC-005's treatment at any depth, as the block
+  itself does: an RFC-005 reference there arrives as its stub's facts,
+  bound to that server and not fetched for the script (its `savedTo` is
+  null unless an earlier fetch saved that URI), one the classifier
+  rejects as its notice, and inline data that also claims a URI of any
+  type, an empty one included, or a disposition, as the withheld notice.
+  Before, such fields reached a script whole, references' URIs included.
+  `structuredContent` still reaches a script whole, from every tool, in
+  any result that can be converted to JSON.
+
+## 0.26.1 — 2026-10-23
+
+### Added
+
+- `HostModeStatus.activeTurnAgents` lists, sorted, the agents with a turn
+  alive, the ones `activeTurns` counts: each from its turn's dequeue to its
+  settled teardown, so a turn in its hooks or compile, one finishing its
+  deliveries, or one whose continuation is on its way to its start, is
+  listed. So a host can record which agents are mid-turn before it abandons
+  their turns or stops.
+
+### Changed
+
+- `stop()` ends a turn whose continuation hasn't started, as `shutdown`,
+  with the continuation dropped.
+- A budget restart's `inference:stream_restarted`, and its boundary's usage
+  report, now come after its continuation is queued and its stream
+  cancelled.
+  A restart boundary reached while the framework is stopping emits no
+  `inference:stream_restarted` and queues no continuation: the turn ends as
+  `shutdown`.
+
+### Fixed
+
+- A coalesced `push/event` or `channels/incoming` message whose receipt the
+  host couldn't write is no longer admitted again when the producer retries.
+  The failed write was answered "host could not persist the acceptance; retry"
+  after the occurrence's effects were in, and no receipt was kept. So each
+  retry was a fresh admission: a copy the agent had read arrived again, a
+  deferred notice rendered again, a deletion notice was appended again, and the
+  answer named the occurrence's own eventId as `priorEventId`. Now the receipt
+  is kept. A retry writes it again and makes it durable, then answers the first
+  result without repeating an effect, as RFC-006 §3.1 has a coalescing host
+  do. While the write keeps failing, each retry gets the same answer and
+  repeats nothing. A host killed before a later save and commit carried the
+  receipt still admits the retry as a new occurrence.
+- On `channels/incoming`, a coalesced message admitted whose receipt couldn't
+  be written or made durable was answered `accepted: false`, which says it
+  wasn't admitted, so a producer could hold it as never delivered. The request
+  is now answered with a -32000 error carrying the same message, since a
+  per-message result can only say a message was taken or wasn't, and the
+  messages after it in the request aren't admitted until they're sent again.
+  An uncoalesced message before it in the same request is admitted again when
+  the request is sent again. A retry of an admitted message while the host is
+  stopping fails the request the same way. A failure before any effect, such
+  as "host is stopping" for a new message, is still a per-message refusal.
+- A save of the coalescing state that fails is kept for the next save or the
+  host's stop, instead of being dropped until the state next changes.
+
+- A module's blocks in a script's `content` now get the treatment the
+  model's lanes give a module's result, as an MCPL peer's already did,
+  since what a script prints comes back to the model. Such blocks include
+  an MCPL peer's result that a module got through `ctx.callTool` and
+  returns whole. An RFC-005 reference anywhere in them, a `disposition:
+  "never"` one included, arrives without its URI, as the stub's facts an
+  MCPL peer's reference arrives as (`refId`, the labels the block gave,
+  `savedTo`). Inline data that also claims a URI, of any type, or a
+  disposition arrives as the withheld notice; a null or absent URI is
+  none, and in a module's result so is an empty one, as the model's
+  history reads it. A reference the classifier
+  rejects arrives as its notice; that includes an MCP-form embedded
+  resource, whose URI sits under `resource`, which the model's history
+  shows the same way, so a script no longer gets its text. Anything else
+  arrives as the module returned it. Before, a module's structured result
+  reached a script with its blocks as the module returned them,
+  references' URIs included. Which results are a module's is decided by
+  where the dispatch sent the call, not by the tool's name. An MCPL
+  peer's inline data beside a URI that isn't a string, such as an object,
+  now also reaches a script as the withheld notice. `structuredContent`
+  still reaches a script whole, from every tool, and so do fields a server
+  puts outside its content blocks' reference positions.
+
+- A turn whose continuation (a budget restart's, or a tool-result guard's
+  retry) is waiting to start now counts as alive. Between the turn's stream
+  ending and the continuation's start, a stretch that a provider wait stated
+  meanwhile makes as long as the wait, the host used to report `drained`, a
+  `quiesce()` returned drained and the continuation then started while the
+  host was quiesced, and `quiesce({ abandon: true })` found nothing to end.
+  Now `activeTurnAgents` lists the agent, a `quiesce()` waits for the
+  continuation's turn, and an abandon ends the turn with the continuation
+  dropped. A puppet tool call and a branch switch are refused in that
+  stretch, as during any live turn.
+- A turn whose continuation is dropped by an abandon, `stop()`, the
+  inference policy, the agent's removal or a conversation agent's disposal
+  now ends, with one `inference:aborted`. A drop other than an abandon or a
+  stop also releases the EventGate window held for the continuation,
+  closes the turn's logical turn and withholds the tool-result guard's
+  pending batch from later requests, as for a turn that ends before it
+  sends anything. A provider hold left empty by the drop releases without
+  queueing a retry turn. An ephemeral run that ends takes such a
+  continuation with it, its own end having ended the turn.
+
+## 0.26.0 — 2026-10-23
+
+### Breaking
+
+- **Hosts:** agent-framework now requires `@animalabs/membrane` ^0.7.1 (was
+  ^0.6.1) and `@animalabs/context-manager` ^0.20.0 (was ^0.19.0), which
+  admit no membrane 0.6.x. A host whose own membrane range is still ^0.6 gets
+  two membrane copies, and an error one copy builds isn't an instance of the
+  other's `MembraneError`, which the framework's error policy reads.
+  **Migration:** move the host to membrane ^0.7.1 with this release
+  (connectome-host 0.13.0 does). The framework calls through the `Membrane`
+  its host passes in, so membrane 0.7's retry changes reach its turns through
+  the host's retry config: since 0.7, membrane also retries on
+  `streamYielding()`, the turn path, inside each of the framework's own
+  attempts, and the framework's error policy retries above it as before.
+  **Unchanged:** the framework's error policy and what it does with a
+  failure that reaches it.
+
+### Fixed
+
+- A cut tool result's spill notice now survives every reader's per-message
+  cut while the turn, each result at its least, fits the bound, unless a
+  mount name past about seventy characters makes the notice longer than its
+  room, or results' notices differ in length (by call ids of different
+  lengths) and the turn passes the bound by that difference. Under a turn's
+  share of the bound, a result is at its least whole where it's no longer
+  than what its cut would store in its place, and otherwise as its notice
+  alone. 0.24.1 said the notice survived until a turn's notices alone filled
+  the bound, which wasn't true for a notice longer than its share: results
+  stored within their shares could leave it no room, and a result just past
+  its share was stored as a notice longer than the result. Now, in a turn
+  stored by its share, such a result is stored whole, and save_recent_image
+  counts the image slots it holds. A turn whose results fit the bound
+  together is stored as before, unless a save_recent_image in it had it
+  stored by its share only because such a result's slots differed: it's now
+  stored as each result would be alone, as other turns that fit are.
+- A spill notice's paging advice in a turn stored by its share is sized to
+  the inline cap that a later read of the file comes back under, alone in
+  its own turn, rather than to the share. Under a share below the notice's
+  room, the advice was to read one character at a time.
+
+## 0.25.0 — 2026-10-22
+
+### Breaking
+
+- **Agents, and whoever writes their prompts, where a mount holds a
+  directory named like the mount itself:** a `workspace--glob` pattern, or a
+  `workspace--grep` `glob` filter, whose first segment is that mount's name
+  is now read mount-prefixed in that mount, from its root and within
+  `path`, and no longer as written there. So a pattern written relative to
+  the mount, such as `work/z/*.ts` for the file the tools show as
+  `work/work/z/a.ts`, no longer finds that file. With a `path`, the same
+  goes for such a directory anywhere beneath it: `glob` with `path:
+  "notes/diary"` and `pattern: "notes/*.md"`, written relative to the path
+  for `notes/diary/notes/x.md`, no longer finds it. Where nothing else
+  matches, the agent gets an answer with no matches (`glob`'s
+  `"matches": []`, `grep`'s `"results": []`), not an error.
+  - **Migration:** write the path as the tools show it: `work/work/z/*.ts`
+    finds `work/work/z/a.ts`, and `notes/diary/notes/*.md` finds
+    `notes/diary/notes/x.md`, with that `path` or without one.
+  - **Unchanged:** in every other mount, and for a pattern whose first
+    segment names no mount, the pattern is still matched relative to the
+    mount (or to `path`).
+
+- **Script authors (`code_execution`):** a tool's text result now reaches a
+  script as that text, in its result's `content[0].text`, where it was the
+  text JSON-encoded. That covers every MCP tool whose result is text only,
+  and every module tool whose `data` is a string, without structured
+  content. A script saved before the upgrade meets the change too. Drop a
+  `JSON.parse` that only unquoted such a result. Where the text is itself
+  JSON, one `JSON.parse` now returns the data, so drop the second. A script
+  that read every result with `JSON.parse` can parse inside a `try` and
+  keep the text when it throws; a string whose text is itself JSON, such as
+  the text `123` or `true`, then reads as the value it spells. A result
+  whose data isn't a string, and a result with structured content, reach a
+  script as before.
+
+### Changed
+
+- Requires `@animalabs/context-manager` ^0.19.0 (was ^0.18.0) and
+  `@animalabs/membrane` ^0.6.1 (was ^0.6.0). context-manager 0.19.0 stores a
+  lone UTF-16 surrogate half in edits and state writes as U+FFFD, where it
+  left state the store couldn't read back, and fixes image-strip pricing;
+  its subclass-facing breaking changes are in its own notes. membrane 0.6.1
+  runs complete tool calls a provider returns under `stop_reason: end_turn`,
+  where 0.6.0 ended the turn without running them.
+
+- A tool result whose `data` is a string now reaches the model as that text.
+  It was JSON-encoded on the way, quoted with every newline, tab and quote
+  escaped, so a multi-line answer, such as a module tool's line-per-item
+  listing, arrived as one escaped line: in context, on the live wire, and in
+  its spill file under `tool-results/`, which `workspace--read` could then
+  page only by character and `workspace--grep` matched as a single line. A
+  spill file now holds the string as the tool returned it. Data that isn't a
+  string reaches the model as before.
+
+  Results stored before the upgrade keep the quoted text they were stored
+  with, so a conversation shows both forms until its older results leave
+  its context. A string is measured as its own text, so one whose JSON form
+  went over the inline cap while its text doesn't, such as a long listing
+  of short lines, now stays inline where it used to spill to a file. A lone
+  UTF-16 surrogate in the string, which JSON escaped, reads as U+FFFD. For
+  a result without an error, `data: ''` reads as an empty result, as
+  `data: undefined` already did.
+
+### Fixed
+
+- A tool presentation file holding `{}`, an object with no keys, is read as the empty document, as a missing presentation file already is. A description defaults file holding `{}` is read as one too, where a missing defaults file is still reported. Before, `{}` was refused for its missing `"version"` and `"tools"`, so every `set_tool_visibility` and `set_tool_description` call refused and the resident was told to ask whoever runs the host to repair the file, though `{}` is what an operator writes by hand to start one. A 0-byte file, and a document with only one of the two keys, are still refused. `parsePresentation('{}')` returns the empty document too, where it threw.
+
+- `workspace--glob` finds files from a mount-prefixed pattern, such as
+  `notes/diary/2026-10-13.md` or `project/src/**/*.ts`, as every other
+  workspace path is written and as its own results are returned. The pattern
+  was matched only against paths relative to the mount (or to `path`), so a
+  mount-prefixed one answered "no matches" for files that were there. When a
+  pattern's first segment names a mount, that mount now matches its rest from
+  the mount's root, in place of the pattern as written. Every other mount
+  still matches the pattern relative to the mount (or to `path`), so
+  `notes/*.md` still finds `project/notes/todo.md` beside the `notes` mount's
+  own files. In a mount holding a directory named like itself, this narrows
+  what a pattern written relative to the mount finds (see Breaking).
+  `workspace--grep`'s `glob` filter takes a mount-prefixed pattern the same
+  way. In both, a `**/` at the start of a path segment now matches zero or
+  more directories, as in other glob tools, so `project/src/**/*.ts` also finds `project/src/main.ts` and
+  `**/*.md` also finds the `.md` files at a mount's root; it used to need at
+  least one directory there. After a brace group whose alternatives each end a
+  directory, a `**/` matches zero or more directories, and so does a `**`
+  that ends an alternative before a `/`, so `{src/,lib/}**/*.ts` and
+  `{src/**,lib}/*.ts` find `src/main.ts`, as `src/**/*.ts` does. `glob`'s description and its `pattern`
+  parameter's description changed, and so did `grep`'s `glob` parameter's
+  description, so the first request after the upgrade that carries the
+  workspace's tools misses the prompt cache from its tool block on.
+
+- **The prose bounce-wake cap no longer latches.** A bounce wakes the resident
+  so it can resend, at most twice in a row, so a bounce → wake → bounce loop
+  ends. The count reset only when a prose envelope was delivered, so a
+  resident that recovered from bounces another way (a send tool, setting the
+  draft aside) kept the count across turns: from its third bounce on, a reply
+  to a fresh message bounced with no wake, and sat unseen until something
+  else woke the resident. The count now also resets when a turn starts with a
+  cause of its own (a channel message, a server event, a gate flush, a timer,
+  an operator nudge), in explicit and hybrid modes. A loop of bounce wakes
+  with no other cause is still capped at two.
+
+- What reaches a request without passing through the context store now carries a lone UTF-16 surrogate as U+FFFD, as the store keeps it (#695). That's a context injection's text and namespace, a hook's or a module's, and what a tool boundary injects into the live round: the messages it heard, with their senders' names, and its own notices. Before, every request an injection was in carried the lone half raw, and the API refuses such a request with a 400 ("The request body is not valid JSON: unexpected end of hex escape"). A namespace is still compared with channel ids as given when an injection is kept to its channel's conversation.
+
+- A lone UTF-16 surrogate in a tool result's text now reaches membrane as U+FFFD, as the context stores it (#695). Before, a text block's text, a reference's stub (from its `name`), an error result's text and the error text of a failure the tool doesn't flag went to membrane with the lone half raw, while the stored copy held U+FFFD. With the tool-result guard on (`toolResultGuard`), such a result left a stored message the context couldn't read back; with a text block or an error result, the agent's next turn sent no request and `stop()` threw. This change doesn't repair a store that already holds such a message.
+
+## 0.24.1 — 2026-10-22
+
+### Added
+
+- **Clock rows** (`AgentConfig.clock`, off by default): with
+  `clock: { intervalMinutes: 10 }` (or `intervalSeconds`, and `precision:
+  'minutes' | 'seconds'`), an agent's window takes a `Clock: 10:50
+  Europe/Berlin (UTC+02:00)` row whenever a boundary of that interval on its
+  local wall clock (from local midnight, in the framework's `timeZone`) has
+  passed since its last clock: before an incoming event, at a fresh turn's
+  start (a silent heartbeat tick included), and mid-turn after a tool
+  round's results, where it also joins the live stream as an injected
+  message (not on a stream that can't carry injected messages, such as
+  membrane's XML prefill path: there the next event or turn start writes
+  it). Only the latest boundary is written, and a window that holds no
+  clock row yet, a conversation fork's seeded one included, takes one at the
+  next of these. A clock reads the boundary's time where that tick would have
+  stood, else the time it is written (after a tool round or a reply that
+  spanned the boundary), so it never reads earlier than a row before it; it
+  shows the weekday and date when the day has changed since the last clock.
+  Clock rows are `system: true`, `kind: 'clock'`, with `metadata.clock: {
+  at, onBoundary, zone }`; they wake no one, move no routing locus and clear
+  no send suppression. None is written while the host is quiesced, or into
+  the residents' shared slot while another of its readers has a turn alive.
+  Residents share one window, so every resident reads the clock rows any of
+  them writes, one with no `clock` of its own included; each writes one when
+  a boundary of its own interval has passed since the window's last clock.
+  The subconscious takes none of its own. On some models a clock after a
+  tool's results drops the loop's earlier thinking from the request, as any
+  message heard while acting does there, at most once an interval. An
+  invalid `clock` setting makes `AgentFramework.create` throw, naming the
+  agent. `resolveClockConfig` (the validation `create` runs, for a host
+  checking a recipe up front), `CLOCK_ROW_KIND` and the `ClockConfig` /
+  `ClockStamp` / `ResolvedClockConfig` types are exported.
+
+### Changed
+
+- The workspace's `edit` and `edit_many` refuse a file the workspace holds
+  when the check of disk before them decided nothing, because the selected
+  branch kept changing while it ran. They store nothing, and say so, with
+  that reason and to make the same call again. Before, they applied to the
+  workspace's copy without a word, so where disk had changed they edited
+  text disk had moved past and left the path in conflict, and they committed
+  on whichever branch was selected when the check gave up. Where disk's copy
+  couldn't be read, an `edit` or `edit_many` still applies to the
+  workspace's copy and says so.
+
+- A cut tool result's spill notice, which names the workspace file holding
+  the rest, now survives every reader's per-message cut until a turn's
+  notices alone fill the bound, or a mount name past about seventy
+  characters makes the notice longer than its room. Past six results at a
+  bound of 4,000, or 62 at 40,000, a turn's share is under the notice's
+  room, so each result longer than its share is stored as its notice alone,
+  with no head; where a workspace is writable, its file holds the whole
+  result. Past about 11 results at 4,000, or 119 at 40,000, the notices
+  themselves pass the bound, and the reader's cut takes the later ones. An
+  ordinary
+  resident's inline cap is at most the smallest per-message bound among the
+  agents that read the shared slot, and `agent_settings` get reports a cap
+  set by another reader's bound as
+  `tool_result_inline_max_chars_clamped_by: "reader-bound"`. Where a cut
+  result's stored copy, notice and kept image slots included, would pass
+  that bound, its head moves back until it fits, and image slots that still
+  don't fit keep the newest. A reader's strategy spends its bound across a
+  message, and a turn's results are stored as one message, so where they
+  pass the bound together, which used to cut or leave out a later result
+  silently, each now takes an equal share of it. A turn whose results fit is
+  stored as each result would be alone, unless a `save_recent_image` in it
+  counted a result whose kept image slots the share would change: that turn
+  is stored by its share, so the images the save counted are the ones
+  stored. A withheld turn under a bound, whether or not its results fit,
+  cuts each stub's kept fields within its share less the notice's room, so
+  every stub's notice and place survive the reader's cut too, under a note
+  that now reads
+  `[cut: N of these fields' M characters; …]`; under a share of about 640
+  characters or less a stub keeps a single character of its fields. The
+  notice offers raising the inline cap only where a cap at the bound would
+  keep more of the result, and a stored copy that leaves out every image
+  slot past its cut says so.
+
+### Fixed
+
+- The workspace's `delete`, `edit` and `edit_many`, and its `readBinary`
+  method, no longer answer "File not found" for a path the workspace doesn't
+  hold when the check of disk before them decided nothing, because the
+  selected branch kept changing while it ran. Each now says that disk
+  couldn't be checked, with that reason, and to make the same call again.
+  Before, they answered "File not found" even when disk held the file
+  (#552). `readBinary` also gives `delete`'s answer for every other path the
+  workspace doesn't hold, such as one whose disk copy couldn't be read, where
+  it said "File not found" whatever the reason.
+
+- `channel_close` refuses a channel that's tuned out, as `channel_open` and
+  `channel_decline` do, and says to cancel the tune-out with `tune_out` mode
+  "cancel", which delivers what it diverted (#633). The channel can be closed
+  after that. Until now the close answered success and ended the tune-out
+  without its cancel, so its diverted backlog never reached the agent, and a
+  later cancel found nothing to cancel. A module's close, such as one that
+  certifies an idle lease (`overrideExplicitOpen`), is refused the same way,
+  with `isError: false` and `data.refusal` `'tuned-out'`, so it can stand
+  down as it does on the explicit-open refusal. A close that a tune-out
+  overtook now answers in the refusal's words, and a decline that one
+  overtook says to cancel the tune-out before calling `channel_close`.
+  Before, both said to call `channel_close`, which now refuses it.
+- A tune-out on record where the host has no tune-out coordinator, at a
+  start with no subconscious or when a start with no servers connects its
+  first one, now ends as the channels come up, and its channel is decided
+  open again, as a cancel leaves it, still the agent's decision. A log line
+  names the channel and says how many of the messages the tune-out diverted
+  are held, which nothing will deliver as its backlog. Before, nothing
+  diverted the channel's traffic or could cancel the tune-out, `tune_out`
+  wasn't offered, and `channel_open`, `channel_decline` and now
+  `channel_close` refused the channel, so its decision couldn't change.
+
+- A modern MCP server whose `requestTimeoutMs` is a value `String()` can't
+  print, such as `{"toString": 1}`, which a JSON configuration can hold, is
+  now refused like any other wrong deadline, with the value shown as
+  `[a value that cannot be printed]`. Before, checking the configuration
+  threw a `TypeError` instead: connecting to the server failed with that
+  error's text, and `listMcplServers` threw rather than list any server.
+
+- A message that arrives during a turn's tool call is injected into the
+  live stream as the next compile would send it, where it was injected
+  whole. The agent's strategy renders the boundary's messages as the newest
+  of its window (context-manager's `renderAsNewest`): cut by the
+  per-message cap, a sharded body joined, and its images as the image
+  limits leave them, counted newest-first across the batch. So the next
+  turn's request matches what the live rounds carried, and its prompt cache
+  holds, where a message over `maxMessageTokens`, or with more images than
+  `maxLiveImages`, made the next request differ there. A message that
+  arrives later can still take an injected one past an image limit, as it
+  can any message. A message the next compile won't send among its newest,
+  such as one in a batch bigger than the memory strategy's recent window,
+  isn't injected, and a log line names it. In its place a stored system
+  line after the batch, `[not shown]`, tells the agent who sent it, its
+  size in characters and images, and the `history--extract` call that reads
+  it, or its id where the agent isn't shown that tool. It names the agent
+  it's for, since residents sharing a slot read it too. Where that boundary
+  marks what it stored as read, the message counts as read with it, so a
+  coalesced render's wake to read it is dropped and a release doesn't pass
+  it to the primary. A strategy without `renderAsNewest`, or a render that
+  throws, which is logged, gets the message as stored, as before.
+
 ## 0.24.0 — 2026-10-22
 
 ### Breaking

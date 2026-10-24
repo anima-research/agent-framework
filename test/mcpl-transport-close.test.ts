@@ -476,12 +476,12 @@ test("after a transport closes and reconnects, channel_open asks the server agai
   // transport; the server hasn't registered its channels again yet.
   connection.transportEpoch++;
   connection.emit('close', null, null, { transport: 'stdio', code: null, signal: null, byHost: false });
-  assert.equal(registry.isChannelOpen('x'), false, "the closed transport's confirmation went with it");
+  assert.equal(registry.isChannelOpen({ serverId: 'srv', channelId: 'x' }), false, "the closed transport's confirmation went with it");
   connection.transportEpoch++;
   sent.length = 0;
   assert.notEqual((await open()).status, 'already open');
   assert.deepEqual(sent, ['open x on transport 2'], 'the open goes to the new transport');
-  assert.equal(registry.isChannelOpen('x'), true, "the new transport's receipt confirms it");
+  assert.equal(registry.isChannelOpen({ serverId: 'srv', channelId: 'x' }), true, "the new transport's receipt confirms it");
 });
 
 test("a server that stops reading its stdin without closing it stays connected, and a request ends at its own timeout", { timeout: 20_000 }, async (t) => {

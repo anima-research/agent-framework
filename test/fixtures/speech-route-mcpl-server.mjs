@@ -2,7 +2,8 @@
 //
 // Registers the channels in CHANNELS (JSON array of {id,label}; two Discord
 // guild channels by default) and, on command, sends inbound traffic over
-// BOTH MCPL lanes. The TEST appends one JSON object per line to COMMAND_PATH:
+// BOTH MCPL lanes. The TEST appends one JSON object per line to COMMAND_PATH,
+// each acted on once its newline is written (writtenLines):
 //   {"op":"incoming","channelId":…,"messageId":…,"mode":"ambient"|"addressed",
 //    "text":…, "threadId"?, "metadata"?, "eventId"?, "coalesce"?}
 //   {"op":"dm","eventId":…,"authorId":…,"authorName"?,"rawChannelId":…,"text":…,
@@ -14,7 +15,8 @@
 //   {"op":"history","channelId":…,"history":[ChannelIncomingMessage…]}
 // Host-side channels/publish and channels/open calls are recorded to
 // STATUS_PATH as JSONL ({event:'publish', channelId, text, messageId}).
-import { appendFileSync, existsSync, readFileSync } from 'node:fs';
+import { appendFileSync } from 'node:fs';
+import { writtenLines } from './command-lines.mjs';
 import { createInterface } from 'node:readline';
 
 const statusPath = process.env.STATUS_PATH;
@@ -44,8 +46,7 @@ const histories = new Map();
 const textBlock = (text) => [{ type: 'text', text }];
 
 function pollCommands() {
-  if (!commandPath || !existsSync(commandPath)) return;
-  const lines = readFileSync(commandPath, 'utf8').split('\n').filter(Boolean);
+  const lines = writtenLines(commandPath);
   for (const line of lines.slice(processedCommands)) {
     processedCommands++;
     const c = JSON.parse(line);
@@ -132,6 +133,7 @@ function pollCommands() {
     }
   }
 }
+// publish-outcome's two-part pin pauses four of these between a line's parts.
 const pollTimer = setInterval(pollCommands, 25);
 
 const rl = createInterface({ input: process.stdin });
