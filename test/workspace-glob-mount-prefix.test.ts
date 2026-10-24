@@ -53,9 +53,14 @@ function setup(t: TestContext, extra: Record<string, string> = {}) {
   const grepFiles = async (input: Record<string, unknown>) => {
     const r = await workspace.handleToolCall({ id: 'r', name: 'grep', input });
     assert.equal(r.success, true, JSON.stringify(r));
-    return ((r.data as { results: Array<{ file: string }> }).results).map((x) => x.file).sort();
+    return ((r.structured as { results: Array<{ file: string }> }).results).map((x) => x.file).sort();
   };
-  return { glob, grepFiles };
+  const refusal = async (name: 'glob' | 'grep', input: Record<string, unknown>) => {
+    const r = await workspace.handleToolCall({ id: 'x', name, input });
+    assert.equal(r.success, false, JSON.stringify(r));
+    return String(r.error);
+  };
+  return { glob, grepFiles, refusal };
 }
 
 test('a mount-prefixed pattern naming one file finds it', async (t) => {
@@ -98,7 +103,7 @@ test('a first segment that is a brace group or a wildcard names no mount', async
 });
 
 test("with a path, a pattern naming the path's mount reads mount-prefixed, within the path", async (t) => {
-  const { glob, grepFiles } = setup(t, { 'notes/drafts/one.md': 'one', 'notes/diary/notes1': 'a note', 'notes/diary/notes/x.md': 'x' });
+  const { glob, grepFiles, refusal } = setup(t, { 'notes/drafts/one.md': 'one', 'notes/diary/notes1': 'a note', 'notes/diary/notes/x.md': 'x' });
   const diary = ['notes/diary/2026-10-12.md', 'notes/diary/2026-10-13.md', 'notes/diary/notes/x.md'];
   assert.deepEqual(await glob({ path: 'notes/diary', pattern: 'notes/**/*.md' }), diary);
   // notes/README.md lies outside the path, and so does notes/drafts. And a
@@ -107,7 +112,12 @@ test("with a path, a pattern naming the path's mount reads mount-prefixed, withi
   assert.deepEqual(await glob({ path: 'notes/diary', pattern: 'notes/*.md' }), []);
   assert.deepEqual(await glob({ path: 'notes/diary', pattern: 'notes/diary/notes/*.md' }), ['notes/diary/notes/x.md']);
   assert.deepEqual(await glob({ pattern: 'notes/diary/notes/*.md' }), ['notes/diary/notes/x.md']);
-  assert.deepEqual(await glob({ path: 'notes/diary', pattern: 'notes/drafts/*.md' }), []);
+  // notes/drafts lies apart from the path, so no file could match: the glob
+  // is refused, naming the pattern that reaches beneath the path.
+  assert.equal(
+    await refusal('glob', { path: 'notes/diary', pattern: 'notes/drafts/*.md' }),
+    'The glob did nothing: its pattern "notes/drafts/*.md" is read mount-prefixed, from the root of mount "notes", so no file within "notes/diary" matches it. To match beneath it, write "notes/diary/drafts/*.md".',
+  );
   assert.deepEqual(await grepFiles({ pattern: 'entry', path: 'notes/diary', glob: 'notes/diary/*-13.md' }), ['notes/diary/2026-10-13.md']);
   assert.deepEqual(await grepFiles({ pattern: 'readme', glob: 'notes/*.md' }), ['notes/README.md']);
   assert.deepEqual(await grepFiles({ pattern: 'readme', path: 'notes/diary', glob: 'notes/*.md' }), []);

@@ -18,7 +18,7 @@ import { join } from 'node:path';
 const WORKSPACE = new URL('../src/modules/workspace/index.js', import.meta.url).href;
 const HANG_GUARD_MS = 60_000;
 
-interface Answer { success: boolean; isError?: boolean; error?: string; data?: unknown }
+interface Answer { success: boolean; isError?: boolean; error?: string; data?: unknown; structured?: unknown }
 
 /** One workspace tool call, made in a child process against a mount `project`
  *  holding `src/a.ts`, `src/c.ts` and `lib/b.ts`. Returns its result, or null
@@ -118,7 +118,7 @@ test('groups that close still match, each by its own braces (control)', () => {
   assert.ok(grep, `grep with the glob "{src,lib}/{a,b}.ts" didn't answer within ${HANG_GUARD_MS / 1000} s`);
   assert.equal(grep.success, true, JSON.stringify(grep));
   assert.deepEqual(
-    (grep.data as { results: Array<{ file: string }> }).results.map((r) => r.file).sort(),
+    (grep.structured as { results: Array<{ file: string }> }).results.map((r) => r.file).sort(),
     ['project/lib/b.ts', 'project/src/a.ts'],
   );
 });

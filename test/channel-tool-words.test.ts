@@ -20,8 +20,7 @@ import type { FeatureSetManager } from '../src/mcpl/feature-set-manager.js';
 interface Internals {
   channelRegistry: unknown;
   agents: Map<string, unknown>;
-  conversationRouter?: { touch(channelId: string, now?: number): void; getBinding(channelId: string): unknown };
-  conversationAgentHomes: Map<string, string>;
+  conversationRouter?: { touch(channel: { serverId: string; channelId: string }, now?: number): void; getBinding(channel: { serverId: string; channelId: string }): unknown };
   lastConversationSweep: number;
   sweepExpiredConversations(): void;
   getToolsForAgent(agentName: string): Array<{ name: string; description?: string }>;
@@ -138,13 +137,13 @@ describe("channel_open and channel_close's words follow whether the agent's wind
       assert.deepEqual(words(internals(framework).getToolsForAgent(fork)), HOLDER);
       // The idle sweep unbinds a fork before its closure turn. Its words don't change for that one turn, which would
       // send its whole window uncached: the closure turn's request carries the registry's.
-      internals(framework).conversationRouter!.touch('slack:C1', 0);
+      internals(framework).conversationRouter!.touch({ serverId: 'srv', channelId: 'slack:C1' }, 0);
       internals(framework).lastConversationSweep = 0;
       membrane.pushResponse(createMockResponse([{ type: 'text', text: 'bye' }]));
       const before = membrane.calls.length;
       internals(framework).sweepExpiredConversations();
       await framework.runUntilIdle();
-      assert.equal(internals(framework).conversationRouter!.getBinding('slack:C1'), undefined, 'the sweep unbound the home');
+      assert.equal(internals(framework).conversationRouter!.getBinding({ serverId: 'srv', channelId: 'slack:C1' }), undefined, 'the sweep unbound the home');
       const sent = membrane.calls.slice(before) as unknown as Array<{ tools?: Array<{ name: string; description?: string }> }>;
       assert.equal(sent.length, 1, 'the closure turn was the one request');
       assert.deepEqual(words(sent[0]!.tools ?? []), HOLDER);

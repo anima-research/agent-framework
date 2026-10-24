@@ -17,7 +17,7 @@ import { join } from 'node:path';
 
 import { AgentFramework } from '../src/index.js';
 import type { PublishRefusalReason } from '../src/index.js';
-import { ChannelRegistry } from '../src/mcpl/channel-registry.js';
+import { ChannelRegistry, destinationKey } from '../src/mcpl/channel-registry.js';
 import { CapabilityGrant, ALL_CAPABILITY_PATHS } from '../src/mcpl/capability-grant.js';
 import { McplRequestError } from '../src/mcpl/server-connection.js';
 import type { McplServerRegistry } from '../src/mcpl/server-registry.js';
@@ -94,7 +94,8 @@ test('a channel tool that can\'t find the channel says what finds it', async () 
   assert.equal((await f.call('channel_close', { channelId: 'nope', serverId: 'a' })).error,
     'No channel "nope" is on server "a", so nothing ran. channel_list shows the channels and their servers.');
   assert.equal((await f.call('channel_decline', { channelId: 'both', messageId: 'm1' })).error,
-    'Channel "both" is on more than one server ("b", "c"), so nothing ran. Call again with serverId set to one of them.');
+    'Channel "both" is on more than one server ("b:both", "c:both"), so nothing ran. ' +
+    'Call again with channelId set to one of them, or with serverId set to "b" or "c".');
   const unknown = await f.call('channel_frobnicate', {});
   assert.equal(unknown.isError, true);
   assert.equal(unknown.error, 'There\'s no channel tool "channel_frobnicate", so nothing ran. Use one of the channel tools you were given.');
@@ -294,7 +295,8 @@ test('a channel_open or channel_close that a later decision overtook says which 
   f.registry.enterTuneOut('a', 'y', { epochId: 'e1', cadenceSeconds: 60, backlogCap: 10, maxWakes: 3, startedAtSequence: 0 }, 'agent-tool');
   await answer();
   assert.equal((await openingY).error, 'Channel "y" was tuned out meanwhile: its messages go to the subconscious, and channel_open ' +
-    'doesn\'t change that. Call tune_out with channelId "y" and mode "cancel" for it to resume normal attention.');
+    'doesn\'t change that. Call tune_out with channelId "y" and mode "cancel" for it to resume normal attention; ' +
+    'cancelling delivers the diverted backlog.');
 
   // And a close it overtook says so too.
   server.sendChannelsOpen = async ({ channelId }) => ({ channel: descriptor(channelId) });
@@ -386,7 +388,7 @@ test('a granted server\'s channels open, close and take speech while this host i
   f.connecting.add('a');
   assert.equal((await f.call('channel_open', { channelId: 'x' })).success, true);
   assert.equal((await f.call('channel_publish', { channelId: 'x', content: 'hi' })).success, true);
-  assert.equal((await f.registry.routeSpeech('agent', 'hello', 'x'))?.delivered, true);
+  assert.equal((await f.registry.routeSpeech('agent', 'hello', { serverId: 'a', channelId: 'x' }))?.delivered, true);
   assert.equal((await f.call('channel_close', { channelId: 'x' })).success, true);
   assert.deepEqual(f.failures, []);
 });
@@ -442,7 +444,7 @@ test('a send to a server that isn\'t up, or isn\'t permitted, says why in the sa
     assert.equal(forAgent.error, `Nothing was posted to channel "x": ${reason}.`);
     assert.equal(forAgent.reason, refusal, reason);
     f.failures.length = 0;
-    assert.equal(await f.registry.routeSpeech('agent', 'hello', 'x'), null);
+    assert.equal(await f.registry.routeSpeech('agent', 'hello', { serverId: 'a', channelId: 'x' }), null);
     assert.deepEqual(f.failures.map((failure) => failure.reason), [reason], 'speech gives the same reason');
   }
 });
@@ -465,7 +467,7 @@ test('speech that has to open its channel says why the open didn\'t happen, and 
   f.servers.set('a', up(['channels.lifecycle']));
   const failed = async () => {
     f.failures.length = 0;
-    assert.equal(await f.registry.routeSpeech('agent', 'hello', 'x'), null);
+    assert.equal(await f.registry.routeSpeech('agent', 'hello', { serverId: 'a', channelId: 'x' }), null);
     return f.failures.map((failure) => failure.reason);
   };
   assert.deepEqual(await failed(), ['opening the channel for these words didn\'t complete: this host isn\'t permitted to open or ' +
@@ -488,7 +490,7 @@ test('words that waited for lifecycle work the server dropped during say what he
   for (let i = 0; i < 50 && answers.length === 0; i++) await tick();
   assert.equal(answers.length, 1, 'the first open went out');
   const second = f.call('channel_open', { channelId: 'x' });
-  const speech = f.registry.routeSpeech('agent', 'hello', 'x');
+  const speech = f.registry.routeSpeech('agent', 'hello', { serverId: 'a', channelId: 'x' });
   await tick();
   // The server drops: the held open gets no answer, and the next finds it down.
   f.servers.set('a', down(true));
@@ -1167,7 +1169,7 @@ test('a decline whose channel stops being registered while its close is out offe
       // it's left running and awaited once that close is answered.
       registering = f.registry.handleRegister('a', { channels: [descriptor('y')] });
       for (let i = 0; i < 5; i++) await tick();
-      assert.equal(f.registry.getChannelServerId('y'), 'a', 'y is registered again while the close is out');
+      assert.ok(f.registry.getDescriptor({ serverId: 'a', channelId: 'y' }), 'y is registered again while the close is out');
     }, 'its registration went and came back while the close was out. Other work for it that\'s still under way applies the ' +
       'decline when its turn comes, so there\'s no need to decline again to close it', retry],
   ];
@@ -1260,7 +1262,7 @@ test('words whose open completed, then met a close decided while later work held
     for (let i = 0; i < 50 && answers.length < count; i++) await tick();
     assert.equal(answers.length, count, 'the open went out');
   };
-  const speech = f.registry.routeSpeech('agent', 'hello', 'x');
+  const speech = f.registry.routeSpeech('agent', 'hello', { serverId: 'a', channelId: 'x' });
   await sent(1);
   const backscroll = f.call('channel_open', { channelId: 'x', backscroll: 5 });
   answers.shift()!();
@@ -1291,7 +1293,7 @@ test('words checked against a connection the registry replaced while they waited
     const opening = f.call('channel_open', { channelId: 'x' });
     for (let i = 0; i < 50 && answers.length === 0; i++) await tick();
     // The words wait for the open, checked against the connection then.
-    const speech = f.registry.routeSpeech('agent', 'hello', 'x');
+    const speech = f.registry.routeSpeech('agent', 'hello', { serverId: 'a', channelId: 'x' });
     await tick();
     // The replacement takes the old connection's place, whose grant goes
     // with it, as a closed connection's does; it answers the open's retry.
@@ -1330,12 +1332,12 @@ test('a channel tool on a server this host is connecting to says so, from the fr
       await new Promise((resolve) => setTimeout(resolve, 10));
     }
     const registry = internals.channelRegistry!;
-    (registry as unknown as { channels: Map<string, unknown> }).channels.set('slow:c1', { serverId: 'slow', descriptor: descriptor('c1'), open: false });
+    (registry as unknown as { channels: Map<string, unknown> }).channels.set(destinationKey({ serverId: 'slow', channelId: 'c1' }), { serverId: 'slow', descriptor: descriptor('c1'), open: false });
     const publish = () => registry.handleChannelToolCall('channel_publish', { channelId: 'c1', content: 'hi' });
     assert.equal((await publish()).error, 'Nothing was posted to channel "c1": this host is connecting to the "slow" server, so try again in a moment.');
     await framework.disconnectMcplServer('slow');
     await connect;
-    (registry as unknown as { channels: Map<string, unknown> }).channels.set('slow:c1', { serverId: 'slow', descriptor: descriptor('c1'), open: false });
+    (registry as unknown as { channels: Map<string, unknown> }).channels.set(destinationKey({ serverId: 'slow', channelId: 'c1' }), { serverId: 'slow', descriptor: descriptor('c1'), open: false });
     assert.equal((await publish()).error, 'Nothing was posted to channel "c1": the "slow" server isn\'t connected, and this host ' +
       'won\'t reconnect to it on its own; if you need it, ask whoever runs this host.');
   } finally {
@@ -1366,7 +1368,7 @@ test('a registered server reads as connecting while the policy exchange of the t
     const connection = { id: 'cold', grant: CapabilityGrant.empty(), isConnected: true, transportEpoch: 2 };
     internals.mcplServerRegistry!.servers.set('cold', connection);
     const registry = internals.channelRegistry!;
-    (registry as unknown as { channels: Map<string, unknown> }).channels.set('cold:c1', { serverId: 'cold', descriptor: descriptor('c1'), open: true });
+    (registry as unknown as { channels: Map<string, unknown> }).channels.set(destinationKey({ serverId: 'cold', channelId: 'c1' }), { serverId: 'cold', descriptor: descriptor('c1'), open: true });
     const publish = async () => (await registry.handleChannelToolCall('channel_publish', { channelId: 'c1', content: 'hi' })).error;
     const notPermitted = 'Nothing was posted to channel "c1": this host isn\'t permitted to post to the "cold" server\'s channels, ' +
       'and trying again won\'t change that; if you need it, ask whoever runs this host.';
@@ -1384,7 +1386,7 @@ test('a registered server reads as connecting while the policy exchange of the t
     claims.ids.set('cold', { restarting: 'cold' });
     assert.equal(await publish(), 'Nothing was posted to channel "c1": this host is connecting to the "cold" server, so try again in a moment.');
     claims.ids.delete('cold');
-    (registry as unknown as { channels: Map<string, unknown> }).channels.set('away:c2', { serverId: 'away', descriptor: descriptor('c2'), open: true });
+    (registry as unknown as { channels: Map<string, unknown> }).channels.set(destinationKey({ serverId: 'away', channelId: 'c2' }), { serverId: 'away', descriptor: descriptor('c2'), open: true });
     const publishAway = async () => (await registry.handleChannelToolCall('channel_publish', { channelId: 'c2', content: 'hi' })).error;
     assert.equal(await publishAway(), 'Nothing was posted to channel "c2": the "away" server isn\'t connected, and this host won\'t ' +
       'reconnect to it on its own; if you need it, ask whoever runs this host.');

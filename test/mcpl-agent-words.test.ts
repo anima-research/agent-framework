@@ -566,7 +566,7 @@ test("an MCPL tool's error result with no words says so, and that its effect is 
 
 test("a conversation bound to its channel is told it can't open another, and where to reply", () => {
   const { framework, events } = frameworkWith(null);
-  framework.registry = { homeChannel: (name: string) => (name === 'fork' ? 'home-1' : undefined), list: () => [] };
+  framework.registry = { homeChannel: (name: string) => (name === 'fork' ? { serverId: 'srv', channelId: 'home-1' } : undefined), list: () => [] };
   framework.toolLifecycleEmitter = undefined;
   framework.dispatchChannelToolCall('fork', { id: 'c1', name: 'channel_open', input: { channelId: 'elsewhere' } });
   assert.equal(events[0]?.result?.error,

@@ -14,7 +14,7 @@ import type {
   ToolDefinition,
   ToolResult,
 } from '../src/index.js';
-import { ChannelRegistry } from '../src/mcpl/channel-registry.js';
+import { ChannelRegistry, destinationKey, type ChannelRef } from '../src/mcpl/channel-registry.js';
 import { CapabilityGrant, ALL_CAPABILITY_PATHS } from '../src/mcpl/capability-grant.js';
 import { MockMembrane, createMockResponse } from './helpers/mock-membrane.js';
 import { bindAsConversationFork, homeChannelOf } from './helpers/dendrite.js';
@@ -87,13 +87,16 @@ function installChannelRegistry(
     () => {},
     () => {},
     {
-      homeChannelResolver: (agentName) => homeChannelOf(framework, agentName),
+      homeChannelResolver: (agentName) => {
+        const home = homeChannelOf(framework, agentName);
+        return typeof home === 'string' ? undefined : home;
+      },
     },
   );
   for (const channelId of channelIds) {
     // §14.5: register first (a conforming server's channels/register),
     // then the incoming message marks the registered channel open.
-    (registry as unknown as { channels: Map<string, unknown> }).channels.set(`srv:${channelId}`, {
+    (registry as unknown as { channels: Map<string, unknown> }).channels.set(destinationKey({ serverId: 'srv', channelId }), {
       serverId: 'srv', descriptor: { id: channelId, type: 'srv', label: channelId }, open: false,
     });
     registry.handleIncoming('srv', {
@@ -111,7 +114,7 @@ function installChannelRegistry(
 }
 
 function bindForkHome(framework: AgentFramework, agentName = FORK_AGENT, channelId = 'chanA'): void {
-  bindAsConversationFork(framework, agentName, channelId);
+  bindAsConversationFork(framework, agentName, { serverId: 'srv', channelId });
 }
 
 function installHookInjections(framework: AgentFramework, injections: ContextInjection[]): void {
@@ -176,6 +179,9 @@ describe('conversation fork injection scoping', () => {
       systemInjection('module chanB context', 'chanB'),
       systemInjection('module retrieval context', 'retrieval'),
       systemInjection('module unnamespaced context'),
+      // A namespace that is a registered channel's server-qualified name, not
+      // its id: channel context is namespaced by id, so it's kept.
+      systemInjection('module qualified-name context', 'srv:chanB'),
     ], [FORK_AGENT]);
     installChannelRegistry(framework);
     bindForkHome(framework);
@@ -194,6 +200,7 @@ describe('conversation fork injection scoping', () => {
     assertOmits(system, 'module chanB context');
     assertContains(system, 'module retrieval context');
     assertContains(system, 'module unnamespaced context');
+    assertContains(system, 'module qualified-name context');
     assertContains(system, 'hook chanA context');
     assertOmits(system, 'hook chanB context');
     assertContains(system, 'hook retrieval context');
@@ -301,7 +308,7 @@ describe('conversation fork injection scoping', () => {
     ], []);
     const registry = installChannelRegistry(framework);
     // chanC is registered and was never opened.
-    (registry as unknown as { channels: Map<string, unknown> }).channels.set('srv:chanC', {
+    (registry as unknown as { channels: Map<string, unknown> }).channels.set(destinationKey({ serverId: 'srv', channelId: 'chanC' }), {
       serverId: 'srv', descriptor: { id: 'chanC', type: 'srv', label: 'chanC' }, open: false,
     });
     // The server's transport closes: chanA and chanB are unconfirmed now.

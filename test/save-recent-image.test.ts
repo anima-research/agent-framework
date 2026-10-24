@@ -156,6 +156,7 @@ class SnapModule implements Module {
       { name: 'mid_slot', description: 'Text with an attachment line inside the cap.', inputSchema: schema },
       { name: 'near_slot', description: 'Text within the cap, with an attachment line near its end.', inputSchema: schema },
       { name: 'snap_listed', description: 'Text, a snapshot, then 24 attachment lines.', inputSchema: schema },
+      { name: 'snap_noted', description: 'A short note, then a picture.', inputSchema: schema },
       { name: 'quiet_failure', description: 'A failure not flagged as an error.', inputSchema: schema },
       { name: 'loud_failure', description: 'An error result.', inputSchema: schema },
     ];
@@ -212,6 +213,8 @@ class SnapModule implements Module {
         return { success: true, data: [{ type: 'text', text: MID_SLOT_TEXT }] };
       case 'near_slot':
         return { success: true, data: [{ type: 'text', text: NEAR_SLOT_TEXT }] };
+      case 'snap_noted':
+        return { success: true, data: [{ type: 'text', text: 'n'.repeat(290) }, png] };
       case 'snap_listed':
         return { success: true, data: [{ type: 'text', text: 'x'.repeat(3000) }, png, { type: 'text', text: LISTING_24 }] };
       case 'quiet_failure':
@@ -1430,6 +1433,106 @@ describe('save_recent_image provenance (issue #104)', () => {
       const receipt = saved(await waitForToolResult(h.framework, 'call_save_batch'));
       assert.strictEqual(receipt[0]!.source, 'attachment');
       assert.strictEqual(receipt[0]!.sha256, sha(GIF));
+    } finally {
+      await h.framework.stop();
+      rmSync(h.tempDir, { recursive: true, force: true });
+    }
+  });
+
+  it("a save in its batch counts a result no longer than its notice as stored whole, as its share stores it", async () => {
+    const h = await startTurn({
+      prefix: 'sri-short-share-',
+      inlineCap: 1000,
+      inlineBound: 100,
+      responses: [
+        [
+          { type: 'tool_use', id: 'call_snap', name: 'world--snap', input: {} } as ContentBlock,
+          saveCall('call_save_batch', { path: 'files/batch.png', index: 0 }),
+        ],
+        done,
+      ],
+    });
+    try {
+      // Beside the save its share is 50, under the snapshot's text, and the
+      // notice a cut would store in its place is longer than the text, so
+      // it is stored whole, its image slot with it. The save, counted
+      // before the commit, counts it the same way: index 0 is the snapshot.
+      const stored = await waitForToolResult(h.framework, 'call_snap');
+      assert.match(stored.content, /^watchtower, facing north/);
+      assert.doesNotMatch(stored.content, /truncated/);
+      assert.equal(parseImagePlaceholders(stored.content).length, 1);
+      // The save's own receipt is past its share too, so its bytes are read
+      // from the file it wrote.
+      await waitForToolResult(h.framework, 'call_save_batch');
+      const bytes = await fileBytes(h, 'files/batch.png');
+      assert.ok(bytes, 'the save wrote its file');
+      assert.strictEqual(sha(bytes), sha(PNG));
+    } finally {
+      await h.framework.stop();
+      rmSync(h.tempDir, { recursive: true, force: true });
+    }
+  });
+
+  it("under a share, an image result no longer than its notice and the note on its left-out slot is stored whole", async () => {
+    const h = await startTurn({
+      prefix: 'sri-noted-share-',
+      inlineCap: 1000,
+      inlineBound: 600,
+      responses: [
+        [
+          { type: 'tool_use', id: 'call_noted', name: 'world--snap_noted', input: {} } as ContentBlock,
+          saveCall('call_save_batch', { path: 'files/batch.png', index: 0 }),
+        ],
+        done,
+      ],
+    });
+    try {
+      // Beside the save its share is 300, under the result's text and its
+      // notice's room. Its cut would keep no head and no slot, and store the
+      // notice and the note that its slot was left out, which together are
+      // longer than the text: so it is stored whole, its slot with it, and
+      // the save counts it so.
+      const stored = await waitForToolResult(h.framework, 'call_noted');
+      assert.match(stored.content, /^n{290}/);
+      assert.doesNotMatch(stored.content, /truncated|left out/);
+      assert.equal(parseImagePlaceholders(stored.content).length, 1);
+      await waitForToolResult(h.framework, 'call_save_batch');
+      const bytes = await fileBytes(h, 'files/batch.png');
+      assert.ok(bytes, 'the save wrote its file');
+      assert.strictEqual(sha(bytes), sha(PNG));
+    } finally {
+      await h.framework.stop();
+      rmSync(h.tempDir, { recursive: true, force: true });
+    }
+  });
+
+  it("a turn that fits, with a save beside an image result past its share but no longer than its notice and note, is stored as each result would be alone", async () => {
+    const h = await startTurn({
+      prefix: 'sri-noted-fits-',
+      inlineCap: 2000,
+      inlineBound: 960,
+      responses: [
+        [
+          { type: 'tool_use', id: 'call_quiet', name: 'world--quiet_failure', input: {} } as ContentBlock,
+          { type: 'tool_use', id: 'call_noted', name: 'world--snap_noted', input: {} } as ContentBlock,
+          saveCall('call_save_batch', { path: 'files/batch.png', index: 0 }),
+        ],
+        done,
+      ],
+    });
+    try {
+      // Three calls under a bound of 960: a share of 320, under the result's
+      // text. By its share the result would keep its slot whole, as it would
+      // alone, so the save marks nothing, and the turn, which fits, is stored
+      // as each result would be alone: the save's receipt whole beside it.
+      const stored = await waitForToolResult(h.framework, 'call_noted');
+      assert.ok(stored.content.length > 320, `the result is past its share (${stored.content.length})`);
+      assert.match(stored.content, /^n{290}/);
+      assert.equal(parseImagePlaceholders(stored.content).length, 1);
+      const receipt = await waitForToolResult(h.framework, 'call_save_batch');
+      const quiet = await waitForToolResult(h.framework, 'call_quiet');
+      assert.ok(stored.content.length + receipt.content.length + quiet.content.length <= 960, 'the turn fits its bound');
+      assert.strictEqual(saved(receipt)[0]!.sha256, sha(PNG), 'the receipt is stored whole, and the save took the snapshot');
     } finally {
       await h.framework.stop();
       rmSync(h.tempDir, { recursive: true, force: true });

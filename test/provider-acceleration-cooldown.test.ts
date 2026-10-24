@@ -148,7 +148,7 @@ test('dynamic conversation forks are excluded from provider cooldown ownership',
     providerGates: Map<string, unknown>;
     holdProviderAcceleration(agent: unknown, error: Error, trigger?: unknown): boolean;
   };
-  bindAsConversationFork(framework, 'resident', 'world:test');
+  bindAsConversationFork(framework, 'resident', { serverId: 'stub', channelId: 'world:test' });
   try {
     const error = new MembraneError({
       type: 'rate_limit', retryable: true, httpStatus: 429,

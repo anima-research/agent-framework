@@ -661,7 +661,7 @@ describe('a tool-ended turn ends what a successful turn ends', () => {
     };
     r.framework.start();
     try {
-      bindAsConversationFork(r.framework, 'resident', 'world:zz');
+      bindAsConversationFork(r.framework, 'resident', { serverId: 'stub', channelId: 'world:zz' });
       r.framework.getAgent('resident')!.getContextManager().addMessage('User', [{ type: 'text', text: 'first' }]);
       await internal.startAgentStream(r.framework.getAgent('resident'),
         { agentName: 'resident', reason: 'conversation', source: 'test', timestamp: Date.now() });

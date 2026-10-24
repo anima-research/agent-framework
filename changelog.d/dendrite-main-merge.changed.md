@@ -57,3 +57,44 @@
   refused in main's words. Under the author rule a placeholder for content
   the host can't read is stored under its author too, `User: [Content not
   shown: …]`, which main's parity test now counts as such.
+- Merged `main` at `8ec1de5a` (0.26.2's changelog and #720). At a tool
+  boundary the branch still releases each stored message's landed mail and
+  skips one held from the residents, and what it injects is then #720's: a
+  message the render gives null goes in as stored.
+- Merged `main` at `a4a74b48` (0.26.0 and after), where #710's
+  server-qualified channels meet the branch. A conversation fork's home
+  stays the agent registry's `homeChannel`, which the framework reads
+  wherever main read its own map of homes. `tune_out` and `focus` resolve
+  their channel as main's channel tools do: with a `serverId`, that server's
+  channel; inside the calling turn, the turn's own channel by its id;
+  otherwise the one registered channel a name answers to, by its id or as
+  `serverId:channelId`, and a name two channels answer to is refused with
+  them as candidates; `check`'s `peek` takes the same names and refuses what
+  they refuse, a channel no server registers now included. Their answers,
+  and the all-except announcement, name and reach the channel on its server.
+  The subconscious's `deliver_summary`, `cancel_tuneout` and
+  `speak_in_channel` resolve a channel as main's do, from a reader fork too.
+  A `cancel_tuneout` that names the all-except scope ends that hold, as
+  before, whatever channel its `channelId` picks or fails to pick (a name two
+  servers' channels answer to, or a turn's own channel its server no longer
+  registers); only a channel with a tune-out of its own is cancelled instead.
+  The latest delivered
+  inbound message, which admission records, keeps its server, and a message
+  whose server no longer registers its channel sets none. A
+  `channel_publish` naming no channel takes the turn's locus only when the
+  call is made inside the turn; outside it, a conversation fork's goes to
+  its home, and anyone else's takes the registry's default. So main's
+  shared-channel-ids entry, which says such a publish posts to the latest
+  message's channel, holds here only under `speech.locus:
+  'latest-inbound'`, for a call made outside a turn or in a turn with
+  neither a locus nor a trigger channel. Every way a live non-ephemeral agent ends drops a continuation
+  of its turn that is on its way (#722), and a conversation agent stopped by
+  a listener of the failure its hold after the compile reports is held by
+  nothing.
+  `AgentSpec.homeChannel` and the registry record's `homeChannel` are a
+  channel with its server, `{ serverId, channelId }`, and
+  `conversationForkSpec` takes it as `homeChannel` in place of `channelId`.
+  A record that keeps a bare id, as one written before does, is read as a
+  wake that names its channel without its server is: the one registered
+  channel with that id, or, where none or several are, a home on no
+  server.

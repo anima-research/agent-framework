@@ -124,7 +124,9 @@ function documentProblems(doc: unknown, descriptionsOnly: boolean): string[] {
 
 function parseDocument(raw: string, descriptionsOnly: boolean): PresentationDocument {
   let doc: unknown;
-  try { doc = JSON.parse(raw); }
+  // Some Windows editors save UTF-8 with a leading U+FEFF, which read() keeps
+  // and JSON.parse refuses; drop exactly one, as parseGateJson does (#758).
+  try { doc = JSON.parse(raw.charCodeAt(0) === 0xfeff ? raw.slice(1) : raw); }
   catch (error) { throw new PresentationFileError([`it isn't valid JSON: ${errorMessage(error)}`]); }
   // An object with no keys carries no settings, so it's the empty document,
   // as a missing resident file is: it's what an operator writes by hand to

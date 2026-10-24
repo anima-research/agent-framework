@@ -17,6 +17,8 @@ function harness() {
   const traces: string[] = [];
   const registry = {
     getTuneOutState: () => null,
+    // Each channel is shown by its id: no other server registers it.
+    nameShown: (ref: { channelId: string }) => ref.channelId,
     listChannelsRaw: () => [{ serverId: 'disc', descriptor: { id: 'work' } }, { serverId: 'disc', descriptor: { id: 'noisy' } }],
     readCoordinatorState: (id: string) => state.get(id) ?? null,
     writeCoordinatorState: (id: string, value: unknown) => { state.set(id, value); },

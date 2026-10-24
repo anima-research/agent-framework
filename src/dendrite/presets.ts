@@ -63,7 +63,13 @@ export function subconsciousSpec(name: AgentName, serves: AgentName): AgentSpec 
  */
 export function conversationForkSpec(
   name: AgentName,
-  options: { template: AgentName; channelId: string; idleTtlMs: number; inherit?: Partial<ContextInheritance> },
+  options: {
+    template: AgentName;
+    /** The channel it's bound to, on its server. */
+    homeChannel: { serverId: string; channelId: string };
+    idleTtlMs: number;
+    inherit?: Partial<ContextInheritance>;
+  },
 ): AgentSpec {
   return {
     name,
@@ -82,7 +88,7 @@ export function conversationForkSpec(
     // A copy renames the template's turns as it copies them. A shared
     // inheritance has no copy step, so the mapping is declared instead.
     ...(options.inherit?.mode === 'shared' ? { selfParticipants: [options.template] } : {}),
-    homeChannel: options.channelId,
+    homeChannel: { serverId: options.homeChannel.serverId, channelId: options.homeChannel.channelId },
     namespace: `conversations/${name}`,
   };
 }

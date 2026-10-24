@@ -232,8 +232,13 @@ export interface AgentSpec {
   selfParticipants?: string[];
   /** The participant name its turns are presented under, when not its own name. */
   presentAs?: string;
-  /** A channel this agent is bound to (its speech home and inbound scope). */
-  homeChannel?: string;
+  /**
+   * A channel this agent is bound to (its speech home and inbound scope), on
+   * its server: channel ids are unique only within one server's connection,
+   * so two servers' channels with one id are two homes (the channel
+   * registry's `ChannelRef`).
+   */
+  homeChannel?: { serverId: string; channelId: string };
   /**
    * Whether the agent reads the residents' shared un-namespaced message
    * slot (as its own slot or through an observe edge).
@@ -298,7 +303,13 @@ export interface AgentRecord {
   inherit?: ContextInheritance;
   selfParticipants?: string[];
   presentAs?: string;
-  homeChannel?: string;
+  /**
+   * The spec's home, on its server. A bare channel id is a record written
+   * before homes carried their server: such a record is an ended one, since
+   * a conversation fork ends at a restart, and the framework reads its id
+   * as a wake that names a channel without its server is.
+   */
+  homeChannel?: { serverId: string; channelId: string } | string;
   readsSharedSlot: boolean;
   namespace?: string;
   metadata?: Record<string, unknown>;

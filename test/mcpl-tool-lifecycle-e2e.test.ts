@@ -245,7 +245,7 @@ describe('tool lifecycle end to end (RFC-007)', () => {
   it('a host-tool refusal (conversation-bound channel guard) is never reported (re-review #1)', async () => {
     // Make scout a conversation fork bound to one channel: the guard in
     // dispatchChannelToolCall refuses channel_open before it runs.
-    const unbind = bindAsConversationFork(framework, 'scout', 'disc:guild:home');
+    const unbind = bindAsConversationFork(framework, 'scout', { serverId: 'obs', channelId: 'disc:guild:home' });
     try {
       const before = readLog(obsLog).filter((e) => e.event === 'lifecycle').length;
       const callsBefore = membrane.calls.length;

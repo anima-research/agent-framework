@@ -197,6 +197,55 @@ describe('tune-out, all-except scope', () => {
     } finally { await f.close(); }
   });
 
+  it("where another server shares a channel's id, check/peek and focus take the names the other modes take, and the subconscious's cancel_tuneout naming the scope ends it though channelId names that shared id", async () => {
+    const f = await fixture({ framework: { subconscious: SUB } as Partial<FrameworkConfig> });
+    try {
+      await registerOpen(f, 'work', 'noisy');
+      const map = (internals(f).channelRegistry as unknown as { channels: Map<string, unknown> }).channels;
+      for (const id of ['work', 'noisy']) {
+        map.set(JSON.stringify(['other', id]), { serverId: 'other', descriptor: { id, type: 'discord', label: id }, open: true });
+      }
+      const tool = internals(f) as unknown as {
+        handleTuneOutTool(agent: string, input: Record<string, unknown>, own?: Array<{ serverId: string; channelId: string }>): Promise<{ success: boolean; error?: string; data?: unknown }>;
+        handleFocusTool(agent: string, input: Record<string, unknown>, own?: Array<{ serverId: string; channelId: string }>): Promise<{ success: boolean; error?: string; data?: unknown }>;
+      };
+      // Inside a turn whose channel is editor's 'work', the bare id means that channel.
+      const focused = await tool.handleFocusTool('agent', { channelId: 'work', durationSeconds: 120 }, [{ serverId: 'editor', channelId: 'work' }]);
+      assert.ok(focused.success, focused.error);
+      assert.deepEqual(internals(f).tuneOutCoordinator!.getAllExcept()!.params.except, { serverId: 'editor', channelId: 'work' });
+      await incoming(f, 'noisy', 'n1', 'noise');
+      await settle(f);
+      const shared = await tool.handleTuneOutTool('agent', { mode: 'check', peek: 'noisy' });
+      assert.equal(shared.success, false, 'a peek at a name two servers share is refused, as every mode refuses it');
+      assert.match(shared.error ?? '', /editor:noisy/);
+      const qualified = await tool.handleTuneOutTool('agent', { mode: 'check', peek: 'editor:noisy' });
+      assert.ok(qualified.success, qualified.error);
+      assert.deepEqual((qualified.data as { peek: string[] }).peek, ['antra: noise'], 'the qualified name peeks that server\'s channel');
+      const other = await tool.handleTuneOutTool('agent', { mode: 'check', peek: 'other:noisy' });
+      assert.deepEqual((other.data as { peek: string[] }).peek, [], "and the other server's channel holds nothing");
+      const withServer = await tool.handleTuneOutTool('agent', { mode: 'check', peek: 'noisy', serverId: 'editor' });
+      assert.deepEqual((withServer.data as { peek: string[] }).peek, ['antra: noise'], 'the shared id with a serverId peeks that server\'s channel');
+      const inTurn = await tool.handleTuneOutTool('agent', { mode: 'check', peek: 'noisy' }, [{ serverId: 'editor', channelId: 'noisy' }]);
+      assert.deepEqual((inTurn.data as { peek: string[] }).peek, ['antra: noise'], "inside a turn whose channel it is, the shared id peeks the turn's channel");
+
+      const cancelled = await internals(f).tuneOutCoordinator!.handleSubconsciousTool('cancel_tuneout', { channelId: 'noisy', scope: 'all-except' });
+      assert.ok(cancelled.success, cancelled.error);
+      assert.equal(internals(f).tuneOutCoordinator!.getAllExcept(), null, 'the scope named outright ended the hold');
+
+      // Nor does a turn's own channel its server no longer registers, which picks no channel either.
+      const again = await tool.handleFocusTool('agent', { channelId: 'editor:work', durationSeconds: 120 });
+      assert.ok(again.success, again.error);
+      const gone = { serverId: 'other', channelId: 'gone' };
+      const withoutScope = await internals(f).tuneOutCoordinator!.handleSubconsciousTool('cancel_tuneout', { channelId: 'gone' }, [gone]);
+      assert.equal(withoutScope.success, false, "without the scope, the turn's channel that's gone is refused");
+      assert.match(withoutScope.error ?? '', /until that server registers it again/, "with the refusal for the turn's channel, not the one for a channel that isn't tuned out");
+      assert.notEqual(internals(f).tuneOutCoordinator!.getAllExcept(), null);
+      const withScope = await internals(f).tuneOutCoordinator!.handleSubconsciousTool('cancel_tuneout', { channelId: 'gone', scope: 'all-except' }, [gone]);
+      assert.ok(withScope.success, withScope.error);
+      assert.equal(internals(f).tuneOutCoordinator!.getAllExcept(), null, "naming the scope ends the hold, though the turn's channel it names is gone");
+    } finally { await f.close(); }
+  });
+
   it('check/peek shows only what the active epoch holds, never a released one', async () => {
     const f = await fixture({ framework: { subconscious: SUB } as Partial<FrameworkConfig> });
     try {
@@ -249,6 +298,24 @@ describe('tune-out, all-except scope', () => {
       assert.match(textOfPublish(f.published[1]), /^\[Focus: agent released — test\.\]$/);
       await until(() => traces.filter((t) => t === 'tune-out:announced').length >= 2, 'both announcements traced');
     } finally { await f.close(); }
+
+    // Where another server registers the excepted channel's id, the entry is
+    // still announced in the excepted channel, on its own server, and the
+    // answer names the channel as the agent can name it back.
+    const shared = await fixture({ framework: { subconscious: SUB } as Partial<FrameworkConfig> });
+    try {
+      await registerOpen(shared, 'work', 'noisy');
+      (internals(shared).channelRegistry as unknown as { channels: Map<string, unknown> }).channels.set(
+        JSON.stringify(['other', 'work']), { serverId: 'other', descriptor: { id: 'work', type: 'discord', label: 'work' }, open: true });
+      const entered = await internals(shared).handleTuneOutTool('agent', { channelId: 'editor:work', scope: 'all-except', durationSeconds: 120 });
+      assert.ok(entered.success, entered.error);
+      assert.equal((entered.data as { except?: string }).except, 'editor:work');
+      assert.equal((entered.data as { announcedIn?: string | null }).announcedIn, 'editor:work');
+      await until(() => shared.published.length >= 1, 'the entry is announced, though another server shares the id');
+      // `published` holds what the fixture's one connection, 'editor', is
+      // sent: 'other' has no connection, so nothing sent there is recorded.
+      assert.equal(shared.published[0].channelId, 'work');
+    } finally { await shared.close(); }
 
     const quiet = await fixture({ framework: { subconscious: SUB, tuneOut: { announce: false } } as Partial<FrameworkConfig> });
     try {

@@ -145,7 +145,7 @@ describe('author presentation', () => {
       membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Hello.' }]));
       framework.pushEvent(dm('hello there'));
       await framework.runUntilIdle();
-      const fork = framework.getConversationRouter()!.getBinding('probe:dm:zinnia')!.agentName;
+      const fork = framework.getConversationRouter()!.getBinding({ serverId: 'probe', channelId: 'probe:dm:zinnia' })!.agentName;
       assert.ok(framework.getAgent(fork), 'the DM spawned a fork');
 
       // RFC-006: a replacement notice follows its delivery into the agent

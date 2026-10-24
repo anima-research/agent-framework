@@ -116,7 +116,7 @@ class Env {
 async function call(m: WorkspaceModule, name: string, input: Record<string, unknown>): Promise<any> {
   const res = await m.handleToolCall({ id: 't', name, input });
   assert.equal(res.success, true, `${name} ${JSON.stringify(input)} failed: ${res.error}`);
-  return res.data;
+  return res.structured ?? res.data;
 }
 
 /** Run `fn` with node:fs/promises' `name` replaced by `make(original)`, as the code under test sees it. */
