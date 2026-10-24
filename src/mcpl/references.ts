@@ -349,33 +349,35 @@ function urlMayCarryCredential(u: URL, depth: number): boolean {
 
 /** Whether a parameter's value is a uri that may carry a credential, read in
  *  this order: as an absolute uri; else, where its form is a relative
- *  reference's (it starts with `/`, or holds `?` or `#`), resolved against
- *  the uri it sits in, less that uri's query and fragment, since a value of
- *  a fragment alone, such as a colour's `#ff0000`, would otherwise bring
- *  back the query it sits in and be read again at each level, and one that
- *  doesn't resolve may carry one; else, where decoding it once more changes
- *  it, decoded and read again from the start. Each read or decode is a
- *  level, and a decode is lenient, as the parameter's own was, so a stray
- *  `%` doesn't stop it. A value that is none of these, such as a word,
- *  answers false; within the bound a decode alone never withholds, and past
- *  it a value that would still decode does. */
+ *  reference's (it starts with `/` or `\`, or holds `?` or `#`), resolved
+ *  against the uri it sits in, less that uri's query and fragment, since a
+ *  value of a fragment alone, such as a colour's `#ff0000`, would otherwise
+ *  bring back the query it sits in and be read again at each level, and a
+ *  protocol-relative one that doesn't resolve may carry one; else, where
+ *  decoding it once more changes it, decoded and read again from the start.
+ *  Each read or decode is a level, and a decode is lenient, as the
+ *  parameter's own was, so a stray `%` doesn't stop it. A value that is none
+ *  of these, such as a word, answers false; within the bound a decode alone
+ *  never withholds, and past it a value that would still decode does. */
 function nestedMayCarry(value: string, outer: URL, depth: number): boolean {
   let inner: URL | null = null;
   try {
     inner = new URL(value);
   } catch {
-    if (/^\/|[?#]/.test(value)) {
+    if (/^[/\\]|[?#]/.test(value)) {
       try {
         const base = new URL(outer.href);
         base.search = '';
         base.hash = '';
         inner = new URL(value, base);
       } catch {
-        // One that doesn't resolve may carry one, as a uri that doesn't parse
-        // may: its parts can't be read. Only a protocol-relative value whose
-        // authority doesn't parse comes here, so an ordinary value such as
-        // `q=// note` is withheld too.
-        return true;
+        // A protocol-relative one (`//`, or `\\` as a special scheme reads it)
+        // that doesn't resolve may carry one, as a uri that doesn't parse may:
+        // its authority can't be read. So an ordinary value such as
+        // `q=// note` is withheld too. Any other relative value that doesn't
+        // resolve sits in a uri that can't be a base, such as a `mailto:`'s
+        // subject, against which nothing resolves it, so it carries nothing.
+        return /^[/\\]{2}/.test(value);
       }
     }
   }

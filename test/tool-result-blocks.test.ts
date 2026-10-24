@@ -404,6 +404,8 @@ describe("MCP's resource_link, a reference (RFC-005 §8.1)", () => {
       // A relative value that doesn't resolve can't be read, so it may carry
       // one, as a uri that doesn't parse may: here its authority holds a `%`.
       `https://zz-r.example/go?u=${twice('//zz-user:zz-pass@zz-host%')}`,
+      // The backslash form a special scheme reads as `//`.
+      `https://zz-r.example/go?u=${encodeURIComponent('\\\\zz-user:zz-pass@zz-bucket.example\\k')}`,
     ]) assert.match(line(uri), stub, uri);
     // A decode is a level: three nestings below one value encoded twice put
     // the fourth at level five, past the bound, where encoded once it's read.
@@ -431,6 +433,9 @@ describe("MCP's resource_link, a reference (RFC-005 §8.1)", () => {
       'https://zz-files.example/x?q=zz%20elsewhere%20report',
       'https://zz-files.example/x?q=100%25%20off%',
       `https://zz-files.example/x?q=${encodeURIComponent('/a b?c d#e f')}`,
+      // Nothing resolves against a uri with an opaque path, so a relative
+      // value there that doesn't resolve carries nothing.
+      'mailto:zz-help@zz-files.example?subject=Question%3F',
       'https://zz-files.example/badge?color=%23ff0000&label=%23zz',
     ]) assert.equal(line(uri), `[resource link "report.csv": ${uri}; not fetched]`, uri);
   });
