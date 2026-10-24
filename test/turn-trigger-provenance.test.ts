@@ -700,6 +700,28 @@ describe('private wins, one way', () => {
     }
   });
 
+  it("a silent turn's budget restart that reads a stored private message makes it private, and tells it nothing", async () => {
+    for (const silent of [true, false]) {
+      const rig = await surfaceRig();
+      const label = silent ? 'a silent restart' : 'control: a restart that can publish';
+      try {
+        // An open turn with no destination, as a silent turn's is, between
+        // its stream and the restart that continues it, when the operator's
+        // message is stored.
+        const routing = routingOf(rig.framework);
+        rig.state.openLogical.set('scout', routing);
+        storeOperatorMessage(rig.framework);
+        rig.i.pendingRequests.push({ agentName: 'scout', reason: 'context_budget_restart', source: 'framework', timestamp: Date.now(), ...(silent ? { suppressProse: true } : {}) });
+        await rig.until(() => rig.starts.length >= 1, 'the restart');
+        await rig.framework.runUntilIdle();
+        assert.equal(routing.nonChannelOrigin, true, `${label}: the turn is private now, so its publish names its channel`);
+        assert.equal(rig.texts().filter((t) => t.startsWith(PRIVATE_FROM_HERE)).length, silent ? 0 : 1, `${label}: ${JSON.stringify(rig.texts())}`);
+      } finally {
+        await rig.close();
+      }
+    }
+  });
+
   it("a silent start leaves the mark of a stored private message to the next start", async () => {
     const rig = await surfaceRig();
     try {

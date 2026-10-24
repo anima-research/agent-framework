@@ -19526,10 +19526,11 @@ export class AgentFramework {
       // (processInferenceRequests), or that reads a private surface's message
       // stored since the agent's last start, makes the turn private from
       // here: it loses its locus, and the
-      // agent is told so before this start compiles (makeTurnPrivate).
+      // agent is told so before this start compiles (makeTurnPrivate), unless
+      // the start is silent, as a silent turn's budget restart is.
       // Otherwise a message no tool boundary of the turn weighed can still
       // move it, as it would have at a boundary (TurnRouting.arrivals).
-      if (trigger?.nonChannelOrigin === true || privateInput) this.makeTurnPrivate(agent, routing);
+      if (trigger?.nonChannelOrigin === true || privateInput) this.makeTurnPrivate(agent, routing, trigger?.suppressProse === true);
       // A turn in a mode with a locus reads its arrivals' messages, a turn
       // with no channel (noChannel) included: an addressed message, or a
       // follow-up where the turn sent, gives it its channel, as a re-pin does.
