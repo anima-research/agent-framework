@@ -73,8 +73,16 @@ class FakeService {
             if (this.failMessageUpserts > 0 && items.some((it) => it.kind === 'message')) {
               this.failMessageUpserts--; return json(500, { error: { message: 'boom' } });
             }
-            for (const it of items) this.items.set(it.id, it);
-            return json(200, { namespace: 'ns', inserted: items.length, updated: 0, unchanged: 0, count: this.items.size });
+            // Counted as the service counts them: an id it lacks is
+            // inserted, one it holds with other text updated, and one it
+            // holds as sent unchanged.
+            let inserted = 0, updated = 0, unchanged = 0;
+            for (const it of items) {
+              const had = this.items.get(it.id);
+              if (!had) inserted++; else if (had.text === it.text) unchanged++; else updated++;
+              this.items.set(it.id, it);
+            }
+            return json(200, { namespace: 'ns', inserted, updated, unchanged, count: this.items.size });
           }
           await this.onSearch?.();
           const q = JSON.parse(body) as { query: string; kinds?: string[]; k?: number };
@@ -338,7 +346,7 @@ it('while a bounded pass hasn\'t reached a summary, its old item is no hit, and 
   assert.equal(found.behind, true);
 });
 
-it('a pass whose budget runs out inside a millisecond finishes it, so each summary there has its old item deleted', async (t) => {
+it('a pass whose budget runs out inside a millisecond stops there, and the next pass sends the rest and deletes their old items', async (t) => {
   const svc = new FakeService(); await svc.start();
   t.after(() => svc.stop());
   const T = Date.UTC(2026, 8, 22);
@@ -354,7 +362,11 @@ it('a pass whose budget runs out inside a millisecond finishes it, so each summa
   const mod = new HistoryModule({ semantic: { url: svc.url, namespace: 'ns', syncIntervalMs: 0 } });
   mod.bind(cm);
   t.after(() => mod.stop());
+  // A budget of one writes one summary a pass, inside the millisecond too.
   await mod.syncSemanticIndex(1);
+  assert.deepEqual(svc.summaryKeys(), ['sum:s1@' + (T + 5), 'sum:s2', 'sum:s3']);
+  await mod.syncSemanticIndex(1);
+  assert.deepEqual(svc.summaryKeys(), ['sum:s1@' + (T + 5), 'sum:s2@' + (T + 5), 'sum:s3']);
   await mod.syncSemanticIndex(1);
   assert.deepEqual(svc.summaryKeys(), sums.map((s) => `sum:${s.id}@${s.createdMs}`));
 });
@@ -835,4 +847,113 @@ it('an index restored from before summaries were keyed leaves out the old items 
   // A rebuild: the namespace deleted, so the next pass sends everything again.
   r.svc.items.clear();
   assert.ok((await r.search('apples')).hits.includes(shown));
+});
+
+/** A store stub over fixed messages and summaries: messages walk in time order, paged as the store pages them. */
+function stubStore(messages: Array<{ id: string; ms: number }>, sums: Array<Record<string, unknown> & { id: string; createdMs: number }>): ContextManager {
+  const stored = messages.map((m, i) => ({
+    id: m.id, sequence: i + 1, participant: 'user', content: [{ type: 'text', text: `message ${m.id}` }], timestamp: new Date(m.ms),
+  })).sort((a, b) => a.timestamp.getTime() - b.timestamp.getTime());
+  return {
+    getSummariesInRange: () => sums,
+    getSummary: (id: string) => { const s = sums.find((x) => x.id === id); return s ? { ...s, created: s.createdMs } : null; },
+    getMessage: (id: string) => stored.find((m) => m.id === id) ?? null,
+    queryMessagesByTime(o: { fromMs?: number; offset?: number; limit?: number }) {
+      const from = stored.filter((m) => o.fromMs === undefined || m.timestamp.getTime() >= o.fromMs);
+      const offset = o.offset ?? 0;
+      const page = from.slice(offset, offset + (o.limit ?? from.length));
+      return { messages: page, totalCount: from.length };
+    },
+  } as unknown as ContextManager;
+}
+
+const keysOf = (svc: FakeService, kind: string): string[] => [...svc.items.values()].filter((x) => x.kind === kind).map((x) => x.id).sort();
+
+it('a pass writes exactly its budget, stopping inside a page, and the next pass goes on from there', async (t) => {
+  const svc = new FakeService(); await svc.start();
+  t.after(() => svc.stop());
+  const T = Date.UTC(2026, 8, 22);
+  const cm = stubStore(Array.from({ length: 10 }, (_, i) => ({ id: `m${i + 1}`, ms: T + i })), []);
+  // Batches of 4 and a budget of 3: a batch could write more than the budget.
+  const mod = new HistoryModule({ semantic: { url: svc.url, namespace: 'ns', syncIntervalMs: 0, syncBatch: 4 } });
+  mod.bind(cm);
+  t.after(() => mod.stop());
+  const first = (await mod.syncSemanticIndex(3))!;
+  assert.equal(first.inserted + first.updated, 3, JSON.stringify(first));
+  assert.equal(first.more, true);
+  assert.deepEqual(keysOf(svc, 'message'), ['msg:m1', 'msg:m2', 'msg:m3']);
+  // The next pass sends the first three again, which the service holds unchanged, and writes three more.
+  const second = (await mod.syncSemanticIndex(3))!;
+  assert.deepEqual({ written: second.inserted + second.updated, unchanged: second.unchanged }, { written: 3, unchanged: 3 });
+  assert.deepEqual(keysOf(svc, 'message'), ['msg:m1', 'msg:m2', 'msg:m3', 'msg:m4', 'msg:m5', 'msg:m6']);
+});
+
+it('a message stamped behind the cursor that the overlap finds new counts against the budget', async (t) => {
+  const svc = new FakeService(); await svc.start();
+  t.after(() => svc.stop());
+  const T = Date.UTC(2026, 8, 22);
+  const messages = [{ id: 'm1', ms: T }, { id: 'm2', ms: T + 2 }];
+  const cm = stubStore(messages, []);
+  const mod = new HistoryModule({ semantic: { url: svc.url, namespace: 'ns', syncIntervalMs: 0 } });
+  mod.bind(cm);
+  t.after(() => mod.stop());
+  await mod.syncSemanticIndex(10);
+  // A message written late, stamped between the two, and a new one after them.
+  messages.push({ id: 'late', ms: T + 1 }, { id: 'm3', ms: T + 3 });
+  const late = stubStore(messages, []);
+  mod.bind(late);
+  const r = (await mod.syncSemanticIndex(1))!;
+  assert.equal(r.inserted + r.updated, 1, JSON.stringify(r));
+  assert.deepEqual(keysOf(svc, 'message'), ['msg:late', 'msg:m1', 'msg:m2'], 'the late one is written, within the budget, and m3 waits');
+});
+
+it('the message walk waits for the next pass when less than a batch of the budget is left', async (t) => {
+  const svc = new FakeService(); await svc.start();
+  t.after(() => svc.stop());
+  const T = Date.UTC(2026, 8, 22);
+  const sum = (i: number) => ({ id: `s${i}`, level: 1, content: `summary ${i}`, tokens: 2, startMs: T, endMs: T + 1, firstSequence: 0, lastSequence: 1, createdMs: T + 10 + i });
+  const cm = stubStore(Array.from({ length: 6 }, (_, i) => ({ id: `m${i + 1}`, ms: T + i })), [sum(1), sum(2)]);
+  const mod = new HistoryModule({ semantic: { url: svc.url, namespace: 'ns', syncIntervalMs: 0, syncBatch: 4 } });
+  mod.bind(cm);
+  t.after(() => mod.stop());
+  // The two summaries leave 3 of 5, under a batch of 4.
+  const first = (await mod.syncSemanticIndex(5))!;
+  assert.equal(first.more, true);
+  assert.equal(keysOf(svc, 'summary').length, 2);
+  assert.deepEqual(keysOf(svc, 'message'), []);
+  // The next pass's summaries cost nothing, so its walk has the whole budget.
+  await mod.syncSemanticIndex(5);
+  assert.deepEqual(keysOf(svc, 'message'), ['msg:m1', 'msg:m2', 'msg:m3', 'msg:m4', 'msg:m5']);
+});
+
+it("a pass that stops inside a later millisecond leaves the summary cursor at the last one it finished, so that millisecond's old items go too", async (t) => {
+  const svc = new FakeService(); await svc.start();
+  t.after(() => svc.stop());
+  const T = Date.UTC(2026, 8, 22);
+  const sum = (i: number, createdMs: number) => ({ id: `s${i}`, level: 1, content: `summary ${i}`, tokens: 2, startMs: T, endMs: T + 1, firstSequence: 0, lastSequence: 1, createdMs });
+  // One summary at T, three minted in one later millisecond, each with an old item.
+  const sums = [sum(0, T), sum(1, T + 5), sum(2, T + 5), sum(3, T + 5)];
+  for (const s of sums) svc.items.set(`sum:${s.id}`, { id: `sum:${s.id}`, text: s.content, kind: 'summary', cursor: s.createdMs });
+  const mod = new HistoryModule({ semantic: { url: svc.url, namespace: 'ns', syncIntervalMs: 0 } });
+  mod.bind(stubStore([], sums));
+  t.after(() => mod.stop());
+  await mod.syncSemanticIndex(1);
+  await mod.syncSemanticIndex(2);
+  assert.deepEqual(keysOf(svc, 'summary'), ['sum:s0@' + T, 'sum:s1@' + (T + 5), 'sum:s2@' + (T + 5), 'sum:s3'], 'the second pass stops inside T + 5');
+  await mod.syncSemanticIndex(2);
+  assert.deepEqual(keysOf(svc, 'summary'), sums.map((s) => `sum:${s.id}@${s.createdMs}`));
+});
+
+it('an item the service updates counts against the budget, as one it inserts does', async (t) => {
+  const svc = new FakeService(); await svc.start();
+  t.after(() => svc.stop());
+  const T = Date.UTC(2026, 8, 22);
+  // The index holds m1 with other text, as after an edit its pass missed.
+  svc.items.set('msg:m1', { id: 'msg:m1', text: 'older text', kind: 'message', cursor: T });
+  const mod = new HistoryModule({ semantic: { url: svc.url, namespace: 'ns', syncIntervalMs: 0 } });
+  mod.bind(stubStore([{ id: 'm1', ms: T }, { id: 'm2', ms: T + 1 }], []));
+  t.after(() => mod.stop());
+  const r = (await mod.syncSemanticIndex(1))!;
+  assert.deepEqual({ updated: r.updated, inserted: r.inserted }, { updated: 1, inserted: 0 });
+  assert.deepEqual(keysOf(svc, 'message'), ['msg:m1'], 'm2 waits for the next pass');
 });

@@ -649,8 +649,8 @@ export class HistoryModule implements Module {
 
   /**
    * Background sync into the semantic index: every `syncIntervalMs` (default
-   * 60 s) push about `maxSyncPerTick` new items (its doc says how a tick can
-   * go over it). Idempotent to call — starts
+   * 60 s) write at most `maxSyncPerTick` items to the index, by the
+   * service's own count. Idempotent to call — starts
    * once we have both a context-manager (bind) and a config; `unref`'d so it
    * never keeps a shutting-down process alive. A first tick runs after 5 s so
    * a fresh store starts backfilling immediately rather than a minute later.

@@ -51,13 +51,14 @@ export interface SemanticIndexConfig {
   /** Items per upsert request. Default 128, max 256 (service limit). */
   syncBatch?: number;
   /**
-   * Max new items one background tick will push. Default 1024. A tick can
-   * go over it: one whose budget runs out among summaries minted in one
-   * millisecond sends the rest of them too, and the message walk checks the
-   * budget once per page of 256.
+   * The most items one background tick adds to or changes in the index,
+   * by the service's own count of what each upsert wrote (inserted or
+   * updated), with each queued edit counted as one. A tick still re-sends
+   * items the service already holds unchanged, such as the overlap behind
+   * the message cursor, and those cost nothing. Default 1024.
    */
   maxSyncPerTick?: number;
-  /** Max new items a pre-search catch-up will push before searching anyway, as for `maxSyncPerTick`. Default 256. */
+  /** The most items a pre-search catch-up adds to or changes in the index before searching anyway, counted as for `maxSyncPerTick`. Default 256. */
   maxSyncBeforeSearch?: number;
   /** Re-scan window behind the message watermark, ms. Default 10 min. */
   overlapMs?: number;
@@ -555,9 +556,9 @@ export class SemanticIndexer {
   get backingOff(): boolean { return Date.now() < this.backoffUntil; }
 
   /**
-   * Push what the index is missing, up to `maxItems` new items, with the
-   * rest of the summaries minted in the millisecond where that runs out, and
-   * the rest of the message page it runs out in.
+   * Push what the index is missing, writing at most `maxItems` items by the
+   * service's own count (edits one each), and stopping where that runs out,
+   * inside a millisecond or a message page too.
    * Coalesces: a call while a sync is already running returns that run's
    * promise instead of racing it.
    */
@@ -629,14 +630,22 @@ export class SemanticIndexer {
       const msgWm = held(kept.messages, 'message') ?? stats?.by_kind.message?.max_cursor ?? null;
       let sumNext = sumCursor;
       let msgThrough: number | null = null;
+      // What the pass may still write. Edits spend one each; summaries and
+      // messages spend what the service says each upsert wrote (inserted or
+      // updated), so a re-send it finds unchanged, such as the overlap's
+      // behind the message cursor, costs nothing and can't freeze a pass.
       let budget = maxItems;
       let pending: IndexItem[] = [];
       const flush = async (): Promise<void> => {
         if (pending.length === 0) return;
         const r = await this.client.upsert(pending);
         report.pushed += pending.length; report.inserted += r.inserted; report.updated += r.updated; report.unchanged += r.unchanged;
+        budget -= r.inserted + r.updated;
         pending = [];
       };
+      /** Pending items are sent once they could write all the budget left,
+       *  so a pass never writes more than its budget. */
+      const full = (): boolean => pending.length >= Math.min(batchSize, budget);
 
       // Edits and removals first: they never come back round in the time walk.
       // This phase fails on its own: a failure re-queues its ids, is logged
@@ -730,23 +739,28 @@ export class SemanticIndexer {
         // budget.
         const fresh = all.filter((s) => cursor === null || s.createdMs >= cursor).sort((a, b) => a.createdMs - b.createdMs);
         // Through which creation time this pass sent every summary it read.
-        // A pass whose budget runs out finishes the millisecond it's in, so
-        // a cursor never stops inside one.
+        // A pass whose budget runs out inside a millisecond leaves the cursor
+        // at the one before, so the next pass sends the rest of that
+        // millisecond, re-sending what this one wrote of it at no cost, and
+        // counts all of it as new for the old keys below.
         let through: number | null = null;
+        // The millisecond of the summaries being sent.
+        let at: number | null = null;
+        let finished = true;
         // Each newly sent summary's key in the form written before keys
         // carried the creation time, for deleting once its new item is in.
         const oldKeys: string[] = [];
         for (const s of fresh) {
-          const isNew = cursor === null || s.createdMs > cursor;
-          if (budget <= 0 && s.createdMs !== through) { report.more = true; break; }
-          through = s.createdMs;
+          if (s.createdMs !== at) { through = at; at = s.createdMs; }
+          if (budget <= 0) { report.more = true; finished = false; break; }
           const item = summaryToItem(s, this.cfg);
           if (!item) continue;
           pending.push(item);
-          if (isNew) { budget--; oldKeys.push(`sum:${s.id}`); }
-          if (pending.length >= batchSize) await flush();
+          if (cursor === null || s.createdMs > cursor) oldKeys.push(`sum:${s.id}`);
+          if (full()) await flush();
         }
         await flush();
+        if (finished) through = at;
         // The index's old items go once their summaries' new ones are in. On
         // a service without /delete they stay, and search leaves them out. A
         // failed delete leaves the cursor, so the next pass sends those
@@ -786,27 +800,36 @@ export class SemanticIndexer {
       // of more than a page within one millisecond is walked, not jumped.
       let offset = 0;
       const pageSize = 256;
-      for (;;) {
+      // The walk starts with the overlap's re-sends, which cost nothing but
+      // go out in chunks no bigger than the budget left: with less than a
+      // batch left, it waits for the next pass rather than re-send them a
+      // few at a time.
+      const short = budget < Math.min(batchSize, maxItems);
+      if (short) report.more = true;
+      for (let stopped = short; !stopped;) {
         if (budget <= 0) { report.more = true; break; }
         reading();
         const page = this.cm.queryMessagesByTime({ fromMs, offset, limit: pageSize });
         const msgs = page.messages;
         report.messagesScanned += msgs.length;
         for (const m of msgs) {
+          // Only what the service writes spends the budget (flush). The
+          // overlap re-walk behind the watermark is a dedup no-op for the
+          // service, and it must be one for the budget too: when the overlap
+          // window held more messages than a tick's budget, every tick spent
+          // it all re-sending the same indexed items and never reached the
+          // first new one — the index froze at the watermark while reporting
+          // merely `more: true`. A pass stops inside a page once the budget
+          // is spent; the next one's overlap sends the rest of the
+          // millisecond it stopped in.
+          if (budget <= 0) { report.more = true; stopped = true; break; }
           const item = messageToItem(m, this.cfg);
           if (!item) continue;
           pending.push(item);
-          // Only NEW items spend the budget. The overlap re-walk behind the
-          // watermark is a dedup no-op for the service, and it must be one
-          // for the budget too: when the overlap window held more messages
-          // than a tick's budget, every tick spent it all re-sending the same
-          // indexed items and never reached the first new one — the index
-          // froze at the watermark while reporting merely `more: true`.
-          if (msgWm === null || item.cursor === undefined || item.cursor > msgWm) budget--;
           if (item.cursor !== undefined && (msgThrough === null || item.cursor > msgThrough)) msgThrough = item.cursor;
-          if (pending.length >= batchSize) await flush();
+          if (full()) await flush();
         }
-        if (msgs.length < pageSize) break;
+        if (stopped || msgs.length < pageSize) break;
         const lastMs = msgs[msgs.length - 1]!.timestamp.getTime();
         const atLast = msgs.filter((m) => m.timestamp.getTime() === lastMs).length;
         offset = lastMs === fromMs ? offset + atLast : atLast;

@@ -96,15 +96,18 @@ async function service(t: TestContext, status: number, msg: string): Promise<str
  * upsert, delete or search) and how many of that kind came before it. A
  * string body goes as it is, as a web page; anything else, as JSON.
  */
-async function routed(t: TestContext, reply: (kind: string, n: number) => [number, unknown]): Promise<string> {
+async function routed(t: TestContext, reply: (kind: string, n: number, sent: unknown) => [number, unknown]): Promise<string> {
   const seen = new Map<string, number>();
   const server = createServer((req, res) => {
-    req.resume();
+    let raw = '';
+    req.on('data', (c: Buffer) => { raw += c.toString(); });
     req.on('end', () => {
       const kind = (req.url ?? '').slice((req.url ?? '').lastIndexOf('/') + 1);
       const n = seen.get(kind) ?? 0;
       seen.set(kind, n + 1);
-      const [status, body] = reply(kind, n);
+      let sent: unknown = null;
+      try { sent = raw ? JSON.parse(raw) : null; } catch { /* not JSON */ }
+      const [status, body] = reply(kind, n, sent);
       res.writeHead(status, { 'content-type': typeof body === 'string' ? 'text/html' : 'application/json' });
       res.end(typeof body === 'string' ? body : JSON.stringify(body));
     });
@@ -900,13 +903,15 @@ test('a background sync without stats fails on that answer when its budget cuts 
     },
   } as unknown as ContextManager;
   const hit = { id: 'msg:m1', score: 0.9, ts: T / 1000, channel: 'c1', kind: 'message', level: null, meta: {}, text: 'hello', chars: 5 };
-  const url = await routed(t, (kind) => {
+  const url = await routed(t, (kind, _n, sent) => {
     if (kind === 'search') return [200, { namespace: 'test/ns', hits: [hit], count_indexed: 1, timing_ms: { embed: 1, search: 1 } }];
     if (kind === 'stats') return [200, PAGE];
-    return [200, { inserted: 1, updated: 0, unchanged: 0, count: 1 }];
+    // Every message is new to this index, so each upsert inserts all it carries.
+    const items = (sent as { items?: unknown[] } | null)?.items?.length ?? 0;
+    return [200, { inserted: items, updated: 0, unchanged: 0, count: items }];
   });
   const warned = t.mock.method(console, 'warn', () => {});
-  // Batches of 100, so the 256 the pass walks end in a batch of 56, sent before the pass fails.
+  // Batches of 100, so the 256 the pass writes end in a batch of 56, sent before the pass fails.
   const h = new HistoryModule({ semantic: { url, token: 'tok', namespace: 'test/ns', syncIntervalMs: 0, syncBatch: 100 } });
   h.bind(many);
   t.after(() => h.stop());

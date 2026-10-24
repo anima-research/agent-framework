@@ -26,8 +26,9 @@
   `sum:<id>`, where the service has `/delete`. Where it doesn't, the old items
   stay, and search leaves them out. Until a branch's passes have sent its
   summaries under the new key, a search on it can miss one: the search's
-  own catch-up sends up to `maxSyncBeforeSearch` new items first (256 by
-  default), and background passes send the rest, `maxSyncPerTick` a tick.
+  own catch-up writes up to `maxSyncBeforeSearch` items first (256 by
+  default), and background passes write the rest, up to `maxSyncPerTick` a
+  tick.
   A summary only on a branch no pass syncs keeps its old item, unless
   another branch's pass sends a summary with its id.
   Messages start from the service's watermark, as before. The history
