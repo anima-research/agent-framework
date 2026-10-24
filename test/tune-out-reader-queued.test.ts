@@ -7,12 +7,14 @@
  * the stored ones: on a wake, on a cadence look and on a cancel. Each held
  * message still goes to exactly one reader: a message handed while queued
  * isn't handed again once it lands in the store (its row carries the
- * deferred write's id as `metadata.deferredWriteId`). A reader's own cancel
+ * deferred write's id as `metadata.deferredWriteId`). A fork that never read
+ * what it was handed gives it back (`readerFailed`). A reader's own cancel
  * is followed by one more fork only for what arrived after the reader was
  * handed its own, and a cadence period with nothing new derives no fork.
  *
  * The coordinator runs here against a fake registry and fake framework
  * hooks, so no Dendrite build of chronicle or context-manager is needed.
+ * test/tune-out-reader-fork-handoff.test.ts has the framework's side.
  */
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
@@ -28,19 +30,23 @@ const NOISY = 'disc:guild:noisy';
 const OTHER = 'disc:guild:other';
 const EPOCH = 'e-noisy-0001';
 
-type Queued = { participant: string; content: ContentBlock[]; metadata: Record<string, unknown>; writeId: string };
+type Queued = { participant: string; content: ContentBlock[]; metadata: Record<string, unknown>; writeId?: string };
+interface Where { epochId?: string; channelId?: string; serverId?: string }
 
 const text = (t: string): ContentBlock => ({ type: 'text', text: t } as ContentBlock);
 const textOf = (content: ContentBlock[]): string =>
   content.filter((b) => b.type === 'text').map((b) => (b as { text: string }).text).join('\n');
-const meta = (author: string, epochId: string, channelId = NOISY, extra: Record<string, unknown> = {}) =>
-  ({ author: { name: author }, tuneOut: { epochId }, channelId, serverId: SERVER, ...extra });
+const meta = (author: string, where: Where = {}) => ({
+  author: { name: author },
+  tuneOut: { epochId: where.epochId ?? EPOCH },
+  channelId: where.channelId ?? NOISY,
+  serverId: where.serverId ?? SERVER,
+});
 
 function world() {
   const stored: StoredMessage[] = [];
   const deferred: Queued[] = [];
   const invocations: ReaderInvocation[] = [];
-  const added: Array<{ participant: string; text: string; metadata?: Record<string, unknown> }> = [];
   const coordinatorState = new Map<string, unknown>();
   const active = new Map<string, { params: Record<string, unknown>; wakeCount: number }>();
   let nextSeq = 1;
@@ -60,9 +66,7 @@ function world() {
   } as unknown as ChannelRegistry;
   const servers = { getServer: () => undefined } as unknown as McplServerRegistry;
   const hooks = {
-    addMessage: (participant: string, content: ContentBlock[], metadata?: Record<string, unknown>) => {
-      added.push({ participant, text: textOf(content), metadata });
-    },
+    addMessage: () => {},
     requestInference: () => {},
     subconsciousName: () => null,
     invokeReader: (invocation: ReaderInvocation) => { invocations.push(invocation); },
@@ -81,50 +85,54 @@ function world() {
   const internals = coordinator as unknown as {
     invokeSubconscious(serverId: string, channelId: string, trigger: 'cadence' | 'wake', count: number): void;
     startCadence(serverId: string, channelId: string, cadenceSeconds: number): void;
+    readerHandedWrites: Map<string, Set<string>>;
   };
 
   return {
     coordinator,
     invocations,
-    added,
-    /** Hold NOISY under EPOCH, as a per-channel tune-out does. */
-    tuneOut(backlogCap = 200) {
-      active.set(`${SERVER}\0${NOISY}`, {
-        params: { epochId: EPOCH, cadenceSeconds: 30, backlogCap, maxWakes: 5, startedAtSequence: 0 },
+    internals,
+    /** Hold a channel under an epoch, as a per-channel tune-out does. */
+    tuneOut(backlogCap = 200, where: Where = {}) {
+      active.set(`${where.serverId ?? SERVER}\0${where.channelId ?? NOISY}`, {
+        params: { epochId: where.epochId ?? EPOCH, cadenceSeconds: 30, backlogCap, maxWakes: 5, startedAtSequence: 0 },
         wakeCount: 0,
       });
     },
     /** A held message stored directly (the resident idle). */
-    store(author: string, body: string, epochId = EPOCH, channelId = NOISY): StoredMessage {
+    store(author: string, body: string, where: Where = {}): StoredMessage {
       const message = {
         id: `m-${nextSeq}`,
         sequence: nextSeq++,
         participant: 'user',
         content: [text(body)],
-        metadata: meta(author, epochId, channelId),
+        metadata: meta(author, where),
         timestamp: new Date(),
       } as unknown as StoredMessage;
       stored.push(message);
       return message;
     },
-    /** A held message queued behind the resident's running turn. */
-    queue(author: string, body: string, writeId: string, epochId = EPOCH, channelId = NOISY): void {
-      deferred.push({ participant: 'user', content: [text(body)], metadata: meta(author, epochId, channelId), writeId });
+    /** A held message queued behind the resident's running turn (no write id: a host that gives none). */
+    queue(author: string, body: string, writeId: string | undefined, where: Where = {}): void {
+      deferred.push({ participant: 'user', content: [text(body)], metadata: meta(author, where), ...(writeId ? { writeId } : {}) });
     },
-    /** The resident's turn ends: every queued message lands, stamped with its write id. */
-    land(): void {
-      for (const q of deferred.splice(0)) {
+    /** The resident's turn ends: the queued messages land (only those named, if any are), stamped with their write ids. */
+    land(...writeIds: string[]): void {
+      const lands = (q: Queued): boolean => writeIds.length === 0 || (q.writeId !== undefined && writeIds.includes(q.writeId));
+      const landing = deferred.filter(lands);
+      deferred.splice(0, deferred.length, ...deferred.filter((q) => !lands(q)));
+      for (const q of landing) {
         stored.push({
           id: `m-${nextSeq}`,
           sequence: nextSeq++,
           participant: q.participant,
           content: q.content,
-          metadata: { ...q.metadata, deferredWriteId: q.writeId },
+          metadata: { ...q.metadata, ...(q.writeId ? { deferredWriteId: q.writeId } : {}) },
           timestamp: new Date(),
         } as unknown as StoredMessage);
       }
     },
-    wake: () => internals.invokeSubconscious(SERVER, NOISY, 'wake', 1),
+    wake: (serverId = SERVER, channelId = NOISY) => internals.invokeSubconscious(serverId, channelId, 'wake', 1),
     startCadence: (seconds: number) => internals.startCadence(SERVER, NOISY, seconds),
   };
 }
@@ -172,6 +180,35 @@ describe('reader forks and messages queued behind the resident turn', () => {
     w.coordinator.stop();
   });
 
+  it('a handed write id is let go once its row has landed behind the cursor', () => {
+    const w = world();
+    w.tuneOut();
+    w.queue('ann', 'Q-1', 'w1');
+    w.wake();
+    const handed = () => w.internals.readerHandedWrites.get(`${SERVER}\0${NOISY}`);
+    assert.deepEqual([...(handed() ?? [])], ['w1'], 'kept while it could still be handed by sequence');
+    w.land();
+    w.store('bo', 'S-2 after it');
+    w.wake();
+    assert.deepEqual(bodies(w.invocations[1]!), { stored: ['S-2 after it'], queued: [] });
+    assert.equal(handed(), undefined, 'Q-1 landed behind the cursor, so its id is dropped');
+    w.wake();
+    assert.deepEqual(bodies(w.invocations[2]!), { stored: [], queued: [] }, 'and Q-1 is still not handed again');
+    w.coordinator.stop();
+  });
+
+  it('a queued message the host gives no write id for is left for the reader that comes once it is stored', () => {
+    const w = world();
+    w.tuneOut();
+    w.queue('ann', 'Q-1 without an id', undefined);
+    w.wake();
+    assert.deepEqual(bodies(w.invocations[0]!), { stored: [], queued: [] }, 'not handed while queued');
+    w.land();
+    w.wake();
+    assert.deepEqual(bodies(w.invocations[1]!), { stored: ['Q-1 without an id'], queued: [] }, 'handed once stored');
+    w.coordinator.stop();
+  });
+
   it('a cadence period with nothing new derives no fork, and one with something new does', (t) => {
     t.mock.timers.enable({ apis: ['setTimeout'] });
     const w = world();
@@ -189,6 +226,39 @@ describe('reader forks and messages queued behind the resident turn', () => {
     t.mock.timers.tick(30_000);
     assert.equal(w.invocations.length, 2, 'a period with a new message does');
     assert.deepEqual(bodies(w.invocations[1]!), { stored: [], queued: ['AMB-2 while the turn runs'] });
+    w.coordinator.stop();
+  });
+
+  it("a failed fork's messages go to the next reader: stored, still queued, and landed behind the cursor", () => {
+    const w = world();
+    w.tuneOut();
+    w.store('ann', 'S-1 stored');
+    w.queue('bo', 'Q-2 queued, lands later', 'w2');
+    w.queue('cy', 'Q-3 queued, still queued', 'w3');
+    w.wake();
+    const failed = w.invocations[0]!;
+    assert.equal(w.coordinator.readerFailed(failed), 3, 'all three go back');
+    // Q-2 lands, and a newer message is stored after it; Q-3 stays queued.
+    w.land('w2');
+    w.store('dee', 'S-4 new');
+    w.wake();
+    assert.deepEqual(bodies(w.invocations[1]!), {
+      stored: ['S-1 stored', 'Q-2 queued, lands later', 'S-4 new'],
+      queued: ['Q-3 queued, still queued'],
+    }, 'the returned three again, with the new one');
+    w.wake();
+    assert.deepEqual(bodies(w.invocations[2]!), { stored: [], queued: [] }, 'and once handed again, not a third time');
+    w.coordinator.stop();
+  });
+
+  it('a fork that fails after its epoch ended gives nothing back', () => {
+    const w = world();
+    w.tuneOut();
+    w.queue('ann', 'Q-1', 'w1');
+    w.wake();
+    const failed = w.invocations[0]!;
+    assert.deepEqual(w.coordinator.cancel(SERVER, NOISY, 'agent-tool', 'resident cancelled'), { ok: true });
+    assert.equal(w.coordinator.readerFailed(failed), 0, 'the epoch is over: its cancel had its own last fork');
     w.coordinator.stop();
   });
 
@@ -240,14 +310,45 @@ describe('reader forks and messages queued behind the resident turn', () => {
     const w = world();
     assert.ok(w.coordinator.enterAllExcept({ serverId: SERVER, channelId: 'disc:guild:work' }, { durationSeconds: 600 }, 'agent-tool').ok);
     const epochId = w.coordinator.getAllExcept()!.params.epochId;
-    w.queue('ann', 'N-1 in noisy', 'w1', epochId, NOISY);
+    w.queue('ann', 'N-1 in noisy', 'w1', { epochId, channelId: NOISY });
     w.wake(); // the reader for noisy is handed N-1
     assert.deepEqual(bodies(w.invocations[0]!), { stored: [], queued: ['N-1 in noisy'] });
-    w.queue('bo', 'O-1 in other', 'w2', epochId, OTHER);
+    w.queue('bo', 'O-1 in other', 'w2', { epochId, channelId: OTHER });
     assert.deepEqual(w.coordinator.cancelAllExcept('subconscious', 'subconscious judgment', undefined, 'reader/scout/x/1'), { ok: true });
     assert.equal(w.invocations.length, 2, 'one more fork: for other, whose message no reader had');
     assert.equal(w.invocations[1]!.channelId, OTHER);
     assert.deepEqual(bodies(w.invocations[1]!), { stored: [], queued: ['O-1 in other'] });
+    w.coordinator.stop();
+  });
+
+  it("the resident's release of the all-except hold hands each channel's reader what is still queued", () => {
+    const w = world();
+    assert.ok(w.coordinator.enterAllExcept({ serverId: SERVER, channelId: 'disc:guild:work' }, { durationSeconds: 600 }, 'agent-tool').ok);
+    const epochId = w.coordinator.getAllExcept()!.params.epochId;
+    w.store('ann', 'N-1 stored in noisy', { epochId, channelId: NOISY });
+    w.queue('bo', 'N-2 queued in noisy', 'w2', { epochId, channelId: NOISY });
+    w.queue('cy', 'O-1 queued in other', 'w3', { epochId, channelId: OTHER });
+    assert.deepEqual(w.coordinator.cancelAllExcept('agent-tool', 'resident released'), { ok: true });
+    const byChannel = Object.fromEntries(w.invocations.map((inv) => [inv.channelId, bodies(inv)]));
+    assert.deepEqual(byChannel, {
+      [NOISY]: { stored: ['N-1 stored in noisy'], queued: ['N-2 queued in noisy'] },
+      [OTHER]: { stored: [], queued: ['O-1 queued in other'] },
+    });
+    w.coordinator.stop();
+  });
+
+  it('two servers sharing a channel id keep their readers apart, on a wake and on the release', () => {
+    const w = world();
+    assert.ok(w.coordinator.enterAllExcept({ serverId: SERVER, channelId: 'disc:guild:work' }, { durationSeconds: 600 }, 'agent-tool').ok);
+    const epochId = w.coordinator.getAllExcept()!.params.epochId;
+    w.queue('ann', 'A-1 on disc', 'w1', { epochId, channelId: 'general', serverId: 'disc' });
+    w.queue('bo', 'B-1 on slack', 'w2', { epochId, channelId: 'general', serverId: 'slack' });
+    w.wake('disc', 'general');
+    assert.deepEqual(bodies(w.invocations[0]!), { stored: [], queued: ['A-1 on disc'] }, "disc's reader is handed disc's message only");
+    assert.deepEqual(w.coordinator.cancelAllExcept('agent-tool', 'resident released'), { ok: true });
+    assert.equal(w.invocations.length, 2, "one more fork: for slack's general, whose message no reader had");
+    assert.equal(w.invocations[1]!.serverId, 'slack');
+    assert.deepEqual(bodies(w.invocations[1]!), { stored: [], queued: ['B-1 on slack'] });
     w.coordinator.stop();
   });
 });
@@ -263,11 +364,13 @@ describe('the default reader framing', () => {
     notice: '[Tune-out wake: disc:guild:noisy — 1 addressed message]',
     dispositions: null,
   };
-  const stored = [{ id: 'm-1', sequence: 1, participant: 'user', content: [text('stored line')], metadata: meta('ann', EPOCH), timestamp: new Date() }] as unknown as StoredMessage[];
-  const queued = [{ participant: 'user', content: [text('queued line')], metadata: meta('bo', EPOCH), writeId: 'w2' }];
+  const row = (id: string, sequence: number, author: string, body: string) =>
+    ({ id, sequence, participant: 'user', content: [text(body)], metadata: meta(author), timestamp: new Date() }) as unknown as StoredMessage;
+  const stored = row('m-1', 1, 'ann', 'stored line');
+  const queued = row('held:w2', 2, 'bo', 'queued line');
 
   it('shows the queued messages after the stored ones, counted with them, under a note that they are still queued', () => {
-    const out = textOf(defaultReaderFraming({ ...ctx, backlog: stored, queued }));
+    const out = textOf(defaultReaderFraming({ ...ctx, backlog: [stored, queued], queuedCount: 1 }));
     assert.ok(out.includes('since your last look: 2 messages'), out);
     const at = (s: string) => out.indexOf(s);
     assert.ok(at('stored line') >= 0 && at('queued line') > at('stored line'), 'stored first, then queued');
@@ -276,12 +379,12 @@ describe('the default reader framing', () => {
   });
 
   it('with only queued messages, the note names them all', () => {
-    const out = textOf(defaultReaderFraming({ ...ctx, backlog: [], queued }));
+    const out = textOf(defaultReaderFraming({ ...ctx, backlog: [queued], queuedCount: 1 }));
     assert.ok(out.includes("[It arrived while scout's turn was running, so it is still queued, not yet stored.]"), out);
   });
 
   it('with no queued messages, the framing is as it was', () => {
-    const out = textOf(defaultReaderFraming({ ...ctx, backlog: stored }));
+    const out = textOf(defaultReaderFraming({ ...ctx, backlog: [stored] }));
     assert.ok(!out.includes('still queued'), out);
     assert.ok(out.includes('since your last look: 1 message'), out);
   });

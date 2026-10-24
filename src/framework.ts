@@ -23,7 +23,7 @@ import {
   type PersistentReaderConfig,
   type ForkReaderConfig,
 } from './tune-out/tools.js';
-import { TuneOutCoordinator, TUNE_OUT_DEFAULTS, alreadyTunedOutText, type ReaderInvocation } from './tune-out/coordinator.js';
+import { TuneOutCoordinator, TUNE_OUT_DEFAULTS, alreadyTunedOutText, type QueuedHeldMessage, type ReaderInvocation } from './tune-out/coordinator.js';
 import { admit, type InboundEnvelope, type AdmissionDecision } from './admission/admit.js';
 import type {
   MessageId,
@@ -4234,7 +4234,7 @@ export class AgentFramework {
             framework.settleUnknownLandings(forPrimary);
             return framework.deferredMessages.filter(forPrimary)
               .sort(bySeq)
-              .map((m) => ({ participant: m.participant, content: m.content, metadata: m.metadata as Record<string, unknown> | undefined, writeId: m.id }));
+              .map((m) => ({ participant: m.participant, content: m.content, metadata: m.metadata as Record<string, unknown> | undefined, writeId: m.id, heldAt: m.heldAt }));
           },
           // Every reader of the shared slot compiles the dump with its own
           // strategy, so the dump fits the smallest of their bounds.
@@ -13725,20 +13725,23 @@ export class AgentFramework {
     if (!primary || cfg?.reader !== 'forks' || !this.agents.has(primary)) return;
     const name = `reader/${primary}/${invocation.epochId.slice(0, 8)}/${++this.readerForkCounter}`;
 
-    const content = (cfg.framing ?? defaultReaderFraming)({
-      resident: primary,
-      fork: name,
-      voice: cfg.voice,
-      channelId: invocation.channelId,
-      epochId: invocation.epochId,
-      trigger: invocation.trigger,
-      notice: invocation.notice,
-      dispositions: invocation.dispositions,
-      backlog: invocation.backlog,
-      queued: invocation.queued,
-    });
     void (async () => {
       try {
+        // The queued messages are rows of the backlog a framing reads, after
+        // the stored ones, so any framing that shows `backlog` shows them.
+        const backlog = [...invocation.backlog, ...this.queuedReaderRows(primary, invocation.queued)];
+        const content = (cfg.framing ?? defaultReaderFraming)({
+          resident: primary,
+          fork: name,
+          voice: cfg.voice,
+          channelId: invocation.channelId,
+          epochId: invocation.epochId,
+          trigger: invocation.trigger,
+          notice: invocation.notice,
+          dispositions: invocation.dispositions,
+          backlog,
+          queuedCount: invocation.queued.length,
+        });
         const fork = await this.deriveAgent({
           name,
           from: primary,
@@ -13770,9 +13773,7 @@ export class AgentFramework {
               channelId: invocation.channelId,
               epochId: invocation.epochId,
               trigger: invocation.trigger,
-              // A queued message is named by its held handle, as module rows
-              // name it until it lands (heldRows).
-              heldMessageIds: [...invocation.backlog.map((m) => m.id), ...invocation.queued.map((m) => heldHandle(m.writeId))],
+              heldMessageIds: backlog.map((m) => m.id),
             } as MessageMetadata,
           }],
           metadata: { epochId: invocation.epochId, channelId: invocation.channelId, trigger: invocation.trigger },
@@ -13811,10 +13812,47 @@ export class AgentFramework {
         }
       } catch (error) {
         console.error(`[tune-out] reader fork ${name} failed:`, error instanceof Error ? error.message : error);
+        // A fork that failed before it reported never read what it was
+        // handed: those messages go back to the channel's backlog, so the
+        // next reader for it is handed them instead of no reader ever being.
+        const reported = this.tuneOutCoordinator?.readerReported(name) ?? false;
+        const returned = reported ? 0 : (this.tuneOutCoordinator?.readerFailed(invocation) ?? 0);
+        this.emitTrace({
+          type: 'tune-out:reader-fork-failed',
+          agentName: name,
+          serverId: invocation.serverId,
+          channelId: invocation.channelId,
+          epochId: invocation.epochId,
+          trigger: invocation.trigger,
+          error: error instanceof Error ? error.message : String(error),
+          reported,
+          returned,
+        });
       } finally {
         this.tuneOutCoordinator?.forgetReader(name);
       }
     })();
+  }
+
+  /**
+   * Held messages still queued behind the resident's turn, as rows of a
+   * reader fork's backlog: each named by its held handle, as module rows name
+   * it until it lands (heldRows), at a provisional sequence past the
+   * resident's last stored message, and timed when it was first held.
+   */
+  private queuedReaderRows(primary: string, queued: QueuedHeldMessage[]): StoredMessage[] {
+    if (queued.length === 0) return [];
+    const cm = this.agents.get(primary)!.getContextManager();
+    const count = cm.getMessageCount();
+    const last = count > 0 ? cm.getMessageWindow(count - 1, 1, { resolveBlobs: false }).messages[0]?.sequence ?? 0 : 0;
+    return queued.map((m, i) => ({
+      id: heldHandle(m.writeId),
+      sequence: last + 1 + i,
+      participant: m.participant,
+      content: m.content,
+      metadata: m.metadata as MessageMetadata | undefined,
+      timestamp: new Date(m.heldAt ?? Date.now()),
+    }));
   }
 
   /** A reader fork's own words to the resident: attributed mail when it has a route, else under its name. */

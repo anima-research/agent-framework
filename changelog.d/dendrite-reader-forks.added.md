@@ -5,8 +5,9 @@
   its tools and system prompt, ending with it — hands it the traffic held since
   the last look as ordinary framing (each held message to exactly one fork, media
   preserved), including messages still queued behind a resident turn that is
-  running, which `ReaderInvocation.queued` and `ReaderFramingContext.queued`
-  carry, and lets it report through `deliver_summary` as attributed mail
+  running, which come last in `ReaderFramingContext.backlog` with held handles
+  for ids (`queuedCount` says how many), and lets it report through
+  `deliver_summary` as attributed mail
   under the fork's name and incarnation. In this mode `subconscious.model` is
   required (whose weights read the resident's prefix is never defaulted; the
   resident's own model makes the fork a copy, another model by name is allowed)
@@ -17,6 +18,10 @@
   `subconscious.framing(context)` decides how a fork is prompted, with
   `defaultReaderFraming` exported as the default. A cadence period with nothing
   new derives no fork. A reader's own cancel is followed by one more fork only
-  for messages that arrived after the reader was handed its own. New trace
-  `tune-out:reader-fork` (`held`, of which `queued`). `reader: 'persistent'`
-  remains the default and is unchanged.
+  for messages that arrived after the reader was handed its own, and a
+  reader's own release of the all-except hold by one fork for each channel
+  with messages no reader was handed. A fork that throws before it reports
+  gives its messages back to the channel's next reader while the epoch still
+  holds the channel. New traces `tune-out:reader-fork` (`held`, of which
+  `queued`) and `tune-out:reader-fork-failed` (`returned`).
+  `reader: 'persistent'` remains the default and is unchanged.

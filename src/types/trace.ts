@@ -885,6 +885,25 @@ export type TraceEvent =
       queued: number;
     })
 
+  /**
+   * A tune-out reader fork threw: its framing, its derive or its run. One
+   * that failed before it reported gives its held messages back to the
+   * channel's backlog while the epoch still holds the channel (`returned`
+   * counts them), so the next reader for the channel is handed them.
+   */
+  | (TraceEventBase & {
+      type: 'tune-out:reader-fork-failed';
+      agentName: string;
+      serverId: string;
+      channelId: string;
+      epochId: string;
+      trigger: 'cadence' | 'wake' | 'cancel';
+      error: string;
+      /** Whether the fork had reported through `deliver_summary` before it failed. */
+      reported: boolean;
+      returned: number;
+    })
+
   // Dendrite: agent registry and lifecycle.
   // `agent-created` is the consent event: it names the kind of agent, what
   // ends it, and what happens to it when its spawner ends.
