@@ -526,12 +526,17 @@ describe('an agent whose model binds its thinking, with its window size set, tak
   // takes their reasoning out of the request. The window projection still guards.
   const huge = 1_000_000;
   for (const [label, limits, restarts] of [
-    ['binds, with a window size: the stream goes on', { thinkingBinding: { binds: true }, physicalWindowTokens: huge }, false],
-    ['binds, with no window size: the budget restart, as before', { thinkingBinding: { binds: true } }, true],
-    ['a window size, without binds: the budget restart, as before', { physicalWindowTokens: huge }, true],
+    ['binds, with a window size: the stream goes on', { thinkingBinding: { binds: true }, physicalWindowTokens: huge }, []],
+    ['binds, with no window size: the budget restart, as before', { thinkingBinding: { binds: true } }, ['context_budget']],
+    ['a window size, without binds: the budget restart, as before', { physicalWindowTokens: huge }, ['context_budget']],
     // A window size that isn't a finite number reads as none: a config read from JSON can hold null.
-    ['binds, with a null window size: the budget restart, as before', { thinkingBinding: { binds: true }, physicalWindowTokens: null as unknown as number }, true],
-    ['binds, with an infinite window size: the budget restart, as before', { thinkingBinding: { binds: true }, physicalWindowTokens: Infinity }, true],
+    ['binds, with a null window size: the budget restart, as before', { thinkingBinding: { binds: true }, physicalWindowTokens: null as unknown as number }, ['context_budget']],
+    ['binds, with an infinite window size: the budget restart, as before', { thinkingBinding: { binds: true }, physicalWindowTokens: Infinity }, ['context_budget']],
+    // One a config holds as a string reads as its number, as the projection's comparison always read it.
+    ['binds, with a window size given as a string: the stream goes on', { thinkingBinding: { binds: true }, physicalWindowTokens: String(huge) as unknown as number }, []],
+    // The first call's projection passes the window: its prompt (170, cache included), its output (20) and the
+    // reserve for the next response (100) make 290, past 250, where without the prompt they'd make 120.
+    ['binds, with a window the stream outgrows: the window restart', { thinkingBinding: { binds: true }, maxTokens: 100, physicalWindowTokens: 250 }, ['physical_window']],
   ] as const) {
     it(label, async () => {
       const dir = mkdtempSync(join(tmpdir(), 'af-binds-budget-'));
@@ -554,8 +559,8 @@ describe('an agent whose model binds its thinking, with its window size set, tak
         await tornDown();
         const restarted = traces.filter((e) => e.type === 'inference:stream_restarted');
         assert.ok(firstUsage.inputTokens! > 50, 'the first call is over the budget');
-        assert.deepEqual(restarted.map((e) => (e as { reason?: string }).reason), restarts ? ['context_budget'] : []);
-        assert.equal(membrane.calls.length, restarts ? 2 : 1, restarts ? 'the restart opened a second stream' : 'one stream, its tool round included');
+        assert.deepEqual(restarted.map((e) => (e as { reason?: string }).reason), restarts);
+        assert.equal(membrane.calls.length, restarts.length > 0 ? 2 : 1, restarts.length > 0 ? 'the restart opened a second stream' : 'one stream, its tool round included');
         assert.equal(traces.filter((e) => e.type === 'inference:completed').length, 1, 'the turn completed');
       } finally {
         await framework.stop();

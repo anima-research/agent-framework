@@ -98,8 +98,9 @@ export interface AgentConfig {
    * request the provider will 400 (issue #92: a legal compile can walk past
    * the physical window mid-turn). The projection runs once a call on the
    * stream has reported its prompt. Unset → no projection; only the
-   * maxStreamTokens restart applies. A value that isn't a finite number, such
-   * as null, reads as unset.
+   * maxStreamTokens restart applies. A value is converted to a number as a
+   * comparison converts it, so a string such as "200000" reads as its number;
+   * one whose number isn't finite, such as null, reads as unset.
    */
   physicalWindowTokens?: number;
 

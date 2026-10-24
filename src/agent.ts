@@ -423,10 +423,12 @@ export class Agent {
     this.providerParams = config.providerParams;
     this.sameRoundThinkTextPolicy = config.sameRoundThinkTextPolicy;
     this.maxStreamTokens = config.maxStreamTokens ?? 150_000;
-    // A window size that isn't a finite number (a config read from JSON can hold null) is no window, for every rule
-    // that reads it: the projection could never pass one, and the binding's budget rule would skip the budget restart.
-    this.physicalWindowTokens = typeof config.physicalWindowTokens === 'number' && Number.isFinite(config.physicalWindowTokens)
-      ? config.physicalWindowTokens : undefined;
+    // The window size converted as the projection's comparison (`projected > window`) converts it, so a string such
+    // as "200000" from a JSON or YAML config is its number, for every rule that reads it. A value whose number isn't
+    // finite is no window: null, NaN and Infinity, which the comparison never passed, and -Infinity, which it always
+    // did, a restart at every boundary.
+    const window = config.physicalWindowTokens == null ? NaN : Number(config.physicalWindowTokens);
+    this.physicalWindowTokens = Number.isFinite(window) ? window : undefined;
     this.contextBudgetTokens = config.contextBudgetTokens;
     this.configuredContextBudgetTokens = config.contextBudgetTokens;
     this.contextManager = contextManager;
