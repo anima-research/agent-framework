@@ -354,6 +354,55 @@ describe("MCP's resource_link, a reference (RFC-005 §8.1)", () => {
     }
   });
 
+  it("reads a uri in a parameter's value as it reads the link's own, four levels deep, and withholds one nested deeper", () => {
+    const presigned = `https://zz-bucket.s3.amazonaws.com/k.png?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=zz&X-Amz-Signature=${SECRET}`;
+    const line = (uri: string) => toolResultDataToHistoryString([TEXT, { type: 'resource_link', uri, name: 'report.csv' }]).split('\n')[1]!;
+    const stub = /^\[ref_[^\]]+\] report\.csv — from tool result — it's not tied to any server, so there's nowhere to fetch it from$/;
+    // An image proxy's shape: the signed URL percent-encoded as one
+    // parameter's value, one decode level down, and two.
+    const once = `https://zz-site.example/_next/image?url=${encodeURIComponent(presigned)}&w=640`;
+    const twice = `https://zz-camo.example/?u=${encodeURIComponent(once)}`;
+    // Userinfo in a nested uri, and a credential in a nested uri's fragment.
+    const userinfo = `https://zz-site.example/go?to=${encodeURIComponent('https://zz-user:zz-pass@zz-elsewhere.example/r.csv')}`;
+    const fragment = `https://zz-site.example/go#next=${encodeURIComponent(`https://zz-elsewhere.example/cb#access_token=${SECRET}`)}`;
+    for (const uri of [once, twice, userinfo, fragment]) assert.match(line(uri), stub, uri);
+    // An ordinary nested uri shows, four levels down too; a fifth level is
+    // past the bound, and withheld whatever it holds.
+    const nest = (levels: number) => {
+      let uri = 'https://zz-files.example/page?v=1';
+      for (let i = 0; i < levels; i += 1) uri = `https://zz-site${i}.example/r?next=${encodeURIComponent(uri)}`;
+      return uri;
+    };
+    for (const levels of [1, 4]) {
+      const uri = nest(levels);
+      assert.equal(line(uri), `[resource link "report.csv": ${uri}; not fetched]`, String(levels));
+    }
+    assert.match(line(nest(5)), stub);
+    // A value that isn't an absolute uri is a value, though it reads as a
+    // path: the relative reading's fail-closed answer never meets it.
+    const plain = 'https://zz-files.example/search?q=zz%20elsewhere%20report&page=zz-reports/2';
+    assert.equal(line(plain), `[resource link "report.csv": ${plain}; not fetched]`);
+  });
+
+  it("never shows a data: link's uri, which holds its content rather than naming where it lies", () => {
+    const payload = 'iVBORw0KGgo'.repeat(40);
+    for (const uri of [`data:image/png;base64,${payload}`, `DATA:text/plain,${payload}`]) {
+      const link = { type: 'resource_link', uri, name: 'inline.png' };
+      const shown = toolResultDataToHistoryString([TEXT, link]);
+      assert.match(shown, /^zz-text\n\[ref_[^\]]+\] inline\.png — from tool result — it's not tied to any server, so there's nowhere to fetch it from$/, uri.slice(0, 20));
+      assert.ok(!shown.includes(payload), shown.slice(0, 200));
+      // A script's object for it carries no uri either, as the line shows none.
+      const object = referenceBlockForScript(link, undefined) as { uri?: string };
+      assert.equal(object.uri, undefined);
+    }
+    // From a server, the stub says why the fetch is refused, without the scheme.
+    servingFiles();
+    const link = { type: 'resource_link', uri: `data:image/png;base64,${payload}`, name: 'inline.png' };
+    referenceRegistry.register(testimonyOf(link), 'zz-files');
+    const shown = toolResultDataToHistoryString([TEXT, link]);
+    assert.ok(shown.endsWith('inline.png — from tool result — scheme not allowed: this host fetches only http and https uris') && !shown.includes(payload), shown.slice(0, 200));
+  });
+
   it("in a tool result, shows the stub that says why where the host can't fetch it and the uri may carry a credential", () => {
     const carriers = [
       // userinfo, whatever the scheme

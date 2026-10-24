@@ -258,7 +258,8 @@ export function shownServerId(serverId: string): string {
  * `accessToken`, `access-token` and `access_token[]` are one name. RFC-005 §5: "Signed URLs and query capabilities are
  * bearer credentials that look like locations", so a uri is shown only where
  * the host's policy classifies it as non-capability-bearing, which here is
- * one with no userinfo and none of these parameters (uriMayCarryCredential).
+ * one with no userinfo and none of these parameters, nor any uri in a
+ * parameter's value that has them (uriMayCarryCredential).
  * For example:
  * - AWS's signed URLs: `https://b.s3.amazonaws.com/k?X-Amz-Algorithm=…&X-Amz-Credential=…&X-Amz-Security-Token=…&X-Amz-Signature=…`
  * - Google Cloud Storage's: `https://storage.googleapis.com/b/k?X-Goog-Algorithm=…&X-Goog-Credential=…&X-Goog-Signature=…`
@@ -301,9 +302,13 @@ function credentialName(name: string): string {
  * anchor (`#token`) or `?token=` doesn't. A `?` or `;` inside either may
  * separate parameters too, as in a route kept in a fragment
  * (`#/reset?token=…`), so the parameters are read both with and without
- * them as separators, and one with a value in either reading counts. A uri
- * that doesn't parse, even as a relative reference, may, since its parts
- * can't be read.
+ * them as separators, and one with a value in either reading counts. A
+ * parameter's value that is itself an absolute uri, as an image proxy's
+ * `?url=<a percent-encoded signed URL>` is once decoded, is read the same
+ * way, nested up to CREDENTIAL_NESTING deep, and a uri nested deeper may
+ * carry one, since a bound that let the next level through would be the
+ * same gap one level down. A uri that doesn't parse, even as a relative
+ * reference, may, since its parts can't be read.
  */
 export function uriMayCarryCredential(uri: string): boolean {
   let u: URL;
@@ -318,14 +323,35 @@ export function uriMayCarryCredential(uri: string): boolean {
       return true;
     }
   }
+  return urlMayCarryCredential(u, 0);
+}
+
+/** How deep uriMayCarryCredential reads uris nested in parameters' values,
+ *  each one a parameter's value in the uri before it. */
+const CREDENTIAL_NESTING = 4;
+
+function urlMayCarryCredential(u: URL, depth: number): boolean {
   if (u.username !== '' || u.password !== '') return true;
   // Read both ways: with '&' alone separating parameters, as a server
   // reading the query as WHATWG does sees them, and with '?' and ';' too, so
   // a value that opens with one (`token=;…`) still counts in the first.
   const named = (params: string) => [params, params.replace(/[?;]/g, '&')].some((read) =>
-    [...new URLSearchParams(read).entries()]
-      .some(([name, value]) => value !== '' && CREDENTIAL_PARAMETERS.has(credentialName(name))));
+    [...new URLSearchParams(read).entries()].some(([name, value]) => value !== ''
+      && (CREDENTIAL_PARAMETERS.has(credentialName(name)) || nestedMayCarry(value, depth))));
   return named(u.search) || named(u.hash.slice(1));
+}
+
+/** Whether a parameter's value, decoded, is an absolute uri that may carry
+ *  a credential. Only an absolute one is read, so an ordinary value never
+ *  meets the relative reading's fail-closed answer. */
+function nestedMayCarry(value: string, depth: number): boolean {
+  let inner: URL;
+  try {
+    inner = new URL(value);
+  } catch {
+    return false;
+  }
+  return depth >= CREDENTIAL_NESTING || urlMayCarryCredential(inner, depth + 1);
 }
 
 /** How the host reaches a server, as far as fetching its references goes:
@@ -915,7 +941,9 @@ export function claimedExpiry(record: ReferenceRecord, claims: ResultClaims | un
  * The uri a tool result's link shows, or null where it shows none: a link
  * (fromLink) the host can't fetch, whose uri can't carry a credential, and
  * that no reference withholds with `disposition: never`, keeps its uri, the
- * agent's only handle on it. A tool result's link line (buildReferenceStub,
+ * agent's only handle on it. A `data:` uri holds its content rather than
+ * naming where it lies, so it's never shown: a link's line isn't a way for
+ * inline data to reach context. A tool result's link line (buildReferenceStub,
  * unfetchedLinkUri) and a script's object for the link
  * (referenceBlockForScript) both ask this, so the model and a script, whose
  * output comes back to the model, see a link's uri alike.
@@ -932,7 +960,7 @@ export function shownLinkUri(t: ReferenceTestimony, record: ReferenceRecord, now
   if (!t.fromLink || claimedNever(record, claims)) return null;
   if (unfetchableReason(record, nowMs, claims) === null) return null;
   const uri = shownUri(t.uri);
-  return uriMayCarryCredential(uri) ? null : uri;
+  return uriMayCarryCredential(uri) || /^data:/i.test(uri) ? null : uri;
 }
 
 /**
