@@ -397,6 +397,10 @@ describe("MCP's resource_link, a reference (RFC-005 §8.1)", () => {
       // absolute one, and a protocol-relative one read once decoded.
       `https://zz-r.example/go?u=${twice(presigned)}`,
       `https://zz-r.example/go?u=${twice('//zz-user:zz-pass@zz-bucket.example/k')}`,
+      // Decoded leniently, as the parameter itself was: a stray `%` doesn't
+      // stop the reading, and an `&` the first decode made stays in the value.
+      `https://zz-r.example/go?u=${twice('//zz-user:zz-pass@zz-bucket.example/k')}%`,
+      `https://zz-r.example/go?u=${encodeURIComponent(`%2Fpath&x%3Ftoken%3D${SECRET}`)}`,
     ]) assert.match(line(uri), stub, uri);
     // A decode is a level: three nestings below one value encoded twice put
     // the fourth at level five, past the bound, where encoded once it's read.
@@ -422,6 +426,7 @@ describe("MCP's resource_link, a reference (RFC-005 §8.1)", () => {
       'https://zz-files.example/x?next=/home',
       'https://zz-files.example/x?lang=en:US&tag=type:image',
       'https://zz-files.example/x?q=zz%20elsewhere%20report',
+      'https://zz-files.example/x?q=100%25%20off%',
       'https://zz-files.example/badge?color=%23ff0000&label=%23zz',
     ]) assert.equal(line(uri), `[resource link "report.csv": ${uri}; not fetched]`, uri);
   });

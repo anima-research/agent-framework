@@ -354,8 +354,9 @@ function urlMayCarryCredential(u: URL, depth: number): boolean {
  *  a fragment alone, such as a colour's `#ff0000`, would otherwise bring
  *  back the query it sits in and be read again at each level; else, where
  *  decoding it once more changes it, decoded and read again from the start.
- *  Each read or decode is a level. A value that is none of these, such as a
- *  word, or a malformed `%`, answers false, so an ordinary value never meets
+ *  Each read or decode is a level, and a decode is lenient, as the
+ *  parameter's own was, so a stray `%` doesn't stop it. A value that is none
+ *  of these, such as a word, answers false, so an ordinary value never meets
  *  the relative reading's fail-closed answer; within the bound a decode
  *  alone never withholds, and past it a value that would still decode does. */
 function nestedMayCarry(value: string, outer: URL, depth: number): boolean {
@@ -375,12 +376,10 @@ function nestedMayCarry(value: string, outer: URL, depth: number): boolean {
     }
   }
   if (inner !== null) return depth >= CREDENTIAL_NESTING || urlMayCarryCredential(inner, depth + 1);
-  let decoded: string;
-  try {
-    decoded = decodeURIComponent(value);
-  } catch {
-    return false;
-  }
+  // Decoded as the parameter itself was, leniently: a stray `%` stays as it
+  // is rather than stopping the reading, as it doesn't stop a server's.
+  // `+` and `&` are escaped first, so they come back as themselves.
+  const decoded = new URLSearchParams(`v=${value.replace(/[+&]/g, encodeURIComponent)}`).get('v') ?? value;
   if (decoded === value) return false;
   // Past the bound, a value that would still decode is withheld: the check's
   // work stops where its reading does, and a uri found deeper would be.
