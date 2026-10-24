@@ -74,7 +74,7 @@ describe('thinkingBinding.binds', () => {
     assert.deepEqual(changed(await id({}, [tool('a'), tool('b')], [systemNote('two')])), ['system'], 'a system-position injection');
     assert.deepEqual(changed(await id({ systemPrompt: 'You are another agent.' }, [tool('a'), tool('b')], [systemNote('one')])), ['system'], 'the system prompt');
     assert.deepEqual(changed(await id({ model: 'claude-sonnet-5-5' }, [tool('a'), tool('b')], [systemNote('one')])), ['model'], 'the model');
-    for (const settings of [{ maxTokens: 999 }, { thinking: { enabled: true, budgetTokens: 2048 } }, { providerParams: { tool_choice: { type: 'any' } } }, { thinkingBinding: { binds: true, dropBlock: true } }] as Array<Partial<AgentConfig>>) {
+    for (const settings of [{ maxTokens: 999 }, { thinking: { enabled: true, budgetTokens: 2048 } }, { providerParams: { tool_choice: { type: 'any' } } }, { thinkingBinding: { binds: true, dropBlock: true } }, { prefillUserMessage: '<cmd>cat untitled.txt</cmd>' }] as Array<Partial<AgentConfig>>) {
       assert.deepEqual(changed(await id(settings, [tool('a'), tool('b')], [systemNote('one')])), ['request'], JSON.stringify(settings));
     }
   });

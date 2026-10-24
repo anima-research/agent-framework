@@ -1709,19 +1709,23 @@ export class Agent {
    * thinking-binding record. The system text is the one the request will carry, built from the system-position
    * injections given to the compile as the kv-unified prefix hash builds it; the tools are the ones it will carry, in
    * their order; `request` covers the thinking config, `maxTokens` and `providerParams`, where a host puts its own
-   * thinking config and `tool_choice`. Nothing without `binds`: the compile is as it was.
+   * thinking config and `tool_choice`, and `prefillUserMessage`, which membrane sends as a leading user turn ahead
+   * of a conversation that would begin with the assistant. Nothing without `binds`: the compile is as it was.
    */
   private bindingCompileOptions(tools: readonly ToolDefinition[], systemInjections: ContentBlock[]): BindingCompileOptions {
     const thinkingBinding = this.thinkingBindingOption();
     if (!thinkingBinding) return {};
-    const { config, providerParams } = this.requestSettings();
+    const { config, providerParams, prefillUserMessage } = this.requestSettings();
     return {
       thinkingBinding,
       identity: {
         system: stableHash(this.buildSystemPrompt(systemInjections)),
         tools: stableHash(tools),
         model: stableHash(this.model),
-        request: stableHash({ thinking: config.thinking ?? null, maxTokens: config.maxTokens, providerParams: providerParams ?? null }),
+        request: stableHash({
+          thinking: config.thinking ?? null, maxTokens: config.maxTokens, providerParams: providerParams ?? null,
+          prefillUserMessage: prefillUserMessage ?? null,
+        }),
       },
     };
   }
