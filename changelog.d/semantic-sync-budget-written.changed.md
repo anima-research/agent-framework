@@ -7,6 +7,6 @@
   push, which no pass kept: the message walk checked once per page of 256,
   and messages the overlap behind the cursor found new went uncounted. A
   pass still re-sends items the service holds unchanged, such as the
-  overlap's, and those cost nothing, so re-sending them can't use a pass
-  up. A search that finds a pass already running waits for that pass,
+  overlap's, and those spend no budget and need no embedding, so
+  re-sending them can't use a pass up. A search that finds a pass already running waits for that pass,
   under its budget.

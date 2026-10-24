@@ -57,13 +57,15 @@ export interface SemanticIndexConfig {
    * whatever the budget, and deletes the items its summaries had from before
    * they were keyed by creation time as it sends them.
    *
-   * A pass also re-sends items the service already holds unchanged, which
-   * cost nothing however many there are: the overlap behind the message
-   * cursor, the summaries since the summary cursor while a delete of their
-   * old items keeps failing, and, once on a branch with no cursor yet, as
-   * after upgrading to keys with the creation time, the summaries it shares
-   * with other branches. A tick that finds a pass already running, such as
-   * a search's catch-up, starts none of its own. Default 1024.
+   * A pass also re-sends items the service already holds unchanged. They
+   * spend no budget however many there are, and each costs the service a
+   * check and a metadata write, with no embedding. They're the overlap
+   * behind the message cursor, the summaries since the summary cursor while
+   * a delete of their old items keeps failing, and, once on a branch with
+   * no cursor yet, as after upgrading to keys with the creation time, the
+   * summaries it shares with other branches. A tick that finds a pass
+   * already running, such as a search's catch-up, starts none of its own.
+   * Default 1024.
    */
   maxSyncPerTick?: number;
   /**
@@ -660,9 +662,11 @@ export class SemanticIndexer {
       // What the pass may still write. Edits spend one each; summaries and
       // messages spend what the service says each upsert wrote (inserted or
       // updated), so a re-send it finds unchanged, such as the overlap's
-      // behind the message cursor, costs nothing and can't freeze a pass.
-      // A budget of 1.5 writes one item.
-      let budget = Math.floor(maxItems);
+      // behind the message cursor, spends no budget and can't freeze a pass.
+      // A budget of 1.5 writes one item. One that isn't a number is no limit,
+      // as it was before the budget counted writes, and chunks stay a batch.
+      const floored = Math.floor(maxItems);
+      let budget = Number.isNaN(floored) ? Infinity : floored;
       let pending: IndexItem[] = [];
       const flush = async (): Promise<void> => {
         if (pending.length === 0) return;
@@ -832,7 +836,7 @@ export class SemanticIndexer {
       // of more than a page within one millisecond is walked, not jumped.
       let offset = 0;
       const pageSize = 256;
-      // The walk starts with the overlap's re-sends, which cost nothing, but
+      // The walk starts with the overlap's re-sends, which spend no budget, but
       // like every chunk go out no bigger than the budget left, so a pass
       // whose summaries left little sends them a few at a time.
       for (let stopped = false; !stopped;) {

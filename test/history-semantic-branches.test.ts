@@ -1034,6 +1034,20 @@ it('a budget of 1.5 writes one item', async (t) => {
   assert.deepEqual(keysOf(svc, 'message'), ['msg:m1']);
 });
 
+it('a budget that isn\'t a number is no limit, sent a batch at a time', async (t) => {
+  const svc = new FakeService(); await svc.start();
+  t.after(() => svc.stop());
+  const sizes: number[] = [];
+  svc.onUpsert = async (items) => { sizes.push(items.length); };
+  const T = Date.UTC(2026, 8, 22);
+  const mod = new HistoryModule({ semantic: { url: svc.url, namespace: 'ns', syncIntervalMs: 0, syncBatch: 2 } });
+  mod.bind(stubStore(Array.from({ length: 5 }, (_, i) => ({ id: `m${i + 1}`, ms: T + i })), []));
+  t.after(() => mod.stop());
+  const r = (await mod.syncSemanticIndex(Number.NaN))!;
+  assert.equal(r.inserted, 5, JSON.stringify(r));
+  assert.deepEqual(sizes, [2, 2, 1]);
+});
+
 it('an item the service updates counts against the budget, as one it inserts does', async (t) => {
   const svc = new FakeService(); await svc.start();
   t.after(() => svc.stop());
