@@ -235,10 +235,11 @@ export interface MountConfig {
    * mount. The answer gives a step for each thing the caller may have
    * meant: that mount's path to use; for a new file of this mount's, a path
    * outside both spellings; and for one already there, whoever runs the
-   * workspace starting it again once the nested mount's directory is made,
-   * where the guess rests on a case difference beneath directories that told
-   * nothing at start, and renaming one of the two where it rests on the names
-   * themselves. Where start placed the nested mount only by a guess,
+   * workspace renaming one of the two spellings, or, where the guess rests on
+   * a case difference beneath directories that told nothing at start,
+   * starting it again once the nested mount's directory is made, and renaming
+   * one of the two if the answer comes again after a start that found it
+   * there, since such a level can tell nothing with that directory in it too. Where start placed the nested mount only by a guess,
    * comparing the real roots, as for two mounts' roots configured in spellings
    * it can't tell apart, a path there is a guess too, however exactly it
    * matches, and the answer names that directory as the path spells it, with
@@ -257,12 +258,13 @@ export interface MountConfig {
    * knowing each nested root by which directory it is; a nested mount
    * whose root moves while running, as `acceptRoot` takes, stays placed where
    * it was until the next start, but for the calls of a direct mount whose
-   * root has moved and beneath whose path it's configured, which place it
-   * where it lies; a name a start reads a level's folding by, gone for a
+   * root has moved and on or beneath whose path it's configured, which place
+   * it where it lies; a name a start reads a level's folding by, gone for a
    * moment and back under the same inode number and change time, as a rename
-   * away and back within one tick of a coarse clock right after its last
-   * change can leave it, or a remake on a filesystem whose change times this
-   * module doesn't trust (filesystemTrustsCtime), can make a level that folds
+   * away and back, or a remake under the freed inode number, within one tick
+   * of a coarse clock right after its last change can leave it, or a remake
+   * on a filesystem whose change times this module doesn't trust
+   * (filesystemTrustsCtime), can make a level that folds
    * case read as one that tells it apart, when another spelling of it is
    * looked up while it's gone; and where a direct mount's root is repointed
    * between a read's parse and its open, or a write's parse and its staging, a race

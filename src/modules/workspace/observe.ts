@@ -787,8 +787,9 @@ export async function ownCaseFolding(dir: string, name?: string): Promise<boolea
   // made meanwhile, which changes the file's change time; one in the other
   // case made before, in a directory that tells case apart, still reads as
   // folding. A name gone and back with the same inode number and change time
-  // still passes, as a rename away and back within one tick of a coarse
-  // clock can leave it; that race is outside the nested-mount guarantee
+  // still passes, as a rename away and back, or a remake under the freed
+  // inode number, within one tick of a coarse clock right after its last
+  // change can leave it; that race is outside the nested-mount guarantee
   // (MountConfig.include), and the third spelling's own answer is gated on
   // trusted change times below.
   const unchanged = (a: BigIntStats, b: BigIntStats) => sameFile(a, b) && a.ctimeNs === b.ctimeNs;
@@ -1038,11 +1039,15 @@ function quotedList(paths: readonly string[]): string {
  * to use there may name another file, or nothing. A path the caller named
  * (`named`) may also be a new file of this mount's, which a path outside the
  * directory gives a place; a file already there can only be reached once
- * whoever runs the workspace renames one of the two, or, where the guess rests
- * on levels that told nothing at start, starts it again once the nested
- * mount's directory is made: each such level's directory lacked that
- * directory's own name, which tells whether the level is read from a listing
- * or by that name alone (levelFolds).
+ * whoever runs the workspace renames one of the two spellings, or, where the
+ * guess rests on levels that told nothing at start, starts it again once the
+ * nested mount's directory is made, where such a level lacked that
+ * directory's own name, which then tells, read from a listing or by that name
+ * alone (levelFolds). A level can tell nothing with the name there too, as
+ * where every lettered name it holds has a twin in case that tells nothing
+ * (ownCaseFolding), and the text can't tell a directory made since start from
+ * one that was there, so it says to rename one of the two spellings if the
+ * answer comes again after a start that found the directory there.
  */
 export function nestedStep(holder: { name: string; use: string; guess?: NestedGuess }, opts: { after?: string; named?: boolean } = {}): string {
   const { guess } = holder;
@@ -1066,8 +1071,9 @@ export function nestedStep(holder: { name: string; use: string; guess?: NestedGu
   const untold = guess.byName ? [] : guess.untold;
   const one = untold.length === 1;
   const since = untold.length === 0 ? '' : `, since nothing in ${quotedList(untold)} showed at start how ${one ? 'it compares' : 'they compare'} names`;
-  const remedy = untold.length === 0 ? 'rename one of the two'
-    : `start it again once mount "${holder.name}"'s directory is made`;
+  const rename = `rename one of "${guess.given}" and "${guess.dir}"`;
+  const remedy = untold.length === 0 ? rename
+    : `start it again once mount "${holder.name}"'s directory is made, and, if this answer comes again after a start that found it there, to ${rename}`;
   const own = opts.named
     ? `If you meant one of this mount's own, for a new file use a path outside "${guess.given}" and "${guess.dir}", and for one already there ask whoever runs this workspace to ${remedy}`
     : `If not, ask whoever runs this workspace to ${remedy}`;
