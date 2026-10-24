@@ -748,10 +748,9 @@ export class SemanticIndexer {
         }
         await flush();
         // The index's old items go once their summaries' new ones are in. On
-        // a service without /delete they stay, and search drops an old-form
-        // hit once this branch's cursor covers its summary. A failed delete
-        // leaves the cursor, so the next pass sends those summaries and
-        // deletes again.
+        // a service without /delete they stay, and search leaves them out. A
+        // failed delete leaves the cursor, so the next pass sends those
+        // summaries and deletes again.
         let deleted = true;
         if (oldKeys.length > 0 && !noIndex && !this.deleteUnsupported) {
           try {

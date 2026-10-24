@@ -283,10 +283,10 @@ describe('HistoryModule semantic_search', () => {
     } finally { await svc2.stop(); }
   });
 
-  it('an item from before keys carried the creation time is shown with the local summary and its chars while no cursor covers it, whatever text the index holds', async () => {
-    // Before this branch's passes reach the summary, its old-form item is
-    // checked as before: ranked by the text the index holds, shown with the
-    // local summary's.
+  it('an item from before keys carried the creation time is never a hit, and isn\'t counted, whatever text the index holds', async () => {
+    // An old-form item can hold this branch's summary or another branch's
+    // under the same id, so it's left out, as superseded, before this
+    // branch's passes send the summary under its own key.
     const svc2 = new FakeService(); await svc2.start();
     try {
       const local = [{ ...summaries[0], content: 'Summary of a morning on this branch' }];
@@ -295,11 +295,11 @@ describe('HistoryModule semantic_search', () => {
       mod.bind(stubCm(messages, local));
       const res = await mod.handleToolCall({ id: 'o', name: 'semantic_search', input: { query: 'evening', level: 1 } });
       assert.equal(res.success, true, JSON.stringify(res));
-      const hit = (res.data as { hits: Array<{ id: string; snippet: string; chars: number; score: number }> }).hits.find((h) => h.id === 'sum:s1');
-      assert.ok(hit, JSON.stringify(res.data));
-      assert.equal(hit.score, 0.9, 'ranked by the text the index holds, the only one with "evening"');
-      assert.equal(hit.snippet, 'Summary of a morning on this branch');
-      assert.equal(hit.chars, 'Summary of a morning on this branch'.length);
+      const data = res.data as { hits: Array<{ id: string }>; index: { droppedOffBranch: number; droppedStale: number } };
+      assert.ok(svc2.items.has('sum:s1'), 'the premise: the old item is still in the index');
+      assert.deepEqual(data.hits.map((h) => h.id), [], JSON.stringify(res.data));
+      assert.equal(data.index.droppedOffBranch, 0);
+      assert.equal(data.index.droppedStale, 0);
       await mod.stop();
     } finally { await svc2.stop(); }
   });

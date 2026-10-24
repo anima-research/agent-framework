@@ -297,15 +297,30 @@ it('on a service without /delete, an old item is left out of search once this br
   assert.equal(r.svc.deleteCalls, calls);
 });
 
-it('before this branch\'s first pass, an old item is still its summary\'s hit', async (t) => {
+it('before this branch\'s first pass, an old item is no hit, and isn\'t counted', async (t) => {
   const r = await rig(t, { maxSyncBeforeSearch: 0 });
   await r.talk('apples');
   const [apples] = r.summaries();
   r.svc.items.set(`sum:${apples!.id}`, { id: `sum:${apples!.id}`, text: apples!.content, kind: 'summary', cursor: apples!.created });
-  assert.deepEqual((await r.search('apples')).hits, [`sum:${apples!.id} ${apples!.content}`]);
+  const found = await r.search('apples');
+  assert.deepEqual(found.hits, []);
+  assert.equal(found.droppedOffBranch, 0);
+  assert.equal(found.droppedStale, 0);
 });
 
-it('an old item is still its summary\'s hit while a bounded pass hasn\'t reached that summary', async (t) => {
+it('with the default catch-up, a branch with no cursors finds its summary under its new key on its first search, and its old item is deleted', async (t) => {
+  const r = await rig(t);
+  await r.talk('apples');
+  const [apples] = r.summaries();
+  r.svc.items.set(`sum:${apples!.id}`, { id: `sum:${apples!.id}`, text: apples!.content, kind: 'summary', cursor: apples!.created });
+  assert.deepEqual(cursors(r), {}, 'the premise: no cursors yet');
+  const found = await r.search('apples');
+  assert.deepEqual(found.hits, [`sum:${apples!.id} ${apples!.content}`]);
+  assert.ok(r.svc.items.has(`sum:${apples!.id}@${apples!.created}`), 'sent under its new key by the catch-up');
+  assert.ok(!r.svc.items.has(`sum:${apples!.id}`), 'and its old item deleted');
+});
+
+it('while a bounded pass hasn\'t reached a summary, its old item is no hit, and the search says it\'s behind', async (t) => {
   const r = await rig(t, { maxSyncBeforeSearch: 1 });
   r.svc.noDelete = true;
   await r.talk('apples');
@@ -319,7 +334,8 @@ it('an old item is still its summary\'s hit while a bounded pass hasn\'t reached
   const found = await r.search(newest.content);
   assert.ok((cursors(r).summaries as number) < newest.created, JSON.stringify(r.state()));
   assert.ok(!r.svc.items.has(`sum:${newest.id}@${newest.created}`), 'the premise: the newest isn\'t sent yet');
-  assert.deepEqual(found.hits, [`sum:${newest.id} ${newest.content}`], 'its old item is the hit');
+  assert.deepEqual(found.hits, [], 'its old item is no hit');
+  assert.equal(found.behind, true);
 });
 
 it('a pass whose budget runs out inside a millisecond finishes it, so each summary there has its old item deleted', async (t) => {
@@ -485,25 +501,25 @@ it('messages a branch stored before another branch\'s later synced ones are inde
 
 it('a search the store leaves its branch during checks the hits with the branch it lands on', async (t) => {
   const r = await rig(t, { maxSyncBeforeSearch: 0 });
-  r.svc.noDelete = true;
   t.mock.method(console, 'warn', () => {});
   const trunk = r.manager.currentBranch().name;
   const forkAt = r.store.currentSequence();
   await r.talk('apples');
+  const apples = r.summaries().find((s) => s.content.includes('apples'))!;
   r.store.createBranchAt('side', trunk, forkAt);
   await r.manager.switchBranch('side');
   await r.talk('cherries');
-  const cherries = r.summaries().find((s) => s.content.includes('cherries'))!;
-  await r.manager.switchBranch(trunk);
-  await r.talk('bananas');
   await r.mod.syncSemanticIndex();
-  assert.ok((cursors(r).summaries ?? 0) >= cherries.created, 'the premise: the trunk\'s cursor is past the side\'s summary');
-  // An item from before keys carried the creation time, holding the side's summary.
-  r.svc.items.set(`sum:${cherries.id}`, { id: `sum:${cherries.id}`, text: cherries.content, kind: 'summary', cursor: cherries.created });
+  const cherries = r.summaries().find((s) => s.content.includes('cherries'))!;
+  assert.equal(cherries.id, apples.id, 'the premise: the side minted the trunk\'s summary id');
+  assert.ok(r.svc.items.has(`sum:${cherries.id}@${cherries.created}`), 'the premise: the side\'s summary is indexed under its own key');
+  await r.manager.switchBranch(trunk);
+  const onTrunk = await r.search(cherries.content);
+  assert.deepEqual(onTrunk.hits, [], 'the premise: on the trunk the side\'s summary is no hit');
   // The search starts on the trunk, and the store moves to the side while it waits.
   r.svc.onSearch = async () => { r.svc.onSearch = null; await r.manager.switchBranch('side'); };
   const found = await r.search(cherries.content);
-  assert.deepEqual(found.hits, [`sum:${cherries.id} ${cherries.content}`], 'the side has no cursor yet, so its old item is its hit');
+  assert.deepEqual(found.hits, [`sum:${cherries.id} ${cherries.content}`], 'checked on the side, it\'s the side\'s hit');
 });
 
 it('a branch with no message cursor, as after an upgrade, starts its walk at the service\'s watermark', async (t) => {
