@@ -267,8 +267,8 @@ function captureRouting(framework: AgentFramework) {
   const routed: string[] = [];
   const registry: Record<string, unknown> = {
     handleChannelToolCall: async () => ({ success: true, data: 'ok' }),
-    routeSpeech: async (_agent: string, text: string) => { routed.push(text); return { delivered: true, channelId: 'world:commons' }; },
-    resolveLocus: () => 'world:commons', getDefaultPublishChannel: () => null,
+    routeSpeech: async (_agent: string, text: string) => { routed.push(text); return { delivered: true, serverId: 'stub', channelId: 'world:commons' }; },
+    resolveLocus: () => ({ serverId: 'stub', channelId: 'world:commons' }), getDefaultPublishChannel: () => null,
     isChannelOpen: () => true, getDescriptor: () => undefined, getChannelTools: () => [],
   };
   (framework as unknown as { channelRegistry: unknown }).channelRegistry = new Proxy(registry, {
@@ -684,10 +684,10 @@ test('disposed conversation fork cannot regain legacy tool permissions', async (
   const h = await harness({ allowedTools: ['probe--allowed'] });
   try {
     const internals = h.framework as unknown as {
-      createConversationAgent(name: string, channel: string): Promise<{name: string}>;
+      createConversationAgent(name: string, home: { serverId: string; channelId: string }): Promise<{name: string}>;
       disposeConversationAgent(name: string): void;
     };
-    const fork = await internals.createConversationAgent('conversation-probe-g1', 'world:probe');
+    const fork = await internals.createConversationAgent('conversation-probe-g1', { serverId: 'stub', channelId: 'world:probe' });
     assert.ok(h.framework.getAgent(fork.name));
     const call = {id: 'fork-permitted', name: 'probe--allowed', input: {}, callerAgentName: fork.name};
     assert.equal((await h.framework.executeToolCall(call)).success, true);
@@ -894,8 +894,8 @@ test('ephemeral and conversation fork first surfaces warn once per Agent instanc
       if (!line.startsWith('[deprecated]')) warnings.push(line);
     };
   try {
-    const internals = h.framework as unknown as { createConversationAgent(name: string, channel: string): Promise<{name: string}>; disposeConversationAgent(name: string): void };
-    const fork = await internals.createConversationAgent('utility-fork-g1', 'world:probe');
+    const internals = h.framework as unknown as { createConversationAgent(name: string, home: { serverId: string; channelId: string }): Promise<{name: string}>; disposeConversationAgent(name: string): void };
+    const fork = await internals.createConversationAgent('utility-fork-g1', { serverId: 'stub', channelId: 'world:probe' });
     const created = await h.framework.createEphemeralAgent({ name: 'utility-worker', model: 'test', systemPrompt: 'Test', allowedTools: ['utils'] });
     created.contextManager.addMessage('user', [{ type: 'text', text: 'Complete.' }]);
     h.membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Completed' }]));

@@ -186,7 +186,13 @@ export interface ModuleEvent {
 export interface ToolResult {
   /** Whether the tool succeeded */
   success: boolean;
-  /** Result data (if success) */
+  /**
+   * Result data (if success). The model reads a string as that text, an MCP
+   * content array whose every block the framework knows as those blocks, and
+   * anything else as JSON, where RFC-005 shows a reference as its stub and
+   * withholds inline data that claims a uri or a disposition. With no data,
+   * it reads the result's error text, if any.
+   */
   data?: unknown;
   /** Error message (if failure) */
   error?: string;
@@ -270,9 +276,13 @@ export interface ToolCall {
   /**
    * How long this call's result may be and still reach its caller whole,
    * measured as the framework stores it: an error's text, or a success's data
-   * as JSON (a content array as its text). For a model's call it is the
+   * as JSON (a string or a content array as its text). For a model's call it is the
    * agent's inline cap, past which the framework spills the result to a
-   * workspace file and sends a preview. For a call from a running
+   * workspace file and sends a preview. A result that long is stored whole
+   * unless its round's results together pass the readers' per-message bound,
+   * or a save_recent_image in the round counted it by its share: then each
+   * result of the round takes an equal share of that bound, and one past its
+   * share spills. For a call from a running
    * code_execution script it is the longest result that reaches the script
    * whole whatever its characters, from the script's memory: the script
    * takes an answer of up to a third of its memoryMaxBytes, in which a
@@ -281,13 +291,18 @@ export interface ToolCall {
    * text answer's envelope, over six: 7,456,527 at the default 128 MiB. On
    * Node, past about 1.5 GiB, the host's longest string bounds it instead.
    * A result with a `structured` value reaches a script as its content's
-   * blocks as they are, beside that value as JSON, and the figure counts
+   * blocks, a module's or an MCPL peer's with RFC-005's treatment of what it
+   * governs (a reference as its stub's facts) and a standard peer's as sent,
+   * beside that value as JSON, and the figure counts
    * neither the value nor what the blocks carry past their text, such as each
    * further block's keys or an image's data, so a tool that returns one
    * leaves room for them; and a result nested past 2,000 levels, or whose parse
    * needs more of the script's memory than is free, doesn't reach the script
    * whatever its length. A result that doesn't reach it is answered
-   * ResultTooLarge, the call having taken effect. Nothing is cut or saved to
+   * ResultTooLarge, the call having taken effect. One the host can't convert
+   * to JSON at all, such as one nested deeper than its runtime's
+   * JSON.stringify can take, is answered instead as a failure naming the
+   * tool and saying the call itself completed. Nothing is cut or saved to
    * a file. A tool that pages or budgets its answer can stay under it. The
    * framework sets it on a model's, a script's and the operator's puppet's
    * call to a module, a utility run through `utils` included. A call
@@ -296,7 +311,9 @@ export interface ToolCall {
    * read_image tool passes a model's call to the workspace without it; and a
    * utility run through `utils` carries what its `utils` call carried.
    * Without it, a module holds its answer to a bound of its own, if any: the
-   * workspace's is the house default, 24,000.
+   * workspace's `edit` and `edit_many` answers hold to the house default,
+   * 24,000, and a `read` holds its page to its line limit alone, with every
+   * line whole, since such a caller takes the data itself.
    */
   resultMaxChars?: number;
 }

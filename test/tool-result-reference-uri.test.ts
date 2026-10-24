@@ -1,9 +1,10 @@
 /**
  * A tool result's data never reaches the agent, or its history, with an
  * RFC-005 reference's uri, wherever in the data it sits: data that isn't a
- * content array of blocks the serializer recognizes is written as JSON with
- * each reference as its stub and inline data claiming a uri or a disposition
- * withheld. Everything else in it is written as JSON writes it, as before.
+ * string or a content array of blocks the serializer recognizes is written
+ * as JSON with each reference as its stub and inline data claiming a uri or
+ * a disposition withheld. Everything else in it is written as JSON writes
+ * it, as before.
  */
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';

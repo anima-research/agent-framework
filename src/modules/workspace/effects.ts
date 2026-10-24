@@ -385,7 +385,7 @@ export async function writeContained(
  * the link is what's refused. The opened file's check (checkOpened) asks
  * it, and so does a create, before anything is made.
  */
-async function refusedLanding(view: MountView, rootReal: string, rel: string, real: string): Promise<string | null> {
+export async function refusedLanding(view: MountView, rootReal: string, rel: string, real: string): Promise<string | null> {
   const leaves = view.followSymlinks ? 'a symlink that leaves the mount' : OUTSIDE_PARENT;
   if (!contained(rootReal, real)) return leaves;
   const holder = await nestedAtReal(real, view.nested, { name: view.name, rootReal });

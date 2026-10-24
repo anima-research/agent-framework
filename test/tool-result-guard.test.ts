@@ -9,6 +9,7 @@ import { MembraneError, Membrane as RealMembrane, NativeFormatter, type Provider
   type ProviderResponse, type StreamCallbacks } from '@animalabs/membrane';
 import { AgentFramework, type AgentConfig, type AgentSettingsExtension, type Module, type ModuleContext,
   type ToolCall, type ToolResult, type ProcessEvent, type ProcessState } from '../src/index.js';
+import { destinationKey } from '../src/mcpl/channel-registry.js';
 import { TOOL_RESULT_GUARD_AUDIT_STATE, TOOL_RESULT_GUARD_NOTICE, keptWhenWithheld, withheldResultNotice } from '../src/tool-result-guard.js';
 import { MockYieldingStream, createMockResponse } from './helpers/mock-membrane.js';
 import { UNREACHED_WATCHDOG, silenceRun } from './helpers/run-watchdog.js';
@@ -133,15 +134,37 @@ function toolResults(framework: AgentFramework) {
  * deliverSpeech that explicit and hybrid delivery post through.
  */
 function withDeliverSpeech<T extends Record<string, unknown>>(stub: T): T {
+  // The framework names a channel with its server. These stubs work by
+  // channel id, and every channel is the stub server's, so this adapts
+  // between the two: a locus or target gets the stub's server, and delivery
+  // hands each stub the channel's id.
+  type Channel = { serverId: string; channelId: string };
+  const idOf = (channel: Channel | string | null) => (channel !== null && typeof channel === 'object' ? channel.channelId : channel) as string;
   const route = stub.routeSpeech as (agent: string, text: string, channelId: string) => Promise<{ delivered?: boolean; channelId?: string } | undefined>;
+  const locus = stub.resolveLocus as ((agent: string) => string | null) | undefined;
+  const target = stub.resolveProseTarget as ((spec: string, opts?: unknown) => Record<string, unknown>) | undefined;
   return Object.assign(stub, {
-    deliverSpeech: async (agent: string, text: string, channelId: string) => {
+    routeSpeech: async (agent: string, text: string, channel: Channel | null) => {
+      const result = await route(agent, text, idOf(channel));
+      return result?.delivered ? { ...result, serverId: 'stub' } : result;
+    },
+    deliverSpeech: async (agent: string, text: string, channel: Channel | null) => {
+      const channelId = idOf(channel);
       const result = await route(agent, text, channelId);
       return result?.delivered
         ? { status: 'delivered', destination: { serverId: 'stub', channelId: result.channelId ?? channelId }, at: Date.now() }
         : { status: 'failed', destination: { serverId: 'stub', channelId }, reason: 'the stub reported delivered: false', at: Date.now() };
     },
     resolveDestination: ({ channelId }: { channelId: string }) => ({ destination: { serverId: 'stub', channelId } }),
+    ...(locus ? { resolveLocus: (agent: string) => { const id = locus(agent); return id ? { serverId: 'stub', channelId: id } : null; } } : {}),
+    ...(target ? {
+      resolveProseTarget: (spec: string, opts?: unknown) => {
+        const resolved = target(spec, opts);
+        return 'channelId' in resolved ? { serverId: 'stub', ...resolved } : resolved;
+      },
+    } : {}),
+    channelsNamed: (name: string) => [{ serverId: 'stub', channelId: name }],
+    nameShown: (channel: Channel) => channel.channelId,
   });
 }
 
@@ -1047,13 +1070,15 @@ test("hybrid: a restarted turn whose last response is empty writes its receipt a
 test("a fresh turn starts new routing state in every mode, and leaves the earlier turn's as it was", async () => {
   for (const mode of ['explicit', 'hybrid', 'locus'] as const) {
     const h = await harness([[answer()]], { proseRouting: mode });
-    type Routing = { pin?: string; hybridHold?: 'private' | 'failed';
-      continuation: boolean; deliveries: string[]; suppressed: number; drafts: unknown[]; keptPrivate: number;
-      triggerChannel?: string; locus?: string; engaged: Set<string>; arrivals: Array<{ messageId: string; channelId: string }> };
+    type Channel = { serverId: string; channelId: string };
+    type Routing = { pin?: Channel; hybridHold?: 'private' | 'failed';
+      continuation: boolean; deliveries: Channel[]; suppressed: number; drafts: unknown[]; keptPrivate: number;
+      triggerChannel?: Channel; locus?: Channel; engaged: Set<string>; wasIn: Channel[]; arrivals: Array<{ messageId: string; channel: Channel }> };
     const internals = h.framework as unknown as { turnRouting: Map<string, Routing> };
-    const earlierFields = (): Routing => ({ pin: 'chan-earlier', hybridHold: 'failed',
-      continuation: true, deliveries: ['chan-earlier'], suppressed: 2, drafts: [{ id: 'd-earlier' }], keptPrivate: 1,
-      triggerChannel: 'chan-earlier', locus: 'chan-earlier', engaged: new Set(['chan-earlier']), arrivals: [{ messageId: 'earlier-message', channelId: 'chan-earlier' }] });
+    const earlierChannel = { serverId: 'stub', channelId: 'chan-earlier' };
+    const earlierFields = (): Routing => ({ pin: earlierChannel, hybridHold: 'failed',
+      continuation: true, deliveries: [earlierChannel], suppressed: 2, drafts: [{ id: 'd-earlier' }], keptPrivate: 1,
+      triggerChannel: earlierChannel, locus: earlierChannel, engaged: new Set([destinationKey(earlierChannel)]), wasIn: [earlierChannel], arrivals: [{ messageId: 'earlier-message', channel: earlierChannel }] });
     const earlier = earlierFields();
     internals.turnRouting.set('assistant', earlier);
     try {
@@ -1924,14 +1949,14 @@ test('#281: a withheld result over the inline cap is written as stored, and its 
     const withheld = await h.workspace.readBinary(path);
     assert.ok('data' in withheld);
     const text = (withheld as { data: Buffer }).data.toString('utf8');
-    // The data is a string, stored as its JSON: 407 characters with the quotes.
-    assert.match(text, /^"long-x{94}\n\n\[truncated — showing 100 of 407 chars; full content: workspace file /,
+    // The data is a string, stored as it is: 405 characters.
+    assert.match(text, /^long-x{95}\n\n\[truncated — showing 100 of 405 chars; full content: workspace file /,
       'the withheld file holds the capped text, as stored');
     const whole = /full content: workspace file (work\/tool-results\/[^\s\]"]+\.txt)/.exec(text)?.[1];
     assert.ok(whole && whole !== path, `its note names the file with the whole output: ${text}`);
     const full = await h.workspace.readBinary(whole);
     assert.ok('data' in full);
-    assert.match((full as { data: Buffer }).data.toString('utf8'), /^"long-x{400}"$/);
+    assert.match((full as { data: Buffer }).data.toString('utf8'), /^long-x{400}$/);
     assert.doesNotMatch(stub, /full result/, 'the stub says "its result", which the file holds');
   } finally { await h.framework.stop(); }
 });
@@ -3121,9 +3146,9 @@ test("#281: a conversation fork seeded while its template's stub is written copi
     await framework.runUntilIdle().catch(() => {});
     await until(() => spills === 1, "the template's aborted batch is being annotated");
     const compiles = watchCompiles(framework);
-    const internals = framework as unknown as { createConversationAgent(name: string, channelId: string): Promise<{
+    const internals = framework as unknown as { createConversationAgent(name: string, home: { serverId: string; channelId: string }): Promise<{
       getContextManager(): { getAllMessages(): Array<{ content: ContentBlock[] }> } }> };
-    const forking = internals.createConversationAgent('assistant-chan-g1', 'world:chan');
+    const forking = internals.createConversationAgent('assistant-chan-g1', { serverId: 'stub', channelId: 'world:chan' });
     await until(() => compiles.calls > 0, "the fork's seed waits for the template's stub");
     write.open();
     const fork = await forking;
@@ -3296,14 +3321,14 @@ test('#277: a result keeps the fields its tool marked, in the order marked, cut 
   assert.ok(whole.length > 1000);
   // The note says what was cut and where the rest is, not "original was N",
   // which would read as the whole result's size.
-  assert.equal(cut, `${whole.slice(0, 1000)} [cut at the inline cap: 1000 of these fields' ${whole.length} characters; ` +
+  assert.equal(cut, `${whole.slice(0, 1000)} [cut: 1000 of these fields' ${whole.length} characters; ` +
     'the whole result is where this note says]');
   // A cut never leaves half a surrogate pair.
   // '{"name":"' is 9 characters and each emoji 2, so a cap of 14 falls inside the third.
   const emoji = keptWhenWithheld({ success: true, data: { name: '\u{1F600}'.repeat(10) }, keepWhenWithheld: ['name'] }, 14)!;
   const loneSurrogate = /[\ud800-\udbff](?![\udc00-\udfff])|(?<![\ud800-\udbff])[\udc00-\udfff]/;
   assert.doesNotMatch(emoji, loneSurrogate, `well-formed: ${JSON.stringify(emoji)}`);
-  assert.match(emoji, /^\{"name":"\u{1F600}\u{1F600} \[cut at the inline cap: 13 of these fields' 31 characters;/u);
+  assert.match(emoji, /^\{"name":"\u{1F600}\u{1F600} \[cut: 13 of these fields' 31 characters;/u);
 });
 
 test('#277: a withheld batch keeps what each marked result listed; an unmarked one keeps nothing, and its file has everything', async () => {
@@ -3353,8 +3378,92 @@ test('#277: with no writable workspace the stub still keeps the file lists, cut 
     await h.run();
     const stub = String(toolResults(h.framework)[0].content);
     const whole = JSON.stringify({ written });
-    assert.equal(stub, `${AUDIT_STUB}${LISTS}${whole.slice(0, 1000)} [cut at the inline cap: 1000 of these fields' ` +
+    assert.equal(stub, `${AUDIT_STUB}${LISTS}${whole.slice(0, 1000)} [cut: 1000 of these fields' ` +
       `${whole.length} characters; the whole result is where this note says]`);
+  } finally { await h.framework.stop(); }
+});
+
+/** A strategy whose per-message bound is 4000 characters (1000 tokens). */
+class BoundedStrategy extends PassthroughStrategy {
+  readonly maxMessageTokens = 1000;
+}
+
+test("#277: a withheld round's stubs share their message's bound, each keeping its fields cut within its share", async () => {
+  const written = Array.from({ length: 1000 }, (_, i) => `file-${i}.txt`);
+  const marked: ToolResult = { success: true, data: { written }, keepWhenWithheld: ['written'] };
+  const h = await harness([[calls('marked', 'marked2'), refused()], [answer()]],
+    { toolResultGuard: true, strategy: new BoundedStrategy() as never }, { marked, marked2: marked });
+  try {
+    await h.run();
+    const stubs = toolResults(h.framework).map((block) => String(block.content));
+    // Two results share the bound of 4000, so each stub keeps 2000 less the
+    // notice's room of 640: 1360 characters of its fields.
+    const whole = JSON.stringify({ written });
+    assert.deepEqual(stubs, [marked, marked].map(() => `${AUDIT_STUB}${LISTS}${whole.slice(0, 1360)} [cut: 1360 of these fields' ` +
+      `${whole.length} characters; the whole result is where this note says]`));
+    const total = stubs.reduce((sum, stub) => sum + stub.length, 0);
+    assert.ok(total <= 4000, `the stubs are ${total} characters together`);
+  } finally { await h.framework.stop(); }
+});
+
+test("#277: a withheld result alone under a bound keeps its fields cut within the bound less the notice's room, so its stub fits", async () => {
+  const written = Array.from({ length: 1000 }, (_, i) => `file-${i}.txt`);
+  const h = await harness([[calls('marked'), refused()], [answer()]],
+    { toolResultGuard: true, strategy: new BoundedStrategy() as never },
+    { marked: { success: true, data: { written }, keepWhenWithheld: ['written'] } });
+  try {
+    await h.run();
+    const stub = String(toolResults(h.framework)[0].content);
+    // The bound of 4000 clamps the cap to 4000, and the stub keeps 4000 less
+    // the notice's room of 640: 3360 characters of its fields.
+    const whole = JSON.stringify({ written });
+    assert.equal(stub, `${AUDIT_STUB}${LISTS}${whole.slice(0, 3360)} [cut: 3360 of these fields' ` +
+      `${whole.length} characters; the whole result is where this note says]`);
+    assert.ok(stub.length <= 4000, `the stub is ${stub.length} characters`);
+  } finally { await h.framework.stop(); }
+});
+
+test("#277: a withheld result alone whose bound leaves room for its cap and the notice keeps its fields at the cap, as before", async () => {
+  const written = Array.from({ length: 1000 }, (_, i) => `file-${i}.txt`);
+  const h = await harness([[calls('marked'), refused()], [answer()]],
+    { toolResultGuard: true, strategy: new BoundedStrategy() as never },
+    { marked: { success: true, data: { written }, keepWhenWithheld: ['written'] } });
+  try {
+    const spill = [...(h.framework as unknown as {
+      collectAgentSettingsExtensions(): Map<string, AgentSettingsExtension>;
+    }).collectAgentSettingsExtensions().values()].find((ext) => ext.keys.includes('tool_result_inline_max_chars'))!;
+    spill.update('assistant', { tool_result_inline_max_chars: 1000 });
+    await h.run();
+    // A cap of 1000 under a bound of 4000 is below 4000 less the notice's
+    // room, so the stub keeps its fields to the cap.
+    const stub = String(toolResults(h.framework)[0].content);
+    const whole = JSON.stringify({ written });
+    assert.equal(stub, `${AUDIT_STUB}${LISTS}${whole.slice(0, 1000)} [cut: 1000 of these fields' ` +
+      `${whole.length} characters; the whole result is where this note says]`);
+  } finally { await h.framework.stop(); }
+});
+
+test("#277: a withheld round whose results fit the bound still cuts its stubs' fields within the share, so every stub's place survives the reader's cut", async () => {
+  // About 3,600 characters of fields beside a one-file result: the results fit
+  // 4000 together and are stored as each alone. A stub adds the guard's notice
+  // and place to its fields, so stubs cut at the cap would pass 4000 together.
+  const written = Array.from({ length: 250 }, (_, i) => `file-${i}.txt`);
+  const results = {
+    marked: { success: true, data: { written }, keepWhenWithheld: ['written'] } as ToolResult,
+    marked2: { success: true, data: { written: ['one.txt'] }, keepWhenWithheld: ['written'] } as ToolResult,
+  };
+  const h = await harness([[calls('marked', 'marked2'), refused()], [answer()]],
+    { toolResultGuard: true, strategy: new BoundedStrategy() as never }, results);
+  try {
+    await h.run();
+    const stubs = toolResults(h.framework).map((block) => String(block.content));
+    const whole = JSON.stringify({ written });
+    assert.ok(whole.length > 1360 && whole.length < 3800, `${whole.length} characters of fields`);
+    assert.equal(stubs[0], `${AUDIT_STUB}${LISTS}${whole.slice(0, 1360)} [cut: 1360 of these fields' ` +
+      `${whole.length} characters; the whole result is where this note says]`);
+    assert.equal(stubs[1], `${AUDIT_STUB}${LISTS}${JSON.stringify({ written: ['one.txt'] })}`);
+    const total = stubs.reduce((sum, stub) => sum + stub.length, 0);
+    assert.ok(total <= 4000, `the stubs are ${total} characters together`);
   } finally { await h.framework.stop(); }
 });
 
@@ -3377,7 +3486,7 @@ test('#277: direct API: a withheld result keeps its file lists, cut at the house
     const whole = JSON.stringify({ written });
     assert.ok(whole.length > DEFAULT_TOOL_RESULT_INLINE_MAX_CHARS);
     assert.equal(stub, `${AUDIT_STUB}${LISTS}${whole.slice(0, DEFAULT_TOOL_RESULT_INLINE_MAX_CHARS)}` +
-      ` [cut at the inline cap: ${DEFAULT_TOOL_RESULT_INLINE_MAX_CHARS} of these fields' ${whole.length} characters; ` +
+      ` [cut: ${DEFAULT_TOOL_RESULT_INLINE_MAX_CHARS} of these fields' ${whole.length} characters; ` +
       'the whole result is where this note says]');
   } finally { await h.framework.stop(); }
 });
