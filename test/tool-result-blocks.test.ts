@@ -1436,6 +1436,10 @@ describe('one answer for every block of a result', () => {
       assert.equal(text, UNCHECKED_RESULT_TEXT);
       assert.equal(blocks, false, 'no live copy of its own: the notice is both copies');
       assert.throws(() => toolResultDataToHistoryString(unreadable, undefined, { dataIsContent: true }), /zz-unreadable text/);
+      // A result whose data itself can't be read, as a host's object to the
+      // direct Agent API can be.
+      const result = { get data(): unknown { throw new Error('zz-unreadable data'); } };
+      assert.equal(nonErrorResultText(result, undefined, { toolName: 'zz_data' }), UNCHECKED_RESULT_TEXT);
       // A render that stops where the claims walk got through: the render
       // registers what it shows, and the claims walk registers nothing.
       const uri = 'https://zz-elsewhere.example/render-stop/report.csv';
@@ -1454,9 +1458,10 @@ describe('one answer for every block of a result', () => {
     } finally {
       console.error = error;
     }
-    assert.equal(logged.length, 2, logged.join('\n'));
+    assert.equal(logged.length, 3, logged.join('\n'));
     assert.match(logged[0]!, /tool 'zz_tool'.*zz-unreadable text/);
-    assert.match(logged[1]!, /tool 'zz_deep'.*Maximum call stack size exceeded/);
+    assert.match(logged[1]!, /tool 'zz_data'.*zz-unreadable data/);
+    assert.match(logged[2]!, /tool 'zz_deep'.*Maximum call stack size exceeded/);
   });
 
   it('shows data whose claims walk stops as the unchecked notice, never with no claims, and a round with it completes, both copies alike', async () => {

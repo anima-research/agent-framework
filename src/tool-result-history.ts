@@ -293,20 +293,22 @@ export function nonErrorResultText(
   maxChars?: number,
   options?: HistorySerializeOptions,
 ): string {
-  const data = result.data;
-  if (data === undefined || data === null) {
-    const error = result.error;
-    if (typeof error === 'string' && error) {
-      const text = error.toWellFormed();
-      return maxChars ? truncateForHistory(text, maxChars) : text;
-    }
-  }
   // The blocks go to the caller only once the text is made from them, so a
   // result that shows the notice has no live copy of its own: the notice is
   // both copies' text.
   let blocks: [HistoryBlockSpan[], ToolResultBlock[]] | undefined;
   const onBlocks = options?.onBlocks;
   try {
+    // Read inside the catch too: the direct Agent API's result is its
+    // caller's own object, whose `data` can be a getter.
+    const data = result.data;
+    if (data === undefined || data === null) {
+      const error = result.error;
+      if (typeof error === 'string' && error) {
+        const text = error.toWellFormed();
+        return maxChars ? truncateForHistory(text, maxChars) : text;
+      }
+    }
     const text = toolResultDataToHistoryString(data, maxChars, {
       ...options,
       dataIsContent: Boolean(result.dataIsContent),
