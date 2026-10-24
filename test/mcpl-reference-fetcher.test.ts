@@ -139,6 +139,19 @@ test("a registry journal keeps each record as it stood when it opened, through a
   assert.equal(reg.findByUri(u), undefined);
   assert.deepEqual([two.before(u)?.testimony.disposition, two.before(u)?.serverIds], [undefined, ['first', 'second']]);
   two.close();
+  // Two journals open at once, with no registration between their opens,
+  // each get a copy of their own.
+  const x = 'https://zz-journal.example/x.csv';
+  reg.register(t(x), 'first');
+  const three = reg.openJournal();
+  const four = reg.openJournal();
+  reg.register(t(x), 'second');
+  assert.notEqual(three.before(x), four.before(x));
+  assert.deepEqual(three.before(x)?.serverIds, ['first']);
+  assert.notEqual(three.before(x)?.serverIds, four.before(x)?.serverIds);
+  three.close();
+  four.close();
+  assert.equal(reg.journalCount, 0);
 });
 
 test('vector 5: digest mismatch is never presented', async () => {

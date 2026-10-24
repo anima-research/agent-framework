@@ -1433,6 +1433,22 @@ describe('one answer for every block of a result', () => {
     assert.ok(toolResultDataToHistoryString([dated, link], undefined, { dataIsContent: true }).includes('inline-never'));
   });
 
+  it("withholds a link's uri whose userinfo falls past where its shown text is cut", () => {
+    // Off any server's origin, so the host can't fetch it, and a uri that
+    // can't carry a credential would show; this one's `@` falls past the
+    // 4,096 characters a link's uri is cut to.
+    const link = { type: 'resource_link', uri: `https://zz-user:${'p'.repeat(4200)}@zz-elsewhere.example/long-userinfo.csv`, name: 'a.csv' };
+    const control = { type: 'resource_link', uri: 'https://zz-elsewhere.example/short-userinfo-control.csv', name: 'a.csv' };
+    assert.ok(toolResultDataToHistoryString([control], undefined, { dataIsContent: true }).includes('short-userinfo-control'));
+    for (const shown of [
+      toolResultDataToHistoryString([link], undefined, { dataIsContent: true }),
+      toolResultDataToHistoryString({ link }),
+      JSON.stringify(shownToScript(link, scriptViewClaims([link], false))),
+    ]) {
+      assert.ok(!shown.includes('zz-user:'), shown.slice(0, 300));
+    }
+  });
+
   it("withholds a never uri from a link whose uri shows as the same text once well formed, a lone surrogate showing as U+FFFD", () => {
     // Each side as the other shows it: a never with the replacement character
     // and a link with a lone surrogate, and the other way round.

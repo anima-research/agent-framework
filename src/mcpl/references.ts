@@ -587,16 +587,16 @@ export class ReferenceRegistry {
 
   /**
    * Keep, until `close`, each record as it stood when this opened: a copy
-   * taken the first time a registration changes, creates or evicts it, or
-   * null where the uri had none. `before(uri)` gives that record, or the
-   * record as it is where nothing registered has touched it since, which is
-   * the same. A fetch that saves a copy in the meantime sets its record's
-   * saved path without registering, so a record no registration has copied
-   * yet is read saved, and one a registration copied first, as a module's
-   * demand fetch registers before it fetches, is read as it stood, unsaved,
-   * as the model's line, which makes no demand fetch, reads it. A fetch saves
-   * only what its checks passed. Each open has its own copies, so lanes
-   * that overlap keep theirs apart, and closing one lets its copies go.
+   * taken the first time a registration names its uri, whatever it changes,
+   * or evicts its record, or null where the uri had none then. `before(uri)`
+   * gives that copy, or, where no registration has named the uri since, the
+   * record as it is, which is the same. A fetch that saves a copy while it's
+   * open sets its record's saved path without registering, so a record no
+   * registration has named since is read saved, and one a registration
+   * named first is read as it stood, unsaved. A fetch saves only what passed
+   * the checks a link's line reads too, so either reads as a record the host
+   * can fetch. Each open has its own copies, so lanes that overlap keep
+   * theirs apart, and closing one lets its copies go.
    */
   openJournal(): RegistryJournal {
     const copies = new Map<string, ReferenceRecord | null>();
@@ -607,12 +607,19 @@ export class ReferenceRegistry {
     };
   }
 
-  /** Copy a uri's record into each open journal that has none for it yet. */
+  /** Copy a uri's record into each open journal that has none for it yet,
+   *  a copy of its own for each. */
   private keepFirst(uri: string): void {
     if (this.journals.size === 0) return;
     const record = this.findByUri(uri);
-    const copy = record ? { ...record, serverIds: [...record.serverIds] } : null;
-    for (const copies of this.journals) if (!copies.has(uri)) copies.set(uri, copy);
+    for (const copies of this.journals) {
+      if (!copies.has(uri)) copies.set(uri, record ? { ...record, serverIds: [...record.serverIds] } : null);
+    }
+  }
+
+  /** How many journals are open: none once every lane has closed its own. */
+  get journalCount(): number {
+    return this.journals.size;
   }
 
   register(testimony: ReferenceTestimony, serverId?: string): ReferenceRecord {
@@ -921,7 +928,9 @@ export function shownLinkUri(t: ReferenceTestimony, record: ReferenceRecord, now
   if (!t.fromLink || claimedNever(record, claims)) return null;
   if (unfetchableReason(record, nowMs, claims) === null) return null;
   const uri = shownUri(t.uri);
-  return uriMayCarryCredential(uri) ? null : uri;
+  // The whole uri as well as the cut it shows: userinfo whose `@` falls past
+  // the cut still carries a credential, and the cut would show part of it.
+  return uriMayCarryCredential(uri) || uriMayCarryCredential(sanitizeLabel(t.uri, Infinity).toWellFormed()) ? null : uri;
 }
 
 /**
@@ -1075,10 +1084,11 @@ export function referenceBlockForScript(block: unknown, serverId?: string, claim
       // claims withhold it: reading more claims can loosen as well as
       // tighten, since an expiry makes a link one the host can't fetch, whose
       // uri the line shows (Ada-1017, room-203 #201013). The line's record is
-      // the one before the script lane registered anything (#202683), since
-      // the treatment registers, rebinds and evicts as it goes, which the
-      // line never sees; where there was none, it's the one the link's own
-      // registration makes. A script never sees a uri the model's line
+      // the registry's as the model's line leaves it, before the script
+      // lane's own registrations (#202683, #203011), since the treatment
+      // registers, rebinds and evicts as it goes, which the line never sees;
+      // where there was none, it's the one the link's own registration
+      // makes. A script never sees a uri the model's line
       // withholds, through its blocks; structured content goes as sent, as
       // on main.
       const lineRecord = line

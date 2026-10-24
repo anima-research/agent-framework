@@ -24,8 +24,8 @@ import { join } from 'node:path';
 
 import { AgentFramework, WorkspaceModule } from '../src/index.js';
 import type { EventResponse, Module, ModuleContext, ToolCall, ToolDefinition, ToolResult } from '../src/index.js';
-import { EXPIRY_REASON, INLINE_WITHHELD_TEXT, UNBOUND_REASON, referenceRegistry } from '../src/mcpl/references.js';
-import type { ReferenceRecord } from '../src/mcpl/references.js';
+import { EXPIRY_REASON, INLINE_WITHHELD_TEXT, UNBOUND_REASON, classifyBlock, referenceRegistry } from '../src/mcpl/references.js';
+import type { ReferenceRecord, ReferenceTestimony } from '../src/mcpl/references.js';
 import { nonErrorResultText } from '../src/tool-result-history.js';
 import { MockMembrane } from './helpers/mock-membrane.js';
 
@@ -799,7 +799,84 @@ test("a link's uri reads its record as it stood before the script lane registere
       assert.ok(!out.includes(`evicted-${route}/report.csv`), `${route}: ${out.slice(-600)}`);
       const view = JSON.parse(out) as { content: Array<Record<string, Record<string, unknown>>>; isError: boolean };
       assert.deepEqual([view.isError, typeof view.content[0]!.link!.refId], [false, 'string'], route);
+      // The never record was evicted: the uri's record now is the link's own.
+      assert.equal(referenceRegistry.findByUri(uri)?.testimony.fromLink, true, route);
+      assert.equal(referenceRegistry.journalCount, 0, `${route}: the lane closed its journal`);
     }
+  });
+});
+
+/** A testimony, as the classifier reads a block. */
+const testimonyOf = (block: Record<string, unknown>): ReferenceTestimony => (classifyBlock(block) as { testimony: ReferenceTestimony }).testimony;
+
+/** Make `uri`'s record the registry's oldest, with the registry full: it
+ *  holds 2,000, so 1,999 new records after it take the place of every older
+ *  one. */
+const fillAfter = (tag: string): void => {
+  for (let i = 0; i < 1999; i++) referenceRegistry.register(testimonyOf({ type: 'resource', uri: `https://files.example.invalid/fill-${tag}/${i}.csv`, name: `${i}.csv` }));
+};
+
+test("a module's result a script reads as text registers its links in the result's order, so a later reference keeps the model's line's never on a link before it", { timeout: 60_000 }, async () => {
+  await withPeers(async ({ answer, script, exit }) => {
+    const uri = 'https://elsewhere.example.invalid/text-order/report.csv';
+    answer({ content: [{ type: 'resource', uri, name: 'report.csv', disposition: 'never' }], structuredContent: {} });
+    await script('mcpl--files--attach');
+    fillAfter('text-order');
+    // The model's render reaches the link first, which keeps its record, and
+    // then registers the new reference, which evicts another.
+    const data = [
+      { type: 'resource_link', uri, name: 'report.csv' },
+      { type: 'resource', uri: 'https://files.example.invalid/text-order/new.csv', name: 'new.csv' },
+    ];
+    const out = await exit({ success: true, data }, 'fwd--whole', false);
+    assert.ok(!out.includes('text-order/report.csv'), out);
+    assert.equal(referenceRegistry.findByUri(uri)?.testimony.disposition, 'never');
+  });
+});
+
+test("a module's view reads the registry as the model's line leaves it: where the result's own reference evicts an earlier never before its link, script and line both show the uri", { timeout: 60_000 }, async () => {
+  await withPeers(async ({ answer, script, exit }) => {
+    // The demand loop registers the result's blocks in the order the model's
+    // render does, so the new reference evicts the never record before the
+    // link, for both: an earlier result's never lasts as long as the registry
+    // keeps it (Ada-1017, room-203 #203011).
+    const uri = 'https://elsewhere.example.invalid/view-evicted/report.csv';
+    const data = () => [
+      { type: 'resource', uri: 'https://files.example.invalid/view-evicted/new.csv', name: 'new.csv' },
+      { type: 'resource_link', uri, name: 'report.csv' },
+    ];
+    const seed = async (): Promise<void> => {
+      answer({ content: [{ type: 'resource', uri, name: 'report.csv', disposition: 'never' }], structuredContent: {} });
+      await script('mcpl--files--attach');
+    };
+    await seed();
+    fillAfter('view-evicted-line');
+    const line = nonErrorResultText({ data: data() });
+    assert.ok(line.includes('view-evicted/report.csv'), line);
+    await seed();
+    fillAfter('view-evicted-script');
+    const out = await exit({ success: true, data: data(), structured: {} }, 'fwd--whole', false);
+    const link = (JSON.parse(out) as { content: Array<Record<string, unknown>> }).content[1]!;
+    assert.equal(link.uri, uri, out);
+    assert.equal(referenceRegistry.journalCount, 0);
+  });
+});
+
+test("a link's record read through an eviction keeps its server binding, so a link the host can fetch shows a script no uri", { timeout: 60_000 }, async () => {
+  await withPeers(async ({ answer, script, exit }) => {
+    // Bound to the files server, on its origin, by the peer's dispatch.
+    const uri = 'https://files.example.invalid/bound-evicted/report.csv';
+    answer({ content: [{ type: 'resource', uri, name: 'report.csv' }], structuredContent: {} });
+    await script('mcpl--files--attach');
+    assert.deepEqual(referenceRegistry.findByUri(uri)?.serverIds, ['files']);
+    // A module's nested references, registered with no server, evict it
+    // before the link, whose own registration then makes it unbound.
+    const many = Array.from({ length: 2001 }, (_, i) => ({ type: 'resource', uri: `https://files.example.invalid/bound-many/${i}.csv`, name: `${i}.csv` }));
+    const out = await exit({ success: true, data: [{ type: 'text', text: 'many', many, link: { type: 'resource_link', uri, name: 'report.csv' } }], structured: {} }, 'fwd--whole', false);
+    assert.ok(!out.includes('bound-evicted/report.csv'), out.slice(-600));
+    assert.deepEqual(referenceRegistry.findByUri(uri)?.serverIds, [], 'evicted, and made again unbound');
+    const view = JSON.parse(out) as { content: Array<Record<string, Record<string, unknown>>> };
+    assert.equal(typeof view.content[0]!.link!.refId, 'string');
   });
 });
 
