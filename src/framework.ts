@@ -29985,6 +29985,9 @@ export class AgentFramework {
       });
       const shadowWarnings = this.eventGate!.lintShadows()
         .map((w) => formatShadowWarning(w));
+      // A rule no probe event matches, such as one scoped to external-message,
+      // is invisible in the table: name it, so its rows don't read as its effect.
+      const notProbed = this.eventGate!.probeUnreached();
       finish({
         success: true,
         data: {
@@ -29993,9 +29996,16 @@ export class AgentFramework {
           policies: this.getGatePolicyNames(),
           ...(shadowWarnings.length > 0 ? { shadowWarnings } : {}),
           probes,
+          ...(notProbed.length > 0
+            ? { notProbed, notProbedNote: 'No probe event matches these rules, so the probes above don\'t show what they do: the probes are a few MCPL chat events and a heartbeat, and these rules ask for something none of them carries, such as another event type (a module\'s messages are external-message), a source, channel or path, or particular content, metadata or tags.' }
+            : {}),
           ...(probes.some((p) => 'changed' in p)
             ? {}
-            : { note: 'No canonical probe changed its winning rule — the new rule affects none of the common chat/heartbeat shapes, or only channel/path-specific events the probes do not model.' }),
+            : {
+              note: notProbed.includes(policy.name)
+                ? 'No canonical probe changed its winning rule: the new rule matches no probe event (see notProbed), so the probes don\'t show its effect.'
+                : 'No canonical probe changed its winning rule — the new rule affects none of the common chat/heartbeat shapes.',
+            }),
         },
       });
     } catch (err) {
