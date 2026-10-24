@@ -1434,18 +1434,21 @@ describe('one answer for every block of a result', () => {
   });
 
   it("withholds a link's uri whose userinfo falls past where its shown text is cut", () => {
-    // Off any server's origin, so the host can't fetch it, and a uri that
-    // can't carry a credential would show; this one's `@` falls past the
-    // 4,096 characters a link's uri is cut to.
-    const link = { type: 'resource_link', uri: `https://zz-user:${'p'.repeat(4200)}@zz-elsewhere.example/long-userinfo.csv`, name: 'a.csv' };
-    const control = { type: 'resource_link', uri: 'https://zz-elsewhere.example/short-userinfo-control.csv', name: 'a.csv' };
+    // A scheme the fetcher refuses, so the host can't fetch it, and a uri
+    // that can't carry a credential would show. Its userinfo, a long name
+    // alone, runs past the 4,096 characters a link's uri is cut to: cut,
+    // the text parses as a host with no userinfo, so only the whole uri
+    // shows the credential. (Where the cut falls in a password, the text
+    // doesn't parse, which withholds it anyway.)
+    const link = { type: 'resource_link', uri: `postgres://zz-user-${'t'.repeat(4200)}@zz-db.example/long-userinfo`, name: 'a.csv' };
+    const control = { type: 'resource_link', uri: 'postgres://zz-db.example/short-userinfo-control', name: 'a.csv' };
     assert.ok(toolResultDataToHistoryString([control], undefined, { dataIsContent: true }).includes('short-userinfo-control'));
     for (const shown of [
       toolResultDataToHistoryString([link], undefined, { dataIsContent: true }),
       toolResultDataToHistoryString({ link }),
       JSON.stringify(shownToScript(link, scriptViewClaims([link], false))),
     ]) {
-      assert.ok(!shown.includes('zz-user:'), shown.slice(0, 300));
+      assert.ok(!shown.includes('zz-user-'), shown.slice(0, 300));
     }
   });
 
