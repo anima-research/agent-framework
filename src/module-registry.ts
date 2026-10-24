@@ -441,7 +441,13 @@ export class ModuleRegistry {
   /**
    * Gather context injections from all modules before inference.
    * Calls each module's gatherContext() in parallel with a per-module timeout.
-   * Fail-open: timed-out or erroring modules are skipped (with a stderr line).
+   * Fail-open: timed-out or erroring modules are skipped (with a stderr line),
+   * whether the call throws, rejects or answers with something other than an
+   * array, and one that answers after its timeout adds nothing to the list.
+   * An array returned without a promise is taken as the module's answer.
+   * Each module's budget starts once its call returns, after its own
+   * synchronous work and every earlier module's; a later module's
+   * synchronous work still counts against it.
    *
    * The per-module budget is `module.contextTimeoutMs` when declared, else the
    * `timeoutMs` default (15s). Modules whose gatherContext does real work —
@@ -468,14 +474,35 @@ export class ModuleRegistry {
         MAX_CONTEXT_TIMEOUT_MS,
       );
       let timer: ReturnType<typeof setTimeout> | undefined;
+      let timedOut = false;
+      // Called here, before its timer is set, so its budget starts after its
+      // synchronous work; a call that throws is skipped as a rejection is,
+      // and one that returns an array without a promise has it taken, rather
+      // than throwing out of this loop and losing every module's.
+      let call: Promise<ContextInjection[]>;
+      try {
+        call = Promise.resolve(module.gatherContext(agentName));
+      } catch (err) {
+        call = Promise.reject(err);
+      }
       const promise = Promise.race([
-        module.gatherContext(agentName).then(r => {
+        call.then(r => {
+          // An answer after the timeout would still land in the list: before
+          // it's returned, while another module is still awaited, or after,
+          // while the caller may still be reading it.
+          if (timedOut) return;
+          // Anything else would be spread into the list element by element,
+          // as a string's characters.
+          if (!Array.isArray(r)) throw new TypeError(`answered with ${r === null ? 'null' : typeof r}, not an array of injections`);
           injections.push(...r);
           this.noteBlocksNotShown(module.name, r);
         }),
         new Promise<void>((_, rej) => {
           timer = setTimeout(
-            () => rej(new Error(`gatherContext timed out after ${budgetMs}ms`)),
+            () => {
+              timedOut = true;
+              rej(new Error(`gatherContext timed out after ${budgetMs}ms`));
+            },
             budgetMs,
           );
         }),
