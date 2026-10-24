@@ -2221,7 +2221,7 @@ export class Agent {
         toolUseId: r.id,
         content: isError
           ? truncateForHistory(typeof error === 'string' ? error.toWellFormed() : error as string, DEFAULT_TOOL_RESULT_INLINE_MAX_CHARS)
-          : nonErrorResultText(r.result, DEFAULT_TOOL_RESULT_INLINE_MAX_CHARS),
+          : nonErrorResultText(r.result, DEFAULT_TOOL_RESULT_INLINE_MAX_CHARS, { toolName: r.name }),
         isError,
       };
     });

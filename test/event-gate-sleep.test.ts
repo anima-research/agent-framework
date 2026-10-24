@@ -24,8 +24,36 @@ import { EventGate } from '../src/gate/event-gate.js';
 import { AgentFramework } from '../src/index.js';
 import { MockMembrane, createMockResponse } from './helpers/mock-membrane.js';
 import { goneNames } from './helpers/gone-names.js';
+import { gateToolCalls } from './helpers/gate-tool-calls.js';
+import { forceExpiry } from './helpers/force-expiry.js';
+import type { ChannelRef } from '../src/mcpl/channel-registry.js';
+import { fixture, eventually, TS, ok } from './helpers/coalescing-fixture.js';
 
 const TMP_DIR = join(import.meta.dirname, '../.test-tmp-gate-sleep');
+
+/** A framework whose agent forks a conversation for each message on the open
+ *  channel `channelId`, with a gate; `incoming` sends that channel a message. */
+async function forkFixture(channelId: string, options: { agents?: unknown[]; idleTtlMs?: number } = {}) {
+  const f = await fixture({
+    ...(options.agents ? { agents: options.agents } : {}),
+    framework: {
+      gate: { config: { policies: [], default: 'always' }, configPath: join(TMP_DIR, `gate-${channelId.replace(/\W/g, '-')}.json`) },
+      conversations: { templateAgent: 'agent', bind: { channel: 'always' }, trigger: { channel: 'always' }, ...(options.idleTtlMs ? { idleTtlMs: options.idleTtlMs } : {}) },
+    } as never,
+  });
+  const gate = (f.framework as unknown as { eventGate: EventGate }).eventGate;
+  const incoming = (messageId: string) => f.send('channels/incoming', {
+    messages: [{ channelId, messageId, timestamp: TS, author: { id: 'U1', name: 'antra' }, tags: ['chat:from-human'], content: [{ type: 'text', text: 'hello' }] }],
+  });
+  try {
+    await f.send('channels/register', { channels: [{ id: channelId, type: 'discord', label: channelId.split(':').pop(), initiallyOpen: true, metadata: { channelType: 'guild_text' } }] });
+    await eventually(() => (f.framework as unknown as { channelRegistry: { getDesiredState(s: string, c: string): string | undefined } }).channelRegistry.getDesiredState('editor', channelId) === 'open', 'the channel is open');
+  } catch (err) {
+    await f.close();
+    throw err;
+  }
+  return { f, gate, incoming };
+}
 
 function makeGate(now?: () => number) {
   const inferenceRequests: Array<{ agentName: string; reason: string; source: string }> = [];
@@ -171,35 +199,19 @@ describe("EventGate sleep: its wake, a stop and a fork's end", () => {
     }
   });
 
-  it("agentGone() ends that agent's sleep and self-wake together, and leaves another agent's", () => {
+  it("agentGone() cancels that agent's self-wake, and leaves another agent's", () => {
     const { gate } = makeGate();
     const selfWakes = (gate as unknown as { selfWakeTimers: Map<string, unknown> }).selfWakeTimers;
     const before = timeouts();
     try {
-      gate.setSleep(60, 'resting', 'fork');
       gate.armSelfWake('fork', 60);
       gate.armSelfWake('agent', 60);
       gate.agentGone('fork');
-      assert.strictEqual(gate.inferenceDiagnostics().sleepUntil, 0, "the gone agent's sleep ends");
-      assert.ok(!selfWakes.has('fork'), 'and its self-wake goes, entry and all');
+      assert.ok(!selfWakes.has('fork'), "the gone agent's self-wake goes, entry and all");
       assert.ok(selfWakes.has('agent'), "another agent's self-wake stays");
       assert.strictEqual(timeouts(), before + 1, "and only that one's timer is left");
     } finally {
       gate.dispose();
-    }
-  });
-
-  it("agentGone() leaves a sleep another agent set, or one set with no agent", () => {
-    const { gate } = makeGate();
-    try {
-      gate.setSleep(60, 'resting', 'agent');
-      gate.agentGone('fork');
-      assert.ok(gate.inferenceDiagnostics().sleepUntil > 0, "another agent's end leaves its sleep");
-      gate.setSleep(60, 'resting');
-      gate.agentGone('fork');
-      assert.ok(gate.inferenceDiagnostics().sleepUntil > 0, 'a sleep with no agent stays');
-    } finally {
-      gate.clearSleep();
     }
   });
 
@@ -233,9 +245,10 @@ describe("EventGate sleep: its wake, a stop and a fork's end", () => {
     }
   });
 
-  it("an ephemeral run's sleep ends when the run does", async () => {
+  it("an ephemeral run's sleep and wake are refused, and its end tells the gate", async () => {
     const membrane = new MockMembrane();
     membrane.pushResponse(createMockResponse([{ type: 'tool_use', id: 's1', name: 'sleep', input: { seconds: 3600, announce: false } }], 'tool_use'));
+    membrane.pushResponse(createMockResponse([{ type: 'tool_use', id: 'w1', name: 'wake', input: {} }], 'tool_use'));
     membrane.pushResponse(createMockResponse([{ type: 'text', text: 'done' }]));
     const framework = await AgentFramework.create({
       storePath: join(TMP_DIR, 'store-ephemeral'),
@@ -246,23 +259,95 @@ describe("EventGate sleep: its wake, a stop and a fork's end", () => {
     });
     const gate = (framework as unknown as { eventGate: EventGate }).eventGate;
     const gone = goneNames(gate);
-    const slept: string[] = [];
-    framework.onTrace((e) => {
-      if ((e as { eventType?: unknown }).eventType === 'sleep:set') slept.push('sleep:set');
-    });
+    const calls = gateToolCalls(framework);
     try {
       framework.start();
+      // The primary sleeps, so a run's sleep would replace its note and a
+      // run's wake would end it.
+      gate.setSleep(3600, 'resting', 'agent');
       const created = await framework.createEphemeralAgent({ name: 'worker', model: 'test-model', systemPrompt: 'Work.', allowedTools: 'all' });
       created.contextManager.addMessage('user', [{ type: 'text', text: 'Go.' }]);
       await framework.runEphemeralToCompletion(created.agent, created.contextManager);
-      assert.deepStrictEqual(slept, ['sleep:set'], 'the run slept');
-      assert.strictEqual(gate.getSleepState(), null, 'and its sleep ended with it');
-      assert.deepStrictEqual(gone, ['worker'], "the run's end told the gate, which ends its self-wake too");
+      assert.deepStrictEqual(calls.refused, [
+        'sleep: Nothing was set: a sleep quiets the whole agent, not one run.',
+        "wake: Nothing was changed: a sleep is the agent's, so this run can't end one.",
+      ]);
+      assert.deepStrictEqual(calls.started, [], 'refused before the tools run');
+      assert.strictEqual(gate.getSleepState()?.note, 'resting', "the primary's sleep stands, neither replaced nor ended");
+      assert.deepStrictEqual(gone, ['worker'], "the run's end told the gate, which cancels its self-wake");
     } finally {
-      // So that a run where the sleep outlives the run doesn't hold the
-      // file's process for the sleep's hour.
+      // So that a run where the sleep takes doesn't hold the file's process
+      // for its hour.
       gate.clearSleep();
       await framework.stop();
+    }
+  });
+
+  it("the primary's sleep still silences a message to its conversation fork", async () => {
+    // The gate decides a channel message's wake before it's routed to a fork,
+    // so the primary's sleep quiets every conversation of the agent.
+    const CH = 'discord:g1:dm';
+    const { f, gate, incoming } = await forkFixture(CH);
+    const router = () => (f.framework as unknown as { getConversationRouter(): { getBinding(channel: ChannelRef): { agentName: string } | undefined } }).getConversationRouter();
+    try {
+      gate.setSleep(3600, 'resting', 'agent');
+      const before = f.membrane.calls.length;
+      await incoming('m1');
+      await f.framework.runUntilIdle();
+      assert.ok(router().getBinding({ serverId: 'editor', channelId: CH }) !== undefined, 'the message reached a conversation fork');
+      assert.strictEqual(f.membrane.calls.length, before, 'no turn while the primary sleeps');
+      assert.ok((gate.getSleepState()?.suppressed ?? 0) >= 1, 'the gate held its wake');
+
+      // Control: awake, the next message wakes the fork.
+      gate.clearSleep();
+      f.membrane.pushResponse(ok());
+      await incoming('m2');
+      await f.framework.runUntilIdle();
+      assert.strictEqual(f.membrane.calls.length, before + 1, 'the fork took a turn');
+    } finally {
+      gate.clearSleep();
+      await f.close();
+    }
+  });
+
+  for (const [what, allowedTools, remedy] of [
+    ['can call skip_reply is told its wake_in_seconds is the way back', 'all', ' To come back to this conversation later, call skip_reply with wake_in_seconds.'],
+    ["can't call skip_reply isn't pointed at it", ['sleep', 'wake'], ''],
+  ] as const) it(`a fork that ${what}, when its sleep is refused`, async () => {
+    const CH = 'discord:g1:dm2';
+    const { f, gate, incoming } = await forkFixture(CH, { agents: [{ name: 'agent', model: 'test', systemPrompt: 'test', allowedTools }] });
+    const calls = gateToolCalls(f.framework);
+    try {
+      await incoming('m1'); // the fork's first turn answers with the fixture's 'ok'
+      await f.framework.runUntilIdle();
+      f.membrane.pushResponse(createMockResponse([{ type: 'tool_use', id: 's1', name: 'sleep', input: { seconds: 3600, announce: false } }], 'tool_use'));
+      f.membrane.pushResponse(ok());
+      await incoming('m2');
+      await f.framework.runUntilIdle();
+      assert.deepStrictEqual(calls.refused, [`sleep: Nothing was set: a sleep quiets the whole agent, not one conversation.${remedy}`]);
+    } finally {
+      gate.clearSleep();
+      await f.close();
+    }
+  });
+
+  it("a closing fork isn't pointed at skip_reply when its sleep is refused, since its self-wake would end with it", async () => {
+    const CH = 'discord:g1:dm3';
+    const IDLE_TTL_MS = 60_000;
+    const { f, gate, incoming } = await forkFixture(CH, { idleTtlMs: IDLE_TTL_MS });
+    const calls = gateToolCalls(f.framework);
+    try {
+      await incoming('m1');
+      await f.framework.runUntilIdle(); // the fork's first turn answers with the fixture's 'ok'
+      forceExpiry(f.framework, { serverId: 'editor', channelId: CH }, IDLE_TTL_MS); // idle past the TTL, and the sweep due
+      f.membrane.pushResponse(createMockResponse([{ type: 'tool_use', id: 's1', name: 'sleep', input: { seconds: 3600, announce: false } }], 'tool_use'));
+      f.membrane.pushResponse(ok());
+      f.framework.pushEvent({ type: 'external-message', source: 'test', content: 'tick', metadata: {} } as never);
+      await f.framework.runUntilIdle();
+      assert.deepStrictEqual(calls.refused, ['sleep: Nothing was set: a sleep quiets the whole agent, not one conversation.'], 'its closure turn is told no way back');
+    } finally {
+      gate.clearSleep();
+      await f.close();
     }
   });
 

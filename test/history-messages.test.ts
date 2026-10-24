@@ -96,15 +96,18 @@ async function service(t: TestContext, status: number, msg: string): Promise<str
  * upsert, delete or search) and how many of that kind came before it. A
  * string body goes as it is, as a web page; anything else, as JSON.
  */
-async function routed(t: TestContext, reply: (kind: string, n: number) => [number, unknown]): Promise<string> {
+async function routed(t: TestContext, reply: (kind: string, n: number, sent: unknown) => [number, unknown]): Promise<string> {
   const seen = new Map<string, number>();
   const server = createServer((req, res) => {
-    req.resume();
+    let raw = '';
+    req.on('data', (c: Buffer) => { raw += c.toString(); });
     req.on('end', () => {
       const kind = (req.url ?? '').slice((req.url ?? '').lastIndexOf('/') + 1);
       const n = seen.get(kind) ?? 0;
       seen.set(kind, n + 1);
-      const [status, body] = reply(kind, n);
+      let sent: unknown = null;
+      try { sent = raw ? JSON.parse(raw) : null; } catch { /* not JSON */ }
+      const [status, body] = reply(kind, n, sent);
       res.writeHead(status, { 'content-type': typeof body === 'string' ? 'text/html' : 'application/json' });
       res.end(typeof body === 'string' ? body : JSON.stringify(body));
     });
@@ -775,9 +778,10 @@ test("a hit whose ts or meta can't be read is returned without it, and the host 
   ]);
 });
 
-test("a background sync whose upsert is answered with a web page, or JSON that isn't an object, keeps the client's sentence as lastError", async (t) => {
+test("a background sync whose upsert is answered with a web page, JSON that isn't an object, or an object without both counts keeps the client's sentence as lastError", async (t) => {
   const hit = { id: 'msg:m1', score: 0.9, ts: T / 1000, channel: 'c1', kind: 'message', level: null, meta: {}, text: 'hello', chars: 5 };
-  for (const body of [PAGE, [], null]) {
+  // A pass's budget spends the counts, so an answer without them isn't taken as one.
+  for (const body of [PAGE, [], null, {}, { inserted: 1, unchanged: 0 }, { inserted: '1', updated: 0 }, { inserted: 1, updated: null }]) {
     const url = await routed(t, (kind) => {
       if (kind === 'search') return [200, { namespace: 'test/ns', hits: [hit], count_indexed: 1, timing_ms: { embed: 1, search: 1 } }];
       if (kind === 'stats') return [404, { error: { message: 'no such index' } }];
@@ -786,7 +790,7 @@ test("a background sync whose upsert is answered with a web page, or JSON that i
     const found = await answer<{ index: Record<string, unknown> }>(withIndex(t, url), 'semantic_search', { query: 'x', limit: 1 });
     assert.equal(
       found.index.lastError,
-      'the semantic index service answered the upsert request without a JSON object (HTTP 200)',
+      'the semantic index service answered the upsert request without counts of the items inserted and updated (HTTP 200)',
       JSON.stringify(body),
     );
   }
@@ -890,23 +894,27 @@ test('a background sync without stats fails on that answer when its budget cuts 
   // More messages than the sync before a search may send (256): with no
   // watermark, every pass would walk the same first page again.
   const messages = Array.from({ length: 300 }, (_, i) => message(`m${i + 1}`, T + i, 'c1'));
+  let pages = 0;
   const many = {
     ...store(),
     getMessage: (id: string) => messages.find((m) => m.id === id) ?? null,
     queryMessagesByTime(args: { fromMs?: number; limit?: number; offset?: number }) {
+      pages++;
       const from = messages.filter((m) => args.fromMs === undefined || m.timestamp.getTime() >= args.fromMs);
       const offset = args.offset ?? 0;
       return { messages: from.slice(offset, offset + (args.limit ?? from.length)), matchedCount: from.length };
     },
   } as unknown as ContextManager;
   const hit = { id: 'msg:m1', score: 0.9, ts: T / 1000, channel: 'c1', kind: 'message', level: null, meta: {}, text: 'hello', chars: 5 };
-  const url = await routed(t, (kind) => {
+  const url = await routed(t, (kind, _n, sent) => {
     if (kind === 'search') return [200, { namespace: 'test/ns', hits: [hit], count_indexed: 1, timing_ms: { embed: 1, search: 1 } }];
     if (kind === 'stats') return [200, PAGE];
-    return [200, { inserted: 1, updated: 0, unchanged: 0, count: 1 }];
+    // Every message is new to this index, so each upsert inserts all it carries.
+    const items = (sent as { items?: unknown[] } | null)?.items?.length ?? 0;
+    return [200, { inserted: items, updated: 0, unchanged: 0, count: items }];
   });
   const warned = t.mock.method(console, 'warn', () => {});
-  // Batches of 100, so the 256 the pass walks end in a batch of 56, sent before the pass fails.
+  // Batches of 100, so the 256 the pass writes end in a batch of 56, sent before the pass fails.
   const h = new HistoryModule({ semantic: { url, token: 'tok', namespace: 'test/ns', syncIntervalMs: 0, syncBatch: 100 } });
   h.bind(many);
   t.after(() => h.stop());
@@ -914,6 +922,7 @@ test('a background sync without stats fails on that answer when its budget cuts 
   const notStats = 'the semantic index service answered the stats request without stats by kind (HTTP 200)';
   assert.equal(found.index.behind, true);
   assert.equal(found.index.syncedThisCall, 256);
+  assert.equal(pages, 1, 'a budget spent at a page\'s end reads no next page');
   assert.equal(found.index.lastError, notStats);
   const lines = warned.mock.calls.map((c) => String(c.arguments[0]));
   assert.ok(lines.includes(`[history/semantic] index "test/ns": sync failed (1×, retry in 5s): ${notStats}`), JSON.stringify(lines));
