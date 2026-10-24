@@ -22556,14 +22556,33 @@ export class AgentFramework {
     // isn't a list, the structured view carrying the result. A failure with
     // no blocks reads as its error text.
     const showsBlocks = structured && (!isError || (Array.isArray(result.data) && result.data.length > 0));
+    const failed = (err: unknown): ToolAnswer => {
+      const error = unconvertibleScriptResult(toolName, err, isError ? result.error : undefined);
+      return {
+        ok: true,
+        json: JSON.stringify({ content: [{ type: 'text', text: error }], structuredContent: null, isError: true }),
+        isError: true,
+        brief: error,
+      };
+    };
     // The claims a module's result is shown by, read once, so the fetches
     // below and what the script gets read the same: a structured result's
     // view's (scriptViewClaims), nested fields included, or the model's text's
-    // (resultClaimsOf). Where a value stops the walk, the records decide: the
-    // script gets the same stop when its view is written.
+    // (resultClaimsOf). A view whose claims walk stops fails closed here,
+    // before any fetch or treatment, so the treatment never runs without
+    // them (Ada-1017, room-203 #200250); for the text, where a value stops
+    // the walk, the records decide, as for the model's own text.
     let claims: ResultClaims | undefined;
     if ((!isError || structured) && Array.isArray(result.data) && fromModule) {
-      claims = (showsBlocks ? scriptViewClaims(result.data, false) : resultClaimsOf(result.data, result.dataIsContent)) ?? undefined;
+      if (showsBlocks) {
+        try {
+          claims = scriptViewClaims(result.data, false);
+        } catch (err) {
+          return failed(err);
+        }
+      } else {
+        claims = resultClaimsOf(result.data, result.dataIsContent) ?? undefined;
+      }
       const fetcher = this.getReferenceFetcher();
       for (const block of result.data) {
         const c = classifyBlock(block);
@@ -22585,15 +22604,6 @@ export class AgentFramework {
         if (!outcome.ok) console.error(`[rfc005] script-demand fetch of ${record.refId} failed: ${outcome.error}`);
       }
     }
-    const failed = (err: unknown): ToolAnswer => {
-      const error = unconvertibleScriptResult(toolName, err, isError ? result.error : undefined);
-      return {
-        ok: true,
-        json: JSON.stringify({ content: [{ type: 'text', text: error }], structuredContent: null, isError: true }),
-        isError: true,
-        brief: error,
-      };
-    };
     // An MCPL peer's result whose blocks JSON couldn't hold, so that RFC-005's
     // treatment couldn't be given them at dispatch.
     if (SCRIPT_RESULT_UNCONVERTIBLE.has(result)) return failed(SCRIPT_RESULT_UNCONVERTIBLE.get(result));
@@ -29043,18 +29053,27 @@ export class AgentFramework {
         // dropped, since they are untreated and the result travels on, to the
         // waiter and to the listeners of its event's trace. Its structured
         // content is kept, as every result keeps it, since RFC-005's
-        // treatment doesn't reach it. A walk of the claims that stops, as at
-        // such a depth or at a fault, claims nothing here: the treatment
-        // below meets the same value and answers for it.
-        const claims = scriptViewClaims(direct.data, true) ?? undefined;
+        // treatment doesn't reach it. The view's claims are read first, by
+        // a walk of their own: where it stops, the treatment doesn't run
+        // (Ada-1017, room-203 #200250), a RangeError meaning a result it
+        // can't convert, as below, and anything else a fault.
+        const unconvertible = (err: unknown): ToolResult => {
+          if (!(err instanceof RangeError)) throw err;
+          const dropped: ToolResult = { ...direct, data: [] };
+          SCRIPT_RESULT_UNCONVERTIBLE.set(dropped, err);
+          return dropped;
+        };
+        let claims: ResultClaims;
+        try {
+          claims = scriptViewClaims(direct.data, true);
+        } catch (err) {
+          return unconvertible(err);
+        }
         const blocks = direct.data.map((block: unknown) => referenceBlockForScript(block, serverId, claims));
         try {
           return { ...direct, data: JSON.parse(JSON.stringify(blocks, (_key, value: unknown) => shownToScriptFromServer(value, serverId, claims))) as unknown[] };
         } catch (err) {
-          if (!(err instanceof RangeError)) throw err;
-          const unconvertible: ToolResult = { ...direct, data: [] };
-          SCRIPT_RESULT_UNCONVERTIBLE.set(unconvertible, err);
-          return unconvertible;
+          return unconvertible(err);
         }
       }
       // A standard peer's content that isn't a list of blocks is a malformed

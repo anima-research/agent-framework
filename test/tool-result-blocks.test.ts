@@ -1392,6 +1392,24 @@ describe('one answer for every block of a result', () => {
     }
   });
 
+  it("keeps a result's native live copy when its turn's results are stored by their shares of the readers' bound", async () => {
+    const fw = Object.create(AgentFramework.prototype) as {
+      buildStoredToolResultContent(agent: string, calls: unknown[], maxChars: number | undefined, bound?: number): Promise<{ spilled: Map<string, unknown> }>;
+    };
+    Object.assign(fw, {
+      toolImageLedgers: new Map(), toolRoundsByShare: new WeakSet(),
+      writeToolResultFile: async () => null, moduleRegistry: { getAllModules: () => [] },
+    });
+    // Two results that pass a bound of 600 together, so each is stored by
+    // its share; the first holds an image, which goes natively at the cap.
+    const withImage = { id: 'zz-share-image', name: 'zz_tool', input: {}, result: { success: true, data: [IMAGE, { type: 'text', text: 'i'.repeat(400) }], dataIsContent: true } };
+    const plain = { id: 'zz-share-text', name: 'zz_tool', input: {}, result: { success: true, data: 't'.repeat(400) } };
+    const { spilled } = await fw.buildStoredToolResultContent('zz-agent', [withImage, plain], 24_000, 600);
+    const stored = spilled.get(withImage.id) as { text: string; live: Array<{ kind: string }> | null };
+    assert.ok(stored.text.length < 500, `stored by its share: ${stored.text.length}`);
+    assert.deepEqual(stored.live?.map((block) => block.kind), ['image', 'text']);
+  });
+
   it("goes natively from the stored pass with links and markers exactly at the cap, and as its stored text one past it", async () => {
     const fw = Object.create(AgentFramework.prototype) as {
       buildStoredToolResultContent(agent: string, calls: unknown[], maxChars: number | undefined): Promise<{ spilled: Map<string, unknown> }>;

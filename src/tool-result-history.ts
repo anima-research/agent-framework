@@ -343,10 +343,12 @@ function governedByRfc005(b: Record<string, unknown>): boolean {
   if (b.type === 'resource') return hasUri(b.uri) || (isPlainRecord(b.resource) && hasUri(b.resource.uri));
   // A link that names a uri is governed whatever its value, so one without
   // a usable uri (empty, null, not a string) is its marker here, as on the
-  // content lanes, never its fields. One that names none carries no uri to
-  // withhold, as the object the script lane makes of a link whose uri it
-  // leaves out (referenceBlockForScript), which a script's view, given it
-  // again, leaves as it is, as it leaves a reference's stub.
+  // content lanes, never its fields. One that names none is data, on every
+  // lane, as on main: its fields hold no uri RFC-005 governs, though a value
+  // in them, such as an untyped object's `uri`, is data as anywhere else.
+  // That's the object the script lane makes of a link whose uri it leaves
+  // out (referenceBlockForScript), which a script's view, given it again,
+  // leaves as it is, as it leaves a reference's stub.
   if (b.type === 'resource_link') return b.uri !== undefined;
   if (b.type === 'image' || b.type === 'audio') return typeof b.data === 'string' || hasUri(b.uri);
   return false;
@@ -412,6 +414,19 @@ function walkedInHistory(value: unknown, asText: (b: Record<string, unknown>) =>
  * show.
  */
 function claimsInHistory(data: unknown): ResultClaims | null {
+  try {
+    return claimsInHistoryOrThrow(data);
+  } catch {
+    // Showing the whole result stops at the same value, for a value that
+    // answers the same each time it's read. A caller that shows part of it,
+    // such as a withheld result's kept fields, can't know what the rest
+    // claims.
+    return null;
+  }
+}
+
+/** claimsInHistory's walk, which throws what stops it. */
+function claimsInHistoryOrThrow(data: unknown): ResultClaims {
   const testimonies: ReferenceTestimony[] = [];
   const read = (b: Record<string, unknown>): string | null => {
     const c = classifyBlock(b);
@@ -421,22 +436,14 @@ function claimsInHistory(data: unknown): ResultClaims | null {
     // decides it first.
     return c.kind === 'text' ? null : '';
   };
-  try {
-    const root = walkedInHistory(data, read);
-    // Its text is thrown away, so a string is written as 0, which keeps a
-    // long one from being copied for nothing; the walk descends as before.
-    if (root === data || typeof root !== 'string') {
-      JSON.stringify(data, (_key, value: unknown) => {
-        const walked = walkedInHistory(value, read);
-        return typeof walked === 'string' ? 0 : walked;
-      });
-    }
-  } catch {
-    // Showing the whole result stops at the same value, for a value that
-    // answers the same each time it's read. A caller that shows part of it,
-    // such as a withheld result's kept fields, can't know what the rest
-    // claims.
-    return null;
+  const root = walkedInHistory(data, read);
+  // Its text is thrown away, so a string is written as 0, which keeps a
+  // long one from being copied for nothing; the walk descends as before.
+  if (root === data || typeof root !== 'string') {
+    JSON.stringify(data, (_key, value: unknown) => {
+      const walked = walkedInHistory(value, read);
+      return typeof walked === 'string' ? 0 : walked;
+    });
   }
   return resultClaims(testimonies);
 }
@@ -473,11 +480,15 @@ export function shownToScript(value: unknown, claims?: ResultClaims): unknown {
  * withholds that uri from every block in the view. Stricter than the
  * model's line, which shows a block and not its fields (contentClaims), and
  * never looser. An MCPL peer's top-level block the classifier rejects is
- * its notice, its fields unshown, so they don't count (`fromServer`). Null
- * where a value stops the walk, which stops the view at the same value.
+ * its notice, its fields unshown, so they don't count (`fromServer`). It
+ * throws what stops the walk, such as a value too deep to convert or a
+ * getter that throws, and the script's view then isn't written: the
+ * treatment never runs without the claims it reads (Ada-1017, room-203
+ * #200250), whether or not its own walk, with other replacers and so other
+ * stack depths, would stop at the same value.
  */
-export function scriptViewClaims(content: readonly unknown[], fromServer: boolean): ResultClaims | null {
-  return claimsInHistory(fromServer ? content.filter((block) => classifyBlock(block).kind !== 'invalid') : content);
+export function scriptViewClaims(content: readonly unknown[], fromServer: boolean): ResultClaims {
+  return claimsInHistoryOrThrow(fromServer ? content.filter((block) => classifyBlock(block).kind !== 'invalid') : content);
 }
 
 /**

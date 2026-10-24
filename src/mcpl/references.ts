@@ -116,7 +116,9 @@ export function classifyBlock(block: unknown): BlockClassification {
       // that claims none. Its title, description and annotations aren't
       // testimony.
       // A link's size is MCP's `size`; the script lane's object for a link
-      // names it `sizeBytes`, so given again it reads the same.
+      // names it `sizeBytes`, so given again it reads the same, where
+      // sanitizeLabel left its uri as it was. Read on every lane, so a
+      // peer's link that names a `sizeBytes` is labelled with it too.
       return linkTestimony(parseReferenceFields({ uri: block.uri, name: block.name, mimeType: block.mimeType, sizeBytes: block.size ?? block.sizeBytes }));
     default:
       return { kind: 'invalid', shown: unknownBlockText(block) };

@@ -637,6 +637,70 @@ test("a RangeError from serializing an MCPL peer's blocks, as a result past the 
   });
 });
 
+test("a nested never decides over a plain reference to its uri at the top, for a link at the top or nested, from a peer or a module", { timeout: 30_000 }, async () => {
+  await withPeers(async ({ answer, script, exit }) => {
+    // The top-level blocks alone claim nothing that withholds the uri, so
+    // only a reading of the claims the whole view shows (scriptViewClaims)
+    // keeps it from the link. Each link comes before the references, so a
+    // registry that read them as it went wouldn't have them yet.
+    // A uri of its own for each route, so neither finds the other's
+    // references in the registry.
+    const content = (route: string, where: string) => {
+      const uri = `https://elsewhere.example.invalid/strictest-${route}-${where}/plain.csv`;
+      const link = { type: 'resource_link', uri, name: 'plain.csv' };
+      return [
+        where === 'top' ? link : { type: 'text', text: 'a nested link', link },
+        { type: 'resource', uri, name: 'plain.csv' },
+        { type: 'text', text: 'sealed', attachment: { type: 'resource', uri, name: 'plain.csv', disposition: 'never' } },
+      ];
+    };
+    for (const where of ['top', 'nested']) {
+      answer({ content: content('peer', where), structuredContent: {} });
+      const fromPeer = await script('mcpl--files--attach');
+      const fromModule = await exit({ success: true, data: content('module', where), structured: {} }, 'fwd--whole', false);
+      for (const out of [fromPeer, fromModule]) assert.ok(!out.includes('elsewhere.example.invalid'), `${where}: ${out}`);
+    }
+  });
+});
+
+test("a peer's top-level block the classifier rejects shows none of its fields, so a never among them claims nothing in a script's view", { timeout: 30_000 }, async () => {
+  await withPeers(async ({ answer, script }) => {
+    const uri = 'https://elsewhere.example.invalid/rejected-fields/plain.csv';
+    const content = [
+      { type: 'video', uri: 'https://elsewhere.example.invalid/clip.mp4', sealed: { type: 'resource', uri, disposition: 'never' } },
+      { type: 'resource', uri, name: 'plain.csv' },
+      { type: 'resource_link', uri, name: 'plain.csv' },
+    ];
+    answer({ content, structuredContent: {} });
+    const object = JSON.parse(await script('mcpl--files--attach')) as { content: Array<Record<string, unknown>> };
+    assert.equal(object.content[0]!.type, 'text', 'the video is its notice');
+    assert.equal(object.content[2]!.uri, uri, 'the view shows no never for the uri, so the link carries it, as the model\'s line shows it');
+  });
+});
+
+test("where the walk of a script view's claims stops, the view isn't written, though the treatment's own walk would pass", async () => {
+  await withPeers(async ({ answer, script, exit }) => {
+    // A value that stops the claims walk and not the treatment's: its type
+    // throws a RangeError the first time it's read, as a stack can run out
+    // one frame sooner in one walk than in the other, and then reads as data.
+    const once = () => {
+      let read = false;
+      return { get type(): string { if (!read) { read = true; throw new RangeError('Maximum call stack size exceeded'); } return 'note'; } };
+    };
+    const uri = 'https://elsewhere.example.invalid/stopped-walk/plain.csv';
+    const content = () => [{ type: 'text', text: 'one link', deep: once(), attachment: { type: 'resource', uri, disposition: 'never' } }, { type: 'resource_link', uri, name: 'plain.csv' }];
+    answer({ content: content(), structuredContent: {} });
+    const fromPeer = JSON.parse(await script('mcpl--files--attach')) as { content: [{ text: string }]; isError: boolean };
+    assert.equal(fromPeer.isError, true);
+    assert.match(fromPeer.content[0].text, /^tool 'mcpl--files--attach' returned a result that can't be converted to JSON/);
+    // A module's result, as the exit receives it.
+    const fromModule = JSON.parse(await exit({ success: true, data: content(), structured: {} }, 'fwd--whole', false)) as { content: [{ text: string }]; isError: boolean };
+    assert.equal(fromModule.isError, true);
+    assert.match(fromModule.content[0].text, /^tool 'fwd--whole' returned a result that can't be converted to JSON/);
+    for (const out of [fromPeer, fromModule]) assert.ok(!JSON.stringify(out).includes('elsewhere.example.invalid'), JSON.stringify(out));
+  });
+});
+
 test("a fault in an MCPL peer's round trip other than a RangeError fails the dispatch, as any fault does, with its own message", async () => {
   await withPeers(async ({ answer, script, observe }) => {
     const seen = observe();
