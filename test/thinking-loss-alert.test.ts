@@ -167,6 +167,23 @@ describe('the operators\' alert on a framework turn', () => {
     assert.equal(alerts.length, 2);
   });
 
+  it('counts a block of the stream\'s own round and one it can\'t place, and names each in the alert\'s data', async () => {
+    // The second call drops round 0's block (the stream's own first reply) and a block at the request's first
+    // message, which holds no signed block, so it can't be placed; the stored reply, at the record's start, is kept.
+    const alerts = await turn(0, () => [[], [entry({ message: 3, block: 0, round: 0 }), entry({ message: 0, block: 0 })], []]);
+    assert.equal(alerts.length, 1);
+    assert.match(alerts[0]!.message, /dropped 2 signed thinking blocks/);
+    assert.match(alerts[0]!.message, /0 in stored replies after the record began at sequence \d+, 1 from the stream's own rounds, 1 that couldn't be placed/);
+    assert.deepEqual({ replies: alerts[0]!.data?.replies, rounds: alerts[0]!.data?.rounds, unplaced: alerts[0]!.data?.unplaced },
+      { replies: [], rounds: [0], unplaced: 1 });
+  });
+
+  it('stays quiet for a drop for the account\'s binding, wherever it sits', async () => {
+    const account = (at: { message: number; block: number }, reason: string) => entry({ message: at.message, block: at.block, reason } as never);
+    const alerts = await turn(-1, (at) => [[account(at, 'organization_binding_mismatch')], [account(at, 'end_user_binding_mismatch')], []]);
+    assert.equal(alerts.length, 0, 'the record tracks neither');
+  });
+
   it('stays quiet for a reply at the record\'s start, and where the compile gives no record start', async () => {
     assert.equal((await turn(0, (at) => [[dropped(at)], [dropped(at)], []])).length, 0, 'minted before the record began');
     assert.equal((await turn(undefined, (at) => [[dropped(at)], [dropped(at)], []])).length, 0, 'a context manager without a record');

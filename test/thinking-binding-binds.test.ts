@@ -9,6 +9,7 @@ import assert from 'node:assert/strict';
 import type { ContextInjection, ContextManager } from '@animalabs/context-manager';
 import type { Membrane, NormalizedRequest } from '@animalabs/membrane';
 
+import { createHash } from 'node:crypto';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -49,6 +50,19 @@ async function turnOptions(settings: Partial<AgentConfig>, tools: ToolDefinition
   return seen[0];
 }
 
+/** A digest as the agent takes one: SHA-256 over JSON with each object's keys sorted. */
+function digest(value: unknown): string {
+  const encode = (item: unknown): string => {
+    if (Array.isArray(item)) return `[${item.map(encode).join(',')}]`;
+    if (item && typeof item === 'object') {
+      const record = item as Record<string, unknown>;
+      return `{${Object.keys(record).sort().map((key) => `${JSON.stringify(key)}:${encode(record[key])}`).join(',')}}`;
+    }
+    return JSON.stringify(item) ?? 'null';
+  };
+  return createHash('sha256').update(encode(value)).digest('hex');
+}
+
 describe('thinkingBinding.binds', () => {
   it('tells each compile a framework turn sends the binding and the request head\'s digests, and tells nothing without it', async () => {
     const binding = await turnOptions({ thinkingBinding: { binds: true, dropBlock: true } }, [tool('a')]);
@@ -60,6 +74,28 @@ describe('thinkingBinding.binds', () => {
       const opts = await turnOptions(settings);
       assert.equal(opts?.thinkingBinding, undefined, JSON.stringify(settings));
       assert.equal(opts?.identity, undefined, JSON.stringify(settings));
+    }
+  });
+
+  it('digests what the request it starts the stream with carries ahead of its messages', async () => {
+    for (const tools of [[tool('a'), tool('b')], []]) {
+      const { contextManager, seen } = recording();
+      const membrane = new MockMembrane();
+      const agent = new Agent(config({
+        thinkingBinding: { binds: true }, thinking: { enabled: true, budgetTokens: 2048 }, maxTokens: 999,
+        providerParams: { tool_choice: { type: 'auto' } }, prefillUserMessage: '<cmd>cat untitled.txt</cmd>',
+      } as Partial<AgentConfig>), contextManager, membrane.asMembrane());
+      await agent.startStreamWithInjections(tools, [systemNote('one'), systemNote('two')]);
+      agent.cancelStream();
+      const request = membrane.calls[0]! as NormalizedRequest & { providerParams?: unknown; prefillUserMessage?: unknown };
+      const identity = seen[0]!.identity!;
+      assert.equal(identity.system, digest(request.system), 'the system text the request carries');
+      assert.equal(identity.tools, digest(request.tools ?? []), 'the tools it carries, none where it carries none');
+      assert.equal(identity.model, digest(request.config.model));
+      assert.equal(identity.request, digest({
+        thinking: request.config.thinking ?? null, maxTokens: request.config.maxTokens,
+        providerParams: request.providerParams ?? null, prefillUserMessage: request.prefillUserMessage ?? null,
+      }));
     }
   });
 
