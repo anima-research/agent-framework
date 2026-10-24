@@ -406,6 +406,14 @@ describe("MCP's resource_link, a reference (RFC-005 §8.1)", () => {
       `https://zz-r.example/go?u=${twice('//zz-user:zz-pass@zz-host%')}`,
       // The backslash form a special scheme reads as `//`.
       `https://zz-r.example/go?u=${encodeURIComponent('\\\\zz-user:zz-pass@zz-bucket.example\\k')}`,
+      // Its form read as the URL parser reads it: led by a tab, a space or a
+      // C0 control, a protocol-relative value is still one, and one whose
+      // authority doesn't parse is withheld through its failed resolve.
+      ...['\t', ' ', '\u0001'].map((lead) => `https://zz-r.example/go?u=${encodeURIComponent(`${lead}//zz-user:zz-pass@zz-bucket.example/k`)}`),
+      `https://zz-r.example/go?u=${encodeURIComponent('\t//zz-user:zz-pass@zz-host%?x')}`,
+      // Read against a fixed base, so a uri with no path to resolve against,
+      // such as a mailto:, still has its parameters' relative values read.
+      `mailto:zz-help@zz-files.example?body=${encodeURIComponent(`?token=${SECRET}`)}`,
     ]) assert.match(line(uri), stub, uri);
     // A decode is a level: three nestings below one value encoded twice put
     // the fourth at level five, past the bound, where encoded once it's read.
@@ -425,16 +433,15 @@ describe("MCP's resource_link, a reference (RFC-005 §8.1)", () => {
     assert.equal(line(four), `[resource link "report.csv": ${four}; not fetched]`);
     assert.match(line(`https://zz-files.example/x?q=${encodeURIComponent(encoded)}`), stub);
     // Ordinary values still show: a path, values with a colon, a value with
-    // a space, and a colour, whose fragment alone resolves against the uri
-    // less its query, so it isn't read again at each level.
+    // a space, and a colour, a fragment alone with no parameter in it.
     for (const uri of [
       'https://zz-files.example/x?next=/home',
       'https://zz-files.example/x?lang=en:US&tag=type:image',
       'https://zz-files.example/x?q=zz%20elsewhere%20report',
       'https://zz-files.example/x?q=100%25%20off%',
       `https://zz-files.example/x?q=${encodeURIComponent('/a b?c d#e f')}`,
-      // Nothing resolves against a uri with an opaque path, so a relative
-      // value there that doesn't resolve carries nothing.
+      // A relative value with an empty query carries nothing, in a mailto:
+      // as anywhere.
       'mailto:zz-help@zz-files.example?subject=Question%3F',
       'https://zz-files.example/badge?color=%23ff0000&label=%23zz',
     ]) assert.equal(line(uri), `[resource link "report.csv": ${uri}; not fetched]`, uri);

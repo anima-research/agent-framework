@@ -324,13 +324,18 @@ export function uriMayCarryCredential(uri: string): boolean {
     u = new URL(uri);
   } catch {
     try {
-      u = new URL(uri, 'http://relative.invalid/');
+      u = new URL(uri, RELATIVE_BASE);
     } catch {
       return true;
     }
   }
   return urlMayCarryCredential(u, 0);
 }
+
+/** The base a relative uri is read against: it supplies only a scheme and a
+ *  path, and a credential lives in the uri's own authority, query or
+ *  fragment. */
+const RELATIVE_BASE = 'http://relative.invalid/';
 
 /** How deep uriMayCarryCredential reads uris nested in parameters' values,
  *  each one a parameter's value in the uri before it. */
@@ -343,41 +348,39 @@ function urlMayCarryCredential(u: URL, depth: number): boolean {
   // a value that opens with one (`token=;…`) still counts in the first.
   const named = (params: string) => [params, params.replace(/[?;]/g, '&')].some((read) =>
     [...new URLSearchParams(read).entries()].some(([name, value]) => value !== ''
-      && (CREDENTIAL_PARAMETERS.has(credentialName(name)) || nestedMayCarry(value, u, depth))));
+      && (CREDENTIAL_PARAMETERS.has(credentialName(name)) || nestedMayCarry(value, depth))));
   return named(u.search) || named(u.hash.slice(1));
 }
 
 /** Whether a parameter's value is a uri that may carry a credential, read in
  *  this order: as an absolute uri; else, where its form is a relative
  *  reference's (it starts with `/` or `\`, or holds `?` or `#`), resolved
- *  against the uri it sits in, less that uri's query and fragment, since a
- *  value of a fragment alone, such as a colour's `#ff0000`, would otherwise
- *  bring back the query it sits in and be read again at each level, and a
- *  protocol-relative one that doesn't resolve may carry one; else, where
- *  decoding it once more changes it, decoded and read again from the start.
- *  Each read or decode is a level, and a decode is lenient, as the
- *  parameter's own was, so a stray `%` doesn't stop it. A value that is none
- *  of these, such as a word, answers false; within the bound a decode alone
- *  never withholds, and past it a value that would still decode does. */
-function nestedMayCarry(value: string, outer: URL, depth: number): boolean {
+ *  against RELATIVE_BASE, never against the uri it sits in, which may have
+ *  no path to resolve against, as a `mailto:` hasn't; else, where decoding
+ *  it once more changes it, decoded and read again from the start. Each read
+ *  or decode is a level, and a decode is lenient, as the parameter's own
+ *  was, so a stray `%` doesn't stop it. A value that is none of these, such
+ *  as a word, answers false; within the bound a decode alone never
+ *  withholds, and past it a value that would still decode does. */
+function nestedMayCarry(value: string, depth: number): boolean {
   let inner: URL | null = null;
   try {
     inner = new URL(value);
   } catch {
-    if (/^[/\\]|[?#]/.test(value)) {
+    // Its form as the URL parser reads it, which first trims C0 controls and
+    // spaces, so `\t//user:pass@…` is the protocol-relative uri it resolves
+    // as. The tabs and newlines it also drops can't change this form once the
+    // lead is trimmed: none is a `/`, `\\`, `?` or `#`.
+    if (/^[\u0000-\u0020]*[/\\]|[?#]/.test(value)) {
       try {
-        const base = new URL(outer.href);
-        base.search = '';
-        base.hash = '';
-        inner = new URL(value, base);
+        inner = new URL(value, RELATIVE_BASE);
       } catch {
-        // A protocol-relative one (`//`, or `\\` as a special scheme reads it)
-        // that doesn't resolve may carry one, as a uri that doesn't parse may:
-        // its authority can't be read. So an ordinary value such as
-        // `q=// note` is withheld too. Any other relative value that doesn't
-        // resolve sits in a uri that can't be a base, such as a `mailto:`'s
-        // subject, against which nothing resolves it, so it carries nothing.
-        return /^[/\\]{2}/.test(value);
+        // Against a hierarchical base only a value that is protocol-relative
+        // as the parser reads it (`//`, or `\\` as a special scheme reads it)
+        // fails to resolve, on its authority, and it may carry one, as a uri
+        // that doesn't parse may: its authority can't be read. So an
+        // ordinary value such as `q=// note` is withheld too.
+        return true;
       }
     }
   }
@@ -389,7 +392,7 @@ function nestedMayCarry(value: string, outer: URL, depth: number): boolean {
   if (decoded === value) return false;
   // Past the bound, a value that would still decode is withheld: the check's
   // work stops where its reading does, and a uri found deeper would be.
-  return depth >= CREDENTIAL_NESTING || nestedMayCarry(decoded, outer, depth + 1);
+  return depth >= CREDENTIAL_NESTING || nestedMayCarry(decoded, depth + 1);
 }
 
 /** How the host reaches a server, as far as fetching its references goes:
