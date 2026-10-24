@@ -26,6 +26,7 @@ import { AgentFramework, WorkspaceModule } from '../src/index.js';
 import type { EventResponse, Module, ModuleContext, ToolCall, ToolDefinition, ToolResult } from '../src/index.js';
 import { EXPIRY_REASON, INLINE_WITHHELD_TEXT, UNBOUND_REASON, referenceRegistry } from '../src/mcpl/references.js';
 import type { ReferenceRecord } from '../src/mcpl/references.js';
+import { nonErrorResultText } from '../src/tool-result-history.js';
 import { MockMembrane } from './helpers/mock-membrane.js';
 
 const SAVED = 'board/references/report.pdf';
@@ -658,7 +659,110 @@ test("a nested never decides over a plain reference to its uri at the top, for a
       answer({ content: content('peer', where), structuredContent: {} });
       const fromPeer = await script('mcpl--files--attach');
       const fromModule = await exit({ success: true, data: content('module', where), structured: {} }, 'fwd--whole', false);
-      for (const out of [fromPeer, fromModule]) assert.ok(!out.includes('elsewhere.example.invalid'), `${where}: ${out}`);
+      for (const out of [fromPeer, fromModule]) {
+        assert.ok(!out.includes('elsewhere.example.invalid'), `${where}: ${out}`);
+        // The view was written, each block in it, the link as its object.
+        const object = JSON.parse(out) as { content: Array<Record<string, unknown>>; isError: boolean };
+        assert.equal(object.isError, false, out);
+        assert.equal(object.content.length, 3, out);
+        const link = (where === 'top' ? object.content[0] : object.content[0]!.link) as Record<string, unknown>;
+        assert.equal(link.type, 'resource_link', out);
+        assert.match(String(link.refId), /^ref_/, out);
+        assert.equal(link.uri, undefined, out);
+      }
+    }
+  });
+});
+
+test("a link's uri reaches a script only where the model's line shows it: a nested expiry, which makes the link unfetchable, doesn't show it", { timeout: 30_000 }, async () => {
+  await withPeers(async ({ answer, script, modelCall }) => {
+    // On the server's origin and with no credential in it, so the host can
+    // fetch it, and the model's line, reading the top-level blocks, shows no
+    // uri. A reference nested in another block's field says the uri has
+    // expired, which a script's view reads: the host couldn't fetch it then,
+    // and a link it can't fetch shows its uri, so reading more claims would
+    // show the script what the line withholds (Ada-1017, room-203 #201013).
+    const uri = 'https://files.example.invalid/line-claims/report.csv';
+    const content = () => [
+      { type: 'resource_link', uri, name: 'report.csv' },
+      { type: 'text', text: 'an old copy', attachment: { type: 'resource', uri, name: 'report.csv', expiresAt: '2000-01-01T00:00:00Z' } },
+    ];
+    answer({ content: content(), structuredContent: {} });
+    // The model's line for the same result, as history stores it.
+    const line = nonErrorResultText(await modelCall('attach'));
+    assert.match(line, /report\.csv/);
+    assert.ok(!line.includes('line-claims'), line);
+    answer({ content: content(), structuredContent: {} });
+    const out = await script('mcpl--files--attach');
+    assert.ok(!out.includes('line-claims'), out);
+    const object = JSON.parse(out) as { content: Array<Record<string, unknown>>; isError: boolean };
+    assert.equal(object.isError, false);
+    // Its words still read the view's claims: a fetch with its id would be refused.
+    assert.equal(object.content[0]!.expired, EXPIRY_REASON.passed);
+  });
+});
+
+test("an MCPL peer's script-demand fetch reads the view's claims: a nested expiry isn't fetched, and a view that can't be read fetches nothing", async () => {
+  await withPeers(async ({ answer, script, fetched }) => {
+    // A reference the demand fetch would save, and a reference nested in
+    // another block that says its uri has expired, which only a reading of
+    // the whole view's claims sees (Ada-1017, room-203 #201013).
+    const expiredNested = blocks('nested-expiry')[0] as { uri: string };
+    answer({
+      content: [expiredNested, { type: 'text', text: 'an old copy', attachment: { type: 'resource', uri: expiredNested.uri, expiresAt: '2000-01-01T00:00:00Z' } }],
+      structuredContent: {},
+    });
+    const object = JSON.parse(await script('mcpl--files--attach')) as { content: Array<Record<string, unknown>>; isError: boolean };
+    assert.equal(object.isError, false);
+    assert.deepEqual(fetched, [], 'the uri a nested reference calls expired was not fetched');
+    assert.equal(object.content[0]!.expired, EXPIRY_REASON.passed);
+    // A view whose claims walk stops isn't written, and nothing is fetched for it first.
+    const stuck = { get type(): string { throw new RangeError('Maximum call stack size exceeded'); } };
+    answer({ content: [blocks('stopped-walk')[0], { type: 'text', text: 'deep', deep: stuck }], structuredContent: {} });
+    const failed = JSON.parse(await script('mcpl--files--attach')) as { content: [{ text: string }]; isError: boolean };
+    assert.equal(failed.isError, true);
+    assert.match(failed.content[0].text, /can't be converted to JSON/);
+    assert.deepEqual(fetched, [], 'nothing was fetched for a view that was never written');
+  });
+});
+
+test("an MCPL peer's top-level link, treated once, keeps the record of the uri its result named, whatever sanitizeLabel cut from the uri it shows", async () => {
+  await withPeers(async ({ answer, script }) => {
+    // Off the server's origin, so its uri is shown, cut of its bidi override.
+    // The nested pass leaves the top-level blocks to the treatment above it,
+    // so the link's object isn't read again as a link to the cut uri.
+    const raw = 'https://elsewhere.example.invalid/re\u202Eport.csv';
+    answer({ content: [{ type: 'resource_link', uri: raw, name: 'report.csv' }], structuredContent: {} });
+    const object = JSON.parse(await script('mcpl--files--attach')) as { content: Array<Record<string, unknown>> };
+    assert.equal(object.content[0]!.uri, 'https://elsewhere.example.invalid/report.csv');
+    assert.equal(object.content[0]!.refId, referenceRegistry.findByUri(raw)?.refId);
+    assert.equal(referenceRegistry.findByUri('https://elsewhere.example.invalid/report.csv'), undefined);
+  });
+});
+
+test("where the treatment fails after the claims walk read the view, a peer's result is one the script can't convert and a module's a failure naming the tool", async () => {
+  await withPeers(async ({ answer, script, exit }) => {
+    // The claims walk reads a reference and registers nothing; the treatment
+    // registers what it shows. A registry that throws a RangeError for one
+    // nested reference stands in for a treatment that runs out of stack where
+    // the claims walk, with lighter replacers, didn't.
+    const uri = 'https://files.example.invalid/treatment-stop/report.csv';
+    const real = referenceRegistry.register;
+    referenceRegistry.register = function (this: typeof referenceRegistry, ...args: Parameters<typeof real>) {
+      if (args[0].uri === uri) throw new RangeError('Maximum call stack size exceeded');
+      return real.apply(this, args);
+    } as typeof real;
+    try {
+      const content = () => [{ type: 'text', text: 'a report', attachment: { type: 'resource', uri, name: 'report.csv' } }];
+      answer({ content: content(), structuredContent: {} });
+      const fromPeer = JSON.parse(await script('mcpl--files--attach')) as { content: [{ text: string }]; isError: boolean };
+      assert.equal(fromPeer.isError, true);
+      assert.match(fromPeer.content[0].text, /^tool 'mcpl--files--attach' returned a result that can't be converted to JSON/);
+      const fromModule = JSON.parse(await exit({ success: true, data: content(), structured: {} }, 'fwd--whole', false)) as { content: [{ text: string }]; isError: boolean };
+      assert.equal(fromModule.isError, true);
+      assert.match(fromModule.content[0].text, /^tool 'fwd--whole' returned a result that can't be converted to JSON/);
+    } finally {
+      referenceRegistry.register = real;
     }
   });
 });

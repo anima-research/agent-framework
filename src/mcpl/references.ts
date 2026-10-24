@@ -741,8 +741,17 @@ export interface UriClaims {
 
 /** A result's claims (ResultClaims), from the testimonies of its references,
  *  each read once, as referenceExpiry reads an expiry. */
-export function resultClaims(testimonies: Iterable<ReferenceTestimony>): ResultClaims {
+export function resultClaims(testimonies: Iterable<ReferenceTestimony>, nevers: Iterable<string> = []): ResultClaims {
   const claims = new Map<string, UriClaims>();
+  // A uri inline data marks `disposition: never` beside its data, the
+  // classifier's contradiction (inlineNeverUri): withheld unconditionally
+  // (RFC-005 §5), though the block is no reference. Only its never counts,
+  // since its other claims could loosen (Ada-1017, room-203 #201013).
+  for (const uri of nevers) {
+    const c = claims.get(uri);
+    if (c) c.never = true;
+    else claims.set(uri, { never: true, rejected: false, unparseable: false, earliestMs: null });
+  }
   for (const t of testimonies) {
     if (t.fromLink) continue;
     let c = claims.get(t.uri);
@@ -764,11 +773,24 @@ export function resultClaims(testimonies: Iterable<ReferenceTestimony>): ResultC
  *  `_meta`, aren't shown, so a reference inside them doesn't count. */
 export function contentClaims(blocks: readonly unknown[]): ResultClaims {
   const testimonies: ReferenceTestimony[] = [];
+  const nevers: string[] = [];
   for (const block of blocks) {
     const c = classifyBlock(block);
     if (c.kind === 'reference') testimonies.push(c.testimony);
+    const never = inlineNeverUri(block, c);
+    if (never !== null) nevers.push(never);
   }
-  return resultClaims(testimonies);
+  return resultClaims(testimonies, nevers);
+}
+
+/** The uri inline data marks `disposition: never` beside its data, the
+ *  classifier's contradiction, which counts for that uri's claims
+ *  (resultClaims); null for any other block. A uri that isn't a non-empty
+ *  string names nothing a claim is kept for. */
+export function inlineNeverUri(block: unknown, c: BlockClassification = classifyBlock(block)): string | null {
+  if (c.kind !== 'inline' || !c.contradiction) return null;
+  const b = block as { uri?: unknown; disposition?: unknown };
+  return b.disposition === 'never' && typeof b.uri === 'string' && b.uri !== '' ? b.uri : null;
 }
 
 /** The claims a decision about a record reads: its result's for its uri,
@@ -943,7 +965,7 @@ export function referenceStubOrNull(block: unknown, provenance?: string, serverI
  * empty, the withheld notice, each as a text block.
  * A text block, or inline data that claims nothing, is returned as sent.
  */
-export function referenceBlockForScript(block: unknown, serverId?: string, claims?: ResultClaims): unknown {
+export function referenceBlockForScript(block: unknown, serverId?: string, claims?: ResultClaims, lineClaims?: ResultClaims): unknown {
   const c = classifyBlock(block);
   switch (c.kind) {
     case 'text': return block;
@@ -967,7 +989,14 @@ export function referenceBlockForScript(block: unknown, serverId?: string, claim
       // One clock reading for the whole object, so its words can't disagree
       // with each other across an expiry.
       const nowMs = Date.now();
-      const uri = shownLinkUri(t, record, nowMs, claims);
+      // A link's uri where the model's line for the result shows it, by the
+      // claims the line reads (lineClaims, where they differ from the view's),
+      // and never where the view's claims withhold it: reading more claims
+      // can loosen as well as tighten, since an expiry makes a link one the
+      // host can't fetch, whose uri the line shows (Ada-1017, room-203
+      // #201013). A script never sees a uri the model's line withholds.
+      const lineShows = shownLinkUri(t, record, nowMs, lineClaims ?? claims);
+      const uri = lineShows !== null && lineClaims !== undefined && claimedNever(record, claims) ? null : lineShows;
       // Why a fetch_reference with this object's refId would be refused, in
       // the words a stub gives, whether or not the model's line for it is a
       // stub: the line has no id to fetch with, and the object does. As the

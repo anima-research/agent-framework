@@ -31,6 +31,7 @@ import {
   buildReferenceStub,
   classifyBlock,
   contentClaims,
+  inlineNeverUri,
   referenceBlockForScript,
   referenceStubOrNull,
   referenceTypeLabel,
@@ -217,6 +218,11 @@ export interface HistorySerializeOptions {
    * (resultClaimsOf), such as the fields a withheld result keeps.
    */
   claims?: ResultClaims;
+  /**
+   * Whose result this is, as nonErrorResultText's log line names it where it
+   * shows UNCHECKED_RESULT_TEXT for a result it couldn't read or show.
+   */
+  toolName?: string;
 }
 
 /**
@@ -268,6 +274,9 @@ export function toolResultDataToHistoryString(
  *
  * Each field is read once: the direct Agent API passes its caller's own
  * result here, unchecked, and a getter needn't answer the same way twice.
+ * Whatever stops reading or showing the data is UNCHECKED_RESULT_TEXT, with
+ * a log line naming the tool (`options.toolName`) and the error: the model's
+ * lane has no failure answer that doesn't wedge the round.
  * Whether an array is content is the result's own `dataIsContent`, read for
  * its truth as a result's flags are, whatever `options` says.
  *
@@ -292,7 +301,38 @@ export function nonErrorResultText(
       return maxChars ? truncateForHistory(text, maxChars) : text;
     }
   }
-  return toolResultDataToHistoryString(data, maxChars, { ...options, dataIsContent: Boolean(result.dataIsContent) });
+  // The blocks go to the caller only once the text is made from them, so a
+  // result that shows the notice has no live copy of its own: the notice is
+  // both copies' text.
+  let blocks: [HistoryBlockSpan[], ToolResultBlock[]] | undefined;
+  const onBlocks = options?.onBlocks;
+  try {
+    const text = toolResultDataToHistoryString(data, maxChars, {
+      ...options,
+      dataIsContent: Boolean(result.dataIsContent),
+      ...(onBlocks ? { onBlocks: (spans: HistoryBlockSpan[], made: ToolResultBlock[]) => { blocks = [spans, made]; } } : {}),
+    });
+    if (onBlocks && blocks) onBlocks(blocks[0], blocks[1]);
+    return text;
+  } catch (error) {
+    // The model's lane has no failure answer that doesn't wedge the round, so
+    // whatever stops reading or showing a result, such as a getter that
+    // throws in a content array's block or a render deeper than the claims
+    // walk got (a script's routes call the serializer directly, and fail),
+    // is the notice, with a line naming the tool and the error, since it can
+    // also be a fault of this host's (Ada-1017, room-203 #201013).
+    console.error(`[tool-results] ${options?.toolName ? `tool '${options.toolName}'` : 'a tool'}: its result couldn't be read or shown, so the model reads that it was withheld: ${thrownLine(error)}`);
+    return maxChars ? truncateForHistory(UNCHECKED_RESULT_TEXT, maxChars) : UNCHECKED_RESULT_TEXT;
+  }
+}
+
+/** The first line of what was thrown, for a log line. */
+function thrownLine(error: unknown): string {
+  try {
+    return (error instanceof Error ? error.message : String(error)).split('\n')[0] || 'no reason given';
+  } catch {
+    return 'a value that can\'t be read';
+  }
 }
 
 /** Bounded copy of an arbitrary string with the standard truncation notice,
@@ -344,15 +384,19 @@ function tryHistoryStringFromContentArray(data: unknown, options?: HistorySerial
  * isn't a string isn't inline data, so a record that only shares one of
  * those type names is data. A uri of any other value, string or not, counts,
  * so a credential fails closed. MCP's `resource_link` (RFC-005 §8.1) is
- * governed whatever its uri: one without a usable uri is its marker.
+ * governed whatever value its uri has, so one whose uri isn't usable is its
+ * marker; one that names no uri is data here, where as a block of a content
+ * array, which the classifier reads, it's the marker.
  */
 function governedByRfc005(b: Record<string, unknown>): boolean {
   if (b.type === 'resource') return hasUri(b.uri) || (isPlainRecord(b.resource) && hasUri(b.resource.uri));
   // A link that names a uri is governed whatever its value, so one without
   // a usable uri (empty, null, not a string) is its marker here, as on the
-  // content lanes, never its fields. One that names none is data, on every
-  // lane, as on main: its fields hold no uri RFC-005 governs, though a value
-  // in them, such as an untyped object's `uri`, is data as anywhere else.
+  // content lanes, never its fields. One that names none is data at depth,
+  // on the model's lanes and a script's, as main has every link at depth:
+  // its fields hold no uri RFC-005 governs, though a value in them, such as
+  // an untyped object's `uri`, is data as anywhere else. As a block of a
+  // content array, the classifier reads it, and there it's the marker.
   // That's the object the script lane makes of a link whose uri it leaves
   // out (referenceBlockForScript), which a script's view, given it again,
   // leaves as it is, as it leaves a reference's stub.
@@ -418,16 +462,17 @@ function walkedInHistory(value: unknown, asText: (b: Record<string, unknown>) =>
  * the data claims is unknown. It's a walk of its own before the one that
  * shows the data, so a value's toJSON and getters run in both: one that
  * answers differently the second time can claim what the shown text doesn't
- * show.
+ * show, or show a reference the claims never read. Only data no check has
+ * read through JSON can do either: a module's result is parsed JSON from its
+ * dispatch, and an MCPL peer's blocks are parsed wire JSON, so this is the
+ * direct Agent API's, whose results a host gives unchecked.
  */
 function claimsInHistory(data: unknown): ResultClaims | null {
   try {
     return claimsInHistoryOrThrow(data);
   } catch {
-    // Showing the whole result stops at the same value, for a value that
-    // answers the same each time it's read. A caller that shows part of it,
-    // such as a withheld result's kept fields, can't know what the rest
-    // claims.
+    // What the rest of the data claims is unknown: historyJson shows it as
+    // UNCHECKED_RESULT_TEXT, and a withheld result's kept fields keep nothing.
     return null;
   }
 }
@@ -435,6 +480,14 @@ function claimsInHistory(data: unknown): ResultClaims | null {
 /** claimsInHistory's walk, which throws what stops it. */
 function claimsInHistoryOrThrow(data: unknown): ResultClaims {
   const testimonies: ReferenceTestimony[] = [];
+  // Inline data's never, which walkedInHistory withholds before it asks
+  // `read` (inlineNeverUri).
+  const nevers: string[] = [];
+  const noteInline = (value: unknown): void => {
+    if (!isPlainRecord(value) || (value.type !== 'image' && value.type !== 'audio')) return;
+    const never = inlineNeverUri(value);
+    if (never !== null) nevers.push(never);
+  };
   const read = (b: Record<string, unknown>): string | null => {
     const c = classifyBlock(b);
     if (c.kind === 'reference') testimonies.push(c.testimony);
@@ -443,16 +496,18 @@ function claimsInHistoryOrThrow(data: unknown): ResultClaims {
     // decides it first.
     return c.kind === 'text' ? null : '';
   };
+  noteInline(data);
   const root = walkedInHistory(data, read);
   // Its text is thrown away, so a string is written as 0, which keeps a
   // long one from being copied for nothing; the walk descends as before.
   if (root === data || typeof root !== 'string') {
     JSON.stringify(data, (_key, value: unknown) => {
+      if (value !== data) noteInline(value);
       const walked = walkedInHistory(value, read);
       return typeof walked === 'string' ? 0 : walked;
     });
   }
-  return resultClaims(testimonies);
+  return resultClaims(testimonies, nevers);
 }
 
 /**
@@ -465,18 +520,19 @@ function claimsInHistoryOrThrow(data: unknown): ResultClaims {
  * withheld notice, each as a text block. A null, absent or empty uri claims
  * none (hasUri), so inline data beside one is itself. Any other value is
  * itself. `claims` are those of everything the script's view shows
- * (scriptViewClaims). What it gives is either a stub or a notice, which
+ * (scriptViewClaims), and `lineClaims` those the model's line for the
+ * result reads, which decide where a link's uri is shown. What it gives is either a stub or a notice, which
  * RFC-005 doesn't govern, or the value itself, which it gives again, so
  * applying it twice gives what applying it once gave.
  */
-export function shownToScript(value: unknown, claims?: ResultClaims): unknown {
+export function shownToScript(value: unknown, claims?: ResultClaims, lineClaims?: ResultClaims): unknown {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return value;
   const b = value as Record<string, unknown>;
   if (!governedByRfc005(b)) return value;
   if ((b.type === 'image' || b.type === 'audio') && typeof b.data === 'string') {
     return hasUri(b.uri) || b.disposition !== undefined ? { type: 'text', text: INLINE_WITHHELD_TEXT } : value;
   }
-  return referenceBlockForScript(b, undefined, claims);
+  return referenceBlockForScript(b, undefined, claims, lineClaims);
 }
 
 /**
@@ -484,9 +540,12 @@ export function shownToScript(value: unknown, claims?: ResultClaims): unknown {
  * shows, nested fields included (Ada-1017, room-203 #200094), by the walk
  * history's JSON takes (claimsInHistory): a script is shown the references
  * nested in a block's fields, each as its stub, so a `never` among them
- * withholds that uri from every block in the view. Stricter than the
- * model's line, which shows a block and not its fields (contentClaims), and
- * never looser. An MCPL peer's top-level block the classifier rejects is
+ * withholds that uri from every block in the view. A link's uri is still
+ * shown only where the model's line shows it, by the claims the line reads
+ * (contentClaims, which reads a block and not its fields): reading more
+ * claims can loosen as well as tighten, since an expiry makes a link one the
+ * host can't fetch (referenceBlockForScript's `lineClaims`). An MCPL peer's
+ * top-level block the classifier rejects is
  * its notice, its fields unshown, so they don't count (`fromServer`). It
  * throws what stops the walk, such as a value too deep to convert or a
  * getter that throws, and the script's view then isn't written: the
@@ -509,10 +568,10 @@ export function scriptViewClaims(content: readonly unknown[], fromServer: boolea
  * governed, so a block the top-level pass already treated is left as it is.
  * `claims` are those of the script's whole view (scriptViewClaims).
  */
-export function shownToScriptFromServer(value: unknown, serverId: string, claims?: ResultClaims): unknown {
+export function shownToScriptFromServer(value: unknown, serverId: string, claims?: ResultClaims, lineClaims?: ResultClaims): unknown {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return value;
   const b = value as Record<string, unknown>;
-  return governedByRfc005(b) ? referenceBlockForScript(b, serverId, claims) : value;
+  return governedByRfc005(b) ? referenceBlockForScript(b, serverId, claims, lineClaims) : value;
 }
 
 /**
@@ -535,8 +594,10 @@ export function rfc005TextOf(value: unknown): string | null {
  * (keptWhenWithheld). The claims walk meets data no JSON can hold, such as
  * a cycle or a BigInt, or data too deep to write, before the render does,
  * so such data shows this too, where the render threw (Desmond-2579's run).
- * A script never gets it: both of its routes read the claims first and
- * fail naming the tool (Ada-1017, room-203 #200344, #200374).
+ * nonErrorResultText, the model lane's entry, shows it as well for anything
+ * else that stops reading or showing a result (Ada-1017, room-203 #201013).
+ * A script never gets it: both of its routes read the claims first and call
+ * the serializer directly, and fail naming the tool (#200344, #200374).
  */
 export const UNCHECKED_RESULT_TEXT =
   "[Result not shown: the tool ran, but its result couldn't be read through to check it for references, so this host withheld it.]";

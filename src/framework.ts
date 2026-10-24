@@ -117,7 +117,6 @@ import type { ToolResultGuard, WithheldSpill } from './tool-result-guard.js';
 import {
   goesNative,
   nonErrorResultText,
-  resultClaimsOf,
   resultClaimsOrThrow,
   scriptViewClaims,
   shownToScript,
@@ -1117,6 +1116,15 @@ const SCRIPT_CALL_NO_RESULT = new WeakSet<ToolResult>();
  * everyone (checkedToolResult).
  */
 const SCRIPT_RESULT_UNCONVERTIBLE = new WeakMap<ToolResult, unknown>();
+
+/**
+ * The claims of an MCPL peer's blocks as a script's view reads them
+ * (scriptViewClaims), or what stopped their walk, read once at dispatch, by
+ * the content array the result carries: its demand fetch reads them, and the
+ * script lane's reading of the same blocks takes them from here, so the two
+ * read the same claims (Ada-1017, room-203 #201013).
+ */
+const SCRIPT_VIEW_CLAIMS = new WeakMap<object, { claims: ResultClaims } | { error: unknown }>();
 
 /**
  * One logical turn's routing state and receipt tallies
@@ -6261,8 +6269,11 @@ export class AgentFramework {
    *    script receiving a result is the strongest available signal that the
    *    bytes are wanted (scripts process, they do not browse), so the stub it
    *    receives carries a workspace path it can open directly.
-   *  A uri the result calls expired is fetched in no mode. */
-  private async autoFetchReferences(content: unknown, serverId: string, mode: 'register' | 'model' | 'script'): Promise<void> {
+   *  A uri the result calls expired is fetched in no mode: by its blocks, or
+   *  by `claims` where given, those of everything a script's view of it
+   *  shows (scriptViewClaims), nested fields included, as the module
+   *  route's demand fetch reads them (Ada-1017, room-203 #201013). */
+  private async autoFetchReferences(content: unknown, serverId: string, mode: 'register' | 'model' | 'script', claims?: ResultClaims): Promise<void> {
     if (!Array.isArray(content)) return;
     // Register every block first, then judge each uri once, by its latest
     // record. The registry keys records by uri and evicts the one registered
@@ -6291,7 +6302,11 @@ export class AgentFramework {
     }
     if (mode === 'register') return;
     const fetcher = this.getReferenceFetcher();
-    const live = [...byUri.values()].filter(({ expiredHere, linkOnly }) => !expiredHere && !linkOnly).map(({ record }) => record);
+    const nowMs = Date.now();
+    const live = [...byUri.values()]
+      .filter(({ record, expiredHere, linkOnly }) => !expiredHere && !linkOnly
+        && (claims === undefined || Boolean(record.fetchedPath) || claimedExpiry(record, claims, nowMs) === null))
+      .map(({ record }) => record);
     // Parallel with a count cap: N small fetches cost one round-trip of
     // wall-clock, and anything past the cap stays lazy (stub says so).
     const MAX_EAGER_PER_RESULT = 8;
@@ -12359,7 +12374,7 @@ export class AgentFramework {
             this.pendingAssistantBlocks.delete(agent.name);
           }
           const membraneResults = currentState.toolResults.map(tc =>
-            this.toMembraneToolResult(tc.id, tc.result, maxChars, spilled.get(tc.id))
+            this.toMembraneToolResult(tc.id, tc.result, maxChars, spilled.get(tc.id), tc.name)
           );
           agent.toolResultGuard.storeResults(toolResultContent, membraneResults, currentState.toolResults, turnRowMetadata, keptCap);
 
@@ -20175,7 +20190,7 @@ export class AgentFramework {
                   bound,
                 );
                 agent.toolResultGuard.storeResults(toolResultContent, readyState.toolResults.map((tc) =>
-                  this.toMembraneToolResult(tc.id, tc.result, cap, spilled.get(tc.id))), readyState.toolResults,
+                  this.toMembraneToolResult(tc.id, tc.result, cap, spilled.get(tc.id), tc.name)), readyState.toolResults,
                   this.silentTurnRowMetadata(agent.name), keptCap);
                 // The response is already complete: this batch is never
                 // submitted in this turn, so it cannot be refused. Admit it.
@@ -22188,6 +22203,7 @@ export class AgentFramework {
     let blocks = null as HistoryBlockSpan[] | null;
     let classified = null as ToolResultBlock[] | null;
     const text = nonErrorResultText(tc.result, undefined, {
+      toolName: tc.name,
       imageRef: (blockIndex, image) => ledger.retain({
         toolCallId: tc.id,
         toolName: tc.name,
@@ -22569,15 +22585,20 @@ export class AgentFramework {
     // The claims a module's result is shown by, read once, so the fetches
     // below and what the script gets read the same: a structured result's
     // view's (scriptViewClaims), nested fields included, or the model's text's
-    // (resultClaimsOf). Where the walk stops, the script's answer is a
+    // (resultClaimsOrThrow, which throws where resultClaimsOf answers null).
+    // Where the walk stops, the script's answer is a
     // failure naming the tool, before any fetch or treatment, so neither runs
     // without them (Ada-1017, room-203 #200250, #200374): on both of a
     // script's routes, `is_error` says nothing could be shown, where the
     // model's lane shows UNCHECKED_RESULT_TEXT.
     let claims: ResultClaims | undefined;
+    // The claims the model's line for the result reads, which decide where a
+    // link's object shows its uri (referenceBlockForScript's lineClaims).
+    let lineClaims: ResultClaims | undefined;
     if ((!isError || structured) && Array.isArray(result.data) && fromModule) {
       try {
-        claims = showsBlocks ? scriptViewClaims(result.data, false) : resultClaimsOrThrow(result.data, result.dataIsContent);
+        lineClaims = resultClaimsOrThrow(result.data, result.dataIsContent);
+        claims = showsBlocks ? scriptViewClaims(result.data, false) : lineClaims;
       } catch (err) {
         return failed(err);
       }
@@ -22613,12 +22634,13 @@ export class AgentFramework {
       // and returns whole, are read as history reads a module's data: what
       // RFC-005 governs, at any depth, as the script lane shows it, and
       // anything else as sent. What a script prints comes back to the model,
-      // so no uri the model's lanes withhold reaches it. What this gives is
+      // so no uri the model's lanes withhold reaches it through the blocks
+      // (structured content goes as sent, as on main). What this gives is
       // a stub, a notice or the value itself, so a module that returns
       // blocks it already gave has them left as they are.
       if (fromModule) {
         try {
-          content = JSON.parse(JSON.stringify(content, (_key, value: unknown) => shownToScript(value, claims))) as unknown[];
+          content = JSON.parse(JSON.stringify(content, (_key, value: unknown) => shownToScript(value, claims, lineClaims))) as unknown[];
         } catch (err) {
           return failed(err);
         }
@@ -22788,6 +22810,8 @@ export class AgentFramework {
      *  copy is built from these, never classified again, so the two copies
      *  agree on every block and on whether it goes natively (goesNative). */
     precomputed?: StoredToolResult,
+    /** The tool's name, for the log line of a result shown as the notice. */
+    toolName?: string,
   ): MembraneToolResult {
     if (afResult.isError) {
       // Same spill policy as successes: reuse the history copy so a giant
@@ -22819,7 +22843,7 @@ export class AgentFramework {
     // (goesNative), the very blocks that text was made from go natively.
     let spans = null as HistoryBlockSpan[] | null;
     let classified = null as ToolResultBlock[] | null;
-    const text = nonErrorResultText(afResult, maxChars, { onBlocks: (s, b) => { spans = s; classified = b; } });
+    const text = nonErrorResultText(afResult, maxChars, { toolName, onBlocks: (s, b) => { spans = s; classified = b; } });
     if (spans && classified && goesNative((spans as HistoryBlockSpan[]).map(({ kind, start, end }) => ({ kind, length: end - start })), maxChars)) {
       return { toolUseId: callId, content: this.nativeContent(classified, maxChars, null), isError: false };
     }
@@ -29067,14 +29091,28 @@ export class AgentFramework {
           return dropped;
         };
         let claims: ResultClaims;
+        // The model's line for a peer's content reads its blocks' claims
+        // alone, which decide where a link's object shows its uri.
+        let lineClaims: ResultClaims;
         try {
-          claims = scriptViewClaims(direct.data, true);
+          // As the dispatch read them for its demand fetch, where it did.
+          const read = SCRIPT_VIEW_CLAIMS.get(direct.data);
+          if (read && 'error' in read) throw read.error;
+          claims = read ? read.claims : scriptViewClaims(direct.data, true);
+          lineClaims = resultClaimsOrThrow(direct.data, true);
         } catch (err) {
           return unconvertible(err);
         }
-        const blocks = direct.data.map((block: unknown) => referenceBlockForScript(block, serverId, claims));
+        const blocks = direct.data.map((block: unknown) => referenceBlockForScript(block, serverId, claims, lineClaims));
         try {
-          return { ...direct, data: JSON.parse(JSON.stringify(blocks, (_key, value: unknown) => shownToScriptFromServer(value, serverId, claims))) as unknown[] };
+          // The top-level blocks were treated just above; the pass treats
+          // what's nested in them. Reading a treated block again would take
+          // a link object's uri, as sanitizeLabel cut it, for a new link,
+          // registered apart from the one the result named.
+          const nested = function (this: unknown, _key: string, value: unknown): unknown {
+            return this === blocks ? value : shownToScriptFromServer(value, serverId, claims, lineClaims);
+          };
+          return { ...direct, data: JSON.parse(JSON.stringify(blocks, nested)) as unknown[] };
         } catch (err) {
           return unconvertible(err);
         }
@@ -29162,7 +29200,22 @@ export class AgentFramework {
         if (mcplPeer) {
           const scriptReads = forScript
             && (!result.isError || Object.prototype.hasOwnProperty.call(result, 'structuredContent'));
-          await this.autoFetchReferences(result.content, serverId, scriptReads ? 'script' : 'model')
+          // A script's demand fetch reads the claims of everything its view
+          // shows, as the module route's does; where that walk stops, the view
+          // isn't written (reading()), so nothing is fetched for it, the
+          // references only registered (Ada-1017, room-203 #201013).
+          let mode: 'register' | 'model' | 'script' = scriptReads ? 'script' : 'model';
+          let claims: ResultClaims | undefined;
+          if (scriptReads && Array.isArray(result.content)) {
+            try {
+              claims = scriptViewClaims(result.content, true);
+              SCRIPT_VIEW_CLAIMS.set(result.content, { claims });
+            } catch (error) {
+              SCRIPT_VIEW_CLAIMS.set(result.content, { error });
+              mode = 'register';
+            }
+          }
+          await this.autoFetchReferences(result.content, serverId, mode, claims)
             .catch((e) => console.error('[rfc005] autofetch error:', (e as Error).message));
         }
         return { result, toolResult: await reading(result, mcplPeer) };

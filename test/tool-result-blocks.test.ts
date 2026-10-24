@@ -47,7 +47,7 @@ import { CoalesceError, validateCoalescedContent } from '../src/mcpl/push-coales
 import { ReferenceFetcher } from '../src/mcpl/reference-fetcher.js';
 import { checkedToolResult } from '../src/module-registry.js';
 import { parseImagePlaceholders } from '../src/tool-image-ledger.js';
-import { UNCHECKED_RESULT_TEXT, nonErrorResultText, shownToScript, toolResultDataToHistoryString } from '../src/tool-result-history.js';
+import { UNCHECKED_RESULT_TEXT, nonErrorResultText, shownToScript, toolResultDataToHistoryString, truncateForHistory } from '../src/tool-result-history.js';
 import { MockMembrane, createMockResponse } from './helpers/mock-membrane.js';
 import { fixture } from './helpers/coalescing-fixture.js';
 
@@ -254,6 +254,14 @@ function testimonyOf(block: unknown) {
 }
 
 describe("MCP's resource_link, a reference (RFC-005 §8.1)", () => {
+  it("reads its size from MCP's size, and from sizeBytes only where size is absent or null, a size of 0 included", () => {
+    const sized = (fields: Record<string, unknown>) => testimonyOf({ type: 'resource_link', uri: PLAIN_URI, name: 'report.csv', ...fields }).sizeBytes;
+    assert.equal(sized({ size: 10, sizeBytes: 20 }), 10, 'size decides where both are named');
+    assert.equal(sized({ size: 0, sizeBytes: 20 }), 0, 'a size of 0 is a size');
+    assert.equal(sized({ sizeBytes: 2048 }), 2048);
+    assert.equal(sized({ size: null, sizeBytes: 2048 }), 2048);
+  });
+
   it('maps onto the reference record field for field, its size as sizeBytes, with no disposition', () => {
     const t = testimonyOf({ ...LINK, disposition: 'never', digest: `sha256:${'A'.repeat(43)}`, expiresAt: '2020-01-01T00:00:00Z' });
     assert.deepEqual([t.uri, t.name, t.mimeType, t.sizeBytes], [LINK_URI, 'report.csv', 'text/csv', 1234]);
@@ -1393,6 +1401,62 @@ describe('one answer for every block of a result', () => {
     } finally {
       servingFiles();
     }
+  });
+
+  it("withholds a uri inline data marks never from a link naming it, in a content array, at depth and in a script's view", () => {
+    // Off the server's origin, so a link to it shows its uri where nothing
+    // withholds it; the inline block's never does, though it's no reference
+    // (Ada-1017, room-203 #201013).
+    const uri = 'https://zz-elsewhere.example/inline-never/report.csv';
+    const sealed = { type: 'image', data: 'iVBORw0KGgo=', mimeType: 'image/png', uri, disposition: 'never' };
+    const link = { type: 'resource_link', uri, name: 'report.csv' };
+    const control = toolResultDataToHistoryString([link], undefined, { dataIsContent: true });
+    assert.ok(control.includes('inline-never'), control);
+    for (const shown of [
+      toolResultDataToHistoryString([sealed, link], undefined, { dataIsContent: true }),
+      toolResultDataToHistoryString({ sealed, link }),
+      JSON.stringify(shownToScript(link, referencesModule.contentClaims([sealed, link]))),
+    ]) {
+      assert.ok(!shown.includes('inline-never'), shown);
+    }
+    // Only its never counts: an expiry beside its data claims nothing.
+    const dated = { ...sealed, disposition: 'ref', expiresAt: '2000-01-01T00:00:00Z' };
+    assert.ok(toolResultDataToHistoryString([dated, link], undefined, { dataIsContent: true }).includes('inline-never'));
+  });
+
+  it("shows the model the unchecked notice, with a line naming the tool, for whatever stops reading or showing a result, where the serializer throws for a script", () => {
+    const logged: string[] = [];
+    const error = console.error;
+    console.error = (...args: unknown[]) => { logged.push(args.map(String).join(' ')); };
+    try {
+      // A block of a content array whose text can't be read.
+      const unreadable = [{ type: 'text', get text(): string { throw new Error('zz-unreadable text'); } }];
+      let blocks = false;
+      const text = nonErrorResultText({ data: unreadable, dataIsContent: true }, undefined, { toolName: 'zz_tool', onBlocks: () => { blocks = true; } });
+      assert.equal(text, UNCHECKED_RESULT_TEXT);
+      assert.equal(blocks, false, 'no live copy of its own: the notice is both copies');
+      assert.throws(() => toolResultDataToHistoryString(unreadable, undefined, { dataIsContent: true }), /zz-unreadable text/);
+      // A render that stops where the claims walk got through: the render
+      // registers what it shows, and the claims walk registers nothing.
+      const uri = 'https://zz-elsewhere.example/render-stop/report.csv';
+      const real = referencesModule.referenceRegistry.register;
+      referencesModule.referenceRegistry.register = function (this: unknown, ...args: Parameters<typeof real>) {
+        if (args[0].uri === uri) throw new RangeError('Maximum call stack size exceeded');
+        return real.apply(referencesModule.referenceRegistry, args);
+      } as typeof real;
+      try {
+        const data = { found: { type: 'resource', uri, name: 'report.csv' } };
+        assert.equal(nonErrorResultText({ data }, 100, { toolName: 'zz_deep' }), truncateForHistory(UNCHECKED_RESULT_TEXT, 100));
+        assert.throws(() => toolResultDataToHistoryString(data), RangeError);
+      } finally {
+        referencesModule.referenceRegistry.register = real;
+      }
+    } finally {
+      console.error = error;
+    }
+    assert.equal(logged.length, 2, logged.join('\n'));
+    assert.match(logged[0]!, /tool 'zz_tool'.*zz-unreadable text/);
+    assert.match(logged[1]!, /tool 'zz_deep'.*Maximum call stack size exceeded/);
   });
 
   it('shows data whose claims walk stops as the unchecked notice, never with no claims, and a round with it completes, both copies alike', async () => {
