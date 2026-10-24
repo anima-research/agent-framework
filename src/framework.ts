@@ -1,7 +1,7 @@
 import { ToolPresentation, presentationTools, isPresentationTool, renderCatalogue, type PresentationSnapshot } from "./tool-presentation.js";
 import { constants as bufferConstants } from 'node:buffer';
 import { dirname, join } from 'node:path';
-import { INLINE_WITHHELD_TEXT, REFERENCE_LIMITS, classifyBlock, isInlineContradiction, isReferenceExpired, referenceBlockForScript, referenceRegistry, referenceStubOrNull, sanitizeLabel } from './mcpl/references.js';
+import { EXPIRY_REASON, REFERENCE_LIMITS, claimedExpiry, classifyBlock, isReferenceExpired, referenceBlockForScript, referenceRegistry, sanitizeLabel, type RegistryJournal, type ResultClaims, type ScriptLine, type ServerAddress } from './mcpl/references.js';
 import { ReferenceFetcher, DEFAULT_FETCH_MAX_BYTES, EAGER_FETCH_TIMEOUT_MS } from './mcpl/reference-fetcher.js';
 import {
   appendFileSync, closeSync, existsSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, unlinkSync,
@@ -115,13 +115,19 @@ import { ProviderWaits, EVERY_MODEL, isReleaseModel, withoutControls, type Provi
 import type { WorkspaceModule } from './modules/workspace/index.js';
 import type { ToolResultGuard, WithheldSpill } from './tool-result-guard.js';
 import {
+  goesNative,
   nonErrorResultText,
+  nonErrorResultTextOrThrow,
+  isContentArray,
+  resultClaimsOrThrow,
+  scriptViewClaims,
   shownToScript,
   shownToScriptFromServer,
   toolResultDataToHistoryString,
   truncateForHistory,
   DEFAULT_TOOL_RESULT_INLINE_MAX_CHARS,
   type HistoryBlockSpan,
+  type ToolResultBlock,
 } from './tool-result-history.js';
 import {
   TOOL_IMAGE_REF_RE,
@@ -526,7 +532,7 @@ const SEND_ENGAGEMENT_TOOLS = new Set([
 function extractChannelIdFromToolResult(
   content: Array<{ type: string; text?: string }> | undefined,
 ): string | undefined {
-  const text = content?.find((c) => c.type === 'text' && c.text)?.text;
+  const text = content?.find((c) => c?.type === 'text' && c.text)?.text;
   if (!text) return undefined;
   try {
     const parsed = JSON.parse(text) as { channelId?: unknown };
@@ -538,6 +544,33 @@ function extractChannelIdFromToolResult(
   }
 }
 
+/** A tool result's stored copy as the history path wrote it: its text,
+ *  spilled or cut at the cap, the spill file, and, where its live copy goes
+ *  as native blocks (goesNative), the blocks the text was made from, which
+ *  the live copy is built from (toMembraneToolResult). */
+interface StoredToolResult {
+  text: string;
+  filePath: string | null;
+  live: ToolResultBlock[] | null;
+}
+
+/**
+ * How the host reaches an MCPL server, for fetching its references: the url
+ * it dials the server at, as the transport decides. None for a server the
+ * host spawns, as a stdio server, nor for a WebSocket server whose url the
+ * transport won't dial, which buildWebSocketUrl refuses: one that isn't a
+ * ws:// or wss:// url, or has a fragment.
+ */
+function serverAddressOf(cfg: McplServerConfig): ServerAddress {
+  if (!isWebSocketTransport(cfg) || !cfg.url) return 'no-address';
+  try {
+    buildWebSocketUrl(cfg, null);
+  } catch {
+    return 'no-address';
+  }
+  return { url: cfg.url };
+}
+
 /**
  * The text of an MCPL tools/call result: its text blocks' text, joined by
  * line breaks, with empty ones left out. A text block whose text isn't a
@@ -546,8 +579,10 @@ function extractChannelIdFromToolResult(
  * too, has no text.
  */
 function mcplResultText(content: McpToolResultContent[] | undefined): string {
+  // An element that isn't a block, null among them, has no text: it shows as
+  // its marker where the content is shown block by block.
   return (Array.isArray(content) ? content : [])
-    .filter((c) => c.type === 'text')
+    .filter((c) => c?.type === 'text')
     .map((c) => (typeof c.text === 'string' ? c.text : NON_STRING_TEXT_PLACEHOLDER))
     .filter((text) => text !== '')
     .join('\n');
@@ -1086,6 +1121,15 @@ const SCRIPT_CALL_NO_RESULT = new WeakSet<ToolResult>();
  * everyone (checkedToolResult).
  */
 const SCRIPT_RESULT_UNCONVERTIBLE = new WeakMap<ToolResult, unknown>();
+
+/**
+ * The claims of an MCPL peer's blocks as a script's view reads them
+ * (scriptViewClaims), or what stopped their walk, read once at dispatch, by
+ * the content array the result carries: its demand fetch reads them, and the
+ * script lane's reading of the same blocks takes them from here, so the two
+ * read the same claims (Ada-1017, room-203 #201013).
+ */
+const SCRIPT_VIEW_CLAIMS = new WeakMap<object, { claims: ResultClaims } | { error: unknown }>();
 
 /**
  * One logical turn's routing state and receipt tallies
@@ -4063,6 +4107,11 @@ export class AgentFramework {
     // and withheld spills, closed for the generation a stop ended, are open
     // for this one.
     this.lifecycleGeneration++;
+    // Its servers' addresses, which an earlier stop() took out of the
+    // reference registry, for its stubs.
+    for (const config of this.mcplServerConfigs.values()) {
+      referenceRegistry.setServerAddress(config.id, serverAddressOf(config), this);
+    }
     // A sleep kept through a stop() wakes this lifecycle at its end, or now
     // if it ended while stopped. Before the loop's first pass, so that a wake
     // owed now joins the requests already pending in one turn.
@@ -4581,6 +4630,10 @@ export class AgentFramework {
       shutdownPromises.push(this.mcplServerRegistry.closeAll(teardownTimeoutMs));
     }
     shutdownPromises.push(this.closeModernMcpConnections(teardownTimeoutMs));
+    // A stopped framework's servers' addresses leave the reference registry,
+    // so no other framework's stub reads them and the registry doesn't keep
+    // this one reachable. start() records them again.
+    step(() => { for (const id of this.mcplServerConfigs.keys()) referenceRegistry.forgetServerAddress(id, this); });
     // Timed-out or failed teardown retains its context and may still write.
     // Sync available state best-effort, but leave its store open for a retry.
     for (const result of await Promise.allSettled(shutdownPromises)) {
@@ -6165,18 +6218,8 @@ export class AgentFramework {
         (serverId) => {
           const cfg = this.mcplServerConfigs.get(serverId);
           if (!cfg) return undefined;
-          // A server's address is the url the host dials it at, as the
-          // transport decides: none for a server the host spawns, as a stdio
-          // server, nor for a WebSocket server whose url the transport won't
-          // dial, which buildWebSocketUrl refuses: one that isn't a ws:// or
-          // wss:// url, or has a fragment.
-          if (!isWebSocketTransport(cfg) || !cfg.url) return 'no-address';
-          try {
-            buildWebSocketUrl(cfg, null);
-          } catch {
-            return 'no-address';
-          }
-          return { url: cfg.url, token: cfg.token, autofetch: cfg.autofetch };
+          const address = serverAddressOf(cfg);
+          return address === 'no-address' ? address : { url: address.url, token: cfg.token, autofetch: cfg.autofetch };
         },
         // A null tells the agent only that the payload couldn't be stored;
         // why, which can name the host's paths, goes to the log.
@@ -6208,6 +6251,14 @@ export class AgentFramework {
     return this.referenceFetcherInstance;
   }
 
+  /** Configure an MCPL server: its config, for tool routing and the fetcher,
+   *  which reads a server's address and credential from it, and its address
+   *  in the reference registry, where a reference's stub reads it. */
+  private setMcplServerConfig(config: McplServerConfig): void {
+    this.mcplServerConfigs.set(config.id, config);
+    referenceRegistry.setServerAddress(config.id, serverAddressOf(config), this);
+  }
+
   /** Register every RFC-005 reference in an MCPL peer's tool-result content
    *  against its server, then fetch by `mode`:
    *  - `register`: nothing. An in-process caller (executeMcplToolCall) may
@@ -6219,12 +6270,15 @@ export class AgentFramework {
    *    the eager ceiling, connection origin — never worse than the server
    *    having inlined the bytes). Failures are non-fatal: the stub then says
    *    fetch_reference instead of a path.
-   *  - `script`: as `model`, then fetch every reference ("eagerly lazy"): a
+   *  - `script`: as `model`, then fetch every reference but a link ("eagerly lazy"): a
    *    script receiving a result is the strongest available signal that the
    *    bytes are wanted (scripts process, they do not browse), so the stub it
    *    receives carries a workspace path it can open directly.
-   *  A uri the result calls expired is fetched in no mode. */
-  private async autoFetchReferences(content: unknown, serverId: string, mode: 'register' | 'model' | 'script'): Promise<void> {
+   *  A uri the result calls expired is fetched in no mode: by its blocks, or
+   *  by `claims` where given, those of everything a script's view of it
+   *  shows (scriptViewClaims), nested fields included, as the module
+   *  route's demand fetch reads them (Ada-1017, room-203 #201013). */
+  private async autoFetchReferences(content: unknown, serverId: string, mode: 'register' | 'model' | 'script', claims?: ResultClaims): Promise<void> {
     if (!Array.isArray(content)) return;
     // Register every block first, then judge each uri once, by its latest
     // record. The registry keys records by uri and evicts the one registered
@@ -6234,17 +6288,30 @@ export class AgentFramework {
     // record here, hence the key by uri. A uri that any of this result's
     // blocks calls expired takes no slot, whichever block registered last. A
     // later result's fresh expiry still supersedes, through register().
-    const byUri = new Map<string, { record: import('./mcpl/references.js').ReferenceRecord; expiredHere: boolean }>();
+    // A link (MCP's resource_link) is registered, so the agent can fetch it,
+    // but never fetched here: a tool's links are what it offers to follow,
+    // and fetching them would spend the server's fetch budget on bytes
+    // nobody asked for. A uri a link names is fetched only when a block of
+    // the result that isn't a link names it too.
+    const byUri = new Map<string, {
+      record: import('./mcpl/references.js').ReferenceRecord; expiredHere: boolean; linkOnly: boolean;
+    }>();
     for (const block of content) {
       const c = classifyBlock(block);
       if (c.kind !== 'reference') continue;
       const record = referenceRegistry.register(c.testimony, serverId);
-      const expiredHere = byUri.get(c.testimony.uri)?.expiredHere === true || isReferenceExpired(c.testimony);
-      byUri.set(c.testimony.uri, { record, expiredHere });
+      const prior = byUri.get(c.testimony.uri);
+      const expiredHere = prior?.expiredHere === true || isReferenceExpired(c.testimony);
+      const linkOnly = (prior?.linkOnly ?? true) && c.testimony.fromLink === true;
+      byUri.set(c.testimony.uri, { record, expiredHere, linkOnly });
     }
     if (mode === 'register') return;
     const fetcher = this.getReferenceFetcher();
-    const live = [...byUri.values()].filter(({ expiredHere }) => !expiredHere).map(({ record }) => record);
+    const nowMs = Date.now();
+    const live = [...byUri.values()]
+      .filter(({ record, expiredHere, linkOnly }) => !expiredHere && !linkOnly
+        && (claims === undefined || Boolean(record.fetchedPath) || claimedExpiry(record, claims, nowMs) === null))
+      .map(({ record }) => record);
     // Parallel with a count cap: N small fetches cost one round-trip of
     // wall-clock, and anything past the cap stays lazy (stub says so).
     const MAX_EAGER_PER_RESULT = 8;
@@ -12506,7 +12573,7 @@ export class AgentFramework {
             this.pendingAssistantBlocks.delete(agent.name);
           }
           const membraneResults = currentState.toolResults.map(tc =>
-            this.toMembraneToolResult(tc.id, tc.result, maxChars, spilled.get(tc.id))
+            this.toMembraneToolResult(tc.id, tc.result, maxChars, spilled.get(tc.id), tc.name)
           );
           agent.toolResultGuard.storeResults(toolResultContent, membraneResults, currentState.toolResults, turnRowMetadata, keptCap);
 
@@ -20401,7 +20468,7 @@ export class AgentFramework {
                   bound,
                 );
                 agent.toolResultGuard.storeResults(toolResultContent, readyState.toolResults.map((tc) =>
-                  this.toMembraneToolResult(tc.id, tc.result, cap, spilled.get(tc.id))), readyState.toolResults,
+                  this.toMembraneToolResult(tc.id, tc.result, cap, spilled.get(tc.id), tc.name)), readyState.toolResults,
                   this.silentTurnRowMetadata(agent.name), keptCap);
                 // The response is already complete: this batch is never
                 // submitted in this turn, so it cannot be refused. Admit it.
@@ -21947,10 +22014,12 @@ export class AgentFramework {
       // agent's own fetch_reference needs, on bytes nobody asked for. A
       // failure keeps only its text, so no stub is made of its references and
       // they aren't registered. Only an MCPL peer's blocks are references; a
-      // modern server's and an MCP-only peer's are standard.
+      // modern server's and an MCP-only peer's are standard. An MCPL peer's
+      // content is marked as content (dataIsContent), as on the model's path.
       if (server && server.capabilities !== null) {
         await this.autoFetchReferences(result.content, serverId, 'register')
           .catch((e) => console.error('[rfc005] reference registration error:', (e as Error).message));
+        return Array.isArray(direct.data) ? { ...direct, dataIsContent: true } : direct;
       }
       return direct;
     } catch (err) {
@@ -22342,12 +22411,12 @@ export class AgentFramework {
     bound: number | undefined = undefined,
   ): Promise<{
     blocks: ContentBlock[];
-    spilled: Map<string, { text: string; filePath: string | null }>;
+    spilled: Map<string, StoredToolResult>;
     /** Where a withheld stub's kept fields are cut: the share's keptCap
      *  (toolResultShare), which is the cap where there's no bound. */
     keptCap: number | undefined;
   }> {
-    const spilled = new Map<string, { text: string; filePath: string | null }>();
+    const spilled = new Map<string, StoredToolResult>();
     const dateLabel = new Date().toISOString().slice(0, 10);
     // The results are stored as one message, whose bound a reader's
     // strategy spends across them in order. Each is stored as it would be
@@ -22356,20 +22425,23 @@ export class AgentFramework {
     // stored under its share (toolResultShare). A result carrying an image
     // keeps its live copy cut at the cap; any other's live copy is its stored
     // text.
-    const alone = new Map<string, { text: string; shown: ShownRanges | null; stored: { text: string; filePath: string | null; written?: SpillWrite } }>();
+    const alone = new Map<string, { text: string; shown: ShownRanges | null; live: ToolResultBlock[] | null; stored: { text: string; filePath: string | null; written?: SpillWrite } }>();
     for (const tc of toolResults) {
-      const { text, shown } = this.storedToolResultText(agentName, tc, maxChars);
-      alone.set(tc.id, { text, shown, stored: await this.spillOrTruncate(text, maxChars, `${dateLabel}-${tc.id}`, shown, bound) });
+      const { text, shown, live } = this.storedToolResultText(agentName, tc, maxChars);
+      alone.set(tc.id, { text, shown, live, stored: await this.spillOrTruncate(text, maxChars, `${dateLabel}-${tc.id}`, shown, bound) });
     }
     const share = maxChars === undefined ? undefined : toolResultShare(maxChars, bound, toolResults.length);
     const total = [...alone.values()].reduce((sum, { stored }) => sum + stored.text.length, 0);
     const byShare = share?.bound !== undefined && toolResults.length > 1
       && (this.toolRoundsByShare.has(toolResults) || total > bound!);
     for (const tc of toolResults) {
-      const { text, shown, stored } = alone.get(tc.id)!;
-      spilled.set(tc.id, byShare
+      const { text, shown, live, stored } = alone.get(tc.id)!;
+      const kept = byShare
         ? await this.spillOrTruncate(text, share!.cap, `${dateLabel}-${tc.id}`, shown, share!.bound, stored.written, { readCap: maxChars! })
-        : stored);
+        : stored;
+      // The live copy is built from the blocks the stored text was made
+      // from, never classified again (StoredToolResult.live).
+      spilled.set(tc.id, { text: kept.text, filePath: kept.filePath, live });
     }
     const blocks: ContentBlock[] = toolResults.map(tc => ({
       type: 'tool_result' as const,
@@ -22395,21 +22467,24 @@ export class AgentFramework {
    * the image stays reachable by provenance after the bytes leave the wire.
    *
    * The live copy is the stored text itself unless the result is a content
-   * array carrying an inline image, which tryNativeToolResultContent sends
-   * as native blocks. It takes the same arrays the serializer takes block by
-   * block, and shows each image and each reference block's stub whole and
-   * each text block up to where it cuts that block at the cap (`maxChars`,
-   * toolResultCutAt), so those are the ranges of the text it showed.
+   * array carrying an inline image whose links and markers fit the cap
+   * together (goesNative). Then `live` holds the blocks this text was made
+   * from, which toMembraneToolResult sends as native blocks (nativeContent),
+   * showing each image, stub and marker whole and each text block up to where
+   * it cuts that block at the cap (`maxChars`, toolResultCutAt), so those are
+   * the ranges of the text it showed.
    */
   private storedToolResultText(
     agentName: string,
     tc: CompletedToolCall,
     maxChars: number | undefined,
-  ): { text: string; shown: ShownRanges | null } {
-    if (tc.result.isError) return { text: (tc.result.error ?? 'Unknown error').toWellFormed(), shown: null };
+  ): { text: string; shown: ShownRanges | null; live: ToolResultBlock[] | null } {
+    if (tc.result.isError) return { text: (tc.result.error ?? 'Unknown error').toWellFormed(), shown: null, live: null };
     const ledger = this.toolImageLedgerFor(agentName);
     let blocks = null as HistoryBlockSpan[] | null;
+    let classified = null as ToolResultBlock[] | null;
     const text = nonErrorResultText(tc.result, undefined, {
+      toolName: tc.name,
       imageRef: (blockIndex, image) => ledger.retain({
         toolCallId: tc.id,
         toolName: tc.name,
@@ -22417,13 +22492,16 @@ export class AgentFramework {
         data: image.data,
         mediaType: image.mimeType,
       }).ref,
-      onBlocks: (spans) => { blocks = spans; },
+      onBlocks: (spans, result) => { blocks = spans; classified = result; },
     });
-    if (!blocks?.some((block) => block.kind === 'image')) return { text, shown: null };
+    if (!blocks || !classified || !goesNative(blocks.map(({ kind, start, end }) => ({ kind, length: end - start })), maxChars)) {
+      return { text, shown: null, live: null };
+    }
     return {
       text,
       shown: blocks.map(({ kind, start, end }): [number, number] =>
         [start, kind === 'text' && maxChars ? start + toolResultCutAt(text.slice(start, end), maxChars) : end]),
+      live: classified,
     };
   }
 
@@ -22736,7 +22814,9 @@ export class AgentFramework {
    * what the model would read: a structured result's blocks as the dispatch
    * gave them (the direct reading, with RFC-005's treatment of an MCPL peer's
    * blocks there, bound to the server that sent them), a module's under
-   * history's reading of RFC-005 at every depth (shownToScript), and
+   * history's reading of RFC-005 at every depth (shownToScript), each
+   * reading the claims of everything the script's view shows, nested fields
+   * included (scriptViewClaims), and
    * otherwise one text block of the model's text, which for a failure is its
    * error. A module's is any result whose call the dispatch didn't send to
    * a server (`toServer`, from the call's waiter). `structuredContent` is the
@@ -22754,31 +22834,26 @@ export class AgentFramework {
     // RFC-005 "eagerly lazy": a script receiving a result is the strongest
     // available signal that the bytes are wanted (scripts process, they do
     // not browse), so the stub the script receives carries a workspace path
-    // it can open directly. An MCPL peer's references were fetched for the
-    // script at dispatch (autoFetchReferences). Any other tool's content
+    // it can open directly. An MCPL peer's references, but its links, were
+    // fetched for the script at dispatch (autoFetchReferences). Any other tool's content
     // array, a module's, is materialized here. Only a reference registered
     // against its server can be fetched: a module's result can carry content
     // it got from a call of its own (ctx.callTool), whose references were
     // registered on arrival (executeMcplToolCall). A reference a module makes
     // itself has no server, so its fetch is refused (and logged here) and the
     // script gets its stub, as it does for a reference nested in other data,
-    // which isn't fetched.
+    // which isn't fetched. A link (MCP's resource_link) isn't fetched either:
+    // a tool's links are what it offers to follow, and the script can fetch
+    // the ones it wants with fetch_reference.
     // Whenever the result's blocks reach the script: a structured failure's
     // included, as a module's error can carry content.
     // Not a server's result: a module's, whose blocks no dispatch has given
     // RFC-005's treatment.
     const fromModule = !toServer;
-    if ((!isError || structured) && Array.isArray(result.data) && fromModule) {
-      const fetcher = this.getReferenceFetcher();
-      for (const block of result.data) {
-        const c = classifyBlock(block);
-        if (c.kind !== 'reference') continue;
-        const record = referenceRegistry.findByUri(c.testimony.uri)
-          ?? referenceRegistry.register(c.testimony);
-        const outcome = await fetcher.fetch(record);
-        if (!outcome.ok) console.error(`[rfc005] script-demand fetch of ${record.refId} failed: ${outcome.error}`);
-      }
-    }
+    // A structured result's blocks, as #538 gives them: none when its content
+    // isn't a list, the structured view carrying the result. A failure with
+    // no blocks reads as its error text.
+    const showsBlocks = structured && (!isError || (Array.isArray(result.data) && result.data.length > 0));
     const failed = (err: unknown): ToolAnswer => {
       const error = unconvertibleScriptResult(toolName, err, isError ? result.error : undefined);
       return {
@@ -22788,55 +22863,145 @@ export class AgentFramework {
         brief: error,
       };
     };
-    // An MCPL peer's result whose blocks JSON couldn't hold, so that RFC-005's
-    // treatment couldn't be given them at dispatch.
-    if (SCRIPT_RESULT_UNCONVERTIBLE.has(result)) return failed(SCRIPT_RESULT_UNCONVERTIBLE.get(result));
-    let content: unknown[];
-    let text: string | undefined;
-    // A structured result's blocks, as #538 gives them: none when its content
-    // isn't a list, the structured view carrying the result. A failure with
-    // no blocks reads as its error text.
-    if (structured && (!isError || (Array.isArray(result.data) && result.data.length > 0))) {
-      content = Array.isArray(result.data) ? result.data : [];
-      // A module's blocks, such as an MCPL peer's it got from ctx.callTool
-      // and returns whole, are read as history reads a module's data: what
-      // RFC-005 governs, at any depth, as the script lane shows it, and
-      // anything else as sent. What a script prints comes back to the model,
-      // so no uri the model's lanes withhold reaches it. What this gives is
-      // a stub, a notice or the value itself, so a module that returns
-      // blocks it already gave has them left as they are.
-      if (fromModule) {
+    // The claims a module's result is shown by, read once, so the fetches
+    // below and what the script gets read the same: a structured result's
+    // view's (scriptViewClaims), nested fields included, or the model's text's
+    // (resultClaimsOrThrow, which throws where resultClaimsOf answers null).
+    // Where the walk stops, the script's answer is a
+    // failure naming the tool, before any fetch or treatment, so neither runs
+    // without them (Ada-1017, room-203 #200250, #200374): on both of a
+    // script's routes, `isError` says nothing could be shown, where the
+    // model's lane shows UNCHECKED_RESULT_TEXT.
+    let claims: ResultClaims | undefined;
+    // The model's line for the result, its claims and its records as it reads
+    // them, which decide where a link's object shows its uri
+    // (referenceBlockForScript's line). Its records are the registry's as
+    // the model's line leaves it, before the lane's own registrations
+    // (openJournal): where the line renders the result's blocks, the demand
+    // loop below registers them in their order, as the line's render does;
+    // the treatment then registers, rebinds and evicts as it goes, which the
+    // line never sees (Ada-1017, room-203 #202683, #203011, #203172).
+    let line: ScriptLine | undefined;
+    let journal: RegistryJournal | undefined;
+    try {
+      if ((!isError || structured) && Array.isArray(result.data) && fromModule) {
+        let lineClaims: ResultClaims;
         try {
-          content = JSON.parse(JSON.stringify(content, (_key, value: unknown) => shownToScript(value))) as unknown[];
+          // The flag as the render reads it, so a value other than a
+          // boolean decides the same way here (isContentArray reads `true`).
+          lineClaims = resultClaimsOrThrow(result.data, Boolean(result.dataIsContent));
+          claims = showsBlocks ? scriptViewClaims(result.data, false) : lineClaims;
         } catch (err) {
           return failed(err);
         }
+        // The loop's registrations are the line's own only where the line
+        // renders these blocks: a content array's, block by block at the top
+        // level, and not a failure's, whose line is its error. There the loop
+        // registers links too, in the result's order, and the journal opens
+        // after it. Elsewhere the line registers nothing (a failure) or
+        // registers in its own walk's order (data at depth), which the loop
+        // can't follow, so the journal opens before the loop, which leaves
+        // links to the treatment: the line's records are then the registry
+        // before the line's own walk, which can only be stricter, by an
+        // eviction (Ada-1017, room-203 #203172). Past 2,000 references in one
+        // result, a content array's loop can evict an earlier never before
+        // the line, rendering in order, would have (#203184).
+        const blocksAreLines = !isError && isContentArray(result.data, Boolean(result.dataIsContent));
+        if (showsBlocks && !blocksAreLines) {
+          journal = referenceRegistry.openJournal();
+          line = { claims: lineClaims, recordBefore: journal.before };
+        }
+        const fetcher = this.getReferenceFetcher();
+        for (const block of result.data) {
+          const c = classifyBlock(block);
+          if (c.kind !== 'reference' || (c.testimony.fromLink && !blocksAreLines)) continue;
+          // Registered, not only found, so a re-issued reference's claims
+          // replace a link's, or a stale reference's, before the fetch reads
+          // them, as on any other path, while the record isn't fetched yet. A
+          // record its uri already has keeps the server it's bound to.
+          const record = referenceRegistry.register(c.testimony);
+          // A link of blocks the line renders is registered too, in the
+          // result's order, and not fetched: the registry then holds its
+          // records in the order the model's own render makes, so a
+          // registration here evicts what that render's would, short of more
+          // references in one result than the registry holds, and the text
+          // route, which reads the live registry, decides each link's uri as
+          // the model's line does (Ada-1017, room-203 #203000).
+          if (c.testimony.fromLink) continue;
+          // A uri any of the result's references gives an expiry that counts
+          // isn't fetched, as autoFetchReferences passes over one that any block
+          // of an MCPL result marks expired.
+          const expired = record.fetchedPath ? null : claimedExpiry(record, claims, Date.now());
+          if (expired !== null) {
+            console.error(`[rfc005] script-demand fetch of ${record.refId} not made: by the result's claims, the reference is ${EXPIRY_REASON[expired]}`);
+            continue;
+          }
+          const outcome = await fetcher.fetch(record);
+          if (!outcome.ok) console.error(`[rfc005] script-demand fetch of ${record.refId} failed: ${outcome.error}`);
+        }
+        // Where the loop's registrations are the ones the model's line makes,
+        // the treatment's, below, are the script lane's own, which the
+        // journal keeps the line's records from (Ada-1017, room-203 #203011).
+        if (showsBlocks && blocksAreLines) {
+          journal = referenceRegistry.openJournal();
+          line = { claims: lineClaims, recordBefore: journal.before };
+        }
       }
-    } else {
-      // As in history, a reference is its stub at any depth and inline data
-      // claiming a uri or a disposition is withheld (RFC-005).
+      // An MCPL peer's result whose blocks JSON couldn't hold, so that RFC-005's
+      // treatment couldn't be given them at dispatch.
+      if (SCRIPT_RESULT_UNCONVERTIBLE.has(result)) return failed(SCRIPT_RESULT_UNCONVERTIBLE.get(result));
+      let content: unknown[];
+      let text: string | undefined;
+      if (showsBlocks) {
+        content = Array.isArray(result.data) ? result.data : [];
+        // A module's blocks, such as an MCPL peer's it got from ctx.callTool
+        // and returns whole, are read as history reads a module's data: what
+        // RFC-005 governs, at any depth, as the script lane shows it, and
+        // anything else as sent. What a script prints comes back to the model,
+        // so no uri the model's lanes withhold reaches it through the blocks
+        // (structured content goes as sent, as on main). What this gives is
+        // a stub, a notice or the value itself, so a module that returns
+        // blocks it already gave has them left as they are.
+        if (fromModule) {
+          try {
+            content = JSON.parse(JSON.stringify(content, (_key, value: unknown) => shownToScript(value, claims, line))) as unknown[];
+          } catch (err) {
+            return failed(err);
+          }
+        }
+      } else {
+        // As in history, a reference is its stub at any depth and inline data
+        // claiming a uri or a disposition is withheld (RFC-005), by the claims
+        // the fetches read, or else the serializer's own reading of them,
+        // whose walk throws where it stops, failing as a stopped render does.
+        try {
+          text = isError
+            ? result.error ?? 'tool call failed'
+            : result.data === undefined || result.data === null
+              ? nonErrorResultTextOrThrow(result)
+              : toolResultDataToHistoryString(result.data, undefined, {
+                dataIsContent: Boolean(result.dataIsContent),
+                ...(claims ? { claims } : {}),
+              });
+        } catch (err) {
+          return failed(err);
+        }
+        content = [{ type: 'text', text }];
+      }
+      let json: string;
       try {
-        text = isError
-          ? result.error ?? 'tool call failed'
-          : result.data === undefined || result.data === null
-            ? nonErrorResultText(result)
-            : toolResultDataToHistoryString(result.data);
+        json = JSON.stringify({
+          content,
+          structuredContent: structured && result.structured !== undefined ? result.structured : null,
+          isError,
+        });
       } catch (err) {
         return failed(err);
       }
-      content = [{ type: 'text', text }];
+      return { ok: true, json, isError, brief: text ?? scriptResultBrief(content) };
+    } finally {
+      journal?.close();
     }
-    let json: string;
-    try {
-      json = JSON.stringify({
-        content,
-        structuredContent: structured && result.structured !== undefined ? result.structured : null,
-        isError,
-      });
-    } catch (err) {
-      return failed(err);
-    }
-    return { ok: true, json, isError, brief: text ?? scriptResultBrief(content) };
   }
 
   /**
@@ -22967,9 +23132,13 @@ export class AgentFramework {
     callId: string,
     afResult: ToolResult,
     maxChars?: number,
-    /** Pre-spilled outcome from the history path — used for the non-image
-     *  path so the live wire copy byte-matches what the window stored. */
-    precomputed?: { text: string; filePath: string | null },
+    /** The history path's outcome: its stored text, spilled or cut, and the
+     *  blocks it was made from where the live copy goes natively. The live
+     *  copy is built from these, never classified again, so the two copies
+     *  agree on every block and on whether it goes natively (goesNative). */
+    precomputed?: StoredToolResult,
+    /** The tool's name, for the log line of a result shown as the notice. */
+    toolName?: string,
   ): MembraneToolResult {
     if (afResult.isError) {
       // Same spill policy as successes: reuse the history copy so a giant
@@ -22985,79 +23154,63 @@ export class AgentFramework {
     // blocks natively rather than JSON-stringifying them away. Anything else
     // goes as text. The error path was handled above, so isError is always
     // false on these return paths.
-    const blocks = this.tryNativeToolResultContent(afResult.data, maxChars, precomputed?.filePath ?? null);
-    if (blocks) {
-      return { toolUseId: callId, content: blocks, isError: false };
-    }
     if (precomputed !== undefined) {
-      return { toolUseId: callId, content: precomputed.text, isError: false };
+      return {
+        toolUseId: callId,
+        content: precomputed.live ? this.nativeContent(precomputed.live, maxChars, precomputed.filePath) : precomputed.text,
+        isError: false,
+      };
     }
-    // Without the history path's copy, the text is made as that copy is
-    // (nonErrorResultText), so a reference's uri stays out of it at any depth
-    // (RFC-005), a result with no data reads its error text, or no text, and
-    // never the value undefined.
-    return { toolUseId: callId, content: nonErrorResultText(afResult, maxChars), isError: false };
+    // Without the history path's copy, one classification makes both the
+    // decision and the copy, as on that path: the text is made as that copy
+    // is (nonErrorResultText), so a reference shows at any depth as its stub,
+    // or a link as its line (RFC-005), a result with no data reads its error
+    // text, or no text, and never the value undefined; and where it's a
+    // content array whose links and markers fit the cap beside an image
+    // (goesNative), the very blocks that text was made from go natively.
+    let spans = null as HistoryBlockSpan[] | null;
+    let classified = null as ToolResultBlock[] | null;
+    const text = nonErrorResultText(afResult, maxChars, { toolName, onBlocks: (s, b) => { spans = s; classified = b; } });
+    if (spans && classified && goesNative((spans as HistoryBlockSpan[]).map(({ kind, start, end }) => ({ kind, length: end - start })), maxChars)) {
+      return { toolUseId: callId, content: this.nativeContent(classified, maxChars, null), isError: false };
+    }
+    return { toolUseId: callId, content: text, isError: false };
   }
 
   /**
-   * If `data` is an MCP tool-result content array carrying at least one image,
-   * convert to Membrane's native ToolResultContentBlock[]. Returns null when
-   * the array is text-only (let JSON path handle it; saves a code path).
-   * `maxChars`, when provided, caps each accompanying text block so an image
-   * inlined alongside an enormous text payload can't blow the context. A
-   * block is cut at the cap as the stored copy's cut at that cap is
-   * (toolResultCutAt), never inside a slot, so the stored copy can keep
-   * exactly the slots this showed (#403); under a readers' bound the stored
-   * copy's cut can come earlier (cutStoredToolResultToFit).
+   * A content array's blocks (toolResultBlocks) as Membrane's native
+   * ToolResultContentBlock[], for a caller that found they go natively: at
+   * least one image, with links and markers that fit the cap together
+   * (goesNative), which this doesn't check. Each image as itself, each text block
+   * cut at the cap, and every other block whole, as the text the stored copy
+   * shows for it. `maxChars`, when provided, caps each text block so an image
+   * inlined beside an enormous text payload can't blow the context. A block
+   * is cut as the stored copy is at that cap (toolResultCutAt), never inside a
+   * slot, so the stored copy can keep exactly the slots this showed (#403);
+   * under a readers' bound the stored copy's cut can come earlier
+   * (cutStoredToolResultToFit). Each text is already well formed, as the
+   * stored copy's is (toolResultBlocks).
    */
-  private tryNativeToolResultContent(
-    data: unknown,
-    maxChars?: number,
+  private nativeContent(
+    blocks: ToolResultBlock[],
+    maxChars: number | undefined,
     /** Spill file written by the history path — referenced from truncation
      *  notices so an image-adjacent giant text block stays recoverable. */
-    spillPath: string | null = null,
-  ): ToolResultContentBlock[] | null {
-    if (!Array.isArray(data)) return null;
-    let hasImage = false;
-    const blocks: ToolResultContentBlock[] = [];
-    for (const raw of data) {
-      if (!raw || typeof raw !== 'object') return null;
-      const b = raw as { type?: unknown; text?: unknown; data?: unknown; mimeType?: unknown };
-      if (isInlineContradiction(b)) {
-        // RFC-005 vector 2: withhold inline data claiming bulk disposition.
-        blocks.push({ type: 'text', text: INLINE_WITHHELD_TEXT });
-        continue;
+    spillPath: string | null,
+  ): ToolResultContentBlock[] {
+    return blocks.map((block): ToolResultContentBlock => {
+      if (block.kind === 'image') {
+        return { type: 'image', source: { type: 'base64', data: block.data, mediaType: block.mimeType } };
       }
-      if (b.type === 'text') {
-        // A text that isn't a string shows as the converters' placeholder,
-        // rather than sending the whole array to the JSON fallback.
-        // Well formed, as the stored copy's text is (nonErrorResultText).
-        let text = typeof b.text === 'string' ? b.text.toWellFormed() : NON_STRING_TEXT_PLACEHOLDER;
-        if (maxChars && text.length > maxChars) {
-          text = text.slice(0, toolResultCutAt(text, maxChars))
-            + '\n\n[truncated — original was ' + text.length + ' chars'
-            + (spillPath ? `; full serialized result: workspace file ${spillPath}` : '')
-            + ']';
-        }
-        blocks.push({ type: 'text', text });
-      } else if (b.type === 'image' && typeof b.data === 'string' && typeof b.mimeType === 'string') {
-        hasImage = true;
-        blocks.push({
-          type: 'image',
-          source: { type: 'base64', data: b.data, mediaType: b.mimeType },
-        });
-      } else if (b.type === 'resource' || ((b.type === 'image' || b.type === 'audio') && typeof (b as { uri?: unknown }).uri === 'string')) {
-        // RFC-005 reference block → bounded stub. Previously this bailed the
-        // whole array to JSON, which both inlined the reference verbatim and
-        // demoted any adjacent image block to stringified base64.
-        const stub = referenceStubOrNull(b, 'from tool result');
-        if (stub === null) return null;
-        blocks.push({ type: 'text', text: stub });
-      } else {
-        return null; // unknown shape: the stored copy's text, which shows any reference in it as its stub
+      let text = block.text;
+      if (block.kind === 'text' && maxChars && text.length > maxChars) {
+        text = text.slice(0, toolResultCutAt(text, maxChars))
+          + '\n\n[truncated — original was ' + text.length + ' chars'
+          + (spillPath ? `; full serialized result: workspace file ${spillPath}` : '')
+          + ']';
       }
-    }
-    return hasImage ? blocks : null;
+      return { type: 'text', text };
+    });
   }
 
   private toolImageLedgerFor(agentName: string): ToolImageLedger {
@@ -25949,7 +26102,7 @@ export class AgentFramework {
     for (const config of serverConfigs) {
       const prefix = config.toolPrefix ?? `mcpl--${config.id}`;
       this.mcplPrefixMap.set(prefix, config.id);
-      this.mcplServerConfigs.set(config.id, config);
+      this.setMcplServerConfig(config);
     }
 
     // Find shouldTriggerInference callback:
@@ -26898,7 +27051,7 @@ export class AgentFramework {
       if (owner === config.id && other !== prefix) this.mcplPrefixMap.delete(other);
     }
     this.mcplPrefixMap.set(prefix, config.id);
-    this.mcplServerConfigs.set(config.id, config);
+    this.setMcplServerConfig(config);
 
     if (family === 'modern') {
       // Registered and wired before its first connect, so the connect in
@@ -27763,6 +27916,7 @@ export class AgentFramework {
         if (owner === id) this.mcplPrefixMap.delete(prefix);
       }
       this.mcplServerConfigs.delete(id);
+      referenceRegistry.forgetServerAddress(id, this);
 
       await this.refreshMcplTools();
       this.emitMcplToolDiff(oldToolNames, id);
@@ -29234,7 +29388,9 @@ export class AgentFramework {
       if (mcpl) {
         if (!Array.isArray(direct.data)) return direct;
         // Each block by the classifier, then what's nested in each, at any
-        // depth. The blocks came from the wire as JSON, so the round trip
+        // depth, each reading the claims of everything the script's view
+        // shows, nested fields included (scriptViewClaims; Ada-1017, room-203
+        // #200094). The blocks came from the wire as JSON, so the round trip
         // changes nothing else. But a value that parsed can still fail to go
         // back: past some depth JSON.stringify overflows the stack where
         // JSON.parse didn't (on Node 24.19 an array 5,000 deep does, on Bun
@@ -29251,15 +29407,47 @@ export class AgentFramework {
         // dropped, since they are untreated and the result travels on, to the
         // waiter and to the listeners of its event's trace. Its structured
         // content is kept, as every result keeps it, since RFC-005's
-        // treatment doesn't reach it.
-        const blocks = direct.data.map((block: unknown) => referenceBlockForScript(block, serverId));
-        try {
-          return { ...direct, data: JSON.parse(JSON.stringify(blocks, (_key, value: unknown) => shownToScriptFromServer(value, serverId))) as unknown[] };
-        } catch (err) {
+        // treatment doesn't reach it. The view's claims are read first, by
+        // a walk of their own: where it stops, the treatment doesn't run
+        // (Ada-1017, room-203 #200250), a RangeError meaning a result it
+        // can't convert, as below, and anything else a fault.
+        const unconvertible = (err: unknown): ToolResult => {
           if (!(err instanceof RangeError)) throw err;
-          const unconvertible: ToolResult = { ...direct, data: [] };
-          SCRIPT_RESULT_UNCONVERTIBLE.set(unconvertible, err);
-          return unconvertible;
+          const dropped: ToolResult = { ...direct, data: [] };
+          SCRIPT_RESULT_UNCONVERTIBLE.set(dropped, err);
+          return dropped;
+        };
+        let claims: ResultClaims;
+        // The model's line for a peer's content reads its blocks' claims
+        // alone, and each record as it stood before the treatment registered
+        // anything (openJournal), which decide where a link's object shows
+        // its uri (Ada-1017, room-203 #202683).
+        let lineClaims: ResultClaims;
+        try {
+          // As the dispatch read them for its demand fetch, where it did.
+          const read = SCRIPT_VIEW_CLAIMS.get(direct.data);
+          if (read && 'error' in read) throw read.error;
+          claims = read ? read.claims : scriptViewClaims(direct.data, true);
+          lineClaims = resultClaimsOrThrow(direct.data, true);
+        } catch (err) {
+          return unconvertible(err);
+        }
+        const journal = referenceRegistry.openJournal();
+        try {
+          const line: ScriptLine = { claims: lineClaims, recordBefore: journal.before };
+          const blocks = direct.data.map((block: unknown) => referenceBlockForScript(block, serverId, claims, line));
+          // The top-level blocks were treated just above; the pass treats
+          // what's nested in them. Reading a treated block again would take
+          // a link object's uri, as shownUri shows it, for a new link,
+          // registered apart from the one the result named.
+          const nested = function (this: unknown, _key: string, value: unknown): unknown {
+            return this === blocks ? value : shownToScriptFromServer(value, serverId, claims, line);
+          };
+          return { ...direct, data: JSON.parse(JSON.stringify(blocks, nested)) as unknown[] };
+        } catch (err) {
+          return unconvertible(err);
+        } finally {
+          journal.close();
         }
       }
       // A standard peer's content that isn't a list of blocks is a malformed
@@ -29345,7 +29533,26 @@ export class AgentFramework {
         if (mcplPeer) {
           const scriptReads = forScript
             && (!result.isError || Object.prototype.hasOwnProperty.call(result, 'structuredContent'));
-          await this.autoFetchReferences(result.content, serverId, scriptReads ? 'script' : 'model')
+          // A script's demand fetch reads the claims of everything its view
+          // shows, as the module route's does; where that walk stops, the view
+          // isn't written (reading()), so nothing is fetched for it, the
+          // references only registered (Ada-1017, room-203 #201013).
+          let mode: 'register' | 'model' | 'script' = scriptReads ? 'script' : 'model';
+          let claims: ResultClaims | undefined;
+          // Only where the script reads a view of the blocks (reading()'s own
+          // condition): without structured content it reads the model lane's
+          // text, and its fetch passes over what each top-level block's own
+          // expiry marks, as a model's call does. No fetch reads a `never`.
+          if (scriptReads && Object.prototype.hasOwnProperty.call(result, 'structuredContent') && Array.isArray(result.content)) {
+            try {
+              claims = scriptViewClaims(result.content, true);
+              SCRIPT_VIEW_CLAIMS.set(result.content, { claims });
+            } catch (error) {
+              SCRIPT_VIEW_CLAIMS.set(result.content, { error });
+              mode = 'register';
+            }
+          }
+          await this.autoFetchReferences(result.content, serverId, mode, claims)
             .catch((e) => console.error('[rfc005] autofetch error:', (e as Error).message));
         }
         return { result, toolResult: await reading(result, mcplPeer) };
@@ -29546,11 +29753,14 @@ export class AgentFramework {
     // for callers that expect data to be string-ish (mcplResultText).
     let textContent = mcplResultText(blocks);
     if (blocks.length === 0 && hasStructured) textContent = JSON.stringify(result.structuredContent) ?? 'null';
-    const hasNonText = blocks.some((c) => c.type !== 'text');
+    const hasNonText = blocks.some((c) => c?.type !== 'text');
     const structured = hasStructured ? { structured: result.structuredContent } : {};
+    // Blocks passed through are marked as content (dataIsContent), so each
+    // shows as itself, its stub or its marker, never as the array's JSON.
     return {
       success: !result.isError,
       data: result.isError ? undefined : hasNonText ? blocks : (textContent || undefined),
+      ...(!result.isError && hasNonText ? { dataIsContent: true } : {}),
       error: result.isError ? (textContent.trim() ? textContent : mcplToolNoWordsText(serverId, callName)) : undefined,
       isError: result.isError ?? false,
       ...structured,
@@ -30276,8 +30486,8 @@ export class AgentFramework {
    * Handle the synthesized `read_image` tool: read image bytes from a
    * workspace mount and return them as a native MCP-shaped content array
    * (`[{type:'text'…},{type:'image', data, mimeType}]`). The live-turn
-   * converter (tryNativeToolResultContent → membrane tool_result image
-   * blocks) delivers the actual image to the model; history storage keeps
+   * converter (toMembraneToolResult's nativeContent → membrane tool_result
+   * image blocks) delivers the actual image to the model; history storage keeps
    * the standard compact `[image: …]` placeholder.
    */
   /** RFC-005 on-demand dereference: [ref id] → workspace file, via the
