@@ -701,6 +701,23 @@ test("where the walk of a script view's claims stops, the view isn't written, th
   });
 });
 
+test("where the walk of a result's claims stops, a script's text route fails naming the tool, as its structured view does, for an object or a list", async () => {
+  await withPeers(async ({ exit }) => {
+    // A type that throws a RangeError the first time it's read stops the
+    // claims walk only: the render's walk would read it as data.
+    const once = () => {
+      let read = false;
+      return { get type(): string { if (!read) { read = true; throw new RangeError('Maximum call stack size exceeded'); } return 'note'; } };
+    };
+    // No structured content, so the text route; data that isn't content.
+    for (const data of [{ deep: once() }, [{ deep: once() }]]) {
+      const out = JSON.parse(await exit({ success: true, data }, 'fwd--whole', false)) as { content: [{ text: string }]; isError: boolean };
+      assert.equal(out.isError, true, JSON.stringify(out));
+      assert.match(out.content[0].text, /^tool 'fwd--whole' returned a result that can't be converted to JSON, so the script can't receive it/);
+    }
+  });
+});
+
 test("a fault in an MCPL peer's round trip other than a RangeError fails the dispatch, as any fault does, with its own message", async () => {
   await withPeers(async ({ answer, script, observe }) => {
     const seen = observe();

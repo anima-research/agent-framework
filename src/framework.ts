@@ -118,6 +118,7 @@ import {
   goesNative,
   nonErrorResultText,
   resultClaimsOf,
+  resultClaimsOrThrow,
   scriptViewClaims,
   shownToScript,
   shownToScriptFromServer,
@@ -22568,20 +22569,17 @@ export class AgentFramework {
     // The claims a module's result is shown by, read once, so the fetches
     // below and what the script gets read the same: a structured result's
     // view's (scriptViewClaims), nested fields included, or the model's text's
-    // (resultClaimsOf). A view whose claims walk stops fails closed here,
-    // before any fetch or treatment, so the treatment never runs without
-    // them (Ada-1017, room-203 #200250); for the text, where a value stops
-    // the walk, the records decide, as for the model's own text.
+    // (resultClaimsOf). Where the walk stops, the script's answer is a
+    // failure naming the tool, before any fetch or treatment, so neither runs
+    // without them (Ada-1017, room-203 #200250, #200374): on both of a
+    // script's routes, `is_error` says nothing could be shown, where the
+    // model's lane shows UNCHECKED_RESULT_TEXT.
     let claims: ResultClaims | undefined;
     if ((!isError || structured) && Array.isArray(result.data) && fromModule) {
-      if (showsBlocks) {
-        try {
-          claims = scriptViewClaims(result.data, false);
-        } catch (err) {
-          return failed(err);
-        }
-      } else {
-        claims = resultClaimsOf(result.data, result.dataIsContent) ?? undefined;
+      try {
+        claims = showsBlocks ? scriptViewClaims(result.data, false) : resultClaimsOrThrow(result.data, result.dataIsContent);
+      } catch (err) {
+        return failed(err);
       }
       const fetcher = this.getReferenceFetcher();
       for (const block of result.data) {
@@ -22627,13 +22625,18 @@ export class AgentFramework {
       }
     } else {
       // As in history, a reference is its stub at any depth and inline data
-      // claiming a uri or a disposition is withheld (RFC-005).
+      // claiming a uri or a disposition is withheld (RFC-005), by the
+      // result's claims, read here where no fetch read them, a stop in their
+      // walk failing as a stopped render does.
       try {
         text = isError
           ? result.error ?? 'tool call failed'
           : result.data === undefined || result.data === null
             ? nonErrorResultText(result)
-            : toolResultDataToHistoryString(result.data, undefined, { dataIsContent: Boolean(result.dataIsContent), claims });
+            : toolResultDataToHistoryString(result.data, undefined, {
+              dataIsContent: Boolean(result.dataIsContent),
+              claims: claims ?? resultClaimsOrThrow(result.data, result.dataIsContent),
+            });
       } catch (err) {
         return failed(err);
       }

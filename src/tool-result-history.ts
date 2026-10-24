@@ -136,6 +136,13 @@ export function resultClaimsOf(data: unknown, dataIsContent?: boolean): ResultCl
   return isContentArray(data, dataIsContent) ? contentClaims(data) : claimsInHistory(data);
 }
 
+/** resultClaimsOf, throwing what stops the walk, for a caller that answers
+ *  a stop itself: a script's text route, which fails then, as its view does
+ *  (Ada-1017, room-203 #200374). */
+export function resultClaimsOrThrow(data: unknown, dataIsContent?: boolean): ResultClaims {
+  return isContentArray(data, dataIsContent) ? contentClaims(data) : claimsInHistoryOrThrow(data);
+}
+
 /** One element of a content array, as toolResultBlocks gives it. Only an
  *  image with data and a media type is shown as itself, as the push lane's
  *  converter shows one, and only text and images can be: this host's tool
@@ -525,7 +532,11 @@ export function rfc005TextOf(value: unknown): string | null {
  * ran, and its result isn't shown, rather than shown with no claims, where a
  * link could show a uri a reference in the result withholds. The round
  * completes, as a withheld result's kept fields keep nothing then
- * (keptWhenWithheld). Ada-1017, room-203 #200344.
+ * (keptWhenWithheld). The claims walk meets data no JSON can hold, such as
+ * a cycle or a BigInt, or data too deep to write, before the render does,
+ * so such data shows this too, where the render threw (Desmond-2579's run).
+ * A script never gets it: both of its routes read the claims first and
+ * fail naming the tool (Ada-1017, room-203 #200344, #200374).
  */
 export const UNCHECKED_RESULT_TEXT =
   "[Result not shown: the tool ran, but its result couldn't be read through to check it for references, so this host withheld it.]";
