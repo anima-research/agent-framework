@@ -446,7 +446,8 @@ export class ModuleRegistry {
    * order they finish in. Fail-open: timed-out or erroring modules are skipped
    * (with a stderr line), whether the call throws, rejects, or answers with
    * something that isn't an array of objects, or with a `system` entry whose
-   * content isn't an array of blocks (noteBlocksNotShown reads it), and one that
+   * content isn't an array of objects, every block of which the agent's
+   * buildSystemPrompt reads, and one that
    * answers after its timeout adds nothing. An entry's other fields are the
    * module's to get right, as before. Each module's budget starts once its
    * call returns, after its own synchronous work and every earlier module's,
@@ -496,9 +497,18 @@ export class ModuleRegistry {
         call.then(r => {
           if (timedOut) return;
           // Checked before it's kept, so an answer that isn't an array of
-          // objects skips the module.
-          if (!Array.isArray(r) || r.some((entry) => entry === null || typeof entry !== 'object')) {
+          // objects skips the module, as does a system entry whose content
+          // isn't an array of objects: buildSystemPrompt reads every block
+          // of it, and one it can't read would fail the turn. Each array is
+          // read through Array.from, which reads a hole as `undefined`, as
+          // context-manager's compile does when it spreads the content.
+          if (!Array.isArray(r) || Array.from(r).some((entry) => entry === null || typeof entry !== 'object')) {
             throw new TypeError(`gatherContext answered with ${Array.isArray(r) ? 'an array holding an entry that is not an object' : r === null ? 'null' : typeof r}, not an array of objects`);
+          }
+          const unreadable = r.find((entry) => entry.position === 'system'
+            && !(Array.isArray(entry.content) && Array.from(entry.content).every((block) => block !== null && typeof block === 'object')));
+          if (unreadable) {
+            throw new TypeError(`gatherContext answered with a system injection in namespace ${logValue(unreadable.namespace)} whose content isn't an array of objects`);
           }
           this.noteBlocksNotShown(module.name, r);
           results[slot] = [...r];

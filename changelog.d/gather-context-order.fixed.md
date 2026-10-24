@@ -8,5 +8,6 @@
   skipped too; before, the throw failed the whole gather, and the turn got
   no module's injections. So is one whose answer isn't an array of objects
   (a string, or an array holding `null`), or holds a `system` entry whose
-  content isn't an array of blocks; before, its entries were kept and
-  reached the turn's start.
+  content isn't an array of objects (such as `[image, null]`, or an array
+  with a hole); before, its entries were kept and reached the turn's
+  start, where such content then failed the turn.

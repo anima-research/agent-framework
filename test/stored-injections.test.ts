@@ -1130,6 +1130,15 @@ test("a module whose gatherContext throws, answers with something that isn't an 
     ['null-entry-source', async () => [one, null]],
     ['string-entry-source', async () => [one, 'x']],
     ['contentless-system-source', async () => [one, { namespace: 'sys', position: 'system' }]],
+    ['null-block-system-source', async () => [one, { namespace: 'sys', position: 'system', content: [{ type: 'image', source: { type: 'base64', media_type: 'image/png', data: 'iVBORw0KGgo=' } }, null] }]],
+    // A hole, which `every` and `some` pass over, and a spread reads as undefined.
+    ['hole-block-system-source', async () => {
+      const content: unknown[] = [{ type: 'image', source: { type: 'base64', media_type: 'image/png', data: 'iVBORw0KGgo=' } }];
+      content.length = 3;
+      content[2] = text('after the hole');
+      return [one, { namespace: 'sys', position: 'system', content }];
+    }],
+    ['hole-entry-source', async () => { const answer: unknown[] = [one]; answer.length = 2; return answer; }],
   ];
   const modules: Module[] = answers.map(([name, gather]) => ({
     name, async start() {}, async stop() {}, getTools: () => [],
@@ -1149,6 +1158,7 @@ test("a module whose gatherContext throws, answers with something that isn't an 
   }
   assert.deepEqual(gathered.map((i) => i.namespace), ['kept']);
   for (const [name] of answers) assert.ok(errors.some((e) => e.includes(name)), `${name} is logged: ${errors.join('\n')}`);
+  assert.ok(errors.some((e) => e.includes('hole-entry-source') && e.includes('not an array of objects')), 'a hole in the answer is refused by the check, not by a later read');
 });
 
 test("a window that can't be read when a start sets its point is stored into, with nothing recorded to skip it, and the start goes on", async () => {
