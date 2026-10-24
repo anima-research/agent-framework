@@ -135,6 +135,19 @@ class ChannelLifecycleError extends Error {
   }
 }
 
+/** Whether a lifecycle failure, or one it wraps (an overtaken open's
+ *  `cause`), leaves in doubt which channel the server reaches by this id:
+ *  convergence that never established the channel's target, or an answer
+ *  for another channel. Words don't go into such a channel on the strength
+ *  of a close the agent decided meanwhile (refusalGivesWay), since the
+ *  server may not resolve their publish to it either. */
+function targetInDoubt(err: unknown): boolean {
+  for (let e: unknown = err; e instanceof Error; e = e.cause) {
+    if (e instanceof ChannelLifecycleError && (e.kind === 'converge' || e.kind === 'substituted')) return true;
+  }
+  return false;
+}
+
 /** Why a channel is selected for opening after a failed open by speech or a
  *  reply: its put-back couldn't be recorded, or the server's latest
  *  announcement or the subscription policy lifted the default it restored. */
@@ -1280,7 +1293,7 @@ export class ChannelRegistry {
   /** Whether a decided close holds words back from a channel: only where
    *  the host directs the server's lifecycle. Without that grant the host
    *  can't close the channel, and words go into a transport that is open,
-   *  as the open step's engagesDecidedClosed reads it too. */
+   *  as the open step reads it too (speechOpens). */
   private closeStands(entry: ChannelEntry): boolean {
     return this.getDesiredState(entry.serverId, entry.descriptor.id) === 'closed' &&
       this.directsLifecycle(entry.serverId);
@@ -2969,8 +2982,8 @@ export class ChannelRegistry {
     // close, records itself over any closed record from another source,
     // another deliberate close included, so a decline after a close is the
     // decision on record. Speech opens no channel whose close was decided
-    // (speechOpens). A machine's close never replaces a record, so what
-    // nobody decided stays liftable.
+    // (speechOpens). A machine's close never replaces a closed record, so
+    // what nobody decided stays liftable.
     const agentOverOther = AGENT_DECISION_SOURCES.has(source) && !AGENT_DECISION_SOURCES.has(current?.source ?? '');
     const latestClose = desired === 'closed' && isCloseDecision(source) && current?.source !== source;
     if (current?.state === desired && !agentOverOther && !latestClose) {
@@ -3929,6 +3942,13 @@ export class ChannelRegistry {
    * For channel_close, which refuses a tuned-out channel too, it adds that
    * the close comes after that.
    */
+  /** How this channel's tune-out ends, as tune_out's own refusals say it
+   *  (tuneOutEndText), or undefined for a channel no longer registered. */
+  tuneOutEnd(ref: ChannelRef): string | undefined {
+    const entry = this.entryAt(ref);
+    return entry ? this.tuneOutEndText(entry) : undefined;
+  }
+
   private tuneOutEndText(entry: ChannelEntry, tool?: string): string {
     const close = tool === 'channel_close';
     return this.nameFor(entry) !== undefined
@@ -4707,31 +4727,53 @@ export class ChannelRegistry {
    *  the agent made itself (channel_close, channel_decline) or a module made
    *  (MODULE_CLOSE_SOURCE), which stands against the agent's own speech
    *  whatever the channel's transport is; or its server is up and this host
-   *  doesn't direct its lifecycle (channels.lifecycle), so nothing opens
+   *  doesn't direct its lifecycle (lifecycleWithheld), so nothing opens
    *  there. A wait or an open that failed gives way to such a registration,
-   *  as when the agent closed the channel while the words waited: there's
-   *  nothing for the words to wait for. */
+   *  as when the agent closed the channel while the words waited, since
+   *  there's nothing for the words to wait for (refusalGivesWay). */
   private speechLeavesAsItStands(entry: ChannelEntry | undefined): entry is ChannelEntry {
     if (!entry) return false;
-    return this.closeDecided(refOf(entry)) ||
-      (!this.directsLifecycle(entry.serverId) && this.serverReach(entry.serverId) === 'up');
+    return this.closeDecided(refOf(entry)) || this.lifecycleWithheld(entry.serverId);
   }
 
-  /** Whether this channel is closed because the agent or a module decided
-   *  to keep it closed (the agent's own close or decline, or a module's
-   *  close), which speech never opens (speechOpens). False for a channel
-   *  open at the transport, whose traffic still flows. */
-  closedByDecision(ref: ChannelRef): boolean {
+  /** Whether words a wait or an open refused go into the channel after all:
+   *  its registration `now` is one speech leaves as it stands
+   *  (speechLeavesAsItStands), such as one the agent closed or declined
+   *  while the words waited, and the failure doesn't leave in doubt which
+   *  channel the server reaches by its id (targetInDoubt). A registration
+   *  that went still fails them. */
+  private refusalGivesWay(err: unknown, now: ChannelEntry | undefined): now is ChannelEntry {
+    return this.speechLeavesAsItStands(now) && !targetInDoubt(err);
+  }
+
+  /** Whether this host doesn't direct the server's channel lifecycle: the
+   *  server is up, and its grant lacks channels.lifecycle, so nothing opens
+   *  or closes its channels. A server that isn't up has an empty grant from
+   *  a drop until its next exchange, which says nothing yet of what it
+   *  grants, so it isn't counted. */
+  lifecycleWithheld(serverId: string): boolean {
+    return !this.directsLifecycle(serverId) && this.serverReach(serverId) === 'up';
+  }
+
+  /** Whether the agent's words go into this channel and leave it closed: it
+   *  isn't open at the transport, and speech leaves it as it stands
+   *  (speechLeavesAsItStands: the agent's or a module's close, or a server
+   *  that's up without channels.lifecycle). False for a channel open at the
+   *  transport, whose traffic still flows, and for one speech opens. */
+  speechLeavesClosed(ref: ChannelRef): boolean {
     const entry = this.entryAt(ref);
-    return !!entry && !entry.open && this.closeDecided(ref);
+    return !!entry && !entry.open && this.speechLeavesAsItStands(entry);
   }
 
   /**
-   * How the agent kept this channel closed itself, if it did: 'closed' for
-   * its channel_close, 'declined' for its channel_decline. Its speech there
-   * leaves such a channel as it stands (speechOpens).
+   * How the agent kept this registered channel closed itself, if it did:
+   * 'closed' for its channel_close, 'declined' for its channel_decline. Its
+   * speech there leaves such a channel as it stands (speechOpens). A
+   * channel no longer registered has nothing to keep closed, whatever its
+   * record says, so it answers undefined.
    */
   closedByAgent(ref: ChannelRef): 'closed' | 'declined' | undefined {
+    if (!this.entryAt(ref)) return undefined;
     const current = this.desiredStates.get(this.lifecycleKey(ref.serverId, ref.channelId));
     if (current?.state !== 'closed') return undefined;
     if (current.source === 'agent-tool') return 'closed';
@@ -4835,9 +4877,11 @@ export class ChannelRegistry {
     } catch (err) {
       // A channel the send now leaves as it stands, such as one the agent
       // closed or declined while queued work or the open was out, answers as
-      // one it found so: nothing failed that the send would have done.
+      // one it found so: nothing failed that the send would have done. A
+      // failure that leaves its target in doubt is still reported
+      // (refusalGivesWay).
       const now = this.entryAt({ serverId: entry.serverId, channelId: entry.descriptor.id });
-      if (this.speechLeavesAsItStands(now)) return this.sendLeavesChannel(now);
+      if (this.refusalGivesWay(err, now)) return this.sendLeavesChannel(now);
       // Where a decision made during the open's round-trip replaced it, such
       // as the agent's channel_open, the channel is as that decision left it,
       // and the agent isn't told the open failed.
@@ -4858,7 +4902,8 @@ export class ChannelRegistry {
     }
   }
 
-  /** What a send answers for a channel it leaves as it is (speechOpens):
+  /** What a send answers for a channel it leaves as it is
+   *  (speechLeavesAsItStands):
    *  `already-open` where its transport is open with no close standing,
    *  `stays-closed` otherwise. */
   private sendLeavesChannel(entry: ChannelEntry): { status: 'already-open' | 'stays-closed'; channelId: string; serverId: string; label?: string } {
@@ -5624,10 +5669,10 @@ export class ChannelRegistry {
    * it's opened first (`openSource` names why), once its server and that
    * server's channels.publish grant are known to take the send, so a send
    * refused before the open opens nothing; and a failed open sends nothing.
-   * A channel speech leaves as it stands, one the agent closed or declined
-   * itself or a module closed, or a closed one on a server whose lifecycle
-   * this host doesn't direct, takes the words as it is, once its queued
-   * lifecycle work has settled.
+   * A channel speech leaves as it stands (speechLeavesAsItStands), one the
+   * agent closed or declined itself or a module closed, or a closed one on
+   * a server that's up but whose lifecycle this host doesn't direct, takes
+   * the words as it is, once its queued lifecycle work has settled.
    *
    * A channel its server declared inbound-only (isInboundOnly) takes nothing
    * the host would post, whichever path the words took, a drafts resend
@@ -5706,12 +5751,13 @@ export class ChannelRegistry {
     // Words go into a channel that's open with no close standing, or into
     // one speech leaves as it stands (speechLeavesAsItStands): a channel the
     // agent closed or declined itself, or a module closed, and a closed
-    // channel on a server whose lifecycle this host doesn't direct, where
-    // nothing opens. Every other channel speech opens first (speechOpens),
-    // and if it doesn't open, nothing goes out. A wait or an open that fails
-    // is read against the channel as it is then, so a close the agent
-    // decides while the words wait lets them go into the channel as that
-    // close leaves it.
+    // channel on a server that's up but whose lifecycle this host doesn't
+    // direct, where nothing opens. Every other channel speech opens first
+    // (speechOpens), and if it doesn't open, nothing goes out. A wait or an
+    // open that fails is read against the channel as it is then, so a close
+    // the agent decides while the words wait lets them go into the channel
+    // as that close leaves it, unless the failure leaves in doubt which
+    // channel the server reaches by its id (refusalGivesWay).
 
     // Lifecycle work already queued for the channel settles first: words go
     // out only into the channel it leaves, and fail visibly if it leaves
@@ -5721,7 +5767,7 @@ export class ChannelRegistry {
         entry = await this.waitForOpenChannel(entry);
       } catch (err) {
         const now = this.entryAt(refOf(entry));
-        if (!this.speechLeavesAsItStands(now)) return prevented(err);
+        if (!this.refusalGivesWay(err, now)) return prevented(err);
         entry = now;
       }
     }
@@ -5765,7 +5811,7 @@ export class ChannelRegistry {
         }
       } catch (err) {
         const now = this.entryAt(refOf(entry));
-        if (!this.speechLeavesAsItStands(now)) return { status: 'failed', destination, reason: openFailedReason(err), at: at() };
+        if (!this.refusalGivesWay(err, now)) return { status: 'failed', destination, reason: openFailedReason(err), at: at() };
         entry = now;
       }
     }
@@ -5784,15 +5830,15 @@ export class ChannelRegistry {
     // again on the registration that stands. waitForOpenChannel returns
     // only a registration it found open and whose close doesn't stand, or
     // throws, so the loop ends unless the channel keeps changing. A channel
-    // speech leaves as it stands (speechLeavesAsItStands) needs none of that, and
-    // its words go into it as it is.
+    // speech leaves as it stands (speechLeavesAsItStands) needs none of
+    // that, and its words go into it as it is.
     const key = destinationKey({ serverId: entry.serverId, channelId: entry.descriptor.id });
     let current = this.channels.get(key);
     while (current && !isInboundOnly(current) && (!current.open || this.closeStands(current)) && !this.speechLeavesAsItStands(current)) {
       try {
         entry = await this.waitForOpenChannel(current);
       } catch (err) {
-        if (!this.speechLeavesAsItStands(this.channels.get(key))) return prevented(err);
+        if (!this.refusalGivesWay(err, this.channels.get(key))) return prevented(err);
       }
       current = this.channels.get(key);
     }

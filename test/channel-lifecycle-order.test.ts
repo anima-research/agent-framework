@@ -445,6 +445,31 @@ test('a channel retargeted while its opening is announced takes the words only o
   await announced;
 });
 
+test("a channel retargeted while its opening is announced takes the words as it stands once the agent closes it while they wait", async () => {
+  // The check after the open waits for the new target's open. The agent's
+  // close decided meanwhile stands against nothing the words need, so they
+  // go into the channel as that close leaves it, opening nothing more.
+  let announced: Promise<unknown> | undefined;
+  let f!: ReturnType<typeof fixture>;
+  f = fixture(() => {
+    f.held.add('x');
+    announced = f.registry.handleChanged('test', { updated: [descriptor('x', false, 'retargeted')] });
+  });
+  await f.registry.handleChanged('test', { added: [descriptor('x')] });
+  const speech = f.registry.routeSpeech('resident', 'hello', { serverId: 'test', channelId: 'x' });
+  for (let i = 0; i < 5; i++) await tick();
+  assert.equal(f.pending.length, 1, "the new target's open is in flight");
+  assert.equal(f.publishedWhileOpen.length, 0);
+  const close = f.tool('close');
+  await f.drain(speech, close, announced!);
+  assert.equal((await speech)?.delivered, true);
+  assert.equal(f.publishedWhileOpen.length, 1, 'the words were published once');
+  assert.deepEqual(f.routeFailures, []);
+  assert.equal((await close).success, true);
+  assert.equal(f.registry.getDesiredState('test', 'x'), 'closed');
+  assert.equal(f.isOpen('x'), false);
+});
+
 test('a channel registered again while the words wait for a new registration takes them only once the newest is open', async () => {
   // The server registers x again while the words wait for the first new
   // registration's open. The words wait through the newer one's open too,
@@ -674,6 +699,64 @@ test("an open answered for another channel applies nothing of its answer to the 
   assert.ok(f.traces.some((e) => e.type === 'mcpl:channel-open-substituted' && e.channelId === 'x'),
     'the open reached the server and was answered for another channel');
   assert.equal(f.registry.inboundOnlyServer({ serverId: 'test', channelId: 'x' }), undefined, "the other channel's declaration isn't applied");
+});
+
+for (const via of ['speech', 'a send'] as const) {
+  test(`${via} whose open was answered for another channel isn't let through by the agent's close made while that open was out`, async () => {
+    // An answer for another channel leaves in doubt which channel the server
+    // reaches by this id, and a publish by that id may not reach it either.
+    // A close the agent decides while the open is out lets words go into the
+    // channel as it stands only where the failure says nothing of the target.
+    const f = fixture();
+    await f.registry.handleChanged('test', { added: [descriptor('x'), descriptor('y')] });
+    f.answeredFor.set('x', 'y');
+    f.held.add('x');
+    const outcome = via === 'speech'
+      ? f.registry.routeSpeech('resident', 'hello', { serverId: 'test', channelId: 'x' })
+      : f.registry.openIfClosedForSend('x', 'test');
+    await tick();
+    assert.equal(f.pending.length, 1, 'the open is in flight');
+    const close = f.tool('close');
+    await f.drain(outcome, close);
+    assert.equal((await close).success, true);
+    assert.equal(f.registry.getDesiredState('test', 'x'), 'closed', "the agent's close stands");
+    if (via === 'speech') {
+      assert.equal(await outcome, null);
+      assert.deepEqual(f.publishedWhileOpen, [], 'nothing was published');
+      assert.match(f.routeFailures[0]?.reason ?? '', /answered for a different channel/);
+    } else {
+      assert.equal(((await outcome) as { status: string }).status, 'open-failed', "not answered as a channel the send left closed");
+    }
+  });
+}
+
+test("words for a channel the agent closed aren't let through where convergence never established the channel's target", async () => {
+  // The words wait on the agent's close, retargeted before each receipt until
+  // its tries run out. The close stands, but the server's channel for this id
+  // was never established, so the words aren't published into it.
+  const f = fixture();
+  await f.registry.handleChanged('test', { added: [descriptor('x')] });
+  assert.equal((await f.tool('open')).success, true);
+  f.held.add('x');
+  const close = f.tool('close');
+  await tick();
+  assert.equal(f.pending.length, 1, 'the close is in flight');
+  const speech = f.registry.routeSpeech('resident', 'hello', { serverId: 'test', channelId: 'x' });
+  try {
+    for (let i = 0; i < 12 && f.pending.length > 0; i++) {
+      await f.registry.handleChanged('test', { updated: [descriptor('x', false, 'churn-' + i)] });
+      f.pending.shift()!.finish();
+      await tick();
+    }
+  } finally {
+    f.held.delete('x');
+    while (f.pending.length > 0) f.pending.shift()!.finish();
+  }
+  assert.equal(await speech, null);
+  assert.deepEqual(f.publishedWhileOpen, [], 'nothing was published');
+  assert.match(f.routeFailures[0]?.reason ?? '', /kept changing, and 5 tries didn't settle it/);
+  assert.equal((await close).success, false);
+  assert.equal(f.registry.getDesiredState('test', 'x'), 'closed', "the agent's close stands");
 });
 
 test("an open's answer for a target the channel has since left applies nothing; the new target's answer decides", async () => {

@@ -2145,7 +2145,7 @@ describe('explicit prose routing', () => {
   }
 
   const CAFE_NOTE = "[closed channel] #cafe (discord:g:cafe) stays closed: you closed it, and your words there don't open it. " +
-    'Messages there that address you, such as an @-mention, still reach you; ' +
+    'Messages there that address you, such as an @-mention, still reach you. ' +
     'channel_open with channelId "discord:g:cafe" and serverId "discord" opens it. ' +
     'To stop this note, set closed_channel_note to false with agent_settings.';
 
@@ -2168,6 +2168,21 @@ describe('explicit prose routing', () => {
     const texts = windowTexts(framework);
     assert.deepEqual(texts.filter((t) => t.startsWith('[closed channel]')), [CAFE_NOTE]);
     assert.ok(!texts.some((t) => t.startsWith('[delivered]')), 'explicit mode still has no delivery line');
+    await framework.stop();
+  });
+
+  it('speech into a closed channel twice in one turn gets its note once', async () => {
+    membrane.pushResponse(createMockResponse([
+      { type: 'text', text: '>>#cafe hello there\n>>#alpha and everyone\n>>#cafe and again' },
+    ] as ContentBlock[]));
+    const framework = await createFramework();
+    const routed = closedNoteRegistry(framework);
+
+    trigger(framework);
+    await framework.runUntilIdle();
+
+    assert.deepEqual(routed.map((r) => r.locus), ['discord:g:cafe', 'chan-alpha', 'discord:g:cafe']);
+    assert.deepEqual(windowTexts(framework).filter((t) => t.startsWith('[closed channel]')), [CAFE_NOTE]);
     await framework.stop();
   });
 

@@ -43,7 +43,7 @@ const agentStub = (more: Record<string, unknown> = {}) => ({
 
 /** The note a send's answer carries when it lands in #upkeep, which the agent closed. */
 const UPKEEP_NOTE = `[closed channel] #upkeep (${channelId}) stays closed: you closed it, and your words there don't open it. ` +
-  'Messages there that address you, such as an @-mention, still reach you; ' +
+  'Messages there that address you, such as an @-mention, still reach you. ' +
   `channel_open with channelId "${channelId}" and serverId "discord" opens it. ` +
   'To stop this note, set closed_channel_note to false with agent_settings.';
 
@@ -65,6 +65,8 @@ async function harness(opts: { sharedIdFirst?: boolean } = {}) {
   let refuseSends = false;
   // While set, the server refuses channels/close.
   let refuseCloses = false;
+  // While set, the send's answer is this content instead of discord-mcpl's receipt.
+  let answer: unknown[] | null = null;
   const published: Array<{ channelId: string; text: string }> = [];
   const server = {
     id: 'discord',
@@ -79,6 +81,7 @@ async function harness(opts: { sharedIdFirst?: boolean } = {}) {
       if (refuseSends) {
         return { content: [{ type: 'text', text: `Missing Access in channel ${sentTo}` }], isError: true };
       }
+      if (answer) return { content: answer };
       // discord-mcpl's send tools answer with the posted message and the raw channel id.
       return { content: [{ type: 'text', text: JSON.stringify({ messageId: 'm9', channelId: sentTo }) }] };
     },
@@ -158,9 +161,9 @@ async function harness(opts: { sharedIdFirst?: boolean } = {}) {
    *  with its result, and the turn's engaged channels once the open the send
    *  started has settled, and what follows it. A script's call (`script`) is
    *  one the framework is waiting on for a script. */
-  async function reply(tool = 'reply_message', callId = 'call-reply', script = false): Promise<{ success: boolean; engaged: string[]; data: string; error: string }> {
+  async function reply(tool = 'reply_message', callId = 'call-reply', script = false): Promise<{ success: boolean; engaged: string[]; data: string; raw: unknown; error: string }> {
     if (script) framework.scriptToolWaiters = new Map([[callId, () => {}]]);
-    const out = await new Promise<{ success: boolean; data: string; error: string }>((resolve, reject) => {
+    const out = await new Promise<{ success: boolean; data: string; raw: unknown; error: string }>((resolve, reject) => {
       const timeout = setTimeout(() => reject(new Error('timed out waiting for the tool result')), 1000);
       framework.pushEvent = (event: { type: string; callId?: string; result: { success: boolean; data?: unknown; error?: string } }) => {
         if (event.type === 'tool-result' && event.callId === callId) {
@@ -168,6 +171,7 @@ async function harness(opts: { sharedIdFirst?: boolean } = {}) {
           resolve({
             success: event.result.success,
             data: String(event.result.data ?? ''),
+            raw: event.result.data,
             error: String(event.result.error ?? ''),
           });
         }
@@ -200,7 +204,13 @@ async function harness(opts: { sharedIdFirst?: boolean } = {}) {
     setSentTo: (raw: string) => { sentTo = raw; },
     setRefuseSends: (v: boolean) => { refuseSends = v; },
     setRefuseCloses: (v: boolean) => { refuseCloses = v; },
+    setAnswer: (content: unknown[] | null) => { answer = content; },
     setGrant: (grant: CapabilityGrant) => { server.grant = grant; },
+    /** The server's connection, as a drop leaves it: not connected, the host
+     *  reconnecting to it, its grant empty until its next exchange. */
+    dropConnection: () => {
+      Object.assign(server, { isConnected: false, willReconnect: true, grant: new CapabilityGrant(new Set(), []) });
+    },
     state: () => frameworkState as { closedChannelNotes?: Record<string, boolean> } | null,
   };
 }
@@ -266,6 +276,15 @@ test("a note that can't be worked out leaves the delivered words as they were, a
     assert.deepEqual(logged.splice(0), ['[closed-channel-note] for sol failed: undefined']);
     registry.closedByAgent = closedByAgent;
 
+    // The channel the send went to can't be looked up.
+    const resolveSendTarget = registry.resolveSendTarget;
+    registry.resolveSendTarget = () => { throw new Error('target lookup failed'); };
+    sent = await reply();
+    assert.equal(sent.success, true);
+    assert.equal(sent.data, answer);
+    assert.deepEqual(logged.splice(0), ['[closed-channel-note] for sol failed: target lookup failed']);
+    registry.resolveSendTarget = resolveSendTarget;
+
     // Routed speech's delivery line stands without the note.
     const lines: string[] = [];
     const agent = {
@@ -295,6 +314,96 @@ test("on a server whose grant lacks channels.lifecycle, the note doesn't offer c
   assert.ok(data.endsWith(`\n[closed channel] #upkeep (${channelId}) stays closed: you closed it, and your words there don't open it. ` +
     'Messages there that address you, such as an @-mention, still reach you. ' +
     'To stop this note, set closed_channel_note to false with agent_settings.'), data);
+});
+
+test("the note offers only what its reader can use: channel_open and agent_settings where its allowedTools hold them, and what still reaches it where those messages land in its window", async () => {
+  const { registry, framework, reply } = await harness();
+  assert.equal((await registry.handleChannelToolCall('channel_open', { channelId }, origin)).success, true);
+  assert.equal((await registry.handleChannelToolCall('channel_close', { channelId }, origin)).success, true);
+  const head = `[closed channel] #upkeep (${channelId}) stays closed: you closed it, and your words there don't open it.`;
+  const reach = ' Messages there that address you, such as an @-mention, still reach you.';
+  const open = ` channel_open with channelId "${channelId}" and serverId "discord" opens it.`;
+  const off = ' To stop this note, set closed_channel_note to false with agent_settings.';
+  const noteOf = async () => {
+    const { success, data } = await reply();
+    assert.equal(success, true);
+    return data.slice(data.indexOf('[closed channel]'));
+  };
+  assert.equal(await noteOf(), head + reach + open + off);
+  // An agent whose allowedTools leave a tool out isn't offered it.
+  framework.agents.set('sol', agentStub({ canUseTool: (tool: string) => tool !== 'channel_open' }));
+  assert.equal(await noteOf(), head + reach + off);
+  framework.agents.set('sol', agentStub({ canUseTool: (tool: string) => tool !== 'agent_settings' }));
+  assert.equal(await noteOf(), head + reach + open);
+  // An agent whose window isn't where those messages land, as an ephemeral
+  // run's is its own, isn't told they reach it: here the delivery agent is
+  // another, and sol doesn't read the residents' shared slot.
+  framework.agents = new Map([['primary', agentStub()], ['sol', agentStub()]]);
+  framework.sharedSlotAgents = new Set();
+  assert.equal(await noteOf(), head + open + off);
+});
+
+test("a note written while its server reconnects still offers channel_open, which opens the channel once the server is back", async () => {
+  const { registry, framework, dropConnection } = await harness();
+  assert.equal((await registry.handleChannelToolCall('channel_open', { channelId }, origin)).success, true);
+  assert.equal((await registry.handleChannelToolCall('channel_close', { channelId }, origin)).success, true);
+  // The turn's speech went out before the drop; its delivery line is written after it.
+  dropConnection();
+  assert.equal(registry.directsLifecycle('discord'), false, 'the grant is empty until the next exchange');
+  const lines: string[] = [];
+  const agent = {
+    name: 'sol',
+    proseRouting: 'locus',
+    getContextManager: () => ({
+      addMessage: (_role: string, content: Array<{ text: string }>) => { lines.push(content[0]!.text); return 'm'; },
+    }),
+  };
+  framework.appendProseDeliveryReceipt(agent, receiptRouting(channelId));
+  assert.equal(lines.length, 1);
+  assert.ok(lines[0]!.includes(` channel_open with channelId "${channelId}" and serverId "discord" opens it.`), lines[0]);
+});
+
+test("a send's note goes after the server's own answer, whatever its shape: one more block after an image's, or the note alone where the answer has no words", async () => {
+  const { registry, reply, setAnswer } = await harness();
+  assert.equal((await registry.handleChannelToolCall('channel_open', { channelId }, origin)).success, true);
+  assert.equal((await registry.handleChannelToolCall('channel_close', { channelId }, origin)).success, true);
+  const png = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII=';
+  setAnswer([{ type: 'text', text: 'posted' }, { type: 'image', data: png, mimeType: 'image/png' }]);
+  const withImage = await reply();
+  assert.equal(withImage.success, true);
+  assert.deepEqual(withImage.raw, [
+    { type: 'text', text: 'posted' },
+    { type: 'image', data: png, mimeType: 'image/png' },
+    { type: 'text', text: UPKEEP_NOTE },
+  ]);
+  setAnswer([]);
+  const empty = await reply();
+  assert.equal(empty.success, true);
+  assert.equal(empty.raw, UPKEEP_NOTE);
+});
+
+test("a closed-channel invitation in a tuned-out channel doesn't offer the decline as a way to reply without opening it, since channel_decline refuses a tuned-out channel", async () => {
+  const { registry, framework } = await harness();
+  await registry.handleChanged('discord', {
+    added: [{ id: 'discord:g1:777888', type: 'discord', label: '#lobby', direction: 'bidirectional',
+      address: { guildId: 'g1', channelId: '777888' } }],
+  } as never);
+  const invite = (id: string, label: string): string => framework.buildClosedChannelInvitation({
+    serverId: 'discord', channelId: id, channelLabel: label, messageId: 'm7', authorName: 'Ann', tags: ['chat:addressed'],
+  })?.block.text ?? '';
+  // Tuned out while its transport is closed, as while tune_out's open is out, or after it failed.
+  registry.enterTuneOut('discord', channelId, {
+    epochId: 'e1', cadenceSeconds: 600, backlogCap: 50, maxWakes: 3, startedAtSequence: 0,
+  }, 'agent-tool');
+  assert.equal(registry.isChannelOpen(ref(channelId)), false);
+  const tunedOut = invite(channelId, '#upkeep');
+  assert.match(tunedOut, /it will be delivered there, which opens the channel\.\n/);
+  assert.doesNotMatch(tunedOut, /decline it first/);
+  assert.equal((await registry.handleChannelToolCall('channel_decline', { channelId, messageId: 'm7' }, origin)).success, false,
+    'channel_decline refuses it');
+  // A closed channel nobody decided about is offered the decline.
+  assert.match(invite('discord:g1:777888', '#lobby'),
+    /which opens the channel\. To reply without opening it, decline it first \(option 3\): a channel you've declined stays closed when you speak there\.\n/);
 });
 
 test("a channel the agent closed whose server refused the close is still open, so a send there carries no note", async () => {
@@ -491,8 +600,8 @@ test('a send into a tuned-out channel leaves the tune-out in place, and its answ
   const opensBefore = opens.length;
   const tunedOutNote = `[tuned out] #upkeep (${channelId}) stays tuned out: your words there don't end the tune-out, ` +
     'so its traffic still goes to your subconscious until the tune-out ends. ' +
-    `tune_out with channelId "${channelId}" and mode "cancel" resumes normal attention there. ` +
-    'To stop this note, set closed_channel_note to false with agent_settings.';
+    `Call tune_out with channelId "${channelId}" and mode "cancel" for it to resume normal attention; cancelling ` +
+    'delivers the diverted backlog. To stop this note, set closed_channel_note to false with agent_settings.';
 
   for (const tool of ['reply_message', 'send_dm']) {
     const { success, data } = await reply(tool);
@@ -507,9 +616,24 @@ test('a send into a tuned-out channel leaves the tune-out in place, and its answ
   framework.closedChannelNoteSettingsExtension().update('sol', { closed_channel_note: false });
   assert.ok(!(await reply()).data.includes('[tuned out]'));
   framework.closedChannelNoteSettingsExtension().reset('sol');
+  // An agent whose allowedTools leave tune_out out isn't told how to call it.
+  framework.agents.set('sol', agentStub({ canUseTool: (tool: string) => tool !== 'tune_out' }));
+  assert.ok((await reply()).data.endsWith('until the tune-out ends. To stop this note, set closed_channel_note to false with agent_settings.'));
+  framework.agents.set('sol', agentStub());
   // A conversation agent gets none.
   framework.conversationAgentHomes.set('sol', channelId);
   assert.ok(!(await reply()).data.includes('[tuned out]'));
+});
+
+test("a tuned-out channel whose id another server's channel shares is named for tune_out by its server-qualified name, which picks it alone", async () => {
+  const { registry, reply } = await harness({ sharedIdFirst: true });
+  assert.equal((await registry.handleChannelToolCall('channel_open', { channelId, serverId: 'discord' }, origin)).success, true);
+  registry.enterTuneOut('discord', channelId, {
+    epochId: 'e1', cadenceSeconds: 600, backlogCap: 50, maxWakes: 3, startedAtSequence: 0,
+  }, 'agent-tool');
+  const { success, data } = await reply();
+  assert.equal(success, true);
+  assert.ok(data.includes(`Call tune_out with channelId "discord:${channelId}" and mode "cancel"`), data);
 });
 
 test("a code_execution script's send into a channel the agent closed or tuned out keeps the server's receipt, and the agent is told in its window", async () => {
@@ -643,7 +767,7 @@ test("closed_channel_note is an agent_settings key, kept in the framework's stat
 });
 
 test("a sleep announced into a channel the agent or a module closed says the agent will still see messages addressed to it; elsewhere the post opens the channel as speech does, and says it will still see messages", async () => {
-  const { registry, framework, published, opens, setRefuseCloses } = await harness();
+  const { registry, framework, published, opens, setRefuseCloses, setGrant } = await harness();
   await registry.handleChanged('discord', {
     added: [{ id: 'discord:g1:777888', type: 'discord', label: '#lobby', direction: 'bidirectional',
       address: { guildId: 'g1', channelId: '777888' } }],
@@ -697,10 +821,10 @@ test("a sleep announced into a channel the agent or a module closed says the age
   framework.closedChannelNoteSettingsExtension().reset('sol');
 
   // When who closed the channel can't be read, the words are ones true either way.
-  const closedByDecision = registry.closedByDecision.bind(registry);
-  registry.closedByDecision = () => { throw new Error('the registry is unreadable'); };
+  const speechLeavesClosed = registry.speechLeavesClosed.bind(registry);
+  registry.speechLeavesClosed = () => { throw new Error('the registry is unreadable'); };
   slept = await sleep({ seconds: 600 });
-  registry.closedByDecision = closedByDecision;
+  registry.speechLeavesClosed = speechLeavesClosed;
   assert.deepEqual(published.splice(0), [{ channelId, text: addressed }]);
 
   // A channel a module closed stays closed too, as connectome-host's mentions mode keeps it.
@@ -787,6 +911,22 @@ test("a sleep announced into a channel the agent or a module closed says the age
   routing.pin = ref(channelId);
   slept = await sleep({ seconds: 600 });
   assert.deepEqual(published.splice(0), [{ channelId, text: addressed }]);
+  routing.pin = undefined;
+  framework.agents.set('sol', agentStub());
+
+  // On a server that's up without channels.lifecycle, speech opens nothing,
+  // so a closed channel there stays closed, and the words say what reaches
+  // the agent from a closed channel.
+  await registry.handleChanged('discord', {
+    added: [{ id: 'discord:g1:565656', type: 'discord', label: '#ungranted', direction: 'bidirectional',
+      address: { guildId: 'g1', channelId: '565656' } }],
+  } as never);
+  setGrant(new CapabilityGrant(new Set(ALL_CAPABILITY_PATHS.filter((p) => p !== 'channels.lifecycle')), []));
+  routing.locus = ref('discord:g1:565656');
+  const opensBeforeUngranted = opens.length;
+  slept = await sleep({ seconds: 600 });
+  assert.deepEqual(published.splice(0), [{ channelId: 'discord:g1:565656', text: addressed }]);
+  assert.equal(opens.length, opensBeforeUngranted, 'the post opened nothing');
 });
 
 test('a conversation agent gets no note on its send: channel_open is refused to it', async () => {
