@@ -22649,9 +22649,9 @@ export class AgentFramework {
       }
     } else {
       // As in history, a reference is its stub at any depth and inline data
-      // claiming a uri or a disposition is withheld (RFC-005), by the
-      // result's claims, read here where no fetch read them, a stop in their
-      // walk failing as a stopped render does.
+      // claiming a uri or a disposition is withheld (RFC-005), by the claims
+      // the fetches read, or else the serializer's own reading of them,
+      // whose walk throws where it stops, failing as a stopped render does.
       try {
         text = isError
           ? result.error ?? 'tool call failed'
@@ -22659,7 +22659,7 @@ export class AgentFramework {
             ? nonErrorResultTextOrThrow(result)
             : toolResultDataToHistoryString(result.data, undefined, {
               dataIsContent: Boolean(result.dataIsContent),
-              claims: claims ?? resultClaimsOrThrow(result.data, result.dataIsContent),
+              ...(claims ? { claims } : {}),
             });
       } catch (err) {
         return failed(err);
