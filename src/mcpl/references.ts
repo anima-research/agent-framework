@@ -591,8 +591,11 @@ export class ReferenceRegistry {
    * null where the uri had none. `before(uri)` gives that record, or the
    * record as it is where nothing registered has touched it since, which is
    * the same. A fetch that saves a copy in the meantime sets its record's
-   * saved path without registering, so that is read as it is; a fetch only
-   * saves what its checks passed. Each open has its own copies, so lanes
+   * saved path without registering, so a record no registration has copied
+   * yet is read saved, and one a registration copied first, as a module's
+   * demand fetch registers before it fetches, is read as it stood, unsaved,
+   * as the model's line, which makes no demand fetch, reads it. A fetch saves
+   * only what its checks passed. Each open has its own copies, so lanes
    * that overlap keep theirs apart, and closing one lets its copies go.
    */
   openJournal(): RegistryJournal {
